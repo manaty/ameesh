@@ -787,6 +787,12 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     declaration explicitly. A scheduled start, a dependency or a gate stays
     ahead: the more explicit wait wins. Nothing is inferred from prose or git.
 
+    #5028/#5037: a future scheduled wake (`wake_ts`) is a planned wait even
+    without a hold, in `build` too; it is only the **fallback**, read after
+    the explicit waits (pilot hold, decision, packet, dependency, gate) and
+    after the declared landing, so it never displays "scheduled wake" over a
+    hold's holder or gate (N1 of #5028's review).
+
     `holds` (#1664, `pilot_holds`) est un hold déclaré, prioritaire sur une
     dépendance : le lot est parqué, pas en attente d'un lot.
 
@@ -904,26 +910,36 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         # remplace que l'attente de fusion ; sorti de qa (build, blocked,
         # waiting_human), le signal revient.
         landing = landing_by_item.get(ident)
-        if (not landing or row.get("state") not in lifecycle.TO_VALIDATE
-                or landing.get("admitted") is False):
-            continue
-        vehicle = int(landing["vehicle_id"])
-        open_vehicle = landing.get("open")
-        if open_vehicle is None:
-            open_vehicle = vehicle in open_ids
-        etat = landing.get("vehicle_state")
-        pinned = (landing.get("pinned_sha") or "").strip()
-        tete = (landing.get("head") or "").strip()
-        end = hold_end(landing.get("until_on"))
-        if (vehicle == ident or not open_vehicle or etat == "blocked"
-                or not pinned or not tete or pinned != tete
-                or end is None or now >= end):
-            continue
-        wait = {"what": "landing", "vehicle": vehicle,
-                "until": str(landing.get("until_on"))[:10], "head": pinned}
-        if etat:
-            wait["step"] = etat
-        waits[ident] = wait
+        if (landing and row.get("state") in lifecycle.TO_VALIDATE
+                and landing.get("admitted") is not False):
+            vehicle = int(landing["vehicle_id"])
+            open_vehicle = landing.get("open")
+            if open_vehicle is None:
+                open_vehicle = vehicle in open_ids
+            etat = landing.get("vehicle_state")
+            pinned = (landing.get("pinned_sha") or "").strip()
+            tete = (landing.get("head") or "").strip()
+            end = hold_end(landing.get("until_on"))
+            if not (vehicle == ident or not open_vehicle or etat == "blocked"
+                    or not pinned or not tete or pinned != tete
+                    or end is None or now >= end):
+                wait = {"what": "landing", "vehicle": vehicle,
+                        "until": str(landing.get("until_on"))[:10], "head": pinned}
+                if etat:
+                    wait["step"] = etat
+                waits[ident] = wait
+                continue
+        # #5028/#5037 : un réveil futur est une attente, même sans hold et en
+        # build — mais une attente de **repli**, après les attentes explicites
+        # (hold du pilote, décision, paquet, dépendance, porte) et
+        # l'atterrissage déclaré. Il ne remplace donc plus « hold by X » ou
+        # « external hold until … (gate) » (N1 de la revue de #5028).
+        wake = row.get("wake_ts")
+        if wake is not None and float(wake) > now:
+            start = datetime.datetime.fromtimestamp(
+                float(wake), datetime.timezone.utc).isoformat()
+            waits[ident] = {"what": "scheduled", "start": start,
+                            "wake_ts": float(wake)}
     return waits
 
 

@@ -524,8 +524,8 @@ class Policy:
     artifact_ended_idle: float = build_artifacts.DEFAULT_ENDED_IDLE_S
     #: L230/L162: names of the user's processes whose unreadability (not
     #: dumpable: capabilities, setuid) does not block a deletion — the build
-    #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
-    #: entry; empty by default, set per host in its Host card
+    #: artifacts of an idle worktree, abandoned /tmp entries and the shared
+    #: node_modules cache; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
     #: #2820 : taille du flux `events.jsonl` d'un agent au-delà de laquelle il
     #: tourne au début du tour suivant (`events_rotation`)
@@ -1207,7 +1207,8 @@ def _is_mount_point(directory: str, mounts: set | None) -> bool:
 
 def _files(top: str, limit: int | None = None, *, state: dict | None = None,
            protect_git: bool = False, device: int | None = None,
-           mounts: set | None = None, budget: PassBudget | None = None):
+           mounts: set | None = None, budget: PassBudget | None = None,
+           collect_links: bool = True):
     """(chemin, taille, mtime, stat) des fichiers sous `top`, sans suivre les
     liens ni changer de système de fichiers ; s'arrête à `limit` entrées
     comptées — fichiers rendus ET dossiers à ouvrir (#530) — (défaut
@@ -1287,7 +1288,7 @@ def _files(top: str, limit: int | None = None, *, state: dict | None = None,
                     # before counting the bytes (a link left behind means the
                     # bytes were not freed).
                     names = state.setdefault("links", {}).setdefault(inode, []) \
-                        if state is not None else None
+                        if state is not None and collect_links else None
                     if names is not None:
                         names.append(entry.path)
                     if inode in seen:            # #500: hard link, counted once
@@ -1299,18 +1300,21 @@ def _files(top: str, limit: int | None = None, *, state: dict | None = None,
             continue
 
 
-def size_of(path: str, limit: int = WALK_LIMIT,
-            budget: PassBudget | None = None) -> int:
+def size_of(path: str, limit: int | float = WALK_LIMIT,
+            budget: PassBudget | None = None, *, state: dict | None = None) -> int:
     """Octets occupés sous `path` (fichier ou dossier), bornés à `limit`
     entrées comptées (#530 : fichiers et dossiers) et au budget du passage
-    (#3802) ; 0 si illisible, un minimum si le parcours s'arrête."""
+    (#3802) ; 0 si illisible, un minimum si le parcours s'arrête.
+    `state` rend la troncature explicite sans stocker tous les noms de liens ;
+    une limite infinie retire le plafond d'entrées, pas le budget de temps."""
     try:
         st = os.lstat(path)
     except OSError:
         return 0
     if not stat.S_ISDIR(st.st_mode):
         return _used_bytes(st)
-    return sum(size for _p, size, _m, _st in _files(path, limit, budget=budget))
+    return sum(size for _p, size, _m, _st in _files(
+        path, limit, budget=budget, state=state, collect_links=False))
 
 
 def _in_subtree(path: str, directory: str) -> bool:
@@ -3551,15 +3555,24 @@ def measure(cfg, policy: Policy, budget: PassBudget | None = None) -> dict:
             if name != MARKER and os.path.isdir(full) and not os.path.islink(full):
                 agents[name] = size_of(full, budget=budget)
     caches: dict = {}
+    cache_partial: list[str] = []
     from . import deps as deps_mod
     # Shared installs occupy the cache even when linking is disabled.
     for name in [n for n, _vars in cache_names(policy)] + [deps_mod.NM_DIR]:
+        full = os.path.join(croot, name)
+        if not os.path.isdir(full):
+            continue
         if budget is not None and budget.expired():
             budget.timed_out = True
-            break                      # #3802: a bounded host pass
-        full = os.path.join(croot, name)
-        if os.path.isdir(full):
-            caches[name] = size_of(full, budget=budget)
+            cache_partial.append(name)
+            continue
+        state: dict = {}
+        # #5022: shared installs routinely exceed WALK_LIMIT. Count the
+        # entire tree, still bounded by the host pass's time budget.
+        caches[name] = size_of(full, limit=(float("inf") if name == deps_mod.NM_DIR
+                                          else WALK_LIMIT), budget=budget, state=state)
+        if state.get("truncated"):
+            cache_partial.append(name)
     system = resources_mod.fs_usage(resources_mod.system_tmp())
     fraction = resources_mod.tmpfs_fraction(system)
     seuil = min(policy.tmpfs_alert, resources_mod.DEFAULT_MAX_TMPFS_USED)
@@ -3570,6 +3583,9 @@ def measure(cfg, policy: Policy, budget: PassBudget | None = None) -> dict:
                             if os.path.isdir(troot) else None),
         "cache_root": croot, "cache_bytes": sum(caches.values()), "cache_by_name": caches,
         "cache_quota": policy.cache_quota,
+        "cache_partial": cache_partial,
+        "cache_quota_exceeded": (True if sum(caches.values()) > policy.cache_quota
+                                 else None if cache_partial else False),
         "system_tmp": system,
         "system_tmp_fraction": fraction,
         "system_tmp_top": (tmp_top(budget=budget)
@@ -5668,12 +5684,14 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         for line in deps_mod.gc_node_modules(croot, now=now, idle=policy.deps_idle,
                                              dry_run=dry_run, worktrees=known_worktrees,
                                              budget=budget,
-                                             reserve=reserve):
+                                             reserve=reserve,
+                                             allow=policy.unreadable_ok):
             if line["action"] == "would-delete":
                 plan.append({"kind": "deps", "path": line["path"], "action": "suppression",
                              "bytes": line["bytes"], "detail": line["detail"]})
             elif line["action"] == "kept":
                 skipped.append("deps %s kept: %s" % (line["path"], line["detail"]))
+                entries.append(line)  # #5022: retain the refusal in the durable log
             else:
                 entries.append(line)
     budget.check("archive")
@@ -5838,6 +5856,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     # #3802 : la trace des phases reste au journal (relevé `mesure`), pas
     # seulement dans la sortie de cette passe.
     report_measure["host_pass"] = budget.summary()
+    report_measure["deps_kept"] = [dict(line) for line in entries
+                                   if line.get("kind") == "deps"
+                                   and line.get("action") == "kept"]
     report_measure["worktree_archives"] = dict(
         housekeeping_archive.survey(archive_root),
         after=policy.dirty_worktree_after, retention=policy.dirty_archive_retention)
@@ -5956,8 +5977,15 @@ def print_report(report: dict) -> None:
     if m:
         print("  temporary dirs        %s (%s); quota %s per agent"
               % (_fmt(m["tmp_bytes"]), m["tmp_root"], _fmt(m["tmp_quota"])))
-        print("  shared caches         %s / %s (%s)"
-              % (_fmt(m["cache_bytes"]), _fmt(m["cache_quota"]), m["cache_root"]))
+        print("  shared caches         %s%s / %s (%s)%s"
+              % ("at least " if m.get("cache_partial") else "",
+                 _fmt(m["cache_bytes"]), _fmt(m["cache_quota"]), m["cache_root"],
+                 " — partial: " + ", ".join(m["cache_partial"])
+                 if m.get("cache_partial") else ""))
+        if m.get("cache_quota_exceeded") is True:
+            print("  shared caches: quota exceeded")
+        elif m.get("cache_quota_exceeded") is None and m.get("cache_partial"):
+            print("  shared caches: quota compliance unknown (partial measurement)")
         sys_tmp = m.get("system_tmp") or {}
         if sys_tmp.get("tmp_size_bytes"):
             print("  %-21s %s / %s (%s)%s" % (
@@ -6065,13 +6093,15 @@ def print_report(report: dict) -> None:
             print("    %s  %s  (%s%s)  →  %s" % (
                 _fmt(e.get("bytes")), e["path"], e.get("owner") or "?", sort,
                 e.get("command") or ""))
-    # #4234 : le volume des arbres de lots livrés gardés pour des fichiers
-    # modifiés/non suivis, les plus gros en tête. Le relevé est borné ; il ne
-    # supprime rien et ne remplace pas la politique d'archivage du Host.
+    # #5052 : volume de tous les arbres gardés ou en attente, y compris
+    # les HEAD non intégrés. Relevé borné, sans suppression ; les gardes
+    # de fin, d'inactivité et de sécurité restent celles de la passe.
     sizes = report.get("worktree_sizes") or {}
-    if sizes.get("dirty"):
-        print("  kept dirty worktrees by volume (biggest first; %d of %d measured "
-              "in %ss):" % (sizes.get("measured") or 0, sizes["dirty"],
+    if sizes.get("kept", sizes.get("dirty")):
+        label = "kept worktrees" if "kept" in sizes else "kept dirty worktrees"
+        print("  %s by volume (biggest first; %d of %d measured "
+              "in %ss):" % (label, sizes.get("measured") or 0,
+                            sizes.get("kept", sizes.get("dirty")),
                             sizes.get("seconds") or 0))
         for row in sizes.get("top") or ():
             print("    %s%s  %s — %s" % (
@@ -6081,7 +6111,7 @@ def print_report(report: dict) -> None:
             print("    … %d not measured this pass" % sizes["unmeasured"])
         print("    total measured %s; %s" % (
             _fmt(sizes.get("total_bytes")),
-            "archive policy declared: kept until the archive grace"
+            "archive policy declared: end, inactivity and safety guards still apply"
             if sizes.get("archive_declared") else
             "archive policy NOT declared (Host card dirty_worktree_after / "
             "dirty_archive_retention): these trees stay"))
@@ -6095,20 +6125,27 @@ WORKTREE_SIZE_TOP = 10
 
 
 def kept_worktree_sizes(plan, *, seconds: float = WORKTREE_SIZE_BUDGET_S) -> dict:
-    """#4234 : tailles des worktrees gardés pour des fichiers modifiés, non
-    suivis ou ignorés, les plus grosses d'abord.
+    """#5052 : tailles de TOUS les worktrees gardés ou en attente.
+
+    `dirty` reste le sous-ensemble modifié/ignoré ; `kept` est le périmètre
+    mesuré, y compris HEAD non intégré, processus et lots encore actifs.
 
     `plan` est le plan d'une passe en essai (les lignes `garde`/`attend` du
     kind `worktree`) ; chaque parcours est borné par le temps restant du
     relevé (20 s au total) et par 5 s pour un seul arbre. Rien n'est supprimé
     ni écrit : un arbre non mesuré est dit, jamais compté à zéro."""
     wanted = []
+    dirty = 0
+    seen = set()
     for row in plan or ():
+        if (row.get("kind") != "worktree" or row.get("action") not in ("garde", "attend")
+                or not row.get("path") or row["path"] in seen):
+            continue
+        seen.add(row["path"])
+        wanted.append(row)
         detail = row.get("detail") or ""
-        if (row.get("kind") == "worktree" and row.get("action") in ("garde", "attend")
-                and ("modified or untracked" in detail
-                     or "ignored file(s) outside build artifacts" in detail)):
-            wanted.append(row)
+        dirty += int("modified or untracked" in detail
+                     or "ignored file(s) outside build artifacts" in detail)
     started = time.monotonic()
     deadline = started + max(0.0, float(seconds))
     measured = []
@@ -6122,7 +6159,7 @@ def kept_worktree_sizes(plan, *, seconds: float = WORKTREE_SIZE_BUDGET_S) -> dic
                          "complete": complete, "detail": row.get("detail") or "",
                          "lot": row.get("lot")})
     top = sorted(measured, key=lambda item: item["bytes"], reverse=True)[:WORKTREE_SIZE_TOP]
-    return {"dirty": len(wanted), "measured": len(measured),
+    return {"dirty": dirty, "kept": len(wanted), "measured": len(measured),
             "unmeasured": len(wanted) - len(measured),
             "total_bytes": sum(item["bytes"] for item in measured),
             "seconds": round(time.monotonic() - started, 1),

@@ -115,6 +115,7 @@ nav:
       - Install on a workstation: guides/install.md
       - Write a canon: guides/write-a-canon.md
       - Write a Process card: guides/write-a-process.md
+      - Write a module: guides/write-a-module.md
       - Write a Pipeline: guides/write-a-pipeline.md
       - Run the demo: guides/run-the-demo.md
       - Switch from a v0 setup: guides/switch-from-v0.md

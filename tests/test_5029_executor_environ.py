@@ -122,6 +122,42 @@ class UndumpableWitnessTest(unittest.TestCase):
         self.assertIn(start, without["unread"])
         self.assertNotIn(start, allowed["unread"])
 
+    @unittest.skipUnless(platform.is_linux(), "the /proc credential check is Linux-only")
+    def test_a_shebang_name_is_not_automatically_excused(self):
+        """A borrowed console-script name grants no automatic exemption."""
+        workdir = tempfile.mkdtemp(prefix="l5029-", dir=os.environ.get("TMPDIR"))
+        self.addCleanup(shutil.rmtree, workdir, True)
+        script = os.path.join(workdir, "ameesh")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write("#!%s\n" % sys.executable)
+            fh.write("import sys, time\n"
+                     "from ameesh import platform\n"
+                     "assert platform.become_undumpable()\n"
+                     "open(sys.argv[1], 'w').write('ready')\n"
+                     "time.sleep(30)\n")
+        os.chmod(script, 0o755)
+        marker = os.path.join(workdir, "ready")
+        proc = subprocess.Popen(
+            [script, marker], env=dict(_env(), AMEESH_TEST_SECRET="une-valeur-de-test"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (proc.kill(), proc.wait(), proc.stdout.close(),
+                                 proc.stderr.close()))
+        deadline = time.monotonic() + 10
+        while not os.path.exists(marker):
+            if proc.poll() is not None:
+                self.fail("shebang helper exited before hardening: %s" % proc.stderr.read())
+            if time.monotonic() > deadline:
+                self.fail("shebang helper did not become undumpable in time")
+            time.sleep(0.02)
+        self.assertTrue(platform.process._allowed_proc(proc.pid, ("ameesh",)))
+        start = platform.start_time(proc.pid)
+        table = [{"pid": proc.pid, "start": start, "zombie": False}]
+        with mock.patch.object(platform.process, "_psutil", return_value=None), \
+                mock.patch.object(platform.process, "process_table", return_value=table):
+            scan = platform.env_values("AMEESH_TEST_SECRET")
+        self.assertIn(start, scan["unread"])
+        self.assertEqual(scan["values"], {})
+
 
 class BecomeUndumpableTest(unittest.TestCase):
     def test_no_proc_is_a_no_op(self):
@@ -198,10 +234,13 @@ class HolderChecksTest(unittest.TestCase):
             reprise.holders("/tmp/session", "id")
         self.assertFalse(holders.call_args.kwargs.get("allow"))
 
-    def test_dependency_holder_check_allows_the_executor(self):
+    def test_dependency_holder_check_carries_the_host_allow(self):
+        # #5046 : `_holders` reçoit désormais l'allow explicite de l'hôte
+        # (`housekeeping.unreadable_allow`, qui inclut l'exécuteur) ; il ne le
+        # fixe plus lui-même.
         with mock.patch.object(platform, "holders", return_value=[]) as holders:
-            deps._holders("/tmp/cache-entry")
-        self.assertFalse(holders.call_args.kwargs.get("allow"))
+            deps._holders("/tmp/cache-entry", allow=("gpg-agent",))
+        self.assertEqual(holders.call_args.kwargs.get("allow"), ("gpg-agent",))
 
 
 

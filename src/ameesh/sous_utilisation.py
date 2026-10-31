@@ -170,7 +170,7 @@ def paid_harnesses(host: str | None = None) -> tuple | None:
         return None
 
 
-def _paid_spend(db, paid, seconds: float = 86400.0) -> tuple | None:
+def _paid_spend(db, paid, seconds: float = 86400.0, *, cfg=None) -> tuple | None:
     """`(paid, estimated)` per token over `seconds` (#325): `paid`, the fall of
     the provider balances in USD (`balance.compare`, L95) for the paid harnesses
     that have readings, else None; `estimated`, ameesh's ledger for the others."""
@@ -179,7 +179,7 @@ def _paid_spend(db, paid, seconds: float = 86400.0) -> tuple | None:
     from . import balance
     now = time.time()
     try:
-        real = [entry for entry in balance.compare(db, paid, now - seconds, now)
+        real = [entry for entry in balance.compare(db, paid, now - seconds, now, cfg=cfg)
                 if entry["provider"] in paid and entry["currency"] == "USD"]
     except Exception:
         real = []                       # balances unreadable: the estimate for all
@@ -486,7 +486,7 @@ def plan_underused(db, listing: list, now: float, *,
                 detail += "; idle %s agents: %s" % (harness, ", ".join(idle))
             if paid and harness not in paid:
                 if not spend_read:
-                    spend, spend_read = _paid_spend(db, paid), True
+                    spend, spend_read = _paid_spend(db, paid, cfg=cfg), True
                 real, estimated = spend or (None, 0.0)
                 parts = []
                 if real:
@@ -1146,9 +1146,13 @@ def footprint_blockers(db, waiting_lots: list, lots: list, *,
     for row in store.work_footprints.for_items(
             [int(lot["id"]) for lot in lots]):
         paths.setdefault(int(row["work_item_id"]), []).append(str(row["path"]))
+    # #4818 : chemins partagés et plafond de lots en vol de chaque dépôt
+    from . import work_footprints
+    policies = work_footprints.policies_of(
+        db, {str(lot.get("app") or "") for lot in waiting_lots})
     out: dict = {}
     for lot in waiting_lots:
-        blockers = slo.footprint_blockers(lot, lots, paths)
+        blockers = slo.footprint_blockers(lot, lots, paths, policies)
         if blockers:
             out[int(lot["id"])] = blockers
     return out
@@ -1557,11 +1561,13 @@ def balance_rate(points: list) -> tuple | None:
 def balance_low(db, listing: list, now: float, *,
                 hours: float = DEFAULT_BALANCE_HOURS,
                 min_usd: float = DEFAULT_BALANCE_MIN_USD,
-                window_s: float = DEFAULT_BALANCE_WINDOW_S) -> list:
+                window_s: float = DEFAULT_BALANCE_WINDOW_S, cfg=None) -> list:
     if hours <= 0 and min_usd <= 0:
         return []
     rows = storage.of(db).operations.balances(provider=None,
                                               since_s=max(window_s, BALANCE_MIN_SPAN_S))
+    from . import balance
+    rows = balance.normalize_readings(rows, cfg)
     series: dict = {}
     for row in rows:
         series.setdefault((row["provider"], row["currency"], row.get("account")),
@@ -1705,7 +1711,7 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         readings={host: reading for host, (reading, _verdict) in verdicts.items()},
         held_hosts=held_hosts, orchestrators=orchestras)
     out += balance_low(db, listing, now, hours=balance_hours, min_usd=balance_min_usd,
-                       window_s=balance_window_s)
+                       window_s=balance_window_s, cfg=cfg)
     out += backlog_empty(db, listing, now, idle_s=backlog_empty_s)
     # #3256 A : la feuille de route notée épuisée sur un lot de découpage
     from . import file_decoupage

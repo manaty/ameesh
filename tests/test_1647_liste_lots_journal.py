@@ -51,7 +51,9 @@ class ListeLotsJournalTest(PgTestCase):
     def test_transitions_ecartent_les_notes(self):
         journal = self._journal()
         transitions = self.st.progress.lot_transitions([self.lot])
-        self.assertEqual(len(journal), 1 + NOTES)
+        # la création, son analyse d'impact (#4818 : une ligne par estimation)
+        # et les notes
+        self.assertEqual(len(journal), 2 + NOTES)
         # la vue groupée ne lit qu'une ligne : la création, pas les notes
         self.assertEqual(len(transitions), 1)
         attendues, precedent = [], None

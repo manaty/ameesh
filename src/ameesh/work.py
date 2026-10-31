@@ -86,6 +86,21 @@ def __getattr__(name):
         return getattr(_module_registry.development_workflow(), name)
     raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
+
+def development_transitions() -> dict:
+    """The dev workflow's transitions, or {} without the dev module.
+
+    #4957 : le noyau générique (`decisions`) tient et rend un lot ; au profil
+    nu (L98 T2b, CI/tests) le module dev n'existe pas. Sans table, l'appelant
+    ne tente aucun déplacement et journalise la note seule, au lieu de lever
+    une ValueError qui masquait le fonctionnement normal du reste.
+    """
+    try:
+        return _module_registry.development_workflow().TRANSITIONS
+    except ValueError:
+        return {}
+
+
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
@@ -556,6 +571,7 @@ def add(
     unique_ref: bool = False,
     external_executor: str | None = None,
     footprint=None,
+    impact: dict | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -622,10 +638,13 @@ def add(
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
     if footprint is None and not _is_vehicle_branch(branch):
+        # #4818 : l'analyse d'impact (lecture seule, bornée) remplace la
+        # seule lecture des chemins cités ; elle est journalisée à la création
         from . import work_footprints
-        footprint = work_footprints.estimate_for_creation(
-            cfg if cfg is not None else getattr(db, "cfg", None),
+        impact = work_footprints.analyze_for_creation(
+            cfg if cfg is not None else getattr(db, "cfg", None), db,
             app=app, title=title, body=body, branch_target=branch_target or "")
+        footprint = list(impact["footprint"]) if impact else []
     return _create(db, title=title, type=type, source=source, app=app, body=body,
                    issue_ref=issue_ref, workstream=workstream, assignee=assignee,
                    budget_usd=budget_usd, actor=actor, package=package, externe=externe,
@@ -634,7 +653,8 @@ def add(
                    note=note, force=force, parent_lot=parent_lot,
                    mark_item_id=mark_item_id, mark_note=mark_note,
                    unique_ref=unique_ref, team_queue=True,
-                   external_executor=external_executor, footprint=footprint)
+                   external_executor=external_executor, footprint=footprint,
+                   impact=impact)
 
 
 #: #3209 : les états d'un lot encore ouvert, lus par `open_with_source`
@@ -722,7 +742,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             branch_target=None, priority=None, estimate=None, estimate_source=None,
             size=None, note="", force=None, parent_lot=None, mark_item_id=None,
             mark_note="", unique_ref: bool = False, team_queue: bool,
-            external_executor=None, footprint=None) -> dict:
+            external_executor=None, footprint=None, impact=None) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
@@ -786,6 +806,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         # une empreinte d'intake inférée de ce texte est fausse (le véhicule
         # n'a pas de delta propre) et refusait son attribution (#3185).
         footprint = []
+        impact = None
     created = ("created" + (" (plan: %s)" % package if package else "")
                + ("; estimate: %s" % span(minutes * 60) if minutes else "")
                + ("; reserved to external executor %s" % external_executor
@@ -810,8 +831,10 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             unique_ref=unique_ref, external_executor=external_executor,
             # #4173 : l'empreinte d'intake est écrite par la création même ;
             # attribuée, celle-ci est refusée si elle chevauche un lot en cours
-            # (`FootprintOverlap`, rien n'est écrit).
-            **({"footprint": list(footprint)} if footprint else {}))
+            # (`FootprintOverlap`, rien n'est écrit). #4818 : une analyse
+            # inconnue prend la politique lue sous le verrou, à l'écriture.
+            **({"footprint": list(footprint)} if footprint else {}),
+            **({"footprint_unknown": True} if impact and impact.get("unknown") else {}))
 
     if fence is None:
         item = create(db)
@@ -819,6 +842,12 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         with db.transaction() as tx:
             fence.hold(tx)
             item = create(tx)
+    if impact:
+        # #4818 : une ligne de journal par estimation, et la dernière analyse,
+        # avec la politique appliquée à l'écriture
+        from . import work_footprints
+        work_footprints.settle(impact, item.get("footprint_policy"))
+        work_footprints.record_analysis(db, int(item["id"]), impact, actor=actor)
 
     if item.get("queued_behind") is not None:
         item["queue_warning"] = queue_warning(db, item, assignee)
@@ -2196,6 +2225,68 @@ def is_pilot(cfg, db: Db, actor: str) -> bool:
         return False
 
 
+#: #5006 : marque machine d'un geste de statut (move, gel) posé par un agent
+#: qui n'est plus l'assigné du lot — dans la note du journal et sur stderr.
+NON_ASSIGNEE_MARK = "ameesh-non-assignee:"
+
+
+def non_assignee_warning(cfg, db: Db, item: dict, actor: str) -> str:
+    """#5006 : l'avertissement d'un geste de statut (`work move`, gel) posé
+    par un agent qui n'est pas l'assigné du lot, ou ''.
+
+    Signalé, jamais refusé : un humain, le système, un pilote (`is_pilot`) ou
+    un relecteur désigné du lot agissent légitimement sur le lot d'un autre.
+    Le cas visé est l'ancien assigné dont le tour a continué après une
+    réassignation (#4858 : intake → build et gel après `work assign`)."""
+    name = (actor or "").strip()
+    holder = (item.get("assignee") or "").strip()
+    if not name or not holder or name == holder:
+        return ""
+    if name.startswith(HUMAN_PREFIX) or name in (SYSTEM_SENDER, UNKNOWN_ACTOR):
+        return ""
+    from .work_reviewers import designated
+    if holder.startswith(HUMAN_PREFIX) or name in designated(item):
+        return ""
+    if is_pilot(cfg, db, name):
+        return ""
+    return ("%s %s is not the assignee of lot #%s (assignee: %s); if the lot was "
+            "reassigned away from you, stop: no push, freeze or move — leave a "
+            "note of your state for %s" % (NON_ASSIGNEE_MARK, name, item.get("id"),
+                                           holder, holder))
+
+
+def _notify_reassigned(db: Db, item: dict, previous: str | None, assignee: str,
+                       actor: str) -> int | None:
+    """#5006 : prévient l'ancien assigné d'une réassignation.
+
+    Le courrier est passif (`info` : il n'ouvre pas de tour à un agent au
+    repos, son prochain brief relit l'assigné courant) et `reassigned`, une
+    clé remise EN COURS de tour (`mail.MID_TURN_KEYS`, L514) : un tour déjà
+    lancé sur le lot l'apprend au prochain appel d'outil. Rien pour un
+    humain, un externe, ni quand l'ancien assigné réassigne lui-même. Un
+    échec d'envoi ne retient pas la réassignation déjà écrite."""
+    from . import fil, mail
+    old = (previous or "").strip()
+    if not old or old == assignee or old == (actor or "").strip() \
+            or old.startswith(HUMAN_PREFIX):
+        return None
+    lot = int(item["id"])
+    to = assignee or "the team queue (nobody)"
+    body = ("Lot #%d (%s) is reassigned to %s by %s: it is no longer yours. "
+            "If a turn of yours is working on it, stop now: no push, no freeze, "
+            "no move. Leave a note of your state (`ameesh work note %d …`: branch, "
+            "pushed head, what remains) so that %s can take it over."
+            % (lot, fil.excerpt(item.get("title") or "", 120), to,
+               actor or "nobody", lot, assignee or "the next assignee"))
+    try:
+        return mail.send(db, SYSTEM_SENDER, old, body, work_item_id=str(lot),
+                         payload={"info": True,
+                                  "reassigned": {"lot": lot, "to": assignee,
+                                                 "by": actor or ""}})
+    except Exception:  # noqa: BLE001 - l'attribution est écrite ; le journal la dit
+        return None
+
+
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
            force: str | None = None, claim: bool = False,
@@ -2342,7 +2433,9 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         # #4173 : l'empreinte du lot chevauche celle d'un lot en cours du
         # même dépôt — rien n'est écrit, le lot attend sa fusion.
         from . import work_footprints
-        raise WorkError(work_footprints.refusal(item_id, exc.overlaps)) from None
+        raise WorkError(work_footprints.refusal(item_id, exc.overlaps,
+                                                cap=getattr(exc, "cap", None),
+                                                in_flight=getattr(exc, "in_flight", None))) from None
     if row is None:
         if claim:
             holder = (get(db, item_id) or {}).get("assignee")
@@ -2353,6 +2446,12 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     if branch:
         row = set_branch(db, item_id, branch, branch_target, actor=actor)
     out = {"item": row, "check": check, "previous": previous}
+    if (row.get("assignee") or None) != (previous or None):
+        # #540 : un lot rendu à la file d'équipe quitte aussi l'ancien assigné
+        notified = _notify_reassigned(db, item, previous,
+                                      row.get("assignee") or "", actor)
+        if notified is not None:
+            out["previous_notified"] = notified
     if behind is not None:
         row["queued_behind"] = behind
         out["queue_warning"] = queue_warning(db, row, check["assignee"])
@@ -4293,6 +4392,11 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     text = note or ("%s → %s" % (current, state))
     if reviewer:
         text = "%s — reviewer %s" % (text, reviewer)
+    # #5006 : un move par un agent qui n'est plus l'assigné est signalé
+    # (journal et sortie), jamais refusé : pilote et relecteur en sont exclus.
+    stranger = non_assignee_warning(getattr(db, "cfg", None), db, item, actor)
+    if stranger:
+        text = "%s\n%s" % (text, stranger)
     from . import planned_waits
     guarded = (planned_waits.is_hold_note(note)
                or planned_waits.is_lift_note(note))
@@ -4339,7 +4443,51 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         if reviewer_warning:
             row["reviewer_warning"] = reviewer_warning
         row.update(_reviewer_request(db, item, reviewer, actor))
+    if stranger:
+        row["assignee_warning"] = stranger
     return row
+
+
+def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
+    """#5035 : qui fait avancer le lot d'un autre (`ameesh work move`).
+
+    Le 31/10, `mty-amh-impl-05` a fait passer #5029 d'intake à build : sa prise
+    (`assign --claim`) venait d'être refusée, le lot était à `ameesh-dev3`, et
+    la commande suivante de la chaîne n'a rien refusé. Un lot qui a un porteur
+    n'est déplacé que par lui ou celui qui lui a délégué le lot, un humain, un
+    pilote, le bureau ou l'auditeur (escalades du §9) ; un relecteur désigné
+    rend un lot en revue. L'entrée en `validated` reste ouverte : elle a sa
+    porte, le quorum d'avis (`move`). Un lot sans porteur se prend d'abord,
+    mais son déplacement n'est pas refusé ici. Une session liée agit en son nom :
+    `--actor` ne prête pas l'autorité d'un autre. Une session sans identité
+    n'a rien à prouver ici (l'avertissement « inconnu » la dit au journal). Le
+    chemin médié a déjà sa garde (`_require_assigned`) ; les moves internes
+    (décisions, report de verdict) n'appellent pas ce contrôle."""
+    from . import identity, slo
+    from .work_reviewers import designated
+
+    if storage.is_remote(db):
+        return
+    item = get(db, item_id)
+    holder = (item or {}).get("assignee")
+    if not holder or lifecycle.phase_name(state) == "validated":
+        return
+    binding = identity.resolve_binding(cfg, db)
+    who = binding.name or (actor or "").strip()
+    if not who or who == UNKNOWN_ACTOR or who == holder or who.startswith(HUMAN_PREFIX):
+        return
+    if who == item.get("delegated_by") and item.get("due_ts"):
+        return
+    if lifecycle.phase(item) in (*TO_VALIDATE, "validated") \
+            and who in designated(item):
+        return
+    if who in slo.CRITICAL_TARGETS or is_pilot(cfg, db, who) or is_auditor(cfg, db, who):
+        return
+    raise WorkError(
+        "move refused: lot %s is held by %s, not %s; nothing changed. Only its holder, "
+        "a designated reviewer, a human, a pilot, the bureau or the auditor moves it "
+        "(take it through the pilot, or say what you found: ameesh work note %s \"…\")"
+        % (item_id, holder, who, item_id))
 
 
 def _wake_moment(ts: float) -> str:

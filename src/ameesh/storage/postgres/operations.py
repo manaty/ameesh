@@ -23,7 +23,8 @@ from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
 from .work import REQUEUED_PARAMS, has_reviewer, requeued_sql
-from .work_dependencies import current_verdict as _current_verdict, freeze_due
+from .work_dependencies import (current_verdict as _current_verdict, freeze_due,
+                                wake_defers)
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"   # closed : abandonné ou remplacé (L29)
@@ -184,7 +185,8 @@ class Operations(interface.Operations):
                    extract(epoch from m.oldest)::float8 AS oldest_unread_ts,
                    coalesce(m.n_passive, 0)::bigint AS passive_unread,
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
-                   coalesce(sw.planned_start > j.today, false) AS session_lot_later,
+                   (coalesce(sw.planned_start > j.today, false)
+                       OR coalesce(sw.wake_at > clock_timestamp(), false)) AS session_lot_later,
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
                    coalesce(al.n, 0)::bigint AS active_lots,
@@ -221,7 +223,7 @@ class Operations(interface.Operations):
                                 WHERE mb.recipient = r.name AND mb.delivered_at IS NULL
                                   AND """ + _PASSIVE + """) passif) m ON true
               LEFT JOIN LATERAL (
-                  SELECT w.title, w.state, w.planned_start FROM work_items w
+                  SELECT w.title, w.state, w.planned_start, w.wake_at FROM work_items w
                    WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
                                      THEN r.session_work_item::bigint END) sw ON true
               LEFT JOIN LATERAL (
@@ -234,7 +236,8 @@ class Operations(interface.Operations):
                   SELECT count(*) AS n FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND w.state NOT IN """ + _WAITING_ON_OTHERS + """
-                     AND (w.planned_start IS NULL OR w.planned_start <= j.today)) al ON true
+                     AND (w.planned_start IS NULL OR w.planned_start <= j.today)
+                     AND NOT """ + wake_defers("w") + """) al ON true
               LEFT JOIN LATERAL (
                   -- #1677 : ce que l'agent doit encore faire — ses lots qui
                   -- l'occupent, plus la correction d'un lot en qa dont le
@@ -249,13 +252,16 @@ class Operations(interface.Operations):
                   -- peut citer ; `assigned_lot_id` reste le lot assigné le plus
                   -- récemment touché, qui peut être prévu plus tard ou en
                   -- attente d'un autre.
+                  -- #5037 : un réveil futur ne l'éteint pas quand ce geste est
+                  -- dû (gel manquant ou verdict courant bloquant).
                   SELECT count(*)""" + review_due + """ AS n, min(w.id) AS lot_id
                     FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND (w.state NOT IN """ + _WAITING_ON_OTHERS + f"""
                           OR (w.state = '{lifecycle.QA}' AND (""" + freeze_due("w") + """
                               OR """ + _current_verdict("w") + """ = 'blocked')))
-                     AND (w.planned_start IS NULL OR w.planned_start <= j.today)) ac ON true
+                     AND (w.planned_start IS NULL OR w.planned_start <= j.today)
+                     AND NOT """ + wake_defers("w") + """) ac ON true
               LEFT JOIN LATERAL (
                   SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
                     FROM turn_costs c
@@ -464,6 +470,9 @@ class Operations(interface.Operations):
     _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, to_jsonb(w)->>'legacy_state' AS legacy_state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+                   -- #4818 : un lot de décision ou de découpage n'entre pas
+                   -- dans le plafond de lots en vol (`work_footprints.is_exempt`)
+                   w.source,
                    to_jsonb(w)->>'external_executor' AS external_executor,
                    -- #2335 : l'appartenance à un paquet se lit sur le porteur
                    -- (`integration/**`), son manifeste (corps) et la tête gelée
@@ -471,6 +480,7 @@ class Operations(interface.Operations):
                    -- pour un porteur : pas pour tous les lots ouverts (N2 de
                    -- la relecture dev7).
                    w.branch, w.branch_head,
+                   extract(epoch from w.wake_at)::float8 AS wake_ts,
                    to_char(w.planned_start, 'YYYY-MM-DD') AS planned_start,
                    CASE WHEN left(btrim(w.branch), 12) = 'integration/' THEN w.body END AS body,
                    to_jsonb(w)->'reviewers' AS reviewers,

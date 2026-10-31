@@ -448,6 +448,22 @@ def mechanics_canon(root: str) -> str:
     return root
 
 
+def patch_mechanics(testcase):
+    """#5005 : document mécanique explicite des bancs PG sans canon Git.
+
+    Comme le plafond §4 et les familles de relecture de fixture, la politique
+    de prise automatique ne doit pas dépendre du canon de la machine hôte.
+    Les tests du lecteur et d'échec fermé remplacent ce patch localement.
+    """
+    from ameesh import mechanics
+    from .test_l1616_mechanics import MECHANICS
+    patcher = mock.patch.object(mechanics, "configured",
+                                return_value=mechanics.compile_document(MECHANICS))
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+    return patcher
+
+
 def patch_families(testcase, families=("claude", "codex", "deepseek")):
     """Épingle les familles compilées d'un banc sans canon Git (#2664).
 
@@ -820,7 +836,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
             "TRUNCATE agent_registry, key_holders, key_events, agent_mailbox, mesh_approvals, "
             "work_items, work_item_events, work_item_milestones, work_packages, "
             "thread_index, notify_liveness, notify_briefs, estimate_references, "
-            "harness_adoptions, harness_versions "
+            "harness_adoptions, harness_versions, repository_footprint_policies "
             "RESTART IDENTITY CASCADE")
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.makedirs(self.tmp, exist_ok=True)
@@ -831,6 +847,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
         # hôte équipé. Le lecteur du canon a ses propres témoins, et un test
         # d'échec fermé défait ce patch localement.
         patch_families(self)
+        patch_mechanics(self)
 
 
     @classmethod

@@ -1271,6 +1271,92 @@ class ReveilTest(_Base):
         self.assertIn('hold: <reason>', spec["prompt"])
         self.assertIsNone(self.pick(worker), "pas deux réveils de suite")
 
+    def test_future_wake_without_hold_waits_in_intake_and_build(self):
+        for state in ("intake", "build"):
+            with self.subTest(state=state):
+                name = "wake5028" + state
+                worker = self._worker(name)
+                lot = work.add(self.db, title="scheduled without hold", assignee=name)["id"]
+                if state == "build":
+                    work.move(self.db, lot, state)
+                self.db.execute("UPDATE work_items SET wake_at = clock_timestamp()"
+                                " + interval '1 hour' WHERE id = %s", (lot,))
+                self.assertEqual(self.st.actionable(name), [])
+                self.assertIsNone(self.pick(worker))
+                self.assertEqual(self.st.listing(name), [])
+                row = next(r for r in storage.of(self.db).operations.listing()
+                           if r["name"] == name)
+                self.assertEqual(row["actionable_lots"], 0)
+                self.assertEqual(row["active_lots"], 0)
+                from ameesh import planned_waits
+                rows = [r for r in storage.of(self.db).operations.open_lots_activity(None)
+                        if r["id"] == lot]
+                self.assertGreater(rows[0]["wake_ts"], time.time())
+                waits = planned_waits.read(self.db, rows, packets=False)
+                self.assertEqual(waits[lot]["what"], "scheduled")
+                self.db.execute("UPDATE work_items SET wake_at = clock_timestamp()"
+                                " - interval '1 second' WHERE id = %s", (lot,))
+                self.assertEqual([r["id"] for r in self.st.actionable(name)], [lot])
+                row = next(r for r in storage.of(self.db).operations.listing()
+                           if r["name"] == name)
+                self.assertEqual(row["actionable_lots"], 1)
+                self.assertEqual(self.pick(worker)["lot"], str(lot))
+
+    def _qa_lot(self, name, *, freeze, verdict=None):
+        lot = work.add(self.db, title="qa lot", assignee=name, force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        work.move(self.db, lot, "qa")
+        if freeze:
+            head = "b" * 40
+            work.milestone(self.db, lot, "frozen", sha=head, actor="test")
+            if verdict:
+                work.milestone(self.db, lot, "verdict", verdict=verdict, sha=head,
+                               actor="reviewer")
+        return lot
+
+    def _future_wake(self, lot):
+        self.db.execute("UPDATE work_items SET wake_at = clock_timestamp()"
+                        " + interval '1 hour' WHERE id = %s", (lot,))
+
+    def test_blocking_verdict_primes_over_a_future_wake(self):
+        # #5037 (N2 de la revue de #5028) : la correction due n'attend pas
+        # l'échéance du réveil, ni pour le réveil ni pour le décompte.
+        name = "wake5037blocked"
+        worker = self._worker(name)
+        lot = self._qa_lot(name, freeze=True, verdict="blocked")
+        self._future_wake(lot)
+        self.assertEqual([r["id"] for r in self.st.actionable(name)], [lot])
+        row = next(r for r in storage.of(self.db).operations.listing()
+                   if r["name"] == name)
+        self.assertEqual(row["actionable_lots"], 1)
+        spec = self.pick(worker)
+        self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(lot)))
+        self.assertIn("Resuming lot #%d" % lot, spec["prompt"])
+
+    def test_missing_freeze_primes_over_a_future_wake(self):
+        # #5037 (N2) : le gel dû est un geste de l'auteur, pas une attente.
+        name = "wake5037freeze"
+        worker = self._worker(name)
+        lot = self._qa_lot(name, freeze=False)
+        self._future_wake(lot)
+        self.assertEqual([r["id"] for r in self.st.actionable(name)], [lot])
+        row = next(r for r in storage.of(self.db).operations.listing()
+                   if r["name"] == name)
+        self.assertEqual(row["actionable_lots"], 1)
+        self.assertEqual(self.pick(worker)["lot"], str(lot))
+
+    def test_qa_without_due_work_still_waits_for_its_future_wake(self):
+        # contrôle : tout lot en qa à réveil futur n'est pas rendu actionnable.
+        name = "wake5037ok"
+        worker = self._worker(name)
+        lot = self._qa_lot(name, freeze=True, verdict="ok")
+        self._future_wake(lot)
+        self.assertEqual(self.st.actionable(name), [])
+        row = next(r for r in storage.of(self.db).operations.listing()
+                   if r["name"] == name)
+        self.assertEqual(row["actionable_lots"], 0)
+        self.assertIsNone(self.pick(worker))
+
     def test_backoff_en_base_survit_au_redemarrage(self):
         worker = self._worker("r2")
         b = work.add(self.db, title="à faire", assignee="r2", force=_FORCE)["id"]
@@ -1538,6 +1624,64 @@ class ReveilTest(_Base):
         self.assertFalse(worker._moved_before_turn(spec))
         self.assertIs(worker._wake_claim, claim)
         self.assertFalse(claim["done"].is_set())
+
+    def test_reveil_reclame_puis_reassigne_ne_part_pas_et_reste_au_nouvel_assigne(self):
+        """#5006 (B1 cx2, dev3) : claim par A, réassignation vers B, tentative de
+        lancement par A — aucun harnais, rien de comptable ouvert, et l'échéance
+        revient à B à l'expiration du bail de A."""
+        worker, lot, spec = self._reveil_reclame("r7k")
+        wake_ts = work.get(self.db, lot)["wake_ts"]
+        nouveau = self._worker("r7l")
+        work.assign(self.db, lot, "r7l", actor="orch", force=_FORCE)
+        avant = len(self.turns()) if os.path.exists(self.turns_log) else 0
+        with mock.patch.dict(os.environ, {
+                "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+                "AMEESH_SESSION_STORE_CHECK": "0",
+                "AMEESH_TEST_NEW_SESSION": "sess-5006"}), \
+                mock.patch.object(worker, "_wake_outdated",
+                                  wraps=worker._wake_outdated) as garde:
+            self.assertFalse(worker.run_turn(spec))
+        garde.assert_called_once()
+        self.assertEqual(len(self.turns()) if os.path.exists(self.turns_log) else 0,
+                         avant, "aucun harnais pour l'ancien assigné")
+        self.assertEqual(registry.get(self.db, "r7k")["status"], "idle",
+                         "`begin_turn` défait : plus de place `running`")
+        self.assertIsNone(registry.pending_spend_get(self.db, "r7k"),
+                          "le marqueur comptable est retiré")
+        self.assertIsNone(worker._wake_claim)
+        self.assertEqual(work.get(self.db, lot)["wake_ts"], wake_ts, "échéance conservée")
+        self.vieillit_claim(lot)
+        again = self.redelivre(nouveau)
+        self.assertEqual(again["lot"], str(lot), "le réveil revient au nouvel assigné")
+
+    def test_consommation_apres_reassignation_laisse_l_echeance_au_nouvel_assigne(self):
+        """#5006 : réassigné entre la dernière lecture et le lancement — le tour
+        est parti, mais il ne consomme pas l'échéance du nouvel assigné."""
+        worker, lot, spec = self._reveil_reclame("r7m")
+        self.register("r7n", "claude", cwd=self._cwd("r7n"))
+        work.assign(self.db, lot, "r7n", actor="orch", force=_FORCE)
+        worker._turn_launched = True
+        worker._consume_scheduled_wake(spec)
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"])
+        self.assertFalse(any(e["note"].startswith("wake:")
+                             for e in work.events(self.db, lot)))
+
+    def test_relance_de_lot_reassigne_ne_part_pas(self):
+        """#5006 : même fenêtre pour la relance d'inactivité (`_lot_wake_spec`)."""
+        worker = self._worker("r7o")
+        lot = work.add(self.db, title="lot actif", assignee="r7o", force=_FORCE)["id"]
+        spec = {"kind": "idle", "ids": [], "lot": str(lot), "lot_wake": True,
+                "prompt": "reprends"}
+        self.assertFalse(worker._wake_outdated(spec))
+        self.register("r7p", "claude", cwd=self._cwd("r7p"))
+        work.assign(self.db, lot, "r7p", actor="orch", force=_FORCE)
+        self.assertTrue(worker._wake_outdated(spec))
+
+    def test_base_en_panne_ne_declare_pas_le_reveil_perime(self):
+        worker, _lot, spec = self._reveil_reclame("r7q")
+        with mock.patch.object(storage.of(self.db).lot_sessions, "claim_wake",
+                               side_effect=db_mod.Unavailable("témoin")):
+            self.assertFalse(worker._wake_outdated(spec))
 
     def test_reveil_programme_non_consomme_si_le_tour_n_est_pas_lance(self):
         """#2466 B1 (cx2, 2e tour) : tant que le harnais n'a pas démarré

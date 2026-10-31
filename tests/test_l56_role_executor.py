@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import secrets
 import subprocess
@@ -13,7 +14,7 @@ from unittest import mock
 
 from ameesh import migrations
 
-from ameesh import db as db_mod, mail, registry, work, modules
+from ameesh import db as db_mod, decisions, mail, registry, work, modules
 from ameesh.modules.storage import ModuleStore
 from tests.test_l317_project_modules import federation
 
@@ -246,6 +247,91 @@ class RoleExecutorTest(PgTestCase):
         with mock.patch.object(work, "_declared_merge_commit", return_value="abcdef1234"), \
                 self.assertRaises(work.WorkError):
             work.merged(self.db, lot, sha="abcdef1234")
+
+    def test_executor_appends_but_cannot_rewrite_the_signed_supersession_log(self):
+        """#4995: SELECT and INSERT (the delegated decision cycle appends one
+        event), never UPDATE nor DELETE; the append-only trigger refuses even
+        an accidental rewrite grant."""
+        q = db_mod.quote_ident
+        table = "%s.decision_supersessions" % q(self.schema)
+        for privilege in ("SELECT", "INSERT"):
+            self.assertTrue(self.db.query(
+                "SELECT has_table_privilege(%s, %s, %s) AS p",
+                (self.role, table, privilege))[0]["p"], privilege)
+        for privilege in ("UPDATE", "DELETE", "TRUNCATE", "TRIGGER"):
+            self.assertFalse(self.db.query(
+                "SELECT has_table_privilege(%s, %s, %s) AS p",
+                (self.role, table, privilege))[0]["p"], privilege)
+        decision_payload = json.dumps({"decision": {"state": "answered"}})
+        rows = self.db.query(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload) VALUES"
+            " ('a', 'human:x', 'old authority', 'request', %s::jsonb),"
+            " ('a', 'human:x', 'replacement', 'request', %s::jsonb),"
+            " ('a', 'human:x', 'delegated old', 'request', %s::jsonb),"
+            " ('a', 'human:x', 'delegated replacement', 'request', %s::jsonb)"
+            " RETURNING id",
+            (decision_payload, decision_payload, decision_payload, decision_payload))
+        old_id, new_id, delegated_old, delegated_new = sorted(
+            int(row["id"]) for row in rows)
+        self.db.execute(
+            "INSERT INTO decision_supersessions"
+            " (supersedes, superseded_by, person, occurred_at, proof)"
+            " VALUES (%s, %s, 'alice', now(), '{\"digest\": \"d\"}'::jsonb)",
+            (old_id, new_id))
+        self.db.execute(
+            "UPDATE agent_mailbox SET payload = jsonb_set(payload,"
+            " '{decision,superseded_by}', to_jsonb(%s::bigint)) WHERE id = %s",
+            (new_id, old_id))
+        # The delegated answer runs under the executor role: it appends the
+        # event and sets the marker after it, but can neither clear nor move a
+        # marker once set, nor rewrite the log.
+        result = self.as_host(
+            "INSERT INTO decision_supersessions"
+            " (supersedes, superseded_by, person, occurred_at, proof)"
+            " VALUES (%d, %d, 'alice', now(), '{\"digest\": \"d\"}'::jsonb)"
+            % (delegated_old, delegated_new))
+        self.assertEqual(result.returncode, 0, attendu(result.stderr))
+        result = self.as_host(
+            "UPDATE agent_mailbox SET payload = jsonb_set(payload,"
+            " '{decision,superseded_by}', to_jsonb(%s::bigint)) WHERE id = %d"
+            % (delegated_new, delegated_old))
+        self.assertEqual(result.returncode, 0, attendu(result.stderr))
+        for sql in ("UPDATE agent_mailbox SET payload = payload #-"
+                    " '{decision,superseded_by}' WHERE id = %d" % delegated_old,
+                    "UPDATE agent_mailbox SET payload = jsonb_set(payload,"
+                    " '{decision,superseded_by}', to_jsonb(%s::bigint)) WHERE id = %d"
+                    % (old_id, delegated_old)):
+            result = self.as_host(sql)
+            self.assertNotEqual(result.returncode, 0, sql)
+            self.assertIn("decision supersession marker is append-only", result.stderr,
+                          attendu(result.stderr))
+        for sql in ("UPDATE decision_supersessions SET person = 'x'",
+                    "DELETE FROM decision_supersessions",
+                    "TRUNCATE decision_supersessions"):
+            result = self.as_host(sql)
+            self.assertNotEqual(result.returncode, 0, sql)
+            self.assertIn("permission denied", result.stderr, attendu(result.stderr))
+        # Even an accidental grant cannot bypass the append-only trigger.
+        self.db.execute("GRANT UPDATE, DELETE ON decision_supersessions TO %s" % q(self.role))
+        try:
+            for sql in ("UPDATE decision_supersessions SET person = 'x'",
+                        "DELETE FROM decision_supersessions"):
+                result = self.as_host(sql)
+                self.assertNotEqual(result.returncode, 0, sql)
+                self.assertIn("append-only", result.stderr, attendu(result.stderr))
+        finally:
+            self.db.execute("REVOKE UPDATE, DELETE ON decision_supersessions FROM %s"
+                            % q(self.role))
+        self.assertEqual(sorted(
+            (int(row["supersedes"]), int(row["superseded_by"]))
+            for row in self.db.query(
+                "SELECT supersedes, superseded_by FROM decision_supersessions")),
+            [(old_id, new_id), (delegated_old, delegated_new)])
+        self.assertEqual(sorted(
+            int(row["marker"]) for row in self.db.query(
+                "SELECT payload->'decision'->>'superseded_by' AS marker"
+                " FROM agent_mailbox WHERE id IN (%s, %s)", (old_id, delegated_old))),
+            [new_id, delegated_new])
 
     def test_event_log_grant_reaches_an_isolated_writer(self):
         """R2 auditeur P2-2: migration 0396's triggers write `ameesh_events`
@@ -746,6 +832,25 @@ class RoleExecutorTest(PgTestCase):
                     '-v','role='+controller,'-f',str(sql)], env=env, text=True,capture_output=True,timeout=60)
                 self.assertEqual(result.returncode,0,result.stderr)
             registry.upsert(self.db,'release-worker',harness='other',host='synthetic-host')
+            self.assertTrue(self.db.query(
+                'SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                (controller, self.schema + '.decision_supersessions',
+                 'SELECT'))[0]['allowed'])
+            # #4995: the controller re-reads the signed replacement log at every
+            # step; it must reach the same refusal under its own role, not a
+            # permission error.
+            decision_payload = json.dumps({"decision": {"state": "answered"}})
+            rows = self.db.query(
+                "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
+                " VALUES ('a', 'human:x', 'old', 'request', %s::jsonb),"
+                " ('a', 'human:x', 'new', 'request', %s::jsonb) RETURNING id",
+                (decision_payload, decision_payload))
+            old_decision, new_decision = sorted(int(row["id"]) for row in rows)
+            self.db.execute(
+                "INSERT INTO decision_supersessions"
+                " (supersedes, superseded_by, person, occurred_at, proof)"
+                " VALUES (%s, %s, 'alice', now(), '{}'::jsonb)",
+                (old_decision, new_decision))
             with self.db.transaction() as tx:
                 tx.execute('SET LOCAL ROLE %s' % q(controller))
                 tx.query('SELECT name FROM agent_registry WHERE name=%s FOR UPDATE',('release-worker',))
@@ -753,8 +858,15 @@ class RoleExecutorTest(PgTestCase):
                            ('controller-fixture','synthetic-host','a'*64))
                 tx.execute('INSERT INTO host_release_fences(host,operation,probe) VALUES (%s,%s,%s)',
                            ('synthetic-host','controller-fixture','synthetic-probe'))
-                for relation in ('agent_mailbox','mesh_approvals','mesh_consumed_nonces','turn_resources','spend_pending'):
+                for relation in ('agent_mailbox','mesh_approvals','mesh_consumed_nonces','turn_resources','spend_pending','decision_supersessions'):
                     tx.query('SELECT * FROM '+q(relation)+' LIMIT 0')
+                # #4995: the real authority read, under the controller role: it
+                # sees the logged event and refuses the old authority because
+                # the replacement carries no signed answer (no permission error).
+                view = decisions.get(tx, old_decision)
+                with self.assertRaisesRegex(decisions.DecisionError,
+                                            'not a signed replacement'):
+                    decisions.require_current(tx, view)
                 tx.query('SELECT * FROM mesh_approvals_status LIMIT 0')
                 # SignedDecisionAuthority re-reads the owner key at every step.
                 tx.query('SELECT name, holder, public_key, public_key_fingerprint, key_role,'
@@ -771,6 +883,42 @@ class RoleExecutorTest(PgTestCase):
                 '-v','role='+controller,'-f',str(sql)], env=env,text=True,capture_output=True,timeout=60)
             self.assertNotEqual(result.returncode,0)
             self.assertIn('unrelated column write privilege',result.stderr,
+                          attendu(result.stderr))
+        finally:
+            if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
+                self.db.execute('DROP OWNED BY %s' % q(controller))
+                self.db.execute('DROP ROLE %s' % q(controller))
+
+    def test_controller_audit_refuses_an_enrollment_without_the_supersession_read(self):
+        """#4995: the authority gate reads the signed replacement log; an
+        enrollment that cannot read it must not pass the audit."""
+        from pathlib import Path
+        q = db_mod.quote_ident
+        controller = 't_release_controller_' + uuid.uuid4().hex[:8]
+        sql = Path(REPO,'deploy/sql/role-release-controller.sql')
+        env = dict(os.environ, PGOPTIONS='-c search_path='+self.schema)
+        command = ['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                   '-v','role='+controller,'-f',str(sql)]
+        try:
+            result = subprocess.run(command, env=env, text=True,
+                                    capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # The script grants the read itself; revoke it and remove that one
+            # grant from a copy to exercise the audit's fail-closed check.
+            self.db.execute('REVOKE SELECT ON decision_supersessions FROM %s'
+                            % q(controller))
+            source = sql.read_text(encoding='utf-8')
+            self.assertIn(',%I.decision_supersessions TO %I', source)
+            patched = source.replace(',%I.decision_supersessions TO %I', ' TO %I', 1)
+            head, tail = patched.split("SELECT format('GRANT SELECT ON", 1)
+            patched = (head + "SELECT format('GRANT SELECT ON"
+                       + tail.replace(":'schema',", "", 1))
+            without_read = Path(self.tmp) / 'role-release-controller-no-log.sql'
+            without_read.write_text(patched, encoding='utf-8')
+            result = subprocess.run(command[:-1] + [str(without_read)], env=env,
+                                    text=True, capture_output=True, timeout=60)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('lacks SELECT on decision_supersessions', result.stderr,
                           attendu(result.stderr))
         finally:
             if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):

@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# #2448 — one tick every five minutes; the command reads the compiled cutoffs.
+# #2448 — one tick every minute on each elected candidate; the command reads the compiled cutoffs.
 # `Persistent=true` replays a tick missed during a reboot; a cutoff older than
 # its window is reported as missed, never run late.
 [Unit]
 Description=Nexlink release tick (#3529)
 
 [Timer]
-OnCalendar=*:0/5
-AccuracySec=30s
+OnBootSec=1min
+OnUnitActiveSec=60s
+AccuracySec=1s
 Persistent=true
 
 [Install]

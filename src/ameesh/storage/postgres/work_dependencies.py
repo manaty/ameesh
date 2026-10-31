@@ -76,6 +76,22 @@ def freeze_due(alias: str) -> str:
             " AND coalesce(to_jsonb({a})->>'reviewer', '') <> '-none')").format(a=alias)
 
 
+def wake_defers(alias: str) -> str:
+    """#5037 : ce réveil programmé futur écarte-t-il encore ce lot ?
+
+    Un réveil futur vaut attente (#5028), sauf quand une correction est due :
+    un lot en `qa` sans gel déclaré (`freeze_due`) ou à verdict courant
+    bloquant attend un geste de son auteur, pas l'échéance. Le réveil ne le
+    sort donc ni des lots actionnables ni de ceux qui occupent l'agent (N2 de
+    la revue de #5028). `False` (aucune attente par réveil) sans réveil
+    futur ; l'appelant écrit `AND NOT ` + ce prédicat.
+    """
+    return ("({a}.wake_at IS NOT NULL AND {a}.wake_at > clock_timestamp()"
+            " AND NOT ({a}.state = '{qa}' AND (" + freeze_due(alias) + " OR "
+            + current_verdict(alias) + " = 'blocked')))").format(
+                a=alias, qa=lifecycle.QA)
+
+
 def not_blocking(alias: str) -> str:
     """#2252 : prédicat SQL « ce lot ne bloque plus » — il est FUSIONNÉ
     (`merged`/`promoted`/`closed`). Un lot en `qa`, même à verdict courant
@@ -158,10 +174,14 @@ class WorkDependencies(Contract):
         ids = sorted({int(i) for i in item_ids})
         if not ids:
             return []
+        # #4621 : la cause dependency-blocking nomme la phase de livraison
+        # (`merged`/`promoted`), comme les états de policy, pas le core
+        # `delivered`. Le prédicat `blocking` garde sa définition (lifecycle
+        # DELIVERED) : seul l'affichage change.
         return self.db.query("""
             SELECT d.work_item_id, d.blocker_id, d.created_by,
                    extract(epoch FROM d.created_at)::float8 AS created_ts,
-                   w.state AS blocker_state,
+                   coalesce(to_jsonb(w)->>'legacy_state', w.state) AS blocker_state,
                    w.branch AS blocker_branch,
                    (SELECT m.sha FROM work_item_milestones m
                      WHERE m.work_item_id = w.id AND m.kind = 'frozen'

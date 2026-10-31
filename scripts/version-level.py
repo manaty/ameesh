@@ -701,7 +701,9 @@ def level(base: str, head: str) -> tuple[str, list[str]]:
     for line in git("diff", "--name-status", "--no-renames", base, head,
                     "--", MIGRATIONS).splitlines():
         status, _, name = line.partition("\t")
-        if not name.endswith(".sql"):
+        if not name.endswith(".sql") or "/" in name.removeprefix(MIGRATIONS):
+            # Match migration discovery: only direct children run on upgrade.
+            # Operator rollback scripts are deliberately outside that set.
             continue
         if status != "A":
             reasons["major"].append("migration %s %s" % (

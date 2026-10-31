@@ -737,7 +737,14 @@ def _close_facts(tx: Any, command: Command) -> tuple[str, int | None, str]:
     (`sha`, 7 to 64 hex) that the `delivered` milestone persists.
     """
     evidence = command.evidence if isinstance(command.evidence, Mapping) else {}
-    reason = str(evidence.get("close_reason") or "").strip()
+    # stop_work publishes `reason`; retain the native contract for other
+    # guards and older callers, without rewriting the receipted intent.
+    key = ("reason" if command.guard == "stop_work" and "reason" in evidence
+           else "close_reason")
+    reason = str(evidence.get(key) or "").strip()
+    if (key == "reason" and "close_reason" in evidence
+            and evidence["close_reason"] != reason):
+        raise RegistryRefusal("close-reason", "conflicting closure reasons")
     if reason not in CLOSE_REASONS:
         raise RegistryRefusal(
             "close-reason",
@@ -747,6 +754,8 @@ def _close_facts(tx: Any, command: Command) -> tuple[str, int | None, str]:
     sha = ""
     if reason == "superseded":
         value = evidence.get("superseded_by")
+        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            value = int(value)
         if not _is_int(value) or int(value) <= 0:
             raise RegistryRefusal(
                 "superseded-unknown",

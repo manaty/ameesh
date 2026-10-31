@@ -1575,6 +1575,8 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
              repos_part: float | None, repos_s: float | None,
              canons=(), configured: bool = False,
              held: Mapping[str, str] | None = None,
+             families: Iterable[str] = (),
+             excluded_families: Iterable[str] = (),
              gating_ok: bool = True,
              rule_source: str = "") -> dict:
     """La section `capacity` du débit (spec #3256 §3.1), sans I/O.
@@ -1584,15 +1586,22 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       exécution, ni éphémère, ni chat, ni arrêté, ni en pause, ni critique ni
       relecteur — `critical_verdict` sur `canons`, `configured`), et en
       plus ni retiré (`retired_ts`), ni sans exécuteur vivant
-      (`_awake_runner`), ni tenu par son budget (`held`). Il compte dans le
+      (`_awake_runner`), ni tenu par son budget (`held`), ni d'une famille
+      exclue des prises (`excluded_families`, #5005 : cette capacité-là est
+      volontairement écartée, elle n'est pas une perte). `families` est la
+      liste du canon qui lit la famille d'un harnais. Il compte dans le
       projet primaire de sa fiche, et une fois au mesh.
     * **au repos depuis `repos_s`** : sans lot actionnable (`idle_agents`)
       et sans tour sur un lot depuis `repos_s` ; `idle_share` = au repos /
       réveillables.
     * `idle_agent_hours` : sur la fenêtre, le temps hors tour sur un lot des
-      agents réveillables, par intervalles d'au moins `repos_s`. L'état
-      réveillable est celui de l'instant ; un agent d'un projet à la feuille
-      de route épuisée ne compte d'heures ni dans son projet ni au mesh.
+      agents **au repos** (les seuls comptés dans `idle`), par intervalles
+      d'au moins `repos_s`. Un agent qui garde un lot actionnable, dont le
+      budget tient le tour, ou qu'une famille exclut n'est pas une capacité
+      disponible : ses trous ne comptent pas, pour que la perte affichée soit
+      celle des agents qu'on peut réellement réveiller.
+      L'état réveillable est celui de l'instant ; un agent d'un projet à la
+      feuille de route épuisée ne compte d'heures ni dans son projet ni au mesh.
     * `startable` : les lots démarrables (`split_startable`) ; `footprint` :
       `{lot: [bloqueurs]}` des lots d'intake retenus par la garde d'empreinte
       (#3185, #4561) — ils ne sont jamais démarrables, ils attendent la fusion
@@ -1624,10 +1633,17 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     spans = _busy_spans(turns, start, now)
     last_lot_turn = {name: values[-1][1] for name, values in spans.items()}
 
+    excluded = {str(name).strip().lower() for name in excluded_families or () if name}
+    known_families = tuple(families or ())
+    family_of = None
+    if excluded:
+        from .review_lot import family_of
     awake = [row for row in file_decoupage.wakeable(rows, list(canons or ()),
                                                     configured=configured)
              if not row.get("retired_ts") and sous_utilisation._awake_runner(row)
-             and row["name"] not in held]
+             and row["name"] not in held
+             and not (family_of is not None
+                      and family_of(row.get("harness"), known_families) in excluded)]
     idle_now = {row["name"] for row in sous_utilisation.idle_agents(
         awake, now, min_gap, waiting_free=True, actionable_idle=True)}
     rested = {name for name in idle_now
@@ -1654,9 +1670,13 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
                 "assignee": other.get("assignee") or blocker.get("assignee") or None,
                 "stalled_s": (int(max(0.0, now - float(last)))
                               if last is not None else None)})
+        # #4818 : la raison de l'attente — chevauchement, ou plafond de lots
+        # en vol du dépôt (tous ses occupants le retiennent alors)
+        reason = ("cap" if blockers and all(b.get("reason") == "cap" for b in blockers)
+                  else "overlap")
         footprint_by.setdefault(project, []).append({
             "lot": ident, "state": lot.get("state") or "",
-            "blockers": delayed})
+            "reason": reason, "blockers": delayed})
     startable = [dict(lot) for lot in startable or ()
                  if int(lot["id"]) not in footprint]
     startable_by: dict[str, list[int]] = {}
@@ -1701,9 +1721,12 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         names = sorted(row["name"] for row in members)
         idle = sorted(name for name in names if name in rested)
         # un agent d'un projet à la feuille de route épuisée ne compte
-        # d'heures au repos ni dans son projet, ni au mesh
+        # d'heures au repos ni dans son projet, ni au mesh ; seuls les
+        # agents au repos en comptent (ni lot actionnable, ni pause budget,
+        # ni famille exclue) : les trous d'un agent occupé ne sont pas de la
+        # capacité disponible (#5043)
         seconds = sum(_idle_gaps(spans.get(name, []), start, now, min_gap)
-                      for name in names if primary.get(name) not in exhausted)
+                      for name in idle if primary.get(name) not in exhausted)
         share = (len(idle) / len(names)) if names else 0.0
         return {"wakeable": len(names), "idle": len(idle), "idle_agents": idle,
                 "idle_share": round(share, 4),
@@ -1790,6 +1813,10 @@ def _footprint_gesture(rows: Iterable[Mapping[str, Any]]) -> str:
             tail = " ; sans mouvement depuis %s : %s" % (
                 _duration(stalled[0].get("stalled_s")),
                 ", ".join("#%d" % int(blocker["id"]) for blocker in stalled))
+        if row.get("reason") == "cap":
+            parts.append("#%d (%s) attend le plafond de lots en vol du dépôt (%s)%s"
+                         % (int(row["lot"]), row.get("state") or "intake", names, tail))
+            continue
         parts.append("#%d (%s) attend %s%s"
                      % (int(row["lot"]), row.get("state") or "intake", names, tail))
     return ("lots en attente d'empreinte : %s — le geste dû porte sur le lot "
@@ -2216,14 +2243,18 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
 
     # Le seuil absent n'est pas une lecture en échec du débit : il est dit
     # dans la section (`rule_error`), qui ne lève alors aucune alerte.
-    rule, rule_error = None, ""
+    rule, rule_error, document = None, "", None
     try:
-        rule = mechanics.configured(cfg).queue_fill if cfg is not None else None
+        document = mechanics.configured(cfg) if cfg is not None else None
+        rule = document.queue_fill if document is not None else None
         if rule is None:
             rule_error = ("no `file` block in the canon mechanics "
                           "(file.repos_part, file.repos_s)")
     except Exception as exc:  # noqa: BLE001 - canon illisible : dit
         rule_error = "canon mechanics unreadable: %s" % " ".join(str(exc).split())[:160]
+    families = tuple(document.families) if document is not None else ()
+    excluded_families = (tuple(document.auto_take_excluded_families(now))
+                         if document is not None else ())
     store = storage.of(db)
     horizon = now - EVENT_DAYS * 86400
     listing = attempt("agents", store.operations.listing, [])
@@ -2290,6 +2321,7 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
                    repos_s=rule.repos_s if rule else None,
                    canons=list(canons or []),
                    configured=bool(canons) or cfg is not None, held=held,
+                   families=families, excluded_families=excluded_families,
                    gating_ok=bool(listing) and not failed,
                    rule_source=mechanics.PATH if rule else "")
     if rule_error:

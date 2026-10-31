@@ -1332,8 +1332,11 @@ def _newest(top: str, *, deadline: float) -> float | None:
     return newest
 
 
-def _holders(entry: str) -> list[dict]:
-    return platform.holders(entry, mapped=True)
+def _holders(entry: str, *, allow=()) -> list[dict]:
+    # #5029/#5046 : l'appelant passe la politique d'illisibilité de l'hôte
+    # (`policy.housekeeping.unreadable_ok`) ;
+    # l'exécuteur ne tient jamais un cache de dépendances.
+    return platform.holders(entry, mapped=True, allow=allow)
 
 
 def entries(cache_root: str) -> list[dict]:
@@ -1369,7 +1372,7 @@ def entries(cache_root: str) -> list[dict]:
 def gc_node_modules(cache_root: str, *, now: float | None = None,
                     idle: float = DEFAULT_DEPS_IDLE_S, dry_run: bool = False,
                     worktrees=None, holders=None, budget=None,
-                    reserve: float = 0.0) -> list[dict]:
+                    reserve: float = 0.0, allow=()) -> list[dict]:
     """Delete the entries no worktree links to any more and partial ones left
     by a dead fill. A complete entry goes only after `idle` (at least GRACE_S)
     since its creation, its last link and the last time a link to it was seen
@@ -1381,6 +1384,10 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
     broken-link scan). Lock files are never deleted: two fillers lock the same
     inode. Returns housekeeping log lines (`kind` "deps").
 
+    `allow` is the host's explicit unreadable-process policy, passed to
+    platform.holders for complete entries and abandoned fills alike. Unknown
+    unreadable processes remain blocking; observed holders always block.
+
     `budget` (#3802), a `housekeeping.PassBudget`: the loop stops at its next
     entry when the pass budget is spent, without starting another deletion.
     `reserve` keeps that many seconds for the phases that follow (worktrees,
@@ -1389,7 +1396,9 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
     omitted worktree), and the kept line says it. The check is made again
     under the lock, right before the deletion (#3802 B/P1, cx1)."""
     now = time.time() if now is None else float(now)
-    holders = holders or _holders
+    # #5046: the same explicit host policy as tmp/worktrees. An actual
+    # observed holder still blocks; only an allowed unreadable daemon is excused.
+    holders = holders or (lambda entry: _holders(entry, allow=allow))
     root = nm_root(cache_root)
     out = []
     known = None

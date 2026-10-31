@@ -756,6 +756,84 @@ class WatcherTest(PgTestCase):
         texte = "\n".join(ci.render_status(report))
         self.assertIn("red  2 failure(s)", texte)
 
+    def _deux_suites(self, sha):
+        """#5044 : deux workflows sur la même tête du lot, tous deux en cours."""
+        self.api.workflows = ["backend-suite.yml", "website-suite.yml"]
+        self.api.live = [run_view(221, sha, "lot/1-un", workflow="backend-suite.yml"),
+                         run_view(222, sha, "lot/1-un", workflow="website-suite.yml")]
+        self.assertEqual(self.watcher.tick(self.db), [])
+
+    def _termine(self, run_id, conclusion):
+        path = next(r["path"] for r in self.api.live if r["id"] == run_id)
+        self.api.live = [r for r in self.api.live if r["id"] != run_id]
+        self.api.done[run_id] = completed(path, conclusion)
+        return self.watcher.tick(self.db)
+
+    def test_5044_seul_le_dernier_verdict_d_une_tete_reveille(self):
+        self._deux_suites("e1" * 20)
+        self._termine(221, "success")
+        (vert,) = self.mails("dev-a")
+        self.assertEqual(mail.passive_reason(vert), "info")
+        self.assertIn("still running: website-suite.yml", vert["body"])
+        self._termine(222, "success")
+        self.assertEqual(mail.passive_reason(self.mails("dev-a")[-1]), "")
+
+    def test_5044_rouge_non_annonce_reveille_meme_avant_la_fin(self):
+        self._deux_suites("e2" * 20)
+        self._termine(221, "failure")
+        (rouge,) = self.mails("dev-a")
+        self.assertEqual(mail.passive_reason(rouge), "")
+
+    def test_5044_rouge_deja_annonce_passif_avant_la_fin(self):
+        sha = "e3" * 20
+        # la base de cette suite est connue : le premier échec est urgent
+        st = storage.of(self.db)
+        st.ci.open_run(DEPOT, 101, head_sha="1" * 40, branch="main", event="push",
+                       base="main", work_item_id=None, url=None,
+                       workflow="backend-suite.yml")
+        st.ci.conclude(DEPOT, 101, "success")
+        self._deux_suites(sha)
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=221)])]
+        self.watcher.tick(self.db)
+        premier = self.mails("dev-a")[0]
+        self.assertTrue(mail.is_urgent(premier))
+        self._termine(221, "failure")
+        self.assertEqual(mail.passive_reason(self.mails("dev-a")[-1]), "info")
+        self._termine(222, "success")
+        self.assertEqual(mail.passive_reason(self.mails("dev-a")[-1]), "")
+
+    def test_5044_echecs_suivants_passifs(self):
+        sha = "e4" * 20
+        self.api.live = [run_view(223, sha, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=223)])]
+        self.watcher.tick(self.db)
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=223),
+                                           ev_test("tests.test_b.T.test_2", execution=223)])]
+        self.watcher.tick(self.db)
+        premier, suivant = self.mails("dev-a")
+        self.assertEqual(mail.passive_reason(premier), "")
+        self.assertTrue(mail.is_urgent(premier))
+        self.assertEqual(mail.passive_reason(suivant), "info")
+        self.assertIn("tests.test_b.T.test_2", suivant["body"])
+
+    def test_5044_dernier_annule_reveille_a_la_place_du_verdict(self):
+        """Le signal d'action : sans cet avis, un agent au repos ne lirait jamais
+        le verdict passif de la suite déjà conclue."""
+        self._deux_suites("e5" * 20)
+        self._termine(221, "success")
+        self._termine(222, "cancelled")
+        passif, avis = self.mails("dev-a")
+        self.assertEqual(mail.passive_reason(passif), "info")
+        self.assertEqual(mail.passive_reason(avis), "")
+        self.assertIn("backend-suite.yml success", avis["body"])
+
+    def test_5044_annule_seul_reste_muet(self):
+        self.api.live = [run_view(224, "e6" * 20, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self._termine(224, "cancelled")
+        self.assertEqual(self.mails("dev-a"), [])
+
     def test_rouge_sans_flux_lit_les_not_ok_tap(self):
         """#3783 : un job `node --test` rouge sans flux JSON donne ses tests.
 

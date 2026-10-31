@@ -68,6 +68,19 @@ class HostIdleTest(unittest.TestCase):
             self.assertEqual(self.project(agents=[agent], lots=[dict(lot, wake_ts=wake)],
                                          holds={42: dict(since=7000)})['state'], 'busy')
 
+    def test_future_wake_releases_parked_session_until_near_deadline(self):
+        lot = dict(id=42, state='build', assignee='worker', updated_ts=7000,
+                   wake_ts=NOW + 3600)
+        agent = self.agent(session_work_item='42', session_lot_state='build')
+        out = self.project(agents=[agent], lots=[lot])
+        self.assertEqual(out['leases'], 0)
+        self.assertEqual(out['state'], 'idle')
+        for wake in (NOW + 60, NOW):
+            self.assertEqual(self.project(agents=[agent], lots=[dict(lot, wake_ts=wake)])['state'],
+                             'busy')
+        self.assertEqual(self.project(agents=[dict(agent, status='running')], lots=[lot])['state'],
+                         'busy')
+
     def test_recent_activity_resets_the_window(self):
         for key in ('status_since_ts', 'last_turn_ts', 'last_turn_recorded_ts'):
             self.assertEqual(self.project(agents=[self.agent(**{key: NOW - 100})])['state'], 'busy')

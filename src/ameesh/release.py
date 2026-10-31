@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
+import argparse
 import re
 import sys
 import time
@@ -292,15 +294,24 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
 
 def _report_error(cfg, db, project, exc, now: float) -> None:
     """Mail a definitive error once; transient errors go to the journal only."""
-    from . import mail, release_cutoff
+    from . import release_cutoff
     if isinstance(exc, release_cutoff.TransientReleaseError):
         return
     try:
         state = release_cutoff.load_state(cfg)
         slot = release_cutoff.project_state(state, project.name)
         text = str(exc)
-        if slot.get("last_error") == text:
+        try:
+            rules, _source = release_cutoff.compiled_rules(cfg, project.name)
+            cutoff_at, _label = release_cutoff.cutoff_slot(rules, now)
+        except release_cutoff.ReleaseError:
+            # A missing calendar can itself be the failure being reported.
+            # Keep the previous once-per-error behavior until it is readable.
+            cutoff_at, _label = None, ""
+        if (slot.get("last_error") == text
+                and slot.get("last_error_cutoff") == cutoff_at):
             return
+        slot["last_error_cutoff"] = cutoff_at
         slot["last_error"] = text
         slot["last_error_at"] = now
         release_cutoff.save_state(cfg, state)
@@ -311,8 +322,13 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
                     "Release %s NON faite : %s\n\nAucun tag, aucun déploiement. "
                     "Corrige la cause ; le prochain tick réessaiera tant que la "
                     "coupure est dans sa fenêtre." % (project.name, text))
-            mail.send(db, work.SYSTEM_SENDER, project.report, body,
-                      kind="event", payload={"release_error": text, "urgent": True})
+            report = {"schema": release_cutoff.SCHEMA, "result": "refused",
+                      "project": project.name, "cutoff_at": cutoff_at,
+                      "label": _label, "completed_at": now, "message": text}
+            if cutoff_at is not None:
+                report["report_path"] = release_cutoff.write_report(
+                    cfg, project, dict(report, version="refused"))
+            release_cutoff.send_report(cfg, db, project, body, report, urgent=True)
     except Exception:  # a report never masks the original error
         pass
 
@@ -431,10 +447,62 @@ def _packet_watch(cfg, args) -> int:
     return status
 
 
+def _elected_tick(cfg, args):
+    """Return the elected wrapper status, or None inside its fenced child."""
+    role = (getattr(cfg, "release", None) or {}).get("role")
+    watch_role = (getattr(cfg, "packet_watch", None) or {}).get("role")
+    if role and watch_role and role != watch_role:
+        raise ReleaseError("release.role and packet_watch.role must agree")
+    role = role or watch_role
+    if not role:
+        return None  # compatibility until the bureau migrates host units
+    # Validate the independent staging route before acquiring an execution
+    # lease: synchronous staging may restart the runner that owns this role.
+    from . import release_cutoff
+    release_cutoff.projects(cfg)
+    from . import role_run, pilot_gesture
+    wrapped_role = (os.environ.get(role_run.ENV_ROLE) or "").strip()
+    if wrapped_role and os.environ.get(role_run.ENV_PASS) == "release":
+        from .db import open_db
+        db = open_db(cfg)
+        try:
+            # The wrapper exports the canonical registry name, even when its
+            # configured role was an alias. Never acquire a second pass here.
+            if wrapped_role != role:
+                configured_role = role_run.live(db, role)["role"]
+                if configured_role != wrapped_role:
+                    raise pilot_gesture.GestureRefused(
+                        "release child does not match the configured role")
+            fence = pilot_gesture.gate(cfg, db, "release", "release " + args.release_command)
+            if fence is None:
+                raise pilot_gesture.GestureRefused("release tick requires an elected role")
+            # The runner alone renews the role; a timer must not keep a dead
+            # runner elected. The wrapper watches its live epoch throughout.
+        finally:
+            db.close()
+        return None
+    command = [sys.executable, "-m", "ameesh", "release", args.release_command]
+    for name in ("project", "now", "version", "actor"):
+        value = getattr(args, name, None)
+        if value is not None:
+            command += ["--" + name, str(value)]
+    for name in ("force", "no_staging", "json", "dry_run", "apply"):
+        if getattr(args, name, False):
+            command.append("--" + name.replace("_", "-"))
+    return role_run.run(cfg, argparse.Namespace(
+        role=role, pass_name="release", command=command,
+        min_left=0, dry_run=False, json=False))
+
+
 def run(cfg, args) -> int:
     """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch`."""
     from . import release_cutoff
     command = args.release_command
+    if (command in ("tick", "packet-watch", "cutoff")
+            or command == "staging-needed" and getattr(args, "apply", False)):
+        status = _elected_tick(cfg, args)
+        if status is not None:
+            return status
     if command == "staging-needed":
         from . import staging_pending
         from .db import open_db

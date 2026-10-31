@@ -30,9 +30,11 @@ injected: it opens the next harness turn, as when it arrives just after the
 last tool call), `FAKE_CLAUDE_PUSH_AFTER` (seconds after an `initialize`
 answer before the harness pushes its `system/commands_changed` event, as the
 real CLI does asynchronously — #1337), `FAKE_CLAUDE_MODEL_USAGE` (JSON
-`modelUsage` map, CTX-03), `FAKE_COMPACT_NO_POST=1` (a compaction boundary
-without an after, CTX-03), `FAKE_CODEX_STEER_REFUSE=1` (`turn/steer` always
-refused), `FAKE_START_DELAY` (seconds before answering `initialize`).
+`modelUsage` map, CTX-03), `FAKE_CLAUDE_SUBAGENT_MODEL` (a sub-agent
+`system/init` carrying that model and a `parent_tool_use_id`, #4892),
+`FAKE_COMPACT_NO_POST=1` (a compaction boundary without an after, CTX-03),
+`FAKE_CODEX_STEER_REFUSE=1` (`turn/steer` always refused), `FAKE_START_DELAY`
+(seconds before answering `initialize`).
 """
 from __future__ import annotations
 
@@ -187,6 +189,12 @@ class Claude:
     def turn(self, first: dict) -> None:
         out({"type": "system", "subtype": "init", "session_id": self.session,
              "model": "fake-model"})
+        # #4892 : un sous-agent annonce son propre modèle ; cet init ne doit
+        # jamais devenir le modèle effectif du fil principal.
+        subagent_model = os.environ.get("FAKE_CLAUDE_SUBAGENT_MODEL")
+        if subagent_model:
+            out({"type": "system", "subtype": "init", "session_id": "sess-aux",
+                 "parent_tool_use_id": "toolu-aux", "model": subagent_model})
         texts = [self.replay(first)]
         trace({"user": texts[0]})
         # #2894 : the harness's own turn document, as handed at launch. Kept

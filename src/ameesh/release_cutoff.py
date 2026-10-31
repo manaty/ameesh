@@ -805,10 +805,16 @@ def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100
 def version_floor(repo: str, since: str, target: str) -> tuple[str, str]:
     """The `version-level.py` floor of the range, or `unknown`."""
     script = os.path.join(repo, "scripts", "version-level.py")
-    if not os.path.isfile(script):
-        return "unknown", "scripts/version-level.py absent"
+    # The operator checkout can lag behind its fetched target. Use the
+    # candidate's analyzer (including CLI refactor support), not that checkout.
+    source = _git(repo, "show", "%s:scripts/version-level.py" % target)
+    if source.returncode:
+        return "unknown", "scripts/version-level.py absent at %s" % target
     try:
-        proc = subprocess.run([sys.executable, script, "level", since, target],
+        launcher = ("import sys; __file__ = sys.argv.pop(1); "
+                    "exec(compile(sys.stdin.read(), __file__, 'exec'))")
+        proc = subprocess.run([sys.executable, "-c", launcher, script,
+                               "level", since, target], input=source.stdout,
                               capture_output=True, text=True, cwd=repo, timeout=300.0)
     except (subprocess.TimeoutExpired, OSError) as exc:
         return "unknown", "version-level.py: %s" % exc
@@ -980,7 +986,8 @@ def migrations_between(repo: str, since: str, target: str) -> list[str]:
     names = _out(repo, "diff", "--name-only", "%s..%s" % (since, target),
                  "--", "src/ameesh/migrations")
     return sorted({os.path.basename(name) for name in names.splitlines()
-                   if name.endswith(".sql")})
+                   if name.endswith(".sql")
+                   and os.path.dirname(name) == "src/ameesh/migrations"})
 
 
 def generate_notes(*, project: "ProjectRelease", repo: str, since: str, target: str,
@@ -1121,6 +1128,13 @@ class ProjectRelease:
                                     or "staging" in entry):
             raise ReleaseError("nexlink model requires project nexlink, target develop, "
                                "and its closed staging workflow list (no staging script)")
+        elected_role = ((getattr(cfg, "release", None) or {}).get("role")
+                        or (getattr(cfg, "packet_watch", None) or {}).get("role"))
+        executor = entry.get("staging_executor")
+        if (elected_role and model != "nexlink"
+                and (not isinstance(executor, str) or not executor.strip())):
+            raise ReleaseError("release.projects.%s.staging_executor is required under an "
+                               "elected role: synchronous staging can restart its pilot" % name)
         bump = entry.get("version_bump", "level")
         if bump not in ("level", "patch"):
             raise ReleaseError("release.projects.%s.version_bump: level | patch" % name)
@@ -1157,11 +1171,14 @@ def projects(cfg) -> dict[str, ProjectRelease]:
     block = getattr(cfg, "release", None) or {}
     if not isinstance(block, dict):
         raise ReleaseError("release: an object is required")
-    unknown = set(block) - {"host", "projects"}
+    unknown = set(block) - {"host", "role", "projects"}
     if unknown:
         raise ReleaseError("release: unknown key(s) %s" % ", ".join(sorted(unknown)))
     host = block.get("host")
-    if host and str(host) != cfg.host:
+    role = block.get("role")
+    if role is not None and (not isinstance(role, str) or not role.strip()):
+        raise ReleaseError("release.role: a non-empty role name is required")
+    if not role and host and str(host) != cfg.host:
         return {}
     declared = block.get("projects") or {}
     if not isinstance(declared, dict):
@@ -1680,8 +1697,8 @@ def rerun_head(project: "ProjectRelease", plan: "Plan") -> list:
                 for row in rows]
 
 
-def _worktree(repo: str, sha: str) -> tuple[str, str]:
-    folder = tempfile.mkdtemp(prefix="ameesh-release-", dir=os.path.dirname(repo) or None)
+def _worktree(repo: str, sha: str, *, prefix: str = "ameesh-release-") -> tuple[str, str]:
+    folder = tempfile.mkdtemp(prefix=prefix, dir=os.path.dirname(repo) or None)
     path = os.path.join(folder, "worktree")
     proc = _git(repo, "worktree", "add", "--detach", path, sha)
     if proc.returncode:
@@ -2516,11 +2533,18 @@ def execute(cfg, db, project: ProjectRelease, *, now: float | None = None,
                   "completed_at": time.time(),
                   "message": "cutoff missed: the tick started more than %ss after it"
                              % int(project.window_s)}
+        failure = state_slot.get("last_error")
+        failure_at = float(state_slot.get("last_error_at") or 0)
+        detail = ""
+        if failure and at <= failure_at <= now:
+            report["attempt_error"] = failure
+            report["message"] = "cutoff failed in its window: %s" % failure
+            detail = " Échec pendant la fenêtre : %s." % failure
         if db is not None:
             send_report(cfg, db, project, "Release %s NON faite : coupure %s du %s manquée "
                         "(démarrage hors fenêtre de %ss). Rien n'a été publié ni déployé."
                         % (project.name, label, cutoff_date(at, rules),
-                           int(project.window_s)), report, urgent=True)
+                           int(project.window_s)) + detail, report, urgent=True)
         return report
 
     lock = os.path.join(cfg.state_dir, "release", "release.lock")

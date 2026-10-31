@@ -13,8 +13,12 @@ SELECT set_config('ameesh.release_role', :'role', true) \g /dev/null
 SELECT format('CREATE ROLE %I NOLOGIN', :'role')
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname=:'role') \gexec
 SELECT format('GRANT USAGE ON SCHEMA %I TO %I', :'schema', :'role') \gexec
-SELECT format('GRANT SELECT ON %I.agent_registry,%I.agent_mailbox,%I.mesh_approvals,%I.mesh_consumed_nonces,%I.turn_resources,%I.spend_pending,%I.host_release_operations,%I.host_release_fences,%I.host_release_fence_receipts TO %I',
-              :'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'role') \gexec
+-- #4995: the authority gate re-reads the signed replacement log
+-- (decisions.require_current); the controller needs SELECT on it, never a
+-- write. This script is the (re)enrollment source, and migration 0527 grants
+-- the same SELECT to controllers already enrolled.
+SELECT format('GRANT SELECT ON %I.agent_registry,%I.agent_mailbox,%I.mesh_approvals,%I.mesh_consumed_nonces,%I.turn_resources,%I.spend_pending,%I.host_release_operations,%I.host_release_fences,%I.host_release_fence_receipts,%I.decision_supersessions TO %I',
+              :'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'role') \gexec
 SELECT format('GRANT SELECT ON %I.mesh_approvals_status TO %I', :'schema', :'role') \gexec
 -- SignedDecisionAuthority re-reads the owner key at every step (verify_proof,
 -- key_info); mesh_keys is a view, outside the table-write audit below.
@@ -85,6 +89,13 @@ BEGIN
             END LOOP;
         END IF;
     END LOOP;
+    -- #4995: the authority gate re-reads the signed replacement log; an
+    -- enrollment without this read would fail every signed operation.
+    IF to_regclass(format('%I.decision_supersessions', current_schema())) IS NOT NULL
+       AND NOT has_table_privilege(r.oid,
+               format('%I.decision_supersessions', current_schema()), 'SELECT') THEN
+        RAISE EXCEPTION 'release controller lacks SELECT on decision_supersessions';
+    END IF;
     -- Sequences carry their own privileges, outside relkind r/p: USAGE allows
     -- nextval/currval and UPDATE allows setval, so a grant on a schema sequence
     -- would move the schema's counters. The controller needs none of them.

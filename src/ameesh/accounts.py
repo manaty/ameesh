@@ -344,6 +344,8 @@ class Profile:
     #: celui de l'environnement de l'exécuteur (L1078). Faux pour un profil
     #: synthétique (« (default) » : hôte sans comptes, session d'avant L30).
     declared: bool = False
+    #: #4944: explicitly assign historical unnamed balance readings to this profile.
+    adopts_unnamed: bool = False
     #: #313/#2580 : raison du refus du compte par CE mesh (`accounts_shared:
     #: refuse` ou `account_sharing: strict`, identifiant déclaré aussi par un
     #: autre mesh de l'hôte, posée par `account_claims.mark_refused`) ; vide =
@@ -597,12 +599,19 @@ def parse(raw) -> dict[str, list[Profile]]:
                     raise AccountError("account %s/%s: `env` variable expected" % (harness, name))
                 if key_file and not os.path.isabs(os.path.expanduser(key_file)):
                     raise AccountError("account %s/%s: absolute path expected" % (harness, name))
+            adopts = item.get("adopts_unnamed", False)
+            if not isinstance(adopts, bool) or (adopts and kind != "api_key_env"):
+                raise AccountError("account %s/%s: adopts_unnamed must be a boolean "
+                                   "on an api_key_env profile" % (harness, name))
+            if adopts and any(p.adopts_unnamed for p in profiles):
+                raise AccountError("accounts.%s: only one profile may adopt unnamed "
+                                   "balance readings" % harness)
             profiles.append(Profile(
                 harness=harness, name=name, kind=kind,
                 path=_expand(path) if path else "",
                 env=env or (default_key_env_of(harness) if kind == "api_key_env" else ""),
                 key_env=key_env, key_file=_expand(key_file) if key_file else "",
-                hourly_usd=hourly, min_balance=min_balance,
+                hourly_usd=hourly, min_balance=min_balance, adopts_unnamed=adopts,
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, **caps,
                 pace_multiplier=pace_multiplier, pace_local=pace_local, declared=True,
@@ -1854,14 +1863,26 @@ def doctor_lines(cfg, environ=None) -> tuple[bool, list[str]]:
 def pause_label(evaluations: dict) -> str:
     """L242b (4) : la pause en court, devant sa raison détaillée — le compte
     qui se libère le premier : « pause (account secondaire, five_hour 96 %)
-    until 14:20; ». Vide si aucun compte n'a de remise à zéro datée."""
+    until 14:20@1793456400; ». Vide si aucun compte n'a de remise à zéro datée.
+
+    #4781 : l'heure lisible est celle de l'hôte de l'exécuteur et ne porte pas
+    toujours sa date ; `@epoch` (à la minute) la rend lisible d'un autre hôte
+    (`pause_deadline`)."""
     dated = [ev for ev in evaluations.values() if ev.until and ev.held]
     if not dated:
         return ""
     first = min(dated, key=lambda ev: ev.until)
     from .cost import until_label
-    return "pause (account %s, %s %.0f %%) until %s; " % (
-        first.profile.name, first.held[0], first.held[1] * 100, until_label(first.until))
+    return "pause (account %s, %s %.0f %%) until %s@%d; " % (
+        first.profile.name, first.held[0], first.held[1] * 100, until_label(first.until),
+        int(float(first.until)) // 60 * 60)
+
+
+def pause_deadline(text: str) -> float | None:
+    """#4781 : l'échéance (epoch) annoncée par `pause_label`, None si la pause
+    n'en annonce pas ; un texte d'avant ce marqueur n'en annonce pas non plus."""
+    found = _PAUSE_DEADLINE.search(text or "")
+    return float(found.group(1)) if found else None
 
 
 #: #2934 : le préambule d'une pause budget — le compte, la fenêtre qui le
@@ -1870,7 +1891,10 @@ def pause_label(evaluations: dict) -> str:
 _PAUSE_NATURE = re.compile(
     r"^pause \(account (?P<compte>\(default\)|[^,)]+)"
     r"(?:, (?P<fenetre>[^\s,]+) [\d.,]+\s*%)?\)"
-    r"(?: until (?P<echeance>[^;]+))?")
+    r"(?: until (?P<echeance>[^;@]+))?")
+
+#: #4781 : l'échéance absolue de `pause_label`, sur le préambule seul
+_PAUSE_DEADLINE = re.compile(r"\bpause \(account (?:\(default\)|[^,)]+)[^)]*\) until [^;@]+@(\d+);")
 
 #: #2934 : les mesures continues d'une raison sans ce préambule (plafond du
 #: mesh ou du compte payé au token, solde d'API). Elles changent à chaque

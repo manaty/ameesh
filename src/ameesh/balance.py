@@ -271,13 +271,39 @@ def _iso(ts: float) -> str:
     return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def spend(rows: Iterable[dict]) -> dict:
+def normalize_readings(rows: Iterable[dict], cfg=None) -> list[dict]:
+    """Apply only the explicitly declared ownership of unnamed balances.
+
+    Configuration is validated without reading credentials. No balance matching,
+    persisted rewrite, or inference from the number of configured accounts.
+
+    #5026 : une configuration illisible ne doit pas casser les lecteurs qui
+    dégradent déjà (alertes `balance_low`, rapport de coût) : les lignes
+    restent inchangées, aucune adoption n'est appliquée.
+    """
+    from . import accounts
+
+    try:
+        declared = accounts.parse(getattr(cfg, "accounts", None) or {})
+    except accounts.AccountError:
+        return [dict(row) for row in rows]
+    owners = {provider: profile.name for provider, profiles in declared.items()
+              for profile in profiles if profile.adopts_unnamed}
+    return [dict(row, account=owners[row["provider"]])
+            if row.get("account") is None and row["provider"] in owners
+            else dict(row) for row in rows]
+
+
+def spend(rows: Iterable[dict], *, cfg=None) -> dict:
     """Dépense réelle par heure et par jour (UTC), depuis des soldes horodatés.
 
     Pour chaque (fournisseur, devise), dans l'ordre chronologique : une baisse
     du solde est une dépense, attribuée à l'heure (et au jour) du relevé qui la
     constate ; une hausse est un rechargement, comptée à part.
+    `cfg.accounts.*.adopts_unnamed` rattache explicitement les lectures sans
+    compte au profil déclaré, sans modifier les lignes enregistrées.
     """
+    rows = normalize_readings(rows, cfg)
     # Une série par (fournisseur, devise, compte) : deux clés d'API ont deux
     # soldes, et la différence entre elles ne serait pas une dépense (L30).
     series: dict = {}
@@ -337,7 +363,7 @@ def gap_ratio() -> float:
     return value if value > 0 else GAP_RATIO
 
 
-def real_spend(rows: Iterable[dict], from_ts: float, to_ts: float) -> list[dict]:
+def real_spend(rows: Iterable[dict], from_ts: float, to_ts: float, *, cfg=None) -> list[dict]:
     """Dépense réelle de `from_ts` à `to_ts`, par (fournisseur, devise).
 
     Par série (fournisseur, devise, compte) : le relevé de départ est le
@@ -347,7 +373,10 @@ def real_spend(rows: Iterable[dict], from_ts: float, to_ts: float) -> list[dict]
     fournisseur et d'une même devise s'additionnent. `start_ts` et `end_ts`
     disent l'intervalle **réellement couvert** par les relevés : c'est sur
     lui que l'estimation se compare. Une série sans deux relevés n'en dit rien.
+    Le rattachement déclaré par `adopts_unnamed` est appliqué avant de former
+    ces séries ; aucun rapprochement de comptes n'est inféré des soldes.
     """
+    rows = normalize_readings(rows, cfg)
     series: dict = {}
     for row in sorted(rows, key=lambda r: (r["provider"], r["currency"],
                                            r.get("account") or "", r["observed_ts"])):
@@ -386,7 +415,7 @@ def real_spend(rows: Iterable[dict], from_ts: float, to_ts: float) -> list[dict]
 
 
 def compare(db, paid_harnesses: Iterable[str], from_ts: float, to_ts: float, *,
-            rows: list[dict] | None = None) -> list[dict]:
+            rows: list[dict] | None = None, cfg=None) -> list[dict]:
     """La dépense réelle (soldes) de chaque fournisseur payé au token, face à
     l'estimation du grand livre sur le **même intervalle** (L95).
 
@@ -402,7 +431,7 @@ def compare(db, paid_harnesses: Iterable[str], from_ts: float, to_ts: float, *,
             provider=None, since_s=max(0.0, to_ts - from_ts) + 1.0)
     ledger = storage.of(db).turn_costs
     out = []
-    for entry in real_spend(rows, from_ts, to_ts):
+    for entry in real_spend(rows, from_ts, to_ts, cfg=cfg):
         harness = entry["provider"]
         estimated = (ledger.spent_between(entry["start_ts"], entry["end_ts"],
                                           harnesses=[harness])

@@ -32,13 +32,14 @@ module:
 | Field | Meaning |
 |---|---|
 | `name` | Module name |
-| `version` | ameesh version for built-ins, distribution version for external modules |
-| `source` | `builtin` or `external` |
+| `version` | ameesh version for built-ins, distribution version for external modules; absent for canon data |
+| `source` | `builtin`, `external` or `canon` |
 | `capabilities` | Supported interfaces: `lifecycle`, `cli`, `audit`, `workspaces` |
 | `cli` | Command entry point, when provided |
 | `storage.types` | Work item types supplied by the module |
 | `descriptor_sha256` | Fingerprint of the compiled descriptor |
 | `distribution`, `entry_point` | Installation provenance for an external module |
+| `card_ref` | Exact canon card revision for a declarative module |
 
 `registry.discover()` returns the discovered modules and refused entries. A
 refused entry is reported with its reason and does not become a module;
@@ -95,6 +96,66 @@ Removing a declaration does not erase historical milestones. Keep a module
 available while its work items remain active: its additional types fail closed
 without their policy.
 
+## Code-free modules: Pipeline cards
+
+A **Pipeline card** supplies a workflow as canon data. It declares stages,
+transitions, evidence guards and an issue projection in `pipelines/*.md`,
+with `type: Pipeline` and a `pipeline:` block. The transitional `workflow:`
+alias is accepted instead of `pipeline:`, never alongside it. Unlike a
+Process card, a Pipeline is not a working rule injected into agent briefs.
+
+```bash
+ameesh canon check
+ameesh canon show --json
+ameesh modules --json
+```
+
+The checker compiles the card; `canon show` lists it under `pipelines`. A
+valid card appears in module discovery with `source: canon`, its pinned
+`card_ref` and the `lifecycle` and `cli` capabilities. Discovery imports no
+Python code from the canon. An invalid card is refused with its reason, and
+a card cannot replace a built-in or installed module with the same name.
+
+Activate the card by its module name, through the same project policy as
+other selectable modules:
+
+```yaml
+extensions:
+  ameesh:
+    projects:
+      support:
+        modules: [support-work-delivery]
+```
+
+Apply that declaration through the [trusted canon procedure](canon.md#only-the-approved-source).
+A Pipeline declares which work item types it can drive; it supplies no stored
+types of its own. Those types must already be admitted by the project's
+installed modules. Activation alone does not pin existing work items.
+
+For an eligible work item assigned to the caller (or adopted by the pilot):
+
+```bash
+ameesh module support-work-delivery adopt 42
+ameesh module support-work-delivery advance 42 --to triage --guard planning
+ameesh module support-work-delivery hold 42 --hold blocked
+ameesh module support-work-delivery release 42
+```
+
+Adoption pins the exact card revision and its initial stage. Subsequent
+commands read that git object, so editing a working copy or publishing a new
+card revision does not silently change an adopted workflow. A later revision
+requires the explicit revision-transfer path. A pinned work item uses
+`advance`, `hold` and `release` for lifecycle changes; `work move` refuses it.
+Adoption writes a journal entry; the later commands return idempotent receipts.
+Installed verifiers still check the declared guards and evidence. A card
+cannot grant itself new executable guards or bypass those checks.
+
+The shipped [development example](https://github.com/manaty/ameesh/blob/main/examples/pipelines/acme-work-delivery.md)
+and [support example](https://github.com/manaty/ameesh/blob/main/examples/pipelines/support-work-delivery.md)
+use the same mechanism. Their stage-to-issue projection is pure data; it does
+not publish to GitHub. See [Write a Pipeline](../guides/write-a-pipeline.md)
+for the complete card, activation, commands and both examples.
+
 ## Built-in examples and the bare profile
 
 **`dev`** supplies development tooling. It has no work item type and is always
@@ -117,6 +178,12 @@ retained aliases. Development work items are called **lots**; the core uses
 persisted states (`merged` and `promoted`). Policy is selected per project;
 its presence in the discovered list does not activate it everywhere.
 
+**`work-types`** declares the non-code work item types `docs`,
+`investigation`, `governance-tracking`, `promotion` and `human_operation`, with
+no schema, rule or command. Like `it`, it is active only in the projects that
+select it (`modules: [work-types]`); a project without it still refuses those
+types. See [Write a Pipeline](../guides/write-a-pipeline.md).
+
 A **bare profile** has no built-in modules and no installed entry points.
 `registry.discover(builtin=False)` then returns an empty registry without
 error. Without `dev`, workspace housekeeping and worktree operations are
@@ -128,3 +195,5 @@ new direct imports of module implementations from the core are refused.
 Declared compatibility exceptions remain explicit; the registry is the
 supported interface. The [architecture document](../design.md) explains this
 boundary in more detail.
+
+To create an installed extension, follow [Write a module](../guides/write-a-module.md).

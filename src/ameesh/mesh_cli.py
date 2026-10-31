@@ -1147,7 +1147,8 @@ def _print_host_menage(menage: dict) -> None:
         arch = m.get("worktree_archives") or {}
         print("  cleanup    temporary directories %s (quota %s per agent); caches %s / %s"
               "%s%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
-                        _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                        ("at least " if m.get("cache_partial") else "")
+                        + _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
                         "; %d /tmp entries reported (%s)" % (
                             m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
                         if m.get("orphans") else "",
@@ -1997,6 +1998,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "footprint":   # #4173 : empreinte de lot (#3185)
             from . import work_footprints
             return work_footprints.run(cfg, db, args)
+        if args.work_command == "footprint-policy":   # #4818 : politique du dépôt
+            from . import work_footprints
+            return work_footprints.run_policy(cfg, db, args)
         if args.work_command == "landing":   # #1945 : atterrissage planifié sur un véhicule
             from . import work_dependencies
             return work_dependencies.run_landing(db, args)
@@ -2096,14 +2100,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             note = "; ".join(part for part in (segment, introduced) if part)
             # #4173 : l'empreinte d'intake (chemins cités), écrite par la
             # création même ; jamais d'échec de la création pour l'estimer.
+            # #4818 : l'analyse d'impact (lecture seule, bornée), une fois pour
+            # les deux tentatives de création
             from . import work_footprints
-            try:
-                footprint = work_footprints.estimate_lot(cfg, {
-                    "app": args.app or "", "title": args.title, "body": args.body or "",
-                    "branch_target": args.target or ""})
-            except Exception as exc:  # noqa: BLE001 - la création n'attend pas l'estimation
-                footprint = []
-                print("warning: footprint not estimated: %s" % exc, file=sys.stderr)
+            impact = None
+            if not work._is_vehicle_branch(args.branch):
+                impact = work_footprints.analyze_for_creation(
+                    cfg, db, app=args.app or "", title=args.title, body=args.body or "",
+                    branch_target=args.target or "")
+            footprint = list(impact["footprint"]) if impact else []
             add_kwargs = dict(
                 title=args.title, type=args.type, source=args.source, app=args.app,
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
@@ -2114,7 +2119,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
                 note=note,
                 force=args.force,
-                parent_lot=args.parent_lot, footprint=footprint)
+                parent_lot=args.parent_lot, footprint=footprint, impact=impact)
             try:
                 item = work.add(db, assignee=args.assignee, **add_kwargs)
             except storage.FootprintOverlap as exc:
@@ -2130,7 +2135,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # doit plus s'afficher (`_print_assignment` plus bas).
                 check = None
                 print("warning: created unassigned: %s"
-                      % work_footprints.refusal(item["id"], exc.overlaps), file=sys.stderr)
+                      % work_footprints.refusal(item["id"], exc.overlaps,
+                                                cap=getattr(exc, "cap", None),
+                                                in_flight=getattr(exc, "in_flight", None)),
+                      file=sys.stderr)
             print(('%s #%d created in %s: %s%s%s%s') % (v.noun, item["id"], item["state"], item["title"], " (plan: %s)" % item["package_id"] if item.get("package_id") else "", " (priority %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
                 if item.get("priority") else "", " — estimated %s" % estimates.label(minutes) if minutes else ""))
             if item.get("external_executor"):
@@ -2172,6 +2180,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                       file=sys.stderr)
             if footprint:
                 print("footprint: %s" % ", ".join(footprint))
+            if impact:
+                print(impact["note"])
             return 0
         if args.work_command == "fingerprint":
             # #3885 : primitive idempotente de la règle §16 — un lot par
@@ -2333,11 +2343,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(('no %s') % v.plural)
                 return 0
             now = time.time()
-            print("%-5s %-10s %-14s %-12s %-10s %-12s %-12s %s" % (
-                "ID", "TYPE", "STATE", "ASSIGNEE", "UPDATED", "DELAY", "EPIC", "TITLE"))
+            # #4621 : la phase de livraison (`legacy_state`) distingue un lot
+            # fusionné d'un lot promu, tous deux `state=delivered` depuis
+            # 0518. Colonne vide quand la phase est le core lui-même.
+            print("%-5s %-10s %-14s %-9s %-12s %-10s %-12s %-12s %s" % (
+                "ID", "TYPE", "STATE", "PHASE", "ASSIGNEE", "UPDATED", "DELAY", "EPIC", "TITLE"))
             for row in rows:
-                print("%-5d %-10s %-14s %-12s %-10s %-12s %-12s %s" % (
-                    row["id"], row["type"], row["state"], (row.get("assignee") or "—")[:12],
+                phase = work_lifecycle.phase(row)
+                print("%-5d %-10s %-14s %-9s %-12s %-10s %-12s %-12s %s" % (
+                    row["id"], row["type"], row["state"],
+                    phase if phase != row["state"] else "—",
+                    (row.get("assignee") or "—")[:12],
                     _fmt_age(now - float(row.get("updated_ts") or 0)),
                     _delays_cell(row.get("delays"), now), (row.get("epic") or "—")[:12],
                     row["title"][:60]))
@@ -2373,6 +2389,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             print("type     : %-10s state: %-14s lifecycle: %-14s assignee: %s" % (
                 item["type"], item["state"], item["lifecycle"],
                 item.get("assignee") or "—"))
+            # #4621 : `state` est le core `delivered` ; `phase` porte la
+            # compatibilité (`merged`/`promoted`) que `legacy_state` conserve.
+            phase = work_lifecycle.phase(item)
+            if phase != item["state"]:
+                print("phase    : %s (delivery stage)" % phase)
             if item.get("external_executor"):
                 print("executor : %s (external, reserved; not assignable)" % (
                     item["external_executor"]))
@@ -2570,6 +2591,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print(('ameesh work move: --device declares the device session a blocked %s waits for: ameesh work move %s blocked --device <device>') % (v.noun, args.id), file=sys.stderr)
                     return 2
                 note = device_gates.session_note(args.device, note)
+            if args.correct is None and not args.package_exclusion:
+                # #5035 : `--correct` et `--package-exclusion` ont leur autorité
+                # (`_work_actor`) ; le reste n'avance pas le lot d'un autre.
+                work.check_mover(cfg, db, args.id, args.state, args.actor)
             item = work.move(db, args.id, args.state, note=note, actor=args.actor,
                              correct=args.correct, reviewer=args.reviewer,
                              package_exclusion=args.package_exclusion)
@@ -2582,6 +2607,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # #2478 : la désignation est écrite ; un courrier non remis est dit.
             if item.get("reviewer_request_warning"):
                 print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
+            # #5006 : un move par un agent qui n'est plus l'assigné
+            if item.get("assignee_warning"):
+                print("warning: %s" % item["assignee_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
             # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
@@ -2971,7 +2999,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # sans en faire un refus.
                 for line in str(row.get("note") or "").splitlines():
                     if line.startswith((work.FREEZE_UNPUBLISHED_MARK,
-                                        work.FREEZE_UNVERIFIED_MARK)):
+                                        work.FREEZE_UNVERIFIED_MARK,
+                                        work.NON_ASSIGNEE_MARK)):
                         print("warning: %s" % line, file=sys.stderr)
                 # #2442 : un réalignement mécanique sur la cible garde les
                 # verdicts de la tête relue ; sinon l'exécuteur retente.
@@ -4000,6 +4029,7 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     work_dependencies.add_links_parser(work_sub, cmd_work)
     from . import work_footprints
     work_footprints.add_parser(work_sub, cmd_work)
+    work_footprints.add_policy_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help=("reserve the next free migration number for the %s (L122), "
                           "before writing the file; idempotent, visible in work show") % v.noun)
@@ -4658,7 +4688,7 @@ def cmd_cost(cfg: Config, args) -> int:
         else:
             print(cost_mod.format_report(rows))
             # L95 : dépense réelle (soldes) face à l'estimation, sur 24 h
-            for entry in _real_spend_24h(db):
+            for entry in _real_spend_24h(db, cfg=cfg):
                 print(balance_mod.describe(entry))
             print()
             print(budget_mod.summary_line(limites))
@@ -4674,7 +4704,7 @@ def cmd_cost(cfg: Config, args) -> int:
         db.close()
 
 
-def _real_spend_24h(db) -> list:
+def _real_spend_24h(db, *, cfg=None) -> list:
     """L95 : dépense réelle des fournisseurs payés au token sur 24 h, face à
     l'estimation du grand livre ; vide si rien n'est lisible."""
     try:
@@ -4683,7 +4713,7 @@ def _real_spend_24h(db) -> list:
         return []
     now = time.time()
     return [dict(entry, period="24h")
-            for entry in balance_mod.compare(db, paid, now - 86400.0, now)]
+            for entry in balance_mod.compare(db, paid, now - 86400.0, now, cfg=cfg)]
 
 
 def _cost_report_reads(cfg: Config, db) -> None:
@@ -4706,7 +4736,7 @@ def _cost_report_reads(cfg: Config, db) -> None:
                                    for g in ligne["gauges"] if g.get("cap") is not None}
                 for ligne in comptes if ligne["active"]}
     book.report(accounts=actifs, multipliers=rythmes, caps=plafonds)
-    _real_spend_24h(db)
+    _real_spend_24h(db, cfg=cfg)
 
 
 def _config_origin(cfg: Config) -> dict:
@@ -4977,7 +5007,7 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
             except balance_mod.BalanceError as exc:
                 errors.append("%s: %s" % (nom, exc))
     rows = ops.balances(provider=args.provider, since_s=_since_seconds(args.since))
-    report = dict(balance_mod.spend(rows), schema="ameesh-balance/1", errors=errors)
+    report = dict(balance_mod.spend(rows, cfg=cfg), schema="ameesh-balance/1", errors=errors)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:

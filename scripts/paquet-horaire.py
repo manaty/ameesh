@@ -119,13 +119,14 @@ avancée est propre et les contrôles de gel verts. Un conflit le rend à la
 file. Sous le seuil, ou si les lots ne sont pas disjoints, un seul paquet
 part.
 
-**Pause (#4361).** `pause --until … --reason …` suspend le tic (staging hors
+**Pause (#4361, #5045).** `pause --until … --reason …` suspend le tic (staging hors
 créneau) sans arrêter la minuterie : `role timers --check` reste vert et nomme
 la pause. L'échéance est obligatoire (au plus 12 h) ; la pause vit au journal
 partagé (`packet.pause`, `ameesh.packet_pause`), pas sur l'hôte : un bail qui
-change de main la garde. Pendant la pause, le tic ne fait aucun geste (ni
-migration ni composition) et le dit ; à l'échéance il reprend seul ; `resume`
-lève avant. Pose et levée sont dites au pilote et au bureau.
+change de main la garde. `--await-announcement` transforme l’échéance en alerte :
+la pause reste jusqu’à `resume --source "auteur, date, message"` (canon §7). Pendant la pause, le tic ne fait aucun geste (ni
+migration ni composition) et le dit ; sans attente d’annonce, à l'échéance il
+reprend seul ; `resume` lève avant. Pose et levée sont dites au pilote et au bureau.
 
 **Cohérence de version (#4473).** Le tic exécute le script de la cible exacte
 (`check_fresh`) ; `main()` met `src/` de ce même clone en tête de `sys.path`
@@ -1898,12 +1899,17 @@ def _connect():
     return db_mod.connect(config_mod.load())
 
 
-def read_pause(project: str, target: str) -> dict | None:
+def read_pause(project: str, target: str, *, pilot: str = "mesh-design",
+               notify: bool = True, now: float | None = None) -> dict | None:
     """#4361 : la pause active de la cible, une lecture par tic."""
     from ameesh import packet_pause
     db = _connect()
     try:
-        return packet_pause.active(db, project=project, target=target)
+        data = packet_pause.active(db, project=project, target=target, now=now)
+        if notify:
+            packet_pause.alert_due(db, data, project=project, target=target,
+                                   recipients=(pilot, BUREAU), now=now)
+        return data
     finally:
         close = getattr(db, "close", None)
         if close:
@@ -1952,16 +1958,23 @@ def main_pause(args, *, connect=_connect, shell: Shell | None = None,
             return 0
         if args.command == "resume":
             before = packet_pause.active(db, project=args.project, target=args.target, now=now)
-            packet_pause.resume(db, project=args.project, target=args.target, by=by)
+            packet_pause.resume(db, project=args.project, target=args.target, by=by,
+                                source=getattr(args, "source", ""))
             text = "paquet horaire %s : pause levée par %s%s" % (
                 where, by, "" if before else " (aucune pause active)")
+            if getattr(args, "source", ""):
+                text += " ; annonce : " + args.source
         else:
             until = parse_until(args.until, now, zone)
             data = packet_pause.pause(db, project=args.project, target=args.target,
-                                      until=until, reason=args.reason, by=by, now=now)
-            text = "paquet horaire %s : %s ; le tic reprend seul à l'échéance " \
-                   "(`paquet-horaire.py resume` pour lever avant)" % (
-                       where, packet_pause.describe(data, zone))
+                                      until=until, reason=args.reason, by=by, now=now,
+                                      await_announcement=getattr(args, "await_announcement", False))
+            end = ("échéance = alerte, reprise après annonce explicite sourcée "
+                   "(`paquet-horaire.py resume --source …`)"
+                   if data.get("await_announcement") else
+                   "le tic reprend seul à l'échéance (`paquet-horaire.py resume` pour lever avant)")
+            text = "paquet horaire %s : %s ; %s" % (
+                where, packet_pause.describe(data, zone), end)
     except InputError as error:
         print("paquet-horaire : %s" % error, file=sys.stderr)
         return 2
@@ -1998,7 +2011,11 @@ def main(argv: list[str] | None = None) -> int:
     hold.add_argument("--until", required=True,
                       help="échéance obligatoire : 90m, 2h, 20:15 (canon) ou date ISO")
     hold.add_argument("--reason", required=True, help="raison, dite au tic et au pilote")
+    hold.add_argument("--await-announcement", action="store_true",
+                      help="#5045 : échéance = alerte ; reprise sur annonce sourcée seulement")
     lift = sub.add_parser("resume", help="#4361 : lever la pause avant l'échéance")
+    lift.add_argument("--source", default="",
+                      help="source de l'annonce de fin : auteur, date, message (200 caractères max)")
     look = sub.add_parser("status", help="#4361 : la pause active, s'il y en a une")
     for each in (one, again, hold, lift, look):
         each.add_argument("--target", default="main")
@@ -2036,7 +2053,8 @@ def main(argv: list[str] | None = None) -> int:
                   python=args.python or auto.project_python(repo),
                   dry_run=args.dry_run, zone=zone, epoch=lease_epoch(),
                   unit_tests=unit_tests, parallel=parallel,
-                  pause_of=lambda: read_pause(args.project, args.target))
+                  pause_of=lambda: read_pause(args.project, args.target,
+                                               pilot=args.pilot, notify=not args.dry_run))
     try:
         if args.command == "recompose":
             # geste explicite du pilote (#4237) : la pause (#4361) ne vise que le tic

@@ -868,3 +868,17 @@ Receipts are counts and booleans only (`units`, `guard`, `reloaded`,
 `ok` field, which the host factory adds once its remaining adapter obligations
 are met. Tests use real disposable files and simulated systemd; no host unit,
 daemon, guard or service is touched.
+
+## Separate controller enrollment operation
+
+`enroler-controleur.py` prepares the exact private document inventory and a
+separate owner-signed question before publishing the seven fixed controller
+documents and starting its existing independent system unit. A distinct signed
+key generation phase creates the new root-private host-local transport key;
+only its public key and fingerprint enter the enrollment mandate. It never writes
+readiness, exports a private credential, changes an SSH delegation or modifies an immutable
+runtime/source tree. Its separate signed stop retains documents and journals.
+See [the operator procedure](ops/release-controller-enrollment.md) for document
+schemas, secret provenance, durable resume, proof collection and the unresolved
+pilot transport/delegation prerequisites. The administrator must enroll the new
+backend code and supply the private inputs before this entry can run on a host.

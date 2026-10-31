@@ -171,6 +171,14 @@ class Decisions(interface.Decisions):
             " AND btrim(work_item_id) = %%s ORDER BY id" % (_COLUMNS, _IS_DECISION),
             (str(lot).strip(),))
 
+    def supersession(self, decision_id):
+        # #4995: append-only evidence, read by the authority gate; the
+        # mutable payload marker is only a cache.
+        rows = self.db.query(
+            "SELECT supersedes, superseded_by, person, occurred_at, proof"
+            " FROM decision_supersessions WHERE supersedes = %s", (int(decision_id),))
+        return rows[0] if rows else None
+
     def close(self, decision_id, *, status, record) -> dict | None:
         from ... import decisions
         if set(record or {}) - {"state", "answer", "withdrawn"}:
@@ -206,16 +214,18 @@ class Decisions(interface.Decisions):
             old_view = decisions.view_of(old) if old else None
             if not old_view or old_view["state"] != "answered":
                 raise decisions.DecisionError("supersedes requires an answered decision; pending uses withdraw")
-            decisions.require_current(old_view)
-            tx.execute("UPDATE agent_mailbox SET payload = jsonb_set(payload,"
-                       " '{decision,superseded_by}', to_jsonb(%s::bigint)) WHERE id = %s",
-                       (int(decision_id), target))
+            decisions.require_current(tx, old_view)
             answer = view["answer"]
+            # Journal first: the #4995 marker trigger only accepts a marker
+            # whose logged replacement is already visible in this transaction.
             tx.execute("INSERT INTO decision_supersessions"
                        " (supersedes, superseded_by, person, occurred_at, proof)"
                        " VALUES (%s, %s, %s, to_timestamp(%s), %s::jsonb)",
                        (target, int(decision_id), answer["by"], answer["ts"],
                         json.dumps(answer["proof"])))
+            tx.execute("UPDATE agent_mailbox SET payload = jsonb_set(payload,"
+                       " '{decision,superseded_by}', to_jsonb(%s::bigint)) WHERE id = %s",
+                       (int(decision_id), target))
             return closed
 
     def _close(self, decision_id, *, status, record):

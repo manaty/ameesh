@@ -56,6 +56,15 @@ def team(idle, working, project="ameesh"):
             + [busy("%s-busy-%d" % (project, i), project) for i in range(working)])
 
 
+def mechanics_doc(*, families=("claude", "codex", "deepseek"), excluded=()):
+    """Le document `mechanics.configured` réduit à ce que `read_capacity` lit."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        queue_fill=SimpleNamespace(repos_part=PART, repos_s=REPOS),
+        families=tuple(families),
+        auto_take_excluded_families=lambda now: tuple(excluded))
+
+
 class TriggerTest(unittest.TestCase):
     def test_twenty_percent_idle_without_decoupage_names_the_project(self):
         cap = measure(team(2, 8))
@@ -219,6 +228,46 @@ class IdleHoursTest(unittest.TestCase):
         cap = measure([agent("a")], turns=turns)
         self.assertEqual(cap["mesh"]["idle_agent_hours"], 5.0)
 
+    def test_a_busy_agents_gaps_are_not_idle_hours(self):
+        # #5043 : l'attente d'un agent sur son propre lot (CI, avis) n'est pas
+        # de la capacité disponible — aucun agent au repos, aucune heure
+        turns = [turn("busy", T - 5 * H, T - 4 * H)]
+        cap = measure([busy("busy")], turns=turns)
+        self.assertEqual(cap["mesh"]["idle_agent_hours"], 0.0)
+        self.assertEqual(cap["mesh"]["idle"], 0)
+
+    def test_only_the_resting_agents_count_hours(self):
+        # #5043 : le total est la somme des seuls agents au repos, pas celle
+        # de tous les réveillables du projet
+        turns = [turn("busy", T - 5 * H, T - 4 * H)]
+        cap = measure([agent("resting"), busy("busy")], turns=turns)
+        self.assertEqual(cap["mesh"]["idle"], 1)
+        self.assertEqual(cap["mesh"]["idle_agent_hours"], 6.0)
+
+    def test_a_budget_hold_counts_no_idle_hours(self):
+        # #5043 : la pause budget n'est pas une perte de capacité
+        cap = measure([agent("a")], held={"a": "budget"})
+        self.assertEqual(cap["mesh"]["idle_agent_hours"], 0.0)
+
+    def test_a_critical_role_counts_no_idle_hours(self):
+        # #5043 : un critique ou un relecteur n'est pas réveillable ; ses
+        # trous ne gonflent pas la perte affichée
+        cap = measure([agent("a"), agent("auditeur")])
+        self.assertEqual(cap["projects"][0]["wakeable"], 1)
+        self.assertEqual(cap["mesh"]["idle_agent_hours"], 6.0)
+
+    def test_an_excluded_family_counts_no_idle_hours(self):
+        # #5043 : une famille exclue des prises (#5005) est une capacité
+        # volontairement écartée, pas une perte : elle ne compte ni dans les
+        # réveillables ni dans les heures-agent
+        families = ("claude", "codex", "deepseek")
+        cap = measure([agent("a", harness="claude-opus"),
+                       agent("ds", harness="deepseek-flash")],
+                      families=families, excluded_families=("deepseek",))
+        self.assertEqual(cap["projects"][0]["wakeable"], 1)
+        self.assertEqual(cap["mesh"]["idle"], 1)
+        self.assertEqual(cap["mesh"]["idle_agent_hours"], 6.0)
+
 
 class PlanLossTest(unittest.TestCase):
     def test_loss_per_account_as_accounts_computes_it(self):
@@ -262,7 +311,7 @@ class ReadCapacityTest(unittest.TestCase):
         store = SimpleNamespace(operations=SimpleNamespace(
             listing=lambda: team(2, 8),
             open_lots_activity=mock.Mock(side_effect=RuntimeError("boom"))))
-        rule = SimpleNamespace(queue_fill=SimpleNamespace(repos_part=PART, repos_s=REPOS))
+        rule = mechanics_doc()
         db = mock.Mock()
         db.query.return_value = []
         unreadable: list = []
@@ -290,7 +339,7 @@ class ReadCapacityTest(unittest.TestCase):
                "app": "ameesh", "type": "evolution", "created_ts": T - 20 * 60}
         store = SimpleNamespace(operations=SimpleNamespace(
             listing=lambda: team(2, 8), open_lots_activity=lambda limit: [row]))
-        rule = SimpleNamespace(queue_fill=SimpleNamespace(repos_part=PART, repos_s=REPOS))
+        rule = mechanics_doc()
 
         def query(sql, params=()):
             if "file-decoupage:%%'" in sql and "SELECT id, source" in sql:
@@ -313,7 +362,7 @@ class ReadCapacityTest(unittest.TestCase):
         self.assertEqual(cap["alerts"], [])
 
 
-    def _read_with(self, patches):
+    def _read_with(self, patches, *, listing=None, document=None):
         """`read_capacity` sur 2/10 au repos, un lot ouvert démarrable, et des
         lecteurs internes remplacés par `patches`."""
         from types import SimpleNamespace
@@ -321,10 +370,11 @@ class ReadCapacityTest(unittest.TestCase):
                "app": "ameesh", "type": "evolution", "created_ts": T - H}
         store = SimpleNamespace(
             operations=SimpleNamespace(
-                listing=lambda: team(2, 8), open_lots_activity=lambda limit: [lot]),
+                listing=lambda: listing if listing is not None else team(2, 8),
+                open_lots_activity=lambda limit: [lot]),
             # #4561 : la garde d'empreinte est lue pour la part démarrable.
             work_footprints=SimpleNamespace(for_items=lambda ids: []))
-        rule = SimpleNamespace(queue_fill=SimpleNamespace(repos_part=PART, repos_s=REPOS))
+        rule = document if document is not None else mechanics_doc()
         db = mock.Mock()
         db.query.return_value = []
         unreadable: list = []
@@ -362,6 +412,16 @@ class ReadCapacityTest(unittest.TestCase):
             {"ameesh.account_turn.turn_hold": mock.Mock(side_effect=RuntimeError("hold"))})
         self.assertEqual(cap["alerts"], [])
         self.assertEqual(cap["gating_unreadable"], ["budget holds"])
+
+    def test_an_excluded_family_is_left_out_of_capacity(self):
+        # #5043 : le lecteur passe au calcul les familles du canon et
+        # l'exclusion temporaire des prises (#5005)
+        cap, _ = self._read_with(
+            {}, listing=team(2, 8) + [agent("ds", harness="deepseek-flash")],
+            document=mechanics_doc(excluded=("deepseek",)))
+        self.assertEqual(cap["mesh"]["wakeable"], 10)
+        self.assertEqual(cap["mesh"]["idle"], 2)
+        self.assertEqual(cap["mesh"]["idle_agent_hours"], 12.0)
 
 
 if __name__ == "__main__":

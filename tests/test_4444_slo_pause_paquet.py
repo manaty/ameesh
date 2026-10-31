@@ -24,6 +24,10 @@ class _Events:
     def recent_type(self, type, days, limit, object=None):
         return [row for row in reversed(self.rows) if row["type"] == type][:limit]
 
+    def context_type(self, type, days, limit, *, object_prefix):
+        return [row for row in reversed(self.rows)
+                if row["type"] == type and row["object"].startswith(object_prefix)][:limit]
+
 
 class _Store:
     def __init__(self, rows):
@@ -109,6 +113,17 @@ class SloPauseTest(_Base):
     def test_pause_active_aucune_escalade(self):
         t0 = self.go_after((9000, "staging agents-1"))
         self.assertEqual(self.steps(t0 + 7300), [])
+
+    def test_announcement_deadline_does_not_restart_slo_clock(self):
+        t0 = self.go_after()
+        app = self.db.query("SELECT app FROM work_items WHERE id = %s",
+                            (self.lot["id"],))[0]["app"]
+        storage.of(self.db).events.record(
+            packet_pause.EVENT, packet_pause.key(app, "main"), app,
+            {"state": "paused", "until": int(t0 + 3600),
+             "await_announcement": True, "reason": "coordination", "target": "main"})
+        self.assertEqual(self.steps(t0 + 7200), [])
+        self.assertEqual(self.steps(t0 + 3 * 86400), [])
 
     def test_levee_horloge_repart_de_la_levee(self):
         t0 = self.go_after((600, "staging agents-1"))

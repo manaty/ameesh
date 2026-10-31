@@ -280,7 +280,10 @@ class TemoinAqaBintakeTest(_Base):
                         (a["id"],))
         lots = storage.of(self.db).operations.open_lots_activity(None)
         store = storage.of(self.db)
-        rule = SimpleNamespace(queue_fill=SimpleNamespace(repos_part=PART, repos_s=REPOS))
+        rule = SimpleNamespace(
+            queue_fill=SimpleNamespace(repos_part=PART, repos_s=REPOS),
+            families=("claude", "codex", "deepseek"),
+            auto_take_excluded_families=lambda now: ())
         db = mock.Mock()
         db.query.return_value = []
         with mock.patch("ameesh.storage.of", return_value=store), \

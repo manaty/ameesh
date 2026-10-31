@@ -302,7 +302,8 @@ class OptionalJobReadingTest(unittest.TestCase):
         self.assertIsNone(release._full_suite_run(data))
 
     def test_tolerances_are_read_from_the_existing_radar_configuration(self):
-        cfg = mock.Mock(humans="smichea", radar={"projects": {"ameesh": {
+        cfg = mock.Mock(humans="smichea", release={}, packet_watch={},
+                        radar={"projects": {"ameesh": {
             "repo": "/unused", "github": "acme/project", "full_suite": [{
                 "path": ".github/workflows/tests.yml", "jobs": ["tests"],
                 "tolerate": ["bilan des impactés"],

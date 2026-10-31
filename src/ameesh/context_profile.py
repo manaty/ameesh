@@ -28,6 +28,7 @@ prochaine annonce runtime.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
@@ -59,23 +60,35 @@ def _name(value) -> str | None:
     return value or None
 
 
+def _finite_int(value) -> int | None:
+    """L'entier d'un réel **fini**, ou ``None`` (#4892 N2).
+
+    ``json.loads`` accepte ``NaN``/``Infinity`` : ``int()`` y lève
+    ``ValueError``/``OverflowError``. Une métadonnée non finie vaut
+    « inconnue » (``None``), jamais une exception.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return int(value)
+
+
 def _positive(value) -> int | None:
     """Un entier de mesure strictement positif, ou ``None``.
 
     Une fenêtre à zéro n'existe pas ; elle vaut « inconnue », jamais ``0``.
     """
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        value = int(value)
-        if value > 0:
-            return value
+    value = _finite_int(value)
+    if value is not None and value > 0:
+        return value
     return None
 
 
 def _token(value) -> int | None:
     """Un jeton de compaction borné à zéro, ou ``None`` (contrat §2.4)."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return max(int(value), 0)
-    return None
+    value = _finite_int(value)
+    return None if value is None else max(value, 0)
 
 
 def _first_token(meta: Mapping, *names: str) -> int | None:

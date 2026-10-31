@@ -101,6 +101,12 @@ human decision (by the card's lead), unblocking. An action of the lot
 waiting for a human (approval, reconciliation) takes precedence over everything; a
 blocking verdict only counts if it follows the last freeze. When ameesh does not know
 who, it says so ("relecteur non désigné" (reviewer not assigned)) instead of guessing.
+**Moving a lot someone else holds** (#5035): `ameesh work move` is refused,
+nothing changed, unless the actor is its holder or the agent who delegated it, a
+human, a pilot, the bureau or the auditor, or a reviewer designated on a lot in
+review. Entry to `validated` stays open: the review quorum guards it. A session
+bound to an agent acts in its own name, whatever `--actor` says; `--correct` and
+`--package-exclusion` keep their own authority.
 The reviewer of a review can be **designated on entry to `qa`** (#705):
 `ameesh work move <id> qa --reviewer <agent>` — a registry name, or a human
 (`human:…`). A lot already in `qa` gets its reviewer with `ameesh work reviewer

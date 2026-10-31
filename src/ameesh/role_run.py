@@ -216,6 +216,24 @@ class _AlertsLease:
             # a lost lease lets the caller fail closed without waiting.
             return self.deadline > time.monotonic()
 
+    def note_renewed(self, epoch: int, started: float) -> bool:
+        """Extend the local deadline after a CAS renewal made by the caller.
+
+        `_record` renews the shared lease inside its own transaction, to check
+        and journal under the same lock. Without this, the database expiry
+        would move but the monotonic deadline would not, and a slow
+        preparation could be reported as a lost lease (#4898 N1). `started`
+        is the monotonic instant taken before the caller's renewal call, so
+        the local deadline never moves later than the server's.
+        """
+        with self.lock:
+            if self.epoch != epoch:
+                return False
+            proposed = started + self.ttl - self.guard
+            if self.deadline is None or proposed > self.deadline:
+                self.deadline = proposed
+            return self.deadline > time.monotonic()
+
     def remaining(self) -> float:
         """Seconds left on the local deadline; negative when it has passed."""
         with self.lock:
@@ -383,7 +401,7 @@ class _AlertsExecution:
 
 def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
                         stop: threading.Event) -> None:
-    """Renew the shared lease for the child's whole life.
+    """Renew the shared lease for the guarded span (child, or a slower caller).
 
     A failed renewal stops the child at once; the deadline watchdog is the
     second, local line of defence when the renewal call itself is blocked.
@@ -398,22 +416,28 @@ def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
 
 
 def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease,
-                     execution: _AlertsExecution) -> tuple[int, bool]:
+                     execution: _AlertsExecution, *, watch: bool = True) -> tuple[int, bool]:
     """Run the child while the shared lease is held and renewed.
 
     Returns ``(exit code, lost)``. The caller releases the lease after closing
     the execution guard, so no stop thread can use the connection while it is
     released. The local deadline is already armed by the caller: it covers the
     selection re-reads that happen before this function starts the child.
+
+    ``watch=False`` lets a caller that already renews the lease for a wider
+    span (a pre-launch phase of its own) keep ONE renewal thread, instead of
+    racing two renewals over the same epoch (#4898 N1).
     """
     proc = execution.start_child(argv, env)
     if proc is None:
         return 1, True
     stop = threading.Event()
-    watcher = threading.Thread(target=_watch_alerts_lease,
-                               args=(lease, execution, stop),
-                               name="alerts-lease", daemon=True)
-    watcher.start()
+    watcher = None
+    if watch:
+        watcher = threading.Thread(target=_watch_alerts_lease,
+                                   args=(lease, execution, stop),
+                                   name="alerts-lease", daemon=True)
+        watcher.start()
     try:
         code = int(proc.wait())
     finally:
@@ -422,7 +446,8 @@ def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease,
         # would race the driver. The child is already stopped by the local
         # deadline even if this renewal never returns; the TTL then frees the
         # pass for the other hosts.
-        watcher.join()
+        if watcher is not None:
+            watcher.join()
     return code, execution.lost.is_set()
 
 
@@ -595,6 +620,26 @@ def _record(report: dict, *, host: str, argv: list[str] | None = None,
     return out
 
 
+class _ReleaseLease(_AlertsLease):
+    """One elected release tick, including packet-watch, across candidates.
+
+    The existing local deadline kills the process group even if the role or
+    execution renewal blocks. A changed role stops renewing this execution.
+    """
+    def __init__(self, db, role, host, epoch):
+        super().__init__(db, role, host)
+        self.key = "release-pass:" + role
+        self.role, self.host, self.role_epoch = role, host, epoch
+
+    def renew(self):
+        current = live(self.db, self.role)
+        if (not current["held"] or current["stopped"]
+                or current["host"] != self.host
+                or current["epoch"] != self.role_epoch):
+            return False
+        return super().renew()
+
+
 def run(cfg, args) -> int:
     """The `ameesh role run ROLE -- command` entry point."""
     name = args.role
@@ -610,8 +655,8 @@ def run(cfg, args) -> int:
         print("ameesh role run: this host has no name (AMEESH_HOST or config host)",
               file=sys.stderr)
         return 2
-    if pass_name and pass_name != "alerts":
-        print("ameesh role run: unknown delegated pass %r (only: alerts)" % pass_name,
+    if pass_name and pass_name not in ("alerts", "release"):
+        print("ameesh role run: unknown delegated pass %r (only: alerts, release)" % pass_name,
               file=sys.stderr)
         return 2
 
@@ -744,6 +789,21 @@ def run(cfg, args) -> int:
                     print("ameesh role run: alerts delegation memory not "
                           "written: %s" % exc, file=sys.stderr)
                 report["delegation_recorded"] = bool(remembered)
+            if pass_name == "release":
+                lease = _ReleaseLease(db, report["role"], host, report["epoch"])
+                if not lease.acquire():
+                    report["code"] = "release-busy"
+                    report["detail"] = "another release tick holds the execution lease"
+                    emit(report, result="standby")
+                    return 0
+                execution = _AlertsExecution(lease)
+                execution.start()
+                fresh = live(db, name)
+                if (not fresh["held"] or fresh["stopped"]
+                        or fresh["host"] != host or fresh["epoch"] != report["epoch"]
+                        or execution.lost.is_set() or lease.remaining() <= 0):
+                    emit(fresh, result="standby")
+                    return 0
             env = os.environ.copy()
             # The command is not an agent turn: never inherit the shell's turn,
             # identity or a foreign tenure. Its explicit actor is the ROLE, under
@@ -781,7 +841,7 @@ def run(cfg, args) -> int:
             if lease is not None:
                 code, lost = _run_under_lease(argv, env, lease, execution)
                 if lost:
-                    print("ameesh role run: alerts execution lease lost; the "
+                    print("ameesh role run: execution lease lost; the "
                           "child was stopped", file=sys.stderr)
                     return 1
             else:
@@ -828,9 +888,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("role", help="agent name of the role (aliases accepted)")
     parser.add_argument("--pass", dest="pass_name", default="", metavar="PASS",
-                        choices=("alerts",),
+                        choices=("alerts", "release"),
                         help="run this pass under its own delegation instead of "
-                             "the lease alone (#3568: only `alerts`; the pass "
+                             "the lease alone (`release` is fenced and exclusive; `alerts` "
                              "runs on the holder when it can push, else on the "
                              "first candidate that can)")
     parser.add_argument("--min-left", type=float, default=0.0,
