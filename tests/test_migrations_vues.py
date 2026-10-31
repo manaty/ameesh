@@ -21,6 +21,7 @@ import uuid
 from ameesh import db as db_mod
 from ameesh import migrations
 from tests.support import REPO, TEST_DSN, PgTestCase
+from tests.role_acl import serialize_role_acl
 
 ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-superviseur.sql")
 RUNNER_SEEN = ["runner_seen_at", "runner_seen_host", "runner_seen_owner"]
@@ -60,6 +61,11 @@ class GardeVueEtoileTest(unittest.TestCase):
 class VueOverviewBaseExistanteTest(PgTestCase):
     """Le schéma de la classe est la base NEUVE de référence ; le témoin migre
     une seconde base dans l'ordre réel d'une base existante."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        serialize_role_acl(cls)
 
     def colonnes(self, db, rel: str) -> list[str]:
         return [r["attname"] for r in db.query(

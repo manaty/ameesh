@@ -21,6 +21,7 @@ import uuid
 from ameesh import db as db_mod
 from ameesh import migrations
 from tests.support import REPO, TEST_DSN, PgTestCase
+from tests.role_acl import serialize_role_acl
 
 ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-superviseur.sql")
 ROLE_CONTENUS_SQL = os.path.join(REPO, "deploy", "sql", "role-superviseur-contenus.sql")
@@ -462,6 +463,7 @@ class SuperviseurRoleTest(PgTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        serialize_role_acl(cls)
         suffix = uuid.uuid4().hex[:8]
         cls.role = "t_sup_%s" % suffix
         cls.role_contenus = "t_supc_%s" % suffix
@@ -699,6 +701,21 @@ class SuperviseurRoleTest(PgTestCase):
                     finally:
                         self.db.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA %s REVOKE SELECT ON "
                                         "TABLES FROM %s" % (q(autre), q(role)))
+            # #5082 : fenêtre exacte du test approve qui polluait les autres
+            # workers ; le refus global reste nécessaire en production.
+            self.db.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT ON "
+                            "TABLES TO PUBLIC" % q(autre))
+            self.db.execute("GRANT USAGE ON SCHEMA %s TO PUBLIC" % q(autre))
+            try:
+                for path, role in ((ROLE_SQL, self.role), (ROLE_CONTENUS_SQL, self.role_contenus)):
+                    proc = self.run_script(path, role)
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn("ACL par défaut hors du schéma %s (r, %s) : SELECT à PUBLIC"
+                                  % (self.schema, autre), proc.stderr)
+            finally:
+                self.db.execute("REVOKE USAGE ON SCHEMA %s FROM PUBLIC" % q(autre))
+                self.db.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA %s REVOKE SELECT ON "
+                                "TABLES FROM PUBLIC" % q(autre))
         finally:
             self.db.execute("DROP SCHEMA %s CASCADE" % q(autre))
         self.apply_script(ROLE_SQL, self.role)

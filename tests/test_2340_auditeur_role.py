@@ -26,6 +26,7 @@ import uuid
 
 from ameesh import db as db_mod
 from tests.support import REPO, TEST_DSN, PgTestCase
+from tests.role_acl import serialize_role_acl
 
 ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-superviseur.sql")
 CONTENTS_SQL = os.path.join(REPO, "deploy", "sql", "role-superviseur-contenus.sql")
@@ -48,6 +49,7 @@ class AuditeurLoginRoleTest(PgTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        serialize_role_acl(cls)
         suffix = uuid.uuid4().hex[:8]
         cls.etat = "t_aud_e_%s" % suffix
         cls.contenus = "t_aud_c_%s" % suffix
