@@ -8,6 +8,7 @@ import socket
 import time
 import shutil
 import stat
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -24,6 +25,28 @@ tool = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tool)
 
 
+class PrivateInputTest(unittest.TestCase):
+    def test_rejects_service_options_nested_uri_and_multiple_endpoints(self):
+        for dsn in ("service=ambient", "host=example port=5432 dbname=db user=owner options='-c role=admin'",
+                    "host=example port=5432 dbname='postgresql://other@elsewhere/db' user=owner",
+                    "host=one,two port=5432 dbname=db user=owner",
+                    "host=example hostaddr=127.0.0.1,127.0.0.2 port=5432 dbname=db user=owner"):
+            with self.subTest(case=dsn.split()[0]):
+                with self.assertRaises(tool.IdentityError):
+                    tool.connection(dsn)
+
+    def test_cli_masks_exceptions_and_ignores_ambient_credentials(self):
+        secret = uuid.uuid4().hex
+        env = dict(os.environ, PGPASSWORD=secret, PGHOST='must-not-be-used.invalid')
+        result = subprocess.run([sys.executable, '-I', '-B', str(REPO / 'deploy/postgres/enroler-identites.py'),
+                                 'invalid-operation'], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(secret not in result.stdout + result.stderr, 'ambient credential escaped')
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(json.loads(result.stderr),
+                         {'error': 'identity_enrollment_refused; private source and intents retained'})
+
+
 class RealIdentityTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -31,11 +54,12 @@ class RealIdentityTest(unittest.TestCase):
         local = (binaries / 'initdb').exists() and os.geteuid() != 0
         if not local and not shutil.which('docker'):
             raise unittest.SkipTest('isolated PostgreSQL cluster tools required')
-        cls.temporary = tempfile.TemporaryDirectory(prefix='identity5162-', dir=os.environ.get('TMPDIR'))
+        cls.temporary = tempfile.TemporaryDirectory(prefix='i5162-', dir=os.environ.get('TMPDIR'))
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         cls.dsns = []
         cls.container_ids = []
+        cls.socket_dsns = []
         for index in range(2):
             root = cls.root / str(index)
             root.mkdir(mode=0o700)
@@ -46,13 +70,20 @@ class RealIdentityTest(unittest.TestCase):
                 envfile = root / 'container.env'
                 envfile.write_text('POSTGRES_USER=test_admin\nPOSTGRES_PASSWORD=' + password.read_text() + '\n')
                 envfile.chmod(0o600)
+                sockets = root / 's'
+                sockets.mkdir(mode=0o700)
+                sockets.chmod(0o777)  # private fixture parent, writable only inside the mount
+                with socket.socket() as sock:
+                    sock.bind(('127.0.0.1', 0))
+                    port = sock.getsockname()[1]
                 result = subprocess.run(['docker', 'run', '-d', '--env-file', str(envfile),
-                                         '-p', '127.0.0.1::5432', 'postgres:16'], check=True, capture_output=True, text=True)
+                                         '--network', 'host', '-v', str(sockets) + ':/socket',
+                                         'postgres:16', '-c', 'listen_addresses=127.0.0.1',
+                                         '-c', 'port=' + str(port), '-c', 'unix_socket_directories=/var/run/postgresql,/socket'],
+                                        check=True, capture_output=True, text=True)
                 container = result.stdout.strip()
                 cls.container_ids.append(container)
                 cls.addClassCleanup(subprocess.run, ['docker', 'rm', '-f', '-v', container], capture_output=True)
-                ports = subprocess.check_output(['docker', 'inspect', '--format', '{{json .NetworkSettings.Ports}}', container], text=True)
-                port = json.loads(ports)['5432/tcp'][0]['HostPort']
                 dsn = make_conninfo(host='127.0.0.1', port=port, dbname='postgres',
                                    user='test_admin', password=password.read_text(), connect_timeout=2)
                 deadline = time.monotonic() + 45
@@ -62,9 +93,12 @@ class RealIdentityTest(unittest.TestCase):
                             break
                     except psycopg.OperationalError:
                         if time.monotonic() > deadline:
+                            logs = subprocess.run(['docker', 'logs', container], capture_output=True)
+                            (root / 'server-private.log').write_bytes(logs.stdout + logs.stderr)
                             raise RuntimeError('disposable PostgreSQL cluster unavailable') from None
                         time.sleep(0.2)
                 cls.dsns.append(dsn)
+                cls.socket_dsns.append(make_conninfo(dsn, host=str(sockets)))
                 continue
             subprocess.run([str(binaries / 'initdb'), '-D', str(root / 'data'), '-U', 'test_admin',
                             '--auth-local=trust', '--auth-host=scram-sha-256', '--pwfile', str(password)],
@@ -79,6 +113,7 @@ class RealIdentityTest(unittest.TestCase):
                                                  '-m', 'immediate', '-w', 'stop'], capture_output=True)
             cls.dsns.append(make_conninfo(host='127.0.0.1', port=port, dbname='postgres',
                                           user='test_admin', password=password.read_text()))
+            cls.socket_dsns.append(make_conninfo(cls.dsns[-1], host=str(root)))
 
     def setUp(self):
         self.suffix = uuid.uuid4().hex[:10]
@@ -153,7 +188,7 @@ class RealIdentityTest(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT count(*) FROM mesh.agent_registry').fetchone()[0], 0)
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):
                 conn.execute("SELECT * FROM mesh.payload")
-        with psycopg.connect(source['backup_dsn']) as conn:
+        with psycopg.connect(source['backup_dsn'], autocommit=True) as conn:
             self.assertEqual(conn.execute('SELECT count(*) FROM mesh.payload').fetchone()[0], 2)
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):
                 conn.execute('CREATE DATABASE probe_forbidden')
@@ -190,6 +225,18 @@ class RealIdentityTest(unittest.TestCase):
         wrong = dict(params, user=self.value['backup_role'], password=source['passwords']['backup'])
         with self.assertRaises(psycopg.OperationalError):
             psycopg.connect(**wrong)
+
+    def test_peer_administration_socket_generates_authenticated_loopback_login(self):
+        self.value['restore_owner_dsn'] = self.socket_dsns[1]
+        self.value['restore_login_host'] = '127.0.0.1'
+        self.enroll()
+        source = self.source_doc()
+        parameters = tool.connection(source['restore_dsn'])
+        self.assertEqual(parameters['host'], '127.0.0.1')
+        self.assertEqual(parameters['port'], tool.connection(self.socket_dsns[1])['port'])
+        with psycopg.connect(source['restore_dsn'], autocommit=True) as conn:
+            self.assertEqual(conn.execute('SELECT current_user').fetchone()[0], self.value['restore_role'])
+            conn.execute(sql.SQL('CREATE DATABASE {} TEMPLATE template0').format(sql.Identifier('probe_' + self.suffix)))
 
     def test_refuses_same_cluster_even_different_database(self):
         self.value['restore_owner_dsn'] = self.dsns[0]

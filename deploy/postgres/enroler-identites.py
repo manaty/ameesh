@@ -86,16 +86,20 @@ def save_new(path, value):
 
 
 def validate(value):
-    require(isinstance(value, dict) and set(value) == {
+    require(isinstance(value, dict) and set(value) - {'restore_login_host'} == {
         'version', 'operation', 'source_owner_dsn', 'restore_owner_dsn', 'schema',
         'controller_role', 'backup_role', 'restore_role', 'group_role'}, 'exact private input required')
-    require(value['version'] == 1, 'unsupported source version')
+    require(type(value['version']) is int and value['version'] == 1, 'unsupported source version')
     for key in ('operation', 'schema', 'controller_role', 'backup_role', 'restore_role', 'group_role'):
         require(isinstance(value[key], str) and NAME.fullmatch(value[key]), 'invalid identity name')
     names = [value[k] for k in ('controller_role', 'backup_role', 'restore_role', 'group_role')]
     require(len(set(names)) == 4 and all(not n.startswith('pg_') for n in names), 'distinct private roles required')
     for key in ('source_owner_dsn', 'restore_owner_dsn'):
         connection(value[key])
+    if 'restore_login_host' in value:
+        require(value['restore_login_host'] == '127.0.0.1'
+                and connection(value['restore_owner_dsn'])['host'].startswith('/'),
+                'restore login override requires a local peer administrator and loopback')
     return value
 
 
@@ -105,19 +109,24 @@ def connection(dsn):
                        'sslrootcert', 'sslcert', 'sslkey', 'connect_timeout'},
             'explicit flat connection required; no services or options')
     require(all(p.get(k) for k in ('host', 'port', 'dbname', 'user')), 'explicit endpoint required')
-    require(not any(c in p['host'] for c in ',\n\r') and ',' not in p['port'], 'single endpoint required')
+    require(not p['dbname'].startswith(('postgresql://', 'postgres://')), 'nested database URI refused')
+    require(not any(c in p['host'] for c in ',\n\r') and ',' not in p['port']
+            and ',' not in p.get('hostaddr', ''), 'single endpoint required')
     p['connect_timeout'] = '10'
     return p
 
 
-def login_dsn(owner, role, password):
+def login_dsn(owner, role, password, *, host=None):
     p = connection(owner)
     p.update(user=role, password=password)
+    if host is not None:
+        p['host'] = host
+        p.pop('hostaddr', None)
     return make_conninfo(**p)
 
 
 def session(dsn):
-    conn = psycopg.connect(**connection(dsn))
+    conn = psycopg.connect(**connection(dsn), passfile='/nonexistent')
     try:
         # Disable statement/parameter logging before even a SCRAM verifier SQL.
         # No plaintext password is ever sent in an SQL statement.
@@ -305,6 +314,11 @@ def enroll(value, directory):
     with session(value['source_owner_dsn']) as live, session(value['restore_owner_dsn']) as restore:
         source_cluster, restore_cluster = cluster(live), cluster(restore)
         require(source_cluster != restore_cluster, 'restore target must be a distinct PostgreSQL cluster')
+        if value.get('restore_login_host'):
+            require(restore.execute('SHOW listen_addresses').fetchone()[0] == '127.0.0.1',
+                    'restore cluster must listen only on enrolled loopback')
+            require(restore.execute('SHOW port').fetchone()[0] == connection(value['restore_owner_dsn'])['port'],
+                    'restore cluster port differs from private source')
         require(not live.execute('SELECT 1 FROM pg_roles WHERE rolname=%s', (value['restore_role'],)).fetchone(),
                 'restore identity must not exist on the live cluster')
     source_path = Path(directory) / 'credentials.json'
@@ -328,7 +342,8 @@ def enroll(value, directory):
                       database=dict(backend='postgres', schema=value['schema'],
                                     dsn=login_dsn(value['source_owner_dsn'], value['controller_role'], passwords['controller'])),
                       backup_dsn=login_dsn(value['source_owner_dsn'], value['backup_role'], passwords['backup']),
-                      restore_dsn=login_dsn(value['restore_owner_dsn'], value['restore_role'], passwords['restore']))
+                      restore_dsn=login_dsn(value['restore_owner_dsn'], value['restore_role'], passwords['restore'],
+                                            host=value.get('restore_login_host')))
         save_new(source_path, source)
     apply_group(value, directory)
     with session(value['source_owner_dsn']) as live:
