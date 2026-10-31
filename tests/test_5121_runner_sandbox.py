@@ -36,6 +36,22 @@ class SelectionTest(card_fixture.SandboxCase):
                 mock.patch.object(runtime, '_pinned_canon', side_effect=AssertionError('not opt-in')):
             self.assertIsNone(runtime.select(self.worker()))
 
+    def test_local_card_edit_cannot_bypass_a_still_pinned_sandbox_block(self):
+        self.commit()
+        pinned, _ = self.load(trusted=True)
+        self.write('agents/tpk-reviewer.md', card_fixture.agent_card().split('sandbox:')[0] + '---\n')
+        self.commit()
+        local, _ = self.load(trusted=True)
+        state = dict(last_good_commit=pinned.sources[0].commit, checked_ts=time.time(), status='ok')
+        worker = self.worker()
+        worker.fail_turn = mock.Mock()
+        with mock.patch.object(canon, 'load_configured', return_value=[local]), \
+                mock.patch.object(runtime, '_pinned_canon', return_value=(pinned, state, pinned.sources[0].commit)), \
+                mock.patch.object(runtime.account_turn, 'for_turn', return_value=NS(billing_account='provider', reserve_usd=2)), \
+                mock.patch.object(runtime, 'run', return_value=True) as run:
+            self.assertTrue(runtime.dispatch(worker, {}))
+        run.assert_called_once()
+
     def test_unloadable_canon_without_declaration_keeps_legacy(self):
         with mock.patch.object(canon, 'load_configured', return_value=[]):
             self.assertIsNone(runtime.select(self.worker()))

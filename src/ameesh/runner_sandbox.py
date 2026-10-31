@@ -94,10 +94,16 @@ def select(worker):
     matches = [c for c in canon.load_configured(worker.cfg) if c.owns(worker._canon_id())]
     declared = [c for c in matches if c.agent(worker.name) is not None
                 and 'sandbox' in c.agent(worker.name).fiche.data]
-    if not declared:
-        return None
     try:
         loaded, state, pinned = _pinned_canon(worker)
+    except Exception:
+        # No declared sandbox must ever make a legacy agent depend on sync.
+        # When a pinned revision is available it remains authoritative: a
+        # local card edit must not bypass a still-synchronized sandbox block.
+        if not declared:
+            return None
+        raise s1.Refusal('profile-refused') from None
+    try:
         card = loaded.agent(worker.name)
         if card is None:
             return None
