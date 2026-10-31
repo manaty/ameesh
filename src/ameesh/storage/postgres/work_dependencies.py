@@ -92,6 +92,26 @@ def wake_defers(alias: str) -> str:
                 a=alias, qa=lifecycle.QA)
 
 
+#: #5151 : `planned_source` des dates écrites par `work schedule`
+#: (`lot_schedule.SOURCE`, recopié ici : le stockage n'importe pas le planificateur)
+SCHEDULE_SOURCE = "reference p80"
+
+
+def start_defers(alias: str, today: str) -> str:
+    """#5151 : ce début planifié futur écarte-t-il encore ce lot ?
+
+    Un début après `today` (expression SQL du jour local) vaut attente, sauf
+    pour un lot de priorité 1 daté par le planificateur (`SCHEDULE_SOURCE`) :
+    cette date n'est qu'une projection de file, pas une attente déclarée. Une
+    date posée à la main reste une attente, même en P1. L'appelant écrit
+    `AND NOT ` + ce prédicat (sans `%`, sûr dans une requête paramétrée).
+    """
+    return ("({a}.planned_start IS NOT NULL AND {a}.planned_start > {t}"
+            " AND NOT (coalesce({a}.priority, 2) = 1"
+            " AND left(coalesce({a}.planned_source, ''), {n}) = '{src}'))").format(
+                a=alias, t=today, n=len(SCHEDULE_SOURCE), src=SCHEDULE_SOURCE)
+
+
 def not_blocking(alias: str) -> str:
     """#2252 : prédicat SQL « ce lot ne bloque plus » — il est FUSIONNÉ
     (`merged`/`promoted`/`closed`). Un lot en `qa`, même à verdict courant
