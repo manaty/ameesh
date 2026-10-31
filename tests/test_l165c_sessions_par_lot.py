@@ -1271,6 +1271,37 @@ class ReveilTest(_Base):
         self.assertIn('hold: <reason>', spec["prompt"])
         self.assertIsNone(self.pick(worker), "pas deux réveils de suite")
 
+    def test_future_wake_without_hold_waits_in_intake_and_build(self):
+        for state in ("intake", "build"):
+            with self.subTest(state=state):
+                name = "wake5028" + state
+                worker = self._worker(name)
+                lot = work.add(self.db, title="scheduled without hold", assignee=name)["id"]
+                if state == "build":
+                    work.move(self.db, lot, state)
+                self.db.execute("UPDATE work_items SET wake_at = clock_timestamp()"
+                                " + interval '1 hour' WHERE id = %s", (lot,))
+                self.assertEqual(self.st.actionable(name), [])
+                self.assertIsNone(self.pick(worker))
+                self.assertEqual(self.st.listing(name), [])
+                row = next(r for r in storage.of(self.db).operations.listing()
+                           if r["name"] == name)
+                self.assertEqual(row["actionable_lots"], 0)
+                self.assertEqual(row["active_lots"], 0)
+                from ameesh import planned_waits
+                rows = [r for r in storage.of(self.db).operations.open_lots_activity(None)
+                        if r["id"] == lot]
+                self.assertGreater(rows[0]["wake_ts"], time.time())
+                waits = planned_waits.read(self.db, rows, packets=False)
+                self.assertEqual(waits[lot]["what"], "scheduled")
+                self.db.execute("UPDATE work_items SET wake_at = clock_timestamp()"
+                                " - interval '1 second' WHERE id = %s", (lot,))
+                self.assertEqual([r["id"] for r in self.st.actionable(name)], [lot])
+                row = next(r for r in storage.of(self.db).operations.listing()
+                           if r["name"] == name)
+                self.assertEqual(row["actionable_lots"], 1)
+                self.assertEqual(self.pick(worker)["lot"], str(lot))
+
     def test_backoff_en_base_survit_au_redemarrage(self):
         worker = self._worker("r2")
         b = work.add(self.db, title="à faire", assignee="r2", force=_FORCE)["id"]

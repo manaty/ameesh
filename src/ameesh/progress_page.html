@@ -917,7 +917,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   function plannedWaitLabel(lot) {
     var wait = lot.planned_wait;
     if (!wait) return "";
-    if (wait.what === "scheduled") return "planned start " + wait.start;
+    if (wait.what === "scheduled") return (wait.wake_ts != null ? "scheduled wake " : "planned start ") + wait.start;
     if (wait.what === "hold") {
       if (wait.gate) return "external hold until " + wait.until + " (" + wait.gate + ")";
       return "hold" + (wait.by ? " by " + wait.by : "")

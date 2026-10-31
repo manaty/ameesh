@@ -571,7 +571,8 @@ def wait_label(wait, plural="lots"):
     if not wait:
         return None
     if wait["what"] == "scheduled":
-        return "planned start %s" % wait["start"]
+        return ("scheduled wake %s" if wait.get("wake_ts") is not None
+                else "planned start %s") % wait["start"]
     if wait["what"] == "hold":
         if wait.get("gate"):
             return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
