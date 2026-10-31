@@ -165,6 +165,20 @@ with tempfile.TemporaryDirectory() as root:
             self.assertTrue(E.managed_entry())
             harden.assert_not_called()
 
+    def test_hook_and_statusline_fallback_never_query_service_manager(self):
+        from ameesh import entry, cli
+        for argv in (["hook", "claude"], ["statusline"]):
+            with self.subTest(argv=argv), \
+                    mock.patch.dict(os.environ, INVOCATION_ID="inherited"), \
+                    mock.patch.object(E, "install") as install, \
+                    mock.patch.object(P, "executor_processes") as snapshot, \
+                    mock.patch.object(entry, "_charge_config", return_value=None), \
+                    mock.patch.object(cli, "main", return_value=0) as full:
+                self.assertEqual(entry.main(argv), 0)
+                install.assert_called_once_with()
+                snapshot.assert_not_called()
+                full.assert_called_once_with(argv)
+
     def test_mechanical_scripts_receive_transport_but_no_provider_credentials(self):
         env = E.execution_transport(dict(AMEESH_DSN="db", GH_TOKEN="github",
                                         DEEPSEEK_API_KEY="provider",

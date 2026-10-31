@@ -120,6 +120,7 @@ class HookRapideTest(PgTestCase):
     # -- décision rapide ---------------------------------------------------
     def test_posttooluse_sans_base_quand_rien_a_faire(self):
         env = self._marqueur_frais()
+        env["INVOCATION_ID"] = "inherited-from-runner"
         garde = (
             "import sys\n"
             "def refuser(event, args):\n"
@@ -311,6 +312,28 @@ class HookRapideTest(PgTestCase):
         self.assertNotIn("✉", frais.stdout)
 
     # -- suites de la relecture (#1628) ------------------------------------
+
+    def test_statusline_en_cache_sans_spawn_avec_invocation_heritee(self):
+        payload = json.dumps({"workspace": {"current_dir": self.tmp}})
+        env = self.env(AGENT_MAIL_NAME="alpha", INVOCATION_ID="inherited-from-runner")
+        first = self.entry("statusline", env=env, stdin=payload)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        guard = (
+            "import sys\n"
+            "def refuse(event, args):\n"
+            "    if event in ('socket.connect', 'subprocess.Popen'):\n"
+            "        raise AssertionError('cached statusline: ' + event)\n"
+            "sys.addaudithook(refuse)\n"
+        )
+        probe = SONDE.replace("['agent-mail', 'hook', 'claude']",
+                              "['agent-mail', 'statusline']")
+        cached = subprocess.run([sys.executable, "-c", guard + probe],
+                                input=payload, capture_output=True, text=True,
+                                timeout=60, env=env, cwd=self.tmp)
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+        self.assertEqual(cached.stdout, first.stdout +
+                         "rc 0\nrapide\nsans-base\nsans-psycopg\n")
+        self.assertEqual(cached.stderr, "")
 
     def test_statusline_ne_partage_pas_la_ligne_entre_deux_agents(self):
         """#1628 N1 : sans session_id, deux sessions d'un même dossier ne

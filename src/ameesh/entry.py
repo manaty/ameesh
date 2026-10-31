@@ -76,10 +76,15 @@ def _rapide_hook(cfg, fastmail, rest: list) -> int | None:
 
 
 def main(argv: list | None = None) -> int:
-    from .platform.child_environment import managed_entry
-    if not managed_entry():
-        return 1
     argv = list(sys.argv[1:] if argv is None else argv)
+    from .platform.child_environment import install, managed_entry
+    if argv[:1] in (["statusline"], ["hook"]):
+        # Hooks inherit INVOCATION_ID from the runner, but are not service
+        # MainPIDs. Keep their child filter without querying systemd, including
+        # when a cache miss takes the full CLI path.
+        install()
+    elif not managed_entry():
+        return 1
     if argv[:1] in (["statusline"], ["hook"]) and not any(
             arg in ("-h", "--help") for arg in argv[1:]):
         try:
