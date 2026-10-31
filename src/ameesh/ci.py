@@ -3307,6 +3307,44 @@ def _covers(have: str, want: str) -> bool:
     return have == want or (want == "lot" and have == "full")
 
 
+def _alive_or_green(run: dict) -> bool:
+    return run["status"] in OPEN_STATUSES or (run["status"] == "completed"
+                                              and run["conclusion"] == "success")
+
+
+def _cutoff_why(run: dict, base: str) -> str:
+    """La trace d'un run qui couvre la composition depuis une base de coupure."""
+    if run["base"] == base:
+        return ""
+    return ("; run on base %s, the target advanced only by cutoff landings (canon §12)"
+            % run["base"][:12])
+
+
+def _cutoff_bases(cfg, db, item, slug: str, target: str, base: str, runs,
+                  mode: str, *, checkout: str = "") -> list[str]:
+    """#5192 (canon §12) : les bases d'autres runs de la tête qui couvrent `base`.
+
+    Une cible avancée par les seuls atterrissages d'une coupure (version et
+    notes) ne fait pas une nouvelle composition : un run vivant ou vert de la
+    même tête et du même mode, sur une base dont `base` ne diffère que par ces
+    commits, la couvre déjà ; reposer l'étiquette annulerait ce run (groupe de
+    concurrence de tests.yml). Même règle que la fusion
+    (`packet_automerge._cutoff_landing_only`) et même clone (`_gate_repo`).
+    Un clone absent ou illisible, ou un commit de code dans l'intervalle, ne
+    couvre rien : la demande part comme avant."""
+    candidates = sorted({r["base"] for r in runs if r["base"] != base
+                         and _covers(r["mode"], mode) and _alive_or_green(r)})
+    if not candidates:
+        return []
+    from . import packet_automerge
+    repo = packet_automerge._gate_repo(cfg, db, item, slug, checkout)
+    if not repo:
+        return []
+    # la pointe de la cible peut manquer au clone : sans elle, rien ne couvre
+    packet_automerge._fetch_into(repo, (target,))
+    return [b for b in candidates if packet_automerge._cutoff_landing_only(repo, b, base)]
+
+
 def _latest_check(api, repo: str, sha: str) -> dict | None:
     """Le dernier check run `tests` de la tête : ce que la fusion regarderait.
 
@@ -3409,7 +3447,7 @@ def reservation_holder(events: list[dict], sha: str, base: str, mode: str, token
 
 def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
              exception: str = "", reason: str = "", full: bool = False,
-             force: bool = False, repo: str = "") -> dict:
+             force: bool = False, repo: str = "", checkout: str = "") -> dict:
     """La décision de `ameesh ci run <lot>`, sans aucune écriture.
 
     Rend `{schema, action: request|green|running|refuse, …}` : `request` est le
@@ -3544,8 +3582,13 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                      if dispatch is not None else
                      _pr_request_runs(api, name, pr["number"], frozen_sha, branch))
     #: P1 R1 : la composition compte — même tête mais autre base, ou mode
-    #: insuffisant (`lot` ne prouve pas le `full`), ne verdit pas.
-    applicable = [r for r in runs if r["base"] == base and _covers(r["mode"], mode)]
+    #: insuffisant (`lot` ne prouve pas le `full`), ne verdit pas. #5192 : sauf
+    #: une base que seuls des atterrissages de coupure séparent de `base`, pour
+    #: un run vivant ou vert (canon §12).
+    cutoff = _cutoff_bases(cfg, db, item, name, pr["base_ref"] or target, base, runs, mode,
+                           checkout=checkout)
+    applicable = [r for r in runs if _covers(r["mode"], mode)
+                  and (r["base"] == base or r["base"] in cutoff and _alive_or_green(r))]
     live = [r for r in applicable if r["status"] in OPEN_STATUSES]
     green = [r for r in applicable if r["status"] == "completed"
              and r["conclusion"] == "success"]
@@ -3559,6 +3602,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                 "exception": exception, "reason": reason.strip(), "avis": avis,
                 "verdicts": sorted((m.get("actor") or "") for m in reviews),
                 "frozen": bool(freeze), "runs": len(runs),
+                **({"cutoff_bases": cutoff} if cutoff else {}),
                 "unreadable": [{"id": r["id"], "mode": r["mode"],
                                 "conclusion": r["conclusion"] or r["status"] or "?"}
                                for r in carried],
@@ -3569,8 +3613,9 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
     if live:
         return {**decision, "action": "running",
                 "why": "a %s request of this composition (PR #%d, %s, base %s) is already "
-                       "in flight: nothing posed"
-                       % (live[0]["mode"], pr["number"], frozen_sha[:12], base[:12]),
+                       "in flight%s: nothing posed"
+                       % (live[0]["mode"], pr["number"], frozen_sha[:12], base[:12],
+                          _cutoff_why(live[0], base)),
                 "run": _short_run(live[0]["row"])}
     if green:
         #: le vert applicable ne suffit pas si le dernier check requis de la
@@ -3581,8 +3626,9 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                              and check["conclusion"] in CHECK_GREEN):
             return {**decision, "action": "green",
                     "why": "already green on this composition (PR #%d, %s, base %s, "
-                           "mode %s): nothing posed"
-                           % (pr["number"], frozen_sha[:12], base[:12], mode),
+                           "mode %s%s): nothing posed"
+                           % (pr["number"], frozen_sha[:12], base[:12], mode,
+                              _cutoff_why(green[-1], base)),
                     "run": _short_run(green[-1]["row"])}
         if check["status"] != "completed":
             return {**decision, "action": "running",
@@ -3894,7 +3940,11 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
         #: ensuite ne sera pas libérée par eux.
         watermark = max([_run_id(r["row"]) for r in known]
                         + [r["id"] for r in carried], default=0)
-        runs = [r for r in known if r["base"] == base and _covers(r["mode"], mode)]
+        #: #5192 : les bases de coupure retenues par `gel_plan` (canon §12)
+        #: couvrent aussi la composition, pour un run vivant ou vert seulement.
+        cutoff = set(decision.get("cutoff_bases") or ())
+        runs = [r for r in known if _covers(r["mode"], mode)
+                and (r["base"] == base or r["base"] in cutoff and _alive_or_green(r))]
         live = [r for r in runs if r["status"] in OPEN_STATUSES]
         green = [r for r in runs if r["status"] == "completed" and r["conclusion"] == "success"]
         if live:
@@ -4211,7 +4261,8 @@ def cmd_ci_run(cfg, args) -> int:
         decision = gel_plan(db, cfg, args.id, api=api, sha=args.sha or "",
                             avis=args.avis, exception=args.exception or "",
                             reason=args.reason or "", full=args.full, force=args.force,
-                            repo=args.repo or "")
+                            repo=args.repo or "",
+                            checkout=getattr(args, "prevalidation_repo", "") or "")
     except (GelError, plan_github.GithubError) as exc:
         if getattr(args, "json", False):
             print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
