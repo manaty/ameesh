@@ -499,10 +499,10 @@ _MARKER = re.compile(r"--\s*ameesh\s*:\s*non[- ]additive", re.IGNORECASE)
 _PRIVILEGES_CHECKED_AFTER = 528
 _REVOKE = re.compile(r"\brevoke\b[^;]*?\bon\s+(?:(table|function|sequence)\s+)?([\w.\"]+)"
                      r"\s*(\([^)]*\))?\s*(from\b)?|\brevoke\b")
-#: toute chaîne SQL : un CREATE qu'elle contient n'est pas forcément exécuté
-_SQL_STRING = re.compile(r"\$(\w*)\$.*?\$\1\$|\be'(?:[^'\\]|\\.|'')*'|'(?:[^']|'')*'")
+_DOLLAR_TAG = re.compile(r"\$(?:[^\W\d]\w*)?\$")
 _ALTER_TABLE = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s[^;]*")
-_ADD_CONSTRAINT = re.compile(r"\badd\s+constraint\s+([\w\"]+)")
+_ADD_CONSTRAINT = re.compile(r"\badd\s+(?:constraint\s+([\w\"]+)"
+                             r"|(primary\s+key|unique|check|foreign\s+key)\b)")
 #: le texte ne dit pas si une contrainte élargit ou resserre : celle qui ne
 #: resserre pas (remplacée pour l'élargir, posée sur une colonne neuve) le déclare
 _CONSTRAINT_MARKER = re.compile(r"--\s*ameesh\s*:\s*constraint\s+not\s+tightened", re.IGNORECASE)
@@ -530,8 +530,56 @@ def non_additive(migration: Migration) -> list[str]:
         if not recreated.search(text, match.end()):
             reasons.append("removal (drop %s %s)" % (kind, name))
     if migration.version > _PRIVILEGES_CHECKED_AFTER:
-        reasons.extend(_privilege_reasons(text, migration.sql))
+        reasons.extend(_privilege_reasons(migration.sql))
     return reasons
+
+
+def _lex(sql: str) -> tuple[str, str]:
+    """(texte sans commentaires, texte sans commentaires ni chaînes), en une
+    seule passe : le délimiteur d'une chaîne ne se lit jamais dans un
+    commentaire, ni l'inverse. Une fin manquante garde le reste pour commentaire
+    ou chaîne : le CREATE qu'il contiendrait ne prouve rien."""
+    kept, code, at, size = [], [], 0, len(sql)
+    while at < size:
+        two = sql[at:at + 2]
+        dollar = _DOLLAR_TAG.match(sql, at) if sql[at] == "$" else None
+        if two == "--":
+            end = sql.find("\n", at)
+            at = size if end < 0 else end
+        elif two == "/*":
+            depth, at = 1, at + 2
+            while at < size and depth:
+                two = sql[at:at + 2]
+                depth += (two == "/*") - (two == "*/")
+                at += 2 if two in ("/*", "*/") else 1
+            kept.append(" "), code.append(" ")
+        elif dollar or sql[at] in "'\"":
+            if dollar:
+                closing = sql.find(dollar.group(0), dollar.end())
+                end = size if closing < 0 else closing + len(dollar.group(0))
+            else:
+                end = at + 1
+                # E'' seul connaît l'échappement par barre oblique
+                escaped = sql[at] == "'" and at and sql[at - 1] in "eE" and not (
+                    at > 1 and (sql[at - 2].isalnum() or sql[at - 2] == "_"))
+                while end < size:
+                    if escaped and sql[end] == "\\":
+                        end += 2
+                    elif sql[end] == sql[at]:
+                        if sql[end + 1:end + 2] != sql[at]:
+                            break
+                        end += 2
+                    else:
+                        end += 1
+                end = min(end + 1, size)
+            kept.append(sql[at:end])
+            # un identifiant entre guillemets reste du code, pas une chaîne
+            code.append(sql[at:end] if sql[at] == '"' else " ")
+            at = end
+        else:
+            kept.append(sql[at]), code.append(sql[at])
+            at += 1
+    return "".join(kept), "".join(code)
 
 
 def _param_types(params: str, *, named: bool) -> list[str]:
@@ -543,18 +591,17 @@ def _param_types(params: str, *, named: bool) -> list[str]:
     return types
 
 
-def _proven_new(text: str, kind: str, name: str, signature: str = "") -> bool:
+def _proven_new(code: str, kind: str, name: str, signature: str = "") -> bool:
     """`name` est-il prouvé neuf ? Seul un CREATE nu, hors chaîne SQL,
     échoue sur un objet existant : `or replace`, `if not exists`, un drop
     préalable, une chaîne non exécutée et une autre surcharge laissent au code
     d'avant son objet."""
     quoted = re.escape(name) + r"(?![\w.\"])"
-    outside = _SQL_STRING.sub(" ", text)
     kinds = {"table": r"table|view|materialized\s+view|sequence", "function": "function",
              "sequence": "sequence"}[kind]
-    if re.search(r"\bdrop\s+(?:%s)\s+(?:if\s+exists\s+)?%s" % (kinds, quoted), outside):
+    if re.search(r"\bdrop\s+(?:%s)\s+(?:if\s+exists\s+)?%s" % (kinds, quoted), code):
         return False
-    match = re.search(r"\bcreate\s+(?:%s)\s+%s\s*(\([^)]*\))?" % (kinds, quoted), outside)
+    match = re.search(r"\bcreate\s+(?:%s)\s+%s\s*(\([^)]*\))?" % (kinds, quoted), code)
     if not match:
         return False
     if signature:
@@ -563,19 +610,24 @@ def _proven_new(text: str, kind: str, name: str, signature: str = "") -> bool:
     return True
 
 
-def _privilege_reasons(text: str, sql: str) -> list[str]:
+def _privilege_reasons(sql: str) -> list[str]:
     """Droits retirés et contraintes posées sur ce qui n'est pas prouvé neuf (#5055)."""
+    def normal(value: str) -> str:
+        return re.sub(r"\s+", " ", value.lower())
+
+    kept, code = (normal(value) for value in _lex(sql))
     reasons = []
-    for match in _REVOKE.finditer(text):
+    for match in _REVOKE.finditer(kept):
         kind, name, signature, single = match.groups()
-        if not (name and single and _proven_new(text, kind or "table", name, signature or "")):
+        if not (name and single and _proven_new(code, kind or "table", name, signature or "")):
             reasons.append("privilege removed (revoke%s)" % (" on " + name if name else ""))
     if not _CONSTRAINT_MARKER.search(sql):
-        for statement in _ALTER_TABLE.finditer(text):
-            if _proven_new(text, "table", statement.group(1)):
+        for statement in _ALTER_TABLE.finditer(kept):
+            if _proven_new(code, "table", statement.group(1)):
                 continue
-            reasons.extend("constraint possibly tightened (add constraint %s)" % name
-                           for name in _ADD_CONSTRAINT.findall(statement.group(0)))
+            reasons.extend("constraint possibly tightened (add %s)"
+                           % (name and "constraint " + name or form)
+                           for name, form in _ADD_CONSTRAINT.findall(statement.group(0)))
     return reasons
 
 
