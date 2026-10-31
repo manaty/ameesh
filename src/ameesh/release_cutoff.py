@@ -1128,6 +1128,13 @@ class ProjectRelease:
                                     or "staging" in entry):
             raise ReleaseError("nexlink model requires project nexlink, target develop, "
                                "and its closed staging workflow list (no staging script)")
+        elected_role = ((getattr(cfg, "release", None) or {}).get("role")
+                        or (getattr(cfg, "packet_watch", None) or {}).get("role"))
+        executor = entry.get("staging_executor")
+        if (elected_role and model != "nexlink"
+                and (not isinstance(executor, str) or not executor.strip())):
+            raise ReleaseError("release.projects.%s.staging_executor is required under an "
+                               "elected role: synchronous staging can restart its pilot" % name)
         bump = entry.get("version_bump", "level")
         if bump not in ("level", "patch"):
             raise ReleaseError("release.projects.%s.version_bump: level | patch" % name)

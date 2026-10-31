@@ -456,6 +456,10 @@ def _elected_tick(cfg, args):
     role = role or watch_role
     if not role:
         return None  # compatibility until the bureau migrates host units
+    # Validate the independent staging route before acquiring an execution
+    # lease: synchronous staging may restart the runner that owns this role.
+    from . import release_cutoff
+    release_cutoff.projects(cfg)
     from . import role_run, pilot_gesture
     if (os.environ.get(role_run.ENV_ROLE) == role
             and os.environ.get(role_run.ENV_PASS) == "release"):

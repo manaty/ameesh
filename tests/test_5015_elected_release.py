@@ -103,6 +103,49 @@ class ElectionTest(unittest.TestCase):
         with mock.patch.object(packet_watch.ProjectWatch, 'from_config', return_value='watch'):
             self.assertEqual(packet_watch.projects(cfg), {'example': 'watch'})
 
+    def test_elected_synchronous_staging_is_refused_before_wrapper(self):
+        cfg = self.cfg()
+        cfg.release['projects'] = {'example': {'repo': '/fixture/repo'}}
+        for command in ('tick', 'packet-watch', 'cutoff', 'staging-needed'):
+            with self.subTest(command=command):
+                args = self.args()
+                args.release_command, args.apply = command, True
+                with mock.patch.object(role_run, 'run') as wrapper, \
+                        mock.patch('ameesh.db.open_db') as opened, \
+                        mock.patch.object(release_cutoff, 'run_staging') as stage:
+                    with self.assertRaisesRegex(release_cutoff.ReleaseError, 'staging_executor'):
+                        release.run(cfg, args)
+                wrapper.assert_not_called()
+                opened.assert_not_called()
+                stage.assert_not_called()
+
+    def test_elected_staging_uses_independent_executor_configuration(self):
+        cfg = self.cfg()
+        cfg.release['projects'] = {'example': {'repo': '/fixture/repo',
+            'staging_executor': '/fixture/executor.json'}}
+        project = release_cutoff.projects(cfg)['example']
+        self.assertEqual(project.staging_executor, '/fixture/executor.json')
+        cfg.release.pop('role')
+        cfg.packet_watch = {}
+        cfg.release['projects']['example'].pop('staging_executor')
+        self.assertEqual(release_cutoff.projects(cfg)['example'].staging_executor, '')
+
+    def test_elected_nexlink_keeps_its_workflow_staging_route(self):
+        cfg = self.cfg()
+        cfg.release['projects'] = {'nexlink': {'repo': '/fixture/repo',
+            'target': 'develop', 'model': 'nexlink'}}
+        self.assertEqual(release_cutoff.projects(cfg)['nexlink'].model, 'nexlink')
+
+    def test_watch_role_also_requires_independent_script_staging(self):
+        cfg = self.cfg()
+        cfg.release.pop('role')
+        for executor in (None, '', '   ', True):
+            cfg.release['projects'] = {'example': {'repo': '/fixture/repo',
+                'staging_executor': executor}}
+            with self.subTest(executor=executor), \
+                    self.assertRaisesRegex(release_cutoff.ReleaseError, 'staging_executor'):
+                release_cutoff.projects(cfg)
+
     def test_changed_role_stops_execution_renewal(self):
         lease = role_run._ReleaseLease(object(), 'pilot', 'a', 7)
         for current in (report('b', 8), report('a', 8),
