@@ -85,6 +85,52 @@ def for_child(argv, environment=None, *, executable=None, shell=False) -> dict:
             if not secret_name(name) or os.fsdecode(name) in allowed}
 
 
+def notify_credentials(raw) -> frozenset[str]:
+    """Register channel secrets, including arbitrary variable names.
+
+    File-backed channels need no environment grant. Registration also keeps
+    these credentials out of unrelated children and executor turns.
+    """
+    names = set()
+    if not isinstance(raw, dict):
+        return frozenset()
+    channels = raw.get("channels", {})
+    if not isinstance(channels, dict):
+        return frozenset()
+    channels = dict(channels)
+    routes = raw.get("routes", {})
+    references = [raw.get("default", [])]
+    if isinstance(routes, dict):
+        references.extend(routes.values())
+    if any("slack" in (value if isinstance(value, (list, tuple)) else [value])
+           for value in references):
+        channels.setdefault("slack", {})
+    for name, channel in channels.items():
+        if not isinstance(channel, dict):
+            continue
+        for env_key, file_key in (("token_env", "token_file"),
+                                  ("webhook_env", "webhook_file")):
+            variable = channel.get(env_key)
+            if (env_key == "webhook_env" and not variable
+                    and channel.get("type", name) == "slack"):
+                variable = "AMEESH_SLACK_WEBHOOK"
+            if isinstance(variable, str) and variable:
+                DECLARED_CREDENTIALS.add(variable.upper())
+                if not channel.get(file_key):
+                    names.add(variable)
+    return frozenset(names)
+
+
+def role_transport(environment: Mapping, argv, notify_config) -> GrantedEnvironment:
+    """Grant channel credentials only to the role's direct notify command."""
+    names = notify_credentials(notify_config)
+    env = execution_transport(environment)
+    if (len(argv) >= 2 and os.path.basename(argv[0]) == "ameesh"
+            and argv[1] == "notify"):
+        return grant(env, env.credentials | names)
+    return env
+
+
 def execution_transport(environment: Mapping) -> GrantedEnvironment:
     """Mechanical role/deployment scripts need mesh/GitHub, never provider keys."""
     return grant(environment, TOOL_CREDENTIALS["ameesh"] | TOOL_CREDENTIALS["gh"])
