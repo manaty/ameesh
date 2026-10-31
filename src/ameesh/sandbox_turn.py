@@ -121,6 +121,14 @@ class SandboxTurn:
         kind = event.get('kind')
         if self.recovery and kind in ('bound', 'result'):
             raise s1.Refusal('stale')
+        if kind not in ('bound', 'result', 'cancel-requested', 'failed', 'cancelled',
+                        'lost', 'expired', 'orphaned', 'heartbeat', 'retry',
+                        'cancelling', 'terminal'):
+            raise s1.Refusal('contract-mismatch')
+        s1.observe_metadata(self.db, self.turn_id, self.owner, self.epoch,
+                            job_phase=event.get('job_phase'), refusal=event.get('refusal'),
+                            job_uid=event.get('job_uid'),
+                            recovery=self.recovery)
         args = self.db, self.turn_id, self.owner, self.epoch
         if kind == 'bound':
             s1.ameesh_sandbox_bind(*args, event.get('job_uid'))

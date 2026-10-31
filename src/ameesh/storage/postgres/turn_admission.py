@@ -207,6 +207,9 @@ def ameesh_admit_turn(db, agent, billing_account, reserve_usd, spend_key,
                        tuple(json.dumps(snapshot[c]) if c in json_cols else
                              '{' + ','.join(map(str,snapshot[c])) + '}' if c == 'request_ids' else snapshot[c]
                              for c in columns) + (seconds,))
+            tx.execute("insert into ameesh_events (type, object, data)"
+                       " values ('sandbox.created', %s, %s::jsonb)",
+                       ('turn:' + turn_id, json.dumps({'turn_id': turn_id, 'agent': agent})))
         _event(tx,tranche_id,'admit',agent,path,reservation=row['id'],data={'spend_key':spend_key})
         result = dict(tranche_reservation_id=row['id'],account_reservation_id=account['id'],replayed=False)
         if snapshot:
@@ -265,6 +268,9 @@ def settle_tx(tx, spend_key, actual_usd=None, *, sandbox_turn=None, actor='runne
                ' closed_by = %s where id = %s',(amount,state,actor,row['id']))
     if actual is not None and actual > _money(row['reserved_usd']):
         tx.execute('update tranche_limits set overdraft = true where id = %s',(row['tranche_id'],))
+        tx.execute("insert into ameesh_events (type, object, data)"
+                   " values ('sandbox.tranche_overdraft', %s, %s::jsonb)",
+                   ('tranche:' + row['tranche_id'], json.dumps({'tranche_id': row['tranche_id']})))
         _event(tx,row['tranche_id'],'overdraft',actor,'actual exceeds reserved bound',reservation=row['id'])
     _event(tx,row['tranche_id'],state,actor,'turn settlement',reservation=row['id'])
     return {'usd':None if actual is None else float(actual),'state':state}

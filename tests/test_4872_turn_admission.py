@@ -115,6 +115,8 @@ class TurnAdmissionTest(PgTestCase):
                          'checked externally')
 
     def test_actual_release_overdraft_and_settlement_idempotency(self):
+        before = self.db.query("select count(*) as n from ameesh_events where type='sandbox.tranche_overdraft'"
+                               " and object='tranche:migration'")[0]['n']
         self.admit(); self.spend('key',0.5)
         api.ameesh_settle_turn(self.db,'key',0.5)
         api.ameesh_settle_turn(self.db,'key',1.5)
@@ -122,6 +124,9 @@ class TurnAdmissionTest(PgTestCase):
         self.admit('over'); self.spend('over',3)
         api.ameesh_settle_turn(self.db,'over',3)
         self.assertEqual(float(self.reservation('over')['usd']),3)
+        self.assertEqual(self.db.query("select count(*) as n from ameesh_events"
+                                       " where type='sandbox.tranche_overdraft'"
+                                       " and object='tranche:migration'")[0]['n'], before + 1)
         self.refusal('tranche-unavailable',self.admit,'blocked')
         api.tranche_close(self.db,'migration',actor='human:t',why='verified overspend',reconcile=True)
         self.admit('again')
@@ -134,11 +139,15 @@ class TurnAdmissionTest(PgTestCase):
         self.assertEqual(self.reservation()['state'],'open')
 
     def test_sandbox_atomic_intent_attempts_and_response_loss(self):
+        before = self.db.query("select count(*) as n from ameesh_events where type='sandbox.created'"
+                               " and object='turn:turn-key'")[0]['n']
         snapshot=self.snapshot()
         one=self.admit(sandbox=snapshot)
         self.assertEqual(one['attempt'],1)
         self.assertEqual(one['scope']['attempt'],1)
         self.assertTrue(self.admit(sandbox=snapshot)['replayed'])
+        self.assertEqual(self.db.query("select count(*) as n from ameesh_events"
+                                       " where type='sandbox.created' and object='turn:turn-key'")[0]['n'], before + 1)
         wrong=copy.deepcopy(snapshot); wrong['source']['contract']='other'
         self.refusal('replay-mismatch',self.admit,sandbox=wrong)
         self.db.execute("update sandbox_turns set state = 'lost'")

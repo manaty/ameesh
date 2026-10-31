@@ -198,6 +198,8 @@
         turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
+  ameesh sandbox list [--agent NAME] [--state STATE] [--scope DIGEST] [--limit N] [--json]
+  ameesh sandbox show TURN_ID [--json]
   ameesh turn current [--local] [--expect-turn ID] [--json]
         read the calling turn; reuse requires its captured turn id;
   ameesh turn observe (--turn ID | --request ID) [--json]
@@ -269,6 +271,7 @@ MESH_COMMANDS = (
     "veille",
     # #2167 B2 : observation d'un tour ou d'une requête (`ameesh turn observe`)
     "turn",
+    "sandbox",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
