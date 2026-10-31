@@ -104,9 +104,10 @@ class ControlerVenvTest(unittest.TestCase):
             enfant.terminate()
         enfant.communicate(timeout=5)
 
-    def lancer(self, pids):
+    def lancer(self, pids, notify=None):
         """pids : {agent: pid} ; notify tourne sur le venv courant."""
-        (self.state / "notify.pid").write_text(str(self.processus(self.live)) + "\n")
+        notify = self.processus(self.live) if notify is None else notify
+        (self.state / "notify.pid").write_text(str(notify) + "\n")
         for agent, pid in pids.items():
             (self.state / ("pid-" + agent)).write_text(str(pid) + "\n")
         return subprocess.run(["bash", str(SCRIPT), "controler"], env=self.env,
@@ -160,13 +161,12 @@ class ControlerVenvTest(unittest.TestCase):
             capture_output=True, text=True, timeout=10)
         self.assertEqual(mauvais.returncode, 1)
 
-    def non_dumpable(self, venv):
+    def non_dumpable(self, venv, durcir="from ameesh import runner\n"
+                     "assert runner._harden_executor_environment()\n"):
         """#5100 : un enfant du venv durci par le vrai chemin de l'exécuteur."""
         enfant = subprocess.Popen(
             [str(venv / "bin/python"), "-c",
-             "import time\n"
-             "from ameesh import runner\n"
-             "assert runner._harden_executor_environment()\n"
+             "import time\n" + durcir +
              "print('ready', flush=True)\n"
              "time.sleep(60)\n"],
             stdout=subprocess.PIPE, text=True,
@@ -230,6 +230,17 @@ class ControlerVenvTest(unittest.TestCase):
         fait = self.lancer({"dev9": enfant.pid, "dev8": self.processus(self.live)})
         self.assertEqual(fait.returncode, 0, fait.stdout + fait.stderr)
         self.assertIn("contrôles verts", fait.stdout)
+        self.assertFalse(journal.exists(), "sudo appelé alors que l'attestation suffit")
+
+    def test_notify_non_dumpable_vert_sans_privilege(self):
+        # `notify.main` durcit par `harden()`, pas par le chemin de l'exécuteur.
+        journal = self.sudo_refuse()
+        notify = self.non_dumpable(
+            self.live, "from ameesh.platform.child_environment import harden\n"
+                       "assert harden()\n")
+        fait = self.lancer({"dev9": self.processus(self.live),
+                            "dev8": self.processus(self.live)}, notify=notify.pid)
+        self.assertEqual(fait.returncode, 0, fait.stdout + fait.stderr)
         self.assertFalse(journal.exists(), "sudo appelé alors que l'attestation suffit")
 
     def test_non_dumpable_rouge_sur_l_ancien_venv(self):
