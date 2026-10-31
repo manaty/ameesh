@@ -12,9 +12,12 @@ Travail de fond : AMEESH_TEST_BACKGROUND (commande shell lancée en fond, dans
 le groupe du tour, que le harnais n'attend pas) et AMEESH_TEST_BACKGROUND_PID
 (fichier où écrire son pid). L217b : AMEESH_TEST_CLAUDE_ON_TERM (JSON : un
 appel du fil principal émis à la réception de SIGTERM, donc lu après la
-clôture du tour, comme un appel encore en tampon). #1270 :
-AMEESH_TEST_STDERR (texte écrit sur le stderr du harnais, canal fournisseur
-distinct du résultat libre).
+clôture du tour, comme un appel encore en tampon). CTX-03b :
+AMEESH_TEST_CLAUDE_MODEL (modèle annoncé par `system/init`),
+AMEESH_TEST_CLAUDE_MODEL_USAGE (JSON `modelUsage` du `result`) et
+AMEESH_TEST_CLAUDE_COMPACT (JSON `compact_metadata` d'une frontière de
+compaction). #1270 : AMEESH_TEST_STDERR (texte écrit sur le stderr du
+harnais, canal fournisseur distinct du résultat libre).
 """
 import json
 import os
@@ -110,8 +113,20 @@ def main() -> int:
     session = os.environ.get("AMEESH_TEST_NEW_SESSION") or "claude-sess-1"
     if "--resume" in args:
         session = args[args.index("--resume") + 1]
-    print(json.dumps({"type": "system", "subtype": "init", "session_id": session,
-                      "cwd": os.getcwd()}), flush=True)
+    initial = {"type": "system", "subtype": "init", "session_id": session,
+               "cwd": os.getcwd()}
+    # CTX-03b : un harnais qui annonce son modèle effectif (le vrai Claude le
+    # fait) ; sans la variable, le flux reste celui d'avant ce lot.
+    if os.environ.get("AMEESH_TEST_CLAUDE_MODEL"):
+        initial["model"] = os.environ["AMEESH_TEST_CLAUDE_MODEL"]
+    print(json.dumps(initial), flush=True)
+    # CTX-03b : une frontière de compaction native du fil (comme le vrai
+    # `system/compact_boundary`), quand le témoin la fournit.
+    compact = os.environ.get("AMEESH_TEST_CLAUDE_COMPACT")
+    if compact:
+        print(json.dumps({"type": "system", "subtype": "compact_boundary",
+                          "session_id": session,
+                          "compact_metadata": json.loads(compact)}), flush=True)
     if os.environ.get("AMEESH_TEST_CLAUDE_ON_TERM"):
         tampon = json.loads(os.environ["AMEESH_TEST_CLAUDE_ON_TERM"])
 
@@ -166,11 +181,16 @@ def main() -> int:
     # #1397 : AMEESH_TEST_IS_ERROR marque le `result` comme erreur du CLI —
     # le seul canal où Claude dit un quota ; son texte est alors fournisseur.
     erreur = os.environ.get("AMEESH_TEST_IS_ERROR") == "1"
-    print(json.dumps({"type": "result",
-                      "subtype": "error_during_execution" if erreur else "success",
-                      "result": reponse, "is_error": erreur,
-                      "total_cost_usd": 0.0125, "usage": tour, "session_id": session}),
-          flush=True)
+    resultat = {"type": "result",
+                "subtype": "error_during_execution" if erreur else "success",
+                "result": reponse, "is_error": erreur,
+                "total_cost_usd": 0.0125, "usage": tour, "session_id": session}
+    # CTX-03b : la métadonnée runtime `modelUsage` du vrai `result` (fenêtre
+    # par modèle), quand le témoin la fournit.
+    model_usage = os.environ.get("AMEESH_TEST_CLAUDE_MODEL_USAGE")
+    if model_usage:
+        resultat["modelUsage"] = json.loads(model_usage)
+    print(json.dumps(resultat), flush=True)
     # #1270 : le stderr du fournisseur (429, trace d'erreur) — canal distinct
     # du résultat libre, lu par `auth_failure`/`rate_limit`
     bruit = os.environ.get("AMEESH_TEST_STDERR")

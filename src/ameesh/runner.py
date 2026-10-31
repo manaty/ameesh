@@ -61,7 +61,7 @@ import uuid
 
 from . import account_budget, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
-from . import context_metrics
+from . import context_metrics, context_profile
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import account_window
@@ -197,6 +197,23 @@ _journal = _AsyncLog()
 def log_async(message: str) -> None:
     """Journal d'un chemin qui ne doit **jamais** attendre le puits (battement)."""
     _journal.write(message)
+
+
+def _modele_publie(document_model, ledger_model) -> str | None:
+    """CTX-03b : le modèle demandé à publier dans le profil du tour.
+
+    Le modèle du flux (``document_model``) prime ; à défaut, celui du grand
+    livre (``ledger_model``), qui porte pour Codex le modèle lu dans le journal
+    de session. Le sentinelle de tarification ``inconnu`` n'est jamais un nom
+    de modèle : il rend ``None``, jamais une valeur supposée.
+    """
+    for value in (document_model, ledger_model):
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if value and value.lower() != "inconnu":
+            return value
+    return None
 
 
 def _sans_raison(observation: dict | None) -> dict | None:
@@ -846,6 +863,11 @@ class AgentWorker(threading.Thread):
         #: un tour réparé par un autre worker (la mesure est alors perdue, pas
         #: inventée).
         self._context_observation: dict | None = None
+        #: CTX-03b : fenêtre observée du tour (Window non résident, ou profil
+        #: du driver résident) et mode, publiés dans `turn.context.profile`
+        #: avec la ligne du grand livre — jamais une décision.
+        self._context_profile_observed: object | None = None
+        self._context_profile_mode: str | None = None
         #: CTX-02b : base `R_session` (relu cumulé des tours précédents) et la
         #: session qu'elle décrit ; relue du grand livre une fois par session,
         #: puis tenue à jour par l'observation du tour.
@@ -4946,11 +4968,32 @@ class AgentWorker(threading.Thread):
             # Tour réparé par un autre worker (la mesure du flux est perdue) :
             # on ne publie pas une observation inventée, et la session garde le
             # trou — `R_session` reste inconnue au lieu d'une somme supposée.
+            self._context_profile_observed = None
+            self._context_profile_mode = None
             self._invalidate_context_session(
                 travail.get("session") or self._context_session_id,
                 (context_metrics.REASON_COLLECTION_LOST,))
             return
         try:
+            # CTX-03b : la clé de profil du contrat §3.1 dans `turn.context`.
+            # Le modèle du grand livre fait foi pour Codex, que `exec --json`
+            # n'annonce pas (lu dans son journal de session) ; le modèle
+            # demandé n'est publié qu'avec la qualité `requested`, jamais une
+            # fenêtre. Une version de harnais non enregistrée reste nulle avec
+            # sa raison, sans retenir le tour.
+            requested = _modele_publie(document.get("model"), usage.model)
+            harness = usage.harness or document.get("harness")
+            profile = context_profile.publish(
+                self._context_profile_observed,
+                requested_model=requested,
+                harness=harness,
+                harness_version=self.runner.harness_version(harness),
+                mode=self._context_profile_mode or document.get("mode"),
+                roles=(self.agent or {}).get("roles"))
+            document["profile"] = profile
+            document["model"] = profile["model_effective"] or document.get("model")
+            document["mode"] = profile["mode"]
+            document["role"] = profile["role"]
             legacy = {
                 "input_tokens": usage.input_tokens,
                 "cached_input_tokens": usage.cached_input_tokens,
@@ -4984,6 +5027,10 @@ class AgentWorker(threading.Thread):
                 # restent lisibles à côté.
                 "close": _sans_raison(self._turn_close_observation),
                 "rotation": _sans_raison(self._last_rotation_observation),
+                # CTX-03b : `false` explicite quand le tour n'a pas compacté
+                # (une demande n'est pas une réussite, contrat §4.2) ; le rejeu
+                # peut alors juger la fenêtre au lieu de rester aveugle.
+                "compacted": document.get("compaction") is not None,
             }
             if self.cfg.window_maintenance_share > 0:
                 decision["window"] = self._window_decision(self.resident)
@@ -5008,6 +5055,8 @@ class AgentWorker(threading.Thread):
                 (context_metrics.REASON_COLLECTION_LOST,))
         finally:
             self._context_observation = None
+            self._context_profile_observed = None
+            self._context_profile_mode = None
             self._turn_close_observation = None
             self._last_rotation_observation = None
 
@@ -8302,6 +8351,11 @@ class AgentWorker(threading.Thread):
             events_start = 0
         session_new: str | None = None
         modele_annonce = ""  # modèle annoncé par le flux du harnais (L13 B4)
+        #: CTX-03b : `modelUsage` et frontière de compaction du fil principal
+        #: (Claude), collectés sur le même flux que les compteurs ; le profil
+        #: résident, lui, vient du driver.
+        model_usage = None
+        compaction_event = None
         cost: float | None = None
         error: str | None = None
         result_code = 0
@@ -8491,6 +8545,8 @@ class AgentWorker(threading.Thread):
         # `R_session` est relue du grand livre AVANT le lancement (la requête
         # ne retarde jamais le harnais ni son flux).
         self._context_observation = None
+        self._context_profile_observed = None
+        self._context_profile_mode = None
         self._turn_close_observation = None
         self._context_baseline = self._context_session_baseline(session)
         try:
@@ -8682,6 +8738,15 @@ class AgentWorker(threading.Thread):
                     events.write(raw if raw.endswith("\n") else raw + "\n")
                     events.flush()
                     parsed = self._parse(adapter, line)
+                    if isinstance(parsed.get("model_usage"), dict):
+                        # CTX-03b : la dernière métadonnée runtime du fil
+                        # principal donne le profil du tour (R1 : jamais la
+                        # première entrée d'un `modelUsage` auxiliaire).
+                        model_usage = parsed["model_usage"]
+                    if isinstance(parsed.get("compaction"), dict):
+                        # CTX-03b : frontière de compaction native du fil
+                        # principal ; un sous-agent n'en publie pas.
+                        compaction_event = parsed["compaction"]
                     try:
                         normalizer.observe(parsed)
                     except Exception as exc:  # noqa: BLE001 — observation seule
@@ -8965,6 +9030,32 @@ class AgentWorker(threading.Thread):
                 document["session"] = (session_new or session
                                        or document.get("session"))
                 document["model"] = modele_annonce or model or None
+                # CTX-03b : la fenêtre observée du tour. Le driver résident
+                # publie déjà son profil (modèle effectif, W, compaction) ;
+                # un tour non résident le lit dans `modelUsage` du flux, sans
+                # jamais prendre une entrée auxiliaire pour le fil principal.
+                observed = None
+                resident_profile = getattr(fin_resident, "profile", None)
+                if isinstance(resident_profile, dict) and resident_profile:
+                    observed = resident_profile
+                elif model_usage is not None:
+                    observed = context_profile.from_model_usage(
+                        model_usage, announced=modele_annonce or None)
+                self._context_profile_observed = observed
+                self._context_profile_mode = (
+                    "resident" if rp is not None else "non-resident")
+                # CTX-03b : la compaction native du tour, résidente (driver)
+                # ou non résidente (`compact_boundary` du flux). Absente, le
+                # document la garde à None et la décision dit `compacted=false`
+                # explicitement, pour que le rejeu ne suppose rien.
+                resident_compact = getattr(fin_resident, "compact", None)
+                if isinstance(resident_compact, dict):
+                    compaction = dict(resident_compact)
+                elif compaction_event is not None:
+                    compaction = context_profile.compaction(compaction_event).to_dict()
+                else:
+                    compaction = None
+                document["compaction"] = compaction
                 self._context_observation = document
                 self._remember_context_session(document, session_new or session)
                 self._window_measure_keep(
@@ -8973,6 +9064,8 @@ class AgentWorker(threading.Thread):
                 log_async("[%s] context observation not published (%s)"
                           % (self.name, " ".join(str(exc).split())[:160]))
                 self._context_observation = None
+                self._context_profile_observed = None
+                self._context_profile_mode = None
                 self._invalidate_context_session(
                     session_new or session or self._context_session_id,
                     (context_metrics.REASON_COLLECTION_LOST,))
@@ -12496,6 +12589,9 @@ class Runner:
     #: L120: how often the version thread wakes; the probe itself runs at
     #: most every `harness_versions.PROBE_INTERVAL_S`
     VERSIONS_WAKE_S = 600.0
+    #: CTX-03b: a recorded harness version changes at the probe rhythm (6 h);
+    #: a short cache keeps `turn.context` from reading SQL on every turn.
+    HARNESS_VERSION_CACHE_S = 300.0
 
     def start_version_poll(self) -> threading.Thread | None:
         """L120: harness versions read at startup, then every 6 h — on their
@@ -13669,6 +13765,35 @@ class Runner:
                 and (r.get("mode") or "execute") == "execute"
                 and r.get("status") != "stopped"
                 and (self.agents_filter is None or r["name"] in self.agents_filter)]
+
+    def harness_version(self, harness: str | None) -> str | None:
+        """CTX-03b : la version du binaire de ``harness`` enregistrée pour cet
+        hôte (L120, ``harness_versions.probe``), ou ``None``.
+
+        Lecture seule, mise en cache courte : une version non enregistrée ou
+        illisible reste ``None`` (le profil la dit ``version_unknown``), jamais
+        une supposition. Une panne de base ne retient jamais un tour.
+        """
+        name = str(harness or "").strip()
+        if not name:
+            return None
+        now = time.monotonic()
+        cache = getattr(self, "_harness_version_cache", None)
+        if cache is None:
+            cache = self._harness_version_cache = {}
+        known = cache.get(name)
+        if known is not None and now < known[0]:
+            return known[1]
+        value = None
+        try:
+            for row in storage.of(self.db).hosts.harness_versions(self.host):
+                if str(row.get("harness") or "") == name:
+                    value = str(row.get("version") or "").strip() or None
+                    break
+        except Exception:  # noqa: BLE001 — observation seule, jamais fatale
+            value = None
+        cache[name] = (now + self.HARNESS_VERSION_CACHE_S, value)
+        return value
 
     @migrations.writer_tick(on_admission_error=_background_admission_error)
     def harness_versions_once(self, now: float | None = None) -> list[dict] | None:

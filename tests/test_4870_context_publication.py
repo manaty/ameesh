@@ -23,7 +23,7 @@ import os
 import unittest
 from unittest import mock
 
-from ameesh import adapters, context_metrics, cost, events, mechanics
+from ameesh import adapters, context_metrics, context_profile, cost, events, mechanics
 from ameesh.runner import AgentWorker
 
 from .support import PgTestCase
@@ -461,14 +461,18 @@ class SessionRereadTest(PgTestCase):
 class TurnContextEventTest(PgTestCase):
     """Un tour réel du banc publie ``turn.context`` après son grand livre."""
 
-    def _run(self, name: str, usage: str, prompt: str = "un tour de contexte",
-             exit_code: str = "0"):
+    def _run(self, name: str, usage: str | None = None,
+             prompt: str = "un tour de contexte", exit_code: str = "0",
+             harness: str = "deepseek", env: dict | None = None, **register):
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        self.register(name, "deepseek", cwd=cwd, prompt=prompt)
-        env = self.env(AMEESH_TEST_DSH_USAGE=usage,
-                       AMEESH_TEST_EXIT=exit_code)
-        proc = self.runner("--once", "--agents", name, env=env)
+        self.register(name, harness, cwd=cwd, prompt=prompt, **register)
+        values = {"AMEESH_TEST_EXIT": exit_code}
+        if usage is not None and harness == "deepseek":
+            values["AMEESH_TEST_DSH_USAGE"] = usage
+        if env:
+            values.update(env)
+        proc = self.runner("--once", "--agents", name, env=self.env(**values))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         rows = self.db.query(
             "select data from ameesh_events where type = %s"
@@ -517,6 +521,98 @@ class TurnContextEventTest(PgTestCase):
         encoded = json.dumps(data)
         self.assertNotIn("un tour de contexte", encoded)
         self.assertNotIn("bonjour du faux dsh", encoded)
+
+    def test_profil_effectif_d_un_tour_non_resident(self):
+        # CTX-03b : même sans `modelUsage`, le profil publie le modèle demandé
+        # (qualité `requested`), le harnais, le mode et le rôle du canon ; une
+        # fenêtre absente reste nulle avec sa raison, jamais une supposition.
+        data = self._run("ctx-profil-dsh", "1000,20000,100")
+        profile = data["context"]["profile"]
+        self.assertEqual(profile["schema"], context_metrics.SCHEMA)
+        self.assertEqual(profile["model_effective"], "deepseek-flash")
+        self.assertEqual(profile["model_quality"], "requested")
+        self.assertEqual(profile["harness"], "deepseek")
+        self.assertIsNone(profile["harness_version"])
+        self.assertIn("version_unknown", profile["version_reasons"])
+        self.assertEqual(profile["mode"], "non-resident")
+        self.assertEqual(profile["role"], "build")
+        self.assertIsNone(profile["window_tokens"])
+        self.assertEqual(profile["window_quality"], "unknown")
+        self.assertIn("window_unknown", profile["reasons"])
+        self.assertEqual(profile["auxiliary_models"], [])
+        # Les champs historiques restent lisibles à côté du profil.
+        self.assertEqual(data["model"], "deepseek-flash")
+        self.assertEqual(data["mode"], "non-resident")
+        self.assertEqual(data["role"], "build")
+        # L'absence de compaction est explicite : le rejeu peut juger la
+        # fenêtre au lieu de rester aveugle.
+        self.assertIs(data["decision"]["compacted"], False)
+        self.assertIsNone(data["context"]["compaction"])
+
+    def test_profil_claude_porte_la_fenetre_annoncee(self):
+        # Claude annonce son modèle (`system/init`) et sa fenêtre
+        # (`modelUsage.contextWindow`) : le profil les publie, avec le modèle
+        # principal même quand une entrée auxiliaire le précède (R1).
+        self.db.execute(
+            "insert into harness_versions (host, harness, path, version, raw)"
+            " values (%s, %s, %s, %s, %s)",
+            (self.cfg.host, "claude", "/fake/bin/claude", "2.1.309",
+             "2.1.309 (Claude Code, fake)"))
+        usage = json.dumps({
+            "claude-haiku-4-5": {"contextWindow": 200_000},
+            "claude-opus-5-5": {"contextWindow": 1_000_000},
+        })
+        data = self._run(
+            "ctx-profil-claude", harness="claude",
+            env={"AMEESH_TEST_CLAUDE_MODEL": "claude-opus-5-5",
+                 "AMEESH_TEST_CLAUDE_MODEL_USAGE": usage})
+        profile = data["context"]["profile"]
+        self.assertEqual(profile["model_effective"], "claude-opus-5-5")
+        self.assertEqual(profile["model_quality"], "measured")
+        self.assertEqual(profile["harness"], "claude")
+        self.assertEqual(profile["harness_version"], "2.1.309")
+        self.assertEqual(profile["mode"], "non-resident")
+        self.assertEqual(profile["role"], "build")
+        self.assertEqual(profile["window_tokens"], 1_000_000)
+        self.assertEqual(profile["window_quality"], "measured")
+        self.assertEqual(profile["window_source"],
+                         context_profile.SOURCE_MODEL_USAGE)
+        self.assertEqual(profile["auxiliary_models"], ["claude-haiku-4-5"])
+        self.assertEqual(data["model"], "claude-opus-5-5")
+
+    def test_profil_codex_porte_le_modele_du_lancement(self):
+        # `codex exec --json` n'annonce pas son modèle : le modèle demandé au
+        # lancement remplit le profil, avec la qualité `requested` — jamais
+        # `measured`, et sans inventer de fenêtre.
+        data = self._run("ctx-profil-codex", harness="codex",
+                         model="gpt-6.1-sol")
+        profile = data["context"]["profile"]
+        self.assertEqual(profile["model_effective"], "gpt-6.1-sol")
+        self.assertEqual(profile["model_quality"], "requested")
+        self.assertEqual(profile["harness"], "codex")
+        self.assertEqual(profile["mode"], "non-resident")
+        self.assertEqual(profile["role"], "build")
+        self.assertIsNone(profile["window_tokens"])
+        self.assertEqual(profile["window_quality"], "unknown")
+        self.assertIn("window_unknown", profile["reasons"])
+        self.assertEqual(data["model"], "gpt-6.1-sol")
+        self.assertIs(data["decision"]["compacted"], False)
+
+    def test_profil_claude_publie_la_compaction_native(self):
+        # Une frontière `compact_boundary` du fil principal est publiée avec
+        # ses jetons avant/après, et `decision.compacted` vaut vrai.
+        data = self._run(
+            "ctx-compact-claude", harness="claude",
+            env={"AMEESH_TEST_CLAUDE_MODEL": "claude-opus-5-5",
+                 "AMEESH_TEST_CLAUDE_MODEL_USAGE": json.dumps(
+                     {"claude-opus-5-5": {"contextWindow": 1_000_000}}),
+                 "AMEESH_TEST_CLAUDE_COMPACT": json.dumps(
+                     {"pre_tokens": 150_000, "post_tokens": 30_000})})
+        self.assertIs(data["decision"]["compacted"], True)
+        compaction = data["context"]["compaction"]
+        self.assertEqual(compaction["pre"], 150_000)
+        self.assertEqual(compaction["post"], 30_000)
+        self.assertEqual(compaction["quality"], "measured")
 
     def test_deuxieme_tour_reprend_le_cumul_de_session(self):
         self._run("ctx-deux", "1000,20000,100;500,22000,200")

@@ -865,6 +865,11 @@ class ClaudeStream(StreamReader):
                 out["session"] = event.get("session_id")
                 if event.get("model"):
                     out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
+        elif kind == "system" and event.get("subtype") == "compact_boundary":
+            # CTX-03b : la frontière de compaction native du fil principal
+            # (pre/post, qualité) ; un sous-agent ne compacte pas le fil.
+            if principal:
+                out["compaction"] = event
         elif kind == "assistant":
             message = event.get("message") or {}
             texts = [
@@ -896,6 +901,11 @@ class ClaudeStream(StreamReader):
                 out["cost"] = float(event["total_cost_usd"])
             if isinstance(event.get("usage"), dict):
                 out["usage"] = event["usage"]  # rotation de session (0018)
+            if principal and isinstance(event.get("modelUsage"), dict):
+                # CTX-03b : métadonnée runtime du modèle principal (fenêtre
+                # `contextWindow`, R1) ; un `result` de sous-agent n'annonce
+                # jamais la fenêtre du fil principal.
+                out["model_usage"] = event["modelUsage"]
             if event.get("session_id") and principal:
                 out["session"] = event["session_id"]
             if event.get("is_error"):
