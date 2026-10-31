@@ -865,6 +865,10 @@ class AgentWorker(threading.Thread):
         #: réussie, publiés avec le tour — jamais lus par une décision.
         self._turn_close_observation: dict | None = None
         self._last_rotation_observation: dict | None = None
+        #: CTX-04b (#4971) : `C_last`/`O_last` du dernier tour mesuré, pour la
+        #: projection de fenêtre ; None après une compaction (la prochaine
+        #: mesure tranche, §4.2)
+        self._window_measure: dict | None = None
         #: plafonds du tour (L105) : le tour suivant reprend le travail d'un
         #: tour clos (raison), et la rotation forcée par le plafond de contexte
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
@@ -2770,10 +2774,62 @@ class AgentWorker(threading.Thread):
         # finir, doit tenir la fenêtre de calme dès cette décision.
         self._humain_observe()
         rotate = self.session_policy() != "jamais"
-        return rp.maintenance_due(
+        # CTX-04b : en opt-in, la projection remplace le 50 % legacy ; le plafond
+        # dur reste jugé avant elle (§5.1).
+        fenetre = self.cfg.window_maintenance_share > 0
+        entretien = rp.maintenance_due(
             cap=self.context_max_tokens() if rotate else 0,
             reread_max=resident_runner.reread_max(
-                self._state_read(resident_runner.REREAD_MAX_SETTING)) if rotate else 0)
+                self._state_read(resident_runner.REREAD_MAX_SETTING)) if rotate else 0,
+            **({"share": 0.0} if fenetre else {}))
+        if not fenetre or entretien == resident_runner.ROTATE:
+            return entretien
+        projection = self._window_decision(rp)
+        if projection["near"] is False:
+            # une mesure retombée sous le seuil rouvre droit à une compaction
+            rp.window_compact_tried = False
+        return projection["decision"] or entretien
+
+    def _window_decision(self, rp) -> dict:
+        """CTX-04b : la projection de fenêtre de la session résidente `rp`
+        (None : pas de résident, donc `W` inconnue), et sa décision. La politique
+        `jamais` garde le compactage mais pas le renouvellement."""
+        from . import resident_runner
+        mesure = self._window_measure or {}
+        if rp is not None and mesure.get("session") != rp.session:
+            mesure = {}
+        projection = resident_runner.window_maintenance(
+            c_last=mesure.get("C_last"), o_last=mesure.get("O_last"),
+            window=rp.profile_window if rp is not None else None,
+            share=self.cfg.window_maintenance_share,
+            input_reserve=self.cfg.window_input_reserve,
+            output_reserve=self.cfg.window_output_reserve,
+            compact_supported=(self.turn_harness()
+                               in resident_runner.NATIVE_COMPACT_HARNESSES),
+            compact_tried=rp.window_compact_tried if rp is not None else False)
+        if projection["decision"] == resident_runner.WINDOW_RENEW \
+                and self.session_policy() == "jamais":
+            projection["decision"] = ""
+        return projection
+
+    def _window_measure_keep(self, document: dict, compacted: bool) -> None:
+        """CTX-04b : garde les mesures du fil principal d'un tour pour la
+        projection. Une mesure absente, de repli ou partielle (tour interrompu,
+        borne d'appels, autre session, cache non qualifié) reste inconnue : la
+        projection serait incomplète. Un tour qui a compacté n'en donne aucune :
+        son dernier appel précède la frontière."""
+        if compacted:
+            self._window_measure = None
+            return
+        fiables = (context_metrics.MEASURED, context_metrics.DERIVED)
+
+        def valeur(nom: str) -> int | None:
+            mesure = (document.get("measures") or {}).get(nom) or {}
+            return mesure.get("value") if mesure.get("quality") in fiables else None
+
+        self._window_measure = {"session": document.get("session"),
+                                "C_last": valeur("C_last"),
+                                "O_last": valeur("O_last")}
 
     def _humain_observe(self) -> None:
         """L81 (étude §6.3) : rafraîchit la fenêtre de calme avant la décision
@@ -2840,6 +2896,12 @@ class AgentWorker(threading.Thread):
             raison = ("resident session re-read: %d tokens (threshold %.0f)"
                       % (rp.session_reread, resident_runner.reread_max(
                           self._state_read(resident_runner.REREAD_MAX_SETTING))))
+        elif decision == resident_runner.WINDOW_RENEW:
+            if self._humain_recent():
+                return False
+            projection = self._window_decision(rp)
+            raison = ("window maintenance: C_next %s tokens (W %s) after a native "
+                      "compaction" % (projection["C_next"], projection["W"]))
         elif decision == resident_runner.COMPACT:
             if self._humain_recent():
                 return False
@@ -2863,10 +2925,14 @@ class AgentWorker(threading.Thread):
         (`COMPACT_RETRY_S`, porté par le processus) évite la boucle."""
         from . import resident_runner
         avant = rp.compactions
+        mesure_avant = self._window_measure
         rp.compact_requested()
         ok = self.run_turn({"kind": "prompt",
                             "prompt": resident_runner.COMPACT_COMMAND, "ids": []})
         courant = self.resident or rp
+        if courant.compactions <= avant:
+            # CTX-04b : rien n'a changé dans la session, la mesure d'avant vaut
+            self._window_measure = mesure_avant
         if not ok:
             log_async("[%s] native compaction cancelled: the turn did not complete"
                       % self.name)
@@ -3033,6 +3099,7 @@ class AgentWorker(threading.Thread):
         # ne lit ce champ.
         self._last_rotation_observation = {
             "kind": "context_cap" if raison.startswith("context cap")
+                    else "window_maintenance" if raison.startswith("window maintenance")
                     else "session_size",
             "reason": raison,
             "old_session": ancienne or None,
@@ -4902,6 +4969,9 @@ class AgentWorker(threading.Thread):
                        if self.cfg.turn_reread_budget > 0 else {}),
                     **({"session_reread_budget": int(self.cfg.session_reread_budget)}
                        if self.cfg.session_reread_budget > 0 else {}),
+                    # CTX-04b : présent seulement en opt-in.
+                    **({"window_maintenance_share": self.cfg.window_maintenance_share}
+                       if self.cfg.window_maintenance_share > 0 else {}),
                 },
                 # Le journal partagé porte des états, pas du texte libre : le
                 # motif est normalisé (`kind`), les valeurs qui l'ont déclenché
@@ -4909,6 +4979,8 @@ class AgentWorker(threading.Thread):
                 "close": _sans_raison(self._turn_close_observation),
                 "rotation": _sans_raison(self._last_rotation_observation),
             }
+            if self.cfg.window_maintenance_share > 0:
+                decision["window"] = self._window_decision(self.resident)
             payload = cost_mod.context_publication(
                 document, legacy=legacy, decision=decision,
                 agent=self.name, host=self.runner.host,
@@ -8885,6 +8957,8 @@ class AgentWorker(threading.Thread):
                 document["model"] = modele_annonce or model or None
                 self._context_observation = document
                 self._remember_context_session(document, session_new or session)
+                self._window_measure_keep(
+                    document, bool(getattr(fin_resident, "compact", None)))
             except Exception as exc:  # noqa: BLE001 — observation seule
                 log_async("[%s] context observation not published (%s)"
                           % (self.name, " ".join(str(exc).split())[:160]))
