@@ -776,6 +776,8 @@ def run(cfg, args) -> int:
                                else str(int(report["left_s"]))),
                     ENV_OWNER: str(report.get("owner") or ""),
                 })
+            from .platform.child_environment import execution_transport
+            env = execution_transport(env)
             if lease is not None:
                 code, lost = _run_under_lease(argv, env, lease, execution)
                 if lost:

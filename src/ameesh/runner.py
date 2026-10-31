@@ -7311,7 +7311,8 @@ class AgentWorker(threading.Thread):
                 return rp
             self._close_resident("restarted: %s" % pourquoi)
         life_id = resident_runner.ResidentProcess.new_life_id()
-        env = dict(env)
+        from .platform import child_environment
+        env = child_environment.grant(env, getattr(env, "credentials", ()))
         env.update({
             "AMEESH_TURN_ID": life_id,
             containers_mod.LABELS_ENV: containers_mod.turn_labels(
@@ -8255,6 +8256,8 @@ class AgentWorker(threading.Thread):
             threading.Thread(target=self._audit_deadline_monitor,
                              args=(preempt_done, time.monotonic() + audit_seconds),
                              daemon=True).start()
+        from .platform import child_environment
+        env = child_environment.harness(env, harness, compte)
         # L76 : servi par le processus résident de l'agent, ou un par événement
         from . import resident as resident_mod, resident_runner
         # L111 : le jeton du relais vaut pour CE tour — jamais gardé par un résident
@@ -13724,8 +13727,7 @@ class Runner:
             if not candidates:
                 return []
             try:
-                scan = os_layer.env_values("AMEESH_TURN_ID",
-                                           allow=_executor_process_names())
+                scan = os_layer.env_values("AMEESH_TURN_ID")
             except os_layer.NotAvailable as exc:
                 log("turn resources not settled: %s; next review in %ds"
                     % (exc, int(LIVE_REVIEW_EVERY_S)))
@@ -14612,7 +14614,10 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         if perdu.is_set():
             return 1
         log_async("[%s] interactive session: %s" % (name, " ".join(argv)))
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
+        from .platform import child_environment
+        proc = subprocess.Popen(argv, cwd=cwd, env=child_environment.harness(
+                                    env, harness_revendique, compte),
+                                start_new_session=True)
         # Course de publication (même correctif que B5a-P) : le veilleur a pu
         # conclure pendant que ce Popen n'était pas encore publié.
         if etat["deadline"] > 0 and time.time() >= etat["deadline"]:
@@ -14938,24 +14943,6 @@ def _take_balance(args) -> dict:
 _ENV_HIDDEN = False
 
 
-def _executor_process_names() -> tuple:
-    """#5029 : noms sous lesquels un exécuteur se présente dans `/proc`.
-
-    `settle_dead_turns` cherche l'identifiant de tour dans l'environnement de
-    tous les processus de l'utilisateur. Depuis #5029, l'exécuteur est
-    non-dumpable et illisible ; il ne porte jamais d'identifiant de tour, mais
-    le doute d'un tour inachevé est sans borne haute : sans `allow`, le premier
-    exécuteur redémarré après un incident empêcherait de solder le tour pour
-    toujours. Les noms sont ceux des deux points d'entrée du paquet
-    (`ameesh`, `agent-runner`) et du script réellement invoqué."""
-    from . import platform as os_layer
-    names = set(os_layer.EXECUTOR_NAMES)
-    argv0 = os.path.basename(sys.argv[0] or "")
-    if argv0 and not argv0.startswith("python") and not argv0.endswith(".py"):
-        names.add(argv0)
-    return tuple(sorted(names))
-
-
 def _harden_executor_environment() -> bool:
     """#5029: rendre l'environnement de l'exécuteur illisible à ses pairs.
 
@@ -14977,6 +14964,8 @@ def _harden_executor_environment() -> bool:
               "stay readable by other processes of the same user)" % exc,
               file=sys.stderr)
         return False
+    from .platform import child_environment
+    child_environment.install()
     if hidden and not _ENV_HIDDEN:
         _ENV_HIDDEN = True
         log("executor environment hidden from other processes of the same user "

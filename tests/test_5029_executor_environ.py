@@ -112,7 +112,13 @@ class UndumpableWitnessTest(unittest.TestCase):
         with mock.patch.object(platform.process, "_psutil", return_value=None), \
                 mock.patch.object(platform.process, "process_table", return_value=table):
             without = platform.env_values("AMEESH_TEST_SECRET")
-            allowed = platform.env_values("AMEESH_TEST_SECRET", allow=("python3",))
+            # #5038: a manager-proven PID, not the interpreter's borrowed name.
+            group = platform.self_cgroup_paths()[0]
+            identity = platform.process._executor_identity(proc.pid, group)
+            self.assertIsNotNone(identity)
+            with mock.patch.object(platform.process, "executor_processes",
+                                   return_value={proc.pid: identity}):
+                allowed = platform.env_values("AMEESH_TEST_SECRET")
         self.assertIn(start, without["unread"])
         self.assertNotIn(start, allowed["unread"])
 
@@ -137,6 +143,10 @@ class BecomeUndumpableTest(unittest.TestCase):
 
 class ExecutorStartupTest(unittest.TestCase):
     """`runner.main` hardens the executor before it can run a turn."""
+
+    def setUp(self):
+        original = subprocess.Popen.__init__
+        self.addCleanup(setattr, subprocess.Popen, "__init__", original)
 
     def test_main_calls_the_hardening_before_loading_anything(self):
         called = []
@@ -186,18 +196,13 @@ class HolderChecksTest(unittest.TestCase):
     def test_session_holder_check_allows_the_executor(self):
         with mock.patch.object(platform, "holders", return_value=[]) as holders:
             reprise.holders("/tmp/session", "id")
-        self.assertEqual(holders.call_args.kwargs.get("allow"), platform.EXECUTOR_NAMES)
+        self.assertFalse(holders.call_args.kwargs.get("allow"))
 
     def test_dependency_holder_check_allows_the_executor(self):
         with mock.patch.object(platform, "holders", return_value=[]) as holders:
             deps._holders("/tmp/cache-entry")
-        self.assertEqual(holders.call_args.kwargs.get("allow"), platform.EXECUTOR_NAMES)
+        self.assertFalse(holders.call_args.kwargs.get("allow"))
 
-    def test_housekeeping_allow_list_includes_the_executor(self):
-        from ameesh import housekeeping
-        allowed = housekeeping.unreadable_allow(
-            housekeeping.Policy(unreadable_ok=("gpg-agent",)))
-        self.assertEqual(allowed, ("gpg-agent",) + platform.EXECUTOR_NAMES)
 
 
 if __name__ == "__main__":

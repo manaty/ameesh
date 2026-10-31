@@ -1745,6 +1745,9 @@ def dump_openapi() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .platform.child_environment import harden
+    if not harden():
+        return 1
     args = build_parser().parse_args(argv)
     if args.openapi:
         sys.stdout.write(dump_openapi())

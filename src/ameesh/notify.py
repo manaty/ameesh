@@ -4633,6 +4633,9 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
 
 
 def main(argv: list | None = None) -> int:
+    from .platform.child_environment import harden
+    if not harden():
+        return 1
     argv = sys.argv[1:] if argv is None else argv
     args = build_parser().parse_args(argv)
     cfg = config_mod.load()

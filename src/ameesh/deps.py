@@ -1333,9 +1333,7 @@ def _newest(top: str, *, deadline: float) -> float | None:
 
 
 def _holders(entry: str) -> list[dict]:
-    # #5029 : l'exécuteur non-dumpable ne tient jamais un cache de dépendances ;
-    # sans cette liste, son refus ferait garder toutes les entrées.
-    return platform.holders(entry, mapped=True, allow=platform.EXECUTOR_NAMES)
+    return platform.holders(entry, mapped=True)
 
 
 def entries(cache_root: str) -> list[dict]:

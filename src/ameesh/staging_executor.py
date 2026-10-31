@@ -242,6 +242,9 @@ def tick(db, cfg, options) -> dict:
 
 
 def main(argv=None):
+    from .platform.child_environment import harden
+    if not harden():
+        return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     commands = parser.add_subparsers(dest="command", required=True)

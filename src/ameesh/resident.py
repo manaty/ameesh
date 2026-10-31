@@ -465,7 +465,9 @@ class ResidentDriver:
         self.effort = effort
         self.tier = tier
         self.on_event = on_event
-        self.extra_env = dict(env or {})
+        from .platform import child_environment
+        self.extra_env = child_environment.grant(
+            env or {}, getattr(env, "credentials", ()))
         self.stderr = stderr
         self.init_timeout = max(init_timeout, 0.1)
         #: L76: starts the harness (`subprocess.Popen` by default); the runner
@@ -499,7 +501,9 @@ class ResidentDriver:
         env.update(self.extra_env)
         # #2763 : le VIRTUAL_ENV hérité du runner ne revient pas par os.environ
         from . import venv_guard
-        return venv_guard.scrub(env)
+        from .platform import child_environment
+        return child_environment.grant(
+            venv_guard.scrub(env), self.extra_env.credentials)
 
     # -- public interface --------------------------------------------------
     @property
