@@ -194,6 +194,8 @@ ameesh debit [--json] [--check] [--hours H] [--threshold DURÉE] [--ci-hours H] 
 ameesh events [--after ID] [--limit N] [--json] | prune [--days N] [--dry-run]
                                            # append-only event log (L85)
 ameesh decisions [--all] [--for human:ID] [--json]  # what waits for a human
+ameesh turn current [--local] [--expect-turn ID] [--json]  # the calling turn (ameesh-turn-context/1)
+ameesh turn observe (--turn ID | --request ID) [--json]    # supervisor read (ameesh-turn-observation/1)
 ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since SINCE]
                 [--no-gantt] [--no-versions] [--stale-after S]
 ameesh plan add|list|accept|done|cancel|propose|show   # roadmap and dated commitments (L96)
@@ -263,6 +265,23 @@ entries, decisions, receipts, alerts and pilot gestures. `--after ID` resumes
 after a position (default: the last 20 events), `--limit` bounds the page (max
 1000), `--json` prints an `ameesh-events/1` object; `prune --days N
 [--dry-run]` applies the retention by hand, one year by default.
+
+`ameesh turn current` reads the turn-context document the runner wrote for
+the calling turn (`ameesh-turn-context/1`, `0600` in the agent's state
+directory) and checks it against the environment — agent, lease owner and
+epoch. Unless `--local` is given it then rechecks the live lease and the
+accounting marker in the database. Without `--json` it prints `<agent>
+<turn-id>`; `--json` prints the whole document. An authorization reused later
+must carry `--expect-turn <captured turn id>`: another turn is refused
+(`turn-mismatch`). Exit 3 means no turn, an unreadable, stale or mismatched
+context, or an unavailable verification; nothing is written.
+
+`ameesh turn observe` is the supervisor's read of one turn or one mail request:
+the request and turn states, the agent, the lease, the accounting state and
+`quiescent` — never a body, a payload or a secret. It serves the same document
+as `GET /api/v1/turns/{turn}` and `GET /api/v1/requests/{request}`
+(`ameesh-turn-observation/1`), is read-only, and exits 3 when the target is
+unknown. Only `--json` is a contract; the text rendering may change.
 
 ## GitHub: `ameesh github`
 
