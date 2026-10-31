@@ -2249,6 +2249,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print(('%s #%d: branch %s (assigned to %s)') % (v.noun, out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))
             else:
                 print(('%s #%d assigned to %s (before: %s)%s%s') % (v.noun, out["item"]["id"], out["item"]["assignee"], out["previous"] or "nobody", "; branch %s" % out["item"]["branch"] if args.branch else "", "; WIP exception (§4)" if args.wip_exception else ""))
+            if out.get("reassignment_warning"):
+                # #5025 N7 : l'attribution est écrite, mais l'avis à l'ancien
+                # assigné n'est pas parti ; le dire, ne pas le taire.
+                print("warning: %s" % out["reassignment_warning"], file=sys.stderr)
             _print_assignment(out["check"])
             return 0
         if args.work_command == "external-executor":

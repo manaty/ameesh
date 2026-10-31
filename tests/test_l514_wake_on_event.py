@@ -28,6 +28,7 @@ class MidTurnTest(unittest.TestCase):
         for payload, expected in (
                 ({}, False), ({"ack": True}, False), ({"cc": "md"}, False),
                 ({"verdict": True}, True), ({"arbitration": True}, True),
+                ({"reassigned": {"lot": 1}}, True),
                 ({"human": True, "decision_answer": {"decision": 1}}, True),
                 ({"urgent": True}, True),
                 # a finished CI run does not interrupt the turn: it wakes the
@@ -251,6 +252,24 @@ class SendMarksTest(_Base):
                         env=self.env(AGENT_MAIL_NAME="codex-review"))
         self.assertEqual(proc.returncode, 2)
         self.assertIn("contradict", proc.stderr)
+
+    def test_reassigned_is_a_payload_key_not_a_cli_option(self):
+        # #5025 N6 : `reassigned` est une clé de charge utile ; le CLI ne la
+        # connaît pas comme option et n'avale donc plus un corps qui la cite.
+        self.register("rx", "deepseek")
+        proc = self.cli("send", "rx", "--reassigned", "to the queue",
+                        env=self.env(AGENT_MAIL_NAME="ameesh-dev3"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("unknown option --reassigned", proc.stderr)
+        # un corps littéral commence par `--` : la marque `--` le protège.
+        proc = self.cli("send", "rx", "--", "--reassigned", "to the queue",
+                        env=self.env(AGENT_MAIL_NAME="ameesh-dev3"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        row = self.db.query(
+            "SELECT body, payload FROM agent_mailbox WHERE recipient = 'rx' "
+            "ORDER BY id DESC LIMIT 1")[0]
+        self.assertIn("--reassigned", row["body"])
+        self.assertFalse(mail.message_payload(row).get("reassigned"))
 
 
 class _FauxApi:
