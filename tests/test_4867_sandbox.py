@@ -92,6 +92,37 @@ class SandboxTest(PgTestCase):
         self.assertEqual(self.db.query('select count(*) as n from ameesh_events where type = %s',
                                        ('sandbox.result',))[0]['n'],self.events_before + 1)
 
+    def test_event_sql_failure_preserves_bind_complete_and_replay(self):
+        from ameesh import db as db_mod
+        for driver in ('psycopg', 'psql'):
+            with self.subTest(driver=driver):
+                db = db_mod.connect(self.cfg, driver=driver)
+                self.addCleanup(db.close)
+                self.db.execute("delete from sandbox_results")
+                self.db.execute("delete from sandbox_turns")
+                self.db.execute("delete from spend_pending")
+                self.db.execute("delete from turn_resources")
+                self.db.execute("delete from account_reservations")
+                self.admit()
+                with mock.patch.object(sandbox, 'bind', return_value='SELECT 1/0'), self.assertLogs(
+                        sandbox.__name__, level='WARNING'):
+                    sandbox.ameesh_sandbox_bind(db, 'turn-1', 'runner', 7, 'uid')
+                    receipt = sandbox.ameesh_sandbox_complete(
+                        db, 'turn-1', 'runner', 7, self.result(), settle=self.settle)
+                replay = sandbox.ameesh_sandbox_complete(
+                    db, 'turn-1', 'runner', 7, self.result(), settle=self.settle)
+                self.assertEqual(replay, dict(receipt, replayed=True))
+                self.assertEqual(self.db.query("select state from sandbox_turns")[0]['state'], 'succeeded')
+                self.assertEqual(self.db.query("select state from account_reservations")[0]['state'], 'kept')
+
+    def test_event_sql_failure_preserves_cancel(self):
+        with mock.patch.object(sandbox, 'bind', return_value='SELECT 1/0'), self.assertLogs(
+                sandbox.__name__, level='WARNING'):
+            got = sandbox.ameesh_sandbox_cancel(self.db, 'turn-1', 'runner', 7,
+                                               observed=True, settle=self.settle)
+        self.assertEqual(got['state'], 'cancelled')
+        self.assertEqual(self.db.query("select state from sandbox_turns")[0]['state'], 'cancelled')
+
     def test_bind_idempotent_and_conflict(self):
         self.assertEqual(self.bind(),self.bind())
         self.refusal('job-conflict',sandbox.ameesh_sandbox_bind,self.db,'turn-1','runner',7,'uid-2')

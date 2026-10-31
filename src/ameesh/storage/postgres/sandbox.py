@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+
+from ...db import bind, sql_literal
 
 from ... import jcs
 
@@ -22,6 +25,27 @@ class Refusal(ValueError):
     def __init__(self, code):
         self.code = code
         super().__init__(code)
+
+
+def emit_observation(tx, event_type, object_ref, data):
+    """Best-effort event in the lifecycle transaction, on both DB drivers.
+
+    A server-side subtransaction preserves S1/S3 on insert errors (including
+    query cancellation). Success commits with the transition, so rollback
+    cannot leave an event and replay cannot duplicate its result.
+    """
+    statement = bind("insert into ameesh_events (type, object, data) values (%s, %s, %s::jsonb)",
+                     (event_type, object_ref, json.dumps(data)))
+    body = ("BEGIN PERFORM set_config('ameesh.sandbox_event_error', '', true); "
+            "BEGIN EXECUTE " + sql_literal(statement) + "; "
+            "EXCEPTION WHEN query_canceled OR OTHERS THEN "
+            "PERFORM set_config('ameesh.sandbox_event_error', SQLSTATE, true); "
+            "END; END")
+    tx.execute("DO " + sql_literal(body))
+    error = tx.query("select current_setting('ameesh.sandbox_event_error') as error")[0]['error']
+    if error:
+        logging.getLogger(__name__).warning("sandbox event %s could not be recorded (SQLSTATE %s)",
+                                            event_type, error)
 
 
 def _refuse(code):
@@ -119,9 +143,8 @@ def ameesh_sandbox_bind(db, turn_id, owner, epoch, job_uid):
                 _refuse('job-conflict')
             tx.execute("update sandbox_turns set job_uid = %s, state = 'bound'"
                        ' where turn_id = %s', (job_uid, turn_id))
-            tx.execute("insert into ameesh_events (type, object, data)"
-                       " values ('sandbox.bound', %s, %s::jsonb)",
-                       ('turn:' + turn_id, json.dumps({'turn_id': turn_id, 'job_uid': job_uid})))
+            emit_observation(tx, 'sandbox.bound', 'turn:' + turn_id,
+                             {'turn_id': turn_id, 'job_uid': job_uid})
         return {'turn_id': turn_id, 'job_uid': job_uid}
 
 
@@ -286,9 +309,8 @@ def ameesh_sandbox_complete(db, turn_id, owner, epoch, result, *, settle=None):
                    ' result_sha256 = %s, sandbox_session = %s, completed_at = clock_timestamp()'
                    ' where turn_id = %s',
                    (result['result_id'], digest, result['sandbox_session'], turn_id))
-        tx.execute("insert into ameesh_events (type, object, data)"
-                   " values ('sandbox.result', %s, %s::jsonb)",
-                   ('turn:' + turn_id, json.dumps({'turn_id': turn_id, 'result_id': result['result_id']})))
+        emit_observation(tx, 'sandbox.result', 'turn:' + turn_id,
+                         {'turn_id': turn_id, 'result_id': result['result_id']})
         return receipt
 
 
@@ -332,36 +354,6 @@ def ameesh_sandbox_cancel(db, turn_id, owner, epoch, *, observed=False,
                    ' then clock_timestamp() else completed_at end where turn_id = %s',
                    (state, observed, observed, turn_id))
         if state != previous_state:
-            tx.execute("insert into ameesh_events (type, object, data) values (%s, %s, %s::jsonb)",
-                       ('sandbox.orphan' if orphaned else 'sandbox.cancelled',
-                        'turn:' + turn_id, json.dumps({'turn_id': turn_id, 'state': state})))
+            emit_observation(tx, 'sandbox.orphan' if orphaned else 'sandbox.cancelled',
+                             'turn:' + turn_id, {'turn_id': turn_id, 'state': state})
         return {'turn_id': turn_id, 'state': state}
-
-
-def observe_metadata(db, turn_id, owner, epoch, *, job_phase=None, refusal=None,
-                     job_uid=None, recovery=False):
-    """Trusted supervisor diagnostics only; never advances lifecycle (#4972).
-
-    Keep the last observed Job phase even if result validation refuses, so a
-    completed Job without a receipt remains diagnosable. No payload is stored.
-    """
-    if job_phase is not None and job_phase not in ('Pending', 'Running', 'Succeeded', 'Failed'):
-        raise Refusal('contract-mismatch')
-    if refusal is not None and (not isinstance(refusal, str)
-                                or not refusal or len(refusal) > 80
-                                or any(c not in 'abcdefghijklmnopqrstuvwxyz_-' for c in refusal)):
-        raise Refusal('contract-mismatch')
-    if job_phase is None and refusal is None:
-        return
-    with db.transaction() as tx:
-        row = _locked(tx, turn_id)
-        if recovery:
-            if (row['owner'], row['lease_epoch']) != (owner, epoch):
-                _refuse('stale')
-        else:
-            _live(tx, row, owner, epoch)
-        if job_uid is not None and row['job_uid'] is not None and job_uid != row['job_uid']:
-            _refuse('job-conflict')
-        tx.execute('update sandbox_turns set job_phase = coalesce(%s, job_phase),'
-                   ' refusal = coalesce(%s, refusal) where turn_id = %s',
-                   (job_phase, refusal, turn_id))

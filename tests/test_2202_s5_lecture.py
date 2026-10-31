@@ -110,29 +110,12 @@ class SandboxReadTest(PgTestCase):
     def test_bound_event_once_and_orphan_event(self):
         sandbox.ameesh_sandbox_bind(self.db, self.turn, 'runner', 7, 'uid')
         sandbox.ameesh_sandbox_bind(self.db, self.turn, 'runner', 7, 'uid')
-        with self.assertRaises(sandbox.Refusal):
-            sandbox.observe_metadata(self.db, self.turn, 'runner', 7,
-                                     job_uid='other', job_phase='Failed')
-        self.assertIsNone(obs.show(self.db, self.turn)['job']['phase'])
         sandbox.ameesh_sandbox_cancel(self.db, self.turn, 'runner', 7, orphaned=True)
         sandbox.ameesh_sandbox_cancel(self.db, self.turn, 'runner', 7, orphaned=True)
         rows = self.db.query("select type from ameesh_events where object=%s and type like 'sandbox.%%'", ('turn:'+self.turn,))
         types = [r['type'] for r in rows]
         self.assertEqual(types.count('sandbox.bound'), 1)
         self.assertEqual(types.count('sandbox.orphan'), 1)
-
-    def test_supervisor_metadata_is_fenced_and_lifecycle_unchanged(self):
-        sandbox.observe_metadata(self.db, self.turn, 'runner', 7,
-                                 job_phase='Succeeded', refusal='revoked')
-        document = obs.show(self.db, self.turn)
-        self.assertEqual(document['state'], 'intent')
-        self.assertEqual(document['job']['phase'], 'Succeeded')
-        self.assertEqual(document['refusal'], 'revoked')
-        with self.assertRaises(sandbox.Refusal):
-            sandbox.observe_metadata(self.db, self.turn, 'runner', 6, job_phase='Failed')
-        self.assertEqual(obs.show(self.db, self.turn), document)
-        with self.assertRaises(sandbox.Refusal):
-            sandbox.observe_metadata(self.db, self.turn, 'runner', 7, refusal='private transcript')
 
     def test_observation_still_composes_after_resource_retention(self):
         self.db.execute('delete from turn_resources where turn_id=%s', (self.turn,))

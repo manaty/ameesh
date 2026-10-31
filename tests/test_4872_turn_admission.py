@@ -131,6 +131,27 @@ class TurnAdmissionTest(PgTestCase):
         api.tranche_close(self.db,'migration',actor='human:t',why='verified overspend',reconcile=True)
         self.admit('again')
 
+    def test_event_sql_failure_preserves_admission_and_overdraft_settlement(self):
+        from ameesh import db as db_mod
+        for driver in ('psycopg', 'psql'):
+            with self.subTest(driver=driver):
+                db = db_mod.connect(self.cfg, driver=driver)
+                self.addCleanup(db.close)
+                snapshot = self.snapshot(driver)
+                with mock.patch.object(sandbox, 'bind', return_value='SELECT 1/0'), self.assertLogs(
+                        sandbox.__name__, level='WARNING'):
+                    self.admit(driver, driver, db=db, sandbox=snapshot)
+                self.spend(driver, 3, relay=True)
+                with mock.patch.object(sandbox, 'bind', return_value='SELECT 1/0'), self.assertLogs(
+                        sandbox.__name__, level='WARNING'):
+                    with db.transaction() as tx:
+                        row = tx.query('select * from sandbox_turns where spend_key=%s', (driver,))[0]
+                        api.settle_tx(tx, driver, 3, sandbox_turn=row)
+                self.assertEqual(self.reservation(driver)['state'], 'settled')
+                self.assertEqual(float(self.reservation(driver)['usd']), 3)
+                self.assertTrue(self.db.query("select overdraft from tranche_limits where id='migration'")[0]['overdraft'])
+                self.db.execute("update tranche_limits set overdraft=false where id='migration'")
+
     def test_account_refusal_rolls_back_old_reservation_kept(self):
         self.admit()
         storage.of(self.db).budgets.account_put('provider',2,actor='human:t')
