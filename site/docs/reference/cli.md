@@ -7,7 +7,7 @@ spellings of the renamed commands and options remain hidden aliases
 ([Switch from a v0 setup](../guides/switch-from-v0.md)).
 Run `ameesh <command> --help` for the authoritative text.
 
-Four entry points are installed by the package:
+Five entry points are installed by the package:
 
 | Command | What it is |
 |---|---|
@@ -15,10 +15,13 @@ Four entry points are installed by the package:
 | `agent-mail` | alias of `ameesh mail` (the harness hooks call it) |
 | `agent-runner` | alias of `ameesh run` |
 | `ameesh-approve` | the human approval service, run under its own Unix user |
+| `ameesh-it-proof` | one-shot IT execution proof producer, isolated and never an agent credential |
 
 From a clone, `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner` and
 `bin/ameesh-approve` do the same with `PYTHONPATH=src`, or use
-`PYTHONPATH=src python3 -m ameesh …`.
+`PYTHONPATH=src python3 -m ameesh …`. `ameesh-it-proof` has no launcher in
+`bin/`: it is installed only as the console script of the isolated proof
+service.
 
 **Closed output.** When the reader closes `ameesh`'s standard output (for
 example `ameesh alerts --json | head`), the command stops quietly, without a
@@ -436,7 +439,8 @@ ameesh module <pipeline> release <id>
 ```
 
 `modules` discovers built-in, installed and declarative modules. `--no-canon`
-limits discovery to installed implementations; `--active` reads applied
+limits discovery to built-in and installed implementations, without the
+canon's Pipeline cards; `--active` reads applied
 project policies (or compiles the local canon if the database is unavailable).
 Discovery reports capabilities and descriptor fingerprints; it does not prove
 activation. `module --list` lists available command providers.
@@ -471,7 +475,9 @@ ameesh work plan <id|record> [--start DAY] [--end DAY] [--delivery DAY] [--sourc
 ameesh work estimates [--app PROJECT] [--json]   # actual/estimated ratios (ameesh-estimates/1)
 ameesh work list [--state S] [--assignee A] [--limit N] [--stale-after S] [--json]
 ameesh work show <id> [--json]
-ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
+ameesh work move <id> <state> [--note N] [--actor A]
+                     # state: intake|build|qa|merged|promoted|blocked|waiting_human,
+                     #        or requested|in_progress|to_validate|validated|delivered|closed
 ameesh work move <id> merged --correct REASON [--actor A]
 ameesh work promote <id> [--note N] [--actor A]
 ameesh work merged <id> (--sha SHA | --pr OWNER/REPO#N) [--migration-landed N]
