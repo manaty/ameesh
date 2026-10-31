@@ -164,7 +164,7 @@ class SettleDeadTurnsTest(PgTestCase):
 
         turn = self._row("ex", pgid=self.mort, status="orphan")
         self.assertEqual(self._review(scan=scan), [turn])
-        self.assertIn("ameesh", seen.get("allow", ()))
+        self.assertFalse(seen.get("allow"))
 
     def test_no_process_table_settles_nothing(self):
         turn = self._row("pt", pgid=self.mort, status="orphan")

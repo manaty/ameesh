@@ -127,6 +127,38 @@ class ControlerVenvTest(unittest.TestCase):
         self.assertIn("dev8", fait.stdout)  # l'autre exécuteur reste sain
         self.assertNotIn("contrôles verts", fait.stdout)
 
+    def test_non_dumpable_demande_preuve_root_sans_accepter_cmdline_seule(self):
+        enfant = subprocess.Popen(
+            [str(self.live / "bin/python"), "-c",
+             "import ctypes,time; "
+             "assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0; "
+             "print('ready',flush=True); time.sleep(60)"],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(self.arreter, enfant)
+        self.assertEqual(enfant.stdout.readline().strip(), "ready")
+        preuve = subprocess.run(
+            [sys.executable, str(ROOT / "deploy/mise-a-jour/venv-processus.py"),
+             str(enfant.pid), str(self.venv), "non-dumpable"],
+            capture_output=True, text=True, timeout=10)
+        # Le noyau refuse exe malgré la cmdline du bon venv.
+        self.assertEqual(preuve.returncode, 3, preuve.stdout + preuve.stderr)
+        sudo = self.bin / "sudo"
+        sudo.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$TEST_STATE/sudo.log\"\nexit 1\n")
+        sudo.chmod(0o755)
+        fait = self.lancer({"dev9": enfant.pid})
+        self.assertNotEqual(fait.returncode, 0)
+        self.assertIn("-n python3", (self.state / "sudo.log").read_text())
+        self.assertNotIn("contrôles verts", fait.stdout)
+        # Un ancien venv est toujours refusé avant tout accès privilégié.
+        courant = self.share / "venv-courant"
+        courant.unlink()
+        courant.symlink_to(self.old.name)
+        mauvais = subprocess.run(
+            [sys.executable, str(ROOT / "deploy/mise-a-jour/venv-processus.py"),
+             str(enfant.pid), str(self.old), "ancien"],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(mauvais.returncode, 1)
+
     def test_controler_rouge_si_un_mainpid_est_absent(self):
         for pid in ("0", "  "):
             with self.subTest(pid=pid):
@@ -145,6 +177,12 @@ with (state / 'ssh.log').open('a') as f:
     f.write(command + '\n')
 if 'MainPID' in command:
     print((state / 'pid').read_text().strip())
+    sys.exit(0)
+if command.startswith('python3 - ') and command.endswith(' --check'):
+    # Le runtime invité appartient à la VM simulée : ne pas exécuter son
+    # contrôle root sur l'hôte qui lance ce test de preuve du venv.
+    sys.stdin.read()
+    print('guest runtime verified')
     sys.exit(0)
 if 'python3 -' in command:
     # #3311 : le helper arrive sur stdin ; le venv stable de la VM est simulé.
@@ -222,6 +260,7 @@ class ControlerServeurTest(unittest.TestCase):
         self.assertEqual(fait.returncode, 0, fait.stdout + fait.stderr)
         self.assertIn("MainPID vivant sur le venv courant", fait.stdout)
         self.assertIn("contrôles verts", fait.stdout)
+        self.assertIn("guest runtime verified", fait.stdout)
 
     def test_controler_rouge_si_le_runner_serveur_reste_sur_l_ancien_venv(self):
         fait = self.controler(self.processus(self.old))

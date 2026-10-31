@@ -383,6 +383,10 @@ def migration_requirements(project, sha, base):
     return {target: rows for target, rows in required.items() if rows}
 
 
+# Read-only staging migration ledger access, granted only to this release model.
+CHILD_CREDENTIALS = frozenset({"SUPABASE_ACCESS_TOKEN"})
+
+
 def migration_rows(project, target, required):
     """Read-only query to the literal staging project, no caller-selected URL."""
     token = os.environ.get("SUPABASE_ACCESS_TOKEN", "")

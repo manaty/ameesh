@@ -19,6 +19,8 @@ Ces tests tiennent la propriété, sans réseau ni base :
 """
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import contextlib
 import dataclasses
 import io
@@ -146,7 +148,7 @@ class CliCase(unittest.TestCase):
                 mock.patch.object(plan_github, "client", client_factory or self.client):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 try:
-                    code = main_mod.main(argv)
+                    code = isolated_entrypoint(main_mod.main, argv)
                 except SystemExit as exit_:  # argparse : `--help`, choix refusé
                     code = int(exit_.code or 0)
         return code, out.getvalue(), err.getvalue()

@@ -1817,7 +1817,9 @@ preuve_venv_agents() {  # persona → 0 si le MainPID vivant exécute le venv in
     echo "venv-processus.py introuvable : $ICI/venv-processus.py" >&2
     return 1
   fi
-  utilisateur_agents_stdin python3 - "$pid" "$VENV_AGENTS" "$u" \
+  # #5094 : les exécuteurs #5029 sont non dumpables ; seul root peut
+  # vérifier /proc/PID/exe. Le transport agents est déjà administratif.
+  ENTREE_STDIN=1 ssh_agents "python3 - '$pid' '$VENV_AGENTS' '$u'" \
     < "$ICI/venv-processus.py"
 }
 

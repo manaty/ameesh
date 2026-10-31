@@ -4,6 +4,8 @@ doctor` : la version du paquet, lue par importlib.metadata (repli sur le
 pyproject.toml de l'arbre source)."""
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import contextlib
 import io
 import os
@@ -27,7 +29,7 @@ def _pyproject_version() -> str:
 def _output(argv) -> tuple[int, str]:
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        code = main_mod.main(argv)
+        code = isolated_entrypoint(main_mod.main, argv)
     return code, out.getvalue()
 
 

@@ -17,7 +17,9 @@ arrêté ou un bail repris par un autre candidat ne laisse rien en suspens.
 Avant tout geste, le tic pose les migrations **additives** de la tête que la
 base partagée n'a pas encore (#4075) : sinon le code de la tête lit des
 colonnes absentes. Une migration non additive en attente, ou une pose refusée
-(droit DDL) : aucun geste, un lot d'empreinte, le pilote et le bureau prévenus.
+(droit DDL) : aucun geste, un lot d'empreinte (la cause notée au lot, #5097), le
+pilote et le bureau prévenus. Un verrou non obtenu (`lock_timeout`) est d'abord
+réessayé une fois dans le même tic.
 
 Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
 `ameesh role run`, ne le lance que sur l'hôte qui détient le bail) :
@@ -123,7 +125,8 @@ part.
 créneau) sans arrêter la minuterie : `role timers --check` reste vert et nomme
 la pause. L'échéance est obligatoire (au plus 12 h) ; la pause vit au journal
 partagé (`packet.pause`, `ameesh.packet_pause`), pas sur l'hôte : un bail qui
-change de main la garde. `--await-announcement` transforme l’échéance en alerte :
+change de main la garde. `--await-announcement` transforme l’échéance en alerte,
+relancée chaque heure tant que l’annonce manque (#5057) :
 la pause reste jusqu’à `resume --source "auteur, date, message"` (canon §7). Pendant la pause, le tic ne fait aucun geste (ni
 migration ni composition) et le dit ; sans attente d’annonce, à l'échéance il
 reprend seul ; `resume` lève avant. Pose et levée sont dites au pilote et au bureau.
@@ -1599,6 +1602,9 @@ BUREAU = "bureau"
 MISSING_RE = re.compile(r"^(\d{4}_[A-Za-z0-9._-]+): (additive|NOT additive)", re.MULTILINE)
 DENIED_RE = re.compile(r"permission denied|must be owner|insufficient.privilege|42501",
                        re.IGNORECASE)
+#: #5097 : `lock_timeout` (5 s) dépassé sur une table chaude ; passager, un
+#: second essai suit avant toute alerte (h-10 : 0529 refusée à 11:40, posée à 11:50).
+LOCK_RE = re.compile(r"lock timeout|55P03", re.IGNORECASE)
 
 
 def _migrate(ctx: Context, flag: str) -> Result:
@@ -1640,9 +1646,14 @@ def align_schema(ctx: Context) -> None:
         ctx.say("[essai] migrations à poser : %s" % ", ".join(labels))
         return
     result = _migrate(ctx, "--additive-only")
+    if result.returncode != 0 and LOCK_RE.search(result.text):
+        ctx.say("schéma : verrou non obtenu (%s), second essai"
+                % auto._tail(result.text, 1))
+        result = _migrate(ctx, "--additive-only")
     if result.returncode != 0:
         kind = "droit-ddl" if DENIED_RE.search(result.text) else (
-            "non-additive" if result.returncode == 3 else "pose")
+            "non-additive" if result.returncode == 3 else
+            "verrou" if LOCK_RE.search(result.text) else "pose")
         fail_schema(ctx, kind, labels, result)
     ctx.say("schéma : %s posée(s) sur la base partagée" % ", ".join(labels))
 
@@ -1651,6 +1662,7 @@ SCHEMA_WHY = {
     "lecture": "lecture des migrations impossible",
     "non-additive": "migration non additive en attente : jamais posée par le tic (§11 bis)",
     "droit-ddl": "le rôle DB du tic n'a pas le droit DDL",
+    "verrou": "verrou de table non obtenu deux fois (lock_timeout)",
     "pose": "pose refusée par la base",
 }
 
@@ -1685,6 +1697,12 @@ def alert_schema(ctx: Context, kind: str, what: str, message: str) -> None:
         lot = int(payload.get("lot") or 0)
     except (ValueError, TypeError, AttributeError):
         lot = 0
+    if lot:
+        # #5097 : la cause vit dans le lot, pas seulement dans le courrier
+        # (h-10 : lot ouvert avec le seul code « pose », courrier jamais lu).
+        noted = ctx.ameesh("work", "note", str(lot), message, "--actor", ctx.actor)
+        if noted.returncode != 0:
+            ctx.say("note du lot #%d non écrite : %s" % (lot, auto._tail(noted.text, 5)))
     for to in dict.fromkeys((ctx.pilot, BUREAU)):
         cmd = ["agent-mail", "send", to, "-", "--from", ctx.actor]
         if lot:

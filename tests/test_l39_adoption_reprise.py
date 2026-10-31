@@ -9,6 +9,8 @@ harnais de `tests/fakebin`.
 """
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import contextlib
 import dataclasses
 import io
@@ -298,7 +300,7 @@ class AdoptTest(_Base):
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, self.env(AMEESH_CONFIG=config)), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = mesh_main.main(["adopt", "coord", "--session", SID,
+            code = isolated_entrypoint(mesh_main.main, ["adopt", "coord", "--session", SID,
                                    "--harness", "codex", "--json"])
         self.assertEqual(code, 0, stderr.getvalue())
         out = json.loads(stdout.getvalue())

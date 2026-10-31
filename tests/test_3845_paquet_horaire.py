@@ -792,7 +792,11 @@ class SchemaTest(unittest.TestCase):
                     return ph.Result(0)
                 if cmd[0] == "ameesh":
                     return ph.Result(0, json.dumps({"created": created, "lot": 4100}))
-                rc, out = read if cmd[-1] == "--dry-run" else apply
+                if cmd[-1] == "--dry-run":
+                    rc, out = read
+                else:
+                    # #5097 : une suite de réponses pour les essais successifs
+                    rc, out = apply.pop(0) if isinstance(apply, list) else apply
                 return ph.Result(rc, out, "")
         ctx = ph.Context(repo=ROOT, target="main", project="ameesh", pilot="mesh-design",
                          actor="mesh-design", shell=Sh(), python="python3", zone=ZONE,
@@ -836,6 +840,37 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual([m[0] for m in mails], ["mesh-design", "bureau"])
         self.assertIn("4100", mails[0][1])
         self.assertIn("droit DDL", mails[0][2])
+
+    def test_cause_notee_dans_le_lot(self):
+        # #5097 : le lot d'empreinte porte la cause, pas seulement le courrier.
+        ctx, calls, _ = self.ctx(read=(0, self.ADDITIVE),
+                                 apply=(1, "migration failed: syntax error at or near x\n"))
+        with self.assertRaises(ph.HoraireError):
+            ph.align_schema(ctx)
+        note = [c for c in calls if c[:3] == ["ameesh", "work", "note"]]
+        self.assertEqual(len(note), 1)
+        self.assertEqual(note[0][3], "4100")
+        self.assertIn("syntax error at or near x", note[0][4])
+
+    def test_verrou_passager_second_essai(self):
+        ctx, calls, mails = self.ctx(read=(0, self.ADDITIVE), apply=[
+            (1, "canceling statement due to lock timeout\n"),
+            (0, "1 migration(s) applied\n")])
+        ph.align_schema(ctx)
+        self.assertEqual([c[-1] for c in calls].count("--additive-only"), 2)
+        self.assertEqual(mails, [])
+        self.assertTrue(any("posée" in line for line in ctx.log))
+
+    def test_verrou_deux_fois_empreinte_verrou(self):
+        ctx, calls, mails = self.ctx(read=(0, self.ADDITIVE), apply=[
+            (1, "canceling statement due to lock timeout\n")] * 2)
+        with self.assertRaises(ph.HoraireError) as caught:
+            ph.align_schema(ctx)
+        self.assertIn("lock_timeout", str(caught.exception))
+        self.assertEqual([c[-1] for c in calls].count("--additive-only"), 2)
+        fingerprint = [c for c in calls if c[1:4] == ["work", "fingerprint", "open"]][0]
+        self.assertIn("paquet-horaire:schema:verrou:0499_operator_pause_until", fingerprint)
+        self.assertEqual([m[0] for m in mails], ["mesh-design", "bureau"])
 
     def test_empreinte_deja_ouverte_aucun_courrier(self):
         ctx, _, mails = self.ctx(read=(0, self.ADDITIVE), apply=(1, "permission denied"),

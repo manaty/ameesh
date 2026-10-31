@@ -77,6 +77,18 @@ AGENT_COLUMNS = """
 """
 
 
+# #5099 : get() sert aussi au courrier AVANT la pose des migrations.
+# Lire les colonnes présentes, puis projeter le contrat connu, évite qu'une
+# nouvelle colonne additive rende ce courrier impossible sur l'ancien schéma.
+_GET_FIELDS = [part.strip() for part in re.sub(r"--[^\n]*", "", AGENT_COLUMNS).split(",")]
+_GET_NAMES = [part.rsplit(" as ", 1)[-1].strip() for part in _GET_FIELDS]
+_GET_NAMES += ["last_mail_ts", "last_mail_host"]
+_GET_TIMESTAMPS = [re.sub(
+    r"from (\w+)", r"from (to_jsonb(agent_registry)->>'\1')::timestamptz", part)
+    for part in _GET_FIELDS if part.startswith("extract(")]
+GET_COLUMNS = "agent_registry.*, " + ", ".join(_GET_TIMESTAMPS)
+
+
 def check_name(name: str) -> str:
     """Nom d'agent sûr (NAME_RE) : seul un nom contrôlé entre dans un littéral."""
     if not NAME_RE.match(name or ""):
@@ -542,9 +554,9 @@ class Agents(interface.Agents):
                    WHERE m.sender = agent_registry.name
                    ORDER BY m.id DESC LIMIT 1) presence ON true
              WHERE name = (SELECT ameesh_resolve_agent_name(%%s, %%s))
-            """ % AGENT_COLUMNS,
+            """ % GET_COLUMNS,
             (name, "agents.get"))
-        return rows[0] if rows else None
+        return {key: rows[0].get(key) for key in _GET_NAMES} if rows else None
 
     def resolve_name(self, name, *, operation="lookup") -> str:
         return self.db.query("SELECT ameesh_resolve_agent_name(%s, %s) AS name",

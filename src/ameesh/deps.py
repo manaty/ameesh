@@ -1334,7 +1334,7 @@ def _newest(top: str, *, deadline: float) -> float | None:
 
 def _holders(entry: str, *, allow=()) -> list[dict]:
     # #5029/#5046 : l'appelant passe la politique d'illisibilité de l'hôte
-    # (`housekeeping.unreadable_allow`, qui inclut l'exécuteur non-dumpable) ;
+    # (`policy.housekeeping.unreadable_ok`) ;
     # l'exécuteur ne tient jamais un cache de dépendances.
     return platform.holders(entry, mapped=True, allow=allow)
 

@@ -36,6 +36,8 @@ MAX_S = 12 * 3600
 LOOKBACK_DAYS = 2
 #: `data` stays short (events.py: identifiers and states)
 REASON_MAX = 200
+#: #5057: an expired announcement pause reminds the pilot at this cadence
+REMIND_S = 3600
 
 
 class PauseError(ValueError):
@@ -123,23 +125,34 @@ def alert_due(db, data: dict | None, *, project: str, target: str,
               recipients, now: float | None = None) -> None:
     """#5045: deadline of an announcement pause alerts, never resumes.
 
-    One mail per pause and recipient, including across a composer lease move.
-    A failed delivery is retried at the next tick with the same key.
+    #5057: the alert is repeated every `REMIND_S` past the deadline while the
+    announcement is missing, so a missed mail does not freeze merges in
+    silence (8 h 37 in 0518). One mail per pause, period and recipient,
+    including across a composer lease move; a failed delivery is retried at
+    the next tick of the same period with the same key.
     """
     from . import mail, work
     now = time.time() if now is None else float(now)
     if not active_of(data, now) or not data.get("await_announcement"):
         return
-    if float(data["until"]) > now:
+    until = float(data["until"])
+    if until > now:
         return
+    period = int((now - until) // REMIND_S)
     body = ("Paquet horaire %s/%s : échéance de pause atteinte. "
             "Annonce explicite toujours attendue ; aucun geste de composition. "
             "Motif : %s. Publier la fin de fenêtre puis lever avec "
             "paquet-horaire.py resume --source (auteur, date, message)."
             % (project, target, data.get("reason") or "?"))
+    suffix = ""
+    if period:
+        late = int(now - until) // 60
+        body = ("Relance %d : composition gelée depuis %d h %02d après l’échéance. %s"
+                % (period, late // 60, late % 60, body))
+        suffix = "-r%d" % period
     for recipient in dict.fromkeys(recipients):
         mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="request",
-                  idempotency_key="packet-pause-%s-%s" % (data["event"], recipient))
+                  idempotency_key="packet-pause-%s-%s%s" % (data["event"], recipient, suffix))
 
 
 def describe(data: dict, zone=None) -> str:
@@ -164,7 +177,8 @@ def windows(db, *, project: str, now: float | None = None) -> list[dict]:
     it opens at the `paused` event and ends at its deadline (ordinary pause)
     or the next event of the same object (`resumed`, or a renewed pause).
     Announcement pauses remain open beyond their alert deadline. The state
-    preceding the lookback is included, so an old open pause is not forgotten.
+    preceding the lookback is included, so an old open pause is not forgotten,
+    with the pauses it renewed (#5057), so a long chain keeps its true start.
     The SLO reads them to stop the GO → merge clock while no composition
     runs (`suspended_start`).
     An event without a date opens no window.
@@ -222,11 +236,15 @@ def suspended_start(start: float, pauses, next_slot, now: float
     accrued = 0.0
     crossed = None
     for window in sorted(pauses, key=lambda w: w["start"]):
-        if window["end"] <= cursor or window["start"] >= now or cursor >= now:
+        if window["start"] >= now:
             continue
-        crossed = window
+        # #5057: a pause running at `now` wins even when an earlier one pushed
+        # the cursor past `now` (its next slot is still ahead).
         if window["end"] > now or (window.get("open") and window["end"] >= now):
             return now, window
+        if window["end"] <= cursor or cursor >= now:
+            continue
+        crossed = window
         accrued += max(0.0, window["start"] - cursor)
         after = next_slot(window["end"])
         cursor = max(cursor, float(after) if after is not None else float(window["end"]))
