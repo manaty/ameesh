@@ -11,7 +11,7 @@ import time
 from .. import interface
 from ..interface import HOLD_NOTE_WHITESPACE
 from .work import has_wake_at
-from .work_dependencies import freeze_due
+from .work_dependencies import current_verdict as _current_verdict, freeze_due, wake_defers
 
 _CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
 
@@ -137,9 +137,10 @@ class LotSessions(interface.LotSessions):
                    WHERE btrim(b.work_item_id) = w.id::text) mb ON true
              WHERE w.assignee = %s
                AND (w.state IN ('{lifecycle.REQUESTED}', '{lifecycle.IN_PROGRESS}')
-                    OR (w.state = '{lifecycle.QA}' AND """ + freeze_due("w") + """))
+                    OR (w.state = '{lifecycle.QA}' AND (""" + freeze_due("w") + """
+                        OR """ + _current_verdict("w") + """ = 'blocked')))
                AND (w.planned_start IS NULL OR w.planned_start <= %s::date)
-               AND (w.wake_at IS NULL OR w.wake_at <= clock_timestamp())
+               AND NOT """ + wake_defers("w") + """
                AND NOT EXISTS (SELECT 1 FROM agent_mailbox b
                                 WHERE b.delivered_at IS NULL AND b.kind = 'request'
                                   AND (b.payload -> 'decision') IS NOT NULL

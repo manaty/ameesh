@@ -210,6 +210,23 @@ class UnitTest(unittest.TestCase):
         for wake in (self.now, self.now - 1, None):
             self.assertEqual(self.resolve(rows=[dict(row, wake_ts=wake)]), {})
 
+    def test_hold_and_gate_prime_over_a_future_wake(self):
+        # #5037 (N1 de la revue de #5028) : le réveil futur est une attente de
+        # repli ; un hold du pilote ou une porte externe garde son libellé.
+        row = dict(id=1, state="build", wake_ts=self.now + 3600)
+        held = {1: {"what": "hold", "by": "orch", "since": 1.0}}
+        wait = self.resolve(rows=[row], holds=held)[1]
+        self.assertEqual(wait, held[1])
+        self.assertTrue(D.wait_label(wait).startswith("hold by orch since "))
+        commitment = {"id": 7, "status": "open", "work_item_id": 1,
+                      "due_on": "2026-10-13",
+                      "depends_on": ["gate:liquichain-window"]}
+        wait = self.resolve(rows=[row], commitments=[commitment])[1]
+        self.assertEqual(wait["what"], "hold")
+        self.assertEqual(wait["gate"], "liquichain-window")
+        self.assertEqual(D.wait_label(wait),
+                         "external hold until 2026-10-13 (liquichain-window)")
+
     def test_future_start_ends_at_local_midnight_without_changing_activity(self):
         dates = {1: {"planned_start": "2026-10-13"}}
         self.assertEqual(self.resolve(dates=dates), {1: {"what": "scheduled", "start": "2026-10-13"}})
@@ -721,6 +738,35 @@ class PgTest(PgTestCase):
             commitment["id"], values={"status": "cancelled"}, current=["open"])
         self.assertEqual([r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)],
                          [waiting["id"]])
+
+    def test_wake_on_a_held_lot_names_the_holder_and_the_gate(self):
+        """#5037 (N1) : le réveil futur ne masque plus le hold dans les vues."""
+        self.unbound()
+        held = self.item("pilot hold with a wake")
+        work.note(self.db, held["id"], "hold: fenêtre opérateur", actor="human:pilote")
+        wake = self.now + 3600
+        self.db.execute("UPDATE work_items SET wake_at = to_timestamp(%s) WHERE id = %s",
+                        (wake, held["id"]))
+        row = plan.annotate(self.db, [work.get(self.db, held["id"])], now=self.now)[0]
+        self.assertEqual(row["planned_wait"]["what"], "hold")
+        self.assertEqual(row["planned_wait"]["by"], "human:pilote")
+        self.assertIn("hold by human:pilote", D.wait_label(row["planned_wait"]))
+        snap = progress.snapshot(self.db, self.cfg, project="acme", now=self.now, gantt=False)
+        seen = {r["id"]: r for r in snap["lots"]}[held["id"]]
+        self.assertEqual(seen["planned_wait"]["what"], "hold")
+        self.assertIn("hold by human:pilote", D.wait_label(seen["planned_wait"]))
+        # la porte externe garde elle aussi son libellé, avec l'échéance.
+        gate = self.item("external gate with a wake")
+        due = (datetime.date.fromtimestamp(self.now)
+               + datetime.timedelta(days=1)).isoformat()
+        roadmap.add_commitment(self.db, "hold until the window", due=due, lot=gate["id"],
+                               depends_on=["gate:liquichain-window"])
+        self.db.execute("UPDATE work_items SET wake_at = to_timestamp(%s) WHERE id = %s",
+                        (wake, gate["id"]))
+        row = plan.annotate(self.db, [work.get(self.db, gate["id"])], now=self.now)[0]
+        self.assertEqual(row["planned_wait"]["what"], "hold")
+        self.assertEqual(D.wait_label(row["planned_wait"]),
+                         "external hold until %s (liquichain-window)" % due)
 
     def test_declared_landing_defers_stagnation_until_cleared_closed_or_expired(self):
         waiting = work.add(self.db, title="frozen, carried by a package vehicle", app="acme")

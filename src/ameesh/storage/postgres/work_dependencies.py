@@ -76,6 +76,22 @@ def freeze_due(alias: str) -> str:
             " AND coalesce(to_jsonb({a})->>'reviewer', '') <> '-none')").format(a=alias)
 
 
+def wake_defers(alias: str) -> str:
+    """#5037 : ce réveil programmé futur écarte-t-il encore ce lot ?
+
+    Un réveil futur vaut attente (#5028), sauf quand une correction est due :
+    un lot en `qa` sans gel déclaré (`freeze_due`) ou à verdict courant
+    bloquant attend un geste de son auteur, pas l'échéance. Le réveil ne le
+    sort donc ni des lots actionnables ni de ceux qui occupent l'agent (N2 de
+    la revue de #5028). `False` (aucune attente par réveil) sans réveil
+    futur ; l'appelant écrit `AND NOT ` + ce prédicat.
+    """
+    return ("({a}.wake_at IS NOT NULL AND {a}.wake_at > clock_timestamp()"
+            " AND NOT ({a}.state = '{qa}' AND (" + freeze_due(alias) + " OR "
+            + current_verdict(alias) + " = 'blocked')))").format(
+                a=alias, qa=lifecycle.QA)
+
+
 def not_blocking(alias: str) -> str:
     """#2252 : prédicat SQL « ce lot ne bloque plus » — il est FUSIONNÉ
     (`merged`/`promoted`/`closed`). Un lot en `qa`, même à verdict courant
