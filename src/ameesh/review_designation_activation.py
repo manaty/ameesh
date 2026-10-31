@@ -2545,16 +2545,28 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
         # siège absent de la colonne a été retiré par le pilote.
         wanted = [name for name in wanted if name in current]
     wanted.extend(names)
+    if effective is not None and effective[1] == "carried":
+        from .agent_review_hold import carried_reviewers
+        wanted = carried_reviewers(db, lot, wanted)
     for name in wanted:
         if name and name not in keep:
             keep.append(name)
     if keep == current:
         return
-    db.query(
-        "UPDATE work_items SET reviewers ="
-        " ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) WHERE id = %s"
-        " RETURNING reviewers",
-        (json.dumps(keep), lot))
+    # #5087: superseding automatic seats does not revoke the old reviewers'
+    # right to offer an opinion. Restore the setting before another write in
+    # this transaction, so a subsequent explicit withdrawal remains guarded.
+    with db.transaction() as tx:
+        previous = tx.query(
+            "SELECT current_setting('ameesh.review_seat_rotation', true) AS value")
+        previous = (previous[0].get("value") if previous else None) or ""
+        tx.execute("SELECT set_config('ameesh.review_seat_rotation', 'on', true)")
+        tx.query(
+            "UPDATE work_items SET reviewers ="
+            " ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) WHERE id = %s"
+            " RETURNING reviewers",
+            (json.dumps(keep), lot))
+        tx.execute("SELECT set_config('ameesh.review_seat_rotation', %s, true)", (previous,))
     if names:
         text = text or "reviewers designated automatically at freeze #%d: %s" % (
             freeze_id, ", ".join(names))
@@ -4096,6 +4108,8 @@ def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
     # #3460 : un agent retiré ne reçoit plus de courrier, son siège est mort
     if rd.is_retired(row):
         return "retired"
+    if row.get("review_hold"):
+        return "review hold"
     if (row.get("mode") or "execute") != "execute":
         return "mode %s" % (row.get("mode"),)
     status = str(row.get("status") or "").strip().lower()

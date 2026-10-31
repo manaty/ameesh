@@ -855,13 +855,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot()
         proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
-        # 0462 : le trigger d'audit dépend aussi de la colonne `reviewer`.
-        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
-        # 0516 : le trigger d'orthographe des noms d'agents aussi.
-        self.db.execute("DROP TRIGGER IF EXISTS ameesh_agent_spelling ON work_items")
-        self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
-        self.addCleanup(self._restore_reviewer_column)
+        self.drop_work_item_column("reviewer", self._restore_reviewer_column)
         self.db.__dict__.pop("_has_reviewer", None)
 
         proc = self.mesh("work", "move", str(lot["id"]), "qa",
@@ -915,13 +909,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot(app="ameesh")
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
-        # 0462 : le trigger d'audit dépend aussi de la colonne `reviewer`.
-        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
-        # 0516 : le trigger d'orthographe des noms d'agents aussi.
-        self.db.execute("DROP TRIGGER IF EXISTS ameesh_agent_spelling ON work_items")
-        self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
-        self.addCleanup(self._restore_reviewer_column)
+        self.drop_work_item_column("reviewer", self._restore_reviewer_column)
         self.db.__dict__.pop("_has_reviewer", None)
 
         item = work.get(self.db, lot["id"])
@@ -953,13 +941,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot()
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
-        # 0462 : le trigger d'audit dépend aussi de la colonne `reviewer`.
-        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
-        # 0516 : le trigger d'orthographe des noms d'agents aussi.
-        self.db.execute("DROP TRIGGER IF EXISTS ameesh_agent_spelling ON work_items")
-        self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
-        self.addCleanup(self._restore_reviewer_column)
+        self.drop_work_item_column("reviewer", self._restore_reviewer_column)
         daemon = self.connect()                 # née avant 0421, aucun cache
         self.addCleanup(daemon.close)
 

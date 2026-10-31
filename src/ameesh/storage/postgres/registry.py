@@ -72,7 +72,7 @@ AGENT_COLUMNS = """
     extract(epoch from operator_pause_at)::float8 as operator_pause_ts,
     extract(epoch from operator_pause_until)::float8 as operator_pause_until_ts,
     -- #3460 (0484) : retrait d'un agent (`ameesh agent retire`)
-    retired_by, retired_reason,
+    retired_by, retired_reason, review_hold,
     extract(epoch from retired_at)::float8 as retired_ts
 """
 
@@ -509,6 +509,25 @@ class Agents(interface.Agents):
         )
         return rows[0]
 
+    def review_hold(self, name, *, reason, actor, clear=False) -> dict | None:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT name, review_hold FROM agent_registry"
+                " WHERE name = ameesh_resolve_agent_name(%s, 'review_hold') FOR UPDATE",
+                (name,))
+            if not rows:
+                return None
+            row = rows[0]
+            value = None if clear else {"reason": reason, "actor": actor}
+            changed = row["review_hold"] != value
+            if changed:
+                tx.execute("UPDATE agent_registry SET review_hold = %s::jsonb WHERE name = %s",
+                           (json.dumps(value) if value is not None else None, row["name"]))
+                from .events import Events
+                Events(tx).record("agent.review_hold", "agent:" + row["name"], None,
+                                  {"agent": row["name"], "actor": actor, "reason": reason, "cleared": clear})
+            return {"name": row["name"], "review_hold": value, "changed": changed}
+
     def get(self, name) -> dict | None:
         # #3729 : le dernier message déposé et son hôte, comme `overview`
         # (#3337) — `ameesh show` lit la même preuve de vie que `list`.
@@ -551,7 +570,8 @@ class Agents(interface.Agents):
     def overview(self) -> list[dict]:
         return self.db.query(
             """
-            SELECT name, (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
+            SELECT name, (SELECT r.review_hold FROM agent_registry r WHERE r.name=o.name) AS review_hold,
+                   (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
                    -- #3185 : projets relus hors équipe (la vue ne porte pas la colonne)
                    (SELECT r.relit FROM agent_registry r WHERE r.name=o.name) AS relit,
                    -- #3460 : retrait (la vue ne porte pas la colonne)
@@ -635,7 +655,7 @@ class Agents(interface.Agents):
         # `auth_blocked` (#4491), court et nécessaire pour que le siège bloqué
         # ne soit pas laissé en place.
         return self.db.query(
-            "SELECT name, aliases,"
+            "SELECT name, aliases, review_hold,"
             "       extract(epoch from retired_at)::float8 AS retired_ts,"
             "       mode, status, status_text, host"
             "  FROM agent_registry"

@@ -321,7 +321,7 @@ def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
         return False
     # #3415: an operator pause is a human "no new turn" (#2200): the seat would
     # wait for a resume, so the designation never deposits a request there.
-    if row.get("operator_paused"):
+    if row.get("operator_paused") or row.get("review_hold"):
         return False
     status = str(row.get("status") or "").strip().lower()
     if not status or status in UNAVAILABLE_STATUS:
@@ -514,7 +514,7 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
     closed = {str(value).strip() for value in closed_hosts or () if str(value).strip()}
     out = []
     for row in rows or ():
-        if is_ephemeral(row) or is_retired(row):
+        if is_ephemeral(row) or is_retired(row) or row.get("review_hold"):
             continue
         team = str((row or {}).get("team") or "").strip()
         if wanted and team != wanted and wanted not in reviewed_projects(row):
