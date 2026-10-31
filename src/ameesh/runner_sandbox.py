@@ -81,29 +81,52 @@ def _pinned_canon(worker):
     return loaded, state, pinned
 
 
+def _known_sandbox(worker):
+    if getattr(worker, '_sandbox_declared', False):
+        return True
+    query = getattr(worker.db, 'query', None)
+    return bool(query and query('select 1 from sandbox_turns where agent = %s limit 1',
+                                (worker.name,)))
+
+
 def select(worker):
+    try:
+        return _select(worker)
+    except s1.Refusal:
+        raise
+    except Exception:
+        raise s1.Refusal('profile-refused') from None
+
+
+def _select(worker):
     """Read the Agent's owning canon at its synchronized revision.
 
     An unreadable declaration is a refusal, including parser failures that
     leave card.sandbox=None.
     """
     if not getattr(worker.cfg, 'canon', None):
+        if _known_sandbox(worker):
+            raise s1.Refusal('profile-refused')
         return None
     # Legacy agents (including spawned agents without a card) do not depend
     # on sandbox admission or on a synchronized sandbox revision.
     matches = [c for c in canon.load_configured(worker.cfg) if c.owns(worker._canon_id())]
     declared = [c for c in matches if c.agent(worker.name) is not None
                 and 'sandbox' in c.agent(worker.name).fiche.data]
+    if declared:
+        worker._sandbox_declared = True
     try:
         loaded, state, pinned = _pinned_canon(worker)
     except Exception:
         # No declared sandbox must ever make a legacy agent depend on sync.
         # When a pinned revision is available it remains authoritative: a
         # local card edit must not bypass a still-synchronized sandbox block.
-        if not declared:
+        if not declared and not _known_sandbox(worker):
             return None
         raise s1.Refusal('profile-refused') from None
     try:
+        if (not loaded.readable or loaded.untrusted) and _known_sandbox(worker):
+            raise s1.Refusal('profile-refused')
         card = loaded.agent(worker.name)
         if card is None:
             return None

@@ -10361,6 +10361,18 @@ class Runner:
         self._lifecycle_adapter = factory.adapter
         self._lifecycle_requirements = factory.requirements_for
 
+    def sandbox_credentials_for(self, agent, owner, epoch, turn_id, deadline_ts):
+        """Issue only admitted sandbox credentials; no ordinary lease bearer."""
+        from . import relay, runner_sandbox, sandbox_relay
+        from .storage.postgres.sandbox import Refusal
+        base = relay.relay_url()
+        if not base or self.mediated or owner != self.runner_id:
+            raise Refusal('profile-refused')
+        token, identity = sandbox_relay.issue(
+            self.db, agent=agent, owner=owner, epoch=epoch, turn_id=turn_id,
+            host=self.host)
+        return runner_sandbox.SandboxCredentials(base, token, identity)
+
     # -- exécuteur médié (L109) ---------------------------------------------
     def _mediated_gate(self) -> None:
         """L112 dans L109 : la porte de l'hôte est relayée au serveur

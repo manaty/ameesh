@@ -56,6 +56,26 @@ token, not a request header; billing identity comes from the stored admission.
 A durable marker precedes each provider request for an admitted sandbox turn.
 Recording its cost and closing that marker is atomic and idempotent.
 
+The runner issues an `amsb1.` bearer only after sandbox admission and only when
+the relay URL is available (`AMEESH_RELAY_URL`, or the mediated service URL).
+Only its SHA-256 digest is stored. The relay loads identity from the admission
+and checks the current lease owner, epoch, host, cancellation, terminal state
+and deadline against the database clock on every authentication. Token issuance,
+verification and the pre-provider accounting gate lock the sandbox row before
+the registry row, like completion and cancellation. Ordinary lease credentials
+cannot replace a sandbox bearer. A previously admitted sandbox agent refuses
+local fallback when its canon cannot be read; the admission trace survives a
+runner restart. These paths do not activate any sandbox card.
+
+Each sandbox provider request has a durable id before the side effect. That id
+is written as `turn_costs.relay_call_id`; a unique `(turn_id, relay_call_id)`
+index for relay rows deduplicates ledger retries. Relay rows keep `spend_key`
+NULL: their reservation is reached through `turn_id` and `sandbox_turns`.
+The unique spend key of the runner's accounting marker remains unchanged.
+Sandbox completion uses only relay costs and does not add a runner cost row;
+two distinct model calls contribute two costs, and replaying either write
+contributes no additional cost.
+
 An absent measurement, an unsettled provider request or an uncertain result
 keeps the full reserved amount. A known lower actual cost releases the unused
 part. A higher actual cost is counted in full and marks the tranche overdrawn,

@@ -726,6 +726,8 @@ def build_relay(cfg, identity: LockedIdentity, pool: ConnectionPool):
     verifier = relay_mod.ExecutorTokens(
         lambda token: identity.verify_kind(token, "session"),
         lambda principal: lease_owner(pool, principal))
+    from ..sandbox_relay import RelayTokens
+    verifier = RelayTokens(db_mod.connect(cfg), verifier)
     return relay_mod.Relay(verifier=verifier,
                            policy=relay_mod.CanonPolicy(relay_mod._canon_loader(cfg)),
                            db=db_mod.connect(cfg), cfg=cfg)
