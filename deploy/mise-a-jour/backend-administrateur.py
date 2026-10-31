@@ -16,6 +16,12 @@ journal or credential:
   plan OPERATION --decision N      dry run: the exact ordered plan, per-step
                                    authority and observed state, no effect;
   install OPERATION --decision N   executes the signed bootstrap;
+  continuation-question NEW --previous OLD --decision N
+                                   freezes the previous receipt reference and
+                                   prints the separate replacement question;
+  continue-install NEW --decision N
+                                   resumes through reciprocal signed
+                                   supersession, keeping previous receipts;
   revoke-question OPERATION --expires T
                                    prints the separate rollback question to
                                    sign (option `revoke`); writes nothing;
@@ -82,8 +88,8 @@ PLAN_FIELDS={'plan','account_ids','expires_at'}
 PLAN_OPTIONAL={'probe_turn','runtime_seal','delegation'}
 #: Signed bundle kinds a staged plan may name; release is the default.
 DELEGATIONS=('release','canaux')
-COMMANDS=('inventory','prepare','plan','install','revoke-question','revoke')
-SIGNED=('plan','install','revoke')
+COMMANDS=('inventory','prepare','plan','install','revoke-question','revoke','continuation-question','continue-install')
+SIGNED=('plan','install','revoke','continue-install')
 GENESIS='0'*64
 
 
@@ -610,6 +616,33 @@ class Backend:
         return dict(operation=operation,bundle_digest=bundle['digest'],question=question,
                     options=kind.revoke_options)
 
+    def continuation_question(self,operation,previous,decision):
+        continuation=module('continuation-bootstrap')
+        prepared=self.prepared(operation)
+        ref=continuation.reference(self,operation,previous,decision)
+        expires=json.loads(prepared.question[len(bootstrap.PREFIX):])['expires_at']
+        text=continuation.question(bootstrap,operation,prepared.bundle,ref,expires)
+        path=self.stage(operation)/'continuation.json'
+        if path.exists() or path.is_symlink():
+            if json.loads(self.private(path,65536))!=ref:
+                raise BackendError('frozen continuation changed')
+        else:
+            self.write(path,json.dumps(ref,sort_keys=True,separators=(',',':')))
+        return dict(question=text,options=bootstrap.OPTIONS,previous=ref)
+
+    def continue_install(self,operation,decision):
+        base=dict(command='continue-install',operation=operation,decision=decision,
+                  bundle_digest=self.prepared(operation).bundle['digest'])
+        self.gestes.append(phase='start',**base)
+        try:
+            outcome=module('continuation-bootstrap').run(bootstrap,self,operation,decision,
+                wrap=lambda adapter:JournaledAdapter(adapter,self.gestes,'continue-install'))
+        except Exception as error:
+            self.gestes.append(phase='held',category=type(error).__name__,**base)
+            raise
+        self.gestes.append(phase=outcome,**base)
+        return dict(operation=operation,outcome=outcome)
+
     def install(self,operation,decision,authority=None):
         prepared=self.prepared(operation)
         authority=authority or self.authority(decision,operation,prepared.bundle)
@@ -669,7 +702,13 @@ def parse(argv):
         # Refused before any path is built from it.
         raise BackendError('bootstrap operation required')
     decision=None
-    if command=='revoke-question':
+    if command=='continuation-question':
+        if (len(rest)!=4 or rest[0]!='--previous' or rest[2]!='--decision'
+                or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}',rest[1]) is None
+                or not rest[3].isdigit() or int(rest[3])<=0):
+            raise BackendError('continuation-question requires --previous OPERATION --decision N')
+        decision=(rest[1],int(rest[3]))
+    elif command=='revoke-question':
         if len(rest)!=2 or rest[0]!='--expires' or not rest[1].isdigit() or int(rest[1])<=0:
             raise BackendError(command+' requires --expires EPOCH')
         decision=int(rest[1])
@@ -683,6 +722,10 @@ def parse(argv):
 
 
 def dispatch(backend,command,operation,decision):
+    if command=='continuation-question':
+        return backend.continuation_question(operation,*decision)
+    if command=='continue-install':
+        return backend.continue_install(operation,decision)
     if command in ('inventory','prepare'):
         return getattr(backend,command)(operation)
     if command=='revoke-question':

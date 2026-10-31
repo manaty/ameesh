@@ -98,13 +98,15 @@ def enrollment_documents(enrollment):
 
 
 def validate(plan):
-    if not isinstance(plan, dict) or set(plan) != ACCESS | {'policy'}:
+    if (not isinstance(plan, dict)
+            or set(plan) not in (ACCESS | {'policy'}, ACCESS | {'policy','local_transport'})):
         raise DelegationError('invalid delegation plan')
     try:
         restart.validate_policy(plan['policy'])
         if plan['host'] != plan['policy']['host']:
             raise DelegationError('delegation host mismatch')
         validate_access(plan)
+        transport_entries(plan)
     except DelegationError:
         raise
     except Exception:
@@ -145,6 +147,29 @@ def validate_account_ids(account_ids):
         raise DelegationError('exact account numeric identity required')
 
 
+def transport_entries(plan):
+    """One administrator key, optionally one distinct host-local transport key.
+
+    The administrator enrolls the measured local source; never infer loopback.
+    Keep legacy plans byte-for-byte stable until a new exact bundle is signed.
+    """
+    entries=[dict(controller_source=plan['controller_source'],controller_key=plan['controller_key'])]
+    if 'local_transport' in plan:
+        local=plan['local_transport']
+        if not isinstance(local,dict) or set(local)!={'controller_source','controller_key'}:
+            raise DelegationError('exact local transport enrollment required')
+        validate_access(dict(plan,**local))
+        network=ipaddress.ip_network(local['controller_source'],strict=True)
+        if network.prefixlen!=network.max_prefixlen:
+            raise DelegationError('one measured local transport source required')
+        if local['controller_source']==plan['controller_source']:
+            raise DelegationError('distinct local transport source required')
+        if local['controller_key']==plan['controller_key']:
+            raise DelegationError('distinct local transport key required')
+        entries.append(dict(local))
+    return entries
+
+
 def access_files(plan, *, account, wrapper, dispatcher, keys_file, sshd_file):
     """Forced-command wrapper, sudoers, key and sshd Match for one SSH account.
 
@@ -163,8 +188,8 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+
             'Defaults:'+account+' env_reset,!setenv\n'
             'Defaults:'+account+' secure_path="/usr/bin:/bin"\n'
             +account+' ALL=(root) NOPASSWD: '+RUNTIME+' -I -B '+dispatcher+'\n')
-    keys = ('restrict,from="'+plan['controller_source']+'",command="'+wrapper+'" '
-            +plan['controller_key']+'\n')
+    keys = ''.join('restrict,from="'+entry['controller_source']+'",command="'+wrapper+'" '
+                   +entry['controller_key']+'\n' for entry in transport_entries(plan))
     sshd = ('# SPDX-License-Identifier: AGPL-3.0-only\n'
             'Match User '+account+'\n'
             '    AuthorizedKeysFile '+keys_file+'\n'
