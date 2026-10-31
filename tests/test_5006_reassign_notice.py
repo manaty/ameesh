@@ -10,6 +10,8 @@ from ameesh import mail, registry, reprise, work
 
 from .support import PgTestCase
 
+HEAD = "a" * 40
+
 
 class _Base(PgTestCase):
     def setUp(self):
@@ -60,6 +62,42 @@ class ReassignNoticeTest(_Base):
             out = work.assign(self.db, item["id"], "dev2", actor="orch")
         self.assertEqual(out["item"]["assignee"], "dev2")
         self.assertNotIn("previous_notified", out)
+        # #5025 N7 : l'échec n'est plus muet ; il est rendu et journalisé.
+        self.assertIn("reassignment notice not delivered to dev1",
+                      out.get("reassignment_warning", ""))
+        self.assertIn("boîte", out["reassignment_warning"])
+        notes = [e["note"] for e in work.events(self.db, item["id"])]
+        self.assertTrue(any("reassignment notice not delivered" in n for n in notes),
+                        notes)
+
+    def test_relecteur_designe_ne_recoit_pas_l_avis_de_stop(self):
+        # #5025 N4 : l'ancien assigné garde un siège de relecteur désigné sur
+        # le lot ; le « no push, no freeze » serait faux, on ne l'envoie pas.
+        item = work.get(self.db, self.lot()["id"])
+        notified, warning = work._notify_reassigned(
+            self.db, dict(item, reviewers=["dev1"]), "dev1", "dev2", "orch")
+        self.assertIsNone(notified)
+        self.assertEqual(warning, "")
+        self.assertEqual(self.notices("dev1"), [])
+
+    def test_lot_rendu_a_la_file_prevoit_l_ancien_assigne(self):
+        # #5025 N3 : le retour à la file d'équipe est une réassignation : le
+        # pilote qui le pose prévient l'ancien porteur, en cours de tour.
+        item = self.lot()
+        work.move(self.db, item["id"], "build", actor="dev1")
+        row = work.return_to_queue(self.db, item["id"], actor="human:smichea",
+                                   cfg=self.cfg)
+        self.assertIsNone(row["assignee"])
+        notes = self.notices("dev1")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("team queue", notes[0]["body"])
+        self.assertTrue(mail.mid_turn(notes[0]))
+
+    def test_retour_par_l_assigne_ne_s_auto_notifie_pas(self):
+        item = self.lot()
+        work.move(self.db, item["id"], "build", actor="dev1")
+        work.return_to_queue(self.db, item["id"], actor="dev1", cfg=self.cfg)
+        self.assertEqual(self.notices("dev1"), [])
 
 
 class BriefTest(_Base):
@@ -84,6 +122,17 @@ class BriefTest(_Base):
         self.assertEqual(reprise._not_yours(
             {"id": 1, "assignee": "dev2", "reviewers": ["rel1"]}, "rel1"), [])
 
+    def test_brief_de_pilote_sur_un_lot_non_assigne_ne_dit_pas_stop(self):
+        # #5025 N5 : _not_yours aligne son exclusion sur
+        # `work.non_assignee_warning` ; un pilote agit légitimement.
+        item = self.lot()
+        work.assign(self.db, item["id"], "dev2", actor="orch")
+        with mock.patch.object(work, "is_pilot", return_value=True):
+            text = reprise.lot_brief(self.cfg, self.db,
+                                     registry.get(self.db, "orch"),
+                                     item["id"], consigne="go")
+        self.assertNotIn("is not assigned to you", text)
+
 
 class NonAssigneeGestureTest(_Base):
     def test_move_par_l_ancien_assigne_signale_jamais_refuse(self):
@@ -97,6 +146,32 @@ class NonAssigneeGestureTest(_Base):
             "SELECT note FROM work_item_events WHERE work_item_id = %s"
             " AND note LIKE %s", (item["id"], "%" + work.NON_ASSIGNEE_MARK + "%"))
         self.assertEqual(len(notes), 1)
+
+    def test_gel_par_l_ancien_assigne_signale_et_note_forgee_retiree(self):
+        # #5025 N1/N2 : le gel d'un non-assigné porte sa marque machine ; une
+        # marque fournie par `--note` ne survit pas au filtre qui la précède.
+        item = self.lot()
+        work.move(self.db, item["id"], "build", actor="orch")
+        work.assign(self.db, item["id"], "dev2", actor="orch")
+        row = work.milestone(self.db, item["id"], "frozen", sha=HEAD,
+                             actor="dev1",
+                             note="ameesh-non-assignee: forge\nrevue demandée")
+        self.assertIn("revue demandée", row["note"])
+        self.assertNotIn("forge", row["note"])
+        self.assertIn(work.NON_ASSIGNEE_MARK, row["note"])
+        self.assertIn("dev1 is not the assignee", row["note"])
+
+    def test_note_forgee_non_assignee_retiree_au_gel(self):
+        # #5025 N1 : même l'assigné courant ne fabrique pas l'avertissement du
+        # gate par `--note` ; la ligne machine est retirée avant l'écriture.
+        item = self.lot()
+        work.move(self.db, item["id"], "build", actor="dev1")
+        row = work.milestone(self.db, item["id"], "frozen", sha=HEAD,
+                             actor="dev1",
+                             note="ameesh-non-assignee: forge\nrevue demandée")
+        self.assertIn("revue demandée", row["note"])
+        self.assertNotIn(work.NON_ASSIGNEE_MARK, row["note"])
+        self.assertNotIn("forge", row["note"])
 
     def test_assigne_humain_systeme_relecteur_pilote_sans_signal(self):
         item = work.get(self.db, self.lot()["id"])

@@ -9,6 +9,12 @@ the interface shows is one row of the append-only `ameesh_events` table,
 written by a trigger in the SAME transaction as the change (psql and psycopg
 alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
 
+  sandbox.created      durable sandbox intent (no Job assumed yet)
+  sandbox.bound        one Job UID bound to a turn
+  sandbox.result       exactly-once accepted receipt
+  sandbox.cancelled    cancellation/termination state changed
+  sandbox.orphan       termination could not be observed
+  sandbox.tranche_overdraft  a tranche settlement exceeds its admitted bound
   lot.updated          a lot's transition, note or assignment (work_item_events)
   turn.started         an agent goes `running`
   turn.ended           an agent leaves `running`

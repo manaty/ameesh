@@ -1278,17 +1278,23 @@ def _lot_thread(db, name: str, lot: str) -> list[str]:
     return section + lignes + [""]
 
 
-def _not_yours(item: dict, name: str) -> list[str]:
+def _not_yours(item: dict, name: str, *, cfg=None, db=None) -> list[str]:
     """#5006 : le brief relit l'assigné courant et le dit quand le lot n'est
     plus à l'agent (réassigné, ou rendu à la file d'équipe) — l'ancien
     assigné réveillé sur ce lot s'arrête au lieu de pousser ou de geler. Un
-    relecteur désigné (#3325) ou un lot tenu par un humain : rien."""
+    relecteur désigné (#3325), un pilote (#5025 N5, qui agit légitimement sur
+    le lot d'un autre, comme `work.non_assignee_warning`) ou un lot tenu par
+    un humain : rien."""
     from .work_reviewers import designated
     holder = (item.get("assignee") or "").strip()
     if not name or name == "?" or holder == name or holder.startswith("human:"):
         return []
     if name in designated(item):
         return []  # un relecteur désigné travaille sur le lot d'un autre
+    if cfg is not None and db is not None:
+        from .work import is_pilot
+        if is_pilot(cfg, db, name):
+            return []
     return ["", "**Lot #%s is not assigned to you** (current assignee: %s). Do not "
             "push, freeze or move it; leave a note of your state on the lot "
             "(branch, pushed head, what remains) for %s, then stop."
@@ -1333,7 +1339,7 @@ def lot_brief(cfg: Config, db, row: dict | None, lot, *, consigne: str = "",
     if item is None:
         fiche = ["## Lot #%s" % lot, "- lot unreadable or unknown to ameesh"]
     else:
-        fiche = _lot_sheet(db, item) + _not_yours(item, name)
+        fiche = _lot_sheet(db, item) + _not_yours(item, name, cfg=cfg, db=db)
     diff = _lot_diff(item or {}, row.get("cwd") or "")
     fin = ["## Instructions", (consigne or "").strip() or DEFAULT_RESUME]
     text = "\n".join(head + ident + [""] + fiche + [""] + diff + [""]

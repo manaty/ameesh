@@ -2258,20 +2258,30 @@ def non_assignee_warning(cfg, db: Db, item: dict, actor: str) -> str:
 
 
 def _notify_reassigned(db: Db, item: dict, previous: str | None, assignee: str,
-                       actor: str) -> int | None:
+                       actor: str) -> tuple[int | None, str]:
     """#5006 : prévient l'ancien assigné d'une réassignation.
 
     Le courrier est passif (`info` : il n'ouvre pas de tour à un agent au
     repos, son prochain brief relit l'assigné courant) et `reassigned`, une
     clé remise EN COURS de tour (`mail.MID_TURN_KEYS`, L514) : un tour déjà
     lancé sur le lot l'apprend au prochain appel d'outil. Rien pour un
-    humain, un externe, ni quand l'ancien assigné réassigne lui-même. Un
-    échec d'envoi ne retient pas la réassignation déjà écrite."""
+    humain, un externe, un relecteur désigné (#5025 N4 : son siège reste, le
+    « stop » serait faux), ni quand l'ancien assigné réassigne lui-même.
+
+    Rend `(id du courrier, avertissement)` : un échec d'envoi ne retient pas
+    la réassignation déjà écrite, mais il laisse une trace dans le journal du
+    lot et dans l'avertissement rendu à l'appelant (#5025 N7)."""
     from . import fil, mail
     old = (previous or "").strip()
     if not old or old == assignee or old == (actor or "").strip() \
             or old.startswith(HUMAN_PREFIX):
-        return None
+        return None, ""
+    from .work_reviewers import designated
+    # `designated` écarte l'assigné courant : on le juge sur la nouvelle
+    # attribution, sinon l'ancien assigné (encore dans `reviewers`) serait
+    # toujours écarté du test.
+    if old in designated(dict(item, assignee=assignee or None)):
+        return None, ""
     lot = int(item["id"])
     to = assignee or "the team queue (nobody)"
     body = ("Lot #%d (%s) is reassigned to %s by %s: it is no longer yours. "
@@ -2284,9 +2294,15 @@ def _notify_reassigned(db: Db, item: dict, previous: str | None, assignee: str,
         return mail.send(db, SYSTEM_SENDER, old, body, work_item_id=str(lot),
                          payload={"info": True,
                                   "reassigned": {"lot": lot, "to": assignee,
-                                                 "by": actor or ""}})
-    except Exception:  # noqa: BLE001 - l'attribution est écrite ; le journal la dit
-        return None
+                                                 "by": actor or ""}}), ""
+    except Exception as exc:  # noqa: BLE001 - l'attribution est écrite ; le dire
+        warning = ("reassignment notice not delivered to %s (%s): tell them"
+                   % (old, exc))
+        try:
+            note(db, lot, warning, actor=SYSTEM_SENDER)
+        except Exception:  # noqa: BLE001 - l'échec d'envoi ne retient rien
+            pass
+        return None, warning
 
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
@@ -2450,10 +2466,12 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     out = {"item": row, "check": check, "previous": previous}
     if (row.get("assignee") or None) != (previous or None):
         # #540 : un lot rendu à la file d'équipe quitte aussi l'ancien assigné
-        notified = _notify_reassigned(db, item, previous,
-                                      row.get("assignee") or "", actor)
+        notified, warning = _notify_reassigned(db, item, previous,
+                                               row.get("assignee") or "", actor)
         if notified is not None:
             out["previous_notified"] = notified
+        if warning:
+            out["reassignment_warning"] = warning
     if behind is not None:
         row["queued_behind"] = behind
         out["queue_warning"] = queue_warning(db, row, check["assignee"])
@@ -2605,6 +2623,12 @@ def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
                                        states=RETURN_STATES)
     if row is None:
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
+    # #5025 N3 : le lot retombe à la file d'équipe : l'ancien assigné est
+    # prévenu comme pour une réassignation à un autre agent (rien s'il se rend
+    # lui-même le lot, s'il est humain ou relecteur désigné).
+    _notified, warning = _notify_reassigned(db, item, current, "", who or UNKNOWN_ACTOR)
+    if warning:
+        row["reassignment_warning"] = warning
     return row
 
 

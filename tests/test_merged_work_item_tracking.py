@@ -474,7 +474,7 @@ class CorrectionTest(_Base):
 
 
 class ActorTest(_Base):
-    """L'acteur des commandes `work` : `--actor`, sinon l'identité liée, sinon « inconnu »."""
+    """Acteur explicite ou lié ; pour `move`, l'identité liée fait foi (#5041)."""
 
     def test_identite_liee_puis_inconnu(self):
         proc = self.mesh("work", "add", "--title", "par l'orchestrateur",
@@ -489,7 +489,9 @@ class ActorTest(_Base):
         proc = self.mesh("work", "move", str(lot["id"]), "build", "--actor", "human:proprio",
                          env=self.env(AGENT_MAIL_NAME="orch"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], "human:proprio")
+        # #5041 : nommer un humain ne transforme pas l'autorité de la session
+        # liée en geste humain. La transition garde l'identité qui l'exerce.
+        self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], "orch")
         proc = self.mesh("work", "milestone", str(lot["id"]), "frozen", "--sha", SHA,
                          env=self.env(AGENT_MAIL_NAME="dev1"))
         self.assertEqual(proc.returncode, 0, proc.stderr)

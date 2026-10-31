@@ -36,6 +36,11 @@
   ameesh ci status <lot> [--limit N] [--json]
         latest CI runs and failing tests of a {work};
   ameesh conflicts [--all] [--json]     conflict radar between {works} (L160b);
+  ameesh context corpus export --out FILE [--days N | --since T] [--harness H]
+        | check FILE
+        read-only replay corpus (`ameesh-context-corpus/1`) rebuilt from the
+        turn ledger and `turn.context` events; written outside the repository,
+        mode 0600 (#5134);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
   ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
@@ -181,6 +186,8 @@
         les passes CI et issues sont refusées explicitement (§9) ;
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
+  ameesh sandbox list [--agent NAME] [--state STATE] [--scope DIGEST] [--limit N] [--json]
+  ameesh sandbox show TURN_ID [--json]
   ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
         mediated executor API (/api/exec/v1, L108): an executor on a
         device without database access (docs/EXECUTEUR-MEDIEE.md).
@@ -269,6 +276,7 @@ MESH_COMMANDS = (
     "veille",
     # #2167 B2 : observation d'un tour ou d'une requête (`ameesh turn observe`)
     "turn",
+    "sandbox",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
@@ -417,6 +425,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L85: the event log of `GET /api/v1/events`
         from . import events
         return events.main(rest)
+    if command == "context" and rest[:1] == ["corpus"]:
+        # #5134 (CTX-05a) : corpus de rejeu, reconstruction en lecture seule.
+        from . import context_corpus
+        return context_corpus.main(rest[1:])
     if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)

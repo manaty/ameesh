@@ -2,6 +2,7 @@
 """Real PostgreSQL concurrency and rollback for the dormant S1 boundary."""
 import copy
 import hashlib
+import importlib.util
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -91,6 +92,72 @@ class SandboxTest(PgTestCase):
         self.assertEqual(self.db.query('select status from turn_resources')[0]['status'],'done')
         self.assertEqual(self.db.query('select count(*) as n from ameesh_events where type = %s',
                                        ('sandbox.result',))[0]['n'],self.events_before + 1)
+
+    def test_result_id_placeholder_is_data_on_both_drivers(self):
+        from ameesh import db as db_mod
+        for driver in ('psycopg', 'psql'):
+            with self.subTest(driver=driver):
+                if driver == 'psycopg' and importlib.util.find_spec('psycopg') is None:
+                    self.skipTest('psycopg is not installed')
+                db = db_mod.connect(self.cfg, driver=driver)
+                self.addCleanup(db.close)
+                for table in ('sandbox_results', 'sandbox_turns', 'spend_pending',
+                              'turn_resources', 'account_reservations'):
+                    self.db.execute('delete from ' + table)
+                self.admit()
+                sandbox.ameesh_sandbox_bind(db, 'turn-1', 'runner', 7, 'uid')
+                result = self.result()
+                result['result_id'] = 'result-%s-1'
+                before = self.db.query("select count(*) as n from ameesh_events where type='sandbox.result'")[0]['n']
+                receipt = sandbox.ameesh_sandbox_complete(
+                    db, 'turn-1', 'runner', 7, result, settle=self.settle)
+                replay = sandbox.ameesh_sandbox_complete(
+                    db, 'turn-1', 'runner', 7, result, settle=self.settle)
+                self.assertEqual(receipt['result_id'], result['result_id'])
+                self.assertEqual(replay, dict(receipt, replayed=True))
+                self.assertEqual(self.db.query("select state from account_reservations")[0]['state'], 'kept')
+                self.assertEqual(self.db.query("select count(*) as n from ameesh_events where type='sandbox.result'")[0]['n'], before + 1)
+                event = self.db.query("select data from ameesh_events where type='sandbox.result' order by id desc limit 1")[0]
+                self.assertEqual(event['data']['result_id'], result['result_id'])
+
+    def test_event_sql_failure_preserves_bind_complete_and_replay(self):
+        self.db.execute("alter table ameesh_events add constraint test_sandbox_event_failure"
+                        " check (type !~ '^sandbox[.]') not valid")
+        self.addCleanup(self.db.execute,
+                        "alter table ameesh_events drop constraint test_sandbox_event_failure")
+        from ameesh import db as db_mod
+        for driver in ('psycopg', 'psql'):
+            with self.subTest(driver=driver):
+                if driver == 'psycopg' and importlib.util.find_spec('psycopg') is None:
+                    self.skipTest('psycopg is not installed')
+                db = db_mod.connect(self.cfg, driver=driver)
+                self.addCleanup(db.close)
+                self.db.execute("delete from sandbox_results")
+                self.db.execute("delete from sandbox_turns")
+                self.db.execute("delete from spend_pending")
+                self.db.execute("delete from turn_resources")
+                self.db.execute("delete from account_reservations")
+                self.admit()
+                with self.assertLogs(sandbox.__name__, level='WARNING'):
+                    sandbox.ameesh_sandbox_bind(db, 'turn-1', 'runner', 7, 'uid')
+                    receipt = sandbox.ameesh_sandbox_complete(
+                        db, 'turn-1', 'runner', 7, self.result(), settle=self.settle)
+                replay = sandbox.ameesh_sandbox_complete(
+                    db, 'turn-1', 'runner', 7, self.result(), settle=self.settle)
+                self.assertEqual(replay, dict(receipt, replayed=True))
+                self.assertEqual(self.db.query("select state from sandbox_turns")[0]['state'], 'succeeded')
+                self.assertEqual(self.db.query("select state from account_reservations")[0]['state'], 'kept')
+
+    def test_event_sql_failure_preserves_cancel(self):
+        self.db.execute("alter table ameesh_events add constraint test_sandbox_event_failure"
+                        " check (type !~ '^sandbox[.]') not valid")
+        self.addCleanup(self.db.execute,
+                        "alter table ameesh_events drop constraint test_sandbox_event_failure")
+        with self.assertLogs(sandbox.__name__, level='WARNING'):
+            got = sandbox.ameesh_sandbox_cancel(self.db, 'turn-1', 'runner', 7,
+                                               observed=True, settle=self.settle)
+        self.assertEqual(got['state'], 'cancelled')
+        self.assertEqual(self.db.query("select state from sandbox_turns")[0]['state'], 'cancelled')
 
     def test_bind_idempotent_and_conflict(self):
         self.assertEqual(self.bind(),self.bind())
