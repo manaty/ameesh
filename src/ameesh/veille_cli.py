@@ -61,6 +61,9 @@ def _line(entry: dict, action: dict | None) -> str:
 
 
 def cmd_veille(cfg, args) -> int:
+    from .platform.child_environment import managed_entry
+    if not managed_entry():
+        return 1
     from . import veille
     from .mesh_cli import _open
 

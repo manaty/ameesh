@@ -2222,11 +2222,14 @@ class ProcessSync:
     changed: list[str] = field(default_factory=list)
     #: événements déposés (une fiche × ses destinataires)
     sent: int = 0
+    #: destinataires retirés au dépôt, ignorés sans annuler la synchronisation
+    skipped_retired: list[str] = field(default_factory=list)
     #: diff git illisible : aucune poussée, les règles restent lues par le brief
     error: str = ""
 
     def to_dict(self) -> dict:
-        out = {"changed": self.changed, "sent": self.sent}
+        out = {"changed": self.changed, "sent": self.sent,
+               "skipped_retired": self.skipped_retired}
         if self.error:
             out["error"] = self.error
         return out
@@ -2303,11 +2306,20 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
             texte = ("Règles de travail du canon : %s\n\n%s"
                      % (process.title, (process.body or "").strip())).strip()
             for name in sorted(set(agents)):
-                mail_mod.send(tx, work_mod.SYSTEM_SENDER, name, texte, host=host,
-                              kind="event",
-                              payload={"event": "canon-process",
-                                       "path": process.fiche.path},
-                              thread=False)
+                if name in done.skipped_retired:
+                    continue
+                try:
+                    mail_mod.send(tx, work_mod.SYSTEM_SENDER, name, texte, host=host,
+                                  kind="event",
+                                  payload={"event": "canon-process",
+                                           "path": process.fiche.path},
+                                  thread=False)
+                except storage.RecipientRetired:
+                    # #5080 : le retrait peut précéder celui de la fiche canon.
+                    # Le dépôt refuse sans erreur SQL ; la transaction reste
+                    # utilisable. Les autres erreurs doivent toujours remonter.
+                    done.skipped_retired.append(name)
+                    continue
                 done.sent += 1
             done.changed.append(process.title)
     return done

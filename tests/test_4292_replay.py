@@ -272,6 +272,23 @@ def _harness_script(tmp: str, *, sleep: float = 0) -> str:
 
 
 class RunHarnessTest(unittest.TestCase):
+    def test_replay_harness_and_review_keep_only_the_selected_credentials(self):
+        from ameesh.platform import child_environment as E
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "credentials.py")
+            with open(script, "w") as out:
+                out.write("import os; assert os.environ['DEEPSEEK_API_KEY']=='selected'; assert os.environ['AMEESH_DSN']=='transport'; assert 'OPENAI_API_KEY' not in os.environ\n")
+            env = dict(os.environ, DEEPSEEK_API_KEY="selected", AMEESH_DSN="transport",
+                       OPENAI_API_KEY="unrelated")
+            # Install only within this context, including existing subclasses.
+            with mock.patch.object(subprocess.Popen, "__init__", subprocess.Popen.__init__):
+                E.install()
+                for runner in (replay.run_harness, replay.run_review):
+                    result = runner(_FakeAdapter(script), "p", run_dir=os.path.join(tmp, runner.__name__),
+                                    cwd=tmp, env=env, harness="deepseek", model="test-model",
+                                    effort="", timeout=10, prices=cost.load_prices(None))
+                    self.assertEqual(result["exit"], 0)
+
     def test_usage_duration_and_cost(self):
         with tempfile.TemporaryDirectory() as tmp:
             tree = os.path.join(tmp, "tree")

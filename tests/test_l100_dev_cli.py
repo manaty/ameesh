@@ -4,7 +4,7 @@
 `ameesh module dev sync-merges | sync-github | project-github | merge-pr |
 review-class` is served by the `dev` module's `main`, found through the module
 registry (capability `cli`). The old commands (`ameesh work sync-merges…`,
-`ameesh review-class`) stay aliases (L104 removes them): each new command gives
+`ameesh review-class`) stay aliases (L104 keeps them): each new command gives
 the same output, in `--json` too, and the same exit code as its alias.
 """
 from __future__ import annotations

@@ -4,7 +4,7 @@
 The old paths (`ameesh.merge_pr`, `ameesh.connectors.git_merge`,
 `ameesh.plan_git`) are declared aliases: both names resolve to the same module
 object, so importers and tests that patch a module global by the old name keep
-working unchanged (L104 removes the aliases). `connectors.get("git-merge")`
+working unchanged (retained, tests/test_generic_core.py lists them). `connectors.get("git-merge")`
 reads the implementation through the module registry, not through the old
 path.
 """

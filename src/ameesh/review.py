@@ -2,7 +2,8 @@
 """Deprecated alias of :mod:`ameesh.modules.dev.review` (L100 T4, #4385).
 
 Both paths resolve to the same module object, preserving imports and patches
-of module globals until the aliases are removed in L104.
+of module globals. Retained compatibility alias, declared and dated in
+tests/test_generic_core.py (L104 T6).
 """
 from __future__ import annotations
 
