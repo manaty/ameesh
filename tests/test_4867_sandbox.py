@@ -2,6 +2,7 @@
 """Real PostgreSQL concurrency and rollback for the dormant S1 boundary."""
 import copy
 import hashlib
+import importlib.util
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -96,6 +97,8 @@ class SandboxTest(PgTestCase):
         from ameesh import db as db_mod
         for driver in ('psycopg', 'psql'):
             with self.subTest(driver=driver):
+                if driver == 'psycopg' and importlib.util.find_spec('psycopg') is None:
+                    self.skipTest('psycopg is not installed')
                 db = db_mod.connect(self.cfg, driver=driver)
                 self.addCleanup(db.close)
                 for table in ('sandbox_results', 'sandbox_turns', 'spend_pending',
@@ -125,6 +128,8 @@ class SandboxTest(PgTestCase):
         from ameesh import db as db_mod
         for driver in ('psycopg', 'psql'):
             with self.subTest(driver=driver):
+                if driver == 'psycopg' and importlib.util.find_spec('psycopg') is None:
+                    self.skipTest('psycopg is not installed')
                 db = db_mod.connect(self.cfg, driver=driver)
                 self.addCleanup(db.close)
                 self.db.execute("delete from sandbox_results")
