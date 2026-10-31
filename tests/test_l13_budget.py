@@ -282,8 +282,8 @@ class BudgetGateTest(PgTestCase):
             "select model, usd from turn_costs where agent = 'budget' "
             "order by id desc limit 1")[0]
         self.assertEqual(ligne["model"], "inconnu")
-        # plus cher connu DeepSeek = pro : 0,55 $/M d'entrée (défaut 0,27)
-        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        # majorant DeepSeek : V4-Pro à 1,32 $/M en entrée
+        self.assertAlmostEqual(float(ligne["usd"]), 1.32, places=6)
 
     def test_modele_annonce_par_le_flux_gagne(self):
         """B4 : le modèle annoncé par le flux du harnais est la source du tour

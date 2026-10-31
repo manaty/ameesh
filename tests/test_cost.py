@@ -702,9 +702,9 @@ class TurnAccountingTest(Sandbox, PgTestCase):
                     for triplet in connus:
                         self.assertGreaterEqual(cout(majorant), cout(triplet))
 
-    def test_defauts_inchanges_quand_le_plus_cher_l_est_partout(self):
+    def test_majorant_deepseek_couvre_aussi_le_v4_pro(self):
         self.assertEqual(cost.max_price_of(cost.DEFAULT_PRICES, "deepseek"),
-                         cost.DEFAULT_PRICES["deepseek-pro"])
+                         [1.32, 0.14, 3.96])
 
     def test_prix_invalides_ne_rentrent_pas_dans_le_bareme(self):
         chemin = os.path.join(self.tmp_cost, "prices.json")
@@ -717,7 +717,7 @@ class TurnAccountingTest(Sandbox, PgTestCase):
             self.assertNotIn(cle, prix)
         self.assertEqual(prix["deepseek-ok"], [2.0, 1.0, 3.0])
         # seuls les tarifs valides comptent : le majorant est celui des défauts et de `deepseek-ok`
-        self.assertEqual(cost.max_price_of(prix, "deepseek"), [2.0, 1.0, 3.0])
+        self.assertEqual(cost.max_price_of(prix, "deepseek"), [2.0, 1.0, 3.96])
 
     def test_famille_sans_tarif_connu_n_a_pas_de_majorant(self):
         """L225 : le pire de tout le barème n'est pas un majorant sûr d'une famille
@@ -917,13 +917,13 @@ class CostDbTest(Sandbox, PgTestCase):
         # modèle inconnu (aucun état) : tarif le plus cher connu de la famille
         # DeepSeek (0019 §3, repli fail-closed appliqué par L13)
         self.assertEqual(usage.model, "inconnu")
-        self.assertAlmostEqual(usage.usd, 0.55)
-        self.assertAlmostEqual(book.spent("a1", 3600), 0.55)
-        self.assertAlmostEqual(book.spent("all", 3600), 0.55)
+        self.assertAlmostEqual(usage.usd, 1.32)
+        self.assertAlmostEqual(book.spent("a1", 3600), 1.32)
+        self.assertAlmostEqual(book.spent("all", 3600), 1.32)
         # hors fenêtre : la dépense d'il y a plus d'une heure ne compte plus
         self.db.execute("update turn_costs set recorded_at = now() - interval '2 hours'")
         self.assertEqual(book.spent("all", 3600), 0.0)
-        self.assertAlmostEqual(book.spent("all", 86400), 0.55)
+        self.assertAlmostEqual(book.spent("all", 86400), 1.32)
 
     def test_record_porte_le_lot_et_le_debut_du_tour(self):
         """#796 : la ligne du grand livre dit le lot servi, l'instant de début
