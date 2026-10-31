@@ -29,6 +29,9 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   dormeurs. #4525 : une relecture désignée ouverte, ou le dernier relecteur
   disponible d'une famille pendant qu'un gel attend un avis, n'est jamais
   endormi ; le motif d'exemption est journalisé sur le lot de découpage.
+  #5129 : un gel arrivé APRÈS la mise en sommeil d'une famille lève le
+  mieux classé de cette famille (désignation d'un relecteur) et le
+  journalise ici, au lieu de déclarer la famille manquante.
   #4610 : un agent à qui un lot actionnable est attribué, ou qui a reçu un
   courrier non lu de son pilote ou d'un orchestrateur, n'est pas endormi (le
   courrier compte s'il a moins de `file.wake_mail_s`, à défaut `file.repos_s`,
@@ -87,6 +90,8 @@ SLEEP_REASON_RE = re.compile(r"^roadmap\s*:\s*épuisée\s+(\S+)\s+\(#3256\s+§2\
 REOPEN_MARK = "sleep lifted: roadmap reopened"
 #: préfixe de la note d'exemption écrite sur le lot de découpage
 SLEEP_EXEMPT_PREFIX = "sleep exempted:"
+#: #5129 : préfixe de la levée motivée par un gel qui manque une famille
+WAKE_REVIEW_PREFIX = "sleep lifted for review:"
 #: #4610 : préfixe de la raison de levée automatique, au journal des pauses
 SLEEP_LIFT_PREFIX = "automatic sleep lifted:"
 #: #4610 : courriers relus par agent pour retrouver le dernier envoi du pilote
@@ -874,6 +879,90 @@ def _wake(db, project: str, listing: list, *, reason: str | None = None) -> list
         if done.get("changed"):
             out.append(row["name"])
     return out
+
+
+def wake_reviewer(db, name: str, project: str, *, family: str = "",
+                  for_lot: int | None = None, freeze=None,
+                  now: float | None = None) -> dict:
+    """#5129 : lève le sommeil d'un relecteur qu'un gel en attente appelle.
+
+    Un gel peut arriver APRÈS la mise en sommeil d'une famille entière : sans
+    cette levée, la désignation déclare la famille manquante alors que ses
+    relecteurs sont seulement endormis (constat #4971). Seule la pause exacte
+    du sommeil automatique de CE projet est levée (`expect_reason`, acteur
+    `ameesh:file-decoupage`) : une pause humaine, budgétaire ou d'un autre
+    projet n'est jamais touchée. La levée est journalisée une fois sur le lot
+    de découpage ouvert, avec le gel qui l'a motivée.
+
+    Rend `{agent, lifted, why}`. Une lecture ou une levée impossible ne lève
+    rien et ne lève pas d'exception : la désignation continue d'attendre.
+    """
+    from . import agent_pause
+    from . import registry
+
+    out = {"agent": str(name or ""), "lifted": False, "why": ""}
+    try:
+        row = registry.get(db, str(name or ""))
+    except Exception as exc:  # noqa: BLE001 - le doute ne lève pas une pause
+        out["why"] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+        return out
+    if not row:
+        out["why"] = "unknown agent"
+        return out
+    if not row.get("operator_paused"):
+        out["why"] = "not asleep"
+        return out
+    reason = str(row.get("operator_pause_reason") or "")
+    if (str(row.get("operator_pause_by") or "") != SLEEP_ACTOR
+            or project_of_sleep_reason(reason) != project):
+        out["why"] = "not the automatic sleep of %s" % project
+        return out
+    owner = (row.get("operator_pause_for") or row.get("operator_pause_by")
+             or _owner_of([row]))
+    if not owner:
+        out["why"] = "no human principal"
+        return out
+    freeze_id = int((freeze or {}).get("id") or 0)
+    why = ("missing reviewer family %s for freeze #%s of lot #%s (#5129)"
+           % (family or "?", freeze_id or "?", for_lot or "?"))
+    try:
+        done = agent_pause.change(
+            db, str(name), paused=False,
+            reason="%s %s" % (SLEEP_LIFT_PREFIX, why),
+            actor=SLEEP_ACTOR, principal=owner, expect_reason=reason,
+            now=now)
+    except Exception as exc:  # noqa: BLE001 - la pause reste, le gel attend
+        out["why"] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+        return out
+    if not done.get("changed"):
+        out["why"] = "pause not changed (already lifted or foreign)"
+        return out
+    out["lifted"] = True
+    out["why"] = why
+    _journal_review_wake(db, project, str(name), family, freeze_id, for_lot)
+    return out
+
+
+def _journal_review_wake(db, project: str, name: str, family: str,
+                         freeze_id: int, lot: int | None = None) -> None:
+    """#5129 : journalise une fois la levée sur le lot de découpage.
+
+    Une note par (gel, relecteur), pas une par passage : la levée est un
+    geste, pas un journal de boucle. Une trace en échec ne défait pas la
+    levée."""
+    split = _open_split(db, project)
+    if split is None:
+        return
+    prefix = "%s #%s %s:" % (WAKE_REVIEW_PREFIX, freeze_id, name)
+    try:
+        if work.events_noted(db, int(split["id"]), prefix):
+            return
+        work.note(db, int(split["id"]),
+                  "%s %s (family %s), freeze #%s of lot #%s (#5129)"
+                  % (prefix, name, family or "?", freeze_id or "?", lot or "?"),
+                  actor=SLEEP_ACTOR)
+    except Exception:  # noqa: BLE001 - une trace ne défait pas la levée
+        pass
 
 
 def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,

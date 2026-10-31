@@ -18,6 +18,13 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "modules" / "hello"
 
 
+class _EntryPoints(list):
+    """Python 3.9 has no importlib.metadata.EntryPoints; ameesh supports 3.9."""
+
+    def select(self, group=None):
+        return [point for point in self if group is None or point.group == group]
+
+
 class HelloModuleTest(unittest.TestCase):
     def test_package_discovery_and_command(self):
         # Read the actual packaging metadata, not a duplicate entry-point stub.
@@ -41,7 +48,7 @@ class HelloModuleTest(unittest.TestCase):
                       for point in dist.entry_points]
             with mock.patch.object(sys, "path", [str(EXAMPLE)] + sys.path), \
                     mock.patch("ameesh.modules.metadata.entry_points",
-                               return_value=metadata.EntryPoints(points)):
+                               return_value=_EntryPoints(points)):
                 implementations, rows, refused = registry._discover(builtin=False)
                 self.assertEqual(refused, ())
                 self.assertEqual(len(rows), 1)
