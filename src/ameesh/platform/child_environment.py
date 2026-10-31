@@ -184,17 +184,33 @@ def install() -> None:
     subprocess.Popen.__init__ = protected
 
 
+def attest_venv() -> None:
+    """#5100: a non-dumpable process attests its executable for `controler`.
+
+    Without the attestation `poste.sh controler` stays red; the service itself
+    keeps running.
+    """
+    import sys
+    from .process import publish_venv_attestation
+    try:
+        publish_venv_attestation()
+    except OSError as exc:
+        print("ameesh: venv attestation not published: %s" % exc, file=sys.stderr)
+
+
 def harden() -> bool:
     """Protect a long-running service entry before configuration and worker threads."""
     import sys
     from .process import become_undumpable
     try:
-        become_undumpable()
+        hidden = become_undumpable()
     except OSError as exc:
         print("ameesh: refusing to run: process environment protection failed (%s)" % exc,
               file=sys.stderr)
         return False
     install()
+    if hidden:
+        attest_venv()
     return True
 
 

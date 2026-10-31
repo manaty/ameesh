@@ -115,10 +115,11 @@ class EngineTest(unittest.TestCase):
         second = _note(T0 + 60, ids=(7,), ident=2)
         self.assertEqual(slo.footprint_wait_note([{"id": 5}, {"id": 1}]),
                          "en attente d'empreinte : #1, #5")
-        # B1 de cx2 : l'union des bloqueurs de l'épisode, pas la dernière
-        # note seule — un ensemble qui revient serait dédoublonné au journal.
+        # B1 de cx2 : l'union des bloqueurs de l'épisode pour dater la levée ;
+        # #5115 : la dernière note à part, pour dire si l'ensemble a changé.
         episode = slo.footprint_episode([second, first])
         self.assertEqual((episode["open"], episode["ids"]), (True, [1, 5, 7]))
+        self.assertEqual(episode["last_ids"], [7])
         self.assertEqual(slo.footprint_episode([{"note": "autre"}])["ids"], [])
 
     def test_un_ensemble_de_bloqueurs_qui_revient_garde_la_vraie_levee(self):
@@ -130,6 +131,13 @@ class EngineTest(unittest.TestCase):
                                   satisfied={1: T0 + 900, 5: T0 + 300})
         self.assertEqual(wait["released_ts"], T0 + 900)
         self.assertFalse(wait["undated"])
+
+    def test_la_derniere_note_d_un_episode_rouvert_ne_reprend_pas_l_ancien(self):
+        # #5115 : après une clôture, un nouvel épisode repart de sa propre note.
+        episode = slo.footprint_episode([
+            _note(T0, ids=(1, 5), ident=1), _release(T0 + 60, ids=(1, 5), ident=2),
+            _note(T0 + 120, ids=(7,), ident=3)])
+        self.assertEqual((episode["ids"], episode["last_ids"]), ([7], [7]))
 
     def test_une_levee_sans_date_reste_suspendue_deux_passes(self):
         # B2 de cx2 : sans date de levée, l'horloge ne repart pas de chaque
@@ -237,6 +245,81 @@ class TemoinAqaBintakeTest(_Base):
             self.assertAlmostEqual(alert["since"], merged, delta=5)
             # 1 h 30 depuis la fusion : 30 min au-delà de la cible d'une heure
             self.assertAlmostEqual(alert["value"], 0.5 * H, delta=5)
+
+    def _attente(self, *blockers):
+        """B en intake, retenu par `blockers` (occupants de `f.py`)."""
+        b = work.add(self.db, title="B attend f.py", app="ameesh")
+        self.footprint(b, "f.py")
+        for blocker in blockers:
+            self.footprint(blocker, "f.py")
+            self._etat(blocker, "qa")
+        return b
+
+    def _etat(self, item, state):
+        self.db.execute("UPDATE work_items SET state = %s WHERE id = %s",
+                        (state, item["id"]))
+
+    def _notes_d_attente(self, item):
+        return [note for note in self.journal(item)
+                if note.startswith(slo.FOOTPRINT_WAIT_NOTE)]
+
+    def test_un_bloqueur_sorti_ne_reecrit_pas_la_note_a_chaque_passe(self):
+        # #5115 : {A, B} -> {B} puis deux passes sur {B} : une seule note de
+        # changement ; sans ce témoin, une note neuve à chaque passe (808 sur
+        # #4971), l'horodatage du texte déjouant `once=True`.
+        a = work.add(self.db, title="A occupe f.py", app="ameesh", assignee="dev1")
+        c = work.add(self.db, title="C occupe f.py", app="ameesh", assignee="dev1")
+        b = self._attente(a, c)
+        self.slo()
+        self.now += 30
+        self.slo()
+        self.assertEqual(len(self._notes_d_attente(b)), 1)
+
+        self._etat(a, "merged")
+        for _ in range(3):
+            self.now += 30
+            self.slo()
+        notes = self._notes_d_attente(b)
+        self.assertEqual(len(notes), 2)
+        self.assertIn("#%d" % c["id"], notes[1])
+        self.assertNotIn("#%d" % a["id"], notes[1])
+
+    def test_un_ensemble_qui_revient_ecrit_une_note_par_changement(self):
+        # #5115 : {A, B} -> {B} -> {A, B} : chaque changement une note, aucune
+        # passe sans changement n'en ajoute.
+        a = work.add(self.db, title="A occupe f.py", app="ameesh", assignee="dev1")
+        c = work.add(self.db, title="C occupe f.py", app="ameesh", assignee="dev1")
+        b = self._attente(a, c)
+        self.slo()
+        self._etat(a, "merged")
+        self.now += 30
+        self.slo()
+        self._etat(a, "qa")
+        for _ in range(2):
+            self.now += 30
+            self.slo()
+        self.assertEqual(len(self._notes_d_attente(b)), 3)
+
+    def test_la_levee_reste_datee_sur_l_union_de_l_episode(self):
+        # #5115 : la dernière note ne sert qu'à détecter le changement. A est
+        # sorti de l'ensemble, la clôture nomme quand même A et C.
+        a = work.add(self.db, title="A occupe f.py", app="ameesh", assignee="dev1")
+        c = work.add(self.db, title="C occupe f.py", app="ameesh", assignee="dev1")
+        b = self._attente(a, c)
+        self.slo()
+        self._etat(a, "merged")
+        self.now += 30
+        self.slo()
+        self._etat(c, "merged")
+        self.now += 30
+        self.slo()
+        self.now += 30
+        self.slo()
+        releases = [note for note in self.journal(b)
+                    if note.startswith(slo.FOOTPRINT_RELEASE_NOTE)]
+        self.assertEqual(len(releases), 1)
+        self.assertTrue(releases[0].startswith(
+            "empreinte libérée : #%d, #%d (" % (a["id"], c["id"])))
 
     def test_une_lecture_n_ecrit_aucune_note_d_episode(self):
         # #4579 : `ameesh alerts` (lecture, tout agent) n'écrit pas au journal

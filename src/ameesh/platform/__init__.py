@@ -94,7 +94,7 @@ def machine() -> str:
 
 
 from .process import (PROC, HoldersUnreadable, alive, ancestry,  # noqa: E402
-                      become_subreaper, become_undumpable, boot_time, children,
+                      become_subreaper, become_undumpable, boot_time, children, publish_venv_attestation,
                       command_argv, command_line, environ, env_values, fd_path, holders,
                       open_fd_count, parent_pid, process_table, process_group_exists,
                       reap, exited_child, exited_child_status, self_cgroup_paths, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
@@ -128,6 +128,7 @@ __all__ = [
     "NotAvailable", "HoldersUnreadable", "SYSTEM", "is_linux", "is_macos", "is_windows", "has_psutil",
     "GUARANTEES",
     "alive", "ancestry", "become_subreaper", "become_undumpable", "boot_time", "command_line", "environ",
+    "publish_venv_attestation",
     "env_values", "fd_path",
     "children", "holders", "open_fd_count", "process_table", "process_group_exists", "reap", "exited_child", "exited_child_status", "start_time", "same_start",
     "command_argv", "parent_pid", "self_cgroup_paths",

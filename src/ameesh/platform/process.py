@@ -7,6 +7,8 @@ de tops d'horloge propres à Linux (ancienne colonne `pid_start`, 0036).
 """
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import sys
 
@@ -426,6 +428,59 @@ def become_undumpable() -> bool:
         code = ctypes.get_errno()
         raise OSError(code, "prctl(PR_SET_DUMPABLE, 0): %s" % os.strerror(code))
     return True
+
+
+def venv_attestation_dir(environ=None) -> str:
+    """#5100: where the executors of this host attest their executable.
+
+    Same rule as `deploy/mise-a-jour/venv-processus.py`, its reader, which
+    imports nothing from ameesh."""
+    env = os.environ if environ is None else environ
+    base = str(env.get("XDG_STATE_HOME") or "").strip()
+    if not os.path.isabs(base):
+        base = os.path.expanduser("~/.local/state")
+    return os.path.join(base, "ameesh-host", "venv-vivant")
+
+
+def publish_venv_attestation() -> str | None:
+    """#5100: attest this process's executable for its non-root controller.
+
+    A non-dumpable process hides `/proc/<pid>/exe` from its peers, while the
+    update's `controler` must compare it with the interpreter of the current
+    venv. The process publishes what only it can still read: its pid, its start
+    in clock ticks (a recycled pid has another one) and the device and inode of
+    its executable. No secret, mode 0600.
+
+    Accepted limit: a process of the same user can forge this file. `controler`
+    proves the health of a host, this is not a security boundary.
+
+    Called after `become_undumpable`, and again after an in-place `exec`, which
+    runs the startup path anew. Returns the path; None on an OS without `/proc`;
+    raises `OSError` when it cannot publish: the caller decides.
+    """
+    if not _proc_ok():
+        return None
+    pid = os.getpid()
+    exe = os.stat(os.path.join(PROC, "self", "exe"))
+    try:
+        ticks = _stat_fields(pid)[22 - 3]
+    except IndexError as exc:
+        raise OSError("%s/%d/stat: %s" % (PROC, pid, exc)) from None
+    folder = venv_attestation_dir()
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    for name in os.listdir(folder):
+        other = name[:-len(".json")] if name.endswith(".json") else ""
+        if other.isdecimal() and not os.path.exists(os.path.join(PROC, other)):
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(folder, name))
+    path = os.path.join(folder, "%d.json" % pid)
+    temporary = "%s.%d.tmp" % (path, pid)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump({"pid": pid, "start_ticks": ticks,
+                   "exe_dev": exe.st_dev, "exe_ino": exe.st_ino}, stream)
+    os.replace(temporary, path)
+    return path
 
 
 def open_fd_count() -> int:
