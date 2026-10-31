@@ -463,6 +463,23 @@ class CarryTest(PgTestCase):
     def carry(self, **extra):
         return verdict_carry.carry(self.cfg, self.db, self.lot, repo=self.repo.root, **extra)
 
+    def test_hold_excludes_one_reviewer_without_losing_the_other_verdict(self):
+        self.verdict("rev1", self.repo.reviewed)
+        self.verdict("rev2", self.repo.reviewed)
+        self.db.execute("UPDATE agent_registry SET review_hold = %s::jsonb"
+                        " WHERE name = 'rev1'", ('{"reason": "rename", "actor": "human:alice"}',))
+        self.addCleanup(self.db.execute,
+                        "UPDATE agent_registry SET review_hold = NULL WHERE name = 'rev1'")
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        outcome = self.carry(dry_run=True)
+        self.assertEqual(outcome["result"], "would-carry", outcome)
+        outcome = self.carry()
+        self.assertEqual(outcome["result"], "carried", outcome)
+        self.assertEqual([m["actor"] for m in self.on(frozen)], ["rev2"])
+        self.assertEqual(sorted(m["actor"] for m in self.on(self.repo.reviewed)),
+                         ["rev1", "rev2"])
+
     def test_withdrawal_survives_realigned_freeze_and_late_carry(self):
         seats = storage.of(self.db).work
         seats.designate_reviewer(self.lot, "rev1", actor="human:alice")

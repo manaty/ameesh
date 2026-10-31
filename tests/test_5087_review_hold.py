@@ -86,6 +86,16 @@ class ReviewHoldTest(PgTestCase):
     def test_unsolicited_opinion_remains_possible(self):
         self.verdict()
 
+    def test_carry_hold_filter_resolves_aliases_and_is_reversible(self):
+        self.db.execute("UPDATE agent_registry SET aliases = ARRAY['old-reader']"
+                        " WHERE name = 'reader'")
+        names = ["reader", "old-reader", "another-reviewer"]
+        self.hold()
+        self.assertEqual(agent_review_hold.carried_reviewers(self.db, self.lot, names),
+                         ["another-reviewer"])
+        self.hold(clear=True)
+        self.assertEqual(agent_review_hold.carried_reviewers(self.db, self.lot, names), names)
+
     def test_carried_mark_cannot_reinstate_a_withdrawn_reviewer(self):
         self.seat()
         self.seat(remove=True)

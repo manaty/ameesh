@@ -6,14 +6,17 @@ from . import storage, work
 
 
 def carried_reviewers(db, lot: int, names) -> list[str]:
-    """A mechanical carry cannot undo a withdrawal, including via an alias."""
+    """Carry admits neither held nor withdrawn actors, including their aliases."""
     import json
 
     return [row["name"] for row in db.query(
         "SELECT n.name FROM jsonb_array_elements_text(%s::jsonb) n(name)"
         " WHERE NOT EXISTS (SELECT 1 FROM work_review_withdrawals w"
         " WHERE w.work_item_id = %s AND w.withdrawn"
-        " AND w.reviewer = coalesce(ameesh_agent_primary_locked(n.name), n.name))",
+        " AND w.reviewer = coalesce(ameesh_agent_primary_locked(n.name), n.name))"
+        " AND NOT EXISTS (SELECT 1 FROM agent_registry a"
+        " WHERE a.review_hold IS NOT NULL"
+        " AND (a.name = n.name OR n.name = ANY(a.aliases)))",
         (json.dumps(list(names)), int(lot)))]
 
 
