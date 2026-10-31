@@ -131,16 +131,19 @@ class SandboxSupervisor:
 
     def _cancel(self, row, spec, recovery):
         job = self._observe(row, spec)
-        if job is not None and not job.terminal:
-            try:
-                self.provider.delete(job.namespace, job.name, uid=job.uid)
-            except JobNotFound:
-                pass
-            job = self._observe(row, spec)
+        observed_terminal = job is not None and job.terminal
+        # An absent Job may still hide the Secret written before POST Job.
+        # Observe/verify first: never delete a conflicting foreign Job.
+        try:
+            self.provider.delete(spec.identity.namespace, spec.identity.name,
+                                 uid=job.uid if job is not None else None)
+        except JobNotFound:
+            pass
+        job = self._observe(row, spec)
         if job is None or job.terminal:
             # A cancellation already fenced in S1 revokes even a successful
             # result. Never read logs on this path.
-            state = ('lost' if job is None else 'expired') if recovery else 'cancelled'
+            state = ('expired' if observed_terminal or job is not None else 'lost') if recovery else 'cancelled'
             return self._event(row, state, state, job)
         since = row.get('cancel_requested_at')
         timed_out = (since is not None
@@ -162,8 +165,8 @@ class SandboxSupervisor:
                 or row['lease_epoch'] != identity.epoch
                 or row['namespace'] != identity.namespace
                 or row['job_name'] != identity.name
-                or row['profile_ref'] != identity.profile
-                or row['placement_ref'] != identity.placement
+                or row.get('limits', {}).get('profile_label', row['profile_ref']) != identity.profile
+                or row.get('limits', {}).get('placement_label', row['placement_ref']) != identity.placement
                 or row['image_digest'] not in (spec.image, spec.image.rsplit('@', 1)[-1])):
             raise Refusal('job-conflict')
         if row['state'] in TERMINAL:

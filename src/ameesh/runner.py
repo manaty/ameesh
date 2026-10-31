@@ -1443,7 +1443,13 @@ class AgentWorker(threading.Thread):
         with self.lock:
             proc = self.proc
             resident = self.resident if proc is None and hard else None
+            sandbox_cancel = getattr(self, '_sandbox_cancel_requested', None)
         self._stop_reason = reason
+        if sandbox_cancel is not None and not hard:
+            # The sandbox supervisor owns a remote Job. Let the turn thread
+            # fence, delete and observe it before terminating the local child.
+            sandbox_cancel.set()
+            return True
         if resident is not None:
             # L76 : un processus résident entre deux tours meurt avec le bail,
             # même inactif — le signal d'abord, sans E/S
@@ -7962,6 +7968,10 @@ class AgentWorker(threading.Thread):
         if spec.get("lot_switch_failed"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
+        from . import runner_sandbox
+        sandbox_result = runner_sandbox.dispatch(self, spec)
+        if sandbox_result is not None:
+            return sandbox_result
         self._workdir_lot = spec.get("lot") or self.agent.get("session_work_item")
         cwd = self._resolve_workdir()
         if not cwd:
