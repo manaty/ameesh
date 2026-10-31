@@ -348,6 +348,13 @@ class Config:
     #: (`ameesh set context_max_tokens=…`). La somme des relectures d'un tour
     #: n'est pas la mesure (#2336). 0 = plafond désactivé.
     context_max_tokens: float = 15_000_000.0
+    #: CTX-04a (#4970) : budgets de relecture opt-in, en jetons, sur `R_turn`
+    #: (relu du tour) et `R_session` (relu cumulé de la session). Dépassé : le
+    #: tour se clôt au prochain point sûr et le travail reprend dans la MÊME
+    #: session, sans rotation ni compactage. Ni taille de fenêtre, ni
+    #: pourcentage de `W`. 0 = éteint (défaut), mode legacy inchangé.
+    turn_reread_budget: float = 0.0
+    session_reread_budget: float = 0.0
     #: L105 : durée maximale d'un tour d'agent mené (secondes). Au-delà, le
     #: tour se clôt au prochain point sûr (fin de l'appel d'outil en cours) et
     #: le travail reprend au tour suivant, dans la même session ; réglable par
@@ -1129,6 +1136,10 @@ def load(env: dict | None = None) -> Config:
             cfg.session_min_turns)),
         context_max_tokens=max(0.0, _as_float(pick("AMEESH_CONTEXT_MAX_TOKENS"),
                                               cfg.context_max_tokens)),
+        turn_reread_budget=max(0.0, _as_float(pick("AMEESH_TURN_REREAD_BUDGET"),
+                                              cfg.turn_reread_budget)),
+        session_reread_budget=max(0.0, _as_float(pick("AMEESH_SESSION_REREAD_BUDGET"),
+                                                 cfg.session_reread_budget)),
         turn_max_seconds=max(0.0, _as_float(pick("AMEESH_TURN_MAX_SECONDS"),
                                             cfg.turn_max_seconds)),
         turn_mail_max=_as_count(pick("AMEESH_TURN_MAIL_MAX"), cfg.turn_mail_max),
