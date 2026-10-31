@@ -259,6 +259,18 @@ class GardeTest(_Empreintes):
         self.assertEqual(storage.of(self.db).work_footprints.overlapping(second["id"]), [])
         work.assign(self.db, second["id"], "human:autre", actor="test")
 
+    def test_la_prise_relue_ignore_les_chemins_partages(self):
+        """#5064 : la relecture sous verrou (la cible et les bugs libres)
+        applique la même politique que le plan."""
+        premier = self.lot("premier", type="bug")
+        second = self.lot("second", type="bug")
+        self.footprint(premier, "CHANGELOG.md", "src/a.py")
+        self.footprint(second, "CHANGELOG.md", "src/b.py")
+        self.assertFalse(project_plan.assignment_ready(self.db, second, second))
+        self.policy(shared_paths=["CHANGELOG.md"])
+        self.assertIn(second["id"], project_plan.report(self.db, "nexlink")["ready"])
+        self.assertTrue(project_plan.assignment_ready(self.db, second, second))
+
     def test_plafond_de_lots_en_vol(self):
         lots = [self.lot("l%d" % i) for i in range(3)]
         vehicule = self.lot("paquet", branch="integration/paquet-h-1")
