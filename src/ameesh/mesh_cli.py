@@ -3205,7 +3205,8 @@ def cmd_export_v0(cfg: Config, args: argparse.Namespace) -> int:
 
 def cmd_migrate(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
-    return cli.cmd_migrate(cfg, dry_run=args.dry_run, additive_only=args.additive_only)
+    return cli.cmd_migrate(cfg, dry_run=args.dry_run, additive_only=args.additive_only,
+                           allow_live_executors=args.allow_live_executors)
 
 
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
@@ -4577,6 +4578,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                        help="missing migrations, additive or not; nothing is written")
     p_mig.add_argument("--additive-only", action="store_true",
                        help="apply nothing if a missing migration is not additive (L151)")
+    p_mig.add_argument("--allow-live-executors", metavar="REASON", default=None,
+                       help="non-additive migration despite live executor leases; "
+                            "the nonempty reason is journaled (recovery gesture)")
     p_mig.set_defaults(func=cmd_migrate)
     p_doc = sub.add_parser("doctor")
     p_doc.add_argument("--notify-test", action="store_true")
