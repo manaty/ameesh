@@ -122,7 +122,13 @@ découpage ouvert et son âge (`decoupage`), la feuille de route notée épuisé
 (`roadmap_exhausted`), et la **part de fenêtre perdue au reset** de chaque
 compte de forfait (`plan_loss_at_reset`, le calcul d'`ameesh accounts`).
 Les relecteurs, les pilotes, l'auditeur, mesh-design et les agents en pause
-ne sont pas réveillables et n'y comptent pas.
+ne sont pas réveillables et n'y comptent pas. Une famille exclue des prises
+(`auto_take.excluded_families` du canon, #5005) ne compte pas non plus tant
+que l'exclusion court : c'est une capacité volontairement écartée, pas une
+perte. Seuls les agents **au repos** comptent les heures-agent : le temps
+hors tour d'un agent qui garde un lot actionnable (attente de CI ou d'avis
+sur son propre lot) n'est pas de la capacité disponible, pas plus que la
+pause d'un budget.
 
 Une file vide n'est pas « rien à signaler ». Quand au moins `file.repos_part`
 (20 %) des agents réveillables d'un projet sont au repos depuis

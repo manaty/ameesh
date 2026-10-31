@@ -23,8 +23,13 @@ def entrust(db, role: str, host: str, *, lock_key: str, owner: str,
             epoch: int) -> bool:
     """Record `host` as the delegate, under the live execution lease.
 
-    The CTE is the fence: an INSERT without a conflict must also see the live
-    `merge_locks` row, which a plain `ON CONFLICT ... WHERE` would not check.
+    The `held` CTE is the fence: an INSERT without a conflict must also see the
+    live `merge_locks` row, which a plain `ON CONFLICT ... WHERE` would not
+    check. The INSERT is the statement itself, not a data-modifying CTE: the
+    psql driver wraps `query()` in an outer CTE for its JSON output, and
+    PostgreSQL refuses a data-modifying statement nested in a CTE ("must be at
+    the top level"). With the write in a CTE the handover was silently never
+    recorded under that driver (#3568 witness).
     The same host does not renew its handover: a pass that runs every 30 s and
     exits without beating would otherwise reset its own grace forever (review
     cx3). Only a host change starts a new handover window.
@@ -39,16 +44,14 @@ def entrust(db, role: str, host: str, *, lock_key: str, owner: str,
               FROM merge_locks
              WHERE target = %s AND owner = %s AND epoch = %s
                AND expires_at > clock_timestamp()
-        ), wrote AS (
-            INSERT INTO alerts_delegations (role, host, entrusted_at)
-            SELECT %s, %s, clock_timestamp() FROM held
-            ON CONFLICT (role) DO UPDATE
-               SET host = excluded.host,
-                   entrusted_at = excluded.entrusted_at
-             WHERE alerts_delegations.host IS DISTINCT FROM excluded.host
-            RETURNING role
         )
-        SELECT role FROM wrote
+        INSERT INTO alerts_delegations (role, host, entrusted_at)
+        SELECT %s, %s, clock_timestamp() FROM held
+        ON CONFLICT (role) DO UPDATE
+           SET host = excluded.host,
+               entrusted_at = excluded.entrusted_at
+         WHERE alerts_delegations.host IS DISTINCT FROM excluded.host
+        RETURNING role
         """, (lock_key, owner, int(epoch), role, host))
     return bool(rows)
 
