@@ -138,7 +138,7 @@ def install() -> None:
 
 
 def harden() -> bool:
-    """Protect every CLI/service entry before configuration and worker threads."""
+    """Protect a long-running service entry before configuration and worker threads."""
     import sys
     from .process import become_undumpable
     try:

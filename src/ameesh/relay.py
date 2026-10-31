@@ -1157,15 +1157,15 @@ def load_verifier(spec: str) -> TokenVerifier:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .platform.child_environment import harden
-    if not harden():
-        return 1
     parser = argparse.ArgumentParser(prog="python -m ameesh.relay",
                                      description="Relais de modèle du serveur du mesh (L111).")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_serve = sub.add_parser("serve", help="servir le relais seul")
     p_serve.add_argument("--bind", default=os.environ.get("AMEESH_RELAY_BIND", "127.0.0.1:8787"))
     args = parser.parse_args(argv)
+    from .platform.child_environment import harden
+    if not harden():
+        return 1
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     spec = (os.environ.get("AMEESH_RELAY_VERIFIER") or "").strip()
     if not spec:

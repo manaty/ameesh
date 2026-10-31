@@ -294,9 +294,6 @@ ACTION_COMMANDS = ("action", "decisions")
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .platform.child_environment import harden
-    if not harden():
-        return 1
     try:
         return _dispatch(argv)
     except BrokenPipeError:

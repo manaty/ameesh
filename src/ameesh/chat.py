@@ -1507,6 +1507,8 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
     if args.veille and not veille_armed(args, popen=popen):
         print("ameesh chat: --veille needs a terminal on input and output; the "
               "session runs without it", file=sys.stderr)
+    from .platform.child_environment import harness
+    env = harness(env, args.harness, compte)
     try:
         slave = None
         if veille_armed(args, popen=popen):

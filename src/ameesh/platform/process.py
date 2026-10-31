@@ -842,17 +842,19 @@ def executor_processes() -> dict:
     if not _proc_ok():
         return {}
     import subprocess
-    try:
-        done = subprocess.run(
-            ["systemctl", "--user", "show", "--no-pager",
-             "--property=Id,MainPID,ControlGroup", "ameesh-*.service"],
-            capture_output=True, text=True, timeout=5, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if done.returncode:
-        return {}
+    blocks = []
+    for manager in (["systemctl", "--user"], ["systemctl", "--system"]):
+        try:
+            done = subprocess.run(
+                [*manager, "show", "--no-pager",
+                 "--property=Id,MainPID,ControlGroup", "ameesh-*.service"],
+                capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0:
+            blocks.extend(done.stdout.strip().split("\n\n"))
     result = {}
-    for block in done.stdout.strip().split("\n\n"):
+    for block in blocks:
         fields = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
         unit, pid, group = (fields.get(k, "") for k in ("Id", "MainPID", "ControlGroup"))
         if not (unit.startswith("ameesh-") and unit.endswith(".service")

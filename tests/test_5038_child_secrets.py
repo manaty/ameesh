@@ -102,6 +102,22 @@ print(json.dumps(results))
         output = subprocess.check_output([sys.executable, "-c", script], env=env, text=True)
         self.assertEqual(json.loads(output), [["AMEESH_DSN", "OPENAI_API_KEY"]] * 2)
 
+    def test_heavy_preserves_the_callers_exact_environment_with_the_guard_installed(self):
+        env = E.for_child([sys.executable], os.environ)
+        env.update(PYTHONPATH=SRC, AMEESH_TEST_DSN="synthetic-db",
+                   PGPASSWORD="synthetic-pg", GH_TOKEN="synthetic-gh")
+        script = """
+import os, sys, tempfile
+from types import SimpleNamespace
+from ameesh import heavy
+from ameesh.platform import child_environment as E
+E.install()
+with tempfile.TemporaryDirectory() as root:
+    code = "import os; assert os.environ['AMEESH_TEST_DSN']=='synthetic-db'; assert os.environ['PGPASSWORD']=='synthetic-pg'; assert os.environ['GH_TOKEN']=='synthetic-gh'"
+    assert heavy.run(SimpleNamespace(state_dir=root, max_heavy_suites=1), [sys.executable, '-c', code], nice=0, max_s=10) == 0
+"""
+        subprocess.run([sys.executable, "-c", script], env=env, check=True)
+
     def test_mechanical_scripts_receive_transport_but_no_provider_credentials(self):
         env = E.execution_transport(dict(AMEESH_DSN="db", GH_TOKEN="github",
                                         DEEPSEEK_API_KEY="provider"))
@@ -151,6 +167,16 @@ class ExecutorIdentityTest(unittest.TestCase):
         self.assertFalse(P._trusted_executor(91, lambda: snapshot))
         self.assertEqual(self.snapshot(), {})
 
+    def test_system_services_are_found_when_the_user_manager_is_unavailable(self):
+        response = "Id=%s\nMainPID=91\nControlGroup=%s\n" % (self.unit, self.group)
+        def show(argv, **kwargs):
+            if "--user" in argv:
+                raise OSError("no user manager")
+            self.assertIn("--system", argv)
+            return SimpleNamespace(returncode=0, stdout=response)
+        with mock.patch("subprocess.run", side_effect=show):
+            self.assertTrue(P._trusted_executor(91, P.executor_processes))
+
     def test_missing_service_manager_grants_nothing(self):
         with mock.patch("subprocess.run", side_effect=OSError("unavailable")):
             self.assertEqual(P.executor_processes(), {})
@@ -195,16 +221,45 @@ time.sleep(30)
                     child.kill()
                     child.wait()
 
-    def test_cli_and_direct_service_entrypoints_refuse_peer_environment_reads(self):
-        for module in ("main", "entry", "notify", "serve", "relay", "watch", "staging_executor"):
+    def test_ordinary_cli_remains_readable_to_holder_and_orphan_scans(self):
+        env = E.for_child([sys.executable], os.environ)
+        env["PYTHONPATH"] = SRC
+        script = """
+from unittest import mock
+from ameesh import main
+with mock.patch.object(main, '_dispatch', return_value=0):
+    assert main.main(['version']) == 0
+"""
+        # Main CLI used to harden before dispatch. Observe from a same-uid peer.
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root, "ready")
+            script = script + "\nimport pathlib,time\npathlib.Path(%r).touch()\ntime.sleep(30)\n" % str(marker)
+            with subprocess.Popen([sys.executable, "-c", script], env=env) as child:
+                try:
+                    deadline = time.monotonic() + 10
+                    while not marker.exists():
+                        if child.poll() is not None or time.monotonic() > deadline:
+                            self.fail("CLI witness did not finish dispatch")
+                        time.sleep(0.02)
+                    self.assertTrue(Path("/proc/%d/environ" % child.pid).read_bytes())
+                finally:
+                    child.kill()
+                    child.wait()
+
+    def test_long_running_service_entrypoints_refuse_peer_environment_reads(self):
+        for module in ("notify", "serve", "relay", "staging_executor"):
             with self.subTest(module=module), tempfile.TemporaryDirectory() as root:
                 marker = Path(root, "ready")
                 code = '''
 import importlib, pathlib, sys, time
+from unittest import mock
+from ameesh import config
 module = importlib.import_module('ameesh.' + sys.argv[1])
+args = {'notify': [], 'serve': [], 'relay': ['serve'], 'staging_executor': ['--config', 'unused', 'tick']}[sys.argv[1]]
 try:
-    module.main(['--help'])
-except SystemExit:
+    with mock.patch.object(config, 'load', side_effect=RuntimeError('stop after hardening')):
+        module.main(args)
+except RuntimeError:
     pass
 pathlib.Path(sys.argv[2]).write_text('ready')
 time.sleep(30)
@@ -220,7 +275,7 @@ time.sleep(30)
                             if child.poll() is not None:
                                 self.fail(child.stderr.read())
                             if time.monotonic() > deadline:
-                                self.fail("service entrypoint did not return from --help")
+                                self.fail("service entrypoint did not reach its configuration")
                             time.sleep(0.02)
                         with self.assertRaises(PermissionError):
                             Path("/proc/%d/environ" % child.pid).read_bytes()
