@@ -136,3 +136,5 @@ test_4150_host_idle  # état inactif conservateur et empreinte des vues
 test_4151_host_capacity_alerts  # alertes agents de capacité inactive
 test_4299_agent_rename  # #4299: rename counts rows through SQL (psql execute has no row count)
 test_5022_cache_measure  # storage: retained shared-cache entries and partial measurements persist in housekeeping_log (#5022)
+
+test_5046_deps_policy  # #5046: nm host policy and actual deletion journal through both drivers

@@ -524,8 +524,8 @@ class Policy:
     artifact_ended_idle: float = build_artifacts.DEFAULT_ENDED_IDLE_S
     #: L230/L162: names of the user's processes whose unreadability (not
     #: dumpable: capabilities, setuid) does not block a deletion — the build
-    #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
-    #: entry; empty by default, set per host in its Host card
+    #: artifacts of an idle worktree, abandoned /tmp entries and the shared
+    #: node_modules cache; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
     #: #2820 : taille du flux `events.jsonl` d'un agent au-delà de laquelle il
     #: tourne au début du tour suivant (`events_rotation`)
@@ -5684,7 +5684,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         for line in deps_mod.gc_node_modules(croot, now=now, idle=policy.deps_idle,
                                              dry_run=dry_run, worktrees=known_worktrees,
                                              budget=budget,
-                                             reserve=reserve):
+                                             reserve=reserve, allow=policy.unreadable_ok):
             if line["action"] == "would-delete":
                 plan.append({"kind": "deps", "path": line["path"], "action": "suppression",
                              "bytes": line["bytes"], "detail": line["detail"]})
