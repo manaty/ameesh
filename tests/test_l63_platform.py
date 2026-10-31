@@ -273,9 +273,10 @@ class PlatformTest(unittest.TestCase):
             def open_files(self):
                 raise Refus("refusé")
 
-        faux = mock.MagicMock()
+        faux = mock.MagicMock(AccessDenied=Refus)
         faux.Process.return_value = Muet()
-        with mock.patch.object(platform, "psutil", faux):
+        with mock.patch.object(platform, "psutil", faux), \
+                mock.patch.object(platform.process, "_proc_ok", return_value=False):
             with self.assertRaises(platform.NotAvailable):
                 platform.holders(__file__, "x")
 

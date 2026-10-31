@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Unreadable holders retain the systemd discovery failure and stay guarded."""
+"""Protected self-probes use the independent Linux scan and keep unknown holders guarded."""
 import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from tests import support  # noqa: F401
-from ameesh import housekeeping
 from ameesh.platform import process as P
 
 
@@ -31,7 +28,7 @@ class HoldersRunnerTest(unittest.TestCase):
         mock.patch.object(P, 'DOUBT_RETRIES', 0).start()
         mock.patch.object(P, 'service_managers', return_value=frozenset()).start()
 
-    def scan(self, snapshot, cwd='/outside'):
+    def scan(self, snapshot, cwd='/outside', ps=None):
         def listing(path):
             if path == self.tmp.name:
                 return ['91']
@@ -41,7 +38,9 @@ class HoldersRunnerTest(unittest.TestCase):
         with mock.patch.object(P, 'executor_processes', return_value=snapshot), \
                 mock.patch.object(P.os, 'listdir', side_effect=listing), \
                 mock.patch.object(P.os, 'readlink', return_value=cwd):
-            return P._holders_proc(self.tmp.name, True, None, set())
+            if ps is None:
+                return P._holders_proc(self.tmp.name, True, None, set())
+            return P._holders_psutil(ps, self.tmp.name, True, None, set())
 
     def test_verified_runner_outside_worktree_does_not_hold_it(self):
         identity = P._executor_identity(91, self.group)
@@ -57,25 +56,52 @@ class HoldersRunnerTest(unittest.TestCase):
         with self.assertRaises(P.HoldersUnreadable):
             self.scan({})
 
-    def test_missing_user_bus_is_explained_without_exempting_unknown_process(self):
-        for failure in (SimpleNamespace(returncode=1, stdout=''),
-                        OSError('no bus'), subprocess.TimeoutExpired('systemctl', 5)):
-            def show(argv, **kwargs):
-                if '--user' in argv:
-                    if isinstance(failure, Exception):
-                        raise failure
-                    return failure
-                return SimpleNamespace(returncode=0, stdout='')
-            with self.subTest(failure=type(failure).__name__), \
-                    mock.patch('subprocess.run', side_effect=show):
-                snapshot = P.executor_processes()
-                self.assertEqual(snapshot, {})
-                with self.assertRaises(P.HoldersUnreadable) as caught:
-                    self.scan(snapshot)
-                with mock.patch.object(housekeeping.platform, 'holders',
-                                       side_effect=caught.exception):
-                    held, detail = housekeeping.worktree_holders(self.tmp.name)
-                self.assertTrue(held)
-                self.assertIn('systemctl --user unavailable', detail)
-                self.assertIn('XDG_RUNTIME_DIR', detail)
-                self.assertNotIn('no bus', detail)
+    def denied_psutil(self):
+        class AccessDenied(Exception):
+            pass
+        ps = mock.Mock(AccessDenied=AccessDenied)
+        ps.Process.return_value.open_files.side_effect = AccessDenied()
+        return ps
+
+    def test_self_probe_denied_falls_back_for_verified_runner_and_observed_cwd(self):
+        ps = self.denied_psutil()
+        identity = P._executor_identity(91, self.group)
+        self.assertEqual(self.scan({91: identity}, ps=ps), [])
+        self.assertEqual(self.scan({91: identity}, cwd=self.tmp.name, ps=ps)[0]['why'],
+                         'working directory')
+
+    def test_self_probe_denied_does_not_exempt_unknown_unreadable_process(self):
+        with self.assertRaises(P.HoldersUnreadable):
+            self.scan({}, ps=self.denied_psutil())
+
+    def test_self_probe_denied_without_proc_stays_unavailable(self):
+        with mock.patch.object(P, '_proc_ok', return_value=False):
+            with self.assertRaises(P.NotAvailable):
+                P._holders_psutil(self.denied_psutil(), self.tmp.name, True, None, set())
+
+    def test_proc_self_probe_denied_stays_unavailable(self):
+        with mock.patch.object(P.os, 'listdir', side_effect=PermissionError()):
+            with self.assertRaises(P.NotAvailable):
+                P._holders_psutil(self.denied_psutil(), self.tmp.name, True, None, set())
+
+    def artifact_paths(self, identities, cwd=None):
+        def link(path):
+            if path.endswith('/cwd') and cwd is not None:
+                return cwd
+            raise PermissionError('protected runner')
+        with mock.patch.object(P, 'executor_processes', return_value=identities), \
+                mock.patch.object(P, '_zombie', return_value=False), \
+                mock.patch.object(P, '_link', side_effect=link):
+            return P.user_paths()
+
+    def test_artifacts_verified_runner_does_not_block_and_observed_path_is_kept(self):
+        identity = P._executor_identity(91, self.group)
+        result = self.artifact_paths({91: identity}, cwd=self.tmp.name)
+        self.assertEqual(result.unreadable, [])
+        self.assertIn(self.tmp.name, result.paths)
+
+    def test_artifacts_unknown_unreadable_or_reused_pid_still_blocks(self):
+        identity = P._executor_identity(91, self.group)
+        for snapshot in ({}, {91: ('other-start', identity[1])}):
+            with self.subTest(snapshot=snapshot):
+                self.assertTrue(self.artifact_paths(snapshot).unreadable)
