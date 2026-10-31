@@ -3180,18 +3180,19 @@ def _pr_request_runs(api, repo: str, number: int, sha: str,
     return readable, carried
 
 
-def _current_run(row: dict, frozen: str, number: int, base: str) -> bool:
+def _current_run(row: dict, frozen: str, number: int, base: str, covered=()) -> bool:
     """Un run de la composition courante : ni périmé, ni à annuler.
 
     Avec `number`/`base` (une demande de gel), un run de PR de la même tête
-    mais d'une autre base est périmé : la composition a bougé. Sans eux
+    mais d'une autre base est périmé : la composition a bougé, sauf pour une
+    base de `covered` (atterrissages de coupure seuls, #5192). Sans eux
     (`ameesh ci cancel` seul), tout run qui porte le SHA gelé est conservé,
     comme avant (#1343).
     """
     info = pr_run(row)
     if number and info is not None:
         return (info["number"] == number and info["sha"] == frozen
-                and (not base or info["base"] == base))
+                and (not base or info["base"] == base or info["base"] in covered))
     return (row.get("head_sha") or "").strip().lower() == frozen
 
 
@@ -3321,28 +3322,34 @@ def _cutoff_why(run: dict, base: str) -> str:
 
 
 def _cutoff_bases(cfg, db, item, slug: str, target: str, base: str, runs,
-                  mode: str, *, checkout: str = "") -> list[str]:
+                  mode: str, *, checkout: str = "", proven=()) -> list[str]:
     """#5192 (canon §12) : les bases d'autres runs de la tête qui couvrent `base`.
 
     Une cible avancée par les seuls atterrissages d'une coupure (version et
     notes) ne fait pas une nouvelle composition : un run vivant ou vert de la
-    même tête et du même mode, sur une base dont `base` ne diffère que par ces
-    commits, la couvre déjà ; reposer l'étiquette annulerait ce run (groupe de
-    concurrence de tests.yml). Même règle que la fusion
-    (`packet_automerge._cutoff_landing_only`) et même clone (`_gate_repo`).
-    Un clone absent ou illisible, ou un commit de code dans l'intervalle, ne
-    couvre rien : la demande part comme avant."""
+    même tête et d'un mode qui couvre `mode` (tous si `mode` est vide), sur une
+    base dont `base` ne diffère que par ces commits, la couvre déjà ; reposer
+    l'étiquette annulerait ce run (groupe de concurrence de tests.yml). Même
+    règle que la fusion (`packet_automerge._cutoff_landing_only`) et même clone
+    (`_gate_repo`). `proven` : des bases déjà prouvées pour ce `base` (la
+    relation ne dépend que des deux SHA), reprises sans relire git. Un clone
+    absent ou illisible, ou un commit de code dans l'intervalle, ne couvre
+    rien : la demande part comme avant."""
     candidates = sorted({r["base"] for r in runs if r["base"] != base
-                         and _covers(r["mode"], mode) and _alive_or_green(r)})
-    if not candidates:
-        return []
+                         and (not mode or _covers(r["mode"], mode)) and _alive_or_green(r)})
+    proven = set(proven)
+    covered = [b for b in candidates if b in proven]
+    fresh = [b for b in candidates if b not in proven]
+    if not fresh:
+        return covered
     from . import packet_automerge
     repo = packet_automerge._gate_repo(cfg, db, item, slug, checkout)
     if not repo:
-        return []
+        return covered
     # la pointe de la cible peut manquer au clone : sans elle, rien ne couvre
     packet_automerge._fetch_into(repo, (target,))
-    return [b for b in candidates if packet_automerge._cutoff_landing_only(repo, b, base)]
+    return sorted(covered + [b for b in fresh
+                             if packet_automerge._cutoff_landing_only(repo, b, base)])
 
 
 def _latest_check(api, repo: str, sha: str) -> dict | None:
@@ -3697,13 +3704,16 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
 
 
 def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
-                repo: str = "", number: int = 0, base: str = "", workflows=WORKFLOWS) -> dict:
+                repo: str = "", number: int = 0, base: str = "", workflows=WORKFLOWS,
+                target: str = "", checkout: str = "", proven=()) -> dict:
     """Les runs d'un lot à annuler : non conclues, hors de la composition gardée.
 
     `all_runs` annule aussi le run du SHA gelé (geste explicite). Un lot non
     gelé n'a pas de SHA de référence : tous ses runs ouverts sont périmés.
     Avec `number`/`base` (une demande de gel), un run de PR de la même tête
-    mais d'une autre base est périmé lui aussi : sa composition a bougé.
+    mais d'une autre base est périmé lui aussi : sa composition a bougé —
+    sauf une base que seuls des atterrissages de coupure séparent de `base`
+    (#5192, canon §12 ; `proven` : bases déjà prouvées par le plan).
     """
     from . import work
     item = work.get(db, int(item_id))
@@ -3717,8 +3727,21 @@ def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
     frozen = ((freeze or {}).get("sha") or "").strip().lower()
     rows = [r for r in _runs_of(api, name, branch=branch, workflows=workflows)
             if (r.get("status") or "").strip().lower() in OPEN_STATUSES]
+    covered: list[str] = []
+    if frozen and not all_runs and number and base:
+        same = []
+        for row in rows:
+            info = pr_run(row)
+            if (info is not None and info["number"] == number and info["sha"] == frozen
+                    and info["base"] != base):
+                same.append({"base": info["base"], "mode": info["mode"],
+                             "status": (row.get("status") or "").strip().lower(),
+                             "conclusion": row.get("conclusion")})
+        covered = _cutoff_bases(cfg, db, item, name,
+                                target or (item.get("branch_target") or "main"), base,
+                                same, "", checkout=checkout, proven=proven)
     if frozen and not all_runs:
-        rows = [r for r in rows if not _current_run(r, frozen, number, base)]
+        rows = [r for r in rows if not _current_run(r, frozen, number, base, covered)]
     return {"schema": CANCEL_SCHEMA, "work_item": int(item_id), "repo": name,
             "branch": branch, "frozen": frozen, "all": bool(all_runs),
             "runs": [_short_run(r) for r in rows],
@@ -3886,7 +3909,8 @@ def _revalidate(db, item_id: int, decision: dict) -> None:
                        % (item_id, len(reviews), sha[:12], avis))
 
 
-def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> dict:
+def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool,
+                  cfg=None, checkout: str = "") -> dict:
     """La demande, sous le verrou de la ligne du lot (#1343, P2 R1).
 
     `work.note` (marque `reserve`) prend le verrou `FOR NO KEY UPDATE` de
@@ -3940,9 +3964,14 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
         #: ensuite ne sera pas libérée par eux.
         watermark = max([_run_id(r["row"]) for r in known]
                         + [r["id"] for r in carried], default=0)
-        #: #5192 : les bases de coupure retenues par `gel_plan` (canon §12)
-        #: couvrent aussi la composition, pour un run vivant ou vert seulement.
-        cutoff = set(decision.get("cutoff_bases") or ())
+        #: #5192 (canon §12) : la couverture par une base de coupure se refait
+        #: sur les runs relus ici — un run apparu après `gel_plan` compte aussi ;
+        #: les bases déjà prouvées par le plan ne relisent pas git.
+        cutoff = set(_cutoff_bases(cfg, db, work.get(db, int(item_id)) or {},
+                                   decision["repo"],
+                                   decision.get("base_ref") or decision.get("target") or "main",
+                                   base, known, mode, checkout=checkout,
+                                   proven=decision.get("cutoff_bases") or ()))
         runs = [r for r in known if _covers(r["mode"], mode)
                 and (r["base"] == base or r["base"] in cutoff and _alive_or_green(r))]
         live = [r for r in runs if r["status"] in OPEN_STATUSES]
@@ -4293,13 +4322,18 @@ def cmd_ci_run(cfg, args) -> int:
                              decision["sha"], actor=getattr(args, "actor", "") or "")
     stale = cancel_plan(db, cfg, args.id, api=api, repo=args.repo or "",
                         number=decision["pr"], base=decision["base"],
+                        target=decision.get("base_ref") or "",
+                        checkout=getattr(args, "prevalidation_repo", "") or "",
+                        proven=decision.get("cutoff_bases") or (),
                         workflows=tuple(decision["dispatch"]) if decision.get("dispatch")
                         is not None else WORKFLOWS)["runs"]
     if stale:
         _cancel_runs(gh, decision["repo"], stale,
                      say=lambda text: print("  %s" % text))
     try:
-        result = _request_once(db, args.id, decision, api=api, gh=gh, force=args.force)
+        result = _request_once(db, args.id, decision, api=api, gh=gh, force=args.force,
+                               cfg=cfg,
+                               checkout=getattr(args, "prevalidation_repo", "") or "")
     except (GelError, plan_github.GithubError) as exc:
         print("ameesh ci run: %s" % exc)
         return 1

@@ -28,7 +28,7 @@ from unittest import mock
 
 from ameesh import ci, packet_automerge, plan_github, work
 
-from .test_l161g_ci_gel import DEPOT, GEL, LABEL, GelTestCase, Gh, Github, label_run, pull
+from .test_l161g_ci_gel import DEPOT, GEL, LABEL, PR, GelTestCase, Gh, Github, label_run, pull
 
 
 class Cible:
@@ -186,24 +186,64 @@ class CutoffCoverageTest(GelTestCase):
                             full=True, reason="paquet §12")
         self.assertEqual((decision["action"], decision["mode"]), ("request", "full"))
 
-    # -- la phase critique refait la même décision ------------------------
+    # -- un run apparu après le plan (B de cx3 sur 893d4aa5a3ce) -----------
 
-    def test_la_phase_critique_garde_les_bases_de_coupure(self):
+    def tardif(self, landed: str) -> "Tardif":
+        return Tardif(base=landed, pulls=[pull(base=landed)],
+                      runs=[self.vivant(self.cible.base)])
+
+    def test_la_phase_critique_relit_la_couverture_d_un_run_apparu_apres_le_plan(self):
         self.gele()
         landed = self.cible.atterrissage()
-        api = self.api(landed, self.vivant(self.cible.base))
+        api = self.tardif(landed)
         decision = self.gel(api)
+        self.assertEqual(decision["action"], "request")
+        self.assertNotIn("cutoff_bases", decision)
+        api.visible = True
         gh = Gh()
-        result = ci._request_once(self.db, 1343, {**decision, "action": "request"},
-                                  api=api, gh=gh, force=False)
+        result = ci._request_once(self.db, 1343, decision, api=api, gh=gh, force=False)
         self.assertEqual((result["requested"], result["action"]), (False, "running"))
         self.assertEqual(gh.poses(), [])
-        # sans la liste, la même phase poserait : c'est elle qui couvre
-        bare = {k: v for k, v in decision.items() if k != "cutoff_bases"}
-        result = ci._request_once(self.db, 1343, {**bare, "action": "request"},
-                                  api=api, gh=gh, force=False)
+        # sans clone lisible, la phase critique ne prouve rien : elle pose
+        self.clone = ""
+        result = ci._request_once(self.db, 1343, decision, api=api, gh=gh, force=False)
         self.assertEqual(result["action"], "request")
         self.assertEqual(gh.poses(), [LABEL])
+
+    def test_la_demande_n_annule_pas_un_run_apparu_apres_le_plan(self):
+        # `cmd_ci_run` annule les périmés avant la phase critique : un run de la
+        # base d'avant l'atterrissage n'en est pas un
+        self.gele()
+        landed = self.cible.atterrissage()
+        api = self.tardif(landed)
+        real = ci.gel_plan
+
+        def plan_then_appear(*a, **k):
+            decision = real(*a, **k)
+            api.visible = True
+            return decision
+
+        gh = Gh()
+        with mock.patch.object(ci, "gel_plan", plan_then_appear):
+            self.assertEqual(self.run_cmd(api, gh), 0)
+        self.assertEqual(gh.annulations(), [], "le run en vol n'est pas périmé")
+        self.assertEqual(gh.poses(), [], "l'étiquette reposée l'annulerait")
+
+    def test_un_run_d_une_base_de_code_reste_perime_pour_l_annulation(self):
+        self.gele()
+        moved = self.cible.code()
+        report = ci.cancel_plan(self.db, None, 1343, api=self.api(
+            moved, self.vivant(self.cible.base)), repo=DEPOT, number=PR, base=moved)
+        self.assertEqual([r["id"] for r in report["runs"]], [7])
+
+
+class Tardif(Github):
+    """La liste des runs de la tête, vide tant que `visible` est faux."""
+
+    visible = False
+
+    def rows(self) -> list[dict]:
+        return list(self.runs) if self.visible else []
 
 
 if __name__ == "__main__":
