@@ -56,6 +56,38 @@ class SelectionTest(card_fixture.SandboxCase):
         with mock.patch.object(canon, 'load_configured', return_value=[]):
             self.assertIsNone(runtime.select(self.worker()))
 
+    def test_select_loads_the_canon_once(self):
+        # #5163 : select() passe sa liste à _pinned_canon(), qui ne relit plus
+        # le canon (~0,2 s) pour chaque tour legacy.
+        self.write('agents/tpk-reviewer.md', card_fixture.agent_card().split('sandbox:')[0] + '---\n')
+        self.commit()
+        loaded, _ = self.load(trusted=True)
+        calls = []
+
+        def load(cfg):
+            calls.append(cfg)
+            return [loaded]
+
+        with mock.patch.object(canon, 'load_configured', side_effect=load), \
+                mock.patch.object(runtime.canon_sync, 'state',
+                                  side_effect=RuntimeError('sync unavailable')):
+            self.assertIsNone(runtime.select(self.worker()))
+        self.assertEqual(1, len(calls))
+
+    def test_pinned_canon_without_a_list_still_reads_the_canon(self):
+        # grant_valid() garde une lecture fraîche : la liste reste optionnelle.
+        self.commit()
+        loaded, _ = self.load(trusted=True)
+        state = dict(last_good_commit=loaded.sources[0].commit,
+                     checked_ts=time.time(), status='ok')
+        with mock.patch.object(canon, 'load_configured', return_value=[loaded]) as load, \
+                mock.patch.object(runtime.canon_sync, 'state', return_value=state):
+            got, got_state, pinned = runtime._pinned_canon(self.worker())
+        self.assertIs(got, loaded)
+        self.assertIs(got_state, state)
+        self.assertEqual(loaded.sources[0].commit, pinned)
+        load.assert_called_once()
+
     def worker(self):
         return NS(cfg=NS(canon=True), name='tpk-reviewer', db=object(),
                   runner=NS(host='tpk-stg-reviewers'), _canon_id=lambda: None)
