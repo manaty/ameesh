@@ -32,7 +32,7 @@ from . import storage
 EVENT = "packet.pause"
 #: a pause is a staging window, not a freeze: 12 h at most, renewable
 MAX_S = 12 * 3600
-#: history/SLO windows are bounded; the latest state has no age cutoff (#5045)
+#: recent history is bounded; its preceding state has no age cutoff (#5045)
 LOOKBACK_DAYS = 2
 #: `data` stays short (events.py: identifiers and states)
 REASON_MAX = 200
@@ -157,18 +157,22 @@ def describe(data: dict, zone=None) -> str:
 WINDOWS_LIMIT = 200
 
 
-def windows(db, *, project: str) -> list[dict]:
+def windows(db, *, project: str, now: float | None = None) -> list[dict]:
     """#4444: the recent pause windows of `project`, every target, oldest first.
 
     Each window is ``{"start", "end", "until", "reason", "by", "target"}``:
-    it opens at the `paused` event and ends at its deadline, or earlier at the
-    next event of the same object (`resumed`, or a renewed pause that opens
-    its own window). The SLO reads them to stop the GO → merge clock while
-    no composition runs (`suspended_start`).
+    it opens at the `paused` event and ends at its deadline (ordinary pause)
+    or the next event of the same object (`resumed`, or a renewed pause).
+    Announcement pauses remain open beyond their alert deadline. The state
+    preceding the lookback is included, so an old open pause is not forgotten.
+    The SLO reads them to stop the GO → merge clock while no composition
+    runs (`suspended_start`).
     An event without a date opens no window.
     """
+    now = time.time() if now is None else float(now)
     prefix = key(project, "")
-    rows = [row for row in _events(db).recent_type(EVENT, LOOKBACK_DAYS, WINDOWS_LIMIT) or ()
+    rows = [row for row in _events(db).context_type(
+                EVENT, LOOKBACK_DAYS, WINDOWS_LIMIT, object_prefix=prefix) or ()
             if isinstance(row, dict) and str(row.get("object") or "").startswith(prefix)]
     rows.sort(key=lambda row: (float(row.get("ts") or 0.0), int(row.get("id") or 0)))
     out: list[dict] = []
@@ -191,7 +195,8 @@ def windows(db, *, project: str) -> list[dict]:
             continue
         if until <= ts:
             continue
-        window = {"start": ts, "end": until, "until": int(until),
+        window = {"start": ts, "end": max(until, now) if data.get("await_announcement") else until,
+                  "until": int(until),
                   "reason": data.get("reason") or "", "by": data.get("by") or "",
                   "target": data.get("target") or obj[len(prefix):]}
         open_[obj] = window

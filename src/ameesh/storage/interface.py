@@ -1061,6 +1061,15 @@ class Events(Domain):
         retention index; `days` is the durability the caller needs, never a
         substitute for an absent event."""
 
+    def context_type(self, type: str, days: int, limit: int, *,
+                     object_prefix: str) -> list[dict]:
+        """Recent events plus the last pre-window state per matching object.
+
+        Each group is bounded by `limit`; the preceding state has no age
+        cutoff, for durable states whose validity exceeds the history window.
+        """
+        raise NotImplementedError("event history with preceding state is unavailable")
+
     def latest_type(self, type: str, days: int, limit: int) -> list[dict]:
         """Newest snapshot per object, newest first, bounded by objects.
 

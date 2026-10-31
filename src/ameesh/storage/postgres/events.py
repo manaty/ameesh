@@ -55,6 +55,21 @@ class Events(interface.Events):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
+    def context_type(self, type, days, limit, *, object_prefix) -> list:
+        # One snapshot for the boundary, recent history and its preceding state.
+        # Bound each set independently: recent chatter must not evict old states.
+        return self.db.query(
+            "with boundary as (select now() - make_interval(days => %s::int) as at),"
+            " recent as (select " + _COLUMNS + " from ameesh_events, boundary"
+            " where type = %s and starts_with(object, %s) and created_at > boundary.at"
+            " order by id desc limit %s),"
+            " preceding as (select * from (select distinct on (object) " + _COLUMNS
+            + " from ameesh_events, boundary where type = %s and starts_with(object, %s)"
+            " and created_at <= boundary.at order by object, id desc) states"
+            " order by id desc limit %s)"
+            " select * from recent union all select * from preceding",
+            (int(days), type, object_prefix, int(limit), type, object_prefix, int(limit)))
+
     def latest_type(self, type, days, limit) -> list:
         # Explicit predicate also works with generic prepared plans: a bound
         # `type` alone cannot imply the partial staging-progress index.

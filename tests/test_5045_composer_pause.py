@@ -106,7 +106,7 @@ class CommandTest(bench.CommandTest):
 
 class DurablePauseTest(PgTestCase):
     def old(self, state, *, object="paquet-horaire:ameesh:main", days=400):
-        data = {"state": state, "until": int(time.time() - 399 * 86400),
+        data = {"state": state, "until": int(time.time() - (days - 1) * 86400),
                 "await_announcement": True, "reason": "window", "by": "pilot"}
         return int(self.db.query(
             "INSERT INTO ameesh_events (type, object, project, data, created_at)"
@@ -127,6 +127,38 @@ class DurablePauseTest(PgTestCase):
         rows = storage.of(self.db).events.recent_type(
             "packet.pause", None, 10, object="paquet-horaire:ameesh:main")
         self.assertEqual([r["id"] for r in rows], [last])
+
+    def test_slo_clock_waits_beyond_deadline_and_lookback_then_resumes(self):
+        self.old("paused", days=4)
+        now = time.time()
+        windows = packet_pause.windows(self.db, project="ameesh", now=now)
+        self.assertEqual(len(windows), 1)
+        start = windows[0]["start"] + 60
+        equivalent, crossed = packet_pause.suspended_start(
+            start, windows, lambda at: None, now)
+        self.assertEqual(equivalent, now)
+        self.assertIsNotNone(crossed)
+        # Closing a pause that started before the history cutoff still keeps
+        # the whole suspension; time runs only after its sourced announcement.
+        packet_pause.resume(self.db, project="ameesh", target="main", by="pilot",
+                            source="pilot, 31/10, message #173232")
+        later = now + 2400
+        windows = packet_pause.windows(self.db, project="ameesh", now=later)
+        self.assertEqual(len(windows), 1)
+        equivalent, _ = packet_pause.suspended_start(
+            start, windows, lambda at: None, later)
+        self.assertAlmostEqual(equivalent, now, delta=2)
+
+    def test_recent_chatter_and_other_project_do_not_evict_old_pause(self):
+        self.old("paused", days=4)
+        self.old("paused", object="paquet-horaire:other:main", days=4)
+        store = storage.of(self.db).events
+        for _ in range(4):
+            store.record(packet_pause.EVENT, "paquet-horaire:ameesh:develop", "ameesh",
+                         {"state": "resumed"})
+        with mock.patch.object(packet_pause, "WINDOWS_LIMIT", 2):
+            windows = packet_pause.windows(self.db, project="ameesh")
+        self.assertEqual([w["target"] for w in windows], ["main"])
 
     def test_unrelated_older_and_superseded_events_are_pruned(self):
         self.old("paused")

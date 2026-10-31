@@ -41,7 +41,7 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        before staging mutations and at each step (#4880)
   staging.request      queued commit and elected execution attempt; survives
                        the launching turn, reused by candidate takeover (#4880)
-  packet.pause         a bounded pause of the hourly packet tick, or its end
+  packet.pause         a pause with a deadline (alert or automatic end) of the hourly packet tick, or its end
                        (no table: written by `paquet-horaire.py pause|resume`,
                        read by its tick and `role timers --check`, #4361)
 
