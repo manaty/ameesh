@@ -640,7 +640,7 @@ class _ReleaseLease(_AlertsLease):
         return super().renew()
 
 
-def run(cfg, args) -> int:
+def run(cfg, args, *, credentials=()) -> int:
     """The `ameesh role run ROLE -- command` entry point."""
     name = args.role
     host = (getattr(cfg, "host", None) or "").strip()
@@ -836,8 +836,11 @@ def run(cfg, args) -> int:
                                else str(int(report["left_s"]))),
                     ENV_OWNER: str(report.get("owner") or ""),
                 })
-            from .platform.child_environment import execution_transport
+            from .platform.child_environment import execution_transport, grant
             env = execution_transport(env)
+            # Only trusted in-process callers can extend this one spawn; the
+            # public role CLI exposes no credential-grant argument.
+            env = grant(env, env.credentials | frozenset(credentials))
             if lease is not None:
                 code, lost = _run_under_lease(argv, env, lease, execution)
                 if lost:

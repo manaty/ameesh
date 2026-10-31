@@ -1167,6 +1167,14 @@ class ProjectRelease:
             suite_tolerated=tolerated, model=model)
 
 
+def child_credentials(project) -> frozenset[str]:
+    """Credentials needed by the selected release model's guarded child."""
+    if getattr(project, "model", "semver") == "nexlink":
+        from . import nexlink_release
+        return nexlink_release.CHILD_CREDENTIALS
+    return frozenset()
+
+
 def projects(cfg) -> dict[str, ProjectRelease]:
     block = getattr(cfg, "release", None) or {}
     if not isinstance(block, dict):

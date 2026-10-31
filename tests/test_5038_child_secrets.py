@@ -167,7 +167,8 @@ with tempfile.TemporaryDirectory() as root:
 
     def test_mechanical_scripts_receive_transport_but_no_provider_credentials(self):
         env = E.execution_transport(dict(AMEESH_DSN="db", GH_TOKEN="github",
-                                        DEEPSEEK_API_KEY="provider"))
+                                        DEEPSEEK_API_KEY="provider",
+                                        SUPABASE_ACCESS_TOKEN="ledger"))
         self.assertEqual(E.for_child(["python3", "composer.py"], env),
                          dict(AMEESH_DSN="db", GH_TOKEN="github"))
 

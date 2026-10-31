@@ -2,6 +2,8 @@
 """Elected release tick: no standby effects, one execution across candidates."""
 import argparse
 import os
+import subprocess
+import sys
 import types
 import unittest
 from unittest import mock
@@ -41,6 +43,60 @@ class ElectionTest(unittest.TestCase):
         self.assertEqual((args.role, args.pass_name), ('pilot', 'release'))
         self.assertIn('--no-staging', args.command)
         self.assertIn('--project', args.command)
+
+    def test_only_selected_nexlink_release_child_gets_ledger_credential(self):
+        from ameesh.platform import child_environment as E
+        from tests.entrypoint import run as isolated_entrypoint
+        child_code = r'''
+import io, os, tempfile
+from types import SimpleNamespace
+from unittest import mock
+from ameesh import nexlink_release as nx
+expected = __import__('sys').argv[1] == 'yes'
+assert ('SUPABASE_ACCESS_TOKEN' in os.environ) == expected
+assert 'OPENAI_API_KEY' not in os.environ
+assert os.environ['AMEESH_DSN'] == 'synthetic-mesh'
+if expected:
+    def request(req, **kwargs):
+        assert req.get_header('Authorization') == 'Bearer synthetic-ledger'
+        return io.BytesIO(b'[]')
+    with tempfile.TemporaryDirectory() as root, mock.patch.object(nx.urllib.request, 'urlopen', side_effect=request):
+        assert nx.migration_rows(SimpleNamespace(repo=root), next(iter(nx.STAGING_DATABASES)), [{'version': 1}]) == []
+'''
+        # Run through the elected release wrapper and role_run, then spawn a
+        # real interpreter with exactly role_run's environment and the guard.
+        projects = {'nexlink': types.SimpleNamespace(model='nexlink'),
+                    'example': types.SimpleNamespace(model='semver')}
+        for selected, expected in (('nexlink', True), ('example', False),
+                                   (None, True), ('unknown', False)):
+            with self.subTest(project=selected):
+                args = self.args()
+                args.project = selected
+
+                def child(argv, env):
+                    self.assertEqual(argv[:5], [sys.executable, '-m', 'ameesh', 'release', 'tick'])
+                    return subprocess.Popen([sys.executable, '-c', child_code,
+                                             'yes' if expected else 'no'], env=env)
+
+                def run():
+                    E.install()
+                    return release._elected_tick(self.cfg(), args)
+
+                with mock.patch.dict(os.environ, dict(SUPABASE_ACCESS_TOKEN='synthetic-ledger',
+                        OPENAI_API_KEY='synthetic-provider', AMEESH_DSN='synthetic-mesh',
+                        PYTHONPATH=os.path.dirname(os.path.dirname(__file__)) + '/src'), clear=True), \
+                        mock.patch.object(release_cutoff, 'projects', return_value=projects), \
+                        mock.patch.object(role_run.db_mod, 'connect'), \
+                        mock.patch.object(role_run, 'live', return_value=report()), \
+                        mock.patch.object(role_run, '_ReleaseLease') as lease, \
+                        mock.patch.object(role_run, '_AlertsExecution') as execution:
+                    lease.return_value.acquire.return_value = 1
+                    lease.return_value.remaining.return_value = 30
+                    lease.return_value.ttl = 60
+                    execution.return_value.lost.is_set.return_value = False
+                    execution.return_value.start_child.side_effect = child
+                    self.assertEqual(isolated_entrypoint(run), 0)
+                    lease.return_value.release.assert_called_once()
 
     def test_child_requires_live_epoch_gate_before_any_tick(self):
         cfg = self.cfg()
