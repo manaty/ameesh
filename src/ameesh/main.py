@@ -36,6 +36,11 @@
   ameesh ci status <lot> [--limit N] [--json]
         latest CI runs and failing tests of a {work};
   ameesh conflicts [--all] [--json]     conflict radar between {works} (L160b);
+  ameesh context corpus export --out FILE [--days N | --since T] [--harness H]
+        | check FILE
+        read-only replay corpus (`ameesh-context-corpus/1`) rebuilt from the
+        turn ledger and `turn.context` events; written outside the repository,
+        mode 0600 (#5134);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
   ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
@@ -420,6 +425,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L85: the event log of `GET /api/v1/events`
         from . import events
         return events.main(rest)
+    if command == "context" and rest[:1] == ["corpus"]:
+        # #5134 (CTX-05a) : corpus de rejeu, reconstruction en lecture seule.
+        from . import context_corpus
+        return context_corpus.main(rest[1:])
     if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
