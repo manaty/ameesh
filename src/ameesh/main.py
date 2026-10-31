@@ -181,6 +181,8 @@
         les passes CI et issues sont refusées explicitement (§9) ;
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
+  ameesh sandbox list [--agent NAME] [--state STATE] [--scope DIGEST] [--limit N] [--json]
+  ameesh sandbox show TURN_ID [--json]
   ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
         mediated executor API (/api/exec/v1, L108): an executor on a
         device without database access (docs/EXECUTEUR-MEDIEE.md).
@@ -198,8 +200,6 @@
         turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
-  ameesh sandbox list [--agent NAME] [--state STATE] [--scope DIGEST] [--limit N] [--json]
-  ameesh sandbox show TURN_ID [--json]
   ameesh turn current [--local] [--expect-turn ID] [--json]
         read the calling turn; reuse requires its captured turn id;
   ameesh turn observe (--turn ID | --request ID) [--json]
