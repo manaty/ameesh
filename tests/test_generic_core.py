@@ -45,6 +45,18 @@ MODULE_PACKAGES = {p.stem for p in (SOURCE / "modules").iterdir()
                    if ((p.is_dir() and p.name != "__pycache__")
                        or (p.suffix == ".py" and p.stem != "__init__"))
                    and p.stem not in INTERFACES}
+#: L104 T6 (#4414, decision 7 of #4403): the one list of direct module imports
+#: the core keeps. Each entry is a pure `sys.modules` alias of the `dev` module:
+#: old path -> (origin lot, date declared, reason). Their removal is L104b.
+COMPATIBILITY_ALIASES = {
+    "connectors/git_merge.py": ("#4382", "2026-10-29", "importers and patchers of the connector path"),
+    "lot_class.py": ("#4385", "2026-10-29", "importers and patchers of the classification"),
+    "merge_pr.py": ("#4382", "2026-10-29", "importers and patchers of the merge gesture"),
+    "plan_git.py": ("#4383", "2026-10-29", "importers and patchers of the merge plan"),
+    "plan_github.py": ("#4384", "2026-10-29", "importers and patchers of the GitHub plan"),
+    "review.py": ("#4385", "2026-10-29", "importers and patchers of the review policy"),
+    "review_target.py": ("#4385", "2026-10-29", "importers and patchers of the review target"),
+}
 
 
 def _module_implementation(module: str) -> bool:
@@ -131,18 +143,30 @@ def report() -> None:
 
 class GenericCoreTest(unittest.TestCase):
     def test_core_does_not_import_module_implementations(self):
-        # L98 T3 (#4406): the legacy adapters read through the registry.
-        # L100 T1/T2/T4: temporary identity aliases, removed by L104.
-        exceptions = Counter({(name + ".py", "module-import"): 1
-                              for name in ("plan_github", "plan_git", "merge_pr",
-                                           "connectors/git_merge", "review",
-                                           "lot_class", "review_target")})
+        # L98 T3 (#4406) emptied the storage adapters; only declared aliases remain.
+        exceptions = Counter({(path, "module-import"): 1 for path in COMPATIBILITY_ALIASES})
         actual = Counter({key: count for key, count in scan_core().items()
                           if key[1] == "module-import"})
         self.assertFalse(actual - exceptions,
                          "New core module imports; use the registry: %s" % (actual - exceptions))
         self.assertFalse(exceptions - actual,
                          "Remove obsolete module-import exceptions: %s" % (exceptions - actual))
+
+    def test_declared_aliases_are_dated_and_import_nothing_else(self):
+        for path, (lot, declared, reason) in COMPATIBILITY_ALIASES.items():
+            with self.subTest(path=path):
+                self.assertRegex(lot, r"^#\d+$")
+                self.assertRegex(declared, r"^\d{4}-\d{2}-\d{2}$")
+                self.assertTrue(reason)
+                body = ast.parse((SOURCE / path).read_text()).body
+                self.assertEqual(
+                    [type(node) for node in body if not (
+                        isinstance(node, ast.Expr)
+                        or (isinstance(node, ast.ImportFrom) and node.module == "__future__"))],
+                    [ast.Import, ast.ImportFrom, ast.Assign], "not a pure alias")
+                self.assertEqual(body[-1].targets[0].value.value.id, "sys")
+                implementation = SOURCE / "modules" / "dev" / Path(path).name
+                self.assertTrue(implementation.is_file())
 
     def test_scanner_distinguishes_docs_from_executable_vocabulary(self):
         counts = scan_python('"""github worktree"""\n# pnpm\n'

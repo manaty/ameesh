@@ -3,7 +3,8 @@
 
 The `git-merge` action connector moved to the development module; the two
 names resolve to the same module object, so importers and patchers of the old
-path keep working unchanged. L104 removes this alias.
+path keep working unchanged. Retained compatibility
+alias, declared and dated in tests/test_generic_core.py (L104 T6).
 """
 from __future__ import annotations
 

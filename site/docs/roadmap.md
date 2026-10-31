@@ -309,5 +309,6 @@ See [Core and modules](concepts/core-and-modules.md),
 [Write a module](guides/write-a-module.md),
 [Write a Pipeline](guides/write-a-pipeline.md), and the
 [configuration reference](reference/configuration.md#modules-and-workspace-policy-in-the-canon).
-These pages describe the implemented surface; they do not claim that the
-remaining boundary-closure work of L104 is complete.
+The boundary is closed (L104): the core imports no module implementation apart
+from a declared, dated list of compatibility aliases, and a new canon starts
+without any project module.
