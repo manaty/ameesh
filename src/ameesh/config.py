@@ -35,6 +35,7 @@ outils v0 qui tournent en production sur ce PC.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import socket
@@ -75,6 +76,12 @@ def _as_float(value, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_reserve(value, default: float) -> float:
+    """Réserve de fenêtre en jetons (CTX-04b) ; non finie : non déclarée."""
+    reserve = _as_float(value, default)
+    return reserve if math.isfinite(reserve) else default
 
 
 def _as_bounded_positive(value, default):
@@ -355,6 +362,15 @@ class Config:
     #: pourcentage de `W`. 0 = éteint (défaut), mode legacy inchangé.
     turn_reread_budget: float = 0.0
     session_reread_budget: float = 0.0
+    #: CTX-04b (#4971) : entretien de fenêtre qualifié, opt-in. Part de `W` à
+    #: partir de laquelle `C_next` (ou `C_next_input` sur `W - O_reserve_next`)
+    #: est « proche » ; 0 = éteint (défaut), mode legacy inchangé. Les réserves
+    #: se déclarent en jetons : `input` couvre `G_consigne`, `G_protocole_outils`
+    #: et `M_harnais`, `output` est `O_reserve_next`. Négative = non déclarée :
+    #: la projection reste inconnue, aucune valeur n'est supposée (§2.3, §7.4).
+    window_maintenance_share: float = 0.0
+    window_input_reserve: float = -1.0
+    window_output_reserve: float = -1.0
     #: L105 : durée maximale d'un tour d'agent mené (secondes). Au-delà, le
     #: tour se clôt au prochain point sûr (fin de l'appel d'outil en cours) et
     #: le travail reprend au tour suivant, dans la même session ; réglable par
@@ -1140,6 +1156,12 @@ def load(env: dict | None = None) -> Config:
                                               cfg.turn_reread_budget)),
         session_reread_budget=max(0.0, _as_float(pick("AMEESH_SESSION_REREAD_BUDGET"),
                                                  cfg.session_reread_budget)),
+        window_maintenance_share=min(1.0, max(0.0, _as_float(
+            pick("AMEESH_WINDOW_MAINTENANCE_SHARE"), cfg.window_maintenance_share))),
+        window_input_reserve=_as_reserve(pick("AMEESH_WINDOW_INPUT_RESERVE"),
+                                         cfg.window_input_reserve),
+        window_output_reserve=_as_reserve(pick("AMEESH_WINDOW_OUTPUT_RESERVE"),
+                                          cfg.window_output_reserve),
         turn_max_seconds=max(0.0, _as_float(pick("AMEESH_TURN_MAX_SECONDS"),
                                             cfg.turn_max_seconds)),
         turn_mail_max=_as_count(pick("AMEESH_TURN_MAIL_MAX"), cfg.turn_mail_max),

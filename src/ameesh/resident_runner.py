@@ -80,6 +80,12 @@ QUIET_S = 120.0
 COMPACT = "compact"
 #: the message that asks Claude Code for a native compaction (study §6.2)
 COMPACT_COMMAND = "/compact"
+#: CTX-04b (#4971) : renouvellement de session d'un entretien de fenêtre, quand
+#: le compactage demandé n'a pas ramené la projection sous le seuil
+WINDOW_RENEW = "window_renew"
+#: contrat §4.1 : seul Claude résident reçoit une compaction demandée par
+#: Ameesh ; ailleurs le support ou le contrôle ne sont pas établis
+NATIVE_COMPACT_HARNESSES = ("claude",)
 #: the session's cumulative re-read passed its threshold (study §6.2): this
 #: rotation waits for a quiet moment, unlike the hard L60 ceiling
 ALERT = "reread-alert"
@@ -176,6 +182,44 @@ def maintenance(*, context: int | None, window: int | None, reread: int,
             return ""
         return COMPACT
     return ""
+
+
+def window_maintenance(*, c_last: int | None, o_last: int | None, window: int | None,
+                       share: float, input_reserve: float, output_reserve: float,
+                       compact_supported: bool, compact_tried: bool = False) -> dict:
+    """CTX-04b : l'entretien de fenêtre qualifié (contrat §2.3, §5.1 point 3).
+
+    Rend la projection, ce qu'elle décide (`COMPACT`, `WINDOW_RENEW` ou '') et
+    les inconnues qui empêchent de décider, nommées (§7.4). `W` ou un terme
+    absent : aucune décision, jamais un zéro ni une valeur supposée. Un budget
+    cumulé (`R_turn`, `R_session`) n'entre pas ici. Le plafond dur et les gardes
+    se jugent avant et hors de cette fonction.
+    """
+    entree_declaree, sortie_declaree = input_reserve >= 0, output_reserve >= 0
+    inconnues = [nom for nom, connu in (
+        ("C_last", c_last is not None), ("O_last", o_last is not None),
+        ("W", window is not None), ("G_input_reserve", entree_declaree),
+        ("O_reserve_next", sortie_declaree)) if not connu]
+    c_next_input = (int(c_last + o_last + input_reserve)
+                    if c_last is not None and o_last is not None and entree_declaree
+                    else None)
+    c_next = (int(c_next_input + output_reserve)
+              if c_next_input is not None and sortie_declaree else None)
+    proche = None
+    if c_next is not None and window is not None:
+        proche = (c_next >= share * window
+                  or c_next_input >= share * (window - output_reserve))
+    decision = ""
+    if proche:
+        if not compact_supported:
+            inconnues.append("native_compaction")
+        else:
+            decision = WINDOW_RENEW if compact_tried else COMPACT
+    return {"C_last": c_last, "O_last": o_last, "W": window,
+            "C_next_input": c_next_input, "C_next": c_next,
+            "O_reserve_next": int(output_reserve) if sortie_declaree else None,
+            "share": share, "near": proche, "decision": decision,
+            "unknowns": inconnues}
 
 
 def _binary_stamp(path: str) -> tuple:
@@ -394,6 +438,11 @@ class ResidentProcess:
         self.compact_pre: int | None = None
         self.compact_post: int | None = None
         self.last_compact = 0.0
+        #: CTX-04b : la fenêtre du profil observé (modèle effectif, R1), jamais
+        #: `context_window` qui peut venir d'un auxiliaire ; et une compaction
+        #: demandée que la projection n'a pas encore vue retomber sous le seuil
+        self.profile_window: int | None = None
+        self.window_compact_tried = False
         #: its `turn_resources` row (under `life_id`) is open
         self.resource_open = False
         #: a close is under way (`AgentWorker._close_resident`)
@@ -445,6 +494,9 @@ class ResidentProcess:
         window = usage.get("context_window")
         if window:
             self.context_window = int(window)
+        profil = getattr(result, "profile", None)
+        self.profile_window = (profil or {}).get("window_tokens") \
+            if isinstance(profil, dict) else None
         self.last_reread = turn_reread(usage)
         self.session_reread += self.last_reread
         compact = getattr(result, "compact", None)
@@ -459,6 +511,7 @@ class ResidentProcess:
         """L81 (étude §6.2) : une compaction native vient d'être demandée — le
         délai de reprise court, qu'elle aboutisse ou non (pas de boucle)."""
         self.last_compact = time.monotonic()
+        self.window_compact_tried = True
 
     def maintenance_due(self, *, cap: float = 0, reread_max: float = 0,
                         share: float = COMPACT_SHARE,

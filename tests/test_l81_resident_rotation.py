@@ -195,8 +195,8 @@ class ResidentMeasurementTest(unittest.TestCase):
         self.assertEqual(rp.maintenance_due(), "")
 
 
-class ResidentRotationTest(PgTestCase):
-    """The rotation itself: measured between two turns, when quiet."""
+class ResidentBench(PgTestCase):
+    """A worker over the fake resident harness, between two turns."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -252,6 +252,10 @@ class ResidentRotationTest(PgTestCase):
     def _states(self, name: str = "res81") -> list[str]:
         page = conversation.history(self.db, name, limit=100)
         return [e["text"] for e in page["entries"] if e["kind"] == "state"]
+
+
+class ResidentRotationTest(ResidentBench):
+    """The rotation itself: measured between two turns, when quiet."""
 
     def test_cumulative_reread_rotates_between_two_turns(self):
         _runner, worker = self._worker(resident_reread_max="100")
