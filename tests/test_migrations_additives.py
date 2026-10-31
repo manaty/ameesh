@@ -122,6 +122,12 @@ class NonAdditiveTest(unittest.TestCase):
             ('select 1 as "create table t "; revoke insert on t from app;', "revoke on t"),
             ('create table "T" (id bigint); alter table "t" add unique (id);', "add unique"),
             ('select 1 as "create table t "; alter table t add unique (c);', "add unique"),
+            # B cx1 : ni un `;` de chaîne $$, ni le corps d'un DO ne cachent la contrainte
+            ("alter table t add column d text default $$;$$, add unique (c);", "add unique"),
+            ("alter table t add column d text default $s$;$s$, add constraint k unique (c);",
+             "add constraint k"),
+            ("create table n (id int); do $$ begin alter table n add column x int;"
+             " alter table t add unique (c); end $$;", "add unique"),
         ):
             with self.subTest(sql=sql):
                 reasons = migrations.non_additive(_migration(sql))
