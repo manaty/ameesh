@@ -227,7 +227,14 @@ time.sleep(30)
         script = """
 from unittest import mock
 from ameesh import main
-with mock.patch.object(main, '_dispatch', return_value=0):
+import subprocess,sys
+from ameesh.platform.child_environment import execution_transport
+def dispatch(*args):
+    env = execution_transport(dict(DEEPSEEK_API_KEY='provider',GH_TOKEN='transport'))
+    subprocess.run([sys.executable,'-c',
+        \"import os; assert 'DEEPSEEK_API_KEY' not in os.environ; assert os.environ['GH_TOKEN']=='transport'\"], env=env, check=True)
+    return 0
+with mock.patch.object(main, '_dispatch', side_effect=dispatch):
     assert main.main(['version']) == 0
 """
         # Main CLI used to harden before dispatch. Observe from a same-uid peer.

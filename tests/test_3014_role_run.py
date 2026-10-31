@@ -127,6 +127,21 @@ class RoleRunGuardTest(PgTestCase):
                             (key + "%",))
 
     # -- wrapper ------------------------------------------------------------
+    def test_main_filters_provider_keys_from_the_real_role_child(self):
+        import subprocess
+        self.lease(epoch=11)
+        with tempfile.TemporaryDirectory() as folder:
+            marker = os.path.join(folder, "credentials")
+            command = ["python3", "-c", "import json,os,pathlib; pathlib.Path(%r).write_text(str((os.environ.get('DEEPSEEK_API_KEY'),os.environ.get('GH_TOKEN'))))" % marker]
+            with mock.patch.object(role_run.config_mod, "load", return_value=self._cfg()), \
+                    mock.patch.object(role_run.db_mod, "connect", return_value=_Conn(self.db)), \
+                    mock.patch.dict(os.environ, DEEPSEEK_API_KEY="provider", GH_TOKEN="transport"), \
+                    mock.patch.object(subprocess.Popen, "__init__", subprocess.Popen.__init__):
+                code = role_run.main([NAME, "--", *command])
+            self.assertEqual(code, 0)
+            with open(marker) as source:
+                self.assertEqual(source.read(), "(None, 'transport')")
+
     def test_holder_runs_the_command_with_the_fencing_environment(self):
         self.lease(epoch=11)
         with tempfile.TemporaryDirectory() as folder:

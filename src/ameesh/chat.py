@@ -1567,6 +1567,8 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .platform.child_environment import install
+    install()
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     cfg = config_mod.load()
     if args.consigne:

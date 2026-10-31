@@ -2445,6 +2445,8 @@ def _cmd_report(cfg: Config, args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .platform.child_environment import install
+    install()
     parser = build_parser()
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     if not getattr(args, "command", None):

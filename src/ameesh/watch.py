@@ -996,6 +996,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .platform.child_environment import install
+    install()
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     if getattr(args, "agent", None) and not NAME_RE.match(args.agent):
         print("error: invalid agent name: %r" % args.agent, file=sys.stderr)

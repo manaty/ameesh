@@ -1157,6 +1157,8 @@ def load_verifier(spec: str) -> TokenVerifier:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .platform.child_environment import install
+    install()
     parser = argparse.ArgumentParser(prog="python -m ameesh.relay",
                                      description="Relais de modèle du serveur du mesh (L111).")
     sub = parser.add_subparsers(dest="cmd", required=True)
