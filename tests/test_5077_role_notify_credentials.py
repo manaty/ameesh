@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import nexlink_alerts, role_run
+from ameesh import nexlink_alerts, notify, role_run
 from ameesh.platform import child_environment as E
 
 
@@ -42,6 +42,49 @@ class RoleNotifyCredentialsTest(unittest.TestCase):
             for raw in ({"default": ["slack"]},
                         {"routes": {"human:test": ["slack"]}}):
                 self.assertEqual(E.notify_credentials(raw), {"AMEESH_SLACK_WEBHOOK"})
+
+    def test_implicit_slack_reads_routes_like_parse_config(self):
+        """#5083: comma-separated routes and null channels, as `parse_config` reads them."""
+        source = dict(AMEESH_SLACK_WEBHOOK="slack", GH_TOKEN="github")
+        for raw in ({"default": "desktop, slack"},
+                    {"routes": {"human:test": "slack,desktop"}, "channels": None},
+                    {"routes": None, "default": ["slack"], "channels": None},
+                    {"channels": {"slack": None}},
+                    {"channels": {"slack": {"type": None}}}):
+            with self.subTest(raw=raw), \
+                    mock.patch.object(E, "DECLARED_CREDENTIALS", set()):
+                notify.parse_config(raw)
+                self.assertEqual(E.notify_credentials(raw), {"AMEESH_SLACK_WEBHOOK"})
+                # declared: an ordinary child never receives the webhook
+                self.assertEqual(set(E.for_child([sys.executable], source)), set())
+                granted = E.role_transport(source, ["ameesh", "notify", "--once"], raw)
+                self.assertEqual(set(E.for_child([sys.executable], granted)),
+                                 {"AMEESH_SLACK_WEBHOOK", "GH_TOKEN"})
+
+    def test_invalid_variable_name_is_never_declared(self):
+        """#5083: `notify._channel` refuses the name; nothing is declared before."""
+        raw = {"channels": {"push": {"type": "ntfy", "token_env": "BAD NAME"},
+                            "slack": {"webhook_env": "1BAD"}}}
+        with mock.patch.object(E, "DECLARED_CREDENTIALS", set()):
+            self.assertEqual(E.notify_credentials(raw), frozenset())
+            self.assertEqual(E.DECLARED_CREDENTIALS, set())
+        self.assertIs(notify.DEFAULT_SLACK_ENV, E.DEFAULT_SLACK_ENV)
+
+    def test_once_hides_its_environment_or_refuses(self):
+        """#5083: the role's `notify --once` holds the granted secrets."""
+        from ameesh.platform import process
+        # In-process main() must not guard the suite's own Popen: later tests
+        # would lose AMEESH_DSN in their children (paquet h-20261031-18).
+        original = subprocess.Popen.__init__
+        with mock.patch.object(E, "install") as install, \
+                mock.patch.object(process, "become_undumpable",
+                                  side_effect=OSError(1, "refused")) as hide, \
+                mock.patch.object(notify.config_mod, "load") as load:
+            self.assertEqual(notify.main(["--once"]), 1)
+        install.assert_called_once_with()
+        hide.assert_called_once_with()
+        load.assert_not_called()
+        self.assertIs(subprocess.Popen.__init__, original)
 
     def test_role_child_sends_signed_primary_request_with_filter_active(self):
         requests = []
