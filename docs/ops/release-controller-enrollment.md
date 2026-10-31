@@ -369,16 +369,22 @@ superutilisateur. Le provisionneur écrit exactement ces trois lignes pg_hba
 
 ```text
 local all ameesh-restore peer
-local all <rôle administrateur> peer map=<carte root>
+local all release_restore_admin peer map=release_admin
 local all <rôle de restauration> scram-sha-256
 ```
 
 pg_ident contient une seule correspondance explicite :
-`<carte root> root <rôle administrateur>`, sans regex ni autre entrée.
-Les noms du rôle administrateur et de la carte sont ceux du provisionnement.
+`release_admin root release_restore_admin`, sans regex ni autre entrée.
+Ces noms sont ceux du provisionnement #5165 (cx3, 31/10, #176490).
+Le DSN administratif est
+`host=/run/ameesh-release-restore dbname=postgres user=release_restore_admin`,
+sans port ni mot de passe. Le rôle SQL administrateur est distinct de
+`ameesh-restore`, afin que la première ligne peer de la sonde ne masque pas
+le mapping root.
 Toutes les bases sont nécessaires aux restaurations dans des bases aléatoires.
 Aucune ligne host, hostssl ou hostnossl, ni autre ligne local, n'est configurée.
-Le rôle de restauration vient de l'entrée privée.
+Le rôle de restauration vient de l'entrée privée et doit correspondre au
+paramètre obligatoire `--restore-role` de l'installateur #5165.
 Son provisionnement et le producteur de
 `restore_capacity` relèvent du lot compagnon #5165 : la mesure doit être faite
 sur le volume PostgreSQL cible ; les octets libres d'agents-3 ne prouvent pas
