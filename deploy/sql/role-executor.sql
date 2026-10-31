@@ -81,6 +81,13 @@ SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM %I', :'schema', name,
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.review_catch_up FROM %I',
               :'schema', :'role')
  WHERE to_regclass(format('%I.review_catch_up', :'schema')) IS NOT NULL \gexec
+-- #4995: signed replacement events are append-only evidence. A delegated
+-- answer may run under the executor role, so it keeps SELECT and INSERT (the
+-- decision cycle appends one event), never UPDATE nor DELETE; the append-only
+-- triggers of migration 0527 refuse an accidental rewrite grant as well.
+SELECT format('REVOKE UPDATE, DELETE ON %I.decision_supersessions FROM %I',
+              :'schema', :'role')
+ WHERE to_regclass(format('%I.decision_supersessions', :'schema')) IS NOT NULL \gexec
 -- #326 r4: the key journal's order is the server's; no setval on its ids
 SELECT format('REVOKE UPDATE ON SEQUENCE %I.key_events_id_seq FROM %I', :'schema', :'role')
  WHERE to_regclass(format('%I.key_events_id_seq', :'schema')) IS NOT NULL \gexec
@@ -176,6 +183,25 @@ BEGIN
                     END IF;
                 END LOOP;
             END LOOP;
+            -- #4995: an inherited parent must not lend a right to rewrite or
+            -- erase the signed replacement log (INSERT stays the append path).
+            FOR item IN SELECT c.oid, c.relname FROM pg_class c
+                         JOIN pg_namespace n ON n.oid = c.relnamespace
+                         WHERE n.nspname = s AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                           AND c.relname = 'decision_supersessions' LOOP
+                FOREACH privilege IN ARRAY ARRAY['UPDATE', 'DELETE'] LOOP
+                    IF has_table_privilege(parent.oid, item.oid, privilege) THEN
+                        violations := violations || format('forbidden %s on %s through %s',
+                                                           privilege, item.relname,
+                                                           parent.rolname);
+                    END IF;
+                END LOOP;
+                IF has_any_column_privilege(parent.oid, item.oid, 'UPDATE') THEN
+                    violations := violations || format(
+                        'forbidden UPDATE on a column of %s through %s',
+                        item.relname, parent.rolname);
+                END IF;
+            END LOOP;
         END IF;
         IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = s AND pg_has_role(parent.oid, c.relowner, 'MEMBER'))
@@ -216,6 +242,22 @@ BEGIN
                     violations := violations || format('missing %s on sequence %s', privilege, item.relname);
                 END IF;
             END LOOP;
+        ELSIF item.relname = 'decision_supersessions' THEN
+            -- #4995: append-only for an executor: read and append, never
+            -- rewrite nor erase.
+            FOREACH privilege IN ARRAY ARRAY['SELECT', 'INSERT'] LOOP
+                IF NOT has_table_privilege(r, item.oid, privilege) THEN
+                    violations := violations || format('missing %s on %s', privilege, item.relname);
+                END IF;
+            END LOOP;
+            FOREACH privilege IN ARRAY ARRAY['UPDATE', 'DELETE'] LOOP
+                IF has_table_privilege(r, item.oid, privilege) THEN
+                    violations := violations || format('forbidden %s on %s', privilege, item.relname);
+                END IF;
+            END LOOP;
+            IF has_any_column_privilege(r, item.oid, 'UPDATE') THEN
+                violations := violations || format('forbidden UPDATE on a column of %s', item.relname);
+            END IF;
         ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts','review_catch_up') THEN
             IF NOT has_table_privilege(r, item.oid, 'SELECT') THEN
                 violations := violations || format('missing SELECT on %s', item.relname);

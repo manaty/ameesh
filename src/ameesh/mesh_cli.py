@@ -2333,11 +2333,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(('no %s') % v.plural)
                 return 0
             now = time.time()
-            print("%-5s %-10s %-14s %-12s %-10s %-12s %-12s %s" % (
-                "ID", "TYPE", "STATE", "ASSIGNEE", "UPDATED", "DELAY", "EPIC", "TITLE"))
+            # #4621 : la phase de livraison (`legacy_state`) distingue un lot
+            # fusionné d'un lot promu, tous deux `state=delivered` depuis
+            # 0518. Colonne vide quand la phase est le core lui-même.
+            print("%-5s %-10s %-14s %-9s %-12s %-10s %-12s %-12s %s" % (
+                "ID", "TYPE", "STATE", "PHASE", "ASSIGNEE", "UPDATED", "DELAY", "EPIC", "TITLE"))
             for row in rows:
-                print("%-5d %-10s %-14s %-12s %-10s %-12s %-12s %s" % (
-                    row["id"], row["type"], row["state"], (row.get("assignee") or "—")[:12],
+                phase = work_lifecycle.phase(row)
+                print("%-5d %-10s %-14s %-9s %-12s %-10s %-12s %-12s %s" % (
+                    row["id"], row["type"], row["state"],
+                    phase if phase != row["state"] else "—",
+                    (row.get("assignee") or "—")[:12],
                     _fmt_age(now - float(row.get("updated_ts") or 0)),
                     _delays_cell(row.get("delays"), now), (row.get("epic") or "—")[:12],
                     row["title"][:60]))
@@ -2373,6 +2379,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             print("type     : %-10s state: %-14s lifecycle: %-14s assignee: %s" % (
                 item["type"], item["state"], item["lifecycle"],
                 item.get("assignee") or "—"))
+            # #4621 : `state` est le core `delivered` ; `phase` porte la
+            # compatibilité (`merged`/`promoted`) que `legacy_state` conserve.
+            phase = work_lifecycle.phase(item)
+            if phase != item["state"]:
+                print("phase    : %s (delivery stage)" % phase)
             if item.get("external_executor"):
                 print("executor : %s (external, reserved; not assignable)" % (
                     item["external_executor"]))

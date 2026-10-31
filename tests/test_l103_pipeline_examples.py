@@ -24,9 +24,10 @@ from unittest import mock
 
 from tests.support import PgTestCase
 from ameesh import canon, modules, pipeline_cli, process_card, process_projection
-from ameesh import process_registry, work
+from ameesh import process_registry, process_workflow, work
 from ameesh.modules import registry
 from ameesh.modules.storage import ModuleStore
+from ameesh.db import DbError
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_CANON = ROOT / "examples" / "canon"
@@ -41,6 +42,20 @@ def copie_canon(destination: Path) -> Path:
     shutil.copytree(EXAMPLE_CANON, destination)
     shutil.copytree(EXAMPLES, destination / "pipelines")
     return destination
+
+
+#: The activation a reader writes (guide, section 5): each card for its
+#: project, and the built-in `work-types` module for support's non-code types.
+FEDERATION = """\
+members: []
+extensions:
+  ameesh:
+    projects:
+      acme:
+        modules: [acme-work-delivery]
+      support:
+        modules: [support-work-delivery, work-types]
+"""
 
 
 def sans_bloc(texte: str, cle: str = "pipeline") -> str:
@@ -130,6 +145,32 @@ class PipelineExamplesCanonTest(unittest.TestCase):
         self.assertIn("\nworkflow:\n", PROCESS_WITNESS.read_text(encoding="utf-8"))
 
 
+class WorkTypesModuleTest(unittest.TestCase):
+    """#5001: the built-in module of the non-code types, inactive by default."""
+
+    def test_it_declares_the_installable_types_beyond_bug_and_evolution(self):
+        from ameesh.modules import work_types
+        self.assertEqual(work_types.TYPES, tuple(
+            kind for kind in process_workflow.SUPPORTED_TYPES
+            if kind not in ("bug", "evolution")))
+        self.assertEqual(work_types.descriptor(),
+                         {"types": list(work_types.TYPES), "schemas": {}, "rules": []})
+        with self.assertRaisesRegex(ValueError, "unknown work-types module option"):
+            work_types.descriptor({"strict": True})
+
+    def test_it_is_built_in_but_active_only_where_selected(self):
+        found = registry.discover()
+        self.assertEqual(found.get("work-types").source, "builtin")
+        self.assertNotIn("work-types", modules.always_active())
+        loaded = canon.Canon(root=".", readable=True, id="test", federation={
+            "extensions": {"ameesh": {"projects": {
+                "support": {"modules": ["work-types"]},
+                "acme": {"modules": ["it"]}}}}})
+        self.assertEqual(sorted((row["project"], row["module"])
+                                for row in modules.declarations(loaded.federation, loaded)),
+                         [("acme", "it"), ("support", "work-types")])
+
+
 class PipelineExamplesEndToEndTest(PgTestCase):
     """Adopt, drive and project both shipped cards on a real PostgreSQL."""
 
@@ -145,6 +186,7 @@ class PipelineExamplesEndToEndTest(PgTestCase):
         self.db.execute("TRUNCATE project_modules CASCADE")
         self.repo = Path(self.tmp) / ("exemples-%s" % os.urandom(4).hex())
         copie_canon(self.repo)
+        (self.repo / "federation.yaml").write_text(FEDERATION, encoding="utf-8")
         self.git("init", "-q")
         self.git("add", ".")
         self.git("-c", "user.name=test", "-c", "user.email=test@example.org",
@@ -161,18 +203,10 @@ class PipelineExamplesEndToEndTest(PgTestCase):
         self.support = found[SUPPORT]
         self.db.execute("INSERT INTO agent_registry (name, status) "
                         "VALUES ('author', 'idle')")
-        # A declarative module stores no work item type: the types covered by
-        # the card are admitted by the project's installed modules. The test
-        # stands a non-development module in for support's four types.
-        ModuleStore(self.db).replace("", [
-            {"project": "acme", "module": ACME, "types": [], "schemas": {}, "rules": []},
-            {"project": "support", "module": SUPPORT, "types": [],
-             "schemas": {}, "rules": []},
-            {"project": "support", "module": "support-types",
-             "types": ["docs", "investigation", "governance-tracking",
-                       "human_operation"],
-             "schemas": {}, "rules": []},
-        ])
+        # A declarative module stores no work item type: support's four types
+        # come from the built-in `work-types` module (#5001), activated with
+        # the card in the canon and applied by the normal `canon sync` step.
+        modules.sync(self.db, self.loaded)
         self.acme_lot = self.lot("acme delivery", "evolution", "acme")
         self.support_lot = self.lot("customer request", "docs", "support")
 
@@ -263,6 +297,28 @@ class PipelineExamplesEndToEndTest(PgTestCase):
                          ("closed", "completed", "Sent", "promoted"))
         self.assertEqual(process_registry.registry_state(
             self.db, self.support_lot).receipts, 6)
+
+    def test_the_canon_activates_work_types_for_support_only(self):
+        stored = {(row["project"], row["module"]): row["types"]
+                  for row in ModuleStore(self.db).stored()}
+        self.assertEqual(sorted(stored), [("acme", ACME), ("support", SUPPORT),
+                                          ("support", "work-types")])
+        self.assertEqual(stored[("support", "work-types")],
+                         ["docs", "investigation", "governance-tracking",
+                          "promotion", "human_operation"])
+        lot = work.add(self.db, title="answer a customer", type="docs",
+                       app="support", actor="author")
+        self.assertEqual(work.get(self.db, lot["id"])["type"], "docs")
+
+    def test_a_project_without_work_types_refuses_a_docs_lot(self):
+        with self.assertRaisesRegex(work.WorkError, "unknown type 'docs' for "
+                                                    "project 'acme'"):
+            work.add(self.db, title="write the manual", type="docs", app="acme",
+                     actor="author")
+        # the SQL guard is unchanged: the same refusal below the API
+        with self.assertRaisesRegex(DbError, "AMEESH_MODULE_RULE: work item type "
+                                             "docs has no active module in project acme"):
+            self.lot("write the manual", "docs", "acme")
 
     def test_adoption_refuses_a_module_that_the_project_did_not_activate(self):
         self.db.execute("DELETE FROM project_modules WHERE project = 'acme'")

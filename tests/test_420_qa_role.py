@@ -542,8 +542,10 @@ class QaEvidenceTest(PgTestCase):
         with self.db.transaction() as tx:
             ModuleStore(tx).replace("", modules.declarations(federation(require_qa=["promoted"])))
         findings = [f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")]
+        # #4621 : `lot_state` nomme la phase de policy (`promoted`), pas le
+        # core `delivered` que 0518 partage entre merged et promoted.
         self.assertEqual([(f["rule"], f["lot"], f["lot_state"]) for f in findings],
-                         [("missing_qa", self.lot, "delivered")])
+                         [("missing_qa", self.lot, "promoted")])
         self.qa()
         self.assertEqual([f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")],
                          [])

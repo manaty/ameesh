@@ -10,6 +10,12 @@ mécanique, ce que l'outillage exécute sans agent :
   distincte des coupures de release ; bloc absent = aucune cadence, tuple vide
   explicite et `last_packet`/`next_packet` refusés, jamais un repli sur
   `cutoffs` ni sur une durée locale (#1757) ;
+- `auto_take.excluded_families`, `expire` (#5005, bloc optionnel) : familles
+  exclues des prises lot/backlog et transferts build de pause budget jusqu’à
+  la date ISO incluse (fuseau du canon),
+  sans fermer les propositions de relecture/correction ; absent ou expiré :
+  aucune exclusion ; canon illisible : passage arrêté à la première prise
+  tentée, comme le plafond §4.
 - `build.max_in_build` : le plafond de lots en développement par agent ;
 - `ci.packet`, `ci.incident_label`, `ci.environment_red`, `ci.faulty_lot` :
   une suite par paquet, l'étiquette qui autorise exceptionnellement la CI d'un
@@ -108,7 +114,7 @@ _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
                   "merge", "prevalidation", "backlog", "staging", "accounts",
-                  "paquet", "packet_tests", "file", "session", "projects")
+                  "paquet", "packet_tests", "file", "session", "auto_take", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production")
 _PRODUCTION_KEYS = ("branch",)
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
@@ -138,6 +144,8 @@ _PACKET_TESTS_KEYS = ("unit_timeout_seconds", "parallel", "total_timeout_seconds
 _PACKET_TESTS_OPTIONAL = ("total_timeout_seconds",)
 #: #3256 A : clés du bloc optionnel `file` (déclencheur du lot de découpage)
 _FILE_KEYS = ("repos_part", "repos_s", "wake_mail_s")
+#: #5005 : routage temporaire des prises automatiques.
+_AUTO_TAKE_KEYS = ("excluded_families", "expire")
 #: #4448 : clés du bloc optionnel `session` (rotation par harnais)
 _SESSION_KEYS = ("max_tokens", "max_tokens_by_harness")
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
@@ -336,6 +344,18 @@ class QueueFill:
 
 
 @dataclass(frozen=True)
+class AutoTake:
+    """#5005 : exclusion temporaire des prises lot/backlog, pas des avis."""
+
+    excluded_families: tuple[str, ...]
+    expire: date
+
+    def to_dict(self) -> dict:
+        return {"excluded_families": list(self.excluded_families),
+                "expire": self.expire.isoformat()}
+
+
+@dataclass(frozen=True)
 class Document:
     """Le document global compilé et validé, sans politique de revue."""
 
@@ -374,6 +394,14 @@ class Document:
     queue_fill: QueueFill | None = None
     #: #4448 : seuil de rotation de session par harnais ; None = bloc absent
     session: Session | None = None
+    auto_take: AutoTake | None = None
+
+    def auto_take_excluded_families(self, now: float) -> tuple[str, ...]:
+        """La date d'expiration est incluse, dans le fuseau du canon."""
+        if self.auto_take is None:
+            return ()
+        today = datetime.fromtimestamp(now, ZoneInfo(self.timezone)).date()
+        return self.auto_take.excluded_families if today <= self.auto_take.expire else ()
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
@@ -442,6 +470,8 @@ class Document:
         if self.session is not None:
             # absent, la clé n'existe pas : un document sans bloc compile à l'identique
             payload["session"] = self.session.to_dict()
+        if self.auto_take is not None:
+            payload["auto_take"] = self.auto_take.to_dict()
         return payload
 
 
@@ -1046,6 +1076,24 @@ def _queue_fill(value, where: str) -> QueueFill:
                                   if wake is not None else None))
 
 
+def _auto_take(value, where: str, families: tuple[str, ...]) -> AutoTake:
+    data = _mapping(value, where, _AUTO_TAKE_KEYS)
+    excluded = data.get("excluded_families")
+    if not isinstance(excluded, list):
+        raise MechanicsError("%s.excluded_families: a list is required" % where)
+    names = _families(excluded, where + ".excluded_families") if excluded else ()
+    if any(name not in families for name in names):
+        raise MechanicsError("%s.excluded_families: unknown family" % where)
+    expiry = data.get("expire")
+    if not isinstance(expiry, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", expiry):
+        raise MechanicsError("%s.expire: an ISO date YYYY-MM-DD is required" % where)
+    try:
+        end = date.fromisoformat(expiry)
+    except ValueError as exc:
+        raise MechanicsError("%s.expire: invalid date" % where) from exc
+    return AutoTake(names, end)
+
+
 def compile_document(text: str, *, source: str = PATH) -> Document:
     """Compile le document global. Strict : toute règle manquante ou inconnue refuse."""
     try:
@@ -1122,6 +1170,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                       if "packet_tests" in parsed else None),
         queue_fill=(_queue_fill(parsed["file"], source + ".file")
                     if "file" in parsed else None),
+        auto_take=(_auto_take(parsed["auto_take"], source + ".auto_take", families)
+                   if "auto_take" in parsed else None),
         session=(_session(parsed["session"], source + ".session", families)
                  if "session" in parsed else None),
     )

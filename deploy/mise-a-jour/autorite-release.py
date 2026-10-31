@@ -95,7 +95,7 @@ class SignedDecisionAuthority:
     def _current(self, view):
         self.denial_reason = None
         try:
-            decisions.require_current(view)
+            decisions.require_current(self.db, view)
         except decisions.DecisionError as error:
             self.denial_reason = str(error)
             return False
