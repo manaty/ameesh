@@ -62,7 +62,9 @@ class WorkFootprints(abc.ABC):
     @abc.abstractmethod
     def record_analysis(self, item_id: int, analysis: dict, *, actor: str) -> dict | None:
         """Écrit la dernière analyse d'impact du lot et sa ligne de journal
-        (`analysis["note"]`) dans une transaction. None si le lot n'existe pas."""
+        (`analysis["note"]`) dans une transaction ; une reprise au même
+        résultat (statut, raison, chemins, devinettes, politique) ne journalise
+        rien (#5063) : `logged` le dit. None si le lot n'existe pas."""
 
     @abc.abstractmethod
     def analyses(self, item_ids: Sequence[int]) -> dict:

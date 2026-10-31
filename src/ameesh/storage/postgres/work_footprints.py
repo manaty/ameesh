@@ -346,6 +346,18 @@ class WorkFootprints(Contract):
             rows = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
             if not rows:
                 return None
+            paths = _json.dumps(analysis.get("paths") or [])
+            weak = _json.dumps(analysis.get("weak") or [])
+            # #5063 : une reprise au même résultat n'écrit pas de ligne de
+            # journal, sinon l'activité du lot repart à chaque essai et un
+            # occupant inconnu qui échoue en boucle n'est jamais stagnant
+            same = tx.query(
+                "SELECT 1 FROM work_item_impact_analyses WHERE work_item_id = %s"
+                " AND status = %s AND reason IS NOT DISTINCT FROM %s"
+                " AND paths = %s::jsonb AND weak = %s::jsonb"
+                " AND policy IS NOT DISTINCT FROM %s FOR UPDATE",
+                (int(item_id), analysis["status"], analysis.get("reason"), paths, weak,
+                 analysis.get("policy")))
             tx.execute(
                 "INSERT INTO work_item_impact_analyses(work_item_id, status, reason,"
                 " paths, weak, policy, elapsed_ms, git_calls, analyzed_by)"
@@ -356,14 +368,14 @@ class WorkFootprints(Contract):
                 " git_calls = EXCLUDED.git_calls, analyzed_by = EXCLUDED.analyzed_by,"
                 " attempts = work_item_impact_analyses.attempts + 1,"
                 " analyzed_at = clock_timestamp()",
-                (int(item_id), analysis["status"], analysis.get("reason"),
-                 _json.dumps(analysis.get("paths") or []),
-                 _json.dumps(analysis.get("weak") or []), analysis.get("policy"),
-                 analysis.get("elapsed_ms"), analysis.get("git_calls"), actor))
-            tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor,"
-                       " created_at) VALUES (%s, %s, %s, %s, clock_timestamp())",
-                       (int(item_id), rows[0]["state"], analysis["note"], actor))
-            return {"id": int(item_id), "status": analysis["status"]}
+                (int(item_id), analysis["status"], analysis.get("reason"), paths, weak,
+                 analysis.get("policy"), analysis.get("elapsed_ms"),
+                 analysis.get("git_calls"), actor))
+            if not same:
+                tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor,"
+                           " created_at) VALUES (%s, %s, %s, %s, clock_timestamp())",
+                           (int(item_id), rows[0]["state"], analysis["note"], actor))
+            return {"id": int(item_id), "status": analysis["status"], "logged": not same}
 
     def analyses(self, item_ids):
         ids = sorted({int(i) for i in item_ids})

@@ -847,6 +847,47 @@ class PassePushTest(PgTestCase):
                                                "footprint": ["src/hot.py"]}], report)
         self.assertEqual(fp.paths_of(self.db, vague["id"]), ["src/hot.py"])
 
+    def _impact_notes(self, lot):
+        return [r["note"] for r in self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s"
+            " AND note LIKE 'Impact analysis:%%' ORDER BY id", (lot,))]
+
+    def _age(self, lot):
+        self.db.execute("UPDATE work_item_impact_analyses SET analyzed_at = analyzed_at"
+                        " - interval '1 hour' WHERE work_item_id = %s", (lot,))
+        self.db.execute("UPDATE work_items SET updated_at = updated_at - interval '1 hour'"
+                        " WHERE id = %s", (lot,))
+        self.db.execute("UPDATE work_item_events SET created_at = created_at"
+                        " - interval '1 hour' WHERE work_item_id = %s", (lot,))
+
+    def test_une_reprise_inchangee_ne_remet_pas_l_activite_a_zero(self):
+        # #5063 : l'occupant inconnu qui échoue en boucle doit pouvoir stagner
+        vague = work.add(self.db, title="vague", app="tpk", cfg=self.cfg)
+        lot = vague["id"]
+        self.assertEqual(len(self._impact_notes(lot)), 1)
+        self._age(lot)
+        before = self.db.query(
+            "SELECT extract(epoch FROM max(created_at))::float8 AS ts"
+            "  FROM work_item_events WHERE work_item_id = %s", (lot,))[0]["ts"]
+        updated = work.get(self.db, lot)["updated_ts"]
+        report = fp.run_pass(self.cfg, self.db, actor="runner")
+        self.assertEqual([a["lot"] for a in report["analyzed"]], [lot], report)
+        self.assertEqual(len(self._impact_notes(lot)), 1)
+        after = self.db.query(
+            "SELECT extract(epoch FROM max(created_at))::float8 AS ts"
+            "  FROM work_item_events WHERE work_item_id = %s", (lot,))[0]["ts"]
+        self.assertEqual(after, before)
+        self.assertEqual(work.get(self.db, lot)["updated_ts"], updated)
+        analysis = storage.of(self.db).work_footprints.analyses([lot])[lot]
+        self.assertEqual(analysis["attempts"], 2)  # l'essai reste compté
+        # un résultat qui change se journalise encore
+        self.db.execute("UPDATE work_items SET body = 'voir src/hot.py' WHERE id = %s", (lot,))
+        self._age(lot)
+        fp.run_pass(self.cfg, self.db, actor="runner")
+        notes = self._impact_notes(lot)
+        self.assertEqual(len(notes), 2, notes)
+        self.assertIn("src/hot.py", notes[-1])
+
 
 if __name__ == "__main__":
     unittest.main()
