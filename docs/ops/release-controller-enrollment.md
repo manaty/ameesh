@@ -288,3 +288,65 @@ y compris si sa réponse se perd. Sans identité enregistrée à cet instant, un
 reprise ne peut pas adopter une instance active apparue ensuite ; l'intent
 reste incertain et nécessite un mandat de réconciliation. Une identité déjà
 observée doit rester identique pendant la readiness et les reprises.
+
+## Identités PostgreSQL séparées (#5162)
+
+Le dossier privé d'identités est indépendant du stage d'enrôlement :
+`/etc/ameesh-release-identities`, root 0700. Le bureau y dépose `input.json`
+root 0600, régulier, non lié, avec les champs exacts suivants :
+`version: 1`, `operation`, `schema`, `source_owner_dsn`, `restore_owner_dsn`,
+`controller_role`, `backup_role`, `restore_role`, `group_role`. Les noms SQL
+sont des identifiants minuscules distincts, sans préfixe `pg_`. Les deux DSN
+administrateurs sont des références privées explicites avec host, port, dbname,
+user ; aucun profil ambiant, service libpq ou `options` n'est admis.
+Aucun DSN ne se transmet sur la ligne de commande.
+
+Après livraison par paquet et staging, installer le répertoire `deploy/postgres`
+et son voisin `deploy/sql/role-release-controller.sql` depuis le même SHA relu,
+sous une racine root non modifiable par les agents. Avec le Python root isolé
+où psycopg est installé, la commande est :
+
+```sh
+/opt/ameesh-release/runtime/bin/python -I -B /opt/ameesh-admin/deploy/postgres/enroler-identites.py enroll
+```
+
+L'installation root doit conserver le voisin
+`/opt/ameesh-admin/deploy/sql/role-release-controller.sql`. La commande prend un
+verrou privé exclusif, génère les secrets localement et écrit durablement
+`credentials.json` root 0600 **avant** tout CREATE ROLE. Le fichier contient le
+DSN du contrôleur (`database`, document directement compatible database.json),
+`backup_dsn`, `restore_dsn`, les mots de passe et l'empreinte de l'entrée.
+Son contenu reste privé ; seule son empreinte est publiée. L'inventaire privé
+note cette origine lors de la préparation des sept JSON de #4989.
+
+Le groupe NOLOGIN est appliqué par le contrat SQL existant, sans rôle parent.
+Le contrôleur LOGIN n'hérite que de ce groupe ; la sauvegarde reçoit USAGE des
+schémas et SELECT des relations/séquences de la base source, aucune écriture.
+L'audit refuse les privilèges supplémentaires, colonnes comprises, les rôles
+parents imprévus, les propriétés administratives, la propriété d'objets,
+les fonctions SECURITY DEFINER accessibles et les tables sous RLS que l'identité
+ne peut sauvegarder complètement. Les droits PUBLIC comptent dans cet audit.
+La commande ne répare pas les droits PUBLIC d'une base partagée : un refus
+exige une correction explicite sous son propre mandat. Réappliquer après toute
+migration qui ajoute des relations à sauvegarder.
+
+La cible de restauration est un **cluster PostgreSQL dédié jetable sur l'hôte
+du contrôleur**, distinct du cluster vif. L'outil mesure les deux
+`system_identifier` et refuse leur égalité, même avec des noms de base ou des
+adresses différents. Le consommateur crée une base aléatoire puis la supprime :
+son identité nécessite CREATEDB, droit de cluster ; elle reste NOSUPERUSER,
+NOCREATEROLE, NOREPLICATION, NOBYPASSRLS et sans rôle parent. Aucun login de
+restauration n'est créé sur la source. Le cluster de vérification ne doit
+héberger aucune autre charge. Son provisionnement et le producteur de
+`restore_capacity` relèvent du lot compagnon #5165 : la mesure doit être faite
+sur le volume PostgreSQL cible ; les octets libres d'agents-3 ne prouvent pas
+ceux d'un serveur distant. Le chemin d'attestation et le port effectifs restent
+à relever dans le reçu du provisionnement avant la préparation de backup.json.
+
+Les mêmes invocations avec `audit` contrôlent les droits effectifs sans les
+modifier ; avec `leave`, elles retirent les trois logins et leurs seuls droits
+attendus. La commande refuse les droits supplémentaires et toute propriété
+inattendue, sans DROP OWNED ni suppression de données. Le groupe NOLOGIN partagé
+reste en place. Les credentials et le reçu privé `retired.json` restent comme
+preuves ; une opération retirée ne se réactive pas implicitement. Une nouvelle
+opération utilise une nouvelle source privée et de nouveaux noms.
