@@ -296,3 +296,18 @@ release is published yet. The main lines:
 Migrations 0058 to 0069 and 0359, 0361–0364, 0368, 0371–0373, 0380, 0384,
 0388, 0390, 0392, 0395, 0398, 0402, 0410, 0412, 0413, all additive; apply them
 with `ameesh migrate` before installing the new code.
+
+## Generic core and modules (L98–L104)
+
+The core now exposes a module registry, project activation through the canon,
+a generic [work lifecycle](concepts/work-lifecycle.md), and domain vocabulary.
+The built-in `dev` module supplies development commands and workspaces;
+installed extensions add trusted Python implementations, while Pipeline cards
+provide workflows as validated data. Compatibility aliases remain accepted.
+
+See [Core and modules](concepts/core-and-modules.md),
+[Write a module](guides/write-a-module.md),
+[Write a Pipeline](guides/write-a-pipeline.md), and the
+[configuration reference](reference/configuration.md#modules-and-workspace-policy-in-the-canon).
+These pages describe the implemented surface; they do not claim that the
+remaining boundary-closure work of L104 is complete.

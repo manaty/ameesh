@@ -21,6 +21,7 @@ ameesh is free software under **AGPL-3.0-only**. Source code:
 |---|---|
 | **Canon** | A git repository in [OKF](concepts/canon.md) format that declares humans, hosts, agents and placements. ameesh reads it only at the merged canonical commit; a host can read several canons. |
 | **Registry and mailbox** | Postgres tables for presence, leases, sessions, messages and work items. LISTEN/NOTIFY wakes runners. |
+| **[Core and modules](concepts/core-and-modules.md)** | The core coordinates work items; modules supply domain rules, vocabulary and commands. Discover them with `ameesh modules`; activate project policy through the canon. |
 | **Runner** (`ameesh run`, alias `agent-runner`) | One per host. Claims agents under leases, runs turns in the agent's harness, resumes the same session. |
 | **Readable threads** (`ameesh fil`) | Every message that goes through ameesh is appended, verbatim, to a Markdown thread per project or lot. |
 | **Actions and the gate** (`ameesh action`) | Effects on the outside world are recorded actions with a stable id and a digest; irreversible or costly ones need a receipt. |

@@ -7,7 +7,7 @@ spellings of the renamed commands and options remain hidden aliases
 ([Switch from a v0 setup](../guides/switch-from-v0.md)).
 Run `ameesh <command> --help` for the authoritative text.
 
-Three entry points are installed by the package:
+Four entry points are installed by the package:
 
 | Command | What it is |
 |---|---|
@@ -421,7 +421,44 @@ lot (number, or a reference matching a single open lot) the message is tied
 to the lot's number, otherwise it stays a plain thread label. See
 `docs/ORCHESTRATEUR.md`.
 
+## Modules: discovery and commands
+
+```text
+ameesh modules [--json] [--no-canon]
+ameesh modules --active [--json]
+ameesh module --list
+ameesh module dev sync-merges|sync-github|project-github|merge-pr|review-class …
+ameesh module it delivery|proof|show|qa …
+ameesh module <pipeline> adopt <id>
+ameesh module <pipeline> advance <id> --to <stage> --guard <guard> [--ref KEY=VALUE]
+ameesh module <pipeline> hold <id> --hold blocked
+ameesh module <pipeline> release <id>
+```
+
+`modules` discovers built-in, installed and declarative modules. `--no-canon`
+limits discovery to installed implementations; `--active` reads applied
+project policies (or compiles the local canon if the database is unavailable).
+Discovery reports capabilities and descriptor fingerprints; it does not prove
+activation. `module --list` lists available command providers.
+
+`dev` supplies development tooling and is always active in the standard
+profile. `ameesh work sync-merges|sync-github|project-github|merge-pr` and
+`ameesh review-class` remain accepted aliases, with no removal date.
+The `it` commands record delivery, execution evidence and QA.
+Pipeline commands require an active declaration and an eligible work item;
+adoption pins the card revision. See [Core and modules](../concepts/core-and-modules.md),
+[Write a Pipeline](../guides/write-a-pipeline.md) and
+[Write a module](../guides/write-a-module.md).
+
 ## Work items: `ameesh work`
+
+The [work lifecycle](../concepts/work-lifecycle.md) accepts the generic state
+names `requested`, `in_progress`, `to_validate`, `validated` and `delivered`,
+alongside compatibility names. Development stages `merged` and `promoted`
+distinguish integration from deployment. `work.deliver` is a Python API;
+the existing shell delivery paths are `work merged`, `work close --delivered
+--sha` and `work close --done`. Options such as `--lot` and JSON keys retain
+their existing names.
 
 ```
 ameesh work add --title TITLE [--type bug|evolution] [--source S] [--app APP]

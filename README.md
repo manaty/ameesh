@@ -230,6 +230,10 @@ ameesh fil tail <projet> [<lot>] [--last N]     # follow; Ctrl-C to exit
 `agent-mesh` (observability, authority, work items):
 
 ```
+ameesh modules [--json]                        # registre des modules disponibles
+ameesh modules --active [--json]               # politiques de projet appliquées
+ameesh module --list                           # fournisseurs de commandes
+ameesh module dev review-class --help          # outillage de développement (alias conservé : ameesh review-class)
 agent-mesh list [--json] | show <agent>
 agent-mesh key generate --out DIR --i-am-the-owner     # bench / agent provenance keys
 agent-mesh key register <agent> --public-key FICHIER [--role owner|agent] | key show|list|revoke <agent>
