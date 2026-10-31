@@ -78,11 +78,6 @@ DEFAULT_PRICES = {
     # https://api-docs.deepseek.com/quick_start/pricing (cache miss, cache hit,
     # output). This is the peak price; off-peak hours are in `PRICE_PERIODS`.
     "deepseek-flash": [0.30, 0.006, 1.20],
-    # #4944: official page checked 2026-10-30 (same URL). V4-Pro is a
-    # distinct model; keep the historical deepseek-pro rate for old logs.
-    "deepseek-v4-pro": [1.32, 0.044, 3.96],
-    "deepseek-v4-flash": [0.30, 0.006, 1.20],
-    "deepseek-v4-flash-vision-exp": [0.30, 0.006, 1.20],
     "deepseek-pro": [0.55, 0.14, 2.19],
     "gpt-6.1-sol": [1.25, 0.125, 10.0],
     "default-codex": [1.25, 0.125, 10.0],
@@ -143,15 +138,6 @@ DEEPSEEK_PEAK_DAYS = (0, 1, 2, 3, 4)
 PRICE_PERIODS = {
     "deepseek-flash": {"peak_utc": DEEPSEEK_PEAK_UTC, "peak_days": DEEPSEEK_PEAK_DAYS,
                        "off_peak": [0.15, 0.003, 0.60]},
-    # #4944: both legacy Flash names are served and billed as Flash;
-    # V4-Pro also has off-peak pricing (official page, 2026-10-30).
-    "deepseek-v4-flash": {"peak_utc": DEEPSEEK_PEAK_UTC, "peak_days": DEEPSEEK_PEAK_DAYS,
-                          "off_peak": [0.15, 0.003, 0.60]},
-    "deepseek-v4-flash-vision-exp": {
-        "peak_utc": DEEPSEEK_PEAK_UTC, "peak_days": DEEPSEEK_PEAK_DAYS,
-        "off_peak": [0.15, 0.003, 0.60]},
-    "deepseek-v4-pro": {"peak_utc": DEEPSEEK_PEAK_UTC, "peak_days": DEEPSEEK_PEAK_DAYS,
-                        "off_peak": [0.66, 0.022, 1.98]},
 }
 
 #: Fenêtres nommées par les jauges, en secondes.
