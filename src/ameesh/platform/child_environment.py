@@ -86,6 +86,15 @@ def for_child(argv, environment=None, *, executable=None, shell=False) -> dict:
             if not secret_name(name) or os.fsdecode(name) in allowed}
 
 
+def _route_names(value) -> tuple:
+    """Channel names of a route, as `notify._names` reads them (never raises)."""
+    if isinstance(value, str):
+        return tuple(v.strip() for v in value.split(",") if v.strip())
+    if isinstance(value, (list, tuple)):
+        return tuple(v for v in value if isinstance(v, str))
+    return ()
+
+
 def notify_credentials(raw) -> frozenset[str]:
     """Register channel secrets, including arbitrary variable names.
 
@@ -95,16 +104,18 @@ def notify_credentials(raw) -> frozenset[str]:
     names = set()
     if not isinstance(raw, dict):
         return frozenset()
-    channels = raw.get("channels", {})
+    # Same reading as `notify.parse_config`: null channels/routes are empty,
+    # a channel declared null is `{}`, routes may be a comma-separated string.
+    channels = raw.get("channels") or {}
     if not isinstance(channels, dict):
         return frozenset()
-    channels = dict(channels)
-    routes = raw.get("routes", {})
-    references = [raw.get("default", [])]
+    channels = {name: {} if channel is None else channel
+                for name, channel in channels.items()}
+    routes = raw.get("routes") or {}
+    references = [raw.get("default") or []]
     if isinstance(routes, dict):
         references.extend(routes.values())
-    if any("slack" in (value if isinstance(value, (list, tuple)) else [value])
-           for value in references):
+    if any("slack" in _route_names(value) for value in references):
         channels.setdefault("slack", {})
     for name, channel in channels.items():
         if not isinstance(channel, dict):
@@ -113,7 +124,7 @@ def notify_credentials(raw) -> frozenset[str]:
                                   ("webhook_env", "webhook_file")):
             variable = channel.get(env_key)
             if (env_key == "webhook_env" and not variable
-                    and channel.get("type", name) == "slack"):
+                    and (channel.get("type") or name) == "slack"):
                 variable = "AMEESH_SLACK_WEBHOOK"
             if isinstance(variable, str) and variable:
                 DECLARED_CREDENTIALS.add(variable.upper())
