@@ -728,6 +728,36 @@ def _bench_upkeep(db) -> None:
               % len(invalid.dropped), file=sys.stderr)
 
 
+def verrou_droits_globaux(cls: type, delai_s: int = 900) -> None:
+    """#5088 : sérialise, entre les processus de la suite (`--parallel`), les
+    classes qui lisent ou posent des droits visibles de toute la base (ACL par
+    défaut d'un autre schéma, PUBLIC, droits sur la base) : un contrat de rôle
+    vérifié pendant qu'une autre classe pose une ACL par défaut à PUBLIC
+    échouait à tort (run 41181527941). Verrou consultatif de session tenu par
+    un `psql` dédié (indépendant du pilote), libéré au nettoyage de la classe
+    ou à la mort du processus."""
+    proc = subprocess.Popen(
+        ["psql", TEST_DSN, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True)
+    proc.stdin.write(
+        "SET lock_timeout = '%ds';\n"
+        "SELECT 'pris' FROM (SELECT pg_advisory_lock("
+        "hashtext('ameesh-tests-droits-globaux'))) s;\n" % delai_s)
+    proc.stdin.flush()
+    if proc.stdout.readline().strip() != "pris":
+        erreur = proc.communicate(timeout=30)[1]
+        raise AssertionError("verrou des droits globaux non obtenu : %s" % erreur)
+
+    def liberer() -> None:
+        try:  # fin de session (entrée fermée) : le verrou tombe avec elle
+            proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+    cls.addClassCleanup(liberer)
+
+
 class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
 

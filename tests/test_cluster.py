@@ -20,7 +20,7 @@ import uuid
 
 from ameesh import db as db_mod
 from ameesh import migrations
-from tests.support import REPO, TEST_DSN, PgTestCase
+from tests.support import REPO, TEST_DSN, PgTestCase, verrou_droits_globaux
 
 ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-superviseur.sql")
 ROLE_CONTENUS_SQL = os.path.join(REPO, "deploy", "sql", "role-superviseur-contenus.sql")
@@ -462,6 +462,7 @@ class SuperviseurRoleTest(PgTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        verrou_droits_globaux(cls)  # #5088
         suffix = uuid.uuid4().hex[:8]
         cls.role = "t_sup_%s" % suffix
         cls.role_contenus = "t_supc_%s" % suffix

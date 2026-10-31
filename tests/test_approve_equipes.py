@@ -49,7 +49,8 @@ from ameesh.approve.tls import TlsReloader
 from ameesh.connectors.shell_noop import ShellNoopConnector
 from ameesh.storage.postgres.authenticators import AUTH_COLUMNS
 
-from .support import REPO, TEST_DSN, PgTestCase, apply_authenticators, child_env
+from .support import (REPO, TEST_DSN, PgTestCase, apply_authenticators, child_env,
+                      verrou_droits_globaux)
 from .webauthn_soft import SoftWebAuthn
 
 H_A = "equipe-a.approve.example.test"
@@ -926,6 +927,7 @@ class RoleApproveTest(PgTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        verrou_droits_globaux(cls)  # #5088
         suffix = uuid.uuid4().hex[:8]
         cls.role = "t_appr_%s" % suffix
         cls.login = "t_appr_login_%s" % suffix
