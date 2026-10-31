@@ -73,12 +73,18 @@ class RoleNotifyCredentialsTest(unittest.TestCase):
     def test_once_hides_its_environment_or_refuses(self):
         """#5083: the role's `notify --once` holds the granted secrets."""
         from ameesh.platform import process
-        with mock.patch.object(process, "become_undumpable",
-                               side_effect=OSError(1, "refused")) as hide, \
+        # In-process main() must not guard the suite's own Popen: later tests
+        # would lose AMEESH_DSN in their children (paquet h-20261031-18).
+        original = subprocess.Popen.__init__
+        with mock.patch.object(E, "install") as install, \
+                mock.patch.object(process, "become_undumpable",
+                                  side_effect=OSError(1, "refused")) as hide, \
                 mock.patch.object(notify.config_mod, "load") as load:
             self.assertEqual(notify.main(["--once"]), 1)
+        install.assert_called_once_with()
         hide.assert_called_once_with()
         load.assert_not_called()
+        self.assertIs(subprocess.Popen.__init__, original)
 
     def test_role_child_sends_signed_primary_request_with_filter_active(self):
         requests = []
