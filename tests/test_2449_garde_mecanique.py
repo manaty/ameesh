@@ -58,6 +58,7 @@ def reader_keys() -> set[str]:
             ("packet_tests", mechanics._PACKET_TESTS_KEYS),
             ("file", mechanics._FILE_KEYS),
             ("session", mechanics._SESSION_KEYS),
+            ("auto_take", mechanics._AUTO_TAKE_KEYS),
             # #3022 : `production.branch` est un bloc **par projet**, pas un
             # bloc du document global ; la garde doit le voir comme les autres.
             ("production", mechanics._PRODUCTION_KEYS)):
@@ -78,7 +79,7 @@ class SchemaCoverageTest(unittest.TestCase):
                          {"schema", "timezone", "cutoffs", "packets", "build",
                           "ci", "reviews", "merge", "prevalidation", "backlog",
                           "staging", "accounts", "paquet", "packet_tests",
-                          "file", "session", "projects"})
+                          "file", "session", "auto_take", "projects"})
         # #3022 : les surcharges par projet peuvent porter un bloc qui n'est
         # pas un bloc du document global (`production`) ; il reste couvert par
         # `production.branch` ci-dessus, jamais ajouté au schéma du document.
@@ -97,6 +98,8 @@ class SchemaCoverageTest(unittest.TestCase):
 #: qu'elle produit bien un constat pour cette clé : aucune clé ne peut être
 #: déclarée couverte sans que sa règle existe.
 POSITIVE = {
+    "auto_take.excluded_families": 'AUTO_TAKE_EXCLUDED_FAMILIES = ["deepseek"]\n',
+    "auto_take.expire": 'AUTO_TAKE_EXPIRE = "2026-11-01"\n',
     "schema": 'MECHANICS_SCHEMA = "ameesh-mechanics/2"\n',
     "timezone": 'def cutoff(now):\n    return ZoneInfo("Europe/Paris")\n',
     "cutoffs": 'def cutoff(local):\n    return local.hour >= 23\n',

@@ -48,7 +48,7 @@ class SwitchTest(unittest.TestCase):
     def test_unset_keeps_the_built_in_modules(self):
         with profile(None), no_entry_points():
             self.assertEqual(modules.profile(), "default")
-            self.assertEqual(registry.discover().names(), ["dev", "it"])
+            self.assertEqual(registry.discover().names(), ["dev", "it", "work-types"])
             self.assertEqual(modules.always_active(), ("dev",))
 
     def test_bare_empties_builtin_and_discover(self):
@@ -65,7 +65,7 @@ class SwitchTest(unittest.TestCase):
 
     def test_an_unknown_value_keeps_the_default_profile(self):
         with profile("Bare"), no_entry_points():
-            self.assertEqual(registry.discover().names(), ["dev", "it"])
+            self.assertEqual(registry.discover().names(), ["dev", "it", "work-types"])
 
 
 class DoctorTest(unittest.TestCase):

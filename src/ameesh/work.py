@@ -86,6 +86,21 @@ def __getattr__(name):
         return getattr(_module_registry.development_workflow(), name)
     raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
+
+def development_transitions() -> dict:
+    """The dev workflow's transitions, or {} without the dev module.
+
+    #4957 : le noyau générique (`decisions`) tient et rend un lot ; au profil
+    nu (L98 T2b, CI/tests) le module dev n'existe pas. Sans table, l'appelant
+    ne tente aucun déplacement et journalise la note seule, au lieu de lever
+    une ValueError qui masquait le fonctionnement normal du reste.
+    """
+    try:
+        return _module_registry.development_workflow().TRANSITIONS
+    except ValueError:
+        return {}
+
+
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,

@@ -108,7 +108,7 @@ class RegistryTest(unittest.TestCase):
             found = registry.discover()
             installed = modules.installed()
         it = found.get("it")
-        self.assertEqual(found.names(), ["dev", "it"])
+        self.assertEqual(found.names(), ["dev", "it", "work-types"])
         self.assertEqual((it.source, it.version, it.cli),
                          ("builtin", version(), "ameesh module it"))
         self.assertEqual(it.capabilities, ("lifecycle", "cli", "audit"))
@@ -228,7 +228,7 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(code, 1)
         payload = json.loads(out)
         self.assertEqual([row["name"] for row in payload["modules"]],
-                         ["dev", "it", "sample"])
+                         ["dev", "it", "work-types", "sample"])
         errors = {row["name"]: row["error"] for row in payload["refused"]}
         self.assertIn("cannot be loaded: boom", errors["broken"])
         self.assertEqual(errors["it"], "duplicate installed module: 'it'")

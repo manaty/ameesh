@@ -117,6 +117,12 @@ retained aliases. Development work items are called **lots**; the core uses
 persisted states (`merged` and `promoted`). Policy is selected per project;
 its presence in the discovered list does not activate it everywhere.
 
+**`work-types`** declares the non-code work item types `docs`,
+`investigation`, `governance-tracking`, `promotion` and `human_operation`, with
+no schema, rule or command. Like `it`, it is active only in the projects that
+select it (`modules: [work-types]`); a project without it still refuses those
+types. See [Write a Pipeline](../guides/write-a-pipeline.md).
+
 A **bare profile** has no built-in modules and no installed entry points.
 `registry.discover(builtin=False)` then returns an empty registry without
 error. Without `dev`, workspace housekeeping and worktree operations are

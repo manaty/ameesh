@@ -105,6 +105,8 @@ SCHEMA_KEYS = (
     "file.repos_part",
     "file.repos_s",
     "file.wake_mail_s",
+    "auto_take.excluded_families",
+    "auto_take.expire",
     "session.max_tokens",
     "session.max_tokens_by_harness",
     "production.branch",
@@ -166,6 +168,9 @@ BINDINGS = {
     "wake_mail_s": "file.wake_mail_s",
     "production_branch": "production.branch",
     # #4448 : le seuil commun et sa table par harnais
+    "auto_take_excluded_families": "auto_take.excluded_families",
+    "excluded_families": "auto_take.excluded_families",
+    "auto_take_expire": "auto_take.expire",
     "session_max_tokens": "session.max_tokens",
     "session_max_tokens_by_harness": "session.max_tokens_by_harness",
     "max_tokens_by_harness": "session.max_tokens_by_harness",
@@ -543,6 +548,10 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "file.wake_mail_s":
         # #4610 : la fenêtre du courrier récent, en secondes
         return type(value) is int and value > 0
+    if key == "auto_take.excluded_families":
+        return isinstance(value, tuple) and bool(value) and all(isinstance(v, str) for v in value)
+    if key == "auto_take.expire":
+        return isinstance(value, str) and bool(_DATE.fullmatch(value))
     if key == "session.max_tokens":
         # #4448 : le seuil commun de rotation, en jetons de session
         return (isinstance(value, (int, float)) and not isinstance(value, bool)
