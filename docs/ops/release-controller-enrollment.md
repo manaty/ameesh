@@ -357,7 +357,27 @@ choisie au moins égale au serveur source, données sous
 `/var/lib/ameesh-release-restore/<major>/data`, configuration root
 `/etc/ameesh-release-restore`, socket privé `/run/ameesh-release-restore`
 (0700), propriétaire OS `ameesh-restore` nologin ; unité
-`ameesh-release-restore.service`. Le cluster n'écoute sur aucun port TCP
+`ameesh-release-restore.service`.
+
+Pour agents-3, le dossier opérateur retient PostgreSQL **17** (source vive
+17.11 ; bureau #176722 et cx3 #176735, 31/10/2026). Le mandat doit nommer
+explicitement le geste root : configuration du dépôt officiel PGDG puis
+installation des deux paquets `postgresql-17` et `postgresql-client-17`.
+Ce texte prépare le mandat ; il ne constitue pas son approbation signée.
+Le provisionneur #5165 utilise `--version 17` et les outils serveur
+`initdb`, `pg_ctl`, `psql`, `pg_controldata` sous `/usr/lib/postgresql/17/bin`.
+Les clients retenus pour le contrôleur sont exactement
+`/usr/lib/postgresql/17/bin/pg_dump` et
+`/usr/lib/postgresql/17/bin/pg_restore`, pas les clients système 16.15.
+Le helper de sauvegarde résout encore ces commandes par PATH : le contexte
+effectif du contrôleur doit donc placer `/usr/lib/postgresql/17/bin` en tête,
+et le reçu doit relever les chemins résolus et leurs versions, ainsi que
+les versions des deux serveurs. Vérifier avant qualification :
+`source_major <= pg_dump_major <= cible_major` et
+`pg_restore_major >= pg_dump_major`. Une garde automatique avant dump est
+suivie dans le panier #5169 ; elle n'est pas livrée dans ce dossier.
+
+Le cluster n'écoute sur aucun port TCP
 (`listen_addresses = ''`) et le DSN du socket n'indique aucun port. Le producteur root tourne toutes les 60 s
 et écrit au chemin exact `backup.json.restore_capacity`. Pour cette commande
 d'identités root, l'administration peer doit autoriser explicitement root vers
