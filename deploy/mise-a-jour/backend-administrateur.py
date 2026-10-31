@@ -718,7 +718,8 @@ def replacement_enrollment(enrollment,operation,code):
     operation, and its signed question binds the digest of exactly that code.
     """
     stage=Path(STAGE)/operation
-    if (Path(__file__).resolve().parent!=stage/'sources' or Path(sys.prefix).resolve()!=stage/'runtime'):
+    if (Path(__file__).resolve().parent!=stage/'sources' or Path(sys.prefix).resolve()!=stage/'runtime'
+            or Path(sys.executable).parent.resolve()!=stage/'runtime/bin'):
         raise BackendError('replacement runs from its staged runtime and sources')
     return dict(enrollment,code_sha256=code)
 
@@ -790,9 +791,13 @@ def main(argv=None):
         enrollment=json.loads(Backend.private(runtime.trusted(ENROLLMENT),4096))
         if command in REPLACEMENT:
             enrollment=replacement_enrollment(enrollment,operation,code_digest())
-        db=connect() if command!='inventory' else None
+        # A replacement measures its stage before importing the database stack.
+        db=connect() if command not in ('inventory',*REPLACEMENT) else None
         # LinuxChannels extends LinuxHost: one fixed system for both kinds.
         backend=Backend(system=channel_installer.LinuxChannels(),enrollment=enrollment,db=db)
+        if command in REPLACEMENT:
+            backend.replacement(operation).check_measured()
+            backend.db=connect()
         result=dispatch(backend,command,operation,decision)
     except (BackendError,module('remplacement-runtime').ReplacementError,*Release.errors,*Channels.errors) as error:
         print(json.dumps(dict(ok=False,error=str(error))),file=sys.stderr)

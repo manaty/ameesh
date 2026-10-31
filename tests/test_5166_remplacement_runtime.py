@@ -140,6 +140,7 @@ class Harness(fixture.Fixture, support.PgTestCase):
         (stage / 'replacement.json').write_text(json.dumps(value))
         (stage / 'replacement.json').chmod(0o600)
         self.swap_stage = stage
+        stage.parent.chmod(0o700)
 
     def prepared_view(self):
         self.out = self.item.prepare()
@@ -272,6 +273,41 @@ class ReplacementTest(Harness):
         self.assertEqual(self.item.prepared(same_code=False)[0]['code_sha256'], 'e'*64)
         with self.assertRaisesRegex(ValueError, 'staged runtime and sources'):
             backend_mod.replacement_enrollment(self.enrollment, 'swap-1', 'f'*64)
+
+    def test_every_signed_command_measures_the_stage_and_refuses_a_change(self):
+        view = self.prepared_view()
+        self.sign(view, 'replace')
+        old = self.snapshot_old()
+        extra = self.swap_stage/'sources/planted.py'
+        extra.write_text('# planted after signature\n'); extra.chmod(0o644)
+        for command in (lambda: self.item.plan(view['id']), lambda: self.item.run(view['id']),
+                        lambda: self.item.rollback(view['id']),
+                        lambda: self.item.rollback_text(int(self.now)+600), self.item.prepare):
+            with self.assertRaisesRegex(ValueError, 'differ from the signed'):
+                command()
+        self.assertEqual(self.snapshot_old(), old)
+        extra.unlink()
+        self.assertEqual(self.item.run(view['id'])['outcome'], 'replaced')
+
+    def test_a_stage_others_can_reach_is_refused(self):
+        self.swap_stage.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, 'private root stage'):
+            self.item.prepare()
+        self.swap_stage.chmod(0o700)
+        target = self.swap_stage/'sources/hote-release.py'
+        target.chmod(0o664)
+        with self.assertRaises(ValueError):
+            self.item.prepare()
+
+    def test_independent_check_compares_the_signed_values(self):
+        check = backend_mod.module('verifier-remplacement')
+        question = self.item.prepare()['question']
+        bundle = json.loads(self.item.bundle_path.read_bytes())
+        measured = dict(runtime=bundle['next']['runtime'], lib=bundle['next']['lib'],
+                        code_sha256=bundle['code_sha256'])
+        self.assertEqual(check.signed(question)['sha'], bundle['next']['sha'])
+        self.assertEqual(check.differences(question, measured), [])
+        self.assertEqual(check.differences(question, dict(measured, lib='0'*64)), ['lib'])
 
     def test_cli_parses_only_the_typed_commands(self):
         self.assertEqual(backend_mod.parse(['replace', 'swap-1', '--decision', '4']), ('replace', 'swap-1', 4))

@@ -129,6 +129,28 @@ class Replacement:
         self.uid=os.geteuid()
 
     # ---- preparation: reads the host, publishes nothing
+    def measure_stage(self):
+        """Digests recomputed from the root copy this command runs from, never read.
+
+        The stage must be private before measuring: nothing but root can change
+        it between this measure and the execution.
+        """
+        runtime.trusted(self.stage)
+        info=self.stage.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=self.uid or stat.S_IMODE(info.st_mode)!=0o700
+                or stat.S_IMODE(self.stage.parent.lstat().st_mode)!=0o700):
+            raise ReplacementError('private root stage required')
+        return {name:runtime.inventory(self.stage/stage) for stage,name in TREES.items()}
+
+    def check_measured(self):
+        """Refuse before any effect when the stage is not the signed one."""
+        fresh=self.measure_stage()
+        if self.bundle_path.exists() or self.bundle_path.is_symlink():
+            bundle=json.loads(self.backend.private(self.bundle_path,1<<24))
+            if any(fresh[name]['digest']!=bundle['next'][name] for name in ('runtime','lib')):
+                raise ReplacementError('staged trees differ from the signed replacement')
+        return fresh
+
     def current_pin(self):
         data=seal.read(self.pin,seal.MAX_DOCUMENT,uid=self.uid)
         document=json.loads(data,object_pairs_hook=seal.unique)
@@ -156,7 +178,7 @@ class Replacement:
 
     def prepare(self):
         backend=self.backend
-        runtime.trusted(self.stage)
+        fresh=self.check_measured()
         try:
             value=json.loads(backend.private(self.stage/'replacement.json',4096))
         except (OSError,ValueError):
@@ -171,7 +193,6 @@ class Replacement:
         machine=backend.machine()
         if old['machine_id']!=machine or old['sha']==value['sha']:
             raise ReplacementError('replacement must change the sealed commit of this host')
-        fresh={name:runtime.inventory(self.stage/stage) for stage,name in TREES.items()}
         if fresh['runtime']['digest']==old['trees']['runtime']['digest'] \
                 and fresh['lib']['digest']==old['trees']['lib']['digest']:
             raise ReplacementError('replacement must change the sealed trees')
@@ -214,8 +235,10 @@ class Replacement:
         if not exact or bundle['host']!=self.backend.enrollment['host'] or bundle['machine_id']!=self.backend.machine():
             raise ReplacementError('prepared replacement does not match this host')
         # The signature stands for the code enrollment of this one operation.
-        if same_code and bundle['code_sha256']!=self.backend.gestes.code:
-            raise ReplacementError('replacement prepared by other code')
+        if same_code:
+            if bundle['code_sha256']!=self.backend.gestes.code:
+                raise ReplacementError('replacement prepared by other code')
+            self.check_measured()
         return bundle,text
 
     def rollback_text(self,expires_at):

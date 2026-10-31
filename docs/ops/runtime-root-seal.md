@@ -128,7 +128,11 @@ Le backend enrôlé ne connaît pas ces commandes, et son réenrôlement (A2) ex
 un runtime qui possède `decisions.require_current`. Ces seules commandes
 s'exécutent donc depuis les arbres de stage de l'opération. `backend.json` ne
 fournit que l'hôte et la machine ; la question signée lie le digest du code qui
-s'exécute (`code_sha256`). Tout autre emplacement refuse.
+s'exécute (`code_sha256`). Tout autre emplacement refuse. Chaque commande
+recalcule en root les digests du stage (`runtime` et `sources`) avant d'importer
+la pile de base de données : stage root 0700 sous un parent 0700, sans lien ni
+écriture de groupe, mesuré sur la copie root et comparé au bundle signé. Un écart
+refuse avant tout effet.
 
 Ordre sur l'hôte :
 
@@ -154,7 +158,18 @@ Ordre sur l'hôte :
    `$S/runtime/bin/python -I -B $S/sources/backend-administrateur.py
    replacement-prepare OP`.
    La sortie donne la question et les options, à passer sans retouche à
-   `ameesh decide ask --needs-signature`.
+   `ameesh decide ask --needs-signature`. La question affiche `next.sha`,
+   `next.runtime`, `next.lib` et `code_sha256`.
+   Avant de signer, recalculer ces valeurs sans passer par le stage, hors root,
+   depuis un clone propre et avec le même Python système :
+   ```sh
+   umask 022
+   /usr/bin/python3 -I -B CLONE/deploy/mise-a-jour/verifier-remplacement.py \
+     --clone CLONE --output "$DIR2/out" --question question.txt
+   ```
+   L'outil reconstruit au SHA de la question, mesure avec l'inventaire de
+   `runtime-release.py` et refuse tout écart (code 2). Signer sans ce résultat
+   revient à signer ce qui a été construit, sans l'avoir vérifié.
 5. Après signature, `replacement-plan OP --decision N` : effet nul, tous les pas
    autorisés. Arrêter `ameesh-handoff-local.socket` et ses instances ; le
    contrôleur doit être inactif. Puis `replace OP --decision N`, à reprendre avec
