@@ -477,7 +477,8 @@ class RoleExecutorTest(PgTestCase):
                 try:
                     proc = run_writers()
                     self.assertNotEqual(proc.returncode, 0)
-                    self.assertIn('must not change the schema compatibility inventory', proc.stderr)
+                    self.assertIn('must not change the schema compatibility inventory', proc.stderr,
+                                  attendu(proc.stderr))
                 finally:
                     self.db.execute('REVOKE UPDATE ON schema_non_additive_migrations FROM PUBLIC')
                 # This class has a private database: never mutate shared bench ACLs.

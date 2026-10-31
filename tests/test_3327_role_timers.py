@@ -316,6 +316,7 @@ class DropinCommandTest(unittest.TestCase):
         self.assertFalse(args.once)
         fake_notifier = mock.Mock()
         fake_db = mock.Mock()
+        fake_db.query.return_value = []  # compatible schema inventory
         cfg = SimpleNamespace(state_dir=tempfile.mkdtemp(prefix="3327-dropin-"))
         with mock.patch.object(notify, "Notifier", return_value=fake_notifier) as ctor, \
                 mock.patch.object(notify.db_mod, "connect", return_value=fake_db), \

@@ -221,6 +221,7 @@ class ServiceBesideTimerTest(unittest.TestCase):
         args = notify.build_parser().parse_args(self.dropin_args())
         self.assertEqual(args.skip, ["issues,github-watch,ci,alerts"])
         fake = mock.Mock()
+        fake.query.return_value = []  # compatible schema inventory
         fake.run_pass = mock.Mock(return_value=[])
         cfg = SimpleNamespace(state_dir=tempfile.mkdtemp(prefix="3383-service-"))
         with mock.patch.object(notify, "Notifier", return_value=fake) as ctor, \
@@ -253,6 +254,7 @@ class ServiceBesideTimerTest(unittest.TestCase):
         cfg = SimpleNamespace(state_dir=tempfile.mkdtemp(prefix="3383-lock-"))
         args = notify.build_parser().parse_args(["--once", "--only", "alerts"])
         fake = mock.Mock()
+        fake.query.return_value = []  # compatible schema inventory
         fake.run_pass = mock.Mock(return_value=[])
         fake.state = notify.empty_state()
         with mock.patch.object(notify, "Notifier", return_value=fake), \
