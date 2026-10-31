@@ -23,7 +23,7 @@ import unittest
 from unittest import mock
 
 from ameesh import db as db_mod
-from ameesh import lot_class, merge_queue, plan_git, registry, verdict_carry, work
+from ameesh import lot_class, merge_queue, plan_git, registry, storage, verdict_carry, work
 
 from .support import PgTestCase, patch_families
 
@@ -462,6 +462,43 @@ class CarryTest(PgTestCase):
 
     def carry(self, **extra):
         return verdict_carry.carry(self.cfg, self.db, self.lot, repo=self.repo.root, **extra)
+
+    def test_withdrawal_survives_realigned_freeze_and_late_carry(self):
+        seats = storage.of(self.db).work
+        seats.designate_reviewer(self.lot, "rev1", actor="human:alice")
+        self.verdict("rev1", self.repo.reviewed)
+        seats.designate_reviewer(self.lot, "rev1", actor="human:alice", remove=True)
+        frozen = self.repo.merge_target()
+        self.assertNotEqual(verdict_carry.would_carry(
+            self.cfg, self.db, self.lot, frozen, repo=self.repo.root)["result"], "would-carry")
+        self.freeze(frozen)
+        self.assertNotEqual(self.carry()["result"], "carried")
+        self.assertTrue(self.db.query("SELECT withdrawn FROM work_review_withdrawals"
+                                     " WHERE work_item_id = %s AND reviewer = 'rev1'",
+                                     (self.lot,))[0]["withdrawn"])
+        self.assertNotIn("rev1", work.get(self.db, self.lot)["reviewers"])
+        with self.assertRaisesRegex(db_mod.DbError, "withdrawn"):
+            self.verdict("rev1", frozen)
+        seats.designate_reviewer(self.lot, "rev1", actor="human:alice")
+        self.assertEqual(self.carry()["result"], "carried")
+
+    def test_withdrawal_during_carry_computation_is_rechecked(self):
+        seats = storage.of(self.db).work
+        seats.designate_reviewer(self.lot, "rev1", actor="human:alice")
+        self.verdict("rev1", self.repo.reviewed)
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        real = verdict_carry._carriable
+
+        def withdraw(*args):
+            seats.designate_reviewer(self.lot, "rev1", actor="human:alice", remove=True)
+            return real(*args)
+
+        with mock.patch.object(verdict_carry, "_carriable", side_effect=withdraw):
+            self.assertNotEqual(self.carry()["result"], "carried")
+        self.assertTrue(self.db.query("SELECT withdrawn FROM work_review_withdrawals"
+                                     " WHERE work_item_id = %s AND reviewer = 'rev1'",
+                                     (self.lot,))[0]["withdrawn"])
 
     def on(self, sha):
         return [m for m in work.milestones(self.db, self.lot)

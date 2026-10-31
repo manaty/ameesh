@@ -147,5 +147,6 @@ sur ce lot, jusqu'à une nouvelle désignation enregistrée. Un avis signé avan
 reste une preuve valable ; le retrait ne réécrit pas l'historique. Une relecture
 spontanée reste acceptée si le relecteur n'a jamais été retiré de ce lot. Le registre
 de retrait suit les alias et les renommages ; une nouvelle tête ne vaut pas
-redésignation. Les retraits antérieurs à cette migration ne sont pas reconstruits
+redésignation. Le report mécanique filtre les relecteurs retirés et ne rétablit
+ni leur siège ni un verdict sur la nouvelle tête. Les retraits antérieurs à cette migration ne sont pas reconstruits
 à partir des courriers ou du texte du journal.

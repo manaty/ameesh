@@ -2545,6 +2545,9 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
         # siège absent de la colonne a été retiré par le pilote.
         wanted = [name for name in wanted if name in current]
     wanted.extend(names)
+    if effective is not None and effective[1] == "carried":
+        from .agent_review_hold import carried_reviewers
+        wanted = carried_reviewers(db, lot, wanted)
     for name in wanted:
         if name and name not in keep:
             keep.append(name)

@@ -86,6 +86,22 @@ class ReviewHoldTest(PgTestCase):
     def test_unsolicited_opinion_remains_possible(self):
         self.verdict()
 
+    def test_carried_mark_cannot_reinstate_a_withdrawn_reviewer(self):
+        self.seat()
+        self.seat(remove=True)
+        self.db.execute("UPDATE agent_registry SET aliases = ARRAY['old-reader'] WHERE name = 'reader'")
+        self.assertEqual(agent_review_hold.carried_reviewers(
+            self.db, self.lot, ["old-reader", "reader"]), [])
+        effective = (1, "carried", {"reviewers": [{"name": "reader"}]})
+        with mock.patch.object(activation, "_lock_current_freeze", return_value=True), \
+                mock.patch.object(activation, "_marks", return_value=[]), \
+                mock.patch.object(activation, "_effective_mark", return_value=effective), \
+                mock.patch.object(activation, "_manual_designations", return_value={}):
+            activation._sync_reviewers(self.db, {"id": self.lot}, {"id": 1}, ["reader"])
+        with self.assertRaisesRegex(db_mod.DbError, "withdrawn"):
+            self.verdict()
+        self.assertEqual(work.get(self.db, self.lot)["reviewers"], [])
+
     def test_direct_removal_and_alias_cannot_bypass_withdrawal(self):
         self.seat()
         self.db.execute("UPDATE agent_registry SET aliases = ARRAY['old-reader'] WHERE name = 'reader'")

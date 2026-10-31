@@ -5,6 +5,18 @@ from __future__ import annotations
 from . import storage, work
 
 
+def carried_reviewers(db, lot: int, names) -> list[str]:
+    """A mechanical carry cannot undo a withdrawal, including via an alias."""
+    import json
+
+    return [row["name"] for row in db.query(
+        "SELECT n.name FROM jsonb_array_elements_text(%s::jsonb) n(name)"
+        " WHERE NOT EXISTS (SELECT 1 FROM work_review_withdrawals w"
+        " WHERE w.work_item_id = %s AND w.withdrawn"
+        " AND w.reviewer = coalesce(ameesh_agent_primary_locked(n.name), n.name))",
+        (json.dumps(list(names)), int(lot)))]
+
+
 def change(cfg, db, name: str, *, reason: str, clear: bool = False,
            actor: str | None = None) -> dict:
     reason = (reason or "").strip()
