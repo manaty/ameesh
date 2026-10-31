@@ -297,8 +297,9 @@ root 0600, régulier, non lié, avec les champs exacts suivants :
 `version: 1`, `operation`, `schema`, `source_owner_dsn`, `restore_owner_dsn`,
 `controller_role`, `backup_role`, `restore_role`, `group_role`. Les noms SQL
 sont des identifiants minuscules distincts, sans préfixe `pg_`. Les deux DSN
-administrateurs sont des références privées explicites avec host, port, dbname,
-user ; aucun profil ambiant, service libpq ou `options` n'est admis.
+administrateurs sont des références privées explicites avec host, dbname,
+user et port pour la source ; le socket de restauration utilise le port par
+défaut, sans champ port ni hostaddr dans son DSN ; aucun profil ambiant, service libpq ou `options` n'est admis.
 Aucun DSN ne se transmet sur la ligne de commande. Les DSN de logins produits exigent
 `require_auth=scram-sha-256` : aucune négociation password/MD5/trust n'est
 acceptée. Les connexions administratives munies d'un mot de passe ont la même
@@ -351,17 +352,25 @@ adresses différents. Le consommateur crée une base aléatoire puis la supprime
 son identité nécessite CREATEDB, droit de cluster ; elle reste NOSUPERUSER,
 NOCREATEROLE, NOREPLICATION, NOBYPASSRLS et sans rôle parent. Aucun login de
 restauration n'est créé sur la source. Le cluster de vérification ne doit
-héberger aucune autre charge. Topologie #5165 (source c628f4c501eb) : initdb/pg_ctl directs, version
+héberger aucune autre charge. Topologie #5165 (décision mesh-design du 31/10, #176428) : initdb/pg_ctl directs, version
 choisie au moins égale au serveur source, données sous
 `/var/lib/ameesh-release-restore/<major>/data`, configuration root
 `/etc/ameesh-release-restore`, socket privé `/run/ameesh-release-restore`
 (0700), propriétaire OS `ameesh-restore` nologin ; unité
-`ameesh-release-restore.service`. Le port numérique du socket est 55432 ;
-il n'implique aucun accès TCP du consommateur. Le producteur root tourne toutes les 60 s
+`ameesh-release-restore.service`. Le cluster n'écoute sur aucun port TCP
+(`listen_addresses = ''`) et le DSN du socket n'indique aucun port. Le producteur root tourne toutes les 60 s
 et écrit au chemin exact `backup.json.restore_capacity`. Pour cette commande
 d'identités root, l'administration peer doit autoriser explicitement root vers
 le rôle administrateur par le seul socket privé ; un accès réservé à l'OS
 `ameesh-restore` ne suffit pas et ne doit pas être promu implicitement.
+Le nom SQL administrateur est explicite dans `restore_owner_dsn` et doit être
+superutilisateur. S'il s'agit de `ameesh-restore`, le provisionneur peut écrire
+`local all ameesh-restore peer map=release_admin`, avec les deux correspondances
+pg_ident `release_admin root ameesh-restore` et
+`release_admin ameesh-restore ameesh-restore`, pour la commande root et la sonde.
+La ligne suivante est `local all <restore_role> scram-sha-256` : toutes les bases
+sont nécessaires aux restaurations dans des bases aléatoires. Aucun accès host
+ou hostssl n'est configuré. Le rôle de restauration vient de l'entrée privée.
 Son provisionnement et le producteur de
 `restore_capacity` relèvent du lot compagnon #5165 : la mesure doit être faite
 sur le volume PostgreSQL cible ; les octets libres d'agents-3 ne prouvent pas

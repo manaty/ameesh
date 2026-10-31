@@ -107,10 +107,13 @@ def connection(dsn):
     require(set(p) <= {'host', 'hostaddr', 'port', 'dbname', 'user', 'password', 'sslmode',
                        'sslrootcert', 'sslcert', 'sslkey', 'connect_timeout', 'require_auth'},
             'explicit flat connection required; no services or options')
-    require(all(p.get(k) for k in ('host', 'port', 'dbname', 'user')), 'explicit endpoint required')
+    require(all(p.get(k) for k in ('host', 'dbname', 'user'))
+            and (p.get('port') or p.get('host') == RESTORE_SOCKET), 'explicit endpoint required')
     require(not p['dbname'].startswith(('postgresql://', 'postgres://')), 'nested database URI refused')
-    require(not any(c in p['host'] for c in ',\n\r') and ',' not in p['port']
+    require(not any(c in p['host'] for c in ',\n\r') and ',' not in p.get('port', '')
             and ',' not in p.get('hostaddr', ''), 'single endpoint required')
+    require(p['host'] != RESTORE_SOCKET or not p.get('hostaddr'),
+            'private socket must not have a TCP hostaddr')
     require(p.get('require_auth') in (None, 'scram-sha-256'), 'unsupported authentication policy')
     if p.get('password'):
         p['require_auth'] = 'scram-sha-256'

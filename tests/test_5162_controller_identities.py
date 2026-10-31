@@ -37,6 +37,17 @@ class PrivateInputTest(unittest.TestCase):
                 with self.assertRaises(tool.IdentityError):
                     tool.connection(dsn)
 
+    def test_private_socket_without_port_and_tcp_override_refusal(self):
+        owner = 'host=/run/ameesh-release-restore dbname=postgres user=ameesh-restore'
+        params = tool.connection(tool.login_dsn(owner, 'restore_login', 'test-secret'))
+        self.assertEqual(params['host'], tool.RESTORE_SOCKET)
+        self.assertNotIn('port', params)
+        self.assertEqual(params['require_auth'], 'scram-sha-256')
+        with self.assertRaisesRegex(tool.IdentityError, 'TCP hostaddr'):
+            tool.connection(owner + ' hostaddr=127.0.0.1')
+        with self.assertRaisesRegex(tool.IdentityError, 'explicit endpoint'):
+            tool.connection('host=example dbname=postgres user=admin')
+
     def test_cli_masks_exceptions_and_ignores_ambient_credentials(self):
         secret = uuid.uuid4().hex
         env = dict(os.environ, PGPASSWORD=secret, PGHOST='must-not-be-used.invalid')
