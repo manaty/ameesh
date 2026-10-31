@@ -33,8 +33,9 @@ class NonAdditiveTest(unittest.TestCase):
             " alter table t add constraint t_c check (c > 0);",
             "alter table t drop constraint t_c;",
             "create table u (id bigint); alter table u add constraint k check (id > 0);",
-            "create or replace function f(a text) returns int language sql as 'select 1';"
-            " revoke all on function f(text) from public; grant execute on function f(text) to r;",
+            "create function f(a text, b timestamptz default now()) returns int language sql"
+            " as $$select 1$$; revoke all on function f(text, timestamptz) from public;"
+            " grant execute on function f(text, timestamptz) to r;",
             "create table u (id bigint); revoke insert on table u from public;",
             "alter table t add column revoked_at timestamptz;",
             "drop view if exists v; create view v as select * from t;",
@@ -64,6 +65,20 @@ class NonAdditiveTest(unittest.TestCase):
             ("revoke all on function f(text) from public;", "revoke on f"),
             ("revoke all on all tables in schema s from r;", "revoke on all"),
             ("revoke r from u;", "privilege removed (revoke)"),
+            ("create or replace function f() returns int language sql as 'select 1';"
+             " revoke execute on function f() from app;", "revoke on f"),
+            ("create table if not exists t (id bigint); revoke insert on t from app;",
+             "revoke on t"),
+            ("create table if not exists t (id bigint);"
+             " alter table t add constraint k check (id > 0);", "add constraint k"),
+            ("create function f(a text) returns int language sql as 'select 1';"
+             " revoke all on function f(int) from public;", "revoke on f"),
+            ("drop function f(); create function f() returns int language sql as 'select 1';"
+             " revoke all on function f() from public;", "revoke on f"),
+            ("create table u (id bigint); revoke all on u, t from r;", "revoke on u"),
+            ("create table f (id bigint); revoke all on function f() from r;", "revoke on f"),
+            ("do $$ begin if false then create table t (id bigint); end if; end $$;"
+             " revoke insert on t from app;", "revoke on t"),
             ("alter table t add constraint k check (c > 0);", "add constraint k"),
             ("alter table t drop constraint k; alter table t add constraint k check (c > 0);",
              "add constraint k"),

@@ -497,11 +497,9 @@ _MARKER = re.compile(r"--\s*ameesh\s*:\s*non[- ]additive", re.IGNORECASE)
 #: d'avant. Les versions déjà livrées gardent leur classement : le rétablir
 #: ferait entrer leurs marqueurs dans `schema_non_additive_migrations`.
 _PRIVILEGES_CHECKED_AFTER = 528
-_REVOKE = re.compile(r"\brevoke\b[^;]*?\bon\s+(?:table\s+|function\s+|sequence\s+|view\s+)?"
-                     r"([\w.\"]+)|\brevoke\b")
-#: l'objet créé (ou remplacé) par la migration : le code d'avant ne s'en sert pas
-_CREATED = r"\bcreate\s+(?:or\s+replace\s+)?(?:table|function|sequence|view|materialized\s+view)" \
-           r"\s+(?:if\s+not\s+exists\s+)?%s(?![\w.\"])"
+_REVOKE = re.compile(r"\brevoke\b[^;]*?\bon\s+(?:(table|function|sequence)\s+)?([\w.\"]+)"
+                     r"\s*(\([^)]*\))?\s*(from\b)?|\brevoke\b")
+_DOLLAR_QUOTED = re.compile(r"\$(\w*)\$.*?\$\1\$")
 _ALTER_TABLE = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s[^;]*")
 _ADD_CONSTRAINT = re.compile(r"\badd\s+constraint\s+([\w\"]+)")
 #: le texte ne dit pas si une contrainte élargit ou resserre : celle qui ne
@@ -535,23 +533,49 @@ def non_additive(migration: Migration) -> list[str]:
     return reasons
 
 
-def _privilege_reasons(text: str, sql: str) -> list[str]:
-    """Droits retirés et contraintes posées sur ce qui existait déjà (#5055)."""
-    def created(name: str) -> bool:
-        return bool(re.search(_CREATED % re.escape(name), text))
+def _param_types(params: str, *, named: bool) -> list[str]:
+    """Types d'une signature ; `named` : le premier mot d'un paramètre est son nom."""
+    types = []
+    for param in params.strip(" ()").split(","):
+        words = re.split(r"\s+(?:default\b|=)|=", param)[0].split()
+        types.append(" ".join(words[1:] if named and len(words) > 1 else words))
+    return types
 
+
+def _proven_new(text: str, kind: str, name: str, signature: str = "") -> bool:
+    """`name` est-il prouvé neuf ? Seul un CREATE nu, hors corps conditionnel,
+    échoue sur un objet existant : `or replace`, `if not exists`, un drop
+    préalable et une autre surcharge laissent au code d'avant son objet."""
+    quoted = re.escape(name) + r"(?![\w.\"])"
+    outside = _DOLLAR_QUOTED.sub(" ", text)
+    kinds = {"table": r"table|view|materialized\s+view|sequence", "function": "function",
+             "sequence": "sequence"}[kind]
+    if re.search(r"\bdrop\s+(?:%s)\s+(?:if\s+exists\s+)?%s" % (kinds, quoted), outside):
+        return False
+    match = re.search(r"\bcreate\s+(?:%s)\s+%s\s*(\([^)]*\))?" % (kinds, quoted), outside)
+    if not match:
+        return False
+    if signature:
+        return bool(match.group(1)) and (_param_types(match.group(1), named=True)
+                                         == _param_types(signature, named=False))
+    return True
+
+
+def _privilege_reasons(text: str, sql: str) -> list[str]:
+    """Droits retirés et contraintes posées sur ce qui n'est pas prouvé neuf (#5055)."""
     reasons = []
     for match in _REVOKE.finditer(text):
-        if not (match.group(1) and created(match.group(1))):
-            reasons.append("privilege removed (revoke%s)"
-                           % (" on " + match.group(1) if match.group(1) else ""))
+        kind, name, signature, single = match.groups()
+        if not (name and single and _proven_new(text, kind or "table", name, signature or "")):
+            reasons.append("privilege removed (revoke%s)" % (" on " + name if name else ""))
     if not _CONSTRAINT_MARKER.search(sql):
         for statement in _ALTER_TABLE.finditer(text):
-            if created(statement.group(1)):
+            if _proven_new(text, "table", statement.group(1)):
                 continue
             reasons.extend("constraint possibly tightened (add constraint %s)" % name
                            for name in _ADD_CONSTRAINT.findall(statement.group(0)))
     return reasons
+
 
 def _applied_readonly(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:
     """Versions appliquées et leur empreinte, sans `create table` : vide si
