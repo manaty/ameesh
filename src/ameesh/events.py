@@ -41,6 +41,8 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        before staging mutations and at each step (#4880)
   staging.request      queued commit and elected execution attempt; survives
                        the launching turn, reused by candidate takeover (#4880)
+  git.lock_removed     an orphan git lock removed from a radar clone: path, age,
+                       size (no table: written by `resolutions`, #5179)
   packet.pause         a pause with a deadline (alert or automatic end) of the hourly packet tick, or its end
                        (no table: written by `paquet-horaire.py pause|resume`,
                        read by its tick and `role timers --check`, #4361)
@@ -97,7 +99,7 @@ TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
          "agent.moved",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
-         "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request",
+         "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request", "git.lock_removed",
          "packet.pause")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365

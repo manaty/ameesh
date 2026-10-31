@@ -3465,7 +3465,7 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
     if live and replayer is None:
         from . import radar
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name),
-                                        target=project.target)
+                                        target=project.target, db=db)
     # the radar reads the agents' refs, which may be stale either way, or gone
     # (a checkout recreated): each pass fetches the branch of every queued
     # lot and its target, scanned or not, and those tips decide

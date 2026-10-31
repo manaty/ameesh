@@ -63,6 +63,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1248,6 +1249,133 @@ def show_lines(rows: list[dict], lot: int) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# radar side: orphan git locks of the private clone (#5179)
+# --------------------------------------------------------------------------
+
+#: #5179 : âge minimal (s) d'un verrou git du clone radar pour le dire orphelin.
+#: Bien au-delà de l'opération git la plus longue du clone (`FETCH_TIMEOUT`,
+#: 180 s), réglable par `AMEESH_GIT_LOCK_STALE_S`.
+GIT_LOCK_STALE_S = float(os.environ.get("AMEESH_GIT_LOCK_STALE_S", "900"))
+#: suffixe de `radar.clone_dir` : seul un clone privé du radar est balayé, jamais
+#: un dépôt d'agent ni un clone jetable
+RADAR_CLONE_SUFFIX = ".clone"
+#: les verrous de premier niveau du dépôt ; `refs/**/*.lock` s'y ajoute
+GIT_TOP_LOCKS = ("index.lock", "HEAD.lock", "packed-refs.lock")
+
+
+def git_locks(path: str) -> list[str]:
+    """Les verrous git du clone `path`. `OSError` : arbre illisible."""
+    git_dir = os.path.join(path, ".git")
+    found = [os.path.join(git_dir, name) for name in GIT_TOP_LOCKS
+             if os.path.lexists(os.path.join(git_dir, name))]
+
+    def unreadable(exc: OSError) -> None:
+        raise exc
+
+    for root, _dirs, files in os.walk(os.path.join(git_dir, "refs"), onerror=unreadable):
+        found += [os.path.join(root, name) for name in files if name.endswith(".lock")]
+    return sorted(found)
+
+
+def git_process_in(path: str, proc_root: str = "/proc") -> bool | None:
+    """Un processus git travaille-t-il dans le clone `path` (son `cwd` y est, ou
+    sa ligne de commande le nomme) ? `None` : on ne peut pas l'exclure — `/proc`
+    illisible, ou un git dont le `cwd` n'est pas lisible. Un processus disparu
+    pendant la lecture ne compte pas."""
+    real = os.path.realpath(path)
+    inside = real + os.sep
+    try:
+        pids = [name for name in os.listdir(proc_root) if name.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as handle:
+                argv = os.fsdecode(handle.read()).split("\0")
+            name = os.path.basename(argv[0])
+            if name != "git" and not name.startswith("git-"):
+                continue
+            cwd = os.readlink(os.path.join(proc_root, pid, "cwd"))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return None
+        if cwd == real or cwd.startswith(inside) or any(real in arg for arg in argv[1:]):
+            return True
+    return False
+
+
+def _journal_removed(path: str, record: dict, db=None) -> None:
+    """Un verrou retiré : stderr, `<clone>.git-locks.log` à côté du clone, et
+    l'événement `git.lock_removed` quand l'appelant a une base. Le journal
+    n'interrompt jamais l'opération : le verrou est déjà retiré."""
+    print("ameesh: #5179 orphan git lock removed: %s" % json.dumps(record, sort_keys=True),
+          file=sys.stderr)
+    try:
+        with open(path + ".git-locks.log", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError as exc:
+        print("ameesh: #5179 lock journal of %s not written (%s)" % (path, exc), file=sys.stderr)
+    if db is None:
+        return
+    try:
+        from . import events
+        events.record(db, "git.lock_removed", "git-lock:%s" % record["path"][-280:], **record)
+    except Exception as exc:  # noqa: BLE001 - journal, voir ci-dessus
+        print("ameesh: #5179 lock event of %s not written (%s: %s)"
+              % (path, type(exc).__name__, exc), file=sys.stderr)
+
+
+def sweep_orphan_locks(path: str, *, db=None, stale_s: float | None = None,
+                       now: float | None = None, proc_root: str = "/proc") -> list[dict]:
+    """#5179 : retire les verrous git orphelins du clone radar `path` ; rend ce
+    qui a été retiré (chemin, âge, taille).
+
+    L'appelant tient le verrou de clone du mesh (`Replayer.locked`, #2432) : aucun
+    geste du mesh ne tient le clone. S'y ajoutent l'âge (`GIT_LOCK_STALE_S`) et
+    l'absence de processus git (`git_process_in`). Tout état illisible laisse le
+    verrou en place (fail closed) : l'atterrissage échoue alors sur ce fichier, et
+    l'alerte `merge_lock_stuck` le nomme après quelques échecs."""
+    stale_s = GIT_LOCK_STALE_S if stale_s is None else stale_s
+    if not os.path.isdir(os.path.join(path, ".git")):
+        return []  # pas encore cloné (`Replayer.ensure`)
+    try:
+        locks = git_locks(path)
+    except OSError as exc:
+        print("ameesh: #5179 locks of %s unreadable (%s): nothing removed" % (path, exc),
+              file=sys.stderr)
+        return []
+    if not locks:
+        return []
+    now = time.time() if now is None else now
+    removed: list[dict] = []
+    checked = False
+    for lock in locks:
+        try:
+            seen = os.lstat(lock)
+            if not stat.S_ISREG(seen.st_mode) or now - seen.st_mtime < stale_s:
+                continue
+            if not checked:
+                busy = git_process_in(path, proc_root)
+                if busy is not False:
+                    print("ameesh: #5179 git locks of %s kept: %s" % (
+                        path, "git process at work" if busy else "/proc unreadable"),
+                        file=sys.stderr)
+                    return removed
+                checked = True
+            os.unlink(lock)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            print("ameesh: #5179 lock %s kept (%s)" % (lock, exc), file=sys.stderr)
+            continue
+        record = {"path": lock, "age_s": round(now - seen.st_mtime), "size": seen.st_size}
+        _journal_removed(path, record, db)
+        removed.append(record)
+    return removed
+
+
+# --------------------------------------------------------------------------
 # radar side: replay in the private clone
 # --------------------------------------------------------------------------
 
@@ -1328,8 +1456,10 @@ class Replayer:
     sees the pair's resolution only, never another pair's nor a replaced one."""
 
     def __init__(self, repo: str, path: str, *, script: str | None = "auto",
-                 target: str = "", follow_forge: bool = True) -> None:
+                 target: str = "", follow_forge: bool = True, db=None) -> None:
         self.repo, self.path, self.script = repo, path, script
+        #: #5179 : où journaliser un verrou git orphelin retiré (facultatif)
+        self.db = db
         #: #3001 : le clone suit la forge (`track_forge`) ; un clone jetable
         #: qui ne rejoue que des résolutions (`rerere`) s'en passe
         self.follow_forge = follow_forge
@@ -1351,10 +1481,15 @@ class Replayer:
         tree under a gate (#2428). The wait is bounded
         (`CLONE_LOCK_WAIT_S`); the caller then raises `CloneBusy` and retries
         at its next pass, instead of acting on a tree someone else is using.
-        Reentrant in one thread."""
+        Reentrant in one thread.
+
+        #5179 : à la prise (hors réentrance), les verrous git orphelins du clone
+        radar sont retirés, avant toute écriture git du bloc."""
         lock = _clone_lock(self.path)
         lock.acquire(CLONE_LOCK_WAIT_S if wait is None else wait)
         try:
+            if lock.depth == 1 and self.path.rstrip(os.sep).endswith(RADAR_CLONE_SUFFIX):
+                sweep_orphan_locks(self.path, db=self.db)
             yield
         finally:
             lock.release()
