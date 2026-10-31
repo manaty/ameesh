@@ -751,3 +751,33 @@ Source : plan `e18`, conversation
 * **rotation** : résumé dans l'ancienne session puis nouvelle session (L11).
 * **renouvellement** : décision de rotation ou de compactage à une frontière
   de tour, selon la politique.
+
+## 9. Rejeu contrefactuel — `ameesh-context-replay/1`
+
+CTX-05b (#5135) rejoue un corpus §8 à travers les fonctions livrées
+(`AgentWorker.reread_budget_due`, `resident_runner.window_maintenance`), sans
+les recopier. Rien n'est activé : aucune écriture au registre ni au grand livre ;
+le rapport s'écrit hors dépôt, en `0600`.
+
+```
+ameesh context replay --corpus FILE --candidates FILE --out FILE [--force]
+```
+
+Les réglages candidats sont une entrée, jamais une valeur du banc :
+`{"candidates": [{"id", "match": {harness, model, role}, "settings": {…}}]}`, la
+première entrée qui correspond s'applique. Réglages admis :
+`turn_reread_budget`, `session_reread_budget`, `window_maintenance_share`,
+`window_input_reserve`, `window_output_reserve`, `context_max_tokens`,
+`session_max_tokens`, `session_min_turns`, `session_policy`. Un plafond ou la
+politique absents reprennent la valeur observée au tour ; le reste absent demeure
+éteint ou inconnu, et nommé.
+
+Chaque tour porte `observed` (lu du corpus) et `counterfactual` (`decision`,
+`cause`, `guard`, `reread`, `window`, `unknowns`), séparés ; `decision` à `null`
+= pas de rejeu (aucun candidat, ou session divergente). La synthèse par profil
+donne les écarts, les rotations évitées ou ajoutées (`unknown` : session non comparable, jamais comptée évitée), les inconnues et `judgeable`
+(tours avec un `C_last`, tours où CTX-04b peut juger) ; rien n'est additionné entre
+harnais. `decision.compacted` à `null` (non publié) vaut mesure inconnue pour la
+projection. Les limites (mesures de fin de tour, divergence après
+compaction ou rotation contrefactuelle, plafond de durée non rejoué) sont reprises
+dans le rapport.
