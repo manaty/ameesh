@@ -144,7 +144,7 @@ class SignedBootstrapRevokeAuthority(SignedBootstrapAuthority):
         return revoke_question(operation,self.bundle,expires_at=expires_at)
 
 
-def _run(journal,operation,bundle, *, authority,adapter,steps=STEPS,scopes_of=None):
+def _run(journal,operation,bundle, *, authority,adapter,steps=STEPS,scopes_of=None,predecessor=None):
     """Resume exact bootstrap intents; no automatic destructive rollback.
 
     adapter validates the real host/runtime closure before copying, preserves
@@ -171,8 +171,15 @@ def _run(journal,operation,bundle, *, authority,adapter,steps=STEPS,scopes_of=No
         binding=dict(operation=operation,digest=bundle['digest'])
         if reservation.exists() or reservation.is_symlink():
             if protocol.load(reservation)!=binding:
-                raise BootstrapError('host has another unresolved bootstrap')
+                prior = ({'operation': predecessor['operation'], 'digest': predecessor['digest']}
+                         if predecessor is not None else None)
+                if protocol.load(reservation) != prior:
+                    raise BootstrapError('host has another unresolved bootstrap')
+                approved('preflight')
+                protocol.save(reservation,binding)
         else:
+            if predecessor is not None and not (root/(operation+'.json')).exists():
+                raise BootstrapError('previous bootstrap reservation unavailable')
             protocol.save(reservation,binding)
         path=root/(operation+'.json')
         if path.exists() or path.is_symlink():

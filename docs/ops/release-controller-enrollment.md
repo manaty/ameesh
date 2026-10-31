@@ -217,6 +217,69 @@ réenrôlé avec le code intégrant `decisions.require_current` de #4991. Un bac
 ancien ne connaît pas la supersession : une décision remplacée y resterait
 exécutable. La nouvelle demande indique `--supersedes ID --supersedes-option
 install` ; seule la réponse signée `install` active le remplacement. La
-continuation doit vérifier les deux liens effectifs réciproques, puis rapprocher
-les anciens reçus sans les réécrire. Ce prérequis ne constitue pas une
-revendication de livraison de la continuation.
+continuation décrite ci-dessous vérifie les deux liens effectifs réciproques,
+puis rapproche les anciens reçus sans les réécrire.
+
+## Continuation native du bootstrap interrompu
+
+Le backend fournit désormais `continuation-question NEW --previous OLD
+--decision OLD_DECISION`, puis `continue-install NEW --decision NEW_DECISION`.
+Le bureau prépare d'abord NEW par le parcours `prepare` habituel : mêmes arbres,
+compte, politique, unité, turn et sceau ; seul `local_transport` peut changer la
+délégation. L'inventaire des fichiers précédents provient de l'état réel. Les
+arbres de stage restent disponibles pour le préflight. NEW et OLD sont deux
+identifiants distincts, jamais un renommage ou une édition de l'ancien stage.
+
+La première commande conserve `continuation.json` et produit la **nouvelle**
+question à signer, préfixée `Approve this exact bootstrap continuation and
+replacement delegation:`. Elle lie le digest du nouveau bundle, l'opération
+précédente, sa décision, l'empreinte exacte de son journal et le digest du code
+administratif enrôlé. Le bundle complet reste joint à la demande pour relecture.
+La demande emploie les options bootstrap exactes et `--supersedes OLD_DECISION
+--supersedes-option install`. La question bootstrap ordinaire de NEW ne vaut
+pas autorisation de continuation.
+
+L'ancien journal doit contenir les six premiers reçus natifs complets, avec
+éventuellement celui de validation ; il doit rester incomplet, sans intent
+d'activation. Un intent `validate` est permis. La chaîne append-only des gestes
+relie l'opération à la décision précédente. Avant chaque étape, la continuation
+vérifie que l'ancienne décision nomme la nouvelle comme remplaçante et que la
+nouvelle nomme l'ancienne, avec réponse `install` signée et preuve encore valide.
+Une demande en attente, une seule moitié du lien ou un ancien reçu modifié refuse.
+
+Sous le verrou permanent et le verrou de réservation de l'hôte, la réservation
+passe de OLD à NEW. Une réponse perdue après ce transfert se reprend sur NEW.
+Les anciens journaux et reçus ne sont ni déplacés ni réécrits. Les nouveaux
+reçus constatent les arbres immuables et le compte effectifs, rapprochés des
+intents natifs précédents ; ils ne republient pas les arbres et ne recréent pas
+le compte. Les fichiers de configuration ont de nouveaux snapshots dans NEW.
+La validation et l'activation des deux clés restent les dernières étapes,
+avec la readiness réelle. Chaque étape conserve intent et résultat dans le
+journal des gestes. Une dérive héritée est contrôlée à chaque reprise et avant
+validation/activation, même si le nouveau journal possède déjà ses reçus.
+
+## Ré-enrôlement après arrêt
+
+Une nouvelle opération d'enrôlement peut ajouter `previous_operation` à son
+`input.json`. Elle conserve une fenêtre fraîche et son propre stage, sa nouvelle
+clé générée sous mandat et ses sept documents. `prepare` exige le reçu terminal
+`stopped` de l'opération précédente, sans intent restant, lié à son bundle et à
+son InvocationID enregistré ; le service doit être arrêté et la file vide.
+Tous les documents installés doivent encore correspondre aux empreintes du
+bundle précédent. Un service seulement inactif, sans reçu d'arrêt signé, ne
+suffit pas.
+
+Le nouveau mandat d'enrôlement lie aussi l'ancienne opération, son bundle, son
+reçu d'arrêt, son instance et les empreintes des documents remplacés. La
+publication atomique remplace uniquement ces documents exacts, avec intent
+préalable ; une réponse perdue reprend ce même intent. Un fichier divergent ou
+disparu refuse. Les anciens stages, privées et reçus restent en place : la
+révocation des anciennes clés sur les destinations demeure une opération de
+délégation séparée. L'opération ne réécrit ni les arbres ni le verrou permanent.
+
+Le nouveau démarrage doit produire un InvocationID différent de celui arrêté.
+L'enrôleur enregistre l'identité observée immédiatement après l'appel de start,
+y compris si sa réponse se perd. Sans identité enregistrée à cet instant, une
+reprise ne peut pas adopter une instance active apparue ensuite ; l'intent
+reste incertain et nécessite un mandat de réconciliation. Une identité déjà
+observée doit rester identique pendant la readiness et les reprises.

@@ -293,6 +293,83 @@ class EnrollmentTest(unittest.TestCase):
         self.assertEqual(self.apply()['outcome'], 'ready')
         self.assertEqual(self.system.calls.count('start'), 1)
 
+    def new_enrollment(self):
+        import shutil
+        old_operation, old_stage = self.operation, self.stage
+        self.operation = 'replacement-enrollment'
+        self.stage = old_stage.parent / self.operation
+        shutil.copytree(old_stage, self.stage)
+        for name in ('bundle.json', 'receipt.json'):
+            (self.stage / name).unlink()
+        self.write(self.stage / 'input.json', dict(version=1, expires_at=int(time.time())+600,
+                                                 previous_operation=old_operation))
+        transport = dict(self.data['transport'], identity_file=str(self.stage / 'transport/identity'))
+        self.write(self.stage / 'transport.json', transport)
+        return old_stage
+
+    def test_reenrollment_requires_stopped_predecessor_and_preserves_its_journal(self):
+        self.prepare(); self.apply()
+        old_stage = self.new_enrollment()
+        with self.assertRaisesRegex(enroll.EnrollmentError, 'stopped|signed stop'):
+            self.prepare()
+        self.engine.apply('fixture-enrollment', 123, stop=True)
+        old_receipt = (old_stage / 'receipt.json').read_bytes()
+        prepared = self.prepare()
+        self.assertEqual(prepared['bundle']['previous']['operation'], 'fixture-enrollment')
+        # The new start must have a new systemd identity.
+        self.system.invocation = 'c' * 32
+        self.assertEqual(self.apply()['outcome'], 'ready')
+        self.assertEqual((old_stage / 'receipt.json').read_bytes(), old_receipt)
+        installed = json.loads(self.path(enroll.CONFIG + '/transport.json').read_bytes())
+        self.assertEqual(installed['identity_file'], str(self.stage / 'transport/identity'))
+        self.assertEqual(self.system.calls.count('start'), 2)
+        self.assertEqual(self.path(enroll.LOCK).stat().st_ino, self.lock_inode)
+
+    def test_reenrollment_refuses_drift_and_same_invocation(self):
+        self.prepare(); self.apply(); self.apply(stop=True)
+        self.new_enrollment()
+        target = self.path(enroll.CONFIG + '/database.json')
+        original = target.read_bytes()
+        self.write(target, dict(self.data['database'], schema='changed'))
+        with self.assertRaisesRegex(enroll.EnrollmentError, 'document changed'):
+            self.prepare()
+        target.write_bytes(original)
+        self.prepare()
+        with self.assertRaisesRegex(enroll.EnrollmentError, 'instance changed'):
+            self.apply()
+        self.assertNotEqual(json.loads((self.stage / 'receipt.json').read_bytes())['status'], 'ready')
+
+    def test_unobserved_start_cannot_adopt_later_foreign_instance(self):
+        self.prepare()
+        original = self.system.command
+        def lost(action):
+            if action == 'start':
+                self.system.calls.append(action)
+                raise OSError('start reply unavailable and no identity observed')
+            return original(action)
+        with mock.patch.object(self.system, 'command', side_effect=lost):
+            with self.assertRaises(OSError):
+                self.apply()
+        self.system.active = True
+        self.system.invocation = 'c' * 32
+        with self.assertRaisesRegex(enroll.EnrollmentError, 'uncertain'):
+            self.apply()
+        self.assertEqual(self.system.calls.count('start'), 1)
+
+    def test_reenrollment_lost_replace_reply_reconciles_exact_intent(self):
+        self.prepare(); self.apply(); self.apply(stop=True)
+        self.new_enrollment(); self.prepare()
+        original = enroll.admin.Backend.replace
+        def lost(path, text):
+            original(path, text)
+            raise OSError('lost replacement reply')
+        self.system.invocation = 'c' * 32
+        with mock.patch.object(enroll.admin.Backend, 'replace', side_effect=lost):
+            with self.assertRaises(OSError):
+                self.apply()
+        self.assertEqual(self.apply()['outcome'], 'ready')
+        self.assertEqual(self.system.calls.count('start'), 2)
+
     def test_incomplete_factory_and_queue_never_start_service(self):
         self.prepare()
         self.system.admission = False

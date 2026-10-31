@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Separate signed, create-only enrollment of the independent release service.
+"""Separate signed enrollment and stopped-instance replacement of the release service.
 
 Root stages seven private documents; prepare prints hashes and an exact signing
 question, never their contents. A distinct signed phase generates only a new
@@ -237,7 +237,8 @@ class Enrollment:
         if not stage.is_dir() or stat.S_IMODE(stage.stat().st_mode) != 0o700:
             raise EnrollmentError('private enrollment stage required')
         spec = document(read(stage / 'input.json'))
-        if (not isinstance(spec, dict) or set(spec) != {'version', 'expires_at'}
+        if (not isinstance(spec, dict) or set(spec) not in ({'version', 'expires_at'},
+                                                       {'version', 'expires_at', 'previous_operation'})
                 or type(spec['version']) is not int or spec['version'] != 1
                 or type(spec['expires_at']) is not int or spec['expires_at'] <= self.clock()):
             raise EnrollmentError('exact unexpired input required')
@@ -302,7 +303,8 @@ class Enrollment:
         values = {name: read(stage / (name + '.json')) for name in FILES}
         data = {name: document(value) for name, value in values.items()}
         spec = document(read(stage / 'input.json'))
-        if (not isinstance(spec, dict) or set(spec) != {'version', 'expires_at'}
+        if (not isinstance(spec, dict) or set(spec) not in ({'version', 'expires_at'},
+                                                       {'version', 'expires_at', 'previous_operation'})
                 or type(spec['version']) is not int or spec['version'] != 1
                 or type(spec['expires_at']) is not int
                 or (not allow_expired and spec['expires_at'] <= self.clock())):
@@ -395,6 +397,27 @@ class Enrollment:
             if not active.is_dir() or any(active.glob('*.active.json')):
                 raise EnrollmentError('controller reservation present')
 
+    def predecessor(self, operation, spec):
+        previous = spec.get('previous_operation')
+        if previous is None:
+            return None
+        if (not isinstance(previous, str) or previous == operation
+                or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}', previous) is None):
+            raise EnrollmentError('distinct previous enrollment required')
+        stage = self.stage(previous)
+        old = document(read(stage / 'bundle.json'))
+        receipt = document(read(stage / 'receipt.json'))
+        if (old.get('operation') != previous or old.get('host') != self.backend.enrollment['host']
+                or old.get('machine_id') != self.backend.machine()
+                or receipt.get('digest') != protocol.identity(old)
+                or receipt.get('status') != 'stopped' or receipt.get('intent') is not None
+                or set(receipt.get('files', [])) != set(FILES)
+                or re.fullmatch(r'[0-9a-f]{32}', receipt.get('invocation') or '') is None):
+            raise EnrollmentError('previous enrollment must have a complete signed stop receipt')
+        return dict(operation=previous, bundle_digest=protocol.identity(old),
+                    receipt_sha256=protocol.identity(receipt), invocation=receipt['invocation'],
+                    files=old['files'])
+
     def bundle(self, operation, spec, data, values):
         bundle = dict(version=1, operation=operation, host=data['enrollment']['host'],
                       machine_id=self.backend.machine(), host_key_sha256=self.backend.host_key(),
@@ -406,6 +429,9 @@ class Enrollment:
                       unit_sha256=sha(unit.UNIT.encode()), directories=list(DIRECTORIES),
                       service='ameesh-release-controller.service',
                       rollback='separate signed stop; retain documents, state and journals')
+        previous = self.predecessor(operation, spec)
+        if previous is not None:
+            bundle['previous'] = previous
         if not isinstance(bundle['host_key_sha256'], str) or re.fullmatch('[0-9a-f]{64}', bundle['host_key_sha256']) is None:
             raise EnrollmentError('host key unavailable')
         return bundle
@@ -415,10 +441,14 @@ class Enrollment:
         self.observe(data)
         if self.system.state().get('ActiveState') not in ('inactive', 'failed'):
             raise EnrollmentError('controller must be stopped before preparation')
-        for name in FILES:
-            if os.path.lexists(self.path(CONFIG + '/' + name + '.json')):
-                raise EnrollmentError('existing enrollment is never overwritten')
         bundle = self.bundle(operation, spec, data, values)
+        for name in FILES:
+            target = self.path(CONFIG + '/' + name + '.json')
+            if 'previous' in bundle:
+                if sha(read(target)) != bundle['previous']['files'][CONFIG + '/' + name + '.json']:
+                    raise EnrollmentError('previous published document changed')
+            elif os.path.lexists(target):
+                raise EnrollmentError('existing enrollment is never overwritten')
         target = stage / 'bundle.json'
         if os.path.lexists(target):
             if document(read(target)) != bundle:
@@ -483,14 +513,27 @@ class Enrollment:
                 target = self.path(CONFIG + '/' + name + '.json')
                 approved('publish')
                 if os.path.lexists(target):
-                    if name not in state['files'] and state['intent'] != name:
-                        raise EnrollmentError('unowned existing enrollment refused')
-                    if read(target) != raw:
-                        raise EnrollmentError('published private document differs')
+                    actual = read(target)
+                    previous = bundle.get('previous')
                     if name in state['files']:
-                        continue  # Preserve any later unresolved publication intent.
+                        if actual != raw:
+                            raise EnrollmentError('published private document differs')
+                        continue
+                    if previous is not None:
+                        old_hash = previous['files'][CONFIG + '/' + name + '.json']
+                        if sha(actual) != old_hash and not (state['intent'] == name and actual == raw):
+                            raise EnrollmentError('previous published document changed')
+                        if actual != raw:
+                            state['intent'] = name; protocol.save(journal, state)
+                            approved('publish')
+                            admin.Backend.replace(target, raw.decode('utf-8'))
+                    else:
+                        if state['intent'] != name:
+                            raise EnrollmentError('unowned existing enrollment refused')
+                        if actual != raw:
+                            raise EnrollmentError('published private document differs')
                 else:
-                    if name in state['files']:
+                    if name in state['files'] or 'previous' in bundle:
                         raise EnrollmentError('published document removed')
                     state['intent'] = name; protocol.save(journal, state)
                     admin.Backend.write(target, raw.decode('utf-8'))
@@ -512,7 +555,7 @@ class Enrollment:
             current = self.system.state()
             if state['intent'] == 'start':
                 # Lost start reply: only observe; never submit a second start.
-                if current.get('ActiveState') != 'active':
+                if current.get('ActiveState') != 'active' or state['invocation'] is None:
                     raise EnrollmentError('service start uncertain; reconcile retained intent')
             else:
                 if current.get('ActiveState') not in ('inactive', 'failed'):
@@ -520,11 +563,25 @@ class Enrollment:
                 self.system.command('daemon-reload')
                 approved('start')
                 state['intent'] = 'start'; protocol.save(journal, state)
-                self.system.command('start')
+                try:
+                    self.system.command('start')
+                finally:
+                    # Capture the instance immediately even on a lost reply.
+                    # If it cannot be observed here, replay may not adopt a
+                    # subsequently active service with an unrelated identity.
+                    observed = self.system.state()
+                    identity = observed.get('InvocationID')
+                    if (observed.get('ActiveState') == 'active'
+                            and isinstance(identity, str)
+                            and re.fullmatch(r'[0-9a-f]{32}', identity)
+                            and identity != bundle.get('previous', {}).get('invocation')):
+                        state.update(status='starting', invocation=identity)
+                        protocol.save(journal, state)
             invocation = self.system.state().get('InvocationID')
             if not isinstance(invocation, str) or re.fullmatch(r'[0-9a-f]{32}', invocation) is None:
                 raise EnrollmentError('current service identity unavailable')
-            if state['invocation'] is not None and state['invocation'] != invocation:
+            if (state['invocation'] is None or state['invocation'] != invocation
+                    or invocation == bundle.get('previous', {}).get('invocation')):
                 raise EnrollmentError('service start instance changed')
             state.update(status='starting', invocation=invocation)
             protocol.save(journal, state)
