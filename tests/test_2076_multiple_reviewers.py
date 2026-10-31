@@ -292,16 +292,11 @@ class MultipleReviewersTest(PgTestCase):
         migration = Path(REPO, "src/ameesh/migrations/0456_work_item_reviewers.sql").read_text()
         audit = Path(REPO, "src/ameesh/migrations/0462_reviewer_audit.sql").read_text()
         spelling = Path(REPO, "src/ameesh/migrations/0516_agent_rename.sql").read_text()
-        self.db.execute("DROP TRIGGER work_item_reviewers_sync ON work_items")
-        self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
-        # 0516 : le trigger d'orthographe des noms d'agents dépend de la colonne.
-        self.db.execute("DROP TRIGGER IF EXISTS ameesh_agent_spelling ON work_items")
-        self.db.execute("ALTER TABLE work_items DROP COLUMN reviewers")
-        # LIFO : 0456 d'abord, puis 0462 qui rétablit le trigger d'audit,
-        # puis 0516 qui rétablit celui des noms d'agents.
-        self.addCleanup(self.db.script, spelling)
-        self.addCleanup(self.db.script, audit)
-        self.addCleanup(self.db.script, migration)
+        def restore():
+            for sql in (migration, audit, spelling):
+                self.db.script(sql)
+
+        self.drop_work_item_column("reviewers", restore)
         self.db.__dict__.pop("_has_reviewers", None)
         self.db.execute("UPDATE work_items SET reviewer = 'first' WHERE id = %s",
                         (self.lot["id"],))

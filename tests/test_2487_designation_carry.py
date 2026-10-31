@@ -597,6 +597,13 @@ class CarriedFreezeTest(_Fixture):
         _, outcome = self.freeze(changed)
         self.assertEqual(outcome["state"], "waiting", outcome)
         self.assertEqual(self.designated(), [])
+        # #5087: retiring automatic seats at the new freeze does not revoke
+        # the old reviewers' right to offer a fresh opinion on the lot.
+        self.verdict("rev1", changed)
+        self.verdict("rev2", changed)
+        self.assertEqual(self.db.query("SELECT * FROM work_review_withdrawals"
+                                       " WHERE work_item_id = %s AND withdrawn",
+                                       (self.lot,)), [])
 
 
 class NotCarriedTest(_Fixture):
