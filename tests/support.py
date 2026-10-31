@@ -731,6 +731,35 @@ def _bench_upkeep(db) -> None:
 class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
 
+    def drop_work_item_column(self, column, restore):
+        """Remove a compatibility column; restore its exact UPDATE OF triggers.
+
+        Register cleanup before DDL: even a failed DROP must leave the shared
+        class schema with its guards. The caller restores the column first.
+        """
+        if column not in {"reviewer", "reviewers"}:
+            raise ValueError(column)
+        triggers = self.db.query(
+            "SELECT t.tgname, pg_get_triggerdef(t.oid) AS definition "
+            "FROM pg_trigger t JOIN pg_attribute a ON a.attrelid = t.tgrelid "
+            "WHERE t.tgrelid = 'work_items'::regclass AND NOT t.tgisinternal "
+            "AND a.attname = %s AND a.attnum = ANY(t.tgattr)", (column,))
+
+        def restore_schema():
+            restore()
+            for trigger in triggers:
+                name = trigger["tgname"].replace('"', '""')
+                self.db.execute(f'DROP TRIGGER IF EXISTS "{name}" ON work_items')
+                self.db.execute(trigger["definition"])
+            self.db.__dict__.pop("_has_" + column, None)
+
+        self.addCleanup(restore_schema)
+        for trigger in triggers:
+            name = trigger["tgname"].replace('"', '""')
+            self.db.execute(f'DROP TRIGGER "{name}" ON work_items')
+        self.db.execute(f'ALTER TABLE work_items DROP COLUMN {column}')
+        self.db.__dict__.pop("_has_" + column, None)
+
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()

@@ -89,7 +89,9 @@ class CompatibilityTest(PgTestCase):
             if not hasattr(old, 'conn'):
                 self.skipTest('named prepared plans are specific to psycopg')
             old.conn.prepare_threshold = 5  # pre-fix psycopg default
-        self.db.execute('ALTER TABLE work_items DROP COLUMN reviewers CASCADE')
+        self.drop_work_item_column(
+            "reviewers", lambda: self.db.script(
+                (ROOT / 'src/ameesh/migrations/0456_work_item_reviewers.sql').read_text()))
         self.db.execute('DROP TABLE review_catch_up')
         work = storage.of(old).work
         for _ in range(8):
