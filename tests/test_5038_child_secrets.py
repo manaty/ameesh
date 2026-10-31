@@ -212,7 +212,11 @@ pathlib.Path(sys.argv[1]).write_text('ready')
 time.sleep(30)
 """
             env = E.for_child([sys.executable], os.environ)
-            env.update(PYTHONPATH=SRC, AMEESH_TURN_ID="synthetic-turn")
+            # argv[0] deliberately hides the interpreter path. Relocated
+            # Python builds (hostedtoolcache in CI) need their real prefixes
+            # to find the standard library before executing this helper.
+            env.update(PYTHONPATH=SRC, AMEESH_TURN_ID="synthetic-turn",
+                       PYTHONHOME=os.pathsep.join((sys.base_prefix, sys.base_exec_prefix)))
             with subprocess.Popen(["ameesh", "-c", code, str(marker)], executable=sys.executable,
                                   env=env, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.PIPE, text=True) as child:
