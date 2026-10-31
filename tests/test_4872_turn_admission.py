@@ -132,18 +132,20 @@ class TurnAdmissionTest(PgTestCase):
         self.admit('again')
 
     def test_event_sql_failure_preserves_admission_and_overdraft_settlement(self):
+        self.db.execute("alter table ameesh_events add constraint test_sandbox_event_failure"
+                        " check (type !~ '^sandbox[.]') not valid")
+        self.addCleanup(self.db.execute,
+                        "alter table ameesh_events drop constraint test_sandbox_event_failure")
         from ameesh import db as db_mod
         for driver in ('psycopg', 'psql'):
             with self.subTest(driver=driver):
                 db = db_mod.connect(self.cfg, driver=driver)
                 self.addCleanup(db.close)
                 snapshot = self.snapshot(driver)
-                with mock.patch.object(sandbox, 'bind', return_value='SELECT 1/0'), self.assertLogs(
-                        sandbox.__name__, level='WARNING'):
+                with self.assertLogs(sandbox.__name__, level='WARNING'):
                     self.admit(driver, driver, db=db, sandbox=snapshot)
                 self.spend(driver, 3, relay=True)
-                with mock.patch.object(sandbox, 'bind', return_value='SELECT 1/0'), self.assertLogs(
-                        sandbox.__name__, level='WARNING'):
+                with self.assertLogs(sandbox.__name__, level='WARNING'):
                     with db.transaction() as tx:
                         row = tx.query('select * from sandbox_turns where spend_key=%s', (driver,))[0]
                         api.settle_tx(tx, driver, 3, sandbox_turn=row)

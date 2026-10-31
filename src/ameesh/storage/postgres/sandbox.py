@@ -13,8 +13,6 @@ import hashlib
 import json
 import logging
 
-from ...db import bind, sql_literal
-
 from ... import jcs
 
 TERMINAL = frozenset(('succeeded', 'failed', 'cancelled', 'expired', 'lost'))
@@ -34,14 +32,21 @@ def emit_observation(tx, event_type, object_ref, data):
     query cancellation). Success commits with the transition, so rollback
     cannot leave an event and replay cannot duplicate its result.
     """
-    statement = bind("insert into ameesh_events (type, object, data) values (%s, %s, %s::jsonb)",
-                     (event_type, object_ref, json.dumps(data)))
-    body = ("BEGIN PERFORM set_config('ameesh.sandbox_event_error', '', true); "
-            "BEGIN EXECUTE " + sql_literal(statement) + "; "
-            "EXCEPTION WHEN query_canceled OR OTHERS THEN "
-            "PERFORM set_config('ameesh.sandbox_event_error', SQLSTATE, true); "
-            "END; END")
-    tx.execute("DO " + sql_literal(body))
+    # psql binds every statement once. Keep payload out of DO source: an
+    # identifier containing "%s" must never be parsed as another placeholder.
+    tx.query("select set_config('ameesh.sandbox_event', %s, true)",
+             (json.dumps({'type': event_type, 'object': object_ref, 'data': data}),))
+    tx.execute("""DO $$
+        BEGIN
+            PERFORM set_config('ameesh.sandbox_event_error', '', true);
+            BEGIN
+                INSERT INTO ameesh_events (type, object, data)
+                SELECT event->>'type', event->>'object', event->'data'
+                FROM (SELECT current_setting('ameesh.sandbox_event')::jsonb AS event) payload;
+            EXCEPTION WHEN query_canceled OR OTHERS THEN
+                PERFORM set_config('ameesh.sandbox_event_error', SQLSTATE, true);
+            END;
+        END $$""")
     error = tx.query("select current_setting('ameesh.sandbox_event_error') as error")[0]['error']
     if error:
         logging.getLogger(__name__).warning("sandbox event %s could not be recorded (SQLSTATE %s)",
