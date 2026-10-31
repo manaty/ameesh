@@ -20,7 +20,7 @@ L100 T5 (#4386): it serves the ``cli`` capability, ``ameesh module dev
 sync-merges | sync-github | project-github | merge-pr | review-class``. The
 old commands (``ameesh work sync-merges | sync-github | project-github |
 merge-pr``, ``ameesh review-class``) stay aliases without a removal date
-(L104 removes them): both names run the same parser and handler, so outputs
+(L104 decision 2): both names run the same parser and handler, so outputs
 and exit codes are the same.
 
 L102 T1 (#4391): it declares the vocabulary of the work items it carries,

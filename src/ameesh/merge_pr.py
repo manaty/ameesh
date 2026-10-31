@@ -3,7 +3,8 @@
 
 The merge gesture moved to the development module; the two names resolve to
 the same module object, so every importer and every test that patches a module
-global by the old name keeps working unchanged. L104 removes this alias.
+global by the old name keeps working unchanged. Retained compatibility
+alias, declared and dated in tests/test_generic_core.py (L104 T6).
 """
 from __future__ import annotations
 
