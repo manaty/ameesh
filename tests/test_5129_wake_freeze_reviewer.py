@@ -149,6 +149,33 @@ class WakeMissingFamilyTest(_ActivationFixture, PgTestCase):
         self.assertEqual(len([note for note in self.split_notes()
                               if note.startswith(LIFT_MARK)]), 1)
 
+    def test_a_recovery_does_not_redesignate_a_removed_seat(self):
+        # B1 cx3/auditeur sur e5ebbbcf9d4c : la reprise d'une attente ne doit
+        # pas réinscrire un siège que le pilote a retiré, même quand la levée
+        # d'un dormeur reconstruit une partie du vivier.
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'stopped'"
+            " WHERE name IN ('r2', 'r3')")
+        _mark, waiting = self.freeze()
+        self.assertEqual(waiting["state"], rd.WAITING)
+        self.assertEqual(set(designated(work.get(self.db, self.lot))), {"r1"})
+        # Le pilote retire r1 du gel ; r2 redevient disponible mais dort.
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY[]::text[] WHERE id = %s",
+            (self.lot,))
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'idle' WHERE name = 'r2'")
+        self.asleep("r2")
+        out = act.designate(self.cfg, self.db, self.lot)
+        item = work.get(self.db, self.lot)
+        self.assertEqual(out["state"], rd.WAITING)
+        # r1 retiré n'est pas réinscrit ; r2 est levé et prend le siège.
+        self.assertEqual(set(designated(item)), {"r2"})
+        self.assertFalse(registry.get(self.db, "r2")["operator_paused"])
+        self.assertEqual(self.lifts("r1"), [])
+        self.assertTrue(any(note.startswith(LIFT_MARK)
+                            for note in self.split_notes()))
+
     def test_a_human_pause_leaves_the_family_missing_and_the_message_unchanged(self):
         self.asleep("r2", actor="human:alice", principal="human:alice")
         self.asleep("r3", actor="human:alice", principal="human:alice")

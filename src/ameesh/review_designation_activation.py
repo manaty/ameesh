@@ -2765,7 +2765,7 @@ class _FloorPort(_ForcedPort):
 
 
 def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
-                             inputs: Inputs) -> Inputs:
+                             inputs: Inputs, *, excluded=()) -> Inputs:
     """#5129 : réveille les relecteurs désignés que le sommeil roadmap retient.
 
     Quand la sélection de ce gel manque une famille de la politique dont des
@@ -2782,9 +2782,18 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
     du sommeil automatique : une pause humaine ou budgétaire reste, et la
     désignation attend comme avant. Une lecture impossible rend les entrées
     inchangées, jamais une levée au hasard.
+
+    `excluded` (#3617/#3661) : les sièges que le pilote a retirés de la colonne
+    de CE gel. Ils ne sont ni repris dans `previous`, ni rendus disponibles par
+    la levée, ni réintroduits dans le vivier : le vivier de base reste
+    `inputs.candidates`, déjà filtré par l'appelant, et seules les entrées des
+    dormeurs y sont remplacées par leur version réveillée. Reconstruire tout le
+    registre perdrait ce retrait et pourrait redésigner un siège retiré
+    (B1 des avis cx3 et auditeur du 31/10 sur #5129).
     """
     from . import file_decoupage as fd
 
+    excluded = {str(name or "").strip() for name in excluded or ()} - {""}
     policy = inputs.policy
     required = int(policy.required or 0)
     if required <= 0 or inputs.unknown_authors:
@@ -2808,7 +2817,8 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
         existing = None
     if existing is not None and existing.get("state") == rd.WAITING:
         previous = [dict(row) for row in existing.get("reviewers") or ()
-                    if isinstance(row, Mapping)]
+                    if isinstance(row, Mapping)
+                    and str((row or {}).get("name") or "").strip() not in excluded]
     try:
         listing = registry.overview(tx)
         loads = _loads(tx)
@@ -2825,7 +2835,7 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
         row = dict(row or {})
         name = str(row.get("name") or "").strip()
         clear = dict(row)
-        if (name and row.get("operator_paused")
+        if (name and name not in excluded and row.get("operator_paused")
                 and str(row.get("operator_pause_by") or "") == fd.SLEEP_ACTOR
                 and fd.project_of_sleep_reason(
                     str(row.get("operator_pause_reason") or "")) == project):
@@ -2850,10 +2860,19 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
             already=list(inputs.manual_seats), fixers=inputs.correctors,
             advances=inputs.advances, automatic=previous)
         # La même sélection sur le vivier réveillé : elle nomme les sièges que
-        # le sommeil retient, sans en réveiller plus que nécessaire.
-        shadow = _candidates(awake_listing, loads=loads, project=project,
-                             families=families, pilot=pilot,
-                             closed_hosts=closed)
+        # le sommeil retient, sans en réveiller plus que nécessaire. Le vivier
+        # de base est celui du gel (retraits compris) ; on n'y remplace que
+        # les entrées des dormeurs, jamais le registre entier.
+        awake_candidates = _candidates(
+            awake_listing, loads=loads, project=project, families=families,
+            pilot=pilot, closed_hosts=closed)
+        shadow_by_name = {str(candidate.name or "").strip(): candidate
+                          for candidate in inputs.candidates or ()}
+        for candidate in awake_candidates:
+            key = str(candidate.name or "").strip()
+            if key in sleeping and key in shadow_by_name:
+                shadow_by_name[key] = candidate
+        shadow = list(shadow_by_name.values())
         preview = rd.select(
             required=required, authors=inputs.authors, candidates=shadow,
             families=families, already=list(inputs.manual_seats),
@@ -2884,22 +2903,16 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
             lifted.add(name)
     if not lifted:
         return inputs
-    # Le vivier relu depuis la même liste, la pause levée : la sélection verra
-    # le relecteur exactement comme la base le porte après le geste.
-    refreshed = []
-    for row in listing or ():
-        row = dict(row or {})
-        if str(row.get("name") or "") in lifted:
-            row["operator_paused"] = False
-            row["operator_pause_reason"] = ""
-            row["operator_pause_by"] = ""
-            row["operator_pause_for"] = ""
-            row["operator_pause_ts"] = None
-            row["operator_pause_until"] = None
-        refreshed.append(row)
-    fresh = _candidates(refreshed, loads=loads, project=project,
-                        families=families, pilot=pilot, closed_hosts=closed)
-    return dataclasses.replace(inputs, candidates=fresh)
+    # Le vivier du gel, la pause levée : seules les entrées des relecteurs
+    # réveillés passent de « indisponible » à « disponible ». Le reste du
+    # vivier — retraits du pilote compris — est inchangé.
+    fresh_by_name = {str(candidate.name or "").strip(): candidate
+                     for candidate in inputs.candidates or ()}
+    for candidate in awake_candidates:
+        key = str(candidate.name or "").strip()
+        if key in lifted and key in fresh_by_name:
+            fresh_by_name[key] = candidate
+    return dataclasses.replace(inputs, candidates=list(fresh_by_name.values()))
 
 
 def _selection(inputs: Inputs, port, *, force: bool = False,
@@ -3872,8 +3885,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 return _stale(freeze)
             # #5129 : une reprise d'attente lève aussi le sommeil de la
             # famille manquante, sinon le pilote doit encore la réveiller à
-            # la main.
-            inputs = _wake_sleeping_reviewers(tx, item, freeze, inputs)
+            # la main. Les sièges retirés de la colonne (#3617/#3661) restent
+            # exclus de la prévision et du vivier final (B1 des avis du 31/10).
+            inputs = _wake_sleeping_reviewers(tx, item, freeze, inputs,
+                                              excluded=removed)
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
                                                 at_freeze=False, retired=removed),
                              force=force, reported=reported)
