@@ -138,6 +138,10 @@ class DurablePauseTest(PgTestCase):
             start, windows, lambda at: None, now)
         self.assertEqual(equivalent, now)
         self.assertIsNotNone(crossed)
+        # Even time accrued before the pause must not escalate while it is open.
+        equivalent, _ = packet_pause.suspended_start(
+            windows[0]["start"] - 9000, windows, lambda at: None, now)
+        self.assertEqual(equivalent, now)
         # Closing a pause that started before the history cutoff still keeps
         # the whole suspension; time runs only after its sourced announcement.
         packet_pause.resume(self.db, project="ameesh", target="main", by="pilot",

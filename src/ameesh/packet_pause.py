@@ -185,8 +185,9 @@ def windows(db, *, project: str, now: float | None = None) -> list[dict]:
         except (KeyError, TypeError, ValueError):
             continue
         current = open_.pop(obj, None)
-        if current is not None and ts < current["end"]:
-            current["end"] = ts
+        if current is not None:
+            current["end"] = min(ts, current["end"])
+            current["open"] = False
         if data.get("state") != "paused":
             continue
         try:
@@ -196,7 +197,7 @@ def windows(db, *, project: str, now: float | None = None) -> list[dict]:
         if until <= ts:
             continue
         window = {"start": ts, "end": max(until, now) if data.get("await_announcement") else until,
-                  "until": int(until),
+                  "until": int(until), "open": bool(data.get("await_announcement")),
                   "reason": data.get("reason") or "", "by": data.get("by") or "",
                   "target": data.get("target") or obj[len(prefix):]}
         open_[obj] = window
@@ -224,7 +225,7 @@ def suspended_start(start: float, pauses, next_slot, now: float
         if window["end"] <= cursor or window["start"] >= now or cursor >= now:
             continue
         crossed = window
-        if window["end"] > now:
+        if window["end"] > now or (window.get("open") and window["end"] >= now):
             return now, window
         accrued += max(0.0, window["start"] - cursor)
         after = next_slot(window["end"])
