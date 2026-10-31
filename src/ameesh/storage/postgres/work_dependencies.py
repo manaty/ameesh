@@ -158,10 +158,14 @@ class WorkDependencies(Contract):
         ids = sorted({int(i) for i in item_ids})
         if not ids:
             return []
+        # #4621 : la cause dependency-blocking nomme la phase de livraison
+        # (`merged`/`promoted`), comme les états de policy, pas le core
+        # `delivered`. Le prédicat `blocking` garde sa définition (lifecycle
+        # DELIVERED) : seul l'affichage change.
         return self.db.query("""
             SELECT d.work_item_id, d.blocker_id, d.created_by,
                    extract(epoch FROM d.created_at)::float8 AS created_ts,
-                   w.state AS blocker_state,
+                   coalesce(to_jsonb(w)->>'legacy_state', w.state) AS blocker_state,
                    w.branch AS blocker_branch,
                    (SELECT m.sha FROM work_item_milestones m
                      WHERE m.work_item_id = w.id AND m.kind = 'frozen'
