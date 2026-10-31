@@ -430,7 +430,7 @@ ameesh module --list
 ameesh module dev sync-merges|sync-github|project-github|merge-pr|review-class …
 ameesh module it delivery|proof|show|qa …
 ameesh module <pipeline> adopt <id>
-ameesh module <pipeline> advance <id> --to <stage> --guard <guard> [--evidence JSON]
+ameesh module <pipeline> advance <id> --to <stage> --guard <guard> [--ref KEY=VALUE]
 ameesh module <pipeline> hold <id> --hold blocked
 ameesh module <pipeline> release <id>
 ```
