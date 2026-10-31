@@ -93,8 +93,8 @@ def machine() -> str:
     return stdlib_platform.machine() or ""
 
 
-from .process import (PROC, HoldersUnreadable, alive, ancestry, become_subreaper,  # noqa: E402
-                      boot_time, children,
+from .process import (PROC, EXECUTOR_NAMES, HoldersUnreadable, alive, ancestry,  # noqa: E402
+                      become_subreaper, become_undumpable, boot_time, children,
                       command_argv, command_line, environ, env_values, fd_path, holders,
                       open_fd_count, parent_pid, process_table, process_group_exists,
                       reap, exited_child, exited_child_status, self_cgroup_paths, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
@@ -127,7 +127,8 @@ GUARANTEES = (
 __all__ = [
     "NotAvailable", "HoldersUnreadable", "SYSTEM", "is_linux", "is_macos", "is_windows", "has_psutil",
     "GUARANTEES",
-    "alive", "ancestry", "become_subreaper", "boot_time", "command_line", "environ",
+    "alive", "ancestry", "become_subreaper", "become_undumpable", "boot_time", "command_line", "environ",
+    "EXECUTOR_NAMES",
     "env_values", "fd_path",
     "children", "holders", "open_fd_count", "process_table", "process_group_exists", "reap", "exited_child", "exited_child_status", "start_time", "same_start",
     "command_argv", "parent_pid", "self_cgroup_paths",

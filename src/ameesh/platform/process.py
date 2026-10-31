@@ -322,7 +322,7 @@ def environ(pid: int | None = None) -> dict | None:
     return out
 
 
-def env_values(name: str) -> dict:
+def env_values(name: str, allow=()) -> dict:
     """#339 : la valeur de la variable `name` dans l'environnement INITIAL de
     chaque processus de CET utilisateur (uid réel), zombies exclus :
     {"values": {valeur: [pid, …]}, "unread": [début, …]}. `unread` : les
@@ -330,8 +330,15 @@ def env_values(name: str) -> dict:
     dont l'environnement est illisible (non « dumpable ») — l'appelant les
     tient pour inconnus, jamais pour absents. Un processus disparu pendant
     la lecture est omis. `NotAvailable` si l'OS ne permet pas de lister les
-    processus ni de lire leur environnement."""
+    processus ni de lire leur environnement.
+
+    `allow` (L230, comme `holders`) : noms des processus dont l'illisibilité
+    n'est PAS un doute. #5029 : l'exécuteur se rend non-dumpable et ne porte
+    jamais d'identifiant de tour ; sans cette liste, sa propre famille de
+    processus empêcherait de solder un tour resté ouvert (le doute est
+    volontairement sans borne haute pour un tour inachevé)."""
     uid = os.getuid() if hasattr(os, "getuid") else None
+    allow = frozenset(allow or ())
     values: dict = {}
     unread: list = []
     ps = _psutil()
@@ -348,6 +355,8 @@ def env_values(name: str) -> dict:
             except ps.NoSuchProcess:
                 continue
             except Exception:
+                if allow and _proc_ok() and _allowed_proc(int(info["pid"]), allow):
+                    continue
                 unread.append(info.get("create_time"))
                 continue
             if value:
@@ -374,6 +383,8 @@ def env_values(name: str) -> dict:
         except FileNotFoundError:
             continue
         except OSError:
+            if allow and _allowed_proc(pid, allow):
+                continue
             unread.append(start)
             continue
         for chunk in data.split(b"\0"):
@@ -381,6 +392,38 @@ def env_values(name: str) -> dict:
                 values.setdefault(chunk[len(key):].decode("utf-8", "replace"), []).append(pid)
                 break
     return {"values": values, "unread": unread}
+
+
+#: Linux `prctl(2)` option: make this process non-dumpable.
+PR_SET_DUMPABLE = 4
+
+
+def become_undumpable() -> bool:
+    """Linux: make this process's `/proc` entries unreadable to its peers.
+
+    `prctl(PR_SET_DUMPABLE, 0)` makes the kernel refuse another process of the
+    same user the read of this process's `/proc/<pid>/{environ,mem,fd}` (the
+    `PTRACE_MODE_READ` check refuses a non-dumpable target, even under
+    `yama/ptrace_scope=1`). This is what keeps a turn from reading the
+    provider keys of the other executors (#5029).
+
+    The flag lives in the `mm`: it follows the threads, and **execve resets
+    it to 1** — called from a launcher that then `exec`s, it protects nothing.
+    Only the long-lived process itself calls it, after its own exec.
+
+    True when the flag was set; False on an OS without `/proc` (macOS,
+    Windows), where the question does not arise. Raises `OSError` when the
+    kernel refuses: the caller decides (the executor refuses to run rather
+    than leave its environment readable).
+    """
+    if not _proc_ok():
+        return False
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, "prctl(PR_SET_DUMPABLE, 0): %s" % os.strerror(code))
+    return True
 
 
 def open_fd_count() -> int:
@@ -1187,6 +1230,15 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
 #: never readable (not dumpable) and never inside a worktree: the user's
 #: service manager (`systemd --user`, cwd `/`)
 SERVICE_MANAGER = frozenset({"systemd", "(sd-pam)"})
+
+#: #5029: the executor's console-script names. The executor is made
+#: non-dumpable at startup and never holds a session journal or a
+#: worktree/node_modules file: a session or dependency holder check may pass
+#: these through `allow` (both `comm` and `argv[0]`, like every allowed name).
+#: Housekeeping adds them to the host policy's list
+#: (`policy.housekeeping.unreadable_ok`), where a worktree's working directory
+#: could matter.
+EXECUTOR_NAMES = ("ameesh", "agent-runner")
 
 
 class UserPaths:

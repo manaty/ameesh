@@ -141,7 +141,7 @@ class SettleDeadTurnsTest(PgTestCase):
         self.addCleanup(lambda: (survivant.kill(), survivant.wait()))
         reel = platform.env_values
         # the real scan; this shared host's unreadable processes are another test
-        soldes = self._review(scan=lambda name: dict(reel(name), unread=[]))
+        soldes = self._review(scan=lambda name, **kwargs: dict(reel(name), unread=[]))
         self.assertNotIn(turn, soldes)
         self.assertIn(autre, soldes)
         self.assertEqual(self.turns.get(turn)["status"], "orphan")
@@ -153,6 +153,18 @@ class SettleDeadTurnsTest(PgTestCase):
         self.assertEqual(self.turns.get(turn)["status"], "orphan")
         avant = time.time() - 2 * runner_mod.LIVE_REVIEW_START_SLACK_S
         self.assertEqual(self._review(scan={"values": {}, "unread": [avant]}), [turn])
+
+    def test_the_executor_itself_is_not_an_unread_survivor(self):
+        """#5029: the non-dumpable executor never carries a turn id."""
+        seen = {}
+
+        def scan(name, **kwargs):
+            seen.update(kwargs)
+            return {"values": {}, "unread": []}
+
+        turn = self._row("ex", pgid=self.mort, status="orphan")
+        self.assertEqual(self._review(scan=scan), [turn])
+        self.assertIn("ameesh", seen.get("allow", ()))
 
     def test_no_process_table_settles_nothing(self):
         turn = self._row("pt", pgid=self.mort, status="orphan")
@@ -181,7 +193,7 @@ class SettleDeadTurnsTest(PgTestCase):
         ferme = self._row("cf", pgid=self.mort, age_s=2 * runner_mod.LIVE_REVIEW_IDLE_S)
         stable = self._row("cs", pgid=self.mort, age_s=2 * runner_mod.LIVE_REVIEW_IDLE_S)
 
-        def pendant(name):
+        def pendant(name, **kwargs):
             self.turns.mark_orphan(ferme, ["c9"])
             return {"values": {}, "unread": []}
         self.assertEqual(self._review(scan=pendant), [stable])
