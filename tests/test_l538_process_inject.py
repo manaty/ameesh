@@ -676,6 +676,61 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.sync()
         self.assertEqual(len(self._sujets("orchestre")), 1)
 
+    def test_retired_recipient_still_declared_does_not_abort_sync(self):
+        # #5080 : fiche encore présente, retrait DB déjà committé.
+        self.sync()
+        retired = storage.of(self.db).agents.retire(
+            "orchestre", actor="human:alice", reason="canari terminé")
+        self.assertTrue(retired["changed"])
+        self._change("# Processus de lot\n\n- nouvelle règle après retrait\n")
+        # Le vrai mail.send lève RecipientRetired ; les envois suivants passent.
+        report = self.sync()
+        self.assertEqual(report.status, canon_sync.CANON_OK)
+        self.assertEqual(report.processes.skipped_retired, ["orchestre"])
+        self.assertEqual(report.processes.to_dict()["skipped_retired"], ["orchestre"])
+        self.assertEqual(report.processes.sent, 1)
+        self.assertEqual(self._sujets("orchestre"), [])
+        self.assertEqual(len(self._sujets("relecteur")), 1)
+        current = canon.load(self.clone).sources[0].commit
+        saved = canon_sync.state(self.db, "atelier", canon.load(self.clone))
+        self.assertEqual(saved["process_commit"], current)
+        self.assertEqual(saved["last_good_commit"], current)
+        self.assertIsNotNone(registry.get(self.db, "orchestre")["retired_ts"])
+        again = self.sync()
+        self.assertEqual(again.processes.sent, 0)
+        self.assertEqual(len(self._sujets("relecteur")), 1)
+
+    def test_all_recipients_retired_still_advances_process_commit(self):
+        self.sync()
+        for name in ("orchestre", "relecteur"):
+            storage.of(self.db).agents.retire(
+                name, actor="human:alice", reason="canaris terminés")
+        self._change("# Processus de lot\n\n- nouvelle règle\n")
+        report = self.sync()
+        self.assertEqual(report.status, canon_sync.CANON_OK)
+        self.assertEqual(report.processes.sent, 0)
+        self.assertEqual(report.processes.skipped_retired, ["orchestre", "relecteur"])
+        self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
+                         canon.load(self.clone).sources[0].commit)
+
+    def test_other_mail_failure_still_aborts_process_commit(self):
+        self.sync()
+        old = canon_sync.state(self.db, "atelier", canon.load(self.clone))["process_commit"]
+        self._change("# Processus de lot\n\n- changement non livré\n")
+        original_send = mail.send
+
+        def fail_second(db, sender, recipient, body, **kwargs):
+            if recipient == "relecteur":
+                raise RuntimeError("mail failure")
+            return original_send(db, sender, recipient, body, **kwargs)
+
+        with mock.patch.object(mail, "send", side_effect=fail_second):
+            with self.assertRaisesRegex(RuntimeError, "mail failure"):
+                self.sync()
+        self.assertEqual(self._sujets("orchestre"), [])
+        self.assertEqual(canon_sync.state(
+            self.db, "atelier", canon.load(self.clone))["process_commit"], old)
+
     def test_deux_synchros_concurrentes_poussent_une_seule_fois(self):
         # #793: two syncs of the host read the same previous state before
         # either records the new commit; the rules go out once

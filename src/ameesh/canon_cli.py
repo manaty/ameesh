@@ -551,6 +551,9 @@ def _print_processes(done) -> None:
     if done.changed:
         print("rules (Process) : %d pushed to the agents of the host: %s"
               % (len(done.changed), ", ".join(done.changed)))
+    if done.skipped_retired:
+        print("rules (Process) skipped retired recipients: %s"
+              % ", ".join(done.skipped_retired))
     if done.error:
         print("rules (Process) NOT pushed: %s" % done.error)
 
