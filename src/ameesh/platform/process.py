@@ -731,11 +731,11 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
 
     `allow` (L230) : noms des processus de l'utilisateur dont l'illisibilité
     n'est PAS un doute — le choix explicite de l'owner de l'hôte, vide par
-    défaut ; le `comm` ET le nom de base d'`argv[0]` doivent s'y trouver
-    (même règle que `user_paths`), sinon le refus reste un doute. Un détenteur
-    CONSTATÉ (fichier ouvert, dossier courant, `needle`) reste rapporté, même
-    si son nom est dans `allow` : l'allow ne lève que le doute, jamais une
-    observation."""
+    défaut ; le `comm` et l'une des deux premières entrées d'`argv` doivent
+    s'y trouver (même règle que `user_paths`), sinon le refus reste un doute.
+    Un détenteur CONSTATÉ (fichier ouvert, dossier courant, `needle`) reste
+    rapporté, même si son nom est dans `allow` : l'allow ne lève que le doute,
+    jamais une observation."""
     real = os.path.realpath(path) if path else None
     is_dir = bool(real) and os.path.isdir(real)
     exclude = set(int(p) for p in exclude)
@@ -829,19 +829,32 @@ def service_managers(uid: int | None = None) -> frozenset:
     return frozenset(out)
 
 
+def _named_by(allow, name: str, argv) -> bool:
+    """L230 : le processus se nomme (`comm`) et s'annonce dans `allow` —
+    `argv[0]`, ou `argv[1]` quand un interpréteur lance un script (le cas de
+    l'exécuteur : comm `ameesh`, argv[0] le python du venv, argv[1] le script
+    `ameesh`). Un nom emprunté ne blanchit pas un refus : les deux doivent
+    s'y trouver."""
+    if not allow or not name:
+        return False
+    return name in allow and any(
+        os.path.basename(arg) in allow for arg in list(argv)[:2] if arg)
+
+
 def _allowed_proc(pid, allow) -> bool:
-    """L230 : le processus se nomme (`comm`) ET s'annonce (`argv[0]`) dans
-    `allow` — un nom emprunté ne blanchit pas un refus. Un `comm` vide ou un
+    """L230 : un processus dont le `comm` et l'un de ses deux premiers argv
+    sont dans `allow` n'est pas un doute (`_named_by`). Un `comm` vide ou un
     `cmdline` illisible ne blanchit rien : le doute reste."""
     if not allow:
         return False
     name = _read_text(os.path.join(PROC, str(pid), "comm")).strip()
     try:
         with open(os.path.join(PROC, str(pid), "cmdline"), "rb") as fh:
-            argv0 = fh.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+            argv = [arg.decode("utf-8", "replace")
+                    for arg in fh.read().split(b"\0")[:2] if arg]
     except OSError:
         return False
-    return bool(name) and name in allow and os.path.basename(argv0) in allow
+    return _named_by(allow, name, argv)
 
 
 def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
@@ -850,7 +863,7 @@ def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
     gone, a zombie (no files left), running as another user (effective uid:
     a setuid helper such as sudo is root's), the user's service manager
     (`managers()`, by PID), or a process named by `allow` (L230, `comm` and
-    `argv[0]`; an unreadable status is a doubt)."""
+    one of its first two argv entries; an unreadable status is a doubt)."""
     try:
         status = _proc_status(pid)
     except OSError as exc:
@@ -870,8 +883,8 @@ def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
 def _doubt_psutil(ps, pid: int, user, allow=()) -> str | None:
     """`_doubt_proc` off Linux, by psutil: gone or zombie, another user
     (effective uid, or user name on Windows), a system executable
-    (`SYSTEM_EXE_ROOTS`), or a process named by `allow` (L230, name and
-    `argv[0]`) is not a doubt; an unreadable answer is."""
+    (`SYSTEM_EXE_ROOTS`), or a process named by `allow` (L230, name and one
+    of its first two argv entries) is not a doubt; an unreadable answer is."""
     try:
         proc = ps.Process(pid)
         if proc.status() == ps.STATUS_ZOMBIE or _owner(proc) != user:
@@ -889,10 +902,10 @@ def _doubt_psutil(ps, pid: int, user, allow=()) -> str | None:
         return None
     if allow:
         try:
-            argv0 = proc.cmdline()[0]
+            argv = [str(a) for a in proc.cmdline()[:2]]
         except (ps.AccessDenied, ps.ZombieProcess, OSError, IndexError):
-            argv0 = ""
-        if name in allow and os.path.basename(str(argv0)) in allow:
+            argv = []
+        if _named_by(allow, name, argv):
             return None
     return "%d %s" % (pid, name)
 
@@ -1317,8 +1330,9 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
 
     A process gone meanwhile is ignored, and so is a zombie (`_zombie`, #1678):
     it holds nothing anymore. One that cannot be read (not dumpable: setuid,
-    file capabilities) is a doubt, unless its name (`comm`) AND the base name
-    of its `argv[0]` are both in `allow` or the service manager: its `exe` link
+    file capabilities) is a doubt, unless its name (`comm`) and one of its two
+    first argv entries (the script an interpreter runs, for an executor) are in
+    `allow` or the service manager: its `exe` link
     is unreadable too, its command line is not. What was read before a
     refusal (a `cwd`, an `exe`) is recorded all the same (#3195 R2): an
     observation is never dropped for what could not be read after it.
@@ -1367,8 +1381,8 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
         except (FileNotFoundError, ProcessLookupError):
             continue   # gone meanwhile
         except OSError:
-            argv0 = _read_text(os.path.join(base, "cmdline")).split("\0", 1)[0]
-            if name in allow and os.path.basename(argv0) in allow:
+            argv = _read_text(os.path.join(base, "cmdline")).split("\0")[:2]
+            if _named_by(allow, name, argv):
                 if name not in SERVICE_MANAGER:
                     out.allowed.append(who)
             else:

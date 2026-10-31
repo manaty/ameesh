@@ -109,9 +109,10 @@ class UndumpableWitnessTest(unittest.TestCase):
         start = platform.start_time(proc.pid)
         self.assertIsNotNone(start)
         # The interpreter's name is the host's: a venv runs `.../bin/python`
-        # (comm "python"), the system one `python3`. `allow` matches both the
-        # `comm` and `argv[0]`, so take the real names from the live process
-        # instead of naming one host's binary (#5029, CI red on the head).
+        # (comm "python"), the system one `python3`. `allow` matches `comm` and
+        # one of the first argv entries, so take the real names from the live
+        # process instead of naming one host's binary (#5029, CI red on the
+        # head).
         with open("/proc/%d/comm" % proc.pid, encoding="utf-8") as fh:
             comm = fh.read().strip()
         with open("/proc/%d/cmdline" % proc.pid, "rb") as fh:
@@ -126,6 +127,50 @@ class UndumpableWitnessTest(unittest.TestCase):
             allowed = platform.env_values("AMEESH_TEST_SECRET", allow=allow)
         self.assertIn(start, without["unread"])
         self.assertNotIn(start, allowed["unread"])
+
+    @unittest.skipUnless(platform.is_linux(), "the /proc credential check is Linux-only")
+    def test_a_shebang_executor_is_excused_by_its_bare_name(self):
+        """The production executor is a script: comm=ameesh, argv[0]=python.
+
+        It is launched by the shebang of the venv console script, so `argv[0]`
+        is the interpreter and the script announces itself in `argv[1]`.
+        Naming only `EXECUTOR_NAMES` must excuse it (#5029, B/P1 ameesh-dev7):
+        otherwise `adopt`/`resume`, the orphan scan and every housekeeping
+        doubt keep failing on a live executor.
+        """
+        workdir = tempfile.mkdtemp(prefix="l5029-", dir=os.environ.get("TMPDIR"))
+        self.addCleanup(shutil.rmtree, workdir, True)
+        script = os.path.join(workdir, "ameesh")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write("#!%s\n" % sys.executable)
+            fh.write("import sys, time\n"
+                     "from ameesh import platform\n"
+                     "assert platform.become_undumpable()\n"
+                     "open(sys.argv[1], 'w').write('ready')\n"
+                     "time.sleep(30)\n")
+        os.chmod(script, 0o755)
+        marker = os.path.join(workdir, "ready")
+        proc = subprocess.Popen(
+            [script, marker], env=dict(_env(), AMEESH_TEST_SECRET="une-valeur-de-test"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (proc.kill(), proc.wait(), proc.stdout.close(),
+                                 proc.stderr.close()))
+        deadline = time.monotonic() + 10
+        while not os.path.exists(marker):
+            if proc.poll() is not None:
+                self.fail("shebang helper exited before hardening: %s" % proc.stderr.read())
+            if time.monotonic() > deadline:
+                self.fail("shebang helper did not become undumpable in time")
+            time.sleep(0.02)
+        self.assertTrue(platform.process._allowed_proc(proc.pid, platform.EXECUTOR_NAMES))
+        start = platform.start_time(proc.pid)
+        table = [{"pid": proc.pid, "start": start, "zombie": False}]
+        with mock.patch.object(platform.process, "_psutil", return_value=None), \
+                mock.patch.object(platform.process, "process_table", return_value=table):
+            scan = platform.env_values("AMEESH_TEST_SECRET",
+                                       allow=platform.EXECUTOR_NAMES)
+        self.assertNotIn(start, scan["unread"])
+        self.assertEqual(scan["values"], {})
 
 
 class BecomeUndumpableTest(unittest.TestCase):
