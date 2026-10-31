@@ -15170,6 +15170,13 @@ def _harden_executor_environment() -> bool:
         _ENV_HIDDEN = True
         log("executor environment hidden from other processes of the same user "
             "(PR_SET_DUMPABLE=0)")
+    if hidden:
+        # #5100 : `poste.sh controler` ne lit plus notre `/proc/<pid>/exe`.
+        # Sans cette attestation il reste rouge : l'exécuteur, lui, tourne.
+        try:
+            process_mod.publish_venv_attestation()
+        except OSError as exc:
+            log("venv attestation not published: %s" % exc)
     return True
 
 

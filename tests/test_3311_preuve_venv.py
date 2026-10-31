@@ -11,6 +11,7 @@ sur l'ancien venv fait échouer le contrôle. Même preuve côté serveur
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -158,6 +159,103 @@ class ControlerVenvTest(unittest.TestCase):
              str(enfant.pid), str(self.old), "ancien"],
             capture_output=True, text=True, timeout=10)
         self.assertEqual(mauvais.returncode, 1)
+
+    def non_dumpable(self, venv):
+        """#5100 : un enfant du venv durci par le vrai chemin de l'exécuteur."""
+        enfant = subprocess.Popen(
+            [str(venv / "bin/python"), "-c",
+             "import time\n"
+             "from ameesh import runner\n"
+             "assert runner._harden_executor_environment()\n"
+             "print('ready', flush=True)\n"
+             "time.sleep(60)\n"],
+            stdout=subprocess.PIPE, text=True,
+            env=dict(self.env, PYTHONPATH=os.pathsep.join(
+                [str(ROOT / "src")] + [p for p in sys.path if p])))
+        self.addCleanup(enfant.stdout.close)
+        self.addCleanup(self.arreter, enfant)
+        # Le journal de l'exécuteur précède le témoin sur la même sortie.
+        self.assertIn("ready\n", iter(enfant.stdout.readline, ""))
+        with self.assertRaises(PermissionError):
+            os.stat("/proc/%d/exe" % enfant.pid)
+        return enfant
+
+    def sudo_refuse(self):
+        sudo = self.bin / "sudo"
+        sudo.write_text("#!/bin/sh\ntouch \"$TEST_STATE/sudo.log\"\nexit 1\n")
+        sudo.chmod(0o755)
+        return self.state / "sudo.log"
+
+    def attestation(self, pid):
+        return (Path(self.env["XDG_STATE_HOME"]) / "ameesh-host/venv-vivant"
+                / ("%d.json" % pid))
+
+    def test_non_dumpable_vert_sans_privilege_sur_le_venv_courant(self):
+        journal = self.sudo_refuse()
+        enfant = self.non_dumpable(self.live)
+        self.assertEqual(self.attestation(enfant.pid).stat().st_mode & 0o777, 0o600)
+        fait = self.lancer({"dev9": enfant.pid, "dev8": self.processus(self.live)})
+        self.assertEqual(fait.returncode, 0, fait.stdout + fait.stderr)
+        self.assertIn("contrôles verts", fait.stdout)
+        self.assertFalse(journal.exists(), "sudo appelé alors que l'attestation suffit")
+
+    def test_non_dumpable_rouge_sur_l_ancien_venv(self):
+        journal = self.sudo_refuse()
+        enfant = self.non_dumpable(self.old)
+        fait = self.lancer({"dev9": enfant.pid, "dev8": self.processus(self.live)})
+        self.assertNotEqual(fait.returncode, 0)
+        self.assertIn("ameesh-runner-agent@dev9.service : venv courant non prouvé",
+                      fait.stderr)
+        self.assertNotIn("contrôles verts", fait.stdout)
+        self.assertFalse(journal.exists())
+
+    def test_non_dumpable_mort_reste_rouge_malgre_son_attestation(self):
+        enfant = self.non_dumpable(self.live)
+        self.assertTrue(self.attestation(enfant.pid).exists())
+        enfant.kill()
+        enfant.wait()
+        fait = self.lancer({"dev9": enfant.pid, "dev8": self.processus(self.live)})
+        self.assertNotEqual(fait.returncode, 0)
+        self.assertIn("venv courant non prouvé", fait.stderr)
+        self.assertNotIn("contrôles verts", fait.stdout)
+
+    def test_non_dumpable_rouge_si_l_attestation_manque_ou_ne_convient_pas(self):
+        enfant = self.non_dumpable(self.live)
+        chemin = self.attestation(enfant.pid)
+        vraie = json.loads(chemin.read_text())
+        journal = self.sudo_refuse()
+        cas = {
+            "absente": None,
+            "pid recyclé": dict(vraie, start_ticks="1"),
+            "illisible": "{",
+            # Le bon venv en cmdline, mais un autre exécutable attesté.
+            "autre exécutable": dict(vraie, exe_ino=vraie["exe_ino"] + 1),
+        }
+        for nom, contenu in cas.items():
+            with self.subTest(nom):
+                chemin.unlink(missing_ok=True)
+                if contenu is not None:
+                    chemin.touch(mode=0o600)
+                    chemin.write_text(contenu if isinstance(contenu, str)
+                                      else json.dumps(contenu))
+                fait = self.lancer({"dev9": enfant.pid})
+                self.assertNotEqual(fait.returncode, 0)
+                self.assertNotIn("contrôles verts", fait.stdout)
+                self.assertEqual(journal.exists(), nom != "autre exécutable", nom)
+                journal.unlink(missing_ok=True)
+        with self.subTest("lisible par d'autres"):
+            chemin.write_text(json.dumps(vraie))
+            chemin.chmod(0o644)
+            fait = self.lancer({"dev9": enfant.pid})
+            self.assertNotEqual(fait.returncode, 0)
+        with self.subTest("lien symbolique"):
+            copie = self.root / "copie.json"
+            copie.write_text(json.dumps(vraie))
+            copie.chmod(0o600)
+            chemin.unlink()
+            chemin.symlink_to(copie)
+            fait = self.lancer({"dev9": enfant.pid})
+            self.assertNotEqual(fait.returncode, 0)
 
     def test_controler_rouge_si_un_mainpid_est_absent(self):
         for pid in ("0", "  "):
