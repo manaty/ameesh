@@ -2157,6 +2157,14 @@ def brief_key_of(alert: dict) -> str:
     et `sous_rythme` décrivent la même fenêtre et appellent le même geste.
     Une gigue d'une seconde de `resets_at`, un clignotement de la raison ou
     une disparition d'une passe ne refont donc pas briefer la même fenêtre."""
+    if alert_briefs.automatic_sleep(alert):
+        # #5331 : le sommeil automatique est levé puis reposé (redémarrage de
+        # staging, cycle de sommeil), et chaque épisode porte un `since` neuf.
+        # La garde de 6 h de #5203 ne couvre que l'alerte qui disparaît d'une
+        # passe : pour ce sommeil, la clé ignore le début d'épisode (agent,
+        # hôte et projet de la raison) et la garde vaut d'un épisode au
+        # suivant. Une vraie pause opérateur garde son épisode dans la clé.
+        return key_of(dict(alert, since=None))
     since = alert.get("since")
     if alert.get("gauge") is None or since is None:
         return key_of(alert)

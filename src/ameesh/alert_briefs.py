@@ -822,7 +822,7 @@ def _budget_pause_long(alert: dict) -> str:
             % (alert.get("detail") or "?"))
 
 
-def _automatic_sleep(alert: dict) -> bool:
+def automatic_sleep(alert: dict) -> bool:
     """#4525 : la pause qui dure est le sommeil automatique du découpage."""
     from . import file_decoupage
     return bool(alert.get("sleep") or file_decoupage.is_sleep_reason(alert.get("reason")))
@@ -840,7 +840,7 @@ def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
         return {}
     names = [name for name in names if not name.startswith("thread:")]
     kind = alert.get("type")
-    if kind in ("operator_pause_long", "operator_pause_host") and _automatic_sleep(alert):
+    if kind in ("operator_pause_long", "operator_pause_host") and automatic_sleep(alert):
         return {name: {"info": True} for name in names}
     if kind != "slo_breach" or len(names) < 2:
         return {}
@@ -861,7 +861,7 @@ def _operator_pause(alert: dict) -> str:
     du pilote ou d'un orchestrateur.
     """
     v = vocab.active()
-    if _automatic_sleep(alert):
+    if automatic_sleep(alert):
         return ("Automatic sleep still in place: %s. This is the automatic sleep of an "
                 "exhausted roadmap, not a maintenance: it is lifted by the first "
                 "startable %s, an assigned actionable %s, or pilot/orchestrator "
