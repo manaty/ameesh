@@ -483,6 +483,9 @@ class Operations(interface.Operations):
                    -- pour un porteur : pas pour tous les lots ouverts (N2 de
                    -- la relecture dev7).
                    w.branch, w.branch_head,
+                   -- #5206 : l'instant du relevé de la tête, pour dater une
+                   -- composition enregistrée après lui (recomposition en cours)
+                   extract(epoch from w.branch_head_at)::float8 AS branch_head_ts,
                    extract(epoch from w.wake_at)::float8 AS wake_ts,
                    to_char(w.planned_start, 'YYYY-MM-DD') AS planned_start,
                    CASE WHEN left(btrim(w.branch), 12) = 'integration/' THEN w.body END AS body,
