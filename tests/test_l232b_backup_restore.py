@@ -95,10 +95,10 @@ class BackupRestoreTest(unittest.TestCase):
     def test_exported_snapshot_restores_despite_concurrent_source_writes(self):
         dump = backup.dump_parameters
 
-        def concurrent_write(parameters, output, *, snapshot=None):
+        def concurrent_write(parameters, output, **options):
             with psycopg.connect(self.source_dsn) as source:
                 source.execute("INSERT INTO mesh_fixture.agent_registry VALUES ('after-snapshot')")
-            dump(parameters, output, snapshot=snapshot)
+            dump(parameters, output, **options)
         with mock.patch.object(backup, "dump_parameters", side_effect=concurrent_write):
             expected = self.snapshot()
         self.assertEqual(expected["row_counts"], {"agent_registry": 1, "agent_mailbox": 1})
@@ -114,11 +114,21 @@ class BackupRestoreTest(unittest.TestCase):
 
     def test_failed_real_restore_removes_disposable_database(self):
         expected = self.snapshot()
-        self.archive.write_bytes(b"not a PostgreSQL archive")
+        # #5189 : the header (and its majors) stays readable, so the check
+        # passes and pg_restore itself fails on the truncated table of contents
+        self.archive.write_bytes(self.archive.read_bytes()[:256] + b"not a PostgreSQL archive")
         expected["artifact_sha256"] = backup.digest(self.archive)
         recovery_id = uuid.uuid4()
         with mock.patch.object(backup.uuid, "uuid4", return_value=recovery_id):
-            with self.assertRaisesRegex(backup.BackupError, "pg_restore"):
+            with self.assertRaisesRegex(backup.BackupError, "pg_restore exited"):
+                backup.verify_restore(self.restore_config, self.archive, expected)
+        self.assertIsNone(self.admin.execute("SELECT datname FROM pg_database WHERE datname=%s",
+                                             ("ameesh_verify_" + recovery_id.hex,)).fetchone())
+        # an unreadable header is refused before any database is created
+        self.archive.write_bytes(b"not a PostgreSQL archive")
+        expected["artifact_sha256"] = backup.digest(self.archive)
+        with mock.patch.object(backup.uuid, "uuid4", return_value=recovery_id):
+            with self.assertRaisesRegex(backup.BackupError, "archive header unreadable"):
                 backup.verify_restore(self.restore_config, self.archive, expected)
         self.assertIsNone(self.admin.execute("SELECT datname FROM pg_database WHERE datname=%s",
                                              ("ameesh_verify_" + recovery_id.hex,)).fetchone())

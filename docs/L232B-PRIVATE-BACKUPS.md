@@ -58,6 +58,21 @@ cleanup produces no verified proof.
 The restore identity therefore needs permission to create its disposable
 database; runner credentials are not a substitute for that capability.
 
+PostgreSQL majors are checked before anything starts (#5189). `dump` and
+`snapshot-dump` read the source server's major and run `pg_dump --version` and
+`pg_restore --version` under the operation's own environment, so the probe
+answers for the binaries that PATH then executes. `verify-restore` reads the
+source server and `pg_dump` majors in the archive header (not through a
+`pg_restore` that may be too old to open it), the target server's major and
+`pg_restore --version`. `retrieve` checks the archive against `pg_restore`
+before listing it. The chain is refused if the source server is newer than
+`pg_dump`, the archive is newer than the target server, `pg_restore` is older
+than the archive, or `pg_restore` is newer than the target server. The error
+names the reason and the majors, never a DSN. A version that cannot be read
+refuses as well. On a host whose system clients are older than the source
+(agents-3: clients 16.15, source 17.11), put the PGDG 17 directory
+(`/usr/lib/postgresql/17/bin`) first in PATH.
+
 `upload --file ARCHIVE --host HOST [--receipt RECEIPT]` uses a private curl
 configuration, disables
 the user's curl configuration and removes upload keys from the child
