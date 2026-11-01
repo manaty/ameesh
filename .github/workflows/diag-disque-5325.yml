@@ -34,6 +34,6 @@ jobs:
       - name: rapport complet avant ménage (#5325)
         run: python3 scripts/ci-disque.py rapport --complet
       - name: ménage (#5325)
-        run: python3 scripts/ci-disque.py menage
+        run: python3 scripts/ci-disque.py menage --images-inutilisees
       - name: rapport après ménage (#5325)
         run: python3 scripts/ci-disque.py rapport

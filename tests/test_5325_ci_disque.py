@@ -162,22 +162,26 @@ class MenageTest(unittest.TestCase):
                 mock.patch.object(disque, "_verrou", return_value=types.SimpleNamespace(close=lambda: None)), \
                 mock.patch.object(disque, "_resume"), \
                 contextlib.redirect_stdout(io.StringIO()) as sortie:
-            code = disque.menage(dry_run=bool(argv), force=False)
+            code = disque.menage(dry_run="--dry-run" in argv, force=False,
+                                 images_inutilisees="--images-inutilisees" in argv)
 
         self.assertEqual(code, 0)
         conteneurs = [c for c in appels if c[:3] == ["docker", "container", "prune"]]
         images = [c for c in appels if c[:3] == ["docker", "image", "prune"]]
         volumes = [c for c in appels if c[:3] == ["docker", "volume", "rm"]]
-        self.assertEqual(len(conteneurs), 0 if argv else 1)  # dry-run : imprime, n'exécute pas
-        self.assertEqual(len(images), 0 if argv else 2)   # dangling, puis sans conteneur
-        self.assertEqual(len(volumes), 0 if argv else 1)
-        if not argv:
+        essai = "--dry-run" in argv
+        agressif = "--images-inutilisees" in argv
+        self.assertEqual(len(conteneurs), 0 if essai else 1)
+        self.assertEqual(len(images), 0 if essai else (2 if agressif else 1))
+        self.assertEqual(len(volumes), 0 if essai else 1)
+        if not essai:
             self.assertIn("until=6h", conteneurs[0])
             self.assertIn("--filter", images[0])
             self.assertNotIn("-a", images[0])
-            self.assertIn("-a", images[1])
-            self.assertIn("until=168h", images[1])
             self.assertEqual(volumes[0][3:], [ANONYME])  # jamais le volume nommé
+            if agressif:
+                self.assertIn("-a", images[1])
+                self.assertIn("until=168h", images[1])
         return sortie.getvalue()
 
     def test_menage_reel_borne(self):
@@ -186,6 +190,8 @@ class MenageTest(unittest.TestCase):
     def test_menage_dry_run(self):
         sortie = self._menage(["--dry-run"])
         self.assertIn("+ docker container prune", sortie)
+        self.assertNotIn("+ docker image prune -a", sortie)
+        sortie = self._menage(["--dry-run", "--images-inutilisees"])
         self.assertIn("+ docker image prune -a", sortie)
 
     def test_fichiers_anciens_efface_et_mesure(self):

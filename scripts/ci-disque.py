@@ -18,10 +18,12 @@ une borne d'âge supérieure au plafond d'un job (45 min) :
   `docker volume inspect`, un volume dont la date est illisible est gardé ;
   un volume *nommé* n'est jamais supprimé : il peut porter des données ;
 * images *dangling* (sans étiquette, donc sans conteneur) de plus de 24 h ;
-* images sans conteneur créées il y a plus de 7 jours : les images de
-  construction (`rust`, `node`, `ubuntu`, `postgres:16`) dorment des semaines
-  sur les VM ; `prune` ne touche jamais une image qu'un conteneur référence,
-  et une image retirée est re-téléchargée par le job qui en a besoin ;
+* avec `--images-inutilisees` seulement (ménage dédié, jamais dans un job
+  de tests) : images sans conteneur créées il y a plus de 7 jours ; les
+  images de construction (`rust`, `node`, `ubuntu`) dorment des semaines sur
+  les VM ; `prune` ne touche jamais une image qu'un conteneur référence — les
+  jobs de tests ne enlèvent donc que les images *dangling*, pour ne pas
+  re-télécharger `postgres:17` entre deux parts ;
 * cache de construction inutilisé depuis plus de 24 h ;
 * fichiers de plus de 48 h sous les `_work/_temp` des runners de l'hôte et
   sous `/tmp` (compte `runner` seulement) ;
@@ -40,7 +42,7 @@ soit.
 
 Usage :
   scripts/ci-disque.py rapport [--complet] [--seuil-gib N]
-  scripts/ci-disque.py menage [--dry-run] [--force]
+  scripts/ci-disque.py menage [--dry-run] [--force] [--images-inutilisees]
 """
 from __future__ import annotations
 
@@ -535,7 +537,8 @@ def _tmp(dry_run: bool) -> dict:
             "sortie": "%d fichier(s)" % resultat["fichiers"]}
 
 
-def menage(dry_run: bool = False, force: bool = False) -> int:
+def menage(dry_run: bool = False, force: bool = False,
+           images_inutilisees: bool = False) -> int:
     if os.environ.get("GITHUB_ACTIONS") != "true" and not force:
         print("ménage : hors CI (GITHUB_ACTIONS != true), rien n'est supprimé ; "
               "--force pour un essai explicite")
@@ -553,7 +556,10 @@ def menage(dry_run: bool = False, force: bool = False) -> int:
                  gib(avant["libre"]), version))
         etapes = []
         if pret:
-            etapes += [_conteneurs, _volumes, _images, _images_inutilisees, _cache_build]
+            etapes += [_conteneurs, _volumes, _images]
+            if images_inutilisees:
+                etapes.append(_images_inutilisees)
+            etapes.append(_cache_build)
         etapes += [_temp, _diag, _tmp]
         resultats = []
         for etape in etapes:
@@ -609,6 +615,9 @@ def _analyse(argv=None):
                                help="imprime les commandes, ne supprime rien")
     menage_parser.add_argument("--force", action="store_true",
                                help="accepte de tourner hors CI (essai explicite)")
+    menage_parser.add_argument("--images-inutilisees", action="store_true",
+                               help="élague aussi les images sans conteneur de plus de 7 jours "
+                                    "(ménage dédié ; jamais dans un job de tests)")
     return analyseur.parse_args(argv)
 
 
@@ -617,7 +626,8 @@ def main(argv=None) -> int:
     if args.mode == "rapport":
         rapport(complet=args.complet, seuil_gib=args.seuil_gib)
         return 0
-    return menage(dry_run=args.dry_run, force=args.force)
+    return menage(dry_run=args.dry_run, force=args.force,
+                  images_inutilisees=args.images_inutilisees)
 
 
 if __name__ == "__main__":
