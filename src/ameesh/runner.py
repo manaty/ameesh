@@ -43,6 +43,7 @@ from ameesh import work_lifecycle as lifecycle
 
 import argparse
 import dataclasses
+import functools
 import getpass
 import hashlib
 import io
@@ -9958,6 +9959,11 @@ class AgentWorker(threading.Thread):
                     self._consigne_a_restaurer = True
                     self._panne_de_base(exc, "the turn")
                     continue
+                except migrations.IncompatibleSchema as exc:
+                    # #4976 : même sortie que le contrôle de tête de boucle, si
+                    # le schéma a changé juste avant le tour : bail rendu (finally)
+                    log_async("[%s] %s" % (self.name, exc))
+                    break
                 if reussi is None:
                     # #1686 N2 : tour différé (attach demandé ou verrou de
                     # session tenu) — la consigne est restaurée, le tour n'a pas
@@ -15101,6 +15107,20 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     return code
 
 
+def _refuses_incompatible_schema(entry):
+    """#4976 : un schéma incompatible à l'admission d'un point d'entrée est un
+    refus nommé (message et code 1), pas une trace d'exception."""
+    @functools.wraps(entry)
+    def checked(argv: list[str] | None = None) -> int:
+        try:
+            return entry(argv)
+        except migrations.IncompatibleSchema as exc:
+            print("agent-runner: %s" % exc, file=sys.stderr)
+            return 1
+    return checked
+
+
+@_refuses_incompatible_schema
 def attach_main(argv: list[str] | None = None) -> int:
     from . import attach as attach_mod
     argv = sys.argv[1:] if argv is None else argv
@@ -15425,6 +15445,7 @@ def _harden_executor_environment() -> bool:
     return True
 
 
+@_refuses_incompatible_schema
 def main(argv: list[str] | None = None) -> int:
     if not _harden_executor_environment():
         return 1

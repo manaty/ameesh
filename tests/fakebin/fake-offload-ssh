@@ -31,8 +31,19 @@ env["PYTHONPATH"] = src
 import subprocess
 import threading
 
-proc = subprocess.Popen([sys.executable, "-m", "ameesh.platform.offload_shell",
-                         "--config", os.environ["AMEESH_FAKE_OFFLOAD_CONFIG"]], env=env,
+shell = [sys.executable, "-m", "ameesh.platform.offload_shell",
+         "--config", os.environ["AMEESH_FAKE_OFFLOAD_CONFIG"]]
+delay = os.environ.get("AMEESH_FAKE_OFFLOAD_START_DELAY")
+if delay and command.split()[:1] == ["run"]:
+    # #5184: start the shell late in its own process, so the session can die
+    # (the client's wait budget) before `main` records its parent; the shell
+    # is forked now, as sshd's child, and only sleeps before importing.
+    shell = [sys.executable, "-c",
+             "import runpy, sys, time; time.sleep(float(sys.argv[1])); "
+             "sys.argv = ['offload_shell'] + sys.argv[2:]; "
+             "runpy.run_module('ameesh.platform.offload_shell', run_name='__main__')",
+             delay, "--config", os.environ["AMEESH_FAKE_OFFLOAD_CONFIG"]]
+proc = subprocess.Popen(shell, env=env,
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE)
 

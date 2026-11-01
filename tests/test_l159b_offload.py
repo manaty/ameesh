@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -115,6 +116,25 @@ class OffloadBase(unittest.TestCase):
             except (OSError, ValueError):
                 pass
         return found
+
+    def wait_for_journal_entry(self, *, exclude: tuple[str, ...] = (),
+                               timeout: float = 60.0) -> dict | None:
+        """The first terminal journal entry of this VM, bounded, or None.
+
+        The journal is written when the shell has finished with the job,
+        before its folder is removed: it is the event that says the
+        cancellation was *observed*, not merely that the cleanup ran (#5184).
+        `exclude` skips the jobs another scenario of the test left behind
+        (the orphan teardown of the regression)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for entry in self.journal():
+                if entry.get("job") in exclude:
+                    continue
+                if entry.get("outcome") in ("cancelled", "done", "error"):
+                    return entry
+            time.sleep(0.1)
+        return None
 
     def set_gate(self, state: str, **extra) -> None:
         path = os.path.join(self.tmp, "state.json")
@@ -332,10 +352,99 @@ class RunTest(OffloadBase):
             self.skipTest("wait budget spent before the job started (loaded host)")
         self.assertIn("no result within", res.stderr)
         self.assertLess(time.time() - began, 20)
+        # #5184 : l'annulation est asynchrone. Le journal est écrit quand le
+        # shell a fini avec le job, avant le ménage du dossier : on attend cet
+        # événement (borné), pas la disparition du dossier (un runner chargé
+        # peut la retarder), et jamais un job qui a tourné jusqu'au bout. Si
+        # le client a rendu la main avant l'annonce `job`, il n'a pas d'id à
+        # annuler : c'est au shell de constater la session morte.
+        announced = re.search(r"cancelling job (\S+)", res.stderr)
+        entry = self.wait_for_journal_entry(timeout=60)
+        if announced is not None:
+            self.assertIsNotNone(entry, self.journal())
+        if entry is not None:
+            self.assertEqual(entry["outcome"], "cancelled", entry)
         deadline = time.time() + 10
         while time.time() < deadline and self.running_jobs():
-            time.sleep(0.2)
+            time.sleep(0.1)
         self.assertEqual(self.running_jobs(), [])
+
+    def test_a_session_lost_before_the_job_is_announced_never_runs_it(self):
+        # #5184 : le budget d'attente peut expirer pendant l'admission, avant
+        # que le shell ait annoncé `job <id>` : le client n'a alors aucun id à
+        # annuler et ferme la session. Le shell doit constater la session
+        # morte avant `running` et avant la commande, et journaliser une
+        # annulation, jamais un job terminé.
+        self.write_profile("slow-teardown", {"after": "sleep 3"})
+        orphan = "20200101-000000-abcdef"
+        orphan_dir = os.path.join(self.vm, "jobs", orphan)
+        os.makedirs(orphan_dir)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        with open(os.path.join(orphan_dir, "meta.json"), "w") as fh:
+            json.dump({"job": orphan, "state": "running", "shell_pid": dead.pid,
+                       "shell_start": "dead:1", "profile": "slow-teardown"}, fh)
+        marker = os.path.join(self.tmp, "ran")
+        began = time.time()
+        res = self.offload("run", "--wait-timeout", "2", "--", "sh", "-c",
+                           "touch %s; sleep 30" % marker)
+        self.assertEqual(res.returncode, 124, res.stderr)
+        if "client wait budget exhausted" in res.stderr:
+            self.skipTest("wait budget spent before the job started (loaded host)")
+        self.assertLess(time.time() - began, 20)
+        self.assertIn("no result within", res.stderr)
+        # le ménage de l'orphelin a tenu le shell en admission au-delà du
+        # budget : aucun id de job annoncé, donc aucun cancel envoyé
+        self.assertNotIn("cancelling job", res.stderr)
+        entry = self.wait_for_journal_entry(exclude=(orphan,), timeout=30)
+        self.assertIsNotNone(entry, self.journal())
+        self.assertEqual(entry["outcome"], "cancelled", entry)
+        self.assertFalse(os.path.exists(marker), "the command ran without a client")
+        self.assertEqual(self.running_jobs(), [])
+
+    def test_a_session_lost_before_main_is_journaled_without_a_job(self):
+        # #5184 : le budget d'attente peut expirer pendant le démarrage du
+        # shell `run` (CI chargée) : il est reparenté avant que `main`
+        # n'enregistre son parent, et seul le flux de protocole dit que la
+        # session est morte. La demande est journalisée annulée, sans job ni
+        # commande.
+        marker = os.path.join(self.tmp, "ran")
+        began = time.time()
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_FAKE_OFFLOAD_START_DELAY": "9"}):
+            res = self.offload("run", "--wait-timeout", "8", "--", "sh", "-c",
+                               "touch %s; sleep 30" % marker)
+        self.assertEqual(res.returncode, 124, res.stderr)
+        if "client wait budget exhausted" in res.stderr:
+            # #3877 : runner chargé, budget épuisé avant le shell : non
+            # concluant (§3), jamais un rouge.
+            self.assertEqual(self.running_jobs(), [])
+            self.skipTest("wait budget spent before the shell started (loaded host)")
+        self.assertLess(time.time() - began, 20)
+        self.assertIn("no result within", res.stderr)
+        self.assertNotIn("cancelling job", res.stderr)
+        entry = self.wait_for_journal_entry(timeout=30)
+        self.assertIsNotNone(entry, self.journal())
+        self.assertEqual(entry["outcome"], "cancelled", entry)
+        self.assertFalse(os.path.exists(marker), "the command ran without a client")
+        self.assertEqual(self.running_jobs(), [])
+
+    def test_a_session_gone_before_cmd_run_creates_no_job(self):
+        # #5184 : session déjà morte quand le shell atteint `run` (démarrage
+        # lent) : refus à l'entrée, aucun dossier de job, aucune commande.
+        cfg = offload_shell.load_config(self.config_path)
+        previous = offload_shell.SESSION_PARENT
+        offload_shell.SESSION_PARENT = os.getppid() + 1
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = offload_shell.cmd_run(
+                    cfg, ["acme-widget", "a" * 40, "--", "true"])
+        finally:
+            offload_shell.SESSION_PARENT = previous
+        self.assertEqual(rc, 130)
+        self.assertIn('"outcome": "cancelled"', err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.vm, "jobs")))
 
     def test_hooks_and_setup_are_supervised_by_the_job_deadline(self):
         after = os.path.join(self.tmp, "after.log")

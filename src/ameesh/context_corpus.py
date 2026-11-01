@@ -35,8 +35,8 @@ from datetime import datetime, timezone
 from hashlib import sha256
 
 from . import context_metrics, context_profile, storage
-from .context_metrics import (DERIVED, FALLBACK, MEASURED, PARTIAL, UNKNOWN,
-                              QUALITIES)
+from .context_metrics import (DERIVED, FALLBACK, MEASURED, MODEL_QUALITIES,
+                              PARTIAL, REQUESTED, UNKNOWN, QUALITIES)
 
 SCHEMA = "ameesh-context-corpus/1"
 SOURCE_SCHEMA = context_metrics.SCHEMA
@@ -47,8 +47,8 @@ DEFAULT_BATCH = 1000
 #: bornée par le temps et le harnais demandés.
 MAX_BATCH = 100_000
 
-#: qualités admises pour le modèle effectif (le contrat nomme `requested`)
-MODEL_QUALITIES = tuple(QUALITIES) + ("requested",)
+# MODEL_QUALITIES (importé de context_metrics) ajoute `requested` aux mesures :
+# le nom demandé au lancement n'est pas une mesure runtime (§3.1).
 
 #: raisons propres au corpus ; les raisons de mesure viennent de
 #: `context_metrics` et restent stables.
@@ -656,6 +656,12 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
     d'outil ou un texte de courrier présent dans la charge ne peut pas entrer
     dans le corpus. Lève :class:`CorpusError` si la charge n'est pas un
     ``ameesh-context/1``.
+
+    ``model_quality`` suit la provenance du nom : la qualité du profil CTX-03
+    quand il porte un modèle effectif, sinon celle publiée par le producteur
+    (``measured`` si le flux a annoncé le modèle, ``requested`` sinon), et
+    ``requested`` pour un événement antérieur qui ne publie que le nom du
+    lancement. Un nom de configuration n'est jamais promu ``measured``.
     """
     if not isinstance(payload, Mapping):
         raise CorpusError("a turn.context payload must be an object")
@@ -671,9 +677,17 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
     session = opaque_session(agent, session_raw)
     model = _text(payload.get("model")) or _text(context.get("model"))
     profile = _profile(payload, context)
-    if profile is not None:
+    profile_model = _text(profile.get("model_effective")) \
+        if profile is not None else None
+    if profile_model is not None:
         # Le modèle effectif du profil CTX-03 prime sur le nom du lancement.
-        model = _text(profile.get("model_effective")) or model
+        model = profile_model
+    # La qualité publiée par le producteur dit si le nom vient d'une annonce
+    # runtime (`measured`) ou seulement du lancement (`requested`). Les
+    # événements antérieurs à cette provenance n'en portent pas : leur nom est
+    # alors traité comme demandé, jamais comme mesuré.
+    published_quality = (_text(payload.get("model_quality"))
+                         or _text(context.get("model_quality")))
     harness_raw = _text(payload.get("harness")) or _text(context.get("harness"))
     harness = context_metrics.convention(harness_raw).harness \
         if harness_raw else "unknown"
@@ -683,10 +697,20 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
         decision_raw = {}
     window_measure, auxiliary_models, profile_model_quality = _window_measure(
         payload, context, decision_raw, model)
-    if profile_model_quality in MODEL_QUALITIES:
+    if profile_model_quality in MODEL_QUALITIES \
+            and (profile_model is not None or profile is None):
+        # La qualité vient du profil quand il nomme le modèle effectif ; sans
+        # profil, elle vient du `model_usage` runtime résolu par _window_measure.
         model_quality = profile_model_quality
+    elif published_quality in MODEL_QUALITIES:
+        model_quality = published_quality
+    elif model:
+        model_quality = REQUESTED
     else:
-        model_quality = MEASURED if model else UNKNOWN
+        model_quality = UNKNOWN
+    if model is None:
+        # une qualité ne qualifie un nom que s'il existe
+        model_quality = UNKNOWN
 
     measures_raw = context.get("measures")
     if not isinstance(measures_raw, Mapping):

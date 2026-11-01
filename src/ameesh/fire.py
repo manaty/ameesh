@@ -2450,7 +2450,7 @@ def _queue_landing(cfg, db, row: dict, fire: dict, freeze: dict, status: dict, *
         return False
     from . import radar, resolutions
     name = project.name if project is not None else os.path.basename(repo.rstrip("/"))
-    clone = resolutions.Replayer(repo, radar.clone_dir(cfg, name), target=target)
+    clone = resolutions.Replayer(repo, radar.clone_dir(cfg, name), target=target, db=db)
     tips, where = merge_queue.fetch_fresh(repo, [row["branch"], target], clone, base=target)
     head = merge_queue.pinned(where, status.get("head"))
     frozen = merge_queue.pinned(where, fire.get("sha"))
@@ -2893,7 +2893,7 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
     name = project.name if project is not None else os.path.basename((repo or "project").rstrip("/"))
     clone = resolutions.Replayer(
         repo, radar.clone_dir(cfg, name),
-        target=getattr(project, "target", "") or "") if repo else None
+        target=getattr(project, "target", "") or "", db=db) if repo else None
     try:
         entered = merge_queue.enter(db, lot, repo=repo, actor=work.SYSTEM_SENDER,
                                     project=project, clone=clone, cfg=cfg,

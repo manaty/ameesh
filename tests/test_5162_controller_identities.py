@@ -253,6 +253,42 @@ class RealIdentityTest(unittest.TestCase):
             for password in source['passwords'].values():
                 self.assertTrue(password.encode() not in logs, 'plaintext credential in server output')
 
+    def test_future_relations_stay_readable_and_leave_revokes_defaults(self):
+        self.enroll()
+        with psycopg.connect(self.source) as conn:
+            conn.execute('CREATE TABLE mesh.later (id integer)')
+            conn.execute('CREATE SEQUENCE mesh.later_seq')
+        source = self.source_doc()
+        with psycopg.connect(source['backup_dsn']) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM mesh.later').fetchone()[0], 0)
+            self.assertEqual(conn.execute('SELECT last_value FROM mesh.later_seq').fetchone()[0], 1)
+        self.assertEqual(tool.audit(self.value, self.directory)['outcome'], 'audit_ok')
+        with psycopg.connect(self.source) as conn:
+            conn.execute('SAVEPOINT remove_default')
+            conn.execute(sql.SQL('ALTER DEFAULT PRIVILEGES FOR ROLE test_admin IN SCHEMA mesh '
+                                 'REVOKE SELECT ON TABLES FROM {}').format(sql.Identifier(self.value['backup_role'])))
+            with self.assertRaisesRegex(tool.IdentityError, 'default read privilege'):
+                tool.audit_data(conn, self.value['backup_role'], 'mesh')
+            conn.execute('ROLLBACK TO SAVEPOINT remove_default')
+        self.assertEqual(tool.leave(self.value, self.directory)['outcome'], 'retired')
+        with psycopg.connect(self.source) as conn:
+            self.assertFalse(conn.execute('SELECT 1 FROM pg_roles WHERE rolname=%s',
+                                          (self.value['backup_role'],)).fetchone())
+
+    def test_default_reads_use_the_migration_owner_not_the_admin(self):
+        migration = 'mig_' + self.suffix
+        with psycopg.connect(self.source) as conn:
+            conn.execute(sql.SQL('CREATE ROLE {}').format(sql.Identifier(migration)))
+            conn.execute(sql.SQL('GRANT USAGE, CREATE ON SCHEMA mesh TO {}').format(sql.Identifier(migration)))
+            conn.execute(sql.SQL('ALTER TABLE mesh.agent_registry OWNER TO {}').format(sql.Identifier(migration)))
+        self.enroll()
+        with psycopg.connect(self.source) as conn:
+            conn.execute(sql.SQL('SET ROLE {}').format(sql.Identifier(migration)))
+            conn.execute('CREATE TABLE mesh.after_migration (id integer)')
+        with psycopg.connect(self.source_doc()['backup_dsn']) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM mesh.after_migration').fetchone()[0], 0)
+        self.assertEqual(tool.audit(self.value, self.directory)['outcome'], 'audit_ok')
+
     def test_public_extension_reads_only_do_not_relax_other_audits(self):
         with psycopg.connect(self.source) as conn:
             conn.execute('CREATE EXTENSION pg_stat_statements')

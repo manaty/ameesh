@@ -80,6 +80,13 @@ RESTORE_SPACE_FACTOR = 2
 #: An attestation older than this is stale: the gate follows the refreshed
 #: document, never a value frozen at enrollment time.
 CAPACITY_TTL_SECONDS = 300
+#: libpq reads these from the environment for every parameter the attested
+#: restore DSN leaves out (it pins host, dbname, user and require_auth, never
+#: port, hostaddr, service or options): inherited by the in-process connection
+#: and by pg_restore, they would route the verified restore elsewhere than the
+#: attested target (#5170 N1).
+LIBPQ_ROUTING_ENVIRONMENT = ('PGSERVICE', 'PGSERVICEFILE', 'PGSYSCONFDIR',
+                             'PGHOSTADDR', 'PGPORT', 'PGOPTIONS')
 CAPACITY_FUTURE_SKEW_SECONDS = 60
 # A recovery artifact left by an interrupted attempt is only evidence of the
 # current pre-migration state for a bounded window; an older set is recreated
@@ -448,6 +455,8 @@ class RecoverySet:
         # The copy is materialised on the restore cluster's volume, not on the
         # retention one: admit it against the live attestation of that volume
         # and the pinned uncompressed source size, before any effect.
+        if any(os.environ.get(key) for key in LIBPQ_ROUTING_ENVIRONMENT):
+            raise RecoveryError('external libpq routing refused for the restore target')
         free = self._capacity()
         needed = MINIMUM_FREE_BYTES + RESTORE_SPACE_FACTOR * expected['source_bytes']
         if free is None or free < needed:

@@ -2,6 +2,7 @@
 """Atomic two-envelope admission and uncertain settlement on real PostgreSQL."""
 import copy
 import dataclasses
+import importlib.util
 import os
 import time
 from pathlib import Path
@@ -139,6 +140,8 @@ class TurnAdmissionTest(PgTestCase):
         from ameesh import db as db_mod
         for driver in ('psycopg', 'psql'):
             with self.subTest(driver=driver):
+                if driver == 'psycopg' and importlib.util.find_spec('psycopg') is None:
+                    self.skipTest('psycopg is not installed')
                 db = db_mod.connect(self.cfg, driver=driver)
                 self.addCleanup(db.close)
                 snapshot = self.snapshot(driver)

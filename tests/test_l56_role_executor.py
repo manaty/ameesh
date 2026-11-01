@@ -647,6 +647,24 @@ class RoleExecutorTest(PgTestCase):
                 self.db.execute('DROP OWNED BY %s' % q(controller))
                 self.db.execute('DROP ROLE %s' % q(controller))
 
+    def test_release_controller_enrolls_before_the_marker_exists(self):
+        """#4976: enrolled before 0524, the script skips the marker's SELECT."""
+        from pathlib import Path
+        q = db_mod.quote_ident
+        controller = 't_release_premarker_' + uuid.uuid4().hex[:8]
+        self.db.execute('ALTER TABLE schema_non_additive_migrations RENAME TO hidden_marker')
+        env = dict(os.environ, PGOPTIONS='-c search_path='+self.schema)
+        try:
+            result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                '-v','role='+controller,'-f',str(Path(REPO,'deploy/sql/role-release-controller.sql'))],
+                env=env, text=True, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode,0,result.stderr)
+        finally:
+            self.db.execute('ALTER TABLE hidden_marker RENAME TO schema_non_additive_migrations')
+            if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
+                self.db.execute('DROP OWNED BY %s' % q(controller))
+                self.db.execute('DROP ROLE %s' % q(controller))
+
     def test_inherited_policy_writes_make_executor_audit_fail(self):
         q = db_mod.quote_ident
         parent = "t_policy_parent_" + uuid.uuid4().hex[:8]

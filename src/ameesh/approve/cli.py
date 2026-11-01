@@ -83,6 +83,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                           workdir=config_mod.ensure_private_dir(cfg.state_dir))
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s ameesh-approve %(levelname)s %(message)s")
+    # #4976: outside the writer admission on purpose. This long-lived service
+    # connects under a read-only role (deploy/sql/role-approve.sql), which
+    # cannot write whatever the schema, and has no writer tick to guard.
     db = db_mod.connect(ameesh_config.load(), writer=False)
     db_mod.require_schema(db)
     try:

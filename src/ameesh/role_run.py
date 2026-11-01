@@ -252,6 +252,9 @@ class _AlertsLease:
         if epoch is None:
             return False
         try:
+            # #4976: the pass may have outlived its admission; a refused
+            # release writes nothing and the TTL frees the pass.
+            migrations.require_compatible_writer(self.db)
             return bool(self._work().land_unlock(self.key, self.owner, epoch))
         except Exception:  # noqa: BLE001 - the TTL still frees the pass
             return False
@@ -413,7 +416,10 @@ def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
             return
         try:
             renewed = lease.renew()
-        except db_mod.DbError:
+        except db_mod.DbError as exc:
+            # #4976: the caller only reports a lost lease; the cause (schema
+            # refused, database down) is said here, once, before the stop.
+            print("ameesh role run: lease renewal failed: %s" % exc, file=sys.stderr)
             renewed = False
         if renewed:
             continue

@@ -200,6 +200,7 @@ class CorpusLineTest(unittest.TestCase):
         }})
         self.assertEqual(line["W"]["value"], 1_000_000)
         self.assertEqual(line["W"]["quality"], "measured")
+        self.assertEqual(line["model_quality"], "measured")
         self.assertEqual(line["auxiliary_models"], ["claude-haiku-4-5"])
         self.assertNotEqual(line["W"]["value"], 200000)
 
@@ -219,6 +220,60 @@ class CorpusLineTest(unittest.TestCase):
                          "runtime:modelUsage.contextWindow")
         self.assertEqual(line["model_quality"], "measured")
         self.assertEqual(line["auxiliary_models"], ["claude-haiku-4-5"])
+
+    def test_sans_profil_le_nom_demande_reste_requested(self):
+        # Un tour configuré avec un alias, sans profil ni model_usage publié :
+        # le corpus ne peut pas affirmer une mesure runtime du modèle.
+        line = build(model="alias-demande")
+        self.assertEqual(line["model"], "alias-demande")
+        self.assertEqual(line["model_quality"], "requested")
+        context_corpus.validate_line(line)
+
+    def test_sans_nom_la_qualite_reste_inconnue(self):
+        line = build(model=None)
+        self.assertIsNone(line["model"])
+        self.assertEqual(line["model_quality"], "unknown")
+        context_corpus.validate_line(line)
+
+    def test_qualite_publiee_par_le_producteur_est_reprise(self):
+        # Le producteur distingue une annonce du flux (`measured`) du seul nom
+        # demandé (`requested`) ; le corpus garde cette provenance.
+        for quality in ("measured", "requested"):
+            with self.subTest(quality=quality):
+                source = payload()
+                source["context"]["model_quality"] = quality
+                line = context_corpus.corpus_line(source)
+                self.assertEqual(line["model_quality"], quality)
+
+    def test_qualite_de_racine_est_reprise(self):
+        source = payload()
+        source["model_quality"] = "measured"
+        line = context_corpus.corpus_line(source)
+        self.assertEqual(line["model_quality"], "measured")
+
+    def test_qualite_inconnue_ne_devient_pas_mesuree(self):
+        source = payload()
+        source["context"]["model_quality"] = "unknown"
+        line = context_corpus.corpus_line(source)
+        self.assertEqual(line["model_quality"], "unknown")
+
+    def test_profil_sans_modele_effectif_ne_promouvoit_pas_le_nom(self):
+        line = build(context_extra={"profile": {
+            "schema": "ameesh-context/1",
+            "model_quality": "measured",
+            "window_tokens": 1_000_000,
+            "window_quality": "measured",
+        }})
+        self.assertEqual(line["model"], "claude-opus-5-5")
+        self.assertEqual(line["model_quality"], "requested")
+        context_corpus.validate_line(line)
+
+    def test_qualite_hors_vocabulaire_retombe_sur_requested(self):
+        source = payload()
+        source["context"]["model_quality"] = "presque-mesure"
+        line = context_corpus.corpus_line(source)
+        self.assertEqual(line["model_quality"], "requested")
+        context_corpus.validate_line(line)
 
     def test_fenetre_zero_reste_inconnue(self):
         line = build(context_extra={"profile": {

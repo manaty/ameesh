@@ -35,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -101,6 +102,33 @@ def _retry_limit(environ=None) -> int:
 TRANSIENT_RETRY_LIMIT = _retry_limit()
 #: préfixe des notes de journal qui comptent ces réessais (`events_noted`).
 RETRY_NOTE = "land transient retry"
+#: #5179 : un échec d'atterrissage au journal du lot, `lock <hôte>:<fichier>` ou
+#: `other` ; le journal, et non `reason`, que le radar réécrit (#2345)
+FAILURE_NOTE = "land failure: "
+#: #5179 : échecs consécutifs sur le même verrou git avant `merge_lock_stuck`
+DEFAULT_GIT_LOCK_ALERT_AFTER = 3
+
+
+def _git_lock_alert_after(environ=None) -> int:
+    """La borne lue sans faire échouer l'import (#2371) ; mal formée ou inférieure
+    à 1 : le défaut, avec un avertissement."""
+    raw = (os.environ if environ is None else environ).get("AMEESH_GIT_LOCK_ALERT_AFTER", "")
+    if not raw.strip():
+        return DEFAULT_GIT_LOCK_ALERT_AFTER
+    try:
+        if int(raw) >= 1:
+            return int(raw)
+    except ValueError:
+        pass
+    warnings.warn("AMEESH_GIT_LOCK_ALERT_AFTER=%r is not a positive integer: using %d"
+                  % (raw, DEFAULT_GIT_LOCK_ALERT_AFTER), RuntimeWarning, stacklevel=2)
+    return DEFAULT_GIT_LOCK_ALERT_AFTER
+
+
+GIT_LOCK_ALERT_AFTER = _git_lock_alert_after()
+#: #5179 : au-delà sans nouvel échec, le blocage n'est plus tenu pour actuel
+GIT_LOCK_ALERT_FRESH_S = 3600.0
+_GIT_LOCK_ERROR = re.compile(r"'?(/[^'\n:]+\.lock)'?:? File exists")
 
 
 class LandError(RuntimeError):
@@ -1021,7 +1049,7 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         renewal.start()
         if replayer is None:
             replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name),
-                                            target=project.target)
+                                            target=project.target, db=db)
         landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
                            cfg=cfg, clone=getattr(replayer, "path", None),
                            replayer=replayer, parts=parts, fence=fence,
@@ -1055,8 +1083,10 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
                 landing.keep = True
                 landing.write(reason="reading PR failed (%s): retried" % str(exc)[:200])
             else:
+                note = {} if isinstance(exc, resolutions.CloneBusy) \
+                    else {"note": _failure_note(str(exc)), "actor": work.SYSTEM_SENDER}
                 landing.write(state="queued",
-                              reason="landing failed (%s): retried" % str(exc)[:200])
+                              reason="landing failed (%s): retried" % str(exc)[:200], **note)
         return error
     finally:
         # #3932: the lease only covers the pass, except where the lot waits on
@@ -1628,6 +1658,53 @@ def run_pass(cfg, db, project, report: dict, *, owner: str, locks=None, gh=_gh) 
 # --------------------------------------------------------------------------
 
 BLOCKED_AFTER_S = float(os.environ.get("AMEESH_MERGE_BLOCKED_MIN", "30")) * 60
+
+
+def lock_note(error: str) -> str | None:
+    """#5179 : la note d'un échec dû à un verrou git, sinon None."""
+    found = _GIT_LOCK_ERROR.search(error)
+    if found is None:
+        return None
+    return "%slock %s:%s" % (FAILURE_NOTE, socket.gethostname(), found.group(1))
+
+
+def _failure_note(error: str) -> str:
+    """#5179 : la cause d'un échec, comparable d'un passage à l'autre."""
+    return lock_note(error) or FAILURE_NOTE + "other"
+
+
+def lock_stuck(db, now: float | None = None) -> list[dict]:
+    """#5179 : les lignes en file dont les `GIT_LOCK_ALERT_AFTER` derniers échecs
+    tiennent au même verrou git (`git_lock` : hôte:fichier, `failures`).
+
+    `blocked` ne les voit pas : chaque réessai rafraîchit `updated_ts`."""
+    now = time.time() if now is None else now
+    ops = storage.of(db).work
+    out = []
+    try:
+        rows = [r for r in ops.queue() if r["state"] in ("queued", "landing")]
+    except Exception:  # noqa: BLE001 - database without 0058
+        return []
+    for row in rows:
+        lot = int(row["work_item_id"])
+        try:
+            notes = ops.events_noted(FAILURE_NOTE, float(row.get("queued_ts") or 0), ids=[lot])
+        except Exception:  # noqa: BLE001 - journal illisible : pas de conclusion
+            continue
+        causes = [str(n.get("note") or "") for n in notes]
+        if not causes or not causes[-1].startswith(FAILURE_NOTE + "lock "):
+            continue
+        if now - float(notes[-1].get("created_ts") or 0) > GIT_LOCK_ALERT_FRESH_S:
+            continue
+        failures = 0
+        for cause in reversed(causes):
+            if cause != causes[-1]:
+                break
+            failures += 1
+        if failures >= GIT_LOCK_ALERT_AFTER:
+            out.append(dict(row, git_lock=causes[-1][len(FAILURE_NOTE) + 5:],
+                            failures=failures))
+    return out
 
 
 def blocked(db, now: float | None = None) -> list[dict]:

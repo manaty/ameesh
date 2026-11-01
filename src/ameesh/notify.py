@@ -229,6 +229,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "owner_key_registered",
                  # L160e2: a merge queue no longer moves
                  "merge_blocked",
+                 # #5179: the same queue, stuck on a named git lock
+                 "merge_lock_stuck",
                  # #194 r6: a PR merged into a wrong base, or not checked
                  "land_uncertain", "db_connections_high",
                  # #4609 : la sauvegarde quotidienne de la base du mesh n'a pas
@@ -371,6 +373,7 @@ TYPE_LABELS = {
     # L159e6: not pushed by default (add it to `notify.types`)
     "guard_restart": "agents started again by the capacity guard",
     "merge_blocked": "merge queue blocked",
+    "merge_lock_stuck": "merge queue stuck on a git lock",
     "land_uncertain": "PR merged by ameesh into a wrong or unchecked base",
 
     "owner_key_registered": "owner key registered",
