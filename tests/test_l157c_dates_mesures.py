@@ -247,12 +247,13 @@ class QueueTest(unittest.TestCase):
                 {"id": 4, "type": "bug", "state": "intake"},
                 {"id": 5, "type": "chore", "estimate_minutes": 120, "state": "intake"}]
         out = lot_schedule.plan_queue(lots, {}, BODY, {}, now=NOW)
-        self.assertEqual([e["id"] for e in out], [1, 2, 4, 5, 3])
+        # #5151: the P1 goes first, even before the lot in progress
+        self.assertEqual([e["id"] for e in out], [2, 1, 4, 5, 3])
         by = {e["id"]: e for e in out}
-        # in progress: started 2 h ago, ends at start + p80 (24 h); the next
-        # one starts at its median (start + 10 h = now + 8 h)
-        self.assertEqual((by[1]["start_ts"], by[1]["end_ts"]), (NOW - 2 * H, NOW + 22 * H))
-        self.assertEqual((by[2]["start_ts"], by[2]["end_ts"]), (NOW + 8 * H, NOW + 32 * H))
+        self.assertEqual((by[2]["start_ts"], by[2]["end_ts"]), (NOW, NOW + 24 * H))
+        # in progress: started 2 h ago, its rest (22 h at the p80, 8 h at the
+        # median) moves after the P1's median (now + 10 h)
+        self.assertEqual((by[1]["start_ts"], by[1]["end_ts"]), (NOW - 2 * H, NOW + 32 * H))
         # no group, no estimate: unplanned, the queue does not move
         self.assertIsNone(by[4]["planned_start"])
         # no group, its own estimate: median = p80 = 2 h

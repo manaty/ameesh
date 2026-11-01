@@ -7,8 +7,8 @@ Point 5 of L157b (#208): planned dates are set at the p80 of the reference
 table, lots are ordered at the median. For each agent, its open lots form a
 queue:
 
-1. **Order**: lots in progress first (by start), then by priority (1 high),
-   by planned start already set, by number.
+1. **Order**: priority 1 first, then lots in progress (by start), then by
+   priority (1 high), by planned start already set, by number.
 2. **Duration of a lot**: its reference group in the table published by the
    auditor (`estimates.lookup`: type, size, host and harness of the
    assignee — median and p80); without a group, the lot's own estimate
@@ -23,7 +23,11 @@ queue:
    its measured start, and of max(now, start + p80)). The promised date is
    the cautious one. Days are LOCAL days, as everywhere in the roadmap
    (`roadmap.today`).
-5. **A lot dated by a person** keeps its date and only takes its place in
+5. **#5151**: a lot waiting on someone else (`qa`, `validated`,
+   `waiting_human`, `blocked`) gets its dates but does not move the queue;
+   a priority 1 lot is placed before the lower priority ones, even in
+   progress (whose remaining time moves after it).
+6. **A lot dated by a person** keeps its date and only takes its place in
    the queue from that date (no earlier than the queue reaches it): a P1
    lot set for next month does not push back the lots after it.
 
@@ -73,12 +77,25 @@ def open_states() -> tuple:
                  if s not in work_mod.MERGED_STATES and s != "closed")
 
 
+def waits_on_others(lot: dict) -> bool:
+    """#5151: a lot waiting on someone else than its assignee (review,
+    package or merge, decision, block — `WAITING_ON_OTHERS`, as the
+    `active_lots` of `operations.listing`, L165b) does not hold the queue."""
+    from . import work_lifecycle
+    return lot.get("state") in work_lifecycle.WAITING_ON_OTHERS
+
+
+def _p1(lot: dict) -> bool:
+    return int(lot.get("priority") or DEFAULT_PRIORITY) == 1
+
+
 def queue_order(lot: dict, plan: dict | None):
-    """Sort key of a queue: in progress first (by start), then priority,
-    planned start already set, number."""
+    """Sort key of a queue: priority 1 first (#5151: a P1 never waits behind
+    a lower priority lot, even one in progress), then in progress (by
+    start), priority, planned start already set, number."""
     started = lot.get("started_ts")
     planned = (plan or {}).get("planned_start")
-    return (0 if started is not None else 1, float(started or 0),
+    return (0 if _p1(lot) else 1, 0 if started is not None else 1, float(started or 0),
             int(lot.get("priority") or DEFAULT_PRIORITY), str(planned or "9999-99-99"),
             int(lot["id"]))
 
@@ -155,14 +172,24 @@ def plan_queue(lots: list[dict], plans: dict, body: dict | None, agent: dict | N
         entry.update(d)
         median_s, p80_s = d["median_minutes"] * 60.0, d["p80_minutes"] * 60.0
         started = lot.get("started_ts")
+        aside = waits_on_others(lot)
         if started is not None:
             started = float(started)
-            start, end = started, max(now, started + p80_s)
-            cursor = max(cursor, started + median_s, now)
+            if aside:
+                start, end = started, max(now, started + p80_s)
+            else:
+                # behind a P1 placed first (#5151), its rest moves by as much
+                base = max(cursor, now)
+                start = started
+                end = max(now, started + p80_s, base + max(0.0, started + p80_s - now))
+                cursor = base + max(0.0, started + median_s - now)
         else:
-            start = cursor if pin is None else max(cursor, pin)
+            start = now if aside else cursor
+            if pin is not None:
+                start = max(start, pin)
             end = start + p80_s
-            cursor = start + median_s
+            if not aside:
+                cursor = start + median_s
         entry.update(start_ts=round(start, 3), end_ts=round(end, 3),
                      planned_start=_day(start), planned_end=_day(end))
         out.append(entry)

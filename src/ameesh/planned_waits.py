@@ -764,9 +764,29 @@ def packet_waits(rows, open_items=None, attachments=None):
     return out
 
 
+def scheduled_p1(row, plan) -> bool:
+    """#5151 : la date de ce lot est-elle une projection du planificateur sur
+    un lot de priorité 1 ? `work schedule` (source « reference p80 … ») date
+    un lot à son tour de file ; pour un P1, cette date ne vaut pas attente
+    (un P1 ne dort pas derrière sa propre projection). Une date posée par une
+    personne reste une attente, même en P1 ; sans priorité lue, la date vaut
+    (le sens prudent des appelants qui ne la lisent pas)."""
+    from .lot_schedule import SOURCE  # lot_schedule imports work, not this module
+    try:
+        priority = int((row or {}).get("priority") or 0)
+    except (TypeError, ValueError):
+        return False
+    source = str((plan or {}).get("planned_source")
+                 or (row or {}).get("planned_source") or "")
+    return priority == 1 and source.startswith(SOURCE)
+
+
 def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies=(),
             landings=(), holds=None, decisions=(), packets=None):
     """Pure resolver. Only an open execution lot can block another lot.
+
+    #5151: a future planned start written by `work schedule` on a P1 lot
+    (`scheduled_p1`) is not a wait; one set by a person still is.
 
     Commitments apply to their explicit work item or to their plan package
     (including descendants). Dependencies are an anchored numeric lot
@@ -863,6 +883,8 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
             continue
         start = dates.get(ident, {}).get("planned_start")
         start_package = None
+        if start and scheduled_p1(row, dates.get(ident)):
+            start = None
         if not start:
             for package_id in ancestors(row.get("package_id"), packages):
                 start = plan.planned_dates(packages[package_id])["start"]
