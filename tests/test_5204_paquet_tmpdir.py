@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from tests.test_3807_paquet_auto import paquet_auto as auto
+from ameesh.role_timers import render_paquet_service
 
 
 class PaquetTmpdirTests(unittest.TestCase):
@@ -70,9 +71,12 @@ class PaquetTmpdirTests(unittest.TestCase):
     def test_unit_creates_the_configured_cache(self):
         unit = (Path(__file__).resolve().parents[1] / "deploy/systemd/"
                 "ameesh-paquet-horaire.service").read_text()
-        self.assertIn("CacheDirectory=ameesh/paquet-auto\n", unit)
-        self.assertIn("CacheDirectoryMode=0700\n", unit)
-        self.assertIn("Environment=TMPDIR=%h/.cache/ameesh/paquet-auto\n", unit)
+        rendered = render_paquet_service(role="mesh-design")
+        for text in (unit, rendered):
+            with self.subTest(rendered=text == rendered):
+                self.assertIn("CacheDirectory=ameesh/paquet-auto\n", text)
+                self.assertIn("CacheDirectoryMode=0700\n", text)
+                self.assertIn("Environment=TMPDIR=%C/ameesh/paquet-auto\n", text)
 
 
 if __name__ == "__main__":

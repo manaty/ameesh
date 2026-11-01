@@ -34,7 +34,7 @@ Type=oneshot
 # #5204 : worktrees et diagnostics sur disque, hors du /tmp partagé.
 CacheDirectory=ameesh/paquet-auto
 CacheDirectoryMode=0700
-Environment=TMPDIR=%h/.cache/ameesh/paquet-auto
+Environment=TMPDIR=%C/ameesh/paquet-auto
 Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
 Environment=AMEESH_PAQUET_TARGET=main
 Environment=AMEESH_PAQUET_PILOT=mesh-design
