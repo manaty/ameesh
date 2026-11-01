@@ -172,6 +172,24 @@ class PilotDbTest(_Base):
                 mock.patch.object(pilot, "_oom_seen", return_value=None):
             self.assertEqual(pilot.collect(self.cfg, self.db, "pilote-h", state, 2000.0)["guards"], [])
 
+    def test_rattachement_des_alertes_de_compte(self):
+        """Relecture : le producteur publie `agent=None`, parfois `host=None`."""
+        self._worker("pilote-i")
+        self.db.execute("UPDATE agent_registry SET session_account = 'c1', host = 'h1',"
+                        " session_harness = 'claude' WHERE name = 'pilote-i'")
+
+        def garde(**champs):
+            return dict({"type": "account_overage", "agent": None, "since": 1.0}, **champs)
+
+        visees = [garde(host=None, harness="claude", account="c1"),
+                  garde(host="h2", harness="claude", account="c1"),
+                  {"type": "guard_restart", "agent": None, "host": "h1", "since": 1.0}]
+        ecartees = [garde(host="h1", harness="codex", account="c1"),
+                    garde(host="h1", harness="claude", account="c2"),
+                    {"type": "guard_restart", "agent": None, "host": "h2", "since": 1.0}]
+        with mock.patch.object(pilot.exploitation, "alerts", return_value=visees + ecartees):
+            self.assertEqual(pilot._guard_alerts(self.cfg, self.db, "pilote-i"), visees)
+
     def test_controle_replie_puis_ramene(self):
         self._worker("pilote-d", context_max_tokens=400_000)
         self.assertEqual(self._apply("pilote-d"), 0)

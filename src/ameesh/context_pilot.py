@@ -169,18 +169,27 @@ def rolling(windows: list | None) -> dict | None:
 
 def _guard_id(alert: dict) -> list:
     return [alert.get(key) for key in
-            ("type", "agent", "host", "account", "gauge", "since")]
+            ("type", "agent", "host", "harness", "account", "gauge", "since")]
 
 
 def _guard_alerts(cfg, db, name: str) -> list[dict]:
-    """Les alertes de garde de l'agent, de son hôte, et de son compte s'il y en a un."""
+    """Les alertes de garde qui visent cet agent.
+
+    Une alerte de compte se rattache par (harnais, compte), quel que soit l'hôte :
+    le producteur la publie parfois sans hôte, et un homonyme d'un autre harnais
+    n'est pas ce compte. Sans compte, par l'agent ou par son hôte."""
     from . import registry
     row = registry.get(db, name) or {}
     host, account = row.get("host"), row.get("session_account")
+    harness = row.get("session_harness") or row.get("harness")
+
+    def concerns(alert: dict) -> bool:
+        if alert.get("account"):
+            return alert["account"] == account and alert.get("harness") == harness
+        return alert.get("agent") == name or bool(host and alert.get("host") == host)
+
     return [a for a in exploitation.alerts(cfg, db)
-            if a.get("type") in GUARD_ALERTS
-            and (a.get("agent") == name or (host and a.get("host") == host))
-            and (not a.get("account") or not account or a["account"] == account)]
+            if a.get("type") in GUARD_ALERTS and concerns(a)]
 
 
 def collect(cfg, db, name: str, state: dict, now: float,
