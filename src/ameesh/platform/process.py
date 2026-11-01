@@ -1491,12 +1491,18 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     is unreadable too, its command line is not. What was read before a
     refusal (a `cwd`, an `exe`) is recorded all the same (#3195 R2): an
     observation is never dropped for what could not be read after it.
+    The descriptors of the reader itself are not read (#5225): the housekeeping
+    pass holds the parent of the artifact it checks open, and would see itself
+    inside. They are left out here, not filtered afterwards: `paths` keeps one
+    process per path, so a later filter would hide another holder of that path.
+    Its own cwd, executable and maps still count.
     Without `/proc` (other OS), `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
     uid = os.getuid() if uid is None else uid
     allow = SERVICE_MANAGER | set(allow or ())
     out = UserPaths()
+    own = os.getpid()
     executors = _once(executor_processes)
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
@@ -1522,7 +1528,8 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
                     found.append(_link(os.path.join(base, link)))
                 except FileNotFoundError:
                     pass
-            for fd in os.listdir(os.path.join(base, "fd")):
+            # #5225: not the descriptors of the reader itself
+            for fd in () if int(pid) == own else os.listdir(os.path.join(base, "fd")):
                 try:
                     found.append(_link(os.path.join(base, "fd", fd)))
                 except FileNotFoundError:
