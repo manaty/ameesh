@@ -13,9 +13,11 @@ l'entoure de `timeout 120`), et ne conclut jamais `success` ni `skipped`.
 from __future__ import annotations
 
 import argparse
+import datetime
 import importlib.util
 import pathlib
 import re
+import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -142,6 +144,18 @@ class ExternalIdTest(unittest.TestCase):
     def test_tentative_absente_vaut_un(self):
         corps = self._create(self._github(GITHUB_RUN_ID="500"))
         self.assertEqual(corps["external_id"], "ameesh-ci-flow/500/1")
+
+    def test_started_at_utc_a_la_creation(self):
+        # #5298 : sans `started_at`, la forge peut dater le check de l'heure
+        # locale du runner ; la lecture `filter=latest` garde alors le check
+        # de l'attempt précédent et son rouge masque le vert de la relance.
+        avant = time.time() - 5.0
+        corps = self._create(self._github(GITHUB_RUN_ID="500", GITHUB_RUN_ATTEMPT="2"))
+        stamp = datetime.datetime.fromisoformat(
+            str(corps["started_at"]).replace("Z", "+00:00"))
+        self.assertIsNotNone(stamp.tzinfo)
+        self.assertGreaterEqual(stamp.timestamp(), avant)
+        self.assertLessEqual(stamp.timestamp(), time.time() + 5.0)
 
     def test_sans_numero_execution_aucun_external_id(self):
         corps = self._create(self._github())

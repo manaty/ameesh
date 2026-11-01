@@ -215,7 +215,8 @@ def _branch_name(target: str) -> str:
     return merge_queue._remote_branch((target or "").strip())
 
 
-def _unstable_ci_ok(rollup, project=None, branch=None) -> bool:
+def _unstable_ci_ok(rollup, project=None, branch=None, *, slug: str = "",
+                    head: str = "", gh=None) -> bool:
     """#4549 : sous `UNSTABLE`, les seuls non-verts tolérés sont les checks
     facultatifs et un run supplanté par une suite verte sans test.
 
@@ -225,19 +226,30 @@ def _unstable_ci_ok(rollup, project=None, branch=None) -> bool:
     un statut en erreur se consigne et ne bloque pas (N2 de dev1) —, la
     preuve du portier `paquet` et le détail de l'agrégat `tests` gardent
     leurs refus. Un négatif facultatif n'arrête donc pas le geste, comme la
-    protection GitHub ne l'exige pas."""
+    protection GitHub ne l'exige pas.
+
+    #5298 : un flux de part d'un attempt antérieur n'est remplacé que sur la
+    preuve identifiée de `fire.replaced_flux_checks` (même exécution, même
+    part, tentative plus récente verte). Sans `slug`/`head`/`gh`, aucune
+    preuve n'est lue et le flux rouge bloque (doute fermé)."""
     status_gaps, _consigned = fire._required_status_gate(
         rollup, radar.required_statuses(project, branch))
     if status_gaps:
         return False
-    proof_gaps, _ = fire._packet_proof_gate(rollup)
+    replaced = ()
+    try:
+        replaced = fire.replaced_flux_checks(rollup, slug=slug, head=head, gh=gh)
+    except Exception:  # noqa: BLE001 - une preuve illisible ne verdit jamais
+        replaced = ()
+    proof_gaps, _ = fire._packet_proof_gate(rollup, replaced)
     if proof_gaps:
         return False
     detail_gaps, _ = fire._aggregate_detail_gate(rollup)
     return not detail_gaps
 
 
-def _pr_guards(view: dict, pr: int, head: str, target: str, project=None) -> None:
+def _pr_guards(view: dict, pr: int, head: str, target: str, project=None, *,
+               slug: str = "", gh=None) -> None:
     """The guards carried by the PR view, replayed before any write.
 
     #4549 : `UNSTABLE` n'est plus refusé d'emblée. GitHub le rend quand des
@@ -267,7 +279,8 @@ def _pr_guards(view: dict, pr: int, head: str, target: str, project=None) -> Non
     required = radar.required_statuses(project, branch)
     rollup = view.get("statusCheckRollup") or []
     if merge_state == "UNSTABLE":
-        if not _unstable_ci_ok(rollup, project, branch):
+        if not _unstable_ci_ok(rollup, project, branch, slug=slug, head=head,
+                               gh=gh):
             raise MergePrError(
                 "PR #%d: the only tolerated non-green checks under UNSTABLE are "
                 "optional ones and a run superseded by a newer green suite; the "
@@ -441,7 +454,8 @@ def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
     #: #4549 : sous `UNSTABLE`, un non-vert facultatif ou un run supplanté ne
     #: bloque plus la file ; `_required_refusal` ci-dessus a déjà prouvé les
     #: checks requis, `_unstable_ci_ok` garde le portier et le détail.
-    unstable_ok = unstable and _unstable_ci_ok(rollup, project, branch)
+    unstable_ok = unstable and _unstable_ci_ok(rollup, project, branch,
+                                               slug=slug, head=head, gh=gh)
 
     def ci_status(name: str):
         if not branch or name != branch:
@@ -815,7 +829,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         # merged by ameesh at their published head (`packet_automerge`),
         # which disarms any GitHub auto-merge it finds; the guards below and
         # the fresh re-read before the push still bind this merge to `head`.
-        _pr_guards(view, pr, head, target, project)
+        _pr_guards(view, pr, head, target, project, slug=slug, gh=gh)
         _stacked_base_guard(owner, fetch_url, repo, view, target)
         ready = _admission(db, cfg, lot, repo, project, owner, view,
                            slug=slug, target=target, head=head, gh=gh,
@@ -930,7 +944,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         # admission and both remote refs are read again; any mutation since
         # the merge commit was built stops without writing.
         fresh = pr_view(slug, pr, gh=gh)
-        _pr_guards(fresh, pr, head, target, project)
+        _pr_guards(fresh, pr, head, target, project, slug=slug, gh=gh)
         _stacked_base_guard(owner, fetch_url, repo, fresh, target)
         ready = _admission(db, cfg, lot, repo, project, owner, fresh,
                            slug=slug, target=target, head=head, gh=gh,
