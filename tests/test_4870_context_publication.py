@@ -144,6 +144,34 @@ class BuilderTest(unittest.TestCase):
         self.assertNotIn("tool_result", encoded)
         self.assertNotIn('"text"', encoded)
 
+    def test_publication_reprend_la_qualite_publiee_du_modele(self):
+        document = observe_all(DEEPSEEK, "deepseek_stream.jsonl",
+                               session="ctx-dsh-1", session_reread=0)
+        self.assertEqual(document["model"], "deepseek-flash")
+        self.assertEqual(document["model_quality"], context_metrics.MEASURED)
+        payload = publication(document)
+        self.assertEqual(payload["model"], "deepseek-flash")
+        self.assertEqual(payload["context"]["model_quality"],
+                         context_metrics.MEASURED)
+
+    def test_nom_demande_sans_annonce_reste_requested(self):
+        document = context_metrics.TurnNormalizer(
+            "deepseek", session="ctx-dsh-1", model="alias-demande").finish()
+        self.assertEqual(document["model_quality"], context_metrics.REQUESTED)
+        payload = publication(document)
+        self.assertEqual(payload["model"], "alias-demande")
+        self.assertEqual(payload["context"]["model_quality"],
+                         context_metrics.REQUESTED)
+
+    def test_document_anterieur_sans_qualite_reste_publicable(self):
+        # Les événements déjà écrits n'ont pas `model_quality` : la
+        # publication reste compatible et ne suppose aucune mesure.
+        document = observe_all(DEEPSEEK, "deepseek_stream.jsonl",
+                               session="ctx-dsh-1", session_reread=0)
+        document.pop("model_quality")
+        payload = publication(document)
+        self.assertIsNone(payload["context"].get("model_quality"))
+
     def test_document_et_legacy_serialisables(self):
         for reader, name in ((CLAUDE, "claude_stream.jsonl"),
                              (CODEX, "codex_exec.jsonl"),
@@ -496,6 +524,13 @@ class TurnContextEventTest(PgTestCase):
         self.assertEqual(measures["O"]["value"], 300)
         self.assertFalse(data["context"]["partial"])
         self.assertEqual(data["context"]["cache"]["write_tokens"]["value"], 0)
+        # Le faux dsh n'annonce pas de modèle : le nom du lancement reste
+        # `requested`, jamais promu `measured` (#5147).
+        expected_model_quality = (context_metrics.REQUESTED
+                                  if data["context"]["model"]
+                                  else context_metrics.UNKNOWN)
+        self.assertEqual(data["context"]["model_quality"],
+                         expected_model_quality)
         # Legacy : les valeurs qui continuent de décider, dont le seuil 150 k.
         ledger = self.db.query(
             "select input_tokens, cached_input_tokens, output_tokens"
