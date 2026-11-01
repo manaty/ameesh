@@ -726,6 +726,35 @@ class _Plan:
     delivered_sha: str = ""
 
 
+_SUPERSEDED_REF_RE = re.compile(r"[0-9]{1,19}")
+_SUPERSEDED_REF_MAX = 2 ** 63 - 1
+
+
+def _superseded_ref(value: Any) -> int | None:
+    """A positive lot reference carried by a superseded closure, or None.
+
+    Normalized like the verifier's `_as_int` (surrounding spaces accepted, a
+    boolean is not an integer) and bounded here, before `int()` or the SQL
+    comparison: a value of more than 19 digits, or beyond the bigint range of
+    `work_items.id`, is refused by name instead of raising `ValueError` on a
+    CPython conversion limit or an out-of-range SQL parameter (#5027).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not _SUPERSEDED_REF_RE.fullmatch(text):
+            return None
+        number = int(text)
+    else:
+        return None
+    if number <= 0 or number > _SUPERSEDED_REF_MAX:
+        return None
+    return number
+
+
 def _close_facts(tx: Any, command: Command) -> tuple[str, int | None, str]:
     """The closure carried by the command evidence, checked against legacy.
 
@@ -753,19 +782,18 @@ def _close_facts(tx: Any, command: Command) -> tuple[str, int | None, str]:
     superseded_by: int | None = None
     sha = ""
     if reason == "superseded":
-        value = evidence.get("superseded_by")
-        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
-            value = int(value)
-        if not _is_int(value) or int(value) <= 0:
+        raw = evidence.get("superseded_by")
+        value = _superseded_ref(raw)
+        if value is None:
             raise RegistryRefusal(
                 "superseded-unknown",
-                "a superseded closure carries a positive superseded_by, got %r" % (value,))
-        if int(value) == int(command.work_item_id):
+                "a superseded closure carries a positive superseded_by, got %r" % (raw,))
+        if value == int(command.work_item_id):
             raise RegistryRefusal("superseded-unknown", "a lot cannot supersede itself")
-        if not tx.query("SELECT 1 FROM work_items WHERE id = %s", (int(value),)):
+        if not tx.query("SELECT 1 FROM work_items WHERE id = %s", (value,)):
             raise RegistryRefusal("superseded-unknown",
                                   "superseding lot %s not found" % value)
-        superseded_by = int(value)
+        superseded_by = value
     elif reason == "delivered":
         sha = str(evidence.get("sha") or "").strip().lower()
         if not _HEAD_RE.match(sha):
