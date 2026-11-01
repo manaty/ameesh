@@ -1192,6 +1192,16 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
     try:
         ps.Process(me).open_files()
         user = _owner(ps.Process(me))
+    except ps.AccessDenied:
+        # #5185: psutil can deny its self-probe in a protected executor.
+        # The independent /proc scan checks its own fd access, then applies
+        # the same MainPID identities and unknown-process guards. Failure
+        # there remains NotAvailable; never infer an empty holder list.
+        if _proc_ok():
+            return _holders_proc(real, is_dir, needle, exclude, mapped,
+                                 session=session, allow=allow)
+        raise NotAvailable("file holders",
+                           "open files unreadable even for this process (AccessDenied)") from None
     except Exception as exc:
         raise NotAvailable("file holders",
                            "open files unreadable even for this process (%s)"
@@ -1445,7 +1455,7 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     it holds nothing anymore. One that cannot be read (not dumpable: setuid,
     file capabilities) is a doubt, unless its name (`comm`) and one of its two
     first argv entries (the script an interpreter runs, for an executor) are in
-    `allow` or the service manager: its `exe` link
+    `allow`, a verified service MainPID, or the service manager: its `exe` link
     is unreadable too, its command line is not. What was read before a
     refusal (a `cwd`, an `exe`) is recorded all the same (#3195 R2): an
     observation is never dropped for what could not be read after it.
@@ -1455,6 +1465,7 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     uid = os.getuid() if uid is None else uid
     allow = SERVICE_MANAGER | set(allow or ())
     out = UserPaths()
+    executors = _once(executor_processes)
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError:
@@ -1495,7 +1506,9 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
             continue   # gone meanwhile
         except OSError:
             argv = _read_text(os.path.join(base, "cmdline")).split("\0")[:2]
-            if _named_by(allow, name, argv):
+            if _trusted_executor(int(pid), executors):
+                pass  # #5185: verified service MainPID, same guard as holders
+            elif _named_by(allow, name, argv):
                 if name not in SERVICE_MANAGER:
                     out.allowed.append(who)
             else:
