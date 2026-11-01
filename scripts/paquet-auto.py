@@ -973,13 +973,26 @@ def composition_holder_elsewhere(repo: Path, name: str) -> tuple[str, int] | Non
 # ---------------------------------------------------------------------------
 
 
+def temporary_parent() -> Path:
+    """#5204 : les checkouts volumineux ne vont pas dans le /tmp partagé.
+
+    Garder le TMPDIR choisi par l'appelant hors de /tmp ; sans choix utilisable,
+    employer le cache utilisateur, également déclaré par l'unité systemd.
+    """
+    configured = os.environ.get("TMPDIR")
+    parent = Path(configured).resolve() if configured else None
+    if parent is None or parent.is_relative_to(Path("/tmp").resolve()):
+        parent = Path.home() / ".cache" / "ameesh" / "paquet-auto"
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return parent
+
+
 def make_worktree(repo: Path, base_sha: str, branch: str) -> Path:
     if rev(repo, "refs/heads/" + branch):
         raise InputError(
             "branche locale %s déjà présente : la supprimer ou choisir un autre "
             "--name" % branch)
-    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
-    parent.mkdir(parents=True, exist_ok=True)
+    parent = temporary_parent()
     path = Path(tempfile.mkdtemp(prefix="paquet-auto-", dir=str(parent)))
     path.rmdir()
     proc = git(repo, "worktree", "add", "-b", branch, str(path), base_sha,
@@ -1762,7 +1775,7 @@ def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
     """
     if not base_sha or not modules:
         return None
-    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    parent = temporary_parent()
     path = Path(tempfile.mkdtemp(prefix="paquet-auto-base-", dir=str(parent)))
     path.rmdir()
     proc = git(worktree, "worktree", "add", "--detach", str(path), base_sha,
@@ -2212,7 +2225,7 @@ def prefix_failures(worktree: Path, composition: Composition,
     if not composition.units:
         return {}, "composition sans unité à rejouer", []
     replay = replay or run_tests
-    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    parent = temporary_parent()
     path = Path(tempfile.mkdtemp(prefix="paquet-auto-prefixe-", dir=str(parent)))
     path.rmdir()
     first = composition.units[0].commit
@@ -3212,7 +3225,7 @@ def ensure_pull_request(worktree: Path, branch: str, target: str,
             raise PaquetAutoError(
                 "gh pr view %s a échoué : %s" % (branch, _tail(text)))
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md",
-                                     delete=False, dir=os.environ.get("TMPDIR")) as handle:
+                                     delete=False, dir=str(temporary_parent())) as handle:
         handle.write(body)
         body_path = Path(handle.name)
     try:
@@ -3907,12 +3920,12 @@ def publish_tested(args: argparse.Namespace) -> int:
         raise ChainRefused("%s sur origin désigne %s, pas la tête testée %s"
                            % (branch, (remote_sha or "rien")[:12], head[:12]))
     worktree = Path(tempfile.mkdtemp(prefix="paquet-auto-publie-",
-                                     dir=os.environ.get("TMPDIR")))
+                                     dir=str(temporary_parent())))
     worktree.rmdir()
     reader = Path(tempfile.mkdtemp(prefix="paquet-auto-base-",
-                                   dir=os.environ.get("TMPDIR")))
+                                   dir=str(temporary_parent())))
     reader.rmdir()
-    tmp = tempfile.TemporaryDirectory(prefix="paquet-auto-", dir=os.environ.get("TMPDIR"))
+    tmp = tempfile.TemporaryDirectory(prefix="paquet-auto-", dir=str(temporary_parent()))
     success = False
     try:
         git(repo, "worktree", "add", "--detach", str(worktree), head)
@@ -4029,7 +4042,7 @@ def compose_packet(args: argparse.Namespace) -> int:
         success = False
         empty = False
         tmp = tempfile.TemporaryDirectory(prefix="paquet-auto-",
-                                          dir=os.environ.get("TMPDIR"))
+                                          dir=str(temporary_parent()))
     except BaseException:
         lock.release()
         raise
