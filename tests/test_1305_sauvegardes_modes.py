@@ -55,6 +55,9 @@ import os
 import sys
 
 args = sys.argv[1:]
+if args == ["--version"]:  # #5189 : la garde des majors interroge ce binaire
+    print("pg_dump (PostgreSQL) 17.11")
+    sys.exit(0)
 if "-f" in args:
     chemin = args[args.index("-f") + 1]
 else:
@@ -76,7 +79,21 @@ with open(chemin, "w") as fh:  # tronque sans changer le mode, comme pg_dump
 '''
 
 FAKE_PG_RESTORE = '''#!/bin/sh
+[ "$1" = --version ] && echo "pg_restore (PostgreSQL) 17.11"
 exit 0
+'''
+
+# #5189 : `dump` lit le major du serveur source avant pg_dump ; la configuration
+# de test ne vise aucun serveur, le lanceur fixe ce seul major (17) et exécute
+# le corps du helper du dépôt.
+LANCEUR = '''import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("sauvegarder_prive", %r)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.source_server_major = lambda parameters: 17
+raise SystemExit(module.main())
 '''
 
 FAKE_CURL = '''#!/bin/sh
@@ -127,6 +144,9 @@ class SauvegardesPriveesTest(unittest.TestCase):
         # Le script est rejoué avec le helper et la rétention du dépôt, la
         # configuration de test et les chemins système absents ; le corps
         # exécuté reste celui du dépôt.
+        self.lanceur = os.path.join(self.tmp, "lanceur.py")
+        with open(self.lanceur, "w", encoding="utf-8") as fh:
+            fh.write(LANCEUR % HELPER)
         self.script = os.path.join(self.tmp, "sauvegarder-base.sh")
         with open(self.script, "w", encoding="utf-8") as fh:
             fh.write(self.script_adapte())
@@ -144,7 +164,7 @@ class SauvegardesPriveesTest(unittest.TestCase):
                 .replace("python=/opt/ameesh/venv/bin/python",
                          "python=" + shlex.quote(sys.executable))
                 .replace("helper=/usr/local/sbin/ameesh-sauvegarder-prive.py",
-                         "helper=" + shlex.quote(HELPER))
+                         "helper=" + shlex.quote(self.lanceur))
                 .replace("/usr/local/sbin/ameesh-retention-privee.py",
                          shlex.quote(RETENTION))
                 .replace("/etc/ameesh/sauvegarde.env",

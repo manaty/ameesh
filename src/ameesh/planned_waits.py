@@ -666,14 +666,39 @@ def _packet_wait(carrier):
     return out
 
 
-def recorded_packet_attachments(st, open_items, rows):
+#: #5206 : une composition enregistrée APRÈS le dernier relevé de la tête du
+#: porteur vaut appartenance pendant au plus ce délai, le temps que la
+#: poussée et le balayage suivant la rattrapent. Au-delà (composition jamais
+#: poussée), la tête observée reprend la main.
+RECORD_AHEAD_GRACE_S = 15 * 60.0
+
+
+def _record_ahead(member, carrier, now: float) -> bool:
+    """#5206 : la composition de `member` est-elle plus récente que la tête
+    observée du porteur ? Une recomposition enregistre ses unités une à une
+    (`paquet-compose --record-package`), chaque fois sur une tête que le
+    balayage n'a pas encore vue : l'ancienne tête observée ne l'invalide pas.
+    Un relevé non daté, postérieur ou trop ancien garde la règle de #4111."""
+    try:
+        recorded = float(member.get("recorded_ts"))
+        observed = float(carrier.get("branch_head_ts"))
+    except (TypeError, ValueError):
+        return False
+    return observed < recorded and now - recorded <= RECORD_AHEAD_GRACE_S
+
+
+def recorded_packet_attachments(st, open_items, rows, *, now=None):
     """#4082: read current packet membership without a local Git clone.
 
     Membership is replaced by record_packet on recomposition. Bind it to the
     observed carrier head and unit head, so stale records cannot hide work
-    excluded from the current packet or added since its composition.
+    excluded from the current packet or added since its composition. #5206:
+    a composition recorded after the observed head, for a bounded time, is the
+    newer evidence (a recomposition the branch sweep has not seen yet).
     """
     from . import plan_git
+
+    now = time.time() if now is None else float(now)
 
     carriers = packet_carriers(open_items)
     if not carriers:
@@ -702,7 +727,8 @@ def recorded_packet_attachments(st, open_items, rows):
         carrier_head = (carrier.get("branch_head")
                         or member.get("package_frozen_sha")
                         or member.get("head_sha"))
-        if not plan_git.same_commit(member.get("head_sha"), carrier_head):
+        if not plan_git.same_commit(member.get("head_sha"), carrier_head) \
+                and not (carrier.get("branch_head") and _record_ahead(member, carrier, now)):
             continue
         frozen = latest_freeze(marks.get(uid, ())) or {}
         current = unit.get("branch_head") or frozen.get("sha")

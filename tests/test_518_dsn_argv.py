@@ -242,9 +242,12 @@ class CommandLineTest(unittest.TestCase):
 # one record per call, ended by \036: tool, PGPASSWORD, PGPASSFILE, then argv,
 # separated by \037, so that newlines survive (a POSIX sh, cheap to start on a
 # loaded host); `-At` queries answer 1 (the role exists); pg_dump writes a
-# non-empty -f/--file target; pg_restore lists nothing; ssh drains its input
+# non-empty -f/--file target; pg_restore lists nothing; ssh drains its input;
+# `--version` (#5189 probe of the clients the same PATH runs) answers a major
+# 17 and is not recorded: the calls measured are the ones that carry a DSN
 FAKE_TOOL = r'''#!/bin/sh
 name=${0##*/}
+[ "$*" = --version ] && { echo "$name (PostgreSQL) 17.0"; exit 0; }
 { printf '%s\037' "$name" "${PGPASSWORD-<unset>}" "${PGPASSFILE-<unset>}" "$@"; printf '\036'; } >> "$FAKE_STATE/calls.log"
 case $name in
   ssh)
@@ -274,6 +277,18 @@ case "$*" in *-At*) echo 1 ;; esac
 exit 0
 '''
 
+LAUNCHER = """import importlib.util
+import sys
+
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("sauvegarder_prive", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.source_server_major = lambda parameters: 17
+sys.argv = sys.argv[1:]
+raise SystemExit(module.main())
+"""
+
 
 class PosteDsnTest(unittest.TestCase):
     def setUp(self):
@@ -296,11 +311,19 @@ class PosteDsnTest(unittest.TestCase):
         # `sauvegarder` runs the private backup channel through the venv's
         # python, as a real poste does (~/.local/share/ameesh/venv): a shim to
         # this interpreter, so the channel really runs its pg_dump/pg_restore.
+        # #5189 : the channel reads the source server's major before pg_dump;
+        # no DSN of the table reaches a server, so the launcher fixes that one
+        # major (17) and runs the repository helper itself.
         venv_bin = os.path.join(home, ".local", "share", "ameesh", "venv", "bin")
         os.makedirs(venv_bin)
+        launcher = os.path.join(self.tmp, "launcher.py")
+        with open(launcher, "w", encoding="utf-8") as fh:
+            fh.write(LAUNCHER)
         python = os.path.join(venv_bin, "python")
         with open(python, "w", encoding="utf-8") as fh:
-            fh.write("#!/bin/sh\nexec %s \"$@\"\n" % shlex.quote(sys.executable))
+            fh.write("#!/bin/sh\ncase $1 in */sauvegarder-prive.py) exec %s %s \"$@\" ;; esac\n"
+                     "exec %s \"$@\"\n" % (shlex.quote(sys.executable), shlex.quote(launcher),
+                                           shlex.quote(sys.executable)))
         os.chmod(python, 0o755)
         self.env = dict(os.environ, HOME=home, FAKE_STATE=self.state,
                         PATH=bin_dir + os.pathsep + os.environ["PATH"])

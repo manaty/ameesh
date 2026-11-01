@@ -54,6 +54,9 @@
   agent-mail list                                agents, host, lease, unread,
                                                  last sign of life (seen/wrote)
   agent-mail inbox [NAME]                        unread messages of NAME (without marking them read)
+  agent-mail show <id>                           one received message in full (its recipient or a
+                                                 copy only), read from the database without
+                                                 marking it read (#5215)
   agent-mail whoami [--session ID --harness H]   bound identity and its source (runner, explicit,
                                                  session); --cwd DIR = diagnostic
   agent-mail bind <NAME> --session ID --harness claude|codex|deepseek [--pid N] [--force]
@@ -869,6 +872,45 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
                 marque = "  [⚠ signature NOT valid: %s]" % verdict.reason
         marque += mail.forwarded_note(msg)
         print("from %s%s: %s" % (msg.get("from"), marque, msg.get("text")))
+    return 0
+
+
+_SHOW_USAGE = "usage: agent-mail show <id>"
+
+
+def cmd_show(bk, cfg: Config, rest: list[str]) -> int:
+    """#5215 : lire en entier un courrier reçu, par son numéro.
+
+    La lecture se fait en base, restreinte au destinataire (une copie a sa
+    propre ligne, donc son propre numéro) ; elle ne marque pas le message lu.
+    Le repli fichier n'a ni numéro ni registre : `show` y est refusé, plutôt
+    que de renvoyer à un fil local qui n'existe pas sur l'hôte appelant."""
+    if len(rest) != 1:
+        print(_SHOW_USAGE, file=sys.stderr)
+        return 2
+    if bk.kind != "pg":
+        print("showing a received message requires the database (AMEESH_DSN): "
+              "the file fallback has no message number", file=sys.stderr)
+        return 1
+    try:
+        message_id = int(str(rest[0]).strip().lstrip("#"))
+    except ValueError:
+        print("invalid message number: %r" % rest[0], file=sys.stderr)
+        return 2
+    if message_id <= 0:
+        print("invalid message number: %r" % rest[0], file=sys.stderr)
+        return 2
+    binding = identity.resolve_binding(cfg, bk.db)
+    if not binding.ok:
+        print("unbound identity: %s" % (binding.reason or "AGENT_MAIL_NAME not set"),
+              file=sys.stderr)
+        return 1
+    row = mail.get_received(bk.db, message_id, binding.name)
+    if row is None:
+        print("no message #%d addressed to %s: only its recipient (or a copy) "
+              "can read it" % (message_id, binding.name), file=sys.stderr)
+        return 1
+    print(mail.render_received(bk.db, row))
     return 0
 
 
@@ -2538,6 +2580,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_send(bk, cfg, rest)
         if command == "inbox":
             return cmd_inbox(bk, cfg, rest)
+        if command == "show":
+            return cmd_show(bk, cfg, rest)
         if command == "list":
             return cmd_list(bk)
         if command == "whoami":
