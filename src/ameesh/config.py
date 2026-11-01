@@ -459,6 +459,10 @@ class Config:
     #: de ce délai le courrier dont personne ne lit la boîte (arrêté sans
     #: successeur, nom absent du registre) ; 0 = aucune expiration
     mail_dead_letter_days: int = 7
+    #: rétention des empreintes de jetons de relais d'un tour sandbox clos, en
+    #: jours (#5217) : au-delà, le ménage de l'exécuteur supprime l'empreinte ;
+    #: le tour, son résultat et ses coûts restent. 0 = aucune purge
+    sandbox_token_retention_days: int = 30
     #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
     #: n'ont de chantier (AMEESH_PROJECT) ; vide = « default »
     project: str = ""
@@ -1216,6 +1220,9 @@ def load(env: dict | None = None) -> Config:
                                         cfg.thread_retention_days),
         mail_dead_letter_days=_as_days(pick("AMEESH_MAIL_DEAD_LETTER_DAYS"),
                                        cfg.mail_dead_letter_days),
+        sandbox_token_retention_days=_as_days(
+            pick("AMEESH_SANDBOX_TOKEN_RETENTION_DAYS"),
+            cfg.sandbox_token_retention_days),
         project=pick("AMEESH_PROJECT", default=cfg.project) or "",
         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
         resource_interval=_as_float(pick("AMEESH_RESOURCE_INTERVAL"),

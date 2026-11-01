@@ -111,6 +111,7 @@ its host audit; see [Write a canon](../guides/write-a-canon.md#3-hosts-and-their
 | `AMEESH_DB_AGING_S` | — | 2 s | a NORMAL admission waiting this long goes before newer CONTROL ones (starvation guard) |
 | `AMEESH_DB_WAIT_WARN_S` | — | 1 s | a shared-connection admission wait above this is logged once per agent per 30 s (`deferred: shared database admission`) |
 | `AMEESH_THREAD_RETENTION_DAYS` | `thread_retention_days` | 365 | readable-thread retention: entries older than this are removed by `ameesh fil expire` and the runner's housekeeping (L361, decision 0033 §9); 0 = never |
+| `AMEESH_SANDBOX_TOKEN_RETENTION_DAYS` | `sandbox_token_retention_days` | 30 | retention of a closed sandbox turn's relay-token digest: the runner's daily housekeeping deletes it past this many days (the turn, its result and its costs stay; #5217); 0 = never |
 | `AMEESH_HEAVY_MAX_S` | `heavy_max_seconds` | 3600 s | duration cap of a heavy command (`ameesh heavy`, or a suite a turn launches), message then SIGTERM/SIGKILL and exit 124 (#453); 0 = none |
 | `AMEESH_SESSION_MIN_TURNS` | `session_min_turns` | 3 | minimum turns before a rotation |
 | `AMEESH_FAST_FAILURE_S` | `fast_failure_s` | 60 s | a failed turn shorter than this counts as a fast failure (1.4.1) |
@@ -325,7 +326,7 @@ It reads the database with `AMEESH_DSN` and `AMEESH_SCHEMA`.
 | `AMEESH_EXEC_SIGNER` | — | signing helper of the executor image |
 | `AMEESH_RELAY_URL`, `AMEESH_RELAY_BIND` | — | model relay of the mediated executor: upstream and bind address |
 | `AMEESH_RELAY_CONCURRENCY`, `AMEESH_RELAY_RATE`, `AMEESH_RELAY_MAX_BODY`, `AMEESH_RELAY_MAX_STREAM`, `AMEESH_RELAY_MAX_TOKENS`, `AMEESH_RELAY_UPSTREAM_TIMEOUT` | — | relay bounds: concurrency, rate, body size, stream size, tokens, upstream timeout |
-| `AMEESH_RELAY_VERIFIER` | — | relay token verifier, `module:object`: the object (or a no-argument factory) must expose `verify_token(token) -> Identity`; without it the relay refuses to start |
+| `AMEESH_RELAY_VERIFIER` | — | relay **lease-token** verifier, `module:object`: the object (or a no-argument factory) must expose `verify_token(token) -> Identity`; the relay composes the sandbox-turn fencing itself (`sandbox_relay.compose`, #5140/#5217), so a sandbox bearer (`amsb1.`) is verified there and a lease bearer of a sandbox agent is refused; without it the relay refuses to start |
 | `AMEESH_RELAY_DEEPSEEK_KEY_FILE`, `AMEESH_RELAY_DEEPSEEK_UPSTREAM` | — | DeepSeek key file and upstream URL of the relayed provider (`DEEPSEEK_API_KEY` is the in-process alternative) |
 
 Operator procedure and exact relay values: `docs/EXECUTEUR-MEDIEE.md`.

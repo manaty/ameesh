@@ -77,8 +77,15 @@ DEFAULT_PRICES = {
     # #475: DeepSeek's official peak price, read on 2026-10-12 at
     # https://api-docs.deepseek.com/quick_start/pricing (cache miss, cache hit,
     # output). This is the peak price; off-peak hours are in `PRICE_PERIODS`.
+    # #5182: reread on 2026-11-01 on the same page. Flash unchanged; V4-Pro added;
+    # the two retired `deepseek-v4-flash*` names are "billed at the Flash price".
+    # `deepseek-pro` is on no official page: it keeps V4-Pro's peak price and no
+    # off-peak hours (upper bound).
     "deepseek-flash": [0.30, 0.006, 1.20],
-    "deepseek-pro": [0.55, 0.14, 2.19],
+    "deepseek-v4-flash": [0.30, 0.006, 1.20],
+    "deepseek-v4-flash-vision-exp": [0.30, 0.006, 1.20],
+    "deepseek-v4-pro": [1.32, 0.044, 3.96],
+    "deepseek-pro": [1.32, 0.044, 3.96],
     "gpt-6.1-sol": [1.25, 0.125, 10.0],
     "default-codex": [1.25, 0.125, 10.0],
     "default-deepseek": [0.30, 0.006, 1.20],
@@ -121,10 +128,11 @@ PROMPT_TIERS = {
 }
 
 #: #513 : heures de pointe DeepSeek, relues le 2026-10-12 sur
-#: https://api-docs.deepseek.com/quick_start/pricing : 01:00-04:00 et
-#: 06:00-10:00 UTC, du lundi au vendredi ; toute autre heure est creuse,
-#: week-ends compris. Les jours fériés chinois, creux eux aussi, ne sont pas
-#: connus ici : ils restent au prix de pointe (majorant).
+#: https://api-docs.deepseek.com/quick_start/pricing (relues inchangées le
+#: 2026-11-01, #5182) : 01:00-04:00 et 06:00-10:00 UTC, du lundi au vendredi ;
+#: toute autre heure est creuse, week-ends compris. Les jours fériés chinois,
+#: creux eux aussi, ne sont pas connus ici : ils restent au prix de pointe
+#: (majorant).
 DEEPSEEK_PEAK_UTC = ((1, 4), (6, 10))
 #: jours de la semaine des heures de pointe (`datetime.weekday`, lundi = 0)
 DEEPSEEK_PEAK_DAYS = (0, 1, 2, 3, 4)
@@ -135,9 +143,14 @@ DEEPSEEK_PEAK_DAYS = (0, 1, 2, 3, 4)
 #: `off_peak` ; un tour dont une partie est en pointe, ou dont l'heure est
 #: inconnue, paie la pointe (majorant). Seulement au tarif officiel : un
 #: barème local qui renomme le prix du modèle n'a pas d'heures creuses.
+_DEEPSEEK_FLASH_PERIOD = {"peak_utc": DEEPSEEK_PEAK_UTC, "peak_days": DEEPSEEK_PEAK_DAYS,
+                          "off_peak": [0.15, 0.003, 0.60]}
 PRICE_PERIODS = {
-    "deepseek-flash": {"peak_utc": DEEPSEEK_PEAK_UTC, "peak_days": DEEPSEEK_PEAK_DAYS,
-                       "off_peak": [0.15, 0.003, 0.60]},
+    "deepseek-flash": _DEEPSEEK_FLASH_PERIOD,
+    "deepseek-v4-flash": _DEEPSEEK_FLASH_PERIOD,
+    "deepseek-v4-flash-vision-exp": _DEEPSEEK_FLASH_PERIOD,
+    "deepseek-v4-pro": {"peak_utc": DEEPSEEK_PEAK_UTC, "peak_days": DEEPSEEK_PEAK_DAYS,
+                        "off_peak": [0.66, 0.022, 1.98]},
 }
 
 #: Fenêtres nommées par les jauges, en secondes.
@@ -814,9 +827,11 @@ def period_price(prices: dict, model: str | None, started: float | None,
 
 
 def price_of(prices: dict, harness: str, model: str | None) -> list:
-    """Le triplet de prix d'un modèle, avec le repli par harnais."""
-    return known_price(prices, model) or prices.get("default-%s" % harness) \
-        or prices["default-deepseek"]
+    """Le triplet de prix d'un modèle, sinon le majorant de sa famille (#5182 :
+    jamais `default-*`, le tarif le moins cher), avec le repli par harnais si la
+    famille n'a aucun tarif."""
+    return known_price(prices, model) or max_price_of(prices, harness) \
+        or prices.get("default-%s" % harness) or prices["default-deepseek"]
 
 
 def max_price_of(prices: dict, harness: str) -> list | None:

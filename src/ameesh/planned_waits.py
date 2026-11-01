@@ -1090,6 +1090,8 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     #4082 : la composition enregistrée en base complète ces preuves sans
     clone local ; elle n'est valable qu'aux têtes composées encore courantes.
     Sa suppression par recomposition ou la fermeture du porteur la lève.
+    #5214 : la grâce de recomposition (#5206) se juge à `now`, la date du
+    rejeu, comme le reste de la lecture — jamais à l'horloge du processus.
     """
     if not rows:
         return {}
@@ -1118,7 +1120,8 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
                 if want_packets and not _dry_pass(db) else {})
     attached = {cid: set(members) for cid, members in attached.items()}
     if want_packets and not _dry_pass(db):
-        for cid, members in recorded_packet_attachments(st, open_items, rows).items():
+        for cid, members in recorded_packet_attachments(st, open_items, rows,
+                                                        now=now).items():
             attached.setdefault(cid, set()).update(members)
     packet = packet_waits(rows, open_items, attachments=attached) if want_packets else {}
     landings = _with_heads(st, _admitted(
