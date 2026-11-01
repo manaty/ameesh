@@ -118,6 +118,14 @@ Règles :
   (`cache_write_tokens`).
 * **Codex** : `input_tokens` inclut déjà `cached_input_tokens`. Ne jamais
   additionner les deux : `C_last = input_tokens`, pas `input + cached`.
+* **Codex, journal de session** : `codex exec --json` ne publie pas d'usage
+  d'appel (seulement le cumul de `turn.completed`) ; `C_last` et `O_last` se
+  lisent dans le `last_token_usage` du `token_count` du tour, borné par le
+  `task_started` du même tour. Le journal ne remplace pas `R_turn` : il ne
+  porte qu'un appel, pas le cumul du tour. Un tour sans relevé garde `null` +
+  `context_unknown` avec son motif (`no_call`, `journal_missing`,
+  `turn_not_in_journal`, `last_token_usage_missing`) ; l'usage d'un tour
+  précédent n'est jamais repris.
 * **DeepSeek/ACP** : pas de champ d'écriture de cache dans le contrat actuel ;
   un harnais qui en publierait un devrait être qualifié avant d'être agrégé.
 * **`O_last`** : `output_tokens` (Claude, Codex `last_token_usage`) ou

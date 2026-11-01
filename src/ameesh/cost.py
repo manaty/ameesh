@@ -1579,6 +1579,104 @@ class CostBook:
                 return usage
         return None
 
+    def codex_turn_last_call_usage(self, thread: str | None, started: float,
+                                   ended: float | None = None) -> dict:
+        """#5148 : le ``last_token_usage`` du tour Codex de cette fenêtre.
+
+        Le journal de session du fil porte un ``task_started`` par tour
+        (``started_at`` en secondes epoch) puis un ``token_count`` par appel.
+        On ne retient que le dernier usage d'un tour **commencé dans la
+        fenêtre** ``[started, ended]`` : un journal existant mais plus ancien
+        (tour qui n'a pas atteint Codex, reprise ratée, worker relancé) ne
+        prête pas l'usage d'un tour précédent. Un tour commencé sans
+        ``last_token_usage`` donne ``no_call`` ; un tour sans marqueur dans la
+        fenêtre donne ``turn_not_in_journal``.
+
+        Rend ``{"usage": dict|None, "reason": str|None, "turn_started": float|None}``.
+        Aucune erreur de lecture n'est fatale : le motif est nommé.
+        """
+        path = self.codex_rollout(thread)
+        if not path:
+            return {"usage": None,
+                    "reason": context_metrics.REASON_JOURNAL_MISSING,
+                    "turn_started": None}
+        try:
+            if not os.access(path, os.R_OK) or os.path.getsize(path) <= 0:
+                return {"usage": None,
+                        "reason": context_metrics.REASON_JOURNAL_UNREADABLE,
+                        "turn_started": None}
+        except OSError:
+            return {"usage": None,
+                    "reason": context_metrics.REASON_JOURNAL_UNREADABLE,
+                    "turn_started": None}
+
+        usage: dict | None = None
+        saw_token_count = False
+        task_seen = False
+        task_start: float | None = None
+        # Parcours de la fin vers le début : le premier `token_count` lisible
+        # est le dernier du journal ; le `task_started` rencontré ensuite est
+        # celui du même tour (les relevés antérieurs sont plus haut dans le
+        # fichier, donc jamais atteints).
+        for ligne in _lines_reverse(path):
+            if b"token_count" not in ligne and b"task_started" not in ligne:
+                continue
+            try:
+                event = json.loads(ligne)
+            except ValueError:
+                continue
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            kind = payload.get("type")
+            if kind == "token_count":
+                saw_token_count = True
+                if usage is None:
+                    info = payload.get("info")
+                    candidate = info.get("last_token_usage") \
+                        if isinstance(info, dict) else None
+                    if isinstance(candidate, dict) and candidate:
+                        usage = candidate
+                continue
+            if kind != "task_started":
+                continue
+            task_seen = True
+            raw_start = payload.get("started_at")
+            if isinstance(raw_start, (int, float)) and not isinstance(raw_start, bool):
+                task_start = float(raw_start)
+            else:
+                stamp = event.get("timestamp") if isinstance(event, dict) else None
+                if isinstance(stamp, str):
+                    try:
+                        task_start = _dt.datetime.fromisoformat(
+                            stamp.replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        task_start = None
+            break
+
+        if task_seen and task_start is not None:
+            if task_start < float(started) - 3.0 \
+                    or (ended is not None and task_start > float(ended) + 1.0):
+                # le dernier tour du journal n'est pas celui qu'on observe :
+                # ne jamais lui emprunter son usage
+                return {"usage": None,
+                        "reason": context_metrics.REASON_TURN_NOT_IN_JOURNAL,
+                        "turn_started": task_start}
+        if not task_seen:
+            # Journal sans marqueur de tour (format ancien ou écriture
+            # partielle) : rien ne prouve que l'usage est celui du tour.
+            return {"usage": None,
+                    "reason": context_metrics.REASON_TURN_NOT_IN_JOURNAL,
+                    "turn_started": None}
+        if usage is not None:
+            return {"usage": usage, "reason": None, "turn_started": task_start}
+        if saw_token_count:
+            return {"usage": None,
+                    "reason": context_metrics.REASON_LAST_USAGE_MISSING,
+                    "turn_started": task_start}
+        return {"usage": None, "reason": context_metrics.REASON_NO_CALL,
+                "turn_started": task_start}
+
     def codex_session_roots(self) -> list:
         """Les dossiers de sessions Codex de la machine : le défaut, puis ceux
         des comptes déclarés (L95), sans doublon."""
