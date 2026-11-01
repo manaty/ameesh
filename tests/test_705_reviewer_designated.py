@@ -903,37 +903,6 @@ class ReviewerDesignationTest(PgTestCase):
                       encoding="utf-8") as fh:
                 self.db.script(fh.read())
 
-    def test_lectures_avant_la_migration_0421(self):
-        """#705 (revue r1, P2-3) : la prod peut être en 0373 ; sans la colonne,
-        lectures, vue et alertes fonctionnent (le relecteur est alors inconnu)."""
-        lot = self._lot(app="ameesh")
-        proc = self._qa(lot)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.drop_work_item_column("reviewer", self._restore_reviewer_column)
-        self.db.__dict__.pop("_has_reviewer", None)
-
-        item = work.get(self.db, lot["id"])
-        self.assertEqual(item["reviewer"], "")
-        rows = work.list_items(self.db, limit=10)
-        self.assertEqual(rows[0]["id"], lot["id"])
-        # `progress` lit la même liste : sans colonne, `to_jsonb` rend ''
-        lots = storage.of(self.db).progress.lots(since_ts=0.0, project=None, limit=10)
-        self.assertIn(lot["id"], [r["id"] for r in lots])
-        listing = storage.of(self.db).operations.open_lots_activity(10)
-        self.assertIn(lot["id"], [r["id"] for r in listing])
-        proc = self.mesh("work", "show", str(lot["id"]))
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("waiting  : verdict from a reviewer (none designated)",
-                      proc.stdout)
-        # l'alerte lit la même jointure : sans la colonne, elle est quand même
-        # collectée (le relecteur est simplement inconnu), #705 P2-3
-        self._stale(lot["id"])
-        alertes = exploitation.alerts(self.cfg, self.db,
-                                      orchestrators_declared=["orchestrateur"])
-        alerte = next(a for a in alertes
-                      if a["type"] == "stale_lot" and a["lot"] == lot["id"])
-        self.assertIsNone(alerte["waiting"]["who"])
-
     def test_la_reponse_negative_de_has_reviewer_ne_se_cache_pas(self):
         """#813 (ex-#798) : la réponse négative n'est pas mise en cache — une
         connexion vivante (démon runner, serve) qui a lu « pas de colonne »

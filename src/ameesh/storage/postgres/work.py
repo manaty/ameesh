@@ -175,7 +175,12 @@ def item_columns(db, ref: str | None = None) -> str:
     la moitié d'`ameesh alerts`. `to_jsonb(colonne)` garde la forme JSON de
     `reviewers`."""
     col = "%s." % ref if ref else ""
-    reviewer = "coalesce(%sreviewer, '') AS reviewer" % col if ref else "reviewer"
+    if ref:
+        reviewer = "coalesce(%sreviewer, '') AS reviewer" % col
+    elif has_reviewer(db):
+        reviewer = "reviewer"
+    else:
+        reviewer = "''::text AS reviewer"
     reviewers = "to_jsonb(%sreviewers) AS reviewers" % col
     external = "%sexternal_executor AS external_executor" % col
     wake = "extract(epoch from %swake_at)::float8 as wake_ts" % col
