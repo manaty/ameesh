@@ -68,6 +68,7 @@ test_4995_decision_supersession_journal  # #4995: journal append-only et lecture
 test_5015_elected_release  # #5015: cross-host exclusive release execution lease
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_5121_runner_sandbox  # #5121: runner sandbox dispatch, S1/S3 receipt, lease loss and fenced cancellation
+test_5140_sandbox_relay  # #5140: database-clock token expiry, lease fencing and idempotent relay accounting
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)
 test_711_migration_reservations  # storage: atomic scoped migration batches, legacy projection, SHA fencing and lifecycle (#711)

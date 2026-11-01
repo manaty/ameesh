@@ -6,7 +6,7 @@ from ameesh import relay, runner_sandbox, sandbox_relay, storage
 from ameesh.storage.postgres import sandbox as s1
 from ameesh.storage.postgres import turn_admission
 from .support import PgTestCase
-from .test_4872_turn_admission import TurnAdmissionTest as Fixture
+from . import test_4872_turn_admission as admission_fixture
 
 
 class SandboxRelayTest(PgTestCase):
@@ -20,10 +20,10 @@ class SandboxRelayTest(PgTestCase):
         turn_admission.tranche_create(self.db, 'migration', 'project', 50,
                                      starts_at='2026-01-01', actor='human:t',
                                      admitted_ref='decision:1')
-        snapshot = Fixture.snapshot(self)
+        snapshot = admission_fixture.TurnAdmissionTest.snapshot(self)
         if self._testMethodName == 'test_expiry_uses_database_clock':
             snapshot['limits']['turn_seconds'] = 1
-        Fixture.admit(self, sandbox=snapshot)
+        admission_fixture.TurnAdmissionTest.admit(self, sandbox=snapshot)
         self.host = self.db.query("select host from agent_registry where name = 'agent'")[0]['host']
 
     def issue(self, **changes):
