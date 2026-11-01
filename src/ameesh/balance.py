@@ -373,6 +373,7 @@ def real_spend(rows: Iterable[dict], from_ts: float, to_ts: float, *, cfg=None) 
     fournisseur et d'une même devise s'additionnent. `start_ts` et `end_ts`
     disent l'intervalle **réellement couvert** par les relevés : c'est sur
     lui que l'estimation se compare. Une série sans deux relevés n'en dit rien.
+    `series` (#5182) : le nombre de séries additionnées.
     Le rattachement déclaré par `adopts_unnamed` est appliqué avant de former
     ces séries ; aucun rapprochement de comptes n'est inféré des soldes.
     """
@@ -394,7 +395,8 @@ def real_spend(rows: Iterable[dict], from_ts: float, to_ts: float, *, cfg=None) 
         slot = out.setdefault((provider, currency), {
             "provider": provider, "currency": currency, "spent": 0.0, "topups": 0.0,
             "readings": 0, "start_ts": float(base["observed_ts"]),
-            "end_ts": float(tail[-1]["observed_ts"]), "accounts": []})
+            "end_ts": float(tail[-1]["observed_ts"]), "accounts": [], "series": 0})
+        slot["series"] += 1
         prev = base
         for cur in tail:
             delta = float(prev["total"]) - float(cur["total"])
