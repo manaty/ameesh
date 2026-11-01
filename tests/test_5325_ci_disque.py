@@ -240,6 +240,7 @@ class RapportTest(unittest.TestCase):
 
 
 WORKFLOW = REPO / ".github" / "workflows" / "tests.yml"
+MENAGE = REPO / ".github" / "workflows" / "menage-disque.yml"
 
 
 def _job(texte: str, nom: str) -> str:
@@ -285,6 +286,15 @@ class WorkflowTest(unittest.TestCase):
         bloc = self.texte[debut:debut + 400]
         self.assertIn("continue-on-error: true", bloc)
         self.assertIn("runner.environment == 'self-hosted'", bloc)
+
+    def test_le_menage_dedie_reste_hors_des_tests(self):
+        texte = MENAGE.read_text(encoding="utf-8")
+        self.assertIn('cron: "23 5 * * *"', texte)
+        self.assertIn("workflow_dispatch:", texte)
+        self.assertNotIn("pull_request:", texte)
+        self.assertIn("scripts/ci-disque.py menage --images-inutilisees", texte)
+        self.assertIn("timeout-minutes:", texte)
+        self.assertIn("continue-on-error: true", texte)
 
 
 if __name__ == "__main__":
