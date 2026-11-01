@@ -161,8 +161,14 @@ Ordre sur l'hôte :
    `$S/runtime/bin/python -I -B $S/sources/backend-administrateur.py
    replacement-prepare OP`.
    Le fichier `$S/replacement-question.txt` et les options de la sortie sont à
-   passer sans retouche :
-   `ameesh decide ask --lot L --needs-signature --question "$(cat "$S/replacement-question.txt")" --option replace="Replace this exact sealed runtime" --option leave="Leave this host unchanged"`.
+   passer sans retouche : lire la question dans une variable (la substitution
+   reste hors guillemets doubles), puis la passer telle quelle.
+   ```sh
+   question=$(cat "$S/replacement-question.txt")
+   ameesh decide ask --lot L --needs-signature --question "$question" \
+     --option replace="Replace this exact sealed runtime" \
+     --option leave="Leave this host unchanged"
+   ```
    La question affiche `next.sha`,
    `next.runtime`, `next.lib` et `code_sha256`.
    Avant de signer, recalculer ces valeurs sans passer par le stage, hors root,
@@ -170,7 +176,7 @@ Ordre sur l'hôte :
    ```sh
    umask 022
    /usr/bin/python3 -I -B CLONE/deploy/mise-a-jour/verifier-remplacement.py \
-     --clone CLONE --output "$DIR2/out" --question replacement-question.txt
+     --clone CLONE --output "$DIR2/out" --question "$S/replacement-question.txt"
    ```
    L'outil reconstruit au SHA de la question, mesure avec l'inventaire de
    `runtime-release.py` et refuse tout écart (code 2). Signer sans ce résultat
