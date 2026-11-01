@@ -62,6 +62,80 @@ class RetiredMailHealthTest(unittest.TestCase):
              mock.patch.object(h.time, 'time', return_value=1000.0):
             self.assertIsNone(h.revalider(None, [active])[0])
 
+    def run_main(self, get, probe=None, unread=None):
+        h = self.health
+        output = io.StringIO()
+        rows = [self.rows()[1]]
+        with mock.patch.object(h.config, 'load', return_value=object()), \
+             mock.patch.object(h.db_mod, 'connect', return_value=mock.Mock()), \
+             mock.patch.object(h.registry, 'overview', return_value=rows), \
+             mock.patch.object(h.registry, 'get', side_effect=get), \
+             mock.patch.object(h.mail, 'unread_active', return_value=unread or []), \
+             mock.patch.object(h.mail, 'maybe_redelivered', return_value=False), \
+             mock.patch.object(h, 'dead_letters', return_value=[]), \
+             mock.patch.object(h, 'canal_humain', return_value=[]), \
+             mock.patch.object(h.time, 'time', return_value=1000.0), \
+             mock.patch.object(h.mail, 'send', side_effect=probe), \
+             contextlib.redirect_stdout(output):
+            code = h.main(['--hote', 'vm', '--json', '--souffrance', '10',
+                           '--attente', '0'])
+        return code, json.loads(output.getvalue())
+
+    def test_retirement_between_snapshot_and_checks_is_not_a_ko(self):
+        # #4902: the snapshot counts the agent, the re-read sees it retired.
+        active = self.rows()[1]
+        retired = dict(active, retired_ts=999.0)
+        code, report = self.run_main(lambda _db, _name: retired,
+                                     unread=[{'id': 1, 'created_ts': 1}])
+        self.assertEqual(report['souffrance'], [])
+        self.assertEqual(report['verdict'], 'sans-sonde')
+        self.assertEqual(code, 0)
+
+    def test_agent_still_active_at_reread_keeps_the_ko(self):
+        active = self.rows()[1]
+        code, report = self.run_main(
+            lambda _db, _name: active, unread=[{'id': 1, 'created_ts': 1}],
+            probe=self.health.storage.RecipientRetired('retired'))
+        self.assertEqual(report['verdict'], 'ko')
+        self.assertEqual(report['souffrance'][0]['destinataire'], 'active')
+        self.assertEqual(code, 1)
+
+    def test_retirement_between_revalidation_and_send_is_not_a_ko(self):
+        # #4902: mail.send refuses under lock; nothing was measured on the host.
+        active = self.rows()[1]
+        code, report = self.run_main(
+            lambda _db, _name: active,
+            probe=self.health.storage.RecipientRetired('retired'))
+        self.assertEqual(report['verdict'], 'non-concluant')
+        self.assertEqual(code, 3)
+        self.assertNotIn('erreur', report)
+        self.assertIsNone(report['sonde']['message'])
+        self.assertIn('retiree', report['sonde']['tour'])
+
+    def test_retirement_during_the_wait_is_not_a_ko(self):
+        h = self.health
+        active = self.rows()[1]
+        with mock.patch.object(h.mail, 'send', return_value=7), \
+             mock.patch.object(h.mail, 'get', return_value={'id': 7}), \
+             mock.patch.object(h.registry, 'get',
+                               return_value=dict(active, retired_ts=999.0)):
+            out = h.probe(None, active, 'abc', 60.0)
+        self.assertFalse(out['concluant'])
+        self.assertIsNone(out['delai_s'])
+        self.assertEqual(out['message'], 7)
+        self.assertIn('retiree', out['tour'])
+
+    def test_stopped_retired_mailbox_is_not_a_dead_letter(self):
+        h = self.health
+        db = mock.Mock()
+        letters = [{'recipient': 'retired', 'n': 2}, {'recipient': 'stopped', 'n': 1}]
+        rows = [dict(self.rows()[0], status='stopped'),
+                dict(self.rows()[1], name='stopped', status='stopped')]
+        with mock.patch.object(h.storage, 'of') as of:
+            of.return_value.mailbox.dead_letters.return_value = letters
+            self.assertEqual(h.dead_letters(db, 'vm', rows),
+                             [{'destinataire': 'stopped', 'n': 1}])
+
     def test_retired_external_profile_is_not_a_human_channel(self):
         h = self.health
         with mock.patch.object(h.mail, 'unread_active') as unread:

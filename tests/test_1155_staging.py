@@ -1617,6 +1617,7 @@ class SanteCourrierTest(unittest.TestCase):
         with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
              mock.patch.object(self.mod.config, 'load', return_value={}), \
              mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod.registry, 'get', return_value=rows[0]), \
              mock.patch.object(self.mod, 'stuck', return_value=[]), \
              mock.patch.object(self.mod, 'sans_executeur',
                                return_value=[{'destinataire': 'orchestrateur',
