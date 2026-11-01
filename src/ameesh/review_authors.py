@@ -1031,6 +1031,52 @@ def _read_local_commit(repo, rev):
     return plan_git.local_commit(repo, rev, deadline=_read_bound(plan_git.PROBE_TIMEOUT_S))
 
 
+def _on_own_review_branch(repo: str, actor: str, lot: int, sha: str) -> bool:
+    """#5197 : `sha` est sur une branche `review/<actor>-<lot>[-…]` du relecteur.
+
+    Lu sur les refs du clone (`refs/remotes/origin/…`, puis `refs/heads/…`) :
+    une ref absente ou illisible rend False, l'exclusion demeure (#4457)."""
+    name = str(actor or "").strip()
+    if not repo or not name or not lot or not sha:
+        return False
+    stems = sorted({"review/%s-%d" % (variant, int(lot))
+                    for variant in (name, name.lower())})
+    patterns = [prefix + stem + suffix for prefix in ("refs/remotes/origin/", "refs/heads/")
+                for stem in stems for suffix in ("", "-*")]
+    tips = _read_out(repo, "for-each-ref", "--format=%(objectname)", *patterns)
+    if not tips:
+        return False
+    return any(_is_ancestor(repo, sha, tip) is True for tip in tips.split())
+
+
+def _touches_only_files_absent_from(repo: str, sha: str, heads) -> bool:
+    """#5197 : `sha` ne touche que des fichiers absents de chacune des `heads`.
+
+    C'est la forme d'une note de relecture poussée sur la branche
+    `review/<relecteur>-<lot>` : un rapport créé puis amendé à côté de la tête
+    relue, qui n'existe ni dans la tête gelée relue ni dans la tête lue. Rien
+    de ce commit n'appartient au contenu du lot : il ne corrige pas sa tête.
+    Un seul parent ; un chemin présent dans l'une des `heads` (un fichier du
+    lot, même réécrit ensuite), un commit de fusion ou une lecture git
+    impossible rendent False : le doute garde l'exclusion (#4457)."""
+    heads = [str(head or "").strip() for head in heads or ()]
+    if not heads or not all(heads):
+        return False
+    parents = _read_out(repo, "rev-list", "--parents", "-n", "1", sha)
+    if not parents or len(parents.split()) != 2:
+        return False
+    text = _read_out(repo, "show", "--name-status", "-z", "--format=", "--no-renames", sha)
+    fields = [field for field in str(text or "").split("\0") if field]
+    if not fields or len(fields) % 2:
+        return False
+    for path in fields[1::2]:
+        for head in heads:
+            present = _read_out(repo, "ls-tree", "--name-only", head, "--", path)
+            if present is None or present:
+                return False
+    return True
+
+
 def _read_patch_ids(repo, *args):
     log = _read_git(repo, "log", "-p", "--no-merges", "--no-color",
                     "--format=commit %H", *args)
@@ -4782,6 +4828,13 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     un reçu **sans aucun rattachement** ne prouve rien sur ce lot : il n'exclut
     pas son acteur, et `unattached` reçoit sa trace pour que le gel le dise
     (#4679 B/P2 auditeur : sept exclusions sans fondement en 48 h).
+
+    #5197 : la note de relecture d'une branche `review/<relecteur>-<lot>` ne
+    corrige pas cette tête : un commit de cette branche du relecteur
+    (`_on_own_review_branch`) qui ne touche que des fichiers absents de la
+    tête gelée relue et de la tête lue (`_touches_only_files_absent_from`)
+    n'exclut pas son acteur. Les deux preuves sont requises : un correctif
+    réécrit sous un autre chemin reste exclu.
     """
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
@@ -5019,6 +5072,14 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 if _is_ancestor(repo, full, head_sha) is True:
                     continue                # encore dans la tête : lu par la plage
                 if _is_ancestor(repo, freeze_sha, full) is not True:
+                    continue
+                check()
+                if (_on_own_review_branch(repo, actor, lot, full)
+                        and _touches_only_files_absent_from(repo, full,
+                                                            (freeze_sha, head_sha))):
+                    # #5197 : une note de relecture — sur la branche review/*
+                    # du relecteur et hors du contenu du lot —, pas un
+                    # correctif réécrit
                     continue
                 check()
                 other_lot = stacked_lot(receipt, full)
