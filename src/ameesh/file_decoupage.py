@@ -38,7 +38,9 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   secondes) ; la pause est levée dès qu'un de ces deux événements arrive,
   avec l'acteur et la raison au journal de la pause. #4619 : la même fenêtre
   de courrier s'applique au sommeil et à la levée, et le journal nomme le lot
-  réellement actionnable, pas seulement un lot assigné.
+  réellement actionnable, pas seulement un lot assigné. #5151 : le sommeil
+  nomme aussi au journal les lots attribués qu'une attente planifiée écarte
+  (« sleep set aside: <agent>: #N (planned start …) »).
 * **#4623, la dernière note fait foi** : une note `roadmap: rouverte <projet>`
   postérieure à la dernière `roadmap: épuisée <projet>` désarme le sommeil et
   lève les dormeurs du projet dans la même passe (le geste est journalisé sur
@@ -92,6 +94,8 @@ REOPEN_MARK = "sleep lifted: roadmap reopened"
 SLEEP_EXEMPT_PREFIX = "sleep exempted:"
 #: #5129 : préfixe de la levée motivée par un gel qui manque une famille
 WAKE_REVIEW_PREFIX = "sleep lifted for review:"
+#: #5151 : lots attribués écartés au moment du sommeil, et pourquoi
+SLEEP_SET_ASIDE_PREFIX = "sleep set aside:"
 #: #4610 : préfixe de la raison de levée automatique, au journal des pauses
 SLEEP_LIFT_PREFIX = "automatic sleep lifted:"
 #: #4610 : courriers relus par agent pour retrouver le dernier envoi du pilote
@@ -753,7 +757,7 @@ def _recent_mail(db, name: str, *, now: float, senders, window_s=None) -> tuple:
 
 def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
            split_id=None, lots=(), listing=(), cfg=None, canons=None,
-           mail_window_s=None) -> list:
+           mail_window_s=None, waits=None) -> list:
     """Met en sommeil les agents d'exécution au repos du projet (§2.3).
 
     #4525 : une relecture désignée ouverte n'est jamais endormie, et le dernier
@@ -842,8 +846,45 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
                         "why": "%s: %s" % (type(exc).__name__, str(exc)[:120])})
             continue
         if done.get("changed"):
-            out.append({"agent": name, "slept": True})
+            aside = set_aside(name, lots, waits or {})
+            out.append(dict({"agent": name, "slept": True},
+                            **({"set_aside": aside} if aside else {})))
+            _journal_set_aside(db, split_id, name, aside)
     return out
+
+
+def set_aside(name: str, lots, waits: dict) -> list:
+    """#5151 : les lots ouverts attribués à `name` qu'une attente planifiée
+    écarte au moment du sommeil (`[{lot, why}]`, par numéro) — un pilote y
+    voit le P1 daté au lendemain qui n'a pas retenu l'agent."""
+    out = []
+    for lot in lots or ():
+        if str(lot.get("assignee") or "") != name:
+            continue
+        wait = waits.get(int(lot["id"]))
+        if not wait:
+            continue
+        if wait.get("what") == "scheduled":
+            why = "planned start %s" % str(wait.get("start") or "?")[:16]
+        else:
+            why = "waiting: %s" % (wait.get("what") or "?")
+        out.append({"lot": int(lot["id"]), "why": why})
+    return sorted(out, key=lambda row: row["lot"])
+
+
+def _journal_set_aside(db, split_id, name: str, aside: list) -> None:
+    """#5151 : nomme au journal du lot de découpage les lots écartés d'un
+    agent endormi et leur raison. Une trace en échec ne défait pas le
+    sommeil."""
+    if split_id is None or not aside:
+        return
+    try:
+        work.note(db, int(split_id), "%s %s: %s" % (
+            SLEEP_SET_ASIDE_PREFIX, name,
+            "; ".join("#%d (%s)" % (row["lot"], row["why"]) for row in aside)),
+            actor=SLEEP_ACTOR)
+    except Exception:  # noqa: BLE001 - une trace ne bloque jamais le geste
+        pass
 
 
 def _wake(db, project: str, listing: list, *, reason: str | None = None) -> list:
@@ -1121,7 +1162,7 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
                 slept = _sleep(db, project, item, by_name, now,
                                split_id=int(split["id"]), lots=lots, listing=listing,
                                cfg=cfg, canons=canons,
-                               mail_window_s=settings.mail_window())
+                               mail_window_s=settings.mail_window(), waits=waits)
                 if slept:
                     out.append({"kind": "sleep", "project": project,
                                 "lot": int(split["id"]), "agents": slept})

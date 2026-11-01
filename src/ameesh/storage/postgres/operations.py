@@ -23,8 +23,8 @@ from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
 from .work import REQUEUED_PARAMS, has_reviewer, requeued_sql
-from .work_dependencies import (current_verdict as _current_verdict, freeze_due,
-                                wake_defers)
+from .work_dependencies import (current_verdict as _current_verdict,
+                                owed_by_assignee, start_defers, wake_defers)
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"   # closed : abandonné ou remplacé (L29)
@@ -185,7 +185,7 @@ class Operations(interface.Operations):
                    extract(epoch from m.oldest)::float8 AS oldest_unread_ts,
                    coalesce(m.n_passive, 0)::bigint AS passive_unread,
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
-                   (coalesce(sw.planned_start > j.today, false)
+                   (coalesce(""" + start_defers("sw", "j.today") + """, false)
                        OR coalesce(sw.wake_at > clock_timestamp(), false)) AS session_lot_later,
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
@@ -223,7 +223,9 @@ class Operations(interface.Operations):
                                 WHERE mb.recipient = r.name AND mb.delivered_at IS NULL
                                   AND """ + _PASSIVE + """) passif) m ON true
               LEFT JOIN LATERAL (
-                  SELECT w.title, w.state, w.planned_start, w.wake_at FROM work_items w
+                  -- #5161 : la ligne entière, `start_defers` lit l'état et
+                  -- les verdicts du lot (correction due)
+                  SELECT w.* FROM work_items w
                    WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
                                      THEN r.session_work_item::bigint END) sw ON true
               LEFT JOIN LATERAL (
@@ -232,11 +234,13 @@ class Operations(interface.Operations):
                    ORDER BY w.updated_at DESC, w.id DESC LIMIT 1) aw ON true
               LEFT JOIN LATERAL (
                   -- L165b : les lots qui occupent l'agent (ni en attente d'un
-                  -- autre, ni prévus pour plus tard)
+                  -- autre, ni prévus pour plus tard) ; #5161 : un lot en qa qui
+                  -- attend son geste (gel, correction due) l'occupe
                   SELECT count(*) AS n FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
-                     AND w.state NOT IN """ + _WAITING_ON_OTHERS + """
-                     AND (w.planned_start IS NULL OR w.planned_start <= j.today)
+                     AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
+                          OR """ + owed_by_assignee("w") + """)
+                     AND NOT """ + start_defers("w", "j.today") + """
                      AND NOT """ + wake_defers("w") + """) al ON true
               LEFT JOIN LATERAL (
                   -- #1677 : ce que l'agent doit encore faire — ses lots qui
@@ -257,10 +261,9 @@ class Operations(interface.Operations):
                   SELECT count(*)""" + review_due + """ AS n, min(w.id) AS lot_id
                     FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
-                     AND (w.state NOT IN """ + _WAITING_ON_OTHERS + f"""
-                          OR (w.state = '{lifecycle.QA}' AND (""" + freeze_due("w") + """
-                              OR """ + _current_verdict("w") + """ = 'blocked')))
-                     AND (w.planned_start IS NULL OR w.planned_start <= j.today)
+                     AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
+                          OR """ + owed_by_assignee("w") + """)
+                     AND NOT """ + start_defers("w", "j.today") + """
                      AND NOT """ + wake_defers("w") + """) ac ON true
               LEFT JOIN LATERAL (
                   SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at

@@ -144,6 +144,13 @@ class PipelineCardTest(_TmpMixin, unittest.TestCase):
                 self.assertIn("pipeline-name-invalid", self.pipeline_errors(found))
                 self.assertFalse(loaded.pipelines[0].valid)
 
+    def test_nom_reserve_par_le_wrapper(self):
+        # `ameesh module list` prints the installation evidence before any
+        # dispatch: a card of that name would be unreachable (#4968/N4).
+        loaded, found = self.charge({CHEMIN: carte(name="list")})
+        self.assertIn("pipeline-name-reserved", self.pipeline_errors(found))
+        self.assertFalse(loaded.pipelines[0].valid)
+
     def test_nom_par_defaut_et_doublon(self):
         loaded, found = self.charge({CHEMIN: carte(),
                                      "pipelines/autre.md": carte(name="acme-work-delivery")})

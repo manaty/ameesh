@@ -38,7 +38,7 @@ The card fields are:
 | `title` | yes | readable title |
 | `responsible` | yes | a **human** `Member` (`human:<id>`) who answers for the pipeline |
 | `updated` | yes | ISO day (`YYYY-MM-DD`) |
-| `name` | no | module name; default: the file name without `.md` (letters, digits, `.`, `_`, `-`, 64 characters at most) |
+| `name` | no | module name; default: the file name without `.md` (letters, digits, `.`, `_`, `-`, 64 characters at most); `list` is reserved by the module wrapper |
 | `description` | no | one line of context |
 | `pipeline` | yes | the pipeline block, in the canon form described below |
 | `workflow` | transitional | accepted instead of `pipeline`, never both |
@@ -190,6 +190,7 @@ ameesh canon show --json        # lists the cards under "pipelines"
 A `pipeline-*` **error** makes `canon check` exit 1 but blocks no agent (the
 same rule as a bad `package`/`process` card). Typical codes are
 `pipeline-path` (card outside `pipelines/`), `pipeline-name-invalid`,
+`pipeline-name-reserved` (`list`, kept by `ameesh module list`),
 `pipeline-responsible-missing`/`-unresolved`, `pipeline-updated-missing`/
 `-invalid`, `pipeline-duplicate`, `pipeline-invalid` (the block does not
 compile). The full refusal list of the block itself is the compiler's:
@@ -282,13 +283,19 @@ ameesh module support-work-delivery advance 42 --to closed --guard stop_work --r
 ameesh module support-work-delivery advance 42 --to closed --guard stop_work --ref reason=superseded --ref superseded_by=43
 ```
 
-Both commands produce a receipt and project the issue as `closed/not_planned`.
+`close_reason` is accepted as the native spelling of `reason` for this guard;
+`superseded_by` is read as a lot number (an integer in the receipt). Both
+commands produce a receipt and project the issue as `closed/not_planned`.
 
 `adopt` rules:
 
-* only the lot's **assignee** or the pilot may adopt it;
-* the lot must be unpinned, not terminal, and its current core must be the
-  card's `initial` core;
+* only a **registered agent** may adopt: the lot's assignee or a pilot; a
+  human pilot acts through its agent (the Process registry signs agent
+  commands, never `human:*`);
+* the lot must be unpinned and not terminal; its current core must be the
+  card's `initial` core — a held lot (`blocked`, `waiting_human`) is adopted
+  **without releasing the hold**, and its journal must prove the core it
+  resumes into (the same rule as revision transfer; no proof, no adoption);
 * the card must be active for the lot's project, and the lot's type must be
   covered by the card;
 * the card is re-read from the **pinned git object**, never from the working
@@ -298,9 +305,10 @@ Both commands produce a receipt and project the issue as `closed/not_planned`.
   declarative module CLI.
 
 A pinned lot is no longer movable by `ameesh work move`: `advance`, `hold` and
-`release` are its only lifecycle commands. `--ref` facts are strings and the
-verifier decides which ones it accepts; an uninstalled verifier or a missing
-piece of evidence refuses the command with a stable code.
+`release` are its only lifecycle commands. `--ref` facts are strings (except
+the numeric `superseded_by`) and the verifier decides which keys it accepts;
+an uninstalled verifier or a missing piece of evidence refuses the command
+with a stable code.
 
 ## 7. End to end, as the tests prove it
 

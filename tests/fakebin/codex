@@ -43,6 +43,24 @@ def main() -> int:
     thread = "codex-thread-1"
     if "resume" in args:
         thread = args[args.index("resume") + 1]
+    # #5148 : un journal daté du tour (task_started dans la fenêtre observée),
+    # pas de l'avant-tour. Le lecteur borne l'usage au tour ; un témoin qui
+    # daterait le journal avant la création du worker serait dépendant du temps.
+    journal = os.environ.get("AMEESH_TEST_CODEX_JOURNAL")
+    if journal:
+        last_usage = json.loads(
+            os.environ.get("AMEESH_TEST_CODEX_LAST_USAGE") or "null") or {
+                "input_tokens": 61000, "output_tokens": 500}
+        dossier = os.path.join(journal, "2026", "10", "31")
+        os.makedirs(dossier, exist_ok=True)
+        path = os.path.join(dossier,
+                            "rollout-2026-10-31T01-00-00-%s.jsonl" % thread)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "task_started", "started_at": int(time.time())}}) + "\n")
+            fh.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "token_count",
+                "info": {"last_token_usage": last_usage}}}) + "\n")
     demarrage = {"type": "thread.started", "thread_id": thread}
     # CTX-03b : le vrai `codex exec --json` n'annonce pas son modèle ; ce
     # réglage de banc permet de témoigner du cas où un harnais le fait.

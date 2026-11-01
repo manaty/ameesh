@@ -67,8 +67,15 @@ def credentials(worker, row):
     return value
 
 
-def _pinned_canon(worker):
-    matches = [c for c in canon.load_configured(worker.cfg) if c.owns(worker._canon_id())]
+def _pinned_canon(worker, matches=None):
+    """The owning canon at its synchronized revision.
+
+    `select` passes the list it has already loaded, so a legacy turn pays one
+    `canon.load_configured` instead of two (~0.2 s each); callers that need a
+    fresh read omit it.
+    """
+    if matches is None:
+        matches = [c for c in canon.load_configured(worker.cfg) if c.owns(worker._canon_id())]
     if len(matches) != 1:
         raise s1.Refusal('profile-refused')
     loaded = matches[0]
@@ -95,7 +102,7 @@ def select(worker):
     declared = [c for c in matches if c.agent(worker.name) is not None
                 and 'sandbox' in c.agent(worker.name).fiche.data]
     try:
-        loaded, state, pinned = _pinned_canon(worker)
+        loaded, state, pinned = _pinned_canon(worker, matches)
     except Exception:
         # No declared sandbox must ever make a legacy agent depend on sync.
         # When a pinned revision is available it remains authoritative: a

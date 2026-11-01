@@ -102,6 +102,15 @@ def inventory(root, *, max_bytes=128*1024*1024, max_files=20000):
     return dict(result,digest=protocol.identity(result))
 
 
+def code_digest(directory):
+    """Digest of the installed Python companions a backend can load."""
+    items = {}
+    for path in sorted(Path(directory).iterdir()):
+        if path.suffix == '.py' and path.is_file() and not path.is_symlink():
+            items[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return protocol.identity(items)
+
+
 def fsync_directory(path):
     fd = os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     try:

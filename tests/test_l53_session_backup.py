@@ -18,6 +18,8 @@ from unittest import mock
 from ameesh import harnesses, session_backup as sb
 from ameesh.runner import AgentWorker
 
+from .support import EMPTY_CODEX_HOME
+
 SESSION = "session-bae71c17-331f-421b-b645-d3a590b676a3"
 DSH = ("sessions/*/{session}",)
 CLAUDE = ("projects/*/{session}.jsonl", "projects/*/{session}")
@@ -212,26 +214,35 @@ class OwnerHomeTest(_Tmp):
             self.assertNotIn("default home", message)
 
     def test_profile_without_a_path_never_falls_back_to_the_caller(self):
-        """B de la relecture #782 : un profil déclaré sans chemin ne prouve rien."""
-        os.environ["DSH_HOME"] = self.home
-        os.environ["CODEX_HOME"] = self.home
-        self.addCleanup(os.environ.pop, "DSH_HOME", None)
-        self.addCleanup(os.environ.pop, "CODEX_HOME", None)
+        """B de la relecture #782 : un profil déclaré sans chemin ne prouve rien.
+
+        #5175 : les variables du banc sont rendues par `mock.patch.dict`, pas
+        retirées. Les retirer laissait `CODEX_HOME` absent pour les modules
+        suivants du même processus ; la garde de rythme Codex lisait alors les
+        vrais journaux du compte (`~/.codex/sessions`).
+        """
         cfg = self.cfg({
             "deepseek": [{"name": "primaire", "type": "config_dir"}],
             "codex": [{"name": "cle", "type": "api_key_env", "env": "OPENAI_API_KEY",
                        "key_env": "OPENAI_KEY"}],
         })
-        for harness, account in (("deepseek", "primaire"), ("codex", "cle")):
-            with self.subTest(harness=harness):
-                with self.assertRaises(sb.BackupError) as caught:
-                    sb._agent_home(cfg, {"harness": harness, "session_account": account},
-                                   "agent-x")
-                message = str(caught.exception)
-                self.assertIn("agent-x", message)
-                self.assertIn("no path", message)
-                self.assertIn("--home", message)
-                self.assertNotIn(self.home, message)
+        avant = {nom: os.environ.get(nom) for nom in ("DSH_HOME", "CODEX_HOME")}
+        with mock.patch.dict(os.environ, {"DSH_HOME": self.home,
+                                          "CODEX_HOME": self.home}):
+            for harness, account in (("deepseek", "primaire"), ("codex", "cle")):
+                with self.subTest(harness=harness):
+                    with self.assertRaises(sb.BackupError) as caught:
+                        sb._agent_home(cfg, {"harness": harness,
+                                             "session_account": account}, "agent-x")
+                    message = str(caught.exception)
+                    self.assertIn("agent-x", message)
+                    self.assertIn("no path", message)
+                    self.assertIn("--home", message)
+                    self.assertNotIn(self.home, message)
+        # Témoin de la fuite #5175 : les variables du banc sont rendues, pas
+        # retirées ; le dossier Codex vide du banc reste en place.
+        self.assertEqual({nom: os.environ.get(nom) for nom in avant}, avant)
+        self.assertEqual(os.environ.get("CODEX_HOME"), EMPTY_CODEX_HOME)
 
     def test_explicit_home_over_an_unprovable_profile_needs_the_flag(self):
         os.environ["DSH_HOME"] = self.home

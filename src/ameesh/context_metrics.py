@@ -94,6 +94,14 @@ REASON_CALL_BOUND_REACHED = "call_bound_reached"
 #: supposé reconstruit.
 REASON_COLLECTION_LOST = "collection_lost"
 
+#: #5148 : relevé du journal de session Codex pour ``C_last``/``O_last``. Ces
+#: motifs disent **pourquoi** le journal n'a rien donné ; une valeur absente
+#: reste ``null`` avec ``context_unknown`` (ou ``output_unknown``), jamais 0.
+REASON_JOURNAL_MISSING = "journal_missing"
+REASON_JOURNAL_UNREADABLE = "journal_unreadable"
+REASON_TURN_NOT_IN_JOURNAL = "turn_not_in_journal"
+REASON_LAST_USAGE_MISSING = "last_token_usage_missing"
+
 #: une valeur de flux est un entier positif ; au-delà, un flux pathologique ne
 #: fait pas grossir la mémoire du tour (contrat §2.2, budget de performance).
 MAX_CALLS = 10_000
@@ -440,10 +448,14 @@ class TurnNormalizer:
 
     Codex : ``turn.completed`` publie un cumul de **fil**, pas un tour. On le
     remet via :meth:`total`, qui travaille en delta à partir d'un point de
-    départ (:meth:`baseline` ou ``cumulative``). Un appel de journal
-    (``last_token_usage``) se remet via :meth:`call` pour ``C_last`` ; la
-    source de ``R_turn`` est choisie automatiquement : un cumul observé
-    remplace la somme des appels, jamais les deux additionnés.
+    départ (:meth:`baseline` ou ``cumulative``). Le flux ``codex exec --json``
+    ne publie pas d'usage d'appel : le ``last_token_usage`` du journal de
+    session se remet via :meth:`journal_call`, qui alimente ``C_last`` et
+    ``O_last`` **sans** entrer dans ``R_turn`` ni dans les caches cumulés (le
+    journal ne publie qu'un appel, pas le tour). :meth:`journal_unavailable`
+    nomme le motif d'un journal muet ; la source de ``R_turn`` reste choisie
+    automatiquement : un cumul observé remplace la somme des appels, jamais
+    les deux additionnés.
     """
 
     def __init__(self, harness: str | None, *, session: str | None = None,
@@ -479,6 +491,10 @@ class TurnNormalizer:
         self.max_calls = max(1, int(max_calls))
         self._calls: list[CallMeasure] = []
         self._subcalls: list[CallMeasure] = []
+        #: #5148 : dernier appel lu au journal Codex (hors flux), et motif
+        #: d'absence du journal. Le premier alimente C_last/O_last seulement.
+        self._journal_call: CallMeasure | None = None
+        self._journal_reason: str | None = None
         self._index: dict[tuple[bool, str], int] = {}
         self._count = 0
         self._duplicates = 0
@@ -625,6 +641,37 @@ class TurnNormalizer:
             self.total(parsed["usage"])
         return self
 
+    # -- journal de session Codex (#5148) --------------------------------
+    def journal_call(self, usage: Mapping | None) -> "TurnNormalizer":
+        """Le dernier appel du fil principal, lu au journal Codex.
+
+        ``codex exec --json`` ne publie pas d'usage d'appel : le journal de
+        session du fil porte le ``last_token_usage`` du dernier ``token_count``.
+        Cette mesure est un appel réel, mais **seul** : elle alimente
+        ``C_last``/``O_last`` et n'entre ni dans ``R_turn`` (cumul du tour) ni
+        dans les caches cumulés, qui restent mesurés par le flux. Un appel de
+        flux, s'il existe, reste prioritaire — jamais les deux additionnés.
+        """
+        self._ensure_open()
+        if not isinstance(usage, Mapping) or self._session_mismatch:
+            return self
+        self._journal_call = call_measure(self.harness, usage,
+                                          source=SOURCE_JOURNAL)
+        return self
+
+    def journal_unavailable(self, reason: str | None = None) -> "TurnNormalizer":
+        """Nomme le motif d'un journal Codex muet pour ce tour (#5148).
+
+        ``C_last`` et ``O_last`` restent ``None`` avec ``context_unknown`` (ou
+        ``output_unknown``) et ce motif distinct : ``journal_missing``,
+        ``journal_unreadable``, ``turn_not_in_journal``,
+        ``last_token_usage_missing`` ou ``no_call``. La mesure d'un tour
+        précédent n'est jamais reprise.
+        """
+        self._ensure_open()
+        self._journal_reason = str(reason) if reason else REASON_NO_CALL
+        return self
+
     # -- sortie ---------------------------------------------------------
     def live_reread(self) -> dict:
         """Les relectures à cet instant du tour, sans clore le normalisateur.
@@ -724,6 +771,7 @@ class TurnNormalizer:
             "counts": {
                 "calls": len(self._calls),
                 "subagent_calls": len(self._subcalls),
+                "journal_calls": 1 if self._journal_call is not None else 0,
                 "totals": self._total_observations,
                 "duplicates": self._duplicates,
                 "replaced": self._replaced,
@@ -746,10 +794,8 @@ class TurnNormalizer:
 
     def _principal_measures(self) -> dict[str, Measure]:
         source = self._reread_source()
-        c_last = (self._calls[-1].c_last if self._calls
-                  else Measure(None, UNKNOWN, (REASON_NO_CALL,), "call", "none"))
-        o_last = (self._calls[-1].o_last if self._calls
-                  else Measure(None, UNKNOWN, (REASON_NO_CALL,), "call", "none"))
+        c_last = self._last_call_measure("c_last", REASON_CONTEXT_UNKNOWN)
+        o_last = self._last_call_measure("o_last", REASON_OUTPUT_UNKNOWN)
         if source == "totals":
             r_turn = self._total_measure("reread")
             output = self._total_measure("output", missing_reason=REASON_NO_MEASURE)
@@ -771,6 +817,22 @@ class TurnNormalizer:
             "cache_read_tokens": cache_read,
             "cache_write_tokens": cache_write,
         }
+
+    def _last_call_measure(self, field: str, unknown_reason: str) -> Measure:
+        """C_last/O_last : appel du flux, sinon appel du journal, sinon motif.
+
+        Un appel de flux reste prioritaire (le journal n'est qu'une source de
+        remplacement) ; l'appel de journal ne compte pas dans ``R_turn``.
+        """
+        if self._calls:
+            return getattr(self._calls[-1], field)
+        if self._journal_call is not None:
+            return getattr(self._journal_call, field)
+        if self._journal_reason is not None:
+            return Measure(None, UNKNOWN,
+                           _reasons((unknown_reason,), (self._journal_reason,)),
+                           "call", SOURCE_JOURNAL)
+        return Measure(None, UNKNOWN, (REASON_NO_CALL,), "call", "none")
 
     def _subagent_measures(self) -> dict[str, Measure]:
         calls = self._subcalls

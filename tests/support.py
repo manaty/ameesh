@@ -688,6 +688,121 @@ class ThreadLeakMixin:
                len(survivors), details, stacks))
 
 
+#: #5180 : l'état du banc qu'un module de test ne doit pas laisser changé au
+#: module suivant du même processus. #5083 : `notify.main --once` laissait
+#: `subprocess.Popen.__init__` remplacé (`child_environment.install`), et les
+#: enfants suivants perdaient `AMEESH_DSN` ; #5175 : un `os.environ.pop`
+#: retirait `CODEX_HOME`, et les tests suivants lisaient le vrai ~/.codex.
+#: Gardées : les variables que ce module pose ou retire, et tout le préfixe
+#: ameesh (dont `AMEESH_DSN`, posé ou non).
+ISOLATION_ENV_PREFIXES = ("AMEESH_", "AGENT_MESH_", "AGENT_MAIL_")
+ISOLATION_ENV_VARS = frozenset((
+    "CODEX_HOME", "XDG_STATE_HOME", "TMPDIR", "HOME", "PATH",
+    *ACCOUNT_ENV_VARS, *HOST_CACHE_VARS,
+))
+#: la photographie de l'état du banc, prise avant le premier module lancé
+_isolation_baseline: dict | None = None
+
+# #5180 : le greffon #1749 (`background._watch_own_children`) remplace
+# `Popen.__init__` une fois par processus, comme dans l'exécuteur, au premier
+# `BackgroundTracker`. Posé ici, avant la photographie, il fait partie de
+# l'état du banc : sinon le premier module de chaque série qui construit un
+# exécuteur serait nommé fautif, et sa remise laisserait le drapeau
+# `_own_hook` levé sans greffon (les `Popen` suivants non retenus).
+from ameesh import background as _background  # noqa: E402
+_background._watch_own_children()
+
+
+def _isolation_env_var(name: str) -> bool:
+    return name in ISOLATION_ENV_VARS or name.startswith(ISOLATION_ENV_PREFIXES)
+
+
+def isolation_snapshot() -> dict:
+    """#5180 : photographie de l'état du banc (environnement gardé, Popen)."""
+    return {
+        "env": {name: value for name, value in os.environ.items()
+                if _isolation_env_var(name)},
+        "subprocess.Popen": subprocess.Popen,
+        "subprocess.Popen.__init__": subprocess.Popen.__dict__.get("__init__"),
+    }
+
+
+def isolation_restore(baseline: dict) -> list:
+    """#5180 : remet l'état photographié ; rend les écarts trouvés (lisibles,
+    sans valeur de variable : le banc peut porter un DSN)."""
+    ecarts = []
+    env = baseline["env"]
+    for name in sorted(set(env) | {n for n in os.environ if _isolation_env_var(n)}):
+        avant, apres = env.get(name), os.environ.get(name)
+        if avant == apres:
+            continue
+        if avant is None:
+            ecarts.append("%s ajoutée" % name)
+            del os.environ[name]
+        elif apres is None:
+            ecarts.append("%s retirée" % name)
+            os.environ[name] = avant
+        else:
+            ecarts.append("%s modifiée" % name)
+            os.environ[name] = avant
+    if subprocess.Popen is not baseline["subprocess.Popen"]:
+        ecarts.append("subprocess.Popen remplacé (%s)"
+                      % _describe_global(subprocess.Popen))
+        subprocess.Popen = baseline["subprocess.Popen"]
+    init = subprocess.Popen.__dict__.get("__init__")
+    if init is not baseline["subprocess.Popen.__init__"]:
+        ecarts.append("subprocess.Popen.__init__ remplacé (%s)"
+                      % _describe_global(init))
+        subprocess.Popen.__init__ = baseline["subprocess.Popen.__init__"]
+    return ecarts
+
+
+_original_module_fixture = unittest.suite.TestSuite._handleModuleFixture
+_original_module_teardown = unittest.suite.TestSuite._handleModuleTearDown
+
+
+def _guarded_module_fixture(self, test, result):
+    """#5180 : la photographie est prise avant le premier module lancé, après
+    tous les chargements ; la garde la remet après chaque module, donc chaque
+    module part du même état."""
+    global _isolation_baseline
+    if _isolation_baseline is None:
+        _isolation_baseline = isolation_snapshot()
+    return _original_module_fixture(self, test, result)
+
+
+def _guarded_module_teardown(self, result):
+    """#5180 : après `tearDownModule` et les cleanups du module, un écart à la
+    photographie fait échouer le module fautif en le nommant ; l'état est
+    remis avant l'échec, pour que les modules suivants restent sains."""
+    module = self._get_previous_module(result)
+    try:
+        _original_module_teardown(self, result)
+    finally:
+        if module is not None and _isolation_baseline is not None:
+            ecarts = isolation_restore(_isolation_baseline)
+            if ecarts:
+                erreur = AssertionError(
+                    "#5180 : le module %s a laissé l'état du banc changé : %s. "
+                    "Restauré pour le module suivant ; utiliser "
+                    "mock.patch.dict(os.environ, …) ou addCleanup, et arrêter "
+                    "tout patch de Popen." % (module, ", ".join(ecarts)))
+                if isinstance(result, unittest.suite._DebugResult):
+                    raise erreur
+                try:
+                    raise erreur
+                except AssertionError:
+                    result.addError(unittest.suite._ErrorHolder(
+                        "garde d'isolement #5180 (%s)" % module), sys.exc_info())
+
+
+_guarded_module_teardown._ameesh_5180 = True
+# une seule garde par processus, même si ce module est chargé sous deux noms
+if not getattr(_original_module_teardown, "_ameesh_5180", False):
+    unittest.suite.TestSuite._handleModuleFixture = _guarded_module_fixture
+    unittest.suite.TestSuite._handleModuleTearDown = _guarded_module_teardown
+
+
 def _bench_upkeep(db) -> None:
     """Purge les schémas t_* orphelins et les bases de test invalides.
 

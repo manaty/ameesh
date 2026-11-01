@@ -36,6 +36,7 @@ from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENC
 from .work_dependencies import current_verdict as _current_verdict
 from .work_dependencies import last_freeze_sha as _last_freeze_sha
 from .work_dependencies import not_blocking as _not_blocking
+from .work_dependencies import start_defers as _start_defers
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
 #: `reviewer` n'existe qu'après la migration 0421, et la base de prod peut
@@ -1302,14 +1303,17 @@ class WorkItems(interface.WorkItems):
         L165b : n'occupent pas l'agent le lot qui attend un autre (`qa`,
         `waiting_human`, `blocked`) ni celui dont le début est prévu après
         aujourd'hui — le jour local du processus qui attribue, comme
-        `operations.listing`."""
+        `operations.listing`. #5161 : un lot en qa à correctif dû n'y entre
+        pas — il n'est plus « à démarrer » (#540), il occupe son auteur par
+        `active_lots`."""
         today = _dt.date.today().isoformat()
         self.db.query(PENDING_LOCK, (assignee,))
         rows = self.db.query(
             "SELECT id FROM work_items WHERE assignee = %%s AND started_at IS NULL"
             "   AND state NOT IN %s AND state NOT IN %s"
-            "   AND (planned_start IS NULL OR planned_start <= %%s)"
-            "   AND id <> %%s ORDER BY id LIMIT 1" % (_CLOSED, _WAITING_ON_OTHERS),
+            "   AND NOT %s"
+            "   AND id <> %%s ORDER BY id LIMIT 1" % (
+                _CLOSED, _WAITING_ON_OTHERS, _start_defers("work_items", "%s")),
             (assignee, today, int(item_id or 0)))
         return int(rows[0]["id"]) if rows else None
 

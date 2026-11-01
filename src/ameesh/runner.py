@@ -2580,6 +2580,39 @@ class AgentWorker(threading.Thread):
             return None
         return adapters.context_tokens("codex", usage) if usage is not None else None
 
+    def _observer_journal_codex(self, normalizer, session: str | None,
+                                started: float, ended: float) -> None:
+        """#5148 : complète ``C_last``/``O_last`` du tour Codex au journal.
+
+        ``codex exec --json`` ne publie pas d'usage d'appel ; le journal de
+        session du fil porte le ``last_token_usage`` du dernier appel. On ne
+        l'attribue qu'au tour dont le ``task_started`` tombe dans la fenêtre
+        du tour : un journal plus ancien (lancement raté, reprise) laisse
+        ``C_last`` inconnu avec son motif, jamais l'usage d'un tour précédent.
+        Observation seule : ``R_turn`` et les caches cumulés restent au flux ;
+        aucune erreur n'est fatale au tour.
+        """
+        reason: str | None = context_metrics.REASON_JOURNAL_UNREADABLE
+        try:
+            book = cost_mod.CostBook(
+                state_dir=self.cfg.state_dir,
+                codex_homes=accounts_mod.homes(self.cfg, "codex"))
+            result = book.codex_turn_last_call_usage(session, started, ended)
+            usage = result.get("usage") if isinstance(result, dict) else None
+            if isinstance(usage, dict) and usage:
+                normalizer.journal_call(usage)
+                return
+            reason = (result.get("reason") if isinstance(result, dict) else None) \
+                or context_metrics.REASON_JOURNAL_MISSING
+        except Exception as exc:  # mesure seulement : jamais fatale au tour
+            log_async("[%s] codex journal observation not read (%s)"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+        try:
+            normalizer.journal_unavailable(reason)
+        except Exception as exc:  # noqa: BLE001 — observation seule
+            log_async("[%s] codex journal reason not published (%s)"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+
     def context_rotation_due(self) -> bool:
         """Le contexte de la session dépasse-t-il le plafond ? (L60)
 
@@ -9016,6 +9049,14 @@ class AgentWorker(threading.Thread):
         # mort, tour réparé) n'est jamais inventée. Le caractère partiel suit
         # exactement les motifs de tour interrompu déjà connus.
         if normalizer is not None:
+            # #5148 : le flux Codex ne publie pas d'usage d'appel ; le journal
+            # du fil le porte. La lecture est bornée au tour observé et n'est
+            # pas conditionnée par `plafonne` (les tours de résumé en ont un).
+            if normalizer.harness == "codex":
+                self._observer_journal_codex(
+                    normalizer,
+                    session_new or session or normalizer.session,
+                    started, started + duration)
             interrupted = bool(
                 error or result_code or clos or self.host_yield is not None
                 or self.lease_lost.is_set() or self.preempting.is_set()
