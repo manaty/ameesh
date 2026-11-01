@@ -309,6 +309,9 @@ TURN_CGROUP_READY_S = 30.0
 #: L976 : au plus un balayage du courrier en souffrance par heure (le seuil de
 #: l'alerte `mail_undeliverable` est de 15 min)
 DEAD_LETTER_SWEEP_EVERY_S = 3600.0
+#: #5217 : purge des empreintes de jetons sandbox des tours clos, au plus une
+#: fois par jour (la rétention est en jours ; une passe bornée par le ménage)
+SANDBOX_TOKEN_PURGE_EVERY_S = 86400.0
 #: #3007 : cadence du constat de vie du notificateur, porté par chaque hôte
 #: (le ménage peut être coupé ; ce fil ne dépend pas de lui). La réclamation
 #: en base dédoublonne les hôtes et espace les relances de six heures.
@@ -10345,6 +10348,9 @@ class Runner:
         #: L85 : dernière rétention du journal d'événements (monotone), son erreur
         self._events_pruned_at: float | None = None
         self._events_prune_error: str | None = None
+        #: #5217 : purge des empreintes de jetons sandbox (monotone), son erreur
+        self._sandbox_token_purge_next: float | None = None
+        self._sandbox_token_purge_error: str | None = None
         #: #3070 : dernière levée des portes d'appareil (monotone), son erreur
         self._device_gates_at: float | None = None
         self._device_gates_error: str | None = None
@@ -10409,7 +10415,13 @@ class Runner:
         self._lifecycle_requirements = factory.requirements_for
 
     def sandbox_credentials_for(self, agent, owner, epoch, turn_id, deadline_ts):
-        """Issue only admitted sandbox credentials; no ordinary lease bearer."""
+        """Issue only admitted sandbox credentials; no ordinary lease bearer.
+
+        `deadline_ts` is the deadline the caller read on the admission. It is
+        part of the S6 boundary signature but never trusted as the expiry: the
+        issuer re-reads the admitted turn under lock and bounds the bearer on
+        the DATABASE deadline, so a caller's claim cannot extend it (#5217/N3).
+        """
         from . import relay, runner_sandbox, sandbox_relay
         from .storage.postgres.sandbox import Refusal
         base = relay.relay_url({
@@ -12758,6 +12770,7 @@ class Runner:
                 units_dir=workspaces.host_units_dir())
             self.expire_threads_once(db)
             self.sweep_dead_letters_once(db)
+            self.purge_sandbox_tokens_once(db)
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("cleanup: %s" % "; ".join(
@@ -12884,6 +12897,47 @@ class Runner:
             log_async("undeliverable mail: %s not re-delivered to %s (%s)"
                       % (action["old"], action["new"], action["reason"].splitlines()[0]))
         return report
+
+    @migrations.writer_tick
+    def purge_sandbox_tokens_once(self, db, clock: float | None = None) -> int | None:
+        """#5217 : rétention des empreintes de jetons de tour sandbox, au plus
+        une fois par jour depuis le ménage.
+
+        Un tour clos ne peut plus vérifier son jeton : l'empreinte n'est plus
+        qu'une preuve d'émission, gardée `sandbox_token_retention_days` jours
+        (0 = jamais purgée). Le tour, son résultat et ses coûts restent. Passe
+        bornée (#5217) ; ne lève jamais, une erreur est dite une fois."""
+        tick = time.monotonic() if clock is None else clock
+        due = getattr(self, "_sandbox_token_purge_next", None)
+        if due is not None and tick < due:
+            return None
+        if self.dry_run or getattr(self, "mediated", False):
+            return None
+        days = int(getattr(getattr(self, "cfg", None),
+                           "sandbox_token_retention_days", 0) or 0)
+        if days <= 0:
+            return None
+        self._sandbox_token_purge_next = tick + SANDBOX_TOKEN_PURGE_EVERY_S
+        own = None
+        if db is None:
+            from .scoped_db import ScopedDb
+            db = own = ScopedDb(self.cfg)
+        try:
+            from . import sandbox_relay
+            gone = sandbox_relay.purge(db, days=days)
+        except (db_mod.DbError, ValueError) as exc:
+            message = "sandbox token retention not applied (%s)" % exc
+            if message != self._sandbox_token_purge_error:
+                log_async(message)
+            self._sandbox_token_purge_error = message
+            return None
+        finally:
+            if own is not None:
+                own.close()
+        self._sandbox_token_purge_error = None
+        if gone:
+            log_async("sandbox tokens: %d digest(s) past retention deleted" % gone)
+        return gone
 
     @migrations.writer_tick(on_admission_error=_background_admission_error)
     def notify_health_once(self, db=None, now: float | None = None) -> dict | None:
