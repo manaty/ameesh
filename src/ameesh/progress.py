@@ -982,8 +982,7 @@ def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict
             "spend_24h_usd": round(float(p.get("usd_24h") or 0.0), 2),
             "decisions_pending": sum(1 for d in decisions if d.get("project") == name),
             "milestone": ({k: ms.get(k) for k in ("id", "title", "date", "progress",
-                                                  "lots_merged", "lots_total", "lots_active",
-                                                  "lots_waiting_activation", "lots_unmeasured")}
+                                                  "lots_merged", "lots_total")}
                           if ms else None),
             "warnings": list(p.get("warnings") or []),
         })
@@ -1308,6 +1307,14 @@ def _ci_suite_lines(ci: dict, width: int) -> list[str]:
     return out
 
 
+def _activation_text(tally: dict) -> str:
+    """#5244 : le détail d'activation, absent d'un instantané qui ne le porte pas."""
+    if "lots_active" not in tally or not tally.get("lots_merged"):
+        return ""
+    return ", %d active, %d not active yet, %d not measured" % (
+        tally["lots_active"], tally["lots_waiting_activation"], tally["lots_unmeasured"])
+
+
 def format_text(snap: dict, width: int | None = None) -> str:
     """La sortie lisible : une colonne, coupée à la largeur du terminal."""
     if width is None:
@@ -1407,9 +1414,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
             counted = epic["lots_total"] - epic["lots_abandoned"]
             line("%s — %s: %d/%d %s merged%s%s" % (
                 epic["id"], epic["title"], epic["lots_merged"], counted, words.plural,
-                ", %d active, %d not active yet, %d not measured" % (
-                    epic["lots_active"], epic["lots_waiting_activation"],
-                    epic["lots_unmeasured"]) if epic["lots_merged"] else "",
+                _activation_text(epic),
                 " (%d abandoned)" % epic["lots_abandoned"] if epic["lots_abandoned"] else ""),
                 "  ")
 
@@ -1445,9 +1450,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
         for ms in snap["milestones"]:
             progress = ("%d/%d %s merged%s" % (
                 ms["lots_merged"], ms["lots_total"] - ms.get("lots_abandoned", 0),
-                words.plural, ", %d active, %d not active yet, %d not measured" % (
-                    ms["lots_active"], ms["lots_waiting_activation"], ms["lots_unmeasured"])
-                if ms["lots_merged"] else "")
+                words.plural, _activation_text(ms))
                 if "lots_total" in ms else "")
             line("%s %s%s" % (ms["date"] if ms.get("date") else "no date",
                               ms.get("title", ""), " — %s" % progress if progress else ""), "  ")
