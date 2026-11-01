@@ -103,6 +103,30 @@ class Operations(interface.Operations):
             " WHERE name = %s RETURNING name", tuple(params + [name]))
         return bool(rows)
 
+    def open_context_pilot(self, name, settings, state, captured) -> dict | None:
+        cols = [key for key in settings if key in self.INTEGER_SETTINGS]
+        sets = "".join("%s = %%s::bigint, " % col for col in cols)
+        initial = ", ".join("'%s', %s" % (col, col) for col in captured
+                            if col in self.INTEGER_SETTINGS)
+        rows = self.db.query(
+            "UPDATE agent_registry SET " + sets + "context_pilot = %s::jsonb"
+            " || jsonb_build_object('initial', jsonb_build_object(" + initial + ")),"
+            " updated_at = now() WHERE name = %s AND (context_pilot IS NULL"
+            " OR context_pilot->>'returned_ts' IS NOT NULL) RETURNING context_pilot",
+            tuple([settings[col] for col in cols] + [json.dumps(state), name]))
+        return rows[0]["context_pilot"] if rows else None
+
+    def write_context_pilot(self, name, settings, state, *, expected) -> bool:
+        cols = [key for key in settings if key in self.INTEGER_SETTINGS]
+        sets = "".join("%s = nullif(%%s, '')::bigint, " % col for col in cols)
+        params: list[Any] = [
+            "" if settings[col] is None else str(settings[col]) for col in cols]
+        return bool(self.db.query(
+            "UPDATE agent_registry SET " + sets + "context_pilot = %s::jsonb,"
+            " updated_at = now() WHERE name = %s AND context_pilot->>'revision' = %s"
+            " AND context_pilot->>'returned_ts' IS NULL RETURNING name",
+            tuple(params + [json.dumps(state), name, expected])))
+
     def set_dormant(self, name, owner, epoch, status_text) -> bool:
         return bool(self.db.query(
             "UPDATE agent_registry SET status_text = %s, updated_at = now()"
@@ -154,6 +178,7 @@ class Operations(interface.Operations):
                    r.cwd,  -- L73b : dossiers de travail protégés par le ménage
                    r.session_policy, r.lot_wake, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
                    r.turn_grace_seconds,
+                   r.session_max_tokens, r.turn_reread_budget, r.session_reread_budget,
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
