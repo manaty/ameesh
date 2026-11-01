@@ -1900,10 +1900,78 @@ def ci_result(rollup) -> dict:
     return out
 
 
+#: #5298 : les agrégats requis de la suite `tests` (les mêmes noms que
+#: `packet_automerge.INHERITED_RED_AGGREGATES`). Un agrégat vert n'est vert que
+#: si toutes les parts planifiées ont passé dans *son* exécution : il conclut
+#: après elles.
+TESTS_AGGREGATES = ("tests", "tests (dispatch)", "suite complète du paquet / tests")
+
+
+def _rollup_completed_at(entry) -> float | None:
+    """La date de fin (`completedAt`) d'une entrée de rollup, en secondes
+    epoch, ou None quand elle est absente ou illisible (#5298)."""
+    from datetime import datetime
+
+    raw = entry.get("completedAt") if isinstance(entry, dict) else None
+    try:
+        stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return stamp.timestamp() if stamp.tzinfo is not None else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def superseded_flux(rollup) -> set:
+    """#5298 : les checks `tests (flux) <part>` qu'un agrégat requis vert,
+    conclu strictement plus tard, remplace.
+
+    Après `gh run rerun --failed`, le flux de l'attempt courant est bien
+    republié et conclu (`external_id` = `ameesh-ci-flow/<exécution>/<tentative>`,
+    #1393), mais `statusCheckRollup` — et la lecture `filter=latest` — ne rend
+    qu'un check par nom : quand le `startedAt` de l'attempt précédent est plus
+    grand (horloge du runner), l'ancien rouge reste seul visible et bloquait la
+    fusion d'un paquet vert (paquet h-10, run 41290078741, #3986).
+
+    Un agrégat requis vert (`tests` …) conclut après toutes les parts de son
+    exécution : conclu strictement après le flux, il prouve que la part a été
+    rejouée et a passé depuis. Un flux conclu à la même date ou après n'est
+    jamais remplacé — un rouge de l'attempt courant reste bloquant —, pas plus
+    qu'un flux sans date de fin lisible. Rend l'ensemble des noms remplacés.
+    """
+    rows = [entry for entry in rollup or () if isinstance(entry, dict)]
+    ends = []
+    for entry in rows:
+        if _entry_name(entry) not in TESTS_AGGREGATES \
+                or check_result(entry) != CI_GREEN_RESULT:
+            continue
+        end = _rollup_completed_at(entry)
+        if end is not None:
+            ends.append(end)
+    if not ends:
+        return set()
+    newest = max(ends)
+    replaced = set()
+    for entry in rows:
+        name = _entry_name(entry)
+        if not name.startswith(TEST_FLOW_PREFIX) \
+                or check_result(entry) != CI_NEGATIVE_RESULT:
+            continue
+        end = _rollup_completed_at(entry)
+        if end is not None and newest > end:
+            replaced.add(name)
+    return replaced
+
+
 def packet_proof_entries(rollup) -> list:
     """Les checks du portier de suite complète d'un paquet : le workflow
     `paquet` et la sentinelle `paquet (run proof unavailable)` que
-    `merge_rollup` ajoute quand la preuve manque (#2876/#3066)."""
+    `merge_rollup` ajoute quand la preuve manque (#2876/#3066).
+
+    #5298 : un flux de part reste une preuve du portier (il est rattaché à sa
+    suite quand `tests.yml` est appelé par `paquet`, #3494) tant qu'il n'est
+    pas remplacé par un agrégat requis vert conclu plus tard
+    (`superseded_flux`). Un flux de l'attempt courant, lui, continue de
+    bloquer."""
+    replaced = superseded_flux(rollup)
     out = []
     for entry in latest_rollup(rollup) or ():
         name = str(entry.get("name") or entry.get("context") or "")
@@ -1911,6 +1979,10 @@ def packet_proof_entries(rollup) -> list:
         # portier, même quand `tests.yml` est appelé par `paquet` (le check est
         # alors associé au workflow appelant) : il a sa propre porte.
         if name == AGGREGATE_DETAIL_CHECK:
+            continue
+        # #5298 : le flux d'un attempt antérieur, remplacé par un agrégat vert
+        # plus récent, n'est pas un rouge courant.
+        if name in replaced:
             continue
         if str(entry.get("workflowName") or "") == "paquet" \
                 or name == "paquet (run proof unavailable)":
