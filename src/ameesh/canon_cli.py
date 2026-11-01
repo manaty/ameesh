@@ -4,7 +4,9 @@
   ameesh canon check [--host H] [--json] validation (§4.3) ; code 1 si erreur ;
                                          état du canon pour l'hôte (ok | invalid |
                                          unreadable), état enregistré au registre,
-                                         placements de l'hôte admis ou refusés (C4)
+                                         placements de l'hôte admis ou refusés (C4) ;
+                                         [--project-repo PROJET=CHEMIN] : tout fichier
+                                         suivi non léger a un nombre d'avis (#5191)
   ameesh canon show [--json]             fiches lues, et d'où (commit)
   ameesh canon sync [--host H] [--json] [--bootstrap-ref BRANCHE]
                      [--allow-rewind]
@@ -278,6 +280,12 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
     status, diagnostic = canon_sync.assess(canon, host, findings)
     placements = placement_mod.verdicts(canon) if canon.readable else []
     unseen = _registry_errors_unseen(canon, recorded, errors)
+    # #5191 : après l'état de l'hôte, que ce contrôle propre au check ne change pas
+    if canon.readable:
+        from . import canon_review_coverage
+        findings = findings + canon_review_coverage.findings(
+            cfg, canon, dict(getattr(args, "project_repo", None) or ()))
+        errors = canon_mod.errors(findings)
     if args.json:
         data = {
             "ok": not errors and not unseen, "root": canon.root, "untrusted": canon.untrusted,
@@ -1090,6 +1098,13 @@ def cmd_move(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _project_repo(text: str) -> tuple[str, str]:
+    project, _sep, path = text.partition("=")
+    if not project.strip() or not path.strip():
+        raise argparse.ArgumentTypeError("PROJECT=PATH expected: %r" % text)
+    return project.strip(), path.strip()
+
+
 def _canon_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--canon", default=None,
                         help="id of a configured canon (L42; otherwise all for "
@@ -1211,6 +1226,11 @@ def add_parsers(sub) -> None:
     p_check.add_argument("--host", default=None,
                          help="host whose state is diagnosed (otherwise AMEESH_HOST / this "
                               "machine)")
+    p_check.add_argument("--project-repo", action="append", type=_project_repo,
+                         metavar="PROJECT=PATH",
+                         help="clone of a project's repository for the review count "
+                              "control (otherwise radar.projects, then the current "
+                              "clone if it is the project's); repeatable")
     p_check.set_defaults(func=cmd_check)
     p_cshow = canon_sub.add_parser("show", help="cards read and their source")
     _canon_options(p_cshow)
