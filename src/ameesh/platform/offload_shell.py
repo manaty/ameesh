@@ -1107,6 +1107,21 @@ def make_executor(cfg: dict, job_id: str) -> Executor:
     raise Refused("unknown executor %r" % kind)
 
 
+def session_streams_gone() -> bool:
+    """True when the client's end of the session streams is closed.
+
+    The protocol travels on stderr: when the SSH session dies, its reader is
+    gone (POLLERR/POLLHUP), even if this shell was reparented before `main`
+    could record its session parent. A write would fail the same way (#5184)."""
+    try:
+        poller = select.poll()
+        poller.register(2, select.POLLERR | select.POLLHUP)
+        events = poller.poll(0)
+    except (OSError, ValueError):
+        return False
+    return any(mask & (select.POLLERR | select.POLLHUP) for _, mask in events)
+
+
 class Job:
     """Runs the phases of one job under the same supervision: cancel, SSH
     session loss, host gate and one deadline for the whole job."""
@@ -1135,8 +1150,10 @@ class Job:
         self.deadline = time.time() + seconds
 
     def session_gone(self) -> bool:
-        # no tty, so no SIGHUP for sure: a dead sshd session reparents us
-        return os.getppid() != self.ssh_parent
+        # no tty, so no SIGHUP for sure: a dead sshd session reparents us.
+        # The protocol stream closing also catches the window where the
+        # session died before `main` could remember its parent (#5184).
+        return os.getppid() != self.ssh_parent or session_streams_gone()
 
     def check(self, now: float | None = None) -> dict:
         """Fills and returns `stop` when the job must end."""
@@ -1420,6 +1437,22 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         emit_result(result)
         return 75
     prune_orphans(cfg)
+    if (SESSION_PARENT is not None and os.getppid() != SESSION_PARENT) \
+            or session_streams_gone():
+        # the session died during admission (the client's wait budget expired
+        # before `job` was announced, or the shell was reparented before
+        # `main` could remember its parent): no client is left, and a job
+        # started now would never be seen. Journal the abandoned request and
+        # create no job (#5184).
+        result.update(outcome="cancelled",
+                      reason="SSH session closed before the job started")
+        _journal(cfg, {"job": job_id, "state": "cancelled",
+                       "repo": req["repo"], "commit": req["commit"],
+                       "profile": req["profile"], "argv": req["argv"],
+                       "created_ts": int(started), "outcome": "cancelled",
+                       "reason": result["reason"], "exit": None})
+        emit_result(result)
+        return 130
     job_dir = os.path.join(_dir(cfg, "jobs", mode=0o750), job_id)
     os.makedirs(job_dir, mode=0o700)
     # the job enters its folder, but only `work` and `tmp` below are writable

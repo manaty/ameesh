@@ -402,6 +402,33 @@ class RunTest(OffloadBase):
         self.assertFalse(os.path.exists(marker), "the command ran without a client")
         self.assertEqual(self.running_jobs(), [])
 
+    def test_a_session_lost_before_main_is_journaled_without_a_job(self):
+        # #5184 : le budget d'attente peut expirer pendant le démarrage du
+        # shell `run` (CI chargée) : il est reparenté avant que `main`
+        # n'enregistre son parent, et seul le flux de protocole dit que la
+        # session est morte. La demande est journalisée annulée, sans job ni
+        # commande.
+        marker = os.path.join(self.tmp, "ran")
+        began = time.time()
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_FAKE_OFFLOAD_START_DELAY": "9"}):
+            res = self.offload("run", "--wait-timeout", "8", "--", "sh", "-c",
+                               "touch %s; sleep 30" % marker)
+        self.assertEqual(res.returncode, 124, res.stderr)
+        if "client wait budget exhausted" in res.stderr:
+            # #3877 : runner chargé, budget épuisé avant le shell : non
+            # concluant (§3), jamais un rouge.
+            self.assertEqual(self.running_jobs(), [])
+            self.skipTest("wait budget spent before the shell started (loaded host)")
+        self.assertLess(time.time() - began, 20)
+        self.assertIn("no result within", res.stderr)
+        self.assertNotIn("cancelling job", res.stderr)
+        entry = self.wait_for_journal_entry(timeout=30)
+        self.assertIsNotNone(entry, self.journal())
+        self.assertEqual(entry["outcome"], "cancelled", entry)
+        self.assertFalse(os.path.exists(marker), "the command ran without a client")
+        self.assertEqual(self.running_jobs(), [])
+
     def test_a_session_gone_before_cmd_run_creates_no_job(self):
         # #5184 : session déjà morte quand le shell atteint `run` (démarrage
         # lent) : refus à l'entrée, aucun dossier de job, aucune commande.
