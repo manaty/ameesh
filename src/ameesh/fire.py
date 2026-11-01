@@ -1650,8 +1650,16 @@ def _flux_identity(check) -> tuple | None:
 
 def _check_id_in_url(url) -> int | None:
     """L'id du check run dans un `detailsUrl` de flux (`…/runs/<id>`, la forme
-    par défaut d'un check publié par un jeton d'exécution), ou None."""
-    match = re.search(r"/runs/([1-9][0-9]*)/?$", str(url or "").strip())
+    par défaut d'un check publié par un jeton d'exécution), ou None.
+
+    Une URL de job (`…/actions/runs/<exécution>/job/<job>`) ou d'exécution
+    (`…/actions/runs/<exécution>`) ne nomme pas un check run : elle est
+    refusée, sinon l'id de l'exécution pourrait être pris pour celui d'un
+    check homonyme."""
+    text = str(url or "").strip()
+    if "/actions/runs/" in text:
+        return None
+    match = re.search(r"/runs/([1-9][0-9]*)/?$", text)
     return int(match.group(1)) if match else None
 
 
