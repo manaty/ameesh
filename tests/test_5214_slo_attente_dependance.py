@@ -15,9 +15,12 @@ ne retiennent rien. Une fusion déjà faite garde sa durée réelle.
 """
 from __future__ import annotations
 
+import time
 import unittest
 
-from ameesh import slo
+from ameesh import planned_waits, slo, storage, work
+
+from .test_789_slo_alerts import _Base
 
 #: Un lundi arbitraire, en secondes epoch.
 T0 = 1_793_491_200.0
@@ -113,3 +116,67 @@ class DependanceBloquanteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RejeuHorlogeUniqueTest(_Base):
+    """#5214 : la grâce de recomposition (#5206) se juge à la date du rejeu.
+
+    `read` normalise `now` pour tout le calcul d'attente ; l'appartenance de
+    paquet doit recevoir la même horloge. Sinon une simulation SLO à date
+    imposée juge la grâce à `time.time()` : un rejeu dans le futur voit une
+    composition trop ancienne comme fraîche (et inversement), et deux lots du
+    même instant ne sont plus jugés au même temps.
+    """
+
+    #: la tête de la composition enregistrée (pas encore poussée)
+    HEAD = "b" * 40
+    #: la tête du porteur que le balayage a déjà vue (composition précédente)
+    OLD = "e" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.store = storage.of(self.db)
+        work.move(self.db, self.lot["id"], "build")
+        work.move(self.db, self.lot["id"], "qa")
+        self.freeze = "d" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (self.freeze, self.lot["id"]))
+        self.vehicle = self.packet()
+        self.store.work.record_packet(
+            int(self.vehicle["id"]), branch="integration/paquet-test",
+            base_sha="a" * 40, head_sha=self.HEAD,
+            units=[{"work_item_id": int(self.lot["id"]), "unit_sha": "c" * 40,
+                    "source_sha": self.freeze, "frozen_sha": self.freeze}],
+            note="packet composition recorded", actor="orch")
+        self.t0 = time.time()
+        # Composition enregistrée 60 s avant t0, tête observée 600 s avant :
+        # c'est le cas #5206 d'une recomposition plus récente que le relevé.
+        self.db.execute(
+            "UPDATE work_packet_members SET recorded_at = to_timestamp(%s)"
+            " WHERE package_id = %s", (self.t0 - 60.0, int(self.vehicle["id"])))
+        self.db.execute(
+            "UPDATE work_items SET branch_head = %s, branch_head_at = to_timestamp(%s)"
+            " WHERE id = %s", (self.OLD, self.t0 - 600.0, int(self.vehicle["id"])))
+
+    def waits(self, now):
+        row = self.store.work.get(int(self.lot["id"]))
+        return planned_waits.read(self.db, [row], now=now, packets=True)
+
+    def test_la_frontiere_des_quinze_minutes_se_lit_a_la_date_du_rejeu(self):
+        member = self.store.work.packet_members(
+            package_ids=[int(self.vehicle["id"])])[0]
+        recorded = float(member["recorded_ts"])
+        ident = int(self.lot["id"])
+        expected = {"what": "packet", "vehicle": int(self.vehicle["id"]),
+                    "branch": "integration/paquet-test", "head": self.OLD}
+        grace = planned_waits.RECORD_AHEAD_GRACE_S
+        # Rejeu 10 min après l'enregistrement : la composition est fraîche.
+        self.assertEqual(self.waits(recorded + 600.0)[ident], expected)
+        # Juste avant la borne (15 min - 1 s), elle compte encore.
+        self.assertEqual(self.waits(recorded + grace - 1.0)[ident], expected)
+        # Juste après (15 min + 1 s), la grâce est passée : plus
+        # d'appartenance, donc plus d'attente de paquet. Sans `now=now`,
+        # l'horloge du processus (t0, 60 s après la composition) la gardait
+        # fraîche et ce cas échouait : le rejeu ne datait pas la frontière.
+        after = self.waits(recorded + grace + 1.0)
+        self.assertNotIn(ident, after)
