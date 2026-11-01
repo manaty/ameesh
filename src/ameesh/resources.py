@@ -1671,9 +1671,14 @@ def host_limits(canons, host: str, *, reading: dict | None = None,
         if value is not None and (max_agents is None or value < max_agents):
             max_agents, max_origin = value, label
     origin["max_agents"] = max_origin or DEFAULT_ORIGIN
+    # #5207 : taire le silence d'un hôte demande l'accord de toutes ses fiches
+    intermittent = bool(fiches) and all(
+        getattr(getattr(fiche, "policy", None), "intermittent", False) is True
+        for _label, fiche in fiches)
     # L159d: the strictest offer (relocation, `ameesh hosts`)
     limits["lend"] = host_offer(canons, host)
-    return {"host": host, "limits": limits, "max_agents": max_agents, "origin": origin,
+    return {"host": host, "limits": limits, "max_agents": max_agents,
+            "intermittent": intermittent, "origin": origin,
             "fiches": [label for label, _f in fiches],
             "scope_fallback": scope_fallback}
 
