@@ -45,6 +45,18 @@ class FactsTest(unittest.TestCase):
         # la relève : l'écart d'horloge n'est pas un double bail
         self.assertFalse(pilot.overlaps([a, {"started_ts": 290, "ended_ts": 400, "host": "b"}]))
 
+    def test_long_tour_contenant_un_court(self):
+        """Relecture : A[100,1000], A[200,300], B[400,500] se chevauchent."""
+        self.assertTrue(pilot.overlaps([
+            {"started_ts": 100, "ended_ts": 1000, "host": "a"},
+            {"started_ts": 200, "ended_ts": 300, "host": "a"},
+            {"started_ts": 400, "ended_ts": 500, "host": "b"}]))
+
+    def test_garde_glissante_24h(self):
+        self.assertEqual(pilot.verdict({"rolling_24h": _window(10, 13)}, self.STATE)[0], "return")
+        self.assertIsNone(pilot.verdict({"rolling_24h": _window(10, 12)}, self.STATE)[0])
+        self.assertIsNone(pilot.verdict({"rolling_24h": _window(9, 900)}, self.STATE)[0])
+
     def test_motifs(self):
         for facts in ({"guards": ["account_overage"]}, {"double_lease": [("a", "b", 1)]},
                       {"oom": True}, {"monitoring_lost": True},
@@ -111,6 +123,34 @@ class PilotDbTest(_Base):
         with mock.patch.object(pilot, "_tell"):
             pilot._return(self.db, "pilote-c", state, "fin", "t", 2000.0)
         self.assertEqual(self._apply("pilote-c"), 0)
+
+    def test_controle_ancien_n_ecrase_pas_un_pilote_rouvert(self):
+        self._worker("pilote-g", context_max_tokens=400_000)
+        self.assertEqual(self._apply("pilote-g"), 0)
+        ancien = pilot._state_of(self.db, "pilote-g")
+        with mock.patch.object(pilot, "_tell"):
+            self.assertTrue(pilot._return(self.db, "pilote-g", ancien, "fin", "t", 2000.0))
+            self.assertEqual(self._apply("pilote-g", context_max=2_000_000), 0)
+            self.assertFalse(pilot._return(self.db, "pilote-g", ancien, "périmé", "t", 3000.0))
+        self.assertEqual(registry.get(self.db, "pilote-g")["context_max_tokens"], 2_000_000)
+
+    def test_garde_nouvelle_dans_la_meme_fenetre_de_forfait(self):
+        """Relecture : `since` d'un dépassement date la fenêtre, pas le dépassement."""
+        self._worker("pilote-h")
+        depassement = {"type": "account_overage", "agent": "pilote-h", "since": 1.0}
+        with mock.patch.object(pilot, "_tell"), \
+                mock.patch.object(pilot.exploitation, "alerts", return_value=[]):
+            self.assertEqual(self._apply("pilote-h"), 0)
+        state = pilot._state_of(self.db, "pilote-h")
+        with mock.patch.object(pilot.exploitation, "alerts", return_value=[depassement]), \
+                mock.patch.object(pilot, "_oom_seen", return_value=None):
+            facts = pilot.collect(self.cfg, self.db, "pilote-h", state, 2000.0)
+        self.assertEqual(facts["guards"], ["account_overage"])
+        # déjà levée à la pose : pas un effet du pilote
+        state["guards_at_apply"] = [pilot._guard_id(depassement)]
+        with mock.patch.object(pilot.exploitation, "alerts", return_value=[depassement]), \
+                mock.patch.object(pilot, "_oom_seen", return_value=None):
+            self.assertEqual(pilot.collect(self.cfg, self.db, "pilote-h", state, 2000.0)["guards"], [])
 
     def test_controle_replie_puis_ramene(self):
         self._worker("pilote-d", context_max_tokens=400_000)

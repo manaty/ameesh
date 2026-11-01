@@ -4246,12 +4246,17 @@ class Operations(Domain):
         défaut, colonne effacée). Faux si l'agent est inconnu."""
 
     @abc.abstractmethod
+    def open_context_pilot(self, name: str, settings: dict, state: dict,
+                           captured: tuple) -> dict | None:
+        """#5250 : pose le pilote en UNE instruction, seulement sans pilote ouvert ;
+        `state.initial` reçoit les colonnes `captured` d'avant la pose. Rend l'état
+        écrit, ou None."""
+
+    @abc.abstractmethod
     def write_context_pilot(self, name: str, settings: dict, state: dict,
-                            *, opening: bool) -> bool:
-        """#5250 : réglages de politique et état du pilote en UNE instruction.
-        `opening` : seulement sans pilote ouvert ; sinon seulement sur un pilote
-        ouvert (`returned_ts` absent). Faux si la condition ne tient plus : deux
-        contrôles concurrents ne font qu'un retour."""
+                            *, expected: str) -> bool:
+        """#5250 : réglages et état du pilote ouvert en UNE instruction, seulement
+        si sa révision est encore `expected` ; faux sinon."""
 
     @abc.abstractmethod
     def set_session_work_item(self, name: str, owner: str, epoch: int,

@@ -8,7 +8,9 @@ le dernier tour a pris les valeurs ; ``check`` évalue les motifs de retour de
 l'engagement e23 et agit.
 
 L'état vit dans ``agent_registry.context_pilot`` : un rôle élu garde son pilote
-quel que soit l'hôte, et plusieurs ``check`` concurrents ne font qu'un retour.
+quel que soit l'hôte. Chaque écriture exige la révision qu'elle a lue : plusieurs
+``check`` concurrents ne font qu'un retour, et un contrôle ancien n'écrase ni un
+repli ni un pilote rouvert.
 Les seuils viennent des arguments : rien de propre à un agent ou un client ici.
 
 Une mesure inconnue reste inconnue et ne décide rien, mais elle est publiée ; seul
@@ -22,6 +24,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 
 from . import config as config_mod, db as db_mod, exploitation, mail, storage, work
 from .mesh_cli import parse_token_count
@@ -69,15 +72,24 @@ def cost_verdict(windows: list, baseline: float | None) -> str | None:
     return "fallback"
 
 
+def rolling_over(rolling: dict | None, baseline: float | None) -> bool:
+    """La garde glissante de 24 h (mesh-design, #5253) : même seuil, même effectif."""
+    return bool(rolling) and bool(baseline) and over_cost(rolling, baseline)
+
+
 def overlaps(turns: list[dict]) -> list[tuple]:
     """Deux tours du même agent qui se chevauchent sur deux hôtes : double bail.
     La marge absorbe l'écart d'horloge entre hôtes, à la relève du bail."""
     bounded = sorted((t for t in turns if t.get("started_ts") and t.get("ended_ts")
                       and t.get("host")), key=lambda t: t["started_ts"])
     found = []
-    for before, after in zip(bounded, bounded[1:]):
-        if after["started_ts"] + CLOCK_MARGIN_S < before["ended_ts"] and after["host"] != before["host"]:
-            found.append((before["host"], after["host"], after["started_ts"]))
+    # La fin la plus tardive par hôte : un long tour peut en contenir un court.
+    latest: dict = {}
+    for turn in bounded:
+        for host, ended in latest.items():
+            if host != turn["host"] and turn["started_ts"] + CLOCK_MARGIN_S < ended:
+                found.append((host, turn["host"], turn["started_ts"]))
+        latest[turn["host"]] = max(latest.get(turn["host"], 0), turn["ended_ts"])
     return found
 
 
@@ -119,17 +131,34 @@ def _oom_seen(agent: str, since: float) -> bool | None:
     return bool(log.stdout.strip()) if log.returncode in (0, 1) else None
 
 
-def _cost_windows(command: str | None) -> list | None:
-    """Les fenêtres d'une heure de la procédure de référence, ou None si illisibles."""
+def _cost_reading(command: str | None) -> dict | None:
+    """``{"windows": [{actions, cost}…], "rolling_24h": {actions, cost}}`` de la
+    procédure de référence, ou None si illisible."""
     if not command:
         return None
     try:
         done = subprocess.run(shlex.split(command), capture_output=True, text=True,
                               timeout=300, check=True)
-        windows = json.loads(done.stdout)
+        reading = json.loads(done.stdout)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
-    return windows if isinstance(windows, list) else None
+    return reading if isinstance(reading, dict) else None
+
+
+def _guard_id(alert: dict) -> list:
+    return [alert.get(key) for key in
+            ("type", "agent", "host", "account", "gauge", "since")]
+
+
+def _guard_alerts(cfg, db, name: str) -> list[dict]:
+    """Les alertes de garde de l'agent, de son hôte, et de son compte s'il y en a un."""
+    from . import registry
+    row = registry.get(db, name) or {}
+    host, account = row.get("host"), row.get("session_account")
+    return [a for a in exploitation.alerts(cfg, db)
+            if a.get("type") in GUARD_ALERTS
+            and (a.get("agent") == name or (host and a.get("host") == host))
+            and (not a.get("account") or not account or a["account"] == account)]
 
 
 def collect(cfg, db, name: str, state: dict, now: float,
@@ -138,22 +167,21 @@ def collect(cfg, db, name: str, state: dict, now: float,
     since = float(state["applied_ts"])
     payloads = _context_payloads(db, name, since, now)
     recent = _context_payloads(db, name, max(since, now - MONITORING_WINDOW_S), now)
-    from . import registry
-    host = (registry.get(db, name) or {}).get("host")
-    # Une alerte d'avant la pose (garde relancée la veille) n'est pas un effet du pilote.
-    alerts = [a for a in exploitation.alerts(cfg, db)
-              if a.get("type") in GUARD_ALERTS
-              and (a.get("agent") == name or (host and a.get("host") == host))
-              and float(a.get("since") or 0) >= since]
+    # Une alerte déjà levée à la pose n'est pas un effet du pilote ; `since` ne
+    # le dit pas : pour un dépassement, c'est le début de la fenêtre du forfait.
+    known = {tuple(item) for item in state.get("guards_at_apply") or ()}
+    alerts = [a for a in _guard_alerts(cfg, db, name) if tuple(_guard_id(a)) not in known]
     turns = storage.of(db).turn_costs.count_since(name, now - MONITORING_WINDOW_S)
     monitoring_lost = (now - since >= MONITORING_WINDOW_S
                        and turns >= MONITORING_MIN_TURNS and not recent)
+    reading = _cost_reading(cost_command) or {}
     return {
         "guards": [a.get("type") for a in alerts],
         "double_lease": overlaps([_turn_bounds(p) for p in payloads]),
         "oom": _oom_seen(name, since),
         "monitoring_lost": monitoring_lost,
-        "cost_windows": _cost_windows(cost_command),
+        "cost_windows": reading.get("windows"),
+        "rolling_24h": reading.get("rolling_24h"),
     }
 
 
@@ -167,6 +195,8 @@ def verdict(facts: dict, state: dict) -> tuple[str | None, str]:
         return "return", "OOM on the agent's unit"
     if facts.get("monitoring_lost"):
         return "return", "monitoring lost: turns without turn.context"
+    if rolling_over(facts.get("rolling_24h"), state.get("baseline_cost")):
+        return "return", "cost per action above +20 % over the rolling 24 h"
     outcome = cost_verdict(facts.get("cost_windows") or [], state.get("baseline_cost"))
     if outcome == "return":
         return "return", "cost per action above +20 % on two windows"
@@ -190,8 +220,8 @@ def _tell(db, name: str, state: dict, text: str, actor: str) -> None:
 
 
 def apply_pilot(cfg, db, args, now: float) -> int:
-    row = storage.of(db).operations.listing()
-    row = next((r for r in row if r["name"] == args.agent), None)
+    from . import registry
+    row = registry.get(db, args.agent)
     if row is None:
         print("unknown agent: %s" % args.agent, file=sys.stderr)
         return 1
@@ -204,15 +234,19 @@ def apply_pilot(cfg, db, args, now: float) -> int:
               "session_reread_budget": args.session_budget}
     state = {
         "schema": SCHEMA, "applied_ts": now, "returned_ts": None, "lot": args.lot,
-        "ref": args.ref, "initial": {key: row.get(key) for key in SETTINGS},
+        "ref": args.ref, "revision": uuid.uuid4().hex,
+        "guards_at_apply": [_guard_id(a) for a in _guard_alerts(cfg, db, args.agent)],
         "applied": values, "fallback_turn_budget": args.fallback_turn_budget,
         "fallback_ts": None, "baseline_cost": args.baseline_cost,
     }
     if args.dry_run:
-        print(json.dumps(state, indent=2))
+        print(json.dumps(dict(state, initial={key: row.get(key) for key in SETTINGS}),
+                         indent=2))
         return 0
-    if not storage.of(db).operations.write_context_pilot(
-            args.agent, values, state, opening=True):
+    # Le profil initial est lu par l'instruction qui pose les valeurs, sur la
+    # ligne verrouillée : une lecture préalable pourrait être déjà périmée.
+    state = storage.of(db).operations.open_context_pilot(args.agent, values, state, SETTINGS)
+    if state is None:
         print("a pilot is already open on %s" % args.agent, file=sys.stderr)
         return 1
     _tell(db, args.agent, state, "context pilot applied (%s), effective at the next "
@@ -223,9 +257,9 @@ def apply_pilot(cfg, db, args, now: float) -> int:
 
 
 def _return(db, name: str, state: dict, reason: str, actor: str, now: float) -> bool:
-    closed = dict(state, returned_ts=now, return_reason=reason)
+    closed = dict(state, returned_ts=now, return_reason=reason, revision=uuid.uuid4().hex)
     if not storage.of(db).operations.write_context_pilot(
-            name, state["initial"], closed, opening=False):
+            name, state["initial"], closed, expected=state["revision"]):
         return False
     _tell(db, name, closed, "context pilot returned to the initial profile (%s): %s; "
           "effective at the next turn" % (reason, state["initial"]), actor)
@@ -266,10 +300,10 @@ def check(cfg, db, name: str, actor: str, now: float,
         action = "return" if _return(db, name, state, reason, actor, now) else None
     elif action == "fallback":
         budget = int(state["fallback_turn_budget"])
-        moved = dict(state, fallback_ts=now,
+        moved = dict(state, fallback_ts=now, revision=uuid.uuid4().hex,
                      applied=dict(state["applied"], turn_reread_budget=budget))
         if storage.of(db).operations.write_context_pilot(
-                name, {"turn_reread_budget": budget}, moved, opening=False):
+                name, {"turn_reread_budget": budget}, moved, expected=state["revision"]):
             _tell(db, name, moved, "context pilot cost fallback (%s): turn_reread_budget=%d"
                   % (reason, budget), actor)
         else:
@@ -309,7 +343,7 @@ def main(argv=None) -> int:
             # pas ce que l'hôte exécute.
             command.add_argument(
                 "--cost-command", default=None,
-                help="prints a JSON list of hourly windows {actions, cost}, oldest first")
+                help="prints JSON {windows: [{actions, cost}, oldest first], rolling_24h: {actions, cost}}")
     parser.add_argument("--actor", default="ameesh")
     args = parser.parse_args(argv)
 
