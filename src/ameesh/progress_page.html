@@ -295,6 +295,12 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   // au chargement puis à chaque Refresh ; "static" pour un fichier --html
   // (données embarquées, rien à relire)
   var MODE = /*__AMEESH_PROGRESS_MODE__*/"static";
+  // #5244 : la part faite (activée) d'une fiche, la fusion sur un ancien instantané
+  function doneShare(x) { return x.progress_active === null || x.progress_active === undefined ? x.progress : x.progress_active; }
+  function activationText(x) {
+    return x.lots_active || x.lots_waiting_activation || x.lots_unmeasured
+      ? ", " + x.lots_active + " active, " + x.lots_waiting_activation + " not active yet, " + x.lots_unmeasured + " not measured" : "";
+  }
   var API = "/api/progress.json", CHAT = "/api/conversation.json";
   var TOKEN_KEY = "ameesh-progress-token", TOKEN = "";
   var D = JSON.parse(document.getElementById("data").textContent || "null");
@@ -1050,14 +1056,15 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       box.appendChild(dl([["date", ms.date || "no date"], ["owner", ms.responsible],
                           ["state", ms.status], ["canon", ms.canon_ref],
                           ["progress", ms.lots_merged + "/" + counted + " " + W().abbreviation + " merged"
-                            + (ms.progress !== null && ms.progress !== undefined ? " (" + Math.round(ms.progress * 100) + "%)" : "")]]));
-      box.appendChild(bar(ms.progress, Math.round((ms.progress || 0) * 100) + "% merged"));
+                            + activationText(ms)
+                            + (doneShare(ms) !== null && doneShare(ms) !== undefined ? " (" + Math.round(doneShare(ms) * 100) + "% done)" : "")]]));
+      box.appendChild(bar(doneShare(ms), Math.round((doneShare(ms) || 0) * 100) + "% done (active)"));
       var epics = (D.epics || []).filter(function (e) { return e.milestone === id; });
       if (epics.length) section(box, "Epics");
       epics.forEach(function (e) {
         var c = e.lots_total - e.lots_abandoned;
-        box.appendChild(el("div", "line", e.id + " — " + (e.title || "") + " : " + e.lots_merged + "/" + c));
-        box.appendChild(bar(e.progress, e.lots_merged + " of " + c));
+        box.appendChild(el("div", "line", e.id + " — " + (e.title || "") + " : " + e.lots_merged + "/" + c + " merged" + activationText(e)));
+        box.appendChild(bar(doneShare(e), Math.round((doneShare(e) || 0) * 100) + "% done (active)"));
         var ids = (e.work_items || []).slice();
         (e.lots || []).forEach(function (l) { ids = ids.concat(l.work_items || []); });
         ids.forEach(function (i) { var l = lotById(i); if (l && !l.closed && l.state !== "merged") lotLine(box, l); });
@@ -1247,10 +1254,10 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         if (ms) {
           var mline = el("div", "ms");
           mline.appendChild(link("◆ " + (ms.title || ms.id), function () { openModal("milestone", ms.id); }));
-          mline.appendChild(el("span", "meta", " · " + (ms.date || "no date") + " · " + (ms.lots_merged || 0) + "/" + (ms.lots_total || 0)
-            + (ms.progress !== null && ms.progress !== undefined ? " (" + Math.round(ms.progress * 100) + "%)" : "")));
+          mline.appendChild(el("span", "meta", " · " + (ms.date || "no date") + " · " + (ms.lots_merged || 0) + "/" + (ms.lots_total || 0) + " merged" + activationText(ms)
+            + (doneShare(ms) !== null && doneShare(ms) !== undefined ? " (" + Math.round(doneShare(ms) * 100) + "% done)" : "")));
           card.appendChild(mline);
-          card.appendChild(bar(ms.progress, Math.round((ms.progress || 0) * 100) + "% of the milestone"));
+          card.appendChild(bar(doneShare(ms), Math.round((doneShare(ms) || 0) * 100) + "% of the milestone done"));
         } else card.appendChild(el("div", "meta", "no current milestone"));
         (c.warnings || []).slice(0, 2).forEach(function (w) { card.appendChild(el("div", "warn", "⚠ " + w)); });
         if ((c.warnings || []).length > 2) card.appendChild(el("div", "meta", "+ " + (c.warnings.length - 2) + " warning(s)"));
@@ -1709,11 +1716,12 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", p.id));
       head.appendChild(el("span", "t", p.title));
-      if (p.units_total) head.appendChild(el("span", "meta", p.units_delivered + "/" + p.units_total + " delivered"));
+      if (p.units_total) head.appendChild(el("span", "meta", p.units_delivered + "/" + p.units_total + " delivered"
+        + (p.units_delivered && p.units_active !== undefined ? ", " + p.units_active + " active, " + p.units_waiting_activation + " not active yet, " + p.units_unmeasured + " not measured" : "")));
       late(head, p.late);
       row.appendChild(head);
       // le réel d'une fiche court jusqu'à aujourd'hui tant que tout n'est pas livré
-      var pr = {debut: p.real.debut, livree: p.progress === 1 ? p.real.livree : null};
+      var pr = {debut: p.real.debut, livree: doneShare(p) === 1 ? p.real.livree : null};
       row.appendChild(track(planBars(p.planned, pr, false)));
       var det = el("div", "rm-detail", planned(p.planned));
       source(det, p.source);
@@ -1731,6 +1739,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       var reached = ["demandee", "debut", "soumise", "verdict", "livree"].filter(function (k) { return x.real[k]; })
         .map(function (k) { return LBL[k] + " " + dmTs(x.real[k]); });
       var det = el("div", "rm-detail", [planned(x.planned), reached.length ? "actual: " + reached.join(", ") : "",
+        x.activation ? x.activation.label : "",
         x.estimate && x.estimate.minutes ? x.estimate.label : "", x.assignee || ""].filter(Boolean).join(" · "));
       source(det, x.source);
       if (x.commitments.length) det.appendChild(document.createTextNode(" · commitment(s) "

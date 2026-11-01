@@ -27,7 +27,7 @@ _PLAN_COLUMNS = ", ".join([
 
 _ITEM_COLUMNS = ", ".join([
     "w.id", "w.title", "w.state", "w.app", "w.workstream", "w.assignee", "w.package_id",
-    "w.body",
+    "w.body", "w.external_executor", "w.close_reason",
     "extract(epoch from w.created_at)::float8 AS created_ts",
     "extract(epoch from w.updated_at)::float8 AS updated_ts",
     "extract(epoch from w.closed_at)::float8 AS closed_ts",
