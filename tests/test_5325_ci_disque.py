@@ -148,6 +148,36 @@ class DuTest(unittest.TestCase):
         self.assertEqual(tailles["cache pip"], 100)
 
 
+class VerrouTest(unittest.TestCase):
+    """Le verrou ne vit pas dans un arbre que le ménage supprime (B/P2 cx1)."""
+
+    def test_le_verrou_est_dans_le_home_du_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            (home / "r1").mkdir()
+            with mock.patch.object(disque, "_racine_runner", return_value=home / "r1"):
+                dossier = disque._dossier_verrou()
+        self.assertEqual(dossier, home)
+        self.assertNotEqual(str(dossier), "/tmp")
+        self.assertFalse(str(dossier).startswith("/tmp/"))
+
+    def test_vieux_verrou_tenu_refuse_le_second(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            premier = None
+            with mock.patch.object(disque, "_dossier_verrou",
+                                   return_value=pathlib.Path(tmp)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                premier = disque._verrou()
+                self.assertIsNotNone(premier)
+                chemin = pathlib.Path(tmp) / (".ameesh-ci-disque-%s.lock" % os.getuid())
+                os.utime(chemin, (100, 100))  # « vieux » ne libère rien
+                self.assertIsNone(disque._verrou())  # même inode tenu : refusé
+                premier.close()
+                troisieme = disque._verrou()
+                self.assertIsNotNone(troisieme)
+                troisieme.close()
+
+
 class MenageTest(unittest.TestCase):
     """Hors CI rien ne part ; en CI, seules les commandes bornées partent."""
 
@@ -219,19 +249,47 @@ class MenageTest(unittest.TestCase):
         sortie = self._menage(["--dry-run", "--images-inutilisees"])
         self.assertIn("+ docker image prune -a", sortie)
 
-    def test_fichiers_anciens_efface_et_mesure(self):
+    def test_fichiers_anciens_se_lit_au_ctime_pas_au_mtime(self):
+        # avis auditeur B/P2 : la suite antidate des mtime sous TMPDIR=/tmp
+        # (os.utime(…, (100, 100))) ; un ménage au mtime supprimerait un
+        # fichier d'un test en cours sur la même VM.
         with tempfile.TemporaryDirectory() as tmp:
-            vieux = pathlib.Path(tmp) / "vieux.log"
-            recent = pathlib.Path(tmp) / "recent.log"
-            vieux.write_text("x" * 1024, encoding="utf-8")
-            recent.write_text("y", encoding="utf-8")
-            cinq_jours = 5 * 24 * 3600
-            os.utime(vieux, (0, 1_700_000_000 - cinq_jours))
-            resultat = disque._fichiers_anciens([pathlib.Path(tmp)], jours=2, dry_run=False)
-            self.assertFalse(vieux.exists())
-            self.assertTrue(recent.exists())
-            self.assertEqual(resultat["fichiers"], 1)
-            self.assertEqual(resultat["octets"], 1024)
+            antidate = pathlib.Path(tmp) / "antidate.log"
+            antidate.write_text("x" * 1024, encoding="utf-8")
+            os.utime(antidate, (100, 100))       # mtime 1970, ctime maintenant
+            vus = []
+
+            def faux(cmd, timeout=120):
+                vus.append(cmd)
+                return 0, "", ""
+
+            with mock.patch.object(disque, "commande", side_effect=faux):
+                resultat = disque._fichiers_anciens([pathlib.Path(tmp)], jours=2,
+                                                   dry_run=False)
+            self.assertTrue(antidate.exists())   # ctime récent : gardé
+            self.assertEqual(resultat["fichiers"], 0)
+            self.assertIn("-ctime", vus[0])
+            self.assertNotIn("-mtime", vus[0])
+
+    def test_fichiers_anciens_compte_et_efface(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fichier = pathlib.Path(tmp) / "vieux.log"
+            fichier.write_text("x" * 1024, encoding="utf-8")
+            appels = []
+
+            def faux(cmd, timeout=120):
+                appels.append(list(cmd))
+                if "-print" in cmd:
+                    return 0, str(fichier) + "\n", ""
+                return 0, "", ""
+
+            with mock.patch.object(disque, "commande", side_effect=faux):
+                resultat = disque._fichiers_anciens([pathlib.Path(tmp)], jours=2,
+                                                   dry_run=False)
+        self.assertEqual(resultat, {"fichiers": 1, "octets": 1024})
+        self.assertIn("-ctime", appels[0])
+        self.assertIn("-print", appels[0])
+        self.assertIn("-delete", appels[1])
 
 
 class RapportTest(unittest.TestCase):

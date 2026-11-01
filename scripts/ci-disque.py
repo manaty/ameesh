@@ -25,9 +25,10 @@ une borne d'âge supérieure au plafond d'un job (45 min) :
   jobs de tests ne enlèvent donc que les images *dangling*, pour ne pas
   re-télécharger `postgres:17` entre deux parts ;
 * cache de construction inutilisé depuis plus de 24 h ;
-* fichiers de plus de 48 h sous les `_work/_temp` des runners de l'hôte et
-  sous `/tmp` (compte `runner` seulement) ;
-* journaux `_diag` du runner de plus de 7 jours.
+* fichiers de plus de 48 h (au **ctime**, non antidatable sans root) sous les
+  `_work/_temp` des runners de l'hôte et sous `/tmp` (compte `runner`
+  seulement) ;
+* journaux `_diag` du runner de plus de 7 jours (au ctime).
 
 Rien n'est supprimé hors CI (`GITHUB_ACTIONS` absent) sans `--force` explicite.
 Les erreurs de docker ne font jamais rougir l'étape : le ménage est un confort,
@@ -65,7 +66,6 @@ AGE_IMAGES_HEURES = 24.0    # images dangling et cache de construction
 AGE_TEMP_HEURES = 48.0      # fichiers abandonnés sous _work/_temp et /tmp
 AGE_DIAG_JOURS = 7          # journaux du runner (_diag)
 AGE_INUTILISEES_HEURES = 168.0  # images sans conteneur (7 jours)
-VERROU = "/tmp/ameesh-ci-disque-%s.lock" % os.getuid()
 MAX_VOLUMES_INSPECT = 100   # par appel docker (borne la ligne de commande)
 MAX_LIGNES_DFV = 400        # `docker system df -v` : les 400 premières lignes
 
@@ -350,10 +350,33 @@ def _resume(texte: str) -> None:
 # ménage
 # --------------------------------------------------------------------------
 
+def _dossier_verrou() -> Path | None:
+    """Le home du runner, jamais un arbre que ce script supprime.
+
+    Le verrou a vécu dans /tmp (#5325, avis ameesh-cx1 B/P2) : au bout de
+    trois jours, `_tmp` le supprimait pendant qu'un job le tenait, et un
+    second job créait un autre inode puis verrouillait en parallèle. Le home
+    du runner n'est touché par aucune étape du ménage.
+    """
+    racine = _racine_runner()
+    if racine is not None:
+        return racine.parent
+    try:
+        home = Path(os.path.expanduser("~"))
+    except (KeyError, RuntimeError):
+        return None
+    return home if str(home) not in ("", "/") else None
+
+
 def _verrou():
     """Verrou par hôte : huit runners partagent le démon docker ; un seul élague."""
+    dossier = _dossier_verrou()
+    if dossier is None:
+        print("ménage : aucun dossier persistant pour le verrou, rien n'est supprimé")
+        return None
     try:
-        fichier = open(VERROU, "a+", encoding="utf-8")
+        fichier = open(dossier / (".ameesh-ci-disque-%s.lock" % os.getuid()),
+                       "a+", encoding="utf-8")
     except OSError as erreur:
         print("ménage : verrou illisible (%s), rien n'est supprimé" % erreur)
         return None
@@ -464,7 +487,14 @@ def _cache_build(dry_run: bool) -> dict:
 
 
 def _fichiers_anciens(dossiers, jours: int, dry_run: bool, user: int | None = None) -> dict:
-    """Fichiers d'un dossier plus vieux que `jours` jours : mesurés, puis effacés."""
+    """Fichiers d'un dossier plus vieux que `jours` jours : mesurés, puis effacés.
+
+    L'âge est le **ctime**, pas le mtime : un créateur antidate un mtime quand
+    il veut (la suite ameesh le fait sous `TMPDIR=/tmp`, `os.utime(…, (100,
+    100))` dans test_1190 et les lots 73/219/3277), et un autre job de la même
+    VM supprimerait alors un fichier en cours de test (#5325, avis auditeur
+    B/P2). Le ctime ne se change pas sans root.
+    """
     total = trouve = 0
     for dossier in dossiers:
         if not dossier.is_dir():
@@ -472,7 +502,7 @@ def _fichiers_anciens(dossiers, jours: int, dry_run: bool, user: int | None = No
         commun = [str(dossier), "-xdev", "-mindepth", "1"]
         if user is not None:
             commun += ["-user", str(user)]
-        code, sortie, _ = commande(["find", *commun, "-mtime", "+%d" % jours,
+        code, sortie, _ = commande(["find", *commun, "-ctime", "+%d" % jours,
                                     "-print"], timeout=120)
         if code != 0:
             continue
@@ -489,9 +519,9 @@ def _fichiers_anciens(dossiers, jours: int, dry_run: bool, user: int | None = No
         total += octets
         trouve += fichiers
         if dry_run:
-            print("+ find %s -mtime +%d -delete  (%d fichier(s))" % (dossier, jours, fichiers))
+            print("+ find %s -ctime +%d -delete  (%d fichier(s))" % (dossier, jours, fichiers))
         else:
-            commande(["find", *commun, "-mtime", "+%d" % jours, "-delete"], timeout=120)
+            commande(["find", *commun, "-ctime", "+%d" % jours, "-delete"], timeout=120)
     return {"fichiers": trouve, "octets": 0 if dry_run else total}
 
 
