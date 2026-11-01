@@ -1050,8 +1050,9 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       box.appendChild(dl([["date", ms.date || "no date"], ["owner", ms.responsible],
                           ["state", ms.status], ["canon", ms.canon_ref],
                           ["progress", ms.lots_merged + "/" + counted + " " + W().abbreviation + " merged"
+                            + (ms.lots_waiting_activation ? ", " + ms.lots_waiting_activation + " not active yet" : "")
                             + (ms.progress !== null && ms.progress !== undefined ? " (" + Math.round(ms.progress * 100) + "%)" : "")]]));
-      box.appendChild(bar(ms.progress, Math.round((ms.progress || 0) * 100) + "% merged"));
+      box.appendChild(bar(ms.progress, Math.round((ms.progress || 0) * 100) + "% done (active)"));
       var epics = (D.epics || []).filter(function (e) { return e.milestone === id; });
       if (epics.length) section(box, "Epics");
       epics.forEach(function (e) {
@@ -1709,7 +1710,8 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", p.id));
       head.appendChild(el("span", "t", p.title));
-      if (p.units_total) head.appendChild(el("span", "meta", p.units_delivered + "/" + p.units_total + " delivered"));
+      if (p.units_total) head.appendChild(el("span", "meta", p.units_delivered + "/" + p.units_total + " delivered"
+        + (p.units_waiting_activation ? ", " + p.units_waiting_activation + " not active yet" : "")));
       late(head, p.late);
       row.appendChild(head);
       // le réel d'une fiche court jusqu'à aujourd'hui tant que tout n'est pas livré
@@ -1731,6 +1733,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       var reached = ["demandee", "debut", "soumise", "verdict", "livree"].filter(function (k) { return x.real[k]; })
         .map(function (k) { return LBL[k] + " " + dmTs(x.real[k]); });
       var det = el("div", "rm-detail", [planned(x.planned), reached.length ? "actual: " + reached.join(", ") : "",
+        x.activation ? x.activation.label : "",
         x.estimate && x.estimate.minutes ? x.estimate.label : "", x.assignee || ""].filter(Boolean).join(" · "));
       source(det, x.source);
       if (x.commitments.length) det.appendChild(document.createTextNode(" · commitment(s) "

@@ -78,21 +78,51 @@ def package_status(items: list[dict]) -> str:
     return "open"
 
 
+def _activated_unit(item: dict, activation: dict | None) -> str:
+    """#5244 : l'unité d'un lot une fois l'étape d'activation connue : `active`
+    (compte comme fait, preuve ou reçu), `unmeasured` (compte, sans mesure
+    possible), `waiting` (livré, pas encore activé) ; sinon comme avant."""
+    entry = (activation or {}).get(int(item["id"]))
+    if not entry or entry["step"] in ("open", "abandoned"):
+        return item_unit_status(item.get("state") or "", item.get("close_reason"))
+    if not entry["counted"]:
+        return "waiting"
+    return "unmeasured" if entry["step"] == "unmeasured" else "active"
+
+
+def _activated_package(items: list[dict], activation: dict | None) -> str:
+    """L'unité d'une fiche `lot` : son lot le moins avancé la retient."""
+    if not items:
+        return "pending"
+    units = {_activated_unit(i, activation) for i in items} - {"abandoned"}
+    for unit in ("open", "waiting", "merged", "unmeasured", "active"):
+        if unit in units:
+            return unit
+    return "abandoned"
+
+
 def _tally(units: list[str]) -> dict:
-    merged = units.count("merged")
+    waiting = units.count("waiting")
+    active = units.count("active")
+    merged = units.count("merged") + active + waiting + units.count("unmeasured")
     abandoned = units.count("abandoned")
     counted = len(units) - abandoned
     return {"lots_total": len(units), "lots_merged": merged, "lots_abandoned": abandoned,
             "lots_open": units.count("open"), "lots_pending": units.count("pending"),
-            "progress": round(merged / counted, 4) if counted else None}
+            "lots_active": active, "lots_waiting_activation": waiting,
+            "lots_unmeasured": units.count("unmeasured"),
+            "progress": round((merged - waiting) / counted, 4) if counted else None}
 
 
-def summarize(packages: Iterable[dict], items: Iterable[dict]) -> dict:
+def summarize(packages: Iterable[dict], items: Iterable[dict],
+              activation: dict | None = None) -> dict:
     """Epics et jalons du plan, avec leur progression.
 
     `packages` : fiches (id, kind, title, parent, responsible, status…) ;
     `items` : lots rattachés (id, package_id, state). Rend
     `{"epics": [...], "milestones": [...], "lots": {id_fiche: statut}}`.
+    #5244 : avec `activation` (`activation.compute`), `progress` ne compte
+    que les lots activés ; `lots_merged` reste le décompte de la fusion.
     """
     by_id = {p["id"]: p for p in packages}
     by_package: dict = {}
@@ -108,8 +138,8 @@ def summarize(packages: Iterable[dict], items: Iterable[dict]) -> dict:
                             and by_id[root]["kind"] == "milestone"
                             and milestone_of(p["id"], by_id) == root]
         direct = [i for h in holders for i in by_package.get(h, [])]
-        statuses = [lot_status[p["id"]] for p in lots] + [
-            item_unit_status(i.get("state") or "", i.get("close_reason")) for i in direct]
+        statuses = [_activated_package(by_package.get(p["id"], []), activation)
+                    for p in lots] + [_activated_unit(i, activation) for i in direct]
         return lots, direct, statuses
 
     epics = []

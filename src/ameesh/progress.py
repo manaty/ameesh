@@ -69,6 +69,7 @@ from typing import Iterable
 
 from . import work_lifecycle as lifecycle
 from .modules import registry
+from . import activation
 from . import config as config_mod
 from . import cost as cost_mod
 from . import db as db_mod
@@ -981,7 +982,8 @@ def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict
             "spend_24h_usd": round(float(p.get("usd_24h") or 0.0), 2),
             "decisions_pending": sum(1 for d in decisions if d.get("project") == name),
             "milestone": ({k: ms.get(k) for k in ("id", "title", "date", "progress",
-                                                  "lots_merged", "lots_total")}
+                                                  "lots_merged", "lots_total", "lots_active",
+                                                  "lots_waiting_activation")}
                           if ms else None),
             "warnings": list(p.get("warnings") or []),
         })
@@ -1119,7 +1121,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     items, lots = view["items"], view["lots"]
     packages, package_rows = view["packages"], view["package_rows"]
     package_items = st.package_items()
-    plan = plan_mod.summarize(package_rows, package_items)
+    plan = plan_mod.summarize(package_rows, package_items,
+                              activation.compute(db, package_items, cfg=cfg))
     action_rows = st.actions(since_ts=since_ts, project=project, limit=max_actions)
     truncated = {}
     for key, rows, limit in (("lots", items, max_lots), ("actions", action_rows, max_actions)):
@@ -1402,8 +1405,10 @@ def format_text(snap: dict, width: int | None = None) -> str:
         line("EPICS (%d)" % len(epics))
         for epic in epics:
             counted = epic["lots_total"] - epic["lots_abandoned"]
-            line("%s — %s: %d/%d %s merged%s" % (
+            line("%s — %s: %d/%d %s merged%s%s" % (
                 epic["id"], epic["title"], epic["lots_merged"], counted, words.plural,
+                ", %d not active yet" % epic["lots_waiting_activation"]
+                if epic.get("lots_waiting_activation") else "",
                 " (%d abandoned)" % epic["lots_abandoned"] if epic["lots_abandoned"] else ""),
                 "  ")
 
@@ -1437,9 +1442,10 @@ def format_text(snap: dict, width: int | None = None) -> str:
     if snap["milestones"]:
         line("MILESTONES (%d)" % len(snap["milestones"]))
         for ms in snap["milestones"]:
-            progress = ("%d/%d %s merged" % (
+            progress = ("%d/%d %s merged%s" % (
                 ms["lots_merged"], ms["lots_total"] - ms.get("lots_abandoned", 0),
-                words.plural)
+                words.plural, ", %d not active yet" % ms["lots_waiting_activation"]
+                if ms.get("lots_waiting_activation") else "")
                 if "lots_total" in ms else "")
             line("%s %s%s" % (ms["date"] if ms.get("date") else "no date",
                               ms.get("title", ""), " — %s" % progress if progress else ""), "  ")

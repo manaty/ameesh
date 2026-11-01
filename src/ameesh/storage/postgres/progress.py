@@ -151,7 +151,7 @@ class Progress(interface.Progress):
 
     def package_items(self) -> list[dict]:
         return self.db.query(
-            "SELECT id, package_id, state, close_reason, app,"
+            "SELECT id, package_id, state, close_reason, app, workstream, external_executor,"
             "       extract(epoch from updated_at)::float8 AS updated_ts"
             "  FROM work_items WHERE package_id IS NOT NULL ORDER BY id")
 

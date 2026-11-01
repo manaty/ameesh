@@ -171,6 +171,20 @@ class Decisions(interface.Decisions):
             " AND btrim(work_item_id) = %%s ORDER BY id" % (_COLUMNS, _IS_DECISION),
             (str(lot).strip(),))
 
+    def signed_for_lots(self, lots) -> dict:
+        """#5244: `{lot: latest decision with a signed answer}`. The channel is
+        only written once `decisions` has verified the signature."""
+        keys = [str(int(lot)) for lot in lots]
+        if not keys:
+            return {}
+        rows = self.db.query(
+            "SELECT id, btrim(work_item_id) AS lot FROM agent_mailbox WHERE %s"
+            " AND btrim(work_item_id) = ANY(%%s)"
+            " AND payload -> 'decision' ->> 'state' = 'answered'"
+            " AND payload -> 'decision' -> 'answer' ->> 'channel' = 'signed'"
+            " ORDER BY id" % _IS_DECISION, (keys,))
+        return {int(r["lot"]): int(r["id"]) for r in rows}
+
     def supersession(self, decision_id):
         # #4995: append-only evidence, read by the authority gate; the
         # mutable payload marker is only a cache.
