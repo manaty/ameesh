@@ -995,7 +995,7 @@ class Relay:
                         cum_cached_input_tokens=None, cum_output_tokens=None,
                         source="relay", executor=row["executor"],
                         lease_owner=row["lease_owner"], lease_epoch=row["lease_epoch"],
-                        turn_id=row.get("turn_id"))
+                        turn_id=row.get("turn_id"), relay_call_id=row.get("relay_request"))
                     if row.get("relay_request"):
                         tx.execute("update tranche_relay_requests set state = 'recorded',"
                                    " recorded_at = clock_timestamp() where id = %s and turn_id = %s",

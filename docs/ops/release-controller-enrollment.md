@@ -379,8 +379,12 @@ effectif du contrôleur doit donc placer `/usr/lib/postgresql/17/bin` en tête,
 et le reçu doit relever les chemins résolus et leurs versions, ainsi que
 les versions des deux serveurs. Vérifier avant qualification :
 `source_major <= pg_dump_major <= cible_major` et
-`pg_restore_major >= pg_dump_major`. Une garde automatique avant dump est
-suivie dans le panier #5169 ; elle n'est pas livrée dans ce dossier.
+`pg_restore_major >= pg_dump_major`. La garde automatique de ces majors est
+livrée par #5189 (`docs/L232B-PRIVATE-BACKUPS.md`) : `dump` et `snapshot-dump`
+refusent avant de démarrer un `pg_dump` plus ancien que le serveur source ou
+un `pg_restore` plus ancien que `pg_dump` ; `verify-restore` refuse en plus une
+archive ou un `pg_restore` plus récents que le serveur cible. Elle ne dispense
+pas du relevé dans le reçu.
 
 Le cluster n'écoute sur aucun port TCP
 (`listen_addresses = ''`) et le DSN du socket n'indique aucun port. Le producteur root tourne toutes les 60 s
