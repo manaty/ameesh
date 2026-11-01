@@ -1047,9 +1047,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     # arête levée reste dans le graphe avec `blocking` faux et sa date
     # (`satisfied_ts`) : si elle suit le GO, l'horloge part de là, le porteur
     # ne paie pas l'attente d'un autre lot. Une arête non bloquante sans date
-    # ne retient ni ne décale rien.
-    blocking_deps = [edge for edge in dependencies or () if edge.get("blocking")]
-    dep_open = any(edge.get("satisfied_ts") is None for edge in blocking_deps)
+    # ne retient ni ne décale rien. `blocking`, lu sur l'état courant, reste la
+    # vérité de l'attente : un bloqueur `merged` à tort, revenu en `build`,
+    # garde son ancien jalon sans être levé.
+    dep_open = any(edge.get("blocking") for edge in dependencies or ())
     dep_ready = max((float(edge["satisfied_ts"])
                      for edge in dependencies or ()
                      if edge.get("satisfied_ts") is not None), default=None)

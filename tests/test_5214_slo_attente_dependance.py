@@ -105,6 +105,12 @@ class DependanceBloquanteTest(unittest.TestCase):
                      ci_green_ts=T0 + 120)
         self.assertEqual(_step(rows, "verdict_merge"), [])
 
+    def test_un_bloqueur_revenu_en_build_retient_malgre_son_ancien_jalon(self):
+        # `merged` à tort corrigé en `build` : le jalon reste, le lot bloque.
+        rows = _rows(dependencies=[_edge(satisfied=GO - 60)])
+        self.assertEqual(_step(rows, "verdict_merge"), [])
+        self.assertEqual(slo.breaches(rows), [])
+
     def test_une_fusion_deja_faite_garde_sa_duree_reelle(self):
         merged = T0 + DEP_MERGE + 81.0
         rows = _rows(dependencies=[_edge(blocking=False, satisfied=DEP_MERGE)],
@@ -112,10 +118,6 @@ class DependanceBloquanteTest(unittest.TestCase):
         row = _step(rows, "verdict_merge")[0]
         self.assertEqual(row["done_ts"], merged)
         self.assertEqual(row["elapsed_s"], int(merged - (T0 + GO)))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RejeuHorlogeUniqueTest(_Base):
@@ -180,3 +182,7 @@ class RejeuHorlogeUniqueTest(_Base):
         # fraîche et ce cas échouait : le rejeu ne datait pas la frontière.
         after = self.waits(recorded + grace + 1.0)
         self.assertNotIn(ident, after)
+
+
+if __name__ == "__main__":
+    unittest.main()
