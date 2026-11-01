@@ -99,3 +99,36 @@ def compose(db, legacy):
     bearer (it never reaches the legacy verifier) or accept a lease bearer
     for a sandbox agent (#5217)."""
     return RelayTokens(db, legacy)
+
+
+#: turns whose token digests may be purged, with the closed timestamp that bounds
+#: their retention. `expired`/`lost` may have no `completed_at`: the deadline is
+#: then the bound that matters (the bearer was useless after it).
+_TERMINAL_STATES = ('succeeded', 'failed', 'cancelled', 'expired', 'lost')
+
+
+def purge(db, *, days, limit: int = 1000) -> int:
+    """Delete the token digests of turns closed for longer than `days` (#5217).
+
+    A digest is useless once its turn is closed (`Tokens` re-checks the turn
+    and its deadline), so only the digest goes: the turn, its result and its
+    recorded costs stay. Bounded batch per pass; `days` is the retention in
+    days and must be positive (0 = keep forever is handled by the caller).
+    The age is measured on the DATABASE clock."""
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+        raise ValueError('retention days must be a positive integer')
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError('purge limit must be a positive integer')
+    states = "'" + "','".join(_TERMINAL_STATES) + "'"
+    with db.transaction() as tx:
+        rows = tx.query(
+            'delete from sandbox_relay_tokens t'
+            ' where t.token_sha256 in ('
+            '   select t2.token_sha256 from sandbox_relay_tokens t2'
+            '   join sandbox_turns s on s.turn_id = t2.turn_id'
+            '   where s.state in (' + states + ')'
+            '   and coalesce(s.completed_at, s.deadline_ts)'
+            '       < clock_timestamp() - make_interval(days => %s)'
+            '   order by t2.token_sha256 limit %s)'
+            ' returning t.token_sha256', (int(days), int(limit)))
+        return len(rows)

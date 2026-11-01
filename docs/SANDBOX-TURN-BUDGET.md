@@ -67,6 +67,12 @@ cannot replace a sandbox bearer. A previously admitted sandbox agent refuses
 local fallback when its canon cannot be read; the admission trace survives a
 runner restart. These paths do not activate any sandbox card.
 
+A closed turn cannot authenticate its bearer any more: the stored digest is
+only a proof of issuance. The runner's daily housekeeping deletes the digests
+of turns closed for longer than `sandbox_token_retention_days` days (default
+30, `AMEESH_SANDBOX_TOKEN_RETENTION_DAYS`; 0 = never purged), in bounded
+batches. The turn row, its result and its costs stay (migration 0530, #5217).
+
 Each sandbox provider request has a durable id before the side effect. That id
 is written as `turn_costs.relay_call_id`; a unique `(turn_id, relay_call_id)`
 index for relay rows deduplicates ledger retries. Relay rows keep `spend_key`
