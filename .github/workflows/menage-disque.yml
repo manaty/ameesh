@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #5325 — ménage dédié du disque des VM de runners de la CI.
+#
+# Les jobs de tests élaguent déjà à chaque part ce qui n'est plus utilisé
+# (images dangling, conteneurs arrêtés, volumes anonymes, `_temp`, `/tmp`,
+# `_diag` : voir `disque_rapport`/`disque_menage` dans tests.yml). Ce ménage
+# dédié, lui, enlève en plus les images SANS conteneur de plus de 7 jours
+# (`--images-inutilisees`) : les images de construction (`rust`, `node`,
+# `ubuntu`, `postgres:16`) dorment des semaines sur les VM et pèsent 3 à 4 GiB
+# par hôte. Il est séparé des tests parce que `image prune -a` peut retirer
+# `postgres:17` quand aucun conteneur ne tourne : le job suivant le
+# re-téléchargerait en plein milieu d'une suite, ce qu'un job de tests ne doit
+# pas provoquer.
+#
+# Une passe quotidienne, hors des coupures de release (11:00 et 23:00
+# Europe/Paris, canon §11 bis) et hors des nocturnes (psql 01:47, macOS 03:17,
+# carte 03:30 UTC) : 05:23 UTC. Six jobs, un par runner libre ; les huit
+# runners d'une VM partagent le démon docker, le verrou du script évite deux
+# élagueurs simultanés sur le même hôte. `workflow_dispatch` : la même passe
+# à la main quand un disque approche du seuil.
+name: menage disque runners
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: menage-disque-runners
+  cancel-in-progress: false
+
+jobs:
+  menage:
+    name: ménage disque ${{ matrix.slot }}
+    runs-on: ["self-hosted", "linux", "ameesh-ci"]
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - name: rapport complet avant ménage (#5325)
+        continue-on-error: true
+        run: python3 scripts/ci-disque.py rapport --complet
+      - name: ménage dédié (#5325)
+        continue-on-error: true
+        run: python3 scripts/ci-disque.py menage --images-inutilisees
+      - name: rapport après ménage (#5325)
+        continue-on-error: true
+        run: python3 scripts/ci-disque.py rapport

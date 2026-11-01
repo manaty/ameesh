@@ -366,6 +366,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # the map commit, and whether it is an ancestor
+      # #5325 — le disque de la VM, mesuré depuis le job : seul accès, le poste
+      # a root sur les VM et le bureau non. Rapport seul ici (le ménage est
+      # dans les jobs de tests, qui écrivent le plus) ; `continue-on-error` :
+      # un rapport raté n'est jamais un verdict, et sous le seuil l'étape
+      # publie une annotation `::warning::` et le résumé du job.
+      - &disque_rapport
+        name: disque de l'hôte (#5325)
+        if: runner.environment == 'self-hosted'
+        continue-on-error: true
+        run: python3 scripts/ci-disque.py rapport
       # #1343 : la demande de gel est une étiquette `ci-lot-<40hex>` ou
       # `ci-full-<40hex>` posée sur la PR par `ameesh ci run`. La porte vérifie,
       # avant tout plan et sans exécuter un test : l'étiquette (motif exact,
@@ -634,6 +644,7 @@ jobs:
         name: début du job (mesure du plafond, #899)
         run: echo "AMEESH_JOB_DEBUT=$(date -u +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+      - *disque_rapport
       # #3581 : le témoin du pont JS (#3529) appelle `node`, absent du PATH de
       # certains runners du pool (FileNotFoundError node, psql 7/16 et psycopg
       # 3/8). Le correctif de paquet 6fdfefdde faisait sauter le témoin quand
@@ -825,6 +836,20 @@ jobs:
           path: ${{ runner.temp }}/flux.jsonl
           if-no-files-found: ignore
           retention-days: 1  # read by bilan in the same run; 8 400 artifacts filled the org quota (13/10)
+      # #5325 — ménage sans root du disque de la VM, à toute issue (un job
+      # annulé laisse ses conteneurs et ses fichiers). L'âge borne chaque
+      # famille bien au-delà du plafond de 45 min d'une part : conteneurs
+      # arrêtés et volumes anonymes de plus de 6 h, images dangling et cache
+      # de construction de plus de 24 h, images sans conteneur de plus de
+      # 7 jours, `_temp` et /tmp du runner de plus de 48 h, journaux `_diag`
+      # de plus de 7 jours ; un volume nommé n'est jamais supprimé.
+      # `continue-on-error` : un ménage raté n'est jamais un verdict, le
+      # rapport d'alerte est dans `disque_rapport`.
+      - &disque_menage
+        name: ménage du disque de l'hôte (#5325)
+        if: always() && runner.environment == 'self-hosted'
+        continue-on-error: true
+        run: python3 scripts/ci-disque.py menage
 
   psql:
     name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
@@ -875,6 +900,7 @@ jobs:
     steps:
       - *debut
       - uses: actions/checkout@v4
+      - *disque_rapport
       - *node_bridge
       - *node_witness
       - *dsn
@@ -910,6 +936,7 @@ jobs:
           path: ${{ runner.temp }}/flux.jsonl
           if-no-files-found: ignore
           retention-days: 1  # read by bilan in the same run; 8 400 artifacts filled the org quota (13/10)
+      - *disque_menage
 
   # #748 : la suite rejouée sur une AUTRE classe de système de fichiers que
   # celle du défaut du runner (tmpfs ↔ disque), à la release seulement. Un test
@@ -959,6 +986,7 @@ jobs:
     steps:
       - *debut
       - uses: actions/checkout@v4
+      - *disque_rapport
       - *node_bridge
       - *node_witness
       - *dsn
@@ -1060,6 +1088,7 @@ jobs:
           case "${TMPDIR:-}" in
             /dev/shm/ameesh-autre-fs-*|*/ameesh-autre-fs) rm -rf -- "$TMPDIR" ;;
           esac
+      - *disque_menage
 
   # L63 : la couche plateforme (ameesh.platform) et son lint, sous macOS avec
   # psutil. Sous Linux, les parts psycopg passent par psutil et les parts psql

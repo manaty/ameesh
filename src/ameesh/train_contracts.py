@@ -76,7 +76,7 @@ def ameesh() -> tuple[Workflow, ...]:
         event="push",
         called=".github/workflows/tests.yml",
         sources=((".github/workflows/paquet.yml", "0d4e4c9cae703575b33aa393d6a1c95a81e5c896"),
-                 (".github/workflows/tests.yml", "c8b5ca77a253c41ebc869081fee7618382dcefd3"),
+                 (".github/workflows/tests.yml", "81a8e4c04dcfcb52af9eb31eb6014f6abfaea7c5"),
                  ("scripts/test-plan.py", "2dbcecd40110f3a10f3551c312779cbefb03bb3c"),
                  ("scripts/test-parts.py", "f5a86e090e97e945b52f77fba344828394635d2a"),
                  ("scripts/ci-flow.py", "c81e4aff4fcaf1b9ec9a75ba987b3beba50258c2"),
