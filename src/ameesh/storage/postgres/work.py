@@ -871,16 +871,27 @@ class WorkItems(interface.WorkItems):
 
     def items(self, *, state, assignee, limit) -> list[dict]:
         # L61 : lecture de `reviewer` sans sonde, cette commande est bornée
-        sql = "SELECT %s FROM work_items WHERE true" % item_columns(self.db, "work_items")
+        where = " WHERE true"
         params: list = []
         if state:
-            sql += (" AND coalesce(to_jsonb(work_items)->>'legacy_state', state) = %s"
-                    if state in ("merged", "promoted") else " AND state = %s")
+            where += (" AND coalesce(to_jsonb(work_items)->>'legacy_state', state) = %s"
+                      if state in ("merged", "promoted") else " AND state = %s")
             params.append(state)
         if assignee:
-            sql += " AND assignee = %s"
+            where += " AND assignee = %s"
             params.append(assignee)
-        sql += " ORDER BY updated_at DESC LIMIT %s"
+        # #5347 : `sync-merges` lit 1 000 lots et `to_jsonb(work_items)` était
+        # recopié six fois par ligne lue — sur les 5 230 lignes du tas, la
+        # lecture dépassait le `statement_timeout` (30 s) avant même
+        # `_PACKET_SELECT`. Une seule conversion par ligne rendue (`j.doc`),
+        # sur les lignes déjà bornées : la sous-requête interne trie et coupe
+        # sans expressions coûteuses, `OFFSET 0` empêche le planificateur de
+        # remonter le latéral (l'appel serait recopié à chaque référence).
+        sql = ("SELECT %s FROM (SELECT * FROM work_items%s"
+               " ORDER BY updated_at DESC LIMIT %%s) work_items"
+               " CROSS JOIN LATERAL (SELECT to_jsonb(work_items) AS doc OFFSET 0) j"
+               " ORDER BY work_items.updated_at DESC"
+               % (item_columns(self.db, "work_items", row_json="j.doc"), where))
         params.append(None if limit is None else int(limit))
         return self.db.query(sql, tuple(params))
 
@@ -3457,24 +3468,38 @@ class WorkItems(interface.WorkItems):
             (package_id,))
 
     # -- paquet de composition (#2443) ---------------------------------------
+    #: les jalons du porteur (#5347) : calculés une fois par porteur distinct,
+    #: pas une fois par ligne de membre. Les deux sous-requêtes corrélées
+    #: s'exécutaient 2 × 653 fois (porteurs répétés) sur les 1 000 lots de
+    #: `sync-merges` ; elles coûtaient à elles seules l'essentiel de la lecture.
+    #: Chaque sous-requête garde l'index (work_item_id, at) et son LIMIT 1 :
+    #: le plan reste des sondes d'index, indépendant de la taille du tas.
+    _PACKET_HEADS = (
+        "carrier AS (SELECT DISTINCT package_id FROM member),"
+        " heads AS (SELECT c.package_id,"
+        "       (SELECT ms.sha FROM work_item_milestones ms"
+        "         WHERE ms.work_item_id = c.package_id AND ms.kind = 'merged'"
+        "           AND ms.sha <> ''"
+        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_merged_sha,"
+        # #3634 : la tête gelée du porteur, sans filtre sur son sha : le
+        # dernier gel fait autorité, même s'il ne nomme aucun commit.
+        "       (SELECT ms.sha FROM work_item_milestones ms"
+        "         WHERE ms.work_item_id = c.package_id AND ms.kind = 'frozen'"
+        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_frozen_sha"
+        "   FROM carrier c)"
+    )
+
     #: la lecture commune aux deux méthodes : l'appartenance, le porteur et
-    #: ses jalons de fusion et de gel, en une requête.
+    #: ses jalons de fusion et de gel, en une requête (sur `member`/`heads`).
     _PACKET_SELECT = (
         "SELECT m.package_id, m.work_item_id, m.package_branch, m.base_sha,"
         "       m.head_sha, m.unit_sha, m.source_sha, m.frozen_sha,"
         "       m.recorded_by, extract(epoch from m.recorded_at)::float8 AS recorded_ts,"
         "       p.state AS package_state, p.branch AS carrier_branch,"
         "       p.branch_target AS package_target,"
-        "       (SELECT ms.sha FROM work_item_milestones ms"
-        "         WHERE ms.work_item_id = m.package_id AND ms.kind = 'merged'"
-        "           AND ms.sha <> ''"
-        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_merged_sha,"
-        # #3634 : la tête gelée du porteur, sans filtre sur son sha : le
-        # dernier gel fait autorité, même s'il ne nomme aucun commit.
-        "       (SELECT ms.sha FROM work_item_milestones ms"
-        "         WHERE ms.work_item_id = m.package_id AND ms.kind = 'frozen'"
-        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_frozen_sha"
-        "  FROM work_packet_members m JOIN work_items p ON p.id = m.package_id"
+        "       h.package_merged_sha, h.package_frozen_sha"
+        "  FROM member m JOIN work_items p ON p.id = m.package_id"
+        "  LEFT JOIN heads h ON h.package_id = m.package_id"
     )
 
     def record_packet(self, package_id, *, branch, base_sha, head_sha, units, note,
@@ -3554,7 +3579,8 @@ class WorkItems(interface.WorkItems):
             params.extend(ids)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         return self.db.query(
-            self._PACKET_SELECT + clause
+            "WITH member AS (SELECT m.* FROM work_packet_members m" + clause + "),"
+            + self._PACKET_HEADS + " " + self._PACKET_SELECT
             + " ORDER BY m.recorded_at DESC, m.package_id DESC, m.work_item_id",
             tuple(params))
 
