@@ -796,14 +796,28 @@ def _verdict_on_head(verdict: dict, freeze: dict, freeze_sha: str,
 
 
 def blocking_review(milestones: list[dict], freeze: dict | None) -> dict | None:
-    """L'avis `blocked` du dernier gel sans gel plus récent (calcul de #3288)."""
+    """L'avis `blocked` encore valable du dernier gel (repli sans base).
+
+    #5328 : le **dernier verdict de chaque acteur** sur la tête tranche, comme
+    le calcul unique de #3288 : un `ok` postérieur du même relecteur annule
+    son blocage. La lecture réelle du débit passe par
+    `review_designation_activation.due_fixes` (`read`) ; ce repli ne sert
+    qu'aux témoins sans base."""
     if freeze is None:
         return None
     freeze_at = float(freeze.get("at_ts") or 0.0)
     freeze_sha = str(freeze.get("sha") or "").strip()
-    blocked = [m for m in milestones
-               if m.get("kind") == "verdict" and m.get("verdict") == "blocked"
-               and _verdict_on_head(m, freeze, freeze_sha, freeze_at)]
+    last: dict[str, dict] = {}
+    on_head = sorted(
+        (m for m in milestones
+         if m.get("kind") == "verdict"
+         and _verdict_on_head(m, freeze, freeze_sha, freeze_at)),
+        key=lambda m: (float(m.get("at_ts") or 0.0), int(m.get("id") or 0)))
+    for milestone in on_head:
+        actor = _norm(milestone.get("actor"))
+        if actor:
+            last[actor] = milestone
+    blocked = [m for m in last.values() if m.get("verdict") == "blocked"]
     if not blocked:
         return None
     latest = max(blocked, key=lambda m: (float(m.get("at_ts") or 0.0),
@@ -888,6 +902,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
           holds: Mapping[int, Mapping[str, Mapping[str, Any]]] | None = None,
           closure_allowed=None,
           ci_unreadable: Iterable[str] = (),
+          fixes: Iterable[Mapping[str, Any]] | None = None,
           packets: Iterable[Mapping[str, Any]] = (),
           zone: str = "UTC") -> dict:
     """Le rapport de débit, calculé sans I/O (témoins et tests).
@@ -896,6 +911,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
     (`planned_waits.lift_authority`) : un pilote lève toute la retenue de
     fermeture, un auteur ordinaire seulement la sienne. Sans elle (appel sans
     base), une levée ne retire que la retenue de son propre auteur.
+
+    `fixes` est la lecture des corrections dues de `read`
+    (`review_designation_activation.due_fixes`, le calcul unique de #3288 que
+    `work fixes-owed` sert aussi, #5328). Fournie — même vide —, elle fait foi
+    pour les avis bloquants, la disponibilité des lots relus et les agents au
+    repos avec du travail dû : le débit ne refait pas la lecture des verdicts.
+    Sans elle (appel sans base), le repli `blocking_review` s'applique.
 
     #4235 : un hold de pilote qui déclare une **fenêtre d'observation** avec
     son échéance armée (`planned_waits.observation_hold`) est listé dans
@@ -914,6 +936,15 @@ def build(*, items: Iterable[Mapping[str, Any]],
     items = [dict(row) for row in items or ()]
     by_id = {int(row["id"]): row for row in items}
     milestones_by_lot = _rows_by_lot(milestones)
+    # #5328 : les corrections dues viennent de `due_fixes` (une seule lecture,
+    # la même que `work fixes-owed`) ; le repli sans base reste local.
+    fixes_authoritative = fixes is not None
+    fixes_by_lot: dict[int, dict] = {}
+    for row in fixes or ():
+        try:
+            fixes_by_lot[int(row["lot"])] = dict(row)
+        except (KeyError, TypeError, ValueError):
+            continue
     # Le journal n'est pas trié par `at_ts` : il porte son instant.
     events_by_lot: dict[int, list[dict]] = {}
     for row in events or ():
@@ -1019,7 +1050,16 @@ def build(*, items: Iterable[Mapping[str, Any]],
                               for text in designation["unreadable"])
             pending = [p for p in designation["pending"]
                        if _norm(p["name"]) != _norm(item.get("assignee"))]
-            blocked = blocking_review(lot_milestones, freeze)
+            if fixes_authoritative:
+                fix = fixes_by_lot.get(ident)
+                blocked = None if fix is None else {
+                    "at_ts": fix.get("blocked_ts"),
+                    "actor": fix.get("blocked_by") or None,
+                    "sha": str(fix.get("sha") or "") or None,
+                    "debtor": fix.get("name") or None,
+                }
+            else:
+                blocked = blocking_review(lot_milestones, freeze)
             age = _age(now, freeze.get("at_ts"))
             state = {
                 "lot": ident, "title": item.get("title") or "",
@@ -1039,7 +1079,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 blocked_reviews.append({
                     "lot": ident, "title": item.get("title") or "",
                     "app": item.get("app") or None,
-                    "assignee": item.get("assignee") or None,
+                    "assignee": blocked.get("debtor")
+                                  or item.get("assignee") or None,
                     "held": ident in held_lots,
                     "sha": str(blocked.get("sha") or "")[:12] or None,
                     "blocked_ts": blocked["at_ts"],
@@ -2148,6 +2189,18 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
     except Exception as exc:  # noqa: BLE001 - repli nommé, jamais un hold inventé
         unreadable.append("holds unreadable: %s" % " ".join(str(exc).split())[:200])
 
+    # #5328 : les corrections dues se lisent au calcul unique de #3288, celui
+    # que `work fixes-owed` sert aussi ; le débit ne refait pas la lecture des
+    # verdicts (un `ok` postérieur du même relecteur annule son blocage).
+    # Illisible : repli local nommé, jamais une file vide ni un faux « prêt ».
+    fixes = None
+    try:
+        from . import review_designation_activation as activation
+        fixes = activation.due_fixes(db)
+    except Exception as exc:  # noqa: BLE001 - repli nommé, jamais un faux dû
+        unreadable.append("fixes owed unreadable: %s"
+                          % " ".join(str(exc).split())[:200])
+
     # CI par job (#3198) : l'API GitHub est bornée aux runs les plus longs,
     # lue par le cache partagé de l'hôte (#848/860). Sans API ou sans run,
     # la durée par workflow reste, et l'absence est dite.
@@ -2200,7 +2253,8 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    now=now, hours=hours, wait_s=wait_s, ci_hours=ci_hours,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
                    holds=holds, closure_allowed=closure_allowed,
-                   ci_unreadable=ci_unreadable, packets=packets, zone=zone)
+                   ci_unreadable=ci_unreadable, fixes=fixes,
+                   packets=packets, zone=zone)
     annotate_candidate_causes(db, cfg, report, milestones, unreadable)
     report["capacity"] = read_capacity(db, cfg=cfg, now=now, hours=hours, turns=turns,
                                        canons=canons, unreadable=unreadable)

@@ -76,6 +76,24 @@ class ReviewDueTest(unittest.TestCase):
         self.assertGreaterEqual(due[0]["age_s"], 21 * H)
         self.assertEqual([row["lot"] for row in report["blocked_reviews"]], [3033])
 
+    def test_bloque_puis_ok_du_meme_relecteur_n_est_pas_une_correction_5328(self):
+        # #5328 : le repli sans base de `build` applique la règle de #3288 —
+        # le dernier verdict de chaque acteur sur la tête tranche. Le témoin
+        # #5307 porte un `blocked` puis un `ok` de deepseek5 sur la même tête.
+        report = run(
+            items=[item(5307, assignee="claude1")],
+            milestones=[frozen(5307, 10, T - 6 * H, sha="d" * 40),
+                        verdict(5307, 11, T - 5 * H, "deepseek5", "blocked",
+                                sha="d" * 40),
+                        verdict(5307, 12, T - 4 * H, "deepseek5", "ok",
+                                sha="d" * 40)],
+            events=[event(5307, 1, T - 6 * H, mark(5307, 10, ["deepseek5"]))],
+            agents=[{"name": "claude1", "status": "idle",
+                     "host": "ameesh-agents-2", "harness": "claude"}])
+        self.assertEqual(report["blocked_reviews"], [])
+        self.assertEqual(report["idle_agents_with_work"], [])
+        self.assertTrue([row for row in report["qa"] if row["lot"] == 5307][0]["ready"])
+
     def test_dispense_du_gel_retire_les_avis_et_le_faux_repos_3818(self):
         report = run(
             items=[item(7)], milestones=[frozen(7, 10, T - 5 * H)],
