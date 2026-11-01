@@ -1303,7 +1303,9 @@ class WorkItems(interface.WorkItems):
         L165b : n'occupent pas l'agent le lot qui attend un autre (`qa`,
         `waiting_human`, `blocked`) ni celui dont le début est prévu après
         aujourd'hui — le jour local du processus qui attribue, comme
-        `operations.listing`."""
+        `operations.listing`. #5161 : un lot en qa à correctif dû n'y entre
+        pas — il n'est plus « à démarrer » (#540), il occupe son auteur par
+        `active_lots`."""
         today = _dt.date.today().isoformat()
         self.db.query(PENDING_LOCK, (assignee,))
         rows = self.db.query(

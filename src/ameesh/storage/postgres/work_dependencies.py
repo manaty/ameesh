@@ -120,9 +120,8 @@ def wake_defers(alias: str) -> str:
     futur ; l'appelant écrit `AND NOT ` + ce prédicat.
     """
     return ("({a}.wake_at IS NOT NULL AND {a}.wake_at > clock_timestamp()"
-            " AND NOT ({a}.state = '{qa}' AND (" + freeze_due(alias) + " OR "
-            + fix_owed(alias).replace("{", "{{").replace("}", "}}")
-            + ")))").format(a=alias, qa=lifecycle.QA)
+            " AND NOT " + owed_by_assignee(alias).replace("{", "{{").replace("}", "}}")
+            + ")").format(a=alias)
 
 
 #: #5151 : `planned_source` des dates écrites par `work schedule`
@@ -136,13 +135,25 @@ def start_defers(alias: str, today: str) -> str:
     Un début après `today` (expression SQL du jour local) vaut attente, sauf
     pour un lot de priorité 1 daté par le planificateur (`SCHEDULE_SOURCE`) :
     cette date n'est qu'une projection de file, pas une attente déclarée. Une
-    date posée à la main reste une attente, même en P1. L'appelant écrit
+    date posée à la main reste une attente, même en P1. #5161 : comme pour
+    `wake_defers`, un lot en qa dont l'assigné doit le geste (gel manquant ou
+    correction due) n'est jamais écarté par sa date. L'appelant écrit
     `AND NOT ` + ce prédicat (sans `%`, sûr dans une requête paramétrée).
     """
     return ("({a}.planned_start IS NOT NULL AND {a}.planned_start > {t}"
             " AND NOT (coalesce({a}.priority, 2) = 1"
-            " AND left(coalesce({a}.planned_source, ''), {n}) = '{src}'))").format(
-                a=alias, t=today, n=len(SCHEDULE_SOURCE), src=SCHEDULE_SOURCE)
+            " AND left(coalesce({a}.planned_source, ''), {n}) = '{src}')"
+            " AND NOT " + owed_by_assignee(alias).replace("{", "{{").replace("}", "}}")
+            + ")").format(a=alias, t=today, n=len(SCHEDULE_SOURCE), src=SCHEDULE_SOURCE)
+
+
+def owed_by_assignee(alias: str) -> str:
+    """#5161 : SQL « ce lot en qa attend un geste de son assigné » — gel
+    manquant (`freeze_due`) ou correction due (`fix_owed`). Un tel lot occupe
+    son auteur et reste actionnable (#1677, #5151), malgré son état « en
+    attente d'autrui »."""
+    return ("({a}.state = '{qa}' AND (".format(a=alias, qa=lifecycle.QA)
+            + freeze_due(alias) + " OR " + fix_owed(alias) + "))")
 
 
 def not_blocking(alias: str) -> str:
