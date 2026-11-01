@@ -29,6 +29,36 @@ class MediatedSelectionTest(TestCase):
             runner_sandbox.select(self.worker)
 
 
+class IssuerUrlTest(TestCase):
+    def test_runner_resolves_relay_before_issuing(self):
+        from ameesh.runner import Runner
+        owner = object.__new__(Runner)
+        owner.db, owner.host = object(), 'host'
+        owner.runner_id, owner.mediated = 'owner', False
+        cases = (
+            ('https://configured.test/', {}, 'https://configured.test/api/exec/v1/llm'),
+            ('https://configured.test', {'AMEESH_EXEC_URL': 'https://env.test'},
+             'https://configured.test/api/exec/v1/llm'),
+            ('https://configured.test', {'AMEESH_RELAY_URL': 'https://relay.test/'},
+             'https://relay.test'),
+            ('', {'AMEESH_EXEC_URL': 'https://env.test/'},
+             'https://env.test/api/exec/v1/llm'),
+        )
+        for configured, env, expected in cases:
+            with self.subTest(configured=configured, env=env):
+                owner.cfg = NS(exec_url=configured)
+                with mock.patch.dict('os.environ', env, clear=True), \
+                        mock.patch.object(sandbox_relay, 'issue', return_value=('token', 'identity')):
+                    material = owner.sandbox_credentials_for('agent', 'owner', 7, 'turn', None)
+                self.assertEqual(material.base_url, expected)
+        owner.cfg = NS(exec_url='')
+        with mock.patch.dict('os.environ', {}, clear=True), \
+                mock.patch.object(sandbox_relay, 'issue') as issue, \
+                self.assertRaises(s1.Refusal):
+            owner.sandbox_credentials_for('agent', 'owner', 7, 'turn', None)
+        issue.assert_not_called()
+
+
 class SandboxRelayTest(PgTestCase):
     def setUp(self):
         super().setUp()
@@ -139,6 +169,7 @@ class SandboxRelayTest(PgTestCase):
         from ameesh.runner import Runner
         owner = object.__new__(Runner)
         owner.db, owner.host, owner.runner_id, owner.mediated = self.db, self.host, 'owner', False
+        owner.cfg = NS(exec_url='')
         worker = NS(runner=owner, name='agent', epoch=7)
         row = self.db.query("select * from sandbox_turns where turn_id = 'turn-key'")[0]
         with mock.patch.object(relay, 'relay_url', return_value='https://relay.example.test'):

@@ -10406,7 +10406,10 @@ class Runner:
         """Issue only admitted sandbox credentials; no ordinary lease bearer."""
         from . import relay, runner_sandbox, sandbox_relay
         from .storage.postgres.sandbox import Refusal
-        base = relay.relay_url()
+        base = relay.relay_url({
+            "AMEESH_RELAY_URL": os.environ.get("AMEESH_RELAY_URL", ""),
+            "AMEESH_EXEC_URL": self.cfg.exec_url or os.environ.get("AMEESH_EXEC_URL", ""),
+        })
         if not base or self.mediated or owner != self.runner_id:
             raise Refusal('profile-refused')
         token, identity = sandbox_relay.issue(
