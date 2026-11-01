@@ -19,7 +19,8 @@ housekeeping pass frees what a build regenerates:
   lot it names is finished: nothing rebuilds in it any more, so its
   regenerable output is only weight. And NO process of the user has its cwd,
   its executable, an open file or a mapped file inside it
-  (`platform.user_paths`, read again right before each deletion). A process
+  (`platform.user_paths`, read again right before each deletion; the
+  descriptors of the pass itself do not count, #5225). A process
   of the user that cannot be read leaves a doubt: no deletion at all for the
   pass (the dry run still lists its plan, #3195), unless its name is allowed
   by the policy (`unreadable_ok`, empty by default; logged) or it is the
