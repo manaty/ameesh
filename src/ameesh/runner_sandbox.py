@@ -91,6 +91,11 @@ def _pinned_canon(worker, matches=None):
 def _known_sandbox(worker):
     if getattr(worker, '_sandbox_declared', False):
         return True
+    # Mediated executors have no SQL access or local sandbox admission.
+    # Keep an observed declaration authoritative, but do not make their
+    # ordinary lease-based turns depend on a PostgreSQL history query.
+    if getattr(worker.db, 'driver', None) == 'mediated':
+        return False
     query = getattr(worker.db, 'query', None)
     return bool(query and query('select 1 from sandbox_turns where agent = %s limit 1',
                                 (worker.name,)))

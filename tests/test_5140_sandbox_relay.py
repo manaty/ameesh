@@ -1,12 +1,32 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Real admission, DB clock, revocation and lease fencing for sandbox bearers."""
-from unittest import mock
+from unittest import TestCase, mock
+from types import SimpleNamespace as NS
 
 from ameesh import relay, runner_sandbox, sandbox_relay, storage
 from ameesh.storage.postgres import sandbox as s1
 from ameesh.storage.postgres import turn_admission
 from .support import PgTestCase
 from . import test_4872_turn_admission as admission_fixture
+
+
+class MediatedSelectionTest(TestCase):
+    def setUp(self):
+        from ameesh.storage.remote.client import RemoteDb
+        self.db = RemoteDb(None, mock.Mock())
+        self.worker = NS(db=self.db, name='agent', cfg=NS(canon=None))
+
+    def test_legacy_mediated_turn_never_queries_sql(self):
+        self.worker.fail_turn = mock.Mock()
+        with mock.patch.object(self.db, 'query', wraps=self.db.query) as query:
+            self.assertIsNone(runner_sandbox.dispatch(self.worker, {}))
+        query.assert_not_called()
+        self.worker.fail_turn.assert_not_called()
+
+    def test_observed_sandbox_still_refuses_without_canon(self):
+        self.worker._sandbox_declared = True
+        with self.assertRaises(s1.Refusal):
+            runner_sandbox.select(self.worker)
 
 
 class SandboxRelayTest(PgTestCase):
@@ -99,6 +119,11 @@ class SandboxRelayTest(PgTestCase):
         worker = NS(db=self.db, name='agent', cfg=NS(canon=True), _canon_id=lambda: None)
         with mock.patch.object(runner_sandbox.canon, 'load_configured', return_value=[]), \
                 self.assertRaises(s1.Refusal):
+            runner_sandbox.select(worker)
+
+    def test_missing_canon_after_admission_never_falls_back(self):
+        worker = NS(db=self.db, name='agent', cfg=NS(canon=None))
+        with self.assertRaises(s1.Refusal):
             runner_sandbox.select(worker)
 
     def test_sandbox_prefix_never_reaches_legacy_verifier(self):
