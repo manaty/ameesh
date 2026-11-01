@@ -2051,18 +2051,40 @@ class RestartTest(unittest.TestCase):
         self.assertEqual(set(state["guard"]["restart"]["skipped"].values()), {"manual"})
 
 
+def _sample_with_disk_free(free_bytes):
+    """The real host reading, with the work_path disk fixed (#5321).
+
+    `guard check` measures the runner's free disk, which made `caps.disk_mb`
+    depend on the host. `read_signals` still goes through `sample()` (codex
+    #211 r4), but the disk it reads is the one given here."""
+    real = guard.resources.sample
+
+    def sample(*args, **kwargs):
+        reading = dict(real(*args, **kwargs))
+        reading["disk_free_bytes"] = free_bytes
+        return reading
+
+    return mock.patch.object(guard.resources, "sample", sample)
+
+
 class CliTest(unittest.TestCase):
+    @staticmethod
+    def _config(tmp):
+        config = os.path.join(tmp, "guard.json")
+        with open(config, "w") as fh:
+            json.dump({"host": "vm-test", "max_agents": 2,
+                       "state_path": os.path.join(tmp, "s", "state.json"),
+                       "ack_path": os.path.join(tmp, "a", "ack.json"),
+                       "work_path": tmp,
+                       "lend": {"cpu_max": 2, "memory_max": "4GiB",
+                                "disk_max": "1MiB"}}, fh)
+        return config
+
     def test_check_and_observe_only(self):
         with tempfile.TemporaryDirectory() as tmp:
-            config = os.path.join(tmp, "guard.json")
-            with open(config, "w") as fh:
-                json.dump({"host": "vm-test", "max_agents": 2,
-                           "state_path": os.path.join(tmp, "s", "state.json"),
-                           "ack_path": os.path.join(tmp, "a", "ack.json"),
-                           "work_path": tmp,
-                           "lend": {"cpu_max": 2, "memory_max": "4GiB",
-                                    "disk_max": "1MiB"}}, fh)
-            with mock.patch("sys.stdout") as out:
+            config = self._config(tmp)
+            with mock.patch("sys.stdout") as out, \
+                    _sample_with_disk_free(guard.DEFAULT_DISK_FREE_MIN + 1024 * 1024):
                 self.assertEqual(guard.main(["check", "--config", config, "--json"]), 0)
             printed = "".join(c.args[0] for c in out.write.call_args_list)
             self.assertEqual(json.loads(printed)["schema"], "ameesh-host-state/1")
@@ -2129,6 +2151,18 @@ class CliTest(unittest.TestCase):
                 json.dump({"slice": "x.slice --now", "lend": {"cpu_max": 1}}, fh)
             with mock.patch("sys.stderr"):
                 self.assertEqual(guard.main(["check", "--config", config]), 1)
+
+    def test_check_with_disk_below_the_floor_is_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(tmp)
+            with mock.patch("sys.stdout") as out, \
+                    _sample_with_disk_free(guard.DEFAULT_DISK_FREE_MIN - 1):
+                self.assertEqual(guard.main(["check", "--config", config, "--json"]), 0)
+            printed = "".join(c.args[0] for c in out.write.call_args_list)
+            state = json.loads(printed)
+            self.assertEqual(state["caps"].get("disk_mb"), 0)
+            self.assertEqual(schema_errors(schema("ameesh-host-state-1.schema.json"),
+                                           state), [])
 
 
 class ClosedOfferTest(unittest.TestCase):
