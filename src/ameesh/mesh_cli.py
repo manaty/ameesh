@@ -3262,6 +3262,8 @@ SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_to
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
             "permission_mode", "lot_wake", "resident", "resident_sleep",
             "resident_reread_max",
+            # #5250 : politique de contexte de cet agent (CTX-06)
+            "session_max_tokens", "turn_reread_budget", "session_reread_budget",
             # #4293 : binaire du harnais pour cet agent (canari d'adoption) ;
             # vide = revenir au binaire de l'hôte (PATH / harness_bins)
             "harness_bin")
@@ -3359,6 +3361,8 @@ def cmd_set(cfg: Config, args) -> int:
             if not sep or cle not in SET_KEYS:
                 print("usage: ameesh set <agent> model=… effort=… tier=… "
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
+                      "session_max_tokens=N|1M turn_reread_budget=N|1.5M|0 "
+                      "session_reread_budget=N|40M|0 "
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
                       "permission_mode=auto|acceptEdits|… lot_wake=on|off "
@@ -3396,6 +3400,17 @@ def cmd_set(cfg: Config, args) -> int:
                 except ValueError:
                     print("invalid context_max_tokens: %r (e.g. 15M, 500k, 0 = "
                           "disabled)" % valeur, file=sys.stderr)
+                    return 2
+            if cle in ("session_max_tokens", "turn_reread_budget",
+                       "session_reread_budget") and valeur:
+                try:
+                    valeur = str(parse_token_count(valeur))
+                    if cle == "session_max_tokens" and valeur == "0":
+                        raise ValueError(valeur)
+                except ValueError:
+                    print("invalid %s: %r (e.g. 1M, 1.5M; 0 turns a budget off, "
+                          "never the session threshold)" % (cle, valeur),
+                          file=sys.stderr)
                     return 2
             if cle == "turn_max_seconds" and valeur:
                 try:
@@ -4558,6 +4573,8 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
                             "lot_wake=on|off "
                             "context_max_tokens=15M|0 "
+                            "session_max_tokens=1M "
+                            "turn_reread_budget=1.5M|0 session_reread_budget=40M|0 "
                             "turn_max_seconds=30m|2h|0 turn_mail_max=20|0 "
                             "turn_grace_seconds=20m|0 "
                             "mail_batch=90s|2m|0 (L125, local state of the host) "
