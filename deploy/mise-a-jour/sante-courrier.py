@@ -238,6 +238,20 @@ def sans_executeur(db, rows: list[dict], souffrance: float, now: float) -> list[
     return out
 
 
+def sans_retires(db, constats: list[dict]) -> list[dict]:
+    """The findings whose recipient is still not retired when re-read.
+
+    #4902 : ``personas`` is a snapshot; an agent retired since then must not
+    turn its old mail into a KO. Only what would block is re-read.
+    """
+    out = []
+    for constat in constats:
+        etat = registry.get(db, constat["destinataire"])
+        if etat is not None and not etat.get("retired_ts"):
+            out.append(constat)
+    return out
+
+
 def humain_sans_executeur(row: dict) -> bool:
     """A human identity with no executor (never claimed by a runner).
 
@@ -266,7 +280,8 @@ def dead_letters(db, hote: str, rows: list[dict] | None = None) -> list[dict]:
     explicit human channel (``canal_humain``), not a dead agent mailbox
     (#2899)."""
     rows = toutes_personas(db, hote) if rows is None else rows
-    noms = {r["name"] for r in rows if not humain_sans_executeur(r)}
+    noms = {r["name"] for r in rows
+            if not r.get("retired_ts") and not humain_sans_executeur(r)}
     out = []
     for letter in storage.of(db).mailbox.dead_letters():
         if letter.get("recipient") in noms:
@@ -535,14 +550,20 @@ def probe(db, row: dict, sha: str, attente: float,
     corps = PROBE_TEMPLATE.format(hote=hote_mesure, sha=(sha or "")[:9],
                                   nom=row["name"], jeton=jeton)
     debut = time.monotonic()
-    message_id = mail.send(db, work.SYSTEM_SENDER, row["name"], corps, kind="event",
-                           payload={"staging": {
-                               "hote": hote_mesure, "sha": sha or "",
-                               "destinataire_hote": row.get("host") or ""}})
-    out = {"message": message_id, "destinataire": row["name"], "delai_s": None,
+    out = {"message": None, "destinataire": row["name"], "delai_s": None,
            "remise_s": None, "hote_destinataire": row.get("host") or "",
            "statut_cible": row.get("status") or "idle", "tour": "non remis",
            "concluant": True}
+    try:
+        message_id = mail.send(db, work.SYSTEM_SENDER, row["name"], corps, kind="event",
+                               payload={"staging": {
+                                   "hote": hote_mesure, "sha": sha or "",
+                                   "destinataire_hote": row.get("host") or ""}})
+    except storage.RecipientRetired:
+        # #4902 : retrait committe depuis revalider() : rien n'est depose, donc
+        # rien n'est mesure sur l'hote. Non concluant, jamais un KO (canon §3).
+        return dict(out, concluant=False, tour="cible retiree avant l'envoi")
+    out["message"] = message_id
     fin = debut + attente
     repondu = False
     budget_vu = ""
@@ -552,6 +573,10 @@ def probe(db, row: dict, sha: str, attente: float,
         livre = float((message or {}).get("delivered_ts") or 0)
         # #5034: deliberate waits may precede delivery, even with idle status.
         etat = registry.get(db, row["name"]) or {}
+        if etat.get("retired_ts"):
+            # #4902 : un retire n'ouvre plus de tour, attendre ne mesurerait rien.
+            return dict(out, concluant=False,
+                        tour="%s (cible retiree pendant la sonde)" % out["tour"])
         budget_vu = attente_budget(etat) or budget_vu
         pause_vue = bool(etat.get("operator_paused")) or pause_vue
         if livre:
@@ -660,8 +685,8 @@ def main(argv: list[str] | None = None) -> int:
         now = time.time()
         rows = personas(conn, args.hote)
         rapport["personas"] = len(rows)
-        souffrance = stuck(conn, rows, args.souffrance, now)
-        sans = sans_executeur(conn, rows, args.souffrance, now)
+        souffrance = sans_retires(conn, stuck(conn, rows, args.souffrance, now))
+        sans = sans_retires(conn, sans_executeur(conn, rows, args.souffrance, now))
         toutes = toutes_personas(conn, args.hote)
         mortes = dead_letters(conn, args.hote, toutes)
         canal = canal_humain(conn, args.hote, now, toutes)
