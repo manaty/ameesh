@@ -49,6 +49,11 @@ class BaremeTest(unittest.TestCase):
                 self.assertAlmostEqual(self.appel(model, CREUX), facture(creux))
                 self.assertAlmostEqual(self.appel(model, SAMEDI), facture(creux))
 
+    def test_deepseek_pro_garde_le_tarif_de_pointe_de_v4_pro(self):
+        self.assertEqual(cost.known_price(self.prices, "deepseek-pro"), [1.32, 0.044, 3.96])
+        self.assertEqual(cost.known_price(self.prices, "deepseek-pro"),
+                         list(PAGE["deepseek-v4-pro"][0]))
+
     def test_modele_inconnu_jamais_au_prix_le_plus_bas(self):
         plus_cher = [max(p[0][i] for p in PAGE.values()) for i in range(3)]
         for model in ("deepseek-v9-inconnu", None, ""):
