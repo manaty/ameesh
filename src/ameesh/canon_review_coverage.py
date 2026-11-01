@@ -119,20 +119,22 @@ def findings(cfg, canon: canon_mod.Canon,
     for project in projects:
         severity = canon_mod.ERROR if project in explicit else canon_mod.INFO
         try:
-            policy = mechanics.load(root.repo, root.commit, project)
-        except mechanics.MechanicsAbsent:
-            return refuse_explicit()
-        except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
-            # politique incomplète (`omarchy`) : `load` le refuse déjà au gel
-            add(CODE_UNMEASURED, _worse(severity, canon_mod.WARNING),
-                "project %s not measured: %s" % (project, exc))
+            repository, reason = _repository(cfg, project, explicit)
+        except (canon_mod.CanonError, OSError) as exc:
+            add(CODE_UNMEASURED, severity, "project %s not measured: %s" % (project, exc))
+            continue
+        if not repository:
+            add(CODE_UNMEASURED, severity,
+                "project %s not measured: %s" % (project, reason))
             continue
         try:
-            repository, reason = _repository(cfg, project, explicit)
-            if not repository:
-                add(CODE_UNMEASURED, severity,
-                    "project %s not measured: %s" % (project, reason))
-                continue
+            policy = mechanics.load(root.repo, root.commit, project)
+        except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
+            # des fichiers à mesurer et aucune politique : le gel refuserait aussi
+            add(CODE_UNMEASURED, canon_mod.ERROR,
+                "project %s: review policy does not compile: %s" % (project, exc))
+            continue
+        try:
             _ref, commit = canon_lowering._revision(*repository)
             paths = canon_lowering._tracked(repository[0], commit) if commit else ()
         except (canon_mod.CanonError, OSError) as exc:
@@ -144,7 +146,3 @@ def findings(cfg, canon: canon_mod.Canon,
             continue
         _scan(policy, paths, add)
     return out
-
-
-def _worse(first: str, second: str) -> str:
-    return canon_mod.ERROR if canon_mod.ERROR in (first, second) else canon_mod.WARNING

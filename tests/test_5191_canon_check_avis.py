@@ -105,10 +105,30 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(canon_mod.WARNING, warned[0].severity)
         self.assertIn("gone/**", warned[0].message)
 
-    def test_incomplete_project_policy_warns_instead_of_failing(self):
+    def test_incomplete_policy_without_repository_is_not_measured(self):
         found = coverage.findings(None, self._canon(), {"ameesh": self.project})
-        self.assertTrue(any(f.severity == canon_mod.WARNING and "omarchy" in f.message
-                            for f in found))
+        self.assertEqual([canon_mod.INFO], [f.severity for f in found
+                                            if "omarchy" in f.message])
+
+    def test_incomplete_policy_with_repository_is_an_error(self):
+        found = coverage.findings(None, self._canon(),
+                                  {"ameesh": self.project, "omarchy": self.project})
+        self.assertEqual([coverage.CODE_UNMEASURED], self._codes(found, canon_mod.ERROR))
+
+    def test_policy_without_mechanics_is_an_error_once_a_repository_is_found(self):
+        commit = self._repo(self.canon_root, {
+            "federation.yaml": _federation(with_count=False, project_rules=False)})
+        canon = mock.Mock(sources=[canon_mod.Source(
+            member="home", directory="", repo=self.canon_root, rev=commit,
+            commit=commit, prefix="", mode="git")])
+        self._git(self.project, "remote", "add", "origin",
+                  "https://github.com/manaty/ameesh.git")
+        cfg = mock.Mock(radar={}, github={"projects": {"ameesh": "manaty/ameesh"}})
+        with mock.patch("os.getcwd", return_value=self.project):
+            detected = coverage.findings(cfg, canon)
+        given = coverage.findings(None, canon, {"ameesh": self.project})
+        for found in (detected, given):
+            self.assertEqual([coverage.CODE_UNMEASURED], self._codes(found, canon_mod.ERROR))
 
     def test_project_without_repository_is_not_measured(self):
         with mock.patch("os.getcwd", return_value=self.canon_root):
@@ -135,7 +155,7 @@ class CoverageTest(unittest.TestCase):
                 self.assertIn(coverage.CODE_UNMEASURED,
                               self._codes(found, canon_mod.ERROR))
 
-    def test_canon_without_mechanics_has_no_finding(self):
+    def test_canon_without_review_policies_has_no_finding(self):
         commit = self._repo(self.canon_root, {"federation.yaml": "federation: \"0.1\"\n"})
         canon = mock.Mock(sources=[canon_mod.Source(
             member="home", directory="", repo=self.canon_root, rev=commit,
