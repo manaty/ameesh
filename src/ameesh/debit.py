@@ -668,12 +668,19 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
     * la dispense `verdict not required:` depuis le gel, levée par une
       désignation explicite ou son retrait (#1979) ;
     * les verdicts qui nomment la tête gelée : un `blocked` rendu compte
-      l'avis (le relecteur a rendu), un verdict d'une autre tête ne compte pas.
+      l'avis (le relecteur a rendu), un verdict d'une autre tête ne compte pas ;
+    * #5202 : le passage en `validated` depuis le gel, que la porte n'accorde
+      qu'au quorum de la tête gelée (#4423, report compris). Comme pour la
+      file et le SLO (#4851), aucun désigné n'est plus dû (#5083 : quorum
+      cx1 + cx3, dev3 sans avis). Une sortie de `validated` (`validated → …`,
+      retour en build) lève ce quorum. Une note du journal écrite en `qa`
+      sans transition (passe de report « carried quorum pending ») ne le
+      lève pas.
     """
     freeze = _latest_freeze(milestones)
     if freeze is None:
         return {"freeze": None, "designees": [], "pending": [], "missing": False,
-                "none": False, "unreadable": []}
+                "none": False, "unreadable": [], "quorum": None}
     freeze_at = float(freeze.get("at_ts") or 0.0)
     freeze_sha = str(freeze.get("sha") or "").strip()
     unreadable: list[str] = []
@@ -682,15 +689,24 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
     waived = False
     ever: set[str] = set()
     manual: dict[str, dict] = {}
+    quorum_at: float | None = None
     for event in sorted(events or (),
                         key=lambda e: (float(e.get("at_ts") or 0.0),
                                        int(e.get("id") or 0))):
         text = str(event.get("note") or "").strip()
-        if float(event.get("at_ts") or 0.0) >= freeze_at:
+        at = float(event.get("at_ts") or 0.0)
+        if at >= freeze_at:
             if text.startswith("verdict not required:"):
                 waived = True
             elif text == "reviewer designation removed" or _MANUAL.match(text):
                 waived = False
+        if at > freeze_at:
+            state = str(event.get("state") or "")
+            if state == "validated":
+                if quorum_at is None:
+                    quorum_at = at
+            elif text.startswith("validated →") or state not in ("", "qa"):
+                quorum_at = None
         parsed = _mark(event)
         if parsed is not None:
             for name in parsed["names"]:
@@ -715,7 +731,8 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
     # gel ou une désignation explicite rend la revue à nouveau due.
     if waived:
         return {"freeze": freeze, "designees": [], "pending": [],
-                "missing": False, "none": True, "unreadable": []}
+                "missing": False, "none": True, "unreadable": [],
+                "quorum": None}
     auto = list(latest_mark["names"]) if latest_mark else []
     # Un auteur de la tête — dont le relecteur qui y a poussé un correctif
     # (#2888/#2739) — ne peut pas la relire. La marque du gel courant le dit ;
@@ -759,12 +776,15 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
         verdict = by_actor.get(_norm(name))
         if verdict is not None:
             continue
+        if quorum_at is not None:
+            continue                    # #5202/#4851 : quorum acquis sans son avis
         pending.append({"name": name, "designated_ts": designated_at,
                         "designated": _iso(designated_at)})
     return {"freeze": freeze, "designees": designees, "pending": pending,
             "missing": (latest_mark is None and not none_mark and not designees
-                        and not by_actor),
-            "none": none_mark, "unreadable": unreadable}
+                        and not by_actor and quorum_at is None),
+            "none": none_mark, "unreadable": unreadable,
+            "quorum": _iso(quorum_at) if quorum_at is not None else None}
 
 
 def _verdict_on_head(verdict: dict, freeze: dict, freeze_sha: str,
