@@ -15,6 +15,8 @@ Témoins du lot :
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
+import re
 import time
 import unittest
 from unittest import mock
@@ -36,6 +38,10 @@ SCHEDULED = "reference p80 (table #16)"
 
 def _day(ts):
     return dt.date.fromtimestamp(ts).isoformat()
+
+
+def _tomorrow():
+    return (dt.date.today() + dt.timedelta(days=1)).isoformat()
 
 
 class QueueTest(unittest.TestCase):
@@ -163,9 +169,12 @@ class SleepTest(PgTestCase):
         made = work.add(self.db, title="P1 daté demain", app="ameesh", actor="pilote")
         lot = int(made["id"])
         work.assign(self.db, lot, "dev1", actor="pilote")
+        # #5198 : demain selon le jour local du processus, celui que lisent
+        # `operations.listing` et le planificateur ; `current_date` suit le
+        # fuseau de la session SQL et diffère d'un jour certains soirs.
         self.db.execute("UPDATE work_items SET priority = 1,"
-                        " planned_start = current_date + 1, planned_source = %s"
-                        " WHERE id = %s", (source, lot))
+                        " planned_start = %s, planned_source = %s"
+                        " WHERE id = %s", (_tomorrow(), source, lot))
         return lot
 
     def listing_row(self, name):
@@ -194,7 +203,7 @@ class SleepTest(PgTestCase):
         by_agent = {r["agent"]: r for g in out if g["kind"] == "sleep"
                     for r in g["agents"]}
         self.assertTrue(by_agent["dev1"]["slept"])
-        tomorrow = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+        tomorrow = _tomorrow()
         self.assertEqual(by_agent["dev1"]["set_aside"],
                          [{"lot": lot, "why": "planned start %s" % tomorrow}])
         self.assertIn("%s dev1: #%d (planned start %s)"
@@ -241,6 +250,24 @@ class SleepTest(PgTestCase):
         self.assertEqual(self.listing_row("dev1")["actionable_lots"], 1)
         self.verdict(lot, "rev-b", "ok")
         self.assertEqual(self.listing_row("dev1")["actionable_lots"], 0)
+
+
+class LocalDaySourceTest(unittest.TestCase):
+    """#5198 : le jour local vient du processus (`date.today()`, celui du
+    planificateur et de `operations.listing`), jamais du fuseau de la session
+    SQL : en heure de Paris, `current_date` vaut déjà demain entre 23:00 et
+    00:00 UTC et un lot daté d'aujourd'hui paraîtrait futur."""
+
+    PATTERN = re.compile(r"\b(current_date|localtimestamp|now\(\)\s*::\s*date)\b",
+                         re.IGNORECASE)
+
+    def test_no_product_sql_reads_the_day_of_the_session(self):
+        root = Path(__file__).resolve().parents[1] / "src" / "ameesh"
+        found = [f"{path.relative_to(root)}:{n}"
+                 for path in sorted(root.rglob("*")) if path.suffix in (".py", ".sql")
+                 for n, line in enumerate(path.read_text().splitlines(), 1)
+                 if self.PATTERN.search(line.split("--")[0].split("#")[0])]
+        self.assertEqual(found, [])
 
 
 if __name__ == "__main__":
