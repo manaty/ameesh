@@ -839,10 +839,12 @@ jobs:
       # #5325 — ménage sans root du disque de la VM, à toute issue (un job
       # annulé laisse ses conteneurs et ses fichiers). L'âge borne chaque
       # famille bien au-delà du plafond de 45 min d'une part : conteneurs
-      # arrêtés et volumes anonymes de plus de 6 h, images et cache de
-      # construction de plus de 24 h, `_temp` de plus de 48 h ; un volume
-      # nommé n'est jamais supprimé. `continue-on-error` : un ménage raté
-      # n'est jamais un verdict, le rapport d'alerte est dans `disque_rapport`.
+      # arrêtés et volumes anonymes de plus de 6 h, images dangling et cache
+      # de construction de plus de 24 h, images sans conteneur de plus de
+      # 7 jours, `_temp` et /tmp du runner de plus de 48 h, journaux `_diag`
+      # de plus de 7 jours ; un volume nommé n'est jamais supprimé.
+      # `continue-on-error` : un ménage raté n'est jamais un verdict, le
+      # rapport d'alerte est dans `disque_rapport`.
       - &disque_menage
         name: ménage du disque de l'hôte (#5325)
         if: always() && runner.environment == 'self-hosted'
