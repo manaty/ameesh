@@ -410,7 +410,9 @@ class OverviewTest(unittest.TestCase):
             "decisions_pending": 2, "warnings": ["w"],
             # M2, plus tôt, est atteint : M1 est le prochain
             "milestone": {"id": "M1", "title": "un", "date": "2026-11-01", "progress": 0.5,
-                          "lots_merged": 1, "lots_total": 2}})
+                          "lots_merged": 1, "lots_total": 2, "progress_active": None,
+                          "lots_active": None, "lots_waiting_activation": None,
+                          "lots_unmeasured": None}})
         self.assertIsNone(autre["milestone"])
         self.assertEqual((autre["lots_merged_in_window"], autre["decisions_pending"]), (1, 0))
 

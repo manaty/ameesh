@@ -21,7 +21,7 @@ _OPEN_ACTION_STATES = ("proposed", "approved", "launched", "unknown")
 
 _ACTION_COLUMNS = """
     action_id, project, work_item, proposed_by, connector, operation, target, class,
-    state, attempts, last_actor, auth_approver, approvers,
+    state, attempts, last_actor, auth_kind, auth_approver, approvers,
     extract(epoch from created_at)::float8  AS created_ts,
     extract(epoch from updated_at)::float8  AS updated_ts,
     extract(epoch from approved_at)::float8 AS approved_ts,
@@ -132,7 +132,8 @@ class Progress(interface.Progress):
             return []
         return self.db.query(
             "SELECT id, work_item_id, kind, actor, verdict, sha, note,"
-            "       extract(epoch from at)::float8 AS at_ts"
+            "       extract(epoch from at)::float8 AS at_ts,"
+            "       (kind = 'merged' AND agent_mesh_merged_annulled(work_item_id, at)) AS annulled"
             "  FROM work_item_milestones WHERE work_item_id IN (%s)"
             " ORDER BY at, id" % _marks(ids), tuple(ids))
 
@@ -151,7 +152,7 @@ class Progress(interface.Progress):
 
     def package_items(self) -> list[dict]:
         return self.db.query(
-            "SELECT id, package_id, state, close_reason, app,"
+            "SELECT id, package_id, state, close_reason, app, workstream, external_executor,"
             "       extract(epoch from updated_at)::float8 AS updated_ts"
             "  FROM work_items WHERE package_id IS NOT NULL ORDER BY id")
 

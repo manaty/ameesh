@@ -239,6 +239,24 @@ dates (set in ameesh, otherwise in the canon; `source`:
 (`work_items`). `progress` = merged / (total − abandoned), null if
 none; computed over all lots, regardless of the window.
 
+**Activation (#5244, canon §5 and §14; added fields).** `progress` and
+`lots_merged` still count the merge. Done means active: `progress_active` =
+`lots_active` / `lots_activation_total`, null when the activation was not computed
+(an older snapshot) or no unit counts, 0 when the evidence is unreadable (the units
+are then in `lots_unmeasured`). `lots_activation_total` is the units not abandoned
+at activation: unlike `lots_total − lots_abandoned`, it counts an operator gesture
+(closed `done`, reserved to an external executor), which waits for its receipt. The
+views use it for what is done, and fall back on `progress` on an older snapshot.
+`lots_waiting_activation` counts units known not to be active yet, `lots_unmeasured`
+those with no readable evidence (not done, no lateness raised). A `lots[]` entry
+adds `step` (`active`, `waiting`, `unmeasured`, or as `status`). In the roadmap, a
+task adds `activation` (`{step, counted, label}`, null while open), a package
+`progress_active`, `units_active`, `units_waiting_activation`, `units_unmeasured`.
+Steps: `merged`, `active` (commit in the staging attested on every active host),
+`gesture` (closed `done`, reserved to an external executor, no receipt), `receipt`
+(a gated action of the lot confirmed under a signed `ameesh-receipt/1`), `delivered`
+(off target), `unmeasured` (`src/ameesh/activation.py`).
+
 ## `versions` (L160f, #497)
 
 `ameesh-versions/1`. One **product** per version-tag stream of the
