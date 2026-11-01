@@ -1552,21 +1552,14 @@ def _api_pages(gh, path: str, what: str) -> list:
     return _json_pages(proc.stdout, what)
 
 
-def _head_check_runs(slug: str | None, sha: str, *, gh,
-                     all_attempts: bool = False) -> list:
+def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
     """Les check runs de la tête **exacte** `sha`, avec l'application qui les a
     produits. `statusCheckRollup` ne porte pas cette source : elle se lit sur
     le commit (`commits/<sha>/check-runs`). Les noms sont rendus exactement,
     espaces significatifs compris : `tests ` n'est pas le contexte `tests`.
     Une lecture impossible ou malformée lève `land.LandError` : une source
     absente ne prouve rien. #2306 : un échec passager lève
-    `land.TransientLandError`, que la file sait réessayer sans éjecter.
-
-    #5298 : `all_attempts` lit aussi les tentatives précédentes
-    (`filter=all`, `id` et `external_id` rendus) — la preuve d'un flux
-    remplacé se lit sur la tentative plus récente de la **même** exécution.
-    La provenance des checks requis garde la lecture par défaut
-    (`filter=latest`) : `_latest_runs` y sélectionne déjà les tentatives."""
+    `land.TransientLandError`, que la file sait réessayer sans éjecter."""
     if not slug:
         raise land.LandError("no GitHub repository known: the source of the checks "
                              "of %s cannot be read" % (sha or "the head"))
@@ -1577,8 +1570,7 @@ def _head_check_runs(slug: str | None, sha: str, *, gh,
         raise land.LandError("no frozen head: the source of the required checks "
                              "cannot be read")
     path = "repos/%s/commits/%s/check-runs" % (slug, quote(sha, safe=""))
-    query = "?per_page=100&filter=all" if all_attempts else "?per_page=100"
-    pages = _api_pages(gh, path + query, "gh api %s" % path)
+    pages = _api_pages(gh, path + "?per_page=100", "gh api %s" % path)
     runs = []
     for page in pages:
         if not isinstance(page, dict) or not isinstance(page.get("check_runs"), list):
@@ -1605,21 +1597,11 @@ def _head_check_runs(slug: str | None, sha: str, *, gh,
             # #3186 : l'URL du job désigne le run à relancer d'un requis
             # jamais conclu (`radar.actions_run_id`).
             details = run.get("details_url")
-            # #5298 : l'identité exacte du check publié (id du check run et
-            # `external_id` du flux) permet de ne remplacer que l'entrée
-            # d'un attempt antérieur, jamais un homonyme courant.
-            ident = run.get("id")
-            ident = ident if type(ident) is int and ident > 0 else None
-            external = run.get("external_id")
-            completed = run.get("completed_at")
-            runs.append({"id": ident,
-                         "name": run["name"],
+            runs.append({"name": run["name"],
                          "status": str(run.get("status") or ""),
                          "conclusion": str(run.get("conclusion") or ""),
                          "app_id": app_id,
                          "started_at": started if isinstance(started, str) else None,
-                         "completed_at": completed if isinstance(completed, str) else None,
-                         "external_id": external if isinstance(external, str) else None,
                          "check_suite_id": suite_id,
                          "details_url": details if isinstance(details, str) else None})
     return runs
@@ -1663,6 +1645,30 @@ def _check_id_in_url(url) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _instant(value) -> float | None:
+    """Une date ISO 8601 en secondes epoch, ou None (absente, illisible)."""
+    from datetime import datetime
+
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return stamp.timestamp() if stamp.tzinfo is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _check_run_of(slug: str, check: int, *, gh) -> dict | None:
+    """Le check run `check` de `slug`, ou None (lecture impossible)."""
+    path = "repos/%s/check-runs/%d" % (slug, int(check))
+    proc = gh(["api", path])
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _run_attempt_of(slug: str, run: int, *, gh) -> tuple | None:
     """`(tentative courante, tête)` de l'exécution `run`, ou None."""
     path = "repos/%s/actions/runs/%d" % (slug, int(run))
@@ -1700,23 +1706,24 @@ def _attempt_jobs(slug: str, run: int, attempt: int, *, gh) -> list | None:
 def replaced_flux_checks(rollup, *, slug: str | None = None, head: str = "",
                          gh=None) -> set:
     """#5298 : les entrées de flux de `rollup` qu'une preuve **identifiée**
-    remplace — même exécution, même part, tentative plus récente verte.
+    remplace — le job de la même part, dans une tentative plus récente de la
+    **même exécution**, `success` et conclu après le flux rouge.
 
     Le constat : après `gh run rerun --failed`, `statusCheckRollup` (et la
     lecture `filter=latest`) ne rend qu'un check par nom ; quand le
     `startedAt` de l'attempt précédent est plus grand (horloge du runner),
-    l'ancien rouge reste seul visible. L'agrégat `tests` vert d'une autre
-    exécution, d'un autre plan ou d'un run concurrent ne prouve pas que
-    *cette* part a été rejouée : la preuve est lue sur la tête exacte, par
-    l'`external_id` du check (`ameesh-ci-flow/<exécution>/<tentative>`).
+    l'ancien rouge reste seul visible. Ni un agrégat `tests` vert d'une autre
+    exécution, ni un plan qui ne porte pas la part ne prouvent que *cette*
+    part a été rejouée : la preuve est le job homonyme de la part
+    (`psycopg 3/8` pour `tests (flux) psycopg 3/8`) relu dans la dernière
+    tentative de l'exécution que nomme l'`external_id` du check
+    (`ameesh-ci-flow/<exécution>/<tentative>`).
 
-    Une entrée rouge est remplacée quand, pour la même exécution et le même
-    nom de flux, une tentative **plus récente** a conclu `success` ; à
-    défaut, quand le job de même part de la dernière tentative de cette
-    exécution a conclu `success` (le publisher peut avoir manqué sa ligne
-    `fin`, le job reste la preuve de la part). Une lecture impossible, un
-    `external_id` absent, une tentative courante ou un job non vert ne
-    remplacent rien : la porte reste fermée.
+    Une entrée rouge n'est remplacée que si ce job est `success` et que sa
+    date de fin est strictement postérieure à celle du flux. Une lecture
+    impossible, un `external_id` ou un `detailsUrl` absent, une tentative
+    courante, un job non vert ou des dates illisibles ne remplacent rien : la
+    porte reste fermée.
 
     Rend les clés `radar.flux_entry_key` des seules entrées remplacées."""
     from . import ci as ci_mod, radar
@@ -1726,46 +1733,46 @@ def replaced_flux_checks(rollup, *, slug: str | None = None, head: str = "",
             and str(entry.get("name") or "").startswith(ci_mod.CHECK_PREFIX + " ")]
     if not reds or not slug or not head or gh is None:
         return set()
-    try:
-        checks = _head_check_runs(slug, head, gh=gh, all_attempts=True)
-    except land.LandError:
-        return set()
-    by_id = {check["id"]: check for check in checks if type(check.get("id")) is int}
-    by_name: dict = {}
-    for check in checks:
-        ident = _flux_identity(check)
-        if ident is not None and check["name"].startswith(ci_mod.CHECK_PREFIX + " "):
-            by_name.setdefault((check["name"], ident[0]), []).append((ident[1], check))
+    wanted_head = str(head).strip().lower()
     replaced = set()
     runs: dict = {}
     for entry in reds:
-        own = by_id.get(_check_id_in_url(entry.get("detailsUrl")
-                                         or entry.get("details_url")))
-        if own is None:
+        check_id = _check_id_in_url(entry.get("detailsUrl")
+                                    or entry.get("details_url"))
+        if check_id is None:
             continue
-        ident = _flux_identity(own)
+        check = _check_run_of(slug, check_id, gh=gh)
+        if check is None or str(check.get("head_sha") or "").strip().lower() != wanted_head:
+            continue
+        name = str(check.get("name") or "")
+        if not name.startswith(ci_mod.CHECK_PREFIX + " "):
+            continue
+        ident = _flux_identity(check)
         if ident is None:
             continue
         run, attempt = ident
-        later = [check for at, check in by_name.get((own["name"], run), ())
-                 if at > attempt]
-        if any(radar.check_result(check) == radar.CI_GREEN_RESULT for check in later):
-            replaced.add(radar.flux_entry_key(entry))
-            continue
         if run not in runs:
             runs[run] = _run_attempt_of(slug, run, gh=gh)
         latest = runs[run]
-        if not latest or latest[0] <= attempt:
+        if not latest or latest[0] <= attempt or latest[1] != wanted_head:
             continue
-        if str(latest[1]) != str(head).strip().lower():
+        flux_end = _instant(entry.get("completedAt")
+                            or entry.get("completed_at"))
+        if flux_end is None:
             continue
+        part = name[len(ci_mod.CHECK_PREFIX) + 1:]
         jobs = _attempt_jobs(slug, run, latest[0], gh=gh)
-        part = own["name"][len(ci_mod.CHECK_PREFIX) + 1:]
-        if jobs is not None and any(
-                str(job.get("name") or "") == part
-                and str(job.get("conclusion") or "").strip().lower() == "success"
-                for job in jobs):
-            replaced.add(radar.flux_entry_key(entry))
+        if jobs is None:
+            continue
+        for job in jobs:
+            if str(job.get("name") or "") != part:
+                continue
+            if str(job.get("conclusion") or "").strip().lower() != "success":
+                continue
+            job_end = _instant(job.get("completed_at"))
+            if job_end is not None and job_end > flux_end:
+                replaced.add(radar.flux_entry_key(entry))
+            break
     return replaced
 
 
