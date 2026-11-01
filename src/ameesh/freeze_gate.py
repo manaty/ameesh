@@ -925,10 +925,14 @@ def milestone(
             pass
         # #4173 : l'empreinte du lot est raffinée par le diff réel de la tête
         # gelée. Jamais d'échec du gel pour elle (`work footprint --refresh`).
+        # #5221 : le diff se lit dans le dépôt qui a résolu la tête gelée ; le
+        # clone déclaré du projet (ameesh-packets) n'a souvent ni la branche
+        # ni le commit du lot. Gel distant `unverified` : clone déclaré.
         try:
             from . import work_footprints
             work_footprints.refresh(db, getattr(db, "cfg", None), item_id,
-                                    actor=actor or "ameesh", head=sha.strip())
+                                    actor=actor or "ameesh", head=sha.strip(),
+                                    repo=repo or freeze_info.get("repo") or None)
         except Exception as exc:  # noqa: BLE001 - le gel est écrit ; l'empreinte se refait
             print("warning: footprint not refreshed from the frozen head: %s "
                   "(`ameesh work footprint %s --refresh`)" % (exc, item_id), file=sys.stderr)
