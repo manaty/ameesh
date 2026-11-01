@@ -4849,6 +4849,23 @@ def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = Fal
     ``deadline`` (#2665) : la découverte ne prend que le temps qui reste ;
     une échéance épuisée lève `GitDeadline`, jamais un canon « illisible ».
     """
+    # #5404 : dans une fenêtre `configured_cache`, un canon ne se lit qu'une fois
+    # (dix lectures par `ameesh alerts`, hors `load_configured`).
+    cache = getattr(_CANONS, "loaded", None)
+    key = None
+    if cache is not None and not fetch and deadline is None and use_pyyaml is None:
+        key = ("load", root, ref, bool(untrusted), bool(default))
+        if key in cache:
+            return cache[key]
+    canon = _load(root, ref=ref, untrusted=untrusted, fetch=fetch, use_pyyaml=use_pyyaml,
+                  default=default, deadline=deadline)
+    if key is not None:
+        cache[key] = canon
+    return canon
+
+
+def _load(root: str, *, ref: str, untrusted: bool, fetch: bool,
+          use_pyyaml: bool | None, default: bool, deadline: Deadline | None) -> Canon:
     loader = _Loader(root, ref=ref, untrusted=untrusted, fetch=fetch, use_pyyaml=use_pyyaml,
                      default=default, deadline=deadline)
     try:

@@ -1632,6 +1632,7 @@ def _skip_trivia(sql: str, index: int) -> int:
     return index
 
 
+@functools.lru_cache(maxsize=1024)
 def single_statement(sql: str) -> bool:
     """True when `sql` holds at most one statement (a trailing `;` allowed).
 
@@ -1685,6 +1686,18 @@ def _same_params(left: tuple, right: tuple) -> bool:
     return True
 
 
+def _copy_rows(value):
+    """Copie profonde de lignes lues : dict et listes, le reste est immuable.
+
+    #5404 : chaque passe lit ses réponses (1 200 lectures par `ameesh alerts`) ;
+    `copy.deepcopy` en coûtait à lui seul plus d'une seconde."""
+    if isinstance(value, dict):
+        return {key: _copy_rows(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_rows(item) for item in value]
+    return value
+
+
 class _Answers:
     """Réponses gardées, par SQL puis paramètres (horodatages tolérés)."""
 
@@ -1697,7 +1710,7 @@ class _Answers:
     def get(self, sql: str, params: tuple):
         for known, rows in self._by_sql.get(sql, ()):
             if _same_params(known, params):
-                return copy.deepcopy(rows)
+                return _copy_rows(rows)
         return None
 
     def forget(self, table: str) -> None:

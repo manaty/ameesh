@@ -40,8 +40,8 @@ _ITEM_COLUMNS = ", ".join([
     "extract(epoch from w.started_at)::float8 AS started_ts",
     # #2204/N5 : la frise porte les relecteurs comme progress/list (lot_state
     # ne doit pas diverger entre les deux lectures).
-    "coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer",
-    "to_jsonb(w)->'reviewers' AS reviewers",
+    "coalesce(w.reviewer, '') AS reviewer",
+    "to_jsonb(w.reviewers) AS reviewers",
 ])
 
 _COMMITMENT_COLUMNS = ", ".join([
@@ -54,8 +54,11 @@ _COMMITMENT_COLUMNS = ", ".join([
 ])
 
 #: tâches de la frise : ouvertes, datées, engagées, ou modifiées récemment
+#: #5404 : le total se compte sur les seuls identifiants ; le fenêtrage des
+#: lignes complètes (corps compris) débordait en fichiers temporaires.
 _ITEMS_SQL = """
-SELECT __COLS__, count(*) OVER ()::bigint AS total
+WITH picked AS (
+SELECT w.id, (w.state NOT IN (__DONE__)) AS undone, count(*) OVER ()::bigint AS total
   FROM work_items w
  WHERE (w.state NOT IN (__DONE__)
     OR w.planned_start IS NOT NULL OR w.planned_end IS NOT NULL
@@ -64,8 +67,12 @@ SELECT __COLS__, count(*) OVER ()::bigint AS total
     OR EXISTS (SELECT 1 FROM commitments c
                 WHERE c.work_item_id = w.id AND c.status IN ('proposed', 'open')))
  __PROJECT__
- ORDER BY (w.state NOT IN (__DONE__)) DESC, w.created_at, w.id
+ ORDER BY undone DESC, w.created_at, w.id
  LIMIT %s
+)
+SELECT __COLS__, picked.total
+  FROM picked JOIN work_items w ON w.id = picked.id
+ ORDER BY picked.undone DESC, w.created_at, w.id
 """
 
 #: colonnes écrites par `add_commitment` / `record_proposal`
@@ -154,10 +161,10 @@ class Roadmap(interface.Roadmap):
         sql = _ITEMS_SQL.replace("__COLS__", _ITEM_COLUMNS).replace(
             "__DONE__", ", ".join(["%s"] * len(done))).replace(
                 "__PROJECT__", "AND (w.app = %s OR w.workstream = %s)" if project else "")
-        params = tuple(done) + (float(since_ts),)
+        params = tuple(done) + tuple(done) + (float(since_ts),)
         if project:
             params += (project, project)
-        return self.db.query(sql, params + tuple(done) + (int(limit),))
+        return self.db.query(sql, params + (int(limit),))
 
     def commitments(self, *, statuses=None, ids=None) -> list[dict]:
         where, params = [], []

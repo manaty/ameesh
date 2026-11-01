@@ -11,7 +11,7 @@ dépassé, avec deux diffusions à « all » par oscillation.
 
 Témoins : le compte passif lit l'index partiel 0489 (même prédicat que
 `PASSIVE_SQL`), les lectures par hôte rendent le dernier relevé de chaque
-hôte, le flux GitHub ne calcule `to_jsonb` qu'une fois par ligne, et une
+hôte, le flux GitHub ne calcule plus `to_jsonb` de la ligne (#5404), et une
 erreur passagère de la base n'est annoncée qu'à sa répétition.
 """
 from __future__ import annotations
@@ -164,17 +164,17 @@ class IssueFeedSqlTest(unittest.TestCase):
 
         work_pg.WorkItems(_Db()).issue_feed(10)
         sql = seen[-1]
+        # #5404 : plus aucun `to_jsonb` de la ligne, seulement de `reviewers`
+        self.assertNotIn("to_jsonb(work_items)", sql)
         self.assertEqual(len(re.findall(r"to_jsonb\(", sql)), 1, sql)
-        # la sous-requête latérale n'est pas remontée (l'appel serait recopié)
-        self.assertIn("to_jsonb(work_items) AS doc OFFSET 0", sql)
 
-    def test_item_columns_without_row_json_is_unchanged(self):
+    def test_item_columns_direct(self):
         class _Db:
             _has_reviewer = True
             _has_migration_slots = True
         cols = work_pg.item_columns(_Db())
-        self.assertIn("to_jsonb(work_items)->'reviewers' AS reviewers", cols)
-        self.assertIn("to_jsonb(work_items)->>'external_executor'", cols)
+        self.assertIn("to_jsonb(reviewers) AS reviewers", cols)
+        self.assertIn("external_executor AS external_executor", cols)
         self.assertEqual(len(re.findall(r"wake_ts", cols)), 1)
 
 

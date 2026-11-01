@@ -299,6 +299,11 @@ def _landing_ref(repo: str, target: str) -> str:
     return target
 
 
+#: #5404 : la racine git d'un dossier de travail du registre, une fois trouvée
+#: (seul le positif) : un sous-processus par dossier et par gel sinon.
+_TOPLEVELS: dict = {}
+
+
 def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
                     overview: list | None = None) -> tuple[str, str]:
     """Le dépôt local qui contient le commit gelé `frozen`, et ce commit résolu.
@@ -320,10 +325,14 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
     d'un autre projet dont le commit manque lançait sinon un fetch paresseux
     (~10 s) avant d'échouer, et le balayage des dossiers du registre payait ce
     délai plusieurs fois par passe d'alertes."""
-    from ... import registry
+    from ... import db as db_mod, registry
 
     frozen = str(frozen or "").strip()
     if not frozen:
+        return "", ""
+    # #5404 : une passe à blanc ne sonde pas les clones (cinq balayages git par
+    # `ameesh alerts`) ; la vraie passe seule conclut.
+    if db_mod.is_dry_pass(db):
         return "", ""
     # #2786 : un gel qui ne nomme pas un commit hexadécimal (`HEAD`, une
     # branche) n'est jamais résolu dans le clone de l'hôte, qui lirait une
@@ -357,9 +366,11 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
         if not path or not os.path.isdir(path):
             continue
         try:
-            root = canon_mod.git_toplevel(path)
+            root = _TOPLEVELS.get(path) or canon_mod.git_toplevel(path)
         except Exception:  # noqa: BLE001 - pas un dépôt : piste suivante
             root = None
+        if root:
+            _TOPLEVELS[path] = root
         if not root or root in seen:
             continue
         seen.add(root)
