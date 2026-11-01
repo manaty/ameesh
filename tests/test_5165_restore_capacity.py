@@ -96,6 +96,48 @@ class CapacityTest(unittest.TestCase):
                 with self.assertRaises(producer.RestoreError):
                     self.value()
 
+    def test_consumer_refuses_inherited_libpq_routing_before_restore(self):
+        # #5170 N1: the producer's environment guard does not cover the
+        # consumer, whose libpq and pg_restore inherit its own environment.
+        instance = recovery.RecoverySet.__new__(recovery.RecoverySet)
+        instance.config, instance.clock = self.backup, lambda: 2000000
+        value = self.value()
+        for key in recovery.LIBPQ_ROUTING_ENVIRONMENT:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.dict(os.environ, {key: 'live'}), \
+                    mock.patch.object(recovery, 'protected_document', return_value=value), \
+                    mock.patch.object(recovery.backup, 'verify_restore') as restore:
+                with self.assertRaises(recovery.RecoveryError):
+                    instance._restore(Path(tmp) / 'dump', Path(tmp) / 'proof',
+                                      dict(source_bytes=100, artifact_sha256='a' * 64))
+                restore.assert_not_called()
+
+    def test_capacity_output_never_targets_enrollment_or_configuration(self):
+        # #5170 N2: refused before any write, not a replaced protected document.
+        conf = producer.layout('16')[1]
+        remote = dict(host='objects', upload_credentials='/srv/keys/../keys/upload.json',
+                      restore_credentials='/srv/keys/restore.json')
+        for output in (str(producer.ENROLLMENT), str(producer.INTENT),
+                       self.enrollment['backup'], '/srv/probe.json',
+                       '/etc/ameesh-release/other.json', str(conf / 'postgresql.conf'),
+                       str(producer.layout('16')[0] / 'capacity.json'),
+                       str(producer.INSTALL / 'capacity.json'),
+                       str(producer.UNIT_ROOT / 'capacity.json'),
+                       '/srv/keys/upload.json', remote['restore_credentials'],
+                       '//etc/ameesh-release/restore-probe.json', '/etc//ameesh-release/x.json',
+                       '/srv/./probe.json', '/srv/keys/../keys/upload.json'):
+            with self.subTest(output=output), \
+                    mock.patch.object(producer, 'protected', side_effect=Path), \
+                    mock.patch.object(producer, 'atomic') as write:
+                backup = dict(self.backup, restore_capacity=output, remote=remote)
+                with self.assertRaises(producer.RestoreError):
+                    producer.capacity_output(backup, self.enrollment, '/srv/probe.json')
+                write.assert_not_called()
+        with mock.patch.object(producer, 'protected', side_effect=Path):
+            self.assertEqual(producer.capacity_output(
+                dict(self.backup, restore_capacity='/var/lib/ameesh-release-restore/capacity.json'),
+                self.enrollment), Path('/var/lib/ameesh-release-restore/capacity.json'))
+
     def test_foreign_cluster_volume_or_tablespace_refused(self):
         for key, invalid in (('system_identifier', '9876543210987654321'),
                              ('data_directory', '/var/lib/postgresql/live'),

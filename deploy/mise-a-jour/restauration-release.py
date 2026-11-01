@@ -187,11 +187,32 @@ def probe(config_path=ENROLLMENT):
     # f_bavail excludes reserved blocks, conservative for the PostgreSQL user.
     value = capacity(config, backup, observed, parser=conninfo_to_dict,
                      free_bytes=volume.f_bavail * volume.f_frsize, now=time.time())
-    output = backup.get('restore_capacity')
-    if not isinstance(output, str):
-        raise RestoreError('capacity output reference required')
+    output = capacity_output(backup, config, config_path)
     atomic(output, (json.dumps(value, sort_keys=True) + '\n').encode())
     return value
+
+
+def capacity_output(backup, config, config_path=ENROLLMENT):
+    """The attestation never replaces an enrollment or configuration document."""
+    output = backup.get('restore_capacity')
+    if not isinstance(output, str) or '\x00' in output:
+        raise RestoreError('capacity output reference required')
+    # Compared in canonical form only: '//etc' or '/a/../etc' alias the same file.
+    def canonical(value):
+        return Path(os.path.normpath('/' + str(value).lstrip('/')))
+    if canonical(output) != Path(output) or str(Path(output)) != output:
+        raise RestoreError('canonical capacity output path required')
+    output = protected(output)
+    documents = {canonical(path) for path in (config_path, config['backup'], ENROLLMENT, INTENT)}
+    remote = backup.get('remote')
+    if isinstance(remote, dict):
+        documents.update(canonical(value) for value in remote.values()
+                         if isinstance(value, str) and value.startswith('/'))
+    data, conf = layout(config['version'])
+    trees = (ENROLLMENT.parent, INTENT.parent, conf, data, INSTALL, UNIT_ROOT)
+    if output in documents or any(output == tree or tree in output.parents for tree in trees):
+        raise RestoreError('capacity output must not target enrollment or configuration')
+    return output
 
 
 def units(version, python):
@@ -377,7 +398,7 @@ def remove():
         if config['system_identifier'] != intent['system_identifier']:
             raise RestoreError('restore enrollment differs')
         backup = read_document(config['backup'])
-        output = protected(backup['restore_capacity'])
+        output = capacity_output(backup, config)
     # Stop the producer before the cluster, including a probe currently running.
     if (UNIT_ROOT / (NAME + '-capacity.timer')).exists():
         command(['/usr/bin/systemctl', 'disable', '--now', NAME + '-capacity.timer'])

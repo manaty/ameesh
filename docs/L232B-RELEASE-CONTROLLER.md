@@ -963,7 +963,16 @@ are refused. The exact enrolled DSN bytes are hashed into the attestation.
 for example `/var/lib/ameesh-release-restore/capacity.json`. This directory is
 root-owned, mode 0755; the attestation itself is root 0600. The recovery
 consumer must run as root to read it, as the independent controller does;
-copying it to a runner is not part of enrollment.
+copying it to a runner is not part of enrollment. The producer refuses an output
+naming the probe enrollment, the install intent, `backup.json`, a remote
+credential file, or any path under `/etc/ameesh-release`, the cluster
+configuration and data directories, the install tree or the systemd unit
+directory: a misdirected reference fails, it never replaces a protected
+document (#5170). Only a canonical absolute path is accepted (no `//`, `.` or
+`..` alias), and removal applies the same refusal before unlinking. The consumer refuses, before any restore, when its own
+environment carries libpq routing defaults the attested DSN leaves open
+(`PGSERVICE`, `PGSERVICEFILE`, `PGSYSCONFDIR`, `PGHOSTADDR`, `PGPORT`,
+`PGOPTIONS`): the in-process connection and `pg_restore` inherit them.
 
 The root-private `/etc/ameesh-release/restore-probe.json` pins the backup
 configuration path, PostgreSQL major and cluster `system_identifier` observed
