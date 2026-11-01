@@ -10415,7 +10415,13 @@ class Runner:
         self._lifecycle_requirements = factory.requirements_for
 
     def sandbox_credentials_for(self, agent, owner, epoch, turn_id, deadline_ts):
-        """Issue only admitted sandbox credentials; no ordinary lease bearer."""
+        """Issue only admitted sandbox credentials; no ordinary lease bearer.
+
+        `deadline_ts` is the deadline the caller read on the admission. It is
+        part of the S6 boundary signature but never trusted as the expiry: the
+        issuer re-reads the admitted turn under lock and bounds the bearer on
+        the DATABASE deadline, so a caller's claim cannot extend it (#5217/N3).
+        """
         from . import relay, runner_sandbox, sandbox_relay
         from .storage.postgres.sandbox import Refusal
         base = relay.relay_url({

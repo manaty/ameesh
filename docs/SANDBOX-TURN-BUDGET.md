@@ -63,9 +63,13 @@ and checks the current lease owner, epoch, host, cancellation, terminal state
 and deadline against the database clock on every authentication. Token issuance,
 verification and the pre-provider accounting gate lock the sandbox row before
 the registry row, like completion and cancellation. Ordinary lease credentials
-cannot replace a sandbox bearer. A previously admitted sandbox agent refuses
-local fallback when its canon cannot be read; the admission trace survives a
-runner restart. These paths do not activate any sandbox card.
+cannot replace a sandbox bearer while a sandbox turn is live on the same
+(agent, owner, epoch); a terminal turn stops fencing, so the lease bearer is
+usable again. A lease shared by several agents is supported: only the agent
+holding the live sandbox turn is fenced (concurrent sandbox turns on one agent
+are not: unique live index). A previously admitted sandbox agent refuses local
+fallback when its canon cannot be read; the admission trace survives a runner
+restart. These paths do not activate any sandbox card.
 
 A closed turn cannot authenticate its bearer any more: the stored digest is
 only a proof of issuance. The runner's daily housekeeping deletes the digests

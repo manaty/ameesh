@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Turn-scoped relay credentials, issued only after durable admission (#5140).
 
-Only the digest of a random bearer is stored. Its identity, spend key and
-deadline always come from the admission, never from a caller's claims.
+Only the digest of a random bearer is stored. The verified identity (agent,
+owner, lease epoch, host) and the deadline always come from the admission,
+never from a caller's claims. The spend key is reached through the turn id
+(`sandbox_turns.spend_key`), never carried by the token (#5217/N1).
 """
 from __future__ import annotations
 
@@ -15,6 +17,13 @@ from .storage.postgres import sandbox as s1
 
 PREFIX = 'amsb1.'
 _TOKEN = re.compile(r'amsb1\.[A-Za-z0-9_-]{43}\Z')
+
+#: states in which a sandbox turn admits no bearer and no longer fences the
+#: agent's ordinary lease bearer; the sandbox storage boundary owns this set.
+#: `expired`/`lost` may have no `completed_at`: retention is then bounded on
+#: `deadline_ts` (the bearer was already useless after it).
+_TERMINAL_STATES = tuple(sorted(s1.TERMINAL))
+_TERMINAL_SQL = "('" + "','".join(_TERMINAL_STATES) + "')"
 
 
 def _identity(tx, turn_id, agent, owner, epoch, host):
@@ -71,7 +80,14 @@ class Tokens:
 
 
 class RelayTokens:
-    """Preserve legacy relay use, fencing lease tokens for sandbox agents."""
+    """Preserve legacy relay use, fencing the lease bearer of a sandbox agent.
+
+    Fencing is per (agent, owner, lease epoch) and only while the sandbox turn
+    is live: a terminal turn no longer accepts its own bearer, so the ordinary
+    lease bearer becomes usable again. A lease shared by several agents is
+    supported (only the agent holding the live sandbox turn is fenced); two
+    concurrent sandbox turns on one agent are not (unique live index,
+    #5217/N5)."""
 
     def __init__(self, db, legacy):
         self.db, self.legacy = db, legacy
@@ -82,7 +98,8 @@ class RelayTokens:
             return self.sandbox.verify_token(token)
         identity = self.legacy.verify_token(token)
         if self.db.query('select 1 from sandbox_turns where agent = %s'
-                         ' and owner = %s and lease_epoch = %s limit 1',
+                         ' and owner = %s and lease_epoch = %s'
+                         ' and state not in ' + _TERMINAL_SQL + ' limit 1',
                          (identity.agent, identity.lease_owner, identity.lease_epoch)):
             raise relay.TokenError('sandbox turn token required')
         return identity
@@ -94,17 +111,11 @@ def compose(db, legacy):
 
     Both relay entry points (the mediated server's `build_relay` and the
     autonomous `relay serve`) compose here: a sandbox bearer is verified by
-    `Tokens`, and a legacy bearer for an agent holding a sandbox turn is
+    `Tokens`, and a legacy bearer for an agent holding a live sandbox turn is
     refused. Without it the autonomous relay would refuse every `amsb1.`
     bearer (it never reaches the legacy verifier) or accept a lease bearer
     for a sandbox agent (#5217)."""
     return RelayTokens(db, legacy)
-
-
-#: turns whose token digests may be purged, with the closed timestamp that bounds
-#: their retention. `expired`/`lost` may have no `completed_at`: the deadline is
-#: then the bound that matters (the bearer was useless after it).
-_TERMINAL_STATES = ('succeeded', 'failed', 'cancelled', 'expired', 'lost')
 
 
 def purge(db, *, days, limit: int = 1000) -> int:
@@ -119,14 +130,13 @@ def purge(db, *, days, limit: int = 1000) -> int:
         raise ValueError('retention days must be a positive integer')
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError('purge limit must be a positive integer')
-    states = "'" + "','".join(_TERMINAL_STATES) + "'"
     with db.transaction() as tx:
         rows = tx.query(
             'delete from sandbox_relay_tokens t'
             ' where t.token_sha256 in ('
             '   select t2.token_sha256 from sandbox_relay_tokens t2'
             '   join sandbox_turns s on s.turn_id = t2.turn_id'
-            '   where s.state in (' + states + ')'
+            '   where s.state in ' + _TERMINAL_SQL +
             '   and coalesce(s.completed_at, s.deadline_ts)'
             '       < clock_timestamp() - make_interval(days => %s)'
             '   order by t2.token_sha256 limit %s)'
