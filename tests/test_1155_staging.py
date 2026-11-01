@@ -2266,6 +2266,88 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertEqual(cible['name'], 'ameesh-dev5')
         self.assertIn('sans bail vivant', remplacement['raison'])
 
+    # --- #5312 : sommeil automatique de la feuille de route epuisee ---
+    SOMMEIL = 'roadmap: épuisée ameesh (#3256 §2.3)'
+
+    def test_5312_sommeil_auto_reconnu_et_distinct_d_une_pause_humaine(self):
+        """#5312 : seule la raison exacte du sommeil automatique est reconnue."""
+        self.assertTrue(self.mod.sommeil_auto(
+            {'operator_paused': True, 'operator_pause_reason': self.SOMMEIL}))
+        self.assertFalse(self.mod.sommeil_auto(
+            {'operator_paused': True,
+             'operator_pause_reason': 'maintenance du 01/11'}))
+        self.assertFalse(self.mod.sommeil_auto(
+            {'operator_paused': True,
+             'operator_pause_reason': 'roadmap: épuisée ameesh'}))
+        self.assertFalse(self.mod.sommeil_auto(
+            {'operator_pause_reason': self.SOMMEIL}))
+        self.assertEqual(
+            self.mod.motif_non_libre(
+                {'operator_paused': True, 'operator_pause_reason': self.SOMMEIL}),
+            'sommeil automatique (feuille de route epuisee)')
+
+    def test_5312_cible_en_sommeil_auto_remplacee_sans_attente(self):
+        """#5312 : la cible endormie n'est pas attendue ; la remplacante est
+        prise tout de suite, sans bruler la borne de 300 s."""
+        t, mono, dormir = self.horloge()
+        rows = self.rangs_4126()
+        rows[0] = dict(rows[0], operator_paused=True,
+                       operator_pause_reason=self.SOMMEIL)
+        etats = {r['name']: r for r in rows}
+        with mock.patch.object(self.mod.registry, 'get',
+                               side_effect=lambda db, nom: etats[nom]), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0):
+            cible, pourquoi, remplacement = self.mod.selection(
+                None, rows, 'ameesh-dev3', 300.0, 1000.0)
+        self.assertEqual(t[0], 0.0)
+        self.assertEqual(cible['name'], 'ameesh-dev5')
+        self.assertEqual(remplacement['attente_s'], 0.0)
+        self.assertIn('sommeil automatique', remplacement['raison'])
+        self.assertIn('remplacante ameesh-dev5', pourquoi)
+
+    def test_5312_sommeil_auto_sans_remplacante_reste_sans_sonde(self):
+        """#5312 : endormie et sans autre libre, la sonde est sans-sonde sans
+        attente, avec le motif nomme."""
+        t, mono, dormir = self.horloge()
+        rows = self.rangs_4126()
+        rows[0] = dict(rows[0], operator_paused=True,
+                       operator_pause_reason=self.SOMMEIL)
+        rows[1] = dict(rows[1], operator_paused=True)
+        etats = {r['name']: r for r in rows}
+        with mock.patch.object(self.mod.registry, 'get',
+                               side_effect=lambda db, nom: etats[nom]), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0):
+            cible, pourquoi, remplacement = self.mod.selection(
+                None, rows, 'ameesh-dev3', 300.0, 1000.0)
+        self.assertEqual(t[0], 0.0)
+        self.assertIsNone(cible)
+        self.assertIsNone(remplacement)
+        self.assertIn('sommeil automatique', pourquoi)
+        self.assertIn('aucune autre persona menee libre', pourquoi)
+
+    def test_5312_pause_de_maintenance_reste_attendue(self):
+        """#5312 : une vraie pause humaine n'est pas le sommeil ; elle est
+        toujours attendue jusqu'a la borne (on ne la traite pas comme libre)."""
+        t, mono, dormir = self.horloge()
+        rows = self.rangs_4126()
+        rows[0] = dict(rows[0], operator_paused=True,
+                       operator_pause_reason='maintenance du 01/11')
+        etats = {r['name']: r for r in rows}
+        with mock.patch.object(self.mod.registry, 'get',
+                               side_effect=lambda db, nom: etats[nom]), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0):
+            cible, pourquoi, remplacement = self.mod.selection(
+                None, rows, 'ameesh-dev3', 300.0, 1000.0)
+        self.assertEqual(t[0], 300.0)
+        self.assertEqual(cible['name'], 'ameesh-dev5')
+        self.assertIn('pause operateur', remplacement['raison'])
+
     def test_4126_cible_nommee_absente_reste_une_erreur(self):
         with self.assertRaises(SystemExit):
             self.mod.selection(None, self.rangs_4126(), 'inconnu', 300.0, 1000.0)
