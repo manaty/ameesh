@@ -158,8 +158,10 @@ class VerrouTest(unittest.TestCase):
             with mock.patch.object(disque, "_racine_runner", return_value=home / "r1"):
                 dossier = disque._dossier_verrou()
         self.assertEqual(dossier, home)
-        self.assertNotEqual(str(dossier), "/tmp")
-        self.assertFalse(str(dossier).startswith("/tmp/"))
+        self.assertNotEqual(dossier, pathlib.Path("/tmp"))
+        # Pas d'assertion « hors /tmp » : en CI, TMPDIR vaut /tmp et le faux
+        # home est donc /tmp/tmpXXXX. Le contrat est que le verrou soit le
+        # home du runner (racine.parent), pas /tmp lui-même.
 
     def test_vieux_verrou_tenu_refuse_le_second(self):
         with tempfile.TemporaryDirectory() as tmp:
