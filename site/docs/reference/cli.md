@@ -1073,6 +1073,35 @@ versions. Exit 0 otherwise, 1 when the report carries an error (an unreadable
 source stays visible in the timer's journal and is retried on the next pass),
 2 on a usage error.
 
+## Context corpus and counterfactual replay: `ameesh context`
+
+```
+ameesh context corpus export --out FILE [--days N | --since T] [--until T]
+                             [--harness H] [--batch N] [--force]
+ameesh context corpus check FILE
+ameesh context replay --corpus FILE --candidates FILE --out FILE [--force]
+```
+
+`corpus export` rebuilds, read-only, one line per turn from the turn ledger
+(`turn_costs`) and the `turn.context` events (CTX-05a, #5134): counters only,
+never a prompt, a tool result, a mail body, a secret or a private path. The
+window defaults to one day; `--since` and `--until` take an epoch or an ISO
+date (`--until` exclusive, default now), `--harness` keeps one harness,
+`--batch` bounds the events read per page (default 1000), and `--out` must be
+outside the repository and is written `0600`; `--force` replaces an existing
+corpus. `corpus check` validates an `ameesh-context-corpus/1` file.
+
+`replay` (CTX-05b, #5135) replays a corpus session after session through the
+delivered decision functions (`AgentWorker.reread_budget_due`, CTX-04a;
+`resident_runner.window_maintenance`, CTX-04b), called and never copied, and
+writes an `ameesh-context-replay/1` report outside the repository, `0600`.
+Each turn carries two separate blocks: `observed`, read from the corpus's
+`decision` alone, and `counterfactual`, computed from the measures and the
+candidate settings without reading `decision.observed`. `--candidates` is an
+input, never a default: a missing setting stays off or unknown, and the
+unknown is named. Nothing is activated — no registry or ledger write, no
+setting changed; `--force` replaces the report.
+
 ## Comparative replay: `ameesh replay`
 
 ```
