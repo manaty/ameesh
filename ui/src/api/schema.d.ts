@@ -821,7 +821,7 @@ export interface components {
             project: string | null;
             ts: number;
             /** @enum {unknown} */
-            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "packet.pause";
+            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "git.lock_removed" | "packet.pause";
         };
         "ameesh-host-1": {
             history: Record<string, never>[];

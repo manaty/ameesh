@@ -2511,6 +2511,9 @@ def fetch_fresh(repo: str, names, clone=None,
         raise QueueError("%s: origin cannot be fetched without the radar's clone "
                          "(ameesh work queue add finds it from the project)" % what)
     present: set = set()
+    # #5179 : ce fetch reste hors du verrou de clone (le radar peut l'utiliser
+    # longtemps) ; ses refs sont sujettes aux verrous orphelins comme l'index.
+    clone.sweep_locks()
     try:
         if not os.path.isdir(os.path.join(clone.path, ".git")):
             clone.ensure()  # an existing clone is not reset: the radar may use it
@@ -3465,7 +3468,7 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
     if live and replayer is None:
         from . import radar
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name),
-                                        target=project.target)
+                                        target=project.target, db=db)
     # the radar reads the agents' refs, which may be stale either way, or gone
     # (a checkout recreated): each pass fetches the branch of every queued
     # lot and its target, scanned or not, and those tips decide
@@ -3495,6 +3498,10 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         tip, head = tips.get(row.get("branch")), tips.get(row["target"])
         if failed is not None:
             defer(row, str(failed))
+            from . import land
+            note = land.lock_note(str(failed))
+            if note:  # #5179 : compté par `land.lock_stuck`, comme un atterrissage
+                storage.of(db).work.queue_update(lot, note=note, actor=work.SYSTEM_SENDER)
             continue
         place = "origin" if where != project.repo else "the repository"
         if tip is None:
