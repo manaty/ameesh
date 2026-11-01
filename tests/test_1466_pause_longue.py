@@ -111,7 +111,9 @@ class PauseLongueTest(PgTestCase):
 
     def test_pause_operateur_sans_alerte(self):
         # 30/10, ameesh-cx1 : sommeil de feuille de route, motif de budget resté
-        self._pause("budget : account primaire: next turn in 24s (start gap 30s, #3779)", 61)
+        # (#5301 : un motif de fenêtre courte ne s'alerte plus de lui-même ;
+        # le témoin garde une pause de jauge sans échéance lisible)
+        self._pause("budget : pause (account primaire, seven_day 99 %); …", 61)
         self.assertEqual(len(self._alertes()), 1)
         self.db.execute("UPDATE agent_registry SET operator_paused = true"
                         " WHERE name = 'ouvrier'")
