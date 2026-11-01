@@ -828,8 +828,8 @@ def period_price(prices: dict, model: str | None, started: float | None,
 
 def price_of(prices: dict, harness: str, model: str | None) -> list:
     """Le triplet de prix d'un modèle, sinon le majorant de sa famille (#5182 :
-    jamais `default-*`, le tarif le moins cher), avec le repli par harnais si la
-    famille n'a aucun tarif."""
+    pas `default-*`, le tarif le moins cher, tant qu'elle a un tarif connu) ;
+    `default-<harnais>` n'est que le repli d'une famille sans aucun tarif."""
     return known_price(prices, model) or max_price_of(prices, harness) \
         or prices.get("default-%s" % harness) or prices["default-deepseek"]
 

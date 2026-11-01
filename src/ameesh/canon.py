@@ -1122,6 +1122,9 @@ class HostPolicy:
     #: hôte volatil (L112) : appareil prêté qui peut disparaître à tout
     #: moment (VM Compute) ; son bail est court, 90 s par défaut
     volatile: bool = False
+    #: hôte intermittent (#5207) : poste qu'on éteint volontairement ; son
+    #: silence n'alerte pas, et ses alertes reviennent avec son premier relevé
+    intermittent: bool = False
     #: durée du bail des agents de cet hôte (secondes, L112) ; None = 90 s
     #: pour un hôte volatil, sinon la configuration de l'exécuteur
     lease_ttl: float | None = None
@@ -4158,6 +4161,13 @@ class _Loader:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.volatile` : booléen attendu", **where, **subject)
                     policy.volatile = True  # prudence : bail court
+            # #5207 : illisible = non déclaré, le silence de l'hôte reste alerté
+            if raw.get("intermittent") is not None:
+                if isinstance(raw["intermittent"], bool):
+                    policy.intermittent = raw["intermittent"]
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.intermittent`: boolean expected", **where, **subject)
             if raw.get("lease_ttl") is not None:
                 value = raw["lease_ttl"]
                 if isinstance(value, (int, float)) and not isinstance(value, bool) \
