@@ -80,14 +80,14 @@ def package_status(items: list[dict]) -> str:
 
 def _activated_unit(item: dict, activation: dict | None) -> str:
     """#5244 : l'unité d'un lot une fois l'étape d'activation connue : `active`
-    (compte comme fait, preuve ou reçu), `unmeasured` (compte, sans mesure
-    possible), `waiting` (livré, pas encore activé) ; sinon comme avant."""
+    (fait : preuve ou reçu), `waiting` (livré, pas encore activé), `unmeasured`
+    (livré, aucune preuve lisible, donc pas fait) ; sinon comme avant."""
     entry = (activation or {}).get(int(item["id"]))
     if not entry or entry["step"] in ("open", "abandoned"):
         return item_unit_status(item.get("state") or "", item.get("close_reason"))
-    if not entry["counted"]:
-        return "waiting"
-    return "unmeasured" if entry["step"] == "unmeasured" else "active"
+    if entry["step"] == "unmeasured":
+        return "unmeasured"
+    return "active" if entry["counted"] else "waiting"
 
 
 def _activated_package(items: list[dict], activation: dict | None) -> str:
@@ -104,14 +104,15 @@ def _activated_package(items: list[dict], activation: dict | None) -> str:
 def _tally(units: list[str]) -> dict:
     waiting = units.count("waiting")
     active = units.count("active")
-    merged = units.count("merged") + active + waiting + units.count("unmeasured")
+    unmeasured = units.count("unmeasured")
+    merged = units.count("merged") + active + waiting + unmeasured
     abandoned = units.count("abandoned")
     counted = len(units) - abandoned
     return {"lots_total": len(units), "lots_merged": merged, "lots_abandoned": abandoned,
             "lots_open": units.count("open"), "lots_pending": units.count("pending"),
             "lots_active": active, "lots_waiting_activation": waiting,
-            "lots_unmeasured": units.count("unmeasured"),
-            "progress": round((merged - waiting) / counted, 4) if counted else None}
+            "lots_unmeasured": unmeasured,
+            "progress": round((merged - waiting - unmeasured) / counted, 4) if counted else None}
 
 
 def summarize(packages: Iterable[dict], items: Iterable[dict],
@@ -152,6 +153,7 @@ def summarize(packages: Iterable[dict], items: Iterable[dict],
             canon_ref=epic.get("canon_ref"),
             planned=planned_dates(epic),         # L96
             lots=[{"id": p["id"], "title": p.get("title"), "status": lot_status[p["id"]],
+                   "step": _activated_package(by_package.get(p["id"], []), activation),
                    "work_items": [int(i["id"]) for i in by_package.get(p["id"], [])]}
                   for p in sorted(lots, key=lambda p: p["id"])],
             work_items=[int(i["id"]) for i in direct],

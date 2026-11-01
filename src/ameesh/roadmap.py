@@ -56,7 +56,7 @@ import textwrap
 import time
 from typing import Iterable
 
-from . import activation
+from . import activation as activation_mod
 from . import config as config_mod
 from . import db as db_mod
 from . import estimates as estimates_mod
@@ -465,6 +465,10 @@ def build_task(item: dict, real: dict, *, base: _dt.date, epic: str | None,
     }
 
 
+def _no_lateness(step: dict) -> bool:
+    return step["counted"] or step["step"] == activation_mod.UNMEASURED
+
+
 def _commitment_view(row: dict, base: _dt.date, items: dict,
                      activation: dict | None = None) -> dict:
     item = items.get(row.get("work_item_id")) if row.get("work_item_id") else None
@@ -474,8 +478,9 @@ def _commitment_view(row: dict, base: _dt.date, items: dict,
         step["counted"] if step else item and dev.livree(item.get("state")))
     due = _date(row.get("due_on"))
     late = None
+    # #5244 : sans preuve lisible, ni tenu ni en retard (§3)
     if row["status"] == "open" and row["kind"] == "commitment" and not fulfilled \
-            and due and base > due:
+            and due and base > due and not (step and step.get("step") == activation_mod.UNMEASURED):
         late = {"what": "commitment", "due": due.isoformat(), "days": (base - due).days,
                 "open": True}
     return {
@@ -511,6 +516,7 @@ def _package_view(pkg: dict, tally: dict, real_span: tuple, base: _dt.date) -> d
         "units_delivered": tally.get("lots_merged", 0),
         "units_active": tally.get("lots_active", 0),
         "units_waiting_activation": tally.get("lots_waiting_activation", 0),
+        "units_unmeasured": tally.get("lots_unmeasured", 0),
         "late": late, "source": source,
         "canon_ref": pkg.get("canon_ref"),
     }
@@ -558,7 +564,7 @@ def build(db, *, now: float | None = None, project: str | None = None,
         if extra:
             items_by_id[int(extra["id"])] = extra
     # #5244 : une seule lecture des preuves, pour les fiches, tâches et engagements
-    steps = activation.compute(db, list({int(i["id"]): i for i in (
+    steps = activation_mod.compute(db, list({int(i["id"]): i for i in (
         *package_items, *items_by_id.values())}.values()))
     summary = plan_mod.summarize(packages, package_items, steps)
     commitments = [_commitment_view(c, base, items_by_id, steps) for c in commitment_rows]
@@ -701,7 +707,7 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
                 continue
             # #5244 : tâche activée : engagement tenu (livrer ne suffit pas)
             if item and dev.livree(item.get("state")) \
-                    and activation.compute(db, [item])[int(item["id"])]["counted"]:
+                    and _no_lateness(activation_mod.compute(db, [item])[int(item["id"])]):
                 continue
         out.append({"reason": "engagement", "what": row["what"], "due": due.isoformat(),
                     "days": (base - due).days, "commitment": row["id"], "lot": lot,
@@ -920,10 +926,9 @@ def format_gantt(view: dict, width: int | None = None, *, who: dict | None = Non
             src = p.get("source") or {}
             row("%s %s" % (p["id"], p["title"]), bar, [
                 planned_text(p["planned"]),
-                "%d/%d delivered, %d not active yet" % (
-                    p["units_delivered"], p["units_total"], p["units_waiting_activation"])
-                if p["units_total"] and p.get("units_waiting_activation")
-                else "%d/%d delivered" % (p["units_delivered"], p["units_total"])
+                "%d/%d delivered, %d active, %d not active yet, %d not measured" % (
+                    p["units_delivered"], p["units_total"], p.get("units_active", 0),
+                    p.get("units_waiting_activation", 0), p.get("units_unmeasured", 0))
                 if p["units_total"] else "",
                 _flag(p), "source: %s" % src["label"] if src.get("label") else ""])
     out.append("")

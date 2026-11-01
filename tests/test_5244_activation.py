@@ -10,6 +10,8 @@ from unittest import mock
 
 from ameesh import activation, plan, roadmap, staging_pending, work
 
+from ameesh.storage.postgres import progress as postgres_progress
+
 from .support import PgTestCase
 
 
@@ -21,15 +23,15 @@ def lot(ident, state="delivered", reason=None, app="ameesh", executor=None, pack
 PROOF = activation.Evidence(ancestors=sorted(["a" * 40, "c" * 40]), known={"b" * 12})
 
 
-def step(item, sha=None, signed=None, proof=PROOF):
-    return activation.step_of(item, sha, signed=signed, proof=proof)["step"]
+def step(item, sha=None, receipts=None, proof=PROOF):
+    return activation.step_of(item, sha, receipts=receipts, proof=proof)["step"]
 
 
 class Steps(unittest.TestCase):
     def test_merged_needs_the_attested_commit(self):
         self.assertEqual(step(lot(1), "a" * 12), "active")
         self.assertEqual(step(lot(1), "b" * 12), "merged")
-        self.assertFalse(activation.step_of(lot(1), "b" * 12, signed=None,
+        self.assertFalse(activation.step_of(lot(1), "b" * 12, receipts=None,
                                             proof=PROOF)["counted"])
 
     def test_absence_of_evidence_is_not_a_negative(self):
@@ -37,15 +39,28 @@ class Steps(unittest.TestCase):
                                  (lot(1), None, PROOF),
                                  (lot(1), "a" * 12, activation.Evidence()),
                                  (lot(1, app="autre"), "a" * 12, PROOF)):
-            view = activation.step_of(item, sha, signed=None, proof=proof)
-            self.assertEqual((view["step"], view["counted"]), ("unmeasured", True))
+            view = activation.step_of(item, sha, receipts=None, proof=proof)
+            self.assertEqual((view["step"], view["counted"]), ("unmeasured", False))
 
-    def test_operator_gesture_needs_a_signed_decision(self):
+    def test_operator_gesture_needs_an_executed_signed_receipt(self):
         gesture = lot(1, "closed", "done", executor="bureau")
         self.assertEqual(step(gesture), "gesture")
-        view = activation.step_of(gesture, None, signed={1: 77}, proof=PROOF)
-        self.assertEqual((view["step"], view["counted"], view["decision"]),
-                         ("receipt", True, 77))
+        view = activation.step_of(gesture, None, receipts={1: "act"}, proof=PROOF)
+        self.assertEqual((view["step"], view["counted"], view["action"]),
+                         ("receipt", True, "act"))
+
+    def test_authorization_is_not_a_result(self):
+        row = {"work_item": 1, "action_id": "act", "state": "confirmed", "auth_kind": "receipt"}
+        self.assertEqual(activation.signed_receipts([row]), {1: "act"})
+        for other in ({"state": "approved"}, {"state": "failed"}, {"auth_kind": "standing"},
+                      {"auth_kind": "none"}):
+            self.assertEqual(activation.signed_receipts([dict(row, **other)]), {})
+
+    def test_losing_the_evidence_never_raises_progress(self):
+        view = activation.step_of(lot(1), "a" * 12, receipts=None, proof=activation.Evidence())
+        epic = plan.summarize(Tally.PACKAGES[:1], [lot(1)], {1: view})["epics"][0]
+        self.assertEqual((epic["progress"], epic["lots_unmeasured"], epic["lots_active"]),
+                         (0, 1, 0))
 
     def test_other_closures_keep_their_meaning(self):
         self.assertEqual(step(lot(1, "closed", "done")), "abandoned")
@@ -85,6 +100,10 @@ class Tally(unittest.TestCase):
         steps[2] = {"step": "active", "counted": True}
         epic = self.summary([lot(1, package="f1"), lot(2, package="f1")], steps)
         self.assertEqual((epic["lots_active"], epic["progress"]), (1, 1))
+        self.assertEqual(epic["lots"][0]["step"], "active")
+        steps[2] = {"step": "merged", "counted": False}
+        epic = self.summary([lot(1, package="f1"), lot(2, package="f1")], steps)
+        self.assertEqual(epic["lots"][0]["step"], "waiting")
 
 
 class Clone(unittest.TestCase):
@@ -128,21 +147,10 @@ class Registry(PgTestCase):
         super().setUp()
         self.ident = int(work.add(db=self.db, title="Geste", assignee=None, app="ameesh")["id"])
 
-    def answer(self, channel):
-        import json
-        self.db.execute(
-            "INSERT INTO agent_mailbox (sender, recipient, body, kind, work_item_id, payload)"
-            " VALUES ('a', 'human:o', 'q', 'request', %s, %s::jsonb)",
-            (str(self.ident), json.dumps({"decision": {"state": "answered",
-                                                       "answer": {"channel": channel}}})))
-
-    def test_only_a_signed_answer_is_a_receipt(self):
+    def test_receipt_columns_are_read(self):
         from ameesh import storage
-        store = storage.of(self.db).decisions
-        self.answer("cli")
-        self.assertEqual(store.signed_for_lots([self.ident]), {})
-        self.answer("signed")
-        self.assertEqual(list(store.signed_for_lots([self.ident])), [self.ident])
+        self.assertEqual(storage.of(self.db).progress.lot_actions([self.ident]), [])
+        self.assertIn("auth_kind", postgres_progress._ACTION_COLUMNS)
 
     def test_commitment_waits_for_activation(self):
         row = {"id": 1, "work_item_id": self.ident, "status": "open", "kind": "commitment",
@@ -156,3 +164,7 @@ class Registry(PgTestCase):
         view = roadmap._commitment_view(row, base, {self.ident: item},
                                         {self.ident: {"counted": True}})
         self.assertTrue(view["fulfilled"])
+        view = roadmap._commitment_view(row, base, {self.ident: item},
+                                        {self.ident: {"counted": False, "step": "unmeasured"}})
+        self.assertFalse(view["fulfilled"])
+        self.assertIsNone(view["late"])

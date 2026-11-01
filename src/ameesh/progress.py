@@ -983,7 +983,7 @@ def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict
             "decisions_pending": sum(1 for d in decisions if d.get("project") == name),
             "milestone": ({k: ms.get(k) for k in ("id", "title", "date", "progress",
                                                   "lots_merged", "lots_total", "lots_active",
-                                                  "lots_waiting_activation")}
+                                                  "lots_waiting_activation", "lots_unmeasured")}
                           if ms else None),
             "warnings": list(p.get("warnings") or []),
         })
@@ -1407,8 +1407,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
             counted = epic["lots_total"] - epic["lots_abandoned"]
             line("%s — %s: %d/%d %s merged%s%s" % (
                 epic["id"], epic["title"], epic["lots_merged"], counted, words.plural,
-                ", %d not active yet" % epic["lots_waiting_activation"]
-                if epic.get("lots_waiting_activation") else "",
+                ", %d active, %d not active yet, %d not measured" % (
+                    epic["lots_active"], epic["lots_waiting_activation"],
+                    epic["lots_unmeasured"]) if epic["lots_merged"] else "",
                 " (%d abandoned)" % epic["lots_abandoned"] if epic["lots_abandoned"] else ""),
                 "  ")
 
@@ -1444,8 +1445,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
         for ms in snap["milestones"]:
             progress = ("%d/%d %s merged%s" % (
                 ms["lots_merged"], ms["lots_total"] - ms.get("lots_abandoned", 0),
-                words.plural, ", %d not active yet" % ms["lots_waiting_activation"]
-                if ms.get("lots_waiting_activation") else "")
+                words.plural, ", %d active, %d not active yet, %d not measured" % (
+                    ms["lots_active"], ms["lots_waiting_activation"], ms["lots_unmeasured"])
+                if ms["lots_merged"] else "")
                 if "lots_total" in ms else "")
             line("%s %s%s" % (ms["date"] if ms.get("date") else "no date",
                               ms.get("title", ""), " — %s" % progress if progress else ""), "  ")

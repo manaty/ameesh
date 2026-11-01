@@ -1050,7 +1050,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       box.appendChild(dl([["date", ms.date || "no date"], ["owner", ms.responsible],
                           ["state", ms.status], ["canon", ms.canon_ref],
                           ["progress", ms.lots_merged + "/" + counted + " " + W().abbreviation + " merged"
-                            + (ms.lots_waiting_activation ? ", " + ms.lots_waiting_activation + " not active yet" : "")
+                            + (ms.lots_merged ? ", " + ms.lots_active + " active, " + ms.lots_waiting_activation + " not active yet, " + ms.lots_unmeasured + " not measured" : "")
                             + (ms.progress !== null && ms.progress !== undefined ? " (" + Math.round(ms.progress * 100) + "%)" : "")]]));
       box.appendChild(bar(ms.progress, Math.round((ms.progress || 0) * 100) + "% done (active)"));
       var epics = (D.epics || []).filter(function (e) { return e.milestone === id; });
@@ -1711,7 +1711,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       head.appendChild(el("span", "lot-id", p.id));
       head.appendChild(el("span", "t", p.title));
       if (p.units_total) head.appendChild(el("span", "meta", p.units_delivered + "/" + p.units_total + " delivered"
-        + (p.units_waiting_activation ? ", " + p.units_waiting_activation + " not active yet" : "")));
+        + (p.units_delivered ? ", " + p.units_active + " active, " + p.units_waiting_activation + " not active yet, " + p.units_unmeasured + " not measured" : "")));
       late(head, p.late);
       row.appendChild(head);
       // le réel d'une fiche court jusqu'à aujourd'hui tant que tout n'est pas livré

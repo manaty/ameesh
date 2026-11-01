@@ -9,12 +9,15 @@ code therefore only reaches the first step. The steps of a lot that was done:
   actually active (`staging_pending.active_hosts`, a reported host holds
   nothing, as in `staging_pending.waiting`);
 * `gesture`: an operator gesture (closed by hand, reserved to an external
-  executor) with no signed decision on the lot: the closure alone proves nothing;
-* `receipt`: the same gesture, with a signed answer to a decision of the lot;
+  executor) with no receipt: neither the closure nor a signed answer proves the
+  effect, an answer may refuse, or authorize what was never run;
+* `receipt`: the same gesture, with a gated action of the lot authorized by a
+  verified signed receipt (`ameesh-receipt/1`) and confirmed once executed;
 * `delivered`: delivered outside the target, there is nothing to activate;
 * `unmeasured`: nothing can tell (a project with no attestation, no readable
-  clone, no attestation yet, a commit absent from the clone). It keeps counting
-  as before and says so: an absence of evidence is not a negative (§3).
+  clone, no attestation yet, a commit absent from the clone). It is not proved,
+  so it does not count as done, and is shown apart from a known `merged`: an
+  absence of evidence is no negative (§3) and raises no lateness.
 
 `counted` says whether the lot counts as done. Read only: no fetch, and a git
 failure only makes the step `unmeasured`.
@@ -134,16 +137,23 @@ def _view(step: str, counted: bool, **extra) -> dict:
     return dict({"step": step, "counted": counted, "label": LABELS[step]}, **extra)
 
 
-def step_of(item: dict, sha: str | None, *, signed: dict | None, proof: Evidence) -> dict:
-    """`{step, counted, label, decision?}` of one lot."""
+def signed_receipts(actions) -> dict:
+    """`{lot: action id}`: gated actions executed under a verified signed receipt
+    (`progress.lot_actions` rows); `actions` checked the receipt before running."""
+    return {int(a["work_item"]): a["action_id"] for a in actions
+            if a.get("state") == "confirmed" and a.get("auth_kind") == "receipt"}
+
+
+def step_of(item: dict, sha: str | None, *, receipts: dict | None, proof: Evidence) -> dict:
+    """`{step, counted, label, action?}` of one lot."""
     state = item.get("state") or ""
     reason = item.get("close_reason")
     if state == lifecycle.CLOSED:
         if reason not in ("done", "delivered"):
             return {"step": ABANDONED, "counted": False, "label": None}
         if (item.get("external_executor") or "").strip():
-            decision = (signed or {}).get(int(item["id"]))
-            return (_view(RECEIPT, True, decision=decision) if decision
+            action = (receipts or {}).get(int(item["id"]))
+            return (_view(RECEIPT, True, action=action) if action
                     else _view(GESTURE, False))
         if reason == "delivered":
             return _view(DELIVERED, True)
@@ -153,10 +163,10 @@ def step_of(item: dict, sha: str | None, *, signed: dict | None, proof: Evidence
         return {"step": OPEN, "counted": False, "label": None}
     if (item.get("app") or item.get("workstream")) != ATTESTED_APP \
             or proof.ancestors is None or not sha:
-        return _view(UNMEASURED, True)
+        return _view(UNMEASURED, False)
     if proof.contains(sha):
         return _view(ACTIVE, True)
-    return _view(MERGED, False) if sha in proof.known else _view(UNMEASURED, True)
+    return _view(MERGED, False) if sha in proof.known else _view(UNMEASURED, False)
 
 
 def compute(db, items, *, cfg=None) -> dict:
@@ -169,6 +179,6 @@ def compute(db, items, *, cfg=None) -> dict:
                 and r.get("close_reason") in ("done", "delivered")
                 and (r.get("external_executor") or "").strip()]
     shas = merged_shas(st.progress.lot_milestones(merged)) if merged else {}
-    signed = st.decisions.signed_for_lots(gestures) if gestures else {}
+    receipts = signed_receipts(st.progress.lot_actions(gestures)) if gestures else {}
     proof = evidence(db, shas.values(), cfg=cfg) if merged else Evidence()
-    return {i: step_of(r, shas.get(i), signed=signed, proof=proof) for i, r in rows.items()}
+    return {i: step_of(r, shas.get(i), receipts=receipts, proof=proof) for i, r in rows.items()}

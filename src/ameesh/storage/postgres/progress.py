@@ -21,7 +21,7 @@ _OPEN_ACTION_STATES = ("proposed", "approved", "launched", "unknown")
 
 _ACTION_COLUMNS = """
     action_id, project, work_item, proposed_by, connector, operation, target, class,
-    state, attempts, last_actor, auth_approver, approvers,
+    state, attempts, last_actor, auth_kind, auth_approver, approvers,
     extract(epoch from created_at)::float8  AS created_ts,
     extract(epoch from updated_at)::float8  AS updated_ts,
     extract(epoch from approved_at)::float8 AS approved_ts,
