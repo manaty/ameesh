@@ -156,6 +156,10 @@ class MechanicsError(canon.CanonError):
     """Règle absente, inconnue ou mal formée : le consommateur refuse."""
 
 
+class ReviewCountUnknown(MechanicsError):
+    """Un chemin non léger sans nombre d'avis déclaré (#5191 : `canon check`)."""
+
+
 class MechanicsAbsent(MechanicsError):
     """Le document n'est pas un fichier ordinaire au commit exact."""
 
@@ -657,7 +661,7 @@ class Mechanics:
                          if any(regex.fullmatch(clean) for regex in rule.regexes)),
                         default=0)
             if cls != "light" and not count:
-                raise MechanicsError("review count unknown for non-light path: %s" % clean)
+                raise ReviewCountUnknown("review count unknown for non-light path: %s" % clean)
             if count:
                 cls = "sensitive"
             if review.RANK[cls] > review.RANK[risk]:
