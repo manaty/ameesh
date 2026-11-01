@@ -241,7 +241,11 @@ none; computed over all lots, regardless of the window.
 
 **Activation (#5244, canon §5 and §14; added fields).** `progress` and
 `lots_merged` still count the merge. Done means active: `progress_active` =
-`lots_active` / (total − abandoned), null when the evidence was not read; the
+`lots_active` / `lots_activation_total`, null when the activation was not computed
+(an older snapshot) or no unit counts, 0 when the evidence is unreadable (the units
+are then in `lots_unmeasured`). `lots_activation_total` is the units not abandoned
+at activation: unlike `lots_total − lots_abandoned`, it counts an operator gesture
+(closed `done`, reserved to an external executor), which waits for its receipt. The
 views use it for what is done, and fall back on `progress` on an older snapshot.
 `lots_waiting_activation` counts units known not to be active yet, `lots_unmeasured`
 those with no readable evidence (not done, no lateness raised). A `lots[]` entry

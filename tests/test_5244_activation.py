@@ -98,7 +98,7 @@ class Tally(unittest.TestCase):
                  3: {"step": "gesture", "counted": False}}
         epic = self.summary([lot(1), lot(2), lot(3, "closed", "done", executor="x")], steps)
         self.assertEqual(epic["lots_pending"], 1)  # la fiche f1, sans lot
-        self.assertEqual(epic["progress_active"], 0.25)
+        self.assertEqual((epic["progress_active"], epic["lots_activation_total"]), (0.25, 4))
         # la fusion garde son sens (contrat ameesh-progress/1) : le geste reste hors compte
         self.assertEqual((epic["lots_merged"], epic["progress"]), (2, round(2 / 3, 4)))
         self.assertEqual((epic["lots_active"], epic["lots_waiting_activation"]), (1, 2))
@@ -114,6 +114,22 @@ class Tally(unittest.TestCase):
         steps[2] = {"step": "merged", "counted": False}
         epic = self.summary([lot(1, package="f1"), lot(2, package="f1")], steps)
         self.assertEqual(epic["lots"][0]["step"], "waiting")
+
+
+class Overview(unittest.TestCase):
+    def test_fully_merged_milestone_stays_until_done(self):
+        from ameesh import progress
+        ms = {"id": "M", "title": "m", "progress": 1, "lots_merged": 1, "lots_total": 1,
+              "progress_active": 0, "lots_active": 0, "lots_waiting_activation": 0,
+              "lots_unmeasured": 1}
+        cards = progress.build_overview([{"name": "p"}], [], [ms], {"M": {"p"}}, [])
+        self.assertEqual(cards[0]["milestone"]["id"], "M")
+        ms["progress_active"] = 1
+        cards = progress.build_overview([{"name": "p"}], [], [ms], {"M": {"p"}}, [])
+        self.assertIsNone(cards[0]["milestone"])
+        del ms["progress_active"]  # ancien instantané : la fusion décide
+        cards = progress.build_overview([{"name": "p"}], [], [ms], {"M": {"p"}}, [])
+        self.assertIsNone(cards[0]["milestone"])
 
 
 class Clone(unittest.TestCase):

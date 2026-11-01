@@ -968,7 +968,7 @@ def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict
     for p in projects:
         name = p.get("name")
         open_ms = [m for m in milestones if name in ms_projects.get(m["id"], ())
-                   and (m.get("progress") != 1 or m.get("lots_waiting_activation"))]
+                   and plan_mod.done_share(m) != 1]
         open_ms.sort(key=lambda m: (m.get("date") is None, m.get("date") or "", m["id"]))
         ms = open_ms[0] if open_ms else None
         cards.append({

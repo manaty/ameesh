@@ -115,7 +115,8 @@ def _activation_tally(units: list[str], measured: bool) -> dict:
     §5. `progress_active` : None sans lecture des preuves."""
     counted = len(units) - units.count("abandoned")
     active = units.count("active")
-    return {"lots_active": active, "lots_waiting_activation": units.count("waiting"),
+    return {"lots_activation_total": counted, "lots_active": active,
+            "lots_waiting_activation": units.count("waiting"),
             "lots_unmeasured": units.count("unmeasured"),
             "progress_active": round(active / counted, 4) if measured and counted else None}
 
