@@ -133,6 +133,12 @@ class TurnCosts(interface.TurnCosts):
             return None
         return rows[0]
 
+    def count_since(self, agent, since_ts) -> int:
+        rows = self.db.query(
+            "select count(*) as n from turn_costs where agent = %s"
+            " and recorded_at >= to_timestamp(%s)", (agent, float(since_ts)))
+        return int(rows[0]["n"]) if rows else 0
+
     def session_rows(self, agent, session) -> list:
         """#5134 (CTX-05a) : toutes les lignes d'une session, dans l'ordre du
         grand livre. Lecture seule, pour reconstruire ``S_hist`` tour par tour

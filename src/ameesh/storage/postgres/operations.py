@@ -103,6 +103,18 @@ class Operations(interface.Operations):
             " WHERE name = %s RETURNING name", tuple(params + [name]))
         return bool(rows)
 
+    def write_context_pilot(self, name, settings, state, *, opening) -> bool:
+        cols = [key for key in settings if key in self.INTEGER_SETTINGS]
+        sets = "".join("%s = nullif(%%s, '')::bigint, " % col for col in cols)
+        params: list[Any] = [
+            "" if settings[col] is None else str(settings[col]) for col in cols]
+        ouvert = "context_pilot IS NOT NULL AND context_pilot->>'returned_ts' IS NULL"
+        garde = "NOT (coalesce(%s, false))" % ouvert if opening else ouvert
+        return bool(self.db.query(
+            "UPDATE agent_registry SET " + sets + "context_pilot = %s::jsonb,"
+            " updated_at = now() WHERE name = %s AND " + garde + " RETURNING name",
+            tuple(params + [json.dumps(state), name])))
+
     def set_dormant(self, name, owner, epoch, status_text) -> bool:
         return bool(self.db.query(
             "UPDATE agent_registry SET status_text = %s, updated_at = now()"
@@ -154,6 +166,7 @@ class Operations(interface.Operations):
                    r.cwd,  -- L73b : dossiers de travail protégés par le ménage
                    r.session_policy, r.lot_wake, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
                    r.turn_grace_seconds,
+                   r.session_max_tokens, r.turn_reread_budget, r.session_reread_budget,
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,

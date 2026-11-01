@@ -792,6 +792,10 @@ class TurnCosts(Domain):
         ligne suit sa propre convention de cache."""
 
     @abc.abstractmethod
+    def count_since(self, agent: str, since_ts: float) -> int:
+        """#5250 : les lignes du grand livre de l'agent depuis cet instant."""
+
+    @abc.abstractmethod
     def session_rows(self, agent: str, session: str) -> list[dict]:
         """#5134 (CTX-05a) : toutes les lignes du grand livre d'une session.
 
@@ -4221,10 +4225,12 @@ class Operations(Domain):
     #: colonnes réglables par `set_settings` (liste fermée)
     SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens",
                 "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "lot_wake",
-                "harness_bin")
+                "harness_bin", "session_max_tokens", "turn_reread_budget",
+                "session_reread_budget")
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
     INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
-                        "turn_grace_seconds")
+                        "turn_grace_seconds", "session_max_tokens",
+                        "turn_reread_budget", "session_reread_budget")
 
     @abc.abstractmethod
     def publish_peek(self, name: str, owner: str, epoch: int, payload: dict) -> bool:
@@ -4238,6 +4244,14 @@ class Operations(Domain):
     def set_settings(self, name: str, values: dict) -> bool:
         """Pose les réglages nommés (clés de `SETTINGS` ; `''` ou None =
         défaut, colonne effacée). Faux si l'agent est inconnu."""
+
+    @abc.abstractmethod
+    def write_context_pilot(self, name: str, settings: dict, state: dict,
+                            *, opening: bool) -> bool:
+        """#5250 : réglages de politique et état du pilote en UNE instruction.
+        `opening` : seulement sans pilote ouvert ; sinon seulement sur un pilote
+        ouvert (`returned_ts` absent). Faux si la condition ne tient plus : deux
+        contrôles concurrents ne font qu'un retour."""
 
     @abc.abstractmethod
     def set_session_work_item(self, name: str, owner: str, epoch: int,
