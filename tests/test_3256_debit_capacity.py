@@ -122,32 +122,57 @@ class TriggerTest(unittest.TestCase):
         self.assertIsNone(cap["projects"][0]["roadmap_exhausted"])
         self.assertEqual(len(cap["alerts"]), 1)
 
-    def test_a_startable_lot_arrived_after_the_note_reopens_for_good(self):
-        # B de cx3 sur b6f1c85 : le lot 91 arrive démarrable après la note,
-        # puis il est pris (`reopened`, lu à l'historique des prises) ; plus
-        # aucun lot démarrable, mais la route reste rouverte
-        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - 2 * H}]
-        cap = measure(team(2, 8), roadmap_notes=notes,
-                      reopened={"ameesh": T - H})
+    def test_a_reopening_note_after_the_exhaustion_reopens(self):
+        # #5149 : la dernière note fait foi, comme pour le sommeil et
+        # `ameesh alerts` (#4623)
+        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - 2 * H},
+                 {"work_item_id": 90, "source": SPLIT, "note": "roadmap: rouverte ameesh", "at_ts": T - H}]
+        cap = measure(team(2, 8), roadmap_notes=notes)
         self.assertIsNone(cap["projects"][0]["roadmap_exhausted"])
         self.assertEqual(len(cap["alerts"]), 1)
         self.assertGreater(cap["projects"][0]["idle_agent_hours"], 0)
 
-    def test_a_lot_created_before_the_note_keeps_it(self):
-        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - H}]
-        cap = measure(team(2, 8), roadmap_notes=notes,
-                      reopened={"ameesh": T - 2 * H})
+    def test_an_exhaustion_after_a_reopening_holds(self):
+        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: rouverte ameesh", "at_ts": T - 2 * H},
+                 {"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - H}]
+        cap = measure(team(2, 8), roadmap_notes=notes)
+        self.assertEqual(cap["projects"][0]["roadmap_exhausted"]["lot"], 90)
+        self.assertEqual(cap["alerts"], [])
+
+    def test_a_lot_taken_after_the_note_does_not_reopen(self):
+        # #5149 (audit 31/10 21:15, #5172) : un lot créé puis pris après la
+        # note n'est plus démarrable ; la route reste épuisée, comme
+        # `ameesh alerts` le dit
+        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh",
+                  "at_ts": T - 2 * H}]
+        lots = [{"id": 91, "app": "ameesh", "state": "qa", "assignee": "bureau",
+                 "created_ts": T - H}]
+        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
         self.assertIsNotNone(cap["projects"][0]["roadmap_exhausted"])
         self.assertEqual(cap["alerts"], [])
 
-    def test_a_lot_created_already_assigned_does_not_reopen(self):
-        # B5 (impl-03) : un lot doc créé assigné après la note n'arrive pas
-        # démarrable ; `reopened` ne le porte pas, la route reste épuisée
-        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh",
-                  "at_ts": T - 2 * H}]
-        cap = measure(team(2, 8), roadmap_notes=notes, reopened={})
-        self.assertIsNotNone(cap["projects"][0]["roadmap_exhausted"])
-        self.assertEqual(cap["alerts"], [])
+    def test_a_review_seat_exempted_from_sleep_is_not_idle(self):
+        # #5149 : le seul relecteur d'une famille, épargné du sommeil pour un
+        # gel, tient un siège ; il ne compte pas au repos
+        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - 2 * H},
+                 {"work_item_id": 90, "source": SPLIT, "at_ts": T - H,
+                  "note": "sleep exempted: ameesh-idle-0: only eligible reviewer of "
+                          "family deepseek for pending freeze #130"},
+                 {"work_item_id": 90, "source": SPLIT, "at_ts": T - H,
+                  "note": "sleep exempted: ameesh-idle-1: unread mail from pilote (5 min)"}]
+        cap = measure(team(2, 8), roadmap_notes=notes)
+        self.assertEqual(cap["projects"][0]["idle_agents"], ["ameesh-idle-1"])
+        self.assertEqual(cap["projects"][0]["wakeable"], 9)
+        self.assertIn({"agent": "ameesh-idle-0", "reason": "review seat: only eligible "
+                       "reviewer of family deepseek for pending freeze #130"}, cap["held"])
+
+    def test_an_exemption_older_than_the_exhaustion_holds_no_seat(self):
+        notes = [{"work_item_id": 90, "source": SPLIT, "at_ts": T - 3 * H,
+                  "note": "sleep exempted: ameesh-idle-0: designated review pending on #130"},
+                 {"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - 2 * H}]
+        cap = measure(team(2, 8), roadmap_notes=notes)
+        self.assertEqual(cap["projects"][0]["idle"], 2)
+        self.assertEqual(cap["held"], [])
 
     def test_a_note_outside_the_split_lot_does_not_count(self):
         # B4 (impl-03) : la note se pose sur le lot de découpage du projet

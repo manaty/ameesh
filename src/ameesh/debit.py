@@ -1522,6 +1522,58 @@ def _exhausted_project(note: Any) -> str | None:
     return match.group(1).strip(".,;:") if match else None
 
 
+def _roadmap_verdicts(notes: Iterable[Mapping[str, Any]]) -> dict[str, dict]:
+    """#5149 : `{projet: note d'épuisement}` des projets dont la **dernière**
+    note de feuille de route, posée sur le lot de découpage du même projet
+    (§1), est `roadmap: épuisée <projet>` — la règle de `roadmap_state` que
+    suivent le sommeil et `ameesh alerts` (#4623) : une note `roadmap:
+    rouverte <projet>` postérieure la retire. Les notes sont lues dans l'ordre
+    du journal (`at_ts`, puis ordre d'entrée)."""
+    from .file_decoupage import REOPENED_RE
+    out: dict[str, dict] = {}
+    for note in sorted(notes or (), key=lambda r: float(r.get("at_ts") or 0.0)):
+        text = str(note.get("note") or "")
+        project = _exhausted_project(text)
+        if project and _decoupage_project(note) == project:
+            out[project] = {"lot": note.get("work_item_id"),
+                            "at_ts": float(note.get("at_ts") or 0.0)}
+            continue
+        match = REOPENED_RE.match(text)
+        project = match.group(1).strip(".,;:") if match else None
+        if project and _decoupage_project(note) == project:
+            out.pop(project, None)
+    return out
+
+
+#: #5149 : les motifs d'exemption du sommeil qui tiennent un siège de
+#: relecture (`file_decoupage._sleep`) ; les autres (lot actionnable,
+#: courrier) se lisent déjà à l'agent.
+_REVIEW_SEAT_WHY = ("designated review pending", "only eligible reviewer")
+
+
+def _review_seats(notes: Iterable[Mapping[str, Any]],
+                  exhausted: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
+    """#5149 : `{agent: raison}` des agents épargnés du sommeil pour un siège
+    de relecture, lus aux notes `sleep exempted: <agent>: <motif>` du lot de
+    découpage d'un projet épuisé, postérieures à sa note d'épuisement. Un
+    siège tenu pour un avis n'est pas de la capacité au repos."""
+    from .file_decoupage import SLEEP_EXEMPT_PREFIX
+    out: dict[str, str] = {}
+    for note in notes or ():
+        text = str(note.get("note") or "").strip()
+        if not text.startswith(SLEEP_EXEMPT_PREFIX):
+            continue
+        entry = exhausted.get(_decoupage_project(note) or "")
+        if (entry is None or note.get("work_item_id") != entry["lot"]
+                or float(note.get("at_ts") or 0.0) < entry["at_ts"]):
+            continue
+        name, _, why = text[len(SLEEP_EXEMPT_PREFIX):].partition(":")
+        name, why = name.strip(), why.strip()
+        if name and name != "*" and why.startswith(_REVIEW_SEAT_WHY):
+            out[name] = "review seat: %s" % why
+    return out
+
+
 def _busy_spans(turns: Iterable[Mapping[str, Any]], start: float,
                 end: float) -> dict[str, list[tuple[float, float]]]:
     """{agent: [(début, fin)]} des tours **sur un lot**, bornés à la fenêtre,
@@ -1569,7 +1621,6 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
              footprint: Mapping[int, Iterable[Mapping[str, Any]]] | None = None,
              open_lots: Iterable[Mapping[str, Any]] = (),
              roadmap_notes: Iterable[Mapping[str, Any]] = (),
-             reopened: Mapping[str, float] | None = None,
              losses: Iterable[Mapping[str, Any]] = (),
              now: float, window_s: float,
              repos_part: float | None, repos_s: float | None,
@@ -1608,12 +1659,11 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       de leur bloqueur et se lisent à part (`footprint_lots`) ; `open_lots` :
       les lots ouverts, où le lot de découpage se lit à sa `source`.
     * `roadmap_notes` : `{note, at_ts, work_item_id, source}` ; seule une
-      note posée **sur un lot de découpage du même projet** vaut (§1).
-    * `reopened` : `{projet: instant}` du dernier lot du projet **arrivé
-      démarrable** — créé sans assigné puis pris (`assigned to … (before:
-      nobody)`), lu à l'historique. Il rouvre durablement une route notée
-      épuisée avant lui (§2.3) ; un lot démarrable de l'instant aussi. Un lot
-      créé déjà assigné ne rouvre rien.
+      note posée **sur un lot de découpage du même projet** vaut (§1), et la
+      dernière fait foi comme pour le sommeil et `ameesh alerts` (#5149) : une
+      note `roadmap: rouverte` ou un lot démarrable de l'instant rouvrent la
+      route ; un lot déjà pris ne la rouvre pas. Les notes `sleep exempted:`
+      d'un siège de relecture tiennent l'agent hors de la capacité.
     * `losses` : la perte au reset par compte, comme `ameesh accounts`.
     * `gating_ok` : faux quand une lecture dont dépend l'alerte a échoué
       (lots ouverts, notes, tenues de budget, historique) ; la mesure reste
@@ -1628,6 +1678,10 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     now = float(now)
     start = now - float(window_s)
     held = dict(held or {})
+    roadmap_notes = list(roadmap_notes or ())
+    exhausted = _roadmap_verdicts(roadmap_notes)
+    for name, why in _review_seats(roadmap_notes, exhausted).items():
+        held.setdefault(name, why)
     min_gap = float(repos_s) if repos_s is not None else 0.0
     rows = [dict(row) for row in agents or ()]
     spans = _busy_spans(turns, start, now)
@@ -1695,19 +1749,10 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         current = decoupage.get(project)
         if current is None or (created or 0.0) > (current.get("created_ts") or 0.0):
             decoupage[project] = entry
-    exhausted: dict[str, dict] = {}
-    for note in sorted(roadmap_notes or (), key=lambda r: float(r.get("at_ts") or 0.0)):
-        project = _exhausted_project(note.get("note"))
-        # §1 : la note se pose sur le lot de découpage du projet, pas ailleurs
-        if project and _decoupage_project(note) == project:
-            exhausted[project] = {"lot": note.get("work_item_id"),
-                                  "at_ts": float(note.get("at_ts") or 0.0)}
-    reopened = dict(reopened or {})
-    for project, entry in list(exhausted.items()):
+    for project in list(exhausted):
         # un lot en attente d'empreinte est du travail réel, pas une feuille
         # de route épuisée : le projet ne se tait pas (#4561).
-        if (startable_by.get(project) or footprint_by.get(project)
-                or float(reopened.get(project) or 0.0) > entry["at_ts"]):
+        if startable_by.get(project) or footprint_by.get(project):
             del exhausted[project]
 
     by_project: dict[str, list[dict]] = {}
@@ -1951,7 +1996,8 @@ _ROADMAP_SQL = """
       JOIN work_items w ON w.id = e.work_item_id
      WHERE e.created_at > to_timestamp(%s)
        AND w.source LIKE 'file-decoupage:%%'
-       AND lower(left(ltrim(e.note), 8)) = 'roadmap:'
+       AND (lower(left(ltrim(e.note), 8)) = 'roadmap:'
+            OR ltrim(e.note) LIKE 'sleep exempted:%%')
      ORDER BY e.created_at
 """
 
@@ -1963,26 +2009,6 @@ _SPLIT_SOURCES_SQL = """
       FROM work_items
      WHERE id = ANY(string_to_array(%s, ',')::bigint[])
        AND source LIKE 'file-decoupage:%%'
-"""
-
-#: #3256 : par projet, la création du dernier lot **arrivé démarrable** :
-#: créé sans assigné ni exécutant externe, puis pris dans la file (le
-#: journal porte `assigned to … (before: nobody)`). Un lot créé déjà
-#: assigné n'a pas cette ligne et ne rouvre pas une route épuisée (§2.3).
-#: Lue seulement pour les projets qui ont une note d'épuisement, depuis elle :
-#: le cas courant (aucune note) ne coûte rien (N5 de la relecture).
-_REOPENED_SQL = """
-    SELECT w.app, extract(epoch FROM max(w.created_at))::float8 AS created_ts
-      FROM work_items w
-      JOIN (SELECT DISTINCT work_item_id FROM work_item_events
-             WHERE created_at > to_timestamp(%s)
-               AND note LIKE 'assigned to %% (before: nobody)%%') e
-        ON e.work_item_id = w.id
-     WHERE w.created_at > to_timestamp(%s)
-       AND w.app = ANY(string_to_array(%s, ','))
-       AND coalesce(w.source, '') NOT LIKE 'file-decoupage:%%'
-       AND coalesce(to_jsonb(w)->>'external_executor', '') = ''
-     GROUP BY w.app
 """
 
 _MERGES_SQL = """
@@ -2302,20 +2328,11 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
         waiting_free=True, actionable_idle=True)
     held = attempt("budget holds", lambda: budget_holds(idle), {})
     notes = attempt("roadmap notes", lambda: _rows(db, _ROADMAP_SQL, (horizon,)), [])
-    spent = {}
-    for note in notes:
-        project = _exhausted_project(note.get("note"))
-        if project and _decoupage_project(note) == project:
-            spent[project] = min(spent.get(project, now), float(note.get("at_ts") or now))
-    reopened = attempt("lot history", lambda: {
-        str(row["app"]): float(row["created_ts"] or 0.0)
-        for row in _rows(db, _REOPENED_SQL, (min(spent.values()), min(spent.values()),
-                                             ",".join(sorted(spent))))}, {}) if spent else {}
     losses = attempt("account gauges", lambda: plan_losses(
         sous_utilisation.latest_account_gauges(db, now), now), [], gating=False)
     out = capacity(agents=listing, turns=turns, startable=startable,
                    footprint=footprint, open_lots=lots,
-                   roadmap_notes=notes, reopened=reopened, losses=losses, now=now,
+                   roadmap_notes=notes, losses=losses, now=now,
                    window_s=int(hours) * 3600,
                    repos_part=rule.repos_part if rule else None,
                    repos_s=rule.repos_s if rule else None,
