@@ -196,6 +196,9 @@ ameesh events [--after ID] [--limit N] [--json] | prune [--days N] [--dry-run]
 ameesh decisions [--all] [--for human:ID] [--json]  # what waits for a human
 ameesh turn current [--local] [--expect-turn ID] [--json]  # the calling turn (ameesh-turn-context/1)
 ameesh turn observe (--turn ID | --request ID) [--json]    # supervisor read (ameesh-turn-observation/1)
+ameesh sandbox list [--agent A] [--state S] [--scope SCOPE] [--limit N] [--json]
+                                           # read-only sandbox turns (ameesh-sandbox-turns/1)
+ameesh sandbox show [--json] TURN          # one sandbox turn (ameesh-sandbox-turn/1)
 ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since SINCE]
                 [--no-gantt] [--no-versions] [--stale-after S]
 ameesh plan add|list|accept|done|cancel|propose|show   # roadmap and dated commitments (L96)
@@ -283,6 +286,17 @@ as `GET /api/v1/turns/{turn}` and `GET /api/v1/requests/{request}`
 (`ameesh-turn-observation/1`), is read-only, and exits 3 when the target is
 unknown. Only `--json` is a contract; the text rendering may change.
 
+`ameesh sandbox list` and `ameesh sandbox show` read the bounded
+external-sandbox turns (#2202, #4972) without Kubernetes I/O: state, scope and
+exact scope digest, profile/placement/canon references, job identity and phase,
+deadlines, bounded usage counters, verdict, result hash, refusal and the
+execution receipt, plus a separate tranche accounting block. `list` filters by
+agent, state and exact scope digest, and `--limit` bounds the page (1–1000,
+default 100); `show` takes one turn id. Both are read-only closed projections
+(`ameesh-sandbox-turns/1`, `ameesh-sandbox-turn/1`) that never return a prompt,
+a result payload, provider credentials or a supervisor handoff; an unknown turn
+exits 3, and `--json` is the contract.
+
 ## GitHub: `ameesh github`
 
 ```
@@ -314,6 +328,8 @@ ameesh set <agent> key=value [key=value …]   # model=… effort=… tier=… s
                                              # turn_grace_seconds=20m|0 mail_batch=90s|2m|0
                                              # mode=execute|externe
                                              # (empty value = default; effect at the next turn)
+ameesh agent review-hold <agent> --reason R [--clear] [--actor A] [--json]
+                                             # hold new review designations and verdicts (#5087)
 ameesh alerts [--json] [--follow] [--interval S] [--long-turn S] [--idle-mail S]
               [--dead-grace S] [--session-tokens N] [--stale-lot S]
               [--orphan-lot S] [--delegation-grace S] [--mail-undeliverable S]
@@ -365,6 +381,15 @@ ameesh service install|uninstall|status [--agent A]… [--no-runner] [--no-notif
 `ameesh notify` takes the same threshold options as `ameesh alerts`. See
 [Operate agents](../guides/operate-agents.md) for the schemas, the alert types,
 `adopt`, `resume` and the `notify` configuration.
+
+`ameesh agent review-hold` places a durable, reversible hold on one agent's new
+review evidence: automatic and manual designations are excluded and any new
+verdict is refused, even for a request already sent; the SQL guards re-read the
+hold on write. The hold is visible in the registry (`review_hold`, with its
+reason and actor), journaled and carried through a rename; `--clear --reason R`
+lifts it. It does not revoke acquired evidence, remove the agent from the
+registry, change its lease or status, or stop mail delivery, and it does not
+expire by itself.
 
 The **watch** (L121) is a timer on the host that sends the agent the versioned
 instruction `consignes/veille.md` every `--every` (default 30 m); `show` lists
