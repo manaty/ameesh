@@ -946,6 +946,36 @@ def _trusted_executor(pid, identities) -> bool:
     return identity is not None and _executor_identity(int(pid), identity[1]) == identity
 
 
+def _cgroup(pid) -> str:
+    """The cgroup v2 path of `pid` ("" when unreadable or gone)."""
+    lines = _read_text(os.path.join(PROC, str(pid), "cgroup")).splitlines()
+    return next((line[3:] for line in lines if line.startswith("0::")), "")
+
+
+def _argv0(pid) -> str:
+    return _read_text(os.path.join(PROC, str(pid), "cmdline")).split("\0", 1)[0]
+
+
+def _trusted_child(pid, identities, status=None) -> bool:
+    """#5223: a direct child that a verified service MainPID runs in its own
+    unit, hidden like it (`ameesh notify --once` under `ameesh role run`,
+    #5083). Its parent passes `_trusted_executor`; the child sits in exactly
+    the unit's control group (not `<unit>/runner`, where a runner's turns
+    live) and runs the parent's interpreter (`argv[0]`). A grandchild (a
+    command a turn launched), an orphan, another cgroup or another program
+    stays a doubt. The caller has already checked the uid."""
+    try:
+        status = _proc_status(pid) if status is None else status
+    except OSError:
+        return False
+    ppid = ((status or {}).get("PPid") or [""])[0]
+    if not ppid.isdecimal() or int(ppid) <= 1 or not _trusted_executor(int(ppid), identities):
+        return False
+    group = identities()[int(ppid)][1]
+    argv0 = _argv0(pid)
+    return _cgroup(pid) == group and bool(argv0) and argv0 == _argv0(ppid)
+
+
 def _named_by(allow, name: str, argv) -> bool:
     """L230 : le processus se nomme (`comm`) et s'annonce dans `allow` —
     `argv[0]`, ou `argv[1]` quand un interpréteur lance un script (le cas de
@@ -979,7 +1009,8 @@ def _doubt_proc(pid, uid: int, managers, allow=(), executors=None) -> str | None
     unknown, read on /proc; None when it cannot hold anything of the user's:
     gone, a zombie (no files left), running as another user (effective uid:
     a setuid helper such as sudo is root's), the user's service manager
-    (`managers()`, by PID), a verified service MainPID (`executors()`), or a
+    (`managers()`, by PID), a verified service MainPID (`executors()`) or
+    its direct child in its unit (`_trusted_child`, #5223), or a
     process explicitly named by `allow` (L230, `comm` and one of its first two argv entries; an
     unreadable status is a doubt)."""
     try:
@@ -993,7 +1024,8 @@ def _doubt_proc(pid, uid: int, managers, allow=(), executors=None) -> str | None
         return "%s (uid unreadable)" % pid
     if int(uids[1]) != uid or int(pid) in managers():
         return None
-    if ((executors is not None and _trusted_executor(pid, executors))
+    if ((executors is not None and (_trusted_executor(pid, executors)
+                                    or _trusted_child(pid, executors, status)))
             or _allowed_proc(pid, allow)):
         return None
     return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
@@ -1506,8 +1538,9 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
             continue   # gone meanwhile
         except OSError:
             argv = _read_text(os.path.join(base, "cmdline")).split("\0")[:2]
-            if _trusted_executor(int(pid), executors):
-                pass  # #5185: verified service MainPID, same guard as holders
+            if (_trusted_executor(int(pid), executors)
+                    or _trusted_child(int(pid), executors)):
+                pass  # #5185/#5223: verified service MainPID or its child, as holders
             elif _named_by(allow, name, argv):
                 if name not in SERVICE_MANAGER:
                     out.allowed.append(who)
