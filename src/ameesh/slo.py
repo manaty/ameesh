@@ -790,6 +790,14 @@ def _after_vehicle(start: float, exited: float | None, extra: dict) -> float:
     return exited
 
 
+def _after_dependency(start: float, ready: float | None, extra: dict) -> float:
+    """#5214 : `verdict_merge` repart de la fusion de la dépendance bloquante."""
+    if ready is None or ready <= start:
+        return start
+    extra["dependency_merged_ts"] = round(ready, 3)
+    return ready
+
+
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               now: float | None = None, packet_slot: float | None = None,
               dependencies: Iterable[dict] = (), packet: bool = False,
@@ -831,6 +839,11 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     #4369 : `vehicle_exit_ts` (sortie du véhicule, `vehicle_exits`) décale
     de même le départ de `verdict_merge` en cours : retiré d'un paquet, le lot
     ne paie pas le temps passé dedans.
+
+    #5214 : une dépendance bloquante encore ouverte retient la fusion : aucune
+    ligne `verdict_merge` ne court (l'attente est celle du bloqueur). Levée,
+    elle décale le départ à sa fusion (jalon `merged`/`closed`, `satisfied_ts`)
+    si elle suit le GO ; une fusion déjà faite garde sa durée réelle.
 
     #4444 : `packet_pause` (la pause déclarée du paquet horaire que
     `packet_slot` a déjà franchie) est seulement nommée sur la ligne.
@@ -1028,6 +1041,20 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             # inventé — seules l'origine réelle et les durées mesurées restent.
             out.append(_row(step, ready, now=now, critical=critical, **fp_extra))
 
+    # #5214 : un lot validé dont une dépendance bloquante n'est pas levée ne
+    # peut pas fusionner : son attente est celle du bloqueur, pas la sienne, et
+    # aucune ligne GO → fusion ne court (comme le délai intake, #2551). Une
+    # arête levée reste dans le graphe avec `blocking` faux et sa date
+    # (`satisfied_ts`) : si elle suit le GO, l'horloge part de là, le porteur
+    # ne paie pas l'attente d'un autre lot. Une arête non bloquante sans date
+    # ne retient ni ne décale rien. `blocking`, lu sur l'état courant, reste la
+    # vérité de l'attente : un bloqueur `merged` à tort, revenu en `build`,
+    # garde son ancien jalon sans être levé.
+    dep_open = any(edge.get("blocking") for edge in dependencies or ())
+    dep_ready = max((float(edge["satisfied_ts"])
+                     for edge in dependencies or ()
+                     if edge.get("satisfied_ts") is not None), default=None)
+
     verdict, kind = jalons.get("verdict"), jalons.get("verdict_kind")
     merged = jalons.get("merged")
     # #3487 : un lot revenu en build après son GO courant porte un correctif
@@ -1140,9 +1167,11 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                         start = lifted
                         extra["hold_released_ts"] = round(lifted, 3)
                     start = _after_vehicle(start, exited, extra)
-                    out.append(_row(step, start, now=running_now,
-                                    critical=critical, target=target,
-                                    escalate=not packet, **extra))
+                    start = _after_dependency(start, dep_ready, extra)
+                    if not dep_open:
+                        out.append(_row(step, start, now=running_now,
+                                        critical=critical, target=target,
+                                        escalate=not packet, **extra))
             else:
                 if packet_slot is not None and float(packet_slot) > start:
                     # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
@@ -1159,8 +1188,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     start = lifted
                     extra["hold_released_ts"] = round(lifted, 3)
                 start = _after_vehicle(start, exited, extra)
-                out.append(_row(step, start, now=running_now, critical=critical,
-                                target=target, escalate=not packet, **extra))
+                start = _after_dependency(start, dep_ready, extra)
+                if not dep_open:
+                    out.append(_row(step, start, now=running_now, critical=critical,
+                                    target=target, escalate=not packet, **extra))
 
     if state not in lifecycle.COMPLETED:
         step = step_of("green_verdict")
