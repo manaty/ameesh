@@ -342,9 +342,12 @@ def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
     v = _vocabulary()
     db = _open(cfg)
-    # L61 : agents et lots préchargés en un seul aller-retour (db.prefetch) ;
-    # le code ci-dessous lit ensuite ces réponses sans retourner à la base
-    db = db_mod.prefetch(db, lambda d: (registry.overview(d), work.delays(d, limit=500)))
+    # L61 : précharger seulement les lectures utilisées par cette sortie.
+    # Les délais des lots servent au tableau, jamais à list --json (#5266).
+    if args.json:
+        db = db_mod.prefetch(db, registry.overview)
+    else:
+        db = db_mod.prefetch(db, lambda d: (registry.overview(d), work.delays(d, limit=500)))
     try:
         rows = registry.overview(db)
         # L62 : le projet de chaque agent (équipe, à défaut chantier), en

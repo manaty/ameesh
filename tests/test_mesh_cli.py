@@ -2,13 +2,17 @@
 """CLI `agent-mesh` : mesh list, show, clés, approbations, work_items."""
 from __future__ import annotations
 
+import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 from ameesh import authority, mail, migrations, registry, signing, storage
 
@@ -67,6 +71,20 @@ class MeshCliTest(PgTestCase):
         self.assertIn("no public key", proc.stdout)
         proc = self.mesh("show", "inconnu")
         self.assertEqual(proc.returncode, 1)
+
+    def test_list_json_does_not_read_work_delays(self):
+        """The staging registry read must work even if lot timelines fail."""
+        from ameesh import mesh_cli
+        with contextlib.closing(self.connect()) as connection:
+            expected = mesh_cli.agent_rows(self.cfg, connection)
+        output = io.StringIO()
+        with mock.patch.object(mesh_cli, "_open", side_effect=lambda cfg: self.connect()), \
+                mock.patch.object(mesh_cli.work, "delays", side_effect=AssertionError(
+                    "JSON registry reads must not load lot timelines")) as delays, \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(mesh_cli.cmd_list(self.cfg, argparse.Namespace(json=True)), 0)
+        delays.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()), expected)
 
     # -- clés --------------------------------------------------------------
     def test_key_generate_refuse_sans_drapeau_proprietaire(self):
