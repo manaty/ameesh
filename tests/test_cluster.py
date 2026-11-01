@@ -112,6 +112,9 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #5140 / 0530: bearer digests and relay replay keys remain internal;
+    # neither supervisor role receives additional access.
+    "sandbox_relay_tokens": {"token_sha256", "turn_id", "host", "created_at"},
     # #5087 / 0529: review admission and withdrawals remain internal authority;
     # neither supervisor role receives additional access.
     "agent_registry": {"review_hold"},
@@ -248,7 +251,7 @@ FERMEES = {
     # (`turn_costs.inputs`), consommée par le rapport local
     # `ameesh cost turns --message` ; le contrat des rôles superviseur reste
     # inchangé : colonne fermée aux deux rôles, aucun GRANT modifié.
-    "turn_costs": {"inputs"},
+    "turn_costs": {"inputs", "relay_call_id"},
     # L165 (EP2, 0476) : scores de candidats d'un rôle élu, lus par les
     # exécuteurs candidats et `ameesh role status`, pas par le rôle
     # superviseur ; table interne fermée aux deux rôles, aucun GRANT ajouté.
