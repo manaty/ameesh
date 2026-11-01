@@ -104,7 +104,12 @@ class BancFileTxLockTest(PgTestCase):
     existe par construction (une acquisition ordinaire attend plus de 2 ms),
     `threading.Lock` n'étant pas FIFO, aucune mesure ne dépend plus de
     l'ordonnancement. Une lecture en base attend derrière ce verrou ; le
-    réveil du worker doit partir avant cette file, pas après."""
+    réveil du worker doit partir avant cette file, pas après.
+
+    L'ordre est prouvé par un témoin pris dans la lecture elle-même (le réveil
+    est déjà posé quand `mail.get` entre), pas par une latence : un runner
+    chargé peut tarder à démarrer le fil de `dispatch` sans changer l'ordre
+    (#5302)."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -125,8 +130,13 @@ class BancFileTxLockTest(PgTestCase):
                 release.wait(5)
 
         original = mail.get
+        #: #5302 : ce que la lecture en base voit en entrant. Le réveil est
+        #: déjà posé si `dispatch` signale avant de lire ; un témoin d'ordre,
+        #: sans durée, ne dépend pas de l'ordonnancement du runner.
+        wake_seen_at_read = []
 
         def queued_get(db, message_id):
+            wake_seen_at_read.append(self.worker.wake.is_set())
             with lock:
                 time.sleep(0.05)
             return original(db, message_id)
@@ -150,7 +160,9 @@ class BancFileTxLockTest(PgTestCase):
             holder_thread.join(timeout=5)
 
         # 2. la lecture en base est derrière ce verrou quand `dispatch` part :
-        # le réveil doit devancer la file, pas l'attendre.
+        # le réveil doit devancer la file, pas l'attendre. La preuve est
+        # l'ordre observé dans la lecture, pas le temps mis par le fil à
+        # démarrer sur un runner chargé.
         held.clear()
         release.clear()
         holder_thread = threading.Thread(target=holder, daemon=True)
@@ -162,11 +174,12 @@ class BancFileTxLockTest(PgTestCase):
             item = {"channel": "agent_mail",
                     "payload": json.dumps({"to": "lat-file", "id": self.mid})}
             with mock.patch.object(mail, "get", side_effect=queued_get):
-                started = time.monotonic()
                 thread = threading.Thread(target=self.runner_obj.dispatch, args=(item,))
                 thread.start()
-                woke = self.worker.wake.wait(0.2)
-                wake_s = time.monotonic() - started
+                # Pas de borne absolue : sur un runner chargé, le fil peut
+                # mettre longtemps à démarrer. Le témoin tranche l'ordre ;
+                # cette attente n'est qu'un garde-fou de temps.
+                woke = self.worker.wake.wait(5)
                 release.set()
                 thread.join(timeout=5)
         finally:
@@ -175,9 +188,9 @@ class BancFileTxLockTest(PgTestCase):
             if thread is not None:
                 thread.join(timeout=5)
         self.assertTrue(woke, "le réveil est resté derrière la file")
-        self.assertLess(wake_s, 0.05,
-                        "le réveil a attendu la lecture en base (file de %.3fs)"
-                        % queue_s)
+        self.assertEqual(wake_seen_at_read, [True],
+                         "le réveil a attendu la lecture en base : `dispatch` a "
+                         "lu le message avant de réveiller le worker")
         self.assertFalse(thread.is_alive())
 
 

@@ -41,7 +41,10 @@ Read-only checks, then one real delivery probe:
   paused is waited for, within ``--attente-cible`` (300 s), then probed; still
   busy at the bound, another driven and free persona of the same pool
   replaces it, and the report names the replacement and why (``remplacement``,
-  #4126). Only when none is free is the verdict ``sans-sonde``. Delivery alone
+  #4126). A target asleep in the automatic roadmap sleep (#3256 §2.3) is not
+  waited for: only an assignment or pilot mail lifts it, never the probe, so
+  waiting would just burn the bound and prove nothing (#5312). Only when none
+  is free is the verdict ``sans-sonde``. Delivery alone
   is recorded when the harness
   starts, before a refused harness exits 127 (#1460): only the answer proves a
   real turn with working tools, and a failed or blocked turn after delivery is
@@ -88,7 +91,8 @@ import secrets
 import sys
 import time
 
-from ameesh import budget, chat, config, db as db_mod, mail, registry, storage, work
+from ameesh import (budget, chat, config, db as db_mod, file_decoupage, mail,
+                    registry, storage, work)
 
 #: seconds allowed for delivery, tool answer and a clean turn end (bounded)
 DEFAULT_ATTENTE = 300.0
@@ -143,8 +147,23 @@ def libre(row: dict) -> bool:
             and not row.get("operator_paused") and not attente_budget(row))
 
 
+def sommeil_auto(row: dict) -> bool:
+    """#5312 : the automatic roadmap sleep, not a human maintenance pause.
+
+    The sleep of an exhausted roadmap (#3256 §2.3) is carried as an operator
+    pause and lasts until a startable lot is assigned or pilot/orchestrator
+    mail arrives: it will not be lifted within a probe's bound. Recognising
+    the exact reason (#4525 helper) keeps a real maintenance pause waited for.
+    """
+    return bool(row.get("operator_paused")
+                and file_decoupage.is_sleep_reason(
+                    row.get("operator_pause_reason")))
+
+
 def motif_non_libre(row: dict) -> str:
     """Why a persona cannot take the probe now (state named in the verdict)."""
+    if sommeil_auto(row):
+        return "sommeil automatique (feuille de route epuisee)"
     if row.get("operator_paused"):
         return "pause operateur"
     return attente_budget(row) or row.get("status") or "?"
@@ -402,6 +421,9 @@ def attendre_cible(db, nom: str, borne: float):
     #4126 : a named target in a turn (or paused) only queues the probe; it is
     re-read until it is free, within ``borne`` seconds, then probed. A target
     gone or without a live lease is not waited for: no turn will free it.
+    #5312 : neither is a target asleep in the automatic roadmap sleep — only
+    an assignment or pilot mail lifts that pause, not the probe, so waiting
+    would just burn the bound (the normal state between roadmap waves).
     """
     debut = time.monotonic()
     while True:
@@ -411,6 +433,10 @@ def attendre_cible(db, nom: str, borne: float):
             return None, attendu, "cible nommee %s sans bail vivant" % nom
         if libre(etat):
             return etat, attendu, None
+        if sommeil_auto(etat):
+            return None, attendu, (
+                "cible nommee %s en sommeil automatique (feuille de route "
+                "epuisee) : ni l'attente ni la sonde ne levent ce sommeil" % nom)
         reste = borne - (time.monotonic() - debut)
         if reste <= 0:
             return None, attendu, "cible nommee %s occupee (%s) apres %ss d'attente" % (

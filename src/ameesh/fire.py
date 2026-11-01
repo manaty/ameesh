@@ -1367,7 +1367,7 @@ def _required_gap(required, rollup, provenance=None, *, slug: str | None = None,
                           slug=slug, gh=gh, head=head, target=target)[0]
 
 
-def _packet_proof_gate(rollup) -> tuple:
+def _packet_proof_gate(rollup, replaced=()) -> tuple:
     """#2876/#3066 : la preuve du portier `paquet` reste **stricte** sur un
     défaut prouvé — une sentinelle `paquet (run proof unavailable)` ou un
     `FAILURE` du workflow `paquet` bloque, un check encore en cours attend.
@@ -1380,10 +1380,12 @@ def _packet_proof_gate(rollup) -> tuple:
     #4812 : le portier annulé par `ci run --full` au profit du run de la PR
     (#2876), dont l'agrégat `tests` est vert, non plus
     (`radar.packet_portier_replaced`).
-    Rend `(gaps, consigned)`."""
+    #5298 : `replaced` porte les clés des seules entrées de flux qu'une preuve
+    identifiée (`replaced_flux_checks`) remplace ; un homonyme courant reste
+    bloquant. Rend `(gaps, consigned)`."""
     from . import radar
     gaps, consigned = [], []
-    entries = radar.packet_proof_entries(rollup)
+    entries = radar.packet_proof_entries(rollup, replaced)
     for entry in entries:
         name = str(entry.get("name") or entry.get("context") or "paquet")
         state = _rollup_state(entry) or "?"
@@ -1603,6 +1605,175 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
                          "check_suite_id": suite_id,
                          "details_url": details if isinstance(details, str) else None})
     return runs
+
+
+#: #5298 : préfixe de l'`external_id` posé par `scripts/ci-flow.py` à la
+#: création d'un check de flux (`ameesh-ci-flow/<exécution>/<tentative>`,
+#: #1393). Recopié ici : le script reste autonome ; la forme est le protocole
+#: du sweep et de la porte.
+FLUX_EXTERNAL_PREFIX = "ameesh-ci-flow/"
+
+
+def _flux_identity(check) -> tuple | None:
+    """L'exécution et la tentative d'un check de flux, lues dans son
+    `external_id`, ou None (absent, d'une autre forme, illisible)."""
+    text = str((check or {}).get("external_id") or "")
+    if not text.startswith(FLUX_EXTERNAL_PREFIX):
+        return None
+    parts = text[len(FLUX_EXTERNAL_PREFIX):].split("/")
+    if len(parts) != 2:
+        return None
+    try:
+        run, attempt = int(parts[0]), int(parts[1])
+    except (TypeError, ValueError):
+        return None
+    return (run, attempt) if run > 0 and attempt > 0 else None
+
+
+def _check_id_in_url(url) -> int | None:
+    """L'id du check run dans un `detailsUrl` de flux (`…/runs/<id>`, la forme
+    par défaut d'un check publié par un jeton d'exécution), ou None.
+
+    Une URL de job (`…/actions/runs/<exécution>/job/<job>`) ou d'exécution
+    (`…/actions/runs/<exécution>`) ne nomme pas un check run : elle est
+    refusée, sinon l'id de l'exécution pourrait être pris pour celui d'un
+    check homonyme."""
+    text = str(url or "").strip()
+    if "/actions/runs/" in text:
+        return None
+    match = re.search(r"/runs/([1-9][0-9]*)/?$", text)
+    return int(match.group(1)) if match else None
+
+
+def _instant(value) -> float | None:
+    """Une date ISO 8601 en secondes epoch, ou None (absente, illisible)."""
+    from datetime import datetime
+
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return stamp.timestamp() if stamp.tzinfo is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _check_run_of(slug: str, check: int, *, gh) -> dict | None:
+    """Le check run `check` de `slug`, ou None (lecture impossible)."""
+    path = "repos/%s/check-runs/%d" % (slug, int(check))
+    proc = gh(["api", path])
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _run_attempt_of(slug: str, run: int, *, gh) -> tuple | None:
+    """`(tentative courante, tête)` de l'exécution `run`, ou None."""
+    path = "repos/%s/actions/runs/%d" % (slug, int(run))
+    proc = gh(["api", path])
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    attempt = data.get("run_attempt")
+    if type(attempt) is not int or attempt < 1:
+        return None
+    return attempt, str(data.get("head_sha") or "").strip().lower()
+
+
+def _attempt_jobs(slug: str, run: int, attempt: int, *, gh) -> list | None:
+    """Les jobs d'une tentative d'exécution, ou None si la lecture échoue."""
+    path = ("repos/%s/actions/runs/%d/attempts/%d/jobs?per_page=100"
+            % (slug, int(run), int(attempt)))
+    try:
+        pages = _api_pages(gh, path, "gh api %s" % path)
+    except land.LandError:
+        return None
+    jobs = []
+    for page in pages:
+        if not isinstance(page, dict) or not isinstance(page.get("jobs"), list):
+            return None
+        jobs.extend(job for job in page["jobs"] if isinstance(job, dict))
+    return jobs
+
+
+def replaced_flux_checks(rollup, *, slug: str | None = None, head: str = "",
+                         gh=None) -> set:
+    """#5298 : les entrées de flux de `rollup` qu'une preuve **identifiée**
+    remplace — le job de la même part, dans une tentative plus récente de la
+    **même exécution**, `success` et conclu après le flux rouge.
+
+    Le constat : après `gh run rerun --failed`, `statusCheckRollup` (et la
+    lecture `filter=latest`) ne rend qu'un check par nom ; quand le
+    `startedAt` de l'attempt précédent est plus grand (horloge du runner),
+    l'ancien rouge reste seul visible. Ni un agrégat `tests` vert d'une autre
+    exécution, ni un plan qui ne porte pas la part ne prouvent que *cette*
+    part a été rejouée : la preuve est le job homonyme de la part
+    (`psycopg 3/8` pour `tests (flux) psycopg 3/8`) relu dans la dernière
+    tentative de l'exécution que nomme l'`external_id` du check
+    (`ameesh-ci-flow/<exécution>/<tentative>`).
+
+    Une entrée rouge n'est remplacée que si ce job est `success` et que sa
+    date de fin est strictement postérieure à celle du flux. Une lecture
+    impossible, un `external_id` ou un `detailsUrl` absent, une tentative
+    courante, un job non vert ou des dates illisibles ne remplacent rien : la
+    porte reste fermée.
+
+    Rend les clés `radar.flux_entry_key` des seules entrées remplacées."""
+    from . import ci as ci_mod, radar
+    reds = [entry for entry in radar.latest_rollup(rollup) or ()
+            if isinstance(entry, dict)
+            and radar.check_result(entry) == radar.CI_NEGATIVE_RESULT
+            and str(entry.get("name") or "").startswith(ci_mod.CHECK_PREFIX + " ")]
+    if not reds or not slug or not head or gh is None:
+        return set()
+    wanted_head = str(head).strip().lower()
+    replaced = set()
+    runs: dict = {}
+    for entry in reds:
+        check_id = _check_id_in_url(entry.get("detailsUrl")
+                                    or entry.get("details_url"))
+        if check_id is None:
+            continue
+        check = _check_run_of(slug, check_id, gh=gh)
+        if check is None or str(check.get("head_sha") or "").strip().lower() != wanted_head:
+            continue
+        name = str(check.get("name") or "")
+        if not name.startswith(ci_mod.CHECK_PREFIX + " "):
+            continue
+        ident = _flux_identity(check)
+        if ident is None:
+            continue
+        run, attempt = ident
+        if run not in runs:
+            runs[run] = _run_attempt_of(slug, run, gh=gh)
+        latest = runs[run]
+        if not latest or latest[0] <= attempt or latest[1] != wanted_head:
+            continue
+        flux_end = _instant(entry.get("completedAt")
+                            or entry.get("completed_at"))
+        if flux_end is None:
+            continue
+        part = name[len(ci_mod.CHECK_PREFIX) + 1:]
+        jobs = _attempt_jobs(slug, run, latest[0], gh=gh)
+        if jobs is None:
+            continue
+        for job in jobs:
+            if str(job.get("name") or "") != part:
+                continue
+            if str(job.get("conclusion") or "").strip().lower() != "success":
+                continue
+            job_end = _instant(job.get("completed_at"))
+            if job_end is not None and job_end > flux_end:
+                replaced.add(radar.flux_entry_key(entry))
+            break
+    return replaced
 
 
 def _app_id(value, path: str) -> int | None:
@@ -1943,6 +2114,15 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
                            % (target or "the target", frozen[:12], exc))
     pairs = _required_pairs(required)
     rollup = status.get("rollup") or ()
+    # #5298 : le flux d'un attempt antérieur n'est remplacé que sur une preuve
+    # identifiée (même exécution, même part, tentative plus récente verte). La
+    # lecture peut échouer : sans preuve, la porte reste fermée.
+    replaced = ()
+    try:
+        replaced = replaced_flux_checks(rollup, slug=slug,
+                                        head=head or frozen_head, gh=gh)
+    except Exception:  # noqa: BLE001 - une preuve illisible ne verdit jamais
+        replaced = ()
     if pairs:
         provenance = None
         if any(app_id is not None for _, app_id in pairs):
@@ -1960,7 +2140,7 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
         # #2876/#3066 : la preuve du portier `paquet` n'est jamais un check
         # facultatif — un rouge ou une preuve indisponible bloque ; un non
         # concluant du portier se consigne.
-        proof_gaps, proof_consigned = _packet_proof_gate(rollup)
+        proof_gaps, proof_consigned = _packet_proof_gate(rollup, replaced)
         gaps += proof_gaps
         consigned += proof_consigned
         # #3251 : le détail de l'agrégat `tests` (décision owner #128512) —
@@ -1970,7 +2150,7 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
         consigned += detail_consigned
         from . import radar
         if any(radar.check_result(entry) == radar.CI_NEGATIVE_RESULT
-               for entry in radar.packet_proof_entries(rollup)):
+               for entry in radar.packet_proof_entries(rollup, replaced)):
             # #3186 : un portier rouge retient la porte quoi qu'il arrive ;
             # relancer l'agrégat jamais conclu ne coûterait qu'une suite.
             unconcluded.clear()

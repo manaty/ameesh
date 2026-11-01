@@ -542,7 +542,14 @@ class GitHub:
                             "jobs")
 
     def create(self, nom: str, output: dict) -> int:
-        corps = {"name": nom, "head_sha": self.tete, "status": "in_progress", "output": output}
+        # #5298 : `started_at` explicite en UTC. Sans lui, la forge date le
+        # check de l'heure locale du runner ; la lecture `filter=latest` (et
+        # `statusCheckRollup`) choisit alors le check de l'attempt précédent,
+        # dont le `startedAt` est plus grand, et l'ancien rouge masque le vert
+        # conclu par la relance.
+        corps = {"name": nom, "head_sha": self.tete, "status": "in_progress",
+                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 "output": output}
         if self.lien:
             corps["details_url"] = self.lien
         if self.external_id:

@@ -1900,10 +1900,33 @@ def ci_result(rollup) -> dict:
     return out
 
 
-def packet_proof_entries(rollup) -> list:
+def flux_entry_key(entry) -> tuple:
+    """#5298 : l'identité stable d'une entrée de flux dans un rollup — son nom
+    et l'URL du check run qui la porte (le `detailsUrl` `/runs/<check-id>` que
+    `ci-flow.py` pose). Deux flux homonymes d'exécutions ou d'attempts
+    différentes ont des clés différentes : un remplacement ne peut en viser
+    qu'un."""
+    if not isinstance(entry, dict):
+        return ()
+    return (str(entry.get("name") or entry.get("context") or ""),
+            str(entry.get("detailsUrl") or entry.get("details_url") or ""),
+            str(entry.get("startedAt") or entry.get("started_at") or ""),
+            str(entry.get("completedAt") or entry.get("completed_at") or ""))
+
+
+def packet_proof_entries(rollup, replaced=()) -> list:
     """Les checks du portier de suite complète d'un paquet : le workflow
     `paquet` et la sentinelle `paquet (run proof unavailable)` que
-    `merge_rollup` ajoute quand la preuve manque (#2876/#3066)."""
+    `merge_rollup` ajoute quand la preuve manque (#2876/#3066).
+
+    #5298 : un flux de part reste une preuve du portier (il est rattaché à sa
+    suite quand `tests.yml` est appelé par `paquet`, #3494) tant que la preuve
+    identifiée ne le remplace pas. `replaced` porte les clés
+    (`flux_entry_key`) des seules entrées remplacées : une entrée homonyme
+    d'une autre exécution ou d'un attempt courant n'est jamais ignorée par
+    l'effet de bord d'un nom. Sans preuve (lecture impossible, `external_id`
+    absent), rien n'est remplacé et le rouge garde la porte fermée."""
+    replaced = set(replaced or ())
     out = []
     for entry in latest_rollup(rollup) or ():
         name = str(entry.get("name") or entry.get("context") or "")
@@ -1911,6 +1934,10 @@ def packet_proof_entries(rollup) -> list:
         # portier, même quand `tests.yml` est appelé par `paquet` (le check est
         # alors associé au workflow appelant) : il a sa propre porte.
         if name == AGGREGATE_DETAIL_CHECK:
+            continue
+        # #5298 : seule l'entrée exacte qu'une preuve identifiée remplace est
+        # écartée ; un homonyme courant reste dans la preuve.
+        if flux_entry_key(entry) in replaced:
             continue
         if str(entry.get("workflowName") or "") == "paquet" \
                 or name == "paquet (run proof unavailable)":
