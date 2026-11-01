@@ -18,8 +18,14 @@ une borne d'âge supérieure au plafond d'un job (45 min) :
   `docker volume inspect`, un volume dont la date est illisible est gardé ;
   un volume *nommé* n'est jamais supprimé : il peut porter des données ;
 * images *dangling* (sans étiquette, donc sans conteneur) de plus de 24 h ;
+* images sans conteneur créées il y a plus de 7 jours : les images de
+  construction (`rust`, `node`, `ubuntu`, `postgres:16`) dorment des semaines
+  sur les VM ; `prune` ne touche jamais une image qu'un conteneur référence,
+  et une image retirée est re-téléchargée par le job qui en a besoin ;
 * cache de construction inutilisé depuis plus de 24 h ;
-* fichiers de plus de 48 h sous les `_work/_temp` des runners de l'hôte.
+* fichiers de plus de 48 h sous les `_work/_temp` des runners de l'hôte et
+  sous `/tmp` (compte `runner` seulement) ;
+* journaux `_diag` du runner de plus de 7 jours.
 
 Rien n'est supprimé hors CI (`GITHUB_ACTIONS` absent) sans `--force` explicite.
 Les erreurs de docker ne font jamais rougir l'étape : le ménage est un confort,
@@ -54,7 +60,9 @@ GIB = 1024 ** 3
 SEUIL_GIB = 5.0
 AGE_HEURES = 6.0            # conteneurs arrêtés et volumes non utilisés
 AGE_IMAGES_HEURES = 24.0    # images dangling et cache de construction
-AGE_TEMP_HEURES = 48.0      # fichiers abandonnés sous _work/_temp
+AGE_TEMP_HEURES = 48.0      # fichiers abandonnés sous _work/_temp et /tmp
+AGE_DIAG_JOURS = 7          # journaux du runner (_diag)
+AGE_INUTILISEES_HEURES = 168.0  # images sans conteneur (7 jours)
 VERROU = "/tmp/ameesh-ci-disque-%s.lock" % os.getuid()
 MAX_VOLUMES_INSPECT = 100   # par appel docker (borne la ligne de commande)
 MAX_LIGNES_DFV = 400        # `docker system df -v` : les 400 premières lignes
@@ -220,20 +228,13 @@ def _comptes_docker() -> dict:
     }
 
 
-def _du(chemin: Path, timeout: float = 30.0) -> int | None:
-    if not chemin.exists():
-        return None
-    code, sortie, _ = commande(["du", "-s", "-x", "-B1", str(chemin)], timeout=timeout)
-    if code != 0 or not sortie.strip():
-        return None
-    try:
-        return int(sortie.split()[0])
-    except (ValueError, IndexError):
-        return None
-
-
 def _du_complet(racine: Path | None, espace_travail: str | None) -> list[tuple[str, int | None]]:
-    """Les tailles utiles sous le home runner, bornées (une mesure, pas un scan)."""
+    """Les tailles utiles sous le home runner, en UN `du` borné.
+
+    Huit runners vivent sur l'hôte, chacun avec son checkout, son cache
+    d'outils et ses journaux : le diagnostic doit voir les huit, pas seulement
+    celui du job, sinon le compte ne tombe pas juste (mesure #5325 du 1/11).
+    """
     if racine is None:
         return []
     home = racine.parent
@@ -242,12 +243,28 @@ def _du_complet(racine: Path | None, espace_travail: str | None) -> list[tuple[s
         cibles.append(("checkout du job", Path(espace_travail)))
     cibles.append(("cache pip", home / ".cache" / "pip"))
     cibles.append(("home du runner", home))
-    for _work_tool in sorted(home.glob("*/_work/_tool")):
-        cibles.append(("outils %s" % _work_tool.parent.parent.name, _work_tool))
-    cibles.append(("_work du runner", racine / "_work"))
-    cibles.append(("_diag du runner", racine / "_diag"))
+    for outil in sorted(home.glob("*/_work/_tool")):
+        cibles.append(("outils %s" % outil.parent.parent.name, outil))
+    for runner in sorted(p for p in home.glob("*") if p.is_dir() and p.name[:1] == "r"):
+        if not runner.name[1:].isdigit():
+            continue
+        cibles.append(("_work %s" % runner.name, runner / "_work"))
+        cibles.append(("_diag %s" % runner.name, runner / "_diag"))
     cibles.append(("/tmp", Path("/tmp")))
-    return [(libelle, _du(chemin)) for libelle, chemin in cibles]
+    argv = ["du", "-s", "-x", "-B1", *[str(chemin) for _, chemin in cibles]]
+    code, sortie, _ = commande(argv, timeout=240)
+    if code not in (0, 1) or not sortie.strip():
+        return [(libelle, None) for libelle, _ in cibles]
+    tailles: dict[str, int] = {}
+    for ligne in sortie.splitlines():
+        morceaux = ligne.split("\t", 1)
+        if len(morceaux) != 2:
+            continue
+        try:
+            tailles[morceaux[1].rstrip("/")] = int(morceaux[0])
+        except ValueError:
+            continue
+    return [(libelle, tailles.get(str(chemin).rstrip("/"))) for libelle, chemin in cibles]
 
 
 def rapport(complet: bool = False, seuil_gib: float | None = None) -> dict:
@@ -380,10 +397,11 @@ def _volumes(dry_run: bool) -> dict:
         try:
             inspecte += json.loads(sortie) if sortie.strip() else []
         except ValueError:
-            etape["sortie"] = "docker volume inspect illisible : %s" % (erreur.strip() or sortie[:200])
+            etape["sortie"] = ("docker volume inspect illisible : %s"
+                               % (erreur.strip() or sortie[:200]))
             return etape
-    vieux, gardes = volumes_a_supprimer(inspecte, dt.datetime.now(dt.timezone.utc).timestamp(),
-                                        AGE_HEURES)
+    maintenant = dt.datetime.now(dt.timezone.utc).timestamp()
+    vieux, gardes = volumes_a_supprimer(inspecte, maintenant, AGE_HEURES)
     if gardes:
         print("ménage : %d volume(s) gardé(s) (nommé(s), créés il y a moins de %.0f h "
               "ou date illisible)" % (len(gardes), AGE_HEURES))
@@ -415,6 +433,25 @@ def _images(dry_run: bool) -> dict:
             "sortie": (sortie + erreur).strip(), "code": code}
 
 
+def _images_inutilisees(dry_run: bool) -> dict:
+    """Images sans conteneur, créées il y a plus de 7 jours.
+
+    Les images de construction (`rust`, `node`, `ubuntu`) dorment des semaines
+    sur les VM ; une image supprimée est retirée par le prochain job qui en a
+    besoin (`docker create` la télécharge), alors qu'un disque plein fait
+    échouer ce téléchargement. Aucune image utilisée par un conteneur, arrêté
+    ou non, n'est enlevée par `prune`.
+    """
+    argv = ["docker", "image", "prune", "-a", "-f", "--filter",
+            "until=%.0fh" % AGE_INUTILISEES_HEURES]
+    if dry_run:
+        print("+ " + " ".join(argv))
+        return {"etape": "images inutilisées > 7 j", "libere": 0, "sortie": ""}
+    code, sortie, erreur = commande(argv, timeout=240)
+    return {"etape": "images inutilisées > 7 j", "libere": taille_docker(sortie),
+            "sortie": (sortie + erreur).strip(), "code": code}
+
+
 def _cache_build(dry_run: bool) -> dict:
     argv = ["docker", "builder", "prune", "-f", "--filter",
             "until=%.0fh" % AGE_IMAGES_HEURES]
@@ -429,41 +466,73 @@ def _cache_build(dry_run: bool) -> dict:
             "sortie": (sortie + erreur).strip(), "code": code}
 
 
+def _fichiers_anciens(dossiers, jours: int, dry_run: bool, user: int | None = None) -> dict:
+    """Fichiers d'un dossier plus vieux que `jours` jours : mesurés, puis effacés."""
+    total = trouve = 0
+    for dossier in dossiers:
+        if not dossier.is_dir():
+            continue
+        commun = [str(dossier), "-xdev", "-mindepth", "1"]
+        if user is not None:
+            commun += ["-user", str(user)]
+        code, sortie, _ = commande(["find", *commun, "-mtime", "+%d" % jours,
+                                    "-print"], timeout=120)
+        if code != 0:
+            continue
+        liste = [ligne for ligne in sortie.splitlines() if ligne.strip()]
+        octets = 0
+        for chemin in liste:
+            try:
+                octets += os.lstat(chemin).st_size
+            except OSError:
+                pass
+        fichiers = len(liste)
+        if not fichiers:
+            continue
+        total += octets
+        trouve += fichiers
+        if dry_run:
+            print("+ find %s -mtime +%d -delete  (%d fichier(s))" % (dossier, jours, fichiers))
+        else:
+            commande(["find", *commun, "-mtime", "+%d" % jours, "-delete"], timeout=120)
+    return {"fichiers": trouve, "octets": 0 if dry_run else total}
+
+
 def _temp(dry_run: bool) -> dict:
     """Fichiers abandonnés (> 48 h) des _temp de tous les runners de l'hôte."""
     racine = _racine_runner()
     if racine is None:
         return {"etape": "_temp des runners > 48 h", "libere": 0,
                 "sortie": "RUNNER_WORKSPACE absent, étape sautée"}
-    total = 0
-    trouve = 0
-    for dossier in sorted(racine.parent.glob("*/_work/_temp")):
-        if not dossier.is_dir():
-            continue
-        code, sortie, erreur = commande(
-            ["find", str(dossier), "-mindepth", "1", "-type", "f",
-             "-mtime", "+%d" % int(AGE_TEMP_HEURES // 24)], timeout=60)
-        if code != 0:
-            continue
-        fichiers = [ligne for ligne in sortie.splitlines() if ligne]
-        if not fichiers:
-            continue
-        octets = 0
-        for fichier in fichiers:
-            try:
-                octets += os.lstat(fichier).st_size
-            except OSError:
-                pass
-        trouve += len(fichiers)
-        total += octets
-        if dry_run:
-            print("+ find %s -type f -mtime +%d -delete  (%d fichier(s))"
-                  % (dossier, int(AGE_TEMP_HEURES // 24), len(fichiers)))
-        else:
-            commande(["find", str(dossier), "-mindepth", "1", "-type", "f",
-                      "-mtime", "+%d" % int(AGE_TEMP_HEURES // 24), "-delete"], timeout=60)
-    return {"etape": "_temp des runners > 48 h", "libere": 0 if dry_run else total,
-            "sortie": "%d fichier(s) %s" % (trouve, "repéré(s)" if dry_run else "supprimé(s)")}
+    resultat = _fichiers_anciens(sorted(racine.parent.glob("*/_work/_temp")),
+                                 int(AGE_TEMP_HEURES // 24), dry_run)
+    return {"etape": "_temp des runners > 48 h", "libere": resultat["octets"],
+            "sortie": "%d fichier(s)" % resultat["fichiers"]}
+
+
+def _diag(dry_run: bool) -> dict:
+    """Journaux du runner de plus de 7 jours (le runner ne les tourne pas)."""
+    racine = _racine_runner()
+    if racine is None:
+        return {"etape": "_diag des runners > 7 j", "libere": 0,
+                "sortie": "RUNNER_WORKSPACE absent, étape sautée"}
+    resultat = _fichiers_anciens(sorted(racine.parent.glob("*/_diag")),
+                                 int(AGE_DIAG_JOURS), dry_run)
+    return {"etape": "_diag des runners > 7 j", "libere": resultat["octets"],
+            "sortie": "%d fichier(s)" % resultat["fichiers"]}
+
+
+def _tmp(dry_run: bool) -> dict:
+    """Fichiers du runner abandonnés dans /tmp depuis plus de 48 h.
+
+    `-user` borne à notre compte : les fichiers de root ou d'un autre service
+    restent. Un job dure 45 min au plus ; deux jours est une marge large, et
+    le nom disparu ne casse rien (l'inode reste ouvert s'il l'est encore).
+    """
+    resultat = _fichiers_anciens([Path("/tmp")], int(AGE_TEMP_HEURES // 24),
+                                 dry_run, user=os.getuid())
+    return {"etape": "/tmp du runner > 48 h", "libere": resultat["octets"],
+            "sortie": "%d fichier(s)" % resultat["fichiers"]}
 
 
 def menage(dry_run: bool = False, force: bool = False) -> int:
@@ -473,8 +542,7 @@ def menage(dry_run: bool = False, force: bool = False) -> int:
         return 0
     pret, version = docker_pret()
     if not pret:
-        print("ménage : docker indisponible (%s), rien n'est supprimé" % version)
-        return 0
+        print("ménage : docker indisponible (%s), les étapes docker sont sautées" % version)
     verrou = _verrou()
     if verrou is None:
         return 0
@@ -483,16 +551,20 @@ def menage(dry_run: bool = False, force: bool = False) -> int:
         print("ménage de %s (%s) : %s libres avant (docker %s)"
               % (socket.gethostname(), os.environ.get("RUNNER_NAME", "runner inconnu"),
                  gib(avant["libre"]), version))
+        etapes = []
+        if pret:
+            etapes += [_conteneurs, _volumes, _images, _images_inutilisees, _cache_build]
+        etapes += [_temp, _diag, _tmp]
         resultats = []
-        for etape in (_conteneurs, _volumes, _images, _cache_build, _temp):
+        for etape in etapes:
             try:
                 resultat = etape(dry_run)
             except Exception as erreur:  # noqa: BLE001 — jamais un verdict
                 resultat = {"etape": etape.__name__, "libere": 0,
                             "sortie": "échec inattendu : %s" % erreur}
             resultats.append(resultat)
-            print("ménage %-30s %s %s" % (resultat["etape"], gib(resultat["libere"]),
-                                          ("— " + resultat["sortie"]) if resultat["sortie"] else ""))
+            detail = ("— " + resultat["sortie"]) if resultat["sortie"] else ""
+            print("ménage %-32s %s %s" % (resultat["etape"], gib(resultat["libere"]), detail))
         apres = espace("/") if not dry_run else avant
         if not dry_run:
             libre = max(0, apres["libre"] - avant["libre"])
