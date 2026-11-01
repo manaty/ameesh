@@ -102,17 +102,28 @@ def _activated_package(items: list[dict], activation: dict | None) -> str:
 
 
 def _tally(units: list[str]) -> dict:
-    waiting = units.count("waiting")
-    active = units.count("active")
-    unmeasured = units.count("unmeasured")
-    merged = units.count("merged") + active + waiting + unmeasured
+    merged = units.count("merged")
     abandoned = units.count("abandoned")
     counted = len(units) - abandoned
     return {"lots_total": len(units), "lots_merged": merged, "lots_abandoned": abandoned,
             "lots_open": units.count("open"), "lots_pending": units.count("pending"),
-            "lots_active": active, "lots_waiting_activation": waiting,
-            "lots_unmeasured": unmeasured,
-            "progress": round((merged - waiting - unmeasured) / counted, 4) if counted else None}
+            "progress": round(merged / counted, 4) if counted else None}
+
+
+def _activation_tally(units: list[str], measured: bool) -> dict:
+    """#5244 : à côté de la fusion (`progress`), ce qui est fait au sens du canon
+    §5. `progress_active` : None sans lecture des preuves."""
+    counted = len(units) - units.count("abandoned")
+    active = units.count("active")
+    return {"lots_active": active, "lots_waiting_activation": units.count("waiting"),
+            "lots_unmeasured": units.count("unmeasured"),
+            "progress_active": round(active / counted, 4) if measured and counted else None}
+
+
+def done_share(tally: dict):
+    """La part faite d'une fiche : activée quand on l'a lue, sinon fusionnée."""
+    share = tally.get("progress_active")
+    return tally.get("progress") if share is None else share
 
 
 def summarize(packages: Iterable[dict], items: Iterable[dict],
@@ -122,8 +133,8 @@ def summarize(packages: Iterable[dict], items: Iterable[dict],
     `packages` : fiches (id, kind, title, parent, responsible, status…) ;
     `items` : lots rattachés (id, package_id, state). Rend
     `{"epics": [...], "milestones": [...], "lots": {id_fiche: statut}}`.
-    #5244 : avec `activation` (`activation.compute`), `progress` ne compte
-    que les lots activés ; `lots_merged` reste le décompte de la fusion.
+    #5244 : `progress` et `lots_merged` restent le décompte de la fusion ; avec
+    `activation` (`activation.compute`), `progress_active` compte les activés.
     """
     by_id = {p["id"]: p for p in packages}
     by_package: dict = {}
@@ -139,14 +150,16 @@ def summarize(packages: Iterable[dict], items: Iterable[dict],
                             and by_id[root]["kind"] == "milestone"
                             and milestone_of(p["id"], by_id) == root]
         direct = [i for h in holders for i in by_package.get(h, [])]
-        statuses = [_activated_package(by_package.get(p["id"], []), activation)
-                    for p in lots] + [_activated_unit(i, activation) for i in direct]
-        return lots, direct, statuses
+        statuses = [lot_status[p["id"]] for p in lots] + [
+            item_unit_status(i.get("state") or "", i.get("close_reason")) for i in direct]
+        activated = [_activated_package(by_package.get(p["id"], []), activation)
+                     for p in lots] + [_activated_unit(i, activation) for i in direct]
+        return lots, direct, statuses, activated
 
     epics = []
     for pid in sorted(p for p in by_id if by_id[p].get("kind") == "epic"):
         epic = by_id[pid]
-        lots, direct, statuses = units_under(pid)
+        lots, direct, statuses, activated = units_under(pid)
         epics.append(dict(
             id=pid, title=epic.get("title"), milestone=milestone_of(pid, by_id),
             responsible=epic.get("responsible"), status=epic.get("status"),
@@ -157,11 +170,11 @@ def summarize(packages: Iterable[dict], items: Iterable[dict],
                    "work_items": [int(i["id"]) for i in by_package.get(p["id"], [])]}
                   for p in sorted(lots, key=lambda p: p["id"])],
             work_items=[int(i["id"]) for i in direct],
-            **_tally(statuses)))
+            **_tally(statuses), **_activation_tally(activated, activation is not None)))
     milestones = []
     for pid in sorted(p for p in by_id if by_id[p].get("kind") == "milestone"):
         ms = by_id[pid]
-        _lots, direct, statuses = units_under(pid)
+        _lots, direct, statuses, activated = units_under(pid)
         # L96 : la date du jalon (posée dans ameesh, sinon déclarée au canon)
         day = planned_dates(ms)["delivery"]
         milestones.append(dict(
@@ -169,7 +182,7 @@ def summarize(packages: Iterable[dict], items: Iterable[dict],
             status=ms.get("status"),
             responsible=ms.get("responsible"), canon_ref=ms.get("canon_ref"),
             epics=[e["id"] for e in epics if e["milestone"] == pid],
-            **_tally(statuses)))
+            **_tally(statuses), **_activation_tally(activated, activation is not None)))
     return {"epics": epics, "milestones": milestones, "lots": lot_status}
 
 

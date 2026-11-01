@@ -497,7 +497,7 @@ def _commitment_view(row: dict, base: _dt.date, items: dict,
 def _package_view(pkg: dict, tally: dict, real_span: tuple, base: _dt.date) -> dict:
     planned = plan_mod.planned_dates(pkg)
     target = _date(planned["delivery"] or planned["end"])
-    complete = tally.get("progress") == 1 or (tally.get("lots_total", 0) > 0 and
+    complete = plan_mod.done_share(tally) == 1 or (tally.get("lots_total", 0) > 0 and
                                               tally.get("lots_open", 0) == 0 and
                                               tally.get("lots_pending", 0) == 0)
     late = None
@@ -512,7 +512,8 @@ def _package_view(pkg: dict, tally: dict, real_span: tuple, base: _dt.date) -> d
         "id": pkg["id"], "title": pkg.get("title") or "", "parent": pkg.get("parent"),
         "responsible": pkg.get("responsible"), "planned": dict(planned, source=origin),
         "real": {"debut": real_span[0], "livree": real_span[1]},
-        "progress": tally.get("progress"), "units_total": tally.get("lots_total", 0),
+        "progress": tally.get("progress"), "progress_active": tally.get("progress_active"),
+        "units_total": tally.get("lots_total", 0),
         "units_delivered": tally.get("lots_merged", 0),
         "units_active": tally.get("lots_active", 0),
         "units_waiting_activation": tally.get("lots_waiting_activation", 0),
@@ -844,10 +845,10 @@ def _package_bar(bar: _Bar, p: dict, base: _dt.date) -> None:
     start = _day_of(p["real"].get("debut"))
     # le réel d'une fiche court jusqu'à sa dernière livraison si tout est
     # livré, sinon jusqu'à aujourd'hui
-    end = _day_of(p["real"].get("livree")) if p.get("progress") == 1 else base
+    end = _day_of(p["real"].get("livree")) if plan_mod.done_share(p) == 1 else base
     if start:
         bar.span(start, end or base, GLYPHS["real"], over=(" ", GLYPHS["planned"]))
-    bar.mark(pd, GLYPHS["delivery"] if not (p.get("progress") == 1) else GLYPHS["delivered"])
+    bar.mark(pd, GLYPHS["delivery"] if plan_mod.done_share(p) != 1 else GLYPHS["delivered"])
 
 
 def _flag(e: dict) -> str:

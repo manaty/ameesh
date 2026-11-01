@@ -59,14 +59,21 @@ class Steps(unittest.TestCase):
     def test_losing_the_evidence_never_raises_progress(self):
         view = activation.step_of(lot(1), "a" * 12, receipts=None, proof=activation.Evidence())
         epic = plan.summarize(Tally.PACKAGES[:1], [lot(1)], {1: view})["epics"][0]
-        self.assertEqual((epic["progress"], epic["lots_unmeasured"], epic["lots_active"]),
+        self.assertEqual((epic["progress_active"], epic["lots_unmeasured"], epic["lots_active"]),
                          (0, 1, 0))
+        self.assertEqual(epic["progress"], 1)
 
     def test_other_closures_keep_their_meaning(self):
         self.assertEqual(step(lot(1, "closed", "done")), "abandoned")
         self.assertEqual(step(lot(1, "closed", "superseded", executor="bureau")), "abandoned")
         self.assertEqual(step(lot(1, "closed", "delivered")), "delivered")
+        self.assertEqual(step(lot(1, "closed", "delivered", executor="bureau")), "delivered")
         self.assertEqual(step(lot(1, "build")), "open")
+
+    def test_annulled_merge_is_not_the_lot_commit(self):
+        rows = [{"work_item_id": 1, "kind": "merged", "sha": "A" * 12},
+                {"work_item_id": 1, "kind": "merged", "sha": "b" * 12, "annulled": True}]
+        self.assertEqual(activation.merged_shas(rows), {1: "a" * 12})
 
     def test_short_sha_prefix(self):
         self.assertTrue(PROOF.contains("c" * 7))
@@ -83,23 +90,26 @@ class Tally(unittest.TestCase):
     def test_without_activation_nothing_changes(self):
         epic = plan.summarize(self.PACKAGES, [lot(1), lot(2, package="f1")])["epics"][0]
         self.assertEqual((epic["lots_merged"], epic["progress"]), (2, 1))
+        self.assertIsNone(epic["progress_active"])
+        self.assertEqual(plan.done_share(epic), 1)
 
     def test_progress_counts_active_lots_only(self):
         steps = {1: {"step": "merged", "counted": False}, 2: {"step": "active", "counted": True},
                  3: {"step": "gesture", "counted": False}}
         epic = self.summary([lot(1), lot(2), lot(3, "closed", "done", executor="x")], steps)
         self.assertEqual(epic["lots_pending"], 1)  # la fiche f1, sans lot
-        self.assertEqual(epic["progress"], 0.25)
-        self.assertEqual((epic["lots_merged"], epic["lots_active"],
-                          epic["lots_waiting_activation"]), (3, 1, 2))
+        self.assertEqual(epic["progress_active"], 0.25)
+        # la fusion garde son sens (contrat ameesh-progress/1) : le geste reste hors compte
+        self.assertEqual((epic["lots_merged"], epic["progress"]), (2, round(2 / 3, 4)))
+        self.assertEqual((epic["lots_active"], epic["lots_waiting_activation"]), (1, 2))
 
     def test_card_is_held_by_its_least_advanced_lot(self):
         steps = {1: {"step": "active", "counted": True}, 2: {"step": "merged", "counted": False}}
         epic = self.summary([lot(1, package="f1"), lot(2, package="f1")], steps)
-        self.assertEqual((epic["lots_waiting_activation"], epic["progress"]), (1, 0))
+        self.assertEqual((epic["lots_waiting_activation"], epic["progress_active"]), (1, 0))
         steps[2] = {"step": "active", "counted": True}
         epic = self.summary([lot(1, package="f1"), lot(2, package="f1")], steps)
-        self.assertEqual((epic["lots_active"], epic["progress"]), (1, 1))
+        self.assertEqual((epic["lots_active"], epic["progress_active"]), (1, 1))
         self.assertEqual(epic["lots"][0]["step"], "active")
         steps[2] = {"step": "merged", "counted": False}
         epic = self.summary([lot(1, package="f1"), lot(2, package="f1")], steps)
@@ -149,7 +159,9 @@ class Registry(PgTestCase):
 
     def test_receipt_columns_are_read(self):
         from ameesh import storage
-        self.assertEqual(storage.of(self.db).progress.lot_actions([self.ident]), [])
+        reads = storage.of(self.db).progress
+        self.assertEqual(reads.lot_actions([self.ident]), [])
+        self.assertFalse(reads.lot_milestones([self.ident])[0]["annulled"])
         self.assertIn("auth_kind", postgres_progress._ACTION_COLUMNS)
 
     def test_commitment_waits_for_activation(self):

@@ -8,7 +8,7 @@ code therefore only reaches the first step. The steps of a lot that was done:
 * `active`: its commit is an ancestor of the commit attested on every host
   actually active (`staging_pending.active_hosts`, a reported host holds
   nothing, as in `staging_pending.waiting`);
-* `gesture`: an operator gesture (closed by hand, reserved to an external
+* `gesture`: an operator gesture (closed `done`, reserved to an external
   executor) with no receipt: neither the closure nor a signed answer proves the
   effect, an answer may refuse, or authorize what was never run;
 * `receipt`: the same gesture, with a gated action of the lot authorized by a
@@ -128,7 +128,7 @@ def merged_shas(milestones) -> dict:
     order, `progress.lot_milestones`)."""
     out = {}
     for row in milestones:
-        if row.get("kind") == "merged" and row.get("sha"):
+        if row.get("kind") == "merged" and row.get("sha") and not row.get("annulled"):
             out[int(row["work_item_id"])] = str(row["sha"]).lower()
     return out
 
@@ -151,7 +151,7 @@ def step_of(item: dict, sha: str | None, *, receipts: dict | None, proof: Eviden
     if state == lifecycle.CLOSED:
         if reason not in ("done", "delivered"):
             return {"step": ABANDONED, "counted": False, "label": None}
-        if (item.get("external_executor") or "").strip():
+        if reason == "done" and (item.get("external_executor") or "").strip():
             action = (receipts or {}).get(int(item["id"]))
             return (_view(RECEIPT, True, action=action) if action
                     else _view(GESTURE, False))
@@ -176,7 +176,7 @@ def compute(db, items, *, cfg=None) -> dict:
     rows = {int(i["id"]): i for i in items}
     merged = [i for i, r in rows.items() if r.get("state") in lifecycle.DELIVERED]
     gestures = [i for i, r in rows.items() if r.get("state") == lifecycle.CLOSED
-                and r.get("close_reason") in ("done", "delivered")
+                and r.get("close_reason") == "done"
                 and (r.get("external_executor") or "").strip()]
     shas = merged_shas(st.progress.lot_milestones(merged)) if merged else {}
     receipts = signed_receipts(st.progress.lot_actions(gestures)) if gestures else {}

@@ -968,7 +968,7 @@ def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict
     for p in projects:
         name = p.get("name")
         open_ms = [m for m in milestones if name in ms_projects.get(m["id"], ())
-                   and m.get("progress") != 1]
+                   and (m.get("progress") != 1 or m.get("lots_waiting_activation"))]
         open_ms.sort(key=lambda m: (m.get("date") is None, m.get("date") or "", m["id"]))
         ms = open_ms[0] if open_ms else None
         cards.append({
@@ -982,7 +982,9 @@ def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict
             "spend_24h_usd": round(float(p.get("usd_24h") or 0.0), 2),
             "decisions_pending": sum(1 for d in decisions if d.get("project") == name),
             "milestone": ({k: ms.get(k) for k in ("id", "title", "date", "progress",
-                                                  "lots_merged", "lots_total")}
+                                                  "lots_merged", "lots_total", "progress_active",
+                                                  "lots_active", "lots_waiting_activation",
+                                                  "lots_unmeasured")}
                           if ms else None),
             "warnings": list(p.get("warnings") or []),
         })

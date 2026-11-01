@@ -132,7 +132,8 @@ class Progress(interface.Progress):
             return []
         return self.db.query(
             "SELECT id, work_item_id, kind, actor, verdict, sha, note,"
-            "       extract(epoch from at)::float8 AS at_ts"
+            "       extract(epoch from at)::float8 AS at_ts,"
+            "       (kind = 'merged' AND agent_mesh_merged_annulled(work_item_id, at)) AS annulled"
             "  FROM work_item_milestones WHERE work_item_id IN (%s)"
             " ORDER BY at, id" % _marks(ids), tuple(ids))
 
