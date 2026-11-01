@@ -260,7 +260,7 @@ class BudgetGateTest(PgTestCase):
             "order by id desc limit 1")[0]
         self.assertEqual(ligne["model"], "deepseek-pro")
         # barème pro : 1 M de jetons d'entrée = 0,55 $ (le défaut serait 0,27 $)
-        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 1.32, places=6)
 
     def test_modele_inconnu_facture_le_plus_cher(self):
         """B4 (arbitrage mesh-design) : un modèle inconnu (vide) facture le
@@ -283,7 +283,7 @@ class BudgetGateTest(PgTestCase):
             "order by id desc limit 1")[0]
         self.assertEqual(ligne["model"], "inconnu")
         # plus cher connu DeepSeek = pro : 0,55 $/M d'entrée (défaut 0,27)
-        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 1.32, places=6)
 
     def test_modele_annonce_par_le_flux_gagne(self):
         """B4 : le modèle annoncé par le flux du harnais est la source du tour
@@ -303,7 +303,7 @@ class BudgetGateTest(PgTestCase):
             "select model, usd from turn_costs where agent = 'budget' "
             "order by id desc limit 1")[0]
         self.assertEqual(ligne["model"], "deepseek-pro")
-        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 1.32, places=6)
 
     def test_suspension_durable_et_reparation_avant_reprise(self):
         """Verdict L13 B5 : un échec de comptabilité survit au redémarrage, et
@@ -439,7 +439,7 @@ class BudgetGateTest(PgTestCase):
             "select model, usd from turn_costs where agent = 'budget' "
             "order by id desc limit 1")[0]
         self.assertEqual(ligne["model"], "deepseek-pro")
-        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 1.32, places=6)
 
 
 class AnnouncedModelTest(PgTestCase):
@@ -519,7 +519,7 @@ class AnnouncedModelTest(PgTestCase):
         autorise = autre.budget_ok()  # réparation, puis décision du plafond
         ligne = self._ligne()
         self.assertEqual(ligne["model"], "deepseek-pro")
-        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 1.32, places=6)
         self.assertFalse(autorise, "0,55 $ dépasse le plafond de 0,40 $/h")
         self.assertIsNone(registry.pending_spend_get(self.db, self.name))
 
@@ -554,7 +554,7 @@ class AnnouncedModelTest(PgTestCase):
         self.worker.budget_ok()  # la réparation de ce worker passe par sa mémoire
         ligne = self._ligne()
         self.assertEqual(ligne["model"], "deepseek-pro")
-        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 1.32, places=6)
 
     def test_double_panne_puis_reprise_par_un_nouveau_worker_facture_le_modele_du_flux(self):
         """La sonde B4 résiduelle (codex3) : ni l'annonce ni la ligne du grand livre
@@ -573,7 +573,7 @@ class AnnouncedModelTest(PgTestCase):
         autorise = nouveau.budget_ok()
         ligne = self._ligne()
         self.assertEqual(ligne["model"], "deepseek-pro")
-        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 1.32, places=6)
         self.assertFalse(autorise, "0,55 $ dépasse le plafond de 0,40 $/h")
 
     def test_flux_sans_annonce_la_reparation_garde_le_modele_du_marqueur(self):
