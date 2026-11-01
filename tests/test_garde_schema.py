@@ -490,6 +490,72 @@ class BackgroundAdmissionTest(unittest.TestCase):
         process.shutdown.assert_called_once()
 
 
+class EntryPointRefusalTest(unittest.TestCase):
+    """#4976: an incompatible schema is a named refusal, its cause kept."""
+
+    def test_runner_entry_points_refuse_without_traceback(self):
+        for entry, argv in ((runner.main, []), (runner.attach_main, ['agent'])):
+            refused = io.StringIO()
+            with self.subTest(entry=entry.__name__), \
+                    mock.patch.object(runner, '_harden_executor_environment',
+                                      side_effect=migrations.IncompatibleSchema('9999_future')), \
+                    contextlib.redirect_stderr(refused):
+                self.assertEqual(entry(argv), 1)
+                self.assertIn('9999_future', refused.getvalue())
+
+    def test_worker_leaves_when_the_schema_changes_just_before_the_turn(self):
+        worker = mock.MagicMock()
+        worker.name = 'agent'
+        worker.stopping.is_set.return_value = False
+        worker.runner.stop.is_set.return_value = False
+        worker.runner.draining.is_set.return_value = False
+        worker.runner.restart_for_stale = False
+        worker.runner.gate_holds.return_value = False
+        worker.renew.return_value = True
+        worker._consigne_a_restaurer = False
+        worker._moved_before_turn.return_value = False
+        worker.placed_elsewhere.return_value = None
+        worker.admission_withdrawn.return_value = None
+        worker._election_handover.return_value = None
+        worker.retry_remaining.return_value = 0
+        worker.run_turn.side_effect = migrations.IncompatibleSchema('9999_future')
+        with mock.patch.object(migrations, 'require_compatible_writer'), \
+                mock.patch.object(runner, 'log'), \
+                mock.patch.object(runner, 'log_async') as journal:
+            runner.AgentWorker.run(worker)
+        worker.run_turn.assert_called_once()
+        self.assertIn('9999_future', journal.call_args.args[0])
+
+    def test_ameesh_migrate_passes_the_live_executor_reason(self):
+        from ameesh import mesh_cli
+        with mock.patch.object(cli, 'cmd_migrate', return_value=0) as migrate, \
+                mock.patch.object(mesh_cli.config_mod, 'load', return_value=object()):
+            self.assertEqual(
+                mesh_cli.main(['migrate', '--allow-live-executors', 'incident recovery']), 0)
+        self.assertEqual(migrate.call_args.kwargs['allow_live_executors'], 'incident recovery')
+
+    def test_alerts_release_refused_writes_nothing(self):
+        from ameesh import role_run
+        lease = role_run._AlertsLease(object(), 'role', 'host', ttl=3)
+        lease.epoch = 7
+        work = mock.Mock()
+        with mock.patch.object(lease, '_work', return_value=work), \
+                mock.patch.object(migrations, 'require_compatible_writer',
+                                  side_effect=migrations.IncompatibleSchema('future')):
+            self.assertFalse(lease.release())
+        work.land_unlock.assert_not_called()
+
+    def test_alerts_watcher_says_why_it_stops_the_child(self):
+        from ameesh import role_run
+        lease = mock.Mock(ttl=0.3)
+        lease.renew.side_effect = migrations.IncompatibleSchema('9999_future')
+        execution, refused = mock.Mock(), io.StringIO()
+        with contextlib.redirect_stderr(refused):
+            role_run._watch_alerts_lease(lease, execution, threading.Event())
+        execution.kill.assert_called_once()
+        self.assertIn('9999_future', refused.getvalue())
+
+
 class MediatedAdmissionTest(unittest.TestCase):
     def test_remote_db_uses_server_admission_without_sql(self):
         from ameesh.storage.remote.client import RemoteDb

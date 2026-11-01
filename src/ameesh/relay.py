@@ -1185,9 +1185,13 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     from . import config as config_mod
-    from . import db as db_mod
+    from . import db as db_mod, migrations
     cfg = config_mod.load()
-    db = db_mod.connect(cfg)
+    try:
+        db = db_mod.connect(cfg)
+    except migrations.IncompatibleSchema as exc:  # #4976 : refus nommé, sans trace
+        print("relais de modèle : %s" % exc, file=sys.stderr)
+        return 1
     policy = CanonPolicy(_canon_loader(cfg))
     relay = Relay(verifier=load_verifier(spec), policy=policy, db=db, cfg=cfg)
     server = make_server(relay, args.bind)
