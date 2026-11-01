@@ -670,12 +670,12 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
     * les verdicts qui nomment la tête gelée : un `blocked` rendu compte
       l'avis (le relecteur a rendu), un verdict d'une autre tête ne compte pas ;
     * #5202 : le passage en `validated` depuis le gel, que la porte n'accorde
-      qu'au quorum de la tête gelée (#4423, report compris). Un désigné en
-      surplus resté sans verdict n'est plus dû (#5083 : quorum cx1 + cx3,
-      dev3 sans avis) ; une désignation postérieure à la validation l'est.
-      Une sortie de `validated` (`validated → …`, retour en build) lève ce
-      quorum. Une note du journal écrite en `qa` sans transition (passe de
-      report « carried quorum pending ») ne le lève pas.
+      qu'au quorum de la tête gelée (#4423, report compris). Comme pour la
+      file et le SLO (#4851), aucun désigné n'est plus dû (#5083 : quorum
+      cx1 + cx3, dev3 sans avis). Une sortie de `validated` (`validated → …`,
+      retour en build) lève ce quorum. Une note du journal écrite en `qa`
+      sans transition (passe de report « carried quorum pending ») ne le
+      lève pas.
     """
     freeze = _latest_freeze(milestones)
     if freeze is None:
@@ -776,8 +776,8 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
         verdict = by_actor.get(_norm(name))
         if verdict is not None:
             continue
-        if quorum_at is not None and designated_at <= quorum_at:
-            continue                    # #5202 : quorum acquis sans son avis
+        if quorum_at is not None:
+            continue                    # #5202/#4851 : quorum acquis sans son avis
         pending.append({"name": name, "designated_ts": designated_at,
                         "designated": _iso(designated_at)})
     return {"freeze": freeze, "designees": designees, "pending": pending,

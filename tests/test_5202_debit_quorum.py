@@ -5,6 +5,7 @@ lot dont la porte a acquis le quorum de la tête gelée (#4423).
 Témoin du 01/11 vers 01:00Z (auditeur) : #5083 validé par report (ok cx1 +
 ok cx3 au gel #29420), ameesh-dev3 resté désigné sans avis ; `ameesh debit`
 le comptait « avis dû », proposait de réveiller dev3 et `--check` sortait 2.
+Même règle que la file et le SLO depuis #4851, lue ici sur le journal.
 """
 from __future__ import annotations
 
@@ -90,12 +91,14 @@ class QuorumAcquisTest(unittest.TestCase):
         self.assertEqual([row["reviewer"] for row in report["reviews_due"]],
                          ["ameesh-dev3"])
 
-    def test_designation_posterieure_a_la_validation_reste_due(self):
+    def test_meme_regle_que_la_file_4851_aucun_designe_du(self):
+        """#4851 décharge tout désigné d'un lot validé (file, charge, SLO) ;
+        le débit ne réclame pas un avis que la file ne réclame plus."""
         report = lot_5083(
             event(5083, 5, T - 3 * H, "reviewer ameesh-dev4 designated",
                   actor="mesh-design", state="validated"))
-        self.assertEqual([row["reviewer"] for row in report["reviews_due"]],
-                         ["ameesh-dev4"])
+        self.assertEqual(report["reviews_due"], [])
+        self.assertTrue(report["qa"][0]["ready"])
 
     def test_validation_d_un_gel_precedent_ne_vaut_pas(self):
         report = lot_5083(extra_milestones=[frozen(5083, 20, T - 2 * H, sha="b" * 40)])
