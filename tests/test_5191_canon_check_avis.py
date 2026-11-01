@@ -155,6 +155,18 @@ class CoverageTest(unittest.TestCase):
                 self.assertIn(coverage.CODE_UNMEASURED,
                               self._codes(found, canon_mod.ERROR))
 
+    def test_malformed_review_policies_is_an_error_without_any_option(self):
+        for block in ("{risk_classes: []}", "{risk_classes: {projects: []}}"):
+            with self.subTest(block=block):
+                commit = self._repo(self.canon_root, {
+                    "federation.yaml": "federation: \"0.1\"\nreview_policies: %s\n" % block})
+                canon = mock.Mock(sources=[canon_mod.Source(
+                    member="home", directory="", repo=self.canon_root, rev=commit,
+                    commit=commit, prefix="", mode="git")])
+                found = coverage.findings(None, canon)
+                self.assertEqual([coverage.CODE_UNMEASURED],
+                                 self._codes(found, canon_mod.ERROR))
+
     def test_canon_without_review_policies_has_no_finding(self):
         commit = self._repo(self.canon_root, {"federation.yaml": "federation: \"0.1\"\n"})
         canon = mock.Mock(sources=[canon_mod.Source(

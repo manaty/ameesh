@@ -111,8 +111,9 @@ def findings(cfg, canon: canon_mod.Canon,
     except mechanics.MechanicsAbsent:
         return refuse_explicit()
     except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
-        add(CODE_UNMEASURED, canon_mod.WARNING, "review policy unreadable: %s" % exc)
-        return refuse_explicit()
+        # un bloc présent mais mal formé n'est pas « aucune politique »
+        add(CODE_UNMEASURED, canon_mod.ERROR, "review policy unreadable: %s" % exc)
+        return out
     for project in sorted(set(explicit) - set(projects)):
         add(CODE_UNMEASURED, canon_mod.ERROR,
             "--project-repo names %s, which risk_classes does not declare" % project)
