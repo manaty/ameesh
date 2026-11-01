@@ -298,7 +298,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   // #5244 : la part faite (activée) d'une fiche, la fusion sur un ancien instantané
   function doneShare(x) { return x.progress_active === null || x.progress_active === undefined ? x.progress : x.progress_active; }
   function activationText(x) {
-    return x.lots_merged && x.lots_active !== undefined && x.lots_active !== null
+    return x.lots_active || x.lots_waiting_activation || x.lots_unmeasured
       ? ", " + x.lots_active + " active, " + x.lots_waiting_activation + " not active yet, " + x.lots_unmeasured + " not measured" : "";
   }
   var API = "/api/progress.json", CHAT = "/api/conversation.json";

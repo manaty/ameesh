@@ -1311,7 +1311,8 @@ def _ci_suite_lines(ci: dict, width: int) -> list[str]:
 
 def _activation_text(tally: dict) -> str:
     """#5244 : le détail d'activation, absent d'un instantané qui ne le porte pas."""
-    if "lots_active" not in tally or not tally.get("lots_merged"):
+    if not any(tally.get(k) for k in ("lots_active", "lots_waiting_activation",
+                                      "lots_unmeasured")):
         return ""
     return ", %d active, %d not active yet, %d not measured" % (
         tally["lots_active"], tally["lots_waiting_activation"], tally["lots_unmeasured"])

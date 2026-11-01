@@ -116,6 +116,27 @@ class Tally(unittest.TestCase):
         self.assertEqual(epic["lots"][0]["step"], "waiting")
 
 
+class Package(unittest.TestCase):
+    def view(self, **tally):
+        base = {"lots_total": 1, "lots_open": 0, "lots_pending": 0}
+        return roadmap._package_view(
+            {"id": "e", "kind": "epic", "planned_end": "2020-01-01"}, dict(base, **tally),
+            (None, None), roadmap.today())
+
+    def test_known_not_active_is_late_unmeasured_is_not(self):
+        self.assertTrue(self.view(lots_waiting_activation=1, progress_active=0)["late"])
+        self.assertIsNone(self.view(lots_unmeasured=1, progress_active=0)["late"])
+
+
+class Text(unittest.TestCase):
+    def test_gesture_alone_is_shown(self):
+        from ameesh import progress
+        self.assertIn("1 not active yet", progress._activation_text(
+            {"lots_merged": 0, "lots_active": 0, "lots_waiting_activation": 1,
+             "lots_unmeasured": 0}))
+        self.assertEqual(progress._activation_text({"lots_merged": 1}), "")
+
+
 class Overview(unittest.TestCase):
     def test_fully_merged_milestone_stays_until_done(self):
         from ameesh import progress
@@ -179,6 +200,15 @@ class Registry(PgTestCase):
         self.assertEqual(reads.lot_actions([self.ident]), [])
         self.assertFalse(reads.lot_milestones([self.ident])[0]["annulled"])
         self.assertIn("auth_kind", postgres_progress._ACTION_COLUMNS)
+
+    def test_overdue_commitment_on_a_gesture_without_receipt(self):
+        self.db.execute("UPDATE work_items SET state = 'closed', close_reason = 'done',"
+                        " external_executor = 'bureau' WHERE id = %s", (self.ident,))
+        roadmap.add_commitment(self.db, "geste", due="2020-01-01", lot=self.ident)
+        self.assertEqual([r["lot"] for r in roadmap.overdue(self.db)], [self.ident])
+        self.db.execute("UPDATE work_items SET external_executor = NULL WHERE id = %s",
+                        (self.ident,))
+        self.assertEqual(roadmap.overdue(self.db), [])
 
     def test_commitment_waits_for_activation(self):
         row = {"id": 1, "work_item_id": self.ident, "status": "open", "kind": "commitment",

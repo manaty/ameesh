@@ -497,9 +497,12 @@ def _commitment_view(row: dict, base: _dt.date, items: dict,
 def _package_view(pkg: dict, tally: dict, real_span: tuple, base: _dt.date) -> dict:
     planned = plan_mod.planned_dates(pkg)
     target = _date(planned["delivery"] or planned["end"])
+    # #5244 : une unité connue non activée retient la fiche ; une unité non
+    # mesurée n'est pas faite (`progress_active`) mais ne lève pas de retard (§3).
     complete = plan_mod.done_share(tally) == 1 or (tally.get("lots_total", 0) > 0 and
                                               tally.get("lots_open", 0) == 0 and
-                                              tally.get("lots_pending", 0) == 0)
+                                              tally.get("lots_pending", 0) == 0 and
+                                              tally.get("lots_waiting_activation", 0) == 0)
     late = None
     if target and not complete and base > target:
         late = {"what": LABELS["delivery"] if planned["delivery"] else LABELS["end"],
@@ -704,12 +707,12 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
         item = items.get(lot) if lot else None
         if lot and item is None:
             item = work_mod.get(db, lot)
-            if item and dev.abandonnee(item.get("state")):
-                continue
-            # #5244 : tâche activée : engagement tenu (livrer ne suffit pas)
-            if item and dev.livree(item.get("state")) \
-                    and _no_lateness(activation_mod.compute(db, [item])[int(item["id"])]):
-                continue
+            # #5244 : tâche activée : engagement tenu (livrer ne suffit pas) ; un geste
+            # fermé sans reçu n'est pas une tâche abandonnée
+            if item and (dev.livree(item.get("state")) or dev.abandonnee(item.get("state"))):
+                step = activation_mod.compute(db, [item])[int(item["id"])]
+                if step["step"] == activation_mod.ABANDONED or _no_lateness(step):
+                    continue
         out.append({"reason": "engagement", "what": row["what"], "due": due.isoformat(),
                     "days": (base - due).days, "commitment": row["id"], "lot": lot,
                     "package": row.get("package_id"), "owner": row.get("owner"),
