@@ -11,14 +11,20 @@ Ce contrôle reste hors de `canon.validate`, que `canon sync` lit aussi : une
 règle manquante refuse le check, elle ne retire pas le canon aux hôtes. Il ne
 lit que des objets git locaux, sans fetch ; un dépôt de projet absent de l'hôte
 est un « non mesuré » (info), jamais un vert ni un refus.
+
+#5216 : le dépôt du canon n'a pas de CI ; `for_freeze` lance ce contrôle au gel
+d'un lot du canon qui touche sa politique. Seul ce que le lot introduit refuse :
+un manque déjà là à sa base, ou né d'un fichier ajouté au projet, ne retient pas
+un lot étranger. Une mesure impossible ne refuse pas et se dit dans la note.
 """
 from __future__ import annotations
 
 import os
-from typing import Mapping
+from typing import Mapping, Optional
 
 from . import canon as canon_mod
 from . import canon_lowering, mechanics, plan_git
+from .deadline import Deadline
 
 CODE_MISSING = "review-count-missing"
 CODE_NO_FILE = "review-rule-no-file"
@@ -147,3 +153,101 @@ def findings(cfg, canon: canon_mod.Canon,
             continue
         _scan(policy, paths, add)
     return out
+
+
+def _missing(policy: mechanics.Mechanics, paths, deadline: Deadline) -> list[str]:
+    """Les fichiers de classe non légère sans nombre d'avis pour cette politique."""
+    out: list[str] = []
+    for index, path in enumerate(paths):
+        if index % canon_lowering.CHECK_EVERY == 0:
+            canon_lowering._check(deadline, "the files of %s" % policy.project)
+        try:
+            policy.reviews_for([path])
+        except mechanics.ReviewCountUnknown:
+            out.append(path)
+        except mechanics.MechanicsError:
+            continue  # chemin inclassable : un avertissement de `canon check`
+    return out
+
+
+def _declared(repo: str, commit: str, deadline: Deadline):
+    """`(projets, erreur)` au commit ; un canon sans politique n'en déclare aucun."""
+    try:
+        return mechanics.declared_projects(repo, commit, deadline=deadline), None
+    except mechanics.MechanicsAbsent:
+        return (), None
+    except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
+        canon_lowering._check(deadline, "federation.yaml")
+        return (), exc
+
+
+def _measure_project(cfg, repo: str, base: str, head: str, project: str,
+                     base_projects, deadline: Deadline, refused: list,
+                     unmeasured: list) -> None:
+    """Le constat d'un projet déclaré à la tête du lot."""
+    before, _error = (canon_lowering._load(repo, base, project, deadline)
+                      if project in base_projects else (None, None))
+    after, error = canon_lowering._load(repo, head, project, deadline)
+    if after is None and before is not None:
+        refused.append("project %s: review policy does not compile: %s"
+                       % (project, str(error)[:300]))
+        return
+    if after is None and project in base_projects:
+        return  # la base ne compilait pas non plus : rien d'introduit
+    found, reason = canon_lowering._project_repository(cfg, project, deadline)
+    if not found:
+        unmeasured.append("%s (%s)" % (project, reason))
+        return
+    if after is None:
+        refused.append("project %s: review policy does not compile: %s"
+                       % (project, str(error)[:300]))
+        return
+    _ref, commit = canon_lowering._revision(found[0], found[1], deadline)
+    if not commit:
+        unmeasured.append("%s (no revision in %s)" % (project, found[0]))
+        return
+    paths = canon_lowering._tracked(found[0], commit, deadline)
+    known = set(_missing(before, paths, deadline)) if before is not None else set()
+    fresh = [path for path in _missing(after, paths, deadline) if path not in known]
+    if fresh:
+        listed = fresh[:canon_lowering.MAX_LISTED]
+        tail = len(fresh) - len(listed)
+        refused.append("project %s: no train_reviews rule gives the review count of "
+                       "%s%s" % (project, ", ".join(listed),
+                                 " (+%d more)" % tail if tail else ""))
+
+
+def for_freeze(cfg, repo: str, target: str, head: str,
+               *, deadline: Optional[Deadline] = None) -> tuple[list, list]:
+    """`(refus, non mesurés)` du contrôle pour la tête gelée d'un lot du canon.
+
+    Rien à dire (`[], []`) quand le diff ne touche pas la politique ou que le
+    dépôt n'en porte aucune. Ne lève jamais : le gel n'attend pas une sonde lente.
+    """
+    if deadline is None:
+        deadline = Deadline(canon_lowering.BUDGET_S)
+    refused: list = []
+    unmeasured: list = []
+    try:
+        if not target:
+            target = plan_git.default_target(repo, deadline=deadline) or ""
+        _ref, tip = canon_lowering._revision(repo, target, deadline)
+        if not tip:
+            return [], ["no readable target in %s" % repo]
+        base = canon_lowering._merge_base(repo, tip, head, deadline)
+        paths = canon_mod.git_range_paths(repo, base, head)
+        if not canon_lowering.touches(paths):
+            return [], []
+        base_projects, base_error = _declared(repo, base, deadline)
+        projects, error = _declared(repo, head, deadline)
+        if error is not None:
+            if base_error is None:
+                refused.append("review policy unreadable: %s" % str(error)[:300])
+            return refused, []
+        for project in projects:
+            _measure_project(cfg, repo, base, head, project, base_projects,
+                             deadline, refused, unmeasured)
+    except (canon_lowering._Expired, canon_mod.CanonError, canon_mod.GitError,
+            canon_mod.GitDeadline, mechanics.MechanicsError, OSError) as exc:
+        unmeasured.append("measure interrupted: %s" % str(exc)[:200])
+    return refused, unmeasured
