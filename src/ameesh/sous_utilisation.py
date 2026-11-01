@@ -19,7 +19,9 @@ Quatre types d'alerte, levés par `ameesh alerts` et poussés par
   fenêtre si rien ne change (même définition que les « pertes à la remise à
   zéro » de L74, `Gauge.expiring`), et la projection au rythme actuel ; le
   débit des six dernières heures ignore les relevés pris pendant que les
-  non-critiques étaient tenus par le plafond de pause (#2816) ;
+  non-critiques étaient tenus par le plafond de pause, à un point de
+  résolution près (#2816, #5408) ; une fenêtre à moins d'un point de son
+  plafond de pause ne rend pas de capacité (#5408) ;
 * `idle_capacity` : des agents réveillables (mode `execute`, exécuteur
   vivant, au repos, sous leur budget, sans lot actionnable ni courrier)
   alors que du travail attend (lots ouverts sans assigné, courrier en
@@ -87,6 +89,12 @@ PLAN_GAUGES_SINCE_S = 8 * 86400.0
 #: rythme récent : six heures, avec au moins trente minutes entre relevés
 PLAN_RATE_WINDOW_S = 6 * 3600.0
 PLAN_RATE_MIN_SPAN_S = 1800.0
+#: pas d'un relevé de jauge : l'utilisation est publiée en points entiers
+#: (63 %, 64 %), le plafond de cadence est continu. Une capacité à moins d'un
+#: point du plafond n'est pas prouvée libre : la pause des non-critiques peut
+#: l'avoir fermée entre deux relevés (#5408, alerte du 01/11 22:26Z : 63 %
+#: utilisés, plafond 63,35 %, agents à peine sortis de la pause).
+GAUGE_STEP = 0.01
 #: `idle_capacity` : seuil (repli quand le relevé ne porte pas
 #: `actionable_lots` ; #1677)
 DEFAULT_IDLE_CAPACITY_S = 1800.0
@@ -301,7 +309,9 @@ def _projected_plan_loss(gauge, account, now: float, history: list, *,
     #2816 : un relevé pris alors que les non-critiques étaient tenus (usage
     au plafond de pause, réserve déduite) mesure ce plafond, pas la demande ;
     il est écarté, et l'absence de relevés libres fait retomber sur la
-    moyenne de fenêtre.
+    moyenne de fenêtre. #5408 : le relevé est écarté aussi à moins d'un point
+    du plafond (`GAUGE_STEP`) — l'utilisation est entière, le plafond continu,
+    et un relevé à 63,00 % pour un plafond de 63,003 % est un relevé de pause.
     """
     points = {}
     for row in history:
@@ -318,7 +328,8 @@ def _projected_plan_loss(gauge, account, now: float, history: list, *,
         if abs(float(reset) - float(gauge.resets_at)) > 1.0:
             continue
         used_at_stamp = float(row.get("used") or 0.0)
-        if used_at_stamp >= gauge.held_cap(stamp, reserve, multiplier, ceiling):
+        if used_at_stamp >= (gauge.held_cap(stamp, reserve, multiplier, ceiling)
+                             - GAUGE_STEP):
             continue
         points[stamp] = used_at_stamp
     samples = sorted(points.items())
@@ -376,7 +387,12 @@ def plan_underused(db, listing: list, now: float, *,
     #2816 : les relevés du débit pris alors que les non-critiques étaient
     tenus par ce plafond mesurent la pause, pas la demande ; ils sont écartés,
     ce qui fait retomber sur la moyenne de fenêtre quand il n'en reste pas
-    assez."""
+    assez. #5408 : le plafond de cadence est comparé à un point près
+    (`GAUGE_STEP`, l'utilisation est entière) et vaut aussi sans compte
+    déclaré ; à 63 % utilisés pour un plafond de 63,35 %, l'alerte annonçait
+    une capacité que la pause des non-critiques refusait, et les relevés de
+    la pause nourrissaient un débit nul (37 % de perte « au rythme courant »).
+    """
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
@@ -426,20 +442,31 @@ def plan_underused(db, listing: list, now: float, *,
                                        ceilings={
                                            g.key: accounts_mod.Ceiling(ceiling)
                                            for g in measured})
-            if any(g.used_at(now) >= caps[g.key][0] for g, _ in blocking):
+            # #5408 : un point de marge, comme partout ici — l'utilisation
+            # est entière, le plafond continu ; à moins d'un point on ne
+            # prouve pas une capacité libre.
+            if any(g.used_at(now) >= caps[g.key][0] - GAUGE_STEP
+                   for g, _ in blocking):
                 continue
         for gauge, seen in live:
-            if caps and gauge.used_at(now) >= caps[gauge.key][0]:
+            # #2648 : le rythme annoncé est celui de la pause d'un
+            # non-critique (réserve déduite), pas le plafond ordinaire.
+            # #5408 : la même comparaison vaut sans compte déclaré (`caps`
+            # vide) — c'est la pause, pas la déclaration, qui ferme la
+            # capacité — et laisse un point de résolution à la jauge.
+            cap = gauge.held_cap(now, accounts_mod.RESERVE, multiplier, ceiling)
+            if gauge.used_at(now) >= cap - GAUGE_STEP:
                 continue
-            if profile is None and any(other.exceeded(now, 0.0, multiplier, ceiling)
-                                       for other, _ in blocking if other is not gauge):
+            if caps and gauge.used_at(now) >= caps[gauge.key][0] - GAUGE_STEP:
+                continue
+            if profile is None and any(
+                    other.used_at(now) >= (other.held_cap(
+                        now, accounts_mod.RESERVE, multiplier, ceiling) - GAUGE_STEP)
+                    for other, _ in blocking if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
             elapsed = gauge.elapsed(now)
-            # #2648 : le rythme annoncé est celui de la pause d'un
-            # non-critique (réserve déduite), pas le plafond ordinaire.
-            cap = gauge.held_cap(now, accounts_mod.RESERVE, multiplier, ceiling)
             used = float(gauge.used or 0.0)
             if history is None:
                 history = _gauge_history(db, since_s=PLAN_RATE_WINDOW_S)
