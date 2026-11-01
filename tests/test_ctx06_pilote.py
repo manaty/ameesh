@@ -10,7 +10,7 @@ import argparse
 import unittest
 from unittest import mock
 
-from ameesh import context_pilot as pilot, exploitation, registry, storage
+from ameesh import context_metrics, context_pilot as pilot, cost, exploitation, registry, storage
 
 from .test_l105_plafonds_du_tour import _Base
 
@@ -189,6 +189,32 @@ class PilotDbTest(_Base):
                     {"type": "guard_restart", "agent": None, "host": "h2", "since": 1.0}]
         with mock.patch.object(pilot.exploitation, "alerts", return_value=visees + ecartees):
             self.assertEqual(pilot._guard_alerts(self.cfg, self.db, "pilote-i"), visees)
+
+    def test_prise_en_compte_sur_une_charge_reelle(self):
+        """Relecture : `context_publication` met `policy` à la racine de la charge."""
+        self._worker("pilote-j", context_max_tokens=400_000)
+        self.assertEqual(self._apply("pilote-j"), 0)
+
+        def tour(**policy):
+            return cost.context_publication(
+                context_metrics.TurnNormalizer("claude").finish(),
+                legacy=dict.fromkeys(cost.CONTEXT_LEGACY_FIELDS), agent="pilote-j", host="h",
+                decision={"policy": dict(policy, session="taille")})
+
+        pose = {"context_max_tokens": 1_000_000, "session_max_tokens": 1_000_000,
+                "turn_reread_budget": 1_500_000, "session_reread_budget": 40_000_000}
+        with mock.patch.object(pilot, "_context_payloads", return_value=[tour(**pose)]):
+            self.assertIs(pilot.status(self.cfg, self.db, "pilote-j", 2000.0)["effective"], True)
+        with mock.patch.object(pilot, "_context_payloads",
+                               return_value=[tour(context_max_tokens=400_000)]):
+            self.assertIs(pilot.status(self.cfg, self.db, "pilote-j", 2000.0)["effective"], False)
+        state = pilot._state_of(self.db, "pilote-j")
+        with mock.patch.object(pilot, "_tell"):
+            pilot._return(self.db, "pilote-j", state, "fin", "t", 2000.0)
+        with mock.patch.object(pilot, "_context_payloads",
+                               return_value=[tour(context_max_tokens=400_000)]) as lu:
+            self.assertIs(pilot.status(self.cfg, self.db, "pilote-j", 3000.0)["effective"], True)
+        self.assertEqual(lu.call_args.args[2], 2000.0)
 
     def test_controle_replie_puis_ramene(self):
         self._worker("pilote-d", context_max_tokens=400_000)

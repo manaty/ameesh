@@ -256,6 +256,9 @@ def apply_pilot(cfg, db, args, now: float) -> int:
     if row is None:
         print("unknown agent: %s" % args.agent, file=sys.stderr)
         return 1
+    if args.session_max <= 0:
+        print("the session threshold cannot be 0", file=sys.stderr)
+        return 2
     if cfg.window_maintenance_share > 0:
         print("window maintenance is on for this executor: the pilot keeps it off",
               file=sys.stderr)
@@ -298,15 +301,23 @@ def _return(db, name: str, state: dict, reason: str, actor: str, now: float) -> 
     return True
 
 
+def _published_policy(payload: dict) -> dict:
+    """`policy` à la racine de `turn.context` ; `decision.policy` pour une charge ancienne."""
+    policy = payload.get("policy")
+    if not isinstance(policy, dict):
+        policy = (payload.get("decision") or {}).get("policy")
+    return policy if isinstance(policy, dict) else {}
+
+
 def status(cfg, db, name: str, now: float) -> dict | None:
     row = _state_of(db, name)
     if not row:
         return None
     # Le plafond de contexte et les budgets publiés par le dernier tour d'après
     # la pose : la preuve de prise en compte, pas l'écriture du réglage.
-    since = float(row.get("fallback_ts") or row["applied_ts"])
+    since = float(row.get("returned_ts") or row.get("fallback_ts") or row["applied_ts"])
     payloads = _context_payloads(db, name, since, now)
-    policy = ((payloads[-1].get("decision") or {}).get("policy") or {}) if payloads else None
+    policy = _published_policy(payloads[-1]) if payloads else None
     wanted = row["initial"] if row.get("returned_ts") else row["applied"]
     effective = None if policy is None else all(
         int(policy.get(key) or 0) == int(wanted[key] or 0) for key in SETTINGS
@@ -351,6 +362,12 @@ def _tokens(text: str) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ameesh context pilot", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    def _positive(text: str) -> float:
+        value = float(text)
+        if not 0 < value < float("inf"):
+            raise argparse.ArgumentTypeError("a positive reference is required")
+        return value
+
     apply_ = sub.add_parser("apply", help="capture the initial profile, set the values")
     apply_.add_argument("--agent", required=True)
     apply_.add_argument("--context-max", type=_tokens, required=True)
@@ -359,9 +376,9 @@ def main(argv=None) -> int:
     apply_.add_argument("--session-budget", type=_tokens, required=True)
     apply_.add_argument("--fallback-turn-budget", type=_tokens, default=None)
     # Requis : sans référence, les gardes de coût seraient inertes en silence.
-    apply_.add_argument("--baseline-cost", type=float, required=True,
+    apply_.add_argument("--baseline-cost", type=_positive, required=True,
                         help="reference cost per admissible action, hourly windows")
-    apply_.add_argument("--baseline-cost-24h", type=float, required=True,
+    apply_.add_argument("--baseline-cost-24h", type=_positive, required=True,
                         help="reference cost per admissible action, rolling 24 h")
     apply_.add_argument("--lot", type=int, default=None)
     apply_.add_argument("--ref", required=True, help="the decision that allows it")
