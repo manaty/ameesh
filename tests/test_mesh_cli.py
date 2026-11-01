@@ -289,11 +289,37 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("migrate")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("up to date", proc.stdout)
-        proc = self.mesh("doctor")
+        proc = self.doctor()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("verdict    : OK", proc.stdout)
         total = len(migrations.discover())
         self.assertIn("%d/%d applied" % (total, total), proc.stdout)
+
+    def doctor(self, problemes: tuple = ()) -> subprocess.CompletedProcess:
+        """`doctor` sans la garde d'installation de l'hôte (#5287).
+
+        Le banc du composeur joue les tests avec le Python du venv installé et
+        `PYTHONPATH` vers son arbre jetable : la garde #2763 y dit, à raison,
+        « loaded outside the venv ». Ce test porte sur le schéma de test, pas
+        sur l'installation de l'hôte : on fixe donc la réponse de la garde,
+        ici seulement, et `doctor` reste rouge sur un écart.
+        """
+        code = ("import sys\n"
+                "from ameesh import main, venv_guard\n"
+                "venv_guard.installation_problems = lambda prefix=None: %r\n"
+                "sys.exit(main.main(['doctor']))\n" % (list(problemes),))
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=60.0,
+            env=self.env(), cwd=self.tmp,
+        )
+
+    def test_doctor_reste_rouge_sur_un_ecart_d_installation(self):
+        # #5287 : le banc fixe la réponse de la garde, il ne la retire pas
+        proc = self.doctor(("editable install: /tmp/x.pth",))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("install    : KO — editable install: /tmp/x.pth", proc.stdout)
+        self.assertIn("verdict    : KO", proc.stdout)
 
 
 if __name__ == "__main__":
