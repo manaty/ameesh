@@ -230,7 +230,7 @@ def _comptes_docker() -> dict:
     }
 
 
-def _du_complet(racine: Path | None, espace_travail: str | None) -> list[tuple[str, int | None]]:
+def _du_complet(racine: Path | None) -> list[tuple[str, int | None]]:
     """Les tailles utiles sous le home runner, en UN `du` borné.
 
     Huit runners vivent sur l'hôte, chacun avec son checkout, son cache
@@ -240,11 +240,7 @@ def _du_complet(racine: Path | None, espace_travail: str | None) -> list[tuple[s
     if racine is None:
         return []
     home = racine.parent
-    cibles: list[tuple[str, Path]] = []
-    if espace_travail:
-        cibles.append(("checkout du job", Path(espace_travail)))
-    cibles.append(("cache pip", home / ".cache" / "pip"))
-    cibles.append(("home du runner", home))
+    cibles: list[tuple[str, Path]] = [("cache pip", home / ".cache" / "pip")]
     for outil in sorted(home.glob("*/_work/_tool")):
         cibles.append(("outils %s" % outil.parent.parent.name, outil))
     for runner in sorted(p for p in home.glob("*") if p.is_dir() and p.name[:1] == "r"):
@@ -297,8 +293,7 @@ def rapport(complet: bool = False, seuil_gib: float | None = None) -> dict:
         for ligne in etat["df"]:
             print(ligne)
         if complet:
-            etat["du"] = _du_complet(_racine_runner(),
-                                     os.environ.get("RUNNER_WORKSPACE"))
+            etat["du"] = _du_complet(_racine_runner())
             for libelle, octets in etat["du"]:
                 print("du %-24s %s" % (libelle, gib(octets)))
     else:

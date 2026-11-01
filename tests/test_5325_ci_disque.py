@@ -123,6 +123,31 @@ class OutilsTest(unittest.TestCase):
             self.assertIsNone(disque._racine_runner())
 
 
+class DuTest(unittest.TestCase):
+    def test_du_complet_lit_les_huit_runners(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "runner"
+            for i in (1, 2):
+                (home / ("r%d" % i) / "_work" / "_tool").mkdir(parents=True)
+                (home / ("r%d" % i) / "_diag").mkdir(parents=True)
+            vus = []
+
+            def faux(cmd, timeout=120):
+                vus.append(cmd)
+                return 0, "".join("100\t%s\n" % chemin for chemin in cmd[4:]), ""
+
+            with mock.patch.object(disque, "commande", side_effect=faux):
+                lignes = disque._du_complet(home / "r1")
+        tailles = dict(lignes)
+        self.assertEqual(vus[0][:4], ["du", "-s", "-x", "-B1"])
+        self.assertIn("/tmp", vus[0])
+        self.assertEqual(len(lignes), 8)  # pip + 2 outils + 2 _work + 2 _diag + /tmp
+        self.assertEqual(tailles["outils r1"], 100)
+        self.assertEqual(tailles["_work r2"], 100)
+        self.assertEqual(tailles["_diag r1"], 100)
+        self.assertEqual(tailles["cache pip"], 100)
+
+
 class MenageTest(unittest.TestCase):
     """Hors CI rien ne part ; en CI, seules les commandes bornées partent."""
 
