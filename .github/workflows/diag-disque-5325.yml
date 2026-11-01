@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# TEMPORAIRE — lot #5325 : diagnostic du disque des VM de runners, avant le
+# ménage définitif intégré à tests.yml. Ce fichier est retiré de la branche
+# avant le gel ; il n'existe que pour mesurer un hôte réel depuis un job, seul
+# accès disponible (le poste a root sur les VM, le bureau non).
+name: diag disque 5325
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/diag-disque-5325.yml"
+      - "scripts/ci-disque.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diag-disque-5325-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diag:
+    name: diag disque ${{ matrix.slot }}
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ["self-hosted", "linux", "ameesh-ci"]
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v4
+      - name: rapport complet avant ménage (#5325)
+        run: python3 scripts/ci-disque.py rapport --complet
+      - name: ménage (#5325)
+        run: python3 scripts/ci-disque.py menage
+      - name: rapport après ménage (#5325)
+        run: python3 scripts/ci-disque.py rapport
