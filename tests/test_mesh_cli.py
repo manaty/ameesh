@@ -84,7 +84,11 @@ class MeshCliTest(PgTestCase):
                 contextlib.redirect_stdout(output):
             self.assertEqual(mesh_cli.cmd_list(self.cfg, argparse.Namespace(json=True)), 0)
         delays.assert_not_called()
-        self.assertEqual(json.loads(output.getvalue()), expected)
+        # state_for_s est un âge recalculé à chaque lecture : une seconde peut
+        # tomber entre les deux (#5314) ; state_since_ts, lui, reste comparé.
+        def sans_age(rows):
+            return [{k: v for k, v in row.items() if k != "state_for_s"} for row in rows]
+        self.assertEqual(sans_age(json.loads(output.getvalue())), sans_age(expected))
 
     # -- clés --------------------------------------------------------------
     def test_key_generate_refuse_sans_drapeau_proprietaire(self):
