@@ -2230,9 +2230,13 @@ class AgentWorker(threading.Thread):
         `session.max_tokens_by_harness`) fait foi, surcharge du harnais puis
         valeur commune ; canon absent ou illisible, ou document sans bloc :
         le seuil commun de l'exécuteur (`AMEESH_SESSION_MAX_TOKENS`), jamais
-        une valeur propre à un harnais écrite en dur.
+        une valeur propre à un harnais écrite en dur. #5250 : le réglage de
+        l'agent passe devant, pour le pilote d'un seul rôle.
         """
         from . import mechanics
+        propre = (self.agent or {}).get("session_max_tokens")
+        if propre:
+            return float(propre)
         return mechanics.session_max_tokens(
             self.cfg, self._ledger_harness() or "", self.runner.session_max_tokens)
 
@@ -2290,6 +2294,16 @@ class AgentWorker(threading.Thread):
         (`AMEESH_CONTEXT_MAX_TOKENS`). 0 = désactivé."""
         from .exploitation import effective_context_max
         return effective_context_max(self.cfg, self.agent)
+
+    def turn_reread_budget(self) -> int:
+        """Budget `R_turn` (CTX-04a) : réglage de l'agent (#5250), sinon exécuteur."""
+        from .exploitation import effective_turn_reread_budget
+        return effective_turn_reread_budget(self.cfg, getattr(self, "agent", None))
+
+    def session_reread_budget(self) -> int:
+        """Budget `R_session` (CTX-04a) : réglage de l'agent (#5250), sinon exécuteur."""
+        from .exploitation import effective_session_reread_budget
+        return effective_session_reread_budget(self.cfg, getattr(self, "agent", None))
 
     def turn_max_seconds(self) -> int:
         """Durée maximale d'un tour (L105) : réglage de l'agent
@@ -2362,14 +2376,14 @@ class AgentWorker(threading.Thread):
         premier point sûr. Jamais lu comme une taille de fenêtre ni comparé à
         ``context_max_tokens``.
         """
-        budget_tour = int(self.cfg.turn_reread_budget)
+        budget_tour = AgentWorker.turn_reread_budget(self)
         relu_tour = live.get("R_turn")
         if budget_tour > 0 and relu_tour is not None and relu_tour >= budget_tour:
             return {"kind": REREAD_BUDGET_CLOSE, "measure": "R_turn",
                     "value": relu_tour, "budget": budget_tour,
                     "reason": "reread budget: R_turn %d tokens (budget %d)"
                               % (relu_tour, budget_tour)}
-        budget_session = int(self.cfg.session_reread_budget)
+        budget_session = AgentWorker.session_reread_budget(self)
         relu_session, base = live.get("R_session"), live.get("base")
         if budget_session > 0 and relu_session is not None and base is not None \
                 and relu_session // budget_session > int(base) // budget_session:
@@ -5051,10 +5065,10 @@ class AgentWorker(threading.Thread):
                     "context_max_tokens": self.context_max_tokens(),
                     "session_max_tokens": self.session_max_tokens(),
                     # CTX-04a : présents seulement en opt-in.
-                    **({"turn_reread_budget": int(self.cfg.turn_reread_budget)}
-                       if self.cfg.turn_reread_budget > 0 else {}),
-                    **({"session_reread_budget": int(self.cfg.session_reread_budget)}
-                       if self.cfg.session_reread_budget > 0 else {}),
+                    **({"turn_reread_budget": self.turn_reread_budget()}
+                       if self.turn_reread_budget() > 0 else {}),
+                    **({"session_reread_budget": self.session_reread_budget()}
+                       if self.session_reread_budget() > 0 else {}),
                     # CTX-04b : présent seulement en opt-in.
                     **({"window_maintenance_share": self.cfg.window_maintenance_share}
                        if self.cfg.window_maintenance_share > 0 else {}),
@@ -8417,8 +8431,8 @@ class AgentWorker(threading.Thread):
         appels_vus: set = set()
         cloture: str | None = None
         cloture_budget = False
-        budget_relecture_actif = (self.cfg.turn_reread_budget > 0
-                                  or self.cfg.session_reread_budget > 0)
+        budget_relecture_actif = (self.turn_reread_budget() > 0
+                                  or self.session_reread_budget() > 0)
         clos = False
         self.last_turn_closed = None
 

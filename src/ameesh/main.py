@@ -204,7 +204,8 @@
   ameesh session list|backup|restore <agent>   off-device session backups (L53);
   ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
-        context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=20|0
+        context_max_tokens=15M|0 session_max_tokens=1M turn_reread_budget=1.5M|0
+        session_reread_budget=40M|0 turn_max_seconds=30m|2h|0 turn_mail_max=20|0
         turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
@@ -436,6 +437,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # #5135 (CTX-05b) : rejeu contrefactuel, rien n'est activé.
         from . import context_replay
         return context_replay.main(rest[1:])
+    if command == "context" and rest[:1] == ["pilot"]:
+        # #5250 (CTX-06) : pilote réversible de la politique d'un agent.
+        from . import context_pilot
+        return context_pilot.main(rest[1:])
     if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)

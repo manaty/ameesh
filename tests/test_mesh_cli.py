@@ -2,13 +2,17 @@
 """CLI `agent-mesh` : mesh list, show, clés, approbations, work_items."""
 from __future__ import annotations
 
+import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 from ameesh import authority, mail, migrations, registry, signing, storage
 
@@ -67,6 +71,20 @@ class MeshCliTest(PgTestCase):
         self.assertIn("no public key", proc.stdout)
         proc = self.mesh("show", "inconnu")
         self.assertEqual(proc.returncode, 1)
+
+    def test_list_json_does_not_read_work_delays(self):
+        """The staging registry read must work even if lot timelines fail."""
+        from ameesh import mesh_cli
+        with contextlib.closing(self.connect()) as connection:
+            expected = mesh_cli.agent_rows(self.cfg, connection)
+        output = io.StringIO()
+        with mock.patch.object(mesh_cli, "_open", side_effect=lambda cfg: self.connect()), \
+                mock.patch.object(mesh_cli.work, "delays", side_effect=AssertionError(
+                    "JSON registry reads must not load lot timelines")) as delays, \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(mesh_cli.cmd_list(self.cfg, argparse.Namespace(json=True)), 0)
+        delays.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()), expected)
 
     # -- clés --------------------------------------------------------------
     def test_key_generate_refuse_sans_drapeau_proprietaire(self):
@@ -289,11 +307,37 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("migrate")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("up to date", proc.stdout)
-        proc = self.mesh("doctor")
+        proc = self.doctor()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("verdict    : OK", proc.stdout)
         total = len(migrations.discover())
         self.assertIn("%d/%d applied" % (total, total), proc.stdout)
+
+    def doctor(self, problemes: tuple = ()) -> subprocess.CompletedProcess:
+        """`doctor` sans la garde d'installation de l'hôte (#5287).
+
+        Le banc du composeur joue les tests avec le Python du venv installé et
+        `PYTHONPATH` vers son arbre jetable : la garde #2763 y dit, à raison,
+        « loaded outside the venv ». Ce test porte sur le schéma de test, pas
+        sur l'installation de l'hôte : on fixe donc la réponse de la garde,
+        ici seulement, et `doctor` reste rouge sur un écart.
+        """
+        code = ("import sys\n"
+                "from ameesh import main, venv_guard\n"
+                "venv_guard.installation_problems = lambda prefix=None: %r\n"
+                "sys.exit(main.main(['doctor']))\n" % (list(problemes),))
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=60.0,
+            env=self.env(), cwd=self.tmp,
+        )
+
+    def test_doctor_reste_rouge_sur_un_ecart_d_installation(self):
+        # #5287 : le banc fixe la réponse de la garde, il ne la retire pas
+        proc = self.doctor(("editable install: /tmp/x.pth",))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("install    : KO — editable install: /tmp/x.pth", proc.stdout)
+        self.assertIn("verdict    : KO", proc.stdout)
 
 
 if __name__ == "__main__":
