@@ -175,7 +175,7 @@ class PilotDbTest(_Base):
     def test_rattachement_des_alertes_de_compte(self):
         """Relecture : le producteur publie `agent=None`, parfois `host=None`."""
         self._worker("pilote-i")
-        self.db.execute("UPDATE agent_registry SET session_account = 'c1', host = 'h1',"
+        self.db.execute("UPDATE agent_registry SET session_id = 's1', session_account = 'c1', host = 'h1',"
                         " session_harness = 'claude' WHERE name = 'pilote-i'")
 
         def garde(**champs):
