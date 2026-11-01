@@ -260,6 +260,21 @@ def get(db: Db, message_id: int) -> dict | None:
     return storage.of(db).mailbox.get(message_id)
 
 
+def get_received(db: Db, message_id: int, recipient: str) -> dict | None:
+    """#5215 : le message `message_id`, si `recipient` l'a reçu.
+
+    Un message est déposé une fois par destinataire : une copie (`--cc`) est
+    une ligne de la boîte de son destinataire, avec son propre numéro. Seul
+    ce destinataire lit la ligne — ni un tiers, ni l'expéditeur. Lecture en
+    base, sans toucher `delivered_at` : le message n'est pas marqué lu."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.show")
+    row = get(db, message_id)
+    if row is None or (row.get("recipient") or "") != recipient:
+        return None
+    return row
+
+
 def mark_delivered(db: Db, ids: Sequence[int]) -> int:
     """Marque remis (le hook les a injectés, ou l'exécuteur a fini son tour)."""
     return storage.of(db).mailbox.mark_delivered(ids)
@@ -378,6 +393,18 @@ def _tronque(text: str, limite: int) -> tuple[str, int]:
     return coupe, len(brut) - octets(coupe)
 
 
+def _truncation_note(row: Any, retire: int) -> str:
+    """#5215 : où lire la suite. Le fil est un fichier local par hôte ; la
+    base porte le message entier, et `agent-mail show <id>` le rend à son
+    destinataire. Le repli fichier n'a pas de numéro : il garde son fil."""
+    message_id = row.get("id")
+    if message_id is None:
+        return ("\n[... truncated: %d more byte(s), full text in the thread]"
+                % retire)
+    return ("\n[... truncated: %d more byte(s); full text: agent-mail show %s]"
+            % (retire, message_id))
+
+
 def _readable_body(row: dict, limite: int | None = None) -> str:
     """Le corps lisible, comme dans le fil : jamais le payload structuré."""
     body = row.get("body") or ""
@@ -388,8 +415,7 @@ def _readable_body(row: dict, limite: int | None = None) -> str:
     if limite is not None:
         text, retire = _tronque(text, limite)
         if retire:
-            text += ("\n[... truncated: %d more byte(s), full text in the thread, "
-                     "message #%s]" % (retire, row.get("id")))
+            text += _truncation_note(row, retire)
     return text
 
 
@@ -427,6 +453,12 @@ def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None
         tete, row.get("id"), row.get("sender") or "?", moment, nature,
         _verdict_note(db, row) if note is None else note, relivre, forwarded_note(row),
         "\n".join("> " + line for line in corps.split("\n")))
+
+
+def render_received(db: Db, row: dict) -> str:
+    """#5215 : le rendu complet d'un message reçu, pour `agent-mail show` :
+    le même bloc que la livraison, sans troncature (texte intégral)."""
+    return _block(db, row)
 
 
 def forwarded_note(row: Any) -> str:
