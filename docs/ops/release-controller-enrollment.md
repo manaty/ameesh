@@ -288,3 +288,133 @@ y compris si sa réponse se perd. Sans identité enregistrée à cet instant, un
 reprise ne peut pas adopter une instance active apparue ensuite ; l'intent
 reste incertain et nécessite un mandat de réconciliation. Une identité déjà
 observée doit rester identique pendant la readiness et les reprises.
+
+## Identités PostgreSQL séparées (#5162)
+
+Le dossier privé d'identités est indépendant du stage d'enrôlement :
+`/etc/ameesh-release-identities`, root 0700. Le bureau y dépose `input.json`
+root 0600, régulier, non lié, avec les champs exacts suivants :
+`version: 1`, `operation`, `schema`, `source_owner_dsn`, `restore_owner_dsn`,
+`controller_role`, `backup_role`, `restore_role`, `group_role`. Les noms SQL
+sont des identifiants minuscules distincts, sans préfixe `pg_`. Les deux DSN
+administrateurs sont des références privées explicites avec host, dbname,
+user et port pour la source ; le socket de restauration utilise le port par
+défaut, sans champ port ni hostaddr dans son DSN ; aucun profil ambiant, service libpq ou `options` n'est admis.
+Aucun DSN ne se transmet sur la ligne de commande. Les DSN de logins produits exigent
+`require_auth=scram-sha-256` : aucune négociation password/MD5/trust n'est
+acceptée. Les connexions administratives munies d'un mot de passe ont la même
+exigence ; l'administration locale peer utilise le socket sans mot de passe.
+La restauration utilise **uniquement** `/run/ameesh-release-restore`, jamais
+le port TCP du banc des agents. La politique est conservée dans le DSN transmis
+à pg_restore. Voir le [contrat require_auth de libpq 16](https://www.postgresql.org/docs/16/libpq-connect.html#LIBPQ-CONNECT-REQUIRE-AUTH).
+
+
+Après livraison par paquet et staging, installer les fichiers wheel
+`share/ameesh/postgres/enroler-identites.py` et
+`share/ameesh/sql/role-release-controller.sql` depuis le même SHA relu,
+sous `/opt/ameesh-admin/deploy`, racine root non modifiable par les agents.
+Avec le Python root isolé
+où psycopg est installé, la commande est :
+
+```sh
+/opt/ameesh-release/runtime/bin/python -I -B /opt/ameesh-admin/deploy/postgres/enroler-identites.py enroll
+```
+
+L'installation root doit conserver le voisin
+`/opt/ameesh-admin/deploy/sql/role-release-controller.sql`. La commande prend un
+verrou privé exclusif, génère les secrets localement et écrit durablement
+`credentials.json` root 0600 **avant** tout CREATE ROLE. Le fichier contient le
+DSN du contrôleur (`database`, document directement compatible database.json),
+`backup_dsn`, `restore_dsn`, les mots de passe et l'empreinte de l'entrée.
+Son contenu reste privé ; seule son empreinte est publiée. L'inventaire privé
+note cette origine lors de la préparation des sept JSON de #4989.
+
+Le groupe NOLOGIN est appliqué par le contrat SQL existant, sans rôle parent.
+Le contrôleur LOGIN n'hérite que de ce groupe ; la sauvegarde reçoit USAGE des
+schémas et SELECT des relations/séquences de la base source, aucune écriture.
+L'audit refuse les privilèges supplémentaires, colonnes comprises, les rôles
+parents imprévus, les propriétés administratives, la propriété d'objets,
+les fonctions SECURITY DEFINER accessibles et les tables sous RLS que l'identité
+ne peut sauvegarder complètement. Les droits PUBLIC comptent dans cet audit. Seul le SELECT public d'un objet
+membre d'une extension nommée dans la liste explicite du code est admis en plus
+pour le contrôleur (uniquement `pg_stat_statements` aujourd'hui), sans grant SELECT direct au login ou à son
+groupe. Cette exception ne dispense d'aucun contrôle d'écriture, de propriété
+ou de fonction SECURITY DEFINER. Un refus `IdentityError` expose sa raison
+locale fixe ; les erreurs du serveur et les DSN restent masqués.
+La commande ne répare pas les droits PUBLIC d'une base partagée : un refus
+exige une correction explicite sous son propre mandat. Réappliquer après toute
+migration qui ajoute des relations à sauvegarder.
+
+La cible de restauration est un **cluster PostgreSQL dédié jetable sur l'hôte
+du contrôleur**, distinct du cluster vif. L'outil mesure les deux
+`system_identifier` et refuse leur égalité, même avec des noms de base ou des
+adresses différents. Le consommateur crée une base aléatoire puis la supprime :
+son identité nécessite CREATEDB, droit de cluster ; elle reste NOSUPERUSER,
+NOCREATEROLE, NOREPLICATION, NOBYPASSRLS et sans rôle parent. Aucun login de
+restauration n'est créé sur la source. Le cluster de vérification ne doit
+héberger aucune autre charge. Topologie #5165 (décision mesh-design du 31/10, #176428) : initdb/pg_ctl directs, version
+choisie au moins égale au serveur source, données sous
+`/var/lib/ameesh-release-restore/<major>/data`, configuration root
+`/etc/ameesh-release-restore`, socket privé `/run/ameesh-release-restore`
+(0700), propriétaire OS `ameesh-restore` nologin ; unité
+`ameesh-release-restore.service`.
+
+Pour agents-3, le dossier opérateur retient PostgreSQL **17** (source vive
+17.11 ; bureau #176722 et cx3 #176735, 31/10/2026). Le mandat doit nommer
+explicitement le geste root : configuration du dépôt officiel PGDG puis
+installation des deux paquets `postgresql-17` et `postgresql-client-17`.
+Ce texte prépare le mandat ; il ne constitue pas son approbation signée.
+Le provisionneur #5165 utilise `--version 17` et les outils serveur
+`initdb`, `pg_ctl`, `psql`, `pg_controldata` sous `/usr/lib/postgresql/17/bin`.
+Les clients retenus pour le contrôleur sont exactement
+`/usr/lib/postgresql/17/bin/pg_dump` et
+`/usr/lib/postgresql/17/bin/pg_restore`, pas les clients système 16.15.
+Le helper de sauvegarde résout encore ces commandes par PATH : le contexte
+effectif du contrôleur doit donc placer `/usr/lib/postgresql/17/bin` en tête,
+et le reçu doit relever les chemins résolus et leurs versions, ainsi que
+les versions des deux serveurs. Vérifier avant qualification :
+`source_major <= pg_dump_major <= cible_major` et
+`pg_restore_major >= pg_dump_major`. Une garde automatique avant dump est
+suivie dans le panier #5169 ; elle n'est pas livrée dans ce dossier.
+
+Le cluster n'écoute sur aucun port TCP
+(`listen_addresses = ''`) et le DSN du socket n'indique aucun port. Le producteur root tourne toutes les 60 s
+et écrit au chemin exact `backup.json.restore_capacity`. Pour cette commande
+d'identités root, l'administration peer doit autoriser explicitement root vers
+le rôle administrateur par le seul socket privé ; un accès réservé à l'OS
+`ameesh-restore` ne suffit pas et ne doit pas être promu implicitement.
+Le nom SQL administrateur est explicite dans `restore_owner_dsn` et doit être
+superutilisateur. Le provisionneur écrit exactement ces trois lignes pg_hba
+(décision mesh-design du 31/10, #176452) :
+
+```text
+local all ameesh-restore peer
+local all release_restore_admin peer map=release_admin
+local all <rôle de restauration> scram-sha-256
+```
+
+pg_ident contient une seule correspondance explicite :
+`release_admin root release_restore_admin`, sans regex ni autre entrée.
+Ces noms sont ceux du provisionnement #5165 (cx3, 31/10, #176490).
+Le DSN administratif est
+`host=/run/ameesh-release-restore dbname=postgres user=release_restore_admin`,
+sans port ni mot de passe. Le rôle SQL administrateur est distinct de
+`ameesh-restore`, afin que la première ligne peer de la sonde ne masque pas
+le mapping root.
+Toutes les bases sont nécessaires aux restaurations dans des bases aléatoires.
+Aucune ligne host, hostssl ou hostnossl, ni autre ligne local, n'est configurée.
+Le rôle de restauration vient de l'entrée privée et doit correspondre au
+paramètre obligatoire `--restore-role` de l'installateur #5165.
+Son provisionnement et le producteur de
+`restore_capacity` relèvent du lot compagnon #5165 : la mesure doit être faite
+sur le volume PostgreSQL cible ; les octets libres d'agents-3 ne prouvent pas
+ceux d'un serveur distant. Le chemin d'attestation effectif et le mapping peer administratif restent
+à relever dans le reçu du provisionnement avant la préparation de backup.json.
+
+Les mêmes invocations avec `audit` contrôlent les droits effectifs sans les
+modifier ; avec `leave`, elles retirent les trois logins et leurs seuls droits
+attendus. La commande refuse les droits supplémentaires et toute propriété
+inattendue, sans DROP OWNED ni suppression de données. Le groupe NOLOGIN partagé
+reste en place. Les credentials et le reçu privé `retired.json` restent comme
+preuves ; une opération retirée ne se réactive pas implicitement. Une nouvelle
+opération utilise une nouvelle source privée et de nouveaux noms.
