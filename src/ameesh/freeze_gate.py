@@ -488,6 +488,25 @@ def _freeze_unresolved(text: str, repo: str | None = None) -> str:
             "<the repository holding the commit>" % text)
 
 
+def _canon_review_coverage(db: Db, item: dict, sha: str, repo: str) -> str:
+    """#5216 : refuse le gel d'un lot du canon qui perd un nombre d'avis ; rend
+    la note d'une mesure incomplète. Tête non lue sur l'hôte : rien à mesurer."""
+    from . import canon_review_coverage, lot_class
+    from .work import WorkError
+    cfg = getattr(db, "cfg", None)
+    if not repo or not lot_class._canon_lot(item, lot_class.canon_clones(cfg))[0]:
+        return ""
+    refused, unmeasured = canon_review_coverage.for_freeze(
+        cfg, repo, str(item.get("branch_target") or ""), sha)
+    if refused:
+        raise WorkError("freeze refused (canon-review-count): %s — declare the "
+                        "count under review_policies.train_reviews (`ameesh canon "
+                        "check`, #5191)" % "; ".join(refused))
+    if unmeasured:
+        return "canon-review-coverage: not measured: %s" % "; ".join(unmeasured)
+    return ""
+
+
 def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None,
                 refreshed: dict | None = None,
                 outcome: dict | None = None) -> str:
@@ -731,6 +750,12 @@ def milestone(
         freeze_stack.guard(
             db, item, sha, repo=repo or str(freeze_info.get("repo") or ""),
             target=str(item.get("branch_target") or ""))
+        # #5216 : le canon n'a pas de CI ; le contrôle de `canon check` (#5191)
+        # refuse ici le lot qui laisse un chemin non léger sans nombre d'avis.
+        coverage_note = _canon_review_coverage(
+            db, item, sha, repo or str(freeze_info.get("repo") or ""))
+        if coverage_note:
+            note = (note + "\n" if note else "") + coverage_note
         # (5) : la marque des branches où le gel était absent, pour que le
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par
