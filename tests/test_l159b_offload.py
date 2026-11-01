@@ -370,11 +370,13 @@ class RunTest(OffloadBase):
         self.assertEqual(self.running_jobs(), [])
 
     def test_a_session_lost_before_the_job_is_announced_never_runs_it(self):
-        # #5184 : le budget d'attente peut expirer pendant l'admission, avant
-        # que le shell ait annoncé `job <id>` : le client n'a alors aucun id à
-        # annuler et ferme la session. Le shell doit constater la session
-        # morte avant `running` et avant la commande, et journaliser une
-        # annulation, jamais un job terminé.
+        # #5184/#5293 : le budget d'attente peut expirer avant que le shell
+        # ait annoncé `job <id>` — au démarrage (le shell est reparenté avant
+        # d'entrer dans `cmd_run`) ou pendant l'admission (ménage de
+        # l'orphelin) : le client n'a alors aucun id à annuler et ferme la
+        # session. Dans les deux cas le shell doit constater la session morte
+        # avant `running` et avant la commande, et journaliser une annulation,
+        # jamais un job terminé.
         self.write_profile("slow-teardown", {"after": "sleep 3"})
         orphan = "20200101-000000-abcdef"
         orphan_dir = os.path.join(self.vm, "jobs", orphan)
@@ -393,14 +395,18 @@ class RunTest(OffloadBase):
             self.skipTest("wait budget spent before the job started (loaded host)")
         self.assertLess(time.time() - began, 20)
         self.assertIn("no result within", res.stderr)
-        # le ménage de l'orphelin a tenu le shell en admission au-delà du
-        # budget : aucun id de job annoncé, donc aucun cancel envoyé
+        # le budget a expiré avant l'admission (démarrage chargé) ou pendant
+        # elle (ménage de l'orphelin) : aucun id de job annoncé dans les deux
+        # cas, donc aucun cancel envoyé
         self.assertNotIn("cancelling job", res.stderr)
         entry = self.wait_for_journal_entry(exclude=(orphan,), timeout=30)
         self.assertIsNotNone(entry, self.journal())
         self.assertEqual(entry["outcome"], "cancelled", entry)
         self.assertFalse(os.path.exists(marker), "the command ran without a client")
-        self.assertEqual(self.running_jobs(), [])
+        # the orphan is the fixture that slows admission, not this request:
+        # the early path returns before the orphan sweep, so it may outlive the
+        # test (the next job cleans it); no job *of this request* may run.
+        self.assertEqual([job for job in self.running_jobs() if job != orphan], [])
 
     def test_a_session_lost_before_main_is_journaled_without_a_job(self):
         # #5184 : le budget d'attente peut expirer pendant le démarrage du
@@ -429,9 +435,13 @@ class RunTest(OffloadBase):
         self.assertFalse(os.path.exists(marker), "the command ran without a client")
         self.assertEqual(self.running_jobs(), [])
 
-    def test_a_session_gone_before_cmd_run_creates_no_job(self):
-        # #5184 : session déjà morte quand le shell atteint `run` (démarrage
-        # lent) : refus à l'entrée, aucun dossier de job, aucune commande.
+    def test_a_session_gone_before_cmd_run_is_journaled_without_a_job(self):
+        # #5184/#5293 : session déjà morte quand le shell atteint `run`
+        # (démarrage lent, budget d'attente expiré avant l'admission) : refus
+        # à l'entrée, la demande abandonnée est journalisée annulée, aucun
+        # dossier de job, aucune commande. C'est le chemin qu'a pris la CI
+        # chargée du paquet h-10 (#5293) : sans journal, le test d'intégration
+        # attendait 30 s une entrée qui n'arrivait jamais.
         cfg = offload_shell.load_config(self.config_path)
         previous = offload_shell.SESSION_PARENT
         offload_shell.SESSION_PARENT = os.getppid() + 1
@@ -445,6 +455,11 @@ class RunTest(OffloadBase):
         self.assertEqual(rc, 130)
         self.assertIn('"outcome": "cancelled"', err.getvalue())
         self.assertFalse(os.path.exists(os.path.join(self.vm, "jobs")))
+        (entry,) = self.journal()
+        self.assertEqual(entry["outcome"], "cancelled", entry)
+        self.assertEqual(entry["state"], "cancelled", entry)
+        self.assertEqual(entry["reason"], "SSH session closed before the job started")
+        self.assertEqual(entry["argv"], ["true"])
 
     def test_hooks_and_setup_are_supervised_by_the_job_deadline(self):
         after = os.path.join(self.tmp, "after.log")

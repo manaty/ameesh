@@ -1396,6 +1396,20 @@ def parse_run(args: list[str]) -> dict:
     return req
 
 
+def _journal_abandoned(cfg: dict, job_id: str, req: dict, started: float,
+                       reason: str) -> None:
+    """A request whose session died before its job started (#5184).
+
+    Journaled on both paths that abandon a request before a job exists — at
+    `cmd_run` entry and after the orphan sweep — so the journal has no silent
+    gap (#5293)."""
+    _journal(cfg, {"job": job_id, "state": "cancelled",
+                   "repo": req["repo"], "commit": req["commit"],
+                   "profile": req["profile"], "argv": req["argv"],
+                   "created_ts": int(started), "outcome": "cancelled",
+                   "reason": reason, "exit": None})
+
+
 def cmd_run(cfg: dict, args: list[str]) -> int:
     started = time.time()
     job_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime(started)) + "-" + secrets.token_hex(3)
@@ -1409,9 +1423,13 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
     if SESSION_PARENT is not None and os.getppid() != SESSION_PARENT:
         # the session died while the request was on its way (idle client,
         # slow startup): no client is left to receive a result or to cancel,
-        # and a job started now would never be seen. Create none (#5184).
+        # and a job started now would never be seen. Journal the abandoned
+        # request and create no job (#5184): on a loaded CI runner the budget
+        # can expire before admission, where this path, not the post-sweep
+        # one, is taken (#5293).
         result.update(outcome="cancelled",
                       reason="SSH session closed before the job started")
+        _journal_abandoned(cfg, job_id, req, started, result["reason"])
         emit_result(result)
         return 130
     state, _, reason = gate_state(cfg)
@@ -1446,11 +1464,7 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         # create no job (#5184).
         result.update(outcome="cancelled",
                       reason="SSH session closed before the job started")
-        _journal(cfg, {"job": job_id, "state": "cancelled",
-                       "repo": req["repo"], "commit": req["commit"],
-                       "profile": req["profile"], "argv": req["argv"],
-                       "created_ts": int(started), "outcome": "cancelled",
-                       "reason": result["reason"], "exit": None})
+        _journal_abandoned(cfg, job_id, req, started, result["reason"])
         emit_result(result)
         return 130
     job_dir = os.path.join(_dir(cfg, "jobs", mode=0o750), job_id)
