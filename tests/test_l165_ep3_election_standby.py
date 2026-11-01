@@ -17,7 +17,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import mail, registry, reprise, storage, work
+from ameesh import cost, mail, registry, reprise, storage, work
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN
@@ -216,10 +216,18 @@ class ElectionBriefTest(_ElectionCase):
 class RunnerStandbyTest(_ElectionCase):
     """Aucun tour sans bail, et le premier tour du gagnant est le brief."""
 
-    def runner_for(self, host: str) -> Runner:
+    def runner_for(self, host: str, *, budget_usd_per_hour: float = 0.0) -> Runner:
         cfg = dataclasses.replace(
             self.cfg, host=host, runner_id="runner-%s" % host,
-            state_dir=os.path.join(self.tmp, "state-%s" % host))
+            state_dir=os.path.join(self.tmp, "state-%s" % host),
+            # #5175 : le tour de ce test ne dépend pas du budget. La garde de
+            # rythme Codex lit les journaux du compte par défaut
+            # (`$CODEX_HOME/sessions`, ou `~/.codex/sessions` quand une autre
+            # suite du même processus a retiré la variable) : une jauge
+            # ambiante à 61 % y a déjà différé le premier tour du gagnant
+            # (série de l'unité #5146, 31/10). On neutralise explicitement
+            # cette garde, comme EP2 ci-dessous.
+            budget_usd_per_hour=budget_usd_per_hour)
         runner = Runner(cfg, self.db, once=True, agents=["relecteur"])
         # EP2 (score, rang, hystérésis) a sa propre suite ; les témoins EP3
         # commencent APRÈS sa porte, quand le candidat peut tenter le CAS.
@@ -265,6 +273,34 @@ class RunnerStandbyTest(_ElectionCase):
         self.assertEqual(row["host"], "banc")
         self.assertEqual(row["session_id"], "codex-thread-1")  # session NEUVE
         self.assertIsNone(row["election_brief"])              # brief consommé
+
+    def test_la_garde_de_rythme_codex_ne_differe_pas_le_gagnant(self):
+        """#5175 (témoin) : garde de budget forcée en refus, le tour part.
+
+        Une autre suite du même processus peut laisser `CODEX_HOME` sur ses
+        journaux, ou le retirer (faisant lire `~/.codex/sessions`) : la garde
+        de rythme Codex diffère alors le premier tour du gagnant (série de
+        l'unité #5146, 31/10). Ici la garde est forcée en refus : le tour part
+        quand même, parce que le test l'a neutralisée explicitement.
+        """
+        self.sync_both()
+        self.hold_atelier()
+        runner = self.runner_for("banc")
+        refus = ("pause (account (default), codex-10080min 61 %) until "
+                 "01/11 13:04@1793538240; plan codex codex-10080min: 61% used "
+                 "with 52% of the window elapsed (pace cap 52%, 10 points "
+                 "kept for critical agents)")
+        with mock.patch.object(cost.CostBook, "pace_exceeded", return_value=refus), \
+                mock.patch.dict(os.environ, {
+                    "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log},
+                    clear=False):
+            runner.sweep()
+        self.assertTrue(runner.did_turn, "le gagnant doit prendre son premier tour")
+        with open(self.turns_log, encoding="utf-8") as fh:
+            entries = [json.loads(line) for line in fh if line.strip()]
+        self.assertEqual(len(entries), 1)
+        self.assertIn("## Election", entries[0]["argv"][-1])
+        self.assertIn("previous holder: host atelier", entries[0]["argv"][-1])
 
     def test_le_premier_tour_d_un_lot_ne_perd_pas_le_brief(self):
         """Verdict cx2 B2 : le brief du lot ne remplace pas celui de relève."""
