@@ -17,6 +17,38 @@ PREFIX = 'Approve this exact bootstrap continuation and replacement delegation:\
 INHERITED = ('runtime', 'sources', 'account')
 
 
+def replaced(backend, previous, old, new):
+    """Proof that the trees moved by a signed replacement naming `previous`."""
+    b = bootstrap
+    swap = b.module('remplacement-runtime')
+    found = swap.receipt_for(backend, previous)
+    if found is None:
+        raise b.BootstrapError('runtime change requires a completed signed replacement')
+    item, bundle, text, record = found
+    seal = b.delegation.SEAL_DOCUMENT
+    if (old['plan']['runtime_tree_sha256'] != bundle['previous']['runtime']
+            or old['plan']['source_tree_sha256'] != bundle['previous']['lib']
+            or new['plan']['runtime_tree_sha256'] != bundle['next']['runtime']
+            or new['plan']['source_tree_sha256'] != bundle['next']['lib']
+            or (old['files'].get(seal) or {}).get('sha256') != bundle['previous']['seal_sha256']
+            or (new['files'].get(seal) or {}).get('content') != bundle['seal']):
+        raise b.BootstrapError('continuation does not match the signed replacement')
+    decisions = b.signed.decisions
+    entries = [e for e in backend.gestes.entries() if e.get('command') == 'replace'
+               and e.get('phase') == 'start' and e.get('operation') == item.operation
+               and e.get('bundle_digest') == bundle['digest']]
+    identifier = entries[-1].get('decision') if entries else None
+    view = decisions.get(backend.db, identifier) if type(identifier) is int else None
+    answer = (view or {}).get('answer') or {}
+    if (view is None or view.get('state') != 'answered' or view.get('needs_signature') is not True
+            or view.get('question') != text or view.get('options') != swap.OPTIONS
+            or answer.get('channel') != 'signed' or answer.get('option') != 'replace'
+            or not decisions.verify_proof(backend.db, view)[0]):
+        raise b.BootstrapError('exact signed replacement decision required')
+    return dict(operation=item.operation, decision=identifier, digest=bundle['digest'],
+                journal_sha256=b.protocol.identity(record))
+
+
 def reference(backend, operation, previous, decision):
     b = bootstrap
     if (operation == previous or not isinstance(previous, str)
@@ -27,15 +59,24 @@ def reference(backend, operation, previous, decision):
     old = previous_prepared.bundle
     new = backend.prepared(operation).bundle
     b.delegation.question(old); b.delegation.question(new)
-    # This operation only adds the second transport. A runtime/account/policy
-    # change needs another explicit provisioning design, never receipt reuse.
+    # This operation adds the second transport. Trees and pin may differ only
+    # by the signed, completed replacement of this very bootstrap (#5166); an
+    # account/policy change needs another explicit design, never receipt reuse.
     old_plan, new_plan = dict(old['plan']), dict(new['plan'])
     local = new_plan.pop('local_transport', None)
     old_plan.pop('local_transport', None)
+    ignored = {'/etc/ameesh-release/authorized_keys'}
+    replacement = None
+    if (old_plan['runtime_tree_sha256'], old_plan['source_tree_sha256']) != (
+            new_plan['runtime_tree_sha256'], new_plan['source_tree_sha256']):
+        replacement = replaced(backend, previous, old, new)
+        ignored = ignored | {b.delegation.SEAL_DOCUMENT}
+        for name in ('runtime_tree_sha256', 'source_tree_sha256'):
+            old_plan[name] = new_plan[name]
     if (local is None or old_plan != new_plan or old['account'] != new['account']
             or old['host'] != new['host'] or old['machine_id'] != new['machine_id']
-            or {k:v for k,v in old['files'].items() if k != '/etc/ameesh-release/authorized_keys'}
-               != {k:v for k,v in new['files'].items() if k != '/etc/ameesh-release/authorized_keys'}):
+            or {k:v for k,v in old['files'].items() if k not in ignored}
+               != {k:v for k,v in new['files'].items() if k not in ignored}):
         raise b.BootstrapError('continuation may only replace the transport delegation')
     record = backend.record(previous)
     if (set(record) != {'bundle', 'intent', 'receipts', 'complete'}
@@ -84,8 +125,11 @@ def reference(backend, operation, previous, decision):
     others = [row['id'] for row in others]
     if any(type(identifier) is int and signed_previous(identifier, current=True) for identifier in others):
         raise b.BootstrapError('multiple previous signed bootstrap decisions require reconciliation')
-    return dict(version=1, operation=previous, decision=decision, digest=old['digest'],
-                journal_sha256=b.protocol.identity(record), code_sha256=backend.gestes.code)
+    result = dict(version=1, operation=previous, decision=decision, digest=old['digest'],
+                  journal_sha256=b.protocol.identity(record), code_sha256=backend.gestes.code)
+    if replacement is not None:
+        result['replacement'] = replacement
+    return result
 
 
 def question(bootstrap, operation, bundle, ref, expires_at):
