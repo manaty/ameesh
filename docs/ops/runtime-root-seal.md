@@ -157,14 +157,21 @@ Ordre sur l'hôte :
    `{"version":1,"sha":"…","expires_at":EPOCH,"held_operation":"OLD"}`.
    `held_operation` nomme le bootstrap retenu à `validate` (`null` s'il n'y en a
    aucun) ; sa réservation et son journal ne sont pas modifiés.
-4. Préparer, avec `S=/var/lib/ameesh-release-bootstrap/OP` :
+4. Préparer, avec `S=/var/lib/ameesh-release-bootstrap/OP` et `DIR2` un
+   répertoire neuf, privé (0700), créé par l'utilisateur qui lance `ameesh
+   decide ask` et la vérification :
    `$S/runtime/bin/python -I -B $S/sources/backend-administrateur.py
    replacement-prepare OP`.
-   Le fichier `$S/replacement-question.txt` et les options de la sortie sont à
-   passer sans retouche : lire la question dans une variable (la substitution
-   reste hors guillemets doubles), puis la passer telle quelle.
+   La question est écrite en root, privée, dans le stage. En root, la copier
+   hors du stage, sans la retoucher, dans `DIR2` :
    ```sh
-   question=$(cat "$S/replacement-question.txt")
+   install -m 0644 "$S/replacement-question.txt" "$DIR2/replacement-question.txt"
+   ```
+   La copie appartient à root et reste lisible par l'utilisateur ; la suite ne
+   lit plus le stage. Lire la question dans une variable (la substitution reste
+   hors guillemets doubles), puis la passer telle quelle :
+   ```sh
+   question=$(cat "$DIR2/replacement-question.txt")
    ameesh decide ask --lot L --needs-signature --question "$question" \
      --option replace="Replace this exact sealed runtime" \
      --option leave="Leave this host unchanged"
@@ -176,7 +183,7 @@ Ordre sur l'hôte :
    ```sh
    umask 022
    /usr/bin/python3 -I -B CLONE/deploy/mise-a-jour/verifier-remplacement.py \
-     --clone CLONE --output "$DIR2/out" --question "$S/replacement-question.txt"
+     --clone CLONE --output "$DIR2/out" --question "$DIR2/replacement-question.txt"
    ```
    L'outil reconstruit au SHA de la question, mesure avec l'inventaire de
    `runtime-release.py` et refuse tout écart (code 2). Signer sans ce résultat
