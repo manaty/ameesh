@@ -1082,6 +1082,22 @@ def _required_ci(view: dict, required, project) -> dict:
     return dict(view, rollup=rollup, ci="green" if radar.ci_green(rollup) else "pending")
 
 
+def _still_consigned(consigned: list, view: dict, fresh: dict, required, project) -> list:
+    """#5219 : un check du portier consigné sur la première lecture de la PR ne
+    l'est plus si la relecture d'avant le geste ne le consigne plus.
+
+    `tests` lié à son application se prouve sur la provenance, lue après les
+    verdicts ; le rollup de `view` peut le montrer encore en cours (paquet
+    #3944 : fin de `tests` à 02:20:40, fusion à 02:21:08). Le portier remplacé
+    (#4812) se lisait alors comme non concluant et ouvrait deux lots. Seul le
+    portier est relu : les autres non concluants restent consignés."""
+    def proof(state):
+        return set(fire._packet_proof_gate(
+            _required_ci(state, required, project)["rollup"])[1])
+    gone = proof(view) - proof(fresh)
+    return [text for text in consigned if text not in gone]
+
+
 def open_carriers(db, app: str) -> list[int]:
     """Les porteurs ouverts du projet `app`."""
     st = storage.of(db).work
@@ -1876,7 +1892,8 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
                                title=fresh.get("title") or "", gh=gh)
     if error is not None:
         return dict(out, result="error", error="merge: %s" % error)
-    consigned = list(report.get("consigned") or ())
+    consigned = _still_consigned(list(report.get("consigned") or ()), view, fresh,
+                                 required, project)
     # #3593 (N1) : les statuts exigés non concluants relus par la preuve du
     # rouge hérité (ERROR) n'ont pas été consignés par `ready_pr`, qui s'arrête
     # sur les checks rouges avant cette lecture. Ils se joignent à la liste,
