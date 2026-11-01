@@ -325,6 +325,52 @@ class PacketTest(banc.Journal):
         self.assertEqual(gh.landed, [("main", banc.HEAD)])
         self.assertEqual(out["consigned"], [])
 
+    def portier(self, gh):
+        """#5219 : la 1re lecture de la PR montre `tests` en cours, le portier
+        annulé et sauté ; la provenance et la relecture d'avant le geste
+        montrent `tests` vert."""
+        answer, seen = gh.answer, []
+
+        def respond(args):
+            code, out, err = answer(args)
+            if args[:2] == ["pr", "view"] and not code:
+                seen.append(args)
+                data = json.loads(out)
+                rollup = data["statusCheckRollup"]
+                for entry in rollup:
+                    entry.setdefault("workflowName", "tests")
+                rollup.extend(
+                    {"__typename": "CheckRun", "name": name, "workflowName": "paquet",
+                     "status": "COMPLETED", "conclusion": conclusion}
+                    for name, conclusion in ((radar.PACKET_COVERAGE, "CANCELLED"),
+                                             (radar.PACKET_SUITE, "SKIPPED")))
+                if len(seen) == 1:
+                    for entry in rollup:
+                        if entry.get("name") == "tests":
+                            entry.update(status="IN_PROGRESS", conclusion="")
+                out = json.dumps(data)
+            return code, out, err
+        gh.answer = respond
+        return gh
+
+    def test_a_portier_replaced_while_the_gate_read_is_not_consigned(self):
+        self.armed()
+        gh = self.portier(banc.FakeGh(tests="success"))
+        out = self.check(gh)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(out["consigned"], [])
+        self.assertEqual(self.created, [])
+
+    def test_another_nonconclusive_stays_consigned_after_the_fresh_read(self):
+        view = {"rollup": [
+            {"__typename": "CheckRun", "name": radar.PACKET_SUITE, "workflowName": "paquet",
+             "status": "COMPLETED", "conclusion": "SKIPPED"}], "branch": "x"}
+        self.assertEqual(
+            packet_automerge._still_consigned(
+                ["tests (SKIPPED)", "%s (SKIPPED)" % radar.PACKET_SUITE],
+                view, view, (("tests", None),), None),
+            ["tests (SKIPPED)", "%s (SKIPPED)" % radar.PACKET_SUITE])
+
 
 class ReleaseRuleTest(unittest.TestCase):
     """La porte de release : un non concluant ne retient pas la tête."""
