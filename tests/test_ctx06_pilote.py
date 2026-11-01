@@ -35,8 +35,28 @@ class CostTest(unittest.TestCase):
         self.assertIsNone(pilot.cost_verdict([_window(10, 900)], None))
 
 
+class WindowsTest(unittest.TestCase):
+    def test_heures_d_avant_la_pose_ecartees(self):
+        windows = [_window(1, 99), _window(5, 5), _window(5, 6)]
+        self.assertEqual(pilot.since_apply(windows, 0.0, 7300.0), windows[-2:])
+        self.assertEqual(pilot.since_apply(windows, 0.0, 100.0), [])
+        self.assertIsNone(pilot.since_apply(None, 0.0, 7300.0))
+
+    def test_cumul_glissant(self):
+        self.assertEqual(pilot.rolling([_window(1, 99)] + [_window(1, 2)] * 24),
+                         {"actions": 24, "cost": 48})
+        self.assertIsNone(pilot.rolling([_window(1, None)]))
+        self.assertIsNone(pilot.rolling([]))
+
+    def test_sortie_illisible_reste_inconnue(self):
+        for sortie in ("pas du json", "[1]", "{}"):
+            with mock.patch.object(pilot.subprocess, "run",
+                                   return_value=mock.Mock(stdout=sortie)):
+                self.assertIsNone(pilot._cost_windows("x"), sortie)
+
+
 class FactsTest(unittest.TestCase):
-    STATE = {"baseline_cost": 1.0, "fallback_turn_budget": 2_000_000, "fallback_ts": None}
+    STATE = {"baseline_cost": 1.0, "baseline_cost_24h": 1.0, "fallback_turn_budget": 2_000_000, "fallback_ts": None}
 
     def test_chevauchement_sur_deux_hotes_seulement(self):
         a = {"started_ts": 100, "ended_ts": 300, "host": "a"}
@@ -77,7 +97,7 @@ class PilotDbTest(_Base):
         return argparse.Namespace(**{**dict(
             agent=name, context_max=1_000_000, session_max=1_000_000,
             turn_budget=1_500_000, session_budget=40_000_000,
-            fallback_turn_budget=2_000_000, baseline_cost=1.0,
+            fallback_turn_budget=2_000_000, baseline_cost=1.0, baseline_cost_24h=1.0,
             lot=None, ref="décision test", dry_run=False, actor="test"), **kw})
 
     def _apply(self, name, **kw):

@@ -131,18 +131,40 @@ def _oom_seen(agent: str, since: float) -> bool | None:
     return bool(log.stdout.strip()) if log.returncode in (0, 1) else None
 
 
-def _cost_reading(command: str | None) -> dict | None:
-    """``{"windows": [{actions, cost}…], "rolling_24h": {actions, cost}}`` de la
-    procédure de référence, ou None si illisible."""
+def _cost_windows(command: str | None) -> list | None:
+    """Les fenêtres d'une heure complètes ``[{actions, cost}…]`` de la procédure de
+    référence, la plus ancienne d'abord ; None si illisibles, jamais une exception."""
     if not command:
         return None
     try:
         done = subprocess.run(shlex.split(command), capture_output=True, text=True,
                               timeout=300, check=True)
-        reading = json.loads(done.stdout)
+        windows = json.loads(done.stdout)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
-    return reading if isinstance(reading, dict) else None
+    if not isinstance(windows, list) or not all(isinstance(w, dict) for w in windows):
+        return None
+    return windows
+
+
+def since_apply(windows: list | None, applied_ts: float, now: float) -> list | None:
+    """Les seules heures complètes du pilote : une heure d'avant la pose ne le juge pas."""
+    if windows is None:
+        return None
+    hours = int((now - applied_ts) // 3600)
+    return windows[-hours:] if hours > 0 else []
+
+
+def rolling(windows: list | None) -> dict | None:
+    """La somme des 24 dernières heures ; None si un coût manque."""
+    if not windows:
+        return None
+    last = windows[-24:]
+    if not all(isinstance(w.get("actions"), int)
+               and isinstance(w.get("cost"), (int, float)) for w in last):
+        return None
+    return {"actions": sum(w["actions"] for w in last),
+            "cost": sum(w["cost"] for w in last)}
 
 
 def _guard_id(alert: dict) -> list:
@@ -174,14 +196,14 @@ def collect(cfg, db, name: str, state: dict, now: float,
     turns = storage.of(db).turn_costs.count_since(name, now - MONITORING_WINDOW_S)
     monitoring_lost = (now - since >= MONITORING_WINDOW_S
                        and turns >= MONITORING_MIN_TURNS and not recent)
-    reading = _cost_reading(cost_command) or {}
+    windows = since_apply(_cost_windows(cost_command), since, now)
     return {
         "guards": [a.get("type") for a in alerts],
         "double_lease": overlaps([_turn_bounds(p) for p in payloads]),
         "oom": _oom_seen(name, since),
         "monitoring_lost": monitoring_lost,
-        "cost_windows": reading.get("windows"),
-        "rolling_24h": reading.get("rolling_24h"),
+        "cost_windows": windows,
+        "rolling_24h": rolling(windows),
     }
 
 
@@ -195,7 +217,7 @@ def verdict(facts: dict, state: dict) -> tuple[str | None, str]:
         return "return", "OOM on the agent's unit"
     if facts.get("monitoring_lost"):
         return "return", "monitoring lost: turns without turn.context"
-    if rolling_over(facts.get("rolling_24h"), state.get("baseline_cost")):
+    if rolling_over(facts.get("rolling_24h"), state.get("baseline_cost_24h")):
         return "return", "cost per action above +20 % over the rolling 24 h"
     outcome = cost_verdict(facts.get("cost_windows") or [], state.get("baseline_cost"))
     if outcome == "return":
@@ -238,6 +260,7 @@ def apply_pilot(cfg, db, args, now: float) -> int:
         "guards_at_apply": [_guard_id(a) for a in _guard_alerts(cfg, db, args.agent)],
         "applied": values, "fallback_turn_budget": args.fallback_turn_budget,
         "fallback_ts": None, "baseline_cost": args.baseline_cost,
+        "baseline_cost_24h": args.baseline_cost_24h,
     }
     if args.dry_run:
         print(json.dumps(dict(state, initial={key: row.get(key) for key in SETTINGS}),
@@ -326,8 +349,11 @@ def main(argv=None) -> int:
     apply_.add_argument("--turn-budget", type=_tokens, required=True)
     apply_.add_argument("--session-budget", type=_tokens, required=True)
     apply_.add_argument("--fallback-turn-budget", type=_tokens, default=None)
-    apply_.add_argument("--baseline-cost", type=float, default=None,
-                        help="reference cost per admissible action")
+    # Requis : sans référence, les gardes de coût seraient inertes en silence.
+    apply_.add_argument("--baseline-cost", type=float, required=True,
+                        help="reference cost per admissible action, hourly windows")
+    apply_.add_argument("--baseline-cost-24h", type=float, required=True,
+                        help="reference cost per admissible action, rolling 24 h")
     apply_.add_argument("--lot", type=int, default=None)
     apply_.add_argument("--ref", required=True, help="the decision that allows it")
     apply_.add_argument("--dry-run", action="store_true")
@@ -343,7 +369,7 @@ def main(argv=None) -> int:
             # pas ce que l'hôte exécute.
             command.add_argument(
                 "--cost-command", default=None,
-                help="prints JSON {windows: [{actions, cost}, oldest first], rolling_24h: {actions, cost}}")
+                help="prints a JSON list of complete hourly windows {actions, cost}, oldest first")
     parser.add_argument("--actor", default="ameesh")
     args = parser.parse_args(argv)
 
