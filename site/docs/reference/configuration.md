@@ -325,7 +325,7 @@ It reads the database with `AMEESH_DSN` and `AMEESH_SCHEMA`.
 | `AMEESH_EXEC_SIGNER` | — | signing helper of the executor image |
 | `AMEESH_RELAY_URL`, `AMEESH_RELAY_BIND` | — | model relay of the mediated executor: upstream and bind address |
 | `AMEESH_RELAY_CONCURRENCY`, `AMEESH_RELAY_RATE`, `AMEESH_RELAY_MAX_BODY`, `AMEESH_RELAY_MAX_STREAM`, `AMEESH_RELAY_MAX_TOKENS`, `AMEESH_RELAY_UPSTREAM_TIMEOUT` | — | relay bounds: concurrency, rate, body size, stream size, tokens, upstream timeout |
-| `AMEESH_RELAY_VERIFIER` | — | relay token verifier, `module:object`: the object (or a no-argument factory) must expose `verify_token(token) -> Identity`; without it the relay refuses to start |
+| `AMEESH_RELAY_VERIFIER` | — | relay **lease-token** verifier, `module:object`: the object (or a no-argument factory) must expose `verify_token(token) -> Identity`; the relay composes the sandbox-turn fencing itself (`sandbox_relay.compose`, #5140/#5217), so a sandbox bearer (`amsb1.`) is verified there and a lease bearer of a sandbox agent is refused; without it the relay refuses to start |
 | `AMEESH_RELAY_DEEPSEEK_KEY_FILE`, `AMEESH_RELAY_DEEPSEEK_UPSTREAM` | — | DeepSeek key file and upstream URL of the relayed provider (`DEEPSEEK_API_KEY` is the in-process alternative) |
 
 Operator procedure and exact relay values: `docs/EXECUTEUR-MEDIEE.md`.

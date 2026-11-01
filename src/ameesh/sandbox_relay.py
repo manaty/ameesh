@@ -86,3 +86,16 @@ class RelayTokens:
                          (identity.agent, identity.lease_owner, identity.lease_epoch)):
             raise relay.TokenError('sandbox turn token required')
         return identity
+
+
+def compose(db, legacy):
+    """The relay verifier: the configured lease verifier, fenced for sandbox
+    agents.
+
+    Both relay entry points (the mediated server's `build_relay` and the
+    autonomous `relay serve`) compose here: a sandbox bearer is verified by
+    `Tokens`, and a legacy bearer for an agent holding a sandbox turn is
+    refused. Without it the autonomous relay would refuse every `amsb1.`
+    bearer (it never reaches the legacy verifier) or accept a lease bearer
+    for a sandbox agent (#5217)."""
+    return RelayTokens(db, legacy)

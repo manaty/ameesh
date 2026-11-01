@@ -1165,6 +1165,20 @@ def load_verifier(spec: str) -> TokenVerifier:
     return target
 
 
+def load_relay_verifier(db, spec: str) -> TokenVerifier:
+    """Le vérificateur du relais autonome (`serve`) : celui de
+    `AMEESH_RELAY_VERIFIER`, **composé** avec le fencing sandbox.
+
+    `AMEESH_RELAY_VERIFIER` désigne le vérificateur de bail (L110) ; les
+    jetons de tour sandbox (`amsb1.`) et le refus d'un jeton de bail pour un
+    agent sandbox sont ajoutés par la même composition que le serveur médié
+    (`sandbox_relay.compose`, #5140) : un seul point pour les deux entrées du
+    relais (#5217). Sans elle, le relais autonome refuserait les jetons
+    sandbox ou accepterait un jeton de bail sans fencing."""
+    from . import sandbox_relay
+    return sandbox_relay.compose(db, load_verifier(spec))
+
+
 def main(argv: list[str] | None = None) -> int:
     from .platform.child_environment import install
     install()
@@ -1193,7 +1207,8 @@ def main(argv: list[str] | None = None) -> int:
         print("relais de modèle : %s" % exc, file=sys.stderr)
         return 1
     policy = CanonPolicy(_canon_loader(cfg))
-    relay = Relay(verifier=load_verifier(spec), policy=policy, db=db, cfg=cfg)
+    verifier = load_relay_verifier(db_mod.connect(cfg), spec)
+    relay = Relay(verifier=verifier, policy=policy, db=db, cfg=cfg)
     server = make_server(relay, args.bind)
     print("relais de modèle sur %s:%d" % server.server_address[:2], file=sys.stderr)
     try:
