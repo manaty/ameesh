@@ -117,7 +117,10 @@ FERMEES = {
     "sandbox_relay_tokens": {"token_sha256", "turn_id", "host", "created_at"},
     # #5087 / 0529: review admission and withdrawals remain internal authority;
     # neither supervisor role receives additional access.
-    "agent_registry": {"review_hold"},
+    # #5250 (0531) : politique de contexte par agent et état du pilote : rien à
+    # superviser au-delà de `turn.context`, aucun droit de plus.
+    "agent_registry": {"review_hold", "session_max_tokens", "turn_reread_budget",
+                       "session_reread_budget", "context_pilot"},
     "work_review_withdrawals": {"work_item_id", "reviewer", "withdrawn"},
     # #4872 / 0526: budget authority and relay accounting remain closed to
     # supervisor roles; classification grants no additional access.
