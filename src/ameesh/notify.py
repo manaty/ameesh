@@ -3177,6 +3177,14 @@ class Notifier:
                     # puis revient. C'est la même fenêtre, déjà briefée : garder
                     # l'entrée évite un courrier par retour avant la relance.
                     continue
+                if entry.get("type") in ("operator_pause_host", "operator_pause_long") \
+                        and now - float(entry["sent_ts"]) < alert_briefs.REMIND_AFTER_S:
+                    # #5203 : le sommeil automatique, levé puis reposé, remet à
+                    # zéro la tenue de 15 min de tous ses dormeurs ; l'alerte
+                    # de chaque hôte disparaît d'une passe puis revient (et
+                    # oscille au seuil de 50 %). C'est la même pause, déjà
+                    # briefée : pas de courrier par retour avant la relance.
+                    continue
                 if entry.get("type") == "slo_breach" and entry.get("lot"):
                     # #2602: a planned wait or a clock crossing below a
                     # threshold must not forget deliveries for this state.
