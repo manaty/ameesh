@@ -12,6 +12,11 @@ Témoins : la déclaration (module → fichiers lus) est valide, `hits` rend les
 contrats dus par un change set, et le plan d'un lot garde le contrat
 transverse dans sa sélection impactée. Les têtes citées par le lot sont
 #3885 `68c30d91` (avant `9173a40dc`) et #3916 `7ae1e095` (avant `4cee317`).
+
+#5518 : `test_migrations_additives` classe tous les fichiers de
+`src/ameesh/migrations/` (lecture du dossier, hors carte mesurée) ; un lot
+qui touche une migration le rend dû (#5506 n'a été vu rouge qu'à la CI du
+paquet).
 """
 from __future__ import annotations
 
@@ -62,6 +67,14 @@ class DeclarationTest(unittest.TestCase):
         self.assertIn("deploy/sql/",
                       transverse_contracts.CONTRACTS["test_cluster"])
 
+    def test_le_contrat_d_additivite_des_migrations_est_declare(self):
+        # #5518 : tout changement sous src/ameesh/migrations/ doit jouer le
+        # test d'additivité avant la CI du paquet.
+        self.assertIn("test_migrations_additives", transverse_contracts.CONTRACTS)
+        self.assertEqual(
+            transverse_contracts.CONTRACTS["test_migrations_additives"],
+            ("src/ameesh/migrations/",))
+
 
 class HitsTest(unittest.TestCase):
     def hits(self, *paths):
@@ -83,11 +96,23 @@ class HitsTest(unittest.TestCase):
 
     def test_migration_et_droits_rendent_le_contrat_cluster(self):
         self.assertEqual(self.hits("src/ameesh/migrations/0492_x.sql"),
-                         {"test_cluster": "src/ameesh/migrations/0492_x.sql"})
+                         {"test_cluster": "src/ameesh/migrations/0492_x.sql",
+                          "test_migrations_additives":
+                          "src/ameesh/migrations/0492_x.sql"})
         self.assertEqual(self.hits("deploy/sql/role-superviseur.sql"),
                          {"test_cluster": "deploy/sql/role-superviseur.sql"})
         self.assertEqual(self.hits("deploy/k8s/statefulset.yaml"),
                          {"test_cluster": "deploy/k8s/statefulset.yaml"})
+
+    def test_migration_rend_le_contrat_d_additivite(self):
+        # #5518 : un fichier de migration rend le test d'additivité dû, comme
+        # le contrat cluster ; un fichier hors migration ne le rend pas.
+        self.assertIn(
+            "test_migrations_additives",
+            self.hits("src/ameesh/migrations/0534_github_watch_followup.sql"))
+        self.assertNotIn(
+            "test_migrations_additives",
+            self.hits("src/ameesh/db.py"))
 
     def test_suppression_et_fichier_hors_contrat(self):
         self.assertEqual(transverse_contracts.hits(
@@ -122,7 +147,7 @@ class PlanTest(unittest.TestCase):
         infos, _ = map_mod.blocks(code)
         modules = {name: {"durees": {"psycopg": 0.2}, "echecs": []}
                    for name in ("test_a", "test_l107_executor_contract",
-                                "test_cluster")}
+                                "test_cluster", "test_migrations_additives")}
         return {
             "schema": map_mod.SCHEMA, "commit": self.base,
             "genere": NOW.isoformat(), "modules": modules,
@@ -160,6 +185,23 @@ class PlanTest(unittest.TestCase):
                               repo=self.repo.path)
         self.assertEqual(state["transverse"], {})
         self.assertEqual(state["classes"]["test_l107_executor_contract"][0], "P3")
+
+    def test_migration_changee_rend_le_contrat_d_additivite(self):
+        # #5506/#5518 : un lot qui ajoute une migration doit voir le test
+        # d'additivité dans sa prévalidation, pas seulement à la CI du paquet.
+        self.repo.write("src/ameesh/migrations/0534_x.sql",
+                        "CREATE TABLE x ();\n")
+        head = self.repo.commit()
+        state = plan.classify(parts.modules(), self.card, NOW,
+                              base_fallback=self.base, head=head,
+                              repo=self.repo.path)
+        self.assertEqual(state["transverse"],
+                         {"test_cluster": "src/ameesh/migrations/0534_x.sql",
+                          "test_migrations_additives":
+                          "src/ameesh/migrations/0534_x.sql"})
+        self.assertEqual(state["classes"]["test_migrations_additives"][0], "P1")
+        self.assertIn("contrat transverse",
+                      state["classes"]["test_migrations_additives"][1])
 
 
 CODE_V1_CHANGED = ('"""Module."""\nLIMIT = 4\n\n\ndef used(x):\n    return x + 1\n')
