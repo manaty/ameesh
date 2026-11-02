@@ -353,3 +353,34 @@ def targets(pkg_dir):
 def local_reason(tools):
     return ("%s needs a local node_modules for packaging; run `ameesh deps unlink` "
             "in this package before the release build" % ", ".join(tools))
+
+
+def release_bundle_warning(pkg_dir):
+    """Advise for declared Expo/Next tooling without executing Next config.
+
+    Next configuration is arbitrary code: warn conditionally for standalone
+    output. This advisory never restricts development links.
+    """
+    with open(os.path.join(pkg_dir, "package.json"), encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    tools = set()
+    for field in DEPENDENCIES:
+        for name, spec in manifest.get(field, {}).items():
+            target = name
+            if isinstance(spec, str) and spec.startswith("npm:"):
+                target = spec[4:].rsplit("@", 1)[0] if "@" in spec[5:] else spec[4:]
+            if target in ("expo", "next"):
+                tools.add(target)
+    for script in manifest.get("scripts", {}).values():
+        tools.update(command for command in _script_commands(script)
+                     if command in ("expo", "next"))
+    builds = []
+    if "expo" in tools:
+        builds.append("expo export (release/OTA)")
+    if "next" in tools:
+        builds.append("next build with output: 'standalone'")
+    if builds:
+        return ("shared-cache node_modules can embed cache paths in %s; "
+                "run `ameesh deps unlink` in this package before the release build"
+                % " or ".join(builds))
+    return None
