@@ -57,7 +57,11 @@ def settings(path: str) -> dict:
                               or not all(isinstance(arg, str) for arg in probe)):
         raise ValueError("quiescence_probe must be a nonempty argv list")
     for key, default in (("timeout_s", staging_watch.STAGING_FALLBACK_S),
-                         ("start_timeout_s", 300)):
+                         ("start_timeout_s", 300),
+                         # #5450: the return step is bounded by its own
+                         # duration and by the service unit's TimeoutStartSec.
+                         ("return_timeout_s", 1800),
+                         ("service_timeout_s", 41400)):
         value = float(data.get(key, default))
         if not math.isfinite(value) or value <= 0:
             raise ValueError(key + " must be finite and positive")
@@ -89,22 +93,17 @@ def _worktree_prefix(run) -> str:
     return WORKTREE_PREFIX + str(run) + "-"
 
 
-def _drop_retained(repo: str, run) -> None:
-    """Remove the worktrees an attempt kept when its execution lease was lost.
-
-    The caller has already proved the old execution stopped (the quiescence
-    probe), so no process can still be using them. An absent tree is not an
-    error: the attempt may have died before creating it.
-    """
+def _retained_trees(repo: str, run) -> list[tuple[str, str]]:
+    """The kept worktrees of an attempt run, as (folder, worktree)."""
     if not run:
-        return
-    from ameesh import release_cutoff
+        return []
     prefix = _worktree_prefix(run)
     base = os.path.dirname(os.path.abspath(repo)) or tempfile.gettempdir()
     try:
         entries = list(os.scandir(base))
     except OSError:
-        return
+        return []
+    found = []
     for entry in entries:
         if not entry.name.startswith(prefix):
             continue
@@ -113,8 +112,20 @@ def _drop_retained(repo: str, run) -> None:
                 continue
         except OSError:
             continue
-        release_cutoff._drop_worktree(repo, entry.path,
-                                      os.path.join(entry.path, "worktree"))
+        found.append((entry.path, os.path.join(entry.path, "worktree")))
+    return found
+
+
+def _drop_retained(repo: str, run) -> None:
+    """Remove the worktrees an attempt kept when its execution lease was lost.
+
+    The caller has already proved the old execution stopped (the quiescence
+    probe), so no process can still be using them. An absent tree is not an
+    error: the attempt may have died before creating it.
+    """
+    from ameesh import release_cutoff
+    for folder, tree in _retained_trees(repo, run):
+        release_cutoff._drop_worktree(repo, folder, tree)
 
 
 def latest(db, key):
@@ -146,6 +157,13 @@ def submit(db, cfg, options, sha, *, included=()):
             elif previous.get("previous_run"):
                 data.update(previous_host=previous["previous_host"],
                             previous_run=previous["previous_run"])
+            # #5450: an unproved stop's units are settled by the next attempt,
+            # before its quiescence probe; their pid must survive a new submit.
+            for field in ("unit_pid", "return_pid", "return_recovery"):
+                if previous.get(field):
+                    data[field] = previous[field]
+            if previous.get("return_recovery") and previous.get("blocked_reason"):
+                data["blocked_reason"] = previous["blocked_reason"]
         _record(db, options["key"], data, lease=lease)
         return data
     finally:
@@ -192,6 +210,20 @@ def tick(db, cfg, options) -> dict:
         elected = role_run.live(db, options["role"])
         if not elected["held"] or elected.get("holder") != host:
             return {"state": "standby", "reason": "role changed"}
+        # #5450: a previous stop that could not prove its workstation units
+        # stopped left their pid in the request. Settle them before any other
+        # host operation; the kept worktree stays until they are proved gone.
+        guard_pid = request.get("unit_pid") or request.get("return_pid")
+        if isinstance(guard_pid, int) and guard_pid > 0:
+            from ameesh import release_cutoff as _release_cutoff
+            note, settled = _release_cutoff._settle_poste_units(
+                guard_pid, lambda seconds: time.sleep(seconds))
+            if not settled:
+                return blocked("previous stop not proved: "
+                               + (note or "workstation units unreadable"))
+            request = dict(request)
+            request.pop("unit_pid", None)
+            request.pop("return_pid", None)
         from .platform.child_environment import execution_transport
         timeout = options.get("timeout_s", staging_watch.STAGING_FALLBACK_S)
         env = execution_transport(dict(os.environ, BASCULE_ENV=options["bascule_env"],
@@ -215,6 +247,30 @@ def tick(db, cfg, options) -> dict:
                                                    watch=False)
             if code or lost:
                 return blocked("old execution not proved stopped")
+            # #5450: a supervisor killed before its bounded return leaves the
+            # return state in the kept tree. The next tick must not drop it
+            # and restart silently: it mails the manual fallback and keeps the
+            # guard, as the pilot's arbitration requires.
+            from ameesh import release_cutoff as _release_cutoff
+            for run in (request.get("run"), request.get("previous_run")):
+                for _folder, tree in _retained_trees(repo, run):
+                    if not os.path.isfile(os.path.join(
+                            tree, _release_cutoff.STAGING_RETURN_STATE)):
+                        continue
+                    # One mail per interrupted return, not one per timer pass.
+                    if request.get("return_recovery"):
+                        return {"state": "blocked",
+                                "reason": request.get("blocked_reason")
+                                or "retour apres arret interrompu"}
+                    _release_cutoff._manual_return_mail(
+                        db, tree, request.get("notify") or "mesh-design",
+                        "superviseur interrompu avant la fin du retour")
+                    reason = ("retour apres arret interrompu: marche manuelle "
+                              "remise au pilote; sources kept")
+                    _record(db, options["key"],
+                            dict(request, blocked_reason=reason,
+                                 return_recovery=True), lease=lease)
+                    return {"state": "blocked", "reason": reason}
             # The stop is proved: the trees kept by the interrupted attempt
             # can be removed now (#4898 N3). Only after this proof, never
             # before, since the old process may still be writing in them.
@@ -262,6 +318,9 @@ def tick(db, cfg, options) -> dict:
         attempt.pop("blocked_reason", None)
         attempt.pop("previous_host", None)
         attempt.pop("previous_run", None)
+        attempt.pop("unit_pid", None)
+        attempt.pop("return_pid", None)
+        attempt.pop("return_recovery", None)
         attempt_id = _record(db, options["key"], attempt, lease=lease)
         request = attempt
         env["STAGING_RUN_ID"] = attempt["run"]
@@ -312,13 +371,45 @@ def tick(db, cfg, options) -> dict:
                              + (note.strip("; ") or "workstation units unreadable")
                              + "; sources kept, next attempt requires quiescence")
                     _record(db, options["key"],
-                            dict(attempt, blocked_reason=guard), lease=lease)
+                            dict(attempt, blocked_reason=guard,
+                                 unit_pid=pid), lease=lease)
                     return {"state": "blocked", "reason": guard,
                             "run": attempt["run"]}
+                # #5450: with the units quiescent, the return of the current
+                # host is a new bounded step run here, outside the killed
+                # group. The guard and the worktree stay until it ends; a
+                # failed or timed-out return is the manual fallback's job.
+                drop = False
+                retour = release_cutoff._return_after_stop(
+                    tree, sha, env=env,
+                    budget=release_cutoff._return_budget(
+                        float(attempt.get("started") or time.time()),
+                        timeout_s=float(options.get(
+                            "return_timeout_s",
+                            release_cutoff.STAGING_RETURN_TIMEOUT_S)),
+                        service_timeout_s=float(options.get(
+                            "service_timeout_s",
+                            release_cutoff.STAGING_SERVICE_TIMEOUT_S))))
+                drop = retour["drop"]
+                if not drop:
+                    guard = ("retour apres arret non conclu: "
+                             + (retour["note"] or "workstation units unreadable")
+                             + "; sources kept, next attempt requires quiescence")
+                    _record(db, options["key"],
+                            dict(attempt, blocked_reason=guard,
+                                 return_pid=retour.get("pid")), lease=lease)
+                    return {"state": "blocked", "reason": guard,
+                            "run": attempt["run"]}
+                if not retour["ok"] and not retour["mailed"]:
+                    release_cutoff._manual_return_mail(
+                        db, tree, attempt.get("notify") or "mesh-design",
+                        retour["note"])
                 monitor.stop(reason)
                 result = dict(attempt, state="failed", exit=code, reason=reason)
                 if note:
                     result["unit_note"] = note
+                if retour["note"]:
+                    result["return_note"] = retour["note"]
                 _record(db, options["key"], result, lease=lease)
                 return result
             if lost:

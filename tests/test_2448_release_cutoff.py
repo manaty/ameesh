@@ -1309,6 +1309,12 @@ exit 0
 # systemd-run --pipe does, the "unit" keeps the staging stdout), then outlives
 # its timeout.
 SLOW_STAGING = """#!/usr/bin/env bash
+# #5450: the supervisor's return step reuses this worktree script.
+if [ "$1" = "--retour-sur-arret" ]; then
+  echo "retour apres arret: ok"
+  exit 0
+fi
+printf 'ameesh-agents-2\\tinstaller\\t0123456789abcdef\\tvm.sh agents retour\\t/tmp/journal.jsonl\\t%s\\n' 'a'*40 > "$(dirname "$0")/../../.retour-apres-arret"
 setsid sleep "$DUREE_UNITE" &
 echo "$!" >> "$UNITES_ETAT.pids"
 echo "poste-maj-staging-$$-redemarrer.service active $!" > "$UNITES_ETAT"
@@ -1393,6 +1399,7 @@ class StagingTimeoutUnitsTest(unittest.TestCase):
     def test_the_worktree_is_dropped_once_the_unit_ended(self):
         message, at_drop, calls = self.run_timeout(grace=5, DUREE_UNITE="2")
         self.assertIn("staging stopped", message)
+        self.assertIn("retour apres arret: ok", message)
         # seen alive while it held stdout, not after it ended
         self.assertIn("ended before the worktree was dropped", message)
         self.assertRegex(message, r"poste-maj-staging-\d+-redemarrer\.service")
@@ -1443,6 +1450,87 @@ class StagingTimeoutUnitsTest(unittest.TestCase):
         with mock.patch.object(release_cutoff.shutil, "which", return_value="systemctl"), \
              mock.patch.object(release_cutoff, "_systemctl", return_value=failed):
             self.assertIsNone(release_cutoff._poste_units(7))
+
+
+class ReturnAfterStopTest(unittest.TestCase):
+    """#5450: the return of the stopped host is a new bounded step.
+
+    It runs after the group kill, so `STOP_GRACE_S`/`STAGING_KILL_GRACE_S`
+    do not bound it; the caller's budget does.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="ameesh-5450-retour-")
+        self.addCleanup(tmp.cleanup)
+        self.tree = Path(tmp.name) / "worktree"
+        (self.tree / "deploy/mise-a-jour").mkdir(parents=True)
+        self.script = self.tree / "deploy/mise-a-jour/staging.sh"
+        self.state = self.tree / release_cutoff.STAGING_RETURN_STATE
+        self.state.write_text(
+            "ameesh-agents-2\tinstaller\t0123456789abcdef\t"
+            "vm.sh agents retour\t/tmp/journal.jsonl\t" + "a" * 40 + "\n")
+        self.env = dict(os.environ)
+
+    def write(self, body):
+        self.script.write_text("#!/usr/bin/env bash\n" + body + "\n")
+        self.script.chmod(0o755)
+
+    def run_step(self, budget=120, **patches):
+        with mock.patch.object(release_cutoff, "_poste_units", return_value=[]):
+            with mock.patch.multiple(release_cutoff, **patches) if patches else \
+                    mock.patch.object(release_cutoff, "STAGING_RETURN_MIN_S", 60.0):
+                return release_cutoff._return_after_stop(
+                    str(self.tree), "a" * 40, env=self.env, budget=budget)
+
+    def test_a_return_longer_than_the_stop_grace_is_carried_to_the_end(self):
+        self.write('sleep 0.4; echo "retour ok"; exit 0')
+        with mock.patch.object(release_cutoff, "STAGING_RETURN_MIN_S", 0.1), \
+             mock.patch.object(release_cutoff, "STAGING_KILL_GRACE_S", 0.1), \
+             mock.patch.object(release_cutoff.staging_watch, "STOP_GRACE_S", 0.1):
+            result = release_cutoff._return_after_stop(
+                str(self.tree), "a" * 40, env=self.env, budget=120)
+        self.assertTrue(result["ran"], result)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["drop"], result)
+        self.assertIn("retour ok", result["note"])
+
+    def test_a_failed_return_is_mailed_by_the_step(self):
+        self.write('echo "retour apres arret en echec (marche manuelle remise au pilote)"; exit 1')
+        result = self.run_step()
+        self.assertTrue(result["ran"], result)
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["mailed"], result)
+        self.assertTrue(result["drop"], result)
+
+    def test_a_timed_out_return_is_left_to_the_manual_fallback(self):
+        self.write("sleep 5")
+        with mock.patch.object(release_cutoff, "STAGING_RETURN_MIN_S", 0.1):
+            started = time.monotonic()
+            result = release_cutoff._return_after_stop(
+                str(self.tree), "a" * 40, env=self.env, budget=0.5)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 3, "the bounded return must not hang")
+        self.assertTrue(result["ran"], result)
+        self.assertFalse(result["ok"], result)
+        self.assertFalse(result["mailed"], result)
+        self.assertTrue(result["drop"], result)
+        self.assertIn("depassement de la borne", result["note"])
+
+    def test_absent_state_is_not_a_return(self):
+        self.state.unlink()
+        result = release_cutoff._return_after_stop(
+            str(self.tree), "a" * 40, env=self.env, budget=120)
+        self.assertFalse(result["ran"])
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["drop"])
+
+    def test_too_little_room_before_timeoutstart_mails(self):
+        result = release_cutoff._return_after_stop(
+            str(self.tree), "a" * 40, env=self.env, budget=1)
+        self.assertFalse(result["ran"])
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["mailed"])
+        self.assertIn("TimeoutStartSec", result["note"])
 
 
 class PureReleaseTest(unittest.TestCase):

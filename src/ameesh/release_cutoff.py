@@ -72,6 +72,16 @@ STAGING_KILL_GRACE_S = staging_watch.STOP_GRACE_S
 #: last bounded read of the staging output once its units are settled: a
 #: survivor may still hold the pipe (`systemd-run --pipe`)
 STAGING_DRAIN_S = 10.0
+#: #5450: after a monitored stop, the return of the current host is a new
+#: bounded step run by the supervisor that survived the group kill. The 11 h
+#: fallback leaves 30 min before the units' 11 h 30 TimeoutStartSec.
+STAGING_RETURN_TIMEOUT_S = 1800.0
+#: below this remaining time the return is not attempted (manual fallback)
+STAGING_RETURN_MIN_S = 60.0
+#: TimeoutStartSec of ameesh-release*.service and ameesh-staging.service
+STAGING_SERVICE_TIMEOUT_S = 41400.0
+#: state file written by the launcher's TERM trap, inside the kept worktree
+STAGING_RETURN_STATE = ".retour-apres-arret"
 #: default target lease duration, the same as the train and the merge queue
 LOCK_TTL_S = land.LOCK_TTL_S
 #: default bounded wait for the target lease (a packet CI may run 45 min)
@@ -2281,6 +2291,132 @@ def _settle_poste_units(pid: int, wait, grace_s: float | None = None) -> tuple[s
                "still running" if alive else "in an unreadable state", grace_s)), False
 
 
+def _return_budget(started: float, *, timeout_s: float = STAGING_RETURN_TIMEOUT_S,
+                   service_timeout_s: float = STAGING_SERVICE_TIMEOUT_S,
+                   now: float | None = None) -> float:
+    """#5450: how long the return may take before TimeoutStartSec kills us."""
+    at = time.time() if now is None else float(now)
+    return min(float(timeout_s),
+               float(started) + float(service_timeout_s) - at - 60.0)
+
+
+def _return_state(tree: str) -> dict:
+    """Read the state the launcher's TERM trap left in the kept worktree."""
+    try:
+        with open(os.path.join(tree, STAGING_RETURN_STATE), encoding="utf-8") as fh:
+            fields = fh.readline().rstrip("\n").split("\t")
+    except OSError:
+        return {}
+    if len(fields) < 6:
+        return {}
+    return dict(zip(("host", "step", "precedent", "outil", "journal", "sha"),
+                    fields))
+
+
+def _return_after_stop(tree: str, sha: str, *, env: dict, budget: float) -> dict:
+    """#5450: run the bounded return left by a stopped staging sequence.
+
+    The caller has killed the launcher's group and proved its workstation
+    units quiescent; this step runs in its own session, so the stop grace no
+    longer bounds it. The caller keeps the staging guard and the worktree
+    until it ends. `drop` is False when the return's own workstation units
+    are not proved stopped: the guard must then stay, as for any stop.
+    """
+    state = os.path.join(tree, STAGING_RETURN_STATE)
+    if not os.path.isfile(state):
+        return {"ran": False, "ok": True, "note": "", "mailed": False,
+                "drop": True, "pid": None}
+    if budget < STAGING_RETURN_MIN_S:
+        return {"ran": False, "ok": False,
+                "note": "retour non tente: %ss restantes avant TimeoutStartSec"
+                        % round(budget), "mailed": False, "drop": True,
+                "pid": None}
+    script = os.path.join(tree, "deploy", "mise-a-jour", "staging.sh")
+    if not os.path.isfile(script):
+        return {"ran": False, "ok": False,
+                "note": "retour non tente: %s absent" % script,
+                "mailed": False, "drop": True, "pid": None}
+    log = tempfile.TemporaryFile(mode="w+")
+    try:
+        proc = subprocess.Popen(
+            ["bash", script, "--retour-sur-arret", state, sha],
+            env=env, start_new_session=True, stdout=log,
+            stderr=subprocess.STDOUT, text=True)
+        timed_out = False
+        try:
+            proc.wait(timeout=budget)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_group(proc, signal.SIGTERM)
+            proc.wait(timeout=min(30.0, budget))
+        # The return may have handed a rolling restart to a transient unit
+        # (`systemd-run --wait`); never conclude before it stopped.
+        note, settled = _settle_poste_units(proc.pid, time.sleep)
+        if timed_out or proc.poll() is None:
+            _kill_group(proc, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=10.0)
+        try:
+            log.seek(0)
+            output = log.read()
+        except OSError:
+            output = ""
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_group(proc, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=10.0)
+        note, settled = _settle_poste_units(proc.pid, time.sleep)
+        output = ""
+    except OSError as exc:
+        return {"ran": False, "ok": False,
+                "note": "retour non lance: %s" % exc, "mailed": False,
+                "drop": True, "pid": None}
+    finally:
+        log.close()
+    tail = " | ".join((output or "").strip().splitlines()[-2:])[:300]
+    if timed_out:
+        return {"ran": True, "ok": False,
+                "note": ("retour apres arret: depassement de la borne (%ss)%s%s"
+                         % (round(budget), (": " + tail) if tail else "", note)),
+                "mailed": False, "drop": settled, "pid": proc.pid}
+    ok = proc.returncode == 0
+    return {"ran": True, "ok": ok,
+            "note": ("retour apres arret: %s%s%s"
+                     % ("ok" if ok else "echec (code %s)" % proc.returncode,
+                        (": " + tail) if tail else "", note)),
+            # The return step mails the manual fallback itself on a normal
+            # failure; a signal kill (no mail) leaves it to the supervisor.
+            "mailed": (not ok) and ("marche manuelle remise au pilote"
+                                    in (output or "")),
+            "drop": settled, "pid": proc.pid}
+
+
+def _manual_return_mail(db, tree: str, notify: str, reason: str) -> bool:
+    """#5450: the manual fallback when the bounded return did not conclude."""
+    state = _return_state(tree)
+    host = state.get("host") or "?"
+    step = state.get("step") or "?"
+    precedent = state.get("precedent") or "previous-sha"
+    outil = state.get("outil") or "le retour de l'hote"
+    journal = state.get("journal") or "journal du staging"
+    sha = state.get("sha") or ""
+    subject = "staging #5450 : retour apres arret non conclu sur %s" % host
+    detail = reason or "Le retour automatique n'a pas conclu."
+    body = ("Le staging %s a ete arrete par la surveillance de progression sur %s, "
+            "etape %s. %s L'hote peut rester a mi-parcours (version precedente %s). "
+            "Remise manuelle : %s, puis controler. Trace : %s"
+            % (sha[:9] or "?", host, step, detail, precedent, outil, journal))
+    try:
+        from . import work
+        mail.send(db, work.SYSTEM_SENDER, notify,
+                  "%s\n\n%s" % (subject, body), kind="event",
+                  payload={"urgent": True, "staging": {"sujet": subject}})
+        return True
+    except Exception:  # noqa: BLE001 - the journal and the failure remain
+        return False
+
+
 def _staging_env(timeout_s: float, *, run: str | None = None) -> dict:
     """#4885: every synchronous sequence gets a fresh run id; an inherited
     STAGING_RUN_ID would exempt a concurrent run of the same id from the
@@ -2394,6 +2530,24 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 # the restart/rollback units of the workstation outlive
                 # the group and run from this worktree (#3049)
                 note, drop = _settle_poste_units(proc.pid, wait)
+                if drop:
+                    # #5450: the return is a new bounded step run here, outside
+                    # the killed group, with the guard and worktree still held.
+                    # The manual fallback is sent only when this step could not
+                    # conclude (its own failure path already mails). An
+                    # exception keeps the tree: `drop` only becomes true again
+                    # once the return proves its own units stopped.
+                    drop = False
+                    retour = _return_after_stop(
+                        worktree, release_sha,
+                        env=_staging_env(duration, run=run),
+                        budget=_return_budget(started))
+                    note += retour["note"]
+                    drop = retour["drop"]
+                    if not retour["ok"] and not retour["mailed"]:
+                        if db is not None:
+                            _manual_return_mail(db, worktree, "mesh-design",
+                                                retour["note"])
                 if read["output"] is None:
                     wait(STAGING_DRAIN_S)
                 if read["output"] is None:

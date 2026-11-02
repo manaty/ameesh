@@ -700,15 +700,27 @@ même verdict dans les deux lanceurs : l'exécutant élu
 (`staging_executor`) et la release synchrone (`run_staging`). Elle n'arrête
 la séquence que si `overdue()` rend encore une raison **15 min après la
 première alerte** : l'opérateur voit ainsi l'alerte avant le geste. L'arrêt
-est un TERM au groupe, puis un KILL après 5 min. `staging.sh` **ne tente pas
-le retour automatique** de l'hôte en cours dans cette fenêtre : un retour
-refait son redémarrage glissant (jusqu'à 30 min par hôte) et ne tiendrait pas ;
-il trace l'étape ouverte et remet au pilote la marche manuelle
-(`vm.sh agents retour`, `poste.sh retour`), l'hôte restant sur son
-`previous-sha`. Le retour automatique reste celui des échecs d'étapes
-ordinaires, hors arrêt par la surveillance. La raison d'`overdue()` est
-enregistrée dans la demande et le snapshot `staging.sequence` ; aucun
-« remis » n'est écrit sans trace `retour ok`.
+est un TERM au groupe, puis un KILL après 5 min. Le piège TERM de
+`staging.sh` **ne tente pas** le retour dans cette fenêtre : un retour refait
+son redémarrage glissant (jusqu'à 30 min par hôte) et ne tiendrait pas dans la
+grâce. Il écrit dans le worktree conservé l'étape ouverte
+(`.retour-apres-arret` : hôte, étape, `previous-sha`, outil, journal) et
+s'arrête. Le superviseur qui a tué le groupe (`staging_executor.tick` ou
+`run_staging`) attend/arrête d'abord les unités
+`poste-maj-staging-<pid>-*` survivantes, puis rejoue le retour comme une
+**étape à part, hors du groupe tué** (`staging.sh --retour-sur-arret`) :
+`retour` puis `controler`, garde du staging et worktree tenus jusqu'à
+« retour ok » ou l'échec. Sa borne est sa propre durée
+(`return_timeout_s`, 30 min) et le temps restant avant le
+`TimeoutStartSec=11h30` des unités (`service_timeout_s`, 41400 s) ; il ne
+tente pas le retour s'il reste moins d'une minute. Un retour en échec, hors
+délai, ou un superviseur tué par systemd fait remettre au pilote la marche
+manuelle (`vm.sh agents retour`, `poste.sh retour`), l'hôte restant sur son
+`previous-sha` ; la garde n'est libérée et l'échec publié qu'après. Un arrêt
+demandé sous `--sans-retour` (migration non additive) ne lance aucun retour :
+le courrier existant donne le rollback SQL d'abord, puis la remise de code.
+La raison d'`overdue()` est enregistrée dans la demande et le snapshot
+`staging.sequence` ; aucun « remis » n'est écrit sans trace `retour ok`.
 
 `STAGING_TIMEOUT_S` (39600 s, 11 h) devient le **secours global** d'un
 lanceur qui ne publie aucun battement ; il ne juge plus une séquence qui bat.
@@ -743,6 +755,8 @@ et `.timer` sur **chaque candidat**, avec une configuration privée
   "arguments": ["--sans-poste"],
   "timeout_s": 39600,
   "start_timeout_s": 300,
+  "return_timeout_s": 1800,
+  "service_timeout_s": 41400,
   "quiescence_probe": ["/chemin/prive/prouver-arret-staging"]
 }
 ```

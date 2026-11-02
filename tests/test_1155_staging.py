@@ -392,12 +392,12 @@ class StagingTest(unittest.TestCase):
                 self.assertTrue(chemin.startswith(str(self.root)),
                                 'executable hors bac a sable : %s' % line)
 
-    def test_term_on_an_open_step_does_not_attempt_a_rollback(self):
-        """#5450 blocking: a rollback's rolling restart cannot fit the grace.
+    def test_term_on_an_open_step_hands_the_return_to_the_supervisor(self):
+        """#5450: the trap never runs a return inside the killed group.
 
-        A `retour` would take up to a turn per runner; the fake one is set
-        longer than STOP_GRACE_S (400 s), so the trap must not start it at
-        all. It traces the open step, mails the manual command, and stops.
+        It records the open step and stops; the supervisor replays it as a
+        separate bounded step (`--retour-sur-arret`), which is where the
+        rolling restart that outlives STOP_GRACE_S belongs.
         """
         import signal
         import time
@@ -420,15 +420,97 @@ class StagingTest(unittest.TestCase):
         out, err = proc.communicate(timeout=60)
         self.assertEqual(proc.returncode, 1, (out, err))
         self.assertFalse(any('action=retour' in line for line in self.calls()))
-        self.assertIn('retour non tente', err)
+        self.assertIn('retour confie au superviseur', err)
         traces = self.traces()
         step = [row for row in traces if row.get('hote') == 'ameesh-agents-2'
                 and row.get('etape') == 'installer' and row.get('verdict') == 'ko']
         self.assertTrue(step, traces)
-        self.assertIn('retour non tente', step[-1]['detail'])
+        self.assertIn('confie au superviseur', step[-1]['detail'])
+        state = (self.repo / '.retour-apres-arret').read_text().rstrip('\n').split('\t')
+        self.assertEqual(state[:4], ['ameesh-agents-2', 'installer', '',
+                                     'vm.sh agents retour'], state)
+        self.assertFalse(any('venv-python - mesh-design' in line
+                             for line in self.calls()),
+                         [line for line in self.calls()
+                          if 'venv-python - mesh-design' in line])
+
+        # The supervisor's step, out of the killed group: the long return is
+        # carried to the end and the host is controlled.
+        (self.state / 'scenario').write_text('')
+        retour = subprocess.run(
+            ['bash', str(self.script_dir / 'staging.sh'),
+             '--retour-sur-arret', str(self.repo / '.retour-apres-arret'), self.sha],
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(retour.returncode, 0, (retour.stdout, retour.stderr))
+        calls = self.calls()
+        self.assertTrue(any('host=ameesh-agents-2 action=retour' in line
+                            for line in calls), calls)
+        self.assertTrue(any('host=ameesh-agents-2 action=controler' in line
+                            for line in calls), calls)
+        traces = self.traces()
+        self.assertTrue(any(row.get('hote') == 'ameesh-agents-2'
+                            and row.get('etape') == 'retour'
+                            and row.get('verdict') == 'ok' for row in traces), traces)
+        self.assertTrue(any(row.get('hote') == 'ameesh-agents-2'
+                            and row.get('etape') == 'controle-retour'
+                            and row.get('verdict') == 'ok' for row in traces), traces)
+        self.assert_no_escape()
+
+    def test_term_under_sans_retour_never_returns_the_code(self):
+        """#4616 + #5450: a non-additive migration keeps the manual path."""
+        import signal
+        import time
+        (self.state / 'scenario').write_text('lent=ameesh-agents-2:installer\n')
+        env = dict(self.env, DUREE_LENT='400')
+        proc = subprocess.Popen(
+            ['bash', str(self.script_dir / 'staging.sh'),
+             '--sans-retour=src/ameesh/migrations/rollback/9999.sql'],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if 'slow host=ameesh-agents-2 action=installer' in self.calls():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('the installer step never started')
+        os.killpg(proc.pid, signal.SIGTERM)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, (out, err))
+        self.assertFalse((self.repo / '.retour-apres-arret').exists())
+        self.assertFalse(any('action=retour' in line for line in self.calls()))
+        self.assertIn('retour automatique desactive', err)
+        traces = self.traces()
+        self.assertTrue(any(row.get('hote') == 'ameesh-agents-2'
+                            and row.get('etape') == 'retour'
+                            and row.get('verdict') == 'desactive'
+                            for row in traces), traces)
+        self.assertTrue(any('venv-python - mesh-design' in line
+                            and 'retour automatique desactive' in line
+                            for line in self.calls()), self.calls())
+        self.assert_no_escape()
+
+    def test_return_step_failure_mails_the_manual_fallback(self):
+        """#5450: a failed return step sends the manual command and stops."""
+        (self.repo / '.retour-apres-arret').write_text(
+            'ameesh-agents-2\tinstaller\t0123456789abcdef\t'
+            'vm.sh agents retour\t%s\t%s\n' % (self.state / 'journal.jsonl', self.sha))
+        (self.state / 'scenario').write_text('ko=ameesh-agents-2:retour\n')
+        env = dict(self.env, DUREE_LENT='1')
+        retour = subprocess.run(
+            ['bash', str(self.script_dir / 'staging.sh'),
+             '--retour-sur-arret', str(self.repo / '.retour-apres-arret'), self.sha],
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(retour.returncode, 1, (retour.stdout, retour.stderr))
+        self.assertIn('marche manuelle remise au pilote', retour.stderr)
+        traces = self.traces()
+        self.assertTrue(any(row.get('hote') == 'ameesh-agents-2'
+                            and row.get('etape') == 'retour'
+                            and row.get('verdict') == 'ko' for row in traces), traces)
         self.assertTrue(any('mesh-design' in line
-                            and "retour automatique n'a ete tente" in line
-                            for line in self.calls()))
+                            and 'retour apres arret en ECHEC' in line
+                            for line in self.calls()), self.calls())
         self.assert_no_escape()
 
     def test_environment_is_isolated(self):

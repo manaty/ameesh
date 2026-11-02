@@ -11,6 +11,13 @@
 #                                [--sans-sauvegarde] [--sans-sonde]
 #                                [--sans-poste] [--absent nom=raison]
 #                                [--sans-retour[=ROLLBACK]] [REF]
+#   deploy/mise-a-jour/staging.sh --retour-sur-arret FICHIER [REF]
+#
+# --retour-sur-arret : etape interne (#5450), lancee par le superviseur qui a
+# arrete une sequence (staging_executor.tick ou run_staging). FICHIER est
+# l'etat ecrit par le piege TERM (hote, etape, previous-sha, outil, journal) ;
+# elle rejoue `retour` puis `controler` sur cet hote, hors du groupe tue,
+# trace le resultat et, en echec, remet la marche manuelle au pilote.
 #
 # REF : commit, branche ou etiquette du depot (defaut : HEAD). Il doit etre un
 # ancetre de origin/main, sauf HORS_MAIN=1 (BRANCHE_MAIN pour viser une autre
@@ -245,12 +252,14 @@ POSITIONNELS=0
 #: #4616 : 1 = aucun retour automatique (migration non additive posee)
 SANS_RETOUR=0
 ROLLBACK_SQL=""
+#: #5450 : etat laisse par le piege TERM, rejoue par le superviseur
+RETOUR_SUR_ARRET=""
 #: #5450 : arret demande par la surveillance de progression (TERM du lanceur)
 ARRET_SURVEILLANCE=0
 #: #5450 : un echec d'hote est deja en cours de traitement (retour, courrier)
 ECHEC_EN_COURS=0
 
-usage() { sed -n '9,13p' "$0"; }
+usage() { sed -n '9,20p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -263,6 +272,9 @@ while [ $# -gt 0 ]; do
       SANS_RETOUR=1
       ROLLBACK_SQL=${1#--sans-retour=}
       [ -n "$ROLLBACK_SQL" ] || { echo "--sans-retour= : rollback vide" >&2; exit 2; }
+      ;;
+    --retour-sur-arret)
+      RETOUR_SUR_ARRET=${2:?--retour-sur-arret attend un fichier d etat}; shift
       ;;
     --absent)
       _absent=${2:?--absent attend NOM=RAISON}
@@ -863,6 +875,60 @@ finally:
     conn.close()
 PY
 }
+
+# #5450 : etape de retour apres arret, rejouee par le superviseur qui a tue le
+# groupe (staging_executor.tick, run_staging). Elle tourne hors de ce groupe,
+# bornee par l'appelant ; elle trace le resultat et ne rend la main qu'apres
+# « retour ok » + controler, ou apres avoir remis la marche manuelle au pilote.
+# Aucun etat de sequence n'est publie ici : la garde reste au superviseur.
+if [ -n "$RETOUR_SUR_ARRET" ]; then
+  if [ ! -r "$RETOUR_SUR_ARRET" ]; then
+    echo "retour apres arret : etat illisible ($RETOUR_SUR_ARRET)" >&2
+    exit 2
+  fi
+  hote_retour="" etape_retour="" precedent_retour="" outil_retour="" journal_etat="" sha_etat=""
+  IFS=$'\t' read -r hote_retour etape_retour precedent_retour outil_retour \
+    journal_etat sha_etat < "$RETOUR_SUR_ARRET" || true
+  if [ -z "$hote_retour" ] || [ -z "$etape_retour" ]; then
+    echo "retour apres arret : etat incomplet ($RETOUR_SUR_ARRET)" >&2
+    exit 2
+  fi
+  case " ${HOTES[*]} " in
+    *" $hote_retour "*) ;;
+    *) echo "retour apres arret : hote $hote_retour hors de la sequence (${HOTES[*]})" >&2; exit 2 ;;
+  esac
+  if [ -z "$outil_retour" ]; then
+    case "$(mode_de "$hote_retour")" in
+      poste) outil_retour="poste.sh retour" ;;
+      agents) outil_retour="vm.sh agents retour" ;;
+      serveur) outil_retour="vm.sh retour" ;;
+      *) outil_retour="la remise en version precedente de $hote_retour" ;;
+    esac
+  fi
+  PRECEDENT=$precedent_retour
+  journal_etat=${journal_etat:-$JOURNAL}
+  etape "$hote_retour : retour automatique apres arret (previous-sha ${PRECEDENT:-previous-sha})"
+  if exec_hote "$hote_retour" retour; then
+    trace "$hote_retour" retour ok "retour automatique apres arret applique"
+    etape "$hote_retour : controle du retour apres arret"
+    if exec_hote "$hote_retour" controler; then
+      trace "$hote_retour" controle-retour ok "unites et baux verts apres retour"
+      rm -f -- "$RETOUR_SUR_ARRET"
+      echo "retour apres arret effectue et controle sur $hote_retour" >&2
+      exit 0
+    fi
+    trace "$hote_retour" controle-retour ko "l'hote ne repond pas apres le retour"
+    detail_retour="Le retour automatique a ete applique mais les controles echouent."
+  else
+    trace "$hote_retour" retour ko "le retour automatique apres arret a echoue"
+    detail_retour="Le retour automatique apres arret a echoue."
+  fi
+  notifier "staging #5450 : retour apres arret en ECHEC sur $hote_retour" \
+    "Le staging $SHA_TRAVE a ete arrete par la surveillance de progression sur $hote_retour, etape $etape_retour. $detail_retour L'hote peut rester a mi-parcours (version precedente ${PRECEDENT:-previous-sha} enregistree). Remise manuelle : $outil_retour, puis controler. Trace : $journal_etat"
+  rm -f -- "$RETOUR_SUR_ARRET"
+  echo "retour apres arret en echec sur $hote_retour (marche manuelle remise au pilote)" >&2
+  exit 1
+fi
 echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   local nom=$1 ou=$2 detail=$3 rapport="" complement=""
   ECHEC_EN_COURS=1
@@ -1104,24 +1170,20 @@ arreter_battement() {
   SUIVI_BATTEMENT_PID=
 }
 # #5450 : la surveillance (run_staging, staging_executor) arrete une sequence
-# retardee par TERM. Aucun retour automatique n'est tente ici : le retour d'un
-# hote refait son redemarrage glissant (jusqu'a 30 min par hote), il ne tient
-# pas dans la grace avant le KILL du lanceur. Une remise a moitie faite serait
-# pire qu'une sequence arretee : on trace l'etape ouverte, on remet la marche
-# manuelle au pilote, et la sequence s'arrete. Le retour automatique reste
-# celui des echecs d'etapes ordinaires (echec_hote), hors de cette fenetre.
+# retardee par TERM. Le piege ne fait jamais le retour lui-meme : il ecrit
+# l'etape ouverte dans un etat que le superviseur, qui survit au groupe tue,
+# rejoue comme une etape a part, bornee (`--retour-sur-arret`). Le retour d'un
+# hote refait son redemarrage glissant (jusqu'a 30 min) : il ne tient pas dans
+# la grace avant le KILL du groupe, et une remise a moitie faite serait pire
+# qu'une sequence arretee. Le superviseur tient la garde et le worktree jusqu'a
+# « retour ok » ou l'echec ; la marche manuelle reste le repli.
 arret_surveillance() {
-  local hote="" etape="" debut="" marque="" lignes="" outil detail
+  local hote="" etape_ouverte="" debut="" marque="" lignes="" outil detail
   [ "$ARRET_SURVEILLANCE" = 0 ] || return 0
   ARRET_SURVEILLANCE=1
   trap - TERM
-  if [ "$ECHEC_EN_COURS" = 1 ]; then
-    # Un retour d'echec est deja en cours : ne pas l'interrompre une seconde
-    # fois ; ses propres courriers d'echec parlent.
-    return 0
-  fi
   if [ -r "$SUIVI_COURANTE" ]; then
-    IFS=$'\t' read -r hote etape debut marque < "$SUIVI_COURANTE" || true
+    IFS=$'\t' read -r hote etape_ouverte debut marque < "$SUIVI_COURANTE" || true
     lignes=$(wc -l < "$JOURNAL" 2>/dev/null || echo 0)
   fi
   # une ligne de journal apres la marque signifie que l'etape est close : son
@@ -1133,11 +1195,26 @@ arret_surveillance() {
       serveur) outil="vm.sh retour" ;;
       *) outil="la remise en version precedente de $hote" ;;
     esac
-    detail="arret demande par la surveillance de progression ; retour non tente (redemarrage glissant hors grace)"
-    trace "$hote" "${etape:-surveillance}" ko "$detail"
-    notifier "staging #5450 : sequence arretee sur $hote a ${etape:-surveillance}" \
-      "Le staging $SHA_TRAVE a ete arrete par la surveillance de progression sur $hote, etape ${etape:-surveillance}. Aucun retour automatique n'a ete tente : un retour refait le redemarrage glissant de l'hote et ne tient pas dans le delai de grace avant l'arret du lanceur. L'hote peut rester a mi-parcours (version precedente ${PRECEDENT:-previous-sha} enregistree). Remise manuelle : $outil, puis controler. Trace : $JOURNAL"
-    echo "staging arrete par la surveillance (retour non tente)" >&2
+    # #4616 : apres une migration non additive, aucun retour de code n'est
+    # lance (l'ancien code est dangereux sur la base migree) : la marche
+    # manuelle existante, rollback SQL d'abord, reste le seul chemin.
+    if [ "$SANS_RETOUR" = 1 ]; then
+      retour_desactive "$hote" "${etape_ouverte:-surveillance}" \
+        "arret demande par la surveillance de progression" ""
+    fi
+    # L'etat reste dans le worktree, que le superviseur conserve jusqu'a la
+    # fin du retour ; aucun secret n'y est ecrit.
+    ( umask 077; printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$hote" "${etape_ouverte:-surveillance}" "${PRECEDENT:-}" \
+        "$outil" "$JOURNAL" "$SHA" > "$DEPOT/.retour-apres-arret" ) \
+      || echo "etat de retour non ecrit dans $DEPOT" >&2
+    if [ "$ECHEC_EN_COURS" = 1 ]; then
+      detail="arret demande par la surveillance de progression ; retour d'echec interrompu, confie au superviseur (hors groupe, borne)"
+    else
+      detail="arret demande par la surveillance de progression ; retour automatique confie au superviseur (hors groupe, borne)"
+    fi
+    trace "$hote" "${etape_ouverte:-surveillance}" ko "$detail"
+    echo "staging arrete par la surveillance (retour confie au superviseur)" >&2
     exit 1
   fi
   echo "staging arrete par la surveillance (aucune etape d'hote ouverte)" >&2
