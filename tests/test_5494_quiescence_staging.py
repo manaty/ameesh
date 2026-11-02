@@ -114,6 +114,24 @@ class QuiescenceTest(unittest.TestCase):
                 self.assertEqual([a.split("\t")[0] for a in alertes], ["mesh-design", "bureau"])
                 self.assertIn("Aucune mutation", alertes[0])
 
+    def test_alerte_par_defaut_avec_le_python_du_venv_de_lexecutant(self):
+        # B1 (docs-01): without QUIESCENCE_NOTIFIER, the mail goes through the
+        # executing account's stable venv, never the python3 of the unit PATH.
+        venv = self.root / ".local/share/ameesh/venv/bin"
+        venv.mkdir(parents=True)
+        (venv / "python").write_text(
+            '#!/usr/bin/env bash\n'
+            'if [ "$1" = - ]; then cat > /dev/null; printf "%s\\n" "$2" >> "$FAUX/python"; fi\n')
+        (venv / "python").chmod(0o755)
+        (self.faux / "root@10.77.0.3.rc").write_text("255")
+        env = dict(self.env, PATH="/usr/bin:/bin")
+        env.pop("QUIESCENCE_NOTIFIER")
+        res = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(res.returncode, 1)
+        self.assertNotIn("non remise", res.stderr)
+        self.assertEqual((self.faux / "python").read_text().split(), ["mesh-design", "bureau"])
+
     def test_hote_precedent_injoignable_bloque_sans_contacter_les_cibles(self):
         (self.faux / "root@10.77.0.3.rc").write_text("255")
         res = self.sonde()
@@ -210,6 +228,11 @@ class QuiescenceTest(unittest.TestCase):
         self.assertIn("session 192.0.2.7 ?", res.stderr)
         # on the remote VMs the stubbed ssh answered for (b)
         self.assertEqual(len(self.appels()), 8)
+        # B2 (docs-01): a failing ss proves nothing
+        (self.bin / "ss").write_text("#!/usr/bin/env bash\nexit 1\n")
+        res = self.sonde(STAGING_PREVIOUS_RUN="ab12d0", **env)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("ss en echec", res.stderr)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,9 @@ BASCULE_ENV=${BASCULE_ENV:-$HOME/.config/ameesh/bascule.env}
 TRAVAIL=${QUIESCENCE_TRAVAIL:-$HOME/.local/state/ameesh/mise-a-jour}
 SSH=${QUIESCENCE_SSH:-ssh}
 DELAI=${QUIESCENCE_DELAI:-60}
+#: venv stable du compte qui execute l'unite (comme py_sequence de staging.sh) :
+#: le PATH de l'unite n'a pas de python qui importe ameesh.
+PYTHON=${QUIESCENCE_PYTHON:-$HOME/.local/share/ameesh/venv/bin/python}
 
 refus() {  # raison : trace, alerte (une par run et raison), code 1
   local raison=$1
@@ -73,7 +76,7 @@ alerter() {
     if [ -n "${QUIESCENCE_NOTIFIER:-}" ]; then
       "$QUIESCENCE_NOTIFIER" "$dest" "staging : quiescence non prouvee ($PRECEDENT)" "$corps" || return 1
     else
-      python3 - "$dest" "staging : quiescence non prouvee ($PRECEDENT)" "$corps" <<'PY' || return 1
+      "$PYTHON" - "$dest" "staging : quiescence non prouvee ($PRECEDENT)" "$corps" <<'PY' || return 1
 import sys
 from ameesh import config, db, mail, work
 dest, sujet, corps = sys.argv[1:4]
@@ -100,9 +103,23 @@ var_de() {  # prefixe hote → nom de variable (pc-smichea → PREFIXE_PC_SMICHE
   printf '%s%s\n' "$1" "$(printf '%s' "$2" | tr 'a-z.-' 'A-Z__')"
 }
 
+# Hote courant : meme ordre que hote_courant() de staging.sh.
 if [ -n "${HOTE_LOCAL:-}" ]; then COURANT=$HOTE_LOCAL
 elif [ -n "${AMEESH_HOST:-}" ]; then COURANT=$AMEESH_HOST
-else COURANT=$(hostname -s); fi
+elif [ -n "${AGENT_MESH_HOST:-}" ]; then COURANT=$AGENT_MESH_HOST
+else
+  CONFIG_HOTE=${AMEESH_CONFIG:-${AGENT_MESH_CONFIG:-$HOME/.config/ameesh/config.json}}
+  COURANT=$("$PYTHON" -c 'import json, sys
+try:
+    hote = json.load(open(sys.argv[1], encoding="utf-8")).get("host")
+except (OSError, ValueError, AttributeError):
+    raise SystemExit(1)
+if not isinstance(hote, str) or not hote.strip():
+    raise SystemExit(1)
+print(hote.strip())' "$CONFIG_HOTE" 2>/dev/null) || COURANT=""
+  [ -n "$COURANT" ] || COURANT=$(hostname -s 2>/dev/null || hostname)
+fi
+COURANT=${COURANT,,}
 
 # --- topologie (meme regle que staging.sh) --------------------------------
 declare -A CIBLE=()
@@ -207,8 +224,12 @@ if [ "$#" -gt 0 ]; then
   read -r moi_ip moi_port _ <<< "${SSH_CONNECTION:-- -}"
   if ! command -v ss >/dev/null 2>&1; then
     printf "illisible\tss absent\n"
+  elif ! sessions=$(ss -Htnp state established "( sport = :22 )" 2>/dev/null); then
+    # Un ss en echec ne prouve aucune absence de session.
+    printf "illisible\tss en echec\n"
   else
-    ss -Htnp state established "( sport = :22 )" 2>/dev/null | while read -r _ _ _ pair proc; do
+    printf "%s\n" "$sessions" | while read -r _ _ _ pair proc; do
+      [ -n "$pair" ] || continue
       port=${pair##*:} ip=${pair%:*}; ip=${ip#[}; ip=${ip%]}; ip=${ip#::ffff:}
       [ -n "${connue[$ip]:-}" ] || continue
       [ "$ip" = "$moi_ip" ] && [ "$port" = "$moi_port" ] && continue
