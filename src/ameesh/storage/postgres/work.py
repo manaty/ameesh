@@ -153,7 +153,7 @@ def has_migration_slots(db) -> bool:
 
 
 #: #5404 : les colonnes optionnelles lues par `item_columns` et `work.get`.
-_OPTIONAL_ITEM_COLUMNS = ("reviewers", "external_executor", "wake_at", "legacy_state",
+_OPTIONAL_ITEM_COLUMNS = ("reviewer", "reviewers", "external_executor", "wake_at", "legacy_state",
                           "workflow_ref", "workflow_stage", "workflow_version")
 
 

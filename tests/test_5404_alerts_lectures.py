@@ -6,6 +6,7 @@ from unittest import mock
 from ameesh import canon, db as db_mod
 from ameesh.modules.dev import lot_class
 from ameesh.storage.postgres import operations, roadmap, work, work_dependencies
+from tests.support import PgTestCase
 
 
 class SqlSansLigneEntiere(unittest.TestCase):
@@ -61,6 +62,34 @@ class SqlSansLigneEntiere(unittest.TestCase):
         sql, params = rows[0]
         self.assertEqual(sql.count("%s"), len(params))
         self.assertEqual(params, ("a", "b", "a", "b", 12.0, "p", "p", 3))
+
+
+class ReplisDeLActivite(PgTestCase):
+    """Le SQL de repli s'exécute : un remplacement qui le corrompt n'a pas
+    d'autre témoin, le schéma des tests étant à jour."""
+
+    def lire(self, lecture):
+        vus = []
+        vrai = self.db.query
+
+        def query(sql, params=()):
+            vus.append(sql)
+            return vrai(sql, params)
+
+        with mock.patch.object(operations, "has_current_item_columns", return_value=False), \
+                mock.patch.object(self.db, "query", query):
+            lecture(operations.Operations(self.db))
+        return vus[-1]
+
+    def test_repli_de_l_activite_valide_et_sans_colonne_directe(self):
+        for lecture in (lambda o: o.open_lots_activity(5),
+                        lambda o: o.state_lots_activity("merged", 5),
+                        lambda o: o.state_lots_activity("promoted", 5),
+                        lambda o: o.build_lots_activity(5)):
+            sql = self.lire(lecture)
+            for colonne in ("w.legacy_state", "w.reviewer", "w.external_executor",
+                            "w.wake_at", "w.workflow_ref"):
+                self.assertNotIn(colonne, sql)
 
 
 class Copie(unittest.TestCase):

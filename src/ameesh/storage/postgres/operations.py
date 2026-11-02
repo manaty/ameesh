@@ -543,19 +543,23 @@ class Operations(interface.Operations):
         # §4 : `returned_to_queue` distingue un lot `build` RENDU à la file
         # (limite d'en-cours) d'un lot en cours sans assigné (prérequis,
         # travail confié par courrier) — voir `work.requeued_sql`.
-        sql = (self._LOTS_ACTIVITY
-               .replace("__RETURNED__", f"(w.state = '{lifecycle.IN_PROGRESS}' AND "
-                        + requeued_sql("w") + ") AS returned_to_queue,")
-               .replace("__WHERE__", where))
+        sql = self._LOTS_ACTIVITY
         # #5404 : lecture directe, repli seulement sur un schéma en retard
-        # (fenêtre de migration, `work.has_current_item_columns`).
+        # (fenêtre de migration, `work.has_current_item_columns`). Avant
+        # `__WHERE__` : le prédicat de l'appelant porte son propre repli.
         if not has_current_item_columns(self.db):
             for direct, repli in (
                     ("w.legacy_state,", "to_jsonb(w)->>'legacy_state' AS legacy_state,"),
+                    ("w.reviewer,", "coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer,"),
                     ("w.external_executor,", "to_jsonb(w)->>'external_executor' AS external_executor,"),
+                    ("extract(epoch from w.wake_at)",
+                     "extract(epoch from (to_jsonb(w)->>'wake_at')::timestamptz)"),
                     ("to_jsonb(w.reviewers)", "to_jsonb(w)->'reviewers'"),
                     ("w.workflow_ref", "to_jsonb(w)->>'workflow_ref'")):
                 sql = sql.replace(direct, repli)
+        sql = (sql.replace("__RETURNED__", f"(w.state = '{lifecycle.IN_PROGRESS}' AND "
+                           + requeued_sql("w") + ") AS returned_to_queue,")
+               .replace("__WHERE__", where))
         return self.db.query(sql, REQUEUED_PARAMS + tuple(params))
 
     def open_lots_activity(self, limit) -> list[dict]:
@@ -564,7 +568,9 @@ class Operations(interface.Operations):
             (int(limit) if limit is not None else None,))
 
     def state_lots_activity(self, state, limit) -> list[dict]:
-        predicate = ("coalesce(w.legacy_state, w.state) = %s"
+        legacy = ("w.legacy_state" if has_current_item_columns(self.db)
+                  else "to_jsonb(w)->>'legacy_state'")
+        predicate = ("coalesce(%s, w.state) = %%s" % legacy
                      if state in ("merged", "promoted") else "w.state = %s")
         return self._lots_activity(
             predicate,
@@ -575,9 +581,11 @@ class Operations(interface.Operations):
         activité (même calcul qu'`open_lots_activity`) — la lecture dédiée du
         balayage de la limite d'en-cours, sans le plafond global des lots
         ouverts."""
+        legacy = ("w.legacy_state" if has_current_item_columns(self.db)
+                  else "to_jsonb(w)->>'legacy_state' AS legacy_state")
         return self.db.query(
             f"""
-            SELECT w.id, w.title, w.state, w.legacy_state, w.assignee, w.package_id, w.type,
+            SELECT w.id, w.title, w.state, {legacy}, w.assignee, w.package_id, w.type,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
