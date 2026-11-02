@@ -1485,6 +1485,12 @@ class ReturnAfterStopTest(unittest.TestCase):
             "ameesh-agents-2\tinstaller\t0123456789abcdef\t"
             "vm.sh agents retour\t/tmp/journal.jsonl\t" + "a" * 40 + "\n")
         self.env = dict(os.environ)
+        # #5478: several tests call _return_after_stop directly; the return
+        # then settles its units. Never read the runner's real
+        # `systemctl --user`, unreadable in CI (drop=False, test red).
+        patch = mock.patch.object(release_cutoff, "_poste_units", return_value=[])
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def write(self, body):
         self.script.write_text("#!/usr/bin/env bash\n" + body + "\n")
