@@ -123,6 +123,12 @@ ameesh budget set --account deepseek-manaty --per-day 100 --tz Europe/Paris
   stale/forged one, another exit code, a signal, one stream line, a usage
   record, or a configured `stream = "text"` descriptor that is not one of the
   qualified families.
+  A failed rotation summary waits before the next attempt (1, 2, 4 min…, at
+  most 30 min). After 3 failures, the session rotates on a deterministic brief
+  with no model call, so a looping harness keeps only a few reservations. Two
+  alerts report kept reservations: `reservations_kept_burst` (5 or more for one
+  agent in 30 min) and `account_cap_kept` (an account blocked by its cap, with
+  kept reservations making up at least 25 % of it).
   A turn can cost more than its reservation; the excess is counted in full
   and blocks the next turns. The cap can therefore be exceeded by at most the
   excess of the turns running at that moment.

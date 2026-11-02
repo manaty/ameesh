@@ -96,9 +96,6 @@ def main() -> int:
               '(choices: "acceptEdits", "auto", "bypassPermissions", "manual", '
               '"dontAsk", "plan")'))
         return 0
-    refus = _refuse()
-    if refus is not None:
-        return refus
     log = os.environ.get("AMEESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:
@@ -120,6 +117,11 @@ def main() -> int:
                     # #2772 : le PATH et le venv vus par le tour
                     "PATH", "VIRTUAL_ENV")},
             }) + "\n")
+    # #5529 : refus AVANT toute ligne de flux ; #5503 : après la trace du
+    # tour (AMEESH_TEST_LOG), pour que le banc compte les tours refusés
+    refus = _refuse()
+    if refus is not None:
+        return refus
     if os.environ.get("AMEESH_TEST_MAKE_TMP"):
         # L73 : un tour qui laisse des fichiers dans son TMPDIR et une entrée
         # dans le /tmp du système (chemin donné), comme un clone de relecture
