@@ -183,7 +183,8 @@ def state(db, lot: int) -> dict:
 
 
 def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None = None,
-         exception: str = "", reason: str = "", wait: float | None = None) -> dict:
+         exception: str = "", reason: str = "", wait: float | None = None,
+         cfg=None) -> dict:
     """Donne le feu du pilote sur la tête gelée `sha` du lot (jalon `fire`).
 
     Refuse un lot terminé, un lot non gelé, un `sha` qui n'est pas un commit,
@@ -211,14 +212,14 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
         except pilot_gesture.GestureRefused as exc:
             raise FireError(str(exc)) from exc
         return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo,
-                            exception=exception, reason=reason, fence=fence)
+                            exception=exception, reason=reason, fence=fence, cfg=cfg)
     finally:
         _unlock(handle)
 
 
 def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
                  repo: str | None = None, exception: str = "",
-                 reason: str = "", fence=None) -> dict:
+                 reason: str = "", fence=None, cfg=None) -> dict:
     item = work.get(db, lot)
     if item is None:
         raise FireError("lot #%d not found" % lot)
@@ -261,7 +262,7 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
         try:
             packet_guard.check_merge(database, lot, item.get("branch") or "", target,
                                      frozen, exception=exception, reason=reason,
-                                     actor=actor)
+                                     actor=actor, repo=repo or "", cfg=cfg)
         except packet_guard.PacketGuardError as exc:
             raise FireError(str(exc)) from exc
 
@@ -2744,7 +2745,8 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     # déclaration d'exception est relue au journal du lot ; un refus désarme
     # une auto-fusion résiduelle (`_not_ready`) avant toute PR ou file.
     try:
-        packet_guard.check_merge(db, lot, branch, target, _norm(fire.get("sha")))
+        packet_guard.check_merge(db, lot, branch, target, _norm(fire.get("sha")),
+                                 repo=slug or work_repo or "", cfg=cfg)
     except packet_guard.PacketGuardError as exc:
         return _not_ready(db, row, status, out, str(exc), gh=gh, slug=slug,
                           dry_run=dry_run, handle=handle)
@@ -3254,7 +3256,7 @@ def run(cfg, db, args) -> int:
                 return 1
         if args.sha:
             row = give(db, args.id, sha=args.sha, actor=actor, note=args.note, repo=repo,
-                       exception=args.exception or "", reason=args.reason or "")
+                       exception=args.exception or "", reason=args.reason or "", cfg=cfg)
             print("fire given to lot #%d on %s (by %s)" % (args.id, row["sha"][:12], actor))
             results = run_pass(cfg, db, only_lot=args.id, repo=repo)
         elif args.withdraw:
