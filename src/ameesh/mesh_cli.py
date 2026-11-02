@@ -3004,7 +3004,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             row = work.milestone(
                 db, args.id, args.kind, sha=sha, actor=args.actor or "",
                 verdict=args.verdict, note=note, outcome=outcome, repo=args.repo,
-                supersedes=args.supersedes or None)
+                supersedes=args.supersedes or None,
+                # #5481 : le report des verdicts (#2442) est évalué avant
+                # toute désignation ; un regel d'adaptation de test ne dépose
+                # aucun courrier de relecture avant sa preuve.
+                defer_designation=(args.kind == "frozen"))
             print(('milestone %s added to %s #%d%s') % (row["kind"], v.noun, args.id, " (%s)" % row["verdict"] if row.get("verdict") else ""))
             if row.get("verdict") == "blocked":
                 # #3416 : le relecteur désigné qui bloque corrige souvent
@@ -3027,19 +3031,53 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         print("warning: %s" % line, file=sys.stderr)
                 # #2442 : un réalignement mécanique sur la cible garde les
                 # verdicts de la tête relue ; sinon l'exécuteur retente.
+                # #5481 : la désignation a été différée ; le report passe
+                # d'abord, avec le dépôt fourni au gel (`--repo`), puis la
+                # désignation seulement s'il refuse. Le report immédiat évite
+                # le `no-repository` d'un hôte sans réglage radar (branche
+                # `review/...` publiée) et les courriers avant preuve.
                 from . import verdict_carry
-                carried = verdict_carry.carry(cfg, db, args.id)
+                deferred = bool(outcome.get("deferred"))
+                carried = outcome.get("carry")
+                carry_repo = verdict_carry._repo_path(args.repo) if args.repo else None
+                if deferred or carried is None:
+                    carried = verdict_carry.carry(cfg, db, args.id, repo=carry_repo)
+                    outcome["carry"] = carried
+                if carried["result"] == "carried" and not outcome.get("reviewers"):
+                    try:
+                        shown = (activation.reviewers(cfg, db, args.id)
+                                 .get("designation") or {})
+                    except Exception:  # noqa: BLE001 - le gel est écrit
+                        shown = {}
+                    if shown:
+                        outcome.clear()
+                        outcome.update(shown)
                 if carried["result"] != "idle":
                     print(verdict_carry.describe(carried))
-                # #2487 : la désignation s'est abstenue sur le plan du report.
-                # Si le report refuse finalement, les sièges manquants sont
-                # désignés maintenant, hors du gel, sans attendre un passage.
-                # `busy`/`moved` ne sont pas des refus : un autre hôte porte le
-                # report ou le gel a bougé, la désignation attend.
-                if outcome.get("state") == "carried" \
-                        and carried.get("result") in ("not-carried", "no-repository",
-                                                      "error", "idle"):
-                    outcome = activation.designate(cfg, db, args.id, force=True)
+                # #2487/#5481 : si le report refuse finalement, les sièges
+                # manquants sont désignés maintenant. Un plan de report encore
+                # complet (le report a échoué pour une autre raison) force la
+                # désignation réelle ; un plan partiel laisse `designate`
+                # écarter les verdicts déjà reportés. `busy`/`moved` ne sont
+                # pas des refus : un autre hôte porte le report ou le gel a
+                # bougé, la désignation attend.
+                failures = ("not-carried", "no-repository", "error", "idle")
+                partial = bool(carried.get("refused"))
+                if not outcome.get("same_head") and (
+                        (deferred and (carried["result"] in failures or partial))
+                        or (outcome.get("state") == "carried"
+                            and (carried["result"] in failures or partial))):
+                    plan = activation.carried_plan(cfg, db, args.id, sha,
+                                                   repo=carry_repo)
+                    force = bool(plan and not plan.get("refused"))
+                    # #5481 : la reprise de l'exécuteur peut constater le même
+                    # report refusé ; le bail du lot sérialise les deux gestes.
+                    outcome = activation.designate_deferred(
+                        cfg, db, args.id,
+                        {"id": int(row.get("id") or 0),
+                         "sha": str(row.get("sha") or ""),
+                         "at_ts": row.get("at_ts")},
+                        force=force)
                     print("review designation after the carry refused: %s"
                           % (outcome.get("state") or "?"))
             state = str(outcome.get("state") or "")
@@ -3066,6 +3104,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # #2561: a light lot has no pre-merge reviewer; say why instead
                 # of printing nothing and letting "no reviewer" look like a failure
                 print("review: none — %s" % (outcome.get("why") or ""))
+            elif state == "deferred":
+                # #5481 : le report n'a pas conclu (hôte occupé ou gel déplacé) ;
+                # l'exécuteur reprend, la désignation attend son issue.
+                print("review pending: verdict report not concluded; designation "
+                      "deferred (#5481)")
             if args.kind == "frozen":
                 # #2644 : le résultat de prévalidation s'attache au gel, après
                 # le jalon et la désignation. Il ne défait jamais le gel : le

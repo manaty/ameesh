@@ -70,7 +70,10 @@ AUTH_TYPES = ("agent", "terminal")
 #: clés connues sous `ameesh`
 AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "interactive",
                "interactive_permission", "session", "stream", "env", "model", "effort", "tier", "hooks",
-               "cost", "permissions", "acp", "accounts", "install", "resident", "backup")
+               "cost", "permissions", "acp", "accounts", "install", "resident", "backup", "refusal")
+#: #5529 : contrat de preuve de refus avant tout appel fournisseur
+REFUSAL_SCHEMAS = ("ameesh-refusal/1",)
+REFUSAL_KEYS = ("schema", "exit_code")
 #: known keys of `ameesh.interactive_permission` (L223: permission mode of an
 #: interactive session, `ameesh attach` and `ameesh chat`); `modes` maps a mode
 #: to fixed arguments for a harness whose flag carries no `{mode}` (L685: codex
@@ -179,6 +182,8 @@ class HarnessDescriptor:
     session_files: tuple[str, ...] = ()
     #: L75: normalized `ameesh.resident` block ({} = one turn per event)
     resident: Mapping[str, Any] = field(default_factory=dict)
+    #: #5529: normalized `ameesh.refusal` block ({} = no proof contract)
+    refusal: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def paid_per_token(self) -> bool:
@@ -922,7 +927,48 @@ def validate(document: Any, *, path: str = "") -> list[Finding]:
                                             "`ameesh.accounts.%s`: non-empty text expected" % key,
                                             path))
     findings.extend(_check_resident(ameesh.get("resident"), protocol, path))
+    findings.extend(_check_refusal(ameesh.get("refusal"), path))
     return findings
+
+
+def _check_refusal(value: Any, path: str) -> list[Finding]:
+    """`ameesh.refusal` (#5529): the contract by which a harness proves that it
+    refused a turn before any provider request. `schema` is one of
+    `REFUSAL_SCHEMAS`; `exit_code` is the clean exit code reserved for that
+    proof (1..125, never 0/126/127). The runner only honours a proof from the
+    three qualified families (`refusal.QUALIFIED`), so a descriptor that
+    declares this block on a configured `text` command is valid but stays
+    unqualified."""
+    if value is None:
+        return []
+    if not isinstance(value, dict):
+        return [Finding("harness-refusal-invalid", ERROR,
+                        "`ameesh.refusal`: object expected", path)]
+    findings = []
+    for key in value:
+        if key not in REFUSAL_KEYS:
+            findings.append(Finding("harness-key-unknown", WARNING,
+                                    "`ameesh.refusal.%s`: unknown key (ignored)"
+                                    % key, path))
+    schema = value.get("schema")
+    if schema not in REFUSAL_SCHEMAS:
+        findings.append(Finding("harness-refusal-invalid", ERROR,
+                                "`ameesh.refusal.schema`: %s expected"
+                                % " | ".join(REFUSAL_SCHEMAS), path))
+    code = value.get("exit_code")
+    if isinstance(code, bool) or not isinstance(code, int) or not 1 <= code <= 125:
+        findings.append(Finding("harness-refusal-invalid", ERROR,
+                                "`ameesh.refusal.exit_code`: an integer from 1 to 125 "
+                                "expected", path))
+    return findings
+
+
+def _refusal(value: Any) -> dict:
+    """The normalized form of `ameesh.refusal` ({} when absent or invalid)."""
+    if not isinstance(value, dict) or errors(_check_refusal(value, "")):
+        return {}
+    return {"schema": value["schema"], "exit_code": int(value["exit_code"])}
+
 
 
 def _check_resident(value: Any, protocol: Any, path: str) -> list[Finding]:
@@ -1268,6 +1314,7 @@ def _build(document: dict, path: str, source: str) -> HarnessDescriptor:
             if isinstance(f, str))
         if isinstance(ameesh.get("backup"), dict) else (),
         resident=_resident(ameesh),
+        refusal=_refusal(ameesh.get("refusal")),
     )
 
 
