@@ -795,6 +795,17 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     return "\n".join(lines)
 
 
+def _vehicle_why(item: dict) -> str:
+    """#4747 : la raison pour laquelle un véhicule de paquet n'a pas de relecture
+    après fusion, ou "" si la ligne n'en est pas un."""
+    from . import packet_reviews
+    if not packet_reviews.is_vehicle(item):
+        return ""
+    return ("véhicule de paquet (%s) : les avis portent sur les membres "
+            "(§12) — pas de relecture après fusion"
+            % (item.get("branch") or "integration/**"))
+
+
 def _review_recursion(item: dict) -> str:
     """Garde anti-récursion (#1280 B2) : rendre la raison si `item` est
     lui-même un avis, "" sinon. Un avis n'a ni code ni fusion à relire."""
@@ -1044,11 +1055,9 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     # son éventuel delta de résolution a passé la porte avant la fusion (§12).
     # Lui ouvrir une relecture dépensait un tour de relecteur par paquet léger
     # fusionné (#4742 ouvert sur le porteur #4739).
-    from . import packet_reviews
-    if packet_reviews.is_vehicle(item):
-        out["why"] = ("véhicule de paquet (%s) : les avis portent sur les membres "
-                      "(§12) — pas de relecture après fusion"
-                      % (item.get("branch") or "integration/**"))
+    vehicle = _vehicle_why(item)
+    if vehicle:
+        out["why"] = vehicle
         return out
     ref = ref_of(lot)
     ops = storage.of(db).work
@@ -1515,6 +1524,12 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
         if recursion:
             out["why"] = recursion
             return out
+        # #5460 : avant la classe — le gel d'un véhicule ne se situe pas dans la
+        # fusion, et ce doute partait en constat aux pilotes à chaque paquet.
+        vehicle = _vehicle_why(item)
+        if vehicle:
+            out["why"] = vehicle
+            return out
         existing = _open(storage.of(db).work, ref_of(lot))
         if existing is not None:
             out.update({"id": int(existing["id"]),
@@ -1830,6 +1845,14 @@ def catch_up(db, *, repo: str = "", target: str = "",
             # la sélection a exclu les pourvus ; le recontrôle couvre une
             # ouverture concurrente entre la sélection et ici
             if _open(ops, ref_of(lot)) is not None:
+                continue
+            # #5460 : un véhicule de paquet n'a aucune relecture due. Marque
+            # terminale sur tout hôte, clone ou non : le fait est sur la ligne,
+            # et le candidat ne consomme plus la borne `limit` des balayages.
+            vehicle = _vehicle_why(row)
+            if vehicle:
+                out["terminal"] += 1
+                close_terminal(lot, state, vehicle)
                 continue
             out["missing"] += 1
             # #3426 : sans dépôt candidat sur cet hôte, rien n'est tenté ni
