@@ -336,13 +336,17 @@ def inspect(cfg, db, project, *, now: float) -> dict:
 
 def apply(cfg, db, project, *, now: float, actor=None) -> dict:
     """Pilot/bureau gesture: the usual staging script, no version or tag."""
-    from . import release_cutoff as rc, work
+    from . import release_cutoff as rc, staging_watch, work
     work.corrector(cfg, db, actor, what="staging", history=False)
     started = time.monotonic()
     # Nonblocking lease: never wait through a cutoff then use an old plan.
     key = rc.land.lock_key(project, project.target)
     owner = "staging:" + rc.uuid.uuid4().hex
-    ttl = max(project.lock_ttl_s, project.staging_timeout_s + rc.STAGING_UNIT_GRACE_S
+    # #5450: the global fallback is still followed by the operator delay
+    # before the stop, then by the normal failure path and its unit grace.
+    ttl = max(project.lock_ttl_s,
+              project.staging_timeout_s + staging_watch.STOP_AFTER_ALERT_S
+              + rc.STAGING_UNIT_GRACE_S
               + rc.STAGING_KILL_GRACE_S + rc.STAGING_DRAIN_S)
     epoch = storage.of(db).work.land_lock(key, owner, ttl)
     if epoch is None:

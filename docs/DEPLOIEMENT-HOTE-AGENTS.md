@@ -546,7 +546,7 @@ la commande refuse — aucun repli sur une heure locale.
       "target": "main",
       "github": "manaty/ameesh",
       "report": "smichea",
-      "staging_timeout_s": 7200
+      "staging_timeout_s": 39600
     }
   }
 }
@@ -692,9 +692,55 @@ de tour (`STAGING_PLAFOND_TOUR_S`, 1800 s) plus cette marge, réduite à
 `STAGING_SILENCE_S` une fois passée l'échéance de l'hôte :
 `STAGING_BASE_HOTE_S` (900 s) + runners × plafond de tour. Le redémarrage du
 poste ne signale pas ses runners : seule cette échéance le juge
-(`STAGING_RUNNERS_DEFAUT`, 20). `STAGING_TIMEOUT_S` (7200 s) ne juge plus qu'un
-lanceur antérieur au battement ; il reste la borne d'arrêt de la release
-synchrone (`run_staging`), qui ne passe pas par l'exécutant élu.
+(`STAGING_RUNNERS_DEFAUT`, 20). Ce budget par hôte (10 h 15 avec 20 runners)
+reste un **seuil d'alerte**, jamais une borne d'arrêt.
+
+Une seule fonction de surveillance (#5450), `staging_watch.Monitor`, lit ce
+même verdict dans les deux lanceurs : l'exécutant élu
+(`staging_executor`) et la release synchrone (`run_staging`). Elle n'arrête
+la séquence que si `overdue()` rend encore une raison **15 min après la
+première alerte** : l'opérateur voit ainsi l'alerte avant le geste. L'arrêt
+est un TERM au groupe, puis un KILL après 5 min. Le piège TERM de
+`staging.sh` **ne tente pas** le retour dans cette fenêtre : un retour refait
+son redémarrage glissant (jusqu'à 30 min par hôte) et ne tiendrait pas dans la
+grâce. Il écrit dans le worktree conservé l'étape ouverte
+(`.retour-apres-arret` : hôte, étape, `previous-sha`, outil, journal) et
+s'arrête. Son `EXIT` ne publie **aucun état terminal** : le snapshot partagé
+`staging.sequence` reste `running`, ce qui tient la garde
+(`staging_watch.in_flight`) même quand son flock local tombe avec le
+processus ; un second démarrage est refusé tant que le superviseur n'a pas
+publié `failed`. Le même chemin s'applique à un TERM hors superviseur (arrêt
+systemd de l'unité, `kill` d'un lancement manuel) : le snapshot reste
+`running` et la trace dit « arrêt demandé par la surveillance » même si aucune
+surveillance ne l'a jugé ; l'opérateur prouve alors l'arrêt des unités et du
+retour, puis reprend avec `STAGING_PREVIOUS_RUN`. Le superviseur qui a tué le
+groupe (`staging_executor.tick` ou
+`run_staging`) attend/arrête d'abord les unités
+`poste-maj-staging-<pid>-*` survivantes, puis rejoue le retour comme une
+**étape à part, hors du groupe tué** (`staging.sh --retour-sur-arret`) :
+`retour` puis `controler`, garde du staging et worktree tenus jusqu'à
+« retour ok » ou l'échec. Sa borne est sa propre durée
+(`return_timeout_s`, 30 min) et le temps restant avant le
+`TimeoutStartSec=11h30` des unités (`service_timeout_s`, 41400 s) ; il ne
+tente pas le retour s'il reste moins d'une minute. Un retour en échec, hors
+délai, ou un superviseur tué par systemd fait remettre au pilote la marche
+manuelle (`vm.sh agents retour`, `poste.sh retour`), l'hôte restant sur son
+`previous-sha` ; la garde n'est libérée et l'échec publié qu'après. La release
+synchrone (`run_staging`) ne publie `failed` qu'après la même preuve ; sinon
+elle laisse le snapshot `running` et son `TransientReleaseError` nomme la
+garde conservée. Un arrêt
+demandé sous `--sans-retour` (migration non additive) ne lance aucun retour :
+le courrier existant donne le rollback SQL d'abord, puis la remise de code.
+La raison d'`overdue()` est enregistrée dans la demande et le snapshot
+`staging.sequence` ; aucun « remis » n'est écrit sans trace `retour ok`.
+
+`STAGING_TIMEOUT_S` (39600 s, 11 h) devient le **secours global** d'un
+lanceur qui ne publie aucun battement ; il ne juge plus une séquence qui bat.
+Les unités `ameesh-release`, `ameesh-release-nexlink` et `ameesh-staging`
+sont bornées à `TimeoutStartSec=11h30min`, sous les 12 h entre deux coupures :
+une séquence figée ne chevauche jamais la coupure suivante. Le plancher de
+`STAGING_BATTEMENT_S` est de 1 s (une valeur plus petite refuse la séquence
+avant toute mutation).
 
 La passe ordinaire d'alertes lit ces événements depuis la base : un lanceur
 tué, figé ou privé de réseau n'a pas besoin de survivre pour que le retard soit
@@ -719,8 +765,10 @@ et `.timer` sur **chaque candidat**, avec une configuration privée
   "target": "origin/main",
   "bascule_env": "/chemin/prive/bascule.env",
   "arguments": ["--sans-poste"],
-  "timeout_s": 7200,
+  "timeout_s": 39600,
   "start_timeout_s": 300,
+  "return_timeout_s": 1800,
+  "service_timeout_s": 41400,
   "quiescence_probe": ["/chemin/prive/prouver-arret-staging"]
 }
 ```

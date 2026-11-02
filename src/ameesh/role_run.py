@@ -358,6 +358,8 @@ class _AlertsExecution:
         self.lost = threading.Event()
         self.stopped = threading.Event()
         self.stop = threading.Event()
+        #: #5450: why a monitor stopped the child (None for a lost lease)
+        self.stop_reason = None
         self.thread = threading.Thread(target=self._watch,
                                        name="alerts-deadline", daemon=True)
 
@@ -403,6 +405,26 @@ class _AlertsExecution:
         if proc is not None:
             _stop_child(proc, self.lease.kill_grace, pgid=pgid)
 
+    def halt(self, reason: str, *, grace: float | None = None) -> None:
+        """#5450: stop on a monitored failure, not on a lost lease.
+
+        The caller keeps the lease; `lost` stays clear, so the failure is
+        recorded as the sequence's own (with `reason`), not as an interrupted
+        attempt to recover. A longer grace than the lease stop lets the
+        launcher trace the open host/step and mail the manual rollback; the
+        rollback itself is not attempted inside this grace.
+        """
+        with self.lock:
+            if self.stopped.is_set():
+                return
+            self.stopped.set()
+            self.stop_reason = str(reason)[:300]
+            proc = self.proc
+            pgid = self.pgid
+        if proc is not None:
+            _stop_child(proc, self.lease.kill_grace if grace is None else grace,
+                        pgid=pgid)
+
 
 def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
                         stop: threading.Event) -> None:
@@ -428,7 +450,9 @@ def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
 
 
 def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease,
-                     execution: _AlertsExecution, *, watch: bool = True) -> tuple[int, bool]:
+                     execution: _AlertsExecution, *, watch: bool = True,
+                     monitor=None, interval: float = 1.0,
+                     stop_grace: float | None = None) -> tuple[int, bool]:
     """Run the child while the shared lease is held and renewed.
 
     Returns ``(exit code, lost)``. The caller releases the lease after closing
@@ -439,6 +463,12 @@ def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease,
     ``watch=False`` lets a caller that already renews the lease for a wider
     span (a pre-launch phase of its own) keep ONE renewal thread, instead of
     racing two renewals over the same epoch (#4898 N1).
+
+    #5450: ``monitor`` is polled while the child runs; the first non-empty
+    reason is a monitored failure, not a lost lease. `execution.halt` stops
+    the whole group and leaves the reason on `execution.stop_reason`; the
+    caller records it. ``stop_grace`` is the launcher's normal failure path
+    before SIGKILL, not the short lease-stop grace.
     """
     proc = execution.start_child(argv, env)
     if proc is None:
@@ -451,7 +481,22 @@ def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease,
                                    name="alerts-lease", daemon=True)
         watcher.start()
     try:
-        code = int(proc.wait())
+        if monitor is None:
+            code = int(proc.wait())
+        else:
+            while True:
+                try:
+                    code = int(proc.wait(timeout=max(0.01, interval)))
+                    break
+                except subprocess.TimeoutExpired:
+                    try:
+                        reason = monitor()
+                    except Exception:  # noqa: BLE001 - never leak the child
+                        # A broken monitor is not a stop proof; the caller's
+                        # service unit remains the last resort.
+                        reason = None
+                    if reason:
+                        execution.halt(reason, grace=stop_grace)
     finally:
         stop.set()
         # No timeout: releasing while the watcher still uses the connection
