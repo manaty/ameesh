@@ -539,8 +539,9 @@ def non_additive(migration: Migration) -> list[str]:
     reasons = []
     if _MARKER.search(migration.sql):
         reasons.append("marked non-additive")
-    # commentaires retirés : une explication qui cite « drop » ne compte pas
-    text = re.sub(r"--[^\n]*", " ", migration.sql)
+    # commentaires retirés : une explication qui cite « drop » ne compte pas ;
+    # PostgreSQL finit un commentaire de ligne au LF comme au CR seul
+    text = re.sub(r"--[^\n\r]*", " ", migration.sql)
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
     text = re.sub(r"\s+", " ", text.lower())
     for pattern, label in _NON_ADDITIVE:
@@ -565,15 +566,20 @@ def _lex(sql: str) -> tuple[list[str], str, bool]:
     passe : le délimiteur d'une chaîne ne se lit jamais dans un commentaire, ni
     l'inverse. Un identifiant cité devient un jeton neutre : son contenu n'est
     pas du code et sa casse ne survit pas aux minuscules. La lecture n'est pas
-    sûre si un commentaire coupe une instruction ou si une fin manque."""
+    sûre si un commentaire bloc coupe une instruction ou si une fin manque ; un
+    commentaire de ligne est sans effet (il finit au LF ou au CR seul, comme
+    PostgreSQL)."""
     strings, code, at, size, sure = [], [], 0, len(sql), True
     while at < size:
         two = sql[at:at + 2]
         dollar = _DOLLAR_TAG.match(sql, at) if sql[at] == "$" else None
-        if two in ("--", "/*") and "".join(code).rsplit(";", 1)[-1].strip():
+        if two == "/*" and "".join(code).rsplit(";", 1)[-1].strip():
             sure = False
         if two == "--":
             end = sql.find("\n", at)
+            cr = sql.find("\r", at)
+            if cr >= 0 and (end < 0 or cr < end):
+                end = cr
             at = size if end < 0 else end
         elif two == "/*":
             depth, at = 1, at + 2
@@ -646,9 +652,10 @@ def _proven_new(code: str, kind: str, name: str, signature: str = "") -> bool:
 def _privilege_reasons(sql: str) -> list[str]:
     """Droits retirés et contraintes posées sur ce qui n'est pas prouvé neuf (#5055).
     Seule une migration de forme simple peut prouver un objet neuf (mesh-design,
-    #174729) : sans `$` ni DO, sans identifiant cité, sans commentaire dans une
-    instruction et sans mot sensible (EXECUTE compris) dans une chaîne. Ailleurs,
-    tout REVOKE et tout ADD de contrainte classent la migration, sans analyse."""
+    #174729) : sans `$` ni DO, sans identifiant cité, sans commentaire bloc dans
+    une instruction et sans mot sensible (EXECUTE compris) dans une chaîne.
+    Ailleurs, tout REVOKE et tout ADD de contrainte classent la migration, sans
+    analyse."""
     def normal(value: str) -> str:
         return re.sub(r"\s+", " ", value.lower())
 
