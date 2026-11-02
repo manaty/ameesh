@@ -2,8 +2,11 @@
 """#4880: shared staging progress, observable after the launcher disappears.
 
 Each event is a complete small snapshot. The independent alerts pass needs
-neither the launcher's filesystem nor its process. A deadline is fixed at
-start; progress never extends it, so even a live but stuck launcher is seen.
+neither the launcher's filesystem nor its process. #5425: a run is late on its
+own evidence, not on one fixed deadline for the whole path: the launcher's
+heartbeat, its last progress (a step or a runner), and the budget of the
+current host, a function of its runners and of the turn cap. The fixed
+`deadline` only judges a launcher older than the heartbeat.
 The shared `staging.attested` proof settles a run whose last snapshot
 publication failed (#4898 N2). Request history is read per key: only a later
 completed deployment settles an earlier failure, never a partial one.
@@ -16,6 +19,7 @@ import json
 import math
 import re
 import sys
+import time
 
 from ameesh import storage
 
@@ -27,6 +31,8 @@ LIMIT = 1000
 HISTORY_LIMIT = 200
 HISTORY_MAX = 10000
 TERMINAL = frozenset(("completed", "partial", "failed", "unattested"))
+#: #5425: liveness fields of a snapshot, all absent from an older launcher's
+_LIVENESS = ("beat", "progress", "silence_s", "stall_s")
 #: exit code of a refused exclusive start, as the local flock of staging.sh
 BUSY = 75
 
@@ -44,10 +50,62 @@ class Busy(RuntimeError):
     """#4885: another staging sequence is in flight in the shared log."""
 
 
+def _finite(value, name: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("invalid staging " + name)
+    return number
+
+
+def _public_step(step: dict) -> dict:
+    public = {key: str(step.get(key) or "")[:128] for key in ("stage", "verdict")}
+    for key in ("since", "deadline"):
+        if step.get(key) is not None:
+            public[key] = _finite(step[key], key)
+    return public
+
+
+def overdue(data: dict, now: float) -> tuple[str, float, float] | None:
+    """#5425: why a running snapshot is late, its measure and its threshold.
+
+    A launcher that stopped beating is late after `silence_s`. A beating one
+    is late when nothing progressed for a whole turn plus that margin, or for
+    `silence_s` once its current host is past its own budget. A slow rolling
+    restart, which progresses runner by runner, is therefore never late.
+    """
+    if not all(isinstance(data.get(key), (int, float)) for key in _LIVENESS):
+        started, deadline = float(data["started"]), float(data["deadline"])
+        if now < deadline:
+            return None
+        return "délai dépassé", now - started, deadline - started
+    silence, stall = float(data["silence_s"]), float(data["stall_s"])
+    progress = float(data["progress"])
+    quiet = now - max(float(data["beat"]), progress)
+    if quiet >= silence:
+        return ("délai dépassé : ni battement ni progrès depuis %d min"
+                % (quiet // 60)), quiet, silence
+    idle = now - progress
+    limits = [step["deadline"] for step in (data.get("hosts") or {}).values()
+              if isinstance(step, dict) and isinstance(step.get("deadline"), (int, float))]
+    limit = silence if any(now >= value for value in limits) else stall
+    if idle >= limit:
+        return ("délai dépassé : lanceur vivant, aucun progrès depuis %d min"
+                % (idle // 60)), idle, limit
+    return None
+
+
+def _step_text(host: str, step: dict) -> str:
+    text = "%s: %s/%s" % (host, step.get("stage", "?"), step.get("verdict", "?"))
+    since = step.get("since")
+    if isinstance(since, (int, float)):
+        text += " depuis " + time.strftime("%H:%M:%SZ", time.gmtime(since))
+    return text
+
+
 def in_flight(rows: list[dict], *, exempt=(), attested=()) -> dict:
     """Runs whose latest snapshot is `running`, by run, with that snapshot.
 
-    The deadline is an alert threshold, never a proof of stop: nothing ends
+    Lateness is an alert, never a proof of stop: nothing ends
     a manual `staging.sh` at `STAGING_TIMEOUT_S`, so a late run still blocks
     (review cx1/docs-01). Only a later shared attestation of the same commit,
     a terminal snapshot or an explicit `exempt` releases it: a previous run whose stop was proved (the executor's
@@ -92,11 +150,12 @@ def record(db, snapshot: dict, *, exclusive: bool = False,
         raise ValueError("too many staging hosts")
     data = {"run": run, "sha": sha, "state": state,
             "started": started, "deadline": deadline,
-            "hosts": {str(host)[:128]: {
-                key: str(step.get(key) or "")[:128]
-                for key in ("stage", "verdict")}
-                for host, step in snapshot.get("hosts", {}).items()},
+            "hosts": {str(host)[:128]: _public_step(step)
+                      for host, step in snapshot.get("hosts", {}).items()},
             "notify": str(snapshot.get("notify") or "")[:128]}
+    for key in _LIVENESS:
+        if key in snapshot:
+            data[key] = _finite(snapshot[key], key)
     if not exclusive:
         return storage.of(db).events.record(EVENT, "staging-run:" + run, None, data)
     with db.transaction() as tx:
@@ -177,15 +236,17 @@ def findings(rows: list[dict], *, now: float, attested=()) -> list[dict]:
                 or completed.get(data.get("notify", ""), 0) > ids[run]
                 or proofs.get(data.get("sha"), 0) > ids[run]):
             continue
-        if state == "running" and now < float(data["deadline"]):
+        late = overdue(data, now) if state == "running" else None
+        if state == "running" and late is None:
             continue
         hosts = data.get("hosts") or {}
-        steps = "; ".join("%s: %s/%s" % (host, step.get("stage", "?"),
-                                        step.get("verdict", "?"))
+        steps = "; ".join(_step_text(host, step)
                           for host, step in sorted(hosts.items()))
         out.append({"schema": "ameesh-alert/1", "type": "staging_interrupted", "agent": None,
-                    "since": data["started"], "value": now - data["started"],
-                    "threshold": data["deadline"] - data["started"],
+                    "since": data["started"],
+                    "value": late[1] if late else now - data["started"],
+                    "threshold": (late[2] if late
+                                  else data["deadline"] - data["started"]),
                     "run": run, "sha": data["sha"], "hosts": hosts,
                     "reason": run, "urgent": True,
                     "orchestrators": [data["notify"]] if data.get("notify") else [],
@@ -193,12 +254,25 @@ def findings(rows: list[dict], *, now: float, attested=()) -> list[dict]:
                               "reprendre la séquence sous verrou, après arrêt "
                               "prouvé de l'ancien exécutant."
                               % (run, data["sha"][:12],
-                                 "délai dépassé" if state == "running" else state,
+                                 late[0] if late else state,
                                  steps or "aucune étape d'hôte terminée")})
     return out
 
 
-def request_findings(rows: list[dict], *, now: float, attested=()) -> list[dict]:
+def _beating_runs(rows, now: float) -> set:
+    """#5425: running sequences that a heartbeat still proves on time."""
+    latest = {}
+    for row in sorted(rows, key=lambda row: int(row["id"])):
+        data = row.get("data") or {}
+        if isinstance(data, dict) and data.get("run"):
+            latest[data["run"]] = data
+    return {run for run, data in latest.items()
+            if data.get("state") == "running" and "beat" in data
+            and overdue(data, now) is None}
+
+
+def request_findings(rows: list[dict], *, now: float, attested=(),
+                     sequences=()) -> list[dict]:
     """One alert per request key for the newest failure still unsettled.
 
     Reading only the latest request per key hid an earlier failed or blocked
@@ -208,6 +282,7 @@ def request_findings(rows: list[dict], *, now: float, attested=()) -> list[dict]
     host.
     """
     proofs = _attested_ids(attested)
+    beating = _beating_runs(sequences, now)
     by_key = {}
     for row in rows:
         data = row.get("data")
@@ -239,8 +314,11 @@ def request_findings(rows: list[dict], *, now: float, attested=()) -> list[dict]
             data = row["data"]
             ident = int(row.get("id") or 0)
             state = data.get("state")
+            # #5425: the sequence's own evidence judges a running request;
+            # its fixed deadline raised a second false alert at 7200 s.
             late = (state in ("pending", "running")
-                    and now >= data.get("deadline", float("inf")))
+                    and now >= data.get("deadline", float("inf"))
+                    and not (state == "running" and data.get("run") in beating))
             if ident <= completed or proofs.get(data.get("sha"), 0) > ident:
                 continue
             if state in ("completed", "partial"):
@@ -307,7 +385,8 @@ def alerts(db, *, now: float) -> list[dict]:
             limit = min(limit * 2, HISTORY_MAX)
         requests.extend(history)
     return (findings(rows, now=now, attested=attested)
-            + request_findings(requests, now=now, attested=attested))
+            + request_findings(requests, now=now, attested=attested,
+                               sequences=rows))
 
 
 def main(argv=None) -> int:
