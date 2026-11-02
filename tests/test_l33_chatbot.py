@@ -467,6 +467,11 @@ class FlakyStore(store.MemoryStore):
 
     def __init__(self, initial=None, delay=0.0):
         super().__init__(initial)
+        # #5512 : l'historique doit être ajouté SOUS le verrou de l'écriture.
+        # Ajouté après `super().save()`, il pouvait être ordonné autrement que
+        # les écritures durables par deux fils et faire échouer à tort
+        # l'assertion de monotonie (le compteur, lui, n'avait pas reculé).
+        self.lock = _threading.RLock()
         self.fail_writes = False
         self.delay = delay
         self.history: list[tuple[str, float]] = []
@@ -480,8 +485,9 @@ class FlakyStore(store.MemoryStore):
             raise store.StoreError("store_put_503")
         if self.delay:
             _time.sleep(self.delay)
-        super().save(state, etag)
-        self.history.append((state["month"], state["month_usd"]))
+        with self.lock:
+            super().save(state, etag)
+            self.history.append((state["month"], state["month_usd"]))
 
 
 class DurableCapTest(unittest.TestCase):
@@ -528,11 +534,28 @@ class DurableCapTest(unittest.TestCase):
 
         errors = []
 
+        def replay(op):
+            # #5512 : le garde rejoue un conflit d'ETag un nombre BORNÉ de fois
+            # (SpendGuard.RETRIES). Cette charge artificielle — deux gardes,
+            # six fils, écriture retardée de 1 ms — peut épuiser ce budget ;
+            # le refus est sûr (aucune écriture), pas un recul du compteur.
+            # Le contrat du store demande alors à l'appelant de relire et
+            # rejouer : le test le fait, avec une échéance pour ne pas masquer
+            # un conflit permanent.
+            deadline = _time.monotonic() + 10.0
+            while True:
+                try:
+                    return op()
+                except store.StoreError as error:
+                    if error.code != "store_conflict" or _time.monotonic() >= deadline:
+                        raise
+                    _time.sleep(0.001)
+
         def worker(g):
             try:
                 for _ in range(8):
-                    rid = g.reserve(0.01)
-                    g.commit(rid, 0.01, 0.004)
+                    rid = replay(lambda: g.reserve(0.01))
+                    replay(lambda: g.commit(rid, 0.01, 0.004))
                     with lock:
                         spent.append(0.004)
             except Exception as error:  # noqa: BLE001
@@ -548,6 +571,26 @@ class DurableCapTest(unittest.TestCase):
         self.assertGreaterEqual(st.data["month_usd"], sum(spent) - 1e-9)
         self.assertEqual(st.data["reservations"], {})
         self.assertEqual(st.data["seq"], st.writes)
+
+    def test_conflits_epuises_refus_sur_etat_intact(self):
+        """#5512 : après ses reprises bornées, le garde refuse sans écrire.
+
+        C'est ce que la sauvegarde concurrente peut rencontrer sous forte
+        contention : un `store_conflict` sûr, que l'appelant rejoue ; jamais
+        une écriture partielle ni un compteur qui recule."""
+        class ConflictingStore(FlakyStore):
+            def save(self, state, etag):
+                raise store.StoreConflict()
+
+        st = ConflictingStore()
+        guard = SpendGuard(st, clock=Clock())
+        with self.assertRaises(store.StoreError) as caught:
+            guard.reserve(0.01)
+        self.assertEqual(caught.exception.code, "store_conflict")
+        self.assertIsNone(st.body)                                 # aucune écriture
+        self.assertEqual(st.writes, 0)
+        self.assertFalse(guard.started)
+        self.assertEqual(guard.unsettled, {})
 
     def test_conflit_d_etag_relu_et_rejoue(self):
         st = FlakyStore({"month": "x"})
