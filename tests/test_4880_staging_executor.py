@@ -27,6 +27,7 @@ class ExecutorTest(unittest.TestCase):
         self.bascule.touch()
         self.options = dict(key="mesh", project="test", role="pilot", candidates=["host-a", "host-b"],
                             repo=str(self.root), bascule_env=str(self.bascule),
+                            github="o/r", config_path=str(self.root / "staging.json"),
                             quiescence_probe=["prove-old-and-remote-operations-stopped"])
         self.cfg = types.SimpleNamespace(host="host-a")
         self.request = dict(request="request-1", sha="a" * 40, state="pending")
@@ -63,6 +64,10 @@ class ExecutorTest(unittest.TestCase):
             # terminal release; a test overrides the outcome when it matters.
             mock.patch.object(release_cutoff, "_settle_poste_units",
                               return_value=("", True)),
+            # #5500: the activation conditions have their own tests.
+            mock.patch.object(executor, "activation_problem", return_value=None),
+            mock.patch.object(executor, "tree_problem", return_value=None),
+            mock.patch.object(executor, "forge_ci", return_value=(None, "CI green")),
         ]
         for patch in patches:
             self.addCleanup(patch.stop)
