@@ -705,7 +705,11 @@ est un TERM au groupe, puis un KILL après 5 min. Le piège TERM de
 son redémarrage glissant (jusqu'à 30 min par hôte) et ne tiendrait pas dans la
 grâce. Il écrit dans le worktree conservé l'étape ouverte
 (`.retour-apres-arret` : hôte, étape, `previous-sha`, outil, journal) et
-s'arrête. Le superviseur qui a tué le groupe (`staging_executor.tick` ou
+s'arrête. Son `EXIT` ne publie **aucun état terminal** : le snapshot partagé
+`staging.sequence` reste `running`, ce qui tient la garde
+(`staging_watch.in_flight`) même quand son flock local tombe avec le
+processus ; un second démarrage est refusé tant que le superviseur n'a pas
+publié `failed`. Le superviseur qui a tué le groupe (`staging_executor.tick` ou
 `run_staging`) attend/arrête d'abord les unités
 `poste-maj-staging-<pid>-*` survivantes, puis rejoue le retour comme une
 **étape à part, hors du groupe tué** (`staging.sh --retour-sur-arret`) :

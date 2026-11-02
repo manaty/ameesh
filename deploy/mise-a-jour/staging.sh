@@ -256,6 +256,9 @@ ROLLBACK_SQL=""
 RETOUR_SUR_ARRET=""
 #: #5450 : arret demande par la surveillance de progression (TERM du lanceur)
 ARRET_SURVEILLANCE=0
+#: #5450 : arret supervise — le superviseur survivant publie l'etat terminal
+#: apres quiescence et retour borne ; le EXIT du lanceur ne doit pas le faire
+ARRET_SUPERVISE=0
 #: #5450 : un echec d'hote est deja en cours de traitement (retour, courrier)
 ECHEC_EN_COURS=0
 
@@ -576,7 +579,15 @@ nettoyer() {
     # EXIT is best effort only. SIGKILL or a dead launcher is detected by
     # the independent alerts pass from the already committed deadline.
     arreter_battement
-    publier_suivi failed || true
+    if [ "$ARRET_SUPERVISE" = 1 ]; then
+      # #5450 : l'arret supervise n'est pas terminal ici. Laisser `running`
+      # dans le journal partage tient la garde (staging_watch.in_flight) et
+      # le demarrage exclusif refuse toute seconde sequence jusqu'a ce que
+      # le superviseur, apres quiescence et retour borne, publie `failed`.
+      echo "suivi laisse running : arret et retour confies au superviseur" >&2
+    else
+      publier_suivi failed || true
+    fi
   fi
   rm -f "$SUIVI_COURANTE" "$SUIVI_PROGRES"
   local f
@@ -1181,6 +1192,7 @@ arret_surveillance() {
   local hote="" etape_ouverte="" debut="" marque="" lignes="" outil detail
   [ "$ARRET_SURVEILLANCE" = 0 ] || return 0
   ARRET_SURVEILLANCE=1
+  ARRET_SUPERVISE=1
   trap - TERM
   if [ -r "$SUIVI_COURANTE" ]; then
     IFS=$'\t' read -r hote etape_ouverte debut marque < "$SUIVI_COURANTE" || true

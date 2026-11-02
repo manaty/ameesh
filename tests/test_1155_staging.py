@@ -107,6 +107,14 @@ if [[ "${1:-}" = */staging_watch.py || "${1:-}" = ameesh.staging_watch ]]; then
   printf '%s\n' "${*:3}" >> "$state/suivi-args.log"
   # #4885 : debut exclusif refuse, sauf reprise d'une sequence prouvee arretee
   if grep -qx suivi-occupe "$state/scenario" && [[ " $* " = *" --exclusive "* && " $* " != *" --supersede "* ]]; then exit 75; fi
+  # #5450 : une sequence dont le dernier instantane est `running` tient la
+  # garde partagee ; le superviseur seul la cloue en `failed` apres le retour.
+  if [[ " $* " = *" --exclusive "* && " $* " != *" --supersede "* ]] \
+     && [ -f "$state/staging-running" ]; then exit 75; fi
+  case "$2" in
+    *'"state": "running"'*) : > "$state/staging-running" ;;
+    *) rm -f "$state/staging-running" ;;
+  esac
   printf '%s\n' "$2" >> "$state/staging-snapshots.jsonl"
   exit 0
 fi
@@ -434,14 +442,46 @@ class StagingTest(unittest.TestCase):
                          [line for line in self.calls()
                           if 'venv-python - mesh-design' in line])
 
+        # #5450 (cx1) : le lanceur ne publie pas `failed` dans son EXIT ; le
+        # superviseur seul conclut apres quiescence et retour. Le dernier
+        # instantane reste `running`, donc la garde partagee est tenue.
+        snapshots = [json.loads(line) for line in
+                     (self.state / 'staging-snapshots.jsonl').read_text().splitlines()]
+        self.assertEqual(snapshots[-1]['state'], 'running', snapshots[-1])
+        self.assertNotIn('reason', snapshots[-1])
+
         # The supervisor's step, out of the killed group: the long return is
-        # carried to the end and the host is controlled.
-        (self.state / 'scenario').write_text('')
-        retour = subprocess.run(
+        # carried to the end and the host is controlled. While it is open, a
+        # second start is refused; after it ends, the launcher's `running`
+        # snapshot (not the released local flock) still refuses it.
+        (self.state / 'scenario').write_text('lent=ameesh-agents-2:retour\n')
+        retour = subprocess.Popen(
             ['bash', str(self.script_dir / 'staging.sh'),
              '--retour-sur-arret', str(self.repo / '.retour-apres-arret'), self.sha],
-            env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(retour.returncode, 0, (retour.stdout, retour.stderr))
+            env=dict(env, DUREE_LENT='5'),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.addCleanup(lambda: retour.poll() is None and retour.kill())
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if 'slow host=ameesh-agents-2 action=retour' in self.calls():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('the return step never started')
+        before = [line for line in self.calls() if line.startswith('call host=')]
+        second = self.run_staging()
+        self.assertEqual(second.returncode, 75, second.stderr)
+        self.assertIn('staging deja en cours', second.stderr)
+        after = [line for line in self.calls() if line.startswith('call host=')]
+        self.assertEqual(after, before)
+        out, err = retour.communicate(timeout=60)
+        self.assertEqual(retour.returncode, 0, (out, err))
+        # Local flock is gone, the return is over, yet the shared `running`
+        # snapshot still holds the guard until the supervisor's terminal.
+        third = self.run_staging()
+        self.assertEqual(third.returncode, 75, third.stderr)
+        self.assertIn('journal partage staging.sequence', third.stderr)
         calls = self.calls()
         self.assertTrue(any('host=ameesh-agents-2 action=retour' in line
                             for line in calls), calls)
