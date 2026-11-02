@@ -77,7 +77,7 @@ class _Book:
         self._gauges = gauges or {}
         self.state_dir = None
 
-    def codex_gauges(self, sessions=None, *, plan=None):
+    def codex_gauges(self, sessions=None, *, plan=None, account=None):
         return self._gauges.get(sessions, [])
 
     def record_gauges(self, gauges, account=None):
