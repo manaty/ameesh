@@ -550,6 +550,10 @@ class PaquetTest(_Base):
         # No Git evidence and no explicit landing declaration: database only.
         with mock.patch.object(planned_waits, "packet_attachments", return_value={}):
             record([unit])
+            # #5470 : l'enregistrement daté sur l'horloge simulée ; le gel de
+            # l'adaptation ci-dessous lui est postérieur, hors grâce #5206.
+            self.db.execute("UPDATE work_packet_members SET recorded_at = to_timestamp(%s)"
+                            " WHERE package_id = %s", (self.GO - 60, carrier["id"]))
             self.assertEqual(self.slo(), [])
             # #4111: packet record precedes the branch-head sweep.
             self.db.execute("UPDATE work_items SET branch_head = NULL WHERE id = %s",

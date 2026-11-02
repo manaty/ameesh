@@ -3483,10 +3483,13 @@ class WorkItems(interface.WorkItems):
         "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_merged_sha,"
         # #3634 : la tête gelée du porteur, sans filtre sur son sha : le
         # dernier gel fait autorité, même s'il ne nomme aucun commit.
-        "       (SELECT ms.sha FROM work_item_milestones ms"
+        # #5470 : avec son instant, dans la même sonde d'index.
+        "       f.sha AS package_frozen_sha,"
+        "       extract(epoch FROM f.at)::float8 AS package_frozen_ts"
+        "   FROM carrier c"
+        "   LEFT JOIN LATERAL (SELECT ms.sha, ms.at FROM work_item_milestones ms"
         "         WHERE ms.work_item_id = c.package_id AND ms.kind = 'frozen'"
-        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_frozen_sha"
-        "   FROM carrier c)"
+        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) f ON true)"
     )
 
     #: la lecture commune aux deux méthodes : l'appartenance, le porteur et
@@ -3497,7 +3500,7 @@ class WorkItems(interface.WorkItems):
         "       m.recorded_by, extract(epoch from m.recorded_at)::float8 AS recorded_ts,"
         "       p.state AS package_state, p.branch AS carrier_branch,"
         "       p.branch_target AS package_target,"
-        "       h.package_merged_sha, h.package_frozen_sha"
+        "       h.package_merged_sha, h.package_frozen_sha, h.package_frozen_ts"
         "  FROM member m JOIN work_items p ON p.id = m.package_id"
         "  LEFT JOIN heads h ON h.package_id = m.package_id"
     )

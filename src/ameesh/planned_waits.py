@@ -678,10 +678,16 @@ def _record_ahead(member, carrier, now: float) -> bool:
     observée du porteur ? Une recomposition enregistre ses unités une à une
     (`paquet-compose --record-package`), chaque fois sur une tête que le
     balayage n'a pas encore vue : l'ancienne tête observée ne l'invalide pas.
-    Un relevé non daté, postérieur ou trop ancien garde la règle de #4111."""
+    Un relevé non daté, postérieur ou trop ancien garde la règle de #4111.
+
+    #5470 : sans tête observée, la référence est le dernier gel du porteur
+    (`package_frozen_ts`) : la recomposition enregistrée avant son regel
+    (45 s pour le paquet nexlink 352) ne détache plus ses membres."""
+    stamp = (carrier.get("branch_head_ts") if carrier.get("branch_head")
+             else member.get("package_frozen_ts"))
     try:
         recorded = float(member.get("recorded_ts"))
-        observed = float(carrier.get("branch_head_ts"))
+        observed = float(stamp)
     except (TypeError, ValueError):
         return False
     return observed < recorded and now - recorded <= RECORD_AHEAD_GRACE_S
@@ -728,7 +734,7 @@ def recorded_packet_attachments(st, open_items, rows, *, now=None):
                         or member.get("package_frozen_sha")
                         or member.get("head_sha"))
         if not plan_git.same_commit(member.get("head_sha"), carrier_head) \
-                and not (carrier.get("branch_head") and _record_ahead(member, carrier, now)):
+                and not _record_ahead(member, carrier, now):
             continue
         frozen = latest_freeze(marks.get(uid, ())) or {}
         current = unit.get("branch_head") or frozen.get("sha")
