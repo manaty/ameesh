@@ -141,7 +141,11 @@ def raw_changes(repo: str, base: str, head: str) -> list[tuple[str, str, str]]:
     """`(ancien mode, nouveau mode, nom)` de chaque fichier changé de `head` sur
     `base` (`git diff --raw --no-renames -z`) : le nom seul ne dit ni un lien
     symbolique, ni un sous-module, ni un bit d'exécution (#5428)."""
-    proc = _git(repo, "diff", "--raw", "--no-renames", "-z", base, head)
+    try:
+        proc = _git(repo, "diff", "--raw", "--no-renames", "-z", base, head)
+    except GitError as exc:
+        raise PartsError("cannot read the change set %s..%s: %s"
+                         % (base[:12], head[:12], exc)) from exc
     if proc.returncode != 0:
         raise PartsError(_fail("cannot read the change set %s..%s" % (base[:12], head[:12]),
                                proc))

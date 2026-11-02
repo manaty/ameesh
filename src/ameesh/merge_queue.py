@@ -3066,9 +3066,11 @@ def doc_only_packet(project, row, repo: str, target: str, sha: str, clone, *, kl
     except plan_github.GithubError as exc:
         raise QueueError("the checks of the frozen commit %s are unreadable (%s): try again "
                          "once gh works" % (sha[:12], exc)) from exc
-    if runs.get("failed"):
+    negative = sorted(set(runs.get("negative") or ())
+                      | set(runs.get("required_negative") or ()))
+    if negative:
         raise QueueError("the CI on the frozen commit %s is red (%s)"
-                         % (sha[:12], ", ".join(runs["failed"])))
+                         % (sha[:12], ", ".join(negative)))
     return proof
 
 
