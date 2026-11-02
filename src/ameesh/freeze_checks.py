@@ -39,6 +39,11 @@ chemins « porte de fusion » du §8, lus au canon configuré, sans liste en dur
 garde n'a pas pu le lire (cible, diff ou politique illisibles) — un doute,
 que le script traite comme une porte touchée. Le script choisit ce qu'il en
 fait (ameesh : les classes sans base de ses modules de contrat de la porte).
+
+#5427 : les mêmes chemins de diff, tous, sont transmis dans [`PATHS_ENV`] :
+l'avertissement d'herméticité du gel ne montre que les tests que le lot
+change (`tests/test_*.py`), pas les constats déjà présents de la suite. Une
+variable absente (lancement manuel du script) fait avertir sur toute la suite.
 """
 from __future__ import annotations
 
@@ -74,6 +79,10 @@ CAUSES = (
 GATE_ANCHOR = "src/ameesh/fire.py"
 #: #3687 : la variable où le script lit les chemins de la porte touchés
 GATE_ENV = "AMEESH_FREEZE_GATE"
+#: #5427 : les chemins du diff gelé, transmis au script pour que
+#: l'avertissement d'herméticité ne montre que les tests du lot. Absente,
+#: le script avertit sur la suite entière (lancement manuel).
+PATHS_ENV = "AMEESH_FREEZE_PATHS"
 #: rappel de l'échappatoire, à la fin de chaque refus
 BYPASS = ('fix the lot and freeze again; to freeze anyway: '
           '--no-static-checks "<reason>" (written in the milestone note)')
@@ -173,20 +182,31 @@ def gate_rules(canons, project: str | None) -> list:
     return rules
 
 
-def gate_paths(cfg, item: dict, repo: str, commit: str, *,
-               canons=None) -> list[str] | None:
-    """Les chemins du diff gelé (merge-base avec la cible..`commit`) que la
-    politique range avec la porte de fusion (#3687), triés ; None quand la
-    cible, le diff ou la politique ne se lisent pas : l'appelant n'affirme
-    alors pas que la porte est hors du diff."""
+def changed_paths(cfg, item: dict, repo: str, commit: str) -> list[str] | None:
+    """Les chemins du diff gelé (merge-base avec la cible..`commit`), triés ;
+    None quand la cible ou le diff ne se lisent pas."""
     from . import lot_class
     target = lot_class.default_base(cfg, item, repo)
     if not target:
         return None
     try:
-        paths = git_range_paths(repo, lot_class._landing_ref(repo, target), commit)
+        return sorted(git_range_paths(repo, lot_class._landing_ref(repo, target),
+                                      commit))
     except GitError:
         return None
+
+
+def gate_paths(cfg, item: dict, repo: str, commit: str, *,
+               canons=None, paths: list[str] | None = None) -> list[str] | None:
+    """Les chemins du diff gelé (merge-base avec la cible..`commit`) que la
+    politique range avec la porte de fusion (#3687), triés ; None quand la
+    cible, le diff ou la politique ne se lisent pas : l'appelant n'affirme
+    alors pas que la porte est hors du diff. `paths` évite de relire le diff
+    quand l'appelant l'a déjà ([`changed_paths`])."""
+    if paths is None:
+        paths = changed_paths(cfg, item, repo, commit)
+        if paths is None:
+            return None
     if canons is None:
         canons = work.configured_canons(cfg)
     rules = gate_rules(canons, str(item.get("app") or "") or None)
@@ -197,19 +217,25 @@ def gate_paths(cfg, item: dict, repo: str, commit: str, *,
 
 
 def run(repo: str, commit: str, *, timeout: float = TIMEOUT,
-        gate: list[str] | None = None) -> dict:
+        gate: list[str] | None = None,
+        paths: list[str] | None = None) -> dict:
     """Passe le script de `commit` sur son arbre construit.
 
     `gate` : les chemins de la porte de fusion touchés ([`gate_paths`]),
     transmis au script dans [`GATE_ENV`] ; None ne transmet rien (doute).
+    `paths` : tous les chemins du diff gelé, transmis dans [`PATHS_ENV`] pour
+    l'avertissement d'herméticité (#5427) ; None ne transmet rien.
     Rend `{"result": "none"}` sans script, `{"result": "green", "seconds",
     "output"}` s'il sort à 0 ; lève [`Refused`] sinon."""
     if not declared(repo, commit):
         return {"result": "none"}
     env = dict(os.environ)
     env.pop(GATE_ENV, None)
+    env.pop(PATHS_ENV, None)
     if gate is not None:
         env[GATE_ENV] = json.dumps(list(gate))
+    if paths is not None:
+        env[PATHS_ENV] = json.dumps(list(paths))
     from . import ci_parts
     with tempfile.TemporaryDirectory(prefix="ameesh-freeze-checks-") as tree:
         try:
@@ -282,13 +308,14 @@ def before_freeze(cfg, db, lot: int, sha: str, *, repo: str | None = None,
              "of the lot's project repository (freeze from the lot's worktree, or --repo)"
              % sha[:12])
         return note
-    gate = gate_paths(cfg, item, where, commit)
+    paths = changed_paths(cfg, item, where, commit)
+    gate = gate_paths(cfg, item, where, commit, paths=paths)
     timeout = TIMEOUT if deadline is None else deadline.timeout(TIMEOUT)
     if timeout <= 0.0:
         raise Refused("checks-incomplete",
                       "freeze budget exhausted before the static checks of %s"
                       % commit[:12])
-    result = run(where, commit, gate=gate, timeout=timeout)
+    result = run(where, commit, gate=gate, timeout=timeout, paths=paths)
     if result["result"] == "none":
         say("static checks: none declared at %s (%s)" % (commit[:12], SCRIPT))
     else:

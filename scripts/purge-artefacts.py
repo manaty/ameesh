@@ -63,6 +63,7 @@ RETENTION_H: dict[str, int | None] = {
     "autre-fs": 14 * 24,     # tests.yml
     "leaks": 15 * 24,        # tests.yml, décompte sur deux semaines (L161i)
     "github-pages": 24,      # actions/upload-pages-artifact (défaut du site)
+    "horloge-rapport": 7 * 24,  # horloge.yml (#5427)
 }
 
 ETATS_EN_COURS = ("queued", "in_progress", "waiting", "requested", "pending")

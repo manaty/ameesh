@@ -4481,6 +4481,15 @@ class Operations(Domain):
         première différence —, dans l'ordre chronologique : provider, currency,
         total, granted, topped_up, available, account, observed_ts."""
 
+    @abc.abstractmethod
+    def balance_series(self, *, provider: str, account: str | None,
+                       since_s: float) -> list[dict]:
+        """#5411 : l'état d'une série de soldes (fournisseur + compte) en une
+        lecture bornée, une ligne par devise : readings, first_ts, last_ts,
+        spent (somme des baisses entre relevés), peak (sommet depuis la
+        dernière hausse), total et available du dernier relevé. Remplace la
+        lecture des 30 jours de lignes brutes pour les gardes de solde."""
+
 
 # --------------------------------------------------------------------------
 # ressources des hôtes (lot L31, décision 0028, migration 0029)

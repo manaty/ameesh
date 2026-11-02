@@ -24,6 +24,16 @@ la politique) ; `[]` n'ajoute rien, une variable absente ou illisible est un
 doute et lance les contrats. Seules leurs classes sans base tournent (le gel
 reste sans Postgres) : les variantes `PgTestCase` restent à la CI du paquet.
 
+#5427 : les contrôles de [`WARN_CHECKS`] **avertissent sans bloquer**. Le lint
+d'herméticité y tourne sur les tests que le lot change (chemins du diff gelé,
+variable [`PATHS_ENV`] ; sans elle, la suite entière), toutes règles : un test
+du lot qui mesure une durée, lit le disque ou le CPU de l'hôte, ou construit
+une fixture au jour courant est montré à l'auteur. Sans diff lisible, seules
+les règles neuves H4 (seuil mural sous la seconde) et H5 (disque de l'hôte)
+sont cherchées sur la suite, pour ne pas noyer le signal sous les constats
+déjà présents (#5302, #5321). Le gel n'est pas une CI (§3) : le constat est
+montré, il ne refuse jamais le gel.
+
 Usage : scripts/freeze-checks.py   (à la racine d'un arbre ameesh)
 Sortie : 0 tous verts, 1 au moins un rouge, 2 hors d'un arbre ameesh.
 """
@@ -71,6 +81,19 @@ CHECKS = (
      ["scripts/garde-alias-classe.py", "--root", ".",
       "--check-policy", "scripts/alias-review-classes.json"]),
 )
+#: #5427 : les contrôles qui **avertissent sans bloquer** le gel. Le lint
+#: d'herméticité tourne sur les tests que le lot change quand le garde
+#: transmet le diff (toutes règles), sinon sur la suite entière avec les seules
+#: règles neuves H4/H5 ; un constat est montré à l'auteur, jamais compté comme
+#: rouge (canon §3 : corriger à la source, pas relancer ; et le gel n'est pas
+#: une CI).
+WARN_CHECKS = (
+    ("herméticité des tests #5427",
+     ["scripts/test-hermeticity-lint.py", "--rules", "H4,H5",
+      "--max-findings", "10"]),
+)
+#: #5427 : les chemins du diff gelé, en JSON, posés par le garde du gel
+PATHS_ENV = "AMEESH_FREEZE_PATHS"
 #: #3687 : les modules de contrat de la porte de fusion (avis, auteurs, feu,
 #: désignation, report des verdicts) ; seules leurs classes sans base tournent
 GATE_CONTRACTS = (
@@ -163,6 +186,32 @@ def gate_checks(root: str, environ) -> tuple:
     return (("contrat de la porte #3687", ["-m", "unittest", "-q", *ids]),), why
 
 
+def warn_checks(root: str, environ) -> tuple:
+    """`(contrôles avertis, raison)` : le lint d'herméticité, restreint aux
+    tests du lot quand [`PATHS_ENV`] porte le diff gelé.
+
+    Une variable absente (lancement manuel) ne restreint pas : la suite
+    entière est lue, sans bloquer. Une variable illisible non plus, pour ne
+    pas perdre un constat sur un doute."""
+    raw = environ.get(PATHS_ENV)
+    if raw is None:
+        return WARN_CHECKS, "whole suite (no diff paths)"
+    try:
+        paths = json.loads(raw)
+    except ValueError:
+        return WARN_CHECKS, "whole suite (diff paths unreadable)"
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        return WARN_CHECKS, "whole suite (diff paths unreadable)"
+    tests = [path for path in paths
+             if path.startswith("tests/") and path.endswith(".py")
+             and path.rsplit("/", 1)[-1].startswith("test_")]
+    if not tests:
+        return (), "no changed test"
+    return (("herméticité des tests #5427",
+             ["scripts/test-hermeticity-lint.py", "--max-findings", "10",
+              *tests]),), "%d changed test(s)" % len(tests)
+
+
 def _run(check, root: str, env: dict) -> tuple:
     name, args = check
     start = time.monotonic()
@@ -188,16 +237,27 @@ def main(argv=None) -> int:
     env.pop(GATE_ENV, None)
     gate, why = gate_checks(root, os.environ)
     print("--  gate contracts: %s" % ("run (%s)" % why if gate else "none (%s)" % why))
+    warnings, warn_why = warn_checks(root, os.environ)
+    print("--  hermeticity warnings: %s"
+          % ("run (%s)" % warn_why if warnings else "none (%s)" % warn_why))
     checks = CHECKS + gate
-    with ThreadPoolExecutor(max_workers=max(1, len(checks))) as pool:
-        results = list(pool.map(lambda check: _run(check, root, env), checks))
+    jobs = ([(True, check) for check in checks]
+            + [(False, check) for check in warnings])
+    with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as pool:
+        results = list(pool.map(lambda job: (job[0], _run(job[1], root, env)), jobs))
     red = 0
-    for name, code, seconds, output in results:
-        print("%-3s %s (%.1f s)" % ("ok" if code == 0 else "RED", name, seconds))
-        if code != 0:
-            red += 1
-            lines = output.rstrip().splitlines()[-TAIL:]
-            print("\n".join("    " + line for line in lines))
+    for is_check, (name, code, seconds, output) in results:
+        if is_check:
+            print("%-3s %s (%.1f s)" % ("ok" if code == 0 else "RED", name, seconds))
+            if code != 0:
+                red += 1
+                lines = output.rstrip().splitlines()[-TAIL:]
+                print("\n".join("    " + line for line in lines))
+        else:
+            print("%-3s %s (%.1f s)" % ("ok" if code == 0 else "WARN", name, seconds))
+            if code != 0:
+                lines = output.rstrip().splitlines()[-TAIL:]
+                print("\n".join("    " + line for line in lines))
     return 1 if red else 0
 
 
