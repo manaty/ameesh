@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Install on EVERY configured candidate; execution follows the shared role
 # and execution leases, not this host's timer. No agent turn is the launcher.
+# #5494: nothing here names an account. The unit runs under the user manager
+# of whichever account holds the deployment access (the runner account, or a
+# dedicated one); %h is that account's home. It needs, in that home: the
+# database environment (.config/ameesh/env), the private configuration
+# (.config/ameesh/staging-executor.json) and its OWN stable venv
+# (.local/share/ameesh/venv, bascule.py layout). vm.sh only switches the venv
+# of the runner account: a dedicated account must never run that venv (agent
+# turns can write it) and keeps its own, updated by its own step (see
+# docs/DEPLOIEMENT-HOTE-AGENTS.md, "venv de l'executant").
 [Unit]
 Description=ameesh elected staging executor (#4880)
 After=network-online.target
@@ -19,5 +28,7 @@ TimeoutStartSec=11h30min
 # #5450: let the launcher TERM trap finish the current host rollback.
 TimeoutStopSec=5min
 KillMode=control-group
-# NoNewPrivileges is deliberately absent: vm.sh uses local sudo on candidates
-# that deploy themselves. Credential placement is a separate operator action.
+# NoNewPrivileges is deliberately absent until the real qualification (#5484
+# Q0-Q5) proves it harmless. vm.sh calls no local sudo: a candidate deploys
+# itself over the SSH identity of its BASCULE_ENV (root@ its own address).
+# Credential placement is a separate operator action.
