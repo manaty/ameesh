@@ -57,6 +57,9 @@ TURN_CGROUP_SUBGROUP = "runner"
 SYSTEMCTL_ENV = "AMEESH_SYSTEMCTL"
 #: #3364 : la minuterie qui porte le packet-watch (`ameesh release tick`)
 RELEASE_TIMER = "ameesh-release.timer"
+#: #5537 : la minuterie du tic paquet-horaire sans agent (#3845), posée sur
+#: chaque hôte candidat du bail `mesh-design`
+PAQUET_HORAIRE_TIMER = "ameesh-paquet-horaire.timer"
 #: #3264 A / #4291 : la minuterie de la veille quotidienne des versions
 VEILLE_TIMER = "ameesh-veille.timer"
 
@@ -467,6 +470,55 @@ def packet_watch_lines(cfg, run=_systemctl) -> list[str]:
         "             systemctl --user enable --now %s" % RELEASE_TIMER,
         "             a single cutter elsewhere: remove this host's `release` block, "
         "never disable the timer",
+    ]
+
+
+def paquet_horaire_lines(cfg, run=_systemctl) -> list[str]:
+    """#5537 : le tic horaire sans projet résolu.
+
+    `ameesh-paquet-horaire.timer` est posé sur chaque hôte candidat du bail
+    `mesh-design` (#3845, L165) : le jour où il prend le bail, son tic lit la
+    liste calculée du composeur depuis sa propre configuration. Sans
+    `radar.projects.<p>` ni `packet_watch.projects.<p>.repo`, aucun projet ne
+    se résout sur cet hôte et la relève composerait sans projet déclaré. Le
+    verdict du doctor ne change pas (avertissement), comme pour le
+    packet-watch."""
+    state = run("show", PAQUET_HORAIRE_TIMER, "-p", "ActiveState", "--value")
+    if state is None or (state or "").strip() != "active":
+        return []
+    from . import packet_watch, radar
+    errors = []
+    projects = {}
+    try:
+        projects = radar.settings_of(cfg).projects
+    except Exception as exc:  # noqa: BLE001 - une lecture ne casse pas le doctor
+        errors.append("radar.projects unreadable: %s"
+                      % (" ".join(str(exc).split())[:200],))
+    watches = {}
+    try:
+        watches = packet_watch.projects(cfg)
+    except Exception as exc:  # noqa: BLE001 - une lecture ne casse pas le doctor
+        errors.append("packet_watch configuration unreadable: %s"
+                      % (" ".join(str(exc).split())[:200],))
+    unresolved = sorted(name for name, watch in watches.items()
+                        if name not in projects and not watch.repo)
+    if not unresolved and (watches or projects):
+        return []
+    detail = ""
+    subject = "no project resolves"
+    if unresolved:
+        subject = "a declared project does not resolve"
+        detail = " (%s without `repo` and missing from radar.projects)" % ", ".join(
+            "packet_watch.projects.%s" % name for name in unresolved)
+    elif errors:
+        detail = " (%s)" % "; ".join(errors)
+    return [
+        "warning    : %s is active but %s%s: a takeover of the "
+        "mesh-design lease would compose without a declared project on this host"
+        % (PAQUET_HORAIRE_TIMER, subject, detail),
+        "             declare packet_watch.projects.<p>.repo with \"role\": "
+        "\"mesh-design\", or radar.projects.<p>.repo (stop the timer on a host "
+        "that is not a candidate)",
     ]
 
 
