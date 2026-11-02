@@ -63,7 +63,7 @@ import uuid
 from . import account_budget, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import context_metrics, context_profile
-from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, sentinel, storage
+from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, refusal, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import account_window
 from . import provider_credits
@@ -4912,13 +4912,18 @@ class AgentWorker(threading.Thread):
                       % (self.name, " ".join(str(exc).split())[:160]))
             return False
 
-    def _compta_ecrit(self, travail: dict, *, incertain: bool = True) -> bool:
+    def _compta_ecrit(self, travail: dict, *, incertain: bool = True,
+                      released: bool = False) -> bool:
         """Écrit une ligne du grand livre, puis efface le marqueur en base.
 
         Rejouable après panne : le marqueur n'est effacé qu'après une écriture
         réussie. Si l'effacement lui-même échoue, la réparation suivante peut
         écrire une ligne en double — jamais une dépense perdue en silence ; le
         contraire (autoriser un tour sans trace) est ce qu'on refuse.
+
+        #5529 : `released` est posé UNIQUEMENT sur une preuve `ameesh-refusal/1`
+        (le harnais a refusé avant tout appel fournisseur) ; la réservation est
+        alors rendue au lieu d'être gardée. L'incertitude prime toujours.
         """
         try:
             debut = int(travail.get("start"))
@@ -4982,7 +4987,8 @@ class AgentWorker(threading.Thread):
             # Le backend médié ne réserve aucun compte local : la dépense
             # fournisseur est comptée au relais, pas sur l'appareil (L111).
             if not self.runner.mediated:
-                account_budget.settle(self.db, cle, state="kept" if incertain else "settled")
+                state = "kept" if incertain else ("released" if released else "settled")
+                account_budget.settle(self.db, cle, state=state)
             registry.pending_spend_clear(self.db, self.name, travail)
             self._compta_travail = None
             self._annonce_ram = ""
@@ -5256,11 +5262,13 @@ class AgentWorker(threading.Thread):
             log("[%s] turn context not removed (%s)" % (self.name, exc))
 
     def _compta_termine(self, model_annonce: str | None = None, *,
-                        incertain: bool = False) -> None:
+                        incertain: bool = False, released: bool = False) -> None:
         """Après un tour : écrit la ligne du grand livre.
 
         Le modèle **annoncé par le flux** du harnais prime sur celui figé au
         lancement : c'est la source du tour (mesh-design, 0019 §3).
+        `released` (#5529) n'est vrai que sur une preuve de refus avant appel ;
+        l'incertitude prime et garde la réservation.
         """
         # L72 : le tour a eu lieu ; sa ligne de grand livre attend la base
         # plutôt que d'être remise à une réparation ultérieure.
@@ -5282,7 +5290,8 @@ class AgentWorker(threading.Thread):
                 return
             if model_annonce:
                 travail = dict(travail, model=model_annonce)
-            self._compta_ecrit(travail, incertain=incertain)
+            self._compta_ecrit(travail, incertain=incertain,
+                               released=released and not incertain)
         elif travail is not None:
             self._compta_en_echec = True
 
@@ -8552,6 +8561,20 @@ class AgentWorker(threading.Thread):
                              daemon=True).start()
         from .platform import child_environment
         env = child_environment.harness(env, harness, compte)
+        # #5529 : preuve de refus avant tout appel fournisseur. Le squelette du
+        # tour est privé (0600) et son jeton ne part JAMAIS dans l'environnement
+        # (`child_environment` filtre les variables en `*_TOKEN`) ; seul le
+        # chemin est posé, et seulement pour une famille qualifiée.
+        preuve_refus = None
+        contrat_refus = refusal.contract(getattr(adapter, "descriptor", None))
+        if contrat_refus is not None and not self.runner.mediated:
+            try:
+                preuve_refus = refusal.prepare(self.state_dir, harness, turn_id)
+                env[refusal.ENV] = preuve_refus["path"]
+            except OSError as exc:
+                log("[%s] refusal proof not prepared (%s): a defeated turn will "
+                    "stay kept" % (self.name, exc))
+                preuve_refus = None
         # L76 : servi par le processus résident de l'agent, ou un par événement
         from . import resident as resident_mod, resident_runner
         # L111 : le jeton du relais vaut pour CE tour — jamais gardé par un résident
@@ -9163,9 +9186,41 @@ class AgentWorker(threading.Thread):
         # même si le bail a été perdu ou le tour préempté (L13 B1). Le modèle
         # est celui du lancement, déjà figé dans le marqueur (L13 B4).
         # #1469 : issue incertaine (erreur, bail perdu, préemption, arrêt
-        # par plafond) : la réservation du compte reste comptée en entier
-        self._compta_termine(modele_annonce, incertain=bool(
-            error or result_code or lost or preempte or clos))
+        # par plafond) : la réservation du compte reste comptée en entier.
+        incertain = bool(error or result_code or lost or preempte or clos)
+        # #5529 : la réservation n'est rendue que sur la preuve POSITIVE du
+        # contrat `ameesh-refusal/1` — sortie propre au code réservé par le
+        # descripteur qualifié, aucune ligne de flux ni usage, tour non
+        # interrompu, et document de preuve intact pour CE tour. Une preuve est
+        # consommée dans tous les cas ; tout écart laisse la réservation `kept`.
+        libre = False
+        if preuve_refus is not None:
+            # La preuve est une entrée non fiable (fichier écrit par le
+            # harnais) : aucune de ses formes ne doit empêcher la ligne de
+            # grand livre — un document illisible laisse la réservation kept
+            # (B cx1 sur #5529).
+            try:
+                raison_refus = refusal.proof(preuve_refus)
+            except Exception as exc:  # noqa: BLE001 - entrée non fiable, kept
+                log_async("[%s] refusal proof unreadable (%s): reservation kept"
+                          % (self.name, exc))
+                raison_refus = None
+            if (raison_refus is not None and incertain
+                    and contrat_refus is not None and rp is None
+                    and result_code == contrat_refus["exit_code"]
+                    and lignes == 0 and error is None
+                    and not (lost or preempte or clos or self._audit_guard_error)
+                    and not self._urgent_end()
+                    # le marqueur réglé doit être celui de CE tour : une reprise
+                    # par un remplaçant ne libère jamais la réservation d'un autre
+                    and (getattr(self, "_compta_travail", None) or {}).get("turn_id")
+                    == turn_id):
+                libre = True
+                log_async("[%s] harness exited %d with an ameesh-refusal/1 proof "
+                          "(%s): no provider call, account reservation released"
+                          % (self.name, result_code, raison_refus[:160]))
+        self._compta_termine(modele_annonce, incertain=incertain and not libre,
+                             released=libre)
         # #4448 B cx3 : le nombre de tours de la session est celui des tours
         # COMPTÉS au grand livre — réussis ou non : la dépense a eu lieu même
         # quand le harnais échoue (L13 B1), et toutes les sorties anticipées
