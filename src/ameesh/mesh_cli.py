@@ -3069,7 +3069,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     plan = activation.carried_plan(cfg, db, args.id, sha,
                                                    repo=args.repo)
                     force = bool(plan and not plan.get("refused"))
-                    outcome = activation.designate(cfg, db, args.id, force=force)
+                    # #5481 : la reprise de l'exécuteur peut constater le même
+                    # report refusé ; le bail du lot sérialise les deux gestes.
+                    outcome = activation.designate_deferred(
+                        cfg, db, args.id,
+                        {"id": int(row.get("id") or 0),
+                         "sha": str(row.get("sha") or ""),
+                         "at_ts": row.get("at_ts")},
+                        force=force)
                     print("review designation after the carry refused: %s"
                           % (outcome.get("state") or "?"))
             state = str(outcome.get("state") or "")

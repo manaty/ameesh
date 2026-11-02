@@ -20,7 +20,7 @@ import os
 from unittest import mock
 
 from ameesh import merge_queue, plan_git, review_designation_activation as act
-from ameesh import verdict_carry, work
+from ameesh import storage, verdict_carry, work
 
 from .test_2487_designation_carry import _Fixture
 
@@ -165,6 +165,78 @@ class SameHeadTest(_Reviewed):
         self.assertEqual(self.review_mail(), [])
         self.assertEqual(self.designated(), ["rev1", "rev2"])
         self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+
+
+class SameHeadRaceTest(_Reviewed):
+    """La vérification du même SHA se refait sous le verrou du gel."""
+
+    def test_a_head_change_under_the_lock_refuses_the_shortcut(self):
+        self.freeze(self.repo.reviewed)
+        other = self.repo.author_commit("autre tête\n")
+        self.receipt(other)
+        self.freeze(other)
+        before = [m["id"] for m in work.milestones(self.db, self.lot)
+                  if m["kind"] == "frozen"]
+        outcome: dict = {}
+        with self.assertRaises(work.WorkError):
+            storage.of(self.db).work.add_milestone(
+                self.lot, "frozen", sha=self.repo.reviewed, actor="author",
+                verdict=None, note="", on_frozen=act.same_head_hook(outcome))
+        after = [m["id"] for m in work.milestones(self.db, self.lot)
+                 if m["kind"] == "frozen"]
+        self.assertEqual(after, before)
+        self.assertEqual(outcome, {})
+
+
+class DeferredRecoveryTest(_Reviewed):
+    """Un gel différé interrompu est repris une fois par l'exécuteur (#5481)."""
+
+    def _deferred_freeze(self, sha: str) -> dict:
+        self.receipt(sha)
+        outcome: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=sha, actor="author",
+                       outcome=outcome, repo=self.repo.root,
+                       defer_designation=True)
+        return outcome
+
+    def _run_recovery(self) -> dict:
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            return act.finish_deferred(self.cfg, self.db)
+
+    def test_an_interrupted_deferred_freeze_is_designated_once(self):
+        self.reviewed_freeze()
+        changed = self.repo.author_commit("vraie correction\n")
+        self._deferred_freeze(changed)
+        self.assertTrue(self.notes(act.DEFERRED_PREFIX))
+        self.db.execute("DELETE FROM agent_mailbox")
+        first = self._run_recovery()
+        mine = [row for row in first["results"] if row["lot"] == self.lot]
+        self.assertEqual(len(mine), 1, first)
+        self.assertEqual([row["recipient"] for row in self.review_mail()],
+                         ["rev1", "rev2"])
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+        # La marque et l'issue finale sont écrites : la passe suivante ne
+        # redésigne pas et ne remet aucun courrier.
+        second = self._run_recovery()
+        self.assertEqual([row for row in second["results"] if row["lot"] == self.lot], [])
+        self.assertEqual(len(self.review_mail()), 2)
+
+    def test_a_deferred_freeze_whose_report_carries_mails_nobody(self):
+        self.reviewed_freeze()
+        frozen = self.repo.adapt_test()
+        # Le plan lu avant le gel échoue (par exemple sans réglage radar) :
+        # le gel diffère. Le report de la passe suivante réussit et garde les
+        # avis, sans courrier.
+        with mock.patch.object(act, "carried_plan", return_value=None):
+            self._deferred_freeze(frozen)
+        self.assertTrue(self.notes(act.DEFERRED_PREFIX))
+        self.db.execute("DELETE FROM agent_mailbox")
+        first = self._run_recovery()
+        mine = [row for row in first["results"] if row["lot"] == self.lot]
+        self.assertEqual([row["result"] for row in mine], ["carried"], first)
+        self.assertEqual(self.review_mail(), [])
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+        self.assertTrue(self.notes(verdict_carry.CARRIED))
 
 
 class QuorumRetryTest(_Reviewed):

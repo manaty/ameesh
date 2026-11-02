@@ -103,6 +103,14 @@ from . import slo as slo_mod
 SENDER = pg.SENDER
 #: journal prefix of a policy/evidence problem: one note per freeze
 UNAVAILABLE_PREFIX = "review-designation-unavailable:"
+#: journal prefix of a designation deferred until after the verdict report
+#: (#5481): `<lot>:<freeze>:`. The executor pass replays the report then the
+#: designation if the CLI that froze was interrupted before either.
+DEFERRED_PREFIX = "review-designation-deferred:"
+#: a deferred marker is left to its CLI for this long before recovery acts
+DEFERRED_GRACE_S = 300.0
+#: lots scanned by the deferred recovery pass (the same bound as the carry pass)
+DEFERRED_SWEEP = 1000
 #: journal prefix of a light/no-review outcome: one note per freeze (#2561)
 NONE_PREFIX = "review-designation-none:"
 #: journal prefix of a floor completion (#3557): `<lot>:<freeze>:<floor>:`. One
@@ -3709,6 +3717,13 @@ def freeze_check_hook(cfg, outcome: Optional[dict] = None, *,
             fresh = _fresh_prepared(cfg, tx, item, milestone, prepared)
         if isinstance(fresh, Inputs):
             freeze_families.enforce(fresh)
+        storage.of(tx).work.note(
+            lot, str((work.get(tx, lot) or {}).get("state") or ""),
+            "%s%d:%d: %s" % (DEFERRED_PREFIX, lot, int(milestone.get("id") or 0),
+                             json.dumps({"sha": str(milestone.get("sha") or ""),
+                                         "why": "report evaluated before designation"},
+                                        ensure_ascii=False)),
+            SENDER)
         if outcome is not None:
             outcome.clear()
             outcome.update({"state": "deferred", "deferred": True,
@@ -3732,6 +3747,17 @@ def same_head_hook(outcome: Optional[dict] = None, *, previous=None):
     def on_frozen(tx, milestone, threads):
         lot = int(milestone["work_item_id"])
         item = work.get(tx, lot) or {"id": lot}
+        # #5481 (B de la revue) : la comparaison lue avant le gel n'est pas
+        # une preuve sous le verrou. Un autre gel a pu changer la tête
+        # entre-temps ; garder les sièges de cette autre tête serait une
+        # désignation sans sélection ni contrôle des familles.
+        current = _previous_freeze(tx, lot, int(milestone.get("id") or 0))
+        if (not current
+                or not plan_git.same_commit(current.get("sha"),
+                                            milestone.get("sha"))):
+            raise work.WorkError(
+                "freeze refused: the frozen head changed while freezing "
+                "(another freeze was written); retry the freeze")
         plan = same_head_plan(tx, lot, str(milestone.get("sha") or ""),
                               previous=previous)
         if _waiver(item):
@@ -4284,6 +4310,135 @@ def _retry_notes(db, after: int, *, scan: int = RETRY_SCAN) -> list:
         "   AND e.id > %s"
         " ORDER BY e.id ASC LIMIT %s",
         (UNAVAILABLE_PREFIX + "%", int(after), int(scan)))
+
+
+def designate_deferred(cfg, db, lot: int, freeze: Mapping, *,
+                       force: bool = False) -> dict:
+    """Désigne sous le bail `fire:<lot>` après un gel différé (#5481).
+
+    Le bail sérialise la reprise de l'exécuteur et la CLI qui viennent toutes
+    deux de constater un report refusé : une seule écrit la sélection et les
+    courriers. Une marque effective déjà écrite (report ou sélection) est
+    rendue telle quelle, sans nouveau geste."""
+    from . import fire
+    handle = fire._lock(db, int(lot))
+    if handle is None:
+        return {"state": "busy", "reviewers": [], "freeze": dict(freeze or {}),
+                "why": "another host holds the lot's fire lease"}
+    try:
+        effective = _effective_mark(db, int(lot), int((freeze or {}).get("id") or 0))
+        if effective is not None:
+            return (_carried_shape(effective[2])
+                    if effective[1] == "carried" else dict(effective[2]))
+        if _retry_resolved(db, int(lot), freeze):
+            return {"state": "resolved", "reviewers": [],
+                    "freeze": dict(freeze or {}),
+                    "why": "a final designation outcome is already journaled"}
+        return designate(cfg, db, int(lot), freeze=freeze, force=force)
+    finally:
+        fire._unlock(handle)
+
+
+def finish_deferred(cfg, db, *, dry_run: bool = False,
+                    limit: int = DEFERRED_SWEEP) -> dict:
+    """Reprend les gels dont la désignation a été différée (#5481).
+
+    La CLI qui gèle diffère la désignation jusqu'après le report ; si elle est
+    interrompue avant, le gel resterait en `qa` sans relecteur. Le gel écrit
+    donc une marque durable `review-designation-deferred` dans sa transaction.
+    Cette passe, après un délai de grâce qui laisse la CLI finir, rejoue le
+    report puis la désignation (sous le bail du lot) une seule fois. Un report
+    qui aboutit écrit sa marque et ne déclenche aucun courrier ; une marque
+    effective ou une issue finale déjà journalisée fait sauter le lot.
+
+    Ne lève jamais ; rend `{results, summary}` pour le journal de l'exécuteur.
+    """
+    out: dict = {"results": [], "summary": ""}
+    try:
+        rows = storage.of(db).work.open_for_sweep(int(limit))
+    except Exception as exc:  # noqa: BLE001 - une passe ne casse pas l'exécuteur
+        out["summary"] = "deferred designation sweep unreadable: %s" % (
+            type(exc).__name__,)
+        return out
+    now = time.time()
+    from . import verdict_carry
+    ids = [int(row.get("id") or 0) for row in rows or ()]
+    try:
+        # une seule lecture bornée aux lots ouverts : le journal peut être long
+        deferred_notes = storage.of(db).work.events_noted(
+            DEFERRED_PREFIX, 0.0, ids=ids)
+        unavailable_notes = storage.of(db).work.events_noted(
+            UNAVAILABLE_PREFIX, 0.0, ids=ids)
+    except Exception as exc:  # noqa: BLE001 - journal illisible : rien de prouvé
+        out["summary"] = "deferred designation journal unreadable: %s" % (
+            type(exc).__name__,)
+        return out
+    notes_by_lot: dict = {}
+    unavailable_by_lot: dict = {}
+    for note in deferred_notes or ():
+        notes_by_lot.setdefault(int(note["work_item_id"]), []).append(note)
+    for note in unavailable_notes or ():
+        unavailable_by_lot.setdefault(int(note["work_item_id"]), []).append(note)
+    for row in rows or ():
+        lot = int(row.get("id") or 0)
+        if str(row.get("state") or "") != "qa":
+            continue
+        marks = work.milestones(db, lot)
+        freeze = plan_git.latest_freeze(marks)
+        if not freeze:
+            continue
+        freeze_id = int(freeze.get("id") or 0)
+        prefix = "%s%d:%d:" % (DEFERRED_PREFIX, lot, freeze_id)
+        notes = [note for note in notes_by_lot.get(lot, ())
+                 if str(note.get("note") or "").startswith(prefix)]
+        unavailable = [note for note in unavailable_by_lot.get(lot, ())
+                       if str(note.get("note") or "").startswith(
+                           "%s%d:%d:" % (UNAVAILABLE_PREFIX, lot, freeze_id))]
+        if not notes or unavailable:
+            continue
+        try:
+            first = min(float(note.get("created_ts") or 0.0) for note in notes)
+        except (TypeError, ValueError):
+            continue
+        if now - first < DEFERRED_GRACE_S:
+            continue
+        try:
+            if _effective_mark(db, lot, freeze_id) is not None:
+                continue
+            if _retry_resolved(db, lot, freeze):
+                continue
+        except Exception:  # noqa: BLE001 - lecture ratée : la passe suivante
+            continue
+        if dry_run:
+            out["results"].append({"lot": lot, "result": "would-designate",
+                                   "detail": "deferred designation due (#5481)"})
+            continue
+        try:
+            carried = verdict_carry.carry(cfg, db, lot)
+        except Exception as exc:  # noqa: BLE001 - une passe ne casse pas
+            out["results"].append({"lot": lot, "result": "error",
+                                   "detail": "%s: %s" % (type(exc).__name__, str(exc)[:160])})
+            continue
+        if carried.get("result") == "carried" and not carried.get("refused"):
+            out["results"].append({"lot": lot, "result": "carried"})
+            continue
+        if carried.get("result") in ("busy", "moved"):
+            continue
+        try:
+            plan = carried_plan(cfg, db, lot, str(freeze.get("sha") or ""))
+            force = bool(plan and not plan.get("refused"))
+            outcome = designate_deferred(cfg, db, lot, freeze, force=force)
+        except Exception as exc:  # noqa: BLE001 - la passe suivante retente
+            out["results"].append({"lot": lot, "result": "error",
+                                   "detail": "%s: %s" % (type(exc).__name__, str(exc)[:160])})
+            continue
+        if outcome.get("state") not in ("stale", "busy"):
+            out["results"].append({"lot": lot,
+                                   "result": str(outcome.get("state") or "?"),
+                                   "detail": str(outcome.get("why") or "")[:160]})
+    if out["results"]:
+        out["summary"] = "%d deferred designation(s) processed" % len(out["results"])
+    return out
 
 
 def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
