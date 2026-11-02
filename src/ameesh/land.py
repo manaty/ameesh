@@ -218,8 +218,12 @@ def _fire_guard(landing, *, gh=None) -> dict | None:
             "the queue entry of lot #%d was removed or replaced before the merge: "
             "nothing merged" % landing.lot)}
     try:
+        project = getattr(landing, "project", None)
         packet_guard.check_merge(landing.db, landing.lot, row.get("branch") or "",
-                                 row.get("target") or "", row.get("frozen_sha") or "")
+                                 row.get("target") or "", row.get("frozen_sha") or "",
+                                 repo=(getattr(project, "github", None)
+                                       or getattr(project, "repo", None) or ""),
+                                 cfg=getattr(landing, "cfg", None))
     except packet_guard.PacketGuardError as exc:
         return landing.eject(str(exc), "This queue entry is not a packet (canon §11 bis): "
                                        "take the lot out of the queue (`ameesh work queue "

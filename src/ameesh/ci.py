@@ -4272,11 +4272,18 @@ def cmd_ci_run(cfg, args) -> int:
     if item is not None:
         freeze = frozen_of(db, args.id)
         declared_sha = ((args.sha or "") or ((freeze or {}).get("sha") or "")).strip().lower()
+        # #5497 : le dépôt où la demande sera posée (celui de `gel_plan`) ;
+        # illisible, il reste porté par les paquets (le doute refuse).
+        try:
+            ci_repo = repo_of(cfg, item, repo=args.repo or "")
+        except GelError:
+            ci_repo = ""
         try:
             packet_guard.check_ci(db, args.id, item.get("branch") or "",
                                   mode="full" if args.full else "lot",
                                   sha=declared_sha,
-                                  exception=args.exception or "", reason=args.reason or "")
+                                  exception=args.exception or "", reason=args.reason or "",
+                                  repo=ci_repo, cfg=cfg)
         except packet_guard.PacketGuardError as exc:
             if getattr(args, "json", False):
                 print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,

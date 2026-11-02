@@ -1057,6 +1057,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
           fixes: Iterable[Mapping[str, Any]] | None = None,
           packets: Iterable[Mapping[str, Any]] = (),
           families: Iterable[str] = (),
+          review_pilots: Mapping[str, str] | None = None,
+          closed_hosts: Iterable[str] = (),
           zone: str = "UTC") -> dict:
     """Le rapport de débit, calculé sans I/O (témoins et tests).
 
@@ -1237,7 +1239,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
             from . import review_family_paused
             family_pauses = review_family_paused.blocked(
                 designation, agents, project=item.get("app") or "",
-                families=known_families, now=now)
+                families=known_families, now=now,
+                pilot=(review_pilots or {}).get(item.get("app") or "") or "",
+                closed_hosts=closed_hosts)
             age = _age(now, freeze.get("at_ts"))
             state = {
                 "lot": ident, "title": item.get("title") or "",
@@ -2457,6 +2461,13 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                                       "status": job.get("status") or "",
                                       "duration_s": max(0.0, (end_dt - start_dt).total_seconds())})
 
+    # #5424 N6 : le vivier d'une famille en pause est celui de la désignation
+    # (pilote du projet et hôtes fermés exclus) ; illisible : personne d'exclu.
+    review_pilots, closed_hosts = None, ()
+    if families:
+        from . import review_family_paused
+        review_pilots, closed_hosts = review_family_paused.exclusions(
+            cfg, db, [item.get("app") or "" for item in items], agents)
     report = build(items=items, milestones=milestones, events=events,
                    agents=agents, turns=turns, merges=merges, ci_runs=ci_runs,
                    jobs=jobs_rows,
@@ -2464,7 +2475,8 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
                    holds=holds, closure_allowed=closure_allowed,
                    ci_unreadable=ci_unreadable, fixes=fixes,
-                   packets=packets, families=families, zone=zone)
+                   packets=packets, families=families, review_pilots=review_pilots,
+                   closed_hosts=closed_hosts, zone=zone)
     annotate_candidate_causes(db, cfg, report, milestones, unreadable)
     report["capacity"] = read_capacity(db, cfg=cfg, now=now, hours=hours, turns=turns,
                                        canons=canons, unreadable=unreadable)
