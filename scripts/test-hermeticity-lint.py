@@ -22,6 +22,14 @@ Règles :
   H3 fixture-dependante-du-jour
      une fixture est construite avec le jour courant (`date.today`,
      `datetime.now|today|utcnow`) : bombe à retardement au changement de jour.
+  H4 seuil-mural-sous-la-seconde
+     une durée mesurée à l'horloge réelle, gardée dans une variable
+     (`wake_s = time.monotonic() - début`), est comparée à une constante
+     inférieure à 1 s : le verdict dépend de l'ordonnancement du runner, pas
+     du code (#5302). L'assertion directe reste H1 ; H4 couvre la variable.
+  H5 etat-disque
+     le test lit le disque de l'hôte (`shutil.disk_usage`) : le verdict
+     dépend du runner et des jobs voisins (#5321).
 
 Exemption motivée : un commentaire `# hermeticity: allow — <raison>` sur
 l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison
@@ -32,6 +40,8 @@ n'exempte pas (R1 #707, N1).
 Usage :
   scripts/test-hermeticity-lint.py [FICHIERS…]        # défaut : tests/**/test_*.py
   scripts/test-hermeticity-lint.py --diff origin/main # seuls les tests changés
+  scripts/test-hermeticity-lint.py --rules H4,H5      # un sous-ensemble de règles
+  scripts/test-hermeticity-lint.py --max-findings 10  # texte tronqué, verdict entier
   scripts/test-hermeticity-lint.py --json
 Sortie : 0 si aucun constat, 1 si au moins un, 2 en cas d'erreur d'usage.
 """
@@ -69,6 +79,14 @@ MACHINE = {
     "os.cpu_count", "os.getloadavg", "os.sched_getaffinity",
     "platform.process_table", "platform.has_psutil",
 }
+#: lectures du disque de l'hôte (#5321) : règle H5, distincte de H2 pour que
+#: l'avertissement de gel puisse ne montrer que les constats neufs.
+DISK = {"shutil.disk_usage"}
+#: comparateurs d'une durée à un seuil (H4) ; l'ordre des opérandes est libre.
+COMPARATORS = {"assertLess", "assertLessEqual", "assertGreater", "assertGreaterEqual"}
+#: au-delà de cette borne (en valeur absolue), une durée n'est plus un seuil
+#: d'ordonnancement : c'est une garde de temps, qui peut rester au banc.
+SUBSECOND_S = 1.0
 #: appels qui reçoivent un chemin : un littéral `/proc/…` y est global.
 PATH_CALLS = {"open", "os.listdir", "os.scandir", "os.stat", "os.readlink",
               "pathlib.Path", "Path", "io.open"}
@@ -77,6 +95,8 @@ RULES = {
     "H1": "horloge-reelle-assertion",
     "H2": "etat-global-machine",
     "H3": "fixture-dependante-du-jour",
+    "H4": "seuil-mural-sous-la-seconde",
+    "H5": "etat-disque",
 }
 
 
@@ -229,7 +249,186 @@ def _is_assertion(node: ast.AST) -> bool:
         and node.func.attr.startswith("assert")
 
 
-def lint_source(path: str, source: str) -> list[Finding]:
+class _Scopes:
+    """La portée la plus interne d'une ligne : fonction, et classe.
+
+    Une table par ligne, construite une fois : `_innermost` linéaire sur
+    chaque affectation rendait H4 quadratique sur les gros modules (47 s pour
+    la suite, contre 3 s avec la table)."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.module = tree
+        self.functions: list = []
+        self.classes: list = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.functions.append(node)
+            elif isinstance(node, ast.ClassDef):
+                self.classes.append(node)
+        self._function = self._index(self.functions)
+        self._class = self._index(self.classes)
+
+    @staticmethod
+    def _index(nodes: list) -> dict[int, ast.AST]:
+        best: dict[int, tuple] = {}
+        for node in nodes:
+            span = node.end_lineno - node.lineno
+            for line in range(node.lineno, node.end_lineno + 1):
+                current = best.get(line)
+                if current is None or span < current[0]:
+                    best[line] = (span, node)
+        return {line: node for line, (_span, node) in best.items()}
+
+    def function(self, node: ast.AST) -> ast.AST:
+        return self._function.get(node.lineno, self.module)
+
+    def cls(self, node: ast.AST) -> ast.AST | None:
+        return self._class.get(node.lineno)
+
+
+def _unwrap(node: ast.AST) -> ast.AST:
+    """`abs(elapsed)`, `round(elapsed, 3)` : la mesure reste la même."""
+    while isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+            and node.func.id in ("abs", "round", "float", "int") and node.args:
+        node = node.args[0]
+    return node
+
+
+def _has_clock(node: ast.AST, alias: dict[str, str]) -> bool:
+    return any(_called(sub, alias, CLOCK) for sub in ast.walk(node))
+
+
+def _is_duration(node: ast.AST, alias: dict[str, str], durations: dict,
+                 attributes: dict, name_scope: ast.AST | None,
+                 class_scope: ast.AST | None) -> bool:
+    """`time.monotonic() - début`, ou une variable qui en vient (chaîne)."""
+    node = _unwrap(node)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
+        if _has_clock(node.left, alias) or _has_clock(node.right, alias):
+            return True
+        for side in (node.left, node.right):
+            if _is_duration_ref(side, durations, attributes, name_scope, class_scope):
+                return True
+    return _is_duration_ref(node, durations, attributes, name_scope, class_scope)
+
+
+def _is_duration_ref(node: ast.AST, durations: dict, attributes: dict,
+                     name_scope: ast.AST | None,
+                     class_scope: ast.AST | None) -> bool:
+    """Une variable ou un attribut `self.…` déjà reconnu comme durée."""
+    node = _unwrap(node)
+    if isinstance(node, ast.Name):
+        return node.id in durations.get(name_scope, ())
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+            and node.value.id == "self":
+        return class_scope is not None and node.attr in attributes.get(class_scope, ())
+    return False
+
+
+def _numeric(node: ast.AST, constants: dict[str, float]) -> float | None:
+    """La valeur numérique d'un littéral (signe compris) ou d'une constante."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+            and not isinstance(node.value, bool):
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        inner = _numeric(node.operand, constants)
+        if inner is None:
+            return None
+        return -inner if isinstance(node.op, ast.USub) else inner
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    return None
+
+
+def _module_constants(tree: ast.Module) -> dict[str, float]:
+    """Les constantes numériques du module, pour un seuil nommé."""
+    values: dict[str, float] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            value = _numeric(node.value, {})
+            if value is not None:
+                values[node.targets[0].id] = value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                and node.value is not None:
+            value = _numeric(node.value, {})
+            if value is not None:
+                values[node.target.id] = value
+    return values
+
+
+def _duration_scopes(tree: ast.Module, alias: dict[str, str],
+                     scopes: _Scopes) -> tuple[dict, dict]:
+    """Les variables et attributs `self.…` qui portent une durée mesurée.
+
+    Analyse de flux volontairement simple (affectations, chaînes, `abs`/
+    `round`) : elle ne prétend pas suivre un retour de fonction. Le point est
+    de rattraper `wake_s = time.monotonic() - début` puis
+    `assertLess(wake_s, 0.05)`, que H1 ne voit pas (#5302)."""
+    durations: dict[ast.AST, set[str]] = {}
+    attributes: dict[ast.AST, set[str]] = {}
+    assignments = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        assignments.append((scopes.function(node), scopes.cls(node), targets, value))
+    changed = True
+    while changed:
+        changed = False
+        for name_scope, class_scope, targets, value in assignments:
+            if not _is_duration(value, alias, durations, attributes,
+                                name_scope, class_scope):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    names = durations.setdefault(name_scope, set())
+                    if target.id not in names:
+                        names.add(target.id)
+                        changed = True
+                elif isinstance(target, ast.Attribute) \
+                        and isinstance(target.value, ast.Name) \
+                        and target.value.id == "self":
+                    if class_scope is None:
+                        continue
+                    attrs = attributes.setdefault(class_scope, set())
+                    if target.attr not in attrs:
+                        attrs.add(target.attr)
+                        changed = True
+    return durations, attributes
+
+
+def _measured_operand(call: ast.Call, durations: dict, attributes: dict,
+                      name_scope: ast.AST | None, class_scope: ast.AST | None,
+                      constants: dict[str, float]) -> tuple:
+    """`(opérande mesuré, seuil)` si la comparaison oppose une durée à un seuil
+    sous la seconde, sinon `(None, None)`."""
+    if len(call.args) < 2:
+        return None, None
+    left, right = call.args[0], call.args[1]
+    for measured, threshold in ((left, right), (right, left)):
+        value = _numeric(threshold, constants)
+        # 0 est une assertion de logique (« plus de temps restant »), pas un
+        # seuil d'ordonnancement : seule une borne strictement positive et
+        # sous la seconde dépend de la charge.
+        if value is not None and 0 < abs(value) < SUBSECOND_S \
+                and _is_duration_ref(measured, durations, attributes,
+                                     name_scope, class_scope):
+            return measured, value
+    return None, None
+
+
+def lint_source(path: str, source: str, rules: set[str] | None = None) -> list[Finding]:
+    """Les constats d'un fichier ; `rules` restreint les analyses lancées.
+
+    Le filtre n'est pas cosmétique : H1/H4 parcourent chaque assertion et
+    coûtent l'essentiel du lint d'une suite entière. L'appelant qui ne veut
+    que H3 (passe horloge) ou H4/H5 (avertissement du gel) ne paie pas les
+    autres règles."""
+    wanted = set(RULES) if rules is None else set(rules)
     try:
         tree = ast.parse(source, filename=path)
     except SyntaxError as exc:
@@ -241,39 +440,78 @@ def lint_source(path: str, source: str) -> list[Finding]:
     findings: list[Finding] = []
     clock_lines: set[int] = set()
 
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Assert, ast.Call)) and _is_assertion(node):
-            body = node.test if isinstance(node, ast.Assert) else node
-            for sub in ast.walk(body):
-                name = _called(sub, alias, CLOCK)
-                if name and _in_subtraction(sub, body) and not _exempt(node, comments):
-                    clock_lines.add(id(sub))
-                    findings.append(Finding(
-                        path, sub.lineno, sub.col_offset + 1, "H1",
-                        "durée mesurée à l'horloge réelle dans une assertion : %s()" % name,
-                        _enclosing(funcs, sub)))
+    if "H1" in wanted:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assert, ast.Call)) and _is_assertion(node):
+                body = node.test if isinstance(node, ast.Assert) else node
+                for sub in ast.walk(body):
+                    name = _called(sub, alias, CLOCK)
+                    if name and _in_subtraction(sub, body) \
+                            and not _exempt(node, comments):
+                        clock_lines.add(id(sub))
+                        findings.append(Finding(
+                            path, sub.lineno, sub.col_offset + 1, "H1",
+                            "durée mesurée à l'horloge réelle dans une assertion : %s()"
+                            % name, _enclosing(funcs, sub)))
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = _called(node, alias, MACHINE)
-        if name and not _exempt(node, comments):
-            findings.append(Finding(path, node.lineno, node.col_offset + 1, "H2",
-                                    "état global de la machine : %s()" % name,
-                                    _enclosing(funcs, node)))
-        elif _proc_literal(node) and not _exempt(node, comments):
-            findings.append(Finding(path, node.lineno, node.col_offset + 1, "H2",
-                                    "état global de la machine : chemin /proc/…",
-                                    _enclosing(funcs, node)))
+    if "H2" in wanted:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _called(node, alias, MACHINE)
+            if name and not _exempt(node, comments):
+                findings.append(Finding(path, node.lineno, node.col_offset + 1, "H2",
+                                        "état global de la machine : %s()" % name,
+                                        _enclosing(funcs, node)))
+            elif _proc_literal(node) and not _exempt(node, comments):
+                findings.append(Finding(path, node.lineno, node.col_offset + 1, "H2",
+                                        "état global de la machine : chemin /proc/…",
+                                        _enclosing(funcs, node)))
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or id(node) in clock_lines:
-            continue
-        name = _called(node, alias, CALENDAR)
-        if name and not _exempt(node, comments):
-            findings.append(Finding(path, node.lineno, node.col_offset + 1, "H3",
-                                    "fixture dépendante du jour : %s()" % name,
-                                    _enclosing(funcs, node)))
+    if "H3" in wanted:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or id(node) in clock_lines:
+                continue
+            name = _called(node, alias, CALENDAR)
+            if name and not _exempt(node, comments):
+                findings.append(Finding(path, node.lineno, node.col_offset + 1, "H3",
+                                        "fixture dépendante du jour : %s()" % name,
+                                        _enclosing(funcs, node)))
+
+    if "H4" in wanted:
+        # H4 : la durée a quitté l'assertion (`wake_s = … - début`) ; H1 ne la
+        # voit plus. Seules les variables reconnues sont retenues : la forme
+        # directe reste H1, pour un seul constat par mesure.
+        constants = _module_constants(tree)
+        scopes = _Scopes(tree)
+        durations, attributes = _duration_scopes(tree, alias, scopes)
+        for node in ast.walk(tree):
+            if not _is_assertion(node) or _exempt(node, comments):
+                continue
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Call) \
+                        or not isinstance(sub.func, ast.Attribute) \
+                        or sub.func.attr not in COMPARATORS:
+                    continue
+                measured, threshold = _measured_operand(
+                    sub, durations, attributes, scopes.function(sub),
+                    scopes.cls(sub), constants)
+                if measured is None:
+                    continue
+                findings.append(Finding(
+                    path, sub.lineno, sub.col_offset + 1, "H4",
+                    "durée murale comparée à un seuil sous la seconde : %s < %g s"
+                    % (ast.unparse(measured), threshold), _enclosing(funcs, sub)))
+
+    if "H5" in wanted:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _called(node, alias, DISK)
+            if name and not _exempt(node, comments):
+                findings.append(Finding(path, node.lineno, node.col_offset + 1, "H5",
+                                        "état du disque de l'hôte : %s()" % name,
+                                        _enclosing(funcs, node)))
     return sorted(findings, key=lambda f: (f.lineno, f.col, f.rule))
 
 
@@ -300,10 +538,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--diff", metavar="REF",
                         help="n'analyser que les tests changés depuis REF (git diff REF...HEAD)")
     parser.add_argument("--json", action="store_true", help="sortie JSON")
+    parser.add_argument("--rules", metavar="H4,H5",
+                        help="ne garder que ces règles (virgules), pour un "
+                             "avertissement ciblé (gel, passe horloge)")
+    parser.add_argument("--max-findings", type=int, metavar="N",
+                        help="n'afficher que les N premiers constats (texte)")
     args = parser.parse_args(argv)
     if args.files and args.diff:
         print("donnez des FICHIERS ou --diff, pas les deux", file=sys.stderr)
         return 2
+    selected = None
+    if args.rules:
+        selected = {rule.strip() for rule in args.rules.split(",") if rule.strip()}
+        unknown = sorted(selected - set(RULES))
+        if not selected or unknown:
+            print("règle(s) inconnue(s) : %s" % (", ".join(unknown) or "(aucune)"),
+                  file=sys.stderr)
+            return 2
     try:
         files = args.files or (diff_files(REPO, args.diff) if args.diff
                                else default_files(REPO))
@@ -316,7 +567,10 @@ def main(argv: list[str] | None = None) -> int:
         path = REPO / rel
         if not path.is_file():
             continue
-        findings.extend(lint_source(rel, path.read_text(encoding="utf-8")))
+        findings.extend(lint_source(rel, path.read_text(encoding="utf-8"),
+                                    rules=selected))
+    if selected is not None:
+        findings = [finding for finding in findings if finding.rule in selected]
     findings.sort(key=lambda f: (f.path, f.lineno, f.col, f.rule))
 
     if args.json:
@@ -327,8 +581,13 @@ def main(argv: list[str] | None = None) -> int:
                                                   for r in sorted(RULES)}}},
                          ensure_ascii=False, indent=2))
     else:
-        for finding in findings:
+        shown = findings
+        if args.max_findings is not None and args.max_findings >= 0:
+            shown = findings[:args.max_findings]
+        for finding in shown:
             print(finding.render())
+        if len(shown) < len(findings):
+            print("… %d constat(s) de plus (--max-findings)" % (len(findings) - len(shown)))
         by_rule = ", ".join("%s %d" % (r, sum(1 for f in findings if f.rule == r))
                             for r in sorted(RULES))
         print("%d constat(s) dans %d fichier(s) — %s"

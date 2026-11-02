@@ -85,13 +85,69 @@ class ScriptTest(unittest.TestCase):
             os.makedirs(os.path.join(root, rel))
         return root
 
-    def main(self, root: str, checks=None) -> tuple[int, str]:
+    def main(self, root: str, checks=None, warn=None) -> tuple[int, str]:
         out = io.StringIO()
         with mock.patch.object(script.os, "getcwd", return_value=root), \
                 mock.patch.object(script, "CHECKS", checks or script.CHECKS), \
+                mock.patch.object(script, "WARN_CHECKS", warn or ()), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             code = script.main([])
         return code, out.getvalue()
+
+    def test_avertissement_rouge_ne_bloque_pas(self):
+        """#5427 : le lint d'herméticité avertit au gel, sans refuser."""
+        code, out = self.main(
+            self.tree(), (("vert", ["-c", "pass"]),),
+            warn=(("herméticité des tests #5427",
+                   ["-c", "print('H4 test_x: 0,05 s'); raise SystemExit(1)"]),))
+        self.assertEqual(code, 0)
+        self.assertIn("ok  vert", out)
+        self.assertIn("WARN herméticité des tests #5427", out)
+        self.assertIn("H4 test_x", out)
+
+    def test_avertissement_vert_est_ok(self):
+        code, out = self.main(
+            self.tree(), (("vert", ["-c", "pass"]),),
+            warn=(("herméticité des tests #5427", ["-c", "pass"]),))
+        self.assertEqual(code, 0)
+        self.assertIn("ok  herméticité des tests #5427", out)
+
+    def test_seuls_les_tests_changes_sont_avertis(self):
+        """Le diff gelé restreint le lint aux tests du lot."""
+        root = self.tree()
+        pathlib.Path(root, "tests", "test_rouge.py").write_text(
+            "import time\n"
+            "def test_x(self):\n"
+            "    debut = time.monotonic()\n"
+            "    elapsed = time.monotonic() - debut\n"
+            "    self.assertLess(elapsed, 0.05)\n", encoding="utf-8")
+        shutil.copyfile(REPO / "scripts" / "test-hermeticity-lint.py",
+                        pathlib.Path(root, "scripts", "test-hermeticity-lint.py"))
+        changed = ("herméticité des tests #5427",
+                   ["scripts/test-hermeticity-lint.py", "--max-findings", "10",
+                    "tests/test_rouge.py"])
+        with mock.patch.dict(script.os.environ, {script.PATHS_ENV:
+                                                 '["tests/test_rouge.py", "src/ameesh/x.py"]'}):
+            checks, why = script.warn_checks(root, script.os.environ)
+        self.assertEqual(checks, (changed,))
+        self.assertIn("1 changed", why)
+        code, out = self.main(root, (("vert", ["-c", "pass"]),), warn=checks)
+        self.assertEqual(code, 0)
+        self.assertIn("WARN", out)
+        self.assertIn("tests/test_rouge.py", out)
+
+    def test_aucun_test_change_aucun_avertissement(self):
+        with mock.patch.dict(script.os.environ, {script.PATHS_ENV:
+                                                 '["src/ameesh/x.py"]'}):
+            checks, why = script.warn_checks("/tmp", script.os.environ)
+        self.assertEqual(checks, ())
+        self.assertIn("no changed test", why)
+
+    def test_diff_illisible_avertit_sur_toute_la_suite(self):
+        with mock.patch.dict(script.os.environ, {script.PATHS_ENV: "pas du json"}):
+            checks, why = script.warn_checks("/tmp", script.os.environ)
+        self.assertEqual(checks, script.WARN_CHECKS)
+        self.assertIn("unreadable", why)
 
     def test_chaque_test_nomme_existe(self):
         """Un contrôle renommé ou retiré de la suite ne passe pas en silence."""
@@ -175,6 +231,23 @@ class GuardTest(unittest.TestCase):
         result = freeze_checks.run(self.repo.root, sha)
         self.assertEqual(result["result"], "green")
         self.assertIn("compilation ok", result["output"])
+
+    def test_paths_env_transmet_le_diff_au_script(self):
+        """#5427 : le script avertit sur les tests du lot, pas toute la suite."""
+        script_source = (
+            "import json, os, sys\n"
+            "raw = os.environ.get('AMEESH_FREEZE_PATHS')\n"
+            "print('paths=%s' % raw)\n"
+            "sys.exit(0 if raw == json.dumps(['tests/test_x.py']) else 1)\n")
+        sha = self.repo.commit(script=script_source)
+        result = freeze_checks.run(self.repo.root, sha, paths=["tests/test_x.py"])
+        self.assertEqual(result["result"], "green")
+        self.assertIn('paths=["tests/test_x.py"]', result["output"])
+        # sans `paths`, la variable est retirée de l'environnement du script
+        sha = self.repo.commit(script="import os, sys\n"
+                                      "sys.exit(1 if os.environ.get("
+                                      "'AMEESH_FREEZE_PATHS') else 0)\n")
+        self.assertEqual(freeze_checks.run(self.repo.root, sha)["result"], "green")
 
     def test_rouge_refuse_avec_la_sortie_et_l_echappatoire(self):
         sha = self.repo.commit(script=RED)
