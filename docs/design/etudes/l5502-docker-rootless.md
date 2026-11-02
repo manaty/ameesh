@@ -19,8 +19,7 @@ generated: { by: "mty-amh-impl-13", at: "2026-11-02" }
   pour les deux moteurs. Les points propres à Docker (rootlesskit, healthcheck
   dans le démon, redémarrage du service) restent à confirmer. Pour cela, le
   bureau doit d'abord poser les prérequis (étape 0). L'essai est isolé :
-  `DOCKER_CONFIG` jetable, puis nettoyage complet. Il a lieu après réparation
-  du socket systemd d'AG3 (#5505).
+  `DOCKER_CONFIG` jetable, puis nettoyage complet.
 - **Repli sans dépense** si Docker rootless ne passe pas : Podman rootless
   derrière la même CLI `docker` (`DOCKER_HOST` vers le socket de l'API
   Podman), avec trois réglages (§3.2). Le repli décrit dans le lot, des hôtes
@@ -201,8 +200,7 @@ Trois réglages sont nécessaires :
    `KillMode=process`, sinon le port forwarding meurt en silence au
    redémarrage.
 3. Healthchecks : ils dépendent du socket privé du gestionnaire systemd
-   utilisateur. Sur AG3, il est périmé, et seul un redémarrage de
-   `user@1001` le répare (redémarrage déjà prévu au §4).
+   utilisateur. Sur AG3, il est périmé (suivi séparé : #5505).
 
 # 4. Plan de bascule par hôte
 
@@ -218,7 +216,7 @@ l'étape 6, **toute commande `docker` du plan porte `DOCKER_HOST=$RF` ou
 
 | # | Geste | Qui | Preuve |
 |---|---|---|---|
-| 0 | **Essai de confirmation sur AG3**, après les avis et après la relance du staging du soir (pilote, 14:33Z). Avant : socket `systemd/private` d'AG3 réparé (#5505), sinon `systemctl --user daemon-reload/start` n'aboutit pas. Prérequis §3.1 (bureau), puis installation avec `DOCKER_CONFIG` jetable, `data-root` sous `$TMPDIR`, unité `docker.service` utilisateur. Même grille qu'au §2, toutes les commandes sous `DOCKER_HOST=$RL`. **Nettoyage** : `systemctl --user disable --now docker`, `dockerd-rootless-setuptool.sh uninstall` (même `DOCKER_CONFIG`), retrait de l'unité, du `DOCKER_CONFIG` jetable et du `data-root` (`rootlesskit rm -rf`) | bureau (root, prérequis), puis mty-amh-impl-13 | grille verte consignée sur le lot ; après nettoyage : `docker context ls` = `default *` seul, `docker info` non qualifié = rootful, `systemctl --user status docker` absent, aucun processus `rootlesskit`/`dockerd` d'ameesh |
+| 0 | **Essai de confirmation sur AG3**, après les avis et après la relance du staging du soir (pilote, 14:33Z). Prérequis §3.1 (bureau), puis installation avec `DOCKER_CONFIG` jetable, `data-root` sous `$TMPDIR`, unité `docker.service` utilisateur. Même grille qu'au §2, toutes les commandes sous `DOCKER_HOST=$RL`. **Nettoyage** : `systemctl --user disable --now docker`, `dockerd-rootless-setuptool.sh uninstall` (même `DOCKER_CONFIG`), retrait de l'unité, du `DOCKER_CONFIG` jetable et du `data-root` (`rootlesskit rm -rf`) | bureau (root, prérequis), puis mty-amh-impl-13 | grille verte consignée sur le lot ; après nettoyage : `docker context ls` = `default *` seul, `docker info` non qualifié = rootful, `systemctl --user status docker` absent, aucun processus `rootlesskit`/`dockerd` d'ameesh |
 | 1 | **Drainer l'hôte** et le garder drainé jusqu'à l'étape 9 : plus de nouveau tour, tours en cours finis ou rendus (§4 du processus) | pilote / bureau | aucun tour actif (`ameesh hosts`) |
 | 2 | **Marge disque** : `df -h /` et `DOCKER_HOST=$RF docker system df`. Seuil : espace libre ≥ taille des images à recharger (étape 4) + taille du volume `ameesh-pg-data` + 10 GiB. Sinon, purge d'abord des images rootful inutiles (tout sauf `postgres:17`) et des conteneurs de test arrêtés, par le bureau. Repère : AG2 à 14:40Z, 19,4 GiB libres sur 135 G, images rootful 13,74 GB, volumes 3,87 GB (impl-08) | agent (mesure), bureau (purge) | sortie de `df` et `system df` collée sur le lot |
 | 3 | Prérequis §3.1 ; vérifier `newuidmap`/`newgidmap` setuid, `slirp4netns`, `fuse-overlayfs`, `/usr/bin/docker-init`, `ameesh` dans `/etc/subuid`/`/etc/subgid` (65536), linger, profil `rootlesskit` chargé (`aa-status`) | bureau (root) | sortie des commandes |
@@ -256,5 +254,5 @@ valeur propre. La pose L2 reste bloquée tant que le retour arrière est actif.
   `docker`). À traiter avec ce plan une fois AG1/AG2 faits, sur décision du
   pilote.
 - AG3 : socket `systemd/private` du gestionnaire utilisateur périmé depuis le
-  01/11 02:05 (`connection refused`). Il est réparé au prochain redémarrage de
-  `user@1001`, à signaler au bureau.
+  01/11 02:05 (`connection refused`) : lot #5505, suivi séparé, sans lien
+  d'ordre avec ce plan.
