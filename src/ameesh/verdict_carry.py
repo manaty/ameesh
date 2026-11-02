@@ -156,6 +156,9 @@ def carried_mark_note(lot: int, freeze: Mapping, plan: Mapping,
                    "sha": _norm(freeze.get("sha"))},
         "carried": [dict(entry or {}) for entry in plan.get("carried") or ()],
         "why": str(plan.get("detail") or ""),
+        # #5481 : la marque écrite avant le report est une provision ; le
+        # report accompli en écrit une autre, sans ce drapeau.
+        "provisional": bool(plan.get("provisional")),
     }
     return "%s%d:%d: %s" % (CARRIED_MARK_PREFIX, int(lot),
                             int(payload["freeze"]["id"]),
@@ -186,6 +189,20 @@ def carried_mark_of(note: str) -> Optional[dict]:
 
 def _norm(sha) -> str:
     return str(sha or "").strip().lower()
+
+
+def _repo_path(path) -> str:
+    """Un dépôt local fourni en chemin relatif (`--repo .`), résolu tôt.
+
+    Le report lit ensuite ce chemin depuis le clone radar : un `"."` y
+    désignerait le clone, pas le dépôt du gel. Les URL et chemins absolus sont
+    rendus tels quels."""
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if os.path.isabs(text) or "://" in text or text.startswith("git@"):
+        return text
+    return os.path.abspath(text)
 
 
 def _same(a, b) -> bool:
@@ -1013,7 +1030,7 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
     if all(_decided(notes, m.get("sha"), declared) for m in candidates.values()):
         out["detail"] = "already decided for this freeze"
         return out, [], [], ""
-    repo = repo or lot_class.repository(cfg, row)
+    repo = _repo_path(repo or lot_class.repository(cfg, row))
     if not repo:
         out.update(result="no-repository", detail="no repository known for the lot on this "
                    "host: the executor's branch sweep retries")
@@ -1275,8 +1292,8 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
     (#4849). Sans cette distinction, une lecture ratée laissait le lot en `qa`
     pour toujours : le report avait déjà marqué ses verdicts « décidés »,
     aucun écrivain ne revenait. Rend
-    `{result: validated|pending|closed|exhausted|idle, detail}` ; ne lève
-    jamais."""
+    `{result: validated|pending|closed|exhausted|stale|idle, detail}` ; ne
+    lève jamais."""
     row = work.get(db, lot)
     if not row or str(row.get("state") or "") != "qa":
         return {"result": "idle", "detail": "lot not in qa"}
@@ -1285,6 +1302,15 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
     marks = work.milestones(db, lot)
     latest = plan_git.latest_freeze(marks)
     freeze = freeze or latest
+    # #5481 : un passage peut porter un gel qui n'est plus celui du lot (gel
+    # concurrent, regel de la même tête). Le quorum ne s'applique qu'à la tête
+    # courante : une tête changée n'est jamais validée par un vieux report.
+    # Un regel de la même tête garde la même preuve (les verdicts portent sur
+    # le SHA, pas sur l'identifiant du gel).
+    if (not freeze or not latest
+            or not plan_git.same_commit(freeze.get("sha"), latest.get("sha"))):
+        return {"result": "stale",
+                "detail": "the carried freeze is no longer the lot's head"}
     if not _carried_ok_on_freeze(marks, freeze):
         return {"result": "idle", "detail": "no carried ok verdict on the frozen head"}
     # #4834 : la porte est lue avec la même lecture que la garde de
@@ -1336,6 +1362,24 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
             exc = gate2_exc
     else:
         exc = gate_exc
+    # #5481 : la course entre hôtes n'est pas une panne. Entre la lecture de
+    # l'état et le geste, un autre passage a pu valider le lot (`work.move`
+    # lève alors « already in validated ») ou le faire sortir de `qa`. On
+    # relit l'état : validé est le résultat attendu, et rien n'est compté
+    # comme essai. Sans cette relecture, trois hôtes brûlaient chacun cinq
+    # tentatives sur un lot déjà validé (nexlink #5434).
+    try:
+        now = work.get(db, lot)
+    except Exception:  # noqa: BLE001 - une relecture ratée ne conclut pas
+        now = None
+    if now is not None:
+        now_state = str(now.get("state") or "")
+        if now_state == "validated":
+            return {"result": "validated",
+                    "detail": "another writer already validated the carried quorum"}
+        if now_state != "qa":
+            return {"result": "idle",
+                    "detail": "the lot left qa during the carried quorum"}
     # La porte n'a pas conclu : sans dépôt local, cet hôte ne peut rien
     # affirmer et ne doit pas consommer le budget d'un autre hôte.
     try:
@@ -1417,7 +1461,9 @@ def _keep_reviewers(tx, lot: int, row: dict, freeze: dict, plan: list, out: dict
         current_names = [str((reviewer or {}).get("name") or "").strip()
                          for reviewer in (effective[2].get("reviewers") or ())]
         current_names = [name for name in current_names if name]
-    if effective is None or effective[1] != "carried" or current_names != wanted_names:
+    if (effective is None or effective[1] != "carried"
+            or current_names != wanted_names
+            or bool((effective[2] if effective else {}).get("provisional"))):
         # #2487 : un report tardif qui aboutit après une vraie désignation
         # (repli `force`) écrit une marque plus récente ; la colonne et la
         # lecture suivent alors le report, pas la sélection supplantée. Les
