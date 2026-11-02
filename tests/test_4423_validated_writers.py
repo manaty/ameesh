@@ -107,12 +107,15 @@ class ValidatedWritersTest(PgTestCase):
         self.mark()
         self.assertEqual(self.current_state(), "qa")
 
-    def test_same_head_refreeze_requires_a_new_verdict(self):
+    def test_same_head_refreeze_keeps_the_acquired_quorum(self):
+        # #5481 : un regel du même SHA ne périme pas les verdicts rendus sur
+        # ce contenu immuable. Le gel repasse par `qa`, puis la porte se relit
+        # sur la même tête et le quorum la rouvre — aucune nouvelle relecture.
         self.read.return_value = {"ok": True}
         self.mark()
         self.assertEqual(self.current_state(), "validated")
         self.mark("frozen")
-        self.assertEqual(self.current_state(), "qa")
+        self.assertEqual(self.current_state(), "validated")
 
     def test_concurrent_note_does_not_cancel_the_quorum(self):
         # #5016 : une note concurrente ne change que `updated_at` ; la garde

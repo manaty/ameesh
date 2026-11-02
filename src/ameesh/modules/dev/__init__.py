@@ -117,6 +117,17 @@ def workspaces():
     return facade
 
 
+def latest_freeze(marks):
+    """Le dernier gel d'un lot (jalon `frozen` le plus récent), ou None.
+
+    L97 : le cœur lit la frise par le registre (``registry.get("dev")``),
+    jamais en important l'implémentation du plan de fusion. Lecture pure, sans
+    écriture ni réseau ; le profil nu n'a pas de module et l'appelant garde son
+    repli."""
+    from . import plan_git
+    return plan_git.latest_freeze(marks)
+
+
 def _workspace_finding(finding):
     """One ``canon check`` workspace finding, shaped like a module finding.
 
