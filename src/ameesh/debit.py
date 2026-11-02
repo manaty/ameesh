@@ -686,6 +686,7 @@ def _mark(event: dict) -> dict | None:
             "state": state, "required": _mark_int(document.get("required")),
             "missing": _mark_int(document.get("missing")),
             "why": str(document.get("why") or "").strip(),
+            "unknown_authors": document.get("unknown_authors") or [],
             "unreadable": False, "at": float(event.get("at_ts") or 0.0)}
 
 
@@ -929,7 +930,13 @@ def designations(milestones: list[dict], events: list[dict], *,
             "quorum": _iso(quorum_at) if quorum_at is not None else None,
             "required": required, "acquired": acquired,
             "shortfall": shortfall, "why": str((latest_mark or {}).get("why") or ""),
-            "cause": cause}
+            "cause": cause,
+            "author_families": (latest_mark or {}).get("author_families") or [],
+            "unknown_authors": (latest_mark or {}).get("unknown_authors") or [],
+            "acquired_families": sorted({
+                ((latest_mark or {}).get("reviewer_families") or {}).get(actor)
+                or (agent_families or {}).get(actor) or ""
+                for actor in by_actor if actor not in authors} - {""})}
 
 
 def _verdict_on_head(verdict: dict, freeze: dict, freeze_sha: str,
@@ -1227,6 +1234,10 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 }
             else:
                 blocked = blocking_review(lot_milestones, freeze)
+            from . import review_family_paused
+            family_pauses = review_family_paused.blocked(
+                designation, agents, project=item.get("app") or "",
+                families=known_families, now=now)
             age = _age(now, freeze.get("at_ts"))
             state = {
                 "lot": ident, "title": item.get("title") or "",
@@ -1242,6 +1253,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 # booléen : « 0 famille éligible » n'est pas « quorum atteint ».
                 "missing_reviews": (int(designation.get("shortfall") or 0)
                                     if designation["missing"] else 0),
+                "review_family_paused": family_pauses,
                 "missing_cause": designation.get("cause") or None,
                 "missing_reason": ((designation.get("why") or None)
                                    if designation["missing"] else None),
@@ -1413,7 +1425,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
             continue                    # la retenue active porte already sa cause
         state = state_by_lot.get(int(row["lot"]))
         reviewers = row["pending_reviewers"]
-        if reviewers:
+        if row.get("review_family_paused"):
+            pauses = row["review_family_paused"]
+            add_wait("review_family_paused", row, row["frozen_ts"],
+                     ", ".join(p["family"] for p in pauses),
+                     "vérifier le compte de repli ou demander une décision de plafond",
+                     pauses=pauses)
+        elif reviewers:
             add_wait("qa", row, row["frozen_ts"], ", ".join(reviewers),
                      ", ".join(GESTURES["review"].format(who=name, lot=row["lot"])
                                for name in reviewers),
@@ -2216,6 +2234,9 @@ _EVENTS_SQL = """
 
 _AGENTS_SQL = """
     SELECT name, status, host, harness, model, effort,
+           team, relit, mode, status_text, session_account, session_harness,
+           capabilities, roles, ephemeral, operator_paused,
+           extract(epoch FROM retired_at)::float8 AS retired_ts,
            extract(epoch FROM last_turn_at)::float8 AS last_turn_ts
       FROM agent_registry
      ORDER BY name

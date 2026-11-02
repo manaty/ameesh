@@ -3190,6 +3190,9 @@ class Notifier:
                 entry = sent[key]
                 if entry.get("type") == "staging_interrupted" and "staging.sequence" in unreadable:
                     continue
+                if entry.get("type") == "review_family_paused" and (
+                        entry.get("resume_ts") is None or now < entry["resume_ts"]):
+                    continue  # same budget episode, even if no lot waits for a pass
                 if entry.get("type") == "idle_capacity" and now - _last_brief_ts(entry) \
                         < alert_briefs.REMIND_AFTER_S:
                     # #2602: brief gaps in available capacity are not a fresh
@@ -3237,7 +3240,8 @@ class Notifier:
             elif entry.get("pending"):
                 # #3036 : une remise a échoué ; la passe la retente.
                 due.append((key, alert, entry))
-            elif not entry.get("reminded") and now - float(entry["sent_ts"]) \
+            elif alert.get("type") != "review_family_paused" \
+                    and not entry.get("reminded") and now - float(entry["sent_ts"]) \
                     >= alert_briefs.REMIND_AFTER_S:
                 due.append((key, alert, entry))
             elif entry.get("dead"):
@@ -3493,7 +3497,8 @@ class Notifier:
                              # `mail_undeliverable` reste un envoi unique à la
                              # levée (comportement L118) : une relance de 6 h
                              # n'ajouterait rien au courrier déjà en souffrance.
-                             "reminded": kind == "mail_undeliverable",
+                             "reminded": kind in ("mail_undeliverable", "review_family_paused"),
+                             "resume_ts": alert.get("resume_ts"),
                              "to": sorted(set(delivered)),
                              # #3036 : les écartés, pour réévaluer la passe
                              # suivante et remettre à qui est revenu, et les

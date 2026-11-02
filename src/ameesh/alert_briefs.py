@@ -52,7 +52,7 @@ BRIEFED_TYPES = ("staging_interrupted", "host_idle_reserved", "baseline_oversize
                  # #1466 : une pause qui dure est un plafond périmé, un compte
                  # retiré ou une configuration que l'exécuteur ne lit pas ; les
                  # orchestrateurs peuvent vérifier, l'auditeur suit
-                 "budget_pause_long",
+                 "budget_pause_long", "review_family_paused",
                  # #3969 : un compte invalide sur l'hôte — l'équipe le répare
                  "account_config_invalid",
                  # #3961 : une pause opérateur restée posée (maintenance
@@ -1197,6 +1197,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "waiting_without_question":
             text = _waiting_without_question(alert)
             teams = _projects(by_name, alert.get("agent"))
+        elif kind == "review_family_paused":
+            text = alert["detail"]
+            teams = {row["project"] for row in alert["held_lots"] if row.get("project")}
+            extra.update(_fallback_bureau(by_name, text))
         elif kind == "critical_budget_pause":
             text = _critical_budget_pause(alert)
             teams = _projects(by_name, alert.get("agent"))

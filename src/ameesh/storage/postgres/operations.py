@@ -170,6 +170,7 @@ class Operations(interface.Operations):
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
+                   r.relit, r.session_harness, r.session_account,
                    -- #4779 : le profil de relecture (capacité `propose`, rôles),
                    -- lu par `file_decoupage._reviewer_spares`
                    r.capabilities, r.roles,
