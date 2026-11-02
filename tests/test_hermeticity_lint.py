@@ -83,6 +83,84 @@ class RulesTest(unittest.TestCase):
             "def test_x(self):\n"
             "    self.assertLess(datetime.datetime.now() - debut, 5)\n"), ["H1"])
 
+    def test_duration_variable_against_a_subsecond_threshold(self):
+        """#5302 : la mesure a quitté l'assertion, H1 ne la voit plus."""
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    debut = time.monotonic()\n"
+            "    wake_s = time.monotonic() - debut\n"
+            "    self.assertLess(wake_s, 0.05)\n"), ["H4"])
+
+    def test_threshold_first_and_chained_durations(self):
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    debut = time.time()\n"
+            "    elapsed = time.time() - debut\n"
+            "    reste = elapsed\n"
+            "    self.assertGreater(0.2, reste)\n"), ["H4"])
+
+    def test_duration_against_a_second_or_more_is_not_h4(self):
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    debut = time.monotonic()\n"
+            "    elapsed = time.monotonic() - debut\n"
+            "    self.assertLess(elapsed, 5)\n"), [])
+
+    def test_zero_is_a_logic_bound_not_a_latency(self):
+        self.assertEqual(self.rules(
+            "import time\n"
+            "def test_x(self):\n"
+            "    debut = time.monotonic()\n"
+            "    reste = debut - time.monotonic()\n"
+            "    self.assertLess(reste, 0)\n"), [])
+
+    def test_a_non_clock_value_is_not_a_duration(self):
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    elapsed = compute()\n"
+            "    self.assertLess(elapsed, 0.05)\n"), [])
+
+    def test_self_attribute_duration(self):
+        self.assertEqual(self.rules(
+            "import time\n"
+            "class T:\n"
+            "    def setUp(self):\n"
+            "        self.elapsed = time.monotonic() - 0\n"
+            "    def test_x(self):\n"
+            "        self.assertLess(self.elapsed, 0.4)\n"), ["H4"])
+
+    def test_named_subsecond_threshold(self):
+        self.assertEqual(self.rules(
+            "import time\n"
+            "BUDGET = 0.05\n"
+            "def test_x(self):\n"
+            "    debut = time.monotonic()\n"
+            "    wake_s = time.monotonic() - debut\n"
+            "    self.assertLess(wake_s, BUDGET)\n"), ["H4"])
+
+    def test_disk_usage_is_h5(self):
+        self.assertEqual(self.rules(
+            "import shutil\n"
+            "def test_x(self):\n"
+            "    libre = shutil.disk_usage('/').free\n"), ["H5"])
+
+    def test_patched_disk_usage_is_not_a_read(self):
+        self.assertEqual(self.rules(
+            "from unittest import mock\n"
+            "def test_x(self):\n"
+            "    with mock.patch.object(shutil, 'disk_usage'):\n"
+            "        pass\n"), [])
+
+    def test_disk_usage_exemption(self):
+        self.assertEqual(self.rules(
+            "import shutil\n"
+            "def test_x(self):\n"
+            "    # hermeticity: allow — disque simulé par le banc\n"
+            "    shutil.disk_usage('/')\n"), [])
+
     def test_exemption_marker(self):
         self.assertEqual(self.rules(
             "import time\n"
@@ -193,6 +271,40 @@ class CliTest(unittest.TestCase):
             rc = hermeticity.main(["tests/x.py", "--diff", "origin/main"])
         self.assertEqual(rc, 2)
         self.assertIn("pas les deux", err.getvalue())
+
+    def test_rules_filter_keeps_only_the_requested_ones(self):
+        path = self.file(
+            "import shutil, time\n"
+            "def test_x(self):\n"
+            "    shutil.disk_usage('/')\n"
+            "    self.assertLess(time.time() - debut, 5)\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = hermeticity.main([str(path), "--rules", "H5"])
+        self.assertEqual(rc, 1)
+        self.assertIn("H5", out.getvalue())
+        self.assertNotIn("H1 horloge", out.getvalue())
+
+    def test_unknown_rule_is_a_usage_error(self):
+        path = self.file("def test_x(self):\n    pass\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = hermeticity.main([str(path), "--rules", "H9"])
+        self.assertEqual(rc, 2)
+        self.assertIn("H9", err.getvalue())
+
+    def test_max_findings_truncates_the_text_not_the_judgement(self):
+        path = self.file(
+            "import time\n"
+            "def test_x(self):\n"
+            "    self.assertLess(time.time() - debut, 5)\n"
+            "    self.assertLess(time.time() - debut, 6)\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = hermeticity.main([str(path), "--max-findings", "1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("de plus", out.getvalue())
+        self.assertIn("2 constat(s)", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #5427 — les modules que la passe horloge/fuseau rejoue toujours, en plus des
+# constats H3 du lint d'herméticité (tests/test-hermeticity-lint.py).
+#
+# Chacun vient d'un lot correctif qui a rougi un paquet sur l'horloge ou
+# l'hôte : la graine garde la régression quand le lint, lui, ne voit pas le
+# défaut (une latence mesurée, un âge recalculé, un disque de runner).
+# Un module par ligne, nom qualifié ; `#` commente.
+#
+# #2600 (bail du runner) n'est pas ici : il ne dépend pas du jour et son test
+# de processus dépasse la fenêtre d'un scénario ; la suite ordinaire le couvre.
+# #4168 pause jugée à l'horloge de la base, en avance sur le runner
+tests.test_3961_pause_echeance
+# #5086 argv0 et Python sous hostedtoolcache
+tests.test_5038_child_secrets
+# #5302 réveil du dispatcher mesuré à 0,05 s
+tests.test_4594_grant_stages
+# #5314 âge `state_for_s` recalculé entre deux lectures
+tests.test_mesh_cli
+# #5321 disque réel du runner dans le test de la garde
+tests.test_l159e_guard
+# #5412 « demain » sur le jour UTC du processus, passe au lendemain
+tests.test_5151_planif_p1
