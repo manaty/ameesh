@@ -679,6 +679,13 @@ son début l'étape, son heure et le verdict par hôte ; les sorties, commandes 
 secrets restent hors de ce suivi. Le lanceur publie aussi un battement
 (`STAGING_BATTEMENT_S`, 120 s) et son dernier progrès, étape ou runner.
 
+Le battement lit l'état du lanceur dans `/proc` : un lanceur zombie ou
+disparu l'arrête, au lieu de continuer à publier. `STAGING_BATTEMENT_S` doit
+être un nombre fini et positif ; une valeur nulle, non numérique ou infinie
+refuse la séquence avant le premier publish et toute mutation. Une étape close
+garde son heure de début (`started`) dans sa ligne de journal, donc le snapshot
+suivant affiche ce début et non la fin.
+
 Le retard (#5425) se juge sur ces preuves : sans battement ni progrès depuis
 `STAGING_SILENCE_S` (900 s), ou lanceur vivant sans progrès depuis un plafond
 de tour (`STAGING_PLAFOND_TOUR_S`, 1800 s) plus cette marge, réduite à
