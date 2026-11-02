@@ -8,8 +8,9 @@ heartbeat, its last progress (a step or a runner), and the budget of the
 current host, a function of its runners and of the turn cap. The fixed
 `deadline` only judges a launcher older than the heartbeat.
 #5450: the launchers themselves read the same verdict (`Monitor`): a late run
-is stopped only once the reason persisted after the alert, through the normal
-failure path (TERM, grace, KILL), never on a global clock while it progresses.
+is stopped only once the reason persisted after the alert (TERM, grace, KILL),
+never on the global fallback while it progresses. The service unit remains the
+last-resort hard bound above that fallback.
 The shared `staging.attested` proof settles a run whose last snapshot
 publication failed (#4898 N2). Request history is read per key: only a later
 completed deployment settles an earlier failure, never a partial one.
@@ -44,8 +45,9 @@ STAGING_FALLBACK_S = 11 * 3600.0
 #: #5450: a late run is stopped only after this delay, so the independent
 #: alerts pass reports it to the operator first.
 STOP_AFTER_ALERT_S = 900.0
-#: #5450: after SIGTERM, the launcher's normal failure path (rollback of the
-#: current host) gets this grace before SIGKILL.
+#: #5450: after SIGTERM, the launcher gets this grace to trace the open
+#: host/step and mail the manual rollback before SIGKILL. It does not attempt
+#: the rolling restart of a rollback inside this window.
 STOP_GRACE_S = 300.0
 #: #5450: re-read interval of a monitored launcher.
 WATCH_INTERVAL_S = 5.0

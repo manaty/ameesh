@@ -700,11 +700,15 @@ même verdict dans les deux lanceurs : l'exécutant élu
 (`staging_executor`) et la release synchrone (`run_staging`). Elle n'arrête
 la séquence que si `overdue()` rend encore une raison **15 min après la
 première alerte** : l'opérateur voit ainsi l'alerte avant le geste. L'arrêt
-suit le chemin d'échec normal — TERM au groupe, délai de grâce de 5 min pour
-que `staging.sh` remette l'hôte en cours à sa version précédente, puis KILL —
-et la raison d'`overdue()` est enregistrée dans la demande et le snapshot
-`staging.sequence`. Une séquence qui progresse n'est donc plus tuée par une
-horloge globale.
+est un TERM au groupe, puis un KILL après 5 min. `staging.sh` **ne tente pas
+le retour automatique** de l'hôte en cours dans cette fenêtre : un retour
+refait son redémarrage glissant (jusqu'à 30 min par hôte) et ne tiendrait pas ;
+il trace l'étape ouverte et remet au pilote la marche manuelle
+(`vm.sh agents retour`, `poste.sh retour`), l'hôte restant sur son
+`previous-sha`. Le retour automatique reste celui des échecs d'étapes
+ordinaires, hors arrêt par la surveillance. La raison d'`overdue()` est
+enregistrée dans la demande et le snapshot `staging.sequence` ; aucun
+« remis » n'est écrit sans trace `retour ok`.
 
 `STAGING_TIMEOUT_S` (39600 s, 11 h) devient le **secours global** d'un
 lanceur qui ne publie aucun battement ; il ne juge plus une séquence qui bat.

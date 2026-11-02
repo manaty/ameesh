@@ -411,7 +411,8 @@ class _AlertsExecution:
         The caller keeps the lease; `lost` stays clear, so the failure is
         recorded as the sequence's own (with `reason`), not as an interrupted
         attempt to recover. A longer grace than the lease stop lets the
-        launcher's normal failure path roll the current host back.
+        launcher trace the open host/step and mail the manual rollback; the
+        rollback itself is not attempted inside this grace.
         """
         with self.lock:
             if self.stopped.is_set():

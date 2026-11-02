@@ -65,8 +65,9 @@ STAGING_TIMEOUT_S = staging_watch.STAGING_FALLBACK_S
 STAGING_UNIT_GRACE_S = 600.0
 #: pause between two reads of those units
 STAGING_UNIT_POLL_S = 5.0
-#: after SIGTERM to a stopped staging group, before SIGKILL. The launcher's
-#: normal failure path (rollback of the current host) runs inside this grace.
+#: after SIGTERM to a stopped staging group, before SIGKILL. The launcher
+#: traces the open host/step and mails the manual rollback inside this grace;
+#: it does not attempt a rolling restart that cannot fit.
 STAGING_KILL_GRACE_S = staging_watch.STOP_GRACE_S
 #: last bounded read of the staging output once its units are settled: a
 #: survivor may still hold the pipe (`systemd-run --pipe`)
@@ -2383,8 +2384,9 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 # `communicate` kills bash only; the sequence's ssh/vm.sh
                 # children would survive and keep the worktree/flock. Kill
                 # the whole session started for this run, then wait for it.
-                # The launcher's TERM trap rolls the current host back
-                # inside STAGING_KILL_GRACE_S (normal failure path, #5450).
+                # The launcher's TERM trap traces the open host/step and
+                # mails the manual rollback inside STAGING_KILL_GRACE_S; it
+                # never claims a rollback it did not finish (#5450).
                 _kill_group(proc, signal.SIGTERM)
                 wait(STAGING_KILL_GRACE_S)
                 if read["output"] is None:

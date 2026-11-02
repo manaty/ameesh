@@ -83,7 +83,7 @@ printf 'call host=%s action=%s args=%s\n' "$host" "$action" "$*" >> "$state/call
 # #5450 : un geste long laisse le temps d'envoyer TERM au lanceur.
 if grep -qx "lent=$host:$action" "$state/scenario" 2>/dev/null; then
   printf 'slow host=%s action=%s\n' "$host" "$action" >> "$state/calls.log"
-  sleep 30
+  sleep "${DUREE_LENT:-30}"
 fi
 if grep -qx "ko=$host:$action" "$state/scenario" 2>/dev/null; then
   grep -vx "ko=$host:$action" "$state/scenario" > "$state/scenario.tmp" || true
@@ -392,12 +392,20 @@ class StagingTest(unittest.TestCase):
                 self.assertTrue(chemin.startswith(str(self.root)),
                                 'executable hors bac a sable : %s' % line)
 
-    def test_term_on_an_open_step_rolls_the_current_host_back(self):
+    def test_term_on_an_open_step_does_not_attempt_a_rollback(self):
+        """#5450 blocking: a rollback's rolling restart cannot fit the grace.
+
+        A `retour` would take up to a turn per runner; the fake one is set
+        longer than STOP_GRACE_S (400 s), so the trap must not start it at
+        all. It traces the open step, mails the manual command, and stops.
+        """
         import signal
         import time
-        (self.state / 'scenario').write_text('lent=ameesh-agents-2:installer\n')
+        (self.state / 'scenario').write_text(
+            'lent=ameesh-agents-2:installer\nlent=ameesh-agents-2:retour\n')
+        env = dict(self.env, DUREE_LENT='400')
         proc = subprocess.Popen(
-            ['bash', str(self.script_dir / 'staging.sh')], env=self.env,
+            ['bash', str(self.script_dir / 'staging.sh')], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=True)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
@@ -411,9 +419,16 @@ class StagingTest(unittest.TestCase):
         os.killpg(proc.pid, signal.SIGTERM)
         out, err = proc.communicate(timeout=60)
         self.assertEqual(proc.returncode, 1, (out, err))
-        self.assertTrue(any('host=ameesh-agents-2 action=retour' in line
+        self.assertFalse(any('action=retour' in line for line in self.calls()))
+        self.assertIn('retour non tente', err)
+        traces = self.traces()
+        step = [row for row in traces if row.get('hote') == 'ameesh-agents-2'
+                and row.get('etape') == 'installer' and row.get('verdict') == 'ko']
+        self.assertTrue(step, traces)
+        self.assertIn('retour non tente', step[-1]['detail'])
+        self.assertTrue(any('mesh-design' in line
+                            and "retour automatique n'a ete tente" in line
                             for line in self.calls()))
-        self.assertIn('retour effectue et controle', err)
         self.assert_no_escape()
 
     def test_environment_is_isolated(self):

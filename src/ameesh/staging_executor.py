@@ -288,9 +288,11 @@ def tick(db, cfg, options) -> dict:
                 stop_grace=staging_watch.STOP_GRACE_S)
             reason = getattr(execution, "stop_reason", None)
             if isinstance(reason, str) and reason:
-                # A monitored stop is the normal failure path: the launcher
-                # rolled the current host back before exiting (TERM trap).
-                # Keep the reason in the request and the shared snapshot.
+                # A monitored stop is recorded as failed. The launcher does
+                # not attempt the current host's rollback inside the grace
+                # (its rolling restart cannot fit); the TERM trap traces the
+                # open step and mails the manual rollback. Never claim a
+                # rollback without a `retour ok` trace.
                 monitor.stop(reason)
                 result = dict(attempt, state="failed", exit=code, reason=reason)
                 _record(db, options["key"], result, lease=lease)

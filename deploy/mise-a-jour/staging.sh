@@ -1104,17 +1104,20 @@ arreter_battement() {
   SUIVI_BATTEMENT_PID=
 }
 # #5450 : la surveillance (run_staging, staging_executor) arrete une sequence
-# retardee par TERM. Le chemin d'echec normal est conserve : si une etape
-# d'hote est ouverte, l'hote en cours est remis a sa version precedente
-# (echec_hote), puis la sequence s'arrete. Entre deux etapes, ou avant la
-# boucle des hotes, il n'y a rien a remettre : arret direct. L'appelant laisse
-# STOP_GRACE_S a ce chemin avant son KILL.
+# retardee par TERM. Aucun retour automatique n'est tente ici : le retour d'un
+# hote refait son redemarrage glissant (jusqu'a 30 min par hote), il ne tient
+# pas dans la grace avant le KILL du lanceur. Une remise a moitie faite serait
+# pire qu'une sequence arretee : on trace l'etape ouverte, on remet la marche
+# manuelle au pilote, et la sequence s'arrete. Le retour automatique reste
+# celui des echecs d'etapes ordinaires (echec_hote), hors de cette fenetre.
 arret_surveillance() {
-  local hote="" etape="" debut="" marque="" lignes=""
+  local hote="" etape="" debut="" marque="" lignes="" outil detail
   [ "$ARRET_SURVEILLANCE" = 0 ] || return 0
   ARRET_SURVEILLANCE=1
   trap - TERM
   if [ "$ECHEC_EN_COURS" = 1 ]; then
+    # Un retour d'echec est deja en cours : ne pas l'interrompre une seconde
+    # fois ; ses propres courriers d'echec parlent.
     return 0
   fi
   if [ -r "$SUIVI_COURANTE" ]; then
@@ -1122,10 +1125,19 @@ arret_surveillance() {
     lignes=$(wc -l < "$JOURNAL" 2>/dev/null || echo 0)
   fi
   # une ligne de journal apres la marque signifie que l'etape est close : son
-  # hote a deja ete controle, il n'y a pas de mutation en cours a remettre.
+  # hote a deja ete controle, il n'y a pas de mutation en cours a signaler.
   if [ -n "$hote" ] && [ "${marque:-x}" = "$lignes" ] && [ "$SUIVI_DEMARRE" = 1 ]; then
-    echec_hote "$hote" "${etape:-surveillance}" \
-      "arret demande par la surveillance de progression"
+    case "$(mode_de "$hote")" in
+      poste) outil="poste.sh retour" ;;
+      agents) outil="vm.sh agents retour" ;;
+      serveur) outil="vm.sh retour" ;;
+      *) outil="la remise en version precedente de $hote" ;;
+    esac
+    detail="arret demande par la surveillance de progression ; retour non tente (redemarrage glissant hors grace)"
+    trace "$hote" "${etape:-surveillance}" ko "$detail"
+    notifier "staging #5450 : sequence arretee sur $hote a ${etape:-surveillance}" \
+      "Le staging $SHA_TRAVE a ete arrete par la surveillance de progression sur $hote, etape ${etape:-surveillance}. Aucun retour automatique n'a ete tente : un retour refait le redemarrage glissant de l'hote et ne tient pas dans le delai de grace avant l'arret du lanceur. L'hote peut rester a mi-parcours (version precedente ${PRECEDENT:-previous-sha} enregistree). Remise manuelle : $outil, puis controler. Trace : $JOURNAL"
+    echo "staging arrete par la surveillance (retour non tente)" >&2
     exit 1
   fi
   echo "staging arrete par la surveillance (aucune etape d'hote ouverte)" >&2
