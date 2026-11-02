@@ -1304,7 +1304,8 @@ class DeclarationTest(unittest.TestCase):
 class DeliveryTest(PgTestCase):
     def setUp(self):
         super().setUp()
-        self.db.execute("TRUNCATE github_watch_cursors, github_watch_events, github_watch_scans")
+        self.db.execute("TRUNCATE github_watch_cursors, github_watch_events, github_watch_scans,"
+                        " github_watch_pending")
         registry.upsert(self.db, "watcher", harness="codex", chantier="app")
         self.cfg = dataclasses.replace(self.cfg, host="atelier", github={"host": "atelier"})
 
