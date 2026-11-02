@@ -14,12 +14,12 @@ import unittest
 
 from ameesh import alert_briefs
 
-from .test_5203_pause_host_brief import PauseBriefTest
+from . import test_5203_pause_host_brief as base
 
 SIX_H = alert_briefs.REMIND_AFTER_S
 
 
-class RelanceOscillationTest(PauseBriefTest):
+class RelanceOscillationTest(base.PauseBriefTest):
     def test_l_oscillation_apres_la_relance_n_est_pas_rebriefee(self):
         self.run_briefs([self.host_alert(13)], now=10000)          # brief
         self.run_briefs([self.host_alert(13)], now=10000 + SIX_H + 1)  # relance
