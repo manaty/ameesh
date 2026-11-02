@@ -910,9 +910,25 @@ class _Landing:
                       work.SYSTEM_SENDER)
         return "history"
 
+    def doc_only(self, sha: str):
+        """#5428 : la preuve de paquet doc seule sur `sha`, refaite à chaque
+        contrôle (classe comprise), None sinon. `QueueError` sur un rouge."""
+        from . import packet_reviews
+        row, target = self.row, self.row.get("target") or ""
+        repo = self.project.repo
+        if not packet_reviews.is_vehicle(row):
+            return None
+        tips, where = merge_queue.fetch_fresh(repo, [target], self.replayer)
+        klass = merge_queue._class_of(self.db, self.lot, row, repo, where, target, sha,
+                                      cfg=self.cfg, base=tips.get(target))
+        return merge_queue.doc_only_packet(self.project, row, repo, target, sha,
+                                           self.replayer, klass=klass, cfg=self.cfg)
+
     def required_ci(self):
         if getattr(self.project, "ci_required", False):
             try:
+                if self.doc_only(self.row["frozen_sha"]) is not None:
+                    return None
                 parts = self.parts
                 if parts is None and getattr(self.project, "ci_parts", None):
                     # L1651 (#1650) : la preuve de complétude est refaite ici,
@@ -1456,7 +1472,15 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         return landing.eject("its branch moved while ameesh was landing it (%s)"
                              % (status["head"] or "?")[:12],
                              "Freeze again, then ameesh work queue add %d." % lot)
+    # #5428: a proven doc-only packet awaits no CI: none will ever come.
+    doc_only = None
     if status["ci"] == "pending":
+        try:
+            doc_only = landing.doc_only(row["landing_sha"])
+        except merge_queue.QueueError as exc:
+            return landing.eject(str(exc), "Fix the frozen commit, freeze again, then "
+                                 "ameesh work queue add %d." % lot)
+    if status["ci"] == "pending" and doc_only is None:
         # #3932: the PR waits for its CI on the merge commit: the target stays
         # reserved between passes, so no train or fire merges under a CI that
         # qualified an older base; the next pass renews the lease.

@@ -137,6 +137,26 @@ def change_set(repo: str, base: str, head: str) -> bytes:
     return proc.stdout
 
 
+def raw_changes(repo: str, base: str, head: str) -> list[tuple[str, str, str]]:
+    """`(ancien mode, nouveau mode, nom)` de chaque fichier changé de `head` sur
+    `base` (`git diff --raw --no-renames -z`) : le nom seul ne dit ni un lien
+    symbolique, ni un sous-module, ni un bit d'exécution (#5428)."""
+    proc = _git(repo, "diff", "--raw", "--no-renames", "-z", base, head)
+    if proc.returncode != 0:
+        raise PartsError(_fail("cannot read the change set %s..%s" % (base[:12], head[:12]),
+                               proc))
+    fields = proc.stdout.split(b"\0")[:-1]
+    if len(fields) % 2:
+        raise PartsError("unreadable raw change set %s..%s" % (base[:12], head[:12]))
+    rows = []
+    for meta, name in zip(fields[::2], fields[1::2]):
+        modes = meta.decode("ascii", "replace").lstrip(":").split()
+        if len(modes) < 2:
+            raise PartsError("unreadable raw change set %s..%s" % (base[:12], head[:12]))
+        rows.append((modes[0], modes[1], name.decode("utf-8", "surrogateescape")))
+    return rows
+
+
 def merge_base(repo: str, base: str, head: str) -> str:
     """Le merge-base de la tête gelée et de la référence versionnée : base du
     change set, comme le job de plan (`origin/develop`)."""
@@ -410,7 +430,8 @@ def cache_dir(cfg) -> str | None:
     return os.path.join(state, "radar", "ci-parts") if state else None
 
 
-def _cache_key(plan, base: str, frozen: str, declarations: str | None = None) -> str:
+def _cache_key(plan, base: str, frozen: str, declarations: str | None = None,
+               exclude=()) -> str:
     """La clé d'une preuve : le couple (commit de base, tête gelée), l'arbre
     de déclarations quand il diffère de la base (#2503) et le contrat qui la
     produit. Deux contrats différents ne partagent jamais une entrée."""
@@ -419,6 +440,8 @@ def _cache_key(plan, base: str, frozen: str, declarations: str | None = None) ->
                "schema": plan.schema, "due": plan.due}
     if declarations is not None and declarations != base:
         payload["declarations"] = declarations
+    if exclude:
+        payload["exclude"] = sorted(exclude)
     return hashlib.sha256(json.dumps(payload, sort_keys=True,
                                      ensure_ascii=True).encode("utf-8")).hexdigest()
 
@@ -519,7 +542,7 @@ def _kill_group(proc) -> None:
 
 
 def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None,
-        declarations_sha: str | None = None) -> dict:
+        declarations_sha: str | None = None, exclude=()) -> dict:
     """Les parts que le change set de la tête gelée `sha` rend dues, calculées
     par le sélecteur versionné de `project` (`ci_parts`), lu au commit
     `base_sha` de `repo` et alimenté du diff `merge-base(base_sha, sha)..sha`.
@@ -546,7 +569,10 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
     N3 de #1666 : le sélecteur ne tourne que dans le bac à sable `bwrap`
     (réseau coupé, racine vide, arbre et entrées en lecture seule). Il n'y a
     **aucun repli** : sans `bwrap` sur l'hôte, ou si le bac à sable ne démarre
-    pas, `PartsError` — la preuve est inconnue, jamais un vert."""
+    pas, `PartsError` — la preuve est inconnue, jamais un vert.
+
+    #5428 : `exclude` retire des noms exacts de l'entrée du sélecteur, pour le
+    manifeste qu'ameesh écrit dans son paquet ; la clé de cache les porte."""
     plan = getattr(project, "ci_parts", None)
     if plan is None:
         raise PartsError("project %s declares no ci_parts contract" % project.name)
@@ -590,7 +616,7 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
     #: gelée) et du contrat ; l'extraction de l'arbre (~71 Mo pour Nexlink)
     #: n'est refaite que sur un défaut de cache, jamais aux contrôles
     #: répétés d'un même couple. Entrée revalidée : jamais servie telle quelle.
-    key = _cache_key(plan, base, frozen, declarations) if cache else None
+    key = _cache_key(plan, base, frozen, declarations, exclude) if cache else None
     if cache:
         _cache_prune(cache, time.time())
         hit = _cache_read(cache, key, plan, base, frozen, declarations)
@@ -612,6 +638,10 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
     try:
         parent = merge_base(repo, base, frozen)
         changed = change_set(repo, parent, frozen)
+        if exclude:
+            kept = [name for name in changed.split(b"\0")
+                    if name and name.decode("utf-8", "surrogateescape") not in exclude]
+            changed = b"".join(name + b"\0" for name in kept)
     except GitError as exc:
         raise PartsError("cannot read the change set of %s in %s: %s"
                          % (frozen[:12], repo, exc)) from exc

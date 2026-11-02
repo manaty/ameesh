@@ -2813,19 +2813,25 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         if not status:
             # #3080: commit statuses (e.g. lot/*) do not need an open PR.
             needs_commit_ci = True
+    # #5428 (canon §3) : un paquet doc seule, prouvé sur son diff réel, n'attend
+    # aucune CI ; `parts` d'un appelant n'y change rien, la preuve est refaite.
+    doc_only = None
+    if status and project is not None:
+        doc_only = doc_only_packet(project, row, repo, target, tip, clone,
+                                   klass=klass, commit_ci=commit_ci, cfg=cfg)
     if status:
         if not _same(status.get("head"), tip):
             raise QueueError("PR #%s is at %s, not at the freeze %s: its CI does not "
                              "vouch for the frozen commit" % (status.get("number"),
                                                              (status.get("head") or "?")[:12],
                                                              tip[:12]))
-        if not status.get("green"):
+        if not status.get("green") and doc_only is None:
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
         if (gate["required"] == 0 or gate["waived"]) and status.get("draft"):
             raise QueueError("PR #%s is a draft: a lot without a review verdict merges only "
                              "from a non-draft PR" % status.get("number"))
-    proof = None
-    if needs_commit_ci:
+    proof = doc_only
+    if needs_commit_ci and doc_only is None:
         project = project or radar.Project(name=os.path.basename(repo), repo=repo)
         if parts is None and getattr(project, "ci_parts", None):
             parts = _parts_reader(project, repo, target, tip, clone, cfg=cfg)
@@ -2836,6 +2842,7 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
             "class": klass.get("class") or gate.get("class"),
             "class_why": klass.get("why") or "", "vehicle": _vehicle_note(gate),
             "parts": proof,
+            "doc_only": doc_only is not None,
             "waived": bool(gate.get("waived")),
             "waived_by": gate.get("waived_by") or ""}
 
@@ -2948,7 +2955,11 @@ def _class_worse(candidate: dict, best: dict) -> bool:
     return bool(best.get("doubt")) and not candidate.get("doubt")
 
 
-def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):
+#: #5428 : fichier régulier non exécutable, ou absent de ce côté du diff
+_DOC_MODES = ("100644", "000000")
+
+
+def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None, exclude=()):
     """L1651 (#1650): le lecteur des parts dues d'une tête gelée.
 
     Le contrat est celui du projet (`ci_parts`), versionné à `ci_parts.rev`
@@ -2979,16 +2990,86 @@ def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):
         try:
             #: N2 de #1666 : le cache de l'hôte (par couple base/tête gelée)
             #: évite de réextraire l'arbre de la cible à chaque contrôle.
-            proof = ci_parts.due(project, sha, base, holder, cache=ci_parts.cache_dir(cfg))
+            proof = ci_parts.due(project, sha, base, holder, cache=ci_parts.cache_dir(cfg),
+                                 exclude=exclude)
         except ci_parts.PartsError as exc:
             raise QueueError("the parts the change set makes due on the frozen head %s cannot "
                              "be proven: %s" % (sha[:12], exc)) from exc
-        reader.proof = proof
+        reader.proof, reader.holder = proof, holder
         return proof["due"]
     #: L1651 : la provenance de la dernière preuve (`ci_parts.due`), pour la
     #: note de file et le raccord du train (#1467) — jamais un vert sans elle
     reader.proof = None
     return reader
+
+
+def _is_doc_path(name: str, manifest: str) -> bool:
+    """#5428 : la liste blanche de la documentation sans CI, volontairement
+    étroite : le `.md` de `docs/` (ni fichier ni répertoire caché) et le
+    manifeste de ce paquet. Tout le reste (`site/`, `.github/`, `scripts/`, un
+    `.yml` ou un `.py` sous `docs/`) peut être exécuté : il retombe sur la CI."""
+    if name == manifest:
+        return True
+    parts = name.split("/")
+    return (len(parts) > 1 and parts[0] == "docs" and name.endswith(".md")
+            and not any(part.startswith(".") for part in parts))
+
+
+def _no_declared_sensitive_path(klass: dict) -> bool:
+    """#5428 : la classe ne nomme aucun chemin sensible. Un `sensitive` que le
+    seul défaut donne (Nexlink : `docs/roadmap.md`, aucune règle) garde ses avis
+    mais n'exige pas de CI ; un doute, une release, une règle ou un chemin
+    critique, si."""
+    from . import lot_class
+    files = klass.get("files") or ()
+    return (not klass.get("doubt") and klass.get("class") != lot_class.RELEASE and bool(files)
+            and all(not entry.get("critical")
+                    and (entry.get("class") == lot_class.LIGHT or entry.get("rule") is None)
+                    for entry in files))
+
+
+def doc_only_packet(project, row, repo: str, target: str, sha: str, clone, *, klass: dict,
+                    commit_ci=None, cfg=None) -> dict | None:
+    """#5428 (canon §3, « doc seule : pas de CI ») : la preuve qu'un véhicule de
+    paquet n'a aucune CI à attendre sur la tête `sha`, ou None (CI exigée).
+
+    Tout est relu sur le diff réel, rien sur une déclaration : véhicule
+    `integration/**`, aucun chemin sensible nommé par la classe, contrat `ci_parts` du projet dont le
+    sélecteur de la cible ne rend aucune part due, chaque fichier dans la liste
+    blanche (`_is_doc_path`) et de mode régulier (ni lien, ni sous-module, ni
+    exécutable). Un projet sans `ci_parts` ne prouve pas « aucune part due » :
+    il garde sa CI. Un check rouge sur la tête reste un négatif : `QueueError`,
+    comme une preuve illisible. Un check en attente n'est pas attendu."""
+    from . import ci_parts, packet_red, packet_reviews, radar
+    if not getattr(project, "ci_parts", None) or not packet_reviews.is_vehicle(row):
+        return None
+    if not _no_declared_sensitive_path(klass):
+        return None
+    # Le manifeste, écrit par ameesh dans le paquet, n'entre pas dans le sélecteur
+    # du projet : Nexlink rendrait trois parts dues pour ce seul fichier inerte.
+    manifest = packet_red.manifest_name(row["branch"])
+    reader = _parts_reader(project, repo, target, sha, clone, cfg=cfg, exclude=(manifest,))
+    if reader():
+        return None
+    proof = reader.proof
+    try:
+        changes = ci_parts.raw_changes(reader.holder, proof["merge_base"], sha)
+    except ci_parts.PartsError as exc:
+        raise QueueError("the change set of the frozen head %s cannot be read: %s"
+                         % (sha[:12], exc)) from exc
+    if not changes or not all(old in _DOC_MODES and new in _DOC_MODES
+                              and _is_doc_path(name, manifest)
+                              for old, new, name in changes):
+        return None
+    try:
+        runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=row["branch"])))(sha)
+    except plan_github.GithubError as exc:
+        raise QueueError("the checks of the frozen commit %s are unreadable (%s): try again "
+                         "once gh works" % (sha[:12], exc)) from exc
+    if runs.get("failed"):
+        raise QueueError("the CI on the frozen commit %s is red (%s)"
+                         % (sha[:12], ", ".join(runs["failed"])))
+    return proof
 
 
 def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
@@ -3162,7 +3243,8 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
             frozen_id=ready["frozen_id"], source=source_of(repo),
             note="merge queue of %s: queued at %s%s, class %s%s%s%s%s" % (
                 ready["target"], ready["frozen_sha"][:12],
-                ", PR #%s green" % ready["pr"] if ready["pr"] else "",
+                (", PR #%s doc-only, no CI awaited (canon §3)" if ready.get("doc_only")
+                 else ", PR #%s green") % ready["pr"] if ready["pr"] else "",
                 ready.get("class") or "?", " (%s)" % ready["class_why"]
                 if ready.get("class_why") else "", vehicle_note, parts_note,
                 waived_note),
