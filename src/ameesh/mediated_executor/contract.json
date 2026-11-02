@@ -4815,6 +4815,7 @@
     "build_lots_activity",
     "gauge_history",
     "gauge_latest",
+    "gauge_latest_window",
     "latest_gauges",
     "listing",
     "open_lots_activity",

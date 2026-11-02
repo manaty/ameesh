@@ -730,6 +730,37 @@ class Operations(interface.Operations):
             return []
         return self._gauge_heads(harness=harness, account=account)
 
+    def gauge_latest_window(self, *, harness, account) -> list[dict]:
+        """#5466 : le dernier relevé de chaque jauge, la fenêtre d'abord.
+
+        Codex ne date pas ses relevés (`produced_at` NULL) : l'heure
+        d'insertion ne peut pas départager deux fenêtres. Pour un même compte
+        et une même jauge, une échéance `resets_at` plus tardive prouve que la
+        fenêtre plus ancienne est close — son relevé est écarté même inséré
+        plus récemment. À échéance égale (même fenêtre), la production puis
+        l'insertion départagent, comme `gauge_latest`.
+        """
+        if harness is None or account is None:
+            return []
+        return self.db.query(
+            """
+            SELECT DISTINCT ON (gauge_key)
+                   harness, gauge_key AS key, used,
+                   extract(epoch from resets_at)::float8 AS resets_at_ts,
+                   window_s,
+                   extract(epoch from observed_at)::float8 AS observed_ts,
+                   extract(epoch from produced_at)::float8 AS produced_ts,
+                   source, account, overage_capable, overage_in_use
+              FROM quota_gauge_readings
+             WHERE harness = %s
+               AND (account IS NULL) IS FALSE
+               AND coalesce(account, '') = %s
+             ORDER BY gauge_key,
+                      resets_at DESC NULLS LAST,
+                      produced_at DESC NULLS LAST,
+                      observed_at DESC, id DESC
+            """, (harness, account))
+
     def _gauge_heads(self, *, since_s=None, harness=None, account=None, by_source=False):
         """#3922: seek each winning reading, skipping its entire group.
 

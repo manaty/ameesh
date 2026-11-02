@@ -1265,11 +1265,16 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
         # profil synthétique sans dossier garde le mécanisme de l'exécuteur.
         # #3034 : son `auth.json` nomme le forfait vivant, pour ignorer les
         # relevés d'un ancien forfait restés dans le même dossier de sessions.
+        # #5466 : le compte nommé est l'identité partagée entre hôtes ; sa
+        # lecture locale est complétée par l'historique (fenêtre à échéance
+        # plus tardive). Le profil synthétique sans dossier n'a pas d'identité
+        # déclarée : il garde la lecture locale de l'exécuteur.
         if profile.declared or profile.path:
             from .codex_gauges import live_plan
             home = profile.home(environ)
             return book.codex_gauges(
-                sessions=os.path.join(home, "sessions"), plan=live_plan(home))
+                sessions=os.path.join(home, "sessions"), plan=live_plan(home),
+                account=profile.name)
         return book.codex_gauges()
     return []
 

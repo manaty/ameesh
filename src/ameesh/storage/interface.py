@@ -100,7 +100,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
                    open_lots_activity state_lots_activity turns record_gauges
-                   gauge_history latest_gauges gauge_latest assigners
+                   gauge_history latest_gauges gauge_latest gauge_latest_window
+                   assigners
                    record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    lot_sessions    switch listing actionable note_wake purge
@@ -4436,6 +4437,16 @@ class Operations(Domain):
         key, used, resets_at_ts, window_s, observed_ts, produced_ts, source,
         account, drapeaux d'overage (#3755). Aucune ligne pour un compte
         inconnu."""
+
+    @abc.abstractmethod
+    def gauge_latest_window(self, *, harness: str, account: str) -> list[dict]:
+        """#5466 : le dernier relevé CONNU de chaque jauge d'un compte nommé,
+        la FENÊTRE d'abord : pour un même compte et une même jauge, une
+        échéance `resets_at` plus tardive prouve que la fenêtre plus ancienne
+        est close, si bien que le relevé de l'ancienne échéance est écarté
+        même s'il a été inséré plus récemment. À échéance égale (même
+        fenêtre), le plus récent par production puis insertion. Mêmes
+        colonnes que `gauge_latest` ; aucune ligne pour un compte inconnu."""
 
     @abc.abstractmethod
     def assigners(self, *, since_s: float) -> list[str]:
