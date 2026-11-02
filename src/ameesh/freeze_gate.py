@@ -922,15 +922,23 @@ def milestone(
         # différé (contrôle des familles, marque durable, reprise) s'applique.
         acquired = False
         if previous and plan_git.same_commit(previous.get("sha"), sha):
+            from . import review_designation_activation as activation
             from . import work as work_mod
+            # #5481 (B de la revue) : des noms dans la colonne peuvent être
+            # hérités d'une AUTRE tête (un gel différé interrompu les garde).
+            # Seule une marque effective du gel précédent, une dispense ou des
+            # verdicts rendus sur ce SHA prouvent une désignation acquise.
             reviewers = [str(name or "").strip()
                          for name in (item.get("reviewers") or ())]
             waived = (work_mod.REVIEWER_NONE in reviewers
                       or str(item.get("reviewer") or "").strip() == work_mod.REVIEWER_NONE)
+            effective = activation._effective_mark(
+                db, item_id, int(previous.get("id") or 0),
+                since_ts=float(previous.get("at_ts") or 0.0))
             verdicts = any(m.get("kind") == "verdict"
                            and plan_git.same_commit(m.get("sha"), sha)
                            for m in marks)
-            acquired = bool(reviewers or waived or verdicts)
+            acquired = bool(effective is not None or waived or verdicts)
         same_head = bool(previous and acquired
                          and plan_git.same_commit(previous.get("sha"), sha))
     if kind == "frozen" and on_frozen is None:

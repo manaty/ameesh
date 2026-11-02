@@ -207,6 +207,37 @@ class SameHeadWithoutSeatsTest(_Fixture):
         self.assertEqual(len(self.review_mail()), 2)
 
 
+class InheritedSeatsTest(_Reviewed):
+    """Des sièges hérités d'une autre tête ne prouvent pas une désignation."""
+
+    def test_inherited_seats_do_not_take_the_same_head_shortcut(self):
+        _, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        changed = self.repo.author_commit("vraie tête B\n")
+        self.receipt(changed)
+        # Gel B différé, CLI interrompue : la colonne garde les sièges de A.
+        first: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=changed, actor="author",
+                       outcome=first, repo=self.repo.root,
+                       defer_designation=True)
+        self.assertEqual(first.get("state"), "deferred", first)
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.db.execute("DELETE FROM agent_mailbox")
+        # Regel du même SHA B : sans marque effective sur B, le raccourci ne
+        # doit pas écrire une marque non provisoire ni sauter la désignation.
+        second: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=changed, actor="author",
+                       outcome=second, repo=self.repo.root,
+                       defer_designation=True)
+        self.assertEqual(second.get("state"), "deferred", second)
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            report = act.finish_deferred(self.cfg, self.db)
+        mine = [row for row in report["results"] if row["lot"] == self.lot]
+        self.assertEqual(len(mine), 1, report)
+        self.assertEqual([row["recipient"] for row in self.review_mail()],
+                         ["rev1", "rev2"])
+
+
 class DesignateDeferredForceTest(_Reviewed):
     """Un report planifié mais refusé ne neutralise pas la sélection réelle."""
 
