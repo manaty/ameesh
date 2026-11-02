@@ -3054,6 +3054,7 @@ def _selection(inputs: Inputs, port, *, force: bool = False,
         families=inputs.policy.families,
         already=list(inputs.manual_seats) + [dict(seat) for seat in kept or ()],
         fixers=inputs.correctors, held=held, doubts=inputs.doubts,
+        answered=inputs.answered,
         required=inputs.policy.required, advances=inputs.advances)
 
 

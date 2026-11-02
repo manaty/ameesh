@@ -301,6 +301,42 @@ class SameHeadWithoutSeatsTest(_Fixture):
 class InheritedSeatsTest(_Reviewed):
     """Des sièges hérités d'une autre tête ne prouvent pas une désignation."""
 
+    def test_a_single_verdict_without_mark_does_not_take_the_shortcut(self):
+        # #5481 (B/P1 cx2) : un avis isolé sur B, sans aucune marque de
+        # désignation de B, ne prouve pas la couverture. Le raccourci « même
+        # tête » écrirait carried avec rev1 seul, sans DEFERRED : le siège
+        # manquant serait perdu.
+        _, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        changed = self.repo.author_commit("vraie tête B\n")
+        self.receipt(changed)
+        first: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=changed, actor="author",
+                       outcome=first, repo=self.repo.root,
+                       defer_designation=True)
+        self.assertEqual(first.get("state"), "deferred", first)
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.verdict("rev1", changed)
+        self.db.execute("DELETE FROM agent_mailbox")
+        second: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=changed, actor="author",
+                       outcome=second, repo=self.repo.root,
+                       defer_designation=True)
+        self.assertEqual(second.get("state"), "deferred", second)
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            report = act.finish_deferred(self.cfg, self.db)
+        mine = [row for row in report["results"] if row["lot"] == self.lot]
+        self.assertEqual(len(mine), 1, report)
+        self.assertEqual(sorted(self.designated()), ["rev1", "rev2"])
+        # rev1 a déjà rendu son avis sur B : seule la seconde famille est
+        # relancée, une fois.
+        self.assertEqual([row["recipient"] for row in self.review_mail()],
+                         ["rev2"])
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            again = act.finish_deferred(self.cfg, self.db)
+        self.assertEqual([row for row in again["results"] if row["lot"] == self.lot], [])
+        self.assertEqual(len(self.review_mail()), 1)
+
     def test_inherited_seats_do_not_take_the_same_head_shortcut(self):
         _, outcome = self.freeze(self.repo.reviewed)
         self.assertEqual(outcome["state"], "designated", outcome)

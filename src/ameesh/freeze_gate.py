@@ -917,8 +917,7 @@ def milestone(
         except Exception:  # noqa: BLE001 - lecture ratée : gel normal
             previous, marks = None, ()
         # #5481 (B de la revue) : le raccourci ne vaut que s'il a quelque
-        # chose à garder — une désignation acquise, une dispense, ou (quand
-        # aucune marque n'est lisible) des verdicts rendus sur ce SHA. Sinon
+        # chose à garder — une désignation acquise ou une dispense. Sinon
         # c'est une première désignation : le chemin différé (contrôle des
         # familles, marque durable, reprise) s'applique.
         acquired = False
@@ -927,28 +926,20 @@ def milestone(
             from . import work as work_mod
             # #5481 (B de la revue) : des noms dans la colonne peuvent être
             # hérités d'une AUTRE tête (un gel différé interrompu les garde).
-            # Seule une marque effective du gel précédent, une dispense ou des
-            # verdicts rendus sur ce SHA prouvent une désignation acquise.
+            # Seule une marque effective du gel précédent ou une dispense
+            # prouvent une désignation acquise.
             reviewers = [str(name or "").strip()
                          for name in (item.get("reviewers") or ())]
             waived = (work_mod.REVIEWER_NONE in reviewers
                       or str(item.get("reviewer") or "").strip() == work_mod.REVIEWER_NONE)
-            # #5481 (B de la revue) : une marque d'attente ou incomplète doit
-            # être **reprise** ; un avis isolé sur la tête ne prouve pas la
-            # couverture de la désignation (deux avis requis, un seul rendu).
-            # Le raccourci fondé sur les seuls avis ne vaut donc que si
-            # aucune marque n'est lisible — rien à reprendre ; un verdict de
-            # plus n'efface jamais le siège manquant ni sa reprise.
-            mark = activation._effective_mark(
-                db, item_id, int(previous.get("id") or 0),
-                since_ts=float(previous.get("at_ts") or 0.0))
+            # #5481 (B/P1 cx2) : un avis isolé sur la tête ne prouve pas la
+            # couverture de la désignation, même sans marque lisible. Le gel
+            # différé a pu être interrompu avant la sélection : le raccourci
+            # écrirait carried avec ce seul siège, sans DEFERRED, et le siège
+            # manquant serait perdu.
             covered = activation.acquired_on_head(
                 db, getattr(db, "cfg", None), item_id, previous)
-            verdicts = any(m.get("kind") == "verdict"
-                           and plan_git.same_commit(m.get("sha"), sha)
-                           for m in marks)
-            acquired = bool(covered or waived
-                            or (verdicts and mark is None))
+            acquired = bool(covered or waived)
         same_head = bool(previous and acquired
                          and plan_git.same_commit(previous.get("sha"), sha))
     if kind == "frozen" and on_frozen is None:
