@@ -850,7 +850,11 @@ class Operations(interface.Operations):
         # lignes à chaque lecture, 211 ms mesurés) ; la fenêtre se lit
         # directement, puis une sonde par série rend le dernier relevé
         # antérieur. Mêmes lignes, même ordre (`observed_at`, `id`).
-        params: list = [float(since_s)] + extra + extra + [float(since_s)]
+        # #5411 : la liste des séries ne relit que les lignes ANTÉRIEURES à la
+        # fenêtre — une série entièrement couverte n'a rien à ajouter, et
+        # l'ancienne lecture hashait tout l'historique à chaque appel (111 000 s
+        # cumulées sur 1,68 M d'appels) pour un résultat vide.
+        params: list = [float(since_s)] + extra + extra + [float(since_s)] + [float(since_s)]
         return _sans_compte_nul(self.db.query(
             """
             SELECT provider, currency, total::float8 AS total, granted::float8 AS granted,
@@ -867,7 +871,8 @@ class Operations(interface.Operations):
                        last.observed_at, last.id
                   FROM (SELECT DISTINCT provider, currency, account
                           FROM provider_balances
-                         WHERE true""" + filtre + """) s
+                         WHERE true""" + filtre + """
+                           AND observed_at < now() - make_interval(secs => %s)) s
                   CROSS JOIN LATERAL (
                     SELECT pb.* FROM provider_balances pb
                      WHERE pb.provider = s.provider
