@@ -2339,7 +2339,7 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
     out.update(result=done["result"], detail=done["detail"])
     if done["result"] == "merged":
         _passive(db, row.get("assignee"), lot, (
-            "Fire on lot #%d « %s »: PR #%s merged (%s)%s. The branch sweep closes the lot."
+            "Fire on lot #%d « %s »: PR #%s merged (%s)%s. The merge is recorded; the lot is closed."
             % (lot, row.get("title") or "", status.get("number"),
                (status.get("merge_commit") or "?")[:12],
                "" if covered else ". WARNING: the merged head is not the one the fire covered; "

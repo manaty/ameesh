@@ -134,7 +134,7 @@ class LotSessions(interface.LotSessions):
                    WHERE e.work_item_id = w.id) ev ON true
               LEFT JOIN LATERAL (
                   SELECT max(b.created_at) AS at FROM agent_mailbox b
-                   WHERE btrim(b.work_item_id) = w.id::text) mb ON true
+                   WHERE b.work_item_id = w.id::text) mb ON true
              WHERE w.assignee = %s
                AND (w.state IN ('{lifecycle.REQUESTED}', '{lifecycle.IN_PROGRESS}')
                     OR """ + owed_by_assignee("w") + """)

@@ -968,18 +968,18 @@ _PENDING_FACTS_SQL = f"""
         SELECT DISTINCT ON (m.work_item_id)
                m.work_item_id AS lot, m.id AS freeze_id, m.sha AS sha, m.at AS at
           FROM work_item_milestones m
-          JOIN open_items o ON o.id = m.work_item_id
-         WHERE m.kind = 'frozen'
+         WHERE m.work_item_id = ANY (ARRAY(SELECT id FROM open_items))
+           AND m.kind = 'frozen'
          ORDER BY m.work_item_id, m.at DESC, m.id DESC
     ), marks AS (
         SELECT e.work_item_id AS lot,
                array_agg(e.id ORDER BY e.id) AS ids,
                array_agg(e.note ORDER BY e.id) AS notes
           FROM work_item_events e
-          JOIN latest_freeze f ON f.lot = e.work_item_id
-         WHERE starts_with(e.note, 'review-designation:' || e.work_item_id || ':')
+         WHERE e.work_item_id = ANY (ARRAY(SELECT lot FROM latest_freeze))
+           AND (starts_with(e.note, 'review-designation:' || e.work_item_id || ':')
             OR starts_with(e.note, 'review-designation-carried:'
-                                   || e.work_item_id || ':')
+                                   || e.work_item_id || ':'))
          GROUP BY e.work_item_id
     ), manual AS (
         SELECT e.work_item_id AS lot,
@@ -988,8 +988,8 @@ _PENDING_FACTS_SQL = f"""
                array_agg(extract(epoch FROM e.created_at)::float8
                          ORDER BY e.id) AS ts
           FROM work_item_events e
-          JOIN latest_freeze f ON f.lot = e.work_item_id
-         WHERE starts_with(e.note, 'reviewer ')
+         WHERE e.work_item_id = ANY (ARRAY(SELECT lot FROM latest_freeze))
+           AND starts_with(e.note, 'reviewer ')
            AND right(e.note, length(' designated')) = ' designated'
          GROUP BY e.work_item_id
     ), verdicts AS (
@@ -999,8 +999,8 @@ _PENDING_FACTS_SQL = f"""
                array_agg(v.verdict ORDER BY v.id) AS kinds,
                array_agg(extract(epoch FROM v.at)::float8 ORDER BY v.id) AS ts
           FROM work_item_milestones v
-          JOIN latest_freeze f ON f.lot = v.work_item_id
-         WHERE v.kind = 'verdict'
+         WHERE v.work_item_id = ANY (ARRAY(SELECT lot FROM latest_freeze))
+           AND v.kind = 'verdict'
          GROUP BY v.work_item_id
     )
     SELECT o.id AS lot, o.assignee, o.reviewers, o.title, o.state, o.app,

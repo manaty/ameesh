@@ -22,7 +22,7 @@ import json
 from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
-from .work import REQUEUED_PARAMS, has_reviewer, requeued_sql
+from .work import REQUEUED_PARAMS, has_current_item_columns, has_reviewer, requeued_sql
 from .work_dependencies import (current_verdict as _current_verdict,
                                 owed_by_assignee, start_defers, wake_defers)
 
@@ -496,12 +496,12 @@ class Operations(interface.Operations):
     #: migration. `released_by` en écarte les dépendants pinnés, dont la
     #: retenue ne tombe que par une commande `release` du registre.
     _LOTS_ACTIVITY = """
-            SELECT w.id, w.title, w.state, to_jsonb(w)->>'legacy_state' AS legacy_state, w.assignee, w.package_id, w.type,
-                   w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+            SELECT w.id, w.title, w.state, w.legacy_state, w.assignee, w.package_id, w.type,
+                   w.priority, w.app, w.workstream, w.branch_target, w.reviewer,
                    -- #4818 : un lot de décision ou de découpage n'entre pas
                    -- dans le plafond de lots en vol (`work_footprints.is_exempt`)
                    w.source,
-                   to_jsonb(w)->>'external_executor' AS external_executor,
+                   w.external_executor,
                    -- #2335 : l'appartenance à un paquet se lit sur le porteur
                    -- (`integration/**`), son manifeste (corps) et la tête gelée
                    -- du lot, sans requête par lot. Le corps n'est transféré que
@@ -514,8 +514,8 @@ class Operations(interface.Operations):
                    extract(epoch from w.wake_at)::float8 AS wake_ts,
                    to_char(w.planned_start, 'YYYY-MM-DD') AS planned_start,
                    CASE WHEN left(btrim(w.branch), 12) = 'integration/' THEN w.body END AS body,
-                   to_jsonb(w)->'reviewers' AS reviewers,
-                   coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
+                   to_jsonb(w.reviewers) AS reviewers,
+                   coalesce(w.workflow_ref, '') AS workflow_ref,
                    __RETURNED__
                    coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
                             nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,
@@ -540,17 +540,25 @@ class Operations(interface.Operations):
             """
 
     def _lots_activity(self, where, params) -> list[dict]:
-        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
-        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
-        reviewer = ("w.reviewer" if has_reviewer(self.db)
-                    else "''::text AS reviewer")
         # §4 : `returned_to_queue` distingue un lot `build` RENDU à la file
         # (limite d'en-cours) d'un lot en cours sans assigné (prérequis,
         # travail confié par courrier) — voir `work.requeued_sql`.
-        sql = (self._LOTS_ACTIVITY
-               .replace("__REVIEWER__", reviewer)
-               .replace("__RETURNED__", f"(w.state = '{lifecycle.IN_PROGRESS}' AND "
-                        + requeued_sql("w") + ") AS returned_to_queue,")
+        sql = self._LOTS_ACTIVITY
+        # #5404 : lecture directe, repli seulement sur un schéma en retard
+        # (fenêtre de migration, `work.has_current_item_columns`). Avant
+        # `__WHERE__` : le prédicat de l'appelant porte son propre repli.
+        if not has_current_item_columns(self.db):
+            for direct, repli in (
+                    ("w.legacy_state,", "to_jsonb(w)->>'legacy_state' AS legacy_state,"),
+                    ("w.reviewer,", "coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer,"),
+                    ("w.external_executor,", "to_jsonb(w)->>'external_executor' AS external_executor,"),
+                    ("extract(epoch from w.wake_at)",
+                     "extract(epoch from (to_jsonb(w)->>'wake_at')::timestamptz)"),
+                    ("to_jsonb(w.reviewers)", "to_jsonb(w)->'reviewers'"),
+                    ("w.workflow_ref", "to_jsonb(w)->>'workflow_ref'")):
+                sql = sql.replace(direct, repli)
+        sql = (sql.replace("__RETURNED__", f"(w.state = '{lifecycle.IN_PROGRESS}' AND "
+                           + requeued_sql("w") + ") AS returned_to_queue,")
                .replace("__WHERE__", where))
         return self.db.query(sql, REQUEUED_PARAMS + tuple(params))
 
@@ -560,7 +568,9 @@ class Operations(interface.Operations):
             (int(limit) if limit is not None else None,))
 
     def state_lots_activity(self, state, limit) -> list[dict]:
-        predicate = ("coalesce(to_jsonb(w)->>'legacy_state', w.state) = %s"
+        legacy = ("w.legacy_state" if has_current_item_columns(self.db)
+                  else "to_jsonb(w)->>'legacy_state'")
+        predicate = ("coalesce(%s, w.state) = %%s" % legacy
                      if state in ("merged", "promoted") else "w.state = %s")
         return self._lots_activity(
             predicate,
@@ -571,9 +581,11 @@ class Operations(interface.Operations):
         activité (même calcul qu'`open_lots_activity`) — la lecture dédiée du
         balayage de la limite d'en-cours, sans le plafond global des lots
         ouverts."""
+        legacy = ("w.legacy_state" if has_current_item_columns(self.db)
+                  else "to_jsonb(w)->>'legacy_state' AS legacy_state")
         return self.db.query(
             f"""
-            SELECT w.id, w.title, w.state, to_jsonb(w)->>'legacy_state' AS legacy_state, w.assignee, w.package_id, w.type,
+            SELECT w.id, w.title, w.state, {legacy}, w.assignee, w.package_id, w.type,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(

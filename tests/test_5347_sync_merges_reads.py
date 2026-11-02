@@ -44,22 +44,22 @@ class _RecordingDb:
 
 
 class ItemsSqlTest(unittest.TestCase):
-    """La conversion JSON d'`items` est unique et postérieure à la borne."""
+    """Les colonnes d'`items` sont calculées après la borne, sans conversion de la ligne."""
 
     def setUp(self) -> None:
         self.db = _RecordingDb()
         work_pg.WorkItems(self.db).items(state=None, assignee=None, limit=1000)
         self.sql, self.params = self.db.statements[-1]
 
-    def test_to_jsonb_once_per_returned_row(self):
-        self.assertEqual(len(re.findall(r"to_jsonb\(", self.sql)), 1, self.sql)
+    def test_no_whole_row_conversion(self):
+        # #5404 : les colonnes se lisent directement, sans `to_jsonb(ligne)`.
+        self.assertNotIn("to_jsonb(work_items)", self.sql)
 
     def test_the_limit_precedes_the_conversion(self):
         self.assertRegex(
             self.sql,
             r"FROM \(SELECT \* FROM work_items.*ORDER BY updated_at DESC LIMIT %s\)"
-            r" work_items CROSS JOIN LATERAL "
-            r"\(SELECT to_jsonb\(work_items\) AS doc OFFSET 0\) j")
+            r" work_items ORDER BY")
         # la borne est le seul paramètre de la lecture
         self.assertEqual(self.params, (1000,))
 
@@ -156,14 +156,20 @@ class PacketHeadsTest(PgTestCase):
         self.assertEqual(rows[0]["package_frozen_sha"], "")
 
     def test_same_at_is_broken_by_the_higher_id(self):
-        self.mark("merged", "3" * 40, seconds_ago=100)
-        winner = self.mark("merged", "4" * 40, seconds_ago=100)
+        tied_at = "2026-01-01T00:00:00+00:00"
+        milestones = self.db.query(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
+            " VALUES (%s, 'merged', %s, %s, 'test'),"
+            " (%s, 'merged', %s, %s, 'test') RETURNING id, at",
+            (int(self.package["id"]), tied_at, "3" * 40,
+             int(self.package["id"]), tied_at, "4" * 40))
+        self.assertEqual(milestones[0]["at"], milestones[1]["at"])
+        self.assertGreater(int(milestones[1]["id"]), int(milestones[0]["id"]))
         rows = self.store.work.packet_members(package_ids=[int(self.package["id"])])
         self.assertEqual({r["work_item_id"] for r in rows},
                          {int(self.first["id"]), int(self.second["id"])})
         self.assertEqual({r["package_merged_sha"] for r in rows}, {"4" * 40})
         self.assertEqual({r["package_frozen_sha"] for r in rows}, {None})
-        self.assertGreater(winner, 0)
 
 
 if __name__ == "__main__":

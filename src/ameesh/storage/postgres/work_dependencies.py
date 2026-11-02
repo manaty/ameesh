@@ -73,7 +73,7 @@ def freeze_due(alias: str) -> str:
     """
     return ("(NOT EXISTS (SELECT 1 FROM work_item_milestones m"
             " WHERE m.work_item_id = {a}.id AND m.kind = 'frozen')"
-            " AND coalesce(to_jsonb({a})->>'reviewer', '') <> '-none')").format(a=alias)
+            " AND coalesce({a}.reviewer, '') <> '-none')").format(a=alias)
 
 
 def fix_owed(alias: str) -> str:
@@ -85,9 +85,7 @@ def fix_owed(alias: str) -> str:
     levé par un `ok` de B rendu après. Sans siège, le dernier verdict du gel
     décide (`current_verdict`). Un verdict s'applique au gel par son sha
     (préfixe admis), à défaut par son instant, comme `current_verdict`."""
-    seats = ("(SELECT lower(btrim(s)) FROM jsonb_array_elements_text("
-             "CASE WHEN jsonb_typeof(to_jsonb({a})->'reviewers') = 'array'"
-             " THEN to_jsonb({a})->'reviewers' ELSE '[]'::jsonb END) s"
+    seats = ("(SELECT lower(btrim(s)) FROM unnest({a}.reviewers) s"
              " WHERE btrim(s) NOT IN ('', '-none'))")
     return ("(CASE WHEN EXISTS " + seats + " THEN EXISTS ("
             "SELECT 1 FROM (SELECT DISTINCT ON (lower(btrim(m.actor))) m.verdict"
