@@ -293,8 +293,32 @@ def tick(db, cfg, options) -> dict:
                 # (its rolling restart cannot fit); the TERM trap traces the
                 # open step and mails the manual rollback. Never claim a
                 # rollback without a `retour ok` trace.
+                # #5450: `halt` stops the local group, never the workstation's
+                # transient units (`poste-maj-staging-<pid>-*`), which run
+                # from this worktree. A terminal state releases the shared
+                # start and the finally block deletes the tree: both must wait
+                # for a proved quiescence, as in the synchronous path. If the
+                # stop is not proved, keep the sources and the request running
+                # with the guard that keeps every later start behind the
+                # quiescence probe.
+                drop = False
+                pid = getattr(execution, "pgid", None)
+                note = ""
+                if isinstance(pid, int) and pid > 0:
+                    note, drop = release_cutoff._settle_poste_units(
+                        pid, lambda seconds: time.sleep(seconds))
+                if not drop:
+                    guard = ("staging stop not proved: "
+                             + (note.strip("; ") or "workstation units unreadable")
+                             + "; sources kept, next attempt requires quiescence")
+                    _record(db, options["key"],
+                            dict(attempt, blocked_reason=guard), lease=lease)
+                    return {"state": "blocked", "reason": guard,
+                            "run": attempt["run"]}
                 monitor.stop(reason)
                 result = dict(attempt, state="failed", exit=code, reason=reason)
+                if note:
+                    result["unit_note"] = note
                 _record(db, options["key"], result, lease=lease)
                 return result
             if lost:

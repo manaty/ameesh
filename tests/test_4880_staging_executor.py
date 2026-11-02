@@ -59,6 +59,10 @@ class ExecutorTest(unittest.TestCase):
             mock.patch.object(executor.subprocess, "run"),
             mock.patch.object(release_cutoff, "_worktree", return_value=("folder", "tree")),
             mock.patch.object(release_cutoff, "_drop_worktree"),
+            # #5450: the executor settles the workstation units before any
+            # terminal release; a test overrides the outcome when it matters.
+            mock.patch.object(release_cutoff, "_settle_poste_units",
+                              return_value=("", True)),
         ]
         for patch in patches:
             self.addCleanup(patch.stop)
@@ -68,6 +72,8 @@ class ExecutorTest(unittest.TestCase):
         executor.ExecutionLease.return_value.epoch = 1
         executor.ExecutionLease.return_value.ttl = 60.0
         executor.role_run._AlertsExecution.return_value.lost.is_set.return_value = False
+        # `$$` of the bash group, the pid that names the workstation units.
+        executor.role_run._AlertsExecution.return_value.pgid = 1234
 
     def record(self, kind, key, project, data):
         if kind == executor.EVENT:
@@ -195,6 +201,10 @@ class ExecutorTest(unittest.TestCase):
             self.assertIs(call.kwargs.get("watch"), False)
 
     def test_the_child_is_monitored_and_a_stop_is_a_recorded_failure(self):
+        release_cutoff._settle_poste_units.return_value = (
+            "; workstation unit(s) poste-maj-staging-1234-retour.service ended "
+            "before the worktree was dropped", True)
+
         def child(*args, **kwargs):
             self.calls.append((args[0], args[1]))
             executor.role_run._AlertsExecution.return_value.stop_reason = \
@@ -206,10 +216,44 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(result["reason"], "délai dépassé : figé")
         self.assertEqual(self.request["state"], "failed")
         self.assertEqual(self.request["reason"], "délai dépassé : figé")
+        self.assertIn("ended before the worktree was dropped",
+                      self.request["unit_note"])
+        release_cutoff._settle_poste_units.assert_called_once_with(1234, mock.ANY)
+        release_cutoff._drop_worktree.assert_called_once_with(
+            str(self.root.resolve()), "folder", "tree")
         call = executor.role_run._run_under_lease.call_args_list[-1]
         self.assertEqual(call.kwargs["stop_grace"], staging_watch.STOP_GRACE_S)
         self.assertEqual(call.kwargs["interval"], staging_watch.WATCH_INTERVAL_S)
         self.assertEqual(call.kwargs["monitor"].__self__.run, result["run"])
+
+    def test_a_unit_surviving_the_leader_keeps_the_worktree_and_blocks(self):
+        """#5450 B/P1 witness: the group is dead, a workstation unit is not.
+
+        No terminal state and no worktree deletion may precede the proved
+        stop; the request stays running with the guard that keeps every later
+        start behind the quiescence probe.
+        """
+        release_cutoff._settle_poste_units.return_value = (
+            "; workstation unit(s) poste-maj-staging-1234-retour.service still "
+            "running after 600s and a stop: worktree kept, check the "
+            "workstation", False)
+
+        def child(*args, **kwargs):
+            self.calls.append((args[0], args[1]))
+            executor.role_run._AlertsExecution.return_value.stop_reason = \
+                "délai dépassé : figé"
+            return 143, False
+        executor.role_run._run_under_lease.side_effect = child
+        with mock.patch.object(executor.staging_watch, "Monitor") as monitor_cls:
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("still running", result["reason"])
+        self.assertEqual(self.request["state"], "running")
+        self.assertIn("blocked_reason", self.request)
+        self.assertIn("quiescence", self.request["blocked_reason"])
+        monitor_cls.return_value.stop.assert_not_called()
+        release_cutoff._drop_worktree.assert_not_called()
+        release_cutoff._settle_poste_units.assert_called_once_with(1234, mock.ANY)
 
     def test_record_renewal_extends_the_local_deadline(self):
         executor.tick(self.db, self.cfg, self.options)
