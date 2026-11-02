@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -52,6 +53,20 @@ DIGEST_MAX_CHARS = 16000
 DIGEST_EXCERPT = 4000
 #: #2925: a failed pass is retried sooner than an hourly cadence.
 RETRY = 300
+#: #5506: an input with no proof of processing is recalled to its watcher
+#: after this delay (canon "dans l'heure"), then escalated to the pilot.
+REMIND_AFTER = 3600
+ESCALATE_AFTER = 7200
+#: Open follow-ups read per pass, and GitHub reads per pass for mesh replies.
+FOLLOW_UP_LIMIT = 200
+FOLLOW_UP_READS = 20
+#: The follow-up pass runs at most this often (base and GitHub reads).
+FOLLOW_UP_EVERY = 300
+#: The marker a mesh reply carries on the ticket (see `instruction`).
+REPLY_MARKER = "<!-- ameesh:github-watch:v1 -->"
+#: A comment an agent posts with `gh` during a turn is marked this way when it
+#: carries no marker (`github_identity`); stage comments are not replies.
+MANUAL_MARKER = re.compile(r"<!-- ameesh:work-stage:v1 lot=\d+ event=manual -->")
 
 
 @dataclass(frozen=True)
@@ -620,7 +635,7 @@ def digest(sub, entries, feed=(), *, quote=True):
 
 
 def deliver(db, sub, events, until, feed, host, *, partial=False,
-            scan_before=None, scan_after=None):
+            scan_before=None, scan_after=None, now=None):
     """One commit for de-duplication, one bounded digest, and scan progress.
 
     Returns the number of inputs delivered in this pass. When ``events`` holds
@@ -632,6 +647,7 @@ def deliver(db, sub, events, until, feed, host, *, partial=False,
     after_commit = []
     delivered = []
     leftover = False
+    now = until if now is None else now
     with db.transaction() as tx:
         st = storage.of(tx)
         previous = st.github_watch.lock(sub.project, sub.repo, until - BOOTSTRAP)
@@ -662,12 +678,17 @@ def deliver(db, sub, events, until, feed, host, *, partial=False,
                                  kind="event", after_commit=after_commit,
                                  payload=payload)
 
+            # #5506: inputs from earlier passes still unprocessed head the digest.
+            still_open = [entry for entry in st.github_watch.open_entries(FOLLOW_UP_LIMIT)
+                          if entry["agent"] == sub.agent]
+            head = open_header(still_open, now)
             try:
-                send(digest(sub, delivered, feed))
+                send(head + digest(sub, delivered, feed))
             except UnreadableBody:
                 # One unreadable external body must not stall the repository:
                 # keep every event and its link, drop all excerpts this pass.
-                send(digest(sub, delivered, feed, quote=False))
+                send(head + digest(sub, delivered, feed, quote=False))
+            st.github_watch.track(sub.project, sub.repo, sub.agent, delivered, now)
         if not leftover:
             if partial:
                 st.github_watch.checkpoint(sub.project, sub.repo, scan_after)
@@ -689,6 +710,7 @@ class Watcher:
         self.next = {}
         self._warned = set()
         self._stalled = set()
+        self._follow_up_next = 0.0
 
     def _warn(self, text):
         """Journal an ignored declaration once, not on every notifier pass."""
@@ -735,7 +757,8 @@ class Watcher:
                              % (sub.project, sub.repo, next_scan["ticks"]))
                 count = len(events) if self.dry_run else deliver(
                     db, sub, events, until, storage.of(db).work.issue_feed(plan_github.FEED_LIMIT),
-                    self.cfg.host, partial=True, scan_before=scan, scan_after=next_scan)
+                    self.cfg.host, partial=True, scan_before=scan, scan_after=next_scan,
+                    now=now)
                 if not self.dry_run and (next_scan is not None or
                                          count >= DIGEST_MAX_ITEMS):
                     # A partial scan or a leftover digest continues at the next
@@ -749,4 +772,160 @@ class Watcher:
                 self.next[key] = now + min(sub.interval, RETRY)
                 self.log("GitHub watch %s: failed; cursor retained: %s" %
                          (sub.repo, plan_github._one_line(exc)))
+        if not self.dry_run and now >= self._follow_up_next:
+            self._follow_up_next = now + FOLLOW_UP_EVERY
+            try:
+                if self.api is None:
+                    self.api = plan_github.client(cache_dir=self.cfg.state_dir)
+                follow_up(db, self.cfg, declared, now, api=self.api, log=self.log)
+            except Exception as exc:
+                self.log("GitHub watch follow-up: failed (%s)" % plan_github._one_line(exc))
         return reports
+
+
+# -- #5506: an input is followed until a proof of processing -----------------
+def _age(entry, now):
+    return "%d min" % max(0, int((now - float(entry["delivered_at"])) // 60))
+
+
+def _line(entry, now):
+    return "- %s · %s · %s · delivered %s ago to %s" % (
+        entry["issue_ref"], entry["kind"], entry["url"], _age(entry, now), entry["agent"])
+
+
+def open_header(entries, now):
+    """The watcher's open inputs, counted in front of a new digest.
+
+    A count and the oldest age, never the links again: each input is quoted
+    once per version, and the recall at 60 min lists the overdue ones.
+    """
+    if not entries:
+        return ""
+    return ("Still open from earlier GitHub watch passes: %d input(s) with no proof of "
+            "processing yet, oldest delivered %s ago; overdue inputs are recalled "
+            "at %d min and escalated to the pilot at %d min.\n\n"
+            % (len(entries), _age(entries[0], now), REMIND_AFTER // 60,
+               ESCALATE_AFTER // 60))
+
+
+PROOF_RULE = (
+    "Proof read by ameesh on every pass: a lot carrying the issue_ref (for a comment, "
+    "a lot created after its delivery), a lot note citing the input's URL, or a mesh "
+    "reply on the ticket (" + REPLY_MARKER + ", or a `gh` comment from a turn) posted "
+    "after the delivery.")
+
+
+def reminder(entries, now):
+    lines = ["GitHub watch follow-up — %d input(s) delivered more than %d min ago with "
+             "no proof of processing:" % (len(entries), REMIND_AFTER // 60)]
+    lines += [_line(entry, now) for entry in entries]
+    lines += ["Process each input now: new need → lot with its issue_ref; information → "
+              "lot note citing the URL; question → answer on the ticket. Escalation to "
+              "the pilot at %d min." % (ESCALATE_AFTER // 60), PROOF_RULE]
+    return "\n".join(lines)
+
+
+def escalation(project, entries, now):
+    lines = ["GitHub watch escalation — project %s — %d input(s) delivered more than "
+             "%d min ago and still unprocessed (watcher relaunched at %d min):"
+             % (project, len(entries), ESCALATE_AFTER // 60, REMIND_AFTER // 60)]
+    lines += [_line(entry, now) for entry in entries]
+    lines += ["Expected: make sure each input becomes a lot, a lot note or an answer "
+              "(reassign it if the watcher is unavailable).", PROOF_RULE]
+    return "\n".join(lines)
+
+
+def _mesh_reply(api, entry, cache):
+    """A ticket comment carrying the reply marker, posted after the delivery.
+
+    One read per issue and pass (``cache``); None when the read failed, so the
+    caller neither resolves nor counts the input as proven.
+    """
+    repo, _, number = entry["issue_ref"].rpartition("#")
+    key = (repo, number)
+    if key not in cache:
+        query = urlencode(dict(since=iso(float(entry["delivered_at"])), per_page=PAGE_SIZE))
+        try:
+            rows = api.get("/repos/%s/issues/%s/comments?%s" % (repo, number, query), ttl=0)
+        except Exception:  # noqa: BLE001 - unreadable: retried next pass
+            rows = None
+        cache[key] = rows if isinstance(rows, list) else None
+    rows = cache[key]
+    if rows is None:
+        return None
+    since = iso(float(entry["delivered_at"]))
+    for row in rows:
+        body = (row.get("body") or "") if isinstance(row, dict) else ""
+        if ((REPLY_MARKER in body or MANUAL_MARKER.search(body))
+                and str(row.get("created_at") or "") >= since):
+            return "mesh reply %s" % (row.get("html_url") or entry["issue_ref"])
+    return ""
+
+
+def follow_up(db, cfg, declared, now, *, api=None, log=None):
+    """Close proven inputs, recall the watcher at 60 min, escalate at 2 h.
+
+    Deterministic: every proof is read from the base or the ticket, never
+    asserted by an agent. Mail and stamps commit together: a failed send keeps
+    the input due for the next pass.
+    """
+    log = log or (lambda text: None)
+    st = storage.of(db)
+    watchers = {(sub.project, sub.repo): sub.agent for sub in declared}
+    cache, reads = {}, 0
+    remind, escalate = {}, {}
+    for entry in st.github_watch.open_entries(FOLLOW_UP_LIMIT):
+        age = now - float(entry["delivered_at"])
+        proof = st.github_watch.local_proof(entry)
+        # A ticket reply is read only while a recall or escalation is due:
+        # bounded GitHub reads, none for an input already escalated.
+        if (proof is None and age >= REMIND_AFTER and api is not None
+                and entry.get("escalated_at") is None):
+            repo, _, number = entry["issue_ref"].rpartition("#")
+            if (repo, number) in cache or reads < FOLLOW_UP_READS:
+                reads += (repo, number) not in cache
+                proof = _mesh_reply(api, entry, cache) or None
+        if proof:
+            st.github_watch.resolve(entry, proof, now)
+            continue
+        if age >= ESCALATE_AFTER and entry.get("escalated_at") is None:
+            escalate.setdefault(entry["project"], []).append(entry)
+        if age >= REMIND_AFTER and entry.get("reminded_at") is None:
+            agent = watchers.get((entry["project"], entry["repo"]), entry["agent"])
+            remind.setdefault(agent, []).append(entry)
+    for agent, entries in remind.items():
+        with db.transaction() as tx:
+            after_commit = []
+            mail.send(tx, "ameesh", agent, reminder(entries, now), host=cfg.host,
+                      after_commit=after_commit,
+                      payload={"github_watch_follow_up": {
+                          "stage": "reminder",
+                          "items": [entry["url"] for entry in entries]}})
+            storage.of(tx).github_watch.mark(entries, "reminded_at", now)
+        for record in after_commit:
+            record(db.cfg, db)
+        log("GitHub watch follow-up: %d input(s) recalled to %s" % (len(entries), agent))
+    if escalate:
+        from . import alert_briefs, registry
+        listing = registry.overview(db)
+    for project, entries in escalate.items():
+        try:
+            pilots = alert_briefs.project_pilots(project, list(listing), cfg=cfg, db=db)
+        except Exception:  # noqa: BLE001 - no readable role: retried next pass
+            pilots = []
+        if not pilots:
+            log("GitHub watch follow-up: no pilot for %s; %d input(s) not escalated"
+                % (project, len(entries)))
+            continue
+        with db.transaction() as tx:
+            after_commit = []
+            mail.send(tx, "ameesh", pilots[0], escalation(project, entries, now),
+                      host=cfg.host, after_commit=after_commit,
+                      payload={"github_watch_follow_up": {
+                          "stage": "escalation",
+                          "items": [entry["url"] for entry in entries]}})
+            storage.of(tx).github_watch.mark(entries, "escalated_at", now)
+        for record in after_commit:
+            record(db.cfg, db)
+        log("GitHub watch follow-up: %d input(s) of %s escalated to %s"
+            % (len(entries), project, pilots[0]))

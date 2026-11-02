@@ -250,6 +250,11 @@ FERMEES = {
     "github_watch_cursors": {"project", "repo", "scanned_through"},
     "github_watch_events": {"project", "repo", "kind", "object_id", "digest"},
     "github_watch_scans": {"project", "repo", "progress"},
+    # #5506 (0534) : suivi des entrées remises au veilleur, tenu par l'hôte de
+    # la veille ; fermé aux deux rôles superviseur, aucun GRANT ajouté.
+    "github_watch_pending": {"project", "repo", "kind", "object_id", "issue_ref",
+                             "url", "agent", "delivered_at", "events_after",
+                             "reminded_at", "escalated_at", "resolved_at", "proof"},
     # #288 (L80b, 0472) : attribution des messages servis par un tour résident
     # (`turn_costs.inputs`), consommée par le rapport local
     # `ameesh cost turns --message` ; le contrat des rôles superviseur reste
