@@ -451,7 +451,7 @@ class FreezeBudgetTest(unittest.TestCase):
     def before(self, deadline):
         seen = {}
 
-        def run(where, commit, *, gate=None, timeout=freeze_checks.TIMEOUT):
+        def run(where, commit, *, gate=None, timeout=freeze_checks.TIMEOUT, paths=None):
             seen["timeout"] = timeout
             return {"result": "green", "seconds": 0.0, "output": ""}
 
