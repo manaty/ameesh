@@ -118,7 +118,8 @@ class Check(unittest.TestCase):
         self.assertTrue(data["urgent"])
         self.assertEqual(data["packet_slot_missed"]["ready"], [2601])
         self.assertIn("#2601", text)
-        self.assertIn("integration/paquet-h-20261019-0400", text)
+        self.assertIn("nom de porteur attribué par le composeur", text)
+        self.assertNotIn("integration/paquet-h-20261019-0400", text)
         self.assertEqual(self.run_check(at(4, 40), state)["result"], "already-alerted")
         self.assertEqual(len(self.sent), 2)
         # the next slot is a new one
