@@ -4,6 +4,7 @@ processing; recalled at 60 min, escalated to the pilot at 2 h."""
 from __future__ import annotations
 
 import dataclasses
+import re
 from unittest import mock
 
 from ameesh import github_watch as watch, mail, registry, storage, work
@@ -15,14 +16,20 @@ H = 3600
 
 class RepliesApi(Api):
     """Issues/comments feed, plus the per-issue comment read of the follow-up."""
-    def __init__(self, issues=(), comments=(), replies=()):
+    def __init__(self, issues=(), comments=(), replies=(), replies_by_issue=None):
         super().__init__(issues, comments)
         self.replies = list(replies)
+        self.replies_by_issue = {int(n): list(rows)
+                                 for n, rows in (replies_by_issue or {}).items()}
 
     def get(self, path, **kw):
-        if "/issues/1/comments" in path:
+        match = re.search(r"/issues/(\d+)/comments", path)
+        if match:
             self.calls.append(path)
-            return list(self.replies)
+            number = int(match.group(1))
+            if number in self.replies_by_issue:
+                return list(self.replies_by_issue[number])
+            return list(self.replies) if number == 1 else []
         return super().get(path, **kw)
 
 
@@ -175,6 +182,10 @@ class FollowUpTest(PgTestCase):
     def reply_reads(self, api):
         return [c for c in api.calls if "/issues/1/comments" in c]
 
+    def read_issues(self, api):
+        found = (re.search(r"/issues/(\d+)/comments", call) for call in api.calls)
+        return [int(match.group(1)) for match in found if match]
+
     def test_check_cadence_is_persisted_across_fresh_processes(self):
         # The role timer runs `notify --once` every 90 s: a fresh Watcher each time.
         api = RepliesApi([issue()])
@@ -186,6 +197,33 @@ class FollowUpTest(PgTestCase):
         self.assertEqual(len(self.reply_reads(api)), 1)
         self.tick(api, NOW + H + 1 + watch.FOLLOW_UP_EVERY)
         self.assertEqual(len(self.reply_reads(api)), 2)
+
+    def test_inputs_beyond_the_read_budget_are_read_on_the_next_pass(self):
+        # #5520: an earlier fix stamped checked_at on every open input, so the
+        # same 20 oldest consumed the budget on each pass and a reply on the
+        # 21st (or later) input was never read. An input skipped by the read
+        # budget keeps its old stamp, so the budget goes round the unread ones.
+        entries = [dict(kind="issue", object_id=n,
+                        issue_ref="acme/rotation#%d" % n,
+                        url="https://github.com/acme/rotation/issues/%d" % n)
+                   for n in range(1, 26)]
+        with self.db.transaction() as tx:
+            storage.of(tx).github_watch.track(
+                "app", "acme/rotation", "watcher", entries, NOW - 2 * H)
+        api = RepliesApi(replies_by_issue={25: [
+            dict(body="Answered " + watch.REPLY_MARKER,
+                 created_at=watch.iso(NOW - H),
+                 html_url="https://github.com/acme/rotation/issues/25"
+                          "#issuecomment-250")]})
+        watch.follow_up(self.db, self.cfg, [SUB], NOW, api=api)
+        self.assertEqual(self.read_issues(api), list(range(1, 21)))
+        self.assertIsNone(self.pending()[("issue", 25)]["resolved_at"])
+        first_pass = len(self.read_issues(api))
+        watch.follow_up(self.db, self.cfg, [SUB],
+                        NOW + watch.FOLLOW_UP_EVERY + 1, api=api)
+        self.assertEqual(self.read_issues(api)[first_pass:],
+                         list(range(21, 26)) + list(range(1, 16)))
+        self.assertIsNotNone(self.pending()[("issue", 25)]["resolved_at"])
 
     def test_escalated_input_is_still_closed_by_a_later_reply(self):
         api = RepliesApi([issue()])
