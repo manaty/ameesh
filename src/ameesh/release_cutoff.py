@@ -2559,10 +2559,25 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 if isinstance(text, bytes):
                     text = text.decode("utf-8", "replace")
                 log.write(text or "")
-                monitor.stop(reason)
+                if drop:
+                    # The stop is proved (units settled, bounded return ended):
+                    # the supervisor publishes the terminal that releases the
+                    # shared guard.
+                    monitor.stop(reason)
+                    garde = ""
+                else:
+                    # #5450: never publish `failed` while the workstation units
+                    # or the return are unproved. The launcher's `running`
+                    # snapshot keeps `staging_watch.in_flight` blocking: no
+                    # manual or elected start may run from a kept worktree.
+                    # The operator proves the stop, then resumes with
+                    # STAGING_PREVIOUS_RUN.
+                    garde = (" ; garde partagee laissee running : arret ou retour "
+                             "non prouve, reprise apres preuve operateur "
+                             "(STAGING_PREVIOUS_RUN)")
                 raise TransientReleaseError(
-                    "staging stopped after %ss: %s (log %s)%s"
-                    % (round(time.time() - started), reason, log_path, note))
+                    "staging stopped after %ss: %s (log %s)%s%s"
+                    % (round(time.time() - started), reason, log_path, note, garde))
             log.write(output or "")
         return {"exit": proc.returncode, "duration_s": round(time.time() - started, 1),
                 "log": log_path,

@@ -1175,14 +1175,19 @@ class HeadCiStateTextTest(unittest.TestCase):
 class StagedStop:
     """#5450: a monitor that stops on its first check, without the 15 min wait."""
 
+    last = None
+
     def __init__(self, *args, **kwargs):
         self.reason = "délai dépassé : figé"
+        self.stop_calls = []
+        StagedStop.last = self
 
     def check(self, now=None):
         return self.reason
 
     def stop(self, reason):
         self.stopped = reason
+        self.stop_calls.append(reason)
 
 
 class StagingTimeoutTest(unittest.TestCase):
@@ -1405,23 +1410,31 @@ class StagingTimeoutUnitsTest(unittest.TestCase):
         self.assertRegex(message, r"poste-maj-staging-\d+-redemarrer\.service")
         self.assertEqual(at_drop, [[]])
         self.assertEqual(self.stops(calls), [])
+        # Quiescence and the return are proved: the terminal is published.
+        self.assertEqual(StagedStop.last.stop_calls, [StagedStop.last.reason])
 
     def test_a_unit_past_its_grace_is_stopped_before_the_drop(self):
         message, at_drop, calls = self.run_timeout()
         self.assertIn("stopped: the workstation may be half restarted", message)
         self.assertEqual(at_drop, [[]])
         self.assertRegex(self.stops(calls)[0], r"^stop poste-maj-staging-\d+-\*$")
+        self.assertEqual(StagedStop.last.stop_calls, [StagedStop.last.reason])
 
     def test_a_unit_that_survives_its_stop_keeps_the_worktree(self):
         message, at_drop, _ = self.run_timeout(STOP_SANS_EFFET="1")
         self.assertIn("still running", message)
         self.assertIn("worktree kept", message)
+        # #5450: no terminal while the unit is alive; the guard stays.
+        self.assertIn("garde partagee laissee running", message)
+        self.assertEqual(StagedStop.last.stop_calls, [])
         self.assertEqual(at_drop, [])
 
     def test_an_unreadable_state_keeps_the_worktree(self):
         message, at_drop, calls = self.run_timeout(LIST_KO="1")
         self.assertIn("unreadable state", message)
         self.assertIn("worktree kept", message)
+        self.assertIn("garde partagee laissee running", message)
+        self.assertEqual(StagedStop.last.stop_calls, [])
         self.assertEqual(at_drop, [])
         self.assertEqual(len(self.stops(calls)), 1, calls)
 
@@ -1429,6 +1442,8 @@ class StagingTimeoutUnitsTest(unittest.TestCase):
         message, at_drop, _ = self.run_timeout(LIST_KO_APRES_STOP="1")
         self.assertNotIn("stopped:", message)
         self.assertIn("unreadable state", message)
+        self.assertIn("garde partagee laissee running", message)
+        self.assertEqual(StagedStop.last.stop_calls, [])
         self.assertEqual(at_drop, [])
 
     def test_without_systemctl_there_is_no_unit(self):
@@ -1531,6 +1546,124 @@ class ReturnAfterStopTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["mailed"])
         self.assertIn("TimeoutStartSec", result["note"])
+
+
+class SynchronousStopGuardTest(unittest.TestCase):
+    """#5450: run_staging publishes `failed` only once the stop is proved.
+
+    Otherwise the launcher's `running` snapshot keeps the shared guard, as in
+    the elected executor: a second start (manual or elected) is refused.
+    """
+
+    RUN = "deadbeef"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="ameesh-5450-garde-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.worktree = self.root / "worktree"
+        script = self.worktree / "deploy/mise-a-jour/staging.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/usr/bin/env bash\n")
+        from tests.test_4885_staging_exclusive import SharedLog
+        self.log = SharedLog()
+        store = types.SimpleNamespace(
+            events=types.SimpleNamespace(record=self.log.record))
+        patch = mock.patch.object(release_cutoff.staging_watch.storage, "of",
+                                  return_value=store)
+        patch.start()
+        self.addCleanup(patch.stop)
+        # The launcher's exclusive start, as staging.sh publishes it.
+        release_cutoff.staging_watch.record(
+            self.log, self.snapshot(self.RUN, "running"), exclusive=True)
+
+    @staticmethod
+    def snapshot(run, state):
+        return dict(run=run, sha="a" * 40, state=state,
+                    started=1, deadline=time.time() + 600)
+
+    def run_stop(self, *, settle, retour):
+        published = []
+
+        class FakeProc:
+            pid = 424244
+            returncode = -15
+
+            def __init__(self):
+                self.calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired("bash", timeout, output=b"x")
+                return "x", ""
+
+        class Monitor:
+            def __init__(self, db, run, **kwargs):
+                self.db = db
+                self.run = run
+
+            def check(self, now=None):
+                return "délai dépassé : figé"
+
+            def stop(self, reason):
+                published.append(reason)
+                release_cutoff.staging_watch.record(
+                    self.db, self.snapshot(self.run, "failed"))
+
+        project = release_cutoff.ProjectRelease(
+            name="ameesh", repo=str(self.root / "repo"), target="main",
+            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh")
+        with mock.patch.object(release_cutoff, "_worktree",
+                               return_value=(str(self.root), str(self.worktree))), \
+             mock.patch.object(release_cutoff, "_drop_worktree"), \
+             mock.patch.object(release_cutoff, "_kill_group"), \
+             mock.patch.object(release_cutoff.subprocess, "Popen",
+                               return_value=FakeProc()), \
+             mock.patch.object(release_cutoff, "_settle_poste_units",
+                               return_value=settle), \
+             mock.patch.object(release_cutoff, "_return_after_stop",
+                               return_value=retour) as retour_call, \
+             mock.patch.object(release_cutoff, "_manual_return_mail"), \
+             mock.patch.object(release_cutoff.uuid, "uuid4",
+                               return_value=types.SimpleNamespace(hex=self.RUN)), \
+             mock.patch.object(release_cutoff.staging_watch, "Monitor", Monitor):
+            with self.assertRaises(release_cutoff.TransientReleaseError) as caught:
+                release_cutoff.run_staging(project, "a" * 40, [],
+                                           state_dir=str(self.root),
+                                           timeout_s=1, db=self.log)
+        return str(caught.exception), retour_call, published
+
+    def states(self):
+        return {row["data"]["run"]: row["data"]["state"]
+                for row in self.log.latest_type()}
+
+    def assert_second_start_refused(self):
+        with self.assertRaises(release_cutoff.staging_watch.Busy):
+            release_cutoff.staging_watch.record(
+                self.log, self.snapshot("second", "running"), exclusive=True)
+
+    def test_unproved_units_keep_the_guard_and_refuse_a_second_start(self):
+        message, retour, published = self.run_stop(
+            settle=("... still running", False), retour=None)
+        self.assertIn("garde partagee laissee running", message)
+        self.assertEqual(published, [])
+        self.assertFalse(retour.called)
+        self.assertEqual(self.states()[self.RUN], "running")
+        self.assert_second_start_refused()
+
+    def test_unproved_return_keeps_the_guard_and_refuses_a_second_start(self):
+        message, retour, published = self.run_stop(
+            settle=("", True),
+            retour=dict(ran=True, ok=False,
+                        note="retour apres arret: echec", mailed=False,
+                        drop=False, pid=424245))
+        self.assertIn("garde partagee laissee running", message)
+        self.assertIn("retour apres arret: echec", message)
+        self.assertEqual(published, [])
+        self.assertTrue(retour.called)
+        self.assertEqual(self.states()[self.RUN], "running")
+        self.assert_second_start_refused()
 
 
 class PureReleaseTest(unittest.TestCase):

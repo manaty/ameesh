@@ -709,7 +709,12 @@ s'arrête. Son `EXIT` ne publie **aucun état terminal** : le snapshot partagé
 `staging.sequence` reste `running`, ce qui tient la garde
 (`staging_watch.in_flight`) même quand son flock local tombe avec le
 processus ; un second démarrage est refusé tant que le superviseur n'a pas
-publié `failed`. Le superviseur qui a tué le groupe (`staging_executor.tick` ou
+publié `failed`. Le même chemin s'applique à un TERM hors superviseur (arrêt
+systemd de l'unité, `kill` d'un lancement manuel) : le snapshot reste
+`running` et la trace dit « arrêt demandé par la surveillance » même si aucune
+surveillance ne l'a jugé ; l'opérateur prouve alors l'arrêt des unités et du
+retour, puis reprend avec `STAGING_PREVIOUS_RUN`. Le superviseur qui a tué le
+groupe (`staging_executor.tick` ou
 `run_staging`) attend/arrête d'abord les unités
 `poste-maj-staging-<pid>-*` survivantes, puis rejoue le retour comme une
 **étape à part, hors du groupe tué** (`staging.sh --retour-sur-arret`) :
@@ -720,7 +725,10 @@ publié `failed`. Le superviseur qui a tué le groupe (`staging_executor.tick` o
 tente pas le retour s'il reste moins d'une minute. Un retour en échec, hors
 délai, ou un superviseur tué par systemd fait remettre au pilote la marche
 manuelle (`vm.sh agents retour`, `poste.sh retour`), l'hôte restant sur son
-`previous-sha` ; la garde n'est libérée et l'échec publié qu'après. Un arrêt
+`previous-sha` ; la garde n'est libérée et l'échec publié qu'après. La release
+synchrone (`run_staging`) ne publie `failed` qu'après la même preuve ; sinon
+elle laisse le snapshot `running` et son `TransientReleaseError` nomme la
+garde conservée. Un arrêt
 demandé sous `--sans-retour` (migration non additive) ne lance aucun retour :
 le courrier existant donne le rollback SQL d'abord, puis la remise de code.
 La raison d'`overdue()` est enregistrée dans la demande et le snapshot
