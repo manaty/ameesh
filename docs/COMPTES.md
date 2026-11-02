@@ -331,6 +331,21 @@ dans un échantillon tronqué, le compte est refusé comme relevé incomplet :
 une limite de lecture ne doit pas masquer une fenêtre saturée. Le forfait
 pro peut ne publier que la semaine.
 
+#5466 : pour un compte Codex **nommé**, la lecture locale est complétée par
+l'historique partagé du même compte — l'identité est le nom du compte, jamais
+l'hôte, plusieurs hôtes du mesh partageant le même forfait. La date d'un
+relevé Codex (`read_at` : horodatage de l'événement, sinon mtime du journal)
+est publiée comme instant de production ; c'est la fenêtre qui départage
+ensuite : une échéance `resets_at` plus tardive prouve que la fenêtre plus
+ancienne est close, et son relevé est écarté, qu'il vienne du journal local ou
+de l'historique. À échéance égale (même fenêtre), le relevé partagé le plus
+récent l'emporte sur une lecture locale plus ancienne. L'écriture d'historique
+Codex porte l'hôte source, et une fenêtre reprise de l'historique n'est jamais
+réécrite (pas d'écho). Seules les fenêtres encore présentes dans la lecture
+locale sont remplacées : une fenêtre disparue du journal n'est pas ressuscitée
+depuis l'historique. Conséquence : après une remise à zéro du compte, un hôte
+dont le journal local est figé sur l'ancienne fenêtre n'impose plus sa pause.
+
 #3044 : un compte non-pro **au repos** — aucun relevé plus récent que sa
 fenêtre courte (5 h) — ne peut plus produire de courte vivante. Quand une
 courte a été retenue, échue, elle compte pour 0 % (L71) et le relevé est

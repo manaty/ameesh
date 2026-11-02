@@ -297,8 +297,9 @@ class Gauge:
     #: qu'une autre du même compte (#2843).
     read_at: float | None = None
     #: #1132 : instant de PRODUCTION du relevé (epoch), None quand le flux ne
-    #: le date pas (sans marqueur, ou Codex) — l'heure d'insertion n'en tient
-    #: pas lieu, un relevé périmé ne doit pas se faire passer pour frais.
+    #: le date pas (sans marqueur) — l'heure d'insertion n'en tient pas lieu,
+    #: un relevé périmé ne doit pas se faire passer pour frais. #5466 : pour
+    #: Codex, c'est la date du relevé (`read_at`), publiée avec lui.
     produced_at: float | None = None
     #: #1132 : journal d'origine du relevé (nom de l'agent), '' si inconnu.
     source: str = ""
@@ -1217,7 +1218,107 @@ class CostBook:
         """Le dernier relevé connu de chaque jauge d'un compte (#1132)."""
         return storage.of(self.db).operations.gauge_latest(harness=harness, account=account)
 
-    def codex_gauges(self, sessions: str | None = None, *, plan: str | None = None) -> list:
+    def _codex_with_history(self, account: str, gauges) -> "Gauges":
+        """#5466 : complète la lecture Codex locale par l'historique partagé.
+
+        Un relevé Codex d'avant #5466 peut n'être pas daté (`produced_at`
+        NULL) : l'heure d'insertion ne prouve pas la fraîcheur. La fenêtre,
+        elle, porte son échéance : pour un même compte et une même jauge, une
+        échéance plus tardive prouve que la fenêtre plus ancienne est close —
+        son relevé est écarté, qu'il vienne du journal local ou de
+        l'historique partagé. À échéance égale (même fenêtre), le relevé
+        partagé le plus récent (`produced_at`, sinon `observed_at`) l'emporte
+        sur une lecture locale plus ancienne ; une mesure locale datée
+        l'emporte sur un relevé partagé non daté (#1132).
+
+        Le compte est l'identité (`account`), jamais l'hôte : plusieurs hôtes
+        du mesh partagent le même forfait et l'un d'eux a pu observer la
+        remise à zéro après une remise à zéro du compte.
+
+        Une fenêtre reprise d'ici porte `from_history=True` et n'est donc
+        jamais réécrite sous la source de cet hôte (`record_gauges`, #1702).
+
+        Seules les fenêtres que la lecture locale observe encore sont
+        remplacées : une fenêtre absente du journal local n'est pas ressuscitée
+        depuis l'historique. Un relevé local ne portant plus une fenêtre est
+        plus récent que l'historique pour cette fenêtre (une fenêtre close ou
+        un plan qui n'en publie plus ne doit pas tenir le compte en pause
+        indéfiniment ; témoins #1672 et #1883).
+
+        Sur un exécuteur `backend=mediated`, `gauge_latest_window` n'est pas
+        admise au contrat médié : l'appel est refusé, l'exception est avalée
+        et la lecture locale est rendue sans réconciliation (même repli que
+        `_gauges_with_history` pour Claude).
+        """
+        if self.db is None:
+            return gauges
+        try:
+            rows = storage.of(self.db).operations.gauge_latest_window(
+                harness="codex", account=account)
+        except Exception:  # historique facultatif : jamais fatal à la garde
+            return gauges
+        known = {row.get("key"): row for row in rows if row.get("key")}
+        if not known:
+            return gauges
+        merged, changed = [], False
+        for gauge in gauges:
+            row = known.get(gauge.key)
+            if row is not None and self._codex_history_wins(gauge, row):
+                merged.append(self._gauge_from_history("codex", row))
+                changed = True
+            else:
+                merged.append(gauge)
+        return Gauges(merged, gauges.overage) if changed else gauges
+
+    @staticmethod
+    def _codex_history_wins(gauge: "Gauge", row: dict) -> bool:
+        """#5466 : le relevé partagé est-il la fenêtre courante, plus fraîche ?
+
+        Échéances toutes deux connues et différentes : la plus tardive gagne.
+        Un relevé partagé non daté ne remplace pas une mesure locale datée
+        (#1132) ; si seule l'échéance locale manque, la fraîcheur décide.
+        Même fenêtre (échéances égales à `GAUGE_TIME_TOLERANCE_S` près) ou
+        aucune date : la plus récente par production, sinon par insertion.
+        """
+        row_resets = row.get("resets_at_ts")
+        local_resets = gauge.resets_at
+        if row_resets is not None and local_resets is not None:
+            delta = float(row_resets) - float(local_resets)
+            # Une remise à zéro revient arrondie de la base : deux valeurs à
+            # moins d'une seconde sont la même fenêtre, pas une plus tardive.
+            if abs(delta) > GAUGE_TIME_TOLERANCE_S:
+                return delta > 0
+        elif local_resets is not None:
+            # Un relevé partagé non daté ne remplace pas une mesure datée
+            # (#1132) ; l'inverse (local non daté, partagé daté) se décide
+            # ci-dessous par la fraîcheur.
+            return False
+        row_stamp = row.get("produced_ts")
+        if row_stamp is None:
+            row_stamp = row.get("observed_ts")
+        local_stamp = gauge.produced_at if gauge.produced_at is not None else gauge.read_at
+        if row_stamp is None:
+            return False
+        return (local_stamp is None or
+                float(row_stamp) > float(local_stamp) + GAUGE_TIME_TOLERANCE_S)
+
+    @staticmethod
+    def _gauge_from_history(harness: str, row: dict) -> "Gauge":
+        """#5466 : une fenêtre relue de l'historique partagé."""
+        produced = row.get("produced_ts")
+        produced = float(produced) if produced is not None else None
+        observed = row.get("observed_ts")
+        read_at = produced if produced is not None else (
+            float(observed) if observed is not None else None)
+        resets = row.get("resets_at_ts")
+        return Gauge(harness, row.get("key"), float(row.get("used") or 0.0),
+                     None if resets is None else float(resets),
+                     float(row.get("window_s") or 0.0),
+                     read_at=read_at, produced_at=produced,
+                     source=row.get("source") or "", from_history=True)
+
+    def codex_gauges(self, sessions: str | None = None, *, plan: str | None = None,
+                     account: str | None = None) -> list:
         """Les fenêtres `rate_limits` des journaux récents du compte.
 
         #2839 : une lecture partielle ne masque aucune fenêtre ; des relevés
@@ -1236,6 +1337,9 @@ class CostBook:
 
         `sessions` (L30) : le dossier de sessions d'un compte
         (`<CODEX_HOME>/sessions`) ; par défaut celui de la machine.
+        `account` (#5466) : le compte nommé dont on complète la lecture par
+        l'historique partagé (fenêtre à échéance plus tardive, source hôte) ;
+        None = lecture locale seule (compte non déclaré, affichage global).
         """
         racine = sessions if sessions is not None else self.codex_sessions
         from .codex_gauges import recent_files, reconcile, session_reading
@@ -1262,8 +1366,26 @@ class CostBook:
             if sample.truncated:
                 truncated = True
                 unread(read_at)
-        return reconcile(readings, now, truncated=truncated, plan=plan,
-                         unread_before=unread_before)
+        gauges = reconcile(readings, now, truncated=truncated, plan=plan,
+                           unread_before=unread_before)
+        # #5466 : la source d'un relevé Codex est l'hôte qui l'a lu (Codex ne
+        # nomme pas d'agent comme Claude) ; elle est publiée telle quelle dans
+        # l'historique partagé, sans quoi deux hôtes homonymes sont
+        # indiscernables. Son instant de PRODUCTION est la date du relevé
+        # (`read_at` : horodatage de l'événement, sinon mtime du journal) ;
+        # sans lui, l'heure d'insertion ferait passer un relevé périmé pour
+        # frais (#1132, #1672) et l'historique ne pourrait pas départager
+        # deux lectures de la même fenêtre.
+        source = config_mod.hostname()
+        gauges = Gauges([replace(gauge, source=gauge.source or source,
+                                produced_at=(gauge.produced_at
+                                             if gauge.produced_at is not None
+                                             else gauge.read_at))
+                         for gauge in gauges],
+                        getattr(gauges, "overage", None))
+        if account is not None:
+            gauges = self._codex_with_history(account, gauges)
+        return gauges
 
     def gauges(self, harness: str | None = None, *, record: bool = True) -> Gauges:
         """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).
@@ -3005,6 +3127,11 @@ def _racy(stat, now_ns: int) -> bool:
 #: commencé : le harnais a rejoué une mesure périmée (incident du 13/10, la
 #: five_hour du relevé figé était échue de ~24 h sous un marqueur récent).
 REPLAY_TOLERANCE_S = 60.0
+
+#: #5466 : les dates de remise à zéro et de production traversent la base en
+#: microsecondes et reviennent arrondies. En deçà d'une seconde, deux valeurs
+#: désignent le même instant — les fenêtres, elles, sont séparées de jours.
+GAUGE_TIME_TOLERANCE_S = 1.0
 
 
 def _marker_ts(event: dict) -> float | None:
