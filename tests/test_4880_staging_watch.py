@@ -114,13 +114,15 @@ class HeartbeatScriptTest(unittest.TestCase):
         import subprocess
         source = "\n".join([
             "set -euo pipefail",
-            'JOURNAL=$D/j; SUIVI_RUN=r; SHA=aaa; SUIVI_DEBUT=$(date +%s); SUIVI_DELAI=7200',
+            'JOURNAL=$D/j; SUIVI_RUN=r; SHA=aaa; PRECEDENT=',
+            'SUIVI_DEBUT=$(date +%s); SUIVI_DELAI=7200',
             'NOTIF_STAGING=p; DEPUIS=2000-01-01T00:00:00Z; SUIVI_COURANTE=$D/c; SUIVI_PROGRES=$D/p',
             'SUIVI_SILENCE_S=900; SUIVI_PLAFOND_TOUR_S=1800; SUIVI_BASE_HOTE_S=900',
             'SUIVI_RUNNERS_DEFAUT=20; SUIVI_BATTEMENT_S=${BEAT:-120}; SUIVI_SUIVI=$D/out',
             'SUIVI_PY=x; touch "$JOURNAL"',
             'py_sequence() { shift; printf "%s\\n" "$1" >> "$SUIVI_SUIVI"; }',
-            self.bloc("publier_suivi() {", "if [ \"$POSTE_ABSENT\" = 1 ]; then\n  printf"),
+            self.bloc("valider_battement() {", "if [ \"$POSTE_ABSENT\" = 1 ]; then\n  printf"),
+            self.bloc("trace() {", "\n# --- gestes par hote"),
             tail])
         return subprocess.run(["bash", "-c", source], capture_output=True, text=True,
                               timeout=30, env=dict(os.environ, D=folder, **env))
@@ -154,6 +156,71 @@ publier_suivi failed
         self.assertNotIn("deadline", closed["hosts"]["vm-1"])
         self.assertGreater(first["beat"], 0)
 
+    def test_closed_step_keeps_its_start_in_the_journal(self):
+        import json
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, """
+debut_etape vm-1 redemarrer
+printf 'vm-1\\tredemarrer\\t1000\\t0\\n' > "$SUIVI_COURANTE"
+trace vm-1 redemarrer ok "fini"
+publier_suivi completed
+""")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            journal = [json.loads(line) for line in
+                       (Path(folder) / "j").read_text().splitlines()]
+            self.assertEqual(journal[0]["started"], 1000)
+            closed = self.snapshots(folder)[-1]["hosts"]["vm-1"]
+        self.assertEqual((closed["stage"], closed["verdict"]), ("redemarrer", "ok"))
+        self.assertEqual(closed["since"], 1000)
+
+    def test_invalid_beat_interval_is_refused_before_any_publication(self):
+        from pathlib import Path
+        for value in ("0", "-1", "abc", "nan", "inf"):
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as folder:
+                    proc = self.harness(folder, "echo tail", BEAT=value)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("STAGING_BATTEMENT_S invalide", proc.stderr)
+                    self.assertFalse((Path(folder) / "out").exists())
+                    self.assertNotIn("tail", proc.stdout)
+
+    def test_fractional_beat_interval_is_accepted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, "echo valid", BEAT="0.1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "valid")
+
+    @unittest.skipUnless(__import__("pathlib").Path("/proc/self/stat").exists(),
+                         "requires /proc (Linux)")
+    def test_beat_refuses_a_zombie_launcher(self):
+        import os
+        import time as clock
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            limit = clock.monotonic() + 5
+            while clock.monotonic() < limit:
+                try:
+                    stat = (__import__("pathlib").Path("/proc/%d/stat" % pid)).read_text()
+                except OSError:
+                    self.fail("zombie disappeared before the check")
+                if stat.rsplit(")", 1)[1].split()[0] == "Z":
+                    break
+                clock.sleep(0.05)
+            else:
+                self.fail("child did not become a zombie")
+            with tempfile.TemporaryDirectory() as folder:
+                proc = self.harness(folder, """
+if lanceur_vivant "$ZPID"; then echo alive; else echo dead; fi
+if lanceur_vivant $$; then echo self-alive; fi
+""", ZPID=str(pid))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.split(), ["dead", "self-alive"])
+        finally:
+            os.waitpid(pid, 0)
+
     def test_beat_runs_then_stops_before_the_final_snapshot(self):
         with tempfile.TemporaryDirectory() as folder:
             proc = self.harness(folder, """
@@ -176,6 +243,7 @@ publier_suivi completed
             proc = self.harness(folder, """
 lancer_battement
 printf '%s\\n' "$SUIVI_BATTEMENT_PID" > "$D/pid"
+sleep 1.5
 kill -KILL $$
 """, BEAT="1")
             self.assertEqual(proc.returncode, -signal.SIGKILL)
@@ -192,6 +260,10 @@ kill -KILL $$
                 clock.sleep(0.2)
             else:
                 self.fail("beat outlived its launcher")
+            before = len(self.snapshots(folder))
+            clock.sleep(2.2)
+            self.assertEqual(len(self.snapshots(folder)), before,
+                             "beat kept publishing after its launcher died")
 
     def test_every_staged_host_step_begins_published(self):
         source = self.script()
