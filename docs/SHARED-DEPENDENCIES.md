@@ -94,30 +94,57 @@ A PATH is a worktree (its packages are found down to depth 3, never through
 `node_modules`, hidden directories or symlinks) or a package directory.
 `link` leaves a real local `node_modules` alone unless `--replace` is given.
 
-### Packaging projects (L248b)
+### Packaging projects (L248b, per package since #5417)
 
-`deps link` refuses packages declaring `electron-builder`, `electron-packager`,
-`@electron/packager`, `pkg`, `@yao-pkg/pkg`, `nexe` or `@vercel/ncc`, including npm
-dependency aliases. It also detects their command names in `package.json`
-scripts (`ncc` for `@vercel/ncc`), at command positions: the start of a command,
-after shell separators or through `npx` / `npm exec`. Arguments such as
-`tsc --outDir pkg` or `echo electron-builder` do not trigger detection.
-Electron-builder's `build` manifest key and
-`electron-builder.{yml,yaml,json,json5,js,cjs,ts}` files also trigger the guard,
-even when the tool is invoked externally through `npx`. Manifest configuration
-keys `pkg` and `nexe` are detected too. Within a git worktree, root and sibling
-manifests are inspected even without lockfiles: tooling anywhere in the same
-repository conservatively guards every package, since it may target another
-app with `--projectDir`. Nested repositories, hidden and generated directories,
-and directory symlinks are excluded. The refusal happens before any install or
-replacement of a local tree. `--force` allows a development link explicitly;
-it does not make the link suitable for a release. Turn-start linking applies
-the same guard and removes existing shared-cache links in detected projects,
-without installing dependencies. Run `deps unlink` to install a local tree
-before building. Real local trees and links outside the shared cache are kept.
+A packager walks the `node_modules` of the app it builds and needs a real
+directory there. The guard is per package, not per repository: a desktop
+Electron app must not force the backend, the website, the mobile app or the
+shared libraries of the same monorepo to keep a local tree.
+
+* A package is a **packaging root** when its own `package.json` declares
+  `electron-builder`, `electron-packager`, `@electron/packager`, `pkg`,
+  `@yao-pkg/pkg`, `nexe` or `@vercel/ncc` (including npm dependency aliases),
+  invokes one of them in a script, or carries electron-builder's `build` key
+  or an `electron-builder.{yml,yaml,json,json5,js,cjs,ts}` file. `deps link`
+  refuses it and the turn-start hook removes a shared link there.
+* A manifest elsewhere in the same git worktree (root, sibling, parent) guards
+  only the app it names: electron-builder's `--projectDir DIR` (or its
+  `--project` alias), resolved from the manifest's directory and from the
+  repository root because an npm script can be run from either, and
+  `directories.app` from its `build` key or an electron-builder YAML/JSON
+  config. A command with no target guards the manifest's own directory and the
+  packages below it; a packaging member of an npm workspace also guards the
+  workspace root that hoists its tree. Thus `desktop/package.json` with
+  electron-builder no longer guards `backend`, `website`, `mobile` or
+  `shared/*`.
+* `pkg`, `nexe` and `@vercel/ncc` guard the package that declares or invokes
+  them and the packages below it (a root tooling script therefore keeps the
+  whole tree local); their entry arguments are not resolved.
+* A broken manifest in the package or on the way up to the repository root
+  refuses the link (it could package this package); a broken sibling is
+  ignored, since it cannot be shown to package it. Nested repositories,
+  hidden and generated directories, and directory symlinks are excluded.
+* The refusal happens before any install or replacement of a local tree.
+  `--force` allows a development link explicitly; it does not make the link
+  suitable for a release. Real local trees and links outside the shared cache
+  are kept.
+* `directories.app` is read from `package.json`'s `build` key and from
+  JSON/JSON5 and YAML electron-builder files. A JS/TS config, or a YAML
+  construct the small reader does not understand, is not inferred: the
+  manifest keeps its conservative own-directory guard. Scripts hidden in
+  external JS or shell files without declarations or recognized configuration
+  cannot be inferred.
+
+Turn-start linking applies the same guard and removes existing shared-cache
+links only in the packages a packager reads, without installing dependencies.
 The turn-start scan includes child packages even when the root has a lockfile.
-Scripts hidden in external JS or shell files without declarations or recognized
-configuration cannot be inferred.
+Script commands are recognized at command positions (`npx` / `npm exec`, after
+shell separators); `tsc --outDir pkg` or `echo electron-builder` do not trigger
+the guard, and the `pkg` / `nexe` manifest configuration keys are detected too.
+A `file:` dependency of a packaging app is not followed, nor a `cd DIR &&
+packager` sequence, a target passed as a variable (`--projectDir "$APP"`) or an
+explicit `--config FILE`: run `deps local` in the dependency or the app when
+packaging that way.
 
 Before packaging, run in the package directory:
 
@@ -137,11 +164,13 @@ child packages down to depth 3, even when the root has a manifest or lockfile.
 A local tree already
 present is kept; use `AMEESH_DEPS=off npm ci` to refresh it before a release.
 
-In a detected packaging project, the npm wrapper passes install commands to
-the real npm after removing any shared link. Thus a subsequent `npm ci` does
-not recreate the link. `deps status` warns about an existing link in such a
-project; its JSON includes `packagers` and `warning`. An invalid manifest is
-reported and cannot silently permit a new link.
+In a packaging package, the npm wrapper passes install commands to the real
+npm after removing any shared link. Thus a subsequent `npm ci` does not
+recreate the link there, while `npm ci` in a sibling development package still
+links the shared tree. `deps status` warns about an existing link in a
+packaging package; its JSON includes `packagers` and `warning`. An invalid
+manifest in the package or an ancestor is reported and cannot silently permit
+a new link; a broken sibling does not block the other packages.
 
 ### `npm` in a turn
 
@@ -223,6 +252,45 @@ The fallback is always available: `ameesh deps unlink` (or `local`) in the packa
 the tool as before. Use it for anything that ships: an electron-builder
 package, a release or OTA bundle, a portable Next standalone tree.
 
+### Nexlink: what links, what stays local (#5417)
+
+`nexlink` is a monorepo without a root manifest. Its package roots, the
+development use and the distribution build behind each one:
+
+| Package | Development | Distribution build | `node_modules` |
+|---|---|---|---|
+| `backend` | tsc, jest | Docker image installs its own tree | shared link |
+| `website` | `next dev`, vitest | Next 16 `output: 'standalone'` (the link path appears in the traced tree); Docker images install their own tree | shared link; `deps local` before a portable standalone build |
+| `mobile` | Expo / Metro, jest | EAS builds in the cloud; a local `expo export` bundle embeds the cache path in asset URLs | shared link; `deps local` before a local release or OTA bundle |
+| `assist` | Expo / Metro, jest | EAS, same as mobile | shared link |
+| `shared/*` | tsc, jest | bundled by the apps and Docker images | shared link |
+| `desktop` | tsc, jest | electron-builder reads `desktop/node_modules`; a link silently produces a broken app (table above) | **local**, guard refuses a link; `deps unlink` before `npm run dist` |
+
+The desktop manifest no longer guards the other packages (#5417). On the nine
+base clones of `ameesh-agents-2` inventoried on 2026-11-02 (26.2 GB, 23.0 GB of
+real `node_modules` and builds), the migration is:
+
+```sh
+ameesh deps status /home/ameesh/work/<clone>          # what is local/linked/absent
+ameesh deps link --replace /home/ameesh/work/<clone>  # links the dev packages, keeps desktop local
+```
+
+An entry already in the host's cache is shared: each link adds one inode, and
+the bytes freed are those of the local tree `--replace` deleted; a missing
+entry is filled once by the first package that links it. `ameesh deps entries`
+gives each entry's size and link count. Do not run two migrations in the same
+tree at once; `deps link` serialises its own work through the
+entry locks, but a concurrent `npm ci` is still a local install.
+
+Measured on ameesh-agents-1 (2026-11-02, `du -s --block-size=1`): the cache
+entries are 435.0 MiB for backend, 1073.6 MiB for website, 811.2 MiB for mobile
+and 63-87 MiB for each shared package; one clone's twelve real shared trees use
+893 MiB and `deps status` finds all twelve entries complete. On
+ameesh-agents-2 the nine base clones held 23.0 GB of real `node_modules` and
+builds on the same date, with `desktop` as the only packaging root: the trees
+of the other packages are the linkable share, and the saving per clone is the
+sum of the local trees `--replace` replaces, not the size of the cache.
+
 ### Garbage collection
 
 The periodic housekeeping pass (`ameesh menage`) deletes an entry only when
@@ -286,6 +354,15 @@ measurements, before and after:
   `find ~/development/manaty -maxdepth 4 -name node_modules -not -type l`.
   For the cache itself, use `ameesh deps entries`, which reports the
   `files` of each entry.
+
+For a per-package migration (#5417), measure bytes, not only inodes:
+`du -sb <clone>` and `du -sb <package>/node_modules` before, then
+`ameesh deps link --replace <clone>`. `deps status --json` says which packages
+are now linked and which stay local; `deps entries` gives the bytes the cache
+shares. A clone stops storing the trees of the packages that linked; a
+packaging package (desktop) stays local and is not part of the saving. The
+same count applies to a base clone that never had a link: the bytes freed are
+its real trees, already counted once in the cache.
 
 ## Out of scope
 
