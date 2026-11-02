@@ -3039,8 +3039,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 from . import verdict_carry
                 deferred = bool(outcome.get("deferred"))
                 carried = outcome.get("carry")
+                carry_repo = verdict_carry._repo_path(args.repo) if args.repo else None
                 if deferred or carried is None:
-                    carried = verdict_carry.carry(cfg, db, args.id, repo=args.repo)
+                    carried = verdict_carry.carry(cfg, db, args.id, repo=carry_repo)
                     outcome["carry"] = carried
                 if carried["result"] == "carried" and not outcome.get("reviewers"):
                     try:
@@ -3067,7 +3068,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         or (outcome.get("state") == "carried"
                             and (carried["result"] in failures or partial))):
                     plan = activation.carried_plan(cfg, db, args.id, sha,
-                                                   repo=args.repo)
+                                                   repo=carry_repo)
                     force = bool(plan and not plan.get("refused"))
                     # #5481 : la reprise de l'exécuteur peut constater le même
                     # report refusé ; le bail du lot sérialise les deux gestes.

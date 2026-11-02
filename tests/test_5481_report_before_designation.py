@@ -106,6 +106,14 @@ class ReportBeforeDesignationTest(_Reviewed):
                          "validated", carried)
         self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
 
+    def test_a_relative_repository_is_resolved_for_the_report(self):
+        # `--repo .` : le report le lit depuis le clone radar, pas depuis le
+        # répertoire courant du processus ; le chemin doit être résolu avant.
+        with mock.patch("os.getcwd", return_value=self.repo.root):
+            self.assertEqual(verdict_carry._repo_path("."), self.repo.root)
+        self.assertEqual(verdict_carry._repo_path("https://example.invalid/x.git"),
+                         "https://example.invalid/x.git")
+
     def test_a_freeze_reads_the_report_plan_in_its_repository(self):
         # Défaut 4 du constat : `no-repository` sur une branche `review/...`
         # publiée. Le gel lit `--repo` ; le plan du report doit lire le même
@@ -165,6 +173,65 @@ class SameHeadTest(_Reviewed):
         self.assertEqual(self.review_mail(), [])
         self.assertEqual(self.designated(), ["rev1", "rev2"])
         self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+
+
+class SameHeadWithoutSeatsTest(_Fixture):
+    """Un premier gel interrompu puis un regel du même SHA reste repris."""
+
+    def test_a_same_head_refreeze_without_seats_keeps_the_deferred_path(self):
+        first: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=self.repo.reviewed,
+                       actor="author", outcome=first, repo=self.repo.root,
+                       defer_designation=True)
+        self.assertEqual(first.get("state"), "deferred", first)
+        self.assertEqual(self.designated(), [])
+        self.assertTrue(self.notes(act.DEFERRED_PREFIX))
+        # La CLI est interrompue ; un regel du même SHA ne doit pas prendre le
+        # raccourci « rien à garder » et laisser le lot sans relecteur.
+        second: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=self.repo.reviewed,
+                       actor="author", outcome=second, repo=self.repo.root,
+                       defer_designation=True)
+        self.assertEqual(second.get("state"), "deferred", second)
+        self.assertEqual(self.designated(), [])
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            report = act.finish_deferred(self.cfg, self.db)
+        mine = [row for row in report["results"] if row["lot"] == self.lot]
+        self.assertEqual(len(mine), 1, report)
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.assertEqual([row["recipient"] for row in self.review_mail()],
+                         ["rev1", "rev2"])
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            again = act.finish_deferred(self.cfg, self.db)
+        self.assertEqual([row for row in again["results"] if row["lot"] == self.lot], [])
+        self.assertEqual(len(self.review_mail()), 2)
+
+
+class DesignateDeferredForceTest(_Reviewed):
+    """Un report planifié mais refusé ne neutralise pas la sélection réelle."""
+
+    def test_force_bypasses_the_provisional_carried_mark(self):
+        self.reviewed_freeze()
+        frozen = self.repo.adapt_test()
+        self.receipt(frozen)
+        self.freeze(frozen)
+        freeze = self.freeze_latest()
+        self.assertEqual(act.reviewers(self.cfg, self.db, self.lot)
+                         ["designation"]["state"], "carried")
+        self.db.execute("DELETE FROM agent_mailbox")
+        outcome = act.designate_deferred(self.cfg, self.db, self.lot,
+                                         freeze, force=True)
+        self.assertEqual(outcome.get("state"), "designated", outcome)
+        self.assertEqual([row["recipient"] for row in self.review_mail()],
+                         ["rev1", "rev2"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], "designated")
+        # Le deuxième appel (CLI/reprise) rend la marque écrite, sans nouveau
+        # courrier.
+        again = act.designate_deferred(self.cfg, self.db, self.lot,
+                                       freeze, force=True)
+        self.assertEqual(again.get("state"), "designated", again)
+        self.assertEqual(len(self.review_mail()), 2)
 
 
 class SameHeadRaceTest(_Reviewed):

@@ -904,18 +904,35 @@ def milestone(
     drain: list | None = None
     prepared = None
     same_head = False
-    carry_repo = (repo or str(freeze_info.get("repo") or "")) if kind == "frozen" else ""
+    carry_repo = ((os.path.abspath(repo) if repo else str(freeze_info.get("repo") or ""))
+                  if kind == "frozen" else "")
     if kind == "frozen":
         # #5481 : un regel qui nomme exactement la tête déjà gelée ne remet
         # pas le quorum en jeu et ne redésigne pas. La lecture est bornée et
         # ne fait jamais perdre le gel.
         from .modules.dev import plan_git
         try:
-            previous = plan_git.latest_freeze(
-                storage.of(db).work.milestones(item_id, None) or ())
+            marks = storage.of(db).work.milestones(item_id, None) or ()
+            previous = plan_git.latest_freeze(marks)
         except Exception:  # noqa: BLE001 - lecture ratée : gel normal
-            previous = None
-        same_head = bool(previous and plan_git.same_commit(previous.get("sha"), sha))
+            previous, marks = None, ()
+        # #5481 (B de la revue) : le raccourci ne vaut que s'il a quelque
+        # chose à garder — des sièges, une dispense, ou des verdicts rendus
+        # sur ce SHA. Sinon c'est une première désignation : le chemin
+        # différé (contrôle des familles, marque durable, reprise) s'applique.
+        acquired = False
+        if previous and plan_git.same_commit(previous.get("sha"), sha):
+            from . import work as work_mod
+            reviewers = [str(name or "").strip()
+                         for name in (item.get("reviewers") or ())]
+            waived = (work_mod.REVIEWER_NONE in reviewers
+                      or str(item.get("reviewer") or "").strip() == work_mod.REVIEWER_NONE)
+            verdicts = any(m.get("kind") == "verdict"
+                           and plan_git.same_commit(m.get("sha"), sha)
+                           for m in marks)
+            acquired = bool(reviewers or waived or verdicts)
+        same_head = bool(previous and acquired
+                         and plan_git.same_commit(previous.get("sha"), sha))
     if kind == "frozen" and on_frozen is None:
         from . import review_designation_activation as activation
         cfg = getattr(db, "cfg", None)

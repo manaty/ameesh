@@ -3028,6 +3028,9 @@ def carried_plan(cfg, db, lot: int, sha: str, *,
         return None
     if plan.get("result") != "would-carry":
         return None
+    # #5481 : le plan est lu avant le report ; la marque qu'il fait écrire est
+    # une provision, pas la preuve d'un report accompli.
+    plan["provisional"] = True
     return plan
 
 
@@ -4327,10 +4330,17 @@ def designate_deferred(cfg, db, lot: int, freeze: Mapping, *,
                 "why": "another host holds the lot's fire lease"}
     try:
         effective = _effective_mark(db, int(lot), int((freeze or {}).get("id") or 0))
-        if effective is not None:
+        # #5481 (B des deux relectures) : une marque `carried` écrite au gel
+        # sur le plan d'un report n'est qu'une provision. Si le report a
+        # ensuite refusé, `force` demande la sélection réelle et ne doit pas
+        # être neutralisé par cette marque. Un report réellement accompli
+        # écrit une marque sans ce `why` de provision.
+        provisional = bool(effective is not None and effective[1] == "carried"
+                           and effective[2].get("provisional"))
+        if effective is not None and not (force and provisional):
             return (_carried_shape(effective[2])
                     if effective[1] == "carried" else dict(effective[2]))
-        if _retry_resolved(db, int(lot), freeze):
+        if not (force and provisional) and _retry_resolved(db, int(lot), freeze):
             return {"state": "resolved", "reviewers": [],
                     "freeze": dict(freeze or {}),
                     "why": "a final designation outcome is already journaled"}
@@ -4382,6 +4392,8 @@ def finish_deferred(cfg, db, *, dry_run: bool = False,
     for row in rows or ():
         lot = int(row.get("id") or 0)
         if str(row.get("state") or "") != "qa":
+            continue
+        if lot not in notes_by_lot:
             continue
         marks = work.milestones(db, lot)
         freeze = plan_git.latest_freeze(marks)
