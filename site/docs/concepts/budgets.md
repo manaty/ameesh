@@ -108,8 +108,21 @@ ameesh budget set --account deepseek-manaty --per-day 100 --tz Europe/Paris
   account and the reservation is closed, in one transaction. An uncertain
   outcome keeps the reservation counted in full for its day (`kept`), in
   addition to the measured cost. Uncertain outcomes are an error, a lost
-  lease, preemption, a turn closed by a cap, or a crash followed by repair. A
-  human checks the turn, then releases it with `ameesh budget release <id>`.
+  lease, preemption, a turn closed by a cap, a signal, a crash followed by
+  repair, or a non-zero exit with no stream line and no usage. A human checks
+  the turn, then releases it with `ameesh budget release <id>`.
+  The **only automatic release** is a positive `ameesh-refusal/1` proof from a
+  qualified harness (`claude`, `codex` or `deepseek`, with its own stream
+  format). Before issuing any provider request, the harness — or the wrapper
+  that drives it — writes the proof document to `$AMEESH_REFUSAL_FILE` (the
+  private per-turn skeleton the runner prepared; `ameesh refusal emit
+  --reason "…"` writes it) and exits with the reserved code declared by its
+  descriptor (`86` in the shipped ones). The runner then closes the
+  reservation as `released`: 0 $ for the day, while the turn still appears in
+  the ledger at 0. Any deviation keeps the reservation `kept`: no proof or a
+  stale/forged one, another exit code, a signal, one stream line, a usage
+  record, or a configured `stream = "text"` descriptor that is not one of the
+  qualified families.
   A turn can cost more than its reservation; the excess is counted in full
   and blocks the next turns. The cap can therefore be exceeded by at most the
   excess of the turns running at that moment.

@@ -42,6 +42,7 @@
     },
     "backup": {"session_files": ["sessions/*/{session}"]},
     "resident": {"protocol": "acp", "launcher": ["--profile", "acp"], "command": [], "min_version": "0.2.0-rc.2"},
+    "refusal": {"schema": "ameesh-refusal/1", "exit_code": 86},
     "install": {"note": "binaire `dsh` installé par l'hôte ; distribution signée en L17"}
   }
 }

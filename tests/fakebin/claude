@@ -26,6 +26,50 @@ import sys
 import time
 
 
+def _refuse() -> int | None:
+    """#5529 : refuse le tour AVANT toute ligne de flux.
+
+    `AMEESH_TEST_REFUSE` porte le motif ; `AMEESH_TEST_REFUSE_PROOF` fait écrire
+    la preuve `ameesh-refusal/1` par la CLI réelle (`ameesh refusal emit`),
+    `AMEESH_TEST_REFUSE_EXIT` choisit le code rendu (86 par défaut) ;
+    `AMEESH_TEST_REFUSE_TOKEN` remplace le jeton du document forgé (`forged`).
+    """
+    message = os.environ.get("AMEESH_TEST_REFUSE")
+    if not message:
+        return None
+    if os.environ.get("AMEESH_TEST_REFUSE_PROOF"):
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, "-m", "ameesh", "refusal", "emit", "--reason", message],
+            capture_output=True, text=True, env=os.environ.copy())
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            return 1
+    target = os.environ.get("AMEESH_TEST_REFUSE_PROOF_AT")
+    if target:  # marqueur fabriqué hors du squelette du tour (négatif)
+        document = {"schema": "ameesh-refusal/1", "harness": "claude",
+                    "token": os.environ.get("AMEESH_TEST_REFUSE_TOKEN", "forged"),
+                    "turn_id": "forged", "reason": message}
+        skeleton = os.environ.get("AMEESH_REFUSAL_FILE")
+        if skeleton:  # au chemin réel : champs du tour copiés, jeton forgé
+            try:
+                with open(skeleton, encoding="utf-8") as fh:
+                    current = json.load(fh)
+            except (OSError, ValueError):
+                current = {}
+            for key in ("harness", "turn_id"):
+                if isinstance(current.get(key), str):
+                    document[key] = current[key]
+        with open(target, "w", encoding="utf-8") as fh:
+            json.dump(document, fh)
+        os.chmod(target, 0o600)
+    if os.environ.get("AMEESH_TEST_REFUSE_LINE"):
+        # une ligne de flux avant le refus : le fournisseur a peut-être été appelé
+        print(os.environ["AMEESH_TEST_REFUSE_LINE"], flush=True)
+    sys.stderr.write(message + "\n")
+    return int(os.environ.get("AMEESH_TEST_REFUSE_EXIT", "86"))
+
+
 def _compte() -> dict:
     """Le compte vu par le harnais (L30) : dossiers, et l'EMPREINTE de la clé
     (jamais la clé, même factice)."""
@@ -52,6 +96,9 @@ def main() -> int:
               '(choices: "acceptEdits", "auto", "bypassPermissions", "manual", '
               '"dontAsk", "plan")'))
         return 0
+    refus = _refuse()
+    if refus is not None:
+        return refus
     log = os.environ.get("AMEESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:

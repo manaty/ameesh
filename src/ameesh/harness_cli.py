@@ -127,6 +127,8 @@ def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
         print("cost           : %s" % json.dumps(descriptor.cost, ensure_ascii=False))
     if descriptor.permissions:
         print("permissions    : %s" % json.dumps(descriptor.permissions, ensure_ascii=False))
+    if descriptor.refusal:
+        print("refusal proof  : %s" % json.dumps(descriptor.refusal, ensure_ascii=False))
     if descriptor.distribution:
         print("distribution   : %s" % ", ".join(sorted(descriptor.distribution)))
     else:

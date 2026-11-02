@@ -873,22 +873,29 @@ def follow_up(db, cfg, declared, now, *, api=None, log=None):
     watchers = {(sub.project, sub.repo): sub.agent for sub in declared}
     cache, reads = {}, 0
     remind, escalate, checked = {}, {}, []
-    # Each input is checked at most every FOLLOW_UP_EVERY, least recently
+    # Each input's ticket is read at most every FOLLOW_UP_EVERY, least recently
     # checked first: the bounded GitHub reads go round, escalated inputs too.
+    # An input the pass budget skipped keeps its old checked_at (or NULL), so
+    # it leads the next pass instead of the same oldest inputs consuming the
+    # budget every time (#5520).
     for entry in st.github_watch.open_entries(
             FOLLOW_UP_LIMIT, checked_before=now - FOLLOW_UP_EVERY):
         age = now - float(entry["delivered_at"])
         proof = st.github_watch.local_proof(entry)
+        read_skipped = False
         # A ticket reply is read once a recall is due, within the pass budget.
         if proof is None and age >= REMIND_AFTER and api is not None:
             repo, _, number = entry["issue_ref"].rpartition("#")
             if (repo, number) in cache or reads < FOLLOW_UP_READS:
                 reads += (repo, number) not in cache
                 proof = _mesh_reply(api, entry, cache) or None
+            else:
+                read_skipped = True
         if proof:
             st.github_watch.resolve(entry, proof, now)
             continue
-        checked.append(entry)
+        if not read_skipped:
+            checked.append(entry)
         if age >= ESCALATE_AFTER and entry.get("escalated_at") is None:
             escalate.setdefault(entry["project"], []).append(entry)
         if age >= REMIND_AFTER and entry.get("reminded_at") is None:

@@ -21,11 +21,51 @@ def _compte() -> dict:
     }
 
 
+def _refuse() -> int | None:
+    """#5529 : refuse le tour AVANT toute ligne de flux (preuve optionnelle)."""
+    message = os.environ.get("AMEESH_TEST_REFUSE")
+    if not message:
+        return None
+    if os.environ.get("AMEESH_TEST_REFUSE_PROOF"):
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, "-m", "ameesh", "refusal", "emit", "--reason", message],
+            capture_output=True, text=True, env=os.environ.copy())
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            return 1
+    target = os.environ.get("AMEESH_TEST_REFUSE_PROOF_AT")
+    if target:  # marqueur fabriqué hors du squelette du tour (négatif)
+        document = {"schema": "ameesh-refusal/1", "harness": "codex",
+                    "token": os.environ.get("AMEESH_TEST_REFUSE_TOKEN", "forged"),
+                    "turn_id": "forged", "reason": message}
+        skeleton = os.environ.get("AMEESH_REFUSAL_FILE")
+        if skeleton:  # au chemin réel : champs du tour copiés, jeton forgé
+            try:
+                with open(skeleton, encoding="utf-8") as fh:
+                    current = json.load(fh)
+            except (OSError, ValueError):
+                current = {}
+            for key in ("harness", "turn_id"):
+                if isinstance(current.get(key), str):
+                    document[key] = current[key]
+        with open(target, "w", encoding="utf-8") as fh:
+            json.dump(document, fh)
+        os.chmod(target, 0o600)
+    if os.environ.get("AMEESH_TEST_REFUSE_LINE"):
+        print(os.environ["AMEESH_TEST_REFUSE_LINE"], flush=True)
+    sys.stderr.write(message + "\n")
+    return int(os.environ.get("AMEESH_TEST_REFUSE_EXIT", "86"))
+
+
 def main() -> int:
     args = sys.argv[1:]
     if args == ["--version"]:  # L120: read by the runner, not a turn
         print("codex-cli 9.9.9")
         return 0
+    refus = _refuse()
+    if refus is not None:
+        return refus
     log = os.environ.get("AMEESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:
