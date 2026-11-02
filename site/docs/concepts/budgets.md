@@ -110,6 +110,14 @@ ameesh budget set --account deepseek-manaty --per-day 100 --tz Europe/Paris
   addition to the measured cost. Uncertain outcomes are an error, a lost
   lease, preemption, a turn closed by a cap, or a crash followed by repair. A
   human checks the turn, then releases it with `ameesh budget release <id>`.
+  An exit code with no stream line and no usage is no proof that the provider
+  was not called, so such a turn keeps its reservation too. A failed rotation
+  summary waits before the next attempt (1, 2, 4 min…, at most 30 min). After
+  3 failures, the session rotates on a deterministic brief with no model call,
+  so a looping harness keeps only a few reservations. Two alerts report kept
+  reservations: `reservations_kept_burst` (5 or more for one agent
+  in 30 min) and `account_cap_kept` (an account blocked by its cap, with kept
+  reservations making up at least 25 % of it).
   A turn can cost more than its reservation; the excess is counted in full
   and blocks the next turns. The cap can therefore be exceeded by at most the
   excess of the turns running at that moment.

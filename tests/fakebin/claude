@@ -73,6 +73,11 @@ def main() -> int:
                     # #2772 : le PATH et le venv vus par le tour
                     "PATH", "VIRTUAL_ENV")},
             }) + "\n")
+    if os.environ.get("AMEESH_TEST_REFUSE"):
+        # #5503 : un harnais qui refuse le tour avant tout appel au
+        # fournisseur — aucune ligne de flux, code 1 (issue #4065)
+        sys.stderr.write(os.environ["AMEESH_TEST_REFUSE"] + "\n")
+        return 1
     if os.environ.get("AMEESH_TEST_MAKE_TMP"):
         # L73 : un tour qui laisse des fichiers dans son TMPDIR et une entrée
         # dans le /tmp du système (chemin donné), comme un clone de relecture

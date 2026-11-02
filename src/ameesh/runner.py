@@ -343,6 +343,13 @@ DEVICE_GATES_EVERY_S = 300.0
 #: perdue de toute façon.
 SUMMARY_DISPLAY_MAX_FRAGMENTS = 10_000
 SUMMARY_DISPLAY_MAX_CHARS = 64_000
+#: #5503 (issue #4065) : une rotation annulée attend avant d'être retentée,
+#: de plus en plus longtemps (1 min, 2 min, 4 min… au plus 30 min) ; après
+#: ROTATION_SUMMARY_MAX_FAILURES résumés en échec, la rotation suivante se fait
+#: SANS tour de résumé, sur le brief déterministe (L39) : aucun appel de modèle.
+ROTATION_BACKOFF_S = 60.0
+ROTATION_BACKOFF_MAX_S = 1800.0
+ROTATION_SUMMARY_MAX_FAILURES = 3
 #: #2096 : croissance de RSS (octets) à partir de laquelle un tour rend au
 #: noyau les arènes qu'il a fait croître (pic de flux, de parsing ou de
 #: journalisation). En deçà, l'allocateur garde sa marge : un tour ordinaire ne
@@ -684,6 +691,11 @@ class AgentWorker(threading.Thread):
         #: sorti en erreur en moins de FAST_FAILURE_S) ; et leur série
         self.fast_failure = False
         self.fast_failures = 0
+        #: #5503 : rotations annulées de suite, échéance de la prochaine
+        #: tentative, et arrêt par le disjoncteur L48 pendant une rotation
+        self.rotation_failures = 0
+        self.rotation_retry_at = 0.0
+        self.rotation_stopped = False
         #: #1268 : série d'échecs de tour **réels** (hors hôte, auth, bail,
         #: session fille), remise à zéro par un succès ; marquée dans
         #: `status_text` avec le **début de l'épisode** (`since`), et lue par
@@ -2822,6 +2834,10 @@ class AgentWorker(threading.Thread):
             return True
         if self.proc is None and (self.rotation_forcee or self.context_rotation_due()
                                   or self.rotation_due()):
+            if self.rotation_retry_at > time.time():
+                # #5503 : une rotation annulée attend son échéance — la session
+                # reste due, sans quoi chaque passe relançait le résumé
+                return False
             if self._held_by_pressure(self.runner.host_pressure()):
                 self.runner.pressure_delayed(self.name, rotation=True)
                 return False
@@ -3099,44 +3115,117 @@ class AgentWorker(threading.Thread):
         self._summary_chars += len(text) + separator
         return True
 
+    def _rotation_cancelled(self, motif: str, *, summary_turn: bool = False) -> str:
+        """#5503 : une rotation annulée attend avant la suivante (1 min, 2 min,
+        4 min… au plus 30 min) ; rend la phrase d'attente pour le fil.
+
+        `summary_turn` : le tour de résumé lui-même a échoué. Un échec rapide
+        compte dans la série L48 comme un tour d'instruction : au seuil,
+        l'agent est arrêté (`rotation_stopped`, la boucle rend le bail)."""
+        self.rotation_failures += 1
+        attente = min(ROTATION_BACKOFF_MAX_S,
+                      ROTATION_BACKOFF_S * (2 ** (self.rotation_failures - 1)))
+        self.rotation_retry_at = time.time() + attente
+        if summary_turn and self.fast_failure:
+            self.fast_failures += 1
+            if self.fast_failures >= self.runner.max_fast_failures:
+                self.stop_after_failures()
+                self.rotation_stopped = True
+        if self.rotation_stopped:
+            log_async("[%s] rotation cancelled: %s (%d in a row); agent stopped"
+                      % (self.name, motif, self.rotation_failures))
+            return ("the agent is stopped after %d consecutive fast failures "
+                    "(`ameesh resume %s` once the cause is fixed)"
+                    % (self.fast_failures, self.name))
+        log_async("[%s] rotation cancelled: %s (%d in a row); next attempt in %ds%s"
+                  % (self.name, motif, self.rotation_failures, int(attente),
+                     ", without a summary turn"
+                     if self.rotation_failures >= ROTATION_SUMMARY_MAX_FAILURES else ""))
+        if self.rotation_failures >= ROTATION_SUMMARY_MAX_FAILURES:
+            return ("will rotate again in %d min on a deterministic brief, without "
+                    "a summary turn (%d failures in a row)"
+                    % (max(1, int(attente // 60)), self.rotation_failures))
+        return "will try again in %d min (%d failure(s) in a row)" % (
+            max(1, int(attente // 60)), self.rotation_failures)
+
+    def _rotation_brief(self, raison: str, ancienne: str | None) -> tuple[str, str]:
+        """#5503 : (mention, brief) d'une rotation sans résumé — le brief de
+        reprise L39, sans appel de modèle ; le fil et l'historique n'en gardent
+        que la mention, comme la bascule de compte."""
+        note = ("Session rotation without a summary: the summary turn failed %d "
+                "times in a row on the previous session (%s). Reread your project "
+                "thread and the state of your lot before continuing."
+                % (self.rotation_failures, ancienne or "?"))
+        try:
+            from . import reprise
+            return note, note + "\n\n" + reprise.deterministic_brief(
+                self.cfg, self.db, registry.get(self.db, self.name) or self.agent,
+                session=ancienne, reason="session rotation (%s), summary unavailable"
+                % raison,
+                consigne="This turn's instruction follows this brief: resume your "
+                         "work from there, and end each turn with a clear status.")
+        except Exception as exc:  # noqa: BLE001 — la note seule ouvre la session
+            log_async("[%s] deterministic resume brief unavailable (%s)" % (self.name, exc))
+            return note, note
+
     def _rotate(self, raison: str) -> bool:
-        """Le mécanisme de rotation (L11) : résumé dans la session, puis oubli."""
+        """Le mécanisme de rotation (L11) : résumé dans la session, puis oubli.
+
+        #5503 : après ROTATION_SUMMARY_MAX_FAILURES résumés en échec, la
+        rotation se fait sur le brief déterministe, sans tour de résumé."""
         ancienne = self.current_session()
-        log_async("[%s] session rotation (%s)" % (self.name, raison))
-        self._refus_pression = False
-        ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
-        if not ok and self._refus_pression:
-            # la pression est venue entre le choix et le lancement : la
-            # rotation attend sa fin (ligne de fin de l'épisode), sans trace
-            # au fil à chaque passage
-            self.runner.pressure_delayed(self.name, rotation=True)
-            return False
-        if not ok:
-            # Résumé partiel, bail perdu pendant le tour, claim remplaçant : on ne
-            # touche à rien. Effacer la session ici effacerait celle du remplaçant
-            # (verdict codex3 L11 B3).
-            log_async("[%s] rotation cancelled: the summary turn did not complete" % self.name)
-            self._fil_note("Session rotation cancelled: the summary turn did not "
-                           "complete. The old session is kept; will try "
-                           "again later.",
-                           meta={"action": "rotation", "etat": "annulee"})
-            return False
-        resume = self.turn_summary()
-        if not resume:
-            log_async("[%s] rotation cancelled: empty summary" % self.name)
-            self._fil_note("Session rotation cancelled: empty summary. The old "
-                           "session is kept.",
-                           meta={"action": "rotation", "etat": "annulee"})
-            return False
-        self._session_history(ancienne, resume)
+        sans_resume = self.rotation_failures >= ROTATION_SUMMARY_MAX_FAILURES
+        log_async("[%s] session rotation (%s)%s" % (
+            self.name, raison, " without a summary turn" if sans_resume else ""))
+        if sans_resume:
+            note, resume = self._rotation_brief(raison, ancienne)
+            origine = "ameesh"
+        else:
+            self._refus_pression = False
+            ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT,
+                                "ids": []})
+            if ok is None:
+                # #1686 N2 : tour différé (attach, verrou de session) — pas un
+                # échec du résumé : ni attente croissante, ni compte vers la
+                # rotation sans résumé (N impl-07)
+                return False
+            if not ok and self._refus_pression:
+                # la pression est venue entre le choix et le lancement : la
+                # rotation attend sa fin (ligne de fin de l'épisode), sans trace
+                # au fil à chaque passage
+                self.runner.pressure_delayed(self.name, rotation=True)
+                return False
+            if not ok:
+                # Résumé partiel, bail perdu pendant le tour, claim remplaçant : on
+                # ne touche à rien. Effacer la session ici effacerait celle du
+                # remplaçant (verdict codex3 L11 B3).
+                suite = self._rotation_cancelled("the summary turn did not complete",
+                                                 summary_turn=True)
+                self._fil_note("Session rotation cancelled: the summary turn did not "
+                               "complete. The old session is kept; %s." % suite,
+                               meta={"action": "rotation", "etat": "annulee",
+                                     "echecs": self.rotation_failures})
+                return False
+            resume, origine = self.turn_summary(), "agent"
+            note = resume
+            if not resume:
+                suite = self._rotation_cancelled("empty summary", summary_turn=True)
+                self._fil_note("Session rotation cancelled: empty summary. The old "
+                               "session is kept; %s." % suite,
+                               meta={"action": "rotation", "etat": "annulee",
+                                     "echecs": self.rotation_failures})
+                return False
+        self._session_history(ancienne, note)
         # #538 : le résumé de l'agent est gardé BRUT ; les règles de travail du
         # canon sont injectées à la construction du prompt de la session neuve
         # (`_resume_prompt`), donc relues à ce moment-là : une fiche retirée ne
         # reste pas dans un résumé en attente.
-        if not self._resume_keep(resume, "agent"):
+        if not self._resume_keep(resume, origine):
+            suite = self._rotation_cancelled("resume summary not kept on disk")
             self._fil_note("Session rotation cancelled: the resume summary could not "
-                           "be kept on disk. The old session is kept.",
-                           meta={"action": "rotation", "etat": "annulee"})
+                           "be kept on disk. The old session is kept; %s." % suite,
+                           meta={"action": "rotation", "etat": "annulee",
+                                 "echecs": self.rotation_failures})
             return False
         # L'effacement est fencé par le bail : si un remplaçant a réclamé l'agent
         # entre-temps, sa session n'est pas touchée.
@@ -3148,6 +3237,10 @@ class AgentWorker(threading.Thread):
                            "before clearing; nothing was touched.",
                            meta={"action": "rotation", "etat": "annulee"})
             return False
+        if not sans_resume:
+            self.fast_failures = 0  # le tour de résumé a abouti
+        self.rotation_failures = 0
+        self.rotation_retry_at = 0.0
         try:
             os.unlink(self._path("session"))
         except OSError:
@@ -3163,9 +3256,10 @@ class AgentWorker(threading.Thread):
         # de relu n'a plus à être gardé.
         self._resident_reread.pop(ancienne or "", None)
         self._fil_note(
-            "Session rotation (%s): the old id (%s) is kept in "
+            "Session rotation (%s)%s: the old id (%s) is kept in "
             "`session-history.jsonl`; the new session starts from the summary below.\n\n%s"
-            % (raison, ancienne or "new", resume),
+            % (raison, " without a summary turn (deterministic brief, L39)"
+               if sans_resume else "", ancienne or "new", note),
             meta={"action": "rotation", "session": ancienne or "", "raison": raison})
         # L81 (étude §6.3) : la rotation est annoncée dans la conversation.
         self._conversation_state(
@@ -9163,7 +9257,11 @@ class AgentWorker(threading.Thread):
         # même si le bail a été perdu ou le tour préempté (L13 B1). Le modèle
         # est celui du lancement, déjà figé dans le marqueur (L13 B4).
         # #1469 : issue incertaine (erreur, bail perdu, préemption, arrêt
-        # par plafond) : la réservation du compte reste comptée en entier
+        # par plafond) : la réservation du compte reste comptée en entier.
+        # #5503 (B cx1) : un code de sortie sans flux ni usage ne prouve pas
+        # l'absence d'appel — un harnais configurable peut avoir appelé le
+        # fournisseur avant de sortir ; la boucle est bornée par le backoff de
+        # rotation, et les réservations gardées ont leurs alertes.
         self._compta_termine(modele_annonce, incertain=bool(
             error or result_code or lost or preempte or clos))
         # #4448 B cx3 : le nombre de tours de la session est celui des tours
@@ -9814,6 +9912,8 @@ class AgentWorker(threading.Thread):
                 continue
             self.apply_restart_if_requested()
             self.maybe_rotate()
+            if self.rotation_stopped:
+                return False  # #5503 : arrêté par le disjoncteur L48
             spec = self._pick_for_turn()
             if spec:
                 # #283 r2 : la même garde que `run()` — une rotation a pu
@@ -9913,6 +10013,8 @@ class AgentWorker(threading.Thread):
                         break
                     self.apply_restart_if_requested()
                     self.maybe_rotate()
+                    if self.rotation_stopped:
+                        break  # #5503 : arrêté par le disjoncteur L48, bail rendu
                     # L165 (EP2) : bascule planifiée — le détenteur rend le bail
                     # en fin de tour, le challenger le réclame à son rang.
                     handover = self._election_handover()
