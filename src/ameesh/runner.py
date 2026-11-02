@@ -13145,11 +13145,29 @@ class Runner:
         feu qui lit la porte des avis. Ne lève jamais ; une même erreur n'est
         dite qu'une fois."""
         from . import verdict_carry
+        from . import review_designation_activation as activation
         try:
             report = verdict_carry.run_pass(fresh_radar(self.cfg), db, dry_run=self.dry_run)
         except Exception as exc:  # jamais fatal pour l'exécuteur
             report = [{"lot": "?", "result": "error",
                        "detail": "%s: %s" % (type(exc).__name__, exc)}]
+        # #5481 : un gel différé dont la CLI a été interrompue avant le report
+        # ou la désignation est repris ici, après un délai de grâce.
+        try:
+            deferred = activation.finish_deferred(
+                fresh_radar(self.cfg), db, dry_run=self.dry_run)
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            deferred = {"results": [], "summary": "deferred designation sweep: %s: %s"
+                        % (type(exc).__name__, exc)}
+        for entry in deferred.get("results") or ():
+            log_async("deferred designation: lot #%s %s%s"
+                      % (entry.get("lot"), entry.get("result"),
+                         " — %s" % entry.get("detail") if entry.get("detail") else ""))
+        if deferred.get("summary") and not deferred.get("results"):
+            message = str(deferred.get("summary"))
+            if message != getattr(self, "_deferred_error", None):
+                log_async(message)
+            self._deferred_error = message
         seen = getattr(self, "_carry_errors", set())
         errors = set()
         for entry in report:

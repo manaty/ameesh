@@ -1341,7 +1341,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           unknown_authors: Iterable = (), families,
           already: Iterable = (), fixers: Iterable = (), required: Optional[int] = None,
           advances: Optional[Mapping] = None, held: Iterable = (),
-          doubts: Iterable = ()) -> dict:
+          answered: Iterable = (), doubts: Iterable = ()) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -1394,6 +1394,12 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     the frozen head or reported onto it, and the port still skips a request
     that already names this head (#2495). The designation names them in its
     mark's `sent`, so the exact-head request is auditable.
+
+    `answered` names the reviewers who already rendered a verdict on the
+    frozen head (#5481, B/P1 cx2). Their seat is covered by that verdict: the
+    designation may name them, but no new request is sent. A missing seat is
+    still provided and asked (the second family of a two-opinion freeze), so
+    an isolated verdict never passes for a complete designation.
 
     The freeze is re-read **once**, and the provided inputs (paths, authors,
     class) are those of this freeze: if the `Port` refuses a freeze that has
@@ -1513,6 +1519,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         out["replayed"] = True
         return out
     state = selection["state"]
+    answered_names = {str(name or "").strip().lower()
+                      for name in answered or () if str(name or "").strip()}
     manual = [dict(row) for row in selection.get("manual") or ()]
     by_name = {str(row.get("name") or "").strip(): row for row in manual}
     held_seats: list = []
@@ -1577,6 +1585,10 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     for index, reviewer in enumerate(selection.get("reviewers") or ()):
         if str(reviewer.get("name") or "") in previous_names:
             # #3596: an automatic seat of this freeze already holds its request.
+            continue
+        if str(reviewer.get("name") or "").strip().lower() in answered_names:
+            # #5481 (B/P1 cx2) : un avis déjà rendu sur cette tête couvre le
+            # siège ; une nouvelle demande réveillerait le relecteur pour rien.
             continue
         # #4325: the room this very reviewer would leave as a corrector, read
         # before the mail so it opens with "do not push" when it is too tight.
