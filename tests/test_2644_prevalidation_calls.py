@@ -369,6 +369,8 @@ class ContractFallbackTest(unittest.TestCase):
         self.repo.write("tests/test_cluster.py", "x = 1\n")
         self.repo.write("tests/test_l107_executor_contract.py", "x = 1\n")
         self.repo.write("tests/test_l161f_plan.py", "x = 1\n")
+        # #5518 : contrat transverse déclaré, donc présent dans tout arbre.
+        self.repo.write("tests/test_migrations_additives.py", "x = 1\n")
         self.head = self.repo.commit("contracts")
 
     def block(self):
