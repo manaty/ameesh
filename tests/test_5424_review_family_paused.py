@@ -71,6 +71,28 @@ class FamilyPausedTest(unittest.TestCase):
         self.assertEqual(len(both), 1)
         self.assertEqual(exploitation.alert_key(both[0]), exploitation.alert_key(one[0]))
 
+    def test_alert_carries_the_contract_schema(self):
+        # #5424 N1 : le contrat `ameesh-alert/1` de tous les producteurs
+        self.assertEqual(self.alerts()[0]["schema"], exploitation.ALERT_SCHEMA)
+
+    def test_held_lot_names_its_issue(self):
+        row, milestone, ev = self.inputs()
+        row["issue_ref"] = "manaty/ameesh#4070"
+        alert = pause.alerts([row], [milestone], [ev], registry(), families=FAMILIES, now=T)[0]
+        self.assertEqual(alert["held_lots"][0]["issue_ref"], "manaty/ameesh#4070")
+        self.assertIn("manaty/ameesh#4070", alert["detail"])
+
+    def test_pilot_and_closed_host_do_not_mask_the_pause(self):
+        # #5424 N6 : le pilote et un hôte fermé sont hors du vivier désigné
+        rows = registry() + [agent_row("pilot", harness="codex"),
+                             dict(agent_row("drained", harness="codex"), host="h-lost")]
+        self.assertEqual(self.alerts(rows), [])
+        row, milestone, ev = self.inputs()
+        alerts = pause.alerts([row], [milestone], [ev], rows, families=FAMILIES, now=T,
+                              pilots={"ameesh": "pilot"}, closed_hosts={"h-lost"})
+        self.assertEqual([alert["family"] for alert in alerts], ["codex"])
+        self.assertEqual({p["name"] for p in alerts[0]["pauses"]}, {"cx1", "cx2"})
+
     def test_debit_names_the_wait(self):
         row, milestone, ev = self.inputs()
         result = run(items=[row], milestones=[milestone], events=[ev], agents=registry(),
@@ -145,6 +167,27 @@ class FamilyEpisodeDeliveryTest(PgTestCase):
         changed = dict(alert, episode=[("primary", self.now+72*H)])
         notifier.run_pass(self.db, current=[changed])
         self.assertEqual(len(self.mails("orch")), 2)
+
+    def test_episode_without_deadline_is_briefed_again_after_six_hours(self):
+        # #5424 N4 : sans échéance, l'entrée ne rend pas muette une pause ultérieure
+        alert = dict(FamilyPausedTest().alerts()[0], orchestrators=["orch"], resume_ts=None)
+        alert["episode"] = [("primary", None)]
+        notifier, clock = self.notifier()
+        notifier.run_pass(self.db, current=[alert])
+        notifier.run_pass(self.db, current=[])
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.mails("orch")), 1)
+        clock[0] += 7*H
+        notifier.run_pass(self.db, current=[])
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.mails("orch")), 2)
+
+    def test_open_lots_read_carries_issue_ref(self):
+        from ameesh import storage, work
+        lot = work.add(self.db, title="held", app="ameesh", issue_ref="manaty/ameesh#1")
+        rows = storage.of(self.db).operations.open_lots_activity(None)
+        row = next(row for row in rows if int(row["id"]) == int(lot["id"]))
+        self.assertEqual(row["issue_ref"], "manaty/ameesh#1")
 
     def test_registry_readers_supply_pause_and_profile_evidence(self):
         from ameesh import debit, storage

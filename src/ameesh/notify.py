@@ -393,6 +393,7 @@ TYPE_LABELS = {
     # #1466: briefed to the orchestrators and auditors (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)
     "budget_pause_long": "agent paused on budget for a long time",
+    "review_family_paused": "review family paused on budget",
     # #3961: briefed to the orchestrators and auditors; the host-wide one is
     # also pushed to humans by default (DEFAULT_TYPES)
     "operator_pause_long": "agent under operator pause for a long time",
@@ -3191,7 +3192,11 @@ class Notifier:
                 if entry.get("type") == "staging_interrupted" and "staging.sequence" in unreadable:
                     continue
                 if entry.get("type") == "review_family_paused" and (
-                        entry.get("resume_ts") is None or now < entry["resume_ts"]):
+                        now < entry["resume_ts"] if entry.get("resume_ts") is not None
+                        # #5424 N4 : sans échéance, l'épisode n'a pas de fin
+                        # lisible ; l'entrée tombe 6 h après le brief, sinon
+                        # une pause ultérieure (même clé) resterait muette.
+                        else now - _last_brief_ts(entry) < alert_briefs.REMIND_AFTER_S):
                     continue  # same budget episode, even if no lot waits for a pass
                 if entry.get("type") == "idle_capacity" and now - _last_brief_ts(entry) \
                         < alert_briefs.REMIND_AFTER_S:
