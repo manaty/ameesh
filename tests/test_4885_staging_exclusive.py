@@ -202,6 +202,11 @@ class InheritedRunIdTest(unittest.TestCase):
         self.assertNotIn("STAGING_RUN_ID", env)
         self.assertEqual(env["STAGING_PREVIOUS_RUN"], "old")
         self.assertEqual(env["STAGING_TIMEOUT_S"], "60")
+        # #5450: the release names the fresh run it monitors; the inherited
+        # one never survives.
+        with mock.patch.dict("os.environ", STAGING_RUN_ID="fixed"):
+            env = release_cutoff._staging_env(60, run="fresh-run")
+        self.assertEqual(env["STAGING_RUN_ID"], "fresh-run")
 
 
 class StagingScriptExclusiveTest(unittest.TestCase):

@@ -59,6 +59,10 @@ class ExecutorTest(unittest.TestCase):
             mock.patch.object(executor.subprocess, "run"),
             mock.patch.object(release_cutoff, "_worktree", return_value=("folder", "tree")),
             mock.patch.object(release_cutoff, "_drop_worktree"),
+            # #5450: the executor settles the workstation units before any
+            # terminal release; a test overrides the outcome when it matters.
+            mock.patch.object(release_cutoff, "_settle_poste_units",
+                              return_value=("", True)),
         ]
         for patch in patches:
             self.addCleanup(patch.stop)
@@ -68,6 +72,8 @@ class ExecutorTest(unittest.TestCase):
         executor.ExecutionLease.return_value.epoch = 1
         executor.ExecutionLease.return_value.ttl = 60.0
         executor.role_run._AlertsExecution.return_value.lost.is_set.return_value = False
+        # `$$` of the bash group, the pid that names the workstation units.
+        executor.role_run._AlertsExecution.return_value.pgid = 1234
 
     def record(self, kind, key, project, data):
         if kind == executor.EVENT:
@@ -193,6 +199,188 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(executor.role_run._run_under_lease.call_count, 2)
         for call in executor.role_run._run_under_lease.call_args_list:
             self.assertIs(call.kwargs.get("watch"), False)
+
+    def test_the_child_is_monitored_and_a_stop_is_a_recorded_failure(self):
+        release_cutoff._settle_poste_units.return_value = (
+            "; workstation unit(s) poste-maj-staging-1234-retour.service ended "
+            "before the worktree was dropped", True)
+
+        def child(*args, **kwargs):
+            self.calls.append((args[0], args[1]))
+            executor.role_run._AlertsExecution.return_value.stop_reason = \
+                "délai dépassé : figé"
+            return 143, False
+        executor.role_run._run_under_lease.side_effect = child
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["reason"], "délai dépassé : figé")
+        self.assertEqual(self.request["state"], "failed")
+        self.assertEqual(self.request["reason"], "délai dépassé : figé")
+        self.assertIn("ended before the worktree was dropped",
+                      self.request["unit_note"])
+        release_cutoff._settle_poste_units.assert_called_once_with(1234, mock.ANY)
+        release_cutoff._drop_worktree.assert_called_once_with(
+            str(self.root.resolve()), "folder", "tree")
+        call = executor.role_run._run_under_lease.call_args_list[-1]
+        self.assertEqual(call.kwargs["stop_grace"], staging_watch.STOP_GRACE_S)
+        self.assertEqual(call.kwargs["interval"], staging_watch.WATCH_INTERVAL_S)
+        self.assertEqual(call.kwargs["monitor"].__self__.run, result["run"])
+
+    def test_a_unit_surviving_the_leader_keeps_the_worktree_and_blocks(self):
+        """#5450 B/P1 witness: the group is dead, a workstation unit is not.
+
+        No terminal state and no worktree deletion may precede the proved
+        stop; the request stays running with the guard that keeps every later
+        start behind the quiescence probe.
+        """
+        release_cutoff._settle_poste_units.return_value = (
+            "; workstation unit(s) poste-maj-staging-1234-retour.service still "
+            "running after 600s and a stop: worktree kept, check the "
+            "workstation", False)
+
+        def child(*args, **kwargs):
+            self.calls.append((args[0], args[1]))
+            executor.role_run._AlertsExecution.return_value.stop_reason = \
+                "délai dépassé : figé"
+            return 143, False
+        executor.role_run._run_under_lease.side_effect = child
+        with mock.patch.object(executor.staging_watch, "Monitor") as monitor_cls:
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("still running", result["reason"])
+        self.assertEqual(self.request["state"], "running")
+        self.assertIn("blocked_reason", self.request)
+        self.assertIn("quiescence", self.request["blocked_reason"])
+        self.assertEqual(self.request["unit_pid"], 1234)
+        monitor_cls.return_value.stop.assert_not_called()
+        release_cutoff._drop_worktree.assert_not_called()
+        release_cutoff._settle_poste_units.assert_called_once_with(1234, mock.ANY)
+
+    def test_a_proven_stop_runs_the_bounded_return_before_failed_and_drop(self):
+        """#5450: settle -> return -> failed, in that order; guard until the end."""
+        order = []
+        release_cutoff._settle_poste_units.side_effect = lambda *a: (
+            order.append("settle"), ("", True))[1]
+
+        def retour(*args, **kwargs):
+            order.append("return")
+            return {"ran": True, "ok": True, "note": "retour apres arret: ok",
+                    "mailed": False, "drop": True}
+
+        def child(*args, **kwargs):
+            self.calls.append((args[0], args[1]))
+            executor.role_run._AlertsExecution.return_value.stop_reason = \
+                "délai dépassé : figé"
+            return 143, False
+
+        executor.role_run._run_under_lease.side_effect = child
+        with mock.patch.object(release_cutoff, "_return_after_stop",
+                               side_effect=retour) as ret, \
+             mock.patch.object(executor.staging_watch, "Monitor") as monitor_cls:
+            monitor_cls.return_value.stop.side_effect = \
+                lambda reason: order.append("stop")
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(order, ["settle", "return", "stop"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["return_note"], "retour apres arret: ok")
+        self.assertEqual(ret.call_args.args[:2], ("tree", "a" * 40))
+        release_cutoff._drop_worktree.assert_called_once()
+        self.assertEqual(self.request["state"], "failed")
+
+    def test_a_return_failure_without_mail_uses_the_manual_fallback(self):
+        release_cutoff._settle_poste_units.return_value = ("", True)
+
+        def child(*args, **kwargs):
+            self.calls.append((args[0], args[1]))
+            executor.role_run._AlertsExecution.return_value.stop_reason = \
+                "délai dépassé : figé"
+            return 143, False
+
+        executor.role_run._run_under_lease.side_effect = child
+        with mock.patch.object(release_cutoff, "_return_after_stop",
+                               return_value=dict(ran=True, ok=False,
+                                                 note="depassement de la borne",
+                                                 mailed=False, drop=True)), \
+             mock.patch.object(release_cutoff, "_manual_return_mail") as mail:
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "failed")
+        mail.assert_called_once()
+        self.assertIn("depassement", self.request["return_note"])
+        release_cutoff._drop_worktree.assert_called_once()
+
+    def test_a_return_not_proved_stopped_keeps_the_guard(self):
+        release_cutoff._settle_poste_units.return_value = ("", True)
+
+        def child(*args, **kwargs):
+            self.calls.append((args[0], args[1]))
+            executor.role_run._AlertsExecution.return_value.stop_reason = \
+                "délai dépassé : figé"
+            return 143, False
+
+        executor.role_run._run_under_lease.side_effect = child
+        with mock.patch.object(release_cutoff, "_return_after_stop",
+                               return_value=dict(ran=True, ok=False,
+                                                 note="unite encore vivante",
+                                                 mailed=False, drop=False,
+                                                 pid=4321)), \
+             mock.patch.object(release_cutoff, "_manual_return_mail") as mail, \
+             mock.patch.object(executor.staging_watch, "Monitor") as monitor_cls:
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(self.request["state"], "running")
+        self.assertIn("retour apres arret non conclu",
+                      self.request["blocked_reason"])
+        self.assertIn("unite encore vivante", self.request["blocked_reason"])
+        self.assertEqual(self.request["return_pid"], 4321)
+        monitor_cls.return_value.stop.assert_not_called()
+        release_cutoff._drop_worktree.assert_not_called()
+        mail.assert_not_called()
+
+    def test_a_guarded_unit_pid_is_settled_before_the_next_attempt(self):
+        self.request.update(state="running", host="host-a", run="attempt-a",
+                            unit_pid=4321)
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "completed")
+        release_cutoff._settle_poste_units.assert_any_call(4321, mock.ANY)
+        self.assertNotIn("unit_pid", self.request)
+
+    def test_guarded_units_not_settled_block_before_any_host_operation(self):
+        self.request.update(state="running", host="host-a", run="attempt-a",
+                            return_pid=4321)
+        release_cutoff._settle_poste_units.return_value = ("unit live", False)
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("previous stop not proved", result["reason"])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.request["state"], "running")
+        self.assertEqual(self.request["return_pid"], 4321)
+
+    def test_a_return_state_left_by_a_killed_supervisor_blocks_and_mails(self):
+        """#5450: the next tick must not drop the tree and restart silently."""
+        self.request.update(state="running", host="host-a", run="attempt-a")
+        tree = self.root / "kept" / "worktree"
+        tree.mkdir(parents=True)
+        (tree / release_cutoff.STAGING_RETURN_STATE).write_text(
+            "ameesh-agents-2\tinstaller\t0123456789abcdef\t"
+            "vm.sh agents retour\t/tmp/journal.jsonl\t" + "a" * 40 + "\n")
+        with mock.patch.object(executor, "_retained_trees",
+                               return_value=[(str(tree.parent), str(tree))]), \
+             mock.patch.object(release_cutoff, "_manual_return_mail") as mail, \
+             mock.patch.object(executor, "_drop_retained") as drop:
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("marche manuelle", result["reason"])
+        self.assertIn("blocked_reason", self.request)
+        mail.assert_called_once()
+        drop.assert_not_called()
+        with mock.patch.object(executor, "_retained_trees",
+                               return_value=[(str(tree.parent), str(tree))]), \
+             mock.patch.object(release_cutoff, "_manual_return_mail") as mail2, \
+             mock.patch.object(executor, "_drop_retained") as drop2:
+            again = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(again["state"], "blocked")
+        mail2.assert_not_called()
+        drop2.assert_not_called()
 
     def test_record_renewal_extends_the_local_deadline(self):
         executor.tick(self.db, self.cfg, self.options)
@@ -333,6 +521,57 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(env["STAGING_RUN_ID"], result["run"])
         self.assertNotIn("STAGING_PREVIOUS_RUN", env)
         self.assertNotIn("STAGING_PREVIOUS_HOST", env)
+
+
+class GuardedStopTest(unittest.TestCase):
+    """#5450: a monitored stop kills the group, not the lease."""
+
+    def test_a_monitor_stop_halts_the_group_and_keeps_the_lease(self):
+        import subprocess
+        import threading
+
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+
+        def cleanup():
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.addCleanup(cleanup)
+
+        class Execution:
+            def __init__(self):
+                self.lost = threading.Event()
+                self.stop_reason = None
+                self.halted = []
+
+            @property
+            def pgid(self):
+                return proc.pid
+
+            def start_child(self, argv, env):
+                return proc
+
+            def halt(self, reason, *, grace=None):
+                self.stop_reason = reason
+                self.halted.append(grace)
+                role_run._stop_child(
+                    proc, 0.2 if grace is None else grace, pgid=proc.pid)
+
+        execution = Execution()
+        checks = []
+
+        def monitor():
+            checks.append(1)
+            return "délai dépassé : figé"
+
+        code, lost = role_run._run_under_lease(
+            ["sleep", "30"], {}, object(), execution, watch=False,
+            monitor=monitor, interval=0.05, stop_grace=0.2)
+        self.assertFalse(lost)
+        self.assertFalse(execution.lost.is_set())
+        self.assertEqual(execution.stop_reason, "délai dépassé : figé")
+        self.assertGreaterEqual(len(checks), 1)
+        self.assertNotEqual(code, 0)
 
 
 class LeaseNoteTest(unittest.TestCase):

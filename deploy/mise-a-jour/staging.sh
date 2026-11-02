@@ -11,6 +11,13 @@
 #                                [--sans-sauvegarde] [--sans-sonde]
 #                                [--sans-poste] [--absent nom=raison]
 #                                [--sans-retour[=ROLLBACK]] [REF]
+#   deploy/mise-a-jour/staging.sh --retour-sur-arret FICHIER [REF]
+#
+# --retour-sur-arret : etape interne (#5450), lancee par le superviseur qui a
+# arrete une sequence (staging_executor.tick ou run_staging). FICHIER est
+# l'etat ecrit par le piege TERM (hote, etape, previous-sha, outil, journal) ;
+# elle rejoue `retour` puis `controler` sur cet hote, hors du groupe tue,
+# trace le resultat et, en echec, remet la marche manuelle au pilote.
 #
 # REF : commit, branche ou etiquette du depot (defaut : HEAD). Il doit etre un
 # ancetre de origin/main, sauf HORS_MAIN=1 (BRANCHE_MAIN pour viser une autre
@@ -245,8 +252,17 @@ POSITIONNELS=0
 #: #4616 : 1 = aucun retour automatique (migration non additive posee)
 SANS_RETOUR=0
 ROLLBACK_SQL=""
+#: #5450 : etat laisse par le piege TERM, rejoue par le superviseur
+RETOUR_SUR_ARRET=""
+#: #5450 : arret demande par la surveillance de progression (TERM du lanceur)
+ARRET_SURVEILLANCE=0
+#: #5450 : arret supervise — le superviseur survivant publie l'etat terminal
+#: apres quiescence et retour borne ; le EXIT du lanceur ne doit pas le faire
+ARRET_SUPERVISE=0
+#: #5450 : un echec d'hote est deja en cours de traitement (retour, courrier)
+ECHEC_EN_COURS=0
 
-usage() { sed -n '9,13p' "$0"; }
+usage() { sed -n '9,20p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -259,6 +275,9 @@ while [ $# -gt 0 ]; do
       SANS_RETOUR=1
       ROLLBACK_SQL=${1#--sans-retour=}
       [ -n "$ROLLBACK_SQL" ] || { echo "--sans-retour= : rollback vide" >&2; exit 2; }
+      ;;
+    --retour-sur-arret)
+      RETOUR_SUR_ARRET=${2:?--retour-sur-arret attend un fichier d etat}; shift
       ;;
     --absent)
       _absent=${2:?--absent attend NOM=RAISON}
@@ -560,7 +579,15 @@ nettoyer() {
     # EXIT is best effort only. SIGKILL or a dead launcher is detected by
     # the independent alerts pass from the already committed deadline.
     arreter_battement
-    publier_suivi failed || true
+    if [ "$ARRET_SUPERVISE" = 1 ]; then
+      # #5450 : l'arret supervise n'est pas terminal ici. Laisser `running`
+      # dans le journal partage tient la garde (staging_watch.in_flight) et
+      # le demarrage exclusif refuse toute seconde sequence jusqu'a ce que
+      # le superviseur, apres quiescence et retour borne, publie `failed`.
+      echo "suivi laisse running : arret et retour confies au superviseur" >&2
+    else
+      publier_suivi failed || true
+    fi
   fi
   rm -f "$SUIVI_COURANTE" "$SUIVI_PROGRES"
   local f
@@ -859,8 +886,63 @@ finally:
     conn.close()
 PY
 }
+
+# #5450 : etape de retour apres arret, rejouee par le superviseur qui a tue le
+# groupe (staging_executor.tick, run_staging). Elle tourne hors de ce groupe,
+# bornee par l'appelant ; elle trace le resultat et ne rend la main qu'apres
+# « retour ok » + controler, ou apres avoir remis la marche manuelle au pilote.
+# Aucun etat de sequence n'est publie ici : la garde reste au superviseur.
+if [ -n "$RETOUR_SUR_ARRET" ]; then
+  if [ ! -r "$RETOUR_SUR_ARRET" ]; then
+    echo "retour apres arret : etat illisible ($RETOUR_SUR_ARRET)" >&2
+    exit 2
+  fi
+  hote_retour="" etape_retour="" precedent_retour="" outil_retour="" journal_etat="" sha_etat=""
+  IFS=$'\t' read -r hote_retour etape_retour precedent_retour outil_retour \
+    journal_etat sha_etat < "$RETOUR_SUR_ARRET" || true
+  if [ -z "$hote_retour" ] || [ -z "$etape_retour" ]; then
+    echo "retour apres arret : etat incomplet ($RETOUR_SUR_ARRET)" >&2
+    exit 2
+  fi
+  case " ${HOTES[*]} " in
+    *" $hote_retour "*) ;;
+    *) echo "retour apres arret : hote $hote_retour hors de la sequence (${HOTES[*]})" >&2; exit 2 ;;
+  esac
+  if [ -z "$outil_retour" ]; then
+    case "$(mode_de "$hote_retour")" in
+      poste) outil_retour="poste.sh retour" ;;
+      agents) outil_retour="vm.sh agents retour" ;;
+      serveur) outil_retour="vm.sh retour" ;;
+      *) outil_retour="la remise en version precedente de $hote_retour" ;;
+    esac
+  fi
+  PRECEDENT=$precedent_retour
+  journal_etat=${journal_etat:-$JOURNAL}
+  etape "$hote_retour : retour automatique apres arret (previous-sha ${PRECEDENT:-previous-sha})"
+  if exec_hote "$hote_retour" retour; then
+    trace "$hote_retour" retour ok "retour automatique apres arret applique"
+    etape "$hote_retour : controle du retour apres arret"
+    if exec_hote "$hote_retour" controler; then
+      trace "$hote_retour" controle-retour ok "unites et baux verts apres retour"
+      rm -f -- "$RETOUR_SUR_ARRET"
+      echo "retour apres arret effectue et controle sur $hote_retour" >&2
+      exit 0
+    fi
+    trace "$hote_retour" controle-retour ko "l'hote ne repond pas apres le retour"
+    detail_retour="Le retour automatique a ete applique mais les controles echouent."
+  else
+    trace "$hote_retour" retour ko "le retour automatique apres arret a echoue"
+    detail_retour="Le retour automatique apres arret a echoue."
+  fi
+  notifier "staging #5450 : retour apres arret en ECHEC sur $hote_retour" \
+    "Le staging $SHA_TRAVE a ete arrete par la surveillance de progression sur $hote_retour, etape $etape_retour. $detail_retour L'hote peut rester a mi-parcours (version precedente ${PRECEDENT:-previous-sha} enregistree). Remise manuelle : $outil_retour, puis controler. Trace : $journal_etat"
+  rm -f -- "$RETOUR_SUR_ARRET"
+  echo "retour apres arret en echec sur $hote_retour (marche manuelle remise au pilote)" >&2
+  exit 1
+fi
 echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   local nom=$1 ou=$2 detail=$3 rapport="" complement=""
+  ECHEC_EN_COURS=1
   # le rapport JSON de la sonde n'est pas perdu : il va dans la trace (objet
   # `rapport`) et dans la notification, pas seulement « sante en echec » (#2190).
   if [ "$ou" = sante ] && [ -n "$SANTE_DETAIL" ]; then
@@ -954,10 +1036,11 @@ done
 # local flock and EXIT trap this evidence survives SIGKILL of the launcher.
 SUIVI_RUN=${STAGING_RUN_ID:-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')}
 SUIVI_DEBUT=$(date +%s)
-SUIVI_DELAI=${STAGING_TIMEOUT_S:-7200}
+SUIVI_DELAI=${STAGING_TIMEOUT_S:-39600}
 SUIVI_DEMARRE=0
 # #5425 : un retard se juge sur le battement et le progres, plus sur une seule
-# echeance de parcours (STAGING_TIMEOUT_S ne juge qu'un lanceur plus ancien).
+# echeance de parcours. #5450 : STAGING_TIMEOUT_S (11 h) n'est plus que le
+# secours d'un lanceur sans battement ; la surveillance arrete sur overdue().
 # Un hote a pour budget BASE + runners x plafond de tour : un redemarrage
 # glissant attend la fin de tour de chaque runner.
 SUIVI_BATTEMENT_S=${STAGING_BATTEMENT_S:-120}
@@ -967,8 +1050,8 @@ SUIVI_BASE_HOTE_S=${STAGING_BASE_HOTE_S:-900}
 SUIVI_RUNNERS_DEFAUT=${STAGING_RUNNERS_DEFAUT:-20}
 SUIVI_BATTEMENT_PID=
 # #5425 N2 : `sleep 0` ou une valeur non numerique ferait tourner le battement
-# en boucle serree ; valider avant tout publish et tout geste, comme les autres
-# reglages de vivacite (nombre fini et positif).
+# en boucle serree ; valider avant tout publish et tout geste. #5450 : plancher
+# a 1 s, une valeur positive minuscule reste une boucle serree.
 valider_battement() {
   local valeur
   valeur=$(python3 - "$SUIVI_BATTEMENT_S" <<'PY'
@@ -977,11 +1060,11 @@ try:
     value = float(sys.argv[1])
 except ValueError:
     raise SystemExit(1)
-if not 0 < value < math.inf:
+if not 1 <= value < math.inf:
     raise SystemExit(1)
 print(value)
 PY
-  ) || { echo "STAGING_BATTEMENT_S invalide : « $SUIVI_BATTEMENT_S » (secondes finies et positives attendues)" >&2; return 2; }
+  ) || { echo "STAGING_BATTEMENT_S invalide : « $SUIVI_BATTEMENT_S » (secondes finies et >= 1 attendues)" >&2; return 2; }
   SUIVI_BATTEMENT_S=$valeur
 }
 valider_battement || exit $?
@@ -1097,6 +1180,59 @@ arreter_battement() {
   wait "$SUIVI_BATTEMENT_PID" 2>/dev/null || true
   SUIVI_BATTEMENT_PID=
 }
+# #5450 : la surveillance (run_staging, staging_executor) arrete une sequence
+# retardee par TERM. Le piege ne fait jamais le retour lui-meme : il ecrit
+# l'etape ouverte dans un etat que le superviseur, qui survit au groupe tue,
+# rejoue comme une etape a part, bornee (`--retour-sur-arret`). Le retour d'un
+# hote refait son redemarrage glissant (jusqu'a 30 min) : il ne tient pas dans
+# la grace avant le KILL du groupe, et une remise a moitie faite serait pire
+# qu'une sequence arretee. Le superviseur tient la garde et le worktree jusqu'a
+# « retour ok » ou l'echec ; la marche manuelle reste le repli.
+arret_surveillance() {
+  local hote="" etape_ouverte="" debut="" marque="" lignes="" outil detail
+  [ "$ARRET_SURVEILLANCE" = 0 ] || return 0
+  ARRET_SURVEILLANCE=1
+  ARRET_SUPERVISE=1
+  trap - TERM
+  if [ -r "$SUIVI_COURANTE" ]; then
+    IFS=$'\t' read -r hote etape_ouverte debut marque < "$SUIVI_COURANTE" || true
+    lignes=$(wc -l < "$JOURNAL" 2>/dev/null || echo 0)
+  fi
+  # une ligne de journal apres la marque signifie que l'etape est close : son
+  # hote a deja ete controle, il n'y a pas de mutation en cours a signaler.
+  if [ -n "$hote" ] && [ "${marque:-x}" = "$lignes" ] && [ "$SUIVI_DEMARRE" = 1 ]; then
+    case "$(mode_de "$hote")" in
+      poste) outil="poste.sh retour" ;;
+      agents) outil="vm.sh agents retour" ;;
+      serveur) outil="vm.sh retour" ;;
+      *) outil="la remise en version precedente de $hote" ;;
+    esac
+    # #4616 : apres une migration non additive, aucun retour de code n'est
+    # lance (l'ancien code est dangereux sur la base migree) : la marche
+    # manuelle existante, rollback SQL d'abord, reste le seul chemin.
+    if [ "$SANS_RETOUR" = 1 ]; then
+      retour_desactive "$hote" "${etape_ouverte:-surveillance}" \
+        "arret demande par la surveillance de progression" ""
+    fi
+    # L'etat reste dans le worktree, que le superviseur conserve jusqu'a la
+    # fin du retour ; aucun secret n'y est ecrit.
+    ( umask 077; printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$hote" "${etape_ouverte:-surveillance}" "${PRECEDENT:-}" \
+        "$outil" "$JOURNAL" "$SHA" > "$DEPOT/.retour-apres-arret" ) \
+      || echo "etat de retour non ecrit dans $DEPOT" >&2
+    if [ "$ECHEC_EN_COURS" = 1 ]; then
+      detail="arret demande par la surveillance de progression ; retour d'echec interrompu, confie au superviseur (hors groupe, borne)"
+    else
+      detail="arret demande par la surveillance de progression ; retour automatique confie au superviseur (hors groupe, borne)"
+    fi
+    trace "$hote" "${etape_ouverte:-surveillance}" ko "$detail"
+    echo "staging arrete par la surveillance (retour confie au superviseur)" >&2
+    exit 1
+  fi
+  echo "staging arrete par la surveillance (aucune etape d'hote ouverte)" >&2
+  exit 1
+}
+trap arret_surveillance TERM
 if [ "$POSTE_ABSENT" = 1 ]; then
   printf '  %-16s %-8s %s\n' pc-smichea absent "reporte — $POSTE_RAISON"
 fi

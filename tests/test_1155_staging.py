@@ -80,6 +80,11 @@ if [ "$host" = pc-smichea ]; then
   esac
 fi
 printf 'call host=%s action=%s args=%s\n' "$host" "$action" "$*" >> "$state/calls.log"
+# #5450 : un geste long laisse le temps d'envoyer TERM au lanceur.
+if grep -qx "lent=$host:$action" "$state/scenario" 2>/dev/null; then
+  printf 'slow host=%s action=%s\n' "$host" "$action" >> "$state/calls.log"
+  sleep "${DUREE_LENT:-30}"
+fi
 if grep -qx "ko=$host:$action" "$state/scenario" 2>/dev/null; then
   grep -vx "ko=$host:$action" "$state/scenario" > "$state/scenario.tmp" || true
   mv "$state/scenario.tmp" "$state/scenario"
@@ -102,6 +107,14 @@ if [[ "${1:-}" = */staging_watch.py || "${1:-}" = ameesh.staging_watch ]]; then
   printf '%s\n' "${*:3}" >> "$state/suivi-args.log"
   # #4885 : debut exclusif refuse, sauf reprise d'une sequence prouvee arretee
   if grep -qx suivi-occupe "$state/scenario" && [[ " $* " = *" --exclusive "* && " $* " != *" --supersede "* ]]; then exit 75; fi
+  # #5450 : une sequence dont le dernier instantane est `running` tient la
+  # garde partagee ; le superviseur seul la cloue en `failed` apres le retour.
+  if [[ " $* " = *" --exclusive "* && " $* " != *" --supersede "* ]] \
+     && [ -f "$state/staging-running" ]; then exit 75; fi
+  case "$2" in
+    *'"state": "running"'*) : > "$state/staging-running" ;;
+    *) rm -f "$state/staging-running" ;;
+  esac
   printf '%s\n' "$2" >> "$state/staging-snapshots.jsonl"
   exit 0
 fi
@@ -386,6 +399,159 @@ class StagingTest(unittest.TestCase):
                 chemin = line.split(' ', 2)[1]
                 self.assertTrue(chemin.startswith(str(self.root)),
                                 'executable hors bac a sable : %s' % line)
+
+    def test_term_on_an_open_step_hands_the_return_to_the_supervisor(self):
+        """#5450: the trap never runs a return inside the killed group.
+
+        It records the open step and stops; the supervisor replays it as a
+        separate bounded step (`--retour-sur-arret`), which is where the
+        rolling restart that outlives STOP_GRACE_S belongs.
+        """
+        import signal
+        import time
+        (self.state / 'scenario').write_text(
+            'lent=ameesh-agents-2:installer\nlent=ameesh-agents-2:retour\n')
+        env = dict(self.env, DUREE_LENT='400')
+        proc = subprocess.Popen(
+            ['bash', str(self.script_dir / 'staging.sh')], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if 'slow host=ameesh-agents-2 action=installer' in self.calls():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('the installer step never started')
+        os.killpg(proc.pid, signal.SIGTERM)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, (out, err))
+        self.assertFalse(any('action=retour' in line for line in self.calls()))
+        self.assertIn('retour confie au superviseur', err)
+        traces = self.traces()
+        step = [row for row in traces if row.get('hote') == 'ameesh-agents-2'
+                and row.get('etape') == 'installer' and row.get('verdict') == 'ko']
+        self.assertTrue(step, traces)
+        self.assertIn('confie au superviseur', step[-1]['detail'])
+        state = (self.repo / '.retour-apres-arret').read_text().rstrip('\n').split('\t')
+        self.assertEqual(state[:4], ['ameesh-agents-2', 'installer', '',
+                                     'vm.sh agents retour'], state)
+        self.assertFalse(any('venv-python - mesh-design' in line
+                             for line in self.calls()),
+                         [line for line in self.calls()
+                          if 'venv-python - mesh-design' in line])
+
+        # #5450 (cx1) : le lanceur ne publie pas `failed` dans son EXIT ; le
+        # superviseur seul conclut apres quiescence et retour. Le dernier
+        # instantane reste `running`, donc la garde partagee est tenue.
+        snapshots = [json.loads(line) for line in
+                     (self.state / 'staging-snapshots.jsonl').read_text().splitlines()]
+        self.assertEqual(snapshots[-1]['state'], 'running', snapshots[-1])
+        self.assertNotIn('reason', snapshots[-1])
+
+        # The supervisor's step, out of the killed group: the long return is
+        # carried to the end and the host is controlled. While it is open, a
+        # second start is refused; after it ends, the launcher's `running`
+        # snapshot (not the released local flock) still refuses it.
+        (self.state / 'scenario').write_text('lent=ameesh-agents-2:retour\n')
+        retour = subprocess.Popen(
+            ['bash', str(self.script_dir / 'staging.sh'),
+             '--retour-sur-arret', str(self.repo / '.retour-apres-arret'), self.sha],
+            env=dict(env, DUREE_LENT='5'),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.addCleanup(lambda: retour.poll() is None and retour.kill())
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if 'slow host=ameesh-agents-2 action=retour' in self.calls():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('the return step never started')
+        before = [line for line in self.calls() if line.startswith('call host=')]
+        second = self.run_staging()
+        self.assertEqual(second.returncode, 75, second.stderr)
+        self.assertIn('staging deja en cours', second.stderr)
+        after = [line for line in self.calls() if line.startswith('call host=')]
+        self.assertEqual(after, before)
+        out, err = retour.communicate(timeout=60)
+        self.assertEqual(retour.returncode, 0, (out, err))
+        # Local flock is gone, the return is over, yet the shared `running`
+        # snapshot still holds the guard until the supervisor's terminal.
+        third = self.run_staging()
+        self.assertEqual(third.returncode, 75, third.stderr)
+        self.assertIn('journal partage staging.sequence', third.stderr)
+        calls = self.calls()
+        self.assertTrue(any('host=ameesh-agents-2 action=retour' in line
+                            for line in calls), calls)
+        self.assertTrue(any('host=ameesh-agents-2 action=controler' in line
+                            for line in calls), calls)
+        traces = self.traces()
+        self.assertTrue(any(row.get('hote') == 'ameesh-agents-2'
+                            and row.get('etape') == 'retour'
+                            and row.get('verdict') == 'ok' for row in traces), traces)
+        self.assertTrue(any(row.get('hote') == 'ameesh-agents-2'
+                            and row.get('etape') == 'controle-retour'
+                            and row.get('verdict') == 'ok' for row in traces), traces)
+        self.assert_no_escape()
+
+    def test_term_under_sans_retour_never_returns_the_code(self):
+        """#4616 + #5450: a non-additive migration keeps the manual path."""
+        import signal
+        import time
+        (self.state / 'scenario').write_text('lent=ameesh-agents-2:installer\n')
+        env = dict(self.env, DUREE_LENT='400')
+        proc = subprocess.Popen(
+            ['bash', str(self.script_dir / 'staging.sh'),
+             '--sans-retour=src/ameesh/migrations/rollback/9999.sql'],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if 'slow host=ameesh-agents-2 action=installer' in self.calls():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('the installer step never started')
+        os.killpg(proc.pid, signal.SIGTERM)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, (out, err))
+        self.assertFalse((self.repo / '.retour-apres-arret').exists())
+        self.assertFalse(any('action=retour' in line for line in self.calls()))
+        self.assertIn('retour automatique desactive', err)
+        traces = self.traces()
+        self.assertTrue(any(row.get('hote') == 'ameesh-agents-2'
+                            and row.get('etape') == 'retour'
+                            and row.get('verdict') == 'desactive'
+                            for row in traces), traces)
+        self.assertTrue(any('venv-python - mesh-design' in line
+                            and 'retour automatique desactive' in line
+                            for line in self.calls()), self.calls())
+        self.assert_no_escape()
+
+    def test_return_step_failure_mails_the_manual_fallback(self):
+        """#5450: a failed return step sends the manual command and stops."""
+        (self.repo / '.retour-apres-arret').write_text(
+            'ameesh-agents-2\tinstaller\t0123456789abcdef\t'
+            'vm.sh agents retour\t%s\t%s\n' % (self.state / 'journal.jsonl', self.sha))
+        (self.state / 'scenario').write_text('ko=ameesh-agents-2:retour\n')
+        env = dict(self.env, DUREE_LENT='1')
+        retour = subprocess.run(
+            ['bash', str(self.script_dir / 'staging.sh'),
+             '--retour-sur-arret', str(self.repo / '.retour-apres-arret'), self.sha],
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(retour.returncode, 1, (retour.stdout, retour.stderr))
+        self.assertIn('marche manuelle remise au pilote', retour.stderr)
+        traces = self.traces()
+        self.assertTrue(any(row.get('hote') == 'ameesh-agents-2'
+                            and row.get('etape') == 'retour'
+                            and row.get('verdict') == 'ko' for row in traces), traces)
+        self.assertTrue(any('mesh-design' in line
+                            and 'retour apres arret en ECHEC' in line
+                            for line in self.calls()), self.calls())
+        self.assert_no_escape()
 
     def test_environment_is_isolated(self):
         """Aucun reglage herite du runner ne peut atteindre le mesh reel."""

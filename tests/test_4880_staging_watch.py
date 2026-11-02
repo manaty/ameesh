@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#4880: independent detection of an interrupted staging sequence."""
+from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
@@ -98,6 +99,94 @@ class LivenessTest(unittest.TestCase):
             [request], now=1000, sequences=[row()])), 1)
 
 
+class MonitorTest(unittest.TestCase):
+    """#5450: the single stop verdict, on a simulated clock.
+
+    No sleep: every check gets its instant, and the reader is the run's own
+    latest snapshot. The launchers only run `check()` periodically.
+    """
+
+    def setUp(self):
+        self.latest = None
+        patch = mock.patch.object(
+            staging_watch, "latest_snapshot",
+            side_effect=lambda db, run: self.latest)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def monitor(self, *, fallback=None, after_s=900):
+        return staging_watch.Monitor(object(), "run-a",
+                                     fallback=fallback, after_s=after_s)
+
+    def snapshot(self, *, now, progress=None, beat=None):
+        budget = 900 + 20 * 1800
+        return dict(run="run-a", sha="a" * 40, state="running", started=0,
+                    deadline=107300, beat=now if beat is None else beat,
+                    progress=now if progress is None else progress,
+                    silence_s=900, stall_s=2700, hosts={"vm-1": {
+                        "stage": "redemarrer", "verdict": "en-cours",
+                        "since": 100, "deadline": 100 + budget}})
+
+    def test_a_slow_progressing_sequence_is_never_stopped(self):
+        monitor = self.monitor()
+        started = 100
+        # Three hosts x twenty runners, one full turn each: beyond the old
+        # 7200 s bound, and beyond a single host budget.
+        for tick in range(3 * 20):
+            now = started + (tick + 1) * 1800
+            self.latest = self.snapshot(now=now)
+            self.assertIsNone(monitor.check(now=now), tick)
+
+    def test_a_frozen_sequence_is_stopped_after_the_alert_delay(self):
+        monitor = self.monitor()
+        self.latest = self.snapshot(now=1000)
+        self.assertIsNone(monitor.check(now=1900))   # first late verdict
+        self.assertIsNone(monitor.check(now=2799))   # 14 min 59 s later
+        self.assertIn("ni battement ni progrès", monitor.check(now=2800))
+
+    def test_a_recovering_sequence_restarts_the_alert_delay(self):
+        monitor = self.monitor()
+        self.latest = self.snapshot(now=1000)
+        self.assertIsNone(monitor.check(now=1900))
+        self.latest = self.snapshot(now=2000, progress=2000, beat=2000)
+        self.assertIsNone(monitor.check(now=2000))
+        self.latest = self.snapshot(now=2000, progress=2000, beat=2000)
+        self.assertIsNone(monitor.check(now=5000))   # new first late verdict
+        self.assertIsNone(monitor.check(now=5899))
+        self.assertIn("ni battement ni progrès", monitor.check(now=5900))
+
+    def test_a_launcher_without_heartbeat_is_bounded_by_the_fallback(self):
+        # An older launcher publishes no beat/progress: the snapshot's own
+        # 11 h deadline is the fallback, then the same operator delay.
+        monitor = self.monitor()
+        self.latest = dict(run="run-a", sha="a" * 40, state="running",
+                           started=0, deadline=int(staging_watch.STAGING_FALLBACK_S),
+                           hosts={})
+        self.assertIsNone(monitor.check(now=39599))
+        self.assertIsNone(monitor.check(now=39600))  # first late verdict
+        self.assertIsNone(monitor.check(now=40499))
+        self.assertIn("délai dépassé", monitor.check(now=40500))
+
+    def test_the_request_fallback_judges_before_the_first_snapshot(self):
+        monitor = self.monitor(fallback=dict(
+            run="run-a", sha="a" * 40, state="running", started=100,
+            deadline=200, hosts={}))
+        self.assertIsNone(monitor.check(now=199))
+        self.assertIsNone(monitor.check(now=200))
+        self.assertIsNone(monitor.check(now=1099))
+        self.assertIn("délai dépassé", monitor.check(now=1100))
+
+    def test_stop_records_the_reason_and_does_not_invent_a_success(self):
+        written = []
+        store = mock.Mock()
+        store.events.record = lambda *args: written.append(args[-1]) or 1
+        self.latest = self.snapshot(now=1000)
+        with mock.patch.object(staging_watch.storage, "of", return_value=store):
+            self.monitor().stop("délai dépassé : figé")
+        self.assertEqual(written[0]["state"], "failed")
+        self.assertEqual(written[0]["reason"], "délai dépassé : figé")
+
+
 class HeartbeatScriptTest(unittest.TestCase):
     """The bash side: the snapshot, and a beat that dies with its launcher."""
     ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
@@ -176,7 +265,8 @@ publier_suivi completed
 
     def test_invalid_beat_interval_is_refused_before_any_publication(self):
         from pathlib import Path
-        for value in ("0", "-1", "abc", "nan", "inf"):
+        # #5450: the floor is 1 s; a tiny positive value is still a tight loop.
+        for value in ("0", "-1", "0.5", "0.999", "1e-9", "abc", "nan", "inf"):
             with self.subTest(value=value):
                 with tempfile.TemporaryDirectory() as folder:
                     proc = self.harness(folder, "echo tail", BEAT=value)
@@ -185,11 +275,13 @@ publier_suivi completed
                     self.assertFalse((Path(folder) / "out").exists())
                     self.assertNotIn("tail", proc.stdout)
 
-    def test_fractional_beat_interval_is_accepted(self):
-        with tempfile.TemporaryDirectory() as folder:
-            proc = self.harness(folder, "echo valid", BEAT="0.1")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "valid")
+    def test_beat_interval_of_one_second_and_above_is_accepted(self):
+        for value in ("1", "1.5"):
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as folder:
+                    proc = self.harness(folder, "echo valid", BEAT=value)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), "valid")
 
     @unittest.skipUnless(__import__("pathlib").Path("/proc/self/stat").exists(),
                          "requires /proc (Linux)")
@@ -297,6 +389,16 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(len(staging_watch.findings([old_success, failed], now=150)), 1)
         new_success = row(3, run="new", state="completed", sha="b" * 40)
         self.assertEqual(staging_watch.findings([failed, new_success], now=250), [])
+
+    def test_a_monitored_stop_keeps_its_overdue_reason_in_the_alert(self):
+        failed = row(2, state="failed", reason="délai dépassé : figé")
+        finding, = staging_watch.findings([failed], now=150)
+        self.assertIn("délai dépassé : figé", finding["detail"])
+
+    def test_a_failed_request_keeps_its_overdue_reason(self):
+        alert, = self.alerts(requests=[
+            request_row(1, "old", reason="délai dépassé : figé")])
+        self.assertIn("délai dépassé : figé", alert["detail"])
 
     def test_partial_subset_keeps_other_host_failure_until_completed(self):
         failed = row(1, state="failed", hosts={
@@ -438,6 +540,39 @@ class WatchTest(unittest.TestCase):
             self.assertEqual(staging_watch.alerts(None, now=250), [])
         self.assertEqual(calls, [staging_watch.HISTORY_LIMIT,
                                  staging_watch.HISTORY_LIMIT * 2])
+
+
+class BoundsTest(unittest.TestCase):
+    """#5450: the global bound, the operator delay and the unit bound agree."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_global_bound_and_units_do_not_overlap_the_next_cutoff(self):
+        from ameesh import release_cutoff
+        self.assertEqual(staging_watch.STAGING_FALLBACK_S, 11 * 3600)
+        self.assertEqual(release_cutoff.STAGING_TIMEOUT_S,
+                         staging_watch.STAGING_FALLBACK_S)
+        self.assertLess(staging_watch.STAGING_FALLBACK_S
+                        + staging_watch.STOP_AFTER_ALERT_S, 12 * 3600)
+        for name in ("ameesh-release.service", "ameesh-release-nexlink.service",
+                     "ameesh-staging.service"):
+            text = (self.ROOT / "deploy/systemd" / name).read_text()
+            self.assertIn("TimeoutStartSec=11h30min", text, name)
+            self.assertIn("TimeoutStopSec=5min", text, name)
+        script = (self.ROOT / "deploy/mise-a-jour/staging.sh").read_text()
+        self.assertIn("SUIVI_DELAI=${STAGING_TIMEOUT_S:-39600}", script)
+
+    def test_executor_default_is_the_global_fallback(self):
+        import json
+        from ameesh import staging_executor
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "staging.json"
+            path.write_text(json.dumps({
+                "key": "mesh", "project": "ameesh", "role": "pilot",
+                "candidates": ["a", "b"], "repo": folder,
+                "bascule_env": str(Path(folder) / "bascule.env")}))
+            self.assertEqual(staging_executor.settings(str(path))["timeout_s"],
+                             staging_watch.STAGING_FALLBACK_S)
 
 
 class KilledSequenceTest(unittest.TestCase):
