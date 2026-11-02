@@ -356,6 +356,7 @@ class PauseTest(PgTestCase):
         # #289 (L81) : maybe_rotate lit d'abord l'entretien résident sous le verrou du worker
         worker.lock, worker.resident = threading.Lock(), None
         worker.rotation_forcee = "forced by restart"
+        worker.rotation_retry_at = 0.0  # #5503 : aucun échec de rotation en attente
         worker.runner = mock.Mock()
         with mock.patch.object(worker, "_held_by_pressure", return_value=False), \
                 mock.patch.object(worker, "_rotate", side_effect=AssertionError("rotated")), \
