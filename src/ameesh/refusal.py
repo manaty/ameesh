@@ -135,9 +135,12 @@ def _read_document(path: str) -> tuple[dict, os.stat_result] | None:
 
     O_NOFOLLOW plus fstat on the acquired descriptor: a symlink, a FIFO or a
     file swapped between the open and the read is refused, not followed.
+    The open is non-blocking: a FIFO without a writer must not suspend the
+    worker before its accounting (B cx1 on #5529); fstat then rejects it.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW
+                     | getattr(os, "O_NONBLOCK", 0))
     except OSError:
         return None
     try:
@@ -193,7 +196,15 @@ def _matches(document: dict, record: dict) -> bool:
     if document.get("turn_id") != record["turn_id"]:
         return False
     token = document.get("token")
-    return isinstance(token, str) and hmac.compare_digest(token, record["token"])
+    expected = record.get("token")
+    if not isinstance(token, str) or not isinstance(expected, str):
+        return False
+    # hmac.compare_digest refuses non-ASCII str with a TypeError (B cx1 on
+    # #5529): the contract's token is ASCII, so a non-ASCII one is no proof
+    # rather than an exception that would skip the turn accounting.
+    if not token.isascii() or not expected.isascii():
+        return False
+    return hmac.compare_digest(token.encode("ascii"), expected.encode("ascii"))
 
 
 def opened(record: dict) -> bool:

@@ -134,9 +134,10 @@ base, aucun appel fournisseur). L'exécuteur ne libère la réservation que si
 familles, son propre flux — `claude-stream-json`, `codex-json`, `dsh-json` —,
 bloc `refusal` valide), sortie propre au code réservé, aucune ligne de flux ni
 usage, tour non interrompu (ni signal, ni bail perdu, ni préemption, ni
-clôture, ni redémarrage), document intact pour ce tour (schéma, harnais, jeton,
-`turn_id`, motif d'une ligne). Il la clôt alors en `released` (0 $ pour la
-journée, ligne de grand livre à 0) ; tout écart la laisse `kept`.
+clôture, ni redémarrage), document intact pour ce tour (fichier régulier lu
+sans blocage, jeton ASCII, schéma, harnais, `turn_id`, motif d'une ligne). Il
+la clôt alors en `released` (0 $ pour la journée, ligne de grand livre à 0) ;
+tout écart la laisse `kept`.
 
 Un descripteur d'hôte qui configure une commande `stream = "text"` n'est
 **pas** qualifié, même s'il déclare `refusal` et imprime un marqueur : la

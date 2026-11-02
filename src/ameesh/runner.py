@@ -9195,7 +9195,16 @@ class AgentWorker(threading.Thread):
         # consommée dans tous les cas ; tout écart laisse la réservation `kept`.
         libre = False
         if preuve_refus is not None:
-            raison_refus = refusal.proof(preuve_refus)
+            # La preuve est une entrée non fiable (fichier écrit par le
+            # harnais) : aucune de ses formes ne doit empêcher la ligne de
+            # grand livre — un document illisible laisse la réservation kept
+            # (B cx1 sur #5529).
+            try:
+                raison_refus = refusal.proof(preuve_refus)
+            except Exception as exc:  # noqa: BLE001 - entrée non fiable, kept
+                log_async("[%s] refusal proof unreadable (%s): reservation kept"
+                          % (self.name, exc))
+                raison_refus = None
             if (raison_refus is not None and incertain
                     and contrat_refus is not None and rp is None
                     and result_code == contrat_refus["exit_code"]

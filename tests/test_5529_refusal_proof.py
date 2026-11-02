@@ -16,6 +16,7 @@ import dataclasses
 import json
 import os
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -158,6 +159,31 @@ class ContractTest(unittest.TestCase):
             self._write(record, document)
             self.assertIsNone(refusal.proof(record), change)
 
+    def test_preuve_refusee_si_jeton_non_ascii(self):
+        """B cx1 : compare_digest(str, str) non ASCII lève TypeError."""
+        record = self._record()
+        document = self._valid(record, token="é" * 64)
+        self._write(record, document)
+        self.assertIsNone(refusal.proof(record))
+        self.assertFalse(os.path.exists(record["path"]))
+
+    def test_fifo_sans_ecrivain_ne_bloque_pas(self):
+        """B cx1 : un FIFO sans écrivain suspendrait l'ouverture du worker."""
+        record = self._record()
+        os.unlink(record["path"])
+        os.mkfifo(record["path"], 0o600)
+        outcome = []
+
+        def attempt():
+            outcome.append(refusal.proof(record))
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), "proof() blocked on a FIFO")
+        self.assertEqual(outcome, [None])
+        self.assertFalse(os.path.exists(record["path"]))
+
     def test_preuve_refusee_si_lien_ou_mode_ou_taille(self):
         record = self._record()
         self._write(record, self._valid(record), mode=0o644)
@@ -230,6 +256,11 @@ class RefusalRunnerTest(PgTestCase):
     def _usage(self):
         return storage.of(self.db).budgets.account_usage(OPENAI)[0]
 
+    def _turns(self, agent):
+        return self.db.query(
+            "select count(*) as n from turn_costs where agent = %s",
+            (agent,))[0]["n"]
+
     def _assert_released(self, agent):
         self.assertEqual(self._states(agent), ["released"])
         self.assertEqual(self._usage()["kept"], 0.0)
@@ -242,6 +273,8 @@ class RefusalRunnerTest(PgTestCase):
     def _assert_kept(self, agent):
         self.assertEqual(self._states(agent), ["kept"])
         self.assertAlmostEqual(self._usage()["kept"], 2.0)
+        # la comptabilité du tour est terminée malgré la preuve refusée
+        self.assertEqual(self._turns(agent), 1)
 
     def test_preuve_qualifiee_libere_la_reservation(self):
         worker = self._worker("preuve")
@@ -297,6 +330,25 @@ class RefusalRunnerTest(PgTestCase):
                                     AMEESH_TEST_REFUSE_PROOF_AT=target,
                                     AMEESH_TEST_REFUSE_EXIT="86"))
         self._assert_kept("faux-jeton")
+
+    def test_jeton_non_ascii_reste_kept_et_comptabilite_finie(self):
+        """B cx1 : un jeton non ASCII lèverait TypeError avant la comptabilité."""
+        worker = self._worker("jeton-non-ascii")
+        target = worker._path(refusal.FILE)
+        self.assertFalse(self._turn(worker, AMEESH_TEST_REFUSE=REFUSE,
+                                    AMEESH_TEST_REFUSE_PROOF_AT=target,
+                                    AMEESH_TEST_REFUSE_TOKEN="é" * 64,
+                                    AMEESH_TEST_REFUSE_EXIT="86"))
+        self._assert_kept("jeton-non-ascii")
+
+    def test_une_erreur_de_lecture_de_la_preuve_reste_kept(self):
+        """La preuve est une entrée non fiable : elle ne retient pas la
+        comptabilité du tour (B cx1)."""
+        worker = self._worker("lecture-cassee")
+        with mock.patch.object(refusal, "proof", side_effect=RecursionError("deep")):
+            self.assertFalse(self._turn(worker, AMEESH_TEST_REFUSE=REFUSE,
+                                        AMEESH_TEST_REFUSE_EXIT="1"))
+        self._assert_kept("lecture-cassee")
 
     def test_marqueur_sur_une_commande_configuree_non_qualifiee_reste_kept(self):
         """Le cas de l'issue : une commande configurée `stream=text` imprime un
