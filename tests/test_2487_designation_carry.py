@@ -132,6 +132,16 @@ class _Repo:
         _git(self.root, "switch", "-q", "lot/9-x")
         return self.commit("src/ameesh/lot.py", text, "fix")
 
+    def adapt_test(self, text: str = "adapte au push rejoué\n") -> str:
+        """F = la tête relue + une adaptation limitée à un fichier de test.
+
+        C'est le cas du constat nexlink #5434 : le delta du lot ne change pas,
+        seule une adaptation de test e2e s'ajoute ; le report doit la
+        reconnaître et garder les avis (canon §2)."""
+        _git(self.root, "switch", "-q", "lot/9-x")
+        return self.commit("backend/test/media-reseed.e2e-spec.ts", text,
+                           "test adaptation")
+
     def cleanup(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
 

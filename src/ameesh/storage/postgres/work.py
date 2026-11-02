@@ -2156,7 +2156,29 @@ class WorkItems(interface.WorkItems):
                            " WHERE id = %s", (int(item_id),))
                 WorkItems(tx)._event(int(item_id), "qa",
                                     "validated → qa — review quorum changed (#4351)", actor)
+            same_head = False
             if (kind == "frozen" and items
+                    and not items[0].get("workflow_ref")
+                    and items[0]["state"] == lifecycle.VALIDATED):
+                # #5481 : un regel du même SHA ne rouvre pas la revue. Le
+                # quorum rendu sur ce contenu immuable reste acquis ; le
+                # journal dit seulement que la validation est gardée.
+                previous = tx.query(
+                    "SELECT sha FROM work_item_milestones"
+                    " WHERE work_item_id = %s AND kind = 'frozen' AND id < %s"
+                    " ORDER BY id DESC LIMIT 1",
+                    (int(item_id), int(milestone["id"])))
+                from ...modules.dev import plan_git
+                same_head = bool(previous and plan_git.same_commit(
+                    previous[0].get("sha"), sha))
+            if (kind == "frozen" and items
+                    and not items[0].get("workflow_ref")
+                    and same_head):
+                WorkItems(tx)._event(
+                    int(item_id), "validated",
+                    "same head re-freeze %s — validation kept (#5481)"
+                    % (sha or "")[:12], actor)
+            elif (kind == "frozen" and items
                     and not items[0].get("workflow_ref")
                     and items[0]["state"] in (
                         lifecycle.REQUESTED,
@@ -2232,9 +2254,17 @@ class WorkItems(interface.WorkItems):
         marks = self.milestones(item_id, None)
         from ... import plan_git
         freeze = plan_git.latest_freeze(marks)
-        # Refreezing alone resets validation, including on the same SHA.
-        if not freeze or not any(mark.get("kind") == "verdict"
-                                 and mark["id"] > freeze["id"] for mark in marks):
+        # #5481 : un verdict rendu sur la tête gelée compte même si son
+        # identifiant précède un regel du **même SHA** : un contenu identique
+        # ne périme pas un quorum déjà rendu. Un gel d'une autre tête garde la
+        # règle historique (un verdict postérieur au gel est nécessaire pour
+        # payer la lecture de la porte). La porte relit ensuite les avis de la
+        # tête courante et refuse tout blocage.
+        if not freeze or not any(
+                mark.get("kind") == "verdict"
+                and (mark["id"] > freeze["id"]
+                     or plan_git.same_commit(mark.get("sha"), freeze.get("sha")))
+                for mark in marks):
             return
         gate = self._validation_gate(item_id, marks, item=item)
         if not gate or not gate.get("ok"):

@@ -606,6 +606,7 @@ def milestone(
     outcome: dict | None = None,
     repo: str | None = None,
     supersedes: Sequence[int] | int | None = None,
+    defer_designation: bool = False,
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
@@ -680,6 +681,17 @@ def milestone(
     `verdict_carry.would_carry` : la désignation s'abstient alors et garde les
     relecteurs reportés, sans courrier (#2487). Le plan est lu **avant** la
     transaction du jalon : la transaction ne fait aucune lecture réseau.
+
+    Un regel de la **même tête** (#5481) ne redésigne pas : le hook garde les
+    relecteurs et les avis acquis, sans courrier, et le lot reste `validated`
+    (un regel du même SHA ne peut pas invalider un quorum rendu sur ce SHA).
+
+    `defer_designation` (#5481) : le gel n'installe pas le hook de désignation.
+    L'appelant (la CLI) fait d'abord le report des verdicts (`verdict_carry`)
+    puis, s'il refuse, désigne réellement. Ainsi un regel d'adaptation de test
+    n'écrit jamais aux relecteurs avant que le report ait été évalué. Le
+    `outcome` reçoit alors `deferred=True` ; un gel de la même tête garde son
+    hook propre, indépendant de ce drapeau.
 
     Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
     porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
@@ -891,42 +903,108 @@ def milestone(
             note = (note + "\n" if note else "") + stranger
     drain: list | None = None
     prepared = None
+    same_head = False
+    carry_repo = ((os.path.abspath(repo) if repo else str(freeze_info.get("repo") or ""))
+                  if kind == "frozen" else "")
+    if kind == "frozen":
+        # #5481 : un regel qui nomme exactement la tête déjà gelée ne remet
+        # pas le quorum en jeu et ne redésigne pas. La lecture est bornée et
+        # ne fait jamais perdre le gel.
+        from .modules.dev import plan_git
+        try:
+            marks = storage.of(db).work.milestones(item_id, None) or ()
+            previous = plan_git.latest_freeze(marks)
+        except Exception:  # noqa: BLE001 - lecture ratée : gel normal
+            previous, marks = None, ()
+        # #5481 (B de la revue) : le raccourci ne vaut que s'il a quelque
+        # chose à garder — une désignation acquise ou une dispense. Sinon
+        # c'est une première désignation : le chemin différé (contrôle des
+        # familles, marque durable, reprise) s'applique.
+        acquired = False
+        if previous and plan_git.same_commit(previous.get("sha"), sha):
+            from . import review_designation_activation as activation
+            from . import work as work_mod
+            # #5481 (B de la revue) : des noms dans la colonne peuvent être
+            # hérités d'une AUTRE tête (un gel différé interrompu les garde).
+            # Seule une marque effective du gel précédent ou une dispense
+            # prouvent une désignation acquise.
+            reviewers = [str(name or "").strip()
+                         for name in (item.get("reviewers") or ())]
+            waived = (work_mod.REVIEWER_NONE in reviewers
+                      or str(item.get("reviewer") or "").strip() == work_mod.REVIEWER_NONE)
+            # #5481 (B/P1 cx2) : un avis isolé sur la tête ne prouve pas la
+            # couverture de la désignation, même sans marque lisible. Le gel
+            # différé a pu être interrompu avant la sélection : le raccourci
+            # écrirait carried avec ce seul siège, sans DEFERRED, et le siège
+            # manquant serait perdu.
+            covered = activation.acquired_on_head(
+                db, getattr(db, "cfg", None), item_id, previous)
+            acquired = bool(covered or waived)
+        same_head = bool(previous and acquired
+                         and plan_git.same_commit(previous.get("sha"), sha))
     if kind == "frozen" and on_frozen is None:
         from . import review_designation_activation as activation
         cfg = getattr(db, "cfg", None)
         if activation.enabled(cfg) and not _in_transaction(db):
-            # #2487 : un gel réaligné dont les verdicts vont être reportés
-            # n'appelle pas de nouvelle désignation. Le plan est lu avant la
-            # transaction du jalon (lectures git/réseau hors verrou de ligne).
-            plan = activation.carried_plan(cfg, db, item_id, sha)
-            # Un plan partiel (certains verdicts reportables, d'autres non,
-            # #4582) ne fait pas s'abstenir : la désignation tourne pour les
-            # sièges manquants, et ses relecteurs reportés ne sont pas relancés.
-            carried = (plan if plan and not plan.get("refused") else None)
-            reported = [str((entry or {}).get("actor") or "").strip()
-                        for entry in (plan or {}).get("carried") or ()
-                        if str((entry or {}).get("actor") or "").strip()]
-            # #3250: a locally present head does not certify a fresh target.
-            # Pin the exact published target before taking the lot's lock.
-            target = (None if carried else
-                      activation.prepare_target(cfg, db, item, sha))
-            # #3836 : la désignation lit les gels antérieurs du lot dans la
-            # transaction du jalon ; ses objets absents se rapatrient ici, hors
-            # transaction. Un `git fetch` de forge dans la transaction laissait
-            # la session `idle in transaction` sept minutes, verrous tenus.
-            if not carried:
-                activation.prefetch_freeze_objects(db, item, target, sha)
-                # #3948 : la lecture des auteurs (dont `_carried_from_previous`
-                # sur tous les gels antérieurs) prend >120 s sur un lot comme
-                # #3889 ; la faire dans la transaction du jalon la laissait
-                # `idle in transaction` au-delà de la garde de 180 s, qui
-                # tuait la connexion. Toute la lecture passe ici.
-                prepared = activation.prepare_for_freeze(
-                    cfg, db, item, sha, target=target, actor=actor, proof=proof)
-            on_frozen = activation.hook(cfg, outcome, carried=carried,
-                                        target=target, prepared=prepared,
-                                        reported=reported)
-            if after_commit is None:
+            if same_head:
+                on_frozen = activation.same_head_hook(outcome, previous=previous)
+            elif defer_designation:
+                # #5481 : ne pas désigner avant que le report des verdicts
+                # (#2442) ait été évalué. Quand le plan du report couvre la
+                # tête, le hook n'écrit que la marque gardée (aucun courrier)
+                # et évite la lecture préparée. Sinon la désignation attend :
+                # la CLI exécute le report juste après le gel et ne désigne
+                # qu'après son refus. Le refus #3742 (familles impossibles)
+                # reste un fait du gel : la lecture préparée et le hook de
+                # contrôle le portent sur ce chemin différé.
+                plan = activation.carried_plan(cfg, db, item_id, sha,
+                                               repo=carry_repo or None)
+                carried = (plan if plan and not plan.get("refused") else None)
+                if carried:
+                    on_frozen = activation.hook(cfg, outcome, carried=carried)
+                else:
+                    target = activation.prepare_target(cfg, db, item, sha)
+                    activation.prefetch_freeze_objects(db, item, target, sha)
+                    prepared = activation.prepare_for_freeze(
+                        cfg, db, item, sha, target=target, actor=actor, proof=proof)
+                    on_frozen = activation.freeze_check_hook(cfg, outcome,
+                                                             prepared=prepared)
+            else:
+                # #2487 : un gel réaligné dont les verdicts vont être reportés
+                # n'appelle pas de nouvelle désignation. Le plan est lu avant
+                # la transaction du jalon (lectures git/réseau hors verrou).
+                # #5481 : le rapport lit le dépôt fourni au gel (`--repo`),
+                # sinon un hôte sans réglage radar rend `no-repository`.
+                plan = activation.carried_plan(cfg, db, item_id, sha,
+                                               repo=carry_repo or None)
+                # Un plan partiel (certains verdicts reportables, d'autres non,
+                # #4582) ne fait pas s'abstenir : la désignation tourne pour les
+                # sièges manquants, et ses relecteurs reportés ne sont pas relancés.
+                carried = (plan if plan and not plan.get("refused") else None)
+                reported = [str((entry or {}).get("actor") or "").strip()
+                            for entry in (plan or {}).get("carried") or ()
+                            if str((entry or {}).get("actor") or "").strip()]
+                # #3250: a locally present head does not certify a fresh target.
+                # Pin the exact published target before taking the lot's lock.
+                target = (None if carried else
+                          activation.prepare_target(cfg, db, item, sha))
+                # #3836 : la désignation lit les gels antérieurs du lot dans la
+                # transaction du jalon ; ses objets absents se rapatrient ici, hors
+                # transaction. Un `git fetch` de forge dans la transaction laissait
+                # la session `idle in transaction` sept minutes, verrous tenus.
+                if not carried:
+                    activation.prefetch_freeze_objects(db, item, target, sha)
+                    # #3948 : la lecture des auteurs (dont `_carried_from_previous`
+                    # sur tous les gels antérieurs) prend >120 s sur un lot comme
+                    # #3889 ; la faire dans la transaction du jalon la laissait
+                    # `idle in transaction` au-delà de la garde de 180 s, qui
+                    # tuait la connexion. Toute la lecture passe ici.
+                    prepared = activation.prepare_for_freeze(
+                        cfg, db, item, sha, target=target, actor=actor, proof=proof)
+                on_frozen = activation.hook(cfg, outcome, carried=carried,
+                                            target=target, prepared=prepared,
+                                            reported=reported)
+            if on_frozen is not None and after_commit is None:
                 after_commit = []
                 drain = after_commit
     row = storage.of(db).work.add_milestone(
