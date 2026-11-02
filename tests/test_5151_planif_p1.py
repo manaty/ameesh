@@ -10,11 +10,14 @@ Témoins du lot :
 * un début futur posé par le planificateur ne vaut pas attente pour un P1
   (`planned_waits`, `operations.listing`), une date posée à la main si ;
 * le sommeil épargne l'agent d'un tel P1 et, quand il endort, nomme au
-  journal le lot écarté et sa raison.
+  journal le lot écarté et sa raison ;
+* le jour de « demain » se calcule sur l'horloge de la passe de sommeil, et
+  les deux côtés de minuit Paris lisent le même jour local (#5412).
 """
 from __future__ import annotations
 
 import datetime as dt
+import os
 from pathlib import Path
 import re
 import time
@@ -40,8 +43,14 @@ def _day(ts):
     return dt.date.fromtimestamp(ts).isoformat()
 
 
-def _tomorrow():
-    return (dt.date.today() + dt.timedelta(days=1)).isoformat()
+def _next_day(ts):
+    """Le lendemain du jour local du processus à `ts`.
+
+    #5412 : la date se calcule sur l'horloge de la passe, jamais sur l'heure
+    réelle du test : entre 23:28 et 00:00 UTC, une passe datée à t0 + 1900 s
+    a changé de jour et un « demain » figé au setUp n'est plus futur.
+    """
+    return (dt.date.fromtimestamp(ts) + dt.timedelta(days=1)).isoformat()
 
 
 class QueueTest(unittest.TestCase):
@@ -147,6 +156,10 @@ class SleepTest(PgTestCase):
         self.state: dict = {}
         self.t0 = time.time()
 
+    #: la passe de sommeil se juge 1900 s après le début du test (repos de
+    #: 30 min dépassé) ; le jour des dates posées suit cette horloge (#5412).
+    SLEEP_AT = 1900
+
     def run_pass(self, offset):
         return fd.run(None, self.db, now=self.t0 + offset, state=self.state,
                       listing=[agent("dev0"), agent("dev1")], canons=[],
@@ -165,16 +178,18 @@ class SleepTest(PgTestCase):
         work.note(self.db, split, "roadmap: épuisée ameesh (test)", actor="pilote")
         return split
 
-    def p1_dated_tomorrow(self, source):
+    def p1_dated_tomorrow(self, source, *, now):
         made = work.add(self.db, title="P1 daté demain", app="ameesh", actor="pilote")
         lot = int(made["id"])
         work.assign(self.db, lot, "dev1", actor="pilote")
         # #5198 : demain selon le jour local du processus, celui que lisent
         # `operations.listing` et le planificateur ; `current_date` suit le
         # fuseau de la session SQL et diffère d'un jour certains soirs.
+        # #5412 : `now` est l'horloge de la passe qui décidera, pas celle du
+        # setUp — sinon le passage de minuit change le jour sous la date.
         self.db.execute("UPDATE work_items SET priority = 1,"
                         " planned_start = %s, planned_source = %s"
-                        " WHERE id = %s", (_tomorrow(), source, lot))
+                        " WHERE id = %s", (_next_day(now), source, lot))
         return lot
 
     def listing_row(self, name):
@@ -183,10 +198,11 @@ class SleepTest(PgTestCase):
 
     def test_a_p1_dated_by_the_scheduler_is_actionable_and_spares_its_agent(self):
         split = self.exhausted()
-        lot = self.p1_dated_tomorrow(SCHEDULED)
+        at = self.t0 + self.SLEEP_AT
+        lot = self.p1_dated_tomorrow(SCHEDULED, now=at)
         row = self.listing_row("dev1")
         self.assertEqual((row["actionable_lots"], row["actionable_lot_id"]), (1, lot))
-        out = self.run_pass(1900)
+        out = self.run_pass(self.SLEEP_AT)
         by_agent = {r["agent"]: r for g in out if g["kind"] == "sleep"
                     for r in g["agents"]}
         self.assertFalse(by_agent["dev1"]["slept"])
@@ -197,13 +213,14 @@ class SleepTest(PgTestCase):
 
     def test_a_date_set_by_hand_still_waits_and_the_journal_names_it(self):
         split = self.exhausted()
-        lot = self.p1_dated_tomorrow("set by mesh-design")
+        at = self.t0 + self.SLEEP_AT
+        lot = self.p1_dated_tomorrow("set by mesh-design", now=at)
         self.assertEqual(self.listing_row("dev1")["actionable_lots"], 0)
-        out = self.run_pass(1900)
+        out = self.run_pass(self.SLEEP_AT)
         by_agent = {r["agent"]: r for g in out if g["kind"] == "sleep"
                     for r in g["agents"]}
         self.assertTrue(by_agent["dev1"]["slept"])
-        tomorrow = _tomorrow()
+        tomorrow = _next_day(at)
         self.assertEqual(by_agent["dev1"]["set_aside"],
                          [{"lot": lot, "why": "planned start %s" % tomorrow}])
         self.assertIn("%s dev1: #%d (planned start %s)"
@@ -268,6 +285,39 @@ class LocalDaySourceTest(unittest.TestCase):
                  for n, line in enumerate(path.read_text().splitlines(), 1)
                  if self.PATTERN.search(line.split("--")[0].split("#")[0])]
         self.assertEqual(found, [])
+
+    def test_the_process_day_holds_on_both_sides_of_paris_midnight(self):
+        """#5412 : horloge et fuseau fixés — de part et d'autre de minuit
+        Paris, « demain » et le jour du résolveur sont le même jour local du
+        processus, jamais l'heure réelle du test."""
+        before = dt.datetime(2026, 11, 1, 22, 30,
+                             tzinfo=dt.timezone.utc).timestamp()  # 23:30 Paris
+        after = dt.datetime(2026, 11, 1, 23, 30,
+                            tzinfo=dt.timezone.utc).timestamp()   # 00:30 Paris
+        row = {"id": 1, "state": "intake", "priority": 1}
+
+        def wait(now, day):
+            return planned_waits.resolve(
+                [row], {1: {"planned_start": day,
+                            "planned_source": "set by mesh-design"}},
+                (), {}, (), now=now).get(1, {})
+
+        try:
+            with mock.patch.dict(os.environ, {"TZ": "Europe/Paris"}):
+                time.tzset()
+                self.assertEqual(_day(before), "2026-11-01")
+                self.assertEqual(_day(after), "2026-11-02")
+                for now in (before, after):
+                    day = _next_day(now)
+                    self.assertEqual(wait(now, day),
+                                     {"what": "scheduled", "start": day})
+                # passé minuit Paris, le 2 est « aujourd'hui » : seule une date
+                # future (le lendemain du jour local) attend encore.
+                self.assertEqual(wait(after, "2026-11-02"), {})
+                self.assertEqual(wait(after, "2026-11-03"),
+                                 {"what": "scheduled", "start": "2026-11-03"})
+        finally:
+            time.tzset()
 
 
 if __name__ == "__main__":
