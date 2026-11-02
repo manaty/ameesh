@@ -4812,6 +4812,7 @@
    "operations": [
     "adopt",
     "assigners",
+    "balance_series",
     "build_lots_activity",
     "gauge_history",
     "gauge_latest",
