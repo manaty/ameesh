@@ -23,8 +23,9 @@ orders, the agent merges) and its `gates`, for the head of each queue:
    freeze), the queue row `landing` until the PR's CI on that commit is
    green, then the PR merged by the API (`gh pr merge --match-head-commit`);
 5. a notice in the lot's thread (passive mail): resolutions replayed,
-   gates; the lot is closed by the branch sweep (L118), which sees the
-   merge.
+   gates; the queue itself closes the lot on the merge it just recorded
+   (`work.deliver`, SHA known — #5459), without waiting for the branch
+   sweep (L118) nor depending on its clone or on the lot's assignee.
 
     ameesh work land <lot> [--project P]   the same, by hand, for the head
                                            of its queue
@@ -877,12 +878,13 @@ class _Landing:
         return dict({"lot": self.lot, "to": row.get("assignee"), "kind": "ejected",
                      "message_id": sent, "result": "ejected"}, **extra)
 
-    def record(self, reason: str, note: str, *, state: str = "landed") -> str:
+    def record(self, reason: str, note: str, *, state: str = "landed",
+               landing_sha: str | None = None) -> str:
         # Once the remote merge may have happened, persistence errors must
         # never send execution back through the pre-merge retry/reset path.
         for _ in range(2):
             try:
-                return self._record(reason, note, state=state)
+                return self._record(reason, note, state=state, landing_sha=landing_sha)
             except Exception as exc:  # noqa: BLE001 - post-merge fact, retry once
                 error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
         merge_queue._wake(self.db, self.row.get("assignee"), self.lot,
@@ -892,19 +894,25 @@ class _Landing:
                            "kind": "land", "lot": self.lot, "reason": UNCERTAIN + error})
         return "unrecorded"
 
-    def _record(self, reason: str, note: str, *, state: str = "landed") -> str:
+    def _record(self, reason: str, note: str, *, state: str = "landed",
+                landing_sha: str | None = None) -> str:
         """#194 r8: a merge that happened is a fact, recorded whatever became
         of the lease: under the lease; else under the freeze (the lot still
         `landing` on the same freeze and landing commit); else — a newer
         freeze or entry is there, never overwritten — as history only, a
-        line in the lot's journal. Returns `lease`, `freeze` or `history`."""
+        line in the lot's journal. Returns `lease`, `freeze` or `history`.
+
+        #5459 : `landing_sha` garde le commit de la fusion sur la ligne
+        `landed` elle-même — le fait reste lisible dans la file, sans dépôt."""
         row = self.row
         freeze = (row["frozen_sha"], row.get("landing_sha"))
-        if self.write(state=state, reason=reason, note=note, actor=work.SYSTEM_SENDER, freeze=freeze):
+        if self.write(state=state, reason=reason, note=note, actor=work.SYSTEM_SENDER,
+                      freeze=freeze, landing_sha=landing_sha):
             return "lease"
         if self.ops.queue_update(self.lot, state=state, reason=reason, note=note,
                                  actor=work.SYSTEM_SENDER,
-                                 freeze=freeze, entry=self.entry) is not None:
+                                 freeze=freeze, entry=self.entry,
+                                 landing_sha=landing_sha) is not None:
             return "freeze"
         self.ops.note(self.lot, row.get("item_state") or "", "%s (history: %s)" % (reason, note),
                       work.SYSTEM_SENDER)
@@ -953,6 +961,37 @@ class _Landing:
                     "why": "lot de relecture non ouvert : %s: %s"
                            % (type(exc).__name__, str(exc)[:200])}
 
+    def close_lot(self, merged: dict, *, pr=None) -> dict:
+        """#5459 : la file ferme elle-même le lot qu'elle vient d'atterrir.
+
+        Le SHA de la fusion est connu ici : la clôture ne dépend ni du clone
+        ni de l'assigné du balayeur des branches (un véhicule de paquet sans
+        assigné n'était jamais vu, et l'hôte du relevé peut ne pas avoir le
+        dépôt). Le constat passe par `work.deliver` (connecteur `git-merge`),
+        comme le feu et les relevés : mêmes gardes (§5 porte de production,
+        gel concurrent) et même journal. La fusion étant déjà écrite, une
+        erreur est rendue, jamais levée ; `withheld` (porte de production) et
+        `refrozen` (nouveau gel) laissent le lot ouvert à dessein."""
+        row = self.row
+        sha = str(merged.get("sha") or "")
+        pr_ref = None
+        if pr:
+            from . import radar
+            slug = radar.github_slug(self.project)
+            if slug:
+                pr_ref = "%s#%s" % (slug, pr)
+        try:
+            return work.deliver(
+                self.db, self.lot, connector=work.merge_connector(),
+                evidence={"seen": "the merge queue of %s" % (row.get("target") or ""),
+                          "sha": sha, "pr": pr_ref},
+                actor=work.SYSTEM_SENDER, frozen_id=row.get("frozen_id"),
+                repo=self.clone or self.project.repo)
+        except Exception as exc:  # noqa: BLE001 - la fusion est un fait déjà écrit
+            return {"id": self.lot, "result": "error",
+                    "detail": "lot not closed: %s: %s" % (
+                        type(exc).__name__, str(exc)[:200])}
+
     def landed(self, merged: dict, base, *, pr=None) -> dict:
         row, project = self.row, self.project
         # #1682: a merge GitHub's auto-merge made at the frozen head, before
@@ -963,7 +1002,7 @@ class _Landing:
         reason = "%s (%s)" % (who, merged["sha"][:12])
         gates_text = ", ".join("`%s`" % g for g in project.gates)
         _passive(self.db, row.get("assignee"), self.lot, (
-            "Merge queue of %s, lot #%d « %s »: %s (%s%s)%s. %s The branch sweep closes the lot."
+            "Merge queue of %s, lot #%d « %s »: %s (%s%s)%s. %s The queue records the merge."
             % (row["target"], self.lot, row.get("title") or "", who, merged["sha"][:12],
                ", PR #%s" % pr if pr else ", on %s" % (base or "?")[:12],
                "; resolutions replayed by rerere on %s" % ", ".join(merged["files"][:6])
@@ -974,13 +1013,22 @@ class _Landing:
             {"project": project.name, "target": row["target"], "commit": merged["sha"]})
         how = self.record(reason, "merge queue of %s: %s, %s%s" % (
             row["target"], "constated GitHub auto-merge" if constated else "landed by ameesh",
-            merged["sha"][:12], ", PR #%s" % pr if pr else ""))
+            merged["sha"][:12], ", PR #%s" % pr if pr else ""),
+            landing_sha=str(merged.get("sha") or ""))
         review = self.review_after_merge(merged_sha=str(merged.get("sha") or ""), pr=pr)
-        return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr,
-                     "review_lot": review},
-                    **({"warning": "queue entry changed: recorded as history only (a newer entry is "
-                        "queued)"} if how == "history" else {"warning": "remote merge succeeded; recording failed"}
-                       if how == "unrecorded" else {}))
+        # #5459 : la clôture suit l'atterrissage, sur le SHA connu de la file.
+        # Un échec inattendu est rendu (`closure`) et remonté comme erreur de
+        # la passe, sans défaire la fusion ; une retenue voulue (porte de
+        # production, nouveau gel) n'est pas une erreur.
+        closure = self.close_lot(merged, pr=pr)
+        out = dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr,
+                    "review_lot": review, "closure": closure},
+                   **({"warning": "queue entry changed: recorded as history only (a newer entry is "
+                       "queued)"} if how == "history" else {"warning": "remote merge succeeded; recording failed"}
+                      if how == "unrecorded" else {}))
+        if closure.get("result") == "error":
+            out["error"] = closure.get("detail") or "lot not closed"
+        return out
 
 
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
