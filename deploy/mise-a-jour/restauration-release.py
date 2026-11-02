@@ -6,6 +6,7 @@ Administrator CLI only. Installation never touches the live cluster. PostgreSQL
 roles/credentials are enrolled separately (#5162); no password reaches argv.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -34,14 +35,61 @@ class RestoreError(ValueError):
     pass
 
 
+@contextmanager
+def diagnostic(step, document=None):
+    """Attach local context, never command output or document contents."""
+    try:
+        yield
+    except Exception as error:
+        steps = getattr(error, 'restore_steps', [])
+        error.restore_steps = [step, *steps]
+        if document is not None and not hasattr(error, 'restore_document'):
+            # Only absolute filesystem references are diagnostic metadata. An
+            # invalid reference might itself be a DSN or another secret.
+            value = str(document)
+            error.restore_document = (value if value.startswith('/') and
+                                      '\x00' not in value else '<invalid path>')
+        raise
+
+
+def failure(error):
+    """Render fixed local reasons and numeric OS/process details only."""
+    kind = type(error).__name__
+    if isinstance(error, RestoreError):
+        reason = str(error)  # RestoreError messages are local literals only.
+    elif isinstance(error, OSError):
+        reason = ('os error ' + str(error.errno) + ': ' + os.strerror(error.errno)
+                  if isinstance(error.errno, int) else 'OS operation failed')
+    elif isinstance(error, json.JSONDecodeError):
+        reason = f'invalid JSON at line {error.lineno} column {error.colno}'
+    elif isinstance(error, subprocess.CalledProcessError):
+        reason = f'maintenance command exited with status {error.returncode}'
+    elif isinstance(error, subprocess.TimeoutExpired):
+        reason = 'maintenance command timed out'
+    else:
+        reason = 'unexpected failure; exception text withheld'
+    result = kind + ': ' + reason
+    if error.__cause__ is not None:
+        result += '; cause=' + failure(error.__cause__)
+    return result
+
+
+def refusal(error):
+    steps = '/'.join(getattr(error, 'restore_steps', ['unknown']))
+    document = getattr(error, 'restore_document', None)
+    return ('restore cluster operation refused; step=' + steps +
+            ('; document=' + json.dumps(document, ensure_ascii=True) if document else '') +
+            '; ' + failure(error) + '\n')
+
+
 def command(args):
     try:
         return subprocess.run(args, check=True, capture_output=True, text=True,
                               timeout=120, env={'PATH': '/usr/bin:/bin',
                                                'LANG': 'C', 'LC_ALL': 'C'}).stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
         # Diagnostics may contain connection strings: never repeat them.
-        raise RestoreError('restore maintenance command failed') from None
+        raise RestoreError('restore maintenance command failed') from error
 
 
 def protected(path):
@@ -57,39 +105,41 @@ def protected(path):
 
 
 def read_document(path):
-    path = protected(path)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, 'rb') as stream:
-        info = os.fstat(stream.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
-                or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 65536):
-            raise RestoreError('private root document required')
-        data = stream.read(65537)
-    if len(data) > 65536:
-        raise RestoreError('document too large')
-    return json.loads(data)
+    with diagnostic('read-document', path):
+        path = protected(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                    or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 65536):
+                raise RestoreError('private root document required')
+            data = stream.read(65537)
+        if len(data) > 65536:
+            raise RestoreError('document too large')
+        return json.loads(data)
 
 
 def atomic(path, data, mode=0o600):
-    path = protected(path)
-    if path.is_symlink():
-        raise RestoreError('linked output refused')
-    fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
-    try:
-        with os.fdopen(fd, 'wb') as stream:
-            os.fchmod(stream.fileno(), mode)
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    with diagnostic('write-document', path):
+        path = protected(path)
+        if path.is_symlink():
+            raise RestoreError('linked output refused')
+        fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
         try:
-            os.fsync(directory)
+            with os.fdopen(fd, 'wb') as stream:
+                os.fchmod(stream.fileno(), mode)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
-            os.close(directory)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
 
 def layout(version):
@@ -112,8 +162,8 @@ def enrollment(value):
 def target(dsn, parser):
     try:
         fields = parser(dsn)
-    except Exception:
-        raise RestoreError('restore DSN cannot be parsed') from None
+    except Exception as error:
+        raise RestoreError('restore DSN cannot be parsed') from error
     # Explicit single local endpoint; no libpq environment/service/options can
     # redirect the producer to another volume. Password and TLS parameters are
     # allowed, but connection routing is completely pinned here.
@@ -178,17 +228,25 @@ def capacity(document, backup, observed, *, parser, free_bytes, now):
 
 
 def probe(config_path=ENROLLMENT):
-    from psycopg.conninfo import conninfo_to_dict
-    config = enrollment(read_document(config_path))
-    backup = read_document(config['backup'])
-    observed = inspect_cluster(config['version'])
+    with diagnostic('load-driver'):
+        from psycopg.conninfo import conninfo_to_dict
+    with diagnostic('probe-enrollment', config_path):
+        config = enrollment(read_document(config_path))
+    with diagnostic('backup-enrollment', config['backup']):
+        backup = read_document(config['backup'])
+    with diagnostic('inspect-cluster'):
+        observed = inspect_cluster(config['version'])
     data, _ = layout(config['version'])
-    volume = os.statvfs(data)
-    # f_bavail excludes reserved blocks, conservative for the PostgreSQL user.
-    value = capacity(config, backup, observed, parser=conninfo_to_dict,
-                     free_bytes=volume.f_bavail * volume.f_frsize, now=time.time())
-    output = capacity_output(backup, config, config_path)
-    atomic(output, (json.dumps(value, sort_keys=True) + '\n').encode())
+    with diagnostic('volume-capacity', data):
+        volume = os.statvfs(data)
+    with diagnostic('validate-capacity', config_path):
+        # f_bavail excludes reserved blocks, conservative for PostgreSQL.
+        value = capacity(config, backup, observed, parser=conninfo_to_dict,
+                         free_bytes=volume.f_bavail * volume.f_frsize, now=time.time())
+    with diagnostic('capacity-output', config['backup']):
+        output = capacity_output(backup, config, config_path)
+    with diagnostic('publish-capacity', output):
+        atomic(output, (json.dumps(value, sort_keys=True) + '\n').encode())
     return value
 
 
@@ -439,14 +497,19 @@ def main():
     if os.geteuid() != 0:
         parser.exit(1, 'administrator required\n')
     try:
-        if args.action == 'install':
-            install(args.pg_version, args.backup, args.python, args.restore_role)
-        elif args.action == 'probe':
-            probe()
-        else:
-            remove()
-    except Exception:
-        parser.exit(1, 'restore cluster operation refused; inspect protected enrollment\n')
+        with diagnostic(args.action):
+            dispatch(args)
+    except Exception as error:
+        parser.exit(1, refusal(error))
+
+
+def dispatch(args):
+    if args.action == 'install':
+        install(args.pg_version, args.backup, args.python, args.restore_role)
+    elif args.action == 'probe':
+        probe()
+    else:
+        remove()
 
 
 if __name__ == '__main__':
