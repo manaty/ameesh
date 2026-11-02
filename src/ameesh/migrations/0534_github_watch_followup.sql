@@ -28,3 +28,7 @@ CREATE TABLE github_watch_pending (
 );
 CREATE INDEX github_watch_pending_open_idx
     ON github_watch_pending (delivered_at) WHERE resolved_at IS NULL;
+-- #4299 : le veilleur est un nom d'agent, réécrit au renommage et normalisé à
+-- l'écriture comme les autres colonnes d'identité.
+create trigger ameesh_agent_spelling before insert or update of agent on github_watch_pending
+    for each row execute function ameesh_agent_spelling('agent');
