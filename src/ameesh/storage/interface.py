@@ -3332,16 +3332,25 @@ class Canon(Domain):
         `keep` (canons retirés de la configuration, L42) ; rend leurs clés."""
 
     @abc.abstractmethod
-    def claim_sync(self, host: str, canon: str, token: str, interval_s: float) -> bool:
-        """Claim one periodic sync per host/canon/interval in a short statement."""
+    def claim_sync(self, host: str, canon: str, token: str, interval_s: float,
+                   takeover: str | None = None) -> bool:
+        """Claim one periodic sync per host/canon/interval in a short statement.
+        #5493: `takeover` (a signature) also claims before the interval when
+        no claim is pending and the completed one has another signature."""
 
     @abc.abstractmethod
     def complete_sync(self, host: str, canon: str, token: str, signature: str) -> None:
         """Publish completion only if this claim is still current."""
 
     @abc.abstractmethod
+    def fail_sync(self, host: str, canon: str, token: str) -> None:
+        """#5493: a claimed sync that raised withdraws the last completed
+        result and releases its claim, only if this claim is still current."""
+
+    @abc.abstractmethod
     def shared_sync(self, host: str, canon: str) -> dict | None:
-        """Completed current claim's state; None while pending or absent."""
+        """Last completed state, kept while a newer claim is pending (#5493);
+        None if no sync ever completed or the last claimed one failed."""
 
     @abc.abstractmethod
     def lock_default_state(self, host: str) -> dict | None:
