@@ -5349,25 +5349,6 @@ class AgentWorker(threading.Thread):
         except OSError as exc:
             log("[%s] turn context not removed (%s)" % (self.name, exc))
 
-    def _sans_appel_fournisseur(self, rp, lignes: int, interrompu: bool,
-                                duration: float, usage, result_code) -> bool:
-        """#5503 : la preuve qu'un tour en échec n'a appelé aucun fournisseur.
-
-        Toutes à la fois : un harnais lancé pour ce tour (un résident a pu
-        appeler avant), sorti de lui-même sur son propre code d'échec (> 0 :
-        ni signal — un crash reste incertain, B impl-07 —, ni bail perdu,
-        préemption, clôture par plafond, redémarrage, arrêt de l'exécuteur ou
-        garde d'audit), en moins de `fast_failure_s`, sans aucune ligne
-        de flux — Claude (`system/init`), Codex (`thread.started`) et DeepSeek
-        (`session`) l'écrivent avant leur premier appel — ni usage. Dans le
-        doute, la réservation reste `kept`."""
-        if not isinstance(result_code, int) or result_code <= 0:
-            return False
-        if interrompu or getattr(self, "_audit_guard_error", "") or self._urgent_end():
-            return False
-        return (rp is None and lignes == 0 and usage is None
-                and duration < self.runner.fast_failure_s)
-
     def _compta_termine(self, model_annonce: str | None = None, *,
                         incertain: bool = False) -> None:
         """Après un tour : écrit la ligne du grand livre.
@@ -9277,19 +9258,12 @@ class AgentWorker(threading.Thread):
         # est celui du lancement, déjà figé dans le marqueur (L13 B4).
         # #1469 : issue incertaine (erreur, bail perdu, préemption, arrêt
         # par plafond) : la réservation du compte reste comptée en entier.
-        # #5503 : sauf preuve qu'aucun appel au fournisseur n'a eu lieu — le
-        # harnais (non résident) est sorti de lui-même, vite, sans une seule
-        # ligne de flux ni usage : la ligne du grand livre (0 $) règle alors la
-        # réservation, au lieu d'en garder 2 $ pour la journée à chaque refus.
-        incertain = bool(error or result_code or lost or preempte or clos)
-        if incertain and self._sans_appel_fournisseur(
-                rp, lignes, lost or preempte or clos, duration, conversation_usage,
-                result_code):
-            log_async("[%s] harness exited (%s) in %.1fs with no stream output nor "
-                      "usage: no provider call, account reservation settled at 0"
-                      % (self.name, result_code if result_code else error, duration))
-            incertain = False
-        self._compta_termine(modele_annonce, incertain=incertain)
+        # #5503 (B cx1) : un code de sortie sans flux ni usage ne prouve pas
+        # l'absence d'appel — un harnais configurable peut avoir appelé le
+        # fournisseur avant de sortir ; la boucle est bornée par le backoff de
+        # rotation, et les réservations gardées ont leurs alertes.
+        self._compta_termine(modele_annonce, incertain=bool(
+            error or result_code or lost or preempte or clos))
         # #4448 B cx3 : le nombre de tours de la session est celui des tours
         # COMPTÉS au grand livre — réussis ou non : la dépense a eu lieu même
         # quand le harnais échoue (L13 B1), et toutes les sorties anticipées

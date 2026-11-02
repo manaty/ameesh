@@ -5,8 +5,9 @@
 stays due, the next pass rotates again — one 2 $ `kept` reservation every few
 seconds until the account's daily cap. Here: backoff per agent, rotation
 without a summary turn after ROTATION_SUMMARY_MAX_FAILURES, the L48 breaker
-counts the summary turn, a turn proven without provider call settles its
-reservation at 0, and the kept reservations raise an alert.
+counts the summary turn, and the kept reservations raise an alert. A silent
+failed turn keeps its reservation (B cx1: an exit code is no proof that the
+provider was not called).
 """
 from __future__ import annotations
 
@@ -78,10 +79,10 @@ class RotationBackoffTest(PgTestCase):
         self.assertGreater(worker.rotation_retry_at, time.time() + 50)
         # The old session is kept.
         self.assertEqual(registry.get(self.db, "doc")["session_id"], "claude-sess-1")
-        # No provider call: the reservation is settled at 0, not kept.
-        self.assertEqual(self._states("doc"), ["settled", "settled"])
+        # One kept reservation for the one summary turn, not one per pass.
+        self.assertEqual(self._states("doc"), ["settled", "kept"])
         usage = storage.of(self.db).budgets.account_usage(OPENAI)[0]
-        self.assertAlmostEqual(usage["kept"], 0.0)
+        self.assertAlmostEqual(usage["kept"], 2.0)
 
     def test_backoff_croissant_puis_rotation_sans_resume(self):
         worker = self._worker("doc2")
@@ -107,7 +108,9 @@ class RotationBackoffTest(PgTestCase):
         self.assertEqual(worker.resume_origin, "ameesh")
         self.assertIn("Session rotation without a summary", worker.resume_summary)
         self.assertEqual((worker.rotation_failures, worker.rotation_retry_at), (0, 0.0))
-        self.assertNotIn("kept", self._states("doc2"))
+        # The deterministic rotation reserves nothing: no model call.
+        self.assertEqual(self._states("doc2").count("kept"),
+                         runner_mod.ROTATION_SUMMARY_MAX_FAILURES)
 
     def test_le_disjoncteur_l48_couvre_le_tour_de_resume(self):
         worker = self._worker("doc3", max_fast_failures=2)
@@ -139,15 +142,14 @@ class RotationBackoffTest(PgTestCase):
             self.assertFalse(worker.run_turn({"kind": "prompt", "prompt": "t", "ids": []}))
         self.assertEqual(self._states("crash"), ["kept"])
 
-    def test_arret_par_l_executeur_reste_kept(self):
-        """A refusal while the runner restarts the agent is not a proof."""
-        worker = self._worker("restart")
-        worker.restarting.set()
-        self.assertFalse(worker._sans_appel_fournisseur(None, 0, False, 0.5, None, 1))
-        worker.restarting.clear()
-        self.assertTrue(worker._sans_appel_fournisseur(None, 0, False, 0.5, None, 1))
-        self.assertFalse(worker._sans_appel_fournisseur(None, 0, False, 0.5, None, -9))
-        self.assertFalse(worker._sans_appel_fournisseur(None, 0, False, 0.5, None, 0))
+    def test_sortie_1_sans_flux_ni_usage_reste_kept(self):
+        """B cx1: a wrapper may call the provider, then exit 1 with no stream
+        line nor usage — the outcome stays uncertain."""
+        worker = self._worker("silencieux")
+        with self._env(AMEESH_TEST_REFUSE="transport error after the request"):
+            worker._account = _profile(OPENAI, harness="claude")
+            self.assertFalse(worker.run_turn({"kind": "prompt", "prompt": "t", "ids": []}))
+        self.assertEqual(self._states("silencieux"), ["kept"])
 
     def test_tour_de_resume_differe_ne_compte_pas(self):
         worker = self._worker("differe")
