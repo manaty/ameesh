@@ -22,7 +22,7 @@ import json
 from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
-from .work import REQUEUED_PARAMS, has_reviewer, requeued_sql
+from .work import REQUEUED_PARAMS, has_current_item_columns, has_reviewer, requeued_sql
 from .work_dependencies import (current_verdict as _current_verdict,
                                 owed_by_assignee, start_defers, wake_defers)
 
@@ -547,6 +547,15 @@ class Operations(interface.Operations):
                .replace("__RETURNED__", f"(w.state = '{lifecycle.IN_PROGRESS}' AND "
                         + requeued_sql("w") + ") AS returned_to_queue,")
                .replace("__WHERE__", where))
+        # #5404 : lecture directe, repli seulement sur un schéma en retard
+        # (fenêtre de migration, `work.has_current_item_columns`).
+        if not has_current_item_columns(self.db):
+            for direct, repli in (
+                    ("w.legacy_state,", "to_jsonb(w)->>'legacy_state' AS legacy_state,"),
+                    ("w.external_executor,", "to_jsonb(w)->>'external_executor' AS external_executor,"),
+                    ("to_jsonb(w.reviewers)", "to_jsonb(w)->'reviewers'"),
+                    ("w.workflow_ref", "to_jsonb(w)->>'workflow_ref'")):
+                sql = sql.replace(direct, repli)
         return self.db.query(sql, REQUEUED_PARAMS + tuple(params))
 
     def open_lots_activity(self, limit) -> list[dict]:

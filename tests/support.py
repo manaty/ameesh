@@ -867,6 +867,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
                 self.db.execute(f'DROP TRIGGER IF EXISTS "{name}" ON work_items')
                 self.db.execute(trigger["definition"])
             self.db.__dict__.pop("_has_" + column, None)
+            self.db.__dict__.pop("_has_current_item_columns", None)
 
         self.addCleanup(restore_schema)
         for trigger in triggers:
@@ -874,6 +875,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
             self.db.execute(f'DROP TRIGGER "{name}" ON work_items')
         self.db.execute(f'ALTER TABLE work_items DROP COLUMN {column}')
         self.db.__dict__.pop("_has_" + column, None)
+        self.db.__dict__.pop("_has_current_item_columns", None)
 
     @classmethod
     def setUpClass(cls) -> None:

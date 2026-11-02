@@ -157,6 +157,7 @@ class IssueFeedSqlTest(unittest.TestCase):
         class _Db:
             _has_reviewer = True
             _has_migration_slots = True
+            _has_current_item_columns = True
 
             def query(self, sql, params=()):
                 seen.append(sql)
@@ -172,6 +173,7 @@ class IssueFeedSqlTest(unittest.TestCase):
         class _Db:
             _has_reviewer = True
             _has_migration_slots = True
+            _has_current_item_columns = True
         cols = work_pg.item_columns(_Db())
         self.assertIn("to_jsonb(reviewers) AS reviewers", cols)
         self.assertIn("external_executor AS external_executor", cols)

@@ -20,6 +20,28 @@ class SqlSansLigneEntiere(unittest.TestCase):
     def test_item_columns_garde_la_forme_json_de_reviewers(self):
         self.assertIn("to_jsonb(w.reviewers) AS reviewers", work.item_columns(None, "w"))
 
+    def test_sans_ref_repli_seulement_sur_un_schema_en_retard(self):
+        class Base:
+            def __init__(self, n):
+                self.n, self.lectures = n, 0
+
+            def query(self, sql, params=()):
+                self.lectures += 1
+                return [{"n": self.n}]
+
+        a_jour = Base(len(work._OPTIONAL_ITEM_COLUMNS))
+        for _ in range(2):
+            self.assertTrue(work.has_current_item_columns(a_jour))
+        self.assertEqual(a_jour.lectures, 1)
+        en_retard = Base(len(work._OPTIONAL_ITEM_COLUMNS) - 1)
+        for _ in range(2):
+            self.assertFalse(work.has_current_item_columns(en_retard))
+        self.assertEqual(en_retard.lectures, 2)
+        for base, repli in ((a_jour, False), (en_retard, True)):
+            with mock.patch.object(work, "has_reviewer", return_value=True), \
+                    mock.patch.object(work, "has_migration_slots", return_value=False):
+                self.assertEqual("to_jsonb(work_items)" in work.item_columns(base), repli)
+
     def test_frise_compte_sur_les_identifiants(self):
         select = roadmap._ITEMS_SQL.split("SELECT __COLS__")[0]
         self.assertIn("count(*) OVER ()", select)

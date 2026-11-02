@@ -152,13 +152,38 @@ def has_migration_slots(db) -> bool:
     return found
 
 
+#: #5404 : les colonnes optionnelles lues par `item_columns` et `work.get`.
+_OPTIONAL_ITEM_COLUMNS = ("reviewers", "external_executor", "wake_at", "legacy_state",
+                          "workflow_ref", "workflow_stage", "workflow_version")
+
+
+def has_current_item_columns(db) -> bool:
+    """#5404 : toutes les colonnes optionnelles existent-elles ? Même règle que
+    `has_reviewer` : seule la réponse positive est mise en cache, une migration
+    appliquée pendant qu'une connexion vit est donc vue à la lecture suivante."""
+    if getattr(db, "_has_current_item_columns", False):
+        return True
+    found = db.query(
+        "SELECT count(*) AS n FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+        " AND column_name IN (%s)" % ", ".join("'%s'" % c for c in _OPTIONAL_ITEM_COLUMNS))
+    current = bool(found) and found[0].get("n") == len(_OPTIONAL_ITEM_COLUMNS)
+    if current:
+        try:
+            db._has_current_item_columns = True
+        except Exception:
+            pass
+    return current
+
+
 def item_columns(db, ref: str | None = None) -> str:
     """Les colonnes d'un lot ; `reviewer` quand 0421 est appliquée, `''` sinon
     (les lectures d'avant la migration ne cassent pas, #705).
 
     `ref` (le nom de la table dans la requête, « work_items ») qualifie les
     colonnes, sans sonde de colonne : les commandes à budget d'allers-retours
-    (L61 : `work list`, `progress`) n'en paient pas un de plus.
+    (L61 : `work list`, `progress`) n'en paient pas un de plus, et exigent le
+    schéma courant.
 
     #2481 : `migrations` est la liste des créneaux réservés du lot (JSONB),
     lue dans `work_migration_reservations` par une sous-requête corrélée —
@@ -169,11 +194,11 @@ def item_columns(db, ref: str | None = None) -> str:
     (`work.migration_line`), jamais sur une erreur : sur une base d'avant
     0419, la liste est de toute façon vide.
 
-    #5404 : les colonnes se lisent directement. `to_jsonb(ligne)` servait les
-    bases d'avant 0421 à 0518, que le schéma exigé exclut désormais, et coûtait
-    plus d'une milliseconde par ligne (corps compris, quatre fois par ligne) :
-    la moitié d'`ameesh alerts`. `to_jsonb(colonne)` garde la forme JSON de
-    `reviewers`."""
+    #5404 : les colonnes se lisent directement. `to_jsonb(ligne)` coûtait plus
+    d'une milliseconde par ligne (corps compris, quatre fois par ligne) : la
+    moitié d'`ameesh alerts`. Il ne reste que le repli sans `ref` d'une base en
+    retard sur le schéma (fenêtre de migration, #2339), derrière une sonde mise
+    en cache. `to_jsonb(colonne)` garde la forme JSON de `reviewers`."""
     col = "%s." % ref if ref else ""
     if ref:
         reviewer = "coalesce(%sreviewer, '') AS reviewer" % col
@@ -181,9 +206,19 @@ def item_columns(db, ref: str | None = None) -> str:
         reviewer = "reviewer"
     else:
         reviewer = "''::text AS reviewer"
-    reviewers = "to_jsonb(%sreviewers) AS reviewers" % col
-    external = "%sexternal_executor AS external_executor" % col
-    wake = "extract(epoch from %swake_at)::float8 as wake_ts" % col
+    if ref or has_current_item_columns(db):
+        reviewers = "to_jsonb(%sreviewers) AS reviewers" % col
+        external = "%sexternal_executor AS external_executor" % col
+        wake = "extract(epoch from %swake_at)::float8 as wake_ts" % col
+        lifecycle_columns = ("%slegacy_state AS legacy_state, "
+                             "%sworkflow_stage AS workflow_stage" % (col, col))
+    else:
+        reviewers = "to_jsonb(work_items)->'reviewers' AS reviewers"
+        external = "to_jsonb(work_items)->>'external_executor' AS external_executor"
+        wake = ("extract(epoch from (to_jsonb(work_items)->>'wake_at')::timestamptz)::float8"
+                " as wake_ts")
+        lifecycle_columns = ("to_jsonb(work_items)->>'legacy_state' AS legacy_state, "
+                             "to_jsonb(work_items)->>'workflow_stage' AS workflow_stage")
     if ref:
         migrations = "'[]'::jsonb AS migrations"
     elif has_migration_slots(db):
@@ -199,8 +234,7 @@ def item_columns(db, ref: str | None = None) -> str:
     return (_COLUMNS_TEMPLATE
             .replace("__REVIEWER__", reviewer + ", " + reviewers)
             .replace("__EXTERNAL__", external)
-            .replace("__LIFECYCLE__", "%slegacy_state AS legacy_state, "
-                     "%sworkflow_stage AS workflow_stage" % (col, col))
+            .replace("__LIFECYCLE__", lifecycle_columns)
             .replace("__WAKE__", wake)
             .replace("__MIGRATIONS__", migrations))
 
@@ -854,13 +888,19 @@ class WorkItems(interface.WorkItems):
         # même lecture — `project_lots` y passe pour les lots anciens/orphelins
         # retrouvés par leur marqueur, et la projection a besoin des trois
         # champs (sinon `projection-stage-missing` sur un lot sain). Une base
-        # pré-0452 rend '', NULL, 0 : aucune sonde de colonne.
+        # pré-0452 rend '', NULL, 0, derrière la sonde #5404.
+        if has_current_item_columns(self.db):
+            workflow = ("coalesce(workflow_ref, '') AS workflow_ref,"
+                        " workflow_stage,"
+                        " coalesce(workflow_version, 0) AS workflow_version")
+        else:
+            workflow = ("coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref,"
+                        " to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
+                        " coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
+                        " AS workflow_version")
         rows = self.db.query(
-            "SELECT %s,"
-            "       coalesce(workflow_ref, '') AS workflow_ref,"
-            "       workflow_stage,"
-            "       coalesce(workflow_version, 0) AS workflow_version"
-            " FROM work_items WHERE id = %%s" % item_columns(self.db), (int(item_id),))
+            "SELECT %s, %s FROM work_items WHERE id = %%s" % (item_columns(self.db), workflow),
+            (int(item_id),))
         return rows[0] if rows else None
 
     def items(self, *, state, assignee, limit) -> list[dict]:
@@ -4080,45 +4120,6 @@ class WorkItems(interface.WorkItems):
         )
 
     def handoff_lots(self, assignee, limit) -> list[dict]:
-        return self.db.query(
-            "SELECT w.*, k.team AS package_team,"
-            "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
-            "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
-            "       EXISTS (SELECT 1 FROM agent_mailbox b"
-            "                WHERE b.delivered_at IS NULL AND b.kind = 'request'"
-            "                  AND (b.payload -> 'decision') IS NOT NULL"
-            "                  AND btrim(b.work_item_id) = w.id::text) AS pending_decision,"
-            "       EXISTS (SELECT 1 FROM commitments c"
-            "                WHERE c.work_item_id = w.id AND c.kind = 'decision'"
-            "                  AND c.status IN ('proposed', 'open')) AS decision_milestone,"
-            "       (SELECT extract(epoch from max(m.at))::float8 FROM work_item_milestones m"
-            "         WHERE m.work_item_id = w.id AND m.kind = 'frozen') AS frozen_ts"
-            "  FROM (SELECT %s,"
-            "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
-            "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
-            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
-            "          FROM work_items"
-            f"         WHERE assignee = %%s AND state IN ('{lifecycle.REQUESTED}', '{lifecycle.IN_PROGRESS}')"
-            "           AND type <> 'improvement') w"
-            "  LEFT JOIN work_packages k ON k.id = w.package_id"
-            "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
-            " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
-            "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
-            "          w.created_ts, w.id"
-            " LIMIT %%s" % item_columns(self.db), (assignee, int(limit)))
-
-    # -- issues GitHub des lots (L126) ------------------------------------------
-    def issue_feed(self, limit) -> list[dict]:
-        """Lots ouverts, porteurs d'une `issue_ref`, ou pinnés sur une révision
-        Process (#2130/D : un cœur `merged` reste projeté ouvert, il doit donc
-        être dans le flux), les plus récents d'abord pour la borne, rendus par
-        id croissant avec l'équipe de leur fiche et l'équipe, le chantier et
-        l'hôte de leur assigné.
-
-        #2130/D : `workflow_ref`, `workflow_stage` et `workflow_version` sont
-        portés par la lecture comme B5 les porte dans `work.get` (`to_jsonb`,
-        sans sonde de colonne) ; base pré-0452 : `''`, NULL, 0.
-        """
         return self.db.query(
             "SELECT w.*, k.team AS package_team,"
             "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
