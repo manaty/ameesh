@@ -64,6 +64,14 @@ class NonAdditiveTest(unittest.TestCase):
             "for each row execute function f()'; end $$;",
             "comment on trigger g on t is 'garde';",
             "-- on ne fait pas de drop table ici\nalter table t add column d text;",
+            # #5517 : un commentaire de ligne dans une instruction ne défait pas
+            # la preuve d'objet neuf (il finit au saut de ligne)
+            "create table n (id int, -- colonne\n x text);"
+            " create trigger g before insert on n for each row execute function f();",
+            "create table n (id int -- commentaire en fin de ligne\n);"
+            " alter table n add unique (id);",
+            "create table n (id int, -- l'apostrophe et le ; ne sont pas du code\n"
+            " x text default 'a'); revoke insert on n from app;",
         ):
             with self.subTest(sql=sql):
                 self.assertEqual(migrations.non_additive(_migration(sql)), [])
@@ -124,6 +132,13 @@ class NonAdditiveTest(unittest.TestCase):
              "add constraint k"),
             ("alter table only t add column d int, add constraint k unique (c);",
              "add constraint k"),
+            # #5517 : un commentaire de ligne ne cache pas une contrainte
+            ("alter table t add column d text -- c\n, add unique (c);", "add unique"),
+            ("alter table t add unique -- c\n (c);", "add unique"),
+            # #5517 (N de relecture) : PostgreSQL finit le commentaire au CR seul
+            ("alter table t add column d text -- c\r, add unique (c);", "add unique"),
+            ("-- c\r revoke insert on t from app;", "revoke on t"),
+            ("-- c\r drop table t;", "drop table"),
             # B docs-01 : un `;` dans une chaîne ne termine pas l'instruction
             ("alter table t add column d text default ';', add unique (c);", "add unique"),
             ("alter table t add column d text default e';', add constraint k unique (c);",

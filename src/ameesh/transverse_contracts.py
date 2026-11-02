@@ -52,6 +52,12 @@ CONTRACTS = {
     "test_l161f_plan": (
         "tests/parts/",
     ),
+    # #5518 : `test_migrations_additives` lit tout le dossier des migrations
+    # pour classer chaque fichier (la carte mesurée ne l'y relie pas) ; un lot
+    # qui touche une migration le rend dû avant la CI du paquet (#5506).
+    "test_migrations_additives": (
+        "src/ameesh/migrations/",
+    ),
 }
 
 

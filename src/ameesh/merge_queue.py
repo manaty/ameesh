@@ -2752,7 +2752,7 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         guard_db, (kind, reason) = None, packet_exception
     try:
         packet_guard.check_merge(guard_db, lot, row["branch"], target, tip,
-                                 exception=kind, reason=reason)
+                                 exception=kind, reason=reason, repo=repo, cfg=cfg)
     except packet_guard.PacketGuardError as exc:
         raise QueueError(str(exc)) from exc
     klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg,

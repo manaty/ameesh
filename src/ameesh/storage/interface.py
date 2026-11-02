@@ -3332,16 +3332,25 @@ class Canon(Domain):
         `keep` (canons retirés de la configuration, L42) ; rend leurs clés."""
 
     @abc.abstractmethod
-    def claim_sync(self, host: str, canon: str, token: str, interval_s: float) -> bool:
-        """Claim one periodic sync per host/canon/interval in a short statement."""
+    def claim_sync(self, host: str, canon: str, token: str, interval_s: float,
+                   takeover: str | None = None) -> bool:
+        """Claim one periodic sync per host/canon/interval in a short statement.
+        #5493: `takeover` (a signature) also claims before the interval when
+        no claim is pending and the completed one has another signature."""
 
     @abc.abstractmethod
     def complete_sync(self, host: str, canon: str, token: str, signature: str) -> None:
         """Publish completion only if this claim is still current."""
 
     @abc.abstractmethod
+    def fail_sync(self, host: str, canon: str, token: str) -> None:
+        """#5493: a claimed sync that raised withdraws the last completed
+        result and releases its claim, only if this claim is still current."""
+
+    @abc.abstractmethod
     def shared_sync(self, host: str, canon: str) -> dict | None:
-        """Completed current claim's state; None while pending or absent."""
+        """Last completed state, kept while a newer claim is pending (#5493);
+        None if no sync ever completed or the last claimed one failed."""
 
     @abc.abstractmethod
     def lock_default_state(self, host: str) -> dict | None:
@@ -4361,7 +4370,7 @@ class Operations(Domain):
         son relecteur désigné), `lot_team` (équipe du lot : la sienne, sinon
         celle de son paquet ou du parent, sinon son `app`), `workflow_ref`
         (#1922/N13 : la révision Process qui pinne le lot, '' sur une base
-        d'avant la 0452). Les plus
+        d'avant la 0452), `issue_ref` (#5424 N2). Les plus
         anciennement actifs d'abord. `limit=None` lit toute la vérité avant le
         filtrage des attentes planifiées (L368)."""
 
@@ -5561,6 +5570,31 @@ class GithubWatch(Domain):
     @abc.abstractmethod
     def checkpoint(self, project: str, repo: str, progress: dict | None) -> None:
         """Persist or clear partial progress atomically with mailbox delivery."""
+
+    @abc.abstractmethod
+    def track(self, project: str, repo: str, agent: str, entries: list,
+              now: float) -> None:
+        """#5506: open one follow-up per delivered input (a new version reopens it)."""
+
+    @abc.abstractmethod
+    def open_entries(self, limit: int, *, checked_before: float | None = None
+                     ) -> list[dict]:
+        """#5506: inputs delivered and not yet proven handled, oldest first.
+
+        ``checked_before``: only those never checked or checked at or before
+        that instant, least recently checked first (round robin)."""
+
+    @abc.abstractmethod
+    def local_proof(self, entry: dict) -> str | None:
+        """#5506: a lot carrying the issue_ref, or a later lot note citing the URL."""
+
+    @abc.abstractmethod
+    def resolve(self, entry: dict, proof: str, now: float) -> None:
+        """#5506: close a follow-up on its proof."""
+
+    @abc.abstractmethod
+    def mark(self, entries: list, column: str, now: float) -> None:
+        """#5506: stamp ``reminded_at``, ``escalated_at`` or ``checked_at``."""
 
 
 class FingerprintWatch(Domain):

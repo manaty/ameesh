@@ -29,9 +29,16 @@ nouvelle tête gelée demande une nouvelle exception.
 
 Le refus est une `PacketGuardError` dont le message cite §11 bis et dit le
 geste à faire. Il n'écrit rien : aucun commit, aucune étiquette.
+
+#5497 : la règle vise la cible d'intégration d'un dépôt porté par les paquets
+(`main` ameesh, `develop` Nexlink), pas tout `main`. Le dépôt du canon
+(manaty/home), que le bureau fusionne (#2511), en est exclu : il se lit dans
+la configuration (les canons approuvés, `canon_repositories`), jamais en dur
+(§7). Un dépôt inconnu ou illisible reste refusé (le doute refuse).
 """
 from __future__ import annotations
 
+import os
 import re
 
 from . import plan_git
@@ -43,6 +50,8 @@ EXCEPTIONS = ("incident", "unblock")
 #: préfixe de la note-journal d'une exception
 MARKER = "packet-exception"
 _SHA = re.compile(r"^[0-9a-f]{40}$")
+#: `owner/repo` nu : un dépôt GitHub
+_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _DECLARATION = re.compile(
     r"^packet-exception (?P<exception>incident|unblock) "
     r"sha=(?P<sha>[0-9a-f]{40})(?: reason=(?P<reason>.*))?$")
@@ -78,6 +87,63 @@ def is_integration_target(target) -> bool:
     gardes qui ne peuvent pas la résoudre : le doute refuse."""
     name = branch_of(target)
     return not name or plan_git.integration_branch(name)
+
+
+def repository(value) -> str:
+    """#5497 : l'identité comparable d'un dépôt (`github.com/owner/repo`, ou
+    l'URL normalisée d'un transport local), ou "" quand elle est illisible.
+
+    `value` est un `owner/repo`, une URL, ou le chemin d'un clone (son
+    `origin` fait foi)."""
+    from . import canon as canon_mod
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    path = os.path.expanduser(text)
+    if os.path.isabs(path) or os.path.isdir(path):
+        if not os.path.isdir(path):
+            return ""
+        try:
+            url = plan_git._out(path, "remote", "get-url", "origin") or ""
+        except Exception:  # noqa: BLE001 - origin illisible : aucune identité
+            return ""
+        return canon_mod._norm_url(url) if url.strip() else ""
+    if _SLUG.fullmatch(text):
+        return canon_mod._norm_url("github.com/" + text)
+    if "://" in text or "@" in text:
+        return canon_mod._norm_url(text)
+    return ""
+
+
+def canon_repositories(cfg) -> frozenset:
+    """#5497 : les dépôts des canons **approuvés** de la configuration (L42),
+    lus par l'`origin` de leur clone. Un canon non approuvé, un dossier
+    illisible ou une configuration absente n'exemptent rien."""
+    if cfg is None:
+        return frozenset()
+    from . import canon as canon_mod
+    try:
+        entries = canon_mod.configured(cfg)
+    except Exception:  # noqa: BLE001 - configuration illisible : aucun canon
+        return frozenset()
+    found = set()
+    for entry in entries:
+        path = str(getattr(entry, "path", "") or "")
+        if not path or getattr(entry, "untrusted", False):
+            continue
+        ident = repository(os.path.abspath(os.path.expanduser(path)))
+        if ident:
+            found.add(ident)
+    return frozenset(found)
+
+
+def outside_packets(repo, cfg) -> str:
+    """#5497 : l'identité du dépôt quand il n'est pas porté par les paquets
+    (le dépôt du canon, fusionné par le bureau, #2511), sinon "". Un dépôt
+    vide, illisible ou non déclaré est porté par les paquets : le doute
+    refuse, comme avant."""
+    ident = repository(repo)
+    return ident if ident and ident in canon_repositories(cfg) else ""
 
 
 def exception_of(exception: str, reason: str) -> tuple[str, str]:
@@ -186,6 +252,11 @@ def declare(db, lot, exception: str, reason: str, sha: str, *, actor: str = "") 
             "journaled": journaled}
 
 
+def _outside_why(ident: str) -> str:
+    return ("repository %s is a configured canon, merged by the bureau (#2511), "
+            "outside the packets of canon §11 bis" % ident)
+
+
 def _merge_refusal(source: str, target: str) -> str:
     return (
         "direct merge of %s into %s refused: canon §11 bis (manaty/home#107, owner "
@@ -208,13 +279,15 @@ def _ci_refusal(source: str, target: str) -> str:
 
 
 def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: str = "",
-                actor: str = "") -> dict:
+                actor: str = "", repo: str = "", cfg=None) -> dict:
     """Refuse une fusion de lot directe hors paquet, sauf exception déclarée.
 
     Une tête `integration/**` passe (c'est le paquet). Une cible qui n'est pas
     une cible d'intégration passe aussi : un lot empilé sur une autre branche
     de travail ne déplace pas `main`/`develop`. La cible vide est traitée
-    comme une cible d'intégration (le doute refuse). Une exception explicite
+    comme une cible d'intégration (le doute refuse). #5497 : la cible d'un
+    dépôt hors paquets (`repo` est celui du canon, `outside_packets`) passe ;
+    sans `repo` ni `cfg`, le refus reste celui d'avant. Une exception explicite
     est journalisée ici, sur la tête `sha` ; une exception déjà déclarée est
     relue. Rend la déclaration retenue, ou lève `PacketGuardError`."""
     source_name, target_name = branch_of(source), branch_of(target)
@@ -225,6 +298,10 @@ def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: st
     if not is_integration_target(target_name):
         return {"allowed": True, "why": "target %s is not an integration target"
                 % target_name, "exception": "", "journaled": False}
+    outside = outside_packets(repo, cfg)
+    if outside:
+        return {"allowed": True, "why": _outside_why(outside), "exception": "",
+                "journaled": False}
     if exception:
         return {"allowed": True, **declare(db, lot, exception, reason, sha, actor=actor)}
     found = declared(db, lot, sha)
@@ -235,7 +312,7 @@ def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: st
 
 
 def check_ci(db, lot, source, *, mode: str = "lot", sha: str = "",
-             exception: str = "", reason: str = "") -> dict:
+             exception: str = "", reason: str = "", repo: str = "", cfg=None) -> dict:
     """Refuse une demande de CI de lot (`ci-lot`) hors paquet.
 
     Seul `mode == "lot"` est concerné : `--full` est la suite du paquet ou
@@ -243,11 +320,16 @@ def check_ci(db, lot, source, *, mode: str = "lot", sha: str = "",
     motif sont validés ici, sa tête exacte est vérifiée et journalisée après
     le plan, avec la tête que `cmd_ci_run` a retenue (elle peut manquer avant
     le plan : ni gel ni `--sha`, la tête distante est lue par `gel_plan`).
-    Une exception déjà déclarée pour `sha` est relue. Rend la déclaration
-    retenue, ou lève `PacketGuardError`."""
+    Une exception déjà déclarée pour `sha` est relue. #5497 : une demande
+    sur un dépôt hors paquets (le canon, `outside_packets`) passe. Rend la
+    déclaration retenue, ou lève `PacketGuardError`."""
     if (mode or "").strip() != "lot":
         return {"allowed": True, "why": "full suite, not a ci-lot request",
                 "exception": "", "journaled": False}
+    outside = outside_packets(repo, cfg)
+    if outside:
+        return {"allowed": True, "why": _outside_why(outside), "exception": "",
+                "journaled": False}
     if exception:
         # validation seule : la note est écrite par l'appelant avec la tête
         # que le plan vient de retenir (elle peut différer du gel, ou n'être

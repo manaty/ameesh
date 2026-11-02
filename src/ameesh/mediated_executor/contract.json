@@ -4639,6 +4639,7 @@
     "close_candidates",
     "close_others",
     "complete_sync",
+    "fail_sync",
     "flag_default",
     "host_rows",
     "key_for_root",
@@ -5100,9 +5101,14 @@
     "advance",
     "checkpoint",
     "cursor",
+    "local_proof",
     "lock",
+    "mark",
+    "open_entries",
     "remember",
-    "scan"
+    "resolve",
+    "scan",
+    "track"
    ],
    "notify_liveness": [
     "acquire_state",

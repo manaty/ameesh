@@ -12379,7 +12379,11 @@ class Runner:
                     report = (canon_sync.periodic_sync(
                         db, canon, self.host, interval,
                         on_incomplete=lambda why: log_async(
-                            "host gate: canon sync incomplete: %s" % why))
+                            "host gate: canon sync incomplete: %s" % why),
+                        # #5493: a runner without a gate yet may take over
+                        # a completed sync of another signature
+                        unsettled=not getattr(self, "_gate_settled", None)
+                        or not self._gate_settled.is_set())
                               if interval > 0 else canon_sync.sync(db, canon, self.host))
                     if report is None:
                         # Another executor is syncing, or this snapshot differs

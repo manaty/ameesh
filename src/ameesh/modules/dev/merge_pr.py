@@ -789,7 +789,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         try:
             packet_guard.check_merge(database, lot, view.get("headRefName") or "",
                                      target, head, exception=exception, reason=reason,
-                                     actor=actor)
+                                     actor=actor, repo=repo, cfg=cfg)
         except packet_guard.PacketGuardError as exc:
             raise MergePrError(str(exc)) from exc
 
@@ -882,7 +882,12 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                 % (target, tip[:12], head[:12], target))
 
         _check(owner, "checkout", "-q", "--detach", tip)
-        proc = _run(owner, "merge", "--no-ff", "--no-commit", "--quiet", head,
+        # #5499 : `git merge` lit l'identité du committer même en `--no-commit`
+        # (le commit de fusion est écrit juste après) ; sur un guest sans
+        # `user.email` global, la fusion échouait avant d'arriver au commit.
+        proc = _run(owner, "-c", "user.name=%s" % IDENTITY[0],
+                    "-c", "user.email=%s" % IDENTITY[1],
+                    "merge", "--no-ff", "--no-commit", "--quiet", head,
                     timeout=FETCH_TIMEOUT)
         if proc.returncode != 0:
             conflicts = [f for f in resolutions.unmerged(owner)]

@@ -17,15 +17,26 @@ def _account(row):
     return nature[1] if nature[0] == "pause" else row.get("session_account")
 
 
-def blocked(designation, listing, *, project, families, now):
-    """Return indispensable paused families, never infer an unknown author."""
+def blocked(designation, listing, *, project, families, now, pilot="", closed_hosts=()):
+    """Return indispensable paused families, never infer an unknown author.
+
+    The pool is the designation's (`review_designation_activation._candidates`):
+    the project's pilot and agents on closed hosts are never reviewers, so they
+    cannot make a paused family look reachable (N6 of #5424).
+    """
     required = designation.get("required")
     authors = set(designation.get("author_families") or ())
     if (not required or not authors or designation.get("unknown_authors")
             or designation.get("quorum") or not designation.get("shortfall")):
         return []
-    candidates = rd.candidates_from_registry(listing, project=project, families=families)
+    candidates = rd.candidates_from_registry(listing, project=project, families=families,
+                                             closed_hosts=closed_hosts)
     by_name = {row["name"]: row for row in listing}
+    closed = {str(host).strip() for host in closed_hosts or () if str(host).strip()}
+    # Out of the pool, not merely unavailable: a closed-host reviewer is no
+    # budget evidence either, and must not stop the family's pause scan.
+    candidates = [candidate for candidate in candidates if candidate.name != pilot
+                  and str(by_name[candidate.name].get("host") or "").strip() not in closed]
     by_family = {}
     for candidate in candidates:
         if candidate.family and candidate.family not in authors:
@@ -66,9 +77,26 @@ def blocked(designation, listing, *, project, families, now):
     return out
 
 
-def alerts(items, milestones, events, listing, *, families, now):
+def exclusions(cfg, db, projects, listing):
+    """The pilots (by project) and closed hosts `blocked` leaves out.
+
+    Same readers as the designation (`review_designation_activation._notify`,
+    `alert_briefs.claims_closed_hosts`); an unreadable source excludes nobody.
+    """
+    from . import alert_briefs, review_designation_activation as activation
+    pilots = {project: activation._notify(cfg, db, project, listing)
+              for project in sorted(set(projects))}
+    try:
+        closed = alert_briefs.claims_closed_hosts(db)
+    except Exception:  # noqa: BLE001 - no proof a host is closed
+        closed = set()
+    return pilots, closed
+
+
+def alerts(items, milestones, events, listing, *, families, now, pilots=None,
+           closed_hosts=()):
     """One alert per family/episode, across projects and frozen lots."""
-    from . import debit
+    from . import debit, exploitation
     grouped = {}
     ms, ev = {}, {}
     for row in milestones:
@@ -87,12 +115,15 @@ def alerts(items, milestones, events, listing, *, families, now):
                                           agent_families=agent_families)
         if not designation.get("freeze"):
             continue
-        for pause in blocked(designation, listing, project=item.get("app") or "",
-                             families=families, now=now):
+        project = item.get("app") or ""
+        for pause in blocked(designation, listing, project=project,
+                             families=families, now=now,
+                             pilot=(pilots or {}).get(project) or "",
+                             closed_hosts=closed_hosts):
             family = pause["family"]
             alert = grouped.setdefault(family, dict(
-                type="review_family_paused", agent=None, since=None, value=None,
-                threshold=None, family=family,
+                schema=exploitation.ALERT_SCHEMA, type="review_family_paused",
+                agent=None, since=None, value=None, threshold=None, family=family,
                 resume_ts=pause["resume_ts"], pauses=[], held_lots=[]))
             for row in pause["pauses"]:
                 if row not in alert["pauses"]:
