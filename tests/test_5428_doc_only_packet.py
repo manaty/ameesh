@@ -111,7 +111,8 @@ class DocOnlyPacketTest(_Contract):
 
     def test_a_red_check_refuses_the_docs_packet(self):
         with self.assertRaisesRegex(merge_queue.QueueError, "is red .*docs-gate"):
-            self.enter(self.packet(), runs=contexts(**{"lot/docs-gate": "failed"}))
+            self.enter(self.packet(), runs=dict(contexts(**{"lot/docs-gate": "failed"}),
+                                                negative=["lot/docs-gate"]))
 
     def test_a_work_branch_keeps_the_ci(self):
         tip_branch = self.lot_touching("docs")
