@@ -2148,6 +2148,23 @@ def key_of(alert: dict) -> str:
 BRIEF_WINDOW_BUCKET_S = 60.0
 
 
+def _last_brief_ts(entry: dict) -> float:
+    """#5461 : l'heure du dernier courrier d'un brief, initial ou relance.
+
+    La garde contre l'oscillation (`idle_capacity`, `plan_underused`,
+    `operator_pause_*`) garde l'entrée d'une alerte disparue d'une passe
+    pendant `REMIND_AFTER_S`. Mesurée depuis le seul brief initial, elle
+    tombait dès la relance de 6 h : la première oscillation suivante
+    supprimait l'entrée et le retour de l'alerte repartait en brief neuf,
+    16 à 22 min après la relance (02/11, agents-1/2/3)."""
+    sent = float(entry.get("sent_ts") or 0.0)
+    try:
+        reminded = float(entry.get("reminded_ts") or 0.0)
+    except (TypeError, ValueError):
+        reminded = 0.0
+    return max(sent, reminded)
+
+
 def brief_key_of(alert: dict) -> str:
     """Identité d'un brief d'agent : une alerte et une fenêtre (#3236).
 
@@ -3173,20 +3190,20 @@ class Notifier:
                 entry = sent[key]
                 if entry.get("type") == "staging_interrupted" and "staging.sequence" in unreadable:
                     continue
-                if entry.get("type") == "idle_capacity" and now - float(entry["sent_ts"]) \
+                if entry.get("type") == "idle_capacity" and now - _last_brief_ts(entry) \
                         < alert_briefs.REMIND_AFTER_S:
                     # #2602: brief gaps in available capacity are not a fresh
                     # reason to wake the pilots every few minutes.
                     continue
                 if entry.get("type") == "plan_underused" \
-                        and now - float(entry["sent_ts"]) < alert_briefs.REMIND_AFTER_S:
+                        and now - _last_brief_ts(entry) < alert_briefs.REMIND_AFTER_S:
                     # #3236 : la perte projetée d'une jauge oscille autour du
                     # seuil (50 % par défaut) ; l'alerte disparaît d'une passe
                     # puis revient. C'est la même fenêtre, déjà briefée : garder
                     # l'entrée évite un courrier par retour avant la relance.
                     continue
                 if entry.get("type") in ("operator_pause_host", "operator_pause_long") \
-                        and now - float(entry["sent_ts"]) < alert_briefs.REMIND_AFTER_S:
+                        and now - _last_brief_ts(entry) < alert_briefs.REMIND_AFTER_S:
                     # #5203 : le sommeil automatique, levé puis reposé, remet à
                     # zéro la tenue de 15 min de tous ses dormeurs ; l'alerte
                     # de chaque hôte disparaît d'une passe puis revient (et
@@ -3489,6 +3506,9 @@ class Notifier:
                 entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead))
                 if remind_due:
                     entry["reminded"] = True
+                    # #5461 : la garde contre l'oscillation se mesure depuis
+                    # ce dernier envoi, pas depuis le brief initial.
+                    entry["reminded_ts"] = now
         # #3057 : l'état des destinataires vu à cette évaluation, pour que les
         # passes suivantes sachent si quelque chose a changé ; une entrée non
         # évaluée (préparation en échec) garde l'ancien et sera reprise.
