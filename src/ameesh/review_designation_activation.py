@@ -2176,14 +2176,21 @@ def same_head_settled(db, cfg, lot: int, sha: str,
     Rend le gel précédent — sa trace et son identifiant servent au hook — ou
     None. Des noms de la colonne peuvent être hérités d'une AUTRE tête (un gel
     différé interrompu les garde) : seule une marque effective du gel précédent
-    ou une dispense prouvent une désignation acquise.
+    ou une dispense prouvent une désignation acquise. La frise se lit par le
+    registre des modules (L97), jamais par un import de son implémentation.
     """
     lot = int(lot)
     try:
         marks = storage.of(db).work.milestones(lot, None) or ()
     except Exception:  # noqa: BLE001 - frise illisible : gel normal
         return None
-    freeze = plan_git.latest_freeze(marks)
+    from .modules import registry as module_registry
+    dev = module_registry.get("dev")
+    if dev is None:
+        # Profil nu (AMEESH_MODULES=bare) : aucun module, aucune désignation ;
+        # le gel reste sur le chemin normal.
+        return None
+    freeze = dev.latest_freeze(marks)
     if not freeze or not plan_git.same_commit((freeze or {}).get("sha"), sha):
         return None
     if _waiver(item):
