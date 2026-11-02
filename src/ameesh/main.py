@@ -162,6 +162,9 @@
         record --signed : hors runner (bureau/owner), attestation signée par une
         clé owner (#4485), sans PID local ni ameesh sur l'hôte du commit ;
   ameesh receipt verify       approval receipts (spec §8);
+  ameesh refusal emit --reason "…"   #5529 : preuve positive qu'un harnais a
+        refusé le tour avant tout appel fournisseur (ameesh-refusal/1), lue
+        dans $AMEESH_REFUSAL_FILE ; libère alors la réservation du compte ;
   ameesh release open|check|reason <lot>   release perimeter and validation;
   ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
         trois {works} {delivered} sur leur base gelée, version installée et version
@@ -373,6 +376,11 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import version
         print("ameesh %s" % version())
         return 0
+    if command == "refusal":
+        # #5529 : preuve de refus avant tout appel fournisseur. Aucune base,
+        # aucun secret : appelable depuis un harnais ou son wrapper.
+        from . import refusal
+        return refusal.main(rest)
     if command == "turn" and rest[:1] == ["current"]:
         from . import turn_context
         return turn_context.cmd_current(rest[1:])

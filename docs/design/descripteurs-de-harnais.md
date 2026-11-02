@@ -104,6 +104,46 @@ Un seul des trois réglages peut être livré par fichier.
 | `accounts` | comptes multiples (L30, L65) : `{"config_env", "default_home", "session_store", "credentials", "keychain_service", "key_env"}` — `keychain_service` nomme le service du trousseau macOS (Claude Code) |
 | `install` | note déclarative d'installation (la distribution signée est L17) |
 | `resident` | L75, resident mode (decision 0035): see [Resident mode](#resident-mode-l75) |
+| `refusal` | #5529 : contrat de **preuve positive de refus avant tout appel fournisseur**, `{"schema": "ameesh-refusal/1", "exit_code": 86}` ; voir [Preuve de refus](#preuve-de-refus-refusal-5529) |
+
+### Preuve de refus (`refusal`, #5529)
+
+Un tour dont le harnais sort non-zéro sans ligne de flux ni usage ne prouve
+pas l'absence d'appel fournisseur : un wrapper configurable a pu envoyer une
+requête facturée puis échouer en silence. La réservation du compte reste donc
+`kept` (issue #4065, mécanisme 2 ; B cx1 sur #5503).
+
+Le contrat `ameesh-refusal/1` est **opt-in** : le descripteur de la famille
+déclare `ameesh.refusal`. Avant le lancement du tour, l'exécuteur crée un
+squelette privé (0600) dans l'état de l'agent — `schema`, `harness`, `token`
+du tour et `turn_id` — et pose son chemin dans `AMEESH_REFUSAL_FILE` (le jeton
+n'est jamais dans l'environnement : une variable en `*_TOKEN` est filtrée).
+
+Un harnais, ou le wrapper qui le mène, qui refuse le tour **avant** toute
+requête fournisseur écrit la preuve dans ce fichier puis sort avec le code
+réservé :
+
+```sh
+ameesh refusal emit --reason "policy: only mail turns are accepted"
+exit 86
+```
+
+La CLI valide le squelette du tour et remplace le fichier atomiquement (aucune
+base, aucun appel fournisseur). L'exécuteur ne libère la réservation que si
+**toutes** les conditions tiennent : descripteur qualifié (l'une des trois
+familles, son propre flux — `claude-stream-json`, `codex-json`, `dsh-json` —,
+bloc `refusal` valide), sortie propre au code réservé, aucune ligne de flux ni
+usage, tour non interrompu (ni signal, ni bail perdu, ni préemption, ni
+clôture, ni redémarrage), document intact pour ce tour (schéma, harnais, jeton,
+`turn_id`, motif d'une ligne). Il la clôt alors en `released` (0 $ pour la
+journée, ligne de grand livre à 0) ; tout écart la laisse `kept`.
+
+Un descripteur d'hôte qui configure une commande `stream = "text"` n'est
+**pas** qualifié, même s'il déclare `refusal` et imprime un marqueur : la
+preuve d'une commande non qualifiée est ignorée. Les trois descripteurs livrés
+(`claude`, `codex`, `deepseek`) déclarent le contrat ; un wrapper de la
+famille l'implémente quand il sait refuser avant tout appel (c'est le cas du
+document-agent d'IMA, qui refuse un tour sans courrier documentaire).
 
 ### Protocole `acp`
 

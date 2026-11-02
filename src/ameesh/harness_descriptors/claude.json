@@ -46,6 +46,7 @@
     },
     "backup": {"session_files": ["projects/*/{session}.jsonl", "projects/*/{session}"]},
     "resident": {"protocol": "claude-stream-json", "command": ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--replay-user-messages", "--dangerously-skip-permissions"], "new_session": ["--session-id"], "min_version": "2.1.286"},
+    "refusal": {"schema": "ameesh-refusal/1", "exit_code": 86},
     "install": {"note": "binaire `claude` installé par l'hôte ; distribution signée en L17"}
   }
 }

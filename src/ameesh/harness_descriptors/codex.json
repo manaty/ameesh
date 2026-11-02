@@ -43,6 +43,7 @@
     },
     "backup": {"session_files": ["sessions/*/*/*/rollout-*-{session}.jsonl"]},
     "resident": {"protocol": "codex-app-server", "command": ["--dangerously-bypass-hook-trust", "app-server"], "thread": {"approvalPolicy": "never", "sandbox": "danger-full-access"}, "min_version": "0.159.3"},
+    "refusal": {"schema": "ameesh-refusal/1", "exit_code": 86},
     "install": {"note": "binaire `codex` installé par l'hôte ; distribution signée en L17"}
   }
 }
