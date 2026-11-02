@@ -19,7 +19,8 @@ import json
 import os
 from unittest import mock
 
-from ameesh import merge_queue, plan_git, review_designation_activation as act
+from ameesh import merge_queue, plan_git, registry, review_floor
+from ameesh import review_designation_activation as act
 from ameesh import storage, verdict_carry, work
 
 from .test_2487_designation_carry import _Fixture
@@ -173,6 +174,96 @@ class SameHeadTest(_Reviewed):
         self.assertEqual(self.review_mail(), [])
         self.assertEqual(self.designated(), ["rev1", "rev2"])
         self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+
+
+class LiveColumnCoverageTest(_Reviewed):
+    """Un siège retiré par le pilote n'est plus couvert par la marque (#5481)."""
+
+    def _requests_after(self, before: int) -> list[str]:
+        return [str(row["recipient"]) for row in self.db.query(
+                    "SELECT id, recipient, payload FROM agent_mailbox"
+                    " WHERE id > %s ORDER BY id", (before,))
+                if isinstance(row.get("payload"), dict)
+                and row["payload"].get("review_designation")]
+
+    def test_a_removed_seat_disables_the_same_head_shortcut(self):
+        freeze, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        # Le pilote retire le siège codex de la colonne vivante ; le siège ne
+        # revient pas (un autre codex est disponible).
+        work.designate_reviewer(self.cfg, self.db, self.lot, "rev2",
+                                actor="human:smichea", remove=True)
+        self.assertEqual(self.designated(), ["rev1"])
+        registry.upsert(self.db, "rev4", harness="codex", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
+                        " WHERE name = 'rev4'")
+        self.db.execute("UPDATE agent_registry SET status = 'stopped'"
+                        " WHERE name = 'rev2'")
+        before = int(self.db.query(
+            "SELECT coalesce(max(id), 0) AS id FROM agent_mailbox")[0]["id"])
+        # La marque nomme encore rev2, la colonne vivante non : le raccourci
+        # « même tête » figerait une désignation incomplète.
+        self.assertFalse(act.acquired_on_head(self.db, self.cfg, self.lot, freeze))
+        second: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=self.repo.reviewed,
+                       actor="author", outcome=second, repo=self.repo.root,
+                       defer_designation=True)
+        self.assertEqual(second.get("state"), "deferred", second)
+        self.assertTrue(self.notes(act.DEFERRED_PREFIX))
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            report = act.finish_deferred(self.cfg, self.db)
+        mine = [row for row in report["results"] if row["lot"] == self.lot]
+        self.assertEqual(len(mine), 1, report)
+        self.assertEqual(sorted(self.designated()), ["rev1", "rev4"])
+        # rev1 nommait déjà cette tête ; le siège codex remplacé reçoit sa
+        # demande une seule fois, puis l'issue finale ne la rejoue pas.
+        self.assertEqual(self._requests_after(before), ["rev4"])
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            again = act.finish_deferred(self.cfg, self.db)
+        self.assertEqual([row for row in again["results"]
+                          if row["lot"] == self.lot], [])
+        self.assertEqual(self._requests_after(before), ["rev4"])
+
+
+class CarriedFloorCoverageTest(_Reviewed):
+    """Une marque carried complète reste acquise au plancher (#5481, B2)."""
+
+    def _carried_head(self) -> str:
+        self.reviewed_freeze()
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+        return frozen
+
+    def test_a_complete_carried_mark_stays_acquired_at_floor_two(self):
+        frozen = self._carried_head()
+        # Le plancher courant exige deux familles ; la marque carried n'écrit
+        # ni `required` ni les familles des acteurs reportés.
+        review_floor.set_floor(self.cfg, self.db, self.lot, 2,
+                               reason="deux familles", actor="human:smichea",
+                               complete=False)
+        freeze = self.freeze_latest()
+        mark = act._effective_mark(self.db, self.lot, int(freeze["id"]))
+        self.assertEqual(mark[1], "carried")
+        self.assertNotIn("required", mark[2])
+        self.assertTrue(act.acquired_on_head(self.db, self.cfg, self.lot, freeze))
+        self.db.execute("DELETE FROM agent_mailbox")
+        # Deux regels identiques du même SHA : le premier écrit la marque
+        # carried, le suivant doit rester acquis sans nouvelle désignation.
+        for _ in range(2):
+            outcome: dict = {}
+            work.milestone(self.db, self.lot, "frozen", sha=frozen,
+                           actor="author", outcome=outcome, repo=self.repo.root,
+                           defer_designation=True)
+            self.assertEqual(outcome.get("state"), "carried", outcome)
+            self.assertEqual(self.review_mail(), [])
+            self.assertFalse(self.notes(act.DEFERRED_PREFIX))
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
 
 
 class SameHeadWithoutSeatsTest(_Fixture):

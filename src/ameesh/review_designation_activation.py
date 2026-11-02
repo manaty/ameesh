@@ -2090,8 +2090,21 @@ def acquired_on_head(db, cfg, lot: int, freeze: Mapping) -> bool:
     Une marque `waiting` (aucun candidat, ou sièges partiels) n'est pas une
     désignation acquise : le retour de capacité doit pouvoir la compléter.
     Une marque `designated` ou `carried` ne compte que si son compte et ses
-    sièges couvrent le plancher d'avis courant. Sert au raccourci « même
-    tête » : des sièges hérités ou une attente ne le justifient pas."""
+    sièges **vivants** couvrent le plancher d'avis courant. Sert au raccourci
+    « même tête » : des sièges hérités, une attente ou un siège que le pilote
+    a retiré de la colonne ne le justifient pas.
+
+    La colonne `reviewers` est lue comme `_mark_covers(..., column=live)` et
+    `_previous_designees` la lisent : un siège retiré n'est plus désigné même
+    quand la marque le nomme encore (#3685). Une colonne illisible ne retire
+    aucun nom (la marque seule fait foi), comme ailleurs.
+
+    Une marque `carried` ne sérialise ni `required` ni la famille des acteurs
+    reportés (`carried_mark_note`) : ses sièges sont son compte
+    (`_carried_shape`), et `_mark_covers` la refuserait toujours au plancher.
+    Sa lecture garde donc le plancher et la colonne ; le compte des familles
+    n'est vérifié que s'il est complet, sinon il ne prouverait rien et toute
+    marque carried resterait non acquise (B2)."""
     effective = _effective_mark(db, int(lot), int((freeze or {}).get("id") or 0),
                                 since_ts=float((freeze or {}).get("at_ts") or 0.0))
     if effective is None:
@@ -2103,14 +2116,29 @@ def acquired_on_head(db, cfg, lot: int, freeze: Mapping) -> bool:
         floor = _floor_of(db, int(lot), cfg)
     except Exception:  # noqa: BLE001 - plancher illisible : pas de raccourci
         return False
-    if floor <= 0:
-        return True
-    rows = payload.get("reviewers") or ()
     try:
-        required = int(payload.get("required") or 0)
-    except (TypeError, ValueError):
-        required = 0
-    return required >= floor and len(rows) >= floor
+        item = work.get(db, int(lot))
+    except Exception:  # noqa: BLE001 - colonne illisible : la marque seule
+        item = None
+    live = _live_column(item)
+    if effective[1] == "carried":
+        rows = _carried_shape(payload).get("reviewers") or ()
+        if live is not None:
+            kept = [row for row in rows
+                    if str((row or {}).get("name") or "").strip() in live]
+            if len(kept) < len(rows):
+                # #5481 (B1) : un siège retiré n'est plus couvert ; la reprise
+                # doit compléter la désignation vivante, pas la figer.
+                return False
+        families = {str((row or {}).get("family") or "").strip().lower()
+                    for row in rows}
+        if floor > 0 and "" not in families and len(families) < floor:
+            # Les acteurs reportés n'ont pas de famille écrite ; le contrôle
+            # ne s'applique que si la marque les porte toutes, sinon il
+            # refuserait toute marque carried (B2).
+            return False
+        return len(rows) >= floor
+    return _mark_covers(payload, floor, column=live)
 
 
 def _removed_seats(db, lot: int, freeze: Mapping, live) -> set:
