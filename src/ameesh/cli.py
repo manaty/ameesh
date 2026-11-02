@@ -2459,6 +2459,11 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         # désignation au gel (« no repository holds the frozen head »).
         for line in hostcheck.packet_watch_lines(cfg):
             print(line)
+        # #5537 : la minuterie du tic paquet-horaire est posée sur chaque
+        # candidat du bail mesh-design ; sans projet résolu (radar.projects ou
+        # packet_watch.projects.<p>.repo), la relève composerait sans liste.
+        for line in hostcheck.paquet_horaire_lines(cfg):
+            print(line)
         # #3264 A : la veille des versions est un passage quotidien ; sans
         # minuterie active, aucun lot d'évaluation n'est ouvert.
         for line in hostcheck.veille_lines(cfg):

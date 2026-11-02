@@ -616,7 +616,12 @@ désactiver la minuterie arrête aussi la fusion automatique des paquets — le
 geste du 24/10 14:31Z sur agents-2. `ameesh doctor` signale un hôte
 `packet_watch` dont `ameesh-release.timer` n'est pas actif, ainsi qu'un dépôt
 `radar.projects.<projet>.repo` auquel il manque une tête gelée (checkout non
-fetché, désignation au gel impossible).
+fetché, désignation au gel impossible). Le tic du composeur a sa propre
+minuterie, `ameesh-paquet-horaire.timer`, posée sur chaque candidat du bail :
+`ameesh doctor` avertit aussi quand elle est active sans projet résolu
+(`radar.projects.<p>` ou `packet_watch.projects.<p>.repo`), car la relève
+composerait alors sans projet déclaré (la liste calculée du composeur ne s'y
+résout pas, #5537).
 
 **Ce que fait un tick** : il prend `B`, la tête de la cible si la CI du
 commit exact est verte, sinon le plus récent commit vert de la chaîne
