@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 
-from ameesh import storage, work
+from ameesh import provider_credits, storage, work
 from ameesh.storage.postgres import menage as menage_pg
 
 from .support import PgTestCase
@@ -221,5 +221,63 @@ class BalancesWindowTest(PgTestCase):
         self.assertEqual(summary["spent"], 30)
         # le sommet repart de la dernière hausse (120), pas du sommet initial
         self.assertEqual(summary["peak"], 120)
-        self.assertEqual(summary["first_ts"], summary["first_ts"])
         self.assertGreater(summary["last_ts"], summary["first_ts"])
+
+    def test_the_last_reading_before_the_window_keeps_the_same_peak_and_spend(self):
+        # La copie de #5411 datait de 40 jours : le dernier relevé antérieur à
+        # la fenêtre fait partie de la série que _peak/balance_rate lisaient
+        # (200 -> 100 -> 80 -> 120 -> 110). Sans lui, la dépense tombait à 30
+        # et l'étendue à 19 jours.
+        for seconds_ago, total in ((40 * 86400, 200), (20 * 86400, 100),
+                                   (10 * 86400, 80), (5 * 86400, 120),
+                                   (86400, 110)):
+            self._reading("p", "USD", total, seconds_ago)
+        summary = next(row for row in storage.of(self.db).operations.balance_series(
+            provider="p", account=None, since_s=30 * 86400.0)
+            if row["currency"] == "USD")
+        self.assertEqual(summary["readings"], 5)
+        self.assertEqual(summary["total"], 110)
+        self.assertEqual(summary["spent"], 130)       # 100 + 20 + 10
+        self.assertEqual(summary["peak"], 120)        # sommet du dernier segment
+        self.assertAlmostEqual(summary["last_ts"] - summary["first_ts"],
+                               39 * 86400, delta=5)
+
+    def test_a_reading_older_than_the_window_still_gives_a_verdict(self):
+        # Un compte plus relevé depuis plus de 30 jours gardait son verdict :
+        # le dernier relevé antérieur reste dans la série.
+        self.db.execute("DELETE FROM provider_account_credits")
+        provider_credits.declare(self.db, "deepseek", None, 100.0,
+                                 actor="human:test")
+        self._reading("deepseek", "USD", 5, 40 * 86400)
+        changed = provider_credits.assess(self.db, harness="deepseek", account="")
+        self.assertTrue(changed, "no verdict on a 40-day-old reading")
+        self.assertEqual(changed[0]["state"], provider_credits.LOW)
+
+    def test_several_currencies_are_summarized_apart(self):
+        self._reading("p", "USD", 10, 7200)
+        self._reading("p", "USD", 8, 3600)
+        self._reading("p", "EUR", 20, 7200)
+        rows = storage.of(self.db).operations.balance_series(
+            provider="p", account=None, since_s=86400.0)
+        by_currency = {row["currency"]: row for row in rows}
+        self.assertEqual(set(by_currency), {"USD", "EUR"})
+        self.assertEqual(by_currency["USD"]["spent"], 2)
+        self.assertEqual(by_currency["EUR"]["spent"], 0)
+
+    def test_a_lowercase_currency_merges_with_its_uppercase(self):
+        self._reading("p", "usd", 10, 7200)
+        self._reading("p", "USD", 9, 3600)
+        rows = storage.of(self.db).operations.balance_series(
+            provider="p", account=None, since_s=86400.0)
+        self.assertEqual([row["currency"] for row in rows], ["USD"])
+        self.assertEqual(rows[0]["readings"], 2)
+        self.assertEqual(rows[0]["spent"], 1)
+
+    def test_empty_and_null_account_are_the_same_series(self):
+        self._reading("p", "USD", 10, 7200, account=None)
+        self._reading("p", "USD", 9, 3600, account="")
+        for account in (None, ""):
+            rows = storage.of(self.db).operations.balance_series(
+                provider="p", account=account, since_s=86400.0)
+            self.assertEqual(len(rows), 1, account)
+            self.assertEqual(rows[0]["readings"], 2, account)

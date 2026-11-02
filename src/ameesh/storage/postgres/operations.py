@@ -900,18 +900,36 @@ class Operations(interface.Operations):
         et 111 000 s cumulées depuis le 27/10.
 
         `account` vide et NULL désignent la même série (le compte par défaut
-        du fournisseur), comme `(row["account"] or "")` dans `_history`."""
+        du fournisseur), comme `(row["account"] or "")` dans `_history`.
+
+        La série comprend le DERNIER relevé antérieur à la fenêtre, comme
+        `balances()` : sans lui, le pic et la dépense perdaient un intervalle
+        et un compte plus relevé depuis plus de 30 jours ne rendait plus de
+        verdict. La fenêtre et cet antérieur sont disjoints (`>=` / `<`)."""
         return self.db.query(
             """
-            WITH s AS (
-                SELECT upper(currency) AS currency, total, available, observed_at, id,
-                       lag(total) OVER w AS previous,
-                       row_number() OVER w AS position
-                  FROM provider_balances
+            WITH cutoff AS (
+                SELECT now() - make_interval(secs => %s) AS at
+            ), windowed AS (
+                SELECT upper(currency) AS currency, total, available, observed_at, id
+                  FROM provider_balances, cutoff
                  WHERE provider = %s
                    AND coalesce(account, '') = %s
-                   AND observed_at >= now() - make_interval(secs => %s)
-                WINDOW w AS (PARTITION BY upper(currency) ORDER BY observed_at, id)
+                   AND observed_at >= cutoff.at
+            ), before AS (
+                SELECT DISTINCT ON (upper(currency))
+                       upper(currency) AS currency, total, available, observed_at, id
+                  FROM provider_balances, cutoff
+                 WHERE provider = %s
+                   AND coalesce(account, '') = %s
+                   AND observed_at < cutoff.at
+                 ORDER BY upper(currency), observed_at DESC, id DESC
+            ), s AS (
+                SELECT currency, total, available, observed_at, id,
+                       lag(total) OVER w AS previous,
+                       row_number() OVER w AS position
+                  FROM (SELECT * FROM windowed UNION ALL SELECT * FROM before) u
+                WINDOW w AS (PARTITION BY currency ORDER BY observed_at, id)
             ), grouped AS (
                 SELECT currency, count(*) AS readings,
                        min(observed_at) AS first_at, max(observed_at) AS last_at,
@@ -936,5 +954,5 @@ class Operations(interface.Operations):
                      AND s.position >= coalesce(g.rise, 1)) peak
              ORDER BY g.currency
             """,
-            (provider, account or "", float(since_s)),
+            (float(since_s), provider, account or "", provider, account or ""),
         )
