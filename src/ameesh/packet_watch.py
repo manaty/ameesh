@@ -313,10 +313,12 @@ def body(watch: ProjectWatch, at: dict, payload: dict, *, now: float | None = No
               "après %s, sans réponse du composeur, et après vérification en base "
               "qu'aucun lot de composition n'est ouvert ; le pilote désigne alors "
               "un seul remplaçant." % fallback_at,
-              "Geste pour %s : composer integration/paquet-h-%s maintenant depuis "
+              "Geste pour %s : composer le paquet maintenant depuis "
                   "`scripts/paquet-candidats.py` (canon §11 bis, §12), écarts motivés "
-                  "au manifeste. Une seule alerte par créneau (#2601)."
-              % (watch.notify[0], at["stamp"])]
+                  "au manifeste. Reprendre le nom de porteur attribué par le composeur "
+                  "dans le journal et le manifeste ; le créneau ne donne pas son nom. "
+                  "Une seule alerte par créneau (#2601)."
+              % watch.notify[0]]
     return "\n".join(lines)
 
 
