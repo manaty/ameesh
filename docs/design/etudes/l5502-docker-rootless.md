@@ -176,7 +176,7 @@ de noms utilisateur. Délégation cgroup de `user@1001.service` : `cpu memory pi
   multiplie l'espace disque ; `dockerd-rootless.sh` et
   `dockerd-rootless-setuptool.sh`, qui ne sont pas fournis par le paquet
   `docker.io` d'Ubuntu, posés dans `/usr/local/bin` depuis
-  `moby/moby@v29.1.3:contrib/` (même version que le démon, empreinte
+  `moby/moby@docker-v29.1.3:contrib/` (même version que le démon, empreinte
   sha256 consignée). Facultatif : `docker-buildx` (sinon `buildx du`
   signale `build_cache_unsupported`, sans effet).
 - Ensuite, sans root, sous ameesh :
@@ -220,14 +220,14 @@ l'étape 6, **toute commande `docker` du plan porte `DOCKER_HOST=$RF` ou
 
 | # | Geste | Qui | Preuve |
 |---|---|---|---|
-| 0 | **Essai de confirmation sur AG3**, après les avis et après la relance du staging du soir (pilote, 14:33Z). Prérequis §3.1 (bureau), puis installation `dockerd-rootless-setuptool.sh install --force --skip-iptables` (démon rootful conservé) avec `DOCKER_CONFIG` jetable, `data-root` sous `$TMPDIR`, unité `docker.service` utilisateur. Même grille qu'au §2, toutes les commandes sous `DOCKER_HOST=$RL`. **Nettoyage** : `systemctl --user disable --now docker`, `dockerd-rootless-setuptool.sh uninstall` (même `DOCKER_CONFIG`), retrait de l'unité, du `DOCKER_CONFIG` jetable et du `data-root` (`rootlesskit rm -rf`) | bureau (root, prérequis), puis mty-amh-impl-13 | grille verte consignée sur le lot ; après nettoyage : `docker context ls` = `default *` seul, `docker info` non qualifié = rootful, `systemctl --user status docker` absent, aucun processus `rootlesskit`/`dockerd` d'ameesh |
+| 0 | **Essai de confirmation sur AG3**, après les avis et après la relance du staging du soir (pilote, 14:33Z). Prérequis §3.1 (bureau), puis installation `dockerd-rootless-setuptool.sh install --force --skip-iptables` (démon rootful conservé) avec `DOCKER_CONFIG` jetable, `data-root` sous `$TMPDIR`, unité `docker.service` utilisateur. Même grille qu'au §2, toutes les commandes sous `DOCKER_HOST=$RL`. **Nettoyage** : `systemctl --user disable --now docker`, `dockerd-rootless-setuptool.sh uninstall` (même `DOCKER_CONFIG`), retrait de l'unité, du `DOCKER_CONFIG` jetable, du `~/.config/docker/daemon.json` (qui porte le `data-root` sous `$TMPDIR`) et du `data-root` (`rootlesskit rm -rf`) | bureau (root, prérequis), puis mty-amh-impl-13 | grille verte consignée sur le lot ; après nettoyage : `docker context ls` = `default *` seul, `docker info` non qualifié = rootful, `systemctl --user status docker` absent, `~/.config/docker/daemon.json` absent, aucun processus `rootlesskit`/`dockerd` d'ameesh |
 | 1 | **Drainer l'hôte** et le garder drainé jusqu'à l'étape 9 : plus de nouveau tour, tours en cours finis ou rendus (§4 du processus) | pilote / bureau | aucun tour actif (`ameesh hosts`) |
-| 2 | **Marge disque** : `df -h /` et `DOCKER_HOST=$RF docker system df`. Seuil : espace libre ≥ taille des images à recharger (étape 4) + taille du volume `ameesh-pg-data` + 10 GiB. Sinon, purge d'abord des images rootful inutiles (tout sauf `postgres:17`) et des conteneurs de test arrêtés, par le bureau. Repère : AG2 à 14:40Z, 19,4 GiB libres sur 135 G, images rootful 13,74 GB, volumes 3,87 GB (impl-08) | agent (mesure), bureau (purge) | sortie de `df` et `system df` collée sur le lot |
+| 2 | **Marge disque** : `df -h /` et `DOCKER_HOST=$RF docker system df`. Seuil : espace libre ≥ taille des images à recharger (étape 5) + taille du volume `ameesh-pg-data` + 10 GiB. Sinon, purge d'abord des images rootful inutiles (tout sauf `postgres:17`) et des conteneurs de test arrêtés, par le bureau. Repère : AG2 à 14:40Z, 19,4 GiB libres sur 135 G, images rootful 13,74 GB, volumes 3,87 GB (impl-08) | agent (mesure), bureau (purge) | sortie de `df` et `system df` collée sur le lot |
 | 3 | Prérequis §3.1 ; vérifier `newuidmap`/`newgidmap` setuid, `slirp4netns`, `fuse-overlayfs`, `/usr/bin/docker-init`, `ameesh` dans `/etc/subuid`/`/etc/subgid` (65536), linger, profil `rootlesskit` chargé (`aa-status`) | bureau (root) | sortie des commandes |
-| 4 | Sous ameesh : `DOCKER_CONFIG=$(mktemp -d) dockerd-rootless-setuptool.sh install --force --skip-iptables` (`--force` : démon rootful conservé), `~/.config/docker/daemon.json`, `systemctl --user enable --now docker` | agent | `DOCKER_HOST=$RL docker info` : `rootless` dans `SecurityOptions`, pilote de stockage `overlay2` (pas `vfs`) ; **`docker context ls` inchangé (`default *`) et `docker info` non qualifié = rootful** |
+| 4 | Sous ameesh : `DOCKER_CONFIG=$(mktemp -d) dockerd-rootless-setuptool.sh install --force --skip-iptables` (`--force` : démon rootful conservé), `~/.config/docker/daemon.json`, `systemctl --user enable --now docker` | agent | `DOCKER_HOST=$RL docker info` : `rootless` dans `SecurityOptions`, pilote de stockage `overlay2` ou `fuse-overlayfs` (pas `vfs`) ; **`docker context ls` inchangé (`default *`) et `docker info` non qualifié = rootful** |
 | 5 | Images utiles : `DOCKER_HOST=$RF docker save postgres:17 … \| DOCKER_HOST=$RL docker load`, plus les images d'un lot en cours ; le reste est reconstruit à la demande | agent | `DOCKER_HOST=$RL docker images` |
 | 6 | Migrer `ameesh-pg-data` : `DOCKER_HOST=$RF docker stop ameesh-pg`, copie du volume par `tar` en flux d'un conteneur `$RF` vers un conteneur `$RL` (uid numériques préservés, PG 17 → 17), puis `DOCKER_HOST=$RL scripts/pg-up.sh` avec le même nom, le même port et le même mot de passe | agent (encore membre du groupe à ce moment) | `psql -p 55432` : nombre de bases et de lignes de `schema_migrations` identique avant/après |
-| 7 | `~/.config/environment.d/50-docker.conf` : `DOCKER_HOST=unix:///run/user/1001/docker.sock` (chemin littéral : uid d'ameesh sur l'hôte, vérifié par `id -u`). Couvre toutes les unités utilisateur, dont `ameesh-runner-agent@`, `ameesh-serve` et les minuteries ; aussi dans `~/.config/ameesh/env` | agent | `systemctl --user show-environment` |
+| 7 | `~/.config/environment.d/50-docker.conf` : `DOCKER_HOST=unix:///run/user/1001/docker.sock` (chemin littéral : uid d'ameesh sur l'hôte, vérifié par `id -u`). Couvre toutes les unités utilisateur, dont `ameesh-runner-agent@`, `ameesh-serve` et les minuteries ; aussi dans `~/.config/ameesh/env` | agent | `systemctl --user daemon-reload`, puis `systemctl --user show-environment` |
 | 8 | `gpasswd -d ameesh docker` puis `systemctl restart user@1001.service` | bureau (root) | voir preuve finale |
 | 9 | Relancer les runners, lever le drainage ; un tour réel de bout en bout (`scripts/test.sh` SQL ciblé, `ameesh menage`, `ameesh doctor`) | agent / pilote | tour réglé sans « container engine not answering » |
 | 10 | Ancien `ameesh-pg` rootful et conteneurs de test : arrêtés ; images rootful purgées sauf `postgres:17` ; **volume rootful et `postgres:17` gardés 7 jours** pour le retour arrière, puis supprimés | bureau (root) | `docker ps -a`, `docker system df` (root) |
@@ -237,12 +237,12 @@ l'étape 6, **toute commande `docker` du plan porte `DOCKER_HOST=$RF` ou
 - `sudo -l -U ameesh` vide (« not allowed ») ;
 - aucun processus d'uid 1001 avec 112 dans `Groups:` de `/proc/<pid>/status` ;
 - sous ameesh : `test -w /var/run/docker.sock` faux ;
-  `docker run -v /etc/shadow:/x:ro … cat /x` → `Permission denied` ;
+  `DOCKER_HOST=$RL docker run -v /etc/shadow:/x:ro … cat /x` → `Permission denied` ;
 - `docker info` (via `DOCKER_HOST`) : `rootless`.
 
 **Retour arrière** (par hôte, 10 min) : `usermod -aG docker ameesh` puis
 redémarrage de `user@1001` (bureau) ; retrait de `50-docker.conf` et de la
-ligne `DOCKER_HOST` ; `systemctl --user disable --now docker` (rootless) ; `docker start ameesh-pg` (rootful, volume gardé).
+ligne `DOCKER_HOST` ; `systemctl --user disable --now docker` (rootless) ; `DOCKER_HOST=$RF docker start ameesh-pg` (rootful, volume gardé ; sous ameesh, un `DOCKER_HOST=$RL` encore exporté viserait le démon rootless arrêté).
 Les écritures de la base de test faites depuis la bascule sont perdues, sauf
 copie inverse par `tar` comme à l'étape 6. Cette base sert aux tests et n'a pas de
 valeur propre. La pose L2 reste bloquée tant que le retour arrière est actif.
