@@ -135,6 +135,10 @@ class NonAdditiveTest(unittest.TestCase):
             # #5517 : un commentaire de ligne ne cache pas une contrainte
             ("alter table t add column d text -- c\n, add unique (c);", "add unique"),
             ("alter table t add unique -- c\n (c);", "add unique"),
+            # #5517 (N de relecture) : PostgreSQL finit le commentaire au CR seul
+            ("alter table t add column d text -- c\r, add unique (c);", "add unique"),
+            ("-- c\r revoke insert on t from app;", "revoke on t"),
+            ("-- c\r drop table t;", "drop table"),
             # B docs-01 : un `;` dans une chaîne ne termine pas l'instruction
             ("alter table t add column d text default ';', add unique (c);", "add unique"),
             ("alter table t add column d text default e';', add constraint k unique (c);",

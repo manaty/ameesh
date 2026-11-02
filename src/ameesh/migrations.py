@@ -539,8 +539,9 @@ def non_additive(migration: Migration) -> list[str]:
     reasons = []
     if _MARKER.search(migration.sql):
         reasons.append("marked non-additive")
-    # commentaires retirés : une explication qui cite « drop » ne compte pas
-    text = re.sub(r"--[^\n]*", " ", migration.sql)
+    # commentaires retirés : une explication qui cite « drop » ne compte pas ;
+    # PostgreSQL finit un commentaire de ligne au LF comme au CR seul
+    text = re.sub(r"--[^\n\r]*", " ", migration.sql)
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
     text = re.sub(r"\s+", " ", text.lower())
     for pattern, label in _NON_ADDITIVE:
@@ -566,7 +567,8 @@ def _lex(sql: str) -> tuple[list[str], str, bool]:
     l'inverse. Un identifiant cité devient un jeton neutre : son contenu n'est
     pas du code et sa casse ne survit pas aux minuscules. La lecture n'est pas
     sûre si un commentaire bloc coupe une instruction ou si une fin manque ; un
-    commentaire de ligne est sans effet (il finit au saut de ligne)."""
+    commentaire de ligne est sans effet (il finit au LF ou au CR seul, comme
+    PostgreSQL)."""
     strings, code, at, size, sure = [], [], 0, len(sql), True
     while at < size:
         two = sql[at:at + 2]
@@ -575,6 +577,9 @@ def _lex(sql: str) -> tuple[list[str], str, bool]:
             sure = False
         if two == "--":
             end = sql.find("\n", at)
+            cr = sql.find("\r", at)
+            if cr >= 0 and (end < 0 or cr < end):
+                end = cr
             at = size if end < 0 else end
         elif two == "/*":
             depth, at = 1, at + 2
