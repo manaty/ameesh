@@ -91,7 +91,9 @@ class PeriodicSyncTest(PgTestCase):
                         "WHERE host='host' AND canon=''")
         self.assertTrue(store.claim_sync("host", "", "replacement", 300))
         store.complete_sync("host", "", "first", "late-completion")
-        self.assertIsNone(store.shared_sync("host", ""))
+        # #5493: the pending replacement keeps the last completed result
+        # readable; the late completion of the old claim never replaces it.
+        self.assertEqual(store.shared_sync("host", "")["sync_signature"], "sig")
 
     def test_concurrent_claims_have_exactly_one_winner(self):
         barrier = threading.Barrier(4, timeout=10)

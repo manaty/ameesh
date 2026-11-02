@@ -1541,8 +1541,14 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     """#3963: one complete sync per host/canon/interval, without a long lock.
 
     Other executors reuse only a completed result for the same immutable
-    sources and trust configuration. Pending, failed or different snapshots
-    never settle the host gate. Explicit CLI sync remains unconditional.
+    sources and trust configuration. Failed or different snapshots never
+    settle the host gate. Explicit CLI sync remains unconditional.
+
+    #5493: a real sync takes minutes; while a newer claim is pending, the
+    last completed result of the same signature stays reusable (the pending
+    sync writes a non-ok status first, so it stays fail closed). A claimed
+    sync that raises withdraws that result and releases its claim: the next
+    pass retries instead of waiting out the interval.
     """
     if interval_s <= 0 or canon.untrusted or not canon.readable or not canon.sources:
         return sync(db, canon, host)
@@ -1560,7 +1566,7 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
         shared = store.shared_sync(host, key)
         if shared is None or shared["sync_signature"] != signature:
             if on_incomplete is not None:
-                reason = ("shared sync pending or failed (no completed token)"
+                reason = ("no completed shared sync (never completed or last one failed)"
                           if shared is None else
                           "snapshot mismatch: local signature %s, shared signature %s"
                           % (signature, shared["sync_signature"]))
@@ -1573,7 +1579,14 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
             return None
         return SyncReport(host, str(canon.root), False, [], [],
                           status=shared["status"], diagnostic=shared["diagnostic"], shared=True)
-    report = sync(db, canon, host)
+    try:
+        report = sync(db, canon, host)
+    except Exception:
+        try:
+            store.fail_sync(host, key, token)
+        except Exception:  # the claim then expires after the interval
+            pass
+        raise
     store.complete_sync(host, key, token, signature)
     return report
 
