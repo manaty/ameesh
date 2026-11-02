@@ -87,6 +87,22 @@ class PathGuardTest(_Root):
         os.symlink(self.file("outside/tool", 0o777), os.path.join(clone, "tool"))
         self.assertIn("tool writable", executor.tree_problem(clone))
 
+    def test_tree_descends_into_a_linked_folder(self):
+        # #5500 B1: a link to a folder is checked down its whole target tree.
+        clone = os.path.join(self.root, "clone")
+        os.makedirs(clone, mode=0o700)
+        self.file("outside/lib/hook.sh", 0o700)
+        os.symlink(os.path.join(self.root, "outside"), os.path.join(clone, "vendor"))
+        self.assertIsNone(executor.tree_problem(clone))
+        os.chmod(os.path.join(self.root, "outside/lib/hook.sh"), 0o770)
+        self.assertIn("hook.sh writable", executor.tree_problem(clone))
+
+    def test_tree_link_cycle_ends(self):
+        clone = os.path.join(self.root, "clone")
+        os.makedirs(os.path.join(clone, "sub"), mode=0o700)
+        os.symlink(clone, os.path.join(clone, "sub", "back"))
+        self.assertIsNone(executor.tree_problem(clone))
+
 
 class ActivationTest(_Root):
     def setUp(self):
@@ -137,6 +153,14 @@ class ActivationTest(_Root):
         self.env["PATH"] = "bin:" + self.bin
         self.assertIn("relative entry",
                       executor.activation_problem(self.options, self.env))
+
+    def test_empty_path_entry_is_refused(self):
+        # An empty PATH entry resolves programs in the current folder.
+        for path in (":" + self.bin, self.bin + ":", self.bin + "::/usr/bin"):
+            with self.subTest(path=path):
+                self.env["PATH"] = path
+                self.assertIn("empty entry",
+                              executor.activation_problem(self.options, self.env))
 
     def test_startup_refusal_is_the_first_answer(self):
         with mock.patch.object(executor, "startup_problem", return_value="code: x"):

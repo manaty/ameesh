@@ -142,11 +142,14 @@ def path_problem(path: str, *, missing_ok: bool = False) -> str | None:
     return None
 
 
-def tree_problem(root: str) -> str | None:
-    """`path_problem` for root, then every entry below it, links included."""
+def tree_problem(root: str, _visited: set | None = None) -> str | None:
+    """`path_problem` for root, then every entry below it, links included:
+    a link to a folder has its whole target tree checked too."""
     problem = path_problem(root)
     if problem:
         return problem
+    visited = set() if _visited is None else _visited
+    visited.add(os.path.realpath(root))
     owners = _owners()
     targets = set()
 
@@ -166,8 +169,13 @@ def tree_problem(root: str) -> str | None:
         return "%s unreadable (%s)" % (getattr(exc, "filename", None) or root,
                                        exc.strerror or exc)
     for target in sorted(targets):
-        # A dangling link in a source tree runs nothing; its parent is kept.
-        problem = path_problem(target, missing_ok=True)
+        if os.path.isdir(target):
+            if target in visited:
+                continue
+            problem = tree_problem(target, visited)
+        else:
+            # A dangling link in a source tree runs nothing; its parent is kept.
+            problem = path_problem(target, missing_ok=True)
         if problem:
             return problem
     return None
@@ -223,7 +231,9 @@ def activation_problem(options: dict, env: dict) -> str | None:
     problem = path_problem(options["bascule_env"])
     if problem:
         return "BASCULE_ENV: " + problem
-    for folder in filter(None, env.get("PATH", "").split(os.pathsep)):
+    for folder in env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []:
+        if not folder:
+            return "PATH: empty entry (the current folder)"
         if not os.path.isabs(folder):
             return "PATH: relative entry %s" % folder
         problem = path_problem(folder, missing_ok=True)
