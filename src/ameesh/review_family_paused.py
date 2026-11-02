@@ -9,6 +9,14 @@ from __future__ import annotations
 from . import accounts, budget, review_designation as rd, work_lifecycle as lifecycle
 
 
+def _account(row):
+    reason = str(row.get("status_text") or "")[len(budget.PAUSE_PREFIX):].strip()
+    if reason.lower().startswith(budget.CRITICAL_MARK.lower()):
+        reason = reason[len(budget.CRITICAL_MARK):].strip()
+    nature = accounts.pause_nature(reason).split("|")
+    return nature[1] if nature[0] == "pause" else row.get("session_account")
+
+
 def blocked(designation, listing, *, project, families, now):
     """Return indispensable paused families, never infer an unknown author."""
     required = designation.get("required")
@@ -46,11 +54,7 @@ def blocked(designation, listing, *, project, families, now):
             deadline = accounts.pause_deadline(text)
             if deadline is not None and deadline <= now:
                 break
-            reason = text[len(budget.PAUSE_PREFIX):].strip()
-            if reason.lower().startswith(budget.CRITICAL_MARK.lower()):
-                reason = reason[len(budget.CRITICAL_MARK):].strip()
-            nature = accounts.pause_nature(reason).split("|")
-            account = nature[1] if nature[0] == "pause" else row.get("session_account")
+            account = _account(row)
             pauses.append({"name": candidate.name,
                            "account": account,
                            "resume_ts": deadline, "reason": text})
@@ -97,8 +101,13 @@ def alerts(items, milestones, events, listing, *, families, now):
             alert["held_lots"].append(dict(lot=ident, issue_ref=item.get("issue_ref"),
                                       project=item.get("app"), age_s=max(0, now-frozen)))
     for alert in grouped.values():
-        alert["episode"] = sorted({(p["account"] or "", p["resume_ts"])
-                                   for p in alert["pauses"]}, key=repr)
+        # The episode belongs to the family, not to today's held projects.
+        # Removing a project's last lot must not create another notification.
+        alert["episode"] = sorted({
+            (_account(row) or "", accounts.pause_deadline(row.get("status_text") or ""))
+            for row in listing if rd.live_family(row, families=families) == alert["family"]
+            and str(row.get("status_text") or "").lower().startswith(budget.PAUSE_PREFIX)
+            and not rd.is_short_window_pause(row["status_text"])}, key=repr)
         deadlines = [p["resume_ts"] for p in alert["pauses"] if p["resume_ts"] is not None]
         alert["resume_ts"] = min(deadlines) if deadlines else None
         alert["held_lots"].sort(key=lambda row: row["lot"])

@@ -55,6 +55,22 @@ class FamilyPausedTest(unittest.TestCase):
         changed = dict(alert, lots=[], detail="changed")
         self.assertEqual(exploitation.alert_key(alert), exploitation.alert_key(changed))
 
+    def test_removing_a_projects_last_lot_keeps_the_family_episode(self):
+        rows = registry()
+        for row in registry():
+            row = dict(row, name=row["name"] + "-nxl", team="nexlink")
+            if row["harness"] == "codex":
+                row["status_text"] = row["status_text"].replace("primary", "secondary")
+            rows.append(row)
+        first, second = self.inputs(1), self.inputs(2)
+        second[0]["app"] = "nexlink"
+        both = pause.alerts([first[0], second[0]], [first[1], second[1]],
+                            [first[2], second[2]], rows, families=FAMILIES, now=T)
+        one = pause.alerts([first[0]], [first[1]], [first[2]], rows,
+                           families=FAMILIES, now=T)
+        self.assertEqual(len(both), 1)
+        self.assertEqual(exploitation.alert_key(both[0]), exploitation.alert_key(one[0]))
+
     def test_debit_names_the_wait(self):
         row, milestone, ev = self.inputs()
         result = run(items=[row], milestones=[milestone], events=[ev], agents=registry(),
