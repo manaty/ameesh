@@ -777,7 +777,9 @@ compte qui détient les accès de déploiement, avec une configuration privée
 Rien dans l'unité ni dans cette procédure ne nomme un compte (#5494) : `~`
 et `%h` sont le dossier personnel du compte qui exécute l'unité, le compte
 des runners ou un compte dédié, selon la décision owner sur les détenteurs
-de la clé de déploiement (#5484). Ce compte porte, chez lui :
+de la clé de déploiement (#5484 ; la décision #184823 retient un compte
+dédié, `ameesh-staging`, sur ameesh-agents-1 et ameesh-agents-2, avec sa
+propre clé et sa copie du DSN). Ce compte porte, chez lui :
 `~/.config/ameesh/env` (accès à la base), la configuration privée ci-dessus,
 `bascule_env` (0600, dossier 0700), le clone dédié et le venv de
 l'exécutant. Le linger du compte est actif (`loginctl enable-linger`), et

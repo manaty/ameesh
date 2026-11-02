@@ -228,6 +228,16 @@ class QuiescenceTest(unittest.TestCase):
         self.assertIn("session 192.0.2.7 ?", res.stderr)
         # on the remote VMs the stubbed ssh answered for (b)
         self.assertEqual(len(self.appels()), 8)
+        # impl-01 N: a ss that prints the State column is still read
+        (self.faux / "ss").write_text(
+            'ESTAB 0 0 10.0.0.9:22 192.0.2.7:5555 users:(("sshd",pid=1,fd=4))\n')
+        res = self.sonde(STAGING_PREVIOUS_RUN="ab12d1", **env)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("session 192.0.2.7 ?", res.stderr)
+        (self.faux / "ss").write_text("garbage\n")
+        res = self.sonde(STAGING_PREVIOUS_RUN="ab12d2", **env)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("ligne ss: garbage", res.stderr)
         # B2 (docs-01): a failing ss proves nothing
         (self.bin / "ss").write_text("#!/usr/bin/env bash\nexit 1\n")
         res = self.sonde(STAGING_PREVIOUS_RUN="ab12d0", **env)

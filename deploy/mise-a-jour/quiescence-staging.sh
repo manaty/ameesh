@@ -228,8 +228,17 @@ if [ "$#" -gt 0 ]; then
     # Un ss en echec ne prouve aucune absence de session.
     printf "illisible\tss en echec\n"
   else
-    printf "%s\n" "$sessions" | while read -r _ _ _ pair proc; do
-      [ -n "$pair" ] || continue
+    printf "%s\n" "$sessions" | while read -r -a champs; do
+      # Le pair suit l adresse locale « …:22 », avec ou sans colonne d etat
+      # selon la version de ss ; introuvable = illisible, jamais ignore.
+      pair="" proc=""
+      for ((i = 0; i < ${#champs[@]} - 1; i++)); do
+        case "${champs[$i]}" in
+          *:22) pair=${champs[$((i + 1))]}; proc="${champs[*]:$((i + 2))}"; break ;;
+        esac
+      done
+      [ "${#champs[@]}" -gt 0 ] || continue
+      [ -n "$pair" ] || { printf "illisible\tligne ss: %s\n" "${champs[*]}"; continue; }
       port=${pair##*:} ip=${pair%:*}; ip=${ip#[}; ip=${ip%]}; ip=${ip#::ffff:}
       [ -n "${connue[$ip]:-}" ] || continue
       [ "$ip" = "$moi_ip" ] && [ "$port" = "$moi_port" ] && continue
