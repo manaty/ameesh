@@ -4382,38 +4382,72 @@ class WorkItems(interface.WorkItems):
 
     # -- actual time by phase and merged diff size (L157c) ------------------------
     def measure_candidates(self, *, ids, retry_diff_s, since_s, limit) -> list[dict]:
-        sql = (
-            "SELECT w.id, w.state, w.assignee, w.branch, w.branch_target, w.change_size,"
+        """Les lots livrés à mesurer (ou à remesurer), le plus récent d'abord.
+
+        #5411 : sans `ids`, la lecture part des seuls lots qui MANQUENT de
+        mesure (ou dont le diff/CI est incomplet), matérialisés une fois
+        (145 lots sur la base du 01/11) ; le LATERAL du jalon `merged` ne
+        tourne plus pour les 4 289 lots ouverts démarrés (111 931 tampons,
+        2,2 s mesurés). Les deux conditions restent celles de #3056/#2317 :
+        un lot mesuré sans diff, ou sans CI alors qu'il a une branche, est
+        remesuré tant que sa fusion est récente."""
+        columns = (
+            "w.id, w.state, w.assignee, w.branch, w.branch_target, w.change_size,"
             "       extract(epoch from w.started_at)::float8 AS started_ts,"
             "       extract(epoch from fus.at)::float8 AS merged_ts, fus.sha AS merge_sha,"
             "       (m.work_item_id IS NOT NULL) AS measured,"
             "       (m.diff_files IS NOT NULL) AS has_diff,"
             "       (m.ci_minutes IS NOT NULL) AS has_ci"
-            "  FROM work_items w"
+        )
+        lateral = (
             "  JOIN LATERAL (SELECT x.at, x.sha FROM work_item_milestones x"
             "                 WHERE x.work_item_id = w.id AND x.kind = 'merged'"
             "                   AND " + _effective_merged("x") +
             "                 ORDER BY x.at DESC, x.id DESC LIMIT 1) fus ON true"
             "  LEFT JOIN work_item_measures m ON m.work_item_id = w.id"
-            f" WHERE w.started_at IS NOT NULL AND w.state <> '{lifecycle.CLOSED}'")
+        )
         params: list = []
         if ids is not None:
             ids = [int(i) for i in ids]
             if not ids:
                 return []
-            sql += " AND w.id IN (%s)" % ", ".join(["%s"] * len(ids))
+            sql = ("SELECT " + columns + " FROM work_items w" + lateral +
+                   f" WHERE w.started_at IS NOT NULL AND w.state <> '{lifecycle.CLOSED}'"
+                   " AND w.id IN (%s)" % ", ".join(["%s"] * len(ids)))
             params += ids
         else:
-            # measured without a diff, or without CI though the lot has a
-            # branch: retried while recent
-            sql += (" AND (m.work_item_id IS NULL OR ((m.diff_files IS NULL"
-                    "      OR (m.ci_minutes IS NULL AND w.branch IS NOT NULL))"
-                    "      AND fus.at > now() - make_interval(secs => %s)))")
+            sql = (
+                "WITH need AS MATERIALIZED ("
+                "  SELECT w.id, w.state, w.assignee, w.branch, w.branch_target,"
+                "         w.change_size, w.started_at,"
+                "         (m.work_item_id IS NOT NULL) AS measured,"
+                "         (m.diff_files IS NOT NULL) AS has_diff,"
+                "         (m.ci_minutes IS NOT NULL) AS has_ci"
+                "    FROM work_items w"
+                "    LEFT JOIN work_item_measures m ON m.work_item_id = w.id"
+                f"   WHERE w.started_at IS NOT NULL AND w.state <> '{lifecycle.CLOSED}'"
+                "     AND (m.work_item_id IS NULL OR m.diff_files IS NULL"
+                "          OR (m.ci_minutes IS NULL AND w.branch IS NOT NULL))"
+                ") SELECT n.id, n.state, n.assignee, n.branch, n.branch_target,"
+                "         n.change_size,"
+                "         extract(epoch from n.started_at)::float8 AS started_ts,"
+                "         extract(epoch from fus.at)::float8 AS merged_ts,"
+                "         fus.sha AS merge_sha, n.measured, n.has_diff, n.has_ci"
+                "    FROM need n"
+                "    JOIN LATERAL (SELECT x.at, x.sha FROM work_item_milestones x"
+                "                   WHERE x.work_item_id = n.id AND x.kind = 'merged'"
+                "                     AND " + _effective_merged("x") +
+                "                   ORDER BY x.at DESC, x.id DESC LIMIT 1) fus ON true"
+                "   WHERE (NOT n.measured"
+                "          OR fus.at > now() - make_interval(secs => %s))")
             params.append(float(retry_diff_s))
             if since_s is not None:
                 sql += " AND fus.at > now() - make_interval(secs => %s)"
                 params.append(float(since_s))
-        sql += " ORDER BY fus.at DESC, w.id DESC LIMIT %s"
+        if ids is not None:
+            sql += " ORDER BY fus.at DESC, w.id DESC LIMIT %s"
+        else:
+            sql += " ORDER BY fus.at DESC, n.id DESC LIMIT %s"
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 

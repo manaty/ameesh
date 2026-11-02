@@ -420,18 +420,52 @@ def _choose_currency(items: dict) -> str | None:
 
 
 def _history(db, harness: str, account: str | None) -> dict:
-    """Les soldes lus du fournisseur, par devise, récents d'abord bornés."""
-    rows = storage.of(db).operations.balances(
-        provider=harness, since_s=PEAK_WINDOW_S)
-    cible = account or ""
+    """L'état des séries de soldes du compte, par devise.
+
+    #5411 : une lecture agrégée par devise (dernier relevé, sommet du dernier
+    segment, dépense et étendue) au lieu des ~4 300 lignes de 30 jours
+    relues à chaque appel — 1,68 M d'appels et 111 000 s cumulées depuis le
+    27/10. `_peak` et `balance_rate` restent la référence pour les séries
+    complètes (`sous_utilisation.balance_low`)."""
+    rows = storage.of(db).operations.balance_series(
+        provider=harness, account=account, since_s=PEAK_WINDOW_S)
     series: dict = {}
     for row in rows:
-        if (row.get("account") or "") != cible:
-            continue
-        series.setdefault(str(row.get("currency") or "").upper(), []).append(row)
-    for points in series.values():
-        points.sort(key=lambda r: float(r["observed_ts"]))
+        currency = str(row.get("currency") or "").upper()
+        series[currency] = {
+            "currency": currency,
+            "total": float(row["total"]),
+            "available": row.get("available"),
+            "peak": None if row.get("peak") is None else float(row["peak"]),
+            "spent": float(row.get("spent") or 0.0),
+            "span": float(row["last_ts"]) - float(row["first_ts"]),
+            "readings": int(row.get("readings") or 0),
+        }
     return series
+
+
+def _series_reference(series: dict | None, declared: float | None) -> float | None:
+    """Le montant de référence d'une série : le prépayé déclaré, sinon le
+    sommet du dernier segment (même règle que `_peak`)."""
+    if declared is not None and declared > 0:
+        return declared
+    peak = (series or {}).get("peak")
+    if peak is None or float(peak) <= 0:
+        return None
+    return float(peak)
+
+
+def _series_rate(series: dict | None) -> float | None:
+    """Le rythme horaire de la série (même règle que `balance_rate`) : None
+    si elle couvre moins de `BALANCE_MIN_SPAN_S`."""
+    from .sous_utilisation import BALANCE_MIN_SPAN_S
+    series = series or {}
+    if int(series.get("readings") or 0) < 2:
+        return None
+    span = float(series.get("span") or 0.0)
+    if span < BALANCE_MIN_SPAN_S:
+        return None
+    return float(series.get("spent") or 0.0) / span * 3600.0
 
 
 def from_readings(db, harness: str, account: str | None, readings, *,
@@ -481,14 +515,10 @@ def from_readings(db, harness: str, account: str | None, readings, *,
         raise
     except db_mod.DbError:
         return None
-    points = series.get(currency) or []
+    points = series.get(currency)
     row = get(db, harness, account)
-    reference = _peak(points, prepaid_of(row) if currency == "USD" else None)
-    measured = None
-    if points:
-        from .sous_utilisation import balance_rate
-        measured = balance_rate(points)
-    rate = (measured[0] / measured[1] * 3600.0) if measured else None
+    reference = _series_reference(points, prepaid_of(row) if currency == "USD" else None)
+    rate = _series_rate(points)
     return _apply(db, harness, account, _verdict(float(ref.total), reference, rate, now),
                   balance=float(ref.total), reference=reference, rate=rate, now=now,
                   source="balance", host=host)
@@ -516,24 +546,21 @@ def _real_verdict(db, row: dict, now: float) -> tuple | None:
     series = _history(db, row["harness"], row.get("account"))
     if not series:
         return None
-    latest = {currency: points[-1] for currency, points in series.items() if points}
+    latest = {currency: state for currency, state in series.items() if state}
     if not latest:
         return None
     currency = _choose_currency(latest)
     if currency is None:
         # aucune devise positive : le compte est à zéro (ou indisponible)
         currency = "USD" if "USD" in series else sorted(series)[0]
-    points = series[currency]
-    if not points:
+    state = series[currency]
+    if not state:
         return None
-    total = float(points[-1]["total"])
-    reference = _peak(points, prepaid_of(row) if currency == "USD" else None)
-    measured = None
-    if points:
-        from .sous_utilisation import balance_rate
-        measured = balance_rate(points)
-    rate = (measured[0] / measured[1] * 3600.0) if measured else None
-    available = points[-1].get("available")
+    total = float(state["total"])
+    reference = _series_reference(
+        state, prepaid_of(row) if currency == "USD" else None)
+    rate = _series_rate(state)
+    available = state.get("available")
     if available is not None and not bool(available):
         total = min(0.0, total)
     return _verdict(total, reference, rate, now), total, reference, rate
