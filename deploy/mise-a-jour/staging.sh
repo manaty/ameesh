@@ -559,12 +559,18 @@ nettoyer() {
   if [ "${SUIVI_DEMARRE:-0}" = 1 ]; then
     # EXIT is best effort only. SIGKILL or a dead launcher is detected by
     # the independent alerts pass from the already committed deadline.
+    arreter_battement
     publier_suivi failed || true
   fi
+  rm -f "$SUIVI_COURANTE" "$SUIVI_PROGRES"
   local f
   for f in ${FICHIER_HOTE[@]+"${FICHIER_HOTE[@]}"}; do rm -f "$f"; done
   return "$rc"
 }
+# #5425 : l'etape en cours (hote, etape, debut) et le progres des runners, lus
+# par le battement, qui ne voit pas les variables du lanceur.
+SUIVI_COURANTE="$TRAVAIL/staging-$$-etape"
+SUIVI_PROGRES="$TRAVAIL/staging-$$-progres"
 trap nettoyer EXIT
 for nom in "${HOTES[@]}"; do
   f="$TRAVAIL/staging-$$-$nom.env"
@@ -580,13 +586,26 @@ done
 SHA_TRAVE=${SHA:0:9}
 PRECEDENT=""
 trace() {  # hote etape verdict [detail] [rapport-json]
-  python3 - "$JOURNAL" "$1" "$2" "$3" "${4:-}" "$SHA" "$PRECEDENT" "${5:-}" <<'PY'
+  # #5425 : une etape close garde son heure de debut dans sa ligne de journal ;
+  # le snapshot suivant ne la reconstruit donc plus depuis la fin.
+  local debut="" hote_courant="" etape_courante=""
+  if [ -r "$SUIVI_COURANTE" ]; then
+    IFS=$'\t' read -r hote_courant etape_courante debut _ < "$SUIVI_COURANTE" || debut=""
+    if [ "$hote_courant" != "$1" ] || [ "$etape_courante" != "$2" ] \
+       || ! [[ "$debut" =~ ^[0-9]+$ ]]; then
+      debut=""
+    fi
+  fi
+  python3 - "$JOURNAL" "$1" "$2" "$3" "${4:-}" "$SHA" "$PRECEDENT" "${5:-}" "$debut" <<'PY'
 import json, sys, time
-path, hote, etape, verdict, detail, sha, precedent, rapport = sys.argv[1:9]
+(path, hote, etape, verdict, detail, sha, precedent, rapport,
+ debut) = sys.argv[1:10]
 line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "hote": hote, "etape": etape, "verdict": verdict,
         "sha": sha or None, "precedent": precedent or None,
         "detail": detail or None}
+if debut:
+    line["started"] = float(debut)
 # le rapport de sonde reste structure dans la trace, pas seulement en texte
 # (#2190) ; `detail` garde sa forme historique, lue par actif.py.
 if rapport:
@@ -624,8 +643,8 @@ exec_hote() {  # nom action [args…]
         redemarrer|retour) poste_transitoire "$@" ;;
         *) "$POSTE_SH" "$@" ;;
       esac ;;
-    agents) env BASCULE_ENV="${FICHIER_HOTE[$nom]}" "$VM_SH" agents "$@" ;;
-    serveur) env BASCULE_ENV="${FICHIER_HOTE[$nom]}" "$VM_SH" "$@" ;;
+    agents) env BASCULE_ENV="${FICHIER_HOTE[$nom]}" STAGING_PROGRES="$SUIVI_PROGRES" "$VM_SH" agents "$@" ;;
+    serveur) env BASCULE_ENV="${FICHIER_HOTE[$nom]}" STAGING_PROGRES="$SUIVI_PROGRES" "$VM_SH" "$@" ;;
   esac
 }
 ssh_lire() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" "$2"; }
@@ -937,28 +956,146 @@ SUIVI_RUN=${STAGING_RUN_ID:-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 SUIVI_DEBUT=$(date +%s)
 SUIVI_DELAI=${STAGING_TIMEOUT_S:-7200}
 SUIVI_DEMARRE=0
+# #5425 : un retard se juge sur le battement et le progres, plus sur une seule
+# echeance de parcours (STAGING_TIMEOUT_S ne juge qu'un lanceur plus ancien).
+# Un hote a pour budget BASE + runners x plafond de tour : un redemarrage
+# glissant attend la fin de tour de chaque runner.
+SUIVI_BATTEMENT_S=${STAGING_BATTEMENT_S:-120}
+SUIVI_SILENCE_S=${STAGING_SILENCE_S:-900}
+SUIVI_PLAFOND_TOUR_S=${STAGING_PLAFOND_TOUR_S:-1800}
+SUIVI_BASE_HOTE_S=${STAGING_BASE_HOTE_S:-900}
+SUIVI_RUNNERS_DEFAUT=${STAGING_RUNNERS_DEFAUT:-20}
+SUIVI_BATTEMENT_PID=
+# #5425 N2 : `sleep 0` ou une valeur non numerique ferait tourner le battement
+# en boucle serree ; valider avant tout publish et tout geste, comme les autres
+# reglages de vivacite (nombre fini et positif).
+valider_battement() {
+  local valeur
+  valeur=$(python3 - "$SUIVI_BATTEMENT_S" <<'PY'
+import math, sys
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+if not 0 < value < math.inf:
+    raise SystemExit(1)
+print(value)
+PY
+  ) || { echo "STAGING_BATTEMENT_S invalide : « $SUIVI_BATTEMENT_S » (secondes finies et positives attendues)" >&2; return 2; }
+  SUIVI_BATTEMENT_S=$valeur
+}
+valider_battement || exit $?
 publier_suivi() {  # etat [options de staging_watch…]
   local etat=$1 instantane
   shift
   instantane=$(python3 - "$JOURNAL" "$SUIVI_RUN" "$SHA" "$SUIVI_DEBUT" \
-    "$SUIVI_DELAI" "$NOTIF_STAGING" "$etat" "$DEPUIS" <<'PY'
-import json, sys
-path, run, sha, start, duration, notify, state, since = sys.argv[1:]
+    "$SUIVI_DELAI" "$NOTIF_STAGING" "$etat" "$DEPUIS" "$SUIVI_COURANTE" \
+    "$SUIVI_PROGRES" "$SUIVI_SILENCE_S" "$SUIVI_PLAFOND_TOUR_S" \
+    "$SUIVI_BASE_HOTE_S" "$SUIVI_RUNNERS_DEFAUT" <<'PY'
+import calendar, json, os, sys, time
+(path, run, sha, start, duration, notify, state, since, current_path,
+ runners_path, silence, cap, base, default_runners) = sys.argv[1:]
 duration = float(duration)
 if not 0 < duration < float('inf'):
     raise SystemExit('STAGING_TIMEOUT_S must be finite and positive')
-hosts = {}
+silence, cap, base = float(silence), float(cap), float(base)
+if not (0 < silence < float('inf') and 0 < cap < float('inf') and 0 <= base < float('inf')):
+    raise SystemExit('staging liveness settings must be finite and positive')
+def epoch(stamp):
+    return float(calendar.timegm(time.strptime(stamp, '%Y-%m-%dT%H:%M:%SZ')))
+hosts, first, last_line = {}, {}, {}
+progress = float(start)
 with open(path, encoding='utf-8') as stream:
-    for line in stream:
+    for number, line in enumerate(stream):
         row = json.loads(line)
         if row.get('sha') == sha and row.get('ts', '') >= since:
-            hosts[row['hote']] = {'stage': row['etape'], 'verdict': row['verdict']}
+            at = epoch(row['ts'])
+            # #5425 : le debut de l'etape est dans la ligne ; a defaut (journal
+            # d'un ancien lanceur), la fin reste la seule heure connue.
+            try:
+                started = float(row['started']) if row.get('started') is not None else at
+            except (TypeError, ValueError):
+                started = at
+            first.setdefault(row['hote'], started)
+            last_line[row['hote']] = number
+            progress = max(progress, at)
+            hosts[row['hote']] = {'stage': row['etape'], 'verdict': row['verdict'], 'since': started}
+try:
+    with open(current_path, encoding='utf-8') as stream:
+        host, stage, began, mark = stream.read().rstrip('\n').split('\t')
+    began, mark = float(began), int(mark)
+except (OSError, ValueError):
+    host = None
+stall = cap + silence
+if host:
+    progress = max(progress, began)
+    first.setdefault(host, began)
+    # a line of this host after the step began closes it (ok, ko, retour)
+    if last_line.get(host, -1) < mark:
+        runners = ''
+        try:
+            progress = max(progress, os.path.getmtime(runners_path))
+            with open(runners_path, encoding='utf-8') as stream:
+                runners = stream.read().strip()
+        except OSError:
+            pass
+        budget = base + int(runners or default_runners) * cap
+        # the workstation's restart runs in its own unit and reports no
+        # runner: only its budget can judge it
+        if stage == 'redemarrer' and not runners:
+            stall = budget
+        hosts[host] = {'stage': stage, 'verdict': 'en-cours', 'since': began,
+                       'deadline': first[host] + budget}
 print(json.dumps(dict(run=run, sha=sha, started=float(start),
                      deadline=float(start)+duration, state=state,
-                     hosts=hosts, notify=notify)))
+                     hosts=hosts, notify=notify, beat=time.time(), progress=progress,
+                     silence_s=silence, stall_s=stall)))
 PY
   ) || return
   py_sequence "$SUIVI_PY" "$instantane" "$@"
+}
+# #5425 : chaque etape est publiee des son debut, avec son heure.
+debut_etape() {  # hote etape
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$(date +%s)" "$(wc -l < "$JOURNAL")" > "$SUIVI_COURANTE"
+  : > "$SUIVI_PROGRES"
+  publier_suivi running || echo "suivi staging indisponible" >&2
+}
+# #5425 N3 : `kill -0` reussit sur un zombie non reape ; lire l'etat /proc
+# pour ne pas continuer a publier pour un lanceur deja mort.
+lanceur_vivant() {  # pid
+  local pid=$1 etat
+  [ -n "$pid" ] || return 1
+  if [ -r "/proc/$pid/stat" ]; then
+    etat=$(sed -n 's/^.*) \([A-Za-z]\).*$/\1/p' "/proc/$pid/stat" 2>/dev/null) || etat=""
+    case "$etat" in Z|X|x) return 1 ;; esac
+  fi
+  kill -0 "$pid" 2>/dev/null
+}
+# Le battement prouve le lanceur : il s'arrete avec lui, meme tue par SIGKILL,
+# et ne garde ni le verrou (fd 9) ni ses sorties. `sleep` en arriere-plan : un
+# TERM l'interrompt, mais attend la fin d'une publication en cours, pour
+# qu'aucun `running` tardif ne suive l'etat final.
+lancer_battement() {
+  valider_battement || return $?
+  local lanceur=$$
+  (
+    exec 9>&- >/dev/null 2>&1
+    trap 'exit 0' TERM
+    set +e
+    while :; do
+      sleep "$SUIVI_BATTEMENT_S" &
+      wait $!
+      lanceur_vivant "$lanceur" || exit 0
+      publier_suivi running
+    done
+  ) &
+  SUIVI_BATTEMENT_PID=$!
+}
+arreter_battement() {
+  [ -n "${SUIVI_BATTEMENT_PID:-}" ] || return 0
+  kill "$SUIVI_BATTEMENT_PID" 2>/dev/null || true
+  wait "$SUIVI_BATTEMENT_PID" 2>/dev/null || true
+  SUIVI_BATTEMENT_PID=
 }
 if [ "$POSTE_ABSENT" = 1 ]; then
   printf '  %-16s %-8s %s\n' pc-smichea absent "reporte — $POSTE_RAISON"
@@ -1004,6 +1141,7 @@ if [ "$rc_suivi" -eq 75 ]; then
 fi
 [ "$rc_suivi" -eq 0 ] || exit "$rc_suivi"
 SUIVI_DEMARRE=1
+lancer_battement
 if [ "$POSTE_ABSENT" = 1 ]; then
   trace pc-smichea absent reporte "$POSTE_RAISON"
   echo "  pc-smichea : absent (reporte) — $POSTE_RAISON"
@@ -1045,6 +1183,7 @@ if [ "$SAUVER" = 1 ]; then
     echo "  sauvegarde non faite (poste et serveur reportes) ; sauvegarde quotidienne du serveur seule"
   elif [ "$POSTE_ABSENT" = 1 ]; then
     etape "sauvegarde du serveur sur manaty-mesh-1 (poste absent, dump garde sur la VM)"
+    debut_etape manaty-mesh-1 sauvegarde
     if ! meta=$(sauvegarde_serveur_vm); then
       trace manaty-mesh-1 sauvegarde ko "sauvegarde serveur en echec"
       echo "sauvegarde serveur en echec : rien n'a ete modifie" >&2
@@ -1066,6 +1205,7 @@ if [ "$SAUVER" = 1 ]; then
     echo "  sauvegarde serveur : $dump ($taille octets)"
   else
     etape "sauvegarde de la base du mesh (poste.sh sauvegarder)"
+    debut_etape poste sauvegarde
     "$POSTE_SH" sauvegarder || { echo "sauvegarde en echec : rien n'a ete modifie" >&2; exit 1; }
     trace poste sauvegarde ok "sauvegarde avant migrations"
   fi
@@ -1076,6 +1216,7 @@ if [ "$POSTE_ABSENT" = 1 ]; then
   # le meme instantane et la meme garde additive que le bureau (HOTE_MIGRATIONS
   # est choisi et valide avant le plan, avec HOTE_OUTILS).
   etape "migrations de $SHA_TRAVE depuis $HOTE_MIGRATIONS (poste absent, additives seulement)"
+  debut_etape "$HOTE_MIGRATIONS" migrations
   if ! migrer_depuis_vm "$HOTE_MIGRATIONS" "$SHA"; then
     trace "$HOTE_MIGRATIONS" migrations ko "migrations en echec depuis la VM"
     echo "migrations en echec : aucune installation" >&2
@@ -1084,6 +1225,7 @@ if [ "$POSTE_ABSENT" = 1 ]; then
   trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord)"
 else
   etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
+  debut_etape poste migrations
   # #2357 : une sonde d'auto-prise en echec ne doit pas arreter la sequence. La
   # suite par hote installe et redemarre les VM d'abord, le poste en dernier
   # (canon §14) ; sans ce drapeau, poste.sh redemarrerait le poste tout de suite
@@ -1107,28 +1249,34 @@ for nom in "${HOTES[@]}"; do
     # l'installateur enregistre la version courante comme cible de retour.
     PRECEDENT=$installe
     etape "$nom : installer $SHA_TRAVE"
+    debut_etape "$nom" installer
     exec_hote "$nom" installer "$SHA" || echec_hote "$nom" installer "installation en echec"
     trace "$nom" installer ok "installe ${SHA_TRAVE} (precedent ${PRECEDENT:-inconnu})"
   fi
   if [ "$(mode_de "$nom")" = poste ]; then
     etape "$nom : role"
+    debut_etape "$nom" role
     exec_hote "$nom" role || echec_hote "$nom" role "role en echec"
     trace "$nom" role ok
   fi
   etape "$nom : redemarrer"
+  debut_etape "$nom" redemarrer
   exec_hote "$nom" redemarrer || echec_hote "$nom" redemarrer "redemarrage en echec"
   trace "$nom" redemarrer ok
   # #4416 : installer les nouvelles unites avant leur controle, sur le poste
   # et les VM d'agents ; le serveur historique n'expose pas cette action.
   if [ "$(mode_de "$nom")" != serveur ]; then
     etape "$nom : timers"
+    debut_etape "$nom" timers
     exec_hote "$nom" timers || echec_hote "$nom" timers "installation des minuteries en echec"
     trace "$nom" timers ok
   fi
   etape "$nom : controler"
+  debut_etape "$nom" controler
   exec_hote "$nom" controler || echec_hote "$nom" controler "controles en echec"
   trace "$nom" controler ok
   etape "$nom : sante"
+  debut_etape "$nom" sante
   rc=0
   sante_hote "$nom" || rc=$?
   case $rc in
@@ -1198,6 +1346,7 @@ else
     "$VENV/bin/python" "$ACTIF_PY" --journal "$JOURNAL_ACTIF" "${ARGS_ACTIF[@]}" || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
+    arreter_battement
     publier_suivi unattested || echo "suivi staging indisponible" >&2
     SUIVI_DEMARRE=0
     if [ "$rc" -eq 5 ]; then
@@ -1211,6 +1360,7 @@ else
 fi
 
 if [ "$SUIVI_DEMARRE" = 1 ]; then
+  arreter_battement
   if [ "$SEQUENCE_COMPLETE" = 1 ]; then
     publier_suivi completed || echo "suivi staging indisponible" >&2
   else

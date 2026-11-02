@@ -674,12 +674,31 @@ connexions directes et les autres clients du serveur.
 ### Suivi indépendant et exécutant élu du staging (#4880)
 
 Avant toute modification d'hôte, `staging.sh` écrit un événement partagé
-`staging.sequence`, avec un identifiant d'exécution et une échéance fixe
-(`STAGING_TIMEOUT_S`, 7200 secondes par défaut). Chaque étape publie la
-dernière étape et le verdict par hôte ; les sorties, commandes et secrets
-restent hors de ce suivi. La passe ordinaire d'alertes lit ces événements
-depuis la base : un lanceur tué, figé ou privé de réseau n'a pas besoin de
-survivre pour que le dépassement soit signalé au pilote. Une sortie sans
+`staging.sequence`, avec un identifiant d'exécution. Chaque étape publie dès
+son début l'étape, son heure et le verdict par hôte ; les sorties, commandes et
+secrets restent hors de ce suivi. Le lanceur publie aussi un battement
+(`STAGING_BATTEMENT_S`, 120 s) et son dernier progrès, étape ou runner.
+
+Le battement lit l'état du lanceur dans `/proc` : un lanceur zombie ou
+disparu l'arrête, au lieu de continuer à publier. `STAGING_BATTEMENT_S` doit
+être un nombre fini et positif ; une valeur nulle, non numérique ou infinie
+refuse la séquence avant le premier publish et toute mutation. Une étape close
+garde son heure de début (`started`) dans sa ligne de journal, donc le snapshot
+suivant affiche ce début et non la fin.
+
+Le retard (#5425) se juge sur ces preuves : sans battement ni progrès depuis
+`STAGING_SILENCE_S` (900 s), ou lanceur vivant sans progrès depuis un plafond
+de tour (`STAGING_PLAFOND_TOUR_S`, 1800 s) plus cette marge, réduite à
+`STAGING_SILENCE_S` une fois passée l'échéance de l'hôte :
+`STAGING_BASE_HOTE_S` (900 s) + runners × plafond de tour. Le redémarrage du
+poste ne signale pas ses runners : seule cette échéance le juge
+(`STAGING_RUNNERS_DEFAUT`, 20). `STAGING_TIMEOUT_S` (7200 s) ne juge plus qu'un
+lanceur antérieur au battement ; il reste la borne d'arrêt de la release
+synchrone (`run_staging`), qui ne passe pas par l'exécutant élu.
+
+La passe ordinaire d'alertes lit ces événements depuis la base : un lanceur
+tué, figé ou privé de réseau n'a pas besoin de survivre pour que le retard soit
+signalé au pilote. Une sortie sans
 attestation reste `unattested`, jamais `completed`. Un sous-ensemble demandé
 explicitement se termine `partial`, sans prétendre attester le mesh.
 

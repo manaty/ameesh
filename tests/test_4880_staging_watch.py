@@ -22,6 +22,258 @@ def request_row(ident, request, *, sha="a" * 40, state="failed", **extra):
     return dict(id=ident, object="staging-request:mesh", data=data)
 
 
+def beating(now, *, ident=1, progress=None, beat=None, deadline=None, runners=20):
+    """A #5425 snapshot: 1800 s turn cap, 900 s margin, one active host."""
+    budget = 900 + runners * 1800
+    return row(ident, deadline=107300, beat=now if beat is None else beat,
+               progress=now if progress is None else progress,
+               silence_s=900, stall_s=2700, hosts={"vm-1": {
+                   "stage": "redemarrer", "verdict": "en-cours", "since": 100,
+                   "deadline": deadline or 100 + budget}})
+
+
+class LivenessTest(unittest.TestCase):
+    def test_three_hosts_of_twenty_runners_progressing_is_never_late(self):
+        # Beyond the old fixed 7200 s and the snapshot's own deadline, each
+        # runner taking a full turn: a real rolling restart is not an alert.
+        hosts, runners, cap = 3, 20, 1800
+        started = 100
+        for tick in range(hosts * runners):
+            now = started + (tick + 1) * cap
+            snapshot = beating(now, ident=tick + 1, progress=now - cap + 1,
+                               deadline=now + 900 + runners * cap)
+            snapshot["data"]["deadline"] = started + 7200
+            self.assertEqual(staging_watch.findings([snapshot], now=now), [], tick)
+
+    def test_frozen_step_without_heartbeat_is_reported_before_the_fixed_deadline(self):
+        frozen = beating(1000)
+        self.assertEqual(staging_watch.findings([frozen], now=1899), [])
+        finding, = staging_watch.findings([frozen], now=1900)
+        self.assertLess(1900, frozen["data"]["deadline"])
+        self.assertIn("ni battement ni progrès depuis 15 min", finding["detail"])
+        self.assertIn("vm-1: redemarrer/en-cours depuis 00:01:40Z", finding["detail"])
+        self.assertEqual((finding["value"], finding["threshold"]), (900, 900))
+
+    def test_live_launcher_without_progress_is_seen(self):
+        stuck = beating(5000, beat=7699, progress=5000)
+        self.assertEqual(staging_watch.findings([stuck], now=7699), [])
+        finding, = staging_watch.findings([beating(5000, beat=7700)], now=7700)
+        self.assertIn("lanceur vivant, aucun progrès depuis 45 min", finding["detail"])
+
+    def test_past_its_host_budget_a_live_launcher_gets_only_the_margin(self):
+        past = beating(5000, beat=5900, progress=5000, deadline=5500)
+        finding, = staging_watch.findings([past], now=5900)
+        self.assertEqual(finding["threshold"], 900)
+        # still progressing, past the budget: no alert
+        self.assertEqual(staging_watch.findings(
+            [beating(5900, deadline=5500)], now=5900), [])
+
+    def test_a_launcher_older_than_the_heartbeat_keeps_its_fixed_deadline(self):
+        self.assertEqual(staging_watch.findings([row()], now=199), [])
+        finding, = staging_watch.findings([row()], now=201)
+        self.assertIn("délai dépassé", finding["detail"])
+
+    def test_record_keeps_liveness_fields_and_refuses_a_non_finite_one(self):
+        written = []
+        store = mock.Mock()
+        store.events.record = lambda *args: written.append(args[-1]) or 1
+        with mock.patch.object(staging_watch.storage, "of", return_value=store):
+            staging_watch.record(object(), beating(150)["data"])
+            data = written[0]
+            self.assertEqual(data["beat"], 150)
+            self.assertEqual(data["hosts"]["vm-1"]["since"], 100.0)
+            self.assertEqual(data["hosts"]["vm-1"]["deadline"], 36900 + 100.0)
+            with self.assertRaises(ValueError):
+                staging_watch.record(object(), dict(beating(150)["data"],
+                                                    beat=float("nan")))
+
+    def test_running_request_past_its_deadline_follows_its_sequence(self):
+        request = request_row(5, "r1", state="running", run="run-a", deadline=200)
+        healthy = beating(1000)
+        self.assertEqual(staging_watch.request_findings(
+            [request], now=1000, sequences=[healthy]), [])
+        self.assertEqual(len(staging_watch.request_findings(
+            [request], now=1900, sequences=[healthy])), 1)
+        self.assertEqual(len(staging_watch.request_findings(
+            [request], now=1000, sequences=[row()])), 1)
+
+
+class HeartbeatScriptTest(unittest.TestCase):
+    """The bash side: the snapshot, and a beat that dies with its launcher."""
+    ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
+
+    def script(self):
+        return (self.ROOT / "deploy/mise-a-jour/staging.sh").read_text()
+
+    def bloc(self, debut, fin):
+        source = self.script()
+        return source[source.index(debut):source.index(fin, source.index(debut))]
+
+    def harness(self, folder, tail, **env):
+        import os
+        import subprocess
+        source = "\n".join([
+            "set -euo pipefail",
+            'JOURNAL=$D/j; SUIVI_RUN=r; SHA=aaa; PRECEDENT=',
+            'SUIVI_DEBUT=$(date +%s); SUIVI_DELAI=7200',
+            'NOTIF_STAGING=p; DEPUIS=2000-01-01T00:00:00Z; SUIVI_COURANTE=$D/c; SUIVI_PROGRES=$D/p',
+            'SUIVI_SILENCE_S=900; SUIVI_PLAFOND_TOUR_S=1800; SUIVI_BASE_HOTE_S=900',
+            'SUIVI_RUNNERS_DEFAUT=20; SUIVI_BATTEMENT_S=${BEAT:-120}; SUIVI_SUIVI=$D/out',
+            'SUIVI_PY=x; touch "$JOURNAL"',
+            'py_sequence() { shift; printf "%s\\n" "$1" >> "$SUIVI_SUIVI"; }',
+            self.bloc("valider_battement() {", "if [ \"$POSTE_ABSENT\" = 1 ]; then\n  printf"),
+            self.bloc("trace() {", "\n# --- gestes par hote"),
+            tail])
+        return subprocess.run(["bash", "-c", source], capture_output=True, text=True,
+                              timeout=30, env=dict(os.environ, D=folder, **env))
+
+    def snapshots(self, folder):
+        import json
+        from pathlib import Path
+        out = Path(folder) / "out"
+        return [json.loads(line) for line in out.read_text().splitlines()] if out.exists() else []
+
+    def test_step_published_with_its_start_and_host_budget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, """
+debut_etape vm-1 redemarrer
+printf '3\\n' > "$SUIVI_PROGRES"
+publier_suivi running
+printf '{"ts":"%s","hote":"vm-1","etape":"redemarrer","verdict":"ko","sha":"aaa"}\\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$JOURNAL"
+publier_suivi failed
+""")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            first, signalled, closed = self.snapshots(folder)
+        step = first["hosts"]["vm-1"]
+        self.assertEqual((step["stage"], step["verdict"]), ("redemarrer", "en-cours"))
+        self.assertEqual(step["deadline"] - step["since"], 900 + 20 * 1800)
+        # before any runner signal, the unsignalled restart is judged by its budget
+        self.assertEqual(first["stall_s"], 900 + 20 * 1800)
+        self.assertEqual(signalled["stall_s"], 2700)
+        self.assertEqual(signalled["hosts"]["vm-1"]["deadline"] - step["since"], 900 + 3 * 1800)
+        self.assertEqual(closed["hosts"]["vm-1"]["verdict"], "ko")
+        self.assertNotIn("deadline", closed["hosts"]["vm-1"])
+        self.assertGreater(first["beat"], 0)
+
+    def test_closed_step_keeps_its_start_in_the_journal(self):
+        import json
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, """
+debut_etape vm-1 redemarrer
+printf 'vm-1\\tredemarrer\\t1000\\t0\\n' > "$SUIVI_COURANTE"
+trace vm-1 redemarrer ok "fini"
+publier_suivi completed
+""")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            journal = [json.loads(line) for line in
+                       (Path(folder) / "j").read_text().splitlines()]
+            self.assertEqual(journal[0]["started"], 1000)
+            closed = self.snapshots(folder)[-1]["hosts"]["vm-1"]
+        self.assertEqual((closed["stage"], closed["verdict"]), ("redemarrer", "ok"))
+        self.assertEqual(closed["since"], 1000)
+
+    def test_invalid_beat_interval_is_refused_before_any_publication(self):
+        from pathlib import Path
+        for value in ("0", "-1", "abc", "nan", "inf"):
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as folder:
+                    proc = self.harness(folder, "echo tail", BEAT=value)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("STAGING_BATTEMENT_S invalide", proc.stderr)
+                    self.assertFalse((Path(folder) / "out").exists())
+                    self.assertNotIn("tail", proc.stdout)
+
+    def test_fractional_beat_interval_is_accepted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, "echo valid", BEAT="0.1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "valid")
+
+    @unittest.skipUnless(__import__("pathlib").Path("/proc/self/stat").exists(),
+                         "requires /proc (Linux)")
+    def test_beat_refuses_a_zombie_launcher(self):
+        import os
+        import time as clock
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            limit = clock.monotonic() + 5
+            while clock.monotonic() < limit:
+                try:
+                    stat = (__import__("pathlib").Path("/proc/%d/stat" % pid)).read_text()
+                except OSError:
+                    self.fail("zombie disappeared before the check")
+                if stat.rsplit(")", 1)[1].split()[0] == "Z":
+                    break
+                clock.sleep(0.05)
+            else:
+                self.fail("child did not become a zombie")
+            with tempfile.TemporaryDirectory() as folder:
+                proc = self.harness(folder, """
+if lanceur_vivant "$ZPID"; then echo alive; else echo dead; fi
+if lanceur_vivant $$; then echo self-alive; fi
+""", ZPID=str(pid))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.split(), ["dead", "self-alive"])
+        finally:
+            os.waitpid(pid, 0)
+
+    def test_beat_runs_then_stops_before_the_final_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, """
+lancer_battement
+sleep 2.5
+arreter_battement
+publier_suivi completed
+""", BEAT="1")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            states = [snap["state"] for snap in self.snapshots(folder)]
+        self.assertGreaterEqual(states.count("running"), 1)
+        self.assertEqual(states[-1], "completed")
+        self.assertEqual(states.count("completed"), 1)
+
+    def test_beat_stops_with_a_killed_launcher(self):
+        import os
+        import signal
+        import time as clock
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, """
+lancer_battement
+printf '%s\\n' "$SUIVI_BATTEMENT_PID" > "$D/pid"
+sleep 1.5
+kill -KILL $$
+""", BEAT="1")
+            self.assertEqual(proc.returncode, -signal.SIGKILL)
+            beat = int((__import__("pathlib").Path(folder) / "pid").read_text())
+            limit = clock.monotonic() + 10
+            while clock.monotonic() < limit:
+                # an orphan may stay a zombie under this harness's reaper
+                try:
+                    stat = (__import__("pathlib").Path("/proc/%d/stat" % beat)).read_text()
+                except OSError:
+                    break
+                if stat.rsplit(")", 1)[1].split()[0] == "Z":
+                    break
+                clock.sleep(0.2)
+            else:
+                self.fail("beat outlived its launcher")
+            before = len(self.snapshots(folder))
+            clock.sleep(2.2)
+            self.assertEqual(len(self.snapshots(folder)), before,
+                             "beat kept publishing after its launcher died")
+
+    def test_every_staged_host_step_begins_published(self):
+        source = self.script()
+        for stage in ("installer", "role", "redemarrer", "timers", "controler", "sante"):
+            self.assertIn('debut_etape "$nom" ' + stage, source)
+        self.assertIn('STAGING_PROGRES="$SUIVI_PROGRES" "$VM_SH" agents', source)
+        vm = (self.ROOT / "deploy/mise-a-jour/vm.sh").read_text()
+        self.assertEqual(vm.count('signaler_progres "${#restantes[@]}"'), 2)
+
+
 class WatchTest(unittest.TestCase):
     def test_fixed_deadline_survives_launcher_loss_and_reports_each_host(self):
         rows = [row(), row(2, hosts={
@@ -209,8 +461,12 @@ class KilledSequenceTest(unittest.TestCase):
         rows = [dict(id=i+1, data=json.loads(line)) for i, line in enumerate(
             (self.fixture.state / 'staging-snapshots.jsonl').read_text().splitlines())]
         self.assertEqual(rows[-1]['data']['state'], 'running')
-        self.assertEqual(rows[-1]['data']['hosts']['ameesh-agents-1'],
-                         dict(stage='sante', verdict='ok'))
+        first = rows[-1]['data']['hosts']['ameesh-agents-1']
+        self.assertEqual((first['stage'], first['verdict']), ('sante', 'ok'))
+        self.assertGreater(first['since'], 0)
+        # #5425: the killed step is published, with its start
+        killed = rows[-1]['data']['hosts']['ameesh-agents-2']
+        self.assertEqual((killed['stage'], killed['verdict']), ('installer', 'en-cours'))
         alerts = staging_watch.findings(rows, now=rows[-1]['data']['deadline'] + 1)
         self.assertEqual(len(alerts), 1)
 
