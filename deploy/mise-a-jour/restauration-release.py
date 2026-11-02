@@ -497,7 +497,7 @@ def main():
     if os.geteuid() != 0:
         parser.exit(1, 'administrator required\n')
     try:
-        with diagnostic(args.action):
+        with diagnostic(args.action, ENROLLMENT if args.action == 'probe' else INTENT):
             dispatch(args)
     except Exception as error:
         parser.exit(1, refusal(error))
