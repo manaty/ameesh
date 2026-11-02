@@ -1102,6 +1102,50 @@ input, never a default: a missing setting stays off or unknown, and the
 unknown is named. Nothing is activated — no registry or ledger write, no
 setting changed; `--force` replaces the report.
 
+## Context policy pilot: `ameesh context pilot`
+
+```
+ameesh context pilot [--actor A] apply --agent A --context-max N --session-max N
+                     --turn-budget N --session-budget N [--fallback-turn-budget N]
+                     --baseline-cost X --baseline-cost-24h X --ref DECISION
+                     [--lot N] [--dry-run]
+ameesh context pilot status --agent A
+ameesh context pilot revert --agent A --reason R
+ameesh context pilot check --agent A [--cost-command CMD]
+```
+
+CTX-06 (#5250): a reversible pilot of one agent's context policy, stored in
+`agent_registry.context_pilot` and effective at the next turn whichever host
+holds the lease. `apply` captures the initial profile and sets the values in
+one instruction: `--context-max`, `--session-max`, `--turn-budget` and
+`--session-budget` in tokens (`--session-max` refuses 0),
+`--fallback-turn-budget` for the single-window cost fallback, and
+`--baseline-cost` / `--baseline-cost-24h`, the reference cost per admissible
+action over hourly windows and over the rolling 24 h. `--ref` names the
+decision that allows the pilot and `--lot` the lot it serves; `--dry-run`
+prints the planned state and the initial profile without writing, and
+`--actor` (group option) names the journaled actor. One pilot at a time per
+agent; `apply` is refused while window maintenance is on for the executor.
+
+`status` prints the stored pilot and whether the last `turn.context` publishes
+the values (`effective`; `null` when no turn has published one yet). `revert
+--reason R` restores the captured profile at the next turn; a pending session
+rotation is decided between two turns. The agent and the lot are notified at
+every step.
+
+`check` is meant to run on a timer on the agent's candidate hosts; concurrent
+checks produce a single return, each write checking the revision it read. It
+returns to the initial profile on a guard alert not already present at
+`apply` (`account_overage`, `overage_in_use`, `guard_restart`; an account
+attaches by harness and account, not host), overlapping turns on two hosts
+(30 s clock margin), an OOM of the agent's unit, no `turn.context` for an hour
+despite at least three turns, a cost per action above +20 % over the rolling
+24 h, or above +20 % on two consecutive cost windows of at least 10 actions.
+One such window alone triggers a single fallback to `--fallback-turn-budget`.
+`--cost-command CMD` runs without a shell and prints a JSON list of complete
+hourly windows (`[{"actions": N, "cost": X}, …]`), oldest first; only windows
+after `apply` count. An unknown measure decides nothing and stays published.
+
 ## Comparative replay: `ameesh replay`
 
 ```
