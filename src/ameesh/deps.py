@@ -1611,6 +1611,8 @@ def _status(top: str, cache_root: str) -> list[dict]:
                 "cached": read_marker(entry_of(root, key)) is not None}
         try:
             packagers = _packagers(pkg)
+            bundle_warning = (deps_packagers.release_bundle_warning(pkg)
+                              if is_shared_link(link, cache_root) else None)
         except (OSError, ValueError) as exc:
             item["warning"] = "invalid package.json: %s" % exc
         else:
@@ -1618,6 +1620,8 @@ def _status(top: str, cache_root: str) -> list[dict]:
                 item["packagers"] = packagers
                 if os.path.islink(link):
                     item["warning"] = deps_packagers.local_reason(packagers)
+            if bundle_warning:
+                item["warning"] = " ".join(filter(None, (item.get("warning"), bundle_warning)))
         out.append(item)
     return out
 

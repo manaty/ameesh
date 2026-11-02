@@ -369,3 +369,14 @@ its real trees, already counted once in the cache.
 Moving nexlink to pnpm (one global store, hard links) would change the nexlink
 repository, its CI and EAS builds. It is a proposal for the owner, not part of
 this lot.
+
+### Release bundle advisory (#5422)
+
+`ameesh deps status` warns (text and JSON `warning`) when a package declares
+Expo or Next in dependencies, npm aliases or script command positions and its
+`node_modules` points into the shared cache, including a stale cache link.
+Run `ameesh deps unlink` in that package before `expo export` for release/OTA
+or `next build` with `output: 'standalone'`. This advisory keeps development
+links allowed. It does not execute Next configuration: the Next warning is
+conditional on standalone output. Undeclared tools invoked externally and
+commands hidden in external scripts cannot be inferred.
