@@ -269,6 +269,43 @@ class WaitingDesignationTest(_Fixture):
         shown = act.reviewers(self.cfg, self.db, self.lot)
         self.assertEqual(shown["designation"]["state"], "designated")
 
+    def test_one_verdict_does_not_neutralize_a_waiting_seat(self):
+        # #5481 (B cx2) : deux avis requis, une seule famille disponible.
+        # L'attente partielle désigne rev1 ; rev1 rend son avis. Au regel du
+        # même SHA, un avis isolé ne prouve pas la couverture : le siège
+        # manquant reste à reprendre, et seule la seconde famille est relancée.
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'stopped' WHERE name = 'rev2'")
+        _, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "waiting", outcome)
+        self.assertEqual([row["name"] for row in outcome["reviewers"]], ["rev1"])
+        # L'attente envoie aussi son avis de capacité au pilote : seules les
+        # demandes de relecture comptent ici.
+        self.assertEqual([row["recipient"] for row in self.review_mail()
+                          if row["recipient"] != "pilot"], ["rev1"])
+        # Le verdict arrive sur la tête gelée, mais le quorum (2) n'est pas
+        # atteint.
+        self.verdict("rev1", self.repo.reviewed)
+        # La capacité revient.
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'idle' WHERE name = 'rev2'")
+        second: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=self.repo.reviewed,
+                       actor="author", outcome=second, repo=self.repo.root,
+                       defer_designation=True)
+        self.assertEqual(second.get("state"), "deferred", second)
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            report = act.finish_deferred(self.cfg, self.db)
+        mine = [row for row in report["results"] if row["lot"] == self.lot]
+        self.assertEqual(len(mine), 1, report)
+        self.assertEqual(sorted(self.designated()), ["rev1", "rev2"])
+        # La demande de rev1 nommait déjà cette tête : aucun second courrier ;
+        # seule la famille manquante (rev2) est notifiée par la reprise.
+        self.assertEqual([row["recipient"] for row in self.review_mail()
+                          if row["recipient"] != "pilot"], ["rev1", "rev2"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], "designated")
+
 
 class DesignateDeferredForceTest(_Reviewed):
     """Un report planifié mais refusé ne neutralise pas la sélection réelle."""

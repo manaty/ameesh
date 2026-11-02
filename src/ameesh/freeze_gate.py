@@ -917,9 +917,10 @@ def milestone(
         except Exception:  # noqa: BLE001 - lecture ratée : gel normal
             previous, marks = None, ()
         # #5481 (B de la revue) : le raccourci ne vaut que s'il a quelque
-        # chose à garder — des sièges, une dispense, ou des verdicts rendus
-        # sur ce SHA. Sinon c'est une première désignation : le chemin
-        # différé (contrôle des familles, marque durable, reprise) s'applique.
+        # chose à garder — une désignation acquise, une dispense, ou (quand
+        # aucune marque n'est lisible) des verdicts rendus sur ce SHA. Sinon
+        # c'est une première désignation : le chemin différé (contrôle des
+        # familles, marque durable, reprise) s'applique.
         acquired = False
         if previous and plan_git.same_commit(previous.get("sha"), sha):
             from . import review_designation_activation as activation
@@ -932,12 +933,22 @@ def milestone(
                          for name in (item.get("reviewers") or ())]
             waived = (work_mod.REVIEWER_NONE in reviewers
                       or str(item.get("reviewer") or "").strip() == work_mod.REVIEWER_NONE)
-            effective = activation.acquired_on_head(
+            # #5481 (B de la revue) : une marque d'attente ou incomplète doit
+            # être **reprise** ; un avis isolé sur la tête ne prouve pas la
+            # couverture de la désignation (deux avis requis, un seul rendu).
+            # Le raccourci fondé sur les seuls avis ne vaut donc que si
+            # aucune marque n'est lisible — rien à reprendre ; un verdict de
+            # plus n'efface jamais le siège manquant ni sa reprise.
+            mark = activation._effective_mark(
+                db, item_id, int(previous.get("id") or 0),
+                since_ts=float(previous.get("at_ts") or 0.0))
+            covered = activation.acquired_on_head(
                 db, getattr(db, "cfg", None), item_id, previous)
             verdicts = any(m.get("kind") == "verdict"
                            and plan_git.same_commit(m.get("sha"), sha)
                            for m in marks)
-            acquired = bool(effective or waived or verdicts)
+            acquired = bool(covered or waived
+                            or (verdicts and mark is None))
         same_head = bool(previous and acquired
                          and plan_git.same_commit(previous.get("sha"), sha))
     if kind == "frozen" and on_frozen is None:
