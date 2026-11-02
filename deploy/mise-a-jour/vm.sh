@@ -162,6 +162,13 @@ unset _d _v
 mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
 etape() { printf '\n== %s\n' "$*"; }
+# #5425 : le battement de staging.sh lit ce fichier : la date de sa derniere
+# ecriture prouve le progres du redemarrage glissant, son contenu donne le
+# nombre de runners qui fixe l'echeance de l'hote. Jamais bloquant.
+signaler_progres() {  # nombre de runners
+  [ -n "${STAGING_PROGRES:-}" ] || return 0
+  printf '%s\n' "$1" > "$STAGING_PROGRES" 2>/dev/null || true
+}
 # #2184/N3 : options communes à tous les liens SSH du script. ConnectTimeout
 # borne l'établissement ; ServerAliveInterval/CountMax coupent un lien devenu
 # muet (30 s) au lieu de laisser la commande suspendue.
@@ -1236,6 +1243,7 @@ redemarrer_agents() {
   # #4358 : boucle indexée, `reporter_illisible` ajoute en fin de liste.
   for ((i = 0; i < ${#restantes[@]}; i++)); do
       p=${restantes[i]}
+      signaler_progres "${#restantes[@]}"
       # Ne jamais poser le drain suivant tant que le précédent reste suivi.
       # Le trap réconcilie et rapporte toute pause restante, même sur échec.
       exiger_drain_precedent_leve "$p" || return 1
@@ -2174,6 +2182,7 @@ redemarrer() {
   # #4358 : boucle indexée, `reporter_illisible` ajoute en fin de liste.
   for ((i = 0; i < ${#restantes[@]}; i++)); do
       p=${restantes[i]}
+      signaler_progres "${#restantes[@]}"
       # Ne jamais poser le drain suivant tant que le précédent reste suivi.
       # Le trap réconcilie et rapporte toute pause restante, même sur échec.
       exiger_drain_precedent_leve "$p" || return 1

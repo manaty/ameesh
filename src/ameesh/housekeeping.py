@@ -36,7 +36,8 @@ l'humain. Chaque famille a sa règle :
 * **Worktrees** : ceux qui APPARAISSENT pendant un tour (diff de `git
   worktree list` avant/après, sous-agents compris) sont enregistrés avec
   l'agent, le tour et le lot — s'ils sont sous le dossier de travail de
-  l'agent, ou si leur branche (`lot/<id>`, `agent/<nom>-<id>`,
+  l'agent, sous son dossier temporaire quel que soit le dépôt d'où ils
+  viennent (#5426), ou si leur branche (`lot/<id>`, `agent/<nom>-<id>`,
   `review/<nom>-<id>`) ou leur dossier (`<nom>-<id>`) nomme un lot assigné à
   cet agent (#1665). #3266 : un worktree suivi sans lot est relu à chaque
   passage (pas seulement ceux marqués « non attribué ») et le dossier le
@@ -2787,6 +2788,77 @@ def same_repository(path: str, repo: str,
     return bool(here and there) and _real(here) == _real(there)
 
 
+def worktree_of(path: str, budget: PassBudget | None = None) -> dict | None:
+    """#5426: the `list_worktrees` entry of the linked worktree `path`, read
+    from ITS repository (the common dir, whichever it is): a worktree created
+    under an agent's temporary directory from another clone must be attached
+    to that clone, not to the turn's cwd. None when its repository is
+    unreadable or the path is no longer listed."""
+    repo = common_dir(path, budget=budget)
+    if not repo:
+        return None
+    target = _real(path)
+    for wt in list_worktrees(repo, budget=budget):
+        if _real(wt["path"]) == target:
+            return wt
+    return None
+
+
+def _linked_worktree(path: str) -> bool:
+    """#5426: `path` is a live linked worktree — `.git` is a regular file
+    (a clone's is a directory) whose gitdir still exists. A symbolic or dead
+    marker is not one (same rule as `_git_marker`)."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        return False
+    marker = os.path.join(path, ".git")
+    try:
+        if os.path.islink(marker) or not os.path.isfile(marker):
+            return False
+    except OSError:
+        return False
+    return _git_marker(path) is not None
+
+
+def worktrees_under(root: str, limit: int | None = None) -> list[str]:
+    """#5426: the linked worktrees under `root`, at any depth — a turn may
+    create one from another repository, under the agent's own temporary
+    directory.
+
+    A git-marked subtree is recognised before it is opened and is never
+    walked (clone, worktree, bare repository, dead worktree); symbolic links
+    are not followed. Bounded by `limit` directories (WALK_LIMIT by default):
+    the inventory is a convenience, never a condition of a deletion."""
+    if not root or not os.path.isdir(root) or os.path.islink(root):
+        return []
+    limit = WALK_LIMIT if limit is None else limit
+    out: list[str] = []
+    stack = [root]
+    walked = 0
+    while stack:
+        current = stack.pop()
+        walked += 1
+        if walked > limit:
+            break
+        if os.path.lexists(os.path.join(current, ".git")):
+            if _linked_worktree(current):
+                out.append(current)
+            continue                   # never open a git-marked subtree
+        if _bare_git_copy(current):
+            continue                   # a bare repository has no work tree to list
+        try:
+            with os.scandir(current) as it:
+                entries = sorted(it, key=lambda e: e.name, reverse=True)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(entry.path)
+            except OSError:
+                continue
+    return out
+
+
 def _scratch_merge_tree(path: str, ref: str, budget: PassBudget | None = None):
     """`git merge-tree --write-tree ref HEAD` whose new objects go to a
     scratch directory (the repository's objects as alternates), deleted
@@ -3429,6 +3501,9 @@ class Turn:
         if self.off:
             return self.entries
         policy = self.policy
+        scanned: list[str] = []        # worktrees already seen by the eviction scan
+        scan_done = False
+        scan_truncated = False
         try:
             if self.env and self.tmp and self.lock is not None and self.lock.exclusive_now():
                 # L219: under the exclusive lock, or no eviction (another
@@ -3436,6 +3511,9 @@ class Turn:
                 root = tmp_root(self.cfg, policy)
                 result = evict_lru([self.tmp], root, policy.tmp_quota,
                                    min_age=EVICT_MIN_AGE_S)
+                scanned = list(result.get("worktrees") or ())
+                scan_done = True
+                scan_truncated = bool(result.get("truncated"))
                 episode = tmp_episode(db, host, self.tmp, result,
                                       now=time.time())
                 self.entries.extend(eviction_entries(
@@ -3446,22 +3524,50 @@ class Turn:
             if self.lock is not None:      # L219: the turn is over
                 self.lock.release()
                 self.lock = None
-        if policy.worktrees and self.cwd and db is not None:
-            known_cwd = os.path.abspath(self.cwd)
-            repo = ""
+        if policy.worktrees and db is not None and (self.cwd or self.tmp):
+            known_cwd = os.path.abspath(self.cwd) if self.cwd else ""
             others = None  # dossiers des autres agents, lus au premier besoin
-            for wt in list_worktrees(self.cwd):
-                if wt["path"] in self.worktrees_before or wt["path"] == known_cwd \
-                        or wt.get("bare"):
+            candidates = list_worktrees(self.cwd) if self.cwd else []
+            seen = {os.path.abspath(wt["path"]) for wt in candidates}
+            if self.tmp:
+                # #5426 : un tour peut créer un worktree d'un AUTRE dépôt sous
+                # son propre dossier temporaire ; `list_worktrees(cwd)` ne le
+                # voit pas. Le relevé d'éviction vient de parcourir ce dossier
+                # (racines git protégées) : on le réutilise, sinon on refait un
+                # parcours borné. Seuls les worktrees liés (`.git` fichier)
+                # sont suivis ici ; un clone a son propre ménage (#2743).
+                if scan_done and not scan_truncated:
+                    found_tmp = [p for p in scanned if _linked_worktree(p)]
+                else:
+                    found_tmp = worktrees_under(self.tmp)
+                for path in found_tmp:
+                    path = os.path.abspath(path)
+                    if path in seen:
+                        continue
+                    wt = worktree_of(path)
+                    if wt is None or wt.get("bare"):
+                        continue
+                    seen.add(path)
+                    candidates.append(wt)
+            for wt in candidates:
+                if wt["path"] in self.worktrees_before \
+                        or (self.cwd and wt["path"] == known_cwd) or wt.get("bare"):
                     continue
+                under_tmp = bool(self.tmp) and _under(_real(wt["path"]), _real(self.tmp))
                 if others is None:
                     others = _other_agent_cwds(db, self.agent)
                 # L73b : `git worktree list` couvre tout le dépôt ; un worktree
                 # d'un autre agent apparu pendant ce tour n'est pas à nous.
-                mine = others is not False and owns_worktree(wt["path"], self.cwd, others)
+                mine = under_tmp or (others is not False
+                                     and owns_worktree(wt["path"], self.cwd, others))
                 branch = wt.get("branch") or ""
                 served = None
-                if not mine and others is not False:
+                if under_tmp:
+                    # #5426 : le dossier temporaire est propre à CET agent (il
+                    # le tient sous verrou) ; la branche peut néanmoins nommer
+                    # le lot que le worktree sert.
+                    served = lot_of_worktree(db, self.agent, wt["path"], branch)
+                elif not mine and others is not False:
                     # #1665 : hors du dossier de l'agent, la branche (ou le
                     # dossier) nomme le lot, et ce lot lui est assigné : c'est
                     # le sien, il suivra la fin de ce lot. Un worktree sous le
@@ -3471,7 +3577,11 @@ class Turn:
                     if not ailleurs:
                         served = lot_of_worktree(db, self.agent, wt["path"], branch)
                         mine = served is not None
-                repo = repo or common_dir(self.cwd)
+                repo = common_dir(wt["path"])
+                if not repo and not under_tmp and self.cwd:
+                    repo = common_dir(self.cwd)
+                if not repo:
+                    continue
                 hk = storage.of(db).housekeeping
                 row = hk.register_worktree(
                     host=host, path=wt["path"], repo=repo, agent=self.agent,
@@ -3480,9 +3590,15 @@ class Turn:
                 if row is None:
                     continue
                 if mine:
-                    detail = ("appeared during turn %s (%s); removed at the end of the lot if "
-                              "clean and integrated into the main branch"
-                              % (turn_id[:8], branch or "detached"))
+                    if under_tmp:
+                        detail = ("under the agent's temporary directory, whatever its "
+                                  "repository, turn %s (%s); removed at the end of the lot "
+                                  "if clean and integrated into the main branch"
+                                  % (turn_id[:8], branch or "detached"))
+                    else:
+                        detail = ("appeared during turn %s (%s); removed at the end of the "
+                                  "lot if clean and integrated into the main branch"
+                                  % (turn_id[:8], branch or "detached"))
                 else:
                     detail = ("%s: appeared during turn %s (%s) outside the agent's "
                               "directory; removed once orphaned (clean, pushed, idle for "
@@ -4136,7 +4252,12 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             plan.append(held_by_archive or dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
-                entries.append(dict(base, action="kept", detail=detail, data={
+                # #5426 : le signal de garde porte la taille du worktree (le
+                # journal, donc `ameesh hosts`), sans l'inscrire dans le détail
+                # de statut qui est normalisé (#4442) : la grâce de 24 h ne
+                # repart pas à chaque passage. Relevé borné par le budget.
+                size = size_of(path, budget=_phase_budget(budget, reserve_s))
+                entries.append(dict(base, action="kept", detail=detail, bytes=size, data={
                     "reason": st["reason"],
                     "command": "git -C %s status ; git -C %s log --all --not --remotes"
                                % (shlex.quote(path), shlex.quote(path))}))
