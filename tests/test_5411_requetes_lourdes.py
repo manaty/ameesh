@@ -207,3 +207,19 @@ class BalancesWindowTest(PgTestCase):
         self._reading("p", "USD", 4, 3600)
         rows = storage.of(self.db).operations.balances(provider="p", since_s=86400.0)
         self.assertEqual([float(row["total"]) for row in rows], [3.0, 4.0])
+
+    def test_the_series_summary_keeps_peak_and_spend(self):
+        # 100 -> 80 (baisse 20), 80 -> 120 (recharge), 120 -> 110 (baisse 10)
+        for seconds_ago, total in ((4 * 3600, 100), (3 * 3600, 80),
+                                   (2 * 3600, 120), (3600, 110)):
+            self._reading("p", "USD", total, seconds_ago)
+        summary = next(row for row in storage.of(self.db).operations.balance_series(
+            provider="p", account=None, since_s=86400.0)
+            if row["currency"] == "USD")
+        self.assertEqual(summary["readings"], 4)
+        self.assertEqual(summary["total"], 110)
+        self.assertEqual(summary["spent"], 30)
+        # le sommet repart de la dernière hausse (120), pas du sommet initial
+        self.assertEqual(summary["peak"], 120)
+        self.assertEqual(summary["first_ts"], summary["first_ts"])
+        self.assertGreater(summary["last_ts"], summary["first_ts"])

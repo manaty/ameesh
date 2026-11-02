@@ -886,3 +886,55 @@ class Operations(interface.Operations):
             """,
             tuple(params),
         ))
+
+    def balance_series(self, *, provider, account, since_s) -> list[dict]:
+        """#5411 : l'état d'UNE série de soldes en une lecture bornée.
+
+        Rend une ligne par devise (de la plus petite à la plus grande) :
+        `readings`, `first_ts`, `last_ts`, `total` et `available` du dernier
+        relevé, `spent` (somme des baisses entre relevés successifs, une
+        hausse est une recharge ignorée) et `peak` (sommet du dernier segment,
+        depuis la dernière hausse). C'est exactement ce que `_peak` et
+        `balance_rate` calculaient en Python sur jusqu'à 30 jours de lignes :
+        `ameesh alerts` transférait ~4 300 lignes par appel, 1,68 M d'appels
+        et 111 000 s cumulées depuis le 27/10.
+
+        `account` vide et NULL désignent la même série (le compte par défaut
+        du fournisseur), comme `(row["account"] or "")` dans `_history`."""
+        return self.db.query(
+            """
+            WITH s AS (
+                SELECT upper(currency) AS currency, total, available, observed_at, id,
+                       lag(total) OVER w AS previous,
+                       row_number() OVER w AS position
+                  FROM provider_balances
+                 WHERE provider = %s
+                   AND coalesce(account, '') = %s
+                   AND observed_at >= now() - make_interval(secs => %s)
+                WINDOW w AS (PARTITION BY upper(currency) ORDER BY observed_at, id)
+            ), grouped AS (
+                SELECT currency, count(*) AS readings,
+                       min(observed_at) AS first_at, max(observed_at) AS last_at,
+                       coalesce(sum(greatest(0, previous - total)), 0) AS spent,
+                       max(position) FILTER (WHERE total > previous) AS rise
+                  FROM s GROUP BY currency
+            )
+            SELECT g.currency, g.readings::int AS readings,
+                   extract(epoch from g.first_at)::float8 AS first_ts,
+                   extract(epoch from g.last_at)::float8 AS last_ts,
+                   g.spent::float8 AS spent,
+                   last.total::float8 AS total, last.available AS available,
+                   peak.total::float8 AS peak
+              FROM grouped g
+              CROSS JOIN LATERAL (
+                  SELECT s.total, s.available FROM s
+                   WHERE s.currency = g.currency
+                   ORDER BY s.observed_at DESC, s.id DESC LIMIT 1) last
+              CROSS JOIN LATERAL (
+                  SELECT max(s.total) AS total FROM s
+                   WHERE s.currency = g.currency
+                     AND s.position >= coalesce(g.rise, 1)) peak
+             ORDER BY g.currency
+            """,
+            (provider, account or "", float(since_s)),
+        )
