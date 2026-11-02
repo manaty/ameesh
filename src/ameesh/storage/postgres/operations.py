@@ -741,29 +741,19 @@ class Operations(interface.Operations):
         fenêtre plus ancienne est close — son relevé est écarté même inséré
         plus récemment. À échéance égale (même fenêtre), la production puis
         l'insertion départagent, comme `gauge_latest`.
+
+        #5542 : le même seek par groupe que `gauge_latest` (#3922) ; seul
+        l'ordre DANS chaque jauge change (`resets_at` d'abord). L'index additif
+        `quota_gauge_readings_window_seek_idx` (migration 0535) porte cet
+        ordre, sans quoi le tri parcourrait tout l'historique du compte.
         """
         if harness is None or account is None:
             return []
-        return self.db.query(
-            """
-            SELECT DISTINCT ON (gauge_key)
-                   harness, gauge_key AS key, used,
-                   extract(epoch from resets_at)::float8 AS resets_at_ts,
-                   window_s,
-                   extract(epoch from observed_at)::float8 AS observed_ts,
-                   extract(epoch from produced_at)::float8 AS produced_ts,
-                   source, account, overage_capable, overage_in_use
-              FROM quota_gauge_readings
-             WHERE harness = %s
-               AND (account IS NULL) IS FALSE
-               AND coalesce(account, '') = %s
-             ORDER BY gauge_key,
-                      resets_at DESC NULLS LAST,
-                      produced_at DESC NULLS LAST,
-                      observed_at DESC, id DESC
-            """, (harness, account))
+        return self._gauge_heads(harness=harness, account=account,
+                                 window_first=True)
 
-    def _gauge_heads(self, *, since_s=None, harness=None, account=None, by_source=False):
+    def _gauge_heads(self, *, since_s=None, harness=None, account=None,
+                     by_source=False, window_first=False):
         """#3922: seek each winning reading, skipping its entire group.
 
         DISTINCT ON walks every historical reading even with an ordered index.
@@ -772,6 +762,10 @@ class Operations(interface.Operations):
         null flag keeps NULL distinct from an empty named account and makes the
         tuple comparable (SQL row comparisons containing NULL cannot seek).
         The additive gauge_seek index matches these expressions exactly.
+
+        `window_first` (#5542) orders each gauge by `resets_at DESC NULLS LAST`
+        before production and insertion, preserving #5466's later-expiry-wins
+        invariant; the additive window_seek index (0535) matches that order.
         """
         key = "harness, (account IS NULL), coalesce(account, ''), gauge_key"
         extra = ", (account IS NULL) AS unnamed, coalesce(account, '') AS account_key"
@@ -794,7 +788,8 @@ class Operations(interface.Operations):
             scope = ("harness = %s AND (account IS NULL) IS FALSE"
                      " AND coalesce(account, '') = %s AND ")
             params.extend((harness, account))
-        order = key + ", produced_at DESC NULLS LAST, observed_at DESC, id DESC"
+        order = key + (", resets_at DESC NULLS LAST" if window_first else "")
+        order += ", produced_at DESC NULLS LAST, observed_at DESC, id DESC"
         return self.db.query(
             "WITH RECURSIVE " + bounds + "heads AS ("
             " (SELECT q.*" + extra + " FROM quota_gauge_readings q WHERE " + scope +
