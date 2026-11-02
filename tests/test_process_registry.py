@@ -1573,7 +1573,8 @@ class RegistryTest(PgTestCase):
         """B5 (package 0650), pre-0452 support: without the registry
         columns, `work.get` returns an empty `workflow_ref` (no lot is
         pinned there) and the historical commands remain those from before
-        the registry — the read depends on no column probe."""
+        the registry — #5404: behind the column probe, whose positive answer
+        is cached, hence the reset."""
         moved = self.lot(state="build")
         to_close = self.lot(state="build")
         to_freeze = self.lot(state="intake")
@@ -1582,6 +1583,7 @@ class RegistryTest(PgTestCase):
         self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_ref CASCADE")
         self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_stage")
         self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_version")
+        self.db.__dict__.pop("_has_current_item_columns", None)
         self.addCleanup(self._restore_workflow_columns)
 
         self.assertEqual(work.get(self.db, moved)["workflow_ref"], "")

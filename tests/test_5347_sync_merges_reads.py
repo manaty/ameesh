@@ -44,22 +44,22 @@ class _RecordingDb:
 
 
 class ItemsSqlTest(unittest.TestCase):
-    """La conversion JSON d'`items` est unique et postérieure à la borne."""
+    """Les colonnes d'`items` sont calculées après la borne, sans conversion de la ligne."""
 
     def setUp(self) -> None:
         self.db = _RecordingDb()
         work_pg.WorkItems(self.db).items(state=None, assignee=None, limit=1000)
         self.sql, self.params = self.db.statements[-1]
 
-    def test_to_jsonb_once_per_returned_row(self):
-        self.assertEqual(len(re.findall(r"to_jsonb\(", self.sql)), 1, self.sql)
+    def test_no_whole_row_conversion(self):
+        # #5404 : les colonnes se lisent directement, sans `to_jsonb(ligne)`.
+        self.assertNotIn("to_jsonb(work_items)", self.sql)
 
     def test_the_limit_precedes_the_conversion(self):
         self.assertRegex(
             self.sql,
             r"FROM \(SELECT \* FROM work_items.*ORDER BY updated_at DESC LIMIT %s\)"
-            r" work_items CROSS JOIN LATERAL "
-            r"\(SELECT to_jsonb\(work_items\) AS doc OFFSET 0\) j")
+            r" work_items ORDER BY")
         # la borne est le seul paramètre de la lecture
         self.assertEqual(self.params, (1000,))
 

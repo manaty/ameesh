@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#5404 : `ameesh alerts` — lectures sans `to_jsonb(ligne)`, passes à blanc sans git."""
+import unittest
+from unittest import mock
+
+from ameesh import canon, db as db_mod
+from ameesh.modules.dev import lot_class
+from ameesh.storage.postgres import operations, roadmap, work, work_dependencies
+from tests.support import PgTestCase
+
+
+class SqlSansLigneEntiere(unittest.TestCase):
+    def test_colonnes_directes(self):
+        for sql in (work.item_columns(None, "w"),
+                    operations.Operations._LOTS_ACTIVITY,
+                    work_dependencies.freeze_due("w"), work_dependencies.fix_owed("w"),
+                    roadmap._ITEM_COLUMNS):
+            self.assertNotIn("to_jsonb(w)", sql)
+            self.assertNotIn("to_jsonb(work_items)", sql)
+
+    def test_item_columns_garde_la_forme_json_de_reviewers(self):
+        self.assertIn("to_jsonb(w.reviewers) AS reviewers", work.item_columns(None, "w"))
+
+    def test_sans_ref_repli_seulement_sur_un_schema_en_retard(self):
+        class Base:
+            def __init__(self, n):
+                self.n, self.lectures = n, 0
+
+            def query(self, sql, params=()):
+                self.lectures += 1
+                return [{"n": self.n}]
+
+        a_jour = Base(len(work._OPTIONAL_ITEM_COLUMNS))
+        for _ in range(2):
+            self.assertTrue(work.has_current_item_columns(a_jour))
+        self.assertEqual(a_jour.lectures, 1)
+        en_retard = Base(len(work._OPTIONAL_ITEM_COLUMNS) - 1)
+        for _ in range(2):
+            self.assertFalse(work.has_current_item_columns(en_retard))
+        self.assertEqual(en_retard.lectures, 2)
+        for base, repli in ((a_jour, False), (en_retard, True)):
+            with mock.patch.object(work, "has_reviewer", return_value=True), \
+                    mock.patch.object(work, "has_migration_slots", return_value=False):
+                self.assertEqual("to_jsonb(work_items)" in work.item_columns(base), repli)
+
+    def test_frise_compte_sur_les_identifiants(self):
+        select = roadmap._ITEMS_SQL.split("SELECT __COLS__")[0]
+        self.assertIn("count(*) OVER ()", select)
+        self.assertNotIn("__COLS__", select)
+
+    def test_frise_lie_ses_parametres_dans_l_ordre(self):
+        rows = []
+
+        class Db:
+            def query(self, sql, params):
+                rows.append((sql, params))
+                return []
+
+        store = roadmap.Roadmap.__new__(roadmap.Roadmap)
+        store.db = Db()
+        store.items(since_ts=12.0, limit=3, done_states=("a", "b"), project="p")
+        sql, params = rows[0]
+        self.assertEqual(sql.count("%s"), len(params))
+        self.assertEqual(params, ("a", "b", "a", "b", 12.0, "p", "p", 3))
+
+
+class ReplisDeLActivite(PgTestCase):
+    """Le SQL de repli s'exécute : un remplacement qui le corrompt n'a pas
+    d'autre témoin, le schéma des tests étant à jour."""
+
+    def lire(self, lecture):
+        vus = []
+        vrai = self.db.query
+
+        def query(sql, params=()):
+            vus.append(sql)
+            return vrai(sql, params)
+
+        with mock.patch.object(operations, "has_current_item_columns", return_value=False), \
+                mock.patch.object(self.db, "query", query):
+            lecture(operations.Operations(self.db))
+        return vus[-1]
+
+    def test_repli_de_l_activite_valide_et_sans_colonne_directe(self):
+        for lecture in (lambda o: o.open_lots_activity(5),
+                        lambda o: o.state_lots_activity("merged", 5),
+                        lambda o: o.state_lots_activity("promoted", 5),
+                        lambda o: o.build_lots_activity(5)):
+            sql = self.lire(lecture)
+            for colonne in ("w.legacy_state", "w.reviewer", "w.external_executor",
+                            "w.wake_at", "w.workflow_ref"):
+                self.assertNotIn(colonne, sql)
+
+
+class Copie(unittest.TestCase):
+    def test_reponses_isolees(self):
+        answers = db_mod._Answers()
+        answers.put("q", (), [{"a": [1], "b": {"c": 2}}])
+        first = answers.get("q", ())
+        first[0]["a"].append(9)
+        first[0]["b"]["c"] = 9
+        first[0]["d"] = 9
+        self.assertEqual(answers.get("q", ()), [{"a": [1], "b": {"c": 2}}])
+
+
+class PasseABlanc(unittest.TestCase):
+    def test_aucune_sonde_git(self):
+        recorder = db_mod._Recorder(mock.Mock(cfg=None), db_mod._Answers())
+        with mock.patch.object(lot_class.plan_git, "local_commit") as probe, \
+                mock.patch.object(lot_class.canon_mod, "git_toplevel") as top:
+            self.assertEqual(
+                lot_class.repo_for_freeze(recorder, None, {"assignee": "a"}, "abc1234"),
+                ("", ""))
+        probe.assert_not_called()
+        top.assert_not_called()
+
+
+class CanonUneFois(unittest.TestCase):
+    def test_une_lecture_par_fenetre(self):
+        with mock.patch.object(canon, "_load", side_effect=lambda *a, **k: object()) as read:
+            with canon.configured_cache():
+                first = canon.load("/c")
+                self.assertIs(canon.load("/c"), first)
+                self.assertIsNot(canon.load("/c", default=False), first)
+            self.assertEqual(read.call_count, 2)
+            canon.load("/c")  # hors fenêtre : le canon se relit
+            self.assertEqual(read.call_count, 3)
+
+    def test_lecture_bornee_jamais_memoisee(self):
+        with mock.patch.object(canon, "_load", side_effect=lambda *a, **k: object()) as read:
+            with canon.configured_cache():
+                canon.load("/c", fetch=True)
+                canon.load("/c", fetch=True)
+            self.assertEqual(read.call_count, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
