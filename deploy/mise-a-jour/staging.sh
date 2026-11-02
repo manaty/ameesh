@@ -586,13 +586,26 @@ done
 SHA_TRAVE=${SHA:0:9}
 PRECEDENT=""
 trace() {  # hote etape verdict [detail] [rapport-json]
-  python3 - "$JOURNAL" "$1" "$2" "$3" "${4:-}" "$SHA" "$PRECEDENT" "${5:-}" <<'PY'
+  # #5425 : une etape close garde son heure de debut dans sa ligne de journal ;
+  # le snapshot suivant ne la reconstruit donc plus depuis la fin.
+  local debut="" hote_courant="" etape_courante=""
+  if [ -r "$SUIVI_COURANTE" ]; then
+    IFS=$'\t' read -r hote_courant etape_courante debut _ < "$SUIVI_COURANTE" || debut=""
+    if [ "$hote_courant" != "$1" ] || [ "$etape_courante" != "$2" ] \
+       || ! [[ "$debut" =~ ^[0-9]+$ ]]; then
+      debut=""
+    fi
+  fi
+  python3 - "$JOURNAL" "$1" "$2" "$3" "${4:-}" "$SHA" "$PRECEDENT" "${5:-}" "$debut" <<'PY'
 import json, sys, time
-path, hote, etape, verdict, detail, sha, precedent, rapport = sys.argv[1:9]
+(path, hote, etape, verdict, detail, sha, precedent, rapport,
+ debut) = sys.argv[1:10]
 line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "hote": hote, "etape": etape, "verdict": verdict,
         "sha": sha or None, "precedent": precedent or None,
         "detail": detail or None}
+if debut:
+    line["started"] = float(debut)
 # le rapport de sonde reste structure dans la trace, pas seulement en texte
 # (#2190) ; `detail` garde sa forme historique, lue par actif.py.
 if rapport:
@@ -953,6 +966,25 @@ SUIVI_PLAFOND_TOUR_S=${STAGING_PLAFOND_TOUR_S:-1800}
 SUIVI_BASE_HOTE_S=${STAGING_BASE_HOTE_S:-900}
 SUIVI_RUNNERS_DEFAUT=${STAGING_RUNNERS_DEFAUT:-20}
 SUIVI_BATTEMENT_PID=
+# #5425 N2 : `sleep 0` ou une valeur non numerique ferait tourner le battement
+# en boucle serree ; valider avant tout publish et tout geste, comme les autres
+# reglages de vivacite (nombre fini et positif).
+valider_battement() {
+  local valeur
+  valeur=$(python3 - "$SUIVI_BATTEMENT_S" <<'PY'
+import math, sys
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+if not 0 < value < math.inf:
+    raise SystemExit(1)
+print(value)
+PY
+  ) || { echo "STAGING_BATTEMENT_S invalide : « $SUIVI_BATTEMENT_S » (secondes finies et positives attendues)" >&2; return 2; }
+  SUIVI_BATTEMENT_S=$valeur
+}
+valider_battement || exit $?
 publier_suivi() {  # etat [options de staging_watch…]
   local etat=$1 instantane
   shift
@@ -978,10 +1010,16 @@ with open(path, encoding='utf-8') as stream:
         row = json.loads(line)
         if row.get('sha') == sha and row.get('ts', '') >= since:
             at = epoch(row['ts'])
-            first.setdefault(row['hote'], at)
+            # #5425 : le debut de l'etape est dans la ligne ; a defaut (journal
+            # d'un ancien lanceur), la fin reste la seule heure connue.
+            try:
+                started = float(row['started']) if row.get('started') is not None else at
+            except (TypeError, ValueError):
+                started = at
+            first.setdefault(row['hote'], started)
             last_line[row['hote']] = number
             progress = max(progress, at)
-            hosts[row['hote']] = {'stage': row['etape'], 'verdict': row['verdict'], 'since': at}
+            hosts[row['hote']] = {'stage': row['etape'], 'verdict': row['verdict'], 'since': started}
 try:
     with open(current_path, encoding='utf-8') as stream:
         host, stage, began, mark = stream.read().rstrip('\n').split('\t')
@@ -1022,11 +1060,23 @@ debut_etape() {  # hote etape
   : > "$SUIVI_PROGRES"
   publier_suivi running || echo "suivi staging indisponible" >&2
 }
+# #5425 N3 : `kill -0` reussit sur un zombie non reape ; lire l'etat /proc
+# pour ne pas continuer a publier pour un lanceur deja mort.
+lanceur_vivant() {  # pid
+  local pid=$1 etat
+  [ -n "$pid" ] || return 1
+  if [ -r "/proc/$pid/stat" ]; then
+    etat=$(sed -n 's/^.*) \([A-Za-z]\).*$/\1/p' "/proc/$pid/stat" 2>/dev/null) || etat=""
+    case "$etat" in Z|X|x) return 1 ;; esac
+  fi
+  kill -0 "$pid" 2>/dev/null
+}
 # Le battement prouve le lanceur : il s'arrete avec lui, meme tue par SIGKILL,
 # et ne garde ni le verrou (fd 9) ni ses sorties. `sleep` en arriere-plan : un
 # TERM l'interrompt, mais attend la fin d'une publication en cours, pour
 # qu'aucun `running` tardif ne suive l'etat final.
 lancer_battement() {
+  valider_battement || return $?
   local lanceur=$$
   (
     exec 9>&- >/dev/null 2>&1
@@ -1035,7 +1085,7 @@ lancer_battement() {
     while :; do
       sleep "$SUIVI_BATTEMENT_S" &
       wait $!
-      kill -0 "$lanceur" 2>/dev/null || exit 0
+      lanceur_vivant "$lanceur" || exit 0
       publier_suivi running
     done
   ) &
