@@ -503,6 +503,8 @@ class Operations(interface.Operations):
                    -- dans le plafond de lots en vol (`work_footprints.is_exempt`)
                    w.source,
                    w.external_executor,
+                   -- #5424 N2 : le ticket du lot retenu (`review_family_paused`)
+                   w.issue_ref,
                    -- #2335 : l'appartenance à un paquet se lit sur le porteur
                    -- (`integration/**`), son manifeste (corps) et la tête gelée
                    -- du lot, sans requête par lot. Le corps n'est transféré que

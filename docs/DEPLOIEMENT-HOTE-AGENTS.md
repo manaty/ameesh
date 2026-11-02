@@ -752,7 +752,8 @@ Le chemin avec relève utilise `ameesh.staging_executor` : la demande vit dans
 `staging.request`, et un service utilisateur dédié l'exécute depuis un arbre
 git du commit exact. L'agent qui soumet la demande ne lance aucun SSH de
 déploiement dans son tour. Installer `deploy/systemd/ameesh-staging.service`
-et `.timer` sur **chaque candidat**, avec une configuration privée
+et `.timer` sur **chaque candidat**, dans le gestionnaire utilisateur du
+compte qui détient les accès de déploiement, avec une configuration privée
 `~/.config/ameesh/staging-executor.json`, par exemple :
 
 ```json
@@ -770,9 +771,42 @@ et `.timer` sur **chaque candidat**, avec une configuration privée
   "start_timeout_s": 300,
   "return_timeout_s": 1800,
   "service_timeout_s": 41400,
-  "quiescence_probe": ["/chemin/prive/prouver-arret-staging"]
+  "quiescence_probe": ["/chemin/du/clone-dedie/deploy/mise-a-jour/quiescence-staging.sh"]
 }
 ```
+
+Rien dans l'unité ni dans cette procédure ne nomme un compte (#5494) : `~`
+et `%h` sont le dossier personnel du compte qui exécute l'unité, le compte
+des runners ou un compte dédié, selon la décision owner sur les détenteurs
+de la clé de déploiement (#5484 ; la décision #184823 retient un compte
+dédié, `ameesh-staging`, sur ameesh-agents-1 et ameesh-agents-2, avec sa
+propre clé et sa copie du DSN). Ce compte porte, chez lui :
+`~/.config/ameesh/env` (accès à la base), la configuration privée ci-dessus,
+`bascule_env` (0600, dossier 0700), le clone dédié et le venv de
+l'exécutant. Le linger du compte est actif (`loginctl enable-linger`), et
+les commandes `systemctl --user` se lancent dans **sa** session.
+
+**Venv de l'exécutant.** `ExecStart` vise `%h/.local/share/ameesh/venv`, le
+venv stable de `bascule.py` (#1969) : ses lanceurs lisent le lien
+`venv-courant` au démarrage puis exécutent le binaire du venv versionné
+`venv-<sha7>`. Sous le compte des runners, c'est le venv que
+`vm.sh agents installer` bascule à chaque staging de l'hôte, y compris
+quand l'exécutant déploie son propre hôte. Il survit à cette bascule :
+`activer` ne fait que renommer le lien, et le processus en cours garde son
+chemin concret ; le ménage garde tout `venv-<version>` qu'un processus vivant
+nomme (`/proc/*/cmdline`), donc celui de l'exécutant et de ses enfants ;
+`redemarrer` ne relance que `ameesh-runner-agent@*`, jamais
+`ameesh-staging` ; `staging.sh` tourne depuis l'arbre du commit demandé, pas
+depuis le venv. Le passage suivant de la minuterie démarre sur le nouveau
+venv. Sous un compte dédié, `%h` n'est plus `/home/ameesh` : `vm.sh` ne
+touche pas ce venv, et le compte dédié ne doit jamais exécuter celui des
+runners (les tours d'agents peuvent l'écrire, ce qui contournerait
+l'isolement de la clé). Il garde son propre venv, même disposition, préparé
+depuis son clone dédié (`bascule.py preparer` puis `activer`) ; sa mise à
+jour est une étape à part, posée avec les accès. Tant qu'elle manque,
+l'exécutant reste sur sa version : la qualification lit la version
+réellement lancée (`venv-courant` et `MainPID`), jamais celle qu'on croit
+installée.
 
 Les candidats sont des noms d'hôtes de configuration, jamais des constantes
 du code. Ils doivent avoir le même `key`, le même rôle élu, accès à la base,
@@ -811,14 +845,41 @@ entrée non fiable :
   exigerait un jeton de lecture, nouveau détenteur de secret soumis à une
   décision owner.
 
-Le programme `quiescence_probe` doit vérifier **et terminer si nécessaire**
-l'ancien exécutant et ses opérations distantes, y compris les unités
-transitoires du poste. Il reçoit `STAGING_PREVIOUS_HOST` et
-`STAGING_PREVIOUS_RUN`, et ne rend zéro qu'après preuve de leur arrêt. Un
-PID local absent ou un bail expiré ne suffit pas : les SSH et unités
-distantes peuvent survivre. Sans programme, avec un résultat négatif, ou
-avec des accès manquants, la reprise refuse toute modification et publie
-son blocage. L'arbre source d'une exécution qui perd son bail est conservé.
+Le programme `quiescence_probe` doit prouver l'arrêt de l'ancien exécutant
+et de ses opérations distantes, y compris les unités transitoires du poste.
+Il reçoit `STAGING_PREVIOUS_HOST` et `STAGING_PREVIOUS_RUN`, et ne rend zéro
+qu'après preuve de leur arrêt. Un PID local absent ou un bail expiré ne
+suffit pas : les SSH et unités distantes peuvent survivre. Sans programme,
+avec un résultat négatif, ou avec des accès manquants, la reprise refuse
+toute modification et publie son blocage. L'arbre source d'une exécution
+qui perd son bail est conservé.
+
+La sonde versionnée `deploy/mise-a-jour/quiescence-staging.sh` (#5494) lit
+la topologie de `staging.sh` dans `bascule_env` (`HOTES_STAGING`, sinon les
+`bascule-*.env` et `SERVEUR_SSH`) et interroge chaque hôte en root, par ssh,
+avec un collecteur en lecture seule. Elle rend 0 seulement si : sur l'hôte
+précédent, aucun processus ne reste dans un groupe `ameesh-staging.service`
+(tous comptes ; sur l'hôte courant, l'exécutant appelant et la sonde sont
+permis), aucun processus ne nomme l'arbre `ameesh-release-staging-<run>-`,
+aucun `staging.lock` n'est tenu, aucun `.retour-apres-arret` n'attend dans
+un arbre conservé du run (ce retour n'est écrit que sur cet hôte : marche
+manuelle) ; sur chaque VM de la topologie, aucune session ssh root venue de
+l'hôte précédent et aucune opération de `vm.sh` (bascule, paquet) n'est en
+cours ; aucune unité `poste-maj-staging-*` ne vit sur l'hôte précédent, ni
+sur le poste s'il est déclaré (`QUIESCENCE_SSH_PC_SMICHEA`) et joignable.
+Elle ne termine rien : arrêter une séquence au milieu d'une étape laisserait
+un hôte à mi-parcours. L'arrêt est le geste de l'opérateur
+(`systemctl --user stop ameesh-staging.service` sur l'hôte précédent) ou de
+la surveillance. Hôte précédent ou cible injoignable, rapport incomplet :
+1, sans mutation, et une alerte au pilote et au bureau (`NOTIF_QUIESCENCE`),
+une par run et par raison ; la reprise attend que l'opérateur prouve
+l'arrêt (la sûreté passe avant la relève en 5 min, écart consigné sous
+#5484). Options dans `bascule_env` : `QUIESCENCE_SSH_<HOTE>` (cible ssh, par
+exemple une clé à commande forcée), `QUIESCENCE_ADRESSES_<HOTE>` (adresses
+sous lesquelles les VM voient l'hôte), `QUIESCENCE_ABSENTS` (hôtes que la
+séquence ne touche jamais, comme ses `--absent`). Le clone dédié se place à
+trois niveaux au plus sous le dossier personnel (par exemple
+`~/staging/ameesh`) : la sonde y cherche les arbres conservés.
 
 Une fois la configuration et les accès approuvés, l'opérateur active les
 services sur les candidats et soumet un SHA complet :

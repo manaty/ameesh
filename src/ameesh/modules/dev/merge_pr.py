@@ -789,7 +789,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         try:
             packet_guard.check_merge(database, lot, view.get("headRefName") or "",
                                      target, head, exception=exception, reason=reason,
-                                     actor=actor)
+                                     actor=actor, repo=repo, cfg=cfg)
         except packet_guard.PacketGuardError as exc:
             raise MergePrError(str(exc)) from exc
 
