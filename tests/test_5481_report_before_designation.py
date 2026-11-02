@@ -175,6 +175,25 @@ class SameHeadTest(_Reviewed):
         self.assertEqual(self.designated(), ["rev1", "rev2"])
         self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
 
+    def test_a_same_head_refreeze_through_the_cli_asks_only_the_missing_seat(self):
+        # #4582 : rev1 a voté sur la tête, rev2 non. Le regel du même SHA ne
+        # peut pas garder le quorum (il manque un avis) : la désignation passe
+        # après le report (idle ici) et ne relance que rev2.
+        _, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.verdict("rev1", self.repo.reviewed)
+        self.db.execute("DELETE FROM agent_mailbox")
+        proc = self.mesh(
+            "work", "milestone", str(self.lot), "frozen",
+            "--sha", self.repo.reviewed, "--actor", "author",
+            "--repo", self.repo.root,
+            env=self.env(AMEESH_CONFIG=self.config_without_radar(),
+                         AGENT_MAIL_NAME="author"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([row["recipient"] for row in self.review_mail()],
+                         ["rev2"])
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+
 
 class LiveColumnCoverageTest(_Reviewed):
     """Un siège retiré par le pilote n'est plus couvert par la marque (#5481)."""

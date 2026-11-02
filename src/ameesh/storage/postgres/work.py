@@ -2168,8 +2168,9 @@ class WorkItems(interface.WorkItems):
                     " WHERE work_item_id = %s AND kind = 'frozen' AND id < %s"
                     " ORDER BY id DESC LIMIT 1",
                     (int(item_id), int(milestone["id"])))
-                from ...modules.dev import plan_git
-                same_head = bool(previous and plan_git.same_commit(
+                # #5481 : le comparateur de commits du cœur, déjà importé ici
+                # (#4501) ; le cœur n'importe pas l'implémentation du module.
+                same_head = bool(previous and packet_head.same_commit(
                     previous[0].get("sha"), sha))
             if (kind == "frozen" and items
                     and not items[0].get("workflow_ref")

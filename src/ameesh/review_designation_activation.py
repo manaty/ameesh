@@ -2156,6 +2156,51 @@ def acquired_on_head(db, cfg, lot: int, freeze: Mapping) -> bool:
     return _mark_covers(payload, floor, column=live)
 
 
+def same_head_settled(db, cfg, lot: int, sha: str,
+                      item: Mapping) -> Optional[dict]:
+    """Le gel précédent quand un regel de la **même tête** n'a rien à redemander.
+
+    #5481 : un regel qui nomme le SHA déjà gelé ne remet pas le quorum en jeu ;
+    les avis rendus portent sur un contenu immuable et restent acquis. Une
+    dispense `-none` suffit à écarter toute demande.
+
+    #4582 : un siège **vivant** sans verdict sur cette tête doit encore être
+    demandé (un siège manuel gardé d'un gel à l'autre, un gel différé
+    interrompu avant sa sélection). Le raccourci ne vaut donc que si la
+    désignation est acquise (`acquired_on_head`) et qu'aucun siège de la
+    colonne n'attend son avis ; sinon None : l'appelant suit la désignation
+    normale, qui ne relance pas les acteurs déjà entendus (`answered`). Une
+    colonne ou une frise illisible laisse le raccourci (la marque seule fait
+    foi), comme `acquired_on_head`.
+
+    Rend le gel précédent — sa trace et son identifiant servent au hook — ou
+    None. Des noms de la colonne peuvent être hérités d'une AUTRE tête (un gel
+    différé interrompu les garde) : seule une marque effective du gel précédent
+    ou une dispense prouvent une désignation acquise.
+    """
+    lot = int(lot)
+    try:
+        marks = storage.of(db).work.milestones(lot, None) or ()
+    except Exception:  # noqa: BLE001 - frise illisible : gel normal
+        return None
+    freeze = plan_git.latest_freeze(marks)
+    if not freeze or not plan_git.same_commit((freeze or {}).get("sha"), sha):
+        return None
+    if _waiver(item):
+        return freeze
+    if not acquired_on_head(db, cfg, lot, freeze):
+        return None
+    live = _live_column(item)
+    if live:
+        heard = {str(mark.get("actor") or "").strip().lower()
+                 for mark in marks
+                 if mark.get("kind") == "verdict"
+                 and plan_git.same_commit(mark.get("sha"), freeze.get("sha"))}
+        if any(str(name).strip().lower() not in heard for name in live):
+            return None
+    return freeze
+
+
 def _removed_seats(db, lot: int, freeze: Mapping, live) -> set:
     """The automatic seats of THIS freeze absent from the live column (#3617).
 
