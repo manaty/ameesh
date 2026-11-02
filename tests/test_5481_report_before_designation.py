@@ -238,6 +238,38 @@ class InheritedSeatsTest(_Reviewed):
                          ["rev1", "rev2"])
 
 
+class WaitingDesignationTest(_Fixture):
+    """Une attente n'est pas une désignation acquise : elle reste à reprendre."""
+
+    def test_a_waiting_mark_is_completed_on_same_head_recovery(self):
+        freeze, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        # La désignation effective devient une attente (aucun candidat).
+        payload = {"state": "waiting", "required": 2, "reviewers": [],
+                   "freeze": {"id": freeze["id"], "sha": freeze["sha"]},
+                   "why": "no candidate"}
+        storage.of(self.db).work.note(
+            self.lot, "qa",
+            act.pg.mark_prefix(self.lot, freeze["id"]) + " " + json.dumps(payload),
+            "ameesh")
+        self.assertFalse(act.acquired_on_head(self.db, self.cfg, self.lot, freeze))
+        self.db.execute("DELETE FROM agent_mailbox")
+        second: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=self.repo.reviewed,
+                       actor="author", outcome=second, repo=self.repo.root,
+                       defer_designation=True)
+        self.assertEqual(second.get("state"), "deferred", second)
+        with mock.patch.object(act, "DEFERRED_GRACE_S", 0.0):
+            report = act.finish_deferred(self.cfg, self.db)
+        mine = [row for row in report["results"] if row["lot"] == self.lot]
+        self.assertEqual(len(mine), 1, report)
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.assertEqual([row["recipient"] for row in self.review_mail()],
+                         ["rev1", "rev2"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], "designated")
+
+
 class DesignateDeferredForceTest(_Reviewed):
     """Un report planifié mais refusé ne neutralise pas la sélection réelle."""
 

@@ -932,13 +932,12 @@ def milestone(
                          for name in (item.get("reviewers") or ())]
             waived = (work_mod.REVIEWER_NONE in reviewers
                       or str(item.get("reviewer") or "").strip() == work_mod.REVIEWER_NONE)
-            effective = activation._effective_mark(
-                db, item_id, int(previous.get("id") or 0),
-                since_ts=float(previous.get("at_ts") or 0.0))
+            effective = activation.acquired_on_head(
+                db, getattr(db, "cfg", None), item_id, previous)
             verdicts = any(m.get("kind") == "verdict"
                            and plan_git.same_commit(m.get("sha"), sha)
                            for m in marks)
-            acquired = bool(effective is not None or waived or verdicts)
+            acquired = bool(effective or waived or verdicts)
         same_head = bool(previous and acquired
                          and plan_git.same_commit(previous.get("sha"), sha))
     if kind == "frozen" and on_frozen is None:

@@ -2084,6 +2084,35 @@ def _mark_covers(mark: Mapping, floor: int, *, column=None) -> bool:
     return required >= floor and len(families) >= floor and len(rows) >= floor
 
 
+def acquired_on_head(db, cfg, lot: int, freeze: Mapping) -> bool:
+    """Une désignation **complète** est-elle acquise sur ce gel (#5481) ?
+
+    Une marque `waiting` (aucun candidat, ou sièges partiels) n'est pas une
+    désignation acquise : le retour de capacité doit pouvoir la compléter.
+    Une marque `designated` ou `carried` ne compte que si son compte et ses
+    sièges couvrent le plancher d'avis courant. Sert au raccourci « même
+    tête » : des sièges hérités ou une attente ne le justifient pas."""
+    effective = _effective_mark(db, int(lot), int((freeze or {}).get("id") or 0),
+                                since_ts=float((freeze or {}).get("at_ts") or 0.0))
+    if effective is None:
+        return False
+    payload = dict(effective[2] or {})
+    if effective[1] == "designation" and payload.get("state") == rd.WAITING:
+        return False
+    try:
+        floor = _floor_of(db, int(lot), cfg)
+    except Exception:  # noqa: BLE001 - plancher illisible : pas de raccourci
+        return False
+    if floor <= 0:
+        return True
+    rows = payload.get("reviewers") or ()
+    try:
+        required = int(payload.get("required") or 0)
+    except (TypeError, ValueError):
+        required = 0
+    return required >= floor and len(rows) >= floor
+
+
 def _removed_seats(db, lot: int, freeze: Mapping, live) -> set:
     """The automatic seats of THIS freeze absent from the live column (#3617).
 
@@ -4337,10 +4366,13 @@ def designate_deferred(cfg, db, lot: int, freeze: Mapping, *,
         # écrit une marque sans ce `why` de provision.
         provisional = bool(effective is not None and effective[1] == "carried"
                            and effective[2].get("provisional"))
-        if effective is not None and not (force and provisional):
+        waiting = bool(effective is not None and effective[1] == "designation"
+                       and effective[2].get("state") == rd.WAITING)
+        if effective is not None and not waiting and not (force and provisional):
             return (_carried_shape(effective[2])
                     if effective[1] == "carried" else dict(effective[2]))
-        if not (force and provisional) and _retry_resolved(db, int(lot), freeze):
+        if not waiting and not (force and provisional) \
+                and _retry_resolved(db, int(lot), freeze):
             return {"state": "resolved", "reviewers": [],
                     "freeze": dict(freeze or {}),
                     "why": "a final designation outcome is already journaled"}
@@ -4415,7 +4447,15 @@ def finish_deferred(cfg, db, *, dry_run: bool = False,
         if now - first < DEFERRED_GRACE_S:
             continue
         try:
-            if _effective_mark(db, lot, freeze_id) is not None:
+            effective = _effective_mark(db, lot, freeze_id)
+            waiting = bool(effective is not None and effective[1] == "designation"
+                           and effective[2].get("state") == rd.WAITING)
+            # Une attente est encore à reprendre (capacité revenue) ; mais si
+            # la reprise a déjà écrit une attente APRÈS la marque différée,
+            # une passe suivante ne la rejoue pas en boucle.
+            if effective is not None and not waiting:
+                continue
+            if waiting and float(effective[3] or 0.0) >= first:
                 continue
             if _retry_resolved(db, lot, freeze):
                 continue
