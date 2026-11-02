@@ -156,14 +156,20 @@ class PacketHeadsTest(PgTestCase):
         self.assertEqual(rows[0]["package_frozen_sha"], "")
 
     def test_same_at_is_broken_by_the_higher_id(self):
-        self.mark("merged", "3" * 40, seconds_ago=100)
-        winner = self.mark("merged", "4" * 40, seconds_ago=100)
+        tied_at = "2026-01-01T00:00:00+00:00"
+        milestones = self.db.query(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
+            " VALUES (%s, 'merged', %s, %s, 'test'),"
+            " (%s, 'merged', %s, %s, 'test') RETURNING id, at",
+            (int(self.package["id"]), tied_at, "3" * 40,
+             int(self.package["id"]), tied_at, "4" * 40))
+        self.assertEqual(milestones[0]["at"], milestones[1]["at"])
+        self.assertGreater(int(milestones[1]["id"]), int(milestones[0]["id"]))
         rows = self.store.work.packet_members(package_ids=[int(self.package["id"])])
         self.assertEqual({r["work_item_id"] for r in rows},
                          {int(self.first["id"]), int(self.second["id"])})
         self.assertEqual({r["package_merged_sha"] for r in rows}, {"4" * 40})
         self.assertEqual({r["package_frozen_sha"] for r in rows}, {None})
-        self.assertGreater(winner, 0)
 
 
 if __name__ == "__main__":
