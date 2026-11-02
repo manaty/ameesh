@@ -785,6 +785,32 @@ class CatchUpWitnessTest(_Witness):
             self.assertEqual(len(mail.unread_active(self.db, "pilote")), 1,
                              "l'avertissement est renvoyé à chaque tentative")
 
+    def test_un_paquet_fusionne_ne_produit_aucun_constat(self):
+        """#5460 : un véhicule de paquet n'a pas de relecture après fusion (§12) :
+        ni tentative ni courrier aux pilotes, et une marque terminale sur tout
+        hôte, pour ne plus revenir aux balayages suivants."""
+        lot = self.lot("paquet horaire")
+        work.set_branch(self.db, lot, "integration/paquet-h-20261102-01",
+                        actor="claude1")
+        self.assertEqual(work.merged(self.db, lot, sha="abcdef1234",
+                                     actor="claude1")["result"], "merged")
+        registry.upsert(self.db, "pilote", harness="claude", host=self.cfg.host,
+                        cwd=self.repo)
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}), \
+                mock.patch.object(review_lot, "_host_holds_lot_repo",
+                                  return_value=False):
+            first = review_lot.catch_up(self.db, retry_s=0, host="sans-clone")
+            second = review_lot.catch_up(self.db, retry_s=0, host="sans-clone")
+        self.assertEqual((first["terminal"], first["missing"], first["attempted"],
+                          first["unopened"]), (1, 0, 0, []), first)
+        self.assertEqual(second["examined"], 0, "le véhicule revient au balayage")
+        self.assertEqual(mail.unread_active(self.db, "pilote"), [])
+        out = review_lot.open_for_merge(self.db, lot, merged_sha="abcdef1234")
+        self.assertFalse(out["created"], out)
+        self.assertNotIn("doubt", out)
+        self.assertIn("véhicule de paquet", out["why"])
+
     def test_l_avertissement_ne_part_qu_aux_pilotes_du_projet(self):
         """#3453 : chaque pilote ne reçoit que les lots de son projet — un lot
         ameesh ne part plus à l'orchestrateur nexlink, ni l'inverse."""
