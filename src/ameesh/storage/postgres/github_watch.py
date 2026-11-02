@@ -50,3 +50,70 @@ class GithubWatch(interface.GithubWatch):
                 "INSERT INTO github_watch_scans VALUES (%s,%s,%s::jsonb)"
                 " ON CONFLICT (project,repo) DO UPDATE SET progress=EXCLUDED.progress",
                 (project, repo, json.dumps(progress)))
+
+    # -- #5506: follow-up of delivered inputs ---------------------------------
+    def track(self, project, repo, agent, entries, now):
+        # Caller holds the cursor lock: the follow-up commits with the digest.
+        bound = self.db.query("SELECT coalesce(max(id), 0) AS id FROM work_item_events")
+        events_after = int(bound[0]["id"])
+        for entry in entries:
+            self.db.execute(
+                "INSERT INTO github_watch_pending (project, repo, kind, object_id,"
+                " issue_ref, url, agent, delivered_at, events_after)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                " ON CONFLICT (project, repo, kind, object_id) DO UPDATE SET"
+                " issue_ref=EXCLUDED.issue_ref, url=EXCLUDED.url, agent=EXCLUDED.agent,"
+                " delivered_at=EXCLUDED.delivered_at, events_after=EXCLUDED.events_after,"
+                " reminded_at=NULL, escalated_at=NULL, resolved_at=NULL, proof=NULL,"
+                " checked_at=NULL",
+                (project, repo, entry["kind"], int(entry["object_id"]),
+                 entry["issue_ref"], entry["url"], agent, float(now), events_after))
+
+    def open_entries(self, limit, *, checked_before=None):
+        if checked_before is None:
+            return self.db.query(
+                "SELECT * FROM github_watch_pending WHERE resolved_at IS NULL"
+                " ORDER BY delivered_at, project, repo, kind, object_id LIMIT %s",
+                (int(limit),))
+        return self.db.query(
+            "SELECT * FROM github_watch_pending WHERE resolved_at IS NULL"
+            " AND (checked_at IS NULL OR checked_at <= %s)"
+            " ORDER BY checked_at NULLS FIRST, delivered_at, project, repo, kind, object_id"
+            " LIMIT %s", (float(checked_before), int(limit)))
+
+    def local_proof(self, entry):
+        # An input on an issue is covered by any lot carrying it; a comment
+        # only by a lot created after its delivery.
+        rows = self.db.query(
+            "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
+            " AND (%s = 'issue' OR created_at >= to_timestamp(%s))"
+            " ORDER BY id LIMIT 1",
+            (entry["issue_ref"], entry["kind"], float(entry["delivered_at"])))
+        if rows:
+            return "lot #%s" % rows[0]["id"]
+        rows = self.db.query(
+            "SELECT work_item_id FROM work_item_events WHERE id > %s"
+            " AND strpos(lower(note), lower(%s)) > 0 AND actor <> 'ameesh'"
+            " ORDER BY id LIMIT 1", (int(entry["events_after"]), entry["url"]))
+        if rows:
+            return "note on lot #%s" % rows[0]["work_item_id"]
+        return None
+
+    def resolve(self, entry, proof, now):
+        self.db.execute(
+            "UPDATE github_watch_pending SET resolved_at=%s, proof=%s"
+            " WHERE project=%s AND repo=%s AND kind=%s AND object_id=%s"
+            " AND resolved_at IS NULL AND delivered_at=%s",
+            (float(now), proof, entry["project"], entry["repo"], entry["kind"],
+             int(entry["object_id"]), float(entry["delivered_at"])))
+
+    def mark(self, entries, column, now):
+        if column not in ("reminded_at", "escalated_at", "checked_at"):
+            raise ValueError("github_watch.mark: unknown column %r" % column)
+        for entry in entries:
+            self.db.execute(
+                "UPDATE github_watch_pending SET " + column + "=%s"
+                " WHERE project=%s AND repo=%s AND kind=%s AND object_id=%s"
+                " AND delivered_at=%s",
+                (float(now), entry["project"], entry["repo"], entry["kind"],
+                 int(entry["object_id"]), float(entry["delivered_at"])))

@@ -5100,9 +5100,14 @@
     "advance",
     "checkpoint",
     "cursor",
+    "local_proof",
     "lock",
+    "mark",
+    "open_entries",
     "remember",
-    "scan"
+    "resolve",
+    "scan",
+    "track"
    ],
    "notify_liveness": [
     "acquire_state",
