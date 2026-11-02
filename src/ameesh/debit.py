@@ -615,41 +615,151 @@ def _human_wait(state: str | None, *texts: Any) -> bool:
     return any(_HUMAN_WAIT_RE.search(str(text or "")) for text in texts)
 
 
+def _mark_int(value: Any) -> int | None:
+    """Un entier de marque, ou None : une marque illisible ne devine rien."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
 def _mark(event: dict) -> dict | None:
-    """Une marque de désignation automatique, lue sans colonne de lot."""
+    """Une marque de désignation automatique, lue sans colonne de lot.
+
+    #5430 : la marque porte aussi l'état de la désignation (`waiting` quand
+    une famille éligible manque, `designated` quand les sièges sont pourvus),
+    le nombre d'avis requis et le nombre manquant. Les ignorer faisait lire
+    une liste `reviewers` vide — donc « aucune famille éligible » — comme un
+    quorum atteint dès le premier avis. On garde aussi les familles des
+    auteurs et des relecteurs : elles seules prouvent l'indépendance.
+    """
     text = str(event.get("note") or "").strip()
     match = _MARK.match(text)
     if not match:
         return None
+    lot, freeze = int(match.group(1)), int(match.group(2))
     try:
         document = json.loads(match.group(3))
+        if not isinstance(document, Mapping):
+            raise ValueError("not an object")
     except (ValueError, TypeError):
-        return {"lot": int(match.group(1)), "freeze": int(match.group(2)),
-                "names": [], "authors": [], "unreadable": True}
+        return {"lot": lot, "freeze": freeze, "names": [], "authors": [],
+                "author_families": [], "reviewer_families": {},
+                "state": None, "required": None, "missing": None, "why": "",
+                "unreadable": True, "at": float(event.get("at_ts") or 0.0)}
     names = []
+    reviewer_families: dict[str, str] = {}
     for reviewer in document.get("reviewers") or ():
         if isinstance(reviewer, Mapping):
             name = str(reviewer.get("name") or "").strip()
+            family = str(reviewer.get("family") or "").strip().lower()
         else:
             name = str(reviewer or "").strip()
+            family = ""
         if name and name != "-none":
             names.append(name)
+            if family:
+                reviewer_families[_norm(name)] = family
     # Les auteurs de la tête (dont un relecteur qui a poussé un correctif,
     # #2888/#2739) ne peuvent pas la relire : la marque les nomme déjà.
     authors = []
+    author_families: list[str] = []
     for author in document.get("authors") or ():
         if isinstance(author, Mapping):
             name = str(author.get("name") or "").strip()
+            family = str(author.get("family") or "").strip().lower()
         else:
             name = str(author or "").strip()
+            family = ""
         if name:
             authors.append(name)
-    return {"lot": int(match.group(1)), "freeze": int(match.group(2)),
-            "names": names, "authors": authors, "unreadable": False,
-            "at": float(event.get("at_ts") or 0.0)}
+        if family and family not in author_families:
+            author_families.append(family)
+    state = str(document.get("state") or "").strip().lower() or None
+    return {"lot": lot, "freeze": freeze,
+            "names": names, "authors": authors,
+            "author_families": author_families,
+            "reviewer_families": reviewer_families,
+            "state": state, "required": _mark_int(document.get("required")),
+            "missing": _mark_int(document.get("missing")),
+            "why": str(document.get("why") or "").strip(),
+            "unreadable": False, "at": float(event.get("at_ts") or 0.0)}
 
 
-def designations(milestones: list[dict], events: list[dict]) -> dict:
+_MISSING_WHY = re.compile(
+    r"(\d+)\s+(?:independent\s+)?reviews?\s+missing:\s*"
+    r"(\d+)\s+eligible\s+famil", re.I)
+
+
+def _mark_cause(mark: Mapping | None) -> str:
+    """La cause courte d'un manque de relecteur, lue dans la marque (#5430).
+
+    La marque dit « 2 independent reviews missing: 0 eligible families
+    (none); forbidden author families: deepseek ». On en tire le fait qui
+    commande le geste : aucune famille éligible, ou N familles éligibles, et
+    les familles d'auteur interdites. Une marque sans motif lisible ne fait
+    pas inventer de cause."""
+    why = str((mark or {}).get("why") or "").strip()
+    match = _MISSING_WHY.search(why)
+    if not match:
+        return ""
+    eligible = int(match.group(2))
+    if eligible == 0:
+        cause = "aucune famille éligible"
+    elif eligible == 1:
+        cause = "1 famille éligible"
+    else:
+        cause = "%d familles éligibles" % eligible
+    forbidden = re.search(r"forbidden author families:\s*([^;)]+)", why, re.I)
+    if forbidden:
+        families = forbidden.group(1).strip()
+        if families and families.lower() not in ("none", "aucune"):
+            cause += " (familles d'auteur interdites : %s)" % families
+    return cause
+
+
+def _independent_families(mark: Mapping | None, by_actor: Mapping,
+                          authors: set[str],
+                          agent_families: Mapping[str, str] | None) -> int:
+    """Le nombre de familles distinctes qui ont rendu un avis sur la tête.
+
+    #5430 : `required` compte des **familles** distinctes, jamais des noms :
+    deux relecteurs de la même famille ne valent qu'un avis. La famille est
+    prouvée par la marque (relecteurs désignés) ou par le registre des agents
+    (`harness` → famille du canon, passé par `read`) ; un acteur dont la
+    famille n'est pas prouvée compte pour **une** famille inconnue, jamais
+    pour plusieurs (l'indépendance ne se suppose pas, #1374). Un auteur de la
+    tête ne compte pas, et sa famille est inéligible."""
+    mark = mark or {}
+    known = {_norm(name): str(family).strip().lower()
+             for name, family in (mark.get("reviewer_families") or {}).items()
+             if str(family).strip()}
+    registry = {_norm(name): str(family).strip().lower()
+                for name, family in (agent_families or {}).items()
+                if str(family).strip()}
+    author_families = {str(family).strip().lower()
+                       for family in mark.get("author_families") or ()
+                       if str(family).strip()}
+    families: set[str] = set()
+    unknown = False
+    for actor in by_actor:
+        if actor in authors:
+            continue
+        family = known.get(actor) or registry.get(actor) or ""
+        if family and family in author_families:
+            continue
+        if family:
+            families.add(family)
+        else:
+            unknown = True
+    return len(families) + (1 if unknown else 0)
+
+
+def designations(milestones: list[dict], events: list[dict], *,
+                 agent_families: Mapping[str, str] | None = None) -> dict:
     """Les relecteurs désignés sur le dernier gel et leurs avis encore dus.
 
     Le calcul lit **les jalons et le journal**, jamais `work_items.reviewer`
@@ -669,6 +779,12 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
       désignation explicite ou son retrait (#1979) ;
     * les verdicts qui nomment la tête gelée : un `blocked` rendu compte
       l'avis (le relecteur a rendu), un verdict d'une autre tête ne compte pas ;
+    * #5430 : une marque `waiting` (aucune famille éligible, ou sièges
+      incomplets) n'est pas « prête » parce que sa liste de relecteurs est
+      vide : le lot n'est prêt que si le nombre d'avis sur la tête gelée, de
+      familles **distinctes et éligibles**, atteint `required` — ou si la
+      porte l'a passé en `validated` (#5202). Le manque et sa cause sont
+      rendus (`shortfall`, `cause`), jamais tus derrière un `ready: true` ;
     * #5202 : le passage en `validated` depuis le gel, que la porte n'accorde
       qu'au quorum de la tête gelée (#4423, report compris). Comme pour la
       file et le SLO (#4851), aucun désigné n'est plus dû (#5083 : quorum
@@ -680,7 +796,9 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
     freeze = _latest_freeze(milestones)
     if freeze is None:
         return {"freeze": None, "designees": [], "pending": [], "missing": False,
-                "none": False, "unreadable": [], "quorum": None}
+                "none": False, "unreadable": [], "quorum": None,
+                "required": None, "acquired": None, "shortfall": 0,
+                "why": "", "cause": ""}
     freeze_at = float(freeze.get("at_ts") or 0.0)
     freeze_sha = str(freeze.get("sha") or "").strip()
     unreadable: list[str] = []
@@ -732,7 +850,8 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
     if waived:
         return {"freeze": freeze, "designees": [], "pending": [],
                 "missing": False, "none": True, "unreadable": [],
-                "quorum": None}
+                "quorum": None, "required": None, "acquired": None,
+                "shortfall": 0, "why": "", "cause": ""}
     auto = list(latest_mark["names"]) if latest_mark else []
     # Un auteur de la tête — dont le relecteur qui y a poussé un correctif
     # (#2888/#2739) — ne peut pas la relire. La marque du gel courant le dit ;
@@ -771,6 +890,16 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
         if not _verdict_on_head(milestone, freeze, freeze_sha, freeze_at):
             continue
         by_actor[_norm(milestone.get("actor"))] = milestone
+    mark_state = str((latest_mark or {}).get("state") or "")
+    required = (latest_mark or {}).get("required")
+    if not isinstance(required, int) or mark_state not in ("waiting", "designated"):
+        required = None
+    acquired = None
+    shortfall = 0
+    if required is not None:
+        acquired = _independent_families(latest_mark, by_actor, authors,
+                                         agent_families)
+        shortfall = max(required - acquired, 0)
     pending = []
     for name, designated_at in designees:
         verdict = by_actor.get(_norm(name))
@@ -780,11 +909,27 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
             continue                    # #5202/#4851 : quorum acquis sans son avis
         pending.append({"name": name, "designated_ts": designated_at,
                         "designated": _iso(designated_at)})
+    cause = ""
+    if quorum_at is not None:
+        missing = False
+    elif mark_state == "waiting" and required is not None:
+        # #5430 : une désignation en attente n'est pas un quorum. Elle reste
+        # manquante tant que les avis de familles distinctes n'atteignent pas
+        # `required`, même si un premier avis (souvent le pilote) est rendu.
+        # Un siège déjà désigné qui n'a pas encore voté est un avis dû
+        # nominatif (`pending`), pas un siège impossible à pourvoir.
+        missing = shortfall > 0 and not pending
+        if missing:
+            cause = _mark_cause(latest_mark)
+    else:
+        missing = (latest_mark is None and not none_mark and not designees
+                   and not by_actor and quorum_at is None)
     return {"freeze": freeze, "designees": designees, "pending": pending,
-            "missing": (latest_mark is None and not none_mark and not designees
-                        and not by_actor and quorum_at is None),
-            "none": none_mark, "unreadable": unreadable,
-            "quorum": _iso(quorum_at) if quorum_at is not None else None}
+            "missing": missing, "none": none_mark, "unreadable": unreadable,
+            "quorum": _iso(quorum_at) if quorum_at is not None else None,
+            "required": required, "acquired": acquired,
+            "shortfall": shortfall, "why": str((latest_mark or {}).get("why") or ""),
+            "cause": cause}
 
 
 def _verdict_on_head(verdict: dict, freeze: dict, freeze_sha: str,
@@ -904,6 +1049,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
           ci_unreadable: Iterable[str] = (),
           fixes: Iterable[Mapping[str, Any]] | None = None,
           packets: Iterable[Mapping[str, Any]] = (),
+          families: Iterable[str] = (),
           zone: str = "UTC") -> dict:
     """Le rapport de débit, calculé sans I/O (témoins et tests).
 
@@ -922,7 +1068,12 @@ def build(*, items: Iterable[Mapping[str, Any]],
     #4235 : un hold de pilote qui déclare une **fenêtre d'observation** avec
     son échéance armée (`planned_waits.observation_hold`) est listé dans
     `window_waits`, hors `slow_waits`, jusqu'à cette échéance ; il redevient
-    une attente ordinaire ensuite."""
+    une attente ordinaire ensuite.
+
+    #5430 : `families` sont les familles du canon compilé ; avec le `harness`
+    des agents, elles prouvent la famille d'un verdict et donc le nombre de
+    familles **distinctes** qui ont relu la tête. Sans elles, un verdict
+    compte pour une famille inconnue, jamais pour plusieurs."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
     # la déclaration d'attente externe d'un hold.
@@ -935,6 +1086,21 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if devices is None else dict(devices)
     items = [dict(row) for row in items or ()]
     by_id = {int(row["id"]): row for row in items}
+    agents = [dict(row) for row in agents or ()]
+    # #5430 : la famille d'un verdict est prouvée par le registre (harness)
+    # et les familles du canon, jamais supposée du nom. Un harnais inconnu ne
+    # donne pas de famille (`review_lot.family_of`), et le verdict compte
+    # alors pour une seule famille inconnue.
+    agent_families: dict[str, str] = {}
+    known_families = tuple(str(family).strip().lower() for family in families or ()
+                           if str(family).strip())
+    if known_families:
+        from .review_lot import family_of
+        for agent in agents:
+            name = str(agent.get("name") or "").strip()
+            family = family_of(agent.get("harness"), known_families)
+            if name and family:
+                agent_families[_norm(name)] = family
     milestones_by_lot = _rows_by_lot(milestones)
     # #5328 : les corrections dues viennent de `due_fixes` (une seule lecture,
     # la même que `work fixes-owed`) ; le repli sans base reste local.
@@ -1045,7 +1211,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 open_branches.setdefault(
                     (str(item.get("app") or ""), branch), []).append(ident)
         if freeze is not None and terminal_ts is None:
-            designation = designations(lot_milestones, lot_events)
+            designation = designations(lot_milestones, lot_events,
+                                       agent_families=agent_families)
             unreadable.extend("%s: %s" % (ident, text)
                               for text in designation["unreadable"])
             pending = [p for p in designation["pending"]
@@ -1071,6 +1238,15 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 "age_s": age, "pending_reviewers": [p["name"] for p in pending],
                 "blocked_verdict": bool(blocked),
                 "missing_reviewer": bool(designation["missing"]),
+                # #5430 : le manque et sa cause sont dits, pas seulement le
+                # booléen : « 0 famille éligible » n'est pas « quorum atteint ».
+                "missing_reviews": (int(designation.get("shortfall") or 0)
+                                    if designation["missing"] else 0),
+                "missing_cause": designation.get("cause") or None,
+                "missing_reason": ((designation.get("why") or None)
+                                   if designation["missing"] else None),
+                "required_reviews": designation.get("required"),
+                "acquired_reviews": designation.get("acquired"),
                 "ready": not pending and not designation["missing"] and not blocked,
                 "held": ident in held_lots,
             }
@@ -1245,9 +1421,16 @@ def build(*, items: Iterable[Mapping[str, Any]],
         elif row.get("blocked_verdict"):
             continue                    # l'avis bloquant a son attente dédiée
         elif row.get("missing_reviewer"):
-            add_wait("qa", row, row["frozen_ts"], "aucun relecteur",
-                     GESTURES["no_reviewer"].format(lot=row["lot"]),
-                     human=_human_wait(state))
+            # #5430 : le geste porte la cause de la marque (aucune famille
+            # éligible, N familles éligibles), pas seulement « aucun
+            # relecteur » qui laisserait croire à un oubli de désignation.
+            cause = row.get("missing_cause") or ""
+            gesture = GESTURES["no_reviewer"].format(lot=row["lot"])
+            if cause:
+                gesture += " — cause : %s" % cause
+            add_wait("qa", row, row["frozen_ts"], "aucun relecteur", gesture,
+                     human=_human_wait(state), cause=cause or None,
+                     missing=int(row.get("missing_reviews") or 0))
         else:
             if row.get("depends_on"):
                 continue                # l'attente est celle du lot parent
@@ -2148,9 +2331,15 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
     # un canon illisible ne devine pas Europe/Paris : il dit UTC, sans
     # ajouter une lecture illisible au rapport des lots.
     zone = "UTC"
+    families: tuple[str, ...] = ()
     try:
         from . import mechanics
-        zone = mechanics.configured(cfg).timezone
+        document = mechanics.configured(cfg)
+        zone = document.timezone
+        # #5430 : les familles du canon compilé servent à prouver la famille
+        # d'un verdict (registre `harness` → famille), donc le nombre de
+        # familles distinctes qui ont relu la tête.
+        families = tuple(document.families or ())
     except Exception:  # noqa: BLE001 - zone de repli explicite, jamais devinée
         pass
     agents = _rows(db, _AGENTS_SQL)
@@ -2254,7 +2443,7 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
                    holds=holds, closure_allowed=closure_allowed,
                    ci_unreadable=ci_unreadable, fixes=fixes,
-                   packets=packets, zone=zone)
+                   packets=packets, families=families, zone=zone)
     annotate_candidate_causes(db, cfg, report, milestones, unreadable)
     report["capacity"] = read_capacity(db, cfg=cfg, now=now, hours=hours, turns=turns,
                                        canons=canons, unreadable=unreadable)
