@@ -131,6 +131,33 @@ class RotationBackoffTest(PgTestCase):
             self.assertFalse(worker.run_turn({"kind": "prompt", "prompt": "t", "ids": []}))
         self.assertEqual(self._states("doc4"), ["kept"])
 
+    def test_harnais_tue_par_un_signal_reste_kept(self):
+        """B impl-07: a crash before the first line is uncertain, not a proof."""
+        worker = self._worker("crash")
+        with self._env(AMEESH_TEST_KILL_SELF="1"):
+            worker._account = _profile(OPENAI, harness="claude")
+            self.assertFalse(worker.run_turn({"kind": "prompt", "prompt": "t", "ids": []}))
+        self.assertEqual(self._states("crash"), ["kept"])
+
+    def test_arret_par_l_executeur_reste_kept(self):
+        """A refusal while the runner restarts the agent is not a proof."""
+        worker = self._worker("restart")
+        worker.restarting.set()
+        self.assertFalse(worker._sans_appel_fournisseur(None, 0, False, 0.5, None, 1))
+        worker.restarting.clear()
+        self.assertTrue(worker._sans_appel_fournisseur(None, 0, False, 0.5, None, 1))
+        self.assertFalse(worker._sans_appel_fournisseur(None, 0, False, 0.5, None, -9))
+        self.assertFalse(worker._sans_appel_fournisseur(None, 0, False, 0.5, None, 0))
+
+    def test_tour_de_resume_differe_ne_compte_pas(self):
+        worker = self._worker("differe")
+        self._with_session(worker)
+        with mock.patch.object(worker, "rotation_due", return_value=True), \
+                mock.patch.object(worker, "run_turn", return_value=None):
+            for _ in range(5):
+                self.assertFalse(worker.maybe_rotate())
+        self.assertEqual((worker.rotation_failures, worker.rotation_retry_at), (0, 0.0))
+
     def test_alertes_des_reservations_gardees(self):
         api = storage.of(self.db).budgets
         api.account_put(OPENAI, 10.0, actor="human:t")

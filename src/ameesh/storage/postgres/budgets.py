@@ -236,10 +236,10 @@ class Budgets(interface.Budgets):
 
     def account_kept_since(self, since_ts) -> list:
         """#5503 : réservations `kept` ouvertes depuis `since_ts` (epoch), par
-        agent et compte : nombre, montant, et les plus récentes (id)."""
+        agent et compte : nombre, montant, la plus grande, et les plus récentes (id)."""
         return self.db.query(
             "select agent, billing_account, count(*)::int as n,"
-            " sum(usd)::float8 as usd,"
+            " sum(usd)::float8 as usd, max(usd)::float8 as max_usd,"
             " extract(epoch from min(created_at))::float8 as since_ts,"
             " (array_agg(id order by id desc))[1:10] as ids"
             " from account_reservations where state = 'kept'"

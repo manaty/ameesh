@@ -3131,6 +3131,12 @@ class AgentWorker(threading.Thread):
             if self.fast_failures >= self.runner.max_fast_failures:
                 self.stop_after_failures()
                 self.rotation_stopped = True
+        if self.rotation_stopped:
+            log_async("[%s] rotation cancelled: %s (%d in a row); agent stopped"
+                      % (self.name, motif, self.rotation_failures))
+            return ("the agent is stopped after %d consecutive fast failures "
+                    "(`ameesh resume %s` once the cause is fixed)"
+                    % (self.fast_failures, self.name))
         log_async("[%s] rotation cancelled: %s (%d in a row); next attempt in %ds%s"
                   % (self.name, motif, self.rotation_failures, int(attente),
                      ", without a summary turn"
@@ -3178,6 +3184,11 @@ class AgentWorker(threading.Thread):
             self._refus_pression = False
             ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT,
                                 "ids": []})
+            if ok is None:
+                # #1686 N2 : tour différé (attach, verrou de session) — pas un
+                # échec du résumé : ni attente croissante, ni compte vers la
+                # rotation sans résumé (N impl-07)
+                return False
             if not ok and self._refus_pression:
                 # la pression est venue entre le choix et le lancement : la
                 # rotation attend sa fin (ligne de fin de l'épisode), sans trace
@@ -5339,16 +5350,22 @@ class AgentWorker(threading.Thread):
             log("[%s] turn context not removed (%s)" % (self.name, exc))
 
     def _sans_appel_fournisseur(self, rp, lignes: int, interrompu: bool,
-                                duration: float, usage) -> bool:
+                                duration: float, usage, result_code) -> bool:
         """#5503 : la preuve qu'un tour en échec n'a appelé aucun fournisseur.
 
         Toutes à la fois : un harnais lancé pour ce tour (un résident a pu
-        appeler avant), sorti de lui-même (ni bail perdu, ni préemption, ni
-        clôture par plafond), en moins de `fast_failure_s`, sans aucune ligne
+        appeler avant), sorti de lui-même sur son propre code d'échec (> 0 :
+        ni signal — un crash reste incertain, B impl-07 —, ni bail perdu,
+        préemption, clôture par plafond, redémarrage, arrêt de l'exécuteur ou
+        garde d'audit), en moins de `fast_failure_s`, sans aucune ligne
         de flux — Claude (`system/init`), Codex (`thread.started`) et DeepSeek
         (`session`) l'écrivent avant leur premier appel — ni usage. Dans le
         doute, la réservation reste `kept`."""
-        return (rp is None and not interrompu and lignes == 0 and usage is None
+        if not isinstance(result_code, int) or result_code <= 0:
+            return False
+        if interrompu or getattr(self, "_audit_guard_error", "") or self._urgent_end():
+            return False
+        return (rp is None and lignes == 0 and usage is None
                 and duration < self.runner.fast_failure_s)
 
     def _compta_termine(self, model_annonce: str | None = None, *,
@@ -9266,7 +9283,8 @@ class AgentWorker(threading.Thread):
         # réservation, au lieu d'en garder 2 $ pour la journée à chaque refus.
         incertain = bool(error or result_code or lost or preempte or clos)
         if incertain and self._sans_appel_fournisseur(
-                rp, lignes, lost or preempte or clos, duration, conversation_usage):
+                rp, lignes, lost or preempte or clos, duration, conversation_usage,
+                result_code):
             log_async("[%s] harness exited (%s) in %.1fs with no stream output nor "
                       "usage: no provider call, account reservation settled at 0"
                       % (self.name, result_code if result_code else error, duration))
