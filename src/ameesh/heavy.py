@@ -55,6 +55,8 @@ WAIT_LOG_S = 60.0
 RELAYED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 #: seconds the command's process group has after SIGTERM, then after SIGKILL
 GROUP_GRACE_S = 10.0
+#: #5541: seconds between two reaps of the orphans adopted while the command runs
+ORPHAN_REAP_S = 0.5
 #: #453: duration cap of a heavy command (seconds; `AMEESH_HEAVY_MAX_S`,
 #: `heavy_max_seconds` of the configuration, `--max-duration`); 0 = none
 DEFAULT_MAX_S = 3600.0
@@ -342,16 +344,39 @@ def _drain_tree(leader: int, *, grace: float | None = None, sleep=time.sleep,
     return _tree_gone(leader)
 
 
-def _wait_unreaped(child, tty: int | None = None) -> int:
+def _reap_orphans(leader: int) -> None:
+    """#5541: reaps the adopted orphans that ended (a subreaper's children
+    other than the command), never the command itself. None waits for them:
+    left unreaped, they pile up as zombies for as long as the suite runs."""
+    from . import platform
+    try:
+        rows = platform.children()
+    except platform.NotAvailable:
+        return
+    for row in rows:
+        if row["zombie"] and row["pid"] != leader:
+            platform.reap(row["pid"])
+
+
+def _wait_unreaped(child, tty: int | None = None, *, orphans: bool = False) -> int:
     """The command's exit code (negative: killed by that signal), waited for
     WITHOUT reaping it (codex review r3): its zombie holds its pid, which is
     also the group's number, until `child.wait()`. With a terminal, a stop of
-    the command (Ctrl-Z) suspends the wrapper too (`_suspend`)."""
+    the command (Ctrl-Z) suspends the wrapper too (`_suspend`). `orphans`
+    (subreaper): the descendants reparented to the wrapper are reaped every
+    `ORPHAN_REAP_S` while the command runs (#5541)."""
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
         return child.wait()
     while True:
         flags = os.WEXITED | os.WNOWAIT | (os.WSTOPPED if tty is not None else 0)
-        info = os.waitid(os.P_PID, child.pid, flags)
+        if orphans:
+            info = os.waitid(os.P_PID, child.pid, flags | os.WNOHANG)
+            if info is None:
+                _reap_orphans(child.pid)
+                time.sleep(ORPHAN_REAP_S)
+                continue
+        else:
+            info = os.waitid(os.P_PID, child.pid, flags)
         if info.si_code == os.CLD_STOPPED:
             os.waitid(os.P_PID, child.pid, os.WSTOPPED | os.WNOHANG)   # consumed
             _suspend(tty, child.pid)
@@ -491,7 +516,7 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE, max_s: float | None = None
             timers.append(timer)
             timer.start()
         if tree and _tree_read(child.pid) is not None:
-            code = _wait_unreaped(child, tty)
+            code = _wait_unreaped(child, tty, orphans=True)
             drained = _drain_tree(child.pid)
         else:
             # without a process table the leader's zombie would look alive

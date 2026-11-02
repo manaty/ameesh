@@ -411,6 +411,30 @@ class RunChildTest(unittest.TestCase):
         self.assertIsNotNone(got)
         heavy.release(got[1])
 
+    @unittest.skipUnless(platform.is_linux(), "#5541 : sous-moissonneur (Linux)")
+    def test_orphans_are_reaped_while_the_command_runs(self):
+        # #5541: a suite whose short-lived workers are orphaned (a pipeline
+        # in a subshell) left them as zombies under the wrapper until it ended
+        churn = ("import os, sys, time\n"
+                 "for _ in range(5):\n"
+                 "    if os.fork() == 0:\n"
+                 "        if os.fork() == 0:\n"
+                 "            os._exit(0)\n"
+                 "        os._exit(0)\n"
+                 "    os.wait()\n"
+                 "print(os.getpid(), flush=True)\n"
+                 "time.sleep(60)\n")
+        proc, command = self._wrapper(churn, grace=1.0)
+        deadline = time.monotonic() + 5
+        while True:
+            zombies = [row for row in platform.children(proc.pid)
+                       if row["zombie"] and row["pid"] != command]
+            if not zombies or time.monotonic() > deadline:
+                break
+            time.sleep(0.1)
+        self.assertEqual(zombies, [])
+        self.assertIsNone(proc.poll())
+
 
 class DrainTest(unittest.TestCase):
     def test_one_empty_scan_is_not_enough(self):
