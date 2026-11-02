@@ -73,12 +73,14 @@ class DiagnosticTest(unittest.TestCase):
         self.assertIn('RestoreError: private root document required', text)
 
     def test_invalid_reference_is_not_printed(self):
-        try:
-            with producer.diagnostic('read-document', SECRET):
-                raise ValueError(SECRET)
-        except ValueError as error:
-            text = self.cli_failure('probe', error)
-        self.assertIn('<invalid path>', text)
+        for reference in (SECRET, '/tmp/' + SECRET):
+            with self.subTest(reference=reference):
+                try:
+                    with producer.diagnostic('read-document', reference):
+                        raise ValueError(SECRET)
+                except ValueError as error:
+                    text = self.cli_failure('probe', error)
+                self.assertIn('<invalid path>', text)
 
     def test_probe_reaches_read_boundary_and_never_publishes_after_failure(self):
         with mock.patch.dict(sys.modules, {'psycopg.conninfo': mock.Mock()}), \

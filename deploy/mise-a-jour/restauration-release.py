@@ -47,8 +47,8 @@ def diagnostic(step, document=None):
             # Only absolute filesystem references are diagnostic metadata. An
             # invalid reference might itself be a DSN or another secret.
             value = str(document)
-            error.restore_document = (value if value.startswith('/') and
-                                      '\x00' not in value else '<invalid path>')
+            error.restore_document = (value if re.fullmatch(r'/[A-Za-z0-9_./-]+', value)
+                                      else '<invalid path>')
         raise
 
 
