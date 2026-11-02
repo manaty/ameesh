@@ -762,6 +762,7 @@ et `.timer` sur **chaque candidat**, avec une configuration privée
   "role": "mesh-design",
   "candidates": ["candidat-a", "candidat-b"],
   "repo": "/chemin/du/clone-dedie",
+  "github": "manaty/ameesh",
   "target": "origin/main",
   "bascule_env": "/chemin/prive/bascule.env",
   "arguments": ["--sans-poste"],
@@ -784,6 +785,31 @@ du rôle commence une tentative. Un second bail partagé, renouvelé avec une
 échéance monotone locale, protège l'exécution pendant un changement de rôle.
 Une demande en attente qui n'est pas prise dans `start_timeout_s`, un refus
 de reprise ou un échec lève une alerte urgente au pilote.
+
+Conditions d'activation (#5500), fermées en cas de doute, car la base est
+partagée avec les agents du même rôle et toute demande qui y est lue est une
+entrée non fiable :
+
+- **rien de lu ni d'exécuté n'est inscriptible par un autre compte** : le
+  venv et le paquet `ameesh`, le dossier de la configuration (ameesh et
+  `staging-executor.json`), le clone dédié (tout son arbre, `.git` compris),
+  `bascule_env`, la sonde de quiescence et ses scripts, `git`, `bash` et
+  chaque dossier du `PATH` appartiennent au compte exécutant (ou à root) et
+  ne sont inscriptibles ni par le groupe ni par les autres, dossiers parents
+  compris ; le service fixe son `umask` à `022`, et le worktree de la
+  tentative est revérifié avant de lancer son script. Un refus ne fait aucun
+  geste, pas même la reprise d'une tentative précédente, et lève l'alerte
+  `staging_interrupted` au pilote (avant la lecture de la configuration, le
+  refus est dans le journal de l'unité et la demande expire) ;
+- **la CI du commit demandé est lue à la forge** avant tout geste root, sans
+  jeton (dépôt public `github`, API REST anonyme) : le dernier run de
+  `tests.yml` a réussi et aucun run push/PR n'a échoué, ou l'arbre est celui
+  d'une tête de paquet verte (suite `ci-full-<tête>` de sa PR, §11 bis) ; un
+  commit de release `[skip ci]` hérite de son premier parent. Rouge, absente,
+  en cours ou illisible (quota anonyme compris) : refus, la demande reste en
+  attente et la forge est relue au plus toutes les 5 min. Un dépôt privé
+  exigerait un jeton de lecture, nouveau détenteur de secret soumis à une
+  décision owner.
 
 Le programme `quiescence_probe` doit vérifier **et terminer si nécessaire**
 l'ancien exécutant et ses opérations distantes, y compris les unités

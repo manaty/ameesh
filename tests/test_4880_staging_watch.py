@@ -569,7 +569,7 @@ class BoundsTest(unittest.TestCase):
             path = Path(folder) / "staging.json"
             path.write_text(json.dumps({
                 "key": "mesh", "project": "ameesh", "role": "pilot",
-                "candidates": ["a", "b"], "repo": folder,
+                "candidates": ["a", "b"], "repo": folder, "github": "o/r",
                 "bascule_env": str(Path(folder) / "bascule.env")}))
             self.assertEqual(staging_executor.settings(str(path))["timeout_s"],
                              staging_watch.STAGING_FALLBACK_S)
