@@ -299,19 +299,14 @@ class RefusalRunnerTest(PgTestCase):
         self._assert_kept("faux-jeton")
 
     def test_marqueur_sur_une_commande_configuree_non_qualifiee_reste_kept(self):
-        """Le cas de l'issue : un descripteur hôte `stream=text` imprime un
-        marqueur. La preuve n'est pas qualifiée, la réservation reste kept."""
-        hosts = os.path.join(self.tmp, "harness-hosts")
-        os.makedirs(hosts, mode=0o700)
-        document = copy.deepcopy(harnesses.get("claude").document)
-        document["ameesh"]["stream"] = "text"
-        path = os.path.join(hosts, "claude.json")
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(document, handle)
-        os.chmod(path, 0o600)
+        """Le cas de l'issue : une commande configurée `stream=text` imprime un
+        marqueur. Le descripteur n'est pas qualifié : le runner ne prépare même
+        pas le canal de preuve et la réservation reste kept."""
         worker = self._worker("non-qualifie")
         target = worker._path(refusal.FILE)
-        with mock.patch.dict(os.environ, {"AMEESH_HARNESSES_DIR": hosts}):
+        package = harnesses.get("claude")
+        configured = dataclasses.replace(package, stream="text")
+        with mock.patch("ameesh.harnesses.get", return_value=configured):
             self.assertFalse(self._turn(worker, AMEESH_TEST_REFUSE=REFUSE,
                                         AMEESH_TEST_REFUSE_PROOF_AT=target,
                                         AMEESH_TEST_REFUSE_EXIT="86"))
