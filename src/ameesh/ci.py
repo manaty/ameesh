@@ -4262,6 +4262,22 @@ def cmd_ci_run(cfg, args) -> int:
     journalisée dans la note du lot à la tête réellement testée."""
     from . import plan_github, work
     from .db import open_db
+    # #5499 : un `--repo` mal formé est une erreur de saisie, pas une garde.
+    # Le message de `repo_of` sort avant toute lecture (base, GitHub) : sur une
+    # tête où la garde du paquet lit le dépôt avant le plan, elle ne voit donc
+    # jamais passer la `GithubError` de `check_repo`.
+    declared_repo = (getattr(args, "repo", "") or "").strip()
+    if declared_repo and declared_repo != ".":
+        try:
+            plan_github.check_repo(declared_repo)
+        except plan_github.GithubError as exc:
+            if getattr(args, "json", False):
+                print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                                  "action": "refuse", "why": str(exc)},
+                                 ensure_ascii=False, indent=1))
+            else:
+                print("ameesh ci run: %s" % exc)
+            return 1
     db = open_db(cfg)
     gh = plan_github.Gh()
 

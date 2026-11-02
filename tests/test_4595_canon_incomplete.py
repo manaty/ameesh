@@ -30,7 +30,7 @@ class IncompleteDiagnosticTest(unittest.TestCase):
                     None, canon, "host", 300, on_incomplete=messages.append))
             sync.assert_not_called()
             self.assertEqual(len(messages), 2)
-            self.assertIn("pending or failed", messages[0])
+            self.assertIn("no completed shared sync", messages[0])
             self.assertIn("snapshot mismatch", messages[1])
             for message in messages:
                 self.assertIn("team at /agent/canon", message)
@@ -100,7 +100,7 @@ class RollingRestartTest(PgTestCase):
                 mock.patch.object(canon_sync, "configured_ref", return_value="main"), \
                 mock.patch.object(canon_sync, "sync") as sync:
             self.assertIsNone(self.run_sync(self.new))
-            self.assertIn("no completed token", self.messages[0])
+            self.assertIn("no completed shared sync", self.messages[0])
             sync.assert_not_called()
             self.expire_claim()
             self.assertIs(self.run_sync(self.new), sync.return_value)

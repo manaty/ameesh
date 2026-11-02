@@ -167,7 +167,7 @@ class Canon(interface.Canon):
             """, (diagnostic, host, json.dumps(list(keep))))
         return sorted(r["canon"] for r in rows)
 
-    def claim_sync(self, host, canon, token, interval_s) -> bool:
+    def claim_sync(self, host, canon, token, interval_s, takeover=None) -> bool:
         rows = self.db.query(
             """INSERT INTO canon_state AS s
                 (host, canon, status, sync_claimed_at, sync_token)
@@ -176,7 +176,10 @@ class Canon(interface.Canon):
                     sync_claimed_at = clock_timestamp(), sync_token = excluded.sync_token
                 WHERE s.sync_claimed_at IS NULL OR
                     s.sync_claimed_at <= clock_timestamp() - make_interval(secs => %s)
-                RETURNING host""", (host, canon, token, float(interval_s)))
+                    OR (%s::text IS NOT NULL AND s.sync_token = s.sync_completed_token
+                        AND s.sync_signature IS DISTINCT FROM %s::text)
+                RETURNING host""", (host, canon, token, float(interval_s),
+                                    takeover, takeover))
         return bool(rows)
 
     def complete_sync(self, host, canon, token, signature) -> None:
@@ -185,10 +188,18 @@ class Canon(interface.Canon):
             "WHERE host = %s AND canon = %s AND sync_token = %s",
             (token, signature, host, canon, token))
 
+    def fail_sync(self, host, canon, token) -> None:
+        self.db.execute(
+            "UPDATE canon_state SET sync_completed_token = NULL, sync_claimed_at = NULL "
+            "WHERE host = %s AND canon = %s AND sync_token = %s",
+            (host, canon, token))
+
     def shared_sync(self, host, canon) -> dict | None:
+        # #5493: a pending claim no longer hides the last completed result;
+        # the caller still compares its signature with its own snapshot.
         rows = self.db.query(
             "SELECT status, diagnostic, sync_signature FROM canon_state "
-            "WHERE host = %s AND canon = %s AND sync_token = sync_completed_token",
+            "WHERE host = %s AND canon = %s AND sync_completed_token IS NOT NULL",
             (host, canon))
         return rows[0] if rows else None
 

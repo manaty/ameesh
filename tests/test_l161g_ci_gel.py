@@ -1085,16 +1085,31 @@ class RequestTest(GelTestCase):
             self.events.append({"id": next(self.seq), "created_ts": time.time(),
                                 "note": "packet-exception unblock sha=%s reason=test"
                                         % frozen})
+        output = io.StringIO()
         with mock.patch("ameesh.db.open_db", lambda cfg: self.db), \
                 mock.patch.object(plan_github, "Gh", lambda *a, **k: gh), \
                 mock.patch.object(plan_github, "_json",
                                   lambda g, argv, *a, **k: api(argv[-1])), \
-                contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(output):
             code = ci.cmd_ci_run(None, args)
+        self.output = output.getvalue()
         return code, self.notes
 
     def marques(self, state: str) -> list[str]:
         return [n for n in self.notes if n.startswith("ci-label %s" % state)]
+
+    def test_un_depot_mal_forme_est_refuse_sans_traceback(self):
+        # #5499 : un `--repo` mal formé est une erreur de saisie, pas une
+        # garde ; la commande doit rendre le message de `repo_of` (le même que
+        # le plan), jamais une `GithubError` non capturée.
+        self.gele()
+        self.args.repo = "manaty"
+        self.args.json = False
+        code, notes = self.run_cmd(Github(), Gh())
+        self.assertEqual(code, 1)
+        self.assertIn('repository "owner/repo" expected', self.output)
+        self.assertNotIn("Traceback", self.output)
+        self.assertEqual(self.marques("applied"), [])
 
     def test_la_demande_annule_les_perimes_puis_pose_l_etiquette(self):
         self.gele()
