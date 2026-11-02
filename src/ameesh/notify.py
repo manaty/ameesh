@@ -238,6 +238,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "mesh_backup_unseen",
                  # #513 : la dépense comptée s'écarte des soldes (barème faux)
                  "budget_drift",
+                 # #5503 : des réservations gardées s'accumulent, ou bloquent
+                 # l'enveloppe d'un compte de facturation
+                 "reservations_kept_burst", "account_cap_kept",
                  # #532: a local PgBouncer pool queues its mesh clients
                  "pgbouncer_pool_waiting")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack", "app", "nexlink")
@@ -400,6 +403,8 @@ TYPE_LABELS = {
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
     "budget_drift": "counted spend strays from the provider balance",
+    "reservations_kept_burst": "kept account reservations pile up for an agent",
+    "account_cap_kept": "billing account blocked by kept reservations",
 }
 
 
@@ -422,6 +427,8 @@ URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_ex
                 "provider_credits_exhausted",
                 # #3536 : « jamais de dépassement » — l'owner le sait tout de suite
                 "account_overage",
+                # #5503 : un compte entier bloqué par des réservations gardées
+                "account_cap_kept",
                 "credential_failing", "critical_budget_pause", "critical_turn_failures",
                 # #3969 : aucun tour tant que l'hôte n'est pas réparé
                 "account_config_invalid",
