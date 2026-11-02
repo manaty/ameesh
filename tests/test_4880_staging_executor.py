@@ -194,6 +194,23 @@ class ExecutorTest(unittest.TestCase):
         for call in executor.role_run._run_under_lease.call_args_list:
             self.assertIs(call.kwargs.get("watch"), False)
 
+    def test_the_child_is_monitored_and_a_stop_is_a_recorded_failure(self):
+        def child(*args, **kwargs):
+            self.calls.append((args[0], args[1]))
+            executor.role_run._AlertsExecution.return_value.stop_reason = \
+                "délai dépassé : figé"
+            return 143, False
+        executor.role_run._run_under_lease.side_effect = child
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["reason"], "délai dépassé : figé")
+        self.assertEqual(self.request["state"], "failed")
+        self.assertEqual(self.request["reason"], "délai dépassé : figé")
+        call = executor.role_run._run_under_lease.call_args_list[-1]
+        self.assertEqual(call.kwargs["stop_grace"], staging_watch.STOP_GRACE_S)
+        self.assertEqual(call.kwargs["interval"], staging_watch.WATCH_INTERVAL_S)
+        self.assertEqual(call.kwargs["monitor"].__self__.run, result["run"])
+
     def test_record_renewal_extends_the_local_deadline(self):
         executor.tick(self.db, self.cfg, self.options)
         executor.ExecutionLease.return_value.note_renewed.assert_called()
@@ -333,6 +350,57 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(env["STAGING_RUN_ID"], result["run"])
         self.assertNotIn("STAGING_PREVIOUS_RUN", env)
         self.assertNotIn("STAGING_PREVIOUS_HOST", env)
+
+
+class GuardedStopTest(unittest.TestCase):
+    """#5450: a monitored stop kills the group, not the lease."""
+
+    def test_a_monitor_stop_halts_the_group_and_keeps_the_lease(self):
+        import subprocess
+        import threading
+
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+
+        def cleanup():
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.addCleanup(cleanup)
+
+        class Execution:
+            def __init__(self):
+                self.lost = threading.Event()
+                self.stop_reason = None
+                self.halted = []
+
+            @property
+            def pgid(self):
+                return proc.pid
+
+            def start_child(self, argv, env):
+                return proc
+
+            def halt(self, reason, *, grace=None):
+                self.stop_reason = reason
+                self.halted.append(grace)
+                role_run._stop_child(
+                    proc, 0.2 if grace is None else grace, pgid=proc.pid)
+
+        execution = Execution()
+        checks = []
+
+        def monitor():
+            checks.append(1)
+            return "délai dépassé : figé"
+
+        code, lost = role_run._run_under_lease(
+            ["sleep", "30"], {}, object(), execution, watch=False,
+            monitor=monitor, interval=0.05, stop_grace=0.2)
+        self.assertFalse(lost)
+        self.assertFalse(execution.lost.is_set())
+        self.assertEqual(execution.stop_reason, "délai dépassé : figé")
+        self.assertGreaterEqual(len(checks), 1)
+        self.assertNotEqual(code, 0)
 
 
 class LeaseNoteTest(unittest.TestCase):

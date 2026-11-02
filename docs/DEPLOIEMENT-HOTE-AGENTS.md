@@ -546,7 +546,7 @@ la commande refuse — aucun repli sur une heure locale.
       "target": "main",
       "github": "manaty/ameesh",
       "report": "smichea",
-      "staging_timeout_s": 7200
+      "staging_timeout_s": 39600
     }
   }
 }
@@ -692,9 +692,27 @@ de tour (`STAGING_PLAFOND_TOUR_S`, 1800 s) plus cette marge, réduite à
 `STAGING_SILENCE_S` une fois passée l'échéance de l'hôte :
 `STAGING_BASE_HOTE_S` (900 s) + runners × plafond de tour. Le redémarrage du
 poste ne signale pas ses runners : seule cette échéance le juge
-(`STAGING_RUNNERS_DEFAUT`, 20). `STAGING_TIMEOUT_S` (7200 s) ne juge plus qu'un
-lanceur antérieur au battement ; il reste la borne d'arrêt de la release
-synchrone (`run_staging`), qui ne passe pas par l'exécutant élu.
+(`STAGING_RUNNERS_DEFAUT`, 20). Ce budget par hôte (10 h 15 avec 20 runners)
+reste un **seuil d'alerte**, jamais une borne d'arrêt.
+
+Une seule fonction de surveillance (#5450), `staging_watch.Monitor`, lit ce
+même verdict dans les deux lanceurs : l'exécutant élu
+(`staging_executor`) et la release synchrone (`run_staging`). Elle n'arrête
+la séquence que si `overdue()` rend encore une raison **15 min après la
+première alerte** : l'opérateur voit ainsi l'alerte avant le geste. L'arrêt
+suit le chemin d'échec normal — TERM au groupe, délai de grâce de 5 min pour
+que `staging.sh` remette l'hôte en cours à sa version précédente, puis KILL —
+et la raison d'`overdue()` est enregistrée dans la demande et le snapshot
+`staging.sequence`. Une séquence qui progresse n'est donc plus tuée par une
+horloge globale.
+
+`STAGING_TIMEOUT_S` (39600 s, 11 h) devient le **secours global** d'un
+lanceur qui ne publie aucun battement ; il ne juge plus une séquence qui bat.
+Les unités `ameesh-release`, `ameesh-release-nexlink` et `ameesh-staging`
+sont bornées à `TimeoutStartSec=11h30min`, sous les 12 h entre deux coupures :
+une séquence figée ne chevauche jamais la coupure suivante. Le plancher de
+`STAGING_BATTEMENT_S` est de 1 s (une valeur plus petite refuse la séquence
+avant toute mutation).
 
 La passe ordinaire d'alertes lit ces événements depuis la base : un lanceur
 tué, figé ou privé de réseau n'a pas besoin de survivre pour que le retard soit
@@ -719,7 +737,7 @@ et `.timer` sur **chaque candidat**, avec une configuration privée
   "target": "origin/main",
   "bascule_env": "/chemin/prive/bascule.env",
   "arguments": ["--sans-poste"],
-  "timeout_s": 7200,
+  "timeout_s": 39600,
   "start_timeout_s": 300,
   "quiescence_probe": ["/chemin/prive/prouver-arret-staging"]
 }

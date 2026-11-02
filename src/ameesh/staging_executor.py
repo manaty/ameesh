@@ -56,7 +56,8 @@ def settings(path: str) -> dict:
     if probe is not None and (not isinstance(probe, list) or not probe
                               or not all(isinstance(arg, str) for arg in probe)):
         raise ValueError("quiescence_probe must be a nonempty argv list")
-    for key, default in (("timeout_s", 7200), ("start_timeout_s", 300)):
+    for key, default in (("timeout_s", staging_watch.STAGING_FALLBACK_S),
+                         ("start_timeout_s", 300)):
         value = float(data.get(key, default))
         if not math.isfinite(value) or value <= 0:
             raise ValueError(key + " must be finite and positive")
@@ -192,8 +193,9 @@ def tick(db, cfg, options) -> dict:
         if not elected["held"] or elected.get("holder") != host:
             return {"state": "standby", "reason": "role changed"}
         from .platform.child_environment import execution_transport
+        timeout = options.get("timeout_s", staging_watch.STAGING_FALLBACK_S)
         env = execution_transport(dict(os.environ, BASCULE_ENV=options["bascule_env"],
-                   STAGING_TIMEOUT_S=str(options.get("timeout_s", 7200))))
+                   STAGING_TIMEOUT_S=str(timeout)))
         env.pop("AMEESH_TURN_ID", None)
         # Only this attempt names its run and a proved-stopped predecessor;
         # never a value inherited from the unit's environment (review qa-01).
@@ -256,7 +258,7 @@ def tick(db, cfg, options) -> dict:
         queued = request
         attempt = dict(request, state="running", host=host, run=uuid.uuid4().hex,
                        started=time.time(), notify=options["role"],
-                       deadline=time.time() + options.get("timeout_s", 7200))
+                       deadline=time.time() + timeout)
         attempt.pop("blocked_reason", None)
         attempt.pop("previous_host", None)
         attempt.pop("previous_run", None)
@@ -270,6 +272,9 @@ def tick(db, cfg, options) -> dict:
         folder, tree = release_cutoff._worktree(
             repo, sha, prefix=_worktree_prefix(attempt["run"]))
         drop = True
+        # #5450: the same lateness verdict as the independent alerts pass; the
+        # attempt's own started/deadline pair is the no-heartbeat fallback.
+        monitor = staging_watch.Monitor(db, attempt["run"], fallback=attempt)
         try:
             argv = ["bash", str(Path(tree) / options.get(
                 "script", "deploy/mise-a-jour/staging.sh")),
@@ -277,8 +282,19 @@ def tick(db, cfg, options) -> dict:
             if attempt.get("included"):
                 argv += ["--lots", " ".join(str(lot) for lot in attempt["included"])]
             argv.append(sha)
-            code, lost = role_run._run_under_lease(argv, env, lease, execution,
-                                                   watch=False)
+            code, lost = role_run._run_under_lease(
+                argv, env, lease, execution, watch=False,
+                monitor=monitor.check, interval=staging_watch.WATCH_INTERVAL_S,
+                stop_grace=staging_watch.STOP_GRACE_S)
+            reason = getattr(execution, "stop_reason", None)
+            if isinstance(reason, str) and reason:
+                # A monitored stop is the normal failure path: the launcher
+                # rolled the current host back before exiting (TERM trap).
+                # Keep the reason in the request and the shared snapshot.
+                monitor.stop(reason)
+                result = dict(attempt, state="failed", exit=code, reason=reason)
+                _record(db, options["key"], result, lease=lease)
+                return result
             if lost:
                 # A workstation's transient unit may outlive the bash group.
                 # Keep its sources until quiescence is proved on recovery.

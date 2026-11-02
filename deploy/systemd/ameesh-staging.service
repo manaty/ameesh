@@ -12,7 +12,12 @@ Slice=app.slice
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=%h/.config/ameesh/env
 ExecStart=%h/.local/share/ameesh/venv/bin/python3 -m ameesh.staging_executor --config %h/.config/ameesh/staging-executor.json tick
-TimeoutStartSec=4h
+# #5450: the global staging fallback is 11 h and its monitored stop starts
+# 15 min later; the unit must still leave room for the rollback and settling.
+# 11h30min stays below the 12 h between two cutoffs.
+TimeoutStartSec=11h30min
+# #5450: let the launcher TERM trap finish the current host rollback.
+TimeoutStopSec=5min
 KillMode=control-group
 # NoNewPrivileges is deliberately absent: vm.sh uses local sudo on candidates
 # that deploy themselves. Credential placement is a separate operator action.

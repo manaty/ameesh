@@ -245,6 +245,10 @@ POSITIONNELS=0
 #: #4616 : 1 = aucun retour automatique (migration non additive posee)
 SANS_RETOUR=0
 ROLLBACK_SQL=""
+#: #5450 : arret demande par la surveillance de progression (TERM du lanceur)
+ARRET_SURVEILLANCE=0
+#: #5450 : un echec d'hote est deja en cours de traitement (retour, courrier)
+ECHEC_EN_COURS=0
 
 usage() { sed -n '9,13p' "$0"; }
 
@@ -861,6 +865,7 @@ PY
 }
 echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   local nom=$1 ou=$2 detail=$3 rapport="" complement=""
+  ECHEC_EN_COURS=1
   # le rapport JSON de la sonde n'est pas perdu : il va dans la trace (objet
   # `rapport`) et dans la notification, pas seulement « sante en echec » (#2190).
   if [ "$ou" = sante ] && [ -n "$SANTE_DETAIL" ]; then
@@ -954,10 +959,11 @@ done
 # local flock and EXIT trap this evidence survives SIGKILL of the launcher.
 SUIVI_RUN=${STAGING_RUN_ID:-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')}
 SUIVI_DEBUT=$(date +%s)
-SUIVI_DELAI=${STAGING_TIMEOUT_S:-7200}
+SUIVI_DELAI=${STAGING_TIMEOUT_S:-39600}
 SUIVI_DEMARRE=0
 # #5425 : un retard se juge sur le battement et le progres, plus sur une seule
-# echeance de parcours (STAGING_TIMEOUT_S ne juge qu'un lanceur plus ancien).
+# echeance de parcours. #5450 : STAGING_TIMEOUT_S (11 h) n'est plus que le
+# secours d'un lanceur sans battement ; la surveillance arrete sur overdue().
 # Un hote a pour budget BASE + runners x plafond de tour : un redemarrage
 # glissant attend la fin de tour de chaque runner.
 SUIVI_BATTEMENT_S=${STAGING_BATTEMENT_S:-120}
@@ -967,8 +973,8 @@ SUIVI_BASE_HOTE_S=${STAGING_BASE_HOTE_S:-900}
 SUIVI_RUNNERS_DEFAUT=${STAGING_RUNNERS_DEFAUT:-20}
 SUIVI_BATTEMENT_PID=
 # #5425 N2 : `sleep 0` ou une valeur non numerique ferait tourner le battement
-# en boucle serree ; valider avant tout publish et tout geste, comme les autres
-# reglages de vivacite (nombre fini et positif).
+# en boucle serree ; valider avant tout publish et tout geste. #5450 : plancher
+# a 1 s, une valeur positive minuscule reste une boucle serree.
 valider_battement() {
   local valeur
   valeur=$(python3 - "$SUIVI_BATTEMENT_S" <<'PY'
@@ -977,11 +983,11 @@ try:
     value = float(sys.argv[1])
 except ValueError:
     raise SystemExit(1)
-if not 0 < value < math.inf:
+if not 1 <= value < math.inf:
     raise SystemExit(1)
 print(value)
 PY
-  ) || { echo "STAGING_BATTEMENT_S invalide : « $SUIVI_BATTEMENT_S » (secondes finies et positives attendues)" >&2; return 2; }
+  ) || { echo "STAGING_BATTEMENT_S invalide : « $SUIVI_BATTEMENT_S » (secondes finies et >= 1 attendues)" >&2; return 2; }
   SUIVI_BATTEMENT_S=$valeur
 }
 valider_battement || exit $?
@@ -1097,6 +1103,35 @@ arreter_battement() {
   wait "$SUIVI_BATTEMENT_PID" 2>/dev/null || true
   SUIVI_BATTEMENT_PID=
 }
+# #5450 : la surveillance (run_staging, staging_executor) arrete une sequence
+# retardee par TERM. Le chemin d'echec normal est conserve : si une etape
+# d'hote est ouverte, l'hote en cours est remis a sa version precedente
+# (echec_hote), puis la sequence s'arrete. Entre deux etapes, ou avant la
+# boucle des hotes, il n'y a rien a remettre : arret direct. L'appelant laisse
+# STOP_GRACE_S a ce chemin avant son KILL.
+arret_surveillance() {
+  local hote="" etape="" debut="" marque="" lignes=""
+  [ "$ARRET_SURVEILLANCE" = 0 ] || return 0
+  ARRET_SURVEILLANCE=1
+  trap - TERM
+  if [ "$ECHEC_EN_COURS" = 1 ]; then
+    return 0
+  fi
+  if [ -r "$SUIVI_COURANTE" ]; then
+    IFS=$'\t' read -r hote etape debut marque < "$SUIVI_COURANTE" || true
+    lignes=$(wc -l < "$JOURNAL" 2>/dev/null || echo 0)
+  fi
+  # une ligne de journal apres la marque signifie que l'etape est close : son
+  # hote a deja ete controle, il n'y a pas de mutation en cours a remettre.
+  if [ -n "$hote" ] && [ "${marque:-x}" = "$lignes" ] && [ "$SUIVI_DEMARRE" = 1 ]; then
+    echec_hote "$hote" "${etape:-surveillance}" \
+      "arret demande par la surveillance de progression"
+    exit 1
+  fi
+  echo "staging arrete par la surveillance (aucune etape d'hote ouverte)" >&2
+  exit 1
+}
+trap arret_surveillance TERM
 if [ "$POSTE_ABSENT" = 1 ]; then
   printf '  %-16s %-8s %s\n' pc-smichea absent "reporte — $POSTE_RAISON"
 fi

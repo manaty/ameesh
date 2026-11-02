@@ -80,6 +80,11 @@ if [ "$host" = pc-smichea ]; then
   esac
 fi
 printf 'call host=%s action=%s args=%s\n' "$host" "$action" "$*" >> "$state/calls.log"
+# #5450 : un geste long laisse le temps d'envoyer TERM au lanceur.
+if grep -qx "lent=$host:$action" "$state/scenario" 2>/dev/null; then
+  printf 'slow host=%s action=%s\n' "$host" "$action" >> "$state/calls.log"
+  sleep 30
+fi
 if grep -qx "ko=$host:$action" "$state/scenario" 2>/dev/null; then
   grep -vx "ko=$host:$action" "$state/scenario" > "$state/scenario.tmp" || true
   mv "$state/scenario.tmp" "$state/scenario"
@@ -386,6 +391,30 @@ class StagingTest(unittest.TestCase):
                 chemin = line.split(' ', 2)[1]
                 self.assertTrue(chemin.startswith(str(self.root)),
                                 'executable hors bac a sable : %s' % line)
+
+    def test_term_on_an_open_step_rolls_the_current_host_back(self):
+        import signal
+        import time
+        (self.state / 'scenario').write_text('lent=ameesh-agents-2:installer\n')
+        proc = subprocess.Popen(
+            ['bash', str(self.script_dir / 'staging.sh')], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if 'slow host=ameesh-agents-2 action=installer' in self.calls():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('the installer step never started')
+        os.killpg(proc.pid, signal.SIGTERM)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, (out, err))
+        self.assertTrue(any('host=ameesh-agents-2 action=retour' in line
+                            for line in self.calls()))
+        self.assertIn('retour effectue et controle', err)
+        self.assert_no_escape()
 
     def test_environment_is_isolated(self):
         """Aucun reglage herite du runner ne peut atteindre le mesh reel."""

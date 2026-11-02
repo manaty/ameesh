@@ -7,6 +7,9 @@ own evidence, not on one fixed deadline for the whole path: the launcher's
 heartbeat, its last progress (a step or a runner), and the budget of the
 current host, a function of its runners and of the turn cap. The fixed
 `deadline` only judges a launcher older than the heartbeat.
+#5450: the launchers themselves read the same verdict (`Monitor`): a late run
+is stopped only once the reason persisted after the alert, through the normal
+failure path (TERM, grace, KILL), never on a global clock while it progresses.
 The shared `staging.attested` proof settles a run whose last snapshot
 publication failed (#4898 N2). Request history is read per key: only a later
 completed deployment settles an earlier failure, never a partial one.
@@ -35,6 +38,17 @@ TERMINAL = frozenset(("completed", "partial", "failed", "unattested"))
 _LIVENESS = ("beat", "progress", "silence_s", "stall_s")
 #: exit code of a refused exclusive start, as the local flock of staging.sh
 BUSY = 75
+#: #5450: global fallback of a launcher without heartbeat. It stays below the
+#: 12 h between two cutoffs; the service unit is bounded 30 min later.
+STAGING_FALLBACK_S = 11 * 3600.0
+#: #5450: a late run is stopped only after this delay, so the independent
+#: alerts pass reports it to the operator first.
+STOP_AFTER_ALERT_S = 900.0
+#: #5450: after SIGTERM, the launcher's normal failure path (rollback of the
+#: current host) gets this grace before SIGKILL.
+STOP_GRACE_S = 300.0
+#: #5450: re-read interval of a monitored launcher.
+WATCH_INTERVAL_S = 5.0
 
 
 #: latest snapshot of every run; same predicate as `latest_type`, so the
@@ -94,6 +108,86 @@ def overdue(data: dict, now: float) -> tuple[str, float, float] | None:
     return None
 
 
+def latest_snapshot(db, run: str) -> dict | None:
+    """Newest shared snapshot of one run, or None before its first publish."""
+    rows = storage.of(db).events.recent_type(
+        EVENT, 60, 1, object="staging-run:" + run)
+    return rows[0]["data"] if rows else None
+
+
+class Monitor:
+    """#5450: the single stop verdict shared by both staging launchers.
+
+    `overdue()` remains the only judge of lateness. This monitor only adds the
+    operator delay: the first late verdict opens the delay, and the run is
+    stopped when `overdue()` still answers `STOP_AFTER_ALERT_S` later. A run
+    that recovers closes the delay, so a later outage gets its own warning.
+
+    `fallback` (the executor's request, or the synchronous launcher's
+    synthetic started/deadline pair) judges the run before its first snapshot
+    and a launcher that publishes no heartbeat. Once a snapshot exists it is
+    the only evidence; a database outage falls back to the fixed deadline
+    instead of stopping on an unreadable state.
+    """
+
+    def __init__(self, db, run: str, *, fallback: dict | None = None,
+                 after_s: float | None = None, clock=time.time):
+        self.db = db
+        self.run = run
+        self.fallback = fallback
+        # Resolve the module constant at call time, so a test (and a future
+        # deployment-level tuning) can adjust the operator delay.
+        self.after_s = STOP_AFTER_ALERT_S if after_s is None else float(after_s)
+        self.clock = clock
+        #: first time `overdue()` answered for the current outage
+        self.first_late: float | None = None
+
+    def _snapshot(self) -> dict | None:
+        if self.db is None:
+            return self.fallback
+        try:
+            return latest_snapshot(self.db, self.run) or self.fallback
+        except Exception:  # noqa: BLE001 - unreadable is not a late proof
+            return self.fallback
+
+    def check(self, now: float | None = None) -> str | None:
+        """Why the run must be stopped now, or None while it may continue."""
+        at = self.clock() if now is None else now
+        data = self._snapshot()
+        if not data or data.get("state") != "running":
+            self.first_late = None
+            return None
+        try:
+            late = overdue(data, at)
+        except (KeyError, TypeError, ValueError):
+            # A malformed snapshot is not a late proof: the unit stays the
+            # last resort rather than stopping a healthy sequence on garbage.
+            self.first_late = None
+            return None
+        if late is None:
+            self.first_late = None
+            return None
+        if self.first_late is None:
+            self.first_late = at
+            return None
+        if at - self.first_late < self.after_s:
+            return None
+        return late[0]
+
+    def stop(self, reason: str) -> int | None:
+        """Record the monitored stop with its overdue() reason, best effort."""
+        if self.db is None:
+            return None
+        data = self._snapshot()
+        if not data:
+            return None
+        try:
+            return record(self.db, dict(data, state="failed",
+                                        reason=str(reason)[:300]))
+        except Exception:  # noqa: BLE001 - the unit bound remains
+            return None
+
+
 def _step_text(host: str, step: dict) -> str:
     text = "%s: %s/%s" % (host, step.get("stage", "?"), step.get("verdict", "?"))
     since = step.get("since")
@@ -105,11 +199,11 @@ def _step_text(host: str, step: dict) -> str:
 def in_flight(rows: list[dict], *, exempt=(), attested=()) -> dict:
     """Runs whose latest snapshot is `running`, by run, with that snapshot.
 
-    Lateness is an alert, never a proof of stop: nothing ends
-    a manual `staging.sh` at `STAGING_TIMEOUT_S`, so a late run still blocks
-    (review cx1/docs-01). Only a later shared attestation of the same commit,
-    a terminal snapshot or an explicit `exempt` releases it: a previous run whose stop was proved (the executor's
-    quiescence probe, or the operator's check).
+    Lateness is an alert, never a proof of stop: a run is released only by a
+    later shared attestation of the same commit, a terminal snapshot or an
+    explicit `exempt`. The launchers' `Monitor` stops a late run and records
+    that terminal snapshot (#5450); a run stopped by another path waits for
+    its proved stop (the executor's quiescence probe, or the operator).
     """
     latest = {}
     ids = {}
@@ -156,6 +250,9 @@ def record(db, snapshot: dict, *, exclusive: bool = False,
     for key in _LIVENESS:
         if key in snapshot:
             data[key] = _finite(snapshot[key], key)
+    # #5450: the monitored stop keeps the overdue() reason that caused it.
+    if isinstance(snapshot.get("reason"), str) and snapshot["reason"].strip():
+        data["reason"] = snapshot["reason"].strip()[:300]
     if not exclusive:
         return storage.of(db).events.record(EVENT, "staging-run:" + run, None, data)
     with db.transaction() as tx:
@@ -254,7 +351,8 @@ def findings(rows: list[dict], *, now: float, attested=()) -> list[dict]:
                               "reprendre la séquence sous verrou, après arrêt "
                               "prouvé de l'ancien exécutant."
                               % (run, data["sha"][:12],
-                                 late[0] if late else state,
+                                 late[0] if late
+                                 else data.get("reason") or state,
                                  steps or "aucune étape d'hôte terminée")})
     return out
 
@@ -315,7 +413,7 @@ def request_findings(rows: list[dict], *, now: float, attested=(),
             ident = int(row.get("id") or 0)
             state = data.get("state")
             # #5425: the sequence's own evidence judges a running request;
-            # its fixed deadline raised a second false alert at 7200 s.
+            # its fixed deadline raised a second, false alert.
             late = (state in ("pending", "running")
                     and now >= data.get("deadline", float("inf"))
                     and not (state == "running" and data.get("run") in beating))
@@ -334,7 +432,7 @@ def request_findings(rows: list[dict], *, now: float, attested=(),
         detail = ("Staging request %s (%s) blocked: %s; reprise refusée avant "
                   "preuve d'arrêt et accès de déploiement sur le candidat élu."
                   % (data.get("request"), str(data.get("sha") or "")[:12],
-                     data.get("blocked_reason")
+                     data.get("blocked_reason") or data.get("reason")
                      or ("deadline exceeded" if late else "failed")))
         if later:
             detail += (" %d demande(s) ultérieure(s), partielle(s) ou en cours, "

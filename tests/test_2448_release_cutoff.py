@@ -1172,6 +1172,19 @@ class HeadCiStateTextTest(unittest.TestCase):
         self.assertEqual(release_cutoff.ci_state_text(None), "absente")
 
 
+class StagedStop:
+    """#5450: a monitor that stops on its first check, without the 15 min wait."""
+
+    def __init__(self, *args, **kwargs):
+        self.reason = "délai dépassé : figé"
+
+    def check(self, now=None):
+        return self.reason
+
+    def stop(self, reason):
+        self.stopped = reason
+
+
 class StagingTimeoutTest(unittest.TestCase):
     def test_timeout_accepts_bytes_and_kills_the_process_group(self):
         """B2: partial bytes output must not break the report, children die."""
@@ -1207,14 +1220,61 @@ class StagingTimeoutTest(unittest.TestCase):
              mock.patch.object(release_cutoff.subprocess, "Popen",
                                return_value=proc) as popen, \
              mock.patch.object(release_cutoff, "_poste_units", return_value=[]), \
-             mock.patch.object(release_cutoff, "_kill_group") as kill:
-            with self.assertRaises(release_cutoff.TransientReleaseError):
+             mock.patch.object(release_cutoff, "_kill_group") as kill, \
+             mock.patch.object(release_cutoff.staging_watch, "Monitor", StagedStop):
+            with self.assertRaises(release_cutoff.TransientReleaseError) as caught:
                 release_cutoff.run_staging(project, "a" * 40, [],
                                            state_dir=tmp.name, timeout_s=1)
+        self.assertIn("staging stopped", str(caught.exception))
         self.assertGreaterEqual(kill.call_count, 1)
         self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
         log = next((Path(tmp.name) / "release").glob("staging-*.log"))
         self.assertIn("partial output", log.read_text())
+
+    def test_the_real_monitor_stops_a_frozen_sequence_after_the_delay(self):
+        tmp = tempfile.TemporaryDirectory(prefix="ameesh-2448-monitor-")
+        self.addCleanup(tmp.cleanup)
+        worktree = Path(tmp.name) / "worktree"
+        script = worktree / "deploy/mise-a-jour/staging.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/usr/bin/env bash\n")
+        frozen = dict(run="run-a", sha="a" * 40, state="running", started=1,
+                      deadline=10 ** 9, beat=1000, progress=1000,
+                      silence_s=900, stall_s=2700, hosts={})
+
+        class FakeProc:
+            pid = 424243
+            returncode = -15
+
+            def __init__(self):
+                self.calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls <= 2:
+                    raise subprocess.TimeoutExpired("bash", timeout, output=b"x")
+                return "x", ""
+
+        project = release_cutoff.ProjectRelease(
+            name="ameesh", repo=str(Path(tmp.name) / "repo"), target="main",
+            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh")
+        with mock.patch.object(release_cutoff, "_worktree",
+                               return_value=(tmp.name, str(worktree))), \
+             mock.patch.object(release_cutoff, "_drop_worktree"), \
+             mock.patch.object(release_cutoff.subprocess, "Popen",
+                               return_value=FakeProc()), \
+             mock.patch.object(release_cutoff, "_poste_units", return_value=[]), \
+             mock.patch.object(release_cutoff, "_kill_group"), \
+             mock.patch.object(release_cutoff.staging_watch, "latest_snapshot",
+                               return_value=frozen), \
+             mock.patch.object(release_cutoff.staging_watch,
+                               "STOP_AFTER_ALERT_S", 0), \
+             mock.patch.object(release_cutoff.staging_watch,
+                               "WATCH_INTERVAL_S", 0.01):
+            with self.assertRaises(release_cutoff.TransientReleaseError) as caught:
+                release_cutoff.run_staging(project, "a" * 40, [],
+                                           state_dir=tmp.name, db=object())
+        self.assertIn("ni battement ni progrès", str(caught.exception))
 
 
 
@@ -1298,10 +1358,12 @@ class StagingTimeoutUnitsTest(unittest.TestCase):
              mock.patch.object(release_cutoff, "STAGING_UNIT_POLL_S", 0.05), \
              mock.patch.object(release_cutoff, "STAGING_KILL_GRACE_S", 0.2), \
              mock.patch.object(release_cutoff, "STAGING_DRAIN_S", 0.3), \
+             mock.patch.object(release_cutoff.staging_watch, "WATCH_INTERVAL_S", 0.2), \
              mock.patch.object(release_cutoff, "_worktree",
                                return_value=(str(self.root), str(self.worktree))), \
              mock.patch.object(release_cutoff, "_drop_worktree",
-                               side_effect=lambda *a: at_drop.append(self.live())):
+                               side_effect=lambda *a: at_drop.append(self.live())), \
+             mock.patch.object(release_cutoff.staging_watch, "Monitor", StagedStop):
             with self.assertRaises(release_cutoff.TransientReleaseError) as caught:
                 release_cutoff.run_staging(project, "a" * 40, [],
                                            state_dir=str(self.root), timeout_s=0.5)
@@ -1330,7 +1392,7 @@ class StagingTimeoutUnitsTest(unittest.TestCase):
 
     def test_the_worktree_is_dropped_once_the_unit_ended(self):
         message, at_drop, calls = self.run_timeout(grace=5, DUREE_UNITE="2")
-        self.assertIn("timed out", message)
+        self.assertIn("staging stopped", message)
         # seen alive while it held stdout, not after it ended
         self.assertIn("ended before the worktree was dropped", message)
         self.assertRegex(message, r"poste-maj-staging-\d+-redemarrer\.service")
