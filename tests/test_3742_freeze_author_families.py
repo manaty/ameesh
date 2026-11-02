@@ -294,6 +294,20 @@ class FreezeRefusalTest(_ActivationFixture, PgTestCase):
             db.close()
         self.assertEqual(self._frozen_marks(), [])
 
+    def test_the_deferred_hook_still_refuses(self):
+        # #5481 : la désignation est repoussée après le report, mais le refus
+        # #3742 reste un fait du gel : le jalon ne doit pas être écrit.
+        self._head([("author", "deepseek"), ("r1", "claude"), ("r2", "codex")])
+        db = self.connect(canon=self.canon.root, canon_ref="HEAD")
+        try:
+            with self.assertRaises(work.WorkError):
+                work.milestone(db, self.lot, "frozen", sha=self.frozen,
+                               actor="author", defer_designation=True)
+        finally:
+            db.close()
+        self.assertEqual(self._frozen_marks(), [])
+        self.assertEqual(self.mailbox(), [])
+
     def test_the_designation_inputs_carry_the_author_commits(self):
         self._head([("author", "deepseek"), ("r1", "claude")])
         freeze = {"id": 7, "sha": self.frozen}

@@ -2992,7 +2992,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False,
         required=inputs.policy.required, advances=inputs.advances)
 
 
-def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
+def carried_plan(cfg, db, lot: int, sha: str, *,
+                 repo: Optional[str] = None) -> Optional[dict]:
     """Le plan du report pour la tête qu'on s'apprête à geler, ou None (#2487).
 
     Lu **avant** le gel : `verdict_carry.would_carry` ne lit que les jalons et
@@ -3003,13 +3004,18 @@ def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
     nouvelle tête (#4582) ; l'appelant teste `refused` avant de s'abstenir.
     Une erreur de lecture ne fait jamais perdre le gel ni la désignation :
     None, le chemin normal.
+
+    `repo` (#5481) : le dépôt fourni au gel (`--repo`). Sans lui, un hôte qui
+    n'a pas le projet dans ses réglages radar rend `no-repository` alors que
+    la tête vient d'être gelée depuis ce dépôt ; le report doit lire le même
+    dépôt que le gel, pas seulement le clone radar.
     """
     text = str(sha or "").strip()
     if not text:
         return None
     from . import verdict_carry
     try:
-        plan = verdict_carry.would_carry(cfg, db, int(lot), text)
+        plan = verdict_carry.would_carry(cfg, db, int(lot), text, repo=repo)
     except Exception:  # noqa: BLE001 - aucune preuve : désignation normale
         return None
     if plan.get("result") != "would-carry":
@@ -3681,6 +3687,97 @@ def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = No
             outcome.update(result)
         return result
     return on_frozen
+
+
+def freeze_check_hook(cfg, outcome: Optional[dict] = None, *,
+                      prepared=None):
+    """Le callback du gel différé (#5481) : contrôle des familles seulement.
+
+    La désignation est repoussée après le report, mais le refus #3742 (une
+    tête dont les familles d'auteurs rendent les avis requis impossibles)
+    reste un fait du **gel** : il doit annuler le jalon, pas le laisser écrit
+    sans relecteur. Ce hook ne sélectionne personne, n'écrit aucun courrier :
+    il exécute la même lecture préparée que le hook normal et laisse le refus
+    remonter. `outcome` reçoit `deferred=True`.
+    """
+    def on_frozen(tx, milestone, threads):
+        from . import freeze_families
+        lot = int(milestone["work_item_id"])
+        fresh = None
+        if isinstance(prepared, Inputs):
+            item = work.get(tx, lot) or {"id": lot}
+            fresh = _fresh_prepared(cfg, tx, item, milestone, prepared)
+        if isinstance(fresh, Inputs):
+            freeze_families.enforce(fresh)
+        if outcome is not None:
+            outcome.clear()
+            outcome.update({"state": "deferred", "deferred": True,
+                            "reviewers": [],
+                            "freeze": {"id": int(milestone.get("id") or 0),
+                                       "sha": str(milestone.get("sha") or "")}})
+        return {}
+    return on_frozen
+
+
+def same_head_hook(outcome: Optional[dict] = None, *, previous=None):
+    """Le callback d'un regel de la **même tête** (#5481).
+
+    Un regel qui nomme exactement le SHA déjà gelé ne redésigne pas : les avis
+    acquis portent sur ce SHA, et une nouvelle sélection enverrait des demandes
+    de relecture pour un contenu identique (constat nexlink #5434). Le callback
+    réutilise le chemin du report (#2487) : marque `review-designation-carried`,
+    relecteurs gardés, aucun courrier. `previous` est le gel précédent, pour la
+    trace.
+    """
+    def on_frozen(tx, milestone, threads):
+        lot = int(milestone["work_item_id"])
+        item = work.get(tx, lot) or {"id": lot}
+        plan = same_head_plan(tx, lot, str(milestone.get("sha") or ""),
+                              previous=previous)
+        if _waiver(item):
+            result = {"state": rd.NONE, "required": 0, "reviewers": [],
+                      "freeze": dict(milestone or {}),
+                      "why": "same head re-freeze (#5481): manual waiver kept"}
+        elif not (plan.get("carried") or (item.get("reviewers") or ())):
+            result = {"state": rd.NONE, "required": 0, "reviewers": [],
+                      "freeze": dict(milestone or {}),
+                      "why": "same head re-freeze (#5481): no reviewer due"}
+        else:
+            result = _carried_in_transaction(tx, item, milestone, plan)
+        result["same_head"] = True
+        if outcome is not None:
+            outcome.clear()
+            outcome.update(result)
+        return result
+    return on_frozen
+
+
+def same_head_plan(db, lot: int, sha: str, *, previous=None) -> dict:
+    """Le plan du report pour un regel de la même tête (#5481).
+
+    Les verdicts rendus sur ce SHA sont repris tels quels (`from` = la même
+    tête) ; le chemin `_carried_in_transaction` garde ensuite les relecteurs
+    du gel précédent et n'envoie aucun courrier. Le plan n'est pas un report
+    de contenu : il ne recopie pas les jalons, il les nomme.
+    """
+    frozen = str(sha or "").strip().lower()
+    latest: dict = {}
+    for mark in storage.of(db).work.milestones(int(lot), None) or ():
+        if (mark.get("kind") != "verdict"
+                or not plan_git.same_commit(mark.get("sha"), frozen)):
+            continue
+        key = str(mark.get("actor") or "").strip().lower() or "?"
+        order = (float(mark.get("at_ts") or 0.0), int(mark.get("id") or 0))
+        if key not in latest or order > latest[key][0]:
+            latest[key] = (order, mark)
+    carried = [{"actor": str(mark.get("actor") or ""),
+                "verdict": str(mark.get("verdict") or "ok"),
+                "from": frozen}
+               for _order, mark in sorted(latest.values(), key=lambda entry: entry[0])]
+    prior_id = int((previous or {}).get("id") or 0)
+    return {"carried": carried,
+            "detail": ("same head re-freeze (#5481): head already freeze #%d; "
+                       "acquired verdicts kept" % prior_id)}
 
 
 # --------------------------------------------------------------------------

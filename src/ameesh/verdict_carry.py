@@ -1275,8 +1275,8 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
     (#4849). Sans cette distinction, une lecture ratée laissait le lot en `qa`
     pour toujours : le report avait déjà marqué ses verdicts « décidés »,
     aucun écrivain ne revenait. Rend
-    `{result: validated|pending|closed|exhausted|idle, detail}` ; ne lève
-    jamais."""
+    `{result: validated|pending|closed|exhausted|stale|idle, detail}` ; ne
+    lève jamais."""
     row = work.get(db, lot)
     if not row or str(row.get("state") or "") != "qa":
         return {"result": "idle", "detail": "lot not in qa"}
@@ -1285,6 +1285,15 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
     marks = work.milestones(db, lot)
     latest = plan_git.latest_freeze(marks)
     freeze = freeze or latest
+    # #5481 : un passage peut porter un gel qui n'est plus celui du lot (gel
+    # concurrent, regel de la même tête). Le quorum ne s'applique qu'à la tête
+    # courante : une tête changée n'est jamais validée par un vieux report.
+    # Un regel de la même tête garde la même preuve (les verdicts portent sur
+    # le SHA, pas sur l'identifiant du gel).
+    if (not freeze or not latest
+            or not plan_git.same_commit(freeze.get("sha"), latest.get("sha"))):
+        return {"result": "stale",
+                "detail": "the carried freeze is no longer the lot's head"}
     if not _carried_ok_on_freeze(marks, freeze):
         return {"result": "idle", "detail": "no carried ok verdict on the frozen head"}
     # #4834 : la porte est lue avec la même lecture que la garde de
@@ -1336,6 +1345,24 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
             exc = gate2_exc
     else:
         exc = gate_exc
+    # #5481 : la course entre hôtes n'est pas une panne. Entre la lecture de
+    # l'état et le geste, un autre passage a pu valider le lot (`work.move`
+    # lève alors « already in validated ») ou le faire sortir de `qa`. On
+    # relit l'état : validé est le résultat attendu, et rien n'est compté
+    # comme essai. Sans cette relecture, trois hôtes brûlaient chacun cinq
+    # tentatives sur un lot déjà validé (nexlink #5434).
+    try:
+        now = work.get(db, lot)
+    except Exception:  # noqa: BLE001 - une relecture ratée ne conclut pas
+        now = None
+    if now is not None:
+        now_state = str(now.get("state") or "")
+        if now_state == "validated":
+            return {"result": "validated",
+                    "detail": "another writer already validated the carried quorum"}
+        if now_state != "qa":
+            return {"result": "idle",
+                    "detail": "the lot left qa during the carried quorum"}
     # La porte n'a pas conclu : sans dépôt local, cet hôte ne peut rien
     # affirmer et ne doit pas consommer le budget d'un autre hôte.
     try:
