@@ -461,6 +461,59 @@ class DesignateDeferredForceTest(_Reviewed):
         self.assertEqual(len(self.review_mail()), 2)
 
 
+class ProvisionalCarriedShortcutTest(_Reviewed):
+    """Une marque carried provisoire ne justifie pas le raccourci (#5481).
+
+    Le gel écrit la marque du report avant de l'avoir accompli : elle est
+    provisoire. La prendre pour une désignation acquise ferait écrire au regel
+    de la même tête une marque définitive, sans qu'aucun siège ait été désigné
+    sur cette tête ; le refus du report ne pourrait plus la contourner.
+    """
+
+    def _freeze_deferred(self, sha: str) -> dict:
+        outcome: dict = {}
+        work.milestone(self.db, self.lot, "frozen", sha=sha, actor="author",
+                       outcome=outcome, repo=self.repo.root,
+                       defer_designation=True)
+        return outcome
+
+    def test_a_provisional_mark_keeps_the_report_refusal_recovery_open(self):
+        self.reviewed_freeze()
+        frozen = self.repo.adapt_test()
+        self.receipt(frozen)
+        first = self._freeze_deferred(frozen)
+        self.assertEqual(first.get("state"), "carried", first)
+        first_freeze = self.freeze_latest()
+        mark = act._effective_mark(self.db, self.lot, int(first_freeze["id"]))
+        self.assertEqual(mark[1], "carried")
+        self.assertTrue(mark[2].get("provisional"), mark[2])
+        # La CLI est interrompue avant le report ; un regel du même SHA ne
+        # doit pas convertir la provision en désignation définitive.
+        self.assertFalse(act.acquired_on_head(self.db, self.cfg, self.lot,
+                                              first_freeze))
+        second = self._freeze_deferred(frozen)
+        self.assertEqual(second.get("state"), "carried", second)
+        self.assertFalse(second.get("same_head"))
+        second_freeze = self.freeze_latest()
+        again = act._effective_mark(self.db, self.lot, int(second_freeze["id"]))
+        self.assertEqual(again[1], "carried")
+        self.assertTrue(again[2].get("provisional"), again[2])
+        self.assertEqual(self.review_mail(), [])
+        # Le report refuse ensuite : la sélection réelle contourne la
+        # provision et ne relance les deux sièges qu'une fois.
+        self.db.execute("DELETE FROM agent_mailbox")
+        outcome = act.designate_deferred(self.cfg, self.db, self.lot,
+                                         second_freeze, force=True)
+        self.assertEqual(outcome.get("state"), "designated", outcome)
+        self.assertEqual([row["recipient"] for row in self.review_mail()],
+                         ["rev1", "rev2"])
+        replay = act.designate_deferred(self.cfg, self.db, self.lot,
+                                        second_freeze, force=True)
+        self.assertEqual(replay.get("state"), "designated", replay)
+        self.assertEqual([row["recipient"] for row in self.review_mail()],
+                         ["rev1", "rev2"])
+
+
 class SameHeadRaceTest(_Reviewed):
     """La vérification du même SHA se refait sous le verrou du gel."""
 

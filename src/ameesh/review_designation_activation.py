@@ -2094,6 +2094,11 @@ def acquired_on_head(db, cfg, lot: int, freeze: Mapping) -> bool:
     « même tête » : des sièges hérités, une attente ou un siège que le pilote
     a retiré de la colonne ne le justifient pas.
 
+    Une marque `carried` **provisoire** (écrite au gel sur le plan du report,
+    avant qu'il soit accompli) n'est pas une désignation acquise non plus : le
+    report peut encore refuser, et le raccourci « même tête » figerait une
+    désignation que personne n'a faite (#5481, B/P1 cx2).
+
     La colonne `reviewers` est lue comme `_mark_covers(..., column=live)` et
     `_previous_designees` la lisent : un siège retiré n'est plus désigné même
     quand la marque le nomme encore (#3685). Une colonne illisible ne retire
@@ -2111,6 +2116,16 @@ def acquired_on_head(db, cfg, lot: int, freeze: Mapping) -> bool:
         return False
     payload = dict(effective[2] or {})
     if effective[1] == "designation" and payload.get("state") == rd.WAITING:
+        return False
+    if effective[1] == "carried" and payload.get("provisional"):
+        # #5481 (B/P1 cx2) : la marque écrite sur le plan du report n'est
+        # qu'une provision. La prendre pour acquise ferait écrire au regel de
+        # la même tête une marque définitive (`same_head_plan` ne reprend pas
+        # le drapeau), la CLI sauterait la sélection via `same_head`, et
+        # `designate_deferred(force=True)` ne contournerait plus cette marque :
+        # aucun avis acquis sur la tête, aucune demande, aucune DEFERRED à
+        # reprendre. La reprise doit rester possible après interruption ou
+        # refus du report ; un report accompli écrit sa marque sans le drapeau.
         return False
     try:
         floor = _floor_of(db, int(lot), cfg)
