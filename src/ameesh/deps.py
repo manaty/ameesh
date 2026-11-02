@@ -721,21 +721,72 @@ def git_exclude(link: str) -> str | None:
     return pattern
 
 
+def _target_paths(manifest_dir: str, root: str, target: str | None) -> list[str]:
+    """The directories a packager target names, resolved both ways.
+
+    A relative `--projectDir app` is relative to the directory the command
+    runs from; an npm script runs in its package's directory, but a caller may
+    also run it from the repository root.  Both resolutions are kept, so a
+    sibling tooling manifest still guards the app it names whichever way it is
+    invoked.  `None` is the manifest's own directory."""
+    if target is None:
+        return [manifest_dir]
+    target = os.path.expanduser(target)
+    if os.path.isabs(target):
+        candidates = [target]
+    else:
+        candidates = [os.path.join(manifest_dir, target), os.path.join(root, target)]
+    out = []
+    for candidate in candidates:
+        candidate = os.path.normpath(candidate)
+        if candidate not in out:
+            out.append(candidate)
+    return out
+
+
 def _packagers(pkg_dir: str) -> list[str]:
-    """Conservative guard: root/sibling tooling can package any app in git.
+    """The packagers whose app tree contains `pkg_dir` (L248b, #5417).
+
+    A package is guarded when it declares a packager itself, when a manifest
+    in the same git worktree names it as its build target (`--projectDir`,
+    `directories.app`), or when a manifest packages its own directory and
+    `pkg_dir` is below it.  A sibling desktop app therefore no longer guards
+    the whole monorepo: only the packages a packaging command actually reads.
 
     Inspect manifests even without a lockfile. Never cross into nested git
     repositories, generated trees, hidden directories or directory symlinks.
+    An unreadable manifest on the way from `pkg_dir` to the root keeps the
+    conservative refusal (it could package this package); an unreadable
+    sibling is ignored, since it cannot be shown to package it.
     """
     root = worktree_root(pkg_dir)
     found = set(deps_packagers.packagers(pkg_dir))
-    if not root:
+    if found or not root:
         return sorted(found)
     stack = [root]
     while stack:
         current = stack.pop()
         if current != pkg_dir and os.path.isfile(os.path.join(current, "package.json")):
-            found.update(deps_packagers.packagers(current))
+            try:
+                packaged = deps_packagers.targets(current)
+            except (OSError, ValueError):
+                if _inside(pkg_dir, current):
+                    raise
+            else:
+                if _inside(current, pkg_dir):
+                    # A package below pkg_dir (an npm workspace member) can
+                    # have its tree hoisted into pkg_dir: if it packages, the
+                    # hoisted tree may be the one its packager reads, so keep
+                    # pkg_dir local too.
+                    found.update(packaged)
+                else:
+                    for tool, targets in packaged.items():
+                        for target in targets:
+                            paths = _target_paths(current, root, target)
+                            if any(_inside(pkg_dir, path) or _inside(path, pkg_dir)
+                                   for path in paths):
+                                found.add(tool)
+                                break
         with os.scandir(current) as entries:
             for entry in entries:
                 if (entry.name.startswith(".") or entry.name in SKIP_DIRS
@@ -858,7 +909,7 @@ def link_ready(top: str, cache_root: str) -> list[dict]:
     """The runner's hook at the start of a turn (cheap, never installs): link
     the packages of the git worktree holding `top` that have NO
     `node_modules` and whose entry is already complete. Existing shared links
-    in packaging projects are removed without installing; run deps unlink to
+    in packaging packages are removed without installing; run deps unlink to
     install the required local tree. Nothing outside git:
     a turn started in a parent directory (`~/development/manaty`) would reach
     every worktree under it, review worktrees included (#249: 262 links from
