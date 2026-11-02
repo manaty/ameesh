@@ -81,7 +81,8 @@ class DiagnosticTest(unittest.TestCase):
         self.assertIn('<invalid path>', text)
 
     def test_probe_reaches_read_boundary_and_never_publishes_after_failure(self):
-        with mock.patch.object(producer, 'read_document', side_effect=FileNotFoundError(errno.ENOENT, SECRET)), \
+        with mock.patch.dict(sys.modules, {'psycopg.conninfo': mock.Mock()}), \
+                mock.patch.object(producer, 'read_document', side_effect=FileNotFoundError(errno.ENOENT, SECRET)), \
                 mock.patch.object(producer, 'atomic') as write:
             with self.assertRaises(FileNotFoundError) as caught:
                 producer.probe()
