@@ -1537,7 +1537,7 @@ def _same(row: dict, values: dict) -> bool:
 
 
 def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
-                  on_incomplete=None) -> SyncReport | None:
+                  on_incomplete=None, unsettled: bool = False) -> SyncReport | None:
     """#3963: one complete sync per host/canon/interval, without a long lock.
 
     Other executors reuse only a completed result for the same immutable
@@ -1545,10 +1545,13 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     settle the host gate. Explicit CLI sync remains unconditional.
 
     #5493: a real sync takes minutes; while a newer claim is pending, the
-    last completed result of the same signature stays reusable (the pending
-    sync writes a non-ok status first, so it stays fail closed). A claimed
-    sync that raises withdraws that result and releases its claim: the next
-    pass retries instead of waiting out the interval.
+    last completed result stays readable, and reused only if its signature
+    equals this snapshot's (the signature is the guard). A claimed sync that
+    raises withdraws that result and releases its claim: the next pass
+    retries instead of waiting out the interval. `unsettled` (no host gate
+    yet, e.g. a runner restarted on another version): a completed result of
+    a different signature is taken over at once instead of at the interval's
+    expiry, so the wait is bounded by one sync in progress plus its own.
     """
     if interval_s <= 0 or canon.untrusted or not canon.readable or not canon.sources:
         return sync(db, canon, host)
@@ -1562,7 +1565,10 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode()).hexdigest()
     store = storage.of(db).canon
     token = uuid.uuid4().hex
-    if not store.claim_sync(host, key, token, interval_s):
+    claimed = store.claim_sync(host, key, token, interval_s)
+    if not claimed and unsettled:
+        claimed = store.claim_sync(host, key, token, interval_s, takeover=signature)
+    if not claimed:
         shared = store.shared_sync(host, key)
         if shared is None or shared["sync_signature"] != signature:
             if on_incomplete is not None:

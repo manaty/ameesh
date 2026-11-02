@@ -167,7 +167,7 @@ class Canon(interface.Canon):
             """, (diagnostic, host, json.dumps(list(keep))))
         return sorted(r["canon"] for r in rows)
 
-    def claim_sync(self, host, canon, token, interval_s) -> bool:
+    def claim_sync(self, host, canon, token, interval_s, takeover=None) -> bool:
         rows = self.db.query(
             """INSERT INTO canon_state AS s
                 (host, canon, status, sync_claimed_at, sync_token)
@@ -176,7 +176,10 @@ class Canon(interface.Canon):
                     sync_claimed_at = clock_timestamp(), sync_token = excluded.sync_token
                 WHERE s.sync_claimed_at IS NULL OR
                     s.sync_claimed_at <= clock_timestamp() - make_interval(secs => %s)
-                RETURNING host""", (host, canon, token, float(interval_s)))
+                    OR (%s::text IS NOT NULL AND s.sync_token = s.sync_completed_token
+                        AND s.sync_signature IS DISTINCT FROM %s::text)
+                RETURNING host""", (host, canon, token, float(interval_s),
+                                    takeover, takeover))
         return bool(rows)
 
     def complete_sync(self, host, canon, token, signature) -> None:
