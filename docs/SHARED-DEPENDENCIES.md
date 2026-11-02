@@ -108,16 +108,18 @@ shared libraries of the same monorepo to keep a local tree.
   or an `electron-builder.{yml,yaml,json,json5,js,cjs,ts}` file. `deps link`
   refuses it and the turn-start hook removes a shared link there.
 * A manifest elsewhere in the same git worktree (root, sibling, parent) guards
-  only the app it names: electron-builder's `--projectDir DIR` (resolved from
-  the manifest's directory and from the repository root, because an npm script
-  can be run from either) and `directories.app` from its `build` key or an
-  electron-builder YAML/JSON config. A command with no target guards the
-  manifest's own directory and the packages below it. Thus
-  `desktop/package.json` with electron-builder no longer guards `backend`,
-  `website`, `mobile` or `shared/*`.
+  only the app it names: electron-builder's `--projectDir DIR` (or its
+  `--project` alias), resolved from the manifest's directory and from the
+  repository root because an npm script can be run from either, and
+  `directories.app` from its `build` key or an electron-builder YAML/JSON
+  config. A command with no target guards the manifest's own directory and the
+  packages below it; a packaging member of an npm workspace also guards the
+  workspace root that hoists its tree. Thus `desktop/package.json` with
+  electron-builder no longer guards `backend`, `website`, `mobile` or
+  `shared/*`.
 * `pkg`, `nexe` and `@vercel/ncc` guard the package that declares or invokes
-  them; their entry arguments are not resolved. A `pkg`/`nexe` script in a
-  root tooling package does not guard the apps below it.
+  them and the packages below it (a root tooling script therefore keeps the
+  whole tree local); their entry arguments are not resolved.
 * A broken manifest in the package or on the way up to the repository root
   refuses the link (it could package this package); a broken sibling is
   ignored, since it cannot be shown to package it. Nested repositories,
@@ -139,6 +141,10 @@ The turn-start scan includes child packages even when the root has a lockfile.
 Script commands are recognized at command positions (`npx` / `npm exec`, after
 shell separators); `tsc --outDir pkg` or `echo electron-builder` do not trigger
 the guard, and the `pkg` / `nexe` manifest configuration keys are detected too.
+A `file:` dependency of a packaging app is not followed, nor a `cd DIR &&
+packager` sequence, a target passed as a variable (`--projectDir "$APP"`) or an
+explicit `--config FILE`: run `deps local` in the dependency or the app when
+packaging that way.
 
 Before packaging, run in the package directory:
 

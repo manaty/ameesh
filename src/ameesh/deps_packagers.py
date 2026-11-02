@@ -24,7 +24,7 @@ BUILDER_CONFIGS = ("electron-builder.yml", "electron-builder.yaml",
                    "electron-builder.ts")
 DEPENDENCIES = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 #: options of the command line that name the directory a packager reads
-PROJECT_DIR_OPTIONS = ("--projectDir", "--project-dir")
+PROJECT_DIR_OPTIONS = ("--projectDir", "--project-dir", "--project")
 APP_DIR_PREFIXES = ("-c.directories.app=", "--config.directories.app=",
                     "-c.directories.app", "--config.directories.app")
 
@@ -188,7 +188,7 @@ def _declared(manifest, pkg_dir):
 
 
 def _app_option(args):
-    """Directories named by electron-builder's `--projectDir`/`-c.directories.app`."""
+    """Directories named by electron-builder's project options or config overrides."""
     found = []
     index = 0
     while index < len(args):

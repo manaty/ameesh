@@ -146,7 +146,9 @@ class ScopeTests(l231._Base):
     def test_project_dir_targets_only_the_named_app(self):
         for index, script in enumerate(("electron-builder --projectDir app",
                                         "electron-builder --project-dir app",
+                                        "electron-builder --project app",
                                         "npx --yes electron-builder --projectDir=app",
+                                        "npx electron-builder --project=app",
                                         "electron-builder -c.directories.app=app",
                                         "electron-builder --config.directories.app app")):
             with self.subTest(script=script):
@@ -189,6 +191,28 @@ class ScopeTests(l231._Base):
                         '{\n  // comment\n  "directories": {"output": "release", "app": "app"}\n}\n')
                 self.assertEqual(deps._packagers(app), ["electron-builder"])
                 self.assertEqual(deps._packagers(backend), [])
+
+    def test_a_packaging_workspace_member_guards_the_root_that_hoists_its_tree(self):
+        root = l231._package(str(self.base), name="workspace",
+                             manifest=dict(l231.MANIFEST,
+                                           workspaces=["desktop", "backend"]))
+        l231._git(root, "init", "-q", "-b", "main")
+        desktop = Path(root, "desktop")
+        desktop.mkdir()
+        Path(desktop, "package.json").write_text(json.dumps({
+            "name": "desktop",
+            "devDependencies": {"electron-builder": "26"},
+            "scripts": {"dist": "electron-builder"}}))
+        backend = Path(root, "backend")
+        backend.mkdir()
+        Path(backend, "package.json").write_text(json.dumps({"name": "backend"}))
+        self.assertEqual(deps.find_packages(root), [root])
+        self.assertEqual(deps._packagers(root), ["electron-builder"])
+        installer = l231.FakeInstaller()
+        self.assertEqual(deps.link_package(root, self.cache, installer=installer)["status"],
+                         "packager-refused")
+        self.assertEqual(installer.calls, [])
+        self.assertFalse(os.path.lexists(os.path.join(root, "node_modules")))
 
     def test_a_root_packaging_command_still_guards_the_tree_below_it(self):
         root = self.repo()

@@ -773,12 +773,20 @@ def _packagers(pkg_dir: str) -> list[str]:
                 if _inside(pkg_dir, current):
                     raise
             else:
-                for tool, targets in packaged.items():
-                    for target in targets:
-                        if any(_inside(pkg_dir, path)
-                               for path in _target_paths(current, root, target)):
-                            found.add(tool)
-                            break
+                if _inside(current, pkg_dir):
+                    # A package below pkg_dir (an npm workspace member) can
+                    # have its tree hoisted into pkg_dir: if it packages, the
+                    # hoisted tree may be the one its packager reads, so keep
+                    # pkg_dir local too.
+                    found.update(packaged)
+                else:
+                    for tool, targets in packaged.items():
+                        for target in targets:
+                            paths = _target_paths(current, root, target)
+                            if any(_inside(pkg_dir, path) or _inside(path, pkg_dir)
+                                   for path in paths):
+                                found.add(tool)
+                                break
         with os.scandir(current) as entries:
             for entry in entries:
                 if (entry.name.startswith(".") or entry.name in SKIP_DIRS
