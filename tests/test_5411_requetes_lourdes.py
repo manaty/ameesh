@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 
+from ameesh import db as db_mod
 from ameesh import provider_credits, storage, work
 from ameesh.storage.postgres import menage as menage_pg
 
@@ -115,7 +116,6 @@ class MeasureCandidatesTest(_LotCase):
         self.assertIn(row["state"], ("merged", "delivered"))
         self.assertEqual(row["merge_sha"], SHA)
         self.assertFalse(row["measured"])
-        self.assertEqual(int(row["started_ts"]), int(row["started_ts"]))
         self.assertGreater(row["merged_ts"], 0)
 
 
@@ -137,21 +137,31 @@ class AlertIndexMigrationTest(PgTestCase):
 class LatestByPathWindowTest(PgTestCase):
     """La lecture à fenêtre passe par l'index du temps, sans balayage complet."""
 
-    def _plan(self, sql, params=()):
-        # `EXPLAIN` ne rentre pas dans l'agrégat JSON du pilote psql.
-        from ameesh import db as db_mod
+    def _require_psycopg(self):
+        # `EXPLAIN` ne rentre pas dans l'agrégat JSON du pilote psql. Le saut
+        # est posé AVANT les insertions de masse : sous psql (statement_timeout
+        # de 30 s), les 220 000 lignes expiraient avant d'atteindre `_plan`
+        # (CI psql 7/16, DbError 57014 — #5411).
         if not isinstance(self.db, db_mod.PsycopgDriver):
             self.skipTest("EXPLAIN is wrapped by the psql driver")
+
+    def _plan(self, sql, params=()):
+        self._require_psycopg()
         return json.dumps(self.db.query("EXPLAIN (FORMAT JSON) " + sql, params))
 
     def test_the_window_read_uses_the_time_index(self):
+        self._require_psycopg()
         self.db.execute("DELETE FROM housekeeping_log")
-        self.db.execute(
+        # #4822 : les insertions de masse ne doivent pas être annulées par un
+        # statement_timeout hérité (rôle, base, PGOPTIONS) — même sous psycopg.
+        db_mod.execute_without_statement_timeout(
+            self.db,
             "INSERT INTO housekeeping_log (host, at, actor, kind, action, path, bytes)"
             " SELECT 'h1', now() - (g || ' seconds')::interval, 'test', 'tmp',"
             " 'signaled', '/tmp/p' || (g % 4000), g"
             " FROM generate_series(1, 20000) g")
-        self.db.execute(
+        db_mod.execute_without_statement_timeout(
+            self.db,
             "INSERT INTO housekeeping_log (host, at, actor, kind, action, path, bytes)"
             " SELECT 'h1', now() - interval '3 days' - (g || ' seconds')::interval,"
             " 'test', 'tmp', 'signaled', '/tmp/old' || g, g"
