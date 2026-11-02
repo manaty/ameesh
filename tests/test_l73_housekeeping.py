@@ -1571,6 +1571,67 @@ class MenageDbTest(PgTestCase):
         self.assertIsNone(rows[inconnu]["lot"])
         self.assertTrue(rows[inconnu]["detail"].startswith(menage.UNATTRIBUTED))
 
+    def test_worktree_d_un_second_depot_sous_le_tmp_est_suivi_et_retire(self):
+        """#5426 : un worktree créé sous le TMPDIR de l'agent depuis un AUTRE
+        dépôt est rattaché à ce dépôt en fin de tour, puis retiré par le
+        passage quand son lot est fini, propre et intégré."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        autre = _repo(os.path.join(self.tmp, "autre"))
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        lot = self._lot("worktree d'un autre dépôt")
+        work.assign(self.db, lot, "a1")
+        tour = menage.Turn.begin(self.cfgl, menage.Policy(), "a1", main,
+                                 new_session=False, base_env={})
+        mine = tour.env["TMPDIR"]
+        wt = os.path.join(mine, "wt-%d" % lot)
+        _git("worktree", "add", "-q", wt, "-b", "lot/%d-autre" % lot, cwd=autre)
+        tour.end(lot=str(lot), turn_id="t" * 32, db=self.db, host="pc")
+        rows = {r["path"]: r for r in storage.of(self.db).housekeeping.worktrees("pc")}
+        self.assertIn(wt, rows)
+        self.assertEqual(rows[wt]["agent"], "a1")
+        self.assertEqual(rows[wt]["lot"], str(lot))
+        self.assertEqual(menage._real(rows[wt]["repo"]),
+                         menage._real(menage.common_dir(autre)))
+        work.close(self.db, lot, abandoned=True)
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                        now=time.time() + 2 * 3600)
+        self.assertFalse(os.path.exists(wt))
+        rows = storage.of(self.db).housekeeping.worktrees("pc")
+        self.assertEqual([r["status"] for r in rows], ["removed"])
+
+    def test_worktree_d_un_second_depot_sous_le_tmp_avec_commit_non_pousse_est_garde(self):
+        """#5426 : le même worktree porteur d'un commit absent de la forge est
+        gardé et signalé (jamais retiré), même lot fini."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        autre = _repo(os.path.join(self.tmp, "autre"))
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        lot = self._lot("worktree d'un autre dépôt, non poussé")
+        work.assign(self.db, lot, "a1")
+        tour = menage.Turn.begin(self.cfgl, menage.Policy(), "a1", main,
+                                 new_session=False, base_env={})
+        mine = tour.env["TMPDIR"]
+        wt = os.path.join(mine, "wt-%d" % lot)
+        _git("worktree", "add", "-q", wt, "-b", "lot/%d-autre" % lot, cwd=autre)
+        _write(os.path.join(wt, "travail.txt"), 10)
+        _git("add", "travail.txt", cwd=wt)
+        _git("commit", "-q", "-m", "commit local", cwd=wt)
+        tour.end(lot=str(lot), turn_id="t" * 32, db=self.db, host="pc")
+        work.close(self.db, lot, abandoned=True)
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                        now=time.time() + 2 * 3600)
+        rows = storage.of(self.db).housekeeping.worktrees("pc")
+        self.assertEqual([r["status"] for r in rows], ["kept"])
+        self.assertIn("commits not pushed", rows[0]["detail"])
+        self.assertTrue(os.path.isdir(wt))
+        kept = [r for r in storage.of(self.db).housekeeping.recent("pc", 3600)
+                if r.get("action") == "kept"]
+        self.assertTrue(kept)
+        self.assertGreater(kept[0]["bytes"] or 0, 0)
+
     def test_worktree_non_attribue_rattache_a_son_lot_fini(self):
         """#1665 : un worktree déjà suivi « non attribué » dont la branche
         nomme un lot assigné à l'agent suit la fin de ce lot (il est retiré
