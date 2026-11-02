@@ -39,7 +39,10 @@ The gesture, and its guards (all checked BEFORE any write):
    head is the given frozen SHA, its `mergeStateStatus` is `CLEAN`,
    `HAS_HOOKS` or `UNSTABLE` — nothing is weakened: a blocked PR or behind
    (`BEHIND`) is refused; on `CLEAN`/`HAS_HOOKS` all its checks are concluded
-   and green (`radar.ci_green`), on `UNSTABLE` (#4549) the only tolerated
+   and green (`radar.ci_green`; #5523: an empty rollup passes only when the
+   project declares `required_checks: []` and the forge proves the repository
+   has no CI at all — no workflow, no run, check run or status on the head),
+   on `UNSTABLE` (#4549) the only tolerated
    non-green checks are optional ones and a run superseded by a newer green
    suite that ran no test (the packet proof and the aggregate detail still
    gate), while every required check is proven by the same gate as the fire;
@@ -111,6 +114,7 @@ import re
 import shutil
 import tempfile
 import time
+from urllib.parse import quote
 
 from ... import (fire, land, merge_queue, migrations, packet_guard, packet_reservation,
                  plan_git, radar, resolutions, work)
@@ -248,6 +252,47 @@ def _unstable_ci_ok(rollup, project=None, branch=None, *, slug: str = "",
     return not detail_gaps
 
 
+def _no_ci_proven(rollup, project, required, *, slug: str = "", head: str = "",
+                  gh=None) -> bool:
+    """#5523 : un dépôt sans CI (canon `manaty/home`) n'a aucun check à
+    rendre vert ; `radar.ci_green` refuse pourtant tout rollup vide.
+
+    Le rollup vide ne vaut vert que si le projet **déclare** `required_checks:
+    []` (#3428), n'exige aucun statut, et que la forge **prouve** l'absence de
+    toute CI : aucun workflow au dépôt, aucun run, check run ni statut sur la
+    tête exacte. Toute autre absence (CI pas encore démarrée, lecture vide ou
+    impossible, `slug`/`head`/`gh` inconnus) garde le refus."""
+    if rollup or required or project is None:
+        return False
+    if getattr(project, "required_checks", ()) \
+            or not getattr(project, "required_checks_declared", False):
+        return False
+    if not slug or not head or gh is None:
+        return False
+    sha = quote(head, safe="")
+    reads = (("repos/%s/actions/workflows?per_page=100" % slug, "workflows"),
+             ("repos/%s/actions/runs?head_sha=%s&per_page=100" % (slug, sha),
+              "workflow_runs"),
+             ("repos/%s/commits/%s/check-runs?per_page=100" % (slug, sha), "check_runs"),
+             ("repos/%s/commits/%s/statuses?per_page=100" % (slug, sha), None))
+    for path, key in reads:
+        try:
+            pages = fire._api_pages(gh, path, "gh api %s" % path)
+        except land.LandError:
+            return False
+        if not pages:
+            return False
+        for page in pages:
+            if key is None:
+                # `statuses` : chaque page est une liste
+                if not isinstance(page, list) or page:
+                    return False
+            elif not isinstance(page, dict) or page.get("total_count") != 0 \
+                    or page.get(key) != []:
+                return False
+    return True
+
+
 def _pr_guards(view: dict, pr: int, head: str, target: str, project=None, *,
                slug: str = "", gh=None) -> None:
     """The guards carried by the PR view, replayed before any write.
@@ -286,7 +331,8 @@ def _pr_guards(view: dict, pr: int, head: str, target: str, project=None, *,
                 "optional ones and a run superseded by a newer green suite; the "
                 "packet proof or a required status is still missing" % pr)
         return
-    if not radar.ci_green(rollup, required):
+    if not radar.ci_green(rollup, required) \
+            and not _no_ci_proven(rollup, project, required, slug=slug, head=head, gh=gh):
         raise MergePrError("PR #%d: the checks on %s are not all concluded and green"
                            % (pr, head[:12]))
 
@@ -457,14 +503,16 @@ def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
     unstable_ok = unstable and _unstable_ci_ok(rollup, project, branch,
                                                slug=slug, head=head, gh=gh)
 
+    required = radar.required_statuses(project, branch)
+
     def ci_status(name: str):
         if not branch or name != branch:
             return None
         return {"number": view.get("number"), "url": view.get("url") or "",
                 "head": head.lower(),
-                "green": (unstable_ok
-                          or radar.ci_green(rollup,
-                                           radar.required_statuses(project, branch))),
+                "green": (unstable_ok or radar.ci_green(rollup, required)
+                          or _no_ci_proven(rollup, project, required,
+                                           slug=slug, head=head, gh=gh)),
                 "draft": bool(view.get("isDraft"))}
 
     clone = resolutions.Replayer(repo, owner)
