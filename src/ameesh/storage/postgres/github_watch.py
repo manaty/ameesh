@@ -64,14 +64,22 @@ class GithubWatch(interface.GithubWatch):
                 " ON CONFLICT (project, repo, kind, object_id) DO UPDATE SET"
                 " issue_ref=EXCLUDED.issue_ref, url=EXCLUDED.url, agent=EXCLUDED.agent,"
                 " delivered_at=EXCLUDED.delivered_at, events_after=EXCLUDED.events_after,"
-                " reminded_at=NULL, escalated_at=NULL, resolved_at=NULL, proof=NULL",
+                " reminded_at=NULL, escalated_at=NULL, resolved_at=NULL, proof=NULL,"
+                " checked_at=NULL",
                 (project, repo, entry["kind"], int(entry["object_id"]),
                  entry["issue_ref"], entry["url"], agent, float(now), events_after))
 
-    def open_entries(self, limit):
+    def open_entries(self, limit, *, checked_before=None):
+        if checked_before is None:
+            return self.db.query(
+                "SELECT * FROM github_watch_pending WHERE resolved_at IS NULL"
+                " ORDER BY delivered_at, project, repo, kind, object_id LIMIT %s",
+                (int(limit),))
         return self.db.query(
             "SELECT * FROM github_watch_pending WHERE resolved_at IS NULL"
-            " ORDER BY delivered_at, project, repo, kind, object_id LIMIT %s", (int(limit),))
+            " AND (checked_at IS NULL OR checked_at <= %s)"
+            " ORDER BY checked_at NULLS FIRST, delivered_at, project, repo, kind, object_id"
+            " LIMIT %s", (float(checked_before), int(limit)))
 
     def local_proof(self, entry):
         # An input on an issue is covered by any lot carrying it; a comment
@@ -100,7 +108,7 @@ class GithubWatch(interface.GithubWatch):
              int(entry["object_id"]), float(entry["delivered_at"])))
 
     def mark(self, entries, column, now):
-        if column not in ("reminded_at", "escalated_at"):
+        if column not in ("reminded_at", "escalated_at", "checked_at"):
             raise ValueError("github_watch.mark: unknown column %r" % column)
         for entry in entries:
             self.db.execute(

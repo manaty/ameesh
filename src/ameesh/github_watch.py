@@ -60,7 +60,8 @@ ESCALATE_AFTER = 7200
 #: Open follow-ups read per pass, and GitHub reads per pass for mesh replies.
 FOLLOW_UP_LIMIT = 200
 FOLLOW_UP_READS = 20
-#: The follow-up pass runs at most this often (base and GitHub reads).
+#: An open input is checked again at most this often. Persisted
+#: (``checked_at``): the role timer runs each pass in a fresh process.
 FOLLOW_UP_EVERY = 300
 #: The marker a mesh reply carries on the ticket (see `instruction`).
 REPLY_MARKER = "<!-- ameesh:github-watch:v1 -->"
@@ -710,7 +711,6 @@ class Watcher:
         self.next = {}
         self._warned = set()
         self._stalled = set()
-        self._follow_up_next = 0.0
 
     def _warn(self, text):
         """Journal an ignored declaration once, not on every notifier pass."""
@@ -772,8 +772,7 @@ class Watcher:
                 self.next[key] = now + min(sub.interval, RETRY)
                 self.log("GitHub watch %s: failed; cursor retained: %s" %
                          (sub.repo, plan_github._one_line(exc)))
-        if not self.dry_run and now >= self._follow_up_next:
-            self._follow_up_next = now + FOLLOW_UP_EVERY
+        if not self.dry_run:
             try:
                 if self.api is None:
                     self.api = plan_github.client(cache_dir=self.cfg.state_dir)
@@ -873,14 +872,15 @@ def follow_up(db, cfg, declared, now, *, api=None, log=None):
     st = storage.of(db)
     watchers = {(sub.project, sub.repo): sub.agent for sub in declared}
     cache, reads = {}, 0
-    remind, escalate = {}, {}
-    for entry in st.github_watch.open_entries(FOLLOW_UP_LIMIT):
+    remind, escalate, checked = {}, {}, []
+    # Each input is checked at most every FOLLOW_UP_EVERY, least recently
+    # checked first: the bounded GitHub reads go round, escalated inputs too.
+    for entry in st.github_watch.open_entries(
+            FOLLOW_UP_LIMIT, checked_before=now - FOLLOW_UP_EVERY):
         age = now - float(entry["delivered_at"])
         proof = st.github_watch.local_proof(entry)
-        # A ticket reply is read only while a recall or escalation is due:
-        # bounded GitHub reads, none for an input already escalated.
-        if (proof is None and age >= REMIND_AFTER and api is not None
-                and entry.get("escalated_at") is None):
+        # A ticket reply is read once a recall is due, within the pass budget.
+        if proof is None and age >= REMIND_AFTER and api is not None:
             repo, _, number = entry["issue_ref"].rpartition("#")
             if (repo, number) in cache or reads < FOLLOW_UP_READS:
                 reads += (repo, number) not in cache
@@ -888,11 +888,13 @@ def follow_up(db, cfg, declared, now, *, api=None, log=None):
         if proof:
             st.github_watch.resolve(entry, proof, now)
             continue
+        checked.append(entry)
         if age >= ESCALATE_AFTER and entry.get("escalated_at") is None:
             escalate.setdefault(entry["project"], []).append(entry)
         if age >= REMIND_AFTER and entry.get("reminded_at") is None:
             agent = watchers.get((entry["project"], entry["repo"]), entry["agent"])
             remind.setdefault(agent, []).append(entry)
+    st.github_watch.mark(checked, "checked_at", now)
     for agent, entries in remind.items():
         with db.transaction() as tx:
             after_commit = []

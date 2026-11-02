@@ -59,12 +59,14 @@ class FollowUpTest(PgTestCase):
         self.assertEqual(set(self.pending()), {("issue", 1)})
         self.tick(api, NOW + H - 60)
         self.assertEqual(self.follow_ups("watcher", "reminder"), [])
-        self.tick(api, NOW + H + 1)
+        self.tick(api, NOW + H + 1)  # checked 61 s ago: next check within 5 min
+        self.assertEqual(self.follow_ups("watcher", "reminder"), [])
+        self.tick(api, NOW + H - 60 + watch.FOLLOW_UP_EVERY)
         recalls = self.follow_ups("watcher", "reminder")
         self.assertEqual(len(recalls), 1)
         self.assertIn("https://github.com/acme/app/issues/1", recalls[0]["body"])
         self.assertEqual(self.follow_ups("pilote", "escalation"), [])
-        self.tick(api, NOW + H + 400)  # no second recall
+        self.tick(api, NOW + H - 60 + 2 * watch.FOLLOW_UP_EVERY)  # no second recall
         self.assertEqual(len(self.follow_ups("watcher", "reminder")), 1)
         self.tick(api, NOW + 2 * H + 1)
         escalations = self.follow_ups("pilote", "escalation")
@@ -169,6 +171,38 @@ class FollowUpTest(PgTestCase):
         self.assertTrue(bodies[-1].startswith(
             "Still open from earlier GitHub watch passes: 2 input(s)"))
         self.assertEqual(bodies[-1].count("https://github.com/acme/app/issues/1#"), 0)
+
+    def reply_reads(self, api):
+        return [c for c in api.calls if "/issues/1/comments" in c]
+
+    def test_check_cadence_is_persisted_across_fresh_processes(self):
+        # The role timer runs `notify --once` every 90 s: a fresh Watcher each time.
+        api = RepliesApi([issue()])
+        self.tick(api, NOW)
+        self.tick(api, NOW + H + 1)
+        self.assertEqual(len(self.reply_reads(api)), 1)
+        self.tick(api, NOW + H + 91)
+        self.tick(api, NOW + H + 181)
+        self.assertEqual(len(self.reply_reads(api)), 1)
+        self.tick(api, NOW + H + 1 + watch.FOLLOW_UP_EVERY)
+        self.assertEqual(len(self.reply_reads(api)), 2)
+
+    def test_escalated_input_is_still_closed_by_a_later_reply(self):
+        api = RepliesApi([issue()])
+        self.tick(api, NOW)
+        self.tick(api, NOW + H + 1)
+        self.tick(api, NOW + 2 * H + 1)
+        self.assertEqual(len(self.follow_ups("pilote", "escalation")), 1)
+        api.replies.append(dict(body="Answered " + watch.REPLY_MARKER,
+                                created_at=watch.iso(NOW + 2 * H + 100)))
+        self.tick(api, NOW + 2 * H + 1 + watch.FOLLOW_UP_EVERY)
+        row = self.pending()[("issue", 1)]
+        self.assertIsNotNone(row["resolved_at"])
+        api.issues.append(issue(2))
+        self.tick(api, NOW + 3 * H)
+        bodies = [m["body"] for m in self.inbox("watcher")
+                  if (m.get("payload") or {}).get("github_watch")]
+        self.assertFalse(bodies[-1].startswith("Still open"))
 
     def test_dry_run_follows_nothing(self):
         api = RepliesApi([issue()])

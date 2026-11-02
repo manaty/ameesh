@@ -254,7 +254,8 @@ FERMEES = {
     # la veille ; fermé aux deux rôles superviseur, aucun GRANT ajouté.
     "github_watch_pending": {"project", "repo", "kind", "object_id", "issue_ref",
                              "url", "agent", "delivered_at", "events_after",
-                             "reminded_at", "escalated_at", "resolved_at", "proof"},
+                             "reminded_at", "escalated_at", "resolved_at", "proof",
+                             "checked_at"},
     # #288 (L80b, 0472) : attribution des messages servis par un tour résident
     # (`turn_costs.inputs`), consommée par le rapport local
     # `ameesh cost turns --message` ; le contrat des rôles superviseur reste

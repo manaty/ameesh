@@ -23,6 +23,9 @@ CREATE TABLE github_watch_pending (
     reminded_at double precision,
     escalated_at double precision,
     resolved_at double precision,
+    -- dernière vérification de la preuve : la passe (processus neuf à chaque
+    -- minuterie) ne relit une entrée qu'après FOLLOW_UP_EVERY
+    checked_at double precision,
     proof text,
     PRIMARY KEY (project, repo, kind, object_id)
 );

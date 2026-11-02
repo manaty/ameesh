@@ -5568,8 +5568,12 @@ class GithubWatch(Domain):
         """#5506: open one follow-up per delivered input (a new version reopens it)."""
 
     @abc.abstractmethod
-    def open_entries(self, limit: int) -> list[dict]:
-        """#5506: inputs delivered and not yet proven handled, oldest first."""
+    def open_entries(self, limit: int, *, checked_before: float | None = None
+                     ) -> list[dict]:
+        """#5506: inputs delivered and not yet proven handled, oldest first.
+
+        ``checked_before``: only those never checked or checked at or before
+        that instant, least recently checked first (round robin)."""
 
     @abc.abstractmethod
     def local_proof(self, entry: dict) -> str | None:
@@ -5581,7 +5585,7 @@ class GithubWatch(Domain):
 
     @abc.abstractmethod
     def mark(self, entries: list, column: str, now: float) -> None:
-        """#5506: stamp ``reminded_at`` or ``escalated_at``."""
+        """#5506: stamp ``reminded_at``, ``escalated_at`` or ``checked_at``."""
 
 
 class FingerprintWatch(Domain):
