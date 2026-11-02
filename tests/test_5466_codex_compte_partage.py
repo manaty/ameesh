@@ -27,19 +27,21 @@ def _timestamp(stamp: float) -> str:
 
 
 def _rollout(home: str, used_percent: float, resets_at: float,
-             observed_at: float) -> str:
+             observed_at: float, *, secondary: dict | None = None) -> str:
     """Un journal Codex local : une fenêtre hebdomadaire, datée."""
+    limits = {"plan_type": "team",
+              "credits": {"has_credits": True},
+              "primary": {"used_percent": used_percent,
+                          "window_minutes": 10080,
+                          "resets_at": resets_at}}
+    if secondary is not None:
+        limits["secondary"] = secondary
     path = os.path.join(home, "sessions", "2026", "11", "02", "rollout.jsonl")
     write(path,
           {"type": "session_meta",
            "payload": {"creator_account_id": "account-a"}},
           {"timestamp": _timestamp(observed_at),
-           "payload": {"rate_limits": {
-               "plan_type": "team",
-               "credits": {"has_credits": True},
-               "primary": {"used_percent": used_percent,
-                           "window_minutes": 10080,
-                           "resets_at": resets_at}}}})
+           "payload": {"rate_limits": limits}})
     return path
 
 
@@ -99,6 +101,42 @@ class FenetrePlusRecenteTest(_CodexBase):
         self.assertFalse(evaluation.ok)
         self.assertIn("81%", evaluation.reason)
         self.assertAlmostEqual(self.gauge(evaluation).used, 0.81)
+
+    def test_remplacer_une_fenetre_saturee_leve_l_overage(self):
+        """B #5466 : 100 % local + crédits, remplacé par 1 % à échéance J+7.
+
+        L'ancien drapeau `in_use` restait collé aux jauges fusionnées ; sans
+        fenêtre à 100 %, `spent()` retombait sur toutes les jauges et le
+        compte était refusé « in overage » jusqu'à la NOUVELLE échéance.
+        """
+        _rollout(self.home, 100, self.now + 2 * 86400, self.now - 3600)
+        self.ops.record_gauges([_history(0.01, self.now + WEEK)])
+
+        evaluation = self.evaluate()
+
+        self.assertTrue(evaluation.ok, evaluation.reason)
+        self.assertAlmostEqual(self.gauge(evaluation).used, 0.01)
+        self.assertFalse(evaluation.gauges.overage.in_use)
+        self.assertFalse(accounts.in_overage(evaluation.gauges, self.now))
+
+    def test_une_fenetre_locale_conservee_saturee_garde_l_overage(self):
+        """Le remplacement d'une fenêtre n'efface pas l'overage d'une autre.
+
+        La fenêtre courte locale, conservée, est encore à 100 % : le compte
+        reste en overage (aucun refus levé par erreur).
+        """
+        _rollout(self.home, 100, self.now + 2 * 86400, self.now - 3600,
+                 secondary={"used_percent": 100,
+                            "window_minutes": 300,
+                            "resets_at": self.now + 3600})
+        self.ops.record_gauges([_history(0.01, self.now + WEEK)])
+
+        evaluation = self.evaluate()
+
+        self.assertTrue(evaluation.gauges.overage.in_use)
+        self.assertTrue(accounts.in_overage(evaluation.gauges, self.now))
+        self.assertFalse(evaluation.ok)
+        self.assertIn("in overage", evaluation.reason)
 
     def test_une_fenetre_partagee_close_est_ecartee(self):
         """Le relevé partagé d'une échéance ANTÉRIEURE ne remplace pas le local."""

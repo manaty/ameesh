@@ -1245,10 +1245,15 @@ class CostBook:
         un plan qui n'en publie plus ne doit pas tenir le compte en pause
         indéfiniment ; témoins #1672 et #1883).
 
-        Sur un exécuteur `backend=mediated`, `gauge_latest_window` n'est pas
-        admise au contrat médié : l'appel est refusé, l'exception est avalée
-        et la lecture locale est rendue sans réconciliation (même repli que
-        `_gauges_with_history` pour Claude).
+        L'historique reste facultatif : sans base, ou si la lecture échoue
+        (contrat médié d'un exécuteur plus ancien, base indisponible),
+        l'exception est avalée et la lecture locale est rendue sans
+        réconciliation (même repli que `_gauges_with_history` pour Claude).
+
+        Les drapeaux d'overage suivent les fenêtres retenues, pas la lecture
+        locale d'avant remplacement : un compte saturé à 100 % avec crédits
+        dont la fenêtre est remplacée par la suivante à 1 % n'est plus en
+        overage (voir `_codex_overage_after_merge`).
         """
         if self.db is None:
             return gauges
@@ -1260,15 +1265,19 @@ class CostBook:
         known = {row.get("key"): row for row in rows if row.get("key")}
         if not known:
             return gauges
-        merged, changed = [], False
+        merged, replaced, changed = [], [], False
         for gauge in gauges:
             row = known.get(gauge.key)
             if row is not None and self._codex_history_wins(gauge, row):
                 merged.append(self._gauge_from_history("codex", row))
+                replaced.append(row)
                 changed = True
             else:
                 merged.append(gauge)
-        return Gauges(merged, gauges.overage) if changed else gauges
+        if not changed:
+            return gauges
+        return Gauges(merged, self._codex_overage_after_merge(
+            gauges.overage, merged, replaced))
 
     @staticmethod
     def _codex_history_wins(gauge: "Gauge", row: dict) -> bool:
@@ -1316,6 +1325,36 @@ class CostBook:
                      float(row.get("window_s") or 0.0),
                      read_at=read_at, produced_at=produced,
                      source=row.get("source") or "", from_history=True)
+
+    @staticmethod
+    def _codex_overage_after_merge(overage: "Overage | None", merged: list,
+                                   replaced: list[dict]) -> "Overage | None":
+        """#5466 : les drapeaux d'overage suivent les fenêtres retenues.
+
+        Le relevé local dit « overage » parce qu'une de ses fenêtres est à
+        100 % avec crédits. Si cette fenêtre est remplacée par la suivante
+        (échéance plus tardive, usage faible), le drapeau local est périmé :
+        `in_overage` le lisait avec `Gauges.spent()` qui, sans fenêtre à
+        100 %, retombe sur toutes les jauges et refuse le compte jusqu'à la
+        NOUVELLE échéance.
+
+        `in_use` est donc recalculé sur l'union retenue (fenêtres locales
+        conservées + fenêtres d'historique) : une autre fenêtre locale encore
+        saturée garde l'overage, une fenêtre remplacée ne le garde pas. La
+        capacité reste celle de la lecture locale ; à défaut seulement, celle
+        de la ligne d'historique retenue (les relevés d'avant #3755 ne la
+        portent pas).
+        """
+        capable = overage.capable if overage is not None else None
+        if capable is None:
+            for row in replaced:
+                if row.get("overage_capable") is not None:
+                    capable = bool(row["overage_capable"])
+                    break
+        if overage is None and capable is None:
+            return None
+        in_use = capable is True and any(g.used >= 1.0 for g in merged)
+        return Overage(capable, in_use)
 
     def codex_gauges(self, sessions: str | None = None, *, plan: str | None = None,
                      account: str | None = None) -> list:
