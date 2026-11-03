@@ -6,7 +6,7 @@
 #
 # La suite passe sous mesure (couverture par test, sous-processus compris,
 # fichiers lus, tables touchées) : psycopg en 12 parts, plus les modules
-# « pilote » en psql en 6 parts (le code propre au pilote psql n'est exécuté
+# « pilote » en psql en 9 parts (#5604 : 6) (le code propre au pilote psql n'est exécuté
 # que là). #3450 : le 24/10, six des dix parts ont été coupées au plafond de
 # 60 min sur un pool saturé ; des parts plus courtes gardent la mesure sous
 # le plafond même quand le pool est chargé, sans publier de carte partielle
@@ -15,7 +15,10 @@
 # ses sous-processus : 2 413 s ; test_503 bloqué 3 087 s sur un communicate
 # sans borne) ; le passage à 12 parts, la mesure des sous-processus de
 # test_1252 désactivée et une borne par test (`--test-timeout`) gardent la
-# mesure sous le plafond.
+# mesure sous le plafond. #5604 : du 31/10 au 02/11, aucune carte publiée —
+# psql 4/6 (01/11) puis psql 1/6 (02/11) coupées à 60 min ; le plan estimait
+# chaque part psql à 2 548 s (×1,5 sous charge : 64 min, au-delà du plafond).
+# Le psql passe à 9 parts (~1 700 s chacune).
 # Le job « carte » fusionne les mesures en carte.json.gz (ameesh-carte/1) :
 #   - cache GitHub Actions `carte-<sha>` (une PR lit les caches de sa branche
 #     de base ; clé de repli `carte-`), sur main et à la main seulement ;
@@ -37,7 +40,7 @@
 #     carte précédente (`--map`), pas par la table statique mesurée sans
 #     couverture : le surcoût de la mesure varie de 1,2× à 9,3× selon les
 #     modules, et la table statique ne couvre que 76 modules sur 250 ;
-#   - B : les modules « pilote » psql sont mesurés en 6 parts, et les modules
+#   - B : les modules « pilote » psql sont mesurés en 9 parts (#5604 : 6), et les modules
 #     psycopg en 12 (#3450 : 8 ; une seule part de 45 modules pesait 38 min de
 #     mur pour un plafond de 40, annulée deux fois ; le run 38845518821 du
 #     16/10 a encore annulé psycopg 2/4, 3/4 et psql 1/2, 2/2 à 40m30, d'où le
@@ -126,7 +129,8 @@ env:
     mesure-psycopg-5 mesure-psycopg-6 mesure-psycopg-7 mesure-psycopg-8
     mesure-psycopg-9 mesure-psycopg-10 mesure-psycopg-11 mesure-psycopg-12
     mesure-psql-1 mesure-psql-2 mesure-psql-3 mesure-psql-4
-    mesure-psql-5 mesure-psql-6
+    mesure-psql-5 mesure-psql-6 mesure-psql-7 mesure-psql-8
+    mesure-psql-9
 
 # Linux jobs run on the self-hosted ameesh-ci runners (one persistent host,
 # four runners): GitHub's free tier caps hosted jobs at 20 for the whole
@@ -195,6 +199,9 @@ jobs:
     # non publiée. 12 parts, sous-processus de test_1252 non mesurés et borne
     # par test (`--test-timeout`) : chaque part garde de la marge sous le
     # plafond même avec une carte périmée.
+    # #5604 — runs 41298837130 (01/11) et 41438191646 (02/11) : psql 4/6 puis
+    # 1/6 coupées à 60 min, parts psql estimées 2 548 s (avertissement du
+    # plan) ; 9 parts psql.
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -212,12 +219,15 @@ jobs:
           - { pilote: psycopg, part: 10, parts: 12 }
           - { pilote: psycopg, part: 11, parts: 12 }
           - { pilote: psycopg, part: 12, parts: 12 }
-          - { pilote: psql, part: 1, parts: 6 }
-          - { pilote: psql, part: 2, parts: 6 }
-          - { pilote: psql, part: 3, parts: 6 }
-          - { pilote: psql, part: 4, parts: 6 }
-          - { pilote: psql, part: 5, parts: 6 }
-          - { pilote: psql, part: 6, parts: 6 }
+          - { pilote: psql, part: 1, parts: 9 }
+          - { pilote: psql, part: 2, parts: 9 }
+          - { pilote: psql, part: 3, parts: 9 }
+          - { pilote: psql, part: 4, parts: 9 }
+          - { pilote: psql, part: 5, parts: 9 }
+          - { pilote: psql, part: 6, parts: 9 }
+          - { pilote: psql, part: 7, parts: 9 }
+          - { pilote: psql, part: 8, parts: 9 }
+          - { pilote: psql, part: 9, parts: 9 }
     services:
       postgres:
         image: postgres:17
