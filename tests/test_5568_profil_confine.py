@@ -25,11 +25,12 @@ class ProfilConfineTest(PgTestCase):
         for table in ("account_identities", "credential_health"):
             self.db.execute("DELETE FROM %s" % table)
         self.now = float(int(time.time()))
-        # la topologie du banc : « poste » est intermittent (policy.intermittent)
-        postes = mock.patch.object(exploitation, "_intermittent_hosts",
-                                   lambda cfg, hosts: set(hosts) & {"poste"})
-        postes.start()
-        self.addCleanup(postes.stop)
+        # la topologie du banc : les VM portent l'étiquette d'hôte d'agents,
+        # pas le poste (un hôte complet, non intermittent)
+        topo = mock.patch.object(exploitation, "_agent_hosts",
+                                 lambda cfg: set(VMS))
+        topo.start()
+        self.addCleanup(topo.stop)
 
     def _declare(self, host, harness, account, ago_s=0.0, identity="x"):
         self.db.execute(
@@ -98,6 +99,9 @@ class ProfilConfineTest(PgTestCase):
         sans_date = dataclasses.replace(
             self.cfg, accounts_withdrawn={"codex": {"secondaire": "plus utile"}})
         self.assertEqual(len(self._alertes(sans_date)), 1)
+        impossible = dataclasses.replace(
+            self.cfg, accounts_withdrawn={"codex": {"secondaire": "2026-99-99 rendu"}})
+        self.assertEqual(len(self._alertes(impossible)), 1)
         date = dataclasses.replace(
             self.cfg, accounts_withdrawn={"codex": {"secondaire": "2026-11-03 rendu"}})
         self.assertEqual(self._alertes(date), [])
@@ -121,17 +125,38 @@ class ProfilConfineTest(PgTestCase):
         self.assertEqual([exploitation.alert_key(a) for a in alertes], avant)
         self.assertEqual(alertes[0]["carriers"], list(VMS))
 
-    def test_hote_intermittent_lu_dans_la_topologie(self):
-        """Le critère vient des fiches Host (`policy.intermittent`), pas d'un nom."""
+    def test_poste_sain_et_vm_en_echec_demande_la_reconnexion(self):
+        """Le cas de mty-amh-impl-03 : poste sain sur secondaire, AG2 déclare
+        secondaire en échec — reconnexion sur la VM, pas de silence."""
+        self._mesh()
+        self._declare("poste", "codex", "secondaire", ago_s=0)
+        self._sante("poste", "secondaire")
+        self._declare("vm-2", "codex", "secondaire", ago_s=0)
+        self._sante("vm-2", "secondaire", "failing")
+        self.assertEqual([a["reason"] for a in self._alertes()], ["reconnect"])
+
+    def test_topologie_lue_dans_les_etiquettes_des_fiches(self):
+        """Le critère vient des fiches Host (`tags`), pas d'un nom ni de
+        `policy.intermittent`."""
         mock.patch.stopall()
-        limites = {"poste": {"intermittent": True}, "vm-1": {"intermittent": False}}
-        with mock.patch("ameesh.canon.load_configured", return_value=["c"]), \
-                mock.patch("ameesh.resources.host_limits",
-                           side_effect=lambda canons, h: limites[h]):
-            self.assertEqual(exploitation._intermittent_hosts(self.cfg, {"poste", "vm-1"}),
-                             {"poste"})
+        hote = lambda titre, tags: mock.Mock(title=titre, tags=tags)
+        canon = mock.Mock(hosts=[hote("poste", None), hote("vm-1", ["agents"]),
+                                 hote("vm-2", ["agents", "gpu"])])
+        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+            self.assertEqual(exploitation._agent_hosts(self.cfg), {"vm-1", "vm-2"})
+        with mock.patch("ameesh.canon.load_configured",
+                        return_value=[mock.Mock(hosts=[hote("vm-1", None)])]):
+            self.assertIsNone(exploitation._agent_hosts(self.cfg))
         with mock.patch("ameesh.canon.load_configured", side_effect=OSError("canon")):
-            self.assertEqual(exploitation._intermittent_hosts(self.cfg, {"poste"}), set())
+            self.assertIsNone(exploitation._agent_hosts(self.cfg))
+
+    def test_topologie_sans_hote_d_agents_le_dit(self):
+        self._mesh()
+        with mock.patch.object(exploitation, "_agent_hosts", lambda cfg: None):
+            alertes = self._alertes()
+        self.assertEqual([a["topology"] for a in alertes], ["untagged"])
+        self.assertIn("tags no agent host", alertes[0]["detail"])
+        self.assertEqual(self._alertes()[0]["topology"], "tagged")
 
     def test_harnais_que_personne_ne_fait_tourner(self):
         self._declare("poste", "codex", "secondaire", ago_s=7 * 24 * HOUR)

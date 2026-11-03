@@ -443,10 +443,12 @@ en base seulement — noms et états, jamais un dossier ni un identifiant :
   hôte pour le harnais (`account_identities`) ; un hôte éteint garde sa
   déclaration, un hôte qui retire le profil de sa configuration cesse de le
   déclarer ;
-* **porteurs** : les hôtes qui ont déclaré un compte de ce harnais depuis 24 h,
-  hors hôtes **intermittents** de la topologie (`policy.intermittent: true` sur
-  leurs fiches Host, #5207) : un poste allumé qui déclare le profil ne le rend
-  pas utilisable aux VM, l'alerte reste ;
+* **porteurs** : les hôtes qui ont déclaré un compte de ce harnais depuis 24 h
+  **et** que la topologie désigne hôtes d'agents (étiquette `agents` de leur
+  fiche Host : `tags: [agents]`) : un poste allumé qui déclare le profil ne le
+  rend pas utilisable aux VM, l'alerte reste. Un canon qui n'étiquette aucun
+  hôte (ou illisible) fait porter tous les hôtes du harnais, et l'alerte levée
+  le dit (`topology: "untagged"`) ;
 * **utilisable** : connu d'un porteur, avec une ligne `credential_health` qui
   n'est pas `failing`.
 

@@ -386,6 +386,7 @@ TYPE_LABELS = {
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
     "account_config_invalid": "no valid harness account on the host",
+    "account_profile_confined": "harness account usable on no agent host",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
     "critical_turn_failures": "critical agent failing turns",
     # #2729 : plus aucun tour n'aboutit — la préemption prioritaire se répète ;
