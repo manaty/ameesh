@@ -3767,7 +3767,7 @@ def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
                     "open runs that do not carry the frozen composition %s" % frozen[:12])}
 
 
-def _cancel_runs(gh, repo: str, runs: list[dict], *, say=print) -> int:
+def _cancel_runs(gh, repo: str, runs: list[dict], *, say=print, on_cancel=None) -> int:
     """Annule les runs (POST …/cancel) ; rend le nombre d'échecs, jamais fatal."""
     failed = 0
     for row in runs:
@@ -3778,6 +3778,8 @@ def _cancel_runs(gh, repo: str, runs: list[dict], *, say=print) -> int:
             say("cancel run %s: %s" % (row.get("id"),
                                        " ".join((err or out or "failed").split())[:200]))
         else:
+            if on_cancel is not None:
+                on_cancel(row)
             say("cancel run %s (%s) requested" % (row.get("id"),
                                                   (row.get("url") or "")[:80]))
     return failed
@@ -4446,7 +4448,11 @@ def cmd_ci_cancel(cfg, args) -> int:
         for row in report["runs"]:
             print("  would cancel run %s (%s)" % (row["id"], row["url"] or ""))
         return 0
-    failed = _cancel_runs(gh, report["repo"], report["runs"])
+    def record_cancel(row):
+        work.note(db, args.id, "ci-cancel: run %s — %s (%s)" %
+                  (row["id"], report["why"], report["repo"]))
+
+    failed = _cancel_runs(gh, report["repo"], report["runs"], on_cancel=record_cancel)
     return 1 if failed else 0
 
 

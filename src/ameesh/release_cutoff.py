@@ -1692,18 +1692,27 @@ def deliberate_cancel(db, run_id: int, *, now: float | None = None) -> str:
     number = str(int(run_id))
     for prefix in CANCEL_TRACES:
         try:
-            rows = ops.events_noted(prefix + number, since) or ()
+            rows = ops.events_noted(prefix, since) or ()
         except Exception:  # noqa: BLE001 - sans lecture, aucune annulation prouvée
             continue
         for row in rows:
             note = str(row.get("note") or "")
-            rest = note[len(prefix) + len(number):]
-            if rest[:1].isdigit():
-                continue
-            if prefix == CANCEL_TRACES[0]:
-                if "requested" not in rest:
+            # A porter note may contain several independent cancel results.
+            entries = (note.split("; ") if prefix == CANCEL_TRACES[0] else [note])
+            matched = False
+            for entry in entries:
+                marker = prefix if entry.startswith(prefix) else "cancel run "
+                match = re.fullmatch(re.escape(marker + number) + r"(?!\d)(.*)", entry)
+                if not match:
                     continue
-            elif not rest.strip(" \t:;,.-—–"):
+                rest = match.group(1)
+                if prefix == CANCEL_TRACES[0]:
+                    matched = rest.rstrip().endswith(" requested")
+                else:
+                    matched = bool(rest.strip(" \t:;,.-—–"))
+                if matched:
+                    break
+            if not matched:
                 continue
             return "lot #%s, %s : %s" % (row.get("work_item_id") or "?",
                                          row.get("actor") or "?", " ".join(note.split())[:200])

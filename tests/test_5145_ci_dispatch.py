@@ -328,8 +328,10 @@ class CancelCliTest(fixtures.GelTestCase):
              mock.patch.object(plan_github, "Gh", return_value=api), \
              mock.patch.object(plan_github, "_json",
                                side_effect=lambda gh, argv: api(argv[-1])), \
+             mock.patch("ameesh.work.note") as note, \
              contextlib.redirect_stdout(output):
             code = ci.cmd_ci_cancel(self.cfg, self.args)
+        self.cancel_notes = note.call_args_list
         # `--json` garde la vue, puis les lignes d'annulation s'ajoutent.
         return code, json.JSONDecoder().raw_decode(output.getvalue())[0]
 
@@ -337,6 +339,24 @@ class CancelCliTest(fixtures.GelTestCase):
         api.runs = [dict(id=ident, path=".github/workflows/" + workflow,
                          head_sha=fixtures.TETE, head_branch=fixtures.BRANCHE,
                          event="workflow_dispatch", status="queued", conclusion=None)]
+
+    def test_successful_cancel_records_a_trace_but_dry_run_does_not(self):
+        api = CancelApi()
+        self._open_run(api, SUITES[0])
+        self.cancel(api)
+        self.assertEqual(len(self.cancel_notes), 1)
+        self.assertIn("ci-cancel: run 7 —", self.cancel_notes[0].args[2])
+        self.args.dry_run = True
+        self.cancel(api)
+        self.assertEqual(self.cancel_notes, [])
+
+    def test_failed_cancel_records_no_success_trace(self):
+        api = CancelApi()
+        self._open_run(api, SUITES[0])
+        with mock.patch.object(api, "run", return_value=(1, "", "HTTP 409")):
+            code, _report = self.cancel(api)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.cancel_notes, [])
 
     def test_cli_cancel_reads_the_declared_workflows(self):
         api = CancelApi()

@@ -205,29 +205,41 @@ def _strip_ext(path: str) -> tuple[str, str]:
     return "", ""
 
 
+def _test_path(value: str) -> str:
+    """Remove source locations and recognized GitHub checkout/URL roots."""
+    from urllib.parse import unquote
+    value = unquote((value or "").strip())
+    value = re.sub(r":\d+(?::\d+)?$", "", value)
+    url = re.fullmatch(r"https?://github\.com/[^/]+/[^/]+/blob/[^/]+/(.+?)(?:[?#].*)?", value)
+    if url:
+        value = url.group(1)
+    checkout = re.match(r"^/?(?:home/runner/work|__w)/([^/]+)/\1/(.+)$", value)
+    if checkout:
+        value = checkout.group(2)
+    return _norm(value)
+
+
 def test_identity(module: str) -> tuple[frozenset, bool]:
     """#5627 (B1 de ameesh-cx1) : les écritures d'un même fichier de test, et
     si elles sont qualifiées.
 
     Un chemin (`web/auth/session.test.ts`) ne se reconnaît que sous sa forme
-    qualifiée (avec ou sans extension ; pour Python, aussi pointée :
+    qualifiée (extension conservée ; pour Python, aussi pointée :
     `tests.test_x`) : deux fichiers homonymes de dossiers différents ne se
     couvrent jamais. Un module Python pointé se reconnaît aussi en chemin.
     Seul un nom nu (le relevé ne dit pas son dossier) se cherche par son nom."""
-    path = _norm(module)
+    path = _test_path(module)
     if "/" in path:
         stem, ext = _strip_ext(path)
         names = {path}
-        if stem:
-            names.add(stem)
-            if ext == "py":
-                names.add(stem.replace("/", "."))
+        if stem and ext == "py":
+            names.add(stem.replace("/", "."))
         return frozenset(names), True
     stem, _ext = _strip_ext(path)
     if not stem and re.fullmatch(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)+", path):
         slashed = path.replace(".", "/")
         return frozenset((path, slashed, slashed + ".py")), True
-    return frozenset(name for name in (path, stem) if name), False
+    return frozenset((path,)), False
 
 
 def _mentions(text: str, name: str, qualified: bool) -> bool:
@@ -244,10 +256,9 @@ def _footprint_covers(paths, names: frozenset, qualified: bool) -> bool:
     nu, un fichier de ce nom."""
     for path in paths or ():
         if qualified:
-            stem, _ext = _strip_ext(path)
-            if path in names or (stem and stem in names):
+            if _test_path(path) in names:
                 return True
-        elif test_key(path) in names or posixpath.basename(path) in names:
+        elif posixpath.basename(path) in names or (path.endswith(".py") and test_key(path) in names):
             return True
     return False
 
@@ -259,7 +270,7 @@ def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
 
     Un lot porte un test quand son titre ou son corps le cite, quand son
     empreinte contient le fichier, ou quand un lot fermé qui le cite a été
-    remplacé (`superseded_by`) par ce lot ouvert. Un chemin ne se reconnaît que
+    remplacé (`superseded_by`) ou lié comme `duplicates` à ce lot ouvert. Un chemin ne se reconnaît que
     qualifié (`test_identity`). Le plus ancien l'emporte. Un nom de moins de
     `TEST_KEY_MIN` caractères n'est jamais cherché. Une lecture impossible
     rend `{}` : mieux vaut un incident en double qu'un rouge perdu."""
@@ -302,7 +313,11 @@ def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
             found[module] = rows[lot]
 
     def cited(text: str, names: frozenset, qualified: bool) -> bool:
-        return any(_mentions(text, name, qualified) for name in names)
+        # Normalize individual path tokens too, including linked source URLs.
+        normalized = " ".join(_test_path(token) for token in
+                              re.findall(r"[^\s`<>\[\]()]+", text))
+        return any(_mentions(text, name, qualified) or _mentions(normalized, name, qualified)
+                   for name in names)
 
     for lot, row in rows.items():
         text = "%s\n%s" % (row.get("title") or "", row.get("body") or "")
@@ -315,14 +330,31 @@ def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
                         limit=SUPERSEDED_SCAN) or ()
     except Exception:  # noqa: BLE001 - le lien n'est qu'un complément
         closed = ()
+    targets = {}
     for row in closed:
         target = row.get("superseded_by")
-        if target in (None, "") or int(target) not in rows:
+        if target not in (None, "") and int(target) in rows:
+            targets.setdefault(int(row["id"]), set()).add(int(target))
+    links_for = getattr(getattr(st, "work_dependencies", None), "links_for", None)
+    if links_for is not None:
+        try:
+            for link in links_for(sorted(rows)) or ():
+                if link.get("kind") != "duplicates":
+                    continue
+                a, b = int(link["work_item_id"]), int(link["other_id"])
+                for source, target in ((a, b), (b, a)):
+                    if target in rows:
+                        targets.setdefault(source, set()).add(target)
+        except Exception:  # noqa: BLE001 - missing links never suppress a red
+            pass
+    for row in closed:
+        if row.get("app") != app:
             continue
         text = "%s\n%s" % (row.get("title") or "", row.get("body") or "")
         for module, (names, qualified) in wanted.items():
             if cited(text, names, qualified):
-                keep(module, int(target))
+                for target in targets.get(int(row["id"]), ()):
+                    keep(module, target)
     return found
 
 
