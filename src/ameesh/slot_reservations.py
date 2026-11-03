@@ -85,16 +85,32 @@ def keys_for(project: Any = None, priority: Any = None) -> list[str]:
     return out
 
 
-def of_host(canons: Iterable[Any], host: str) -> dict[str, int]:
+def of_host(canons: Iterable[Any], host: str,
+            problems: Optional[list] = None) -> dict[str, int]:
     """The reservations of `host` in every loaded canon (`merge`). A canon
-    without Host records (a partial sync, a test double) declares none."""
+    without Host records (a partial sync, a test double) declares none.
+    Each record is checked against its own `max_agents` (`canon`), but the
+    merge may still reserve more than the effective cap, the smallest of the
+    records (#5642): those reservations are then dropped (registry order, as
+    without reservations) and the reason appended to `problems`."""
     policies = []
+    caps = []
     for canon in canons or ():
         find = getattr(canon, "host", None)
         fiche = find(host) if callable(find) else None
         policy = getattr(fiche, "policy", None)
         policies.append(getattr(policy, "slot_reservations", None) or {})
-    return merge(policies)
+        cap = getattr(policy, "max_agents", None)
+        if isinstance(cap, int) and not isinstance(cap, bool):
+            caps.append(cap)
+    merged = merge(policies)
+    if merged and caps and sum(merged.values()) > min(caps):
+        if problems is not None:
+            problems.append("host %s: %d places reserved across canons for "
+                            "max_agents = %d, reservations dropped"
+                            % (host, sum(merged.values()), min(caps)))
+        return {}
+    return merged
 
 
 def merge(policies: Iterable[Mapping[str, int]]) -> dict[str, int]:
