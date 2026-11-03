@@ -122,9 +122,10 @@ last. A resident worker is judged again before every turn that carries a lot
 (idle wake, scheduled wake, mail, prompt): when that lot no longer fills the
 reserved place it holds and no shared place is left, nothing is consumed (the
 prompt is restored, a scheduled wake comes back), it gives its lease back and
-the claim pass admits by class again. Until a turn passes (at most 15 min),
-the next admission judges that refused lot, so an unchanged state never
-loops between admission and refusal.
+the claim pass admits by class again. Until a turn passes or that refused lot
+changes (state, priority, assignee, project, wake, update), the next
+admission judges it, so an unchanged state never loops between admission and
+refusal, however long it lasts.
 Without reservations the claim order is unchanged and no lot is read.
 Reservations divide the `max_agents` of the runner. More reserved places than
 `max_agents` is a canon error; an unreadable entry is a canon error too and

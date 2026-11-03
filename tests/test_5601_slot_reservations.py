@@ -24,11 +24,11 @@ def fake_runner(reservations, max_agents, actionable):
     store = Mock()
     store.lot_sessions.actionable.side_effect = lambda name, today=None: actionable.get(name, [])
     run = types.SimpleNamespace(lock=threading.Lock(), workers={}, db=Mock(),
-                                REFUSED_DEMAND_TTL_S=runner_mod.Runner.REFUSED_DEMAND_TTL_S,
                                 _host_max_agents=max_agents, _host_pinned_admissions=None,
                                 _host_slot_reservations=reservations)
+    store.work.get.return_value = {"state": "build", "priority": 2}
     for method in ("_admission_order", "_reservation_admits", "admits_new_worker",
-                   "reservation_turn_allowed"):
+                   "reservation_turn_allowed", "_lot_fingerprint"):
         setattr(run, method, types.MethodType(getattr(runner_mod.Runner, method), run))
     return run, store
 
@@ -171,12 +171,15 @@ class RunnerTest(unittest.TestCase):
             self.assertTrue(run.reservation_turn_allowed("a", agent, nxt("acme", 1, 10)[0]))
             run._admission_order([agent])
             self.assertTrue(run.admits_new_worker(agent))
-            # and the remembered refusal expires (state changed elsewhere)
+            # an unchanged lot keeps refusing, however long the wait; a
+            # change of the refused lot (moved, answered, reassigned) lifts it
             run.reservation_turn_allowed("a", agent, nxt("acme", 2, 20)[0])
-            run._refused_demands["a"] = (run._refused_demands["a"][0]
-                                         - runner_mod.Runner.REFUSED_DEMAND_TTL_S, {})
+            run._admission_order([agent])
+            self.assertFalse(run.admits_new_worker(agent))
+            store.work.get.return_value = {"state": "delivered", "priority": 2}
             run._admission_order([agent])
             self.assertTrue(run.admits_new_worker(agent))
+            self.assertNotIn("a", run._refused_demands)
 
 
 class CanonTest(test_canon._TmpMixin, unittest.TestCase):

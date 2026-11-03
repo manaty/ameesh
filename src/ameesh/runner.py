@@ -13781,9 +13781,18 @@ class Runner:
                           if name != (agent or {}).get("name") and worker.is_alive())
         return running < cap
 
-    #: #5601 : durée de vie du lot qu'un refus au pick impose à l'admission
-    #: suivante ; un état changé (lot traité ailleurs) se rattrape au plus là
-    REFUSED_DEMAND_TTL_S = 900.0
+    def _lot_fingerprint(self, lot) -> tuple | None:
+        """#5601 (B cx2) : ce qui, du lot refusé au pick, peut changer le
+        prochain tour (état, priorité, assigné, projet, réveil, mise à jour) ;
+        None si illisible."""
+        try:
+            row = storage.of(self.db).work.get(int(lot))
+        except (db_mod.DbError, TypeError, ValueError):
+            return None
+        if row is None:
+            return ("gone",)
+        return tuple(str(row.get(key)) for key in
+                     ("state", "priority", "assignee", "app", "wake_at", "updated_at"))
 
     def _admission_order(self, candidates: list) -> list:
         """#5601 : candidats dans l'ordre d'admission. Sans réservation sur
@@ -13792,10 +13801,10 @@ class Runner:
         est lu, puis `slot_reservations.order` (rôles élus, classe, date).
 
         Décision mesh-design (option A) : un lot que le pick vient de refuser
-        remplace cette lecture jusqu'à ce qu'un tour passe (ou
-        `REFUSED_DEMAND_TTL_S`) : l'admission juge alors exactement ce que le
-        pick jugera — jamais « admis, refusé au pick, bail rendu, réadmis »
-        sur un état inchangé."""
+        remplace cette lecture jusqu'à ce qu'un tour passe ou que ce lot
+        change (`_lot_fingerprint`) : l'admission juge alors exactement ce
+        que le pick jugera — jamais « admis, refusé au pick, bail rendu,
+        réadmis » sur un état inchangé, quelle que soit l'attente."""
         reservations = getattr(self, "_host_slot_reservations", None)
         if not reservations:
             return candidates
@@ -13812,9 +13821,13 @@ class Runner:
                 log_async("[%s] next lot unreadable for admission (%s)" % (name, exc))
                 rows = []
             demands[name] = rows[0] if rows else None
-            refused = (getattr(self, "_refused_demands", None) or {}).get(name)
-            if refused is not None and time.monotonic() - refused[0] < self.REFUSED_DEMAND_TTL_S:
-                demands[name] = refused[1]
+            refused = getattr(self, "_refused_demands", None) or {}
+            if name in refused:
+                fingerprint, row = refused[name]
+                if self._lot_fingerprint(row.get("id")) == fingerprint:
+                    demands[name] = row
+                else:
+                    refused.pop(name, None)   # le travail a changé : relecture
         self._admission_demands = demands
         return slot_reservations_mod.order(candidates, demands, reservations)
 
@@ -13869,7 +13882,7 @@ class Runner:
             refused.pop(name, None)
         else:
             # option A : l'admission suivante juge ce même lot (pas de cycle)
-            refused[name] = (time.monotonic(), dict(row))
+            refused[name] = (self._lot_fingerprint(row.get("id")), dict(row))
         return allowed
 
     def admits_new_worker(self, agent: dict) -> bool:
