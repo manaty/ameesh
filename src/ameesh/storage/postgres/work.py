@@ -4245,6 +4245,23 @@ class WorkItems(interface.WorkItems):
             " ORDER BY w.id" % (item_columns(self.db), _CLOSED),
             (int(limit),))
 
+    def issue_refs(self, limit) -> list[dict]:
+        """#5584 : `(id, issue_ref)` des lots porteurs d'une `issue_ref`, dans la
+        même fenêtre que `issue_feed` (mêmes lots, même borne), sans ses
+        colonnes larges ni ses sous-requêtes. La table de correspondance
+        `issue_ref → lots` ne lit que ces deux champs ; le flux complet coûtait
+        ~10 s sous charge pour la construire (diagnostic #5579). Extension
+        PostgreSQL locale : l'appelant replie sur `issue_feed` ailleurs."""
+        return self.db.query(
+            "SELECT w.id, btrim(w.issue_ref) AS issue_ref"
+            "  FROM (SELECT id, issue_ref FROM work_items"
+            "         WHERE state NOT IN %s OR coalesce(btrim(issue_ref), '') <> ''"
+            "            OR coalesce(workflow_ref, '') <> ''"
+            "         ORDER BY id DESC LIMIT %%s) w"
+            " WHERE coalesce(btrim(w.issue_ref), '') <> ''"
+            " ORDER BY w.id" % (_CLOSED,),
+            (int(limit),))
+
     def set_issue_ref(self, item_id, issue_ref, *, current,
                       migration_repo=interface.UNCHECKED) -> bool:
         # #1654 : quand l'appelant a lu la réservation, le CAS la couvre aussi
