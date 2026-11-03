@@ -4766,6 +4766,7 @@
     "last_measure",
     "latest_by_path",
     "log",
+    "purge_retention",
     "recent",
     "register_worktree",
     "set_worktree_attribution",

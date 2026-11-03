@@ -5440,6 +5440,10 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     budget.context = {"entries": entries, "plan": plan, "skipped": skipped,
                       "unowned": unowned, "orphans": []}
     budget.check("registry")
+    # #5588 : la rétention est globale, indépendante des lots de log().
+    # Une passe effective la purge une fois, même si son budget expire ensuite.
+    if not dry_run:
+        storage.of(db).housekeeping.purge_retention()
     troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
     registered: set[str] = set()
     protected: set[str] = set()
