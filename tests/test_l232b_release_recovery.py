@@ -134,7 +134,7 @@ class RecoverySetTest(unittest.TestCase):
         path.chmod(0o600)
         return document
 
-    def fake_dump(self, config, output, inventory, *, schema=None):
+    def fake_dump(self, config, output, inventory, *, schema=None, timeout=None):
         settings = json.loads(Path(config).read_text())
         self.assertEqual(set(settings), {'dsn'})
         self.dumped_schemas.append(schema)
@@ -180,6 +180,15 @@ class RecoverySetTest(unittest.TestCase):
         self.assertFalse((Path(self.root) / 'release-fixture.set.json').exists())
         self.assertTrue(self.perform('accept'))
         self.assertTrue(self.backup())
+
+    def test_backup_dump_passes_an_explicit_release_timeout(self):
+        # #5682 : la fenêtre du dump de release est nommée au site d'appel,
+        # pas héritée silencieusement du défaut du helper.
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump) as dump, \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore):
+            self.assertTrue(self.perform('backup'))
+        self.assertEqual(dump.call_args.kwargs['timeout'], recovery.RELEASE_DUMP_TIMEOUT)
+        self.assertEqual(recovery.RELEASE_DUMP_TIMEOUT, 3600)
 
     # -- K7: the backup names the migrated database and schema --------------
     def test_backup_source_and_schema_are_cross_checked_with_the_migrate(self):
@@ -468,7 +477,7 @@ class RecoverySetTest(unittest.TestCase):
         autorite, premier = self.controller(stop='pin')
         appels = []
 
-        def dump_once(config, output, inventory, *, schema=None):
+        def dump_once(config, output, inventory, *, schema=None, timeout=None):
             appels.append(1)
             source = self.fake_dump if len(appels) == 1 else self.fresh_dump
             return source(config, output, inventory, schema=schema)
@@ -507,7 +516,7 @@ class RecoverySetTest(unittest.TestCase):
         recrée depuis la source vive jusqu'à `accepted`, empreintes fraîches."""
         appels = []
 
-        def dump(config, output, inventory, *, schema=None):
+        def dump(config, output, inventory, *, schema=None, timeout=None):
             appels.append(1)
             if len(appels) == 1:
                 return self.fake_dump(config, output, inventory, schema=schema)
@@ -547,7 +556,7 @@ class RecoverySetTest(unittest.TestCase):
         self.assertEqual(record['files']['release-fixture.dump'],
                          hashlib.sha256(b'fresh-archive').hexdigest())
 
-    def fresh_dump(self, config, output, inventory, *, schema=None):
+    def fresh_dump(self, config, output, inventory, *, schema=None, timeout=None):
         Path(output).write_bytes(b'fresh-archive')
         Path(output).chmod(0o600)
         document = self.write_inventory(output, inventory=inventory)
@@ -565,7 +574,7 @@ class RecoverySetTest(unittest.TestCase):
         for name in self.value._pending('release-fixture')['files']:
             os.utime(Path(self.retention) / name, (stale, stale))
 
-        def fresh_dump(config, output, inventory, *, schema=None):
+        def fresh_dump(config, output, inventory, *, schema=None, timeout=None):
             Path(output).write_bytes(b'fresh-archive')
             Path(output).chmod(0o600)
             document = self.write_inventory(output, inventory=inventory)
@@ -588,7 +597,7 @@ class RecoverySetTest(unittest.TestCase):
         restore.assert_not_called()
         return restore
 
-    def compressible_dump(self, config, output, inventory, *, schema=None):
+    def compressible_dump(self, config, output, inventory, *, schema=None, timeout=None):
         # A compressed-size check would admit this tiny archive; the pinned
         # uncompressed source size is what bounds the restored copy.
         Path(output).write_bytes(b'x')

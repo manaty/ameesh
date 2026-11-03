@@ -1123,10 +1123,11 @@ if host:
         except OSError:
             pass
         budget = base + int(runners or default_runners) * cap
-        # #5681: server (9060) + retrieval (3600), with margin.
+        # #5682 : sauvegarde = dump serveur (9060) + rapatriement (3600) +
+        # dump de l'ancienne base (3600), plus 60 s de marge.
         if stage == 'sauvegarde':
-            budget = max(budget, 12720)
-            stall = max(stall, 12720)
+            budget = max(budget, 16320)
+            stall = max(stall, 16320)
         # the workstation's restart runs in its own unit and reports no
         # runner: only its budget can judge it
         if stage == 'redemarrer' and not runners:

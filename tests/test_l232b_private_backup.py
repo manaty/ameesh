@@ -405,6 +405,8 @@ class PrivateBackupTest(unittest.TestCase):
             self.assertNotIn("CANARY-PASSWORD", str(args))
             if args[0] == "pg_dump":
                 self.assertEqual(args[args.index("--snapshot") + 1], "00000003-000000AE-1")
+                # #5682 : le dump de snapshot garde une borne explicite.
+                self.assertEqual(timeout, backup.SNAPSHOT_DUMP_TIMEOUT)
                 # Subsequent source changes cannot change the expected snapshot
                 # counts already captured by this transaction.
                 cursors[5].fetchone.return_value = (999,)
@@ -426,6 +428,33 @@ class PrivateBackupTest(unittest.TestCase):
         self.assertEqual(source.execute.call_args_list[1].args[0],
                          "SET LOCAL idle_in_transaction_session_timeout = 0")
         context.__exit__.assert_called_once()
+
+    def test_snapshot_dump_honours_an_explicit_timeout(self):
+        # #5682 : l'appelant (contrôleur de release) nomme son délai ; le dump
+        # de snapshot ne dépend pas du défaut de dump_parameters.
+        source, context, _ = self.snapshot_fixture()
+        inventory = self.output.with_suffix(".inventory.json")
+        seen = []
+
+        def child(args, *, env=None, timeout=None):
+            if args[0] == "pg_dump":
+                seen.append(timeout)
+                Path(args[-1]).write_bytes(b"snapshot archive")
+
+        with mock.patch("psycopg.connect", return_value=context), \
+                mock.patch.object(backup, "run", side_effect=child):
+            backup.snapshot_dump(self.config, self.output, inventory, timeout=1234)
+        self.assertEqual(seen, [1234])
+        self.assertEqual(backup.SNAPSHOT_DUMP_TIMEOUT, 3600)
+
+    def test_snapshot_dump_refuses_invalid_timeout_before_connecting(self):
+        inventory = self.output.with_suffix(".inventory.json")
+        for value in (0, -1, 3601, True, "1.5"):
+            with self.subTest(value=value), mock.patch("psycopg.connect") as connect:
+                with self.assertRaises(backup.BackupError):
+                    backup.snapshot_dump(self.config, self.output, inventory, timeout=value)
+                connect.assert_not_called()
+        self.assertFalse(inventory.exists())
 
     def test_failed_snapshot_dump_never_publishes_expected_inventory(self):
         _, context, _ = self.snapshot_fixture()

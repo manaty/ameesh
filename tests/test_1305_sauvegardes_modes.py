@@ -144,6 +144,7 @@ class SauvegardesPriveesTest(unittest.TestCase):
         # Le script est rejoué avec le helper et la rétention du dépôt, la
         # configuration de test et les chemins système absents ; le corps
         # exécuté reste celui du dépôt.
+        self.storage_env = os.path.join(self.tmp, "sauvegarde.env")
         self.lanceur = os.path.join(self.tmp, "lanceur.py")
         with open(self.lanceur, "w", encoding="utf-8") as fh:
             fh.write(LANCEUR % HELPER)
@@ -167,8 +168,7 @@ class SauvegardesPriveesTest(unittest.TestCase):
                          "helper=" + shlex.quote(self.lanceur))
                 .replace("/usr/local/sbin/ameesh-retention-privee.py",
                          shlex.quote(RETENTION))
-                .replace("/etc/ameesh/sauvegarde.env",
-                         os.path.join(self.tmp, "absent-storage.env"))
+                .replace("/etc/ameesh/sauvegarde.env", self.storage_env)
                 .replace("/etc/ameesh/retention-provider.json",
                          os.path.join(self.tmp, "absent-provider.json"))
                 .replace("/home/ameesh/.config/ameesh/config.json", self.config))
@@ -225,6 +225,16 @@ class SauvegardesPriveesTest(unittest.TestCase):
         self.assertEqual(fait.returncode, 0, fait.stderr)
         self.assertEqual(self.mode(self.dumps), 0o700)
         self.assertEqual(self.mode(self.dump_du_jour()), 0o600)
+
+    def test_timeout_du_fichier_sauvegarde_env_est_lu_avant_le_dump(self):
+        # #5682 : le fichier est sourcé avant le dump, donc une valeur invalide
+        # qu'il porte fait refuser le dump au lieu d'être ignorée.
+        with open(self.storage_env, "w", encoding="utf-8") as fh:
+            fh.write("AMEESH_DUMP_TIMEOUT_S=0\n")
+        fait = self.run_script()
+        self.assertNotEqual(fait.returncode, 0, fait.stdout + fait.stderr)
+        self.assertIn("dump timeout", fait.stderr)
+        self.assertFalse(os.path.exists(self.dump_du_jour()))
 
     def test_dump_herite_0644_normalise_sans_reecriture(self):
         """Un dump du jour d'une version antérieure (0644) devient privé sans

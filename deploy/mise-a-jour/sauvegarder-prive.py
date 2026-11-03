@@ -232,6 +232,10 @@ def private_connection(parameters, directory):
 # #5681: complete central dumps took up to 27 min; allow twice that.
 DEFAULT_DUMP_TIMEOUT = 3600
 MAX_DUMP_TIMEOUT = 3600
+# #5682: a release snapshot keeps its exported read-only transaction open for
+# the whole dump; bound it explicitly at the same measured 2x margin instead
+# of inheriting dump_parameters' default by accident.
+SNAPSHOT_DUMP_TIMEOUT = 3600
 
 
 def dump_timeout(value):
@@ -290,7 +294,8 @@ def dump_parameters(parameters, output, *, snapshot=None, source_major=None, tim
             os.close(directory_fd)
 
 
-def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_registry", "agent_mailbox")):
+def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_registry", "agent_mailbox"),
+                  timeout=SNAPSHOT_DUMP_TIMEOUT):
     """Capture expected rows and the archive from one repeatable-read snapshot.
 
     The full database is dumped; the private inventory identifies the mesh
@@ -300,6 +305,7 @@ def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_
     import psycopg
     from psycopg import sql
     from psycopg.conninfo import make_conninfo
+    timeout = dump_timeout(timeout)
     output, inventory = Path(output), Path(inventory)
     if (inventory.parent.resolve() != output.parent.resolve() or inventory == output
             or os.path.lexists(inventory) or os.path.lexists(output)):
@@ -337,8 +343,10 @@ def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_
         if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
             raise BackupError("source did not report a usable database size")
         # The exporting transaction stays open until pg_dump imports and
-        # finishes the snapshot, including writes made concurrently afterwards.
-        dump_parameters(parameters, output, snapshot=snapshot, source_major=major)
+        # finishes the snapshot, including writes made concurrently afterwards;
+        # timeout bounds that whole interval (#5682).
+        dump_parameters(parameters, output, snapshot=snapshot, source_major=major,
+                        timeout=timeout)
         expected = {"schema": schema, "migrations": [list(row) for row in versions],
                     "row_counts": counts, "artifact_sha256": digest(output),
                     "source_bytes": size}

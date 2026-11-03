@@ -101,8 +101,9 @@ SAUVEGARDES="$HOME/backups/ameesh"
 #: dumps produits sur la VM par ameesh-sauvegarde.service (0700, 0600)
 SAUVEGARDES_VM=${SAUVEGARDES_VM:-/home/ameesh/sauvegardes}
 SAUVEGARDES_VM=${SAUVEGARDES_VM%/}
-#: borne du rapatriement du dump serveur (secondes) ; la progression et les
-#: octets déjà écrits sont journalisés par le récepteur en cas d'échec
+#: borne du rapatriement du dump serveur (secondes, entier de 1 à 3600 ; les
+#: zéros de tête sont normalisés) ; la progression et les octets déjà écrits
+#: sont journalisés par le récepteur en cas d'échec
 RECUPERATION_TIMEOUT=${RECUPERATION_TIMEOUT:-3600}
 case "${1:-}" in
   publier|rattraper) ;;
@@ -229,6 +230,14 @@ sauvegarder() {
   case "$RECUPERATION_TIMEOUT" in
     ''|*[!0-9]*|0) echo "RECUPERATION_TIMEOUT doit être un entier positif" >&2; return 2 ;;
   esac
+  # #5682 : « 00 » ou « 0000 » passent la garde ci-dessus (seul « 0 » est
+  # refusé) ; normalisés, ils valent 0 et `timeout 0` désactive la borne.
+  while [ "${RECUPERATION_TIMEOUT#0}" != "$RECUPERATION_TIMEOUT" ]; do
+    RECUPERATION_TIMEOUT=${RECUPERATION_TIMEOUT#0}
+  done
+  [ -n "$RECUPERATION_TIMEOUT" ] || {
+    echo "RECUPERATION_TIMEOUT doit être un entier positif" >&2; return 2;
+  }
   [ "${#RECUPERATION_TIMEOUT}" -le 4 ] && [ "$RECUPERATION_TIMEOUT" -le 3600 ] || {
     echo "RECUPERATION_TIMEOUT dépasse le plafond de 3600 s" >&2; return 2;
   }
@@ -289,6 +298,9 @@ sauvegarder() {
   if ancienne; then
     etape "ancienne base"
     dsn_part dsn "$CONFIG_RESTE" dsn || return
+    # #5682 : ce dump garde le défaut borné du helper (3600 s) ; le budget du
+    # stade « sauvegarde » de staging.sh le compte avec le dump serveur (9060)
+    # et le rapatriement (3600).
     "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG_RESTE" \
       --output "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
