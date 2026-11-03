@@ -158,6 +158,8 @@ def add_parsers(work_sub, func) -> None:
         "plan", help="planned dates of a task or a WorkPackage (L96)")
     p_plan.add_argument("target", nargs="?", help="task number, or package id")
     p_plan.add_argument("--project", help="read the project dispatch plan and waiting reasons")
+    p_plan.add_argument("--capacity-plan", metavar="JSON", help="forecast a capacity/graph snapshot (#4201)")
+    p_plan.add_argument("--previous-plan", metavar="JSON", help="previous capacity forecast; report moved lots")
     p_plan.add_argument("--start", dest="debut", default=None,
                         help="planned start: YYYY-MM-DD, tomorrow, monday...; - clears")
     p_plan.add_argument("--debut", dest="debut", action=DeprecatedAlias, canonical="--start",
@@ -366,6 +368,22 @@ def _plan(db, args: argparse.Namespace) -> int:
     durée estimée d'une tâche (`--estimate`)."""
     from . import estimates, roadmap
 
+    capacity_path = getattr(args, "capacity_plan", None)
+    if getattr(args, "previous_plan", None) and not capacity_path:
+        raise work.WorkError("--previous-plan requires --capacity-plan")
+    if capacity_path:
+        if args.target is not None or any(
+                getattr(args, k, None) is not None for k in
+                ("debut", "fin", "livraison", "estimate", "source", "estimate_source")):
+            raise work.WorkError("--capacity-plan cannot edit dates or estimates")
+        from . import capacity_plan
+        try:
+            out = capacity_plan.run_file(capacity_path, previous_path=args.previous_plan,
+                                         db=db, project=getattr(args, "project", None))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise work.WorkError("invalid capacity plan: %s" % exc) from exc
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
     project = getattr(args, "project", None)
     if project:
         if args.target is not None or any(getattr(args, k, None) is not None for k in
