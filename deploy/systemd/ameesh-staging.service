@@ -28,6 +28,9 @@ TimeoutStartSec=11h30min
 # #5450: let the launcher TERM trap finish the current host rollback.
 TimeoutStopSec=5min
 KillMode=control-group
+# #5663: files the sequence writes (kept trees, venv, marks) stay readable by
+# the other accounts that deploy or inspect them; secrets are written 0600.
+UMask=0022
 # NoNewPrivileges is deliberately absent until the real qualification (#5484
 # Q0-Q5) proves it harmless. vm.sh calls no local sudo: a candidate deploys
 # itself over the SSH identity of its BASCULE_ENV (root@ its own address).
