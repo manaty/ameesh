@@ -20,7 +20,9 @@ an API-key Codex profile with a billing account is reserved and counted.
 with the account and the reservation closed, in one transaction. An uncertain
 outcome (error, lost lease, preemption, crash then repair) keeps the
 reservation in full for its day (`kept`); only a human releases it
-(`ameesh budget release <id>`). An unknown paid request is never replayed:
+(`ameesh budget release <id>`). A silent failed turn (no stream line, no
+usage) stays uncertain: a configurable harness may have called the provider
+before exiting (#5503, B cx1). An unknown paid request is never replayed:
 the next turn needs a new admission.
 
 **Exhaustion.** The agent is paused (`budget : account … until 00:00`); no

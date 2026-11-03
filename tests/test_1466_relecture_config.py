@@ -240,7 +240,8 @@ class RelectureConfigTest(unittest.TestCase):
         ancien = Config(accounts={"deepseek": [{"name": "plafonne"}]})
         frais = replace(ancien, accounts={"deepseek": [{"name": "disponible"}]})
         worker = SimpleNamespace(db=object(), cfg=ancien, _cfg_pending=None,
-                                 _cfg_lock=threading.Lock(), stopping=threading.Event())
+                                 _cfg_lock=threading.Lock(), stopping=threading.Event(),
+                                 rotation_stopped=False)  # #5503
         worker.ensure_watchdog = lambda: None
         worker.ensure_peek = lambda: None  # #1349
         # #1270 (main) : process_once attend d'abord l'échéance de reprise

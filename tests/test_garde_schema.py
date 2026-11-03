@@ -518,6 +518,7 @@ class EntryPointRefusalTest(unittest.TestCase):
         worker.admission_withdrawn.return_value = None
         worker._election_handover.return_value = None
         worker.retry_remaining.return_value = 0
+        worker.rotation_stopped = False  # #5503 : disjoncteur de rotation
         worker.run_turn.side_effect = migrations.IncompatibleSchema('9999_future')
         with mock.patch.object(migrations, 'require_compatible_writer'), \
                 mock.patch.object(runner, 'log'), \
