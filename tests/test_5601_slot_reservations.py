@@ -33,6 +33,12 @@ def fake_runner(reservations, max_agents, actionable):
     return run, store
 
 
+def leave(run, name):
+    """The sweep: a finished worker leaves `workers`, then `_release_slot`."""
+    del run.workers[name]
+    (getattr(run, "_admitting", None) or set()).discard(name)
+
+
 def nxt(project, priority, created_ts):
     return [{"id": int(created_ts), "project": project, "priority": priority,
              "created_ts": created_ts}]
@@ -101,7 +107,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(admitted, ["a", "b", "urgent"])
         self.assertEqual(run._slot_reservations["urgent"], "class:1")
         # the reserved holder leaves: its place goes to class 1 only
-        del run.workers["urgent"]
+        leave(run, "urgent")
         self.assertFalse(run.admits_new_worker({"name": "c"}))
 
     def test_resident_worker_changing_lot_is_judged_again(self):
@@ -120,7 +126,7 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(run.reservation_turn_allowed("a", {}, nxt("acme", 1, 11)[0]))
         # A's next lot is P2: no shared place left, the worker gives its lease back
         self.assertFalse(run.reservation_turn_allowed("a", {}, nxt("acme", 2, 12)[0]))
-        del run.workers["a"]
+        leave(run, "a")
         self.assertTrue(run.admits_new_worker({"name": "c"}))
         self.assertEqual(run._slot_reservations["c"], "class:1")
         # with a shared place free, a worker leaving its reserved class keeps going
@@ -163,7 +169,7 @@ class RunnerTest(unittest.TestCase):
             self.assertTrue(run.admits_new_worker(agent))
             run.workers["a"] = Fil(agent)
             self.assertFalse(run.reservation_turn_allowed("a", agent, nxt("acme", 2, 20)[0]))
-            del run.workers["a"]
+            leave(run, "a")
             for _ in range(3):     # same mail, lots and wakes: refused every pass
                 run._admission_order([agent])
                 self.assertFalse(run.admits_new_worker(agent))
@@ -180,6 +186,80 @@ class RunnerTest(unittest.TestCase):
             run._admission_order([agent])
             self.assertTrue(run.admits_new_worker(agent))
             self.assertNotIn("a", run._refused_demands)
+
+
+class ConcurrencyTest(unittest.TestCase):
+    def test_turn_changes_are_atomic(self):
+        """B1 cx3: cap 3, class:1 = 1, A and B on shared places switch to P1
+        at the same time. The second check waits while the first is inside
+        its decision, then sees class:1 taken: one holder only."""
+        run, _store = fake_runner({"class:1": 1}, 3, {})
+        run.workers = {n: Fil({"name": n}) for n in ("a", "b")}
+        run._slot_reservations = {"a": None, "b": None}
+        inside, go = threading.Event(), threading.Event()
+        real = sr.decide
+
+        def slow(*args):
+            if threading.current_thread().name == "first":
+                inside.set()
+                go.wait(5)
+            return real(*args)
+
+        results = {}
+
+        def turn(name):
+            results[name] = run.reservation_turn_allowed(name, {"name": name},
+                                                         nxt("acme", 1, 1)[0])
+
+        with patch.object(sr, "decide", side_effect=slow):
+            first = threading.Thread(target=turn, args=("a",), name="first")
+            first.start()
+            self.assertTrue(inside.wait(5))
+            second = threading.Thread(target=turn, args=("b",), name="second")
+            second.start()
+            second.join(0.3)
+            self.assertTrue(second.is_alive(), "second check waits for the first")
+            go.set()
+            first.join(5)
+            second.join(5)
+        self.assertEqual(results, {"a": True, "b": True})
+        self.assertEqual(sorted(map(str, run._slot_reservations.values())),
+                         ["None", "class:1"])
+
+    def test_admitted_not_yet_registered_counts(self):
+        """An agent admitted by the claim pass but not yet a live worker holds
+        its place against a concurrent turn change, until `_release_slot`."""
+        run, store = fake_runner({"class:1": 1}, 2, {"n": nxt("acme", 1, 1)})
+        run._release_slot = types.MethodType(runner_mod.Runner._release_slot, run)
+        run._gate_slots_lock, run._gate_slots = threading.Lock(), {}
+        run.workers = {"a": Fil({"name": "a"})}
+        run._slot_reservations = {"a": None}
+        with patch("ameesh.storage.of", return_value=store):
+            run._admission_order([{"name": "n"}])
+        self.assertTrue(run.admits_new_worker({"name": "n"}))   # class:1, not registered
+        self.assertTrue(run.reservation_turn_allowed("a", {}, nxt("acme", 2, 2)[0]))
+        self.assertFalse(run.admits_new_worker({"name": "z"}), "n's place is counted")
+        run._release_slot("n")
+        self.assertNotIn("n", run._admitting)
+
+
+class FingerprintTest(unittest.TestCase):
+    def test_wake_or_update_alone_lifts_the_refusal(self):
+        """B2 cx3: the fingerprint reads the contract keys of `work.get`
+        (`wake_ts`, `updated_ts`): either change alone lifts the refusal."""
+        for key in ("wake_ts", "updated_ts"):
+            run, store = fake_runner({"class:1": 1}, 1, {"a": nxt("acme", 1, 1)})
+            store.work.get.return_value = {"state": "build", "priority": 2,
+                                           "wake_ts": 100.0, "updated_ts": 200.0}
+            agent = {"name": "a"}
+            with patch("ameesh.storage.of", return_value=store):
+                self.assertFalse(run.reservation_turn_allowed("a", agent, nxt("acme", 2, 2)[0]))
+                run._admission_order([agent])
+                self.assertFalse(run.admits_new_worker(agent))
+                store.work.get.return_value = dict(store.work.get.return_value,
+                                                   **{key: 999.0})
+                run._admission_order([agent])
+                self.assertTrue(run.admits_new_worker(agent), key)
 
 
 class CanonTest(test_canon._TmpMixin, unittest.TestCase):

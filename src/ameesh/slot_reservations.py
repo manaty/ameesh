@@ -85,6 +85,18 @@ def keys_for(project: Any = None, priority: Any = None) -> list[str]:
     return out
 
 
+def of_host(canons: Iterable[Any], host: str) -> dict[str, int]:
+    """The reservations of `host` in every loaded canon (`merge`). A canon
+    without Host records (a partial sync, a test double) declares none."""
+    policies = []
+    for canon in canons or ():
+        find = getattr(canon, "host", None)
+        fiche = find(host) if callable(find) else None
+        policy = getattr(fiche, "policy", None)
+        policies.append(getattr(policy, "slot_reservations", None) or {})
+    return merge(policies)
+
+
 def merge(policies: Iterable[Mapping[str, int]]) -> dict[str, int]:
     """Several Host records of one host: the largest count of each key (a
     reservation declared in one canon is kept by the others)."""

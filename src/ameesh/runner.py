@@ -596,6 +596,12 @@ def agent_adapter(harness: str, harness_bin: str | None,
     return adapters.adapter_for(harness, harness_bin)
 
 
+#: #5601 (B cx3) : rend atomiques, pour l'admission comme pour le changement
+#: de tour, le relevé des vivants, les places tenues, la décision et
+#: l'écriture des réservations ; pris AVANT `Runner.lock`, jamais l'inverse.
+_SLOT_RESERVATIONS_LOCK = threading.Lock()
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -11220,6 +11226,9 @@ class Runner:
         from . import host_gate as host_gate_mod
         with self._gate_slots_lock:
             host_gate_mod.SlotPool.release(self._gate_slots.pop(name, None))
+        with _SLOT_RESERVATIONS_LOCK:
+            # #5601 : admission close (worker inscrit puis fini, ou échec)
+            (getattr(self, "_admitting", None) or set()).discard(name)
 
     # -- réclamation -------------------------------------------------------
     @migrations.writer_tick
@@ -13717,9 +13726,7 @@ class Runner:
             placement_mod.host_load(one)[0].get(self.host, 0) for one in canons)
         # #5601 : places réservées à un projet ou à une classe (fiches Host)
         from . import slot_reservations as slot_reservations_mod
-        self._host_slot_reservations = slot_reservations_mod.merge(
-            one.host(self.host).policy.slot_reservations or {}
-            for one in canons if one.host(self.host) is not None) or None
+        self._host_slot_reservations = slot_reservations_mod.of_host(canons, self.host) or None
         # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
         # par défaut
         sync_gate = getattr(self, "_sync_host_gate", None)
@@ -13791,8 +13798,9 @@ class Runner:
             return None
         if row is None:
             return ("gone",)
+        # B2 cx3 : les clés du contrat de `work.get` (`wake_ts`, `updated_ts`)
         return tuple(str(row.get(key)) for key in
-                     ("state", "priority", "assignee", "app", "wake_at", "updated_at"))
+                     ("state", "priority", "assignee", "app", "wake_ts", "updated_ts"))
 
     def _admission_order(self, candidates: list) -> list:
         """#5601 : candidats dans l'ordre d'admission. Sans réservation sur
@@ -13831,29 +13839,45 @@ class Runner:
         self._admission_demands = demands
         return slot_reservations_mod.order(candidates, demands, reservations)
 
-    def _reservation_admits(self, agent: dict, others: list[str], cap: int) -> bool:
+    def _reservation_admits(self, agent: dict, cap: int, demand: dict | None, *,
+                            admitting: bool = False) -> bool:
         """#5601 : une place réservée n'est prise que par un agent qui la
         remplit — `project:<p>` par un agent du projet `<p>` (canon), sans
-        prédire son tour ; `class:<n>` par un agent dont le lot a la priorité
-        `<n>`. Une place libre ne va aux autres que si les réservations non
-        remplies tiennent encore."""
+        prédire son tour ; `class:<n>` par un agent dont le lot (`demand`) a
+        la priorité `<n>`. Une place libre ne va aux autres que si les
+        réservations non remplies tiennent encore.
+
+        B cx3 : relevé des vivants, places tenues, décision et écriture sont
+        atomiques sous `_SLOT_RESERVATIONS_LOCK` (admission et changement de
+        tour) ; un agent admis pas encore inscrit (`_admitting`) compte."""
         from . import projects as projects_mod
         from . import slot_reservations as slot_reservations_mod
-        reservations = self._host_slot_reservations
-        filled = getattr(self, "_slot_reservations", None)
-        if filled is None:
-            filled = self._slot_reservations = {}
-        held: dict = {}
-        for name in others:
-            key = filled.get(name)
-            held[key] = held.get(key, 0) + 1
-        demand = (getattr(self, "_admission_demands", None) or {}).get(agent.get("name")) or {}
-        wants = slot_reservations_mod.keys_for(None, demand.get("priority")) \
+        name = agent.get("name")
+        wants = slot_reservations_mod.keys_for(None, (demand or {}).get("priority")) \
             if agent.get("releve") != "election" else []
         wants += ["project:%s" % p for p in projects_mod.agent_projects(agent)]
-        admitted, key = slot_reservations_mod.decide(reservations, held, len(others), cap, wants)
-        if admitted:
-            filled[agent.get("name")] = key
+        with _SLOT_RESERVATIONS_LOCK:
+            with self.lock:
+                live = {other for other, worker in self.workers.items()
+                        if other != name and worker.is_alive()
+                        and not (getattr(worker, "agent", None) or {}).get("ephemeral")}
+            admitting_set = getattr(self, "_admitting", None)
+            if admitting_set is None:
+                admitting_set = self._admitting = set()
+            live |= admitting_set - {name}
+            filled = getattr(self, "_slot_reservations", None)
+            if filled is None:
+                filled = self._slot_reservations = {}
+            held: dict = {}
+            for other in live:
+                key = filled.get(other)
+                held[key] = held.get(key, 0) + 1
+            admitted, key = slot_reservations_mod.decide(
+                self._host_slot_reservations, held, len(live), cap, wants)
+            if admitted:
+                filled[name] = key
+                if admitting:
+                    admitting_set.add(name)
         return admitted
 
     def reservation_turn_allowed(self, name: str, agent: dict, row: dict) -> bool:
@@ -13866,15 +13890,7 @@ class Runner:
         if not getattr(self, "_host_slot_reservations", None) or cap is None \
                 or agent.get("ephemeral"):
             return True
-        with self.lock:
-            live = [other for other, worker in self.workers.items()
-                    if other != name and worker.is_alive()
-                    and not (getattr(worker, "agent", None) or {}).get("ephemeral")]
-        demands = getattr(self, "_admission_demands", None)
-        if demands is None:
-            demands = self._admission_demands = {}
-        demands[name] = row
-        allowed = self._reservation_admits(dict(agent, name=name), live, cap)
+        allowed = self._reservation_admits(dict(agent, name=name), cap, row)
         refused = getattr(self, "_refused_demands", None)
         if refused is None:
             refused = self._refused_demands = {}
@@ -13915,7 +13931,8 @@ class Runner:
                 return False
         if not getattr(self, "_host_slot_reservations", None):
             return True
-        return self._reservation_admits(agent or {}, [name for name, _row in live], cap)
+        demand = (getattr(self, "_admission_demands", None) or {}).get((agent or {}).get("name"))
+        return self._reservation_admits(agent or {}, cap, demand, admitting=True)
 
     def host_limits_for(self, host: str) -> dict | None:
         """Seuils connus d'un hôte (dernier `canon sync`), ou None."""

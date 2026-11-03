@@ -331,9 +331,7 @@ def project_snapshot(db, project, settings, *, canons=None):
     # records, the ones the live dispatcher enforces
     for host in out.get("hosts", []):
         if "reservations" not in host and canons:
-            reserved = slot_reservations.merge(
-                one.host(str(host["name"])).policy.slot_reservations or {}
-                for one in canons if one.host(str(host["name"])) is not None)
+            reserved = slot_reservations.of_host(canons, str(host["name"]))
             if reserved:
                 host["reservations"] = reserved
     overrides = {integer(r["id"], "lot override"): r for r in out.pop("lots", [])}
