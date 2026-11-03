@@ -1295,6 +1295,13 @@ class Accounts(Domain):
         un chemin, seulement une empreinte (secret d'hôte)."""
 
     @abc.abstractmethod
+    def declared(self) -> list[dict]:
+        """#5568 : toutes les déclarations de comptes publiées par les hôtes du
+        mesh, une ligne par (host, harness, account) avec `last_ts` (epoch) de
+        la dernière publication, toutes empreintes confondues. Lecture seule,
+        sans fenêtre : un hôte éteint garde sa dernière déclaration."""
+
+    @abc.abstractmethod
     def publish_identity(self, host: str, harness: str, account: str,
                          identity: str) -> None:
         """#1883 : publie (ou rafraîchit) l'empreinte du dossier résolu

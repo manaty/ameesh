@@ -268,6 +268,13 @@ class Accounts(interface.Accounts):
                 {"identity": r["identity"], "last_ts": r["last_ts"]})
         return vues
 
+    def declared(self) -> list:
+        return self.db.query(
+            "select host, harness, account,"
+            " extract(epoch from max(last_seen))::float8 as last_ts"
+            " from account_identities group by host, harness, account"
+            " order by host, harness, account")
+
     def publish_identity(self, host, harness, account, identity) -> None:
         self.db.execute(
             "insert into account_identities (host, harness, account, identity)"

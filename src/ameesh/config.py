@@ -553,6 +553,11 @@ class Config:
     #: `account_sharing: strict`. À activer après la séparation des comptes
     #: (#65) : refuser aujourd'hui arrêterait les deux meshes du poste.
     accounts_shared: str = "report"
+    #: #5568 : retrait explicite d'un profil de l'alerte
+    #: `account_profile_confined` — `{harnais: {profil: "AAAA-MM-JJ motif"}}`.
+    #: Seuls des noms et un motif daté : aucun chemin, aucun identifiant. Une
+    #: valeur sans date en tête n'est pas un retrait (l'alerte reste).
+    accounts_withdrawn: dict = field(default_factory=dict)
     #: #313/#2580 : le registre des revendications de comptes, partagé par les
     #: meshes de l'hôte ; vide = `~/.local/state/ameesh-host/accounts` (sous
     #: `$XDG_STATE_HOME` quand il est posé)
