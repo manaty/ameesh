@@ -1496,6 +1496,55 @@ class ReveilTest(_Base):
         worker._scheduled_wake_checked = float("-inf")
         return worker._scheduled_wake_spec()
 
+    def _reserve_place(self, worker):
+        """#5601 : cap 2, `class:1` = 1 ; ce worker tient la place réservée,
+        un autre résident (P2) la place partagée."""
+        runner = worker.runner
+        runner._host_max_agents = 2
+        runner._host_slot_reservations = {"class:1": 1}
+        runner._slot_reservations = {worker.name: "class:1", "b5601": None}
+        runner.workers = {worker.name: mock.Mock(is_alive=lambda: True, agent={}),
+                          "b5601": mock.Mock(is_alive=lambda: True, agent={})}
+
+    def test_reveil_programme_hors_reservation_rend_le_bail_sans_consommer(self):
+        """#5601 (B cx3) : le réveil programmé d'un worker résident sur un lot
+        P2, alors qu'il tient la place réservée P1 et qu'aucune place partagée
+        ne reste, ne part pas : bail rendu (`stopping`), claim oublié, le
+        réveil revient. Sur un lot P1, il part et garde sa place."""
+        worker = self._worker("r5601")
+        self._reserve_place(worker)
+        lot = work.add(self.db, title="P2", assignee="r5601", app="acme", priority=2,
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: rendez-vous", actor="r5601",
+                  wake_ts=time.time() - 1)
+        tenus = []
+        oublie = worker._forget_wake_claim
+
+        def note_claim():
+            tenus.append(worker._wake_claim)
+            oublie()
+
+        worker._scheduled_wake_checked = float("-inf")
+        worker._lot_wake_checked = float("-inf")
+        with mock.patch.object(worker, "_forget_wake_claim", side_effect=note_claim):
+            self.assertIsNone(worker._pick_for_turn())
+        self.assertTrue(worker.stopping.is_set(), "bail rendu")
+        tenus = [claim for claim in tenus if claim]
+        self.assertEqual(tenus[0]["lot"], lot)
+        self.assertEqual(worker.runner._slot_reservations["r5601"], "class:1")
+        self.assert_claim_oublie(worker, lot, tenus[0])
+
+        other = self._worker("q5601")
+        self._reserve_place(other)
+        p1 = work.add(self.db, title="P1", assignee="q5601", app="acme", priority=1,
+                      force=_FORCE)["id"]
+        work.note(self.db, p1, "hold: rendez-vous", actor="q5601",
+                  wake_ts=time.time() - 1)
+        spec = self.pick(other)
+        self.assertEqual(spec["lot"], str(p1))
+        self.assertFalse(other.stopping.is_set())
+        self.assertEqual(other.runner._slot_reservations["q5601"], "class:1")
+
     def test_reveil_programme_bail_renouvele_pendant_une_bascule_longue(self):
         """#2614 : une bascule de session de lot plus longue que le bail (120 s)
         ne laisse plus le claim expirer — il est renouvelé tant qu'il est tenu,

@@ -6112,6 +6112,23 @@ class AgentWorker(threading.Thread):
                 self._servir(())  # #2810 : ce tour ne partira pas
                 self._credits_candidate = None
                 return None
+            # #5601 (B cx3) : tout tour portant un lot (relance, réveil
+            # programmé, courrier, consigne) rejuge la place réservée que ce
+            # worker résident tient ; le lot ne la remplit plus et aucune
+            # place partagée ne reste : rien n'est consommé (consigne rendue,
+            # claim du réveil oublié par `_pick_for_turn`), le bail est rendu
+            # et la réclamation réadmet par classe.
+            if not self._reservation_fits(spec.get("lot")):
+                if spec.get("kind") == "prompt":
+                    registry.restore_prompt(self.db, self.name, self.runner.runner_id,
+                                            self.epoch)
+                self.suite, self._reprise_attach, self.nudged = reprises
+                self._servir(())
+                self._credits_candidate = None
+                log_async("[%s] lot #%s does not fit the slot reservations: "
+                          "lease released" % (self.name, spec.get("lot")))
+                self.stopping.set()
+                return None
             # #4164 (B1 cx2) : la sonde d'un compte épuisé n'est réservée que
             # pour un tour réellement choisi ; perdue (autre agent), la
             # consigne repart en attente comme ci-dessus.
@@ -6126,6 +6143,23 @@ class AgentWorker(threading.Thread):
             # `_run_guarded_turn` la gardent (dict(spec, …)).
             spec["_preempt_gen"] = frontiere
         return spec
+
+    def _reservation_fits(self, lot) -> bool:
+        """#5601 : la place de ce worker tient-elle pour un tour sur `lot` ?
+        Sans réservation sur l'hôte, sans lot ou lot illisible : oui (une
+        panne de lecture ne rend pas un bail)."""
+        fits = getattr(self.runner, "reservation_turn_allowed", None)  # doublures
+        if fits is None or not lot or not getattr(self.runner, "_host_slot_reservations", None):
+            return True
+        try:
+            row = storage.of(self.db).work.get(int(lot))
+        except (db_mod.DbError, TypeError, ValueError):
+            return True
+        if row is None:
+            return True
+        return fits(self.name, self.agent or {},
+                    {"id": row.get("id"), "project": row.get("app"),
+                     "priority": row.get("priority")})
 
     def _pick(self) -> dict | None:
         agent = registry.get(self.db, self.name)
@@ -6602,15 +6636,6 @@ class AgentWorker(threading.Thread):
                     # #811 (B2) : pas de réveil consommé pour un lot dont le
                     # dossier manque — un autre lot actionnable est élu.
                     continue
-                fits = getattr(self.runner, "reservation_turn_allowed", None)  # doublures
-                if fits is not None and not fits(self.name, self.agent or {}, row):
-                    # #5601 (B cx3) : le nouveau lot ne remplit plus la place
-                    # réservée que ce worker tient, et aucune place partagée ne
-                    # reste : le bail est rendu, la réclamation réadmet par classe
-                    log_async("[%s] lot #%s does not fit the slot reservations: "
-                              "lease released" % (self.name, row["id"]))
-                    self.stopping.set()
-                    return None
                 note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
                 log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
                           % (self.name, row["id"], row["state"], note.get("wakes")))
