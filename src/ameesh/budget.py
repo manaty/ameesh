@@ -491,11 +491,23 @@ def cmd_budget(cfg: Config, args: argparse.Namespace) -> int:
         if what == "prepaid":
             return _cmd_prepaid(cfg, db, args)
         if what == 'reconcile':
+            # #5565 : `reconcile` est une extension du stockage PostgreSQL
+            # local ; un exécuteur médié (`driver` mediated) ne la porte pas.
+            # Le dire clairement, avant `authorize` qui interroge le stockage,
+            # au lieu de laisser échapper un AttributeError.
+            store = storage.of(db)
+            reconcile = getattr(store.pending_spend, 'reconcile', None)
+            if reconcile is None:
+                print('Accounting reconciliation is unavailable on this storage '
+                      '(driver %s): the reconcile extension exists only on the '
+                      'local PostgreSQL storage; nothing changed.'
+                      % getattr(store, 'driver', '?'), file=sys.stderr)
+                return 1
             try:
                 actor = authorize(cfg, db, args.agent)
                 if args.human != actor:
                     raise BudgetError('--human must match the authenticated actor %s' % actor)
-                result = storage.of(db).pending_spend.reconcile(
+                result = reconcile(
                     args.agent, spend_key=args.spend_key, abandon=args.abandon,
                     actor=actor, reason=args.reason)
             except (BudgetError, ValueError) as exc:

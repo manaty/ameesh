@@ -5010,6 +5010,24 @@ class AgentWorker(threading.Thread):
                       % (self.name, " ".join(str(exc).split())[:160]))
             return False
 
+    def _compta_incident_local(self, travail: dict) -> bool:
+        """Réclame le signal unique d'une ambiguïté sans extension durable (#5565).
+
+        `report_ambiguous` n'existe que sur le stockage PostgreSQL local : sur
+        une connexion d'exécuteur médié, l'API distante ne le porte pas et
+        l'incident resterait muet. Ce repli tient la réclamation dans l'état
+        local de l'agent : un signal par marqueur, qui survit au sondage
+        toutes les 30 s et à un redémarrage du worker sur ce poste. Un état
+        illisible ou non écrit ne musèle jamais l'incident — on signale.
+        """
+        ident = str(travail.get('created_at') or travail.get('spend_key') or '')
+        if not ident:
+            return True          # pas d'identité stable : signaler plutôt que taire
+        if self._state_read('accounting_incident') == ident:
+            return False
+        self._state_note('accounting_incident', ident)
+        return True
+
     def _compta_ecrit(self, travail: dict, *, incertain: bool = True,
                       released: bool = False) -> bool:
         """Écrit une ligne du grand livre, puis efface le marqueur en base.
@@ -5039,12 +5057,18 @@ class AgentWorker(threading.Thread):
             # cannot emit the same accounting report every 30 seconds.
             api = storage.of(self.db).pending_spend
             report = getattr(api, 'report_ambiguous', None)
-            try:
-                first_report = report is not None and report(self.name, travail)
-            except db_mod.Unavailable:
-                raise
-            except db_mod.DbError:
-                return False  # no incident claim: stay blocked and retry later
+            if report is None:
+                # #5565 : hors PostgreSQL local (exécuteur médié), pas de
+                # réclamation durable côté serveur. Le repli local garde un
+                # signal unique par marqueur au lieu de taire l'incident.
+                first_report = self._compta_incident_local(travail)
+            else:
+                try:
+                    first_report = report(self.name, travail)
+                except db_mod.Unavailable:
+                    raise
+                except db_mod.DbError:
+                    return False  # no incident claim: stay blocked and retry later
             if first_report:
                 message = ("Accounting marker ambiguous: turn accounting suspended; "
                            "authorized human reconciliation required "
