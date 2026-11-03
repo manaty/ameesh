@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #5630 : une sonde légère par VM, sans dépendre des suites de tests.
+# Le bureau pose le label machine sur tous les runners correspondants.
+name: disque CI
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-disque-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  mesure:
+    name: disque ${{ matrix.host }}
+    runs-on: [self-hosted, linux, '${{ matrix.host }}']
+    timeout-minutes: 3
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [ameesh-ci-1, ameesh-ci-2, ameesh-ci-3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: mesure structurée (#5630)
+        run: python3 scripts/ci-disque.py mesure --host '${{ matrix.host }}'

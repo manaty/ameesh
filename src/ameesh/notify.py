@@ -196,7 +196,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "ci_main_red",
                  # #845 : la garde de la CI — runner busy sans job (panne) et
                  # file au-delà du SLO de 15 min (capacité)
-                 "ci_runner_stuck", "ci_queue_saturated",
+                 "ci_runner_stuck", "ci_queue_saturated", "ci_disk_low", "ci_disk_unreadable",
                  # #3344 : la carte de mesure a plus de 48 h (suite complète
                  # pour chaque lot) — plus seulement une annotation CI
                  "map_stale",
@@ -360,6 +360,8 @@ TYPE_LABELS = {
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "estimate_bias": "estimate bias",
     "ci_main_red": "CI red on main",
+    "ci_disk_low": "CI VM disk almost full",
+    "ci_disk_unreadable": "CI VM disk measurement unavailable",
     "ci_runner_stuck": "CI runner busy with no job running",
     "ci_queue_saturated": "CI queue beyond its SLO",
     "map_stale": "measured test map older than 48 h",

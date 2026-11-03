@@ -5443,6 +5443,23 @@ class CiResults(Domain):
         """Retire les relevés de carte des dépôts hors du périmètre actif
         `repos` (comme `prune_queue`) ; un périmètre vide ne purge rien."""
 
+    @abc.abstractmethod
+    def expect_disk(self, repo: str, *, host: str, volume: str) -> None:
+        """#5630 : attend une sonde ; ne remplace aucune mesure acquise."""
+
+    @abc.abstractmethod
+    def observe_disk(self, repo: str, *, host: str, volume: str, run_id: int,
+                     sampled_ts: float, free_bytes: int, total_bytes: int) -> None:
+        """#5630 : garde la mesure la plus récente de chaque volume de VM CI."""
+
+    @abc.abstractmethod
+    def disks(self) -> list[dict]:
+        """#5630 : mesures via annotations GitHub (sampled_ts NULL si jamais reçue)."""
+
+    @abc.abstractmethod
+    def prune_disks(self, repos: Sequence[str]) -> None:
+        """#5630 : retire les disques des dépôts sortis du périmètre actif."""
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     @abc.abstractmethod
     def claim_guard_scan(self, repo: str, *, now: float, window_s: float) -> bool:
