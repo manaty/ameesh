@@ -97,7 +97,10 @@ A lot is stale when it is open and inactive beyond the configured threshold
   `hold cleared:`) removes only its author's hold; a pilot's lift removes them
   all, and a state change ends every hold. An ordinary note (triage, status
   report) ends nothing, and a later `hold:` note adds a hold (or re-arms its
-  author's).
+  author's). Prose lifts nothing either: while a hold is active, a note that
+  announces its lift in prose (`the hold is lifted`, `holds released`) is
+  refused with the exact form `unhold: <reason>`, instead of leaving the debit
+  on an already-announced wait (#5484).
   The write path authenticates the claim: `ameesh work note` and
   `ameesh work move --note` refuse a `hold:`/lift note that claims a pilot
   identity the writing session cannot prove (same guard as a state

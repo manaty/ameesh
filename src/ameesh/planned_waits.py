@@ -84,6 +84,79 @@ HOLD_NOTE_PATTERNS = (_HOLD.pattern, _LIFT.pattern)
 #: ordinaire, comme le veut le motif exact.
 _HOLD_LIKE = re.compile(r"^hold(?=[\s:(])", re.I)
 
+#: #5484 : une note qui annonce en **prose** la levée d'un hold (« le hold du
+#: staging est levé », « holds lifted ») ne lève rien : le journal ne lit que
+#: la forme exacte `_LIFT`. Le chemin d'écriture prévient quand un hold est
+#: actif sur le lot et que la note annonce pourtant sa levée. Le mot de levée
+#: et le hold sont lus dans la même phrase ; les mots entre eux (ou juste avant
+#: le premier) disent si la levée est acquise — `pas`, `peut être`, `sera`,
+#: `une fois`… ne l'annoncent pas.
+_HOLD_WORD = re.compile(r"\bholds?\b", re.I)
+_LIFT_WORD = re.compile(r"\b(?:lev[ée]e?s?|lifted|released|cleared)\b", re.I)
+_WORD = re.compile(r"\w+(?:['’\-]\w+)*", re.UNICODE)
+_NOT_ANNOUNCED = frozenset((
+    # négation
+    "pas", "jamais", "plus", "guère", "aucun", "aucune", "ni", "not", "never",
+    # modal, futur, condition
+    "peut", "peuvent", "pourrait", "pourraient", "doit", "doivent",
+    "devrait", "devraient", "devra", "devront", "sera", "seront",
+    "serait", "seraient", "être", "va", "vont", "aller", "bientôt",
+    "prochainement", "avant", "quand", "lorsque", "si", "fois", "après",
+    "dès", "reste", "rester", "resterait", "resteront", "encore",
+    "toujours", "train", "point", "soit", "soient",
+    # anglais
+    "will", "would", "should", "must", "may", "might", "can", "could",
+    "be", "being", "yet", "still",
+))
+
+
+def announces_lift(text) -> bool:
+    """#5484 : la note annonce en prose la levée d'un hold.
+
+    Une telle note ne lève rien (`is_lift_note` ne lit que `unhold:`/`hold
+    lifted:`…). Le chemin d'écriture s'en sert pour prévenir, quand un hold est
+    actif, au lieu de laisser le débit garder l'attente. Une forme exacte n'est
+    jamais une annonce en prose ; une négation, un modal, un futur, une
+    condition ou une question n'en sont pas une non plus."""
+    value = str(text or "").strip()
+    if not value or is_hold_note(value) or is_lift_note(value):
+        return False
+    if not _HOLD_WORD.search(value) or not _LIFT_WORD.search(value):
+        return False
+    for sentence in re.finditer(r"[^.!?;\n]+[.!?;]?", value):
+        chunk = sentence.group()
+        if chunk.rstrip().endswith("?"):
+            continue                    # question, pas une annonce
+        words = [match.group().lower() for match in _WORD.finditer(chunk)]
+        for index, word in enumerate(words):
+            if not _LIFT_WORD.fullmatch(word):
+                continue
+            hold = _nearest_hold(words, index)
+            if hold is None:
+                continue
+            first, last = min(index, hold), max(index, hold)
+            span = words[first + 1:last]
+            context = words[max(0, first - 2):first]
+            if any(token in _NOT_ANNOUNCED for token in span + context):
+                continue
+            if any(re.search(r"-(?:il|elle|on|ils|elles|ce)$", token)
+                   for token in span + context):
+                continue                # inversion : une question
+            return True
+    return False
+
+
+def _nearest_hold(words, lift: int) -> int | None:
+    """L'indice du hold le plus proche de `lift`, avant (une phrase courte) ou
+    juste après pour la forme nominale (`levée du hold`)."""
+    for back in range(lift - 1, max(-1, lift - 13), -1):
+        if _HOLD_WORD.fullmatch(words[back]):
+            return back
+    for ahead in range(lift + 1, min(len(words), lift + 5)):
+        if _HOLD_WORD.fullmatch(words[ahead]):
+            return ahead
+    return None
+
 
 def is_hold_note(text) -> bool:
     """#1664 : la note qui pose une retenue (`hold: <raison>`). Le préfixe est
