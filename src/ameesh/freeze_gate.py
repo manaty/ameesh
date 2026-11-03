@@ -507,6 +507,77 @@ def _canon_review_coverage(db: Db, item: dict, sha: str, repo: str) -> str:
     return ""
 
 
+def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
+    """#5556 : refuse le gel d'un lot du canon dont la tête coupe le bloc des
+    règles (`process-rules-block-too-long`) ; rend sinon la note qui donne la
+    marge en octets, lue par l'auteur au gel et par le relecteur sur le jalon.
+
+    Le canon n'a pas de CI : sans ce contrôle, la limite n'était vérifiée qu'à
+    `canon check`, à la synchro et au placement, donc après fusion (home#248,
+    43 octets de trop). Un lot qui ne fait pas grossir un bloc déjà coupé à la
+    base (celui qui le raccourcit) n'est pas refusé. Mesure impossible (canon
+    illisible, délai) : la note le dit, le gel n'attend pas."""
+    from . import canon as canon_mod, canon_lowering, lot_class
+    from .deadline import Deadline
+    from .work import WorkError
+    cfg = getattr(db, "cfg", None)
+    canon_lot, clone = lot_class._canon_lot(item, lot_class.canon_clones(cfg)) \
+        if repo else (False, None)
+    if not canon_lot:
+        return ""
+    deadline = Deadline(canon_lowering.BUDGET_S)
+
+    def measure(where: str, ref: str):
+        loaded = canon_mod.load(where, ref=ref, deadline=deadline)
+        if not loaded.readable:
+            raise canon_mod.CanonError("canon unreadable at %s in %s" % (ref[:12], where))
+        return canon_mod.process_block(loaded)
+
+    # revue qa-01 : la tête se mesure d'abord dans `repo`, le dépôt où le gel
+    # l'a résolue (un clone d'auteur distinct, home#248) ; le clone configuré
+    # n'est qu'un repli. La base se lit dans le même dépôt que la tête.
+    roots = [repo] + ([clone] if clone and clone != repo else [])
+    head, root, failures = None, "", []
+    for where in roots:
+        try:
+            head, root = measure(where, sha), where
+            break
+        except Exception as exc:  # noqa: BLE001 - le gel n'attend pas une mesure cassée
+            failures.append((str(exc) or type(exc).__name__)[:200])
+    if not root:
+        return "canon-rules-block: not measured: %s" % "; ".join(failures)
+    if head is None:
+        return ""
+    if not head.cut:
+        return "canon-rules-block: %s" % head.line()
+    # Tête coupée : l'exemption ne vaut que contre la VRAIE cible. Une cible
+    # implicite se résout comme le dépôt la déclare, jamais par le repli
+    # `HEAD` de `_revision` (le lot lui-même, revue cx3 B1) ; une base
+    # introuvable ou illisible n'exempte rien : le gel est refusé.
+    base_block = None
+    try:
+        from . import plan_git
+        target = str(item.get("branch_target") or "") \
+            or plan_git.default_target(root, deadline=deadline) or ""
+        ref, tip = canon_lowering._revision(root, target, deadline) if target \
+            else ("", "")
+        if tip and ref != "HEAD":
+            base = canon_lowering._merge_base(root, tip, sha, deadline)
+            if base and base != sha:
+                base_block = measure(root, base)
+    except Exception:  # noqa: BLE001 - base illisible : aucune exemption
+        base_block = None
+    # revue docs-01 : le manque (`over`, diagnostics compris) se compare, pas
+    # les octets de règles — un diagnostic de plus coupe davantage à règles égales
+    if base_block is not None and base_block.cut and head.over <= base_block.over:
+        return ("canon-rules-block: %s (already cut at the base, %d bytes over: "
+                "not grown)" % (head.line(), base_block.over))
+    raise WorkError("freeze refused (process-rules-block-too-long): %s — a brief "
+                    "on the oldest served version loses the end of the rules; "
+                    "shorten the cards: %s (`ameesh canon check`, #5556)"
+                    % (head.line(), head.cards))
+
+
 def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None,
                 refreshed: dict | None = None,
                 outcome: dict | None = None) -> str:
@@ -768,6 +839,12 @@ def milestone(
             db, item, sha, repo or str(freeze_info.get("repo") or ""))
         if coverage_note:
             note = (note + "\n" if note else "") + coverage_note
+        # #5556 : la marge du bloc des règles, montrée avant fusion ; un bloc
+        # coupé à la tête gelée est refusé ici, pas découvert au brief.
+        rules_note = _canon_rules_block(
+            db, item, sha, repo or str(freeze_info.get("repo") or ""))
+        if rules_note:
+            note = (note + "\n" if note else "") + rules_note
         # (5) : la marque des branches où le gel était absent, pour que le
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par
