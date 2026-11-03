@@ -100,6 +100,39 @@ class GelTest(unittest.TestCase):
         self.assertIn("not measured", note)
 
 
+class MargeTest(unittest.TestCase):
+    """Revue impl-02 B2 : coupe due aux diagnostics alors que rules <= room."""
+
+    def _bloc(self, regles: str, diag: str):
+        from ameesh import reprise
+        process = types.SimpleNamespace(valid=True, title="T", fiche=None)
+        loaded = types.SimpleNamespace(processes=[process])
+        with mock.patch.object(reprise, "_process_fragment",
+                               return_value=(regles, diag)):
+            return canon.process_block(loaded)
+
+    def test_marge_negative_si_et_seulement_si_coupe(self):
+        from ameesh import reprise
+        regles, diag = "a" * 14800, "x" * 500
+        self.assertLessEqual(len(regles), canon.RULES_BLOC_ROOM_COMPAT)
+        mesure = self._bloc(regles, diag)
+        self.assertTrue(mesure.cut)
+        self.assertLess(mesure.margin, 0)
+        self.assertNotIn("-", mesure.line().split("bytes over")[0])
+        # la marge est le manque exact : un octet de moins ne suffit pas
+        limite = canon.RULES_BLOC_LIMIT_COMPAT
+        juste = regles[:mesure.margin]
+        self.assertIn(juste, reprise._rules_bloc(juste, limite, [diag]))
+        presque = regles[:mesure.margin + 1]
+        self.assertNotIn(presque, reprise._rules_bloc(presque, limite, [diag]))
+
+    def test_bloc_entier_marge_positive(self):
+        mesure = self._bloc("a" * 1000, "")
+        self.assertFalse(mesure.cut)
+        self.assertEqual(mesure.margin, mesure.limit - mesure.size)
+        self.assertGreater(mesure.margin, 0)
+
+
 class CheckTest(unittest.TestCase):
     def test_canon_check_affiche_la_marge(self):
         from ameesh import canon_cli

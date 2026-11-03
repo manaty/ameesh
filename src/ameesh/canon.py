@@ -5685,8 +5685,9 @@ class ProcessBlock:
     """#5556 : mesure du bloc de règles injecté, pour la plus ancienne version
     servie (`RULES_BLOC_LIMIT_COMPAT`). `size` : octets du bloc construit ;
     `rules` : octets des règles seules ; `cut` : le brief en coupe la fin ;
-    `margin` : octets encore libres dans le bloc (négatif quand il est coupé :
-    ce qui manque aux règles pour tenir)."""
+    `margin` : octets encore libres dans le bloc ; négatif si et seulement si
+    il est coupé : moins ce qui manque aux règles pour tenir dans la place
+    réelle, diagnostics compris (`over`, revue impl-02 B2)."""
 
     size: int
     rules: int
@@ -5696,19 +5697,20 @@ class ProcessBlock:
     cards: str
     servies: tuple = ()
     titles: str = ""
+    over: int = 0
 
     @property
     def margin(self) -> int:
         if self.cut:
-            return self.room - self.rules
+            return -max(1, self.over)
         return self.limit - self.size
 
     def line(self) -> str:
         """Une ligne lisible par l'auteur et le relecteur (`canon check`, gel)."""
         if self.cut:
-            return ("rules block CUT: %d bytes of rules for %d bytes of room "
-                    "(oldest served version's limit %d), %d bytes over"
-                    % (self.rules, self.room, self.limit, -self.margin))
+            return ("rules block CUT: %d bytes of rules, %d bytes over the room "
+                    "left by the oldest served version's limit %d (diagnostics "
+                    "included)" % (self.rules, -self.margin, self.limit))
         return ("rules block %d/%d bytes, margin %d bytes (oldest served version)"
                 % (self.size, self.limit, self.margin))
 
@@ -5730,14 +5732,32 @@ def process_block(canon: Canon) -> ProcessBlock | None:
     if not rules:
         return None
     bloc = reprise._rules_bloc(rules, RULES_BLOC_LIMIT_COMPAT, diagnostics)
+    cut = rules not in bloc
     cartes = ", ".join(
         "%s (%d)" % (p.title, len(t.encode("utf-8")))
         for p, t in sorted(fragments, key=lambda f: -len(f[1].encode("utf-8"))))
     return ProcessBlock(
         size=len(bloc.encode("utf-8")), rules=len(rules.encode("utf-8")),
         limit=RULES_BLOC_LIMIT_COMPAT, room=RULES_BLOC_ROOM_COMPAT,
-        cut=rules not in bloc, cards=cartes, servies=tuple(servies),
-        titles=", ".join(p.title for p, _ in fragments))
+        cut=cut, cards=cartes, servies=tuple(servies),
+        titles=", ".join(p.title for p, _ in fragments),
+        over=_rules_shortfall(rules, diagnostics) if cut else 0)
+
+
+def _rules_shortfall(rules: str, diagnostics) -> int:
+    """#5556 : octets à retirer des règles pour que le bloc ne les coupe plus,
+    avec les diagnostics que le brief y pose (même code, `_rules_bloc`) :
+    le plus long préfixe qui tient, trouvé par dichotomie."""
+    from . import reprise
+    lo, hi = 0, len(rules)          # préfixe de `lo` caractères : tient
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if rules[:mid] in reprise._rules_bloc(rules[:mid], RULES_BLOC_LIMIT_COMPAT,
+                                               diagnostics):
+            lo = mid
+        else:
+            hi = mid - 1
+    return len(rules.encode("utf-8")) - len(rules[:lo].encode("utf-8"))
 
 
 def _validate_process_block(canon: Canon, add) -> None:
