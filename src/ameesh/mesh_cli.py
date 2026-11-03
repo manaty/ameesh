@@ -960,6 +960,13 @@ def _host_publish(cfg: Config, args) -> int:
         return 2
     db = _open(cfg)
     try:
+        runner = _host_runner_publishing(cfg, db)
+        if runner is not None:
+            # #5559 : le minuteur est posé sur tout serveur de mesh ; un
+            # exécuteur de l'hôte publie déjà, on ne double pas ses relevés
+            print("%s: not published, runner %s already publishes this host"
+                  % (cfg.host, runner))
+            return 0
         reading = res.collect(dataclasses.replace(cfg, runner_id="publish@%s" % cfg.host), db)
     finally:
         db.close()
@@ -970,6 +977,30 @@ def _host_publish(cfg: Config, args) -> int:
             cfg.host, _fmt_bytes(reading.get("disk_free_bytes")),
             "—" if reading.get("procs_zombie") is None else reading["procs_zombie"]))
     return 0
+
+
+def _host_runner_publishing(cfg: Config, db) -> str | None:
+    """#5559 : l'exécuteur qui publie déjà un relevé frais de cet hôte (moins
+    de trois périodes d'échantillonnage), sinon None — relevé illisible
+    compris : mieux vaut un relevé en double qu'un hôte muet."""
+    from . import exploitation
+    from . import resources as res
+    try:
+        latest = storage.of(db).hosts.current(cfg.host)
+    except Exception:  # noqa: BLE001 — la publication passe
+        return None
+    reading = latest[0] if isinstance(latest, list) and latest else None
+    if not isinstance(reading, dict):
+        return None
+    runner = reading.get("runner_id")
+    sampled = res.finite_float(reading.get("sampled_ts"))
+    if not isinstance(runner, str) or not runner or runner.startswith("publish@") \
+            or sampled is None:
+        return None
+    interval = res.finite_float(getattr(cfg, "resource_interval", None))
+    if interval is None or interval <= 0:
+        interval = exploitation.DEFAULT_HOST_SAMPLE_PERIOD_S
+    return runner if time.time() - sampled < 3 * interval else None
 
 
 def _host_fleet(cfg, db, canons, args) -> int:

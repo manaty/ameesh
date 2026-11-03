@@ -2144,6 +2144,13 @@ installer() {
     rm -f $BASCULE_VM
     $VENV/bin/python -c 'import psycopg, cryptography, ameesh.budget, ameesh.projects; print(\"psycopg\", psycopg.__version__, \"crypto\", cryptography.__version__, \": modules L70 et L62 présents\")'"
   runtime_invite ssh_vm "$SRC"
+  # #5559 : le relevé de l'hôte (disque de la base) suit le code installé ;
+  # rejouable, sans redémarrage d'exécuteur.
+  etape "relevé de l'hôte (ameesh-releve-hote.timer, #5559)"
+  ssh_vm "set -e
+    install -m 0644 $SRC/deploy/serveur/ameesh-releve-hote.service $SRC/deploy/serveur/ameesh-releve-hote.timer /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --now ameesh-releve-hote.timer"
   echo "installé. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
@@ -2314,6 +2321,10 @@ controler() {
   ssh_vm "runuser -l ameesh -c 'ameesh doctor --profiles'" || echec=1
   etape "ameesh doctor sur le serveur"
   ssh_vm "runuser -l ameesh -c 'ameesh doctor' | tail -8" || echec=1
+  # #5559 : informatif (canon §3, non concluant) ; host_unsampled le dira
+  etape "relevé de l'hôte (#5559)"
+  ssh_vm "systemctl is-active ameesh-releve-hote.timer; journalctl -u ameesh-releve-hote -n 2 --no-pager -o cat" \
+    || echo "relevé de l'hôte : minuteur inactif ou illisible (non bloquant)" >&2
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; exit 1; }
   echo; echo "contrôles verts"
 }
