@@ -39,6 +39,16 @@ Règles :
      juge sur la structure (index, scans, lignes, boucles, tampons), le temps
      ne sert qu'en plafond large (≥ 1 s). Modèle sans seuil de temps :
      tests/test_5555_gauge_plans.py.
+  H7 remplissage-volumineux-hors-fill
+     un `INSERT … generate_series` d'au moins 10 000 lignes estimées part par
+     `execute` dans un test PostgreSQL : il partage le statement_timeout et les
+     triggers par ligne du code mesuré, et tombe sous la charge de la CI en
+     restant vert en local (#5599, #5585, #5582). `PgTestCase.fill` lève le
+     délai pour ce seul remplissage et coupe les triggers nommés (#5641).
+     L'estimation multiplie les `generate_series(a, b)` dont les bornes sont
+     des entiers littéraux, des paramètres `%s`/`%d` liés à des constantes, ou
+     des constantes de module ou de classe ; une borne inconnue n'est pas
+     comptée (aucun constat sans preuve du volume).
 
 Exemption motivée : un commentaire `# hermeticity: allow — <raison>` sur
 l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison
@@ -111,7 +121,14 @@ RULES = {
     "H4": "seuil-mural-sous-la-seconde",
     "H5": "etat-disque",
     "H6": "seuil-de-plan-sous-la-seconde",
+    "H7": "remplissage-volumineux-hors-fill",
 }
+#: #5641 : un remplissage de fixture à partir de ce volume passe par `fill`.
+FILL_ROWS = 10_000
+#: appels qui envoient une instruction à la base ; `fill` n'en fait pas partie.
+EXECUTE_CALLS = {"execute": 0, "execute_without_statement_timeout": 1}
+_SERIES = re.compile(r"generate_series\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*[,)]",
+                     re.IGNORECASE)
 
 
 class Finding:
@@ -690,6 +707,76 @@ def _subsecond_plan_threshold(left: ast.AST, right: ast.AST, returns: dict,
     return None
 
 
+def _constant_value(node: ast.AST, constants: dict, class_constants: dict):
+    """Un entier ou une chaîne connus à la lecture, None sinon (#5641)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, str)) \
+            and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+            and node.value.id in ("self", "cls"):
+        value = class_constants.get(node.attr)
+    elif isinstance(node, ast.Name):
+        value = constants.get(node.id)
+    else:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return value if isinstance(value, int) else None
+
+
+def _fill_sql(call: ast.Call, constants: dict, class_constants: dict) -> str | None:
+    """Le SQL d'un appel `execute`, paramètres connus substitués (#5641).
+
+    Une borne inconnue reste un marqueur (`?`), qui n'entre pas dans le
+    compte : le constat ne naît que d'un volume prouvé."""
+    func = call.func
+    name = func.attr if isinstance(func, ast.Attribute) else (
+        func.id if isinstance(func, ast.Name) else None)
+    if name not in EXECUTE_CALLS or len(call.args) <= EXECUTE_CALLS[name]:
+        return None
+    node = call.args[EXECUTE_CALLS[name]]
+    fmt_args = None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        node, fmt_args = node.left, node.right
+    if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+        return None
+    sql = node.value
+    if "generate_series" not in sql.lower() or "insert" not in sql.lower():
+        return None
+
+    def values(arg):
+        items = arg.elts if isinstance(arg, (ast.Tuple, ast.List)) else [arg]
+        return [_constant_value(item, constants, class_constants) for item in items]
+
+    def substitute(text, found, marker):
+        parts = re.split(marker, text)
+        out = [parts[0]]
+        for index, part in enumerate(parts[1:]):
+            value = found[index] if index < len(found) else None
+            out.append("?" if value is None else str(value))
+            out.append(part)
+        return "".join(out)
+
+    if fmt_args is not None:
+        sql = substitute(sql.replace("%%", "\0"), values(fmt_args), r"%[sd]").replace("\0", "%")
+    if name == "execute" and len(call.args) > 1:
+        sql = substitute(sql, values(call.args[1]), r"%s")
+    return sql
+
+
+def _fill_rows(sql: str) -> int | None:
+    """Le produit des `generate_series(a, b)` aux bornes connues."""
+    total = None
+    for low, high in _SERIES.findall(sql):
+        try:
+            low_value = int(low.split("::")[0])
+            high_value = int(high.split("::")[0])
+        except ValueError:
+            continue
+        total = (total or 1) * max(0, high_value - low_value + 1)
+    return total
+
+
 def lint_source(path: str, source: str, rules: set[str] | None = None) -> list[Finding]:
     """Les constats d'un fichier ; `rules` restreint les analyses lancées.
 
@@ -828,6 +915,27 @@ def lint_source(path: str, source: str, rules: set[str] | None = None) -> list[F
                         "temps ne sert qu'en plafond large (>= 1 s)"
                         % (ast.unparse(measured), field, threshold, unit),
                         _enclosing(funcs, sub)))
+
+    if "H7" in wanted and "generate_series" in source:
+        # H7 : un gros remplissage par `execute` partage le délai et les
+        # triggers du code mesuré (#5641) ; `fill` est l'aide commune.
+        h7_scopes = _Scopes(tree)
+        constants = _scope_constants(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or _exempt(node, comments):
+                continue
+            class_scope = h7_scopes.cls(node)
+            merged = dict(constants.get(h7_scopes.module, {}))
+            merged.update(constants.get(class_scope, {}))
+            merged.update(constants.get(h7_scopes.function(node), {}))
+            sql = _fill_sql(node, merged, constants.get(class_scope, {}))
+            rows = _fill_rows(sql) if sql else None
+            if rows is not None and rows >= FILL_ROWS:
+                findings.append(Finding(
+                    path, node.lineno, node.col_offset + 1, "H7",
+                    "remplissage de %d lignes estimées hors de PgTestCase.fill : "
+                    "délai et triggers par ligne du code mesuré (#5641)" % rows,
+                    _enclosing(funcs, node)))
     return sorted(findings, key=lambda f: (f.lineno, f.col, f.rule))
 
 

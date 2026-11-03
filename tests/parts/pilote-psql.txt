@@ -149,3 +149,4 @@ test_5630_ci_disk_storage  # mesures disque CI monotones et alertes, sous les de
 test_5602_capacity_replan  # storage: atomic forecast dates/journal/checkpoint and silent event replay (#5602)
 
 test_5585_journal_plans  # #5585 : un tableau d’ids par page et garde de plan des lectures groupées du journal, sous les deux pilotes
+test_5641_fixture_fill  # #5641 : PgTestCase.fill rétablit les triggers (succès et échec) et le délai, sous les deux pilotes
