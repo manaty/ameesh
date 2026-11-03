@@ -173,6 +173,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "account_identity",
                  # #3647 : un rythme de compte local, hors du canon (§11)
                  "account_pace_local",
+                 # #5568 : un profil connu d'un hôte, utilisable sur aucun
+                 # hôte qui fait tourner son harnais — capacité perdue
+                 "account_profile_confined",
                  # #313 : un autre mesh de l'hôte déclare le même identifiant de
                  # compte — quota et sessions partagés, contraire à 0033
                  "account_shared",

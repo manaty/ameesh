@@ -430,6 +430,37 @@ saturé) et que la session n'est pas portable, la rotation ne peut pas résumer
 sous l'ancien compte : la session neuve s'ouvre sur un **brief de reprise
 déterministe** (voir `ameesh resume` dans [EXPLOITATION.md](EXPLOITATION.md)).
 
+### Profil connu d'un seul hôte : `account_profile_confined` (#5568)
+
+Un profil déclaré sur un hôte du mesh (le poste, par exemple) mais utilisable
+sur **aucun** hôte qui fait tourner son harnais ne sert à rien : le sélecteur
+d'une VM ne choisit pas un profil qu'elle ne déclare pas (03/11/2026 : Codex
+« secondaire » connu du seul poste, 215 tours primaire, 0 secondaire en 24 h).
+`ameesh alerts` lève alors `account_profile_confined` (poussée par défaut), lue
+en base seulement — noms et états, jamais un dossier ni un identifiant :
+
+* **connu** d'un hôte : le profil figure dans la dernière déclaration de cet
+  hôte pour le harnais (`account_identities`) ; un hôte éteint garde sa
+  déclaration, un hôte qui retire le profil de sa configuration cesse de le
+  déclarer ;
+* **porteurs** : les hôtes qui ont déclaré un compte de ce harnais depuis 24 h ;
+* **utilisable** : connu d'un porteur, avec une ligne `credential_health` qui
+  n'est pas `failing`.
+
+Le motif est le geste attendu : `provision` (connexion native device-auth par
+l'owner dans un dossier dédié d'un porteur, puis déclaration du profil par
+l'opérateur, sans copie d'`auth.json`), `reconnect` (identifiant en échec sur
+le porteur), `probe` (déclaré, sonde sentinelle pas encore passée). L'alerte n'a
+pas de date de début : ni le reset ni la reprise d'un autre compte ne la
+changent. Elle se résout quand le profil est utilisable sur un porteur, ou par
+un retrait daté dans la configuration de l'hôte qui lit les alertes :
+
+```json
+"accounts_withdrawn": {"codex": {"secondaire": "2026-11-03 gardé au poste, voulu"}}
+```
+
+Une valeur sans date `AAAA-MM-JJ` en tête n'est pas un retrait.
+
 ## 4. Failover order and caps (L226b, owner decision 2026-10-07)
 
 "Primaries last, capped": the harness's default account (`~/.claude`,
