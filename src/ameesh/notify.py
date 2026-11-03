@@ -173,6 +173,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "account_identity",
                  # #3647 : un rythme de compte local, hors du canon (§11)
                  "account_pace_local",
+                 # #5568 : un profil connu d'un hôte, utilisable sur aucun
+                 # hôte qui fait tourner son harnais — capacité perdue
+                 "account_profile_confined",
                  # #313 : un autre mesh de l'hôte déclare le même identifiant de
                  # compte — quota et sessions partagés, contraire à 0033
                  "account_shared",
@@ -383,6 +386,7 @@ TYPE_LABELS = {
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
     "account_config_invalid": "no valid harness account on the host",
+    "account_profile_confined": "harness account usable on no agent host",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
     "critical_turn_failures": "critical agent failing turns",
     # #2729 : plus aucun tour n'aboutit — la préemption prioritaire se répète ;

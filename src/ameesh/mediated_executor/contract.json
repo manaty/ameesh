@@ -4543,6 +4543,7 @@
     "start"
    ],
    "accounts": [
+    "declared",
     "force_switch",
     "hold",
     "holds",
