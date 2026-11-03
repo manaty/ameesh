@@ -18,16 +18,24 @@ import unittest
 import uuid
 from unittest import mock
 
-import psycopg
-from psycopg import sql
-from psycopg.conninfo import make_conninfo
+try:  # #5628 : l'outil parle psycopg ; la part psql de la CI n'en a pas
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+except ImportError:  # pragma: no cover - dépend de la part de CI
+    psycopg = None
 
 REPO = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('identities5162', REPO / 'deploy/postgres/enroler-identites.py')
-tool = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(tool)
+tool = None
+if psycopg is not None:
+    spec = importlib.util.spec_from_file_location('identities5162', REPO / 'deploy/postgres/enroler-identites.py')
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+requires_psycopg = unittest.skipUnless(psycopg is not None, 'psycopg absent (part psql)')
 
 
+@requires_psycopg
 class PrivateInputTest(unittest.TestCase):
     def test_rejects_service_options_nested_uri_and_multiple_endpoints(self):
         for dsn in ("service=ambient", "host=example port=5432 dbname=db user=owner options='-c role=admin'",
@@ -97,6 +105,7 @@ class PrivateInputTest(unittest.TestCase):
                                     for packet in captured), 'password material sent to a fake server')
 
 
+@requires_psycopg
 class RealIdentityTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
