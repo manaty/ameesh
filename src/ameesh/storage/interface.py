@@ -3359,7 +3359,8 @@ class Canon(Domain):
 
     @abc.abstractmethod
     def complete_sync(self, host: str, canon: str, token: str, signature: str) -> None:
-        """Publish completion only if this claim is still current."""
+        """Publish completion only if this claim is still current. #5653: the
+        completion time is published with it (`shared_sync.completed_age_s`)."""
 
     @abc.abstractmethod
     def fail_sync(self, host: str, canon: str, token: str) -> None:
@@ -3372,7 +3373,9 @@ class Canon(Domain):
     def shared_sync(self, host: str, canon: str) -> dict | None:
         """Last completed state, kept while a newer claim is pending (#5493)
         and after a claim that failed on an `ok` state (#5649); None if no
-        sync ever completed, or the last completed one was withdrawn."""
+        sync ever completed, or the last completed one was withdrawn. #5653:
+        `completed_age_s` carries its age in seconds on the database clock
+        (None when the completion time is unknown: not reusable)."""
 
     @abc.abstractmethod
     def lock_default_state(self, host: str) -> dict | None:
