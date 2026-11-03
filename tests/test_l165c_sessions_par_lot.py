@@ -1545,6 +1545,30 @@ class ReveilTest(_Base):
         self.assertFalse(other.stopping.is_set())
         self.assertEqual(other.runner._slot_reservations["q5601"], "class:1")
 
+    def test_relance_refusee_par_reservation_ne_compte_pas_de_reveil(self):
+        """#5601 (B cx3, 3e tour) : la relance d'inactivité refusée par la
+        réservation est jugée avant `note_wake` — ni compteur ni horodatage ;
+        la place libérée, le réveil part encore (wake 1)."""
+        worker = self._worker("i5601")
+        self._reserve_place(worker)
+        lot = work.add(self.db, title="P2", assignee="i5601", app="acme", priority=2,
+                       force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        for _ in range(4):   # au-delà de `lot_wake_max` (3)
+            worker.stopping.clear()
+            self.assertIsNone(self.pick(worker))
+            self.assertTrue(worker.stopping.is_set(), "bail rendu")
+        self.assertEqual(self.st.listing("i5601"), [], "aucun réveil compté")
+        del worker.runner.workers["b5601"]        # la place partagée se libère
+        worker.stopping.clear()
+        spec = self.pick(worker)
+        self.assertEqual(spec["lot"], str(lot))
+        self.assertTrue(spec.get("lot_wake"))
+        self.assertFalse(worker.stopping.is_set())
+        row = self.st.listing("i5601")[0]
+        self.assertEqual(row["wakes"], 1)
+        self.assertIsNone(worker.runner._slot_reservations["i5601"])
+
     def test_reveil_programme_bail_renouvele_pendant_une_bascule_longue(self):
         """#2614 : une bascule de session de lot plus longue que le bail (120 s)
         ne laisse plus le claim expirer — il est renouvelé tant qu'il est tenu,

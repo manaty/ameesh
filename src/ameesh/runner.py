@@ -6144,22 +6144,24 @@ class AgentWorker(threading.Thread):
             spec["_preempt_gen"] = frontiere
         return spec
 
-    def _reservation_fits(self, lot) -> bool:
+    def _reservation_fits(self, lot, row: dict | None = None) -> bool:
         """#5601 : la place de ce worker tient-elle pour un tour sur `lot` ?
-        Sans réservation sur l'hôte, sans lot ou lot illisible : oui (une
-        panne de lecture ne rend pas un bail)."""
+        `row` : la ligne déjà lue (`actionable`, avec `project`). Sans
+        réservation sur l'hôte, sans lot ou lot illisible : oui (une panne de
+        lecture ne rend pas un bail)."""
         fits = getattr(self.runner, "reservation_turn_allowed", None)  # doublures
         if fits is None or not lot or not getattr(self.runner, "_host_slot_reservations", None):
             return True
-        try:
-            row = storage.of(self.db).work.get(int(lot))
-        except (db_mod.DbError, TypeError, ValueError):
-            return True
         if row is None:
-            return True
-        return fits(self.name, self.agent or {},
-                    {"id": row.get("id"), "project": row.get("app"),
-                     "priority": row.get("priority")})
+            try:
+                item = storage.of(self.db).work.get(int(lot))
+            except (db_mod.DbError, TypeError, ValueError):
+                return True
+            if item is None:
+                return True
+            row = {"id": item.get("id"), "project": item.get("app"),
+                   "priority": item.get("priority")}
+        return fits(self.name, self.agent or {}, row)
 
     def _pick(self) -> dict | None:
         agent = registry.get(self.db, self.name)
@@ -6629,12 +6631,18 @@ class AgentWorker(threading.Thread):
         now = time.time()
         try:
             lots = st.actionable(self.name, today=_dt.date.today().isoformat())
+            refused = False
             for row in lots:
                 if not self.lot_wake_allowed(row, now, base):
                     continue
                 if self._lot_workdir_blocked(row["id"]):
                     # #811 (B2) : pas de réveil consommé pour un lot dont le
                     # dossier manque — un autre lot actionnable est élu.
+                    continue
+                if not self._reservation_fits(row["id"], row):
+                    # #5601 (B cx3, 3e tour) : jugé AVANT `note_wake` — un
+                    # réveil refusé ne compte ni au plafond ni au délai
+                    refused = True
                     continue
                 note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
                 log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
@@ -6643,6 +6651,12 @@ class AgentWorker(threading.Thread):
                         "prompt": adapters.LOT_WAKE_PROMPT % {
                             "id": int(row["id"]), "title": row.get("title") or "",
                             "state": row["state"]}}
+            if refused:
+                # aucun lot actionnable ne tient dans la place réservée tenue :
+                # le bail est rendu, la réclamation réadmet par classe
+                log_async("[%s] no actionable lot fits the slot reservations: "
+                          "lease released" % self.name)
+                self.stopping.set()
         except db_mod.DbError as exc:
             log_async("[%s] actionable lots unreadable (%s)" % (self.name, exc))
         return None
