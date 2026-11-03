@@ -59,7 +59,8 @@ REWRITTEN = (
     "review_catch_up.actor", "sandbox_turns.agent", "session_bindings.agent",
     "tranche_reservations.agent", "tranche_reservations.closed_by", "tranche_events.actor",
     "tranche_limits.admitted_by",
-    "session_bindings.created_by", "spend_pending.agent", "standing_reservations.reserved_by",
+    "session_bindings.created_by", "spend_pending.agent", "spend_marker_events.agent",
+    "standing_reservations.reserved_by",
     "turn_costs.agent", "turn_resources.agent", "visibility_checks.persona",
     "work_item_delegations.delegate", "work_item_delegations.delegated_by",
     "work_item_delegations.resolved_by", "work_item_dependencies.created_by",
@@ -98,6 +99,7 @@ KEPT = (
     "mesh_approvals.consumed_by", "mesh_consumed_nonces.approver",
     "mesh_consumed_nonces.consumed_by", "provenance_receipts.actor", "schema_migrations.name",
     "schema_non_additive_migrations.name",
+    "spend_marker_events.actor",  # Human resolution / runner audit evidence.
     "sandbox_turns.owner",  # Runner lease owner, never an agent identity.
     "standing_approvals.approver", "standing_approvals.registered_by",
     "standing_approvals.revoked_by", "turn_cost_corrections.actor",

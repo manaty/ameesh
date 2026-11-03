@@ -1583,7 +1583,8 @@ class PendingSpend(interface.PendingSpend):
         sinon, pour une ligne d'avant 0423, l'époque portée par sa clé, qui
         doit être un arrondi historique exact de l'instant du marqueur. Une
         ligne ou une réservation antérieure au marqueur est étrangère, même
-        quand son arrondi tombe dans le même intervalle. L'index de début seul
+        quand son arrondi tombe dans le même intervalle ; elle ne contredit
+        pas un candidat postérieur unique (#5561). L'index de début seul
         ne prouve rien : il est réutilisé après une rotation du flux, donc une
         réservation (ou une ligne) au même index mais à un autre instant est
         étrangère. Elle n'est jamais retenue ; une réservation étrangère sans
@@ -1684,7 +1685,7 @@ WITH marqueur_brut AS (
     -- repli sans turn_id ni started_at : l'époque de la clé doit être un
     -- arrondi historique exact du marqueur et la ligne le suivre, sinon c'est
     -- la ligne d'un index réutilisé.
-    SELECT 1 FROM lignes_identifiees
+    SELECT posterieure FROM lignes_identifiees
      WHERE turn_id IS NULL AND started_at IS NULL AND meme_index
        AND (NOT posterieure OR NOT epoque_historique)
 ), lignes_contradictoires AS (
@@ -1721,7 +1722,7 @@ WITH marqueur_brut AS (
      WHERE meme_index AND posterieure
        AND coalesce(cle_epoch = ANY(epoques), false)
 ), reservations_etrangeres AS (
-    SELECT DISTINCT state FROM reservations_identifiees
+    SELECT DISTINCT state, posterieure FROM reservations_identifiees
      WHERE meme_index
        AND (NOT posterieure
             OR NOT coalesce(cle_epoch = ANY(epoques), false))
@@ -1733,15 +1734,20 @@ WITH marqueur_brut AS (
     SELECT
       (SELECT count(*) FROM candidats) AS n_candidats,
       EXISTS (SELECT 1 FROM retenues WHERE spend_key IS NULL) AS sans_cle,
-      EXISTS (SELECT 1 FROM lignes_etrangeres) AS ligne_etrangere,
+      EXISTS (SELECT 1 FROM lignes_etrangeres
+               WHERE posterieure OR (SELECT count(*) FROM candidats) = 0)
+        AS ligne_etrangere,
       EXISTS (SELECT 1 FROM lignes_contradictoires) AS contradictoire,
       EXISTS (SELECT 1 FROM reservations_etrangeres
-               WHERE state = 'open') AS ouverte_etrangere,
+               WHERE state = 'open' AND
+                 (posterieure OR (SELECT count(*) FROM candidats) = 0))
+        AS ouverte_etrangere,
       EXISTS (SELECT 1 FROM reservations_etrangeres) AS reservation_etrangere
 )
 SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
        m.resident_usage, m.spend_key, m.created_at, m.created_ts,
        CASE
+         WHEN resolution.ledger_key IS NOT NULL THEN resolution.ledger_key
          WHEN m.cle_exacte IS NOT NULL THEN m.cle_exacte
          WHEN c.n_candidats = 1 AND NOT c.sans_cle
               AND NOT c.ligne_etrangere AND NOT c.contradictoire
@@ -1754,13 +1760,118 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
            THEN m.agent || ':' || m.start_index || ':' || m.created_at
          ELSE NULL
        END AS ledger_key,
-       (m.cle_exacte IS NULL
+       (resolution.ledger_key IS NULL AND m.cle_exacte IS NULL
         AND (c.n_candidats > 1 OR c.sans_cle OR c.ligne_etrangere
              OR c.contradictoire OR c.ouverte_etrangere
              OR (c.reservation_etrangere AND c.n_candidats = 0)))
          AS ledger_ambiguous
   FROM marqueur m CROSS JOIN constat c
+  LEFT JOIN LATERAL (
+      SELECT e.ledger_key FROM spend_marker_events e
+       WHERE e.agent = m.agent AND e.marker_created_at = m.created_at::timestamptz
+         AND e.marker_spend_key IS NOT DISTINCT FROM m.spend_key
+         AND e.event = 'link'
+       ORDER BY e.id DESC LIMIT 1
+  ) resolution ON true
 """
+
+    def report_ambiguous(self, name, marker) -> bool:
+        """Claim one durable incident for this exact marker, across workers."""
+        return bool(self.db.query(
+            "INSERT INTO spend_marker_events"
+            " (agent, marker_created_at, marker_spend_key, event, actor, reason, snapshot)"
+            " SELECT agent, created_at, spend_key, 'ambiguous', 'runner',"
+            " 'historical ledger/reservation reconciliation required', %s::jsonb"
+            " FROM spend_pending WHERE agent = %s AND created_at = %s::timestamptz"
+            " AND spend_key IS NOT DISTINCT FROM %s"
+            " ON CONFLICT DO NOTHING RETURNING id",
+            (json.dumps(marker, default=str), name, marker['created_at'],
+             marker.get('spend_key'))))
+
+    def reconcile(self, name, *, spend_key, abandon, actor, reason) -> dict:
+        """Human resolution and audit commit together; no inferred real cost.
+
+        A link leaves the marker for ordinary runner repair. Abandonment is
+        allowed only with durable priced ledger evidence for every affected
+        reservation, and never releases an unmeasured reservation as zero.
+        """
+        if not actor.startswith('human:') or not reason.strip():
+            raise ValueError('an authorized human and a nonempty reason are required')
+        if bool(spend_key) == bool(abandon):
+            raise ValueError('choose a spend key or abandonment')
+        from .budgets import Budgets
+        with self.db.transaction() as tx:
+            agents = tx.query('SELECT status, status_text FROM agent_registry'
+                              ' WHERE name = %s FOR UPDATE', (name,))
+            if not agents or agents[0]['status'] != 'blocked':
+                raise ValueError('agent must be blocked before reconciliation')
+            rows = tx.query('SELECT * FROM spend_pending WHERE agent = %s FOR UPDATE',
+                            (name,))
+            if not rows:
+                raise ValueError('no pending accounting marker')
+            marker = rows[0]
+            if tx.query("SELECT id FROM turn_resources WHERE agent = %s"
+                        " AND status <> 'done'", (name,)):
+                raise ValueError('turn resources still active; reconcile only after cleanup')
+            prefix = '%s:%s:' % (name, marker['start_index'])
+            candidates = tx.query(
+                'SELECT spend_key FROM account_reservations WHERE agent = %s'
+                ' AND created_at >= %s AND left(spend_key, length(%s)) = %s'
+                ' UNION SELECT spend_key FROM turn_costs WHERE agent = %s'
+                ' AND recorded_at >= %s AND left(spend_key, length(%s)) = %s'
+                ' AND spend_key IS NOT NULL',
+                (name, marker['created_at'], prefix, prefix,
+                 name, marker['created_at'], prefix, prefix))
+            keys = sorted({r['spend_key'] for r in candidates})
+            if spend_key and spend_key not in keys:
+                raise ValueError('chosen key has no posterior ledger/reservation evidence for this marker')
+            if spend_key:
+                resolved = PendingSpend(tx).get(name)
+                if not resolved['ledger_ambiguous'] and resolved['ledger_key'] != spend_key:
+                    raise ValueError('marker already has a different proven ledger key')
+                if tx.query('SELECT id FROM turn_costs WHERE spend_key = %s'
+                            ' AND (agent <> %s OR usd IS NULL OR void_reason IS NOT NULL)',
+                            (spend_key, name)):
+                    raise ValueError('chosen ledger key has conflicting or unpriced cost evidence')
+            if abandon:
+                if not keys:
+                    raise ValueError('abandonment requires durable actual-cost evidence')
+                # Historical pre-0471 markers predate tranches. A newer
+                # paired reservation must use its own human reconciliation
+                # protocol; never settle just its account half here.
+                if tx.query('SELECT id FROM tranche_reservations WHERE spend_key IN'
+                            ' (SELECT jsonb_array_elements_text(%s::jsonb))',
+                            (json.dumps(keys),)):
+                    raise ValueError('paired tranche reservation requires tranche reconciliation')
+                accounts = tx.query('SELECT DISTINCT billing_account FROM account_reservations'
+                                    ' WHERE spend_key IN (SELECT jsonb_array_elements_text(%s::jsonb))'
+                                    ' ORDER BY billing_account', (json.dumps(keys),))
+                for account in accounts:
+                    tx.query('SELECT pg_advisory_xact_lock(hashtext(%s))',
+                             ('ameesh-account-budget:' + account['billing_account'],))
+                for key in keys:
+                    costs = tx.query(
+                        'SELECT usd, void_reason, source FROM turn_costs'
+                        ' WHERE spend_key = %s AND agent = %s FOR UPDATE', (key, name))
+                    if (not costs or any(r['usd'] is None or r['void_reason'] is not None
+                                         or r['source'] == 'device' for r in costs)):
+                        raise ValueError('actual cost unavailable for %s; marker retained' % key)
+                    Budgets(tx).account_settle(key, state='settled', actor=actor)
+                    tx.execute("UPDATE account_reservations SET state = 'settled',"
+                               ' closed_at = clock_timestamp(), closed_by = %s'
+                               " WHERE spend_key = %s AND state = 'kept'", (actor, key))
+                tx.execute('DELETE FROM spend_pending WHERE agent = %s', (name,))
+            event = 'abandon' if abandon else 'link'
+            event_row = tx.query(
+                'INSERT INTO spend_marker_events (agent, marker_created_at,'
+                ' marker_spend_key, event, ledger_key, actor, reason, snapshot)'
+                ' VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb) RETURNING id',
+                (name, marker['created_at'], marker.get('spend_key'), event,
+                 spend_key, actor, reason.strip(),
+                 json.dumps({'marker': marker, 'keys': keys}, default=str)))[0]
+            tx.query("SELECT pg_notify('ameesh_budget', %s)",
+                     (json.dumps({'scope': 'agent:' + name}),))
+            return dict(event_row, agent=name, event=event, ledger_key=spend_key)
 
     def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
         return self.put_get(name, start_index, turn, model,
@@ -1843,7 +1954,8 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
         ligne ou la réservation doit aussi suivre le marqueur, sinon elle est
         étrangère même au même arrondi d'une seconde. Aucun candidat : la clé
         exacte du marqueur. Candidats incohérents, réservation étrangère sans
-        candidat ou encore ouverte, ligne étrangère au repli : `ledger_key`
+        candidat ou encore ouverte après le marqueur, ligne étrangère au
+        repli après le marqueur : `ledger_key`
         NULL et `ledger_ambiguous` vrai — l'appelant suspend, il ne devine pas.
 
         Une seule instruction : le marqueur lu et la clé résolue voient le
