@@ -44,6 +44,7 @@ def _data(row: dict) -> dict:
 
 def _latest_by_path_sql(kind: str, *, host: str | None = None,
                         since_s: float | None = None,
+                        path: str | None = None,
                         actions: list[str] | None = None) -> tuple[str, tuple]:
     """Le SQL de `latest_by_path` et ses paramètres (une seule requête).
 
@@ -53,7 +54,8 @@ def _latest_by_path_sql(kind: str, *, host: str | None = None,
     — chercher ces candidats dans tout le journal coûtait 15-18 s par lecture
     (#4888) — puis relit la ligne retenue par l'index
     (kind, host, path, at desc, id desc). Sans `actions`, la lecture reste le
-    `DISTINCT ON` borné par `since_s` de #2851.
+    `DISTINCT ON` borné par `since_s` de #2851, sauf avec hôte et chemin
+    précis (#5587) : lecture directe de la dernière ligne par LIMIT 1.
     """
     window = ""
     if since_s is not None:
@@ -65,6 +67,9 @@ def _latest_by_path_sql(kind: str, *, host: str | None = None,
         if host:
             candidates += " AND host = %s"
             params.append(host)
+        if path is not None:
+            candidates += " AND path = %s"
+            params.append(path)
         candidates += window
         if since_s is not None:
             params.append(float(since_s))
@@ -85,11 +90,19 @@ def _latest_by_path_sql(kind: str, *, host: str | None = None,
     if host:
         where += " AND host = %s"
         params.append(host)
+    if path is not None:
+        where += " AND path = %s"
+        params.append(path)
     if since_s is not None:
         # #2851 : une alerte qui ignore de toute façon les lignes plus
         # vieilles ne doit pas trier tout le journal de rétention.
         where += window
         params.append(float(since_s))
+    if host and path is not None:
+        # #5587 : une seule entrée d’index, même si ce chemin a des milliers
+        # de passages ; DISTINCT ON lirait encore tout son historique.
+        return ("SELECT " + LOG_COLUMNS + " FROM housekeeping_log" + where +
+                " ORDER BY at DESC, id DESC LIMIT 1", tuple(params))
     # #3631 : les identifiants de la dernière ligne de chaque (hôte, chemin)
     # se lisent dans l'index (kind, host, path, at DESC, id DESC) — sans
     # tri ni accès au tas — et seule la ligne retenue est relue. L'ancien
@@ -140,14 +153,14 @@ class Housekeeping(interface.Housekeeping):
         return [_data(dict(r)) for r in rows]
 
     def latest_by_path(self, host, kind, *, since_s=None,
-                       only_paths_with=None) -> list[dict]:
+                       only_paths_with=None, path=None) -> list[dict]:
         actions = None
         if only_paths_with is not None:
             actions = [str(action) for action in only_paths_with]
             if not actions:
                 return []
         sql, params = _latest_by_path_sql(kind, host=host, since_s=since_s,
-                                          actions=actions)
+                                          actions=actions, path=path)
         return [_data(dict(r)) for r in self.db.query(sql, params)]
 
     def summary(self, host, since_s) -> list[dict]:

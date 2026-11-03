@@ -1884,7 +1884,8 @@ def tmp_episode(db, host: str, path: str, result: dict, *, now: float) -> dict:
     if db is None:
         return out
     try:
-        rows = storage.of(db).housekeeping.latest_by_path(host or None, "tmp")
+        rows = storage.of(db).housekeeping.latest_by_path(
+            host or None, "tmp", path=path)
     except Exception:
         return out
     for row in rows:
@@ -5479,7 +5480,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     # une ancienne clé de celui-ci) possède, levé par `resolved` ou `gone`
     last_over: dict[str, dict] = {}
     try:
-        for row in storage.of(db).housekeeping.latest_by_path(host, "tmp"):
+        for row in storage.of(db).housekeeping.latest_by_path(
+                host, "tmp", only_paths_with=("unowned", "over_quota")):
             if row.get("action") == "unowned":
                 last_unowned[row["path"]] = row
             elif row.get("action") == "over_quota":
