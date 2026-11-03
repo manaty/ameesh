@@ -64,9 +64,15 @@ La politique ne retire un cache que si toutes les preuves suivantes tiennent :
   courants cohérents, avec la même empreinte de `Runner.Listener.deps.json` ;
 * aucun processus du même uid avec `cwd` ou descripteur ouvert sous le cache
   (updater vivant), aucun script `_work/_update.sh` vivant, aucun
-  `Runner.Worker` actif sous la racine, aucun Listener redémarré depuis moins
-  de 10 min (unité réactivée entre deux contrôles) ; des descripteurs ou un
-  démarrage illisibles préservent le cache ;
+  `Runner.Worker` rattaché à cette racine, aucun Listener redémarré depuis
+  moins de 10 min (unité réactivée entre deux contrôles) ; le rattachement du
+  Worker se fait par son `cwd` réel — `rN`, `rN/bin`, `rN/bin.<version>` ou
+  `rN/_work/...` (relevé opérateur du 03/11 : un Worker tourne depuis
+  `rN/bin`) — ou, si le `cwd` est illisible, par le chemin de son exécutable ;
+  un Worker d'une autre racine ne bloque que la sienne ; une attribution
+  impossible (cwd hors `home`, `home` lui-même, cwd et exécutable illisibles)
+  préserve le cache ; un shell dont la cmdline ou les descripteurs sont
+  illisibles préserve aussi (updater potentiel) ; un zombie ne compte pas ;
 * `bin`, `externals`, `bin.*` et `externals.*` de la racine ne pointent pas
   dans le cache. Les versions installées et les sauvegardes `bin.*`/
   `externals.*` ne sont jamais touchées.

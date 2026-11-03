@@ -200,14 +200,99 @@ class MiseAJourEnAttenteTest(BaseTest):
         self.installer("2.338.2")
         update = self.cache("2.338.2")
         maintenant = time.time()
-        instantane = [{"pid": 42, "comm": "Runner.Worker",
-                       "cwd": self.root / "_work" / "ameesh",
-                       "fds": [], "cmdline": [], "depart": maintenant - 60}]
+        # cwd réels de la flotte : racine, bin, bin.<version>, workspace.
+        for cwd in (self.root,
+                    self.root / "bin",
+                    self.root / "bin.2.338.2",
+                    self.root / "_work" / "ameesh"):
+            instantane = [{"pid": 42, "comm": "Runner.Worker",
+                           "cwd": cwd, "fds": [], "cmdline": [],
+                           "depart": maintenant - 60, "etat": "R"}]
+            resultat, par_root = self.decision(processus=instantane,
+                                               maintenant=maintenant)
+            self.assertTrue(update.exists(), str(cwd))
+            self.assertEqual(par_root["r1"]["verdict"], "préservé", str(cwd))
+            self.assertIn("Worker actif", par_root["r1"]["raison"])
+
+    def test_worker_d_une_autre_racine_ne_protege_pas(self):
+        autre = self.home / "r2"
+        autre.mkdir()
+        (autre / ".runner").write_text("{}", encoding="utf-8")
+        self.installer("2.338.2")
+        update = self.cache("2.338.2")
+        maintenant = time.time()
+        instantane = [{"pid": 43, "comm": "Runner.Worker",
+                       "cwd": autre / "bin", "fds": [], "cmdline": [],
+                       "depart": maintenant - 60, "etat": "R"}]
+        resultat, _ = self.decision(processus=instantane,
+                                    maintenant=maintenant)
+        self.assertFalse(update.exists())
+        self.assertEqual(resultat["retires"], 1)
+
+    def test_worker_attribution_incertaine_preserve(self):
+        # cwd = home ne désigne aucune racine : l'attribution est impossible.
+        self.installer("2.338.2")
+        update = self.cache("2.338.2")
+        maintenant = time.time()
+        instantane = [{"pid": 44, "comm": "Runner.Worker",
+                       "cwd": self.home, "fds": [], "cmdline": [],
+                       "depart": maintenant - 60, "etat": "R"}]
         resultat, par_root = self.decision(processus=instantane,
                                            maintenant=maintenant)
         self.assertTrue(update.exists())
-        self.assertEqual(par_root["r1"]["verdict"], "préservé")
         self.assertIn("Worker actif", par_root["r1"]["raison"])
+
+    def test_informations_illisibles_preservent(self):
+        self.installer("2.338.2")
+        update = self.cache("2.338.2")
+        maintenant = time.time()
+        for comm, complement, motif in (
+                ("Runner.Worker", {"cwd": None}, "cwd illisible"),
+                ("Runner.Worker", {"fds": None}, "Worker actif"),
+                ("Runner.Worker", {"cmdline": None}, "Worker actif"),
+                ("bash", {"cmdline": None}, "shell illisible"),
+                ("bash", {"fds": None}, "descripteurs d'un shell")):
+            instantane = [dict({"pid": 45, "comm": comm,
+                                "cwd": self.root / "bin", "fds": [],
+                                "cmdline": [], "depart": maintenant - 60,
+                                "etat": "R"}, **complement)]
+            resultat, par_root = self.decision(processus=instantane,
+                                               maintenant=maintenant)
+            self.assertTrue(update.exists(), (comm, motif))
+            self.assertEqual(par_root["r1"]["verdict"], "préservé")
+            self.assertIn(motif, par_root["r1"]["raison"])
+
+    def test_worker_cmdline_attribue_si_cwd_illisible(self):
+        autre = self.home / "r2"
+        autre.mkdir()
+        (autre / ".runner").write_text("{}", encoding="utf-8")
+        self.installer("2.338.2")
+        update = self.cache("2.338.2")
+        maintenant = time.time()
+        instantane = [{"pid": 47, "comm": "Runner.Worker", "cwd": None,
+                       "fds": [],
+                       "cmdline": [str(self.root / "bin" / "Runner.Worker")],
+                       "depart": maintenant - 60, "etat": "R"}]
+        resultat, par_root = self.decision(processus=instantane,
+                                           maintenant=maintenant)
+        self.assertTrue(update.exists())
+        self.assertIn("Worker actif", par_root["r1"]["raison"])
+        instantane[0]["cmdline"] = [str(autre / "bin" / "Runner.Worker")]
+        resultat, _ = self.decision(processus=instantane,
+                                    maintenant=maintenant)
+        self.assertFalse(update.exists())
+        self.assertEqual(resultat["retires"], 1)
+
+    def test_zombie_n_empeche_pas_le_retrait(self):
+        self.installer("2.338.2")
+        update = self.cache("2.338.2")
+        maintenant = time.time()
+        instantane = [{"pid": 46, "comm": "", "cwd": None, "fds": None,
+                       "cmdline": None, "depart": None, "etat": "Z"}]
+        resultat, _ = self.decision(processus=instantane,
+                                    maintenant=maintenant)
+        self.assertFalse(update.exists())
+        self.assertEqual(resultat["retires"], 1)
 
     def test_script_de_mise_a_jour_vivant_protege(self):
         self.installer("2.338.2")
@@ -482,6 +567,31 @@ class ProcessusTest(BaseTest):
         self.assertEqual(vu["cmdline"][1],
                          str(self.root / "_work" / "_update.sh"))
         self.assertAlmostEqual(vu["depart"], maintenant - 995, delta=1)
+        self.assertEqual(vu["etat"], "S")
+
+    def test_worker_reel_cwd_bin_et_bin_versionne_protege(self):
+        self.installer("2.338.2")
+        update = self.cache("2.338.2")
+        faux = Path(self.tmp.name) / "proc-bin"
+        faux.mkdir()
+        (faux / "uptime").write_text("1000.00 0.00\n", encoding="utf-8")
+        for pid, cible in ((201, self.root / "bin"),
+                           (202, self.root / "bin.2.338.2")):
+            entree = faux / str(pid)
+            (entree / "fd").mkdir(parents=True)
+            (entree / "comm").write_text("Runner.Worker\n", encoding="utf-8")
+            (entree / "cwd").symlink_to(cible)
+            (entree / "cmdline").write_bytes(
+                b"/opt/runner/Runner.Worker\0")
+            (entree / "stat").write_text(
+                "%d (Runner.Worker) S " % pid + "0 " * 18 + "500 0\n",
+                encoding="utf-8")
+        maintenant = time.time()
+        instantane = disque._processus(faux, maintenant=maintenant)
+        resultat, par_root = self.decision(processus=instantane,
+                                           maintenant=maintenant)
+        self.assertTrue(update.exists())
+        self.assertIn("Worker actif", par_root["r1"]["raison"])
 
 
 class MenageIntegrationTest(BaseTest):

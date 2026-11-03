@@ -86,6 +86,7 @@ MAX_LIGNES_DFV = 400        # `docker system df -v` : les 400 premières lignes
 # référence. Une version supérieure est une mise à jour en attente : préservée.
 DELAI_REDEMARRAGE_S = 600.0
 MAX_ENTREES_UPDATE = 200000
+INTERPRETEURS_SHELL = frozenset({"bash", "dash", "sh", "zsh", "ksh"})
 VERSION_UPDATE = re.compile(r'"Runner\.Listener/(\d+\.\d+\.\d+)"')
 ENTREES_UPDATE = frozenset({
     "bin", "externals", "config.sh", "env.sh", "config.cmd", "run.cmd",
@@ -794,41 +795,102 @@ def _processus(proc: Path = Path("/proc"), *, maintenant=None) -> list[dict]:
                        for morceau in brut.split(b"\0") if morceau]
         except OSError:
             cmdline = None
+        etat = None
         depart = None
-        if uptime is not None:
-            try:
-                statut = (entree / "stat").read_text()
-                champs = statut.rsplit(")", 1)[1].split()
+        try:
+            statut = (entree / "stat").read_text()
+            champs = statut.rsplit(")", 1)[1].split()
+            etat = champs[0]
+            if uptime is not None:
                 depart = maintenant - (uptime - int(champs[19]) / horloge)
-            except (OSError, ValueError, IndexError):
-                depart = None
+        except (OSError, ValueError, IndexError):
+            pass
         vus.append({"pid": int(entree.name), "comm": comm, "cwd": cwd,
-                    "fds": descripteurs, "cmdline": cmdline, "depart": depart})
+                    "fds": descripteurs, "cmdline": cmdline, "depart": depart,
+                    "etat": etat})
     return vus
 
 
+def _racine_du_processus(cwd, home: Path) -> Path | None:
+    """Racine `rN` de `home` qui contient `cwd`, ou None si le doute reste.
+
+    L'attribution n'est fiable que si `cwd` tombe sous une racine de runner
+    marquée par `.runner`. `home` lui-même, un chemin hors de `home` ou un
+    enfant sans marqueur ne permettent pas de dire à quel runner appartient
+    le processus : l'appelant préserve alors le cache.
+    """
+    if cwd is None:
+        return None
+    try:
+        relatif = Path(cwd).relative_to(home)
+    except (TypeError, ValueError):
+        return None
+    if not relatif.parts:
+        return None
+    candidat = home / relatif.parts[0]
+    try:
+        marqueur = candidat / ".runner"
+        if marqueur.is_file() and not marqueur.is_symlink():
+            return candidat
+    except OSError:
+        return None
+    return None
+
+
+def _racine_executable(cmdline, home: Path) -> Path | None:
+    """Racine lue dans le chemin de l'exécutable (`rN/bin/Runner.Worker`)."""
+    if not cmdline:
+        return None
+    return _racine_du_processus(cmdline[0], home)
+
+
 def _verdict_processus(cache: Path, root: Path, processus, maintenant: float):
-    """Raison de préserver le cache si un processus vivant le référence."""
+    """Raison de préserver le cache si un processus vivant le référence.
+
+    Un Worker est rattaché à sa racine par son cwd réel — la flotte observée
+    le lance depuis `root` ou `root/bin` (`bin.<version>`), pas seulement
+    depuis `root/_work/...` — ou, si le cwd est illisible, par le chemin de
+    son exécutable. Un shell dont la cmdline ou les descripteurs sont
+    illisibles peut être `_update.sh` : il préserve. Une attribution
+    impossible préserve le cache ; un processus d'une autre racine ne le fait
+    pas (#5635, canon §2).
+    """
+    home = root.parent
     for processus_vu in processus:
         pid = processus_vu.get("pid")
+        if processus_vu.get("etat") == "Z":
+            continue
         comm = processus_vu.get("comm") or ""
-        if _sous(processus_vu.get("cwd"), cache):
-            return "updater vivant (pid %s)" % pid
+        cwd = processus_vu.get("cwd")
         descripteurs = processus_vu.get("fds")
+        cmdline = processus_vu.get("cmdline")
+        if descripteurs is None and comm.startswith(
+                ("Runner.Listener", "RunnerService")):
+            return "descripteurs du Listener illisibles (pid %s)" % pid
+        if comm == "Runner.Worker":
+            proprietaire = _racine_du_processus(cwd, home)
+            if proprietaire is None:
+                proprietaire = _racine_executable(cmdline, home)
+            if proprietaire is None or proprietaire == root:
+                if cwd is None:
+                    return "Worker actif, cwd illisible (pid %s)" % pid
+                return "Worker actif (pid %s)" % pid
+        if comm in INTERPRETEURS_SHELL and cmdline is None:
+            return "commande d'un shell illisible (pid %s)" % pid
+        if _sous(cwd, cache):
+            return "updater vivant (pid %s)" % pid
         if descripteurs is None:
-            if comm.startswith(("Runner.Listener", "RunnerService")):
-                return "descripteurs du Listener illisibles (pid %s)" % pid
+            if comm in INTERPRETEURS_SHELL:
+                return "descripteurs d'un shell illisibles (pid %s)" % pid
         else:
             for descripteur in descripteurs:
                 if _sous(descripteur, cache):
                     return "updater vivant (pid %s, descripteur ouvert)" % pid
-        for argument in processus_vu.get("cmdline") or []:
+        for argument in cmdline or []:
             if argument.endswith("/_work/_update.sh") and str(root) in argument:
                 return "script de mise à jour vivant (pid %s)" % pid
-        if comm == "Runner.Worker" and _sous(processus_vu.get("cwd"), root / "_work"):
-            return "Worker actif (pid %s)" % pid
         if (comm == "Runner.Listener" or comm.startswith("RunnerService")
-                or comm == "node") and processus_vu.get("cwd") == root:
+                or comm == "node") and cwd == root:
             depart = processus_vu.get("depart")
             if depart is None:
                 return "démarrage du Listener illisible (pid %s)" % pid
