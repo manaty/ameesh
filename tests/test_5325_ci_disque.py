@@ -129,6 +129,7 @@ class DuTest(unittest.TestCase):
             home = pathlib.Path(tmp) / "runner"
             for i in (1, 2):
                 (home / ("r%d" % i) / "_work" / "_tool").mkdir(parents=True)
+                (home / ("r%d" % i) / "_work" / "_update").mkdir(parents=True)
                 (home / ("r%d" % i) / "_diag").mkdir(parents=True)
             vus = []
 
@@ -141,9 +142,10 @@ class DuTest(unittest.TestCase):
         tailles = dict(lignes)
         self.assertEqual(vus[0][:4], ["du", "-s", "-x", "-B1"])
         self.assertIn("/tmp", vus[0])
-        self.assertEqual(len(lignes), 8)  # pip + 2 outils + 2 _work + 2 _diag + /tmp
+        self.assertEqual(len(lignes), 10)  # pip + 2 outils + 2 _work + 2 _update + 2 _diag + /tmp
         self.assertEqual(tailles["outils r1"], 100)
         self.assertEqual(tailles["_work r2"], 100)
+        self.assertEqual(tailles["cache _update r1"], 100)
         self.assertEqual(tailles["_diag r1"], 100)
         self.assertEqual(tailles["cache pip"], 100)
 

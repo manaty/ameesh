@@ -16,5 +16,6 @@ Nice=15
 IOSchedulingClass=idle
 NoNewPrivileges=yes
 # Ne pas isoler /proc ni /tmp : on doit voir les journaux ouverts et les
-# temporaires réels. Aucune suppression dans _work hors _temp, ni dans les
-# caches d'outils/actions/updaters.
+# temporaires réels. Aucune suppression dans _work hors _temp, et dans
+# _work/_update seulement l'extraction d'une version déjà installée/dépassée
+# (#5635) ; les caches d'outils/actions et les updaters vivants restent.
