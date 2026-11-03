@@ -91,6 +91,31 @@ class GelTest(unittest.TestCase):
             self._gate(sha, {"branch": "canon/5556-lot",
                              "branch_target": "cible-absente"})
 
+    def _gate_mesures(self, tete, base):
+        """revue docs-01 : vraies têtes git, mesures (règles, manque) imposées."""
+        git(self.clone, "checkout", "-q", "main")
+        write(self.clone, RACINE, carte(body=_corps(canon.RULES_BLOC_ROOM_COMPAT + 100)))
+        commit_all(self.clone, "base coupée")
+        git(self.clone, "checkout", "-qB", "canon/5556-lot")
+        sha = self._lot(canon.RULES_BLOC_ROOM_COMPAT + 200)
+
+        def bloc(rules, over):
+            return canon.ProcessBlock(
+                size=canon.RULES_BLOC_LIMIT_COMPAT, rules=rules,
+                limit=canon.RULES_BLOC_LIMIT_COMPAT, room=canon.RULES_BLOC_ROOM_COMPAT,
+                cut=True, cards="T (%d)" % rules, over=over)
+        with mock.patch.object(canon, "process_block",
+                               side_effect=[bloc(*tete), bloc(*base)]):
+            return self._gate(sha)
+
+    def test_regles_egales_et_un_diagnostic_de_plus_refuse(self):
+        with self.assertRaises(WorkError):
+            self._gate_mesures(tete=(14943, 230), base=(14943, 143))
+
+    def test_regles_plus_longues_et_un_diagnostic_de_moins_exempte(self):
+        note = self._gate_mesures(tete=(14939, 124), base=(14903, 190))
+        self.assertIn("already cut at the base, 190 bytes over", note)
+
     def test_lot_ordinaire_non_mesure(self):
         self.assertEqual(self._gate("a" * 40, {"branch": "lot/1-x",
                                                "branch_target": "main"}), "")

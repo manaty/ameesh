@@ -339,7 +339,8 @@ def _process_block_json(canon: canon_mod.Canon) -> dict | None:
     if mesure is None:
         return None
     return {"bytes": mesure.size, "rules_bytes": mesure.rules, "limit": mesure.limit,
-            "room": mesure.room, "cut": mesure.cut, "margin": mesure.margin}
+            "room_without_diagnostics": mesure.room, "cut": mesure.cut,
+            "margin": mesure.margin}
 
 
 def _registry_errors_unseen(canon: canon_mod.Canon, recorded: dict | None,

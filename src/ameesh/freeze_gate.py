@@ -559,9 +559,11 @@ def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
                 base_block = measure(base)
     except Exception:  # noqa: BLE001 - base illisible : aucune exemption
         base_block = None
-    if base_block is not None and base_block.cut and head.rules <= base_block.rules:
-        return ("canon-rules-block: %s (already cut at the base, %d bytes of "
-                "rules: not grown)" % (head.line(), base_block.rules))
+    # revue docs-01 : le manque (`over`, diagnostics compris) se compare, pas
+    # les octets de règles — un diagnostic de plus coupe davantage à règles égales
+    if base_block is not None and base_block.cut and head.over <= base_block.over:
+        return ("canon-rules-block: %s (already cut at the base, %d bytes over: "
+                "not grown)" % (head.line(), base_block.over))
     raise WorkError("freeze refused (process-rules-block-too-long): %s — a brief "
                     "on the oldest served version loses the end of the rules; "
                     "shorten the cards: %s (`ameesh canon check`, #5556)"

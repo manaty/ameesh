@@ -5779,10 +5779,11 @@ def _validate_process_block(canon: Canon, add) -> None:
     sujet = {"process": mesure.titles}
     if mesure.cut:
         add("process-rules-block-too-long", ERROR,
-            "Process rules block: %d bytes of rules for %d bytes of room (oldest "
-            "served version's brief block limit %d) — a brief with a full text cuts "
-            "the end of the rules; shorten the cards: %s"
-            % (mesure.rules, mesure.room, mesure.limit, mesure.cards),
+            "Process rules block: %d bytes of rules, %d bytes over the room left "
+            "by the oldest served version's brief block limit %d (diagnostics "
+            "included) — a brief with a full text cuts the end of the rules; "
+            "shorten the cards: %s"
+            % (mesure.rules, -mesure.margin, mesure.limit, mesure.cards),
             mesure.servies[0].fiche, **sujet)
     elif mesure.size * 10 >= mesure.limit * 9:
         add("process-rules-block-near-limit", WARNING,
