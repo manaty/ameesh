@@ -447,8 +447,10 @@ en base seulement — noms et états, jamais un dossier ni un identifiant :
   **et** que la topologie désigne hôtes d'agents (étiquette `agents` de leur
   fiche Host : `tags: [agents]`) : un poste allumé qui déclare le profil ne le
   rend pas utilisable aux VM, l'alerte reste. Un canon qui n'étiquette aucun
-  hôte (ou illisible) fait porter tous les hôtes du harnais, et l'alerte levée
-  le dit (`topology: "untagged"`) ;
+  hôte (ou illisible) fait porter tous les hôtes du harnais, en repli
+  conservateur : aucun hôte n'y vaut preuve pour les autres, le profil doit
+  être utilisable sur **chacun**, et l'alerte levée le dit
+  (`topology: "untagged"`) ;
 * **utilisable** : connu d'un porteur, avec une ligne `credential_health` qui
   n'est pas `failing`.
 

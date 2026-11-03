@@ -150,12 +150,36 @@ class ProfilConfineTest(PgTestCase):
         with mock.patch("ameesh.canon.load_configured", side_effect=OSError("canon")):
             self.assertIsNone(exploitation._agent_hosts(self.cfg))
 
+    def test_sans_etiquette_le_poste_ne_blanchit_pas_les_vm(self):
+        """B1 de ameesh-cx3 / B de mty-amh-impl-03 : topologie réelle sans
+        étiquette, poste revenu et sain sur secondaire, VM sans profil ou en
+        échec — l'alerte reste et dit la topologie manquante."""
+        with mock.patch.object(exploitation, "_agent_hosts", lambda cfg: None):
+            self._mesh()
+            self._declare("poste", "codex", "primaire", ago_s=0)
+            self._declare("poste", "codex", "secondaire", ago_s=0)
+            self._sante("poste", "primaire")
+            self._sante("poste", "secondaire")
+            alertes = self._alertes()
+            self.assertEqual([(a["reason"], a["topology"]) for a in alertes],
+                             [("provision", "untagged")])
+            self.assertIn("vm-1, vm-2, vm-3", alertes[0]["detail"])
+            self._declare("vm-2", "codex", "secondaire", ago_s=0)
+            self._sante("vm-2", "secondaire", "failing")
+            self.assertEqual([a["reason"] for a in self._alertes()], ["reconnect"])
+            # utilisable partout : plus d'alerte
+            for vm in VMS:
+                self._declare(vm, "codex", "secondaire", ago_s=0)
+                self._sante(vm, "secondaire")
+            self.assertEqual(self._alertes(), [])
+
     def test_topologie_sans_hote_d_agents_le_dit(self):
         self._mesh()
         with mock.patch.object(exploitation, "_agent_hosts", lambda cfg: None):
             alertes = self._alertes()
         self.assertEqual([a["topology"] for a in alertes], ["untagged"])
         self.assertIn("tags no agent host", alertes[0]["detail"])
+        self.assertIn("no host vouches for the others", alertes[0]["detail"])
         self.assertEqual(self._alertes()[0]["topology"], "tagged")
 
     def test_harnais_que_personne_ne_fait_tourner(self):
