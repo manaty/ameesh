@@ -270,19 +270,26 @@ class DiskTransportTest(unittest.TestCase):
             [self.row(free_bytes=None, total_bytes=None, sampled_ts=None)], [], self.now)],
                          ['ci_disk_unreadable'])
 
-    def test_first_measure_gets_max_age_grace_after_seen(self):
+    def test_first_measure_grace_uses_first_seen_not_last(self):
         healthy = dict(free_bytes=80 * 1024**3, total_bytes=100 * 1024**3)
-        first = self.row(sampled_ts=None, seen_ts=self.now, **healthy)
+        first = self.row(sampled_ts=None, first_seen_ts=self.now, seen_ts=self.now,
+                         **healthy)
         self.assertEqual(self.disk.findings([first], [], self.now), [])
         self.assertEqual(self.disk.findings([first], [], self.now + self.disk.MAX_AGE), [])
-        late = self.row(sampled_ts=None, seen_ts=self.now - self.disk.MAX_AGE - 1,
-                        **healthy)
+        late = self.row(sampled_ts=None,
+                        first_seen_ts=self.now - self.disk.MAX_AGE - 1,
+                        seen_ts=self.now, **healthy)
         self.assertEqual([r['type'] for r in self.disk.findings([late], [], self.now)],
+                         ['ci_disk_unreadable'])
+        # B1 de la revue : une collecte qui repousse seen_ts ne renouvelle pas
+        # la grâce ; seule first_seen_ts la porte.
+        refreshed = dict(late, seen_ts=self.now + 1800)
+        self.assertEqual([r['type'] for r in self.disk.findings([refreshed], [], self.now)],
                          ['ci_disk_unreadable'])
         # Une mesure déjà reçue puis vieillie n'a pas de grâce : la sonde ne
         # remonte plus, même si la VM est encore dans les jobs.
-        old = self.row(sampled_ts=self.now - self.disk.MAX_AGE - 1, seen_ts=self.now,
-                       **healthy)
+        old = self.row(sampled_ts=self.now - self.disk.MAX_AGE - 1,
+                       first_seen_ts=self.now, seen_ts=self.now, **healthy)
         self.assertEqual([r['type'] for r in self.disk.findings([old], [], self.now)],
                          ['ci_disk_unreadable'])
 

@@ -30,12 +30,34 @@ class DiskStorageTest(PgTestCase):
         self.ci.expect_disk('acme/widget', host='ci-b', volume='/')
         rows = self.ci.disks()
         self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0]['first_seen_ts'], now - 5)
         self.assertGreaterEqual(rows[0]['seen_ts'], now - 5)
         self.assertEqual(ci_disk.findings(rows, [], now), [])
         alerts = ci_disk.findings(rows, [], now + ci_disk.MAX_AGE + 1)
         self.assertEqual([(a['host'], a['type']) for a in alerts],
                          [('ci-b', 'ci_disk_unreadable')])
         self.assertEqual(len({exploitation.alert_key(a) for a in alerts}), 1)
+
+    def test_repeated_collects_do_not_renew_the_first_measure_grace(self):
+        """B1 #5633 : la grâce ne se renouvelle pas au rythme des collectes."""
+        import time
+        now = time.time()
+        self.ci.expect_disk('acme/widget', host='ci-b', volume='/')
+        self.db.execute("UPDATE ci_disk_state "
+                        "SET first_seen_at = now() - interval '3 hours'")
+        premier = self.ci.disks()[0]['first_seen_ts']
+        # Deux collectes de plus, sans mesure : chaque job vu repousse seen_at,
+        # jamais first_seen_at.
+        self.ci.expect_disk('acme/widget', host='ci-b', volume='/')
+        self.ci.expect_disk('acme/widget', host='ci-b', volume='/')
+        row = self.ci.disks()[0]
+        self.assertEqual(row['first_seen_ts'], premier)
+        self.assertGreater(row['seen_ts'], premier + 2 * 3600)
+        self.assertEqual([a['type'] for a in ci_disk.findings([row], [], now)],
+                         ['ci_disk_unreadable'])
+        # La VM est toujours présente : elle n'est pas oubliée.
+        self.ci.forget_disks('acme/widget', ['ci-b'], older_than_s=0)
+        self.assertEqual(len(self.ci.disks()), 1)
 
     def test_expect_refreshes_seen_at_without_touching_the_measure(self):
         self.record(200, 1024**3)
@@ -44,6 +66,7 @@ class DiskStorageTest(PgTestCase):
         self.ci.expect_disk('acme/widget', host='ci-a', volume='/')
         apres = self.ci.disks()[0]
         self.assertGreater(apres['seen_ts'], avant['seen_ts'] + 86400)
+        self.assertEqual(apres['first_seen_ts'], avant['first_seen_ts'])
         self.assertEqual(apres['sampled_ts'], 200)
         self.assertEqual(apres['free_bytes'], 1024**3)
 

@@ -94,16 +94,19 @@ def findings(rows, canons, now):
     """Seuils physiques des Hosts ; une mesure saine seule résout le rouge.
 
     #5633 : une VM tout juste vue par ``expect_disk`` n'a pas encore de
-    première mesure ; MAX_AGE de grâce après ``seen_ts`` évite l'alerte de la
-    première passe. Une mesure déjà acquise puis devenue vieille, elle, alerte
-    toujours (la sonde ne remonte plus).
+    première mesure ; MAX_AGE de grâce après sa **première** apparition
+    (``first_seen_ts``, stable) évite l'alerte de la première passe. La grâce
+    ne se renouvelle pas à chaque collecte : une VM qui apparaît dans les jobs
+    sans jamais produire de mesure alerte après MAX_AGE. Une mesure déjà
+    acquise puis devenue vieille, elle, alerte toujours (la sonde ne remonte
+    plus).
     """
     out = []
     for row in rows:
         host, repo = row['host'], row['repo']
         sampled = row.get('sampled_ts')
-        seen = row.get('seen_ts')
-        grace = sampled is None and seen is not None and now - seen <= MAX_AGE
+        first = row.get('first_seen_ts')
+        grace = sampled is None and first is not None and now - first <= MAX_AGE
         stale = not grace and (sampled is None or now - sampled > MAX_AGE
                                or sampled > now + 300)
         common = dict(agent=None, since=sampled, host=host, repo=repo,

@@ -648,9 +648,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at'
     ]),
     -- #5630 (0539) : mesures physiques CI, sans contenu ni identifiant secret.
+    -- #5633 (0540) : première apparition, même nature (horodatage seul).
     ('ci_disk_state', ARRAY[
         'repo', 'host', 'volume', 'run_id', 'sampled_at', 'free_bytes',
-        'total_bytes', 'seen_at'
+        'total_bytes', 'first_seen_at', 'seen_at'
     ]),
     -- #3344 (0480) : dernière carte de mesure publiée (même nature :
     -- identifiants, tête, horodatages, aucun contenu)

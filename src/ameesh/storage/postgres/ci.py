@@ -441,7 +441,9 @@ class CiResults(interface.CiResults):
     def expect_disk(self, repo, *, host, volume) -> None:
         # #5633 : `seen_at` date la dernière apparition de la VM dans les jobs
         # du workflow, pas la dernière mesure : un job en attente ou une sonde
-        # en échec la repousse. Une lecture ratée n'appelle pas cette méthode.
+        # en échec la repousse. `first_seen_at` est posé à l'insertion et ne
+        # bouge plus : la grâce de première mesure ne se renouvelle pas à
+        # chaque collecte. Une lecture ratée n'appelle pas cette méthode.
         self.db.execute(
             "INSERT INTO ci_disk_state (repo, host, volume) VALUES (%s, %s, %s) "
             "ON CONFLICT (repo, host, volume) DO UPDATE SET seen_at = now()",
@@ -465,6 +467,7 @@ class CiResults(interface.CiResults):
         return self.db.query(
             "SELECT repo, host, volume, run_id, free_bytes, total_bytes, "
             "extract(epoch from sampled_at)::float8 AS sampled_ts, "
+            "extract(epoch from first_seen_at)::float8 AS first_seen_ts, "
             "extract(epoch from seen_at)::float8 AS seen_ts "
             "FROM ci_disk_state ORDER BY repo, host, volume")
 

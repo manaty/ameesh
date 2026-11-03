@@ -59,9 +59,9 @@ service de rétention reste indépendant de ce workflow.
 
 Le veilleur GitHub d'ameesh lit les annotations via son accès existant,
 uniquement dans ce workflow sur la branche de base, jamais sur les PR. Il
-conserve dans `ci_disk_state` (migration additive 0539) le dernier relevé
-par dépôt, VM et volume. Appliquer la migration **avant** de mettre à jour
-le veilleur. Une vieille exécution ne peut pas remplacer un relevé plus
+conserve dans `ci_disk_state` (migrations additives 0539 et 0540) le dernier
+relevé par dépôt, VM et volume. Appliquer les migrations **avant** de mettre
+à jour le veilleur. Une vieille exécution ne peut pas remplacer un relevé plus
 récent. Une lecture ratée ne crée pas de faux relevé sain.
 
 `ci_disk_low` utilise `resources.disk_warnings`, donc les seuils des fiches
@@ -70,19 +70,22 @@ les noms Host correspondent aux labels du workflow. Une sonde absente ou
 vieille de plus de deux heures lève `ci_disk_unreadable`. Avec la sonde
 horaire à :17, une seule exécution manquée peut déclencher cette alerte. Une
 VM vue pour la première fois (`expect_disk`) a **deux heures de grâce** après
-sa première apparition avant que l'absence de première mesure n'alerte ; une
-mesure déjà reçue puis devenue vieille alerte toujours. Un dernier relevé bas
-reste signalé même quand il devient ancien ; seul un relevé sain plus récent
-résout le rouge. Les alertes ont une identité stable par VM et volume,
-indépendante du numéro de run.
+sa **première** apparition (`first_seen_at`, stable) avant que l'absence de
+première mesure n'alerte : la grâce ne se renouvelle pas à chaque collecte,
+donc une VM qui reste dans les jobs sans jamais produire de sonde alerte bien
+au bout de deux heures. Une mesure déjà reçue puis devenue vieille alerte
+toujours. Un dernier relevé bas reste signalé même quand il devient ancien ;
+seul un relevé sain plus récent résout le rouge. Les alertes ont une identité
+stable par VM et volume, indépendante du numéro de run.
 
 Une VM retirée de la matrice du workflow (labels) cesse d'apparaître dans les
 jobs lus. Sa ligne est **oubliée après 24 h** sans réapparition, avec ses
-alertes. Une lecture GitHub ratée n'appelle pas `collect`, donc n'oublie
-rien ; un job encore en file repousse la date de dernière apparition
-(`seen_at`), et un simple échec de sonde garde les dernières mesures basses
-au lieu de les effacer. Rien n'est oublié tant qu'aucun nom de job n'a été
-lu.
+alertes. La grâce lit `first_seen_at` (première apparition, stable) ;
+l'oubli lit `seen_at` (dernière apparition, rafraîchie à chaque job vu).
+Une lecture GitHub ratée n'appelle pas `collect`, donc n'oublie rien ; un job
+encore en file repousse la date de dernière apparition, et un simple échec de
+sonde garde les dernières mesures basses au lieu de les effacer. Rien n'est
+oublié tant qu'aucun nom de job n'a été lu.
 
 Ne pas installer `hosts --publish`, de DSN central ou de clé SSH nouvelle
 sur les VM CI pour cette surveillance (direction mesh-design, 03/11/2026,
