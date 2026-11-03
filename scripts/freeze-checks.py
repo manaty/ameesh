@@ -66,6 +66,11 @@ CHECKS = (
     # #1060 : chaque type d'alerte littéral est déclaré
     ("alert types #1060", ["-m", "unittest", "-q",
                            "tests.test_1060_alert_types.AlertTypesDeclaredTest"]),
+    # #5555 : un `DISTINCT ON` sur quota_gauge_readings hors du seek de
+    # `_gauge_heads` trie tout l'historique (19 s/appel, central à 98 % CPU,
+    # revue de #5466 passée à côté) : refusé au gel, pas seulement en CI.
+    ("jauges DISTINCT ON #5555", ["-m", "unittest", "-q",
+                                  "tests.test_5555_gauge_plans.GaugeDistinctOnGuardTest"]),
     # L161a : un module qui lit docs/ ou site/ est déclaré lecteur de la doc
     ("doc readers L161a", ["-m", "unittest", "-q",
                            "tests.test_l161a_ci_sans_code.ReadersTest"]),

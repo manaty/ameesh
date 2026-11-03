@@ -182,6 +182,37 @@ ameesh attach <agent> [--wait] [--ttl S]
 Interactive session on the agent's lease, same session. `--wait` waits for the
 end of a running turn; `--ttl` sets the lease duration.
 
+## Refusal proof: `ameesh refusal emit`
+
+```
+ameesh refusal emit --reason "…" [--file FILE]
+```
+
+A harness that refuses a turn **before any provider request** (no credential,
+a quota already exhausted, a policy stop) can say so positively, so that the
+runner releases the turn's budget reservation instead of keeping it (`kept`)
+as an uncertain outcome. For every turn the runner prepares a private skeleton
+— schema `ameesh-refusal/1`, harness, a fresh per-turn token, the turn id — in
+the agent's state directory (mode 0600) and exports its path as
+`AMEESH_REFUSAL_FILE`. Before issuing any provider request, the harness — or
+the wrapper that drives it — runs `ameesh refusal emit --reason "…"`: the
+command validates the skeleton, rewrites that same file atomically with the
+reason, and exits 0. It opens no database and makes no provider call.
+
+The harness then exits with the reserved code declared by its descriptor (`86`
+in the shipped ones). The runner releases the reservation only when the proof
+is valid **and** the process exited on its own with exactly that code, wrote
+no stream line and no usage, and was not interrupted; anything else stays
+`kept`. Qualification is narrow: only `claude`, `codex` and `deepseek`, each
+with its own stream format (`claude-stream-json`, `codex-json`, `dsh-json`),
+are honoured. A host-configured `stream = "text"` command, or a descriptor
+without a `refusal` block, never qualifies and its marker is ignored. The
+reason is one printable line of at most 500 characters; a missing
+`AMEESH_REFUSAL_FILE`, an invalid or symlinked skeleton, or an empty reason is
+refused with exit 1 without writing. See
+[Budgets and cost](../concepts/budgets.md#daily-envelope-per-billing-account)
+for the reservation lifecycle.
+
 ## Observability
 
 ```
@@ -722,6 +753,68 @@ only.
 identity (`AGENT_MAIL_NAME`, or a session binding), else `inconnu` with a
 warning — never an empty actor. `work delegate` keeps its meaning (`--actor`
 is the delegator).
+
+### Runner, pilot and reviewer subcommands
+
+These subcommands are part of `ameesh work`, but a lot's author rarely calls
+them: the runner, the elected pilots, the reviewers and the watch role do.
+The full options are under `ameesh work <subcommand> --help`; the syntax
+below is the real one at this version.
+
+```
+ameesh work branch <id> [BRANCH] [--target TARGET] [--detach --reason R] [--actor A]
+        # record the lot's branch and target (L118); --detach removes it from the lot, Git untouched
+ameesh work coherence [--project P] [--repo DIR] [--apply] [--actor A] [--json]
+        # backlog coherence pass: already done, obsolete, duplicates, contradictions; --apply closes the deterministic ones and sends one digest
+ameesh work device-gates [--apply] [--json] [--actor A]
+        # blocked lots waiting for a session on a declared-unavailable device (canon §12); --apply lifts the gate (trace, verification lot, previous state)
+ameesh work external-executor <id> [AGENT] [--clear] [--json] [--actor A]
+        # reserve the lot for an external executor (a registered `externe` agent, or human:<id>), or clear the reservation
+ameesh work fingerprint open --app APP --key KEY --title TITLE [--users N] [--count N] [--route R] [--code C] [--revision R] [--json]
+        # one lot per server-failure fingerprint (canon §16); idempotent, a recurrence lot after a closed one, P1 as soon as a user is touched
+ameesh work fire <id> [--sha SHA] [--withdraw] [--repo R] [--exception incident|unblock --reason R] [--note N] [--json] [--actor A]
+        # the fire, given at the freeze: open the PR and merge the frozen head once the verdicts and CI are green (canon §2); --withdraw disarms it, --exception declares a direct merge outside the packet
+ameesh work fixes-owed [AGENT] [--all] [--json]
+        # the fixes still owed after a blocking verdict: an open lot whose latest freeze carries the block, with no later freeze
+ameesh work footprint <id> [--set PATH… | --clear | --clear-diff | --estimate | --refresh] [--repo R] [--json] [--actor A]
+        # the lot's footprint (files or modules it touches); the scheduler never gives two overlapping lots of one repository
+ameesh work footprint-policy [APP] [--unknown repository|open] [--max-in-flight N | --no-cap] [--shared PATH… | --no-shared] [--json] [--actor A]
+        # repository footprint policy (pilot gesture): unknown footprint, in-flight cap, shared paths ignored for overlap
+ameesh work issue-ref <id> [REF | --none] [--json] [--actor A]
+        # correct the lot's GitHub issue reference (owner/repo#N), journaled
+ameesh work landing <id> [--vehicle LOT] [--until YYYY-MM-DD] [--clear] [--actor A] [--json]
+        # declare the planned landing of a done lot on a package vehicle, or clear it
+ameesh work links <id> [--add LOT | --remove LOT | --decide LOT] --kind duplicates|supersedes|part_of|conflicts_with [--decision TEXT] [--json] [--actor A]
+        # typed links between lots; --decide records the decision taken on a conflict
+ameesh work neighbors --title TITLE [--body BODY] [--app APP] [--reviewed-head SHA] [--repo DIR] [--json]
+        # read-only preview of the lots already touching the constat (same file, close title, line changed since the reviewed head)
+ameesh work pending-reviews [AGENT] [--all] [--json]
+        # the reviews an agent still owes: open lots whose latest freeze designates it without a verdict of its own on that head
+ameesh work prevalidate <lot> --sha SHA --plan PLAN --host HOST [--profile P] [--base B] [--repo DIR] [--published-ref REF] [--json]
+        # run the L161f test plan on a candidate head in a VM agent before the freeze; never the owner's workstation
+ameesh work return <id> [--reason R] [--actor A]
+        # hand a lot back to the queue (the assignee, a human or a pilot); branch, head, freezes and verdicts stay
+ameesh work reviewer <id> [AGENT] [--remove] [--no-verdict] [--floor N] [--reason R] [--actor A]
+        # designate (or remove) a reviewer of a lot already in qa, without a build/qa round trip; --no-verdict marks the verdict unnecessary
+ameesh work reviewers <id> [--apply] [--if-corrector AGENT] [--json]
+        # read the automatic reviewer designation of the latest freeze, or retry it outside the freeze hook (recovery)
+ameesh work set-priority <id> {1,2,3} --reason REASON [--json] [--actor A]
+        # change the priority (1 high, 2 normal, 3 low), journaled
+ameesh work set-type <id> {bug,evolution} [--json] [--actor A]
+        # retype the lot, journaled; a basket `improvement` can only be left
+ameesh work wake <id> [--at TIME | --in DURATION | --cancel] [--why TEXT] [--actor A]
+        # arm, replace or cancel a scheduled wake: the runner wakes the assignee at the deadline, even under a hold or in waiting_human/blocked
+ameesh work wip [--apply] [--limit N] [--json] [--actor A]
+        # return the lots above an agent's WIP cap (canon §4), least recently active first; --apply writes, otherwise a dry run
+```
+
+Several of these are read-only unless the option that writes is given:
+`coherence`, `reviewers` and `wip` need `--apply`, `footprint` and
+`footprint-policy` their named option; `neighbors`, `pending-reviews` and
+`fixes-owed` only report. `set-priority`, `set-type`, `issue-ref` and
+`reviewer` are reserved to a human, an orchestrator or a design agent, and
+`fire` is the pilot's merge gesture (canon §2); every write is journaled in
+the lot.
 
 ### CI of a lot: `ameesh ci`
 

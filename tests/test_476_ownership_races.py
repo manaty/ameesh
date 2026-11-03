@@ -42,15 +42,19 @@ class OwnershipRaceTest(unittest.TestCase):
             code = ("import os,signal,time; from pathlib import Path\n"
                     "pid=os.fork()\n"
                     "if not pid:\n"
-                    " signal.signal(signal.SIGUSR1,lambda *_:os.setsid())\n"
-                    " signal.signal(signal.SIGUSR2,lambda *_:Path(%r).touch())\n"
+                    # Consume commands synchronously, without deferred Python handlers.
+                    " signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGUSR1,signal.SIGUSR2})\n"
                     # #843 : renommage atomique : un write_text laisse le
                     # fichier visible (exists) avant d'avoir écrit le PID,
                     # et le lecteur lit une chaîne vide (CI run 38370053962).
                     " pidfile=Path(%r); tmp=pidfile.with_name(pidfile.name+'.tmp')\n"
                     " tmp.write_text(str(os.getpid()))\n"
                     " os.replace(tmp, pidfile)\n"
-                    "time.sleep(60)\n") % (str(resumed), str(ready))
+                    " signal.sigwait({signal.SIGUSR1})\n"
+                    " os.setsid()\n"
+                    " signal.sigwait({signal.SIGUSR2})\n"
+                    " Path(%r).touch()\n"
+                    "while True: signal.pause()\n") % (str(ready), str(resumed))
             parent = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
             child, handle = None, None
             try:
