@@ -55,10 +55,22 @@ class TmpPathTest(PgTestCase):
         if not isinstance(self.db, db_mod.PsycopgDriver):
             self.skipTest("EXPLAIN is wrapped by the psql driver")
         self.db.execute("DELETE FROM housekeeping_log")
+        # #5599 : le remplissage prépare, il ne mesure pas. Sous la charge du
+        # banc, 500 000 lignes à travers le trigger `ameesh_agent_spelling` et
+        # les index du journal dépassaient le statement_timeout (44 s pour
+        # 30 s) : trigger coupé le temps du remplissage (#3941), délai levé
+        # pour cette instruction (#4822).
         self.db.execute(
-            "INSERT INTO housekeeping_log (host, at, actor, kind, action, path)"
-            " SELECT 'h1', now() - g * interval '1 second', 'test', 'tmp',"
-            " 'signaled', '/tmp/p' || (g % 2000) FROM generate_series(1, 500000) g")
+            "ALTER TABLE housekeeping_log DISABLE TRIGGER ameesh_agent_spelling")
+        try:
+            db_mod.execute_without_statement_timeout(
+                self.db,
+                "INSERT INTO housekeeping_log (host, at, actor, kind, action, path)"
+                " SELECT 'h1', now() - g * interval '1 second', 'test', 'tmp',"
+                " 'signaled', '/tmp/p' || (g % 2000) FROM generate_series(1, 500000) g")
+        finally:
+            self.db.execute(
+                "ALTER TABLE housekeeping_log ENABLE TRIGGER ameesh_agent_spelling")
         hk = storage.of(self.db).housekeeping
         hk.log("h1", [{"kind": "tmp", "action": "unowned", "path": "/tmp/keep"},
                       {"kind": "tmp", "action": "over_quota", "path": "/tmp/gone"},

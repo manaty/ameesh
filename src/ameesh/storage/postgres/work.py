@@ -951,6 +951,16 @@ class WorkItems(interface.WorkItems):
         exclut toujours, et un candidat qui a déjà `max_attempts` tentatives
         n'est plus sélectionné (traitement borné, jamais perpétuel).
 
+        #5582 : les barrières bon marché (état, anti-jointure du lot de
+        # relecture, marque terminale) sont **matérialisées** avant le jalon de
+        # fusion et les compteurs. Sans cela le planificateur partait du
+        # balayage des jalons `merged` depuis la borne (2 700 au central) et
+        # évaluait `agent_mesh_merged_annulled` deux fois par jalon, plus un
+        # parcours d'événements par lot pour la marque terminale et les
+        # tentatives : 3,7 s par appel. La CTE `MATERIALIZED` est une clôture
+        # d'optimisation : `since`/`annulled` et le compteur ne s'exécutent que
+        # sur les candidats qui passent déjà les barrières bon marché.
+
         Le filtre lui-même (`_missing_ref_gates`) est partagé avec
         `missing_ref_eligible`, pour qu'un lot donné reçoive la même vérité que
         le balayage (B1 de la R1 #1104)."""
@@ -959,13 +969,19 @@ class WorkItems(interface.WorkItems):
             return []
         params: list = list(wanted)
         sql = (
+            "WITH candidats AS MATERIALIZED ("
             "SELECT __COLUMNS__ FROM work_items w"
             " WHERE w.state IN (__STATES__)"
-            + self._missing_ref_gates(
-                params, ref_prefix=ref_prefix, attempt_prefix=attempt_prefix,
-                retry_s=retry_s, terminal_prefix=terminal_prefix,
+            + self._missing_ref_pre_gates(
+                params, ref_prefix=ref_prefix, terminal_prefix=terminal_prefix,
+                since=since)
+            + ") SELECT * FROM candidats w WHERE true"
+            + self._missing_ref_late_gates(
+                params, attempt_prefix=attempt_prefix, retry_s=retry_s,
                 max_attempts=max_attempts, since=since)
-            + " ORDER BY w.updated_at DESC, w.id DESC LIMIT %s"
+            # la CTE ne rend que les colonnes de `item_columns` : `updated_ts`
+            # est l'époque de `updated_at`, de même ordre exact (microseconde).
+            + " ORDER BY w.updated_ts DESC, w.id DESC LIMIT %s"
         )
         params.append(int(limit))
         return self.db.query(
@@ -974,20 +990,49 @@ class WorkItems(interface.WorkItems):
             tuple(params))
 
     @staticmethod
-    def _missing_ref_gates(params: list, *, ref_prefix, attempt_prefix="",
-                           retry_s=0, terminal_prefix="", max_attempts=0,
-                           since=None) -> str:
-        """L539 (#1104) : les conditions « relecture encore due » d'un lot.
+    def _missing_ref_pre_gates(params: list, *, ref_prefix,
+                               terminal_prefix="", since=None) -> str:
+        """#5582 : les barrières bon marché de la sélection, matérialisées.
 
-        Rendues en SQL pour être ajoutées après `WHERE …, ` et complète
-        `params` dans l'ordre du texte produit — le même filtre sert au
-        balayage borné (`items_missing_ref`) et à un lot donné
-        (`missing_ref_eligible`)."""
+        L'anti-jointure du lot de relecture (`ref_prefix`), la marque terminale
+        et l'**existence** d'un jalon `merged` depuis la borne se lisent par
+        index, sans relire le journal pour l'annulation. Elles réduisent les
+        ~2 700 jalons `merged` du central à la poignée de candidats encore dus.
+        La marque terminale est un compteur (`= 0`) et non un `NOT EXISTS` :
+        le planificateur ne peut pas la replier en anti-jointure de hachage qui
+        balaierait tout `work_item_events` (garde de plan #5582) ; elle passe
+        par l'index `(work_item_id, split_part(note, ' ', 1))`."""
         sql = (
             "   AND NOT EXISTS (SELECT 1 FROM work_items r"
             "                    WHERE r.issue_ref = %s || w.id::text)"
         )
         params.append(str(ref_prefix))
+        if terminal_prefix:
+            sql += (
+                "   AND (SELECT count(*) FROM work_item_events e"
+                "         WHERE e.work_item_id = w.id"
+                "           AND split_part(e.note, ' ', 1) = %s || w.id::text) = 0"
+            )
+            params.append(str(terminal_prefix))
+        if since is not None:
+            sql += (
+                "   AND EXISTS (SELECT 1 FROM work_item_milestones m"
+                "                WHERE m.work_item_id = w.id AND m.kind = 'merged'"
+                "                  AND m.at >= %s)"
+            )
+            params.append(since)
+        return sql
+
+    @staticmethod
+    def _missing_ref_late_gates(params: list, *, attempt_prefix="", retry_s=0,
+                                max_attempts=0, since=None) -> str:
+        """#5582 : les barrières coûteuses, après la matérialisation.
+
+        Le jalon de fusion effectif (`since` + `agent_mesh_merged_annulled`)
+        et le compteur de tentatives ne s'évaluent que sur les candidats
+        retenus par `_missing_ref_pre_gates` — jamais sur tous les jalons
+        depuis la borne (constat #5579)."""
+        sql = ""
         if since is not None:
             sql += (
                 "   AND EXISTS (SELECT 1 FROM work_item_milestones m"
@@ -996,13 +1041,6 @@ class WorkItems(interface.WorkItems):
                 "                  AND " + _effective_merged("m") + ")"
             )
             params.append(since)
-        if terminal_prefix:
-            sql += (
-                "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
-                "                    WHERE e.work_item_id = w.id"
-                "                      AND split_part(e.note, ' ', 1) = %s || w.id::text)"
-            )
-            params.append(str(terminal_prefix))
         if attempt_prefix:
             if int(max_attempts) > 0:
                 sql += (
@@ -1020,6 +1058,25 @@ class WorkItems(interface.WorkItems):
                 )
                 params += [str(attempt_prefix), float(retry_s)]
         return sql
+
+    @classmethod
+    def _missing_ref_gates(cls, params: list, *, ref_prefix,
+                           attempt_prefix="", retry_s=0, terminal_prefix="",
+                           max_attempts=0, since=None) -> str:
+        """L539 (#1104) : les conditions « relecture encore due » d'un lot.
+
+        Rendues en SQL pour être ajoutées après `WHERE …, ` et complète
+        `params` dans l'ordre du texte produit. Même vérité pour un lot donné
+        (`missing_ref_eligible`, une ligne) que pour le balayage
+        (`items_missing_ref`, qui matérialise les barrières bon marché avant
+        les coûteuses — #5582)."""
+        return (
+            cls._missing_ref_pre_gates(
+                params, ref_prefix=ref_prefix,
+                terminal_prefix=terminal_prefix, since=since)
+            + cls._missing_ref_late_gates(
+                params, attempt_prefix=attempt_prefix, retry_s=retry_s,
+                max_attempts=max_attempts, since=since))
 
     def missing_ref_eligible(self, item_id, *, ref_prefix, attempt_prefix="",
                              retry_s=0, terminal_prefix="", max_attempts=0,
