@@ -59,7 +59,8 @@ récent. Une lecture ratée ne crée pas de faux relevé sain.
 `ci_disk_low` utilise `resources.disk_warnings`, donc les seuils des fiches
 Host du mesh (défauts 85 % utilisés ou moins de 15 Gio libres). Vérifier que
 les noms Host correspondent aux labels du workflow. Une sonde absente ou
-vieille de plus de trois heures lève `ci_disk_unreadable`. Un dernier
+vieille de plus de deux heures lève `ci_disk_unreadable`. Avec la sonde
+horaire à :17, une seule exécution manquée peut déclencher cette alerte. Un dernier
 relevé bas reste signalé même quand il devient ancien ; seul un relevé sain
 plus récent résout le rouge. Les alertes ont une identité stable par VM et
 volume, indépendante du numéro de run.

@@ -43,6 +43,7 @@ postgres » du lot ne tient donc pas ; `rapport --complet` dit où va le disque
 soit.
 
 Usage :
+  scripts/ci-disque.py mesure --host <label-machine>
   scripts/ci-disque.py rapport [--complet] [--seuil-gib N]
   scripts/ci-disque.py menage [--dry-run] [--force] [--images-inutilisees]
 """

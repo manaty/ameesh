@@ -4675,6 +4675,10 @@
     "upsert_models"
    ],
    "ci": [
+    "disks",
+    "expect_disk",
+    "observe_disk",
+    "prune_disks",
     "add_failure",
     "base_failures",
     "claim_guard_scan",
