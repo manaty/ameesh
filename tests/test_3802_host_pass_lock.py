@@ -299,7 +299,8 @@ class HostPassBudgetTest(unittest.TestCase):
                     "others_total": 0}
 
         started = time.monotonic()
-        with mock.patch.object(hk, "reap_containers", side_effect=slow):
+        with mock.patch.object(hk, "reap_containers", side_effect=slow), \
+             mock.patch("ameesh.storage.postgres.menage.Housekeeping.purge_retention"):
             report = hk.run_pass(self.cfg, object(), self.policy, host="pc",
                                  actor="test", artifact_scan=False, budget_s=0.4)
         elapsed = time.monotonic() - started

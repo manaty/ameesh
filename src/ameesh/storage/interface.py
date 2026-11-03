@@ -4981,8 +4981,12 @@ class Housekeeping(Domain):
     @abc.abstractmethod
     def log(self, host: str, entries: Sequence[dict], *, actor: str) -> int:
         """Ajoute des lignes au journal (clés : kind, action, path, bytes,
-        agent, lot, detail, data) ; rend le nombre de lignes écrites. Élague
-        les lignes de plus de 30 jours."""
+        agent, lot, detail, data) ; rend le nombre de lignes écrites."""
+
+    @abc.abstractmethod
+    def purge_retention(self) -> None:
+        """Élague les lignes de plus de 30 jours, une fois par passage
+        effectif de ménage (jamais lors de chaque écriture du journal)."""
 
     @abc.abstractmethod
     def recent(self, host: str | None, since_s: float, limit: int = 50,

@@ -144,3 +144,4 @@ test_5022_cache_measure  # storage: retained shared-cache entries and partial me
 test_5046_deps_policy  # #5046: nm host policy and actual deletion journal through both drivers
 
 test_5411_requetes_lourdes  # stockage : index 0533, measure_candidates borné et séries de soldes agrégées, sous les deux pilotes (#5411)
+test_5588_housekeeping_retention  # #5588: journal writes and 30-day retention through both drivers
