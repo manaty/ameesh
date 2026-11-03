@@ -25,9 +25,9 @@ Deux gardes, complémentaires :
   pas revenir sans faire rougir les tests ;
 * un témoin de sélection : un jalon `merged` annulé par une correction
   `merged → build` ne rend pas un lot dû, une refusion postérieure le rend ;
-* un témoin négatif : la requête d'avant #5582 (toutes les barrières dans un
-  seul `WHERE`, sans `MATERIALIZED`) est refusée par la même garde — elle
-  évalue l'annulation sur les 2 700 jalons depuis la borne.
+* des témoins négatifs synthétiques soumettent chaque défaut de plan à la
+  même garde, sans dépendre du plan choisi pour une ancienne requête : les
+  statistiques peuvent améliorer ce dernier sans régression (#5650).
 """
 from __future__ import annotations
 
@@ -37,7 +37,6 @@ import os
 import unittest
 
 from ameesh import db as db_mod, review_lot, storage, work
-from ameesh.storage.postgres.work import item_columns
 
 from .support import PgTestCase, SRC
 
@@ -113,9 +112,9 @@ def _buffers(measured) -> int:
 def _plan_problems(roots, measured) -> list[str]:
     """Les violations de la garde de plan (#5582, #5606).
 
-    Une assertion unique : liste vide = plan conforme. Le témoin négatif de
-    `test_le_plan_ne_balaye_pas_le_journal_et_borne_l_annulation` applique la
-    même garde à la requête d'avant #5582 et attend une liste non vide.
+    Une assertion unique : liste vide = plan conforme. Les témoins
+    synthétiques de ReviewCatchUpPlanControlTest vérifient chaque refus,
+    indépendamment des statistiques du planificateur (#5650).
     """
     problems: list[str] = []
     scans = _seq_scans(roots, EVENTS)
@@ -132,6 +131,46 @@ def _plan_problems(roots, measured) -> list[str]:
     elif buffers >= MAX_PLAN_BUFFERS:
         problems.append("%d tampons >= %d" % (buffers, MAX_PLAN_BUFFERS))
     return problems
+
+
+class ReviewCatchUpPlanControlTest(unittest.TestCase):
+    """#5650 : la garde refuse chaque défaut sans planificateur ni base.
+
+    Le plan large observé avant #5582 n'est pas garanti : de nouvelles
+    statistiques peuvent améliorer l'ancienne requête. Les plans ci-dessous
+    isolent chaque défaut ; le plan réel reste contrôlé dans le test DB.
+    """
+
+    def test_un_plan_borne_est_accepte(self):
+        node = {"Node Type": "Index Scan", "Relation Name": EVENTS,
+                "Shared Hit Blocks": 1}
+        self.assertEqual(_plan_problems([node], {"Plan": node}), [])
+
+    def test_chaque_defaut_de_plan_est_refuse(self):
+        cases = (
+            ({"Node Type": "Seq Scan", "Relation Name": EVENTS},
+             "Seq Scan du journal"),
+            ({"Node Type": "Parallel Seq Scan", "Relation Name": EVENTS},
+             "Seq Scan du journal"),
+            ({"Node Type": "Index Scan", "Filter": ANNULLED + "(id)",
+              "Actual Rows": BROAD_ROWS, "Actual Loops": 1},
+             "annulation sur un balayage"),
+            ({"Node Type": "Index Scan", "Join Filter": ANNULLED + "(id)",
+              "Actual Rows": 1, "Actual Loops": BROAD_ROWS},
+             "annulation sur un balayage"),
+            ({"Shared Hit Blocks": MAX_PLAN_BUFFERS}, "tampons >="),
+            ({"Shared Hit Blocks": 0}, "tampons absents du plan"),
+        )
+        for defect, expected in cases:
+            with self.subTest(defect=defect):
+                node = {"Node Type": "Result", "Shared Hit Blocks": 1}
+                node.update(defect)
+                # Un enfant exerce aussi la traversée des plans imbriqués.
+                problems = _plan_problems(
+                    [{"Node Type": "Result", "Plans": [node]}],
+                    {"Plan": node})
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(expected, problems[0])
 
 
 class ReviewCatchUpPlanDbTest(PgTestCase):
@@ -247,30 +286,6 @@ class ReviewCatchUpPlanDbTest(PgTestCase):
         self.assertIn("MATERIALIZED", captured["sql"], captured["sql"])
         return captured["sql"], captured["params"], rows
 
-    def _legacy_selection(self):
-        """La requête d'avant #5582 : toutes les barrières dans un seul WHERE.
-
-        Même filtre (`_missing_ref_gates`), sans la clôture `MATERIALIZED`
-        posée par #5582 : c'est la forme dont le plan évaluait l'annulation sur
-        les 2 700 jalons depuis la borne (#5579). Elle sert de témoin négatif
-        à la garde, sans être une seconde implémentation du filtre.
-        """
-        wanted = [str(state) for state in work.MERGED_STATES]
-        params: list = list(wanted)
-        gates = storage.of(self.db).work._missing_ref_gates(
-            params, ref_prefix=review_lot.PREFIX + "#",
-            attempt_prefix=review_lot.ATTEMPT_PREFIX,
-            retry_s=review_lot.ATTEMPT_RETRY_S,
-            terminal_prefix=review_lot.TERMINAL_PREFIX,
-            max_attempts=review_lot.CATCH_UP_MAX_ATTEMPTS,
-            since=self.bound)
-        sql = ("SELECT %s FROM work_items w WHERE w.state IN (%s)%s"
-               " ORDER BY w.updated_at DESC, w.id DESC LIMIT %%s"
-               % (item_columns(self.db, "w"),
-                  ", ".join(["%s"] * len(wanted)), gates))
-        params.append(int(review_lot.CATCH_UP_LIMIT))
-        return sql, tuple(params)
-
     def _plan(self, sql, params):
         """Plan réel, sous psycopg (le pilote psql enveloppe `EXPLAIN`).
 
@@ -314,22 +329,6 @@ class ReviewCatchUpPlanDbTest(PgTestCase):
             "garde de plan #5582/#5606 (borne %d tampons ; plan d'origine "
             "sans les index 0538 : 113 481) :\n%s"
             % (MAX_PLAN_BUFFERS, json.dumps(roots, indent=1)))
-
-        # Témoin négatif : la requête d'avant #5582, sans MATERIALIZED, rend
-        # les mêmes lots mais évalue l'annulation sur les 2 700 jalons. Avec
-        # les index 0538 elle ne dépasse plus la borne de tampons (27 382) ;
-        # c'est la garde de lignes qui la refuse encore, et c'est elle qui
-        # porte le correctif sur le central (#5579, 3,7 s).
-        legacy_sql, legacy_params = self._legacy_selection()
-        legacy_rows = self.db.query(legacy_sql, legacy_params)
-        self.assertEqual([int(row["id"]) for row in legacy_rows],
-                         list(self.MISSING),
-                         "le témoin négatif doit rendre les mêmes manquants")
-        legacy_roots, legacy = self._plan(legacy_sql, legacy_params)
-        self.assertNotEqual(
-            _plan_problems(legacy_roots, legacy), [],
-            "le témoin négatif (requête d'avant #5582) doit être refusé par "
-            "la même garde ; sinon elle ne prouve rien")
 
     def test_les_index_du_journal_sont_presents(self):
         """La migration additive 0538 pose les deux index de la lecture."""
