@@ -15,7 +15,8 @@ Deux gardes, complémentaires :
   borne) : aucun `Seq Scan` de `work_item_events`, et le filtre
   `agent_mesh_merged_annulled` n'est jamais appliqué à un nœud qui lit des
   centaines de jalons — seulement aux candidats qui passent les barrières
-  bon marché. L'exécution reste sous 100 ms ;
+  bon marché. L'exécution reste sous 1 s (garde-fou grossier : la preuve
+  est la forme du plan, le temps mesuré dépend de la charge du runner) ;
 * une garde statique qui refuse de replier les barrières coûteuses dans la
   sélection matérialisée (`_missing_ref_pre_gates`) et exige la clôture
   `MATERIALIZED` dans `items_missing_ref` : la forme qui a coûté 3,7 s ne peut
@@ -41,8 +42,10 @@ BOUND_DAYS = 17
 #: au-delà, le nœud qui porte l'annulation lit un balayage, pas une poignée de
 #: candidats (le central en compte 2 700 depuis la borne).
 BROAD_ROWS = 500
-#: borne d'exécution du constat #5579 (3,7 s avant correctif).
-MAX_MS = 100.0
+#: borne d'exécution du constat #5579 (3,7 s avant correctif). Garde-fou
+#: grossier : la forme du plan est la preuve ; à 100 ms, une part psycopg
+#: chargée (8 jobs par hôte) a mesuré 142 ms (run 41609560517, #5626).
+MAX_MS = 1000.0
 
 
 # -- plan -------------------------------------------------------------------
