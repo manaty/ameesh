@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#5630 — transport des mesures disque via GitHub, aucun accès aux VM.
+
+Seul le workflow dédié sur la branche de base est lu. Une annotation de PR
+ne peut pas résoudre une alerte. Chaque mesure est liée au job de sa VM et
+à sa date de fin, pas à la date de lecture du veilleur.
+"""
+from __future__ import annotations
+
+import json
+import re
+from urllib.parse import quote
+
+from . import resources
+
+WORKFLOW = 'ci-disque.yml'
+SCHEMA = 'ameesh-ci-disk/1'
+MAX_AGE = 3 * 3600
+READ_INTERVAL = 300
+HOST = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
+
+
+def annotation(row, host):
+    if row.get('title') != SCHEMA:
+        return None
+    try:
+        data = json.loads(row.get('message') or '')
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get('schema') != SCHEMA or data.get('host') != host:
+        return None
+    free, total = data.get('free_bytes'), data.get('total_bytes')
+    if (data.get('volume') != '/' or type(free) is not int or type(total) is not int
+            or not 0 <= free <= total or not 0 < total < 2**63):
+        return None
+    return dict(host=host, volume='/', free_bytes=free, total_bytes=total)
+
+
+def collect(api, repo, branch, store):
+    """Au plus 5 runs / 100 jobs / 100 annotations par job, sur la base seule.
+
+    Un job en attente est enregistré sans mesure. Une mesure absente ou
+    illisible ne remplace jamais une mesure acquise par un faux vert.
+    """
+    from .ci import _iso_ts
+    runs = api('repos/%s/actions/workflows/%s/runs?branch=%s&per_page=5'
+               % (repo, WORKFLOW, quote(branch, safe=''))) or {}
+    candidates = [r for r in runs.get('workflow_runs', ())
+                  if r.get('head_branch') == branch
+                  and r.get('event') in ('schedule', 'workflow_dispatch')]
+    # Lire les deux plus récentes : le nouveau run en file ne masque pas
+    # les mesures acquises par le précédent.
+    for run in sorted(candidates, key=lambda r: int(r['id']), reverse=True)[:2]:
+        jobs = api('repos/%s/actions/runs/%s/jobs?per_page=100' % (repo, run['id'])) or {}
+        for job in jobs.get('jobs', ()):
+            name = str(job.get('name') or '')
+            host = name.removeprefix('disque ')
+            if not name.startswith('disque ') or not HOST.fullmatch(host):
+                continue
+            store.expect_disk(repo, host=host, volume='/')
+            sampled = _iso_ts(job.get('completed_at'))
+            if job.get('conclusion') != 'success' or sampled is None:
+                continue
+            # Checks API : identifiant du check lié au job, jamais une URL
+            # arbitraire fournie par le contenu de l'annotation.
+            match = re.fullmatch(r'https://api.github.com/repos/%s/check-runs/(\d+)'
+                                 % re.escape(repo), str(job.get('check_run_url') or ''))
+            if not match:
+                continue
+            rows = api('repos/%s/check-runs/%s/annotations?per_page=100'
+                       % (repo, match[1])) or []
+            for row in rows:
+                data = annotation(row, host)
+                if data is not None:
+                    store.observe_disk(repo, run_id=int(run['id']), sampled_ts=sampled, **data)
+
+
+def findings(rows, canons, now):
+    """Seuils physiques des Hosts ; une mesure saine seule résout le rouge."""
+    out = []
+    for row in rows:
+        host, repo = row['host'], row['repo']
+        sampled = row.get('sampled_ts')
+        stale = sampled is None or now - sampled > MAX_AGE or sampled > now + 300
+        common = dict(agent=None, since=sampled, host=host, repo=repo,
+                      reason='%s:%s:%s' % (repo, host, row['volume']), run_id=row.get('run_id'))
+        if stale:
+            out.append(dict(common, type='ci_disk_unreadable', value=None, threshold=MAX_AGE,
+                            detail='CI disk %s (%s): no fresh disk annotation; inspect ci-disque.yml, '
+                                   'machine label and CI watcher' % (host, repo)))
+        limits = resources.host_limits(canons, host)['limits']
+        reading = {'volumes': [{'path': row['volume'], 'disk_free_bytes': row.get('free_bytes'),
+                                'disk_total_bytes': row.get('total_bytes')}]}
+        warnings = resources.disk_warnings(reading, limits)
+        if warnings:
+            warning = warnings[0]
+            by_free = 'free' in warning['reasons']
+            out.append(dict(common, type='ci_disk_low',
+                            value=row['free_bytes'] if by_free else warning['used'],
+                            threshold=limits['warn_disk_free'] if by_free else limits['warn_disk_used'],
+                            critical=warning['critical'], urgent=warning['critical'],
+                            detail='CI disk %s (%s) %s: %s bytes free, %.1f%% used%s; '
+                                   'check host retention timer (bureau)' % (
+                                       host, repo, row['volume'], row['free_bytes'],
+                                       100 * warnings[0]['used'],
+                                       ' (last known low measurement, stale)' if stale else '')))
+    return out

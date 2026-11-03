@@ -35,27 +35,38 @@ original. Le service a sa propre borne de 15 minutes. Le ménage docker garde
 les politiques existantes de #5325 ; les images étiquetées sans conteneur
 ne sont pas élaguées par cette passe (le workflow quotidien s'en charge).
 
-## Surveillance native du mesh
+## Surveillance via GitHub, sans identifiant nouveau sur les VM
 
-Utiliser l'échantillonneur existant `ameesh hosts --publish` (#2022/#5559),
-qui fonctionne sans runner d'agent et publie sous `publish@<hôte>`. Ne pas
-remplacer cette surveillance par les annotations des jobs.
+Le workflow `ci-disque.yml` s'exécute chaque heure et cible chacune des trois
+VM par son **label de machine**. Le bureau doit d'abord ajouter le label
+`ameesh-ci-1`, `ameesh-ci-2` ou `ameesh-ci-3` aux runners de la VM correspondante.
+Le nom du runner ne constitue pas automatiquement un label. Une matrice de
+slots sans affinité ne garantit pas de visiter chaque VM.
 
-Prérequis à préparer par le bureau avant activation : compte de service
-`ameesh`, installation versionnée sous `/opt/ameesh/venv`, configuration
-individuelle de l'hôte et accès à la base suivant le mécanisme de secrets
-habituel. Aucun DSN dans le checkout, dans le compte `runner` ou dans les
-journaux. La disponibilité de ces prérequis sur les VM CI doit être vérifiée
-par le bureau ; le script de rétention ne les crée pas.
+La commande `scripts/ci-disque.py mesure --host <label-machine>` ne fait qu'un
+`statvfs` et publie une notice `ameesh-ci-disk/1` contenant hôte, volume,
+octets libres, total et pourcentage utilisé. Elle publie aussi au vert pour
+permettre la résolution de l'alerte. Chaque job est borné à 3 minutes ; le
+service de rétention reste indépendant de ce workflow.
 
-Poser et activer les unités existantes
-`deploy/serveur/ameesh-releve-hote.{service,timer}` sur **chaque VM**. Vérifier
-la fiche Host (nom identique à config.json, volumes des runners inclus) et
-les seuils `warn_disk_used` / `warn_disk_free`. Sans surcharge, le mesh
-avertit à 85 % utilisés ou sous 15 Gio libres ; la tendance est aussi
-calculée sur les relevés. Lire `ameesh hosts --fleet` et les alertes : le
-relevé doit être frais et porter `publish@<hôte>`. Un échantillonneur muet
-est signalé par `host_unsampled`, y compris pour un hôte sans agent.
+Le veilleur GitHub d'ameesh lit les annotations via son accès existant,
+uniquement dans ce workflow sur la branche de base, jamais sur les PR. Il
+conserve dans `ci_disk_state` (migration additive 0539) le dernier relevé
+par dépôt, VM et volume. Appliquer la migration **avant** de mettre à jour
+le veilleur. Une vieille exécution ne peut pas remplacer un relevé plus
+récent. Une lecture ratée ne crée pas de faux relevé sain.
+
+`ci_disk_low` utilise `resources.disk_warnings`, donc les seuils des fiches
+Host du mesh (défauts 85 % utilisés ou moins de 15 Gio libres). Vérifier que
+les noms Host correspondent aux labels du workflow. Une sonde absente ou
+vieille de plus de trois heures lève `ci_disk_unreadable`. Un dernier
+relevé bas reste signalé même quand il devient ancien ; seul un relevé sain
+plus récent résout le rouge. Les alertes ont une identité stable par VM et
+volume, indépendante du numéro de run.
+
+Ne pas installer `hosts --publish`, de DSN central ou de clé SSH nouvelle
+sur les VM CI pour cette surveillance (direction mesh-design, 03/11/2026,
+messages #187442 et #187450). Les jobs de PR partagent ces machines.
 
 ## Qualification et retour
 
@@ -65,16 +76,19 @@ Avant et après pose, relever `df -B1 /`, `df -i /`, les tailles `_diag`,
 Répéter après une journée de CI ; comparer les octets libres et l'évolution
 des catégories, sans attribuer une croissance aux logs sans mesure.
 
+Après intégration, dispatcher `ci-disque.yml` sur la branche de base et
+vérifier trois jobs et trois relevés, puis les alertes et leur notification.
+
 Pour tester le trajet d'alerte sans remplir le disque : relever d'abord les
 seuils de la fiche Host, augmenter temporairement `warn_disk_free` au-dessus
-du libre réel d'une VM, publier un relevé et constater `host_disk_soon_full`
+du libre réel d'une VM, dispatcher la sonde sur la base et constater `ci_disk_low`
 et sa notification dans le mesh. Restaurer immédiatement les valeurs exactes
-et publier à nouveau. Répéter sur chaque VM ; ne pas changer les seuils
+et dispatcher à nouveau. Répéter sur chaque VM ; ne pas changer les seuils
 `min_disk_free` qui gouvernent la capacité. Ce témoin et le relevé à J+1 sont
 des gestes du bureau, après intégration de la configuration revue.
 
 Retour rétention :
 `sudo bash deploy/ci-flotte/install-disque.sh --remove`. Cela arrête la passe
 avant de retirer ses fichiers et conserve la configuration et les archives.
-Les jobs GitHub continuent leur ménage habituel. L'échantillonneur est
-indépendant : ne le désactiver qu'avec une surveillance de remplacement.
+Les jobs GitHub continuent leur ménage habituel. La sonde GitHub est
+indépendante : ne la désactiver qu'avec une surveillance de remplacement.
