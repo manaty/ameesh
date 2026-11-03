@@ -183,8 +183,11 @@ class Canon(interface.Canon):
         return bool(rows)
 
     def complete_sync(self, host, canon, token, signature) -> None:
+        # #5653: publish the completion time in the same guarded statement as
+        # the token/signature; it bounds the age of any later reuse.
         self.db.execute(
-            "UPDATE canon_state SET sync_completed_token = %s, sync_signature = %s "
+            "UPDATE canon_state SET sync_completed_token = %s, sync_signature = %s, "
+            "sync_completed_at = clock_timestamp() "
             "WHERE host = %s AND canon = %s AND sync_token = %s",
             (token, signature, host, canon, token))
 
@@ -206,8 +209,13 @@ class Canon(interface.Canon):
     def shared_sync(self, host, canon) -> dict | None:
         # #5493: a pending claim no longer hides the last completed result;
         # the caller still compares its signature with its own snapshot.
+        # #5653: `completed_age_s` is the age of that result, in seconds on
+        # the database clock (NULL: completion time unknown, never reusable
+        # until the next complete sync).
         rows = self.db.query(
-            "SELECT status, diagnostic, sync_signature FROM canon_state "
+            "SELECT status, diagnostic, sync_signature, "
+            "extract(epoch FROM clock_timestamp() - sync_completed_at)::float8 "
+            "AS completed_age_s FROM canon_state "
             "WHERE host = %s AND canon = %s AND sync_completed_token IS NOT NULL",
             (host, canon))
         return rows[0] if rows else None

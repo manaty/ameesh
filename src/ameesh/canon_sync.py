@@ -190,6 +190,13 @@ _DIAGNOSTIC_MAX = 4000
 #: Au-delà, on ne réessaie plus : l'état garde le commit le plus récent.
 _COMMIT_CAS_ATTEMPTS = 5
 
+#: #5653: a completed sync is reused only while it is at most this many
+#: `canon_sync_interval` old. A staging sequence restarts its units minutes
+#: apart (more than one interval, #5649) and still reuses; after a long stop
+#: of every runner on the host, the first restarted one pays a full sync
+#: instead of settling the host gate on an arbitrarily old canon.
+SYNC_REUSE_MAX_INTERVALS = 3
+
 
 class SpawnError(ValueError):
     pass
@@ -1536,6 +1543,17 @@ def _same(row: dict, values: dict) -> bool:
     return True
 
 
+def _reusable_completed(shared: dict | None, signature: str,
+                        max_age_s: float) -> bool:
+    """#5653: a completed result is reusable only for this exact snapshot and
+    while it is recent enough (`completed_age_s`, database clock). An unknown
+    completion time (row completed before migration 0541) is never reused."""
+    if shared is None or shared.get("sync_signature") != signature:
+        return False
+    age = shared.get("completed_age_s")
+    return age is not None and 0.0 <= float(age) <= max_age_s
+
+
 def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
                   on_incomplete=None, unsettled: bool = False) -> SyncReport | None:
     """#3963: one complete sync per host/canon/interval, without a long lock.
@@ -1564,6 +1582,12 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     `ok`: a transient failure does not force the next restarted unit to pay a
     full sync, and a failure that records `unreadable`/`invalid` still
     withdraws the result.
+
+    #5653: any reuse is bounded in age (`SYNC_REUSE_MAX_INTERVALS` x
+    `interval_s`): after a long stop of every runner on a host, the first one
+    to restart runs a new sync instead of settling the host gate on a result
+    of arbitrary age. A result whose completion time is unknown is never
+    reused (the next complete sync publishes it).
     """
     if interval_s <= 0 or canon.untrusted or not canon.readable or not canon.sources:
         return sync(db, canon, host)
@@ -1577,6 +1601,7 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode()).hexdigest()
     store = storage.of(db).canon
     token = uuid.uuid4().hex
+    max_age_s = interval_s * SYNC_REUSE_MAX_INTERVALS
     # #5649: before claiming a NEW sync, an unsettled runner settles its host
     # gate on a completed sync of the same snapshot. A staging sequence
     # restarts the units one by one, often more than one interval apart: the
@@ -1584,10 +1609,12 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     # missed the "redémarrer" guard. Same signature = same sources, trust and
     # version fingerprint = the completed result is what the new sync would
     # say; a different snapshot falls through to the claim/takeover below.
+    # #5653: only a recent result may settle the gate; an old one (long stop
+    # of the host) leaves the claim to the usual path, which runs a full sync.
     if unsettled:
         shared = store.shared_sync(host, key)
         if (shared is not None and shared["status"] == CANON_OK
-                and shared["sync_signature"] == signature):
+                and _reusable_completed(shared, signature, max_age_s)):
             return SyncReport(host, str(canon.root), False, [], [],
                               status=shared["status"],
                               diagnostic=shared["diagnostic"], shared=True)
@@ -1608,6 +1635,22 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
                               "claim interval %.1fs; local signature payload %s" % (
                                   canon.id, canon.root, reason, sources, interval_s,
                                   json.dumps(signature_payload, sort_keys=True)))
+            return None
+        if not _reusable_completed(shared, signature, max_age_s):
+            # #5653: an old result never settles the gate. The claim is
+            # unavailable now (interval not elapsed or a newer sync pending):
+            # report the reason and let a later pass sync.
+            if on_incomplete is not None:
+                age = shared.get("completed_age_s")
+                sources = ", ".join("%s=%s@%s (%s)" % (
+                    s.member, s.repo, s.commit, s.mode) for s in canon.sources)
+                on_incomplete(
+                    "canon %s at %s: completed shared sync too old to settle the "
+                    "host gate (%s, max %.1fs = %d x %.1fs); sources [%s]" % (
+                        canon.id, canon.root,
+                        "completion time unknown" if age is None
+                        else "age %.1fs" % float(age),
+                        max_age_s, SYNC_REUSE_MAX_INTERVALS, interval_s, sources))
             return None
         return SyncReport(host, str(canon.root), False, [], [],
                           status=shared["status"], diagnostic=shared["diagnostic"], shared=True)
