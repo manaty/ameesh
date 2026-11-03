@@ -39,6 +39,11 @@ compression écrit des membres gzip complets et, après chaque bloc, un état
 au lieu de repartir de zéro. Un `.gz.part` sans état lisible (résidu d'un
 processus tué) est jeté puis recompressé ; il ne bloque jamais la rotation.
 Un suffixe postérieur au dernier état enregistré est coupé avant reprise.
+Les auxiliaires de reprise ne suivent aucun lien : `.gz.part` et `.gz.state`
+sont ouverts par descripteur (`O_NOFOLLOW`), l'état enregistre l'inode du
+partiel, et le temporaire d'état est créé exclusivement sous un nom
+imprévisible (`mkstemp`). Un lien planté sous ces noms est retiré, sa cible
+reste intacte.
 Le rapport dit les fichiers déjà traités, les compressions en cours, les
 résidus ignorés et le budget atteint. Une erreur réelle, une source modifiée
 ou une archive existante conserve le log original et enlève le partiel.

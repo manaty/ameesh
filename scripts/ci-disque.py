@@ -66,6 +66,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -625,27 +626,129 @@ def _identite(info) -> dict:
 
 
 def _ecrire_etat(chemin: Path, etat: dict) -> None:
-    """Écrit l'état atomiquement : un kill laisse l'ancien état, jamais un mixte."""
-    temporaire = chemin.with_name(chemin.name + ".tmp")
+    """Écrit l'état atomiquement : un kill laisse l'ancien état, jamais un mixte.
+
+    Le temporaire est créé exclusivement sous un nom imprévisible (`mkstemp`) :
+    un `.gz.state.tmp` lié laissé dans `_diag` n'est jamais suivi ni réutilisé.
+    """
+    descripteur, temporaire = tempfile.mkstemp(
+        dir=str(chemin.parent), prefix=chemin.name + ".", suffix=".tmp")
     try:
-        temporaire.write_text(json.dumps(etat), encoding="utf-8")
+        with os.fdopen(descripteur, "w", encoding="utf-8") as fichier:
+            fichier.write(json.dumps(etat))
+            fichier.flush()
+            os.fsync(fichier.fileno())
         os.replace(temporaire, chemin)
-    except OSError:
-        temporaire.unlink(missing_ok=True)
+    except BaseException:
+        Path(temporaire).unlink(missing_ok=True)
         raise
 
 
 def _lire_etat(chemin: Path, identite: dict) -> dict | None:
-    """L'état de reprise s'il décrit encore cette source, sinon None (résidu)."""
+    """L'état de reprise s'il décrit encore cette source, sinon None (résidu).
+
+    Lecture par descripteur sans suivre de lien : un `.gz.state` lié est un
+    résidu, jamais une source de confiance.
+    """
     try:
-        etat = json.loads(chemin.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        descripteur = os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descripteur)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_size > 64 * 1024):
+            return None
+        morceaux = []
+        while bloc := os.read(descripteur, 65536):
+            morceaux.append(bloc)
+    except OSError:
+        return None
+    finally:
+        os.close(descripteur)
+    try:
+        etat = json.loads(b"".join(morceaux))
+    except ValueError:
         return None
     if (not isinstance(etat, dict) or etat.get("identite") != identite
             or type(etat.get("offset")) is not int or etat["offset"] < 0
-            or type(etat.get("part_size")) is not int or etat["part_size"] < 0):
+            or type(etat.get("part_size")) is not int or etat["part_size"] < 0
+            or type(etat.get("part_dev")) is not int or etat["part_dev"] < 0
+            or type(etat.get("part_ino")) is not int or etat["part_ino"] <= 0):
         return None
     return etat
+
+
+def _retirer(*entrees: Path) -> None:
+    """Retire des entrées de `_diag` : `unlink` ne suit jamais un lien."""
+    for entree in entrees:
+        try:
+            entree.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _tronquer_partiel(partiel: Path, etat: dict) -> bool:
+    """Coupe un partiel à la taille enregistrée, par descripteur sans lien.
+
+    L'inode doit être celui que l'état décrit : un partiel remplacé est refusé
+    (False), l'appelant repart de zéro.
+    """
+    try:
+        descripteur = os.open(partiel, os.O_RDWR | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(descripteur)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or (info.st_dev, info.st_ino)
+                != (etat["part_dev"], etat["part_ino"])):
+            return False
+        os.ftruncate(descripteur, etat["part_size"])
+        os.fsync(descripteur)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(descripteur)
+
+
+def _ouvrir_partiel(partiel: Path, etat: dict) -> int | None:
+    """Ouvre le partiel en ajout, sans suivre de lien, si c'est bien le sien.
+
+    None si le chemin a été remplacé (type, propriétaire, inode ou taille ne
+    correspondent plus à l'état) : l'appelant jette et repart de zéro.
+    """
+    try:
+        descripteur = os.open(partiel, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descripteur)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or (info.st_dev, info.st_ino)
+                != (etat["part_dev"], etat["part_ino"])
+                or info.st_size != etat["part_size"]):
+            raise OSError("partiel remplacé")
+    except OSError:
+        os.close(descripteur)
+        return None
+    return descripteur
+
+
+def _creer_partiel(partiel: Path, etat_chemin: Path) -> int:
+    """Crée le partiel exclusivement ; un lien ou résidu est retiré puis recréé.
+
+    `O_EXCL` ne suit ni ne réutilise une entrée existante, `O_NOFOLLOW` refuse
+    un lien : une entrée plantée sous ce nom ne peut pas devenir la sortie.
+    """
+    for _ in range(3):
+        try:
+            return os.open(partiel, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                           | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            _retirer(partiel, etat_chemin)
+    raise OSError("partiel impossible à créer sans suivre de lien")
 
 
 def _compresser_partiel(chemin: Path, initial, *, debut: float, budget_s: float,
@@ -658,97 +761,128 @@ def _compresser_partiel(chemin: Path, initial, *, debut: float, budget_s: float,
     lisible, ou d'une autre source, est jeté puis recompressé : il ne bloque
     plus la rotation. Une source modifiée ou une archive déjà présente garde
     le journal original et enlève le partiel.
+
+    Aucun auxiliaire n'est ouvert par son chemin sans contrôle : `.gz.part` et
+    `.gz.state` sont ouverts par descripteur (`O_NOFOLLOW`), l'inode du
+    partiel enregistré dans l'état doit être celui rouvert, et le temporaire
+    d'état est créé exclusivement sous un nom imprévisible. Un lien planté
+    sous ces noms est retiré sans être suivi, sa cible reste intacte.
     """
     partiel = _fichier_partiel(chemin)
     etat_chemin = _fichier_etat(chemin)
     identite = _identite(initial)
     offset = 0
     residu = False
-    if partiel.exists():
-        etat = _lire_etat(etat_chemin, identite)
+    etat = None
+    try:
+        info_partiel = partiel.lstat()
+    except FileNotFoundError:
+        info_partiel = None
+    if info_partiel is not None:
+        if (stat.S_ISREG(info_partiel.st_mode)
+                and info_partiel.st_uid == os.geteuid()):
+            etat = _lire_etat(etat_chemin, identite)
         if etat is None:
-            partiel.unlink(missing_ok=True)
-            etat_chemin.unlink(missing_ok=True)
+            _retirer(partiel, etat_chemin)
             residu = True
         else:
             offset = etat["offset"]
-            taille = partiel.stat().st_size
-            if taille < etat["part_size"]:
+            if info_partiel.st_size < etat["part_size"]:
                 # Le partiel a été tronqué hors de notre contrôle : l'état ne
                 # décrit plus son contenu, on repart de zéro.
-                partiel.unlink(missing_ok=True)
-                etat_chemin.unlink(missing_ok=True)
+                _retirer(partiel, etat_chemin)
                 offset, residu = 0, True
-            elif taille > etat["part_size"]:
+            elif info_partiel.st_size > etat["part_size"]:
                 # Processus tué entre l'écriture d'un membre complet et celle
                 # de l'état : le préfixe enregistré est fsynqué et valide, les
-                # octets au-delà ne sont pas référencés, on les coupe.
-                with partiel.open("r+b") as fichier:
-                    fichier.truncate(etat["part_size"])
-                    fichier.flush()
-                    os.fsync(fichier.fileno())
+                # octets au-delà ne sont pas référencés, on les coupe — par
+                # descripteur, sans suivre un lien ni un inode remplacé.
+                if not _tronquer_partiel(partiel, etat):
+                    _retirer(partiel, etat_chemin)
+                    offset, residu = 0, True
     if offset > initial.st_size:
-        partiel.unlink(missing_ok=True)
-        etat_chemin.unlink(missing_ok=True)
+        _retirer(partiel, etat_chemin)
         offset, residu = 0, True
 
     try:
         with os.fdopen(os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
             if _identite(os.fstat(source.fileno())) != identite:
-                partiel.unlink(missing_ok=True)
-                etat_chemin.unlink(missing_ok=True)
+                _retirer(partiel, etat_chemin)
                 return {"termine": False, "partiel": False, "octets": 0,
                         "residu": residu, "change": True}
-            source.seek(offset)
-            if initial.st_size == 0 and not partiel.exists():
-                # Un journal vide reste un journal : une archive gzip vide est
-                # valide et ne doit pas buter sur un partiel inexistant.
-                descripteur = os.open(partiel, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                                      0o600)
-                with os.fdopen(descripteur, "wb") as sortie:
+            descripteur = None
+            if offset > 0:
+                descripteur = _ouvrir_partiel(partiel, etat)
+                if descripteur is None:
+                    # Partiel remplacé ou disparu entre-temps : on repart de
+                    # zéro plutôt que d'écrire dans un inode inconnu.
+                    _retirer(partiel, etat_chemin)
+                    offset, residu = 0, True
+            if descripteur is None:
+                descripteur = _creer_partiel(partiel, etat_chemin)
+            sortie = os.fdopen(descripteur, "wb")
+            try:
+                source.seek(offset)
+                if initial.st_size == 0 and offset == 0:
+                    # Un journal vide reste un journal : une archive gzip vide
+                    # est valide et ne doit pas buter sur un partiel inexistant.
                     with gzip.GzipFile(filename="", mode="wb", fileobj=sortie):
                         pass
-                    sortie.flush()
-                    os.fsync(sortie.fileno())
-            while bloc := source.read(taille_bloc):
-                descripteur = os.open(partiel, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                                      0o600)
-                with os.fdopen(descripteur, "wb") as sortie:
+                while bloc := source.read(taille_bloc):
                     with gzip.GzipFile(filename="", mode="wb", fileobj=sortie) as gz:
                         gz.write(bloc)
                     sortie.flush()
-                    os.fsync(sortie.fileno())
-                offset += len(bloc)
-                _ecrire_etat(etat_chemin, {"identite": identite, "offset": offset,
-                                           "part_size": partiel.stat().st_size})
-                if time.monotonic() - debut >= budget_s:
-                    return {"termine": False, "partiel": True, "octets": 0,
-                            "residu": residu}
+                    os.fsync(descripteur)
+                    offset += len(bloc)
+                    info = os.fstat(descripteur)
+                    _ecrire_etat(etat_chemin, {
+                        "identite": identite, "offset": offset,
+                        "part_size": info.st_size,
+                        "part_dev": info.st_dev, "part_ino": info.st_ino})
+                    if time.monotonic() - debut >= budget_s:
+                        return {"termine": False, "partiel": True, "octets": 0,
+                                "residu": residu}
+                sortie.flush()
+                os.fsync(descripteur)
+                info = os.fstat(descripteur)
+            finally:
+                sortie.close()
             final = chemin.lstat()
             if _identite(final) != identite:
-                partiel.unlink(missing_ok=True)
-                etat_chemin.unlink(missing_ok=True)
+                _retirer(partiel, etat_chemin)
                 return {"termine": False, "partiel": False, "octets": 0,
                         "residu": residu, "change": True}
             archive = chemin.with_name(chemin.name + ".gz")
             try:
-                os.link(partiel, archive)  # refuse une archive déjà présente
+                # `follow_symlinks=False` : un partiel remplacé par un lien
+                # donnerait une archive lien, refusée par le contrôle ci-dessous.
+                os.link(partiel, archive, follow_symlinks=False)
             except FileExistsError:
-                partiel.unlink(missing_ok=True)
-                etat_chemin.unlink(missing_ok=True)
+                _retirer(partiel, etat_chemin)
                 return {"termine": False, "partiel": False, "octets": 0,
                         "residu": residu, "archive": True}
+            except FileNotFoundError:
+                _retirer(partiel, etat_chemin)
+                return {"termine": False, "partiel": False, "octets": 0,
+                        "residu": residu, "change": True}
+            lien = archive.lstat()
+            if (not stat.S_ISREG(lien.st_mode)
+                    or (lien.st_dev, lien.st_ino) != (info.st_dev, info.st_ino)):
+                # Le partiel a été remplacé entre la fermeture et le lien :
+                # l'archive ne porte pas nos octets, on la retire.
+                archive.unlink(missing_ok=True)
+                _retirer(partiel, etat_chemin)
+                return {"termine": False, "partiel": False, "octets": 0,
+                        "residu": residu, "change": True}
             chemin.unlink()
-            partiel.unlink(missing_ok=True)
-            etat_chemin.unlink(missing_ok=True)
+            _retirer(partiel, etat_chemin)
             return {"termine": True, "partiel": False,
-                    "octets": max(0, initial.st_size - archive.stat().st_size),
+                    "octets": max(0, initial.st_size - lien.st_size),
                     "residu": residu}
     except OSError:
         # Échec réel (disque plein, droit) : on jette le partiel pour ne pas
         # tromper une reprise, et la source reste intacte.
-        partiel.unlink(missing_ok=True)
-        etat_chemin.unlink(missing_ok=True)
+        _retirer(partiel, etat_chemin)
         raise
 
 

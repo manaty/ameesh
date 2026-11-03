@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Rotation de vrais fichiers : ctime, inodes ouverts, archives et échecs."""
 import gzip
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -188,6 +189,62 @@ class RotationTest(unittest.TestCase):
                 resultat = disque._diag(False)
             self.assertIn('PermissionError', resultat['sortie'])
             self.assertIn('non tentée', resultat['sortie'])
+
+    def test_linked_partial_is_not_followed(self):
+        """Un `.gz.part` lié n'est jamais la sortie : sa cible reste intacte."""
+        contenu = b'journal\n' * 1000
+        self.log.write_bytes(contenu)
+        cible = self.root / 'cible-du-partiel'
+        cible.write_bytes(b'precieux' * 100)
+        part = self.log.with_name(self.log.name + '.gz.part')
+        etat = self.log.with_name(self.log.name + '.gz.state')
+        part.symlink_to(cible)
+        info = cible.stat()
+        etat.write_text(json.dumps({
+            'identite': disque._identite(self.log.lstat()),
+            'offset': 100, 'part_size': info.st_size,
+            'part_dev': info.st_dev, 'part_ino': info.st_ino}))
+        resultat = self.rotate()
+        self.assertEqual(cible.read_bytes(), b'precieux' * 100)
+        self.assertEqual(resultat['fichiers'], 1)
+        self.assertEqual(resultat['residus'], 1)
+        self.assertFalse(part.exists())
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         contenu)
+
+    def test_linked_state_tmp_is_not_written(self):
+        """Un `.gz.state.tmp` lié n'est jamais écrit : sa cible reste intacte."""
+        contenu = self.log.read_bytes()
+        cible = self.root / 'cible-etat'
+        cible.write_bytes(b'precieux')
+        temporaire = self.log.with_name(self.log.name + '.gz.state.tmp')
+        temporaire.symlink_to(cible)
+        resultat = self.rotate()
+        self.assertEqual(cible.read_bytes(), b'precieux')
+        self.assertEqual(resultat['fichiers'], 1)
+        self.assertTrue(temporaire.is_symlink())
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         contenu)
+
+    def test_linked_state_is_not_read(self):
+        """Un `.gz.state` lié n'est pas une source de confiance : résidu jeté."""
+        contenu = b'journal\n' * 1000
+        self.log.write_bytes(contenu)
+        identite = disque._identite(self.log.lstat())
+        part = self.log.with_name(self.log.name + '.gz.part')
+        part.write_bytes(b'partiel')
+        cible = self.root / 'cible-etat-lu'
+        texte = json.dumps({'identite': identite, 'offset': 1, 'part_size': 7,
+                            'part_dev': 1, 'part_ino': 1})
+        cible.write_text(texte)
+        etat = self.log.with_name(self.log.name + '.gz.state')
+        etat.symlink_to(cible)
+        resultat = self.rotate()
+        self.assertEqual(resultat['fichiers'], 1)
+        self.assertEqual(resultat['residus'], 1)
+        self.assertEqual(cible.read_text(), texte)
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         contenu)
 
 
 class ProcessReadingTest(unittest.TestCase):
