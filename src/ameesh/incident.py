@@ -43,6 +43,12 @@ Ce module porte la règle seule :
   exacts, `None` laissant `unknown` — une carte globale, valable pour tous les
   dépôts et toutes les têtes, attribuerait le lot d'un autre paquet.
 
+#5627 : avant d'ouvrir l'incident d'une exécution, `consume` cherche un lot
+**ouvert** qui porte déjà chaque test en échec (`covering_lots` : titre, corps
+ou empreinte, ou un lot fermé `superseded_by` un lot ouvert). Si chaque test
+est couvert, l'occurrence est notée sur ces lots et aucun incident ne s'ouvre :
+un correctif en cours n'est pas doublé (#5600/#5599, #5626/#5606).
+
 Le relevé Git/API (commits de l'atterrissage) reste chez `ci` : ce module ne
 parle ni à GitHub ni au réseau. Deux passages **concurrents** (deux hôtes dans
 la même fenêtre) sont sérialisés par `work.add(unique_ref=True)` : un seul lot
@@ -52,6 +58,7 @@ par exécution, les passages suivants restant idempotents par `issue_ref` et par
 from __future__ import annotations
 
 import posixpath
+import re
 from typing import Iterable, Optional
 
 from . import storage, work
@@ -159,6 +166,111 @@ def attributable(modules: Iterable[str]) -> list[str]:
         if path not in out:
             out.append(path)
     return out
+
+
+#: #5627 : extensions retirées du nom d'un fichier de test pour sa clé
+_TEST_EXTENSIONS = frozenset(("py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "sql",
+                              "go", "rs", "kt", "swift", "java", "rb"))
+#: #5627 : une clé plus courte (`a.test`, `test_x`) citerait n'importe quel lot
+TEST_KEY_MIN = 8
+#: #5627 : les lots fermés relus pour suivre un lien `superseded_by`
+SUPERSEDED_SCAN = 200
+#: #5627 : les lots ouverts relus par état pour chercher une couverture
+COVER_SCAN = 500
+
+
+def test_key(module: str) -> str:
+    """#5627 : le nom qui désigne un fichier de test dans un lot.
+
+    `tests/test_5582_x.py` → `test_5582_x` ; un module Python pointé
+    (`tests.test_5582_x`) → `test_5582_x` ; `mobile/src/a.test.ts` →
+    `a.test`."""
+    path = _norm(module)
+    name = posixpath.basename(path)
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        return name
+    if ext.lower() in _TEST_EXTENSIONS:
+        return stem
+    if "/" not in path and re.fullmatch(r"[A-Za-z_]\w*", ext):
+        return ext
+    return name
+
+
+def _mentions(text: str, key: str) -> bool:
+    """`key` cité comme un mot entier (`tests.test_x.Classe` cite `test_x`,
+    `test_x2` ne le cite pas)."""
+    return re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(key), text or "") is not None
+
+
+def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
+    """#5627 : `{clé de test: lot ouvert}` pour chaque test en échec déjà
+    porté par un lot ouvert du même projet.
+
+    Un lot porte un test quand son titre ou son corps le cite, quand son
+    empreinte contient le fichier, ou quand un lot fermé qui le cite a été
+    remplacé (`superseded_by`) par ce lot ouvert. Le plus ancien l'emporte.
+    Une clé trop courte n'est jamais cherchée. Une lecture impossible rend
+    `{}` : mieux vaut un incident en double qu'un rouge perdu."""
+    keys = []
+    for module in attributable(modules):
+        key = test_key(module)
+        if len(key) >= TEST_KEY_MIN and key not in keys:
+            keys.append(key)
+    reader = getattr(getattr(st, "work", None), "items", None)
+    if not keys or reader is None:
+        return {}
+    rows: dict = {}
+    try:
+        for state in work.OPEN_STATES:
+            for row in reader(state=state, assignee=None, limit=COVER_SCAN) or ():
+                rows[int(row["id"])] = row
+    except Exception:  # noqa: BLE001 - lecture incomplète : rien n'est couvert
+        return {}
+    rows = {lot: row for lot, row in rows.items()
+            if not (app and row.get("app") and row.get("app") != app)}
+    if not rows:
+        return {}
+    paths: dict = {}
+    footprints = getattr(getattr(st, "work_footprints", None), "for_items", None)
+    if footprints is not None:
+        try:
+            for line in footprints(sorted(rows)) or ():
+                paths.setdefault(int(line["work_item_id"]), set()).add(
+                    test_key(str(line.get("path") or "")))
+        except Exception:  # noqa: BLE001 - sans empreinte, le texte suffit
+            paths = {}
+    found: dict = {}
+
+    def keep(key: str, lot: int) -> None:
+        if key not in found or lot < int(found[key]["id"]):
+            found[key] = rows[lot]
+
+    for lot, row in rows.items():
+        text = "%s\n%s" % (row.get("title") or "", row.get("body") or "")
+        for key in keys:
+            if _mentions(text, key) or key in paths.get(lot, ()):
+                keep(key, lot)
+    try:
+        closed = reader(state=work.lifecycle.CLOSED, assignee=None,
+                        limit=SUPERSEDED_SCAN) or ()
+    except Exception:  # noqa: BLE001 - le lien n'est qu'un complément
+        closed = ()
+    for row in closed:
+        target = row.get("superseded_by")
+        if target in (None, "") or int(target) not in rows:
+            continue
+        text = "%s\n%s" % (row.get("title") or "", row.get("body") or "")
+        for key in keys:
+            if _mentions(text, key):
+                keep(key, int(target))
+    return found
+
+
+def _uncovered(modules: Iterable[str], covered: dict) -> list[str]:
+    """Les modules en échec qu'aucun lot ouvert ne porte."""
+    return [module for module in attributable(modules)
+            if test_key(module) not in covered]
 
 
 def _lot_of(commit: dict) -> Optional[int]:
@@ -649,6 +761,29 @@ def consume(db, *, integration=None, lands=None, links=None, links_for=None,
                 failures = st.ci.failures(repo, run_id)
             except Exception:  # noqa: BLE001 - sans échecs relevés, l'incident reste dû
                 failures = []
+            modules = [f.get("module") for f in failures]
+            covered = covering_lots(st, app=app, modules=modules)
+            if covered and attributable(modules) and not _uncovered(modules, covered):
+                # #5627 : chaque test rouge est déjà porté par un lot ouvert
+                # (un correctif en cours) : l'occurrence y est notée, aucun
+                # second lot n'est ouvert.
+                lots = sorted({int(lot_row["id"]) for lot_row in covered.values()})
+                for lot in lots:
+                    tests_of = sorted(key for key, lot_row in covered.items()
+                                      if int(lot_row["id"]) == lot)
+                    try:
+                        work.note(db, lot, "rouge de nouveau sur %s : run %d (%s, tête %s), "
+                                  "%s — porté par ce lot, aucun incident ouvert (#5627)"
+                                  % (branch, run_id, row.get("workflow") or "?",
+                                     head_sha[:12] or "?", ", ".join(tests_of)),
+                                  actor=actor, once=True)
+                    except Exception:  # noqa: BLE001 - la note est un suivi
+                        pass
+                line.update({"id": lots[0], "covered": lots,
+                             "why": "test(s) rouge(s) déjà porté(s) par %s : aucun incident"
+                                    % ", ".join("#%d" % lot for lot in lots)})
+                out.append(line)
+                continue
             commits: list[dict] = []
             try:
                 commits = list(lands(repo, head_sha))
@@ -677,7 +812,7 @@ def consume(db, *, integration=None, lands=None, links=None, links_for=None,
             result = open_incident(
                 db, repo=repo, branch=branch, run_id=run_id, head_sha=head_sha,
                 workflow=str(row.get("workflow") or ""), url=str(row.get("url") or ""),
-                modules=[f.get("module") for f in failures],
+                modules=modules,
                 tests=[f.get("test") for f in failures],
                 commits=commits, app=app, links=card, diagnosis=diagnosis, actor=actor)
             earlier = line["why"]
