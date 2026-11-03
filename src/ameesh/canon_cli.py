@@ -305,6 +305,8 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
             "findings": [f.to_dict() for f in findings],
             "placements": [v.to_dict() for v in placements],
             "canon_id": canon.id, "default": canon.is_default,
+            # #5556 : la marge du bloc de règles, montrée même sans constat
+            "process_rules_block": _process_block_json(canon),
         }
         if sink is not None:
             sink.append(data)
@@ -314,6 +316,10 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
     print("canon : %s" % canon.root)
     print("source : %s%s" % (UNTRUSTED_TAG if canon.untrusted else "", canon.source_label()))
     _print_findings(findings)
+    mesure = canon_mod.process_block(canon) if canon.readable else None
+    if mesure is not None:
+        # #5556 : la marge se lit avant la fusion, pas au premier brief coupé
+        print("process   : %s" % mesure.line())
     print(("canon valid — " if not errors and not unseen
            else "canon valid here, ERRORS in the registry — " if not errors
            else "canon UNREADABLE — " if not canon.readable
@@ -326,6 +332,14 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
         _print_placements(host, [v for v in placements if v.host == host])
     _print_recorded_placements(recorded)
     return 1 if errors or unseen else 0
+
+
+def _process_block_json(canon: canon_mod.Canon) -> dict | None:
+    mesure = canon_mod.process_block(canon) if canon.readable else None
+    if mesure is None:
+        return None
+    return {"bytes": mesure.size, "rules_bytes": mesure.rules, "limit": mesure.limit,
+            "room": mesure.room, "cut": mesure.cut, "margin": mesure.margin}
 
 
 def _registry_errors_unseen(canon: canon_mod.Canon, recorded: dict | None,

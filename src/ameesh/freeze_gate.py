@@ -507,6 +507,56 @@ def _canon_review_coverage(db: Db, item: dict, sha: str, repo: str) -> str:
     return ""
 
 
+def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
+    """#5556 : refuse le gel d'un lot du canon dont la tête coupe le bloc des
+    règles (`process-rules-block-too-long`) ; rend sinon la note qui donne la
+    marge en octets, lue par l'auteur au gel et par le relecteur sur le jalon.
+
+    Le canon n'a pas de CI : sans ce contrôle, la limite n'était vérifiée qu'à
+    `canon check`, à la synchro et au placement, donc après fusion (home#248,
+    43 octets de trop). Un lot qui ne fait pas grossir un bloc déjà coupé à la
+    base (celui qui le raccourcit) n'est pas refusé. Mesure impossible (canon
+    illisible, délai) : la note le dit, le gel n'attend pas."""
+    from . import canon as canon_mod, canon_lowering, lot_class
+    from .deadline import Deadline
+    from .work import WorkError
+    cfg = getattr(db, "cfg", None)
+    canon_lot, clone = lot_class._canon_lot(item, lot_class.canon_clones(cfg)) \
+        if repo else (False, None)
+    if not canon_lot:
+        return ""
+    root = clone or repo
+    deadline = Deadline(canon_lowering.BUDGET_S)
+
+    def measure(ref: str):
+        loaded = canon_mod.load(root, ref=ref, deadline=deadline)
+        if not loaded.readable:
+            raise canon_mod.CanonError("canon unreadable at %s" % ref[:12])
+        return canon_mod.process_block(loaded)
+
+    try:
+        head = measure(sha)
+        if head is None:
+            return ""
+        if not head.cut:
+            return "canon-rules-block: %s" % head.line()
+        target = str(item.get("branch_target") or "")
+        _ref, tip = canon_lowering._revision(repo, target, deadline)
+        base_block = None
+        if tip:
+            base = canon_lowering._merge_base(repo, tip, sha, deadline)
+            base_block = measure(base) if base else None
+    except Exception as exc:  # noqa: BLE001 - le gel n'attend pas une mesure cassée
+        return "canon-rules-block: not measured: %s" % (str(exc) or type(exc).__name__)[:200]
+    if base_block is not None and base_block.cut and head.rules <= base_block.rules:
+        return ("canon-rules-block: %s (already cut at the base, %d bytes of "
+                "rules: not grown)" % (head.line(), base_block.rules))
+    raise WorkError("freeze refused (process-rules-block-too-long): %s — a brief "
+                    "on the oldest served version loses the end of the rules; "
+                    "shorten the cards: %s (`ameesh canon check`, #5556)"
+                    % (head.line(), head.cards))
+
+
 def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None,
                 refreshed: dict | None = None,
                 outcome: dict | None = None) -> str:
@@ -768,6 +818,12 @@ def milestone(
             db, item, sha, repo or str(freeze_info.get("repo") or ""))
         if coverage_note:
             note = (note + "\n" if note else "") + coverage_note
+        # #5556 : la marge du bloc des règles, montrée avant fusion ; un bloc
+        # coupé à la tête gelée est refusé ici, pas découvert au brief.
+        rules_note = _canon_rules_block(
+            db, item, sha, repo or str(freeze_info.get("repo") or ""))
+        if rules_note:
+            note = (note + "\n" if note else "") + rules_note
         # (5) : la marque des branches où le gel était absent, pour que le
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par
