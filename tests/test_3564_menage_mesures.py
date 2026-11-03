@@ -84,7 +84,7 @@ class MenageApresLeRunTest(unittest.TestCase):
     def test_code_de_confiance_seulement(self):
         corps = _sans_commentaires(MENAGE)
         # checkout de la branche par défaut : ni ref ni dépôt de la PR
-        self.assertIn("- uses: actions/checkout@v4\n", corps)
+        self.assertIn("- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4\n", corps)
         self.assertNotIn("ref:", corps)
         self.assertNotIn("repository:", corps)
         self.assertNotIn("head_sha", corps)

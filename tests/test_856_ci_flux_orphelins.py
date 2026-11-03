@@ -420,7 +420,7 @@ class WorkflowTest(unittest.TestCase):
         sweep = job.index("- name: conclusion des checks de flux orphelins")
         self.assertIn("if: always()", job[sweep:],
                       "sweep doit tourner même quand le bilan est rouge")
-        checkouts = [m.start() for m in re.finditer(r"- uses: actions/checkout@v4", job)]
+        checkouts = [m.start() for m in re.finditer(r"- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262", job)]
         avant = [i for i in checkouts if i < sweep]
         self.assertTrue(avant, "sweep lit scripts/ci-flow.py : un checkout doit précéder")
         dernier = avant[-1]

@@ -1048,6 +1048,7 @@ class Watcher:
         self.logs = logs
         self.rerun_job = rerun_job
         self._action_downloads = {}
+        self._job_log_texts = {}
         self._parsed_logs: set = set()
         self._warned_logs: set = set()
         #: l'écriture d'annulation GitHub (`repos/<repo>/actions/runs/<id>/cancel`) ;
@@ -2292,7 +2293,7 @@ class Watcher:
             if key in self._parsed_logs:
                 continue
             try:
-                text = self.logs(repo, job_id)
+                text = self._job_log(repo, row, job_id)
             except Exception as exc:  # noqa: BLE001 - un log absent n'est pas un verdict
                 if key not in self._warned_logs:
                     self._warned_logs.add(key)
@@ -2311,6 +2312,13 @@ class Watcher:
                             "ts": tap.get("failed_at")})
         return out
 
+    def _job_log(self, repo, row, job_id):
+        """Share successful log reads between TAP and bootstrap classification."""
+        key = (repo, int(row["run_id"]), int(row.get("run_attempt") or 1), int(job_id))
+        if key not in self._job_log_texts:
+            self._job_log_texts[key] = self.logs(repo, int(job_id))
+        return self._job_log_texts[key]
+
     def _download_jobs(self, repo, row, jobs):
         """#5655: classify only bootstrap failures, with cached log reads."""
         from .ci_action_download import failed_action_download
@@ -2324,7 +2332,7 @@ class Watcher:
             if key not in self._action_downloads:
                 try:
                     self._action_downloads[key] = failed_action_download(
-                        job, self.logs(repo, int(job["id"])))
+                        job, self._job_log(repo, row, int(job["id"])))
                 except Exception as exc:
                     self.log("CI: action download log unreadable (%s)" % exc)
                     continue

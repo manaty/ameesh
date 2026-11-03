@@ -22,6 +22,15 @@ ROW = {'run_id': 8, 'run_attempt': 1, 'head_sha': 'abc', 'branch': 'main'}
 
 
 class DownloadFailureTest(unittest.TestCase):
+    def test_log_cache_is_scoped_to_repo_run_attempt_and_job(self):
+        logs = mock.Mock(side_effect=['first', 'retry', 'other repo'])
+        watcher = Watcher(types.SimpleNamespace(), logs=logs)
+        self.assertEqual(watcher._job_log('org/repo', ROW, 42), 'first')
+        self.assertEqual(watcher._job_log('org/repo', ROW, '42'), 'first')
+        self.assertEqual(watcher._job_log('org/repo', dict(ROW, run_attempt=2), 42), 'retry')
+        self.assertEqual(watcher._job_log('other/repo', ROW, 42), 'other repo')
+        self.assertEqual(logs.call_count, 3)
+
     def test_real_logs_are_infrastructure(self):
         for file in (ROOT / 'tests/fixtures/5655').glob('*.log'):
             with self.subTest(file=file.name):
