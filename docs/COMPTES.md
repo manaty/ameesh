@@ -1160,3 +1160,40 @@ compte, sans redémarrage :
 `max_concurrent: 0` ou `min_start_gap_s: 0` désactivent la garde
 correspondante ; l'absence des clés prend les défauts du harnais. Un exécuteur
 médié sans le domaine `account_windows` ignore la garde (contrat fermé).
+
+### Réconcilier un marqueur comptable historique ambigu
+
+Un marqueur ambigu suspend les tours. L'incident est conservé une seule fois
+par marqueur dans `spend_marker_events`, avec sa date et son identité ; les
+nouvelles tentatives ne répètent pas son message. Les écritures antérieures au
+marqueur ne contredisent pas un candidat postérieur unique au même index.
+Des candidats postérieurs multiples ou contradictoires restent bloquants.
+
+Depuis une session humaine autorisée, après vérification du grand livre et
+des réservations, sélectionner explicitement la clé du tour :
+
+```sh
+ameesh budget reconcile AGENT --spend-key CLE --reason 'Vérification des écritures historiques' --human human:NOM
+```
+
+`--human` doit correspondre à l'identité humaine authentifiée par les règles
+habituelles des commandes de budget ; ce paramètre ne donne aucun droit.
+Les sessions d'agents sont refusées. L'agent doit être bloqué, ses ressources
+de tour terminées, et la clé doit avoir une preuve postérieure au marqueur
+pour cet agent et cet index. La décision humaine, sa raison et l'état initial
+sont journalisés dans la même transaction. Le marqueur reste présent ; la
+réparation ordinaire du runner utilise la clé choisie pour inscrire le coût
+et régler la réservation. La décision ne s'applique pas au marqueur suivant.
+
+Si les coûts réels sont **déjà inscrits** pour toutes les clés concernées :
+
+```sh
+ameesh budget reconcile AGENT --abandon --reason 'Coûts réels vérifiés dans le grand livre' --human human:NOM
+```
+
+L'abandon règle les réservations ouvertes ou gardées sur ces coûts réels,
+puis retire le marqueur dans la même transaction que son audit. Il conserve
+les lignes du grand livre et leurs montants. Une mesure manquante, annulée
+ou provenant seulement de l'appareil refuse l'abandon ; une réservation
+inconnue ne devient jamais une dépense nulle. Les réservations liées à une
+tranche exigent leur propre protocole de réconciliation et sont refusées.

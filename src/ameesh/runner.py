@@ -5035,8 +5035,23 @@ class AgentWorker(threading.Thread):
             # worker a écrit une ligne que son identité ne distingue pas) :
             # écrire au hasard réglerait le mauvais tour. On suspend.
             self._compta_en_echec = True
-            log_async("[%s] accounting marker ambiguous: turn accounting "
-                      "suspended" % self.name)
+            # Persist the incident claim so polling and worker replacement
+            # cannot emit the same accounting report every 30 seconds.
+            api = storage.of(self.db).pending_spend
+            report = getattr(api, 'report_ambiguous', None)
+            try:
+                first_report = report is not None and report(self.name, travail)
+            except db_mod.Unavailable:
+                raise
+            except db_mod.DbError:
+                return False  # no incident claim: stay blocked and retry later
+            if first_report:
+                message = ("Accounting marker ambiguous: turn accounting suspended; "
+                           "authorized human reconciliation required "
+                           "(ameesh budget reconcile).")
+                log_async('[%s] %s' % (self.name, message))
+                self._fil_note(message, meta={'action': 'accounting_incident',
+                                             'marker': travail.get('created_at')})
             return False
         try:
             from . import accounts as accounts_mod
@@ -5218,9 +5233,10 @@ class AgentWorker(threading.Thread):
     def _compta_repare(self) -> None:
         """Avant un tour : rejoue le travail en attente ; `{}` suspend."""
         travail = self._compta_en_attente()
-        if travail is None and self._compta_doute:
-            # L72 : la suspension venait d'une base injoignable à la création
-            # du worker ; aucun marqueur n'attend, rien à réparer.
+        if travail is None:
+            # L72 / #5561: a successful read proving absence also observes
+            # human abandonment. Do not retain an in-memory accounting block
+            # after the durable marker has been reconciled.
             self._compta_doute = False
             self._compta_en_echec = False
         if travail:

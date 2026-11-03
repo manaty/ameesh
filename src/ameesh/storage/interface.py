@@ -691,6 +691,13 @@ class PendingSpend(Domain):
     `get`, dans la même instruction ; `clear_if(name, created_at, spend_key)`
     ne retire que ce marqueur. Absentes de l'interface distante : elle garde
     les opérations de base, avec le contrôle du bail côté serveur.
+
+    #5561 : `report_ambiguous(name, marker)` réclame un incident durable
+    unique ; `reconcile(name, spend_key=..., abandon=..., actor=..., reason=...)`
+    lie une identité ambiguë ou abandonne un marqueur dont les coûts réels
+    sont déjà durables. Ces extensions PostgreSQL sont locales : la CLI
+    vérifie l'autorisation humaine, le stockage journalise et modifie dans
+    la même transaction. Une résolution ne vaut que pour le marqueur exact.
     """
 
     @abc.abstractmethod

@@ -112,6 +112,10 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #5561 / 0536: accounting reconciliation audit stays internal to both roles.
+    "spend_marker_events": {"id", "agent", "marker_created_at", "marker_spend_key",
+                            "event", "ledger_key", "actor", "reason", "snapshot",
+                            "created_at"},
     # #5140 / 0530: bearer digests and relay replay keys remain internal;
     # neither supervisor role receives additional access.
     "sandbox_relay_tokens": {"token_sha256", "turn_id", "host", "created_at"},
