@@ -1,5 +1,6 @@
 # #2022 — host reading of a host that runs no agent (CI VMs, the mesh
-# server): memory, disks, zombies, published to `host_resources` like a
+# server, which uses deploy/serveur/ameesh-releve-hote.* since #5559):
+# memory, disks, zombies, published to `host_resources` like a
 # runner's, so `ameesh alerts` (host_disk_soon_full, host_zombies) and
 # `ameesh hosts --fleet` see it. Needs only the host name and the database
 # access of `~/.config/ameesh/env`. Started every 5 minutes by
