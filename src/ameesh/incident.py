@@ -43,6 +43,12 @@ Ce module porte la règle seule :
   exacts, `None` laissant `unknown` — une carte globale, valable pour tous les
   dépôts et toutes les têtes, attribuerait le lot d'un autre paquet.
 
+#5627 : avant d'ouvrir l'incident d'une exécution, `consume` cherche un lot
+**ouvert** qui porte déjà chaque test en échec (`covering_lots` : titre, corps
+ou empreinte, ou un lot fermé `superseded_by` un lot ouvert). Si chaque test
+est couvert, l'occurrence est notée sur ces lots et aucun incident ne s'ouvre :
+un correctif en cours n'est pas doublé (#5600/#5599, #5626/#5606).
+
 Le relevé Git/API (commits de l'atterrissage) reste chez `ci` : ce module ne
 parle ni à GitHub ni au réseau. Deux passages **concurrents** (deux hôtes dans
 la même fenêtre) sont sérialisés par `work.add(unique_ref=True)` : un seul lot
@@ -52,6 +58,7 @@ par exécution, les passages suivants restant idempotents par `issue_ref` et par
 from __future__ import annotations
 
 import posixpath
+import re
 from typing import Iterable, Optional
 
 from . import storage, work
@@ -158,6 +165,176 @@ def attributable(modules: Iterable[str]) -> list[str]:
             continue
         if path not in out:
             out.append(path)
+    return out
+
+
+#: #5627 : extensions retirées du nom d'un fichier de test pour sa clé
+_TEST_EXTENSIONS = frozenset(("py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "sql",
+                              "go", "rs", "kt", "swift", "java", "rb"))
+#: #5627 : une clé plus courte (`a.test`, `test_x`) citerait n'importe quel lot
+TEST_KEY_MIN = 8
+#: #5627 : les lots fermés relus pour suivre un lien `superseded_by`
+SUPERSEDED_SCAN = 200
+#: #5627 : les lots ouverts relus par état pour chercher une couverture
+COVER_SCAN = 500
+
+
+def test_key(module: str) -> str:
+    """#5627 : le nom court d'un fichier de test (affichage, garde de longueur).
+
+    `tests/test_5582_x.py` → `test_5582_x` ; un module Python pointé
+    (`tests.test_5582_x`) → `test_5582_x` ; `mobile/src/a.test.ts` →
+    `a.test`."""
+    path = _norm(module)
+    name = posixpath.basename(path)
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        return name
+    if ext.lower() in _TEST_EXTENSIONS:
+        return stem
+    if "/" not in path and re.fullmatch(r"[A-Za-z_]\w*", ext):
+        return ext
+    return name
+
+
+def _strip_ext(path: str) -> tuple[str, str]:
+    """`(chemin sans extension de code, extension)` ; `("", "")` sans extension connue."""
+    stem, dot, ext = path.rpartition(".")
+    if dot and "/" not in ext and ext.lower() in _TEST_EXTENSIONS:
+        return stem, ext.lower()
+    return "", ""
+
+
+def test_identity(module: str) -> tuple[frozenset, bool]:
+    """#5627 (B1 de ameesh-cx1) : les écritures d'un même fichier de test, et
+    si elles sont qualifiées.
+
+    Un chemin (`web/auth/session.test.ts`) ne se reconnaît que sous sa forme
+    qualifiée (avec ou sans extension ; pour Python, aussi pointée :
+    `tests.test_x`) : deux fichiers homonymes de dossiers différents ne se
+    couvrent jamais. Un module Python pointé se reconnaît aussi en chemin.
+    Seul un nom nu (le relevé ne dit pas son dossier) se cherche par son nom."""
+    path = _norm(module)
+    if "/" in path:
+        stem, ext = _strip_ext(path)
+        names = {path}
+        if stem:
+            names.add(stem)
+            if ext == "py":
+                names.add(stem.replace("/", "."))
+        return frozenset(names), True
+    stem, _ext = _strip_ext(path)
+    if not stem and re.fullmatch(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)+", path):
+        slashed = path.replace(".", "/")
+        return frozenset((path, slashed, slashed + ".py")), True
+    return frozenset(name for name in (path, stem) if name), False
+
+
+def _mentions(text: str, name: str, qualified: bool) -> bool:
+    """`name` cité entier : un chemin qualifié n'est pas la fin d'un autre
+    chemin (`mobile/web/x` ne cite pas `web/x`) ; un nom nu peut suivre un
+    dossier ou un paquet (`tests.test_x.Classe` cite `test_x`). Dans les deux
+    cas, un nom plus long (`test_x2`, `x/suite`) ne le cite pas."""
+    before = r"(?<![\w/.-])" if qualified else r"(?<![\w-])"
+    return re.search(before + re.escape(name) + r"(?![\w/-])", text or "") is not None
+
+
+def _footprint_covers(paths, names: frozenset, qualified: bool) -> bool:
+    """L'empreinte porte le fichier : le même chemin qualifié, ou, pour un nom
+    nu, un fichier de ce nom."""
+    for path in paths or ():
+        if qualified:
+            stem, _ext = _strip_ext(path)
+            if path in names or (stem and stem in names):
+                return True
+        elif test_key(path) in names or posixpath.basename(path) in names:
+            return True
+    return False
+
+
+def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
+    """#5627 : `{module en échec: lot ouvert}` pour chaque test en échec déjà
+    porté par un lot ouvert du même projet (`app` connu et égal : un lot sans
+    projet, ou un appel sans projet, ne couvre rien).
+
+    Un lot porte un test quand son titre ou son corps le cite, quand son
+    empreinte contient le fichier, ou quand un lot fermé qui le cite a été
+    remplacé (`superseded_by`) par ce lot ouvert. Un chemin ne se reconnaît que
+    qualifié (`test_identity`). Le plus ancien l'emporte. Un nom de moins de
+    `TEST_KEY_MIN` caractères n'est jamais cherché. Une lecture impossible
+    rend `{}` : mieux vaut un incident en double qu'un rouge perdu."""
+    wanted: dict = {}
+    for module in attributable(modules):
+        if len(test_key(module)) < TEST_KEY_MIN:
+            continue
+        names, qualified = test_identity(module)
+        names = frozenset(name for name in names if len(name) >= TEST_KEY_MIN)
+        if names:
+            wanted[module] = (names, qualified)
+    reader = getattr(getattr(st, "work", None), "items", None)
+    if not wanted or reader is None:
+        return {}
+    rows: dict = {}
+    try:
+        for state in work.OPEN_STATES:
+            for row in reader(state=state, assignee=None, limit=COVER_SCAN) or ():
+                rows[int(row["id"])] = row
+    except Exception:  # noqa: BLE001 - lecture incomplète : rien n'est couvert
+        return {}
+    # même projet, connu des deux côtés : un lot sans projet n'exempte aucun
+    # rouge (B de cx3), ni comme lot direct ni comme cible d'un superseded_by
+    rows = {lot: row for lot, row in rows.items() if app and row.get("app") == app}
+    if not rows:
+        return {}
+    paths: dict = {}
+    footprints = getattr(getattr(st, "work_footprints", None), "for_items", None)
+    if footprints is not None:
+        try:
+            for line in footprints(sorted(rows)) or ():
+                paths.setdefault(int(line["work_item_id"]), set()).add(
+                    _norm(str(line.get("path") or "")))
+        except Exception:  # noqa: BLE001 - sans empreinte, le texte suffit
+            paths = {}
+    found: dict = {}
+
+    def keep(module: str, lot: int) -> None:
+        if module not in found or lot < int(found[module]["id"]):
+            found[module] = rows[lot]
+
+    def cited(text: str, names: frozenset, qualified: bool) -> bool:
+        return any(_mentions(text, name, qualified) for name in names)
+
+    for lot, row in rows.items():
+        text = "%s\n%s" % (row.get("title") or "", row.get("body") or "")
+        for module, (names, qualified) in wanted.items():
+            if cited(text, names, qualified) \
+                    or _footprint_covers(paths.get(lot), names, qualified):
+                keep(module, lot)
+    try:
+        closed = reader(state=work.lifecycle.CLOSED, assignee=None,
+                        limit=SUPERSEDED_SCAN) or ()
+    except Exception:  # noqa: BLE001 - le lien n'est qu'un complément
+        closed = ()
+    for row in closed:
+        target = row.get("superseded_by")
+        if target in (None, "") or int(target) not in rows:
+            continue
+        text = "%s\n%s" % (row.get("title") or "", row.get("body") or "")
+        for module, (names, qualified) in wanted.items():
+            if cited(text, names, qualified):
+                keep(module, int(target))
+    return found
+
+
+def _uncovered(modules: Iterable[str], covered: dict) -> list[str]:
+    """Les lignes d'échec qu'aucun lot ouvert ne porte. Une ligne sans module
+    ou à module générique (`PLACEHOLDERS` : agrégat, panne d'installation)
+    n'est jamais couverte (B de ameesh-cx2) : l'incident reste dû."""
+    out = []
+    for module in modules or ():
+        path = _norm(module or "")
+        if not path or path in PLACEHOLDERS or path not in covered:
+            out.append(path or "<module vide>")
     return out
 
 
@@ -649,6 +826,29 @@ def consume(db, *, integration=None, lands=None, links=None, links_for=None,
                 failures = st.ci.failures(repo, run_id)
             except Exception:  # noqa: BLE001 - sans échecs relevés, l'incident reste dû
                 failures = []
+            modules = [f.get("module") for f in failures]
+            covered = covering_lots(st, app=app, modules=modules)
+            if covered and modules and not _uncovered(modules, covered):
+                # #5627 : chaque test rouge est déjà porté par un lot ouvert
+                # (un correctif en cours) : l'occurrence y est notée, aucun
+                # second lot n'est ouvert.
+                lots = sorted({int(lot_row["id"]) for lot_row in covered.values()})
+                for lot in lots:
+                    tests_of = sorted(key for key, lot_row in covered.items()
+                                      if int(lot_row["id"]) == lot)
+                    try:
+                        work.note(db, lot, "rouge de nouveau sur %s : run %d (%s, tête %s), "
+                                  "%s — porté par ce lot, aucun incident ouvert (#5627)"
+                                  % (branch, run_id, row.get("workflow") or "?",
+                                     head_sha[:12] or "?", ", ".join(tests_of)),
+                                  actor=actor, once=True)
+                    except Exception:  # noqa: BLE001 - la note est un suivi
+                        pass
+                line.update({"id": lots[0], "covered": lots,
+                             "why": "test(s) rouge(s) déjà porté(s) par %s : aucun incident"
+                                    % ", ".join("#%d" % lot for lot in lots)})
+                out.append(line)
+                continue
             commits: list[dict] = []
             try:
                 commits = list(lands(repo, head_sha))
@@ -677,7 +877,7 @@ def consume(db, *, integration=None, lands=None, links=None, links_for=None,
             result = open_incident(
                 db, repo=repo, branch=branch, run_id=run_id, head_sha=head_sha,
                 workflow=str(row.get("workflow") or ""), url=str(row.get("url") or ""),
-                modules=[f.get("module") for f in failures],
+                modules=modules,
                 tests=[f.get("test") for f in failures],
                 commits=commits, app=app, links=card, diagnosis=diagnosis, actor=actor)
             earlier = line["why"]
