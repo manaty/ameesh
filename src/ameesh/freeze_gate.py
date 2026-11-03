@@ -525,19 +525,27 @@ def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
         if repo else (False, None)
     if not canon_lot:
         return ""
-    root = clone or repo
     deadline = Deadline(canon_lowering.BUDGET_S)
 
-    def measure(ref: str):
-        loaded = canon_mod.load(root, ref=ref, deadline=deadline)
+    def measure(where: str, ref: str):
+        loaded = canon_mod.load(where, ref=ref, deadline=deadline)
         if not loaded.readable:
-            raise canon_mod.CanonError("canon unreadable at %s" % ref[:12])
+            raise canon_mod.CanonError("canon unreadable at %s in %s" % (ref[:12], where))
         return canon_mod.process_block(loaded)
 
-    try:
-        head = measure(sha)
-    except Exception as exc:  # noqa: BLE001 - le gel n'attend pas une mesure cassée
-        return "canon-rules-block: not measured: %s" % (str(exc) or type(exc).__name__)[:200]
+    # revue qa-01 : la tête se mesure d'abord dans `repo`, le dépôt où le gel
+    # l'a résolue (un clone d'auteur distinct, home#248) ; le clone configuré
+    # n'est qu'un repli. La base se lit dans le même dépôt que la tête.
+    roots = [repo] + ([clone] if clone and clone != repo else [])
+    head, root, failures = None, "", []
+    for where in roots:
+        try:
+            head, root = measure(where, sha), where
+            break
+        except Exception as exc:  # noqa: BLE001 - le gel n'attend pas une mesure cassée
+            failures.append((str(exc) or type(exc).__name__)[:200])
+    if not root:
+        return "canon-rules-block: not measured: %s" % "; ".join(failures)
     if head is None:
         return ""
     if not head.cut:
@@ -550,13 +558,13 @@ def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
     try:
         from . import plan_git
         target = str(item.get("branch_target") or "") \
-            or plan_git.default_target(repo, deadline=deadline) or ""
-        ref, tip = canon_lowering._revision(repo, target, deadline) if target \
+            or plan_git.default_target(root, deadline=deadline) or ""
+        ref, tip = canon_lowering._revision(root, target, deadline) if target \
             else ("", "")
         if tip and ref != "HEAD":
-            base = canon_lowering._merge_base(repo, tip, sha, deadline)
+            base = canon_lowering._merge_base(root, tip, sha, deadline)
             if base and base != sha:
-                base_block = measure(base)
+                base_block = measure(root, base)
     except Exception:  # noqa: BLE001 - base illisible : aucune exemption
         base_block = None
     # revue docs-01 : le manque (`over`, diagnostics compris) se compare, pas

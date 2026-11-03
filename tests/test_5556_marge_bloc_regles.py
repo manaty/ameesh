@@ -116,6 +116,18 @@ class GelTest(unittest.TestCase):
         note = self._gate_mesures(tete=(14939, 124), base=(14903, 190))
         self.assertIn("already cut at the base, 190 bytes over", note)
 
+    def test_tete_mesuree_dans_le_depot_du_gel_pas_dans_le_clone_configure(self):
+        # revue qa-01 : clone configuré A sain, clone d'auteur B porteur de la
+        # tête coupée (home#248) ; A ne connaît pas la tête, B la mesure
+        auteur = self.clone + "-auteur"
+        git(os.path.dirname(self.clone), "clone", "-q", self.clone, auteur)
+        git(auteur, "checkout", "-qB", "canon/5556-lot", "origin/main")
+        write(auteur, RACINE, carte(body=_corps(canon.RULES_BLOC_ROOM_COMPAT + 50)))
+        sha = commit_all(auteur, "lot", push=False)
+        db = types.SimpleNamespace(cfg=None)
+        with self.assertRaisesRegex(WorkError, "process-rules-block-too-long"):
+            freeze_gate._canon_rules_block(db, ITEM, sha, auteur)
+
     def test_lot_ordinaire_non_mesure(self):
         self.assertEqual(self._gate("a" * 40, {"branch": "lot/1-x",
                                                "branch_target": "main"}), "")
