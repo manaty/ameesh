@@ -377,5 +377,45 @@ class CoveredRedTest(unittest.TestCase):
             store, app="ameesh", modules=["tests/test_5582_rattrapage_relecture.py"]), {})
 
 
+class Edges5634Test(unittest.TestCase):
+    nexlink = CoveredRedTest.nexlink
+    def test_extensions_are_distinct_in_text_and_footprints(self):
+        module = "web/auth/session.test.tsx"
+        for footprint in ([], [(7001, "web/auth/session.test.ts")]):
+            store = self.nexlink([lot(7001, "Corriger web/auth/session.test.ts",
+                                      app="nexlink")], footprint)
+            self.assertEqual(incident.covering_lots(store, app="nexlink", modules=[module]), {})
+
+    def test_checkout_and_github_url_match_relative_path(self):
+        path = "website/auth/session.test.ts"
+        for module in ("/home/runner/work/product/product/" + path + ":12:1", path):
+            for citation in (path, "https://github.com/org/product/blob/main/" + path + "#L12"):
+                store = self.nexlink([lot(7001, "Corriger " + citation, app="nexlink")])
+                self.assertIn(module.lstrip("/"), incident.covering_lots(store, app="nexlink", modules=[module]))
+
+    def test_duplicate_link_from_closed_lot(self):
+        closed = lot(7000, "Corriger website/auth/session.test.ts", state="closed", app="nexlink")
+        store = self.nexlink([closed, lot(7001, "Correctif groupé", app="nexlink")])
+        for a, b in ((7000, 7001), (7001, 7000)):
+            store.work_dependencies = types.SimpleNamespace(links_for=lambda ids: [
+                {"work_item_id": a, "other_id": b, "kind": "duplicates"}])
+            self.assertEqual(incident.covering_lots(store, app="nexlink",
+                             modules=["website/auth/session.test.ts"])["website/auth/session.test.ts"]["id"], 7001)
+
+
+class MultiCancel5634Test(unittest.TestCase):
+    plan = DeliberateCancelTest.plan
+    groups = DeliberateCancelTest.groups
+    def test_second_cancel_in_porter_note_is_traced(self):
+        groups = self.groups(_Events(
+            "packet portier: cancel run 123 (url) requested; cancel run %d (%s) requested" % (RUN, URL)))
+        self.assertTrue(groups[0]["cancelled"])
+
+    def test_failed_second_cancel_is_not_traced(self):
+        groups = self.groups(_Events(
+            "packet portier: cancel run 123 (url) requested; cancel run %d: HTTP 409" % RUN))
+        self.assertFalse(groups[0]["cancelled"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
