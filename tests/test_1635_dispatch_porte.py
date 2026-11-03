@@ -111,7 +111,7 @@ class WorkflowStepsTest(unittest.TestCase):
         steps = plan.index("    steps:\n")
         self.assertEqual(plan.index("      - ", steps), plan.index(_REF_STEP))
         self.assertLess(plan.index(_REF_STEP), plan.index("actions/checkout@11d5960a326750d5838078e36cf38b85af677262"))
-        self.assertLess(plan.index("actions/setup-python@v5"), plan.index(_PR_STEP))
+        self.assertLess(plan.index("actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"), plan.index(_PR_STEP))
         self.assertLess(plan.index(_PR_STEP), plan.index("      - id: plan\n"))
         for name in (_REF_STEP, _PR_STEP):
             self.assertIn("        if: github.event_name == 'workflow_dispatch'\n", step(name))

@@ -109,7 +109,7 @@ class MiroirDesPartsTest(unittest.TestCase):
         # le découpage sous mesure ne peut pas venir de la table statique.
         # R1 : la carte est lue une seule fois, par le job `plan-mesure`.
         plan = _job("plan-mesure")
-        self.assertIn("actions/cache/restore@v4", plan)
+        self.assertIn("actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830", plan)
         self.assertIn('${CARTE:+--map "$CARTE"}', plan)
 
     def test_la_fusion_exige_une_matrice_verte(self):
@@ -143,7 +143,7 @@ class MiroirDesPartsTest(unittest.TestCase):
             if sur_echec.search(bloc):
                 self.assertIn("continue-on-error: true", bloc,
                               "seul un ménage tolérant tourne sur échec")
-        self.assertIn("actions/cache/save@v4", etapes)
+        self.assertIn("actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830", etapes)
 
 
 class PlanUniqueTest(unittest.TestCase):

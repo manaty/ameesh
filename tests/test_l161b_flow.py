@@ -191,10 +191,10 @@ class WorkflowTest(unittest.TestCase):
             self.assertIn('--plan "$RUNNER_TEMP/plan.json"', job, pilote)
             self.assertIn('--flow "$RUNNER_TEMP/flux.jsonl"', job, pilote)
             self.assertIn(f"name: flux-{pilote}-${{{{ matrix.part }}}}", job, pilote)
-            self.assertIn("actions/upload-artifact@v4", job, pilote)
+            self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", job, pilote)
             # résumé (ancre &resume, reprise par *resume) et artefact, même en échec
             self.assertRegex(job, r"- [&*]resume\b", pilote)
-            self.assertIn("if: always()\n        uses: actions/upload-artifact@v4", job, pilote)
+            self.assertIn("if: always()\n        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", job, pilote)
         self.assertIn('ci-flow.py summary "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"',
                       texte)
 
