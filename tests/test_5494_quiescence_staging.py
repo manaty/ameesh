@@ -156,6 +156,45 @@ class QuiescenceTest(unittest.TestCase):
         self.assertNotIn("non remise", res.stderr)
         self.assertEqual((self.faux / "python").read_text().split(), ["mesh-design", "bureau"])
 
+    def test_le_dsn_retire_va_au_seul_notifier(self):
+        # #5663: the unit's DSN is out of the probe's environment and of every
+        # remote command, yet the refusal still reaches the mail notifier.
+        espion = self.bin / "notifier"
+        espion.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "%s\\t%s\\n" "$1" "${AMEESH_DSN-absent}/${AGENT_MESH_DSN-absent}" >> "$FAUX/alertes"\n')
+        ssh = self.bin / "ssh"
+        ssh.write_text(SSH.replace(
+            "cat > /dev/null\n",
+            'cat > /dev/null\nprintf "%s %s\\n" "${AMEESH_DSN-absent}" "$*" >> "$FAUX/ssh-env"\n'))
+        self.rapporter("root@10.77.0.5", "session\t10.77.0.3\troot")
+        res = self.sonde(AMEESH_DSN="postgresql://secret-a", AGENT_MESH_DSN="postgresql://secret-b")
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertNotIn("non remise", res.stderr)
+        self.assertEqual(self.alertes(),
+                         ["mesh-design\tpostgresql://secret-a/postgresql://secret-b",
+                          "bureau\tpostgresql://secret-a/postgresql://secret-b"])
+        vus = (self.faux / "ssh-env").read_text()
+        self.assertEqual(len(vus.splitlines()), 4)
+        self.assertNotIn("secret", vus)
+        self.assertNotIn("secret", res.stderr)
+        # a DSN absent from the unit stays absent for the notifier
+        for f in ("alertes", "ssh-env"):
+            (self.faux / f).unlink()
+        env = dict(self.env, STAGING_PREVIOUS_RUN="sans-dsn")
+        env.pop("AMEESH_DSN", None)
+        env.pop("AGENT_MESH_DSN", None)
+        res = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(self.alertes(), ["mesh-design\tabsent/absent", "bureau\tabsent/absent"])
+
+    def test_unite_staging_pose_umask_0022(self):
+        unite = SCRIPT.parents[1] / "systemd/ameesh-staging.service"
+        lignes = unite.read_text().splitlines()
+        service = lignes[lignes.index("[Service]") + 1:]
+        self.assertIn("UMask=0022", service)
+
     def test_hote_precedent_injoignable_bloque_sans_contacter_les_cibles(self):
         (self.faux / "root@10.77.0.3.rc").write_text("255")
         res = self.sonde()
