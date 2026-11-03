@@ -20,20 +20,91 @@ Depuis un checkout revu, sur chacune des VM CI :
    `journalctl -u ameesh-ci-disque.service -n 100 --no-pager`.
 
 La passe partage le verrou des jobs et s'exécute sous leur uid, jamais root.
-Elle ne touche pas aux caches d'actions, d'outils et d'updaters. Les temporaires
-sous `_work/_temp` et `/tmp` gardent leur garde au **ctime >48 h** ; `/tmp`
-est borné au compte courant. Le contenu `_work` hors `_temp` est conservé.
-Les journaux `Runner_*.log` et `Worker_*.log` fermés sont compressés après
-72 h ; les archives restent encore 7 jours. Les liens sont ignorés. Les
-inodes ouverts par Listener/Worker sont gardés même s'ils sont anciens ;
-si leurs descripteurs sont illisibles, la rotation est abandonnée et le
-rapport l'indique. Vérifier ce point sur la première passe.
+Elle ne touche pas aux caches d'actions ni d'outils. Pour `_work/_update`
+(#5635), elle ne retire que l'extraction d'un auto-update **déjà installé ou
+dépassé**, après preuve que le cache est hors usage (voir ci-dessous). Les
+temporaires sous `_work/_temp` et `/tmp` gardent leur garde au **ctime >48 h** ;
+`/tmp` est borné au compte courant. Le contenu `_work` hors `_temp` et hors
+cache `_update` éligible est conservé. Les journaux `Runner_*.log` et
+`Worker_*.log` fermés sont compressés après 72 h ; les archives restent encore
+7 jours. Les liens sont ignorés. Les inodes ouverts par Listener/Worker sont
+gardés même s'ils sont anciens ; si leurs descripteurs sont illisibles, la
+rotation est abandonnée et le rapport l'indique. Vérifier ce point sur la
+première passe.
 
 Le budget de compression est de 128 fichiers / 120 secondes par passe.
 Une erreur, une source modifiée ou une archive existante conserve le log
 original. Le service a sa propre borne de 15 minutes. Le ménage docker garde
 les politiques existantes de #5325 ; les images étiquetées sans conteneur
 ne sont pas élaguées par cette passe (le workflow quotidien s'en charge).
+
+## Caches `_work/_update` des auto-updates (#5635)
+
+Le mécanisme officiel du runner (source `actions/runner`,
+`Runner.Listener/SelfUpdater*.cs`) télécharge et extrait le paquet dans
+`_work/_update`, copie `bin` → `bin.<version>` et `externals` →
+`externals.<version>` à la racine, puis bascule les liens `bin`/`externals`
+avec `_work/_update.sh`. Il supprime `_work/_update` au **début** du cycle
+suivant, pas à la fin du courant : sans ménage, chaque slot garde une
+extraction d'environ 700 MiB (mesure opérateur du 03/11 : ~699 000 KiB ×
+8 slots ≈ 5,33 GiB/hôte).
+
+La politique ne retire un cache que si toutes les preuves suivantes tiennent :
+
+* chemin attendu : `<home>/rN/_work/_update`, racine avec `.runner`, aucun
+  lien dans le chemin, `_update` réel et sur le même système de fichiers ;
+* entrées de tête attendues du paquet ; `bin` et `externals` réels (jamais
+  des liens) ; liens internes du paquet autorisés seulement s'ils restent
+  dans le cache (les liens `node*/bin/npm` du paquet officiel sont internes) ;
+* version du cache lue dans `bin/Runner.Listener.deps.json`, sans exécuter le
+  binaire : version **inférieure ou égale** à `bin/Runner.Listener.deps.json`
+  courant. Une version supérieure est une mise à jour en attente, préservée ;
+  une version illisible aussi ;
+* pour la version égale, `bin.<v>`/`externals.<v>` installés et les liens
+  courants cohérents, avec la même empreinte de `Runner.Listener.deps.json` ;
+* aucun processus du même uid avec `cwd` ou descripteur ouvert sous le cache
+  (updater vivant), aucun script `_work/_update.sh` vivant, aucun
+  `Runner.Worker` actif sous la racine, aucun Listener redémarré depuis moins
+  de 10 min (unité réactivée entre deux contrôles) ; des descripteurs ou un
+  démarrage illisibles préservent le cache ;
+* `bin`, `externals`, `bin.*` et `externals.*` de la racine ne pointent pas
+  dans le cache. Les versions installées et les sauvegardes `bin.*`/
+  `externals.*` ne sont jamais touchées.
+
+Le contrôle est refait juste avant la suppression (inode, version, processus,
+liens). Un doute, une erreur de lecture ou une suppression partielle sont
+rapportés dans la ligne de ménage, sans faire rougir l'étape. Aucun label
+n'est retiré, aucune mise à jour n'est désactivée, aucun identifiant nouveau
+n'est posé sur les VM.
+
+### Qualification et marge disque
+
+Après intégration, réinstaller la copie exécutée par la minuterie
+(`sudo bash deploy/ci-flotte/install-disque.sh --install`), puis sur chaque VM
+et sans drain si le dry-run est propre :
+
+1. `sudo -u runner /usr/local/lib/ameesh-ci/ci-disque.py menage --force
+   --dry-run` : lire les décisions `rN` (retiré / préservé / refusé et la
+   raison), vérifier qu'aucun updater ni Worker actif n'est préservé à tort.
+2. Relever `df -B1 /`, `df -i /` et la taille de chaque `_work/_update`
+   (`rapport --complet` publie désormais une ligne `cache _update rN`).
+   Lancer la passe réelle, puis vérifier que `bin`, `externals`,
+   `bin.<v>`/`externals.<v>` et les liens courants sont intacts, et que
+   `df -B1 /` a gagné au moins la taille mesurée des caches retirés.
+3. Attendre deux cycles d'auto-update (ou deux mises à jour provoquées par
+   le mécanisme officiel) et refaire les mêmes relevés : un cache dont la
+   version vient d'être installée doit partir ; un cache de version
+   supérieure doit rester jusqu'à la bascule.
+4. Si un drain est nécessaire, réutiliser `ameesh-ci-runner-drain` (#3312) et
+   ne redémarrer que les unités que cette opération a arrêtées.
+
+Arithmétique de capacité, à ne pas confondre avec la prévention : après le
+retrait opérateur des 23 caches, les VM avaient 6,6–7 GiB libres, sous le
+seuil mesh de 15 GiB. Cette politique supprime le pic durable de 5,33 GiB,
+mais ne garantit pas 15 GiB pendant la fenêtre d'un update sur une racine de
+35 GiB. Si le seuil ne tient pas après une journée de mesure, chiffrer la
+capacité avant toute dépense (ordre de grandeur : +8 à +9 GiB, ou une racine
+de 48 GiB) et demander la décision owner.
 
 ## Surveillance via GitHub, sans identifiant nouveau sur les VM
 
