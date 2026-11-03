@@ -65,25 +65,61 @@ class DownloadFailureTest(unittest.TestCase):
         self.assertFalse(failed_action_download(job, text))
         self.assertFalse(failed_action_download(JOB, 'HTTP 429 Too Many Requests'))
 
-    def test_retry_is_only_for_listed_jobs_and_survives_watcher_restart(self):
+    def test_retry_is_once_per_run_and_survives_watcher_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = types.SimpleNamespace(state_dir=tmp)
             api = mock.Mock(return_value={'status': 'completed', 'head_sha': 'abc', 'run_attempt': 1})
             rerun = mock.Mock()
             jobs = [JOB, dict(JOB, id=43)]
             for _ in range(2):
-                watcher = Watcher(cfg, api=api, rerun_job=rerun)
+                watcher = Watcher(cfg, api=api, rerun_failed_jobs=rerun)
                 watcher._retry_download_jobs('org/repo', ROW, jobs)
-            self.assertEqual(rerun.call_args_list, [mock.call('org/repo', 42), mock.call('org/repo', 43)])
+            self.assertEqual(rerun.call_args_list, [mock.call('org/repo', 8)])
             watcher._retry_download_jobs('org/repo', dict(ROW, run_attempt=2), [dict(JOB, id=44)])
-            self.assertEqual(rerun.call_count, 2)
+            self.assertEqual(rerun.call_count, 1)
+
+    def test_retry_posts_failed_jobs_endpoint_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watcher = Watcher(types.SimpleNamespace(state_dir=tmp),
+                api=lambda _: {'status': 'completed', 'head_sha': 'abc', 'run_attempt': 1})
+            with mock.patch('ameesh.plan_github._json') as post:
+                watcher._retry_download_jobs('org/repo', ROW, [JOB, dict(JOB, id=43)])
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(post.call_args.args[1],
+                ['api', '-X', 'POST', 'repos/org/repo/actions/runs/8/rerun-failed-jobs'])
+
+    def test_forbidden_retry_consumes_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rerun = mock.Mock(side_effect=RuntimeError('HTTP 403 Forbidden'))
+            for _ in range(2):
+                watcher = Watcher(types.SimpleNamespace(state_dir=tmp),
+                    api=lambda _: {'status': 'completed', 'head_sha': 'abc', 'run_attempt': 1},
+                    rerun_failed_jobs=rerun)
+                watcher._retry_download_jobs('org/repo', ROW, [JOB, dict(JOB, id=43)])
+            rerun.assert_called_once_with('org/repo', 8)
+
+    def test_mixed_or_incomplete_run_is_never_retried(self):
+        text = (ROOT / 'tests/fixtures/5655/429.log').read_text()
+        bad = dict(JOB, id=43, steps=[{'name': 'Tests', 'conclusion': 'failure'}])
+        for listing in [{'jobs': [JOB, bad]}, {'jobs': [JOB], 'total_count': 101}]:
+            watcher = Watcher(types.SimpleNamespace(), api=lambda _: listing, logs=lambda *_: text)
+            store = mock.Mock()
+            store.ci.failures.return_value = []
+            store.ci.head_replaced.return_value = False
+            run = {'id': 8, 'status': 'completed', 'conclusion': 'failure', 'run_attempt': 1}
+            with mock.patch('ameesh.ci.storage.of', return_value=store), \
+                    mock.patch.object(watcher, '_retry_download_jobs') as retry, \
+                    mock.patch.object(watcher, '_verdict'):
+                watcher._conclude(None, 'org/repo', ROW, run=run)
+            retry.assert_not_called()
+            store.ci.conclude.assert_called_once_with('org/repo', 8, 'failure')
 
     def test_changed_head_or_running_attempt_is_never_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
             rerun = mock.Mock()
             watcher = Watcher(types.SimpleNamespace(state_dir=tmp),
                 api=lambda _: {'status': 'in_progress', 'head_sha': 'other', 'run_attempt': 2},
-                rerun_job=rerun)
+                rerun_failed_jobs=rerun)
             watcher._retry_download_jobs('org/repo', ROW, [JOB])
             rerun.assert_not_called()
 

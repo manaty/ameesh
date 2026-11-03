@@ -1039,14 +1039,14 @@ class Watcher:
     passage, et un quota épuisé arrête le passage sans boucle."""
 
     def __init__(self, cfg, *, api=None, cancel=None, log=None, clock=None,
-                 dry_run: bool = False, ttl=None, logs=None, rerun_job=None):
+                 dry_run: bool = False, ttl=None, logs=None, rerun_failed_jobs=None):
         self.cfg = cfg
         self.api = api
         #: #3783 : lecture du log d'un job (`(dépôt, job_id) -> texte`). None :
         #: pas de lecture de log (tests, ou `gh` absent) ; le relevé normal et
         #: le flux JSON gardent leur comportement.
         self.logs = logs
-        self.rerun_job = rerun_job
+        self.rerun_failed_jobs = rerun_failed_jobs
         self._action_downloads = {}
         self._job_log_texts = {}
         self._parsed_logs: set = set()
@@ -2350,7 +2350,7 @@ class Watcher:
         return found
 
     def _retry_download_jobs(self, repo, row, jobs):
-        """#5655: at most one request per job, durable across watcher restarts.
+        """#5655: at most one request per run, durable across watcher restarts.
 
         Spend the marker before the request: an ambiguous HTTP failure must
         not cause an unbounded replay. Only attempt 1 is eligible.
@@ -2370,23 +2370,24 @@ class Watcher:
                 or int(current.get("run_attempt") or 1) != 1
                 or current.get("head_sha") != row.get("head_sha")):
             return
-        for job in jobs:
-            key = hashlib.sha256((repo + ":" + str(row["run_id"]) + ":" + str(job["id"])).encode()).hexdigest()
-            try:
-                with (folder / key).open("x") as marker:
-                    marker.write("action archive infrastructure; one retry consumed\n")
-            except FileExistsError:
-                continue
-            try:
-                if self.rerun_job is not None:
-                    self.rerun_job(repo, int(job["id"]))
-                else:
-                    from . import plan_github
-                    plan_github._json(plan_github.Gh(), ["api", "-X", "POST",
-                        "repos/%s/actions/jobs/%s/rerun" % (repo, job["id"])])
-                self.log("CI %s: infrastructure action download, job %s rerun once" % (repo, job["id"]))
-            except Exception as exc:
-                self.log("CI: action download retry failed (request consumed): %s" % exc)
+        if not jobs:
+            return
+        key = hashlib.sha256((repo + ":" + str(row["run_id"])).encode()).hexdigest()
+        try:
+            with (folder / key).open("x") as marker:
+                marker.write("action archive infrastructure; one retry consumed\n")
+        except FileExistsError:
+            return
+        try:
+            if self.rerun_failed_jobs is not None:
+                self.rerun_failed_jobs(repo, int(row["run_id"]))
+            else:
+                from . import plan_github
+                plan_github._json(plan_github.Gh(), ["api", "-X", "POST",
+                    "repos/%s/actions/runs/%s/rerun-failed-jobs" % (repo, row["run_id"])])
+            self.log("CI %s: infrastructure action download, run %s failed jobs rerun once" % (repo, row["run_id"]))
+        except Exception as exc:
+            self.log("CI: action download retry failed (request consumed): %s" % exc)
 
     def _record_failed_jobs(self, st, repo: str, row: dict,
                             bases=BASE_BRANCHES) -> None:
@@ -2443,14 +2444,14 @@ class Watcher:
             failed = [j for j in jobs.get("jobs") or []
                       if j.get("conclusion") in FAILED_JOB_CONCLUSIONS]
             infrastructure = self._download_jobs(repo, row, failed)
-            if infrastructure and not st.ci.head_replaced(
-                    repo, row["branch"], row["head_sha"], int(row["run_id"])):
-                self._retry_download_jobs(repo, row, infrastructure)
             complete = int(jobs.get("total_count") or len(jobs.get("jobs") or [])) <= len(jobs.get("jobs") or [])
             if complete and failed and len(infrastructure) == len(failed) and not st.ci.failures(repo, int(row["run_id"])):
                 # Existing cancelled storage state represents no conclusion;
                 # never persist success or manufacture negative test evidence.
                 status = "cancelled"
+                if not st.ci.head_replaced(
+                        repo, row["branch"], row["head_sha"], int(row["run_id"])):
+                    self._retry_download_jobs(repo, row, infrastructure)
         if infrastructure and status == "cancelled":
             if not st.ci.conclude(repo, int(row["run_id"]), status):
                 return []
