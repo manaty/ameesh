@@ -21,7 +21,7 @@ from unittest import mock
 from ameesh import adapters, mail, registry, runner as runner_mod
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, scaled
 
 #: faux harnais : dépose un message « pendant le tour », appelle le hook v1
 #: comme le ferait le harnais, journalise sa sortie, puis se comporte comme le
@@ -368,7 +368,8 @@ class CourrierDansLaConsigneTest(PgTestCase):
             fil_r.start()
             fil_r.join(1.5)
             self.assertTrue(fil_r.is_alive(), "la réservation n'a pas attendu le verrou")
-        fil_r.join(30)
+        # #5629 : borne haute seule — mise à l'échelle du banc (psql chargé)
+        fil_r.join(scaled(30))
         self.assertEqual(resultat["ids"], [])
         self.assertIsNone(self._ligne(mid)["consigne_runner"])
 
@@ -500,7 +501,8 @@ class CourrierDansLaConsigneTest(PgTestCase):
         def porteur(nom, porte):
             conn = self.connect()
             try:
-                barriere.wait(10)
+                # #5629 : bornes hautes seules — à l'échelle du banc (psql chargé)
+                barriere.wait(scaled(10))
                 jeton = mail.new_token()
                 pris: list[int] = []
                 for _ in range(10):
@@ -519,7 +521,7 @@ class CourrierDansLaConsigneTest(PgTestCase):
         for f in fils:
             f.start()
         for f in fils:
-            f.join(60)
+            f.join(scaled(60))
         for valeur in resultats.values():
             if isinstance(valeur, BaseException):
                 raise valeur

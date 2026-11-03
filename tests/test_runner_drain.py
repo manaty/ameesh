@@ -21,7 +21,7 @@ import unittest
 
 from ameesh import config as config_mod, registry
 
-from .support import EMPTY_CONFIG, REPO, PgTestCase
+from .support import EMPTY_CONFIG, REPO, PgTestCase, scaled
 
 UNIT = os.path.join(REPO, "deploy", "systemd", "ameesh-runner-agent@.service")
 
@@ -84,11 +84,15 @@ class DrainageTest(PgTestCase):
         self.assertEqual(len(self.turns()), 1)  # aucun nouveau tour
 
     def test_borne_du_drainage_arrete_le_tour(self):
-        proc = self._lance("borne", AMEESH_DRAIN_SECONDS="1", AMEESH_TEST_SLEEP="60")
+        # #5629 : borne et durée du tour à la même échelle (arrêt et ménage
+        # sous psql chargé) : la borne reste sous la fin naturelle du tour,
+        # coupé avant, il ne coûte rien de plus
+        proc = self._lance("borne", AMEESH_DRAIN_SECONDS="1",
+                           AMEESH_TEST_SLEEP=str(int(scaled(60))))
         debut = time.monotonic()
         proc.send_signal(signal.SIGTERM)
-        sortie, _ = proc.communicate(timeout=60)
-        self.assertLess(time.monotonic() - debut, 30, sortie)
+        sortie, _ = proc.communicate(timeout=scaled(60))
+        self.assertLess(time.monotonic() - debut, scaled(30), sortie)
         self.assertEqual(proc.returncode, 0, sortie)
         self.assertIn("limit reached", sortie)
         # tour arrêté (comme avant le drainage) : sa consigne repart en attente
@@ -109,15 +113,17 @@ class DrainageTest(PgTestCase):
 
     def test_le_drainage_attend_le_travail_de_fond(self):
         pidfile = os.path.join(self.tmp, "fond.pid")
+        # #5629 : le travail de fond doit tourner encore au signal, après la
+        # fin du tour vue en base (plusieurs secondes sous psql chargé)
         proc = self._lance("fond-drain", AMEESH_DRAIN_SECONDS="120",
-                           AMEESH_TEST_BACKGROUND="sleep 8",
+                           AMEESH_TEST_BACKGROUND="sleep %d" % scaled(8),
                            AMEESH_TEST_BACKGROUND_PID=pidfile)
         # le tour fini, son travail de fond tourne : le signal attend sa fin
         self.wait_for(lambda: registry.get(self.db, "fond-drain")["turns"] == 1,
                       timeout=30)
         debut = time.monotonic()
         proc.send_signal(signal.SIGTERM)
-        sortie, _ = proc.communicate(timeout=60)
+        sortie, _ = proc.communicate(timeout=scaled(60))  # #5629 : borne haute
         self.assertEqual(proc.returncode, 0, sortie)
         self.assertGreater(time.monotonic() - debut, 1.0, sortie)
         self.assertIn("draining finished", sortie)

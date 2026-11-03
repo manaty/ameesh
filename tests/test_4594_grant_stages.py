@@ -26,7 +26,7 @@ from unittest import mock
 from ameesh import mail, registry
 from ameesh.runner import Runner
 
-from .support import PgTestCase
+from .support import PgTestCase, scaled
 
 
 class _Worker:
@@ -127,7 +127,9 @@ class BancFileTxLockTest(PgTestCase):
         def holder():
             with lock:
                 held.set()
-                release.wait(5)
+                # #5629 : le verrou reste tenu au moins autant que l'attente du
+                # réveil (mise à l'échelle) ; `release` le rend dès le réveil
+                release.wait(scaled(5))
 
         original = mail.get
         #: #5302 : ce que la lecture en base voit en entrant. Le réveil est
@@ -179,14 +181,15 @@ class BancFileTxLockTest(PgTestCase):
                 # Pas de borne absolue : sur un runner chargé, le fil peut
                 # mettre longtemps à démarrer. Le témoin tranche l'ordre ;
                 # cette attente n'est qu'un garde-fou de temps.
-                woke = self.worker.wake.wait(5)
+                # #5629 : borne haute à l'échelle du banc (psql chargé)
+                woke = self.worker.wake.wait(scaled(5))
                 release.set()
-                thread.join(timeout=5)
+                thread.join(timeout=scaled(5))
         finally:
             release.set()
-            holder_thread.join(timeout=5)
+            holder_thread.join(timeout=scaled(5))
             if thread is not None:
-                thread.join(timeout=5)
+                thread.join(timeout=scaled(5))
         self.assertTrue(woke, "le réveil est resté derrière la file")
         self.assertEqual(wake_seen_at_read, [True],
                          "le réveil a attendu la lecture en base : `dispatch` a "

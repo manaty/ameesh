@@ -20,7 +20,7 @@ from unittest import mock
 from ameesh import exploitation, mail, registry
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, scaled
 
 
 class MarqueurTest(unittest.TestCase):
@@ -144,7 +144,7 @@ class FenetreDeSelectionTest(PgTestCase):
 
         def ouverture_lente():
             preparation_atteinte.set()
-            self.assertTrue(liberer.wait(5), "barrière de préparation non libérée")
+            self.assertTrue(liberer.wait(scaled(5)), "barrière de préparation non libérée")
             return ouverture()
 
         resultat: list = []
@@ -157,7 +157,7 @@ class FenetreDeSelectionTest(PgTestCase):
                 fil = threading.Thread(
                     target=lambda: resultat.append(worker.run_turn(spec)), daemon=True)
                 fil.start()
-                self.assertTrue(preparation_atteinte.wait(5),
+                self.assertTrue(preparation_atteinte.wait(scaled(5)),
                                 "préparation du tour non atteinte")
                 # Ordre déterministe de la relecture : pick() -> préparation ->
                 # request_preempt() (dispatch) -> le début de tour ne doit pas
@@ -165,7 +165,7 @@ class FenetreDeSelectionTest(PgTestCase):
                 worker.request_preempt()
                 self.assertTrue(worker.preempting.is_set())
                 liberer.set()
-                fil.join(timeout=10)
+                fil.join(timeout=scaled(10))
             self.assertFalse(fil.is_alive())
             self.assertEqual(resultat, [False],
                              "la préemption reçue pendant la préparation a été effacée")
@@ -210,7 +210,7 @@ class FrontiereAvantSelectionTest(PgTestCase):
             fil = threading.Thread(
                 target=lambda: verdict.append(worker.run_turn(spec)), daemon=True)
             fil.start()
-            fil.join(timeout=15)
+            fil.join(timeout=scaled(15))
         self.assertFalse(fil.is_alive(), "le tour n'a pas rendu la main")
         return verdict
 
