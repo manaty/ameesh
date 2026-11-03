@@ -71,7 +71,9 @@ class WorkAliasTest(unittest.TestCase):
     def _both(self, command, arguments, *, code=0):
         calls = []
 
-        def handler(*args):
+        def handler(*args, **_kwargs):
+            # #5601 : `plan_cli.run(db, args, cfg=cfg)` ; la doublure de
+            # merge_pr, elle, ne reçoit que des positionnels
             namespace = args[-1]
             calls.append(_seen(namespace))
             print(json.dumps({"command": command, "seen": calls[-1]}, default=str))

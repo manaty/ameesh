@@ -596,6 +596,12 @@ def agent_adapter(harness: str, harness_bin: str | None,
     return adapters.adapter_for(harness, harness_bin)
 
 
+#: #5601 (B cx3) : rend atomiques, pour l'admission comme pour le changement
+#: de tour, le relevé des vivants, les places tenues, la décision et
+#: l'écriture des réservations ; pris AVANT `Runner.lock`, jamais l'inverse.
+_SLOT_RESERVATIONS_LOCK = threading.Lock()
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -6112,6 +6118,23 @@ class AgentWorker(threading.Thread):
                 self._servir(())  # #2810 : ce tour ne partira pas
                 self._credits_candidate = None
                 return None
+            # #5601 (B cx3) : tout tour portant un lot (relance, réveil
+            # programmé, courrier, consigne) rejuge la place réservée que ce
+            # worker résident tient ; le lot ne la remplit plus et aucune
+            # place partagée ne reste : rien n'est consommé (consigne rendue,
+            # claim du réveil oublié par `_pick_for_turn`), le bail est rendu
+            # et la réclamation réadmet par classe.
+            if not self._reservation_fits(spec.get("lot")):
+                if spec.get("kind") == "prompt":
+                    registry.restore_prompt(self.db, self.name, self.runner.runner_id,
+                                            self.epoch)
+                self.suite, self._reprise_attach, self.nudged = reprises
+                self._servir(())
+                self._credits_candidate = None
+                log_async("[%s] lot #%s does not fit the slot reservations: "
+                          "lease released" % (self.name, spec.get("lot")))
+                self.stopping.set()
+                return None
             # #4164 (B1 cx2) : la sonde d'un compte épuisé n'est réservée que
             # pour un tour réellement choisi ; perdue (autre agent), la
             # consigne repart en attente comme ci-dessus.
@@ -6126,6 +6149,25 @@ class AgentWorker(threading.Thread):
             # `_run_guarded_turn` la gardent (dict(spec, …)).
             spec["_preempt_gen"] = frontiere
         return spec
+
+    def _reservation_fits(self, lot, row: dict | None = None) -> bool:
+        """#5601 : la place de ce worker tient-elle pour un tour sur `lot` ?
+        `row` : la ligne déjà lue (`actionable`, avec `project`). Sans
+        réservation sur l'hôte, sans lot ou lot illisible : oui (une panne de
+        lecture ne rend pas un bail)."""
+        fits = getattr(self.runner, "reservation_turn_allowed", None)  # doublures
+        if fits is None or not lot or not getattr(self.runner, "_host_slot_reservations", None):
+            return True
+        if row is None:
+            try:
+                item = storage.of(self.db).work.get(int(lot))
+            except (db_mod.DbError, TypeError, ValueError):
+                return True
+            if item is None:
+                return True
+            row = {"id": item.get("id"), "project": item.get("app"),
+                   "priority": item.get("priority")}
+        return fits(self.name, self.agent or {}, row)
 
     def _pick(self) -> dict | None:
         agent = registry.get(self.db, self.name)
@@ -6595,12 +6637,18 @@ class AgentWorker(threading.Thread):
         now = time.time()
         try:
             lots = st.actionable(self.name, today=_dt.date.today().isoformat())
+            refused = False
             for row in lots:
                 if not self.lot_wake_allowed(row, now, base):
                     continue
                 if self._lot_workdir_blocked(row["id"]):
                     # #811 (B2) : pas de réveil consommé pour un lot dont le
                     # dossier manque — un autre lot actionnable est élu.
+                    continue
+                if not self._reservation_fits(row["id"], row):
+                    # #5601 (B cx3, 3e tour) : jugé AVANT `note_wake` — un
+                    # réveil refusé ne compte ni au plafond ni au délai
+                    refused = True
                     continue
                 note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
                 log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
@@ -6609,6 +6657,12 @@ class AgentWorker(threading.Thread):
                         "prompt": adapters.LOT_WAKE_PROMPT % {
                             "id": int(row["id"]), "title": row.get("title") or "",
                             "state": row["state"]}}
+            if refused:
+                # aucun lot actionnable ne tient dans la place réservée tenue :
+                # le bail est rendu, la réclamation réadmet par classe
+                log_async("[%s] no actionable lot fits the slot reservations: "
+                          "lease released" % self.name)
+                self.stopping.set()
         except db_mod.DbError as exc:
             log_async("[%s] actionable lots unreadable (%s)" % (self.name, exc))
         return None
@@ -11179,6 +11233,9 @@ class Runner:
         from . import host_gate as host_gate_mod
         with self._gate_slots_lock:
             host_gate_mod.SlotPool.release(self._gate_slots.pop(name, None))
+        with _SLOT_RESERVATIONS_LOCK:
+            # #5601 : admission close (worker inscrit puis fini, ou échec)
+            (getattr(self, "_admitting", None) or set()).discard(name)
 
     # -- réclamation -------------------------------------------------------
     @migrations.writer_tick
@@ -11588,6 +11645,9 @@ class Runner:
         # lit une liste vide comme « tous »)
         candidates = ([] if _admits_nobody(self)
                       else registry.claimable(self.db, self.host, self.agents_filter))
+        # #5601 : avec des réservations, admission par classe puis par date du
+        # prochain lot ; sans réservation, l'ordre du registre reste intact
+        candidates = self._admission_order(candidates)
         for agent in candidates:
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -13677,6 +13737,9 @@ class Runner:
         from . import placement as placement_mod
         self._host_pinned_admissions = sum(
             placement_mod.host_load(one)[0].get(self.host, 0) for one in canons)
+        # #5601 : places réservées à un projet ou à une classe (fiches Host)
+        from . import slot_reservations as slot_reservations_mod
+        self._host_slot_reservations = slot_reservations_mod.of_host(canons, self.host) or None
         # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
         # par défaut
         sync_gate = getattr(self, "_sync_host_gate", None)
@@ -13738,6 +13801,119 @@ class Runner:
                           if name != (agent or {}).get("name") and worker.is_alive())
         return running < cap
 
+    def _lot_fingerprint(self, lot) -> tuple | None:
+        """#5601 (B cx2) : ce qui, du lot refusé au pick, peut changer le
+        prochain tour (état, priorité, assigné, projet, réveil, mise à jour) ;
+        None si illisible."""
+        try:
+            row = storage.of(self.db).work.get(int(lot))
+        except (db_mod.DbError, TypeError, ValueError):
+            return None
+        if row is None:
+            return ("gone",)
+        # B2 cx3 : les clés du contrat de `work.get` (`wake_ts`, `updated_ts`)
+        return tuple(str(row.get(key)) for key in
+                     ("state", "priority", "assignee", "app", "wake_ts", "updated_ts"))
+
+    def _admission_order(self, candidates: list) -> list:
+        """#5601 : candidats dans l'ordre d'admission. Sans réservation sur
+        l'hôte : la liste telle quelle, aucun lot lu. Avec : le prochain lot
+        de chaque candidat (celui de son réveil, `lot_sessions.actionable`)
+        est lu, puis `slot_reservations.order` (rôles élus, classe, date).
+
+        Décision mesh-design (option A) : un lot que le pick vient de refuser
+        remplace cette lecture jusqu'à ce qu'un tour passe ou que ce lot
+        change (`_lot_fingerprint`) : l'admission juge alors exactement ce
+        que le pick jugera — jamais « admis, refusé au pick, bail rendu,
+        réadmis » sur un état inchangé, quelle que soit l'attente."""
+        reservations = getattr(self, "_host_slot_reservations", None)
+        if not reservations:
+            return candidates
+        import datetime as _dt
+        from . import slot_reservations as slot_reservations_mod
+        st = storage.of(self.db).lot_sessions
+        today = _dt.date.today().isoformat()
+        demands = {}
+        for agent in candidates:
+            name = agent.get("name")
+            try:
+                rows = st.actionable(name, today=today)
+            except db_mod.DbError as exc:
+                log_async("[%s] next lot unreadable for admission (%s)" % (name, exc))
+                rows = []
+            demands[name] = rows[0] if rows else None
+            refused = getattr(self, "_refused_demands", None) or {}
+            if name in refused:
+                fingerprint, row = refused[name]
+                if self._lot_fingerprint(row.get("id")) == fingerprint:
+                    demands[name] = row
+                else:
+                    refused.pop(name, None)   # le travail a changé : relecture
+        self._admission_demands = demands
+        return slot_reservations_mod.order(candidates, demands, reservations)
+
+    def _reservation_admits(self, agent: dict, cap: int, demand: dict | None, *,
+                            admitting: bool = False) -> bool:
+        """#5601 : une place réservée n'est prise que par un agent qui la
+        remplit — `project:<p>` par un agent du projet `<p>` (canon), sans
+        prédire son tour ; `class:<n>` par un agent dont le lot (`demand`) a
+        la priorité `<n>`. Une place libre ne va aux autres que si les
+        réservations non remplies tiennent encore.
+
+        B cx3 : relevé des vivants, places tenues, décision et écriture sont
+        atomiques sous `_SLOT_RESERVATIONS_LOCK` (admission et changement de
+        tour) ; un agent admis pas encore inscrit (`_admitting`) compte."""
+        from . import projects as projects_mod
+        from . import slot_reservations as slot_reservations_mod
+        name = agent.get("name")
+        wants = slot_reservations_mod.keys_for(None, (demand or {}).get("priority")) \
+            if agent.get("releve") != "election" else []
+        wants += ["project:%s" % p for p in projects_mod.agent_projects(agent)]
+        with _SLOT_RESERVATIONS_LOCK:
+            with self.lock:
+                live = {other for other, worker in self.workers.items()
+                        if other != name and worker.is_alive()
+                        and not (getattr(worker, "agent", None) or {}).get("ephemeral")}
+            admitting_set = getattr(self, "_admitting", None)
+            if admitting_set is None:
+                admitting_set = self._admitting = set()
+            live |= admitting_set - {name}
+            filled = getattr(self, "_slot_reservations", None)
+            if filled is None:
+                filled = self._slot_reservations = {}
+            held: dict = {}
+            for other in live:
+                key = filled.get(other)
+                held[key] = held.get(key, 0) + 1
+            admitted, key = slot_reservations_mod.decide(
+                self._host_slot_reservations, held, len(live), cap, wants)
+            if admitted:
+                filled[name] = key
+                if admitting:
+                    admitting_set.add(name)
+        return admitted
+
+    def reservation_turn_allowed(self, name: str, agent: dict, row: dict) -> bool:
+        """#5601 (B cx3) : un worker résident change de lot entre ses tours
+        sans repasser l'admission. Au départ de chaque tour de lot, sa place
+        est rejugée sur ce lot, les autres workers gardant la leur : la clé
+        qu'il remplit est mise à jour, ou False quand le lot ne tient plus
+        (il rend alors son bail). Sans réservation ni plafond : True."""
+        cap = getattr(self, "_host_max_agents", None)
+        if not getattr(self, "_host_slot_reservations", None) or cap is None \
+                or agent.get("ephemeral"):
+            return True
+        allowed = self._reservation_admits(dict(agent, name=name), cap, row)
+        refused = getattr(self, "_refused_demands", None)
+        if refused is None:
+            refused = self._refused_demands = {}
+        if allowed:
+            refused.pop(name, None)
+        else:
+            # option A : l'admission suivante juge ce même lot (pas de cycle)
+            refused[name] = (self._lot_fingerprint(row.get("id")), dict(row))
+        return allowed
+
     def admits_new_worker(self, agent: dict) -> bool:
         """L43 (0031) : `max_agents` PHYSIQUE de l'hôte (le plus petit des
         fiches Host de tous les canons) borne le nombre de personas que cet
@@ -13754,17 +13930,22 @@ class Runner:
         if cap is None or (agent or {}).get("ephemeral"):
             return True
         with self.lock:
-            others = [(getattr(worker, "agent", None) or {})
-                      for name, worker in self.workers.items()
-                      if name != (agent or {}).get("name") and worker.is_alive()
-                      and not (getattr(worker, "agent", None) or {}).get("ephemeral")]
+            live = [(name, getattr(worker, "agent", None) or {})
+                    for name, worker in self.workers.items()
+                    if name != (agent or {}).get("name") and worker.is_alive()
+                    and not (getattr(worker, "agent", None) or {}).get("ephemeral")]
+        others = [row for _name, row in live]
         if len(others) >= cap:
             return False
         pinned = getattr(self, "_host_pinned_admissions", None)
-        if (agent or {}).get("releve") != "election" or pinned is None:
+        if (agent or {}).get("releve") == "election" and pinned is not None:
+            elected = sum(1 for other in others if other.get("releve") == "election")
+            if elected >= cap - pinned:
+                return False
+        if not getattr(self, "_host_slot_reservations", None):
             return True
-        elected = sum(1 for other in others if other.get("releve") == "election")
-        return elected < cap - pinned
+        demand = (getattr(self, "_admission_demands", None) or {}).get((agent or {}).get("name"))
+        return self._reservation_admits(agent or {}, cap, demand, admitting=True)
 
     def host_limits_for(self, host: str) -> dict | None:
         """Seuils connus d'un hôte (dernier `canon sync`), ou None."""
