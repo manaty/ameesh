@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- #5561 / #4162: exact-marker incident and human resolution journal.
-create table if not exists spend_marker_events (
+create table spend_marker_events (
     id bigserial primary key,
     agent text not null,
     marker_created_at timestamptz not null,
