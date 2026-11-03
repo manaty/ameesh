@@ -875,8 +875,51 @@ def _bench_upkeep(db) -> None:
               % len(invalid.dropped), file=sys.stderr)
 
 
+#: #5641 : un nom de table ou de trigger passé à `PgTestCase.fill` (composé
+#: dans l'ALTER TABLE, jamais un paramètre lié).
+_FILL_IDENT = re.compile(r"[a-z_][a-z0-9_]*\Z")
+
+
 class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
+
+    def fill(self, sql: str, params=(), *, triggers=()) -> None:
+        """#5641 : remplit une fixture volumineuse, sans délai ni triggers nommés.
+
+        Le remplissage prépare, il ne mesure pas : sous la charge de la CI, des
+        dizaines de milliers de lignes à travers les triggers par ligne et les
+        clés étrangères dépassaient le statement_timeout du banc (#5599, #5585,
+        #5582), en vert local. Une seule transaction, pour les deux pilotes :
+        `SET LOCAL statement_timeout = 0` (#4822) ne survit pas à l'instruction,
+        et `ALTER TABLE … DISABLE TRIGGER` est transactionnel (#3941) — un
+        remplissage en échec rétablit les triggers par son ROLLBACK, aucun ne
+        reste coupé pour le témoin suivant. Le délai client du pilote psql est
+        levé le temps du remplissage, puis rendu.
+
+        `triggers` : des couples (table, trigger) à couper, seulement ceux qui
+        n'ont pas d'effet sur ce que le test mesure. Les clés étrangères restent
+        vérifiées (seul le délai est levé).
+        """
+        pairs = [tuple(pair) for pair in triggers]
+        for pair in pairs:
+            if len(pair) != 2 or not all(_FILL_IDENT.match(name) for name in pair):
+                raise ValueError("fill: trigger attendu (table, nom) : %r" % (pair,))
+        db = self.db
+        client = "_client_timeout" in vars(db)
+        saved = db._client_timeout if client else None
+        if client:
+            db._client_timeout = None
+        try:
+            with db.transaction() as tx:
+                tx.execute("SET LOCAL statement_timeout = 0")
+                for table, trigger in pairs:
+                    tx.execute("ALTER TABLE %s DISABLE TRIGGER %s" % (table, trigger))
+                tx.execute(sql, params)
+                for table, trigger in pairs:
+                    tx.execute("ALTER TABLE %s ENABLE TRIGGER %s" % (table, trigger))
+        finally:
+            if client:
+                db._client_timeout = saved
 
     def drop_work_item_column(self, column, restore):
         """Remove a compatibility column; restore its exact UPDATE OF triggers.
