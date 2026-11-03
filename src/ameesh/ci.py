@@ -1649,9 +1649,16 @@ class Watcher:
 
         `reopen_run` garde ses refus (ligne remplacée, tête plus récente) :
         une relance d'une tête qui n'est plus la tête courante de la base ne
-        change pas son état courant."""
+        change pas son état courant.
+
+        #5661 : un essai dont tous les jobs ont échoué au téléchargement
+        d'action ne rend aucune conclusion. Une ligne déjà conclue garde son
+        dernier résultat utile ; une ligne encore `running` (le veilleur n'a
+        pas vu la relance) est close `cancelled`, sinon elle resterait
+        `running` à jamais : le relevé ne la revoit plus au même essai."""
         run_id = int(run["id"])
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
+        infra_only = False
         if status == "failure" and self.logs is not None:
             observation = dict(run, run_id=run["id"])
             jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
@@ -1659,16 +1666,20 @@ class Watcher:
             failed = [j for j in jobs.get("jobs") or [] if j.get("conclusion") in FAILED_JOB_CONCLUSIONS]
             complete = int(jobs.get("total_count") or len(jobs.get("jobs") or [])) <= len(jobs.get("jobs") or [])
             if complete and failed and len(self._download_jobs(repo, observation, failed)) == len(failed):
-                return  # no negative result to use as the base reference
+                row = st.ci.run(repo, run_id)
+                if row is None or row.get("status") != "running":
+                    return  # no negative result to replace the last useful one
+                infra_only = True
         if status not in ("success", "failure"):
             return
         attempt = int(run.get("run_attempt") or 1)
         reopened = st.ci.reopen_run(repo, run_id, run_attempt=attempt)
         if reopened is None:
             return
-        st.ci.conclude(repo, run_id, status)
+        concluded = "cancelled" if infra_only else status
+        st.ci.conclude(repo, run_id, concluded)
         row = st.ci.run(repo, run_id) or reopened
-        self._record_base_failures(st, repo, row, run_id, status, bases)
+        self._record_base_failures(st, repo, row, run_id, concluded, bases)
 
     def _record_base_failures(self, st, repo: str, row: dict, run_id: int,
                               status: str, bases=BASE_BRANCHES) -> None:
