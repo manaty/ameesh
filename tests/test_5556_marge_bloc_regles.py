@@ -66,7 +66,7 @@ class GelTest(unittest.TestCase):
         commit_all(self.clone, "base coupée")
         git(self.clone, "checkout", "-qB", "canon/5556-lot")
         note = self._gate(self._lot(canon.RULES_BLOC_ROOM_COMPAT + 100))
-        self.assertIn("already cut at the base", note)
+        self.assertIn("already cut at the target", note)
 
     def test_lot_qui_fait_grossir_un_bloc_deja_coupe_est_refuse(self):
         git(self.clone, "checkout", "-q", "main")
@@ -104,8 +104,11 @@ class GelTest(unittest.TestCase):
                 size=canon.RULES_BLOC_LIMIT_COMPAT, rules=rules,
                 limit=canon.RULES_BLOC_LIMIT_COMPAT, room=canon.RULES_BLOC_ROOM_COMPAT,
                 cut=True, cards="T (%d)" % rules, over=over)
+        # #5562 : la mesure porte sur la fusion d'essai. La branche descend de
+        # main, donc la fusion rend la tête ; puis la cible est mesurée pour
+        # l'exemption « déjà coupée ».
         with mock.patch.object(canon, "process_block",
-                               side_effect=[bloc(*tete), bloc(*base)]):
+                               side_effect=[bloc(*tete), bloc(*tete), bloc(*base)]):
             return self._gate(sha)
 
     def test_regles_egales_et_un_diagnostic_de_plus_refuse(self):
@@ -114,7 +117,7 @@ class GelTest(unittest.TestCase):
 
     def test_regles_plus_longues_et_un_diagnostic_de_moins_exempte(self):
         note = self._gate_mesures(tete=(14939, 124), base=(14903, 190))
-        self.assertIn("already cut at the base, 190 bytes over", note)
+        self.assertIn("already cut at the target, 190 bytes over", note)
 
     def test_tete_mesuree_dans_le_depot_du_gel_pas_dans_le_clone_configure(self):
         # revue qa-01 : clone configuré A sain, clone d'auteur B porteur de la
