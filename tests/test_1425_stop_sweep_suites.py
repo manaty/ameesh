@@ -150,6 +150,10 @@ class SweepAfterGuardsTest(_Base):
         # doublure n'a ni porte ni horloge, la passe est neutralisée.
         fake.lift_device_gates_once = lambda: None
         fake.release_stopped_lots_once = mock.Mock(return_value=[])
+        # #5601 : l'ordre d'admission réel, sans réservation sur l'hôte (la
+        # liste du registre telle quelle, aucun lot lu)
+        fake._host_slot_reservations = None
+        fake._admission_order = types.MethodType(runner_mod.Runner._admission_order, fake)
         for key, value in kwargs.items():
             setattr(fake, key, value)
         return fake
