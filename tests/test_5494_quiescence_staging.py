@@ -3,10 +3,12 @@
 
 No real host is contacted: `ssh` is a stub that answers a canned report per
 target and records every call. One test runs the read-only collector for real
-on the local host, with a stub `ss`.
+on the local host, with stubs for everything that reads the host's state
+(`ss`, `ps -eo`, `find` under the cgroup and home roots, `flock`) (#5551).
 """
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -31,6 +33,28 @@ printf '%s\t%s\n' "$cible" "$commande" >> "$FAUX/appels"
 NOTIFIER = r'''#!/usr/bin/env bash
 printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$FAUX/alertes"
 '''
+
+# #5551: the local collector must not see the host's real processes (other CI
+# runners, an agent quoting a bascule path), units or locks. `ps -eo` lists
+# $FAUX/ps; the other ps calls (sid of the probe, args of a pid) stay real.
+PS = r'''#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = -eo ] && { cat "$FAUX/ps" 2>/dev/null; exit 0; }; done
+exec %(ps)s "$@"
+'''
+# The cgroup tree and the kept trees are looked up under $FAUX/racine.
+FIND = r'''#!/usr/bin/env bash
+racines=()
+while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do
+  case "$1" in
+    /sys/fs/cgroup|/root|/home|/tmp|/var/tmp) racines+=("$FAUX/racine$1") ;;
+    *) racines+=("$1") ;;
+  esac
+  shift
+done
+exec %(find)s "${racines[@]}" "$@"
+'''
+# The real lock paths are globbed under /root and /home: none is reported held.
+FLOCK = "#!/usr/bin/env bash\nexit 0\n"
 
 
 class QuiescenceTest(unittest.TestCase):
@@ -209,10 +233,8 @@ class QuiescenceTest(unittest.TestCase):
 
     def test_collecteur_reel_en_local_lit_les_sessions_ssh(self):
         # The previous host is the current one, without ssh target: the real
-        # read-only collector runs locally; `ss` is stubbed.
-        (self.bin / "ss").write_text(
-            "#!/usr/bin/env bash\ncat \"$FAUX/ss\" 2>/dev/null\n")
-        (self.bin / "ss").chmod(0o755)
+        # read-only collector runs locally; what it reads of the host is stubbed.
+        self.simuler_hote()
         topologie = TOPOLOGIE.replace("pc-smichea=poste", "pc-smichea=local")
         self.bascule.write_text('HOTES_STAGING="%s"\nHOTE_LOCAL=pc-smichea\n' % topologie)
         env = dict(STAGING_PREVIOUS_HOST="pc-smichea",
@@ -243,6 +265,49 @@ class QuiescenceTest(unittest.TestCase):
         res = self.sonde(STAGING_PREVIOUS_RUN="ab12d0", **env)
         self.assertEqual(res.returncode, 1, res.stderr)
         self.assertIn("ss en echec", res.stderr)
+
+    def simuler_hote(self):
+        reels = {nom: shutil.which(nom) for nom in ("ps", "find")}
+        for nom, texte in (("ss", '#!/usr/bin/env bash\ncat "$FAUX/ss" 2>/dev/null\n'),
+                           ("ps", PS % reels), ("find", FIND % reels), ("flock", FLOCK)):
+            (self.bin / nom).write_text(texte)
+            (self.bin / nom).chmod(0o755)
+        for racine in ("sys/fs/cgroup", "root", "home", "tmp", "var/tmp"):
+            (self.faux / "racine" / racine).mkdir(parents=True)
+
+    def test_collecteur_reel_en_local_lit_les_processus_simules(self):
+        # #5551: the host's real processes, units and locks are not read, and
+        # the simulated ones are reported.
+        self.simuler_hote()
+        (self.faux / "ss").write_text("")
+        topologie = TOPOLOGIE.replace("pc-smichea=poste", "pc-smichea=local")
+        self.bascule.write_text('HOTES_STAGING="%s"\nHOTE_LOCAL=pc-smichea\n' % topologie)
+        env = dict(STAGING_PREVIOUS_HOST="pc-smichea",
+                   QUIESCENCE_ADRESSES_PC_SMICHEA="192.0.2.7")
+        res = self.sonde(**env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        (self.faux / "ps").write_text(
+            "99901 99901 python3 /home/s/.local/state/ameesh/mise-a-jour/bascule-x.py preparer\n")
+        res = self.sonde(STAGING_PREVIOUS_RUN="ab12d3", **env)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("operation 99901 python3 /home/s/.local/state/ameesh/mise-a-jour/"
+                      "bascule-x.py preparer", res.stderr)
+        (self.faux / "ps").write_text(
+            "99902 99902 bash /h/ameesh-release-staging-ab12d4-x/worktree/deploy/mise-a-jour/vm.sh\n")
+        res = self.sonde(STAGING_PREVIOUS_RUN="ab12d4", **env)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("run 99902 bash /h/ameesh-release-staging-ab12d4-x", res.stderr)
+        (self.faux / "ps").unlink()
+        unite = self.faux / "racine/sys/fs/cgroup/user.slice/poste-maj-staging-12-retour.service"
+        unite.mkdir(parents=True)
+        (unite / "cgroup.procs").write_text("99903\n")
+        retour = self.faux / "racine/home/s/ameesh-release-staging-ab12d5-x/worktree"
+        retour.mkdir(parents=True)
+        (retour / ".retour-apres-arret").touch()
+        res = self.sonde(STAGING_PREVIOUS_RUN="ab12d5", **env)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("poste poste-maj-staging-12-retour.service", res.stderr)
+        self.assertIn("ameesh-release-staging-ab12d5-x/worktree/.retour-apres-arret", res.stderr)
 
 
 if __name__ == "__main__":
