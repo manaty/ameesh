@@ -1610,7 +1610,8 @@ class Watcher:
             jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
                             % (repo, run["id"], run.get("run_attempt") or 1)) or {}
             failed = [j for j in jobs.get("jobs") or [] if j.get("conclusion") in FAILED_JOB_CONCLUSIONS]
-            if failed and len(self._download_jobs(repo, observation, failed)) == len(failed):
+            complete = int(jobs.get("total_count") or len(jobs.get("jobs") or [])) <= len(jobs.get("jobs") or [])
+            if complete and failed and len(self._download_jobs(repo, observation, failed)) == len(failed):
                 return  # no negative result to use as the base reference
         if status not in ("success", "failure"):
             return
@@ -1646,7 +1647,8 @@ class Watcher:
             jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
                             % (repo, run["id"], run.get("run_attempt") or 1)) or {}
             failed = [j for j in jobs.get("jobs") or [] if j.get("conclusion") in FAILED_JOB_CONCLUSIONS]
-            if failed and len(self._download_jobs(repo, observation, failed)) == len(failed):
+            complete = int(jobs.get("total_count") or len(jobs.get("jobs") or [])) <= len(jobs.get("jobs") or [])
+            if complete and failed and len(self._download_jobs(repo, observation, failed)) == len(failed):
                 return  # no negative result to use as the base reference
         if status not in ("success", "failure"):
             return
@@ -2427,7 +2429,8 @@ class Watcher:
             if infrastructure and not st.ci.head_replaced(
                     repo, row["branch"], row["head_sha"], int(row["run_id"])):
                 self._retry_download_jobs(repo, row, infrastructure)
-            if failed and len(infrastructure) == len(failed) and not st.ci.failures(repo, int(row["run_id"])):
+            complete = int(jobs.get("total_count") or len(jobs.get("jobs") or [])) <= len(jobs.get("jobs") or [])
+            if complete and failed and len(infrastructure) == len(failed) and not st.ci.failures(repo, int(row["run_id"])):
                 # Existing cancelled storage state represents no conclusion;
                 # never persist success or manufacture negative test evidence.
                 status = "cancelled"

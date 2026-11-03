@@ -82,6 +82,19 @@ class DownloadFailureTest(unittest.TestCase):
         self.assertEqual(verdict.call_args.args[-1], 'inconclusive')
         retry.assert_called_once()
 
+    def test_incomplete_job_listing_cannot_hide_a_negative_on_another_page(self):
+        text = (ROOT / 'tests/fixtures/5655/429.log').read_text()
+        watcher = Watcher(types.SimpleNamespace(),
+            api=lambda _: {'jobs': [JOB], 'total_count': 101}, logs=lambda *_: text)
+        store = mock.Mock()
+        store.ci.failures.return_value = []
+        store.ci.head_replaced.return_value = True
+        run = {'id': 8, 'status': 'completed', 'conclusion': 'failure', 'run_attempt': 1}
+        with mock.patch('ameesh.ci.storage.of', return_value=store), \
+                mock.patch.object(watcher, '_verdict'):
+            watcher._conclude(None, 'org/repo', ROW, run=run)
+        store.ci.conclude.assert_called_once_with('org/repo', 8, 'failure')
+
     def test_negative_evidence_prevents_nonconclusive_run(self):
         text = (ROOT / 'tests/fixtures/5655/429.log').read_text()
         watcher = Watcher(types.SimpleNamespace(), api=lambda _: {'jobs': [JOB]}, logs=lambda *_: text)
