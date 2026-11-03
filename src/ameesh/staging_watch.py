@@ -14,6 +14,9 @@ last-resort hard bound above that fallback.
 The shared `staging.attested` proof settles a run whose last snapshot
 publication failed (#4898 N2). Request history is read per key: only a later
 completed deployment settles an earlier failure, never a partial one.
+#5558: a later run on a descendant commit settles a failure host by host: once
+every host the failed run left unhealthy is healthy again (or declared absent
+and deferred, canon §14), a partial run that omits the workstation clears it.
 No command, environment, arbitrary log output or credential is journaled.
 """
 from __future__ import annotations
@@ -24,6 +27,7 @@ import math
 import re
 import sys
 import time
+from pathlib import Path
 
 from ameesh import storage
 
@@ -37,6 +41,11 @@ HISTORY_MAX = 10000
 TERMINAL = frozenset(("completed", "partial", "failed", "unattested"))
 #: #5425: liveness fields of a snapshot, all absent from an older launcher's
 _LIVENESS = ("beat", "progress", "silence_s", "stall_s")
+#: #5558: last step of a host proved healthy by its run (installer, restart,
+#: control and real health all passed: `sante` is traced ok last)
+_HEALTHY = ("sante", "ok")
+#: #5558: host declared absent and deferred by its run (canon §14)
+_DEFERRED = ("absent", "reporte")
 #: exit code of a refused exclusive start, as the local flock of staging.sh
 BUSY = 75
 #: #5450: global fallback of a launcher without heartbeat. It stays below the
@@ -304,14 +313,69 @@ def _attested_ids(rows) -> dict[str, int]:
     return out
 
 
-def findings(rows: list[dict], *, now: float, attested=()) -> list[dict]:
-    """Latest snapshot of every run; no success inferred from process exit.
+#: #5558: proved (ancestor, descendant) pairs; a refusal is not cached, the
+#: clone may fetch the descendant before the next pass
+_DESCENDS: set = set()
 
-    `attested` carries the shared `staging.attested` events: a successful
-    sequence whose last snapshot publication failed must not be alerted as
-    interrupted (#4898 N2). An attestation settles a run only when it was
-    written after that run's snapshot.
+
+def _git_descends(ancestor: str, descendant: str) -> bool:
+    """#5558: `descendant` contains `ancestor`, read in this package's clone.
+
+    An installed package without its clone, an unknown commit or a git error
+    answer False: doubt never settles a failure (the alert stays)."""
+    if (ancestor, descendant) in _DESCENDS:
+        return True
+    from . import canon
+    if not canon.git_contains(str(Path(__file__).resolve().parents[2]),
+                              ancestor, descendant):
+        return False
+    if len(_DESCENDS) >= 1024:
+        _DESCENDS.clear()
+    _DESCENDS.add((ancestor, descendant))
+    return True
+
+
+def _step(data: dict, host: str) -> tuple[str, str]:
+    step = (data.get("hosts") or {}).get(host)
+    if not isinstance(step, dict):
+        return ("", "")
+    return (str(step.get("stage") or ""), str(step.get("verdict") or ""))
+
+
+def _repaired(run: str, latest: dict, ids: dict, descends) -> bool:
+    """#5558: later runs repaired, host by host, the failure of `run`.
+
+    A host the run left unhealthy (any last step but a passed health check or
+    a declared absence) is repaired by a later run, on a commit descending
+    from the failed one, that made it healthy or declared it absent and
+    deferred (§14: a workstation off does not hold staging). At least one
+    such later run must have made a host healthy, so a failure before any
+    host step is not settled by an empty run. Unreached hosts were not
+    modified and need no repair.
     """
+    data = latest.get(run)
+    if not data or data.get("state") in ("completed", "partial", "running"):
+        return False
+    broken = {host for host in data.get("hosts") or {}
+              if _step(data, host) not in (_HEALTHY, _DEFERRED)}
+    proved = False
+    for name in sorted(latest, key=ids.get):
+        other = latest[name]
+        if ids[name] <= ids[run] or not isinstance(other.get("sha"), str):
+            continue
+        healthy = {host for host in other.get("hosts") or {}
+                   if _step(other, host) == _HEALTHY}
+        if not healthy or not descends(data.get("sha"), other["sha"]):
+            continue
+        proved = True
+        broken -= {host for host in broken
+                   if _step(other, host) in (_HEALTHY, _DEFERRED)}
+        if not broken:
+            return True
+    return proved and not broken
+
+
+def _latest_runs(rows) -> tuple[dict, dict]:
     latest = {}
     ids = {}
     for row in sorted(rows, key=lambda row: int(row["id"]), reverse=True):
@@ -319,10 +383,25 @@ def findings(rows: list[dict], *, now: float, attested=()) -> list[dict]:
         if isinstance(data, dict) and data.get("run"):
             latest.setdefault(data["run"], data)
             ids.setdefault(data["run"], int(row["id"]))
+    return latest, ids
+
+
+def findings(rows: list[dict], *, now: float, attested=(),
+             descends=None) -> list[dict]:
+    """Latest snapshot of every run; no success inferred from process exit.
+
+    `attested` carries the shared `staging.attested` events: a successful
+    sequence whose last snapshot publication failed must not be alerted as
+    interrupted (#4898 N2). An attestation settles a run only when it was
+    written after that run's snapshot. #5558: a failure is also settled
+    host by host (`_repaired`); `descends(ancestor, descendant)`
+    defaults to git ancestry in this package's clone.
+    """
+    latest, ids = _latest_runs(rows)
     proofs = _attested_ids(attested)
     out = []
-    # Only a complete deployment by the same staging authority settles an
-    # earlier failure. A partial run may omit the host that failed.
+    # A complete deployment by the same staging authority settles an earlier
+    # failure. A partial run settles it only through the hosts it repaired.
     completed = {}
     for run, data in latest.items():
         if (data.get("state") == "completed"
@@ -334,6 +413,8 @@ def findings(rows: list[dict], *, now: float, attested=()) -> list[dict]:
         if (state in ("completed", "partial")
                 or completed.get(data.get("notify", ""), 0) > ids[run]
                 or proofs.get(data.get("sha"), 0) > ids[run]):
+            continue
+        if _repaired(run, latest, ids, descends or _git_descends):
             continue
         late = overdue(data, now) if state == "running" else None
         if state == "running" and late is None:
@@ -372,17 +453,19 @@ def _beating_runs(rows, now: float) -> set:
 
 
 def request_findings(rows: list[dict], *, now: float, attested=(),
-                     sequences=()) -> list[dict]:
+                     sequences=(), descends=None) -> list[dict]:
     """One alert per request key for the newest failure still unsettled.
 
     Reading only the latest request per key hid an earlier failed or blocked
     request behind a later partial one (#4898, P3/N3). History is read here;
     only a later *completed* deployment, or a shared attestation of the same
     commit, settles an earlier failure - a partial run may omit the failed
-    host.
+    host. #5558: a failed request whose run later runs repaired host by host
+    (`_repaired`) is settled too.
     """
     proofs = _attested_ids(attested)
     beating = _beating_runs(sequences, now)
+    latest, ids = _latest_runs(sequences)
     by_key = {}
     for row in rows:
         data = row.get("data")
@@ -421,6 +504,9 @@ def request_findings(rows: list[dict], *, now: float, attested=(),
                     and not (state == "running" and data.get("run") in beating))
             if ident <= completed or proofs.get(data.get("sha"), 0) > ident:
                 continue
+            if state == "failed" and _repaired(
+                    data.get("run"), latest, ids, descends or _git_descends):
+                continue
             if state in ("completed", "partial"):
                 continue
             if state == "failed" or data.get("blocked_reason") or late:
@@ -438,7 +524,8 @@ def request_findings(rows: list[dict], *, now: float, attested=(),
                      or ("deadline exceeded" if late else "failed")))
         if later:
             detail += (" %d demande(s) ultérieure(s), partielle(s) ou en cours, "
-                       "ne soldent pas cet échec : seul un déploiement completed "
+                       "ne soldent pas cet échec : seul un déploiement completed, "
+                       "ou des hôtes rendus sains sur un commit descendant, "
                        "le solde." % later)
         out.append(dict(schema="ameesh-alert/1", type="staging_interrupted",
                         agent=None, since=None, value=None, threshold=None,

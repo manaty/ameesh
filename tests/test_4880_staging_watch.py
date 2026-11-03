@@ -542,6 +542,102 @@ class WatchTest(unittest.TestCase):
                                  staging_watch.HISTORY_LIMIT * 2])
 
 
+class HostRepairTest(unittest.TestCase):
+    """#5558: a failure is settled host by host by later descendant runs."""
+
+    OK = {"stage": "sante", "verdict": "ok"}
+    DEFERRED = {"stage": "absent", "verdict": "reporte"}
+    VMS = ("ameesh-agents-1", "ameesh-agents-2", "ameesh-agents-3",
+           "manaty-mesh-1")
+
+    @staticmethod
+    def descends(ancestor, descendant):
+        return (ancestor, descendant) in {("a" * 40, "b" * 40),
+                                          ("a" * 40, "a" * 40)}
+
+    def failed(self, hosts):
+        return row(1, run="failed-run", state="failed", hosts=hosts)
+
+    def later(self, ident, hosts, *, sha="b" * 40, state="partial"):
+        return row(ident, run="later-%d" % ident, state=state, sha=sha,
+                   notify="executor", hosts=hosts)
+
+    def test_partial_run_with_workstation_deferred_clears_the_failure(self):
+        failed = self.failed({"ameesh-agents-1": self.OK,
+                              "ameesh-agents-2": {"stage": "controler",
+                                                  "verdict": "ko"}})
+        later = self.later(2, dict({vm: self.OK for vm in self.VMS},
+                                   **{"pc-smichea": self.DEFERRED}))
+        self.assertEqual(staging_watch.findings(
+            [failed, later], now=250, descends=self.descends), [])
+        request = request_row(3, "r1", run="failed-run")
+        self.assertEqual(staging_watch.request_findings(
+            [request], now=250, sequences=[failed, later],
+            descends=self.descends), [])
+
+    def test_failure_on_the_workstation_is_cleared_once_it_is_deferred(self):
+        failed = self.failed({"pc-smichea": {"stage": "redemarrer",
+                                             "verdict": "ko"}})
+        later = self.later(2, {"ameesh-agents-1": self.OK,
+                               "pc-smichea": self.DEFERRED})
+        self.assertEqual(staging_watch.findings(
+            [failed, later], now=250, descends=self.descends), [])
+
+    def test_unrepaired_host_keeps_the_alert(self):
+        failed = self.failed({"vm-2": {"stage": "installer", "verdict": "ko"}})
+        later = self.later(2, {"vm-1": self.OK,
+                               "vm-2": {"stage": "sante", "verdict": "ko"}})
+        self.assertEqual(len(staging_watch.findings(
+            [failed, later], now=250, descends=self.descends)), 1)
+        request = request_row(3, "r1", run="failed-run")
+        self.assertEqual(len(staging_watch.request_findings(
+            [request], now=250, sequences=[failed, later],
+            descends=self.descends)), 1)
+        # the host repaired by a second later run settles it
+        again = self.later(4, {"vm-2": self.OK})
+        self.assertEqual(staging_watch.findings(
+            [failed, later, again], now=250, descends=self.descends), [])
+
+    def test_non_descendant_or_earlier_run_does_not_clear(self):
+        failed = self.failed({"vm-1": {"stage": "installer", "verdict": "ko"}})
+        other = self.later(2, {"vm-1": self.OK}, sha="c" * 40)
+        self.assertEqual(len(staging_watch.findings(
+            [failed, other], now=250, descends=self.descends)), 1)
+        earlier = dict(self.later(0, {"vm-1": self.OK}))
+        self.assertEqual(len(staging_watch.findings(
+            [failed, earlier], now=250, descends=self.descends)), 1)
+
+    def test_failure_before_any_host_needs_a_healthy_later_host(self):
+        failed = self.failed({})
+        deferred_only = self.later(2, {"pc-smichea": self.DEFERRED})
+        self.assertEqual(len(staging_watch.findings(
+            [failed, deferred_only], now=250, descends=self.descends)), 1)
+        healthy = self.later(3, {"vm-1": self.OK})
+        self.assertEqual(staging_watch.findings(
+            [failed, deferred_only, healthy], now=250,
+            descends=self.descends), [])
+
+    def test_default_ancestry_reads_the_package_clone_and_fails_closed(self):
+        failed = self.failed({"vm-1": {"stage": "installer", "verdict": "ko"}})
+        later = self.later(2, {"vm-1": self.OK})
+        staging_watch._DESCENDS.clear()
+        with mock.patch("ameesh.canon.git_contains",
+                        return_value=False) as contains:
+            self.assertEqual(len(staging_watch.findings(
+                [failed, later], now=250)), 1)
+        repo, ancestor, descendant = contains.call_args.args
+        self.assertTrue((Path(repo) / "src/ameesh/staging_watch.py").exists())
+        self.assertEqual((ancestor, descendant), ("a" * 40, "b" * 40))
+        staging_watch._DESCENDS.clear()
+        with mock.patch("ameesh.canon.git_contains", return_value=True):
+            self.assertEqual(staging_watch.findings([failed, later], now=250), [])
+        # a refusal is not cached; a proof is
+        with mock.patch("ameesh.canon.git_contains") as contains:
+            self.assertEqual(staging_watch.findings([failed, later], now=250), [])
+        contains.assert_not_called()
+        staging_watch._DESCENDS.clear()
+
+
 class BoundsTest(unittest.TestCase):
     """#5450: the global bound, the operator delay and the unit bound agree."""
 
