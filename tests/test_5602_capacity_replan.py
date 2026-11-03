@@ -55,34 +55,60 @@ class ReplanTest(unittest.TestCase):
         self.store.roadmap.plan_item.assert_not_called()
         replan.work.note.assert_not_called()
 
-    def test_changed_input_with_identical_forecast_does_not_publish(self):
+    def test_changed_input_same_calendar_dates_checkpoints_without_publication(self):
         self.run_plan()
         self.store.reset_mock()
         replan.work.note.reset_mock()
         self.data["approver_minutes"] = {"unused": 120}
-        self.assertFalse(self.run_plan()["changed"])
-        self.store.events.record.assert_not_called()
+        self.data["now"] += 7200
+        self.assertEqual(self.run_plan()["published"], [])
+        self.store.events.record.assert_called_once()
+        self.store.roadmap.plan_item.assert_not_called()
         replan.work.note.assert_not_called()
+
+    def test_day_change_publishes_and_same_day_checkpoint_prevents_recompute(self):
+        self.run_plan()
+        replan.work.note.reset_mock()
+        self.data["now"] += 7200
+        self.data["approver_minutes"] = {"unused": 120}
+        self.assertEqual(self.run_plan()["published"], [])
+        replan.work.note.assert_not_called()
+        with patch.object(replan.capacity_plan, "forecast") as forecast:
+            self.data["now"] += 60
+            self.assertFalse(self.run_plan()["changed"])
+            forecast.assert_not_called()
+        self.data["now"] += 86400
+        self.data["approver_minutes"]["unused"] = 121
+        self.assertEqual(set(self.run_plan()["published"]), {1, 2, 3})
+        self.assertEqual(replan.work.note.call_count, 3)
+
+    def test_manual_ownership_change_publishes_once(self):
+        self.run_plan()
+        replan.work.note.reset_mock()
+        self.plans[1]["planned_source"] = "set by human:planner"
+        self.assertEqual(self.run_plan()["published"], [1])
+        self.assertIn("manual dates kept", replan.work.note.call_args.args[2])
+        self.assertFalse(self.run_plan()["changed"])
 
     def test_early_and_late_merge_move_remaining_lots(self):
         self.run_plan()
         before = self.saved["forecast"]
         self.data["now"] += 1800
         self.data["lots"][0]["completed_ts"] = self.data["now"]
-        self.assertIn(2, self.run_plan()["published"])
+        self.assertEqual(self.run_plan()["published"], [])
         self.assertLess(by_id(self.saved["forecast"])[2]["end_ts"], by_id(before)[2]["end_ts"])
         self.data["now"] += 7200
         self.data["lots"][0]["completed_ts"] = self.data["now"]
-        self.assertIn(2, self.run_plan()["published"])
+        self.assertEqual(self.run_plan()["published"], [])
         self.assertGreater(by_id(self.saved["forecast"])[2]["end_ts"], by_id(before)[2]["end_ts"])
 
     def test_gate_answer_and_capacity_move_dates(self):
         self.data = snapshot([lot(1, gates=[{"response_minutes": 120}]), lot(2)], 1)
         self.run_plan()
         self.data["lots"][0]["gates"][0]["answered_ts"] = self.data["now"]
-        self.assertEqual(set(self.run_plan()["published"]), {1, 2})
+        self.assertEqual(self.run_plan()["published"], [])
         self.data["hosts"][0]["slots"] = 2
-        self.assertEqual(self.run_plan()["published"], [2])
+        self.assertEqual(self.run_plan()["published"], [])
         self.store.reset_mock()
         self.assertFalse(self.run_plan()["changed"])
         self.store.events.record.assert_not_called()
@@ -162,7 +188,7 @@ class LiveInputsTest(unittest.TestCase):
             path = Path(directory) / "capacity.json"
             cfg = SimpleNamespace(project_planning={"broken": {"capacity_plan": str(path)+"-missing"},
                                                     "acme": {"capacity_plan": str(path)}})
-            with patch.object(replan, "reconcile") as reconcile:
+            with patch.object(replan, "reconcile", return_value={"published": []}) as reconcile:
                 path.write_text(json.dumps(snapshot([], 1)))
                 replan.tick(cfg, Mock(), now=1)
                 self.assertEqual(reconcile.call_args.args[2]["hosts"][0]["slots"], 1)
@@ -249,3 +275,17 @@ class PublicationDbTest(PgTestCase):
         self.assertEqual(sorted(result["changed"] for result in results), [False, True])
         self.assertEqual(len(storage.of(self.db).events.recent_type(
             replan.EVENT, None, 10, object=self.project)), 1)
+
+    def test_same_day_capacity_event_checkpoints_without_lot_journal(self):
+        replan.reconcile(self.db, self.project, self.settings, now=self.now)
+        before = work.events(self.db, self.second["id"])
+        self.settings["hosts"][0]["slots"] = 2
+        out = replan.reconcile(self.db, self.project, self.settings, now=self.now+7200)
+        self.assertTrue(out["changed"])
+        self.assertEqual(out["published"], [])
+        self.assertEqual(work.events(self.db, self.second["id"]), before)
+        rows = storage.of(self.db).events.recent_type(replan.EVENT, None, 10, object=self.project)
+        self.assertEqual(len(rows), 2)
+        self.assertFalse(replan.reconcile(self.db, self.project, self.settings, now=self.now+7260)["changed"])
+        self.assertEqual(len(storage.of(self.db).events.recent_type(
+            replan.EVENT, None, 10, object=self.project)), 2)

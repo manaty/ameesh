@@ -119,9 +119,13 @@ that merged are discarded. Other explicit external gates still use the file.
 The pass detects changes in these inputs and recomputes automatically: an
 early/late merge, decision answer or host/slot change needs no manual forecast
 command. Clock ticks alone leave the published forecast unchanged. Repeating
-the same event, or computing the same projection, publishes nothing. Dates
-and a UTC timestamped forecast note for each moved lot commit with a durable
-checkpoint, so another host/restart does not publish the same update again.
+the same event publishes nothing. Journal notes are published only when the
+computed calendar dates (YYYY-MM-DD) or manual/scheduler ownership change,
+not when seconds move within the same day. Each changed input is checkpointed
+even when dates do not move, so later ticks do not recompute it. Dates and
+notes commit with that durable checkpoint; another host/restart does not
+publish the same update again. The CLI retains the latest precise UTC forecast.
+The pass logs its elapsed time and number of lot date publications.
 Incomplete inputs leave the previous dates intact and are logged per project.
 The latest checkpoint survives event retention; older checkpoints are pruned.
 
