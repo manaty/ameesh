@@ -129,7 +129,10 @@ refusal, however long it lasts.
 Without reservations the claim order is unchanged and no lot is read.
 Reservations divide the `max_agents` of the runner. More reserved places than
 `max_agents` is a canon error; an unreadable entry is a canon error too and
-is ignored, so it never holds places nobody can take.
+is ignored, so it never holds places nobody can take. Records of several
+canons merge by the largest count of each key; when that merge reserves more
+than the effective `max_agents` (the smallest of the records), the runner and
+the planner drop the host's reservations and the runner logs why (#5642).
 
 ## Automatic date publication (#5602)
 

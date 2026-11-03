@@ -13739,7 +13739,13 @@ class Runner:
             placement_mod.host_load(one)[0].get(self.host, 0) for one in canons)
         # #5601 : places réservées à un projet ou à une classe (fiches Host)
         from . import slot_reservations as slot_reservations_mod
-        self._host_slot_reservations = slot_reservations_mod.of_host(canons, self.host) or None
+        problems: list = []
+        self._host_slot_reservations = slot_reservations_mod.of_host(
+            canons, self.host, problems) or None
+        for problem in problems:
+            if problem != getattr(self, "_slot_reservations_logged", None):
+                self._slot_reservations_logged = problem
+                log_async(problem)
         # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
         # par défaut
         sync_gate = getattr(self, "_sync_host_gate", None)

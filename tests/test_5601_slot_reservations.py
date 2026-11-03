@@ -88,6 +88,25 @@ class PureTest(unittest.TestCase):
         self.assertEqual(sr.decide(res, {}, 0, None, []), (True, None))
 
 
+    def test_merged_reservations_over_effective_cap_dropped(self):
+        """#5642: each record fits its own max_agents, the merge does not."""
+        def canon_of(max_agents, reservations):
+            policy = types.SimpleNamespace(max_agents=max_agents,
+                                           slot_reservations=reservations)
+            return types.SimpleNamespace(host=lambda name: types.SimpleNamespace(policy=policy))
+        a = canon_of(4, {"project:x": 2, "class:1": 2})
+        b = canon_of(4, {"project:y": 2, "class:2": 2})
+        problems = []
+        self.assertEqual(sr.of_host([a, b], "h", problems), {})
+        self.assertEqual(problems, ["host h: 8 places reserved across canons for "
+                                    "max_agents = 4, reservations dropped"])
+        same = canon_of(4, {"project:x": 2, "class:1": 2})
+        self.assertEqual(sr.of_host([a, same], "h"), {"project:x": 2, "class:1": 2})
+        self.assertEqual(sr.of_host([a, canon_of(3, None)], "h"), {})
+        self.assertEqual(sr.of_host([a, canon_of(None, None)], "h"),
+                         {"project:x": 2, "class:1": 2})
+
+
 class RunnerTest(unittest.TestCase):
     def test_claim_pass_admits_by_class_and_keeps_reserved_slot(self):
         """3 places, one reserved for class 1: two P2 agents fill the shared
