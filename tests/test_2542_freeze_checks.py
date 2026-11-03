@@ -149,6 +149,16 @@ class ScriptTest(unittest.TestCase):
         self.assertEqual(checks, script.WARN_CHECKS)
         self.assertIn("unreadable", why)
 
+    def test_le_gel_sans_diff_avertit_aussi_le_seuil_de_plan(self):
+        """#5607 : H6 rejoint H4/H5 dans l'avertissement par défaut du gel."""
+        checks, why = script.warn_checks("/tmp", {})
+        self.assertEqual(checks, script.WARN_CHECKS)
+        args = [check[1] for check in checks
+                if check[0] == "herméticité des tests #5427"]
+        self.assertEqual(len(args), 1)
+        self.assertIn("H6", ",".join(args[0]))
+        self.assertIn("whole suite", why)
+
     def test_chaque_test_nomme_existe(self):
         """Un contrôle renommé ou retiré de la suite ne passe pas en silence."""
         nommes = [arg for _nom, args in script.CHECKS if "unittest" in args

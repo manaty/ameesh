@@ -30,6 +30,15 @@ Règles :
   H5 etat-disque
      le test lit le disque de l'hôte (`shutil.disk_usage`) : le verdict
      dépend du runner et des jobs voisins (#5321).
+  H6 seuil-de-plan-sous-la-seconde
+     un champ de temps d'un plan (`Execution Time`, `Planning Time` d'un
+     `EXPLAIN (ANALYZE)`) est comparé à un seuil inférieur à une seconde
+     (moins de 1 000 ms, ou moins de 1 s après conversion) : ce temps est
+     celui du serveur sous la charge de l'hôte, pas une preuve du plan
+     (#5607 : #5582 à 142 ms pour un plafond de 100 ms). La garde de plan se
+     juge sur la structure (index, scans, lignes, boucles, tampons), le temps
+     ne sert qu'en plafond large (≥ 1 s). Modèle sans seuil de temps :
+     tests/test_5555_gauge_plans.py.
 
 Exemption motivée : un commentaire `# hermeticity: allow — <raison>` sur
 l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison
@@ -40,7 +49,7 @@ n'exempte pas (R1 #707, N1).
 Usage :
   scripts/test-hermeticity-lint.py [FICHIERS…]        # défaut : tests/**/test_*.py
   scripts/test-hermeticity-lint.py --diff origin/main # seuls les tests changés
-  scripts/test-hermeticity-lint.py --rules H4,H5      # un sous-ensemble de règles
+  scripts/test-hermeticity-lint.py --rules H4,H5,H6   # un sous-ensemble de règles
   scripts/test-hermeticity-lint.py --max-findings 10  # texte tronqué, verdict entier
   scripts/test-hermeticity-lint.py --json
 Sortie : 0 si aucun constat, 1 si au moins un, 2 en cas d'erreur d'usage.
@@ -87,6 +96,10 @@ COMPARATORS = {"assertLess", "assertLessEqual", "assertGreater", "assertGreaterE
 #: au-delà de cette borne (en valeur absolue), une durée n'est plus un seuil
 #: d'ordonnancement : c'est une garde de temps, qui peut rester au banc.
 SUBSECOND_S = 1.0
+#: champs de temps d'un plan `EXPLAIN (ANALYZE, FORMAT JSON)` : le serveur les
+#: rend en millisecondes. Un seuil sous la seconde vaut donc moins de 1 000.
+PLAN_TIME_FIELDS = ("Execution Time", "Planning Time")
+SUBSECOND_PLAN_MS = 1000.0
 #: appels qui reçoivent un chemin : un littéral `/proc/…` y est global.
 PATH_CALLS = {"open", "os.listdir", "os.scandir", "os.stat", "os.readlink",
               "pathlib.Path", "Path", "io.open"}
@@ -97,6 +110,7 @@ RULES = {
     "H3": "fixture-dependante-du-jour",
     "H4": "seuil-mural-sous-la-seconde",
     "H5": "etat-disque",
+    "H6": "seuil-de-plan-sous-la-seconde",
 }
 
 
@@ -421,13 +435,249 @@ def _measured_operand(call: ast.Call, durations: dict, attributes: dict,
     return None, None
 
 
+def _walk_scope(node: ast.AST):
+    """Les nœuds du corps d'un scope, sans entrer dans ses définitions."""
+    stack = list(node.body)
+    while stack:
+        child = stack.pop()
+        yield child
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        stack.extend(ast.iter_child_nodes(child))
+
+
+def _scope_assignments(tree: ast.Module) -> list[tuple]:
+    """`(scope, cibles, valeur)` des affectations du module, des classes et
+    des fonctions, sans descendre dans une définition imbriquée."""
+    scopes = [tree] + [node for node in ast.walk(tree)
+                       if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                            ast.ClassDef))]
+    out = []
+    for scope in scopes:
+        for node in _walk_scope(scope):
+            if isinstance(node, ast.Assign):
+                out.append((scope, node.targets, node.value))
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                out.append((scope, [node.target], node.value))
+    return out
+
+
+def _class_scope_of(scopes: _Scopes, scope: ast.AST) -> ast.AST | None:
+    return None if isinstance(scope, ast.Module) else scopes.cls(scope)
+
+
+def _call_key(call: ast.Call, class_scope: ast.AST | None) -> tuple | None:
+    """La clé d'une fonction appelée : (classe, nom), ou (None, nom)."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        return None, func.id
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        if func.value.id == "self":
+            name = class_scope.name if isinstance(class_scope, ast.ClassDef) else None
+            return name, func.attr
+        return None, func.attr
+    return None
+
+
+def _plan_field(node: ast.AST) -> str | None:
+    """Le champ de temps de plan lu par un nœud, None sinon."""
+    if isinstance(node, ast.Subscript):
+        key = node.slice
+        if isinstance(key, ast.Constant) and key.value in PLAN_TIME_FIELDS:
+            return key.value
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+            and node.func.attr == "get" and node.args:
+        key = node.args[0]
+        if isinstance(key, ast.Constant) and key.value in PLAN_TIME_FIELDS:
+            return key.value
+    return None
+
+
+def _plan_time_value(node: ast.AST, returns: dict, values: dict, attributes: dict,
+                     name_scope: ast.AST, class_scope: ast.AST | None) -> dict:
+    """`{slot: (champ, unité)}` des temps de plan portés par un nœud.
+
+    `()` désigne la valeur elle-même ; `(i,)` l'élément i d'un tuple rendu par
+    une fonction (`return plan["Plan"], plan["Execution Time"]`). L'unité est
+    `ms` pour le champ brut, `s` après la conversion `/ 1000` ou `* 0.001`."""
+    node = _unwrap(node)
+    field = _plan_field(node)
+    if field is not None:
+        return {(): (field, "ms")}
+    if isinstance(node, ast.BinOp):
+        for measured, factor in ((node.left, node.right), (node.right, node.left)):
+            inner = _plan_time_value(measured, returns, values, attributes,
+                                     name_scope, class_scope)
+            if () not in inner:
+                continue
+            number = _numeric(factor, {})
+            if number is None:
+                continue
+            if isinstance(node.op, (ast.Div, ast.FloorDiv)) \
+                    and abs(number - SUBSECOND_PLAN_MS) < 1e-9:
+                return {(): (inner[()][0], "s")}
+            if isinstance(node.op, ast.Mult) and abs(number - 0.001) < 1e-12:
+                return {(): (inner[()][0], "s")}
+        return {}
+    if isinstance(node, ast.Name):
+        info = values.get(name_scope, {}).get(node.id)
+        return {(): info} if info is not None else {}
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+            and node.value.id == "self":
+        info = attributes.get(class_scope, {}).get(node.attr)
+        return {(): info} if info is not None else {}
+    if isinstance(node, ast.Call):
+        key = _call_key(node, class_scope)
+        found = returns.get(key) if key is not None else None
+        if found is None and key is not None and key[0] is not None:
+            found = returns.get((None, key[1]))
+        return dict(found or {})
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) \
+            and isinstance(node.slice.value, int) \
+            and not isinstance(node.slice.value, bool):
+        inner = _plan_time_value(node.value, returns, values, attributes,
+                                 name_scope, class_scope)
+        info = inner.get((node.slice.value,))
+        return {(): info} if info is not None else {}
+    if isinstance(node, (ast.Tuple, ast.List)):
+        out = {}
+        for index, element in enumerate(node.elts):
+            for slot, info in _plan_time_value(element, returns, values,
+                                               attributes, name_scope,
+                                               class_scope).items():
+                out[(index,) + slot] = info
+        return out
+    return {}
+
+
+def _return_times(tree: ast.Module, scopes: _Scopes) -> dict:
+    """Les fonctions qui rendent un temps de plan : `{clé: {slot: info}}`."""
+    returns: dict = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        class_scope = scopes.cls(node)
+        key = (class_scope.name if isinstance(class_scope, ast.ClassDef) else None,
+               node.name)
+        slots: dict = {}
+        for child in _walk_scope(node):
+            if not isinstance(child, ast.Return) or child.value is None:
+                continue
+            slots.update(_plan_time_value(child.value, {}, {}, {}, node,
+                                          class_scope))
+        if slots:
+            returns.setdefault(key, {}).update(slots)
+    return returns
+
+
+def _plan_time_scopes(tree: ast.Module, scopes: _Scopes,
+                      returns: dict) -> tuple[dict, dict]:
+    """Les variables et attributs `self.…` qui portent un temps de plan.
+
+    Même analyse de flux volontairement simple que [`_duration_scopes`] : les
+    affectations et le dépaquetage d'un tuple rendu par une fonction
+    (`root, elapsed_ms = self._plan()`), jusqu'à point fixe."""
+    values: dict = {}
+    attributes: dict = {}
+    assignments = [(scope, _class_scope_of(scopes, scope), targets, value)
+                   for scope, targets, value in _scope_assignments(tree)]
+    changed = True
+    while changed:
+        changed = False
+        for scope, class_scope, targets, value in assignments:
+            incoming = _plan_time_value(value, returns, values, attributes,
+                                        scope, class_scope)
+            if not incoming:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    info = incoming.get(())
+                    if info is None:
+                        continue
+                    table = values.setdefault(scope, {})
+                    if table.get(target.id) != info:
+                        table[target.id] = info
+                        changed = True
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    for index, element in enumerate(target.elts):
+                        info = incoming.get((index,))
+                        if info is None:
+                            continue
+                        if isinstance(element, ast.Name):
+                            table = values.setdefault(scope, {})
+                            if table.get(element.id) != info:
+                                table[element.id] = info
+                                changed = True
+                        elif isinstance(element, ast.Attribute) \
+                                and isinstance(element.value, ast.Name) \
+                                and element.value.id == "self" \
+                                and class_scope is not None:
+                            attrs = attributes.setdefault(class_scope, {})
+                            if attrs.get(element.attr) != info:
+                                attrs[element.attr] = info
+                                changed = True
+                elif isinstance(target, ast.Attribute) \
+                        and isinstance(target.value, ast.Name) \
+                        and target.value.id == "self" and class_scope is not None:
+                    info = incoming.get(())
+                    if info is None:
+                        continue
+                    attrs = attributes.setdefault(class_scope, {})
+                    if attrs.get(target.attr) != info:
+                        attrs[target.attr] = info
+                        changed = True
+    return values, attributes
+
+
+def _scope_constants(tree: ast.Module) -> dict:
+    """Les constantes numériques par scope : module, classe, fonction."""
+    constants: dict = {}
+    for scope, targets, value in _scope_assignments(tree):
+        number = _numeric(value, {})
+        if number is None:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                constants.setdefault(scope, {})[target.id] = number
+    return constants
+
+
+def _threshold_number(node: ast.AST, constants: dict,
+                      class_constants: dict) -> float | None:
+    """La valeur d'un seuil, y compris `self.MAX_MS` d'une constante de classe."""
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+            and node.value.id == "self":
+        return class_constants.get(node.attr)
+    return _numeric(node, constants)
+
+
+def _subsecond_plan_threshold(left: ast.AST, right: ast.AST, returns: dict,
+                              values: dict, attributes: dict, constants: dict,
+                              class_constants: dict, name_scope: ast.AST,
+                              class_scope: ast.AST | None) -> tuple | None:
+    """`(opérande, (champ, unité), seuil)` si la comparaison borne un temps de
+    plan par un seuil sous la seconde, sinon None."""
+    for measured, threshold in ((left, right), (right, left)):
+        info = _plan_time_value(measured, returns, values, attributes,
+                                name_scope, class_scope).get(())
+        if info is None:
+            continue
+        value = _threshold_number(threshold, constants, class_constants)
+        if value is None:
+            continue
+        limit = SUBSECOND_PLAN_MS if info[1] == "ms" else SUBSECOND_S
+        if 0 < abs(value) < limit:
+            return measured, info, value
+    return None
+
+
 def lint_source(path: str, source: str, rules: set[str] | None = None) -> list[Finding]:
     """Les constats d'un fichier ; `rules` restreint les analyses lancées.
 
     Le filtre n'est pas cosmétique : H1/H4 parcourent chaque assertion et
     coûtent l'essentiel du lint d'une suite entière. L'appelant qui ne veut
-    que H3 (passe horloge) ou H4/H5 (avertissement du gel) ne paie pas les
-    autres règles."""
+    que H3 (passe horloge) ou H4/H5/H6 (avertissement du gel) ne paie pas
+    les autres règles."""
     wanted = set(RULES) if rules is None else set(rules)
     try:
         tree = ast.parse(source, filename=path)
@@ -478,12 +728,14 @@ def lint_source(path: str, source: str, rules: set[str] | None = None) -> list[F
                                         "fixture dépendante du jour : %s()" % name,
                                         _enclosing(funcs, node)))
 
+    if "H4" in wanted or "H6" in wanted:
+        scopes = _Scopes(tree)
+
     if "H4" in wanted:
         # H4 : la durée a quitté l'assertion (`wake_s = … - début`) ; H1 ne la
         # voit plus. Seules les variables reconnues sont retenues : la forme
         # directe reste H1, pour un seul constat par mesure.
         constants = _module_constants(tree)
-        scopes = _Scopes(tree)
         durations, attributes = _duration_scopes(tree, alias, scopes)
         for node in ast.walk(tree):
             if not _is_assertion(node) or _exempt(node, comments):
@@ -512,6 +764,51 @@ def lint_source(path: str, source: str, rules: set[str] | None = None) -> list[F
                 findings.append(Finding(path, node.lineno, node.col_offset + 1, "H5",
                                         "état du disque de l'hôte : %s()" % name,
                                         _enclosing(funcs, node)))
+
+    if "H6" in wanted and ("Execution Time" in source or "Planning Time" in source):
+        # H6 : le temps d'un plan (`EXPLAIN ANALYZE`) dépend de la charge de
+        # l'hôte ; sous la seconde, ce n'est pas une garde. La lecture directe
+        # du champ, une variable ou un attribut qui en vient, et le
+        # dépaquetage d'une fonction qui le rend, sont suivis.
+        returns = _return_times(tree, scopes)
+        values, attributes = _plan_time_scopes(tree, scopes, returns)
+        constants = _scope_constants(tree)
+        seen: set[tuple] = set()
+        for node in ast.walk(tree):
+            if not _is_assertion(node) or _exempt(node, comments):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) \
+                        and sub.func.attr in COMPARATORS and len(sub.args) >= 2:
+                    pairs = ((sub.args[0], sub.args[1]),)
+                elif isinstance(sub, ast.Compare):
+                    operands = [sub.left] + list(sub.comparators)
+                    pairs = tuple(zip(operands, operands[1:]))
+                else:
+                    continue
+                name_scope = scopes.function(sub)
+                class_scope = scopes.cls(sub)
+                merged = dict(constants.get(scopes.module, {}))
+                merged.update(constants.get(class_scope, {}))
+                merged.update(constants.get(name_scope, {}))
+                for left, right in pairs:
+                    found = _subsecond_plan_threshold(
+                        left, right, returns, values, attributes, merged,
+                        constants.get(class_scope, {}), name_scope, class_scope)
+                    if found is None:
+                        continue
+                    measured, (field, unit), threshold = found
+                    key = (sub.lineno, sub.col_offset)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    findings.append(Finding(
+                        path, sub.lineno, sub.col_offset + 1, "H6",
+                        "champ de plan comparé à un seuil sous la seconde : %s "
+                        "(%s) contre %g %s — la structure est la preuve, le "
+                        "temps ne sert qu'en plafond large (>= 1 s)"
+                        % (ast.unparse(measured), field, threshold, unit),
+                        _enclosing(funcs, sub)))
     return sorted(findings, key=lambda f: (f.lineno, f.col, f.rule))
 
 
@@ -538,7 +835,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--diff", metavar="REF",
                         help="n'analyser que les tests changés depuis REF (git diff REF...HEAD)")
     parser.add_argument("--json", action="store_true", help="sortie JSON")
-    parser.add_argument("--rules", metavar="H4,H5",
+    parser.add_argument("--rules", metavar="H4,H5,H6",
                         help="ne garder que ces règles (virgules), pour un "
                              "avertissement ciblé (gel, passe horloge)")
     parser.add_argument("--max-findings", type=int, metavar="N",

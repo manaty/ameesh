@@ -141,6 +141,87 @@ class RulesTest(unittest.TestCase):
             "    wake_s = time.monotonic() - debut\n"
             "    self.assertLess(wake_s, BUDGET)\n"), ["H4"])
 
+    def test_plan_execution_time_against_a_subsecond_threshold(self):
+        """#5607 : le temps d'un plan n'est pas une garde de plan."""
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    measured = plan[0]\n"
+            "    self.assertLess(float(measured['Execution Time']), 100.0)\n"),
+            ["H6"])
+
+    def test_the_5582_shape_is_refused(self):
+        """Le constat #5582 tel qu'il était : un plafond de 100 ms."""
+        self.assertEqual(self.rules(
+            "MAX_MS = 100.0\n"
+            "def test_x(self):\n"
+            "    measured = plan[0]\n"
+            "    self.assertLess(\n"
+            "        float(measured['Execution Time']), MAX_MS,\n"
+            "        'le rattrapage doit rester sous 100 ms')\n"), ["H6"])
+
+    def test_plan_time_named_constant_in_a_class(self):
+        self.assertEqual(self.rules(
+            "class T:\n"
+            "    MAX_MS = 100.0\n"
+            "    def test_x(self):\n"
+            "        self.assertLess(plan['Planning Time'], self.MAX_MS)\n"),
+            ["H6"])
+
+    def test_plan_time_local_constant(self):
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    max_ms = 100\n"
+            "    self.assertLess(plan['Execution Time'], max_ms)\n"), ["H6"])
+
+    def test_plan_time_seconds_conversion(self):
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    elapsed_s = plan['Execution Time'] / 1000.0\n"
+            "    self.assertLess(elapsed_s, 0.5)\n"), ["H6"])
+
+    def test_plan_time_one_second_ceiling_is_allowed(self):
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    self.assertLess(plan['Execution Time'], 1000)\n"
+            "    elapsed_s = plan['Planning Time'] / 1000.0\n"
+            "    self.assertLess(elapsed_s, 1.0)\n"), [])
+
+    def test_plan_time_through_a_helper_return(self):
+        """Le temps passe par `_plan()` : le dépaquetage le suit (#5607)."""
+        self.assertEqual(self.rules(
+            "class T:\n"
+            "    def _plan(self):\n"
+            "        return plan['Plan'], plan['Execution Time']\n"
+            "    def test_x(self):\n"
+            "        root, elapsed_ms = self._plan()\n"
+            "        self.assertLess(elapsed_ms, 100)\n"), ["H6"])
+
+    def test_plan_time_self_attribute(self):
+        self.assertEqual(self.rules(
+            "class T:\n"
+            "    def setUp(self):\n"
+            "        self.elapsed_ms = plan['Planning Time']\n"
+            "    def test_x(self):\n"
+            "        self.assertLess(self.elapsed_ms, 100)\n"), ["H6"])
+
+    def test_plan_time_comparison_in_assert_true(self):
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    self.assertTrue(plan['Execution Time'] < 100)\n"), ["H6"])
+
+    def test_plan_time_logged_without_a_verdict(self):
+        """Le temps journalisé n'est pas un seuil (#5606, #5582)."""
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    print('plan execution ms:', plan['Execution Time'])\n"
+            "    self.assertEqual(_plan_problems(plan), [])\n"), [])
+
+    def test_plan_time_exemption(self):
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    # hermeticity: allow — mesuré sur un banc dédié\n"
+            "    self.assertLess(plan['Execution Time'], 100)\n"), [])
+
     def test_disk_usage_is_h5(self):
         self.assertEqual(self.rules(
             "import shutil\n"
