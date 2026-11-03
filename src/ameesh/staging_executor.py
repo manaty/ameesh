@@ -51,6 +51,11 @@ TESTS_WORKFLOW = ".github/workflows/tests.yml"
 _GATING_EVENTS = ("push", "pull_request", "pull_request_target")
 _NEGATIVE = ("failure", "timed_out", "startup_failure")
 _SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+#: Every fingerprint refusal starts with this prefix (#5665).
+FINGERPRINT_REFUSAL = "fingerprint: "
+#: The probe's default python, as in quiescence-staging.sh.
+PROBE_PYTHON = ".local/share/ameesh/venv/bin/python"
 
 
 class ExecutionLease(role_run._AlertsLease):
@@ -82,6 +87,14 @@ def settings(path: str) -> dict:
     if probe is not None and (not isinstance(probe, list) or not probe
                               or not all(isinstance(arg, str) for arg in probe)):
         raise ValueError("quiescence_probe must be a nonempty argv list")
+    # #5665: optional expected SHA256 per fingerprinted path; absent, the
+    # fingerprints are only recorded.
+    expected = data.get("expected_sha256", {})
+    if not isinstance(expected, dict) or not all(
+            isinstance(path, str) and os.path.isabs(path)
+            and isinstance(digest, str) and _SHA256.fullmatch(digest)
+            for path, digest in expected.items()):
+        raise ValueError("expected_sha256 must map absolute paths to SHA256 digests")
     for key, default in (("timeout_s", staging_watch.STAGING_FALLBACK_S),
                          ("start_timeout_s", 300),
                          # #5450: the return step is bounded by its own
@@ -254,6 +267,123 @@ def activation_problem(options: dict, env: dict) -> str | None:
         if problem:
             return "program: " + problem
     return None
+
+
+# -- #5665: fingerprints of the probe and its notifier ------------------------
+
+def _sha256(path: str) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tree_sha256(root: str) -> str:
+    """One digest of a package: every file's relative path and SHA256, sorted
+    (bytecode caches excluded: they are rebuilt from the sources)."""
+    import hashlib
+    lines = []
+
+    def fail(exc):
+        raise exc
+    for top, dirs, files in os.walk(root, onerror=fail):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for name in sorted(files):
+            path = os.path.join(top, name)
+            lines.append("%s\0%s\n" % (os.path.relpath(path, root), _sha256(path)))
+    return hashlib.sha256("".join(sorted(lines)).encode("utf-8")).hexdigest()
+
+
+def _sourced_literal(path: str, name: str) -> tuple:
+    """(value or None, problem) of `name` in a file the probe sources: only a
+    plain literal is accepted, an expansion could name anything."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, "%s unreadable (%s)" % (path, getattr(exc, "strerror", None) or exc)
+    value = None
+    pattern = re.compile(r"\s*(?:export\s+)?%s=(.*)" % re.escape(name))
+    for line in text.splitlines():
+        match = pattern.fullmatch(line)
+        if not match:
+            continue
+        raw = match.group(1).strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+            raw = raw[1:-1]
+        if not re.fullmatch(r"[A-Za-z0-9_./+:@%-]*", raw):
+            return None, "%s in %s is not a plain path" % (name, path)
+        value = raw
+    return value, None
+
+
+def _notifier(options: dict, env: dict) -> tuple:
+    """([files], [packages], problem): what the probe's alert runs.
+
+    QUIESCENCE_NOTIFIER (the unit's environment, overridden by BASCULE_ENV
+    which the probe sources), otherwise the probe's python and the `ameesh`
+    package of its venv."""
+    value = env.get("QUIESCENCE_NOTIFIER") or None
+    sourced, problem = _sourced_literal(options["bascule_env"], "QUIESCENCE_NOTIFIER")
+    if problem:
+        return [], [], problem
+    if sourced is not None:
+        value = sourced or None
+    if value:
+        program = _program(value, env)
+        if not program or not os.path.isfile(program):
+            return [], [], "notifier not found: %s" % value
+        return [program], [], None
+    home = env.get("HOME") or os.path.expanduser("~")
+    python = env.get("QUIESCENCE_PYTHON") or os.path.join(home, PROBE_PYTHON)
+    venv = os.path.dirname(os.path.dirname(os.path.abspath(python)))
+    import glob
+    packages = sorted(glob.glob(os.path.join(
+        venv, "lib", "python3*", "site-packages", "ameesh")))
+    if len(packages) != 1 or not os.path.isdir(packages[0]):
+        return [], [], "notifier package ameesh not found once in %s" % venv
+    return [python], packages, None
+
+
+def fingerprints(options: dict, env: dict) -> tuple:
+    """#5665: ({path: sha256}, problem) before a sequence, closed on doubt.
+
+    The probe program, every absolute script it receives, the notifier (or
+    the python and the `ameesh` package it imports), each read in full.
+    An unreadable file, or a digest other than one declared in
+    `expected_sha256`, is a refusal before any host operation."""
+    probe = options.get("quiescence_probe") or []
+    files, packages = [], []
+    if probe:
+        program = _program(probe[0], env)
+        if not program:
+            return {}, "probe not found: %s" % probe[0]
+        files.append(program)
+        files += [arg for arg in probe[1:] if os.path.isabs(arg)
+                  and os.path.isfile(arg)]
+        notifier, packages, problem = _notifier(options, env)
+        if problem:
+            return {}, problem
+        files += notifier
+    found = {}
+    for path in files + packages:
+        problem = path_problem(path)
+        if problem:
+            return {}, problem
+        try:
+            found[os.path.realpath(path)] = (
+                _tree_sha256(path) if path in packages else _sha256(path))
+        except OSError as exc:
+            return {}, "%s unreadable (%s)" % (
+                getattr(exc, "filename", None) or path, exc.strerror or exc)
+    for path, digest in sorted(options.get("expected_sha256", {}).items()):
+        actual = found.get(os.path.realpath(path))
+        if actual is None:
+            return found, "%s expected but not run" % path
+        if actual != digest:
+            return found, "%s is %s, expected %s" % (path, actual, digest)
+    return found, None
 
 
 class ForgeUnreadable(RuntimeError):
@@ -499,6 +629,16 @@ def tick(db, cfg, options) -> dict:
             if request.get("blocked_reason") == reason:
                 return {"state": "blocked", "reason": reason}
             return blocked(reason)
+        # #5665: the probe and its notifier, read and fingerprinted before
+        # any host operation; recorded in the attempt.
+        prints, problem = fingerprints(options, env)
+        if problem:
+            reason = FINGERPRINT_REFUSAL + problem
+            if request.get("blocked_reason") == reason:
+                return {"state": "blocked", "reason": reason}
+            return blocked(reason)
+        # Every record of this pass carries them, the probe's refusal too.
+        request = dict(request, fingerprints=prints)
         # #5450: a previous stop that could not prove its workstation units
         # stopped left their pid in the request. Settle them before any other
         # host operation; the kept worktree stays until they are proved gone.
