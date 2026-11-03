@@ -39,7 +39,7 @@ def _envois() -> list[tuple[str, str, str | None]]:
     envois = []
     for wf in sorted(WORKFLOWS.glob("*.yml")):
         texte = wf.read_text(encoding="utf-8")
-        for m in re.finditer(r"uses: actions/upload-(?:pages-)?artifact@v\d+\n((?:\s{8,}.*\n)+)", texte):
+        for m in re.finditer(r"uses: actions/upload-(?:pages-)?artifact@[a-f0-9]{40}(?:[ \t]+# v\d+)?\n((?:\s{8,}.*\n)+)", texte):
             bloc = m.group(1)
             nom = re.search(r"^\s+name: (.+)$", bloc, re.M)
             ret = re.search(r"^\s+retention-days: (\d+)", bloc, re.M)

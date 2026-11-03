@@ -729,7 +729,9 @@ def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict],
     others = sorted({workflow_of(r.get("workflow") or r.get("path")) or "?"
                      for r in pending or ()
                      if int(r.get("run_id") or 0) != int(run.get("run_id") or 0)})
-    if status == "success" and not failures:
+    if status == "inconclusive" and not failures:
+        first = "%s: inconclusive infrastructure — action archive download failed before tests; one targeted retry at most (see CI log)." % head
+    elif status == "success" and not failures:
         first = "%s: green." % head
     else:
         lines = []
@@ -1037,13 +1039,16 @@ class Watcher:
     passage, et un quota épuisé arrête le passage sans boucle."""
 
     def __init__(self, cfg, *, api=None, cancel=None, log=None, clock=None,
-                 dry_run: bool = False, ttl=None, logs=None):
+                 dry_run: bool = False, ttl=None, logs=None, rerun_failed_jobs=None):
         self.cfg = cfg
         self.api = api
         #: #3783 : lecture du log d'un job (`(dépôt, job_id) -> texte`). None :
         #: pas de lecture de log (tests, ou `gh` absent) ; le relevé normal et
         #: le flux JSON gardent leur comportement.
         self.logs = logs
+        self.rerun_failed_jobs = rerun_failed_jobs
+        self._action_downloads = {}
+        self._job_log_texts = {}
         self._parsed_logs: set = set()
         self._warned_logs: set = set()
         #: l'écriture d'annulation GitHub (`repos/<repo>/actions/runs/<id>/cancel`) ;
@@ -1313,10 +1318,19 @@ class Watcher:
                          % " ".join(str(exc).split())[:200])
             return out
         finally:
+            self._job_log_texts.clear()
             plan_github.flush_reads(getattr(self.cfg, "state_dir", None))
 
     # -- un dépôt --------------------------------------------------------------
     def watch(self, db, repo: str) -> list[dict]:
+        # Logs can be large: share them only during this repository's pass,
+        # including when a failed observation interrupts either reader.
+        try:
+            return self._watch(db, repo)
+        finally:
+            self._job_log_texts.clear()
+
+    def _watch(self, db, repo: str) -> list[dict]:
         st = storage.of(db)
         followed = set(self.followed_workflows(repo))
         bases = self.bases(repo)
@@ -1601,6 +1615,14 @@ class Watcher:
         `conclude` gardent la ligne dans la forme du relevé normal."""
         run_id = int(run["id"])
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
+        if status == "failure" and self.logs is not None:
+            observation = dict(run, run_id=run["id"])
+            jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
+                            % (repo, run["id"], run.get("run_attempt") or 1)) or {}
+            failed = [j for j in jobs.get("jobs") or [] if j.get("conclusion") in FAILED_JOB_CONCLUSIONS]
+            complete = int(jobs.get("total_count") or len(jobs.get("jobs") or [])) <= len(jobs.get("jobs") or [])
+            if complete and failed and len(self._download_jobs(repo, observation, failed)) == len(failed):
+                return  # no negative result to use as the base reference
         if status not in ("success", "failure"):
             return
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
@@ -1630,6 +1652,14 @@ class Watcher:
         change pas son état courant."""
         run_id = int(run["id"])
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
+        if status == "failure" and self.logs is not None:
+            observation = dict(run, run_id=run["id"])
+            jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
+                            % (repo, run["id"], run.get("run_attempt") or 1)) or {}
+            failed = [j for j in jobs.get("jobs") or [] if j.get("conclusion") in FAILED_JOB_CONCLUSIONS]
+            complete = int(jobs.get("total_count") or len(jobs.get("jobs") or [])) <= len(jobs.get("jobs") or [])
+            if complete and failed and len(self._download_jobs(repo, observation, failed)) == len(failed):
+                return  # no negative result to use as the base reference
         if status not in ("success", "failure"):
             return
         attempt = int(run.get("run_attempt") or 1)
@@ -2272,7 +2302,7 @@ class Watcher:
             if key in self._parsed_logs:
                 continue
             try:
-                text = self.logs(repo, job_id)
+                text = self._job_log(repo, row, job_id)
             except Exception as exc:  # noqa: BLE001 - un log absent n'est pas un verdict
                 if key not in self._warned_logs:
                     self._warned_logs.add(key)
@@ -2291,6 +2321,74 @@ class Watcher:
                             "ts": tap.get("failed_at")})
         return out
 
+    def _job_log(self, repo, row, job_id):
+        """Share successful log reads between TAP and bootstrap classification."""
+        key = (repo, int(row["run_id"]), int(row.get("run_attempt") or 1), int(job_id))
+        if key not in self._job_log_texts:
+            self._job_log_texts[key] = self.logs(repo, int(job_id))
+        return self._job_log_texts[key]
+
+    def _download_jobs(self, repo, row, jobs):
+        """#5655: classify only bootstrap failures, with cached log reads."""
+        from .ci_action_download import failed_action_download
+        found = []
+        if self.logs is None:
+            return found
+        for job in jobs:
+            if job.get("conclusion") != "failure" or not job.get("id"):
+                continue
+            key = (repo, row["run_id"], row.get("run_attempt") or 1, job["id"])
+            if key not in self._action_downloads:
+                try:
+                    self._action_downloads[key] = failed_action_download(
+                        job, self._job_log(repo, row, int(job["id"])))
+                except Exception as exc:
+                    self.log("CI: action download log unreadable (%s)" % exc)
+                    continue
+            if self._action_downloads[key]:
+                found.append(job)
+        return found
+
+    def _retry_download_jobs(self, repo, row, jobs):
+        """#5655: at most one request per run, durable across watcher restarts.
+
+        Spend the marker before the request: an ambiguous HTTP failure must
+        not cause an unbounded replay. Only attempt 1 is eligible.
+        """
+        from pathlib import Path
+        import hashlib
+        if self.dry_run or int(row.get("run_attempt") or 1) != 1:
+            return
+        state = getattr(self.cfg, "state_dir", None)
+        if state is None:
+            self.log("CI: action download retry unavailable: no state directory")
+            return
+        folder = Path(state) / "ci-action-retries"
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        current = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
+        if (current.get("status") != "completed"
+                or int(current.get("run_attempt") or 1) != 1
+                or current.get("head_sha") != row.get("head_sha")):
+            return
+        if not jobs:
+            return
+        key = hashlib.sha256((repo + ":" + str(row["run_id"])).encode()).hexdigest()
+        try:
+            with (folder / key).open("x") as marker:
+                marker.write("action archive infrastructure; one retry consumed\n")
+        except FileExistsError:
+            return
+        try:
+            if self.rerun_failed_jobs is not None:
+                self.rerun_failed_jobs(repo, int(row["run_id"]))
+            else:
+                from . import plan_github
+                plan_github._json(plan_github.Gh(), ["api", "-X", "POST",
+                    "repos/%s/actions/runs/%s/rerun-failed-jobs" % (repo, row["run_id"])])
+            self.log("CI %s: infrastructure action download, run %s failed jobs rerun once" % (repo, row["run_id"]))
+        except Exception as exc:
+            self.log("CI: action download retry failed (request consumed): %s" % exc)
+
     def _record_failed_jobs(self, st, repo: str, row: dict,
                             bases=BASE_BRANCHES) -> None:
         """#846 : sur une branche de base, un job déjà en échec est un rouge de
@@ -2308,7 +2406,9 @@ class Watcher:
         attempt = int(row.get("run_attempt") or 1)
         jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
                         % (repo, run_id, attempt)) or {}
-        for job in failed_jobs_of(jobs.get("jobs")):
+        rows = jobs.get("jobs") or []
+        infra = {j["id"] for j in self._download_jobs(repo, row, rows)}
+        for job in failed_jobs_of([j for j in rows if j.get("id") not in infra]):
             st.ci.add_failure(repo, run_id, run_attempt=attempt,
                               part=JOB_PART, test=job,
                               module="", status="echec", inherited=False,
@@ -2337,6 +2437,25 @@ class Watcher:
                     or int(run.get("run_attempt") or 0) != attempt:
                 return []
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
+        infrastructure = []
+        if status == "failure":
+            jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
+                            % (repo, row["run_id"], attempt)) or {}
+            failed = [j for j in jobs.get("jobs") or []
+                      if j.get("conclusion") in FAILED_JOB_CONCLUSIONS]
+            infrastructure = self._download_jobs(repo, row, failed)
+            complete = int(jobs.get("total_count") or len(jobs.get("jobs") or [])) <= len(jobs.get("jobs") or [])
+            if complete and failed and len(infrastructure) == len(failed) and not st.ci.failures(repo, int(row["run_id"])):
+                # Existing cancelled storage state represents no conclusion;
+                # never persist success or manufacture negative test evidence.
+                status = "cancelled"
+                if not st.ci.head_replaced(
+                        repo, row["branch"], row["head_sha"], int(row["run_id"])):
+                    self._retry_download_jobs(repo, row, infrastructure)
+        if infrastructure and status == "cancelled":
+            if not st.ci.conclude(repo, int(row["run_id"]), status):
+                return []
+            return self._verdict(db, repo, row, run, "inconclusive", pending=pending)
         if not st.ci.conclude(repo, int(row["run_id"]), status):
             return []
         if status == "cancelled":

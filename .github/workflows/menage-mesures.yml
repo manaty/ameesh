@@ -46,7 +46,7 @@ jobs:
       contents: read   # actions/checkout, branche par défaut
       actions: write   # lire le run, supprimer ses mesures
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: supprimer les mesures du run terminé
         env:
           GH_TOKEN: ${{ github.token }}
