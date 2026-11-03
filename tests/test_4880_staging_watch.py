@@ -245,7 +245,7 @@ publier_suivi failed
         self.assertNotIn("deadline", closed["hosts"]["vm-1"])
         self.assertGreater(first["beat"], 0)
 
-    def test_backup_budget_covers_server_and_retrieval_with_one_runner(self):
+    def test_backup_budget_covers_the_three_dumps_with_one_runner(self):
         with tempfile.TemporaryDirectory() as folder:
             proc = self.harness(folder, """
 debut_etape poste sauvegarde
@@ -255,8 +255,10 @@ publier_suivi running
             self.assertEqual(proc.returncode, 0, proc.stderr)
             snapshot = self.snapshots(folder)[-1]
         step = snapshot["hosts"]["poste"]
-        self.assertGreaterEqual(step["deadline"] - step["since"], 9060 + 30 + 3600)
-        self.assertGreaterEqual(snapshot["stall_s"], 9060 + 30 + 3600)
+        # #5682 : serveur (9060) + rapatriement (3600) + ancienne base (3600),
+        # plus 60 s de marge.
+        self.assertEqual(step["deadline"] - step["since"], 9060 + 3600 + 3600 + 60)
+        self.assertEqual(snapshot["stall_s"], 9060 + 3600 + 3600 + 60)
 
     def test_closed_step_keeps_its_start_in_the_journal(self):
         import json

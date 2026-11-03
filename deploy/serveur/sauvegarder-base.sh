@@ -5,6 +5,9 @@
 # copie hors de la VM si /etc/ameesh/sauvegarde.env existe (stockage d'objets
 # S3 ; une clé en ÉCRITURE SEULE suffit et est recommandée).
 #   SCW_ACCESS_KEY, SCW_SECRET_KEY, SCW_BUCKET, SCW_REGION
+#   AMEESH_DUMP_TIMEOUT_S : borne du pg_dump en secondes, entier de 1 à 3600
+#   (défaut 3600). Ce fichier est lu AVANT le dump (#5682), et les clés SCW ne
+#   sont exportées qu'avant l'envoi, donc pas dans l'environnement de pg_dump.
 #
 # Les dumps ne sont lisibles que par ameesh : répertoire 0700, fichiers 0600,
 # quel que soit le umask de l'appelant (#1305) ou une ACL par défaut du
@@ -29,10 +32,17 @@ export TMPDIR
 f="$d/ameesh-$(hostname)-$(date +%F-%H%M%S).dump"
 python=/opt/ameesh/venv/bin/python
 helper=/usr/local/sbin/ameesh-sauvegarder-prive.py
-"$python" "$helper" dump --config /home/ameesh/.config/ameesh/config.json --output "$f" \
-    --timeout "${AMEESH_DUMP_TIMEOUT_S:-3600}"
+# #5682 : lire le fichier d'environnement avant le dump, pour que le
+# AMEESH_DUMP_TIMEOUT_S qu'il porte s'applique ; les clés SCW ne sont
+# exportées qu'avant l'envoi, donc pas dans l'environnement de pg_dump.
+storage=0
 if [ -r /etc/ameesh/sauvegarde.env ]; then
     . /etc/ameesh/sauvegarde.env
+    storage=1
+fi
+"$python" "$helper" dump --config /home/ameesh/.config/ameesh/config.json --output "$f" \
+    --timeout "${AMEESH_DUMP_TIMEOUT_S:-3600}"
+if [ "$storage" = 1 ]; then
     export SCW_ACCESS_KEY SCW_SECRET_KEY SCW_BUCKET SCW_REGION
     "$python" "$helper" upload --file "$f" --host "$(hostname)"
 fi

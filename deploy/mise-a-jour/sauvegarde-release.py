@@ -109,6 +109,13 @@ backup = module('sauvegarder-prive')
 retention = module('retention-privee')
 protocol = module('controleur-release')
 
+#: #5682 : délai explicite du dump de l'ensemble de récupération. Les dumps
+#: complets mesurés prennent 22 à 27 min ; 3600 s garde le facteur 2 du canal
+#: privé et borne la transaction de snapshot exportée à cette même durée.
+#: Ce n'est pas un défaut implicite : un changement du helper ne déplace pas
+#: silencieusement la fenêtre de la release.
+RELEASE_DUMP_TIMEOUT = 3600
+
 
 class RecoveryError(ValueError):
     pass
@@ -362,7 +369,8 @@ class RecoverySet:
             return False
         with self._config_file(self.config['dsn']) as config:
             try:
-                backup.snapshot_dump(config, archive, inventory_path, schema=self.schema)
+                backup.snapshot_dump(config, archive, inventory_path, schema=self.schema,
+                                     timeout=RELEASE_DUMP_TIMEOUT)
             except backup.BackupError:
                 return False
         expected = self._read_inventory(inventory_path)
