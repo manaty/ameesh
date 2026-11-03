@@ -22,7 +22,7 @@ from unittest import mock
 from ameesh import (fetch_cache, merge_queue, registry, review_authors,
                     review_designation as rd, work)
 
-from .support import PgTestCase
+from .support import PgTestCase, scaled
 from .test_2447_review_designation_activation import _ActivationFixture
 
 FAMILIES = ("claude", "codex", "deepseek")
@@ -149,6 +149,15 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
         # perdait le correctif sous l'activité ultérieure de l'agent. Témoin
         # direct (jalons insérés sans hook de gel) pour rester sous 15 s : le
         # hook de gel pèse ~80 s à lui seul dans le profil du gel #25249.
+        # #5629 : la lecture des 501 reçus coûte ~33 s sous psql à vide (un
+        # processus par requête), au-delà des 60 s du budget local sur un
+        # banc chargé. Le budget n'est pas l'objet du témoin : il suit l'échelle
+        # du banc (inchangé hors psql), pour la lecture directe et la porte.
+        budget = mock.patch.object(
+            review_authors, "REWRITTEN_SCAN_BUDGET_S",
+            scaled(review_authors.REWRITTEN_SCAN_BUDGET_S))
+        budget.start()
+        self.addCleanup(budget.stop)
         head_a = self.frozen
         self._milestone("frozen", head_a)
         self.repo.write("src/ameesh/mail.py", "lot\ncx3 petit correctif\n")

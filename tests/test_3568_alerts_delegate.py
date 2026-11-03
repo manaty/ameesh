@@ -43,7 +43,7 @@ from unittest import mock
 from ameesh import (alerts_delegation_pg, election, notify, registry, role_run,
                     role_timers, role_standings_pg as pg)
 
-from .support import PgTestCase
+from .support import PgTestCase, scaled
 
 NAME = "pilote-3568"
 NTFY = {"routes": {"human:owner": ["ntfy"]},
@@ -399,7 +399,9 @@ class AlertsGateTest(_AlertsCase):
         thread = threading.Thread(target=run_first, name="alerts-first")
         thread.start()
         try:
-            deadline = time.time() + 10.0
+            # #5629 : bornes hautes seules (relectures sous psql chargé avant
+            # le lancement de l'enfant) — à l'échelle du banc
+            deadline = time.time() + scaled(10.0)
             while time.time() < deadline and not os.path.exists(started):
                 time.sleep(0.02)
             self.assertTrue(os.path.exists(started),
@@ -417,7 +419,7 @@ class AlertsGateTest(_AlertsCase):
             # Let the first child finish only after the second attempt: a slow
             # query must not turn "the lease is held" into "the child is gone".
             open(release, "w").close()
-            thread.join(timeout=20.0)
+            thread.join(timeout=scaled(20.0))
         self.assertFalse(thread.is_alive())
         self.assertEqual(first["result"][0], 0)
         self.assertTrue(os.path.exists(done))
@@ -463,14 +465,17 @@ class AlertsGateTest(_AlertsCase):
             # A short TTL relative to the bench, but long enough for the
             # selection re-reads and the child start to fit before the local
             # deadline. The watcher's next renewal is TTL/3 away.
-            with mock.patch.object(role_run, "ALERTS_LEASE_TTL_S", 8.0):
+            # #5629 : sous psql chargé, les relectures dépassaient l'échéance
+            # locale (2/3 du TTL) : l'enfant ne démarrait jamais. Le TTL suit
+            # l'échelle du banc, l'attente et la jointure aussi.
+            with mock.patch.object(role_run, "ALERTS_LEASE_TTL_S", scaled(8.0)):
                 first["result"] = self.run_cli_isolated(
                     dataclasses.replace(self.cfg, host="atelier"), self.args(command))
 
         thread = threading.Thread(target=run_first, name="alerts-lost")
         thread.start()
         try:
-            deadline = time.time() + 10.0
+            deadline = time.time() + scaled(10.0)
             while time.time() < deadline and not os.path.exists(started):
                 time.sleep(0.02)
             self.assertTrue(os.path.exists(started))
@@ -480,7 +485,7 @@ class AlertsGateTest(_AlertsCase):
                 "UPDATE merge_locks SET owner = 'other', epoch = epoch + 1"
                 " WHERE target = %s", (ALERTS_KEY,))
         finally:
-            thread.join(timeout=15.0)
+            thread.join(timeout=scaled(15.0))
             alive = thread.is_alive()
             if alive:  # let the child finish so the failure can be reported
                 open(release, "w").close()
@@ -501,8 +506,13 @@ class AlertsGateTest(_AlertsCase):
         first_started = os.path.join(folder, "first")
         second_started = os.path.join(folder, "second")
         overlap = os.path.join(folder, "overlap")
+        # #5629 : sous psql chargé, les relectures dépassaient l'échéance
+        # locale (2/3 du TTL de 8 s) : l'enfant ne démarrait jamais. Toutes
+        # les durées suivent l'échelle du banc ensemble, l'ordre est gardé :
+        # échéance locale (2/3 TTL) < retour du renouvellement suspendu
+        # (TTL/3 + 4 s) < expiration du bail (TTL) < vie du premier enfant.
         first_command = ["python3", "-c", LOCK_CHILD, lock, first_started,
-                         overlap, "20"]
+                         overlap, str(scaled(20.0))]
         second_command = ["python3", "-c", LOCK_CHILD, lock, second_started,
                           overlap, "0.2"]
         original_renew = role_run._AlertsLease.renew
@@ -511,14 +521,14 @@ class AlertsGateTest(_AlertsCase):
             # The delegate's renewal is suspended before the server: it never
             # returns before the lease expires (the other host renews normally).
             if "atelier" in lease.owner:
-                time.sleep(4.0)
+                time.sleep(scaled(4.0))
                 return False
             return original_renew(lease)
 
         first = {}
 
         def run_first():
-            with mock.patch.object(role_run, "ALERTS_LEASE_TTL_S", 8.0), \
+            with mock.patch.object(role_run, "ALERTS_LEASE_TTL_S", scaled(8.0)), \
                     mock.patch.object(role_run._AlertsLease, "renew",
                                       suspended_renew):
                 first["result"] = self.run_cli_isolated(
@@ -528,7 +538,7 @@ class AlertsGateTest(_AlertsCase):
         thread = threading.Thread(target=run_first, name="alerts-suspended")
         thread.start()
         try:
-            deadline = time.time() + 10.0
+            deadline = time.time() + scaled(10.0)
             while time.time() < deadline and not os.path.exists(first_started):
                 time.sleep(0.02)
             self.assertTrue(os.path.exists(first_started),
@@ -538,7 +548,7 @@ class AlertsGateTest(_AlertsCase):
             self.standing("banc", notify_ok=True)
             # Wait for the database lease to expire. The first child must
             # already be dead by then, on its local deadline.
-            deadline = time.time() + 15.0
+            deadline = time.time() + scaled(15.0)
             while time.time() < deadline:
                 rows = self.db.query(
                     "SELECT (owner IS NULL OR expires_at < clock_timestamp())"
@@ -555,7 +565,7 @@ class AlertsGateTest(_AlertsCase):
             self.assertFalse(os.path.exists(overlap),
                              "two alerts children ran at the same time")
         finally:
-            thread.join(timeout=15.0)
+            thread.join(timeout=scaled(15.0))
         self.assertFalse(thread.is_alive())
         self.assertEqual(first["result"][0], 1)
 

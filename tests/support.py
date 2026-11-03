@@ -48,6 +48,8 @@ BENCH_ENV_VARS = frozenset((
     "AMEESH_TEST_GABARIT",
     # L98 T2b (#4408) : AMEESH_MODULES=bare, le job « profil nu » de la CI
     "AMEESH_MODULES",
+    # #5629 : facteur des bornes murales des tests (`scaled`)
+    "AMEESH_TEST_TIME_SCALE",
 ))
 #: L73/L142 : les caches de gestionnaires de paquets que le ménage redirige
 #: (`menage.CACHES`, `menage.XDG_CACHE`) sont un « choix de l'hôte » que le
@@ -56,6 +58,36 @@ BENCH_ENV_VARS = frozenset((
 #: un test qui veut ce cas les pose explicitement (`child_env`, `turn_env`).
 HOST_CACHE_PREFIXES = ("npm_config_", "pnpm_config_")
 HOST_CACHE_VARS = ("YARN_CACHE_FOLDER", "XDG_CACHE_HOME")
+
+
+#: #5629 : facteur d'échelle des bornes murales des tests (délai d'attente,
+#: fenêtre d'échéance). Sous psql, chaque requête est un processus : un banc
+#: chargé (nocturne, CI de paquet en parallèle) y est plusieurs fois plus
+#: lent qu'en local. `AMEESH_TEST_TIME_SCALE` le fixe ; à défaut, 5 sous
+#: psql, 1 sinon. Une borne haute s'allonge sans rien coûter au vert ; une
+#: durée que le test veut voir NON écoulée ne s'échelonne jamais.
+def _time_scale() -> float:
+    raw = os.environ.get("AMEESH_TEST_TIME_SCALE", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value >= 1.0:
+            return value
+        raise ValueError("AMEESH_TEST_TIME_SCALE invalide (nombre >= 1) : %r"
+                         % raw)
+    driver = (os.environ.get("AMEESH_DRIVER")
+              or os.environ.get("AGENT_MESH_DRIVER") or "").strip()
+    return 5.0 if driver == "psql" else 1.0
+
+
+TIME_SCALE = _time_scale()
+
+
+def scaled(seconds: float) -> float:
+    """Borne murale `seconds` mise à l'échelle du banc (#5629)."""
+    return seconds * TIME_SCALE
 
 
 #: L98 T2b (#4408) : au profil nu (`AMEESH_MODULES=bare`), le cœur tourne sans
@@ -1018,15 +1050,15 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
             timeout: float = 60.0) -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, "-m", "ameesh.cli", *args],
-            input=stdin, capture_output=True, text=True, timeout=timeout,
-            env=env or self.env(), cwd=self.tmp,
+            input=stdin, capture_output=True, text=True,
+            timeout=scaled(timeout), env=env or self.env(), cwd=self.tmp,
         )
 
     def runner(self, *args: str, env: dict | None = None, timeout: float = 60.0,
                ) -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, "-m", "ameesh.runner", *args],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=scaled(timeout),
             env=env or self.env(), cwd=self.tmp,
         )
 
@@ -1034,7 +1066,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
              ) -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, "-m", "ameesh.main", *args],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=scaled(timeout),
             env=env or self.env(), cwd=self.tmp,
         )
 
@@ -1059,6 +1091,8 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
     # -- attentes ----------------------------------------------------------
     def wait_for(self, predicate, timeout: float = 10.0, interval: float = 0.1,
                  msg=None):
+        # #5629 : la borne est mise à l'échelle du banc (`scaled`)
+        timeout = scaled(timeout)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             value = predicate()

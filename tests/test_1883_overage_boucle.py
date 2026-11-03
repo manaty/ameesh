@@ -512,8 +512,10 @@ class OveragePartageTest(_Base):
             kind="bascule", reason="r", agent="t", now=maintenant))
         self.assertEqual(store.active(self.cfg.host, "codex")["account"], "primaire")
         self.assertEqual(self._bascules(), [])
-        self.db.execute("UPDATE account_holds"
-                        " SET until_ts = extract(epoch from now()) - 1")
+        # #5629 : la retenue échoit avant `maintenant`, l'horloge que reçoit
+        # la bascule — non avant l'heure de la base à l'UPDATE, qui sous psql
+        # chargé dépasse `maintenant` de plus d'une seconde
+        self.db.execute("UPDATE account_holds SET until_ts = %s", (maintenant - 1,))
         self.assertTrue(store.switch_guarded(
             self.cfg.host, "codex", expected="primaire", to="secondaire",
             kind="bascule", reason="r", agent="t", now=maintenant,

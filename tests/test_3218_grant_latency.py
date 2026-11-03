@@ -18,7 +18,7 @@ import unittest
 from ameesh import account_window, mail, registry, turn_stages
 from ameesh.runner import AgentWorker, Runner
 
-from .support import PgTestCase
+from .support import PgTestCase, scaled
 
 
 class RecuTest(unittest.TestCase):
@@ -116,8 +116,11 @@ class ReveilALEcheanceTest(_Base):
         _runner, worker = self._worker("lat-batch", batch=30.0)
         mail.send(self.db, "dev1", "lat-batch", "prêt")
         self.assertIsNone(worker.pick())
-        # l'échéance est la fin de la fenêtre, pas le sondage suivant
-        self.assertAlmostEqual(worker._due_at - time.time(), 30.0, delta=2.0)
+        # l'échéance est la fin de la fenêtre, pas le sondage suivant ; #5629 :
+        # comptée depuis l'arrivée du message, pas depuis la fin de `pick()`
+        # (plusieurs secondes sous psql chargé)
+        arrivee = float(mail.unread(self.db, "lat-batch")[0]["created_ts"])
+        self.assertAlmostEqual(worker._due_at, arrivee + 30.0, delta=2.0)
         self.assertEqual(worker._until_due(5.0), 5.0)  # au-delà du sondage : le sondage
         self.assertIsNone(worker._due_at)              # consommée
         worker.note_due_at(time.time() + 0.5)
@@ -127,11 +130,13 @@ class ReveilALEcheanceTest(_Base):
         self.assertEqual(worker._until_due(5.0), 0.05)
 
     def test_reveil_dans_la_fenetre(self):
-        _runner, worker = self._worker("lat-short", batch=3.0)
+        # #5629 : la fenêtre ne doit pas s'écouler pendant le premier `pick()`
+        fenetre = scaled(3.0)
+        _runner, worker = self._worker("lat-short", batch=fenetre)
         mail.send(self.db, "dev1", "lat-short", "prêt")
         self.assertIsNone(worker.pick())
-        attente = worker._until_due(5.0)
-        self.assertLess(attente, 3.1)  # la fin de la fenêtre, avant le sondage
+        attente = worker._until_due(fenetre + 2.0)
+        self.assertLess(attente, fenetre + 0.1)  # la fin de la fenêtre, avant le sondage
         time.sleep(attente)
         spec = worker.pick()
         self.assertEqual(spec["kind"], "mail")

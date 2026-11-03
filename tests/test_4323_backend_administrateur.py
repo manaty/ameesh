@@ -306,6 +306,9 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
         self.assertEqual(self.backend.install(self.operation,self.view['id'],authority=self.signed())['outcome'],
                          'installed')
         self.assertTrue((self.root/KEY.lstrip('/')).exists())
+        # #5629: the revoke is signed now, not at setUp — the proof refuses an
+        # approval dated more than 120 s past the authority clock (psql load)
+        self.now=time.time()
         view=self.revoke_view()
         revoke='revoke — saisi par le bureau, délégation §10'
         self.sign(view,revoke)

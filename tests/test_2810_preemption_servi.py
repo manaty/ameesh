@@ -29,7 +29,7 @@ from unittest import mock
 from ameesh import mail, registry
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, scaled
 
 
 class PropreMessageTest(PgTestCase):
@@ -57,7 +57,9 @@ class PropreMessageTest(PgTestCase):
 
     @staticmethod
     def _attendre(condition, timeout: float = 5.0) -> bool:
-        fin = time.monotonic() + timeout
+        # #5629 : borne haute à l'échelle du banc — sous psql chargé, la
+        # préparation du tour (avant la publication du harnais) en prend plus
+        fin = time.monotonic() + scaled(timeout)
         while time.monotonic() < fin:
             if condition():
                 return True
@@ -100,7 +102,7 @@ class PropreMessageTest(PgTestCase):
                             "le harnais du tour n'a pas été publié")
             self._dispatch(runner, "pre", row["id"])
             self.assertFalse(worker.preempting.is_set())
-            fil.join(timeout=15)
+            fil.join(timeout=scaled(15))
         self.assertFalse(fil.is_alive(), "le tour n'a pas rendu la main")
         self.assertEqual(verdict, [True],
                          "le tour a été interrompu par le NOTIFY de son message")
@@ -112,7 +114,10 @@ class PropreMessageTest(PgTestCase):
         self.assertEqual(spec["kind"], "urgent")
         verdict: list = []
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
-               "AMEESH_TEST_SLEEP": "5"}
+               # #5629 : le tour doit durer jusqu'au second urgent (envoi et
+               # relecture : plusieurs secondes sous psql chargé) ; coupé, il
+               # ne coûte rien de plus
+               "AMEESH_TEST_SLEEP": str(int(scaled(5)))}
         with mock.patch.dict(os.environ, env, clear=False):
             fil = threading.Thread(
                 target=lambda: verdict.append(worker.run_turn(spec)), daemon=True)
@@ -122,7 +127,7 @@ class PropreMessageTest(PgTestCase):
             autre = self._urgent("pre", "second incident")
             self._dispatch(runner, "pre", autre["id"])
             self.assertTrue(self._attendre(lambda: worker.preempting.is_set()))
-            fil.join(timeout=15)
+            fil.join(timeout=scaled(15))
         self.assertFalse(fil.is_alive())
         self.assertEqual(verdict, [False],
                          "un urgent différent n'a pas interrompu le tour")
@@ -153,7 +158,7 @@ class PropreMessageTest(PgTestCase):
             self.assertTrue(self._attendre(lambda: worker.proc is not None))
             self._dispatch(runner, "pre", row["id"])
             self.assertFalse(worker.preempting.is_set())
-            fil.join(timeout=15)
+            fil.join(timeout=scaled(15))
         self.assertFalse(fil.is_alive())
         self.assertEqual(verdict, [True])
 
