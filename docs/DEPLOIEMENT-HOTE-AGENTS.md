@@ -848,7 +848,22 @@ entrée non fiable :
   en cours ou illisible (quota anonyme compris) : refus, la demande reste en
   attente et la forge est relue au plus toutes les 5 min. Un dépôt privé
   exigerait un jeton de lecture, nouveau détenteur de secret soumis à une
-  décision owner.
+  décision owner ;
+- **les empreintes de la sonde et du notifier sont consignées** (#5665) :
+  avant chaque passage qui traite une demande, et avant tout geste d'hôte
+  (reprise comprise), l'exécutant lit en entier et hache en SHA256 le
+  programme `quiescence_probe`, chaque script absolu qu'il reçoit en
+  argument, et le notifier de ses alertes : `QUIESCENCE_NOTIFIER` (celui de
+  `bascule_env`, que la sonde source, l'emporte sur celui de l'unité ; seul
+  un chemin littéral y est admis), sinon le python de la sonde
+  (`QUIESCENCE_PYTHON`, défaut `~/.local/share/ameesh/venv/bin/python`) et
+  le paquet `ameesh` de son venv (une empreinte de l'arbre, caches
+  `__pycache__` exclus). Elles vont dans la demande (`fingerprints`), donc
+  dans la tentative et son résultat. Fichier illisible ou introuvable :
+  refus `fingerprint: …`, sans aucun geste. La clé facultative
+  `expected_sha256` de `staging-executor.json` (chemin absolu → SHA256)
+  fait refuser toute empreinte différente, ou un chemin déclaré que la
+  séquence ne lance pas ; absente, on consigne sans refuser.
 
 Le programme `quiescence_probe` doit prouver l'arrêt de l'ancien exécutant
 et de ses opérations distantes, y compris les unités transitoires du poste.
