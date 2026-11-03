@@ -363,7 +363,7 @@ jobs:
               echo "::error::workflow_dispatch on '$DISPATCH_REF': only main, release/**, integration/** and validation/** may be run by hand (#1635); a lot branch gets its CI through its pull request, nothing run"
               exit 1 ;;
           esac
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           fetch-depth: 0  # the map commit, and whether it is an ancestor
       # #5325 — le disque de la VM, mesuré depuis le job : seul accès, le poste
@@ -520,7 +520,7 @@ jobs:
       - name: poussée (plan automatique)
         if: github.event_name != 'pull_request'
         run: echo "AMEESH_CI_MODE=auto" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
       # #4521 (revue cx2, B/P2 ; B/P1 auditeur) : la garde des alias
@@ -556,7 +556,7 @@ jobs:
       # #4543 : la clé suit la base du plan (`plan_base`), pas la base
       # demandée : la carte doit être celle du commit que le plan diff, sinon
       # la trace du run porte une base et la sélection en lit une autre.
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: carte/carte.json.gz
           key: carte-${{ steps.gel.outputs.plan_base || github.event.before || github.sha }}
@@ -596,7 +596,7 @@ jobs:
       - id: plan_digest
         name: empreinte du plan (canal artefacts, #1256 B4)
         run: echo "sha256=$(sha256sum plan.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: plan
           path: plan.json
@@ -643,7 +643,7 @@ jobs:
       - &debut
         name: début du job (mesure du plafond, #899)
         run: echo "AMEESH_JOB_DEBUT=$(date -u +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - *disque_rapport
       # #3581 : le témoin du pont JS (#3529) appelle `node`, absent du PATH de
       # certains runners du pool (FileNotFoundError node, psql 7/16 et psycopg
@@ -679,7 +679,7 @@ jobs:
         name: port de la base jetable
         run: echo "AMEESH_TEST_DSN=postgresql://ameesh@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/ameesh" >> "$GITHUB_ENV"
       - id: py
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
           cache: pip
@@ -698,7 +698,7 @@ jobs:
       # identique, si bien qu'un venv devenu invalide était reconstruit à
       # chaque exécution sur ce runner.
       - id: venv
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: .venv-ci
           key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
@@ -737,7 +737,7 @@ jobs:
       # reconstruction reste correcte, seule la prochaine exécution repaie.
       - if: steps.deps.outputs.reconstruit == '1'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: .venv-ci
           key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
@@ -790,7 +790,7 @@ jobs:
           git config --global user.email "ci@ameesh.invalid"
           git config --global init.defaultBranch main
       - &plan
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: plan
           path: ${{ runner.temp }}
@@ -830,7 +830,7 @@ jobs:
         run: python scripts/ci-flow.py summary "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"
       - name: flux en artefact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: flux-psycopg-${{ matrix.part }}
           path: ${{ runner.temp }}/flux.jsonl
@@ -899,12 +899,12 @@ jobs:
       AMEESH_PLAFOND_MIN: "60"
     steps:
       - *debut
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - *disque_rapport
       - *node_bridge
       - *node_witness
       - *dsn
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
       # ManifestesTest (test_cluster, liste « toujours ») lit deploy/k8s avec
@@ -930,7 +930,7 @@ jobs:
       - *resume
       - name: flux en artefact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: flux-psql-${{ matrix.part }}
           path: ${{ runner.temp }}/flux.jsonl
@@ -985,13 +985,13 @@ jobs:
       AMEESH_PLAFOND_MIN: "45"
     steps:
       - *debut
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - *disque_rapport
       - *node_bridge
       - *node_witness
       - *dsn
       - id: py
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
           cache: pip
@@ -1001,7 +1001,7 @@ jobs:
       # le venv. Une clé distincte paierait deux constructions et laisserait le
       # contrôle de fs-class plus étroit que le contenu déposé par psycopg.
       - id: venv
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: .venv-ci
           key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
@@ -1024,7 +1024,7 @@ jobs:
       # reconstruction reste correcte, seule la prochaine exécution repaie.
       - if: steps.deps.outputs.reconstruit == '1'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: .venv-ci
           key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
@@ -1071,7 +1071,7 @@ jobs:
       - *resume
       - name: flux en artefact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           # hors du motif `flux-*` : le bilan (L161f) agrège ces flux-là, une
           # seconde part du même plan y fausserait le vert provisoire
@@ -1123,8 +1123,8 @@ jobs:
     env:
       AMEESH_REQUIRE_DB: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
       # psutil est la dépendance de la couche plateforme sous macOS : sans
@@ -1163,8 +1163,8 @@ jobs:
     env:
       AMEESH_REQUIRE_DB: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
       - name: lecteurs de la doc
@@ -1198,14 +1198,14 @@ jobs:
     timeout-minutes: 5
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: plan
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           pattern: flux-*
           path: flux
@@ -1213,7 +1213,7 @@ jobs:
         run: |
           python3 scripts/test-plan.py leaks plan.json flux/*/flux.jsonl --out leaks.json \
             --summary "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: leaks
           path: leaks.json
@@ -1234,7 +1234,7 @@ jobs:
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           fetch-depth: 0  # the tags, and the range since the last one
       - name: number against content
@@ -1300,7 +1300,7 @@ jobs:
       # fichier avant la réconciliation #856). `continue-on-error` : un
       # checkout en échec laisse le bilan conclure (script absent = rouge),
       # jamais un vert muet.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         if: always()
         continue-on-error: true
       - name: bilan des types clients
@@ -1395,8 +1395,8 @@ jobs:
     env:
       PYTHONPATH: src
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.14'
       - name: installation
@@ -1439,8 +1439,8 @@ jobs:
       AMEESH_MODULES: bare
       AMEESH_REQUIRE_DB: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
       # venv du job : un runner auto-hébergé ne garde rien dans le Python partagé

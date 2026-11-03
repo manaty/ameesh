@@ -63,7 +63,7 @@ jobs:
       covered: ${{ steps.pr.outputs.covered }}
       covered_pr: ${{ steps.pr.outputs.covered_pr }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       # le repli est dans la commande : contexte incomplet, API illisible ou
       # non listée écrivent covered=false et sortent 0 — la suite tourne.
       - id: pr

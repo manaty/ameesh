@@ -567,3 +567,28 @@ activation waits for the gates of §5, and the whole loan stays reversible at
 every step through the state file written by `ci-runners.sh --prepare`. The
 loan carries **no required check** (option A): relieving the required suite
 is the announcement of the lot, not of the loan.
+
+### Cache local des archives d’actions (#5655)
+
+`ci-runners.sh --prepare` remplit le cache Linux commun aux slots de la VM,
+`/usr/local/lib/ameesh-guest-ci/action-archives`, puis installe le drop-in
+`ameesh-guest-ci@.service.d/action-cache.conf`. Le runner 2.338.0 y lit
+`owner_repo/SHA.tar.gz` via `ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE`. Root publie
+les archives ; les jobs ne peuvent pas les remplacer. Un verrou sérialise
+le remplissage ; un transfert incomplet n’est jamais publié. Un second
+passage réutilise les archives dont la somme locale est intacte.
+
+Les références des workflows sont figées aux SHA. Après leur mise à jour,
+le bureau relance `--prepare` depuis le checkout fusionné, avant d’armer les
+slots. Le remplissage se fait une fois par VM ; une référence absente du cache
+reste téléchargeable normalement par le runner. `--remove` retire le cache
+et le drop-in créés par le script.
+
+Le veilleur reconnaît un échec de téléchargement d’archive codeload seulement
+si `Set up job` a échoué et qu’aucune étape du workflow n’a tourné. Il écarte
+ce job des échecs de tests et demande une relance ciblée, au plus une fois
+(marqueur persistant dans `state_dir/ci-action-retries`). Une requête dont la
+réponse est ambiguë consomme cette tentative et se consigne dans le journal.
+Un run dont tous les jobs échoués sont ainsi reconnus rend un verdict
+`inconclusive`, conservé avec l’état de stockage existant `cancelled` ; il
+n’est jamais déclaré vert. Tout échec de test observé garde le verdict rouge.

@@ -77,7 +77,7 @@ jobs:
       contents: read   # actions/checkout, branche par défaut
       actions: write   # rerun-failed-jobs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: décision et relance
         env:
           GH_TOKEN: ${{ github.token }}

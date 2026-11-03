@@ -21,6 +21,6 @@ jobs:
       matrix:
         host: [ameesh-ci-1, ameesh-ci-2, ameesh-ci-3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: mesure structurée (#5630)
         run: python3 scripts/ci-disque.py mesure --host '${{ matrix.host }}'
