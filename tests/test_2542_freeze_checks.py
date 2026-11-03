@@ -189,8 +189,13 @@ class ScriptTest(unittest.TestCase):
     def test_erreur_de_syntaxe_rougit_la_compilation(self):
         root = self.tree()
         pathlib.Path(root, "tests", "test_casse.py").write_text("def (:\n", encoding="utf-8")
-        compilation = [c for c in script.CHECKS if c[0] == "compilation"]
-        code, out = self.main(root, tuple(compilation))
+        # #5607 : le guest de prévalidation n'a pas AF_UNIX ; `compileall -j 0`
+        # y casse son forkserver avant d'atteindre le fichier (OSError 97,
+        # #4071). Même contrôle en sériel : le défaut de syntaxe rougit.
+        name, args = next(c for c in script.CHECKS if c[0] == "compilation")
+        args = list(args)
+        args[args.index("-j") + 1] = "1"
+        code, out = self.main(root, ((name, args),))
         self.assertEqual(code, 1)
         self.assertIn("RED compilation", out)
         self.assertIn("test_casse.py", out)
