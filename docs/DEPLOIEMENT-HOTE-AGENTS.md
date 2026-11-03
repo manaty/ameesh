@@ -406,23 +406,29 @@ python3 deploy/mise-a-jour/venv-staging.py verifier \
 ```
 
 Le code 0 est obligatoire. Un écart est un refus : aucune activation, aucun
-repli libre, aucun élargissement des droits. La vérification est en lecture
-seule et fail closed ; elle contrôle :
+repli libre, aucun élargissement des droits. Le manifeste épingle aussi
+l'interpréteur : `python` porte sa `version`, son `home` et son `executable`
+résolus, et le SHA-256 du binaire résolu. La vérification compare ces valeurs
+**avant d'exécuter l'interpréteur** ; un `pyvenv.cfg` ou un `bin/python`
+réécrit vers un autre binaire, même de même version, est un écart. Elle est en
+lecture seule et fail closed ; elle contrôle :
 
 | Objet | Contrôle |
 | --- | --- |
-| Interpréteur | `pyvenv.cfg` (`home`, `version`, `include-system-site-packages=false`), `bin/python` lié à l'interpréteur de base, version relue |
+| Interpréteur | `python.version`, `home` et `executable` résolus et root, SHA-256 du binaire résolu, `bin/python*` liés à ce binaire, `include-system-site-packages=false`, version relue après la comparaison |
 | Distributions | liste exacte et versions de `distributions`, égale au bootstrap (`pip`) plus le lock |
 | Arbre installé | SHA-256, nombre de fichiers, dossiers et octets de tout le venv hors `bin/`, `pyvenv.cfg`, `lib64` et bytecode |
-| Scripts d'entrée | contenu et lanceur de chaque script de `bin/` déclaré par un `RECORD` |
+| Scripts d'entrée | contenu, lanceur et mode de chaque script de `bin/` déclaré par un `RECORD` |
 | Activation | scripts `activate*` normalisés par le chemin du venv |
-| Dépendances | `pip check` après la vérification de l'arbre |
+| Dépendances | `pip check` après la vérification de l'arbre, avec `-B` et un cache de bytecode hors du venv |
 
 Les fichiers `bin/` sont couverts par le hash de chaque script d'entrée (le
 chemin du venv est normalisé en `<VENV>`), les scripts d'activation par leur
 propre hash, et `__pycache__`/`.pyc` ne font pas partie du manifeste : la pose
 utilise `--no-compile` et la vérification n'écrit pas de bytecode ; seul le
-bytecode du `pip` de bootstrap est toléré, tout autre est un écart. Un
+bytecode du `pip` de bootstrap est toléré, tout autre est un écart. Le
+`pip check` de la vérification relit la source de `pip`, jamais son bytecode :
+il s'exécute avec `-B` et un `pycache_prefix` hors du venv. Un
 dossier `lib64` n'est accepté que comme lien vers `lib`.
 
 Codes de sortie du vérifier : `0` conforme, `1` écart constaté, `2` manifeste

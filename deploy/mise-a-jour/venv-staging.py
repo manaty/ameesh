@@ -34,11 +34,13 @@ La production :
   ni secret. Deux exécutions sur le même SHA, le même lock et le même
   wheelhouse produisent les mêmes octets.
 
-La vérification est en lecture seule et fail closed : elle contrôle le
-``pyvenv.cfg`` (version, ``include-system-site-packages``, interpréteur de
-base), l'inventaire des distributions, l'arbre installé (hors ``bin/``,
-``pyvenv.cfg`` et bytecode, couverts séparément), les scripts d'entrée, les
-scripts d'activation, puis ``pip check``. Un fichier de plus, de moins, modifié
+La vérification est en lecture seule et fail closed : elle épingle
+l'interpréteur (``version``, ``home``, ``executable`` et SHA-256 du binaire
+résolu) et le compare avant de l'exécuter, puis contrôle le ``pyvenv.cfg``
+(``include-system-site-packages``), l'inventaire des distributions, l'arbre
+installé (hors ``bin/``, ``pyvenv.cfg`` et bytecode, couverts séparément), les
+scripts d'entrée (contenu, lanceur et mode), les scripts d'activation, puis
+``pip check`` sans charger le bytecode de ``pip``. Un fichier de plus, de moins, modifié
 ou un mode élargi est un écart.
 
 Le manifeste ne remplace ni la qualification du commit à la forge, ni la
@@ -65,10 +67,11 @@ import sys
 import tempfile
 import zipfile
 
-FORMAT = 'ameesh-venv-staging/1'
+FORMAT = 'ameesh-venv-staging/2'
 MAX_LOCK_BYTES = 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 10 * 1024 * 1024
+MAX_PYTHON_BYTES = 64 * 1024 * 1024
 MAX_TREE_BYTES = 512 * 1024 * 1024
 MAX_WHEEL_BYTES = 512 * 1024 * 1024
 MAX_READ = 64 * 1024
@@ -142,7 +145,7 @@ def _lire_regulier(chemin, limite, *, proprietaires=None):
     return donnees
 
 
-def _sha256_regulier(chemin, limite, *, proprietaires=None):
+def _sha256_regulier(chemin, limite, *, proprietaires=None, libelle='roue'):
     """SHA-256 et taille d'un fichier régulier, sans le charger en mémoire."""
     chemin = Path(chemin)
     if proprietaires is None:
@@ -157,7 +160,7 @@ def _sha256_regulier(chemin, limite, *, proprietaires=None):
                 or avant.st_uid not in proprietaires
                 or avant.st_mode & 0o022 or avant.st_mode & 0o7000
                 or avant.st_size > limite):
-            raise Erreur('roue non sûre ou trop grande : %s' % chemin.name)
+            raise Erreur('%s non conforme ou trop grand : %s' % (libelle, chemin.name))
         digest = hashlib.sha256()
         taille = 0
         while True:
@@ -166,13 +169,13 @@ def _sha256_regulier(chemin, limite, *, proprietaires=None):
                 break
             taille += len(morceau)
             if taille > limite:
-                raise Erreur('roue trop grande : %s' % chemin.name)
+                raise Erreur('%s trop grand : %s' % (libelle, chemin.name))
             digest.update(morceau)
         apres = os.fstat(flux.fileno())
         if (taille != avant.st_size
                 or (avant.st_size, avant.st_mtime_ns, avant.st_ctime_ns)
                 != (apres.st_size, apres.st_mtime_ns, apres.st_ctime_ns)):
-            raise Erreur('roue changée pendant sa lecture : %s' % chemin.name)
+            raise Erreur('%s changé pendant sa lecture : %s' % (libelle, chemin.name))
     return digest.hexdigest(), taille
 
 
@@ -517,8 +520,8 @@ def _distributions(venv, proprietaires):
     return sorted(distributions, key=lambda item: item['name'])
 
 
-def _entree_normalisee(donnees, venv):
-    """Type de lanceur, ligne de lanceur et corps canoniques d'un script."""
+def _entree_normalisee(donnees, venv, mode):
+    """Type de lanceur, ligne, mode et corps canoniques d'un script."""
     if not donnees:
         raise Ecart('script d’entrée vide')
     prefixe = os.fsencode(str(Path(venv).resolve()))
@@ -540,7 +543,8 @@ def _entree_normalisee(donnees, venv):
         corps = b''.join(lignes[1:])
     else:
         raise Ecart('script d’entrée sans shebang')
-    canonique = type_lanceur.encode('ascii') + b'\0' + lanceur + b'\0' + corps
+    canonique = (type_lanceur.encode('ascii') + b'\0' + lanceur + b'\0'
+                 + str(mode).encode('ascii') + b'\0' + corps)
     return dict(launcher=type_lanceur,
                 sha256=hashlib.sha256(canonique).hexdigest(),
                 taille=len(lanceur) + len(corps))
@@ -587,9 +591,10 @@ def _entrees(venv, site, proprietaires):
             if nom in entrees:
                 raise Ecart('script de bin/ déclaré deux fois : %s' % nom)
             fichier = Path(venv) / 'bin' / nom
-            entrees[nom] = _entree_normalisee(
-                _lire_regulier(fichier, MAX_METADATA_BYTES,
-                               proprietaires=proprietaires), venv)
+            donnees = _lire_regulier(fichier, MAX_METADATA_BYTES,
+                                     proprietaires=proprietaires)
+            mode = stat.S_IMODE(fichier.lstat().st_mode)
+            entrees[nom] = _entree_normalisee(donnees, venv, mode)
     return entrees
 
 
@@ -617,13 +622,15 @@ def _activations(venv, proprietaires):
     return resultat
 
 
-def _controler_pyvenv(venv, proprietaires):
-    """Version, mode site et interpréteur de base, sans exécuter le venv."""
+def _interpreteur(venv):
+    """Le Python de base épinglable, mesuré sans exécuter le venv."""
     venv = Path(venv)
+    propriete = _proprietaires(venv)
+    _dossier_protege(venv, proprietaires=propriete)
     cfg = venv / 'pyvenv.cfg'
     try:
         texte = _lire_regulier(cfg, 64 * 1024,
-                               proprietaires=proprietaires).decode('utf-8')
+                               proprietaires=propriete).decode('utf-8')
     except UnicodeDecodeError:
         raise Ecart('pyvenv.cfg non UTF-8') from None
     valeurs = {}
@@ -648,33 +655,50 @@ def _controler_pyvenv(venv, proprietaires):
     executable = Path(valeurs['executable'])
     if not home.is_absolute() or not executable.is_absolute():
         raise Ecart('chemins absolus attendus dans pyvenv.cfg')
-    _dossier_protege(home)
-    if not executable.exists():
-        raise Ecart('interpréteur de base absent')
-    if executable.parent != home:
-        raise Ecart('interpréteur de base hors de home')
-    lien = venv / 'bin' / 'python'
-    if not lien.is_symlink() or not lien.exists():
-        raise Ecart('bin/python doit être un lien vers le Python de base')
-    if not os.path.samefile(lien.resolve(), executable.resolve()):
-        raise Ecart('bin/python ne pointe pas vers l’interpréteur de base')
+    try:
+        home_resolu = home.resolve(strict=True)
+        executable_resolu = executable.resolve(strict=True)
+    except OSError:
+        raise Ecart('interpréteur de base absent') from None
+    try:
+        _dossier_protege(home_resolu, proprietaires=frozenset((0,)))
+    except Erreur as erreur:
+        raise Ecart('home de l’interpréteur non root : %s' % erreur) from None
+    try:
+        digest, _taille = _sha256_regulier(
+            executable_resolu, MAX_PYTHON_BYTES,
+            proprietaires=frozenset((0,)), libelle='interpréteur')
+    except Erreur as erreur:
+        raise Ecart('interpréteur de base non sûr : %s' % erreur) from None
+    for nom in ('python', 'python3'):
+        lien = venv / 'bin' / nom
+        if not lien.is_symlink() or not lien.exists():
+            raise Ecart('bin/python doit être un lien vers le Python de base')
+        if not os.path.samefile(lien.resolve(), executable_resolu):
+            raise Ecart('bin/%s ne pointe pas vers l’interpréteur de base' % nom)
     for nom in sorted((venv / 'bin').iterdir()):
         if nom.name.startswith('python'):
             if not nom.is_symlink() or not nom.exists():
                 raise Ecart('lien Python invalide dans bin/ : %s' % nom.name)
-            if nom.name != 'python' and not os.path.samefile(
-                    nom.resolve(), executable.resolve()):
+            if not os.path.samefile(nom.resolve(), executable_resolu):
                 raise Ecart('lien Python étranger dans bin/ : %s' % nom.name)
-    with tempfile.TemporaryDirectory(prefix='venv-staging-home-') as home_tmp:
+    return dict(version=valeurs['version'], home=str(home_resolu),
+                executable=str(executable_resolu), sha256=digest)
+
+
+def _version_executable(interpreteur):
+    """La version réellement imprimée par le binaire épinglé, après contrôle."""
+    with tempfile.TemporaryDirectory(prefix='venv-staging-version-') as home:
         environnement = dict(
-            PATH='/usr/bin:/bin', HOME=home_tmp,
+            PATH='/usr/bin:/bin', HOME=home,
             LANG='C', LC_ALL='C', TZ='UTC', PYTHONHASHSEED='0',
             PYTHONDONTWRITEBYTECODE='1', PYTHONNOUSERSITE='1')
         try:
             resultat = subprocess.run(
-                [str(executable), '-I', '-S', '--version'], env=environnement,
-                cwd=str(venv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, timeout=30, check=False)
+                [interpreteur['executable'], '-I', '-S', '--version'],
+                env=environnement, cwd=home, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=30, check=False)
         except (OSError, subprocess.TimeoutExpired):
             raise Ecart('interpréteur de base non exécutable') from None
     sortie = (resultat.stdout + resultat.stderr).decode('utf-8', 'replace').strip()
@@ -682,9 +706,9 @@ def _controler_pyvenv(venv, proprietaires):
         r'Python ([0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+_-]*)', sortie)
     if resultat.returncode != 0 or correspondance is None:
         raise Ecart('version de l’interpréteur de base illisible')
-    if correspondance.group(1) != valeurs['version']:
+    if correspondance.group(1) != interpreteur['version']:
         raise Ecart('version de l’interpréteur de base différente de pyvenv.cfg')
-    return valeurs['version']
+    return correspondance.group(1)
 
 
 def _controler_bin(venv, entrees, activations):
@@ -807,7 +831,7 @@ def _mesurer_arbre(racine, *, proprietaires, ignorer=(), exclure_pycache=False,
                 dirs=dossiers, bytes=octets)
 
 
-def _mesurer_venv(venv):
+def _mesurer_venv(venv, *, interpreteur=None):
     """Tout le venv : arbre hors bin/pyvenv, distributions, entrées, activation."""
     venv = Path(venv)
     if not venv.is_dir() or venv.is_symlink():
@@ -818,7 +842,8 @@ def _mesurer_venv(venv):
     if lib64.exists() or lib64.is_symlink():
         if not lib64.is_symlink() or (lib64.resolve() != (venv / 'lib').resolve()):
             raise Ecart('lib64 inattendu dans le venv')
-    python = _controler_pyvenv(venv, propriete)
+    if interpreteur is None:
+        interpreteur = _interpreteur(venv)
     site = _dossier_site(venv)
     distributions = _distributions(venv, propriete)
     _controler_bytecode(site)
@@ -828,7 +853,7 @@ def _mesurer_venv(venv):
     arbre = _mesurer_arbre(
         venv, proprietaires=propriete, ignorer={'bin', 'lib64'},
         exclure_pycache=True, entrees=entrees, venv=venv)
-    return dict(python=python, distributions=distributions, tree=arbre,
+    return dict(python=interpreteur, distributions=distributions, tree=arbre,
                 entry_points=sorted(entrees.items()),
                 activation=activations)
 
@@ -868,9 +893,21 @@ def _valider_manifeste(document):
     _exiger(isinstance(document['source_tree_sha256'], str)
             and HEX256.fullmatch(document['source_tree_sha256']) is not None,
             'manifeste : source_tree_sha256')
-    _exiger(isinstance(document['python'], str)
-            and VERSION.fullmatch(document['python']) is not None,
-            'manifeste : version Python')
+    python = document['python']
+    _exiger(isinstance(python, dict)
+            and set(python) == {'version', 'home', 'executable', 'sha256'},
+            'manifeste : python')
+    _exiger(isinstance(python['version'], str)
+            and VERSION.fullmatch(python['version']) is not None,
+            'manifeste : python.version')
+    for champ in ('home', 'executable'):
+        _exiger(isinstance(python[champ], str)
+                and python[champ].startswith('/')
+                and '\x00' not in python[champ],
+                'manifeste : python.%s' % champ)
+    _exiger(isinstance(python['sha256'], str)
+            and HEX256.fullmatch(python['sha256']) is not None,
+            'manifeste : python.sha256')
     lock = document['lock']
     _exiger(isinstance(lock, dict) and set(lock) == {'sha256', 'distributions'},
             'manifeste : lock')
@@ -976,9 +1013,9 @@ def _ecrire_manifeste(chemin, document):
 
 def _pip_check(venv):
     venv = Path(venv)
-    pip = venv / 'bin' / 'pip'
-    if not pip.is_file():
-        raise Ecart('pip bootstrap absent du venv')
+    python = venv / 'bin' / 'python'
+    if not python.exists():
+        raise Ecart('python du venv absent pour pip check')
     with tempfile.TemporaryDirectory(prefix='venv-staging-pip-') as home:
         environnement = dict(
             PATH='/usr/bin:/bin', HOME=home,
@@ -988,8 +1025,12 @@ def _pip_check(venv):
             PIP_NO_CACHE_DIR='1', PIP_DISABLE_PIP_VERSION_CHECK='1',
             TMPDIR=home)
         try:
+            # -B et un cache de bytecode hors du venv : le pip de bootstrap
+            # est relu depuis sa source vérifiée, jamais depuis ses `.pyc`.
             resultat = subprocess.run(
-                [str(pip), 'check'], env=environnement, cwd=home,
+                [str(python), '-I', '-B', '-X',
+                 'pycache_prefix=' + os.path.join(home, 'pycache'),
+                 '-m', 'pip', 'check'], env=environnement, cwd=home,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, timeout=120, check=False)
         except (OSError, subprocess.TimeoutExpired):
@@ -1068,6 +1109,10 @@ def _produire(depot, *, sha, tag, lock_path, wheelhouse, python, output,
             mesure = _mesurer_venv(venv)
         except Ecart as erreur:
             raise Erreur('venv produit non mesurable : %s' % erreur) from None
+        try:
+            _version_executable(mesure['python'])
+        except Ecart as erreur:
+            raise Erreur('interpréteur du venv produit : %s' % erreur) from None
         attendues = dict(base)
         for record in lock['records'].values():
             attendues[record['name']] = dict(name=record['name'],
@@ -1117,6 +1162,12 @@ def _produire(depot, *, sha, tag, lock_path, wheelhouse, python, output,
 def _comparer(attendu, mesure, etiquette):
     if attendu == mesure:
         return
+    if isinstance(attendu, dict) and isinstance(mesure, dict):
+        champs = sorted(set(attendu) | set(mesure))
+        differents = [champ for champ in champs
+                      if attendu.get(champ) != mesure.get(champ)]
+        raise Ecart('%s : champs différents : %s'
+                    % (etiquette, ', '.join(differents)))
     if (isinstance(attendu, list) and isinstance(mesure, list)
             and attendu and isinstance(attendu[0], dict)
             and 'name' in attendu[0]):
@@ -1141,8 +1192,11 @@ def _verifier(manifest_path, venv):
     venv = Path(venv)
     if venv.is_symlink():
         venv = venv.resolve()
-    mesure = _mesurer_venv(venv)
-    _comparer(document['python'], mesure['python'], 'version Python')
+    interpreteur = _interpreteur(venv)
+    # L'interpréteur est comparé au manifeste AVANT toute exécution.
+    _comparer(document['python'], interpreteur, 'interpréteur')
+    _version_executable(interpreteur)
+    mesure = _mesurer_venv(venv, interpreteur=interpreteur)
     _comparer(document['distributions'], mesure['distributions'], 'distributions')
     installed = document['installed']
     _comparer(installed['entry_points'],

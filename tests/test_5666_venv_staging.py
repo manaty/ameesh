@@ -14,13 +14,12 @@ import base64
 import copy
 import hashlib
 import importlib.util
-import io
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -418,18 +417,20 @@ class ArbreTest(unittest.TestCase):
                         '#!/tmp/venv-b/bin/python3\nprint(1)\n'):
             info = module._entree_normalisee(
                 lanceur.encode(), '/tmp/venv-a' if 'venv-a' in lanceur
-                else '/tmp/venv-b')
+                else '/tmp/venv-b', 0o755)
             self.assertEqual(info['launcher'], 'direct')
             self.assertEqual(info['sha256'], module._entree_normalisee(
                 b'#!/tmp/venv-a/bin/python3\nprint(1)\n',
-                '/tmp/venv-a')['sha256'])
+                '/tmp/venv-a', 0o755)['sha256'])
         shell = (b'#!/bin/sh\n'
                  b"'''exec' \"/tmp/venv-a/bin/python3\" \"$0\" \"$@\"\n"
                  b"' '''\nprint(1)\n")
-        info = module._entree_normalisee(shell, '/tmp/venv-a')
+        info = module._entree_normalisee(shell, '/tmp/venv-a', 0o755)
         self.assertEqual(info['launcher'], 'sh-preamble')
+        self.assertNotEqual(info['sha256'], module._entree_normalisee(
+            shell, '/tmp/venv-a', 0o700)['sha256'])
         with self.assertRaises(module.Ecart):
-            module._entree_normalisee(b'print(1)\n', '/tmp/venv-a')
+            module._entree_normalisee(b'print(1)\n', '/tmp/venv-a', 0o755)
 
 
 class ProductionTest(unittest.TestCase):
@@ -463,7 +464,10 @@ class ProductionTest(unittest.TestCase):
     def test_manifeste_contient_les_attendus(self):
         document = self.document1
         self.assertEqual(document['sha'], self.paquet.sha)
-        self.assertEqual(document['python'], platform.python_version())
+        self.assertEqual(document['python']['version'], platform.python_version())
+        self.assertTrue(document['python']['home'].startswith('/'))
+        self.assertTrue(document['python']['executable'].startswith('/'))
+        self.assertEqual(len(document['python']['sha256']), 64)
         self.assertEqual([item['name'] for item in document['distributions']],
                          ['ameesh', 'pip', 'setuptools', 'tiny-dep'])
         self.assertEqual([item['name'] for item in document['installed']['entry_points']],
@@ -524,6 +528,12 @@ class ProductionTest(unittest.TestCase):
         finally:
             script.write_bytes(original)
             script.chmod(0o755)
+        script.chmod(0o700)
+        try:
+            with self.assertRaisesRegex(module.Ecart, 'scripts d’entrée'):
+                module._verifier(self.paquet.sortie / 'm1.json', self.venv)
+        finally:
+            script.chmod(0o755)
         cfg = self.venv / 'pyvenv.cfg'
         original = cfg.read_bytes()
         try:
@@ -535,6 +545,62 @@ class ProductionTest(unittest.TestCase):
             cfg.write_bytes(original)
             cfg.chmod(0o644)
         module._verifier(self.paquet.sortie / 'm1.json', self.venv)
+
+    def test_pyvenv_reecrit_vers_un_autre_interpreteur(self):
+        version = self.document1['python']['version']
+        faux = self.root / 'faux-interpreteur'
+        faux.mkdir(mode=0o700)
+        binaire = faux / 'python3'
+        binaire.write_text('#!/bin/sh\necho "Python %s"\n' % version)
+        binaire.chmod(0o755)
+        cfg = self.venv / 'pyvenv.cfg'
+        original_cfg = cfg.read_bytes()
+        lien = self.venv / 'bin' / 'python3'
+        original_lien = os.readlink(lien)
+        try:
+            cfg.write_text(
+                re.sub(r'^home = .*$', 'home = ' + str(faux),
+                       original_cfg.decode(), flags=re.M)
+                .replace('executable = ' + self.document1['python']['executable'],
+                         'executable = ' + str(binaire)))
+            cfg.chmod(0o644)
+            lien.unlink()
+            lien.symlink_to(binaire)
+            with self.assertRaisesRegex(module.Ecart, 'interpréteur'):
+                module._verifier(self.paquet.sortie / 'm1.json', self.venv)
+        finally:
+            cfg.write_bytes(original_cfg)
+            cfg.chmod(0o644)
+            if lien.is_symlink() or lien.exists():
+                lien.unlink()
+            lien.symlink_to(original_lien)
+        module._verifier(self.paquet.sortie / 'm1.json', self.venv)
+
+    def test_sha_interpreteur_compare_avant_execution(self):
+        document = json.loads(self.manifeste1)
+        document['python']['sha256'] = 'f' * 64
+        chemin = self.root / 'm-sha.json'
+        chemin.write_text(json.dumps(document) + '\n')
+        chemin.chmod(0o644)
+        with mock.patch.object(module, '_version_executable',
+                               side_effect=AssertionError('exécuté')):
+            with self.assertRaisesRegex(module.Ecart, 'interpréteur'):
+                module._verifier(chemin, self.venv)
+
+    def test_pip_check_sans_bytecode_du_venv(self):
+        resultat = subprocess.CompletedProcess(args=[], returncode=0,
+                                               stdout=b'', stderr=b'')
+        with mock.patch.object(module.subprocess, 'run',
+                               return_value=resultat) as appel:
+            module._pip_check(self.venv)
+        argv = appel.call_args.args[0]
+        self.assertIn('-B', argv)
+        self.assertIn('-X', argv)
+        self.assertTrue(any(argument.startswith('pycache_prefix=')
+                            for argument in argv))
+        self.assertEqual(argv[-3:], ['-m', 'pip', 'check'])
+        self.assertEqual(appel.call_args.kwargs['env']['PYTHONDONTWRITEBYTECODE'],
+                         '1')
 
     def test_ecart_distribution_et_pip_check(self):
         site = self.venv / 'lib/python3.12/site-packages'
@@ -615,6 +681,18 @@ class ManifesteTest(unittest.TestCase):
         document = self.copie()
         document['installed']['files'] = True
         cas.append((document, 'installed.files'))
+        document = self.copie()
+        document['python'] = '3.12.3'
+        cas.append((document, 'python'))
+        document = self.copie()
+        del document['python']['home']
+        cas.append((document, 'python'))
+        document = self.copie()
+        document['python']['sha256'] = 'f' * 63
+        cas.append((document, 'python.sha256'))
+        document = self.copie()
+        document['python']['home'] = 'usr/bin'
+        cas.append((document, 'python.home'))
         for document, motif in cas:
             with self.subTest(motif=motif):
                 with self.assertRaisesRegex(module.Erreur, motif):
@@ -625,7 +703,7 @@ class ManifesteTest(unittest.TestCase):
         self.assertTrue(module._ecrire_manifeste(sortie, self.document))
         self.assertFalse(module._ecrire_manifeste(sortie, self.document))
         autre = self.copie()
-        autre['python'] = '3.12.99'
+        autre['python']['version'] = '3.12.99'
         with self.assertRaisesRegex(module.Erreur, 'différent'):
             module._ecrire_manifeste(sortie, autre)
 
