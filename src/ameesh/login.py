@@ -81,7 +81,17 @@ _CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz"
 #: capacité de clôture d'un défi : 256 bits en base64url (même forme que les
 #: jetons de lien du service) ; sans elle, le jeton global ne ferme pas le défi
 _CLOSE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
-_URL_RE = re.compile(r"https://[^\s<>\"'`\\]+")
+#: une URL s'arrête à tout caractère de contrôle (reste d'une séquence coupée)
+_URL_RE = re.compile(r"https://[^\s<>\"'`\\\x00-\x1f\x7f]+")
+#: séquences d'échappement terminal (#5571) : CSI (couleurs SGR comprises),
+#: OSC terminé par BEL ou ST, et échappements courts ; motifs linéaires, sur
+#: une sortie déjà bornée par `capture_max`
+_TERMINAL_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b(?![\[\]])[ -/]*[0-~]")
+#: séquence encore coupée en fin de lecture : on attend la suite
+_PARTIAL_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x1b]*|[ -/]*)\Z")
 #: ce que les CLI disent d'un refus fournisseur (repris de `sentinel`)
 _REFUSED_RE = re.compile(
     r"token in \S+ is invalid|not logged in|no active account"
@@ -229,6 +239,12 @@ def _clean_url(raw: str) -> str:
     return raw.rstrip(".,;:!?)]}'\"<>")
 
 
+def strip_terminal(text: str) -> str:
+    """Le texte sans séquences d'échappement terminal : codex 0.159 colore
+    l'URL et le code malgré `NO_COLOR`, ce qui masquait le flux (#5571)."""
+    return _TERMINAL_ESCAPE_RE.sub("", text or "")
+
+
 def scan_flow(adapter: Adapter, version: str | None, text: str) -> Flow | None:
     """Le flux reconnu dans la sortie du CLI, ou None tant qu'elle est
     incomplète. Refuse (`flow_unrecognized`) une version non épinglée, une URL
@@ -238,7 +254,10 @@ def scan_flow(adapter: Adapter, version: str | None, text: str) -> Flow | None:
         raise LoginError("unsupported_version",
                          "%s %s is not a pinned version (%s)"
                          % (adapter.harness, version or "?", ", ".join(adapter.versions)))
-    match = _URL_RE.search(text or "")
+    text = strip_terminal(text)
+    if _PARTIAL_ESCAPE_RE.search(text):
+        return None
+    match = _URL_RE.search(text)
     if not match:
         return None
     url = _clean_url(match.group(0))
@@ -251,7 +270,7 @@ def scan_flow(adapter: Adapter, version: str | None, text: str) -> Flow | None:
                          "%s: authorization URL is not an official host" % adapter.harness)
     if adapter.code is None:
         return Flow(url=url)
-    found = adapter.code.search(text or "")
+    found = adapter.code.search(text)
     if not found:
         return None
     return Flow(url=url, code=found.group(1))
@@ -644,7 +663,7 @@ class Supervisor:
             self._settle(request, proc)
             return
         # fin de sortie sans flux reconnu
-        output = b"".join(captured).decode("utf-8", "replace")
+        output = strip_terminal(b"".join(captured).decode("utf-8", "replace"))
         category = "provider_refused" if _REFUSED_RE.search(output) else "flow_unrecognized"
         message = ("%s refused the login" % adapter.harness if category == "provider_refused"
                    else "%s: no recognized login flow in the output" % adapter.harness)

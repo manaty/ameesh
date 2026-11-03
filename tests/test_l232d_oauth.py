@@ -110,6 +110,50 @@ class FlowTest(unittest.TestCase):
             login.scan_flow(login.ADAPTERS["gh"], "2.101.0", "https://github.com/login/device")
         self.assertEqual(caught.exception.category, "unsupported_version")
 
+    def test_scan_flow_reconnait_un_flux_colore(self):
+        # #5571 : codex 0.159 encadre l'URL et le code de couleurs malgré NO_COLOR
+        codex = ("Follow these steps to sign in with ChatGPT using device code"
+                 " authorization:\n\n1. Open this link in your browser and sign in"
+                 "\n   \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n\n"
+                 "2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m"
+                 "\n   \x1b[1;94mWXYZ-98765\x1b[0m\n")
+        flow = login.scan_flow(login.ADAPTERS["codex"], "0.159.0", codex)
+        self.assertIsNotNone(flow)
+        self.assertEqual(flow.url, "https://auth.openai.com/codex/device")
+        self.assertEqual(flow.code, "WXYZ-98765")
+        gh = ("! First copy your one-time code: \x1b[1mWXYZ-9876\x1b[0m\n"
+              "\x1b]8;;https://github.com/login/device\x07"
+              "\x1b[1mhttps://github.com/login/device\x1b[0m\x1b]8;;\x1b\\\n")
+        flow = login.scan_flow(login.ADAPTERS["gh"], "2.102.0", gh)
+        self.assertIsNotNone(flow)
+        self.assertEqual(flow.url, "https://github.com/login/device")
+        self.assertEqual(flow.code, "WXYZ-9876")
+        self.assertNotIn("\x1b", flow.url + flow.code)
+
+    def test_scan_flow_attend_la_fin_d_une_sequence_coupee(self):
+        gh = login.ADAPTERS["gh"]
+        head = "code \x1b[1mWXYZ-9876\x1b[0m https://github.com/login/device"
+        for cut in ("\x1b", "\x1b[", "\x1b[0", "\x1b]8;;https://github.com/lo"):
+            self.assertIsNone(login.scan_flow(gh, "2.102.0", head + cut), repr(cut))
+        flow = login.scan_flow(gh, "2.102.0", head + "\x1b[0m\n")
+        self.assertEqual(flow.url, "https://github.com/login/device")
+
+    def test_scan_flow_colore_refuse_toujours_un_hote_non_officiel(self):
+        for harness, version, text in (
+                ("codex", "0.159.0",
+                 "\x1b[94mhttps://auth.openai.com.evil.example/device\x1b[0m"
+                 " \x1b[94mWXYZ-98765\x1b[0m"),
+                ("gh", "2.102.0",
+                 "\x1b[1mWXYZ-9876\x1b[0m \x1b[1mhttps://evil.example/login\x1b[0m")):
+            with self.assertRaises(login.LoginError) as caught:
+                login.scan_flow(login.ADAPTERS[harness], version, text)
+            self.assertEqual(caught.exception.category, "flow_unrecognized")
+        # la couleur ne contourne pas non plus la version épinglée
+        with self.assertRaises(login.LoginError) as caught:
+            login.scan_flow(login.ADAPTERS["codex"], "0.158.0",
+                            "\x1b[94mhttps://auth.openai.com/codex/device\x1b[0m")
+        self.assertEqual(caught.exception.category, "unsupported_version")
+
     def test_parse_flow_exige_un_flux_complet(self):
         with self.assertRaises(login.LoginError) as caught:
             login.parse_flow(login.ADAPTERS["gh"], "2.102.0", "rien a voir")
@@ -294,6 +338,27 @@ class SupervisorTest(FakeCliTest):
 
     def test_refus_fournisseur_dans_la_sortie(self):
         self.cli("gh", "printf 'not logged in\\n'; exit 1")
+        sup = self.supervisor()
+        request = self.begin(sup)
+        self.assertTrue(wait_for(lambda: request.state == login.FAILED))
+        self.assertEqual(request.category, "provider_refused")
+
+    def test_codex_colore_publie_le_flux(self):
+        self.cli("codex", "printf '1. Open this link\\n   \\033[94mhttps://auth.openai.com"
+                          "/codex/device\\033[0m\\n2. Enter this one-time code\\n"
+                          "   \\033[94mWXYZ-98765\\033[0m\\n'; sleep 30")
+        sink = Sink()
+        sup = self.supervisor(publish=sink)
+        request = self.begin(sup, harness="codex", version="0.159.0")
+        self.assertTrue(wait_for(lambda: request.state == login.VIEWING),
+                        "state=%s category=%s" % (request.state, request.category))
+        payload = sink.payloads[0]
+        self.assertEqual(payload["url"], "https://auth.openai.com/codex/device")
+        self.assertEqual(payload["code"], "WXYZ-98765")
+        sup.finish(request.id, "cancel")
+
+    def test_refus_fournisseur_colore(self):
+        self.cli("gh", "printf '\\033[31mnot logged in\\033[0m\\n'; exit 1")
         sup = self.supervisor()
         request = self.begin(sup)
         self.assertTrue(wait_for(lambda: request.state == login.FAILED))
