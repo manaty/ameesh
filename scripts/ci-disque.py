@@ -29,7 +29,11 @@ une borne d'âge supérieure au plafond d'un job (45 min) :
   `_work/_temp` des runners de l'hôte et sous `/tmp` (compte `runner`
   seulement) ;
 * journaux `_diag` fermés compressés après 72 h, archives retirées après
-  7 jours supplémentaires (au ctime).
+  7 jours supplémentaires (au ctime) ;
+* caches `_work/_update` d'un auto-update déjà installé (ou dépassé), et
+  seulement si aucun Listener, Worker, updater ou lien vivant ne les
+  référence ; une version de cache supérieure à la version courante est une
+  mise à jour en attente, jamais retirée (#5635).
 
 Rien n'est supprimé hors CI (`GITHUB_ACTIONS` absent) sans `--force` explicite.
 Les erreurs de docker ne font jamais rougir l'étape : le ménage est un confort,
@@ -53,6 +57,7 @@ import argparse
 import datetime as dt
 import fcntl
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -73,6 +78,22 @@ AGE_DIAG_JOURS = 7          # journaux du runner (_diag)
 AGE_INUTILISEES_HEURES = 168.0  # images sans conteneur (7 jours)
 MAX_VOLUMES_INSPECT = 100   # par appel docker (borne la ligne de commande)
 MAX_LIGNES_DFV = 400        # `docker system df -v` : les 400 premières lignes
+
+# #5635 — caches _update des runners. Une extraction de paquet (~700 MiB) reste
+# sous `_work/_update` après chaque auto-update ; le runner la supprime au début
+# du suivant, pas à la fin du courant. On ne la retire que si la version qu'elle
+# porte est déjà installée (ou dépassée) et qu'aucun processus vivant ne la
+# référence. Une version supérieure est une mise à jour en attente : préservée.
+DELAI_REDEMARRAGE_S = 600.0
+MAX_ENTREES_UPDATE = 200000
+INTERPRETEURS_SHELL = frozenset({"bash", "dash", "sh", "zsh", "ksh"})
+VERSION_UPDATE = re.compile(r'"Runner\.Listener/(\d+\.\d+\.\d+)"')
+ENTREES_UPDATE = frozenset({
+    "bin", "externals", "config.sh", "env.sh", "config.cmd", "run.cmd",
+    "run.sh", "run-helper.sh.template", "run-helper.cmd.template",
+    "safe_sleep.sh",
+})
+ARCHIVE_UPDATE = re.compile(r"runner\d+\.(?:tar\.gz|zip)\Z")
 
 
 # --------------------------------------------------------------------------
@@ -252,6 +273,8 @@ def _du_complet(racine: Path | None) -> list[tuple[str, int | None]]:
         if not runner.name[1:].isdigit():
             continue
         cibles.append(("_work %s" % runner.name, runner / "_work"))
+        cibles.append(("cache _update %s" % runner.name,
+                       runner / "_work" / "_update"))
         cibles.append(("_diag %s" % runner.name, runner / "_diag"))
     cibles.append(("/tmp", Path("/tmp")))
     argv = ["du", "-s", "-x", "-B1", *[str(chemin) for _, chemin in cibles]]
@@ -671,6 +694,588 @@ def _tmp(dry_run: bool) -> dict:
             "sortie": "%d fichier(s)" % resultat["fichiers"]}
 
 
+# --------------------------------------------------------------------------
+# caches _update des runners (#5635)
+# --------------------------------------------------------------------------
+
+def _version_tuple(texte):
+    """« 2.338.2 » → (2, 338, 2) ; illisible → None (on ne compare pas)."""
+    try:
+        parties = tuple(int(partie) for partie in str(texte).split("."))
+    except (TypeError, ValueError):
+        return None
+    return parties if parties else None
+
+
+def _lire_version_bin(dossier: Path) -> str | None:
+    """Version du paquet dans un `bin`, sans exécuter le binaire.
+
+    Le fichier `Runner.Listener.deps.json` du paquet officiel porte
+    `"Runner.Listener/2.338.2"` : une lecture suffit, aucun `--version`.
+    """
+    chemin = dossier / "Runner.Listener.deps.json"
+    try:
+        if chemin.is_symlink() or not chemin.is_file():
+            return None
+        with open(chemin, "rb") as fichier:
+            donnees = fichier.read(1_000_000)
+    except OSError:
+        return None
+    correspondance = VERSION_UPDATE.search(donnees.decode("utf-8", "replace"))
+    return correspondance.group(1) if correspondance else None
+
+
+def _lire_version(dossier: Path) -> str | None:
+    return _lire_version_bin(dossier / "bin")
+
+
+def _empreinte(chemin: Path) -> bytes | None:
+    try:
+        if chemin.is_symlink() or not chemin.is_file():
+            return None
+        return hashlib.sha256(chemin.read_bytes()).digest()
+    except OSError:
+        return None
+
+
+def _sous(chemin, parent) -> bool:
+    """Vrai si `chemin` est `parent` ou l'un de ses descendants (lexical)."""
+    if chemin is None or parent is None:
+        return False
+    try:
+        chemin = Path(chemin)
+        parent = Path(parent)
+    except TypeError:
+        return False
+    return chemin == parent or parent in chemin.parents
+
+
+def _processus(proc: Path = Path("/proc"), *, maintenant=None) -> list[dict]:
+    """Instantané des processus du même uid : cwd, descripteurs, cmdline, départ.
+
+    Aucun contenu mémoire ni environnement n'est lu (#5635 : les règles du
+    canon interdisent `/proc/<pid>/environ`). Un champ illisible reste None ;
+    l'appelant traite ce doute comme une raison de ne pas supprimer.
+    """
+    maintenant = time.time() if maintenant is None else maintenant
+    try:
+        uptime = float((proc / "uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        uptime = None
+    horloge = os.sysconf("SC_CLK_TCK")
+    vus = []
+    for entree in proc.iterdir():
+        if not entree.name.isdigit():
+            continue
+        try:
+            if entree.stat().st_uid != os.getuid():
+                continue
+            comm = (entree / "comm").read_text().strip()
+        except OSError:
+            continue
+        try:
+            cwd = Path(os.readlink(entree / "cwd"))
+        except OSError:
+            cwd = None
+        try:
+            descripteurs = []
+            for fd in (entree / "fd").iterdir():
+                try:
+                    cible = os.readlink(fd)
+                except OSError:
+                    continue
+                if cible.endswith(" (deleted)"):
+                    cible = cible[:-10]
+                descripteurs.append(Path(cible))
+        except OSError:
+            descripteurs = None
+        try:
+            brut = (entree / "cmdline").read_bytes()
+            cmdline = [morceau.decode("utf-8", "replace")
+                       for morceau in brut.split(b"\0") if morceau]
+        except OSError:
+            cmdline = None
+        etat = None
+        depart = None
+        try:
+            statut = (entree / "stat").read_text()
+            champs = statut.rsplit(")", 1)[1].split()
+            etat = champs[0]
+            if uptime is not None:
+                depart = maintenant - (uptime - int(champs[19]) / horloge)
+        except (OSError, ValueError, IndexError):
+            pass
+        vus.append({"pid": int(entree.name), "comm": comm, "cwd": cwd,
+                    "fds": descripteurs, "cmdline": cmdline, "depart": depart,
+                    "etat": etat})
+    return vus
+
+
+def _racine_du_processus(cwd, home: Path) -> Path | None:
+    """Racine `rN` de `home` qui contient `cwd`, ou None si le doute reste.
+
+    L'attribution n'est fiable que si `cwd` tombe sous une racine de runner
+    marquée par `.runner`. `home` lui-même, un chemin hors de `home` ou un
+    enfant sans marqueur ne permettent pas de dire à quel runner appartient
+    le processus : l'appelant préserve alors le cache.
+    """
+    if cwd is None:
+        return None
+    try:
+        relatif = Path(cwd).relative_to(home)
+    except (TypeError, ValueError):
+        return None
+    if not relatif.parts:
+        return None
+    candidat = home / relatif.parts[0]
+    try:
+        marqueur = candidat / ".runner"
+        if marqueur.is_file() and not marqueur.is_symlink():
+            return candidat
+    except OSError:
+        return None
+    return None
+
+
+def _racine_executable(cmdline, home: Path) -> Path | None:
+    """Racine lue dans le chemin de l'exécutable (`rN/bin/Runner.Worker`)."""
+    if not cmdline:
+        return None
+    return _racine_du_processus(cmdline[0], home)
+
+
+def _verdict_processus(cache: Path, root: Path, processus, maintenant: float):
+    """Raison de préserver le cache si un processus vivant le référence.
+
+    Un Worker est rattaché à sa racine par son cwd réel — la flotte observée
+    le lance depuis `root` ou `root/bin` (`bin.<version>`), pas seulement
+    depuis `root/_work/...` — ou, si le cwd est illisible, par le chemin de
+    son exécutable. Un shell dont la cmdline ou les descripteurs sont
+    illisibles peut être `_update.sh` : il préserve. Une attribution
+    impossible préserve le cache ; un processus d'une autre racine ne le fait
+    pas (#5635, canon §2).
+    """
+    home = root.parent
+    for processus_vu in processus:
+        pid = processus_vu.get("pid")
+        if processus_vu.get("etat") == "Z":
+            continue
+        comm = processus_vu.get("comm") or ""
+        cwd = processus_vu.get("cwd")
+        descripteurs = processus_vu.get("fds")
+        cmdline = processus_vu.get("cmdline")
+        if descripteurs is None and comm.startswith(
+                ("Runner.Listener", "RunnerService")):
+            return "descripteurs du Listener illisibles (pid %s)" % pid
+        if comm == "Runner.Worker":
+            proprietaire = _racine_du_processus(cwd, home)
+            if proprietaire is None:
+                proprietaire = _racine_executable(cmdline, home)
+            if proprietaire is None or proprietaire == root:
+                if cwd is None:
+                    return "Worker actif, cwd illisible (pid %s)" % pid
+                return "Worker actif (pid %s)" % pid
+        if comm in INTERPRETEURS_SHELL and cmdline is None:
+            return "commande d'un shell illisible (pid %s)" % pid
+        if _sous(cwd, cache):
+            return "updater vivant (pid %s)" % pid
+        if descripteurs is None:
+            if comm in INTERPRETEURS_SHELL:
+                return "descripteurs d'un shell illisibles (pid %s)" % pid
+        else:
+            for descripteur in descripteurs:
+                if _sous(descripteur, cache):
+                    return "updater vivant (pid %s, descripteur ouvert)" % pid
+        for argument in cmdline or []:
+            if argument.endswith("/_work/_update.sh") and str(root) in argument:
+                return "script de mise à jour vivant (pid %s)" % pid
+        if (comm == "Runner.Listener" or comm.startswith("RunnerService")
+                or comm == "node") and cwd == root:
+            depart = processus_vu.get("depart")
+            if depart is None:
+                return "démarrage du Listener illisible (pid %s)" % pid
+            if maintenant - depart < DELAI_REDEMARRAGE_S:
+                minutes = max(0, int((maintenant - depart) / 60))
+                return "unité réactivée il y a %d min (pid %s)" % (minutes, pid)
+    return None
+
+
+def _dossier_interne(root: Path, nom: str) -> Path | None:
+    """`root/nom` réel ou lien interne à la racine, jamais un lien qui sort."""
+    chemin = root / nom
+    try:
+        if chemin.is_symlink():
+            cible = Path(os.path.realpath(chemin))
+            if cible.parent != root or not cible.is_dir():
+                return None
+            return cible
+        if chemin.is_dir():
+            return chemin
+    except OSError:
+        return None
+    return None
+
+
+def _references_cache(root: Path, cache: Path) -> str | None:
+    """Refuse si bin/externals ou une version pointent dans le cache."""
+    for motif in ("bin", "externals", "bin.*", "externals.*"):
+        for chemin in root.glob(motif):
+            if not chemin.is_symlink():
+                continue
+            try:
+                cible = Path(os.path.realpath(chemin))
+            except OSError:
+                continue
+            if _sous(cible, cache):
+                return "référencé par %s" % chemin.name
+    return None
+
+
+def _verifier_cache(cache: Path, home: Path) -> str | None:
+    """None si le chemin est un cache `_update` attendu, sinon la raison."""
+    try:
+        if cache.is_symlink() or not cache.is_dir():
+            return "lien symbolique ou dossier absent"
+        travail = cache.parent
+        root = travail.parent
+        if travail.name != "_work" or root.parent != home:
+            return "chemin inattendu"
+        for composant in (root, travail):
+            if composant.is_symlink():
+                return "lien symbolique dans le chemin"
+        config = root / ".runner"
+        if config.is_symlink() or not config.is_file():
+            return "pas une racine de runner (.runner absent)"
+        if cache.stat().st_dev != travail.stat().st_dev:
+            return "point de montage"
+    except OSError as erreur:
+        return "chemin illisible (%s)" % erreur
+    try:
+        entrees = list(os.scandir(cache))
+    except OSError as erreur:
+        return "cache illisible (%s)" % erreur
+    try:
+        peripherique = cache.stat().st_dev
+    except OSError as erreur:
+        return "cache illisible (%s)" % erreur
+    for entree in entrees:
+        if entree.is_symlink():
+            return "lien symbolique en tête (%s)" % entree.name
+        if entree.name not in ENTREES_UPDATE and not ARCHIVE_UPDATE.match(entree.name):
+            return "entrée inattendue (%s)" % entree.name
+        try:
+            if entree.stat(follow_symlinks=False).st_dev != peripherique:
+                return "point de montage dans le cache (%s)" % entree.name
+        except OSError as erreur:
+            return "entrée illisible (%s)" % erreur
+    for nom in ("bin", "externals"):
+        dossier = cache / nom
+        if dossier.is_symlink() or not dossier.is_dir():
+            return "%s absent ou lié" % nom
+    return None
+
+
+def _lien_sortant(chemin: Path, cache: Path) -> str | None:
+    """Refuse un lien absolu ou qui sort du cache ; les liens du paquet restent."""
+    try:
+        cible = os.readlink(chemin)
+    except OSError as erreur:
+        return "lien illisible (%s)" % erreur
+    if not cible or os.path.isabs(cible):
+        return "lien absolu ou vide (%s)" % chemin.name
+    relatif = os.path.normpath(os.path.join(
+        os.path.dirname(str(chemin.relative_to(cache))), cible))
+    if relatif == os.pardir or relatif.startswith(os.pardir + os.sep):
+        return "lien sortant (%s)" % chemin.name
+    return None
+
+
+def _verifier_liens(cache: Path) -> str | None:
+    """Refuse un lien externe, sans suivre ni exécuter aucun lien du paquet."""
+    try:
+        peripherique = cache.lstat().st_dev
+    except OSError as erreur:
+        return "cache illisible (%s)" % erreur
+    total = 0
+    erreurs = []
+    for racine, dossiers, fichiers in os.walk(
+            cache, topdown=True, followlinks=False, onerror=erreurs.append):
+        try:
+            if os.lstat(racine).st_dev != peripherique:
+                return "point de montage dans le cache"
+        except OSError as erreur:
+            return "arborescence illisible (%s)" % erreur
+        total += len(dossiers) + len(fichiers)
+        if total > MAX_ENTREES_UPDATE:
+            return "arborescence trop grande"
+        for nom in list(dossiers):
+            chemin = Path(racine) / nom
+            if chemin.is_symlink():
+                raison = _lien_sortant(chemin, cache)
+                if raison:
+                    return raison
+                dossiers.remove(nom)
+            else:
+                try:
+                    if os.lstat(chemin).st_dev != peripherique:
+                        return "point de montage dans le cache (%s)" % nom
+                except OSError as erreur:
+                    return "arborescence illisible (%s)" % erreur
+        for nom in fichiers:
+            chemin = Path(racine) / nom
+            if chemin.is_symlink():
+                raison = _lien_sortant(chemin, cache)
+                if raison:
+                    return raison
+            else:
+                try:
+                    if os.lstat(chemin).st_dev != peripherique:
+                        return "point de montage dans le cache (%s)" % nom
+                except OSError as erreur:
+                    return "arborescence illisible (%s)" % erreur
+    if erreurs:
+        return "arborescence illisible (%s)" % erreurs[0]
+    return None
+
+
+def _taille_arbre(chemin: Path) -> int:
+    """Octets réellement occupés (blocs de 512), sans suivre les liens.
+
+    Un fichier à plusieurs liens durs ne libère rien tant qu'un autre nom
+    existe : il n'est pas compté (mesure prudente, le `df` avant/après fait foi).
+    """
+    if chemin.is_symlink():
+        return 0
+    total = 0
+    for racine, dossiers, fichiers in os.walk(chemin, followlinks=False):
+        try:
+            total += os.lstat(racine).st_blocks * 512
+        except OSError:
+            pass
+        for nom in fichiers:
+            try:
+                info = os.lstat(os.path.join(racine, nom))
+            except OSError:
+                continue
+            if info.st_nlink > 1:
+                continue
+            blocs = getattr(info, "st_blocks", None)
+            total += blocs * 512 if blocs is not None else info.st_size
+        for nom in dossiers:
+            chemin_lien = os.path.join(racine, nom)
+            if os.path.islink(chemin_lien):
+                try:
+                    total += os.lstat(chemin_lien).st_blocks * 512
+                except OSError:
+                    pass
+    return total
+
+
+def _supprimer_arbre(chemin: Path) -> None:
+    """Supprime sans suivre aucun lien ni franchir un point de montage."""
+    if chemin.is_symlink():
+        raise OSError("lien symbolique")
+    peripherique = chemin.lstat().st_dev
+    for racine, dossiers, fichiers in os.walk(
+            chemin, topdown=False, followlinks=False):
+        if os.lstat(racine).st_dev != peripherique:
+            raise OSError("point de montage dans le cache")
+        for nom in fichiers:
+            try:
+                os.unlink(os.path.join(racine, nom))
+            except FileNotFoundError:
+                pass
+        for nom in dossiers:
+            chemin_lien = os.path.join(racine, nom)
+            try:
+                if os.path.islink(chemin_lien):
+                    os.unlink(chemin_lien)
+                elif os.lstat(chemin_lien).st_dev != peripherique:
+                    raise OSError("point de montage dans le cache")
+                else:
+                    os.rmdir(chemin_lien)
+            except FileNotFoundError:
+                pass
+    os.rmdir(chemin)
+
+
+def _installation_complete(root: Path, version: str, cache: Path) -> str | None:
+    """Vérifie que bin/externals installés sont bien la copie de ce cache."""
+    bin_dir = _dossier_interne(root, "bin")
+    externals_dir = _dossier_interne(root, "externals")
+    if bin_dir is None or externals_dir is None:
+        return "bin/externals courant absent ou hors racine"
+    lien_bin = (root / "bin").is_symlink()
+    lien_externals = (root / "externals").is_symlink()
+    if lien_bin != lien_externals:
+        return "bin/externals mixtes (lien et dossier)"
+    if lien_bin:
+        if (root / "bin").resolve().name != "bin." + version:
+            return "lien bin inattendu"
+        if (root / "externals").resolve().name != "externals." + version:
+            return "lien externals inattendu"
+    empreinte_installee = _empreinte(bin_dir / "Runner.Listener.deps.json")
+    empreinte_cache = _empreinte(cache / "bin" / "Runner.Listener.deps.json")
+    if empreinte_installee is None or empreinte_cache is None:
+        return "empreinte de version illisible"
+    if empreinte_installee != empreinte_cache:
+        return "contenu du cache différent de la version installée"
+    return None
+
+
+def _decision_cache(cache: Path, root: Path, home: Path, processus,
+                    maintenant: float) -> dict:
+    """Verdict motivé pour un cache : éligible, préservé ou refusé."""
+    def decision(verdict, raison=None):
+        return {"cache": str(cache), "root": str(root), "verdict": verdict,
+                "raison": raison, "version": None, "courante": None,
+                "octets": None}
+
+    raison = _verifier_cache(cache, home)
+    if raison:
+        return decision("refusé", raison)
+    raison = _references_cache(root, cache)
+    if raison:
+        return decision("refusé", raison)
+    courante = _version_installee(root)
+    if courante is None:
+        return decision("préservé", "version courante illisible")
+    cachee = _lire_version(cache)
+    if cachee is None:
+        return decision("préservé", "version du cache illisible")
+    resultat = decision("éligible")
+    resultat["version"] = cachee
+    resultat["courante"] = courante
+    version_cachee = _version_tuple(cachee)
+    version_courante = _version_tuple(courante)
+    if version_cachee is None or version_courante is None:
+        resultat["verdict"] = "préservé"
+        resultat["raison"] = "version illisible"
+        return resultat
+    if version_cachee > version_courante:
+        resultat["verdict"] = "préservé"
+        resultat["raison"] = "mise à jour en attente (%s > %s)" % (
+            cachee, courante)
+        return resultat
+    raison = _verdict_processus(cache, root, processus, maintenant)
+    if raison:
+        resultat["verdict"] = "préservé"
+        resultat["raison"] = raison
+        return resultat
+    if cachee == courante:
+        raison = _installation_complete(root, courante, cache)
+        if raison:
+            resultat["verdict"] = "préservé"
+            resultat["raison"] = raison
+            return resultat
+    raison = _verifier_liens(cache)
+    if raison:
+        resultat["verdict"] = "refusé"
+        resultat["raison"] = raison
+    return resultat
+
+
+def _version_installee(root: Path) -> str | None:
+    dossier = _dossier_interne(root, "bin")
+    return None if dossier is None else _lire_version_bin(dossier)
+
+
+def _retirer_cache(cache: Path, root: Path, home: Path,
+                   maintenant: float) -> tuple[int, str | None]:
+    """Recontrôle tout, puis retire le cache ; jamais sur un état périmé."""
+    try:
+        avant = cache.lstat()
+    except OSError as erreur:
+        return 0, "cache illisible (%s)" % erreur
+    processus = _processus(maintenant=maintenant)
+    decision = _decision_cache(cache, root, home, processus, maintenant)
+    if decision["verdict"] != "éligible":
+        return 0, decision.get("raison") or "état non prouvé"
+    try:
+        apres = cache.lstat()
+    except OSError:
+        return 0, "cache disparu entre deux contrôles"
+    if (apres.st_dev, apres.st_ino) != (avant.st_dev, avant.st_ino):
+        return 0, "cache remplacé entre deux contrôles"
+    taille = _taille_arbre(cache)
+    try:
+        _supprimer_arbre(cache)
+    except OSError as erreur:
+        reste = _taille_arbre(cache) if cache.exists() else 0
+        return max(0, taille - reste), "suppression partielle : %s" % erreur
+    return taille, None
+
+
+def _resume_caches(decisions, dry_run: bool) -> str:
+    if not decisions:
+        return "aucun cache _update"
+    morceaux = []
+    for element in decisions:
+        nom = Path(element["root"]).name
+        if element["verdict"] == "retiré":
+            morceaux.append("%s retiré (%s)" % (nom, gib(element.get("octets"))))
+        elif element["verdict"] == "serait retiré":
+            morceaux.append("%s serait retiré (%s)"
+                            % (nom, gib(element.get("octets"))))
+        else:
+            morceaux.append("%s %s : %s"
+                            % (nom, "préservé" if element["verdict"] == "préservé"
+                               else "refusé", element.get("raison")))
+    return " ; ".join(morceaux)
+
+
+def _caches_update(racine: Path | None, dry_run: bool = False, *,
+                   processus=None, maintenant: float | None = None) -> dict:
+    """Politique #5635 : ne retire que les caches dont la version est installée."""
+    if racine is None:
+        return {"etape": "caches _update inactifs", "libere": 0,
+                "sortie": "RUNNER_WORKSPACE absent, étape sautée", "caches": []}
+    home = Path(os.path.abspath(racine.parent))
+    maintenant = time.time() if maintenant is None else maintenant
+    if processus is None:
+        processus = _processus(maintenant=maintenant)
+    decisions = []
+    liberes = retires = 0
+    for cache in sorted(home.glob("*/_work/_update")):
+        root = cache.parent.parent
+        try:
+            decision = _decision_cache(cache, root, home, processus, maintenant)
+        except Exception as erreur:  # noqa: BLE001 — un cache ne fait pas un verdict
+            decision = {"cache": str(cache), "root": str(root),
+                        "verdict": "préservé", "version": None, "courante": None,
+                        "octets": None,
+                        "raison": "contrôle impossible : %s" % erreur}
+        if decision["verdict"] == "éligible":
+            decision["octets"] = _taille_arbre(cache)
+            if dry_run:
+                decision["verdict"] = "serait retiré"
+                retires += 1
+            else:
+                obtenu, raison = _retirer_cache(cache, root, home, maintenant)
+                decision["octets"] = obtenu
+                liberes += obtenu
+                if raison:
+                    decision["verdict"] = "préservé"
+                    decision["raison"] = raison
+                else:
+                    decision["verdict"] = "retiré"
+                    retires += 1
+        decisions.append(decision)
+    return {"etape": "caches _update inactifs", "libere": liberes,
+            "sortie": _resume_caches(decisions, dry_run), "caches": decisions,
+            "retires": retires}
+
+
+def _updates(dry_run: bool) -> dict:
+    racine = _racine_runner()
+    if racine is None:
+        return {"etape": "caches _update inactifs", "libere": 0,
+                "sortie": "RUNNER_WORKSPACE absent, étape sautée"}
+    resultat = _caches_update(racine, dry_run)
+    return {"etape": "caches _update inactifs", "libere": resultat["libere"],
+            "sortie": resultat["sortie"]}
+
+
 def menage(dry_run: bool = False, force: bool = False,
            images_inutilisees: bool = False) -> int:
     if os.environ.get("GITHUB_ACTIONS") != "true" and not force:
@@ -694,7 +1299,7 @@ def menage(dry_run: bool = False, force: bool = False,
             if images_inutilisees:
                 etapes.append(_images_inutilisees)
             etapes.append(_cache_build)
-        etapes += [_temp, _diag, _tmp]
+        etapes += [_temp, _diag, _updates, _tmp]
         resultats = []
         for etape in etapes:
             try:
