@@ -507,17 +507,67 @@ def _canon_review_coverage(db: Db, item: dict, sha: str, repo: str) -> str:
     return ""
 
 
+#: #5562 : identité et dates figées du commit de fusion d'essai mesuré pour le
+#: bloc des règles. Même arbre, même message, même commit : deux gels de la
+#: même fusion n'écrivent qu'un objet pendant, que git élague ensuite.
+_MERGE_IDENTITY = {
+    "GIT_AUTHOR_NAME": "ameesh canon", "GIT_AUTHOR_EMAIL": "canon@ameesh.invalid",
+    "GIT_AUTHOR_DATE": "@0 +0000",
+    "GIT_COMMITTER_NAME": "ameesh canon", "GIT_COMMITTER_EMAIL": "canon@ameesh.invalid",
+    "GIT_COMMITTER_DATE": "@0 +0000",
+}
+
+
+def _canon_merge_commit(root: str, target: str, head: str, deadline) -> tuple[str, str]:
+    """#5562 : `(commit, pourquoi)` de la fusion d'essai de `head` dans `target`.
+
+    `git merge-tree --write-tree` écrit l'arbre de la fusion sans toucher au
+    working tree ; `commit-tree` en fait un commit **sans parent** (contenu
+    figé, identité et date fixes) que `canon.load` lit comme une révision.
+    Objet pendant : aucune ref ne le nomme, git l'élague. Un conflit, un arbre
+    illisible ou une échéance ne sont pas des erreurs de la garde : la fusion
+    n'est simplement pas mesurable (`commit` vide, `pourquoi` le dit)."""
+    from . import canon as canon_mod
+    proc = canon_mod._git(root, "merge-tree", "--write-tree", target, head,
+                          deadline=deadline)
+    if proc.returncode == 1:
+        return "", "merge with the target conflicts"
+    if proc.returncode != 0:
+        text = proc.stderr.decode("utf-8", "replace").strip() \
+            or "git merge-tree rc=%d" % proc.returncode
+        return "", "merge with the target unreadable: %s" % text[:200]
+    lines = proc.stdout.decode("utf-8", "replace").splitlines()
+    tree = lines[0].strip() if lines else ""
+    if not tree:
+        return "", "merge with the target rendered no tree"
+    made = canon_mod._git(root, "commit-tree", tree, "-m",
+                          "ameesh canon rules-block merge", env_extra=_MERGE_IDENTITY,
+                          deadline=deadline)
+    commit = made.stdout.decode("utf-8", "replace").strip() if made.returncode == 0 else ""
+    if not commit:
+        text = made.stderr.decode("utf-8", "replace").strip() \
+            or "git commit-tree rc=%d" % made.returncode
+        return "", "merge result unreadable: %s" % text[:200]
+    return commit, ""
+
+
 def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
-    """#5556 : refuse le gel d'un lot du canon dont la tête coupe le bloc des
-    règles (`process-rules-block-too-long`) ; rend sinon la note qui donne la
-    marge en octets, lue par l'auteur au gel et par le relecteur sur le jalon.
+    """#5556/#5562 : refuse le gel d'un lot du canon dont la fusion avec la
+    cible coupe le bloc des règles (`process-rules-block-too-long`) ; rend sinon
+    la note qui donne la marge en octets, lue par l'auteur au gel et par le
+    relecteur sur le jalon.
 
     Le canon n'a pas de CI : sans ce contrôle, la limite n'était vérifiée qu'à
     `canon check`, à la synchro et au placement, donc après fusion (home#248,
-    43 octets de trop). Un lot qui ne fait pas grossir un bloc déjà coupé à la
-    base (celui qui le raccourcit) n'est pas refusé. Mesure impossible (canon
-    illisible, délai) : la note le dit, le gel n'attend pas."""
-    from . import canon as canon_mod, canon_lowering, lot_class
+    43 octets de trop). #5562 : la tête seule ne suffit pas — deux lots du canon
+    sous la limite, partis d'une cible plus ancienne, la coupent une fois
+    fusionnés. On mesure donc la **fusion d'essai** de la tête avec la cible
+    courante (celle que le gel vient de rafraîchir), pas la tête seule. Une
+    cible déjà coupée ne refuse pas un lot qui ne l'aggrave pas : le manque
+    (`over`, diagnostics compris) se compare. Mesure impossible (canon
+    illisible, délai, fusion en conflit) : la note le dit, le gel n'attend pas ;
+    une tête coupée reste alors jugée contre sa base, comme avant."""
+    from . import canon as canon_mod, canon_lowering, lot_class, plan_git
     from .deadline import Deadline
     from .work import WorkError
     cfg = getattr(db, "cfg", None)
@@ -535,7 +585,8 @@ def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
 
     # revue qa-01 : la tête se mesure d'abord dans `repo`, le dépôt où le gel
     # l'a résolue (un clone d'auteur distinct, home#248) ; le clone configuré
-    # n'est qu'un repli. La base se lit dans le même dépôt que la tête.
+    # n'est qu'un repli. La cible, la fusion et la base se lisent dans le même
+    # dépôt que la tête.
     roots = [repo] + ([clone] if clone and clone != repo else [])
     head, root, failures = None, "", []
     for where in roots:
@@ -548,25 +599,73 @@ def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
         return "canon-rules-block: not measured: %s" % "; ".join(failures)
     if head is None:
         return ""
-    if not head.cut:
-        return "canon-rules-block: %s" % head.line()
-    # Tête coupée : l'exemption ne vaut que contre la VRAIE cible. Une cible
-    # implicite se résout comme le dépôt la déclare, jamais par le repli
-    # `HEAD` de `_revision` (le lot lui-même, revue cx3 B1) ; une base
-    # introuvable ou illisible n'exempte rien : le gel est refusé.
-    base_block = None
+
+    # La cible courante. Une cible implicite se résout comme le dépôt la
+    # déclare, jamais par le repli `HEAD` de `_revision` (le lot lui-même,
+    # revue cx3 B1) : sans cible nommée, rien n'est fusionné.
+    target, tip, why = "", "", "target not resolved"
     try:
-        from . import plan_git
         target = str(item.get("branch_target") or "") \
             or plan_git.default_target(root, deadline=deadline) or ""
         ref, tip = canon_lowering._revision(root, target, deadline) if target \
             else ("", "")
-        if tip and ref != "HEAD":
+        if not tip:
+            why = "target not resolved"
+        elif ref == "HEAD":
+            tip, why = "", "target unresolved (only HEAD)"
+    except Exception as exc:  # noqa: BLE001 - cible illisible : pas de mesure
+        tip, why = "", "target unreadable: %s" % (str(exc) or type(exc).__name__)[:160]
+
+    merged = None
+    if tip:
+        try:
+            merged_commit, why = _canon_merge_commit(root, tip, sha, deadline)
+            if merged_commit:
+                merged = measure(root, merged_commit)
+                why = "" if merged is not None else "no rules block in the merge"
+        except Exception as exc:  # noqa: BLE001 - fusion illisible : pas de mesure
+            merged, why = None, "merge result unreadable: %s" % (
+                str(exc) or type(exc).__name__)[:160]
+
+    label = target or "the target"
+    if merged is not None:
+        if not merged.cut:
+            head_note = ("; head alone: %s" % head.line()) if head.cut else ""
+            return ("canon-rules-block: %s (merge result of %s into %s%s)"
+                    % (merged.line(), sha[:12], label, head_note))
+        target_block = None
+        try:
+            target_block = measure(root, tip)
+        except Exception:  # noqa: BLE001 - cible illisible : aucune exemption
+            target_block = None
+        # Le manque (`over`, diagnostics compris) se compare, pas les octets de
+        # règles — un diagnostic de plus coupe davantage à règles égales
+        # (revue docs-01 #5556). Une cible déjà coupée et non aggravée passe.
+        if target_block is not None and target_block.cut \
+                and merged.over <= target_block.over:
+            return ("canon-rules-block: %s (already cut at the target, %d bytes "
+                    "over: not grown)" % (merged.line(), target_block.over))
+        raise WorkError(
+            "freeze refused (process-rules-block-too-long): %s — merging head %s "
+            "into %s cuts the rules block (head alone: %s); a brief on the oldest "
+            "served version loses the end of the rules; shorten the cards: %s "
+            "(`ameesh canon check`, #5556/#5562)"
+            % (merged.line(), sha[:12], label, head.line(), merged.cards))
+
+    # Fusion non mesurable (conflit, cible absente, lecture cassée) : la tête
+    # seule est jugée comme avant, et la note dit ce qui n'a pas été mesuré.
+    if not head.cut:
+        return "canon-rules-block: %s (%s)" % (head.line(), why)
+    # Tête coupée : l'exemption ne vaut que contre la VRAIE cible. Une cible
+    # introuvable ou illisible n'exempte rien : le gel est refusé.
+    base_block = None
+    if tip:
+        try:
             base = canon_lowering._merge_base(root, tip, sha, deadline)
             if base and base != sha:
                 base_block = measure(root, base)
-    except Exception:  # noqa: BLE001 - base illisible : aucune exemption
-        base_block = None
+        except Exception:  # noqa: BLE001 - base illisible : aucune exemption
+            base_block = None
     # revue docs-01 : le manque (`over`, diagnostics compris) se compare, pas
     # les octets de règles — un diagnostic de plus coupe davantage à règles égales
     if base_block is not None and base_block.cut and head.over <= base_block.over:
@@ -574,7 +673,7 @@ def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
                 "not grown)" % (head.line(), base_block.over))
     raise WorkError("freeze refused (process-rules-block-too-long): %s — a brief "
                     "on the oldest served version loses the end of the rules; "
-                    "shorten the cards: %s (`ameesh canon check`, #5556)"
+                    "shorten the cards: %s (`ameesh canon check`, #5556/#5562)"
                     % (head.line(), head.cards))
 
 
