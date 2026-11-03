@@ -515,11 +515,12 @@ _PSQL_OPTION_SINCE = {"sslnegotiation": 17}
 
 
 def _psql_client_major(binary: str) -> int | None:
-    """The libpq major behind `binary` (`psql --version`), or None.
+    """The major of `binary` (`psql --version`), read as its libpq's, or None.
 
-    libpq is the client library of psql itself: a psql 16 speaks libpq 16.
-    An unreadable answer is never guessed (the DSN is then left as written,
-    as before)."""
+    psql does not print the libpq it is linked to; its own major is a lower
+    bound (a psql 16 against a newer libpq only loses an option it could have
+    kept, never keeps one its library refuses). An unreadable answer is never
+    guessed (the DSN is then left as written, as before)."""
     try:
         proc = subprocess.run([binary, "--version"], capture_output=True,
                               text=True, timeout=10)
@@ -532,8 +533,12 @@ def _psql_client_major(binary: str) -> int | None:
 
 
 def _psql_compatible_dsn(base: str, binary: str) -> str:
-    """`base` without the options this psql's libpq cannot parse (#5652)."""
-    if not any(option in base for option in _PSQL_OPTION_SINCE):
+    """`base` without the options this psql's libpq cannot parse (#5652).
+
+    The keys are compared as libpq reads them (a percent-encoded URI key
+    too); `psql --version` is probed only when the DSN carries one."""
+    if all(dsn_mod.without_parameter(base, option) == base
+           for option in _PSQL_OPTION_SINCE):
         return base
     major = _psql_client_major(binary)
     if major is None:
