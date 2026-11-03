@@ -97,6 +97,22 @@ class WithoutParameterTest(unittest.TestCase):
                 "postgresql://u@h.invalid/db?sslnegotiation=direct&", "sslnegotiation"),
             "postgresql://u@h.invalid/db")
 
+    def test_uri_without_a_path(self):
+        """#5654 : la requête commence au premier « ? » sans chemin avant, même
+        quand elle contient elle-même un « / »."""
+        cases = {
+            "postgresql://h.invalid:5432?sslnegotiation=direct&sslmode=require":
+                "postgresql://h.invalid:5432?sslmode=require",
+            "postgresql://h.invalid?sslrootcert=/x/ca.pem&sslnegotiation=direct":
+                "postgresql://h.invalid?sslrootcert=/x/ca.pem",
+            "postgresql://u@h.invalid?sslnegotiation=direct": "postgresql://u@h.invalid",
+            "postgres://?host=/run/pg&sslnegotiation=direct": "postgres://?host=/run/pg",
+        }
+        for dsn, expected in cases.items():
+            with self.subTest(dsn=dsn):
+                self.assertEqual(dsn_mod.without_parameter(dsn, "sslnegotiation"), expected)
+                self.assertEqual(dsn_mod.without_parameter(dsn, "absent-key"), dsn)
+
     def test_a_malformed_uri_stays_refused(self):
         with self.assertRaises(dsn_mod.DsnError):
             dsn_mod.without_parameter(
@@ -157,6 +173,25 @@ class PsqlDriverOptionTest(unittest.TestCase):
         sent = [line for line in self.calls() if not line.startswith("--version")]
         self.assertTrue(sent)
         self.assertIn("sslnegotiation=direct", sent[0])
+
+    def test_percent_encoded_key_is_dropped_too(self):
+        """#5654 : le préfiltre lit les clés décodées, pas la sous-chaîne."""
+        self.driver("postgresql://u@h.invalid/db?ssl%6Eegotiation=direct&sslmode=require",
+                    "psql (PostgreSQL) 16.15 (Ubuntu 16.15)")
+        self.assertEqual(sum(line.startswith("--version") for line in self.calls()), 1)
+        sent = [line for line in self.calls() if not line.startswith("--version")]
+        self.assertTrue(sent)
+        self.assertNotIn("egotiation", sent[0])
+        self.assertIn("sslmode=require", sent[0])
+
+    def test_no_probe_when_the_name_is_only_a_value(self):
+        # « sslnegotiation » ailleurs que dans une clé ne déclenche pas la sonde
+        # (le faux psql refuse toute chaîne qui contient le mot : seul compte
+        # ici l'absence de --version)
+        with self.assertRaises(db_mod.Unavailable):
+            self.driver("postgresql://u@h.invalid/sslnegotiation?sslmode=require",
+                        "psql (PostgreSQL) 16.15 (Ubuntu 16.15)")
+        self.assertFalse([line for line in self.calls() if line.startswith("--version")])
 
     def test_no_probe_without_a_concerned_option(self):
         self.driver("postgresql://ameesh@h.invalid/ameesh?sslmode=require",
