@@ -246,6 +246,58 @@ class RotationTest(unittest.TestCase):
         self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
                          contenu)
 
+    def test_fifo_auxiliary_never_blocks_rotation(self):
+        """Une FIFO sous `.gz.state`/`.gz.part` ne bloque jamais la rotation.
+
+        Témoin borné : sans `O_NONBLOCK`, l'ouverture d'une FIFO sans
+        écrivain attend indéfiniment ; le sous-processus est tué au délai et
+        le test échoue au lieu de figer la suite.
+        """
+        import subprocess
+        import sys
+        import textwrap
+        racine = self.root / 'fifo'
+        racine.mkdir()
+        script = racine / 'temoin.py'
+        script.write_text(textwrap.dedent('''
+            import gzip, importlib.util, os, sys, time
+            from pathlib import Path
+            repo, racine = Path(sys.argv[1]), Path(sys.argv[2])
+            spec = importlib.util.spec_from_file_location(
+                "ci_disque_fifo", repo / "scripts" / "ci-disque.py")
+            disque = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(disque)
+            contenu = b"journal\\n" * 1000
+            log = racine / "Worker_20261101.log"
+            log.write_bytes(contenu)
+            part = log.with_name(log.name + ".gz.part")
+            part.write_bytes(b"debut")
+            etat = log.with_name(log.name + ".gz.state")
+            os.mkfifo(etat)
+            resultat = disque._rotation_diag(
+                [racine], maintenant=time.time() + 73 * 3600, ouverts=set())
+            assert resultat["fichiers"] == 1, resultat
+            assert resultat["residus"] == 1, resultat
+            assert not part.exists() and not etat.exists()
+            assert gzip.decompress(
+                log.with_name(log.name + ".gz").read_bytes()) == contenu
+            # Partiel lui aussi substitué par une FIFO : les ouvertures
+            # rendent la main et le contrôle de type refuse l'entrée.
+            os.mkfifo(part)
+            os.mkfifo(etat)
+            fausse = {"part_dev": 1, "part_ino": 1, "part_size": 0}
+            assert disque._ouvrir_partiel(part, fausse) is None
+            assert disque._tronquer_partiel(part, fausse) is False
+            assert disque._lire_etat(etat, {}) is None
+            print("ok")
+        '''))
+        resultat = subprocess.run(
+            [sys.executable, str(script),
+             str(Path(__file__).resolve().parent.parent), str(racine)],
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(resultat.returncode, 0, resultat.stdout + resultat.stderr)
+        self.assertIn('ok', resultat.stdout)
+
 
 class ProcessReadingTest(unittest.TestCase):
     def test_only_runner_descriptors_are_read(self):

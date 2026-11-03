@@ -648,10 +648,12 @@ def _lire_etat(chemin: Path, identite: dict) -> dict | None:
     """L'état de reprise s'il décrit encore cette source, sinon None (résidu).
 
     Lecture par descripteur sans suivre de lien : un `.gz.state` lié est un
-    résidu, jamais une source de confiance.
+    résidu, jamais une source de confiance. `O_NONBLOCK` rend la main même
+    si l'entrée est une FIFO sans écrivain (`O_NOFOLLOW` ne la refuse pas) ;
+    le contrôle `S_ISREG` qui suit la rejette alors comme résidu.
     """
     try:
-        descripteur = os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW)
+        descripteur = os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
@@ -695,7 +697,9 @@ def _tronquer_partiel(partiel: Path, etat: dict) -> bool:
     (False), l'appelant repart de zéro.
     """
     try:
-        descripteur = os.open(partiel, os.O_RDWR | os.O_NOFOLLOW)
+        # `O_NONBLOCK` : une FIFO plantée sous ce nom ne fait pas attendre
+        # l'ouverture ; le contrôle de type ci-dessous la refuse.
+        descripteur = os.open(partiel, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return False
     try:
@@ -720,7 +724,10 @@ def _ouvrir_partiel(partiel: Path, etat: dict) -> int | None:
     correspondent plus à l'état) : l'appelant jette et repart de zéro.
     """
     try:
-        descripteur = os.open(partiel, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+        # `O_NONBLOCK` : une FIFO substituée au partiel échoue (ENXIO) au
+        # lieu d'attendre un lecteur ; le contrôle de type reste la garde.
+        descripteur = os.open(partiel, os.O_WRONLY | os.O_APPEND
+                              | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
@@ -763,10 +770,11 @@ def _compresser_partiel(chemin: Path, initial, *, debut: float, budget_s: float,
     le journal original et enlève le partiel.
 
     Aucun auxiliaire n'est ouvert par son chemin sans contrôle : `.gz.part` et
-    `.gz.state` sont ouverts par descripteur (`O_NOFOLLOW`), l'inode du
-    partiel enregistré dans l'état doit être celui rouvert, et le temporaire
-    d'état est créé exclusivement sous un nom imprévisible. Un lien planté
-    sous ces noms est retiré sans être suivi, sa cible reste intacte.
+    `.gz.state` sont ouverts par descripteur (`O_NOFOLLOW | O_NONBLOCK` — une
+    FIFO substituée ne bloque pas et le contrôle de type la refuse), l'inode
+    du partiel enregistré dans l'état doit être celui rouvert, et le
+    temporaire d'état est créé exclusivement sous un nom imprévisible. Un lien
+    planté sous ces noms est retiré sans être suivi, sa cible reste intacte.
     """
     partiel = _fichier_partiel(chemin)
     etat_chemin = _fichier_etat(chemin)
@@ -805,7 +813,8 @@ def _compresser_partiel(chemin: Path, initial, *, debut: float, budget_s: float,
         offset, residu = 0, True
 
     try:
-        with os.fdopen(os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
+        with os.fdopen(os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW
+                               | os.O_NONBLOCK), "rb") as source:
             if _identite(os.fstat(source.fileno())) != identite:
                 _retirer(partiel, etat_chemin)
                 return {"termine": False, "partiel": False, "octets": 0,
