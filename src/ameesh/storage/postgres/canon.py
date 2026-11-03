@@ -189,8 +189,17 @@ class Canon(interface.Canon):
             (token, signature, host, canon, token))
 
     def fail_sync(self, host, canon, token) -> None:
+        # #5649: release the claim; keep the last COMPLETED result while the
+        # canon state is still `ok`. The signature check in `periodic_sync`
+        # already refuses a result of another snapshot, so withdrawing a
+        # valid result only forced the next restarted unit to pay a full sync
+        # (and miss the staging "redémarrer" guard). A failure that recorded
+        # `unreadable`/`invalid` still withdraws it: the gate must not settle
+        # over a non-ok canon.
         self.db.execute(
-            "UPDATE canon_state SET sync_completed_token = NULL, sync_claimed_at = NULL "
+            "UPDATE canon_state SET sync_claimed_at = NULL, "
+            "sync_completed_token = CASE WHEN status = 'ok' "
+            "THEN sync_completed_token ELSE NULL END "
             "WHERE host = %s AND canon = %s AND sync_token = %s",
             (host, canon, token))
 

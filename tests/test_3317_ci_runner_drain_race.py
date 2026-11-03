@@ -28,6 +28,13 @@ class FrozenDrainTest(unittest.TestCase):
         (self.group / "cgroup.procs").write_text("10\n")
         self.proc = self.root / "proc"
         self.process("10", "Runner.Listener")
+        self.work = self.root / "runner"
+        (self.work / "_diag").mkdir(parents=True)
+        self.log = self.work / "_diag" / "Runner_20261103-130000-utc.log"
+        self.log.write_text(
+            "[2026-11-03 13:00:00Z INFO Runner] Runner is built for Linux\n"
+            "[2026-11-03 13:00:00Z INFO Terminal] WRITE LINE: "
+            "2026-11-03 13:00:00Z: Listening for Jobs\n")
         self.host = drain.Host(str(self.root / "cg"), str(self.proc),
                                str(self.root / "drain.lock"))
         self.events = []
@@ -48,6 +55,8 @@ class FrozenDrainTest(unittest.TestCase):
     def command(self, argv):
         if argv[3] == "RestartForceExitStatus":
             return self.forced
+        if argv[3] == "WorkingDirectory":
+            return str(self.work)
         return self.restart if argv[3] == "Restart" else "/system.slice/" + R1
 
     def set_freezer(self, group, value):
@@ -98,6 +107,34 @@ class FrozenDrainTest(unittest.TestCase):
         self.process("11", "Runner.Worker")
         self.assertFalse(self.host.act_if_idle("stop", R1))
         self.assertEqual(self.events, ["freeze", "thaw"])
+        self.host._kill_frozen.assert_not_called()
+
+    def test_job_accepted_without_worker_is_kept(self):
+        # #5656: the listener logged "Running job" and has not spawned the
+        # Worker yet; the frozen reading must not call the runner idle.
+        with open(self.log, "a") as f:
+            f.write("[2026-11-03 13:32:18Z INFO Terminal] WRITE LINE: "
+                    "2026-11-03 13:32:18Z: Running job: psql 13/16\n")
+        self.assertFalse(self.host.act_if_idle("restart", R1))
+        self.assertEqual(self.events, ["freeze", "thaw"])
+        self.assertTrue(self.alive)
+        self.host._kill_frozen.assert_not_called()
+
+    def test_completed_job_returns_to_idle(self):
+        with open(self.log, "a") as f:
+            f.write("[2026-11-03 13:32:18Z INFO Terminal] WRITE LINE: "
+                    "2026-11-03 13:32:18Z: Running job: psql 13/16\n")
+            f.write("[2026-11-03 13:40:00Z INFO Terminal] WRITE LINE: "
+                    "2026-11-03 13:40:00Z: Job psql 13/16 completed with "
+                    "result: Failed\n")
+        self.assertTrue(self.host.act_if_idle("restart", R1))
+        self.assertEqual(self.events, ["freeze", "kill", "thaw", "restart"])
+
+    def test_unreadable_diag_log_is_kept(self):
+        os.unlink(self.log)
+        self.assertFalse(self.host.act_if_idle("stop", R1))
+        self.assertEqual(self.events, ["freeze", "thaw"])
+        self.assertTrue(self.alive)
         self.host._kill_frozen.assert_not_called()
 
     def test_automatic_restart_is_refused_before_freezing(self):

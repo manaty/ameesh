@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#5493: a restarted runner settles on the last completed sync while a
-neighbour's newer sync is pending; a failed claimed sync closes and retries."""
+neighbour's newer sync is pending; a failed claimed sync releases its claim
+and retries (it keeps the last completed result on an `ok` state, #5649)."""
 import types
 from unittest import mock
 
@@ -59,13 +60,17 @@ class PendingReuseTest(_Setup):
     def test_failed_claimed_sync_closes_then_retries_without_waiting(self):
         with mock.patch.object(canon_sync, "sync") as sync:
             self.run_sync()
+            # the completed sync left an `ok` state (real `sync()` records it)
+            self.db.execute("UPDATE canon_state SET status = 'ok' "
+                            "WHERE host = %s AND canon = ''", (HOST,))
             self.expire_claim()
             sync.side_effect = RuntimeError("boom")
             with self.assertRaises(RuntimeError):
                 self.run_sync()
-            # the failure withdrew the completed result: no reuse
-            self.assertIsNone(self.store.shared_sync(HOST, ""))
-            # and released the claim: the next pass syncs at once
+            # #5649: the last completed result is kept while the state is ok
+            # (a restarted runner may reuse it), and the claim is released.
+            self.assertIsNotNone(self.store.shared_sync(HOST, ""))
+            # released claim: the next settled pass retries at once
             sync.side_effect = None
             self.assertIs(self.run_sync(), sync.return_value)
             self.assertEqual(sync.call_count, 3)
