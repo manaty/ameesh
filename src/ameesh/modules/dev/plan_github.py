@@ -1053,7 +1053,12 @@ def issues_of_pr(pr: dict, repo: str) -> list[str]:
 def _lots_by_issue_ref(st) -> dict:
     """{issue_ref sans casse: [lots]} des lots qui portent une issue_ref."""
     out: dict = {}
-    for item in st.work.issue_feed(FEED_LIMIT):
+    # #5584 : la lecture dédiée `(id, issue_ref)` de la même fenêtre que le flux,
+    # sans ses lignes larges ; le flux complet reste le repli d'un stockage qui
+    # ne la porte pas (exécuteur médié).
+    reader = getattr(st.work, "issue_refs", None)
+    rows = reader(FEED_LIMIT) if reader is not None else st.work.issue_feed(FEED_LIMIT)
+    for item in rows:
         ref = (item.get("issue_ref") or "").strip().casefold()
         if ref:
             out.setdefault(ref, []).append(int(item["id"]))
