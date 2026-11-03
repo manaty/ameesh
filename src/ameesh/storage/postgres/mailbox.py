@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 
 from .. import interface
-from .registry import NAME_LOCK_SQL, canon_governed_sql, name_lock_key
+from .registry import (
+    NAME_LOCK_SQL, PASSIVE_SQL, canon_governed_sql, name_lock_key)
 
 #: projet du fil d'un agent (`fil.agent_project`), en SQL : son équipe s'il est
 #: gouverné par le canon, sinon son chantier, désormais `workstream` (un
@@ -67,24 +68,9 @@ _RESERVED_SQL = """
         > extract(epoch from clock_timestamp())
 """
 
-#: L125 : un message PASSIF — accusé, copie, diffusion à tous, conflit signalé
-#: par le radar (L160c), échec de CI sans référence de la base (L161c),
-#: information sans geste attendu (#3451), jamais urgent —
-#: n'ouvre pas de tour à lui seul (même règle que `mail.passive_reason`).
-#: `{t}` : l'alias de la table `agent_mailbox` (`PASSIVE_SQL.format(t="mb")`).
-#: #3741 : l'index partiel `agent_mailbox_passive_unread_idx` (0489) porte ce
-#: prédicat au mot près ; le changer appelle une migration de l'index.
-#: #3923 : son complément `agent_mailbox_unread_active_idx` (0495) porte la
-#: négation, pour le compte des non-lus actifs de `operations.listing` ;
-#: le changer appelle aussi une migration de cet index.
-PASSIVE_SQL = (
-    "(NOT {t}.payload @> '{{\"urgent\": true}}'::jsonb"
-    " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
-    " OR {t}.payload @> '{{\"broadcast\": true}}'::jsonb"
-    " OR {t}.payload @> '{{\"ci_passif\": true}}'::jsonb"
-    " OR {t}.payload @> '{{\"info\": true}}'::jsonb"
-    " OR coalesce({t}.payload->>'cc', '') <> ''"
-    " OR coalesce(jsonb_typeof({t}.payload->'radar'), '') = 'object'))")
+#: L125 : le prédicat d'un message PASSIF (`PASSIVE_SQL`) vit dans
+#: `registry` depuis #5586 (le compte groupé d'`overview()` le lit sans import
+#: circulaire) ; il reste exporté ici pour ses lecteurs.
 
 
 class Mailbox(interface.Mailbox):
