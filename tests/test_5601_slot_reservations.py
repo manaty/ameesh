@@ -26,7 +26,8 @@ def fake_runner(reservations, max_agents, actionable):
     run = types.SimpleNamespace(lock=threading.Lock(), workers={}, db=Mock(),
                                 _host_max_agents=max_agents, _host_pinned_admissions=None,
                                 _host_slot_reservations=reservations)
-    for method in ("_admission_order", "_reservation_admits", "admits_new_worker"):
+    for method in ("_admission_order", "_reservation_admits", "admits_new_worker",
+                   "reservation_turn_allowed"):
         setattr(run, method, types.MethodType(getattr(runner_mod.Runner, method), run))
     return run, store
 
@@ -101,6 +102,32 @@ class RunnerTest(unittest.TestCase):
         # the reserved holder leaves: its place goes to class 1 only
         del run.workers["urgent"]
         self.assertFalse(run.admits_new_worker({"name": "c"}))
+
+    def test_resident_worker_changing_lot_is_judged_again(self):
+        """B cx3: cap 2, class:1 = 1. A, admitted on a P1 lot, moves on to a
+        P2 lot: B (P2) took the other place, so A must give its lease back
+        and C (P1) gets the reserved place."""
+        lots = {"a": nxt("acme", 1, 10), "b": nxt("acme", 2, 20), "c": nxt("acme", 1, 30)}
+        run, store = fake_runner({"class:1": 1}, 2, lots)
+        with patch("ameesh.storage.of", return_value=store):
+            run._admission_order([{"name": "a"}, {"name": "b"}, {"name": "c"}])
+        for name in ("a", "b"):
+            self.assertTrue(run.admits_new_worker({"name": name}))
+            run.workers[name] = Fil({"name": name})
+        self.assertEqual(run._slot_reservations, {"a": "class:1", "b": None})
+        # A's next lot is still P1: its turn starts, the reserved place is kept
+        self.assertTrue(run.reservation_turn_allowed("a", {}, nxt("acme", 1, 11)[0]))
+        # A's next lot is P2: no shared place left, the worker gives its lease back
+        self.assertFalse(run.reservation_turn_allowed("a", {}, nxt("acme", 2, 12)[0]))
+        del run.workers["a"]
+        self.assertTrue(run.admits_new_worker({"name": "c"}))
+        self.assertEqual(run._slot_reservations["c"], "class:1")
+        # with a shared place free, a worker leaving its reserved class keeps going
+        run, _store = fake_runner({"class:1": 1}, 3, {})
+        run.workers = {"a": Fil({"name": "a"}), "b": Fil({"name": "b"})}
+        run._slot_reservations = {"a": "class:1", "b": None}
+        self.assertTrue(run.reservation_turn_allowed("a", {}, nxt("acme", 2, 12)[0]))
+        self.assertIsNone(run._slot_reservations["a"])
 
     def test_project_reservation(self):
         lots = {"n": nxt("nexlink", 2, 50), "o": nxt("other", 2, 10)}

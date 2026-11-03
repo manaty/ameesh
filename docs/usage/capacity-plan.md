@@ -117,7 +117,10 @@ priority. A free place goes to another agent only while the unfilled
 reservations still fit in the places left. With reservations on its host,
 the runner admits unleased agents by the class, then the creation date of
 their next lot; elected roles come first, agents without an actionable lot
-last. Without reservations the claim order is unchanged and no lot is read.
+last. A resident worker is judged again at the start of each lot turn: when
+its new lot no longer fills the reserved place it holds and no shared place
+is left, it gives its lease back and the claim pass admits by class again.
+Without reservations the claim order is unchanged and no lot is read.
 Reservations divide the `max_agents` of the runner. More reserved places than
 `max_agents` is a canon error; an unreadable entry is a canon error too and
 is ignored, so it never holds places nobody can take.

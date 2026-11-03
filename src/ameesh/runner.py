@@ -6602,6 +6602,15 @@ class AgentWorker(threading.Thread):
                     # #811 (B2) : pas de réveil consommé pour un lot dont le
                     # dossier manque — un autre lot actionnable est élu.
                     continue
+                fits = getattr(self.runner, "reservation_turn_allowed", None)  # doublures
+                if fits is not None and not fits(self.name, self.agent or {}, row):
+                    # #5601 (B cx3) : le nouveau lot ne remplit plus la place
+                    # réservée que ce worker tient, et aucune place partagée ne
+                    # reste : le bail est rendu, la réclamation réadmet par classe
+                    log_async("[%s] lot #%s does not fit the slot reservations: "
+                              "lease released" % (self.name, row["id"]))
+                    self.stopping.set()
+                    return None
                 note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
                 log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
                           % (self.name, row["id"], row["state"], note.get("wakes")))
@@ -13777,6 +13786,26 @@ class Runner:
         if admitted:
             filled[agent.get("name")] = key
         return admitted
+
+    def reservation_turn_allowed(self, name: str, agent: dict, row: dict) -> bool:
+        """#5601 (B cx3) : un worker résident change de lot entre ses tours
+        sans repasser l'admission. Au départ de chaque tour de lot, sa place
+        est rejugée sur ce lot, les autres workers gardant la leur : la clé
+        qu'il remplit est mise à jour, ou False quand le lot ne tient plus
+        (il rend alors son bail). Sans réservation ni plafond : True."""
+        cap = getattr(self, "_host_max_agents", None)
+        if not getattr(self, "_host_slot_reservations", None) or cap is None \
+                or agent.get("ephemeral"):
+            return True
+        with self.lock:
+            live = [other for other, worker in self.workers.items()
+                    if other != name and worker.is_alive()
+                    and not (getattr(worker, "agent", None) or {}).get("ephemeral")]
+        demands = getattr(self, "_admission_demands", None)
+        if demands is None:
+            demands = self._admission_demands = {}
+        demands[name] = row
+        return self._reservation_admits(dict(agent, name=name), live, cap)
 
     def admits_new_worker(self, agent: dict) -> bool:
         """L43 (0031) : `max_agents` PHYSIQUE de l'hôte (le plus petit des
