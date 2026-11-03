@@ -157,11 +157,14 @@ def _split_uri(dsn: str) -> tuple[str, str, bool]:
 def _without_uri_parameter(dsn: str, key: str) -> str:
     prefix = next(p for p in _URI_PREFIXES if dsn.startswith(p))
     body = dsn[len(prefix):]
+    # the userinfo ends at an "@" met before any "/", as libpq scans it (and
+    # as _split_uri does); without one, the query starts at the first "?"
+    # whatever precedes it: no path at all (h:5432?k=v), or a "/" that only
+    # appears inside the query (h?sslrootcert=/x)
     start = 0
     while start < len(body) and body[start] not in "@/":
         start += 1
-    if start < len(body) and body[start] == "@":
-        start += 1
+    start = start + 1 if start < len(body) and body[start] == "@" else 0
     path, question, query = body[start:].partition("?")
     if not question:
         return dsn
