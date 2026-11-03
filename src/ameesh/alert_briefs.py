@@ -26,6 +26,10 @@ envoyé par le notificateur (ce serait le disparu qui parle) : la passe du
 runner hors du poste le porte (`notify_gap.brief_once`), et
 `NOTIFIER_EXCLUDED` l'en écarte côté `ameesh notify`.
 
+#5563 : `host_disk_soon_full` et `host_unsampled` vont à mesh-design et au
+bureau (fil pour un bureau externe), avec filtre des destinataires vivants.
+Le silence du relevé et le passage du disque au critique sont urgents.
+
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
 `REMIND_AFTER_S` (6 h) plus tard ; les SLO ne repartent qu'au palier suivant
@@ -44,7 +48,8 @@ import time
 from . import sous_utilisation, vocab, work_lifecycle as lifecycle
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
-BRIEFED_TYPES = ("staging_interrupted", "host_idle_reserved", "baseline_oversized", "host_release_failed",
+BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
+                 "host_idle_reserved", "baseline_oversized", "host_release_failed",
                  "host_release_overdue", "host_release_no_runs",
                  "host_release_canon_unreadable", "idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
@@ -1114,6 +1119,22 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     by_name = {row["name"]: row for row in listing}
     orchestras = list(alert.get("orchestrators") or ())
     closed = set(closed_hosts or ())
+    if kind in ("host_disk_soon_full", "host_unsampled"):
+        # #5563 : opérateurs du mesh, sans diffusion aux pilotes produit.
+        # Le bureau externe lit le fil, pas sa boîte.
+        text = alert["detail"]
+        if kind == "host_unsampled":
+            text += (" Check the host sampler: ameesh-releve-hote.timer (system) "
+                     "or ameesh-host-publish.timer (user, publish@); verify that "
+                     "a fresh reading appears in ameesh hosts.")
+        out = {"mesh-design": text} if "mesh-design" in by_name else {}
+        out.update(_fallback_bureau(by_name, text))
+        live, dead = _split_live(out, by_name, closed)
+        if dead_out is not None:
+            dead_out.update(dead)
+        if not live and "bureau" in by_name:
+            live = {"thread:bureau": text}
+        return {name: _dead_note(dead) + body for name, body in live.items()}
     if kind == "module_deviation":
         text = alert.get("action") or alert.get("detail") or "Module procedure deviation"
         project = alert.get("project")

@@ -35,6 +35,30 @@ class BriefsTest(unittest.TestCase):
         self.listing = _listing(("orch", "a"), ("orch-b", "b"), ("dev1", "a"),
                                 ("dev2", "b"), ("auditeur", ""))
 
+    def test_host_alerts_reach_mesh_operators(self):
+        listing = self.listing + _listing(("mesh-design", ""), ("bureau", ""))
+        for kind in ("host_disk_soon_full", "host_unsampled"):
+            with self.subTest(kind=kind):
+                alert = {"type": kind, "host": "central", "detail": "host central: act",
+                         "orchestrators": ["orch", "orch-b"]}
+                briefs = alert_briefs.briefs(alert, listing, auditor_names=["auditeur"])
+                self.assertEqual(set(briefs), {"mesh-design", "bureau"})
+                self.assertIn("host central: act", briefs["mesh-design"])
+                if kind == "host_unsampled":
+                    for timer in ("ameesh-releve-hote.timer", "ameesh-host-publish.timer"):
+                        self.assertIn(timer, briefs["bureau"])
+                external = [dict(row, mode="externe") if row["name"] == "bureau"
+                            else row for row in listing]
+                self.assertEqual(set(alert_briefs.briefs(alert, external)),
+                                 {"mesh-design", "thread:bureau"})
+                dead = {}
+                lost = [dict(row, lease_live=False) if row["name"] == "mesh-design"
+                        else row for row in listing]
+                remaining = alert_briefs.briefs(alert, lost, dead_out=dead)
+                self.assertEqual(set(remaining), {"bureau"})
+                self.assertIn("mesh-design", dead)
+                self.assertIn("No live recipient", remaining["bureau"])
+
     def test_stale_lot(self):
         briefs = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])
         self.assertEqual(sorted(briefs), ["orch"])   # équipe de l'assigné
@@ -232,6 +256,30 @@ class NotifierBriefsTest(PgTestCase):
     def mails(self, name):
         return self.db.query("SELECT body, kind, payload FROM agent_mailbox"
                              " WHERE recipient = %s ORDER BY id", (name,))
+
+    def test_host_alert_briefs_urgent_once_per_severity(self):
+        for name in ("mesh-design", "bureau"):
+            registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'")
+        notifier = notify.Notifier(self.cfg, notify.parse_config({"default": []}),
+                                   sender=object(), log=lambda t: None,
+                                   clock=lambda: self.now)
+        warning = {"type": "host_disk_soon_full", "host": "central",
+                   "detail": "central disk warning", "reason": "seuil"}
+        critical = dict(warning, reason="critique", critical=True, urgent=True)
+        silent = {"type": "host_unsampled", "host": "central",
+                  "detail": "central sampler silent", "since": self.now - HEURE}
+        for current in ([warning], [warning], [critical, silent], [critical, silent]):
+            notifier.run_pass(self.db, current=current)
+        for name in ("mesh-design", "bureau"):
+            rows = self.mails(name)
+            self.assertEqual(len(rows), 3, rows)
+            self.assertFalse(rows[0]["payload"].get("urgent"))
+            self.assertTrue(all(row["payload"].get("urgent") for row in rows[1:]))
+            self.assertTrue(all(row["kind"] == "event" for row in rows))
+        self.assertEqual(self.mails("orch"), [])
+        self.assertEqual(self.mails("auditeur"), [])
 
     def test_une_fois_puis_une_relance(self):
         clock = [self.now]

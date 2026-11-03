@@ -181,7 +181,7 @@ class CliTest(unittest.TestCase):
     def test_error_fails_the_check_but_not_the_host_state(self):
         finding = canon_mod.Finding(coverage.CODE_MISSING, canon_mod.ERROR, "m")
         canon = mock.Mock(readable=True, root="/c", untrusted=False, sources=[],
-                          id="c", is_default=True)
+                          id="c", is_default=True, processes=[])
         args = argparse.Namespace(host="h", json=True, project_repo=[("ameesh", "/p")])
         out = io.StringIO()
         with mock.patch.object(canon_cli.canon_mod, "validate", return_value=[]), \

@@ -436,6 +436,14 @@ def add_parsers(sub) -> None:
     pr = bsub.add_parser("release", help="#1469: release a kept account reservation "
                          "(uncertain turn checked by a human)")
     pr.add_argument("reservation", type=int)
+    prec = bsub.add_parser('reconcile', help='resolve a blocked accounting marker (authorized human only)')
+    prec.add_argument('agent')
+    choice = prec.add_mutually_exclusive_group(required=True)
+    choice.add_argument('--spend-key')
+    choice.add_argument('--abandon', action='store_true')
+    prec.add_argument('--reason', required=True)
+    prec.add_argument('--human', required=True,
+                      help='must match the authenticated Unix human (human:NAME)')
     from . import tranche_budget
     tranche_budget.add_parser(bsub)
     # #4166 : prépayé déclaré d'un compte fournisseur sans API de solde
@@ -482,6 +490,20 @@ def cmd_budget(cfg: Config, args: argparse.Namespace) -> int:
             return tranche_budget.command(cfg, db, args)
         if what == "prepaid":
             return _cmd_prepaid(cfg, db, args)
+        if what == 'reconcile':
+            try:
+                actor = authorize(cfg, db, args.agent)
+                if args.human != actor:
+                    raise BudgetError('--human must match the authenticated actor %s' % actor)
+                result = storage.of(db).pending_spend.reconcile(
+                    args.agent, spend_key=args.spend_key, abandon=args.abandon,
+                    actor=actor, reason=args.reason)
+            except (BudgetError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print('Accounting reconciliation #%s: %s for %s (by %s).'
+                  % (result['id'], result['event'], args.agent, actor))
+            return 0
         if what == "release" or getattr(args, "account", None):
             return _cmd_account(cfg, db, args, what)
         if what == "set":
