@@ -29,7 +29,8 @@ export TMPDIR
 f="$d/ameesh-$(hostname)-$(date +%F-%H%M%S).dump"
 python=/opt/ameesh/venv/bin/python
 helper=/usr/local/sbin/ameesh-sauvegarder-prive.py
-"$python" "$helper" dump --config /home/ameesh/.config/ameesh/config.json --output "$f"
+"$python" "$helper" dump --config /home/ameesh/.config/ameesh/config.json --output "$f" \
+    --timeout "${AMEESH_DUMP_TIMEOUT_S:-3600}"
 if [ -r /etc/ameesh/sauvegarde.env ]; then
     . /etc/ameesh/sauvegarde.env
     export SCW_ACCESS_KEY SCW_SECRET_KEY SCW_BUCKET SCW_REGION
