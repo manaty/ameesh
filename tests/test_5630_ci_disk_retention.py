@@ -172,7 +172,7 @@ class DiskTransportTest(unittest.TestCase):
         self.assertEqual(self.disk.findings([self.row(free_bytes=80 * 1024**3)], [], self.now), [])
 
     def test_stale_low_stays_low_and_reports_missing_sampling(self):
-        out = self.disk.findings([self.row(sampled_ts=self.now - 4 * 3600)], [], self.now)
+        out = self.disk.findings([self.row(sampled_ts=self.now - 2 * 3600 - 1)], [], self.now)
         self.assertEqual({r['type'] for r in out}, {'ci_disk_low', 'ci_disk_unreadable'})
         self.assertEqual([r['type'] for r in self.disk.findings(
             [self.row(free_bytes=None, total_bytes=None, sampled_ts=None)], [], self.now)],

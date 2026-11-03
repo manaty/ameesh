@@ -15,7 +15,7 @@ from . import resources
 
 WORKFLOW = 'ci-disque.yml'
 SCHEMA = 'ameesh-ci-disk/1'
-MAX_AGE = 3 * 3600
+MAX_AGE = 2 * 3600
 READ_INTERVAL = 300
 HOST = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 
