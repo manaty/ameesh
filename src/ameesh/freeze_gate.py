@@ -536,18 +536,29 @@ def _canon_rules_block(db: Db, item: dict, sha: str, repo: str) -> str:
 
     try:
         head = measure(sha)
-        if head is None:
-            return ""
-        if not head.cut:
-            return "canon-rules-block: %s" % head.line()
-        target = str(item.get("branch_target") or "")
-        _ref, tip = canon_lowering._revision(repo, target, deadline)
-        base_block = None
-        if tip:
-            base = canon_lowering._merge_base(repo, tip, sha, deadline)
-            base_block = measure(base) if base else None
     except Exception as exc:  # noqa: BLE001 - le gel n'attend pas une mesure cassée
         return "canon-rules-block: not measured: %s" % (str(exc) or type(exc).__name__)[:200]
+    if head is None:
+        return ""
+    if not head.cut:
+        return "canon-rules-block: %s" % head.line()
+    # Tête coupée : l'exemption ne vaut que contre la VRAIE cible. Une cible
+    # implicite se résout comme le dépôt la déclare, jamais par le repli
+    # `HEAD` de `_revision` (le lot lui-même, revue cx3 B1) ; une base
+    # introuvable ou illisible n'exempte rien : le gel est refusé.
+    base_block = None
+    try:
+        from . import plan_git
+        target = str(item.get("branch_target") or "") \
+            or plan_git.default_target(repo, deadline=deadline) or ""
+        ref, tip = canon_lowering._revision(repo, target, deadline) if target \
+            else ("", "")
+        if tip and ref != "HEAD":
+            base = canon_lowering._merge_base(repo, tip, sha, deadline)
+            if base and base != sha:
+                base_block = measure(base)
+    except Exception:  # noqa: BLE001 - base illisible : aucune exemption
+        base_block = None
     if base_block is not None and base_block.cut and head.rules <= base_block.rules:
         return ("canon-rules-block: %s (already cut at the base, %d bytes of "
                 "rules: not grown)" % (head.line(), base_block.rules))

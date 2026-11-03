@@ -76,6 +76,21 @@ class GelTest(unittest.TestCase):
         with self.assertRaises(WorkError):
             self._gate(self._lot(canon.RULES_BLOC_ROOM_COMPAT + 500))
 
+    def test_cible_implicite_ne_prend_pas_le_lot_pour_sa_base(self):
+        # revue cx3 B1 : sans branch_target, HEAD (le lot) n'est pas la base ;
+        # la vraie cible (main, saine) est résolue et le dépassement refusé
+        sha = self._lot(canon.RULES_BLOC_ROOM_COMPAT + 50)
+        for item in ({"branch": "canon/5556-lot"},
+                     {"branch": "canon/5556-lot", "branch_target": ""}):
+            with self.subTest(item=item), self.assertRaises(WorkError):
+                self._gate(sha, item)
+
+    def test_base_illisible_n_exempte_pas(self):
+        sha = self._lot(canon.RULES_BLOC_ROOM_COMPAT + 50)
+        with self.assertRaises(WorkError):
+            self._gate(sha, {"branch": "canon/5556-lot",
+                             "branch_target": "cible-absente"})
+
     def test_lot_ordinaire_non_mesure(self):
         self.assertEqual(self._gate("a" * 40, {"branch": "lot/1-x",
                                                "branch_target": "main"}), "")
