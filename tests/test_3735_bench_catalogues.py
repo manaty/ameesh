@@ -36,10 +36,32 @@ def _name(tag: str) -> str:
 
 
 def _dead_pid() -> int:
-    """PID d'un processus révolu : sa preuve de propriété ne protège plus."""
+    """PID d'un processus révolu : sa preuve de propriété ne protège plus.
+
+    Le marqueur est posé avec ``start=0`` : aucun processus qui recyclerait
+    ce PID ne peut avoir un start à moins d'une seconde de l'époque 0, donc
+    ``same_start`` refuse et la preuve reste morte (#5548). Un start réel du
+    processus mort serait, lui, exposé au recyclage dans la tolérance d'une
+    seconde.
+    """
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait()
     return child.pid
+
+
+#: #5548 — l'âge d'un témoin est le mtime de sa première relation :
+#: ``pg_stat_file`` le tronque à la seconde et PostgreSQL ne l'écrit qu'au
+#: vidage de la page sale (bgwriter, checkpoint), à un instant que le test ne
+#: maîtrise pas. Un ``sleep`` ne date donc rien : une passe datée
+#: ``now = time.time() + AGED_S`` rend « vieux » les témoins qui doivent
+#: partir ; ceux qui doivent rester jeunes gardent l'horloge réelle et un
+#: seuil large (3600 s).
+AGED_S = 3600.0
+
+
+def _aged() -> float:
+    """Date une passe une heure devant : l'âge n'est plus une course."""
+    return time.time() + AGED_S
 
 
 #: #3735 B/P1 : processus **legacy** réel — aucune connexion persistante
@@ -102,22 +124,22 @@ class BenchCataloguesTest(PgTestCase):
         # témoin de purge, `old` porte la preuve d'un propriétaire mort.
         bench_mod.claim_owner(self.db, old, pid=_dead_pid(), start=0)
         mine = {old, active, young}
-        # l'âge lu est celui de la première relation : une seconde de marge
-        # suffit pour distinguer « vieux » de « créé après la mesure ».
-        time.sleep(1.1)
+        # l'âge est daté par la passe (`now`) : le mtime de la première
+        # relation n'est écrit qu'au vidage de la page sale (#5548).
         other = db_mod.connect(self.cfg)
         try:
             with other.transaction() as tx:
                 tx.query('SELECT * FROM "%s".x' % active)
                 found = {orphan.schema for orphan in bench_mod.orphan_schemas(
-                    self.db, min_age_s=0.5, only=mine)}
+                    self.db, min_age_s=0.5, now=_aged(), only=mine)}
                 self.assertIn(old, found)
                 self.assertNotIn(active, found)   # session qui tient un verrou
-                dry = bench_mod.purge_orphans(self.db, min_age_s=0.5, dry_run=True,
-                                             only=mine)
+                dry = bench_mod.purge_orphans(self.db, min_age_s=0.5, now=_aged(),
+                                             dry_run=True, only=mine)
                 self.assertIn(old, [schema for schema, _ in dry.kept])
                 self.assertTrue(self._exists(old))
-                result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only=mine)
+                result = bench_mod.purge_orphans(self.db, min_age_s=0.5,
+                                                 now=_aged(), only=mine)
         finally:
             other.close()
         self.assertIn(old, result.dropped)
@@ -138,8 +160,8 @@ class BenchCataloguesTest(PgTestCase):
         # la purge exige une mort prouvée (#3735 B/P1) : `mine` porte la
         # preuve, `neighbour` reste sans marqueur et hors de `only`.
         bench_mod.claim_owner(self.db, mine, pid=_dead_pid(), start=0)
-        time.sleep(1.1)
-        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={mine})
+        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, now=_aged(),
+                                         only={mine})
         self.assertIn(mine, result.dropped)
         self.assertNotIn(neighbour, result.dropped)
         self.assertTrue(self._exists(neighbour))
@@ -156,14 +178,12 @@ class BenchCataloguesTest(PgTestCase):
         self._create(owned)
         self._create(gone)
         bench_mod.claim_owner(self.db, owned)  # le processus de la suite vit
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
-        bench_mod.claim_owner(self.db, gone, pid=child.pid, start=0)
+        bench_mod.claim_owner(self.db, gone, pid=_dead_pid(), start=0)
         # la dernière requête de la connexion ne doit nommer aucun des deux
         # schémas (sinon la garde _in_use suffirait au lieu de la preuve).
         self.db.query("SELECT 1")
-        time.sleep(1.1)
-        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={owned, gone})
+        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, now=_aged(),
+                                         only={owned, gone})
         self.assertNotIn(owned, result.dropped)
         self.assertTrue(self._exists(owned))
         self.assertIn(gone, result.dropped)
@@ -183,12 +203,11 @@ class BenchCataloguesTest(PgTestCase):
         other = db_mod.connect(self.cfg)
         try:
             other.query("SELECT 1")  # client vivant, session au repos
-            time.sleep(1.1)
             found = {orphan.schema for orphan in bench_mod.orphan_schemas(
-                self.db, min_age_s=0.5, only={unmarked})}
+                self.db, min_age_s=0.5, now=_aged(), only={unmarked})}
             self.assertNotIn(unmarked, found)
             result = bench_mod.purge_orphans(self.db, min_age_s=0.5,
-                                             only={unmarked})
+                                             now=_aged(), only={unmarked})
         finally:
             other.close()
         self.assertNotIn(unmarked, result.dropped)
@@ -211,8 +230,8 @@ class BenchCataloguesTest(PgTestCase):
             self.assertEqual(bench_mod.parse_owner(marker), (os.getpid(), None))
             self.assertTrue(bench_mod.owner_alive(marker))
             bench_mod.claim_owner(self.db, owned)
-        time.sleep(1.1)
-        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={owned})
+        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, now=_aged(),
+                                         only={owned})
         self.assertNotIn(owned, result.dropped)
         self.assertTrue(self._exists(owned))
 
@@ -230,8 +249,8 @@ class BenchCataloguesTest(PgTestCase):
         self.assertIsNone(bench_mod.parse_owner(marker))
         self.assertEqual(bench_mod.owner_state(marker), bench_mod.OWNER_UNKNOWN)
         self.assertFalse(bench_mod.owner_alive(marker))
-        time.sleep(1.1)
-        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={legacy})
+        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, now=_aged(),
+                                         only={legacy})
         self.assertNotIn(legacy, result.dropped)
         self.assertTrue(self._exists(legacy))
 
@@ -284,9 +303,8 @@ class BenchCataloguesTest(PgTestCase):
             ready = proc.stdout.readline().strip()
             self.assertEqual(ready, "ready", "legacy process did not start")
             # le processus vit ; aucune connexion persistante ni verrou
-            time.sleep(1.1)
             result = bench_mod.purge_orphans(self.db, min_age_s=0.5,
-                                             only={name})
+                                             now=_aged(), only={name})
             self.assertNotIn(name, result.dropped)
             self.assertTrue(self._exists(name))
             proc.stdin.write("\n")
@@ -304,12 +322,12 @@ class BenchCataloguesTest(PgTestCase):
         """Les schémas sans marqueur ne partent que sur l'assertion opérateur."""
         name = _name("operator")
         self._create(name)
-        time.sleep(1.1)
-        kept = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={name})
+        kept = bench_mod.purge_orphans(self.db, min_age_s=0.5, now=_aged(),
+                                       only={name})
         self.assertNotIn(name, kept.dropped)
         self.assertTrue(self._exists(name))
-        dropped = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={name},
-                                          admit_unmarked=True)
+        dropped = bench_mod.purge_orphans(self.db, min_age_s=0.5, now=_aged(),
+                                          only={name}, admit_unmarked=True)
         self.assertIn(name, dropped.dropped)
         self.assertFalse(self._exists(name))
 
@@ -385,6 +403,20 @@ class BenchCataloguesTest(PgTestCase):
         child.wait()
         dead = "ameesh-bench-owner pid=%d start=0" % child.pid
         self.assertFalse(bench_mod.owner_alive(dead))
+
+    def test_reused_pid_with_unknown_start_stays_dead(self) -> None:
+        """#5548 : un PID recyclé (vivant) ne ressuscite pas le propriétaire.
+
+        Le témoin d'orphelin pose ``start=0`` : le processus qui reprend le
+        numéro est vivant, mais son start réel est à des années de l'époque 0 ;
+        ``same_start`` refuse donc la preuve, qui reste morte. Un start réel
+        du processus mort, lui, serait exposé au recyclage dans la tolérance
+        d'une seconde.
+        """
+        self.assertTrue(bench_mod.platform_mod.alive(os.getpid()))
+        marker = "ameesh-bench-owner pid=%d start=0" % os.getpid()
+        self.assertEqual(bench_mod.owner_state(marker), bench_mod.OWNER_DEAD)
+        self.assertFalse(bench_mod.owner_alive(marker))
 
     def test_pgtestcase_schema_has_live_owner(self) -> None:
         """Le socle pose bien la preuve de propriété de son propre schéma."""
