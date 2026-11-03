@@ -318,21 +318,60 @@ def _attested_ids(rows) -> dict[str, int]:
 _DESCENDS: set = set()
 
 
-def _git_descends(ancestor: str, descendant: str) -> bool:
-    """#5558: `descendant` contains `ancestor`, read in this package's clone.
+def ancestry_repos(cfg=None) -> list[str]:
+    """#5558: local ameesh clones that can prove a commit's ancestry.
 
-    An installed package without its clone, an unknown commit or a git error
-    answer False: doubt never settles a failure (the alert stays)."""
-    if (ancestor, descendant) in _DESCENDS:
+    In order: the clone declared to the host (`radar.projects`, github
+    manaty/ameesh), the deployment clone beside the sealed venv
+    (`~/.local/share/ameesh/src`, fetched by every install, and the
+    `src-<sha7>` snapshot of a `venv-<sha7>`), then the source checkout this
+    module runs from. Only existing directories are kept; a non-repository
+    simply never proves anything.
+    """
+    found = []
+    if cfg is not None:
+        try:
+            from . import migrations
+            declared = migrations.checkout_for(migrations.AMEESH_REPO, cfg)
+        except Exception:  # noqa: BLE001 - a malformed radar proves nothing
+            declared = None
+        if declared:
+            found.append(Path(declared))
+    prefix = Path(sys.prefix).resolve()
+    found.append(prefix.parent / "src")
+    if prefix.name.startswith("venv-"):
+        found.append(prefix.parent / ("src-" + prefix.name[len("venv-"):]))
+    found.append(Path(__file__).resolve().parents[2])
+    out = []
+    for path in found:
+        if path.is_dir() and str(path) not in out:
+            out.append(str(path))
+    return out
+
+
+def git_descends(repos):
+    """#5558: `descends(ancestor, descendant)` over `repos`.
+
+    Any clone that proves the ancestry settles; an unknown commit, a
+    non-repository or a git error answer False: doubt never settles a
+    failure (the alert stays)."""
+    def descends(ancestor: str, descendant: str) -> bool:
+        if (ancestor, descendant) in _DESCENDS:
+            return True
+        from . import canon
+        if not any(canon.git_contains(repo, ancestor, descendant)
+                   for repo in repos):
+            return False
+        if len(_DESCENDS) >= 1024:
+            _DESCENDS.clear()
+        _DESCENDS.add((ancestor, descendant))
         return True
-    from . import canon
-    if not canon.git_contains(str(Path(__file__).resolve().parents[2]),
-                              ancestor, descendant):
-        return False
-    if len(_DESCENDS) >= 1024:
-        _DESCENDS.clear()
-    _DESCENDS.add((ancestor, descendant))
-    return True
+    return descends
+
+
+def _git_descends(ancestor: str, descendant: str) -> bool:
+    """Default ancestry, over the clones found without configuration."""
+    return git_descends(ancestry_repos())(ancestor, descendant)
 
 
 def _step(data: dict, host: str) -> tuple[str, str]:
@@ -395,7 +434,7 @@ def findings(rows: list[dict], *, now: float, attested=(),
     interrupted (#4898 N2). An attestation settles a run only when it was
     written after that run's snapshot. #5558: a failure is also settled
     host by host (`_repaired`); `descends(ancestor, descendant)`
-    defaults to git ancestry in this package's clone.
+    defaults to git ancestry in the clones of `ancestry_repos()`.
     """
     latest, ids = _latest_runs(rows)
     proofs = _attested_ids(attested)
@@ -536,7 +575,7 @@ def request_findings(rows: list[dict], *, now: float, attested=(),
     return out
 
 
-def alerts(db, *, now: float) -> list[dict]:
+def alerts(db, *, now: float, cfg=None) -> list[dict]:
     # Do not swallow a read failure: the caller must keep the alert family
     # unreadable instead of resolving an existing alert through absence.
     events = storage.of(db).events
@@ -571,9 +610,12 @@ def alerts(db, *, now: float) -> list[dict]:
                 break
             limit = min(limit * 2, HISTORY_MAX)
         requests.extend(history)
-    return (findings(rows, now=now, attested=attested)
+    # #5558: the host's clones, not this module's path: the sealed venv's
+    # site-packages is not a repository.
+    descends = git_descends(ancestry_repos(cfg))
+    return (findings(rows, now=now, attested=attested, descends=descends)
             + request_findings(requests, now=now, attested=attested,
-                               sequences=rows))
+                               sequences=rows, descends=descends))
 
 
 def main(argv=None) -> int:

@@ -617,25 +617,67 @@ class HostRepairTest(unittest.TestCase):
             [failed, deferred_only, healthy], now=250,
             descends=self.descends), [])
 
-    def test_default_ancestry_reads_the_package_clone_and_fails_closed(self):
-        failed = self.failed({"vm-1": {"stage": "installer", "verdict": "ko"}})
-        later = self.later(2, {"vm-1": self.OK})
-        staging_watch._DESCENDS.clear()
-        with mock.patch("ameesh.canon.git_contains",
-                        return_value=False) as contains:
+    @staticmethod
+    def git(repo, *args):
+        import subprocess
+        return subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=t", "-c",
+             "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+             *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def test_installed_layout_proves_ancestry_in_the_deployment_clone(self):
+        """The sealed venv's site-packages is not a repository: the clone
+        beside the venv (`~/.local/share/ameesh/src`) proves the ancestry."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            clone = root / "src"
+            clone.mkdir()
+            self.git(clone, "init", "-q")
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "a")
+            old = self.git(clone, "rev-parse", "HEAD")
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "b")
+            new = self.git(clone, "rev-parse", "HEAD")
+            (root / "venv-1234567").mkdir()
+            with mock.patch.object(staging_watch.sys, "prefix",
+                                   str(root / "venv-1234567")):
+                repos = staging_watch.ancestry_repos()
+            self.assertEqual(repos[0], str(clone.resolve()))
+            staging_watch._DESCENDS.clear()
+            descends = staging_watch.git_descends(repos)
+            self.assertTrue(descends(old, new))
+            self.assertFalse(descends(new, old))
+            failed = row(1, run="failed-run", state="failed", sha=old,
+                         hosts={"vm-1": {"stage": "installer", "verdict": "ko"}})
+            later = self.later(2, {"vm-1": self.OK,
+                                   "pc-smichea": self.DEFERRED}, sha=new)
+            self.assertEqual(staging_watch.findings(
+                [failed, later], now=250, descends=descends), [])
+            # without the deployment clone, nothing proves it: alert kept
+            staging_watch._DESCENDS.clear()
             self.assertEqual(len(staging_watch.findings(
-                [failed, later], now=250)), 1)
-        repo, ancestor, descendant = contains.call_args.args
-        self.assertTrue((Path(repo) / "src/ameesh/staging_watch.py").exists())
-        self.assertEqual((ancestor, descendant), ("a" * 40, "b" * 40))
+                [failed, later], now=250,
+                descends=staging_watch.git_descends([str(root / "venv-1234567")]))), 1)
+            # a proof is cached, a refusal is not
+            self.assertTrue(descends(old, new))
+            with mock.patch("ameesh.canon.git_contains") as contains:
+                self.assertTrue(descends(old, new))
+            contains.assert_not_called()
         staging_watch._DESCENDS.clear()
-        with mock.patch("ameesh.canon.git_contains", return_value=True):
-            self.assertEqual(staging_watch.findings([failed, later], now=250), [])
-        # a refusal is not cached; a proof is
-        with mock.patch("ameesh.canon.git_contains") as contains:
-            self.assertEqual(staging_watch.findings([failed, later], now=250), [])
-        contains.assert_not_called()
-        staging_watch._DESCENDS.clear()
+
+    def test_declared_clone_comes_first_and_alerts_use_the_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch("ameesh.migrations.checkout_for",
+                            return_value=folder) as checkout:
+                repos = staging_watch.ancestry_repos(cfg="cfg")
+            checkout.assert_called_once_with("manaty/ameesh", "cfg")
+            self.assertEqual(repos[0], folder)
+        with mock.patch.object(staging_watch.storage, "of") as factory, \
+                mock.patch.object(staging_watch, "ancestry_repos",
+                                  return_value=[]) as found:
+            events = factory.return_value.events
+            events.latest_type.return_value = []
+            staging_watch.alerts(None, now=250, cfg="cfg")
+        found.assert_called_once_with("cfg")
 
 
 class BoundsTest(unittest.TestCase):
