@@ -160,6 +160,13 @@ class CommitTest(unittest.TestCase):
 
 PYTHONS_ROOT = ('/usr/bin/python3', '/usr/local/bin/python3')
 
+SONDE_ROOT = (
+    'import platform, sys, venv, ensurepip; '
+    'print(platform.python_version()); '
+    'print("%d.%d" % sys.version_info[:2]); '
+    'print(sys._base_executable)')
+SONDE_VERSION = 'import platform; print(platform.python_version())'
+
 
 def _fichier_root(chemin):
     """Un fichier root, non modifiable par autrui."""
@@ -181,6 +188,35 @@ def _dossier_root(chemin):
             and not info.st_mode & 0o022 and not info.st_mode & 0o7000)
 
 
+def _environnement_sonde(home):
+    """L'environnement de la production, sans celui du banc.
+
+    setup-python exporte LD_LIBRARY_PATH vers la libpython du runner : hérité,
+    il fait charger une autre libpython au Python système et le fait annoncer
+    à la version du banc. La production, elle, tourne dans cet environnement
+    propre ; la sonde doit mesurer exactement comme elle.
+    """
+    return module._construction()._base_env(Path(home))
+
+
+def _mesurer_python(python, code):
+    """Les lignes imprimées par ``python -I -c code``, ou None.
+
+    L'appel est isolé (-I) et tourne dans l'environnement de la production.
+    """
+    with tempfile.TemporaryDirectory(prefix='5666-sonde-') as home:
+        try:
+            sonde = subprocess.run(
+                [str(python), '-I', '-c', code], capture_output=True,
+                timeout=120, check=False,
+                env=_environnement_sonde(Path(home)))
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    if sonde.returncode != 0:
+        return None
+    return sonde.stdout.decode('utf-8', 'replace').split()
+
+
 def _python_root():
     """Le Python système root du banc, ou None.
 
@@ -195,35 +231,44 @@ def _python_root():
             continue
         if not (_dossier_root(chemin.parent) and _fichier_root(resolu)):
             continue
+        lignes = _mesurer_python(chemin, SONDE_ROOT)
+        if lignes is None or len(lignes) != 3:
+            continue
+        version, mineure, base_brute = lignes
+        if mineure != '%d.%d' % sys.version_info[:2]:
+            continue
         try:
-            sonde = subprocess.run(
-                [str(chemin), '-c',
-                 'import platform, sys, venv, ensurepip; '
-                 'print(platform.python_version()); '
-                 'print("%d.%d" % sys.version_info[:2]); '
-                 'print(sys._base_executable)'],
-                capture_output=True, timeout=120, check=False,
-                env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
-        except (OSError, subprocess.TimeoutExpired):
+            base = Path(base_brute).resolve(strict=True)
+        except OSError:
             continue
-        lignes = sonde.stdout.decode('utf-8', 'replace').split()
-        if (sonde.returncode != 0 or len(lignes) != 3
-                or lignes[1] != '%d.%d' % sys.version_info[:2]):
-            continue
-        base = Path(lignes[2])
         if not (base.is_absolute() and _dossier_root(base.parent)
                 and _fichier_root(base)):
             continue
-        return str(chemin), lignes[0]
+        return str(chemin), version
     return None
 
 
+def _version_python(python):
+    """La version que la production mesurera pour cet interpréteur, ou None."""
+    lignes = _mesurer_python(python, SONDE_VERSION)
+    if lignes is None or len(lignes) != 1:
+        return None
+    return lignes[0]
+
+
 def _python_du_banc():
-    """(python, version, vérifie_root) des productions jetables du test."""
+    """(python, version, vérifie_root) des productions jetables du test.
+
+    La version vient d'une sonde dans l'environnement de la production : celle
+    du banc (``platform.python_version()``) peut mentir quand setup-python a
+    exporté LD_LIBRARY_PATH.
+    """
     trouve = _python_root()
     if trouve is not None:
         return trouve[0], trouve[1], True
-    return sys.executable, platform.python_version(), False
+    return (sys.executable,
+            _version_python(sys.executable) or platform.python_version(),
+            False)
 
 
 @contextlib.contextmanager
@@ -575,6 +620,26 @@ class InterpreteurTest(unittest.TestCase):
         with self.assertRaisesRegex(
                 module.Ecart, 'home de l’interpréteur non root'):
             module._interpreteur(venv)
+
+
+class SondeTest(unittest.TestCase):
+    """La sonde mesure comme la production, pas comme le banc.
+
+    En CI, setup-python exporte LD_LIBRARY_PATH vers la libpython du runner ;
+    hérité, il faisait annoncer 3.12.15 au Python système 3.12.3, alors que la
+    production, dans un environnement propre, mesurait 3.12.3.
+    """
+
+    def test_environnement_de_la_sonde_sans_celui_du_banc(self):
+        with tempfile.TemporaryDirectory(prefix='5666-sonde-') as home:
+            with mock.patch.dict(os.environ, {
+                    'LD_LIBRARY_PATH': '/outil/lib',
+                    'PYTHONHOME': '/outil',
+                    'PYTHONPATH': 'src'}):
+                env = _environnement_sonde(Path(home))
+        self.assertNotIn('LD_LIBRARY_PATH', env)
+        self.assertNotIn('PYTHONHOME', env)
+        self.assertNotIn('PYTHONPATH', env)
 
 
 class ProductionTest(unittest.TestCase):
