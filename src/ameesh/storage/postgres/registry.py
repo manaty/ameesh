@@ -346,6 +346,26 @@ def name_lock_key(name: str) -> str:
 # lignes du registre
 # --------------------------------------------------------------------------
 
+#: L125 : un message PASSIF — accusé, copie, diffusion à tous, conflit signalé
+#: par le radar (L160c), échec de CI sans référence de la base (L161c),
+#: information sans geste attendu (#3451), jamais urgent —
+#: n'ouvre pas de tour à lui seul (même règle que `mail.passive_reason`).
+#: `{t}` : l'alias de la table `agent_mailbox` (`PASSIVE_SQL.format(t="mb")`).
+#: #3741 : l'index partiel `agent_mailbox_passive_unread_idx` (0489) porte ce
+#: prédicat au mot près ; le changer appelle une migration de l'index.
+#: #3923 : son complément `agent_mailbox_unread_active_idx` (0495) porte la
+#: négation, pour le compte des non-lus actifs de `operations.listing` ;
+#: le changer appelle aussi une migration de cet index.
+PASSIVE_SQL = (
+    "(NOT {t}.payload @> '{{\"urgent\": true}}'::jsonb"
+    " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
+    " OR {t}.payload @> '{{\"broadcast\": true}}'::jsonb"
+    " OR {t}.payload @> '{{\"ci_passif\": true}}'::jsonb"
+    " OR {t}.payload @> '{{\"info\": true}}'::jsonb"
+    " OR coalesce({t}.payload->>'cc', '') <> ''"
+    " OR coalesce(jsonb_typeof({t}.payload->'radar'), '') = 'object'))")
+
+
 #: #5101 : `overview()` lit les colonnes absentes de la vue figée
 #: (`review_hold`, `retired_at`, `harness_bin`, les six colonnes de pause) sur
 #: UNE latérale par ligne (`j.__row`), partagée par toutes les projections :
@@ -354,12 +374,24 @@ def name_lock_key(name: str) -> str:
 #: l'auditeur : 9 évaluations par ligne faisaient passer overview() de
 #: ~0,2-0,8 s à ~1,8-2,0 s sur la base commune). Une colonne additive absente
 #: d'un schéma en retard laisse NULL au lieu de lever 42703 (#5099).
+#:
+#: #5586 (diagnostic #5579 : 373 ms à vide, 2,6 s sous charge) : la même
+#: latérale porte aussi les colonnes du registre que la vue n'a pas (alias,
+#: `relit`, `session_harness`, passage de l'exécuteur) et le prédicat de
+#: réclamation, au lieu de six relectures de `agent_registry` par ligne ;
+#: `canon_state` est lu par UNE latérale (clé primaire `host, canon`) au lieu
+#: de trois sous-requêtes ; les deux comptes de courrier (`unread`,
+#: `passive_unread`) viennent d'UN agrégat groupé des non-remis, joint une
+#: fois : la vue n'est plus lue pour ces deux colonnes, dont les
+#: sous-requêtes par agent ne sont alors pas évaluées (vue aplatie). Mêmes
+#: prédicats que la vue (0483) ; le dernier dépôt (#3337/#3729) est lu par
+#: une seule latérale sur l'index `(sender, id desc)`.
 OVERVIEW_SQL = ("""
             SELECT name,
                    (j.__row->>'review_hold')::jsonb AS review_hold,
-                   (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
+                   j.aliases,
                    -- #3185 : projets relus hors équipe (la vue ne porte pas la colonne)
-                   (SELECT r.relit FROM agent_registry r WHERE r.name=o.name) AS relit,
+                   j.relit,
                    -- #3460 : retrait (la vue ne porte pas la colonne)
                    extract(epoch from (j.__row->>'retired_at')::timestamptz)::float8
                        AS retired_ts,
@@ -372,16 +404,13 @@ OVERVIEW_SQL = ("""
                    -- `last_seen` (hook/exécuteur). L'index (sender, id desc)
                    -- rend la lecture ponctuelle ; une identité `externe` écrit
                    -- sans exécuteur, son `last_seen` ne bouge donc pas.
-                   (SELECT extract(epoch from m.created_at)::float8
-                      FROM agent_mailbox m WHERE m.sender = o.name
-                     ORDER BY m.id DESC LIMIT 1) AS last_mail_ts,
                    -- #3729 : l'hôte du dernier dépôt, pour nommer un signe de
                    -- vie venu d'ailleurs que l'hôte déclaré.
-                   (SELECT m.host FROM agent_mailbox m WHERE m.sender = o.name
-                     ORDER BY m.id DESC LIMIT 1) AS last_mail_host,
+                   lm.last_mail_ts, lm.last_mail_host,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
-                   public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
-                   passive_unread,
+                   public_key_fingerprint, key_role, key_ready, has_owner_key,
+                   coalesce(mb.n_unread, 0) AS unread,
+                   coalesce(mb.n_passive_unread, 0) AS passive_unread,
                    responsible, team, projects, provider, credential_mode, capabilities,
                    -- #4779 : les rôles déclarés, requis pour la désignation des
                    -- relecteurs (la vue les porte depuis 0483)
@@ -389,12 +418,7 @@ OVERVIEW_SQL = ("""
                    canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    mode, stop_reason, canon,
-                   (SELECT extract(epoch from r.runner_seen_at)::float8
-                      FROM agent_registry r WHERE r.name = o.name) AS runner_seen_ts,
-                   (SELECT r.runner_seen_host FROM agent_registry r
-                     WHERE r.name = o.name) AS runner_seen_host,
-                   (SELECT r.runner_seen_owner FROM agent_registry r
-                     WHERE r.name = o.name) AS runner_seen_owner,
+                   j.runner_seen_ts, j.runner_seen_host, j.runner_seen_owner,
                    -- #5101 : ces colonnes ne sont pas dans la vue figée et
                    -- peuvent manquer sur un schéma en retard (42703 sinon).
                    (j.__row->>'operator_paused')::boolean AS operator_paused,
@@ -406,33 +430,45 @@ OVERVIEW_SQL = ("""
                    extract(epoch from (j.__row->>'operator_pause_until')::timestamptz)::float8
                        AS operator_pause_until_ts,
                    __GOVERNED__ AS canon_governed,
-                   (SELECT s.status FROM canon_state s WHERE s.host = o.host
-                       AND s.canon = coalesce(o.canon, '')) AS canon_status,
-                   (SELECT s.diagnostic FROM canon_state s
-                     WHERE s.host = o.host
-                       AND s.canon = coalesce(o.canon, '')) AS canon_diagnostic,
-                   (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
-                     WHERE s.host = o.host
-                       AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
+                   cs.canon_status, cs.canon_diagnostic, cs.canon_checked_ts,
                    -- L165 (EP1) : la vue est figée à sa création et ne porte
                    -- pas `releve`/`candidats` ; le prédicat les lit sur la
-                   -- ligne du registre, sous-requête plutôt qu'une jointure
-                   -- pour ne pas qualifier toutes les colonnes de la vue.
-                   (SELECT __CLAIM_OK__ FROM agent_registry r
-                     WHERE r.name = o.name) AS canon_claim_ok,
-                   -- #1250 : le harnais de la session VIVANTE (0384), absent de
-                   -- la vue dont les colonnes sont figées à sa création ;
-                   -- sous-requête pour ne pas qualifier toutes les colonnes.
-                   (SELECT r.session_harness FROM agent_registry r
-                     WHERE r.name = o.name) AS session_harness
+                   -- ligne du registre, dans la latérale.
+                   j.canon_claim_ok,
+                   -- #1250 : le harnais de la session VIVANTE (0384)
+                   j.session_harness
             FROM agent_mesh_overview o
             LEFT JOIN LATERAL (
-                SELECT to_jsonb(agent_registry) AS __row
+                SELECT to_jsonb(agent_registry) AS __row,
+                       agent_registry.aliases, agent_registry.relit,
+                       extract(epoch from agent_registry.runner_seen_at)::float8
+                           AS runner_seen_ts,
+                       agent_registry.runner_seen_host,
+                       agent_registry.runner_seen_owner,
+                       agent_registry.session_harness,
+                       __CLAIM_OK__ AS canon_claim_ok
                   FROM agent_registry WHERE name = o.name
                  OFFSET 0) j ON true
+            LEFT JOIN LATERAL (
+                SELECT s.status AS canon_status, s.diagnostic AS canon_diagnostic,
+                       extract(epoch from s.checked_at)::float8 AS canon_checked_ts
+                  FROM canon_state s
+                 WHERE s.host = o.host AND s.canon = coalesce(o.canon, '')) cs ON true
+            LEFT JOIN LATERAL (
+                SELECT extract(epoch from m.created_at)::float8 AS last_mail_ts,
+                       m.host AS last_mail_host
+                  FROM agent_mailbox m WHERE m.sender = o.name
+                 ORDER BY m.id DESC LIMIT 1) lm ON true
+            LEFT JOIN (
+                SELECT m.recipient, count(*) AS n_unread,
+                       count(*) FILTER (WHERE __PASSIVE__) AS n_passive_unread
+                  FROM agent_mailbox m
+                 WHERE m.delivered_at IS NULL
+                 GROUP BY m.recipient) mb ON mb.recipient = o.name
             ORDER BY last_seen_ts DESC NULLS LAST
             """.replace("__GOVERNED__", canon_governed_sql("o"))
-               .replace("__CLAIM_OK__", canon_claim_predicate_sql("r")))
+               .replace("__CLAIM_OK__", canon_claim_predicate_sql("agent_registry"))
+               .replace("__PASSIVE__", PASSIVE_SQL.format(t="m")))
 
 
 class Agents(interface.Agents):
