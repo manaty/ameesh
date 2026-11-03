@@ -261,7 +261,7 @@ class CoveredRedTest(unittest.TestCase):
         self.assertEqual(
             set(incident.covering_lots(store, app="ameesh",
                                        modules=["tests.test_5587_tmp_path_filter"])),
-            {"test_5587_tmp_path_filter"})
+            {"tests.test_5587_tmp_path_filter"})
 
     def test_a_closed_lot_superseded_by_an_open_one_covers(self):
         closed = lot(5600, "INCIDENT CI main rouge — run 41598021698",
@@ -319,6 +319,37 @@ class CoveredRedTest(unittest.TestCase):
         near = lot(5700, "Test test_5582_rattrapage_relecture_bis : autre chose")
         out, add, _note = self.consume([near], ["tests/test_5582_rattrapage_relecture.py"])
         add.assert_called_once()
+
+    def nexlink(self, rows, footprint=()):
+        return types.SimpleNamespace(
+            work=_Work(rows),
+            work_footprints=types.SimpleNamespace(for_items=lambda ids: [
+                {"work_item_id": lot_id, "path": path} for lot_id, path in footprint]))
+
+    def test_a_qualified_path_in_the_title_covers(self):
+        store = self.nexlink([lot(7001, "Corriger web/auth/session.test.ts", app="nexlink")])
+        self.assertEqual(set(incident.covering_lots(
+            store, app="nexlink", modules=["web/auth/session.test.ts"])),
+            {"web/auth/session.test.ts"})
+
+    def test_negative_a_namesake_in_another_folder_does_not_cover_by_title(self):
+        """B1 de ameesh-cx1 : le correctif du mobile ne couvre pas le site."""
+        store = self.nexlink([lot(7001, "Corriger mobile/auth/session.test.ts",
+                                  app="nexlink")])
+        self.assertEqual(incident.covering_lots(
+            store, app="nexlink", modules=["website/auth/session.test.ts"]), {})
+
+    def test_negative_a_namesake_in_another_folder_does_not_cover_by_footprint(self):
+        store = self.nexlink([lot(7001, "Corriger la session", app="nexlink")],
+                             footprint=[(7001, "mobile/auth/session.test.ts")])
+        self.assertEqual(incident.covering_lots(
+            store, app="nexlink", modules=["website/auth/session.test.ts"]), {})
+
+    def test_negative_a_path_is_not_the_tail_of_a_longer_path(self):
+        store = self.nexlink([lot(7001, "Corriger mobile/web/auth/session.test.ts",
+                                  app="nexlink")])
+        self.assertEqual(incident.covering_lots(
+            store, app="nexlink", modules=["web/auth/session.test.ts"]), {})
 
     def test_negative_a_short_key_is_never_searched(self):
         self.assertEqual(incident.test_key("mobile/src/a.test.ts"), "a.test")

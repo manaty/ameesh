@@ -180,7 +180,7 @@ COVER_SCAN = 500
 
 
 def test_key(module: str) -> str:
-    """#5627 : le nom qui désigne un fichier de test dans un lot.
+    """#5627 : le nom court d'un fichier de test (affichage, garde de longueur).
 
     `tests/test_5582_x.py` → `test_5582_x` ; un module Python pointé
     (`tests.test_5582_x`) → `test_5582_x` ; `mobile/src/a.test.ts` →
@@ -197,29 +197,82 @@ def test_key(module: str) -> str:
     return name
 
 
-def _mentions(text: str, key: str) -> bool:
-    """`key` cité comme un mot entier (`tests.test_x.Classe` cite `test_x`,
-    `test_x2` ne le cite pas)."""
-    return re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(key), text or "") is not None
+def _strip_ext(path: str) -> tuple[str, str]:
+    """`(chemin sans extension de code, extension)` ; `("", "")` sans extension connue."""
+    stem, dot, ext = path.rpartition(".")
+    if dot and "/" not in ext and ext.lower() in _TEST_EXTENSIONS:
+        return stem, ext.lower()
+    return "", ""
+
+
+def test_identity(module: str) -> tuple[frozenset, bool]:
+    """#5627 (B1 de ameesh-cx1) : les écritures d'un même fichier de test, et
+    si elles sont qualifiées.
+
+    Un chemin (`web/auth/session.test.ts`) ne se reconnaît que sous sa forme
+    qualifiée (avec ou sans extension ; pour Python, aussi pointée :
+    `tests.test_x`) : deux fichiers homonymes de dossiers différents ne se
+    couvrent jamais. Un module Python pointé se reconnaît aussi en chemin.
+    Seul un nom nu (le relevé ne dit pas son dossier) se cherche par son nom."""
+    path = _norm(module)
+    if "/" in path:
+        stem, ext = _strip_ext(path)
+        names = {path}
+        if stem:
+            names.add(stem)
+            if ext == "py":
+                names.add(stem.replace("/", "."))
+        return frozenset(names), True
+    stem, _ext = _strip_ext(path)
+    if not stem and re.fullmatch(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)+", path):
+        slashed = path.replace(".", "/")
+        return frozenset((path, slashed, slashed + ".py")), True
+    return frozenset(name for name in (path, stem) if name), False
+
+
+def _mentions(text: str, name: str, qualified: bool) -> bool:
+    """`name` cité entier : un chemin qualifié n'est pas la fin d'un autre
+    chemin (`mobile/web/x` ne cite pas `web/x`) ; un nom nu peut suivre un
+    dossier ou un paquet (`tests.test_x.Classe` cite `test_x`). Dans les deux
+    cas, un nom plus long (`test_x2`, `x/suite`) ne le cite pas."""
+    before = r"(?<![\w/.-])" if qualified else r"(?<![\w-])"
+    return re.search(before + re.escape(name) + r"(?![\w/-])", text or "") is not None
+
+
+def _footprint_covers(paths, names: frozenset, qualified: bool) -> bool:
+    """L'empreinte porte le fichier : le même chemin qualifié, ou, pour un nom
+    nu, un fichier de ce nom."""
+    for path in paths or ():
+        if qualified:
+            stem, _ext = _strip_ext(path)
+            if path in names or (stem and stem in names):
+                return True
+        elif test_key(path) in names or posixpath.basename(path) in names:
+            return True
+    return False
 
 
 def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
-    """#5627 : `{clé de test: lot ouvert}` pour chaque test en échec déjà
+    """#5627 : `{module en échec: lot ouvert}` pour chaque test en échec déjà
     porté par un lot ouvert du même projet (`app` connu et égal : un lot sans
     projet, ou un appel sans projet, ne couvre rien).
 
     Un lot porte un test quand son titre ou son corps le cite, quand son
     empreinte contient le fichier, ou quand un lot fermé qui le cite a été
-    remplacé (`superseded_by`) par ce lot ouvert. Le plus ancien l'emporte.
-    Une clé trop courte n'est jamais cherchée. Une lecture impossible rend
-    `{}` : mieux vaut un incident en double qu'un rouge perdu."""
-    keys = []
+    remplacé (`superseded_by`) par ce lot ouvert. Un chemin ne se reconnaît que
+    qualifié (`test_identity`). Le plus ancien l'emporte. Un nom de moins de
+    `TEST_KEY_MIN` caractères n'est jamais cherché. Une lecture impossible
+    rend `{}` : mieux vaut un incident en double qu'un rouge perdu."""
+    wanted: dict = {}
     for module in attributable(modules):
-        key = test_key(module)
-        if len(key) >= TEST_KEY_MIN and key not in keys:
-            keys.append(key)
+        if len(test_key(module)) < TEST_KEY_MIN:
+            continue
+        names, qualified = test_identity(module)
+        names = frozenset(name for name in names if len(name) >= TEST_KEY_MIN)
+        if names:
+            wanted[module] = (names, qualified)
     reader = getattr(getattr(st, "work", None), "items", None)
-    if not keys or reader is None:
+    if not wanted or reader is None:
         return {}
     rows: dict = {}
     try:
@@ -239,20 +292,24 @@ def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
         try:
             for line in footprints(sorted(rows)) or ():
                 paths.setdefault(int(line["work_item_id"]), set()).add(
-                    test_key(str(line.get("path") or "")))
+                    _norm(str(line.get("path") or "")))
         except Exception:  # noqa: BLE001 - sans empreinte, le texte suffit
             paths = {}
     found: dict = {}
 
-    def keep(key: str, lot: int) -> None:
-        if key not in found or lot < int(found[key]["id"]):
-            found[key] = rows[lot]
+    def keep(module: str, lot: int) -> None:
+        if module not in found or lot < int(found[module]["id"]):
+            found[module] = rows[lot]
+
+    def cited(text: str, names: frozenset, qualified: bool) -> bool:
+        return any(_mentions(text, name, qualified) for name in names)
 
     for lot, row in rows.items():
         text = "%s\n%s" % (row.get("title") or "", row.get("body") or "")
-        for key in keys:
-            if _mentions(text, key) or key in paths.get(lot, ()):
-                keep(key, lot)
+        for module, (names, qualified) in wanted.items():
+            if cited(text, names, qualified) \
+                    or _footprint_covers(paths.get(lot), names, qualified):
+                keep(module, lot)
     try:
         closed = reader(state=work.lifecycle.CLOSED, assignee=None,
                         limit=SUPERSEDED_SCAN) or ()
@@ -263,16 +320,15 @@ def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
         if target in (None, "") or int(target) not in rows:
             continue
         text = "%s\n%s" % (row.get("title") or "", row.get("body") or "")
-        for key in keys:
-            if _mentions(text, key):
-                keep(key, int(target))
+        for module, (names, qualified) in wanted.items():
+            if cited(text, names, qualified):
+                keep(module, int(target))
     return found
 
 
 def _uncovered(modules: Iterable[str], covered: dict) -> list[str]:
     """Les modules en échec qu'aucun lot ouvert ne porte."""
-    return [module for module in attributable(modules)
-            if test_key(module) not in covered]
+    return [module for module in attributable(modules) if module not in covered]
 
 
 def _lot_of(commit: dict) -> Optional[int]:
