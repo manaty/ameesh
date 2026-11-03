@@ -136,7 +136,9 @@ class Housekeeping(interface.Housekeeping):
 
     def purge_retention(self) -> None:
         self.db.execute(
-            "DELETE FROM housekeeping_log WHERE at < now() - interval '30 days'", ())
+            "DELETE FROM housekeeping_log"
+            " WHERE (at AT TIME ZONE 'UTC')"
+            " < ((now() - interval '30 days') AT TIME ZONE 'UTC')", ())
 
     def recent(self, host, since_s, limit=50, kind=None) -> list[dict]:
         where, params = "", [float(since_s)]

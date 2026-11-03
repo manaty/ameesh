@@ -47,9 +47,9 @@ class RetentionSqlTest(PgTestCase):
     def test_migration_adds_the_time_index(self):
         rows = self.db.query(
             "SELECT indexdef FROM pg_indexes WHERE schemaname = %s"
-            " AND indexname = 'housekeeping_log_at_idx'", (self.schema,))
+            " AND indexname = 'housekeeping_log_retention_utc_idx'", (self.schema,))
         self.assertEqual(len(rows), 1)
-        self.assertIn('(at)', rows[0]['indexdef'])
+        self.assertIn("at AT TIME ZONE 'UTC'", rows[0]['indexdef'])
 
     def test_retention_keeps_recent_rows_and_log_does_not_delete_old_rows(self):
         self.db.execute('DELETE FROM housekeeping_log')
@@ -63,13 +63,40 @@ class RetentionSqlTest(PgTestCase):
         self.assertEqual({r['host'] for r in self.db.query('SELECT host FROM housekeeping_log')},
                          {'recent', 'h'})
 
+    def test_retention_uses_same_instant_cutoff_in_non_utc_timezone(self):
+        if not isinstance(self.db, db_mod.PsycopgDriver):
+            self.skipTest('SET TIME ZONE needs a persistent session')
+        original = self.db.query("SELECT current_setting('TimeZone') AS zone")[0]['zone']
+        self.db.execute("SET TIME ZONE 'Pacific/Chatham'")
+        try:
+            self.db.execute('DELETE FROM housekeeping_log')
+            self.db.execute(
+                "INSERT INTO housekeeping_log (host, at, kind, action) VALUES"
+                " ('expired', now() - interval '30 days' - interval '1 minute', 'tmp', 'deleted'),"
+                " ('retained', now() - interval '30 days' + interval '1 minute', 'cache', 'deleted')")
+            storage.of(self.db).housekeeping.purge_retention()
+            self.assertEqual([r['host'] for r in self.db.query('SELECT host FROM housekeeping_log')],
+                             ['retained'])
+        finally:
+            self.db.query("SELECT set_config('TimeZone', %s, false)", (original,))
+
     def test_empty_purge_uses_time_index_on_500000_rows(self):
         if not isinstance(self.db, db_mod.PsycopgDriver):
             self.skipTest('EXPLAIN is wrapped by the psql driver')
         self.db.execute('DELETE FROM housekeeping_log')
-        self.db.execute("INSERT INTO housekeeping_log (host, at, kind, action)"
-                        " SELECT 'h', now() - make_interval(secs => g), 'tmp', 'measured'"
-                        " FROM generate_series(1, 500000) g")
+        # Fixture-only bulk load: the spelling trigger is irrelevant here;
+        # inherited statement timeouts must not make host load a test failure.
+        timeout = self.db.query("SELECT current_setting('statement_timeout') AS timeout")[0]['timeout']
+        self.db.execute('ALTER TABLE housekeeping_log DISABLE TRIGGER ameesh_agent_spelling')
+        try:
+            db_mod.execute_without_statement_timeout(
+                self.db,
+                "INSERT INTO housekeeping_log (host, at, kind, action)"
+                " SELECT 'h', now() - make_interval(secs => g), 'tmp', 'measured'"
+                " FROM generate_series(1, 500000) g")
+        finally:
+            self.db.execute('ALTER TABLE housekeeping_log ENABLE TRIGGER ameesh_agent_spelling')
+            self.db.query("SELECT set_config('statement_timeout', %s, false)", (timeout,))
         self.db.execute('ANALYZE housekeeping_log')
         # Capture the actual production SQL rather than duplicate its predicate.
         capture = mock.Mock()
@@ -80,7 +107,7 @@ class RetentionSqlTest(PgTestCase):
         if isinstance(plan, str):
             plan = json.loads(plan)
         document = json.dumps(plan)
-        self.assertIn('housekeeping_log_at_idx', document)
+        self.assertIn('housekeeping_log_retention_utc_idx', document)
         self.assertIn('Index Scan', document)
         self.assertNotIn('housekeeping_log_kind_host_time_idx', document)
         self.assertNotIn('Seq Scan', document)
