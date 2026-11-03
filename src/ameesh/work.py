@@ -401,9 +401,30 @@ def check_wait_note(cfg, db, actor: str, text: str, *,
             "\"hold: <reason>\" to hold (or \"unhold: <reason>\" to lift); "
             "variants such as \"hold :\", \"hold (pilote) :\" or \"Hold —\" "
             "stay ordinary notes and stop nothing (#3373)")
-    if planned_waits.is_hold_note(text) and claims_pilot(cfg, db, actor):
-        return corrector(cfg, db, actor, what="hold", history=False)
+    if planned_waits.is_hold_note(text):
+        if claims_pilot(cfg, db, actor):
+            return corrector(cfg, db, actor, what="hold", history=False)
+        return actor
     return actor
+
+
+def hold_lift_warning(db, item_id: int, text: str) -> str:
+    """#5484 : l'avertissement d'une levée de hold annoncée en prose.
+
+    La note est écrite : rien ne la refuse, mais elle ne lève rien. Quand un
+    hold est encore actif, l'appelant (la CLI) affiche la forme exacte
+    `unhold: <raison>` et les auteurs des retenues, au lieu de laisser le débit
+    garder l'attente active. Rend une chaîne vide quand il n'y a rien à dire."""
+    from . import planned_waits
+    if not planned_waits.announces_lift(text):
+        return ""
+    holds = _active_holds(db, item_id)
+    if not holds:
+        return ""
+    return ("the note announces a hold lift in prose, which lifts nothing: lot "
+            "%s is still held by %s. Write exactly \"unhold: <reason>\" "
+            "(ameesh work note %s \"unhold: <reason>\") to lift it (#5484)"
+            % (item_id, _hold_holders(holds), item_id))
 
 
 def forcer(cfg, db, explicit: str | None = None) -> str:

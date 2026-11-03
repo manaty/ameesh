@@ -12,7 +12,8 @@
 #   - l'utilisateur Unix `ameesh`, ameesh dans /opt/ameesh/venv, sa configuration ;
 #   - le gabarit systemd ameesh-runner@<persona> (un exécuteur par persona) ;
 #   - la sauvegarde quotidienne de la base (locale, et hors de la VM si
-#     /etc/ameesh/sauvegarde.env existe).
+#     /etc/ameesh/sauvegarde.env existe) ;
+#   - le relevé de l'hôte toutes les 5 minutes (#5559 : disque de la base).
 # Le résumé (clé publique WireGuard, suite) est écrit dans /root/ameesh-serveur.txt.
 set -euo pipefail
 
@@ -172,6 +173,13 @@ install -m 0644 "$SRC/deploy/serveur/ameesh-sauvegarde.service" "$SRC/deploy/ser
   /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now ameesh-sauvegarde.timer
+
+# --- relevé de l'hôte (#5559) ----------------------------------------------------
+log "relevé de l'hôte toutes les 5 minutes (disque de la base)"
+install -m 0644 "$SRC/deploy/serveur/ameesh-releve-hote.service" "$SRC/deploy/serveur/ameesh-releve-hote.timer" \
+  /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ameesh-releve-hote.timer
 
 # --- résumé --------------------------------------------------------------------
 IP=$(curl -fsS --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')

@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# #5559 : relevé de l'hôte du serveur du mesh (disques, mémoire, processus),
+# publié dans `host_resources` comme celui d'un exécuteur (`publish@<hôte>`),
+# pour que `host_disk_soon_full` (#2022) et `ameesh hosts --fleet` voient le
+# disque de la base. Service SYSTÈME sous `ameesh`, en lecture seule : aucun
+# secret au-delà de l'accès à la base de config.json/.pgpass. Si un exécuteur
+# de l'hôte publie déjà, `--publish` ne relève rien.
+#
+#   systemctl enable --now ameesh-releve-hote.timer
+#   journalctl -u ameesh-releve-hote -n 5
+
+[Unit]
+Description=ameesh — relevé de l'hôte du serveur du mesh (#5559)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ameesh
+Group=ameesh
+WorkingDirectory=/home/ameesh
+Environment=PATH=/home/ameesh/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/ameesh/venv/bin/ameesh hosts --publish
+TimeoutStartSec=120
+Nice=10
+NoNewPrivileges=yes

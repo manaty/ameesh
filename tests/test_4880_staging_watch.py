@@ -542,6 +542,144 @@ class WatchTest(unittest.TestCase):
                                  staging_watch.HISTORY_LIMIT * 2])
 
 
+class HostRepairTest(unittest.TestCase):
+    """#5558: a failure is settled host by host by later descendant runs."""
+
+    OK = {"stage": "sante", "verdict": "ok"}
+    DEFERRED = {"stage": "absent", "verdict": "reporte"}
+    VMS = ("ameesh-agents-1", "ameesh-agents-2", "ameesh-agents-3",
+           "manaty-mesh-1")
+
+    @staticmethod
+    def descends(ancestor, descendant):
+        return (ancestor, descendant) in {("a" * 40, "b" * 40),
+                                          ("a" * 40, "a" * 40)}
+
+    def failed(self, hosts):
+        return row(1, run="failed-run", state="failed", hosts=hosts)
+
+    def later(self, ident, hosts, *, sha="b" * 40, state="partial"):
+        return row(ident, run="later-%d" % ident, state=state, sha=sha,
+                   notify="executor", hosts=hosts)
+
+    def test_partial_run_with_workstation_deferred_clears_the_failure(self):
+        failed = self.failed({"ameesh-agents-1": self.OK,
+                              "ameesh-agents-2": {"stage": "controler",
+                                                  "verdict": "ko"}})
+        later = self.later(2, dict({vm: self.OK for vm in self.VMS},
+                                   **{"pc-smichea": self.DEFERRED}))
+        self.assertEqual(staging_watch.findings(
+            [failed, later], now=250, descends=self.descends), [])
+        request = request_row(3, "r1", run="failed-run")
+        self.assertEqual(staging_watch.request_findings(
+            [request], now=250, sequences=[failed, later],
+            descends=self.descends), [])
+
+    def test_failure_on_the_workstation_is_cleared_once_it_is_deferred(self):
+        failed = self.failed({"pc-smichea": {"stage": "redemarrer",
+                                             "verdict": "ko"}})
+        later = self.later(2, {"ameesh-agents-1": self.OK,
+                               "pc-smichea": self.DEFERRED})
+        self.assertEqual(staging_watch.findings(
+            [failed, later], now=250, descends=self.descends), [])
+
+    def test_unrepaired_host_keeps_the_alert(self):
+        failed = self.failed({"vm-2": {"stage": "installer", "verdict": "ko"}})
+        later = self.later(2, {"vm-1": self.OK,
+                               "vm-2": {"stage": "sante", "verdict": "ko"}})
+        self.assertEqual(len(staging_watch.findings(
+            [failed, later], now=250, descends=self.descends)), 1)
+        request = request_row(3, "r1", run="failed-run")
+        self.assertEqual(len(staging_watch.request_findings(
+            [request], now=250, sequences=[failed, later],
+            descends=self.descends)), 1)
+        # the host repaired by a second later run settles it
+        again = self.later(4, {"vm-2": self.OK})
+        self.assertEqual(staging_watch.findings(
+            [failed, later, again], now=250, descends=self.descends), [])
+
+    def test_non_descendant_or_earlier_run_does_not_clear(self):
+        failed = self.failed({"vm-1": {"stage": "installer", "verdict": "ko"}})
+        other = self.later(2, {"vm-1": self.OK}, sha="c" * 40)
+        self.assertEqual(len(staging_watch.findings(
+            [failed, other], now=250, descends=self.descends)), 1)
+        earlier = dict(self.later(0, {"vm-1": self.OK}))
+        self.assertEqual(len(staging_watch.findings(
+            [failed, earlier], now=250, descends=self.descends)), 1)
+
+    def test_failure_before_any_host_needs_a_healthy_later_host(self):
+        failed = self.failed({})
+        deferred_only = self.later(2, {"pc-smichea": self.DEFERRED})
+        self.assertEqual(len(staging_watch.findings(
+            [failed, deferred_only], now=250, descends=self.descends)), 1)
+        healthy = self.later(3, {"vm-1": self.OK})
+        self.assertEqual(staging_watch.findings(
+            [failed, deferred_only, healthy], now=250,
+            descends=self.descends), [])
+
+    @staticmethod
+    def git(repo, *args):
+        import subprocess
+        return subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=t", "-c",
+             "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+             *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def test_installed_layout_proves_ancestry_in_the_deployment_clone(self):
+        """The sealed venv's site-packages is not a repository: the clone
+        beside the venv (`~/.local/share/ameesh/src`) proves the ancestry."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            clone = root / "src"
+            clone.mkdir()
+            self.git(clone, "init", "-q")
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "a")
+            old = self.git(clone, "rev-parse", "HEAD")
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "b")
+            new = self.git(clone, "rev-parse", "HEAD")
+            (root / "venv-1234567").mkdir()
+            with mock.patch.object(staging_watch.sys, "prefix",
+                                   str(root / "venv-1234567")):
+                repos = staging_watch.ancestry_repos()
+            self.assertEqual(repos[0], str(clone.resolve()))
+            staging_watch._DESCENDS.clear()
+            descends = staging_watch.git_descends(repos)
+            self.assertTrue(descends(old, new))
+            self.assertFalse(descends(new, old))
+            failed = row(1, run="failed-run", state="failed", sha=old,
+                         hosts={"vm-1": {"stage": "installer", "verdict": "ko"}})
+            later = self.later(2, {"vm-1": self.OK,
+                                   "pc-smichea": self.DEFERRED}, sha=new)
+            self.assertEqual(staging_watch.findings(
+                [failed, later], now=250, descends=descends), [])
+            # without the deployment clone, nothing proves it: alert kept
+            staging_watch._DESCENDS.clear()
+            self.assertEqual(len(staging_watch.findings(
+                [failed, later], now=250,
+                descends=staging_watch.git_descends([str(root / "venv-1234567")]))), 1)
+            # a proof is cached, a refusal is not
+            self.assertTrue(descends(old, new))
+            with mock.patch("ameesh.canon.git_contains") as contains:
+                self.assertTrue(descends(old, new))
+            contains.assert_not_called()
+        staging_watch._DESCENDS.clear()
+
+    def test_declared_clone_comes_first_and_alerts_use_the_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch("ameesh.migrations.checkout_for",
+                            return_value=folder) as checkout:
+                repos = staging_watch.ancestry_repos(cfg="cfg")
+            checkout.assert_called_once_with("manaty/ameesh", "cfg")
+            self.assertEqual(repos[0], folder)
+        with mock.patch.object(staging_watch.storage, "of") as factory, \
+                mock.patch.object(staging_watch, "ancestry_repos",
+                                  return_value=[]) as found:
+            events = factory.return_value.events
+            events.latest_type.return_value = []
+            staging_watch.alerts(None, now=250, cfg="cfg")
+        found.assert_called_once_with("cfg")
+
+
 class BoundsTest(unittest.TestCase):
     """#5450: the global bound, the operator delay and the unit bound agree."""
 
