@@ -14,7 +14,7 @@ from unittest import mock
 from ameesh import mail, registry
 from ameesh.runner import AgentWorker, Runner, write_worktree_marker
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, scaled
 
 
 class InterruptionTest(PgTestCase):
@@ -66,7 +66,7 @@ class InterruptionTest(PgTestCase):
                 thread.start()
                 time.sleep(0.4)
                 worker.request_preempt()
-                thread.join(timeout=6)
+                thread.join(timeout=scaled(6))
             self.assertEqual(resultat, [False])
             row = registry.get(self.db, "l11")
             self.assertEqual(row["pending_prompt"], "tour long")
@@ -87,7 +87,7 @@ class InterruptionTest(PgTestCase):
 
         def faux_log(message, *args, **kwargs):
             if "prioritaire" in str(message):
-                time.sleep(30)  # simule un tube plein
+                time.sleep(scaled(30))  # simule un tube plein
 
         try:
             with mock.patch.dict(os.environ, env, clear=False), \
@@ -97,7 +97,7 @@ class InterruptionTest(PgTestCase):
                 thread.start()
                 time.sleep(0.4)
                 worker.request_preempt()
-                thread.join(timeout=6)
+                thread.join(timeout=scaled(6))
             self.assertFalse(thread.is_alive(), "l'arrêt a été bloqué par un journal")
             self.assertEqual(resultat, [False])
         finally:
@@ -178,7 +178,7 @@ class InterruptionTest(PgTestCase):
                 thread.start()
                 time.sleep(0.4)
                 worker.request_preempt()
-                thread.join(timeout=6)
+                thread.join(timeout=scaled(6))
             self.assertEqual(resultat, [False])
             mail.send(self.db, "orch", "l11", "incident prioritaire", kind="event",
                       payload={"urgent": True})

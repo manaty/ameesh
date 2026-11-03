@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -19,7 +20,7 @@ from ameesh import canon, registry
 from ameesh.runner import AgentWorker, Runner
 
 from . import test_canon
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, scaled
 from .test_canon import write
 
 BANC = """---
@@ -213,6 +214,10 @@ class BoucleTest(PgTestCase):
         self.assertEqual(len(self.absent_logs()), 1)
         self.assertEqual(w._wd_delay, w.WORKDIR_BACKOFF_MIN)
         # sondages suivants : rien n'est consommé, pas de nouvelle ligne
+        # #5629 : l'échéance repart d'ici et suit l'échelle du banc — sous psql
+        # chargé, le premier tour et ces cinq sondages dépassent le délai
+        # minimal (5 s) ; `_wd_next = 0.0` plus bas reste l'échéance atteinte
+        w._wd_next = time.monotonic() + scaled(w.WORKDIR_BACKOFF_MIN)
         with mock.patch.object(w, "adopt_moved_worktree", return_value=None) as adopt:
             for _ in range(5):
                 self.assertIsNone(self.tour(w))

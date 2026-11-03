@@ -23,7 +23,7 @@ from ameesh import (config, db as db_mod, host_idle, host_lifecycle,
 from ameesh.mediated_executor import server as mediated_server
 from ameesh.runner import Runner
 
-from .support import PgTestCase
+from .support import PgTestCase, scaled
 
 
 class RunsEvidenceTest(unittest.TestCase):
@@ -175,7 +175,10 @@ class HostReleaseTest(PgTestCase):
             self.cfg, host="vm", resource_interval=60, idle_after_s=60,
             host_release_settle=0, host_release_drain_bound=3600,
             host_release_retry=1, host_release_interval=0,
-            lifecycle_hook_timeout=5,
+            # #5629 : un crochet retenu par une barrière est tué passé ce délai
+            # (puis `busy`) ; sous psql chargé, la fenêtre entre la barrière
+            # et ses assertions dépasse 5 s : le délai suit l'échelle du banc
+            lifecycle_hook_timeout=scaled(5),
             lifecycle_hooks={"vm": "%s %s" % (sys.executable, self.script)})
 
     def _restore_env(self):
@@ -529,7 +532,7 @@ class HostReleaseTest(PgTestCase):
         thread = threading.Thread(target=scan, daemon=True)
         thread.start()
         marker = barrier + ".started"
-        deadline = time.time() + 15
+        deadline = time.time() + scaled(15)  # #5629 : borne haute
         while not os.path.exists(marker) and time.time() < deadline:
             time.sleep(0.05)
         self.assertTrue(os.path.exists(marker),
@@ -543,7 +546,7 @@ class HostReleaseTest(PgTestCase):
         self.assertFalse(control["claims_open"])
         self.assertNotIn("busy", self.states())
         open(barrier + ".release", "w").close()
-        thread.join(30)
+        thread.join(scaled(30))
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(self.control()["release_state"], "idle-drained")

@@ -46,7 +46,7 @@ import sys
 from ameesh import canon, mail, receipts, registry
 
 from . import banc_v1
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, scaled
 from .test_canon import EXAMPLE, commit_all, git, publish
 from .webauthn_soft import ORIGIN, RP_ID
 
@@ -123,9 +123,10 @@ class BoutEnBoutTest(PgTestCase):
         return proc
 
     def run_approve(self, *args: str) -> subprocess.CompletedProcess:
+        # #5629 : borne haute seule — mise à l'échelle du banc (psql chargé)
         proc = subprocess.run([sys.executable, "-m", "ameesh.approve", *args],
-                              capture_output=True, text=True, timeout=60, env=self.e(),
-                              cwd=self.tmp)
+                              capture_output=True, text=True, timeout=scaled(60),
+                              env=self.e(), cwd=self.tmp)
         self.assertEqual(proc.returncode, 0, "ameesh-approve %s\n%s%s"
                          % (" ".join(args), proc.stdout, proc.stderr))
         return proc

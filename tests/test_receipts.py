@@ -21,7 +21,7 @@ from unittest import mock
 from ameesh import cose, jcs, p256, receipts, signing
 from ameesh import db as db_mod
 
-from .support import TEST_DSN, PgTestCase, apply_authenticators
+from .support import TEST_DSN, PgTestCase, apply_authenticators, scaled
 from .webauthn_soft import (
     ORIGIN, RP_ID, SoftDevice, SoftEd25519, SoftES256Key, SoftWebAuthn, b64u, cbor,
     make_receipt, make_request, new_action_id, sha,
@@ -1293,10 +1293,11 @@ class DeadlineRaceTest(StandingBase):
     réussit.
     """
 
-    #: secondes entre la préparation de la course et l'échéance
-    MARGIN = 4
+    #: secondes entre la préparation de la course et l'échéance ; #5629 : à
+    #: l'échelle du banc (sous psql chargé, la préparation en prend plusieurs)
+    MARGIN = int(scaled(4))
     #: échéance des témoins : bien après la fin de l'attente
-    LATER = 60
+    LATER = int(scaled(60))
 
     def clock(self) -> float:
         """L'heure réelle de la BASE (celle des contrôles SQL)."""
