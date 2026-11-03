@@ -4993,12 +4993,16 @@ class Housekeeping(Domain):
     @abc.abstractmethod
     def latest_by_path(self, host: str | None, kind: str,
                        *, since_s: float | None = None,
-                       only_paths_with: Sequence[str] | None = None) -> list[dict]:
+                       only_paths_with: Sequence[str] | None = None,
+                       path: str | None = None) -> list[dict]:
         """#222: the last line of each (host, path) of this `kind` (of the host
         if given). Without `since_s`, no time window nor limit: only the
         retention of the log bounds it; with it (#2851), the lines older than
         `since_s` seconds are left out — a caller that ignores them anyway
         does not sort the whole journal.
+
+        `path` (#5587) restricts the read to this exact path (including an
+        empty string); with a host, only one latest row is read.
 
         `only_paths_with` (#2851) restricts the result to the paths that have
         at least one line whose `action` is in this set. The line returned is
