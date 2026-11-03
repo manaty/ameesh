@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import time
 import unittest
+from unittest import mock
 
 from ameesh import exploitation, notify, storage
 
@@ -24,6 +25,11 @@ class ProfilConfineTest(PgTestCase):
         for table in ("account_identities", "credential_health"):
             self.db.execute("DELETE FROM %s" % table)
         self.now = float(int(time.time()))
+        # la topologie du banc : « poste » est intermittent (policy.intermittent)
+        postes = mock.patch.object(exploitation, "_intermittent_hosts",
+                                   lambda cfg, hosts: set(hosts) & {"poste"})
+        postes.start()
+        self.addCleanup(postes.stop)
 
     def _declare(self, host, harness, account, ago_s=0.0, identity="x"):
         self.db.execute(
@@ -101,6 +107,31 @@ class ProfilConfineTest(PgTestCase):
         self._mesh()
         self._declare("poste", "codex", "primaire", ago_s=0)
         self.assertEqual(self._alertes(), [])
+
+    def test_poste_allume_et_sain_ne_couvre_pas_les_vm(self):
+        """B1 (ameesh-cx1) : le poste allumé déclare primaire + secondaire, sain ;
+        les VM n'ont toujours que primaire — l'alerte reste, même clé."""
+        self._mesh()
+        avant = [exploitation.alert_key(a) for a in self._alertes()]
+        self._declare("poste", "codex", "primaire", ago_s=0)
+        self._declare("poste", "codex", "secondaire", ago_s=0)
+        self._sante("poste", "primaire")
+        self._sante("poste", "secondaire")
+        alertes = self._alertes()
+        self.assertEqual([exploitation.alert_key(a) for a in alertes], avant)
+        self.assertEqual(alertes[0]["carriers"], list(VMS))
+
+    def test_hote_intermittent_lu_dans_la_topologie(self):
+        """Le critère vient des fiches Host (`policy.intermittent`), pas d'un nom."""
+        mock.patch.stopall()
+        limites = {"poste": {"intermittent": True}, "vm-1": {"intermittent": False}}
+        with mock.patch("ameesh.canon.load_configured", return_value=["c"]), \
+                mock.patch("ameesh.resources.host_limits",
+                           side_effect=lambda canons, h: limites[h]):
+            self.assertEqual(exploitation._intermittent_hosts(self.cfg, {"poste", "vm-1"}),
+                             {"poste"})
+        with mock.patch("ameesh.canon.load_configured", side_effect=OSError("canon")):
+            self.assertEqual(exploitation._intermittent_hosts(self.cfg, {"poste"}), set())
 
     def test_harnais_que_personne_ne_fait_tourner(self):
         self._declare("poste", "codex", "secondaire", ago_s=7 * 24 * HOUR)

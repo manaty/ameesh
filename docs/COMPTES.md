@@ -443,7 +443,10 @@ en base seulement — noms et états, jamais un dossier ni un identifiant :
   hôte pour le harnais (`account_identities`) ; un hôte éteint garde sa
   déclaration, un hôte qui retire le profil de sa configuration cesse de le
   déclarer ;
-* **porteurs** : les hôtes qui ont déclaré un compte de ce harnais depuis 24 h ;
+* **porteurs** : les hôtes qui ont déclaré un compte de ce harnais depuis 24 h,
+  hors hôtes **intermittents** de la topologie (`policy.intermittent: true` sur
+  leurs fiches Host, #5207) : un poste allumé qui déclare le profil ne le rend
+  pas utilisable aux VM, l'alerte reste ;
 * **utilisable** : connu d'un porteur, avec une ligne `credential_health` qui
   n'est pas `failing`.
 
