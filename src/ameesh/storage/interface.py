@@ -698,6 +698,10 @@ class PendingSpend(Domain):
     sont déjà durables. Ces extensions PostgreSQL sont locales : la CLI
     vérifie l'autorisation humaine, le stockage journalise et modifie dans
     la même transaction. Une résolution ne vaut que pour le marqueur exact.
+
+    #5565 : sans `report_ambiguous` (exécuteur médié), le runner tient un
+    signal local unique par marqueur au lieu de taire l'incident ; sans
+    `reconcile`, la CLI refuse par une erreur claire, jamais une traceback.
     """
 
     @abc.abstractmethod
