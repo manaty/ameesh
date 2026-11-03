@@ -356,14 +356,46 @@ def quote_ident(name: str) -> str:
     return '"%s"' % name
 
 
+def _array_literal(values) -> str:
+    """Tableau PostgreSQL (`'{…}'`) pour un paramètre `ANY(%s::T[])` (#5585).
+
+    Les éléments sont cités : `'{1,2}'` et `'{"1","2"}'` se lisent pareil pour
+    `bigint[]` comme pour `text[]`, et un texte contenant virgule, guillemet
+    ou barre oblique inverse reste un seul élément.
+    """
+    parts = []
+    for item in values:
+        if item is None:
+            parts.append("NULL")
+        elif isinstance(item, bool):
+            parts.append("TRUE" if item else "FALSE")
+        elif isinstance(item, int):
+            parts.append(str(item))
+        elif isinstance(item, float):
+            parts.append(repr(item))
+        elif isinstance(item, str):
+            text = item.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append('"%s"' % text)
+        else:
+            raise DbError("unsupported array element: %r" % (item,))
+    return "'{%s}'" % ",".join(parts)
+
+
 def sql_literal(value: Any) -> str:
-    """Littéral SQL échappé. Utilisé uniquement par le pilote psql."""
+    """Littéral SQL échappé. Utilisé uniquement par le pilote psql.
+
+    #5585 : une liste ou un couple devient un tableau PostgreSQL, pour que
+    `work_item_id = ANY(%s::bigint[])` se lie de la même façon sous psql et
+    sous psycopg (aucun SQL à 4 500 marqueurs).
+    """
     if value is None:
         return "NULL"
     if value is True:
         return "TRUE"
     if value is False:
         return "FALSE"
+    if isinstance(value, (list, tuple)):
+        return _array_literal(value)
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
