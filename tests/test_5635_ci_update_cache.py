@@ -101,6 +101,17 @@ class BaseTest(unittest.TestCase):
     def sans_processus(self):
         return mock.patch.object(disque, "_processus", return_value=[])
 
+    def avec_processus(self, processus):
+        """Recontrôle de suppression isolé des processus ambiants du banc.
+
+        Le banc de CI exécute le test depuis une vraie racine de runner : son
+        Worker, hors de `self.home`, serait « attribution impossible » et
+        préserverait le cache au recontrôle. Le test fournit donc le même
+        instantané aux deux contrôles ; la production, elle, relit /proc.
+        """
+        return mock.patch.object(disque, "_processus",
+                                 return_value=processus)
+
 
 class CacheInactifTest(BaseTest):
     def test_cache_installe_est_retire_et_conserve_les_versions(self):
@@ -183,7 +194,10 @@ class MiseAJourEnAttenteTest(BaseTest):
             [sys.executable, "-c", "import time; time.sleep(60)"], cwd=update)
         self.addCleanup(lambda: (processus.terminate(), processus.wait()))
         maintenant = time.time()
-        instantane = disque._processus(maintenant=maintenant)
+        # Ne garder que le témoin : le Worker du banc, hors de `self.home`,
+        # serait « attribution impossible » et masquerait la raison cherchée.
+        instantane = [vu for vu in disque._processus(maintenant=maintenant)
+                      if vu["pid"] == processus.pid]
         resultat, par_root = self.decision(processus=instantane,
                                            maintenant=maintenant)
         self.assertTrue(update.exists())
@@ -224,8 +238,9 @@ class MiseAJourEnAttenteTest(BaseTest):
         instantane = [{"pid": 43, "comm": "Runner.Worker",
                        "cwd": autre / "bin", "fds": [], "cmdline": [],
                        "depart": maintenant - 60, "etat": "R"}]
-        resultat, _ = self.decision(processus=instantane,
-                                    maintenant=maintenant)
+        with self.avec_processus(instantane):
+            resultat, _ = self.decision(processus=instantane,
+                                        maintenant=maintenant)
         self.assertFalse(update.exists())
         self.assertEqual(resultat["retires"], 1)
 
@@ -278,8 +293,9 @@ class MiseAJourEnAttenteTest(BaseTest):
         self.assertTrue(update.exists())
         self.assertIn("Worker actif", par_root["r1"]["raison"])
         instantane[0]["cmdline"] = [str(autre / "bin" / "Runner.Worker")]
-        resultat, _ = self.decision(processus=instantane,
-                                    maintenant=maintenant)
+        with self.avec_processus(instantane):
+            resultat, _ = self.decision(processus=instantane,
+                                        maintenant=maintenant)
         self.assertFalse(update.exists())
         self.assertEqual(resultat["retires"], 1)
 
@@ -289,8 +305,9 @@ class MiseAJourEnAttenteTest(BaseTest):
         maintenant = time.time()
         instantane = [{"pid": 46, "comm": "", "cwd": None, "fds": None,
                        "cmdline": None, "depart": None, "etat": "Z"}]
-        resultat, _ = self.decision(processus=instantane,
-                                    maintenant=maintenant)
+        with self.avec_processus(instantane):
+            resultat, _ = self.decision(processus=instantane,
+                                        maintenant=maintenant)
         self.assertFalse(update.exists())
         self.assertEqual(resultat["retires"], 1)
 
