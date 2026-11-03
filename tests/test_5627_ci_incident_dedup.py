@@ -289,6 +289,26 @@ class CoveredRedTest(unittest.TestCase):
         out, add, _note = self.consume([other], ["tests/test_5582_rattrapage_relecture.py"])
         add.assert_called_once()
 
+    def test_negative_a_lot_without_project_does_not_cover(self):
+        for app in (None, ""):
+            orphan = dict(FIX_5606, app=app)
+            out, add, _note = self.consume([orphan],
+                                           ["tests/test_5582_rattrapage_relecture.py"])
+            add.assert_called_once()
+
+    def test_negative_a_superseded_target_without_project_does_not_cover(self):
+        closed = lot(5600, "INCIDENT CI main rouge — run 41598021698",
+                     "Fichiers de test en échec :\n- `test_5587_tmp_path_filter`",
+                     state="closed", superseded_by=5599)
+        target = lot(5599, "Remplissage annulé (paquet #5596)", app=None)
+        out, add, _note = self.consume([closed, target], ["test_5587_tmp_path_filter"])
+        add.assert_called_once()
+
+    def test_negative_a_call_without_project_covers_nothing(self):
+        store = types.SimpleNamespace(work=_Work([FIX_5606]))
+        self.assertEqual(incident.covering_lots(
+            store, app="", modules=["tests/test_5582_rattrapage_relecture.py"]), {})
+
     def test_negative_a_delivered_fix_does_not_cover(self):
         delivered = dict(FIX_5606, state="delivered")
         out, add, _note = self.consume([delivered],

@@ -205,7 +205,8 @@ def _mentions(text: str, key: str) -> bool:
 
 def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
     """#5627 : `{clé de test: lot ouvert}` pour chaque test en échec déjà
-    porté par un lot ouvert du même projet.
+    porté par un lot ouvert du même projet (`app` connu et égal : un lot sans
+    projet, ou un appel sans projet, ne couvre rien).
 
     Un lot porte un test quand son titre ou son corps le cite, quand son
     empreinte contient le fichier, ou quand un lot fermé qui le cite a été
@@ -227,8 +228,9 @@ def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
                 rows[int(row["id"])] = row
     except Exception:  # noqa: BLE001 - lecture incomplète : rien n'est couvert
         return {}
-    rows = {lot: row for lot, row in rows.items()
-            if not (app and row.get("app") and row.get("app") != app)}
+    # même projet, connu des deux côtés : un lot sans projet n'exempte aucun
+    # rouge (B de cx3), ni comme lot direct ni comme cible d'un superseded_by
+    rows = {lot: row for lot, row in rows.items() if app and row.get("app") == app}
     if not rows:
         return {}
     paths: dict = {}
