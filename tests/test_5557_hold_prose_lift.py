@@ -4,11 +4,11 @@
 Le journal ne lit la levée que dans la forme exacte (`unhold:`, `hold
 lifted:`…). Une note qui annonce pourtant « le hold du staging est levé »
 n'arrêtait rien : le débit gardait l'attente active (#5484, deux holds restés
-deux heures après la levée annoncée). Le chemin d'écriture (`work note`, et la
-note de transition) refuse désormais cette annonce tant qu'un hold est actif,
-en citant la commande exacte `unhold: <raison>` ; sans hold actif, la note
-ordinaire passe, et une note qui dit qu'il n'est pas levé, qu'il le sera ou
-demande s'il l'est n'est pas une annonce.
+deux heures après la levée annoncée). La note est écrite (c'est une note
+ordinaire, le lot demandait un avertissement), mais la CLI cite alors la
+commande exacte `unhold: <raison>` et les auteurs des retenues actives ; sans
+hold actif, pas d'avertissement. Une note qui dit que le hold n'est pas levé,
+qu'il le sera, qu'il est maintenu ou qu'une levée est demandée n'annonce rien.
 """
 from __future__ import annotations
 
@@ -36,11 +36,12 @@ class ProseLiftPatternTest(unittest.TestCase):
                 "The holds have been released.",
                 "hold released",
                 "Holds levés.",
+                "Le hold est levé jusqu'à demain.",
         ):
             with self.subTest(text=text):
                 self.assertTrue(W.announces_lift(text))
 
-    def test_intentions_negations_and_questions_are_not_announcements(self):
+    def test_intentions_negations_requests_and_questions_are_not_announcements(self):
         for text in (
                 "Le hold peut être levé par le pilote.",
                 "Le hold n'est pas levé.",
@@ -54,9 +55,17 @@ class ProseLiftPatternTest(unittest.TestCase):
                 "Le hold reste à lever.",
                 "Le hold est-il levé ?",
                 "Je ne sais pas si le hold est levé.",
+                # B auditeur du 03/11 : conservation et demande, pas une
+                # levée acquise.
+                "hold maintenu jusqu'à la levée du gel",
+                "levée du hold demandée au pilote",
+                "La levée du hold est demandée au pilote.",
+                "levée du hold requise",
                 "the hold is not lifted",
                 "the hold will be lifted",
                 "the hold has not yet been released",
+                "the hold is maintained until the freeze is lifted",
+                "lift of the hold requested",
                 "le staging est levé",
                 "Relevé du staging : L2 reste.",
         ):
@@ -71,7 +80,7 @@ class ProseLiftPatternTest(unittest.TestCase):
 
 
 class ProseLiftWriteTest(PgTestCase):
-    """Le hold actif rend l'annonce en prose actionnable, pas silencieuse."""
+    """La note est écrite ; l'avertissement rend la levée actionnable."""
 
     def setUp(self):
         super().setUp()
@@ -91,88 +100,103 @@ class ProseLiftWriteTest(PgTestCase):
             [self.lot["id"]], W.HOLD_NOTE_PATTERNS)
         return W.active_holds(self.db, events).get(self.lot["id"], {})
 
-    def test_prose_lift_is_refused_while_a_hold_is_active(self):
+    def _warning(self, text: str) -> str:
+        return work.hold_lift_warning(self.db, self.lot["id"], text)
+
+    def test_prose_lift_is_written_with_a_warning_and_the_hold_stays(self):
         self._note("hold: staging hors créneau", actor="human:proprio")
-        with self.assertRaises(work.WorkError) as ctx:
-            self._note("Le hold du staging est levé.", actor="human:proprio")
-        message = str(ctx.exception)
-        self.assertIn("unhold: <reason>", message)
-        self.assertIn("#5484", message)
-        self.assertIn("human:proprio", message)
-        self.assertNotIn("Le hold du staging est levé.", self._notes())
+        text = "Le hold du staging est levé."
+        self.assertTrue(self._note(text, actor="human:proprio"))
+        self.assertIn(text, self._notes())
+        warning = self._warning(text)
+        self.assertIn("unhold: <reason>", warning)
+        self.assertIn("#5484", warning)
+        self.assertIn("human:proprio", warning)
         self.assertEqual(set(self._active()), {"human:proprio"})
 
-    def test_both_holds_stay_active_and_are_named(self):
+    def test_both_holds_are_named_and_stay_active(self):
         """Le cas de #5484 : deux retenues annoncées levées en prose."""
         self._note("hold: gestes owner", actor="human:proprio")
         self._note("hold: attente du paquet", actor="dev-a")
-        with self.assertRaises(work.WorkError) as ctx:
-            self._note("Holds périmés levés : les deux sont finis.",
-                       actor="human:proprio")
-        message = str(ctx.exception)
-        self.assertIn("human:proprio", message)
-        self.assertIn("dev-a", message)
+        text = "Holds périmés levés : les deux sont finis."
+        self.assertTrue(self._note(text, actor="human:proprio"))
+        warning = self._warning(text)
+        self.assertIn("human:proprio", warning)
+        self.assertIn("dev-a", warning)
         self.assertEqual(set(self._active()), {"human:proprio", "dev-a"})
 
-    def test_without_a_hold_the_prose_note_is_written(self):
-        self._note("Le hold du staging est levé.")
-        self.assertIn("Le hold du staging est levé.", self._notes())
+    def test_without_a_hold_there_is_no_warning(self):
+        text = "Le hold du staging est levé."
+        self._note(text)
+        self.assertIn(text, self._notes())
+        self.assertEqual(self._warning(text), "")
 
-    def test_non_announcements_are_written_under_a_hold(self):
+    def test_non_announcements_have_no_warning(self):
         self._note("hold: staging", actor="human:proprio")
         for text in ("Le hold n'est pas levé : L2 reste.",
                      "Le hold peut être levé par le pilote.",
+                     "Le hold est maintenu jusqu'à la levée du gel",
+                     "levée du hold demandée au pilote",
                      "Le hold est-il levé ?",
                      "Relevé du staging : L2 reste.",
                      "hold-up: staging"):
             with self.subTest(text=text):
                 self._note(text, actor="human:proprio")
                 self.assertIn(text, self._notes())
+                self.assertEqual(self._warning(text), "")
 
     def test_a_new_hold_note_may_recall_an_old_lift(self):
         self._note("hold: gestes owner", actor="human:proprio")
         text = "hold: L2 ; l'ancien hold du staging est levé"
         self._note(text, actor="human:proprio")
         self.assertIn(text, self._notes())
+        self.assertEqual(self._warning(text), "")
 
-    def test_exact_unhold_still_lifts(self):
+    def test_exact_unhold_still_lifts_without_a_warning(self):
         self._note("hold: staging", actor="human:proprio")
-        self._note("unhold: staging attesté", actor="human:proprio")
+        text = "unhold: staging attesté"
+        self._note(text, actor="human:proprio")
         self.assertEqual(self._active(), {})
-        self.assertIn("unhold: staging attesté", self._notes())
+        self.assertIn(text, self._notes())
+        self.assertEqual(self._warning(text), "")
 
-    def test_wake_note_is_refused_too(self):
+    def test_wake_note_is_written_and_warned(self):
         self._note("hold: staging", actor="human:proprio")
-        with self.assertRaisesRegex(work.WorkError, "#5484"):
-            self._note("Le hold est levé.", actor="human:proprio",
-                       wake_ts=time.time() + 3600)
-        self.assertNotIn("Le hold est levé.", self._notes())
+        text = "Le hold est levé."
+        self._note(text, actor="human:proprio", wake_ts=time.time() + 3600)
+        self.assertTrue(any(note.startswith(text) and "[réveil programmé:" in note
+                            for note in self._notes()))
+        self.assertIn("#5484", self._warning(text))
 
-    def test_a_state_change_still_lifts_before_a_prose_note(self):
+    def test_a_state_change_lifts_before_the_warning(self):
         self._note("hold: staging", actor="human:proprio")
         work.move(self.db, self.lot["id"], "build", actor="human:proprio")
         self.assertEqual(self._active(), {})
-        self._note("Le hold du staging est levé.", actor="human:proprio")
-        self.assertIn("Le hold du staging est levé.", self._notes())
+        text = "Le hold du staging est levé."
+        self._note(text, actor="human:proprio")
+        self.assertIn(text, self._notes())
+        self.assertEqual(self._warning(text), "")
 
-    def test_transition_note_is_refused_and_the_move_not_done(self):
+    def test_a_transition_note_is_written_and_the_state_lifts(self):
+        """La transition lève les holds : la note de move n'a rien à lever."""
         self._note("hold: staging", actor="human:proprio")
-        with self.assertRaisesRegex(work.WorkError, "#5484"):
-            work.move(self.db, self.lot["id"], "build",
-                      note="Le hold est levé, on passe en build.",
-                      actor="human:proprio")
-        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "intake")
-        self.assertEqual(set(self._active()), {"human:proprio"})
+        text = "Le hold est levé, on passe en build."
+        item = work.move(self.db, self.lot["id"], "build", note=text,
+                         actor="human:proprio")
+        self.assertEqual(item["state"], "build")
+        self.assertIn(text, self._notes())
+        self.assertEqual(self._active(), {})
 
-    def test_cli_exits_nonzero_and_names_the_exact_command(self):
+    def test_cli_returns_zero_writes_the_note_and_warns(self):
         self._note("hold: staging")
-        proc = self.mesh("work", "note", str(self.lot["id"]),
-                         "Le hold du staging est levé.",
+        text = "Le hold du staging est levé."
+        proc = self.mesh("work", "note", str(self.lot["id"]), text,
                          env=self.env(AGENT_MAIL_NAME="dev-a"))
-        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("note added", proc.stdout)
         self.assertIn("unhold: <reason>", proc.stderr)
         self.assertIn("#5484", proc.stderr)
-        self.assertNotIn("Le hold du staging est levé.", self._notes())
+        self.assertIn(text, self._notes())
 
 
 if __name__ == "__main__":

@@ -88,25 +88,33 @@ _HOLD_LIKE = re.compile(r"^hold(?=[\s:(])", re.I)
 #: staging est levé », « holds lifted ») ne lève rien : le journal ne lit que
 #: la forme exacte `_LIFT`. Le chemin d'écriture prévient quand un hold est
 #: actif sur le lot et que la note annonce pourtant sa levée. Le mot de levée
-#: et le hold sont lus dans la même phrase ; les mots entre eux (ou juste avant
-#: le premier) disent si la levée est acquise — `pas`, `peut être`, `sera`,
-#: `une fois`… ne l'annoncent pas.
+#: et le hold sont lus dans la même phrase ; les mots autour disent si la
+#: levée est acquise — `pas`, `peut être`, `sera`, `une fois`, `jusqu'à`,
+#: `demandée`… ne l'annoncent pas.
 _HOLD_WORD = re.compile(r"\bholds?\b", re.I)
 _LIFT_WORD = re.compile(r"\b(?:lev[ée]e?s?|lifted|released|cleared)\b", re.I)
 _WORD = re.compile(r"\w+(?:['’\-]\w+)*", re.UNICODE)
 _NOT_ANNOUNCED = frozenset((
     # négation
     "pas", "jamais", "plus", "guère", "aucun", "aucune", "ni", "not", "never",
-    # modal, futur, condition
+    # modal, futur, condition, conservation
     "peut", "peuvent", "pourrait", "pourraient", "doit", "doivent",
     "devrait", "devraient", "devra", "devront", "sera", "seront",
     "serait", "seraient", "être", "va", "vont", "aller", "bientôt",
     "prochainement", "avant", "quand", "lorsque", "si", "fois", "après",
     "dès", "reste", "rester", "resterait", "resteront", "encore",
-    "toujours", "train", "point", "soit", "soient",
+    "toujours", "train", "point", "soit", "soient", "jusqu'à",
+    "maintenu", "maintenue", "maintenus", "maintenues", "garde", "gardé",
+    "gardée", "gardés", "gardées",
     # anglais
     "will", "would", "should", "must", "may", "might", "can", "could",
-    "be", "being", "yet", "still",
+    "be", "being", "yet", "still", "until",
+))
+#: une levée **demandée** n'est pas une levée faite (le débit conseille
+#: justement de la demander) ; le mot suit souvent le hold.
+_NOT_CLAIMED_AFTER = frozenset((
+    "demande", "demandé", "demandée", "demandés", "demandées", "demander",
+    "requis", "requise", "requises", "requested", "asked", "ask",
 ))
 
 
@@ -117,7 +125,7 @@ def announces_lift(text) -> bool:
     lifted:`…). Le chemin d'écriture s'en sert pour prévenir, quand un hold est
     actif, au lieu de laisser le débit garder l'attente. Une forme exacte n'est
     jamais une annonce en prose ; une négation, un modal, un futur, une
-    condition ou une question n'en sont pas une non plus."""
+    condition, une demande ou une question n'en sont pas une non plus."""
     value = str(text or "").strip()
     if not value or is_hold_note(value) or is_lift_note(value):
         return False
@@ -136,11 +144,15 @@ def announces_lift(text) -> bool:
                 continue
             first, last = min(index, hold), max(index, hold)
             span = words[first + 1:last]
-            context = words[max(0, first - 2):first]
-            if any(token in _NOT_ANNOUNCED for token in span + context):
+            before = words[max(0, first - 2):first]
+            after = words[last + 1:last + 3]
+            around = span + before
+            if any(token in _NOT_ANNOUNCED for token in around):
+                continue
+            if any(token in _NOT_CLAIMED_AFTER for token in after):
                 continue
             if any(re.search(r"-(?:il|elle|on|ils|elles|ce)$", token)
-                   for token in span + context):
+                   for token in around):
                 continue                # inversion : une question
             return True
     return False

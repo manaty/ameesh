@@ -381,11 +381,7 @@ def check_wait_note(cfg, db, actor: str, text: str, *,
     L'auteur d'une retenue active peut lever la sienne (la passe de contenu
     #2744 le lui demande) ; les retenues des autres — pilote, humain, QA —
     restent actives et ne sont levées que par un pilote. Sans lot lu
-    (`item_id` absent), la levée reste réservée au pilote.
-
-    #5484 : une note qui annonce la levée en prose (« le hold du staging est
-    levé ») ne lève rien ; quand un hold est actif, elle est refusée avec la
-    forme exacte, au lieu de laisser le débit garder l'attente."""
+    (`item_id` absent), la levée reste réservée au pilote."""
     text = (text or "").strip()
     if not text:
         return actor
@@ -409,16 +405,26 @@ def check_wait_note(cfg, db, actor: str, text: str, *,
         if claims_pilot(cfg, db, actor):
             return corrector(cfg, db, actor, what="hold", history=False)
         return actor
-    if planned_waits.announces_lift(text):
-        holds = _active_holds(db, item_id)
-        if holds:
-            raise WorkError(
-                "note announces a hold lift in prose, but prose lifts nothing: "
-                "lot %s is still held by %s. Write exactly \"unhold: <reason>\" "
-                "to lift it (ameesh work note %s \"unhold: <reason>\"), or reword "
-                "the note without announcing the lift (#5484)"
-                % (item_id, _hold_holders(holds), item_id))
     return actor
+
+
+def hold_lift_warning(db, item_id: int, text: str) -> str:
+    """#5484 : l'avertissement d'une levée de hold annoncée en prose.
+
+    La note est écrite : rien ne la refuse, mais elle ne lève rien. Quand un
+    hold est encore actif, l'appelant (la CLI) affiche la forme exacte
+    `unhold: <raison>` et les auteurs des retenues, au lieu de laisser le débit
+    garder l'attente active. Rend une chaîne vide quand il n'y a rien à dire."""
+    from . import planned_waits
+    if not planned_waits.announces_lift(text):
+        return ""
+    holds = _active_holds(db, item_id)
+    if not holds:
+        return ""
+    return ("the note announces a hold lift in prose, which lifts nothing: lot "
+            "%s is still held by %s. Write exactly \"unhold: <reason>\" "
+            "(ameesh work note %s \"unhold: <reason>\") to lift it (#5484)"
+            % (item_id, _hold_holders(holds), item_id))
 
 
 def forcer(cfg, db, explicit: str | None = None) -> str:
@@ -4439,11 +4445,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     if stranger:
         text = "%s\n%s" % (text, stranger)
     from . import planned_waits
-    # #5484 : une annonce de levée en prose se juge sous le même verrou, pour
-    # lire les retenues actives sans course avec une pose intercalée.
     guarded = (planned_waits.is_hold_note(note)
-               or planned_waits.is_lift_note(note)
-               or planned_waits.announces_lift(note))
+               or planned_waits.is_lift_note(note))
     if guarded and not storage.is_remote(db):
         with db.transaction() as tx:
             locked = storage.of(tx).work.lock(item_id)
@@ -4579,11 +4582,8 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
     # dans la même transaction, sous le verrou de ligne du lot (le même que
     # `move`, `close_merged` et les autres notes hold/lift). Un hold intercalé
     # entre le contrôle et l'écriture ne peut donc plus être effacé.
-    # #5484 : une annonce de levée en prose se juge sous le même verrou, pour
-    # lire les retenues actives sans course avec une pose intercalée.
     guarded = (planned_waits.is_hold_note(note_text)
-               or planned_waits.is_lift_note(note_text)
-               or planned_waits.announces_lift(note_text))
+               or planned_waits.is_lift_note(note_text))
     cfg = getattr(db, "cfg", None)
     token_ts = _note_wake_at(text)
     if wake_ts is not None and token_ts is not None:
