@@ -82,7 +82,12 @@ class DownloadFailureTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             watcher = Watcher(types.SimpleNamespace(state_dir=tmp),
                 api=lambda _: {'status': 'completed', 'head_sha': 'abc', 'run_attempt': 1})
-            with mock.patch('ameesh.plan_github._json') as post:
+            # #5673: `Gh()` resolves a `gh` binary and raises without one (a CI
+            # part without it); the retry swallows that, so the client is
+            # doubled too, on the module object ci.py itself imports.
+            from ameesh import plan_github
+            with mock.patch.object(plan_github, 'Gh'), \
+                    mock.patch.object(plan_github, '_json') as post:
                 watcher._retry_download_jobs('org/repo', ROW, [JOB, dict(JOB, id=43)])
             self.assertEqual(post.call_count, 1)
             self.assertEqual(post.call_args.args[1],
