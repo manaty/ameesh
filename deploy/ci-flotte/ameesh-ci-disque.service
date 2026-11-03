@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #5630 : indépendant des jobs GitHub, sous le même uid (jamais root).
+[Unit]
+Description=ameesh CI — rétention et espace disque des runners
+After=docker.service
+
+[Service]
+Type=oneshot
+User=runner
+Group=runner
+EnvironmentFile=/etc/ameesh-ci-disque.env
+ExecStart=/usr/local/lib/ameesh-ci/ci-disque.py menage --force
+ExecStartPost=/usr/local/lib/ameesh-ci/ci-disque.py rapport --complet
+TimeoutStartSec=15min
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+# Ne pas isoler /proc ni /tmp : on doit voir les journaux ouverts et les
+# temporaires réels. Aucune suppression dans _work hors _temp, ni dans les
+# caches d'outils/actions/updaters.
