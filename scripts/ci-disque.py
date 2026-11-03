@@ -73,6 +73,9 @@ AGE_DIAG_JOURS = 7          # journaux du runner (_diag)
 AGE_INUTILISEES_HEURES = 168.0  # images sans conteneur (7 jours)
 MAX_VOLUMES_INSPECT = 100   # par appel docker (borne la ligne de commande)
 MAX_LIGNES_DFV = 400        # `docker system df -v` : les 400 premières lignes
+MAX_FICHIERS_DIAG = 128     # par passe : les fichiers _diag compressés ou retirés
+BUDGET_COMPRESSION_S = 120.0  # par passe : au-delà, la compression en cours est reprise
+BLOC_COMPRESSION = 8 * 1024 * 1024  # un membre gzip complet par bloc (reprise sûre)
 
 
 # --------------------------------------------------------------------------
@@ -581,19 +584,175 @@ def _journaux_ouverts(proc=Path("/proc")) -> set:
     return ouverts
 
 
-def _rotation_diag(dossiers, dry_run=False, *, maintenant=None) -> dict:
+ETAPE_DIAG = "_diag fermés >72 h compressés, archives >7 j retirées"
+
+
+def _fichier_partiel(chemin: Path) -> Path:
+    return chemin.with_name(chemin.name + ".gz.part")
+
+
+def _fichier_etat(chemin: Path) -> Path:
+    return chemin.with_name(chemin.name + ".gz.state")
+
+
+def _identite(info) -> dict:
+    """Ce qui identifie le contenu d'un fichier sans le lire (ctime compris)."""
+    return {cle: getattr(info, cle) for cle in
+            ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")}
+
+
+def _ecrire_etat(chemin: Path, etat: dict) -> None:
+    """Écrit l'état atomiquement : un kill laisse l'ancien état, jamais un mixte."""
+    temporaire = chemin.with_name(chemin.name + ".tmp")
+    try:
+        temporaire.write_text(json.dumps(etat), encoding="utf-8")
+        os.replace(temporaire, chemin)
+    except OSError:
+        temporaire.unlink(missing_ok=True)
+        raise
+
+
+def _lire_etat(chemin: Path, identite: dict) -> dict | None:
+    """L'état de reprise s'il décrit encore cette source, sinon None (résidu)."""
+    try:
+        etat = json.loads(chemin.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(etat, dict) or etat.get("identite") != identite
+            or type(etat.get("offset")) is not int or etat["offset"] < 0
+            or type(etat.get("part_size")) is not int or etat["part_size"] < 0):
+        return None
+    return etat
+
+
+def _compresser_partiel(chemin: Path, initial, *, debut: float, budget_s: float,
+                        taille_bloc: int) -> dict:
+    """Compresse par membres gzip complets, repris à la passe suivante.
+
+    Un membre gzip complet et un état écrit après chaque bloc : une passe qui
+    atteint le budget laisse une archive partielle valide et son offset, la
+    suivante continue au lieu de repartir de zéro. Un `.gz.part` sans état
+    lisible, ou d'une autre source, est jeté puis recompressé : il ne bloque
+    plus la rotation. Une source modifiée ou une archive déjà présente garde
+    le journal original et enlève le partiel.
+    """
+    partiel = _fichier_partiel(chemin)
+    etat_chemin = _fichier_etat(chemin)
+    identite = _identite(initial)
+    offset = 0
+    residu = False
+    if partiel.exists():
+        etat = _lire_etat(etat_chemin, identite)
+        if etat is None:
+            partiel.unlink(missing_ok=True)
+            etat_chemin.unlink(missing_ok=True)
+            residu = True
+        else:
+            offset = etat["offset"]
+            taille = partiel.stat().st_size
+            if taille < etat["part_size"]:
+                # Le partiel a été tronqué hors de notre contrôle : l'état ne
+                # décrit plus son contenu, on repart de zéro.
+                partiel.unlink(missing_ok=True)
+                etat_chemin.unlink(missing_ok=True)
+                offset, residu = 0, True
+            elif taille > etat["part_size"]:
+                # Processus tué entre l'écriture d'un membre complet et celle
+                # de l'état : le préfixe enregistré est fsynqué et valide, les
+                # octets au-delà ne sont pas référencés, on les coupe.
+                with partiel.open("r+b") as fichier:
+                    fichier.truncate(etat["part_size"])
+                    fichier.flush()
+                    os.fsync(fichier.fileno())
+    if offset > initial.st_size:
+        partiel.unlink(missing_ok=True)
+        etat_chemin.unlink(missing_ok=True)
+        offset, residu = 0, True
+
+    try:
+        with os.fdopen(os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
+            if _identite(os.fstat(source.fileno())) != identite:
+                partiel.unlink(missing_ok=True)
+                etat_chemin.unlink(missing_ok=True)
+                return {"termine": False, "partiel": False, "octets": 0,
+                        "residu": residu, "change": True}
+            source.seek(offset)
+            if initial.st_size == 0 and not partiel.exists():
+                # Un journal vide reste un journal : une archive gzip vide est
+                # valide et ne doit pas buter sur un partiel inexistant.
+                descripteur = os.open(partiel, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                      0o600)
+                with os.fdopen(descripteur, "wb") as sortie:
+                    with gzip.GzipFile(filename="", mode="wb", fileobj=sortie):
+                        pass
+                    sortie.flush()
+                    os.fsync(sortie.fileno())
+            while bloc := source.read(taille_bloc):
+                descripteur = os.open(partiel, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                                      0o600)
+                with os.fdopen(descripteur, "wb") as sortie:
+                    with gzip.GzipFile(filename="", mode="wb", fileobj=sortie) as gz:
+                        gz.write(bloc)
+                    sortie.flush()
+                    os.fsync(sortie.fileno())
+                offset += len(bloc)
+                _ecrire_etat(etat_chemin, {"identite": identite, "offset": offset,
+                                           "part_size": partiel.stat().st_size})
+                if time.monotonic() - debut >= budget_s:
+                    return {"termine": False, "partiel": True, "octets": 0,
+                            "residu": residu}
+            final = chemin.lstat()
+            if _identite(final) != identite:
+                partiel.unlink(missing_ok=True)
+                etat_chemin.unlink(missing_ok=True)
+                return {"termine": False, "partiel": False, "octets": 0,
+                        "residu": residu, "change": True}
+            archive = chemin.with_name(chemin.name + ".gz")
+            try:
+                os.link(partiel, archive)  # refuse une archive déjà présente
+            except FileExistsError:
+                partiel.unlink(missing_ok=True)
+                etat_chemin.unlink(missing_ok=True)
+                return {"termine": False, "partiel": False, "octets": 0,
+                        "residu": residu, "archive": True}
+            chemin.unlink()
+            partiel.unlink(missing_ok=True)
+            etat_chemin.unlink(missing_ok=True)
+            return {"termine": True, "partiel": False,
+                    "octets": max(0, initial.st_size - archive.stat().st_size),
+                    "residu": residu}
+    except OSError:
+        # Échec réel (disque plein, droit) : on jette le partiel pour ne pas
+        # tromper une reprise, et la source reste intacte.
+        partiel.unlink(missing_ok=True)
+        etat_chemin.unlink(missing_ok=True)
+        raise
+
+
+def _rotation_diag(dossiers, dry_run=False, *, maintenant=None,
+                   budget_s: float = BUDGET_COMPRESSION_S,
+                   taille_bloc: int = BLOC_COMPRESSION, ouverts=None) -> dict:
     """Logs fermés >72 h compressés ; archives gardées encore 7 jours.
 
     Ctime, pas mtime antidatable. Ne suit aucun lien, n'écrase aucune archive.
-    Budget 128 fichiers / 120 secondes par passe ; garde une source changée.
+    Budget 128 fichiers / 120 secondes par passe : le budget ne coupe
+    qu'entre deux fichiers ou dans une compression, qui laisse alors son état
+    pour la passe suivante (une passe fait toujours progresser un gros log).
     """
     debut = time.monotonic()
     maintenant = time.time() if maintenant is None else maintenant
-    ouverts = _journaux_ouverts()
-    compte = libere = 0
-    chemins = (p for d in dossiers for p in sorted(d.glob("*.log*")))
+    if ouverts is None:
+        ouverts = _journaux_ouverts()
+    compte = libere = partiels = residus = traites = 0
+    interrompu = False
+    chemins = [p for dossier in dossiers for p in sorted(dossier.glob("*.log*"))
+               if not p.name.endswith((".gz.part", ".gz.state", ".gz.state.tmp"))]
     for chemin in chemins:
-        if compte >= 128 or time.monotonic() - debut >= 120:
+        # `traites` : au moins une tentative par passe, même si le budget est
+        # déjà dépensé, pour que le gros log en cours avance toujours.
+        if compte >= MAX_FICHIERS_DIAG or (traites and
+                                           time.monotonic() - debut >= budget_s):
+            interrompu = True
             break
         initial = chemin.lstat()
         if (not chemin.name.startswith(("Runner_", "Worker_"))
@@ -607,42 +766,28 @@ def _rotation_diag(dossiers, dry_run=False, *, maintenant=None) -> dict:
                     chemin.unlink()
                     libere += initial.st_size
                 compte += 1
+                traites += 1
             continue
         if chemin.suffix != ".log" or age <= 72 * 3600:
             continue
         if dry_run:
             print("+ gzip " + str(chemin))
             compte += 1
+            traites += 1
             continue
-        archive = chemin.with_name(chemin.name + ".gz")
-        temporaire = chemin.with_name(chemin.name + ".gz.part")
-        cree = False
-        try:
-            with os.fdopen(os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
-                if os.fstat(source.fileno()) != initial:
-                    continue
-                fd = os.open(temporaire, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                cree = True
-                with os.fdopen(fd, "wb") as sortie:
-                    with gzip.GzipFile(filename="", mode="wb", fileobj=sortie) as gz:
-                        while bloc := source.read(1024 * 1024):
-                            gz.write(bloc)
-                            if time.monotonic() - debut >= 120:
-                                raise TimeoutError("budget de compression atteint")
-                final = chemin.lstat()
-                if any(getattr(final, k) != getattr(initial, k) for k in
-                       ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")):
-                    continue
-                os.link(temporaire, archive)  # refuse une archive déjà présente
-                chemin.unlink()
-                libere += max(0, initial.st_size - archive.stat().st_size)
-                compte += 1
-        except FileExistsError:
-            pass
-        finally:
-            if cree:
-                temporaire.unlink(missing_ok=True)
-    return {"fichiers": compte, "octets": libere}
+        resultat = _compresser_partiel(chemin, initial, debut=debut,
+                                       budget_s=budget_s, taille_bloc=taille_bloc)
+        traites += 1
+        residus += 1 if resultat.get("residu") else 0
+        if resultat["termine"]:
+            compte += 1
+            libere += resultat["octets"]
+        elif resultat["partiel"]:
+            partiels += 1
+            interrompu = True
+            break
+    return {"fichiers": compte, "octets": libere, "partiels": partiels,
+            "residus": residus, "interrompu": interrompu}
 
 
 def _diag(dry_run: bool) -> dict:
@@ -653,9 +798,27 @@ def _diag(dry_run: bool) -> dict:
                 "sortie": "RUNNER_WORKSPACE absent, étape sautée"}
     dossiers = [p for p in sorted(racine.parent.glob("*/_diag"))
                 if not p.is_symlink() and not p.parent.is_symlink()]
-    resultat = _rotation_diag(dossiers, dry_run)
-    return {"etape": "_diag fermés >72 h compressés, archives >7 j retirées", "libere": resultat["octets"],
-            "sortie": "%d fichier(s)" % resultat["fichiers"]}
+    try:
+        ouverts = _journaux_ouverts()
+    except PermissionError as erreur:
+        # #5633 : le refus est dit dans le rapport, la rotation n'est pas tentée.
+        return {"etape": ETAPE_DIAG, "libere": 0,
+                "sortie": "descripteurs des runners illisibles (PermissionError : %s) ; "
+                          "rotation non tentée" % erreur}
+    try:
+        resultat = _rotation_diag(dossiers, dry_run, ouverts=ouverts)
+    except PermissionError as erreur:
+        return {"etape": ETAPE_DIAG, "libere": 0,
+                "sortie": "lecture d'un journal refusée (PermissionError : %s) ; "
+                          "rotation interrompue" % erreur}
+    detail = "%d fichier(s)" % resultat["fichiers"]
+    if resultat["residus"]:
+        detail += ", %d résidu(s) .gz.part ignoré(s)" % resultat["residus"]
+    if resultat["partiels"]:
+        detail += ", %d compression(s) en cours" % resultat["partiels"]
+    if resultat["interrompu"]:
+        detail += " (budget atteint, reprise à la passe suivante)"
+    return {"etape": ETAPE_DIAG, "libere": resultat["octets"], "sortie": detail}
 
 
 def _tmp(dry_run: bool) -> dict:

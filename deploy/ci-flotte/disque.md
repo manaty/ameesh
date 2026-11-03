@@ -27,13 +27,21 @@ Les journaux `Runner_*.log` et `Worker_*.log` fermés sont compressés après
 72 h ; les archives restent encore 7 jours. Les liens sont ignorés. Les
 inodes ouverts par Listener/Worker sont gardés même s'ils sont anciens ;
 si leurs descripteurs sont illisibles, la rotation est abandonnée et le
-rapport l'indique. Vérifier ce point sur la première passe.
+rapport nomme le `PermissionError`. Vérifier ce point sur la première passe.
 
-Le budget de compression est de 128 fichiers / 120 secondes par passe.
-Une erreur, une source modifiée ou une archive existante conserve le log
-original. Le service a sa propre borne de 15 minutes. Le ménage docker garde
-les politiques existantes de #5325 ; les images étiquetées sans conteneur
-ne sont pas élaguées par cette passe (le workflow quotidien s'en charge).
+Le budget de compression est de 128 fichiers / 120 secondes par passe. La
+compression écrit des membres gzip complets et, après chaque bloc, un état
+`<journal>.gz.state` : une passe qui atteint le budget laisse un
+`<journal>.gz.part` valide et son offset, et la passe suivante **reprend**
+au lieu de repartir de zéro. Un `.gz.part` sans état lisible (résidu d'un
+processus tué) est jeté puis recompressé ; il ne bloque jamais la rotation.
+Un suffixe postérieur au dernier état enregistré est coupé avant reprise.
+Le rapport dit les fichiers déjà traités, les compressions en cours, les
+résidus ignorés et le budget atteint. Une erreur réelle, une source modifiée
+ou une archive existante conserve le log original et enlève le partiel.
+Le service a sa propre borne de 15 minutes. Le ménage docker garde les
+politiques existantes de #5325 ; les images étiquetées sans conteneur ne
+sont pas élaguées par cette passe (le workflow quotidien s'en charge).
 
 ## Surveillance via GitHub, sans identifiant nouveau sur les VM
 
@@ -60,10 +68,21 @@ récent. Une lecture ratée ne crée pas de faux relevé sain.
 Host du mesh (défauts 85 % utilisés ou moins de 15 Gio libres). Vérifier que
 les noms Host correspondent aux labels du workflow. Une sonde absente ou
 vieille de plus de deux heures lève `ci_disk_unreadable`. Avec la sonde
-horaire à :17, une seule exécution manquée peut déclencher cette alerte. Un dernier
-relevé bas reste signalé même quand il devient ancien ; seul un relevé sain
-plus récent résout le rouge. Les alertes ont une identité stable par VM et
-volume, indépendante du numéro de run.
+horaire à :17, une seule exécution manquée peut déclencher cette alerte. Une
+VM vue pour la première fois (`expect_disk`) a **deux heures de grâce** après
+sa première apparition avant que l'absence de première mesure n'alerte ; une
+mesure déjà reçue puis devenue vieille alerte toujours. Un dernier relevé bas
+reste signalé même quand il devient ancien ; seul un relevé sain plus récent
+résout le rouge. Les alertes ont une identité stable par VM et volume,
+indépendante du numéro de run.
+
+Une VM retirée de la matrice du workflow (labels) cesse d'apparaître dans les
+jobs lus. Sa ligne est **oubliée après 24 h** sans réapparition, avec ses
+alertes. Une lecture GitHub ratée n'appelle pas `collect`, donc n'oublie
+rien ; un job encore en file repousse la date de dernière apparition
+(`seen_at`), et un simple échec de sonde garde les dernières mesures basses
+au lieu de les effacer. Rien n'est oublié tant qu'aucun nom de job n'a été
+lu.
 
 Ne pas installer `hosts --publish`, de DSN central ou de clé SSH nouvelle
 sur les VM CI pour cette surveillance (direction mesh-design, 03/11/2026,

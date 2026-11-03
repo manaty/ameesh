@@ -5445,7 +5445,8 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def expect_disk(self, repo: str, *, host: str, volume: str) -> None:
-        """#5630 : attend une sonde ; ne remplace aucune mesure acquise."""
+        """#5630 : attend une sonde ; ne remplace aucune mesure acquise.
+        #5633 : repousse `seen_at`, dernière apparition de la VM dans les jobs."""
 
     @abc.abstractmethod
     def observe_disk(self, repo: str, *, host: str, volume: str, run_id: int,
@@ -5454,7 +5455,15 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def disks(self) -> list[dict]:
-        """#5630 : mesures via annotations GitHub (sampled_ts NULL si jamais reçue)."""
+        """#5630 : mesures via annotations GitHub (sampled_ts NULL si jamais reçue).
+        #5633 : `seen_ts` date la dernière apparition de la VM (grâce initiale,
+        oubli)."""
+
+    @abc.abstractmethod
+    def forget_disks(self, repo: str, hosts: Sequence[str], *, older_than_s: float) -> None:
+        """#5633 : oublie les volumes des VM de `repo` absentes des jobs `hosts`
+        depuis `older_than_s` ; une VM encore vue (`seen_at` récent) est gardée
+        même sans mesure fraîche (sonde cassée, lecture ratée)."""
 
     @abc.abstractmethod
     def prune_disks(self, repos: Sequence[str]) -> None:
