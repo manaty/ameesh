@@ -3,12 +3,26 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
+import time
 import unittest
 from unittest import mock
 
 from ameesh import db as db_mod, housekeeping as hk, storage
 from ameesh.storage.postgres.menage import Housekeeping
 from .support import PgTestCase
+
+
+class _Cfg:
+    """The fields of a host config the housekeeping pass reads (no DB)."""
+
+    def __init__(self, state_dir: str):
+        self.state_dir = state_dir
+        self.host = 'retention-outage'
+        self.dsn = 'host=db dbname=ameesh'
+        self.schema = 'test'
 
 
 class RetentionCallsTest(unittest.TestCase):
@@ -115,3 +129,39 @@ class RetentionSqlTest(PgTestCase):
         # the performance target without making host load a CI failure (§3).
         elapsed = plan[0]['Execution Time']
         print(f'housekeeping retention: {elapsed:.3f} ms / target < 5 ms (500000 rows)')
+
+
+class RetentionOutageTest(PgTestCase):
+    """#5589 : une panne de base à la rétention ne coupe pas le ménage local."""
+
+    def test_a_retention_failure_does_not_stop_the_local_cleanup(self):
+        base = tempfile.mkdtemp(prefix='ameesh-5589-')
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        cfg = _Cfg(os.path.join(base, 'state'))
+        policy = hk.Policy(worktrees=False, deps=False, artifacts=(),
+                           docker_volumes=False, docker_images=False,
+                           orphan_idle=0.0)
+        troot = hk.tmp_root(cfg, policy)
+        hk._ensure_root(troot)
+        doomed = os.path.join(troot, 'gone-agent')
+        os.makedirs(doomed)
+        with open(os.path.join(doomed, 'work.txt'), 'w', encoding='utf-8') as fh:
+            fh.write('x' * 64)
+        hk._write_owner(troot, 'gone-agent', hk.mesh_key(cfg), hk.ORIGIN_CREATED)
+        with mock.patch.object(
+                Housekeeping, 'purge_retention',
+                side_effect=db_mod.Unavailable(
+                    'could not connect to server: Connection refused')):
+            report = hk._run_pass(cfg, self.db, policy, host='retention-outage',
+                                  actor='test', artifact_scan=False,
+                                  now=time.time() + 1.0)
+        # The local phase ran after the failed purge: the orphan directory is gone.
+        self.assertFalse(os.path.exists(doomed))
+        self.assertTrue(any('retention: database unreachable' in note
+                            and 'local cleanup continues' in note
+                            for note in report['skipped']), report['skipped'])
+        self.assertTrue(any(line.get('kind') == 'tmp'
+                            and line.get('action') == 'deleted'
+                            and line.get('path') == doomed
+                            for line in report['entries']), report['entries'])
+
