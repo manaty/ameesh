@@ -72,6 +72,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    overdue_delegations returned_delegations backlog_add
                    backlog_basket_add backlog auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
+                   (Postgres optional: issue_refs)
    packages       all get upsert retire lock_sync
    actions         get recent attempts events log_event last_event_note
                    decision_queues covering_grants launched propose bind
