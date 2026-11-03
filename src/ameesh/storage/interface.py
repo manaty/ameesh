@@ -3363,13 +3363,16 @@ class Canon(Domain):
 
     @abc.abstractmethod
     def fail_sync(self, host: str, canon: str, token: str) -> None:
-        """#5493: a claimed sync that raised withdraws the last completed
-        result and releases its claim, only if this claim is still current."""
+        """#5493/#5649: a claimed sync that raised releases its claim, only if
+        this claim is still current. The last completed result is kept while
+        the canon state is still `ok` (the caller compares signatures); it is
+        withdrawn when the failure recorded a non-ok state."""
 
     @abc.abstractmethod
     def shared_sync(self, host: str, canon: str) -> dict | None:
-        """Last completed state, kept while a newer claim is pending (#5493);
-        None if no sync ever completed or the last claimed one failed."""
+        """Last completed state, kept while a newer claim is pending (#5493)
+        and after a claim that failed on an `ok` state (#5649); None if no
+        sync ever completed, or the last completed one was withdrawn."""
 
     @abc.abstractmethod
     def lock_default_state(self, host: str) -> dict | None:
