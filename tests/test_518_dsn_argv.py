@@ -530,6 +530,34 @@ class PosteDsnTest(unittest.TestCase):
         self.configure(case("postgresql://ameesh:")[0])
         self.assert_stops(dict(self.env, PGSERVICE="prod"))
 
+    def test_recovery_timeout_zero_with_leading_zeros_stops_before_backup(self):
+        # #5682 : « 00 »/« 0000 » passaient la garde et `timeout 0` désactivait
+        # la borne ; normalisés, ils valent 0 et doivent refuser avant tout geste.
+        for value in ("00", "000", "0000"):
+            with self.subTest(value=value):
+                self.configure(case("postgresql://ameesh:")[0])
+                proc = subprocess.run(["bash", SCRIPT, "sauvegarder"],
+                                      env=dict(self.env, RECUPERATION_TIMEOUT=value),
+                                      capture_output=True, text=True, timeout=300,
+                                      stdin=subprocess.DEVNULL)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("RECUPERATION_TIMEOUT", proc.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.state, "calls.log")),
+                                 "a backup started")
+
+    def test_recovery_timeout_leading_zeros_is_normalized(self):
+        # #5682 : la normalisation ne refuse pas un délai légitime écrit avec
+        # des zéros de tête ; la borne reçoit sa valeur canonique.
+        self.configure(case("postgresql://ameesh:")[0])
+        proc = subprocess.run(["bash", SCRIPT, "sauvegarder"],
+                              env=dict(self.env, RECUPERATION_TIMEOUT="03600"),
+                              capture_output=True, text=True, timeout=300,
+                              stdin=subprocess.DEVNULL)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("RECUPERATION_TIMEOUT", proc.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "calls.log")),
+                        "the backup did not start")
+
 
 if __name__ == "__main__":
     unittest.main()

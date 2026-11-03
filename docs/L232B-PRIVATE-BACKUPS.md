@@ -21,6 +21,11 @@ restorability.
 inventory. Archive and inventory must be new files in the same directory.
 The source uses a read-only repeatable-read transaction and exports its
 snapshot to `pg_dump`; that transaction stays open until the dump finishes.
+The dump is bounded by an explicit `SNAPSHOT_DUMP_TIMEOUT` (3600 s, #5682):
+the exported transaction stays open at most that bounded duration, never an
+implicit default that could drift. The release controller passes
+`RELEASE_DUMP_TIMEOUT` (same 3600 s, twice the measured 22–27 min dumps) so
+its window is named at the call site.
 It disables the server's `idle_in_transaction_session_timeout` for that
 transaction only (`SET LOCAL … = 0`, #3836/#3844): a 180 s idle guard on the
 mesh database must not take the deliberate snapshot holder for an abandoned

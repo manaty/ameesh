@@ -194,8 +194,11 @@ class ReveilParLeFluxTest(MedieBase):
                                                                    "id": 812})]
         self._ecoute(runner)
         self.assertTrue(attendre(worker.wake.is_set), "le flux n'a pas réveillé le worker")
-        # le réveil ne fait pas foi : le message est relu par l'API
-        self.assertIn("mailbox.get", self.transport.ops())
+        # le réveil ne fait pas foi : le message est relu par l'API. Le signal
+        # part avant la lecture (#4594) : la relève peut donc être postérieure
+        # au réveil, il faut l'attendre (#5680).
+        self.assertTrue(attendre(lambda: "mailbox.get" in self.transport.ops()),
+                        "le message doit être relu après le réveil")
         self.assertEqual(self.db.events_cursor, "k3f9:17")
 
     def test_trou_de_reprise_reveille_tous_les_workers(self):

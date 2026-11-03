@@ -101,8 +101,9 @@ SAUVEGARDES="$HOME/backups/ameesh"
 #: dumps produits sur la VM par ameesh-sauvegarde.service (0700, 0600)
 SAUVEGARDES_VM=${SAUVEGARDES_VM:-/home/ameesh/sauvegardes}
 SAUVEGARDES_VM=${SAUVEGARDES_VM%/}
-#: borne du rapatriement du dump serveur (secondes) ; la progression et les
-#: octets déjà écrits sont journalisés par le récepteur en cas d'échec
+#: borne du rapatriement du dump serveur (secondes, entier de 1 à 3600 ; les
+#: zéros de tête sont normalisés) ; la progression et les octets déjà écrits
+#: sont journalisés par le récepteur en cas d'échec
 RECUPERATION_TIMEOUT=${RECUPERATION_TIMEOUT:-3600}
 case "${1:-}" in
   publier|rattraper) ;;
@@ -115,7 +116,7 @@ ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
 #: retenir le staging indéfiniment si le lien WireGuard se bloque.
 ssh_vm_borne() {
   local delai=$1; shift
-  timeout --foreground "$delai" ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"
+  timeout --foreground --kill-after=30 "$delai" ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"
 }
 dsn_de() { python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1]))["dsn"])' "$1"; }
 # #518: a DSN's password never goes on a command line, which every process of
@@ -198,7 +199,7 @@ verifier() {
 # dump est donc reconnu nouveau à son nom, son inode, sa taille ou sa date (#2424).
 # Aucun DSN ni secret ne traverse cette commande distante.
 sauvegarde_serveur() {
-  printf '%s\n' "$SAUVEGARDES_VM" | ssh_vm 'set -eu
+  printf '%s\n' "$SAUVEGARDES_VM" | ssh_vm_borne 9060 'set -eu
     IFS= read -r d
     test -d "$d"
     before=$(mktemp "$d/.liste-avant.XXXXXX")
@@ -229,6 +230,17 @@ sauvegarder() {
   case "$RECUPERATION_TIMEOUT" in
     ''|*[!0-9]*|0) echo "RECUPERATION_TIMEOUT doit être un entier positif" >&2; return 2 ;;
   esac
+  # #5682 : « 00 » ou « 0000 » passent la garde ci-dessus (seul « 0 » est
+  # refusé) ; normalisés, ils valent 0 et `timeout 0` désactive la borne.
+  while [ "${RECUPERATION_TIMEOUT#0}" != "$RECUPERATION_TIMEOUT" ]; do
+    RECUPERATION_TIMEOUT=${RECUPERATION_TIMEOUT#0}
+  done
+  [ -n "$RECUPERATION_TIMEOUT" ] || {
+    echo "RECUPERATION_TIMEOUT doit être un entier positif" >&2; return 2;
+  }
+  [ "${#RECUPERATION_TIMEOUT}" -le 4 ] && [ "$RECUPERATION_TIMEOUT" -le 3600 ] || {
+    echo "RECUPERATION_TIMEOUT dépasse le plafond de 3600 s" >&2; return 2;
+  }
   # #518 : le DSN ambigu est refusé (garde fail-closed du code déployé) avant
   # toute sauvegarde, comme pour « migrer ».
   dsn_part dsn "$CONFIG" dsn || return
@@ -286,6 +298,9 @@ sauvegarder() {
   if ancienne; then
     etape "ancienne base"
     dsn_part dsn "$CONFIG_RESTE" dsn || return
+    # #5682 : ce dump garde le défaut borné du helper (3600 s) ; le budget du
+    # stade « sauvegarde » de staging.sh le compte avec le dump serveur (9060)
+    # et le rapatriement (3600).
     "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG_RESTE" \
       --output "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"

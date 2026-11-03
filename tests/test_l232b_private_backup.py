@@ -49,7 +49,7 @@ class PrivateBackupTest(unittest.TestCase):
     def test_password_channel_and_atomic_completed_archive(self):
         seen = []
 
-        def child(args, *, env=None):
+        def child(args, *, env=None, timeout=None):
             self.assertNotIn("CANARY-PASSWORD", str(args))
             if args[0] == "pg_dump":
                 passfile = Path(env["PGPASSFILE"])
@@ -70,7 +70,7 @@ class PrivateBackupTest(unittest.TestCase):
         self.assertFalse(seen[0].exists())
 
     def test_failed_or_unreadable_archive_keeps_final_path_absent(self):
-        def failed_check(args, *, env=None):
+        def failed_check(args, *, env=None, timeout=None):
             if args[0] == "pg_dump":
                 Path(args[-1]).write_bytes(b"incomplete")
             else:
@@ -101,7 +101,7 @@ class PrivateBackupTest(unittest.TestCase):
         self.output.write_bytes(b"archive")
         seen = []
 
-        def child(args, *, env=None):
+        def child(args, *, env=None, timeout=None):
             self.assertEqual(args[:2], ["curl", "--disable"])
             self.assertNotIn("CANARY-SECRET", str(args))
             header = args[args.index("-H") + 1]
@@ -122,7 +122,7 @@ class PrivateBackupTest(unittest.TestCase):
         self.output.parent.mkdir(mode=0o700)
         self.output.write_bytes(b"archive")
         receipt = self.output.with_suffix(".upload.json")
-        def child(args, *, env=None):
+        def child(args, *, env=None, timeout=None):
             self.assertEqual(env, {"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
             self.assertNotIn("CANARY-SECRET", str(args))
             Path(args[args.index("--dump-header") + 1]).write_text(
@@ -147,7 +147,7 @@ class PrivateBackupTest(unittest.TestCase):
         settings = {"SCW_ACCESS_KEY": "CANARY-ACCESS", "SCW_SECRET_KEY": "CANARY-SECRET",
                     "SCW_BUCKET": "acme", "SCW_REGION": "fr-par", "TMPDIR": str(self.root)}
         for header in ("", "x-amz-version-id: null", "x-amz-version-id: v1\r\nx-amz-version-id: v2"):
-            def child(args, *, env=None):
+            def child(args, *, env=None, timeout=None):
                 Path(args[args.index("--dump-header") + 1]).write_text("HTTP/1.1 200 OK\r\n" + header + "\r\n\r\n")
             with self.subTest(header=header), mock.patch.dict(os.environ, settings), mock.patch.object(backup, "run", side_effect=child):
                 with self.assertRaises(backup.BackupError):
@@ -163,7 +163,7 @@ class PrivateBackupTest(unittest.TestCase):
     def test_retrieval_pins_and_attests_exact_version_even_with_same_digest(self):
         credentials, sha = self.recovery_fixture()
         version = "pinned/+?version"
-        def child(args, *, env=None):
+        def child(args, *, env=None, timeout=None):
             if args[0] == "curl":
                 self.assertTrue(args[-1].endswith("?versionId=pinned%2F%2B%3Fversion"))
                 Path(args[args.index("--output") + 1]).write_bytes(b"archive")
@@ -175,7 +175,7 @@ class PrivateBackupTest(unittest.TestCase):
 
     def test_retrieval_wrong_or_null_version_never_publishes(self):
         credentials, sha = self.recovery_fixture()
-        def child(args, *, env=None):
+        def child(args, *, env=None, timeout=None):
             if args[0] == "curl":
                 Path(args[args.index("--output") + 1]).write_bytes(b"archive")
                 Path(args[args.index("--dump-header") + 1]).write_text("HTTP/1.1 200 OK\r\nx-amz-version-id: different\r\n\r\n")
@@ -228,7 +228,7 @@ class PrivateBackupTest(unittest.TestCase):
         # refused: the backup of the enrolled host must still run.
         owned = self.root / "owned"
         owned.mkdir(mode=0o755)
-        def child(args, *, env=None):
+        def child(args, *, env=None, timeout=None):
             if args[0] == "pg_dump":
                 Path(args[-1]).write_bytes(b"archive")
         with mock.patch.object(backup, "run", side_effect=child):
@@ -240,7 +240,7 @@ class PrivateBackupTest(unittest.TestCase):
         credentials, sha = self.recovery_fixture()
         seen = []
 
-        def child(args, *, env=None):
+        def child(args, *, env=None, timeout=None):
             self.assertFalse(self.output.exists())
             self.assertNotIn("RECOVERY-SECRET", str(args))
             self.assertNotIn("SCW_SECRET_KEY", env)
@@ -270,7 +270,7 @@ class PrivateBackupTest(unittest.TestCase):
     def test_failed_retrieval_never_publishes_an_artifact(self):
         credentials, sha = self.recovery_fixture()
         for failure in ("download", "digest", "catalogue", "empty"):
-            def child(args, *, env=None):
+            def child(args, *, env=None, timeout=None):
                 if args[0] == "curl":
                     Path(args[args.index("--output") + 1]).write_bytes(
                         b"wrong" if failure == "digest" else b"" if failure == "empty" else b"archive")
@@ -322,7 +322,7 @@ class PrivateBackupTest(unittest.TestCase):
         expected, admin, restored, connections = self.restore_fixture()
         seen = []
 
-        def child(args, *, env=None):
+        def child(args, *, env=None, timeout=None):
             self.assertNotIn("CANARY-PASSWORD", str(args))
             self.assertIn("--exit-on-error", args)
             public_dsn = args[args.index("--dbname") + 1]
@@ -400,11 +400,13 @@ class PrivateBackupTest(unittest.TestCase):
     def test_inventory_and_dump_share_live_exported_snapshot(self):
         source, context, cursors = self.snapshot_fixture()
         inventory = self.output.with_suffix(".inventory.json")
-        def child(args, *, env=None):
+        def child(args, *, env=None, timeout=None):
             context.__exit__.assert_not_called()
             self.assertNotIn("CANARY-PASSWORD", str(args))
             if args[0] == "pg_dump":
                 self.assertEqual(args[args.index("--snapshot") + 1], "00000003-000000AE-1")
+                # #5682 : le dump de snapshot garde une borne explicite.
+                self.assertEqual(timeout, backup.SNAPSHOT_DUMP_TIMEOUT)
                 # Subsequent source changes cannot change the expected snapshot
                 # counts already captured by this transaction.
                 cursors[5].fetchone.return_value = (999,)
@@ -426,6 +428,33 @@ class PrivateBackupTest(unittest.TestCase):
         self.assertEqual(source.execute.call_args_list[1].args[0],
                          "SET LOCAL idle_in_transaction_session_timeout = 0")
         context.__exit__.assert_called_once()
+
+    def test_snapshot_dump_honours_an_explicit_timeout(self):
+        # #5682 : l'appelant (contrôleur de release) nomme son délai ; le dump
+        # de snapshot ne dépend pas du défaut de dump_parameters.
+        source, context, _ = self.snapshot_fixture()
+        inventory = self.output.with_suffix(".inventory.json")
+        seen = []
+
+        def child(args, *, env=None, timeout=None):
+            if args[0] == "pg_dump":
+                seen.append(timeout)
+                Path(args[-1]).write_bytes(b"snapshot archive")
+
+        with mock.patch("psycopg.connect", return_value=context), \
+                mock.patch.object(backup, "run", side_effect=child):
+            backup.snapshot_dump(self.config, self.output, inventory, timeout=1234)
+        self.assertEqual(seen, [1234])
+        self.assertEqual(backup.SNAPSHOT_DUMP_TIMEOUT, 3600)
+
+    def test_snapshot_dump_refuses_invalid_timeout_before_connecting(self):
+        inventory = self.output.with_suffix(".inventory.json")
+        for value in (0, -1, 3601, True, "1.5"):
+            with self.subTest(value=value), mock.patch("psycopg.connect") as connect:
+                with self.assertRaises(backup.BackupError):
+                    backup.snapshot_dump(self.config, self.output, inventory, timeout=value)
+                connect.assert_not_called()
+        self.assertFalse(inventory.exists())
 
     def test_failed_snapshot_dump_never_publishes_expected_inventory(self):
         _, context, _ = self.snapshot_fixture()
@@ -473,15 +502,15 @@ class PrivateBackupTest(unittest.TestCase):
         self.assertNotIn("CANARY", str(error.exception))
 
     def test_dump_timeout_cause_names_bytes_written(self):
-        def child(args, *, env=None, timeout=1800):
-            self.assertEqual(timeout, 1800)
+        def child(args, *, env=None, timeout=3600):
+            self.assertEqual(timeout, 3600)
             Path(args[-1]).write_bytes(b"p" * 123)
-            raise backup.BackupError("pg_dump timed out after 1800 s")
+            raise backup.BackupError("pg_dump timed out after 3600 s")
         with mock.patch.object(backup, "run", side_effect=child):
             with self.assertRaises(backup.BackupError) as error:
                 backup.dump(self.config, self.output)
         message = str(error.exception)
-        self.assertIn("pg_dump timed out after 1800 s", message)
+        self.assertIn("pg_dump timed out after 3600 s", message)
         self.assertIn("123 bytes written", message)
         self.assertNotIn("CANARY-PASSWORD", message)
         self.assertFalse(self.output.exists())

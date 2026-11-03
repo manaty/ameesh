@@ -229,11 +229,31 @@ def private_connection(parameters, directory):
             passfile.unlink(missing_ok=True)
 
 
-def dump(config, output):
-    return dump_parameters(parameters_from(config), output)
+# #5681: complete central dumps took up to 27 min; allow twice that.
+DEFAULT_DUMP_TIMEOUT = 3600
+MAX_DUMP_TIMEOUT = 3600
+# #5682: a release snapshot keeps its exported read-only transaction open for
+# the whole dump; bound it explicitly at the same measured 2x margin instead
+# of inheriting dump_parameters' default by accident.
+SNAPSHOT_DUMP_TIMEOUT = 3600
 
 
-def dump_parameters(parameters, output, *, snapshot=None, source_major=None):
+def dump_timeout(value):
+    if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value)):
+        raise BackupError("dump timeout must be a positive integer")
+    value = int(value)
+    if not 1 <= value <= MAX_DUMP_TIMEOUT:
+        raise BackupError("dump timeout must be between 1 and %d s" % MAX_DUMP_TIMEOUT)
+    return value
+
+
+def dump(config, output, *, timeout=DEFAULT_DUMP_TIMEOUT):
+    timeout = dump_timeout(timeout)
+    return dump_parameters(parameters_from(config), output, timeout=timeout)
+
+
+def dump_parameters(parameters, output, *, snapshot=None, source_major=None, timeout=DEFAULT_DUMP_TIMEOUT):
+    timeout = dump_timeout(timeout)
     output = Path(output)
     private_parent(output.parent, "backup directory")
     if os.path.lexists(output):
@@ -251,7 +271,7 @@ def dump_parameters(parameters, output, *, snapshot=None, source_major=None):
             if snapshot is not None:
                 args.extend(["--snapshot", snapshot])
             try:
-                run(args + ["--file", str(archive)], env=env)
+                run(args + ["--file", str(archive)], env=env, timeout=timeout)
             except BackupError as exc:
                 try:
                     written = archive.stat().st_size
@@ -274,7 +294,8 @@ def dump_parameters(parameters, output, *, snapshot=None, source_major=None):
             os.close(directory_fd)
 
 
-def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_registry", "agent_mailbox")):
+def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_registry", "agent_mailbox"),
+                  timeout=SNAPSHOT_DUMP_TIMEOUT):
     """Capture expected rows and the archive from one repeatable-read snapshot.
 
     The full database is dumped; the private inventory identifies the mesh
@@ -284,6 +305,7 @@ def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_
     import psycopg
     from psycopg import sql
     from psycopg.conninfo import make_conninfo
+    timeout = dump_timeout(timeout)
     output, inventory = Path(output), Path(inventory)
     if (inventory.parent.resolve() != output.parent.resolve() or inventory == output
             or os.path.lexists(inventory) or os.path.lexists(output)):
@@ -321,8 +343,10 @@ def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_
         if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
             raise BackupError("source did not report a usable database size")
         # The exporting transaction stays open until pg_dump imports and
-        # finishes the snapshot, including writes made concurrently afterwards.
-        dump_parameters(parameters, output, snapshot=snapshot, source_major=major)
+        # finishes the snapshot, including writes made concurrently afterwards;
+        # timeout bounds that whole interval (#5682).
+        dump_parameters(parameters, output, snapshot=snapshot, source_major=major,
+                        timeout=timeout)
         expected = {"schema": schema, "migrations": [list(row) for row in versions],
                     "row_counts": counts, "artifact_sha256": digest(output),
                     "source_bytes": size}
@@ -760,6 +784,7 @@ def main():
     backup = commands.add_parser("dump")
     backup.add_argument("--config", required=True)
     backup.add_argument("--output", required=True)
+    backup.add_argument("--timeout", default=DEFAULT_DUMP_TIMEOUT)
     snapshot = commands.add_parser("snapshot-dump")
     snapshot.add_argument("--config", required=True)
     snapshot.add_argument("--output", required=True)
@@ -789,7 +814,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "dump":
-            dump(args.config, args.output)
+            dump(args.config, args.output, timeout=args.timeout)
         elif args.command == "snapshot-dump":
             proof = snapshot_dump(args.config, args.output, args.inventory, schema=args.schema,
                                   tables=args.tables or ("agent_registry", "agent_mailbox"))

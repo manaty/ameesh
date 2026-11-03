@@ -750,7 +750,7 @@ REMOTE
 # rapatriement. Sortie : chemin, taille, SHA-256. Aucun DSN ne traverse la
 # commande.
 sauvegarde_serveur_vm() {
-  printf '%s\n' "$SAUVEGARDES_VM" | ssh -o BatchMode=yes -o ConnectTimeout=10 \
+  printf '%s\n' "$SAUVEGARDES_VM" | timeout --foreground --kill-after=30 9060 ssh -o BatchMode=yes -o ConnectTimeout=10 \
     "${CIBLE[manaty-mesh-1]}" 'set -eu
     IFS= read -r d
     test -d "$d"
@@ -1123,6 +1123,11 @@ if host:
         except OSError:
             pass
         budget = base + int(runners or default_runners) * cap
+        # #5682 : sauvegarde = dump serveur (9060) + rapatriement (3600) +
+        # dump de l'ancienne base (3600), plus 60 s de marge.
+        if stage == 'sauvegarde':
+            budget = max(budget, 16320)
+            stall = max(stall, 16320)
         # the workstation's restart runs in its own unit and reports no
         # runner: only its budget can judge it
         if stage == 'redemarrer' and not runners:

@@ -10,3 +10,7 @@ User=ameesh
 # si le script perdait son umask.
 UMask=0077
 ExecStart=/usr/local/sbin/ameesh-sauvegarder-base
+# #5681: dump <=3600, listing <=1800, upload <=1800, retention + margin.
+TimeoutStartSec=9000
+TimeoutStopSec=30
+KillMode=control-group
