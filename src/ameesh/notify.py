@@ -196,7 +196,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "ci_main_red",
                  # #845 : la garde de la CI — runner busy sans job (panne) et
                  # file au-delà du SLO de 15 min (capacité)
-                 "ci_runner_stuck", "ci_queue_saturated",
+                 "ci_runner_stuck", "ci_queue_saturated", "ci_disk_low", "ci_disk_unreadable",
                  # #3344 : la carte de mesure a plus de 48 h (suite complète
                  # pour chaque lot) — plus seulement une annotation CI
                  "map_stale",
@@ -360,6 +360,8 @@ TYPE_LABELS = {
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "estimate_bias": "estimate bias",
     "ci_main_red": "CI red on main",
+    "ci_disk_low": "CI VM disk almost full",
+    "ci_disk_unreadable": "CI VM disk measurement unavailable",
     "ci_runner_stuck": "CI runner busy with no job running",
     "ci_queue_saturated": "CI queue beyond its SLO",
     "map_stale": "measured test map older than 48 h",
@@ -2897,10 +2899,15 @@ class Notifier:
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     def _github_issues(self, db, now: float) -> None:
-        """Chaque lot a son issue GitHub, tenue par ameesh : la projection
+        """Reconcile configured capacity forecasts, then GitHub issues.
+
+        Chaque lot a son issue GitHub, tenue par ameesh : la projection
         tourne ici, sur l'hôte que désigne la clé `github` de la configuration
-        (`plan_github.Projector`). Sans cette clé, rien ; une erreur (GitHub,
+        (`plan_github.Projector`). Sans cette clé, seule la capacité passe ;
+        une erreur (GitHub,
         `gh`, base) est journalisée et ne touche jamais aux alertes."""
+        from . import capacity_replan
+        capacity_replan.tick(self.cfg, db, now=now, dry_run=self.dry_run, log=self.log)
         if not getattr(self.cfg, "github", None):
             return
         from . import plan_github

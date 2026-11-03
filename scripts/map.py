@@ -313,8 +313,17 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict], list[dic
     complète alors que sa contribution manque (R1 B3 #1257).
 
     Une même perte alimente les deux projections sans double compteur : le
-    résumé (#1257) et le repli du plan (#1690/#1716) la voient tous les deux."""
-    lignes: dict = collections.defaultdict(lambda: collections.defaultdict(set))
+    résumé (#1257) et le repli du plan (#1690/#1716) la voient tous les deux.
+
+    #5604 : l'assemblage tenait 43 à 46 min le 30/10 et a été coupé à 60 min
+    le 31/10 (run 41190576717), presque tout dans `contexts_by_lineno` et un
+    `context_module` par ligne et par processus. Le contexte est statique par
+    processus (`write_rc`) : un fichier à un seul contexte est lu par
+    `lines()`, le module de chaque contexte est calculé une fois par fichier,
+    et les lignes s'accumulent par module (`set.update`) avant d'être
+    retournées ligne par ligne."""
+    # {fichier relatif: {module: {lignes}}}, retourné en {fichier: {ligne: {modules}}}
+    par_module: dict = collections.defaultdict(lambda: collections.defaultdict(set))
     processus = sans_contexte = 0
     ignorees: list[dict] = []
     incomplets: list[dict] = []
@@ -351,16 +360,22 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict], list[dic
                 donnees = CoverageData(basename=fichier)
                 donnees.read()
                 contextes = donnees.measured_contexts()
-                sans_attribution = bool(contextes) and not any(
-                    context_module(c) for c in contextes)
-                for mesure in donnees.measured_files():
+                module_de = {c: context_module(c) for c in contextes}
+                sans_attribution = bool(contextes) and not any(module_de.values())
+                # #5604 : contexte unique → `lines()`, sans attribution par ligne
+                unique = module_de[next(iter(contextes))] if len(contextes) == 1 else None
+                for mesure in donnees.measured_files() if not sans_attribution else ():
                     relatif = relative_path(mesure)
                     if relatif is None:
                         continue
+                    if unique is not None:
+                        contribution[relatif][unique].update(donnees.lines(mesure) or ())
+                        continue
                     for ligne, ctx in donnees.contexts_by_lineno(mesure).items():
-                        modules = {m for m in map(context_module, ctx) if m}
-                        if modules:
-                            contribution[relatif][ligne] |= modules
+                        for c in ctx:
+                            module = module_de[c] if c in module_de else context_module(c)
+                            if module:
+                                contribution[relatif][module].add(ligne)
             except (CoverageException, sqlite3.DatabaseError, OSError) as exc:
                 # #1257 x #1690 : la perte alimente les deux projections, sans
                 # double compteur ; le diagnostic d'en-tête nomme la panne.
@@ -385,9 +400,14 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict], list[dic
             processus += 1
             if sans_attribution:
                 sans_contexte += 1
-            for relatif, par_ligne in contribution.items():
-                for ligne, modules in par_ligne.items():
-                    lignes[relatif][ligne] |= modules
+            for relatif, modules in contribution.items():
+                for module, numeros in modules.items():
+                    par_module[relatif][module] |= numeros
+    lignes: dict = collections.defaultdict(lambda: collections.defaultdict(set))
+    for relatif, modules in par_module.items():
+        for module, numeros in modules.items():
+            for ligne in numeros:
+                lignes[relatif][ligne].add(module)
     return lignes, processus, sans_contexte, ignorees, incomplets
 
 

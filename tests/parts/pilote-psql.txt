@@ -145,3 +145,7 @@ test_5046_deps_policy  # #5046: nm host policy and actual deletion journal throu
 
 test_5411_requetes_lourdes  # stockage : index 0533, measure_candidates borné et séries de soldes agrégées, sous les deux pilotes (#5411)
 test_5588_housekeeping_retention  # #5588: journal writes and 30-day retention through both drivers
+test_5630_ci_disk_storage  # mesures disque CI monotones et alertes, sous les deux pilotes
+test_5602_capacity_replan  # storage: atomic forecast dates/journal/checkpoint and silent event replay (#5602)
+
+test_5585_journal_plans  # #5585 : un tableau d’ids par page et garde de plan des lectures groupées du journal, sous les deux pilotes

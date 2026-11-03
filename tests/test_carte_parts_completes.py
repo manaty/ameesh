@@ -73,7 +73,7 @@ class MiroirDesPartsTest(unittest.TestCase):
 
     def test_le_miroir_couvre_la_matrice_de_mesure(self):
         matrice = sorted(f"mesure-{p}-{n}" for p, n, _ in INCLUDE.findall(WORKFLOW))
-        self.assertEqual(len(matrice), 18, "matrice de mesure inattendue")
+        self.assertEqual(len(matrice), 21, "matrice de mesure inattendue")
         m = MIROIR.search(WORKFLOW)
         self.assertIsNotNone(m, "PARTS_MESURE introuvable dans carte.yml")
         miroir = sorted(m.group(2).split())
@@ -86,8 +86,10 @@ class MiroirDesPartsTest(unittest.TestCase):
         # psql 1/2 et 2/2, psycopg 2/4 et 3/4 à 40m30 : 6 parts psql et 12
         # parts psycopg (#3450 : 8 ; #3604 : 8 ne tenaient plus sous le
         # plafond de 60 min sur un pool saturé, run 40177589953 du 25/10).
+        # #5604 : psql 4/6 et 1/6 coupées à 60 min (01/11, 02/11), parts
+        # estimées 2 548 s : 9 parts psql.
         psql = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW) if p == "psql"]
-        self.assertEqual(psql, [("psql", str(n), "6") for n in range(1, 7)])
+        self.assertEqual(psql, [("psql", str(n), "9") for n in range(1, 10)])
         psycopg = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW)
                    if p == "psycopg"]
         self.assertEqual(psycopg, [("psycopg", str(n), "12") for n in range(1, 13)])

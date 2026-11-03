@@ -87,9 +87,9 @@ ameesh work plan --capacity-plan updated.json --previous-plan forecast.json
 ```
 
 The output names every moved lot and its old/new times. A completed lot uses
-`completed_ts`; no run slot is retained. The caller owns event subscription
-and publication of the JSON. This command does not register a background
-subscriber.
+`completed_ts`; no run slot is retained. This standalone command does not
+register a background subscriber. For automatic publication from live
+project inputs, configure the notification pass described below.
 
 For an unmet `deadline_ts`, the forecast tries adding unreserved slots on an
 additional host and returns the smallest tested feasible capacity. This is a
@@ -130,3 +130,43 @@ Without reservations the claim order is unchanged and no lot is read.
 Reservations divide the `max_agents` of the runner. More reserved places than
 `max_agents` is a canon error; an unreadable entry is a canon error too and
 is ignored, so it never holds places nobody can take.
+
+## Automatic date publication (#5602)
+
+Configure the existing `issues` notification pass on a transactional database
+connection with a project settings file:
+
+```json
+{"project_planning":{"acme":{"capacity_plan":"/srv/ameesh/acme-capacity.json"}}}
+```
+
+The file uses the capacity settings format above (`hosts`, reservations,
+gate/resource overrides, approver delays and policies). It is read again on
+each `ameesh notify --only issues` pass, including when GitHub projection is
+not configured. `now` comes from the pass clock. Update the file atomically
+when offered hosts/slots or reservations change. Live project lots, dependencies
+and recorded actuals are read from the database. A gate may contain
+`decision_id`; its answer timestamp then comes from the current decision for
+that lot, rather than a cached `answered_ts` in the file. Overrides for lots
+that merged are discarded. Other explicit external gates still use the file.
+
+The pass detects changes in these inputs and recomputes automatically: an
+early/late merge, decision answer or host/slot change needs no manual forecast
+command. Clock ticks alone leave the published forecast unchanged. Repeating
+the same event publishes nothing. Journal notes are published only when the
+computed calendar dates (YYYY-MM-DD) or manual/scheduler ownership change,
+not when seconds move within the same day. Each changed input is checkpointed
+even when dates do not move, so later ticks do not recompute it. Dates and
+notes commit with that durable checkpoint; another host/restart does not
+publish the same update again. The CLI retains the latest precise UTC forecast.
+The pass logs its elapsed time and number of lot date publications.
+Incomplete inputs leave the previous dates intact and are logged per project.
+The latest checkpoint survives event retention; older checkpoints are pruned.
+
+`ameesh work plan --project acme --json` includes `capacity_forecast`; text
+mode shows its delivery bound alongside the usual lot dates. Scheduler-owned
+start/end dates are updated; dates pinned by a person and manual delivery
+dates remain intact. The journal and forecast still expose the computed ETA
+when a manual date is retained. This pass publishes forecasts and does not
+change dispatch admission; live reservations are enforced by the runner
+(above).

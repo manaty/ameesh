@@ -1825,11 +1825,30 @@ def no_valid_reason(harness: str, evaluations: dict) -> str:
     return why
 
 
+#: #5632 : les problèmes qui disent seulement qu'un compte attend sa
+#: connexion humaine — un état de provisionnement, pas une faute de
+#: configuration de l'hôte. Fichier d'identifiants absent, ou trousseau vide.
+_PENDING_CREDENTIALS = (
+    "credentials missing (",
+    "credentials missing in the Keychain (",
+)
+
+
+def _awaiting_login(problem: str) -> bool:
+    return problem.startswith(_PENDING_CREDENTIALS)
+
+
 def doctor_lines(cfg, environ=None) -> tuple[bool, list[str]]:
     """#3969 : `(ko, lignes)` de `ameesh doctor` — chaque compte déclaré sur
     l'hôte que la sélection jugerait invalide (`check`), avec son remède. Le
     27/10, à la mise en service d'agents-3, des profils laissés en 755 ont
     tenu des agents en « pause budget » sous un doctor vert.
+
+    #5632 : un compte dont le seul défaut est l'identifiant absent (auth.json,
+    `.credentials.json`, trousseau) attend une connexion humaine : il est dit
+    en avertissement, sans changer le verdict, tant qu'un autre compte du même
+    harnais reste utilisable. Seul, il laisse le harnais sans compte valide et
+    le KO demeure. Un autre défaut (dossier, droits, clé) reste un KO.
 
     Lu par l'utilisateur qui lance doctor : un dossier ou un fichier de clé
     à un autre utilisateur (doctor lancé hors du compte de l'exécuteur) n'est
@@ -1843,6 +1862,7 @@ def doctor_lines(cfg, environ=None) -> tuple[bool, list[str]]:
     uid = os.getuid() if hasattr(os, "getuid") else None
     ko, lines = False, []
     for harness, items in declared.items():
+        evaluated = []
         for profile in items:
             label = "%s/%s" % (harness, profile.name)
             if profile.kind == "api_key_env" and not profile.key_file:
@@ -1858,10 +1878,21 @@ def doctor_lines(cfg, environ=None) -> tuple[bool, list[str]]:
                     lines.append("%s not checked (%s belongs to uid %d: run doctor as "
                                  "the runner's user)" % (label, owned, owner))
                     continue
-            problems = invalid(profile, _check(profile, environ))
-            if problems:
-                ko = True
-                lines.append("KO — %s invalid: %s" % (label, "; ".join(problems)))
+            evaluated.append((label, profile, invalid(profile, _check(profile, environ))))
+        # Un compte « refusé » par ce mesh (#313) n'est pas une faute d'hôte :
+        # `invalid` le laisse sans problème, mais il ne rend pas le harnais
+        # utilisable pour autant.
+        usable = any(not problems and not getattr(profile, "refused", "")
+                     for _, profile, problems in evaluated)
+        for label, _, problems in evaluated:
+            if not problems:
+                continue
+            if usable and all(_awaiting_login(problem) for problem in problems):
+                lines.append("warning — %s awaiting credentials (another %s account is "
+                             "usable): %s" % (label, harness, "; ".join(problems)))
+                continue
+            ko = True
+            lines.append("KO — %s invalid: %s" % (label, "; ".join(problems)))
     return ko, lines
 
 

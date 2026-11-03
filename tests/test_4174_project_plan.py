@@ -102,7 +102,8 @@ class PlanTest(unittest.TestCase):
                 plan_cli._plan(None, args)
             legacy.assert_called_once_with(None, "12", source=None, actor="", start="2026-10-28")
         args = parser.parse_args(["plan", "--project", "acme", "--json"])
-        with patch.object(plan, "report", return_value=self.report([lot(1)])):
+        with patch.object(plan, "report", return_value=self.report([lot(1)])), \
+                patch("ameesh.capacity_replan.latest", return_value=None):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 plan_cli._plan(None, args)
             self.assertEqual(json.loads(output.getvalue())["ready"], [1])

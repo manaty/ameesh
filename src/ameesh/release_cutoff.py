@@ -566,6 +566,18 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         # tentative lue ci-dessous resterait sinon masqué.
         negative += [name for name in reading.get("required_negative", ())
                      if name not in negative]
+        # #5627 : le run de chaque non concluant, pour un lot par run (et
+        # non par check) ; un nom de workflow lu au rollup va à son dernier run.
+        runs_of: dict = {}
+        by_workflow: dict = {}
+        for row in suite.get("runs", ()):
+            workflow = row.get("workflow") or ""
+            if workflow and (workflow not in by_workflow
+                             or int(row["id"]) > int(by_workflow[workflow]["id"])):
+                by_workflow[workflow] = row
+        for name in inconclusive:
+            if name in by_workflow:
+                runs_of[name] = _run_ref(by_workflow[name])
         for attempt in _suite_runs(suite, run):
             for job in attempt["jobs"]:
                 label = "%s (%s; %s)" % (
@@ -578,6 +590,7 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
                     continue
                 elif _job_inconclusive(job):
                     inconclusive.append(label)
+                    runs_of[label] = _run_ref(attempt)
         if not aggregate_ok:
             # Never silently reject an absent/cancelled aggregate with empty
             # diagnostic lists, and never let an older green redeem it.
@@ -588,9 +601,16 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         acceptable = bool(aggregate_ok and not negative and not pending
                           and not reading.get("missing") and not reading.get("unconcluded"))
         return dict(reading, green=acceptable, acceptable=acceptable,
-                    negative=negative, pending=pending, inconclusive=inconclusive)
+                    negative=negative, pending=pending, inconclusive=inconclusive,
+                    inconclusive_runs=runs_of)
     except plan_github.GithubError as exc:
         raise TransientReleaseError("CI of %s unreadable: %s" % (sha[:12], exc)) from exc
+
+
+def _run_ref(run: dict) -> dict:
+    """#5627 : le run d'un non concluant, tel que le lot de correction le cite."""
+    return {"id": int(run["id"]), "url": run.get("url") or "",
+            "workflow": run.get("workflow") or "", "conclusion": run.get("conclusion") or ""}
 
 
 def suite_reading(project: "ProjectRelease", sha: str) -> dict:
@@ -1650,31 +1670,140 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
 # release commit, tag, GitHub release
 # --------------------------------------------------------------------------
 
-def _open_correction(db, project: "ProjectRelease", plan: "Plan"):
+#: #5627 : les notes de lot qui tracent une annulation **volontaire** d'un
+#: run. Le portier de paquet écrit la première (`ci._cancel_runs`) ; un
+#: opérateur ou le pilote qui annule à la main consigne la seconde, motif
+#: compris : `ameesh work note <lot> "ci-cancel: run <id> — <motif>"`.
+CANCEL_TRACES = ("packet portier: cancel run ", "ci-cancel: run ")
+#: #5627 : la fenêtre de relecture de ces notes (une release relit la veille)
+CANCEL_TRACE_WINDOW_S = 14 * 86400
+
+
+def deliberate_cancel(db, run_id: int, *, now: float | None = None) -> str:
+    """#5627 : la trace d'une annulation volontaire du run `run_id`, ou "".
+
+    Une note du portier compte si elle dit la demande partie (`requested`) ;
+    une note `ci-cancel:` compte si elle porte un motif après le numéro. Un
+    autre run dont le numéro commence pareil ne compte pas. Une lecture
+    impossible rend "" : le lot s'ouvre, mieux vaut un doublon qu'un suivi
+    perdu."""
+    ops = storage.of(db).work
+    since = (time.time() if now is None else now) - CANCEL_TRACE_WINDOW_S
+    number = str(int(run_id))
+    for prefix in CANCEL_TRACES:
+        try:
+            rows = ops.events_noted(prefix + number, since) or ()
+        except Exception:  # noqa: BLE001 - sans lecture, aucune annulation prouvée
+            continue
+        for row in rows:
+            note = str(row.get("note") or "")
+            rest = note[len(prefix) + len(number):]
+            if rest[:1].isdigit():
+                continue
+            if prefix == CANCEL_TRACES[0]:
+                if "requested" not in rest:
+                    continue
+            elif not rest.strip(" \t:;,.-—–"):
+                continue
+            return "lot #%s, %s : %s" % (row.get("work_item_id") or "?",
+                                         row.get("actor") or "?", " ".join(note.split())[:200])
+    return ""
+
+
+def correction_groups(plan: "Plan", db=None) -> list:
+    """#5627 : les non concluants de la tête regroupés par run.
+
+    Un groupe `{run, checks, cancelled}` par run (le run cité, ses checks) ;
+    un non concluant dont le run est inconnu (statut de commit, application
+    externe) reste seul dans son groupe (`run` None), comme avant. Un run
+    annulé dont l'annulation est tracée (`deliberate_cancel`) porte la trace
+    dans `cancelled` : il n'ouvre aucun lot, il est cité dans le rapport."""
+    runs = plan.ci.get("inconclusive_runs") or {}
+    groups: dict = {}
+    for text in plan.ci.get("inconclusive") or ():
+        run = runs.get(text)
+        key = ("run", int(run["id"])) if run else ("check", text)
+        group = groups.setdefault(key, {"run": run, "checks": [], "cancelled": ""})
+        group["checks"].append(text)
+    out = list(groups.values())
+    if db is not None:
+        for group in out:
+            run = group["run"]
+            if run and str(run.get("conclusion") or "").lower() == "cancelled":
+                group["cancelled"] = deliberate_cancel(db, run["id"])
+    return out
+
+
+def _cancel_deviation(plan: "Plan", groups) -> list:
+    """#5627 : les lignes de rapport des runs annulés volontairement."""
+    return ["tête %s: run %s (%s) annulé volontairement (%s) — non concluants "
+            "non consignés en lot : %s"
+            % (plan.head[:12], group["run"]["id"], group["run"].get("workflow") or "?",
+               group["cancelled"], ", ".join(group["checks"]))
+            for group in groups or () if group.get("cancelled")]
+
+
+def _open_correction(db, project: "ProjectRelease", plan: "Plan", groups=None):
     """#3085 : ouvre le lot de correction d'un check non concluant qui n'a pas
     retenu la release (règle owner du 23/10). Suivi seulement : la release
     n'en dépend pas, et un échec d'écriture ne la défait pas.
     #3209 : un lot par check tant qu'il est ouvert, clé partagée avec le
-    paquet (`radar.nonconclusive_source`) ; une nouvelle occurrence y est notée."""
+    paquet (`radar.nonconclusive_source`) ; une nouvelle occurrence y est notée.
+    #5627 : un lot par **run** (la liste de ses checks), clé du workflow
+    (`nonconclusive:<app>:run:<workflow>`) dès deux checks — un check seul
+    garde la clé partagée de #3209 ; un run annulé volontairement
+    (`deliberate_cancel`) n'ouvre rien, il est cité dans le rapport."""
     from . import work
     out = []
-    for text in plan.ci.get("inconclusive") or ():
+    for group in correction_groups(plan, db) if groups is None else groups:
+        if group.get("cancelled"):
+            continue
+        run = group["run"]
         try:
+            if run is None or len(group["checks"]) == 1:
+                # un check seul garde la clé du check, partagée avec le paquet
+                # (#3209) : un run à une ligne est déjà un lot par run.
+                text = group["checks"][0]
+                out.append(work.add_or_note(
+                    db,
+                    title="CI non concluante sur %s@%s : corriger %s"
+                          % (project.name, plan.head[:12], text),
+                    type="bug", priority=2, app=project.name,
+                    source=radar.nonconclusive_source(project.name, text),
+                    occurrence=("de nouveau non concluant sur la tête %s releasée en %s : %s"
+                                % (plan.head[:12], plan.version, text)),
+                    body=("Le check suivant n'a pas conclu (ni vert ni négatif) sur la "
+                          "tête %s releasée en %s : %s.\n\nRègle owner du 23/10 (canon home "
+                          "§3) : un résultat non concluant ne bloque pas la release ; il se "
+                          "consigne et ouvre ce lot de correction. Rejouer ou réparer le "
+                          "check, sans refaire la release. Tant que ce lot est ouvert, les "
+                          "occurrences suivantes y sont notées."
+                          % (plan.head, plan.version, text)),
+                    actor="ameesh"))
+                continue
+            workflow = run.get("workflow") or "run %s" % run["id"]
+            checks = "\n".join("- %s" % text for text in group["checks"])
             out.append(work.add_or_note(
                 db,
-                title="CI non concluante sur %s@%s : corriger %s"
-                      % (project.name, plan.head[:12], text),
+                title="CI non concluante sur %s@%s : corriger %s (run %s, %d check(s))"
+                      % (project.name, plan.head[:12], workflow, run["id"],
+                         len(group["checks"])),
                 type="bug", priority=2, app=project.name,
-                source=radar.nonconclusive_source(project.name, text),
-                occurrence=("de nouveau non concluant sur la tête %s releasée en %s : %s"
-                            % (plan.head[:12], plan.version, text)),
-                body=("Le check suivant n'a pas conclu (ni vert ni négatif) sur la "
-                      "tête %s releasée en %s : %s.\n\nRègle owner du 23/10 (canon home "
-                      "§3) : un résultat non concluant ne bloque pas la release ; il se "
-                      "consigne et ouvre ce lot de correction. Rejouer ou réparer le "
-                      "check, sans refaire la release. Tant que ce lot est ouvert, les "
-                      "occurrences suivantes y sont notées."
-                      % (plan.head, plan.version, text)),
+                source=radar.nonconclusive_source(project.name, "run:%s" % workflow),
+                occurrence=("de nouveau non concluant sur la tête %s releasée en %s : "
+                            "run %s (%s), %d check(s) :\n%s"
+                            % (plan.head[:12], plan.version, run["id"],
+                               run.get("conclusion") or "?", len(group["checks"]), checks)),
+                body=("Le run %s (%s, %s) n'a pas conclu (ni vert ni négatif) sur la "
+                      "tête %s releasée en %s. Checks non concluants :\n%s\n\nRègle owner "
+                      "du 23/10 (canon home §3) : un résultat non concluant ne bloque pas "
+                      "la release ; il se consigne et ouvre ce lot de correction, un par "
+                      "run (#5627). Rejouer ou réparer le run, sans refaire la release. "
+                      "Tant que ce lot est ouvert, les runs suivants du même workflow y "
+                      "sont notés. Une annulation volontaire se trace par une note "
+                      "`ci-cancel: run <id> — <motif>` : elle n'ouvre alors aucun lot."
+                      % (run["id"], workflow, run.get("url") or "?", plan.head, plan.version,
+                         checks)),
                 actor="ameesh"))
         except Exception:  # noqa: BLE001 - la release est écrite, le lot est un suivi
             continue
@@ -2884,10 +3013,15 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
         return report
 
     deviations = _unconcluded_deviation(plan, reruns)
-    if plan.ci.get("inconclusive"):
+    # #5627 : lu avant la release (citée dans ses notes), écrit après elle
+    groups = correction_groups(plan, db) if plan.ci.get("inconclusive") else []
+    consigned = [text for group in groups if not group.get("cancelled")
+                 for text in group["checks"]]
+    if consigned:
         deviations.append(
             "tête %s: checks non concluants non bloquants (%s) — consignés, lot de "
-            "correction ouvert" % (plan.head[:12], ", ".join(plan.ci["inconclusive"])))
+            "correction ouvert" % (plan.head[:12], ", ".join(consigned)))
+    deviations += _cancel_deviation(plan, groups)
     if plan.tree_green:
         deviations.append(
             "tête %s: CI %s, arbre identique à la tête de paquet %s "
@@ -2943,10 +3077,10 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
     tag = landed["tag"]
     fetch(project.repo, project.remote, project.target)
     ensure_github_release(project, tag, plan.version, plan.notes, version_sha, deviations)
-    if plan.ci.get("inconclusive") and db is not None:
+    if consigned and db is not None:
         # #3085 : la release est publiée ; le suivi du non concluant s'ouvre
         # après elle, il ne la retient ni ne la défait.
-        _open_correction(db, project, plan)
+        _open_correction(db, project, plan, groups)
     # Staging deploys the tag's commit V (the green content), never the main
     # head; `origin/main` now contains the landing merge M when main was red.
     staging = (None if no_staging else

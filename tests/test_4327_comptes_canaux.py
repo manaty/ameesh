@@ -476,6 +476,9 @@ class SignedChannelRefusalTest(Fixture,support.PgTestCase):
         self.assertFalse(self.signed().validate(self.operation,scopes['revoke'],'revoke'))
         with self.assertRaises(Exception): self.backend.revoke(self.operation,self.view['id'])
         self.assertTrue(self.path(HANDOFF_KEY).exists())
+        # #5629: the revoke is signed now, not at setUp — the proof refuses an
+        # approval dated more than 120 s past the authority clock (psql load)
+        self.now=time.time()
         text=self.backend.revoke_question(self.operation,int(self.now)+600)['question']
         view=self.ask(text,channels.REVOKE_OPTIONS); self.sign(view,'revoke')
         revoke=self.signed(view=view,revoke=True)
@@ -498,6 +501,9 @@ class SignedChannelRefusalTest(Fixture,support.PgTestCase):
         self.assertEqual(self.backend.install(self.operation,self.view['id'],authority=self.signed())['outcome'],
                          'installed')
         self.assertTrue(self.path(HANDOFF_KEY).exists())
+        # #5629: the revoke is signed now, not at setUp — the proof refuses an
+        # approval dated more than 120 s past the authority clock (psql load)
+        self.now=time.time()
         text=self.backend.revoke_question(self.operation,int(self.now)+600)['question']
         view=self.ask(text,channels.REVOKE_OPTIONS)
         revoke='revoke — saisi par le bureau, délégation §10'

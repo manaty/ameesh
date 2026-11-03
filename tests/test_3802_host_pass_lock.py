@@ -25,7 +25,7 @@ from ameesh import (build_artifacts, exploitation, housekeeping as hk,
 from ameesh.housekeeping import HOST_PASS_ALERT_AFTER_S, PassBudget, _PassExpired
 from ameesh.platform import session_lock
 
-from .support import PgTestCase
+from .support import PgTestCase, scaled
 
 
 def _fd_for(path: str) -> list[int]:
@@ -691,7 +691,10 @@ class HostPassBlockedTest(PgTestCase):
 
         with mock.patch.object(hk, "reap_containers", side_effect=slow):
             report = hk.run_pass(self.cfgl, self.db, self.policy, host="pc",
-                                 actor="test", artifact_scan=False, budget_s=0.4)
+                                 actor="test", artifact_scan=False,
+                                 # #5629 : la phase registry (base) doit
+                                 # tenir dans le budget, même sous psql chargé
+                                 budget_s=scaled(1.0))
         self.assertEqual(report["status"], "timed_out")
         rows = self._blocked_rows()
         self.assertEqual(len(rows), 1, rows)

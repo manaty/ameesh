@@ -1071,6 +1071,7 @@ class Watcher:
         #: téléchargement de carte raté n'est pas retenté à chaque échec du
         #: même dépôt (N2 du gel #20746).
         self._packet_shared: dict = {}
+        self._disk_reads: dict = {}
 
     def _cache_ttl(self) -> float:
         """La garde des lectures CI : le réglage `github.ci_ttl`, sinon le défaut."""
@@ -1306,6 +1307,7 @@ class Watcher:
                          % " ".join(str(exc).split())[:200])
             try:
                 storage.of(db).ci.prune_maps(repos)
+                storage.of(db).ci.prune_disks(repos)
             except Exception as exc:  # noqa: BLE001 - cache seulement, jamais fatal
                 self.log("CI: map rows outside the active perimeter not pruned (%s)"
                          % " ".join(str(exc).split())[:200])
@@ -1368,7 +1370,23 @@ class Watcher:
         # dizaines de secondes en saturation) et ne doit pas les retarder
         self._guard(db, repo)
         self._map(db, repo, bases)
+        self._disks(db, repo, bases)
         return out
+
+    def _disks(self, db, repo: str, bases=BASE_BRANCHES) -> None:
+        from . import ci_disk, plan_github
+        if ci_disk.WORKFLOW not in (self.discovered_workflows(repo) or ()):
+            return
+        now = float(self.clock())
+        if now - self._disk_reads.get(repo, float('-inf')) < ci_disk.READ_INTERVAL:
+            return
+        self._disk_reads[repo] = now
+        try:
+            ci_disk.collect(self.api, repo, (tuple(bases) or BASE_BRANCHES)[0], storage.of(db).ci)
+        except plan_github.GithubRateLimited:
+            raise
+        except Exception as exc:  # noqa: BLE001 — garde les dernières mesures, leur âge alerte
+            self.log('CI %s: disk annotations unreadable (%s)' % (repo, str(exc)[:200]))
 
     def _map(self, db, repo: str, bases=BASE_BRANCHES) -> None:
         """#3344 : la dernière carte de mesure publiée sur la base du dépôt.

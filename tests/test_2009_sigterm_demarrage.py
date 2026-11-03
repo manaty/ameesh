@@ -43,7 +43,7 @@ from ameesh import config as config_mod
 from ameesh import mail, registry
 from ameesh import runner as runner_mod
 
-from .support import SRC, PgTestCase
+from .support import SRC, PgTestCase, scaled
 
 
 class _FakeDb:
@@ -457,13 +457,16 @@ class ReveilCourrierPendantLeDrainageTest(PgTestCase):
         return proc
 
     def test_reveil_courrier_pendant_le_drainage_ne_lance_aucun_tour(self):
+        # #5629 : le tour doit durer jusqu'à l'envoi du message (plusieurs
+        # secondes sous psql chargé), sinon le message n'arrive pas pendant
+        # le drainage ; la borne de `communicate` est à la même échelle
         proc = self._lance("drain-courrier", AMEESH_DRAIN_SECONDS="120",
-                           AMEESH_TEST_SLEEP="6")
+                           AMEESH_TEST_SLEEP=str(int(scaled(6))))
         proc.send_signal(signal.SIGTERM)
         time.sleep(0.5)
         message_id = mail.send(self.db, "pair", "drain-courrier",
                                "message reçu pendant le drainage")
-        sortie, _ = proc.communicate(timeout=60)
+        sortie, _ = proc.communicate(timeout=scaled(60))
         self.assertEqual(proc.returncode, 0, sortie)
         self.assertIn("draining", sortie)
         self.assertEqual(len(self.turns()), 1, "aucun tour ne part après le SIGTERM")

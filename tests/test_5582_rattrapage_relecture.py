@@ -15,13 +15,19 @@ Deux gardes, complémentaires :
   borne) : aucun `Seq Scan` de `work_item_events`, et le filtre
   `agent_mesh_merged_annulled` n'est jamais appliqué à un nœud qui lit des
   centaines de jalons — seulement aux candidats qui passent les barrières
-  bon marché. L'exécution reste sous 100 ms ;
+  bon marché. Le coût est borné par les **tampons** du plan (structure
+  indépendante de la charge de l'hôte) ; le temps réel est journalisé, jamais
+  seuillé : sous la charge de la CI il dépasse 100 ms sans que le plan change
+  (#5606) ;
 * une garde statique qui refuse de replier les barrières coûteuses dans la
   sélection matérialisée (`_missing_ref_pre_gates`) et exige la clôture
   `MATERIALIZED` dans `items_missing_ref` : la forme qui a coûté 3,7 s ne peut
   pas revenir sans faire rougir les tests ;
 * un témoin de sélection : un jalon `merged` annulé par une correction
-  `merged → build` ne rend pas un lot dû, une refusion postérieure le rend.
+  `merged → build` ne rend pas un lot dû, une refusion postérieure le rend ;
+* un témoin négatif : la requête d'avant #5582 (toutes les barrières dans un
+  seul `WHERE`, sans `MATERIALIZED`) est refusée par la même garde — elle
+  évalue l'annulation sur les 2 700 jalons depuis la borne.
 """
 from __future__ import annotations
 
@@ -31,6 +37,7 @@ import os
 import unittest
 
 from ameesh import db as db_mod, review_lot, storage, work
+from ameesh.storage.postgres.work import item_columns
 
 from .support import PgTestCase, SRC
 
@@ -41,8 +48,12 @@ BOUND_DAYS = 17
 #: au-delà, le nœud qui porte l'annulation lit un balayage, pas une poignée de
 #: candidats (le central en compte 2 700 depuis la borne).
 BROAD_ROWS = 500
-#: borne d'exécution du constat #5579 (3,7 s avant correctif).
-MAX_MS = 100.0
+#: tampons (lus + trouvés) que le plan du rattrapage peut toucher sur la
+#: fixture : 17 103 pour le plan borné, 113 481 pour le plan d'origine, mesuré
+#: sans les index 0538 (#5579). Les tampons dépendent de la forme du plan, pas
+#: de la charge de l'hôte ; l'`Execution Time`, lui, n'est que journalisé
+#: (#5606).
+MAX_PLAN_BUFFERS = 50_000
 
 
 # -- plan -------------------------------------------------------------------
@@ -84,6 +95,41 @@ def _broad_annulled(roots) -> list[str]:
         for node in _nodes(roots)
         if _annulled_rows(node) >= BROAD_ROWS
     ]
+
+
+def _buffers(measured) -> int:
+    """Les tampons partagés (lus + trouvés) touchés par le plan.
+
+    Indépendant de la charge : une page trouvée en cache compte comme une page
+    lue ; seule la forme du plan décide du nombre de pages visitées (#5606).
+    """
+    node = measured["Plan"]
+    return (int(node.get("Shared Hit Blocks") or 0)
+            + int(node.get("Shared Read Blocks") or 0))
+
+
+def _plan_problems(roots, measured) -> list[str]:
+    """Les violations de la garde de plan (#5582, #5606).
+
+    Une assertion unique : liste vide = plan conforme. Le témoin négatif de
+    `test_le_plan_ne_balaye_pas_le_journal_et_borne_l_annulation` applique la
+    même garde à la requête d'avant #5582 et attend une liste non vide.
+    """
+    problems: list[str] = []
+    scans = _seq_scans(roots, EVENTS)
+    if scans:
+        problems.append("Seq Scan du journal : %s" % ", ".join(scans))
+    broad = _broad_annulled(roots)
+    if broad:
+        problems.append("annulation sur un balayage : %s" % ", ".join(broad))
+    buffers = _buffers(measured)
+    if buffers <= 0:
+        # N de relecture : sans les clés BUFFERS, un 0 passerait la borne pour
+        # rien et le plan ne serait pas gardé du tout.
+        problems.append("tampons absents du plan (EXPLAIN (BUFFERS) ?)")
+    elif buffers >= MAX_PLAN_BUFFERS:
+        problems.append("%d tampons >= %d" % (buffers, MAX_PLAN_BUFFERS))
+    return problems
 
 
 class ReviewCatchUpPlanDbTest(PgTestCase):
@@ -197,12 +243,37 @@ class ReviewCatchUpPlanDbTest(PgTestCase):
         self.assertIn("MATERIALIZED", captured["sql"], captured["sql"])
         return captured["sql"], captured["params"], rows
 
+    def _legacy_selection(self):
+        """La requête d'avant #5582 : toutes les barrières dans un seul WHERE.
+
+        Même filtre (`_missing_ref_gates`), sans la clôture `MATERIALIZED`
+        posée par #5582 : c'est la forme dont le plan évaluait l'annulation sur
+        les 2 700 jalons depuis la borne (#5579). Elle sert de témoin négatif
+        à la garde, sans être une seconde implémentation du filtre.
+        """
+        wanted = [str(state) for state in work.MERGED_STATES]
+        params: list = list(wanted)
+        gates = storage.of(self.db).work._missing_ref_gates(
+            params, ref_prefix=review_lot.PREFIX + "#",
+            attempt_prefix=review_lot.ATTEMPT_PREFIX,
+            retry_s=review_lot.ATTEMPT_RETRY_S,
+            terminal_prefix=review_lot.TERMINAL_PREFIX,
+            max_attempts=review_lot.CATCH_UP_MAX_ATTEMPTS,
+            since=self.bound)
+        sql = ("SELECT %s FROM work_items w WHERE w.state IN (%s)%s"
+               " ORDER BY w.updated_at DESC, w.id DESC LIMIT %%s"
+               % (item_columns(self.db, "w"),
+                  ", ".join(["%s"] * len(wanted)), gates))
+        params.append(int(review_lot.CATCH_UP_LIMIT))
+        return sql, tuple(params)
+
     def _plan(self, sql, params):
         """Plan réel, sous psycopg (le pilote psql enveloppe `EXPLAIN`).
 
         La part psql de la CI n'installe pas psycopg : le témoin y est sauté,
-        jamais faux. Le premier passage chauffe les index, le second est
-        mesuré (le constat porte sur la requête chaude, appelée en continu).
+        jamais faux. Le premier passage chauffe les index, le second porte les
+        assertions (le constat porte sur la requête chaude, appelée en
+        continu).
         """
         driver = self.db
         if not isinstance(driver, db_mod.PsycopgDriver):
@@ -229,17 +300,32 @@ class ReviewCatchUpPlanDbTest(PgTestCase):
         self._plan(sql, params)                      # chauffe les index
         roots, measured = self._plan(sql, params)
 
-        self.assertEqual(_seq_scans(roots, EVENTS), [],
-                         "aucun Seq Scan de work_item_events (#5579)")
+        self.assertGreater(
+            _buffers(measured), 0,
+            "EXPLAIN (BUFFERS) doit rendre les tampons du plan (#5606)")
+        print("#5582 plan execution ms:", measured["Execution Time"],
+              "buffers:", _buffers(measured))
         self.assertEqual(
-            _broad_annulled(roots), [],
-            "l'annulation ne s'évalue que sur les candidats, pas sur le "
-            "balayage des %d jalons (#5582)\n%s"
-            % (self.RECENT, json.dumps(roots, indent=1)))
-        self.assertLess(
-            float(measured["Execution Time"]), MAX_MS,
-            "le rattrapage doit rester sous %g ms (était 3,7 s, #5579)"
-            % MAX_MS)
+            _plan_problems(roots, measured), [],
+            "garde de plan #5582/#5606 (borne %d tampons ; plan d'origine "
+            "sans les index 0538 : 113 481) :\n%s"
+            % (MAX_PLAN_BUFFERS, json.dumps(roots, indent=1)))
+
+        # Témoin négatif : la requête d'avant #5582, sans MATERIALIZED, rend
+        # les mêmes lots mais évalue l'annulation sur les 2 700 jalons. Avec
+        # les index 0538 elle ne dépasse plus la borne de tampons (27 382) ;
+        # c'est la garde de lignes qui la refuse encore, et c'est elle qui
+        # porte le correctif sur le central (#5579, 3,7 s).
+        legacy_sql, legacy_params = self._legacy_selection()
+        legacy_rows = self.db.query(legacy_sql, legacy_params)
+        self.assertEqual([int(row["id"]) for row in legacy_rows],
+                         list(self.MISSING),
+                         "le témoin négatif doit rendre les mêmes manquants")
+        legacy_roots, legacy = self._plan(legacy_sql, legacy_params)
+        self.assertNotEqual(
+            _plan_problems(legacy_roots, legacy), [],
+            "le témoin négatif (requête d'avant #5582) doit être refusé par "
+            "la même garde ; sinon elle ne prouve rien")
 
     def test_les_index_du_journal_sont_presents(self):
         """La migration additive 0538 pose les deux index de la lecture."""

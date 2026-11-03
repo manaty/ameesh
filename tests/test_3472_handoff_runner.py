@@ -156,15 +156,23 @@ class RunnerLifecycleTest(PgTestCase):
         for host in ("source", "target"):
             self.api.canon.record_state(host, "ok", root="/canon", source="local", commit=fixtures.COMMIT,
                                         good=True, diagnostic="")
+            for harness in ("codex", "gh", "gcloud"):
+                self.api.credentials.report(host, harness, "", "healthy", source="manual")
+        self.fresh_readings()
+        self.limits = dict(resources.thresholds({"resources": {"min_mem_available": "4GiB",
+                                                               "min_disk_free": "1GiB"}}), max_agents=4)
+        self.adapter = drain_fixtures.Adapter()
+
+    def fresh_readings(self):
+        """Relevés frais des deux hôtes. #5629 : un relevé vieillit en
+        `host_lifecycle.MIN_STALENESS_S` (180 s) ; sous psql chargé, un aller
+        et retour en prend plus que ça : chaque phase repart de relevés frais."""
+        fixtures = drain_fixtures.fixtures
+        for host in ("source", "target"):
             for _ in range(3):
                 self.api.hosts.record({"host": host, "mem_available_bytes": 24*fixtures.GIB,
                                       "swap_used_bytes": 0, "cpu_count": 8, "load1": 0.0,
                                       "disk_free_bytes": 100*fixtures.GIB, "gate_state": "available"})
-            for harness in ("codex", "gh", "gcloud"):
-                self.api.credentials.report(host, harness, "", "healthy", source="manual")
-        self.limits = dict(resources.thresholds({"resources": {"min_mem_available": "4GiB",
-                                                               "min_disk_free": "1GiB"}}), max_agents=4)
-        self.adapter = drain_fixtures.Adapter()
 
     def requirements(self, agent, target):
         return host_preflight.Requirements(target, agent["harness"], secret_refs=("mesh/api",))
@@ -198,6 +206,7 @@ class RunnerLifecycleTest(PgTestCase):
             Runner.host_lifecycle_once(self.runner(), self.db)
         self.assertEqual(registry.get(self.db, "dev")["host"], "target")
         self.assertIsNotNone(registry.claim(self.db, "dev", "target-runner", ttl_seconds=300))
+        self.fresh_readings()
         self.api.host_lifecycle.undrain("source", actor="orch")
         for _ in range(9):
             Runner.host_lifecycle_once(self.runner(), self.db)

@@ -9735,6 +9735,13 @@ class AgentWorker(threading.Thread):
             self.nudged = True
         with self.runner.lock:
             self.runner.turns += 1
+        # #5637 : un tour fini est un événement de la boucle de l'exécuteur
+        # (plafond `--max-turns`, redémarrage entre tours, drainage), pas du
+        # NOTIFY `agent_lease` — non durable, une coupure d'écoute le perd.
+        # Sans ce réveil, la sortie attendait le sondage (`--poll`, 60 s) : le
+        # témoin de réveil, borné à 30 s, rougissait sous charge (CI main
+        # 41623141035).
+        self.runner.wake_all.set()
         return ok
 
     def _turn_closed(self, raison: str, duration: float) -> None:
@@ -11774,6 +11781,12 @@ class Runner:
                 else:
                     with self.lock:
                         self.workers[agent["name"]] = worker
+                    # #5637 : inscrit dans `workers` est la condition exacte
+                    # sous laquelle un NOTIFY de courrier trouve ce worker. Le
+                    # journal le dit, pour que les témoins attendent ce point
+                    # plutôt qu'un délai fixe (le NOTIFY arrivé avant
+                    # l'inscription était perdu, #3877).
+                    log("worker serving: %s" % agent["name"])
                     registered = True
                     worker.start()
             except BaseException:

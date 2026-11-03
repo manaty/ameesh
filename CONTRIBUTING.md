@@ -37,10 +37,10 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 - **Tests dépendants de l'environnement** (#5427) : un test qui lit l'horloge,
   le jour, le disque ou le CPU de l'hôte sans fixture est un défaut **du
   test** (canon §3), pas une instabilité à relancer. Le lint
-  `scripts/test-hermeticity-lint.py` le signale (règles H1 à H5) ; le gel
-  l'avertit sans le bloquer (`scripts/freeze-checks.py`, règles H4/H5 sur les
-  seuls tests que le lot change), et la passe nocturne
-  `.github/workflows/horloge.yml` rejoue les tests du jour sous libfaketime
+  `scripts/test-hermeticity-lint.py` le signale (règles H1 à H6) ; le gel
+  l'avertit sans le bloquer (`scripts/freeze-checks.py`, règles H4/H5/H6 sans
+  diff, toutes règles sur les seuls tests que le lot change), et la passe
+  nocturne `.github/workflows/horloge.yml` rejoue les tests du jour sous libfaketime
   (23:45 et 00:05 UTC) et sous un fuseau extrême. Un rouge ouvre un ticket
   « test dépendant de l'environnement » que la veille GitHub convertit en lot.
   Injectez l'horloge (`now=…`, `HorlogeSimulee`) ou fixez la valeur.

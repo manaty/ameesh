@@ -22,7 +22,7 @@ from ameesh import background, capacity_guard, config as config_mod, host_gate, 
 from ameesh import relocation, storage
 from ameesh.runner import AgentWorker
 
-from .support import EMPTY_CONFIG, REPO, PgTestCase
+from .support import EMPTY_CONFIG, REPO, PgTestCase, scaled
 
 GOLDEN = os.path.join(REPO, "tests", "dore", "capacity_guard")
 
@@ -33,8 +33,11 @@ def _golden(name: str) -> dict:
 
 
 def _write_state(path: str, **fields) -> dict:
+    # #5629 : l'état vit plus longtemps que les attentes (mises à l'échelle)
+    # qui le lisent ; un état périmé ferme la porte (repli `stopped`), un
+    # état trop lointain aussi (`MAX_STATE_TTL_S`) : l'allongement est borné
     doc = {"schema": capacity_guard.SCHEMA_HOST_STATE, "seq": 1, "state": "available",
-           "expires_ts": time.time() + 90}
+           "expires_ts": time.time() + min(scaled(90), capacity_guard.MAX_STATE_TTL_S - 30)}
     doc.update(fields)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -984,12 +987,12 @@ class RunnerObeysTheGateTest(PgTestCase):
             AMEESH_HOST_GATE="file", AMEESH_HOST_GATE_FALLBACK="stopped",
             AMEESH_HOST_GATE_PATH=self.state_path, AMEESH_HOST_GATE_ACK=self.ack_path,
             **env))
-        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait(10)))
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait(scaled(10))))
         return proc
 
     def stop(self, proc) -> str:
         proc.terminate()
-        out, _ = proc.communicate(timeout=60)
+        out, _ = proc.communicate(timeout=scaled(60))  # #5629 : borne haute
         return out
 
     def test_closed_by_default_then_claims_when_available(self):
@@ -1005,15 +1008,18 @@ class RunnerObeysTheGateTest(PgTestCase):
 
     def test_draining_stops_the_turn_at_a_safe_point_and_returns_the_lease(self):
         _write_state(self.state_path, seq=2)
-        calls = [{"tool": True, "sleep": 1.0} for _ in range(20)]
+        # #5629 : sous charge, échéance, borne du point sûr et longueur du tour
+        # s'allongent ensemble — borne < échéance, et le tour dure plus que la
+        # borne : il est arrêté au point sûr, ni par l'échéance ni par sa fin
+        calls = [{"tool": True, "sleep": 1.0} for _ in range(int(scaled(20)))]
         proc = self.launch("retrait", AMEESH_TEST_CLAUDE_CALLS=json.dumps(calls))
         self.wait_for(lambda: len(self.turns()) == 1, timeout=30)
         start = time.monotonic()
         _write_state(self.state_path, seq=3, state="draining", reason="app_memory",
-                     drain_deadline_ts=time.time() + 60)
+                     drain_deadline_ts=time.time() + scaled(60))
         ack = self.wait_for(lambda: (self.ack().get("seq") == 3 and self.ack().get("drained")
                                      and self.ack()), timeout=30)
-        self.assertLess(time.monotonic() - start, 15)  # a safe point, not the deadline
+        self.assertLess(time.monotonic() - start, scaled(15))  # a safe point, not the deadline
         self.assertEqual((ack["held"], ack["in_turn"]), ([], []))
         row = registry.get(self.db, "retrait")
         self.assertEqual(row["pending_prompt"], "consigne du tour")  # back in the queue
@@ -1028,7 +1034,9 @@ class RunnerObeysTheGateTest(PgTestCase):
 
     def test_deadline_stops_a_turn_without_safe_point(self):
         _write_state(self.state_path, seq=2)
-        proc = self.launch("echeance", AMEESH_TEST_SLEEP="60")
+        # #5629 : le tour sans point sûr dure plus que l'attente de l'échéance
+        # (mise à l'échelle) : c'est l'échéance qui l'arrête, pas sa fin
+        proc = self.launch("echeance", AMEESH_TEST_SLEEP=str(int(scaled(60))))
         self.wait_for(lambda: len(self.turns()) == 1, timeout=30)
         _write_state(self.state_path, seq=3, state="draining",
                      drain_deadline_ts=time.time() + 2)

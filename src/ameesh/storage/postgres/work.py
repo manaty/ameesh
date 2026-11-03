@@ -176,7 +176,7 @@ def has_current_item_columns(db) -> bool:
     return current
 
 
-def item_columns(db, ref: str | None = None) -> str:
+def item_columns(db, ref: str | None = None, migrations: str | None = None) -> str:
     """Les colonnes d'un lot ; `reviewer` quand 0421 est appliquée, `''` sinon
     (les lectures d'avant la migration ne cassent pas, #705).
 
@@ -193,6 +193,11 @@ def item_columns(db, ref: str | None = None) -> str:
     qu'il économise. Ces vues rendent `[]` et se replient sur le scalaire
     (`work.migration_line`), jamais sur une erreur : sur une base d'avant
     0419, la liste est de toute façon vide.
+
+    #5583 : `migrations` fournit l'expression de la colonne à la place de la
+    sous-requête corrélée — un agrégat borné que l'appelant joint. Le flux
+    GitHub (5 000 lots) ne sonde plus la table des créneaux une fois par
+    ligne ; les lectures d'une ligne gardent le comportement par défaut.
 
     #5404 : les colonnes se lisent directement. `to_jsonb(ligne)` coûtait plus
     d'une milliseconde par ligne (corps compris, quatre fois par ligne) : la
@@ -220,9 +225,11 @@ def item_columns(db, ref: str | None = None) -> str:
         lifecycle_columns = ("to_jsonb(work_items)->>'legacy_state' AS legacy_state, "
                              "to_jsonb(work_items)->>'workflow_stage' AS workflow_stage")
     if ref:
-        migrations = "'[]'::jsonb AS migrations"
+        migrations_column = "'[]'::jsonb AS migrations"
+    elif migrations is not None:
+        migrations_column = migrations
     elif has_migration_slots(db):
-        migrations = (
+        migrations_column = (
             "coalesce((SELECT jsonb_agg(jsonb_build_object("
             "'number', r.number, 'repo', r.target_repo, 'slot', r.slot)"
             " ORDER BY r.number, r.slot)"
@@ -230,13 +237,13 @@ def item_columns(db, ref: str | None = None) -> str:
             " WHERE r.work_item_id = work_items.id AND r.status = 'reserved'), '[]'::jsonb)"
             " AS migrations")
     else:
-        migrations = "'[]'::jsonb AS migrations"
+        migrations_column = "'[]'::jsonb AS migrations"
     return (_COLUMNS_TEMPLATE
             .replace("__REVIEWER__", reviewer + ", " + reviewers)
             .replace("__EXTERNAL__", external)
             .replace("__LIFECYCLE__", lifecycle_columns)
             .replace("__WAKE__", wake)
-            .replace("__MIGRATIONS__", migrations))
+            .replace("__MIGRATIONS__", migrations_column))
 
 
 def has_reviewers(db) -> bool:
@@ -4272,35 +4279,84 @@ class WorkItems(interface.WorkItems):
         #2130/D : `workflow_ref`, `workflow_stage` et `workflow_version` sont
         portés par la lecture comme B5 les porte dans `work.get` (`to_jsonb`,
         sans sonde de colonne) ; base pré-0452 : `''`, NULL, 0.
+
+        #5583 : `merged_ts` se calcule en ensemble. La fenêtre (`ids`) est
+        matérialisée une fois ; `merged` agrège les jalons de fusion par lot et
+        n'évalue `agent_mesh_merged_annulled` que là où une correction `build`
+        postérieure au dernier jalon existe (2 lots sur 5 000 au central) ; la
+        liste des créneaux de migration est un agrégat borné aux lots de la
+        fenêtre. L'ordre par id croissant est rendu en mémoire : trier 5 000
+        identifiants coûte moins que trier 5 000 lignes larges (5 Mo, tri
+        externe, diagnostic #5579).
         """
-        # #3741 : `to_jsonb(work_items)` une fois par ligne (`j.doc`), non
-        # cinq — sur les ~3 500 lignes du flux, ses cinq appels coûtaient 17 s
-        # sous charge et faisaient expirer la synchro GitHub (27 s mesurées,
-        # contre 30 s de statement_timeout). `OFFSET 0` empêche le planificateur
-        # de remonter la sous-requête latérale, ce qui recopierait l'appel à
-        # chaque référence.
-        return self.db.query(
-            "SELECT w.*, k.team AS package_team, r.team AS assignee_team,"
-            "       r.chantier AS assignee_chantier, r.host AS assignee_host,"
-            # L157 : dates prévues et fusion, pour l'en-tête de l'issue
-            "       (SELECT extract(epoch from max(m.at))::float8 FROM work_item_milestones m"
-            "         WHERE m.work_item_id = w.id AND m.kind = 'merged'"
-            "           AND " + _effective_merged("m") + ") AS merged_ts"
-            "  FROM (SELECT %s,"
-            "               coalesce(workflow_ref, '') AS workflow_ref,"
-            "               workflow_stage,"
-            "               coalesce(workflow_version, 0) AS workflow_version,"
-            "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
-            "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
-            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
-            "          FROM work_items"
-            "         WHERE state NOT IN %s OR coalesce(btrim(issue_ref), '') <> ''"
-            "            OR coalesce(workflow_ref, '') <> ''"
-            "         ORDER BY id DESC LIMIT %%s) w"
-            "  LEFT JOIN work_packages k ON k.id = w.package_id"
-            "  LEFT JOIN agent_registry r ON r.name = w.assignee"
-            " ORDER BY w.id" % (item_columns(self.db), _CLOSED),
+        slots = has_migration_slots(self.db)
+        reserved = (
+            " reserved AS MATERIALIZED ("
+            "  SELECT r.work_item_id,"
+            "         jsonb_agg(jsonb_build_object('number', r.number,"
+            "                                    'repo', r.target_repo, 'slot', r.slot)"
+            "                    ORDER BY r.number, r.slot) AS migrations"
+            "    FROM work_migration_reservations r"
+            "    JOIN ids ON ids.id = r.work_item_id"
+            "   WHERE r.status = 'reserved'"
+            "   GROUP BY r.work_item_id),") if slots else ""
+        reserved_join = (
+            " LEFT JOIN reserved res ON res.work_item_id = work_items.id"
+            if slots else "")
+        migrations_column = ("coalesce(res.migrations, '[]'::jsonb) AS migrations"
+                             if slots else "'[]'::jsonb AS migrations")
+        rows = self.db.query(
+            ("WITH ids AS MATERIALIZED ("
+             "  SELECT id FROM work_items"
+             "   WHERE state NOT IN %s OR coalesce(btrim(issue_ref), '') <> ''"
+             "      OR coalesce(workflow_ref, '') <> ''"
+             "   ORDER BY id DESC LIMIT %%s),"
+             + reserved +
+             " last_merge AS MATERIALIZED ("
+             "  SELECT i.id, lm.at"
+             "    FROM ids i"
+             "   CROSS JOIN LATERAL (SELECT max(m.at) AS at"
+             "                         FROM work_item_milestones m"
+             "                        WHERE m.work_item_id = i.id"
+             "                          AND m.kind = 'merged') lm"
+             "   WHERE lm.at IS NOT NULL),"
+             " candidates AS MATERIALIZED ("
+             "  SELECT lm.id, lm.at"
+             "    FROM last_merge lm"
+             "   WHERE EXISTS (SELECT 1 FROM work_item_events c"
+             "                  WHERE c.work_item_id = lm.id"
+             "                    AND c.state = 'build'"
+             "                    AND c.created_at >= lm.at)),"
+             " annulled AS MATERIALIZED ("
+             "  SELECT k.id"
+             "    FROM candidates k"
+             "   WHERE agent_mesh_merged_annulled(k.id, k.at)),"
+             " merged AS MATERIALIZED ("
+             "  SELECT lm.id, extract(epoch FROM lm.at)::float8 AS merged_ts"
+             "    FROM last_merge lm"
+             "   WHERE NOT EXISTS (SELECT 1 FROM annulled a WHERE a.id = lm.id))"
+             " SELECT w.*, k.team AS package_team, r.team AS assignee_team,"
+             "        r.chantier AS assignee_chantier, r.host AS assignee_host,"
+             # L157 : la date de fusion effective, pour l'en-tête de l'issue
+             "        mm.merged_ts"
+             "   FROM (SELECT %s,"
+             "                coalesce(workflow_ref, '') AS workflow_ref,"
+             "                workflow_stage,"
+             "                coalesce(workflow_version, 0) AS workflow_version,"
+             "                to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
+             "                to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
+             "                to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
+             "           FROM work_items" + reserved_join +
+             "          WHERE work_items.id IN (SELECT id FROM ids)) w"
+             "   LEFT JOIN work_packages k ON k.id = w.package_id"
+             "   LEFT JOIN agent_registry r ON r.name = w.assignee"
+             "   LEFT JOIN merged mm ON mm.id = w.id")
+            % (_CLOSED, item_columns(self.db, migrations=migrations_column)),
             (int(limit),))
+        # #5583 : l'ordre de sortie de la fenêtre est rendu ici, pas par un
+        # tri SQL des lignes larges (5 000 × ~1,6 ko, tri externe).
+        rows.sort(key=lambda row: int(row["id"]))
+        return rows
 
     def issue_refs(self, limit) -> list[dict]:
         """#5584 : `(id, issue_ref)` des lots porteurs d'une `issue_ref`, dans la

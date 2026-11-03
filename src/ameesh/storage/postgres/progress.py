@@ -4,9 +4,12 @@
 Lectures seules sur les tables existantes (`work_items`, `work_item_events`,
 `work_item_milestones` (L10),
 `actions`, `agent_registry`, `spend_pending`, `agent_mailbox`, `turn_costs`) :
-le lot L24 n'a pas de migration. Les listes de noms ou d'ids sont développées
-en marqueurs `%s` (aucun tableau lié : même SQL pour psql et psycopg) ; un
-filtre absent n'est jamais un paramètre NULL typé par le serveur.
+le lot L24 n'a pas de migration. Les listes de noms restent développées en
+marqueurs `%s` (même SQL pour psql et psycopg) ; les listes d'ids des lectures
+groupées lient UN tableau (`= ANY(%s::bigint[])`, #5585) et sont découpées en
+pages de `GROUPED_IDS_MAX` : au-delà, le SQL de 18 Ko et les 4 500 paramètres
+faisaient abandonner l'index du lot au planificateur. Un filtre absent n'est
+jamais un paramètre NULL typé par le serveur.
 """
 from __future__ import annotations
 
@@ -17,6 +20,10 @@ from .work import item_columns
 
 #: états d'action qui attendent encore quelque chose (non terminaux)
 _OPEN_ACTION_STATES = ("proposed", "approved", "launched", "unknown")
+
+#: #5585 : au plus 1 000 lots par lecture groupée. Les ids d'un lot restent
+#: dans une seule page : la fenêtre `lag` des transitions garde son sens.
+GROUPED_IDS_MAX = 1000
 
 
 _ACTION_COLUMNS = """
@@ -32,6 +39,17 @@ _ACTION_COLUMNS = """
 
 def _marks(values) -> str:
     return ", ".join(["%s"] * len(values))
+
+
+def _id_pages(item_ids):
+    """Ids entiers, sans doublon, par pages de `GROUPED_IDS_MAX` (#5585).
+
+    Dédupliquer garde le contrat de `IN`/`ANY` : un id répété ne rend pas
+    deux fois la même ligne, même quand il tombe dans deux pages.
+    """
+    ids = list(dict.fromkeys(int(i) for i in item_ids))
+    for start in range(0, len(ids), GROUPED_IDS_MAX):
+        yield ids[start:start + GROUPED_IDS_MAX]
 
 
 class Progress(interface.Progress):
@@ -53,40 +71,42 @@ class Progress(interface.Progress):
         return self.db.query(sql, tuple(params))
 
     def lot_events(self, item_ids) -> list[dict]:
-        ids = [int(i) for i in item_ids]
-        if not ids:
-            return []
-        return self.db.query(
-            "SELECT id, work_item_id, state, note, actor,"
-            "       extract(epoch from created_at)::float8 AS created_ts"
-            "  FROM work_item_events WHERE work_item_id IN (%s)"
-            " ORDER BY id" % _marks(ids), tuple(ids))
+        rows: list[dict] = []
+        for page in _id_pages(item_ids):
+            rows += self.db.query(
+                "SELECT id, work_item_id, state, note, actor,"
+                "       extract(epoch from created_at)::float8 AS created_ts"
+                "  FROM work_item_events WHERE work_item_id = ANY(%s::bigint[])"
+                " ORDER BY id", (page,))
+        return sorted(rows, key=lambda row: int(row["id"]))
 
     def lot_transitions(self, item_ids) -> list[dict]:
-        ids = [int(i) for i in item_ids]
-        if not ids:
-            return []
         # Seules les lignes où l'état change sortent : le texte des notes
         # (des mégaoctets sur une liste de lots) n'est ni lu ni transféré.
-        return self.db.query(
-            "SELECT id, work_item_id, state, actor,"
-            "       extract(epoch from created_at)::float8 AS created_ts"
-            "  FROM (SELECT id, work_item_id, state, actor, created_at,"
-            "               lag(state) OVER (PARTITION BY work_item_id"
-            "                               ORDER BY id) AS prev"
-            "          FROM work_item_events WHERE work_item_id IN (%s)) marked"
-            " WHERE prev IS DISTINCT FROM state"
-            " ORDER BY id" % _marks(ids), tuple(ids))
+        rows: list[dict] = []
+        for page in _id_pages(item_ids):
+            rows += self.db.query(
+                "SELECT id, work_item_id, state, actor,"
+                "       extract(epoch from created_at)::float8 AS created_ts"
+                "  FROM (SELECT id, work_item_id, state, actor, created_at,"
+                "               lag(state) OVER (PARTITION BY work_item_id"
+                "                               ORDER BY id) AS prev"
+                "          FROM work_item_events"
+                "         WHERE work_item_id = ANY(%s::bigint[])) marked"
+                " WHERE prev IS DISTINCT FROM state"
+                " ORDER BY id", (page,))
+        return sorted(rows, key=lambda row: int(row["id"]))
 
     def lot_event_last(self, item_ids) -> list[dict]:
-        ids = [int(i) for i in item_ids]
-        if not ids:
-            return []
-        return self.db.query(
-            "SELECT work_item_id,"
-            "       extract(epoch from max(created_at))::float8 AS last_ts"
-            "  FROM work_item_events WHERE work_item_id IN (%s)"
-            " GROUP BY work_item_id" % _marks(ids), tuple(ids))
+        last: dict[int, dict] = {}
+        for page in _id_pages(item_ids):
+            for row in self.db.query(
+                    "SELECT work_item_id,"
+                    "       extract(epoch from max(created_at))::float8 AS last_ts"
+                    "  FROM work_item_events WHERE work_item_id = ANY(%s::bigint[])"
+                    " GROUP BY work_item_id", (page,)):
+                last[int(row["work_item_id"])] = row
+        return [last[lot] for lot in sorted(last)]
 
     def packet_exits(self, *, since_ts) -> list[dict]:
         from ...slo import PACKET_COMPOSITION_NOTE, VEHICLE_EXIT_MARK
@@ -100,14 +120,11 @@ class Progress(interface.Progress):
             (float(since_ts), PACKET_COMPOSITION_NOTE + "%" + VEHICLE_EXIT_MARK + "%"))
 
     def lot_hold_events(self, item_ids, patterns) -> list[dict]:
-        ids = [int(i) for i in item_ids]
-        if not ids:
-            return []
         wanted = [str(pattern) for pattern in patterns]
         if any(not pattern for pattern in wanted):
             raise ValueError("empty hold pattern")
         merged: dict[tuple[int, int], dict] = {}
-        for ev in self.lot_transitions(ids):
+        for ev in self.lot_transitions(item_ids):
             merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
         if wanted:
             # #1664 : seules les notes hold/levée sortent (motifs de
@@ -115,27 +132,31 @@ class Progress(interface.Progress):
             # mégaoctets sur une liste de lots) n'est ni lu ni transféré. La
             # ligne à note l'emporte sur la transition de même id.
             where = " OR ".join(["btrim(note, %s) ~* %s"] * len(wanted))
-            for ev in self.db.query(
-                    "SELECT id, work_item_id, state, note, actor,"
-                    "       extract(epoch from created_at)::float8 AS created_ts"
-                    "  FROM work_item_events"
-                    " WHERE work_item_id IN (%s) AND note IS NOT NULL AND (%s)"
-                    " ORDER BY id" % (_marks(ids), where),
-                    tuple(ids) + tuple(value for pattern in wanted
-                                       for value in (interface.HOLD_NOTE_WHITESPACE, pattern))):
-                merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
+            note_params = tuple(value for pattern in wanted
+                                for value in (interface.HOLD_NOTE_WHITESPACE, pattern))
+            for page in _id_pages(item_ids):
+                for ev in self.db.query(
+                        "SELECT id, work_item_id, state, note, actor,"
+                        "       extract(epoch from created_at)::float8 AS created_ts"
+                        "  FROM work_item_events"
+                        " WHERE work_item_id = ANY(%%s::bigint[])"
+                        "   AND note IS NOT NULL AND (%s)"
+                        " ORDER BY id" % where,
+                        (page,) + note_params):
+                    merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
         return sorted(merged.values(), key=lambda e: int(e["id"]))
 
     def lot_milestones(self, item_ids) -> list[dict]:
-        ids = [int(i) for i in item_ids]
-        if not ids:
-            return []
-        return self.db.query(
-            "SELECT id, work_item_id, kind, actor, verdict, sha, note,"
-            "       extract(epoch from at)::float8 AS at_ts,"
-            "       (kind = 'merged' AND agent_mesh_merged_annulled(work_item_id, at)) AS annulled"
-            "  FROM work_item_milestones WHERE work_item_id IN (%s)"
-            " ORDER BY at, id" % _marks(ids), tuple(ids))
+        rows: list[dict] = []
+        for page in _id_pages(item_ids):
+            rows += self.db.query(
+                "SELECT id, work_item_id, kind, actor, verdict, sha, note,"
+                "       extract(epoch from at)::float8 AS at_ts,"
+                "       (kind = 'merged' AND agent_mesh_merged_annulled(work_item_id, at)) AS annulled"
+                "  FROM work_item_milestones WHERE work_item_id = ANY(%s::bigint[])"
+                " ORDER BY at, id", (page,))
+        return sorted(rows, key=lambda row: (float(row.get("at_ts") or 0),
+                                             int(row["id"])))
 
     def packages(self) -> list[dict]:
         return self.db.query(
@@ -157,22 +178,26 @@ class Progress(interface.Progress):
             "  FROM work_items WHERE package_id IS NOT NULL ORDER BY id")
 
     def lot_messages(self, item_ids) -> list[dict]:
-        ids = [int(i) for i in item_ids]
-        if not ids:
-            return []
-        return self.db.query(
-            "SELECT work_item_id::bigint AS work_item_id,"
-            "       extract(epoch from max(created_at))::float8 AS last_ts"
-            "  FROM agent_mailbox WHERE work_item_id IN (%s)"
-            " GROUP BY work_item_id" % _marks(ids), tuple(str(i) for i in ids))
+        # `agent_mailbox.work_item_id` est un texte : la page garde des
+        # marqueurs (1 000 au plus), l'index texte de 0413 reste utilisable.
+        rows: list[dict] = []
+        for page in _id_pages(item_ids):
+            rows += self.db.query(
+                "SELECT work_item_id::bigint AS work_item_id,"
+                "       extract(epoch from max(created_at))::float8 AS last_ts"
+                "  FROM agent_mailbox WHERE work_item_id IN (%s)"
+                " GROUP BY work_item_id" % _marks(page),
+                tuple(str(i) for i in page))
+        return sorted(rows, key=lambda row: int(row["work_item_id"]))
 
     def lot_actions(self, item_ids) -> list[dict]:
-        ids = [int(i) for i in item_ids]
-        if not ids:
-            return []
-        return self.db.query(
-            "SELECT %s FROM actions WHERE work_item IN (%s)"
-            " ORDER BY created_at, action_id" % (_ACTION_COLUMNS, _marks(ids)), tuple(ids))
+        rows: list[dict] = []
+        for page in _id_pages(item_ids):
+            rows += self.db.query(
+                "SELECT %s FROM actions WHERE work_item = ANY(%%s::bigint[])"
+                " ORDER BY created_at, action_id" % _ACTION_COLUMNS, (page,))
+        return sorted(rows, key=lambda row: (float(row.get("created_ts") or 0),
+                                             str(row["action_id"])))
 
     def actions(self, *, since_ts, project, limit) -> list[dict]:
         open_marks = _marks(_OPEN_ACTION_STATES)

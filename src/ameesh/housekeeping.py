@@ -5442,8 +5442,17 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     budget.check("registry")
     # #5588 : la rétention est globale, indépendante des lots de log().
     # Une passe effective la purge une fois, même si son budget expire ensuite.
+    # #5589 (N de revue #5588) : la purge précède les lectures de la base ;
+    # une base injoignable ne doit pas emporter le ménage local qui suit.
+    # L'échec est un constat de la passe — la purge reste due au passage
+    # suivant — et surtout pas une sortie en erreur.
     if not dry_run:
-        storage.of(db).housekeeping.purge_retention()
+        try:
+            storage.of(db).housekeeping.purge_retention()
+        except Exception as exc:  # noqa: BLE001 - cleanup must survive a DB outage
+            from . import db as db_mod
+            skipped.append("retention: %s; local cleanup continues, purge deferred"
+                           % db_mod.explain(exc))
     troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
     registered: set[str] = set()
     protected: set[str] = set()
