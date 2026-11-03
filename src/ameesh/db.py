@@ -506,6 +506,43 @@ def _batch_item(item) -> tuple[str, Sequence[Any]]:
 # #518: libpq's own parsing, in ameesh.dsn (also run by deploy/mise-a-jour/poste.sh)
 split_password = dsn_mod.split_password
 
+#: Connection options libpq knows only from the major given: a client older
+#: than that refuses the whole DSN ("invalid URI query parameter" /
+#: "invalid connection option"). The DSN is shared with psycopg, which may be
+#: newer, so the psql driver drops those options for the client it has
+#: (#5652: on a host without psycopg, the fallback never served).
+_PSQL_OPTION_SINCE = {"sslnegotiation": 17}
+
+
+def _psql_client_major(binary: str) -> int | None:
+    """The libpq major behind `binary` (`psql --version`), or None.
+
+    libpq is the client library of psql itself: a psql 16 speaks libpq 16.
+    An unreadable answer is never guessed (the DSN is then left as written,
+    as before)."""
+    try:
+        proc = subprocess.run([binary, "--version"], capture_output=True,
+                              text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = re.search(r"\(PostgreSQL\) (\d+)", proc.stdout or "")
+    return int(match.group(1)) if match else None
+
+
+def _psql_compatible_dsn(base: str, binary: str) -> str:
+    """`base` without the options this psql's libpq cannot parse (#5652)."""
+    if not any(option in base for option in _PSQL_OPTION_SINCE):
+        return base
+    major = _psql_client_major(binary)
+    if major is None:
+        return base
+    for option, since in _PSQL_OPTION_SINCE.items():
+        if major < since:
+            base = dsn_mod.without_parameter(base, option)
+    return base
+
 
 # --------------------------------------------------------------------------
 # pilote psql
@@ -532,6 +569,10 @@ class PsqlDriver:
             self.password, base = split_password(cfg.dsn)
         except dsn_mod.DsnError as exc:   # #518: libpq would refuse it too
             raise Unavailable("psql: invalid DSN: %s" % exc) from None
+        # #5652 : un DSN partagé peut porter une option que ce libpq-ci ne
+        # connaît pas encore (sslnegotiation pour un psycopg ≥ 17) ; il
+        # refuserait la chaîne entière et le repli ne servirait jamais.
+        base = _psql_compatible_dsn(base, self.binary)
         self.env = os.environ.copy()
         self.env["PGCONNECT_TIMEOUT"] = str(max(1, int(cfg.connect_timeout)))
         #: psql traduit les libellés des champs de son rapport d'erreur

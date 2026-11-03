@@ -1546,12 +1546,24 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
 
     #5493: a real sync takes minutes; while a newer claim is pending, the
     last completed result stays readable, and reused only if its signature
-    equals this snapshot's (the signature is the guard). A claimed sync that
-    raises withdraws that result and releases its claim: the next pass
-    retries instead of waiting out the interval. `unsettled` (no host gate
-    yet, e.g. a runner restarted on another version): a completed result of
-    a different signature is taken over at once instead of at the interval's
+    equals this snapshot's (the signature is the guard). `unsettled` (no host
+    gate yet, e.g. a runner restarted on another version): a completed result
+    of a different signature is taken over at once instead of at the interval's
     expiry, so the wait is bounded by one sync in progress plus its own.
+
+    #5649: an `unsettled` runner reuses a completed result of ITS OWN snapshot
+    BEFORE claiming a new sync. A staging sequence restarts the units one by
+    one, often more than one interval apart; claiming first made every
+    restarted runner run a full sync (minutes) before taking its lease, and
+    the sequence's "redémarrer" guard (24 x 5 s) failed. The signature is the
+    proof that the sources, trust and version fingerprint are the same, so the
+    completed result already says what a new sync would. A settled runner
+    keeps the interval pacing (the periodic refresh); a different snapshot
+    still claims/takes over and syncs. A claimed sync that raises releases its
+    claim but keeps the last completed result while the canon state is still
+    `ok`: a transient failure does not force the next restarted unit to pay a
+    full sync, and a failure that records `unreadable`/`invalid` still
+    withdraws the result.
     """
     if interval_s <= 0 or canon.untrusted or not canon.readable or not canon.sources:
         return sync(db, canon, host)
@@ -1565,6 +1577,20 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode()).hexdigest()
     store = storage.of(db).canon
     token = uuid.uuid4().hex
+    # #5649: before claiming a NEW sync, an unsettled runner settles its host
+    # gate on a completed sync of the same snapshot. A staging sequence
+    # restarts the units one by one, often more than one interval apart: the
+    # claim was free, so each restarted runner ran a full sync (minutes) and
+    # missed the "redémarrer" guard. Same signature = same sources, trust and
+    # version fingerprint = the completed result is what the new sync would
+    # say; a different snapshot falls through to the claim/takeover below.
+    if unsettled:
+        shared = store.shared_sync(host, key)
+        if (shared is not None and shared["status"] == CANON_OK
+                and shared["sync_signature"] == signature):
+            return SyncReport(host, str(canon.root), False, [], [],
+                              status=shared["status"],
+                              diagnostic=shared["diagnostic"], shared=True)
     claimed = store.claim_sync(host, key, token, interval_s)
     if not claimed and unsettled:
         claimed = store.claim_sync(host, key, token, interval_s, takeover=signature)

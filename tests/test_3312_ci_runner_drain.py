@@ -2,7 +2,8 @@
 """Lot #3312: the runners of a CI VM are never stopped in the middle of a job
 by the host's maintenance. needrestart defers them after an unattended
 upgrade (needrestart-ameesh-ci.conf), and ameesh-ci-runner-drain restarts or
-stops a runner only while no `Runner.Worker` lives in its cgroup.
+stops a runner only while no `Runner.Worker` lives in its cgroup and no job
+the listener accepted is still running (its `_diag` log, #5656).
 """
 from __future__ import annotations
 
@@ -42,6 +43,8 @@ class FakeHost:
         self.active = list(active)
         self.busy = list(busy)
         self.acts = []
+        self.in_flight = set()
+        self.active_age = 10 ** 9
 
     def outdated_units(self):
         return list(self.outdated)
@@ -52,6 +55,12 @@ class FakeHost:
     def process_names(self, unit):
         now = self.busy[0] if len(self.busy) == 1 else self.busy.pop(0)
         return ["Runner.Listener", "Runner.Worker"] if unit in now else ["Runner.Listener"]
+
+    def job_in_flight(self, unit):
+        return unit in self.in_flight
+
+    def active_seconds(self, unit):
+        return self.active_age
 
     def act(self, verb, unit):
         self.acts.append((verb, unit))
@@ -161,7 +170,17 @@ class HostReadingTest(unittest.TestCase):
             with open(os.path.join(root, "proc", pid, "comm"), "w") as f:
                 f.write(comm + "\n")
         host = drain.Host(cgroup_root=root + "/cg", proc=root + "/proc")
-        host._run = lambda argv: group + "\n"
+        work = root + "/runner"
+        os.makedirs(work + "/_diag")
+        with open(work + "/_diag/Runner_20261103-130000-utc.log", "w") as f:
+            f.write("[2026-11-03 13:00:00Z INFO Runner] Runner is built for Linux\n")
+            f.write("[2026-11-03 13:00:00Z INFO Terminal] WRITE LINE: "
+                    "2026-11-03 13:00:00Z: Listening for Jobs\n")
+
+        def command(argv):
+            return (work if argv[3] == "WorkingDirectory" else group) + "\n"
+
+        host._run = command
         self.assertTrue(drain.busy(host, R1))
         os.unlink(os.path.join(root, "proc", "12", "comm"))  # job ended
         self.assertFalse(drain.busy(host, R1))

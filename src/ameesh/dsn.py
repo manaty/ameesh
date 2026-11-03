@@ -68,6 +68,23 @@ def split_password(dsn: str, environ: Mapping[str, str] | None = None) -> tuple[
     return password, rest
 
 
+def without_parameter(dsn: str, key: str) -> str:
+    """The same connection string without one connection parameter.
+
+    `key` is compared as libpq reads it: a URI query parameter's key is
+    percent-decoded, a key/value pair's keyword is literal. Everything else
+    stays as written; a string that does not carry the parameter comes back
+    unchanged, byte for byte (a bare database name too). Used by the psql
+    driver for an option the host's libpq predates: the shared DSN may set it
+    for a newer client, and the older library refuses the whole string
+    (#5652)."""
+    if dsn.startswith(_URI_PREFIXES):
+        return _without_uri_parameter(dsn, key)
+    if "=" in dsn:
+        return _without_keyword(dsn, key)
+    return dsn
+
+
 # -- URI ---------------------------------------------------------------------
 
 def _uri_decode(text: str) -> str:
@@ -135,6 +152,34 @@ def _split_uri(dsn: str) -> tuple[str, str, bool]:
     if kept:
         base += "?" + "&".join(kept)
     return password or "", prefix + userinfo + base, service
+
+
+def _without_uri_parameter(dsn: str, key: str) -> str:
+    prefix = next(p for p in _URI_PREFIXES if dsn.startswith(p))
+    body = dsn[len(prefix):]
+    start = 0
+    while start < len(body) and body[start] not in "@/":
+        start += 1
+    if start < len(body) and body[start] == "@":
+        start += 1
+    path, question, query = body[start:].partition("?")
+    if not question:
+        return dsn
+    params = query.split("&")
+    if params and not params[-1]:   # libpq accepts one trailing "&"
+        params.pop()
+    kept = []
+    removed = False
+    for param in params:
+        if param.count("=") != 1:
+            raise DsnError("malformed query parameter in the URI")
+        if _uri_decode(param.split("=", 1)[0]) == key:
+            removed = True
+            continue
+        kept.append(param)
+    if not removed:
+        return dsn
+    return prefix + body[:start] + path + ("?" + "&".join(kept) if kept else "")
 
 
 # -- key/value pairs ----------------------------------------------------------
@@ -211,6 +256,17 @@ def _split_keywords(dsn: str) -> tuple[str, str, bool]:
     if password == "":   # explicit and empty: it still overrides PGPASSWORD
         kept.append("password=''")
     return password or "", " ".join(kept), service
+
+
+def _without_keyword(dsn: str, key: str) -> str:
+    kept = []
+    removed = False
+    for token_key, value in _tokens(dsn):
+        if token_key == key:
+            removed = True
+            continue
+        kept.append("%s=%s" % (token_key, _quote(value)))
+    return " ".join(kept) if removed else dsn
 
 
 # -- command line (deploy/mise-a-jour/poste.sh) --------------------------------

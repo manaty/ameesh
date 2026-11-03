@@ -9,5 +9,5 @@ After=apt-daily-upgrade.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/ameesh-ci-runner-drain --needrestart
-# 3 = runners still busy: kept until their job ends, the next pass takes them
+# 3 = busy or recently restarted: kept, the next pass takes them (#5656)
 SuccessExitStatus=3
