@@ -493,6 +493,15 @@ def _plan_field(node: ast.AST) -> str | None:
     return None
 
 
+def _preferred_plan_info(infos: set) -> tuple:
+    """Une information stable quand une cible en porte plusieurs.
+
+    Les millisecondes passent avant les secondes : leur plafond est plus
+    large, donc le constat est le plus prudent. L'ordre est total (champ
+    ensuite), pour que le lint ne dépende pas du hasard des ensembles."""
+    return min(infos, key=lambda info: (info[1] != "ms", info[0]))
+
+
 def _plan_time_value(node: ast.AST, returns: dict, values: dict, attributes: dict,
                      name_scope: ast.AST, class_scope: ast.AST | None) -> dict:
     """`{slot: (champ, unité)}` des temps de plan portés par un nœud.
@@ -520,12 +529,12 @@ def _plan_time_value(node: ast.AST, returns: dict, values: dict, attributes: dic
                 return {(): (inner[()][0], "s")}
         return {}
     if isinstance(node, ast.Name):
-        info = values.get(name_scope, {}).get(node.id)
-        return {(): info} if info is not None else {}
+        infos = values.get(name_scope, {}).get(node.id)
+        return {(): _preferred_plan_info(infos)} if infos else {}
     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
             and node.value.id == "self":
-        info = attributes.get(class_scope, {}).get(node.attr)
-        return {(): info} if info is not None else {}
+        infos = attributes.get(class_scope, {}).get(node.attr)
+        return {(): _preferred_plan_info(infos)} if infos else {}
     if isinstance(node, ast.Call):
         key = _call_key(node, class_scope)
         found = returns.get(key) if key is not None else None
@@ -576,7 +585,14 @@ def _plan_time_scopes(tree: ast.Module, scopes: _Scopes,
 
     Même analyse de flux volontairement simple que [`_duration_scopes`] : les
     affectations et le dépaquetage d'un tuple rendu par une fonction
-    (`root, elapsed_ms = self._plan()`), jusqu'à point fixe."""
+    (`root, elapsed_ms = self._plan()`), jusqu'à point fixe.
+
+    Le point fixe est monotone : chaque cible accumule les informations
+    possibles et n'en perd jamais (B/P2 #5607). Une même variable affectée
+    deux fois (`elapsed = plan["Execution Time"]` puis
+    `elapsed = plan["Planning Time"]`) ne réécrit donc pas la table à chaque
+    passe : les ensembles ne font que croître, et ils sont bornés par les
+    deux champs et les deux unités, donc la boucle termine."""
     values: dict = {}
     attributes: dict = {}
     assignments = [(scope, _class_scope_of(scopes, scope), targets, value)
@@ -594,9 +610,9 @@ def _plan_time_scopes(tree: ast.Module, scopes: _Scopes,
                     info = incoming.get(())
                     if info is None:
                         continue
-                    table = values.setdefault(scope, {})
-                    if table.get(target.id) != info:
-                        table[target.id] = info
+                    infos = values.setdefault(scope, {}).setdefault(target.id, set())
+                    if info not in infos:
+                        infos.add(info)
                         changed = True
                 elif isinstance(target, (ast.Tuple, ast.List)):
                     for index, element in enumerate(target.elts):
@@ -604,17 +620,19 @@ def _plan_time_scopes(tree: ast.Module, scopes: _Scopes,
                         if info is None:
                             continue
                         if isinstance(element, ast.Name):
-                            table = values.setdefault(scope, {})
-                            if table.get(element.id) != info:
-                                table[element.id] = info
+                            infos = values.setdefault(scope, {}).setdefault(
+                                element.id, set())
+                            if info not in infos:
+                                infos.add(info)
                                 changed = True
                         elif isinstance(element, ast.Attribute) \
                                 and isinstance(element.value, ast.Name) \
                                 and element.value.id == "self" \
                                 and class_scope is not None:
-                            attrs = attributes.setdefault(class_scope, {})
-                            if attrs.get(element.attr) != info:
-                                attrs[element.attr] = info
+                            infos = attributes.setdefault(class_scope, {}).setdefault(
+                                element.attr, set())
+                            if info not in infos:
+                                infos.add(info)
                                 changed = True
                 elif isinstance(target, ast.Attribute) \
                         and isinstance(target.value, ast.Name) \
@@ -622,9 +640,10 @@ def _plan_time_scopes(tree: ast.Module, scopes: _Scopes,
                     info = incoming.get(())
                     if info is None:
                         continue
-                    attrs = attributes.setdefault(class_scope, {})
-                    if attrs.get(target.attr) != info:
-                        attrs[target.attr] = info
+                    infos = attributes.setdefault(class_scope, {}).setdefault(
+                        target.attr, set())
+                    if info not in infos:
+                        infos.add(info)
                         changed = True
     return values, attributes
 

@@ -204,6 +204,15 @@ class RulesTest(unittest.TestCase):
             "    def test_x(self):\n"
             "        self.assertLess(self.elapsed_ms, 100)\n"), ["H6"])
 
+    def test_conflicting_plan_time_assignments_converge(self):
+        """B/P2 #5607 : deux champs pour la même variable ne bouclent pas."""
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    elapsed = plan['Execution Time']\n"
+            "    self.assertLess(elapsed, 100)\n"
+            "    elapsed = plan['Planning Time']\n"
+            "    self.assertLess(elapsed, 100)\n"), ["H6", "H6"])
+
     def test_plan_time_comparison_in_assert_true(self):
         self.assertEqual(self.rules(
             "def test_x(self):\n"
