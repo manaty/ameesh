@@ -439,9 +439,15 @@ class CiResults(interface.CiResults):
             % ", ".join(["%s"] * len(keys)), tuple(keys))
 
     def expect_disk(self, repo, *, host, volume) -> None:
+        # #5633 : `seen_at` date la dernière apparition de la VM dans les jobs
+        # du workflow, pas la dernière mesure : un job en attente ou une sonde
+        # en échec la repousse. `first_seen_at` est posé à l'insertion et ne
+        # bouge plus : la grâce de première mesure ne se renouvelle pas à
+        # chaque collecte. Une lecture ratée n'appelle pas cette méthode.
         self.db.execute(
             "INSERT INTO ci_disk_state (repo, host, volume) VALUES (%s, %s, %s) "
-            "ON CONFLICT (repo, host, volume) DO NOTHING", (repo, host, volume))
+            "ON CONFLICT (repo, host, volume) DO UPDATE SET seen_at = now()",
+            (repo, host, volume))
 
     def observe_disk(self, repo, *, host, volume, run_id, sampled_ts,
                      free_bytes, total_bytes) -> None:
@@ -460,8 +466,23 @@ class CiResults(interface.CiResults):
     def disks(self) -> list[dict]:
         return self.db.query(
             "SELECT repo, host, volume, run_id, free_bytes, total_bytes, "
-            "extract(epoch from sampled_at)::float8 AS sampled_ts "
+            "extract(epoch from sampled_at)::float8 AS sampled_ts, "
+            "extract(epoch from first_seen_at)::float8 AS first_seen_ts, "
+            "extract(epoch from seen_at)::float8 AS seen_ts "
             "FROM ci_disk_state ORDER BY repo, host, volume")
+
+    def forget_disks(self, repo, hosts, *, older_than_s) -> None:
+        # #5633 : ne garde que les VM encore présentes dans les jobs du
+        # workflow ; l'âge sur `seen_at` protège les pannes de lecture (qui ne
+        # rafraîchissent pas la date) et une VM encore attendue (job en file).
+        keep = sorted({str(host) for host in hosts if str(host).strip()})
+        if not keep:
+            return
+        self.db.execute(
+            "DELETE FROM ci_disk_state WHERE lower(repo) = lower(%s) "
+            "AND host <> ALL(%s) "
+            "AND seen_at < now() - (%s * interval '1 second')",
+            (repo, keep, float(older_than_s)))
 
     def prune_disks(self, repos) -> None:
         keys = sorted({str(repo).strip().casefold() for repo in repos if str(repo).strip()})

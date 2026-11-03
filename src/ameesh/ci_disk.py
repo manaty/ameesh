@@ -17,6 +17,12 @@ WORKFLOW = 'ci-disque.yml'
 SCHEMA = 'ameesh-ci-disk/1'
 MAX_AGE = 2 * 3600
 READ_INTERVAL = 300
+#: #5633 : une VM qui n'apparaît plus dans les jobs du workflow de base depuis
+#: ce délai est sortie du périmètre (matrice/labels modifiés) : sa ligne est
+#: oubliée, ses alertes avec. Un simple échec de lecture ne passe pas par
+#: `collect`, donc n'oublie rien ; `expect_disk` repousse `seen_at` à chaque
+#: job vu, même sans mesure.
+FORGET_AGE = 24 * 3600
 HOST = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 
 
@@ -41,6 +47,11 @@ def collect(api, repo, branch, store):
 
     Un job en attente est enregistré sans mesure. Une mesure absente ou
     illisible ne remplace jamais une mesure acquise par un faux vert.
+
+    #5633 : les noms de jobs des deux runs lus sont le périmètre courant (la
+    matrice du workflow) ; une VM absente depuis FORGET_AGE en est oubliée.
+    Aucun ensemble de noms vu (lecture vide ou en échec) n'oublie rien, et un
+    échec de lecture lève avant l'oubli : les dernières mesures restent.
     """
     from .ci import _iso_ts
     runs = api('repos/%s/actions/workflows/%s/runs?branch=%s&per_page=5'
@@ -48,6 +59,7 @@ def collect(api, repo, branch, store):
     candidates = [r for r in runs.get('workflow_runs', ())
                   if r.get('head_branch') == branch
                   and r.get('event') in ('schedule', 'workflow_dispatch')]
+    hosts_vus: set[str] = set()
     # Lire les deux plus récentes : le nouveau run en file ne masque pas
     # les mesures acquises par le précédent.
     for run in sorted(candidates, key=lambda r: int(r['id']), reverse=True)[:2]:
@@ -57,6 +69,7 @@ def collect(api, repo, branch, store):
             host = name.removeprefix('disque ')
             if not name.startswith('disque ') or not HOST.fullmatch(host):
                 continue
+            hosts_vus.add(host)
             store.expect_disk(repo, host=host, volume='/')
             sampled = _iso_ts(job.get('completed_at'))
             if job.get('conclusion') != 'success' or sampled is None:
@@ -73,15 +86,29 @@ def collect(api, repo, branch, store):
                 data = annotation(row, host)
                 if data is not None:
                     store.observe_disk(repo, run_id=int(run['id']), sampled_ts=sampled, **data)
+    if hosts_vus:
+        store.forget_disks(repo, hosts_vus, older_than_s=FORGET_AGE)
 
 
 def findings(rows, canons, now):
-    """Seuils physiques des Hosts ; une mesure saine seule résout le rouge."""
+    """Seuils physiques des Hosts ; une mesure saine seule résout le rouge.
+
+    #5633 : une VM tout juste vue par ``expect_disk`` n'a pas encore de
+    première mesure ; MAX_AGE de grâce après sa **première** apparition
+    (``first_seen_ts``, stable) évite l'alerte de la première passe. La grâce
+    ne se renouvelle pas à chaque collecte : une VM qui apparaît dans les jobs
+    sans jamais produire de mesure alerte après MAX_AGE. Une mesure déjà
+    acquise puis devenue vieille, elle, alerte toujours (la sonde ne remonte
+    plus).
+    """
     out = []
     for row in rows:
         host, repo = row['host'], row['repo']
         sampled = row.get('sampled_ts')
-        stale = sampled is None or now - sampled > MAX_AGE or sampled > now + 300
+        first = row.get('first_seen_ts')
+        grace = sampled is None and first is not None and now - first <= MAX_AGE
+        stale = not grace and (sampled is None or now - sampled > MAX_AGE
+                               or sampled > now + 300)
         common = dict(agent=None, since=sampled, host=host, repo=repo,
                       reason='%s:%s:%s' % (repo, host, row['volume']), run_id=row.get('run_id'))
         if stale:
