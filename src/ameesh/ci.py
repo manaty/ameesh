@@ -1318,10 +1318,19 @@ class Watcher:
                          % " ".join(str(exc).split())[:200])
             return out
         finally:
+            self._job_log_texts.clear()
             plan_github.flush_reads(getattr(self.cfg, "state_dir", None))
 
     # -- un dépôt --------------------------------------------------------------
     def watch(self, db, repo: str) -> list[dict]:
+        # Logs can be large: share them only during this repository's pass,
+        # including when a failed observation interrupts either reader.
+        try:
+            return self._watch(db, repo)
+        finally:
+            self._job_log_texts.clear()
+
+    def _watch(self, db, repo: str) -> list[dict]:
         st = storage.of(db)
         followed = set(self.followed_workflows(repo))
         bases = self.bases(repo)

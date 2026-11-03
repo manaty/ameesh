@@ -22,6 +22,25 @@ ROW = {'run_id': 8, 'run_attempt': 1, 'head_sha': 'abc', 'branch': 'main'}
 
 
 class DownloadFailureTest(unittest.TestCase):
+    def test_log_texts_are_released_between_ticks_even_on_error(self):
+        logs = mock.Mock(return_value='large log')
+        watcher = Watcher(types.SimpleNamespace(), api=mock.Mock(), logs=logs)
+
+        def observe(db, repo):
+            self.assertEqual(watcher._job_log_texts, {})
+            watcher._job_log(repo, ROW, 42)
+            watcher._job_log(repo, ROW, 42)
+            raise RuntimeError('interrupted observation')
+
+        with mock.patch.object(watcher, 'repos', return_value=['org/repo']), \
+                mock.patch.object(watcher, '_watch', side_effect=observe), \
+                mock.patch('ameesh.ci.storage.of'), \
+                mock.patch('ameesh.plan_github.flush_reads'):
+            for _ in range(2):
+                watcher.tick(None)
+                self.assertEqual(watcher._job_log_texts, {})
+        self.assertEqual(logs.call_count, 2)
+
     def test_log_cache_is_scoped_to_repo_run_attempt_and_job(self):
         logs = mock.Mock(side_effect=['first', 'retry', 'other repo'])
         watcher = Watcher(types.SimpleNamespace(), logs=logs)
