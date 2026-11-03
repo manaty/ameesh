@@ -231,6 +231,46 @@ class RulesTest(unittest.TestCase):
             "    # hermeticity: allow — mesuré sur un banc dédié\n"
             "    self.assertLess(plan['Execution Time'], 100)\n"), [])
 
+    def test_large_fill_through_execute_is_h7(self):
+        """#5641 : la forme de #5599 (500 000 lignes par execute) est vue."""
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    self.db.execute(\"INSERT INTO t SELECT g FROM generate_series(1, 500000) g\")\n"),
+            ["H7"])
+
+    def test_large_fill_bound_from_constants_is_h7(self):
+        """La forme de #5582 : bornes en paramètres liés à des constantes de classe."""
+        self.assertEqual(self.rules(
+            "class T:\n"
+            "    LOTS = 2_700\n"
+            "    def _fixture(self):\n"
+            "        self.db.execute(\"\"\"INSERT INTO e SELECT g, j\n"
+            "            FROM generate_series(1, %s) g\n"
+            "            CROSS JOIN generate_series(1, 10) j\"\"\", (self.LOTS,))\n"),
+            ["H7"])
+
+    def test_large_fill_formatted_with_percent_d_is_h7(self):
+        self.assertEqual(self.rules(
+            "N = 20_000\n"
+            "def test_x(self):\n"
+            "    self.db.execute(\"INSERT INTO t SELECT g %% 4 FROM generate_series(1, %d) g\" % N)\n"),
+            ["H7"])
+
+    def test_fill_helper_small_or_unknown_volume_is_not_h7(self):
+        self.assertEqual(self.rules(
+            "def test_x(self, n):\n"
+            "    self.fill(\"INSERT INTO t SELECT g FROM generate_series(1, 500000) g\")\n"
+            "    self.db.execute(\"INSERT INTO t SELECT g FROM generate_series(1, 9999) g\")\n"
+            "    self.db.execute(\"INSERT INTO t SELECT g FROM generate_series(1, %s) g\", (n,))\n"
+            "    self.db.query(\"SELECT count(*) FROM generate_series(1, 500000)\")\n"), [])
+
+    def test_large_fill_exemption(self):
+        self.assertEqual(self.rules(
+            "def test_x(self):\n"
+            "    # hermeticity: allow — volume mesuré exprès, délai compris\n"
+            "    self.db.execute(\"INSERT INTO t SELECT g FROM generate_series(1, 500000) g\")\n"),
+            [])
+
     def test_disk_usage_is_h5(self):
         self.assertEqual(self.rules(
             "import shutil\n"

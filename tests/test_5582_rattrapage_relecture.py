@@ -43,6 +43,8 @@ from .support import PgTestCase, SRC
 
 EVENTS = "work_item_events"
 MILESTONES = "work_item_milestones"
+#: #5641 : le trigger d'événements du journal, sans effet sur les plans mesurés.
+EVENT_TRIGGERS = ((EVENTS, "ameesh_events_lot"),)
 ANNULLED = "agent_mesh_merged_annulled"
 BOUND_DAYS = 17
 #: au-delà, le nœud qui porte l'annulation lit un balayage, pas une poignée de
@@ -149,10 +151,12 @@ class ReviewCatchUpPlanDbTest(PgTestCase):
         """Le volume du central, et la borne d'activation du rattrapage.
 
         Construit dans le test : `PgTestCase.setUp` remet la base à zéro
-        (les tables du lot sont truncatées) avant chaque témoin.
+        (les tables du lot sont truncatées) avant chaque témoin. #5641 : les
+        remplissages volumineux passent par `fill` (sans délai, trigger
+        d'événements coupé) ; ils préparent, ils ne mesurent pas.
         """
         db = self.db
-        db.execute("""
+        self.fill("""
             INSERT INTO work_items (id, type, source, app, title, body, issue_ref,
                                     state, assignee, created_at, updated_at)
             SELECT g, 'evolution', 'diag', 'ameesh', 'lot ' || g, '', NULL,
@@ -163,12 +167,12 @@ class ReviewCatchUpPlanDbTest(PgTestCase):
         db.execute("SELECT setval('work_items_id_seq', %s)", (self.LOTS,))
         # 2 700 fusions depuis la borne, les autres avant : le balayage que le
         # plan d'origine évaluait en entier.
-        db.execute("""
+        self.fill("""
             INSERT INTO work_item_milestones (work_item_id, kind, at, note)
             SELECT g, 'merged', now() - make_interval(mins => g), 'transition'
               FROM generate_series(1, %s) g
         """, (self.RECENT,))
-        db.execute("""
+        self.fill("""
             INSERT INTO work_item_milestones (work_item_id, kind, at, note)
             SELECT g, 'merged',
                    now() - make_interval(days => 18 + mod(g, 30)), 'transition'
@@ -176,22 +180,22 @@ class ReviewCatchUpPlanDbTest(PgTestCase):
         """, (self.RECENT + 1, self.LOTS))
         # 10 événements ordinaires par lot : le journal reste volumineux, un
         # `Seq Scan` de `work_item_events` se voit dans le plan.
-        db.execute("""
+        self.fill("""
             INSERT INTO work_item_events (work_item_id, state, note, actor, created_at)
             SELECT g, 'merged', 'ordinary note ' || j, 'agent-x',
                    now() - make_interval(mins => g * 3 + j)
               FROM generate_series(1, %s) g
              CROSS JOIN generate_series(1, 10) j
-        """, (self.LOTS,))
+        """, (self.LOTS,), triggers=EVENT_TRIGGERS)
         # 2 600 marques terminales : les candidats déjà relus ne doivent pas
         # être recalculés (annulation, tentatives) à chaque passage.
-        db.execute("""
+        self.fill("""
             INSERT INTO work_item_events (work_item_id, state, note, actor, created_at)
             SELECT g, 'merged',
                    'review-after-merge:closed:#' || g || ' reviewed', 'system',
                    now() - make_interval(mins => g)
               FROM generate_series(1, 2600) g
-        """)
+        """, triggers=EVENT_TRIGGERS)
         # 60 lots à trois tentatives et 30 lots à tentative récente : le reste
         # des 10 candidats (2691..2700) est le rattrapage dû.
         db.execute("""

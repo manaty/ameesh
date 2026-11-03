@@ -299,7 +299,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("actions: write", texte)
         self.assertIn("contents: read", texte)
         self.assertIn("runs-on: ubuntu-latest", texte)
-        self.assertIn("actions/checkout@v4", texte)
+        self.assertIn("actions/checkout@11d5960a326750d5838078e36cf38b85af677262", texte)
         self.assertIn("--apply", texte)
         self.assertIn("timeout-minutes: 5", texte)
 

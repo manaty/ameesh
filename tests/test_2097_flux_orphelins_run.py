@@ -145,7 +145,7 @@ class GardeFluxOrphelinsTest(unittest.TestCase):
         # vit sur la branche par défaut ; `actions/checkout` y prend son code,
         # jamais celui de la PR (jeton `checks: write`, code de confiance).
         self.assertIn("runs-on: ubuntu-latest", self.texte)
-        self.assertIn("actions/checkout@v4", self.texte)
+        self.assertIn("actions/checkout@11d5960a326750d5838078e36cf38b85af677262", self.texte)
 
     def test_jeton_minimal_et_aucune_publication(self):
         self.assertIn("checks: write", self.texte)

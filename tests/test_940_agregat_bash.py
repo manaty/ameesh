@@ -139,7 +139,7 @@ class WorkflowContractTest(unittest.TestCase):
         text = WORKFLOW.read_text(encoding="utf-8")
         job = text[text.index("\n  tests:\n"):]
         before = job[:job.index(_STEP)]
-        self.assertIn("- uses: actions/checkout@v4", before)
+        self.assertIn("- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262", before)
 
     def test_un_run_annule_rougit_avant_le_bilan(self):
         # Décision #128512 : un run annulé n'a pas conclu du tout. L'étape

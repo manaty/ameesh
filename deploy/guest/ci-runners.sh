@@ -834,6 +834,17 @@ SHIM
   if absent "/etc/systemd/system/$UNIT"; then unit_new=1; fi
   put "/etc/systemd/system/$UNIT" 0644 root:root <"$SRC_UNIT"
   if [ "$unit_new" = 1 ]; then remember "/etc/systemd/system/$UNIT" created; fi
+  # #5655: root publishes the cache; jobs can only read its archives.
+  run python3 -I "$HERE/action-archive-cache.py" \
+    --workflows "$HERE/../../.github/workflows" --cache "$TOOLS/action-archives"
+  remember "$TOOLS/action-archives" created
+  run install -d -m 0755 "$(at "/etc/systemd/system/$UNIT.d")"
+  put "/etc/systemd/system/$UNIT.d/action-cache.conf" 0644 root:root <<'CACHE'
+# #5655: runner's immutable archive cache, shared by this VM's guest slots.
+[Service]
+Environment=ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=/usr/local/lib/ameesh-guest-ci/action-archives
+CACHE
+  remember "/etc/systemd/system/$UNIT.d/action-cache.conf" created
   run systemctl daemon-reload
   if [ "$DRY" = 0 ]; then
     {
@@ -1225,6 +1236,14 @@ remove() {
     # below removes the registrations they created (offline ones included)
     recorded "$JIT_DIR" && run runuser -u "$GUEST" -- rm -rf "$(at "$JIT_DIR")"
     recorded "$ROOT/ci" && run runuser -u "$GUEST" -- rmdir --ignore-fail-on-non-empty "$(at "$ROOT/ci")" || true
+  fi
+  if recorded "$TOOLS/action-archives"; then
+    run rm -rf "$(at "$TOOLS/action-archives")"
+  fi
+  if recorded "/etc/systemd/system/$UNIT.d/action-cache.conf"; then
+    run rm -f "$(at "/etc/systemd/system/$UNIT.d/action-cache.conf")"
+    run rmdir --ignore-fail-on-non-empty "$(at "/etc/systemd/system/$UNIT.d")"
+    run systemctl daemon-reload
   fi
   recorded "$SHIM" && run rm -f "$(at "$SHIM")"
   recorded "$GATE_WRAPPER" && run rm -f "$(at "$GATE_WRAPPER")"

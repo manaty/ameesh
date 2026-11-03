@@ -151,3 +151,4 @@ test_5602_capacity_replan  # storage: atomic forecast dates/journal/checkpoint a
 test_5585_journal_plans  # #5585 : un tableau d’ids par page et garde de plan des lectures groupées du journal, sous les deux pilotes
 
 test_5584_issue_refs  # stockage : lecture dédiée issue_refs, même fenêtre que issue_feed, sous les deux pilotes (#5584)
+test_5641_fixture_fill  # #5641 : PgTestCase.fill rétablit les triggers (succès et échec) et le délai, sous les deux pilotes

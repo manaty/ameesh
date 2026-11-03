@@ -184,8 +184,8 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         # #1256 B4 : le plan téléchargé est vérifié par l'empreinte que le job
         # plan publie en sortie ; une part au plan différent n'exécute rien.
         self.assertIn("needs: plan", self.suite)
-        self.assertIn("uses: actions/upload-artifact@v4", self.job)
-        self.assertIn("uses: actions/download-artifact@v4", self.suite)
+        self.assertIn("uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", self.job)
+        self.assertIn("uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", self.suite)
         self.assertIn("needs.plan.outputs.plan_sha256", self.suite)
         self.assertIn("shasum -a 256 -c -", self.suite)
 

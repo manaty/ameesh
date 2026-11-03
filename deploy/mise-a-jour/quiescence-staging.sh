@@ -47,6 +47,11 @@
 # tous les comptes de l'hote (la commande distante tourne en root).
 set -euo pipefail
 
+# #5663 : le DSN de l'EnvironmentFile ne va a aucune commande distante ni au
+# collecteur ; il est garde dans des variables non exportees et rendu au seul
+# notifier, par son environnement (jamais en argv).
+DSN_AMEESH=${AMEESH_DSN-} DSN_AGENT_MESH=${AGENT_MESH_DSN-}
+DSN_AMEESH_POSE=${AMEESH_DSN+1} DSN_AGENT_MESH_POSE=${AGENT_MESH_DSN+1}
 unset AMEESH_DSN AGENT_MESH_DSN 2>/dev/null || true
 PRECEDENT=${STAGING_PREVIOUS_HOST:-}
 RUN=${STAGING_PREVIOUS_RUN:-}
@@ -65,6 +70,14 @@ refus() {  # raison : trace, alerte (une par run et raison), code 1
   exit 1
 }
 
+avec_dsn() {  # commande… : lancee avec le DSN de l'unite, en sous-shell
+  (
+    [ -n "$DSN_AMEESH_POSE" ] && export AMEESH_DSN=$DSN_AMEESH
+    [ -n "$DSN_AGENT_MESH_POSE" ] && export AGENT_MESH_DSN=$DSN_AGENT_MESH
+    exec "$@"
+  )
+}
+
 alerter() {
   local marque corps dest
   [[ $RUN =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
@@ -74,9 +87,9 @@ alerter() {
   corps="L'executant elu du staging ne reprend pas la demande : l'arret du run $RUN (hote $PRECEDENT) n'est pas prouve. Raison : $1. Aucune mutation faite. Prouver l'arret a la main (unite, ssh, verrou, retour en attente), puis laisser la minuterie reprendre ; voir docs/DEPLOIEMENT-HOTE-AGENTS.md."
   for dest in ${NOTIF_QUIESCENCE:-${NOTIF_STAGING:-mesh-design} bureau}; do
     if [ -n "${QUIESCENCE_NOTIFIER:-}" ]; then
-      "$QUIESCENCE_NOTIFIER" "$dest" "staging : quiescence non prouvee ($PRECEDENT)" "$corps" || return 1
+      avec_dsn "$QUIESCENCE_NOTIFIER" "$dest" "staging : quiescence non prouvee ($PRECEDENT)" "$corps" || return 1
     else
-      "$PYTHON" - "$dest" "staging : quiescence non prouvee ($PRECEDENT)" "$corps" <<'PY' || return 1
+      avec_dsn "$PYTHON" - "$dest" "staging : quiescence non prouvee ($PRECEDENT)" "$corps" <<'PY' || return 1
 import sys
 from ameesh import config, db, mail, work
 dest, sujet, corps = sys.argv[1:4]

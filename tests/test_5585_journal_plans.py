@@ -185,13 +185,15 @@ class JournalPlanDbTest(PgTestCase):
         self._plan_db = None
 
     def _seed(self) -> None:
-        self.db.execute("""
+        # #5641 : le remplissage prépare, il ne mesure pas — sans délai, et
+        # sans le trigger d'événements du journal (sans effet sur les plans).
+        self.fill("""
             INSERT INTO work_items (title, state, created_at, updated_at)
             SELECT 'plan-5585-' || n, 'merged',
                    now() - interval '2 days', now()
               FROM generate_series(1, %d) n
         """ % self.LOTS)
-        self.db.execute("""
+        self.fill("""
             INSERT INTO work_item_events
                    (work_item_id, state, note, actor, created_at)
             SELECT w.id,
@@ -200,7 +202,8 @@ class JournalPlanDbTest(PgTestCase):
                    now() - make_interval(mins => j)
               FROM (SELECT id FROM work_items ORDER BY id) w
              CROSS JOIN generate_series(1, %d) j
-        """ % self.EVENTS_PER_LOT)
+        """ % self.EVENTS_PER_LOT,
+                  triggers=(("work_item_events", "ameesh_events_lot"),))
         self.db.execute("ANALYZE work_item_events")
         self.ids = [int(row["id"]) for row in self.db.query(
             "SELECT id FROM work_items ORDER BY id LIMIT %s", (self.IDS,))]

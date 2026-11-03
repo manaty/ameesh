@@ -56,7 +56,7 @@ class CacheVenvTest(unittest.TestCase):
         # #1293 : la clé primaire est celle du run (unique) ; la restauration
         # d'un venv sauvé par une exécution précédente passe par restore-keys.
         step = _etape("      - id: venv")
-        self.assertIn("uses: actions/cache/restore@v4", step)
+        self.assertIn("uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830", step)
         self.assertIn("path: .venv-ci", step)
         self.assertIn("github.run_id", step)
         self.assertIn("github.run_attempt", step)
@@ -82,7 +82,7 @@ class CacheVenvTest(unittest.TestCase):
         self.assertLess(deps.index("rm -rf .venv-ci"),
                         deps.index('echo "reconstruit=1"'))
         sauve = _etape("      - if: steps.deps.outputs.reconstruit")
-        self.assertIn("uses: actions/cache/save@v4", sauve)
+        self.assertIn("uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830", sauve)
         self.assertIn("if: steps.deps.outputs.reconstruit == '1'", sauve)
         self.assertIn("continue-on-error: true", sauve)
         self.assertIn("path: .venv-ci", sauve)
@@ -97,8 +97,8 @@ class CacheVenvTest(unittest.TestCase):
         # avec une clé par run, il écrirait un cache par exécution. Le
         # sauvetage est donc une étape explicite, conditionnée.
         self.assertNotIn("uses: actions/cache@v4", WORKFLOW)
-        self.assertIn("uses: actions/cache/restore@v4", WORKFLOW)
-        self.assertIn("uses: actions/cache/save@v4", WORKFLOW)
+        self.assertIn("uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830", WORKFLOW)
+        self.assertIn("uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830", WORKFLOW)
 
 
 if __name__ == "__main__":

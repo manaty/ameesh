@@ -78,7 +78,11 @@ La politique ne retire un cache que si toutes les preuves suivantes tiennent :
   `externals.*` ne sont jamais touchées.
 
 Le contrôle est refait juste avant la suppression (inode, version, processus,
-liens). Un doute, une erreur de lecture ou une suppression partielle sont
+liens). Le cache est ensuite renommé atomiquement en
+`_work/_update.retire-<pid>` (même système de fichiers), puis c'est l'arbre
+renommé qui est supprimé : une auto-update qui démarre pendant la suppression
+(plusieurs secondes pour ~700 Mio) voit `_update` absent et le recrée, sans
+perdre de fichiers de sa nouvelle extraction (#5643). Un doute, une erreur de lecture ou une suppression partielle sont
 rapportés dans la ligne de ménage, sans faire rougir l'étape. Aucun label
 n'est retiré, aucune mise à jour n'est désactivée, aucun identifiant nouveau
 n'est posé sur les VM.
