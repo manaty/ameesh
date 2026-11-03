@@ -517,7 +517,7 @@ class CouvertureTronqueeTest(_PetitDepot, unittest.TestCase):
 
     @unittest.skipUnless(_coverage_disponible(), "coverage requis")
     def test_panne_apres_lecture_ecarte_sans_partiel(self):
-        """R1 #1257 : une panne après `read()` (ici contexts_by_lineno) écarte
+        """R1 #1257 : une panne après `read()` (ici lines/contexts_by_lineno) écarte
         le fichier et nomme la panne ; rien de sa contribution partielle n'est
         versé dans la carte, les autres fichiers restent mesurés."""
         from coverage import CoverageData
@@ -551,6 +551,24 @@ class CouvertureTronqueeTest(_PetitDepot, unittest.TestCase):
 
         CoverageData.contexts_by_lineno = partielle
         self.addCleanup(setattr, CoverageData, "contexts_by_lineno", original)
+        # #5604 : un fichier à contexte unique est lu par `lines()` ; la même
+        # panne en cours d'exploitation y est simulée.
+        lignes = CoverageData.lines
+
+        def lignes_partielles(self, mesure):
+            donnees = lignes(self, mesure)
+            if ".coverage.casse" not in str(getattr(self, "_basename", "")):
+                return donnees
+
+            def premiere_seule():
+                for index, ligne in enumerate(donnees or ()):
+                    if index:
+                        raise DataError("panne simulée en cours d'exploitation")
+                    yield ligne
+            return premiere_seule()
+
+        CoverageData.lines = lignes_partielles
+        self.addCleanup(setattr, CoverageData, "lines", lignes)
 
         carte_ = carte.merge([str(part)], "abc")
         self.assertEqual(carte_["mesure"]["processus"], 1)  # seule la part valide
@@ -562,6 +580,42 @@ class CouvertureTronqueeTest(_PetitDepot, unittest.TestCase):
                    for info in blocs.values() for m in info["modules"]}
         self.assertIn("test_l2", modules)
         self.assertNotIn("test_l1", modules)  # aucune ligne partielle versée
+class AttributionParContexteTest(_PetitDepot, unittest.TestCase):
+    """#5604 : un fichier à contexte unique est lu par `lines()`, un fichier à
+    plusieurs contextes par `contexts_by_lineno()` ; les deux donnent la même
+    attribution ligne → modules qu'avant, et un contexte hors test n'attribue
+    rien."""
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_contexte_unique_et_contextes_multiples(self):
+        from coverage import CoverageData
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        (dossier / "cov").mkdir()
+        db = str(carte.REPO / "src" / "ameesh" / "db.py")
+        autre = str(carte.REPO / "src" / "ameesh" / "autre.py")
+        unique = CoverageData(basename=str(dossier / "cov" / ".coverage.unique"))
+        unique.set_context("tests.test_a.T.test_x")
+        unique.add_lines({db: {1, 2}, autre: {1}})
+        unique.write()
+        multiple = CoverageData(basename=str(dossier / "cov" / ".coverage.multiple"))
+        multiple.set_context("tests.test_b.T.test_y")
+        multiple.add_lines({db: {2}})
+        multiple.set_context("tests.test_c.T.test_z")
+        multiple.add_lines({db: {1}})
+        multiple.set_context("hors-test")
+        multiple.add_lines({autre: {1}})
+        multiple.write()
+        anonyme = CoverageData(basename=str(dossier / "cov" / ".coverage.anonyme"))
+        anonyme.add_lines({db: {1}})
+        anonyme.write()
+        lignes, processus, sans_contexte, ignorees, _ = carte._coverage([str(dossier)])
+        self.assertEqual((processus, sans_contexte, ignorees), (3, 1, []))
+        self.assertEqual({f: {l: set(m) for l, m in d.items()} for f, d in lignes.items()},
+                         {"src/ameesh/db.py": {1: {"test_a", "test_c"}, 2: {"test_a", "test_b"}},
+                          "src/ameesh/autre.py": {1: {"test_a"}}})
+
+
 class _FauxCoverageException(Exception):
     pass
 
