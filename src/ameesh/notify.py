@@ -422,7 +422,7 @@ def type_label(kind: str, vocabulary=None) -> str:
 
 
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
-URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
+URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
                 # #4164 : plus aucun tour sur le compte tant qu'il n'est pas rechargé
                 "provider_credits_exhausted",
@@ -2182,6 +2182,10 @@ def brief_key_of(alert: dict) -> str:
     et `sous_rythme` décrivent la même fenêtre et appellent le même geste.
     Une gigue d'une seconde de `resets_at`, un clignotement de la raison ou
     une disparition d'une passe ne refont donc pas briefer la même fenêtre."""
+    if alert.get("type") == "host_disk_soon_full":
+        # #5563 : le passage au critique doit réveiller les opérateurs même
+        # si l'avertissement du même hôte a déjà été briefé.
+        return json.dumps([key_of(alert), bool(alert.get("critical"))])
     if alert_briefs.automatic_sleep(alert):
         # #5331 : le sommeil automatique est levé puis reposé (redémarrage de
         # staging, cycle de sommeil), et chaque épisode porte un `since` neuf.
