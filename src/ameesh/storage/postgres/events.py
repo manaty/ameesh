@@ -9,8 +9,8 @@ from .. import interface
 _COLUMNS = ("id, type, object, project, data,"
             " extract(epoch from created_at)::float8 as ts")
 
-# #5045: retain the latest pause state, including a resume tombstone.
-_DISPOSABLE = ("not (e.type = 'packet.pause' and not exists ("
+# #5045/#5602: retain durable pause and capacity-plan checkpoints.
+_DISPOSABLE = ("not (e.type in ('packet.pause', 'capacity.plan') and not exists ("
                "select 1 from ameesh_events newer where newer.type = e.type"
                " and newer.object = e.object and newer.id > e.id))")
 

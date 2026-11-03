@@ -391,10 +391,17 @@ def _plan(db, args: argparse.Namespace) -> int:
             raise work.WorkError("--project is read-only; use work plan <id> to edit dates")
         from . import project_plan
         out = project_plan.report(db, project)
+        from . import capacity_replan
+        saved = capacity_replan.latest(db, project)
+        if saved:
+            out["capacity_forecast"] = saved["forecast"]
         if args.json:
             print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
         else:
             print("%s: %s" % (project, out["phase"]))
+            if saved:
+                print("capacity forecast: %s" % saved["forecast"]["end"])
+            projected = {r["id"]: r for r in saved["forecast"]["lots"]} if saved else {}
             for row in out["lots"]:
                 dates = " · ".join("%s %s" % (label, row[key]) for label, key in
                     (("start", "planned_start"), ("end", "planned_end"),
@@ -402,6 +409,9 @@ def _plan(db, args: argparse.Namespace) -> int:
                 print("#%s %s: %s%s" % (row["id"], row["title"],
                       "ready" if row["ready"] else "; ".join(row["waiting"]),
                       " · " + dates if dates else ""))
+                if row["id"] in projected:
+                    eta = projected[row["id"]]
+                    print("  capacity: %s → %s" % (eta["start"], eta["end"]))
         return 0
     if args.target is None:
         raise work.WorkError("work plan requires a target or --project P")

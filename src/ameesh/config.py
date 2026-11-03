@@ -598,7 +598,7 @@ class Config:
     #: `exclude_terms`), validée par `ameesh.plan_github`. Jamais de secret
     #: ici : le jeton de `gh` reste dans son environnement.
     github: dict = field(default_factory=dict)
-    #: #4174/#4256: spec acceptance, validation authority routes and timezones.
+    #: #4174/#4256/#5602: spec acceptance, validation routes and capacity plan settings.
     project_planning: dict = field(default_factory=dict)
     #: radar de conflits entre lots (L160b) : la clé `radar` du fichier de
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier

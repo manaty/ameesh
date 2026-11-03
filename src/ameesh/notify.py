@@ -2899,10 +2899,15 @@ class Notifier:
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     def _github_issues(self, db, now: float) -> None:
-        """Chaque lot a son issue GitHub, tenue par ameesh : la projection
+        """Reconcile configured capacity forecasts, then GitHub issues.
+
+        Chaque lot a son issue GitHub, tenue par ameesh : la projection
         tourne ici, sur l'hôte que désigne la clé `github` de la configuration
-        (`plan_github.Projector`). Sans cette clé, rien ; une erreur (GitHub,
+        (`plan_github.Projector`). Sans cette clé, seule la capacité passe ;
+        une erreur (GitHub,
         `gh`, base) est journalisée et ne touche jamais aux alertes."""
+        from . import capacity_replan
+        capacity_replan.tick(self.cfg, db, now=now, dry_run=self.dry_run, log=self.log)
         if not getattr(self.cfg, "github", None):
             return
         from . import plan_github
