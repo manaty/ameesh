@@ -122,6 +122,7 @@ class LotSessions(interface.LotSessions):
         rows = self.db.query(
             f"""
             SELECT w.id, w.title, w.state, w.priority, w.source AS roadmap_source,
+                   w.app AS project, extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(w.updated_at, w.branch_head_at, ev.at, mb.at)
                            )::float8 AS activity_ts,
                    coalesce(l.wakes, 0)::bigint AS wakes,

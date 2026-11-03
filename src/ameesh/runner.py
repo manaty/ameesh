@@ -11581,6 +11581,9 @@ class Runner:
         # lit une liste vide comme « tous »)
         candidates = ([] if _admits_nobody(self)
                       else registry.claimable(self.db, self.host, self.agents_filter))
+        # #5601 : avec des réservations, admission par classe puis par date du
+        # prochain lot ; sans réservation, l'ordre du registre reste intact
+        candidates = self._admission_order(candidates)
         for agent in candidates:
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -13664,6 +13667,11 @@ class Runner:
         from . import placement as placement_mod
         self._host_pinned_admissions = sum(
             placement_mod.host_load(one)[0].get(self.host, 0) for one in canons)
+        # #5601 : places réservées à un projet ou à une classe (fiches Host)
+        from . import slot_reservations as slot_reservations_mod
+        self._host_slot_reservations = slot_reservations_mod.merge(
+            one.host(self.host).policy.slot_reservations or {}
+            for one in canons if one.host(self.host) is not None) or None
         # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
         # par défaut
         sync_gate = getattr(self, "_sync_host_gate", None)
@@ -13725,6 +13733,51 @@ class Runner:
                           if name != (agent or {}).get("name") and worker.is_alive())
         return running < cap
 
+    def _admission_order(self, candidates: list) -> list:
+        """#5601 : candidats dans l'ordre d'admission. Sans réservation sur
+        l'hôte : la liste telle quelle, aucun lot lu. Avec : le prochain lot
+        de chaque candidat (celui de son réveil, `lot_sessions.actionable`)
+        est lu, puis `slot_reservations.order` (rôles élus, classe, date)."""
+        reservations = getattr(self, "_host_slot_reservations", None)
+        if not reservations:
+            return candidates
+        import datetime as _dt
+        from . import slot_reservations as slot_reservations_mod
+        st = storage.of(self.db).lot_sessions
+        today = _dt.date.today().isoformat()
+        demands = {}
+        for agent in candidates:
+            name = agent.get("name")
+            try:
+                rows = st.actionable(name, today=today)
+            except db_mod.DbError as exc:
+                log_async("[%s] next lot unreadable for admission (%s)" % (name, exc))
+                rows = []
+            demands[name] = rows[0] if rows else None
+        self._admission_demands = demands
+        return slot_reservations_mod.order(candidates, demands, reservations)
+
+    def _reservation_admits(self, agent: dict, others: list[str], cap: int) -> bool:
+        """#5601 : une place réservée à un projet ou à une classe n'est prise
+        que par un agent dont le prochain lot la remplit ; une place libre ne
+        va aux autres que si les réservations non remplies tiennent encore."""
+        from . import slot_reservations as slot_reservations_mod
+        reservations = self._host_slot_reservations
+        filled = getattr(self, "_slot_reservations", None)
+        if filled is None:
+            filled = self._slot_reservations = {}
+        held: dict = {}
+        for name in others:
+            key = filled.get(name)
+            held[key] = held.get(key, 0) + 1
+        demand = (getattr(self, "_admission_demands", None) or {}).get(agent.get("name")) or {}
+        wants = slot_reservations_mod.keys_for(demand.get("project"), demand.get("priority")) \
+            if agent.get("releve") != "election" else []
+        admitted, key = slot_reservations_mod.decide(reservations, held, len(others), cap, wants)
+        if admitted:
+            filled[agent.get("name")] = key
+        return admitted
+
     def admits_new_worker(self, agent: dict) -> bool:
         """L43 (0031) : `max_agents` PHYSIQUE de l'hôte (le plus petit des
         fiches Host de tous les canons) borne le nombre de personas que cet
@@ -13741,17 +13794,21 @@ class Runner:
         if cap is None or (agent or {}).get("ephemeral"):
             return True
         with self.lock:
-            others = [(getattr(worker, "agent", None) or {})
-                      for name, worker in self.workers.items()
-                      if name != (agent or {}).get("name") and worker.is_alive()
-                      and not (getattr(worker, "agent", None) or {}).get("ephemeral")]
+            live = [(name, getattr(worker, "agent", None) or {})
+                    for name, worker in self.workers.items()
+                    if name != (agent or {}).get("name") and worker.is_alive()
+                    and not (getattr(worker, "agent", None) or {}).get("ephemeral")]
+        others = [row for _name, row in live]
         if len(others) >= cap:
             return False
         pinned = getattr(self, "_host_pinned_admissions", None)
-        if (agent or {}).get("releve") != "election" or pinned is None:
+        if (agent or {}).get("releve") == "election" and pinned is not None:
+            elected = sum(1 for other in others if other.get("releve") == "election")
+            if elected >= cap - pinned:
+                return False
+        if not getattr(self, "_host_slot_reservations", None):
             return True
-        elected = sum(1 for other in others if other.get("releve") == "election")
-        return elected < cap - pinned
+        return self._reservation_admits(agent or {}, [name for name, _row in live], cap)
 
     def host_limits_for(self, host: str) -> dict | None:
         """Seuils connus d'un hôte (dernier `canon sync`), ou None."""

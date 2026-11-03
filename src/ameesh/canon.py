@@ -1136,6 +1136,10 @@ class HostPolicy:
     #: `<command> busy|draining|idle-drained <host>` and never touches the
     #: cluster or the cloud itself. None = no adapter, so no automatic release.
     lifecycle_hook: str | None = None
+    #: #5601 : places de `max_agents` réservées à un projet ou à une classe de
+    #: priorité (`{"project:<app>": n, "class:<p>": n}`, `ameesh.slot_reservations`) ;
+    #: None = aucune réservation, l'ordre d'admission reste celui du registre.
+    slot_reservations: dict | None = None
     #: #2202 S2 : le placement de Job (`policy.sandbox`), None = l'hôte ne
     #: reçoit aucun tour en bac à sable.
     sandbox: SandboxPlacement | None = None
@@ -4188,6 +4192,20 @@ class _Loader:
                 else:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.lifecycle_hook`: a non-empty command line expected",
+                             **where, **subject)
+            # #5601 : réservations de places ; une entrée illisible est écartée
+            # (elle ne doit pas tenir des places que personne ne peut prendre)
+            if raw.get("slot_reservations") is not None:
+                from . import slot_reservations as slot_reservations_mod
+                parsed, problems = slot_reservations_mod.parse(raw["slot_reservations"])
+                for problem in problems:
+                    self.add("host-policy-invalid", ERROR, problem, **where, **subject)
+                policy.slot_reservations = parsed or None
+                if parsed and policy.max_agents is not None \
+                        and sum(parsed.values()) > policy.max_agents:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.slot_reservations`: %d places reserved for "
+                             "max_agents = %d" % (sum(parsed.values()), policy.max_agents),
                              **where, **subject)
             # Seuils de ressources (L31, 0028) : un mapping dont chaque clé est
             # validée ici ; une clé illisible est une erreur (fail closed sur le

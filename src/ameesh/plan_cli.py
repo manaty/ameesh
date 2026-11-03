@@ -249,11 +249,11 @@ def add_parsers(work_sub, func) -> None:
     p_proj.set_defaults(func=func)
 
 
-def run(db, args: argparse.Namespace) -> int:
+def run(db, args: argparse.Namespace, cfg=None) -> int:
     """Exécute une sous-commande du plan sur la connexion `db` ouverte."""
     command = args.work_command
     if command == "plan":
-        return _plan(db, args)
+        return _plan(db, args, cfg)
     if command == "estimates":
         from . import estimates
         if args.publish:
@@ -363,7 +363,7 @@ def _pin(db, args: argparse.Namespace) -> int:
     return 0
 
 
-def _plan(db, args: argparse.Namespace) -> int:
+def _plan(db, args: argparse.Namespace, cfg=None) -> int:
     """L96 : dates prévues d'une tâche ou d'une fiche WorkPackage ; L157 :
     durée estimée d'une tâche (`--estimate`)."""
     from . import estimates, roadmap
@@ -376,10 +376,13 @@ def _plan(db, args: argparse.Namespace) -> int:
                 getattr(args, k, None) is not None for k in
                 ("debut", "fin", "livraison", "estimate", "source", "estimate_source")):
             raise work.WorkError("--capacity-plan cannot edit dates or estimates")
-        from . import capacity_plan
+        from . import canon, capacity_plan
+        project = getattr(args, "project", None)
+        # #5601 : les réservations des fiches Host, celles de l'admission live
+        canons = canon.load_configured(cfg) if project and cfg is not None else None
         try:
             out = capacity_plan.run_file(capacity_path, previous_path=args.previous_plan,
-                                         db=db, project=getattr(args, "project", None))
+                                         db=db, project=project, canons=canons)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise work.WorkError("invalid capacity plan: %s" % exc) from exc
         print(json.dumps(out, ensure_ascii=False, indent=2))

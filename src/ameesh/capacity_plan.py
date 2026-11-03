@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import math
 from statistics import median
 
+from . import slot_reservations
 from .work_footprints import held_pairs
 
 SCHEMA = "ameesh-capacity-plan/1"
@@ -75,7 +76,10 @@ def _slots(hosts):
         reserved = host.get("reservations", {})
         if sum(integer(n, "reservation") for n in reserved.values()) > count:
             raise PlanningError("reservations exceed capacity on %s" % name)
-        owners = [str(owner) for owner, n in sorted(reserved.items())
+        # #5601: `project:<app>` and `class:<p>` are the live dispatcher's
+        # keys (`slot_reservations`); a bare name stays a project/repository
+        owners = [slot_reservations.normalize_key(owner) or str(owner)
+                  for owner, n in sorted(reserved.items())
                   for _ in range(integer(n, "reservation"))]
         owners += [None] * (count - len(owners))
         slots.extend({"host": name, "slot": i + 1, "reservation": owner}
@@ -153,11 +157,14 @@ def _compute(snapshot):
                                b.get("footprint_paths") or unknown,
                                policy.get("shared_paths", [])))
 
+    def priority_class(row):
+        return integer(row.get("priority_class", classes.get(str(row.get("project", "")), 2)),
+                       "priority class")
+
     def admission(i):
         row = lots[i]
-        priority = integer(row.get("priority_class", classes.get(str(row.get("project", "")), 2)),
-                           "priority class")
-        return row.get("started_ts") is None, priority, number(row.get("created_ts", 0), "created_ts"), i
+        return (row.get("started_ts") is None, priority_class(row),
+                number(row.get("created_ts", 0), "created_ts"), i)
 
     pending = set(lots)
     while pending:
@@ -199,10 +206,12 @@ def _compute(snapshot):
             if started > now:
                 raise PlanningError("started_ts cannot be in the future")
             duration = max(duration - (now - started), 1.0)
+        project, repository = str(row.get("project", "")), str(row.get("repository", ""))
+        owners = {None, project, repository, "project:" + repository,
+                  *slot_reservations.keys_for(project, priority_class(row))}
         options = []
         for index, slot in enumerate(slots):
-            if slot["reservation"] not in (None, str(row.get("project", "")),
-                                             str(row.get("repository", ""))):
+            if slot["reservation"] not in owners:
                 continue
             if row.get("host") and row["host"] != slot["host"]:
                 continue
@@ -298,18 +307,18 @@ def forecast(snapshot, *, previous=None):
     return out
 
 
-def run_file(path, *, previous_path=None, db=None, project=None):
+def run_file(path, *, previous_path=None, db=None, project=None, canons=None):
     """CLI boundary: read snapshots and print only the computed projection."""
     import json
     from pathlib import Path
     snapshot = json.loads(Path(path).read_text())
     if project:
-        snapshot = project_snapshot(db, project, snapshot)
+        snapshot = project_snapshot(db, project, snapshot, canons=canons)
     previous = json.loads(Path(previous_path).read_text()) if previous_path else None
     return forecast(snapshot, previous=previous)
 
 
-def project_snapshot(db, project, settings):
+def project_snapshot(db, project, settings, *, canons=None):
     """Read the existing backlog and recorded actuals for a capacity forecast.
 
     Settings supply hosts, now, gate response times and per-lot gate details.
@@ -318,6 +327,15 @@ def project_snapshot(db, project, settings):
     """
     from . import estimates, storage, work_dependencies
     out = deepcopy(settings)
+    # #5601: a host without explicit reservations gets those of its Host
+    # records, the ones the live dispatcher enforces
+    for host in out.get("hosts", []):
+        if "reservations" not in host and canons:
+            reserved = slot_reservations.merge(
+                one.host(str(host["name"])).policy.slot_reservations or {}
+                for one in canons if one.host(str(host["name"])) is not None)
+            if reserved:
+                host["reservations"] = reserved
     overrides = {integer(r["id"], "lot override"): r for r in out.pop("lots", [])}
     rows = storage.of(db).work.project_plan_rows(project)
     ids = {int(row["id"]) for row in rows}

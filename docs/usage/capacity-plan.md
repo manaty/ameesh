@@ -59,8 +59,11 @@ cross-project snapshot. A blocked lot or pending decision needs explicit
 wait details; otherwise the forecast fails with the lot number.
 
 Slots reserved for a project or repository cannot be borrowed by another.
-Unreserved slots are shared. Among eligible lots admission uses ascending
-priority class, then creation time, then ID. Existing runs are placed first;
+Reservation keys are those of the live dispatcher (below): `project:<app>`
+and `class:<priority>`; a bare name still means a project or repository.
+In `--project` mode a host without `reservations` in the file takes those of
+its Host records. Unreserved slots are shared. Among eligible lots admission
+uses ascending priority class, then creation time, then ID. Existing runs are placed first;
 there is no implicit one-run-per-repository restriction. In-progress lots may
 pin `host` and `slot`; their elapsed time is subtracted from the calibrated
 duration (at least one second remains when overdue). If existing runs cannot
@@ -86,7 +89,7 @@ ameesh work plan --capacity-plan updated.json --previous-plan forecast.json
 The output names every moved lot and its old/new times. A completed lot uses
 `completed_ts`; no run slot is retained. The caller owns event subscription
 and publication of the JSON. This command does not register a background
-subscriber or enforce reservations in the live dispatcher.
+subscriber.
 
 For an unmet `deadline_ts`, the forecast tries adding unreserved slots on an
 additional host and returns the smallest tested feasible capacity. This is a
@@ -96,3 +99,25 @@ null `required_slots` includes an explanation; adding capacity to a specific
 existing host can be evaluated by changing its `slots` explicitly. The
 critical chain describes this allocation, rather than a resource-free CPM
 path. Calendar dates and epic delivery bounds inherit these assumptions.
+
+## Live reservations (#5601)
+
+A Host record may keep some of its `policy.max_agents` places for a project
+or a priority class:
+
+```yaml
+policy:
+  max_agents: 6
+  slot_reservations: {"project:nexlink": 2, "class:1": 1}
+```
+
+An agent fills a reservation when its next lot (the one it would wake for:
+highest priority, then oldest) belongs to that project (`app`) or has that
+priority. A free place goes to another agent only while the unfilled
+reservations still fit in the places left. With reservations on its host,
+the runner admits unleased agents by the class, then the creation date of
+their next lot; elected roles come first, agents without an actionable lot
+last. Without reservations the claim order is unchanged and no lot is read.
+Reservations divide the `max_agents` of the runner. More reserved places than
+`max_agents` is a canon error; an unreadable entry is a canon error too and
+is ignored, so it never holds places nobody can take.
