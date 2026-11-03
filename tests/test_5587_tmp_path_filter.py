@@ -55,10 +55,22 @@ class TmpPathTest(PgTestCase):
         if not isinstance(self.db, db_mod.PsycopgDriver):
             self.skipTest("EXPLAIN is wrapped by the psql driver")
         self.db.execute("DELETE FROM housekeeping_log")
-        self.db.execute(
-            "INSERT INTO housekeeping_log (host, at, actor, kind, action, path)"
-            " SELECT 'h1', now() - g * interval '1 second', 'test', 'tmp',"
-            " 'signaled', '/tmp/p' || (g % 2000) FROM generate_series(1, 500000) g")
+        # #5600 : sous la charge de la CI, le remplissage (500 000 lignes
+        # et leurs index) dépassait le `statement_timeout` du banc alors que le
+        # test ne lit que le plan ; le délai est levé le temps du remplissage
+        # seulement, puis rétabli à sa valeur de session (pas RESET : elle
+        # n'est pas forcément celle du démarrage).
+        timeout = self.db.query("SELECT current_setting('statement_timeout') AS v")[0]["v"]
+        try:
+            db_mod.execute_without_statement_timeout(
+                self.db,
+                "INSERT INTO housekeeping_log (host, at, actor, kind, action, path)"
+                " SELECT 'h1', now() - g * interval '1 second', 'test', 'tmp',"
+                " 'signaled', '/tmp/p' || (g % 2000) FROM generate_series(1, 500000) g")
+        finally:
+            self.db.query("SELECT set_config('statement_timeout', %s, false)", (timeout,))
+        self.assertEqual(self.db.query(
+            "SELECT current_setting('statement_timeout') AS v")[0]["v"], timeout)
         hk = storage.of(self.db).housekeeping
         hk.log("h1", [{"kind": "tmp", "action": "unowned", "path": "/tmp/keep"},
                       {"kind": "tmp", "action": "over_quota", "path": "/tmp/gone"},
