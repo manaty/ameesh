@@ -71,6 +71,11 @@ CHECKS = (
     # revue de #5466 passée à côté) : refusé au gel, pas seulement en CI.
     ("jauges DISTINCT ON #5555", ["-m", "unittest", "-q",
                                   "tests.test_5555_gauge_plans.GaugeDistinctOnGuardTest"]),
+    # #5582 : le rattrapage de relecture matérialise ses barrières bon marché ;
+    # l'annulation et le compteur de tentatives ne doivent pas revenir dans la
+    # sélection qui évaluait 2 700 jalons `merged` à chaque relevé (3,7 s).
+    ("rattrapage de relecture #5582", ["-m", "unittest", "-q",
+                                       "tests.test_5582_rattrapage_relecture.ReviewCatchUpPlanGuardTest"]),
     # L161a : un module qui lit docs/ ou site/ est déclaré lecteur de la doc
     ("doc readers L161a", ["-m", "unittest", "-q",
                            "tests.test_l161a_ci_sans_code.ReadersTest"]),
