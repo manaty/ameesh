@@ -332,6 +332,109 @@ poussée ne couvre (#2957). Les profils humains sont aussi exclus de
 `sans_executeur`, même si une ligne `mode=execute` portait `key_role=owner` ou
 `harness=none` : ils ne sont jamais comptés deux fois (#2957).
 
+## Manifeste verrouillé du venv de staging (#5666)
+
+Le §5 du plan L2 (#5495) exige, avant la pose du venv de staging, un paquet
+opérateur protégé (`requirements-staging.lock` et `wheelhouse`) et un manifeste
+qualifié : distributions et versions exactes, SHA-256 de chaque roue, SHA-256 de
+l'arbre installé. Le script
+[`deploy/mise-a-jour/venv-staging.py`](../deploy/mise-a-jour/venv-staging.py)
+produit ce manifeste depuis un commit de release et vérifie un venv installé
+contre lui ; il ne pose rien sur un hôte et n'utilise ni réseau ni secret.
+Le script exécuté doit être celui du dépôt au commit qualifié ; le manifeste
+ne porte pas de hash de l'outil.
+
+### Paquet opérateur et production
+
+Le lock est exact : une ligne `nom==version` par distribution, chacune avec au
+moins un `--hash=sha256:` ; ni URL, ni marqueur, ni sdist, ni option. Le
+wheelhouse contient exactement une roue par distribution du lock, avec le
+SHA-256 du lock, et le lock doit nommer `ameesh` et `setuptools`. Le
+wheelhouse et son dossier sont protégés (réguliers, non liés, non modifiables
+par le groupe ou les autres) ; les roues sont construites avec `umask 022`,
+car le manifeste compare aussi leurs modes.
+
+La roue `ameesh` du wheelhouse est reconstruite depuis le commit qualifié avec
+le `setuptools` du wheelhouse, sans isolation de construction ni réseau. Le
+script refuse toute différence de nom, de contenu ou de mode avec la roue du
+wheelhouse : le SHA-256 du manifeste est celui de la roue réellement installée,
+et cette comparaison prouve sa correspondance au commit.
+
+```sh
+install -d -m 0700 ~/staging/manifeste
+python3 deploy/mise-a-jour/venv-staging.py produire \
+  --clone ~/work/ameesh-release --tag vX.Y.Z \
+  --lock ~/staging/paquet/requirements-staging.lock \
+  --wheelhouse ~/staging/paquet/wheelhouse \
+  --python /usr/bin/python3 \
+  --output ~/staging/manifeste/venv-vX.Y.Z.json
+```
+
+`--sha <40 hexadécimaux>` remplace `--tag` ; les deux formes donnent le même
+manifeste pour le même commit. La production se fait hors root, avec le
+Python système de l'hôte cible (même version et même `pip` de bootstrap que la
+pose) ; le manifeste enregistre cette version. Le manifeste est canonique,
+sans date ni chemin temporaire : deux exécutions sur le même SHA, le même lock
+et le même wheelhouse donnent les mêmes octets. Le vérifier :
+
+```sh
+python3 deploy/mise-a-jour/venv-staging.py produire ... --output m1.json
+python3 deploy/mise-a-jour/venv-staging.py produire ... --output m2.json
+cmp m1.json m2.json
+```
+
+Une sortie identique à un manifeste existant est acceptée ; une sortie
+différente est refusée. Le fichier est écrit en `0444`, dans un dossier non
+modifiable par le groupe ou les autres.
+
+### Pose et vérification
+
+Le manifeste ne remplace ni la qualification du commit à la forge, ni la
+relecture du paquet opérateur, ni le feu de pose. Après le feu seulement :
+
+1. créer le venv avec le Python système (liens par défaut, pas `--copies`)
+   et `umask 022` ;
+2. installer depuis le **même** paquet, avec la commande du plan :
+   `pip install --no-index --find-links <wheelhouse> --require-hashes
+   --only-binary=:all: --no-compile -r <requirements-staging.lock>`, puis
+   `pip check` ;
+3. vérifier le venv avant toute activation :
+
+```sh
+python3 deploy/mise-a-jour/venv-staging.py verifier \
+  --manifeste ~/staging/manifeste/venv-vX.Y.Z.json --venv <venv>
+```
+
+Le code 0 est obligatoire. Un écart est un refus : aucune activation, aucun
+repli libre, aucun élargissement des droits. Le manifeste épingle aussi
+l'interpréteur : `python` porte sa `version`, son `home` et son `executable`
+résolus, et le SHA-256 du binaire résolu. La vérification compare ces valeurs
+**avant d'exécuter l'interpréteur** ; un `pyvenv.cfg` ou un `bin/python`
+réécrit vers un autre binaire, même de même version, est un écart. Elle est en
+lecture seule et fail closed ; elle contrôle :
+
+| Objet | Contrôle |
+| --- | --- |
+| Interpréteur | `python.version`, `home` et `executable` résolus et root, SHA-256 du binaire résolu, `bin/python*` liés à ce binaire, `include-system-site-packages=false`, version relue après la comparaison |
+| Distributions | liste exacte et versions de `distributions`, égale au bootstrap (`pip`) plus le lock |
+| Arbre installé | SHA-256, nombre de fichiers, dossiers et octets de tout le venv hors `bin/`, `pyvenv.cfg`, `lib64` et bytecode |
+| Scripts d'entrée | contenu, lanceur et mode de chaque script de `bin/` déclaré par un `RECORD` |
+| Activation | scripts `activate*` normalisés par le chemin du venv |
+| Dépendances | `pip check` après la vérification de l'arbre, avec `-B` et un cache de bytecode hors du venv |
+
+Les fichiers `bin/` sont couverts par le hash de chaque script d'entrée (le
+chemin du venv est normalisé en `<VENV>`), les scripts d'activation par leur
+propre hash, et `__pycache__`/`.pyc` ne font pas partie du manifeste : la pose
+utilise `--no-compile` et la vérification n'écrit pas de bytecode ; seul le
+bytecode du `pip` de bootstrap est toléré, tout autre est un écart. Le
+`pip check` de la vérification relit la source de `pip`, jamais son bytecode :
+il s'exécute avec `-B` et un `pycache_prefix` hors du venv. Un
+dossier `lib64` n'est accepté que comme lien vers `lib`.
+
+Codes de sortie du vérifier : `0` conforme, `1` écart constaté, `2` manifeste
+ou entrée invalide. Le script ne crée aucun compte, clé, DSN, unité ou
+privilège ; il ne fait aucun geste d'hôte.
+
 ## Signal « staging actif » (#1323)
 
 Le signal est porté par
@@ -848,7 +951,22 @@ entrée non fiable :
   en cours ou illisible (quota anonyme compris) : refus, la demande reste en
   attente et la forge est relue au plus toutes les 5 min. Un dépôt privé
   exigerait un jeton de lecture, nouveau détenteur de secret soumis à une
-  décision owner.
+  décision owner ;
+- **les empreintes de la sonde et du notifier sont consignées** (#5665) :
+  avant chaque passage qui traite une demande, et avant tout geste d'hôte
+  (reprise comprise), l'exécutant lit en entier et hache en SHA256 le
+  programme `quiescence_probe`, chaque script absolu qu'il reçoit en
+  argument, et le notifier de ses alertes : `QUIESCENCE_NOTIFIER` (celui de
+  `bascule_env`, que la sonde source, l'emporte sur celui de l'unité ; seul
+  un chemin littéral y est admis), sinon le python de la sonde
+  (`QUIESCENCE_PYTHON`, défaut `~/.local/share/ameesh/venv/bin/python`) et
+  le paquet `ameesh` de son venv (une empreinte de l'arbre, caches
+  `__pycache__` exclus). Elles vont dans la demande (`fingerprints`), donc
+  dans la tentative et son résultat. Fichier illisible ou introuvable :
+  refus `fingerprint: …`, sans aucun geste. La clé facultative
+  `expected_sha256` de `staging-executor.json` (chemin absolu → SHA256)
+  fait refuser toute empreinte différente, ou un chemin déclaré que la
+  séquence ne lance pas ; absente, on consigne sans refuser.
 
 Le programme `quiescence_probe` doit prouver l'arrêt de l'ancien exécutant
 et de ses opérations distantes, y compris les unités transitoires du poste.

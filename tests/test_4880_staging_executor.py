@@ -11,6 +11,9 @@ from unittest import mock
 from ameesh import (release_cutoff, role_run, staging_executor as executor,
                     staging_watch)
 
+#: #5665: kept before ExecutorTest replaces it.
+FINGERPRINTS = executor.fingerprints
+
 
 def running(run, deadline=600):
     """#4885: a sequence of another path, in flight (deadline relative)."""
@@ -66,6 +69,8 @@ class ExecutorTest(unittest.TestCase):
                               return_value=("", True)),
             # #5500: the activation conditions have their own tests.
             mock.patch.object(executor, "activation_problem", return_value=None),
+            # #5665: the fingerprints have their own tests (FingerprintTest).
+            mock.patch.object(executor, "fingerprints", return_value=({}, None)),
             mock.patch.object(executor, "tree_problem", return_value=None),
             mock.patch.object(executor, "forge_ci", return_value=(None, "CI green")),
         ]
@@ -593,3 +598,135 @@ class LeaseNoteTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FingerprintTest(unittest.TestCase):
+    """#5665: the probe, its scripts and its notifier are read and
+    fingerprinted before any host operation (ownership: #5500 tests)."""
+    record = ExecutorTest.record
+    recent = ExecutorTest.recent
+    run_child = ExecutorTest.run_child
+
+    def setUp(self):
+        ExecutorTest.setUp(self)
+        for patch in (mock.patch.object(executor, "fingerprints", FINGERPRINTS),
+                      mock.patch.object(executor, "path_problem", return_value=None)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.probe = self.write("bin/probe", "#!/bin/sh\n")
+        self.script = self.write("quiescence-staging.sh", "exit 0\n")
+        self.notifier = self.write("bin/notifier", "#!/bin/sh\n")
+        self.options["quiescence_probe"] = [self.probe, self.script, "--flag"]
+        patch = mock.patch.dict("os.environ", {"QUIESCENCE_NOTIFIER": self.notifier})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def write(self, name, text):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return str(path.resolve())
+
+    @staticmethod
+    def digest(path):
+        import hashlib
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def assert_refused_before_any_operation(self, result, text):
+        self.assertEqual(result["state"], "blocked")
+        self.assertTrue(result["reason"].startswith(executor.FINGERPRINT_REFUSAL))
+        self.assertIn(text, result["reason"])
+        self.assertEqual(self.calls, [])
+        executor.subprocess.run.assert_not_called()
+        release_cutoff._settle_poste_units.assert_not_called()
+        release_cutoff._worktree.assert_not_called()
+
+    def test_attempt_records_each_fingerprint(self):
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["fingerprints"], {
+            path: self.digest(path) for path in (self.probe, self.script, self.notifier)})
+        self.assertEqual(self.request["fingerprints"], result["fingerprints"])
+
+    def test_refused_probe_records_what_ran(self):
+        self.request.update(state="running", host="host-a", run="attempt-a")
+        self.cfg.host = "host-b"
+        self.run_child = lambda argv, env, *a, **kw: (self.calls.append((argv, env))
+                                                      or (1, False))
+        executor.role_run._run_under_lease.side_effect = self.run_child
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["reason"], "old execution not proved stopped")
+        self.assertEqual(self.request["fingerprints"][self.probe], self.digest(self.probe))
+
+    def test_unreadable_file_is_refused_before_any_operation(self):
+        import os
+        if os.geteuid() == 0:
+            self.skipTest("root reads any file")
+        os.chmod(self.script, 0)
+        self.addCleanup(os.chmod, self.script, 0o600)
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assert_refused_before_any_operation(result, "unreadable")
+        self.assertEqual(self.request["blocked_reason"], result["reason"])
+
+    def test_missing_notifier_is_refused(self):
+        with mock.patch.dict("os.environ", {"QUIESCENCE_NOTIFIER": str(self.root / "absent")}):
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assert_refused_before_any_operation(result, "notifier not found")
+
+    def test_expected_digest(self):
+        self.options["expected_sha256"] = {self.notifier: self.digest(self.notifier)}
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "completed")
+        for expected, text in (({self.notifier: "0" * 64}, "expected " + "0" * 64),
+                               ({str(self.root / "other"): "0" * 64}, "expected but not run")):
+            with self.subTest(text):
+                self.calls.clear()
+                executor.subprocess.run.reset_mock()
+                release_cutoff._worktree.reset_mock()
+                self.request = dict(request="request-2", sha="a" * 40, state="pending")
+                self.options["expected_sha256"] = expected
+                result = executor.tick(self.db, self.cfg, self.options)
+                self.assert_refused_before_any_operation(result, text)
+
+    def test_expected_digest_declaration_is_validated(self):
+        import json
+        base = dict(key="k", project="p", role="r", repo="/r", bascule_env="/b",
+                    github="o/r", candidates=["a", "b"])
+        for bad in ({"relative": "0" * 64}, {"/abs": "short"}, ["/abs"]):
+            with self.subTest(bad=bad):
+                path = self.root / "settings.json"
+                path.write_text(json.dumps(dict(base, expected_sha256=bad)))
+                with self.assertRaises(ValueError):
+                    executor.settings(str(path))
+
+    def test_python_notifier_fingerprints_its_ameesh_package(self):
+        python = self.write("venv/bin/python", "binary")
+        package = self.root / "venv/lib/python3.12/site-packages/ameesh"
+        self.write("venv/lib/python3.12/site-packages/ameesh/mail.py", "send = 1\n")
+        with mock.patch.dict("os.environ", {"QUIESCENCE_NOTIFIER": "",
+                                            "QUIESCENCE_PYTHON": python}):
+            first, problem = executor.fingerprints(self.options, dict(executor.os.environ))
+            self.assertIsNone(problem)
+            self.assertEqual(first[python], self.digest(python))
+            (package / "__pycache__").mkdir()
+            (package / "__pycache__" / "mail.pyc").write_bytes(b"cache")
+            self.assertEqual(executor.fingerprints(
+                self.options, dict(executor.os.environ))[0], first)
+            (package / "db.py").write_text("")
+            self.assertNotEqual(executor.fingerprints(
+                self.options, dict(executor.os.environ))[0][str(package)],
+                first[str(package)])
+            import shutil
+            shutil.rmtree(package)
+            self.assertIn("package ameesh not found", executor.fingerprints(
+                self.options, dict(executor.os.environ))[1])
+
+    def test_bascule_env_notifier_overrides_the_unit_environment(self):
+        other = self.write("bin/other-notifier", "#!/bin/sh\necho\n")
+        self.bascule.write_text("X=1\nexport QUIESCENCE_NOTIFIER='%s'\n" % other)
+        prints, problem = executor.fingerprints(self.options, dict(executor.os.environ))
+        self.assertIsNone(problem)
+        self.assertIn(other, prints)
+        self.assertNotIn(self.notifier, prints)
+        self.bascule.write_text("QUIESCENCE_NOTIFIER=$HOME/notifier\n")
+        self.assertIn("not a plain path", executor.fingerprints(
+            self.options, dict(executor.os.environ))[1])
