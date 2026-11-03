@@ -854,11 +854,14 @@ entrée non fiable :
   (reprise comprise), l'exécutant lit en entier et hache en SHA256 le
   programme `quiescence_probe`, chaque script absolu qu'il reçoit en
   argument, et le notifier de ses alertes : `QUIESCENCE_NOTIFIER` (celui de
-  `bascule_env`, que la sonde source, l'emporte sur celui de l'unité ; seul
-  un chemin littéral y est admis), sinon le python de la sonde
+  `bascule_env`, que la sonde source, l'emporte sur celui de l'unité ; les
+  formes littérales `NAME=…`, `export`, `readonly`, `declare -x` sont
+  admises et `unset NAME` l'efface, toute autre ligne active qui le nomme
+  étant un refus, #5669), sinon le python de la sonde
   (`QUIESCENCE_PYTHON`, défaut `~/.local/share/ameesh/venv/bin/python`) et
   le paquet `ameesh` de son venv (une empreinte de l'arbre, caches
-  `__pycache__` exclus). Elles vont dans la demande (`fingerprints`), donc
+  `__pycache__` exclus ; tout l'arbre du paquet est vérifié, pas seulement
+  sa racine, #5669). Elles vont dans la demande (`fingerprints`), donc
   dans la tentative et son résultat. Fichier illisible ou introuvable :
   refus `fingerprint: …`, sans aucun geste. La clé facultative
   `expected_sha256` de `staging-executor.json` (chemin absolu → SHA256)
