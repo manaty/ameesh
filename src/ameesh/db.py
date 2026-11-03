@@ -362,6 +362,11 @@ def _array_literal(values) -> str:
     Les éléments sont cités : `'{1,2}'` et `'{"1","2"}'` se lisent pareil pour
     `bigint[]` comme pour `text[]`, et un texte contenant virgule, guillemet
     ou barre oblique inverse reste un seul élément.
+
+    L'apostrophe est doublée dans le littéral final : sans cela, un élément
+    texte la refermerait et ajouterait une instruction (B/P1 de la revue de
+    #5585 : `db.bind("SELECT %s::text[]", [["x'}'; …"]])`). Le parseur SQL la
+    rend une fois, puis le parseur de tableau la garde telle quelle.
     """
     parts = []
     for item in values:
@@ -374,11 +379,13 @@ def _array_literal(values) -> str:
         elif isinstance(item, float):
             parts.append(repr(item))
         elif isinstance(item, str):
+            if "\x00" in item:
+                raise DbError("NUL character not allowed in an SQL parameter")
             text = item.replace("\\", "\\\\").replace('"', '\\"')
             parts.append('"%s"' % text)
         else:
             raise DbError("unsupported array element: %r" % (item,))
-    return "'{%s}'" % ",".join(parts)
+    return "'{%s}'" % ",".join(parts).replace("'", "''")
 
 
 def sql_literal(value: Any) -> str:

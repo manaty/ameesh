@@ -82,6 +82,19 @@ class JournalPlanCheckTest(unittest.TestCase):
         self.assertEqual(_journal_plan_problems(roots), [])
         self.assertIn(ITEM_INDEX, _journal_indexes(roots))
 
+    def test_a_text_element_cannot_close_the_sql_literal(self):
+        """B/P1 de la revue : l'apostrophe d'un élément est doublée."""
+        evil = "x'}'; SELECT 1; --"
+        self.assertEqual(
+            db_mod.bind("SELECT %s::text[]", [[evil]]),
+            "SELECT '{\"x''}''; SELECT 1; --\"}'::text[]")
+        self.assertEqual(db_mod.bind("SELECT %s::bigint[]", [[1, 2, 3]]),
+                         "SELECT '{1,2,3}'::bigint[]")
+
+    def test_a_nul_array_element_is_refused(self):
+        with self.assertRaises(db_mod.DbError):
+            db_mod.bind("SELECT %s::text[]", [["a\x00b"]])
+
 
 class JournalPlanDbTest(PgTestCase):
     """#5585 : les lectures du journal lient un tableau et restent indexées."""
@@ -176,6 +189,16 @@ class JournalPlanDbTest(PgTestCase):
             "       %s = ANY(%s::bigint[]) AS miss",
             (2, [1, 2, 3], 9, [1, 2, 3]))
         self.assertEqual(rows, [{"hit": True, "miss": False}])
+
+        # B/P1 de la revue : un tableau de textes garde apostrophe, accolade,
+        # virgule, guillemet et barre oblique inverse comme UN élément, sous
+        # psql comme sous psycopg.
+        for value in ("x'}'; SELECT 1; --", 'a"b', "c\\d", "e,f", "g}h"):
+            with self.subTest(value=value):
+                rows = self.db.query(
+                    "SELECT %s::text = ANY(%s::text[]) AS hit",
+                    (value, [value]))
+                self.assertEqual(rows, [{"hit": True}])
 
         st = storage.of(self.db).progress
         for name, read in (
