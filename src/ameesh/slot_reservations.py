@@ -8,16 +8,20 @@ project or a priority class (`docs/usage/capacity-plan.md`):
       max_agents: 6
       slot_reservations: {"project:nexlink": 2, "class:1": 1}
 
-* `project:<app>` keeps places for agents whose next lot belongs to `<app>`;
-* `class:<n>` keeps places for agents whose next lot has priority `<n>`.
+* `project:<p>` keeps places for the agents of project `<p>` (their canon
+  `projects`, else their team), whatever their next turn: no prediction;
+* `class:<n>` keeps places for agents whose lot has priority `<n>`.
 
-The "next lot" of an agent is the first row of `lot_sessions.actionable`,
-the one the agent would wake for (priority, then creation date). With
-reservations, the claim pass admits candidates by class, then by the
-creation date of that lot; elected roles stay first (their relief must not
-wait behind backlog). A place is free for anyone only while the unfilled
-reservations still fit in what remains. Without reservations nothing
-changes: the candidates keep the registry order and no lot is read.
+The class of an agent is that of its next lot, the first row of
+`lot_sessions.actionable` (priority, then creation date), and is judged
+again at the start of each lot turn; a lot refused there replaces that row
+at the next admission, so an unchanged state never loops (mesh-design
+decision, option A). With reservations, the claim pass admits candidates by
+class, then by the creation date of that lot; elected roles stay first
+(their relief must not wait behind backlog). A place is free for anyone only
+while the unfilled reservations still fit in what remains. Without
+reservations nothing changes: the candidates keep the registry order and no
+lot is read.
 
 The capacity planner (`capacity_plan`) reads the same keys for its slots.
 This module is pure: no database, no clock.

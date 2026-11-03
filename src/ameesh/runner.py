@@ -13781,11 +13781,21 @@ class Runner:
                           if name != (agent or {}).get("name") and worker.is_alive())
         return running < cap
 
+    #: #5601 : durée de vie du lot qu'un refus au pick impose à l'admission
+    #: suivante ; un état changé (lot traité ailleurs) se rattrape au plus là
+    REFUSED_DEMAND_TTL_S = 900.0
+
     def _admission_order(self, candidates: list) -> list:
         """#5601 : candidats dans l'ordre d'admission. Sans réservation sur
         l'hôte : la liste telle quelle, aucun lot lu. Avec : le prochain lot
         de chaque candidat (celui de son réveil, `lot_sessions.actionable`)
-        est lu, puis `slot_reservations.order` (rôles élus, classe, date)."""
+        est lu, puis `slot_reservations.order` (rôles élus, classe, date).
+
+        Décision mesh-design (option A) : un lot que le pick vient de refuser
+        remplace cette lecture jusqu'à ce qu'un tour passe (ou
+        `REFUSED_DEMAND_TTL_S`) : l'admission juge alors exactement ce que le
+        pick jugera — jamais « admis, refusé au pick, bail rendu, réadmis »
+        sur un état inchangé."""
         reservations = getattr(self, "_host_slot_reservations", None)
         if not reservations:
             return candidates
@@ -13802,13 +13812,19 @@ class Runner:
                 log_async("[%s] next lot unreadable for admission (%s)" % (name, exc))
                 rows = []
             demands[name] = rows[0] if rows else None
+            refused = (getattr(self, "_refused_demands", None) or {}).get(name)
+            if refused is not None and time.monotonic() - refused[0] < self.REFUSED_DEMAND_TTL_S:
+                demands[name] = refused[1]
         self._admission_demands = demands
         return slot_reservations_mod.order(candidates, demands, reservations)
 
     def _reservation_admits(self, agent: dict, others: list[str], cap: int) -> bool:
-        """#5601 : une place réservée à un projet ou à une classe n'est prise
-        que par un agent dont le prochain lot la remplit ; une place libre ne
-        va aux autres que si les réservations non remplies tiennent encore."""
+        """#5601 : une place réservée n'est prise que par un agent qui la
+        remplit — `project:<p>` par un agent du projet `<p>` (canon), sans
+        prédire son tour ; `class:<n>` par un agent dont le lot a la priorité
+        `<n>`. Une place libre ne va aux autres que si les réservations non
+        remplies tiennent encore."""
+        from . import projects as projects_mod
         from . import slot_reservations as slot_reservations_mod
         reservations = self._host_slot_reservations
         filled = getattr(self, "_slot_reservations", None)
@@ -13819,8 +13835,9 @@ class Runner:
             key = filled.get(name)
             held[key] = held.get(key, 0) + 1
         demand = (getattr(self, "_admission_demands", None) or {}).get(agent.get("name")) or {}
-        wants = slot_reservations_mod.keys_for(demand.get("project"), demand.get("priority")) \
+        wants = slot_reservations_mod.keys_for(None, demand.get("priority")) \
             if agent.get("releve") != "election" else []
+        wants += ["project:%s" % p for p in projects_mod.agent_projects(agent)]
         admitted, key = slot_reservations_mod.decide(reservations, held, len(others), cap, wants)
         if admitted:
             filled[agent.get("name")] = key
@@ -13844,7 +13861,16 @@ class Runner:
         if demands is None:
             demands = self._admission_demands = {}
         demands[name] = row
-        return self._reservation_admits(dict(agent, name=name), live, cap)
+        allowed = self._reservation_admits(dict(agent, name=name), live, cap)
+        refused = getattr(self, "_refused_demands", None)
+        if refused is None:
+            refused = self._refused_demands = {}
+        if allowed:
+            refused.pop(name, None)
+        else:
+            # option A : l'admission suivante juge ce même lot (pas de cycle)
+            refused[name] = (time.monotonic(), dict(row))
+        return allowed
 
     def admits_new_worker(self, agent: dict) -> bool:
         """L43 (0031) : `max_agents` PHYSIQUE de l'hôte (le plus petit des

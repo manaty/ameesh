@@ -1136,8 +1136,8 @@ class HostPolicy:
     #: `<command> busy|draining|idle-drained <host>` and never touches the
     #: cluster or the cloud itself. None = no adapter, so no automatic release.
     lifecycle_hook: str | None = None
-    #: #5601 : places de `max_agents` réservées à un projet ou à une classe de
-    #: priorité (`{"project:<app>": n, "class:<p>": n}`, `ameesh.slot_reservations`) ;
+    #: #5601 : places de `max_agents` réservées aux agents d'un projet ou à une
+    #: classe de priorité (`{"project:<p>": n, "class:<n>": n}`, `ameesh.slot_reservations`) ;
     #: None = aucune réservation, l'ordre d'admission reste celui du registre.
     slot_reservations: dict | None = None
     #: #2202 S2 : le placement de Job (`policy.sandbox`), None = l'hôte ne

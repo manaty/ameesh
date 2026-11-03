@@ -24,6 +24,7 @@ def fake_runner(reservations, max_agents, actionable):
     store = Mock()
     store.lot_sessions.actionable.side_effect = lambda name, today=None: actionable.get(name, [])
     run = types.SimpleNamespace(lock=threading.Lock(), workers={}, db=Mock(),
+                                REFUSED_DEMAND_TTL_S=runner_mod.Runner.REFUSED_DEMAND_TTL_S,
                                 _host_max_agents=max_agents, _host_pinned_admissions=None,
                                 _host_slot_reservations=reservations)
     for method in ("_admission_order", "_reservation_admits", "admits_new_worker",
@@ -129,13 +130,53 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(run.reservation_turn_allowed("a", {}, nxt("acme", 2, 12)[0]))
         self.assertIsNone(run._slot_reservations["a"])
 
-    def test_project_reservation(self):
-        lots = {"n": nxt("nexlink", 2, 50), "o": nxt("other", 2, 10)}
-        run, store = fake_runner({"project:nexlink": 1}, 1, lots)
+    def test_project_reservation_follows_the_agent_project(self):
+        """Option A (mesh-design): `project:<p>` keeps places for the agents of
+        project <p>, without predicting their turn. B cx2: a reviewer of acme
+        with no assigned lot (review mail only) is admitted; a reviewer of
+        another project is not."""
+        run, store = fake_runner({"project:acme": 1}, 1, {})
+        reviewer = {"name": "rev", "team": "acme"}
+        other = {"name": "rev2", "team": "other"}
         with patch("ameesh.storage.of", return_value=store):
-            run._admission_order([{"name": "o"}, {"name": "n"}])
-        self.assertFalse(run.admits_new_worker({"name": "o"}))
-        self.assertTrue(run.admits_new_worker({"name": "n"}))
+            run._admission_order([other, reviewer])
+        self.assertFalse(run.admits_new_worker(other))
+        self.assertTrue(run.admits_new_worker(reviewer))
+        self.assertEqual(run._slot_reservations["rev"], "project:acme")
+        run.workers["rev"] = Fil(reviewer)
+        # its later turns keep the place whatever the class of their lot
+        self.assertTrue(run.reservation_turn_allowed("rev", reviewer, nxt("x", 3, 1)[0]))
+        self.assertEqual(run._slot_reservations["rev"], "project:acme")
+        # declared `projects` count too
+        self.assertTrue(sr.decide({"project:b": 1}, {}, 0, 1, ["project:b"])[0])
+
+    def test_no_admit_refuse_cycle_on_unchanged_state(self):
+        """Invariant of the decision: cap 1, class:1 = 1. Admitted on its P1
+        lot, the agent's pick runs a P2 lot (scheduled wake): refused, lease
+        released. On the same state the next admission judges that P2 lot and
+        refuses: no "admitted, refused at pick, readmitted" loop."""
+        lots = {"a": nxt("acme", 1, 10)}
+        run, store = fake_runner({"class:1": 1}, 1, lots)
+        agent = {"name": "a"}
+        with patch("ameesh.storage.of", return_value=store):
+            run._admission_order([agent])
+            self.assertTrue(run.admits_new_worker(agent))
+            run.workers["a"] = Fil(agent)
+            self.assertFalse(run.reservation_turn_allowed("a", agent, nxt("acme", 2, 20)[0]))
+            del run.workers["a"]
+            for _ in range(3):     # same mail, lots and wakes: refused every pass
+                run._admission_order([agent])
+                self.assertFalse(run.admits_new_worker(agent))
+            # a turn that passes the pick clears the remembered refusal
+            self.assertTrue(run.reservation_turn_allowed("a", agent, nxt("acme", 1, 10)[0]))
+            run._admission_order([agent])
+            self.assertTrue(run.admits_new_worker(agent))
+            # and the remembered refusal expires (state changed elsewhere)
+            run.reservation_turn_allowed("a", agent, nxt("acme", 2, 20)[0])
+            run._refused_demands["a"] = (run._refused_demands["a"][0]
+                                         - runner_mod.Runner.REFUSED_DEMAND_TTL_S, {})
+            run._admission_order([agent])
+            self.assertTrue(run.admits_new_worker(agent))
 
 
 class CanonTest(test_canon._TmpMixin, unittest.TestCase):

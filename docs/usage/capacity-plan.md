@@ -59,7 +59,7 @@ cross-project snapshot. A blocked lot or pending decision needs explicit
 wait details; otherwise the forecast fails with the lot number.
 
 Slots reserved for a project or repository cannot be borrowed by another.
-Reservation keys are those of the live dispatcher (below): `project:<app>`
+Reservation keys are those of the live dispatcher (below): `project:<p>`
 and `class:<priority>`; a bare name still means a project or repository.
 In `--project` mode a host without `reservations` in the file takes those of
 its Host records. Unreserved slots are shared. Among eligible lots admission
@@ -111,9 +111,10 @@ policy:
   slot_reservations: {"project:nexlink": 2, "class:1": 1}
 ```
 
-An agent fills a reservation when its next lot (the one it would wake for:
-highest priority, then oldest) belongs to that project (`app`) or has that
-priority. A free place goes to another agent only while the unfilled
+`project:<p>` is filled by an agent of project `<p>` (its canon `projects`,
+else its team), whatever its next turn: a reviewer with review mail only is
+admitted. `class:<n>` is filled by an agent whose next lot (the one it would
+wake for: highest priority, then oldest) has priority `<n>`. A free place goes to another agent only while the unfilled
 reservations still fit in the places left. With reservations on its host,
 the runner admits unleased agents by the class, then the creation date of
 their next lot; elected roles come first, agents without an actionable lot
@@ -121,7 +122,9 @@ last. A resident worker is judged again before every turn that carries a lot
 (idle wake, scheduled wake, mail, prompt): when that lot no longer fills the
 reserved place it holds and no shared place is left, nothing is consumed (the
 prompt is restored, a scheduled wake comes back), it gives its lease back and
-the claim pass admits by class again.
+the claim pass admits by class again. Until a turn passes (at most 15 min),
+the next admission judges that refused lot, so an unchanged state never
+loops between admission and refusal.
 Without reservations the claim order is unchanged and no lot is read.
 Reservations divide the `max_agents` of the runner. More reserved places than
 `max_agents` is a canon error; an unreadable entry is a canon error too and
