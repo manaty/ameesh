@@ -4677,6 +4677,7 @@
    "ci": [
     "disks",
     "expect_disk",
+    "forget_disks",
     "observe_disk",
     "prune_disks",
     "add_failure",
