@@ -2798,6 +2798,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             work.note(db, args.id, text, actor=args.actor,
                       wake_ts=_wake_deadline(args))
             print(('note added to %s #%d') % (v.noun, args.id))
+            # #5484 : la note est écrite ; si elle annonce en prose la levée
+            # d'un hold encore actif, la CLI dit la forme exacte qui, elle,
+            # lève la retenue.
+            warning = work.hold_lift_warning(db, args.id, text)
+            if warning:
+                print("warning: %s" % warning, file=sys.stderr)
             return 0
         if args.work_command == "wake":
             if args.cancel:
