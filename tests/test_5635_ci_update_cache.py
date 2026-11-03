@@ -638,5 +638,55 @@ class MenageIntegrationTest(BaseTest):
         self.assertIn("RUNNER_WORKSPACE absent", resultat["sortie"])
 
 
+class RetraitAtomiqueTest(BaseTest):
+    """#5643 : renommer avant de supprimer, la nouvelle extraction est sûre."""
+
+    def test_auto_update_pendant_la_suppression_reste_intacte(self):
+        self.installer("2.338.2")
+        self.cache("2.338.2", taille=4096)
+        original = disque._supprimer_arbre
+        vus = []
+
+        def runner_extrait_puis_supprime(chemin):
+            # Le Listener démarre une auto-update pendant la suppression.
+            vus.append(chemin)
+            self.assertFalse(self.up.exists())
+            self.ecrire_bin(self.up / "bin", "2.339.0")
+            original(chemin)
+
+        with self.sans_processus(), mock.patch.object(
+                disque, "_supprimer_arbre", runner_extrait_puis_supprime):
+            resultat, par_root = self.decision()
+        self.assertEqual(resultat["retires"], 1)
+        self.assertEqual(vus, [self.up.with_name(
+            "_update.retire-%d" % os.getpid())])
+        self.assertFalse(vus[0].exists())
+        self.assertEqual(disque._lire_version_bin(self.up / "bin"), "2.339.0")
+        self.assertTrue((self.up / "bin" / "Runner.Listener.dll").is_file())
+        self.assertEqual(par_root["r1"]["verdict"], "retiré")
+
+    def test_renommage_impossible_preserve(self):
+        self.installer("2.338.2")
+        update = self.cache("2.338.2")
+        with self.sans_processus(), mock.patch.object(
+                disque.os, "rename", side_effect=OSError("EXDEV")):
+            resultat, par_root = self.decision()
+        self.assertTrue((update / "bin" / "Runner.Listener.dll").is_file())
+        self.assertEqual(resultat["retires"], 0)
+        self.assertIn("renommage impossible", par_root["r1"]["raison"])
+
+    def test_suppression_partielle_nomme_l_arbre_renomme(self):
+        self.installer("2.338.2")
+        self.cache("2.338.2")
+        with self.sans_processus(), mock.patch.object(
+                disque, "_supprimer_arbre", side_effect=OSError("EBUSY")):
+            resultat, par_root = self.decision()
+        retire = self.up.with_name("_update.retire-%d" % os.getpid())
+        self.assertFalse(self.up.exists())
+        self.assertTrue(retire.is_dir())
+        self.assertIn("_update.retire-", par_root["r1"]["raison"])
+        self.assertEqual(resultat["retires"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

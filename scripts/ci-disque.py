@@ -1197,12 +1197,29 @@ def _retirer_cache(cache: Path, root: Path, home: Path,
         return 0, "cache disparu entre deux contrôles"
     if (apres.st_dev, apres.st_ino) != (avant.st_dev, avant.st_ino):
         return 0, "cache remplacé entre deux contrôles"
-    taille = _taille_arbre(cache)
+    # Renommer d'abord (atomique, même système de fichiers) : une auto-update
+    # qui démarre pendant la suppression voit `_update` absent et le recrée,
+    # au lieu de perdre des fichiers de sa nouvelle extraction (#5643).
+    retire = cache.with_name("%s.retire-%d" % (cache.name, os.getpid()))
     try:
-        _supprimer_arbre(cache)
+        os.rename(cache, retire)
     except OSError as erreur:
-        reste = _taille_arbre(cache) if cache.exists() else 0
-        return max(0, taille - reste), "suppression partielle : %s" % erreur
+        return 0, "renommage impossible : %s" % erreur
+    renomme = retire.lstat()
+    if (renomme.st_dev, renomme.st_ino) != (avant.st_dev, avant.st_ino):
+        # Remplacé entre le contrôle et le renommage : rendre l'arbre neuf.
+        try:
+            os.rename(retire, cache)
+        except OSError as erreur:
+            return 0, "cache remplacé, laissé sous %s (%s)" % (retire.name, erreur)
+        return 0, "cache remplacé entre deux contrôles"
+    taille = _taille_arbre(retire)
+    try:
+        _supprimer_arbre(retire)
+    except OSError as erreur:
+        reste = _taille_arbre(retire) if retire.exists() else 0
+        return (max(0, taille - reste),
+                "suppression partielle de %s : %s" % (retire.name, erreur))
     return taille, None
 
 
