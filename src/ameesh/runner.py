@@ -3005,6 +3005,10 @@ class AgentWorker(threading.Thread):
             return self._native_compact(rp)
         else:
             return False
+        if self.rotation_retry_at > time.time():
+            # #5510 : le backoff par agent de #5503 vaut aussi pour l'entretien
+            # résident — une rotation annulée attend son échéance
+            return False
         if not self._rotation_allowed():
             return False
         if not self._rotate(raison):
