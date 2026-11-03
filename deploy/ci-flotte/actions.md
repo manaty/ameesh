@@ -5,11 +5,21 @@ Le bureau applique depuis le checkout fusionné, sur **chaque** VM CI
 
 1. `sudo bash deploy/ci-flotte/install-action-cache.sh --install`
 2. `sudo bash deploy/ci-flotte/install-action-cache.sh --check`
-3. Drainer puis redémarrer les runners entre deux jobs avec l’outil existant
-   `ameesh-ci-runner-drain --all --wait 3600`.
+3. Poser d’abord le drain corrigé de #5656 (`sudo bash
+   deploy/ci-flotte/install.sh --check` vert, sinon `--install`), puis
+   redémarrer les runners entre deux jobs avec ce drain : il ne coupe pas un
+   job accepté avant le lancement du Worker. **Ne jamais utiliser l’ancien
+   drain f40978b, suspendu.**
 4. Au premier job, vérifier dans les diagnostics Worker la mention
-   `Found action archive` et le chemin du cache. `systemctl show` vérifie la
-   configuration chargée ; le journal prouve l’usage par le processus lancé.
+   `Found action archive` et le chemin du cache. `--check` et `systemctl show`
+   ne prouvent que les fichiers et la configuration chargée ; le journal du
+   nouveau processus prouve l’usage effectif.
+
+Séquence confirmée par le bureau le 03/11/2026 (#187938) : le remplissage et
+les drop-ins (étapes 1–2) ne signalent aucune unité ; l’activation et le
+redémarrage (étape 3) attendent que #5656 soit relu, fusionné et posé. La
+preuve d’usage reste `Found action archive` dans les diagnostics du nouveau
+processus, pas `--check`.
 
 L’installateur vise les unités natives
 `actions.runner.manaty-ameesh.*.service` présentes sous `/etc/systemd/system`,
