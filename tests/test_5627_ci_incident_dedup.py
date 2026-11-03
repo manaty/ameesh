@@ -284,6 +284,18 @@ class CoveredRedTest(unittest.TestCase):
                          "tests/test_9999_autre_chose.py"])
         add.assert_called_once()
 
+    def test_negative_a_covered_red_with_an_empty_module_still_opens(self):
+        """B de ameesh-cx2 : une ligne d'échec sans module n'est pas couverte."""
+        for other in ("", None):
+            out, add, _note = self.consume(
+                [FIX_5606], ["tests/test_5582_rattrapage_relecture.py", other])
+            add.assert_called_once()
+
+    def test_negative_a_covered_red_with_a_placeholder_still_opens(self):
+        out, add, _note = self.consume(
+            [FIX_5606], ["tests/test_5582_rattrapage_relecture.py", "<hors test>"])
+        add.assert_called_once()
+
     def test_negative_a_lot_of_another_project_does_not_cover(self):
         other = dict(FIX_5606, app="nexlink")
         out, add, _note = self.consume([other], ["tests/test_5582_rattrapage_relecture.py"])

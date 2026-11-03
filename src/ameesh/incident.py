@@ -327,8 +327,15 @@ def covering_lots(st, *, app: str, modules: Iterable[str]) -> dict:
 
 
 def _uncovered(modules: Iterable[str], covered: dict) -> list[str]:
-    """Les modules en échec qu'aucun lot ouvert ne porte."""
-    return [module for module in attributable(modules) if module not in covered]
+    """Les lignes d'échec qu'aucun lot ouvert ne porte. Une ligne sans module
+    ou à module générique (`PLACEHOLDERS` : agrégat, panne d'installation)
+    n'est jamais couverte (B de ameesh-cx2) : l'incident reste dû."""
+    out = []
+    for module in modules or ():
+        path = _norm(module or "")
+        if not path or path in PLACEHOLDERS or path not in covered:
+            out.append(path or "<module vide>")
+    return out
 
 
 def _lot_of(commit: dict) -> Optional[int]:
@@ -821,7 +828,7 @@ def consume(db, *, integration=None, lands=None, links=None, links_for=None,
                 failures = []
             modules = [f.get("module") for f in failures]
             covered = covering_lots(st, app=app, modules=modules)
-            if covered and attributable(modules) and not _uncovered(modules, covered):
+            if covered and modules and not _uncovered(modules, covered):
                 # #5627 : chaque test rouge est déjà porté par un lot ouvert
                 # (un correctif en cours) : l'occurrence y est notée, aucun
                 # second lot n'est ouvert.
