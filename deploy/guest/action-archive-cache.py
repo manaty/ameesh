@@ -37,7 +37,7 @@ def safe_directory(path):
     for parent in [*reversed(path.parents), path]:
         if parent.exists() or parent.is_symlink():
             info = parent.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022 or info.st_uid != os.geteuid():
+            if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022 or info.st_uid not in (0, os.geteuid()):
                 raise ValueError(f'unsafe cache directory: {parent}')
         else:
             parent.mkdir(mode=0o755)
@@ -88,9 +88,29 @@ def prefill(workflows, cache):
             print(f'cached {repo}@{sha}')
 
 
+def check(workflows, cache):
+    cache = Path(cache)
+    if not cache.is_dir():
+        raise ValueError('action cache is absent')
+    safe_directory(cache)
+    for repo, sha in actions(workflows):
+        folder = cache / repo.replace('/', '_')
+        if not folder.is_dir():
+            raise ValueError(f'missing cache folder: {repo}')
+        safe_directory(folder)
+        archive = folder / f'{sha}.tar.gz'
+        checksum = folder / f'{sha}.sha256'
+        if (archive.is_symlink() or checksum.is_symlink()
+                or not archive.is_file() or not checksum.is_file()
+                or digest(archive) != checksum.read_text().strip()):
+            raise ValueError(f'missing or corrupt action archive: {repo}@{sha}')
+    print('action archive cache: all current workflow pins present')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--workflows', required=True)
     parser.add_argument('--cache', required=True)
+    parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    prefill(args.workflows, args.cache)
+    (check if args.check else prefill)(args.workflows, args.cache)

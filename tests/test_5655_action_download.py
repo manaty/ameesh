@@ -2,6 +2,9 @@
 import copy
 import importlib.util
 import io
+import os
+import subprocess
+import sys
 from pathlib import Path
 import tarfile
 import tempfile
@@ -153,3 +156,70 @@ class ArchiveCacheTest(unittest.TestCase):
             (Path(tmp) / 'test.yml').write_text('- uses: org/action@v4\n')
             with self.assertRaises(ValueError):
                 self.module.actions(tmp)
+
+
+class NativeInstallationTest(unittest.TestCase):
+    def test_install_check_refresh_and_remove_native_units_without_touching_guest(self):
+        installer = ROOT / 'deploy/ci-flotte/install-action-cache.sh'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            units = root / 'etc/systemd/system'
+            units.mkdir(parents=True)
+            native = units / 'actions.runner.manaty-ameesh.ameesh-ci-3-1.service'
+            native.write_text('[Service]\nUser=runner\n')
+            guest = units / 'ameesh-guest-ci@.service'
+            guest.write_text('guest untouched\n')
+            foreign = units / 'actions.runner.other-project.service'
+            foreign.write_text('foreign untouched\n')
+            archive = root / 'source.tar.gz'
+            with tarfile.open(archive, 'w:gz') as tar:
+                member = tarfile.TarInfo('root/action.yml')
+                member.size = 4
+                tar.addfile(member, io.BytesIO(b'test'))
+            binary = root / 'bin'
+            binary.mkdir()
+            curl = binary / 'curl'
+            curl.write_text('#!' + sys.executable + "\nimport os,shutil,sys\nshutil.copyfile(os.environ['FAKE_ARCHIVE'], sys.argv[sys.argv.index('--output')+1])\n")
+            curl.chmod(0o755)
+            # The installer's filesystem seam is under TMPDIR, whose outer
+            # shared directories rightly fail the production root guard.
+            # Keep real downloads/publication/checks; replace only that guard
+            # in this unprivileged subprocess, never in deployed code.
+            python = binary / 'python3'
+            python.write_text('#!' + sys.executable + '\n' + """
+import pathlib, sys
+source = sys.argv[2]
+ns = {'__name__': 'test_helper'}
+exec(compile(pathlib.Path(source).read_text(), source, 'exec'), ns)
+def private_directory(path):
+    path = pathlib.Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+ns['safe_directory'] = private_directory
+args = sys.argv[3:]
+ns['check' if '--check' in args else 'prefill'](
+    args[args.index('--workflows')+1], args[args.index('--cache')+1])
+""")
+            python.chmod(0o755)
+            env = dict(os.environ, CI_FLOTTE_TEST_ROOT=tmp, FAKE_ARCHIVE=str(archive),
+                       PATH=str(binary) + os.pathsep + os.environ['PATH'])
+            def run(mode):
+                return subprocess.run(['bash', str(installer), mode], env=env, text=True, capture_output=True)
+            self.assertNotEqual(run('--check').returncode, 0)
+            result = run('--install')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            dropin = Path(str(native) + '.d/action-cache.conf')
+            self.assertIn('ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=/usr/local/lib/ameesh-ci/action-archives', dropin.read_text())
+            self.assertEqual(run('--check').returncode, 0)
+            cached = next((root / 'usr/local/lib/ameesh-ci/action-archives').glob('*/*.tar.gz'))
+            cached.write_bytes(b'corrupt')
+            self.assertNotEqual(run('--check').returncode, 0)
+            result = run('--install')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(run('--check').returncode, 0)
+            self.assertEqual(run('--remove').returncode, 0)
+            self.assertFalse(dropin.exists())
+            self.assertTrue(cached.exists())
+            self.assertEqual(guest.read_text(), 'guest untouched\n')
+            self.assertEqual(foreign.read_text(), 'foreign untouched\n')
+            self.assertEqual(native.read_text(), '[Service]\nUser=runner\n')
