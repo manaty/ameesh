@@ -13,7 +13,8 @@ Trois gardes, complémentaires :
 * un plan RÉEL de la lecture exacte, à volume réaliste (5 000 lots, 5 000
   jalons `merged`, 10 000 événements) : l'annulation n'est évaluée que sur les
   lots dont le dernier jalon a une correction `build` postérieure, aucun tri
-  externe de plus de 1 Mo des lignes larges, exécution sous 500 ms ;
+  externe de plus de 1 Mo des lignes larges, exécution sous 1 s (plafond
+  large : la structure du plan est la preuve) ;
 * une garde statique : la sous-requête corrélée `merged_ts` ne revient pas,
   et les ensembles (`last_merge`, `candidates`, `annulled`, `merged`) restent
   matérialisés dans `issue_feed` ;
@@ -38,8 +39,9 @@ FEED = "issue_feed"
 ANNULLED = "agent_mesh_merged_annulled"
 #: au-delà, l'annulation est évaluée sur le flux, pas sur les seuls candidats.
 BROAD_ROWS = 100
-#: borne du constat #5579 (3,95 s hors charge).
-MAX_MS = 500.0
+#: borne du constat #5579 (3,95 s hors charge) : plafond large seulement, le
+#: temps de plan dépend de la charge du runner (canon §3, #5607).
+MAX_MS = 1000.0
 #: le tri externe du constat : 5 152 kB de lignes larges.
 MAX_SORT_KB = 1024
 

@@ -11,7 +11,9 @@ son courrier non remis par deux sous-requêtes de la vue et lisait
 Le témoin, sur le modèle de #5555 : 54 agents, 10 000 messages, 20 lignes de
 `canon_state` ; les comptes et l'état du canon sont ceux de la vue (0483), le
 plan (sous psycopg) n'a qu'un agrégat du courrier et aucune sous-requête par
-ligne sur `agent_registry` ou `agent_mailbox`, et l'appel tient sous 100 ms.
+ligne sur `agent_registry` ou `agent_mailbox`, et l'appel tient sous 1 s
+(plafond large : la structure du plan est la preuve, le temps mesuré dépend
+de la charge du runner, canon §3).
 """
 from __future__ import annotations
 
@@ -151,7 +153,9 @@ class OverviewPlanDbTest(PgTestCase):
         self.assertEqual(len(mail_aggregates), 1, json.dumps(root, indent=1))
         self.assertEqual(int(mail_aggregates[0].get("Actual Loops", 1)), 1)
         self.assertEqual(problems, [], json.dumps(root, indent=1))
-        self.assertLess(elapsed_ms, 100, "overview() : %.1f ms" % elapsed_ms)
+        # Plafond large : le temps de plan dépend de la charge du runner
+        # (canon §3, #5607) ; la structure ci-dessus porte la garde.
+        self.assertLess(elapsed_ms, 1000, "overview() : %.1f ms" % elapsed_ms)
 
 
 if __name__ == "__main__":

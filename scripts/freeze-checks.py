@@ -27,12 +27,13 @@ reste sans Postgres) : les variantes `PgTestCase` restent à la CI du paquet.
 #5427 : les contrôles de [`WARN_CHECKS`] **avertissent sans bloquer**. Le lint
 d'herméticité y tourne sur les tests que le lot change (chemins du diff gelé,
 variable [`PATHS_ENV`] ; sans elle, la suite entière), toutes règles : un test
-du lot qui mesure une durée, lit le disque ou le CPU de l'hôte, ou construit
-une fixture au jour courant est montré à l'auteur. Sans diff lisible, seules
-les règles neuves H4 (seuil mural sous la seconde) et H5 (disque de l'hôte)
-sont cherchées sur la suite, pour ne pas noyer le signal sous les constats
-déjà présents (#5302, #5321). Le gel n'est pas une CI (§3) : le constat est
-montré, il ne refuse jamais le gel.
+du lot qui mesure une durée, lit le disque ou le CPU de l'hôte, construit une
+fixture au jour courant ou borne un temps de plan sous la seconde est montré à
+l'auteur. Sans diff lisible, seules les règles neuves H4 (seuil mural sous la
+seconde), H5 (disque de l'hôte) et H6 (temps d'un plan `EXPLAIN ANALYZE` sous
+la seconde) sont cherchées sur la suite, pour ne pas noyer le signal sous les
+constats déjà présents (#5302, #5321, #5607). Le gel n'est pas une CI (§3) :
+le constat est montré, il ne refuse jamais le gel.
 
 Usage : scripts/freeze-checks.py   (à la racine d'un arbre ameesh)
 Sortie : 0 tous verts, 1 au moins un rouge, 2 hors d'un arbre ameesh.
@@ -94,12 +95,12 @@ CHECKS = (
 #: #5427 : les contrôles qui **avertissent sans bloquer** le gel. Le lint
 #: d'herméticité tourne sur les tests que le lot change quand le garde
 #: transmet le diff (toutes règles), sinon sur la suite entière avec les seules
-#: règles neuves H4/H5 ; un constat est montré à l'auteur, jamais compté comme
-#: rouge (canon §3 : corriger à la source, pas relancer ; et le gel n'est pas
-#: une CI).
+#: règles neuves H4/H5/H6 ; un constat est montré à l'auteur, jamais compté
+#: comme rouge (canon §3 : corriger à la source, pas relancer ; et le gel n'est
+#: pas une CI).
 WARN_CHECKS = (
     ("herméticité des tests #5427",
-     ["scripts/test-hermeticity-lint.py", "--rules", "H4,H5",
+     ["scripts/test-hermeticity-lint.py", "--rules", "H4,H5,H6",
       "--max-findings", "10"]),
 )
 #: #5427 : les chemins du diff gelé, en JSON, posés par le garde du gel
