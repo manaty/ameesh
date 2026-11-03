@@ -438,6 +438,37 @@ class CiResults(interface.CiResults):
             "DELETE FROM ci_map_state WHERE lower(repo) NOT IN (%s)"
             % ", ".join(["%s"] * len(keys)), tuple(keys))
 
+    def expect_disk(self, repo, *, host, volume) -> None:
+        self.db.execute(
+            "INSERT INTO ci_disk_state (repo, host, volume) VALUES (%s, %s, %s) "
+            "ON CONFLICT (repo, host, volume) DO NOTHING", (repo, host, volume))
+
+    def observe_disk(self, repo, *, host, volume, run_id, sampled_ts,
+                     free_bytes, total_bytes) -> None:
+        self.db.execute(
+            """
+            INSERT INTO ci_disk_state AS d
+                (repo, host, volume, run_id, sampled_at, free_bytes, total_bytes)
+            VALUES (%s, %s, %s, %s, to_timestamp(%s), %s, %s)
+            ON CONFLICT (repo, host, volume) DO UPDATE SET
+                run_id=excluded.run_id, sampled_at=excluded.sampled_at,
+                free_bytes=excluded.free_bytes, total_bytes=excluded.total_bytes,
+                seen_at=now()
+            WHERE d.sampled_at IS NULL OR excluded.sampled_at > d.sampled_at
+            """, (repo, host, volume, run_id, sampled_ts, free_bytes, total_bytes))
+
+    def disks(self) -> list[dict]:
+        return self.db.query(
+            "SELECT repo, host, volume, run_id, free_bytes, total_bytes, "
+            "extract(epoch from sampled_at)::float8 AS sampled_ts "
+            "FROM ci_disk_state ORDER BY repo, host, volume")
+
+    def prune_disks(self, repos) -> None:
+        keys = sorted({str(repo).strip().casefold() for repo in repos if str(repo).strip()})
+        if keys:
+            self.db.execute("DELETE FROM ci_disk_state WHERE lower(repo) NOT IN (%s)"
+                            % ", ".join(["%s"] * len(keys)), tuple(keys))
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     def claim_guard_scan(self, repo, *, now, window_s) -> bool:
         """Revendique la fenêtre du relevé de `repo`, atomiquement.

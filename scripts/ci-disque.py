@@ -28,7 +28,8 @@ une borne d'âge supérieure au plafond d'un job (45 min) :
 * fichiers de plus de 48 h (au **ctime**, non antidatable sans root) sous les
   `_work/_temp` des runners de l'hôte et sous `/tmp` (compte `runner`
   seulement) ;
-* journaux `_diag` du runner de plus de 7 jours (au ctime).
+* journaux `_diag` fermés compressés après 72 h, archives retirées après
+  7 jours supplémentaires (au ctime).
 
 Rien n'est supprimé hors CI (`GITHUB_ACTIONS` absent) sans `--force` explicite.
 Les erreurs de docker ne font jamais rougir l'étape : le ménage est un confort,
@@ -42,6 +43,7 @@ postgres » du lot ne tient donc pas ; `rapport --complet` dit où va le disque
 soit.
 
 Usage :
+  scripts/ci-disque.py mesure --host <label-machine>
   scripts/ci-disque.py rapport [--complet] [--seuil-gib N]
   scripts/ci-disque.py menage [--dry-run] [--force] [--images-inutilisees]
 """
@@ -50,13 +52,16 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
+import gzip
 import json
 import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 GIB = 1024 ** 3
@@ -308,6 +313,18 @@ def rapport(complet: bool = False, seuil_gib: float | None = None) -> dict:
     return etat
 
 
+def mesure(hote=None):
+    """#5630 : petite sonde indépendante de docker, lisible via Checks API."""
+    disque = espace("/")
+    document = {"schema": "ameesh-ci-disk/1", "host": hote or socket.gethostname(),
+                "volume": disque["chemin"], "free_bytes": disque["libre"],
+                "total_bytes": disque["total"], "used_pct": disque["utilise_pct"],
+                "hostname": socket.gethostname()}
+    # Une notice même au vert : sa lecture permet de résoudre l'alerte.
+    print("::notice title=ameesh-ci-disk/1::" + json.dumps(document, separators=(",", ":")))
+    return document
+
+
 def _resume_rapport(etat: dict) -> None:
     lignes = ["### Disque de l'hôte %s (`%s`)" % (etat["hote"], etat["runner"]), "",
               "| | |", "|---|---|",
@@ -537,15 +554,107 @@ def _temp(dry_run: bool) -> dict:
             "sortie": "%d fichier(s)" % resultat["fichiers"]}
 
 
+def _journaux_ouverts(proc=Path("/proc")) -> set:
+    """Inodes ouverts par les runners ; lecture refusée = rotation abandonnée.
+
+    Un Listener peut garder son journal ouvert plusieurs jours. Aucun contenu
+    ni environnement de processus n'est lu, seulement les descripteurs.
+    """
+    ouverts = set()
+    for processus in proc.iterdir():
+        if not processus.name.isdigit():
+            continue
+        try:
+            if processus.stat().st_uid != os.getuid():
+                continue
+            if (processus / "comm").read_text().strip() not in (
+                    "Runner.Listener", "Runner.Worker"):
+                continue
+            for fd in (processus / "fd").iterdir():
+                try:
+                    info = fd.stat()
+                    ouverts.add((info.st_dev, info.st_ino))
+                except FileNotFoundError:
+                    pass
+        except FileNotFoundError:
+            pass
+    return ouverts
+
+
+def _rotation_diag(dossiers, dry_run=False, *, maintenant=None) -> dict:
+    """Logs fermés >72 h compressés ; archives gardées encore 7 jours.
+
+    Ctime, pas mtime antidatable. Ne suit aucun lien, n'écrase aucune archive.
+    Budget 128 fichiers / 120 secondes par passe ; garde une source changée.
+    """
+    debut = time.monotonic()
+    maintenant = time.time() if maintenant is None else maintenant
+    ouverts = _journaux_ouverts()
+    compte = libere = 0
+    chemins = (p for d in dossiers for p in sorted(d.glob("*.log*")))
+    for chemin in chemins:
+        if compte >= 128 or time.monotonic() - debut >= 120:
+            break
+        initial = chemin.lstat()
+        if (not chemin.name.startswith(("Runner_", "Worker_"))
+                or not stat.S_ISREG(initial.st_mode) or initial.st_uid != os.getuid()
+                or (initial.st_dev, initial.st_ino) in ouverts):
+            continue
+        age = maintenant - initial.st_ctime
+        if chemin.name.endswith(".log.gz"):
+            if age > AGE_DIAG_JOURS * 86400:
+                if not dry_run:
+                    chemin.unlink()
+                    libere += initial.st_size
+                compte += 1
+            continue
+        if chemin.suffix != ".log" or age <= 72 * 3600:
+            continue
+        if dry_run:
+            print("+ gzip " + str(chemin))
+            compte += 1
+            continue
+        archive = chemin.with_name(chemin.name + ".gz")
+        temporaire = chemin.with_name(chemin.name + ".gz.part")
+        cree = False
+        try:
+            with os.fdopen(os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
+                if os.fstat(source.fileno()) != initial:
+                    continue
+                fd = os.open(temporaire, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                cree = True
+                with os.fdopen(fd, "wb") as sortie:
+                    with gzip.GzipFile(filename="", mode="wb", fileobj=sortie) as gz:
+                        while bloc := source.read(1024 * 1024):
+                            gz.write(bloc)
+                            if time.monotonic() - debut >= 120:
+                                raise TimeoutError("budget de compression atteint")
+                final = chemin.lstat()
+                if any(getattr(final, k) != getattr(initial, k) for k in
+                       ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")):
+                    continue
+                os.link(temporaire, archive)  # refuse une archive déjà présente
+                chemin.unlink()
+                libere += max(0, initial.st_size - archive.stat().st_size)
+                compte += 1
+        except FileExistsError:
+            pass
+        finally:
+            if cree:
+                temporaire.unlink(missing_ok=True)
+    return {"fichiers": compte, "octets": libere}
+
+
 def _diag(dry_run: bool) -> dict:
-    """Journaux du runner de plus de 7 jours (le runner ne les tourne pas)."""
+    """Rotation des journaux sans toucher aux caches/updaters des runners."""
     racine = _racine_runner()
     if racine is None:
         return {"etape": "_diag des runners > 7 j", "libere": 0,
                 "sortie": "RUNNER_WORKSPACE absent, étape sautée"}
-    resultat = _fichiers_anciens(sorted(racine.parent.glob("*/_diag")),
-                                 int(AGE_DIAG_JOURS), dry_run)
-    return {"etape": "_diag des runners > 7 j", "libere": resultat["octets"],
+    dossiers = [p for p in sorted(racine.parent.glob("*/_diag"))
+                if not p.is_symlink() and not p.parent.is_symlink()]
+    resultat = _rotation_diag(dossiers, dry_run)
+    return {"etape": "_diag fermés >72 h compressés, archives >7 j retirées", "libere": resultat["octets"],
             "sortie": "%d fichier(s)" % resultat["fichiers"]}
 
 
@@ -635,6 +744,8 @@ def _analyse(argv=None):
                                 help="docker system df -v et du borné sous /home/runner")
     rapport_parser.add_argument("--seuil-gib", type=float, default=None,
                                 help="seuil d'alerte en GiB (défaut %(default)s)")
+    mesure_parser = sous.add_parser("mesure", help="sonde disque structurée sans docker")
+    mesure_parser.add_argument("--host", help="nom Host du mesh, lié au label de la VM")
     menage_parser = sous.add_parser("menage", help="élague ce qui n'est plus utilisé")
     menage_parser.add_argument("--dry-run", action="store_true",
                                help="imprime les commandes, ne supprime rien")
@@ -648,6 +759,9 @@ def _analyse(argv=None):
 
 def main(argv=None) -> int:
     args = _analyse(argv)
+    if args.mode == "mesure":
+        mesure(args.host)
+        return 0
     if args.mode == "rapport":
         rapport(complet=args.complet, seuil_gib=args.seuil_gib)
         return 0
