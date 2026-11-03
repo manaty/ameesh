@@ -490,10 +490,25 @@ class CiRunnersTest(unittest.TestCase):
         env.update({name: str(value) for name, value in env_extra.items()})
         return env
 
+    def assertNamesNoAppTree(self, out, root=REPO):
+        """No command it would run names the host application's namespace or
+        trees. The script cites its own helpers through its checkout
+        (`$HERE/…`), and a CI checkout lives under /home/runner (#5673): the
+        checkout root is masked first, so only a path of the application's
+        own tree still falls."""
+        roots = sorted({root, os.path.realpath(root)}, key=len, reverse=True)
+        for line in out.splitlines():
+            if line.startswith("DRY ") or line.startswith("next,"):
+                for prefix in roots:
+                    line = line.replace(prefix, "<checkout>")
+                self.assertNotIn("/home/runner", line)
+                self.assertNotIn("actions.runner", line)
+
     def run_script(self, *args, busy=False, **env_extra):
         if busy:
             env_extra["CI_RUNNERS_TEST_BUSY"] = "1"
-        return subprocess.run(["bash", SCRIPT, "--dry-run",
+        script = env_extra.pop("script", SCRIPT)
+        return subprocess.run(["bash", script, "--dry-run",
                                *self._with_host(self._with_floor(args))],
                               capture_output=True, text=True,
                               env=self.script_env(**env_extra))
@@ -571,6 +586,28 @@ class CiRunnersTest(unittest.TestCase):
         root = os.path.join(self.host, "srv/ameesh-guest/ci/jit/r%d" % n)
         return [f for f in os.listdir(root) if f.endswith(".b64")]
 
+    def test_a_checkout_under_home_runner_is_not_the_application_tree(self):
+        # #5673: in CI the checkout lives under /home/runner/…/_work; the
+        # helpers cited through it are not the application's tree. A
+        # checkout reached through such a path (`$HERE` keeps the logical
+        # path) passes, and a real command under /home/runner still falls.
+        base = tempfile.TemporaryDirectory()
+        self.addCleanup(base.cleanup)
+        checkout = os.path.join(base.name, "home/runner/r8/_work/ameesh/ameesh")
+        os.makedirs(os.path.dirname(checkout))
+        os.symlink(REPO, checkout)
+        res = self.run_script("--prepare", "--host", "ci-3", "--count", "2",
+                              script=os.path.join(checkout, "deploy/guest/ci-runners.sh"))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(checkout + "/deploy/guest/action-archive-cache.py", res.stdout)
+        self.assertNamesNoAppTree(res.stdout, root=checkout)
+        for line in ("DRY rm -rf /home/runner/r1/.runner",
+                     "DRY cp %s/x /home/runner/r1/.credentials" % checkout,
+                     "next, systemctl stop actions.runner.manaty-nexlink.r1"):
+            with self.subTest(line=line):
+                with self.assertRaises(AssertionError):
+                    self.assertNamesNoAppTree(line, root=checkout)
+
     def test_prepare_prints_the_install_and_changes_nothing(self):
         before = sorted(os.path.relpath(os.path.join(d, f), self.host)
                         for d, _, files in os.walk(self.host) for f in files)
@@ -585,10 +622,7 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("DRY write /etc/systemd/system/ameesh-guest-ci@.service", out)
         self.assertIn("systemctl daemon-reload", out)
         # nothing it would run ever names the application's namespace or trees
-        for line in out.splitlines():
-            if line.startswith("DRY ") or line.startswith("next,"):
-                self.assertNotIn("/home/runner", line)
-                self.assertNotIn("actions.runner", line)
+        self.assertNamesNoAppTree(out)
         after = sorted(os.path.relpath(os.path.join(d, f), self.host)
                        for d, _, files in os.walk(self.host) for f in files)
         self.assertEqual(before, after)
@@ -887,10 +921,7 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("runuser -u ameesh-guest -- rm -rf", out)
         self.assertIn("srv/ameesh-guest/ci/jit", out)
         self.assertIn("gh api -X DELETE", out)
-        for line in out.splitlines():
-            if line.startswith("DRY ") or line.startswith("next,"):
-                self.assertNotIn("/home/runner", line)
-                self.assertNotIn("actions.runner", line)
+        self.assertNamesNoAppTree(out)
 
     def test_prepare_requires_the_guard(self):
         # #1256 R1 : sans garde (ou sans couverture), rien n'arrête les

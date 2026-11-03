@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Rotation de vrais fichiers : ctime, inodes ouverts, archives et échecs."""
 import gzip
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -97,6 +98,206 @@ class RotationTest(unittest.TestCase):
         self.assertTrue(self.log.exists())
         self.assertFalse(list(self.root.glob('*.gz')))
 
+    def test_big_log_resumes_across_passes_instead_of_restarting(self):
+        contenu = b'x' * 5000
+        self.log.write_bytes(contenu)
+        part = self.log.with_name(self.log.name + '.gz.part')
+        etat = self.log.with_name(self.log.name + '.gz.state')
+        premier = disque._rotation_diag([self.root], maintenant=self.now,
+                                        budget_s=0, taille_bloc=1000)
+        self.assertEqual(premier['fichiers'], 0)
+        self.assertEqual(premier['partiels'], 1)
+        self.assertTrue(part.exists() and etat.exists())
+        self.assertTrue(self.log.exists())
+        passes = 0
+        while not self.log.with_suffix('.log.gz').exists() and passes < 10:
+            disque._rotation_diag([self.root], maintenant=self.now,
+                                  budget_s=0, taille_bloc=1000)
+            passes += 1
+        self.assertLess(passes, 10)
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         contenu)
+        self.assertFalse(self.log.exists())
+        self.assertFalse(part.exists())
+        self.assertFalse(etat.exists())
+
+    def test_stale_partial_without_state_is_discarded(self):
+        contenu = b'journal\n' * 1000
+        self.log.write_bytes(contenu)
+        part = self.log.with_name(self.log.name + '.gz.part')
+        part.write_bytes(b'residu illisible')
+        resultat = self.rotate()
+        self.assertEqual(resultat['fichiers'], 1)
+        self.assertEqual(resultat['residus'], 1)
+        self.assertFalse(part.exists())
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         contenu)
+
+    def test_partial_of_a_changed_source_is_restarted(self):
+        self.log.write_bytes(b'a' * 2000)
+        premier = disque._rotation_diag([self.root], maintenant=self.now,
+                                        budget_s=0, taille_bloc=1000)
+        self.assertEqual(premier['partiels'], 1)
+        with self.log.open('ab') as fichier:
+            fichier.write(b'b' * 500)
+        resultat = self.rotate()
+        self.assertEqual(resultat['residus'], 1)
+        self.assertEqual(resultat['fichiers'], 1)
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         b'a' * 2000 + b'b' * 500)
+
+    def test_unrecorded_partial_suffix_is_truncated_then_resumed(self):
+        contenu = b'z' * 3000
+        self.log.write_bytes(contenu)
+        disque._rotation_diag([self.root], maintenant=self.now, budget_s=0,
+                              taille_bloc=1000)
+        part = self.log.with_name(self.log.name + '.gz.part')
+        with part.open('ab') as fichier:
+            fichier.write(b'queue non enregistree')
+        passes = 0
+        while not self.log.with_suffix('.log.gz').exists() and passes < 10:
+            disque._rotation_diag([self.root], maintenant=self.now,
+                                  budget_s=0, taille_bloc=1000)
+            passes += 1
+        self.assertLess(passes, 10)
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         contenu)
+        self.assertFalse(part.exists())
+
+    def test_empty_log_is_archived(self):
+        self.log.write_bytes(b'')
+        resultat = self.rotate()
+        self.assertEqual(resultat['fichiers'], 1)
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()), b'')
+
+    def test_report_names_partial_residue_and_permission_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'r1'
+            (root / '_diag').mkdir(parents=True)
+            with mock.patch.object(disque, '_racine_runner', return_value=root), \
+                    mock.patch.object(disque, '_rotation_diag', return_value={
+                        'fichiers': 2, 'octets': 10, 'partiels': 1,
+                        'residus': 1, 'interrompu': True}):
+                resultat = disque._diag(False)
+            self.assertEqual(resultat['libere'], 10)
+            self.assertIn('résidu', resultat['sortie'])
+            self.assertIn('en cours', resultat['sortie'])
+            self.assertIn('reprise', resultat['sortie'])
+            with mock.patch.object(disque, '_racine_runner', return_value=root), \
+                    mock.patch.object(disque, '_journaux_ouverts',
+                                      side_effect=PermissionError('refus fd')):
+                resultat = disque._diag(False)
+            self.assertIn('PermissionError', resultat['sortie'])
+            self.assertIn('non tentée', resultat['sortie'])
+
+    def test_linked_partial_is_not_followed(self):
+        """Un `.gz.part` lié n'est jamais la sortie : sa cible reste intacte."""
+        contenu = b'journal\n' * 1000
+        self.log.write_bytes(contenu)
+        cible = self.root / 'cible-du-partiel'
+        cible.write_bytes(b'precieux' * 100)
+        part = self.log.with_name(self.log.name + '.gz.part')
+        etat = self.log.with_name(self.log.name + '.gz.state')
+        part.symlink_to(cible)
+        info = cible.stat()
+        etat.write_text(json.dumps({
+            'identite': disque._identite(self.log.lstat()),
+            'offset': 100, 'part_size': info.st_size,
+            'part_dev': info.st_dev, 'part_ino': info.st_ino}))
+        resultat = self.rotate()
+        self.assertEqual(cible.read_bytes(), b'precieux' * 100)
+        self.assertEqual(resultat['fichiers'], 1)
+        self.assertEqual(resultat['residus'], 1)
+        self.assertFalse(part.exists())
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         contenu)
+
+    def test_linked_state_tmp_is_not_written(self):
+        """Un `.gz.state.tmp` lié n'est jamais écrit : sa cible reste intacte."""
+        contenu = self.log.read_bytes()
+        cible = self.root / 'cible-etat'
+        cible.write_bytes(b'precieux')
+        temporaire = self.log.with_name(self.log.name + '.gz.state.tmp')
+        temporaire.symlink_to(cible)
+        resultat = self.rotate()
+        self.assertEqual(cible.read_bytes(), b'precieux')
+        self.assertEqual(resultat['fichiers'], 1)
+        self.assertTrue(temporaire.is_symlink())
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         contenu)
+
+    def test_linked_state_is_not_read(self):
+        """Un `.gz.state` lié n'est pas une source de confiance : résidu jeté."""
+        contenu = b'journal\n' * 1000
+        self.log.write_bytes(contenu)
+        identite = disque._identite(self.log.lstat())
+        part = self.log.with_name(self.log.name + '.gz.part')
+        part.write_bytes(b'partiel')
+        cible = self.root / 'cible-etat-lu'
+        texte = json.dumps({'identite': identite, 'offset': 1, 'part_size': 7,
+                            'part_dev': 1, 'part_ino': 1})
+        cible.write_text(texte)
+        etat = self.log.with_name(self.log.name + '.gz.state')
+        etat.symlink_to(cible)
+        resultat = self.rotate()
+        self.assertEqual(resultat['fichiers'], 1)
+        self.assertEqual(resultat['residus'], 1)
+        self.assertEqual(cible.read_text(), texte)
+        self.assertEqual(gzip.decompress(self.log.with_suffix('.log.gz').read_bytes()),
+                         contenu)
+
+    def test_fifo_auxiliary_never_blocks_rotation(self):
+        """Une FIFO sous `.gz.state`/`.gz.part` ne bloque jamais la rotation.
+
+        Témoin borné : sans `O_NONBLOCK`, l'ouverture d'une FIFO sans
+        écrivain attend indéfiniment ; le sous-processus est tué au délai et
+        le test échoue au lieu de figer la suite.
+        """
+        import subprocess
+        import sys
+        import textwrap
+        racine = self.root / 'fifo'
+        racine.mkdir()
+        script = racine / 'temoin.py'
+        script.write_text(textwrap.dedent('''
+            import gzip, importlib.util, os, sys, time
+            from pathlib import Path
+            repo, racine = Path(sys.argv[1]), Path(sys.argv[2])
+            spec = importlib.util.spec_from_file_location(
+                "ci_disque_fifo", repo / "scripts" / "ci-disque.py")
+            disque = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(disque)
+            contenu = b"journal\\n" * 1000
+            log = racine / "Worker_20261101.log"
+            log.write_bytes(contenu)
+            part = log.with_name(log.name + ".gz.part")
+            part.write_bytes(b"debut")
+            etat = log.with_name(log.name + ".gz.state")
+            os.mkfifo(etat)
+            resultat = disque._rotation_diag(
+                [racine], maintenant=time.time() + 73 * 3600, ouverts=set())
+            assert resultat["fichiers"] == 1, resultat
+            assert resultat["residus"] == 1, resultat
+            assert not part.exists() and not etat.exists()
+            assert gzip.decompress(
+                log.with_name(log.name + ".gz").read_bytes()) == contenu
+            # Partiel lui aussi substitué par une FIFO : les ouvertures
+            # rendent la main et le contrôle de type refuse l'entrée.
+            os.mkfifo(part)
+            os.mkfifo(etat)
+            fausse = {"part_dev": 1, "part_ino": 1, "part_size": 0}
+            assert disque._ouvrir_partiel(part, fausse) is None
+            assert disque._tronquer_partiel(part, fausse) is False
+            assert disque._lire_etat(etat, {}) is None
+            print("ok")
+        '''))
+        resultat = subprocess.run(
+            [sys.executable, str(script),
+             str(Path(__file__).resolve().parent.parent), str(racine)],
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(resultat.returncode, 0, resultat.stdout + resultat.stderr)
+        self.assertIn('ok', resultat.stdout)
+
 
 class ProcessReadingTest(unittest.TestCase):
     def test_only_runner_descriptors_are_read(self):
@@ -178,9 +379,32 @@ class DiskTransportTest(unittest.TestCase):
             [self.row(free_bytes=None, total_bytes=None, sampled_ts=None)], [], self.now)],
                          ['ci_disk_unreadable'])
 
+    def test_first_measure_grace_uses_first_seen_not_last(self):
+        healthy = dict(free_bytes=80 * 1024**3, total_bytes=100 * 1024**3)
+        first = self.row(sampled_ts=None, first_seen_ts=self.now, seen_ts=self.now,
+                         **healthy)
+        self.assertEqual(self.disk.findings([first], [], self.now), [])
+        self.assertEqual(self.disk.findings([first], [], self.now + self.disk.MAX_AGE), [])
+        late = self.row(sampled_ts=None,
+                        first_seen_ts=self.now - self.disk.MAX_AGE - 1,
+                        seen_ts=self.now, **healthy)
+        self.assertEqual([r['type'] for r in self.disk.findings([late], [], self.now)],
+                         ['ci_disk_unreadable'])
+        # B1 de la revue : une collecte qui repousse seen_ts ne renouvelle pas
+        # la grâce ; seule first_seen_ts la porte.
+        refreshed = dict(late, seen_ts=self.now + 1800)
+        self.assertEqual([r['type'] for r in self.disk.findings([refreshed], [], self.now)],
+                         ['ci_disk_unreadable'])
+        # Une mesure déjà reçue puis vieillie n'a pas de grâce : la sonde ne
+        # remonte plus, même si la VM est encore dans les jobs.
+        old = self.row(sampled_ts=self.now - self.disk.MAX_AGE - 1,
+                       first_seen_ts=self.now, seen_ts=self.now, **healthy)
+        self.assertEqual([r['type'] for r in self.disk.findings([old], [], self.now)],
+                         ['ci_disk_unreadable'])
+
     def test_collector_binds_annotation_to_base_workflow_job_and_timestamp(self):
         from types import SimpleNamespace
-        calls, measures, expected = [], [], []
+        calls, measures, expected, forgotten = [], [], [], []
         def api(path):
             calls.append(path)
             if '/workflows/' in path:
@@ -192,7 +416,9 @@ class DiskTransportTest(unittest.TestCase):
                     check_run_url='https://api.github.com/repos/acme/widget/check-runs/99')]}
             return [self.annotation(host='wrong'), self.annotation()]
         store = SimpleNamespace(expect_disk=lambda *a, **kw: expected.append(kw),
-                                observe_disk=lambda *a, **kw: measures.append(kw))
+                                observe_disk=lambda *a, **kw: measures.append(kw),
+                                forget_disks=lambda repo, hosts, **kw: forgotten.append(
+                                    (repo, hosts, kw)))
         self.disk.collect(api, self.repo, 'main', store)
         self.assertEqual(len(measures), 1)
         self.assertEqual(measures[0]['run_id'], 42)
@@ -200,6 +426,22 @@ class DiskTransportTest(unittest.TestCase):
         self.assertEqual(len(expected), 1)
         self.assertFalse(any('/runs/44/' in call for call in calls))
         self.assertEqual(measures[0]['sampled_ts'], 1793700000)
+        self.assertEqual(forgotten, [(self.repo, {self.host},
+                                      {'older_than_s': self.disk.FORGET_AGE})])
+
+    def test_no_job_seen_forgets_nothing(self):
+        from types import SimpleNamespace
+        forgotten = []
+        def api(path):
+            if '/workflows/' in path:
+                return {'workflow_runs': [dict(id=42, head_branch='main',
+                                               event='schedule')]}
+            return {'jobs': []}
+        store = SimpleNamespace(expect_disk=lambda *a, **kw: None,
+                                observe_disk=lambda *a, **kw: None,
+                                forget_disks=lambda *a, **kw: forgotten.append(kw))
+        self.disk.collect(api, self.repo, 'main', store)
+        self.assertEqual(forgotten, [])
 
     def test_probe_emits_parseable_notice_without_docker(self):
         import contextlib

@@ -2046,6 +2046,60 @@ class WatcherTest(PgTestCase):
         self.assertEqual(ci.main_red(self.db), [])
         self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
 
+    def test_relance_tout_infrastructure_ferme_la_ligne_running(self):
+        """#5661 : une relance terminée hors fenêtre dont tous les jobs ont
+        échoué au téléchargement d'action ne rend aucune conclusion ; la ligne
+        restée `running` est close, pas laissée orpheline pour toujours."""
+        st = storage.of(self.db)
+        sha = "9" * 20
+        st.ci.open_run(DEPOT, 4030, head_sha=sha, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW, logs=self.api.log)
+        self.api.terminated = [self.terminated(
+            4030, sha, "main", conclusion="failure", attempt=2,
+            updated_at=self.OLD)]  # 2 h : hors fenêtre
+        self.api.attempt_jobs[(4030, 2)] = [
+            dict(job_view("psql 7/16", status="completed", conclusion="failure",
+                          job_id=777),
+                 steps=[{"name": "Set up job", "status": "completed",
+                         "conclusion": "failure"}])]
+        self.api.log_text[777] = (REPO / "tests" / "fixtures" / "5655" / "429.log").read_text()
+        watcher._refresh_bases(self.db, DEPOT, {"tests.yml"}, ("main",))
+        row = st.ci.run(DEPOT, 4030)
+        self.assertEqual((row["status"], row["run_attempt"]), ("cancelled", 2))
+        self.assertEqual(st.ci.failures(DEPOT, 4030), [])
+        self.assertEqual(ci.main_red(self.db), [])
+
+    def test_relance_tout_infrastructure_ne_remplace_pas_un_resultat_conclu(self):
+        """#5661 : le dernier résultat utile d'une ligne déjà conclue reste ;
+        seul l'orphelin `running` est clos."""
+        st = storage.of(self.db)
+        sha = "7" * 20
+        st.ci.open_run(DEPOT, 4031, head_sha=sha, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.add_failure(DEPOT, 4031, run_attempt=1, part="psql 1/1",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=False, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        st.ci.conclude(DEPOT, 4031, "failure")
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW, logs=self.api.log)
+        self.api.terminated = [self.terminated(
+            4031, sha, "main", conclusion="failure", attempt=2,
+            updated_at=self.OLD)]
+        self.api.attempt_jobs[(4031, 2)] = [
+            dict(job_view("psql 7/16", status="completed", conclusion="failure",
+                          job_id=778),
+                 steps=[{"name": "Set up job", "status": "completed",
+                         "conclusion": "failure"}])]
+        self.api.log_text[778] = (REPO / "tests" / "fixtures" / "5655" / "429.log").read_text()
+        watcher._refresh_bases(self.db, DEPOT, {"tests.yml"}, ("main",))
+        row = st.ci.run(DEPOT, 4031)
+        self.assertEqual((row["status"], row["run_attempt"]), ("failure", 1))
+        self.assertIn("tests.test_a.T.test_1",
+                      " ".join(ci.main_red(self.db)[0]["tests"]))
+
     def test_vert_de_main_derriere_une_annulation_hors_fenetre(self):
         """#2935 (relecture cx3 B2) : le dernier résultat UTILE d'une base est
         le dernier success/failure, pas la dernière exécution ; un vert R2

@@ -2,15 +2,21 @@
 """#5666 : manifeste verrouillé du venv de staging, production et vérification.
 
 Aucun réseau, root, hôte ni installation réelle de staging : les roues sont
-synthétiques et le venv jetable est créé par le Python du banc. La construction
-de la roue ameesh est remplacée par la roue du wheelhouse pour le test
-d'intégration ; `_comparer_roues` est éprouvée séparément sur de vraies
-archives ZIP. `_preparer_outil` est aussi remplacé : le chemin pip réel est
-exercé par l'installation du wheelhouse dans le venv jetable.
+synthétiques et le venv jetable est créé par un Python du banc. La production
+est faite avec le Python système root quand il existe (`/usr/bin/python3`),
+car la garde de #5666 refuse un home non root ; sinon le Python du banc sert
+et seuls les contrôles de propriétaire sont élargis à son propriétaire réel
+(`_accepter_le_proprietaire_du_banc`). `InterpreteurTest` vérifie le refus d'un
+home non root dans les deux cas. La construction de la roue ameesh est
+remplacée par la roue du wheelhouse pour le test d'intégration ;
+`_comparer_roues` est éprouvée séparément sur de vraies archives ZIP.
+`_preparer_outil` est aussi remplacé : le chemin pip réel est exercé par
+l'installation du wheelhouse dans le venv jetable.
 """
 from tests import support  # noqa: F401 — environnement isolé du poste
 
 import base64
+import contextlib
 import copy
 import hashlib
 import importlib.util
@@ -20,6 +26,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -151,11 +158,111 @@ class CommitTest(unittest.TestCase):
             module._resoudre_commit(self.depot, sha=self.sha[:12])
 
 
+PYTHONS_ROOT = ('/usr/bin/python3', '/usr/local/bin/python3')
+
+
+def _fichier_root(chemin):
+    """Un fichier root, non modifiable par autrui."""
+    try:
+        info = Path(chemin).lstat()
+    except OSError:
+        return False
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == 0
+            and not info.st_mode & 0o022 and not info.st_mode & 0o7000)
+
+
+def _dossier_root(chemin):
+    try:
+        info = Path(chemin).lstat()
+    except OSError:
+        return False
+    return (stat.S_ISDIR(info.st_mode) and not Path(chemin).is_symlink()
+            and info.st_uid == 0
+            and not info.st_mode & 0o022 and not info.st_mode & 0o7000)
+
+
+def _python_root():
+    """Le Python système root du banc, ou None.
+
+    Même version mineure que le banc : le lock synthétique du test suppose le
+    pip de ``ensurepip`` de cette version (aucun setuptools avant 3.12).
+    """
+    for candidat in PYTHONS_ROOT:
+        chemin = Path(candidat)
+        try:
+            resolu = chemin.resolve(strict=True)
+        except OSError:
+            continue
+        if not (_dossier_root(chemin.parent) and _fichier_root(resolu)):
+            continue
+        try:
+            sonde = subprocess.run(
+                [str(chemin), '-c',
+                 'import platform, sys, venv, ensurepip; '
+                 'print(platform.python_version()); '
+                 'print("%d.%d" % sys.version_info[:2]); '
+                 'print(sys._base_executable)'],
+                capture_output=True, timeout=120, check=False,
+                env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        lignes = sonde.stdout.decode('utf-8', 'replace').split()
+        if (sonde.returncode != 0 or len(lignes) != 3
+                or lignes[1] != '%d.%d' % sys.version_info[:2]):
+            continue
+        base = Path(lignes[2])
+        if not (base.is_absolute() and _dossier_root(base.parent)
+                and _fichier_root(base)):
+            continue
+        return str(chemin), lignes[0]
+    return None
+
+
+def _python_du_banc():
+    """(python, version, vérifie_root) des productions jetables du test."""
+    trouve = _python_root()
+    if trouve is not None:
+        return trouve[0], trouve[1], True
+    return sys.executable, platform.python_version(), False
+
+
+@contextlib.contextmanager
+def _accepter_le_proprietaire_du_banc():
+    """Le Python du banc remplace un Python root absent, production et
+    vérification jetables.
+
+    La garde de production n'est pas modifiée : seuls les deux contrôles de
+    propriétaire root (home et binaire de l'interpréteur) sont élargis au
+    propriétaire réel du banc. Le refus d'un home non root reste éprouvé par
+    `InterpreteurTest`, sans ce remplacement.
+    """
+    vrai_dossier = module._dossier_protege
+    vrai_sha = module._sha256_regulier
+
+    def dossier(chemin, *, proprietaires=None):
+        if proprietaires == frozenset((0,)):
+            proprietaires = frozenset((0, Path(chemin).lstat().st_uid))
+        return vrai_dossier(chemin, proprietaires=proprietaires)
+
+    def sha(chemin, limite, *, proprietaires=None, libelle='roue'):
+        if proprietaires == frozenset((0,)):
+            proprietaires = frozenset((0, Path(chemin).lstat().st_uid))
+        return vrai_sha(chemin, limite, proprietaires=proprietaires,
+                        libelle=libelle)
+
+    with mock.patch.multiple(module, _dossier_protege=dossier,
+                             _sha256_regulier=sha):
+        yield
+
+
 class Paquet:
     """Un dépôt, un lock et un wheelhouse synthétiques, prêts à produire."""
 
     def __init__(self, root):
         self.root = Path(root)
+        self.python, self.python_version, self.verifie_root = _python_du_banc()
+        self.version_courte = '%d.%d' % tuple(
+            int(partie) for partie in self.python_version.split('.')[:2])
         self.wheelhouse = self.root / 'wheelhouse'
         self.wheelhouse.mkdir(mode=0o700)
         self.ameesh = _roue(
@@ -173,12 +280,18 @@ class Paquet:
             path=self.ameesh['path'], name=self.ameesh['filename'],
             version=self.ameesh['version'], sha256=self.ameesh['sha256'])
 
+    def garde(self):
+        """Le remplacement de propriétaire si le banc n'est pas root."""
+        return (contextlib.nullcontext() if self.verifie_root
+                else _accepter_le_proprietaire_du_banc())
+
     def produire(self, nom, travail):
-        return module._produire(
-            self.depot, sha=self.sha, tag=None, lock_path=self.lock,
-            wheelhouse=self.wheelhouse, python=sys.executable,
-            output=self.sortie / (nom + '.json'),
-            travail=self.root / travail)
+        with self.garde():
+            return module._produire(
+                self.depot, sha=self.sha, tag=None, lock_path=self.lock,
+                wheelhouse=self.wheelhouse, python=self.python,
+                output=self.sortie / (nom + '.json'),
+                travail=self.root / travail)
 
 
 def _patches(ameesh):
@@ -433,12 +546,48 @@ class ArbreTest(unittest.TestCase):
             module._entree_normalisee(b'print(1)\n', '/tmp/venv-a', 0o755)
 
 
+class InterpreteurTest(unittest.TestCase):
+    """Le refus d'un home non root survit au choix du Python du banc."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='5666-interpreteur-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    @unittest.skipIf(os.geteuid() == 0, 'le banc ne tourne pas root')
+    def test_home_non_root_refuse(self):
+        venv = self.root / 'venv'
+        venv.mkdir(mode=0o700)
+        (venv / 'bin').mkdir(mode=0o700)
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        executable = home / 'python3'
+        executable.write_text('#!/bin/sh\nexit 1\n')
+        executable.chmod(0o755)
+        for nom in ('python', 'python3'):
+            (venv / 'bin' / nom).symlink_to(executable)
+        cfg = venv / 'pyvenv.cfg'
+        cfg.write_text(
+            'home = %s\ninclude-system-site-packages = false\n'
+            'version = %s\nexecutable = %s\n'
+            % (home, platform.python_version(), executable))
+        cfg.chmod(0o644)
+        with self.assertRaisesRegex(
+                module.Ecart, 'home de l’interpréteur non root'):
+            module._interpreteur(venv)
+
+
 class ProductionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix='5666-production-')
         cls.root = Path(cls.temp.name)
         cls.paquet = Paquet(cls.root)
+        # La vérification lit le même interpréteur que la production : quand
+        # le banc n'a pas de Python root, l'élargissement vaut pour la classe.
+        cls.pile = contextlib.ExitStack()
+        cls.addClassCleanup(cls.pile.close)
+        cls.pile.enter_context(cls.paquet.garde())
         patch_preparer, patch_construire = _patches(cls.paquet.ameesh)
         with patch_preparer, patch_construire:
             cls.document1 = cls.paquet.produire('m1', 'travail1')
@@ -446,6 +595,7 @@ class ProductionTest(unittest.TestCase):
         cls.manifeste1 = (cls.paquet.sortie / 'm1.json').read_bytes()
         cls.manifeste2 = (cls.paquet.sortie / 'm2.json').read_bytes()
         cls.venv = cls.root / 'travail1' / 'venv'
+        cls.site = module._dossier_site(cls.venv)
 
     @classmethod
     def tearDownClass(cls):
@@ -464,14 +614,16 @@ class ProductionTest(unittest.TestCase):
     def test_manifeste_contient_les_attendus(self):
         document = self.document1
         self.assertEqual(document['sha'], self.paquet.sha)
-        self.assertEqual(document['python']['version'], platform.python_version())
+        self.assertEqual(document['python']['version'],
+                         self.paquet.python_version)
         self.assertTrue(document['python']['home'].startswith('/'))
         self.assertTrue(document['python']['executable'].startswith('/'))
         self.assertEqual(len(document['python']['sha256']), 64)
         self.assertEqual([item['name'] for item in document['distributions']],
                          ['ameesh', 'pip', 'setuptools', 'tiny-dep'])
         self.assertEqual([item['name'] for item in document['installed']['entry_points']],
-                         ['agent-mail', 'ameesh', 'pip', 'pip3', 'pip3.12'])
+                         ['agent-mail', 'ameesh', 'pip', 'pip3',
+                          'pip' + self.paquet.version_courte])
         self.assertTrue((self.venv / 'share/ameesh/mise-a-jour/helper.py').is_file())
         self.assertEqual(len(document['wheels']), 3)
 
@@ -482,7 +634,7 @@ class ProductionTest(unittest.TestCase):
         module._verifier(self.paquet.sortie / 'm1.json', lien)
 
     def test_ecart_fichier_ajoute_modifie_ou_supprime(self):
-        site = self.venv / 'lib/python3.12/site-packages'
+        site = self.site
         cible = site / 'tiny_dep' / '__init__.py'
         original = cible.read_bytes()
         try:
@@ -603,7 +755,7 @@ class ProductionTest(unittest.TestCase):
                          '1')
 
     def test_ecart_distribution_et_pip_check(self):
-        site = self.venv / 'lib/python3.12/site-packages'
+        site = self.site
         metadata = site / 'tiny_dep-1.0.dist-info' / 'METADATA'
         original = metadata.read_bytes()
         try:

@@ -59,8 +59,11 @@ cross-project snapshot. A blocked lot or pending decision needs explicit
 wait details; otherwise the forecast fails with the lot number.
 
 Slots reserved for a project or repository cannot be borrowed by another.
-Unreserved slots are shared. Among eligible lots admission uses ascending
-priority class, then creation time, then ID. Existing runs are placed first;
+Reservation keys are those of the live dispatcher (below): `project:<p>`
+and `class:<priority>`; a bare name still means a project or repository.
+In `--project` mode a host without `reservations` in the file takes those of
+its Host records. Unreserved slots are shared. Among eligible lots admission
+uses ascending priority class, then creation time, then ID. Existing runs are placed first;
 there is no implicit one-run-per-repository restriction. In-progress lots may
 pin `host` and `slot`; their elapsed time is subtracted from the calibrated
 duration (at least one second remains when overdue). If existing runs cannot
@@ -84,8 +87,8 @@ ameesh work plan --capacity-plan updated.json --previous-plan forecast.json
 ```
 
 The output names every moved lot and its old/new times. A completed lot uses
-`completed_ts`; no run slot is retained. This standalone command does not register a background subscriber or enforce
-reservations in the live dispatcher. For automatic publication from live
+`completed_ts`; no run slot is retained. This standalone command does not
+register a background subscriber. For automatic publication from live
 project inputs, configure the notification pass described below.
 
 For an unmet `deadline_ts`, the forecast tries adding unreserved slots on an
@@ -96,6 +99,40 @@ null `required_slots` includes an explanation; adding capacity to a specific
 existing host can be evaluated by changing its `slots` explicitly. The
 critical chain describes this allocation, rather than a resource-free CPM
 path. Calendar dates and epic delivery bounds inherit these assumptions.
+
+## Live reservations (#5601)
+
+A Host record may keep some of its `policy.max_agents` places for a project
+or a priority class:
+
+```yaml
+policy:
+  max_agents: 6
+  slot_reservations: {"project:nexlink": 2, "class:1": 1}
+```
+
+`project:<p>` is filled by an agent of project `<p>` (its canon `projects`,
+else its team), whatever its next turn: a reviewer with review mail only is
+admitted. `class:<n>` is filled by an agent whose next lot (the one it would
+wake for: highest priority, then oldest) has priority `<n>`. A free place goes to another agent only while the unfilled
+reservations still fit in the places left. With reservations on its host,
+the runner admits unleased agents by the class, then the creation date of
+their next lot; elected roles come first, agents without an actionable lot
+last. A resident worker is judged again before every turn that carries a lot
+(idle wake, scheduled wake, mail, prompt): when that lot no longer fills the
+reserved place it holds and no shared place is left, nothing is consumed (the
+prompt is restored, a scheduled wake comes back), it gives its lease back and
+the claim pass admits by class again. Until a turn passes or that refused lot
+changes (state, priority, assignee, project, wake, update), the next
+admission judges it, so an unchanged state never loops between admission and
+refusal, however long it lasts.
+Without reservations the claim order is unchanged and no lot is read.
+Reservations divide the `max_agents` of the runner. More reserved places than
+`max_agents` is a canon error; an unreadable entry is a canon error too and
+is ignored, so it never holds places nobody can take. Records of several
+canons merge by the largest count of each key; when that merge reserves more
+than the effective `max_agents` (the smallest of the records), the runner and
+the planner drop the host's reservations and the runner logs why (#5642).
 
 ## Automatic date publication (#5602)
 
@@ -134,4 +171,5 @@ mode shows its delivery bound alongside the usual lot dates. Scheduler-owned
 start/end dates are updated; dates pinned by a person and manual delivery
 dates remain intact. The journal and forecast still expose the computed ETA
 when a manual date is retained. This pass publishes forecasts and does not
-change dispatch admission or enforce reservations.
+change dispatch admission; live reservations are enforced by the runner
+(above).

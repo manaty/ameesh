@@ -2026,7 +2026,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command in prevalidation.COMMANDS:   # #1770 prévalidation au gel
             return prevalidation.run(cfg, db, args)
         if args.work_command in plan_cli.COMMANDS:
-            return plan_cli.run(db, args)
+            return plan_cli.run(db, args, cfg=cfg)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
             return backlog.run(db, args, cfg)

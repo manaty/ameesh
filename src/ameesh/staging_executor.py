@@ -297,24 +297,43 @@ def _tree_sha256(root: str) -> str:
 
 
 def _sourced_literal(path: str, name: str) -> tuple:
-    """(value or None, problem) of `name` in a file the probe sources: only a
-    plain literal is accepted, an expansion could name anything."""
+    """(value or None, problem) of `name` in a file the probe sources.
+
+    The literal shell forms that set it (`NAME=…`, `export`, `readonly`,
+    `declare -x`, `typeset -x`) and `unset NAME` (or `unset -v NAME`) are
+    applied in file order; the value is "" when the last operation clears
+    the name, None when the file never names it. Any other active line
+    naming it is a refusal: an unrecognized shell form could set or clear
+    the variable without us seeing it, and only a plain literal is accepted
+    (an expansion could name anything). A comment line is inert."""
     try:
         text = Path(path).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return None, "%s unreadable (%s)" % (path, getattr(exc, "strerror", None) or exc)
+    escaped = re.escape(name)
+    assignment = re.compile(
+        r"\s*(?:(?:export|readonly)\s+|(?:declare|typeset)(?:\s+-[A-Za-z]+)*\s+)?"
+        r"%s=(.*)" % escaped)
+    unset = re.compile(r"\s*unset(?:\s+-v)?\s+%s\s*" % escaped)
+    mention = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % escaped)
     value = None
-    pattern = re.compile(r"\s*(?:export\s+)?%s=(.*)" % re.escape(name))
     for line in text.splitlines():
-        match = pattern.fullmatch(line)
-        if not match:
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        raw = match.group(1).strip()
-        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
-            raw = raw[1:-1]
-        if not re.fullmatch(r"[A-Za-z0-9_./+:@%-]*", raw):
-            return None, "%s in %s is not a plain path" % (name, path)
-        value = raw
+        match = assignment.fullmatch(line)
+        if match:
+            raw = match.group(1).strip()
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+                raw = raw[1:-1]
+            if not re.fullmatch(r"[A-Za-z0-9_./+:@%-]*", raw):
+                return None, "%s in %s is not a plain path" % (name, path)
+            value = raw
+        elif unset.fullmatch(line):
+            # `unset` in the sourced file removes even the unit's value: the
+            # probe then falls back to its python and package.
+            value = ""
+        elif mention.search(line):
+            return None, "%s in %s is not a recognized assignment" % (name, path)
     return value, None
 
 
@@ -350,9 +369,11 @@ def fingerprints(options: dict, env: dict) -> tuple:
     """#5665: ({path: sha256}, problem) before a sequence, closed on doubt.
 
     The probe program, every absolute script it receives, the notifier (or
-    the python and the `ameesh` package it imports), each read in full.
-    An unreadable file, or a digest other than one declared in
-    `expected_sha256`, is a refusal before any host operation."""
+    the python and the `ameesh` package it imports), each read in full; a
+    package's whole tree is guarded, not only its root. An unreadable or
+    writable file, a `QUIESCENCE_NOTIFIER` form that is not a recognized
+    literal, or a digest other than one declared in `expected_sha256`, is a
+    refusal before any host operation."""
     probe = options.get("quiescence_probe") or []
     files, packages = [], []
     if probe:
@@ -368,7 +389,9 @@ def fingerprints(options: dict, env: dict) -> tuple:
         files += notifier
     found = {}
     for path in files + packages:
-        problem = path_problem(path)
+        # #5669: the package's files are imported too; its root and parents
+        # alone would let another account write the code that runs.
+        problem = tree_problem(path) if path in packages else path_problem(path)
         if problem:
             return {}, problem
         try:

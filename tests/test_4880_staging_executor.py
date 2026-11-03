@@ -13,6 +13,8 @@ from ameesh import (release_cutoff, role_run, staging_executor as executor,
 
 #: #5665: kept before ExecutorTest replaces it.
 FINGERPRINTS = executor.fingerprints
+#: #5669: the real tree guard, kept before ExecutorTest replaces it.
+TREE_PROBLEM = executor.tree_problem
 
 
 def running(run, deadline=600):
@@ -609,6 +611,13 @@ class FingerprintTest(unittest.TestCase):
 
     def setUp(self):
         ExecutorTest.setUp(self)
+        # #5669: the package tree is really guarded here; the service sets
+        # umask 022, while this host's shell umask may create 664 fixtures.
+        import os
+        umask = os.umask(0o022)
+        self.addCleanup(os.umask, umask)
+        # #5665: the fingerprints have their own tests; only ownership and
+        # paths are neutralized here.
         for patch in (mock.patch.object(executor, "fingerprints", FINGERPRINTS),
                       mock.patch.object(executor, "path_problem", return_value=None)):
             patch.start()
@@ -730,3 +739,77 @@ class FingerprintTest(unittest.TestCase):
         self.bascule.write_text("QUIESCENCE_NOTIFIER=$HOME/notifier\n")
         self.assertIn("not a plain path", executor.fingerprints(
             self.options, dict(executor.os.environ))[1])
+
+    def test_bascule_env_accepts_the_literal_shell_forms(self):
+        other = self.write("bin/other-notifier", "#!/bin/sh\necho\n")
+        for line in ("QUIESCENCE_NOTIFIER='%s'" % other,
+                     "export QUIESCENCE_NOTIFIER='%s'" % other,
+                     "readonly QUIESCENCE_NOTIFIER='%s'" % other,
+                     "declare -x QUIESCENCE_NOTIFIER='%s'" % other,
+                     "declare -x -r QUIESCENCE_NOTIFIER='%s'" % other,
+                     "typeset -rx QUIESCENCE_NOTIFIER='%s'" % other):
+            with self.subTest(line=line):
+                self.bascule.write_text(line + "\n")
+                prints, problem = executor.fingerprints(
+                    self.options, dict(executor.os.environ))
+                self.assertIsNone(problem)
+                self.assertIn(other, prints)
+                self.assertNotIn(self.notifier, prints)
+
+    def test_bascule_env_unset_clears_the_notifier(self):
+        python = self.write("venv/bin/python", "binary")
+        self.write("venv/lib/python3.12/site-packages/ameesh/mail.py", "send = 1\n")
+        for unset in ("unset QUIESCENCE_NOTIFIER", "unset -v QUIESCENCE_NOTIFIER"):
+            with self.subTest(unset=unset):
+                self.bascule.write_text(
+                    "QUIESCENCE_NOTIFIER='%s'\n%s\n" % (self.notifier, unset))
+                with mock.patch.dict("os.environ",
+                                     {"QUIESCENCE_NOTIFIER": self.notifier,
+                                      "QUIESCENCE_PYTHON": python}):
+                    prints, problem = executor.fingerprints(
+                        self.options, dict(executor.os.environ))
+                self.assertIsNone(problem)
+                self.assertIn(python, prints)
+                self.assertNotIn(self.notifier, prints)
+
+    def test_bascule_env_assignment_after_unset_wins(self):
+        self.bascule.write_text("unset QUIESCENCE_NOTIFIER\n"
+                                "QUIESCENCE_NOTIFIER='%s'\n" % self.notifier)
+        prints, problem = executor.fingerprints(self.options,
+                                                dict(executor.os.environ))
+        self.assertIsNone(problem)
+        self.assertIn(self.notifier, prints)
+
+    def test_bascule_env_refuses_an_unrecognized_mention(self):
+        for line in ("readonly QUIESCENCE_NOTIFIER",
+                     "declare -x QUIESCENCE_NOTIFIER",
+                     "unset -f QUIESCENCE_NOTIFIER",
+                     "QUIESCENCE_NOTIFIER+=%s" % self.notifier,
+                     'if [ -n "$QUIESCENCE_NOTIFIER" ]; then :; fi'):
+            with self.subTest(line=line):
+                self.bascule.write_text(line + "\n")
+                _prints, problem = executor.fingerprints(
+                    self.options, dict(executor.os.environ))
+                self.assertIn("not a recognized assignment", problem)
+
+    def test_bascule_env_comment_naming_the_notifier_is_inert(self):
+        self.bascule.write_text("# QUIESCENCE_NOTIFIER=/nope\n"
+                                "export QUIESCENCE_NOTIFIER='%s'\n" % self.notifier)
+        prints, problem = executor.fingerprints(self.options,
+                                                dict(executor.os.environ))
+        self.assertIsNone(problem)
+        self.assertIn(self.notifier, prints)
+
+    def test_writable_file_inside_the_notifier_package_is_refused(self):
+        python = self.write("venv/bin/python", "binary")
+        self.write("venv/lib/python3.12/site-packages/ameesh/mail.py", "send = 1\n")
+        writable = (self.root
+                    / "venv/lib/python3.12/site-packages/ameesh/mail.py")
+        writable.chmod(0o666)
+        self.addCleanup(writable.chmod, 0o644)
+        with mock.patch.object(executor, "tree_problem", TREE_PROBLEM), \
+                mock.patch.dict("os.environ", {"QUIESCENCE_NOTIFIER": "",
+                                               "QUIESCENCE_PYTHON": python}):
+            _prints, problem = executor.fingerprints(
+                self.options, dict(executor.os.environ))
+        self.assertIn("writable by group or others", problem)

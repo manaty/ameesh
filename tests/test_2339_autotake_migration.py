@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import threading
+import types
 import unittest
 from unittest import mock
 
@@ -32,6 +33,10 @@ class LogTest(unittest.TestCase):
         # libertés d'élection observées ; la doublure n'en a aucune.
         state.role_evaluation_once = lambda: None
         state._election_free_since = {}
+        # #5601 : l'ordre d'admission réel, sans réservation sur l'hôte (la
+        # liste du registre telle quelle, aucun lot lu)
+        state._host_slot_reservations = None
+        state._admission_order = types.MethodType(runner.Runner._admission_order, state)
         state.take_pass.side_effect = db_mod.DbError(
             'column x does not exist\nDETAIL: ' + 'x' * 500, sqlstate='42P01')
         with mock.patch.object(runner, 'log_async') as log, \
