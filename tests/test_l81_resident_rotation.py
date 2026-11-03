@@ -276,6 +276,23 @@ class ResidentRotationTest(ResidentBench):
         self.assertNotIn("--resume", argv)
         self.assertIn("Session resumed after rotation", self._prompts()[-1])
 
+    def test_a_failed_maintenance_rotation_waits_for_its_backoff(self):
+        """#5510: the #5503 per-agent backoff also holds the L81 maintenance."""
+        _runner, worker = self._worker(resident_reread_max="100")
+        self.assertTrue(self._turn(worker, "premier"))
+        self.assertEqual(worker._resident_maintenance(), resident_runner.ALERT)
+        with mock.patch.object(worker, "run_turn", return_value=False) as turn:
+            for _ in range(3):
+                self.assertFalse(worker.maybe_rotate())
+        self.assertEqual(turn.call_count, 1)  # one summary turn before the deadline
+        self.assertEqual(worker.rotation_failures, 1)
+        self.assertGreater(worker.rotation_retry_at, time.time() + 50)
+        self.assertIsNotNone(worker.resident)         # the resident is kept
+        self.assertIsNotNone(worker.current_session())
+        worker.rotation_retry_at = 0.0                # the deadline has passed
+        self.assertTrue(worker.maybe_rotate())
+        self.assertIsNone(worker.resident)
+
     def test_hard_ceiling_rotates_even_right_after_a_human_message(self):
         _runner, worker = self._worker(resident_reread_max="0")
         self.assertTrue(self._turn(worker, "premier"))
