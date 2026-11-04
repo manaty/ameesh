@@ -1419,6 +1419,23 @@ partial directory and leaves the active version untouched. `src-current` and
 `menage`, `etat`), copied to the VM (server and agents) so that install and
 rollback use the same version whatever commit is deployed.
 
+Since #5711, `preparer` can also take the locked operator package of #5666:
+`--lock`, `--wheelhouse`, `--manifeste` and `--verificateur` together. It then
+creates the venv with the fixed `ameesh` prompt, installs from the local
+wheelhouse only (`--no-index`, `--require-hashes`, `--only-binary=:all:`,
+`--no-compile`, `PYTHONDONTWRITEBYTECODE=1`), writes the deterministic `.pret`
+marker, seals the venv (#2763: `pip` refuses, `lib/` and `bin/` read-only) and
+verifies the sealed tree against the format-3 manifest with
+`venv-staging.py`. Any byte or mode difference refuses the preparation; a
+venv already prepared for that version with another package is refused rather
+than silently reused, and a version marked complete is verified again before
+being considered ready. The locked import controls cover `psycopg`, `psutil`
+and `ameesh`: the standard operator package does not carry the `cryptography`
+extra (#3619), which stays required only for the historical host venv. Without
+the four options, the historical source-path preparation is unchanged, so
+merging the code does not change the live staging venv or the agent VMs before
+the L2 pose.
+
 Each update creates a complete venv, and `menage` (#3792) stops them from
 accumulating: `activer` applies it at the end of a successful switch
 (best-effort, it never fails the switch), and

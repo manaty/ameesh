@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Bascule atomique du venv d'ameesh (#1969).
 
-    bascule.py preparer --venv <venv> --src <code> --version <sha7>
+    bascule.py preparer --venv <venv> --src <code> --version <sha7> \\
+        [--lock L --wheelhouse W --manifeste M --verificateur V]
     bascule.py activer  --venv <venv> --version <sha7> [--precedent <sha7>]
     bascule.py retour   --venv <venv>
     bascule.py menage   --venv <venv> [--apply]
@@ -31,6 +32,15 @@ plus d'un chemin qu'une bascule changerait sous lui :
   lanceurs — un processus en cours n'importe pas depuis `bin/`. Le retour se
   fait en rebasculant le lien, sans pip.
 
+Quand les quatre options verrouillées sont fournies (#5711), `preparer` suit
+le contrat du paquet opérateur de #5666 : le venv est créé avec une invite
+fixe, installé depuis le lock et le wheelhouse locaux (`--no-index`,
+`--require-hashes`, `--only-binary=:all:`, `--no-compile`,
+`PYTHONDONTWRITEBYTECODE=1`), puis scellé (#2763) et vérifié par le
+vérificateur de #5666 APRÈS scellement. Sans ces options, le chemin historique
+(installation depuis `--src` et l'index) reste inchangé : la pose L2 décide du
+basculement, ce fichier ne l'impose pas.
+
 `retour` repointe vers la version précédente enregistrée, sans pip ; il est
 idempotent. Aucun octet d'un venv versionné n'est modifié après préparation.
 
@@ -46,6 +56,7 @@ mode à blanc (`--apply` absent) montre ce qui serait retiré.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -53,9 +64,15 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 MARKER = ".pret"                 # venv-<version> complet et contrôlé
+#: #5711/N2 : invite fixe du venv verrouillé, identique à la production #5666.
+INVITE = "ameesh"
+#: #5711 : le manifeste scellé est le seul accepté par la préparation L2.
+FORMAT_SCELLE = "ameesh-venv-staging/3"
+MAX_MANIFESTE_BYTES = 1024 * 1024
 #: #3619 : les extras que porte tout venv versionné d'hôte — psycopg (pilote
 #: normal) et crypto (canal nexlink, `cryptography>=41`). La préparation les
 #: installe et les contrôle AVANT la bascule : un hôte sans crypto ne sert
@@ -207,6 +224,136 @@ def _pip_install(directory, src):
     _run([pip, "install", "-q", "%s[%s]" % (src, HOST_EXTRAS)])
 
 
+def marqueur_verrouille(version, lock_sha256):
+    """Contenu exact du marqueur `.pret` d'un venv verrouillé (#5711).
+
+    Même octets que `venv_staging.marqueur` : le manifeste scellé mesure ce
+    fichier, donc la pose doit écrire exactement ce contenu.
+    """
+    if not isinstance(version, str) or not version \
+            or "/" in version or version.startswith("."):
+        raise RuntimeError("marqueur : version invalide")
+    if not isinstance(lock_sha256, str) \
+            or not re.fullmatch(r"[0-9a-f]{64}", lock_sha256):
+        raise RuntimeError("marqueur : lock invalide")
+    return (json.dumps({"format": "ameesh-bascule/2", "version": version,
+                        "lock": lock_sha256},
+                       sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _env_isole(home):
+    """Environnement de la production verrouillée : ni index, ni bytecode."""
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": home,
+        "TMPDIR": home,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "PYTHONHASHSEED": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PIP_CONFIG_FILE": os.devnull,
+        "PIP_NO_INPUT": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_NO_INDEX": "1",
+        "PIP_NO_CACHE_DIR": "1",
+    }
+
+
+def _creer_venv_verrouille(directory, python, env):
+    _run([python, "-m", "venv", "--prompt", INVITE, directory], env=env)
+
+
+def _pip_install_verrouille(directory, lock, wheelhouse, env):
+    """#5666 : installation depuis le paquet local, sans index ni hashes libres."""
+    python = os.path.join(directory, "bin", "python")
+    _run([python, "-m", "pip", "--isolated", "--disable-pip-version-check",
+          "--no-input", "install", "--no-index", "--find-links", wheelhouse,
+          "--require-hashes", "--only-binary=:all:", "--no-compile",
+          "--no-cache-dir", "-r", lock], env=env)
+
+
+def _lire_borne(chemin, limite=MAX_MANIFESTE_BYTES):
+    with open(chemin, "rb") as flux:
+        donnees = flux.read(limite + 1)
+    if len(donnees) > limite:
+        raise RuntimeError("fichier trop grand : %s" % chemin)
+    return donnees
+
+
+def _options_verrouillees(args):
+    """Les quatre options de la pose L2 vont ensemble, ou aucune (#5711)."""
+    noms = ("lock", "wheelhouse", "manifeste", "verificateur")
+    valeurs = {nom: getattr(args, nom, None) for nom in noms}
+    if not any(valeurs.values()):
+        return None
+    manquants = [nom for nom in noms if not valeurs[nom]]
+    if manquants:
+        _die("préparation verrouillée : --lock, --wheelhouse, --manifeste et "
+             "--verificateur vont ensemble ; manquantes : --%s"
+             % ", --".join(manquants))
+    return valeurs
+
+
+def _valider_arguments_verrouilles(verrou, version, python):
+    """Contrôle les entrées avant de créer quoi que ce soit (fail closed)."""
+    for nom in ("lock", "manifeste", "verificateur"):
+        if not os.path.isfile(verrou[nom]):
+            _die("--%s n'est pas un fichier : %s" % (nom, verrou[nom]))
+    if not os.path.isdir(verrou["wheelhouse"]):
+        _die("--wheelhouse n'est pas un dossier : %s" % verrou["wheelhouse"])
+    try:
+        lock_bytes = _lire_borne(verrou["lock"])
+        document = json.loads(_lire_borne(verrou["manifeste"]).decode("utf-8"))
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
+        _die("paquet verrouillé illisible (lock ou manifeste)")
+    if not isinstance(document, dict) \
+            or document.get("format") != FORMAT_SCELLE:
+        _die("manifeste non scellé : format %s attendu" % FORMAT_SCELLE)
+    sha = document.get("sha")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        _die("manifeste : SHA invalide")
+    if sha[:7] != version:
+        _die("manifeste %s ne correspond pas à --version %s"
+             % (sha[:7], version))
+    lock = document.get("lock")
+    if not isinstance(lock, dict) \
+            or lock.get("sha256") != hashlib.sha256(lock_bytes).hexdigest():
+        _die("le lock fourni n'est pas celui du manifeste")
+    scellement = document.get("scellement")
+    pip = hashlib.sha256(_PIP_REFUS.encode("utf-8")).hexdigest()
+    if not isinstance(scellement, dict) \
+            or scellement.get("pip_sha256") != pip:
+        _die("le scellement du manifeste diffère du pip refusé de bascule")
+    python_attendu = (document.get("python") or {}).get("executable")
+    resolu = os.path.realpath(shutil.which(python) or python)
+    if not isinstance(python_attendu, str) \
+            or os.path.realpath(python_attendu) != resolu:
+        _die("--python %s n'est pas l'interpréteur épinglé du manifeste"
+             % python)
+    return document, resolu
+
+
+def _verifier_venv(verificateur, manifeste, cible):
+    """Le contrat #5666 est vérifié APRÈS scellement, jamais desserré (#5711)."""
+    commande = [sys.executable or "python3", verificateur, "verifier",
+                "--manifeste", manifeste, "--venv", cible]
+    try:
+        resultat = subprocess.run(commande, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=900,
+                                  check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("vérificateur non exécutable : %s" % exc) from None
+    if resultat.returncode != 0:
+        detail = (resultat.stdout + resultat.stderr).decode(
+            "utf-8", "replace").strip().splitlines()
+        raise RuntimeError(
+            "vérification du manifeste refusée (code %d) : %s"
+            % (resultat.returncode,
+               " | ".join(detail[-3:])[:600] or "sans détail"))
+
+
 def _sceller(directory):
     """#2763 : un venv versionné préparé ne s'installe plus.
 
@@ -219,7 +366,7 @@ def _sceller(directory):
     bin_dir = os.path.join(directory, "bin")
     for nom in os.listdir(bin_dir):
         if re.fullmatch(r"pip[0-9.]*", nom):
-            _write(os.path.join(bin_dir, nom), _PIP_REFUS)
+            _write_bytes(os.path.join(bin_dir, nom), _PIP_REFUS.encode("utf-8"))
     for racine in (os.path.join(directory, "lib"), bin_dir):
         for dossier, _sous, fichiers in os.walk(racine, topdown=False):
             for nom in fichiers:
@@ -287,16 +434,24 @@ def _verifier_shebang(ameesh, python):
         refuser("ligne 2 %r : interpréteur attendu %r" % (execution, python))
 
 
-def _controles(directory):
-    """Imports, point d'entrée et shebang : tout doit répondre AVANT la bascule."""
+def _controles(directory, env=None, cryptography=True):
+    """Imports, point d'entrée et shebang : tout doit répondre AVANT la bascule.
+
+    #3619 : le venv historique d'hôte porte l'extra `cryptography` (canal
+    nexlink) ; son absence fait échouer la préparation, pas le premier envoi.
+    #5711 : le paquet opérateur verrouillé est le runtime standard, sans
+    extra (l'exécuteur de staging n'utilise pas le canal nexlink) : ses
+    contrôles portent sur psycopg, psutil et ameesh, et le manifeste scellé
+    pinne déjà l'inventaire exact des distributions.
+    """
     python = os.path.join(directory, "bin", "python")
     ameesh = os.path.join(directory, "bin", "ameesh")
     _verifier_shebang(ameesh, python)
-    # #3619 : `cryptography` fait partie du contrat du venv (canal nexlink) ;
-    # son absence fait échouer la préparation, pas le premier envoi.
-    _run([python, "-c", "import psycopg, cryptography, ameesh; print('imports ok')"],
-         stdout=subprocess.DEVNULL)
-    _run([ameesh, "--version"], stdout=subprocess.DEVNULL)
+    imports = ("import psycopg, cryptography, ameesh; print('imports ok')"
+               if cryptography else
+               "import psycopg, psutil, ameesh; print('imports ok')")
+    _run([python, "-c", imports], stdout=subprocess.DEVNULL, env=env)
+    _run([ameesh, "--version"], stdout=subprocess.DEVNULL, env=env)
 
 
 def preparer(args):
@@ -304,19 +459,67 @@ def preparer(args):
     src = os.path.abspath(args.src)
     if not os.path.isdir(src):
         _die("--src introuvable : %s" % src)
+    verrou = _options_verrouillees(args)
+    manifeste = None
+    python_verrou = None
+    if verrou:
+        manifeste, python_verrou = _valider_arguments_verrouilles(
+            verrou, version, args.python)
     cible = _version_dir(args.venv, version)
     etat = etat_de(args.venv)
     if os.path.isdir(cible) and not os.path.islink(cible):
         if etat.get("versions", {}).get(version) == "complete":
+            if verrou:
+                attendu = marqueur_verrouille(
+                    version, manifeste["lock"]["sha256"])
+                try:
+                    with open(os.path.join(cible, MARKER),
+                              encoding="utf-8") as handle:
+                        actuel = handle.read()
+                except OSError:
+                    actuel = None
+                if actuel != attendu:
+                    _die("venv-%s déjà préparé avec un autre paquet "
+                         "(marqueur différent)" % version)
+                # #5711/N (auditeur) : un venv marqué complet est revérifié ;
+                # un arbre modifié après préparation n'est pas réputé prêt.
+                try:
+                    _verifier_venv(verrou["verificateur"],
+                                   verrou["manifeste"], cible)
+                except RuntimeError as exc:
+                    print("bascule: venv-%s déjà préparé mais NON CONFORME : %s"
+                          % (version, exc), file=sys.stderr)
+                    return 1
             print("bascule: venv-%s déjà préparé" % version)
             return 0
         _supprimer(cible)
     print("bascule: préparation de venv-%s depuis %s" % (version, src))
+    home = None
+    masque = None
     try:
-        _creer_venv(cible, args.python)
-        _pip_install(cible, src)
-        _controles(cible)
-        _sceller(cible)
+        if verrou:
+            home = tempfile.mkdtemp(prefix="bascule-pip-")
+            # #5711 : même umask que la production #5666 ; sinon les dossiers
+            # naissent 0775 et le vérificateur refuse l'arbre (dossier non sûr).
+            masque = os.umask(0o022)
+            env = _env_isole(home)
+            _creer_venv_verrouille(cible, python_verrou, env)
+            _pip_install_verrouille(cible, verrou["lock"],
+                                    verrou["wheelhouse"], env)
+            _controles(cible, env=env, cryptography=False)
+            _write(os.path.join(cible, MARKER),
+                   marqueur_verrouille(version, manifeste["lock"]["sha256"]),
+                   mode=0o444)
+            _sceller(cible)
+            _verifier_venv(verrou["verificateur"], verrou["manifeste"], cible)
+        else:
+            _creer_venv(cible, args.python)
+            _pip_install(cible, src)
+            _controles(cible)
+            _sceller(cible)
+            with open(os.path.join(cible, MARKER), "w", encoding="utf-8") as handle:
+                json.dump({"version": version, "src": src, "at": time.time()},
+                          handle)
     except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
         try:
             _supprimer(cible)   # rien de partiel ne reste
@@ -325,8 +528,11 @@ def preparer(args):
         print("bascule: préparation de venv-%s ÉCHOUÉE, version active intacte : %s"
               % (version, exc), file=sys.stderr)
         return 1
-    with open(os.path.join(cible, MARKER), "w") as handle:
-        json.dump({"version": version, "src": src, "at": time.time()}, handle)
+    finally:
+        if masque is not None:
+            os.umask(masque)
+        if home is not None:
+            shutil.rmtree(home, ignore_errors=True)
     print("bascule: venv-%s préparé et contrôlé" % version)
     return 0
 
@@ -418,10 +624,10 @@ def _installer_lanceurs(venv, version):
     for nom in sorted(interpreteurs):
         _write(os.path.join(bin_dir, nom), _LAUNCHER.format(lien=CURRENT, binaire="python"))
     _write(os.path.join(bin_dir, "ameesh"), _LAUNCHER.format(lien=CURRENT, binaire="ameesh"))
-    _write(os.path.join(bin_dir, "pip"), _PIP_REFUS)
+    _write_bytes(os.path.join(bin_dir, "pip"), _PIP_REFUS.encode("utf-8"))
     for nom in ("pip3", "pip3.14", "pip3.12"):
         if os.path.exists(os.path.join(bin_dir, nom)):
-            _write(os.path.join(bin_dir, nom), _PIP_REFUS)
+            _write_bytes(os.path.join(bin_dir, nom), _PIP_REFUS.encode("utf-8"))
     # #2155 : les scripts console de la version qui s'active (agent-mail,
     # ameesh-approve, futur outil…) n'existaient dans le venv stable que s'ils
     # étaient là à l'adoption. On leur rend un lanceur qui suit `venv-courant`,
@@ -949,6 +1155,15 @@ def main(argv=None):
     p.add_argument("--version", required=True, help="nom de version (sha court)")
     p.add_argument("--python", default=os.environ.get("BASCULE_PYTHON") or "python3",
                    help="interpréteur qui crée le venv versionné (défaut : python3 du PATH)")
+    p.add_argument("--lock", default=None,
+                   help="#5711 : lock exact du paquet opérateur (avec --wheelhouse, "
+                        "--manifeste et --verificateur)")
+    p.add_argument("--wheelhouse", default=None,
+                   help="#5711 : dossier local des roues verrouillées")
+    p.add_argument("--manifeste", default=None,
+                   help="#5711 : manifeste scellé produit par venv-staging.py")
+    p.add_argument("--verificateur", default=None,
+                   help="#5711 : venv-staging.py du commit qualifié (vérifie après scellement)")
     p.set_defaults(func=preparer)
     p = sub.add_parser("activer", help="bascule atomique vers un venv préparé")
     p.add_argument("--venv", required=True)

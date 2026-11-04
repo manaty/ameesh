@@ -336,13 +336,16 @@ def extract_source(repo, sha, destination, *, env):
             pass
 
 
-def create_venv(path, *, python, with_pip, env):
+def create_venv(path, *, python, with_pip, env, prompt=None):
     path = Path(path)
     if path.exists() or path.is_symlink():
         raise BuildError('new venv directory required')
     argv = [str(python), '-m', 'venv']
     if not with_pip:
         argv.append('--without-pip')
+    if prompt is not None:
+        # #5711/N2 : l'invite ne dépend jamais du répertoire de la version.
+        argv.extend(('--prompt', str(prompt)))
     argv.append(str(path))
     _run(argv, env=env, timeout=300)
     if not (path / 'bin' / 'python').exists():

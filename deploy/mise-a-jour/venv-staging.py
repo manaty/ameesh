@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Manifeste verrouillé du venv de staging (#5666).
+"""Manifeste verrouillé du venv de staging (#5666, #5711).
 
 Le §5 du plan L2 V4 exige, avant la pose d'un venv de staging, un paquet
 opérateur protégé (``requirements-staging.lock`` et ``wheelhouse``) et un
@@ -11,7 +11,7 @@ d'hôte et sans secret.
 
     venv-staging.py produire --clone DÉPÔT --sha SHA|--tag TAG \\
         --lock requirements-staging.lock --wheelhouse WHEELHOUSE \\
-        --python /usr/bin/python3 --output manifeste.json
+        --python /usr/bin/python3 --output manifeste.json [--scelle]
     venv-staging.py verifier --manifeste manifeste.json --venv VENV
 
 La production :
@@ -34,6 +34,14 @@ La production :
   ni secret. Deux exécutions sur le même SHA, le même lock et le même
   wheelhouse produisent les mêmes octets.
 
+En mode ``--scelle`` (#5711), la production décrit l'artefact réellement posé
+par ``bascule.py`` : l'invite du venv est fixe, le marqueur de bascule est
+écrit, les scripts ``pip*`` sont remplacés par le refus de #2763 et ``lib/``
+et ``bin/`` passent en lecture seule AVANT la mesure. Le manifeste (format 3)
+porte alors ``scellement`` et ses scripts d'entrée ``pip*`` de lanceur
+``scelle`` : un venv non scellé, ou dont un octet ou un mode diffère, est
+refusé. Le manifeste de format 2 reste celui d'un venv non scellé.
+
 La vérification est en lecture seule et fail closed : elle épingle
 l'interpréteur (``version``, ``home``, ``executable`` et SHA-256 du binaire
 résolu) et le compare avant de l'exécuter, puis contrôle le ``pyvenv.cfg``
@@ -41,7 +49,8 @@ résolu) et le compare avant de l'exécuter, puis contrôle le ``pyvenv.cfg``
 installé (hors ``bin/``, ``pyvenv.cfg`` et bytecode, couverts séparément), les
 scripts d'entrée (contenu, lanceur et mode), les scripts d'activation, puis
 ``pip check`` sans charger le bytecode de ``pip``. Un fichier de plus, de moins, modifié
-ou un mode élargi est un écart.
+ou un mode élargi est un écart. En format 3, tout fichier de ``bin/`` doit en
+outre être en lecture seule (scellement #2763).
 
 Le manifeste ne remplace ni la qualification du commit à la forge, ni la
 relecture du paquet opérateur, ni le feu de pose. Aucune installation sur un
@@ -68,6 +77,20 @@ import tempfile
 import zipfile
 
 FORMAT = 'ameesh-venv-staging/2'
+FORMAT_SCELLE = 'ameesh-venv-staging/3'
+#: #5711/N2 : invite fixe, jamais dérivée du répertoire de la version.
+INVITE = 'ameesh'
+#: Marqueur de version préparée écrit par `bascule.py` ; il fait partie du
+#: manifeste scellé, qui décrit l'artefact exact que `activer` met en service.
+MARQUEUR = '.pret'
+#: #2763 : contenu exact du pip refusé dans un venv préparé. Il doit rester
+#: identique à `bascule._PIP_REFUS` (témoin de dérive dans les tests #5711).
+PIP_REFUS = """#!/bin/sh
+echo "bascule: pip est interdit dans le venv vivant ; préparez un venv versionné (bascule.py preparer)" >&2
+exit 1
+""".encode('utf-8')
+SCELLEMENT = {'regle': 'lecture-seule',
+              'pip_sha256': hashlib.sha256(PIP_REFUS).hexdigest()}
 MAX_LOCK_BYTES = 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 10 * 1024 * 1024
@@ -87,6 +110,7 @@ REQUIREMENT = re.compile(
 HASH_OPTION = re.compile(r'--hash=sha256:([0-9a-f]{64})\Z')
 ACTIVATIONS = ('Activate.ps1', 'activate', 'activate.csh', 'activate.fish')
 PYTHON_LINK = re.compile(r'python[0-9.]*\Z')
+SCELLE_NAME = re.compile(r'pip[0-9.]*\Z')
 
 
 class Erreur(ValueError):
@@ -452,13 +476,98 @@ def _comparer_roues(construite, attendue):
         raise Erreur('roue ameesh illisible') from None
 
 
-def _creer_venv(chemin, *, python, env):
+def _creer_venv(chemin, *, python, env, prompt=None):
     construction = _construction()
     try:
         return construction.create_venv(chemin, python=python,
-                                        with_pip=True, env=env)
+                                        with_pip=True, env=env,
+                                        prompt=prompt)
     except construction.BuildError as erreur:
         raise Erreur('création du venv impossible : %s' % erreur) from None
+
+
+def marqueur(version, lock_sha256):
+    """Contenu exact du marqueur `.pret` d'un venv scellé (#5711).
+
+    Il est déterministe (ni date ni chemin) pour que la production et la pose
+    mesurent le même arbre. Il doit rester identique à
+    `bascule.marqueur_verrouille` (témoin de dérive dans les tests #5711).
+    """
+    _exiger(isinstance(version, str) and VERSION.fullmatch(version) is not None,
+            'marqueur : version')
+    _exiger(isinstance(lock_sha256, str)
+            and HEX256.fullmatch(lock_sha256) is not None, 'marqueur : lock')
+    return (json.dumps({'format': 'ameesh-bascule/2', 'version': version,
+                        'lock': lock_sha256},
+                       sort_keys=True, separators=(',', ':')) + '\n').encode('utf-8')
+
+
+def _ecrire_marqueur(venv, version, lock_sha256):
+    chemin = Path(venv) / MARQUEUR
+    donnees = marqueur(version, lock_sha256)
+    temporaire = chemin.with_name('.%s.%d' % (MARQUEUR, os.getpid()))
+    try:
+        descripteur = os.open(
+            temporaire, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o444)
+        with os.fdopen(descripteur, 'wb') as flux:
+            flux.write(donnees)
+            flux.flush()
+            os.fsync(flux.fileno())
+        os.replace(temporaire, chemin)
+    finally:
+        try:
+            temporaire.unlink()
+        except OSError:
+            pass
+
+
+def sceller(venv):
+    """#2763/#5711 : scellement exact d'un venv préparé.
+
+    Le pip de bootstrap est remplacé par le refus constant et `lib/` et `bin/`
+    passent en lecture seule. Ce geste est celui de `bascule._sceller` : les
+    deux contenus (`PIP_REFUS`) et les deux règles de mode doivent rester
+    identiques, sinon le manifeste scellé ne décrit plus l'artefact posé.
+    """
+    venv = Path(venv)
+    bin_dir = venv / 'bin'
+    for nom in sorted(os.listdir(bin_dir)):
+        if not re.fullmatch(r'pip[0-9.]*', nom):
+            continue
+        chemin = bin_dir / nom
+        if chemin.is_symlink() or not chemin.is_file():
+            raise Ecart('pip non régulier dans bin/ : %s' % nom)
+        temporaire = chemin.with_name('.%s.%d' % (nom, os.getpid()))
+        try:
+            descripteur = os.open(
+                temporaire, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o755)
+            with os.fdopen(descripteur, 'wb') as flux:
+                flux.write(PIP_REFUS)
+                flux.flush()
+                os.fsync(flux.fileno())
+            os.replace(temporaire, chemin)
+        finally:
+            try:
+                temporaire.unlink()
+            except OSError:
+                pass
+    for racine in (venv / 'lib', bin_dir):
+        for dossier, _sous, fichiers in os.walk(racine, topdown=False):
+            for nom in fichiers:
+                chemin = Path(dossier) / nom
+                if not chemin.is_symlink():
+                    os.chmod(chemin, chemin.lstat().st_mode & ~0o222)
+            os.chmod(dossier, Path(dossier).stat().st_mode & ~0o222)
+
+
+def _supprimer(directory):
+    """Retire un venv scellé (ou non) : rend l'écriture aux dossiers d'abord."""
+    for dossier, _sous, _fichiers in os.walk(directory):
+        if not os.path.islink(dossier):
+            os.chmod(dossier, os.stat(dossier).st_mode | 0o700)
+    shutil.rmtree(directory)
 
 
 def _pip(venv, *arguments, env):
@@ -550,6 +659,17 @@ def _entree_normalisee(donnees, venv, mode):
                 taille=len(lanceur) + len(corps))
 
 
+def _entree_scellee(mode):
+    """#5711 : entrée `pip*` remplacée par le refus, en lecture seule exacte."""
+    if mode != 0o555:
+        raise Ecart('pip scellé : mode %o attendu, %o observé' % (0o555, mode))
+    canonique = (b'scelle' + b'\0' + PIP_REFUS + b'\0'
+                 + str(mode).encode('ascii') + b'\0')
+    return dict(launcher='scelle',
+                sha256=hashlib.sha256(canonique).hexdigest(),
+                taille=len(PIP_REFUS))
+
+
 def _controler_bytecode(site):
     """Seul le bytecode du pip de bootstrap est toléré dans site-packages."""
     for repertoire, enfants, noms in os.walk(site, followlinks=False):
@@ -594,7 +714,10 @@ def _entrees(venv, site, proprietaires):
             donnees = _lire_regulier(fichier, MAX_METADATA_BYTES,
                                      proprietaires=proprietaires)
             mode = stat.S_IMODE(fichier.lstat().st_mode)
-            entrees[nom] = _entree_normalisee(donnees, venv, mode)
+            if SCELLE_NAME.fullmatch(nom) and donnees == PIP_REFUS:
+                entrees[nom] = _entree_scellee(mode)
+            else:
+                entrees[nom] = _entree_normalisee(donnees, venv, mode)
     return entrees
 
 
@@ -731,6 +854,25 @@ def _controler_bin(venv, entrees, activations):
                 raise Ecart('script de bin/ non exécutable : %s' % entree.name)
         elif entree.name not in noms_activation:
             raise Ecart('script inattendu dans bin/ : %s' % entree.name)
+
+
+def _controler_bin_scelle(venv):
+    """#5711 : en format 3, tout fichier de bin/ est en lecture seule exacte.
+
+    Le hash d'arbre couvre `lib/` ; les scripts de `bin/` sont couverts par
+    leur entrée, sauf les scripts d'activation (hash de contenu seul). Le
+    scellement #2763 les rend lecture seule : on l'exige aussi, sinon un mode
+    élargi passerait sans être vu.
+    """
+    bin_dir = Path(venv) / 'bin'
+    for entree in sorted(bin_dir.iterdir(), key=lambda item: item.name):
+        if entree.is_symlink():
+            continue
+        info = entree.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        if stat.S_IMODE(info.st_mode) & 0o222:
+            raise Ecart('bin/ non scellé : %s' % entree.name)
 
 
 def _normaliser_record(donnees, entrees):
@@ -883,11 +1025,27 @@ def _liste(items, champs, etiquette, cle):
 def _valider_manifeste(document):
     if not isinstance(document, dict):
         raise Erreur('manifeste : objet JSON attendu')
-    _exiger(set(document) == {'format', 'sha', 'source_tree_sha256', 'python',
-                              'bootstrap', 'lock', 'distributions', 'wheels',
-                              'installed'},
-            'manifeste : champs exacts attendus')
-    _exiger(document['format'] == FORMAT, 'manifeste : format inconnu')
+    if document.get('format') == FORMAT:
+        champs = {'format', 'sha', 'source_tree_sha256', 'python',
+                  'bootstrap', 'lock', 'distributions', 'wheels', 'installed'}
+        scelle = False
+    elif document.get('format') == FORMAT_SCELLE:
+        champs = {'format', 'sha', 'source_tree_sha256', 'python',
+                  'bootstrap', 'lock', 'distributions', 'wheels', 'installed',
+                  'scellement'}
+        scelle = True
+    else:
+        raise Erreur('manifeste : format inconnu')
+    _exiger(set(document) == champs, 'manifeste : champs exacts attendus')
+    if scelle:
+        scellement = document['scellement']
+        _exiger(isinstance(scellement, dict)
+                and set(scellement) == {'regle', 'pip_sha256'},
+                'manifeste : scellement')
+        _exiger(scellement['regle'] == SCELLEMENT['regle'],
+                'manifeste : règle de scellement inconnue')
+        _exiger(scellement['pip_sha256'] == SCELLEMENT['pip_sha256'],
+                'manifeste : pip refusé différent du contrat')
     _exiger(isinstance(document['sha'], str)
             and SHA.fullmatch(document['sha']) is not None, 'manifeste : SHA')
     _exiger(isinstance(document['source_tree_sha256'], str)
@@ -958,12 +1116,23 @@ def _valider_manifeste(document):
                 'manifeste : installed.%s' % champ)
     _exiger(installed['files'] > 0 and installed['dirs'] > 0
             and installed['bytes'] > 0, 'manifeste : arbre installé vide')
-    _liste(installed['entry_points'],
-           {'name': CLEAN_NAME,
-            'launcher': re.compile(r'direct|sh-preamble\Z'),
-            'sha256': HEX256}, 'entry_points', 'name')
     _liste(installed['activation'],
            {'name': CLEAN_NAME, 'sha256': HEX256}, 'activation', 'name')
+    entrees = _liste(installed['entry_points'],
+                     {'name': CLEAN_NAME,
+                      'launcher': re.compile(r'direct|sh-preamble|scelle\Z'),
+                      'sha256': HEX256}, 'entry_points', 'name')
+    scellees = [nom for nom, entree in entrees.items()
+                if entree['launcher'] == 'scelle']
+    for nom in scellees:
+        _exiger(scelle and SCELLE_NAME.fullmatch(nom) is not None,
+                'manifeste : lanceur scelle inattendu (%s)' % nom)
+    if scelle:
+        _exiger(scellees, 'manifeste : aucun script pip scellé')
+        for nom in entrees:
+            if SCELLE_NAME.fullmatch(nom) is not None:
+                _exiger(entrees[nom]['launcher'] == 'scelle',
+                        'manifeste : pip non scellé (%s)' % nom)
     return document
 
 
@@ -1042,8 +1211,12 @@ def _pip_check(venv):
 
 
 def _produire(depot, *, sha, tag, lock_path, wheelhouse, python, output,
-              travail=None):
-    """Produire le manifeste ; ``travail`` (tests) est conservé tel quel."""
+              travail=None, scelle=False):
+    """Produire le manifeste ; ``travail`` (tests) est conservé tel quel.
+
+    ``scelle`` décrit l'artefact posé par `bascule.py` (#5711) : marqueur,
+    pip refusé et lecture seule AVANT la mesure, puis vérification du pip.
+    """
     if os.geteuid() == 0:
         raise Erreur('la production doit se faire hors root')
     output = Path(output).absolute()
@@ -1092,7 +1265,8 @@ def _produire(depot, *, sha, tag, lock_path, wheelhouse, python, output,
         construite = _construire_roue(outil, source, sortie, env_pip)
         _comparer_roues(construite, par_nom['ameesh'])
         venv = racine / 'venv'
-        _creer_venv(venv, python=python, env=env_pip)
+        _creer_venv(venv, python=python, env=env_pip,
+                    prompt=INVITE if scelle else None)
         try:
             bootstrap = _distributions(venv, frozenset((0, os.geteuid())))
         except Ecart as erreur:
@@ -1104,6 +1278,9 @@ def _produire(depot, *, sha, tag, lock_path, wheelhouse, python, output,
         _pip(venv, 'install', '--no-index', '--find-links', str(wheelhouse),
              '--require-hashes', '--only-binary=:all:', '--no-compile',
              '--no-cache-dir', '-r', str(lock_path), env=env_pip)
+        if scelle:
+            _ecrire_marqueur(venv, sha[:7], lock['digest'])
+            sceller(venv)
         _pip(venv, 'check', env=env_pip)
         try:
             mesure = _mesurer_venv(venv)
@@ -1123,7 +1300,7 @@ def _produire(depot, *, sha, tag, lock_path, wheelhouse, python, output,
             if item['version'] != attendues[item['name']]['version']:
                 raise Erreur('version installée inattendue : %s' % item['name'])
         document = dict(
-            format=FORMAT,
+            format=FORMAT_SCELLE if scelle else FORMAT,
             sha=sha,
             source_tree_sha256=source_arbre['tree_sha256'],
             python=mesure['python'],
@@ -1150,13 +1327,18 @@ def _produire(depot, *, sha, tag, lock_path, wheelhouse, python, output,
                     for nom, value in mesure['entry_points']],
                 activation=mesure['activation']),
         )
+        if scelle:
+            document['scellement'] = dict(SCELLEMENT)
         _valider_manifeste(document)
         _ecrire_manifeste(output, document)
         return document
     finally:
         os.umask(ancien_masque)
         if propre:
-            shutil.rmtree(racine, ignore_errors=True)
+            try:
+                _supprimer(racine)
+            except OSError:
+                pass
 
 
 def _comparer(attendu, mesure, etiquette):
@@ -1197,6 +1379,11 @@ def _verifier(manifest_path, venv):
     _comparer(document['python'], interpreteur, 'interpréteur')
     _version_executable(interpreteur)
     mesure = _mesurer_venv(venv, interpreteur=interpreteur)
+    if document['format'] == FORMAT_SCELLE:
+        for nom, value in mesure['entry_points']:
+            if (SCELLE_NAME.fullmatch(nom) is not None
+                    and value['launcher'] != 'scelle'):
+                raise Ecart('venv non scellé : %s' % nom)
     _comparer(document['distributions'], mesure['distributions'], 'distributions')
     installed = document['installed']
     _comparer(installed['entry_points'],
@@ -1204,6 +1391,8 @@ def _verifier(manifest_path, venv):
                     sha256=value['sha256'])
                for nom, value in mesure['entry_points']],
               'scripts d’entrée')
+    if document['format'] == FORMAT_SCELLE:
+        _controler_bin_scelle(venv)
     _comparer(installed['activation'], mesure['activation'],
               'scripts d’activation')
     _comparer(installed['tree_sha256'], mesure['tree']['tree_sha256'],
@@ -1228,6 +1417,8 @@ def main(argv=None):
     produire.add_argument('--wheelhouse', required=True)
     produire.add_argument('--python', default='/usr/bin/python3')
     produire.add_argument('--output', required=True)
+    produire.add_argument('--scelle', action='store_true',
+                          help='décrire le venv scellé posé par bascule.py (#5711)')
     verifier = sous.add_parser('verifier', help='vérifier un venv installé')
     verifier.add_argument('--manifeste', required=True)
     verifier.add_argument('--venv', required=True)
@@ -1237,7 +1428,8 @@ def main(argv=None):
             document = _produire(
                 arguments.clone, sha=arguments.sha, tag=arguments.tag,
                 lock_path=arguments.lock, wheelhouse=arguments.wheelhouse,
-                python=arguments.python, output=arguments.output)
+                python=arguments.python, output=arguments.output,
+                scelle=arguments.scelle)
             print('manifeste: %s' % Path(arguments.output))
             print('sha: %s' % document['sha'])
             print('arbre installé: %s' % document['installed']['tree_sha256'])
