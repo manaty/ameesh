@@ -369,6 +369,14 @@ def pr_identity(run: dict) -> tuple[str, tuple[int, ...]] | None:
     return (source, numbers)
 
 
+def same_repository(run: dict, repo: str) -> bool:
+    """#5755 : le code du run vient du dépôt suivi lui-même ; un fork, ou un
+    run sans `head_repository` lisible, n'en vient pas."""
+    source = (run.get("head_repository") or {}) if isinstance(run, dict) else {}
+    name = source.get("full_name") if isinstance(source, dict) else None
+    return isinstance(name, str) and name.casefold() == repo.casefold()
+
+
 def run_group(run: dict) -> tuple | None:
     """Le périmètre prudent d'annulation : (dépôt source, PR, workflow).
 
@@ -1382,7 +1390,8 @@ class Watcher:
         for row in running:
             run = finishing.get(int(row["run_id"]))
             out += self._failures(db, repo, row, bases,
-                                  terminal=conclusion_status(run))
+                                  terminal=conclusion_status(run),
+                                  run=run or live.get(int(row["run_id"])))
             if run is None:
                 continue
             others = [r for r in running if int(r["run_id"]) not in finishing
@@ -1516,13 +1525,23 @@ class Watcher:
             record(db.cfg, db)
         return out
 
-    def _github_disk_refusals(self, db, repo, row, *, checks=None, terminal=""):
+    def _github_disk_refusals(self, db, repo, row, run=None, *, checks=None, terminal=""):
         """#5751 : signaux uniquement levants de tous les runs, PR comprises.
 
         La liste des hôtes vient du workflow dédié ; corps et charges des
         courriers sont des projections fermées, jamais du texte du code testé.
+        #5755 : un run d'un autre dépôt (fork), ou d'origine illisible, lève
+        encore l'alerte, sans urgence ni courrier au pilote.
         """
         from . import ci_disk
+        origin = []
+
+        def fork():
+            if not origin:
+                source = run if run is not None else self.api(
+                    "repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
+                origin.append(not same_repository(source, repo))
+            return origin[0]
         # #5753 : amortir la liste des jobs ; les checks déjà lus évitent
         # les annotations vides. Leur liste peut être tronquée ou ne porter
         # que les dernières tentatives : elle ne remplace pas la liste jobs.
@@ -1568,14 +1587,15 @@ class Watcher:
                     if not isinstance(host, str) or host not in known:
                         continue
                     if annotation.get("title") == ci_disk.SCHEMA:
-                        self._disk_low_signal(db, repo, row, job, annotation, event, index)
+                        self._disk_low_signal(db, repo, row, job, annotation, event, index,
+                                              fork=fork())
                         continue
                     if (str(event.get("run_id")) != str(row["run_id"])
                             or str(event.get("attempt")) != str(row.get("run_attempt") or 1)
                             or not ci_disk.HOST.fullmatch(str(event.get("host", "")))):
                         continue
                     ci_disk.observe_refusal(repo, event["host"], event, storage.of(db).ci,
-                                            now=float(self.clock()))
+                                            now=float(self.clock()), fork=fork())
                 self._disk_checks[key] = now
             self._disk_scans[scan_key] = (now, terminal)
             return self._disk_refusal_messages(db, repo)
@@ -1588,7 +1608,7 @@ class Watcher:
                 while len(cache) > maximum:
                     del cache[next(iter(cache))]
 
-    def _disk_low_signal(self, db, repo, row, job, annotation, event, index):
+    def _disk_low_signal(self, db, repo, row, job, annotation, event, index, fork=False):
         from . import ci_disk, canon as canon_mod, resources
         import hashlib
         data = ci_disk.annotation(annotation, event['host'])
@@ -1606,6 +1626,8 @@ class Watcher:
         payload = dict(signal=True, run_id=int(row['run_id']), attempt=int(row.get('run_attempt') or 1),
                        sampled_ts=sampled, volume='root',
                        free_bytes=data['free_bytes'], total_bytes=data['total_bytes'])
+        if fork:
+            payload['fork'] = True
         storage.of(db).ci.observe_disk_refusal(repo, host=event['host'],
             event_id=hashlib.sha256(identity.encode()).hexdigest()[:32], payload=payload)
 
@@ -1732,7 +1754,7 @@ class Watcher:
             if row is None or (run.get("status") or "") != "completed":
                 continue
             out += self._failures(db, repo, row, bases,
-                                  terminal=conclusion_status(run))
+                                  terminal=conclusion_status(run), run=run)
             pending = [r for r in st.ci.running(repo) if r.get("head_sha") == head
                        and r.get("branch") == branch
                        and int(r["run_id"]) not in settled]
@@ -2371,7 +2393,7 @@ class Watcher:
             return None
 
     def _failures(self, db, repo: str, row: dict, bases=BASE_BRANCHES,
-                  terminal: str = "") -> list[dict]:
+                  terminal: str = "", run: dict | None = None) -> list[dict]:
         """Les échecs nouveaux d'une exécution suivie, et leur message.
 
         `terminal` : le statut GitHub de l'exécution quand elle vient de
@@ -2390,7 +2412,8 @@ class Watcher:
         checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
-        self._github_disk_refusals(db, repo, row, checks=checks.get("check_runs"), terminal=terminal)
+        self._github_disk_refusals(db, repo, row, run, checks=checks.get("check_runs"),
+                                   terminal=terminal)
         self._record_failed_jobs(st, repo, row, bases)
         if not events and terminal == "failure":
             events = self._log_failures(repo, row)

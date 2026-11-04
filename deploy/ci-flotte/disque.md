@@ -287,6 +287,11 @@ basse ouvre ou aggrave une alerte jusqu'à un relevé dédié plus récent. Les
 hôtes doivent déjà appartenir au périmètre du workflow dédié. Les signaux
 ne remplacent jamais une mesure physique et n'en repoussent pas l'âge.
 
+Un signal ou un refus venu d'un run d'un autre dépôt (fork : head_repository
+différent du dépôt suivi, ou illisible) lève l'alerte, mais sans urgence ni
+courrier au pilote (#5755) : du code non relu ne peut pas réveiller le pilote.
+Un run du dépôt garde l'urgence ; à hôte égal, l'alerte urgente l'emporte.
+
 Chaque refus de marge #5742 publie ameesh-ci-disk-refusal/1, même sous
 ENOSPC : aucun fichier n'est écrit par les jobs. Le veilleur lit aussi les
 annotations des jobs réussis (carte.yml peut absorber le code 75). Les
