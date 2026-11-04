@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -261,3 +262,10 @@ class LocalResolutionTest(unittest.TestCase):
             notifier.run_local_pass(now=200.0)
         types = {entry["alert"]["type"] for entry in notifier.state["active"].values()}
         self.assertEqual(types, {"host_migration_pending_non_additive"})
+
+    def test_a_cfg_without_config_path_has_no_secondary_base(self):
+        # #532, paquet h-20261104-03 : `notify.cmd_notify` reçoit parfois une
+        # configuration légère (banc, SimpleNamespace) sans `config_path` ;
+        # l'absence vaut « aucune base secondaire », sinon la passe locale
+        # lève avant de pousser l'alerte du pool qu'elle vient de lire.
+        self.assertEqual(config.secondary_configs(types.SimpleNamespace()), [])

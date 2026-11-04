@@ -1411,10 +1411,11 @@ def secondary_configs(cfg: Config) -> list[tuple[str, str]]:
     d'exécuteur ou une sauvegarde de `config.json` n'est pas une base : seule
     une configuration rangée à côté du fichier lu, sous un nom connu, compte.
     Absente, la liste est vide. Un chemin identique au fichier lu est écarté."""
-    if not cfg.config_path:
+    config_path = getattr(cfg, "config_path", None)
+    if not config_path:
         return []
-    directory = os.path.dirname(os.path.abspath(_expand(cfg.config_path)))
-    current = os.path.abspath(_expand(cfg.config_path))
+    directory = os.path.dirname(os.path.abspath(_expand(config_path)))
+    current = os.path.abspath(_expand(config_path))
     out = []
     for name in SECONDARY_CONFIG_NAMES:
         path = os.path.abspath(os.path.join(directory, name))
