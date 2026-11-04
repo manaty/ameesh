@@ -26,8 +26,8 @@
 
 Guarantees (R3, R5):
 * an agent has only one live lease: `claim` is an atomic conditional UPDATE;
-* the lease is renewed by a heartbeat during turns; if it is lost, the
-  harness process is terminated and the turn is not counted;
+* the lease is renewed by a heartbeat throughout the worker lifetime; if it
+  is lost, the harness process is terminated and the turn is not counted;
 * if the runner dies (SIGKILL, power cut), the lease expires and another runner
   on the same machine takes the agent over;
 * the harness JSONL stream is logged to
@@ -42,6 +42,7 @@ from __future__ import annotations
 from ameesh import work_lifecycle as lifecycle
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import dataclasses
 import functools
 import getpass
@@ -791,9 +792,12 @@ class AgentWorker(threading.Thread):
         #: après la réponse de la base (prise ou renouvellement + ttl) : jamais
         #: avant l'échéance de la base, quel que soit l'écart des horloges
         self.lease_held_until = self._held_until()
-        #: L159f4 r2 : le fil de renouvellement du tour (son renouvellement en
+        #: L159f4 r2 : le fil de renouvellement du worker (son renouvellement en
         #: cours peut encore prolonger `lease_held_until` après la fin du tour)
         self.heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_done: threading.Event | None = None
+        self._renew_lock = threading.Lock()
+        self._preparation_phase: tuple[str, float] | None = None
         #: r3 : les appels de renouvellement détachés (sans réponse dans
         #: `call_budget()`) : l'un d'eux peut encore prolonger le bail en base
         self.renewals: list[threading.Thread] = []
@@ -1223,6 +1227,12 @@ class AgentWorker(threading.Thread):
         le signal a laissé, sous charge, un remplaçant réclamer le bail pendant
         que l'ancien harnais vivait encore (sonde codex3 b731f4f : +12 ms).
         """
+        # #5806 : le battement de fond peut croiser un renouvellement explicite
+        # (attente, rotation). Ne pas réécrire l'échéance dans l'ordre inverse.
+        with getattr(self, "_renew_lock", nullcontext()):
+            return AgentWorker._renew_serialized(self)
+
+    def _renew_serialized(self) -> bool:
         if self.lease_lost.is_set():
             return False
         if self.deadline_passed():
@@ -1296,6 +1306,9 @@ class AgentWorker(threading.Thread):
         self._close_resident("lease released")
         AgentWorker._close_peek(self)  # aussi sur les doublures de test
         self._release_session_lock()
+        heartbeat_done = getattr(self, "_heartbeat_done", None)
+        if heartbeat_done is not None:
+            heartbeat_done.set()
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
         # L113 : le travail part au serveur sous le bail, puis le dossier est
         # effacé (même bail perdu : rien ne doit rester sur l'appareil)
@@ -1723,6 +1736,38 @@ class AgentWorker(threading.Thread):
             self.stop_group_now("lease deadline reached", grace=0, hard=True)
             return
 
+    @contextmanager
+    def _lease_heartbeat(self):
+        """#5806 : un seul battement, de la sélection jusqu'à la fin du worker.
+
+        Les tours imbriqués (résumé de rotation) empruntent le battement du
+        worker. Les appels directs de banc gardent leur propre portée.
+        """
+        if getattr(self, "_heartbeat_done", None) is not None:
+            yield
+            return
+        done = threading.Event()
+        self._heartbeat_done = done
+        self.heartbeat_thread = threading.Thread(
+            target=self._heartbeat, args=(done,), daemon=True,
+            name="%s-heartbeat" % self.name)
+        self.heartbeat_thread.start()
+        try:
+            yield
+        finally:
+            done.set()
+            self._heartbeat_done = None
+
+    @contextmanager
+    def _preparing(self, phase: str):
+        """Le battement décrit une préparation lente sans attendre sa fin."""
+        previous = getattr(self, "_preparation_phase", None)
+        self._preparation_phase = (phase, _clock_of(self).monotonic())
+        try:
+            yield
+        finally:
+            self._preparation_phase = previous
+
     def _heartbeat(self, stop_event: threading.Event) -> None:
         self.ensure_watchdog()
         # #2483 : le battement doit renouveler AVANT l'échéance. Un plancher de
@@ -1738,6 +1783,14 @@ class AgentWorker(threading.Thread):
         reprise = Reprise(maximum=interval, minimum=min(Reprise.MINIMUM, interval))
         attente = interval
         while not stop_event.wait(self.wait_timeout(attente)):
+            phase = getattr(self, "_preparation_phase", None)
+            if phase is not None:
+                elapsed = _clock_of(self).monotonic() - phase[1]
+                if elapsed >= interval:
+                    log_async("[%s] preparation waiting: %s (%.1fs elapsed)"
+                              % (self.name, phase[0], elapsed))
+            if self.watchdog_stop.is_set() or self.lease_lost.is_set():
+                return
             if not self.renew():
                 return
             if self.renew_failures:
@@ -6108,7 +6161,10 @@ class AgentWorker(threading.Thread):
         le claim n'est plus renouvelé, expire, et le réveil revient (#2466 B1)."""
         spec = None
         try:
-            spec = self.rotate_for_lot(self.pick())
+            with self._preparing("choosing turn (accounts, budget, mail)"):
+                selected = self.pick()
+            with self._preparing("rotating session for lot"):
+                spec = self.rotate_for_lot(selected)
             return spec
         finally:
             if not (spec and spec.get("scheduled_wake")):
@@ -7535,6 +7591,7 @@ class AgentWorker(threading.Thread):
         messages restent non livrés et la remise est signalée incertaine : le
         bail suivant les re-livrera en le disant.
         """
+        self._preparation_phase = None  # le harnais a démarré
         if not spec.get("jeton"):
             return
         self._courrier_lance = True
@@ -8333,41 +8390,24 @@ class AgentWorker(threading.Thread):
             closed=self.rate_limit_window, ongoing=en_cours, paused=paused)
 
     def _run_turn(self, spec: dict) -> bool:
-        """Un tour, sous battement de bail **dès la préparation** (#2544).
+        """Un tour sous le battement du worker, ou une portée locale au banc.
 
-        Le battement ne démarrait qu'une fois le harnais publié : sous charge
-        CI, la préparation (dossier, harnais, canon, ménage, comptabilité)
-        pouvait dépasser un bail court, le veilleur tuait le worker avant le
-        `Popen` et le tour ne démarrait jamais (run 39158768160, psql 6/16 :
-        « stop requested (lease deadline reached): harness not yet published »
-        puis « lease lost … before the turn »). Le bail protège le tour entier
-        — la préparation en fait partie — donc le battement démarre ici, avant
-        elle, et la couvre jusqu'à la sortie du tour, y compris les retours
-        anticipés.
-
-        #2597 : il couvre aussi l'après-harnais (nettoyage, compta, fin de tour).
-        Il s'arrêtait dès la sortie du harnais alors que le veilleur jugeait
-        encore l'échéance : une compta lente sous charge laissait expirer le bail
-        (run 39181194843, psql 6/16 : « harness not yet published » après
-        « end of turn »). Seule cette sortie l'arrête.
+        #5806 : le battement du service précède le choix du compte et les
+        rotations ; un tour imbriqué l'emprunte sans l'arrêter à sa sortie.
+        Les appels directs restent protégés de la préparation (#2544)
+        jusqu'à la fin du nettoyage et de la comptabilité (#2597).
         """
         #: #2466 : vrai dès que le harnais du tour est réellement lancé (Popen
         #: ou processus résident) ; l'échéance d'un réveil programmé n'est
         #: consommée qu'à ce moment.
         self._turn_launched = False
-        heartbeat_done = threading.Event()
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
-                                                 daemon=True)
-        self.heartbeat_thread.start()
-        try:
-            return self._run_turn_sous_battement(spec)
-        finally:
-            heartbeat_done.set()
-            # #2894 : le document de tour vit exactement le tour. Retiré sur
-            # tout retour (succès, échec, lancement impossible, exception) ;
-            # un document resté après un crash est refusé par le lecteur
-            # (bail et marqueur) et remplacé au tour suivant.
-            self._purge_turn_context()
+        with self._lease_heartbeat():
+            try:
+                with self._preparing("turn setup"):
+                    return self._run_turn_sous_battement(spec)
+            finally:
+                # Le document ne survit à aucun retour du tour (#2894).
+                self._purge_turn_context()
 
     def _run_turn_sous_battement(self, spec: dict) -> bool:
         if spec.get("lot_switch_failed"):
@@ -8424,7 +8464,8 @@ class AgentWorker(threading.Thread):
             self._host_missing(str(exc))
             return False
 
-        compte = account_turn.for_turn(self)  # L30 : compte de ce tour (ou None)
+        with self._preparing("account setup"):
+            compte = account_turn.for_turn(self)  # L30
         session = self.current_session()
         connue = (self._session_connue(harness, compte, adapter)
                   if session and not self.runner.dry_run else None)
@@ -8437,7 +8478,8 @@ class AgentWorker(threading.Thread):
         # Session neuve : résumé de rotation (règles relues) ou, sans résumé,
         # règles de travail du canon (premier démarrage) — `_ouverture` calcule
         # les deux, règles bornées comprises.
-        resume = self._ouverture()
+        with self._preparing("session opening and canon"):
+            resume = self._ouverture()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = self.modele_du_tour(harness, adapter, emprunte=emprunte)
@@ -8624,7 +8666,8 @@ class AgentWorker(threading.Thread):
         env.update(identite)
         # #1645 : chaque geste gh du tour est consigné (agent, tour, lot), et
         # le tour porte le jeton de son rôle GitHub quand il est configuré.
-        self._github_env(env, lot_du_tour)
+        with self._preparing("GitHub identity"):
+            self._github_env(env, lot_du_tour)
         if getattr(self.runner, "mediated", False):
             self._mediated_env(env)
         if not account_turn.apply(self, env, compte):
@@ -10158,6 +10201,11 @@ class AgentWorker(threading.Thread):
             publisher.close()
 
     def process_once(self, wait_seconds: float) -> bool:
+        """#5806 : protéger aussi choix du compte et rotation en mode --once."""
+        with self._lease_heartbeat():
+            return self._process_once_under_heartbeat(wait_seconds)
+
+    def _process_once_under_heartbeat(self, wait_seconds: float) -> bool:
         """Mode banc : au plus un tour, en attendant `wait_seconds` du travail."""
         admission_lock.reset()  # #4602 : le fil appelant est ordinaire
         self.ensure_watchdog()
@@ -10175,7 +10223,8 @@ class AgentWorker(threading.Thread):
                 self.wake.clear()
                 continue
             self.apply_restart_if_requested()
-            self.maybe_rotate()
+            with self._preparing("session rotation"):
+                self.maybe_rotate()
             if self.rotation_stopped:
                 return False  # #5503 : arrêté par le disjoncteur L48
             spec = self._pick_for_turn()
@@ -10220,6 +10269,11 @@ class AgentWorker(threading.Thread):
             admission_lock.set_priority(admission_lock.CONTROL)
 
     def run(self) -> None:
+        """#5806 : battement indépendant, y compris entre les tours."""
+        with self._lease_heartbeat():
+            self._run_under_heartbeat()
+
+    def _run_under_heartbeat(self) -> None:
         """Mode service : boucle jusqu'à l'arrêt, réveillée par NOTIFY."""
         self.ensure_watchdog()
         self.ensure_peek()
@@ -10276,7 +10330,8 @@ class AgentWorker(threading.Thread):
                             % (self.name, retrait))
                         break
                     self.apply_restart_if_requested()
-                    self.maybe_rotate()
+                    with self._preparing("session rotation"):
+                        self.maybe_rotate()
                     if self.rotation_stopped:
                         break  # #5503 : arrêté par le disjoncteur L48, bail rendu
                     # L165 (EP2) : bascule planifiée — le détenteur rend le bail

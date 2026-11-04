@@ -242,6 +242,11 @@ class RelectureConfigTest(unittest.TestCase):
         worker = SimpleNamespace(db=object(), cfg=ancien, _cfg_pending=None,
                                  _cfg_lock=threading.Lock(), stopping=threading.Event(),
                                  rotation_stopped=False)  # #5503
+        from contextlib import nullcontext
+        worker._lease_heartbeat = nullcontext
+        worker._preparing = lambda phase: nullcontext()
+        worker._process_once_under_heartbeat = lambda wait: (
+            AgentWorker._process_once_under_heartbeat(worker, wait))
         worker.ensure_watchdog = lambda: None
         worker.ensure_peek = lambda: None  # #1349
         # #1270 (main) : process_once attend d'abord l'échéance de reprise
