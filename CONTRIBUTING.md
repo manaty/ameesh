@@ -132,6 +132,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `tests/test_cluster.py`. Le lint de `tests/test_cluster.py` compare les
   `ADD COLUMN` des migrations à ce contrat et à `EXCLUES` ; il tourne dans la
   sélection du lot, sans base, et refuse une colonne non tranchée.
+- **Compatibilité N-1** (#5690) : une colonne ajoutée que le nouveau code lit
+  n'est pas écrite par les écrivains restés sur la version N-1 pendant un
+  déploiement par vagues (cas `canon_state.sync_completed_at`, #5653/#5688) ;
+  les défauts et triggers du nouveau schéma doivent suffire, ou la lecture doit
+  tenir sans la valeur. Le lot joint un test `PgTestCase` qui rejoue l'écriture
+  N-1 (ou son stub SQL) avec `previous_write`, `previous_insert` ou
+  `previous_update`, contre le nouveau schéma et le nouveau lecteur ; le
+  courrier de relecture pose la question « le code tient-il si les écrivains
+  N-1 ignorent la colonne ? ».
 - **En-tête de licence** `SPDX-License-Identifier: AGPL-3.0-only` en tête des
   nouveaux fichiers source.
 

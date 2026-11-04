@@ -1020,11 +1020,33 @@ def _do_not_push_line(remaining: int, required: int, lot, sha: str = "") -> str:
            "y" if remaining == 1 else "ies", required))
 
 
+def sql_migration(paths: Iterable) -> bool:
+    """#5690: the frozen diff carries SQL, so probably a migration.
+
+    A head that adds a column the new code reads meets the N-1 case: writers
+    still on the previous version do not write it during a wave deployment
+    (`canon_state.sync_completed_at`, #5653/#5688). The reviewer of such a head
+    is asked the question; the lot proves the answer with a `PgTestCase`
+    replay (`CONTRIBUTING.md`, « Compatibilité N-1 »).
+    """
+    return any(str(path or "").strip().lower().endswith(".sql") for path in paths or ())
+
+
+#: #5690: the N-1 question added to the reviewer mail when the frozen diff
+#: carries SQL.
+N1_QUESTION = (
+    "- N-1 compatibility: if the frozen diff adds a column the new code reads, "
+    "does the code hold while writers still on the previous version ignore it? "
+    "Replay their write (or its SQL stub) against the new schema and reader "
+    "(`PgTestCase.previous_write`, CONTRIBUTING.md);")
+
+
 def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      reviewer: Mapping, authors: Iterable = (), base: str = "",
                      risk: str = "", policy_ref: str = "",
                      eligible_families: Optional[int] = None,
-                     correction: Optional[Mapping] = None) -> str:
+                     correction: Optional[Mapping] = None,
+                     sql_migration: bool = False) -> str:
     """The mail that hands the reviewer the exact head and its place.
 
     The SHA is written in full, with its `frozen` milestone: the verdict will
@@ -1045,6 +1067,10 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
     reads `ok` or `short` it overrides the family count. A correction that
     would leave too few families opens the instructions with "do not push"
     (#4325): the mail no longer starts with "fix it yourself".
+
+    `sql_migration` (#5690) adds the N-1 question: the frozen diff carries a
+    migration, so a column added for the new code may be left unwritten by
+    writers still on the previous version during a wave deployment.
     """
     sha = str((freeze or {}).get("sha") or "")
     fid = (freeze or {}).get("id")
@@ -1073,10 +1099,13 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         "To do:",
     ]
     remaining = _correction_room(required, eligible_families, correction)
+    read = ["- read the diff **of this exact head** and check the edge cases;"]
+    if sql_migration:
+        read.append(N1_QUESTION)
     if remaining is not None and remaining < required:
         lines += [
             _do_not_push_line(remaining, required, row.get("id"), sha),
-            "- read the diff **of this exact head** and check the edge cases;",
+            *read,
             "- render the verdict: `ameesh work milestone %s verdict ok|blocked "
             "--sha %s`;" % (row.get("id"), sha),
             "- a non-blocking defect goes to the backlog, it does not block the merge;",
@@ -1088,7 +1117,7 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         ]
         return "\n".join(lines)
     lines += [
-        "- read the diff **of this exact head** and check the edge cases;",
+        *read,
         "- render the verdict: `ameesh work milestone %s verdict ok|blocked --sha %s`;"
         % (row.get("id"), sha),
         "- fix a blocking defect yourself and push to the lot branch "
@@ -1442,6 +1471,9 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
             " nothing written; recollect the paths, authors and class of the new"
             " freeze, then retry" % (lot, expected[:12], sha[:12]))
     paths = tuple(paths or ())
+    # #5690 : un diff gelé qui porte du SQL peut ajouter une colonne lue par le
+    # nouveau code ; le courrier de relecture pose alors la question N-1.
+    migration = sql_migration(paths)
     # Sans chemin changé il n'y a rien à relire, quel que soit le plancher.
     if not paths:
         required = 0
@@ -1580,7 +1612,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                                      authors=authors, base=base, risk=risk,
                                      policy_ref=policy_ref,
                                      eligible_families=eligible_families,
-                                     correction=correction),
+                                     correction=correction,
+                                     sql_migration=migration),
         })
     for index, reviewer in enumerate(selection.get("reviewers") or ()):
         if str(reviewer.get("name") or "") in previous_names:
@@ -1605,7 +1638,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                                      authors=authors, base=base, risk=risk,
                                      policy_ref=policy_ref,
                                      eligible_families=eligible_families,
-                                     correction=correction),
+                                     correction=correction,
+                                     sql_migration=migration),
         })
     try:
         return port.commit(lot, freeze=freeze, required=required, state=state,
