@@ -34,6 +34,8 @@ class FallbackTest(unittest.TestCase):
         with mock.patch('ameesh.ci.storage.of') as store, \
                 mock.patch('ameesh.ci_disk.observe_refusal') as observe:
             store.return_value.ci.disks.return_value = [dict(repo='acme/widget', host='ci-a')]
+            # #5755 : le run vient de _failures ; son origine ne coûte aucun appel.
+            kwargs.setdefault('run', {'head_repository': {'full_name': 'acme/widget'}})
             self.watcher._github_disk_refusals(object(), 'acme/widget', self.row, **kwargs)
             return observe, store
 
