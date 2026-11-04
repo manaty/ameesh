@@ -864,6 +864,23 @@ class StagingTest(unittest.TestCase):
         actions = self.actions()
         self.assertIn(('pc-smichea', 'migrer'), actions)
         self.assertNotIn(('ameesh-agents-1', 'installer'), actions)
+        # #5691 : un « verifier/ok » de preflight ne doit pas se lire comme
+        # une installation. L'instantané le dit par hôte, et l'alerte le
+        # résume au lieu de laisser croire que les VM sont à jour.
+        snapshots = [json.loads(line) for line in
+                     (self.state / 'staging-snapshots.jsonl').read_text().splitlines()]
+        failed = snapshots[-1]
+        self.assertEqual(failed['state'], 'failed')
+        self.assertEqual(failed['hosts']['ameesh-agents-1']['stage'], 'verifier')
+        self.assertTrue(all(step.get('installed') is False
+                            for step in failed['hosts'].values()),
+                        failed['hosts'])
+        rows = [dict(id=number, data=snapshot)
+                for number, snapshot in enumerate(snapshots, 1)]
+        from ameesh import staging_watch
+        finding, = staging_watch.findings(rows, now=failed['deadline'] + 1)
+        self.assertIn('0 installé(s) sur 5 hôte(s)', finding['detail'])
+        self.assertIn('préflight seul', finding['detail'])
 
     def test_already_installed_workstation_is_not_reinstalled(self):
         court = self.sha[:7]

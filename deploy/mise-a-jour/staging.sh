@@ -1102,7 +1102,15 @@ with open(path, encoding='utf-8') as stream:
             first.setdefault(row['hote'], started)
             last_line[row['hote']] = number
             progress = max(progress, at)
-            hosts[row['hote']] = {'stage': row['etape'], 'verdict': row['verdict'], 'since': started}
+            # #5691 : la trace `installer ok` est la seule preuve que la cible
+            # a ete installee sur cet hote. Le marqueur se garde sur les etapes
+            # suivantes (redemarrage, controle, sante), pour qu'un
+            # `verifier/ok` de preflight ne se lise pas comme une installation.
+            installe = bool(hosts.get(row['hote'], {}).get('installed'))
+            if row['etape'] == 'installer' and row['verdict'] == 'ok':
+                installe = True
+            hosts[row['hote']] = {'stage': row['etape'], 'verdict': row['verdict'],
+                                  'since': started, 'installed': installe}
 try:
     with open(current_path, encoding='utf-8') as stream:
         host, stage, began, mark = stream.read().rstrip('\n').split('\t')
@@ -1133,7 +1141,8 @@ if host:
         if stage == 'redemarrer' and not runners:
             stall = budget
         hosts[host] = {'stage': stage, 'verdict': 'en-cours', 'since': began,
-                       'deadline': first[host] + budget}
+                       'deadline': first[host] + budget,
+                       'installed': bool(hosts.get(host, {}).get('installed'))}
 print(json.dumps(dict(run=run, sha=sha, started=float(start),
                      deadline=float(start)+duration, state=state,
                      hosts=hosts, notify=notify, beat=time.time(), progress=progress,

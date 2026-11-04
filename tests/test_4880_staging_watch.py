@@ -245,6 +245,24 @@ publier_suivi failed
         self.assertNotIn("deadline", closed["hosts"]["vm-1"])
         self.assertGreater(first["beat"], 0)
 
+    def test_preflight_is_not_an_installation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, """
+trace vm-1 verifier ok
+trace vm-2 verifier ok
+publier_suivi running
+trace vm-1 installer ok
+debut_etape vm-1 redemarrer
+""")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            before, after = self.snapshots(folder)
+        # #5691: the preflight verdict says the host answered, not that the
+        # target was installed.
+        self.assertIs(before["hosts"]["vm-1"]["installed"], False)
+        self.assertIs(before["hosts"]["vm-2"]["installed"], False)
+        self.assertIs(after["hosts"]["vm-1"]["installed"], True)
+        self.assertIs(after["hosts"]["vm-2"]["installed"], False)
+
     def test_backup_budget_covers_the_three_dumps_with_one_runner(self):
         with tempfile.TemporaryDirectory() as folder:
             proc = self.harness(folder, """
@@ -397,6 +415,28 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(list(routed), ["pilot"])
         self.assertIn("vm-1: sante/ok", routed["pilot"])
 
+    def test_alert_says_when_only_the_preflight_ran(self):
+        failed = row(1, state="failed", hosts={
+            "vm-1": {"stage": "verifier", "verdict": "ok", "installed": False},
+            "vm-2": {"stage": "verifier", "verdict": "ok", "installed": False},
+            # §14: a deferred workstation is not a host awaiting installation.
+            "pc-smichea": {"stage": "absent", "verdict": "reporte",
+                           "installed": False},
+            # the run's own closing step is not a host either
+            "sequence": {"stage": "sequence", "verdict": "ok",
+                         "installed": False}})
+        finding, = staging_watch.findings([failed], now=150)
+        self.assertIn("0 installé(s) sur 2 hôte(s)", finding["detail"])
+        self.assertIn("préflight seul", finding["detail"])
+
+    def test_alert_counts_a_partially_installed_run(self):
+        failed = row(1, state="failed", hosts={
+            "vm-1": {"stage": "sante", "verdict": "ko", "installed": True},
+            "vm-2": {"stage": "verifier", "verdict": "ok", "installed": False}})
+        finding, = staging_watch.findings([failed], now=150)
+        self.assertIn("1 installé(s) sur 2 hôte(s)", finding["detail"])
+        self.assertIn("1 pas encore installé(s)", finding["detail"])
+
     def test_failure_immediate_and_only_later_completed_retry_resolves(self):
         failed = row(2, state="failed")
         self.assertEqual(len(staging_watch.findings([failed], now=150)), 1)
@@ -463,6 +503,21 @@ class WatchTest(unittest.TestCase):
             for deadline in (99, float("inf"), float("nan")):
                 with self.assertRaises(ValueError):
                     staging_watch.record(None, dict(data, deadline=deadline))
+
+    def test_record_keeps_only_a_boolean_installed_marker(self):
+        with mock.patch.object(staging_watch.storage, "of") as factory:
+            for value, expected in ((True, True), (False, False),
+                                    ("yes", None), (1, None)):
+                with self.subTest(value=value):
+                    data = row()["data"]
+                    data["hosts"]["vm-1"]["installed"] = value
+                    staging_watch.record(None, data)
+                    saved = factory.return_value.events.record.call_args.args[3]
+                    if expected is None:
+                        self.assertNotIn("installed", saved["hosts"]["vm-1"])
+                    else:
+                        self.assertIs(saved["hosts"]["vm-1"]["installed"],
+                                      expected)
 
     def test_truncated_history_cannot_resolve_existing_alerts(self):
         with mock.patch.object(staging_watch.storage, "of") as factory:

@@ -87,6 +87,10 @@ def _public_step(step: dict) -> dict:
     for key in ("since", "deadline"):
         if step.get(key) is not None:
             public[key] = _finite(step[key], key)
+    # #5691: proof that the target was installed on this host. Only a real
+    # boolean is public; a malformed value is dropped rather than guessed.
+    if isinstance(step.get("installed"), bool):
+        public["installed"] = step["installed"]
     return public
 
 
@@ -381,6 +385,43 @@ def _step(data: dict, host: str) -> tuple[str, str]:
     return (str(step.get("stage") or ""), str(step.get("verdict") or ""))
 
 
+def _installation_text(hosts: dict) -> str:
+    """#5691: how many hosts proved a target install, against the rest.
+
+    Only hosts carrying the boolean `installed` count; an absent/deferred host
+    (§14) is not a host awaiting installation. The workstation's `poste`
+    pseudo-host is folded into `pc-smichea`, so it is never counted twice. An
+    older snapshot without the field answers nothing, so its alert text is
+    unchanged.
+    """
+    entries = dict(hosts or {})
+    # `poste` is the pseudo-host of the workstation's backup/migration steps;
+    # it is the same machine as `pc-smichea`, never a second host to count.
+    if "pc-smichea" in entries:
+        entries.pop("poste", None)
+    steps = [step for step in entries.values()
+             if isinstance(step, dict)
+             and (str(step.get("stage") or ""), str(step.get("verdict") or ""))
+             != _DEFERRED
+             # `sequence` is the run's own closing step, not a host.
+             and str(step.get("stage") or "") != "sequence"
+             and isinstance(step.get("installed"), bool)]
+    if not steps:
+        return ""
+    done = sum(1 for step in steps if step["installed"])
+    total = len(steps)
+    if done == total:
+        return "Installation : %d installé(s) sur %d hôte(s)." % (done, total)
+    if not done:
+        # The installer step itself proves installation began, not succeeded.
+        begun = any(str(step.get("stage") or "") == "installer" for step in steps)
+        return ("Installation : 0 installé(s) sur %d hôte(s) — %s."
+                % (total, "installation commencée, aucune preuve" if begun
+                   else "préflight seul"))
+    return ("Installation : %d installé(s) sur %d hôte(s) — %d pas encore "
+            "installé(s)." % (done, total, total - done))
+
+
 def _repaired(run: str, latest: dict, ids: dict, descends) -> bool:
     """#5558: later runs repaired, host by host, the failure of `run`.
 
@@ -461,6 +502,7 @@ def findings(rows: list[dict], *, now: float, attested=(),
         hosts = data.get("hosts") or {}
         steps = "; ".join(_step_text(host, step)
                           for host, step in sorted(hosts.items()))
+        installation = _installation_text(hosts)
         out.append({"schema": "ameesh-alert/1", "type": "staging_interrupted", "agent": None,
                     "since": data["started"],
                     "value": late[1] if late else now - data["started"],
@@ -469,13 +511,14 @@ def findings(rows: list[dict], *, now: float, attested=(),
                     "run": run, "sha": data["sha"], "hosts": hosts,
                     "reason": run, "urgent": True,
                     "orchestrators": [data["notify"]] if data.get("notify") else [],
-                    "detail": "Staging %s (%s): %s; %s. Vérifier le lanceur et "
+                    "detail": "Staging %s (%s): %s; %s. %sVérifier le lanceur et "
                               "reprendre la séquence sous verrou, après arrêt "
                               "prouvé de l'ancien exécutant."
                               % (run, data["sha"][:12],
                                  late[0] if late
                                  else data.get("reason") or state,
-                                 steps or "aucune étape d'hôte terminée")})
+                                 steps or "aucune étape d'hôte terminée",
+                                 installation + " " if installation else "")})
     return out
 
 
