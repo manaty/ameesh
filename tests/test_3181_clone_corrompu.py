@@ -367,6 +367,17 @@ class CorruptedCloneTest(unittest.TestCase):
         self.assertIn("try again once the remote answers", message)
         self.assertNotIn("corrupted", message)
 
+    def test_an_uncreatable_ref_directory_names_the_local_filesystem(self):
+        """#5741 : un disque plein (ou un clone en lecture seule) écrit
+        « unable to create directory » ; le message ne doit pas envoyer
+        attendre la forge, qui n'y est pour rien."""
+        message = merge_queue._fetch_refusal(
+            "/clone", "error: cannot lock ref 'refs/ameesh/queue/lot/x': "
+            "unable to create directory for .git/refs/ameesh/queue/lot/x")
+        self.assertIn("filesystem", message)
+        self.assertIn("not the forge", message)
+        self.assertNotIn("try again once the remote answers", message)
+
 
 if __name__ == "__main__":
     unittest.main()
