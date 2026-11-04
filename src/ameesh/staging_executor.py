@@ -413,6 +413,27 @@ class ForgeUnreadable(RuntimeError):
     pass
 
 
+def canon_commit(cfg) -> str:
+    """#5727: the commit of this host's default canon, '' when unresolved.
+
+    Read by object name only (`rev-parse`, no hook nor fsmonitor), as the
+    canon loader does; never a refusal: the field is evidence, not a gate."""
+    from ameesh import canon
+    path = getattr(cfg, "canon", "")
+    try:
+        repo = canon.git_toplevel(path) if path else None
+        if not repo:
+            return ""
+        for rev in ([cfg.canon_ref] if getattr(cfg, "canon_ref", "")
+                    else ["origin/main", "origin/HEAD"]):
+            commit = canon.git_commit(repo, rev)
+            if commit:
+                return commit
+    except canon.GitError:
+        pass
+    return ""
+
+
 def forge_runs(slug: str, sha: str) -> list:
     """The workflow runs of one exact commit, read anonymously at the forge."""
     url = "%s/repos/%s/actions/runs?head_sha=%s&per_page=100" % (FORGE_API, slug, sha)
@@ -661,7 +682,9 @@ def tick(db, cfg, options) -> dict:
                 return {"state": "blocked", "reason": reason}
             return blocked(reason)
         # Every record of this pass carries them, the probe's refusal too.
-        request = dict(request, fingerprints=prints)
+        # #5727: so does the commit of the canon this host reads, compared
+        # with the agents' canon by the alerts pass.
+        request = dict(request, fingerprints=prints, canon_ref=canon_commit(cfg))
         # #5450: a previous stop that could not prove its workstation units
         # stopped left their pid in the request. Settle them before any other
         # host operation; the kept worktree stays until they are proved gone.
