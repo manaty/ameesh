@@ -17,6 +17,10 @@ completed deployment settles an earlier failure, never a partial one.
 #5558: a later run on a descendant commit settles a failure host by host: once
 every host the failed run left unhealthy is healthy again (or declared absent
 and deferred, canon §14), a partial run that omits the workstation clears it.
+#5693: failures of the same staging authority on a descending line of commits
+are one alert, carried by the most recent failed or running run, with the union
+of the hosts still to repair: a retry that fails before installing proves
+nothing about the earlier hosts, so it neither hides nor duplicates that alert.
 No command, environment, arbitrary log output or credential is journaled.
 """
 from __future__ import annotations
@@ -437,21 +441,21 @@ def _installation_text(hosts: dict) -> str:
             % (done, total, total - done, suffix))
 
 
-def _repaired(run: str, latest: dict, ids: dict, descends) -> bool:
-    """#5558: later runs repaired, host by host, the failure of `run`.
+def _unrepaired(run: str, latest: dict, ids: dict, descends) -> tuple[dict, bool]:
+    """#5558: hosts `run` left unhealthy that later runs did not repair.
 
     A host the run left unhealthy (any last step but a passed health check or
     a declared absence) is repaired by a later run, on a commit descending
     from the failed one, that made it healthy or declared it absent and
-    deferred (§14: a workstation off does not hold staging). At least one
-    such later run must have made a host healthy, so a failure before any
-    host step is not settled by an empty run. Unreached hosts were not
-    modified and need no repair.
+    deferred (§14: a workstation off does not hold staging). The second value
+    says whether at least one such later run made a host healthy, so a failure
+    before any host step is not settled by an empty run. Unreached hosts were
+    not modified and need no repair.
     """
     data = latest.get(run)
     if not data or data.get("state") in ("completed", "partial", "running"):
-        return False
-    broken = {host for host in data.get("hosts") or {}
+        return {}, False
+    broken = {host: step for host, step in (data.get("hosts") or {}).items()
               if _step(data, host) not in (_HEALTHY, _DEFERRED)}
     proved = False
     for name in sorted(latest, key=ids.get):
@@ -463,10 +467,16 @@ def _repaired(run: str, latest: dict, ids: dict, descends) -> bool:
         if not healthy or not descends(data.get("sha"), other["sha"]):
             continue
         proved = True
-        broken -= {host for host in broken
-                   if _step(other, host) in (_HEALTHY, _DEFERRED)}
+        broken = {host: step for host, step in broken.items()
+                  if _step(other, host) not in (_HEALTHY, _DEFERRED)}
         if not broken:
-            return True
+            break
+    return broken, proved
+
+
+def _repaired(run: str, latest: dict, ids: dict, descends) -> bool:
+    """#5558: every host `run` left unhealthy was repaired by a later run."""
+    broken, proved = _unrepaired(run, latest, ids, descends)
     return proved and not broken
 
 
@@ -491,10 +501,15 @@ def findings(rows: list[dict], *, now: float, attested=(),
     written after that run's snapshot. #5558: a failure is also settled
     host by host (`_repaired`); `descends(ancestor, descendant)`
     defaults to git ancestry in the clones of `ancestry_repos()`.
+    #5693: failures of one staging authority on a descending line of commits
+    are one alert, carried by the most recent failed or running run of that
+    line, with the union of the hosts still to repair. A newer run that fails
+    before installing settles nothing; it keeps the alert, it does not add a
+    second one.
     """
     latest, ids = _latest_runs(rows)
     proofs = _attested_ids(attested)
-    out = []
+    descends = descends or _git_descends
     # A complete deployment by the same staging authority settles an earlier
     # failure. A partial run settles it only through the hosts it repaired.
     completed = {}
@@ -503,37 +518,101 @@ def findings(rows: list[dict], *, now: float, attested=(),
                 or proofs.get(data.get("sha"), 0) > ids[run]):
             scope = data.get("notify", "")
             completed[scope] = max(completed.get(scope, 0), ids[run])
-    for run, data in latest.items():
-        state = data.get("state")
-        if (state in ("completed", "partial")
+    # #5693: every unsettled run's hosts still to repair, computed once.
+    still_broken = {}
+
+    def remaining(run):
+        if run not in still_broken:
+            still_broken[run] = _unrepaired(run, latest, ids, descends)
+        return still_broken[run]
+
+    def settled(run):
+        data = latest[run]
+        if (data.get("state") in ("completed", "partial")
                 or completed.get(data.get("notify", ""), 0) > ids[run]
                 or proofs.get(data.get("sha"), 0) > ids[run]):
+            return True
+        broken, proved = remaining(run)
+        return proved and not broken
+
+    # Newest first: a failure joins the most recent unsettled run of the same
+    # authority whose commit contains it, so a retry that proves nothing about
+    # the earlier hosts cannot hide or duplicate their alert.
+    groups = []
+    for run in sorted(latest, key=ids.get, reverse=True):
+        if settled(run):
             continue
-        if _repaired(run, latest, ids, descends or _git_descends):
-            continue
+        data = latest[run]
+        for group in groups:
+            head = latest[group[0]]
+            if (head.get("notify", "") == data.get("notify", "")
+                    and isinstance(data.get("sha"), str)
+                    and isinstance(head.get("sha"), str)
+                    and descends(data["sha"], head["sha"])):
+                group.append(run)
+                break
+        else:
+            groups.append([run])
+    out = []
+    for group in groups:
+        run = group[0]
+        data = latest[run]
+        # #5693: the alert is carried by the newest run but keeps the identity
+        # of the first failure of the line (`since`, `reason`): a later retry
+        # neither resolves it nor raises a fresh one. Only a completed,
+        # attested or repaired line makes it disappear; a human ack
+        # acknowledges it without resolving it.
+        first = group[-1]
+        first_data = latest[first]
+        state = data.get("state")
         late = overdue(data, now) if state == "running" else None
-        if state == "running" and late is None:
+        # A running retry keeps the alert of the failures it is replacing:
+        # nothing proves their hosts repaired yet (#5693).
+        replaces_failure = any(latest[member].get("state") in ("failed", "unattested")
+                               for member in group[1:])
+        if state == "running" and late is None and not replaces_failure:
             continue
-        hosts = data.get("hosts") or {}
-        steps = "; ".join(_step_text(host, step)
-                          for host, step in sorted(hosts.items()))
+        hosts = dict(data.get("hosts") or {})
+        for member in group[1:]:
+            for host, step in sorted(remaining(member)[0].items()):
+                hosts.setdefault(host, step)
         installation = _installation_text(hosts)
+        if len(group) == 1:
+            steps = "; ".join(_step_text(host, step)
+                              for host, step in sorted(hosts.items()))
+            detail = ("Staging %s (%s): %s; %s. %sVérifier le lanceur et "
+                      "reprendre la séquence sous verrou, après arrêt "
+                      "prouvé de l'ancien exécutant."
+                      % (run, data["sha"][:12],
+                         late[0] if late
+                         else data.get("reason") or state,
+                         steps or "aucune étape d'hôte terminée",
+                         installation + " " if installation else ""))
+        else:
+            # Compact: the mail body is bounded, so the runs and the hosts
+            # still to repair come before any per-run narration.
+            names = ", ".join("%s (%s)" % (member, latest[member]["sha"][:12])
+                              for member in group)
+            steps = "; ".join(_step_text(host, step)
+                              for host, step in sorted(hosts.items()))
+            detail = ("Staging %s (%s): %s; échecs regroupés : %s; hôtes non "
+                      "réparés : %s. %sVérifier le lanceur et reprendre la "
+                      "séquence sous verrou, après arrêt prouvé de l'ancien "
+                      "exécutant."
+                      % (run, data["sha"][:12],
+                         late[0] if late
+                         else data.get("reason") or state,
+                         names, steps or "aucune étape d'hôte terminée",
+                         installation + " " if installation else ""))
         out.append({"schema": "ameesh-alert/1", "type": "staging_interrupted", "agent": None,
-                    "since": data["started"],
-                    "value": late[1] if late else now - data["started"],
+                    "since": first_data["started"],
+                    "value": late[1] if late else now - first_data["started"],
                     "threshold": (late[2] if late
-                                  else data["deadline"] - data["started"]),
+                                  else first_data["deadline"] - first_data["started"]),
                     "run": run, "sha": data["sha"], "hosts": hosts,
-                    "reason": run, "urgent": True,
+                    "reason": first, "urgent": True,
                     "orchestrators": [data["notify"]] if data.get("notify") else [],
-                    "detail": "Staging %s (%s): %s; %s. %sVérifier le lanceur et "
-                              "reprendre la séquence sous verrou, après arrêt "
-                              "prouvé de l'ancien exécutant."
-                              % (run, data["sha"][:12],
-                                 late[0] if late
-                                 else data.get("reason") or state,
-                                 steps or "aucune étape d'hôte terminée",
-                                 installation + " " if installation else "")})
+                    "detail": detail})
     return out
 
 
