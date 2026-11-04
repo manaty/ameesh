@@ -461,11 +461,14 @@ class WorkflowTest(unittest.TestCase):
         cls.text = WORKFLOW.read_text(encoding="utf-8")
         cls.jobs = yaml.safe_load(cls.text)["jobs"]
 
-    def test_qualification_est_bornee_et_limitee_au_push_main(self):
+    def test_qualification_tourne_sur_tous_les_evenements(self):
+        # actions/runner#491 : un job sauté fait sauter **transitivement** les
+        # jobs aval de `plan` sans fonction de statut. La qualification n'a
+        # donc aucune porte d'événement : son script rend `ordinary_event`
+        # hors push de main, sans lecture git ni API.
         job = self.jobs["qualification"]
+        self.assertNotIn("if", job)
         self.assertEqual(job["timeout-minutes"], 5)
-        self.assertIn("github.event_name == 'push'", job["if"])
-        self.assertIn("refs/heads/main", job["if"])
         self.assertEqual(job["permissions"]["checks"], "read")
         self.assertEqual(job["permissions"]["actions"], "read")
         steps = job["steps"]
@@ -496,7 +499,9 @@ class WorkflowTest(unittest.TestCase):
         for option in ("--qualified ", "--qualified-packet ",
                        "--qualified-head ", "--qualified-tree ", "--ref "):
             self.assertIn(option, step["run"])
-        self.assertIn("needs.qualification.outputs.reuse", step["run"])
+        # N P2 d'auditeur : la voie qualifiée suit la décision **appliquée**
+        # par le plan, pas seulement la preuve du job de qualification.
+        self.assertIn("needs.plan.outputs.reuse", step["run"])
 
 
 if __name__ == "__main__":  # pragma: no cover

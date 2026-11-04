@@ -306,9 +306,14 @@ jobs:
   # `reuse=false` : la suite complète reste due (fermé par défaut). Une panne
   # de ce job ne rougit pas main : `continue-on-error` laisse la suite
   # ordinaire se faire, et `plan` reste lancé par `!cancelled()`.
+  #
+  # AUCUNE porte d'événement : un job sauté ferait sauter **transitivement**
+  # les jobs aval de `plan` qui n'ont pas de fonction de statut (psycopg,
+  # psql, fs-class, doc-readers, platform-macos, python314, profil-nu ;
+  # actions/runner#491). Le job tourne donc sur tous les événements ; le
+  # script rend `ordinary_event` hors push de main, sans lecture git ni API.
   qualification:
     name: qualification (arbre du paquet)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.event.label.name != 'ci-macos'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
@@ -1422,7 +1427,7 @@ jobs:
             --plateforme-macos "${{ needs.platform-macos.result }}" \
             --autre-fs "${{ needs.fs-class.result }}" \
             --ref "${{ github.ref }}" \
-            --qualified "${{ needs.qualification.outputs.reuse }}" \
+            --qualified "${{ needs.plan.outputs.reuse }}" \
             --qualified-packet "${{ needs.qualification.outputs.packet }}" \
             --qualified-head "${{ needs.qualification.outputs.head }}" \
             --qualified-tree "${{ needs.qualification.outputs.tree }}" \
