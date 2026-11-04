@@ -1772,4 +1772,10 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
                                    orchestrators=orchestras)
     except Exception:  # an unavailable control never drops the other alerts
         pass
+    # #5695: a fingerprints source refused for hours was a silent unit failure
+    from . import fingerprints
+    try:
+        out += fingerprints.alerts(db, now, orchestrators=orchestras)
+    except Exception:  # an unreadable state never drops the other alerts
+        pass
     return out

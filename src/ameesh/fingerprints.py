@@ -67,6 +67,13 @@ MAX_REVISION = 120
 MAX_FINGERPRINT = 200
 MAX_SEEN = 64
 MAX_TITLE = 200
+#: #5695: a source that refuses the token (401/403) is retried at most every
+#: 15 min, not at its 1 min cadence: the token is not coming back by itself,
+#: the ``fingerprints_source_failing`` alert carries the gesture instead
+AUTH_RETRY_S = 900.0
+#: #5695: a source failing longer than this raises ``fingerprints_source_failing``
+FAILING_ALERT_S = 900.0
+_AUTH_REFUSED_RE = re.compile(r": HTTP (401|403)\b")
 
 _APP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _KEY_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,200}$")
@@ -600,7 +607,8 @@ def tick(cfg, db, *, now: float | None = None, log=None,
         # Explicit refusal, like a missing GitHub key: never a silent pass.
         for decl in decls:
             try:
-                storage.of(db).fingerprints.fail(decl.project, decl.url, str(exc))
+                storage.of(db).fingerprints.fail(decl.project, decl.url, str(exc),
+                                                 now=now)
             except Exception:  # noqa: BLE001 - the refusal is the point
                 pass
         raise FingerprintError(str(exc)) from None
@@ -619,12 +627,23 @@ def tick(cfg, db, *, now: float | None = None, log=None,
             emit("fingerprints %s: next read in %ds"
                  % (decl.project, max(1, int(decl.interval - (moment - float(last_ts))))))
             continue
+        # #5695: AG2 failed 1 365 times on 03/11 on one rejected token.  A
+        # refused token is retried every AUTH_RETRY_S, its refusal kept in
+        # `last_error` (the alert reads it), instead of failing each minute.
+        tried_ts = (state or {}).get("updated_ts")
+        retry = max(decl.interval, AUTH_RETRY_S)
+        if (auth_refused((state or {}).get("last_error")) and tried_ts is not None
+                and moment - float(tried_ts) < retry):
+            emit("fingerprints %s: token refused (%s); next try in %ds"
+                 % (decl.project, (state or {}).get("last_error"),
+                    max(1, int(retry - (moment - float(tried_ts))))))
+            continue
         try:
             payload = read_page(decl, cursor, token, opener=opener)
             entries, next_cursor = parse_page(payload)
         except FingerprintError as exc:
             failures.append(str(exc))
-            storage.of(db).fingerprints.fail(decl.project, decl.url, str(exc))
+            storage.of(db).fingerprints.fail(decl.project, decl.url, str(exc), now=now)
             continue
         except Exception as exc:  # noqa: BLE001 - one source never hides another
             text = ("fingerprints source %s: %s" % (decl.project, type(exc).__name__))
@@ -664,3 +683,53 @@ def tick(cfg, db, *, now: float | None = None, log=None,
     if failures:
         raise FingerprintError("; ".join(failures)[:1000])
     return results
+
+
+def auth_refused(error) -> bool:
+    """#5695: the recorded failure is the source refusing the token."""
+    return bool(_AUTH_REFUSED_RE.search(str(error or "")))
+
+
+def alerts(db, now: float, *, orchestrators=(), after_s: float = FAILING_ALERT_S) -> list:
+    """#5695: ``fingerprints_source_failing``, one per source still failing.
+
+    A source is failing while its state keeps a ``last_error``; it alerts
+    once its last complete read (or, never read, its first failure) is older
+    than ``after_s``.  The alert goes to the orchestrators of the source's
+    project: a refused token is renewed on the source side
+    (``FINGERPRINTS_READ_TOKEN`` for Nexlink), then written, 0600, on every
+    candidate host of the elected role.  Never reads the token itself.
+    """
+    from .exploitation import _alert
+    out = []
+    for row in storage.of(db).fingerprints.failing():
+        # A source never read has no healthy moment to wait from: it alerts
+        # at once (`since` unknown), a read source after `after_s`.
+        since = row.get("last_read_ts")
+        if since is not None:
+            since = float(since)
+            if now - since < after_s:
+                continue
+        project = row["project"]
+        error = str(row.get("last_error") or "")
+        if auth_refused(error):
+            gesture = ("the source refuses the read-only token: renew it on the source "
+                       "side (Nexlink: FINGERPRINTS_READ_TOKEN, asked of its owner, "
+                       "never read from another process) and write it, 0600, to %s "
+                       "(or the file named by %s) on every candidate host of the "
+                       "elected role; the pass retries every %ds"
+                       % (DEFAULT_TOKEN_FILE, TOKEN_ENV, int(AUTH_RETRY_S)))
+        else:
+            gesture = "the pass retries at its declared cadence"
+        detail = ("Failure fingerprints source %s (%s) failing since %s: %s. "
+                  "No new fingerprint lot can open meanwhile (canon §16). Action: %s."
+                  % (project, row.get("url") or "?",
+                     time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(since))
+                     if since is not None else "its first read",
+                     error[:300], gesture))
+        out.append(_alert("fingerprints_source_failing", None, since,
+                          None if since is None else max(0.0, now - since),
+                          after_s, detail,
+                          project=project, auth_refused=auth_refused(error),
+                          orchestrators=list(orchestrators)))
+    return out

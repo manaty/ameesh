@@ -9,9 +9,18 @@ class FingerprintWatch(interface.FingerprintWatch):
     def state(self, project):
         rows = self.db.query(
             "SELECT cursor, extract(epoch FROM last_read_at) AS last_read_ts,"
-            "       last_error FROM fingerprint_watch_state"
+            "       last_error, extract(epoch FROM updated_at) AS updated_ts"
+            " FROM fingerprint_watch_state"
             " WHERE project = %s", (str(project or ""),))
         return rows[0] if rows else None
+
+    def failing(self):
+        return self.db.query(
+            "SELECT project, url, last_error,"
+            "       extract(epoch FROM last_read_at) AS last_read_ts,"
+            "       extract(epoch FROM updated_at) AS updated_ts"
+            " FROM fingerprint_watch_state WHERE last_error <> ''"
+            " ORDER BY project")
 
     def advance(self, project, url, cursor, *, now=None):
         self.db.execute(
@@ -30,9 +39,9 @@ class FingerprintWatch(interface.FingerprintWatch):
         self.db.execute(
             "INSERT INTO fingerprint_watch_state"
             "    (project, url, cursor, last_read_at, last_error, updated_at)"
-            " VALUES (%s, %s, NULL, NULL, %s, now())"
+            " VALUES (%s, %s, NULL, NULL, %s, coalesce(to_timestamp(%s), now()))"
             " ON CONFLICT (project) DO UPDATE SET"
             "    url = EXCLUDED.url,"
             "    last_error = EXCLUDED.last_error,"
-            "    updated_at = now()",
-            (str(project or ""), str(url or ""), str(error or "")[:500]))
+            "    updated_at = EXCLUDED.updated_at",
+            (str(project or ""), str(url or ""), str(error or "")[:500], now))

@@ -736,6 +736,37 @@ class IncompatibleSchema(DbError):
     """The database has a non-additive migration absent from this code."""
 
 
+def pending_non_additive_from(known, done,
+                              ) -> list[tuple[Migration, list[str]]]:
+    """Le calcul de `pending_non_additive` sur un inventaire déjà lu."""
+    out = []
+    for migration in known:
+        if migration.version in done:
+            continue
+        reasons = non_additive(migration)
+        if reasons:
+            out.append((migration, reasons))
+    return out
+
+
+def pending_non_additive(db, directory: str = MIGRATIONS_DIR,
+                         ) -> list[tuple[Migration, list[str]]]:
+    """#5692 : les migrations manquantes que le code d'avant ne survivrait pas.
+
+    Lecture seule (comme `status`), pour le doctor, les alertes et le
+    préflight de staging. `require_compatible_writer` garde l'autre sens (la
+    base est en avance sur ce code) ; ici le code est en avance sur la base :
+    `migrate --additive-only` refuse ces migrations, et les appliquer exige
+    les exécuteurs arrêtés. Le rattrapage lui-même n'est pas fait ici."""
+    return pending_non_additive_from(discover(directory), set(_applied_readonly(db)))
+
+
+def describe_pending_non_additive(items) -> str:
+    """Les libellés et raisons d'un `pending_non_additive`, en une ligne."""
+    return ", ".join("%s (%s)" % (migration.label, "; ".join(reasons))
+                     for migration, reasons in items)
+
+
 def marker_available(db) -> bool:
     return bool(db.query(
         "SELECT to_regclass('schema_non_additive_migrations') IS NOT NULL AS ok"

@@ -435,6 +435,48 @@ Codes de sortie du vérifier : `0` conforme, `1` écart constaté, `2` manifeste
 ou entrée invalide. Le script ne crée aucun compte, clé, DSN, unité ou
 privilège ; il ne fait aucun geste d'hôte.
 
+### Préparation et activation par la bascule (#5711)
+
+Le venv de staging se pose par la bascule, dans le contrat ci-dessus :
+`venv-staging.py produire ... --scelle` produit le manifeste de l'artefact
+réellement posé, puis `bascule.py preparer` reçoit le paquet verrouillé et le
+vérificateur :
+
+```sh
+python3 deploy/mise-a-jour/venv-staging.py produire \
+  --clone ~/work/ameesh-release --tag vX.Y.Z \
+  --lock ~/staging/paquet/requirements-staging.lock \
+  --wheelhouse ~/staging/paquet/wheelhouse \
+  --python /usr/bin/python3 --scelle \
+  --output ~/staging/manifeste/venv-vX.Y.Z.json
+
+python3 deploy/mise-a-jour/bascule.py preparer \
+  --venv ~/.local/share/ameesh/venv --src ~/work/ameesh-release \
+  --version <sha7> --python /usr/bin/python3 \
+  --lock ~/staging/paquet/requirements-staging.lock \
+  --wheelhouse ~/staging/paquet/wheelhouse \
+  --manifeste ~/staging/manifeste/venv-vX.Y.Z.json \
+  --verificateur deploy/mise-a-jour/venv-staging.py
+python3 deploy/mise-a-jour/bascule.py activer \
+  --venv ~/.local/share/ameesh/venv --version <sha7> [--precedent <sha7>]
+```
+
+`preparer` crée le venv avec l'invite fixe `ameesh` (N2), installe depuis le
+wheelhouse local sans index (`--no-index`, `--require-hashes`,
+`--only-binary=:all:`, `--no-compile`, `PYTHONDONTWRITEBYTECODE=1`), écrit le
+marqueur `.pret` déterministe, scelle (#2763 : `pip` refusé, `lib/` et `bin/`
+en lecture seule), puis vérifie le manifeste **après** scellement. Le
+manifeste de format 3 décrit cet état scellé (scripts `pip*` de lanceur
+`scelle`, modes en lecture seule, marqueur inclus) ; un venv non scellé, ou
+dont un octet ou un mode diffère, est refusé et aucun marqueur n'est laissé.
+Le contrôle d'imports verrouillé porte sur `psycopg`, `psutil` et `ameesh` :
+le paquet opérateur standard n'inclut pas l'extra `cryptography` (#3619),
+réservé au venv historique d'hôte. Une version déjà marquée complète est
+revérifiée avant d'être réputée prête : un arbre modifié après préparation ne
+passe pas. Les quatre options vont ensemble ; sans elles, `preparer` garde le
+chemin historique (source + index) : le staging en cours et les VM d'agents ne
+changent qu'au moment de la pose L2, pas à la fusion de #5711.
+
 ## Signal « staging actif » (#1323)
 
 Le signal est porté par
@@ -476,6 +518,19 @@ Provisionner un hôte neuf comprend donc ce clone complet (jamais `--depth` ni
 ```sh
 ssh root@<vm> 'runuser -u ameesh -- git clone https://github.com/manaty/ameesh.git /home/ameesh/work/ameesh-release'
 ```
+
+#5692 : avant la sauvegarde, le préflight joue aussi `migrate --dry-run
+--additive-only` sur toute base qu’il touchera — sur la VM qui migre, et sur le
+poste avec `poste.sh prevol REF` (base du mesh puis
+`config-ancienne-base.json`). Une migration non additive en attente sur la base
+du mesh arrête la séquence **avant** la sauvegarde ; une base secondaire du
+poste en échec (migration non additive, base ou configuration illisible) ne
+retient que lui : le poste est déclaré `absent`/`reporte` d’emblée et les
+quatre VM passent, migrations depuis une VM. `ameesh doctor`
+affiche un WARN par base (la secondaire comprise), `doctor --probe --all-bases` est KO (la sonde mono-base reste celle du déploiement), et
+`ameesh alerts` porte `migration_pending_non_additive` pour la base du mesh
+comme `host_migration_pending_non_additive` pour une base secondaire, avec les
+migrations et la base en clair (DSN masqué).
 
 Un `DEPOT_VM` différent se déclare dans l’environnement du lanceur. Lancée hors
 du poste et des VM d’agents (bureau-goal,

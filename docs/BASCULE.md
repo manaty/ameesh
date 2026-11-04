@@ -1027,6 +1027,16 @@ The `installer` step follows the same practice.
 
 1. `poste.sh verifier`: target databases (without password), runners, SSH
    access to the server. Nothing is modified.
+1 bis. `poste.sh prevol [REF]` (#5692): `ameesh migrate --dry-run
+   --additive-only` from REF's snapshot on **every configured base**, the mesh
+   database and the old one (`config-ancienne-base.json`). Read-only on the
+   databases. Code 0: no non-additive migration waits; 3: the mesh database
+   waits for one (the staging sequence stops there, before any backup); 4:
+   only a secondary base fails, non-additive or unreadable (the workstation is
+   declared deferred from the outset, its update at its return, and the VMs
+   still go); 1: another failure. `ameesh doctor` warns per base,
+   `doctor --probe --all-bases` is KO (the mono-base `--probe` stays the deployment gate), and the
+   `migration_pending_non_additive` alert names the waiting migrations.
 2. `poste.sh sauvegarder`: the server backup (`ameesh-sauvegarde`) dumps the
    mesh database on the VM into its guarded local copy, then `poste.sh`
    retrieves that dump compressed over SSH into `~/backups/ameesh/`, checking
@@ -1342,6 +1352,16 @@ drain and recovery procedure. An installed symlink cannot authorise a
 non-additive migration; this command never disables its additive guard.
 Rollback of such a separately approved operation requires the database backup.
 
+#5692: this refusal is announced **before** the staging spends a backup on it.
+`ameesh doctor` prints `migrations : WARNING …` per configured base (the
+secondary one included, read from `config-ancienne-base.json`), and its
+`--probe` is KO with the non-additive migrations named. `ameesh alerts` raises
+one `migration_pending_non_additive` per base, and the staging preflight runs
+`migrate --dry-run --additive-only` on every base it will touch — on the
+migrating VM, and on the workstation with `poste.sh prevol REF`, which
+declares the workstation deferred from the outset when only a secondary base
+is blocked. Catching up a non-additive migration remains #4792.
+
 **New dependency.** The new code is run with the packages of the venv
 in place. If REF adds a dependency that `ameesh migrate` needs,
 `migrer` fails at import: first install that dependency in the venv
@@ -1398,6 +1418,23 @@ partial directory and leaves the active version untouched. `src-current` and
 `deploy/mise-a-jour/bascule.py` (`preparer`, `activer --precedent`, `retour`,
 `menage`, `etat`), copied to the VM (server and agents) so that install and
 rollback use the same version whatever commit is deployed.
+
+Since #5711, `preparer` can also take the locked operator package of #5666:
+`--lock`, `--wheelhouse`, `--manifeste` and `--verificateur` together. It then
+creates the venv with the fixed `ameesh` prompt, installs from the local
+wheelhouse only (`--no-index`, `--require-hashes`, `--only-binary=:all:`,
+`--no-compile`, `PYTHONDONTWRITEBYTECODE=1`), writes the deterministic `.pret`
+marker, seals the venv (#2763: `pip` refuses, `lib/` and `bin/` read-only) and
+verifies the sealed tree against the format-3 manifest with
+`venv-staging.py`. Any byte or mode difference refuses the preparation; a
+venv already prepared for that version with another package is refused rather
+than silently reused, and a version marked complete is verified again before
+being considered ready. The locked import controls cover `psycopg`, `psutil`
+and `ameesh`: the standard operator package does not carry the `cryptography`
+extra (#3619), which stays required only for the historical host venv. Without
+the four options, the historical source-path preparation is unchanged, so
+merging the code does not change the live staging venv or the agent VMs before
+the L2 pose.
 
 Each update creates a complete venv, and `menage` (#3792) stops them from
 accumulating: `activer` applies it at the end of a successful switch
