@@ -401,6 +401,14 @@ def check_wait_note(cfg, db, actor: str, text: str, *,
             "\"hold: <reason>\" to hold (or \"unhold: <reason>\" to lift); "
             "variants such as \"hold :\", \"hold (pilote) :\" or \"Hold —\" "
             "stay ordinary notes and stop nothing (#3373)")
+    buried = planned_waits.buried_hold_marker(text)
+    if buried is not None:
+        raise WorkError(
+            "note carries a hold marker that is not at its start (%r): only the "
+            "start of a note is read, so it holds or lifts nothing. Put it first "
+            "(\"hold: <reason>\" or \"unhold: <reason>\", the rest after it), or "
+            "quote it (\"hold:\" between quotes or backticks) if it is a "
+            "citation (#5735)" % buried)
     if planned_waits.is_hold_note(text):
         if claims_pilot(cfg, db, actor):
             return corrector(cfg, db, actor, what="hold", history=False)
