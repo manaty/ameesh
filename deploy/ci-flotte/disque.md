@@ -202,3 +202,34 @@ Retour rétention :
 avant de retirer ses fichiers et conserve la configuration et les archives.
 Les jobs GitHub continuent leur ménage habituel. La sonde GitHub est
 indépendante : ne la désactiver qu'avec une surveillance de remplacement.
+
+## Marge avant une part et temporaires de tests (#5742)
+
+Les parts Linux de `tests.yml` (psycopg, psql, autre-fs) et `carte.yml`
+passent par `python3 scripts/ci-test-space.py -- <commande de la part>`.
+Avant tout import de test, le wrapper vérifie 5 Gio disponibles sur `/`, le
+workspace et `RUNNER_TEMP`, et 1 Gio sur le parent temporaire choisi par le
+job (dont le tmpfs du banc autre-fs). Chaque volume avec une table d'inodes
+bornée doit aussi conserver 10 000 inodes disponibles. Une mesure illisible
+ou insuffisante refuse la part avec le code 75 et une annotation « CI non
+concluante » : aucun test n'est exécuté, aucun flux vert n'est fabriqué.
+
+La garde mesure la marge au démarrage ; elle ne réserve pas de blocs contre
+les autres jobs, les auto-updates ou Docker. Elle arrive après les étapes de
+préparation du job et ne peut protéger un Worker qui échoue avant le checkout.
+Le rapport et la rétention par VM restent donc nécessaires ; une capacité
+insuffisante sous charge exige toujours un dimensionnement de la flotte.
+
+Le wrapper crée un dossier privé, au nom court pour les sockets Unix, dans
+le parent temporaire du job. `TMPDIR`, `TMP` et `TEMP` des tests et de leurs
+sous-processus pointent dedans. À la fin, succès comme échec, il arrête leur
+groupe de processus et enlève ce dossier seul. Une annulation TERM/INT suit
+le même nettoyage. La racine autre-fs reste choisie par le workflow ; les
+artefacts et les flux dans `RUNNER_TEMP` restent disponibles pour publication.
+
+Cette récupération immédiate complète le ménage de plus de 48 h : elle
+évite que les `mkdtemp` abandonnés par les imports ou les tests s'accumulent
+entre deux suites. Elle ne supprime ni les temporaires des autres parts ni
+ceux écrits explicitement hors de ce dossier. Après SIGKILL ou arrêt brutal
+de la VM, le dossier peut rester ; la rétention conservatrice prend le relais.
+Ne pas abaisser sa garde d'âge pour récupérer de la place pendant des jobs.

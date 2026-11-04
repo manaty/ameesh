@@ -885,7 +885,7 @@ jobs:
           > "$RUNNER_TEMP/publier.log" 2>&1 &
       - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
         run: >-
-          .venv-ci/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
+          python3 scripts/ci-test-space.py -- .venv-ci/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
           --part ${{ matrix.part }} --driver psycopg --flow "$RUNNER_TEMP/flux.jsonl"
           --parallel 2
       - &fermer
@@ -995,7 +995,7 @@ jobs:
       - *publier
       - name: part ${{ matrix.part }}
         run: >-
-          python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
+          python3 scripts/ci-test-space.py -- python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
           --part ${{ matrix.part }} --driver psql --flow "$RUNNER_TEMP/flux.jsonl"
           --parallel 2
       - *fermer
@@ -1137,7 +1137,7 @@ jobs:
       - *publier
       - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
         run: >-
-          .venv-ci/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
+          python3 scripts/ci-test-space.py -- .venv-ci/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
           --part ${{ matrix.part }} --driver psycopg --flow "$RUNNER_TEMP/flux.jsonl"
       - *fermer
       - *resume
