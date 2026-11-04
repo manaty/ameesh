@@ -24,6 +24,9 @@ GIB = 1024 ** 3
 MIN_LIBRE_GIB = 5.0
 MIN_TMP_GIB = 1.0  # le banc autre-fs dispose d'un tmpfs distinct
 MIN_INODES = 10000
+#: #5754 : vocabulaire fermé des volumes vérifiés (même liste que
+#: `ci_disk.VOLUMES`). Le courrier ne recopie jamais un chemin du code testé.
+VOLUMES = ("root", "runner_temp", "cwd", "tmp")
 
 
 def verifier(chemin: Path, minimum_gib: float) -> None:
@@ -40,6 +43,19 @@ def verifier(chemin: Path, minimum_gib: float) -> None:
         raise erreur
 
 
+def verifier_volume(chemin: Path, minimum_gib: float, volume: str) -> None:
+    """Vérifie un volume et nomme le volume en cause sur le refus (#5754).
+
+    Le nom vient de `VOLUMES`, jamais du chemin : l'erreur peut être lue par le
+    pilote sans transporter de texte libre.
+    """
+    try:
+        verifier(chemin, minimum_gib)
+    except OSError as erreur:
+        erreur.ci_volume = volume
+        raise
+
+
 def signaler_refus(erreur):
     """Signal numérique uniquement levant ; aucun fichier à écrire sous ENOSPC."""
     event = {"schema": "ameesh-ci-disk-refusal/1",
@@ -48,6 +64,7 @@ def signaler_refus(erreur):
              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
              "attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
              "sampled_ts": time.time(),
+             "volume": getattr(erreur, "ci_volume", None),
              "free_bytes": getattr(erreur, "ci_free_bytes", None),
              "available_inodes": getattr(erreur, "ci_available_inodes", None),
              "required_bytes": getattr(erreur, "ci_required_bytes", None)}
@@ -102,10 +119,11 @@ def executer(commande: list[str]) -> int:
     parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
     try:
         # Le Worker écrit sur / et RUNNER_TEMP même quand les tests sont en tmpfs.
-        verifier(Path("/"), MIN_LIBRE_GIB)
-        verifier(Path(os.environ.get("RUNNER_TEMP") or parent), MIN_LIBRE_GIB)
-        verifier(Path.cwd(), MIN_LIBRE_GIB)
-        verifier(parent, MIN_TMP_GIB)
+        verifier_volume(Path("/"), MIN_LIBRE_GIB, "root")
+        verifier_volume(Path(os.environ.get("RUNNER_TEMP") or parent), MIN_LIBRE_GIB,
+                        "runner_temp")
+        verifier_volume(Path.cwd(), MIN_LIBRE_GIB, "cwd")
+        verifier_volume(parent, MIN_TMP_GIB, "tmp")
         dossier = tempfile.TemporaryDirectory(prefix="ci-", dir=parent)
     except OSError as erreur:
         print("::warning::CI non concluante : marge disque insuffisante ou "

@@ -510,6 +510,15 @@ class CiResults(interface.CiResults):
             "WHERE repo = %s AND host = %s AND event_id = %s",
             (message_id, repo, host, event_id))
 
+    def dismiss_disk_refusal(self, repo, *, host, event_id) -> None:
+        # #5754 : 0 = consommée sans courrier (aucun identifiant de message
+        # n'est nul) ; la purge des acquittés après 8 jours s'applique comme
+        # pour un courrier réel.
+        self.db.execute(
+            "UPDATE ci_disk_refusals SET message_id = 0 "
+            "WHERE repo = %s AND host = %s AND event_id = %s",
+            (repo, host, event_id))
+
     def claim_disk_dispatch(self, repo, *, now, interval_s) -> bool:
         return bool(self.db.query(
             "INSERT INTO ci_disk_dispatch AS d (repo, requested_at) "
