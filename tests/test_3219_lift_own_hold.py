@@ -614,8 +614,11 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         self.assertEqual(retention["what"], "unreadable")
         # la fusion datée par la forge (sync-github) : avant, après, inconnue
         since = time.time()
-        for merged_ts, what in ((since - 3600, "stale-freeze"), (since + 3600, None),
-                                (None, "unreadable")):
+        slack = plan_git.CLOCK_SLACK_S
+        for merged_ts, what in ((since - 3600, "stale-freeze"),
+                                (since + slack - 1, "stale-freeze"),   # marge prudente
+                                (since + slack + 1, None),
+                                (since + 3600, None), (None, "unreadable")):
             retention = plan_git.content_retention(
                 st, row, entered_before=plan_git.merged_at(merged_ts))
             self.assertEqual((retention or {}).get("what"), what)
