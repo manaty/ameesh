@@ -245,6 +245,17 @@ class FreshTest(HoraireBase):
         self.assertEqual((rc, alert.call_count), (ph.STALE_RC, 0))
 
 
+class UnitTest(unittest.TestCase):
+    def test_sortie_3_n_est_pas_un_echec_de_l_unite(self):
+        from ameesh import role_timers
+        unit = (ROOT / "deploy" / "systemd" / "ameesh-paquet-horaire.service").read_text(
+            encoding="utf-8")
+        self.assertIn("SuccessExitStatus=%d" % ph.STALE_RC, unit.splitlines())
+        with mock.patch.object(role_timers, "_check_bin", side_effect=lambda b: b):
+            rendered = role_timers.render_paquet_service(role="mesh-design")
+        self.assertIn("SuccessExitStatus=%d" % ph.STALE_RC, rendered.splitlines())
+
+
 class TickAlertTest(HoraireBase):
     def test_empreinte_stable_d_une_heure_a_l_autre(self):
         one = ph.tick_fingerprint(ph.HoraireError("paquet-auto rc 1 pour h-20261103-12"))
