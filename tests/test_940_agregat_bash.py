@@ -100,6 +100,13 @@ class WorkflowContractTest(unittest.TestCase):
         "inputs.psql-full": "--psql-full",
         "needs.platform-macos.result": "--plateforme-macos",
         "needs.fs-class.result": "--autre-fs",
+        # #5729 : la décision appliquée par le plan et la réf du run ; les
+        # détails de la preuve viennent du job de qualification.
+        "github.ref": "--ref",
+        "needs.plan.outputs.reuse": "--qualified",
+        "needs.qualification.outputs.packet": "--qualified-packet",
+        "needs.qualification.outputs.head": "--qualified-head",
+        "needs.qualification.outputs.tree": "--qualified-tree",
     }
 
     #: les sorties de plan (JSON) sont citées en simple, le reste en double

@@ -95,13 +95,14 @@ class WorkflowTest(unittest.TestCase):
         # L161f : les matrices du plan sont vides pour une PR de documentation
         self.assertIn("if: needs.plan.outputs.psycopg != '[]'", self.text)
         self.assertIn("if: needs.plan.outputs.psql != '[]'", self.text)
-        self.assertIn("if: needs.plan.outputs.code == 'true'", self.text)
+        self.assertIn("needs.plan.outputs.code == 'true'", self.text)
         self.assertIn("if: needs.plan.outputs.docs_only == 'true'", self.text)
         self.assertIn("python -m unittest -v ${{ needs.plan.outputs.doc_readers }}", self.text)
         # #3251 : la garde des lecteurs vit dans le classifieur de l'agrégat
         # (scripts/ci-agregat.py) ; l'étape lui passe les deux sorties.
-        self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, "
-                      "doc-readers, fs-class]", self.text)
+        # #5729 : la qualification entre dans les needs de l'agrégat.
+        self.assertIn("needs: [qualification, plan, version, psycopg, psql, "
+                      "platform-macos, doc-readers, fs-class]", self.text)
         self.assertIn('--docs-only "${{ needs.plan.outputs.docs_only }}"', self.text)
         self.assertIn('--doc-readers "${{ needs.doc-readers.result }}"', self.text)
 
