@@ -7,6 +7,21 @@
 # persona's `ameesh show --json`, and `heure_base <args…>`, which prints the
 # database clock in epoch seconds (a lease expires at a database time).
 
+# #5734 : fenêtre de reprise du bail, réglable par les bancs. En production,
+# 24 essais espacés de 5 s (les deux minutes qui suivent un redémarrage) ; un
+# banc la ramène à un seul essai pour ne pas payer 24 lectures réelles sous
+# charge. Les valeurs par défaut ne changent pas le comportement.
+BAIL_ESSAIS=${BAIL_ESSAIS:-24}
+BAIL_ECART=${BAIL_ECART:-5}
+if ! [[ $BAIL_ESSAIS =~ ^[1-9][0-9]*$ ]]; then
+  echo "BAIL_ESSAIS invalide : « $BAIL_ESSAIS » (entier > 0 attendu)" >&2
+  exit 2
+fi
+if ! [[ $BAIL_ECART =~ ^[0-9]+$ ]]; then
+  echo "BAIL_ECART invalide : « $BAIL_ECART » (secondes attendues)" >&2
+  exit 2
+fi
+
 bail_epoque() {  # stdin: show JSON → lease epoch (0 when absent)
   python3 -c 'import json,sys; print(int(json.loads(sys.stdin.read() or "{}").get("lease_epoch") or 0))'
 }
@@ -53,10 +68,10 @@ sys.exit(0 if row.get("status") == "stopped" or (
 attendre_bail() {  # epoch-before expected-owner, then the arguments of lire_bail
   local avant=$1 attendu=$2 heure essai
   shift 2
-  for ((essai = 0; essai < 24; essai++)); do
+  for ((essai = 1; essai <= BAIL_ESSAIS; essai++)); do
     heure=$(heure_base "$@") && lire_bail "$@" | bail_valide "$avant" "$attendu" "$heure" \
       && return 0
-    if ((essai < 23)); then sleep 5; fi
+    if ((essai < BAIL_ESSAIS)); then sleep "$BAIL_ECART"; fi
   done
   return 1
 }
