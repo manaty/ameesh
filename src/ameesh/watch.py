@@ -18,7 +18,8 @@ last 30 minutes nothing is sent, otherwise a short `--info` note is deposited
 (read at the next turn). A changed reading sends the instruction shipped with
 the package (`consignes/veille.md`, versioned), from `veille`, and stores the
 fingerprint on the watch row; a change seen within 30 minutes of the agent's
-own turn is only recorded, so the watch does not wake it for its own work. An
+own turn is kept pending (nothing sent, the next firing whose turn is older
+sends it). An
 unreadable reading never mutes the watch: the instruction is sent.
 The watch is recorded in the database (`agent_watches`, 0362): `ameesh
 projects` shows it from any host, and enabling or disabling it is noted in
@@ -879,8 +880,8 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
     sent while its last note is still unread, nothing when the agent had a
     turn within `RECENT_TURN_S`, otherwise a short passive (`--info`) note is
     deposited. A changed reading sends the instruction and the fingerprint is
-    stored on the watch row; a change seen right after a turn is recorded
-    without a message (the agent already worked on it). A reading that cannot
+    stored on the watch row; a change seen right after a turn is kept pending
+    (nothing sent until a firing whose turn is older). A reading that cannot
     be made never mutes the watch: the instruction is sent.
 
     The host check, the message, `last_sent_ts` and the fingerprint are one
@@ -932,21 +933,12 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
                         "nothing sent" % agent)
             passive = True
         elif recent:
-            # The agent just worked; the change is recorded without a wake,
-            # so the next firing does not wake it for its own work.
-            try:
-                stored = storage.of(db).watches.deliver(agent, host, None, reading=digest)
-            except Exception as exc:  # noqa: BLE001 — the unit fails, visible
-                raise WatchError("recording the reading of %s failed: %s"
-                                 % (agent, exc)) from exc
-            if stored is None:
-                return "no watch of %s: nothing sent (ameesh watch disable --agent %s " \
-                       "removes this timer)" % (agent, agent)
-            if stored["host"] != host:
-                return "the watch of %s is on %s: nothing sent from here" % (agent,
-                                                                             stored["host"])
+            # B/P2 cx3 : never consume a change on the strength of a recent
+            # turn. The change may be external or have happened after the
+            # agent's last turn; it stays pending, and the first firing whose
+            # turn is older sends the instruction.
             return ("watch of %s: changed, but a turn within %d min: nothing sent "
-                    "(reading recorded)" % (agent, RECENT_TURN_S // 60))
+                    "(change kept pending)" % (agent, RECENT_TURN_S // 60))
     text = UNCHANGED_TEXT % agent if passive else instruction(agent)
     payload = {"info": True} if passive else None
     if mail_send is None:

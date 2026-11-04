@@ -295,24 +295,22 @@ class WatchTest(PgTestCase):
         self.assertEqual(note["body"], watch.UNCHANGED_TEXT % "w121")
         self.assertNotEqual(note["body"], watch.consigne("w121"))
         self.assertEqual(storage.of(self.db).watches.list("w121")[0]["last_reading"], first)
-        # a changed reading right after a turn is recorded without a message:
-        # the agent is not woken for its own work ...
+        # a changed reading right after a turn is kept pending, never
+        # consumed: the change may be external or have happened after the
+        # turn (B/P2 cx3 on #5698) ...
         storage.of(self.db).mailbox.mark_delivered([int(note["id"])])
         self.db.execute(
             "UPDATE agent_registry SET status_since = now(), last_turn_at = now()"
             " WHERE name = 'w121'")
         work.add(self.db, title="a change the watch must see", app="ameesh")
-        self.assertIn("nothing sent (reading recorded)",
-                      watch.send(self.here, self.db, "w121"))
+        self.assertIn("change kept pending", watch.send(self.here, self.db, "w121"))
         self.assertEqual([m for m in storage.of(self.db).mailbox.unread("w121", 200)
                           if m["sender"] == "veille"], [])
-        recorded = storage.of(self.db).watches.list("w121")[0]["last_reading"]
-        self.assertNotEqual(recorded, first)
-        # ... and a later change, with no recent turn, sends the instruction
+        self.assertEqual(storage.of(self.db).watches.list("w121")[0]["last_reading"], first)
+        # ... and the first firing whose turn is older sends that same change
         self.db.execute(
             "UPDATE agent_registry SET status_since = now() - interval '1 hour',"
             " last_turn_at = now() - interval '1 hour' WHERE name = 'w121'")
-        work.add(self.db, title="a second change the watch must see", app="ameesh")
         self.assertEqual(watch.send(self.here, self.db, "w121"),
                          "instruction sent to w121")
         [last] = [m for m in storage.of(self.db).mailbox.unread("w121", 200)
@@ -320,7 +318,7 @@ class WatchTest(PgTestCase):
         self.assertFalse((last["payload"] or {}).get("info"))
         self.assertEqual(last["body"], watch.consigne("w121"))
         self.assertNotEqual(storage.of(self.db).watches.list("w121")[0]["last_reading"],
-                            recorded)
+                            first)
 
     def test_an_unreadable_reading_never_mutes_the_watch(self):
         # #5698: the reading is a comfort, not a gate; if it cannot be made,

@@ -1066,11 +1066,11 @@ class Watches(Domain):
         read (with `sent` true or false), None if there is no watch; `send`
         raising rolls the transaction back.
 
-        #5698 : `send=None` sends nothing (a firing whose reading did not
-        change, or a change the agent already saw in a recent turn) and only
-        records `reading` as the watch's last reading fingerprint. `reading`
-        is stored in the same transaction as the message, so a failed firing
-        leaves neither the message nor the fingerprint."""
+        #5698 : `send=None` sends nothing and only records `reading` as the
+        watch's last reading fingerprint (a caller that must record a reading
+        without depositing a message). `reading` is stored in the same
+        transaction as the message, so a failed firing leaves neither the
+        message nor the fingerprint."""
 
 
 # --------------------------------------------------------------------------
