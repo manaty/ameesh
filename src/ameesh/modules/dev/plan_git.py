@@ -60,9 +60,9 @@ best-effort :
   périmée. Un clone que personne ne fetch ne fermait jamais les lots livrés
   par un paquet ; si le fetch échoue, le relevé continue sur les refs lues.
 
-#2744 : une fermeture par contenu est retenue tant que le lot est `blocked`
-ou qu'une note `hold:` n'est pas levée (le contenu fusionné est constaté, le
-journal le dit, le détenteur est réveillé, le lot reste ouvert) ; le contrôle
+#2744/#5774 : une fermeture par contenu est retenue tant que le lot est
+`blocked` ou `waiting_human`, ou qu'une note `hold:` n'est pas levée (le
+contenu fusionné est constaté, le journal le dit, le détenteur est réveillé, le lot reste ouvert) ; le contrôle
 et la fermeture partagent le verrou de ligne du lot avec les notes hold/lift
 (`work.close_merged(content_guard=…)`), et une lecture du journal en erreur
 retient aussi. #3219 : les retenues ordinaires de l'assigné (règle 1) ne
@@ -70,7 +70,10 @@ retiennent pas — le contenu prouvé les lève et la note de fusion garde la
 trace ; celles d'un pilote ou d'un autre acteur retiennent, même recouvertes
 par celle de l'assigné et après sa levée (les holds sont un ensemble, pas une
 pile). `sync-branches` et les unités de paquet (`sync-packets`) portent la
-même garde.
+même garde. #5774 : pour un lot passé par `waiting_human`, le gel doit
+attester la reprise après la décision, même levée ; sinon seul un nouveau
+gel ou une clôture explicite permet de terminer le lot. C'est conservateur :
+la date d'un commit Git ne prouve pas sa date d'entrée dans la cible.
 
 Un lot absorbé par un autre ou remplacé se clôt par
 `ameesh work close <id> --superseded-by <id>` ; jamais de réouverture d'un
@@ -1291,14 +1294,14 @@ def _packet_delivery(repo: str, lot: int, members: list[dict], refs: list[tuple]
 
 #: #2744 : états qui retiennent la fermeture par le contenu — le lot peut être
 #: livré sans être clos (une passe, une décision ou un déblocage restent dus).
-CONTENT_HELD_STATES = ("blocked",)
+CONTENT_HELD_STATES = ("blocked", "waiting_human")
 
 
 def content_retention(st, row: dict) -> dict | None:
     """#2744 : la retenue qui empêche de fermer un lot par son contenu.
 
-    Un lot `blocked`, ou sous une note `hold: …` non levée (#1664), n'est pas
-    fermé par le contenu : sa livraison est constatée, sa fermeture attend la
+    Un lot `blocked`/`waiting_human`, ou sous une note `hold: …` non levée
+    (#1664), n'est pas fermé par le contenu : sa livraison est constatée, sa fermeture attend la
     levée. `planned_waits.explicit_holds` est la seule lecture des hold : une
     note `unhold:` ou un changement d'état lève la retenue. Une lecture du
     journal qui échoue rend une retenue `unreadable` : une erreur ne doit
@@ -1311,7 +1314,12 @@ def content_retention(st, row: dict) -> dict | None:
     fusion (`lift: True`). Les retenues d'un pilote ou d'un autre acteur
     restent actives et retiennent : les holds sont un ensemble, pas une pile,
     donc un hold de pilote recouvert par celui de l'assigné garde son effet.
-    Sa levée reste un geste autorisé (règle #1664)."""
+    Sa levée reste un geste autorisé (règle #1664).
+
+    #5774 : pour un lot passé par waiting_human, ces levées ne permettent
+    pas de réutiliser un gel antérieur au cycle de décision. La barrière
+    historique est lue sous le même verrou que la fermeture ; elle impose un nouveau gel ou un acte
+    explicite de clôture, sans heuristique sur le titre ou le projet."""
     row = row or {}
     try:
         lot = int(row["id"])
@@ -1347,6 +1355,9 @@ def content_retention(st, row: dict) -> dict | None:
             else:
                 retained.append(hold)
         if own and not retained:
+            barrier = _historical_content_retention(st, row, events)
+            if barrier is not None:
+                return barrier
             last = max(own, key=lambda hold: float(hold.get("since") or 0.0))
             lift = "levée du hold de l'assigné %s" % assignee
             reason = _hold_reason(last)
@@ -1363,6 +1374,46 @@ def content_retention(st, row: dict) -> dict | None:
             motif += " : %s" % reason
         return {"what": "hold", "motif": motif, "by": by,
                 "since": chosen.get("since")}
+    return _historical_content_retention(st, row, events)
+
+
+def _historical_content_retention(st, row: dict, events: list[dict]) -> dict | None:
+    # #5774 : après une mise en attente, l'ancien gel peut ne représenter
+    # que la préparation d'un acte opérateur encore dû. Même une levée ne
+    # transforme pas ce contenu historique en preuve de l'acte. On ne date
+    # pas une entrée dans la cible avec l'horloge d'un commit Git : seul un
+    # nouveau gel, ou une clôture explicite, peut remplacer cette preuve.
+    # Une attente ordinaire levée n'est pas un acte encore dû : #3219 et
+    # la fermeture d'un paquet après unhold restent valables. La barrière
+    # historique vise le cycle de décision, même après son passage en qa.
+    decisions = [e for e in events if e.get("state") == "waiting_human"]
+    if not decisions:
+        return None
+    barriers = [e for e in events
+                if e.get("state") in CONTENT_HELD_STATES
+                or planned_waits.is_hold_note(e.get("note"))]
+    if barriers:
+        lot = int(row["id"])
+        try:
+            freeze = latest_freeze(st.work.milestones(lot, limit=None))
+            decision_ts = max(float(e.get("created_ts") or 0) for e in decisions)
+            # Un nouveau gel termine ce cycle de décision : les attentes
+            # ordinaires suivantes ne doivent pas réarmer la barrière.
+            if freeze and decision_ts and float(freeze.get("at_ts") or 0) > decision_ts:
+                return None
+            last = max(barriers, key=lambda e: (float(e.get("created_ts") or 0),
+                                                int(e.get("id") or 0)))
+            since = float(last.get("created_ts") or 0)
+            if freeze is None or not since or float(freeze.get("at_ts") or 0) <= since:
+                return {"what": "stale-freeze",
+                        "motif": "gel antérieur à la dernière mise en attente : "
+                                 "nouveau gel ou close --delivered requis",
+                        "by": str(row.get("assignee") or ""), "since": since}
+        except Exception as exc:  # noqa: BLE001 — preuve illisible : on retient
+            return {"what": "unreadable",
+                    "motif": "historique des gels illisible (%s: %s)"
+                             % (type(exc).__name__, " ".join(str(exc).split())[:120]),
+                    "by": str(row.get("assignee") or ""), "since": None}
     return None
 
 
@@ -1485,9 +1536,11 @@ def _wake_retention(db, row: dict, retention: dict, *, entry: dict, target: str)
     if not recipient:
         return
     ref = str(entry.get("ref") or entry.get("sha") or "")
-    lift = ("lift the hold (a state change or an `unhold:` note) and the next "
-            "content sweep will close it")
-    if retention.get("what") == "production":
+    lift = ("resolve the remaining wait; if the freeze predates that wait, record "
+            "a new freeze or explicitly close --delivered after verifying the act")
+    if retention.get("what") == "stale-freeze":
+        lift = "record a new freeze for the remaining work or explicitly close --delivered"
+    elif retention.get("what") == "production":
         # #3022 : c'est la présence sur la branche de prod qui ferme
         lift = ("it closes once the fix reaches the production branch (release or "
                 "incident fix); a wrong mark is lifted by a `prod-gate lifted:` note")

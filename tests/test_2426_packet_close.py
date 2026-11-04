@@ -49,7 +49,7 @@ class PacketCloseTest(_PlanDb):
 
     def package(self, items: list[dict], *, withdrawn: set | None = None,
                 manifest: bool = True, trailer: bool = True,
-                branch: str = "integration/paquet-test") -> list[dict]:
+                branch: str = "integration/paquet-test", before_merge=None) -> list[dict]:
         """Compose un paquet de `len(items)` unités, chacune depuis `main`, puis
         fusionne la branche du paquet dans `main`. Rend `[{lot, source, unit}]`.
 
@@ -88,6 +88,8 @@ class PacketCloseTest(_PlanDb):
             write(self.repo, "reviews/integration-paquet-test.md", "\n".join(rows))
             git(self.repo, "add", "-A")
             git(self.repo, "commit", "-q", "-m", "manifeste — %d unités" % len(units))
+        if before_merge is not None:
+            before_merge(units)
         git(self.repo, "checkout", "-q", "main")
         git(self.repo, "merge", "-q", "--no-ff", "-m",
             "Merge pull request #1 from manaty/%s" % branch, branch)
@@ -188,6 +190,22 @@ class PacketCloseTest(_PlanDb):
         git(self.repo, "merge", "-q", "--no-ff", "-m", "livraison", "lot/%d-refreeze"
             % first["id"])
         self.assertEqual(self.sync()["results"][0]["result"], "merged")
+
+    def test_5774_gel_hold_unhold_puis_paquet_ferme_sans_regel(self):
+        item = self.item("lot ordinaire en attente du paquet")
+
+        def before_merge(units):
+            self.freeze(item, units[0]["source"])
+            work.note(self.db, item["id"], "hold: attendre la fenêtre", actor="human:alice")
+            work.note(self.db, item["id"], "unhold: fenêtre ouverte", actor="human:alice")
+
+        self.package([item], before_merge=before_merge)
+        self.assertEqual(self.by_lot(self.sync(dry_run=True))[item["id"]]["result"],
+                         "would-merge")
+        self.assertEqual(self.by_lot(self.sync())[item["id"]]["result"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
+        self.assertEqual(len([m for m in work.milestones(self.db, item["id"])
+                              if m["kind"] == "frozen"]), 1)
 
     def test_2744_un_lot_blocked_n_est_pas_ferme_par_le_paquet(self):
         """#2744 : une unité bloquée garde sa fermeture, le contenu du paquet
