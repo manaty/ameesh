@@ -30,7 +30,8 @@
 # suite psql entière passe de nuit : .github/workflows/psql-nocturne.yml
 # appelle ce workflow (workflow_call) avec l'entrée `psql-full` — psql sur
 # tous les modules, aucune part psycopg (déjà passée sur chaque poussée de
-# main). Le nocturne n'est jamais le check requis d'une PR.
+# main, ou sur l'arbre identique du paquet réutilisé, #5729). Le nocturne
+# n'est jamais le check requis d'une PR.
 # #1476 : 16 psql + 8 psycopg = 24 jobs, la taille du pool de #1468 ; le
 # découpage suit les durées mesurées (scripts/test-plan.py, PARTS), jamais ce
 # fichier (rééquilibrage : #3754).
@@ -56,6 +57,18 @@
 # cette suite (`workflow_call`) que si aucune PR ouverte ne couvre la tête
 # exacte, et son check n'est jamais nommé `tests` (incident #1342 : deux suites
 # complètes, l'agrégat rouge du run push annulé bloquait la PR #1050).
+#
+# #5729 — le push de `main` qui suit la fusion d'un paquet ne relance plus la
+# suite sur un arbre déjà testé. Le job `qualification`
+# (scripts/ci/qualified-tree.py) prouve, par `git rev-parse <sha>^{tree}` et
+# par la conclusion du run, que le commit poussé est le merge commit d'une PR
+# `integration/**` fusionnée sur `main`, que son arbre est identique à celui
+# de la tête de cette PR, et que le check `tests` et le run `tests.yml` de
+# cette tête sont verts. `plan` vide alors les parts et l'agrégat `tests`
+# conclut vert en nommant la preuve ; toute lecture incomplète, tout autre
+# push (direct, release/**, arbre différent) garde la suite complète (fermé
+# par défaut). Le nocturne psql reste cohérent : psycopg a bien passé sur cet
+# arbre, dans le run de la PR de paquet.
 #
 # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
 # toujours les tests de contrat (tests/parts/toujours.txt : droits, rôles,
@@ -283,6 +296,47 @@ env:
 # (`bilan`, after the priority pool of #1468) is `continue-on-error` and is
 # NOT in the `needs` of `tests`.
 jobs:
+  # #5729 — le push de main qui suit la fusion d'un paquet relançait la suite
+  # entière sur un arbre déjà testé : le merge commit et la tête de la PR
+  # `integration/**` ont le même arbre, et le run `tests` de la PR est vert
+  # (canon §12). Ce job lit la preuve (PR fusionnée dont le commit poussé est
+  # le merge commit, arbre identique, check `tests` et run `tests.yml` verts
+  # sur la tête) et n'en publie rien : il alimente seulement `plan`, qui vide
+  # alors les parts. Toute lecture incomplète, ambiguë ou en échec rend
+  # `reuse=false` : la suite complète reste due (fermé par défaut). Une panne
+  # de ce job ne rougit pas main : `continue-on-error` laisse la suite
+  # ordinaire se faire, et `plan` reste lancé par `!cancelled()`.
+  qualification:
+    name: qualification (arbre du paquet)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.event.label.name != 'ci-macos'
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: read  # la PR fusionnée associée au commit poussé
+      actions: read        # le run `tests` qui a publié le check
+      checks: read         # le check `tests` de la tête du paquet
+    outputs:
+      reuse: ${{ steps.proof.outputs.reuse }}
+      packet: ${{ steps.proof.outputs.packet }}
+      head: ${{ steps.proof.outputs.head }}
+      tree: ${{ steps.proof.outputs.tree }}
+      detail: ${{ steps.proof.outputs.detail }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      # La décision est dans le script (pur, testé hors Actions) : il refuse
+      # par défaut, écrit `reuse=false` et ne fait jamais échouer la preuve.
+      - name: preuve d'arbre qualifié (#5729)
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/qualified-tree.py
+          --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+
   # L157, L161a, L161f : nature of the change (version or documentation only,
   # lot PR only; merge commit against its target), the branch context
   # (release PRs keep the full suite) and the plan of the run, from the map
@@ -294,7 +348,11 @@ jobs:
     # l'étiquette étrangère et le check requis `tests` rougirait sur une PR
     # par ailleurs verte. Tous les jobs la portent ; le job `tests` change en
     # plus de nom, pour ne jamais publier le contexte requis sans tests.
-    if: github.event.label.name != 'ci-macos'
+    # #5729 : `needs: qualification` ; `!cancelled()` et non `success()` —
+    # une qualification en échec (ou sautée sur une PR) ne saute jamais le
+    # plan : sans preuve, la suite complète reste due.
+    needs: qualification
+    if: ${{ !cancelled() && github.event.label.name != 'ci-macos' }}
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     # #1635 : dispatch-guard.py lit les PR ouvertes
@@ -314,10 +372,15 @@ jobs:
       # la tête demandée par l'étiquette (payload), tracée et comparée
       AMEESH_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       AMEESH_CI_LABEL: ${{ github.event.label.name }}
+      # #5729 : la preuve d'arbre qualifié du job `qualification` ; vide hors
+      # d'un push de main, ou si la preuve est absente/illisible.
+      AMEESH_CI_REUSE: ${{ needs.qualification.outputs.reuse }}
+      AMEESH_CI_REUSE_DETAIL: ${{ needs.qualification.outputs.detail }}
     outputs:
       client_types: ${{ steps.client_types.outcome }}
       version_only: ${{ steps.plan.outputs.version_only }}
       docs_only: ${{ steps.plan.outputs.docs_only }}
+      reuse: ${{ steps.plan.outputs.reuse }}
       doc_readers: ${{ steps.plan.outputs.doc_readers }}
       code: ${{ steps.plan.outputs.code }}
       psycopg: ${{ steps.plan.outputs.psycopg }}
@@ -577,6 +640,7 @@ jobs:
             --base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF" \
             --base-ref "$BASE_REF" --head-ref "$HEAD_REF" --mode "$AMEESH_CI_MODE" \
             --psql-full "$PSQL_FULL" \
+            --reuse "$AMEESH_CI_REUSE" --reuse-detail "$AMEESH_CI_REUSE_DETAIL" \
             --github-output "$GITHUB_OUTPUT" \
             --summary "$GITHUB_STEP_SUMMARY" --annotations
       - id: release
@@ -1117,7 +1181,7 @@ jobs:
   platform-macos:
     name: plateforme macOS
     needs: plan
-    if: needs.plan.outputs.code == 'true' && github.event.label.name != 'ci-macos'
+    if: needs.plan.outputs.reuse != 'true' && needs.plan.outputs.code == 'true' && github.event.label.name != 'ci-macos'
     runs-on: macos-26-intel
     timeout-minutes: 20
     env:
@@ -1180,7 +1244,7 @@ jobs:
     name: bilan des impactés
     # #876 : « always() » seul recrée le job après l'annulation de l'exécution
     # (il reste queued des heures, puis la conclut en rouge) ; !cancelled() le saute.
-    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true' && github.event.label.name != 'ci-macos'
+    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.reuse != 'true' && needs.plan.outputs.code == 'true' && github.event.label.name != 'ci-macos'
     needs: [plan, psycopg, psql]
     # Union #1256 x #1468 : le pool prioritaire d'abord, puis l'hôte prêté
     # quand un prêt est armé, puis la flotte ordinaire. `bilan` est hors de la
@@ -1273,7 +1337,7 @@ jobs:
     # #3198 : hors demande de gel (étiquette `ci-macos`), il saute et change de
     # nom — jamais de `tests` vert sans tests.
     if: always() && github.event.label.name != 'ci-macos'
-    needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
+    needs: [qualification, plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
@@ -1357,6 +1421,11 @@ jobs:
             --psql-full "${{ inputs.psql-full }}" \
             --plateforme-macos "${{ needs.platform-macos.result }}" \
             --autre-fs "${{ needs.fs-class.result }}" \
+            --ref "${{ github.ref }}" \
+            --qualified "${{ needs.qualification.outputs.reuse }}" \
+            --qualified-packet "${{ needs.qualification.outputs.packet }}" \
+            --qualified-head "${{ needs.qualification.outputs.head }}" \
+            --qualified-tree "${{ needs.qualification.outputs.tree }}" \
             --publish
       # #856 : réconciliation indépendante du publisher — un runner arrêté
       # (#747) tue le publisher ET l'étape `close`, et le check « tests (flux) »
@@ -1387,7 +1456,7 @@ jobs:
     name: Python 3.14 smoke (optional)
     continue-on-error: true
     needs: plan
-    if: github.event.label.name != 'ci-macos' && needs.plan.outputs.code == 'true'
+    if: github.event.label.name != 'ci-macos' && needs.plan.outputs.reuse != 'true' && needs.plan.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -1430,7 +1499,7 @@ jobs:
   profil-nu:
     name: profil nu (modules)
     needs: plan
-    if: github.event.label.name != 'ci-macos' && needs.plan.outputs.code == 'true'
+    if: github.event.label.name != 'ci-macos' && needs.plan.outputs.reuse != 'true' && needs.plan.outputs.code == 'true'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:

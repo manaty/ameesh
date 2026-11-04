@@ -1891,7 +1891,8 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
               head: str = "HEAD", repo: pathlib.Path = REPO,
               base: str = "HEAD^1", ref: str = "",
               base_ref: str | None = None, head_ref: str | None = None,
-              mode: str = "auto", psql_full: bool = False) -> dict:
+              mode: str = "auto", psql_full: bool = False,
+              reuse: bool = False, reuse_detail: str = "") -> dict:
     """The plan of one run; `mode` says which CI this is (canon §3).
 
     `auto` (default): inferred from the event, as before — a pull request
@@ -1906,6 +1907,12 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     #3749 : outside a lot, psql runs its pilot list and the contract, not the
     whole suite; `psql_full` (the night run) gives psql every module and
     psycopg no part.
+
+    #5729 : `reuse` porte la preuve d'arbre qualifié du job `qualification`
+    (scripts/ci/qualified-tree.py). Sur un push de `main` seulement, il vide
+    les deux plans de parts : la tête a déjà passé la suite complète sur le
+    même arbre dans le run `tests` de sa PR de paquet. Partout ailleurs, ou
+    sans preuve, le plan ordinaire (suite complète) s'applique.
     """
     now = now or datetime.datetime.now(datetime.timezone.utc)
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
@@ -1924,6 +1931,34 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
             "psql_full": psql_full, "docs_fallback": False,
             "refs": {"base": base_ref, "head": head_ref},
             **nature(event, base=base, head=head, repo=repo, ref=ref)}
+    #: #5729 : une qualification de paquet ne se réutilise que sur le push de
+    #: `main`, jamais sur une PR, une release ou un dispatch. Le job
+    #: `qualification` a déjà refusé les autres cas ; ce garde-fou est local
+    #: à la décision de plan, pour qu'un appel direct ne puisse pas vider les
+    #: parts d'une autre cible.
+    if reuse and event == "push" and _branch(ref) == "main" and mode == "auto":
+        plan.update({
+            "reuse": True,
+            "reuse_detail": reuse_detail,
+            "version_only": False, "docs_only": False, "doc_readers": [],
+            "release": "", "docs_fallback": False,
+            "why": "qualified tree reused (%s): no part rerun"
+                   % (reuse_detail or "packet proof"),
+            "map": None, "changed": 0, "sure": True,
+            "phase2_safe": False, "phase2_why": "",
+            "lot_safe": False, "unsure": [], "untested": [],
+            "unknown_blocks": [], "foundation": [], "removed": [],
+            "importers": {}, "certified": {}, "uncovered": [],
+            "contract": [], "always": [], "transverse": {},
+            "classes": {m: ["P3", ""] for m in modules},
+            "selection": {"mode": "reused", "why": "qualified packet tree",
+                          "modules": len(modules), "impacted": 0,
+                          "contract": 0, "selected": 0, "skipped": 0,
+                          "impacted_estimate_s": 0, "total_estimate_s": 0},
+            "parts": {driver: [] for driver in PARTS},
+        })
+        return plan
+    plan["reuse"] = False
     if mode in ("lot", "full"):
         #: canon §3 (#1343) : une demande de gel (ci-lot ou ci-full) ne prend
         #: jamais une voie qui saute les tests — le contrat tourne au minimum,
@@ -2080,7 +2115,7 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
     modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
             "version_only": False, "docs_only": False, "why": why, "mode": mode,
-            "release": release, "psql_full": psql_full,
+            "release": release, "psql_full": psql_full, "reuse": False,
             "refs": {"base": base_ref, "head": head_ref},
             "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
@@ -2130,6 +2165,7 @@ def outputs(plan: dict) -> dict[str, str]:
     """Job outputs (`$GITHUB_OUTPUT`) read by the parts through `fromJSON`."""
     out = {"version_only": str(plan["version_only"]).lower(),
            "docs_only": str(plan["docs_only"]).lower(),
+           "reuse": str(bool(plan.get("reuse"))).lower(),
            "doc_readers": " ".join(f"tests.{m}" for m in plan["doc_readers"]),
            "code": str(not (plan["version_only"] or plan["docs_only"])).lower()}
     for driver, ps in plan["parts"].items():
@@ -2167,6 +2203,11 @@ def _listing(items: list[str]) -> str:
 
 
 def summary(plan: dict) -> str:
+    if plan.get("reuse"):
+        return ("### Test plan\n\n* arbre qualifié réutilisé (%s) : aucune part "
+                "relancée ; la tête de `main` a déjà passé la suite complète sur "
+                "le même arbre (lot #5729).\n"
+                % (plan.get("reuse_detail") or "preuve du paquet"))
     lines = ["### Test plan", ""]
     m = plan.get("map")
     if m is None:
@@ -2382,6 +2423,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--psql-full", default="false",
                    help="true: the psql night run (#3749), the whole suite under "
                         "psql and no psycopg part; anything else: false")
+    p.add_argument("--reuse", default="false",
+                   help="true: reuse the packet qualification of an identical "
+                        "tree on a push to main (#5729); no part is planned")
+    p.add_argument("--reuse-detail", default="",
+                   help="the proof text (packet, head, tree, run) for the summary")
     p.add_argument("--github-output", help="appends the job outputs to this file")
     p.add_argument("--summary", help="appends the Markdown summary to this file")
     p.add_argument("--annotations", action="store_true",
@@ -2419,13 +2465,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "plan":
         psql_full = args.psql_full.strip().lower() == "true"
+        reuse = args.reuse.strip().lower() == "true"
         card, why = _load_map(args.map)
         if card is None and args.map:
             print(f"map: {why}", file=sys.stderr)
         try:
             plan = make_plan(args.event, card, base=args.base, ref=args.ref,
                              base_ref=args.base_ref, head_ref=args.head_ref,
-                             mode=args.mode, psql_full=psql_full)
+                             mode=args.mode, psql_full=psql_full,
+                             reuse=reuse, reuse_detail=args.reuse_detail)
         except Exception as exc:  # planning must never block the suite
             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
             plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",

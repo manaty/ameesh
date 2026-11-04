@@ -100,6 +100,12 @@ class WorkflowContractTest(unittest.TestCase):
         "inputs.psql-full": "--psql-full",
         "needs.platform-macos.result": "--plateforme-macos",
         "needs.fs-class.result": "--autre-fs",
+        # #5729 : la preuve d'arbre qualifié et la réf du run.
+        "github.ref": "--ref",
+        "needs.qualification.outputs.reuse": "--qualified",
+        "needs.qualification.outputs.packet": "--qualified-packet",
+        "needs.qualification.outputs.head": "--qualified-head",
+        "needs.qualification.outputs.tree": "--qualified-tree",
     }
 
     #: les sorties de plan (JSON) sont citées en simple, le reste en double
