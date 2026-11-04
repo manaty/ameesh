@@ -75,6 +75,9 @@ class RealStateGuardTest(unittest.TestCase):
         for event, args, blamed in (
                 ("open", (path, "w", 0), path),
                 ("open", (path, "a", 0), path),
+                # B1 ameesh-cx2 : un chemin bytes ne doit pas lever TypeError.
+                ("open", (os.fsencode(path), "w", 0), path),
+                ("open", (os.fsencode(path), None, os.O_WRONLY | os.O_CREAT), path),
                 ("open", (path, None, os.O_WRONLY | os.O_CREAT), path),
                 ("os.mkdir", (folder, 0o700, None), folder),
                 ("os.rename", ("/tmp/ailleurs", path), path),
@@ -83,12 +86,20 @@ class RealStateGuardTest(unittest.TestCase):
                     self.assertRaises(state_guard.RealStateWrite) as caught:
                 state_guard.check(event, args)
             self.assertIn(blamed, str(caught.exception))
-        # Lecture, écriture hors de l'état réel : permises.
+        # Lecture, écriture hors de l'état réel, descripteur : permis.
         state_guard.check("open", (path, "r", 0))
         state_guard.check("open", (path, None, os.O_RDONLY))
+        state_guard.check("open", (3, "w", 0))
         with tempfile.TemporaryDirectory(prefix="ameesh-5804-") as bac:
             state_guard.check("open", (os.path.join(bac, "actif-x.json"), "w", 0))
+            state_guard.check("open", (os.fsencode(os.path.join(bac, "bies.json")),
+                                       "w", 0))
             state_guard.check("os.mkdir", (os.path.join(bac, "neuf"), 0o700, None))
+            # Le symptôme du B1, de bout en bout : une vraie écriture bytes
+            # hors état protégé passe le hook (avant le correctif : TypeError).
+            with open(os.fsencode(os.path.join(bac, "reel-bytes.json")),
+                      "w", encoding="utf-8") as stream:
+                stream.write("ok")
 
     def test_guarded_child_cannot_materialise_the_fixture(self):
         with tempfile.TemporaryDirectory(prefix="ameesh-5804-garde-") as tmp:

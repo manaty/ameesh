@@ -66,6 +66,22 @@ def installed_roots() -> tuple:
     return _roots
 
 
+def _normalise(path):
+    """Le chemin en absolu texte, ou None si ce n'est pas un chemin.
+
+    Les événements d'audit peuvent porter un chemin `bytes` (open de
+    `os.fsencode(x)`). `os.fspath` le laisserait en `bytes`, et la comparaison
+    `bytes.startswith(str)` lèverait TypeError sur une écriture pourtant
+    permise (B1 ameesh-cx2, #5804) ; `os.fsdecode` accepte `str` et `bytes`
+    et rend toujours `str`. Un descripteur de fichier (`open(fd)`) n'est pas
+    un chemin : TypeError, traité comme tel.
+    """
+    try:
+        return os.path.abspath(os.fsdecode(path))
+    except (TypeError, ValueError):
+        return None
+
+
 def _inside(path, root: str) -> bool:
     """Le chemin lexical `path` est-il sous `root` ?
 
@@ -73,9 +89,8 @@ def _inside(path, root: str) -> bool:
     `open` du processus et ne doit pas déclencher d'appels système. Un lien
     symbolique qui contournerait le chemin lexical n'est pas le constat visé.
     """
-    try:
-        path = os.path.abspath(os.fspath(path))
-    except (TypeError, ValueError):
+    path = _normalise(path)
+    if path is None:
         return False
     return path == root or path.startswith(root + os.sep)
 
@@ -117,7 +132,7 @@ def check(event: str, args) -> None:
                     "(%s). Un test isole son état : rediriger HOME vers un "
                     "dossier temporaire (voir tests/test_2448_release_cutoff.py, "
                     "ReleaseFixtureMixin) ; l'état réel ne se salit pas depuis "
-                    "un test." % os.path.abspath(os.fspath(path)))
+                    "un test." % _normalise(path))
 
 
 def _hook(event: str, args) -> None:
