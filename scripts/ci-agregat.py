@@ -180,22 +180,29 @@ def disk_infrastructure(job: dict, text: str) -> bool:
             r"|System\.IO\.IOException:.*No space left on device)", re.I)
         def disk_block(block):
             lines = [line.strip() for line in block.splitlines() if line.strip()]
-            final = lines[-1] if lines else ""
+            # Le message de la dernière exception peut couvrir plusieurs lignes.
+            exceptions = [i for i, line in enumerate(lines)
+                          if re.match(r"[\w.]+(?:Error|Exception):", line)]
+            if not exceptions:
+                return False
+            final_index = exceptions[-1]
+            final = lines[final_index]
+            message = "\n".join(lines[final_index:])
             # Seul un code de retour non nul comparé à zéro peut remonter
             # stderr ; les comparaisons de chaînes restent négatives.
             returncode = re.match(r"AssertionError: -?[1-9][0-9]* != 0 : (.+)$", final)
-            if returncode and disk.search(returncode.group(1)):
+            if returncode and disk.search(message):
                 return True
             if re.search(r"not found in| != |does not match|not raised", final, re.I):
                 return False
             if final_disk.search(final):
                 return True
             if re.match(r"AssertionError: git |(?:[\w.]+\.)?_ProvenanceError:", final):
-                return bool(re.search(r"\[Errno 28\]", final))
+                return bool(disk.search(message))
             if re.match(r"subprocess\.CalledProcessError:", final):
                 # Preuve dans stderr ou la cause du même bloc, pas le source.
                 return any(re.match(r"(?:OSError: \[Errno 28\]|(?:fatal|error):.*No space left on device)",
-                                    line, re.I) for line in lines[:-1])
+                                    line, re.I) for line in lines[:final_index])
             return False
 
         if len(blocks) != len(headers) or not all(disk_block(block) for block in blocks):

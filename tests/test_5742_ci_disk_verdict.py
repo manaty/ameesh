@@ -74,6 +74,25 @@ class EvidenceTest(unittest.TestCase):
         self.assertFalse(agregat.disk_infrastructure(job(), traceback(
             "AssertionError: git init: 'No space left on device' not found in '[Errno 28]'")))
 
+    def test_stderr_multiligne_du_run_41811687787(self):
+        for evidence in (
+                "AssertionError: 1 != 0 : OSError: [Errno 28] No space left on device\n\n"
+                "During handling of the above exception, another exception occurred:\n"
+                "...\nOSError: [Errno 28] No space left on device\n"
+                "gpgconf --kill gpg-agent en échec sur ameesh-ci-1\n"
+                "étape GnuPG en échec : code c0ff11393 installé ; la relancer",
+                "AssertionError: git init -q -b main: error: copy-fd: write returned: No space left on device\n"
+                "fatal: cannot copy 'source' to 'target': No space left on device",
+                "AssertionError: 128 != 0 : fatal: git init failed\n"
+                "fatal: cannot copy: No space left on device"):
+            with self.subTest(evidence=evidence):
+                self.assertTrue(agregat.disk_infrastructure(job(), traceback(evidence)))
+        self.assertFalse(agregat.disk_infrastructure(job(), traceback(
+            "AssertionError: '0fe6' not found in '[Errno 28] No space left on device'")))
+        self.assertFalse(agregat.disk_infrastructure(job(), traceback(
+            "OSError: [Errno 28] No space left on device\n"
+            "AssertionError: regression\nadditional diagnostic")))
+
     def test_code_retour_non_nul_avec_stderr_enospc(self):
         for stderr in ("fatal: cannot mkdir: No space left on device",
                        "fatal: cannot mkdir: [Errno 28]"):
