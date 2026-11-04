@@ -282,6 +282,25 @@ publier_suivi failed
         # longer installed, and the later control does not undo that.
         self.assertIs(rolled_back["hosts"]["vm-1"]["installed"], False)
 
+    def test_a_failed_rollback_clears_the_installed_marker(self):
+        # #5706: `retour ko` leaves the host in an unknown state (the previous
+        # version is not proved reinstalled either): `installed` must not stay
+        # true and let the alert count the host as up to date.
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, """
+trace vm-1 installer ok
+publier_suivi running
+trace vm-1 redemarrer ko
+trace vm-1 retour ko
+publier_suivi failed
+""")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            installed, failed_rollback = self.snapshots(folder)
+        self.assertIs(installed["hosts"]["vm-1"]["installed"], True)
+        self.assertEqual(failed_rollback["hosts"]["vm-1"]["stage"], "retour")
+        self.assertEqual(failed_rollback["hosts"]["vm-1"]["verdict"], "ko")
+        self.assertIs(failed_rollback["hosts"]["vm-1"]["installed"], False)
+
     def test_backup_budget_covers_the_three_dumps_with_one_runner(self):
         with tempfile.TemporaryDirectory() as folder:
             proc = self.harness(folder, """
@@ -465,6 +484,40 @@ class WatchTest(unittest.TestCase):
         self.assertIn("0 installé(s) sur 2 hôte(s)", finding["detail"])
         self.assertIn("retour arrière effectué", finding["detail"])
         self.assertNotIn("préflight seul", finding["detail"])
+
+    def test_alert_names_each_rollback_outcome(self):
+        # #5706: a passed control proves the rollback, a failed control leaves
+        # it applied but unverified, and a failed `retour` is its own outcome.
+        failed = row(1, state="failed", hosts={
+            "vm-1": {"stage": "controle-retour", "verdict": "ok",
+                     "installed": False},
+            "vm-2": {"stage": "controle-retour", "verdict": "ko",
+                     "installed": False},
+            # An older snapshot could still carry the target as installed on a
+            # failed rollback: that uncertain state never counts as installed.
+            "vm-3": {"stage": "retour", "verdict": "ko", "installed": True}})
+        detail = staging_watch.findings([failed], now=150)[0]["detail"]
+        self.assertIn("0 installé(s) sur 3 hôte(s)", detail)
+        self.assertIn("1 retour arrière effectué", detail)
+        self.assertIn("1 retour appliqué mais non vérifié", detail)
+        self.assertIn("1 retour en échec", detail)
+        self.assertNotIn("1 installé(s)", detail)
+
+    def test_a_control_failure_is_not_a_completed_rollback(self):
+        failed = row(1, state="failed", hosts={
+            "vm-1": {"stage": "controle-retour", "verdict": "ko",
+                     "installed": False}})
+        detail = staging_watch.findings([failed], now=150)[0]["detail"]
+        self.assertIn("retour appliqué mais non vérifié", detail)
+        self.assertNotIn("retour arrière effectué", detail)
+
+    def test_an_applied_rollback_without_its_control_is_unverified(self):
+        failed = row(1, state="failed", hosts={
+            "vm-1": {"stage": "retour", "verdict": "ok",
+                     "installed": False}})
+        detail = staging_watch.findings([failed], now=150)[0]["detail"]
+        self.assertIn("retour appliqué mais non vérifié", detail)
+        self.assertNotIn("retour arrière effectué", detail)
 
     def test_alert_never_counts_the_poste_pseudo_host(self):
         failed = row(1, state="failed", hosts={
