@@ -1115,6 +1115,11 @@ L'exécuteur ne relance un agent au repos qu'**une fois** : après un tour de
 relance, il attend du courrier. (#408 : s'il détient un lot actionnable, la règle 1
 le réveille aussi pour ce lot, borné ; `ameesh set auditeur lot_wake=off`
 l'en dispense.) Les passages viennent donc de trois minuteurs.
+
+Depuis #5699, la relance au repos n'ouvre un tour que si une correction est
+due, un avis est dû ou un lot actionnable attend ; tout vide, l'exécuteur
+poste `available: nothing due` et attend, sans tour de modèle. Les passages
+ci-dessous restent donc les seuls tours périodiques de l'auditeur.
 Le passage horaire (`ameesh-auditeur-heure.service` et `.timer`) :
 
 ```ini
