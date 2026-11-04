@@ -1138,10 +1138,13 @@ with open(path, encoding='utf-8') as stream:
             # `verifier/ok` de preflight ne se lise pas comme une installation.
             # `retour ok` reinstalle la version precedente : la cible ne l'est
             # plus (avis auditeur), et `controle-retour ok` ne la remet pas.
+            # #5706 : un `retour ko` laisse l'hote dans un etat incertain ; il
+            # ne prouve pas davantage la cible, et ne doit pas rester compte
+            # comme installe.
             installe = bool(hosts.get(row['hote'], {}).get('installed'))
             if row['etape'] == 'installer' and row['verdict'] == 'ok':
                 installe = True
-            elif row['etape'] == 'retour' and row['verdict'] == 'ok':
+            elif row['etape'] in ('retour', 'controle-retour'):
                 installe = False
             hosts[row['hote']] = {'stage': row['etape'], 'verdict': row['verdict'],
                                   'since': started, 'installed': installe}

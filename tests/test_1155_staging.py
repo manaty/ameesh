@@ -982,6 +982,52 @@ class StagingTest(unittest.TestCase):
         self.assertIn('0 installé(s) sur 5 hôte(s)', finding['detail'])
         self.assertIn('retour arrière effectué', finding['detail'])
 
+    def test_failed_rollback_is_named_and_not_installed(self):
+        # #5706 : le retour lui-meme echoue. `installed` ne doit pas rester
+        # vrai (etat incertain, la version precedente n'est pas prouvee) et le
+        # detail d'alerte nomme un retour en echec, pas un retour effectue.
+        (self.state / 'scenario').write_text(
+            'ko=ameesh-agents-1:redemarrer\nko=ameesh-agents-1:retour\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn(('ameesh-agents-1', 'retour'), self.actions())
+        snapshots = [json.loads(line) for line in
+                     (self.state / 'staging-snapshots.jsonl').read_text().splitlines()]
+        failed = snapshots[-1]
+        self.assertEqual(failed['state'], 'failed')
+        step = failed['hosts']['ameesh-agents-1']
+        self.assertEqual((step['stage'], step['verdict']), ('retour', 'ko'))
+        self.assertIs(step['installed'], False)
+        rows = [dict(id=number, data=snapshot)
+                for number, snapshot in enumerate(snapshots, 1)]
+        from ameesh import staging_watch
+        finding, = staging_watch.findings(rows, now=failed['deadline'] + 1)
+        self.assertIn('retour en échec', finding['detail'])
+        self.assertNotIn('retour arrière effectué', finding['detail'])
+
+    def test_failed_rollback_control_is_not_a_completed_rollback(self):
+        # #5706 : le retour est applique mais son controle echoue. L'alerte
+        # doit dire « applique mais non verifie », jamais « retour arriere
+        # effectue » comme pour un retour sain.
+        (self.state / 'scenario').write_text(
+            'ko=ameesh-agents-1:redemarrer\nko=ameesh-agents-1:controler\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1)
+        snapshots = [json.loads(line) for line in
+                     (self.state / 'staging-snapshots.jsonl').read_text().splitlines()]
+        failed = snapshots[-1]
+        self.assertEqual(failed['state'], 'failed')
+        step = failed['hosts']['ameesh-agents-1']
+        self.assertEqual((step['stage'], step['verdict']),
+                         ('controle-retour', 'ko'))
+        self.assertIs(step['installed'], False)
+        rows = [dict(id=number, data=snapshot)
+                for number, snapshot in enumerate(snapshots, 1)]
+        from ameesh import staging_watch
+        finding, = staging_watch.findings(rows, now=failed['deadline'] + 1)
+        self.assertIn('retour appliqué mais non vérifié', finding['detail'])
+        self.assertNotIn('retour arrière effectué', finding['detail'])
+
     def test_already_installed_workstation_is_not_reinstalled(self):
         court = self.sha[:7]
         (self.home / '.local/share/ameesh').mkdir(parents=True, exist_ok=True)

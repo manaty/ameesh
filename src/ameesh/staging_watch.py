@@ -392,15 +392,38 @@ def _step(data: dict, host: str) -> tuple[str, str]:
     return (str(step.get("stage") or ""), str(step.get("verdict") or ""))
 
 
+def _rollback_outcome(step: dict) -> str:
+    """#5706: how a host's last rollback step ended, or "" without one.
+
+    Only `controle-retour ok` proves a successful rollback: the previous
+    version was reinstalled and its units answered. A `retour ok` waits for
+    that control, a `controle-retour ko` keeps the applied rollback
+    unverified, and a `retour ko` failed (the host's state is unknown).
+    """
+    stage = str(step.get("stage") or "")
+    verdict = str(step.get("verdict") or "")
+    if stage == "controle-retour":
+        return "ok" if verdict == "ok" else "unverified"
+    if stage == "retour":
+        if verdict == "ko":
+            return "failed"
+        if verdict == "ok":
+            return "unverified"
+    return ""
+
+
 def _installation_text(hosts: dict) -> str:
     """#5691: how many hosts proved a target install, against the rest.
 
     Only hosts carrying the boolean `installed` count; an absent/deferred host
     (§14) is not a host awaiting installation. The workstation's `poste`
     pseudo-host is never a host of its own. A rolled-back host is reported
-    apart: its `retour ok` clears `installed`, but the installation did begin.
-    An older snapshot without the field answers nothing, so its alert text is
-    unchanged.
+    apart: its rollback clears `installed`, but the installation did begin.
+    #5706: the rollback outcomes are named apart — successful (control
+    passed), applied but unverified (control failed or still to come), and
+    failed. A failed rollback never counts as an installed target, even from
+    an older snapshot whose `installed` stayed true. An older snapshot without
+    the field answers nothing, so its alert text is unchanged.
     """
     entries = dict(hosts or {})
     # `poste` is the pseudo-host of the workstation's backup/migration steps:
@@ -418,25 +441,43 @@ def _installation_text(hosts: dict) -> str:
              and isinstance(step.get("installed"), bool)]
     if not steps:
         return ""
-    done = sum(1 for step in steps if step["installed"])
+    outcomes = [_rollback_outcome(step) for step in steps]
+    # A rollback attempt means the target commit is not the installed one; a
+    # failed `retour ko` leaves the host in an unknown state, which never
+    # proves the target either.
+    done = sum(1 for step, outcome in zip(steps, outcomes)
+               if not outcome and step["installed"])
     total = len(steps)
-    rolled = sum(1 for step in steps
-                 if stage_of(step) == "controle-retour"
-                 or (stage_of(step) == "retour"
-                     and str(step.get("verdict") or "") == "ok"))
+    rolled = outcomes.count("ok")
+    unverified = outcomes.count("unverified")
+    failed = outcomes.count("failed")
+
+    def counted(number: int, singular: str, plural: str) -> str:
+        return "%d %s" % (number, singular if number == 1 else plural)
+
+    named = []
+    if rolled:
+        named.append(counted(rolled, "retour arrière effectué",
+                             "retours arrière effectués"))
+    if unverified:
+        named.append(counted(unverified, "retour appliqué mais non vérifié",
+                             "retours appliqués mais non vérifiés"))
+    if failed:
+        named.append(counted(failed, "retour en échec", "retours en échec"))
+    rollbacks = ", ".join(named)
     if done == total:
         return "Installation : %d installé(s) sur %d hôte(s)." % (done, total)
     if not done:
-        if rolled:
+        if rollbacks:
             return ("Installation : 0 installé(s) sur %d hôte(s) — "
-                    "installation commencée, retour arrière effectué." % total)
+                    "installation commencée ; %s." % (total, rollbacks))
         # These steps only exist after the install attempt began; the installer
         # step itself proves it began, not that it succeeded.
         begun = any(stage_of(step) in _INSTALL_STEPS for step in steps)
         return ("Installation : 0 installé(s) sur %d hôte(s) — %s."
                 % (total, "installation commencée, aucune preuve" if begun
                    else "préflight seul"))
-    suffix = (", dont %d retour(s) arrière" % rolled) if rolled else ""
+    suffix = (", dont " + rollbacks) if rollbacks else ""
     return ("Installation : %d installé(s) sur %d hôte(s) — %d pas installé(s)%s."
             % (done, total, total - done, suffix))
 
