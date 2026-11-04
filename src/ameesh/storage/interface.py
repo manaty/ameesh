@@ -5667,7 +5667,13 @@ class FingerprintWatch(Domain):
 
     @abc.abstractmethod
     def state(self, project: str) -> dict | None:
-        """`{cursor, last_read_at, last_error}`, or None before the first read."""
+        """`{cursor, last_read_ts, last_error, updated_ts}` (`updated_ts`: the
+        last attempt, read or failure), or None before the first read."""
+
+    @abc.abstractmethod
+    def failing(self) -> list[dict]:
+        """#5695: the sources whose last attempt failed
+        (`project, url, last_error, last_read_ts, updated_ts`)."""
 
     @abc.abstractmethod
     def advance(self, project: str, url: str, cursor: str | None, *,
