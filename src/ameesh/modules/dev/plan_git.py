@@ -70,8 +70,8 @@ retiennent pas — le contenu prouvé les lève et la note de fusion garde la
 trace ; celles d'un pilote ou d'un autre acteur retiennent, même recouvertes
 par celle de l'assigné et après sa levée (les holds sont un ensemble, pas une
 pile). `sync-branches` et les unités de paquet (`sync-packets`) portent la
-même garde. #5774 : après un hold ou un état non fermable, le gel doit
-être postérieur à cette mise en attente, même levée ; sinon seul un nouveau
+même garde. #5774 : pour un lot passé par `waiting_human`, le gel doit
+attester la reprise après la décision, même levée ; sinon seul un nouveau
 gel ou une clôture explicite permet de terminer le lot. C'est conservateur :
 la date d'un commit Git ne prouve pas sa date d'entrée dans la cible.
 
@@ -1316,9 +1316,9 @@ def content_retention(st, row: dict) -> dict | None:
     donc un hold de pilote recouvert par celui de l'assigné garde son effet.
     Sa levée reste un geste autorisé (règle #1664).
 
-    #5774 : ces levées ne permettent pas de réutiliser un gel antérieur à
-    la dernière mise en attente. La barrière historique est lue sous le
-    même verrou que la fermeture ; elle impose un nouveau gel ou un acte
+    #5774 : pour un lot passé par waiting_human, ces levées ne permettent
+    pas de réutiliser un gel antérieur au cycle de décision. La barrière
+    historique est lue sous le même verrou que la fermeture ; elle impose un nouveau gel ou un acte
     explicite de clôture, sans heuristique sur le titre ou le projet."""
     row = row or {}
     try:
@@ -1383,6 +1383,12 @@ def _historical_content_retention(st, row: dict, events: list[dict]) -> dict | N
     # transforme pas ce contenu historique en preuve de l'acte. On ne date
     # pas une entrée dans la cible avec l'horloge d'un commit Git : seul un
     # nouveau gel, ou une clôture explicite, peut remplacer cette preuve.
+    # Une attente ordinaire levée n'est pas un acte encore dû : #3219 et
+    # la fermeture d'un paquet après unhold restent valables. La barrière
+    # historique vise le cycle de décision, même après son passage en qa.
+    decisions = [e for e in events if e.get("state") == "waiting_human"]
+    if not decisions:
+        return None
     barriers = [e for e in events
                 if e.get("state") in CONTENT_HELD_STATES
                 or planned_waits.is_hold_note(e.get("note"))]
@@ -1390,6 +1396,11 @@ def _historical_content_retention(st, row: dict, events: list[dict]) -> dict | N
         lot = int(row["id"])
         try:
             freeze = latest_freeze(st.work.milestones(lot, limit=None))
+            decision_ts = max(float(e.get("created_ts") or 0) for e in decisions)
+            # Un nouveau gel termine ce cycle de décision : les attentes
+            # ordinaires suivantes ne doivent pas réarmer la barrière.
+            if freeze and decision_ts and float(freeze.get("at_ts") or 0) > decision_ts:
+                return None
             last = max(barriers, key=lambda e: (float(e.get("created_ts") or 0),
                                                 int(e.get("id") or 0)))
             since = float(last.get("created_ts") or 0)

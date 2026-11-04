@@ -1479,13 +1479,8 @@ class ContentMergeTest(_PlanDb):
                          ("withheld", "hold"))
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
         self.assertIn("passe réelle due", result["detail"])
-        # #5774 : la levée ne suffit plus à réutiliser le gel historique.
+        # Une attente ordinaire levée reste fermable sans regel.
         work.note(self.db, item["id"], "unhold: passe faite", actor="human:alice")
-        self.assertEqual(self.run_sync()[item["id"]]["retention"]["what"], "stale-freeze")
-        previous = plan_git.latest_freeze(work.milestones(self.db, item["id"]))
-        storage.of(self.db).work.add_milestone(
-            item["id"], "frozen", sha=previous["sha"], actor="ouvrier", verdict=None,
-            note="ameesh-freeze-absent: main")
         self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
         self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
 
@@ -1518,6 +1513,8 @@ class ContentMergeTest(_PlanDb):
         def probe(repo, sha, target, **kwargs):
             if not moved:
                 moved.append(True)
+                from .support import hold_for_owner
+                hold_for_owner(self.db, item["id"])
                 work.move(self.db, item["id"], "blocked", note="acte dû")
                 work.move(self.db, item["id"], "qa", note="reprise")
             return real(repo, sha, target, **kwargs)

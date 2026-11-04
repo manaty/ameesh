@@ -1586,6 +1586,7 @@ class ContentDeliveryTest(_Base):
     def test_5774_releve_automatique_retient_le_gel_historique(self):
         sha = self.livrer("agent/acte", "préparation de l'acte")
         item = self.lot(sha)
+        hold_for_owner(self.db, item["id"])
         work.move(self.db, item["id"], "blocked", note="acte opérateur dû")
         work.move(self.db, item["id"], "qa", note="reprise après décision")
         for dry in (True, False):

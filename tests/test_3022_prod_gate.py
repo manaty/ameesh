@@ -183,10 +183,6 @@ class ProdGateCloseTest(_PlanDb):
         with bound("dev-a"):
             work.note(self.db, item["id"], "hold: j'attends la fusion du paquet",
                       actor="dev-a")
-        previous = plan_git.latest_freeze(work.milestones(self.db, item["id"]))
-        storage.of(self.db).work.add_milestone(
-            item["id"], "frozen", sha=previous["sha"], actor="dev-a", verdict=None,
-            note="ameesh-freeze-absent: develop")
         dry = plan_git.sync_merges(self.db, self.repo, target="develop", dry_run=True)
         [entry] = [r for r in dry["results"] if r["work_item"] == item["id"]]
         self.assertEqual((entry["result"], entry["retention"]["what"]),

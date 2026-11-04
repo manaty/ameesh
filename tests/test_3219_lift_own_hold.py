@@ -319,7 +319,6 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
             work.note(self.db, item["id"], "unhold: paquet 1900 fusionné",
                       actor="dev-a")
         self.assertEqual(self._active(item), {})
-        self._refreeze(item)
         result = self._sync()[item["id"]]
         self.assertEqual(result["result"], "merged")
         self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
@@ -329,14 +328,12 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
 
     def test_la_passe_ferme_malgre_le_hold_de_l_assigne(self):
         """#3219 : la retenue de règle 1 de l'assigné ne retient pas une
-        livraison attestée par un nouveau gel après le hold (#5774) ; la
-        note de fusion journalise la levée. Un relevé à
+        livraison prouvée ; la note de fusion journalise la levée. Un relevé à
         blanc annonce la même fermeture (`would-merge`), pas une retenue."""
         item = self._delivered()
         with bound("dev-a"):
             work.note(self.db, item["id"], "hold: j'attends le paquet 1900",
                       actor="dev-a")
-        self._refreeze(item)
         dry = self._sync(dry_run=True)[item["id"]]
         self.assertEqual(dry["result"], "would-merge")
         self.assertIn("levée du hold de l'assigné dev-a", dry["detail"])
@@ -383,7 +380,6 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         with bound(""):
             work.note(self.db, item["id"], "unhold: gestes faits",
                       actor="human:proprio")
-        self._refreeze(item)
         self.assertEqual(self._sync()[item["id"]]["result"], "merged")
 
     def test_B1_le_hold_de_pilote_pose_apres_retient_aussi(self):
@@ -418,7 +414,6 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         # son auteur le lève lui-même (#3219), puis la passe ferme
         with bound("dev-b"):
             work.note(self.db, item["id"], "unhold: relecture faite", actor="dev-b")
-        self._refreeze(item)
         self.assertEqual(self._sync()[item["id"]]["result"], "merged")
 
     def test_5774_waiting_human_apres_un_gel_deja_fusionne(self):
@@ -444,7 +439,10 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
                         [downstream["id"]][0]["blocking"])
 
     def test_5774_hold_leve_ne_reutilise_pas_l_ancien_gel(self):
+        from .support import hold_for_owner
         item = self._delivered()
+        hold_for_owner(self.db, item["id"])
+        work.move(self.db, item["id"], "qa", note="décision reçue, acte à effectuer")
         with bound("dev-a"):
             work.note(self.db, item["id"], "hold: acte opérateur encore dû", actor="dev-a")
         result = self._sync()[item["id"]]
@@ -458,13 +456,26 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         self._refreeze(item)
         self.assertEqual(self._sync()[item["id"]]["result"], "merged")
 
-    def test_5774_blocked_leve_exige_un_nouveau_gel(self):
+    def test_5774_attente_owner_levee_exige_un_nouveau_gel(self):
+        from .support import hold_for_owner
         item = self._delivered()
+        hold_for_owner(self.db, item["id"])
         work.move(self.db, item["id"], "blocked", note="acte opérateur dû")
         work.move(self.db, item["id"], "qa", note="reprise du travail")
         result = self._sync()[item["id"]]
         self.assertEqual(result["retention"]["what"], "stale-freeze")
         self._refreeze(item)
+        self.assertEqual(self._sync()[item["id"]]["result"], "merged")
+
+    def test_5774_nouveau_gel_reinitialise_le_cycle_de_decision(self):
+        from .support import hold_for_owner
+        item = self._delivered()
+        hold_for_owner(self.db, item["id"])
+        work.move(self.db, item["id"], "qa", note="acte effectué")
+        self._refreeze(item)
+        with bound("dev-a"):
+            work.note(self.db, item["id"], "hold: attendre le paquet", actor="dev-a")
+            work.note(self.db, item["id"], "unhold: paquet prêt", actor="dev-a")
         self.assertEqual(self._sync()[item["id"]]["result"], "merged")
 
     def test_5774_cloture_explicite_de_l_acte_reste_possible(self):
@@ -477,7 +488,9 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         self.assertEqual(work.get(self.db, item["id"])["state"], "closed")
 
     def test_5774_gels_illisibles_ne_levent_pas_la_barriere(self):
+        from .support import hold_for_owner
         item = self._delivered()
+        hold_for_owner(self.db, item["id"])
         work.move(self.db, item["id"], "blocked", note="acte opérateur dû")
         work.move(self.db, item["id"], "qa", note="reprise")
         st = storage.of(self.db)
