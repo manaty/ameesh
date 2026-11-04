@@ -71,6 +71,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -78,6 +79,13 @@ import urllib.request
 #: nom du check de détail, partagé avec `ameesh.radar.AGGREGATE_DETAIL_CHECK`
 #: (un témoin de tests/test_3251_agregat_annulation.py verrouille l'égalité).
 DETAIL_CHECK = "tests (bilan des parts)"
+
+#: #5729 : la ligne de l'agrégat quand le push de main réutilise la
+#: qualification complète d'une tête de paquet au même arbre.
+QUALIFIED_ROW = "arbre qualifié"
+
+#: une empreinte git complète (preuve d'arbre qualifié)
+SHA = re.compile(r"^[0-9a-f]{40}$")
 
 #: conclusions de job qui ne prouvent rien (canon §3 : non concluant)
 NON_CONCLUSIVE = ("cancelled", "timed_out", "startup_failure", "stale",
@@ -157,10 +165,61 @@ def _job_stats(jobs, expected):
             "absent": absent, "nonconclusive": nonconclusive}
 
 
+def _classify_qualified(*, event, ref, plan, version, version_only, docs_only,
+                        doc_readers, psycopg, psycopg_parts, psql, psql_parts,
+                        platform_macos, fs_class, packet, head, tree) -> dict:
+    """#5729 : le push de main réutilise la suite complète du paquet.
+
+    Vert seulement si la preuve est complète **et** qu'aucune part n'a été
+    planifiée ni lancée : un plan en échec, une part lancée, une voie
+    version/doc ou un événement qui n'est pas le push de main rougissent
+    l'agrégat. La qualification est nommée dans le détail : jamais un vert
+    muet.
+    """
+    problems = []
+    if event != "push":
+        problems.append("événement %s" % (event or "absent"))
+    if _state(ref) != "refs/heads/main":
+        problems.append("réf %s" % (_state(ref) or "absente"))
+    if _state(plan) != "success":
+        problems.append("plan %s" % (_state(plan) or "absent"))
+    if _state(version) not in ("success", "skipped"):
+        problems.append("version %s" % (_state(version) or "absente"))
+    if _flag(version_only) or _flag(docs_only):
+        problems.append("voie sans tests")
+    for name, value in (("psycopg", psycopg), ("psql", psql),
+                        ("doc-readers", doc_readers),
+                        ("plateforme macOS", platform_macos),
+                        ("autre système de fichiers", fs_class)):
+        if _state(value) not in ("skipped", ""):
+            problems.append("%s %s (aucune part n'était due)"
+                            % (name, _state(value) or "absent"))
+    for name, value in (("psycopg", psycopg_parts), ("psql", psql_parts)):
+        text = str(value or "").strip()
+        if text not in ("", "0") and _json_list(text) != []:
+            problems.append("%s : %s part(s) planifiée(s)" % (name, value))
+    if not (isinstance(packet, str) and packet.isdigit() and int(packet) > 0):
+        problems.append("paquet absent")
+    if not SHA.fullmatch(head or "") or not SHA.fullmatch(tree or ""):
+        problems.append("preuve d'arbre incomplète")
+    if problems:
+        return {"state": RED,
+                "red": ["arbre qualifié : " + "; ".join(problems)],
+                "missing": [], "consigned": [],
+                "parts": [{"part": QUALIFIED_ROW, "result": "incohérent",
+                           "status": RED, "parts": ""}]}
+    return {"state": GREEN, "red": [], "missing": [], "consigned": [],
+            "parts": [{"part": QUALIFIED_ROW, "result": "reuse",
+                       "status": GREEN, "parts": ""}],
+            "qualified": {"packet": int(packet), "head": head, "tree": tree}}
+
+
 def classify(*, event, plan, version, version_only, docs_only, doc_readers,
              psycopg, psycopg_parts, psql, psql_parts,
              platform_macos=None, fs_class=None,
-             psycopg_jobs=None, psql_jobs=None, psql_full=False) -> dict:
+             psycopg_jobs=None, psql_jobs=None, psql_full=False,
+             ref="", qualified=False, qualified_packet="",
+             qualified_head="", qualified_tree="") -> dict:
     """Classe l'agrégat sans réseau : `{state, red, missing, consigned, parts}`.
 
     `state` vaut `green` quand la preuve Linux est acquise (chaque famille
@@ -179,7 +238,12 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
 
     `psql_full` (#3749) : le nocturne psql (`psql-nocturne.yml`, entrée
     `psql-full` de tests.yml) ne planifie aucune part psycopg ; c'est le seul
-    cas où une famille psycopg vide (`[]`) et sautée est légitime."""
+    cas où une famille psycopg vide (`[]`) et sautée est légitime.
+
+    `qualified` (#5729) : le push de main réutilise la qualification complète
+    d'une tête de paquet au même arbre. Toutes les parts doivent alors être
+    sautées, le plan vert et la preuve (paquet, tête, arbre) complète ; sinon
+    l'agrégat rougit — cette voie ne couvre jamais une part qui a tourné."""
     red: list[str] = []
     missing: list[str] = []
     consigned: list[dict] = []
@@ -246,6 +310,18 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
         parts.append(row)
 
     event = _state(event)
+    if _flag(qualified):
+        #: #5729 : la preuve d'arbre qualifié remplace les parts, elle ne les
+        #: complète pas. Le classifieur vérifie que rien n'a été planifié ni
+        #: lancé, et que la preuve elle-même est complète.
+        return _classify_qualified(
+            event=event, ref=ref, plan=plan, version=version,
+            version_only=version_only, docs_only=docs_only,
+            doc_readers=doc_readers, psycopg=psycopg,
+            psycopg_parts=psycopg_parts, psql=psql, psql_parts=psql_parts,
+            platform_macos=platform_macos, fs_class=fs_class,
+            packet=qualified_packet, head=qualified_head,
+            tree=qualified_tree)
     plan_state = _state(plan)
     if plan_state != "success":
         red.append("plan (%s)" % (plan_state or "absent"))
@@ -327,6 +403,14 @@ def _summary(event: str, parts: list[dict], result: dict) -> str:
         return "- %s : %s%s" % (row["part"], row["result"], suffix)
 
     lines += [display(row) for row in parts]
+    if result.get("qualified"):
+        proof = result["qualified"]
+        lines.append("")
+        lines.append("Aucune part relancée (lot #5729) : l'arbre `%s` du commit "
+                     "poussé est identique à celui de la tête `%s` du paquet #%d, "
+                     "dont le check `tests` et le run `tests.yml` sont verts ; "
+                     "la qualification complète est réutilisée."
+                     % (proof["tree"], proof["head"], proof["packet"]))
     if result["consigned"]:
         lines.append("")
         lines.append("Non concluant (non bloquant, canon §3 ; lot de correction "
@@ -450,6 +534,13 @@ def _parse(argv=None) -> argparse.Namespace:
                         help="nocturne psql (#3749) : psycopg sans part admise")
     parser.add_argument("--plateforme-macos", dest="platform_macos", default=None)
     parser.add_argument("--autre-fs", dest="fs_class", default=None)
+    parser.add_argument("--ref", default="", help="github.ref du run")
+    parser.add_argument("--qualified", default="false",
+                        help="true: le push main réutilise l'arbre qualifié du "
+                             "paquet (#5729)")
+    parser.add_argument("--qualified-packet", default="")
+    parser.add_argument("--qualified-head", default="")
+    parser.add_argument("--qualified-tree", default="")
     parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", ""),
                         help="run dont lire les jobs (défaut : GITHUB_RUN_ID)")
     parser.add_argument("--publish", action="store_true",
@@ -475,7 +566,11 @@ def main(argv=None, gh=None, jobs=None) -> int:
             psql=args.psql, psql_parts=args.psql_parts,
             platform_macos=args.platform_macos, fs_class=args.fs_class,
             psycopg_jobs=psycopg_jobs, psql_jobs=psql_jobs,
-            psql_full=args.psql_full)
+            psql_full=args.psql_full, ref=args.ref,
+            qualified=args.qualified,
+            qualified_packet=args.qualified_packet,
+            qualified_head=args.qualified_head,
+            qualified_tree=args.qualified_tree)
     except (TypeError, ValueError) as exc:  # pragma: no cover - garde-fou
         print("ci-agregat : %s" % exc, file=sys.stderr)
         return 2
@@ -498,6 +593,9 @@ def main(argv=None, gh=None, jobs=None) -> int:
     if result["state"] == RED:
         title = ("tests : preuve absente" if result["missing"]
                  else "tests : négatif prouvé")
+    elif result.get("qualified"):
+        title = "tests : arbre qualifié (paquet #%d)" % (
+            result["qualified"]["packet"],)
     elif result["consigned"]:
         title = "tests : %d part(s) non concluante(s)" % len(result["consigned"])
     else:

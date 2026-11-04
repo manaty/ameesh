@@ -425,7 +425,7 @@ class BranchementCITest(unittest.TestCase):
         self.assertNotIn("CANON_REF", plan)
         # `plan` est une dépendance de l'agrégat requis `tests` : son échec
         # rougit le check requis (`scripts/ci-agregat.py`, plan != success).
-        self.assertIn("needs: [plan,", self.job_block("tests"))
+        self.assertIn("needs: [qualification, plan,", self.job_block("tests"))
 
     def test_la_politique_epinglee_couvre_les_alias_du_depot(self):
         path = REPO / "scripts" / "alias-review-classes.json"

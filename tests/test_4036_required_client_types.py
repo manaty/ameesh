@@ -27,7 +27,7 @@ class RequiredClientTypesTest(unittest.TestCase):
         self.assertIn("node-version: \"22\"", plan)
         self.assertIn("client_types: ${{ steps.client_types.outcome }}", plan)
         required = workflow.split("\n  tests:\n", 1)[1].split("\n  python314:\n", 1)[0]
-        self.assertIn("needs: [plan,", required)
+        self.assertIn("needs: [qualification, plan,", required)
         self.assertIn("--plan \"${{ needs.plan.result }}\"", required)
         self.assertIn("CLIENT_TYPES: ${{ needs.plan.outputs.client_types }}", required)
         self.assertIn("Types clients à jour (gen-api --check, requis via plan)", required)

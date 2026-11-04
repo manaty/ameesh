@@ -264,7 +264,10 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
                                      frozen, exception=exception, reason=reason,
                                      actor=actor, repo=repo or "", cfg=cfg)
         except packet_guard.PacketGuardError as exc:
-            raise FireError(str(exc)) from exc
+            # #4306 : le lot d'un canon reçoit son feu depuis le clone du canon.
+            hint = (" — a lot of the canon repository: pass --repo <its clone>"
+                    if packet_guard.canon_repositories(cfg) else "")
+            raise FireError(str(exc) + hint) from exc
 
     if fence is None:
         check(db)
@@ -402,13 +405,21 @@ def _project_checkout(project) -> str | None:
 
 def _slug(cfg, item: dict, repo: str | None) -> str | None:
     """`owner/repo` du lot : son issue, le projet déclaré, sinon l'`origin` du
-    dossier de travail."""
+    dossier de travail.
+
+    #4306 : un lot du canon porte souvent une issue manaty/ameesh, mais sa
+    branche et sa PR vivent dans le dépôt du canon. Quand le dossier de
+    travail est le clone d'un canon approuvé (`packet_guard.outside_packets`,
+    lu dans la configuration, §7), son `origin` l'emporte sur l'issue : le
+    passage lit la PR là où elle est, et la garde du paquet voit le canon."""
     from . import migrations
+    origin = migrations.origin_repo(repo) if repo else None
+    if origin and packet_guard.outside_packets(repo, cfg):
+        return migrations.repo_key(origin)
     try:
         return work.lot_repository(item, cfg)
     except work.WorkError:
         pass
-    origin = migrations.origin_repo(repo) if repo else None
     return migrations.repo_key(origin) if origin else None
 
 
