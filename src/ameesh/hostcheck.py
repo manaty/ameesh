@@ -463,6 +463,18 @@ def packet_watch_lines(cfg, run=_systemctl) -> list[str]:
     if state == "active":
         return ["packet-watch: %s active — packet watch (missed slot, automatic "
                 "merge) runs on its tick" % RELEASE_TIMER]
+    role = ((getattr(cfg, "packet_watch", None) or {}).get("role")
+            or (getattr(cfg, "release", None) or {}).get("role"))
+    if role:
+        # #5748 : sous un rôle élu, l'unité est posée par `role timers` sur
+        # chaque candidat (absente ici = « not-found », pas un geste systemctl)
+        return [
+            "warning    : packet_watch is declared for role %s but %s is not active "
+            "(%s): if this host is a candidate, the takeover has no release tick here"
+            % (role, RELEASE_TIMER, state),
+            "             ameesh role timers --role %s --install (a host-pinned cutter "
+            "elsewhere is migrated by the bureau first: one cutter)" % role,
+        ]
     return [
         "warning    : packet_watch is declared for this host but %s is not active "
         "(%s): the packet watch (missed slot, automatic merge) is stopped"

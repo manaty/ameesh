@@ -54,6 +54,17 @@ hand is replaced, not doubled; it needs the dedicated clone declared in
 ``paquet-horaire.env``, and a candidate without it reports the gap as an
 advisory warning, like the alerts route.
 
+#5748: the release tick (``ameesh release tick``: the canon cutoffs and the
+packet watch, #2448, #3364) is a role timer too. Since #5015 a host declares
+``release.role``/``packet_watch.role`` and the tick fences itself under
+``role run --pass release``, but ``ameesh-release.timer`` was posed by hand on
+one host only: the elected takeover moved the lease, not the timer (agents-1,
+04/11, holder of ``mesh-design`` without the unit). The unit keeps the name of
+``deploy/systemd/ameesh-release.{service,timer}`` so a hand copy is replaced,
+not doubled. It is planned only on a host whose configuration names this
+role: a legacy host-pinned cutter (no ``role``) is neither rewritten nor
+removed here, its migration stays a gesture of the bureau.
+
 The units are user units, like ``ameesh-release.timer``. This module never
 runs ``systemctl`` during rendering; ``--install``/``--remove``/``--check``
 do, unless ``--no-apply`` is given.
@@ -109,6 +120,13 @@ PAQUET_ENV = "~/.config/ameesh/paquet-horaire.env"
 PAQUET_SCRIPT = "scripts/paquet-horaire.py"
 PAQUET_DESCRIPTION = "ameesh paquet horaire sans agent (#3845)"
 
+#: #5748: the release tick under the elected role (#2448, #5015); 60 s with a
+#: 180 s role lease is a takeover within five minutes (deploy/systemd unit)
+RELEASE_PASS = "release"
+RELEASE_UNIT = "ameesh-release"
+RELEASE_INTERVAL_S = 60
+RELEASE_DESCRIPTION = "ameesh release at the compiled canon cutoffs (#2448)"
+
 
 class TimerError(RuntimeError):
     """The timers cannot be rendered or installed (actionable message)."""
@@ -133,6 +151,8 @@ class TimerSpec:
     def unit(self) -> str:
         if self.name == PAQUET_PASS:
             return PAQUET_UNIT
+        if self.name == RELEASE_PASS:
+            return RELEASE_UNIT
         return "ameesh-role-%s" % self.name
 
     @property
@@ -400,6 +420,38 @@ def paquet_reach(path: str | None = None, *, git=None) -> tuple[str, str]:
             "(git -C %s pull --ff-only)" % (repo, target, repo))
 
 
+def release_reach(cfg, role: str):
+    """#5748: ``(blocked, detail)`` of the release tick for ``role``, or None.
+
+    None when neither ``release.role`` nor ``packet_watch.role`` names
+    ``role``: a host-pinned (legacy) cutter is not this module's to rewrite or
+    remove (#3364: disabling it stops the packet watch). Otherwise the
+    configuration is validated as the tick does before it takes its lease
+    (roles that disagree, a release block that cannot run); a gap is advisory,
+    like the alerts route: a host setting, never a failed staging (§3).
+    """
+    release = getattr(cfg, "release", None) or {}
+    watch = getattr(cfg, "packet_watch", None) or {}
+    if not isinstance(release, dict) or not isinstance(watch, dict):
+        return None
+    release_role = str(release.get("role") or "").strip()
+    watch_role = str(watch.get("role") or "").strip()
+    if role not in (release_role, watch_role):
+        return None
+    if release_role and watch_role and release_role != watch_role:
+        return ("release.role and packet_watch.role disagree",
+                "%s vs %s: the tick refuses both; declare the same elected role"
+                % (release_role, watch_role))
+    from . import packet_watch, release_cutoff
+    try:
+        release_cutoff.projects(cfg)
+        packet_watch.projects(cfg)
+    except (release_cutoff.ReleaseError, packet_watch.WatchError) as exc:
+        return ("release configuration refused",
+                " ".join(str(exc).split())[:300])
+    return ("", "ameesh release tick under %s (cutoffs and packet watch)" % role)
+
+
 def notify_reach(cfg, *, responsible=None, env: dict | None = None) -> tuple[list[str], str]:
     """#3383: the humans the alerts timer must push to, or the gap.
 
@@ -532,7 +584,7 @@ def alerts_timer_gap(*, role: str, directory: Path | None = None,
 def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
          watch_error: str = "", expected_projects=None, notify_humans=None,
          notify_error: str = "", paquet=None, fingerprint_intervals=(),
-         fingerprint_error: str = "") -> dict:
+         fingerprint_error: str = "", release=None) -> dict:
     """The timers this host should run, without touching the filesystem.
 
     ``row`` is the role's ``agent_registry`` row: an elected role is a
@@ -548,6 +600,8 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
     ``fingerprint_intervals`` are the cadences of the canon's ``fingerprints``
     cards (#3885): at least one declaration installs the pass; none installs
     nothing, and an unreadable declaration is reported blocked.
+    ``release`` is the ``(blocked, detail)`` of :func:`release_reach`; ``None``
+    leaves the release tick out of the plan (#5748).
     """
     declared = candidates(row)
     candidate = is_candidate(row, host)
@@ -640,6 +694,11 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
         reported.append(TimerSpec(
             PAQUET_PASS, PAQUET_PASS, PAQUET_INTERVAL_S, PAQUET_DESCRIPTION,
             blocked=blocked, detail=detail, advisory=bool(blocked)))
+    if release is not None:
+        blocked, detail = release
+        reported.append(TimerSpec(
+            RELEASE_PASS, RELEASE_PASS, RELEASE_INTERVAL_S, RELEASE_DESCRIPTION,
+            blocked=blocked, detail=detail, advisory=bool(blocked)))
     report["timers"] = [item.as_json() for item in reported]
     return report
 
@@ -662,6 +721,8 @@ def render_service(spec: TimerSpec, *, role: str, bin_path: str = DEFAULT_BIN) -
     """
     if spec.name == PAQUET_PASS:
         return render_paquet_service(role=role, bin_path=bin_path)
+    if spec.name == RELEASE_PASS:
+        return render_release_service(bin_path=bin_path)
     delegated = " --pass alerts" if spec.name == "alerts" else ""
     # #4172: the coherence pass may walk many lots of several projects; the
     # other passes are single ticks and keep the tighter bound.
@@ -738,8 +799,57 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
     ))
 
 
+def render_release_service(*, bin_path: str = DEFAULT_BIN) -> str:
+    """#5748: the unit of ``deploy/systemd/ameesh-release.service``.
+
+    The command fences itself: with ``release.role`` (or ``packet_watch.role``)
+    declared, ``ameesh release tick`` runs under ``role run --pass release``
+    and a standby candidate exits 0 without a host operation (#5015).
+    """
+    binary = _check_bin(bin_path)
+    return "\n".join((
+        "# generated by `ameesh role timers` — do not edit; rerun the command",
+        "# #5748: on every candidate of the elected role; the tick fences itself",
+        "# (`role run --pass release`), a standby candidate exits 0.",
+        "[Unit]",
+        "Description=%s" % RELEASE_DESCRIPTION,
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        "Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin",
+        "EnvironmentFile=%h/.config/ameesh/env",
+        "EnvironmentFile=-%h/.config/ameesh/release.env",
+        "UnsetEnvironment=PYTHONPATH",
+        "ExecStart=%s release tick" % binary,
+        # #5450: room for the staging fallback and its rollback, below 12 h
+        "TimeoutStartSec=11h30min",
+        "TimeoutStopSec=5min",
+        "NoNewPrivileges=yes",
+        "",
+    ))
+
+
 def render_timer(spec: TimerSpec) -> str:
     """The timer that wakes ``render_service``; bounded for the takeover."""
+    if spec.name == RELEASE_PASS:
+        # #2448: the cadence of deploy/systemd/ameesh-release.timer
+        return "\n".join((
+            "# generated by `ameesh role timers` — do not edit; rerun the command",
+            "[Unit]",
+            "Description=ameesh release tick (compiled canon cutoffs, #2448)",
+            "",
+            "[Timer]",
+            "OnBootSec=1min",
+            "OnUnitActiveSec=%ds" % RELEASE_INTERVAL_S,
+            "AccuracySec=1s",
+            "Persistent=true",
+            "",
+            "[Install]",
+            "WantedBy=timers.target",
+            "",
+        ))
     if spec.name == PAQUET_PASS:
         # #3845: on the wall clock, so every candidate ticks at the same minutes
         return "\n".join((
@@ -879,6 +989,10 @@ def install(report: dict, *, directory: Path, bin_path: str = DEFAULT_BIN,
         service = directory / spec.service
         timer = directory / spec.timer
         if spec.blocked:
+            if spec.name == RELEASE_PASS:
+                # #3364: never cut the release timer, it carries the packet
+                # watch; a refused configuration is reported, the unit kept
+                continue
             if apply:
                 _systemctl("disable", "--now", spec.timer)
             for path in (service, timer):
@@ -1014,6 +1128,10 @@ def remove(report: dict, *, directory: Path, apply: bool = True) -> dict:
     removed = []
     names = []
     for item in report.get("timers") or []:
+        if item["name"] == RELEASE_PASS:
+            # #3364: retiring the cutter is removing the `release` block,
+            # never disabling the timer that carries the packet watch
+            continue
         spec = TimerSpec(item["name"], item["only"], int(item["interval_s"]),
                          item["description"])
         names.append(spec.timer)
@@ -1146,7 +1264,8 @@ def main(argv: list[str] | None = None) -> int:
                       notify_humans=humans, notify_error=notify_error,
                       paquet=paquet_reach() if args.role == DEFAULT_ROLE else None,
                       fingerprint_intervals=fingerprint_intervals,
-                      fingerprint_error=fingerprint_error)
+                      fingerprint_error=fingerprint_error,
+                      release=release_reach(cfg, args.role))
         if sync is not None:
             report["github_sync"] = sync
         directory = systemd_dir(args.systemd_dir)
