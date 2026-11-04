@@ -695,6 +695,126 @@ class HostRepairTest(unittest.TestCase):
         found.assert_called_once_with("cfg")
 
 
+class AlertGroupTest(unittest.TestCase):
+    """#5693: one alert per descending line of failures, hosts still to repair."""
+
+    A, B, C = "a" * 40, "b" * 40, "c" * 40
+    KO = {"stage": "installer", "verdict": "ko"}
+    OK = {"stage": "sante", "verdict": "ok"}
+
+    @classmethod
+    def descends(cls, ancestor, descendant):
+        return ancestor == descendant or (ancestor, descendant) in {
+            (cls.A, cls.B), (cls.B, cls.C), (cls.A, cls.C)}
+
+    def failed(self, ident, run, sha, hosts, **extra):
+        return row(ident, run=run, sha=sha, state="failed", hosts=hosts,
+                   **extra)
+
+    def test_a_failed_retry_joins_the_alert_of_the_newest_failure(self):
+        # The witness: A failed on vm-2, B descends and fails at preflight.
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO}, started=100)
+        b = self.failed(2, "run-b", self.B, {}, started=150, deadline=1200)
+        finding, = staging_watch.findings(
+            [a, b], now=250, descends=self.descends)
+        self.assertEqual(finding["run"], "run-b")
+        self.assertEqual(finding["since"], 100)
+        self.assertEqual(finding["reason"], "run-a")
+        self.assertIn("run-a", finding["detail"])
+        self.assertIn("run-b", finding["detail"])
+        self.assertIn("vm-2: installer/ko", finding["detail"])
+        self.assertIn("hôtes non réparés", finding["detail"])
+        self.assertIn("vm-2", finding["hosts"])
+
+    def test_a_newer_run_does_not_renew_the_alert_identity(self):
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO}, started=100)
+        b = self.failed(2, "run-b", self.B, {}, started=150, deadline=1200)
+        alone, = staging_watch.findings(
+            [a], now=250, descends=self.descends)
+        joined, = staging_watch.findings(
+            [a, b], now=250, descends=self.descends)
+        self.assertEqual((joined["since"], joined["reason"]),
+                         (alone["since"], alone["reason"]))
+        self.assertNotEqual(joined["run"], alone["run"])
+
+    def test_a_repaired_first_failure_hands_the_alert_to_the_next_one(self):
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO}, started=100)
+        b = self.failed(2, "run-b", self.B, {"vm-3": self.KO}, started=150,
+                        deadline=1200)
+        c = row(3, run="run-c", sha=self.C, state="partial",
+                hosts={"vm-2": self.OK})
+        finding, = staging_watch.findings(
+            [a, b, c], now=250, descends=self.descends)
+        self.assertEqual(finding["run"], "run-b")
+        self.assertEqual(finding["since"], 150)
+        self.assertEqual(finding["reason"], "run-b")
+        self.assertEqual(set(finding["hosts"]), {"vm-3"})
+
+    def test_a_same_commit_retry_joins_the_alert_too(self):
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO})
+        b = self.failed(2, "run-b", self.A, {"vm-3": self.KO})
+        finding, = staging_watch.findings(
+            [a, b], now=250, descends=self.descends)
+        self.assertEqual(finding["run"], "run-b")
+        self.assertIn("run-a", finding["detail"])
+        self.assertEqual(set(finding["hosts"]), {"vm-2", "vm-3"})
+
+    def test_the_union_of_unrepaired_hosts_is_kept(self):
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO})
+        b = self.failed(2, "run-b", self.B, {"vm-3": self.KO})
+        c = self.failed(3, "run-c", self.C, {"vm-4": self.KO})
+        finding, = staging_watch.findings(
+            [a, b, c], now=250, descends=self.descends)
+        self.assertEqual(finding["run"], "run-c")
+        self.assertEqual(set(finding["hosts"]), {"vm-2", "vm-3", "vm-4"})
+        for name in ("run-a", "run-b", "run-c"):
+            self.assertIn(name, finding["detail"])
+
+    def test_a_running_retry_keeps_the_alert_of_the_failure_it_replaces(self):
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO})
+        b = row(2, run="run-b", sha=self.B, state="running", started=200,
+                deadline=1200, hosts={"vm-1": {"stage": "migrations",
+                                               "verdict": "ok"}})
+        finding, = staging_watch.findings(
+            [a, b], now=250, descends=self.descends)
+        self.assertEqual(finding["run"], "run-b")
+        self.assertIn("run-a", finding["detail"])
+        self.assertIn("vm-2", finding["hosts"])
+
+    def test_a_different_scope_is_a_different_alert(self):
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO})
+        b = self.failed(2, "run-b", self.B, {}, notify="other-pilot")
+        found = staging_watch.findings([a, b], now=250,
+                                       descends=self.descends)
+        self.assertEqual({finding["run"] for finding in found},
+                         {"run-a", "run-b"})
+
+    def test_a_non_descendant_failure_is_a_different_alert(self):
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO})
+        b = self.failed(2, "run-b", "d" * 40, {})
+        found = staging_watch.findings([a, b], now=250,
+                                       descends=self.descends)
+        self.assertEqual({finding["run"] for finding in found},
+                         {"run-a", "run-b"})
+
+    def test_a_later_repaired_failure_does_not_absorb_the_older_one(self):
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO})
+        b = self.failed(2, "run-b", self.B, {"vm-3": self.KO})
+        c = row(3, run="run-c", sha=self.C, state="partial",
+                hosts={"vm-3": self.OK})
+        finding, = staging_watch.findings(
+            [a, b, c], now=250, descends=self.descends)
+        self.assertEqual(finding["run"], "run-a")
+        self.assertEqual(set(finding["hosts"]), {"vm-2"})
+
+    def test_a_completed_retry_still_settles_the_whole_line(self):
+        a = self.failed(1, "run-a", self.A, {"vm-2": self.KO})
+        b = self.failed(2, "run-b", self.B, {})
+        c = row(3, run="run-c", sha=self.C, state="completed")
+        self.assertEqual(staging_watch.findings(
+            [a, b, c], now=250, descends=self.descends), [])
+
+
 class BoundsTest(unittest.TestCase):
     """#5450: the global bound, the operator delay and the unit bound agree."""
 
