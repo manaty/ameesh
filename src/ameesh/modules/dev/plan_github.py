@@ -1238,7 +1238,7 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     """
     check_repo(repo)
     prs = _json(gh, ["pr", "list", "--repo", repo, "--state", "merged", "--limit", str(int(limit)),
-                     "--json", "number,headRefName,headRefOid,isCrossRepository,body,state,mergeCommit,"
+                     "--json", "number,baseRefName,headRefName,headRefOid,isCrossRepository,body,state,mergeCommit,"
                      "mergedBy,mergedAt,url"])
     if not isinstance(prs, list):
         raise GithubError("gh pr list: list expected")
@@ -1331,7 +1331,7 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                 elif dry_run:
                     from . import plan_git
                     state = item["state"]
-                    retention = (plan_git.content_retention(storage.of(db), item)
+                    retention = (plan_git.dry_run_retention(db, st, item, sha=sha or "", repo=None)
                                  if live else None)
                     if retention is not None and not retention.get("lift"):
                         plan_git.mark_retained(entry, retention,
@@ -1348,6 +1348,13 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                         evidence={"seen": "sync-github", "sha": sha or "", "pr": ref},
                         actor=actor, content_guard=plan_git.content_retention)
                     entry.update(result=done["result"], detail=done["detail"])
+                    if done["result"] in ("withheld", "error") and done.get("retention"):
+                        target = pr.get("baseRefName") or "GitHub"
+                        plan_git.mark_retained(entry, done["retention"], target=target)
+                        if done["result"] == "withheld":
+                            plan_git.record_content_withheld(
+                                db, st, item, entry, done["retention"],
+                                target=target, actor=actor)
             results.append(entry)
     return {"repo": repo, "dry_run": bool(dry_run), "pull_requests": len(prs),
             "results": results,
