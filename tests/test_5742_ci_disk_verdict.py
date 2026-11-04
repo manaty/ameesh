@@ -58,6 +58,18 @@ class EvidenceTest(unittest.TestCase):
                             "Traceback (most recent call last):\nAssertionError: regression")
         self.assertFalse(agregat.disk_infrastructure(job(), chained))
 
+    def test_assertion_externe_non_masquee_par_stderr_du_fils(self):
+        for message in (
+                "AssertionError: 'ko' != 'ok'\nOSError: [Errno 28] No space left on device",
+                "AssertionError: 'ko' != 'ok'\nTraceback (most recent call last):\n"
+                '  File "child.py", line 5, in <module>\n'
+                "OSError: [Errno 28] No space left on device",
+                "ValueError: invalid input\nOSError: [Errno 28] No space left on device"):
+            with self.subTest(message=message):
+                self.assertFalse(agregat.disk_infrastructure(job(), traceback(
+                    '  File "parent.py", line 9, in test_parent\n'
+                    "    invoke_child()\n" + message)))
+
     def test_erreurs_de_commande_enveloppent_enospc(self):
         for evidence in (
                 "AssertionError: git init: fatal: [Errno 28] No space left on device",

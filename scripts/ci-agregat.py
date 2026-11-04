@@ -179,13 +179,28 @@ def disk_infrastructure(job: dict, text: str) -> bool:
             r"^(?:(?:OSError|IOError): (?:\[Errno 28\](?:\s|:|$)|No space left on device)"
             r"|System\.IO\.IOException:.*No space left on device)", re.I)
         def disk_block(block):
-            lines = [line.strip() for line in block.splitlines() if line.strip()]
-            # Le message de la dernière exception peut couvrir plusieurs lignes.
+            # Garder l'indentation : le source d'un cadre n'est pas
+            # l'exception externe. Son stderr peut lui-même citer un traceback.
+            lines = [line for line in block.splitlines() if line.strip()]
             exceptions = [i for i, line in enumerate(lines)
                           if re.match(r"[\w.]+(?:Error|Exception):", line)]
             if not exceptions:
                 return False
-            final_index = exceptions[-1]
+            final_index = exceptions[0]
+            # Une cause disque directe peut être suivie d'une exception
+            # enveloppante. S'arrêter dès celle-ci : ses lignes de message
+            # ne doivent jamais remplacer son propre verdict.
+            for index in exceptions[1:]:
+                if re.match(r"AssertionError:", lines[final_index]):
+                    break
+                between = lines[final_index + 1:index]
+                chained = any(line in (
+                    "During handling of the above exception, another exception occurred:",
+                    "The above exception was the direct cause of the following exception:")
+                              for line in between)
+                if not (chained or final_disk.search(lines[final_index])):
+                    break
+                final_index = index
             final = lines[final_index]
             message = "\n".join(lines[final_index:])
             # Seul un code de retour non nul comparé à zéro peut remonter
