@@ -1894,6 +1894,15 @@ class Approvals(Domain):
         """Consomme l'approbation une seule fois, par (approver, nonce) :
         faux si ce nonce était déjà consommé."""
 
+    @abc.abstractmethod
+    def merge_meta(self, approval_id: int, values: dict) -> dict | None:
+        """Fusionne `values` dans le meta de l'approbation et rend le meta
+        résultant ; None si elle n'existe plus.
+
+        Le meta n'est pas couvert par `signed_payload` : cette écriture ne
+        change ni la preuve ni sa validité, elle garde un contexte de lecture
+        (par exemple le harnais courant divergent, #5759)."""
+
 
 class Nonces(Domain):
     """Registre des nonces consommés (`mesh_consumed_nonces`)."""
