@@ -10,8 +10,17 @@
   ameesh watch fire --agent A --wake S          what a wake unit runs
 
 A watch is a systemd user timer (`ameesh-watch-<agent>.timer`) that runs
-`ameesh watch send` every period: it sends the agent the instruction
-shipped with the package (`consignes/veille.md`, versioned), from `veille`.
+`ameesh watch send` every period. Before waking anyone, a firing does its own
+reading — the projects board (agents and open lots), the active alerts and the
+agent's due lots (`actionable`, `due_wakes`) — and fingerprints it (#5698).
+An unchanged reading never opens a turn: if the agent had a turn within the
+last 30 minutes nothing is sent, otherwise a short `--info` note is deposited
+(read at the next turn). A changed reading sends the instruction shipped with
+the package (`consignes/veille.md`, versioned), from `veille`, and stores the
+fingerprint on the watch row; a change seen within 30 minutes of the agent's
+own turn is kept pending (nothing sent, the next firing whose turn is older
+sends it). An
+unreadable reading never mutes the watch: the instruction is sent.
 The watch is recorded in the database (`agent_watches`, 0362): `ameesh
 projects` shows it from any host, and enabling or disabling it is noted in
 the agent's thread. A timer whose watch was disabled, or moved to another
@@ -34,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -88,6 +98,19 @@ PINNED_ENV = {
 #: a firing longer than this is stopped by systemd: it never holds the watch's
 #: row (and the moves or disables waiting for it) for long (codex r2, #303)
 FIRING_TIMEOUT_S = 300
+#: #5698 : fenêtre d'un tour récent. Un destinataire qui a eu un tour dans
+#: cette fenêtre ne reçoit pas de note « rien n'a changé » : elle serait lue
+#: au tour suivant, sans rien lui apprendre de neuf.
+RECENT_TURN_S = 1800
+#: #5698 : clé du méta du fil qui porte l'empreinte de la lecture d'un tir.
+READING_KEY = "watch"
+#: #5698 : la note passive déposée quand la lecture n'a pas changé (elle
+#: n'ouvre pas de tour : elle est lue au tour suivant).
+UNCHANGED_TEXT = (
+    "WATCH (no change) — %s: nothing changed since the last watch "
+    "(projects, alerts, due lots). No action expected; this note is read at "
+    "your next turn."
+)
 #: lot #1020: the identity a wake unit carries BY CONSTRUCTION. The runner
 #: sets it for the session it launches, but not for a systemd unit an agent
 #: arms for later: without this line the wake fails at the deadline with
@@ -722,40 +745,212 @@ def _refuse_foreign(cfg: Config, env: dict | None, what: str, regenerate: str) -
             "Regenerate it on this host: %s" % (what, cfg.host, own, regenerate))
 
 
+def _agent_reading(row: dict) -> list:
+    """The stable part of an agent row for the watch's fingerprint.
+
+    The running/idle churn of a turn is not a change the watch must see (it
+    happens at every turn); a stop, a block, a pause, a mode, an assignment or
+    a project change is."""
+    status = str(row.get("status") or "")
+    projects = row.get("projects")
+    if isinstance(projects, (list, tuple)):
+        projects = sorted(str(project) for project in projects)
+    else:
+        projects = str(projects or "")
+    return [
+        str(row.get("name") or ""),
+        "up" if status in ("running", "idle") else status,
+        str(row.get("mode") or ""),
+        bool(row.get("operator_paused")),
+        str(row.get("operator_pause_reason") or ""),
+        str(row.get("stop_reason") or ""),
+        str(row.get("team") or ""),
+        str(row.get("workstream") or ""),
+        projects,
+        str(row.get("responsible") or ""),
+        int(row.get("open_lots") or 0),
+    ]
+
+
+def _alerts_reading(db) -> dict:
+    """The active alerts, as the alerts pass persists them (`notify_state`).
+
+    An unreadable source is a marker, not a silence: while it stays
+    unreadable the fingerprint is stable (a reading failure does not wake the
+    agent), and it moves when the source becomes readable again."""
+    try:
+        body = storage.of(db).notify_liveness.read_state("alerts") or {}
+        active = body.get("active") if isinstance(body, dict) else {}
+    except Exception:  # noqa: BLE001 — a reading failure is not a change
+        return {"unreadable": True}
+    rows = []
+    for key, entry in (active or {}).items():
+        alert = entry.get("alert") if isinstance(entry, dict) else None
+        alert = alert if isinstance(alert, dict) else {}
+        rows.append([str(key), str(alert.get("type") or ""),
+                     bool(alert.get("critical"))])
+    return {"active": sorted(rows)}
+
+
+def _due_reading(db, agent: str, now: float) -> dict:
+    """The lots due to `agent`: actionable lots and elapsed scheduled wakes."""
+    st = storage.of(db)
+    actionable = st.lot_sessions.actionable(agent)
+    wakes = st.lot_sessions.due_wakes(agent, now)
+    return {
+        "actionable": sorted([
+            [int(row.get("id") or 0), str(row.get("state") or ""),
+             row.get("priority")] for row in actionable]),
+        "due_wakes": sorted([
+            [int(row.get("id") or 0),
+             round(float(row.get("wake_ts") or 0.0), 3)] for row in wakes]),
+    }
+
+
+def reading(db, agent: str, now: float | None = None,
+            board: dict | None = None) -> dict:
+    """#5698 : la lecture propre de la veille — projets, alertes, lots dus.
+
+    The projects part keeps only what a watch acts on: an agent's stop, block,
+    pause, mode, assignment or project, and the open lots' state and assignee.
+    Turn timestamps, counters, unread mail and spend are left out: they change
+    at every turn, not at the events the watch must see. `board` may be given
+    when the caller already read it (it also carries the recent-turn check).
+    """
+    from . import projects
+
+    now = time.time() if now is None else float(now)
+    if board is None:
+        board = storage.of(db).projects.board(max_lots=projects.MAX_LOTS)
+    raw_lots = list(board.get("lots") or [])
+    lots = sorted([
+        [lot.get("id"), str(lot.get("state") or ""),
+         str(lot.get("assignee") or ""), str(lot.get("app") or "")]
+        for lot in raw_lots], key=lambda row: int(row[0] or 0))
+    agents = sorted([_agent_reading(row) for row in board.get("agents") or []])
+    return {
+        "projects": {
+            "agents": agents,
+            "lots": lots,
+            "total": int(raw_lots[0].get("total") or 0) if raw_lots else 0,
+        },
+        "alerts": _alerts_reading(db),
+        "due": _due_reading(db, agent, now),
+    }
+
+
+def fingerprint(state: dict) -> str:
+    """The stable digest of a reading (sha256 of a canonical JSON)."""
+    data = json.dumps(state, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, default=str)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _unread_note(db, agent: str) -> bool:
+    """A `veille` note is already waiting in `agent`'s mailbox (#5698)."""
+    try:
+        rows = storage.of(db).mailbox.unread(agent, 200)
+    except Exception:  # noqa: BLE001 — a doubt keeps the note from stacking
+        return True
+    return any(row.get("sender") == SENDER for row in rows)
+
+
+def _recent_turn(board: dict | None, agent: str, now: float) -> bool:
+    """Has `agent` had a turn (or a state change) within `RECENT_TURN_S`?"""
+    if not board:
+        return False
+    row = next((row for row in board.get("agents") or []
+                if row.get("name") == agent), None)
+    if row is None:
+        return False
+    if str(row.get("status") or "") == "running":
+        return True
+    last = max(float(row.get("last_turn_ts") or 0.0),
+               float(row.get("status_since_ts") or 0.0))
+    return last > 0 and now - last < RECENT_TURN_S
+
+
 def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
-         env: dict | None = None) -> str:
+         env: dict | None = None, now: float | None = None) -> str:
     """One firing: the instruction to `agent` when its watch is recorded for
-    this host; else nothing (disabled, or moved). The host check, the message
-    and `last_sent_ts` are one transaction on the watch row (codex r1 and r2,
-    #303): a move or a disable waits for a firing in progress, a firing after
-    them sends nothing, and a firing that fails drops no message, so that the
-    next one never sends a second copy. `mail_send(tx, agent, text)` drops the
-    message in the transaction (tests). What happened, in words."""
-    from . import mail, undeliverable
+    this host; else nothing (disabled, or moved).
+
+    #5698 : the firing first does its own reading (projects, alerts, due lots)
+    and fingerprints it. An unchanged reading does not open a turn: nothing is
+    sent while its last note is still unread, nothing when the agent had a
+    turn within `RECENT_TURN_S`, otherwise a short passive (`--info`) note is
+    deposited. A changed reading sends the instruction and the fingerprint is
+    stored on the watch row; a change seen right after a turn is kept pending
+    (nothing sent until a firing whose turn is older). A reading that cannot
+    be made never mutes the watch: the instruction is sent.
+
+    The host check, the message, `last_sent_ts` and the fingerprint are one
+    transaction on the watch row (codex r1 and r2, #303): a move or a disable
+    waits for a firing in progress, a firing after them sends nothing, and a
+    firing that fails drops neither the message nor the fingerprint, so that
+    the next one never sends a second copy.
+    `mail_send(tx, agent, text)` drops the message in the transaction (tests).
+    What happened, in words."""
+    from . import mail, projects, undeliverable
     _refuse_foreign(cfg, env, "watch of %s" % agent,
                     "ameesh watch enable --agent %s" % agent)
     host = cfg.host or ""
-    text = instruction(agent)
+    now = time.time() if now is None else float(now)
     rows = storage.of(db).watches.list(agent)
     # the project of the thread, read BEFORE the delivery (codex #303 r3): once
     # the message is committed, nothing may fail the firing (the timer would
     # retry, and send it twice)
     agent_row = registry.get(db, agent)
+    digest: str | None = None
+    changed = True
+    recent = False
+    passive = False
+    previous = rows[0].get("last_reading") if rows and rows[0]["host"] == host else None
     if rows and rows[0]["host"] == host:
         # the checks of `agent-mail send`, before the transaction (read only)
         try:
             undeliverable.check_send(cfg, db, sender=SENDER, dest=agent, explicit=True)
         except undeliverable.Refused as exc:
             raise WatchError("instruction to %s not sent: %s" % (agent, exc)) from exc
+        try:
+            board = storage.of(db).projects.board(max_lots=projects.MAX_LOTS)
+            state = reading(db, agent, now, board=board)
+            digest = fingerprint(state)
+            changed = previous is None or previous != digest
+            # a first firing always sends: the watch just got enabled and has
+            # no reading yet, even if the agent had a turn a minute ago.
+            recent = previous is not None and _recent_turn(board, agent, now)
+        except Exception as exc:  # noqa: BLE001 — a reading failure never mutes
+            print("warning: watch reading of %s unreadable: %s: %s"
+                  % (agent, type(exc).__name__, exc), file=sys.stderr)
+            digest, changed, recent = None, True, False
+        if not changed:
+            if recent:
+                return ("watch of %s: unchanged and a turn within %d min: nothing sent"
+                        % (agent, RECENT_TURN_S // 60))
+            if _unread_note(db, agent):
+                return ("watch of %s: unchanged, its last note is not read yet: "
+                        "nothing sent" % agent)
+            passive = True
+        elif recent:
+            # B/P2 cx3 : never consume a change on the strength of a recent
+            # turn. The change may be external or have happened after the
+            # agent's last turn; it stays pending, and the first firing whose
+            # turn is older sends the instruction.
+            return ("watch of %s: changed, but a turn within %d min: nothing sent "
+                    "(change kept pending)" % (agent, RECENT_TURN_S // 60))
+    text = UNCHANGED_TEXT % agent if passive else instruction(agent)
+    payload = {"info": True} if passive else None
     if mail_send is None:
         def mail_send(tx, recipient: str, body: str) -> int:
-            return mail.send(tx, SENDER, recipient, body, host=host, thread=False)
+            return mail.send(tx, SENDER, recipient, body, host=host,
+                             thread=False, payload=payload)
     sent: list[int] = []
 
     def deliver(tx) -> None:
         sent.append(mail_send(tx, agent, text))
     try:
-        row = storage.of(db).watches.deliver(agent, host, deliver)
+        row = storage.of(db).watches.deliver(agent, host, deliver, reading=digest)
     except WatchError:
         raise
     except Exception as exc:  # noqa: BLE001 — the unit fails, nothing was dropped
@@ -770,7 +965,12 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
     fil.record(cfg, db, sender=SENDER, recipients=[agent], text=text,
                project=fil.agent_project(agent_row) if agent_row else None,
                mailbox_ids=[int(m) for m in sent if isinstance(m, int)],
-               meta={"host": host})
+               meta={"host": host, READING_KEY: {
+                   "digest": digest, "changed": bool(changed),
+                   "passive": passive, "recent_turn": bool(recent)}})
+    if passive:
+        return ("watch of %s: unchanged, an information was deposited "
+                "(read at its next turn)" % agent)
     return "instruction sent to %s" % agent
 
 
