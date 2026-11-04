@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import db as db_mod
-from ameesh import fil, projects, storage, watch
+from ameesh import fil, projects, storage, watch, work
 
 from .support import EMPTY_CONFIG, PgTestCase
 
@@ -118,10 +118,66 @@ class TextTest(unittest.TestCase):
         self.assertIn("enable-linger u", watch.linger_warning(fails, "u"))
 
 
+class ReadingTest(unittest.TestCase):
+    """#5698 : l'empreinte de la lecture de veille ne bouge que sur ce qu'un
+    watch doit voir, jamais sur la valse d'un tour."""
+
+    @staticmethod
+    def board(**agent):
+        row = {"name": "mesh-design", "status": "idle", "mode": "execute",
+               "operator_paused": False, "operator_pause_reason": None,
+               "stop_reason": None, "team": "ameesh", "workstream": "ameesh",
+               "projects": ["ameesh"], "responsible": "human:owner",
+               "open_lots": 2, "last_turn_ts": 1.0, "status_since_ts": 2.0,
+               "unread": 3, "usd_24h": 1.5, "turns_24h": 4,
+               "session_lot_id": 1, "assigned_lot_id": 2}
+        row.update(agent)
+        return {"agents": [row],
+                "lots": [{"id": 1, "state": "build", "assignee": "mesh-design",
+                          "app": "ameesh", "total": 2},
+                         {"id": 2, "state": "build", "assignee": "orchestrateur",
+                          "app": "ameesh", "total": 2}]}
+
+    def reading(self, board):
+        with mock.patch.object(watch, "_alerts_reading", return_value={"active": []}), \
+                mock.patch.object(watch, "_due_reading",
+                                  return_value={"actionable": [], "due_wakes": []}):
+            return watch.reading(None, "mesh-design", now=0, board=board)
+
+    def test_the_fingerprint_ignores_turn_churn(self):
+        base = watch.fingerprint(self.reading(self.board()))
+        # a turn start/end, counters, unread mail, spend, the current session
+        # lot: none of them is a change the watch must react to.
+        churn = self.board(status="running", last_turn_ts=9.0, status_since_ts=9.0,
+                           unread=0, usd_24h=2.0, turns_24h=5,
+                           session_lot_id=2, assigned_lot_id=1)
+        self.assertEqual(watch.fingerprint(self.reading(churn)), base)
+
+    def test_the_fingerprint_moves_on_what_the_watch_acts_on(self):
+        base = watch.fingerprint(self.reading(self.board()))
+        for board in (self.board(status="blocked"),
+                      self.board(operator_paused=True),
+                      self.board(open_lots=0),
+                      self.board(stop_reason="budget"),
+                      self.board(team="other")):
+            self.assertNotEqual(watch.fingerprint(self.reading(board)), base)
+        moved_lot = self.board()
+        moved_lot["lots"][0]["state"] = "qa"
+        self.assertNotEqual(watch.fingerprint(self.reading(moved_lot)), base)
+
+
 class WatchTest(PgTestCase):
     def setUp(self) -> None:
+        self.db.execute("DELETE FROM agent_mailbox")
+        self.db.execute("DELETE FROM work_items")
         self.db.execute("DELETE FROM agent_watches")
+        self.db.execute("DELETE FROM notify_state")
         self.register("w121", "claude")
+        # #5698 : a previous test may have aged the turn; each test starts
+        # with a fresh one so "a turn within 30 min" is deterministic.
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now(), last_turn_at = NULL"
+            " WHERE name = 'w121'")
         self.units = tempfile.mkdtemp(prefix="ameesh-l121-")
         self.addCleanup(shutil.rmtree, self.units, True)
         self.env = {watch.UNIT_DIR_ENV: self.units, "PATH": "/usr/bin:/bin",
@@ -182,6 +238,14 @@ class WatchTest(PgTestCase):
         self.assertEqual(thread.call_args.kwargs["mailbox_ids"], [int(message["id"])])
         self.assertIsNotNone(storage.of(self.db).watches.list("w121")[0]["last_sent_ts"])
         sent = []
+        # #5698: a changed reading is what makes the firing deliver; force one
+        # so that the failing callback is exercised (an unchanged firing does
+        # not attempt a delivery at all). A turn within 30 min would have the
+        # change recorded without a message, so age the turn first.
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now() - interval '1 hour',"
+            " last_turn_at = now() - interval '1 hour' WHERE name = 'w121'")
+        work.add(self.db, title="a change the watch must see", app="ameesh")
         # a failed send is an error (the unit fails, visible in systemd)
         with self.assertRaises(watch.WatchError):
             watch.send(self.here, self.db, "w121", mail_send=self.failing)
@@ -201,6 +265,74 @@ class WatchTest(PgTestCase):
         self.assertEqual(sent, [])
         with self.assertRaises(watch.WatchError):
             watch.disable(self.here, self.db, "w121", run=self.run_, env=self.env)
+
+    def test_a_firing_reads_first_and_only_wakes_on_change(self):
+        # #5698: a firing reads projects, alerts and due lots first; an
+        # unchanged reading never opens a turn.
+        with mock.patch.object(watch.fil, "record"):
+            self.enable()
+            self.assertEqual(watch.send(self.here, self.db, "w121"),
+                             "instruction sent to w121")
+        [message] = [m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                     if m["sender"] == "veille"]
+        self.assertEqual(message["body"], watch.consigne("w121"))
+        first = storage.of(self.db).watches.list("w121")[0]["last_reading"]
+        self.assertTrue(first)
+        # the agent has just had a turn (registration): nothing more is sent
+        self.assertIn("turn within 30 min", watch.send(self.here, self.db, "w121"))
+        self.assertEqual([m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                          if m["sender"] == "veille"], [message])
+        # read, and no recent turn: the unchanged reading becomes a passive
+        # `--info` note (it never opens a turn)
+        storage.of(self.db).mailbox.mark_delivered([int(message["id"])])
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now() - interval '1 hour',"
+            " last_turn_at = now() - interval '1 hour' WHERE name = 'w121'")
+        self.assertIn("information was deposited", watch.send(self.here, self.db, "w121"))
+        [note] = [m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                  if m["sender"] == "veille"]
+        self.assertEqual(note["payload"], {"info": True})
+        self.assertEqual(note["body"], watch.UNCHANGED_TEXT % "w121")
+        self.assertNotEqual(note["body"], watch.consigne("w121"))
+        self.assertEqual(storage.of(self.db).watches.list("w121")[0]["last_reading"], first)
+        # a changed reading right after a turn is recorded without a message:
+        # the agent is not woken for its own work ...
+        storage.of(self.db).mailbox.mark_delivered([int(note["id"])])
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now(), last_turn_at = now()"
+            " WHERE name = 'w121'")
+        work.add(self.db, title="a change the watch must see", app="ameesh")
+        self.assertIn("nothing sent (reading recorded)",
+                      watch.send(self.here, self.db, "w121"))
+        self.assertEqual([m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                          if m["sender"] == "veille"], [])
+        recorded = storage.of(self.db).watches.list("w121")[0]["last_reading"]
+        self.assertNotEqual(recorded, first)
+        # ... and a later change, with no recent turn, sends the instruction
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now() - interval '1 hour',"
+            " last_turn_at = now() - interval '1 hour' WHERE name = 'w121'")
+        work.add(self.db, title="a second change the watch must see", app="ameesh")
+        self.assertEqual(watch.send(self.here, self.db, "w121"),
+                         "instruction sent to w121")
+        [last] = [m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                  if m["sender"] == "veille"]
+        self.assertFalse((last["payload"] or {}).get("info"))
+        self.assertEqual(last["body"], watch.consigne("w121"))
+        self.assertNotEqual(storage.of(self.db).watches.list("w121")[0]["last_reading"],
+                            recorded)
+
+    def test_an_unreadable_reading_never_mutes_the_watch(self):
+        # #5698: the reading is a comfort, not a gate; if it cannot be made,
+        # the instruction still goes (a failure must not silence the watch).
+        with mock.patch.object(watch.fil, "record"):
+            self.enable()
+            with mock.patch.object(watch, "reading",
+                                   side_effect=RuntimeError("database down")):
+                self.assertEqual(watch.send(self.here, self.db, "w121"),
+                                 "instruction sent to w121")
+        self.assertEqual(len([m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                              if m["sender"] == "veille"]), 1)
 
     def test_linger_off_is_a_warning(self):
         self.linger = "no"
@@ -280,6 +412,12 @@ class WatchTest(PgTestCase):
         # a failed send leaves last_sent_ts untouched (rolled back)
         other.execute("update agent_watches set host = 'laptop', last_sent_at = null"
                       " where agent = 'w121'")
+        # #5698 : same reading as the first send; age the turn and force a
+        # change so the firing really attempts the delivery.
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now() - interval '1 hour',"
+            " last_turn_at = now() - interval '1 hour' WHERE name = 'w121'")
+        work.add(self.db, title="a change the watch must see", app="ameesh")
         with self.assertRaises(watch.WatchError):
             watch.send(self.here, self.db, "w121", mail_send=self.failing)
         self.assertIsNone(storage.of(self.db).watches.list("w121")[0]["last_sent_ts"])
@@ -301,6 +439,13 @@ class WatchTest(PgTestCase):
             if instructions() > before:
                 raise db_mod.Unavailable("registry down")
             return real(db, name)
+        # #5698: only a changed reading delivers; make one so the firing goes
+        # through the delivery path this test fences, and age the turn so the
+        # change is not merely recorded.
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now() - interval '1 hour',"
+            " last_turn_at = now() - interval '1 hour' WHERE name = 'w121'")
+        work.add(self.db, title="a change the watch must see", app="ameesh")
         with mock.patch.object(watch.registry, "get", side_effect=down_after_delivery), \
                 mock.patch.object(watch.fil, "record"):
             self.assertEqual(watch.send(self.here, self.db, "w121"),
