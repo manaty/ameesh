@@ -2360,6 +2360,33 @@ def _refetch_tip_objects(where: str, url: str, branch: str) -> str:
     return resolutions._err(proc)[:300] if proc.returncode else ""
 
 
+def _drop_queue_ref_conflicts(clone: str, names) -> list[str]:
+    """#5741 : retire les refs de file qui occupent le chemin d'un nom demandé.
+
+    `refs/ameesh/queue/<branche>` est un chemin de fichiers : une ref restée
+    d'une branche supprimée (`.../lot`) empêche Git de créer `.../lot/x`, et
+    une ref `.../lot` ne peut pas naître tant que des refs `.../lot/x`
+    subsistent (conflit fichier/dossier). Ces refs ne sont qu'un cache de
+    `fetch_fresh`, qui refait chaque nom demandé : retirer celle qui bloque ne
+    perd aucune preuve. Rend les refs retirées ; vide si le listing est
+    illisible, le fetch tentera et son erreur sera nommée."""
+    from . import resolutions
+    wanted = {QUEUE_REF + _remote_branch(name) for name in names}
+    listing = resolutions._run(clone, "for-each-ref", "--format=%(refname)", QUEUE_REF)
+    if listing.returncode:
+        return []
+    dropped = []
+    for ref in resolutions._text(listing).splitlines():
+        ref = ref.strip()
+        if not ref or ref in wanted:
+            continue
+        if any(wanted_ref.startswith(ref + "/") or ref.startswith(wanted_ref + "/")
+               for wanted_ref in wanted):
+            if resolutions._run(clone, "update-ref", "-d", ref).returncode == 0:
+                dropped.append(ref)
+    return dropped
+
+
 def _fetch_refusal(where: str, error: str) -> str:
     """#3181 : la suite du refus d'un fetch, selon sa cause. Une corruption
     locale (objet ou ref vides après une coupure de courant) ne se résorbe pas
@@ -2371,6 +2398,11 @@ def _fetch_refusal(where: str, error: str) -> str:
         return ("(%s): repair the clone %s and its alternates by hand (git fsck), "
                 "waiting for the remote will not fix it"
                 % (resolutions.fetch_failure(error)[:300], where))
+    if any(cause in error for cause in ("unable to create directory",
+                                        "No space left on device",
+                                        "Read-only file system", "Disk quota exceeded")):
+        return ("(%s): the clone's filesystem cannot create the ref directory "
+                "(disk full or read-only clone?), not the forge" % error[:300])
     return "(%s): try again once the remote answers" % error[:300]
 
 
@@ -2492,10 +2524,12 @@ def fetch_fresh(repo: str, names, clone=None,
     an `origin`, they are listed on it, then fetched from it now into the
     radar's clone (`clone`, a `resolutions.Replayer`: never into the agents'
     repository), under QUEUE_REF; neither a local branch nor the cached
-    `origin/<branch>` counts, since another host may have pushed since. No
-    clone, or a remote that does not answer, raises QueueError: no fetch, no
-    tip. Without an `origin`, `repo` is the only copy and its local branches
-    are the tips.
+    `origin/<branch>` counts, since another host may have pushed since. A
+    stale queue ref left by a deleted branch that occupies another's path
+    (`.../lot` against `.../lot/x`) is dropped before the fetch (#5741): it
+    is only a cache, never a proof. No clone, or a remote that does not
+    answer, raises QueueError: no fetch, no tip. Without an `origin`, `repo`
+    is the only copy and its local branches are the tips.
 
     #2738 : les objets de chaque tête sont vérifiés dans le clone avant d'être
     rendus, avec ceux de la cible (B1 : la fusion lit la base et l'ancêtre
@@ -2536,6 +2570,10 @@ def fetch_fresh(repo: str, names, clone=None,
                       if "\t" in line}
             present = {b for b in wanted if "refs/heads/" + b in listed}
         if failed is None and present:
+            # #5741 : une ref de file morte (branche renommée/supprimée) peut
+            # occuper le chemin d'une autre ; ce cache se refait, il ne doit
+            # pas bloquer le fetch (D/F des refs, pas une forge muette).
+            _drop_queue_ref_conflicts(clone.path, present)
             proc = resolutions._run(clone.path, "fetch", "--quiet", url,
                                     *("+refs/heads/%s:%s%s" % (b, QUEUE_REF, b)
                                       for b in sorted(present)), timeout=FETCH_TIMEOUT)
