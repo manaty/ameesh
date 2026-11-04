@@ -454,6 +454,19 @@ class TickTest(PgTestCase):
         self.assertEqual(set(alert_briefs.briefs(alert, listing)) - {"auditeur"},
                          {"pilot"})
 
+    def test_two_failing_sources_of_one_pass_are_two_alerts(self):
+        # #5695 verdict mty-amh-impl-03: `advance` dates both reads with the
+        # same `now`; the alert identity must still tell the projects apart.
+        from ameesh import exploitation
+        api = storage.of(self.db).fingerprints
+        for project in ("nexlink", "liquichain"):
+            api.advance(project, "https://%s.example/f" % project, "c", now=1000.0)
+            api.fail(project, "https://%s.example/f" % project,
+                     "fingerprints source %s: HTTP 401" % project, now=1061.0)
+        alerts = fingerprints.alerts(self.db, 1000.0 + fingerprints.FAILING_ALERT_S)
+        self.assertEqual(sorted(a["project"] for a in alerts), ["liquichain", "nexlink"])
+        self.assertEqual(len({exploitation.alert_key(a) for a in alerts}), 2)
+
     def test_a_read_source_alerts_only_after_the_delay_and_clears_on_success(self):
         payload = page()
         error = fingerprints.FingerprintError("fingerprints source nexlink: HTTP 503")
