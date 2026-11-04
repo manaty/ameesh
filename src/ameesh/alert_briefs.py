@@ -51,7 +51,9 @@ from . import sous_utilisation, vocab, work_lifecycle as lifecycle
 BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
                  "host_idle_reserved", "baseline_oversized", "host_release_failed",
                  "host_release_overdue", "host_release_no_runs",
-                 "host_release_canon_unreadable", "idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
+                 "host_release_canon_unreadable",
+                 # #5695 : l'équipe du projet de la source renouvelle son jeton
+                 "fingerprints_source_failing", "idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
                  "critical_budget_pause", "idle_actionable_lot", "slo_breach",
                  # #1466 : une pause qui dure est un plafond périmé, un compte
@@ -1243,6 +1245,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                      "host_release_no_runs", "host_release_canon_unreadable"):
             text = alert["detail"]
             teams = set()
+        elif kind == "fingerprints_source_failing":
+            text = alert["detail"]
+            teams = {alert["project"]} if alert.get("project") else set()
         elif kind == "notify_undeliverable":
             # #3007 : aucun notificateur vivant ne couvre l'humain ; tous les
             # orchestrateurs de l'alerte et l'auditeur la reçoivent.

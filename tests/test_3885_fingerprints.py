@@ -395,6 +395,98 @@ class TickTest(PgTestCase):
         self.assertIn("unknown field", state["last_error"])
         self.assertIsNone(state["cursor"])
 
+    def refused(self):
+        return fingerprints.FingerprintError("fingerprints source nexlink: HTTP 401")
+
+    def test_a_refused_token_is_retried_every_15_min_not_each_minute(self):
+        # #5695: AG2 failed 1 365 times on 03/11 on one rejected token.
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([declaration()], "")), \
+                mock.patch.object(fingerprints, "read_page",
+                                  side_effect=self.refused()) as read:
+            with self.assertRaisesRegex(fingerprints.FingerprintError, "HTTP 401"):
+                fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
+                                  now=1000.0)
+            self.assertEqual(fingerprints.tick(self.cfg, self.db,
+                                               token_file=self.token_file(),
+                                               now=1061.0), [])
+            self.assertEqual(read.call_count, 1)
+            with self.assertRaisesRegex(fingerprints.FingerprintError, "HTTP 401"):
+                fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
+                                  now=1000.0 + fingerprints.AUTH_RETRY_S)
+            self.assertEqual(read.call_count, 2)
+        state = storage.of(self.db).fingerprints.state("nexlink")
+        self.assertIn("HTTP 401", state["last_error"])
+
+    def test_another_failure_keeps_the_declared_cadence(self):
+        error = fingerprints.FingerprintError("fingerprints source nexlink: HTTP 503")
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([declaration()], "")), \
+                mock.patch.object(fingerprints, "read_page", side_effect=error) as read:
+            for moment in (1000.0, 1061.0):
+                with self.assertRaisesRegex(fingerprints.FingerprintError, "HTTP 503"):
+                    fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
+                                      now=moment)
+        self.assertEqual(read.call_count, 2)
+
+    def test_a_refused_source_alerts_its_project_with_the_gesture(self):
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([declaration()], "")), \
+                mock.patch.object(fingerprints, "read_page", side_effect=self.refused()):
+            with self.assertRaises(fingerprints.FingerprintError):
+                fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
+                                  now=1000.0)
+        # never read: no healthy moment to wait from, the alert is immediate
+        alerts = fingerprints.alerts(self.db, 1001.0, orchestrators=["pilot"])
+        self.assertEqual(len(alerts), 1)
+        alert = alerts[0]
+        self.assertEqual(alert["type"], "fingerprints_source_failing")
+        self.assertEqual(alert["project"], "nexlink")
+        self.assertTrue(alert["auth_refused"])
+        self.assertIn("FINGERPRINTS_READ_TOKEN", alert["detail"])
+        self.assertNotIn(TOKEN, alert["detail"])
+        self.assertIn("fingerprints_source_failing", notify.TYPE_LABELS)
+        from ameesh import alert_briefs, exploitation
+        self.assertIn("fingerprints_source_failing", exploitation.ALERT_TYPES)
+        listing = [{"name": "pilot", "projects": ["nexlink"]},
+                   {"name": "other", "projects": ["elsewhere"]}]
+        alert["orchestrators"] = ["pilot", "other"]
+        self.assertEqual(set(alert_briefs.briefs(alert, listing)) - {"auditeur"},
+                         {"pilot"})
+
+    def test_two_failing_sources_of_one_pass_are_two_alerts(self):
+        # #5695 verdict mty-amh-impl-03: `advance` dates both reads with the
+        # same `now`; the alert identity must still tell the projects apart.
+        from ameesh import exploitation
+        api = storage.of(self.db).fingerprints
+        for project in ("nexlink", "liquichain"):
+            api.advance(project, "https://%s.example/f" % project, "c", now=1000.0)
+            api.fail(project, "https://%s.example/f" % project,
+                     "fingerprints source %s: HTTP 401" % project, now=1061.0)
+        alerts = fingerprints.alerts(self.db, 1000.0 + fingerprints.FAILING_ALERT_S)
+        self.assertEqual(sorted(a["project"] for a in alerts), ["liquichain", "nexlink"])
+        self.assertEqual(len({exploitation.alert_key(a) for a in alerts}), 2)
+
+    def test_a_read_source_alerts_only_after_the_delay_and_clears_on_success(self):
+        payload = page()
+        error = fingerprints.FingerprintError("fingerprints source nexlink: HTTP 503")
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([declaration()], "")), \
+                mock.patch.object(fingerprints, "read_page",
+                                  side_effect=[payload, error, payload]):
+            fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
+                              actor="mesh-design", now=1000.0)
+            with self.assertRaises(fingerprints.FingerprintError):
+                fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
+                                  now=1061.0)
+            self.assertEqual(fingerprints.alerts(self.db, 1100.0), [])
+            late = fingerprints.alerts(self.db, 1000.0 + fingerprints.FAILING_ALERT_S)
+            self.assertEqual([a["since"] for a in late], [1000.0])
+            self.assertFalse(late[0]["auth_refused"])
+            fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
+                              actor="mesh-design", now=3000.0)
+        self.assertEqual(fingerprints.alerts(self.db, 9000.0), [])
+
     def test_the_notify_cli_refuses_fingerprints_outside_role_run(self):
         proc = self.mesh("notify", "--once", "--only", "fingerprints",
                          env=self.env(AMEESH_ROLE=""))
