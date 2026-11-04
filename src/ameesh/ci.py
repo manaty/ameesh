@@ -1078,6 +1078,8 @@ class Watcher:
         self._packet_shared: dict = {}
         self._disk_reads: dict = {}
         self._disk_checks: set = set()
+        self._disk_origins: dict = {}
+        self._disk_notified_hosts: set = set()
 
     def _cache_ttl(self) -> float:
         """La garde des lectures CI : le réglage `github.ci_ttl`, sinon le défaut."""
@@ -1278,6 +1280,7 @@ class Watcher:
             # #5751 : la collecte physique précède tout appel GitHub ; un
             # quota épuisé ou une découverte en panne ne doit pas l'affamer.
             native_out = []
+            self._disk_notified_hosts.clear()
             for repo in repos:
                 try:
                     native_out += self._native_disks(db, repo)
@@ -1430,34 +1433,59 @@ class Watcher:
         return self._disk_refusal_messages(db, repo)
 
     def _disk_refusal_messages(self, db, repo):
-        out, threads = [], []
+        from . import ci_disk
+        out, threads, notified = [], [], []
         with _atomic(db) as tx:
             st = storage.of(tx)
-            pending = st.ci.disk_refusals(repo)
-            if not pending:
+            groups = {}
+            for refusal in st.ci.disk_refusals(repo):
+                host = refusal["host"]
+                if (not ci_disk.HOST.fullmatch(host)
+                        or host in self._disk_notified_hosts):
+                    continue
+                groups.setdefault(host, []).append(refusal)
+            if not groups:
                 return []
             to = self._project_pilot(tx, repo)
             if not to:
                 return []  # les refus non acquittés restent dus au prochain tour
-            for refusal in pending:
-                data = refusal["payload"]
+            for host, refusals in groups.items():
+                # Anciennes lignes comprises : aucun texte libre du spool ou
+                # des annotations n'entre dans le corps NI dans son payload.
+                events = []
+                for refusal in refusals:
+                    data = refusal["payload"]
+                    if (not re.fullmatch(r"[0-9a-f]{32}", refusal["event_id"])
+                            or type(data.get("run_id")) is not int
+                            or not 0 < data["run_id"] < 2**64
+                            or type(data.get("attempt")) is not int
+                            or not 0 < data["attempt"] < 2**32):
+                        continue
+                    events.append(dict(ci_disk.numeric_metrics(data), id=refusal["event_id"],
+                        run_id=data["run_id"], attempt=data["attempt"]))
+                if not events:
+                    continue
+                last = events[-1]
                 text = ("CI non concluante : marge disque insuffisante ou illisible (#5742). "
-                        "Part refusée sur %s (%s), job %s, tentative %s. "
-                        "Aucun test lancé. Vérifier le disque et la rétention native. "
-                        "https://github.com/%s/actions/runs/%s\n%s" % (
-                            refusal["host"], data["runner"], data["job"], data["attempt"],
-                            repo, data["run_id"], data["reason"]))
-                payload = {"ci_disk_refusal": dict(refusal, payload=data)}
-                # Info opérationnelle au pilote : ne fabrique ni test négatif,
-                # ni verdict, ni preuve d'interruption urgente d'un lot.
-                short = ("CI non concluante : part refusée pour marge disque sur %s. "
-                         "Aucun test lancé. https://github.com/%s/actions/runs/%s" % (
-                             refusal["host"], repo, data["run_id"]))
-                message = _send(tx, to, text, short, lot=None, payload=payload, urgent=False,
+                        "%d part(s) refusée(s) sur %s. Aucun test lancé pour ces refus. "
+                        "Dernière mesure : libre %s octets, inodes disponibles %s, "
+                        "minimum %s octets. Vérifier le disque et la rétention native. "
+                        "https://github.com/%s/actions/runs/%d" % (
+                            len(events), host, last["free_bytes"], last["available_inodes"],
+                            last["required_bytes"], repo, last["run_id"]))
+                payload = {"ci_disk_refusal": {"repo": repo, "host": host,
+                                               "count": len(events), "events": events}}
+                message = _send(tx, to, text, text, lot=None, payload=payload, urgent=False,
                                 after_commit=threads)
-                st.ci.set_disk_refusal_message(repo, host=refusal["host"],
-                    event_id=refusal["event_id"], message_id=message)
+                reported_ids = {event["id"] for event in events}
+                for refusal in refusals:
+                    if refusal["event_id"] not in reported_ids:
+                        continue
+                    st.ci.set_disk_refusal_message(repo, host=host,
+                        event_id=refusal["event_id"], message_id=message)
+                notified.append(host)
                 out.append(dict(action="disk_refusal", repo=repo, to=to, message_id=message))
+        self._disk_notified_hosts.update(notified)
         for record in threads:
             record(db.cfg, db)
         return out
@@ -1470,6 +1498,13 @@ class Watcher:
         """
         from . import ci_disk
         try:
+            origin_key = (repo, int(row["run_id"]))
+            if origin_key not in self._disk_origins:
+                run = self.api("repos/%s/actions/runs/%s" % origin_key) or {}
+                origin = (run.get("head_repository") or {}).get("full_name") or ""
+                self._disk_origins[origin_key] = origin.casefold() == repo.casefold()
+            if not self._disk_origins[origin_key]:
+                return []  # un fork ne peut écrire au pilote du dépôt de base
             path = "repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100" % (
                 repo, row["run_id"], row.get("run_attempt") or 1)
             jobs = self.api(path) or {}

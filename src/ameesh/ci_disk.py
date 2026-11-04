@@ -213,6 +213,15 @@ def observe_refusal(repo, host, refusal, store, *, now):
     attempt = str(refusal.get("attempt", ""))
     if not run_id.isdecimal() or not attempt.isdecimal() or len(run_id) > 20 or len(attempt) > 10:
         return
-    payload = {k: str(refusal.get(k, ""))[:1000] for k in ("job", "runner", "reason")}
+    if not 0 < int(run_id) < 2**64 or not 0 < int(attempt) < 2**32:
+        return
+    payload = numeric_metrics(refusal)
     payload.update(run_id=int(run_id), attempt=int(attempt), sampled_ts=refusal["sampled_ts"])
     store.observe_disk_refusal(repo, host=host, event_id=refusal["id"], payload=payload)
+
+
+def numeric_metrics(data):
+    """Projection fermée : les données du code testé ne sont jamais du texte
+    d'instruction pour le pilote, pas même dans la charge du courrier."""
+    return {key: value if type(value := data.get(key)) is int and 0 <= value < 2**63 else None
+            for key in ("free_bytes", "available_inodes", "required_bytes")}

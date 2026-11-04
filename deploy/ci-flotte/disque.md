@@ -299,11 +299,16 @@ et une annotation `ameesh-ci-disk-refusal/1`. Le répertoire persistant est
 installé pour `runner`, hors du workspace et des temporaires des tests. Si
 ENOSPC empêche même cette écriture, l'annotation reste le secours. Le veilleur
 récupère les fichiers par SSH et les annotations des jobs en échec de la
-tentative suivie. La migration 0544 conserve les refus et leur courrier ;
+tentative suivie, uniquement si le dépôt de tête du run est le dépôt suivi
+(les forks et les origines inconnues sont exclus du secours). La migration 0544 conserve les refus et leur courrier ;
 l'UUID commun aux deux transports évite les doubles envois, y compris après
 un redémarrage ou avec un alias différent pour la machine. L'envoi au pilote
 et son acquittement sont dans une même transaction. Aucun destinataire ou
-un envoi en panne laisse le refus en attente ; aucun test négatif ni verdict
+un envoi en panne laisse le refus en attente. Le courrier et sa charge ne
+contiennent que des identifiants validés et des mesures numériques : aucun
+reason, job, runner ou autre texte libre issu du code testé. Les refus sont
+regroupés en un seul courrier par hôte et par passage du veilleur ; un refus
+arrivé après ce courrier reste dû au passage suivant. Aucun test négatif ni verdict
 rouge n'est inventé. Les fichiers restent sept jours et les acquittements
 huit jours ; les refus non acquittés restent dus en base. Le transport lit au
 plus 10 000 fichiers par passe et envoie au plus 100 courriers par transaction.

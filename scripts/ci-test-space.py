@@ -32,9 +32,13 @@ def verifier(chemin: Path, minimum_gib: float) -> None:
     libre = etat.f_bavail * etat.f_frsize
     # Certains FS n'ont pas de table d'inodes bornée (f_files == 0).
     if libre < minimum_gib * GIB or (etat.f_files and etat.f_favail < MIN_INODES):
-        raise OSError("%s : %.2f GiB libres, %s inodes disponibles "
+        erreur = OSError("%s : %.2f GiB libres, %s inodes disponibles "
                       "(minimum %.1f GiB / %d inodes)"
                       % (chemin, libre / GIB, etat.f_favail, minimum_gib, MIN_INODES))
+        erreur.ci_free_bytes = libre
+        erreur.ci_available_inodes = etat.f_favail
+        erreur.ci_required_bytes = int(minimum_gib * GIB)
+        raise erreur
 
 
 def signaler_refus(erreur):
@@ -45,9 +49,10 @@ def signaler_refus(erreur):
              "id": uuid.uuid4().hex, "repo": os.environ.get("GITHUB_REPOSITORY", ""),
              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
              "attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
-             "job": os.environ.get("GITHUB_JOB", ""),
-             "runner": os.environ.get("RUNNER_NAME", ""),
-             "sampled_ts": time.time(), "reason": str(erreur)[:1000]}
+             "sampled_ts": time.time(),
+             "free_bytes": getattr(erreur, "ci_free_bytes", None),
+             "available_inodes": getattr(erreur, "ci_available_inodes", None),
+             "required_bytes": getattr(erreur, "ci_required_bytes", None)}
     # Deux transports, même identifiant : la notice reste utilisable quand
     # ENOSPC empêche précisément d'écrire le refus local.
     print("::notice title=ameesh-ci-disk-refusal/1::" + json.dumps(event).replace("%", "%25"), flush=True)
