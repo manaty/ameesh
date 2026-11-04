@@ -113,9 +113,11 @@ verifier() {
 
 preparer() {
   etape "accès forge de l'utilisateur ameesh"
+  # #5787 : root ne touche pas au home d'ameesh (un lien ~/.ssh vers
+  # /etc/systemd/system lui ferait écrire une unité) : tout par runuser.
   ssh_vm "set -e
-    install -d -m 700 -o ameesh -g ameesh /home/ameesh/.ssh
-    cat > /home/ameesh/.ssh/config <<EOF
+    runuser -u ameesh -- install -d -m 700 /home/ameesh/.ssh
+    runuser -u ameesh -- sh -c 'umask 077 && cat > /home/ameesh/.ssh/config && chmod 600 /home/ameesh/.ssh/config' <<EOF
 # Clés de déploiement du mesh (L57)
 Host github-canon
   HostName github.com
@@ -126,8 +128,7 @@ Host github.com
   User git
   IdentityFile ~/.ssh/$CLE_CODE
   IdentitiesOnly yes
-EOF
-    chown ameesh:ameesh /home/ameesh/.ssh/config; chmod 600 /home/ameesh/.ssh/config"
+EOF"
   etape "canon"
   ssh_vm "set -e; [ -d /home/ameesh/canon ] || runuser -u ameesh -- git clone -q $CANON_DEPOT /home/ameesh/canon
     runuser -u ameesh -- git -C /home/ameesh/canon fetch -q
@@ -135,7 +136,7 @@ EOF
   etape "configuration ameesh du serveur"
   budget=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("budget_usd_per_hour") or "")' "$CONFIG")
   humains=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("humans") or []))' "$CONFIG")
-  ssh_vm "python3 - '$HOTE_VM' '$budget' '$humains' <<'EOF'
+  ssh_vm "runuser -u ameesh -- python3 - '$HOTE_VM' '$budget' '$humains' <<'EOF'
 import json, sys
 p = '/home/ameesh/.config/ameesh/config.json'
 c = json.load(open(p))
@@ -161,8 +162,12 @@ EOF"
       bases=$(git -C "$d" for-each-ref --format='^%(objectname)' refs/remotes/origin/main refs/remotes/origin/develop)
       # shellcheck disable=SC2086
       git -C "$d" bundle create -q "$TRAVAIL/$p.bundle" HEAD $bases
-      scp -q -o BatchMode=yes "$TRAVAIL/$p.bundle" "root@$VM:/tmp/$p.bundle"
-      ssh_vm "chown ameesh /tmp/$p.bundle; cd '$cible' && runuser -u ameesh -- git fetch -q /tmp/$p.bundle HEAD && rm -f /tmp/$p.bundle"
+      # #5787 : ni scp root vers un nom devinable de /tmp ni chown (un lien
+      # posé là par ameesh) : le paquet entre par l'entrée standard, écrit par
+      # ameesh dans son propre fichier temporaire.
+      ssh_vm "set -e; t=\$(runuser -u ameesh -- mktemp); trap 'rm -f \"\$t\"' EXIT
+        runuser -u ameesh -- sh -c 'cat > \"\$1\"' sh \"\$t\"
+        cd '$cible' && runuser -u ameesh -- git fetch -q \"\$t\" HEAD" < "$TRAVAIL/$p.bundle"
     fi
     # la branche pointe EXACTEMENT sur le commit du poste (pas sur la pointe
     # d'origin, qui peut différer quand les commits locaux sont sur d'autres
@@ -221,16 +226,18 @@ copier() {
   pg_dump -Fp --no-owner --no-privileges "$racine/ameesh_scission" -f "$TRAVAIL/mesh.sql"
   rm -f "$TRAVAIL/partage.sql"
   etape "chargement sur le serveur"
-  scp -q -o BatchMode=yes "$TRAVAIL/mesh.sql" "root@$VM:/tmp/mesh.sql"
+  # #5787 : ni /tmp/mesh.sql ni journal sous un nom devinable de /tmp (un lien
+  # posé là ferait écrire root ailleurs) : le vidage entre par l'entrée
+  # standard, le journal reste sous /root.
   ssh_vm "set -e
     runuser -u postgres -- psql -q -c 'DROP DATABASE IF EXISTS ameesh_essai'
     runuser -u postgres -- psql -q -c 'DROP DATABASE ameesh' -c 'CREATE DATABASE ameesh OWNER ameesh'
     # #3503 : la nouvelle base coupe le JIT pour tout rôle qui s'y connecte
     runuser -u postgres -- psql -q -d ameesh -c 'ALTER DATABASE ameesh SET jit = off'
-    runuser -u postgres -- psql -q -d ameesh -v ON_ERROR_STOP=1 -c 'set role ameesh' -f /tmp/mesh.sql > /tmp/mesh-restauration.log
-    rm -f /tmp/mesh.sql
+    umask 077; mkdir -p /root/.cache/ameesh
+    runuser -u postgres -- psql -q -d ameesh -v ON_ERROR_STOP=1 -c 'set role ameesh' -f - > /root/.cache/ameesh/mesh-restauration.log
     runuser -l ameesh -c 'ameesh migrate && ameesh doctor' | tail -5
-    runuser -l ameesh -c 'ameesh canon sync --fetch' | tail -8"
+    runuser -l ameesh -c 'ameesh canon sync --fetch' | tail -8" < "$TRAVAIL/mesh.sql"
   # Les sessions DeepSeek ne se déplacent pas : dsh inscrit le dossier de
   # travail d'origine dans l'en-tête et refuse de les reprendre ailleurs
   # (« corrupt session log … cwd identify … »). `demarrer` reprend donc les
