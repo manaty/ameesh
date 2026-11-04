@@ -67,6 +67,9 @@ class FakeShell:
         if cmd[0] == "agent-mail":
             self.mails.append((cmd[2], input_text))
             return ph.Result(0)
+        if cmd[0] == "gh":
+            # #5696 : forge illisible par défaut, le relevé d'ameesh fait foi
+            return ph.Result(1, "", "gh absent du banc")
         if cmd[0] == "git":
             if "ls-remote" in cmd:
                 return ph.Result(0, "%s\trefs/heads/integration/paquet-h-20261027-03\n" % HEAD)

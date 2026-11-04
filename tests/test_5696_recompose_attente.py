@@ -14,6 +14,9 @@ Témoins :
   (sortie 0) si le tic a recomposé entre-temps ; sans `--wait`, le refus
   reste immédiat ;
 - la ligne de commande documentée (EXPLOITATION) passe au parseur ;
+- la garde de fraîcheur est rejouée après chaque attente, sur la tête
+  chargée (B cx3) ; la forge est relue avant de refuser (relevé en retard) ;
+  le code périmé sort en 3, sans alerte (refus attendu, pas une panne) ;
 - un tic sorti en 1 ouvre un lot par empreinte et écrit au pilote et au
   bureau ; la même panne l'heure suivante garde la même empreinte.
 """
@@ -60,6 +63,10 @@ class WaitTest(HoraireBase):
         self.clock = Clock()
         self.ctx.clock = self.clock
         self.ctx.sleep = self.clock.sleep
+        # garde de fraîcheur rejouée après chaque attente : banc sans clone
+        fresh = mock.patch.object(ph, "check_fresh")
+        fresh.start()
+        self.addCleanup(fresh.stop)
 
     def cancelled(self):
         return self.shell.ran("ci", "cancel")
@@ -106,6 +113,43 @@ class WaitTest(HoraireBase):
             with self.assertRaisesRegex(ph.Busy, "en cours"):
                 ph.pilot_recompose(self.ctx, 4000, [3807], [], wait=60)
         self.assertEqual(sum(self.clock.slept), 60)
+
+    def test_cible_avancee_pendant_l_attente_aucun_geste(self):
+        # B cx3 : la garde de fraîcheur est rejouée après chaque attente
+        self.shell.ci[4000] = {"runs": [ci_run("in_progress")]}
+        heads = {"HEAD": HEAD, "origin": HEAD}
+        self.ctx.executed_head = HEAD
+
+        def fresh(ctx):
+            if heads["origin"] != ctx.executed_head:
+                raise ph.Stale("code périmé")
+
+        def sleep(seconds):
+            self.clock.sleep(seconds)
+            heads["origin"] = HEAD2
+
+        self.ctx.sleep = sleep
+        with mock.patch.object(ph, "check_fresh", side_effect=fresh) as checked:
+            with self.assertRaises(ph.Stale):
+                ph.pilot_recompose(self.ctx, 4000, [3801], [], wait=600)
+        self.assertEqual(checked.call_count, 1)
+        self.assertEqual(self.autos(), [])
+
+    def test_forge_terminee_vaut_fin_du_run(self):
+        # relevé d'ameesh en retard : la forge dit le run annulé, pas d'attente
+        self.shell.ci[4000] = {"runs": [ci_run("in_progress")]}
+        status = self.shell.run
+
+        def run(cmd, **kw):
+            if cmd[:3] == ["gh", "run", "view"]:
+                self.shell.calls.append(list(cmd))
+                return ph.Result(0, '{"status": "completed"}')
+            return status(cmd, **kw)
+
+        self.shell.run = run
+        ph.pilot_recompose(self.ctx, 4000, [3801], [])
+        self.assertEqual(self.clock.slept, [])
+        self.assertEqual(len(self.autos()), 1)
 
     def test_tete_changee_rien_a_faire(self):
         out = ph.pilot_recompose(self.ctx, 4000, [3801], [], expect_head=HEAD2[:12])
@@ -163,6 +207,42 @@ class CommandLineTest(unittest.TestCase):
         self.assertIn("--wait", argv)
         rc, _called = self.run_main(argv + ["--repo", "CLONE"])
         self.assertEqual(rc, 0)
+
+
+class FreshTest(HoraireBase):
+    def heads(self, local, remote):
+        status = self.shell.run
+
+        def run(cmd, **kw):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                return ph.Result(0, (remote if "origin/" in cmd[-1] else local) + "\n")
+            return status(cmd, **kw)
+
+        self.shell.run = run
+
+    def test_tete_executee_retenue_puis_clone_avance_refuse(self):
+        self.ctx.repo = ph.SCRIPT_DIR.parent
+        self.heads(HEAD, HEAD)
+        ph.check_fresh(self.ctx)
+        self.assertEqual(self.ctx.executed_head, HEAD)
+        # un autre processus a avancé le clone : HEAD == origin, code chargé ancien
+        self.heads(HEAD2, HEAD2)
+        with self.assertRaisesRegex(ph.Stale, "code chargé"):
+            ph.check_fresh(self.ctx)
+
+    def test_code_perime_sort_en_3_sans_alerte(self):
+        clone = tempfile.TemporaryDirectory(prefix="paquet-5696-")
+        self.addCleanup(clone.cleanup)
+        (pathlib.Path(clone.name) / ".git").mkdir()
+        zone = mock.Mock(timezone="Europe/Paris")
+        with mock.patch.object(ph, "pose_git_identity"), \
+                mock.patch("ameesh.config.load", return_value=None), \
+                mock.patch("ameesh.mechanics.configured", return_value=zone), \
+                mock.patch.object(ph, "run", side_effect=ph.Stale("code périmé")), \
+                mock.patch.object(ph, "alert_tick") as alert, \
+                mock.patch.object(ph, "Shell", return_value=self.shell):
+            rc = ph.main(["tick", "--repo", clone.name])
+        self.assertEqual((rc, alert.call_count), (ph.STALE_RC, 0))
 
 
 class TickAlertTest(HoraireBase):
