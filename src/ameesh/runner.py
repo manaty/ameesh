@@ -11677,7 +11677,12 @@ class Runner:
         self.expire_operator_pauses_once()  # #3961 : avant toute garde de passe
         self.lift_device_gates_once()
         for row in registry.reap(self.db, self.host):
-            log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
+            if row.get("residual"):
+                log("residual lease cleared: %s (status %s)"
+                    % (row["name"], row.get("status") or "?"))
+            else:
+                log("lease expired: %s (owner %s)"
+                    % (row["name"], row.get("lease_owner")))
         self.prune_events_once()   # L85 : après la moisson des baux, bornée
         finished = []
         with self.lock:

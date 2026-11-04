@@ -340,7 +340,8 @@ def claimable(db: Db, host: str, names: Sequence[str] | None = None, *,
 
 
 def reap(db: Db, host: str | None = None) -> list[dict]:
-    """Marque morts les agents dont le bail a expiré en plein tour."""
+    """Marque morts les agents dont le bail a expiré en plein tour, et retire
+    le bail échu d'un agent déjà arrêté (#5722)."""
     return storage.of(db).leases.reap(host)
 
 

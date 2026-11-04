@@ -1289,18 +1289,51 @@ class Leases(interface.Leases):
         return bool(rows and rows[0]["en_cours"])
 
     def reap(self, host) -> list[dict]:
-        sql = """
-            UPDATE agent_registry
-               SET status = 'dead', status_text = 'lease expired', stop_reason = 'bail_expire',
-                   updated_at = now()
-             WHERE status = 'running' AND lease_expires_at < clock_timestamp()
+        """Baux échus : un agent `running` devient `dead` ; le bail résiduel
+        d'un agent arrêté est retiré (#5722).
+
+        Un agent arrêté ne garde pas de bail : dès que son échéance est passée
+        — un tour en cours garde le sien jusqu'à sa fin —, la même passe
+        efface le détenteur et avance l'époque. Un agent `dead`, lui, garde son
+        bail échu : c'est la preuve lue par l'alerte `dead_runner`. `host`
+        restreint la passe à un hôte. Chaque ligne rendue porte `residual` :
+        vrai pour un bail retiré à un agent arrêté, faux pour un tour mort.
         """
+        where = ""
         params: tuple = ()
         if host is not None:
-            sql += " AND host = %s"
+            where = "AND host = %s"
             params = (host,)
-        sql += " RETURNING name, lease_owner, lease_epoch"
-        return self.db.query(sql, params)
+        expired = self.db.query(
+            """
+            UPDATE agent_registry
+               SET status = 'dead', status_text = 'lease expired',
+                   stop_reason = 'bail_expire', updated_at = now()
+             WHERE status = 'running' AND lease_expires_at < clock_timestamp()
+               __HOST__
+            RETURNING name, lease_owner, lease_epoch
+            """.replace("__HOST__", where),
+            params,
+        )
+        residual = self.db.query(
+            """
+            UPDATE agent_registry
+               SET lease_owner = NULL, lease_expires_at = NULL,
+                   lease_epoch = lease_epoch + 1, updated_at = now()
+             WHERE status = 'stopped'
+               AND lease_owner IS NOT NULL
+               AND (lease_expires_at IS NULL
+                    OR lease_expires_at <= clock_timestamp())
+               __HOST__
+            RETURNING name, status
+            """.replace("__HOST__", where),
+            params,
+        )
+        for row in expired:
+            row["residual"] = False
+        for row in residual:
+            row["residual"] = True
+        return expired + residual
 
     @track_change("rotation")
     def clear_session(self, name, owner, epoch) -> bool:
