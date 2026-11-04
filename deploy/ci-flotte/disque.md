@@ -298,11 +298,17 @@ texte libre du code testé ne passe dans le corps ni la charge du courrier :
 uniquement des identifiants validés et des nombres bornés. Ni test négatif
 ni preuve de réussite ne sont fabriqués par ce canal non fiable.
 
-Activation par le bureau après intégration : appliquer la migration 0544
-et les contrats de lecture superviseur (métadonnées d'état, payload réservé
-aux contenus), installer le script et les deux services/timers avec
-install-disque.sh --install, lancer une première mesure protégée, vérifier
-install-disque.sh --check et dispatcher le workflow dédié sur la base. Le
+Ordre de pose par le bureau (avis auditeur du 04/11/2026, #190079) :
+avant la fusion, ou dans la même fenêtre, installer ci-disque.py et les
+services/timers ameesh-ci-disque et ameesh-ci-mesure sur les trois VM
+ci-1, ci-2 et ci-3 avec install-disque.sh --install. Lancer une première
+mesure protégée et vérifier install-disque.sh --check avant que le nouveau
+workflow de base ne tourne : il appelle la sous-commande publication du
+script installé et échouerait avec l’ancienne version.
+
+Après intégration, appliquer la migration 0544 et les contrats de lecture
+superviseur (métadonnées d'état, payload réservé aux contenus), puis
+dispatcher le workflow dédié sur la base. Le
 nom physique du snapshot doit correspondre au label matrix.host ; si
 nécessaire, AMEESH_CI_DISQUE_HOST se pose dans le fichier d'environnement
 root-owned du service. Vérifier la date physique reçue et les alertes sur
