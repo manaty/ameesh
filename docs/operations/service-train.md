@@ -257,7 +257,8 @@ l'enregistrement du plan du créneau.
 
 `train_contracts.ameesh()` épingle les blobs de `.github/workflows/paquet.yml`
 (le run appelant), `.github/workflows/tests.yml` (le workflow appelé), du
-classifieur de l'agrégat (`ci-agregat.py`, #3251) et des planificateurs
+classifieur de l'agrégat (`ci-agregat.py`, #3251), du wrapper d'exécution
+(`ci-test-space.py`, #5742) et des planificateurs
 (`test-plan.py`, `test-parts.py`, `ci-flow.py`, `map.py`). La
 preuve est le run `push` de `paquet.yml` à la tête exacte : il doit référencer
 `tests.yml` au même SHA et porter les jobs appelés, préfixés par le job

@@ -289,7 +289,7 @@ jobs:
           # jamais bloquant : un échec sous mesure est noté dans la carte
           # #3604 : une borne par test (10 min) nomme un test bloqué au lieu
           # de laisser la part consommer le plafond de 60 min.
-          .venv-carte/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json" \
+          python3 scripts/ci-test-space.py -- .venv-carte/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json" \
             --part ${{ matrix.part }} --driver "$AMEESH_DRIVER" --test-timeout 600 \
             --measure "$M" --output-durations "$M/durees.json" --flow "$M/flux.jsonl" \
             || echo "::warning::tests en échec sous mesure (notés dans la carte)"

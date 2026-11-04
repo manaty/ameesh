@@ -17,6 +17,13 @@ l'agrégat, même si les 15 autres ont réussi ; seuls les non-concluants
 #3251 qui élargissait #128512 est justement le maillon qui a laissé passer
 h-13.
 
+#5742 : un ENOSPC explicite dans le log complet d'une part est une panne
+d'infrastructure. Tous ses tracebacks doivent être ENOSPC ; un autre
+négatif garde le rouge. Une famille qui conserve une part réussie et dont
+les autres parts sont toutes prouvées ENOSPC est consignée sans négatif.
+Sans log lisible, sans toutes les parts, ou sans aucune part réussie dans
+la famille, on ne fabrique pas de vert.
+
 Ce script sépare donc trois cas :
 
 * un **échec** (`failure`, ou une part sautée qui devait tourner) est un
@@ -69,12 +76,14 @@ Sans `--publish` (tests locaux), la classification seule est rendue.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import re
 import sys
 import urllib.error
 import urllib.request
+import urllib.parse
 
 #: nom du check de détail, partagé avec `ameesh.radar.AGGREGATE_DETAIL_CHECK`
 #: (un témoin de tests/test_3251_agregat_annulation.py verrouille l'égalité).
@@ -137,6 +146,90 @@ def _family_jobs(jobs, family: str) -> list:
             and str(job.get("name", "")).rsplit(" / ", 1)[-1].startswith(prefix)]
 
 
+
+def disk_infrastructure(job: dict, text: str) -> bool:
+    """#5742 : ENOSPC prouvé, sans masquer un autre échec de la part.
+
+    Lire le log entier ; un avertissement disque récupéré ne suffit pas.
+    Chaque traceback négatif doit être un ENOSPC. Sans traceback, seuls le
+    refus explicite du wrapper ou la mort du Worker en ENOSPC font preuve.
+    """
+    if job.get("conclusion") != "failure":
+        return False
+    steps = job.get("steps") or []
+    if not any(re.match(r"^part \d+", step.get("name", ""))
+               and step.get("status") in ("in_progress", "completed") for step in steps):
+        return False
+    if any(step.get("conclusion") == "failure"
+           and not re.match(r"^part \d+", step.get("name", ""))
+           for step in steps):
+        return False
+    text = re.sub(r"(?m)^\d{4}-\d\d-\d\dT\S+Z\s?", "", text)
+    disk = re.compile(r"\[Errno 28\]|No space left on device", re.I)
+    wrapper = "CI non concluante : marge disque insuffisante ou illisible" in text
+    if (not (disk.search(text) or wrapper)
+            or re.search(r"(?m)^not ok \d+|unexpected success|not raised|does not match", text, re.I)):
+        return False
+    headers = re.findall(r"(?m)^(?:ERROR|FAIL): .+", text)
+    blocks = re.findall(r"(?ms)^(?:ERROR|FAIL): [^\n]*\n-{20,}\n(.*?)"
+                        r"(?=^={20,}\n|^-{20,}\nRan |\Z)", text)
+    if headers:
+        # Un log interrompu au milieu d'un autre échec est une preuve incomplète.
+        final_disk = re.compile(
+            r"^(?:(?:OSError|IOError): (?:\[Errno 28\](?:\s|:|$)|No space left on device)"
+            r"|System\.IO\.IOException:.*No space left on device)", re.I)
+        def disk_block(block):
+            # Garder l'indentation : le source d'un cadre n'est pas
+            # l'exception externe. Son stderr peut lui-même citer un traceback.
+            lines = [line for line in block.splitlines() if line.strip()]
+            exceptions = [i for i, line in enumerate(lines)
+                          if re.match(r"[\w.]+(?:Error|Exception):", line)]
+            if not exceptions:
+                return False
+            final_index = exceptions[0]
+            # Une cause disque directe peut être suivie d'une exception
+            # enveloppante. S'arrêter dès celle-ci : ses lignes de message
+            # ne doivent jamais remplacer son propre verdict.
+            for index in exceptions[1:]:
+                if re.match(r"AssertionError:", lines[final_index]):
+                    break
+                between = lines[final_index + 1:index]
+                chained = any(line in (
+                    "During handling of the above exception, another exception occurred:",
+                    "The above exception was the direct cause of the following exception:")
+                              for line in between)
+                if not (chained or final_disk.search(lines[final_index])):
+                    break
+                final_index = index
+            final = lines[final_index]
+            message = "\n".join(lines[final_index:])
+            # Seul un code de retour non nul comparé à zéro peut remonter
+            # stderr ; les comparaisons de chaînes restent négatives.
+            returncode = re.match(r"AssertionError: -?[1-9][0-9]* != 0 : (.+)$", final)
+            if returncode and disk.search(message):
+                return True
+            if re.search(r"not found in| != |does not match|not raised", final, re.I):
+                return False
+            if final_disk.search(final):
+                return True
+            if re.match(r"AssertionError: git |(?:[\w.]+\.)?_ProvenanceError:", final):
+                return bool(disk.search(message))
+            if re.match(r"subprocess\.CalledProcessError:", final):
+                # Preuve dans stderr ou la cause du même bloc, pas le source.
+                return any(re.match(r"(?:OSError: \[Errno 28\]|(?:fatal|error):.*No space left on device)",
+                                    line, re.I) for line in lines[:final_index])
+            return False
+
+        if len(blocks) != len(headers) or not all(disk_block(block) for block in blocks):
+            return False
+        statuses = collections.Counter(re.findall(
+            r"(?m)^(test\S+)[^\n]* \.\.\. (?:ERROR|FAIL)\s*$", text))
+        names = collections.Counter(header.split()[1] for header in headers)
+        return all(count <= names[name] for name, count in statuses.items())
+    if re.search(r"(?m)^test[^\n]* \.\.\. (?:ERROR|FAIL)\s*$|^FAILED \(", text):
+        return False
+    return (wrapper or bool(re.search(r"System\.IO\.IOException:[^\n]*No space left on device", text)))
+
 def _job_stats(jobs, expected):
     """Les comptes d'une famille, ou None si ses jobs sont illisibles.
 
@@ -153,7 +246,10 @@ def _job_stats(jobs, expected):
     if jobs is None:
         return None
     rows = [job for job in jobs if isinstance(job, dict)]
-    conclusions = [_state(job.get("conclusion")) for job in rows]
+    infrastructure = [job for job in rows if job.get("infrastructure") == "disk-full"
+                      and _state(job.get("conclusion")) == "failure"]
+    conclusions = [_state(job.get("conclusion")) for job in rows
+                   if job not in infrastructure]
     successes = sum(1 for value in conclusions if value == "success")
     failures = sum(1 for value in conclusions
                    if value != "success" and value not in NON_CONCLUSIVE)
@@ -162,6 +258,7 @@ def _job_stats(jobs, expected):
     total = max(planned, len(rows))
     absent = max(0, planned - len(rows))
     return {"success": successes, "total": total, "failure": failures,
+            "infrastructure": len(infrastructure),
             "absent": absent, "nonconclusive": nonconclusive}
 
 
@@ -253,6 +350,28 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
             required: bool, jobs=None, expected=None) -> None:
         value = _state(result)
         row = {"part": name, "result": value or "absent", "parts": parts_text}
+        stats = _job_stats(jobs, expected) if required else None
+        if (value in ("failure", *NON_CONCLUSIVE) and stats is not None
+                and stats["infrastructure"]):
+            row["success"] = stats["success"]
+            detail = {"part": name + " (ENOSPC)", "result": "infrastructure",
+                      "parts": str(stats["infrastructure"]), "status": INCONCLUSIVE}
+            consigned.append(detail)
+            if not (stats["failure"] or stats["absent"] or stats["nonconclusive"]):
+                if stats["success"]:
+                    row["status"] = INCONCLUSIVE
+                else:
+                    row["status"] = MISSING
+                    missing.append("%s (ENOSPC, aucune part réussie, preuve absente)" % name)
+                parts.append(row)
+                return
+            # Le vrai négatif à côté reste bloquant. Un manque de preuve ne
+            # se transforme pas en négatif prouvé à cause de l'ENOSPC.
+            if not stats["failure"]:
+                row["status"] = MISSING
+                missing.append("%s (ENOSPC et parts absentes/non concluantes)" % name)
+                parts.append(row)
+                return
         if value == "success":
             row["status"] = GREEN
         elif value in NON_CONCLUSIVE:
@@ -478,10 +597,48 @@ class GitHub:
             if (not isinstance(job, dict) or not isinstance(job.get("name"), str)
                     or not job["name"]):
                 raise AgregatError("run jobs: invalid job")
-            rows.append({"name": job["name"],
-                         "status": job.get("status") or "",
-                         "conclusion": job.get("conclusion") or ""})
+            row = {"name": job["name"], "status": job.get("status") or "",
+                   "conclusion": job.get("conclusion") or ""}
+            if (job.get("id") and job.get("conclusion") == "failure"
+                    and (_family_jobs([job], "psycopg") or _family_jobs([job], "psql"))):
+                try:
+                    if disk_infrastructure(job, self.job_log(job["id"])):
+                        row["infrastructure"] = "disk-full"
+                except (OSError, ValueError, AgregatError) as exc:
+                    print("ci-agregat : preuve disque illisible pour %s : %s"
+                          % (job["name"], exc), file=sys.stderr)
+            rows.append(row)
         return rows
+
+    def job_log(self, job_id) -> str:
+        """Log complet borné à 8 Mio ; jamais de jeton sur l'URL signée.
+
+        Au plus 24 parts Linux, deux lectures de 5 s au pire par part : le
+        budget reste dans les 5 min du job. Une troncature n'est pas une preuve.
+        """
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        request = urllib.request.Request(
+            "%s/repos/%s/actions/jobs/%d/logs" % (self.api, self.depot, int(job_id)),
+            headers={"Authorization": "Bearer %s" % self.jeton,
+                     "Accept": "application/vnd.github+json"})
+        try:
+            response = urllib.request.build_opener(NoRedirect()).open(request, timeout=5)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 302:
+                raise AgregatError("job log: HTTP %d" % exc.code) from exc
+            location = exc.headers.get("Location", "")
+            parsed = urllib.parse.urlsplit(location)
+            if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+                raise AgregatError("job log: invalid redirect") from exc
+            response = urllib.request.urlopen(location, timeout=5)  # aucun en-tête Authorization
+        with response:
+            data = response.read(8 * 1024 * 1024 + 1)
+        if len(data) > 8 * 1024 * 1024:
+            raise AgregatError("job log: truncated, no disk evidence")
+        return data.decode("utf-8", "replace")
 
     def create(self, name: str, conclusion: str, title: str, summary: str) -> int:
         """Publie le check de détail sur la tête poussée ; l'identifiant rendu."""
