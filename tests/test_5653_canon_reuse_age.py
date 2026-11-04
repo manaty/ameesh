@@ -47,10 +47,15 @@ class _Setup(PgTestCase):
         return report
 
     def age_completed(self, seconds):
+        # #5688 (0542): the producing claim is another date of the same
+        # completion; age both, as a long stop of every runner would.
         self.db.execute(
             "UPDATE canon_state SET sync_completed_at = "
+            "clock_timestamp() - make_interval(secs => %s), "
+            "sync_completed_claim_at = "
             "clock_timestamp() - make_interval(secs => %s) "
-            "WHERE host = %s AND canon = ''", (float(seconds), HOST))
+            "WHERE host = %s AND canon = ''",
+            (float(seconds), float(seconds), HOST))
 
     def expire_claim(self, seconds=301):
         self.db.execute(
@@ -98,15 +103,15 @@ class ReuseAgeBoundTest(_Setup):
             self.assertLess(shared["completed_age_s"], 30.0)
 
     def test_unknown_completion_time_is_never_reused(self):
-        # No usable date at all: neither a published completion nor the claim
-        # that produced it (#5688 keeps that claim proxy; without either, the
-        # result stays unusable until the next complete sync).
+        # No usable date at all: neither a published completion, nor the
+        # producing claim kept by 0542 (#5688). Without either, the result
+        # stays unusable until the next complete sync.
         with mock.patch.object(canon_sync, "sync") as sync:
             self.complete_ok()
             self.db.execute(
                 "UPDATE canon_state SET sync_completed_at = NULL, "
-                "sync_claimed_at = NULL WHERE host = %s AND canon = ''",
-                (HOST,))
+                "sync_completed_claim_at = NULL, sync_claimed_at = NULL "
+                "WHERE host = %s AND canon = ''", (HOST,))
             self.assertIsNone(self.store.shared_sync(HOST, "")["completed_age_s"])
             report = self.run_sync(unsettled=True)
             self.assertIs(report, sync.return_value)

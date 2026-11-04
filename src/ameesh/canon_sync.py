@@ -1547,8 +1547,8 @@ def _reusable_completed(shared: dict | None, signature: str,
                         max_age_s: float) -> bool:
     """#5653: a completed result is reusable only for this exact snapshot and
     while it is recent enough (`completed_age_s`, database clock). A result
-    with no usable completion time (neither published completion nor the claim
-    that produced it, #5688) is never reused."""
+    with no usable completion time (neither published completion nor the
+    producing claim kept by 0542, #5688) is never reused."""
     if shared is None or shared.get("sync_signature") != signature:
         return False
     age = shared.get("completed_age_s")
@@ -1591,12 +1591,13 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     (the next complete sync publishes it).
 
     #5688: during a mixed staging, a runner still on the pre-0541 code keeps
-    completing syncs without publishing `sync_completed_at`; `shared_sync`
-    dates such a result by the claim that produced it, so the restarted
-    runner can still reuse it inside the age bound instead of waiting for a
-    full sync that cannot fit the restart guard. A pending claim does not
-    date the previous result, and a host whose runners all stopped keeps its
-    old age.
+    completing syncs without publishing `sync_completed_at`; migration 0542
+    keeps the claim that produced each completion, for every writer, so
+    `shared_sync` dates such a result even after a following claim (old runner
+    included). The restarted runner can then reuse it inside the age bound
+    instead of waiting for a full sync that cannot fit the restart guard. A
+    pending claim does not date the previous result, and a host whose runners
+    all stopped keeps its old age.
     """
     if interval_s <= 0 or canon.untrusted or not canon.readable or not canon.sources:
         return sync(db, canon, host)

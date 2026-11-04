@@ -3376,9 +3376,10 @@ class Canon(Domain):
         sync ever completed, or the last completed one was withdrawn. #5653:
         `completed_age_s` carries its age in seconds on the database clock
         (None when no usable completion time is known: not reusable). #5688:
-        the claim that produced the result dates it when a runner still on the
-        pre-0541 code completed it without `sync_completed_at`; a newer
-        pending claim never dates it."""
+        migration 0542 keeps the claim that produced the result in
+        `sync_completed_claim_at` for every writer, so a runner still on the
+        pre-0541 code dates its completion even after a following claim; a
+        newer pending claim never dates the previous result."""
 
     @abc.abstractmethod
     def lock_default_state(self, host: str) -> dict | None:

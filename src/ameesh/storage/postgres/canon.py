@@ -213,15 +213,16 @@ class Canon(interface.Canon):
         # the database clock (NULL: no usable completion time, never reusable
         # until the next complete sync).
         # #5688: a runner still on the pre-0541 code completes a sync without
-        # publishing `sync_completed_at`; the claim that produced the result
-        # is then its age, the same conservative proxy as the 0541 backfill —
-        # and only while that claim is still the completed one, so a newer
-        # pending claim never makes an old result look fresh.
+        # publishing `sync_completed_at`; migration 0542 records the claim that
+        # produced the result in `sync_completed_claim_at`, for every writer.
+        # A following claim (old runner included) may overwrite
+        # `sync_claimed_at` but not that proof, so a pending claim never dates
+        # the previous result and never hides a recent completion (#5493).
         rows = self.db.query(
             "SELECT status, diagnostic, sync_signature, "
             "extract(epoch FROM clock_timestamp() - greatest("
-            "sync_completed_at, CASE WHEN sync_token = sync_completed_token "
-            "THEN sync_claimed_at END))::float8 AS completed_age_s FROM canon_state "
+            "sync_completed_at, sync_completed_claim_at))::float8 "
+            "AS completed_age_s FROM canon_state "
             "WHERE host = %s AND canon = %s AND sync_completed_token IS NOT NULL",
             (host, canon))
         return rows[0] if rows else None

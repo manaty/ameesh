@@ -159,8 +159,11 @@ FERMEES = {
     "validation_decision_links": {"source_id", "target_id", "relation", "response_key"},
     # #3963 (0498) : coordination interne de canon sync, sans nouveau GRANT.
     # #5653 (0541) : l'âge du dernier résultat complété reste lui aussi fermé.
+    # #5688 (0542) : la réclamation qui a produit cette fin, conservée pour
+    # tous les écrivains, reste dans le même ensemble fermé.
     "canon_state": {"sync_claimed_at", "sync_token", "sync_completed_token",
-                    "sync_signature", "sync_completed_at"},
+                    "sync_signature", "sync_completed_at",
+                    "sync_completed_claim_at"},
     # #1467 (0442): plans and replayable admission/fire receipts stay closed
     # to both supervisor roles. No new grants accompany this classification.
     "integration_trains": {"target_key", "revision", "document", "updated_at"},
