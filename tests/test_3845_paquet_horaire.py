@@ -771,7 +771,9 @@ class FreshTest(unittest.TestCase):
         try:
             # #5696 (B dev3) : aucune alerte réelle depuis un banc ; le code
             # périmé sort en 3 (refus attendu), sans alerte
+            # canon simulé (N dev3) : sans AMEESH_CONFIG, `_zone` sortirait en 1
             with mock.patch.dict(os.environ, {}, clear=False), \
+                    mock.patch.object(ph, "_zone", return_value=(ZONE, mock.Mock())), \
                     mock.patch.object(ph, "alert_tick") as alert:
                 self.assertEqual(ph.main(["tick", "--repo", str(ROOT)]), ph.STALE_RC)
         finally:
