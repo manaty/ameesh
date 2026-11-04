@@ -162,6 +162,20 @@ class WaitTest(HoraireBase):
         ph.pilot_recompose(self.ctx, 4000, [3801], [], expect_head=HEAD[:12])
         self.assertEqual(len(self.autos()), 1)
 
+    def test_cancel_ci_sans_wait_refuse_avant_tout_geste(self):
+        # #5703 : il annulait la ci-full puis sortait en 2 sans recomposer
+        self.shell.ci[4000] = {"runs": [ci_run("in_progress")]}
+        with self.assertRaisesRegex(ph.InputError, "--cancel-ci exige --wait"):
+            ph.pilot_recompose(self.ctx, 4000, [3801], [], cancel_ci=True)
+        self.assertEqual((self.clock.slept, self.cancelled(), self.autos()), ([], [], []))
+
+    def test_expect_head_sans_gel_refuse(self):
+        # #5703 : un porteur sans tête gelée sortait en 0 « rien à faire »
+        self.shell.items[4000]["freeze"] = {}
+        with self.assertRaisesRegex(ph.InputError, "aucune tête gelée"):
+            ph.pilot_recompose(self.ctx, 4000, [3801], [], expect_head=HEAD[:12])
+        self.assertEqual(self.autos(), [])
+
 
 class CommandLineTest(unittest.TestCase):
     def test_duree_de_wait(self):
