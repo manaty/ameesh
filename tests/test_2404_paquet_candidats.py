@@ -93,9 +93,16 @@ class FakeProgress:
         compiled = tuple(re.compile(pattern, re.I) for pattern in patterns)
         out = []
         for lot in ids:
-            for event in self.holds.get(int(lot), ()):
+            previous = None
+            events = sorted(self.holds.get(int(lot), ()),
+                            key=lambda event: (event["created_ts"], event["id"]))
+            for event in events:
+                # #5758 : le stockage rend TOUTES les transitions d'état, même
+                # sans note de hold ; le test doit voir la même chose.
+                transition = previous is not None and event["state"] != previous
+                previous = event["state"]
                 note = str(event.get("note") or "").strip()
-                if note and any(rx.match(note) for rx in compiled):
+                if transition or (note and any(rx.match(note) for rx in compiled)):
                     out.append(dict(event))
         return out
 
@@ -335,9 +342,19 @@ class InventoryTest(unittest.TestCase):
             self.inventory()
 
     def hold(self, lot: int, note: str, *, actor: str = "human:smichea") -> dict:
-        """Ajoute un événement hold/levée au journal ciblé simulé."""
+        """Ajoute un événement hold/levée au journal ciblé simulé.
+
+        La note suit l'état courant du lot, comme le journal réel : une levée
+        ne fabrique pas un changement d'état (#5758)."""
+        events = self.holds.get(int(lot), ())
+        state = events[-1]["state"] if events else "qa"
+        return self.transition(lot, state, note, actor=actor)
+
+    def transition(self, lot: int, state: str, note: str, *,
+                   actor: str = "ameesh") -> dict:
+        """Ajoute une transition d'état au journal ciblé simulé (#5758)."""
         self.hold_clock += 1
-        event = {"id": self.hold_clock, "work_item_id": int(lot), "state": "qa",
+        event = {"id": self.hold_clock, "work_item_id": int(lot), "state": state,
                  "actor": actor, "note": note,
                  "created_ts": float(self.hold_clock)}
         self.holds.setdefault(int(lot), []).append(event)
@@ -400,6 +417,53 @@ class InventoryTest(unittest.TestCase):
         entry = self.by_id(self.inventory())[1]
         self.assertTrue(entry["ready"], entry["causes"])
         self.assertNotIn("pilot-hold", [cause["code"] for cause in entry["causes"]])
+
+    def test_pilot_hold_survives_the_automatic_quorum_transition(self):
+        """#5758 : le scénario de #5751 — hold pilote, puis quorum d'avis.
+
+        Le hold posé à 13:48Z tenait le lot hors du paquet ; le quorum l'a
+        porté `qa → validated` à 13:51Z. L'outil signe cette transition : le
+        lot doit rester écarté du paquet (`pilot-hold`) tant que le pilote n'a
+        pas levé sa retenue.
+        """
+        self.role_verdicts["mesh-design"] = True
+        row = next(row for row in self.rows if row["id"] == 1)
+        row["state"] = "validated"
+        self.hold(1, "hold: pas de paquet avant la pose VM du bureau",
+                  actor="mesh-design")
+        self.transition(1, "validated", "qa → validated — review quorum (#4423)",
+                        actor="ameesh")
+        entry = self.by_id(self.inventory())[1]
+        self.assertFalse(entry["ready"])
+        self.assertEqual([cause["code"] for cause in entry["causes"]], ["pilot-hold"])
+        self.assertEqual(entry["pilot_hold"]["by"], "mesh-design")
+
+    def test_pilot_hold_still_lifts_after_the_automatic_quorum_transition(self):
+        """#5758 : le second attendu — le `unhold:` du pilote lève le hold."""
+        self.role_verdicts["mesh-design"] = True
+        row = next(row for row in self.rows if row["id"] == 1)
+        row["state"] = "validated"
+        self.hold(1, "hold: pas de paquet avant la pose VM du bureau",
+                  actor="mesh-design")
+        self.transition(1, "validated", "qa → validated — review quorum (#4423)",
+                        actor="ameesh")
+        self.hold(1, "unhold: pose VM faite", actor="mesh-design")
+        entry = self.by_id(self.inventory())[1]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertNotIn("pilot-hold", [cause["code"] for cause in entry["causes"]])
+
+    def test_an_assignee_hold_still_falls_on_the_automatic_transition(self):
+        """#5758 : le hold personnel d'un agent garde le comportement d'avant.
+
+        Une transition automatique le lève comme n'importe quel changement
+        d'état ; seul le hold de pilote attend un geste explicite.
+        """
+        self.hold(1, "hold: je reprends demain", actor="ameesh-dev5")
+        self.transition(1, "validated", "qa → validated — review quorum (#4423)",
+                        actor="ameesh")
+        entry = self.by_id(self.inventory())[1]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertIsNone(entry["pilot_hold"])
 
     def test_an_assignee_hold_is_not_a_pilot_hold(self):
         """Un `hold:` ordinaire (règle 1 du réveil) ne réserve pas le paquet.
