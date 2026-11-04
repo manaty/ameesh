@@ -56,6 +56,10 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 FINGERPRINT_REFUSAL = "fingerprint: "
 #: The probe's default python, as in quiescence-staging.sh.
 PROBE_PYTHON = ".local/share/ameesh/venv/bin/python"
+#: #5743: a stable venv that only carries launchers (bascule.py) holds this
+#: marker; its live version is the target of the sibling link `venv-courant`.
+BASCULE_LAUNCHERS = ".bascule-lanceurs"
+BASCULE_CURRENT = "venv-courant"
 
 
 class ExecutionLease(role_run._AlertsLease):
@@ -342,7 +346,8 @@ def _notifier(options: dict, env: dict) -> tuple:
 
     QUIESCENCE_NOTIFIER (the unit's environment, overridden by BASCULE_ENV
     which the probe sources), otherwise the probe's python and the `ameesh`
-    package of its venv."""
+    package of its venv; a stable venv of launchers stands for its live
+    version (#5743), as in quiescence-staging.sh."""
     value = env.get("QUIESCENCE_NOTIFIER") or None
     sourced, problem = _sourced_literal(options["bascule_env"], "QUIESCENCE_NOTIFIER")
     if problem:
@@ -357,6 +362,16 @@ def _notifier(options: dict, env: dict) -> tuple:
     home = env.get("HOME") or os.path.expanduser("~")
     python = env.get("QUIESCENCE_PYTHON") or os.path.join(home, PROBE_PYTHON)
     venv = os.path.dirname(os.path.dirname(os.path.abspath(python)))
+    if os.path.isfile(os.path.join(venv, BASCULE_LAUNCHERS)):
+        # #5743: the stable venv's python is a launcher and its lib/ holds no
+        # package; the probe runs the live version's python, as resolved here.
+        current = os.path.join(os.path.dirname(venv), BASCULE_CURRENT)
+        if not os.path.islink(current):
+            return [], [], "notifier: no live venv (%s)" % current
+        venv = os.path.realpath(current)
+        python = os.path.join(venv, "bin", "python")
+        if not os.path.isfile(python):
+            return [], [], "notifier: live venv incomplete (%s)" % python
     import glob
     packages = sorted(glob.glob(os.path.join(
         venv, "lib", "python3*", "site-packages", "ameesh")))
