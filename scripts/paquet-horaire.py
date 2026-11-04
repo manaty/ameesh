@@ -3,6 +3,9 @@
 """Paquet horaire déclenché par minuterie, sans agent (#3845, #1606 point 1).
 
     scripts/paquet-horaire.py tick --repo ~/ameesh-composeur --target main
+    scripts/paquet-horaire.py recompose --repo ~/ameesh-composeur --carrier N \
+        --exclude LOT [--exclude-reason TEXTE] [--wait DURÉE [--cancel-ci]] \
+        [--expect-head SHA]
     scripts/paquet-horaire.py pause --until 20:15 --reason "staging hors créneau"
     scripts/paquet-horaire.py resume | status
 
@@ -92,8 +95,12 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
 6. Un courrier au pilote à chaque étape (tête, unités, écartés, CI).
 
 **Recomposition du pilote** (#4237) : `paquet-horaire.py recompose --carrier N
---exclude LOT [--exclude-reason TEXTE]` au lieu de `paquet-auto.py --force` à
-la main : la marque « tentative » (hôte, pid, époque de la session, motifs) est
+--exclude LOT [--exclude-reason TEXTE] [--wait DURÉE [--cancel-ci]]
+[--expect-head SHA]` au lieu de `paquet-auto.py --force` à la main (#5696 :
+`--wait` attend la fin d'une tentative vivante ou d'une ci-full au lieu de
+refuser, `--cancel-ci` l'annule d'abord et exige `--wait`, `--expect-head` ne
+recompose que si la tête gelée est encore celle-là et refuse un porteur sans
+gel) : la marque « tentative » (hôte, pid, époque de la session, motifs) est
 posée d'abord, si bien qu'un tic du détenteur courant reprend une recomposition
 perdue à la relève du bail comme les siennes. Elle ne compte pas dans le
 retrait automatique unique du point 4. `--repo` est le clone **dédié** du
@@ -1935,10 +1942,17 @@ def pilot_recompose(ctx: Context, carrier: int, exclude: list[int],
     tic a pu recomposer entre-temps : rien à faire, sortie 0). Ces trois
     options remplacent les enveloppes `systemd-run` écrites à la main, sorties
     en 2 le 03/11 (h16, h17, h19).
+
+    #5703 : `cancel_ci` sans `wait` est refusé avant tout geste (il annulait
+    la ci-full puis sortait en 2 sur le relevé en retard, sans recomposer).
     """
     if reasons and len(reasons) != len(exclude):
         raise InputError("--exclude-reason : %d motif(s) pour %d --exclude"
                          % (len(reasons), len(exclude)))
+    if cancel_ci and wait <= 0:
+        raise InputError("--cancel-ci exige --wait : le relevé de la ci-full annulée "
+                         "reste « in_progress » un moment, la recomposition serait "
+                         "refusée après l'annulation")
     refuse_agent_clone(ctx)
     deadline = ctx.clock() + max(wait, 0)
     cancelled: set[str] = set()
@@ -1974,9 +1988,13 @@ def _pilot_recompose_once(ctx: Context, carrier: int, exclude: list[int],
                          "ne reprendrait sa recomposition" % (carrier, ctx.target))
     sha = frozen_sha(item)
     expected = expect_head.strip().lower()
+    if expected and not sha:
+        # #5703 : sans gel, rien ne prouve que la tête attendue a été remplacée
+        raise InputError("#%d : aucune tête gelée, --expect-head %s invérifiable"
+                         % (carrier, expected[:12]))
     if expected and not sha.startswith(expected):
         return ("#%d : tête gelée %s, plus %s (recomposée entre-temps) : rien à faire"
-                % (carrier, sha[:12] or "absente", expected[:12]))
+                % (carrier, sha[:12], expected[:12]))
     left = pending(ctx, item, sha)
     if left is not None and running(ctx, left):
         raise Busy("#%d : %s en cours (%s:%d), attendre sa fin"
@@ -2168,9 +2186,11 @@ def main(argv: list[str] | None = None) -> int:
                        help="#5696 : attendre la fin du tic ou de la ci-full "
                             "(90m, 2h, 600s ; défaut : refuser tout de suite)")
     again.add_argument("--cancel-ci", action="store_true",
-                       help="#5696 : annuler la ci-full en cours du porteur, puis attendre")
+                       help="#5696 : annuler la ci-full en cours du porteur, puis "
+                            "attendre (exige --wait)")
     again.add_argument("--expect-head", default="", metavar="SHA",
-                       help="#5696 : rien à faire (sortie 0) si la tête gelée a changé")
+                       help="#5696 : rien à faire (sortie 0) si la tête gelée a "
+                            "changé ; refusé (sortie 2) sans tête gelée")
     for each in (one, again):
         each.add_argument("--repo", default=".", help="clone du projet (défaut : .)")
         each.add_argument("--actor", default=None,
