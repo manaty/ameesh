@@ -1775,7 +1775,10 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     # #5695: a fingerprints source refused for hours was a silent unit failure
     from . import fingerprints
     try:
-        out += fingerprints.alerts(db, now, orchestrators=orchestras)
+        sources, error = fingerprints.declarations_of_config(cfg)
+        if not error:
+            out += fingerprints.alerts(db, now, sources=sources,
+                                       orchestrators=orchestras)
     except Exception:  # an unreadable state never drops the other alerts
         pass
     return out

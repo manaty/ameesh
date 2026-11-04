@@ -395,6 +395,10 @@ class TickTest(PgTestCase):
         self.assertIn("unknown field", state["last_error"])
         self.assertIsNone(state["cursor"])
 
+    def source_alerts(self, now, **kwargs):
+        kwargs.setdefault("sources", [declaration()])
+        return fingerprints.alerts(self.db, now, **kwargs)
+
     def refused(self):
         return fingerprints.FingerprintError("fingerprints source nexlink: HTTP 401")
 
@@ -437,13 +441,15 @@ class TickTest(PgTestCase):
                 fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
                                   now=1000.0)
         # never read: no healthy moment to wait from, the alert is immediate
-        alerts = fingerprints.alerts(self.db, 1001.0, orchestrators=["pilot"])
+        alerts = self.source_alerts(1001.0, orchestrators=["pilot"])
         self.assertEqual(len(alerts), 1)
         alert = alerts[0]
         self.assertEqual(alert["type"], "fingerprints_source_failing")
         self.assertEqual(alert["project"], "nexlink")
         self.assertTrue(alert["auth_refused"])
-        self.assertIn("FINGERPRINTS_READ_TOKEN", alert["detail"])
+        self.assertIn("with its owner", alert["detail"])
+        self.assertNotIn("Nexlink", alert["detail"])
+        self.assertIn("every 900s", alert["detail"])
         self.assertNotIn(TOKEN, alert["detail"])
         self.assertIn("fingerprints_source_failing", notify.TYPE_LABELS)
         from ameesh import alert_briefs, exploitation
@@ -454,6 +460,23 @@ class TickTest(PgTestCase):
         self.assertEqual(set(alert_briefs.briefs(alert, listing)) - {"auditeur"},
                          {"pilot"})
 
+    def test_active_source_reports_its_actual_retry_interval(self):
+        source = fingerprints.Declaration("acme", "https://acme.example/f", 1800)
+        storage.of(self.db).fingerprints.fail(
+            source.project, source.url, "fingerprints source acme: HTTP 401", now=1000)
+        alerts = self.source_alerts(1001, sources=[source])
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("every 1800s", alerts[0]["detail"])
+        self.assertNotIn("Nexlink", alerts[0]["detail"])
+
+    def test_removed_or_replaced_source_does_not_alert(self):
+        storage.of(self.db).fingerprints.fail(
+            "nexlink", declaration().url, str(self.refused()), now=1000)
+        self.assertEqual(self.source_alerts(1001, sources=[]), [])
+        self.assertEqual(self.source_alerts(1001, sources=[declaration(
+            url="https://replacement.example/f")]), [])
+        self.assertEqual(len(self.source_alerts(1001)), 1)
+
     def test_two_failing_sources_of_one_pass_are_two_alerts(self):
         # #5695 verdict mty-amh-impl-03: `advance` dates both reads with the
         # same `now`; the alert identity must still tell the projects apart.
@@ -463,7 +486,10 @@ class TickTest(PgTestCase):
             api.advance(project, "https://%s.example/f" % project, "c", now=1000.0)
             api.fail(project, "https://%s.example/f" % project,
                      "fingerprints source %s: HTTP 401" % project, now=1061.0)
-        alerts = fingerprints.alerts(self.db, 1000.0 + fingerprints.FAILING_ALERT_S)
+        alerts = self.source_alerts(1000.0 + fingerprints.FAILING_ALERT_S,
+                                   sources=[fingerprints.Declaration(
+                                       p, "https://%s.example/f" % p, 60)
+                                       for p in ("nexlink", "liquichain")])
         self.assertEqual(sorted(a["project"] for a in alerts), ["liquichain", "nexlink"])
         self.assertEqual(len({exploitation.alert_key(a) for a in alerts}), 2)
 
@@ -479,13 +505,13 @@ class TickTest(PgTestCase):
             with self.assertRaises(fingerprints.FingerprintError):
                 fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
                                   now=1061.0)
-            self.assertEqual(fingerprints.alerts(self.db, 1100.0), [])
-            late = fingerprints.alerts(self.db, 1000.0 + fingerprints.FAILING_ALERT_S)
+            self.assertEqual(self.source_alerts(1100.0), [])
+            late = self.source_alerts(1000.0 + fingerprints.FAILING_ALERT_S)
             self.assertEqual([a["since"] for a in late], [1000.0])
             self.assertFalse(late[0]["auth_refused"])
             fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
                               actor="mesh-design", now=3000.0)
-        self.assertEqual(fingerprints.alerts(self.db, 9000.0), [])
+        self.assertEqual(self.source_alerts(9000.0), [])
 
     def test_the_notify_cli_refuses_fingerprints_outside_role_run(self):
         proc = self.mesh("notify", "--once", "--only", "fingerprints",
