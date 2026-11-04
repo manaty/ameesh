@@ -295,6 +295,7 @@ TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
     "mesh_backup_unseen": "mesh database backup not seen",
     "migration_pending_non_additive": "non-additive migration waiting",
+    "staging_canon_stale": "staging executor canon behind the agents' canon",
     "host_migration_pending_non_additive": (
         "non-additive migration waiting on a host base"),
     "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
