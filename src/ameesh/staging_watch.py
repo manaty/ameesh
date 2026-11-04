@@ -712,6 +712,98 @@ def request_findings(rows: list[dict], *, now: float, attested=(),
     return out
 
 
+#: #5727 (auditor C3 on #5495): the agents' canon may move ahead of the canon
+#: the elected staging executor reads. Past one day, stale host fiches or
+#: rules no longer stay silent.
+CANON_DRIFT_S = 86400.0
+#: Records read per executor key to find the newest one carrying `canon_ref`
+#: (a submitted request does not carry it; only the executor's pass does).
+CANON_HISTORY = 50
+
+
+def canon_drift_findings(records, *, head: str, first_ahead, now: float) -> list[dict]:
+    """One alert per executor key whose canon has fallen behind for a day.
+
+    `records`: (key, data) pairs, the newest executor record carrying
+    `canon_ref` per key. `head`: the commit of the agents' canon.
+    `first_ahead(canon_ref, head)`: commit time of the oldest first-parent
+    commit of `head` that `canon_ref` lacks, None when nothing lacks or when
+    the agents' clone cannot judge (unknown commit: it may simply lag)."""
+    out = []
+    for key, data in records:
+        ref = str(data.get("canon_ref") or "")
+        if not ref or not head or ref == head:
+            continue
+        since = first_ahead(ref, head)
+        if since is None or now - since < CANON_DRIFT_S:
+            continue
+        detail = ("Staging executor %s reads canon %s; the agents' canon is at %s, "
+                  "ahead for %.1f d (threshold 1 d). Host fiches and rules read "
+                  "by staging may be stale: install a new qualified canon copy "
+                  "at the next quiescent handover."
+                  % (key, ref[:12], head[:12], (now - since) / 86400.0))
+        out.append(dict(schema="ameesh-alert/1", type="staging_canon_stale",
+                        agent=None, since=since, value=now - since,
+                        threshold=CANON_DRIFT_S, reason=key, canon_ref=ref,
+                        head=head, urgent=False,
+                        orchestrators=([data["notify"]]
+                                       if data.get("notify") else []),
+                        detail=detail))
+    return out
+
+
+def executor_canons(db) -> list[tuple[str, dict]]:
+    """The newest executor record carrying `canon_ref`, per request key."""
+    events = storage.of(db).events
+    out = []
+    for row in events.latest_type("staging.request", 60, LIMIT):
+        key = row.get("object")
+        if not key:
+            continue
+        for item in events.recent_type("staging.request", 60, CANON_HISTORY,
+                                       object=key):
+            data = item.get("data")
+            if isinstance(data, dict) and data.get("canon_ref"):
+                out.append((key.split(":", 1)[-1], data))
+                break
+    return out
+
+
+def _first_ahead(repo: str):
+    from . import canon
+
+    def first(ref: str, head: str):
+        if not (canon.git_commit(repo, ref) and canon.git_commit(repo, head)):
+            return None
+        out = canon._git_out(repo, "log", "--first-parent", "--reverse",
+                             "--format=%ct", "%s..%s" % (ref, head))
+        line = (out or "").splitlines()[:1]
+        return float(line[0]) if line and line[0].isdigit() else None
+    return first
+
+
+def canon_alerts(db, *, now: float, cfg) -> list[dict]:
+    """#5727: the executor's `canon_ref` against the agents' canon head.
+
+    The agents' canon is this host's default canon at its configured revision
+    (`origin/main` without one). No canon or an unknown commit: no alert."""
+    from . import canon
+    path = getattr(cfg, "canon", "") if cfg is not None else ""
+    repo = canon.git_toplevel(path) if path else None
+    if not repo:
+        return []
+    head = None
+    for rev in ([cfg.canon_ref] if getattr(cfg, "canon_ref", "")
+                else ["origin/main", "origin/HEAD"]):
+        head = canon.git_commit(repo, rev)
+        if head:
+            break
+    if not head:
+        return []
+    return canon_drift_findings(executor_canons(db), head=head,
+                                first_ahead=_first_ahead(repo), now=now)
+
+
 def alerts(db, *, now: float, cfg=None) -> list[dict]:
     # Do not swallow a read failure: the caller must keep the alert family
     # unreadable instead of resolving an existing alert through absence.
