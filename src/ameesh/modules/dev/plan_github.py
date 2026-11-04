@@ -1329,15 +1329,24 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                     entry.update(result="linked" if linked else "stage-merged",
                                  detail=text + (" (dry run)" if dry_run else ""))
                 elif dry_run:
+                    from . import plan_git
                     state = item["state"]
-                    entry.update(result=("already" if state in work_mod.MERGED_STATES else
-                                         "refused" if state == lifecycle.CLOSED else "would-merge"),
-                                 detail="%s (dry run)" % state)
+                    retention = (plan_git.content_retention(storage.of(db), item)
+                                 if live else None)
+                    if retention is not None and not retention.get("lift"):
+                        plan_git.mark_retained(entry, retention,
+                                               target=pr.get("baseRefName") or "GitHub",
+                                               dry_run=True)
+                    else:
+                        entry.update(result=("already" if state in work_mod.MERGED_STATES else
+                                             "refused" if state == lifecycle.CLOSED else "would-merge"),
+                                     detail="%s (dry run)" % state)
                 else:
+                    from . import plan_git
                     done = work_mod.deliver(
                         db, item_id, connector=work_mod.merge_connector(),
                         evidence={"seen": "sync-github", "sha": sha or "", "pr": ref},
-                        actor=actor)
+                        actor=actor, content_guard=plan_git.content_retention)
                     entry.update(result=done["result"], detail=done["detail"])
             results.append(entry)
     return {"repo": repo, "dry_run": bool(dry_run), "pull_requests": len(prs),

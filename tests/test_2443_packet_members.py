@@ -623,6 +623,10 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
         work.move(self.db, item["id"], "qa", note="retenue levée")
         report = plan_git.sync_merges(self.db, self.repo, target="main")
         row = next(r for r in report["results"] if r["work_item"] == item["id"])
+        self.assertEqual(row["retention"]["what"], "stale-freeze")
+        self.freeze(item, frozen)
+        report = plan_git.sync_merges(self.db, self.repo, target="main")
+        row = next(r for r in report["results"] if r["work_item"] == item["id"])
         self.assertEqual(row["result"], "merged", row)
         self.assertEqual(row["how"], "composition", row)
 

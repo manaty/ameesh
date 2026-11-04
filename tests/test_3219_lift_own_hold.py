@@ -290,6 +290,13 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
             note="ameesh-freeze-absent: main")
         return item
 
+    def _refreeze(self, item: dict) -> None:
+        """#5774 : attester le travail restant après une mise en attente."""
+        previous = plan_git.latest_freeze(work.milestones(self.db, item["id"]))
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha=previous["sha"], actor="dev-a", verdict=None,
+            note="ameesh-freeze-absent: main")
+
     def _sync(self, *, dry_run: bool = False) -> dict:
         report = plan_git.sync_merges(self.db, self.repo, target="main",
                                       dry_run=dry_run)
@@ -312,6 +319,7 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
             work.note(self.db, item["id"], "unhold: paquet 1900 fusionné",
                       actor="dev-a")
         self.assertEqual(self._active(item), {})
+        self._refreeze(item)
         result = self._sync()[item["id"]]
         self.assertEqual(result["result"], "merged")
         self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
@@ -321,12 +329,14 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
 
     def test_la_passe_ferme_malgre_le_hold_de_l_assigne(self):
         """#3219 : la retenue de règle 1 de l'assigné ne retient pas une
-        livraison prouvée ; la note de fusion journalise la levée. Un relevé à
+        livraison attestée par un nouveau gel après le hold (#5774) ; la
+        note de fusion journalise la levée. Un relevé à
         blanc annonce la même fermeture (`would-merge`), pas une retenue."""
         item = self._delivered()
         with bound("dev-a"):
             work.note(self.db, item["id"], "hold: j'attends le paquet 1900",
                       actor="dev-a")
+        self._refreeze(item)
         dry = self._sync(dry_run=True)[item["id"]]
         self.assertEqual(dry["result"], "would-merge")
         self.assertIn("levée du hold de l'assigné dev-a", dry["detail"])
@@ -373,6 +383,7 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         with bound(""):
             work.note(self.db, item["id"], "unhold: gestes faits",
                       actor="human:proprio")
+        self._refreeze(item)
         self.assertEqual(self._sync()[item["id"]]["result"], "merged")
 
     def test_B1_le_hold_de_pilote_pose_apres_retient_aussi(self):
@@ -407,6 +418,77 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         # son auteur le lève lui-même (#3219), puis la passe ferme
         with bound("dev-b"):
             work.note(self.db, item["id"], "unhold: relecture faite", actor="dev-b")
+        self._refreeze(item)
+        self.assertEqual(self._sync()[item["id"]]["result"], "merged")
+
+    def test_5774_waiting_human_apres_un_gel_deja_fusionne(self):
+        from ameesh import decisions
+        item = self._delivered()
+        downstream = work.add(self.db, title="activer après l'acte", assignee="dev-b")
+        from ameesh import work_dependencies
+        work_dependencies.add(self.db, downstream["id"], item["id"], actor="dev-b")
+        work.move(self.db, item["id"], "blocked", note="acte opérateur encore dû")
+        self.assertEqual(self._sync()[item["id"]]["result"], "withheld")
+        self.db.execute("UPDATE agent_registry SET responsible = 'human:alice' "
+                        "WHERE name = 'dev-a'")
+        decisions.ask(self.cfg, self.db, requester="dev-a", lot=str(item["id"]),
+                      question="Autoriser l'acte opérateur ?", options=["a=oui", "b=non"])
+        for dry in (True, False):
+            result = self._sync(dry_run=dry)[item["id"]]
+            self.assertEqual(result["result"], "would-withhold" if dry else "withheld")
+            self.assertEqual(result["retention"]["motif"], "état waiting_human")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "waiting_human")
+        self.assertFalse(any(m["kind"] == "merged"
+                             for m in work.milestones(self.db, item["id"])))
+        self.assertTrue(work_dependencies.grouped(self.db, [downstream["id"]])
+                        [downstream["id"]][0]["blocking"])
+
+    def test_5774_hold_leve_ne_reutilise_pas_l_ancien_gel(self):
+        item = self._delivered()
+        with bound("dev-a"):
+            work.note(self.db, item["id"], "hold: acte opérateur encore dû", actor="dev-a")
+        result = self._sync()[item["id"]]
+        self.assertEqual(result["retention"]["what"], "stale-freeze")
+        with bound("dev-a"):
+            work.note(self.db, item["id"], "unhold: décision reçue", actor="dev-a")
+        for dry in (True, False):
+            result = self._sync(dry_run=dry)[item["id"]]
+            self.assertEqual(result["result"], "would-withhold" if dry else "withheld")
+            self.assertEqual(result["retention"]["what"], "stale-freeze")
+        self._refreeze(item)
+        self.assertEqual(self._sync()[item["id"]]["result"], "merged")
+
+    def test_5774_blocked_leve_exige_un_nouveau_gel(self):
+        item = self._delivered()
+        work.move(self.db, item["id"], "blocked", note="acte opérateur dû")
+        work.move(self.db, item["id"], "qa", note="reprise du travail")
+        result = self._sync()[item["id"]]
+        self.assertEqual(result["retention"]["what"], "stale-freeze")
+        self._refreeze(item)
+        self.assertEqual(self._sync()[item["id"]]["result"], "merged")
+
+    def test_5774_cloture_explicite_de_l_acte_reste_possible(self):
+        item = self._delivered()
+        work.move(self.db, item["id"], "blocked", note="acte opérateur dû")
+        self.assertEqual(self._sync()[item["id"]]["result"], "withheld")
+        previous = plan_git.latest_freeze(work.milestones(self.db, item["id"]))
+        work.close(self.db, item["id"], delivered=True, sha=previous["sha"],
+                   note="acte opérateur effectué et vérifié", actor="dev-a")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "closed")
+
+    def test_5774_gels_illisibles_ne_levent_pas_la_barriere(self):
+        item = self._delivered()
+        work.move(self.db, item["id"], "blocked", note="acte opérateur dû")
+        work.move(self.db, item["id"], "qa", note="reprise")
+        st = storage.of(self.db)
+        with mock.patch.object(type(st.work), "milestones", side_effect=RuntimeError("indisponible")):
+            result = self._sync()[item["id"]]
+        self.assertEqual(result["result"], "error")
+        self.assertEqual(result["retention"]["what"], "unreadable")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_5774_lot_normal_ferme_par_le_contenu(self):
+        item = self._delivered()
         self.assertEqual(self._sync()[item["id"]]["result"], "merged")
 
     def test_l_etat_blocked_retient_meme_sous_le_hold_de_l_assigne(self):

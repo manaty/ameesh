@@ -435,6 +435,21 @@ class GithubTest(_PlanDb):
                                                    time.gmtime(time.time() + 60)),
             "url": "https://example.invalid/%d" % number}
 
+    def test_5774_pr_historique_ne_ferme_pas_une_attente_owner(self):
+        from .support import hold_for_owner
+        item = work.add(self.db, title="acte opérateur encore dû")
+        work.move(self.db, item["id"], "build")
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha=SHA, actor="ouvrier", verdict=None, note="préparation")
+        self.merged_pr(90, "lot/%d-acte" % item["id"],
+                       body="ameesh-work: %d" % item["id"])
+        hold_for_owner(self.db, item["id"])
+        for dry in (True, False):
+            report = plan_github.sync_github(self.db, self.gh, REPO, dry_run=dry)
+            [entry] = [r for r in report["results"] if r["work_item"] == item["id"]]
+            self.assertEqual(entry["result"], "would-withhold" if dry else "withheld")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "waiting_human")
+
     def test_sync_github_ferme_les_lots_fusionnes(self):
         a = work.add(self.db, title="recherche", package="cat-recherche")
         work.move(self.db, a["id"], "build")
@@ -1464,8 +1479,13 @@ class ContentMergeTest(_PlanDb):
                          ("withheld", "hold"))
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
         self.assertIn("passe réelle due", result["detail"])
-        # levée explicite par un pilote : le contenu ferme
+        # #5774 : la levée ne suffit plus à réutiliser le gel historique.
         work.note(self.db, item["id"], "unhold: passe faite", actor="human:alice")
+        self.assertEqual(self.run_sync()[item["id"]]["retention"]["what"], "stale-freeze")
+        previous = plan_git.latest_freeze(work.milestones(self.db, item["id"]))
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha=previous["sha"], actor="ouvrier", verdict=None,
+            note="ameesh-freeze-absent: main")
         self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
         self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
 
@@ -1489,6 +1509,24 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual(result["result"], "withheld")
         self.assertEqual(work.get(self.db, item["id"])["state"], "blocked")
         self.assertIn("état blocked", result["detail"])
+
+    def test_5774_attente_et_reprise_pendant_la_sonde_retiennent(self):
+        item = self._delivered("attente-pendant-sonde")
+        real = plan_git.probe
+        moved = []
+
+        def probe(repo, sha, target, **kwargs):
+            if not moved:
+                moved.append(True)
+                work.move(self.db, item["id"], "blocked", note="acte dû")
+                work.move(self.db, item["id"], "qa", note="reprise")
+            return real(repo, sha, target, **kwargs)
+
+        with mock.patch.object(plan_git, "probe", side_effect=probe):
+            result = self.run_sync()[item["id"]]
+        self.assertEqual(result["result"], "withheld")
+        self.assertEqual(result["retention"]["what"], "stale-freeze")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
 
     def test_2744_un_journal_illisible_ne_ferme_pas(self):
         """B2 cx2 : une lecture des retenues en erreur retient la fermeture ;
