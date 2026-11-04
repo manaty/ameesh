@@ -38,6 +38,12 @@ BEGIN
 END;
 $$;
 
+-- Le déclencheur ne change aucune écriture lue par le code d'avant : il ne
+-- remplit que `sync_completed_claim_at`, colonne neuve que le nouveau code
+-- seul lit, et laisse `sync_token`, `sync_claimed_at`, `sync_completed_token`
+-- et `sync_signature` inchangés. Un runner d'avant 0542 réclame et termine
+-- donc exactement comme avant.
+-- ameesh: trigger compatible with previous code
 DROP TRIGGER IF EXISTS canon_state_sync_completed_claim ON canon_state;
 CREATE TRIGGER canon_state_sync_completed_claim
     BEFORE UPDATE OF sync_completed_token ON canon_state
