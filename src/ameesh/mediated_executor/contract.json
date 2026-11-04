@@ -4678,6 +4678,8 @@
     "disks",
     "expect_disk",
     "observe_disk_refusal",
+    "claim_disk_dispatch",
+    "disk_signals",
     "disk_refusals",
     "set_disk_refusal_message",
     "forget_disks",

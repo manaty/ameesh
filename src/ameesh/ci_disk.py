@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Mesures physiques CI : relevé natif SSH (#5751), annotations de base (#5630).
+"""Mesures CI : seul le workflow dédié sur la base résout une alerte.
 
-Le périmètre natif configuré est collecté avant les appels GitHub. La date
-vient de la sonde sur la VM, jamais de l'heure de lecture ; un timer arrêté
-reste donc visible. Les anciens dépôts non migrés gardent leur transport
-GitHub. Aucun accès SQL ni secret du mesh sur une VM de tests.
+#5751, décision mesh-design du 04/11/2026 : aucune connexion SSH. Le
+veilleur compense les tics cron manqués par workflow_dispatch après 60 min.
+Les signaux des autres runs ne peuvent que lever ou aggraver une alerte.
 """
 from __future__ import annotations
 
 import json
 import math
-import subprocess
 import re
 from urllib.parse import quote
 
@@ -88,12 +86,25 @@ def collect(api, repo, branch, store):
             for row in rows:
                 data = annotation(row, host)
                 if data is not None:
-                    store.observe_disk(repo, run_id=int(run['id']), sampled_ts=sampled, **data)
+                    document = json.loads(row['message'])
+                    physical = document.get('sampled_ts', sampled)
+                    if timestamp(physical, sampled):
+                        store.observe_disk(repo, run_id=int(run['id']), sampled_ts=physical, **data)
     if hosts_vus:
         store.forget_disks(repo, hosts_vus, older_than_s=FORGET_AGE)
+    return any(r.get('status') in ('queued', 'in_progress', 'waiting', 'pending')
+               for r in candidates)
 
 
-def findings(rows, canons, now):
+DISPATCH_AGE = 60 * 60  # +45 min de part en file +5 min de sonde < MAX_AGE
+
+
+def needs_dispatch(rows, now):
+    return not rows or any(row.get('sampled_ts') is None
+                           or now - row['sampled_ts'] >= DISPATCH_AGE for row in rows)
+
+
+def findings(rows, canons, now, signals=()):
     """Seuils physiques des Hosts ; une mesure saine seule résout le rouge.
 
     #5633 : une VM tout juste vue par ``expect_disk`` n'a pas encore de
@@ -105,7 +116,13 @@ def findings(rows, canons, now):
     plus).
     """
     out = []
-    for row in rows:
+    trusted = {(r['repo'], r['host']): r.get('sampled_ts') for r in rows}
+    raised = []
+    for signal in signals:
+        measured = trusted.get((signal['repo'], signal['host']))
+        if measured is None or measured < signal['sampled_ts']:
+            raised.append(dict(signal, signal_only=True, volume='/'))
+    for row in list(rows) + raised:
         host, repo = row['host'], row['repo']
         sampled = row.get('sampled_ts')
         first = row.get('first_seen_ts')
@@ -114,11 +131,17 @@ def findings(rows, canons, now):
                                or sampled > now + 300)
         common = dict(agent=None, since=sampled, host=host, repo=repo,
                       reason='%s:%s:%s' % (repo, host, row['volume']), run_id=row.get('run_id'))
-        if stale:
+        if stale and not row.get('signal_only'):
             out.append(dict(common, type='ci_disk_unreadable', value=None, threshold=MAX_AGE,
                             detail='CI disk %s (%s): no fresh disk measurement; inspect native retention timer, '
                                    'machine label and CI watcher' % (host, repo)))
         limits = resources.host_limits(canons, host)['limits']
+        if row.get('refusal'):
+            out.append(dict(common, type='ci_disk_low', value=row.get('free_bytes'),
+                            threshold=5 * 1024**3, critical=True, urgent=True,
+                            detail='CI blocked: disk margin refusal on %s (%s); '
+                                   'raise-only signal, dedicated base probe required' % (host, repo)))
+            continue
         reading = {'volumes': [{'path': row['volume'], 'disk_free_bytes': row.get('free_bytes'),
                                 'disk_total_bytes': row.get('total_bytes')}]}
         warnings = resources.disk_warnings(reading, limits)
@@ -130,76 +153,22 @@ def findings(rows, canons, now):
                             threshold=limits['warn_disk_free'] if by_free else limits['warn_disk_used'],
                             critical=warning['critical'], urgent=warning['critical'],
                             detail='CI disk %s (%s) %s: %s bytes free, %.1f%% used%s; '
-                                   'check host retention timer (bureau)' % (
+                                   'check host retention timer (bureau)%s' % (
                                        host, repo, row['volume'], row['free_bytes'],
                                        100 * warnings[0]['used'],
-                                       ' (last known low measurement, stale)' if stale else '')))
-    return out
-
-
-# #5751 : destinations de confiance configurées sur l'hôte du veilleur,
-# jamais tirées d'une PR ou d'une annotation. Commande distante fixe.
-SSH_TARGET = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]{0,252}\Z")
-NATIVE_COMMAND = "/usr/local/lib/ameesh-ci/ci-disque.py natif"
-
-
-def native_settings(raw, repos):
-    if not isinstance(raw, dict):
-        raise ValueError("object {repo: {host: SSH destination}} expected")
-    out = {}
-    count = 0
-    for repo, hosts in raw.items():
-        if repo not in repos or not isinstance(hosts, dict) or not hosts:
-            raise ValueError("declared repository and non-empty host map required")
-        for host, target in hosts.items():
-            if (not isinstance(host, str) or not HOST.fullmatch(host)
-                    or not isinstance(target, str) or not SSH_TARGET.fullmatch(target)):
-                raise ValueError("invalid host or SSH destination")
-            count += 1
-        out[repo] = dict(hosts)
-    if count > 32:
-        raise ValueError("at most 32 native hosts per watcher")
-    return out
-
-
-def read_native(target):
-    result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                             "-o", "StrictHostKeyChecking=yes", "--", target, NATIVE_COMMAND],
-                            capture_output=True, text=True, timeout=15, check=True)
-    if len(result.stdout) > 16 * 1024 * 1024:
-        raise ValueError("native payload too large")
-    data = json.loads(result.stdout)
-    if not isinstance(data, dict):
-        raise ValueError("native object expected")
-    return data
+                                       ' (last known low measurement, stale)' if stale else '',
+                                       ' (raise-only CI signal)' if row.get('signal_only') else '')))
+    unique = {}
+    for finding in out:
+        key = (finding['repo'], finding['host'], finding['type'])
+        if key not in unique or (finding.get('critical') and not unique[key].get('critical')):
+            unique[key] = finding
+    return list(unique.values())
 
 
 def timestamp(value, now):
     return (type(value) in (int, float) and math.isfinite(value)
             and 0 < value <= now + 300)
-
-
-def collect_native(repo, hosts, store, *, now, read=None, log=lambda _: None):
-    """Une panne SSH garde la dernière mesure et son âge réel.
-
-    Aucun fallback GitHub dans le périmètre natif : il masquerait un timer
-    cassé. Le dépôt et l'hôte viennent de la configuration authentifiée SSH.
-    """
-    read = read or read_native
-    for host, target in hosts.items():
-        store.expect_disk(repo, host=host, volume='/')
-        try:
-            document = read(target)
-            snapshot = document.get("snapshot")
-            if isinstance(snapshot, dict) and timestamp(snapshot.get("sampled_ts"), now):
-                data = annotation({"title": SCHEMA, "message": json.dumps(snapshot)}, host)
-                if data is not None:
-                    store.observe_disk(repo, run_id=None, sampled_ts=snapshot["sampled_ts"], **data)
-            for refusal in document.get("refusals", ())[:10000]:
-                observe_refusal(repo, host, refusal, store, now=now)
-        except Exception as exc:  # une VM n'arrête ni les autres ni leur alerte
-            log("CI %s: native disk %s unreadable (%s)" % (repo, host, type(exc).__name__))
-    store.forget_disks(repo, hosts, older_than_s=FORGET_AGE)
 
 
 def observe_refusal(repo, host, refusal, store, *, now):

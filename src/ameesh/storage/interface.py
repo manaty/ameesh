@@ -5501,6 +5501,14 @@ class CiResults(Domain):
     def set_disk_refusal_message(self, repo: str, *, host: str, event_id: str, message_id: int) -> None:
         """#5751 : acquittement durable dans la transaction du courrier."""
 
+    @abc.abstractmethod
+    def claim_disk_dispatch(self, repo: str, *, now: float, interval_s: float) -> bool:
+        """#5751 : consomme atomiquement une intention de sonde dédiée."""
+
+    @abc.abstractmethod
+    def disk_signals(self) -> list[dict]:
+        """#5751 : signaux non fiables, uniquement levants, distincts des mesures."""
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     @abc.abstractmethod
     def claim_guard_scan(self, repo: str, *, now: float, window_s: float) -> bool:

@@ -20,7 +20,6 @@ import socket
 import subprocess
 import tempfile
 
-NATIVE_DIR = Path("/var/lib/ameesh-ci-disk")
 GIB = 1024 ** 3
 MIN_LIBRE_GIB = 5.0
 MIN_TMP_GIB = 1.0  # le banc autre-fs dispose d'un tmpfs distinct
@@ -42,8 +41,7 @@ def verifier(chemin: Path, minimum_gib: float) -> None:
 
 
 def signaler_refus(erreur):
-    """Trace persistante indépendante de GitHub ; pas de données de test."""
-    dossier = NATIVE_DIR
+    """Signal numérique uniquement levant ; aucun fichier à écrire sous ENOSPC."""
     event = {"schema": "ameesh-ci-disk-refusal/1",
              "host": os.environ.get("AMEESH_CI_DISQUE_HOST") or socket.gethostname(),
              "id": uuid.uuid4().hex, "repo": os.environ.get("GITHUB_REPOSITORY", ""),
@@ -53,24 +51,8 @@ def signaler_refus(erreur):
              "free_bytes": getattr(erreur, "ci_free_bytes", None),
              "available_inodes": getattr(erreur, "ci_available_inodes", None),
              "required_bytes": getattr(erreur, "ci_required_bytes", None)}
-    # Deux transports, même identifiant : la notice reste utilisable quand
-    # ENOSPC empêche précisément d'écrire le refus local.
+    # Aucun accès au disque : le signal est publié même sous ENOSPC.
     print("::notice title=ameesh-ci-disk-refusal/1::" + json.dumps(event).replace("%", "%25"), flush=True)
-    try:
-        # Le dossier est installé pour runner. Ne pas le créer dans le dépôt
-        # ni en /tmp : le ménage des tests ne doit pas effacer cette preuve.
-        temporaire = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", dir=dossier, delete=False) as fichier:
-                temporaire = Path(fichier.name)
-                json.dump(event, fichier)
-            os.replace(temporaire, dossier / ("refus-%s.json" % event["id"]))
-        finally:
-            if temporaire is not None:
-                temporaire.unlink(missing_ok=True)
-    except OSError as exc:
-        print("::warning::#5751 : refus disque non conservé par la sonde native : %s" % exc,
-              flush=True)
 
 
 class Consommation:

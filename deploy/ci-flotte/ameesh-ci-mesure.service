@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #5751 : mesure physique indépendante des identités des jobs de PR.
+[Unit]
+Description=ameesh CI — mesure physique protégée du disque
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/ameesh-ci-disque.env
+ExecStart=/usr/local/lib/ameesh-ci/ci-disque.py mesure --snapshot
+TimeoutStartSec=30s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ameesh-ci-disk
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+CapabilityBoundingSet=
+UMask=0022

@@ -174,9 +174,13 @@ encore en file repousse la date de dernière apparition, et un simple échec de
 sonde garde les dernières mesures basses au lieu de les effacer. Rien n'est
 oublié tant qu'aucun nom de job n'a été lu.
 
-Ne pas installer `hosts --publish`, de DSN central ou de clé SSH nouvelle
-sur les VM CI pour cette surveillance (direction mesh-design, 03/11/2026,
-messages #187442 et #187450). Les jobs de PR partagent ces machines.
+Ne pas installer `hosts --publish`, de DSN central ni de clé SSH nouvelle
+sur les VM CI pour cette surveillance. L'interdiction inclut aussi la
+réutilisation d'un accès SSH existant : les accès opérateur/root du bureau
+ne sont pas des accès de veille automatique. Direction mesh-design du
+03/11/2026 (#187442/#187450), confirmée et étendue par sa décision du
+04/11/2026, courrier #190059 en réponse à #190057 pour le lot #5751.
+Le veilleur passe uniquement par son accès GitHub existant.
 
 ## Qualification et retour
 
@@ -244,83 +248,73 @@ exemption. Le détail reste publié en `neutral` quand seule l'infrastructure
 est en cause et que chaque famille conserve une part réussie. Une famille
 sans aucune preuve réussie garde la garde de preuve absente (#3449).
 
-### Collecte native et refus des parts (#5751)
+### Mesure protégée, compensation du cron et signaux des parts (#5751)
 
-Le cron GitHub est un transport de secours : une heure planifiée ne garantit
-pas une exécution. Pour chaque VM suivie, le service natif conserve désormais
-`/var/lib/ameesh-ci-disk/snapshot.json` avant et après le ménage. Le relevé
-porte son horodatage de mesure ; le lecteur SSH ne le rafraîchit jamais.
-Une panne de ménage ne bloque pas la première mesure. Le timer reste à
-30 minutes, avec une borne de quinze minutes pour le service.
+Décision mesh-design du 04/11/2026, courrier #190059 : aucun accès SSH aux
+VM pour cette surveillance, même par réutilisation d'une clé du bureau.
+Le transport reste le workflow dédié sur la branche de base ; le veilleur
+le déclenche par workflow_dispatch lorsque le cron manque son rendez-vous.
 
-Sur l'hôte du veilleur élu, ajouter à la clé `github` de la configuration :
+Une unité de mesure distincte, ameesh-ci-mesure.service, tourne sous root
+toutes les cinq minutes et conserve /var/lib/ameesh-ci-disk/snapshot.json.
+Elle ne fait que mesurer le disque : réseau et HOME isolés, système en
+lecture seule sauf ce répertoire, capacités retirées, délai de trente
+secondes. Le ménage reste sous runner sur son timer de trente minutes.
+Aucune clé, aucun compte d'accès entrant ni DSN n'est ajouté aux VM.
 
-```json
-{
-  "ci_disk_native": {
-    "owner/repository": {
-      "ci-vm-a": "runner@ci-vm-a",
-      "ci-vm-b": "runner@ci-vm-b"
-    }
-  }
-}
-```
+Le répertoire de mesure est root:root 0755, le snapshot root:root 0644.
+Le lecteur refuse un fichier ou un parent inscriptible par l'uid des PR,
+un lien et un fichier spécial. Le workflow ci-disque.yml de la base appelle
+le script installé et protégé, en mode publication, et publie la date
+physique du snapshot ; la fin du job ne rafraîchit jamais cette date.
+Une mesure forgée par un job ne peut donc pas résoudre ci_disk_low.
 
-Le dépôt doit déjà figurer dans `github.projects`. Les noms de machines et
-les destinations SSH viennent de cette configuration, jamais des PR. Le
-compte du veilleur doit disposer d'une connexion SSH sans interaction, avec
-les clés d'hôtes vérifiées ; aucune désactivation de leur vérification,
-aucun DSN du mesh sur les VM. La commande distante est fixée à
-`/usr/local/lib/ameesh-ci/ci-disque.py natif`. Le nom physique du relevé
-(`hostname` par défaut) doit correspondre à la clé de la configuration ;
-si nécessaire, poser `AMEESH_CI_DISQUE_HOST` dans le fichier d'environnement
-du service natif. Ne pas utiliser les noms des slots `r1`, `r2` comme hôtes.
+La collecte reste bornée à cinq minutes entre deux lectures. À partir de
+**60 minutes** sans mesure récente d'un hôte attendu, le veilleur demande
+une exécution du workflow dédié sur la base. Ce choix laisse encore une
+part de 45 minutes en file et cinq minutes de sonde avant la borne de
+fraîcheur de deux heures (60 + 45 + 5 < 120). Une exécution dédiée déjà
+queued ou in_progress empêche un doublon. L'intention de dispatch est
+consommée en base avant l'appel HTTP, au plus une fois par heure par dépôt,
+y compris après redémarrage ou réponse ambiguë. Un échec reste visible par
+l'âge de la mesure ; aucune attente ni relance en boucle n'est ajoutée.
 
-Activation par le bureau, après intégration : appliquer d'abord la migration
-additive 0544 sur le mesh, actualiser les contrats de lecture superviseur
-(métadonnées en état, diagnostic réservé au rôle contenus), installer le
-script et le service avec
-`install-disque.sh --install`, lancer une première passe native, vérifier
-`install-disque.sh --check`, puis configurer toutes les VM attendues sur le
-veilleur. Vérifier la lecture SSH sous le compte réel du veilleur et la date
-physique dans `ci_disk_state`. Les anciennes annotations GitHub ne sont plus
-lues pour un dépôt configuré en natif : elles ne doivent pas masquer un timer
-arrêté. Sans configuration native, le transport historique reste disponible.
+Seul ci-disque.yml, sur la base et pour schedule ou workflow_dispatch,
+alimente la table physique ci_disk_state et peut résoudre l'alerte. Les
+annotations ameesh-ci-disk/1 des autres runs, PR et forks compris, sont des
+signaux **uniquement levants** : une mesure saine est ignorée, une mesure
+basse ouvre ou aggrave une alerte jusqu'à un relevé dédié plus récent. Les
+hôtes doivent déjà appartenir au périmètre du workflow dédié. Les signaux
+ne remplacent jamais une mesure physique et n'en repoussent pas l'âge.
 
-La collecte native précède tout accès GitHub et se répète au plus toutes les
-cinq minutes. Une destination en panne ne retient pas les autres. Chaque
-machine configurée est attendue même si elle n'a jamais rendu de mesure :
-après les deux heures de grâce initiale, une absence ou un relevé de plus de
-deux heures lève `ci_disk_unreadable`. Une ancienne mesure basse continue de
-lever `ci_disk_low` ; une lecture ratée ne la transforme pas en zéro ni en vert.
+Chaque refus de marge #5742 publie ameesh-ci-disk-refusal/1, même sous
+ENOSPC : aucun fichier n'est écrit par les jobs. Le veilleur lit aussi les
+annotations des jobs réussis (carte.yml peut absorber le code 75). Les
+refus sont conservés dans ci_disk_refusals (migration additive 0544), avec
+un identifiant dédupliqué et l'acquittement dans la transaction du courrier.
+Un courrier par hôte et par passage regroupe les signaux ; ceux arrivés
+ensuite restent dus au passage suivant. Aucun reason, job, runner ou autre
+texte libre du code testé ne passe dans le corps ni la charge du courrier :
+uniquement des identifiants validés et des nombres bornés. Ni test négatif
+ni preuve de réussite ne sont fabriqués par ce canal non fiable.
 
-Chaque refus de marge de la garde #5742 produit un fichier `refus-<UUID>.json`
-et une annotation `ameesh-ci-disk-refusal/1`. Le répertoire persistant est
-installé pour `runner`, hors du workspace et des temporaires des tests. Si
-ENOSPC empêche même cette écriture, l'annotation reste le secours. Le veilleur
-récupère les fichiers par SSH et les annotations des jobs en échec de la
-tentative suivie, uniquement si le dépôt de tête du run est le dépôt suivi
-(les forks et les origines inconnues sont exclus du secours). La migration 0544 conserve les refus et leur courrier ;
-l'UUID commun aux deux transports évite les doubles envois, y compris après
-un redémarrage ou avec un alias différent pour la machine. L'envoi au pilote
-et son acquittement sont dans une même transaction. Aucun destinataire ou
-un envoi en panne laisse le refus en attente. Le courrier et sa charge ne
-contiennent que des identifiants validés et des mesures numériques : aucun
-reason, job, runner ou autre texte libre issu du code testé. Les refus sont
-regroupés en un seul courrier par hôte et par passage du veilleur ; un refus
-arrivé après ce courrier reste dû au passage suivant. Aucun test négatif ni verdict
-rouge n'est inventé. Les fichiers restent sept jours et les acquittements
-huit jours ; les refus non acquittés restent dus en base. Le transport lit au
-plus 10 000 fichiers par passe et envoie au plus 100 courriers par transaction.
-Une interruption de collecte dépassant sept jours dépasse la rétention locale.
+Activation par le bureau après intégration : appliquer la migration 0544
+et les contrats de lecture superviseur (métadonnées d'état, payload réservé
+aux contenus), installer le script et les deux services/timers avec
+install-disque.sh --install, lancer une première mesure protégée, vérifier
+install-disque.sh --check et dispatcher le workflow dédié sur la base. Le
+nom physique du snapshot doit correspondre au label matrix.host ; si
+nécessaire, AMEESH_CI_DISQUE_HOST se pose dans le fichier d'environnement
+root-owned du service. Vérifier la date physique reçue et les alertes sur
+une mesure absente ou périmée. Aucun déploiement n'est revendiqué par la PR.
 
-Le seuil reste **5 GiB**, avec **10 000 inodes**. Chaque part affiche son libre
-initial, le minimum observé sur `/` toutes les secondes et leur différence
-(`#5751 : consommation disque observée par part`). Cette baisse physique
-inclut les jobs concurrents et ne constitue pas une attribution exclusive à
-la part. Comparer ces observations sur les VM de 60 Go avant de modifier le
-seuil ; aucune nouvelle mesure sous charge n'est revendiquée par ce lot.
+Le seuil reste **5 GiB** et **10 000 inodes**. Chaque part publie le libre
+initial, le minimum observé sur / toutes les secondes et leur différence.
+Cette baisse inclut les jobs concurrents : elle n'est pas une attribution
+exclusive. Comparer ces observations sur les VM de 60 Go avant de modifier
+le seuil ; aucune nouvelle mesure sous charge n'est revendiquée ici.
 
-Retour arrière : retirer `github.ci_disk_native` du veilleur rétablit la
-lecture des annotations historiques. Revenir au script/service précédent
-avec `install-disque.sh --install` ; la table additive peut rester en place.
+Retour arrière : réinstaller le script/service et le workflow précédents.
+Retirer le timer de mesure dédié s'il n'est plus utilisé ; les tables
+additives peuvent rester. La surveillance revient aux annotations du
+workflow de base et conserve l'alerte de fraîcheur en cas de silence.

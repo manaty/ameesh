@@ -656,6 +656,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'total_bytes', 'first_seen_at', 'seen_at'
     ]),
     -- #5751 (0544) : état de livraison des refus ; payload est un contenu.
+    ('ci_disk_dispatch', ARRAY['repo', 'requested_at']),
     ('ci_disk_refusals', ARRAY[
         'repo', 'host', 'event_id', 'message_id', 'seen_at'
     ]),

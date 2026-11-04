@@ -510,6 +510,20 @@ class CiResults(interface.CiResults):
             "WHERE repo = %s AND host = %s AND event_id = %s",
             (message_id, repo, host, event_id))
 
+    def claim_disk_dispatch(self, repo, *, now, interval_s) -> bool:
+        return bool(self.db.query(
+            "INSERT INTO ci_disk_dispatch AS d (repo, requested_at) "
+            "VALUES (%s, to_timestamp(%s)) ON CONFLICT (repo) DO UPDATE "
+            "SET requested_at = excluded.requested_at "
+            "WHERE d.requested_at <= excluded.requested_at - (%s * interval '1 second') "
+            "RETURNING repo", (repo, float(now), float(interval_s))))
+
+    def disk_signals(self) -> list[dict]:
+        rows = self.db.query("SELECT repo, host, payload FROM ci_disk_refusals "
+                             "WHERE seen_at >= now() - interval '7 days'")
+        return [dict(row['payload'], repo=row['repo'], host=row['host'],
+                     refusal=not row['payload'].get('signal')) for row in rows]
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     def claim_guard_scan(self, repo, *, now, window_s) -> bool:
         """Revendique la fenêtre du relevé de `repo`, atomiquement.

@@ -349,12 +349,15 @@ def mesure(hote=None, *, snapshot=False):
                 "total_bytes": disque["total"], "used_pct": disque["utilise_pct"],
                 "hostname": socket.gethostname(), "sampled_ts": time.time()}
     if snapshot:
+        if os.geteuid() != 0:
+            raise PermissionError("le snapshot physique exige l'identité de la sonde protégée")
         dossier = NATIVE_DIR
         temporaire = None
         try:
             with tempfile.NamedTemporaryFile(mode="w", dir=dossier, delete=False) as fichier:
                 temporaire = Path(fichier.name)
                 json.dump(document, fichier)
+                os.fchmod(fichier.fileno(), 0o644)
             os.replace(temporaire, dossier / "snapshot.json")
         finally:
             if temporaire is not None:
@@ -364,41 +367,30 @@ def mesure(hote=None, *, snapshot=False):
     return document
 
 
-def _document_natif(chemin):
+def _document_natif(chemin, *, protege=False):
     # Les tests tournent sous le même uid : une FIFO ou un lien dans le
     # spool ne doit jamais bloquer le transport ni lui faire lire autre chose.
+    if protege:
+        parent = chemin.parent.lstat()
+        if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0
+                or parent.st_mode & 0o022):
+            raise PermissionError("répertoire de mesure non protégé")
     fd = os.open(chemin, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as fichier:
         etat = os.fstat(fichier.fileno())
+        if protege and (etat.st_uid != 0 or etat.st_mode & 0o022):
+            raise PermissionError("mesure inscriptible hors de la sonde protégée")
         if not stat.S_ISREG(etat.st_mode) or etat.st_size > 16384:
             raise ValueError("document natif non régulier ou trop grand")
         return json.loads(fichier.read(16385))
 
 
-def natif():
-    """#5751 : transport SSH borné du relevé natif et des refus de parts.
-
-    Ne refait pas la mesure : son âge révèle un timer arrêté. Pas de secret,
-    de DSN ni d'appel GitHub sur la VM. Les refus restent sept jours pour
-    survivre aux coupures du veilleur ; aucun acquittement distant destructif.
-    """
-    dossier = NATIVE_DIR
-    try:
-        snapshot = _document_natif(dossier / "snapshot.json")
-    except (OSError, ValueError):
-        snapshot = None
-    refus = []
-    for chemin in sorted(dossier.glob("refus-*.json"))[:10000]:
-        try:
-            if chemin.is_symlink() or chemin.stat().st_size > 16384:
-                continue
-            if time.time() - chemin.stat().st_mtime > 7 * 86400:
-                chemin.unlink()
-                continue
-            refus.append(_document_natif(chemin))
-        except (OSError, ValueError):
-            continue
-    print(json.dumps({"snapshot": snapshot, "refusals": refus}, separators=(",", ":")))
+def publication(hote):
+    """Publie le relevé protégé via le seul workflow de base, sans SSH."""
+    snapshot = _document_natif(NATIVE_DIR / "snapshot.json", protege=True)
+    if snapshot.get("schema") != "ameesh-ci-disk/1" or snapshot.get("host") != hote:
+        raise ValueError("snapshot de la sonde absent ou hôte différent")
+    print("::notice title=ameesh-ci-disk/1::" + json.dumps(snapshot, separators=(",", ":")))
 
 
 def _resume_rapport(etat: dict) -> None:
@@ -1725,7 +1717,8 @@ def _analyse(argv=None):
     mesure_parser.add_argument("--host", help="nom Host du mesh, lié au label de la VM")
     mesure_parser.add_argument("--snapshot", action="store_true",
                                help="conserve le relevé horodaté natif (#5751)")
-    sous.add_parser("natif", help="lit le relevé et les refus locaux pour le veilleur SSH")
+    publication_parser = sous.add_parser("publication", help="publie le relevé physique protégé sur la base")
+    publication_parser.add_argument("--host", required=True)
     menage_parser = sous.add_parser("menage", help="élague ce qui n'est plus utilisé")
     menage_parser.add_argument("--dry-run", action="store_true",
                                help="imprime les commandes, ne supprime rien")
@@ -1742,8 +1735,8 @@ def main(argv=None) -> int:
     if args.mode == "mesure":
         mesure(args.host, snapshot=args.snapshot)
         return 0
-    if args.mode == "natif":
-        natif()
+    if args.mode == "publication":
+        publication(args.host)
         return 0
     if args.mode == "rapport":
         rapport(complet=args.complet, seuil_gib=args.seuil_gib)

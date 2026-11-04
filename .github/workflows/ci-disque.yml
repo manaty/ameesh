@@ -23,4 +23,4 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: mesure structurée (#5630)
-        run: python3 scripts/ci-disque.py mesure --host '${{ matrix.host }}'
+        run: /usr/local/lib/ameesh-ci/ci-disque.py publication --host '${{ matrix.host }}'
