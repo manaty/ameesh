@@ -35,7 +35,7 @@
   agent-mesh import-v0 [--agents a,b] [--dry-run]     cutover: v0 file mailbox → Postgres
   agent-mesh export-v0 [--agents a,b] [--keep]        rollback: Postgres → v0 mailbox
   agent-mesh migrate [--dry-run | --additive-only]   --additive-only: nothing if a migration is not additive (L151)
-  agent-mesh doctor [--notify-test | --probe]
+  agent-mesh doctor [--notify-test | --probe [--all-bases]]
   agent-mesh canon check|show|sync [--json] [--host H]   OKF canon (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions and admissible hosts (C4)
   agent-mesh hosts [--json] [HOST] [--history N]         host resources (L31)
@@ -3296,7 +3296,8 @@ def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
     return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe,
                           harness=getattr(args, "harness", False),
-                          profiles=getattr(args, "profiles", False))
+                          profiles=getattr(args, "profiles", False),
+                          all_bases=getattr(args, "all_bases", False))
 
 
 # --------------------------------------------------------------------------
@@ -4686,6 +4687,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     p_doc.add_argument("--notify-test", action="store_true")
     p_doc.add_argument("--probe", action="store_true",
                        help="light probe: database, schema, migrations up to date; nothing else")
+    p_doc.add_argument("--all-bases", action="store_true",
+                       help="#5692: with --probe, also probe every configured "
+                            "secondary base (mono-base by default)")
     p_doc.add_argument("--harness", action="store_true",
                        help="harness binaries served by the host (path, provenance, "
                             "interpreter) and runner units (L106)")

@@ -477,6 +477,19 @@ Provisionner un hôte neuf comprend donc ce clone complet (jamais `--depth` ni
 ssh root@<vm> 'runuser -u ameesh -- git clone https://github.com/manaty/ameesh.git /home/ameesh/work/ameesh-release'
 ```
 
+#5692 : avant la sauvegarde, le préflight joue aussi `migrate --dry-run
+--additive-only` sur toute base qu’il touchera — sur la VM qui migre, et sur le
+poste avec `poste.sh prevol REF` (base du mesh puis
+`config-ancienne-base.json`). Une migration non additive en attente sur la base
+du mesh arrête la séquence **avant** la sauvegarde ; une base secondaire du
+poste en échec (migration non additive, base ou configuration illisible) ne
+retient que lui : le poste est déclaré `absent`/`reporte` d’emblée et les
+quatre VM passent, migrations depuis une VM. `ameesh doctor`
+affiche un WARN par base (la secondaire comprise), `doctor --probe --all-bases` est KO (la sonde mono-base reste celle du déploiement), et
+`ameesh alerts` porte `migration_pending_non_additive` pour la base du mesh
+comme `host_migration_pending_non_additive` pour une base secondaire, avec les
+migrations et la base en clair (DSN masqué).
+
 Un `DEPOT_VM` différent se déclare dans l’environnement du lanceur. Lancée hors
 du poste et des VM d’agents (bureau-goal,
 sans venv ameesh ni route vers la base), la séquence fait tourner la sonde de

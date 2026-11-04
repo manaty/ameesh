@@ -73,7 +73,7 @@
   agent-mail statusline                          Claude Code status bar: [workspace/name] work · directory
   agent-mail migrate [--dry-run | --additive-only] [--allow-live-executors REASON]
                                                  applies the versioned migrations
-  agent-mail doctor [--notify-test | --probe | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY and the OS desktop channel (L66); host harnesses (L106)
+  agent-mail doctor [--notify-test | --probe [--all-bases] | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY and the OS desktop channel (L66); host harnesses (L106)
                                                  (--probe: lightweight container probe)
 
 Identity of a session: $AGENT_MAIL_NAME (the runner sets it for the harness
@@ -2048,7 +2048,9 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
                 allow_live_executors: str | None = None) -> int:
     """`--dry-run` : migrations manquantes, additives ou non, sans rien écrire.
     `--additive-only` : n'applique rien (code 3) si l'une d'elles n'est pas
-    additive — c'est le garde de « migrer avant d'installer » (L151)."""
+    additive — c'est le garde de « migrer avant d'installer » (L151).
+    #5692 : `--dry-run --additive-only` rend le même verdict (3) sans écrire,
+    pour que le préflight de staging constate le refus avant toute sauvegarde."""
     try:
         db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
@@ -2072,13 +2074,20 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
             if refused:
                 print("%d non-additive migration(s): the previous code would break on the "
                       "migrated database" % len(refused), file=sys.stderr)
-            if dry_run:
+            # #5692 : le préflight combine les deux options pour obtenir le
+            # verdict du garde sans écrire ; `--dry-run` seul reste un
+            # diagnostic (code 0) même avec des migrations non additives.
+            if dry_run and not additive_only:
                 if not missing:
                     print("schema up to date: no migration to apply")
                 return 0
             if refused:
                 print("nothing applied (--additive-only)", file=sys.stderr)
                 return 3
+            if dry_run:
+                if not missing:
+                    print("schema up to date: no migration to apply")
+                return 0
         done = migrations.migrate(db, log=lambda line: print(line), additive_only=additive_only,
                                   allow_live_executors=allow_live_executors)
     except migrations.NonAdditiveMigration as exc:
@@ -2096,11 +2105,17 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
     return 0
 
 
-def cmd_probe(cfg: Config) -> int:
+def cmd_probe(cfg: Config, *, all_bases: bool = False) -> int:
     """Sonde légère (`doctor --probe`) : base joignable, schéma présent,
     migrations à jour. Ni comptage, ni NOTIFY, ni écriture : faite pour une
     sonde de conteneur appelée toutes les quelques secondes. Une ligne, code 0
-    (OK) ou 1 (KO)."""
+    (OK) ou 1 (KO).
+
+    #5692 : `--all-bases` sonde aussi chaque base secondaire configurée (la
+    secondaire de l'hôte comprise) ; une seule en défaut rend la sonde KO, avec
+    sa ligne. Sans l'option, la sonde reste mono-base : `poste.sh`
+    `migrer`/`installer` l'appellent entre deux migrations, et une ancienne
+    base pas encore migrée ne doit pas faire échouer la base du mesh."""
     try:
         db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
@@ -2123,12 +2138,56 @@ def cmd_probe(cfg: Config) -> int:
         return 1
     finally:
         db.close()
+    pending_na = []
+    for migration in missing:
+        reasons = migrations.non_additive(migration)
+        if reasons:
+            pending_na.append((migration, reasons))
     if missing or modified:
-        print("probe: KO — migrations %s%s" % (
+        print("probe: KO — migrations %s%s%s" % (
             "missing %s" % ",".join(m.label for m in missing) if missing else "",
             ("%smodified %s" % ("; " if missing else "", ",".join(m.label for m in modified))
-             if modified else "")))
+             if modified else ""),
+            ("; %d non-additive — `migrate --additive-only` refuses them (%s)"
+             % (len(pending_na), migrations.describe_pending_non_additive(pending_na)))
+            if pending_na else ""))
         return 1
+    # #5692 : avec `--all-bases` seulement, chaque base secondaire de l'hôte
+    # est sondée en lecture seule avec le même verdict (le doctor complet la
+    # dit toujours, lui). Une base secondaire injoignable y est un KO.
+    for label, path in (config_mod.secondary_configs(cfg) if all_bases else ()):
+        other_db = None
+        try:
+            other = config_mod.load_file(path)
+            other_db = db_mod.connect(other, writer=False)
+            db_mod.require_schema(other_db)
+            other_missing, other_modified, _other_unknown = migrations.check(other_db)
+            migrations.require_compatible_writer(other_db)
+        except (Exception, SystemExit) as exc:  # une base dite, pas une trace
+            print("probe: KO — %s: %s"
+                  % (label, " ".join(str(exc).split())[:160]))
+            return 1
+        finally:
+            if other_db is not None:
+                other_db.close()
+        other_pending = []
+        for migration in other_missing:
+            reasons = migrations.non_additive(migration)
+            if reasons:
+                other_pending.append((migration, reasons))
+        if other_missing or other_modified:
+            print("probe: KO — %s: migrations %s%s%s" % (
+                label,
+                "missing %s" % ",".join(m.label for m in other_missing)
+                if other_missing else "",
+                ("%smodified %s" % ("; " if other_missing else "",
+                                    ",".join(m.label for m in other_modified))
+                 if other_modified else ""),
+                ("; %d non-additive — `migrate --additive-only` refuses them (%s)"
+                 % (len(other_pending),
+                    migrations.describe_pending_non_additive(other_pending)))
+                if other_pending else ""))
+            return 1
     extra = ("; database newer than this code (versions %s)"
              % ",".join("%04d" % v for v in unknown)) if unknown else ""
     print("probe: OK (driver %s, schema %s)%s" % (db.name, cfg.schema, extra))
@@ -2218,10 +2277,24 @@ def _print_profile_audit(audit) -> bool:
     return True
 
 
+def _print_pending_non_additive(pending, base: str | None = None) -> None:
+    """#5692 : une migration non additive en attente ne fait pas un KO — rien
+    n'est cassé — mais elle interdit le prochain `--additive-only`. WARN le
+    doctor complet, KO la sonde de déploiement (`doctor --probe`)."""
+    where = (" on %s" % base) if base else ""
+    print("migrations : WARNING%s — %d pending non-additive migration(s): %s"
+          % (where, len(pending),
+             migrations.describe_pending_non_additive(pending)))
+    print("warning    : `migrate --additive-only` refuses them: the previous code "
+          "would break on the migrated base; plan the migration window (executors "
+          "stopped) or defer this host at the next staging")
+
+
 def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
-               harness: bool = False, profiles: bool = False) -> int:
+               harness: bool = False, profiles: bool = False,
+               all_bases: bool = False) -> int:
     if probe:
-        return cmd_probe(cfg)
+        return cmd_probe(cfg, all_bases=all_bases)
     if profiles:
         # #3345 : contrôle léger et sans base, pour le déploiement
         # (`deploy/mise-a-jour/{vm,poste}.sh`) : tout profil qui hérite de
@@ -2382,6 +2455,33 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         return 1
     known, done = migrations.status(db)
     print("migrations : %d/%d applied" % (len(done), len(known)))
+    pending_switch = migrations.pending_non_additive_from(known, done)
+    if pending_switch:
+        _print_pending_non_additive(pending_switch)
+    # #5692 : la base secondaire de l'hôte (`config-ancienne-base.json`) n'était
+    # sondée par aucun doctor. Elle l'est ici, en lecture seule, pour que le
+    # signal existe avant le staging et pas seulement pendant `controler`.
+    # Une base injoignable est dite, sans changer le verdict : ce n'est pas la
+    # base du mesh.
+    for label, path in config_mod.secondary_configs(cfg):
+        other_db = None
+        try:
+            other = config_mod.load_file(path)
+            other_db = db_mod.connect(other, writer=False)
+            db_mod.require_schema(other_db)
+            other_known, other_done = migrations.status(other_db)
+        except (Exception, SystemExit) as exc:  # une lecture ne casse pas le doctor
+            print("migrations : %s: not checked (%s)"
+                  % (label, " ".join(str(exc).split())[:120]))
+            continue
+        finally:
+            if other_db is not None:
+                other_db.close()
+        print("migrations : %s: %d/%d applied"
+              % (label, len(other_done), len(other_known)))
+        other_pending = migrations.pending_non_additive_from(other_known, other_done)
+        if other_pending:
+            _print_pending_non_additive(other_pending, base=label)
     agents = storage.of(db).agents.count()
     unread = storage.of(db).mailbox.unread_total()
     print("agents     : %d" % agents)
@@ -2571,7 +2671,8 @@ def main(argv: list[str] | None = None) -> int:
         if command == "doctor":
             return cmd_doctor(cfg, notify_test="--notify-test" in rest,
                               probe="--probe" in rest, harness="--harness" in rest,
-                              profiles="--profiles" in rest)
+                              profiles="--profiles" in rest,
+                              all_bases="--all-bases" in rest)
         if command == "statusline":
             return cmd_statusline(cfg)
         if command == "alias":

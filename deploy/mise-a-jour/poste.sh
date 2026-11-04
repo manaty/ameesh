@@ -7,6 +7,11 @@
 #   deploy/mise-a-jour/poste.sh <étape> [REF]
 #
 #   verifier     contrôles, rien n'est modifié ; affiche les bases visées
+#   prevol [REF] #5692 : `migrate --dry-run --additive-only` sur chaque base
+#                configurée depuis l'instantané de REF (lecture seule) ;
+#                0 = additive, 3 = base du mesh bloquée (staging refusé),
+#                4 = base secondaire en échec, bloquée ou illisible (poste
+#                reportable d'emblée), 1 = autre échec
 #   sauvegarder  dump de la base du mesh sur la VM (copie gardée), rapatrié
 #                compressé, puis pg_dump de l'ancienne base
 #   migrer [--additif-seulement] [REF]
@@ -191,6 +196,54 @@ verifier() {
   ssh_vm 'hostname'
   ("$AMEESH" doctor || true) | tail -3
 }
+
+# #5692 : lecture seule des bases, depuis l'instantané de REF. Codes : 0 aucune
+# non additive ; 3 la base du mesh en attend (staging refusé AVANT sauvegarde) ;
+# 4 seule une base secondaire en attend (poste reportable d'emblée, le staging
+# des VM continue) ; 1 autre échec.
+prevol() {
+  local ref=${1:-HEAD} sha cible d code_mesh=0 code_reste=0
+  sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}") \
+    || { echo "prevol : REF introuvable dans $DEPOT : $ref" >&2; return 1; }
+  cible=$(instantane "$sha") || return 1
+  etape "migrations à venir (lecture seule) : $sha"
+  dsn_part d "$CONFIG" dsn || return 1
+  echo "mesh     : $d"
+  # Le fichier de l'hôte fait foi : un AMEESH_CONFIG ambiant (profil, banc)
+  # ne doit pas faire sonder une autre base que celle que « migrer » servira.
+  AMEESH_CONFIG="$CONFIG" ameesh_de "$cible" migrate --dry-run --additive-only \
+    || code_mesh=$?
+  if ancienne; then
+    if ! dsn_part d "$CONFIG_RESTE" dsn; then
+      echo "poste : preflight des migrations en echec : ancienne base illisible — poste reportable d'emblee, mise a jour a son retour" >&2
+      return 4
+    fi
+    echo "ancienne : $d"
+    AMEESH_CONFIG="$CONFIG_RESTE" ameesh_de "$cible" migrate --dry-run --additive-only \
+      || code_reste=$?
+  fi
+  if [ "$code_mesh" = 0 ] && [ "$code_reste" = 0 ]; then
+    return 0
+  fi
+  if [ "$code_mesh" != 0 ]; then
+    if [ "$code_mesh" = 3 ]; then
+      echo "poste : migrations non additives en attente sur la base du mesh : staging refuse avant toute sauvegarde" >&2
+      return 3
+    fi
+    echo "poste : preflight des migrations en echec sur la base du mesh (code $code_mesh)" >&2
+    return 1
+  fi
+  # Une base secondaire ne retient que le poste : quelle que soit la cause
+  # (non additive, base illisible, config refusée), le staging des VM continue
+  # et le poste se met a jour a son retour.
+  if [ "$code_reste" = 3 ]; then
+    echo "poste : migrations non additives en attente sur l'ancienne base : poste reportable d'emblee, mise a jour a son retour" >&2
+  else
+    echo "poste : preflight des migrations en echec sur l'ancienne base (code $code_reste) : poste reportable d'emblee, mise a jour a son retour" >&2
+  fi
+  return 4
+}
+
 
 # Démarre la sauvegarde serveur (copie gardée sur la VM) et atteste le dump
 # qu'elle vient de produire : chemin, taille et SHA-256, sur trois lignes.
@@ -391,7 +444,7 @@ redemarrer_urgence() {
 # si ce code est déjà installé. Le lien src-current n'accorde aucune autorité de
 # migration. --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
-  local ref cible d garde=(--additive-only) sha incompatible=0
+  local ref cible d garde=(--additive-only) sha incompatible=0 code_dry=0
   if [ "${1:-}" = "--additif-seulement" ]; then
     shift
   fi
@@ -402,7 +455,16 @@ migrer() {
   etape "base du mesh (une seule fois pour tout le mesh)"
   dsn_part d "$CONFIG" dsn || return
   echo "base : $d"
-  ameesh_de "$cible" migrate --dry-run --additive-only
+  # #5692 : depuis que le dry-run rend le verdict du garde (code 3), le
+  # message de refus doit sortir ici aussi — sinon `set -e` quitte le script
+  # sans expliquer pourquoi.
+  ameesh_de "$cible" migrate --dry-run --additive-only || code_dry=$?
+  if [ "$code_dry" = 3 ]; then
+    echo "migration non additive : le code en place casserait sur la base migrée." >&2
+    echo "Plan non additif séparé à faire approuver ; migrer conserve toujours la garde additive." >&2
+    return 3
+  fi
+  [ "$code_dry" = 0 ] || return "$code_dry"
   migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
@@ -1044,6 +1106,7 @@ case "${1:-}" in
   publier) publier "${2:-HEAD}" ;;
   rattraper) rattraper ;;
   verifier) verifier ;;
+  prevol) prevol "${2:-HEAD}" ;;
   sauvegarder) sauvegarder ;;
   installer) installer "${2:-HEAD}" ;;
   migrer) shift; migrer "$@" ;;
