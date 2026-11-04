@@ -25,6 +25,17 @@ READ_INTERVAL = 300
 #: job vu, même sans mesure.
 FORGET_AGE = 24 * 3600
 HOST = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
+#: #5754 : volumes vérifiés par la garde, vocabulaire fermé (même liste que
+#: `scripts/ci-test-space.py`). Le courrier nomme le volume sans recopier un
+#: chemin du code testé.
+VOLUMES = ('root', 'runner_temp', 'cwd', 'tmp')
+VOLUME_LABELS = {'root': 'racine (/)', 'runner_temp': 'RUNNER_TEMP',
+                 'cwd': 'répertoire courant (cwd)', 'tmp': 'temporaires (TMPDIR)'}
+#: #5754 : une ligne illisible ne peut pas recevoir de courrier ; elle est
+#: acquittée sur place. Ce plafond borne le balayage d'un passage quand des
+#: lignes illisibles occupent la fenêtre de 100 de la boîte durable.
+REFUSAL_SCAN = 500
+REFUSAL_WINDOW = 100
 
 
 def annotation(row, host):
@@ -119,6 +130,10 @@ def findings(rows, canons, now, signals=()):
     trusted = {(r['repo'], r['host']): r.get('sampled_ts') for r in rows}
     raised = []
     for signal in signals:
+        # #5754 : une ligne illisible, déjà acquittée sans courrier, ne doit
+        # pas faire échouer le relevé d'alertes ; sans date, elle ne lève rien.
+        if not isinstance(signal, dict) or not timestamp(signal.get('sampled_ts'), now):
+            continue
         measured = trusted.get((signal['repo'], signal['host']))
         if measured is None or measured < signal['sampled_ts']:
             raised.append(dict(signal, signal_only=True, volume='/'))
@@ -171,6 +186,35 @@ def timestamp(value, now):
             and math.isfinite(value))
 
 
+def volume(data):
+    """#5754 : volume vérifié, projection fermée ; None si absent ou inconnu."""
+    if not isinstance(data, dict):
+        return None
+    value = data.get('volume')
+    return value if value in VOLUMES else None
+
+
+def refusal_event(refusal):
+    """#5754 : données d'une ligne de refus lisible, None sinon.
+
+    Une ligne dont l'identifiant, le run ou la tentative ne sont pas les types
+    attendus ne peut ni être nommée dans un courrier ni être acquittée par un
+    identifiant stable : le veilleur la consomme sans courrier plutôt que de
+    la laisser retenir la fenêtre des 100 (N7).
+    """
+    if not isinstance(refusal, dict):
+        return None
+    data = refusal.get('payload')
+    if not isinstance(data, dict):
+        return None
+    if not re.fullmatch(r"[0-9a-f]{32}", str(refusal.get('event_id', ''))):
+        return None
+    if (type(data.get('run_id')) is not int or not 0 < data['run_id'] < 2**64
+            or type(data.get('attempt')) is not int or not 0 < data['attempt'] < 2**32):
+        return None
+    return data
+
+
 def observe_refusal(repo, host, refusal, store, *, now):
     if (not isinstance(refusal, dict) or refusal.get("repo") != repo
             or refusal.get("schema") != "ameesh-ci-disk-refusal/1"
@@ -185,7 +229,8 @@ def observe_refusal(repo, host, refusal, store, *, now):
     if not 0 < int(run_id) < 2**64 or not 0 < int(attempt) < 2**32:
         return
     payload = numeric_metrics(refusal)
-    payload.update(run_id=int(run_id), attempt=int(attempt), sampled_ts=refusal["sampled_ts"])
+    payload.update(run_id=int(run_id), attempt=int(attempt), sampled_ts=refusal["sampled_ts"],
+                   volume=volume(refusal))
     store.observe_disk_refusal(repo, host=host, event_id=refusal["id"], payload=payload)
 
 
