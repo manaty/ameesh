@@ -58,6 +58,22 @@ class EvidenceTest(unittest.TestCase):
                             "Traceback (most recent call last):\nAssertionError: regression")
         self.assertFalse(agregat.disk_infrastructure(job(), chained))
 
+    def test_erreurs_de_commande_enveloppent_enospc(self):
+        for evidence in (
+                "AssertionError: git init: fatal: [Errno 28] No space left on device",
+                "merge_queue._ProvenanceError: authors cannot be read ([Errno 28] No space left on device)",
+                "fatal: cannot mkdir: No space left on device\n"
+                "subprocess.CalledProcessError: Command ['git', 'init'] returned non-zero exit status 128.",
+                "OSError: [Errno 28] No space left on device\n\n"
+                "During handling of the above exception, another exception occurred:\n\n"
+                "subprocess.CalledProcessError: Command ['git'] returned non-zero exit status 128."):
+            with self.subTest(evidence=evidence):
+                self.assertTrue(agregat.disk_infrastructure(job(), traceback(evidence)))
+        self.assertFalse(agregat.disk_infrastructure(job(), traceback(
+            "subprocess.CalledProcessError: Command ['git'] returned non-zero exit status 128.")))
+        self.assertFalse(agregat.disk_infrastructure(job(), traceback(
+            "AssertionError: git init: 'No space left on device' not found in '[Errno 28]'")))
+
     def test_avertissement_recupere_ne_suffit_pas(self):
         for text in ("No space left on device\n", "ENOSPC\n",
                      "No space left on device\nFAILED (errors=1)\n"):

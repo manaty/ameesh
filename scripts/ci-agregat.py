@@ -178,11 +178,23 @@ def disk_infrastructure(job: dict, text: str) -> bool:
         final_disk = re.compile(
             r"^(?:(?:OSError|IOError): (?:\[Errno 28\](?:\s|:|$)|No space left on device)"
             r"|System\.IO\.IOException:.*No space left on device)", re.I)
-        # Une assertion peut citer un vrai ENOSPC (ou son traceback chaîné)
-        # tout en prouvant une régression : seule l'exception finale compte.
-        finals = [next((line.strip() for line in reversed(block.splitlines())
-                        if line.strip()), "") for block in blocks]
-        if len(blocks) != len(headers) or not all(final_disk.search(line) for line in finals):
+        def disk_block(block):
+            lines = [line.strip() for line in block.splitlines() if line.strip()]
+            final = lines[-1] if lines else ""
+            # Une comparaison reste négative, même après une cause ENOSPC.
+            if re.search(r"not found in| != |does not match|not raised", final, re.I):
+                return False
+            if final_disk.search(final):
+                return True
+            if re.match(r"AssertionError: git |(?:[\w.]+\.)?_ProvenanceError:", final):
+                return bool(re.search(r"\[Errno 28\]", final))
+            if re.match(r"subprocess\.CalledProcessError:", final):
+                # Preuve dans stderr ou la cause du même bloc, pas le source.
+                return any(re.match(r"(?:OSError: \[Errno 28\]|(?:fatal|error):.*No space left on device)",
+                                    line, re.I) for line in lines[:-1])
+            return False
+
+        if len(blocks) != len(headers) or not all(disk_block(block) for block in blocks):
             return False
         statuses = collections.Counter(re.findall(
             r"(?m)^(test\S+)[^\n]* \.\.\. (?:ERROR|FAIL)\s*$", text))
