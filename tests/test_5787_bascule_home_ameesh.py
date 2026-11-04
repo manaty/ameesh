@@ -6,7 +6,8 @@ sous des noms devinables de /tmp : un lien posé par ameesh (~/.ssh vers /etc/sy
 à écrire hors du home. Témoin statique : toute écriture du home ou d'un
 fichier temporaire passe par runuser -u ameesh ; vm.sh et poste.sh, dans
 l'empreinte, n'écrivent pas le home d'ameesh en root (poste.sh : listes de
-sauvegarde_serveur dans un dossier privé de root).
+sauvegarde_serveur dans un dossier privé de root ; idem staging.sh,
+sauvegarde_serveur_vm, #5799).
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASCULE = ROOT / "deploy" / "serveur" / "basculer-mesh.sh"
 VM = ROOT / "deploy" / "mise-a-jour" / "vm.sh"
 POSTE = ROOT / "deploy" / "mise-a-jour" / "poste.sh"
+STAGING = ROOT / "deploy" / "mise-a-jour" / "staging.sh"
 
 
 def code(path: pathlib.Path) -> list[str]:
@@ -54,10 +56,14 @@ class BasculeHomeAmeeshTest(unittest.TestCase):
     def test_backup_lists_never_live_in_the_user_dir(self):
         # revue DeepSeek (mty-amh-impl-03, beb212b37603) : les listes avant/après
         # de sauvegarde_serveur étaient des mktemp dans $d (dossier d'ameesh),
-        # réécrites par redirection root pendant pg_dump.
-        text = "\n".join(code(POSTE))
-        self.assertNotRegex(text, r'mktemp "\$d/')
-        self.assertIn("t=$(mktemp -d)", text)
+        # réécrites par redirection root pendant pg_dump. #5799 : même motif
+        # dans sauvegarde_serveur_vm de staging.sh (VM manaty-mesh-1).
+        for script in (POSTE, STAGING):
+            text = "\n".join(code(script))
+            self.assertNotRegex(text, r'mktemp "\$d/', script)
+            self.assertIn("t=$(mktemp -d)", text, script)
+            self.assertRegex(text, r'before=\$t/avant', script)
+            self.assertRegex(text, r'after=\$t/apres', script)
 
     def test_poste_root_commands_leave_the_home_alone(self):
         for line in code(POSTE):

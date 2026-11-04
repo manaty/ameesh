@@ -784,9 +784,13 @@ sauvegarde_serveur_vm() {
     "${CIBLE[manaty-mesh-1]}" 'set -eu
     IFS= read -r d
     test -d "$d"
-    before=$(mktemp "$d/.liste-avant.XXXXXX")
-    after=$(mktemp "$d/.liste-apres.XXXXXX")
-    trap "rm -f -- \"$before\" \"$after\"" EXIT HUP INT TERM
+    # #5799, même motif que #5787 : $d appartient à ameesh, qui pourrait y
+    # remplacer une liste par un lien que la redirection root suivrait :
+    # listes dans un dossier privé de root.
+    t=$(mktemp -d)
+    trap "rm -rf -- \"$t\"" EXIT HUP INT TERM
+    before=$t/avant
+    after=$t/apres
     find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f %i %s %T@\n" | sort > "$before"
     systemctl start ameesh-sauvegarde.service
     test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
