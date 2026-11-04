@@ -170,6 +170,8 @@ class SignedProvenanceTest(PgTestCase):
         receipt = prov.receipt_for_commit(self.db, head)
         self.assertEqual(receipt["actor"], "bureau")
         self.assertEqual(receipt["turn"], "signed:%d" % int(built["id"]))
+        # #5759 : aucun harnais courant divergent, aucun meta ajouté.
+        self.assertNotIn("registry_harness", self.approval_meta(receipt))
 
     def test_a_rejected_approval_proves_nothing(self):
         """Un refus signé reste un refus : il ne crée ni reçu ni consommation.
@@ -251,6 +253,33 @@ class SignedProvenanceTest(PgTestCase):
         self.assertEqual(receipt["harness"], "claude")
         self.assertEqual(self.approval_meta(receipt).get("registry_harness"),
                          "codex")
+
+    def test_a_pre_signed_approval_keeps_the_divergent_registry_harness(self):
+        """#5759 : le chemin --approval persiste le harnais courant divergent.
+
+        L'approbation pré-signée ne contient que le texte signé. Le contexte
+        (registre codex, session claude) est écrit au moment de la
+        consommation, sans toucher au texte version 1 ni à l'empreinte."""
+        self.bind(session="s-claude-old", harness="claude")
+        self.unbind(session="s-claude-old", harness="claude")
+        registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
+                        mode="externe")
+        head = self.commit("claude pré-signé")
+        built = self.approval(head)
+        before = storage.of(self.db).approvals.get(int(built["id"]))
+        row = prov.record_signed_commit(
+            self.db, head, actor="bureau", session=SESSION, harness="claude",
+            host=HOST, families=FAMILIES, lot=int(self.lot["id"]),
+            approval_id=int(built["id"]), cwd=self.repo)
+        self.assertTrue(row["recorded"])
+        meta = self.approval_meta(prov.receipt_for_commit(self.db, head))
+        self.assertEqual(meta.get("registry_harness"), "codex")
+        # Le texte signé, l'empreinte et les autres clés du meta sont intacts.
+        before_meta = before.get("meta") or {}
+        self.assertEqual(meta.get("statement"), before_meta.get("statement"))
+        after = storage.of(self.db).approvals.get(int(built["id"]))
+        self.assertEqual(after["artifact_hash"], before["artifact_hash"])
+        self.assertEqual(after["signed_payload"], before["signed_payload"])
 
     def test_a_harness_never_seen_is_refused(self):
         """#5756 : registre codex, aucune liaison claude -> refus nommé."""
@@ -459,6 +488,44 @@ class SignedProvenanceCliTest(PgTestCase):
         shown = self.mesh("provenance", "show", "--commit", self.head)
         self.assertEqual(shown.returncode, 0, shown.stderr + shown.stdout)
         self.assertIn("registry harness: codex", shown.stdout)
+
+    def test_the_cli_shows_the_registry_harness_of_a_pre_signed_receipt(self):
+        """#5759 : `--approval` écrit le contexte divergent, `show` l'affiche."""
+        import json
+        sb.bind(self.cfg, self.db, "bureau", session_id="s-claude-old",
+                harness="claude", by="human:test")
+        sb.unbind(self.cfg, self.db, session_id="s-claude-old", harness="claude",
+                  by="human:test")
+        registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
+                        mode="externe")
+        statement = prov.signed_statement(
+            commit=self.head, actor="bureau", session=SESSION, harness="claude",
+            host=HOST, lot=int(self.lot["id"]))
+        digest = prov.signed_digest(
+            commit=self.head, actor="bureau", session=SESSION, harness="claude",
+            host=HOST, lot=int(self.lot["id"]))
+        built = authority.create_approval(
+            self.db, self.seed, approver=OWNER, action=prov.SIGNED_ACTION,
+            artifact_kind=prov.SIGNED_KIND, artifact_hash=digest,
+            meta={"statement": statement})
+        canon = mechanics_canon(os.path.join(self.tmp, "canon"))
+        env = self.env(AMEESH_CANON=canon, AMEESH_CANON_REF="HEAD")
+        out = self.mesh(
+            "provenance", "record", "--signed", "--commit", self.head,
+            "--actor", "bureau", "--session", SESSION, "--harness", "claude",
+            "--host", HOST, "--lot", str(self.lot["id"]),
+            "--approval", str(int(built["id"])), "--repo", self.repo, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr + out.stdout)
+        shown = self.mesh("provenance", "show", "--commit", self.head, "--json")
+        self.assertEqual(shown.returncode, 0, shown.stderr + shown.stdout)
+        data = json.loads(shown.stdout)
+        self.assertEqual(data["harness"], "claude")
+        self.assertEqual(data["registry_harness"], "codex")
+        # La preuve signée n'a pas bougé : seul le meta (diagnostic) a reçu
+        # le contexte de consommation.
+        after = storage.of(self.db).approvals.get(int(built["id"]))
+        self.assertEqual(after["artifact_hash"], digest)
+        self.assertEqual(after["signed_payload"], built["signed_payload"])
 
     def test_the_statement_subcommand_prints_the_digest(self):
         out = self.mesh("provenance", "statement", "--commit", self.head,

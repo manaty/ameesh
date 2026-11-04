@@ -263,6 +263,23 @@ class Approvals(interface.Approvals):
         )
         return rows[0] if rows else None
 
+    def merge_meta(self, approval_id, values) -> dict | None:
+        """Fusionne `values` dans le meta (diagnostic, hors signature).
+
+        `signed_payload` ne couvre pas le meta : cette écriture ne change ni
+        la preuve ni sa validité. `RETURNING` rend le meta résultant ; aucune
+        ligne si l'approbation a disparu (#5759)."""
+        rows = self.db.query(
+            """
+            UPDATE mesh_approvals
+               SET meta = meta || %s::jsonb
+             WHERE id = %s
+            RETURNING meta
+            """,
+            (json.dumps(values or {}, ensure_ascii=False), int(approval_id)),
+        )
+        return rows[0]["meta"] if rows else None
+
     def consume(self, approval_id, by) -> bool:
         """Consomme une approbation une seule fois, par (approver, nonce).
 

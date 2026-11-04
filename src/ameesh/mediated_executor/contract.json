@@ -4609,6 +4609,7 @@
     "consume",
     "create",
     "get",
+    "merge_meta",
     "recent"
    ],
    "authenticators": [
