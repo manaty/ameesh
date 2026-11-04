@@ -2176,6 +2176,11 @@ class WorkItems(interface.WorkItems):
         l'appelant est gardé."""
         if on_frozen is not None and kind != "frozen":
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
+        # #5758 : les transitions que l'outil écrit pour un jalon (gel, quorum
+        # d'avis) sont signées par lui, pas par l'agent dont le jalon les
+        # déclenche : un hold de pilote ne tombe que sur un geste, jamais sur
+        # une écriture automatique (`planned_waits.is_automatic_transition`).
+        from ...work import SYSTEM_SENDER
         threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
             # #3490: a freeze can call work.move below. Acquire its repository
@@ -2219,7 +2224,8 @@ class WorkItems(interface.WorkItems):
                 tx.execute(f"UPDATE work_items SET state = '{lifecycle.QA}', updated_at = now()"
                            " WHERE id = %s", (int(item_id),))
                 WorkItems(tx)._event(int(item_id), "qa",
-                                    "validated → qa — review quorum changed (#4351)", actor)
+                                    "validated → qa — review quorum changed (#4351)",
+                                    SYSTEM_SENDER)
             same_head = False
             if (kind == "frozen" and items
                     and not items[0].get("workflow_ref")
@@ -2258,9 +2264,9 @@ class WorkItems(interface.WorkItems):
                 # roll back the state, journal and milestone together.
                 from ... import work
                 if items[0]["state"] == lifecycle.REQUESTED:
-                    work.move(tx, item_id, lifecycle.IN_PROGRESS, actor=actor,
+                    work.move(tx, item_id, lifecycle.IN_PROGRESS, actor=SYSTEM_SENDER,
                               note="intake → build — frozen (#3467)")
-                work.move(tx, item_id, lifecycle.QA, actor=actor,
+                work.move(tx, item_id, lifecycle.QA, actor=SYSTEM_SENDER,
                           note=("validated → qa — frozen (#4351)"
                                 if items[0]["state"] == "validated"
                                 else "build → qa — frozen (#3467)"))
@@ -2292,7 +2298,7 @@ class WorkItems(interface.WorkItems):
             # designation hooks are reconciled by the outer freeze writer.
             from ...freeze_gate import _in_transaction
             if not _in_transaction(self.db):
-                self._sync_validation(item_id, actor)
+                self._sync_validation(item_id, SYSTEM_SENDER)
         return milestone
 
     def _validation_gate(self, item_id, marks=None, *, item=None):

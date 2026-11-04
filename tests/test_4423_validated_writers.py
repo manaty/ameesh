@@ -2,7 +2,7 @@
 """Stored validation is derived from the exact-head review gate (#4423, #5016)."""
 from unittest import mock
 
-from ameesh import progress, storage, work, work_lifecycle
+from ameesh import planned_waits, progress, storage, work, work_lifecycle
 from .support import PgTestCase
 
 HEAD = "a" * 40
@@ -42,6 +42,25 @@ class ValidatedWritersTest(PgTestCase):
         self.read.return_value = {"ok": False, "blocked": [{"actor": "reader"}]}
         self.mark(verdict="blocked")
         self.assertEqual(self.current_state(), "qa")
+
+    def test_the_automatic_quorum_does_not_lift_a_pilot_hold(self):
+        """#5758 : le quorum `qa → validated` est une écriture de l'outil.
+
+        Il ne lève pas le hold de pilote posé sur le lot : le composeur doit
+        continuer à le refuser (`pilot-hold`). La transition est signée par
+        l'outil ; si un writer cesse de le faire, ce témoin le dit."""
+        work.note(self.db, self.lot, "hold: pose VM du bureau avant paquet",
+                  actor="human:pilote")
+        self.read.return_value = {"ok": True}
+        self.mark()
+        self.assertEqual(self.current_state(), "validated")
+        events = storage.of(self.db).progress.lot_hold_events(
+            [self.lot], planned_waits.HOLD_NOTE_PATTERNS)
+        transition = [event for event in events
+                      if event["state"] == "validated"][-1]
+        self.assertEqual(transition["actor"], "ameesh")
+        self.assertTrue(planned_waits.is_automatic_transition(transition))
+        self.assertIn(self.lot, planned_waits.pilot_holds(self.db, events))
 
     def test_refreeze_resets_validation_in_the_same_transaction(self):
         self.read.return_value = {"ok": True}

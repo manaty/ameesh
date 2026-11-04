@@ -316,8 +316,10 @@ class FreezeIntakeTest(_ActivationFixture, PgTestCase):
         moves = self.db.query(
             "SELECT state, actor FROM work_item_events WHERE work_item_id = %s"
             " AND note LIKE %s ORDER BY id", (self.lot, "%frozen (#3467)"))
+        # #5758 : les transitions du crochet de gel sont signées par l'outil ;
+        # le jalon `frozen`, lui, garde l'auteur du gel.
         self.assertEqual([(r["state"], r["actor"]) for r in moves],
-                         [("build", "author"), ("qa", "author")])
+                         [("build", "ameesh"), ("qa", "ameesh")])
 
     def test_pinned_freeze_keeps_process_state_and_designates_reviewers(self):
         for state in ("intake", "build"):

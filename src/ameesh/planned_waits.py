@@ -6,9 +6,13 @@ an explicit blocking dependency — or an explicit **hold** (#1664), the note a
 pilot writes when the lot is parked on a gate no open lot carries (operator
 window, human decision). The hold stops the stale reminders and the SLO
 breaches, like any other planned wait, until the lot changes state or the hold
-is explicitly lifted. Only a pilot's hold counts here (`pilot_holds`), and the
-write path authenticates that claim (`work.check_wait_note`); the runner wake
-keeps its own, older convention (`LotSessions.HOLD_PREFIX`).
+is explicitly lifted. #5758: an automatic transition of the tooling (review
+quorum, freeze, designation, sync) is not a gesture — it does not lift a
+pilot's hold; only a transition by an agent or a human does, the same as an
+`unhold:` note. An ordinary hold (the assignee's, rule 1) keeps following any
+state change. Only a pilot's hold counts here (`pilot_holds`), and the write
+path authenticates that claim (`work.check_wait_note`); the runner wake keeps
+its own, older convention (`LotSessions.HOLD_PREFIX`).
 
 #2378: a lot in `waiting_human` with an open decision request (`ameesh decide
 ask`) waits for its decider until the request's deadline; past the deadline,
@@ -68,7 +72,9 @@ def hold_end(due_on):
 #: #1664 : le préfixe de la note de retenue — le même que celui du réveil
 #: (règle 1, `LotSessions.HOLD_PREFIX`).
 _HOLD = re.compile("^" + re.escape(LotSessions.HOLD_PREFIX), re.I)
-#: les notes de levée explicite ; un changement d'état du lot lève aussi.
+#: les notes de levée explicite ; un changement d'état lève les holds
+#: ordinaires. Un hold de pilote attend un geste : une transition automatique de
+#: l'outillage ne le lève pas (`is_automatic_transition`, #5758).
 _SPACE = "[" + HOLD_NOTE_WHITESPACE + "]"
 # Expliciter aussi les variantes Unicode de IGNORECASE absentes d'ARE.
 _LIFT = re.compile(
@@ -359,6 +365,31 @@ def expired_window(holds: dict | None, now: float) -> float | None:
     return max(dues)
 
 
+#: #5758 : une transition **automatique** de l'outillage — quorum d'avis,
+#: gel, désignation, sync — n'est pas un geste : elle ne lève pas un hold de
+#: pilote. L'outil signe ces écritures sous son nom (`work.SYSTEM_SENDER` =
+#: « ameesh », ou une de ses passes `ameesh:…`), sous celui de ses portes
+#: (`device-gates (runner …)`) ou de ses relevés de fusion (`git:<cible>`,
+#: `composition:<paquet>`) ; une transition d'agent ou d'humain, elle, est un
+#: geste. Le journal ciblé (`lot_hold_events`) ne transfère pas le texte des
+#: transitions : l'acteur est la seule marque lisible, d'où la signature de
+#: l'outil au chemin d'écriture.
+_AUTOMATIC_ACTOR = re.compile(
+    r"^(?:ameesh(?::|$)|device-gates(?: |$)|git:|composition:)")
+
+
+def is_automatic_transition(event) -> bool:
+    """#5758 : cette transition d'état est-elle une écriture de l'outillage ?
+
+    Le quorum d'avis, le gel, la désignation et la sync changent l'état sans
+    geste d'agent : ils ne lèvent pas un hold de pilote. L'outil écrit ces
+    transitions sous son nom (`SYSTEM_SENDER`, ses passes, ses portes et ses
+    relevés de fusion) ; toute autre transition est un geste d'agent ou
+    d'humain et lève le hold."""
+    actor = str(event.get("actor") or "").strip()
+    return bool(actor) and bool(_AUTOMATIC_ACTOR.match(actor))
+
+
 def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
     """Les holds lus dans le journal d'un lot (#1664) — la **dernière** retenue.
 
@@ -373,7 +404,8 @@ def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
     #3219 : c'est une lecture d'affichage, pas l'ensemble des retenues actives
     — un hold couvert par celui d'un autre auteur reste actif et continue de
     retenir. La lecture d'autorité (levée, fermeture par le contenu) est
-    `active_holds`."""
+    `active_holds`, seule à distinguer le hold d'un pilote de celui d'un agent
+    devant une transition automatique (#5758)."""
     ordered: dict[int, list[dict]] = {}
     for event in events or ():
         ordered.setdefault(int(event["work_item_id"]), []).append(event)
@@ -460,7 +492,9 @@ def active_holds(db, events, *, cfg=None,
     hold de son propre auteur — sauf celle d'un pilote (humain, orchestrateur
     ou conception), qui lève toute la retenue du lot (#1664). Un hold posé
     avant ou après celui d'un autre auteur continue donc de retenir, même
-    après la levée du sien.
+    après la levée du sien. #5758 : une transition automatique de l'outillage
+    (quorum, gel, désignation, sync) lève les seuls holds ordinaires ; un hold
+    de pilote attend un geste d'agent ou d'humain (`is_automatic_transition`).
 
     `pilot` dit si l'auteur est un pilote **à la lecture** (`_pilot_allowed`,
     la même autorisation que la stagnation). `note` est le texte de la pose
@@ -482,7 +516,14 @@ def active_holds(db, events, *, cfg=None,
                                                        int(e.get("id") or 0))):
             state = event.get("state")
             if previous is not None and state != previous:
-                held = {}                   # le lot a repris : tout est fini
+                if is_automatic_transition(event):
+                    # #5758 : l'outillage n'a pas repris le lot. Une retenue
+                    # ordinaire suit tout changement d'état (règle 1), celle
+                    # d'un pilote attend un geste explicite.
+                    held = {who: hold for who, hold in held.items()
+                            if hold.get("pilot")}
+                else:
+                    held = {}               # le lot a repris : tout est fini
             previous = state
             text = str(event.get("note") or "").strip()
             if not text:
@@ -533,7 +574,9 @@ def pilot_hold_releases(db, events, *, cfg=None) -> dict[int, list]:
     """#2916 : les instants où un hold de pilote a été levé, par lot.
 
     Même journal et même autorisation que `pilot_holds` (`hold:` d'un pilote,
-    levé par `unhold:`/`hold lifted:`/`cleared:` ou par un changement d'état).
+    levé par `unhold:`/`hold lifted:`/`cleared:` ou par un changement d'état
+    qui est un geste ; une transition automatique de l'outillage ne le lève
+    pas, #5758).
     Le délai intake repart de la dernière levée antérieure au début du lot
     (#2921) : le temps parqué sous un hold de pilote n'est pas un retard
     imputable au porteur. Un `hold:` d'un acteur ordinaire ne compte pas — il
@@ -560,9 +603,12 @@ def pilot_hold_releases(db, events, *, cfg=None) -> dict[int, list]:
                 state = event.get("state")
                 at = event.get("created_ts")
                 if previous is not None and state != previous:
-                    if held and at is not None:
-                        released.append(float(at))
-                    held = False
+                    # #5758 : une transition automatique de l'outillage ne
+                    # lève pas le hold de pilote (ni ne date sa levée).
+                    if not is_automatic_transition(event):
+                        if held and at is not None:
+                            released.append(float(at))
+                        held = False
                 previous = state
                 text = str(event.get("note") or "").strip()
                 if not text:

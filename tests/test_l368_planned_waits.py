@@ -537,6 +537,60 @@ class UnitTest(unittest.TestCase):
             None, [event("unhold: reprise", 3.0, 3),
                    event("hold: op", 1.0, 2)]), {1: [3.0]})
 
+    def test_a_pilot_hold_survives_an_automatic_transition(self):
+        """#5758 : le quorum d'avis change l'état sans geste d'agent.
+
+        Le lot #5751 a été porté `qa → validated` par le quorum (#4423) trois
+        minutes après le hold du pilote. L'outil signe cette transition sous
+        son nom : elle ne doit pas lever le hold de pilote. Le hold ordinaire
+        d'un agent suit le changement d'état comme avant ; un geste d'agent
+        lève le hold de pilote, et une levée explicite reste la voie."""
+        def event(note, ts, ident, actor="human:pilote", state="qa"):
+            return {"work_item_id": 1, "state": state, "note": note,
+                    "actor": actor, "created_ts": ts, "id": ident}
+
+        quorum = event("qa → validated — review quorum (#4423)", 2.0, 3,
+                       actor="ameesh", state="validated")
+        events = [event("created", 0.5, 1), event("hold: pose VM du bureau", 1.0, 2),
+                  quorum]
+        self.assertEqual(set(W.active_holds(None, events)[1]), {"human:pilote"})
+        self.assertEqual(W.pilot_holds(None, events)[1]["by"], "human:pilote")
+        self.assertEqual(W.pilot_hold_releases(None, events), {})
+        # le report du quorum signe déjà sous l'outil : même lecture
+        self.assertEqual(set(W.active_holds(None, [
+            event("hold: attente", 1.0, 2),
+            event("qa → validated — carried review quorum (#4423)", 2.0, 3,
+                  actor="ameesh", state="validated")])[1]), {"human:pilote"})
+        # le gel automatique aussi
+        self.assertEqual(set(W.active_holds(None, [
+            event("hold: attente", 1.0, 2),
+            event("build → qa — frozen (#3467)", 2.0, 3, actor="ameesh",
+                  state="qa")])[1]), {"human:pilote"})
+        # une fermeture par le relevé de fusion (`git:<cible>`) est aussi un
+        # écrit de l'outil, quel que soit son motif
+        self.assertEqual(set(W.active_holds(None, [
+            event("hold: attente", 1.0, 2),
+            event("merge constaté", 2.0, 3, actor="git:origin/main",
+                  state="merged")])[1]), {"human:pilote"})
+        # et le calcul SLO ne date pas de levée sur cette transition
+        self.assertEqual(W.pilot_hold_releases(None, [
+            event("hold: attente", 1.0, 2, state="build"),
+            event("build → qa — frozen (#3467)", 2.0, 3, actor="ameesh",
+                  state="qa")]), {})
+        # le hold ordinaire d'un agent garde le comportement d'avant
+        self.assertEqual(W.active_holds(None, [
+            event("hold: je reprends demain", 1.0, 2, actor="dev7"),
+            quorum]), {})
+        # une transition faite par un agent ou un humain lève le hold de pilote
+        self.assertEqual(W.pilot_holds(None, [
+            event("hold: attente", 1.0, 2),
+            event("qa → build — reprise", 2.0, 3, actor="mty-amh-impl-08",
+                  state="build")]), {})
+        # et la levée explicite du pilote le lève
+        self.assertEqual(W.pilot_hold_releases(None, [
+            event("hold: attente", 1.0, 2),
+            event("unhold: pose faite", 2.0, 3)]), {1: [2.0]})
+
     def test_hold_outranks_a_declared_dependency_and_its_label(self):
         hold = {1: {"what": "hold", "by": "pilote", "since": 1700000000.0}}
         commitment = {"status": "open", "work_item_id": 1, "depends_on": ["#2"]}
