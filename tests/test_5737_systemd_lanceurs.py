@@ -9,12 +9,13 @@ stable vide dans un dossier temporaire, aucun hôte, aucune base.
 """
 from __future__ import annotations
 
+import configparser
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
 import tempfile
-import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +31,15 @@ APPEL_VENV = re.compile(r"\.local/share/ameesh/venv/bin/([^\s/;'\"]+)")
 
 def lanceurs_stable_neuf() -> set[str]:
     """Les noms de `bin/` après `_installer_lanceurs` sur un stable neuf."""
-    scripts = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["scripts"]
+    # Les scripts sont des scalaires TOML entre guillemets ; comme le test
+    # l104, lire ce sous-ensemble sans tomllib (absent de Python 3.9/3.10).
+    package = configparser.ConfigParser()
+    contenu = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    section = re.search(r"(?ms)^\[project\.scripts\]\s*\n(.*?)(?=^\[|\Z)", contenu)
+    assert section is not None, "section project.scripts absente"
+    package.read_string("[project.scripts]\n" + section.group(1))
+    scripts = {nom: json.loads(valeur)
+               for nom, valeur in package["project.scripts"].items()}
     with tempfile.TemporaryDirectory() as tmp:
         venv = os.path.join(tmp, "venv")
         version = "neuf"
