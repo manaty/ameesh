@@ -70,6 +70,7 @@ import tempfile
 import time
 from pathlib import Path
 
+NATIVE_DIR = Path("/var/lib/ameesh-ci-disk")
 GIB = 1024 ** 3
 SEUIL_GIB = 5.0
 AGE_HEURES = 6.0            # conteneurs arrêtés et volumes non utilisés
@@ -340,16 +341,56 @@ def rapport(complet: bool = False, seuil_gib: float | None = None) -> dict:
     return etat
 
 
-def mesure(hote=None):
+def mesure(hote=None, *, snapshot=False):
     """#5630 : petite sonde indépendante de docker, lisible via Checks API."""
     disque = espace("/")
-    document = {"schema": "ameesh-ci-disk/1", "host": hote or socket.gethostname(),
+    document = {"schema": "ameesh-ci-disk/1", "host": hote or os.environ.get("AMEESH_CI_DISQUE_HOST") or socket.gethostname(),
                 "volume": disque["chemin"], "free_bytes": disque["libre"],
                 "total_bytes": disque["total"], "used_pct": disque["utilise_pct"],
-                "hostname": socket.gethostname()}
+                "hostname": socket.gethostname(), "sampled_ts": time.time()}
+    if snapshot:
+        if os.geteuid() != 0:
+            raise PermissionError("le snapshot physique exige l'identité de la sonde protégée")
+        dossier = NATIVE_DIR
+        temporaire = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=dossier, delete=False) as fichier:
+                temporaire = Path(fichier.name)
+                json.dump(document, fichier)
+                os.fchmod(fichier.fileno(), 0o644)
+            os.replace(temporaire, dossier / "snapshot.json")
+        finally:
+            if temporaire is not None:
+                temporaire.unlink(missing_ok=True)
     # Une notice même au vert : sa lecture permet de résoudre l'alerte.
     print("::notice title=ameesh-ci-disk/1::" + json.dumps(document, separators=(",", ":")))
     return document
+
+
+def _document_natif(chemin, *, protege=False):
+    # Les tests tournent sous le même uid : une FIFO ou un lien dans le
+    # spool ne doit jamais bloquer le transport ni lui faire lire autre chose.
+    if protege:
+        parent = chemin.parent.lstat()
+        if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0
+                or parent.st_mode & 0o022):
+            raise PermissionError("répertoire de mesure non protégé")
+    fd = os.open(chemin, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fichier:
+        etat = os.fstat(fichier.fileno())
+        if protege and (etat.st_uid != 0 or etat.st_mode & 0o022):
+            raise PermissionError("mesure inscriptible hors de la sonde protégée")
+        if not stat.S_ISREG(etat.st_mode) or etat.st_size > 16384:
+            raise ValueError("document natif non régulier ou trop grand")
+        return json.loads(fichier.read(16385))
+
+
+def publication(hote):
+    """Publie le relevé protégé via le seul workflow de base, sans SSH."""
+    snapshot = _document_natif(NATIVE_DIR / "snapshot.json", protege=True)
+    if snapshot.get("schema") != "ameesh-ci-disk/1" or snapshot.get("host") != hote:
+        raise ValueError("snapshot de la sonde absent ou hôte différent")
+    print("::notice title=ameesh-ci-disk/1::" + json.dumps(snapshot, separators=(",", ":")))
 
 
 def _resume_rapport(etat: dict) -> None:
@@ -1674,6 +1715,10 @@ def _analyse(argv=None):
                                 help="seuil d'alerte en GiB (défaut %(default)s)")
     mesure_parser = sous.add_parser("mesure", help="sonde disque structurée sans docker")
     mesure_parser.add_argument("--host", help="nom Host du mesh, lié au label de la VM")
+    mesure_parser.add_argument("--snapshot", action="store_true",
+                               help="conserve le relevé horodaté natif (#5751)")
+    publication_parser = sous.add_parser("publication", help="publie le relevé physique protégé sur la base")
+    publication_parser.add_argument("--host", required=True)
     menage_parser = sous.add_parser("menage", help="élague ce qui n'est plus utilisé")
     menage_parser.add_argument("--dry-run", action="store_true",
                                help="imprime les commandes, ne supprime rien")
@@ -1688,7 +1733,10 @@ def _analyse(argv=None):
 def main(argv=None) -> int:
     args = _analyse(argv)
     if args.mode == "mesure":
-        mesure(args.host)
+        mesure(args.host, snapshot=args.snapshot)
+        return 0
+    if args.mode == "publication":
+        publication(args.host)
         return 0
     if args.mode == "rapport":
         rapport(complet=args.complet, seuil_gib=args.seuil_gib)

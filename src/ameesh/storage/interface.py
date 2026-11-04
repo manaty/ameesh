@@ -1894,6 +1894,15 @@ class Approvals(Domain):
         """Consomme l'approbation une seule fois, par (approver, nonce) :
         faux si ce nonce était déjà consommé."""
 
+    @abc.abstractmethod
+    def merge_meta(self, approval_id: int, values: dict) -> dict | None:
+        """Fusionne `values` dans le meta de l'approbation et rend le meta
+        résultant ; None si elle n'existe plus.
+
+        Le meta n'est pas couvert par `signed_payload` : cette écriture ne
+        change ni la preuve ni sa validité, elle garde un contexte de lecture
+        (par exemple le harnais courant divergent, #5759)."""
+
 
 class Nonces(Domain):
     """Registre des nonces consommés (`mesh_consumed_nonces`)."""
@@ -5472,13 +5481,13 @@ class CiResults(Domain):
         première apparition `first_seen_at` reste stable."""
 
     @abc.abstractmethod
-    def observe_disk(self, repo: str, *, host: str, volume: str, run_id: int,
+    def observe_disk(self, repo: str, *, host: str, volume: str, run_id: int | None,
                      sampled_ts: float, free_bytes: int, total_bytes: int) -> None:
         """#5630 : garde la mesure la plus récente de chaque volume de VM CI."""
 
     @abc.abstractmethod
     def disks(self) -> list[dict]:
-        """#5630 : mesures via annotations GitHub (sampled_ts NULL si jamais reçue).
+        """#5630 : mesures physiques CI (sampled_ts NULL si jamais reçue).
         #5633 : `first_seen_ts` date la première apparition (grâce initiale),
         `seen_ts` la dernière (oubli)."""
 
@@ -5491,6 +5500,27 @@ class CiResults(Domain):
     @abc.abstractmethod
     def prune_disks(self, repos: Sequence[str]) -> None:
         """#5630 : retire les disques des dépôts sortis du périmètre actif."""
+
+    @abc.abstractmethod
+    def observe_disk_refusal(self, repo: str, *, host: str, event_id: str, payload: dict) -> None:
+        """#5751 : insère une fois un refus natif ; ne modifie aucun verdict."""
+
+    @abc.abstractmethod
+    def disk_refusals(self, repo: str) -> list[dict]:
+        """#5751 : au plus 100 refus sans courrier, verrouillés SKIP LOCKED.
+        À appeler dans la transaction d'envoi, sur le veilleur direct seul."""
+
+    @abc.abstractmethod
+    def set_disk_refusal_message(self, repo: str, *, host: str, event_id: str, message_id: int) -> None:
+        """#5751 : acquittement durable dans la transaction du courrier."""
+
+    @abc.abstractmethod
+    def claim_disk_dispatch(self, repo: str, *, now: float, interval_s: float) -> bool:
+        """#5751 : consomme atomiquement une intention de sonde dédiée."""
+
+    @abc.abstractmethod
+    def disk_signals(self) -> list[dict]:
+        """#5751 : signaux non fiables, uniquement levants, distincts des mesures."""
 
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     @abc.abstractmethod

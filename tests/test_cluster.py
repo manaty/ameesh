@@ -101,6 +101,8 @@ CONTENUS = {
     "mesh_approvals_status": {"meta"},
     # L161c (0055) : sortie d'un test en échec
     "ci_test_failures": {"excerpt"},
+    # #5751 : diagnostic des refus ; les métadonnées seules sont un état.
+    "ci_disk_refusals": {"payload"},
     # L232a (0371) : plans, preuves et détails de travail, sans secrets
     "host_handoffs": {"plan", "evidence"},
     "host_handoff_events": {"detail"},

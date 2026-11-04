@@ -842,6 +842,9 @@ class SettingsTest(unittest.TestCase):
             raise plan_github.GithubRateLimited(repo, 1000)
 
         watcher.watch = watch
+        # #5751 : ce banc de quota n'a pas de base ; le transport natif et
+        # sa boîte de refus persistants sont vérifiés dans leur propre banc.
+        watcher._disk_refusal_messages = lambda db, repo: []
         self.assertEqual(watcher.tick(None), [])
         self.assertEqual(visited, ["o/a"])          # le second dépôt n'appelle pas
         self.assertIn("quota exhausted", logs[0])

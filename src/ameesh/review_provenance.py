@@ -51,7 +51,8 @@ pas de signature valide, pas de reçu. L'acteur doit être `externe` au registre
 sans bail vivant ; le harnais est celui de la SESSION (#5756) : une liaison de
 session le fixe avec l'agent, sinon il doit être un harnais déjà connu de
 l'acteur (registre courant ou liaison passée). Le harnais courant du registre,
-s'il diverge, est gardé dans le meta de l'approbation (`registry_harness`).
+s'il diverge, est gardé dans le meta de l'approbation (`registry_harness`) :
+à la signature, ou à sa consommation quand elle a été pré-signée (#5759).
 
 Un commit n'est enregistrable que s'il a été **créé dans ce tour** : le hook
 `pre-commit` écrit avant le commit une attestation (identité du tour, HEAD et
@@ -580,6 +581,7 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     if approval_id is None and not key_path:
         raise ProvenanceError(
             "a signed receipt requires --key (sign now) or --approval ID")
+    pre_signed = approval_id is not None
     if key_path:
         if not approver:
             raise ProvenanceError("--key requires --as <owner>")
@@ -625,6 +627,16 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
                                       "provenance:%s" % full):
         raise ProvenanceError(
             "approval #%s was already consumed" % approval_id)
+    # #5759 : une approbation pré-signée ne porte que le texte signé. Le
+    # harnais courant divergent est un diagnostic hors signature : il est
+    # écrit après une consommation réussie par CET appel, pour que
+    # `provenance show` lise le contexte de la consommation sans le
+    # recalculer à la lecture. Une seconde tentative échoue avant cette
+    # écriture : elle ne peut pas réécrire le diagnostic d'une approbation
+    # déjà consommée. Le texte version 1 et l'empreinte signée ne changent pas.
+    if pre_signed and ident.get("registry_harness"):
+        storage.of(db).approvals.merge_meta(
+            int(approval_id), {"registry_harness": ident["registry_harness"]})
     receipt = storage.of(db).provenance.add(
         subject, full, ident["actor"], ident["session"],
         SIGNED_TURN_PREFIX + str(approval_id), ident["harness"],

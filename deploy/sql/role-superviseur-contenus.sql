@@ -88,6 +88,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('commitments', ARRAY[
         'note'
     ]),
+    -- #5751 : diagnostic du refus (peut contenir des chemins de travail).
+    ('ci_disk_refusals', ARRAY['payload']),
     -- L161c (0055) : extrait de la sortie d'un test en échec
     ('ci_test_failures', ARRAY[
         'excerpt'
