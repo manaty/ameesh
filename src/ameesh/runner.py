@@ -478,6 +478,32 @@ class _LancementImpossible(Exception):
 TURN_LABELS_EN = {"consigne": "instruction", "messages": "mail", "événements": "events",
                   "prioritaire": "priority", "reprise": "resume", "suite": "continuation"}
 
+#: #5699 : texte de disponibilité posté, sans tour, quand la relance au repos
+#: n'a rien de dû (aucune correction, aucun avis, aucun lot actionnable). Lu
+#: dans `ameesh list`/`show` ; le tour qui n'existe plus n'écrit pas « rien de
+#: dû » au pilote.
+IDLE_AVAILABLE_STATUS = "available: nothing due"
+
+
+def _idle_owed_lines(db, name: str) -> tuple[list[str], list[str]]:
+    """#3033/#3288 : `(corrections dues, avis dus)`, lignes brutes.
+
+    Les marqueurs « aucun » (`NO_FIX_OWED`, `NO_PENDING_REVIEW`) et
+    « illisible » sont rendus tels quels : la décision de #5699 lit la liste,
+    la relance n'affiche que le travail réel. Une lecture en échec ne lève
+    jamais : le marqueur « illisible » compte comme dû (on ne conclut pas
+    « rien de dû » sur une lecture ratée)."""
+    from . import reprise
+    try:
+        fixes = reprise.fixes_owed_lines(db, name)
+    except Exception as exc:  # noqa: BLE001 - la relance part quand même
+        fixes = ["(fixes owed unreadable: %s)" % exc]
+    try:
+        reviews = reprise.pending_review_lines(db, name)
+    except Exception as exc:  # noqa: BLE001 - la relance part quand même
+        reviews = ["(pending reviews unreadable: %s)" % exc]
+    return fixes, reviews
+
 
 def turn_status_text(shown: str, duration: float, *, ok: bool = True,
                      cloture: str = "") -> str:
@@ -6375,8 +6401,81 @@ class AgentWorker(threading.Thread):
             if reveil is not None:
                 return reveil
         if self.idle_due():
-            return {"kind": "idle", "prompt": self._idle_prompt(), "ids": []}
+            if self._idle_owes_work():
+                return {"kind": "idle", "prompt": self._idle_prompt(), "ids": []}
+            # #5699 : rien de dû — pas de tour de modèle pour l'écrire. Le
+            # statut de disponibilité est posté mécaniquement, puis l'agent
+            # attend un courrier, une consigne ou un réveil (même drapeau
+            # `nudged` qu'après un tour de relance).
+            self.nudged = True
+            self._post_idle_available()
+            return None
         return None
+
+    @staticmethod
+    def _owed_due(lines: list[str], none_marker: str) -> bool:
+        """Une liste brute porte-t-elle du travail dû ?
+
+        Le marqueur « aucun » seul ne porte rien. Une lecture illisible, elle,
+        compte comme due : on ne conclut pas « rien de dû » sur une lecture
+        ratée (#5699), le tour part et l'agent peut diagnostiquer."""
+        return bool(lines) and lines != [none_marker]
+
+    def _idle_owes_work(self) -> bool:
+        """#5699 : la relance au repos a-t-elle de quoi justifier un tour ?
+
+        Trois lectures mécaniques, sans appel de modèle : corrections dues
+        (#3288), avis dus (#3033), lot actionnable (règle 1, #408). Tout vide :
+        pas de tour, la disponibilité est postée (`_post_idle_available`).
+        """
+        from . import reprise
+        fixes, reviews = _idle_owed_lines(self.db, self.name)
+        if self._owed_due(fixes, reprise.NO_FIX_OWED):
+            return True
+        if self._owed_due(reviews, reprise.NO_PENDING_REVIEW):
+            return True
+        return self._idle_actionable()
+
+    def _idle_actionable(self) -> bool:
+        """#408/#5699 : un lot actionnable justifie-t-il un tour au repos ?
+
+        Lecture seule : le réveil ciblé (`_lot_wake_spec`) a déjà eu sa chance
+        et garde ses compteurs. Mêmes gardes de dossier et de place réservée
+        que lui ; une lecture illisible ne conclut pas « rien de dû ».
+        """
+        import datetime as _dt
+        try:
+            rows = storage.of(self.db).lot_sessions.actionable(
+                self.name, today=_dt.date.today().isoformat())
+            for row in rows:
+                if self._lot_workdir_blocked(row["id"]):
+                    continue
+                if not self._reservation_fits(row["id"], row):
+                    continue
+                return True
+        except Exception as exc:  # noqa: BLE001 - une lecture ratée ne conclut rien
+            log_async("[%s] actionable lots unreadable (%s)" % (self.name, exc))
+            return True
+        return False
+
+    def _post_idle_available(self) -> None:
+        """#5699 : poste « disponible » sans ouvrir de tour.
+
+        Le statut reste celui de l'exécuteur (`idle`) ; seul le texte change,
+        comme `agent-mail status`. Best-effort : un registre qui refuse
+        l'écriture ne rouvre pas le tour qu'on vient d'économiser."""
+        try:
+            posted = registry.set_status_text(
+                self.db, self.name, IDLE_AVAILABLE_STATUS)
+        except Exception as exc:  # noqa: BLE001 - statut best-effort
+            log("[%s] availability status not posted (%s)" % (self.name, exc))
+            return
+        if not posted:
+            log("[%s] availability status not posted (agent not takeable)"
+                % self.name)
+            return
+        log_async("[%s] nothing due: no idle turn, availability posted"
+                  % self.name)
 
     def _idle_prompt(self) -> str:
         """#3033/#3288/#3273 : la relance d'inactivité porte les corrections et
@@ -6389,24 +6488,18 @@ class AgentWorker(threading.Thread):
         #3307 : corrections et avis dus précèdent la consigne de reprise, qui
         finit par « nothing to do … stop » : l'en-tête des avis les place
         « before declaring yourself available ».
-        Une file illisible ne change pas la relance : le brief de reprise la
-        dit, et un tour au repos ne part pas sur une lecture ratée."""
+        #5699 : une file illisible ne conclut jamais « rien de dû » — le tour
+        part quand même, sans en-tête (le brief de reprise la dit) ; c'est
+        `_idle_owes_work` qui a tranché en amont."""
         from . import reprise
+        fixes, reviews = _idle_owed_lines(self.db, self.name)
         parts: list[str] = []
-        try:
-            fixes = reprise.fixes_owed_lines(self.db, self.name)
-        except Exception:  # noqa: BLE001 - la relance part quand même
-            fixes = []
         if (fixes and fixes != [reprise.NO_FIX_OWED]
                 and not fixes[0].startswith("(fixes owed unreadable")):
             parts += [adapters.IDLE_FIXES_HEADER] + fixes + [""]
-        try:
-            lines = reprise.pending_review_lines(self.db, self.name)
-        except Exception:  # noqa: BLE001 - la relance part quand même
-            lines = []
-        if (lines and lines != [reprise.NO_PENDING_REVIEW]
-                and not lines[0].startswith("(pending reviews unreadable")):
-            parts += [adapters.IDLE_REVIEWS_HEADER] + lines + [""]
+        if (reviews and reviews != [reprise.NO_PENDING_REVIEW]
+                and not reviews[0].startswith("(pending reviews unreadable")):
+            parts += [adapters.IDLE_REVIEWS_HEADER] + reviews + [""]
         parts.append(adapters.idle_prompt(self._idle_pilot()))
         return "\n".join(parts)
 

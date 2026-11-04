@@ -269,7 +269,12 @@ class CourrierPassifTest(_Base):
         runner, worker = self._worker("orch-i", batch=0.0)
         self._passifs("orch-i")
         runner.idle_nudge = 0.0
-        self.assertEqual(worker.pick()["kind"], "idle")
+        # #5699 : la relance au repos n'ouvre plus un tour pour « rien de dû » ;
+        # elle reste possible quand du travail est dû, malgré la boîte pleine
+        # de courrier passif.
+        with mock.patch("ameesh.reprise.fixes_owed_lines",
+                        return_value=["- #12 [qa] une correction"]):
+            self.assertEqual(worker.pick()["kind"], "idle")
 
     def test_listing_et_alertes_ignorent_le_passif(self):
         registry.upsert(self.db, "orch-a", harness="claude")
