@@ -50,6 +50,9 @@ _LIVENESS = ("beat", "progress", "silence_s", "stall_s")
 _HEALTHY = ("sante", "ok")
 #: #5558: host declared absent and deferred by its run (canon §14)
 _DEFERRED = ("absent", "reporte")
+#: #5691: steps that only exist once the host's install attempt began
+_INSTALL_STEPS = frozenset(("installer", "role", "redemarrer", "timers",
+                            "controler", "sante", "retour", "controle-retour"))
 #: exit code of a refused exclusive start, as the local flock of staging.sh
 BUSY = 75
 #: #5450: global fallback of a launcher without heartbeat. It stays below the
@@ -91,6 +94,10 @@ def _public_step(step: dict) -> dict:
     for key in ("since", "deadline"):
         if step.get(key) is not None:
             public[key] = _finite(step[key], key)
+    # #5691: proof that the target was installed on this host. Only a real
+    # boolean is public; a malformed value is dropped rather than guessed.
+    if isinstance(step.get("installed"), bool):
+        public["installed"] = step["installed"]
     return public
 
 
@@ -385,6 +392,55 @@ def _step(data: dict, host: str) -> tuple[str, str]:
     return (str(step.get("stage") or ""), str(step.get("verdict") or ""))
 
 
+def _installation_text(hosts: dict) -> str:
+    """#5691: how many hosts proved a target install, against the rest.
+
+    Only hosts carrying the boolean `installed` count; an absent/deferred host
+    (§14) is not a host awaiting installation. The workstation's `poste`
+    pseudo-host is never a host of its own. A rolled-back host is reported
+    apart: its `retour ok` clears `installed`, but the installation did begin.
+    An older snapshot without the field answers nothing, so its alert text is
+    unchanged.
+    """
+    entries = dict(hosts or {})
+    # `poste` is the pseudo-host of the workstation's backup/migration steps:
+    # it is the same machine as `pc-smichea`, never a host to count (auditor).
+    entries.pop("poste", None)
+
+    def stage_of(step: dict) -> str:
+        return str(step.get("stage") or "")
+
+    steps = [step for step in entries.values()
+             if isinstance(step, dict)
+             and (stage_of(step), str(step.get("verdict") or "")) != _DEFERRED
+             # `sequence` is the run's own closing step, not a host.
+             and stage_of(step) != "sequence"
+             and isinstance(step.get("installed"), bool)]
+    if not steps:
+        return ""
+    done = sum(1 for step in steps if step["installed"])
+    total = len(steps)
+    rolled = sum(1 for step in steps
+                 if stage_of(step) == "controle-retour"
+                 or (stage_of(step) == "retour"
+                     and str(step.get("verdict") or "") == "ok"))
+    if done == total:
+        return "Installation : %d installé(s) sur %d hôte(s)." % (done, total)
+    if not done:
+        if rolled:
+            return ("Installation : 0 installé(s) sur %d hôte(s) — "
+                    "installation commencée, retour arrière effectué." % total)
+        # These steps only exist after the install attempt began; the installer
+        # step itself proves it began, not that it succeeded.
+        begun = any(stage_of(step) in _INSTALL_STEPS for step in steps)
+        return ("Installation : 0 installé(s) sur %d hôte(s) — %s."
+                % (total, "installation commencée, aucune preuve" if begun
+                   else "préflight seul"))
+    suffix = (", dont %d retour(s) arrière" % rolled) if rolled else ""
+    return ("Installation : %d installé(s) sur %d hôte(s) — %d pas installé(s)%s."
+            % (done, total, total - done, suffix))
+
+
 def _unrepaired(run: str, latest: dict, ids: dict, descends) -> tuple[dict, bool]:
     """#5558: hosts `run` left unhealthy that later runs did not repair.
 
@@ -520,16 +576,18 @@ def findings(rows: list[dict], *, now: float, attested=(),
         for member in group[1:]:
             for host, step in sorted(remaining(member)[0].items()):
                 hosts.setdefault(host, step)
+        installation = _installation_text(hosts)
         if len(group) == 1:
             steps = "; ".join(_step_text(host, step)
                               for host, step in sorted(hosts.items()))
-            detail = ("Staging %s (%s): %s; %s. Vérifier le lanceur et "
+            detail = ("Staging %s (%s): %s; %s. %sVérifier le lanceur et "
                       "reprendre la séquence sous verrou, après arrêt "
                       "prouvé de l'ancien exécutant."
                       % (run, data["sha"][:12],
                          late[0] if late
                          else data.get("reason") or state,
-                         steps or "aucune étape d'hôte terminée"))
+                         steps or "aucune étape d'hôte terminée",
+                         installation + " " if installation else ""))
         else:
             # Compact: the mail body is bounded, so the runs and the hosts
             # still to repair come before any per-run narration.
@@ -538,13 +596,14 @@ def findings(rows: list[dict], *, now: float, attested=(),
             steps = "; ".join(_step_text(host, step)
                               for host, step in sorted(hosts.items()))
             detail = ("Staging %s (%s): %s; échecs regroupés : %s; hôtes non "
-                      "réparés : %s. Vérifier le lanceur et reprendre la "
+                      "réparés : %s. %sVérifier le lanceur et reprendre la "
                       "séquence sous verrou, après arrêt prouvé de l'ancien "
                       "exécutant."
                       % (run, data["sha"][:12],
                          late[0] if late
                          else data.get("reason") or state,
-                         names, steps or "aucune étape d'hôte terminée"))
+                         names, steps or "aucune étape d'hôte terminée",
+                         installation + " " if installation else ""))
         out.append({"schema": "ameesh-alert/1", "type": "staging_interrupted", "agent": None,
                     "since": first_data["started"],
                     "value": late[1] if late else now - first_data["started"],

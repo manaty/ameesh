@@ -787,6 +787,13 @@ son début l'étape, son heure et le verdict par hôte ; les sorties, commandes 
 secrets restent hors de ce suivi. Le lanceur publie aussi un battement
 (`STAGING_BATTEMENT_S`, 120 s) et son dernier progrès, étape ou runner.
 
+Chaque hôte porte `installed` : faux tant que sa trace `installer ok` n'a pas
+prouvé l'installation de la cible, vrai ensuite, puis de nouveau faux après un
+`retour ok` qui réinstalle la version précédente. Un `verifier/ok` de preflight
+n'est donc pas une installation ; le détail d'alerte compte
+« N installé(s) sur M hôte(s) », nomme les retours arrière et dit
+« préflight seul » quand aucune installation n'a commencé (#5691).
+
 Le battement lit l'état du lanceur dans `/proc` : un lanceur zombie ou
 disparu l'arrête, au lieu de continuer à publier. `STAGING_BATTEMENT_S` doit
 être un nombre fini et positif ; une valeur nulle, non numérique ou infinie
