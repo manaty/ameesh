@@ -3375,7 +3375,10 @@ class Canon(Domain):
         and after a claim that failed on an `ok` state (#5649); None if no
         sync ever completed, or the last completed one was withdrawn. #5653:
         `completed_age_s` carries its age in seconds on the database clock
-        (None when the completion time is unknown: not reusable)."""
+        (None when no usable completion time is known: not reusable). #5688:
+        the claim that produced the result dates it when a runner still on the
+        pre-0541 code completed it without `sync_completed_at`; a newer
+        pending claim never dates it."""
 
     @abc.abstractmethod
     def lock_default_state(self, host: str) -> dict | None:

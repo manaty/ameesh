@@ -210,12 +210,18 @@ class Canon(interface.Canon):
         # #5493: a pending claim no longer hides the last completed result;
         # the caller still compares its signature with its own snapshot.
         # #5653: `completed_age_s` is the age of that result, in seconds on
-        # the database clock (NULL: completion time unknown, never reusable
+        # the database clock (NULL: no usable completion time, never reusable
         # until the next complete sync).
+        # #5688: a runner still on the pre-0541 code completes a sync without
+        # publishing `sync_completed_at`; the claim that produced the result
+        # is then its age, the same conservative proxy as the 0541 backfill —
+        # and only while that claim is still the completed one, so a newer
+        # pending claim never makes an old result look fresh.
         rows = self.db.query(
             "SELECT status, diagnostic, sync_signature, "
-            "extract(epoch FROM clock_timestamp() - sync_completed_at)::float8 "
-            "AS completed_age_s FROM canon_state "
+            "extract(epoch FROM clock_timestamp() - greatest("
+            "sync_completed_at, CASE WHEN sync_token = sync_completed_token "
+            "THEN sync_claimed_at END))::float8 AS completed_age_s FROM canon_state "
             "WHERE host = %s AND canon = %s AND sync_completed_token IS NOT NULL",
             (host, canon))
         return rows[0] if rows else None

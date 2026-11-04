@@ -98,12 +98,16 @@ class ReuseAgeBoundTest(_Setup):
             self.assertLess(shared["completed_age_s"], 30.0)
 
     def test_unknown_completion_time_is_never_reused(self):
-        # A row completed before migration 0541 has no completion timestamp.
+        # No usable date at all: neither a published completion nor the claim
+        # that produced it (#5688 keeps that claim proxy; without either, the
+        # result stays unusable until the next complete sync).
         with mock.patch.object(canon_sync, "sync") as sync:
             self.complete_ok()
-            self.db.execute("UPDATE canon_state SET sync_completed_at = NULL "
-                            "WHERE host = %s AND canon = ''", (HOST,))
-            self.expire_claim()
+            self.db.execute(
+                "UPDATE canon_state SET sync_completed_at = NULL, "
+                "sync_claimed_at = NULL WHERE host = %s AND canon = ''",
+                (HOST,))
+            self.assertIsNone(self.store.shared_sync(HOST, "")["completed_age_s"])
             report = self.run_sync(unsettled=True)
             self.assertIs(report, sync.return_value)
             self.assertEqual(sync.call_count, 2)
