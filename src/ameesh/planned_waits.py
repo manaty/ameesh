@@ -196,6 +196,35 @@ def is_hold_lookalike(text) -> bool:
         and not is_lift_note(value)
 
 
+#: #5735 : une marque de retenue ou de levée **enfouie** — en tête d'une ligne
+#: suivante, ou après une fin de phrase (`.`, `;`, `!`, `?`) — n'est lue par
+#: personne : le journal ne lit que la tête de la note. Le 03/11 22:49, la note
+#: « Correction: … (not #3269). hold: attente externe : … » de #5684 n'a rien
+#: retenu, et le lot a crié en retard au matin. Une citation reste possible
+#: entre guillemets ou accents graves (« hold: », `hold:`), ou au fil d'une
+#: phrase (« le préfixe hold: »), qui ne sont pas des débuts de phrase.
+_BURIED_START = re.compile(r"(?:\n|[.;!?])[" + HOLD_NOTE_WHITESPACE + r"]*")
+
+
+def buried_hold_marker(text) -> str | None:
+    """#5735 : la marque `hold:`/`unhold:` enfouie dans la note, ou None.
+
+    Rend le fragment qui commence par la marque (pour le message de refus).
+    Une note qui commence déjà par une marque n'est pas visée : sa tête est
+    lue, la suite est son motif. Les graphies voisines (#3373) ne sont pas
+    cherchées au milieu d'un texte : « Hold on » y reste de la prose."""
+    note = str(text or "").strip()
+    if not note or is_hold_note(note) or is_lift_note(note):
+        return None
+    for match in _BURIED_START.finditer(note):
+        if match.end() == 0:
+            continue
+        tail = note[match.end():]
+        if is_hold_note(tail) or is_lift_note(tail):
+            return tail.split("\n", 1)[0][:80]
+    return None
+
+
 #: #3498 : un hold peut nommer son exécutant externe (bureau ou owner) et le
 #: geste attendu — `hold: attente bureau : <geste>`, `hold: attente owner :
 #: <geste>`, `hold: attente externe (bureau) : <geste>`. #3773 : il peut aussi
@@ -293,6 +322,41 @@ def observation_hold(text) -> dict | None:
     if not motif:
         return None
     return {"motif": motif, "due": found.group("date").strip()}
+
+
+def observation_due(text) -> tuple[dict | None, float | None]:
+    """#4235/#5735 : la fenêtre déclarée par la note et son échéance lue.
+
+    Rend `(fenêtre, échéance)` : `(None, None)` hors fenêtre, `(fenêtre,
+    None)` quand l'échéance écrite est illisible (le débit le signale, le sens
+    sûr est alors une attente ordinaire). La lecture de l'échéance est celle
+    du réveil (`debit.parse_wake_due`), partagée par le débit et le SLO."""
+    window = observation_hold(text)
+    if window is None:
+        return None, None
+    from .debit import parse_wake_due       # import tardif : pas de cycle
+    return window, parse_wake_due("(due %s)" % window["due"])
+
+
+def expired_window(holds: dict | None, now: float) -> float | None:
+    """#5735 : l'échéance passée de la fenêtre qui retient seule le lot.
+
+    `holds` est l'entrée d'un lot dans `active_holds` (`{auteur: hold}`). Rend
+    la dernière échéance quand **toutes** les retenues de pilote actives sont
+    des fenêtres (#4235) échues ; sinon None : une fenêtre non échue, un hold
+    de pilote ordinaire ou une échéance illisible tiennent encore le lot. À
+    l'échéance, le débit rend le hold à l'attente ordinaire ; le SLO reprend
+    alors son horloge à cette échéance, pas à la pose de la fenêtre."""
+    pilots = [hold for hold in (holds or {}).values() if hold.get("pilot")]
+    if not pilots:
+        return None
+    dues = []
+    for hold in pilots:
+        window, due_ts = observation_due(hold.get("note"))
+        if window is None or due_ts is None or float(due_ts) > float(now):
+            return None
+        dues.append(float(due_ts))
+    return max(dues)
 
 
 def explicit_holds(events, *, allowed=None) -> dict[int, dict]:

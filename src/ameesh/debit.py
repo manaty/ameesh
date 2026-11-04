@@ -1313,7 +1313,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
             # #4235 : une fenêtre d'observation est un geste de pilote, comme
             # la déclaration externe ; une échéance illisible ne devine rien et
             # laisse le hold en attente d'agent (le sens sûr).
-            window = planned_waits.observation_hold(note)
+            window, due_ts = planned_waits.observation_due(note)
             if window is not None:
                 if holds_authoritative and hold.get("pilot") is False:
                     # Le lot peut être couvert par la fenêtre d'un autre hold :
@@ -1321,7 +1321,6 @@ def build(*, items: Iterable[Mapping[str, Any]],
                     rejected_window.append(hold.get("by") or "?")
                     window = None
                 else:
-                    due_ts = parse_wake_due("(due %s)" % window["due"])
                     if due_ts is None:
                         unreadable.append(
                             "lot %d: observation window due date unreadable: %s"

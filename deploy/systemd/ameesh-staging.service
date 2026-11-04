@@ -20,7 +20,9 @@ Type=oneshot
 Slice=app.slice
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=%h/.config/ameesh/env
-ExecStart=%h/.local/share/ameesh/venv/bin/python3 -m ameesh.staging_executor --config %h/.config/ameesh/staging-executor.json tick
+# #5737: `python` is the only interpreter launcher bascule.py guarantees on a
+# fresh stable venv; python3 exists only if it was already there (203/EXEC).
+ExecStart=%h/.local/share/ameesh/venv/bin/python -m ameesh.staging_executor --config %h/.config/ameesh/staging-executor.json tick
 # #5450: the global staging fallback is 11 h and its monitored stop starts
 # 15 min later; the unit must still leave room for the rollback and settling.
 # 11h30min stays below the 12 h between two cutoffs.
