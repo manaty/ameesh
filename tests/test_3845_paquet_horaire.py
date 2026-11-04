@@ -197,14 +197,31 @@ class ComposeTest(Base):
         self.assertIn("aucun lot prêt", ph.tick(self.ctx))
         self.assertEqual(self.shell.ran("work", "add"), [])
 
-    def test_heure_deja_servie(self):
-        # #4171 : un porteur clos sans fusion garde le créneau (pas de
-        # recomposition à chaque tic).
+    def test_abandon_sans_ci_libere_le_creneau_avec_un_nom_unique(self):
         for reason in ("abandoned", "superseded"):
-            self.shell.lists[""] = [dict(carrier(), state="closed", close_reason=reason,
-                                         created_ts=NOW - 60)]
+            with self.subTest(reason=reason):
+                self.shell.lists[""] = [dict(carrier(lot=3990), state="closed",
+                                             close_reason=reason, created_ts=NOW - 60)]
+                self.shell.items[4000] = carrier()
+                self.shell.ci[3990] = {"runs": [{"status": "cancelled"}]}
+                self.assertIn("ci-full demandée", ph.tick(self.ctx))
+                self.assertIn("integration/paquet-h-20261027-05", self.shell.added[-1])
+
+    def test_abandon_avec_ci_active_garde_le_creneau(self):
+        self.shell.lists[""] = [dict(carrier(lot=3990), state="closed",
+                                     close_reason="abandoned", created_ts=NOW - 60)]
+        for status in ("running", "queued", "pending", "in_progress", None):
+            self.shell.ci[3990] = {"runs": [{"status": status, "head_sha": HEAD2}]}
             self.assertIn("déjà créé", ph.tick(self.ctx))
-        self.assertEqual(self.shell.ran("work", "add"), [])
+        self.assertEqual(self.shell.added, [])
+
+    def test_abandon_ci_illisible_ne_compose_pas(self):
+        self.shell.lists[""] = [dict(carrier(lot=3990), state="closed",
+                                     close_reason="abandoned", created_ts=NOW - 60)]
+        with mock.patch.object(ph, "ci_status", side_effect=ph.HoraireError("CI illisible")):
+            with self.assertRaisesRegex(ph.HoraireError, "CI illisible"):
+                ph.tick(self.ctx)
+        self.assertEqual(self.shell.added, [])
 
     def test_nouveau_nom_de_paquet_deja_verrouille(self):
         # #4329 : un paquet-auto lancé à la main tient le verrou du nom que le
