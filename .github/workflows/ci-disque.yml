@@ -21,6 +21,6 @@ jobs:
       matrix:
         host: [ameesh-ci-1, ameesh-ci-2, ameesh-ci-3]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      # Script installé : aucun checkout à écrire sur un disque saturé.
       - name: mesure structurée (#5630)
         run: /usr/local/lib/ameesh-ci/ci-disque.py publication --host '${{ matrix.host }}'
