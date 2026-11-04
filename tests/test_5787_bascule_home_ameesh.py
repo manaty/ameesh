@@ -5,7 +5,8 @@ réécrit par python3), puis posait un paquet git (chown) et le vidage du mesh
 sous des noms devinables de /tmp : un lien posé par ameesh (~/.ssh vers /etc/systemd/system) menait root
 à écrire hors du home. Témoin statique : toute écriture du home ou d'un
 fichier temporaire passe par runuser -u ameesh ; vm.sh et poste.sh, dans
-l'empreinte, n'écrivent pas le home d'ameesh en root.
+l'empreinte, n'écrivent pas le home d'ameesh en root (poste.sh : listes de
+sauvegarde_serveur dans un dossier privé de root).
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASCULE = ROOT / "deploy" / "serveur" / "basculer-mesh.sh"
 VM = ROOT / "deploy" / "mise-a-jour" / "vm.sh"
+POSTE = ROOT / "deploy" / "mise-a-jour" / "poste.sh"
 
 
 def code(path: pathlib.Path) -> list[str]:
@@ -47,6 +49,19 @@ class BasculeHomeAmeeshTest(unittest.TestCase):
     def test_vm_root_commands_leave_the_home_alone(self):
         for line in code(VM):
             if re.search(r"\bssh_vm\b", line):
+                self.assertNotIn("/home/ameesh", line, line)
+
+    def test_backup_lists_never_live_in_the_user_dir(self):
+        # revue DeepSeek (mty-amh-impl-03, beb212b37603) : les listes avant/après
+        # de sauvegarde_serveur étaient des mktemp dans $d (dossier d'ameesh),
+        # réécrites par redirection root pendant pg_dump.
+        text = "\n".join(code(POSTE))
+        self.assertNotRegex(text, r'mktemp "\$d/')
+        self.assertIn("t=$(mktemp -d)", text)
+
+    def test_poste_root_commands_leave_the_home_alone(self):
+        for line in code(POSTE):
+            if re.search(r"\bssh_vm(_borne)?\b", line):
                 self.assertNotIn("/home/ameesh", line, line)
 
 
