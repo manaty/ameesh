@@ -933,17 +933,21 @@ class StreamPgTest(ServerMixin, PgTestCase):
         with mock.patch.object(db_mod, "listener", side_effect=RuntimeError("refused")):
             hub.start()
             self.addCleanup(hub.stop)
-            deadline = time.monotonic() + 5
-            while hub.generation < 2 and time.monotonic() < deadline:
-                time.sleep(0.05)          # the refusal's wake, then a poll
+            # #5785: the refusal's wake is generation 1 (the first poll may
+            # follow at once, generation 2); wait on the hub's own condition,
+            # with a bound that is a deadlock guard, not a measurement of the
+            # runner's load.
+            self.assertGreaterEqual(hub.wait(0, 30), 1)
             self.assertTrue(hub._thread.is_alive())
             self.assertFalse(hub.listening)
             before = hub.generation
             events.record(self.db, "alert.raised", "alert:after-hub")
-            deadline = time.monotonic() + 5
-            while hub.generation == before and time.monotonic() < deadline:
-                time.sleep(0.05)
-        self.assertGreater(hub.generation, before)
+            # #3868/#5785: a foreign transaction of the shared bench (xmin)
+            # holds the new row back, `bounds()["head"]` does not move and the
+            # hub legitimately stays asleep; wait, bounded, for the log to be
+            # deliverable instead of letting the runner's load decide.
+            self.wait_deliverable()
+            self.assertGreater(hub.wait(before, 30), before)
 
     def test_reset_when_events_were_lost(self):
         self.serve()
