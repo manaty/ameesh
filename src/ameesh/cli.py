@@ -2109,7 +2109,11 @@ def cmd_probe(cfg: Config) -> int:
     """Sonde légère (`doctor --probe`) : base joignable, schéma présent,
     migrations à jour. Ni comptage, ni NOTIFY, ni écriture : faite pour une
     sonde de conteneur appelée toutes les quelques secondes. Une ligne, code 0
-    (OK) ou 1 (KO)."""
+    (OK) ou 1 (KO).
+
+    #5692 : chaque base configurée est sondée (la secondaire de l'hôte
+    comprise) ; une seule en défaut rend la sonde KO, avec sa ligne. Le probe
+    n'est donc plus aveugle à `config-ancienne-base.json`."""
     try:
         db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
@@ -2146,6 +2150,42 @@ def cmd_probe(cfg: Config) -> int:
              % (len(pending_na), migrations.describe_pending_non_additive(pending_na)))
             if pending_na else ""))
         return 1
+    # #5692 : la base secondaire de l'hôte, en lecture seule, avec le même
+    # verdict. Une base secondaire injoignable est un KO : le staging devra la
+    # traiter (le poste est reportable d'emblée), et le doctor complet la dit.
+    for label, path in config_mod.secondary_configs(cfg):
+        other_db = None
+        try:
+            other = config_mod.load_file(path)
+            other_db = db_mod.connect(other, writer=False)
+            db_mod.require_schema(other_db)
+            other_missing, other_modified, _other_unknown = migrations.check(other_db)
+            migrations.require_compatible_writer(other_db)
+        except (Exception, SystemExit) as exc:  # une base dite, pas une trace
+            print("probe: KO — %s: %s"
+                  % (label, " ".join(str(exc).split())[:160]))
+            return 1
+        finally:
+            if other_db is not None:
+                other_db.close()
+        other_pending = []
+        for migration in other_missing:
+            reasons = migrations.non_additive(migration)
+            if reasons:
+                other_pending.append((migration, reasons))
+        if other_missing or other_modified:
+            print("probe: KO — %s: migrations %s%s%s" % (
+                label,
+                "missing %s" % ",".join(m.label for m in other_missing)
+                if other_missing else "",
+                ("%smodified %s" % ("; " if other_missing else "",
+                                    ",".join(m.label for m in other_modified))
+                 if other_modified else ""),
+                ("; %d non-additive — `migrate --additive-only` refuses them (%s)"
+                 % (len(other_pending),
+                    migrations.describe_pending_non_additive(other_pending)))
+                if other_pending else ""))
+            return 1
     extra = ("; database newer than this code (versions %s)"
              % ",".join("%04d" % v for v in unknown)) if unknown else ""
     print("probe: OK (driver %s, schema %s)%s" % (db.name, cfg.schema, extra))

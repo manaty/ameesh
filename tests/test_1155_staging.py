@@ -670,10 +670,11 @@ class StagingTest(unittest.TestCase):
             ('ameesh-agents-2', 'verifier'),
             ('ameesh-agents-3', 'verifier'),
             ('manaty-mesh-1', 'verifier'),
-            ('pc-smichea', 'verifier'),
             # #5692 : dry-run des migrations sur chaque base du poste, avant
-            # la sauvegarde (lecture seule).
+            # `verifier` (une config secondaire illisible reporte le poste) et
+            # avant la sauvegarde (lecture seule).
             ('pc-smichea', 'prevol'),
+            ('pc-smichea', 'verifier'),
             ('pc-smichea', 'sauvegarder'),
             ('pc-smichea', 'migrer'),
             ('ameesh-agents-1', 'installer'),
@@ -884,8 +885,10 @@ class StagingTest(unittest.TestCase):
         p = self.run_staging()
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         actions = self.actions()
-        self.assertIn(('pc-smichea', 'verifier'), actions)
+        # `prevol` precede `verifier` : le poste est reporte sans que son
+        # `verifier` (qui lit la meme configuration secondaire) ne tranche.
         self.assertIn(('pc-smichea', 'prevol'), actions)
+        self.assertNotIn(('pc-smichea', 'verifier'), actions)
         self.assertNotIn(('pc-smichea', 'sauvegarder'), actions)
         self.assertNotIn(('pc-smichea', 'migrer'), actions)
         self.assertNotIn(('pc-smichea', 'installer'), actions)
@@ -922,6 +925,7 @@ class StagingTest(unittest.TestCase):
         self.assertIn('refusees avant sauvegarde', p.stderr)
         actions = self.actions()
         self.assertIn(('pc-smichea', 'prevol'), actions)
+        self.assertNotIn(('pc-smichea', 'verifier'), actions)
         self.assertNotIn(('pc-smichea', 'sauvegarder'), actions)
         self.assertNotIn(('pc-smichea', 'migrer'), actions)
         self.assertFalse([a for a in actions if a[1] == 'installer'], actions)
@@ -1629,6 +1633,21 @@ class PosteMigrerTest(unittest.TestCase):
         p = self.run_poste('prevol', self.premier)
         self.assertEqual(p.returncode, 1, p.stderr + p.stdout)
         self.assertIn('preflight des migrations en echec', p.stderr)
+
+    def test_migrer_dry_run_refusal_is_explained(self):
+        """#5692 (N auditeur) : le dry-run sort 3 sous set -e ; le refus doit
+        être expliqué comme celui de migrer_base, pas quitter sans un mot."""
+        stub = self.venv / 'python'
+        stub.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "venv %s\\n" "$*" >> "${FAKE_LOG:?}"\n'
+            'case " $* " in *"migrate --dry-run --additive-only"*) exit 3 ;; esac\n'
+            'exit 0\n')
+        stub.chmod(0o755)
+        p = self.run_poste('migrer', self.premier)
+        self.assertEqual(p.returncode, 3, p.stderr + p.stdout)
+        self.assertIn('migration non additive', p.stderr)
+        self.assertIn('garde additive', p.stderr)
 
 
 class PaquetGitTest(unittest.TestCase):

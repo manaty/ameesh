@@ -1335,25 +1335,14 @@ for nom in "${HOTES[@]}"; do
     echo "preflight en echec sur $nom : rien n'a ete modifie" >&2
     exit 1
   fi
-  if ! exec_hote "$nom" verifier; then
-    trace "$nom" verifier ko "echec du preflight"
-    echo "preflight en echec sur $nom : rien n'a ete modifie" >&2
-    exit 1
-  fi
-  # #5692 : le preflight joue le dry-run additif de la cible sur la base que
-  # le chemin sans poste va migrer — avant la sauvegarde, pas apres elle.
-  if [ "$POSTE_ABSENT" = 1 ] && [ "$nom" = "$HOTE_MIGRATIONS" ]; then
-    if ! verifier_migrations_vm "$nom" "$SHA"; then
-      trace "$nom" verifier ko "preflight des migrations de $SHA_TRAVE en echec (non additive ou illisible)"
-      echo "preflight en echec sur $nom : migrations de $SHA_TRAVE refusees avant sauvegarde ; rien n'a ete modifie" >&2
-      exit 1
-    fi
-  fi
   # #5692 : sur le poste, `poste.sh prevol` sonde CHAQUE base configuree
-  # (mesh et ancienne) depuis l'instantane de la cible. Une non additive sur
-  # une base secondaire ne retient pas les VM : le poste est reporte d'emblee,
-  # comme s'il etait absent, et la sequence continue sans lui. Une non
-  # additive sur la base du mesh arrete tout avant la sauvegarde.
+  # (mesh et ancienne) depuis l'instantane de la cible, AVANT `verifier` : une
+  # configuration secondaire illisible ou refusee doit reporter le poste, pas
+  # faire echouer tout le preflight (`verifier` lit la meme configuration).
+  # Une non additive sur une base secondaire ne retient pas les VM : le poste
+  # est reporte d'emblee, comme s'il etait absent, et la sequence continue
+  # sans lui. Une non additive sur la base du mesh arrete tout avant la
+  # sauvegarde.
   if [ "$nom" = pc-smichea ] && [ "$POSTE_ABSENT" = 0 ]; then
     rc_prevol=0
     sortie_prevol=$(exec_hote "$nom" prevol "$SHA" 2>&1) || rc_prevol=$?
@@ -1370,9 +1359,14 @@ for nom in "${HOTES[@]}"; do
       choisir_hote_migrations || exit $?
       trace pc-smichea absent reporte "$POSTE_RAISON"
       echo "  pc-smichea : absent (reporte) — $POSTE_RAISON"
-      # La base du mesh sera migrée depuis cette VM : le dry-run additif de la
-      # cible passe ici, avant la sauvegarde (même contrôle que le préflight
+      # L'hote de migrations change : son clone et le dry-run additif de la
+      # cible passent ici, avant la sauvegarde (meme controle que le preflight
       # ordinaire du chemin sans poste).
+      if ! verifier_clone_migrations "$HOTE_MIGRATIONS"; then
+        trace "$HOTE_MIGRATIONS" verifier ko "clone des migrations absent ou illisible ($DEPOT_VM)"
+        echo "preflight en echec sur $HOTE_MIGRATIONS : clone des migrations absent ou illisible ($DEPOT_VM) ; rien n'a ete modifie" >&2
+        exit 1
+      fi
       if ! verifier_migrations_vm "$HOTE_MIGRATIONS" "$SHA"; then
         trace "$HOTE_MIGRATIONS" verifier ko "preflight des migrations de $SHA_TRAVE en echec (non additive ou illisible)"
         echo "preflight en echec sur $HOTE_MIGRATIONS : migrations de $SHA_TRAVE refusees avant sauvegarde ; rien n'a ete modifie" >&2
@@ -1382,6 +1376,20 @@ for nom in "${HOTES[@]}"; do
     fi
     if [ "$rc_prevol" != 0 ]; then
       trace "$nom" verifier ko "preflight des migrations en echec (code $rc_prevol)"
+      echo "preflight en echec sur $nom : migrations de $SHA_TRAVE refusees avant sauvegarde ; rien n'a ete modifie" >&2
+      exit 1
+    fi
+  fi
+  if ! exec_hote "$nom" verifier; then
+    trace "$nom" verifier ko "echec du preflight"
+    echo "preflight en echec sur $nom : rien n'a ete modifie" >&2
+    exit 1
+  fi
+  # #5692 : le preflight joue le dry-run additif de la cible sur la base que
+  # le chemin sans poste va migrer — avant la sauvegarde, pas apres elle.
+  if [ "$POSTE_ABSENT" = 1 ] && [ "$nom" = "$HOTE_MIGRATIONS" ]; then
+    if ! verifier_migrations_vm "$nom" "$SHA"; then
+      trace "$nom" verifier ko "preflight des migrations de $SHA_TRAVE en echec (non additive ou illisible)"
       echo "preflight en echec sur $nom : migrations de $SHA_TRAVE refusees avant sauvegarde ; rien n'a ete modifie" >&2
       exit 1
     fi

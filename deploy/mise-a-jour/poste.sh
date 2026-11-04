@@ -444,7 +444,7 @@ redemarrer_urgence() {
 # si ce code est déjà installé. Le lien src-current n'accorde aucune autorité de
 # migration. --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
-  local ref cible d garde=(--additive-only) sha incompatible=0
+  local ref cible d garde=(--additive-only) sha incompatible=0 code_dry=0
   if [ "${1:-}" = "--additif-seulement" ]; then
     shift
   fi
@@ -455,7 +455,16 @@ migrer() {
   etape "base du mesh (une seule fois pour tout le mesh)"
   dsn_part d "$CONFIG" dsn || return
   echo "base : $d"
-  ameesh_de "$cible" migrate --dry-run --additive-only
+  # #5692 : depuis que le dry-run rend le verdict du garde (code 3), le
+  # message de refus doit sortir ici aussi — sinon `set -e` quitte le script
+  # sans expliquer pourquoi.
+  ameesh_de "$cible" migrate --dry-run --additive-only || code_dry=$?
+  if [ "$code_dry" = 3 ]; then
+    echo "migration non additive : le code en place casserait sur la base migrée." >&2
+    echo "Plan non additif séparé à faire approuver ; migrer conserve toujours la garde additive." >&2
+    return 3
+  fi
+  [ "$code_dry" = 0 ] || return "$code_dry"
   migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"

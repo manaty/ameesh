@@ -164,6 +164,26 @@ class SecondaryBaseTest(PgTestCase):
         self.assertIn("host_migration_pending_non_additive", notify.DEFAULT_TYPES)
         self.assertIn("host_migration_pending_non_additive", notify.TYPE_LABELS)
 
+    def test_probe_is_ko_on_a_secondary_base_without_the_switch(self):
+        """#5692 (B cx3) : le probe ne s'arrête pas à la base du mesh — une
+        migration non additive manquante sur la base secondaire est un KO."""
+        # Le probe exige le schéma complet : le construire ici (migré), puis
+        # retirer 0518 du registre — les autres tests de la classe n'ont pas
+        # besoin de ce coût.
+        self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % self.ancienne)
+        self.db.execute('CREATE SCHEMA "%s"' % self.ancienne)
+        other = self.connect(schema=self.ancienne)
+        try:
+            migrations.migrate(other)
+            other.execute("DELETE FROM schema_migrations WHERE version = 518")
+        finally:
+            other.close()
+        out = self.mesh("doctor", "--probe",
+                        env=self.env(AMEESH_CONFIG=self.primaire))
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("probe: KO — config-ancienne-base.json", out.stdout)
+        self.assertIn("0518_generic_delivery_state", out.stdout)
+
     def test_local_pass_raises_the_alert_for_a_secondary_base(self):
         """Le passage local du notifieur porte l'alerte de la base secondaire
         (elle n'est visible que de cet hôte, type LOCAL, gardé par `host`)."""
@@ -190,5 +210,41 @@ class SecondaryBaseTest(PgTestCase):
         self.assertIn("config-ancienne-base.json", errors[0])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class LocalResolutionTest(unittest.TestCase):
+    """#5692 (B auditeur) : une source locale en échec ne fige pas les alertes
+    d'une autre source — la résolution est par type observé, pas globale."""
+
+    def _alert(self, kind, **extra):
+        alert = {"schema": "ameesh-alert/1", "type": kind, "agent": None,
+                 "since": 100.0, "value": 1, "threshold": 0,
+                 "detail": "détail", "host": "pc-smichea"}
+        alert.update(extra)
+        return alert
+
+    def notifier(self):
+        cfg = dataclasses.replace(config.Config(), host="pc-smichea")
+        ncfg = notify.parse_config({"default": ["desktop"]})
+        return notify.Notifier(cfg, ncfg, state=notify.empty_state(),
+                               sender=mock.Mock(), log=lambda text: None,
+                               clock=lambda: 200.0)
+
+    def test_a_secondary_base_failure_does_not_freeze_the_pool_alert(self):
+        notifier = self.notifier()
+        migration = self._alert("host_migration_pending_non_additive",
+                                base="ancienne", config="config-ancienne-base.json")
+        pool = self._alert("pgbouncer_pool_waiting")
+        with mock.patch.object(pgbouncer_local, "probe", return_value=[pool]), \
+             mock.patch.object(migration_alerts, "local",
+                               return_value=([migration], [])):
+            notifier.run_local_pass(now=100.0)
+        types = {entry["alert"]["type"] for entry in notifier.state["active"].values()}
+        self.assertEqual(types, {"pgbouncer_pool_waiting",
+                                 "host_migration_pending_non_additive"})
+        # La console répond de nouveau (aucune alerte) mais la base secondaire
+        # reste illisible : seule l'alerte de la console se résout.
+        with mock.patch.object(pgbouncer_local, "probe", return_value=[]), \
+             mock.patch.object(migration_alerts, "local",
+                               return_value=([], ["config-ancienne-base.json: unreachable"])):
+            notifier.run_local_pass(now=200.0)
+        types = {entry["alert"]["type"] for entry in notifier.state["active"].values()}
+        self.assertEqual(types, {"host_migration_pending_non_additive"})

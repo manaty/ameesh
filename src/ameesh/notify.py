@@ -463,6 +463,10 @@ QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
 #: passe ordinaire d'un autre hôte qui ne voit pas ce fichier.
 LOCAL_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_console_unreadable",
                "host_migration_pending_non_additive")
+#: #5692 : les deux types d'une même source (la console du pool), pour ne
+#: retenir que la source qui n'a pas conclu — une base secondaire illisible ne
+#: doit pas figer une alerte de console qui, elle, a été observée et résolue.
+PGBOUNCER_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_console_unreadable")
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -2762,19 +2766,20 @@ class Notifier:
         records: list = []
         self._records = records
         from . import migration_alerts, pgbouncer_local
-        incomplete = False
+        unobserved: set[str] = set()
         try:
             current = pgbouncer_local.probe(self.cfg)
         except db_mod.Unavailable as exc:
             self.log("local pool console unreadable (%s): active local alerts kept"
                      % exc)
             current = []
-            incomplete = True
+            unobserved.update(PGBOUNCER_TYPES)
         migration_current, migration_errors = migration_alerts.local(self.cfg)
         for error in migration_errors:
             self.log("configured secondary base unreadable (%s): its local alerts kept"
                      % error)
-        incomplete = incomplete or bool(migration_errors)
+        if migration_errors:
+            unobserved.add("host_migration_pending_non_additive")
         current += migration_current
         router = Router(self.cfg, None, self.ncfg)
         wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
@@ -2795,20 +2800,31 @@ class Notifier:
                 self._raise(entry, router, now)
             else:
                 self._retry(entry, "raised", now)
-        if not incomplete:
+        if not unobserved:
             self._local_resolutions(wanted, now)
+        else:
+            # Résolution par source : un type d'une source non lue est gardé,
+            # les types des sources lues se résolvent normalement (#5692).
+            self._local_resolutions(wanted, now, unobserved=unobserved)
         self._prune_notified(now)
         return records
 
-    def _local_resolutions(self, wanted: dict, now: float) -> None:
-        """Résout les alertes locales que la console ne montre plus, et retente
-        les résolutions en vol. Les autres types ne sont jamais touchés : la
-        base peut simplement être non observée.
+    def _local_resolutions(self, wanted: dict, now: float, *,
+                           unobserved=()) -> None:
+        """Résout les alertes locales que les sources ne montrent plus, et
+        retente les résolutions en vol. Les autres types ne sont jamais
+        touchés : la base peut simplement être non observée.
+
+        `unobserved` (#5692) : les types dont la source n'a pas conclu ce tour
+        (console illisible, base secondaire illisible) sont gardés ; les
+        autres types locaux se résolvent normalement, sans quoi une source en
+        panne figerait pour toujours les alertes d'une autre.
 
         #3576 : l'état partagé porte les alertes de console de tous les hôtes ;
         un hôte ne résout que les siennes (`alert.host`), jamais celle d'un
         autre dont la console ne dit rien ici (relecture cx1)."""
         host = getattr(self.cfg, "host", None)
+        unobserved = set(unobserved)
         # Résolutions déjà en vol AVANT ce tour : seules celles-là se soldent
         # ici ; celle que `_resolved` vient d'ajouter doit atteindre la fusion
         # de l'état partagé (#3576, relecture cx1).
@@ -2818,6 +2834,8 @@ class Notifier:
                 continue
             entry = self.state["active"][key]
             if not _local_entry_owned(entry, host):
+                continue
+            if entry["alert"].get("type") in unobserved:
                 continue
             del self.state["active"][key]
             # #3576 (relecture dev4) : la fusion doit retirer la clé du partagé
@@ -2835,6 +2853,8 @@ class Notifier:
                 continue
             entry = self.state["resolved"][key]
             if not _local_entry_owned(entry, host):
+                continue
+            if entry["alert"].get("type") in unobserved:
                 continue
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
