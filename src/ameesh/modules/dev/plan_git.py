@@ -72,8 +72,11 @@ par celle de l'assigné et après sa levée (les holds sont un ensemble, pas une
 pile). `sync-branches` et les unités de paquet (`sync-packets`) portent la
 même garde. #5774 : pour un lot passé par `waiting_human`, le gel doit
 attester la reprise après la décision, même levée ; sinon seul un nouveau
-gel ou une clôture explicite permet de terminer le lot. C'est conservateur :
-la date d'un commit Git ne prouve pas sa date d'entrée dans la cible.
+gel ou une clôture explicite permet de terminer le lot. #5778 : de même pour
+toute entrée en `blocked`, `waiting_human` ou sous le hold d'un autre que
+l'assigné — un contenu déjà entré dans la cible avant la dernière de ces
+entrées (chaîne première-parente de la cible, `entered_in`) ne ferme pas le
+lot ; celui d'un paquet fusionné après la reprise ferme normalement.
 
 Un lot absorbé par un autre ou remplacé se clôt par
 `ameesh work close <id> --superseded-by <id>` ; jamais de réouverture d'un
@@ -1297,7 +1300,7 @@ def _packet_delivery(repo: str, lot: int, members: list[dict], refs: list[tuple]
 CONTENT_HELD_STATES = ("blocked", "waiting_human")
 
 
-def content_retention(st, row: dict) -> dict | None:
+def content_retention(st, row: dict, *, entered_before=None) -> dict | None:
     """#2744 : la retenue qui empêche de fermer un lot par son contenu.
 
     Un lot `blocked`/`waiting_human`, ou sous une note `hold: …` non levée
@@ -1316,10 +1319,14 @@ def content_retention(st, row: dict) -> dict | None:
     donc un hold de pilote recouvert par celui de l'assigné garde son effet.
     Sa levée reste un geste autorisé (règle #1664).
 
-    #5774 : pour un lot passé par waiting_human, ces levées ne permettent
-    pas de réutiliser un gel antérieur au cycle de décision. La barrière
-    historique est lue sous le même verrou que la fermeture ; elle impose un nouveau gel ou un acte
-    explicite de clôture, sans heuristique sur le titre ou le projet."""
+    #5778 (suite de #5774) : un contenu déjà entré dans la cible AVANT la
+    dernière entrée du lot en blocked, waiting_human ou sous un hold d'un
+    autre que l'assigné ne ferme pas le lot une fois levé — un nouveau gel ou
+    une clôture explicite le fait. `entered_before(since)` dit si le contenu
+    examiné était dans la cible à l'instant `since` (True, False, None si
+    illisible) ; voir `entry_guard`. Sans lui, l'entrée est réputée
+    antérieure (prudence). Une unité de paquet fusionnée après la reprise
+    ferme normalement (B1 auditeur #190438)."""
     row = row or {}
     try:
         lot = int(row["id"])
@@ -1355,7 +1362,8 @@ def content_retention(st, row: dict) -> dict | None:
             else:
                 retained.append(hold)
         if own and not retained:
-            barrier = _historical_content_retention(st, row, events)
+            barrier = _historical_content_retention(st, row, events,
+                                                    entered_before=entered_before)
             if barrier is not None:
                 return barrier
             last = max(own, key=lambda hold: float(hold.get("since") or 0.0))
@@ -1374,56 +1382,122 @@ def content_retention(st, row: dict) -> dict | None:
             motif += " : %s" % reason
         return {"what": "hold", "motif": motif, "by": by,
                 "since": chosen.get("since")}
-    return _historical_content_retention(st, row, events)
+    return _historical_content_retention(st, row, events, entered_before=entered_before)
 
 
-def _historical_content_retention(st, row: dict, events: list[dict]) -> dict | None:
-    # #5774 : après une mise en attente, l'ancien gel peut ne représenter
-    # que la préparation d'un acte opérateur encore dû. Même une levée ne
-    # transforme pas ce contenu historique en preuve de l'acte. On ne date
-    # pas une entrée dans la cible avec l'horloge d'un commit Git : seul un
-    # nouveau gel, ou une clôture explicite, peut remplacer cette preuve.
-    # Une attente ordinaire levée n'est pas un acte encore dû : #3219 et
-    # la fermeture d'un paquet après unhold restent valables. La barrière
-    # historique vise le cycle de décision, même après son passage en qa.
-    decisions = [e for e in events if e.get("state") == "waiting_human"]
-    if not decisions:
+def _last_barrier(db, row: dict, events: list[dict]) -> dict | None:
+    """#5778 : la dernière entrée du lot dans une attente qui retient.
+
+    Une entrée en `blocked`/`waiting_human` (le premier événement d'une suite
+    dans cet état, pas une note posée pendant), ou une note `hold:` d'un
+    autre que l'assigné ou d'un pilote. Le hold de règle 1 de l'assigné n'en
+    est pas une (#3219 : il attend d'ordinaire le paquet qui livre)."""
+    assignee = str(row.get("assignee") or "")
+    allowed = None
+    barrier, previous = None, None
+    for event in sorted(events, key=lambda e: (float(e.get("created_ts") or 0),
+                                               int(e.get("id") or 0))):
+        state = event.get("state")
+        if state in CONTENT_HELD_STATES and state != previous:
+            barrier = event
+        elif planned_waits.is_hold_note(event.get("note")):
+            who = str(event.get("actor") or "")
+            if who != assignee:
+                barrier = event
+            else:
+                if allowed is None:
+                    allowed = planned_waits.lift_authority(db, getattr(db, "cfg", None))
+                if allowed(who):
+                    barrier = event
+        previous = state
+    return barrier
+
+
+def _historical_content_retention(st, row: dict, events: list[dict], *,
+                                  entered_before=None) -> dict | None:
+    # #5774/#5778 : après une mise en attente, l'ancien gel peut ne
+    # représenter que la préparation d'un acte opérateur encore dû (#5686).
+    # Un contenu déjà dans la cible avant la dernière entrée en attente n'est
+    # pas la preuve de ce qui a suivi : seul un nouveau gel, ou une clôture
+    # explicite, le remplace. Un contenu entré après (le paquet fusionné
+    # après la reprise, B1 #190438) ferme normalement. L'entrée se lit sur la
+    # chaîne première-parente de la cible (`entry_guard`), pas à la date du
+    # commit gelé.
+    barrier = _last_barrier(getattr(st, "db", None), row, events)
+    if barrier is None:
         return None
-    barriers = [e for e in events
-                if e.get("state") in CONTENT_HELD_STATES
-                or planned_waits.is_hold_note(e.get("note"))]
-    if barriers:
-        lot = int(row["id"])
-        try:
-            freeze = latest_freeze(st.work.milestones(lot, limit=None))
-            decision_ts = max(float(e.get("created_ts") or 0) for e in decisions)
-            # Un nouveau gel termine ce cycle de décision : les attentes
-            # ordinaires suivantes ne doivent pas réarmer la barrière.
-            if freeze and decision_ts and float(freeze.get("at_ts") or 0) > decision_ts:
-                return None
-            last = max(barriers, key=lambda e: (float(e.get("created_ts") or 0),
-                                                int(e.get("id") or 0)))
-            since = float(last.get("created_ts") or 0)
-            if freeze is None or not since or float(freeze.get("at_ts") or 0) <= since:
-                return {"what": "stale-freeze",
-                        "motif": "gel antérieur à la dernière mise en attente : "
-                                 "nouveau gel ou close --delivered requis",
-                        "by": str(row.get("assignee") or ""), "since": since}
-        except Exception as exc:  # noqa: BLE001 — preuve illisible : on retient
-            return {"what": "unreadable",
-                    "motif": "historique des gels illisible (%s: %s)"
-                             % (type(exc).__name__, " ".join(str(exc).split())[:120]),
-                    "by": str(row.get("assignee") or ""), "since": None}
-    return None
+    since = float(barrier.get("created_ts") or 0)
+    by = str(row.get("assignee") or "")
+    lot = int(row["id"])
+    try:
+        freeze = latest_freeze(st.work.milestones(lot, limit=None))
+        # Un nouveau gel après la dernière attente atteste la reprise.
+        if freeze and since and float(freeze.get("at_ts") or 0) > since:
+            return None
+        before = entered_before(since) if entered_before is not None and since else True
+    except Exception as exc:  # noqa: BLE001 — preuve illisible : on retient
+        return {"what": "unreadable",
+                "motif": "historique des gels illisible (%s: %s)"
+                         % (type(exc).__name__, " ".join(str(exc).split())[:120]),
+                "by": by, "since": None}
+    if before is None:
+        return {"what": "unreadable",
+                "motif": "entrée du contenu dans la cible illisible",
+                "by": by, "since": None}
+    if not before:
+        return None
+    return {"what": "stale-freeze",
+            "motif": "contenu entré dans la cible avant la dernière mise en attente : "
+                     "nouveau gel ou close --delivered requis",
+            "by": by, "since": since}
 
 
-def dry_run_retention(db, st, row: dict, *, sha: str, repo: str | None) -> dict | None:
+def entered_in(repo: str, ref: str, target: str):
+    """#5778 : `entered_before` pour un contenu `ref` lu dans `target`.
+
+    Le contenu était-il dans la cible à l'instant `since` ? La chaîne
+    première-parente de la cible à cet instant (plus `CLOCK_SLACK_S`, en
+    faveur de la retenue) le dit ; une lecture git en erreur rend None."""
+    def entered_before(since) -> bool | None:
+        if not ref or not target:
+            return None
+        proc = _git(repo, "rev-list", "-1", "--first-parent",
+                    "--before=@%d" % int(float(since) + CLOCK_SLACK_S),
+                    _target_ref(repo, target))
+        if proc.returncode != 0:
+            return None
+        tip = proc.stdout.decode("utf-8", "replace").strip()
+        if not tip:
+            return False        # la cible n'avait encore aucun commit
+        return _is_ancestor_checked(repo, ref, tip)
+    return entered_before
+
+
+def merged_at(merged_ts):
+    """#5778 : `entered_before` pour une fusion datée par la forge."""
+    def entered_before(since) -> bool | None:
+        if not merged_ts:
+            return None
+        return float(merged_ts) <= float(since) + CLOCK_SLACK_S
+    return entered_before
+
+
+def entry_guard(entered_before):
+    """#5778 : le `content_guard` de `work.close_merged`, avec l'entrée du
+    contenu dans la cible."""
+    def guard(st, row):
+        return content_retention(st, row, entered_before=entered_before)
+    return guard
+
+
+def dry_run_retention(db, st, row: dict, *, sha: str, repo: str | None,
+                      entered_before=None) -> dict | None:
     """La retenue qu'un relevé à blanc annonce : #2744 (blocked, hold), puis
     #3022 (porte de production hors de la branche de prod) — la même que
     `work.close_merged` appliquerait, sans verrou ni écriture. Le hold de
     l'assigné levé par le contenu (#3219, `lift: True`) n'exempte pas de la
     porte : sa retenue prime, sinon la levée est rendue."""
-    retention = content_retention(st, row)
+    retention = content_retention(st, row, entered_before=entered_before)
     if retention is None or retention.get("lift"):
         from ... import prod_gate
         gate = prod_gate.check(st, row, sha=sha, repo=repo,
@@ -1692,11 +1766,13 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                          composition={"package": int(member["package_id"]),
                                       "branch": member.get("package_branch") or "",
                                       "unit": member["unit_sha"]})
+            # #5778 : l'entrée de l'unité dans la cible, face aux attentes
+            entered = entered_in(repo_dir, entry["ref"] or "", composition["target"])
             if dry_run:
                 # #2744 : la même retenue que la fermeture par le gel ;
                 # #3219 : celle de l'assigné est levée par le contenu.
                 retention = dry_run_retention(db, st, row, sha=entry["ref"] or "",
-                                              repo=repo_dir)
+                                              repo=repo_dir, entered_before=entered)
                 if retention is not None and not retention.get("lift"):
                     mark_retained(entry, retention, target=composition["target"],
                                   dry_run=True)
@@ -1717,7 +1793,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                     # un gel apparu entre-temps refuse la fermeture.
                     unfrozen=freeze is None,
                     repo=repo_dir,      # L539 : dépôt du relevé, indice de classe
-                    content_guard=content_retention)   # #2744 : verrou commun avec le hold
+                    content_guard=entry_guard(entered))   # #2744 : verrou commun avec le hold
                 entry["result"] = done["result"]
                 if done["result"] in ("withheld", "error"):
                     mark_retained(entry, done["retention"],
@@ -1795,9 +1871,10 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         entry.update(target=found_target, off_target=off_default, how=found_proof["how"],
                      ref=found_proof["ref"], sha=sha, result="open",
                      detail=found_proof["detail"])
+        entered = entered_in(repo_dir, entry["ref"] or "", found_target)   # #5778
         if dry_run:
             retention = dry_run_retention(db, st, row, sha=entry["ref"] or "",
-                                          repo=repo_dir)
+                                          repo=repo_dir, entered_before=entered)
             if retention is not None and not retention.get("lift"):
                 mark_retained(entry, retention, target=found_target, dry_run=True)
                 results.append(entry)
@@ -1812,7 +1889,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                 actor="git:%s" % found_target, frozen_id=frozen_id,
                 unfrozen=frozen_id is None,   # #2444 : un gel apparu entre-temps refuse
                 repo=repo_dir,          # L539 : dépôt du relevé, indice de classe
-                content_guard=content_retention)   # #2744 : verrou commun avec le hold
+                content_guard=entry_guard(entered))   # #2744 : verrou commun avec le hold
             entry["result"] = done["result"]
             if done["result"] in ("withheld", "error"):
                 mark_retained(entry, done["retention"], target=found_target)
@@ -4080,8 +4157,10 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                             st.work.set_branch_head(lot, branch, found["tip"])
             results.append(entry)
             continue
+        entered = entered_in(repo, found["ref"] or "", target)   # #5778
         if dry_run:
-            retention = dry_run_retention(db, st, row, sha=found["ref"] or "", repo=repo)
+            retention = dry_run_retention(db, st, row, sha=found["ref"] or "", repo=repo,
+                                          entered_before=entered)
             if retention is not None and not retention.get("lift"):
                 mark_retained(entry, retention, target=target, dry_run=True)
                 results.append(entry)
@@ -4106,7 +4185,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             evidence={"seen": source, "sha": found["ref"] or ""},
             actor=actor or "git:%s" % target, frozen_id=found.get("frozen_id"),
             repo=repo,                          # L539 : dépôt du relevé, indice de classe
-            content_guard=content_retention)    # #2744 : verrou commun avec le hold
+            content_guard=entry_guard(entered))    # #2744 : verrou commun avec le hold
         entry["result"] = done["result"]
         if done["result"] in ("withheld", "error"):
             mark_retained(entry, done["retention"], target=target)
