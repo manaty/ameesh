@@ -6,12 +6,15 @@
 * `deploy/sql/role-superviseur.sql` appliqué sur le Postgres du banc : le rôle
   lit ce qui est accordé, rien d'autre, et n'écrit nulle part ; toute colonne
   du schéma est soit accordée, soit exclue explicitement ;
+* un lint statique compare les `ADD COLUMN` des migrations au contrat et à
+  `EXCLUES`, sans base : une colonne non tranchée rougit avant le gel (#5697) ;
 * `deploy/k8s/` et `Dockerfile` : contrôles statiques (aucun cluster, aucun
   registre, aucune construction d'image ici).
 """
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import subprocess
 import unittest
@@ -336,6 +339,55 @@ EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
            | FERMEES.get(rel, set()) | HORS_CONTRAT.get(rel, set())
            for rel in set(SIGNATURES) | set(CONTENUS) | set(FERMEES) | set(HORS_CONTRAT)}
 
+#: #5697 : lecture statique du contrat et des `ADD COLUMN` des migrations, sans
+#: base. Le lint de sélection (classe `ContratDesColonnesTest`) compare les
+#: colonnes ajoutées au contrat du rôle superviseur et à `EXCLUES` : une
+#: colonne non tranchée rougit avant le gel, au lieu d'attendre le test de
+#: contrat sur un vrai schéma (manques répétés #1465, #2814, #3755, #5250,
+#: #5633, #5653).
+_CONTRAT_VALUES = re.compile(
+    r"INSERT\s+INTO\s+pg_temp\.ameesh_contrat\s*\(rel,\s*cols\)\s*VALUES"
+    r"(?P<entrees>.*?);", re.IGNORECASE | re.DOTALL)
+_CONTRAT_ENTREE = re.compile(
+    r"\('(?P<rel>[^']+)'\s*,\s*ARRAY\s*\[(?P<cols>.*?)\]\)", re.DOTALL)
+_ALTER_TABLE = re.compile(
+    r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?(?P<rel>[\w\".]+)"
+    r"(?P<corps>[^;]*?);", re.IGNORECASE | re.DOTALL)
+_ADD_COLUMN = re.compile(
+    r"\badd\s+column\s+(?:if\s+not\s+exists\s+)?\"?(?P<col>[A-Za-z_][\w$]*)\"?",
+    re.IGNORECASE)
+
+
+def _sans_commentaires(sql: str) -> str:
+    """Le SQL sans commentaires de ligne ni de bloc (les chaînes citées restent)."""
+    return re.sub(r"--[^\n]*", " ",
+                  re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL))
+
+
+def colonnes_du_contrat(script: str = ROLE_SQL) -> dict[str, set[str]]:
+    """{relation: colonnes accordées} lues dans un script de contrat."""
+    with open(script, encoding="utf-8") as fichier:
+        texte = _sans_commentaires(fichier.read())
+    bloc = _CONTRAT_VALUES.search(texte)
+    if bloc is None:
+        raise AssertionError("%s : INSERT dans ameesh_contrat introuvable" % script)
+    contrat: dict[str, set[str]] = {}
+    for entree in _CONTRAT_ENTREE.finditer(bloc.group("entrees")):
+        contrat.setdefault(entree.group("rel"), set()).update(
+            re.findall(r"'([^']+)'", entree.group("cols")))
+    return contrat
+
+
+def colonnes_ajoutees(sql: str) -> list[tuple[str, str]]:
+    """[(relation, colonne)] des `ADD COLUMN` d'un texte de migration."""
+    ajouts: list[tuple[str, str]] = []
+    texte = _sans_commentaires(sql)
+    for alter in _ALTER_TABLE.finditer(texte):
+        rel = alter.group("rel").strip('"').split(".")[-1].strip('"')
+        for colonne in _ADD_COLUMN.finditer(alter.group("corps")):
+            ajouts.append((rel, colonne.group("col")))
+    return ajouts
+
 
 def ecarts_de_classement(cols: dict[str, dict[str, bool]]) -> list[str]:
     """Colonnes d'un relevé `columns()` ni accordées ni exclues, classées.
@@ -389,6 +441,55 @@ class ClassementColonnesTest(unittest.TestCase):
         self.assertEqual(len(ecarts), 1)
         self.assertIn("agent_registry.public_key", ecarts[0])
         self.assertIn("lisible", ecarts[0])
+
+
+class ContratDesColonnesTest(unittest.TestCase):
+    """#5697 : un `ADD COLUMN` de migration est accordé ou exclu, sans base.
+
+    `test_cluster` est dans la liste « toujours » : ce lint tourne dans la
+    sélection de chaque lot, avant le gel, sans psql ni schéma. Le test de
+    contrat sur le vrai schéma reste le juge final ; ce lint donne le même
+    verdict plus tôt (manques répétés #1465, #2814, #3755, #5250, #5633,
+    #5653).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.contrat = colonnes_du_contrat()
+        cls.ajouts: list[tuple[str, str]] = []
+        cls.cols: dict[str, dict[str, bool]] = {}
+        cls.origine: dict[str, str] = {}
+        for migration in migrations.discover():
+            for rel, col in colonnes_ajoutees(migration.sql):
+                cls.ajouts.append((rel, col))
+                cls.cols.setdefault(rel, {})[col] = col in cls.contrat.get(rel, set())
+                cls.origine.setdefault("%s.%s" % (rel, col), migration.label)
+
+    def test_le_lint_voit_les_ajouts_de_colonnes(self):
+        self.assertIn(("agent_registry", "review_hold"), self.ajouts)
+        self.assertIn(("work_items", "wake_at"), self.ajouts)
+        # un `ADD CONSTRAINT` n'est pas une colonne
+        self.assertNotIn(("work_items", "constraint"), self.ajouts)
+
+    def test_les_add_constraint_ne_sont_pas_des_colonnes(self):
+        sql = ("ALTER TABLE agent_registry ADD COLUMN IF NOT EXISTS future_a text, "
+               "ADD COLUMN \"future_b\" timestamptz; "
+               "ALTER TABLE work_items ADD CONSTRAINT future_check CHECK (true);")
+        self.assertEqual(colonnes_ajoutees(sql),
+                         [("agent_registry", "future_a"),
+                          ("agent_registry", "future_b")])
+
+    def test_toute_colonne_ajoutee_est_accordee_ou_exclue(self):
+        ecarts = ecarts_de_classement(self.cols)
+        details = " ; ".join(
+            "%s (migration %s)" % (ecart.split(" :", 1)[0],
+                                   self.origine.get(ecart.split(" :", 1)[0], "?"))
+            for ecart in ecarts)
+        self.assertEqual(
+            ecarts, [],
+            "colonne(s) ajoutée(s) par migration, ni accordée(s) ni exclue(s) : "
+            "trancher dans deploy/sql/role-superviseur.sql ou EXCLUES "
+            "(tests/test_cluster.py) — %s" % details)
 
 
 class ProbeTest(PgTestCase):

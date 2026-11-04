@@ -124,6 +124,14 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   font échouer la suite unitaire (`tests/test_l122_numeros_de_migration.py`) :
   la dernière venue se renumérote. Une migration ne fait qu'ajouter, sauf
   version majeure (voir ci-dessous).
+- **Colonne nouvelle** (#5697) : toute colonne ajoutée par une migration
+  (`ADD COLUMN`) est tranchée **avant le gel** : soit le rôle superviseur la
+  lit, et elle entre au contrat de `deploy/sql/role-superviseur.sql` (un
+  contenu : `deploy/sql/role-superviseur-contenus.sql`), soit elle reste
+  fermée, et elle est classée dans `EXCLUES` en tête de
+  `tests/test_cluster.py`. Le lint de `tests/test_cluster.py` compare les
+  `ADD COLUMN` des migrations à ce contrat et à `EXCLUES` ; il tourne dans la
+  sélection du lot, sans base, et refuse une colonne non tranchée.
 - **En-tête de licence** `SPDX-License-Identifier: AGPL-3.0-only` en tête des
   nouveaux fichiers source.
 
