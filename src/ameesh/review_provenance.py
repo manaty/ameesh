@@ -48,7 +48,10 @@ harnais, hôte et lot. `record --signed` vérifie la signature, la consomme et
 écrit le reçu (`turn = "signed:<approbation>"`). Ce n'est pas une preuve
 d'ascendance : c'est une attestation d'autorité, et le garde reste le même —
 pas de signature valide, pas de reçu. L'acteur doit être `externe` au registre,
-sans bail vivant, sous le harnais que le registre lui connaît.
+sans bail vivant ; le harnais est celui de la SESSION (#5756) : une liaison de
+session le fixe avec l'agent, sinon il doit être un harnais déjà connu de
+l'acteur (registre courant ou liaison passée). Le harnais courant du registre,
+s'il diverge, est gardé dans le meta de l'approbation (`registry_harness`).
 
 Un commit n'est enregistrable que s'il a été **créé dans ce tour** : le hook
 `pre-commit` écrit avant le commit une attestation (identité du tour, HEAD et
@@ -405,9 +408,18 @@ def _signed_identity(db, *, actor, session, harness, host, families) -> dict:
 
     L'acteur doit être au registre en mode `externe` (liste d'admission : mode
     absent = `execute`), sans bail vivant — sinon le tour managé est la preuve,
-    pas une signature — et sous le harnais que le registre lui connaît. Le
-    harnais doit être une famille du canon. L'hôte est un nom borné : il ne
-    prouve rien à lui seul, il est couvert par la signature avec le reste."""
+    pas une signature. Le harnais est une propriété de la SESSION (#5756) :
+
+    * si la session figure dans `session_bindings` (toute ligne, révoquée
+      comprise), elle fixe l'agent ET le harnais : toute divergence est refusée ;
+    * sinon (hôte sans ameesh, session jamais liée), le harnais déclaré doit
+      être un harnais déjà connu de l'acteur : le courant du registre ou celui
+      d'une de ses liaisons passées. Un harnais jamais vu reste refusé.
+
+    Le harnais doit être une famille du canon. L'hôte est un nom borné : il ne
+    prouve rien à lui seul, il est couvert par la signature avec le reste. Le
+    harnais courant du registre, quand il diverge du harnais signé, est rendu
+    dans `registry_harness` : il est écrit dans le meta de l'approbation."""
     from . import agent_names
     from . import registry
     from . import session_bindings
@@ -443,11 +455,40 @@ def _signed_identity(db, *, actor, session, harness, host, families) -> dict:
             "%s holds a live lease (runner-driven): its turns are the proof, "
             "not a signed statement" % name)
     declared = str(reg.get("harness") or "").strip().lower()
-    if declared and declared != harness:
-        raise ProvenanceError(
-            "agent %s is registered under %r but the signed statement declares %r"
-            % (name, declared, harness))
-    return {"actor": name, "session": session, "harness": harness, "host": host}
+    # #5756 : le registre porte le harnais COURANT de l'acteur, pas celui de la
+    # session qui a créé le commit. Les liaisons de session (révoquées
+    # comprises) disent les harnais réellement vus pour l'acteur.
+    bindings = session_bindings.listing(db, include_revoked=True)
+    session_rows = [row for row in bindings
+                    if str(row.get("session_id") or "") == session]
+    if session_rows:
+        for row in session_rows:
+            bound_agent = str(row.get("agent") or "")
+            bound_harness = str(row.get("harness") or "").strip().lower()
+            if bound_agent != name:
+                raise ProvenanceError(
+                    "session %s is bound to %s, not to the signed actor %s"
+                    % (session, bound_agent or "?", name))
+            if bound_harness != harness:
+                raise ProvenanceError(
+                    "session %s is bound under %r, but the signed statement "
+                    "declares %r: a session keeps the harness of its binding"
+                    % (session, bound_harness or "?", harness))
+    else:
+        known = {str(row.get("harness") or "").strip().lower()
+                 for row in bindings
+                 if str(row.get("agent") or "") == name}
+        if declared:
+            known.add(declared)
+        if harness not in known:
+            registered = ("is registered under %r" % declared if declared
+                          else "has no harness in the registry")
+            raise ProvenanceError(
+                "agent %s %s but the signed statement declares %r: no session "
+                "binding of %s ever used %r"
+                % (name, registered, harness, name, harness))
+    return {"actor": name, "session": session, "harness": harness, "host": host,
+            "registry_harness": declared if declared != harness else ""}
 
 
 def _approval_row(db, approval_id, digest: str) -> dict:
@@ -464,6 +505,25 @@ def _approval_row(db, approval_id, digest: str) -> dict:
     raise ProvenanceError(
         "approval #%s does not cover this signed statement (%s)"
         % (wanted, digest[:12]))
+
+
+def _signed_meta(db, turn: str) -> dict:
+    """Le meta de l'approbation qui porte un reçu signé (`signed:<id>`)."""
+    turn = str(turn or "")
+    if not turn.startswith(SIGNED_TURN_PREFIX):
+        return {}
+    try:
+        approval_id = int(turn[len(SIGNED_TURN_PREFIX):])
+    except ValueError:
+        return {}
+    row = storage.of(db).approvals.get(approval_id)
+    meta = (row or {}).get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            return {}
+    return meta if isinstance(meta, dict) else {}
 
 
 def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
@@ -527,13 +587,17 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
             seed = signing.read_private(os.path.expanduser(key_path))
         except (OSError, ValueError) as exc:
             raise ProvenanceError("cannot read the signing key: %s" % exc) from exc
+        meta = {"statement": statement, "host": ident["host"],
+                "lot": work_item_id or 0, "source": "provenance --signed"}
+        # #5756 : le texte signé ne bouge pas (version 1) ; le harnais courant
+        # du registre, quand il diverge, reste lisible dans l'approbation.
+        if ident.get("registry_harness"):
+            meta["registry_harness"] = ident["registry_harness"]
         try:
             built = authority.create_approval(
                 db, seed, approver=approver, action=SIGNED_ACTION,
                 artifact_kind=SIGNED_KIND, artifact_hash=digest,
-                ttl=authority.parse_ttl(expires),
-                meta={"statement": statement, "host": ident["host"],
-                      "lot": work_item_id or 0, "source": "provenance --signed"})
+                ttl=authority.parse_ttl(expires), meta=meta)
         except authority.AuthorityError as exc:
             raise ProvenanceError(str(exc)) from exc
         approval_id = int(built["id"])
@@ -1318,7 +1382,13 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("error: --commit or --milestone is required", file=sys.stderr)
             return 2
+        registry_harness = ""
+        if recu is not None:
+            registry_harness = str(
+                _signed_meta(db, recu.get("turn") or "").get("registry_harness") or "")
         if args.json:
+            if registry_harness:
+                recu = dict(recu, registry_harness=registry_harness)
             print(json.dumps(recu, default=str))
         elif recu is None:
             print("unknown origin (no exact receipt)")
@@ -1326,6 +1396,9 @@ def main(argv: list[str] | None = None) -> int:
             print("%s: %s in %s, turn %s, %s"
                   % (recu["subject"], recu["actor"], recu["session"],
                      recu["turn"][:8], recu["record"]))
+            if registry_harness:
+                print("registry harness: %s (the signed statement declares %s)"
+                      % (registry_harness, recu["harness"]))
         return 0 if recu is not None else 3
     except ProvenanceError as exc:
         print("provenance refused: %s" % exc, file=sys.stderr)

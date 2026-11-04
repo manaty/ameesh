@@ -63,7 +63,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    pending_recipients_sorted unread_total dead_letters forward
    wakeups         subscribe notify
    keys            info register revoke registered
-   approvals       create recent candidates consume
+   approvals       create get recent candidates consume
    nonces          state consume
    work            add get items move note assign events milestones add_milestone
                    delays timeline link_package by_package close_merged close
@@ -1880,6 +1880,10 @@ class Approvals(Domain):
     def recent(self, *, action: str | None, artifact_hash: str | None,
                limit: int) -> list[dict]:
         """Approbations avec leur état, de la plus récente à la plus ancienne."""
+
+    @abc.abstractmethod
+    def get(self, approval_id: int) -> dict | None:
+        """L'approbation `approval_id`, meta compris, ou None."""
 
     @abc.abstractmethod
     def candidates(self, action: str, artifact_hash: str, decision: str) -> list[dict]:
