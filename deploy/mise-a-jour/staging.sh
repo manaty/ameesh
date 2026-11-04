@@ -696,7 +696,7 @@ precedent_retour() {  # commit que « retour » reinstalle reellement
   case "$(mode_de "$nom")" in
     poste) cat "$TRAVAIL/precedent" 2>/dev/null ;;
     agents) ssh_lire "${CIBLE[$nom]}" \
-      "cat /home/ameesh/.local/share/ameesh/previous-sha" 2>/dev/null ;;
+      "runuser -u ameesh -- cat /home/ameesh/.local/share/ameesh/previous-sha" 2>/dev/null ;;
     serveur) ssh_lire "${CIBLE[$nom]}" "cat /opt/ameesh/precedent" 2>/dev/null ;;
   esac || true
 }
@@ -836,13 +836,14 @@ py_sequence() {  # script|- [args…]
   fi
 }
 # #3981 : le journal de la sequence reste ecrit par le lanceur ; actif.py qui
-# tourne sur HOTE_OUTILS doit le lire la-bas. Copie root puis propriete a
-# ameesh, 0600 : l'outil distant (runuser -u ameesh) le relit sans privilege.
+# tourne sur HOTE_OUTILS doit le lire la-bas. #5797 : mkdir et ecriture sous
+# l'identite ameesh (runuser), 0600, jamais en root ni chown : ce chemin
+# appartient au compte d'agents, un lien pose par lui menerait root ailleurs.
 copier_journal_outils() {  # source locale distant
   local source=$1 distant=$2
   ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 \
     "${CIBLE[$HOTE_OUTILS]}" \
-    "umask 077; mkdir -p $(citer "$TRAVAIL_OUTILS") && cat > $(citer "$distant") && chown ameesh:ameesh $(citer "$distant")" \
+    "runuser -u ameesh -- sh -c $(citer 'umask 077; mkdir -p -- "$1" && cat > "$2"') sh $(citer "$TRAVAIL_OUTILS") $(citer "$distant")" \
     < "$source"
 }
 # Verdict d'une sonde de courrier (#3976, canon §3) : « ok » (code 0), « ko »
