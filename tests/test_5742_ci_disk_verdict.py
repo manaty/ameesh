@@ -44,6 +44,20 @@ class EvidenceTest(unittest.TestCase):
         self.assertFalse(agregat.disk_infrastructure(job(), disk + "ERROR: test_other (tests.X)\n"))
         self.assertFalse(agregat.disk_infrastructure(job(), disk + "test_other ... FAIL\n"))
 
+    def test_assertion_qui_cite_enospc_reste_un_negatif(self):
+        # Régression B1 : test_l159e_guard assertIn attend cette chaîne.
+        for final in (
+                "AssertionError: 'No space left on device' not found in 'autre erreur'",
+                "ValueError: No space left on device",
+                "OSError: [Errno 13] No space left on device",
+                "AssertionError: [Errno 28] No space left on device"):
+            with self.subTest(final=final):
+                self.assertFalse(agregat.disk_infrastructure(job(), traceback(final)))
+        chained = traceback("OSError: [Errno 28] No space left on device\n\n"
+                            "During handling of the above exception, another exception occurred:\n\n"
+                            "Traceback (most recent call last):\nAssertionError: regression")
+        self.assertFalse(agregat.disk_infrastructure(job(), chained))
+
     def test_avertissement_recupere_ne_suffit_pas(self):
         for text in ("No space left on device\n", "ENOSPC\n",
                      "No space left on device\nFAILED (errors=1)\n"):

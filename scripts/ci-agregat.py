@@ -175,7 +175,14 @@ def disk_infrastructure(job: dict, text: str) -> bool:
                         r"(?=^={20,}\n|^-{20,}\nRan |\Z)", text)
     if headers:
         # Un log interrompu au milieu d'un autre échec est une preuve incomplète.
-        if len(blocks) != len(headers) or not all(disk.search(block) for block in blocks):
+        final_disk = re.compile(
+            r"^(?:(?:OSError|IOError): (?:\[Errno 28\](?:\s|:|$)|No space left on device)"
+            r"|System\.IO\.IOException:.*No space left on device)", re.I)
+        # Une assertion peut citer un vrai ENOSPC (ou son traceback chaîné)
+        # tout en prouvant une régression : seule l'exception finale compte.
+        finals = [next((line.strip() for line in reversed(block.splitlines())
+                        if line.strip()), "") for block in blocks]
+        if len(blocks) != len(headers) or not all(final_disk.search(line) for line in finals):
             return False
         statuses = collections.Counter(re.findall(
             r"(?m)^(test\S+)[^\n]* \.\.\. (?:ERROR|FAIL)\s*$", text))
