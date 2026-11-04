@@ -1027,6 +1027,16 @@ The `installer` step follows the same practice.
 
 1. `poste.sh verifier`: target databases (without password), runners, SSH
    access to the server. Nothing is modified.
+1 bis. `poste.sh prevol [REF]` (#5692): `ameesh migrate --dry-run
+   --additive-only` from REF's snapshot on **every configured base**, the mesh
+   database and the old one (`config-ancienne-base.json`). Read-only on the
+   databases. Code 0: no non-additive migration waits; 3: the mesh database
+   waits for one (the staging sequence stops there, before any backup); 4:
+   only a secondary base fails, non-additive or unreadable (the workstation is
+   declared deferred from the outset, its update at its return, and the VMs
+   still go); 1: another failure. `ameesh doctor` warns per base,
+   `doctor --probe` is KO, and the
+   `migration_pending_non_additive` alert names the waiting migrations.
 2. `poste.sh sauvegarder`: the server backup (`ameesh-sauvegarde`) dumps the
    mesh database on the VM into its guarded local copy, then `poste.sh`
    retrieves that dump compressed over SSH into `~/backups/ameesh/`, checking
@@ -1341,6 +1351,16 @@ A separate owner-approved migration plan must name its exact commit, backup,
 drain and recovery procedure. An installed symlink cannot authorise a
 non-additive migration; this command never disables its additive guard.
 Rollback of such a separately approved operation requires the database backup.
+
+#5692: this refusal is announced **before** the staging spends a backup on it.
+`ameesh doctor` prints `migrations : WARNING …` per configured base (the
+secondary one included, read from `config-ancienne-base.json`), and its
+`--probe` is KO with the non-additive migrations named. `ameesh alerts` raises
+one `migration_pending_non_additive` per base, and the staging preflight runs
+`migrate --dry-run --additive-only` on every base it will touch — on the
+migrating VM, and on the workstation with `poste.sh prevol REF`, which
+declares the workstation deferred from the outset when only a secondary base
+is blocked. Catching up a non-additive migration remains #4792.
 
 **New dependency.** The new code is run with the packages of the venv
 in place. If REF adds a dependency that `ameesh migrate` needs,

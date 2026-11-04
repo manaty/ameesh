@@ -495,9 +495,11 @@ if [ "$POSTE_ABSENT" = 0 ]; then
 fi
 
 # Hote des migrations quand le poste est absent (#3848), choisi et valide avant
-# toute mutation : une VM d'agents de la sequence.
+# toute mutation : une VM d'agents de la sequence. #5692 : rejouable quand le
+# preflight reporte le poste (base secondaire bloquee) — la sequence continue
+# alors sans lui, migrations depuis une VM.
 HOTE_MIGRATIONS=${HOTE_MIGRATIONS:-}
-if [ "$POSTE_ABSENT" = 1 ]; then
+choisir_hote_migrations() {
   if [ -z "$HOTE_MIGRATIONS" ]; then
     for nom in ameesh-agents-2 ameesh-agents-1 ameesh-agents-3; do
       case " ${HOTES[*]} " in *" $nom "*) HOTE_MIGRATIONS=$nom; break ;; esac
@@ -505,12 +507,15 @@ if [ "$POSTE_ABSENT" = 1 ]; then
   fi
   if [ -z "$HOTE_MIGRATIONS" ] || [ "$(mode_de "$HOTE_MIGRATIONS")" != agents ]; then
     echo "HOTE_MIGRATIONS (« ${HOTE_MIGRATIONS:-absent} ») doit etre une VM d'agents de la sequence" >&2
-    exit 2
+    return 2
   fi
   case " ${HOTES[*]} " in
     *" $HOTE_MIGRATIONS "*) ;;
-    *) echo "HOTE_MIGRATIONS (« $HOTE_MIGRATIONS ») n'est pas dans la sequence (${HOTES[*]})" >&2; exit 2 ;;
+    *) echo "HOTE_MIGRATIONS (« $HOTE_MIGRATIONS ») n'est pas dans la sequence (${HOTES[*]})" >&2; return 2 ;;
   esac
+}
+if [ "$POSTE_ABSENT" = 1 ]; then
+  choisir_hote_migrations || exit $?
 fi
 
 # #3976 : les outils python de la sequence (sonde de courrier, notification)
@@ -744,6 +749,31 @@ PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migra
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --additive-only
 REMOTE
 }
+# #5692 : preflight de la base que le chemin sans poste va migrer. Meme
+# instantane que `migrer_depuis_vm`, mais dry-run additif seul : une migration
+# non additive est constatee AVANT la sauvegarde, pas apres elle. Code 3 (guard
+# additif) ou toute autre erreur arrete le preflight, rien n'a ete modifie.
+verifier_migrations_vm() {  # nom sha
+  local nom=$1 sha=$2 cible=${CIBLE[$1]} a b c
+  printf -v a '%q' "$sha"
+  printf -v b '%q' "$DEPOT_VM"
+  printf -v c '%q' "$SNAP_VM"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$cible" \
+    "runuser -u ameesh -- env HOME=/home/ameesh bash -s -- $a $b $c" <<'REMOTE'
+set -euo pipefail
+R=$1
+depot=$2
+snap=$3
+d="$snap/snap-${R:0:8}"
+rm -rf -- "$d"
+mkdir -p -- "$d"
+git -C "$depot" fetch -q origin
+git -C "$depot" archive "$R" src | tar -x -C "$d"
+cd "$d"
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --dry-run --additive-only
+REMOTE
+}
+
 # Sauvegarde du serveur quand le poste est absent (relecture dev1 #3848) : le
 # meme service que poste.sh (ameesh-sauvegarde.service, pg_dump sur la VM),
 # dont un nouveau dump est exige ; il reste sur manaty-mesh-1, sans
@@ -1309,6 +1339,52 @@ for nom in "${HOTES[@]}"; do
     trace "$nom" verifier ko "echec du preflight"
     echo "preflight en echec sur $nom : rien n'a ete modifie" >&2
     exit 1
+  fi
+  # #5692 : le preflight joue le dry-run additif de la cible sur la base que
+  # le chemin sans poste va migrer — avant la sauvegarde, pas apres elle.
+  if [ "$POSTE_ABSENT" = 1 ] && [ "$nom" = "$HOTE_MIGRATIONS" ]; then
+    if ! verifier_migrations_vm "$nom" "$SHA"; then
+      trace "$nom" verifier ko "preflight des migrations de $SHA_TRAVE en echec (non additive ou illisible)"
+      echo "preflight en echec sur $nom : migrations de $SHA_TRAVE refusees avant sauvegarde ; rien n'a ete modifie" >&2
+      exit 1
+    fi
+  fi
+  # #5692 : sur le poste, `poste.sh prevol` sonde CHAQUE base configuree
+  # (mesh et ancienne) depuis l'instantane de la cible. Une non additive sur
+  # une base secondaire ne retient pas les VM : le poste est reporte d'emblee,
+  # comme s'il etait absent, et la sequence continue sans lui. Une non
+  # additive sur la base du mesh arrete tout avant la sauvegarde.
+  if [ "$nom" = pc-smichea ] && [ "$POSTE_ABSENT" = 0 ]; then
+    rc_prevol=0
+    sortie_prevol=$(exec_hote "$nom" prevol "$SHA" 2>&1) || rc_prevol=$?
+    printf '%s\n' "$sortie_prevol"
+    if [ "$rc_prevol" = 4 ]; then
+      POSTE_ABSENT=1
+      detail_prevol=$(printf '%s\n' "$sortie_prevol" | sed -n 's/^poste : //p' | head -1)
+      POSTE_RAISON="migrations non additives en attente sur une base secondaire (${detail_prevol:-voir le preflight}) : poste reporte d'emblee, mise a jour a son retour"
+      nouveaux=()
+      for h in "${HOTES[@]}"; do
+        [ "$h" = pc-smichea ] || nouveaux+=("$h")
+      done
+      HOTES=("${nouveaux[@]}")
+      choisir_hote_migrations || exit $?
+      trace pc-smichea absent reporte "$POSTE_RAISON"
+      echo "  pc-smichea : absent (reporte) — $POSTE_RAISON"
+      # La base du mesh sera migrée depuis cette VM : le dry-run additif de la
+      # cible passe ici, avant la sauvegarde (même contrôle que le préflight
+      # ordinaire du chemin sans poste).
+      if ! verifier_migrations_vm "$HOTE_MIGRATIONS" "$SHA"; then
+        trace "$HOTE_MIGRATIONS" verifier ko "preflight des migrations de $SHA_TRAVE en echec (non additive ou illisible)"
+        echo "preflight en echec sur $HOTE_MIGRATIONS : migrations de $SHA_TRAVE refusees avant sauvegarde ; rien n'a ete modifie" >&2
+        exit 1
+      fi
+      continue
+    fi
+    if [ "$rc_prevol" != 0 ]; then
+      trace "$nom" verifier ko "preflight des migrations en echec (code $rc_prevol)"
+      echo "preflight en echec sur $nom : migrations de $SHA_TRAVE refusees avant sauvegarde ; rien n'a ete modifie" >&2
+      exit 1
+    fi
   fi
   trace "$nom" verifier ok
 done

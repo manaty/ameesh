@@ -2048,7 +2048,9 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
                 allow_live_executors: str | None = None) -> int:
     """`--dry-run` : migrations manquantes, additives ou non, sans rien écrire.
     `--additive-only` : n'applique rien (code 3) si l'une d'elles n'est pas
-    additive — c'est le garde de « migrer avant d'installer » (L151)."""
+    additive — c'est le garde de « migrer avant d'installer » (L151).
+    #5692 : `--dry-run --additive-only` rend le même verdict (3) sans écrire,
+    pour que le préflight de staging constate le refus avant toute sauvegarde."""
     try:
         db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
@@ -2072,13 +2074,20 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
             if refused:
                 print("%d non-additive migration(s): the previous code would break on the "
                       "migrated database" % len(refused), file=sys.stderr)
-            if dry_run:
+            # #5692 : le préflight combine les deux options pour obtenir le
+            # verdict du garde sans écrire ; `--dry-run` seul reste un
+            # diagnostic (code 0) même avec des migrations non additives.
+            if dry_run and not additive_only:
                 if not missing:
                     print("schema up to date: no migration to apply")
                 return 0
             if refused:
                 print("nothing applied (--additive-only)", file=sys.stderr)
                 return 3
+            if dry_run:
+                if not missing:
+                    print("schema up to date: no migration to apply")
+                return 0
         done = migrations.migrate(db, log=lambda line: print(line), additive_only=additive_only,
                                   allow_live_executors=allow_live_executors)
     except migrations.NonAdditiveMigration as exc:
@@ -2123,11 +2132,19 @@ def cmd_probe(cfg: Config) -> int:
         return 1
     finally:
         db.close()
+    pending_na = []
+    for migration in missing:
+        reasons = migrations.non_additive(migration)
+        if reasons:
+            pending_na.append((migration, reasons))
     if missing or modified:
-        print("probe: KO — migrations %s%s" % (
+        print("probe: KO — migrations %s%s%s" % (
             "missing %s" % ",".join(m.label for m in missing) if missing else "",
             ("%smodified %s" % ("; " if missing else "", ",".join(m.label for m in modified))
-             if modified else "")))
+             if modified else ""),
+            ("; %d non-additive — `migrate --additive-only` refuses them (%s)"
+             % (len(pending_na), migrations.describe_pending_non_additive(pending_na)))
+            if pending_na else ""))
         return 1
     extra = ("; database newer than this code (versions %s)"
              % ",".join("%04d" % v for v in unknown)) if unknown else ""
@@ -2216,6 +2233,19 @@ def _print_profile_audit(audit) -> bool:
           "(%s); keep only what a profile overrides, or align it"
           % (audit.directory, audit.host, ", ".join(config_mod.SHARED_CONFIG_KEYS)))
     return True
+
+
+def _print_pending_non_additive(pending, base: str | None = None) -> None:
+    """#5692 : une migration non additive en attente ne fait pas un KO — rien
+    n'est cassé — mais elle interdit le prochain `--additive-only`. WARN le
+    doctor complet, KO la sonde de déploiement (`doctor --probe`)."""
+    where = (" on %s" % base) if base else ""
+    print("migrations : WARNING%s — %d pending non-additive migration(s): %s"
+          % (where, len(pending),
+             migrations.describe_pending_non_additive(pending)))
+    print("warning    : `migrate --additive-only` refuses them: the previous code "
+          "would break on the migrated base; plan the migration window (executors "
+          "stopped) or defer this host at the next staging")
 
 
 def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
@@ -2382,6 +2412,33 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         return 1
     known, done = migrations.status(db)
     print("migrations : %d/%d applied" % (len(done), len(known)))
+    pending_switch = migrations.pending_non_additive_from(known, done)
+    if pending_switch:
+        _print_pending_non_additive(pending_switch)
+    # #5692 : la base secondaire de l'hôte (`config-ancienne-base.json`) n'était
+    # sondée par aucun doctor. Elle l'est ici, en lecture seule, pour que le
+    # signal existe avant le staging et pas seulement pendant `controler`.
+    # Une base injoignable est dite, sans changer le verdict : ce n'est pas la
+    # base du mesh.
+    for label, path in config_mod.secondary_configs(cfg):
+        other_db = None
+        try:
+            other = config_mod.load_file(path)
+            other_db = db_mod.connect(other, writer=False)
+            db_mod.require_schema(other_db)
+            other_known, other_done = migrations.status(other_db)
+        except (Exception, SystemExit) as exc:  # une lecture ne casse pas le doctor
+            print("migrations : %s: not checked (%s)"
+                  % (label, " ".join(str(exc).split())[:120]))
+            continue
+        finally:
+            if other_db is not None:
+                other_db.close()
+        print("migrations : %s: %d/%d applied"
+              % (label, len(other_done), len(other_known)))
+        other_pending = migrations.pending_non_additive_from(other_known, other_done)
+        if other_pending:
+            _print_pending_non_additive(other_pending, base=label)
     agents = storage.of(db).agents.count()
     unread = storage.of(db).mailbox.unread_total()
     print("agents     : %d" % agents)

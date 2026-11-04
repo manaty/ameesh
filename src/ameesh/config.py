@@ -1007,7 +1007,7 @@ def audit_profiles(extra=(), directory: str | None = None,
                         warnings=tuple(warnings))
 
 
-def load(env: dict | None = None) -> Config:
+def load(env: dict | None = None, *, register_credentials: bool = True) -> Config:
     env = dict(os.environ if env is None else env)
     cfg = Config()
     # #1127 : une variable explicite nomme un fichier qui doit exister. Un
@@ -1385,10 +1385,63 @@ def load(env: dict | None = None) -> Config:
     # profil réellement lu et sa base.
     cfg = replace(cfg, config_path=cfg_path, config_base=base_path,
                   config_shadowed=shadowed)
-    from .platform import child_environment
-    child_environment.declare_accounts(cfg.accounts)
-    child_environment.notify_credentials(cfg.notify)
+    # #5692 : la lecture d'une AUTRE base (alerte, doctor) ne déclare pas ses
+    # comptes et canaux dans l'environnement de ce processus — seuls ceux de
+    # la base réellement servie comptent pour les enfants des tours.
+    if register_credentials:
+        from .platform import child_environment
+        child_environment.declare_accounts(cfg.accounts)
+        child_environment.notify_credentials(cfg.notify)
     return cfg
+
+
+#: #5692 : configurations d'AUTRES bases rangées à côté de `config.json`.
+#: Le nom est celui que `deploy/mise-a-jour/{poste,basculer-mesh}.sh` lisent
+#: depuis toujours (`CONFIG_RESTE`) ; un profil de `runner-profiles/`, un
+#: `config.json.*` de sauvegarde ou le fichier courant ne sont jamais une
+#: base secondaire (le suffixe `.json` et le dossier comptent).
+SECONDARY_CONFIG_NAMES = ("config-ancienne-base.json",)
+
+
+def secondary_configs(cfg: Config) -> list[tuple[str, str]]:
+    """#5692 : les autres bases configurées de l'hôte, en lecture seule.
+
+    Rend `[(libellé, chemin)]` ; le libellé est le nom du fichier (il nomme la
+    base dans une alerte ou un doctor, sans exposer un DSN). Un profil
+    d'exécuteur ou une sauvegarde de `config.json` n'est pas une base : seule
+    une configuration rangée à côté du fichier lu, sous un nom connu, compte.
+    Absente, la liste est vide. Un chemin identique au fichier lu est écarté."""
+    if not cfg.config_path:
+        return []
+    directory = os.path.dirname(os.path.abspath(_expand(cfg.config_path)))
+    current = os.path.abspath(_expand(cfg.config_path))
+    out = []
+    for name in SECONDARY_CONFIG_NAMES:
+        path = os.path.abspath(os.path.join(directory, name))
+        if path == current or not os.path.isfile(path):
+            continue
+        out.append((name, path))
+    return out
+
+
+def load_file(path: str, env: dict | None = None) -> Config:
+    """#5692 : charge une configuration de base secondaire, isolée de ce
+    processus.
+
+    Le DSN, le schéma et l'alias de base de l'environnement de l'appelant sont
+    retirés : sinon `AMEESH_DSN` (une session `ameesh attach`, un banc)
+    remplacerait la base du fichier et l'alerte porterait sur la mauvaise.
+    Le fichier reste autonome, comme dans `load` : hors du dossier des profils,
+    il n'hérite de rien."""
+    env = dict(os.environ if env is None else env)
+    for name in ("AMEESH_DSN", "AGENT_MESH_DSN",
+                 "AMEESH_DATABASE_URL", "AGENT_MESH_DATABASE_URL",
+                 "AMEESH_SCHEMA", "AGENT_MESH_SCHEMA",
+                 "AMEESH_BACKEND", "AGENT_MESH_BACKEND",
+                 "AMEESH_EXEC_URL", "AMEESH_EXEC_TOKEN_FILE"):
+        env.pop(name, None)
+    env["AMEESH_CONFIG"] = path
+    return load(env=env, register_credentials=False)
 
 
 def fresh_radar(cfg: Config) -> Config:

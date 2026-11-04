@@ -244,6 +244,10 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #5503 : des réservations gardées s'accumulent, ou bloquent
                  # l'enveloppe d'un compte de facturation
                  "reservations_kept_burst", "account_cap_kept",
+                 # #5692 : une migration non additive attend, sur la base du
+                 # mesh ou sur une autre base configurée de l'hôte
+                 "migration_pending_non_additive",
+                 "host_migration_pending_non_additive",
                  # #532: a local PgBouncer pool queues its mesh clients
                  "pgbouncer_pool_waiting")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack", "app", "nexlink")
@@ -290,6 +294,9 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
     "mesh_backup_unseen": "mesh database backup not seen",
+    "migration_pending_non_additive": "non-additive migration waiting",
+    "host_migration_pending_non_additive": (
+        "non-additive migration waiting on a host base"),
     "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
     "pgbouncer_console_unreadable": "local PgBouncer console unreadable",
     "stopped_with_mail": "agent stopped with mail",
@@ -451,7 +458,11 @@ QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
 #: base ne les résout jamais, et ne les cache pas non plus. #1179 : la passe
 #: ordinaire ne lit pas cette console (`local_pool=False`) et ne résout donc
 #: jamais ces types ; `run_local_pass` en est seul propriétaire.
-LOCAL_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_console_unreadable")
+#: #5692 : la base secondaire d'un hôte n'est lisible que sur cet hôte ; son
+#: alerte est locale comme la console du pool (#532), jamais résolue par la
+#: passe ordinaire d'un autre hôte qui ne voit pas ce fichier.
+LOCAL_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_console_unreadable",
+               "host_migration_pending_non_additive")
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -2731,7 +2742,7 @@ class Notifier:
         return records
 
     def run_local_pass(self, now: float | None = None) -> list:
-        """Un passage sans la base du mesh : la console du pool local (#532).
+        """Un passage sans la base du mesh : les sources locales de l'hôte.
 
         Le notifieur atteint la base à travers ce même pool : quand
         `max_client_conn` refuse tout le monde, sa connexion ordinaire échoue
@@ -2740,22 +2751,36 @@ class Notifier:
         `LOCAL_TYPES` — sans connexion ni lecture préalable de la base. Les
         autres livraisons en cours sont laissées telles quelles : une alerte
         non observée n'est jamais résolue. Une console illisible est
-        journalisée et ne change rien."""
+        journalisée et ne change rien.
+
+        #5692 : les autres bases configurées de l'hôte
+        (`config-ancienne-base.json`, `migration_alerts.local`) se lisent aussi
+        ici : elles ne sont visibles que de cet hôte, et leur alerte est locale
+        (`LOCAL_TYPES`). Une base secondaire illisible garde ses alertes, comme
+        une console illisible."""
         now = float(self.clock() if now is None else now)
         records: list = []
         self._records = records
-        from . import pgbouncer_local
+        from . import migration_alerts, pgbouncer_local
+        incomplete = False
         try:
             current = pgbouncer_local.probe(self.cfg)
         except db_mod.Unavailable as exc:
             self.log("local pool console unreadable (%s): active local alerts kept"
                      % exc)
-            return records
+            current = []
+            incomplete = True
+        migration_current, migration_errors = migration_alerts.local(self.cfg)
+        for error in migration_errors:
+            self.log("configured secondary base unreadable (%s): its local alerts kept"
+                     % error)
+        incomplete = incomplete or bool(migration_errors)
+        current += migration_current
         router = Router(self.cfg, None, self.ncfg)
         wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
         active = self.state["active"]
         for key, alert in wanted.items():
-            # Une console qui represse la même clé annule le tombstone de
+            # Une source qui represse la même clé annule le tombstone de
             # résolution en attente de fusion (#3576, relecture dev4).
             self.local_resolved_keys.discard(key)
             entry = active.get(key)
@@ -2770,7 +2795,8 @@ class Notifier:
                 self._raise(entry, router, now)
             else:
                 self._retry(entry, "raised", now)
-        self._local_resolutions(wanted, now)
+        if not incomplete:
+            self._local_resolutions(wanted, now)
         self._prune_notified(now)
         return records
 

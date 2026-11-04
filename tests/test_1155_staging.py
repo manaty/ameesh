@@ -91,6 +91,18 @@ if grep -qx "ko=$host:$action" "$state/scenario" 2>/dev/null; then
   echo "echec injecte : $host $action" >&2
   exit 1
 fi
+# #5692 : preflight des migrations du poste. Une base secondaire bloquee le
+# rend reportable (4) ; la base du mesh bloquee arrete la sequence (3).
+if [ "$host" = pc-smichea ] && [ "$action" = prevol ]; then
+  if grep -qx 'defer=pc-smichea:prevol' "$state/scenario" 2>/dev/null; then
+    echo "poste : migrations non additives en attente sur l'ancienne base : poste reportable d'emblee, mise a jour a son retour" >&2
+    exit 4
+  fi
+  if grep -qx 'refuse=pc-smichea:prevol' "$state/scenario" 2>/dev/null; then
+    echo "poste : migrations non additives en attente sur la base du mesh : staging refuse avant toute sauvegarde" >&2
+    exit 3
+  fi
+fi
 exit 0
 '''
 
@@ -182,8 +194,12 @@ case "$*" in
     fi
     exit 0 ;;
   *"bash -s -- "*)
-    cat >/dev/null || true
-    if grep -qx "ko=migration" "$FAKE_STATE/scenario" 2>/dev/null; then
+    # #5692 : le preflight (dry-run seul) et l'application (seconde ligne
+    # `migrate --additive-only`) partagent ce canal ; une panne injectee vise
+    # l'application, pas le dry-run.
+    script=$(cat)
+    if printf '%s\n' "$script" | grep -q -- '-m ameesh migrate --additive-only$' \
+       && grep -qx "ko=migration" "$FAKE_STATE/scenario" 2>/dev/null; then
       grep -vx "ko=migration" "$FAKE_STATE/scenario" > "$FAKE_STATE/scenario.tmp" || true
       mv "$FAKE_STATE/scenario.tmp" "$FAKE_STATE/scenario"
       echo "migration injectee KO" >&2
@@ -655,6 +671,9 @@ class StagingTest(unittest.TestCase):
             ('ameesh-agents-3', 'verifier'),
             ('manaty-mesh-1', 'verifier'),
             ('pc-smichea', 'verifier'),
+            # #5692 : dry-run des migrations sur chaque base du poste, avant
+            # la sauvegarde (lecture seule).
+            ('pc-smichea', 'prevol'),
             ('pc-smichea', 'sauvegarder'),
             ('pc-smichea', 'migrer'),
             ('ameesh-agents-1', 'installer'),
@@ -857,6 +876,60 @@ class StagingTest(unittest.TestCase):
                           if line.startswith('venv-python ')
                           and 'staging_watch' not in line])
 
+    def test_secondary_base_non_additive_defers_the_poste_before_backup(self):
+        """#5692 : une base secondaire bloquee ne fait pas echouer le staging
+        apres 38 min de sauvegarde — le preflight reporte le poste d'emblee et
+        les quatre VM passent, migrations depuis une VM."""
+        (self.state / 'scenario').write_text('defer=pc-smichea:prevol\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        actions = self.actions()
+        self.assertIn(('pc-smichea', 'verifier'), actions)
+        self.assertIn(('pc-smichea', 'prevol'), actions)
+        self.assertNotIn(('pc-smichea', 'sauvegarder'), actions)
+        self.assertNotIn(('pc-smichea', 'migrer'), actions)
+        self.assertNotIn(('pc-smichea', 'installer'), actions)
+        self.assertIn('pc-smichea : absent (reporte)', p.stdout)
+        self.assertIn("reporte d'emblee", p.stdout)
+        # Le dump du serveur remplace celui du poste, avant les migrations.
+        sauvegardes = [i for i, ligne in enumerate(self.calls())
+                       if ligne.startswith('sauvegarde-serveur ')]
+        self.assertEqual(len(sauvegardes), 1, self.calls())
+        migrations = [i for i, ligne in enumerate(self.calls())
+                      if ligne.startswith('stub ') and 'bash -s -- %s' % self.sha in ligne]
+        self.assertEqual(len(migrations), 2, self.calls())
+        self.assertLess(migrations[0], sauvegardes[0])
+        self.assertLess(sauvegardes[0], migrations[1])
+        trace = next(t for t in self.traces()
+                     if t['hote'] == 'pc-smichea' and t['etape'] == 'absent')
+        self.assertEqual(trace['verdict'], 'reporte')
+        self.assertIn("reporte d'emblee", trace['detail'])
+        ligne = self.actif_args()
+        self.assertNotIn('--hote pc-smichea=', ligne)
+        self.assertIn('--absent pc-smichea=', ligne)
+        self.assertEqual([a for a in actions if a[1] == 'installer'],
+                         [('ameesh-agents-1', 'installer'),
+                          ('ameesh-agents-2', 'installer'),
+                          ('ameesh-agents-3', 'installer'),
+                          ('manaty-mesh-1', 'installer')])
+
+    def test_mesh_base_non_additive_stops_staging_before_backup(self):
+        """#5692 : la base du mesh bloquee arrete le staging au preflight, avant
+        toute sauvegarde et toute migration."""
+        (self.state / 'scenario').write_text('refuse=pc-smichea:prevol\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn('refusees avant sauvegarde', p.stderr)
+        actions = self.actions()
+        self.assertIn(('pc-smichea', 'prevol'), actions)
+        self.assertNotIn(('pc-smichea', 'sauvegarder'), actions)
+        self.assertNotIn(('pc-smichea', 'migrer'), actions)
+        self.assertFalse([a for a in actions if a[1] == 'installer'], actions)
+        self.assertFalse([l for l in self.calls()
+                          if l.startswith('stub ') and 'bash -s -- ' in l], self.calls())
+        self.assertFalse([l for l in self.calls()
+                          if l.startswith('sauvegarde-serveur ')], self.calls())
+
     def test_migrations_failure_installs_nothing(self):
         (self.state / 'scenario').write_text('ko=pc-smichea:migrer\n')
         p = self.run_staging()
@@ -984,7 +1057,8 @@ class StagingTest(unittest.TestCase):
         self.assertEqual(len(sondes), 1, self.calls())
         migrations = [i for i, ligne in enumerate(self.calls())
                       if ligne.startswith('stub ') and 'bash -s -- %s' % self.sha in ligne]
-        self.assertEqual(len(migrations), 1, self.calls())
+        # #5692 : dry-run du preflight, puis application.
+        self.assertEqual(len(migrations), 2, self.calls())
         self.assertLess(sondes[0], migrations[0])
         self.assertNotIn('actif.py', ' '.join(self.calls()))
 
@@ -1060,12 +1134,16 @@ class StagingTest(unittest.TestCase):
         self.assertNotIn(('pc-smichea', 'migrer'), actions)
         migrations = [i for i, ligne in enumerate(self.calls())
                       if ligne.startswith('stub ') and 'bash -s -- %s' % self.sha in ligne]
-        self.assertEqual(len(migrations), 1, self.calls())
-        self.assertIn('root@10.77.0.4', self.calls()[migrations[0]])
+        # #5692 : le dry-run du preflight precede la sauvegarde ; l'application
+        # la suit.
+        self.assertEqual(len(migrations), 2, self.calls())
+        for indice in migrations:
+            self.assertIn('root@10.77.0.4', self.calls()[indice])
         premier_install = next(i for i, ligne in enumerate(self.calls())
                                if 'action=installer' in ligne)
-        self.assertLess(sauvegardes[0], migrations[0])
-        self.assertLess(migrations[0], premier_install)
+        self.assertLess(migrations[0], sauvegardes[0])
+        self.assertLess(sauvegardes[0], migrations[1])
+        self.assertLess(migrations[1], premier_install)
         trace_migration = next(t for t in self.traces() if t['etape'] == 'migrations')
         self.assertEqual(trace_migration['hote'], 'ameesh-agents-2')
         self.assertEqual(trace_migration['verdict'], 'ok')
@@ -1098,7 +1176,8 @@ class StagingTest(unittest.TestCase):
                           ('ameesh-agents-3', 'installer')])
         migrations = [i for i, ligne in enumerate(self.calls())
                       if ligne.startswith('stub ') and 'bash -s -- %s' % self.sha in ligne]
-        self.assertEqual(len(migrations), 1, self.calls())
+        # #5692 : dry-run du preflight puis application.
+        self.assertEqual(len(migrations), 2, self.calls())
         trace = next(t for t in self.traces()
                      if t['hote'] == 'manaty-mesh-1' and t['etape'] == 'absent')
         self.assertEqual(trace['verdict'], 'reporte')
@@ -1124,8 +1203,13 @@ class StagingTest(unittest.TestCase):
         p = self.run_vm()
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn('sauvegarde serveur en echec', p.stderr)
-        self.assertFalse([l for l in self.calls()
-                          if l.startswith('stub ') and 'bash -s -- ' in l], self.calls())
+        # #5692 : le dry-run du preflight a bien eu lieu (lecture seule), mais
+        # aucune application : une seule invocation `bash -s`, et aucune etape
+        # `migrations` ouverte.
+        self.assertEqual(len([l for l in self.calls()
+                              if l.startswith('stub ') and 'bash -s -- ' in l]), 1,
+                         self.calls())
+        self.assertNotIn('migrations', [t['etape'] for t in self.traces()])
         self.assertNotIn(('ameesh-agents-1', 'installer'), self.actions())
         trace = next(t for t in self.traces() if t['etape'] == 'sauvegarde')
         self.assertEqual((trace['hote'], trace['verdict']), ('manaty-mesh-1', 'ko'))
@@ -1477,6 +1561,74 @@ class PosteMigrerTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         self.assertTrue(any('migrate --additive-only' in l
                             for l in self.log.read_text().splitlines()))
+
+    # -- #5692 : preflight des migrations, sur chaque base configuree ---------
+    def _prevol_stub(self, mesh: int = 0, ancienne: int = 0) -> None:
+        """`$VENV/bin/python` factice : le code de sortie depend de la base
+        (l'ancienne est invoquee avec AMEESH_CONFIG)."""
+        stub = self.venv / 'python'
+        stub.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "venv %%s | config=%%s\\n" "$*" "${AMEESH_CONFIG:-}" '
+            '>> "${FAKE_LOG:?}"\n'
+            'case " $* " in\n'
+            '  *"migrate --dry-run --additive-only"*)\n'
+            '    case "${AMEESH_CONFIG:-}" in\n'
+            '      *config-ancienne-base.json*) exit %d ;;\n'
+            '      *) exit %d ;;\n'
+            '    esac ;;\n'
+            'esac\n'
+            'exit 0\n' % (ancienne, mesh))
+        stub.chmod(0o755)
+
+    def _ancienne_config(self) -> Path:
+        path = self.home / '.config/ameesh/config-ancienne-base.json'
+        path.write_text(json.dumps({'dsn': 'postgresql://u:p@127.0.0.1:1/ancienne'}))
+        return path
+
+    def test_prevol_reads_every_configured_base(self):
+        self._ancienne_config()
+        self._prevol_stub()
+        p = self.run_poste('prevol', self.premier)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        runs = [l for l in self.log.read_text().splitlines()
+                if 'migrate --dry-run --additive-only' in l]
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn('config=', runs[0])
+        self.assertIn('config.json', runs[0])
+        self.assertIn('config-ancienne-base.json', runs[1])
+
+    def test_prevol_reports_a_blocked_secondary_base(self):
+        self._ancienne_config()
+        self._prevol_stub(ancienne=3)
+        p = self.run_poste('prevol', self.premier)
+        self.assertEqual(p.returncode, 4, p.stderr + p.stdout)
+        self.assertIn('poste reportable', p.stderr)
+        self.assertIn("mise a jour a son retour", p.stderr)
+
+    def test_prevol_defers_the_poste_on_an_unreadable_secondary_base(self):
+        """#5692 : une base secondaire illisible ne retient pas les VM — le
+        poste est reportable, pas le staging entier."""
+        self._ancienne_config()
+        self._prevol_stub(ancienne=1)
+        p = self.run_poste('prevol', self.premier)
+        self.assertEqual(p.returncode, 4, p.stderr + p.stdout)
+        self.assertIn("preflight des migrations en echec sur l'ancienne base", p.stderr)
+        self.assertIn('poste reportable', p.stderr)
+
+    def test_prevol_stops_on_a_blocked_mesh_base(self):
+        self._ancienne_config()
+        self._prevol_stub(mesh=3)
+        p = self.run_poste('prevol', self.premier)
+        self.assertEqual(p.returncode, 3, p.stderr + p.stdout)
+        self.assertIn('base du mesh', p.stderr)
+        self.assertIn('staging refuse avant toute sauvegarde', p.stderr)
+
+    def test_prevol_other_failure_is_not_a_migration_verdict(self):
+        self._prevol_stub(mesh=1)
+        p = self.run_poste('prevol', self.premier)
+        self.assertEqual(p.returncode, 1, p.stderr + p.stdout)
+        self.assertIn('preflight des migrations en echec', p.stderr)
 
 
 class PaquetGitTest(unittest.TestCase):
