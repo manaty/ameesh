@@ -311,7 +311,8 @@ class NativeStorageTest(PgTestCase):
         watcher.api = api
         with mock.patch.object(ci, '_send', return_value=800):
             self.assertEqual(len(watcher._github_disk_refusals(
-                self.db, REPO, dict(run_id=42, run_attempt=1))), 1)
+                self.db, REPO, dict(run_id=42, run_attempt=1),
+                {'head_repository': {'full_name': REPO}})), 1)
         self.assertEqual(self.st.disks()[0]['free_bytes'], 1024**3)
         self.assertEqual(self.st.disks()[0]['sampled_ts'], NOW - 10)
         self.assertEqual([a['type'] for a in ci_disk.findings(
@@ -349,3 +350,63 @@ class NativeStorageTest(PgTestCase):
             self.assertEqual(len(out), 1)
             self.assertEqual(self.watcher()._disk_refusal_messages(self.db, REPO), [])
             send.assert_called_once()
+
+    def test_fork_run_raises_without_urgency_nor_mail(self):
+        """#5755 : un run de fork lève l'alerte, sans urgence ni courrier."""
+        self.st.expect_disk(REPO, host=HOST, volume='/')
+        notices = [{'title': 'ameesh-ci-disk-refusal/1', 'message': json.dumps(refusal())},
+                   {'title': ci_disk.SCHEMA, 'message': json.dumps(snapshot())}]
+        def api(path):
+            if '/jobs?' in path:
+                return {'jobs': [dict(id=7, status='completed', conclusion='failure',
+                    completed_at='2026-11-03T10:00:00Z', check_run_url=
+                    'https://api.github.com/repos/acme/widget/check-runs/70')]}
+            return notices
+        watcher = self.watcher()
+        watcher.api = api
+        with mock.patch.object(ci, '_send', return_value=800) as send:
+            self.assertEqual(watcher._github_disk_refusals(
+                self.db, REPO, dict(run_id=42, run_attempt=1),
+                {'head_repository': {'full_name': 'mallory/widget'}}), [])
+            self.assertEqual(self.watcher()._disk_refusal_messages(self.db, REPO), [])
+            send.assert_not_called()
+        signals = self.st.disk_signals()
+        self.assertEqual(len(signals), 2)
+        self.assertTrue(all(s['fork'] for s in signals))
+        finding, = ci_disk.findings(self.st.disks(), [], NOW, signals)
+        self.assertEqual((finding['type'], finding['critical'], finding['urgent']),
+                         ('ci_disk_low', True, False))
+        # Un refus du dépôt lui-même, sur le même hôte, garde l'urgence et le courrier.
+        ci_disk.observe_refusal(REPO, HOST, refusal(id='b' * 32), self.st, now=NOW)
+        finding, = ci_disk.findings(self.st.disks(), [], NOW, self.st.disk_signals())
+        self.assertTrue(finding['urgent'])
+        with mock.patch.object(ci, '_send', return_value=801) as send:
+            self.assertEqual(len(self.watcher()._disk_refusal_messages(self.db, REPO)), 1)
+        self.assertEqual(send.call_args.kwargs['payload']['ci_disk_refusal']['count'], 1)
+
+    def test_unknown_origin_is_moderated_and_looked_up_once(self):
+        self.st.expect_disk(REPO, host=HOST, volume='/')
+        notices = [{'title': 'ameesh-ci-disk-refusal/1', 'message': json.dumps(refusal())},
+                   {'title': 'ameesh-ci-disk-refusal/1', 'message': json.dumps(refusal(id='b' * 32))}]
+        calls = []
+        def api(path):
+            calls.append(path)
+            if path == 'repos/%s/actions/runs/42' % REPO:
+                return {}
+            if '/jobs?' in path:
+                return {'jobs': [dict(id=7, status='completed', check_run_url=
+                    'https://api.github.com/repos/acme/widget/check-runs/70')]}
+            return notices
+        watcher = self.watcher()
+        watcher.api = api
+        with mock.patch.object(ci, '_send') as send:
+            watcher._github_disk_refusals(self.db, REPO, dict(run_id=42, run_attempt=1))
+            send.assert_not_called()
+        self.assertEqual(calls.count('repos/%s/actions/runs/42' % REPO), 1)
+        self.assertEqual(len(self.st.disk_signals()), 2)
+
+    def test_same_repository(self):
+        self.assertTrue(ci.same_repository({'head_repository': {'full_name': 'ACME/Widget'}}, REPO))
+        for run in ({}, {'head_repository': None}, {'head_repository': {'full_name': 7}},
+                    {'head_repository': {'full_name': 'mallory/widget'}}, [], None):
+            self.assertFalse(ci.same_repository(run, REPO))
