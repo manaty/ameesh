@@ -27,7 +27,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-import yaml
+from ameesh import canon
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 WORKFLOW = REPO / ".github" / "workflows" / "tests.yml"
@@ -459,15 +459,19 @@ class WorkflowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.text = WORKFLOW.read_text(encoding="utf-8")
-        cls.jobs = yaml.safe_load(cls.text)["jobs"]
+        cls.jobs = canon.load_yaml(cls.text)["jobs"]
 
     def test_qualification_tourne_sur_tous_les_evenements(self):
         # actions/runner#491 : un job sauté fait sauter **transitivement** les
         # jobs aval de `plan` sans fonction de statut. La qualification n'a
-        # donc aucune porte d'événement : son script rend `ordinary_event`
-        # hors push de main, sans lecture git ni API.
+        # donc aucune porte d'**événement** ; seule la garde commune à tous
+        # les jobs de tests.yml, l'étiquette `ci-macos` (#3198), l'éteint. Son
+        # script rend `ordinary_event` hors push de main, sans lecture git ni
+        # API.
         job = self.jobs["qualification"]
-        self.assertNotIn("if", job)
+        self.assertEqual(job["if"],
+                         "${{ github.event.label.name != 'ci-macos' }}")
+        self.assertNotIn("github.event_name", job["if"])
         self.assertEqual(job["timeout-minutes"], 5)
         self.assertEqual(job["permissions"]["checks"], "read")
         self.assertEqual(job["permissions"]["actions"], "read")
