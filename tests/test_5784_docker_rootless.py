@@ -49,9 +49,13 @@ STUBS = {
         else exec /usr/bin/sha256sum "$@"; fi""",
     # Pas de root dans l'essai : -o/-g retirés, le reste à install(1).
     "install": """
+        for x in "$@"; do [[ $x == "$HOME_U"* ]] && { echo "install root dans le home : $x" >&2; exit 99; }; done
         a=(); while (( $# )); do case $1 in -o|-g) shift 2 ;; *) a+=("$1"); shift ;; esac; done
         exec /usr/bin/install "${a[@]}" """,
-    "runuser": 'echo "$DOCKER_INFO"',
+    # runuser exécute pour de vrai (même uid dans l'essai), sauf `docker info`.
+    "runuser": """
+        while [[ $1 != -- ]]; do shift; done; shift
+        if [[ $* == *"docker info"* ]]; then echo "$DOCKER_INFO"; else exec "$@"; fi""",
 }
 
 
@@ -138,6 +142,33 @@ class DockerRootlessTest(unittest.TestCase):
         self.assertEqual((self.racine / "etc/subuid").read_text(),
                          "ubuntu:100000:65536\nameesh:165536:65536\n")
         self.assertEqual(env_file.read_text(), "AMEESH_X=1\nDOCKER_HOST=%s\n" % SOCK)
+
+    def test_a_hostile_link_in_the_home_never_reaches_system_units(self):
+        # revue cx1 : ~/.config/systemd/user -> /etc/systemd/system, posé par
+        # l'utilisateur avant une reprise. Les écritures du home passent par
+        # runuser (droits de l'utilisateur) : la cible système, non inscriptible
+        # pour lui, reste intacte, et le script s'arrête.
+        system = self.racine / "etc/systemd/system"
+        system.mkdir(parents=True)
+        system.chmod(0o555)
+        self.addCleanup(system.chmod, 0o755)
+        (self.home / ".config/systemd").mkdir(parents=True)
+        (self.home / ".config/systemd/user").symlink_to(system)
+        out = self.run_script()
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(list(system.iterdir()), [])
+        self.assertEqual(stat.S_IMODE(system.stat().st_mode), 0o555)
+        self.assertIn("runuser -u ameesh -- mkdir -p %s/.config/systemd/user" % self.home,
+                      self.calls())
+        self.assertNotIn("install root dans le home", out.stderr)
+
+    def test_home_writes_run_as_the_user(self):
+        self.assertEqual(self.run_script().returncode, 0)
+        # chaque commande simulée qui touche au home passe par runuser ; les
+        # autres (install en root) s'arrêteraient sur le code 99 du bouchon.
+        for line in self.calls().splitlines():
+            if line.split(" ")[0] in STUBS and str(self.home) in line:
+                self.assertTrue(line.startswith(("getent ", "runuser -u ameesh -- ")), line)
 
     def test_a_new_range_follows_the_existing_ones(self):
         (self.racine / "etc/subuid").write_text("ubuntu:100000:65536\n")

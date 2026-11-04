@@ -104,9 +104,13 @@ fi
 
 # --- unité utilisateur et DOCKER_HOST ------------------------------------------------
 loginctl enable-linger "$U"
+# Le home appartient à l'utilisateur : toute écriture y est faite avec ses seuls
+# droits (revue cx1 #5784). En root, un lien qu'il aurait posé (par exemple
+# ~/.config/systemd/user vers /etc/systemd/system) serait suivi.
+en_u() { runuser -u "$U" -- "$@"; }
 pose() {  # pose <chemin> : stdin vers un fichier de l'utilisateur, 0644
-  install -d -o "$U" -g "$U" "$(dirname "$1")"
-  install -m 0644 -o "$U" -g "$U" /dev/stdin "$1"
+  en_u mkdir -p "$(dirname "$1")"
+  en_u sh -c 'cat > "$1" && chmod 0644 "$1"' sh "$1"
 }
 pose "$HOME_U/.config/systemd/user/docker.service" <<'UNIT'
 # Posée par deploy/serveur/docker-rootless.sh (#5784).
@@ -139,12 +143,8 @@ pose "$HOME_U/.config/environment.d/50-docker.conf" <<CONF
 DOCKER_HOST=$SOCK
 CONF
 ENV_AMEESH=$HOME_U/.config/ameesh/env
-if [[ -f $ENV_AMEESH ]]; then
-  grep -qx "DOCKER_HOST=$SOCK" "$ENV_AMEESH" || {
-    sed -i '/^DOCKER_HOST=/d' "$ENV_AMEESH"
-    echo "DOCKER_HOST=$SOCK" >> "$ENV_AMEESH"
-  }
-fi
+en_u sh -c '[ ! -f "$1" ] || grep -qx "DOCKER_HOST=$2" "$1" || {
+  sed -i "/^DOCKER_HOST=/d" "$1" && echo "DOCKER_HOST=$2" >> "$1"; }' sh "$ENV_AMEESH" "$SOCK"
 # Les exécuteurs du serveur sont des unités SYSTÈME (User=) : environment.d ne
 # les atteint pas.
 install -d "$RACINE/etc/systemd/system/ameesh-runner@.service.d"
