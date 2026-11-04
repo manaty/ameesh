@@ -33,7 +33,8 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
 2. **Composition, au moins une fois par heure.** Cible libre et aucun porteur
    horaire créé dans l'heure locale (fuseau du canon compilé) dont la fusion
    ne soit pas vue (#4171 : un porteur fusionné libère le créneau, un porteur
-   clos sans fusion le garde) : la liste calculée est lue
+   abandonné ou remplacé sans CI active le libère aussi, #5786) : la liste
+   calculée est lue
    (`paquet-candidats.py` depuis un worktree à la tête exacte de la cible) ;
    sans lot prêt, rien n'est créé. Sinon le lot porteur « Paquet horaire
    h-AAAAMMJJ-NN » est créé et `paquet-auto.py` compose, pousse et gèle.
@@ -580,18 +581,32 @@ def freeze_foreign(item: dict, since: float) -> bool:
 
 
 def slot_served(rows: list[dict], now: float, zone: ZoneInfo, project: str,
-                target: str) -> bool:
+                target: str, ctx: Context | None = None) -> bool:
     """Un porteur horaire créé dans l'heure locale courante consomme-t-il le créneau ?
 
-    #4171 (décision #154026 a) : un porteur dont la fusion est vue ne le
-    consomme plus, le suivant se compose au tic suivant ; un porteur clos sans
-    fusion (abandonné, rien composé) le garde, pour ne pas recomposer à
-    chaque tic. L'heure reste le rythme minimum.
+    Une fusion vue libère le créneau (#4171). Avec le contexte du tic,
+    un abandon/remplacement explicite le libère aussi si la CI est arrêtée
+    (#5786). Sans contexte, cette dernière preuve manque : on reste prudent.
     """
     start = hour_start(now, zone)
     return any(is_hourly(row) and is_carrier(row, project, target)
                and float(row.get("created_ts") or 0) >= start
-               and not merged_seen(row) for row in rows)
+               and not merged_seen(row)
+               and not (ctx is not None and released_carrier(ctx, row))
+               for row in rows)
+
+
+def released_carrier(ctx: Context, row: dict) -> bool:
+    """#5786 : abandon explicite sans CI active, même sur une ancienne tête.
+
+    Une lecture de CI impossible remonte l'erreur sans autoriser de paquet.
+    """
+    if row.get("state") != "closed" or row.get("close_reason") not in (
+            "abandoned", "superseded"):
+        return False
+    return not any(run.get("status") in (
+        None, "running", "queued", "pending", "in_progress", "waiting", "requested")
+        for run in ci_status(ctx, int(row["id"])).get("runs") or [])
 
 
 def next_name(ctx: Context) -> str:
@@ -603,6 +618,11 @@ def next_name(ctx: Context) -> str:
         raise HoraireError("ls-remote : %s" % auto._tail(result.text, 5))
     numbers = [int(found) for found in re.findall(
         r"paquet-h-%s-(\d+)\s*$" % day, result.stdout, re.MULTILINE)]
+    # Les branches abandonnées peuvent déjà avoir été supprimées.
+    for row in recent_lots(ctx):
+        match = HOURLY_RE.match(str(row.get("title") or ""))
+        if match and match.group(2) == day:
+            numbers.append(int(match.group(3)))
     return "h-%s-%02d" % (day, (max(numbers) + 1) if numbers else 1)
 
 
@@ -1020,7 +1040,7 @@ def _create_carrier(ctx: Context, name: str, group: list[int], *,
 
 
 def compose(ctx: Context, rows: list[dict]) -> str:
-    if slot_served(rows, ctx.now, ctx.zone, ctx.project, ctx.target):
+    if slot_served(rows, ctx.now, ctx.zone, ctx.project, ctx.target, ctx):
         return "porteur horaire déjà créé dans l'heure, non fusionné : rien à faire"
     ready = ready_lots(ctx)
     if not ready:
