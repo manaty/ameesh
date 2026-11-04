@@ -23,4 +23,4 @@ jobs:
     steps:
       # Script installé : aucun checkout à écrire sur un disque saturé.
       - name: mesure structurée (#5630)
-        run: /usr/local/lib/ameesh-ci/ci-disque.py publication --host '${{ matrix.host }}'
+        run: /usr/bin/python3 -I /usr/local/lib/ameesh-ci/ci-disque.py publication --host '${{ matrix.host }}'
