@@ -6,7 +6,8 @@ from .. import interface
 
 _COLUMNS = ("agent, every_s, host, enabled_by,"
             " extract(epoch from enabled_at)::float8 as enabled_ts,"
-            " extract(epoch from last_sent_at)::float8 as last_sent_ts")
+            " extract(epoch from last_sent_at)::float8 as last_sent_ts,"
+            " last_reading")
 
 
 class Watches(interface.Watches):
@@ -35,7 +36,7 @@ class Watches(interface.Watches):
         return self.db.query(
             "select " + _COLUMNS + " from agent_watches where agent = %s", (agent,))
 
-    def deliver(self, agent, host, send) -> dict | None:
+    def deliver(self, agent, host, send, *, reading=None) -> dict | None:
         with self.db.transaction() as tx:
             rows = tx.query("select " + _COLUMNS + " from agent_watches where agent = %s"
                             " for update", (agent,))
@@ -44,8 +45,15 @@ class Watches(interface.Watches):
             row = dict(rows[0], sent=False)
             if row["host"] != host:
                 return row
-            send(tx)
-            tx.execute("update agent_watches set last_sent_at = now() where agent = %s",
-                       (agent,))
-            row["sent"] = True
+            if send is not None:
+                send(tx)
+                tx.execute("update agent_watches set last_sent_at = now() where agent = %s",
+                           (agent,))
+                row["sent"] = True
+            if reading is not None:
+                # #5698 : the fingerprint travels with the message, or alone
+                # when the firing only records a reading (no wake).
+                tx.execute("update agent_watches set last_reading = %s where agent = %s",
+                           (reading, agent))
+                row["last_reading"] = reading
             return row
