@@ -220,6 +220,13 @@ elif sys.argv[1] == 'show':
             row['lease_owner'] = 'runner-dev8@other-host'
         if scenario == 'bail-perdu' and name == 'dev8':
             row['lease_epoch'] = 7
+        if scenario == 'bail-retard':
+            # #5734 : le bail ne revient qu'à la seconde lecture après le
+            # redémarrage — de quoi prouver la relance bornée d'attendre_bail.
+            marque = state / ('bail-retard-' + name)
+            if not marque.exists():
+                marque.touch()
+                row['lease_epoch'] = 7
     if scenario == 'busy-once' and name == 'dev9' and not (state / 'busy-seen').exists():
         (state / 'busy-seen').touch(); row['status'] = 'running'
     print(json.dumps(row))
@@ -500,12 +507,15 @@ print(time.time() + (60 if scenario == 'db-ahead' else 0))
 #: #2152 : plus aucune attente de créneau « idle » (DRAIN_ATTENTE est un
 #: interrupteur) ; les attentes de bail (5 s) restent instantanées. #2184/R3 :
 #: l'attente de l'échéance d'une pose incertaine avance l'horloge du banc.
+#: #5734 : elle avance de la durée DEMANDÉE (15 s) et rend la main en 0,05 s ;
+#: l'échéance locale d'un drain incertain (50 s) se franchit en quatre pas
+#: au lieu d'attendre 50 s réelles sous la charge du runner.
 SLEEP = ('#!/bin/sh\n'
          'if [ "$1" = 15 ]; then\n'
          '  if [ -n "${HORLOGE_FICHIER:-}" ]; then\n'
-         '    echo "$(( $(cat "$HORLOGE_FICHIER") + 2 ))" > "$HORLOGE_FICHIER"\n'
+         '    echo "$(( $(cat "$HORLOGE_FICHIER") + 15 ))" > "$HORLOGE_FICHIER"\n'
          '  fi\n'
-         '  exec %s 0.5\n'
+         '  exec %s 0.05\n'
          'fi\n'
          'exit 0\n') % (shutil.which('sleep') or '/bin/sleep')
 
@@ -530,6 +540,9 @@ class AgentHostTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.state = self.root / 'state'; self.state.mkdir()
         (self.state / 'runner.env').write_text('AMEESH_DSN=test-runner-dsn\nAMEESH_SCHEMA=test_runner_schema\n')
+        # #5734 : horloge du drain injectée pour tous les cas ; le faux `sleep`
+        # l'avance de la durée demandée, aucune attente ne suit le temps réel.
+        (self.state / 'horloge').write_text('0')
         (self.state / 'expected-env.json').write_text(json.dumps(dict(AMEESH_DSN='test-runner-dsn', AMEESH_SCHEMA='test_runner_schema')))
         self.bin = self.root / 'bin'; self.bin.mkdir()
         (self.bin / 'python3').symlink_to(sys.executable)
@@ -561,6 +574,7 @@ class AgentHostTest(unittest.TestCase):
                         FAKE_STATE=str(self.state), FAKE_AMEESH=str(self.bin / 'ameesh'),
                         FAKE_DB_PYTHON=str(self.bin / 'db-python'),
                         FAKE_SHARE=str(self.share),
+                        HORLOGE_FICHIER=str(self.state / 'horloge'),
                         PATH=str(self.bin) + os.pathsep + os.environ['PATH'])
         # #3604 : sous mesure, chaque faux exécutable de la VM (ssh, ameesh,
         # systemctl…) démarrait sa propre couverture ; test_503 pesait ~62 s
@@ -570,6 +584,13 @@ class AgentHostTest(unittest.TestCase):
         # que test_1252 dans 240a58a7.
         for variable in ('CARTE_MESURE', 'COVERAGE_PROCESS_START'):
             self.env.pop(variable, None)
+        # #5734 : la fenêtre de reprise du bail (24 × 5 s en production) est
+        # ramenée à un essai borné. Le faux hôte répond de façon déterministe :
+        # une lecture suffit à conclure l'échec, et 24 lectures réelles ne
+        # prouvaient rien de plus. Les deux témoins de la relance
+        # (test_restart_retries_a_lease_taken_back_on_the_next_read et
+        # test_restart_stops_at_the_bail_window) remontent la fenêtre à deux.
+        self.env.update(BAIL_ESSAIS='1', BAIL_ECART='0')
         self.agents = [dict(name=n, host=h, mode=m, status=s) for n,h,m,s in [
             ('dev9', 'host-agents', 'execute', 'idle'),
             ('dev8', 'host-agents', 'execute', 'idle'),
@@ -1396,6 +1417,29 @@ class AgentHostTest(unittest.TestCase):
                 self.assertNotIn('dev8 : redémarré', p.stdout)
                 self.assertIn('2 agent(s) sans bail repris : dev8 dev9', p.stdout)
 
+    def test_restart_retries_a_lease_taken_back_on_the_next_read(self):
+        """#5734 : la fenêtre de reprise du bail est relue ; un bail qui revient
+        à la seconde lecture est une reprise normale, pas un échec.
+
+        La fenêtre de production (24 essais) est ramenée à deux essais ici :
+        la première lecture après le redémarrage rend l'ancienne époque, la
+        seconde la nouvelle. Le banc ne paie plus 24 lectures réelles pour
+        conclure, mais la relance reste prouvée."""
+        self.env.update(BAIL_ESSAIS='2', BAIL_ECART='0')
+        p = self.run_vm(scenario='bail-retard', agents=[self.agents[0]])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue((self.state / 'bail-retard-dev9').exists())
+        self.assertIn('dev9 : redémarré', p.stdout)
+        self.assertNotIn('bail non repris', p.stderr)
+
+    def test_restart_stops_at_the_bail_window(self):
+        """#5734 : la borne est réelle — le même bail qui revient à la seconde
+        lecture échoue quand la fenêtre n'a qu'un essai (défaut du banc)."""
+        p = self.run_vm(scenario='bail-retard', agents=[self.agents[0]])
+        self.assertNotEqual(p.returncode, 0)
+        self.assertTrue((self.state / 'bail-retard-dev9').exists())
+        self.assertIn('bail non repris', p.stderr)
+
     def test_restart_elected_role_taken_by_other_host_is_a_warning(self):
         """#3412 : la reprise par un autre hôte candidat est l'issue normale."""
         agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
@@ -1960,6 +2004,19 @@ class SharedLeasePredicateTest(unittest.TestCase):
                     'test', str(ROOT / 'deploy/mise-a-jour/bail.sh'), str(before), str(time.time())],
                     input=json.dumps(value), capture_output=True, text=True)
                 self.assertEqual(p.returncode, expected, p.stderr)
+
+    def test_bail_window_refuses_invalid_values(self):
+        """#5734 : la fenêtre de reprise est validée à la source ; une valeur
+        nulle ou non numérique ne peut pas désarmer la preuve de bail."""
+        script = str(ROOT / 'deploy/mise-a-jour/bail.sh')
+        for variable, valeur in (('BAIL_ESSAIS', '0'), ('BAIL_ESSAIS', 'x'),
+                                 ('BAIL_ECART', '-1'), ('BAIL_ECART', 'x')):
+            with self.subTest(variable=variable, valeur=valeur):
+                p = subprocess.run(['bash', '-c', '. "$1"', 'test', script],
+                                   env=dict(os.environ, **{variable: valeur}),
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn(variable + ' invalide', p.stderr)
 
 
 if __name__ == '__main__':
