@@ -690,19 +690,25 @@ def auth_refused(error) -> bool:
     return bool(_AUTH_REFUSED_RE.search(str(error or "")))
 
 
-def alerts(db, now: float, *, orchestrators=(), after_s: float = FAILING_ALERT_S) -> list:
+def alerts(db, now: float, *, sources, orchestrators=(),
+           after_s: float = FAILING_ALERT_S) -> list:
     """#5695: ``fingerprints_source_failing``, one per source still failing.
 
     A source is failing while its state keeps a ``last_error``; it alerts
     once its last complete read (or, never read, its first failure) is older
     than ``after_s``.  The alert goes to the orchestrators of the source's
-    project: a refused token is renewed on the source side
-    (``FINGERPRINTS_READ_TOKEN`` for Nexlink), then written, 0600, on every
-    candidate host of the elected role.  Never reads the token itself.
+    project: a refused token is renewed with its source owner,
+    then written, 0600, on every candidate host of the elected role.
+    Only current declarations matching the recorded URL alert.
+    Never reads the token itself.
     """
     from .exploitation import _alert
     out = []
+    active = {decl.project: decl for decl in sources}
     for row in storage.of(db).fingerprints.failing():
+        decl = active.get(row["project"])
+        if decl is None or decl.url != row.get("url"):
+            continue
         # A source never read has no healthy moment to wait from: it alerts
         # at once (`since` unknown), a read source after `after_s`.
         since = row.get("last_read_ts")
@@ -714,13 +720,13 @@ def alerts(db, now: float, *, orchestrators=(), after_s: float = FAILING_ALERT_S
         error = str(row.get("last_error") or "")
         if auth_refused(error):
             gesture = ("the source refuses the read-only token: renew it on the source "
-                       "side (Nexlink: FINGERPRINTS_READ_TOKEN, asked of its owner, "
+                       "side with its owner ("
                        "never read from another process) and write it, 0600, to %s "
                        "(or the file named by %s) on every candidate host of the "
-                       "elected role; the pass retries every %ds"
-                       % (DEFAULT_TOKEN_FILE, TOKEN_ENV, int(AUTH_RETRY_S)))
+                       "elected role; the pass retries every %gs"
+                       % (DEFAULT_TOKEN_FILE, TOKEN_ENV, max(decl.interval, AUTH_RETRY_S)))
         else:
-            gesture = "the pass retries at its declared cadence"
+            gesture = "the pass retries at its declared cadence (%gs)" % decl.interval
         detail = ("Failure fingerprints source %s (%s) failing since %s: %s. "
                   "No new fingerprint lot can open meanwhile (canon §16). Action: %s."
                   % (project, row.get("url") or "?",
