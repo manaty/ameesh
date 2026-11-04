@@ -1035,7 +1035,7 @@ The `installer` step follows the same practice.
    only a secondary base fails, non-additive or unreadable (the workstation is
    declared deferred from the outset, its update at its return, and the VMs
    still go); 1: another failure. `ameesh doctor` warns per base,
-   `doctor --probe` is KO, and the
+   `doctor --probe --all-bases` is KO (the mono-base `--probe` stays the deployment gate), and the
    `migration_pending_non_additive` alert names the waiting migrations.
 2. `poste.sh sauvegarder`: the server backup (`ameesh-sauvegarde`) dumps the
    mesh database on the VM into its guarded local copy, then `poste.sh`

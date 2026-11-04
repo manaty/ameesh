@@ -485,7 +485,7 @@ du mesh arrête la séquence **avant** la sauvegarde ; une base secondaire du
 poste en échec (migration non additive, base ou configuration illisible) ne
 retient que lui : le poste est déclaré `absent`/`reporte` d’emblée et les
 quatre VM passent, migrations depuis une VM. `ameesh doctor`
-affiche un WARN par base (la secondaire comprise), `doctor --probe` est KO, et
+affiche un WARN par base (la secondaire comprise), `doctor --probe --all-bases` est KO (la sonde mono-base reste celle du déploiement), et
 `ameesh alerts` porte `migration_pending_non_additive` pour la base du mesh
 comme `host_migration_pending_non_additive` pour une base secondaire, avec les
 migrations et la base en clair (DSN masqué).

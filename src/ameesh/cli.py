@@ -73,7 +73,7 @@
   agent-mail statusline                          Claude Code status bar: [workspace/name] work · directory
   agent-mail migrate [--dry-run | --additive-only] [--allow-live-executors REASON]
                                                  applies the versioned migrations
-  agent-mail doctor [--notify-test | --probe | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY and the OS desktop channel (L66); host harnesses (L106)
+  agent-mail doctor [--notify-test | --probe [--all-bases] | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY and the OS desktop channel (L66); host harnesses (L106)
                                                  (--probe: lightweight container probe)
 
 Identity of a session: $AGENT_MAIL_NAME (the runner sets it for the harness
@@ -2105,15 +2105,17 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
     return 0
 
 
-def cmd_probe(cfg: Config) -> int:
+def cmd_probe(cfg: Config, *, all_bases: bool = False) -> int:
     """Sonde légère (`doctor --probe`) : base joignable, schéma présent,
     migrations à jour. Ni comptage, ni NOTIFY, ni écriture : faite pour une
     sonde de conteneur appelée toutes les quelques secondes. Une ligne, code 0
     (OK) ou 1 (KO).
 
-    #5692 : chaque base configurée est sondée (la secondaire de l'hôte
-    comprise) ; une seule en défaut rend la sonde KO, avec sa ligne. Le probe
-    n'est donc plus aveugle à `config-ancienne-base.json`."""
+    #5692 : `--all-bases` sonde aussi chaque base secondaire configurée (la
+    secondaire de l'hôte comprise) ; une seule en défaut rend la sonde KO, avec
+    sa ligne. Sans l'option, la sonde reste mono-base : `poste.sh`
+    `migrer`/`installer` l'appellent entre deux migrations, et une ancienne
+    base pas encore migrée ne doit pas faire échouer la base du mesh."""
     try:
         db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
@@ -2150,10 +2152,10 @@ def cmd_probe(cfg: Config) -> int:
              % (len(pending_na), migrations.describe_pending_non_additive(pending_na)))
             if pending_na else ""))
         return 1
-    # #5692 : la base secondaire de l'hôte, en lecture seule, avec le même
-    # verdict. Une base secondaire injoignable est un KO : le staging devra la
-    # traiter (le poste est reportable d'emblée), et le doctor complet la dit.
-    for label, path in config_mod.secondary_configs(cfg):
+    # #5692 : avec `--all-bases` seulement, chaque base secondaire de l'hôte
+    # est sondée en lecture seule avec le même verdict (le doctor complet la
+    # dit toujours, lui). Une base secondaire injoignable y est un KO.
+    for label, path in (config_mod.secondary_configs(cfg) if all_bases else ()):
         other_db = None
         try:
             other = config_mod.load_file(path)
@@ -2289,9 +2291,10 @@ def _print_pending_non_additive(pending, base: str | None = None) -> None:
 
 
 def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
-               harness: bool = False, profiles: bool = False) -> int:
+               harness: bool = False, profiles: bool = False,
+               all_bases: bool = False) -> int:
     if probe:
-        return cmd_probe(cfg)
+        return cmd_probe(cfg, all_bases=all_bases)
     if profiles:
         # #3345 : contrôle léger et sans base, pour le déploiement
         # (`deploy/mise-a-jour/{vm,poste}.sh`) : tout profil qui hérite de
@@ -2668,7 +2671,8 @@ def main(argv: list[str] | None = None) -> int:
         if command == "doctor":
             return cmd_doctor(cfg, notify_test="--notify-test" in rest,
                               probe="--probe" in rest, harness="--harness" in rest,
-                              profiles="--profiles" in rest)
+                              profiles="--profiles" in rest,
+                              all_bases="--all-bases" in rest)
         if command == "statusline":
             return cmd_statusline(cfg)
         if command == "alias":

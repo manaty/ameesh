@@ -164,12 +164,9 @@ class SecondaryBaseTest(PgTestCase):
         self.assertIn("host_migration_pending_non_additive", notify.DEFAULT_TYPES)
         self.assertIn("host_migration_pending_non_additive", notify.TYPE_LABELS)
 
-    def test_probe_is_ko_on_a_secondary_base_without_the_switch(self):
-        """#5692 (B cx3) : le probe ne s'arrête pas à la base du mesh — une
-        migration non additive manquante sur la base secondaire est un KO."""
-        # Le probe exige le schéma complet : le construire ici (migré), puis
-        # retirer 0518 du registre — les autres tests de la classe n'ont pas
-        # besoin de ce coût.
+    def _secondary_without_switch(self):
+        """Un schéma secondaire complet, migré, dont 0518 est retiré du
+        registre : la base attend une migration non additive."""
         self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % self.ancienne)
         self.db.execute('CREATE SCHEMA "%s"' % self.ancienne)
         other = self.connect(schema=self.ancienne)
@@ -178,11 +175,27 @@ class SecondaryBaseTest(PgTestCase):
             other.execute("DELETE FROM schema_migrations WHERE version = 518")
         finally:
             other.close()
-        out = self.mesh("doctor", "--probe",
+
+    def test_probe_is_ko_on_a_secondary_base_without_the_switch(self):
+        """#5692 (B cx3) : `doctor --probe --all-bases` sonde chaque base
+        configurée — une migration non additive manquante sur la secondaire
+        est un KO."""
+        self._secondary_without_switch()
+        out = self.mesh("doctor", "--probe", "--all-bases",
                         env=self.env(AMEESH_CONFIG=self.primaire))
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         self.assertIn("probe: KO — config-ancienne-base.json", out.stdout)
         self.assertIn("0518_generic_delivery_state", out.stdout)
+
+    def test_mono_base_probe_ignores_the_old_base_still_to_migrate(self):
+        """#5692 (B auditeur) : le probe de `poste.sh migrer` reste mono-base.
+        Avec une ancienne base encore en retard, la base du mesh est prête :
+        le probe doit être OK, sinon `migrer` s'arrête avant de la migrer."""
+        self._secondary_without_switch()
+        out = self.mesh("doctor", "--probe",
+                        env=self.env(AMEESH_CONFIG=self.primaire))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("probe: OK", out.stdout)
 
     def test_local_pass_raises_the_alert_for_a_secondary_base(self):
         """Le passage local du notifieur porte l'alerte de la base secondaire
