@@ -765,15 +765,19 @@ class FreshTest(unittest.TestCase):
         ph.read_pause = lambda project, target, **kw: None
         ticked = []
         def stale(ctx):
-            raise ph.HoraireError("code périmé")
+            raise ph.Stale("code périmé")
         ph.check_fresh, ph.tick = stale, lambda ctx: ticked.append(ctx) or "x"
         ph.align_schema = lambda ctx: ticked.append("schéma")
         try:
-            with mock.patch.dict(os.environ, {}, clear=False):
-                self.assertEqual(ph.main(["tick", "--repo", str(ROOT)]), 1)
+            # #5696 (B dev3) : aucune alerte réelle depuis un banc ; le code
+            # périmé sort en 3 (refus attendu), sans alerte
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                    mock.patch.object(ph, "alert_tick") as alert:
+                self.assertEqual(ph.main(["tick", "--repo", str(ROOT)]), ph.STALE_RC)
         finally:
             ph.check_fresh, ph.tick, ph.align_schema, ph.read_pause = saved
         self.assertEqual(ticked, [])
+        self.assertEqual(alert.call_count, 0)
 
 
 class SchemaTest(unittest.TestCase):

@@ -163,8 +163,27 @@ class TreeLibraryTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _sandbox(self, env: dict) -> dict:
+        """#5696 (B dev3) : le tic sorti en 1 alerte (`ameesh work fingerprint
+        open`, `agent-mail send`) ; le banc ne doit jamais joindre le vrai
+        mesh. PATH ne garde que git et des doublures qui consignent l'appel."""
+        bin_dir = self.base / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        self.called = self.base / "called.txt"
+        for name in ("ameesh", "agent-mail"):
+            stub = bin_dir / name
+            stub.write_text('#!/bin/sh\necho "%s $*" >> "%s"\nexit 1\n'
+                            % (name, self.called), encoding="utf-8")
+            stub.chmod(0o755)
+        git = shutil.which("git") or "/usr/bin/git"
+        link = bin_dir / "git"
+        if not link.exists():
+            link.symlink_to(git)
+        env["PATH"] = str(bin_dir)
+        return env
+
     def _run(self, script: str) -> str:
-        env = dict(os.environ)
+        env = self._sandbox(dict(os.environ))
         env["PYTHONPATH"] = str(self.stale)
         env["AMEESH_PYTHON"] = sys.executable
         proc = subprocess.run(
@@ -180,11 +199,13 @@ class TreeLibraryTest(unittest.TestCase):
         self.assertIn("PYTHONPATH_FIRST=%s" % (self.tree / "src"), out)
         self.assertIn("RC 1", out)  # le faux clone n'a pas d'origin : rien n'est fait
         self.assertIn("fetch main", out)
+        # l'alerte du tic est partie, mais vers les doublures seulement
+        self.assertIn("ameesh work fingerprint open", self.called.read_text(encoding="utf-8"))
         self.assertNotIn("cannot import name 'packet_pause'", out)
         self.assertNotIn("pause illisible", out)
 
     def test_a_stale_library_already_imported_is_refused_not_mixed(self):
-        env = dict(os.environ)
+        env = self._sandbox(dict(os.environ))
         env["PYTHONPATH"] = str(self.stale)
         env["AMEESH_PYTHON"] = sys.executable
         proc = subprocess.run(
