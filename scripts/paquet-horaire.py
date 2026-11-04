@@ -228,6 +228,11 @@ COMMAND_TIMEOUT = 600
 COMPOSE_TIMEOUT = 3 * 3600
 #: au-delà, une tentative lancée sur un autre hôte sans époque est réputée morte
 ATTEMPT_STALE = COMPOSE_TIMEOUT + 900
+#: #5696 : pas de `recompose --wait` (le relevé de `ci status` suit la forge
+#: avec retard : une ci-full annulée y reste « in_progress » un moment)
+WAIT_POLL = 30
+#: #5696 : sortie du code périmé (refus attendu, sans alerte) ; 1 reste la panne
+STALE_RC = 3
 REPLAY_TIMEOUT = 900
 #: poids #3801 d'une preuve forte (fichier du test, liste, migration) :
 #: `packet_red.attribute_tests` rend `best` = poids de la meilleure preuve
@@ -240,6 +245,20 @@ class HoraireError(RuntimeError):
 
 class InputError(HoraireError):
     """Un argument invalide."""
+
+
+class Stale(HoraireError):
+    """#5696 : code exécuté qui n'est plus celui de la cible ; refus attendu
+    (sortie STALE_RC, sans alerte), pas une panne."""
+
+
+class Busy(InputError):
+    """#5696 : refus passager (tentative vivante, ci-full en cours) ;
+    `recompose --wait` l'attend au lieu de sortir en 2."""
+
+    def __init__(self, message: str, run_id: str = ""):
+        super().__init__(message)
+        self.run_id = run_id
 
 
 def _load_auto():
@@ -358,6 +377,12 @@ class Context:
     #: de travail d'un agent) ; la CLI le vérifie avant `check_fresh`
     clone_checked: bool = False
     log: list[str] = field(default_factory=list)
+    #: #5696 : horloge et attente de `recompose --wait` (les tests les remplacent)
+    clock: object = time.monotonic
+    sleep: object = time.sleep
+    #: #5696 : la tête dont le code a été chargé (premier `check_fresh`) ; un
+    #: clone avancé ensuite par un autre processus ne rend pas ce code frais
+    executed_head: str = ""
 
     def alive(self, pid: int) -> bool:
         """Un processus vit-il encore sous ce pid, sur cet hôte ? (#4501)
@@ -603,7 +628,24 @@ def run_for(report: dict, sha: str) -> dict | None:
     return None
 
 
-def ci_in_progress(ctx: Context, item: dict) -> dict | None:
+def forge_completed(ctx: Context, run_id: str) -> bool:
+    """#5696 : la forge dit-elle ce run terminé ? `ci status` suit GitHub avec
+    10 à 40 s de retard (constat du pilote, 03/11 : run annulé « completed »
+    à la forge, encore « en cours » au relevé). Une lecture impossible ne vaut
+    jamais « terminé »."""
+    if not str(run_id or "").isdigit():
+        return False
+    seen = ctx.shell.run(["gh", "run", "view", str(run_id), "--json", "status"],
+                         cwd=ctx.repo, timeout=120)
+    if seen.returncode != 0:
+        return False
+    try:
+        return json.loads(seen.stdout).get("status") == "completed"
+    except (ValueError, AttributeError):
+        return False
+
+
+def ci_in_progress(ctx: Context, item: dict, *, forge: bool = False) -> dict | None:
     """#4501 : le run en cours de la tête poussée du porteur, ou None.
 
     La tête poussée est la tête gelée et/ou la tête de branche vue en avance
@@ -621,7 +663,8 @@ def ci_in_progress(ctx: Context, item: dict) -> dict | None:
     for run in report.get("runs") or []:
         if str(run.get("head_sha") or "").lower() in heads \
                 and str(run.get("status") or "") in (
-                    "running", "queued", "pending", "in_progress"):
+                    "running", "queued", "pending", "in_progress") \
+                and not (forge and forge_completed(ctx, str(run.get("run_id") or ""))):
             return run
     return None
 
@@ -1582,10 +1625,14 @@ def check_fresh(ctx: Context) -> None:
     remote = ctx.git("rev-parse", "origin/%s^{commit}" % ctx.target)
     if local.returncode or remote.returncode or not remote.stdout.strip():
         raise HoraireError("têtes illisibles (HEAD, origin/%s)" % ctx.target)
-    if local.stdout.strip() != remote.stdout.strip():
-        raise HoraireError("clone à %s, %s à %s : code périmé, aucun geste"
-                           % (local.stdout.strip()[:12], ctx.target,
-                              remote.stdout.strip()[:12]))
+    head = local.stdout.strip()
+    if head != remote.stdout.strip():
+        raise Stale("clone à %s, %s à %s : code périmé, aucun geste"
+                    % (head[:12], ctx.target, remote.stdout.strip()[:12]))
+    if ctx.executed_head and ctx.executed_head != head:
+        raise Stale("code chargé à %s, clone et %s à %s : code périmé, aucun geste"
+                    % (ctx.executed_head[:12], ctx.target, head[:12]))
+    ctx.executed_head = head
     dirty = ctx.git("status", "--porcelain", "--untracked-files=no")
     if dirty.returncode or dirty.stdout.strip():
         raise HoraireError("clone modifié : aucun geste\n%s" % auto._tail(dirty.text, 5))
@@ -1673,22 +1720,57 @@ def fail_schema(ctx: Context, kind: str, labels: list[str], result: Result) -> N
     message = ("schéma de la tête de %s non aligné (%s) : %s, %s : aucun geste\n%s"
                % (ctx.target, kind, what, SCHEMA_WHY[kind], auto._tail(result.text, 10)))
     alert_schema(ctx, kind, what, message)
-    raise HoraireError(message)
+    error = HoraireError(message)
+    error.alerted = True
+    raise error
 
 
 def alert_schema(ctx: Context, kind: str, what: str, message: str) -> None:
+    if ctx.dry_run:
+        ctx.say("[essai] alerte schéma %s : %s" % (kind, what))
+        return
+    alert_once(ctx, "paquet-horaire:schema:%s:%s" % (kind, what),
+               "Tic horaire bloqué : migrations %s non posées (%s)" % (what, kind),
+               kind, message)
+
+
+def tick_fingerprint(error: BaseException) -> str:
+    """#5696 : l'empreinte d'un échec du tic, sans ce qui change d'une heure
+    à l'autre (nom du paquet, numéros, SHA), pour qu'un même échec répété
+    toutes les dix minutes note un seul lot."""
+    text = str(error).splitlines()[0] if str(error) else type(error).__name__
+    text = re.sub(r"h-\d{8}-\d+", "h-*", text)
+    text = re.sub(r"\b[0-9a-f]{7,40}\b", "*", text)
+    text = re.sub(r"\d+", "N", text)
+    return text[:120]
+
+
+def alert_tick(ctx: Context, error: BaseException) -> None:
+    """#5696 : le tic sort en 1 (paquet non composé à l'heure) : pilote et
+    bureau prévenus une fois par empreinte, comme le schéma. Une alerte
+    perdue ne change pas le code de sortie."""
+    message = ("tic paquet-horaire de %s sur %s en échec (rc 1) : %s\n%s"
+               % (ctx.target, ctx.host, error, "\n".join(ctx.log[-10:])))
+    if ctx.dry_run:
+        ctx.say("[essai] alerte tic : %s" % error)
+        return
+    try:
+        alert_once(ctx, "paquet-horaire:tick:%s" % tick_fingerprint(error),
+                   "Tic horaire en échec : %s" % auto._tail(str(error), 1)[:120],
+                   "tick", message)
+    except Exception as failure:  # noqa: BLE001 - l'alerte ne masque pas l'échec
+        print("paquet-horaire : alerte non posée (%s)" % failure, file=sys.stderr)
+
+
+def alert_once(ctx: Context, key: str, title: str, code: str, message: str) -> None:
     """Un lot par empreinte (`work fingerprint open`, #3885) : le tic suivant,
     même échec, note ce lot au lieu d'écrire de nouveau ; un nouvel échec ou
     une récidive après clôture ouvre un lot et écrit au pilote et au bureau.
     Sans lot lisible, le courrier part quand même : se taire est pire."""
-    if ctx.dry_run:
-        ctx.say("[essai] alerte schéma %s : %s" % (kind, what))
-        return
     opened = ctx.ameesh(
         "work", "fingerprint", "open", "--app", ctx.project,
-        "--key", "paquet-horaire:schema:%s:%s" % (kind, what),
-        "--title", "Tic horaire bloqué : migrations %s non posées (%s)" % (what, kind),
-        "--code", kind, "--actor", ctx.actor, "--json")
+        "--key", key, "--title", title,
+        "--code", code, "--actor", ctx.actor, "--json")
     lot = 0
     try:
         payload = json.loads(opened.stdout) if opened.returncode == 0 else {}
@@ -1843,12 +1925,47 @@ def refuse_agent_clone(ctx: Context) -> None:
 
 
 def pilot_recompose(ctx: Context, carrier: int, exclude: list[int],
-                    reasons: list[str]) -> str:
-    """#4237 : la recomposition du pilote, marquée comme celles du tic."""
+                    reasons: list[str], *, wait: float = 0, cancel_ci: bool = False,
+                    expect_head: str = "") -> str:
+    """#4237 : la recomposition du pilote, marquée comme celles du tic.
+
+    #5696 : `wait` (secondes) attend la fin d'une tentative vivante ou d'une
+    ci-full au lieu de refuser ; `cancel_ci` annule cette ci-full (une fois) ;
+    `expect_head` ne recompose que si la tête gelée est encore celle-là (le
+    tic a pu recomposer entre-temps : rien à faire, sortie 0). Ces trois
+    options remplacent les enveloppes `systemd-run` écrites à la main, sorties
+    en 2 le 03/11 (h16, h17, h19).
+    """
     if reasons and len(reasons) != len(exclude):
         raise InputError("--exclude-reason : %d motif(s) pour %d --exclude"
                          % (len(reasons), len(exclude)))
     refuse_agent_clone(ctx)
+    deadline = ctx.clock() + max(wait, 0)
+    cancelled: set[str] = set()
+    while True:
+        try:
+            return _pilot_recompose_once(ctx, carrier, exclude, reasons, expect_head)
+        except Busy as error:
+            if cancel_ci and error.run_id and error.run_id not in cancelled:
+                cancelled.add(error.run_id)
+                if ctx.dry_run:
+                    ctx.say("[essai] ci cancel #%d --all" % carrier)
+                else:
+                    ctx.must("ci", "cancel", str(carrier), "--all",
+                             what="annulation de la ci-full de #%d" % carrier)
+                ctx.say("#%d : ci-full %s annulée" % (carrier, error.run_id))
+            left = deadline - ctx.clock()
+            if left <= 0:
+                raise
+            ctx.say("%s ; nouvel essai dans %d s" % (error, min(WAIT_POLL, left)))
+            ctx.sleep(min(WAIT_POLL, left))
+            # B cx3 : la cible a pu avancer pendant l'attente ; le code chargé
+            # doit rester celui de sa tête exacte avant tout geste.
+            check_fresh(ctx)
+
+
+def _pilot_recompose_once(ctx: Context, carrier: int, exclude: list[int],
+                          reasons: list[str], expect_head: str) -> str:
     item = show(ctx, carrier)
     if not (item.get("state") in OPEN_STATES
             and is_carrier(item, ctx.project, ctx.target) and is_hourly(item)
@@ -1856,17 +1973,22 @@ def pilot_recompose(ctx: Context, carrier: int, exclude: list[int],
         raise InputError("#%d n'est pas un porteur horaire ouvert sur %s : aucun tic "
                          "ne reprendrait sa recomposition" % (carrier, ctx.target))
     sha = frozen_sha(item)
+    expected = expect_head.strip().lower()
+    if expected and not sha.startswith(expected):
+        return ("#%d : tête gelée %s, plus %s (recomposée entre-temps) : rien à faire"
+                % (carrier, sha[:12] or "absente", expected[:12]))
     left = pending(ctx, item, sha)
     if left is not None and running(ctx, left):
-        raise InputError("#%d : %s en cours (%s:%d), attendre sa fin"
-                         % (carrier, left.step, left.host, left.pid))
+        raise Busy("#%d : %s en cours (%s:%d), attendre sa fin"
+                   % (carrier, left.step, left.host, left.pid))
     # #4501 : une ci-full tourne sur la tête poussée ; la recomposition
     # l'écraserait au lieu d'attendre son verdict.
-    run = ci_in_progress(ctx, item)
+    run = ci_in_progress(ctx, item, forge=True)
     if run is not None:
-        raise InputError(
+        raise Busy(
             "#%d : ci-full en cours sur %s (run %s), recomposition refusée"
-            % (carrier, sha[:12], run.get("run_id") or "?"))
+            % (carrier, sha[:12], run.get("run_id") or "?"),
+            run_id=str(run.get("run_id") or "?"))
     ctx.epoch = session_epoch(ctx)
     name = str(item.get("branch") or "")[len(auto.PACKAGE_PREFIX):]
     ctx.say("#%d : recomposition du pilote sans %s" % (
@@ -1894,6 +2016,18 @@ def pose_git_identity(pilot: str) -> dict:
 
 DURATION_RE = re.compile(r"^(\d+)\s*(h|m|min)$")
 CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def parse_wait(text: str) -> float:
+    """#5696 : `--wait` en secondes : 600, 600s, 90m, 2h ; 12 h au plus."""
+    match = re.match(r"^\s*(\d+)\s*(s|m|min|h)?\s*$", str(text or "0"))
+    if not match:
+        raise InputError("--wait illisible : %r (600s, 90m, 2h)" % text)
+    seconds = int(match.group(1)) * {"": 1, "s": 1, "m": 60, "min": 60,
+                                     "h": 3600}[match.group(2) or ""]
+    if seconds > 12 * 3600:
+        raise InputError("--wait : 12 h au plus")
+    return float(seconds)
 
 
 def parse_until(text: str, now: float, zone: ZoneInfo) -> float:
@@ -2030,6 +2164,13 @@ def main(argv: list[str] | None = None) -> int:
                        metavar="LOT", help="lot retiré (répétable)")
     again.add_argument("--exclude-reason", action="append", default=[], metavar="TEXTE",
                        help="motif au manifeste, apparié par ordre aux --exclude")
+    again.add_argument("--wait", default="0", metavar="DURÉE",
+                       help="#5696 : attendre la fin du tic ou de la ci-full "
+                            "(90m, 2h, 600s ; défaut : refuser tout de suite)")
+    again.add_argument("--cancel-ci", action="store_true",
+                       help="#5696 : annuler la ci-full en cours du porteur, puis attendre")
+    again.add_argument("--expect-head", default="", metavar="SHA",
+                       help="#5696 : rien à faire (sortie 0) si la tête gelée a changé")
     for each in (one, again):
         each.add_argument("--repo", default=".", help="clone du projet (défaut : .)")
         each.add_argument("--actor", default=None,
@@ -2092,7 +2233,9 @@ def main(argv: list[str] | None = None) -> int:
             refuse_agent_clone(ctx)
             check_fresh(ctx)
             align_schema(ctx)
-            print(pilot_recompose(ctx, args.carrier, args.exclude, args.exclude_reason),
+            print(pilot_recompose(ctx, args.carrier, args.exclude, args.exclude_reason,
+                                  wait=parse_wait(args.wait), cancel_ci=args.cancel_ci,
+                                  expect_head=args.expect_head),
                   flush=True)
         else:
             print(run(ctx), flush=True)
@@ -2100,8 +2243,14 @@ def main(argv: list[str] | None = None) -> int:
     except InputError as error:
         print("paquet-horaire : %s" % error, file=sys.stderr)
         return 2
+    except Stale as error:
+        # #5696 : refus attendu (hôte en retard sur la cible), distinct d'une panne
+        print("paquet-horaire : refus attendu : %s" % error, file=sys.stderr)
+        return STALE_RC
     except (HoraireError, auto.PaquetAutoError) as error:
         print("paquet-horaire : %s" % error, file=sys.stderr)
+        if args.command == "tick" and not getattr(error, "alerted", False):
+            alert_tick(ctx, error)
         return 1
 
 

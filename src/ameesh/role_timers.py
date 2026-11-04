@@ -729,6 +729,8 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
         "%s ${AMEESH_PAQUET_REPO}/%s tick "
         "--repo ${AMEESH_PAQUET_REPO} --target ${AMEESH_PAQUET_TARGET} "
         "--pilot ${AMEESH_PAQUET_PILOT}" % (binary, role, python, PAQUET_SCRIPT),
+        # #5696: exit 3 = stale code, an expected refusal, neither "failed" nor alert
+        "SuccessExitStatus=3",
         # a composition (local tests included) is bounded to three hours by the script
         "TimeoutStartSec=4h",
         "NoNewPrivileges=yes",

@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import dataclasses
 import time
+import types
 import unittest
 from unittest import mock
 
-from ameesh import (exploitation, mail, notify, plan, registry, roadmap, storage, sous_utilisation,
-                    work, work_dependencies)
+from ameesh import (debit, exploitation, mail, notify, plan, registry, roadmap, storage,
+                    sous_utilisation, work, work_dependencies)
 
 from .support import PgTestCase
 
@@ -270,6 +271,33 @@ class IdleCapacityTest(_Base):
             work_dependencies.add(self.db, lot["id"], bloqueur["id"], actor="test")
         self.assertEqual(sous_utilisation.idle_capacity(
             self.db, self.listing(), self.now, [], paid=()), [])
+
+    def test_auditeur_au_repos_n_est_pas_une_capacite(self):
+        """#5694 : l'auditeur est un rôle critique, hors du prédicat de
+        réveillabilité du débit (`file_decoupage.wakeable`) ; l'alerte ne le
+        compte pas, même quand un lot démarrable attend."""
+        self.agent("auditeur")
+        work.add(self.db, title="à prendre")
+        self.assertEqual(self.alertes(), [])
+        self.assertEqual(sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=()), [])
+
+    def test_orchestrateur_du_canon_au_repos_n_est_pas_compte(self):
+        """#5694 : le rôle critique se lit sur la fiche du canon, comme pour
+        le débit ; l'alerte et le débit donnent le même compte."""
+        self.agent("orchestrateur")
+        self.agent("claude1")
+        work.add(self.db, title="à prendre")
+        canon = types.SimpleNamespace(
+            agents=[types.SimpleNamespace(title="orchestrateur",
+                                          roles=["orchestrateur"])])
+        alerte = sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=(), canons=[canon])[0]
+        self.assertEqual(alerte["agents"], ["claude1"])
+        cap = debit.capacity(agents=self.listing(), now=self.now,
+                             window_s=6 * HEURE, repos_part=None, repos_s=None,
+                             canons=[canon], configured=True)
+        self.assertEqual(cap["mesh"]["idle"], 1)
 
     def test_lot_d_un_autre_projet_ne_leve_pas(self):
         """#2337 B4 : cinq agents Nexlink au repos ne sont pas une capacité

@@ -1030,6 +1030,10 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
     (`session_lot_busy`) occupent l'agent, comme pour la prise
     (`backlog._awaited`).
 
+    #5694 : ce prédicat dit le repos et la disponibilité, pas la capacité de
+    réveil : les alertes de capacité et le débit le croisent avec
+    `file_decoupage.wakeable` (rôles critiques et relecteurs exclus).
+
     #1677 : `actionable_idle` lit le repos sur les lots **actionnables**
     (`actionable_lots`, lu par `operations.listing` : rien qui l'occupe,
     aucune correction attendue d'un verdict bloquant, aucune relecture
@@ -1247,7 +1251,7 @@ def waiting_text(blocked: dict, limit: int = 6) -> str:
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
                   lots: list | None = None, designers=(), held=(), held_hosts=(),
-                  pressured: dict | None = None, cfg=None) -> list:
+                  pressured: dict | None = None, cfg=None, canons=()) -> list:
     """#254 : `held`, les agents d'un hôte en pause, ni comptés ni à
     réveiller ; `held_hosts` (hôtes en pause) et `pressured` ({hôte:
     verdict} des hôtes sous pression, relevé frais) ne sont jamais proposés :
@@ -1256,14 +1260,31 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     #1021 : `cfg` (l'hôte qui juge) — un agent encore `idle` dont les comptes
     viennent de franchir le seuil n'est pas proposé non plus : la pause n'est
     écrite qu'au sondage suivant de son exécuteur, et l'attribution le refuse
-    déjà (`work.check_assignee`)."""
+    déjà (`work.check_assignee`).
+
+    #5694 : le repos ne compte que des agents **réveillables**, au même
+    prédicat que le débit (`file_decoupage.wakeable`) : ni rôles critiques
+    (auditeur, orchestrateurs, conception, relecture), ni chat, ni retiré, ni
+    sans exécuteur. `canons` est la lecture déjà faite par `alerts` ; sans
+    canon configuré, le verdict par défaut ne retient que la persona
+    auditeur, exactement comme `debit.capacity`."""
     if idle_s <= 0:
         return []
+    from . import canon as canon_mod
+    from . import file_decoupage
+    try:
+        # Même règle que `debit.capacity` et `host_lifecycle` : un canon
+        # configuré mais illisible reste configuré (fail-safe critique).
+        configured = bool(canons) or bool(canon_mod.configured(cfg))
+    except Exception:  # noqa: BLE001 - configuration illisible : pas « sans canon »
+        configured = True
+    wakeable = {row["name"] for row in file_decoupage.wakeable(
+        listing, list(canons or ()), configured=configured)}
     pressured = pressured or {}
     # L165b : un agent dont tous les lots attendent un autre est au repos
     idle = [row for row in idle_agents(listing, now, idle_s, waiting_free=True,
                                        actionable_idle=True)
-            if row["name"] not in held]
+            if row["name"] in wakeable and row["name"] not in held]
     on_hold = sorted((row["name"], row.get("host")) for row in idle
                      if row.get("host") in held_hosts)
     idle = [row for row in idle if row.get("host") not in held_hosts]
@@ -1728,7 +1749,7 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         verdicts, pressured = {}, {}
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid,
                          designers=designers, held=held, held_hosts=held_hosts,
-                         pressured=pressured, cfg=cfg)
+                         pressured=pressured, cfg=cfg, canons=canons)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
                           idle_mail_s=idle_mail_s, canons=canons, verdicts=verdicts)

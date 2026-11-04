@@ -864,6 +864,46 @@ class StagingTest(unittest.TestCase):
         actions = self.actions()
         self.assertIn(('pc-smichea', 'migrer'), actions)
         self.assertNotIn(('ameesh-agents-1', 'installer'), actions)
+        # #5691 : un « verifier/ok » de preflight ne doit pas se lire comme
+        # une installation. L'instantané le dit par hôte, et l'alerte le
+        # résume au lieu de laisser croire que les VM sont à jour.
+        snapshots = [json.loads(line) for line in
+                     (self.state / 'staging-snapshots.jsonl').read_text().splitlines()]
+        failed = snapshots[-1]
+        self.assertEqual(failed['state'], 'failed')
+        self.assertEqual(failed['hosts']['ameesh-agents-1']['stage'], 'verifier')
+        self.assertTrue(all(step.get('installed') is False
+                            for step in failed['hosts'].values()),
+                        failed['hosts'])
+        rows = [dict(id=number, data=snapshot)
+                for number, snapshot in enumerate(snapshots, 1)]
+        from ameesh import staging_watch
+        finding, = staging_watch.findings(rows, now=failed['deadline'] + 1)
+        self.assertIn('0 installé(s) sur 5 hôte(s)', finding['detail'])
+        self.assertIn('préflight seul', finding['detail'])
+
+    def test_rollback_clears_the_installed_marker(self):
+        # #5691 (avis auditeur) : `installer ok` puis `redemarrer ko` puis
+        # `retour ok` : la cible n'est plus installee sur l'hote, et l'alerte
+        # le dit au lieu de compter l'hote comme installe.
+        (self.state / 'scenario').write_text(
+            'ko=ameesh-agents-1:redemarrer\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn(('ameesh-agents-1', 'retour'), self.actions())
+        snapshots = [json.loads(line) for line in
+                     (self.state / 'staging-snapshots.jsonl').read_text().splitlines()]
+        failed = snapshots[-1]
+        self.assertEqual(failed['state'], 'failed')
+        step = failed['hosts']['ameesh-agents-1']
+        self.assertEqual(step['stage'], 'controle-retour')
+        self.assertIs(step['installed'], False)
+        rows = [dict(id=number, data=snapshot)
+                for number, snapshot in enumerate(snapshots, 1)]
+        from ameesh import staging_watch
+        finding, = staging_watch.findings(rows, now=failed['deadline'] + 1)
+        self.assertIn('0 installé(s) sur 5 hôte(s)', finding['detail'])
+        self.assertIn('retour arrière effectué', finding['detail'])
 
     def test_already_installed_workstation_is_not_reinstalled(self):
         court = self.sha[:7]
