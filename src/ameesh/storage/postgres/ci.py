@@ -497,11 +497,15 @@ class CiResults(interface.CiResults):
             (repo, host, event_id, json.dumps(payload)))
 
     def disk_refusals(self, repo) -> list[dict]:
-        self.db.execute("DELETE FROM ci_disk_refusals WHERE message_id IS NOT NULL "
+        # #5755 : un signal de fork n'appelle aucun courrier ; il ne fait
+        # que lever l'alerte, et part avec l'âge comme un signal acquitté.
+        self.db.execute("DELETE FROM ci_disk_refusals WHERE (message_id IS NOT NULL "
+                        "OR payload->>'fork' = 'true') "
                         "AND seen_at < now() - interval '8 days'")
         return self.db.query(
             "SELECT repo, host, event_id, payload FROM ci_disk_refusals "
-            "WHERE repo = %s AND message_id IS NULL ORDER BY seen_at, event_id "
+            "WHERE repo = %s AND message_id IS NULL "
+            "AND payload->>'fork' IS DISTINCT FROM 'true' ORDER BY seen_at, event_id "
             "LIMIT 100 FOR UPDATE SKIP LOCKED", (repo,))
 
     def set_disk_refusal_message(self, repo, *, host, event_id, message_id) -> None:

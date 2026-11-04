@@ -153,7 +153,7 @@ def findings(rows, canons, now, signals=()):
         limits = resources.host_limits(canons, host)['limits']
         if row.get('refusal'):
             out.append(dict(common, type='ci_disk_low', value=row.get('free_bytes'),
-                            threshold=5 * 1024**3, critical=True, urgent=True,
+                            threshold=5 * 1024**3, critical=True, urgent=not row.get('fork'),
                             detail='CI blocked: disk margin refusal on %s (%s); '
                                    'raise-only signal, dedicated base probe required' % (host, repo)))
             continue
@@ -166,7 +166,8 @@ def findings(rows, canons, now, signals=()):
             out.append(dict(common, type='ci_disk_low',
                             value=row['free_bytes'] if by_free else warning['used'],
                             threshold=limits['warn_disk_free'] if by_free else limits['warn_disk_used'],
-                            critical=warning['critical'], urgent=warning['critical'],
+                            critical=warning['critical'],
+                            urgent=warning['critical'] and not row.get('fork'),
                             detail='CI disk %s (%s) %s: %s bytes free, %.1f%% used%s; '
                                    'check host retention timer (bureau)%s' % (
                                        host, repo, row['volume'], row['free_bytes'],
@@ -176,7 +177,9 @@ def findings(rows, canons, now, signals=()):
     unique = {}
     for finding in out:
         key = (finding['repo'], finding['host'], finding['type'])
-        if key not in unique or (finding.get('critical') and not unique[key].get('critical')):
+        rank = (bool(finding.get('critical')), bool(finding.get('urgent')))
+        if key not in unique or rank > (bool(unique[key].get('critical')),
+                                        bool(unique[key].get('urgent'))):
             unique[key] = finding
     return list(unique.values())
 
@@ -215,7 +218,7 @@ def refusal_event(refusal):
     return data
 
 
-def observe_refusal(repo, host, refusal, store, *, now):
+def observe_refusal(repo, host, refusal, store, *, now, fork=False):
     if (not isinstance(refusal, dict) or refusal.get("repo") != repo
             or refusal.get("schema") != "ameesh-ci-disk-refusal/1"
             or not re.fullmatch(r"[0-9a-f]{32}", str(refusal.get("id", "")))
@@ -231,6 +234,8 @@ def observe_refusal(repo, host, refusal, store, *, now):
     payload = numeric_metrics(refusal)
     payload.update(run_id=int(run_id), attempt=int(attempt), sampled_ts=refusal["sampled_ts"],
                    volume=volume(refusal))
+    if fork:
+        payload["fork"] = True  # #5755 : lève sans urgence ni courrier
     store.observe_disk_refusal(repo, host=host, event_id=refusal["id"], payload=payload)
 
 
