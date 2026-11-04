@@ -10,6 +10,7 @@
 #   - réseau privé WireGuard 10.77.0.0/24 (serveur 10.77.0.1) pour les appareils ;
 #   - Postgres en TLS, n'écoutant que sur localhost et le réseau WireGuard ;
 #   - l'utilisateur Unix `ameesh`, ameesh dans /opt/ameesh/venv, sa configuration ;
+#   - Docker rootless pour `ameesh` (docker-rootless.sh, #5784), sans le groupe docker ;
 #   - le gabarit systemd ameesh-runner@<persona> (un exécuteur par persona) ;
 #   - la sauvegarde quotidienne de la base (locale, et hors de la VM si
 #     /etc/ameesh/sauvegarde.env existe) ;
@@ -32,8 +33,11 @@ log() { echo "== $*"; }
 # --- utilisateur des exécuteurs ----------------------------------------------
 log "utilisateur ameesh"
 id ameesh >/dev/null 2>&1 || useradd --create-home --shell /bin/bash ameesh
-usermod -aG docker ameesh
 install -d -m 0750 -o root -g ameesh /etc/ameesh
+# #5784 : Docker rootless, jamais le groupe docker (démon rootful = root) ; un
+# compte encore membre du groupe arrête l'installation avant tout autre geste.
+log "Docker rootless pour ameesh"
+"$SRC/deploy/serveur/docker-rootless.sh" ameesh
 
 # --- WireGuard -----------------------------------------------------------------
 log "WireGuard (wg0, $WG_NET.1/24, port $WIREGUARD_PORT)"

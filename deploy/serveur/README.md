@@ -21,6 +21,7 @@ Postgres n'est jamais exposé sur Internet.
 | `terraform/` | crée la VM, son IP et son groupe de sécurité (SSH restreint, WireGuard) chez Scaleway |
 | `cloud-init.yaml` | premier démarrage : paquets, clone d'ameesh, lance l'installation |
 | `installer-serveur.sh` | installation idempotente : WireGuard, Postgres TLS, utilisateur `ameesh`, ameesh, gabarits systemd, sauvegardes |
+| `docker-rootless.sh` | Docker rootless pour `ameesh` (#5784) : paquets, plages subordonnées, `dockerd-rootless.sh` épinglé (moby, empreinte vérifiée), unité `docker.service` utilisateur, `DOCKER_HOST` des unités utilisateur et des exécuteurs. Jamais le groupe `docker` : un compte encore membre arrête l'installation, la bascule se fait d'abord (`docs/design/etudes/l5502-docker-rootless.md` §4) |
 | `ameesh-runner@.service` | un exécuteur par persona, service système sous `ameesh` |
 | `ameesh-sauvegarde.{service,timer}`, `sauvegarder-base.sh` | `pg_dump` quotidien (répertoire 0700, dumps 0600), rétention locale par catalogue privé et protection rollback, copie hors de la VM si configurée ; les sauvegardes non inscrites sont conservées. `ameesh alerts` vérifie que la base a bien été lue dans la fenêtre (`mesh_backup_unseen`, PostgreSQL 16 et suivants) : accorder `mesh_backup_window` à `OnCalendar` si le minuteur change |
 | `ajouter-appareil.sh` | déclare un appareil dans WireGuard et affiche sa configuration |
