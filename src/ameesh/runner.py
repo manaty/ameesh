@@ -4831,8 +4831,12 @@ class AgentWorker(threading.Thread):
             self._budget_nature = ""
             self._leve_pause_budget()
             return True
-        self._retenue_debut("short_window" if account_window.is_short_window(raison)
-                            else "budget")
+        # #5783 : la fenêtre courte du compte n'est pas une pause budget — le
+        # `status_text` garde sa raison distincte (`account window: …`), qu'un
+        # lecteur (`ameesh show`, client machine) ne confond pas avec le
+        # message générique « compte ou budget indisponible ».
+        fenetre_courte = account_window.is_short_window(raison)
+        self._retenue_debut("short_window" if fenetre_courte else "budget")
         maintenant = time.monotonic()
         if maintenant >= self._budget_next_check:
             self._budget_next_check = maintenant + self.runner.budget_check_interval
@@ -4847,9 +4851,12 @@ class AgentWorker(threading.Thread):
             marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) \
                 and not config else ""
             registry.set_status(self.db, self.name, "blocked",
-                                status_text="%s%s%s" % (
-                                    accounts_mod.CONFIG_BLOCK_PREFIX if config
-                                    else budget_mod.PAUSE_PREFIX, marque, raison))
+                                status_text=(raison if fenetre_courte
+                                             else "%s%s%s" % (
+                                                 accounts_mod.CONFIG_BLOCK_PREFIX
+                                                 if config
+                                                 else budget_mod.PAUSE_PREFIX,
+                                                 marque, raison)))
             # #2934 : une note par nature de pause (compte, fenêtre, échéance),
             # pas à chaque variation du pourcentage, qui reste dans `status_text`.
             # #4020 : la fenêtre courte (#3779 : cooldown, écart de départ,
@@ -4877,8 +4884,12 @@ class AgentWorker(threading.Thread):
         jusqu'à son prochain tour, même la jauge redescendue."""
         agent = self.agent or {}
         texte = agent.get("status_text") or ""
-        if agent.get("status") != "blocked" or not texte.startswith(
-                ("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX)):
+        # #5783 : une pause de fenêtre courte s'écrit désormais sans le préfixe
+        # budget ; elle se lève comme lui, sinon un agent idle resterait
+        # `blocked` avec une raison de quelques secondes.
+        if agent.get("status") != "blocked" or not (
+                texte.startswith(("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX))
+                or account_window.is_short_window(texte)):
             return
         issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
                                             self.epoch, texte, "")
