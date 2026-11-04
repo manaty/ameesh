@@ -1077,7 +1077,8 @@ class Watcher:
         #: même dépôt (N2 du gel #20746).
         self._packet_shared: dict = {}
         self._disk_reads: dict = {}
-        self._disk_checks: set = set()
+        self._disk_checks: dict = {}
+        self._disk_scans: dict = {}
         self._disk_notified_hosts: set = set()
 
     def _cache_ttl(self) -> float:
@@ -1490,26 +1491,42 @@ class Watcher:
             record(db.cfg, db)
         return out
 
-    def _github_disk_refusals(self, db, repo, row):
+    def _github_disk_refusals(self, db, repo, row, *, checks=None, terminal=""):
         """#5751 : signaux uniquement levants de tous les runs, PR comprises.
 
         La liste des hôtes vient du workflow dédié ; corps et charges des
         courriers sont des projections fermées, jamais du texte du code testé.
         """
         from . import ci_disk
+        # #5753 : amortir la liste des jobs ; les checks déjà lus évitent
+        # les annotations vides. Leur liste peut être tronquée ou ne porter
+        # que les dernières tentatives : elle ne remplace pas la liste jobs.
+        now = float(self.clock())
+        scan_key = (repo, int(row["run_id"]), int(row.get("run_attempt") or 1))
+        previous = self._disk_scans.get(scan_key)
+        if previous and now - previous[0] < 300 and previous[1] == terminal:
+            return []
         try:
             path = "repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100" % (
                 repo, row["run_id"], row.get("run_attempt") or 1)
             jobs = self.api(path) or {}
             for job in (jobs.get("jobs") or ())[:100]:
                 key = (repo, job.get("id"))
-                if (job.get("status") not in (None, "completed")
-                        or key in self._disk_checks):
+                # carte.yml absorbe le code 75 : un job vert peut porter
+                # la notice. Aucun résultat de test n'est créé ici.
+                if job.get("status") not in (None, "completed"):
+                    continue
+                if key in self._disk_checks and now - self._disk_checks[key] < 300:
                     continue
                 match = re.fullmatch(r'https://api.github.com/repos/%s/check-runs/(\d+)'
                                      % re.escape(repo), str(job.get("check_run_url") or ''))
                 if not match:
                     continue
+                if checks is not None:
+                    known = [check for check in checks if str(check.get("id")) == match[1]]
+                    if known and all((check.get("output") or {}).get("annotations_count") == 0
+                                     for check in known):
+                        continue
                 annotations = self.api("repos/%s/check-runs/%s/annotations?per_page=100"
                                        % (repo, match[1])) or []
                 known = {r['host'] for r in storage.of(db).ci.disks() if r['repo'] == repo}
@@ -1534,11 +1551,17 @@ class Watcher:
                         continue
                     ci_disk.observe_refusal(repo, event["host"], event, storage.of(db).ci,
                                             now=float(self.clock()))
-                self._disk_checks.add(key)
+                self._disk_checks[key] = now
+            self._disk_scans[scan_key] = (now, terminal)
             return self._disk_refusal_messages(db, repo)
         except Exception as exc:
             self.log("CI %s: disk refusal annotations unreadable (%s)" % (repo, type(exc).__name__))
             return []
+        finally:
+            # Mémoire bornée, y compris pour un veilleur de longue durée.
+            for cache, maximum in ((self._disk_checks, 2048), (self._disk_scans, 512)):
+                while len(cache) > maximum:
+                    del cache[next(iter(cache))]
 
     def _disk_low_signal(self, db, repo, row, job, annotation, event, index):
         from . import ci_disk, canon as canon_mod, resources
@@ -1592,7 +1615,7 @@ class Watcher:
             return
         try:
             data = self.api("repos/%s/actions/workflows/%s/runs?branch=%s&status=success"
-                            "&per_page=1" % (repo, MAP_WORKFLOW, quote(branch, safe=""))) or {}
+                            "&per_page=5" % (repo, MAP_WORKFLOW, quote(branch, safe=""))) or {}
         except plan_github.GithubRateLimited:
             raise
         except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
@@ -1601,6 +1624,14 @@ class Watcher:
             return
         runs = list(data.get("workflow_runs") or ())
         run = runs[0] if runs else {}
+        # #5753 : carte.yml n'est pas une suite suivie par _failures. Ses
+        # parts peuvent absorber exit 75 et finir vertes ; lire leurs notices
+        # dans ce relevé déjà borné, sans fabriquer de verdict de test.
+        for candidate in runs[:5]:
+            if candidate.get("id") and candidate.get("head_branch") == branch:
+                self._github_disk_refusals(db, repo, dict(
+                    run_id=candidate["id"], run_attempt=candidate.get("run_attempt") or 1),
+                    terminal="success")
         st.ci.observe_map(repo, branch=branch, run_id=run.get("id"),
                           head_sha=run.get("head_sha"),
                           published_at=run.get("updated_at") or None)
@@ -2333,7 +2364,7 @@ class Watcher:
         checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
-        self._github_disk_refusals(db, repo, row)
+        self._github_disk_refusals(db, repo, row, checks=checks.get("check_runs"), terminal=terminal)
         self._record_failed_jobs(st, repo, row, bases)
         if not events and terminal == "failure":
             events = self._log_failures(repo, row)
