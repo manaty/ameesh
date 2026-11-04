@@ -246,6 +246,23 @@ class Approvals(interface.Approvals):
             (action, artifact_hash.lower(), decision),
         )
 
+    def get(self, approval_id) -> dict | None:
+        rows = self.db.query(
+            """
+            SELECT id, approver, action, artifact_kind, artifact_hash, decision, nonce,
+                   signed_payload, signature, signature_key,
+                   extract(epoch from created_at)::float8 as created_ts,
+                   extract(epoch from expires_at)::float8 as expires_ts,
+                   extract(epoch from consumed_at)::float8 as consumed_ts,
+                   consumed_by, unconsumed, unexpired, key_known, key_live, key_matches,
+                   key_is_owner, meta
+              FROM mesh_approvals_status
+             WHERE id = %s
+            """,
+            (int(approval_id),),
+        )
+        return rows[0] if rows else None
+
     def consume(self, approval_id, by) -> bool:
         """Consomme une approbation une seule fois, par (approver, nonce).
 

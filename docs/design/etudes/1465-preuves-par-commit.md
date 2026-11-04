@@ -246,8 +246,17 @@ le `meta` de l'approbation pour l'audit.
 
 - résout le commit dans un dépôt (`--repo`), **pas nécessairement HEAD** : il a
   été créé sur l'autre hôte ;
-- vérifie que l'acteur est `externe`, sans bail vivant, que le registre lui
-  connaît le même harnais et que ce harnais est une famille du canon ;
+- vérifie que l'acteur est `externe`, sans bail vivant, et que le harnais
+  déclaré est une famille du canon. Ce harnais est celui de la SESSION
+  (#5756) : si la session figure dans `session_bindings` (toute ligne, révoquée
+  comprise), elle fixe l'agent et le harnais, et toute divergence est refusée ;
+  sinon (hôte sans ameesh, session jamais liée) le harnais doit être déjà connu
+  de l'acteur — le courant du registre ou celui d'une liaison passée. Le
+  registre porte le harnais courant, pas celui de la session qui a créé le
+  commit : un acteur qui a changé de harnais garde donc ses attestations
+  passées. Le harnais courant divergent est conservé dans le `meta` de
+  l'approbation (`registry_harness`), et `provenance show` l'affiche ; le texte
+  signé (version 1) ne change pas ;
 - signe une approbation (`--key`, clé en 0600 ou `/dev/stdin`, `--as` le
   détenteur) ou consomme une approbation déjà signée (`--approval`) ; une
   approbation non valide, révoquée, expirée, déjà consommée ou couvrant un autre
@@ -266,6 +275,9 @@ Témoins : `tests/test_4485_signed_provenance.py` (preuve par clé ou approbatio
 pré-signée, lecture de la famille au gel, commit non-HEAD, commit d'auteur Git
 humain, refus d'un agent execute ou sous bail, harnais divergent ou hors canon,
 clé de rôle agent, clé révoquée, approbation d'un autre texte ou déjà
-consommée) et les trois témoins #4485 de
+consommée ; #5756 : harnais d'une liaison passée accepté après changement de
+harnais au registre, harnais jamais vu refusé, session liée sous un autre
+harnais ou à un autre agent refusée, `registry_harness` dans le meta et affiché
+par `provenance show`) et les trois témoins #4485 de
 `tests/test_3985_bound_session_provenance.py` (nom annoncé couvert par une
 liaison, jamais une autre).
