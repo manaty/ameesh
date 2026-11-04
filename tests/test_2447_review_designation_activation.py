@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
-import json
 import os
 import shutil
 import subprocess
@@ -1601,7 +1600,13 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
     def test_a_lost_host_alone_in_its_family_waits_and_alerts(self):
         # Aucun autre claude : la demande n'est pas déposée chez un mort ; la
         # famille codex disponible est pourvue et le second avis attend
-        # (#3596, aucune marque ne porte r1).
+        # (#3596, aucune marque ne porte r1). #5770 : le chemin du canon entre
+        # dans la marque (`policy_ref`) ; un dossier « canon-r1 » rend
+        # déterministe la collision qui n'était qu'aléatoire sur le suffixe
+        # temporaire, sans changer ce que le témoin mesure.
+        self.canon = _Canon(os.path.join(self.tmp, "canon-r1"))
+        self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root,
+                                       canon_ref="HEAD")
         self._move_to_lost("r1")
         self._lose_host()
         _, out = self.freeze()
@@ -1612,7 +1617,12 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         noted = pg.designation_of(self.marks()[0])
         self.assertEqual(noted["state"], rd.WAITING)
         self.assertEqual(noted["reviewers"], [{"name": "r2", "family": "codex"}])
-        self.assertNotIn("r1", json.dumps(noted))
+        # #5770 : la marque porte aussi `policy_ref`, le chemin du canon lu ;
+        # un suffixe aléatoire y contenait « r1 » (~1 % des exécutions). Le
+        # témoin vérifie les champs nommés, pas le JSON entier.
+        self.assertNotIn("r1", [r["name"] for r in noted["reviewers"]])
+        self.assertNotIn("r1", [s["to"] for s in noted["sent"]])
+        self.assertNotIn("r1", [a["name"] for a in noted["authors"]])
 
     def test_an_undrained_host_is_designated_on_the_next_pass(self):
         # Témoin (3) : l'hôte rouvert rend r1 candidat ; la marque d'attente du

@@ -901,15 +901,32 @@ class RunnerTest(PgTestCase):
         for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
                     "GIT_COMMITTER_EMAIL"):
             env.pop(var, None)  # le lanceur des tests ne prête pas son identité
-        self.register(nom1, "claude", cwd=w1, prompt="premier tour")
-        proc = self.runner("--once", "--agents", nom1, env=env)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.register(nom1, "claude", cwd=w1, prompt="deuxième tour")
-        proc = self.runner("--once", "--agents", nom1, env=env)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.register(nom2, "claude", cwd=w2, prompt="tour de l'autre agent")
-        proc = self.runner("--once", "--agents", nom2, env=env)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        def tour(nom: str, dossier: str, consigne: str) -> None:
+            """#5771 : le tour est vérifié joué avant que la trace soit lue.
+
+            `--once` rend 0 dès qu'un tour est tenté, même différé sans échec
+            (pression de l'hôte, verrou de session) : la consigne reste alors
+            en attente et un nouvel essai la joue. Un tour joué dont la
+            commande échoue, lui, échoue tout de suite, sorties à l'appui."""
+            self.register(nom, "claude", cwd=dossier, prompt=consigne)
+            sorties = []
+            for _essai in range(3):
+                avant = len(self.turns())
+                proc = self.runner("--once", "--agents", nom, env=env)
+                sorties.append(proc.stdout + proc.stderr)
+                self.assertEqual(proc.returncode, 0, "\n".join(sorties))
+                joues = [t["run"] for t in self.turns()[avant:] if "run" in t]
+                if joues:
+                    self.assertEqual(joues[-1]["code"], 0,
+                                     "%s\n%s" % (joues[-1], "\n".join(sorties)))
+                    return
+            self.fail("%s : aucun tour joué en 3 essais (harnais jamais lancé)\n%s"
+                      % (nom, "\n".join(sorties)))
+
+        tour(nom1, w1, "premier tour")
+        tour(nom1, w1, "deuxième tour")
+        tour(nom2, w2, "tour de l'autre agent")
 
         def attendu(nom: str) -> str:
             return "%s <%s@ameesh.invalid>|%s <%s@ameesh.invalid>" % (nom, nom, nom, nom)

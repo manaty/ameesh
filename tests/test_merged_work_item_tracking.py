@@ -1583,6 +1583,19 @@ class ContentDeliveryTest(_Base):
     def sync(self, **kw):
         return plan_git.sync_branches(self.db, host=self.cfg.host, **kw)
 
+    def test_5774_releve_automatique_retient_le_gel_historique(self):
+        sha = self.livrer("agent/acte", "préparation de l'acte")
+        item = self.lot(sha)
+        hold_for_owner(self.db, item["id"])
+        work.move(self.db, item["id"], "blocked", note="acte opérateur dû")
+        work.move(self.db, item["id"], "qa", note="reprise après décision")
+        for dry in (True, False):
+            report = self.sync(dry_run=dry)
+            entry = next(r for r in report["results"] if r["work_item"] == item["id"])
+            self.assertEqual(entry["result"], "would-withhold" if dry else "withheld")
+            self.assertEqual(entry["retention"]["what"], "stale-freeze")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
     def test_1005_gel_ancetre_de_develop_ferme_le_lot(self):
         sha = self.livrer("agent/deepseek6-905-timestamp-precision",
                           "Merge pull request #627 from manaty/"
