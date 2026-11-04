@@ -62,6 +62,16 @@ DELAI=${QUIESCENCE_DELAI:-60}
 #: venv stable du compte qui execute l'unite (comme py_sequence de staging.sh) :
 #: le PATH de l'unite n'a pas de python qui importe ameesh.
 PYTHON=${QUIESCENCE_PYTHON:-$HOME/.local/share/ameesh/venv/bin/python}
+#: #5743 : un venv stable (marqueur .bascule-lanceurs de bascule.py) ne porte
+#: que des lanceurs, sans paquet ameesh : on lance le python de la version
+#: vivante (lien venv-courant), celui dont l'executant a pris l'empreinte
+#: (staging_executor._notifier). Lien absent : le lanceur refuse lui-meme.
+VENV_SONDE=$(dirname -- "$(dirname -- "$PYTHON")")
+if [ -f "$VENV_SONDE/.bascule-lanceurs" ] \
+    && VIVANT=$(readlink -f -- "$(dirname -- "$VENV_SONDE")/venv-courant") \
+    && [ -x "$VIVANT/bin/python" ]; then
+  PYTHON=$VIVANT/bin/python
+fi
 
 refus() {  # raison : trace, alerte (une par run et raison), code 1
   local raison=$1

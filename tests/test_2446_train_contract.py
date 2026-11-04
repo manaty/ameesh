@@ -53,6 +53,11 @@ class ContractTest(unittest.TestCase):
         self.assertIn("scripts/ci-agregat.py",
                       [path for path, _blob in contract.sources])
 
+    def test_the_part_execution_wrapper_is_a_packet_proof_source(self):
+        # #5742 B2 : ce wrapper peut décider de ne pas exécuter la commande.
+        contract, = train_contracts.ameesh()
+        self.assertIn("scripts/ci-test-space.py", dict(contract.sources))
+
     def test_the_full_macos_suite_is_not_a_packet_proof_source(self):
         # #3198 : la suite complète macOS (macos.yml) est nocturne et
         # `ci-macos`, hors du chemin du paquet ; le contrat ne l'épingle pas.

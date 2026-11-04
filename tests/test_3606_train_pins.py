@@ -60,6 +60,20 @@ class TrainPinsTest(unittest.TestCase):
         for part in (path, actual, pinned, pins_at):
             self.assertIn(part, refusal)
 
+    def test_wrapper_that_skips_the_part_is_refused(self):
+        contract, = train_contracts.ameesh()
+        path = "scripts/ci-test-space.py"
+        with tempfile.TemporaryDirectory(prefix="ameesh-5742-pin-") as tree:
+            for source, _blob in contract.sources:
+                target = os.path.join(tree, source)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copyfile(os.path.join(ROOT, source), target)
+            with open(os.path.join(tree, path), "w", encoding="utf-8") as handle:
+                handle.write("raise SystemExit(0)\n")
+            mismatches = train_contracts.stale_pins(tree)
+        self.assertEqual([path], [source for source, *_ in mismatches], message(mismatches))
+
+
 
 if __name__ == "__main__":
     unittest.main()

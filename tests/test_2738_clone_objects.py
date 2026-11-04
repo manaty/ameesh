@@ -220,6 +220,43 @@ class FetchFreshObjectsTest(unittest.TestCase):
         self.assertFalse(_git(self.agents, "for-each-ref",
                               "refs/ameesh/queue/"))
 
+    def test_a_dead_queue_ref_does_not_block_a_branch_below_it(self):
+        """#5741 : une ref de file restée d'une branche supprimée (`lot`) est
+        un fichier qui empêche Git de créer `lot/x` (conflit fichier/dossier
+        dans `refs/ameesh/queue/`). Cette ref n'est qu'un cache : le fetch la
+        retire et rend la tête demandée."""
+        branch = "lot/x"
+        tip = self.publish(branch)
+        self.clone.ensure()
+        stale = _git(self.clone.path, "rev-parse", "HEAD")
+        _git(self.clone.path, "update-ref", "refs/ameesh/queue/lot", stale)
+
+        tips, where = merge_queue.fetch_fresh(self.agents, [branch, "main"],
+                                              self.clone, base="main")
+        self.assertEqual(where, self.clone.path)
+        self.assertEqual(tips[branch], tip)
+        self.assertIsNone(plan_git._commit(self.clone.path, "refs/ameesh/queue/lot"))
+        self.assertEqual(_git(self.clone.path, "rev-parse",
+                              "refs/ameesh/queue/" + branch), tip)
+
+    def test_a_dead_queue_ref_below_a_branch_does_not_block_it(self):
+        """#5741, sens inverse : des refs restées sous `.../lot/` (branche
+        renommée) empêchent de créer `.../lot`. Le fetch les retire aussi."""
+        branch = "lot"
+        tip = self.publish(branch)
+        self.clone.ensure()
+        stale = _git(self.clone.path, "rev-parse", "HEAD")
+        _git(self.clone.path, "update-ref", "refs/ameesh/queue/lot/gone", stale)
+
+        tips, where = merge_queue.fetch_fresh(self.agents, [branch, "main"],
+                                              self.clone, base="main")
+        self.assertEqual(where, self.clone.path)
+        self.assertEqual(tips[branch], tip)
+        self.assertIsNone(plan_git._commit(self.clone.path,
+                                           "refs/ameesh/queue/lot/gone"))
+        self.assertEqual(_git(self.clone.path, "rev-parse",
+                              "refs/ameesh/queue/" + branch), tip)
+
     def test_a_missing_blob_of_the_freeze_is_refetched(self):
         """L'état de l'incident : commit et arbre présents, contenu du gel
         absent (blob retiré du clone, source élaguée). Le fetch répare."""
