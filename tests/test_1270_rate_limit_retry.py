@@ -20,7 +20,7 @@ from unittest import mock
 from ameesh import adapters, db as db_mod, exploitation, rate_limit, registry
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, ThreadLeakMixin
 from .test_l30_accounts import _Base
 
 
@@ -325,12 +325,18 @@ class EtatTest(unittest.TestCase):
         self.assertFalse(rate_limit.alert_suppressed(vieux, 2, now=now))
 
 
-class RepriseTest(_Base):
+class RepriseTest(ThreadLeakMixin, _Base):
     """Un vrai tour qui prend un 429 : attente cadencée, reprise, pas d'arrêt.
 
     Le débit est écrit sur le **stderr du fournisseur** (le vrai canal d'un
     429) ; le résultat libre du tour ne conclut plus rien sur un débit (P2
-    dev1 du 14/10)."""
+    dev1 du 14/10).
+
+    #5794 : `process_once` démarre le fil d'aperçu du worker ; sans le
+    cleanup `_close_peek`, il survit au test et son avertissement « snapshot
+    unavailable » tombe dans la sortie capturée d'un module voisin. Le mixin
+    (#4740) fait échouer le test qui laisse ce fil vivant.
+    """
 
     DEBIT = {"AMEESH_TEST_STDERR": "rate_limit_error: 429 Too Many Requests\n",
              "AMEESH_TEST_EXIT": "1"}

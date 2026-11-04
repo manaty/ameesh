@@ -36,7 +36,7 @@ from ameesh import db as db_mod, resources, storage
 from ameesh import runner as runner_mod
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, ThreadLeakMixin
 
 
 def _script(path: str, body: str) -> str:
@@ -560,8 +560,15 @@ class AlimentationExecuteurTest(PgTestCase):
         self.assertFalse(worker.is_alive())
 
 
-class CoupureTest(PgTestCase):
-    """Après la coupure : session attach reprise, courrier re-livré, orphelins."""
+class CoupureTest(ThreadLeakMixin, PgTestCase):
+    """Après la coupure : session attach reprise, courrier re-livré, orphelins.
+
+    #5794 : le fil `peek-*` d'un worker (`Publisher`) est un démon ; oublié au
+    nettoyage, il survit à son test, sa base de test disparaît et son
+    avertissement « snapshot unavailable » tombe dans la sortie capturée d'un
+    module voisin (part psycopg 1/8 du paquet H04-21). `ThreadLeakMixin`
+    (#4740) fait échouer le test qui laisse un fil vivant après ses cleanups.
+    """
 
     def _cwd(self, name):
         cwd = os.path.join(self.tmp, "work", name)
@@ -955,6 +962,7 @@ class CoupureTest(PgTestCase):
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
         self.addCleanup(worker.watchdog_stop.set)
+        self.addCleanup(worker._close_peek)  # #5794 : aucun fil d'aperçu après le test
         return worker
 
     def test_place_ailleurs_pendant_une_bascule_de_compte_dans_pick(self):

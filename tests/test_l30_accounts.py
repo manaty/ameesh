@@ -355,7 +355,9 @@ class _Base(PgTestCase):
         os.makedirs(cwd, exist_ok=True)
         self.register(name, harness, cwd=cwd)
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
-        return runner, AgentWorker(runner, registry.get(self.db, name), lease)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        self.addCleanup(worker._close_peek)  # #5794 : aucun fil d'aperçu après le test
+        return runner, worker
 
     def _python_du_banc(self) -> str:
         """#3242 : les faux harnais (`#!/usr/bin/env python3`) jouent sous
