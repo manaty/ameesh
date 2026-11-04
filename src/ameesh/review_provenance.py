@@ -623,21 +623,20 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     if not verdict.ok:
         raise ProvenanceError(
             "approval #%s is not valid: %s" % (approval_id, verdict.reason))
-    # #5759 : une approbation pré-signée ne porte que le texte signé. Le
-    # harnais courant divergent est un diagnostic hors signature : il est
-    # écrit ici, au moment de la consommation, pour que `provenance show` le
-    # lise dans le meta sans recalculer le contexte à la lecture. Le texte
-    # version 1 et l'empreinte signée ne changent pas.
-    if pre_signed and ident.get("registry_harness"):
-        merged = storage.of(db).approvals.merge_meta(
-            int(approval_id), {"registry_harness": ident["registry_harness"]})
-        if merged is None:
-            raise ProvenanceError(
-                "approval #%s disappeared before its consumption" % approval_id)
     if not authority.consume_approval(db, int(approval_id),
                                       "provenance:%s" % full):
         raise ProvenanceError(
             "approval #%s was already consumed" % approval_id)
+    # #5759 : une approbation pré-signée ne porte que le texte signé. Le
+    # harnais courant divergent est un diagnostic hors signature : il est
+    # écrit après une consommation réussie par CET appel, pour que
+    # `provenance show` lise le contexte de la consommation sans le
+    # recalculer à la lecture. Une seconde tentative échoue avant cette
+    # écriture : elle ne peut pas réécrire le diagnostic d'une approbation
+    # déjà consommée. Le texte version 1 et l'empreinte signée ne changent pas.
+    if pre_signed and ident.get("registry_harness"):
+        storage.of(db).approvals.merge_meta(
+            int(approval_id), {"registry_harness": ident["registry_harness"]})
     receipt = storage.of(db).provenance.add(
         subject, full, ident["actor"], ident["session"],
         SIGNED_TURN_PREFIX + str(approval_id), ident["harness"],

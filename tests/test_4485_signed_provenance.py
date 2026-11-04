@@ -281,6 +281,35 @@ class SignedProvenanceTest(PgTestCase):
         self.assertEqual(after["artifact_hash"], before["artifact_hash"])
         self.assertEqual(after["signed_payload"], before["signed_payload"])
 
+    def test_a_consumed_approval_keeps_its_diagnostic(self):
+        """#5759 (N auditeur) : une approbation consommée sans reçu n'est pas
+        enrichie par une seconde tentative, même si le registre a changé.
+
+        Le premier essai a consommé l'approbation puis s'est arrêté avant le
+        reçu ; la reprise échoue avant l'écriture du diagnostic."""
+        self.bind(session="s-claude-old", harness="claude")
+        self.unbind(session="s-claude-old", harness="claude")
+        registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
+                        mode="externe")
+        head = self.commit("consommé sans reçu")
+        built = self.approval(head)
+        self.assertTrue(authority.consume_approval(
+            self.db, int(built["id"]), "provenance:crash"))
+        before = storage.of(self.db).approvals.get(int(built["id"]))
+        registry.upsert(self.db, "bureau", harness="deepseek",
+                        host=self.cfg.host, mode="externe")
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            prov.record_signed_commit(
+                self.db, head, actor="bureau", session=SESSION,
+                harness="claude", host=HOST, families=FAMILIES,
+                lot=int(self.lot["id"]), approval_id=int(built["id"]),
+                cwd=self.repo)
+        self.assertIn("already consumed", str(raised.exception))
+        after = storage.of(self.db).approvals.get(int(built["id"]))
+        self.assertEqual((after.get("meta") or {}).get("registry_harness"),
+                         (before.get("meta") or {}).get("registry_harness"))
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+
     def test_a_harness_never_seen_is_refused(self):
         """#5756 : registre codex, aucune liaison claude -> refus nommé."""
         registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
