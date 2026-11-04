@@ -29,6 +29,10 @@ PG_CONF=/etc/postgresql/$PG_VERSION/main
 VERSION=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo "?")
 
 log() { echo "== $*"; }
+# #5784 (revue DeepSeek) : le home d'ameesh n'est écrit qu'avec ses droits ; en
+# root, un lien qu'il y aurait posé (~/.config/ameesh vers /etc/systemd/system)
+# serait suivi à la reprise.
+as_ameesh() { runuser -u ameesh -- "$@"; }
 
 # --- utilisateur des exécuteurs ----------------------------------------------
 log "utilisateur ameesh"
@@ -105,7 +109,7 @@ if [[ ! -f /etc/ameesh/db.env ]]; then
   PW=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
   printf 'PGPASSWORD=%s\n' "$PW" | install -m 0640 -o root -g ameesh /dev/stdin /etc/ameesh/db.env
   printf '127.0.0.1:5432:ameesh:ameesh:%s\n' "$PW" \
-    | install -m 0600 -o ameesh -g ameesh /dev/stdin /home/ameesh/.pgpass
+    | as_ameesh sh -c 'umask 077 && cat > "$1" && chmod 0600 "$1"' sh /home/ameesh/.pgpass
 fi
 # rôle et base assurés à chaque passage (rejouable, et après un changement de version)
 PW=$(sed -n 's/^PGPASSWORD=//p' /etc/ameesh/db.env)
@@ -148,15 +152,14 @@ log "ameesh ($(echo "$VERSION")) dans $VENV"
 for b in ameesh agent-runner agent-mail; do ln -sfn "$VENV/bin/$b" "/usr/local/bin/$b"; done
 CFG=/home/ameesh/.config/ameesh/config.json
 if [[ ! -f $CFG ]]; then
-  install -d -o ameesh -g ameesh /home/ameesh/.config/ameesh
-  cat > "$CFG" <<CONF
+  as_ameesh mkdir -p /home/ameesh/.config/ameesh
+  as_ameesh sh -c 'cat > "$1"' sh "$CFG" <<CONF
 {
   "dsn": "postgresql://ameesh@127.0.0.1:5432/ameesh",
   "host": "$HOST_NAME",
   "canons": []
 }
 CONF
-  chown ameesh:ameesh "$CFG"
 fi
 runuser -l ameesh -c "ameesh migrate"
 

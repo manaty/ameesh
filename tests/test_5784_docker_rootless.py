@@ -227,6 +227,17 @@ class InstallerTest(unittest.TestCase):
         # avant WireGuard, Postgres, etc. : un compte encore membre arrête tout
         self.assertLess(text.index("docker-rootless.sh\" ameesh"), text.index("# --- WireGuard"))
 
+    def test_the_installer_never_writes_the_home_as_root(self):
+        # revue DeepSeek (mty-amh-qa-01, eca769b03) : .pgpass et config.json
+        # étaient écrits en root (install -o, cat > puis chown) dans le home.
+        for line in INSTALLER.read_text().splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            if re.search(r"/home/ameesh|\$CFG", line) and re.search(
+                    r"install |chown |mkdir |cat >|> *\"?(/home|\$CFG)", line):
+                self.assertIn("as_ameesh ", line, line)
+        self.assertIn('as_ameesh() { runuser -u ameesh -- "$@"; }', INSTALLER.read_text())
+
     def test_the_script_never_runs_the_setuptool_nor_switches_context(self):
         code = "\n".join(l for l in SCRIPT.read_text().splitlines()
                          if not l.lstrip().startswith("#"))
