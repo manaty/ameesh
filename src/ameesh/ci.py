@@ -1523,7 +1523,7 @@ class Watcher:
                     if not isinstance(event, dict):
                         continue
                     host = event.get("host")
-                    if host not in known:
+                    if not isinstance(host, str) or host not in known:
                         continue
                     if annotation.get("title") == ci_disk.SCHEMA:
                         self._disk_low_signal(db, repo, row, job, annotation, event, index)

@@ -42,6 +42,7 @@ class NativeTest(unittest.TestCase):
         st = mock.Mock()
         for over in (dict(repo='evil/repo'), dict(id='../../escape'), dict(schema='other'),
                      dict(sampled_ts=NOW - 7 * 86400 - 1), dict(sampled_ts=NOW + 301),
+                     dict(sampled_ts=2**2048),
                      dict(run_id='not-a-run'), dict(attempt='1.2')):
             ci_disk.observe_refusal(REPO, HOST, refusal(**over), st, now=NOW)
         st.observe_disk_refusal.assert_not_called()
@@ -330,7 +331,8 @@ class NativeStorageTest(PgTestCase):
 
     def test_notice_fallback_binds_run_attempt_and_check_url(self):
         self.st.expect_disk(REPO, host=HOST, volume='/')
-        rows = [{'title': 'ameesh-ci-disk-refusal/1', 'message': json.dumps(refusal(attempt='2'))},
+        rows = [{'title': 'ameesh-ci-disk-refusal/1', 'message': json.dumps(refusal(host={}))},
+                {'title': 'ameesh-ci-disk-refusal/1', 'message': json.dumps(refusal(attempt='2'))},
                 {'title': 'ameesh-ci-disk-refusal/1', 'message': json.dumps(refusal())}]
         def api(path):
             if path == 'repos/%s/actions/runs/42' % REPO:

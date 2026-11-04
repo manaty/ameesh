@@ -167,8 +167,8 @@ def findings(rows, canons, now, signals=()):
 
 
 def timestamp(value, now):
-    return (type(value) in (int, float) and math.isfinite(value)
-            and 0 < value <= now + 300)
+    return (type(value) in (int, float) and 0 < value <= now + 300
+            and math.isfinite(value))
 
 
 def observe_refusal(repo, host, refusal, store, *, now):
