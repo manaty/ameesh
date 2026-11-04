@@ -1173,7 +1173,13 @@ ensemble :
   supplémentaire dans les 15 min, plafonné à 15 min. Il retarde le **début**
   des tours, jamais un tour en cours ;
 * `account_turn_starts` porte les débuts de tour du compte ; l'écart minimal
-  par défaut est de **30 s**, le plafond de tours actifs de **2** (Codex). Le
+  par défaut est de **30 s**, le plafond de tours actifs de **2** (Codex), pour
+  un **compte de forfait** (`type: config_dir`, connexion ChatGPT) seulement.
+  #5783 : une clé d'API mesurée (`type: api_key_env`, `api_key_file`) n'a pas
+  ce bucket de forfait ; elle part sans plafond ni écart par défaut et garde
+  seulement la journalisation des 429 et le cooldown partagé. Un refus porte
+  une raison distincte, `account window: …`, écrite dans `status_text` et
+  lisible dans `ameesh show` (ce n'est pas une pause budget). Le
   plafond compte les places d'`account_turn_slots`, qui portent le harnais et
   le compte **effectifs** du tour : un agent Claude/DeepSeek qui emprunte Codex
   (repli L242b) compte dans le plafond Codex. La place n'est retenue que si le
@@ -1196,8 +1202,12 @@ compte, sans redémarrage :
 ```
 
 `max_concurrent: 0` ou `min_start_gap_s: 0` désactivent la garde
-correspondante ; l'absence des clés prend les défauts du harnais. Un exécuteur
-médié sans le domaine `account_windows` ignore la garde (contrat fermé).
+correspondante ; l'absence des clés prend les défauts du harnais pour un compte
+de forfait, et **aucune garde** pour une clé d'API (#5783). Une surcharge
+explicite gagne dans les deux cas. `ameesh doctor` avertit quand un compte
+plafonné sert plus d'agents que son `max_concurrent` (il n'y a rien à dire
+d'une clé sans plafond). Un exécuteur médié sans le domaine `account_windows`
+ignore la garde (contrat fermé).
 
 ### Réconcilier un marqueur comptable historique ambigu
 

@@ -9,11 +9,12 @@ et le branchement du runner.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import threading
 import unittest
 
-from ameesh import account_turn, account_window, accounts, cost
+from ameesh import account_turn, account_window, accounts, cost, progress, registry
 
 from .test_l30_accounts import _Base, _dossier
 
@@ -44,12 +45,53 @@ class CooldownTest(unittest.TestCase):
         libre = accounts.Profile("codex", "primaire", max_concurrent=0)
         self.assertEqual(account_window.max_active("codex", libre), 0)
 
+    def test_cle_api_sans_garde_par_defaut(self):
+        """#5783 : une clé d'API mesurée n'a pas le bucket de rafale du forfait."""
+        for cle in (accounts.Profile("codex", "ima", kind="api_key_env"),
+                    accounts.Profile("codex", "ima", kind="api_key_env",
+                                     key_env="IMA_OPENAI_API_KEY")):
+            with self.subTest(profil=cle):
+                self.assertEqual(account_window.max_active("codex", cle), 0)
+                self.assertEqual(account_window.min_start_gap("codex", cle), 0.0)
+                self.assertFalse(account_window.guarded("codex", cle))
+
+    def test_forfait_garde_par_defaut(self):
+        """#5783 : le forfait ChatGPT garde 2 tours / 30 s."""
+        forfait = accounts.Profile("codex", "primaire", kind="config_dir")
+        self.assertEqual(account_window.max_active("codex", forfait), 2)
+        self.assertEqual(account_window.min_start_gap("codex", forfait), 30.0)
+        self.assertTrue(account_window.guarded("codex", forfait))
+
+    def test_surcharge_explicite_prioritaire(self):
+        """#5783 : le profil explicite gagne, dans les deux types de compte."""
+        cle = accounts.Profile("codex", "ima", kind="api_key_env",
+                               max_concurrent=3, min_start_gap_s=12.5)
+        self.assertEqual(account_window.max_active("codex", cle), 3)
+        self.assertEqual(account_window.min_start_gap("codex", cle), 12.5)
+        self.assertTrue(account_window.guarded("codex", cle))
+        forfait = accounts.Profile("codex", "primaire", kind="config_dir",
+                                   max_concurrent=0, min_start_gap_s=0.0)
+        self.assertEqual(account_window.max_active("codex", forfait), 0)
+        self.assertEqual(account_window.min_start_gap("codex", forfait), 0.0)
+        self.assertFalse(account_window.guarded("codex", forfait))
+
+    def test_le_type_vient_de_la_configuration(self):
+        profils = accounts.parse({"codex": [
+            {"name": "forfait", "path": "/tmp/codex-forfait"},
+            {"name": "cle", "type": "api_key_env", "key_env": "IMA_OPENAI_KEY"},
+        ]})["codex"]
+        self.assertEqual(account_window.max_active("codex", profils[0]), 2)
+        self.assertEqual(account_window.min_start_gap("codex", profils[0]), 30.0)
+        self.assertEqual(account_window.max_active("codex", profils[1]), 0)
+        self.assertEqual(account_window.min_start_gap("codex", profils[1]), 0.0)
+
 
 class FenetreCourteTest(_Base):
     def setUp(self) -> None:
         super().setUp()
         self.db.execute("DELETE FROM account_rate_events")
         self.db.execute("DELETE FROM account_turn_starts")
+        self.db.execute("DELETE FROM account_turn_slots")
 
     def _comptes_codex(self) -> dict:
         dossier = _dossier(os.path.join(self.tmp, "comptes", "codex-3779"),
@@ -187,6 +229,56 @@ class FenetreCourteTest(_Base):
             self.db, "codex", "primaire", "h", "cx2")
         self.assertFalse(troisieme.ok)
         self.assertIn("cooldown", troisieme.reason)
+
+    def test_cle_api_admission_sans_garde(self):
+        """#5783 : une clé d'API mesurée ne pose ni place ni départ ; le 429
+        partagé, lui, refuse toujours le tour."""
+        profil = accounts.Profile("codex", "ima", kind="api_key_env")
+        premier = account_window.claim_start(
+            self.db, "codex", "ima", "ameesh-agents-2", "ima-agent",
+            profile=profil)
+        self.assertTrue(premier.ok)
+        self.assertFalse(premier.begun)
+        self.assertEqual(self.db.query(
+            "SELECT id FROM account_turn_starts"), [])
+        self.assertEqual(self.db.query(
+            "SELECT agent FROM account_turn_slots"), [])
+        account_window.record_rate_limit(
+            self.db, "codex", "ima", "h", "voisin", ERREUR_429)
+        refuse = account_window.claim_start(
+            self.db, "codex", "ima", "h", "ima-agent", profile=profil)
+        self.assertFalse(refuse.ok)
+        self.assertTrue(refuse.reason.startswith("account window: "))
+        self.assertIn("short-window cooldown", refuse.reason)
+        self.assertIn("account ima", refuse.reason)
+
+    def test_cle_api_ignore_le_plafond_du_forfait(self):
+        """#5783 : trois places actives sur une clé ne bloquent pas le 4e tour."""
+        profil = accounts.Profile("codex", "ima", kind="api_key_env")
+        for name in ("ima-a", "ima-b", "ima-c"):
+            self.db.execute(
+                "INSERT INTO agent_registry"
+                " (name, chantier, harness, host, status, session_account,"
+                "  status_since, lease_owner, lease_expires_at)"
+                " VALUES (%s, '', 'codex', 'h', 'running', 'ima', now(),"
+                "         'runner', now() + interval '1 hour')", (name,))
+            self.db.execute(
+                "INSERT INTO account_turn_slots (agent, harness, account, host, at)"
+                " VALUES (%s, 'codex', 'ima', 'h', now())", (name,))
+        self.assertEqual(account_window.reason(
+            self.db, "codex", "ima", exclude_agent="ima-d", profile=profil), "")
+        quatre = account_window.claim_start(
+            self.db, "codex", "ima", "h", "ima-d", profile=profil)
+        self.assertTrue(quatre.ok, quatre)
+        etat = account_window.state(self.db, "codex", "ima", profile=profil)
+        self.assertEqual(etat["max_active"], 0)
+        # pas de plafond : les places et le dernier départ ne sont même pas lus
+        self.assertEqual(etat["active_count"], 0)
+        self.assertIsNone(etat["last_start_at"])
+        lignes = account_window.rows(
+            self.db, [{"harness": "codex", "account": "ima"}],
+            profiles={"codex": [profil]})
+        self.assertIn("no cap", "\n".join(account_window.format_rows(lignes)))
 
     def test_departs_concurrents_ne_depassent_pas_l_ecart(self):
         """Témoin cx2 : deux runners cross-hôtes se présentent ensemble ; le
@@ -456,6 +548,57 @@ class FenetreCourteTest(_Base):
                              tools={worker.name: "codex"})
         raison = account_turn.choose(worker, book)
         self.assertIn("start gap", raison or "")
+
+    def test_pause_de_fenetre_sans_prefixe_budget_et_levee(self):
+        """#5783 : `status_text` dit « account window », pas une pause budget ;
+        la pause se lève comme une pause budget quand la garde passe."""
+        worker = self._worker_codex("cx-window-status")
+        account_window.record_start(self.db, "codex", "primaire",
+                                    "ameesh-agents-1", "codex1")
+        self.assertFalse(worker.budget_ok())
+        row = registry.get(self.db, "cx-window-status")
+        self.assertEqual(row["status"], "blocked")
+        self.assertTrue(row["status_text"].startswith("account window: "))
+        self.assertNotIn("budget :", row["status_text"])
+        self.assertIn("next turn in", row["status_text"])
+        self.assertFalse(progress.paused_on_budget(row))
+        # la garde passée (plus de départ enregistré), le tour repart et la
+        # pause est levée sans attendre un autre tour.
+        self.db.execute("DELETE FROM account_turn_starts")
+        worker.agent = registry.get(self.db, "cx-window-status")
+        self.assertTrue(worker.budget_ok())
+        row = registry.get(self.db, "cx-window-status")
+        self.assertEqual(row["status"], "idle")
+        self.assertEqual(row["status_text"], "")
+
+    def test_doctor_avertit_un_compte_plafonne_qui_sert_trop_d_agents(self):
+        """#5783 : le doctor dit qu'un compte de forfait sert plus d'agents que
+        son plafond ; une clé d'API sans surcharge n'avertit pas."""
+        cfg = dataclasses.replace(self.cfg, accounts=self._comptes_codex())
+        for name in ("sert-1", "sert-2", "sert-3"):
+            self.db.execute(
+                "INSERT INTO agent_registry"
+                " (name, chantier, harness, host, status, session_id,"
+                "  session_account)"
+                " VALUES (%s, '', 'codex', 'h', 'idle', %s, 'primaire')",
+                (name, "sess-" + name))
+        self.assertEqual(len(accounts.parse(cfg.accounts)["codex"]), 1)
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM agent_registry WHERE harness = 'codex'"
+            " AND session_account = 'primaire'")[0]["n"], 3)
+        lignes = account_window.doctor_lines(cfg, self.db)
+        self.assertEqual(len(lignes), 1, lignes)
+        self.assertIn("codex/primaire", lignes[0])
+        self.assertIn("3 agents", lignes[0])
+        self.assertIn("max_concurrent=2", lignes[0])
+        self.assertIn("min_start_gap_s=30s", lignes[0])
+        # deux agents : rien à dire
+        self.db.execute("DELETE FROM agent_registry WHERE name = 'sert-3'")
+        self.assertEqual(account_window.doctor_lines(cfg, self.db), [])
+        # une clé d'API n'a pas de plafond par défaut : aucun avertissement
+        cle = dataclasses.replace(self.cfg, accounts={"codex": [
+            {"name": "ima", "type": "api_key_env", "key_env": "IMA_OPENAI_KEY"}]})
+        self.assertEqual(account_window.doctor_lines(cle, self.db), [])
 
     def test_migration_presente(self):
         for table in ("account_rate_events", "account_turn_starts",

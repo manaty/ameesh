@@ -2486,6 +2486,18 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     unread = storage.of(db).mailbox.unread_total()
     print("agents     : %d" % agents)
     print("unread     : %d" % unread)
+    # #5783 : le garde-fou de fenêtre courte (#3779) plafonne un compte de
+    # forfait ; un compte qui sert plus d'agents que son `max_concurrent` est
+    # dit (avertissement, pas un KO : c'est un réglage, pas une panne). Lu
+    # après la connexion, sur les comptes de session du registre.
+    try:
+        from . import account_window
+        window_lines = account_window.doctor_lines(cfg, db)
+    except Exception as exc:  # une lecture ne casse pas le doctor
+        window_lines = ["not checked (%s)"
+                        % (" ".join(str(exc).split())[:120],)]
+    for line in window_lines:
+        print("accounts   : %s" % line)
     # L98 T2a (#4407): active project modules against the readable canon — an
     # active module that is not installed (or is refused) is an error; a
     # descriptor drift or a refused, inactive entry point is a warning.
