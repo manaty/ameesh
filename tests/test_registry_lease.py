@@ -296,10 +296,54 @@ class RegistryTest(PgTestCase):
         morts = registry.reap(self.db, "laptop")
         self.assertEqual([row["name"] for row in morts], ["alpha"])
         self.assertEqual(registry.get(self.db, "alpha")["status"], "dead")
+        # #5722 : un agent mort garde son bail échu, preuve lue par
+        # l'alerte `dead_runner` ; seul un agent arrêté le perd.
+        self.assertEqual(registry.get(self.db, "alpha")["lease_owner"], "runner-a")
         # un agent mort reste réclamable (le nouveau bail le remet en vie)
         nouveau = registry.claim(self.db, "alpha", "runner-b", 60)
         self.assertIsNotNone(nouveau)
         self.assertEqual(registry.get(self.db, "alpha")["status"], "idle")
+
+    def test_reap_retire_le_bail_residuel_d_un_agent_arrete(self):
+        """#5722 : un agent arrêté ne garde pas de bail échu sur son hôte."""
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        lease = registry.claim(self.db, "alpha", "runner-a", 1.0)
+        registry.set_status(self.db, "alpha", "stopped", status_text="arrêté à la main",
+                            stop_reason="manuel")
+        time.sleep(1.3)
+        retires = registry.reap(self.db, "laptop")
+        self.assertEqual([row["name"] for row in retires], ["alpha"])
+        self.assertTrue(retires[0]["residual"])
+        row = registry.get(self.db, "alpha")
+        self.assertEqual(row["status"], "stopped")  # un arrêt reste un arrêt
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(row["lease_expires_ts"])
+        self.assertEqual(int(row["lease_epoch"]), int(lease["lease_epoch"]) + 1)
+
+    def test_reap_garde_le_bail_vivant_d_un_agent_arrete(self):
+        """Un arrêt pendant un tour ne coupe pas le bail avant la fin (#5722)."""
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        registry.claim(self.db, "alpha", "runner-a", 60)
+        registry.set_status(self.db, "alpha", "stopped", status_text="arrêté à la main",
+                            stop_reason="manuel")
+        self.assertEqual(registry.reap(self.db, "laptop"), [])
+        row = registry.get(self.db, "alpha")
+        self.assertEqual(row["lease_owner"], "runner-a")
+        self.assertIsNotNone(row["lease_expires_ts"])
+
+    def test_reap_ne_touche_pas_les_baux_des_autres_hotes(self):
+        """#5722 : la passe d'un hôte ne retire que les baux de cet hôte."""
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        registry.upsert(self.db, "beta", harness="claude", host="autre")
+        registry.claim(self.db, "alpha", "runner-a", 1.0)
+        registry.claim(self.db, "beta", "runner-b", 1.0)
+        for name in ("alpha", "beta"):
+            registry.set_status(self.db, name, "stopped", status_text="arrêté à la main",
+                                stop_reason="manuel")
+        time.sleep(1.3)
+        registry.reap(self.db, "laptop")
+        self.assertIsNone(registry.get(self.db, "alpha")["lease_owner"])
+        self.assertEqual(registry.get(self.db, "beta")["lease_owner"], "runner-b")
 
     def test_set_status_et_session(self):
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")

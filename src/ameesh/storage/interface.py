@@ -511,7 +511,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def reap(self, host: str | None) -> list[dict]:
-        """Marque morts les agents dont le bail a expiré en plein tour."""
+        """Marque morts les agents dont le bail a expiré en plein tour, et
+        retire le bail échu d'un agent déjà arrêté (#5722)."""
 
     @abc.abstractmethod
     def clear_session(self, name: str, owner: str, epoch: int) -> bool:
