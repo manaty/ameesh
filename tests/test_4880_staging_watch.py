@@ -263,6 +263,25 @@ debut_etape vm-1 redemarrer
         self.assertIs(after["hosts"]["vm-1"]["installed"], True)
         self.assertIs(after["hosts"]["vm-2"]["installed"], False)
 
+    def test_a_rollback_clears_the_installed_marker(self):
+        with tempfile.TemporaryDirectory() as folder:
+            proc = self.harness(folder, """
+trace vm-1 installer ok
+publier_suivi running
+trace vm-1 redemarrer ko
+trace vm-1 retour ok
+trace vm-1 controle-retour ok
+publier_suivi failed
+""")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            installed, rolled_back = self.snapshots(folder)
+        self.assertIs(installed["hosts"]["vm-1"]["installed"], True)
+        self.assertEqual(rolled_back["hosts"]["vm-1"]["stage"],
+                         "controle-retour")
+        # `retour ok` reinstalled the previous version: the target is no
+        # longer installed, and the later control does not undo that.
+        self.assertIs(rolled_back["hosts"]["vm-1"]["installed"], False)
+
     def test_backup_budget_covers_the_three_dumps_with_one_runner(self):
         with tempfile.TemporaryDirectory() as folder:
             proc = self.harness(folder, """
@@ -435,7 +454,34 @@ class WatchTest(unittest.TestCase):
             "vm-2": {"stage": "verifier", "verdict": "ok", "installed": False}})
         finding, = staging_watch.findings([failed], now=150)
         self.assertIn("1 installé(s) sur 2 hôte(s)", finding["detail"])
-        self.assertIn("1 pas encore installé(s)", finding["detail"])
+        self.assertIn("1 pas installé(s)", finding["detail"])
+
+    def test_alert_reports_a_rollback_apart_from_a_preflight(self):
+        failed = row(1, state="failed", hosts={
+            "vm-1": {"stage": "controle-retour", "verdict": "ok",
+                     "installed": False},
+            "vm-2": {"stage": "verifier", "verdict": "ok", "installed": False}})
+        finding, = staging_watch.findings([failed], now=150)
+        self.assertIn("0 installé(s) sur 2 hôte(s)", finding["detail"])
+        self.assertIn("retour arrière effectué", finding["detail"])
+        self.assertNotIn("préflight seul", finding["detail"])
+
+    def test_alert_never_counts_the_poste_pseudo_host(self):
+        failed = row(1, state="failed", hosts={
+            "vm-1": {"stage": "sante", "verdict": "ok", "installed": True},
+            "poste": {"stage": "migrations", "verdict": "en-cours",
+                      "installed": False}})
+        finding, = staging_watch.findings([failed], now=150)
+        self.assertIn("1 installé(s) sur 1 hôte(s)", finding["detail"])
+
+    def test_a_disabled_rollback_is_not_a_preflight_only_run(self):
+        failed = row(1, state="failed", hosts={
+            "vm-1": {"stage": "retour", "verdict": "desactive",
+                     "installed": False}})
+        finding, = staging_watch.findings([failed], now=150)
+        self.assertIn("installation commencée, aucune preuve",
+                      finding["detail"])
+        self.assertNotIn("préflight seul", finding["detail"])
 
     def test_failure_immediate_and_only_later_completed_retry_resolves(self):
         failed = row(2, state="failed")

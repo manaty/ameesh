@@ -1106,9 +1106,13 @@ with open(path, encoding='utf-8') as stream:
             # a ete installee sur cet hote. Le marqueur se garde sur les etapes
             # suivantes (redemarrage, controle, sante), pour qu'un
             # `verifier/ok` de preflight ne se lise pas comme une installation.
+            # `retour ok` reinstalle la version precedente : la cible ne l'est
+            # plus (avis auditeur), et `controle-retour ok` ne la remet pas.
             installe = bool(hosts.get(row['hote'], {}).get('installed'))
             if row['etape'] == 'installer' and row['verdict'] == 'ok':
                 installe = True
+            elif row['etape'] == 'retour' and row['verdict'] == 'ok':
+                installe = False
             hosts[row['hote']] = {'stage': row['etape'], 'verdict': row['verdict'],
                                   'since': started, 'installed': installe}
 try:
