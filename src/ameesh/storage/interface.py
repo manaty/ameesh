@@ -5515,6 +5515,11 @@ class CiResults(Domain):
         """#5751 : acquittement durable dans la transaction du courrier."""
 
     @abc.abstractmethod
+    def dismiss_disk_refusal(self, repo: str, *, host: str, event_id: str) -> None:
+        """#5754 : acquitte sans courrier une ligne illisible (message_id 0),
+        pour qu'elle ne retienne pas la fenêtre des 100 refus dus."""
+
+    @abc.abstractmethod
     def claim_disk_dispatch(self, repo: str, *, now: float, interval_s: float) -> bool:
         """#5751 : consomme atomiquement une intention de sonde dédiée."""
 

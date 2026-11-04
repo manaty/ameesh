@@ -1433,54 +1433,79 @@ class Watcher:
         out, threads, notified = [], [], []
         with _atomic(db) as tx:
             st = storage.of(tx)
-            groups = {}
-            for refusal in st.ci.disk_refusals(repo):
-                host = refusal["host"]
-                if (not ci_disk.HOST.fullmatch(host)
-                        or host in self._disk_notified_hosts):
-                    continue
-                groups.setdefault(host, []).append(refusal)
-            if not groups:
+            collected, unreadable, scanned = {}, 0, 0
+            # #5754 : une ligne illisible ne peut pas recevoir de courrier.
+            # Elle est acquittée sur place (sans message) pour ne pas retenir
+            # la fenêtre de 100 et affamer les refus valides ; le balayage est
+            # borné et le même passage draine les suivants.
+            while scanned < ci_disk.REFUSAL_SCAN:
+                rows = st.ci.disk_refusals(repo)
+                if not rows:
+                    break
+                scanned += len(rows)
+                invalid = []
+                for refusal in rows:
+                    host = refusal.get("host")
+                    data = ci_disk.refusal_event(refusal)
+                    if (not isinstance(host, str) or not ci_disk.HOST.fullmatch(host)
+                            or data is None):
+                        invalid.append(refusal)
+                        continue
+                    if host in self._disk_notified_hosts:
+                        continue
+                    collected.setdefault((host, refusal["event_id"]), (refusal, data))
+                for refusal in invalid:
+                    st.ci.dismiss_disk_refusal(repo, host=refusal["host"],
+                                               event_id=refusal["event_id"])
+                unreadable += len(invalid)
+                if not invalid or len(rows) < ci_disk.REFUSAL_WINDOW:
+                    break
+            if unreadable:
+                self.log("CI %s: %d unreadable disk refusal line(s) acknowledged "
+                         "without mail" % (repo, unreadable))
+            if not collected:
                 return []
             to = self._project_pilot(tx, repo)
             if not to:
-                return []  # les refus non acquittés restent dus au prochain tour
+                return []  # les refus lisibles non acquittés restent dus au prochain tour
+            groups = {}
+            for refusal, data in collected.values():
+                groups.setdefault(refusal["host"], []).append((refusal, data))
             for host, refusals in groups.items():
-                # Anciennes lignes comprises : aucun texte libre du spool ou
-                # des annotations n'entre dans le corps NI dans son payload.
+                # Lignes validées : aucun texte libre du spool ou des
+                # annotations n'entre dans le corps NI dans son payload.
                 events = []
-                for refusal in refusals:
-                    data = refusal["payload"]
-                    if (not re.fullmatch(r"[0-9a-f]{32}", refusal["event_id"])
-                            or type(data.get("run_id")) is not int
-                            or not 0 < data["run_id"] < 2**64
-                            or type(data.get("attempt")) is not int
-                            or not 0 < data["attempt"] < 2**32):
-                        continue
+                for refusal, data in refusals:
                     events.append(dict(ci_disk.numeric_metrics(data), id=refusal["event_id"],
                         run_id=data["run_id"], attempt=data["attempt"],
+                        volume=ci_disk.volume(data),
                         kind="measurement" if data.get("signal") is True else "refusal"))
-                if not events:
-                    continue
                 last = events[-1]
                 refused = sum(event['kind'] == 'refusal' for event in events)
+                labels = []
+                for event in events:
+                    label = ci_disk.VOLUME_LABELS.get(event.get("volume"))
+                    if label and label not in labels:
+                        labels.append(label)
+                volumes = ", ".join(labels) or "inconnu (ancienne mesure)"
+                volume_title = "Volume vérifié" if len(labels) <= 1 else "Volumes vérifiés"
+                last_volume = ci_disk.VOLUME_LABELS.get(last.get("volume")) or "volume inconnu"
                 text = ("CI : marge disque insuffisante ou illisible (#5742). "
-                        "%d refus de part(s), %d signal(s) de mesure basse sur %s. %s"
-                        "Dernière mesure : libre %s octets, inodes disponibles %s, "
+                        "%d refus de part(s), %d signal(s) de mesure basse sur %s. "
+                        "%s : %s. %s"
+                        "Dernière mesure (%s) : libre %s octets, inodes disponibles %s, "
                         "minimum %s octets. Vérifier le disque et la rétention native. "
                         "https://github.com/%s/actions/runs/%d" % (
                             refused, len(events) - refused, host,
+                            volume_title, volumes,
                             "Aucun test lancé pour les refus. " if refused else "",
-                            last["free_bytes"], last["available_inodes"],
+                            last_volume, last["free_bytes"], last["available_inodes"],
                             last["required_bytes"], repo, last["run_id"]))
                 payload = {"ci_disk_refusal": {"repo": repo, "host": host,
                                                "count": len(events), "events": events}}
                 message = _send(tx, to, text, text, lot=None, payload=payload, urgent=False,
                                 after_commit=threads)
-                reported_ids = {event["id"] for event in events}
-                for refusal in refusals:
-                    if refusal["event_id"] not in reported_ids:
-                        continue
+                for refusal, _data in refusals:
                     st.ci.set_disk_refusal_message(repo, host=host,
                         event_id=refusal["event_id"], message_id=message)
                 notified.append(host)
@@ -1556,7 +1581,8 @@ class Watcher:
             return
         identity = '%s:%s:%s:%s:%s' % (repo, row['run_id'], row.get('run_attempt') or 1, job['id'], index)
         payload = dict(signal=True, run_id=int(row['run_id']), attempt=int(row.get('run_attempt') or 1),
-                       sampled_ts=sampled, free_bytes=data['free_bytes'], total_bytes=data['total_bytes'])
+                       sampled_ts=sampled, volume='root',
+                       free_bytes=data['free_bytes'], total_bytes=data['total_bytes'])
         storage.of(db).ci.observe_disk_refusal(repo, host=event['host'],
             event_id=hashlib.sha256(identity.encode()).hexdigest()[:32], payload=payload)
 

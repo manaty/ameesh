@@ -4684,6 +4684,7 @@
     "disk_signals",
     "disk_refusals",
     "set_disk_refusal_message",
+    "dismiss_disk_refusal",
     "forget_disks",
     "observe_disk",
     "prune_disks",

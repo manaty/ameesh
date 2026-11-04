@@ -80,7 +80,7 @@ def ameesh() -> tuple[Workflow, ...]:
                  ("scripts/test-plan.py", "fca4ffe4347649901f3fa14c533a388d1bbeaedf"),
                  ("scripts/test-parts.py", "f5a86e090e97e945b52f77fba344828394635d2a"),
                  ("scripts/ci-flow.py", "c81e4aff4fcaf1b9ec9a75ba987b3beba50258c2"),
-                 ("scripts/ci-test-space.py", "15d00e8629a8fc5962bc91f2937f023144ac5ecd"),
+                 ("scripts/ci-test-space.py", "f5535ce3eadcd0b6a6e69567a8c36ed3a121420f"),
                  ("scripts/ci-agregat.py", "89032421c9ffa573df026314f1377fe5f4e00674"),
                  ("scripts/map.py", "4769661ac614ccd5dabda678c27be3bc02a32ce8")),
         pins_at="src/ameesh/train_contracts.py",
