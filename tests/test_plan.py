@@ -450,6 +450,53 @@ class GithubTest(_PlanDb):
             self.assertEqual(entry["result"], "would-withhold" if dry else "withheld")
         self.assertEqual(work.get(self.db, item["id"])["state"], "waiting_human")
 
+    def test_5777_retenue_journalisee_et_reveil_unique(self):
+        item = work.add(self.db, title="acte retenu")
+        work.move(self.db, item["id"], "build")
+        work.move(self.db, item["id"], "blocked", note="acte encore dû")
+        self.merged_pr(91, "x", body="ameesh-work: %d" % item["id"])
+        self.gh.state["prs"]["%s#91" % REPO]["baseRefName"] = "develop"
+        with mock.patch.object(plan_git, "_wake_retention") as wake:
+            for _ in range(2):
+                report = plan_github.sync_github(self.db, self.gh, REPO)
+                [entry] = report["results"]
+                self.assertEqual(entry["result"], "withheld")
+                self.assertEqual(entry["retention"]["what"], "blocked")
+                self.assertIn("develop", entry["detail"])
+            wake.assert_called_once()
+        notes = [e for e in work.events(self.db, item["id"])
+                 if "contenu fusionné, fermeture retenue" in (e.get("note") or "")]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(work.get(self.db, item["id"])["state"], "blocked")
+
+    def test_5777_journal_illisible_reste_une_erreur_sans_reveil(self):
+        item = work.add(self.db, title="journal illisible")
+        self.merged_pr(93, "x", body="ameesh-work: %d" % item["id"])
+        retention = {"what": "unreadable", "motif": "journal illisible"}
+        with mock.patch.object(work, "deliver", return_value={
+                "result": "error", "detail": "lecture refusée", "retention": retention}), \
+                mock.patch.object(plan_git, "record_content_withheld") as record:
+            [entry] = plan_github.sync_github(self.db, self.gh, REPO)["results"]
+        self.assertEqual(entry["result"], "error")
+        self.assertEqual(entry["retention"], retention)
+        record.assert_not_called()
+
+    def test_5777_apercu_porte_prod_sans_effet(self):
+        item = work.add(self.db, title="attente prod")
+        self.merged_pr(92, "x", body="ameesh-work: %d" % item["id"])
+        before = work.events(self.db, item["id"])
+        gate = {"what": "prod-gate", "motif": "attente de main"}
+        with mock.patch("ameesh.prod_gate.check", return_value={"retention": gate}), \
+                mock.patch.object(plan_git, "record_content_withheld") as record:
+            [entry] = plan_github.sync_github(
+                self.db, self.gh, REPO, dry_run=True)["results"]
+        self.assertEqual(entry["result"], "would-withhold")
+        self.assertEqual(entry["retention"], gate)
+        self.assertEqual(work.events(self.db, item["id"]), before)
+        record.assert_not_called()
+        self.assertTrue(any("baseRefName" in arg for call in self.gh.calls()
+                            for arg in call if isinstance(arg, str)))
+
     def test_sync_github_ferme_les_lots_fusionnes(self):
         a = work.add(self.db, title="recherche", package="cat-recherche")
         work.move(self.db, a["id"], "build")
