@@ -879,6 +879,22 @@ def _bench_upkeep(db) -> None:
 #: dans l'ALTER TABLE, jamais un paramètre lié).
 _FILL_IDENT = re.compile(r"[a-z_][a-z0-9_]*\Z")
 
+#: #5690 : un nom de table ou de colonne passé aux écritures N-1 (composé dans
+#: l'instruction, jamais un paramètre lié). Une colonne ajoutée par la
+#: migration du lot est refusée dans le SQL de l'ancien écrivain : sinon le
+#: banc ne prouve pas que le code d'avant l'ignore.
+_N1_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _without_comments(sql: str) -> str:
+    """#5690 : le SQL sans ses commentaires.
+
+    Les chaînes restent : un nom de colonne ajoutée dans une chaîne est un
+    doute (SQL dynamique), le banc refuse aussi.
+    """
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    return re.sub(r"--[^\n\r]*", " ", sql)
+
 
 class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
@@ -920,6 +936,100 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
         finally:
             if client:
                 db._client_timeout = saved
+
+    # -- compatibilité N-1 (#5690) ---------------------------------------
+    def _check_n1_write(self, sql: str, added) -> None:
+        """Refuse une écriture N-1 qui nomme une colonne ajoutée (#5690)."""
+        if isinstance(added, str):
+            raise ValueError(
+                "écriture N-1 : `added` est une séquence de colonnes, pas une chaîne")
+        columns = tuple(str(column) for column in added)
+        if not columns:
+            raise ValueError(
+                "écriture N-1 : `added` nomme les colonnes que la migration du "
+                "lot ajoute, il ne peut pas être vide")
+        for column in columns:
+            if not _N1_IDENT.fullmatch(column):
+                raise ValueError("écriture N-1 : colonne ajoutée invalide : %r"
+                                 % (column,))
+        code = _without_comments(sql)
+        for column in columns:
+            if re.search(r"(?<![\w$])%s(?![\w$])" % re.escape(column), code,
+                         re.IGNORECASE):
+                raise ValueError(
+                    "écriture N-1 : l'instruction nomme %r, colonne ajoutée par la "
+                    "migration : le banc ne prouverait pas que le code d'avant "
+                    "l'ignore" % (column,))
+
+    def previous_write(self, sql: str, params=(), *, added) -> None:
+        """#5690 : rejoue l'écriture d'un écrivain de la version N-1.
+
+        Une migration additive peut ajouter une colonne que le nouveau code lit
+        alors que les écrivains restés sur la version N-1 ne l'écrivent pas
+        pendant un déploiement par vagues (cas `canon_state.sync_completed_at`,
+        #5653/#5688). `sql` est l'instruction de cette version — copiée de son
+        stockage, ou son stub SQL — et `added` les colonnes que la migration du
+        lot ajoute : le banc refuse une instruction qui les nomme, sinon elle ne
+        prouverait rien. L'instruction est ensuite exécutée telle quelle contre
+        le schéma courant : les défauts, contraintes et triggers de
+        compatibilité s'appliquent comme pendant la vague. Le test appelle
+        ensuite le nouveau lecteur et vérifie qu'il tient sur la ligne écrite
+        par l'ancien code (CONTRIBUTING.md, « Compatibilité N-1 »).
+        """
+        self._check_n1_write(sql, added)
+        self.db.execute(sql, params)
+
+    def previous_insert(self, table: str, values, *, added) -> None:
+        """#5690 : insère une ligne comme le code N-1, sans les colonnes `added`.
+
+        `values` est l'ensemble des colonnes que l'ancien code connaît ; les
+        colonnes ajoutées par la migration sont absentes de l'INSERT, comme
+        dans son propre SQL. Voir [`previous_write`] pour la règle et la suite
+        du test (nouveau lecteur sur la ligne de l'ancien écrivain).
+        """
+        if not _N1_IDENT.fullmatch(str(table)):
+            raise ValueError("écriture N-1 : table invalide : %r" % (table,))
+        if not values:
+            raise ValueError("écriture N-1 : aucune colonne à insérer")
+        names = []
+        for column in values:
+            if not _N1_IDENT.fullmatch(str(column)):
+                raise ValueError("écriture N-1 : colonne invalide : %r" % (column,))
+            names.append(str(column))
+        self.previous_write(
+            "INSERT INTO %s (%s) VALUES (%s)"
+            % (table, ", ".join(names), ", ".join(["%s"] * len(names))),
+            tuple(values.values()), added=added)
+
+    def previous_update(self, table: str, values, *, where, added) -> None:
+        """#5690 : met à jour une ligne comme le code N-1, sans `added`.
+
+        `values` et `where` ne nomment que les colonnes que l'ancien code
+        connaît : les colonnes ajoutées par la migration restent hors de
+        l'UPDATE, comme dans son SQL. Voir [`previous_write`] pour la règle et
+        la suite du test (nouveau lecteur sur la ligne de l'ancien écrivain).
+        """
+        if not _N1_IDENT.fullmatch(str(table)):
+            raise ValueError("écriture N-1 : table invalide : %r" % (table,))
+        if not values or not where:
+            raise ValueError("écriture N-1 : colonnes à écrire et condition requises")
+        names = []
+        for column in values:
+            if not _N1_IDENT.fullmatch(str(column)):
+                raise ValueError("écriture N-1 : colonne invalide : %r" % (column,))
+            names.append(str(column))
+        conditions = []
+        for column in where:
+            if not _N1_IDENT.fullmatch(str(column)):
+                raise ValueError("écriture N-1 : colonne de condition invalide : %r"
+                                 % (column,))
+            conditions.append(str(column))
+        self.previous_write(
+            "UPDATE %s SET %s WHERE %s"
+            % (table,
+               ", ".join("%s = %%s" % name for name in names),
+               " AND ".join("%s = %%s" % name for name in conditions)),
+            tuple(values.values()) + tuple(where.values()), added=added)
 
     def drop_work_item_column(self, column, restore):
         """Remove a compatibility column; restore its exact UPDATE OF triggers.
