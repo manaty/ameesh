@@ -12,6 +12,12 @@ Les témoins couvrent la preuve (clé owner, ou approbation pré-signée), les
 refus (agent execute, bail vivant, harnais divergent, clé de rôle agent, sans
 approbation, approbation consommée) et le fait que le commit n'a pas à être
 HEAD : il a été créé sur un autre hôte.
+
+#5756 : le harnais est une propriété de la SESSION. Une liaison de session
+(toute ligne, révoquée comprise) fixe l'agent et le harnais ; sinon le harnais
+signé doit être un harnais déjà vu pour l'acteur (registre courant ou liaison
+passée). Le harnais courant divergent est écrit dans le meta de l'approbation
+et `provenance show` l'affiche.
 """
 from __future__ import annotations
 
@@ -21,7 +27,7 @@ import tempfile
 import unittest
 
 from ameesh import authority, registry, review_authors, review_provenance as prov
-from ameesh import signing, work
+from ameesh import session_bindings as sb, signing, storage, work
 
 from .support import PgTestCase, mechanics_canon
 
@@ -35,8 +41,8 @@ class SignedProvenanceTest(PgTestCase):
     def setUp(self):
         super().setUp()
         self.db.execute(
-            "TRUNCATE provenance_receipts, mesh_approvals, mesh_consumed_nonces"
-            " RESTART IDENTITY CASCADE")
+            "TRUNCATE provenance_receipts, mesh_approvals, mesh_consumed_nonces,"
+            " session_bindings RESTART IDENTITY CASCADE")
         registry.upsert(self.db, "bureau", harness="claude", host=self.cfg.host,
                         mode="externe")
         self.lot = work.add(self.db, title="un lot signé", app="ameesh",
@@ -102,6 +108,22 @@ class SignedProvenanceTest(PgTestCase):
             self.db, self.seed, approver=OWNER, action=prov.SIGNED_ACTION,
             artifact_kind=prov.SIGNED_KIND, artifact_hash=digest,
             decision=decision, meta={"statement": statement})
+
+    def bind(self, *, agent="bureau", session="s-bureau-old", harness="claude"):
+        return sb.bind(self.cfg, self.db, agent, session_id=session,
+                       harness=harness, by="human:test")
+
+    def unbind(self, *, session="s-bureau-old", harness="claude"):
+        return sb.unbind(self.cfg, self.db, session_id=session, harness=harness,
+                         by="human:test")
+
+    def approval_meta(self, receipt):
+        turn = str(receipt.get("turn") or "")
+        self.assertTrue(turn.startswith(prov.SIGNED_TURN_PREFIX))
+        row = storage.of(self.db).approvals.get(
+            int(turn[len(prov.SIGNED_TURN_PREFIX):]))
+        self.assertIsNotNone(row)
+        return row.get("meta") or {}
 
     # -- la preuve --------------------------------------------------------
     def test_an_owner_signed_commit_is_proven_outside_a_turn(self):
@@ -210,6 +232,73 @@ class SignedProvenanceTest(PgTestCase):
             self.sign(head, harness="codex")
         self.assertIn("registered under", str(raised.exception))
 
+    def test_a_past_binding_keeps_the_former_harness_known(self):
+        """#5756 : le registre au harnais COURANT ne cache pas la session passée.
+
+        Le bureau est passé de claude à codex au registre ; le commit signé a
+        été créé par une session claude (hôte sans ameesh, session jamais
+        liée). La liaison claude révoquée prouve que l'acteur a bien connu ce
+        harnais : l'attestation est acceptée, et le harnais courant divergent
+        reste lisible dans le meta de l'approbation."""
+        self.bind(session="s-claude-old", harness="claude")
+        self.unbind(session="s-claude-old", harness="claude")
+        registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
+                        mode="externe")
+        head = self.commit("claude d'hier")
+        row = self.sign(head, harness="claude")
+        self.assertTrue(row["recorded"])
+        receipt = prov.receipt_for_commit(self.db, head)
+        self.assertEqual(receipt["harness"], "claude")
+        self.assertEqual(self.approval_meta(receipt).get("registry_harness"),
+                         "codex")
+
+    def test_a_harness_never_seen_is_refused(self):
+        """#5756 : registre codex, aucune liaison claude -> refus nommé."""
+        registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
+                        mode="externe")
+        head = self.commit()
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            self.sign(head, harness="claude")
+        self.assertIn("registered under", str(raised.exception))
+        self.assertIn("no session binding", str(raised.exception))
+
+    def test_a_bound_session_keeps_its_own_harness(self):
+        """#5756 : une session liée en codex ne peut pas être signée en claude."""
+        self.bind(session="s-codex-1", harness="codex")
+        head = self.commit()
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            self.sign(head, session="s-codex-1", harness="claude")
+        self.assertIn("bound under", str(raised.exception))
+        self.assertIn("codex", str(raised.exception))
+
+    def test_a_revoked_binding_of_the_session_still_fixes_identity(self):
+        """#5756 : une liaison révoquée de la session compte encore."""
+        self.bind(session=SESSION, harness="claude")
+        self.unbind(session=SESSION, harness="claude")
+        head = self.commit()
+        row = self.sign(head, session=SESSION, harness="claude")
+        self.assertTrue(row["recorded"])
+        self.assertEqual(prov.receipt_for_commit(self.db, head)["harness"],
+                         "claude")
+
+    def test_a_bound_session_of_another_agent_is_refused(self):
+        """#5756 : la session déclarée garde l'agent de sa liaison."""
+        registry.upsert(self.db, "autre", harness="codex", host=self.cfg.host,
+                        mode="externe")
+        self.bind(agent="autre", session="s-autre-1", harness="codex")
+        head = self.commit()
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            self.sign(head, session="s-autre-1", harness="codex")
+        self.assertIn("bound to autre", str(raised.exception))
+
+    def test_the_current_harness_writes_no_extra_meta(self):
+        """#5756 : harnais courant égal au harnais signé, comportement inchangé."""
+        head = self.commit()
+        row = self.sign(head)
+        self.assertTrue(row["recorded"])
+        receipt = prov.receipt_for_commit(self.db, head)
+        self.assertNotIn("registry_harness", self.approval_meta(receipt))
+
     def test_the_signed_harness_must_be_a_compiled_family(self):
         head = self.commit()
         with self.assertRaises(prov.ProvenanceError) as raised:
@@ -299,6 +388,9 @@ class SignedProvenanceCliTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        self.db.execute(
+            "TRUNCATE provenance_receipts, mesh_approvals, mesh_consumed_nonces,"
+            " session_bindings RESTART IDENTITY CASCADE")
         registry.upsert(self.db, "bureau", harness="claude", host=self.cfg.host,
                         mode="externe")
         self.lot = work.add(self.db, title="un lot signé du CLI", app="ameesh",
@@ -340,6 +432,33 @@ class SignedProvenanceCliTest(PgTestCase):
         receipt = prov.receipt_for_commit(self.db, self.head)
         self.assertEqual(receipt["actor"], "bureau")
         self.assertTrue(receipt["turn"].startswith("signed:"))
+
+    def test_the_cli_shows_the_registry_harness_of_a_signed_receipt(self):
+        """#5756 : `provenance show` affiche le harnais courant divergent."""
+        import json
+        sb.bind(self.cfg, self.db, "bureau", session_id="s-claude-old",
+                harness="claude", by="human:test")
+        sb.unbind(self.cfg, self.db, session_id="s-claude-old", harness="claude",
+                  by="human:test")
+        registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
+                        mode="externe")
+        canon = mechanics_canon(os.path.join(self.tmp, "canon"))
+        env = self.env(AMEESH_CANON=canon, AMEESH_CANON_REF="HEAD")
+        out = self.mesh(
+            "provenance", "record", "--signed", "--commit", self.head,
+            "--actor", "bureau", "--session", SESSION, "--harness", "claude",
+            "--host", HOST, "--lot", str(self.lot["id"]),
+            "--key", self.key_path, "--as", OWNER, "--repo", self.repo,
+            env=env)
+        self.assertEqual(out.returncode, 0, out.stderr + out.stdout)
+        shown = self.mesh("provenance", "show", "--commit", self.head, "--json")
+        self.assertEqual(shown.returncode, 0, shown.stderr + shown.stdout)
+        data = json.loads(shown.stdout)
+        self.assertEqual(data["harness"], "claude")
+        self.assertEqual(data["registry_harness"], "codex")
+        shown = self.mesh("provenance", "show", "--commit", self.head)
+        self.assertEqual(shown.returncode, 0, shown.stderr + shown.stdout)
+        self.assertIn("registry harness: codex", shown.stdout)
 
     def test_the_statement_subcommand_prints_the_digest(self):
         out = self.mesh("provenance", "statement", "--commit", self.head,
