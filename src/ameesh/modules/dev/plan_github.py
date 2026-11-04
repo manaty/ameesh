@@ -1759,7 +1759,7 @@ TITLE_MAX = 256
 BODY_MAX = 30000
 SUMMARY_MAX = 300
 #: clé `github` de la configuration de l'hôte : clés admises, cadence
-SETTINGS_KEYS = ("projects", "host", "interval", "ci_ttl", "exclude_terms", "process")
+SETTINGS_KEYS = ("projects", "host", "interval", "ci_ttl", "exclude_terms", "process", "ci_disk_native")
 #: #2130/D : clés admises d'un mapping Process (data only, compilé au chargement)
 PROCESS_KEYS = ("ref", "version", "document", "labels")
 #: forme longue d'un projet : `repo`, les workflows suivis par le veilleur de
@@ -1836,6 +1836,8 @@ class Settings:
     #: leurs libellés de board ; un lot pinné n'est projeté que par un mapping
     #: admis de son couple exact (ref, version). Vide : aucune greffe.
     process: dict = field(default_factory=dict)
+    #: #5751 : {dépôt: {hôte physique: destination SSH}}, sans secret.
+    ci_disk_native: dict = field(default_factory=dict)
 
     def process_for(self, project: str | None) -> tuple:
         """Les mappings admis d'un projet (nom sans casse), ou () — opt-in."""
@@ -2047,10 +2049,16 @@ def parse_settings(raw) -> Settings:
             raise SettingsError("`github.process`: project %s declared twice (case-insensitive)"
                                 % canonical)
         process[canonical] = _process_mappings(canonical, value)
+    native = raw.get("ci_disk_native", {})
+    from ... import ci_disk
+    try:
+        native = ci_disk.native_settings(native, set(projects.values()))
+    except ValueError as exc:
+        raise SettingsError("`github.ci_disk_native`: %s" % exc) from exc
     return Settings(projects=projects, host=(host or "").strip() or None,
                     interval=float(interval), ci_ttl=float(ci_ttl),
                     exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)),
-                    workflows=workflows, bases=bases, process=process)
+                    workflows=workflows, bases=bases, process=process, ci_disk_native=native)
 
 
 def settings_of(cfg) -> Settings:

@@ -9,12 +9,18 @@ Le contrôle est ponctuel, pas une réservation contre les autres jobs de la VM.
 from __future__ import annotations
 
 import argparse
+import json
+import threading
+import time
+import uuid
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import tempfile
 
+NATIVE_DIR = Path("/var/lib/ameesh-ci-disk")
 GIB = 1024 ** 3
 MIN_LIBRE_GIB = 5.0
 MIN_TMP_GIB = 1.0  # le banc autre-fs dispose d'un tmpfs distinct
@@ -31,6 +37,78 @@ def verifier(chemin: Path, minimum_gib: float) -> None:
                       % (chemin, libre / GIB, etat.f_favail, minimum_gib, MIN_INODES))
 
 
+def signaler_refus(erreur):
+    """Trace persistante indépendante de GitHub ; pas de données de test."""
+    dossier = NATIVE_DIR
+    event = {"schema": "ameesh-ci-disk-refusal/1",
+             "host": os.environ.get("AMEESH_CI_DISQUE_HOST") or socket.gethostname(),
+             "id": uuid.uuid4().hex, "repo": os.environ.get("GITHUB_REPOSITORY", ""),
+             "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+             "attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
+             "job": os.environ.get("GITHUB_JOB", ""),
+             "runner": os.environ.get("RUNNER_NAME", ""),
+             "sampled_ts": time.time(), "reason": str(erreur)[:1000]}
+    # Deux transports, même identifiant : la notice reste utilisable quand
+    # ENOSPC empêche précisément d'écrire le refus local.
+    print("::notice title=ameesh-ci-disk-refusal/1::" + json.dumps(event).replace("%", "%25"), flush=True)
+    try:
+        # Le dossier est installé pour runner. Ne pas le créer dans le dépôt
+        # ni en /tmp : le ménage des tests ne doit pas effacer cette preuve.
+        temporaire = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=dossier, delete=False) as fichier:
+                temporaire = Path(fichier.name)
+                json.dump(event, fichier)
+            os.replace(temporaire, dossier / ("refus-%s.json" % event["id"]))
+        finally:
+            if temporaire is not None:
+                temporaire.unlink(missing_ok=True)
+    except OSError as exc:
+        print("::warning::#5751 : refus disque non conservé par la sonde native : %s" % exc,
+              flush=True)
+
+
+class Consommation:
+    """Minimum physique observé toutes les secondes pendant une part.
+
+    L'espace de la VM est partagé : la baisse inclut les jobs concurrents,
+    ce n'est donc pas une attribution exclusive aux tests de cette part.
+    """
+    def __init__(self):
+        self.stop = threading.Event()
+        self.before = self.minimum = None
+        self.thread = None
+
+    def relever(self):
+        try:
+            st = os.statvfs("/")
+            libre = st.f_bavail * st.f_frsize
+            if self.before is None:
+                self.before = libre
+            self.minimum = libre if self.minimum is None else min(self.minimum, libre)
+        except OSError:
+            pass
+
+    def boucle(self):
+        while not self.stop.wait(1):
+            self.relever()
+
+    def __enter__(self):
+        self.relever()
+        self.thread = threading.Thread(target=self.boucle, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop.set()
+        self.thread.join(timeout=2)
+        self.relever()
+        print("#5751 : consommation disque observée par part : " + json.dumps({
+            "before_bytes": self.before, "minimum_bytes": self.minimum,
+            "drop_bytes": None if self.before is None else self.before - self.minimum,
+            "scope": "VM partagée, autres jobs inclus", "period_s": 1}), flush=True)
+
+
 def executer(commande: list[str]) -> int:
     # Garder le parent temporaire choisi par le job (dont le tmpfs autre-fs),
     # et un nom court : les sockets Unix de gpg ont une limite de chemin.
@@ -45,8 +123,9 @@ def executer(commande: list[str]) -> int:
     except OSError as erreur:
         print("::warning::CI non concluante : marge disque insuffisante ou "
               "illisible ; aucun test lancé (#5742) : %s" % erreur, flush=True)
+        signaler_refus(erreur)
         return 75
-    with dossier as racine:
+    with dossier as racine, Consommation():
         env = dict(os.environ, TMPDIR=racine, TMP=racine, TEMP=racine)
         print("#5742 : temporaires de cette part : %s" % racine, flush=True)
         anciens = {}

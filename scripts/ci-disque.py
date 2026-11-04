@@ -70,6 +70,7 @@ import tempfile
 import time
 from pathlib import Path
 
+NATIVE_DIR = Path("/var/lib/ameesh-ci-disk")
 GIB = 1024 ** 3
 SEUIL_GIB = 5.0
 AGE_HEURES = 6.0            # conteneurs arrêtés et volumes non utilisés
@@ -340,16 +341,64 @@ def rapport(complet: bool = False, seuil_gib: float | None = None) -> dict:
     return etat
 
 
-def mesure(hote=None):
+def mesure(hote=None, *, snapshot=False):
     """#5630 : petite sonde indépendante de docker, lisible via Checks API."""
     disque = espace("/")
-    document = {"schema": "ameesh-ci-disk/1", "host": hote or socket.gethostname(),
+    document = {"schema": "ameesh-ci-disk/1", "host": hote or os.environ.get("AMEESH_CI_DISQUE_HOST") or socket.gethostname(),
                 "volume": disque["chemin"], "free_bytes": disque["libre"],
                 "total_bytes": disque["total"], "used_pct": disque["utilise_pct"],
-                "hostname": socket.gethostname()}
+                "hostname": socket.gethostname(), "sampled_ts": time.time()}
+    if snapshot:
+        dossier = NATIVE_DIR
+        temporaire = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=dossier, delete=False) as fichier:
+                temporaire = Path(fichier.name)
+                json.dump(document, fichier)
+            os.replace(temporaire, dossier / "snapshot.json")
+        finally:
+            if temporaire is not None:
+                temporaire.unlink(missing_ok=True)
     # Une notice même au vert : sa lecture permet de résoudre l'alerte.
     print("::notice title=ameesh-ci-disk/1::" + json.dumps(document, separators=(",", ":")))
     return document
+
+
+def _document_natif(chemin):
+    # Les tests tournent sous le même uid : une FIFO ou un lien dans le
+    # spool ne doit jamais bloquer le transport ni lui faire lire autre chose.
+    fd = os.open(chemin, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fichier:
+        etat = os.fstat(fichier.fileno())
+        if not stat.S_ISREG(etat.st_mode) or etat.st_size > 16384:
+            raise ValueError("document natif non régulier ou trop grand")
+        return json.loads(fichier.read(16385))
+
+
+def natif():
+    """#5751 : transport SSH borné du relevé natif et des refus de parts.
+
+    Ne refait pas la mesure : son âge révèle un timer arrêté. Pas de secret,
+    de DSN ni d'appel GitHub sur la VM. Les refus restent sept jours pour
+    survivre aux coupures du veilleur ; aucun acquittement distant destructif.
+    """
+    dossier = NATIVE_DIR
+    try:
+        snapshot = _document_natif(dossier / "snapshot.json")
+    except (OSError, ValueError):
+        snapshot = None
+    refus = []
+    for chemin in sorted(dossier.glob("refus-*.json"))[:10000]:
+        try:
+            if chemin.is_symlink() or chemin.stat().st_size > 16384:
+                continue
+            if time.time() - chemin.stat().st_mtime > 7 * 86400:
+                chemin.unlink()
+                continue
+            refus.append(_document_natif(chemin))
+        except (OSError, ValueError):
+            continue
+    print(json.dumps({"snapshot": snapshot, "refusals": refus}, separators=(",", ":")))
 
 
 def _resume_rapport(etat: dict) -> None:
@@ -1674,6 +1723,9 @@ def _analyse(argv=None):
                                 help="seuil d'alerte en GiB (défaut %(default)s)")
     mesure_parser = sous.add_parser("mesure", help="sonde disque structurée sans docker")
     mesure_parser.add_argument("--host", help="nom Host du mesh, lié au label de la VM")
+    mesure_parser.add_argument("--snapshot", action="store_true",
+                               help="conserve le relevé horodaté natif (#5751)")
+    sous.add_parser("natif", help="lit le relevé et les refus locaux pour le veilleur SSH")
     menage_parser = sous.add_parser("menage", help="élague ce qui n'est plus utilisé")
     menage_parser.add_argument("--dry-run", action="store_true",
                                help="imprime les commandes, ne supprime rien")
@@ -1688,7 +1740,10 @@ def _analyse(argv=None):
 def main(argv=None) -> int:
     args = _analyse(argv)
     if args.mode == "mesure":
-        mesure(args.host)
+        mesure(args.host, snapshot=args.snapshot)
+        return 0
+    if args.mode == "natif":
+        natif()
         return 0
     if args.mode == "rapport":
         rapport(complet=args.complet, seuil_gib=args.seuil_gib)

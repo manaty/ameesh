@@ -490,6 +490,26 @@ class CiResults(interface.CiResults):
             self.db.execute("DELETE FROM ci_disk_state WHERE lower(repo) NOT IN (%s)"
                             % ", ".join(["%s"] * len(keys)), tuple(keys))
 
+    def observe_disk_refusal(self, repo, *, host, event_id, payload) -> None:
+        self.db.execute(
+            "INSERT INTO ci_disk_refusals (repo, host, event_id, payload) "
+            "VALUES (%s, %s, %s, %s::jsonb) ON CONFLICT DO NOTHING",
+            (repo, host, event_id, json.dumps(payload)))
+
+    def disk_refusals(self, repo) -> list[dict]:
+        self.db.execute("DELETE FROM ci_disk_refusals WHERE message_id IS NOT NULL "
+                        "AND seen_at < now() - interval '8 days'")
+        return self.db.query(
+            "SELECT repo, host, event_id, payload FROM ci_disk_refusals "
+            "WHERE repo = %s AND message_id IS NULL ORDER BY seen_at, event_id "
+            "LIMIT 100 FOR UPDATE SKIP LOCKED", (repo,))
+
+    def set_disk_refusal_message(self, repo, *, host, event_id, message_id) -> None:
+        self.db.execute(
+            "UPDATE ci_disk_refusals SET message_id = %s "
+            "WHERE repo = %s AND host = %s AND event_id = %s",
+            (message_id, repo, host, event_id))
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     def claim_guard_scan(self, repo, *, now, window_s) -> bool:
         """Revendique la fenêtre du relevé de `repo`, atomiquement.

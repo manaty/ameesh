@@ -655,6 +655,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'repo', 'host', 'volume', 'run_id', 'sampled_at', 'free_bytes',
         'total_bytes', 'first_seen_at', 'seen_at'
     ]),
+    -- #5751 (0544) : état de livraison des refus ; payload est un contenu.
+    ('ci_disk_refusals', ARRAY[
+        'repo', 'host', 'event_id', 'message_id', 'seen_at'
+    ]),
     -- #3344 (0480) : dernière carte de mesure publiée (même nature :
     -- identifiants, tête, horodatages, aucun contenu)
     ('ci_map_state', ARRAY[

@@ -4677,6 +4677,9 @@
    "ci": [
     "disks",
     "expect_disk",
+    "observe_disk_refusal",
+    "disk_refusals",
+    "set_disk_refusal_message",
     "forget_disks",
     "observe_disk",
     "prune_disks",

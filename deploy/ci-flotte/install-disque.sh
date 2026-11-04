@@ -22,7 +22,9 @@ check() {
     if ! cmp -s "$src" "$dest"; then echo "KO missing or differs: $dest"; ko=1
     else echo "OK $dest"; fi
   done
+  [ -d "$R/var/lib/ameesh-ci-disk" ] || { echo 'KO native disk spool absent'; ko=1; }
   if [ -z "$R" ]; then
+    [ "$(stat -c %U /var/lib/ameesh-ci-disk)" = runner ] || { echo 'KO native disk spool owner'; ko=1; }
     [ -f /etc/ameesh-ci-disque.env ] || { echo 'KO /etc/ameesh-ci-disque.env absent'; ko=1; }
     systemctl is-active --quiet "$TIMER" || { echo "KO $TIMER inactive"; ko=1; }
   fi
@@ -33,6 +35,11 @@ case "$MODE" in
     if [ -z "$R" ] && [ ! -f /etc/ameesh-ci-disque.env ]; then
       echo 'poser /etc/ameesh-ci-disque.env depuis le fichier exemple avant installation' >&2
       exit 1
+    fi
+    if [ -z "$R" ]; then
+      install -d -o runner -g runner -m 0750 /var/lib/ameesh-ci-disk
+    else
+      install -d -m 0750 "$R/var/lib/ameesh-ci-disk"
     fi
     install -D -m 0755 "$HERE/../../scripts/ci-disque.py" "$R$TOOL"
     for unit in "$SERVICE" "$TIMER"; do

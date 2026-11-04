@@ -243,3 +243,79 @@ lectures sont bornées ; un log illisible ou tronqué ne permet aucune
 exemption. Le détail reste publié en `neutral` quand seule l'infrastructure
 est en cause et que chaque famille conserve une part réussie. Une famille
 sans aucune preuve réussie garde la garde de preuve absente (#3449).
+
+### Collecte native et refus des parts (#5751)
+
+Le cron GitHub est un transport de secours : une heure planifiée ne garantit
+pas une exécution. Pour chaque VM suivie, le service natif conserve désormais
+`/var/lib/ameesh-ci-disk/snapshot.json` avant et après le ménage. Le relevé
+porte son horodatage de mesure ; le lecteur SSH ne le rafraîchit jamais.
+Une panne de ménage ne bloque pas la première mesure. Le timer reste à
+30 minutes, avec une borne de quinze minutes pour le service.
+
+Sur l'hôte du veilleur élu, ajouter à la clé `github` de la configuration :
+
+```json
+{
+  "ci_disk_native": {
+    "owner/repository": {
+      "ci-vm-a": "runner@ci-vm-a",
+      "ci-vm-b": "runner@ci-vm-b"
+    }
+  }
+}
+```
+
+Le dépôt doit déjà figurer dans `github.projects`. Les noms de machines et
+les destinations SSH viennent de cette configuration, jamais des PR. Le
+compte du veilleur doit disposer d'une connexion SSH sans interaction, avec
+les clés d'hôtes vérifiées ; aucune désactivation de leur vérification,
+aucun DSN du mesh sur les VM. La commande distante est fixée à
+`/usr/local/lib/ameesh-ci/ci-disque.py natif`. Le nom physique du relevé
+(`hostname` par défaut) doit correspondre à la clé de la configuration ;
+si nécessaire, poser `AMEESH_CI_DISQUE_HOST` dans le fichier d'environnement
+du service natif. Ne pas utiliser les noms des slots `r1`, `r2` comme hôtes.
+
+Activation par le bureau, après intégration : appliquer d'abord la migration
+additive 0544 sur le mesh, actualiser les contrats de lecture superviseur
+(métadonnées en état, diagnostic réservé au rôle contenus), installer le
+script et le service avec
+`install-disque.sh --install`, lancer une première passe native, vérifier
+`install-disque.sh --check`, puis configurer toutes les VM attendues sur le
+veilleur. Vérifier la lecture SSH sous le compte réel du veilleur et la date
+physique dans `ci_disk_state`. Les anciennes annotations GitHub ne sont plus
+lues pour un dépôt configuré en natif : elles ne doivent pas masquer un timer
+arrêté. Sans configuration native, le transport historique reste disponible.
+
+La collecte native précède tout accès GitHub et se répète au plus toutes les
+cinq minutes. Une destination en panne ne retient pas les autres. Chaque
+machine configurée est attendue même si elle n'a jamais rendu de mesure :
+après les deux heures de grâce initiale, une absence ou un relevé de plus de
+deux heures lève `ci_disk_unreadable`. Une ancienne mesure basse continue de
+lever `ci_disk_low` ; une lecture ratée ne la transforme pas en zéro ni en vert.
+
+Chaque refus de marge de la garde #5742 produit un fichier `refus-<UUID>.json`
+et une annotation `ameesh-ci-disk-refusal/1`. Le répertoire persistant est
+installé pour `runner`, hors du workspace et des temporaires des tests. Si
+ENOSPC empêche même cette écriture, l'annotation reste le secours. Le veilleur
+récupère les fichiers par SSH et les annotations des jobs en échec de la
+tentative suivie. La migration 0544 conserve les refus et leur courrier ;
+l'UUID commun aux deux transports évite les doubles envois, y compris après
+un redémarrage ou avec un alias différent pour la machine. L'envoi au pilote
+et son acquittement sont dans une même transaction. Aucun destinataire ou
+un envoi en panne laisse le refus en attente ; aucun test négatif ni verdict
+rouge n'est inventé. Les fichiers restent sept jours et les acquittements
+huit jours ; les refus non acquittés restent dus en base. Le transport lit au
+plus 10 000 fichiers par passe et envoie au plus 100 courriers par transaction.
+Une interruption de collecte dépassant sept jours dépasse la rétention locale.
+
+Le seuil reste **5 GiB**, avec **10 000 inodes**. Chaque part affiche son libre
+initial, le minimum observé sur `/` toutes les secondes et leur différence
+(`#5751 : consommation disque observée par part`). Cette baisse physique
+inclut les jobs concurrents et ne constitue pas une attribution exclusive à
+la part. Comparer ces observations sur les VM de 60 Go avant de modifier le
+seuil ; aucune nouvelle mesure sous charge n'est revendiquée par ce lot.
+
+Retour arrière : retirer `github.ci_disk_native` du veilleur rétablit la
+lecture des annotations historiques. Revenir au script/service précédent
+avec `install-disque.sh --install` ; la table additive peut rester en place.
