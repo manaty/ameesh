@@ -74,6 +74,22 @@ class EvidenceTest(unittest.TestCase):
         self.assertFalse(agregat.disk_infrastructure(job(), traceback(
             "AssertionError: git init: 'No space left on device' not found in '[Errno 28]'")))
 
+    def test_extraits_reels_figes_des_neuf_check_runs(self):
+        checks = json.loads((ROOT / "tests/fixtures/5742/run-41811687787.json").read_text())
+        self.assertEqual(len(checks), 9)
+        self.assertEqual(sum(len(check["events"]) for check in checks), 47)
+        for check in checks:
+            for event in check["events"]:
+                with self.subTest(check=check["check_run"], test=event["test"]):
+                    self.assertEqual(agregat.disk_infrastructure(
+                        job(), traceback(event["extrait"], event["test"])),
+                        event["expected_disk_infrastructure"])
+        # La même part contient un ENOSPC explicite et une assertion de porte :
+        # le voisinage ne transforme pas l'assertion en panne d'infrastructure.
+        combined = "".join(traceback(event["extrait"], event["test"])
+                           for event in checks[0]["events"])
+        self.assertFalse(agregat.disk_infrastructure(job(), combined))
+
     def test_stderr_multiligne_du_run_41811687787(self):
         for evidence in (
                 "AssertionError: 1 != 0 : OSError: [Errno 28] No space left on device\n\n"
