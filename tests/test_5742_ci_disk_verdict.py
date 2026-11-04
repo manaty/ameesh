@@ -74,6 +74,20 @@ class EvidenceTest(unittest.TestCase):
         self.assertFalse(agregat.disk_infrastructure(job(), traceback(
             "AssertionError: git init: 'No space left on device' not found in '[Errno 28]'")))
 
+    def test_code_retour_non_nul_avec_stderr_enospc(self):
+        for stderr in ("fatal: cannot mkdir: No space left on device",
+                       "fatal: cannot mkdir: [Errno 28]"):
+            with self.subTest(stderr=stderr):
+                self.assertTrue(agregat.disk_infrastructure(job(), traceback(
+                    "AssertionError: 128 != 0 : " + stderr)))
+        for final in (
+                "AssertionError: 'No space left on device' != 'other'",
+                "AssertionError: 128 != 0 : fatal: permission denied",
+                "AssertionError: 0 != 128 : No space left on device",
+                "AssertionError: 1 != 2 : No space left on device"):
+            with self.subTest(final=final):
+                self.assertFalse(agregat.disk_infrastructure(job(), traceback(final)))
+
     def test_avertissement_recupere_ne_suffit_pas(self):
         for text in ("No space left on device\n", "ENOSPC\n",
                      "No space left on device\nFAILED (errors=1)\n"):

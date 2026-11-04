@@ -181,7 +181,11 @@ def disk_infrastructure(job: dict, text: str) -> bool:
         def disk_block(block):
             lines = [line.strip() for line in block.splitlines() if line.strip()]
             final = lines[-1] if lines else ""
-            # Une comparaison reste négative, même après une cause ENOSPC.
+            # Seul un code de retour non nul comparé à zéro peut remonter
+            # stderr ; les comparaisons de chaînes restent négatives.
+            returncode = re.match(r"AssertionError: -?[1-9][0-9]* != 0 : (.+)$", final)
+            if returncode and disk.search(returncode.group(1)):
+                return True
             if re.search(r"not found in| != |does not match|not raised", final, re.I):
                 return False
             if final_disk.search(final):
