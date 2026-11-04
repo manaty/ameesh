@@ -233,3 +233,13 @@ entre deux suites. Elle ne supprime ni les temporaires des autres parts ni
 ceux écrits explicitement hors de ce dossier. Après SIGKILL ou arrêt brutal
 de la VM, le dossier peut rester ; la rétention conservatrice prend le relais.
 Ne pas abaisser sa garde d'âge pour récupérer de la place pendant des jobs.
+
+Le bilan requis lit aussi les logs complets des parts Linux en échec.
+Un refus explicite de la garde, un Worker mort en ENOSPC ou des tracebacks
+exclusivement ENOSPC sont consignés comme infrastructure, sans « négatif
+prouvé ». Un autre traceback négatif dans la même part, ou une autre part
+en échec, garde le rouge. Un avertissement disque seul ne suffit pas. Les
+lectures sont bornées ; un log illisible ou tronqué ne permet aucune
+exemption. Le détail reste publié en `neutral` quand seule l'infrastructure
+est en cause et que chaque famille conserve une part réussie. Une famille
+sans aucune preuve réussie garde la garde de preuve absente (#3449).
