@@ -29,14 +29,23 @@ Ce module rend cette limite **visible et partagée** :
 * `reason` reste le pré-contrôle lisible (choix et affichage) ; il refuse un
   nouveau tour quand le cooldown court, quand l'écart minimal depuis le
   dernier début n'est pas écoulé, ou quand le nombre de places actives du
-  compte atteint `max_concurrent` (2 pour Codex ; l'écart de 30 s est le
-  levier principal : cinq débuts en 90 s suffisaient à voir des 429 même avec
-  un seul tour actif). Une place porte le harnais et le compte **effectifs**
-  du tour : un agent Claude/DeepSeek qui emprunte Codex compte dans le plafond
-  Codex. Le bail vivant est relu au registre central
+  compte atteint `max_concurrent` (2 pour un compte de forfait Codex ; l'écart
+  de 30 s est le levier principal : cinq débuts en 90 s suffisaient à voir des
+  429 même avec un seul tour actif). Une place porte le harnais et le compte
+  **effectifs** du tour : un agent Claude/DeepSeek qui emprunte Codex compte
+  dans le plafond Codex. Le bail vivant est relu au registre central
   (`agent_registry.status = 'running'`, **bail vivant**), donc cross-hôtes ;
 * `rows`/`format` nourrissent `ameesh accounts list` : la « jauge de fenêtre
   courte » demandée par le témoin du lot.
+
+#5783 — la garde par défaut ne vise QUE les comptes de forfait : le bucket de
+rafale modélisé est celui d'un abonnement ChatGPT, pas d'une clé d'API
+facturée au token. Un profil `type: api_key_env` garde la journalisation des
+429 et le cooldown partagé, mais part sans plafond ni écart (`max_concurrent`
+et `min_start_gap_s` à 0) tant que son profil ne les déclare pas ; une
+surcharge explicite reste souveraine, dans les deux sens. Le refus porte une
+raison distincte (`account window: …`), écrite telle quelle dans
+`status_text`, pour qu'un lecteur ne la confonde pas avec une pause budget.
 
 Aucun secret ne transite : seuls le nom du compte, celui de l'agent, l'hôte et
 le texte d'erreur du fournisseur (borné) sont écrits. Un backend de stockage
@@ -58,9 +67,15 @@ SHORT_WINDOW_HARNESSES = ("codex",)
 #: Défauts d'admission par harnais, surchargeables par le profil de compte
 #: (`max_concurrent`, `min_start_gap_s`). Codex : 2 tours actifs au plus, et
 #: 30 s entre deux débuts de tour — cinq débuts en 90 s suffisaient à produire
-#: des 429 même avec un seul tour actif (#41702, relevé #3779).
+#: des 429 même avec un seul tour actif (#41702, relevé #3779). #5783 : ces
+#: valeurs ne valent que pour un compte de forfait (`config_dir`, connexion
+#: ChatGPT) ; une clé d'API mesurée n'a pas ce bucket et part sans garde.
 DEFAULT_MAX_ACTIVE = {"codex": 2}
 DEFAULT_MIN_START_GAP_S = {"codex": 30.0}
+
+#: Types de profil portant un forfait (connexion / abonnement). Les autres
+#: (`api_key_env`, clé mesurée) n'ont pas le bucket de rafale du forfait.
+PLAN_KINDS = ("config_dir",)
 
 #: Fenêtre d'observation des 429 (15 min).
 BURST_WINDOW_S = 900.0
@@ -94,27 +109,53 @@ def enabled(harness: str | None) -> bool:
     return (harness or "") in SHORT_WINDOW_HARNESSES
 
 
+def _defaults_apply(profile) -> bool:
+    """Le profil sans surcharge reçoit-il les défauts du harnais ?
+
+    #5783 : seulement un compte de forfait (`config_dir`). Un profil
+    `api_key_env` (clé mesurée) part sans garde par défaut. Sans profil
+    (harnais d'avant L30, `(default)` synthétique, affichage d'un compte non
+    déclaré), on garde le défaut historique : c'est un compte de forfait.
+    """
+    if profile is None:
+        return True
+    return getattr(profile, "kind", "config_dir") in PLAN_KINDS
+
+
 def max_active(harness: str, profile=None) -> int:
     """Le plafond de tours simultanés du compte (0 = pas de garde).
 
     Le profil de compte (`accounts.Profile`) peut le régler (`max_concurrent`,
-    `None` = défaut du harnais ; 0 = garde désactivée).
+    `None` = défaut du harnais ; 0 = garde désactivée). #5783 : sans surcharge,
+    le défaut ne vaut que pour un compte de forfait ; une clé d'API mesurée
+    n'a aucun plafond par défaut.
     """
     value = getattr(profile, "max_concurrent", None) if profile is not None else None
     if value is not None:
         return int(value)
+    if not _defaults_apply(profile):
+        return 0
     return int(DEFAULT_MAX_ACTIVE.get(harness or "", 0) or 0)
 
 
 def min_start_gap(harness: str, profile=None) -> float:
     """L'écart minimal entre deux débuts de tour du compte, en secondes.
 
-    Surchargeable par le profil (`min_start_gap_s` ; 0 = pas d'écart).
+    Surchargeable par le profil (`min_start_gap_s` ; 0 = pas d'écart). #5783 :
+    sans surcharge, le défaut ne vaut que pour un compte de forfait ; une clé
+    d'API mesurée n'a aucun écart par défaut.
     """
     value = getattr(profile, "min_start_gap_s", None) if profile is not None else None
     if value is not None:
         return float(value)
+    if not _defaults_apply(profile):
+        return 0.0
     return float(DEFAULT_MIN_START_GAP_S.get(harness or "", 0.0) or 0.0)
+
+
+def guarded(harness: str, profile=None) -> bool:
+    """Ce compte a-t-il un plafond ou un écart à tenir ? (#5783)"""
+    return max_active(harness, profile) > 0 or min_start_gap(harness, profile) > 0
 
 
 def _blank(harness: str, account: str, profile=None) -> dict:
@@ -163,13 +204,16 @@ def state(db, harness: str, account: str, now: float | None = None,
     if api is None:
         return out
     try:
-        rows = api.active(harness, account) or []
-        out["active"] = [
-            {"name": row.get("name"), "host": row.get("host"),
-             "status_since_ts": row.get("status_since_ts")}
-            for row in rows if row.get("name") != exclude_agent
-        ]
-        out["active_count"] = len(out["active"])
+        # #5783 : ni plafond ni écart (clé d'API par défaut) — inutile de lire
+        # les places et les débuts ; le cooldown des 429, lui, reste lu.
+        if out["max_active"] > 0:
+            rows = api.active(harness, account) or []
+            out["active"] = [
+                {"name": row.get("name"), "host": row.get("host"),
+                 "status_since_ts": row.get("status_since_ts")}
+                for row in rows if row.get("name") != exclude_agent
+            ]
+            out["active_count"] = len(out["active"])
         recent = api.recent(harness, account, BURST_WINDOW_S) or {}
         out["recent_429"] = int(recent.get("count") or 0)
         out["last_429_at"] = recent.get("last_at_ts")
@@ -182,11 +226,12 @@ def state(db, harness: str, account: str, now: float | None = None,
         # #3779 : l'écart entre deux débuts se lit sur le journal des débuts,
         # que le statut `running` ne suffit pas à donner (un tour fini change
         # `status_since`).
-        last_start = api.last_start(harness, account) or {}
-        out["last_start_at"] = last_start.get("last_at_ts")
-        if out["last_start_at"] is not None and out["min_start_gap_s"] > 0:
-            out["next_start_at"] = (float(out["last_start_at"])
-                                    + out["min_start_gap_s"])
+        if out["min_start_gap_s"] > 0:
+            last_start = api.last_start(harness, account) or {}
+            out["last_start_at"] = last_start.get("last_at_ts")
+            if out["last_start_at"] is not None:
+                out["next_start_at"] = (float(out["last_start_at"])
+                                        + out["min_start_gap_s"])
         out["source"] = "journal"
     except Exception as exc:  # noqa: BLE001 - état illisible : pas de garde, jamais d'échec
         _log("[account_window] %s/%s state unreadable (%s)"
@@ -212,35 +257,53 @@ def _delay(seconds: float) -> str:
 
 
 def _reason_from_state(st: dict, now: float) -> str:
-    """La raison de pause déduite d'un état déjà lu (aucune E/S)."""
+    """La raison de pause déduite d'un état déjà lu (aucune E/S).
+
+    #5783 : le préfixe `account window:` est distinct de celui d'une pause
+    budget (`budget : `) ; `ameesh show` et `status_text` le portent tel quel,
+    et un lecteur machine n'a pas à lire le message générique « compte ou
+    budget indisponible ». Les sous-chaînes historiques (`short-window
+    cooldown`, `next turn in`, `n/m concurrent turns`) restent là : des
+    `status_text` déjà écrits les portent, et les reconnaisseurs les lisent.
+    """
     account = st.get("account") or "?"
     if st.get("cooldown_until") and float(st["cooldown_until"]) > now:
-        return ("account %s: short-window cooldown until %s (in %s; %d provider "
-                "429 in %s, shared burst bucket, #3779)" % (
-                    account, _moment(st["cooldown_until"]),
+        return ("account window: short-window cooldown until %s (in %s; %d provider "
+                "429 in %s, shared burst bucket, #3779; account %s)" % (
+                    _moment(st["cooldown_until"]),
                     _delay(float(st["cooldown_until"]) - now),
-                    st["recent_429"], _delay(BURST_WINDOW_S)))
-    if st.get("next_start_at") and float(st["next_start_at"]) > now:
-        return ("account %s: next turn in %s (start gap %.0fs between turns, "
-                "#3779; last start %s)" % (
-                    account, _delay(float(st["next_start_at"]) - now),
-                    float(st.get("min_start_gap_s") or 0.0),
-                    _moment(st.get("last_start_at"))))
+                    st["recent_429"], _delay(BURST_WINDOW_S), account))
     if st.get("max_active") and st["active_count"] >= st["max_active"]:
         others = ", ".join(str(row.get("name") or "?") for row in st["active"][:3])
-        return ("account %s: %d/%d concurrent turns (provider burst bucket shared "
-                "by sessions, #3779%s)" % (
-                    account, st["active_count"], st["max_active"],
+        # L'écart de départ peut courir en même temps que le plafond : on le
+        # donne avec lui, comme « 2/2 active, next start in 12 s ».
+        suivant = ""
+        if st.get("next_start_at") and float(st["next_start_at"]) > now:
+            suivant = ", next start in %s" % _delay(
+                float(st["next_start_at"]) - now)
+        return ("account window: %d/%d concurrent turns%s (provider burst bucket "
+                "shared by sessions, #3779; account %s%s)" % (
+                    st["active_count"], st["max_active"], suivant, account,
                     "; running: %s" % others if others else ""))
+    if st.get("next_start_at") and float(st["next_start_at"]) > now:
+        return ("account window: next turn in %s (start gap %.0fs between turns, "
+                "#3779; last start %s; account %s)" % (
+                    _delay(float(st["next_start_at"]) - now),
+                    float(st.get("min_start_gap_s") or 0.0),
+                    _moment(st.get("last_start_at")), account))
     return ""
 
 
 #: #3876 : les trois raisons de `_reason_from_state` (cooldown, écart de
 #: début, plafond de tours). Toutes durent au plus `COOLDOWN_MAX_S` : un agent
 #: ainsi retenu reste un relecteur, sa prochaine admission lira le courrier.
+#: #5783 : le préfixe `account window:` s'ajoute aux formes déjà persistées
+#: (`account <nom>: …`), qui restent reconnues tant qu'un `status_text` ancien
+#: est en base.
 _SHORT_WINDOW = re.compile(
-    r"account [^:]*: (?:short-window cooldown until |next turn in "
-    r"|\d+/\d+ concurrent turns )", re.IGNORECASE)
+    r"(?:account window\b"
+    r"|account [^:]*: (?:short-window cooldown until |next turn in "
+    r"|\d+/\d+ concurrent turns ))", re.IGNORECASE)
 
 
 def is_short_window(text: str) -> bool:
@@ -322,6 +385,12 @@ def claim_start(db, harness: str, account: str | None, host: str, agent: str,
     tour. Sans `begin` (outil ou test), le journal des débuts et la place sont
     écrits ; la place ne compte que si le bail du registre est vivant.
 
+    #5783 : un compte sans garde (`max_active == 0` et écart nul, défaut d'une
+    clé d'API mesurée) ne pose ni place ni début — le cooldown des 429 est
+    quand même relu sous le verrou, puis le tour est ouvert par le chemin
+    normal (`begun=False`). Cela évite d'écrire deux lignes par tour pour un
+    compte qui peut servir une centaine d'agents.
+
     Fail-open si le journal est indisponible (base absente, backend médié sans
     contrat) : `Admission()` sans `begun`, l'appelant ouvre le tour par le
     chemin normal et la garde locale de l'agent (#1270) reste. Un tour refusé
@@ -353,6 +422,10 @@ def claim_start(db, harness: str, account: str | None, host: str, agent: str,
             why = _reason_from_state(st, now)
             if why:
                 return Admission(False, why, retry_at=lift_at(st, now))
+            if not guarded(harness, profile):
+                # #5783 : aucune place à tenir ni écart à journaliser ; le
+                # cooldown vient d'être relu, l'appelant ouvre le tour.
+                return Admission()
             begun = False
             if begin is not None:
                 if not begin(tx):
@@ -408,10 +481,12 @@ def record_start(db, harness: str, account: str | None, host: str,
 
 def rows(db, accounts_rows: list[dict], now: float | None = None,
          profiles=None) -> list[dict]:
-    """Une ligne de fenêtre courte par compte à forfait, pour `accounts list`.
+    """Une ligne de fenêtre courte par compte codex, pour `accounts list`.
 
     `profiles` : `{harness: [accounts.Profile]}` (la configuration de l'hôte),
-    pour lire les seuils surchargés (`max_concurrent`, `min_start_gap_s`).
+    pour lire les seuils surchargés (`max_concurrent`, `min_start_gap_s`) et le
+    type du profil (#5783 : une clé d'API mesurée affiche « no cap » et garde
+    la seule jauge des 429/cooldown).
     """
     now = time.time() if now is None else float(now)
     lookup: dict[tuple[str, str], object] = {}
@@ -453,8 +528,9 @@ def format_rows(rows: list[dict], now: float | None = None) -> list[str]:
     now = time.time() if now is None else float(now)
     lines: list[str] = []
     for row in rows or ():
-        bits = ["%d/%d turn active" % (int(row.get("active") or 0),
-                                       int(row.get("max_active") or 0))]
+        plafond = int(row.get("max_active") or 0)
+        bits = (["%d/%d turn active" % (int(row.get("active") or 0), plafond)]
+                if plafond else ["no cap"])
         gap = float(row.get("min_start_gap_s") or 0.0)
         if gap > 0:
             bits.append("start gap %.0fs" % gap)
@@ -478,4 +554,56 @@ def format_rows(rows: list[dict], now: float | None = None) -> list[str]:
             row.get("harness"), row.get("account"),
             row.get("key") or "%s-short-window" % row.get("harness"),
             "; ".join(bits)))
+    return lines
+
+
+def doctor_lines(cfg, db) -> list[str]:
+    """#5783 : `ameesh doctor` — un compte codex plafonné servi par plus
+    d'agents que `max_concurrent`.
+
+    Le garde-fou de #3779 est passé inaperçu au déploiement de la 1.26 : un
+    compte de forfait qui sert huit agents est plafonné à deux tours actifs.
+    Le doctor le dit (avertissement, jamais un KO : c'est un réglage, pas une
+    panne). Les agents sont comptés sur le compte que leur session a choisi
+    (`agent_registry.session_account`) ; une clé d'API sans surcharge a
+    `max_active == 0` et n'est donc jamais signalée.
+    """
+    if db is None:
+        return []
+    try:
+        from . import accounts as accounts_mod
+        declared = accounts_mod.parse(getattr(cfg, "accounts", None) or {})
+    except Exception:  # noqa: BLE001 - une lecture ne casse pas le doctor
+        return []
+    items = declared.get("codex") or []
+    if not items:
+        return []
+    try:
+        rows = db.query(
+            "SELECT session_account, count(*) AS n FROM agent_registry"
+            " WHERE harness = 'codex' AND status NOT IN ('stopped', 'dead')"
+            " GROUP BY session_account") or []
+    except Exception:  # noqa: BLE001 - un doctor sans base le dit ailleurs
+        return []
+    counts = {str(row.get("session_account") or ""): int(row.get("n") or 0)
+              for row in rows}
+    # Un seul compte codex déclaré : les agents sans compte de session (session
+    # oubliée, nouvel agent) le prendront à leur prochain tour ; on les compte
+    # avec lui. Plusieurs comptes : chacun ne répond que de ses sessions.
+    seul = len(items) == 1
+    lines: list[str] = []
+    for profile in items:
+        cap = max_active("codex", profile)
+        if cap <= 0:
+            continue
+        served = counts.get(profile.name, 0) + (counts.get("", 0) if seul else 0)
+        if served <= cap:
+            continue
+        gap = min_start_gap("codex", profile)
+        lines.append(
+            "warning — codex/%s is used by %d agents but max_concurrent=%d%s "
+            "(#3779): turns wait for a free slot; raise the profile limits or "
+            "split the account" % (
+                profile.name, served, cap,
+                ", min_start_gap_s=%.0fs" % gap if gap else ""))
     return lines

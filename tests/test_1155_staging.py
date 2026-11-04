@@ -1443,10 +1443,31 @@ class StagingTest(unittest.TestCase):
         self.assertIn('/home/ameesh/.local/state/ameesh/mise-a-jour/staging-', ligne)
         copies = [l for l in self.calls() if l.startswith('ssh-copie-journal ')]
         self.assertEqual(len(copies), 1, self.calls())
-        self.assertIn('chown ameesh:ameesh', copies[0])
+        # #5797 : ecriture sous l'identite ameesh, jamais root ni chown.
+        self.assertIn('root@10.77.0.4 runuser -u ameesh -- sh -c ', copies[0])
+        self.assertNotIn('chown', copies[0])
         self.assertFalse([l for l in self.calls() if l.startswith('venv-python ')])
         self.assertFalse(list(
             (self.home / '.local/state/ameesh/mise-a-jour').glob('actif-*.json')))
+
+    def test_5797_aucune_ecriture_root_sous_home_ameesh(self):
+        """#5797 : temoin statique. Les chemins sous /home/ameesh des VM
+        d'agents appartiennent au compte d'agents : toute commande distante
+        qui les vise passe par runuser -u ameesh, aucune n'y chowne."""
+        lignes = (ROOT / 'deploy/mise-a-jour/staging.sh').read_text().splitlines()
+        code = [l for l in lignes if not l.lstrip().startswith('#')]
+        self.assertFalse([l for l in code if 'chown' in l])
+        cibles = ('/home/ameesh', 'TRAVAIL_OUTILS', 'HOME_OUTILS')
+        for ligne in code:
+            if not ligne.lstrip().startswith('"') or not any(
+                    c in ligne for c in cibles):
+                continue
+            self.assertTrue(ligne.lstrip().startswith('"runuser -u ameesh -- '),
+                            ligne)
+        copie = '\n'.join(lignes)
+        debut = copie.index('copier_journal_outils() {')
+        corps = copie[debut:copie.index('\n}', debut)]
+        self.assertIn('runuser -u ameesh -- sh -c', corps)
 
     def test_bureau_journal_non_copie_aucun_actif_et_le_dit(self):
         """#3981 : sans journal sur HOTE_OUTILS, actif.py n'est pas lance ;

@@ -324,9 +324,11 @@ class Profile:
     #: bound of one turn), settled at the real cost when the turn ends
     reserve_usd: float = 2.0
     #: #3779: provider short-window admission of this account. `None` = the
-    #: harness default (`account_window`); an explicit integer caps the
-    #: account's concurrent turns (0 disables the cap), an explicit number of
-    #: seconds spaces two turn starts (0 disables the gap). The start gap is
+    #: harness default (`account_window`) for a plan account (`config_dir`);
+    #: #5783: an `api_key_env` account has no such default (metered key, no
+    #: plan burst bucket), so `None` means 0 for it. An explicit integer caps
+    #: the account's concurrent turns (0 disables the cap), an explicit number
+    #: of seconds spaces two turn starts (0 disables the gap). The start gap is
     #: what the observed bursts needed: five turn starts in 90 s produced 429s
     #: even with one active turn.
     max_concurrent: int | None = None
@@ -552,7 +554,9 @@ def parse(raw) -> dict[str, list[Profile]]:
                 raise AccountError("account %s/%s: reserve_usd must be positive"
                                    % (harness, name))
             # #3779 : admission de la fenêtre courte du fournisseur. Absent =
-            # défaut du harnais (`account_window`) ; 0 explicite désactive.
+            # défaut du harnais (`account_window`) pour un compte de forfait ;
+            # #5783 : une clé d'API mesurée part sans garde. 0 explicite
+            # désactive dans les deux cas.
             max_concurrent = item.get("max_concurrent")
             if max_concurrent is not None and (
                     isinstance(max_concurrent, bool)
