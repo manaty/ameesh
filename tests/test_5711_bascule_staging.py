@@ -54,21 +54,43 @@ def _env_propre():
 
 
 class PaquetStaging(Paquet):
-    """Le paquet #5666 complété par les extras d'hôte du contrôle bascule.
+    """Le paquet opérateur M2 (#5495) : runtime standard, sans extra crypto.
 
-    `bascule._controles` exige psycopg, cryptography et ameesh (#3619) : le
-    paquet opérateur réel les porte, le banc doit donc les porter aussi.
+    Le lock reprend exactement les distributions de `runtime-pins.txt` et
+    `runtime-build-pins.txt` (psutil, psycopg[binary], psycopg-binary,
+    setuptools, typing-extensions, ameesh). Le paquet réel n'a pas
+    cryptography : le banc ne doit pas en ajouter une roue factice, sinon la
+    préparation réelle échouerait sur l'import de #3619 (B auditeur #5711).
     """
 
     def __init__(self, root):
         super().__init__(root)
-        self.psycopg = _roue(self.wheelhouse, 'psycopg', '3.2',
+        self.setuptools['path'].unlink()
+        self.setuptools = _roue(self.wheelhouse, 'setuptools', '84.2.1',
+                                module_name='setuptools')
+        self.tiny['path'].unlink()
+        self.ameesh['path'].unlink()
+        self.ameesh = _roue(
+            self.wheelhouse, 'ameesh', '1.36.0',
+            scripts=('ameesh', 'agent-mail'), module_name='ameesh',
+            data=(('share/ameesh/mise-a-jour/helper.py', b'HELPER = 1\n'),))
+        self._build = dict(
+            path=self.ameesh['path'], name=self.ameesh['filename'],
+            version=self.ameesh['version'], sha256=self.ameesh['sha256'])
+        self.psycopg = _roue(self.wheelhouse, 'psycopg', '3.3.6',
                              module_name='psycopg')
-        self.crypto = _roue(self.wheelhouse, 'cryptography', '41.0',
-                            module_name='cryptography')
+        self.psycopg_binary = _roue(self.wheelhouse, 'psycopg-binary', '3.3.6',
+                                    module_name='psycopg_binary')
+        self.psutil = _roue(self.wheelhouse, 'psutil', '7.2.2',
+                            module_name='psutil')
+        self.typing_extensions = _roue(
+            self.wheelhouse, 'typing-extensions', '4.16.0',
+            module_name='typing_extensions')
         self.lock = _lock(self.root, (
-            self.ameesh, self.setuptools, self.tiny, self.psycopg,
-            self.crypto))
+            self.psutil, self.psycopg, self.psycopg_binary, self.setuptools,
+            self.typing_extensions, self.ameesh))
+        self.lock.write_text(self.lock.read_text().replace(
+            'psycopg==3.3.6', 'psycopg[binary]==3.3.6'))
 
 
 class PreparationVerrouilleeTest(unittest.TestCase):
@@ -156,7 +178,7 @@ class PreparationVerrouilleeTest(unittest.TestCase):
 
     def test_ecart_octet_ou_mode_refuse(self):
         self.assertEqual(0, self.preparer())
-        fichier = staging._dossier_site(self.cible) / 'tiny_dep' / '__init__.py'
+        fichier = staging._dossier_site(self.cible) / 'ameesh' / '__init__.py'
         original = fichier.read_bytes()
         self.assertEqual(0o444, stat.S_IMODE(fichier.stat().st_mode))
         fichier.chmod(0o644)
@@ -189,6 +211,22 @@ class PreparationVerrouilleeTest(unittest.TestCase):
             staging._verifier(self.manifeste, self.cible)
         activation.chmod(mode)
         staging._verifier(self.manifeste, self.cible)
+
+    def test_deja_prepare_rejoue_le_verificateur(self):
+        self.assertEqual(0, self.preparer())
+        # Idempotent : la version complète est revérifiée, sans écart.
+        self.assertEqual(0, self.preparer())
+        # Un arbre modifié après préparation n'est pas réputé prêt (N
+        # auditeur #5711) : le marqueur intact ne suffit pas.
+        fichier = staging._dossier_site(self.cible) / 'ameesh' / '__init__.py'
+        original = fichier.read_bytes()
+        fichier.chmod(0o644)
+        fichier.write_bytes(original + b'# modified after preparation\n')
+        self.assertEqual(1, self.preparer())
+        self.assertTrue((self.cible / bascule.MARKER).is_file())
+        fichier.write_bytes(original)
+        fichier.chmod(0o444)
+        self.assertEqual(0, self.preparer())
 
     def test_verification_echouee_ne_laisse_rien(self):
         document = json.loads(self.manifeste.read_text())

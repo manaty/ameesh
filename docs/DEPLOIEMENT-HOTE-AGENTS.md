@@ -469,8 +469,12 @@ en lecture seule), puis vérifie le manifeste **après** scellement. Le
 manifeste de format 3 décrit cet état scellé (scripts `pip*` de lanceur
 `scelle`, modes en lecture seule, marqueur inclus) ; un venv non scellé, ou
 dont un octet ou un mode diffère, est refusé et aucun marqueur n'est laissé.
-Les quatre options vont ensemble ; sans elles, `preparer` garde le chemin
-historique (source + index) : le staging en cours et les VM d'agents ne
+Le contrôle d'imports verrouillé porte sur `psycopg`, `psutil` et `ameesh` :
+le paquet opérateur standard n'inclut pas l'extra `cryptography` (#3619),
+réservé au venv historique d'hôte. Une version déjà marquée complète est
+revérifiée avant d'être réputée prête : un arbre modifié après préparation ne
+passe pas. Les quatre options vont ensemble ; sans elles, `preparer` garde le
+chemin historique (source + index) : le staging en cours et les VM d'agents ne
 changent qu'au moment de la pose L2, pas à la fusion de #5711.
 
 ## Signal « staging actif » (#1323)

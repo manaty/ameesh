@@ -476,12 +476,12 @@ def _comparer_roues(construite, attendue):
         raise Erreur('roue ameesh illisible') from None
 
 
-def _creer_venv(chemin, *, python, env):
+def _creer_venv(chemin, *, python, env, prompt=None):
     construction = _construction()
     try:
         return construction.create_venv(chemin, python=python,
                                         with_pip=True, env=env,
-                                        prompt=INVITE)
+                                        prompt=prompt)
     except construction.BuildError as erreur:
         raise Erreur('création du venv impossible : %s' % erreur) from None
 
@@ -1265,7 +1265,8 @@ def _produire(depot, *, sha, tag, lock_path, wheelhouse, python, output,
         construite = _construire_roue(outil, source, sortie, env_pip)
         _comparer_roues(construite, par_nom['ameesh'])
         venv = racine / 'venv'
-        _creer_venv(venv, python=python, env=env_pip)
+        _creer_venv(venv, python=python, env=env_pip,
+                    prompt=INVITE if scelle else None)
         try:
             bootstrap = _distributions(venv, frozenset((0, os.geteuid())))
         except Ecart as erreur:

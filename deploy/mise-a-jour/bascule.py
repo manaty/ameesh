@@ -434,16 +434,23 @@ def _verifier_shebang(ameesh, python):
         refuser("ligne 2 %r : interpréteur attendu %r" % (execution, python))
 
 
-def _controles(directory, env=None):
-    """Imports, point d'entrée et shebang : tout doit répondre AVANT la bascule."""
+def _controles(directory, env=None, cryptography=True):
+    """Imports, point d'entrée et shebang : tout doit répondre AVANT la bascule.
+
+    #3619 : le venv historique d'hôte porte l'extra `cryptography` (canal
+    nexlink) ; son absence fait échouer la préparation, pas le premier envoi.
+    #5711 : le paquet opérateur verrouillé est le runtime standard, sans
+    extra (l'exécuteur de staging n'utilise pas le canal nexlink) : ses
+    contrôles portent sur psycopg, psutil et ameesh, et le manifeste scellé
+    pinne déjà l'inventaire exact des distributions.
+    """
     python = os.path.join(directory, "bin", "python")
     ameesh = os.path.join(directory, "bin", "ameesh")
     _verifier_shebang(ameesh, python)
-    # #3619 : `cryptography` fait partie du contrat du venv (canal nexlink) ;
-    # son absence fait échouer la préparation, pas le premier envoi.
-    # #5711 : en mode verrouillé, l'environnement interdit tout bytecode.
-    _run([python, "-c", "import psycopg, cryptography, ameesh; print('imports ok')"],
-         stdout=subprocess.DEVNULL, env=env)
+    imports = ("import psycopg, cryptography, ameesh; print('imports ok')"
+               if cryptography else
+               "import psycopg, psutil, ameesh; print('imports ok')")
+    _run([python, "-c", imports], stdout=subprocess.DEVNULL, env=env)
     _run([ameesh, "--version"], stdout=subprocess.DEVNULL, env=env)
 
 
@@ -474,19 +481,32 @@ def preparer(args):
                 if actuel != attendu:
                     _die("venv-%s déjà préparé avec un autre paquet "
                          "(marqueur différent)" % version)
+                # #5711/N (auditeur) : un venv marqué complet est revérifié ;
+                # un arbre modifié après préparation n'est pas réputé prêt.
+                try:
+                    _verifier_venv(verrou["verificateur"],
+                                   verrou["manifeste"], cible)
+                except RuntimeError as exc:
+                    print("bascule: venv-%s déjà préparé mais NON CONFORME : %s"
+                          % (version, exc), file=sys.stderr)
+                    return 1
             print("bascule: venv-%s déjà préparé" % version)
             return 0
         _supprimer(cible)
     print("bascule: préparation de venv-%s depuis %s" % (version, src))
     home = None
+    masque = None
     try:
         if verrou:
             home = tempfile.mkdtemp(prefix="bascule-pip-")
+            # #5711 : même umask que la production #5666 ; sinon les dossiers
+            # naissent 0775 et le vérificateur refuse l'arbre (dossier non sûr).
+            masque = os.umask(0o022)
             env = _env_isole(home)
             _creer_venv_verrouille(cible, python_verrou, env)
             _pip_install_verrouille(cible, verrou["lock"],
                                     verrou["wheelhouse"], env)
-            _controles(cible, env=env)
+            _controles(cible, env=env, cryptography=False)
             _write(os.path.join(cible, MARKER),
                    marqueur_verrouille(version, manifeste["lock"]["sha256"]),
                    mode=0o444)
@@ -509,6 +529,8 @@ def preparer(args):
               % (version, exc), file=sys.stderr)
         return 1
     finally:
+        if masque is not None:
+            os.umask(masque)
         if home is not None:
             shutil.rmtree(home, ignore_errors=True)
     print("bascule: venv-%s préparé et contrôlé" % version)
