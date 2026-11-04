@@ -1077,6 +1077,8 @@ class Watcher:
         #: même dépôt (N2 du gel #20746).
         self._packet_shared: dict = {}
         self._disk_reads: dict = {}
+        self._disk_checks: set = set()
+        self._disk_notified_hosts: set = set()
 
     def _cache_ttl(self) -> float:
         """La garde des lectures CI : le réglage `github.ci_ttl`, sinon le défaut."""
@@ -1274,6 +1276,14 @@ class Watcher:
             repos = self.repos()
             if not repos or self.dry_run:
                 return []
+            # #5751 : un refus déjà reçu reste dû même en quota GitHub.
+            disk_out = []
+            self._disk_notified_hosts.clear()
+            for repo in repos:
+                try:
+                    disk_out += self._disk_refusal_messages(db, repo)
+                except Exception as exc:
+                    self.log("CI %s: disk refusal delivery failed (%s)" % (repo, type(exc).__name__))
             if self.api is None:
                 self.api = gh_api(cache_dir=getattr(self.cfg, "state_dir", None),
                                   ttl=self._cache_ttl(), clock=self.clock)
@@ -1286,7 +1296,7 @@ class Watcher:
                     except Exception as exc:  # noqa: BLE001 - jamais fatal
                         self.log("CI: job logs unavailable (%s)"
                                  % " ".join(str(exc).split())[:200])
-            out: list[dict] = []
+            out: list[dict] = disk_out
             for repo in repos:
                 try:
                     out += self.watch(db, repo)
@@ -1396,11 +1406,159 @@ class Watcher:
             return
         self._disk_reads[repo] = now
         try:
-            ci_disk.collect(self.api, repo, (tuple(bases) or BASE_BRANCHES)[0], storage.of(db).ci)
+            store = storage.of(db).ci
+            branch = (tuple(bases) or BASE_BRANCHES)[0]
+            pending = ci_disk.collect(self.api, repo, branch, store)
+            rows = [r for r in store.disks() if r['repo'] == repo]
+            if (not pending and ci_disk.needs_dispatch(rows, now)
+                    and store.claim_disk_dispatch(repo, now=now, interval_s=ci_disk.DISPATCH_AGE)):
+                self._dispatch_disk(repo, branch)
         except plan_github.GithubRateLimited:
             raise
         except Exception as exc:  # noqa: BLE001 — garde les dernières mesures, leur âge alerte
             self.log('CI %s: disk annotations unreadable (%s)' % (repo, str(exc)[:200]))
+
+    def _dispatch_disk(self, repo, branch):
+        from . import plan_github, ci_disk
+        gh = plan_github.Gh()
+        code, _, _ = gh.run(["api", "-X", "POST",
+            "repos/%s/actions/workflows/%s/dispatches" % (repo, ci_disk.WORKFLOW),
+            "--input", "-"], json.dumps({"ref": branch}))
+        if code:
+            raise RuntimeError("disk workflow dispatch failed or ambiguous; intent retained")
+        self.log("CI %s: disk probe requested on base %s" % (repo, branch))
+
+    def _disk_refusal_messages(self, db, repo):
+        from . import ci_disk
+        out, threads, notified = [], [], []
+        with _atomic(db) as tx:
+            st = storage.of(tx)
+            groups = {}
+            for refusal in st.ci.disk_refusals(repo):
+                host = refusal["host"]
+                if (not ci_disk.HOST.fullmatch(host)
+                        or host in self._disk_notified_hosts):
+                    continue
+                groups.setdefault(host, []).append(refusal)
+            if not groups:
+                return []
+            to = self._project_pilot(tx, repo)
+            if not to:
+                return []  # les refus non acquittés restent dus au prochain tour
+            for host, refusals in groups.items():
+                # Anciennes lignes comprises : aucun texte libre du spool ou
+                # des annotations n'entre dans le corps NI dans son payload.
+                events = []
+                for refusal in refusals:
+                    data = refusal["payload"]
+                    if (not re.fullmatch(r"[0-9a-f]{32}", refusal["event_id"])
+                            or type(data.get("run_id")) is not int
+                            or not 0 < data["run_id"] < 2**64
+                            or type(data.get("attempt")) is not int
+                            or not 0 < data["attempt"] < 2**32):
+                        continue
+                    events.append(dict(ci_disk.numeric_metrics(data), id=refusal["event_id"],
+                        run_id=data["run_id"], attempt=data["attempt"],
+                        kind="measurement" if data.get("signal") is True else "refusal"))
+                if not events:
+                    continue
+                last = events[-1]
+                refused = sum(event['kind'] == 'refusal' for event in events)
+                text = ("CI : marge disque insuffisante ou illisible (#5742). "
+                        "%d refus de part(s), %d signal(s) de mesure basse sur %s. %s"
+                        "Dernière mesure : libre %s octets, inodes disponibles %s, "
+                        "minimum %s octets. Vérifier le disque et la rétention native. "
+                        "https://github.com/%s/actions/runs/%d" % (
+                            refused, len(events) - refused, host,
+                            "Aucun test lancé pour les refus. " if refused else "",
+                            last["free_bytes"], last["available_inodes"],
+                            last["required_bytes"], repo, last["run_id"]))
+                payload = {"ci_disk_refusal": {"repo": repo, "host": host,
+                                               "count": len(events), "events": events}}
+                message = _send(tx, to, text, text, lot=None, payload=payload, urgent=False,
+                                after_commit=threads)
+                reported_ids = {event["id"] for event in events}
+                for refusal in refusals:
+                    if refusal["event_id"] not in reported_ids:
+                        continue
+                    st.ci.set_disk_refusal_message(repo, host=host,
+                        event_id=refusal["event_id"], message_id=message)
+                notified.append(host)
+                out.append(dict(action="disk_refusal", repo=repo, to=to, message_id=message))
+        self._disk_notified_hosts.update(notified)
+        for record in threads:
+            record(db.cfg, db)
+        return out
+
+    def _github_disk_refusals(self, db, repo, row):
+        """#5751 : signaux uniquement levants de tous les runs, PR comprises.
+
+        La liste des hôtes vient du workflow dédié ; corps et charges des
+        courriers sont des projections fermées, jamais du texte du code testé.
+        """
+        from . import ci_disk
+        try:
+            path = "repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100" % (
+                repo, row["run_id"], row.get("run_attempt") or 1)
+            jobs = self.api(path) or {}
+            for job in (jobs.get("jobs") or ())[:100]:
+                key = (repo, job.get("id"))
+                if (job.get("status") not in (None, "completed")
+                        or key in self._disk_checks):
+                    continue
+                match = re.fullmatch(r'https://api.github.com/repos/%s/check-runs/(\d+)'
+                                     % re.escape(repo), str(job.get("check_run_url") or ''))
+                if not match:
+                    continue
+                annotations = self.api("repos/%s/check-runs/%s/annotations?per_page=100"
+                                       % (repo, match[1])) or []
+                known = {r['host'] for r in storage.of(db).ci.disks() if r['repo'] == repo}
+                for index, annotation in enumerate(annotations):
+                    if annotation.get("title") not in ("ameesh-ci-disk-refusal/1", ci_disk.SCHEMA):
+                        continue
+                    try:
+                        event = json.loads(annotation.get("message") or "{}")
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    host = event.get("host")
+                    if not isinstance(host, str) or host not in known:
+                        continue
+                    if annotation.get("title") == ci_disk.SCHEMA:
+                        self._disk_low_signal(db, repo, row, job, annotation, event, index)
+                        continue
+                    if (str(event.get("run_id")) != str(row["run_id"])
+                            or str(event.get("attempt")) != str(row.get("run_attempt") or 1)
+                            or not ci_disk.HOST.fullmatch(str(event.get("host", "")))):
+                        continue
+                    ci_disk.observe_refusal(repo, event["host"], event, storage.of(db).ci,
+                                            now=float(self.clock()))
+                self._disk_checks.add(key)
+            return self._disk_refusal_messages(db, repo)
+        except Exception as exc:
+            self.log("CI %s: disk refusal annotations unreadable (%s)" % (repo, type(exc).__name__))
+            return []
+
+    def _disk_low_signal(self, db, repo, row, job, annotation, event, index):
+        from . import ci_disk, canon as canon_mod, resources
+        import hashlib
+        data = ci_disk.annotation(annotation, event['host'])
+        if data is None:
+            return
+        reading = {'volumes': [{'path': '/', 'disk_free_bytes': data['free_bytes'],
+                                'disk_total_bytes': data['total_bytes']}]}
+        limits = resources.host_limits(canon_mod.load_configured(self.cfg), event['host'])['limits']
+        if not resources.disk_warnings(reading, limits):
+            return  # une annotation saine hors workflow dédié n'efface rien
+        sampled = _iso_ts(job.get('completed_at'))
+        if sampled is None or not ci_disk.timestamp(sampled, float(self.clock())):
+            return
+        identity = '%s:%s:%s:%s:%s' % (repo, row['run_id'], row.get('run_attempt') or 1, job['id'], index)
+        payload = dict(signal=True, run_id=int(row['run_id']), attempt=int(row.get('run_attempt') or 1),
+                       sampled_ts=sampled, free_bytes=data['free_bytes'], total_bytes=data['total_bytes'])
+        storage.of(db).ci.observe_disk_refusal(repo, host=event['host'],
+            event_id=hashlib.sha256(identity.encode()).hexdigest()[:32], payload=payload)
 
     def _map(self, db, repo: str, bases=BASE_BRANCHES) -> None:
         """#3344 : la dernière carte de mesure publiée sur la base du dépôt.
@@ -2175,6 +2333,7 @@ class Watcher:
         checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
+        self._github_disk_refusals(db, repo, row)
         self._record_failed_jobs(st, repo, row, bases)
         if not events and terminal == "failure":
             events = self._log_failures(repo, row)
@@ -2563,6 +2722,8 @@ def describe(record: dict) -> str:
             where, record.get("for"))
     to = "→ %s%s" % (record["to"], " (urgent)" if record.get("urgent") else "") \
         if record.get("to") else "(no recipient)"
+    if record["action"] == "disk_refusal":
+        return "CI %s: disk margin refusal reported %s" % (record.get("repo"), to)
     if record["action"] == "failures":
         return "%s: %d failure(s) %s" % (where, len(record.get("tests") or ()), to)
     if record["action"] == "pending":
