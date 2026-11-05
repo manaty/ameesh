@@ -8,16 +8,36 @@ compte cloud, d'utilisateur agent ou de copie de clé sur les runners.
 
 Le hook des runners est `python -m ameesh.vm_adapter request`. Le scanner
 ajoute `<busy|draining|idle-drained> <hôte>` et la génération du drainage.
-Le hook enregistre une demande idempotente en base ; tant que le worker ne
-l'a pas réalisée, il répond non-zéro. Le worker inscrit la réalisation dans le journal natif, sous la même
-génération ; une demande en attente n'est jamais un acquittement de mise en veille.
-L'état et le motif borné sont dans `vm_adapter_requests`. L'intention d'arrêt
-est persistée avant l'effet cloud, pour que la détection de perte ne confonde
-pas l'archivage volontaire avec une panne. Le worker termine la transition
-native sans dépendre d'une nouvelle tentative dans le délai de drainage :
-l'hystérésis de facturation a son propre délai. Seule cette demande déjà
-validée permet au worker de prolonger l'attente ; les preuves de repos, de
-fraîcheur et d'absence de travail sont revérifiées avant l'arrêt.
+Le hook enregistre une demande idempotente en base. Il répond `0` seulement
+si le worker a déjà réalisé l'état, `75` (`EX_TEMPFAIL`) quand la demande est
+en attente, et `1` en cas de refus : une demande en attente est une **attente
+asynchrone**, pas une panne. Le scanner enregistre alors `hook_wait_*`, garde
+l'état acquitté précédent et les prises fermées ; il n'écrit ni
+`release_error` ni `host_release_failed`, et ne rouvre rien. Le worker
+inscrit la réalisation dans le journal natif, sous la même
+génération/époque ; une demande en attente n'est jamais un acquittement de
+mise en veille. L'état et le motif borné sont dans `vm_adapter_requests`.
+L'intention d'arrêt est persistée avant l'effet cloud, pour que la détection
+de perte ne confonde pas l'archivage volontaire avec une panne. L'attente est
+bornée à la génération/époque qui l'a produite : un écrivain N-1 qui change
+l'une ou l'autre sans connaître `hook_wait_*` rend l'attente périmée, et la
+détection de perte cesse de l'ignorer (#5690). Le worker solde au tick suivant
+les demandes d'une vague révolue. Le worker termine la transition native sans
+dépendre d'une nouvelle tentative dans le délai de drainage : l'hystérésis de
+facturation a son propre délai. Seule cette demande déjà validée permet au
+worker de prolonger l'attente ; les preuves de repos, de fraîcheur et
+d'absence de travail sont revérifiées avant l'arrêt.
+
+Une intention d'arrêt durable qui ne progresse plus au-delà de
+`AMEESH_HOST_RELEASE_ADAPTER_STALL` (900 s par défaut) lève
+`host_release_adapter_stalled`, comme un worker dont aucun tick
+`vm_adapter_observations` n'est vu depuis ce délai, ou une intention dont la
+génération/époque ne correspond plus au contrôle courant (le worker ne l'a
+pas réconciliée). Ce dernier cas n'alerte que tant que la porte est fermée et
+l'hôte en retrait : une fois le retour acquis, le worker solde la demande
+périmée et l'alerte disparaît. Ces alertes nomment le worker et le couple
+génération/époque ; elles ne demandent pas de retirer le hook d'une VM
+encore arrêtée.
 
 Un seul hôte opérateur, externe aux VM qu'il gère, exécute le timer. Son
 inscription privée fixe les UUID VM/projet et la zone ; aucune identité,
@@ -102,4 +122,6 @@ Avant de retirer un hook ou de revenir à l'ancien binaire, le bureau remet
 chaque VM arrêtée en marche par le chemin autorisé, vérifie santé et
 réconciliation, et termine le retour natif. **Ne pas retirer le hook d'une
 VM encore arrêtée** : le chemin historique sans adaptateur n'a pas cette
-preuve cloud. La migration reste en place et les écrivains N-1 l'ignorent.
+preuve cloud. La migration reste en place et les écrivains N-1 l'ignorent ;
+l'attente périmée qu'ils laissent est ignorée par le nouveau lecteur, grâce à
+la borne génération/époque.

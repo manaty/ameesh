@@ -1286,16 +1286,17 @@ class CostBook:
         Échéances toutes deux connues et différentes : la plus tardive gagne.
         Un relevé partagé non daté ne remplace pas une mesure locale datée
         (#1132) ; si seule l'échéance locale manque, la fraîcheur décide.
-        Même fenêtre (échéances égales à `GAUGE_TIME_TOLERANCE_S` près) ou
-        aucune date : la plus récente par production, sinon par insertion.
+        Même fenêtre (échéances égales à `CODEX_WINDOW_JITTER_S` près, #5950)
+        ou aucune date : la plus récente par production, sinon par insertion.
         """
         row_resets = row.get("resets_at_ts")
         local_resets = gauge.resets_at
         if row_resets is not None and local_resets is not None:
             delta = float(row_resets) - float(local_resets)
-            # Une remise à zéro revient arrondie de la base : deux valeurs à
-            # moins d'une seconde sont la même fenêtre, pas une plus tardive.
-            if abs(delta) > GAUGE_TIME_TOLERANCE_S:
+            # #5950 : Codex publie pour une même fenêtre des échéances qui
+            # varient de quelques secondes (1794205167, …168, …172) ; un tel
+            # écart est la même fenêtre, pas une plus tardive.
+            if abs(delta) > CODEX_WINDOW_JITTER_S:
                 return delta > 0
         elif local_resets is not None:
             # Un relevé partagé non daté ne remplace pas une mesure datée
@@ -3171,6 +3172,13 @@ REPLAY_TOLERANCE_S = 60.0
 #: microsecondes et reviennent arrondies. En deçà d'une seconde, deux valeurs
 #: désignent le même instant — les fenêtres, elles, sont séparées de jours.
 GAUGE_TIME_TOLERANCE_S = 1.0
+
+#: #5950 : Codex renvoie, pour une MÊME fenêtre, des `resets_at` qui varient de
+#: quelques secondes d'un relevé à l'autre. Deux échéances à moins de cinq
+#: minutes l'une de l'autre désignent la même fenêtre ; la plus courte fenêtre
+#: Codex (5 h) en reste très au-delà, si bien qu'un vrai changement de fenêtre
+#: (échéance plus tardive de plusieurs heures) gagne toujours.
+CODEX_WINDOW_JITTER_S = 300.0
 
 
 def _marker_ts(event: dict) -> float | None:

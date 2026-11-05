@@ -34,6 +34,8 @@ _ROW = ("host, mode, generation, actor, "
         "extract(epoch from release_error_since)::float8 AS release_error_since_ts, "
         "extract(epoch from hook_attempt_at)::float8 AS hook_attempt_ts, "
         "hook_attempt_state, hook_attempt_generation, hook_attempt_epoch, "
+        "extract(epoch from hook_wait_at)::float8 AS hook_wait_ts, "
+        "hook_wait_state, hook_wait_generation, hook_wait_epoch, "
         "extract(epoch from updated_at)::float8 AS updated_ts")
 
 #: #4148: states an adapter can acknowledge, in the strict order of the spec.
@@ -95,11 +97,19 @@ class HostLifecycle(interface.HostLifecycle):
             "       < clock_timestamp()-make_interval(secs=>%s)"
             # #4148: a host released by the lifecycle (VM off, pod evicted)
             # stops publishing on purpose. It is idle-drained, not lost; a
-            # hook still in flight for that state says the same.
+            # hook still in flight for that state says the same. #5932: an
+            # asynchronous idle-drained wait (queued VM stop) is the same
+            # intentional unavailability while the worker archives the VM,
+            # but only for the wave that queued it: an N-1 writer moves the
+            # generation/epoch without knowing hook_wait_*, so a wait whose
+            # fence no longer matches must not mask a real loss (#5690).
             "   AND NOT EXISTS (SELECT 1 FROM host_lifecycle c"
             "                    WHERE c.host = h.host"
             "                      AND (c.release_state = 'idle-drained'"
-            "                           OR c.hook_attempt_state = 'idle-drained'))"
+            "                           OR c.hook_attempt_state = 'idle-drained'"
+            "                           OR (c.hook_wait_state = 'idle-drained'"
+            "                               AND c.hook_wait_generation = c.generation"
+            "                               AND c.hook_wait_epoch = c.release_epoch)))"
             # #4148 B1: a released host woken by `busy` is booting; stale
             # readings are expected until the first post-ack reading.
             "   AND NOT EXISTS (SELECT 1 FROM host_lifecycle c"
@@ -131,8 +141,17 @@ class HostLifecycle(interface.HostLifecycle):
                 old = HostLifecycle(tx).get(host)
                 if not agents or (old and old["mode"] == "lost"):
                     continue
-                if old and (old.get("release_state") == "idle-drained"
-                            or old.get("hook_attempt_state") == "idle-drained"):
+                # #5932 B (cx2): the candidate selection ran before this gate.
+                # In between, a scanner may have committed `begin_transition`
+                # then `wait_transition` (idle-drained), which clears the
+                # attempt and leaves only the wait: re-check that wait under
+                # the lock with the same wave fence as the preselection, or a
+                # legitimate stop would be declared lost and its wait erased.
+                waited = old and old.get("hook_wait_state") == "idle-drained" \
+                    and old.get("hook_wait_generation") == old.get("generation") \
+                    and old.get("hook_wait_epoch") == old.get("release_epoch")
+                if waited or (old and (old.get("release_state") == "idle-drained"
+                                       or old.get("hook_attempt_state") == "idle-drained")):
                     # #4148: off by decision, between two readings.
                     continue
                 if old and ((old.get("released_ts") is not None
@@ -165,6 +184,9 @@ class HostLifecycle(interface.HostLifecycle):
                     # same withdrawal window (same generation).
                     row = tx.query("UPDATE host_lifecycle SET mode='lost',actor=%s,"
                                    "release_epoch=release_epoch+1,"
+                                   # #5932: a loss ends any adapter wait.
+                                   "hook_wait_at=NULL,hook_wait_state=NULL,"
+                                   "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                                    "updated_at=clock_timestamp() WHERE host=%s RETURNING " + _ROW,
                                    (actor, host))[0]
                 else:
@@ -173,6 +195,8 @@ class HostLifecycle(interface.HostLifecycle):
                         "ON CONFLICT(host) DO UPDATE SET mode='lost',actor=excluded.actor, "
                         "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
                         "return_at=NULL,release_epoch=host_lifecycle.release_epoch+1,"
+                        "hook_wait_at=NULL,hook_wait_state=NULL,"
+                        "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                         "updated_at=clock_timestamp() RETURNING " + _ROW,
                         (host, actor))[0]
                 for agent in agents:
@@ -234,6 +258,11 @@ class HostLifecycle(interface.HostLifecycle):
                 "return_requested_at=NULL,return_requested_by=NULL, "
                 "release_error=NULL,release_error_state=NULL,release_error_at=NULL, "
                 "release_error_since=NULL, "
+                # #5932: a wait belongs to the wave that queued it. A new
+                # generation/epoch supersedes it; unlike an in-flight attempt,
+                # a wait has no external call left to protect.
+                "hook_wait_at=NULL,hook_wait_state=NULL,"
+                "hook_wait_generation=NULL,hook_wait_epoch=NULL, "
                 # #4148: NEVER clear an in-flight adapter attempt here. A new
                 # drain from `returning` can start while an idle-drained hook
                 # of the previous wave is still running; erasing its marker
@@ -275,6 +304,9 @@ class HostLifecycle(interface.HostLifecycle):
                 "UPDATE host_lifecycle SET mode='returning',actor=%s,return_at=NULL, "
                 "release_epoch=release_epoch+1, claims_open=%s, "
                 "return_requested_at=NULL,return_requested_by=NULL, "
+                # #5932: the return supersedes any adapter wait of the old wave.
+                "hook_wait_at=NULL,hook_wait_state=NULL,"
+                "hook_wait_generation=NULL,hook_wait_epoch=NULL, "
                 # the release state follows the opened gate; a closed return
                 # keeps saying `draining` until the busy hook answers.
                 "release_state=CASE WHEN %s THEN 'busy' ELSE release_state END, "
@@ -338,6 +370,9 @@ class HostLifecycle(interface.HostLifecycle):
                     # #4148: the busy hook must answer before claims reopen;
                     # the epoch invalidates any transition decided before.
                     "release_epoch=release_epoch+1, "
+                    # #5932: the scheduled return supersedes any adapter wait.
+                    "hook_wait_at=NULL,hook_wait_state=NULL,"
+                    "hook_wait_generation=NULL,hook_wait_epoch=NULL, "
                     "claims_open=CASE WHEN %s THEN true ELSE claims_open END, "
                     "release_state=CASE WHEN %s THEN 'busy' ELSE release_state END, "
                     "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
@@ -391,6 +426,17 @@ class HostLifecycle(interface.HostLifecycle):
             "UPDATE host_lifecycle c SET hook_attempt_at=clock_timestamp(), "
             "hook_attempt_state=%s,hook_attempt_generation=c.generation,"
             "hook_attempt_epoch=c.release_epoch, "
+            # #5932: a retry of the same state keeps the first instant of the
+            # wait (the stall alert must not restart every retry); a different
+            # state ends the previous wait.
+            "hook_wait_at=CASE WHEN c.hook_wait_state IS NOT DISTINCT FROM %s "
+            "                  THEN c.hook_wait_at END, "
+            "hook_wait_state=CASE WHEN c.hook_wait_state IS NOT DISTINCT FROM %s "
+            "                     THEN c.hook_wait_state END, "
+            "hook_wait_generation=CASE WHEN c.hook_wait_state IS NOT DISTINCT FROM %s "
+            "                          THEN c.hook_wait_generation END, "
+            "hook_wait_epoch=CASE WHEN c.hook_wait_state IS NOT DISTINCT FROM %s "
+            "                     THEN c.hook_wait_epoch END, "
             "updated_at=clock_timestamp() "
             "WHERE c.host=%s AND c.generation=%s AND c.release_epoch=%s "
             # #5925: the operator owns a durable asynchronous stop intent.
@@ -411,6 +457,10 @@ class HostLifecycle(interface.HostLifecycle):
             # undrain) must not block the safe `busy` answer.
             "AND (c.release_error_at IS NULL OR c.release_error_state IS DISTINCT FROM %s "
             "     OR c.release_error_at <= clock_timestamp()-make_interval(secs=>%s)) "
+            # #5932: a wait paces its own retry; the worker owns the
+            # completion and the scanner must not hammer the queue in between.
+            "AND (c.hook_wait_at IS NULL OR c.hook_wait_state IS DISTINCT FROM %s "
+            "     OR c.hook_wait_at <= clock_timestamp()-make_interval(secs=>%s)) "
             # The state must be legal for the row read under the same lock.
             "AND ((%s='busy' AND c.mode IN ('draining','returning')) "
             "     OR (%s='draining' AND c.mode='draining' AND NOT c.claims_open "
@@ -418,8 +468,10 @@ class HostLifecycle(interface.HostLifecycle):
             "     OR (%s='idle-drained' AND c.mode='draining' AND NOT c.claims_open "
             "         AND c.release_state='draining' AND c.hook_state='draining')) "
             "RETURNING " + _ROW,
-            (state, host, generation, release_epoch, state, state, state, stale_after,
-             state, retry_after, state, state, state))
+            (state, state, state, state, state, host, generation, release_epoch,
+             state, state, state,
+             stale_after, state, retry_after, state, retry_after,
+             state, state, state))
         return rows[0] if rows else None
 
     def finish_transition(self, host, generation, state, *, release_epoch, actor,
@@ -471,7 +523,11 @@ class HostLifecycle(interface.HostLifecycle):
                 tx.execute(
                     "UPDATE host_lifecycle SET hook_attempt_at=NULL,"
                     "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
-                    "hook_attempt_epoch=NULL,updated_at=clock_timestamp() "
+                    "hook_attempt_epoch=NULL,"
+                    # #5932: a new decision ends the wait it superseded.
+                    "hook_wait_at=NULL,hook_wait_state=NULL,"
+                    "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
+                    "updated_at=clock_timestamp() "
                     "WHERE host=%s AND hook_attempt_generation=%s "
                     "AND hook_attempt_epoch=%s AND hook_attempt_state=%s",
                     (host, generation, release_epoch, state))
@@ -482,6 +538,10 @@ class HostLifecycle(interface.HostLifecycle):
                     "UPDATE host_lifecycle SET hook_attempt_at=NULL,"
                     "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
                     "hook_attempt_epoch=NULL,"
+                    # #5932: a real failure replaces any earlier wait; the
+                    # dedicated stalled-worker alert must not double up.
+                    "hook_wait_at=NULL,hook_wait_state=NULL,"
+                    "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                     "release_error=%s,release_error_state=%s,"
                     "release_error_at=clock_timestamp(),"
                     "release_error_since=coalesce(release_error_since,clock_timestamp()),"
@@ -505,6 +565,8 @@ class HostLifecycle(interface.HostLifecycle):
                     "UPDATE host_lifecycle SET hook_state=%s,hook_attempt_at=NULL,"
                     "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
                     "hook_attempt_epoch=NULL,"
+                    "hook_wait_at=NULL,hook_wait_state=NULL,"
+                    "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                     "release_error=NULL,release_error_state=NULL,release_error_at=NULL,"
                     "release_error_since=NULL,"
                     "release_state=CASE WHEN %s='busy' THEN 'busy' "
@@ -514,6 +576,71 @@ class HostLifecycle(interface.HostLifecycle):
                     "                  ELSE released_at END,"
                     "updated_at=clock_timestamp() WHERE host=%s AND generation=%s",
                     (state, state, state, state, host, generation))
+            return HostLifecycle(tx).get(host)
+
+    def wait_transition(self, host, generation, state, *, release_epoch, actor,
+                        detail=None):
+        """Record an accepted asynchronous request without acknowledging it.
+
+        #5932: the external adapter queued the state and answered "wait". The
+        acknowledged `hook_state`/`release_state` must not move and claims stay
+        closed; only `hook_wait_*` names the waited state and the first
+        instant of this wait episode. Re-waiting the same state keeps that
+        instant, so a scanner retry cannot reset the stalled-worker age. The
+        attempt is cleared: the adapter call is over, and the worker owns the
+        completion through its own `finish_transition`.
+        """
+        _check_state(state)
+        if isinstance(release_epoch, bool) or not isinstance(release_epoch, int) \
+                or release_epoch < 1:
+            raise ValueError("release_epoch: a positive integer expected")
+        if not isinstance(actor, str) or not actor.strip() \
+                or any(ord(c) < 32 for c in actor):
+            raise ValueError("transition actor required")
+        if detail is not None and not isinstance(detail, dict):
+            raise ValueError("transition detail: an object expected")
+        with self.db.transaction() as tx:
+            Hosts._lock_gate(tx, host)
+            control = HostLifecycle(tx).get(host)
+            if (not control or control["generation"] != generation
+                    or control["release_epoch"] != release_epoch
+                    or control.get("hook_attempt_generation") != generation
+                    or control.get("hook_attempt_epoch") != release_epoch
+                    or control.get("hook_attempt_state") != state):
+                return None
+            first = (control.get("hook_wait_state") != state
+                     or control.get("hook_wait_ts") is None)
+            tx.execute(
+                "UPDATE host_lifecycle SET hook_attempt_at=NULL,"
+                "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
+                "hook_attempt_epoch=NULL,"
+                # A retry of the same waited state keeps the episode start; a
+                # different state starts a new wait.
+                "hook_wait_at=CASE WHEN hook_wait_state IS NOT DISTINCT FROM %s "
+                "                  THEN coalesce(hook_wait_at,clock_timestamp()) "
+                "                  ELSE clock_timestamp() END,"
+                "hook_wait_state=%s,"
+                # The wait is fenced to the wave that queued it: a reader must
+                # not trust it once an N-1 writer (or a newer decision) has
+                # moved the generation or the release epoch.
+                "hook_wait_generation=%s,hook_wait_epoch=%s,"
+                "release_error=NULL,release_error_state=NULL,"
+                "release_error_at=NULL,release_error_since=NULL,"
+                "updated_at=clock_timestamp() "
+                "WHERE host=%s AND generation=%s AND release_epoch=%s",
+                (state, state, generation, release_epoch, host, generation,
+                 release_epoch))
+            if first:
+                tx.execute(
+                    "INSERT INTO ameesh_events(type,object,project,data) "
+                    "VALUES ('host.release_waiting',%s,NULL,%s::jsonb)",
+                    ("host:" + host, json.dumps({
+                        "generation": generation,
+                        "release_epoch": release_epoch,
+                        "state": state,
+                        "actor": actor,
+                        "detail": detail or {},
+                    }, sort_keys=True)))
             return HostLifecycle(tx).get(host)
 
     def open_claims(self, host, generation, *, require_busy=True,
@@ -528,6 +655,9 @@ class HostLifecycle(interface.HostLifecycle):
         rows = self.db.query(
             "UPDATE host_lifecycle SET claims_open=true,"
             "return_requested_at=NULL,return_requested_by=NULL,"
+            # #5932: reopening ends any adapter wait of the closed gate.
+            "hook_wait_at=NULL,hook_wait_state=NULL,"
+            "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
             "updated_at=clock_timestamp() "
             "WHERE host=%s AND generation=%s AND (NOT %s OR hook_state='busy') "
             "AND (%s::bigint IS NULL OR release_epoch=%s) "
@@ -583,6 +713,9 @@ class HostLifecycle(interface.HostLifecycle):
                 "UPDATE host_lifecycle c SET mode='returning',actor=%s,"
                 "return_at=NULL,claims_open=true,release_state='busy',"
                 "return_requested_at=NULL,return_requested_by=NULL,"
+                # #5932: the return ends the wait of the closed gate.
+                "hook_wait_at=NULL,hook_wait_state=NULL,"
+                "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                 "release_epoch=c.release_epoch+1,updated_at=clock_timestamp() "
                 "WHERE c.host=%s AND c.generation=%s AND c.release_epoch=%s "
                 "AND c.mode IN ('draining','returning') "

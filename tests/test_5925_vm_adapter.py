@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 from tests.support import PgTestCase
-from ameesh import config, storage, vm_adapter as vm
+from ameesh import config, host_release, storage, vm_adapter as vm
 from ameesh.storage.postgres.vm_adapter import Queue
 
 
@@ -340,11 +340,17 @@ class AdapterTest(PgTestCase):
                 mock.patch('ameesh.vm_adapter.db_mod.connect', return_value=self.db), \
                 mock.patch.object(self.db, 'close'), \
                 mock.patch.dict(os.environ, {'AMEESH_HOST_GENERATION': str(control['generation'])}):
-            self.assertEqual(vm.main(['request', 'draining', 'burst']), 1)
+            self.assertEqual(vm.main(['request', 'draining', 'burst']),
+                             host_release.ADAPTER_WAIT_CODE)
             self.assertEqual(self.tick(), 'native hook in flight')
-            native.finish_transition('burst', control['generation'], 'draining',
-                                     release_epoch=control['release_epoch'], actor='tester',
-                                     detail={}, error='adapter pending')
+            # The scanner records the explicit wait; the worker then owns the
+            # completion, under the same generation/epoch (#5932).
+            waited = native.wait_transition(
+                'burst', control['generation'], 'draining',
+                release_epoch=control['release_epoch'], actor='tester',
+                detail={'command': 'adapter'})
+            self.assertEqual(waited['hook_wait_state'], 'draining')
+            self.assertIsNone(waited['hook_attempt_state'])
             self.assertEqual(self.tick(), 'draining')
             self.assertEqual(vm.main(['request', 'draining', 'burst']), 0)
             with mock.patch.dict(os.environ, {'AMEESH_HOST_GENERATION': str(control['generation']+1)}):
