@@ -918,6 +918,17 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
                 entry["ready"] = False
         if entry["ready"] and not entry["source"]:
             entry["source"] = entry["published_head"]
+    # #5971 : le retrait d'un porteur reste visible au tic suivant, même
+    # depuis un autre clone. Lecture ciblée des notes, pas du journal entier.
+    from . import packet_unit_red
+    ready_ids = [entry['work_item'] for entry in candidates if entry['ready']]
+    if ready_ids:
+        try:
+            red_events = storage.of(db).progress.lot_hold_events(
+                ready_ids, [packet_unit_red.PATTERN])
+            packet_unit_red.apply(candidates, red_events, base=fetched_target)
+        except Exception as exc:
+            raise CandidateError('cannot read unit-test exclusions: %s' % exc) from exc
     for entry in candidates:
         # #3256 C : les fichiers modifiés d'un lot prêt, pour ne jamais
         # partager deux lots qui se croisent entre deux paquets parallèles.

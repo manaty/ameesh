@@ -3432,16 +3432,47 @@ def lot_author(lot: int, repo: Path) -> str:
     return str(item.get("assignee") or "").strip()
 
 
+def remember_unit_red(repo: Path, lot: int, source: str, target: str,
+                      tests: list[str], sender: str | None, *, base=None) -> bool:
+    """#5971 : note durable par base avant recomposition ; False si déjà signalé.
+
+    Ne jamais réarmer la borne d'une tête expirée : la première note reste
+    l'origine de l'exclusion sur cette base, même si un nouvel essai rougit encore.
+    Une nouvelle base a sa propre borne, sans deuxième courrier par source/cible.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+    from ameesh import config, db, packet_unit_red
+    connection = None
+    try:
+        connection = db.connect(config.load())
+        return packet_unit_red.remember(connection, lot, source, target, tests,
+                                        actor=sender or '', base=base)
+    except Exception as exc:
+        raise PaquetAutoError('mémoire du rouge #%d non enregistrée : %s' % (lot, exc)) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def notify_removals(repo: Path, name: str, removals: list[Removal], *,
-                    sender: str | None, log=print) -> list[str]:
+                    sender: str | None, log=print, sources=None, target='', base=None) -> list[str]:
     """Prévient l'auteur de chaque unité retirée (§11 bis, #3931).
 
     Un courrier qui ne part pas n'annule pas la recomposition : il est
     consigné, et le courrier du pilote porte les lots retirés. Rend les
-    échecs, pour la trace du tic.
+    échecs, pour la trace du tic. Une mémoire impossible à écrire arrête en
+    revanche la tentative : aucun retrait réputé durable sans sa note.
     """
     failed: list[str] = []
     for removal in removals:
+        if sources is not None:
+            try:
+                if not remember_unit_red(repo, removal.lot, sources[removal.lot],
+                                         target, removal.tests, sender, base=base):
+                    continue
+            except (PaquetAutoError, ValueError, KeyError) as exc:
+                raise PaquetAutoError('retrait #%d non mémorisé : %s'
+                                      % (removal.lot, exc)) from exc
         author = lot_author(removal.lot, repo)
         if not author:
             log("auteur de #%d inconnu : courrier non envoyé" % removal.lot)
@@ -3466,6 +3497,10 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
             "sans ton lot ; corrige puis regèle, il reviendra à une coupure "
             "suivante."
             % (removal.lot, name, why, tests))
+        if sources is not None:
+            body += (' Source : %s. Mémoire sur le lot : cette source est exclue '
+                     'pendant au plus une heure depuis le premier retrait ; '
+                     'une nouvelle source est réadmise immédiatement.' % sources[removal.lot])
         try:
             send_mail(author, removal.lot, body, sender)
         except PaquetAutoError as exc:
@@ -4308,6 +4343,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                 modules = next(
                     (run.modules for run in runs
                      if run.label == "unité #%d" % removal.lot), [])
+                if not removal.tests:
+                    removal.tests = list(modules)
                 if removal.proof == "prefixes":
                     reason = ("tests ciblés rouges (%s), situés au premier "
                               "préfixe de l'empilement, retirés de la "
@@ -4327,6 +4364,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                               % (", ".join(modules) or "modules illisibles"))
                     detail = ""
                 reasons.append(Discarded(removal.lot, reason, detail))
+            # #5971 : mémoire et signalement avant de perdre les sources de
+            # la composition retirée, même si la recomposition échoue ensuite.
+            if not getattr(args, 'local', False):
+                failed = notify_removals(
+                    worktree, args.name, removals,
+                    sender=getattr(args, 'sender', None),
+                    sources={candidate.lot: candidate.source for candidate in candidates},
+                    target=args.target, base=base_sha)
+                if failed:
+                    print('mémoire/courriers de retrait non enregistrés : %s'
+                          % ' ; '.join(failed), file=sys.stderr, flush=True)
             print("recomposition : retrait de %s"
                   % ", ".join("#%d" % lot for lot in faulty), flush=True)
             removed_sources.update(
@@ -4341,15 +4389,6 @@ def compose_packet(args: argparse.Namespace) -> int:
                 expect_pushed=lease or "", removed=removed_sources,
                 guard=guard)
             composition.discarded = errors + composition.discarded + reasons
-            # `--local` est une composition de contrôle : aucun courrier.
-            failed: list[str] = []
-            if not getattr(args, "local", False):
-                failed = notify_removals(
-                    worktree, args.name, removals,
-                    sender=getattr(args, "sender", None))
-            if failed:
-                print("courriers d'auteur non envoyés : %s"
-                      % " ; ".join(failed), file=sys.stderr, flush=True)
             if not composition.units:
                 if pushed:
                     # la tête poussée n'a plus d'unité : sa CI et sa PR tombent,
