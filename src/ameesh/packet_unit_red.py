@@ -2,12 +2,16 @@
 """#5971 : mémoire bornée des sources retirées pour tests par unité rouges.
 
 Une note sur le lot survit au porteur et au clone du composeur. La première
-note d'une source/cible/base donne au plus une heure d'exclusion ; les retraits
-répétés sur la même base ne renouvellent pas cette borne. Le courrier
+note d'une source/cible/base donne au plus deux heures d'exclusion ; les
+retraits répétés sur la même base ne renouvellent pas cette borne. Le courrier
 reste unique par source/cible, même si la base change. Une source neuve
 ou une nouvelle tête de la cible est admise immédiatement. Les non-concluants ne passent pas par ce chemin :
 paquet-auto ne les retire pas (§3). La borne protège aussi contre un rouge
 initialement attribué au code qui se révèle ensuite instable ou lié au banc.
+
+La cible est normalisée (`origin/main`, `refs/heads/main` et `main` nomment
+`main`) à l'écriture comme à la comparaison : une note écrite avec une cible
+préfixée n'est jamais une exclusion muette.
 """
 from __future__ import annotations
 
@@ -18,7 +22,25 @@ import time
 
 PREFIX = 'packet-unit-red: '
 PATTERN = '^' + re.escape(PREFIX)
-EXCLUSION_S = 3600
+#: Le tic paquet-horaire passe toutes les dix minutes, mais un porteur ouvert
+#: retient la composition suivante ; sa ci-full dure environ une heure (jobs
+#: bornés à soixante minutes), puis le tic suivant compose. Deux heures
+#: couvrent ce cycle — CI, tic de fermeture, tic de composition — avec une
+#: marge, sans exclure indéfiniment un rouge instable.
+EXCLUSION_S = 2 * 3600
+#: Mêmes préfixes que `merge_queue._remote_branch`, dont `packet_candidates`
+#: normalise déjà la cible des candidats.
+TARGET_PREFIXES = ('refs/heads/', 'refs/remotes/origin/', 'origin/')
+
+
+def normalize_target(target):
+    """La branche nommée par `target` : `origin/main`, `refs/heads/main`,
+    `refs/remotes/origin/main` et `main` nomment tous `main`."""
+    text = target if isinstance(target, str) else ''
+    for prefix in TARGET_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
 
 
 def read_note(note):
@@ -37,11 +59,14 @@ def read_note(note):
     if 'base' in value and (not isinstance(value['base'], str)
                             or not re.fullmatch('[0-9a-f]{40}', value['base'])):
         return None
+    value['target'] = normalize_target(value['target'])
+    if not value['target']:
+        return None
     return value
 
 
 def note(source, target, tests, *, base=None):
-    value = dict(source=source, target=target, tests=list(tests))
+    value = dict(source=source, target=normalize_target(target), tests=list(tests))
     if base is not None:
         if not isinstance(base, str) or not re.fullmatch('[0-9a-f]{40}', base):
             raise ValueError('invalid unit-red target base')
@@ -65,7 +90,8 @@ def apply(candidates, events, *, now=None, base=None):
         if key not in first or stamp < first[key][0]:
             first[key] = (stamp, value)
     for entry in candidates:
-        identity = (entry['work_item'], entry.get('source'), entry.get('target'))
+        identity = (entry['work_item'], entry.get('source'),
+                    normalize_target(entry.get('target')))
         prior = first.get((*identity, base)) or first.get((*identity, None))
         if not entry.get('ready') or prior is None:
             continue
@@ -99,9 +125,10 @@ def remember(db, lot, source, target, tests, *, actor='', base=None):
         if st.work.lock(lot) is None:
             raise work.WorkError('lot %s not found' % lot)
         seen_source = False
+        wanted = normalize_target(target)
         for event in st.progress.lot_hold_events([lot], [PATTERN]):
             value = read_note(event.get('note'))
-            if value and value['source'] == source and value['target'] == target:
+            if value and value['source'] == source and value['target'] == wanted:
                 seen_source = True
                 if value.get('base') == base:
                     return False

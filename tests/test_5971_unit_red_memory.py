@@ -56,12 +56,39 @@ class SelectionTest(unittest.TestCase):
         memory.apply(rows, [b1, b2], now=260, base=Y)
         self.assertIn('tests.b2', rows[0]['causes'][0]['detail'])
 
+    def test_exclusion_outlives_a_packet_cycle_longer_than_one_hour(self):
+        # Revue #5971 : un porteur ouvert retient la composition suivante ;
+        # sa ci-full dure ~1 h, donc la borne d'une heure expirait avant elle.
+        rows = [candidate()]
+        memory.apply(rows, [event()], now=100 + 3600 + 600)
+        self.assertFalse(rows[0]['ready'])
+        self.assertGreater(memory.EXCLUSION_S, 3600)
+
+    def test_target_prefixes_name_the_same_branch(self):
+        for target in ('origin/main', 'refs/heads/main',
+                       'refs/remotes/origin/main'):
+            self.assertEqual(memory.normalize_target(target), 'main')
+            self.assertEqual(memory.read_note(memory.note(X, target, ['t']))['target'],
+                             'main')
+        # Note écrite avant la normalisation, comparée à la cible canonique.
+        legacy = (memory.PREFIX + '{"source":"%s","target":"origin/main",'
+                  '"tests":["tests.test_bug"]}' % X)
+        self.assertEqual(memory.read_note(legacy)['target'], 'main')
+        for target in ('main', 'origin/main', 'refs/heads/main'):
+            rows = [candidate(target=target)]
+            memory.apply(rows, [dict(event(), note=legacy)], now=160)
+            self.assertFalse(rows[0]['ready'], target)
+        self.assertRaises(ValueError, memory.note, X, 'origin/', ['t'])
+
     def test_exclusion_names_its_expiry_for_the_ready_list_and_watch(self):
+        import datetime
         from ameesh import packet_watch
         rows = [candidate()]
         memory.apply(rows, [event()], now=160)
         detail = rows[0]['causes'][0]['detail']
-        self.assertIn('01:01 UTC', detail)
+        expiry = datetime.datetime.fromtimestamp(
+            100 + memory.EXCLUSION_S, datetime.timezone.utc).strftime('%H:%M UTC')
+        self.assertIn(expiry, detail)
         watch = packet_watch.ProjectWatch('ameesh', ('composer',))
         text = packet_watch.body(watch, {'label': 'test', 'at': 160},
                                  {'candidates': rows, 'ready': []}, now=160)
@@ -138,6 +165,19 @@ class DurableMemoryTest(PgTestCase):
         self.assertEqual({row['base'] for row in notes}, {X, Y})
         expiry = max(row['created_ts'] for row in records()) + memory.EXCLUSION_S
         self.assertTrue(ready(Y, expiry))
+
+    def test_prefixed_target_does_not_create_a_second_note(self):
+        from ameesh import storage
+        lot = self.db.query("INSERT INTO work_items (title, state) VALUES (%s, 'qa') RETURNING id",
+                            ('prefixed target',))[0]['id']
+        self.assertTrue(memory.remember(self.db, lot, X, 'origin/main', ['tests.b1']))
+        self.assertFalse(memory.remember(self.db, lot, X, 'main', ['tests.b2']))
+        marks = storage.of(self.db).progress.lot_hold_events([lot], [memory.PATTERN])
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(memory.read_note(marks[0]['note'])['target'], 'main')
+        entry = dict(candidate(), work_item=lot)
+        memory.apply([entry], marks, now=marks[0]['created_ts'] + 60)
+        self.assertFalse(entry['ready'])
 
     def test_record_survives_another_reader_and_more_than_a_hundred_events(self):
         from ameesh import storage
