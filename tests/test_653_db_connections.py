@@ -42,11 +42,81 @@ class ScopedConnections(PgTestCase):
             time.sleep(0.02)
         return self.present(pid)
 
+    def shared_sessions(self):
+        if self.db.name == "psql":
+            self.skipTest("the psql driver runs one psql process per statement")
+
+    def pid(self, scoped=None):
+        return (scoped or self.scoped).query('SELECT pg_backend_pid() AS pid')[0]['pid']
+
     def test_session_released_before_external_work(self):
-        pid = self.scoped.query('SELECT pg_backend_pid() AS pid')[0]['pid']
+        pid = self.pid()
+        self.scoped.release()
         self.assertEqual(self.released(pid), 0)
         self.scoped.execute('INSERT INTO scoped_values VALUES (1)')
         self.assertEqual(self.db.query('SELECT n FROM scoped_values'), [{'n': 1}])
+
+    def test_one_session_per_pass_closed_at_end(self):
+        self.shared_sessions()
+        # #5979: the statements of a pass share one backend, autocommitted.
+        pid = self.pid()
+        self.scoped.execute('INSERT INTO scoped_values VALUES (1)')
+        self.assertEqual(self.db.query('SELECT n FROM scoped_values'), [{'n': 1}])
+        self.assertEqual(self.pid(), pid)
+        self.scoped.close()
+        self.assertEqual(self.released(pid), 0)
+        # usable after close: a new session
+        self.assertNotEqual(self.pid(), pid)
+        self.scoped.close()
+
+    def test_idle_session_reaped_during_external_wait(self):
+        scoped = ScopedDb(self.cfg, idle_s=0.2)
+        pid = self.pid(scoped)
+        # an external wait (git, gh, ssh) longer than idle_s, no release call
+        self.assertEqual(self.released(pid), 0)
+        self.assertNotEqual(self.pid(scoped), pid)
+        scoped.close()
+
+    def test_error_discards_session(self):
+        pid = self.pid()
+        with self.assertRaises(db_mod.DbError):
+            self.scoped.query('SELECT * FROM scoped_missing_table')
+        self.assertEqual(self.released(pid), 0)
+        self.assertNotEqual(self.pid(), pid)
+        self.scoped.close()
+
+    def test_reaper_never_closes_a_transaction_in_progress(self):
+        scoped = ScopedDb(self.cfg, idle_s=0.1)
+        with scoped.transaction() as tx:
+            pid = self.pid(tx)
+            tx.execute('INSERT INTO scoped_values VALUES (1)')
+            time.sleep(0.5)
+            scoped.release()  # inside a transaction: nothing is released
+            self.assertEqual(self.present(pid), 1)
+            self.assertEqual(tx.query('SELECT n FROM scoped_values'), [{'n': 1}])
+        self.assertEqual(self.db.query('SELECT n FROM scoped_values'), [{'n': 1}])
+        self.assertEqual(self.released(pid), 0)
+
+    def test_threads_hold_separate_sessions(self):
+        self.shared_sessions()
+        pids, errors = [], []
+
+        def run():
+            try:
+                pids.append((self.pid(), self.pid()))
+                self.scoped.close()
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(errors, [])
+        self.assertEqual([a == b for a, b in pids], [True, True])
+        self.assertNotEqual(pids[0][0], pids[1][0])
+        self.assertEqual([self.released(a) for a, _ in pids], [0, 0])
 
     def test_transaction_keeps_session_and_rolls_back_as_a_unit(self):
         with self.assertRaisesRegex(ValueError, 'abort'):
