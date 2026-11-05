@@ -12,7 +12,10 @@ Nexlink).  This module is the mechanical part on the ameesh side:
   ``ameesh work fingerprint open``.  It is idempotent: while a lot is open for
   ``empreinte:<app>:<key>`` the call **notes** the occurrence (count, last
   seen, revision) instead of opening a second lot, and promotes the lot to P1
-  as soon as one user is touched.  A fingerprint that comes back after its lot
+  as soon as one user is touched **in production**.  A staging occurrence
+  never promotes it: one user there is a tester, not a P1, so a lot opened
+  from staging is capped at P2 (a production occurrence of the same
+  fingerprint still promotes it).  A fingerprint that comes back after its lot
   was merged/promoted/closed opens a new **recurrence** lot linked to the
   previous one.  Two concurrent passes are serialized by a transaction
   advisory lock; the partial unique index added by migration 0492 is the
@@ -246,7 +249,9 @@ def _body(*, source, users, count, fields, environment, previous=None) -> str:
         "",
         "Un seul lot ouvert par empreinte : les doublons sont notés au journal, "
         "pas ouverts en double.",
-        "P1 dès qu'un utilisateur est touché.",
+        ("P1 dès qu'un utilisateur est touché." if environment == DEFAULT_ENVIRONMENT
+         else "P2 au plus pour une empreinte %s : un utilisateur y est un "
+              "testeur, pas un P1 (canon §16)." % environment),
     ]
     if previous is not None:
         lines += ["", "Récidive du lot #%d (fermé) : même empreinte, nouvelle "
@@ -282,6 +287,19 @@ def _latest_row(db, source: str) -> dict | None:
     return rows[-1] if rows else None
 
 
+def _priority_for(users: int, environment: str) -> int:
+    """#5987 — a touched user gives P1 in production only.
+
+    A staging source samples testers, not users: a lot opened from it is
+    capped at P2, and a staging occurrence never promotes an open lot.  The
+    same fingerprint seen in production still promotes it to P1.  A priority
+    raised by a human is never lowered here.
+    """
+    if users > 0 and environment == DEFAULT_ENVIRONMENT:
+        return 1
+    return 2
+
+
 def _seen_note(*, fields, count: int, users: int, escalated: bool,
                environment: str) -> str:
     text = ("Empreinte revue : occurrences=%d, dernière vue=%s, révision=%s, "
@@ -290,6 +308,9 @@ def _seen_note(*, fields, count: int, users: int, escalated: bool,
                fields["revision"] or "—", users, environment))
     if escalated:
         text += " ; P1 (un utilisateur est touché)"
+    elif users > 0 and environment != DEFAULT_ENVIRONMENT:
+        text += (" ; %s : pas d'escalade P1 (un utilisateur y est un testeur)"
+                 % environment)
     return text
 
 
@@ -297,12 +318,16 @@ def _note_seen(db, row: dict, *, fields, count: int, users: int, actor: str,
                environment: str) -> bool:
     """Note the occurrence on the open lot and promote it to P1 if needed.
 
-    Returns True when the priority was changed.  The row is read again under
-    the transaction lock by ``set_priority``; a concurrent close is refused
-    there rather than writing a priority on a finished lot.
+    Only a **production** occurrence with a touched user promotes it (#5987):
+    staging users are testers, so they leave the lot at P2.  Returns True when
+    the priority was changed.  The row is read again under the transaction
+    lock by ``set_priority``; a concurrent close is refused there rather than
+    writing a priority on a finished lot.  A priority raised by a human is
+    never lowered here.
     """
     escalated = False
-    if users > 0 and row.get("priority") != 1:
+    if (users > 0 and environment == DEFAULT_ENVIRONMENT
+            and row.get("priority") != 1):
         updated = storage.of(db).work.set_priority(
             int(row["id"]), 1, current=row.get("priority"),
             reason="empreinte touchant %d utilisateur(s) (canon §16)" % users,
@@ -348,7 +373,7 @@ def _open_once(db, *, source, app, title, users, count, fields, actor,
             new_title = _recurrence_title(new_title, previous_id)
         note = ("récidive du lot #%d (empreinte déjà close)" % previous_id
                 if recurrence else "")
-        priority = 1 if users > 0 else 2
+        priority = _priority_for(users, environment)
         item = work.add(
             tx, title=new_title, type="bug", priority=priority, source=source,
             app=app, body=_body(source=source, users=users,
@@ -372,11 +397,14 @@ def open_lot(db, *, app: str, key: str, title: str, users=0, count=0,
 
     Idempotent by identity, never by call: a repeated call notes the
     occurrence (the pass may re-read a window after a failure).  ``users > 0``
-    gives priority 1 at creation and promotes an open P2/P3 lot.  A closed
-    fingerprint opens a recurrence lot linked to the previous one.
-    ``environment`` (``production`` or ``staging``) marks the lot; the
-    fingerprint identity stays shared across environments, so the same bug
-    seen in staging then production is one lot, noted again.
+    gives priority 1 at creation and promotes an open P2/P3 lot, but **in
+    production only**: a staging source sees testers, so its lot is capped at
+    P2 (#5987).  A closed fingerprint opens a recurrence lot linked to the
+    previous one.  ``environment`` (``production`` or ``staging``) marks the
+    lot; the fingerprint identity stays shared across environments, so the
+    same bug seen in staging then production is one lot, noted again, and a
+    production occurrence with a user still promotes it to P1.  A priority
+    raised by a human is never lowered.
     """
     source, title, users, count, fields, environment = _checked(
         app=app, key=key, title=title, users=users, count=count, route=route,
