@@ -88,6 +88,21 @@ bureau) les confirmera ou les corrigera.
    calendrier `*:0/10`), un processus et une ou plusieurs sessions chacune.
    Ordre de grandeur : quelques sessions/s pour la flotte.
 
+**Charge CPU : `OVERVIEW_SQL` toutes les 60 s par runner.** La signature
+fréquente relevée par le bureau (#194499 : f8284e0feb0d1470, 33 occurrences
+sur 16 échantillons d'1 s, jusqu'à 3,3 s, coût estimé 30 203) est
+`storage/postgres/registry.py:389` `OVERVIEW_SQL`, la vue complète du
+registre. Le runner l'appelle à chaque `resource_once` (60 s) par
+`host_lifecycle.critical_names` (`runner.py:13136` →
+`host_lifecycle.py:158`), seulement pour lire le verdict critique de chaque
+agent. Avec ~46 runners, cela fait ~0,77 exécution/s ; à 1-3 s chacune, on
+obtient ~1-2 requêtes lourdes toujours en cours, ce qui correspond aux
+~2 par échantillon du bureau. Le runner l'appelle aussi dans `served_rows`
+(`runner.py:14603`, comptes) et `_idle_pilot` (`runner.py:1900`, relance au
+repos). C'est la part #5764 (CPU) plutôt que #5972 (sessions), mais le
+correctif est du même ordre : une lecture étroite (nom, canon, verdict
+critique) au lieu de la vue complète, ou une vue partagée par hôte.
+
 Le bail (`runner.py:1195`, 100 s) et la réclamation de canon (100 s) ouvrent
 aussi leur propre connexion, mais leur part est négligeable. La boucle
 principale, le listener et les sondes d'inactivité réutilisent `self.db` :
@@ -120,6 +135,7 @@ octets, la famille étant posée par l'appelant (`runner.main`,
 | C | `require_compatible_writer` est volontairement sans cache (`migrations.py:777` : les minuteries longues doivent voir une incompatibilité nouvelle) ; le vérifier une fois par passe ou par processus court plutôt qu'à chaque session, en gardant cette garantie (vérification au bord de tick, déjà exigée par `_writer_connection`) | ~moitié des commits des sessions courtes | sensible (porte de migration) |
 | D | `serve` : connexions de lecture et d'écriture réutilisées (pool interne, ou pool `psycopg_pool` comme `mediated_executor/server.py:706`), SSE drainés sur une connexion partagée | dépend de la mesure serveur | sensible |
 | E | `agent_peek` : publier sur la connexion du runner (ou une connexion gardée par le publieur) au lieu d'une nouvelle toutes les 15 s | ~3/s | léger |
+| G | `host_lifecycle.critical_names` et `served_rows` : requête étroite au lieu de `OVERVIEW_SQL` toutes les 60 s par runner (#5764) | ~0,77 requête lourde/s, ~1-2 backends actifs en permanence | sensible (concurrence, porte d'hôte) |
 | F | Pose de PgBouncer sur agents-1/2/3 par le bureau, recette `deploy/pgbouncer-host.md`, après relecture du dimensionnement (budget 3 × 80 + pc 80 > 300 à revoir : agents-3 est à 40) | absorbe les sessions courtes restantes côté serveur | geste du bureau, pas un lot de code |
 
 Ordre recommandé : A d'abord (il rend mesurables tous les autres), puis B et
