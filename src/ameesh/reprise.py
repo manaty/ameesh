@@ -1876,6 +1876,9 @@ def cmd_resume(cfg: Config, args) -> int:
     if getattr(args, "expect_reason", None) is not None:
         print("ameesh resume: --expect-reason requires --operator", file=sys.stderr)
         return 1
+    if getattr(args, "actor", None) is not None:
+        print("ameesh resume: --actor requires --operator", file=sys.stderr)
+        return 1
     try:
         brief = _read_brief(args.brief)
     except OSError as exc:
@@ -1911,6 +1914,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pause.add_argument("agent")
     p_pause.add_argument("--reason", required=True)
     p_pause.add_argument("--human", default=None, help="local human (same as ameesh serve)")
+    p_pause.add_argument("--actor", choices=("ameesh:staging",), default=None,
+                         help="machine actor of the #2152 deployment drain of the "
+                              "elected staging executor (#5967); principal: the owner")
     p_pause.add_argument("--not-after", type=float, default=None, metavar="EPOCH",
                          help="deadline (epoch) after which the database refuses "
                               "the pause; set by the drain before a remote call")
@@ -1959,6 +1965,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="with --operator: lift only the pause whose reason is "
                            "exactly TEXT, atomically (#2152)")
     p_re.add_argument("--human", default=None, help="local human for --operator")
+    p_re.add_argument("--actor", choices=("ameesh:staging",), default=None,
+                      help="with --operator: machine actor of the #2152 deployment "
+                           "drain (#5967); principal: the owner")
     p_re.set_defaults(func=cmd_resume)
     return parser
 
