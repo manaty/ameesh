@@ -1334,6 +1334,7 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
                   note="qa → validated — carried review quorum (#4423)")
 
     gate, gate_exc = _read_gate()
+    gate2 = None
     if isinstance(gate, dict) and not gate.get("error"):
         if not gate.get("ok"):
             # Porte lisible et fermée : avis manquant ou bloquant. Le lot
@@ -1362,6 +1363,14 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
             exc = gate2_exc
     else:
         exc = gate_exc
+    # #5880 : une porte rendue avec `error` a un diagnostic (provenance
+    # inconnue, registre ou canon illisible) : la note le dit au lieu de
+    # « the review gate is unreadable ».
+    gate_why = ""
+    for found in (gate2, gate):
+        if isinstance(found, dict) and found.get("error"):
+            gate_why = str(found.get("error") or found.get("why") or "")
+            break
     # #5481 : la course entre hôtes n'est pas une panne. Entre la lecture de
     # l'état et le geste, un autre passage a pu valider le lot (`work.move`
     # lève alors « already in validated ») ou le faire sortir de `qa`. On
@@ -1391,7 +1400,8 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
         return {"result": "no-repository",
                 "detail": "the frozen head is unreadable from this host"}
     why = ("%s: %s" % (type(exc).__name__, exc) if not isinstance(exc, work.WorkError)
-           else str(exc)) if exc is not None else "the review gate is unreadable"
+           else str(exc)) if exc is not None else (
+               gate_why or "the review gate is unreadable")
     freeze_id = int((freeze or {}).get("id") or 0)
     host = _host(db)
     try:

@@ -1378,6 +1378,16 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if strict and not recognized:
         # Aucun auteur connu (assigné absent, ni `authors`) : l'indépendance
         # ne se suppose pas, comme avant #2681.
+        if attribution is not None and author and not reference_is_author:
+            # #5880 : la plage lue ne nomme aucun auteur. Dire « famille
+            # inconnue » de l'assigné, dont la famille est connue, faisait
+            # chercher un défaut de registre.
+            out["why"] = ("no review verdict ok on the freeze %s (class: %s): the reading "
+                          "of the frozen range names no author (the assignee %s wrote none "
+                          "of its commits and no other author is proven), so no verdict "
+                          "can be proven independent (canon §2: independence is never "
+                          "assumed)" % (frozen[:12], cls, author))
+            return out
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "
                       "no known model family, so no verdict can be proven independent "
                       "(canon §2: independence is never assumed)"
