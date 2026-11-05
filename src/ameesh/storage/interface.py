@@ -5754,30 +5754,39 @@ class GithubWatch(Domain):
 
 
 class FingerprintWatch(Domain):
-    """#3885: the resume cursor of the failure-fingerprint pass, per project.
+    """#3885: the resume cursor of the failure-fingerprint pass, per source.
 
-    The source is read with a read-only token; the cursor is opaque and only
-    advances after a complete, strictly validated page. A failed read keeps
-    the previous cursor so the next pass replays the same window.
+    A project may declare several sources (production, staging, …); each
+    source is identified by its URL and keeps its own cursor.  The source is
+    read with a read-only token; the cursor is opaque and only advances after
+    a complete, strictly validated page. A failed read keeps the previous
+    cursor so the next pass replays the same window.
     """
 
     @abc.abstractmethod
-    def state(self, project: str) -> dict | None:
-        """`{cursor, last_read_ts, last_error, updated_ts}` (`updated_ts`: the
-        last attempt, read or failure), or None before the first read."""
+    def state(self, project: str, environment: str = "production") -> dict | None:
+        """`{cursor, environment, url, last_read_ts, last_error, updated_ts}`
+        (`updated_ts`: the last attempt, read or failure), or None before the
+        first read of that source.  A production source with no row in the new
+        table falls back to the historical `fingerprint_watch_state` row, so an
+        N-1 process's cursor is never lost during a deployment (#5946)."""
 
     @abc.abstractmethod
     def failing(self) -> list[dict]:
-        """#5695: the sources whose last attempt failed
-        (`project, url, last_error, last_read_ts, updated_ts`)."""
+        """#5695/#5968: the sources whose last attempt failed
+        (`project, environment, url, last_error, last_read_ts, updated_ts`);
+        the historical production row is included while the new pass has not
+        written that source yet."""
 
     @abc.abstractmethod
     def advance(self, project: str, url: str, cursor: str | None, *,
+                environment: str = "production",
                 now: float | None = None) -> None:
-        """Record a complete read: move the cursor, clear the last error."""
+        """Record a complete read: move that source's cursor, clear its error."""
 
     @abc.abstractmethod
     def fail(self, project: str, url: str, error: str, *,
+             environment: str = "production",
              now: float | None = None) -> None:
         """Record an explicit refusal/read failure; never move the cursor."""
 

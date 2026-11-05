@@ -33,8 +33,10 @@ def page():
         return json.load(fh)
 
 
-def declaration(url="https://nexlink.example/api/fingerprints", interval=60):
-    return fingerprints.Declaration("nexlink", url, float(interval), "watch")
+def declaration(url="https://nexlink.example/api/fingerprints", interval=60,
+                environment="production", token_file=""):
+    return fingerprints.Declaration("nexlink", url, float(interval), "watch",
+                                    environment, token_file)
 
 
 TOKEN = "a" * 40
@@ -74,8 +76,33 @@ class PrimitiveTest(PgTestCase):
         self.assertEqual(item["app"], "ameesh")
         for text in ("POST /api/v1/requests", "23505", "rev-abc",
                      "2026-10-27T04:30:00Z", "Occurrences : 3",
-                     "Utilisateurs touchés : 0", "Un seul lot ouvert par empreinte"):
+                     "Utilisateurs touchés : 0", "Un seul lot ouvert par empreinte",
+                     "Environnement : production"):
             self.assertIn(text, item["body"])
+
+    def test_a_staging_lot_is_marked_and_the_identity_stays_shared(self):
+        first = self.open(users=1, environment="staging")
+        self.assertTrue(first["created"])
+        self.assertEqual(first["environment"], "staging")
+        item = work.get(self.db, first["lot"])
+        self.assertTrue(item["title"].startswith("[staging] "), item["title"])
+        self.assertIn("Environnement : staging", item["body"])
+        self.assertEqual(item["source"],
+                         "empreinte:ameesh:v1:0123456789abcdef0123456789abcdef")
+        # production sees the same fingerprint: one lot, noted, not a second
+        second = self.open(users=1, environment="production")
+        self.assertFalse(second["created"])
+        self.assertTrue(second["noted"])
+        self.assertEqual(second["lot"], first["lot"])
+        self.assertEqual(len(self.rows()), 1)
+        self.assertTrue(any("environnement=production" in note
+                            for note in self.notes(first["lot"])))
+        self.assertTrue(work.get(self.db, first["lot"])["title"].startswith("[staging] "))
+
+    def test_an_unknown_environment_is_refused(self):
+        with self.assertRaisesRegex(fingerprints.FingerprintError, "environment"):
+            self.open(environment="preprod")
+        self.assertEqual(self.rows(), [])
 
     def test_a_user_touched_gives_p1_at_creation(self):
         result = self.open(users=1)
@@ -284,17 +311,88 @@ class DeclarationTest(unittest.TestCase):
                                  ([], ""))
                 self.assertTrue(any("interval" in warning for warning in warnings))
 
+    def test_several_sources_carry_their_environment_and_token_file(self):
+        bundle = self.bundle(fiche=types.SimpleNamespace(data={"fingerprints": {
+            "nexlink": {"sources": [
+                {"url": "https://api.example.test/f", "interval": 60},
+                {"url": "https://api-staging.example.test/f", "interval": 120,
+                 "environment": "staging",
+                 "token_file": "~/.config/ameesh/fingerprints-staging.token"},
+            ]}}}))
+        decls, error = fingerprints.declarations([bundle])
+        self.assertEqual(error, "")
+        self.assertEqual(decls, [
+            fingerprints.Declaration("nexlink", "https://api.example.test/f",
+                                     60.0, "watcher"),
+            fingerprints.Declaration("nexlink", "https://api-staging.example.test/f",
+                                     120.0, "watcher", "staging",
+                                     "~/.config/ameesh/fingerprints-staging.token"),
+        ])
+        self.assertEqual(decls[0].token_path(), fingerprints.DEFAULT_TOKEN_FILE)
+        self.assertEqual(decls[1].token_path(),
+                         "~/.config/ameesh/fingerprints-staging.token")
+
+    def test_an_invalid_source_does_not_discard_its_siblings(self):
+        warnings = []
+        bundle = self.bundle(fiche=types.SimpleNamespace(data={"fingerprints": {
+            "nexlink": {"sources": [
+                {"url": "https://api.example.test/f"},
+                {"url": "https://api-staging.example.test/f",
+                 "environment": "preprod"},
+            ]}}}))
+        decls, error = fingerprints.declarations([bundle], log=warnings.append)
+        self.assertEqual(error, "")
+        self.assertEqual([item.url for item in decls],
+                         ["https://api.example.test/f"])
+        self.assertTrue(any("environment" in warning for warning in warnings), warnings)
+
+    def test_a_duplicate_url_is_kept_once(self):
+        warnings = []
+        bundle = self.bundle(fiche=types.SimpleNamespace(data={"fingerprints": {
+            "nexlink": {"sources": [
+                {"url": "https://api.example.test/f"},
+                {"url": "https://api.example.test/f", "interval": 120},
+            ]}}}))
+        decls, _error = fingerprints.declarations([bundle], log=warnings.append)
+        self.assertEqual(len(decls), 1)
+        self.assertTrue(any("duplicate" in warning for warning in warnings), warnings)
+
+    def test_a_duplicate_environment_is_kept_once(self):
+        warnings = []
+        bundle = self.bundle(fiche=types.SimpleNamespace(data={"fingerprints": {
+            "nexlink": {"sources": [
+                {"url": "https://api.example.test/f", "environment": "staging"},
+                {"url": "https://api-2.example.test/f", "environment": "staging"},
+            ]}}}))
+        decls, _error = fingerprints.declarations([bundle], log=warnings.append)
+        self.assertEqual([item.url for item in decls],
+                         ["https://api.example.test/f"])
+        self.assertTrue(any("duplicate" in warning for warning in warnings), warnings)
+
+    def test_url_and_sources_cannot_be_mixed(self):
+        warnings = []
+        bundle = self.bundle(fiche=types.SimpleNamespace(data={"fingerprints": {
+            "nexlink": {"url": "https://api.example.test/f",
+                        "sources": [{"url": "https://api-staging.example.test/f"}]}}}))
+        self.assertEqual(fingerprints.declarations([bundle], log=warnings.append),
+                         ([], ""))
+        self.assertTrue(any("unknown" in warning for warning in warnings), warnings)
+
 
 class TickTest(PgTestCase):
     def setUp(self):
         # These witnesses share the project name and read the cursor: start
         # from an empty state, never from the previous test's rows.
+        self.db.execute("DELETE FROM fingerprint_source_state")
         self.db.execute("DELETE FROM fingerprint_watch_state")
         self.db.execute("DELETE FROM work_item_events")
         self.db.execute("DELETE FROM work_items")
 
-    def token_file(self, content=TOKEN):
-        path = os.path.join(self.tmp, "fingerprints.token")
+    def cursor_state(self, project="nexlink", environment="production"):
+        return storage.of(self.db).fingerprints.state(project, environment)
+
+    def token_file(self, content=TOKEN, name="fingerprints.token"):
+        path = os.path.join(self.tmp, name)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.write(fd, (content + "\n").encode("ascii"))
@@ -316,7 +414,7 @@ class TickTest(PgTestCase):
         rows = self.db.query("SELECT id, priority, title FROM work_items ORDER BY id")
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["priority"] for row in rows], [1, 2])
-        state = storage.of(self.db).fingerprints.state("nexlink")
+        state = self.cursor_state()
         self.assertEqual(state["cursor"], payload["cursor"])
         self.assertEqual(state["last_error"], "")
 
@@ -349,7 +447,7 @@ class TickTest(PgTestCase):
                               actor="mesh-design", now=1000.0)
             fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
                               actor="mesh-design", now=1061.0)
-        state = storage.of(self.db).fingerprints.state("nexlink")
+        state = self.cursor_state()
         self.assertEqual(state["cursor"], "cur-1")
         # the second read still asked for the previous cursor, never without
         self.assertEqual(read.call_args_list[1].args[1], "cur-1")
@@ -377,10 +475,84 @@ class TickTest(PgTestCase):
             with self.assertRaisesRegex(fingerprints.FingerprintError, "token"):
                 fingerprints.tick(self.cfg, self.db, token_file=missing)
         self.assertEqual(self.db.query("SELECT id FROM work_items"), [])
-        state = storage.of(self.db).fingerprints.state("nexlink")
+        state = self.cursor_state()
         self.assertIsNotNone(state)
         self.assertIn("token", state["last_error"])
         self.assertIsNone(state["cursor"])
+
+    def test_two_sources_keep_two_cursors_and_share_the_lot(self):
+        payload = page()
+        staging = declaration(url="https://staging.example.test/f",
+                              environment="staging")
+        production = declaration(url="https://prod.example.test/f")
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([staging, production], "")), \
+                mock.patch.object(fingerprints, "read_page", return_value=payload):
+            first = fingerprints.tick(self.cfg, self.db,
+                                      token_file=self.token_file(), now=1000.0)
+            second = fingerprints.tick(self.cfg, self.db,
+                                       token_file=self.token_file(), now=1061.0)
+        # staging is read first: it opens the two lots, marked
+        self.assertEqual(len(first), 4)
+        self.assertTrue(all(row["created"] for row in first[:2]))
+        self.assertTrue(all(not row["created"] and row["noted"]
+                            for row in first[2:]))
+        self.assertEqual({row["environment"] for row in first[:2]}, {"staging"})
+        lots = self.db.query("SELECT id, title FROM work_items ORDER BY id")
+        self.assertEqual(len(lots), 2)
+        self.assertTrue(all(row["title"].startswith("[staging] ") for row in lots))
+        rows = self.db.query(
+            "SELECT project, url, environment, cursor FROM fingerprint_source_state"
+            " ORDER BY url")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["environment"] for row in rows},
+                         {"staging", "production"})
+        self.assertTrue(all(row["cursor"] == payload["cursor"] for row in rows))
+        # the second pass notes both lots from both sources, no new lot
+        self.assertEqual(len(second), 4)
+        self.assertTrue(all(not row["created"] and row["noted"] for row in second))
+        self.assertEqual(len(self.db.query("SELECT id FROM work_items")), 2)
+        self.assertTrue(any("environnement=production" in note
+                            for note in (row["note"] for row in self.db.query(
+                                "SELECT note FROM work_item_events"))))
+
+    def test_each_source_reads_its_own_token_file(self):
+        prod_token = self.token_file(TOKEN, "prod.token")
+        staging_token = self.token_file("b" * 40, "staging.token")
+        staging = declaration(url="https://staging.example.test/f",
+                              environment="staging", token_file=staging_token)
+        production = declaration(url="https://prod.example.test/f",
+                                 token_file=prod_token)
+        seen = []
+
+        def read(decl, cursor, token, **kwargs):
+            seen.append((decl.url, token))
+            return page()
+
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([staging, production], "")), \
+                mock.patch.object(fingerprints, "read_page", side_effect=read):
+            fingerprints.tick(self.cfg, self.db, now=1000.0)
+        self.assertEqual(seen, [("https://staging.example.test/f", "b" * 40),
+                                ("https://prod.example.test/f", TOKEN)])
+
+    def test_a_missing_staging_token_does_not_stop_production(self):
+        missing = os.path.join(self.tmp, "missing-staging.token")
+        staging = declaration(url="https://staging.example.test/f",
+                              environment="staging", token_file=missing)
+        production = declaration(url="https://prod.example.test/f",
+                                 token_file=self.token_file())
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([staging, production], "")), \
+                mock.patch.object(fingerprints, "read_page", return_value=page()):
+            with self.assertRaisesRegex(fingerprints.FingerprintError, "not found"):
+                fingerprints.tick(self.cfg, self.db, now=1000.0)
+        self.assertEqual(len(self.db.query("SELECT id FROM work_items")), 2)
+        failed = self.cursor_state(environment="staging")
+        self.assertIn("not found", failed["last_error"])
+        healthy = self.cursor_state(environment="production")
+        self.assertEqual(healthy["last_error"], "")
+        self.assertEqual(healthy["cursor"], page()["cursor"])
 
     def test_an_unknown_field_refuses_the_page_and_keeps_the_cursor(self):
         bad = page()
@@ -391,7 +563,7 @@ class TickTest(PgTestCase):
             with self.assertRaisesRegex(fingerprints.FingerprintError, "unknown field"):
                 fingerprints.tick(self.cfg, self.db, token_file=self.token_file())
         self.assertEqual(self.db.query("SELECT id FROM work_items"), [])
-        state = storage.of(self.db).fingerprints.state("nexlink")
+        state = self.cursor_state()
         self.assertIn("unknown field", state["last_error"])
         self.assertIsNone(state["cursor"])
 
@@ -419,7 +591,7 @@ class TickTest(PgTestCase):
                 fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
                                   now=1000.0 + fingerprints.AUTH_RETRY_S)
             self.assertEqual(read.call_count, 2)
-        state = storage.of(self.db).fingerprints.state("nexlink")
+        state = self.cursor_state()
         self.assertIn("HTTP 401", state["last_error"])
 
     def test_another_failure_keeps_the_declared_cadence(self):
@@ -492,6 +664,31 @@ class TickTest(PgTestCase):
                                        for p in ("nexlink", "liquichain")])
         self.assertEqual(sorted(a["project"] for a in alerts), ["liquichain", "nexlink"])
         self.assertEqual(len({exploitation.alert_key(a) for a in alerts}), 2)
+
+    def test_two_failing_sources_of_one_project_are_two_alerts(self):
+        # #5964: production and staging of one project may fail in the same
+        # pass; the URL tells them apart, not only the project.
+        from ameesh import exploitation
+        api = storage.of(self.db).fingerprints
+        sources = [
+            fingerprints.Declaration("nexlink", "https://prod.example/f", 60),
+            fingerprints.Declaration("nexlink", "https://staging.example/f", 60,
+                                     "watch", "staging"),
+        ]
+        for source in sources:
+            api.advance(source.project, source.url, "c",
+                        environment=source.environment, now=1000.0)
+            api.fail(source.project, source.url,
+                     "fingerprints source nexlink: HTTP 401", now=1061.0,
+                     environment=source.environment)
+        alerts = self.source_alerts(1000.0 + fingerprints.FAILING_ALERT_S,
+                                   sources=sources)
+        self.assertEqual(len(alerts), 2)
+        self.assertEqual({alert["url"] for alert in alerts},
+                         {"https://prod.example/f", "https://staging.example/f"})
+        self.assertEqual({alert["environment"] for alert in alerts},
+                         {"production", "staging"})
+        self.assertEqual(len({exploitation.alert_key(alert) for alert in alerts}), 2)
 
     def test_a_read_source_alerts_only_after_the_delay_and_clears_on_success(self):
         payload = page()

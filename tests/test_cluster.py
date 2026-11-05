@@ -322,6 +322,11 @@ FERMEES = {
     # aux deux rôles, aucun GRANT modifié.
     "fingerprint_watch_state": {"project", "url", "cursor", "last_read_at",
                                 "last_error", "updated_at"},
+    # #5968 (0549) : état par (projet, environnement) pour une passe
+    # multi-sources ; la table historique reste la barrière N-1 (#5946) et
+    # n'est pas modifiée.
+    "fingerprint_source_state": {"project", "environment", "url", "cursor",
+                                 "last_read_at", "last_error", "updated_at"},
     # #4164 (0500) : crédits du compte fournisseur ; l'état est accordé au rôle
     # superviseur (alertes), le texte d'erreur libre du fournisseur reste fermé
     "provider_account_credits": {"detail"},
