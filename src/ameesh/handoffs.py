@@ -69,6 +69,8 @@ class Refusal(Enum):
     RENEWAL_REQUIRED = ("reservation expired; explicit host reconciliation and renewal required; "
                         "retry with --renew-ttl SECONDS (30..7200)")
     CHECKPOINT_MISSING = "missing recovery checkpoint"
+    ADAPTER_UNAVAILABLE = ("source restoration needs the enrolled host adapter; "
+                           "run the cancellation where the handoff factory is installed")
 
 
 class HandoffRefusal(HandoffError):
@@ -504,7 +506,10 @@ def promote_loss(db, operation, adapter):
 
 @_serialized
 def cancel(db, operation, adapter):
-    """Only before switching hosts: reconcile stopped source, then release its fence."""
+    """Only before switching hosts: reconcile stopped source, then release its fence.
+
+    An expired plan without host effect is closed without restore_source (#5864).
+    """
     api = storage.of(db).handoffs
     op = api.get(operation)
     if not op:
@@ -519,9 +524,20 @@ def cancel(db, operation, adapter):
     # Loss publication uses this same gate lock. Keep the current lifecycle
     # check, restoration and fence release within one boundary.
     with api.cancellation_guard(operation) as guarded:
+        # #5864: an expired plan that never fenced nor touched a host has
+        # nothing to restore; restore_source would re-enable a drained unit.
+        # Checked before the lost-source refusal: closing it has no host
+        # effect, and a stale plan on a lost source would block its reconcile.
+        # Journal backend, like begin_effect: a row lock taken on the gate
+        # backend would be held until the gate commits and block the intent.
+        unused = api.cancel_unused(operation)
+        if unused:
+            return unused
         control = storage.of(guarded.db).host_lifecycle.get(op["source"])
         if control and control["mode"] == "lost":
             raise HandoffRefusal(Refusal.SOURCE_LOST)
+        if adapter is None:
+            raise HandoffRefusal(Refusal.ADAPTER_UNAVAILABLE)
         if _effect(api, adapter, "restore_source", op, completion_api=guarded) is not True:
             raise HandoffRefusal(Refusal.SOURCE_RECOVERY_UNVERIFIED)
         return guarded.unfence(operation, op["state"], "cancelled") or guarded.get(operation)
