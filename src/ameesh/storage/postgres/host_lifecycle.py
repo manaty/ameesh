@@ -393,6 +393,13 @@ class HostLifecycle(interface.HostLifecycle):
             "hook_attempt_epoch=c.release_epoch, "
             "updated_at=clock_timestamp() "
             "WHERE c.host=%s AND c.generation=%s AND c.release_epoch=%s "
+            # #5925: the operator owns a durable asynchronous stop intent.
+            # Retrying its hook after the normal timeout could clear that
+            # intent while the VM is archiving. Only the worker reconciles it.
+            "AND NOT (%s='idle-drained' AND EXISTS (SELECT 1 FROM vm_adapter_requests v "
+            "WHERE v.host=c.host AND v.generation=c.generation "
+            "AND v.release_epoch=c.release_epoch AND v.state='idle-drained' "
+            "AND v.status='pending' AND v.result='poweroff intent')) "
             "AND c.hook_state IS DISTINCT FROM %s "
             "AND NOT EXISTS (SELECT 1 FROM host_lifecycle_transitions t "
             "                WHERE t.host=c.host AND t.generation=c.generation "
@@ -411,7 +418,7 @@ class HostLifecycle(interface.HostLifecycle):
             "     OR (%s='idle-drained' AND c.mode='draining' AND NOT c.claims_open "
             "         AND c.release_state='draining' AND c.hook_state='draining')) "
             "RETURNING " + _ROW,
-            (state, host, generation, release_epoch, state, state, stale_after,
+            (state, host, generation, release_epoch, state, state, state, stale_after,
              state, retry_after, state, state, state))
         return rows[0] if rows else None
 

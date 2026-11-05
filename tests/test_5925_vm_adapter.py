@@ -320,3 +320,15 @@ class AdapterTest(PgTestCase):
         self.assertIsNotNone(self.q.control('burst')['released_ts'])
         rows = self.db.query("SELECT state FROM host_lifecycle_transitions WHERE host='burst'")
         self.assertEqual(rows, [{'state': 'idle-drained'}])
+
+    def test_scanner_does_not_retry_owned_stop_after_attempt_timeout(self):
+        self.request()
+        self.observe_old()
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.db.execute("UPDATE host_lifecycle SET hook_attempt_at=clock_timestamp()-interval '5 hours'")
+        c = self.q.control('burst')
+        attempt = storage.of(self.db).host_lifecycle.begin_transition(
+            'burst', c['generation'], 'idle-drained', release_epoch=c['release_epoch'],
+            actor='scanner', stale_after=420, retry_after=0)
+        self.assertIsNone(attempt)
+        self.assertEqual(self.q.control('burst')['hook_attempt_state'], 'idle-drained')

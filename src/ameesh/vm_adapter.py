@@ -258,7 +258,8 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             q.finish(request, 'obsolete', 'generation changed')
             return 'obsolete'
         verb = request['state']
-        if (verb in ('busy', 'draining') and control.get('hook_attempt_state') == verb
+        if (control.get('hook_attempt_state') == verb
+                and (verb != 'idle-drained' or request.get('result') != 'poweroff intent')
                 and now - (control.get('hook_attempt_ts') or 0) < host_release._attempt_bound(cfg)):
             return 'native hook in flight'
         if state == 'stopping':
