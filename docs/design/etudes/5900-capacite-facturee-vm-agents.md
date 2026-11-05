@@ -22,18 +22,21 @@ sources:
 
 # Recommendation
 
-1. **Do not expect savings from shutting VMs down when they go idle, today.**
-   Over the last seven days the three agent VMs had 0 to 4 whole hours a day
-   without a turn, and the night carries as much work as the day. The idle
-   periods come in minutes. Scaleway bills at least 60 minutes per start/stop
-   period, and powering a local-storage VM off and on takes minutes. So the
-   30-minute drain rule of 28/10 would save almost nothing here, even once it
-   works.
+1. **Expect little from shutting VMs down when they go idle, today.** Over
+   the last seven days, agents-1 had 1 whole hour without a turn, agents-2
+   none and agents-3 8 (about one a day). The night carries as much work as
+   the day. An hour without a turn is not yet an idle hour: mail, a lot wake
+   or a lease can still keep the host busy. Even if all 8 hours of agents-3
+   were idle, the ceiling is about 35 h a month × 0.19074 € ≈ **6.6 €/month**.
+   That is before the 60-minute billing minimum per start/stop period and
+   the minutes it takes to archive and restore a local disk. The 30-minute
+   drain rule of 28/10 is still worth repairing and running (point 4). Its
+   saving today is small.
 2. **The lever is the size of the fleet, not its schedule.** Summed minute by
    minute, the work of the three VMs fits on two VMs 98.7 % of the time with
    a 20 % margin, but not on one (memory p99 37 GB, max 45.7 GB). agents-3 is
    the least loaded: mean concurrency 0.95 turn, memory max 12.4 GB, CPU max
-   5.7 cores. It hosts no elected role.
+   6.1 cores (§5). It hosts no elected role.
 3. **First target, bounded and reversible: resize agents-3 from GP1-S
    (8 vCPU/32 GB) to GP1-XS (4 vCPU/16 GB).** Same family, same local disk
    (GP1-XS takes up to 150 GB), same agents, same IP. Saving: **≈ 71.5 €/month
@@ -41,15 +44,16 @@ sources:
    gives the first real measurement of the wake-up delay, which the drain
    policy needs. It runs after #5869, so the power-off does not turn the
    host `lost` (§6).
-4. **Repair the release path before relying on it.** The release half of
-   #4148 is inert end to end (§2). #5869 must land first. Then the lots C2–C4
-   below make the existing policy usable for a future host that really goes
-   idle in blocks.
+4. **Repair and run the existing rule now, without waiting.** The release
+   half of #4148 is inert end to end (§2). The lots that apply the rule of
+   28/10 (C2–C5) need no new owner decision, as the pilot noted. They start
+   now in the order of §8. Only the resize (C1) and option D are outside the
+   rule.
 5. The bigger option, taking agents-3 out and keeping it powered off as a
-   burst reserve (≈ 139 €/month), is not recommended before C4 has measured
-   per-turn memory. agents-2 alone already saturated its memory on 30/10.
-   Moving six more agents onto agents-1/2 would put Nexlink throughput at
-   risk.
+   burst reserve (≈ 139 €/month), is riskier. agents-2 alone already
+   saturated its memory on 30/10, and moving six more agents onto agents-1/2
+   could slow Nexlink. The owner can choose it at any time (Q1). C4's
+   per-turn peaks would make that choice safer, but nothing waits for them.
 
 # 1. The request and its limits
 
@@ -65,7 +69,10 @@ shutdown. The constraints of the lot:
   that stays on;
 - no cloud rights for agents, no new VM, no budget increase, nothing on IMA,
   Memoria or a personal session;
-- one track, lots only on an owner decision.
+- one track, with no automatic sub-lots. A gesture outside the rule of
+  28/10 (a resize, a new expense) goes to the owner. The lots that apply
+  that rule follow this study once reviewed (pilot's note, 05/11 06:50,
+  #192699).
 
 The canon decision exists (lots.md, « Capacité allumée au plus juste »,
 28/10): `baseline_hosts` = 2, a burst host idle for 30 min is drained and
@@ -245,10 +252,10 @@ that GP1 does not include it (Q3).
 
 | Option | Saving €/month | Risk to throughput | Reversible | Verdict |
 |---|---|---|---|---|
-| A. Idle drain of burst hosts (canon of 28/10) as is | ≈ 0 today: no idle block of ≥ 60 min | none | yes | keep the policy, repair it (C2–C4), expect nothing now |
+| A. Idle drain of burst hosts (canon of 28/10), repaired | ≤ 6.6 on agents-3 (8 h without a turn in 7 days, upper bound), ≈ 0 on agents-1/2 | none | yes | apply the rule now (C2–C5); small saving today, larger if the load keeps falling |
 | B. Night shutdown of a VM | ≈ 0, would cut work that runs | high | yes | rejected: no night trough |
-| **C. agents-3 GP1-S → GP1-XS** | **71.48** | low: observed max 12.4 GB of 16, 5.7 cores of 4 at the peak (short) | yes, the same resize back | **recommended first target** |
-| D. agents-3 archived as a burst reserve, its 6 agents moved to agents-1/2 | 139.24 (keeps 9.02) | medium to high: agents-2 already saturated; 41 agents on two VMs | yes, power on again | after C4 measurements, owner decision |
+| **C. agents-3 GP1-S → GP1-XS** | **71.48** | low to medium: memory fits (max 12.4 GB of 16), CPU does not at its peak (max 6.1 cores of 4, 73 minutes above 4 in 7 days) | yes, the same resize back | **recommended first target** |
+| D. agents-3 archived as a burst reserve, its 6 agents moved to agents-1/2 | 139.24 (keeps 9.02) | medium to high: agents-2 already saturated; 41 agents on two VMs | yes, power on again | owner decision (Q1); safer with C4 data, not blocked by it |
 | E. agents-3 deleted | 148.26 | as D, and no reserve | no | rejected |
 | F. agents-1/2 smaller | — | high (both under memory pressure) | — | rejected |
 | G. Move to POP2/PRO2 | negative (more expensive) | — | — | rejected |
@@ -256,15 +263,15 @@ that GP1 does not include it (Q3).
 **Why option C and not D.**
 
 - C keeps the three hosts, the placements, the sessions and the elected
-  base. The only thing that changes is the ceiling of one host whose
-  measured peak fits under it.
+  base. The only thing that changes is the ceiling of one host. Its memory
+  peak fits under the new ceiling; its CPU peak does not (next paragraph).
 - D saves twice as much, but it adds 6 agents to two hosts that have
   already reached PSI mem above 96 %. The figure of 98.7 % of minutes that
   fit on two VMs comes from spot readings, not from the per-turn peaks that
   C4 will store. The Nexlink reviewer mty-nxl-rev-02 would share a VM with
   the Nexlink orchestrator.
-- D becomes a sound decision if two weeks of C4 measurements confirm the
-  margin, or if the turn count keeps falling (§3.1).
+- D becomes a safer decision once C4 has stored per-turn peaks, or if the
+  turn count keeps falling (§3.1). The owner can still take it earlier.
 
 **Why each VM stays on.**
 
@@ -273,10 +280,16 @@ that GP1 does not include it (Q3).
 - agents-3 is a burst host that carries work 58 % of the time, at night as
   well. It goes down a size; it does not go off.
 
-**The CPU under option C.** GP1-XS has 4 shared cores. On agents-3,
-`app_cpu` was above 4 cores only in short peaks (p95 2.24). Above that, turns
-would slow down: CPU PSI rises, no turn is killed. The host gate already
-holds back new turns under pressure. `max_agents` on agents-3 stays at 10.
+**The CPU under option C.** GP1-XS has 4 shared cores, and the observed
+peak does not fit under them. Over 7 days (9 611 minutes, 29/10 07:13 →
+05/11 07:12 UTC, a window one hour later than §3.2), agents-3 had
+`app_cpu` above 4 cores for **73 minutes (0.76 %)**, above 3.2 cores (80 %
+of 4) for 174 minutes, and a maximum of 6.07 cores. Its memory was above
+12.8 GB (80 % of 16) for 17 minutes. In those minutes turns slow down:
+CPU PSI rises, but no turn is killed. The host gate already holds back new
+turns under pressure. The cost is about one hour a week of slower turns
+for the 6 agents of agents-3, one of which is the Nexlink reviewer
+mty-nxl-rev-02. The rollback criterion of §6 watches exactly that. `max_agents` on agents-3 stays at 10.
 Per-agent memory caps (6 GB per agent) stay as they are, because the
 kernel is what enforces the ceiling of the host.
 
@@ -338,17 +351,22 @@ change on billed infrastructure, even though it lowers the cost.
   Scaleway key, on one host, in the ci-autoscale pattern. It reports back
   `busy` only after the host's fresh reading. The runners hold no cloud
   credentials.
-- **No power-off on spot averages.** The decision uses the per-turn memory
-  peaks and the history of C4, never one reading or the average CPU.
+- **No power-off on spot averages.** The decision uses the idle state of
+  #4147 (turns, leases, runs, mail, wakes), never one reading or the
+  average CPU. Sizing decisions (C1, D) use measured peaks: today the
+  per-minute maximum of `host_resources`, and the per-turn peaks once C4
+  stores them.
+- **Wake-up delay before it is measured.** C5 starts with a default of
+  15 minutes for the anticipation and the hysteresis. It replaces the
+  default with the delay measured by C1, or by its own first wake-up.
 
 # 8. Proposed lots
 
 The pilot's note of 05/11 06:50 on the lot, agreed with bureau (#192699),
 says the rule of 28/10 needs no new decision. The lots that apply it, C2–C5,
 follow this study once reviewed, with no owner round trip. C1 is a different
-case: a resize is not in the rule, so it goes to the owner (Q1). C6 would be
-a decision on infrastructure as well.
-
+case: a resize is not in the rule, so it goes to the owner (Q1). Option D is
+also an owner decision.
 
 | Lot | Content | Class | Estimate |
 |---|---|---|---|
@@ -357,12 +375,19 @@ a decision on infrastructure as well.
 | C2 | Declared runs: a host card or mesh config can say `runs_interface: none`, so `runs = 0` counts as known. This unblocks `auto_drain_blocker` and `release_blocker` (§2) | sensitive (gate of release) | 0.5 d |
 | C3 | Cost per state: card fields for compute, disk and IP; `ameesh hosts` shows the on/off cost; `host_idle_reserved` and `baseline_oversized` are journaled as events, so they have a history | light | 0.5 d |
 | C4 | Sizing history: store the per-turn cgroup `memory.peak` and CPU in `turn_resources`; keep a daily per-host aggregate (p95/max memory, `app_cpu`, concurrency, PSI) for 90 days; one additive migration | sensitive (SQL) | 1 d |
-| C5 | Scaleway VM adapter on one host (§7): request in the database, systemd unit with the key, fresh reading before `busy`, hysteresis and anticipated wake-up | sensitive (infra, credentials) | 1 d |
-| C6 | Review after two weeks of C4: decide option D (agents-3 archived as a reserve) with measured figures | study | 2 h |
+| C5 | Scaleway VM adapter on one host (§7): request in the database, systemd unit with the key, fresh reading before `busy`, hysteresis and anticipated wake-up, default wake-up delay until measured | sensitive (infra, credentials) | 1 d |
+| C6 | Optional, only if the owner asks for D with figures: re-read §3 with the per-turn peaks stored by C4 since its delivery | study | 2 h |
 
-C1 depends on the owner's go and on #5869 (§6, step 3). C5 is worth
-building only if C4 shows a host that is idle in blocks of 60 minutes or
-more, or if option D is chosen.
+**Order, with no wait on a duration.**
+
+1. **Now, in parallel:** #5869 (already P1), C2, C3 and C4. They do not
+   depend on each other.
+2. **C5** follows as soon as C2 and #5869 are merged. The release path must
+   reach `idle-drained`, and a powered-off host must not turn `lost`. C5
+   does not wait for C4 or C6.
+3. **C1** needs the owner's go (Q1) and #5869 (§6, step 3). It is
+   independent of C2–C5.
+4. **C6** blocks nothing. It exists only to inform a later choice of D.
 
 # 9. Questions for the owner
 
