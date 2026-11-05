@@ -1827,7 +1827,7 @@ class AgentWorker(threading.Thread):
         bail est rendu en base (fencé par l'époque) pour qu'un autre
         exécuteur reprenne l'agent sans attendre l'échéance. Raison distincte
         de « lease deadline reached » : une préparation lente mais vivante
-        (#5806, IMA : ~75 s) reste très en deçà de la borne.
+        (#5806, mesure de recette : ~75 s) reste très en deçà de la borne.
         """
         raison = "preparation stuck %ds in %s (bound %ds)" % (elapsed, phase, borne)
         self.lease_lost.set()
