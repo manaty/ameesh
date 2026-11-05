@@ -107,6 +107,18 @@ class IsolatedRenewalTest(PgTestCase):
         row = registry.get(self.db, worker.name)
         self.assertEqual(row["lease_epoch"], worker.epoch - 1)
 
+    def test_heartbeat_renews_immediately_when_initial_margin_is_short(self):
+        worker = self.worker("short")
+        worker.lease_deadline = time.time() + 10  # moins que TTL/3
+        stop = mock.Mock()
+        stop.wait.return_value = False
+        with mock.patch.object(worker, "ensure_watchdog"), \
+                mock.patch.object(worker, "renew", return_value=False) as renew:
+            worker._heartbeat(stop)
+        stop.wait.assert_called_once_with(0.0)
+        renew.assert_called_once()
+        self.assertFalse(worker.deadline_passed())
+
     def test_schema_guard_still_refuses_before_renewing(self):
         worker = self.worker("schema")
         self.db.execute(

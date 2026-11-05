@@ -1790,7 +1790,10 @@ class AgentWorker(threading.Thread):
         # reprise ne peut pas attendre le minimum de 2 s : elle serait après
         # l'échéance (#2483).
         reprise = Reprise(maximum=interval, minimum=min(Reprise.MINIMUM, interval))
-        attente = interval
+        # #5849 : le worker peut démarrer avec un bail déjà entamé. Sans le
+        # renouvellement de tête de boucle, réserver dès le premier battement
+        # une tranche complète pour l'appel, plutôt que viser l'échéance.
+        attente = self.renew_wait(interval)
         while not stop_event.wait(self.wait_timeout(attente)):
             phase = getattr(self, "_preparation_phase", None)
             if phase is not None:
