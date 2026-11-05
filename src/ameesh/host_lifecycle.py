@@ -24,6 +24,47 @@ def staleness_s(interval_s) -> float:
     return max(MIN_STALENESS_S, 3.0 * interval)
 
 
+def closed_hosts(db, *, readings=None, holds=None) -> dict:
+    """{host: reason} des hôtes qui ne peuvent pas ouvrir de tour maintenant.
+
+    Même lecture que l'élection (`election._gate_reason`, celle qu'affiche
+    `ameesh role status` : « host gate closed (draining) ») :
+
+    * le mode durable de L232e (`draining`, `lost`) ;
+    * la pause voulue de l'owner (#254, `host_holds`) ;
+    * l'état de porte publié par le dernier relevé de l'hôte (`draining`,
+      `stopped`).
+
+    `returning` n'est pas fermé : ses claims se rouvrent au fil de la reprise.
+    `readings` / `holds` évitent une relecture quand l'appelant les a déjà
+    (la passe d'alertes partage ses relevés) ; sinon le dernier relevé de
+    chaque hôte et les pauses en cours sont lus ici.
+
+    #5867 : la prise automatique (L165) s'en sert pour ne pas confier un lot à
+    un agent dont l'hôte est en drainage — aucun tour ne s'y ouvrirait, le lot
+    dormirait jusqu'à l'undrain. `idle_capacity` et le découpage (#5122) s'en
+    servent aussi : ces agents ne sont pas de la capacité disponible.
+    """
+    store = storage.of(db)
+    out: dict = {}
+    for row in store.host_lifecycle.listing():
+        mode = str(row.get("mode") or "")
+        if mode in ("draining", "lost"):
+            out[str(row["host"])] = "host gate closed (%s)" % mode
+    if holds is None:
+        holds = store.hosts.holds()
+    for row in holds:
+        out.setdefault(str(row["host"]), "host held by %s: %s" % (
+            row.get("author") or "?", row.get("reason") or "hold"))
+    if readings is None:
+        readings = store.hosts.current(None)
+    for reading in readings:
+        state = str(reading.get("gate_state") or "")
+        if state in ("draining", "stopped"):
+            out.setdefault(str(reading["host"]), "host gate %s" % state)
+    return out
+
+
 def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
           automatic=False):
     """`actor`: the human the API authenticated (L87); otherwise the session's
