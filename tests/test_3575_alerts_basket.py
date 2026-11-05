@@ -305,7 +305,7 @@ class AlertsTimerGapTest(unittest.TestCase):
                 returncode=0, stdout="", stderr="")
             self.assertEqual(self.gap(apply=True), "")
         checked = [call.args[0] for call in systemctl.call_args_list]
-        self.assertEqual(checked, ["is-enabled", "is-active"])
+        self.assertEqual(checked, ["is-enabled", "is-active", "show"])  # show: #5853
 
     def test_a_missing_systemctl_is_reported_not_raised(self):
         with mock.patch.object(role_timers, "_systemctl",
