@@ -1204,9 +1204,11 @@ class AgentWorker(threading.Thread):
                 # pas seulement l'UPDATE. La connexion appartient à cet appel
                 # (même détaché après call_budget) et se ferme à sa sortie.
                 # Le client médié ouvre déjà une requête par opération.
-                connection = (nullcontext(self.db)
-                              if getattr(self.db.cfg, "backend", "") == "mediated"
-                              else closing(db_mod.connect(self.db.cfg, writer=False)))
+                # #5976 : nommée « lease » dès son ouverture
+                with db_mod.application("lease", self.name):
+                    connection = (nullcontext(self.db)
+                                  if getattr(self.db.cfg, "backend", "") == "mediated"
+                                  else closing(db_mod.connect(self.db.cfg, writer=False)))
                 with connection as renew_db:
                     migrations.require_compatible_writer(renew_db)
                     result["expires"] = registry.renew(
@@ -1897,7 +1899,13 @@ class AgentWorker(threading.Thread):
         écrire personne (jamais un pilote d'une autre équipe par défaut)."""
         try:
             from . import alert_briefs, projects as projects_mod
-            listing = registry.overview(self.db)
+            # #5982 : seuls les champs de routage sont lus ; `overview()`
+            # joignait le courrier, les baux et l'état du canon de tout le
+            # registre pour choisir un pilote. Un exécuteur médié n'a que
+            # l'annuaire réduit du contrat 1.1 (`agents.overview`) : il garde
+            # cette lecture, la seule que son stockage distant admet.
+            listing = (registry.overview(self.db) if storage.is_remote(self.db)
+                       else registry.routing_rows(self.db))
             row = next((r for r in listing if r.get("name") == self.name),
                        self.agent or {})
             by_name = {r["name"]: r for r in listing}
@@ -10957,7 +10965,7 @@ class Runner:
         """
         from . import handoff_factory
         from .scoped_db import ScopedDb
-        self._lifecycle_db = ScopedDb(self.cfg)
+        self._lifecycle_db = ScopedDb(self.cfg, family="runner.scoped.lifecycle")
         try:
             factory = handoff_factory.load(self._lifecycle_db)
         except handoff_factory.FactoryUnavailable as exc:
@@ -12797,7 +12805,7 @@ class Runner:
         ok = True
         try:
             from .scoped_db import ScopedDb
-            db = ScopedDb(self.cfg)
+            db = ScopedDb(self.cfg, family="runner.scoped.canon_sync")
             db_mod.require_schema(db)
             # L42 (0031) : chaque canon configuré est relu et synchronisé à chaque
             # passe, le canon par défaut d'abord ; une erreur dans l'un n'empêche
@@ -12940,7 +12948,7 @@ class Runner:
             if not activation.enabled(self.cfg):
                 return
             from .scoped_db import ScopedDb
-            db = ScopedDb(self.cfg)
+            db = ScopedDb(self.cfg, family="runner.scoped.review_retry")
             try:
                 report = activation.retry_pending(self.cfg, db)
                 # #3328 : a seat whose reviewer's host vanished is reattributed
@@ -13044,7 +13052,7 @@ class Runner:
         releves = 0
         try:
             from .scoped_db import ScopedDb
-            db = ScopedDb(self.cfg)
+            db = ScopedDb(self.cfg, family="runner.scoped.balance")
             for source, compte in paires:
                 try:
                     releves += len(balance_mod.record(db, source, compte,
@@ -13103,7 +13111,7 @@ class Runner:
         db = None
         try:
             from .scoped_db import ScopedDb
-            db = ScopedDb(self.cfg)
+            db = ScopedDb(self.cfg, family="runner.scoped.resource")
             gate = self.host_gate
             reading = resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
                                             gate=gate.snapshot() if gate is not None else None)
@@ -13178,7 +13186,7 @@ class Runner:
         db = None
         try:
             from .scoped_db import ScopedDb
-            db = ScopedDb(self.cfg)
+            db = ScopedDb(self.cfg, family="runner.scoped.host_release")
             if complete:
                 from . import host_lifecycle
                 # No resource pass will call `host_lifecycle_once` after this
@@ -13329,7 +13337,7 @@ class Runner:
         db = None
         try:
             from .scoped_db import ScopedDb
-            db = ScopedDb(self.cfg)
+            db = ScopedDb(self.cfg, family="runner.scoped.housekeeping")
             en_tour = self.agents_in_turn()
             try:
                 busy = bool(en_tour) or storage.of(db).hosts.turns_in_progress(self.host) > 0
@@ -13500,7 +13508,7 @@ class Runner:
         own = None
         if db is None:
             from .scoped_db import ScopedDb
-            db = own = ScopedDb(self.cfg)
+            db = own = ScopedDb(self.cfg, family="runner.scoped.sandbox_purge")
         try:
             from . import sandbox_relay
             gone = sandbox_relay.purge(db, days=days)
@@ -13534,7 +13542,7 @@ class Runner:
         try:
             if own:
                 from .scoped_db import ScopedDb
-                db = ScopedDb(self.cfg)
+                db = ScopedDb(self.cfg, family="runner.scoped.notify_health")
             from . import notify_gap, validation_deadlines
             try:
                 validation_deadlines.sweep(self.cfg, db, now=now)
@@ -13575,7 +13583,7 @@ class Runner:
         db = None
         try:
             from .scoped_db import ScopedDb
-            db = ScopedDb(self.cfg)
+            db = ScopedDb(self.cfg, family="runner.scoped.branch_sweep")
             # #3972 : un filtre d'admission vide ne sélectionne aucun agent
             # (un ensemble vide n'est jamais « tous les agents »)
             report = plan_git.sync_branches(
@@ -14599,12 +14607,16 @@ class Runner:
 
     def served_rows(self, db) -> list[dict]:
         """The agents this runner leads: this host, mode `execute`, not
-        stopped, within `--agents`."""
-        return [r for r in registry.overview(db)
-                if (r.get("host") or "") == self.host
-                and (r.get("mode") or "execute") == "execute"
-                and r.get("status") != "stopped"
-                and (self.agents_filter is None or r["name"] in self.agents_filter)]
+        stopped, within `--agents`.
+
+        #5982 : l'hôte, le mode et l'arrêt sont filtrés par la lecture étroite
+        du registre ; `--agents` reste l'admission de cet exécuteur."""
+        if storage.is_remote(db):
+            # L109 : l'annuaire réduit du contrat 1.1 ne porte ni hôte ni
+            # harnais ; l'ancien filtre n'y rendait déjà aucun agent.
+            return []
+        return [r for r in registry.served_agents(db, self.host)
+                if self.agents_filter is None or r["name"] in self.agents_filter]
 
     def harness_version(self, harness: str | None) -> str | None:
         """CTX-03b : la version du binaire de ``harness`` enregistrée pour cet
@@ -14650,7 +14662,7 @@ class Runner:
         db = None
         try:
             from .scoped_db import ScopedDb
-            db = ScopedDb(self.cfg)
+            db = ScopedDb(self.cfg, family="runner.scoped.harness_versions")
             served = {r.get("harness") for r in self.served_rows(db)} - {None, ""}
             return versions_mod.probe_and_record(db, self.host, served)
         except Exception as exc:  # never fatal for the runner
@@ -16284,6 +16296,10 @@ def main(argv: list[str] | None = None) -> int:
                 _sortie_sure(code)
 
     parsed = build_parser().parse_args(argv)
+    # #5976 : sessions du runner attribuées dans pg_stat_activity
+    db_mod.set_application(
+        "runner.main", "+".join(a for a in (parsed.agents or "").split(",") if a)
+        or "runner")
     #: #1466 : les options de ligne de commande survivent à une relecture du
     #: fichier de configuration (elles ont décidé les baux en cours)
     overrides: dict = {}

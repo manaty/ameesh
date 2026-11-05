@@ -356,6 +356,8 @@ def _dispatch(argv: list[str] | None) -> int:
         print(_doc())
         return 0
     command, rest = argv[0], argv[1:]
+    from . import db as db_mod
+    db_mod.set_command_application(command)  # #5976
     if command == "role" and rest[:1] == ["run"]:
         # L165 (EP5) : minuterie gardée par le bail du rôle. Routé avant
         # `role status` (EP2) : les deux sous-commandes vivent dans `role`.

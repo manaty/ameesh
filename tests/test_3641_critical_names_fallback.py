@@ -35,7 +35,7 @@ def critical_names(rows, *, canons=(), configured_entries=(), memory=None,
     cfg = types.SimpleNamespace(critical_agents=critical_agents)
     with mock.patch.object(host_lifecycle.work, "configured_canons",
                            return_value=list(canons)), \
-            mock.patch.object(host_lifecycle.registry, "overview",
+            mock.patch.object(host_lifecycle.registry, "critical_rows",
                               return_value=list(rows)), \
             mock.patch("ameesh.canon.configured", return_value=tuple(configured_entries)), \
             mock.patch("ameesh.sous_utilisation.critical_memory",

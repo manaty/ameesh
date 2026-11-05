@@ -401,7 +401,7 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None,
         for spec in settings.projects:
             db = None
             try:
-                db = ScopedDb(fresh)
+                db = ScopedDb(fresh, family="runner.scoped.train.assembly")
                 train_requalify.automatic(fresh, db, spec.name)
             except Exception as exc:  # optional follow-up must not stop the train
                 reason = "%s: %s" % (type(exc).__name__, exc)

@@ -116,6 +116,11 @@ host fails to connect. It always tracks `application_name`, `client_encoding`,
 `track_extra_parameters = search_path,statement_timeout,jit`. A setting listed
 in `ignore_startup_parameters` instead is accepted but never applied.
 
+Since #5976 every session also names itself
+(`ameesh/<family>/<agent or role>@<host>`, as `application_name` in the startup
+packet): PgBouncer tracks it natively, so the server's `pg_stat_activity` shows
+the client's name behind the pool too. Nothing to add to the recipe.
+
 An installation generated before #3745 (pc-smichea, 2026-10-13) stops at
 `search_path,statement_timeout` and is corrected **by hand**. Back up the file
 first (dated name, 0600), then change that line only:

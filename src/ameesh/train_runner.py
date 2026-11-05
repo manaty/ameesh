@@ -517,7 +517,7 @@ class Service:
         retry = self._reload_pin()
         if retry is not None:
             return retry
-        db = ScopedDb(self.cfg)
+        db = ScopedDb(self.cfg, family="runner.scoped.train.pass")
         try:
             result, deadline = self.passages[index].scheduled_step(db, now)
             if isinstance(result, dict) and result.get("result") == "landed":
@@ -538,7 +538,7 @@ class Service:
         from .scoped_db import ScopedDb
         if self.stop.is_set():
             return None
-        db = ScopedDb(self.cfg)
+        db = ScopedDb(self.cfg, family="runner.scoped.train.maintain")
         try:
             return self.passages[index].maintain(db, now)
         except Exception as exc:
@@ -562,7 +562,7 @@ class Service:
         db = None
         error = ""
         try:
-            db = ScopedDb(self.cfg)
+            db = ScopedDb(self.cfg, family="runner.scoped.train.role_ready")
             report = role_run.live(db, self.role)
             held = bool(report["held"] and report["host"] == self.cfg.host)
             if held and self.lease is not None:
@@ -600,7 +600,7 @@ class Service:
             return True
         from .scoped_db import ScopedDb
         now = self.clock() if now is None else float(now)
-        db = ScopedDb(self.cfg)
+        db = ScopedDb(self.cfg, family="runner.scoped.train.lease_ready")
         try:
             if self.lease.epoch is None:
                 if not self.lease.acquire(db, now):
@@ -633,7 +633,7 @@ class Service:
         if self.lease is None or self.lease.epoch is None:
             return
         from .scoped_db import ScopedDb
-        db = ScopedDb(self.cfg)
+        db = ScopedDb(self.cfg, family="runner.scoped.train.release_tenure")
         try:
             self.lease.release(db)
         except Exception as exc:
@@ -647,7 +647,7 @@ class Service:
         if self.lease is None:
             return
         from .scoped_db import ScopedDb
-        db = ScopedDb(self.cfg)
+        db = ScopedDb(self.cfg, family="runner.scoped.train.release_lease")
         try:
             if self.lease.close(db, timeout=timeout) is None and timeout:
                 self.report("train service lease kept: a train effect is still running;"
