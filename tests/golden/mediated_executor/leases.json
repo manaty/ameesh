@@ -282,6 +282,45 @@
    }
   },
   {
+   "name": "leases.begin_turn_diagnosed/ok",
+   "op": "leases.begin_turn_diagnosed",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "81f5a692-2b97-5eab-ba24-a786c66a52b2"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "leases.begin_turn_diagnosed",
+     "args": [
+      "inge-front",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
+      42,
+      "tour en cours"
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": "started",
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
    "name": "leases.end_turn/ok",
    "op": "leases.end_turn",
    "request": {

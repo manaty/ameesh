@@ -54,6 +54,7 @@ ARGS = {  # op: (args, kwargs, résultat)
  "leases.renew": ([AG, OWN, EP, 90.0], {}, TS + 90),
  "leases.release": ([AG, OWN, EP], {}, True),
  "leases.reap": ([HOST], {}, []),
+ "leases.begin_turn_diagnosed": ([AG, OWN, EP, "tour en cours"], {}, "started"),
  "leases.begin_turn": ([AG, OWN, EP, "tour en cours"], {}, True),
  "leases.end_turn": ([AG, OWN, EP], {"status": "idle", "status_text": "tour terminé",
                                       "error": None, "cost_usd": 0.031}, True),
