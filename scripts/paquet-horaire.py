@@ -945,14 +945,25 @@ SECOND_PREFIX = "paquet-horaire: second paquet parallèle de #"
 #: le groupe de lots composé dans ce porteur (les paires et les reprises)
 GROUP_RE = re.compile(r"groupe=(\d+(?:,\d+)*)")
 SECOND_RE = re.compile(r"^paquet-horaire: second paquet parallèle de #(\d+)\b")
+#: #5941 : le corps du porteur cite le premier de la paire, écrit atomiquement
+#: avec la création ; le journal le redit ensuite, sans être indispensable.
+FIRST_RE = re.compile(r"premier=#(\d+)\b")
 
 
 def carrier_group(item: dict) -> list[int]:
-    """Les lots que ce porteur doit composer (`groupe=…` de sa note)."""
+    """Les lots que ce porteur doit composer (`groupe=…` de sa note).
+
+    #5941 : le corps du porteur porte aussi `groupe=…`, écrit dans la même
+    transaction que le lot. Une interruption entre la création et la note de
+    journal laisse donc la paire reconnaissable et reprenable.
+    """
     for event in reversed(_events(item)):
         match = GROUP_RE.search(str(event.get("note") or ""))
         if match:
             return [int(lot) for lot in match.group(1).split(",") if lot]
+    match = GROUP_RE.search(str(item.get("body") or ""))
+    if match:
+        return [int(lot) for lot in match.group(1).split(",") if lot]
     return []
 
 
@@ -962,7 +973,8 @@ def second_peer(item: dict) -> int | None:
         match = SECOND_RE.match(str(event.get("note") or ""))
         if match:
             return int(match.group(1))
-    return None
+    match = FIRST_RE.search(str(item.get("body") or ""))
+    return int(match.group(1)) if match else None
 
 
 def yesterday_measure(ctx: Context) -> dict | None:
@@ -1019,13 +1031,19 @@ def parallel_partition(ctx: Context, ready: list[int]) -> dict | None:
 
 
 def _create_carrier(ctx: Context, name: str, group: list[int], *,
-                    parallel: int, composition_owner: str = "") -> int:
+                    parallel: int, composition_owner: str = "",
+                    first: int = 0) -> int:
     branch = auto.package_branch(name)
     title = "%s%s — composition automatique (§11 bis, §12)" % (TITLE_PREFIX, name)
     detail = ""
     if parallel:
-        detail = (" Paquet parallèle #3256 C (%d/%d) : groupe disjoint %s."
-                  % (parallel, 2, ", ".join("#%d" % lot for lot in group)))
+        # #5941 (B1 cx3) : le groupe et le premier porteur sont aussi dans le
+        # corps, écrit dans la même transaction que le lot. Un arrêt entre la
+        # création et la note de journal laisse donc une paire reconnaissable
+        # (`carrier_group`/`second_peer` lisent le corps en repli).
+        detail = (" Paquet parallèle #3256 C (%d/%d) : groupe=%s%s."
+                  % (parallel, 2, ",".join(str(lot) for lot in group),
+                     " premier=#%d" % first if first else ""))
     cmd = [
         "work", "add", "--title", title, "--type", "evolution",
         "--app", ctx.project, "--assignee", ctx.pilot, "--priority", "1",
@@ -1063,8 +1081,6 @@ COMPOSITION_REFUSALS = ("composition in progress", "already reserves",
                         "composition lock")
 
 
-#: prend le bail de composition pour la section critique « relire les porteurs
-#: → créer le porteur » ; None si le banc n'en fournit pas (tests sans base).
 def _close_lease(lease) -> None:
     """Referme la connexion du bail ; une fermeture ne juge pas le geste."""
     try:
@@ -1073,6 +1089,8 @@ def _close_lease(lease) -> None:
         pass
 
 
+#: prend le bail de composition pour la section critique « relire les porteurs
+#: → créer le porteur » ; None si le banc n'en fournit pas (tests sans base).
 def _composition_lease(ctx: Context):
     if ctx.composition is None:
         return None
@@ -1149,6 +1167,7 @@ def compose(ctx: Context, rows: list[dict]) -> str:
             if reserved:
                 return "%s réservée par %s : rien à faire" % (
                     ctx.target, ", ".join("#%d" % int(row["id"]) for row in reserved))
+        first: int = 0
         for index, group in enumerate(groups):
             name = next_name(ctx)
             # #4329 : une composition du même paquet vit (lancement à la main ou
@@ -1161,16 +1180,33 @@ def compose(ctx: Context, rows: list[dict]) -> str:
                 carrier = _create_carrier(
                     ctx, name, group,
                     parallel=(index + 1 if len(groups) == 2 else 0),
-                    composition_owner=(lease.owner if lease is not None else ""))
+                    composition_owner=(lease.owner if lease is not None else ""),
+                    first=first)
             except HoraireError as exc:
                 # #5941 : le bail a expiré ou a été pris entre la relecture et
                 # la création ; le premier porteur, s'il existe, reste suivi.
-                if lease is not None and any(marker in str(exc)
-                                             for marker in COMPOSITION_REFUSALS):
-                    results.append("composition en cours : rien de plus créé (%s)"
-                                   % auto._tail(str(exc), 2))
+                refused = lease is not None and any(
+                    marker in str(exc) for marker in COMPOSITION_REFUSALS)
+                if refused or created:
+                    # B1 cx3 : un échec du second `work add` ne doit pas
+                    # laisser le premier porteur sans composition ; le corps
+                    # du premier porte déjà son groupe, le tic le reprend.
+                    results.append(
+                        "composition en cours : rien de plus créé (%s)"
+                        % auto._tail(str(exc), 2) if refused else
+                        "porteur suivant non créé (%s) ; le premier reste composé"
+                        % auto._tail(str(exc), 2))
                     break
                 raise
+            if len(groups) == 2:
+                if index == 0:
+                    first = carrier
+                    ctx.note(carrier, "paquet-horaire: parallèle premier groupe=%s"
+                             % ",".join(str(lot) for lot in group))
+                elif first:
+                    ctx.note(carrier, "%s%d groupe=%s"
+                             % (SECOND_PREFIX, first,
+                                ",".join(str(lot) for lot in group)))
             created.append((index, list(group), name, carrier))
     finally:
         # #5941 : le bail ne couvre que la décision et la création. La
@@ -1183,17 +1219,7 @@ def compose(ctx: Context, rows: list[dict]) -> str:
             except Exception as exc:  # noqa: BLE001 - le TTL libère le bail
                 ctx.say("bail de composition non rendu : %s" % exc)
             _close_lease(lease)
-    first: int | None = None
     for index, group, name, carrier in created:
-        if len(groups) == 2:
-            if index == 0:
-                first = carrier
-                ctx.note(carrier, "paquet-horaire: parallèle premier groupe=%s"
-                         % ",".join(str(lot) for lot in group))
-            elif first is not None:
-                ctx.note(carrier, "%s%d groupe=%s"
-                         % (SECOND_PREFIX, first,
-                            ",".join(str(lot) for lot in group)))
         try:
             results.append(attempt(ctx, carrier, name,
                                    Attempt(COMPOSITION, 1, "",

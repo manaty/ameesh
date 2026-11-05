@@ -21,6 +21,7 @@ import unittest
 from unittest import mock
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -443,6 +444,65 @@ class CompositionLockTest(Base):
             ph.tick(self.ctx)
         self.assertEqual(seen, [None])
         self.assertEqual(lease.released, 1)
+
+    def test_le_corps_porte_le_groupe_et_le_premier(self):
+        # B1 cx3 : la paire reste reconnaissable même si l'arrêt tombe entre
+        # la création et la note de journal.
+        first = carrier()
+        first["body"] = "Paquet parallèle #3256 C (1/2) : groupe=101."
+        self.assertEqual(ph.carrier_group(first), [101])
+        second = carrier()
+        second["body"] = ("Paquet parallèle #3256 C (2/2) : groupe=102 "
+                          "premier=#4001.")
+        self.assertEqual(ph.carrier_group(second), [102])
+        self.assertEqual(ph.second_peer(second), 4001)
+
+    def test_echec_du_second_porteur_compose_le_premier(self):
+        # B1 cx3 : un échec du second `work add` ne bloque pas le premier
+        # porteur ; il est composé dans la même passe.
+        lease = FakeLease()
+        self.ctx.composition = lambda: lease
+        calls = []
+
+        def create(ctx, name, group, **_kw):
+            calls.append(name)
+            if len(calls) > 1:
+                raise ph.HoraireError("second porteur : panne passagère")
+            return 4000
+
+        attempted = []
+        with mock.patch.object(ph, "parallel_decision",
+                               return_value={"enabled": True}), \
+                mock.patch.object(ph, "parallel_partition",
+                                  return_value={"first": [101], "second": [102]}), \
+                mock.patch.object(ph, "_create_carrier", side_effect=create), \
+                mock.patch.object(ph, "attempt",
+                                  side_effect=lambda ctx, carrier, name, this:
+                                  attempted.append(carrier) or "composé"):
+            out = ph.compose(self.ctx, [])
+        self.assertEqual(attempted, [4000])
+        self.assertIn("porteur suivant non créé", out)
+        self.assertEqual(lease.released, 1)
+
+    def test_deux_porteurs_sans_note_sont_suivis_pas_reserves(self):
+        # B1 cx3 : deux porteurs créés avant leurs notes (arrêt brutal) ne
+        # laissent pas la cible « réservée » : le corps suffit à les apparier.
+        first = carrier(lot=4001, title="Paquet horaire h-20261027-09 — a")
+        first["branch"] = "integration/paquet-h-20261027-09"
+        first["body"] = "Paquet parallèle #3256 C (1/2) : groupe=101."
+        second = carrier(lot=4002, title="Paquet horaire h-20261027-10 — b")
+        second["branch"] = "integration/paquet-h-20261027-10"
+        second["body"] = ("Paquet parallèle #3256 C (2/2) : groupe=102 "
+                          "premier=#4001.")
+        self.ctx.parallel = SimpleNamespace(max_paquets=2)
+        self.shell.lists["qa"] = [first, second]
+        self.shell.items = {4001: first, 4002: second}
+        with mock.patch.object(ph, "follow",
+                               side_effect=lambda ctx, item: "#%d" % item["id"]):
+            out = ph.tick(self.ctx)
+        self.assertIn("#4001", out)
+        self.assertIn("#4002", out)
+        self.assertNotIn("réservée", out)
 
 
 class FollowTest(Base):
