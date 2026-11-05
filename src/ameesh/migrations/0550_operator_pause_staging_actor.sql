@@ -12,9 +12,12 @@
 -- pause de drain plafonnée doit encore être levée à son échéance (#3961).
 --
 -- Migration additive : mêmes signatures et mêmes types de retour ; seules les
--- gardes d'acteur et la contrainte d'audit changent.
+-- gardes d'acteur et la contrainte d'audit changent. Les REVOKE de 0517 ne
+-- sont pas rejoués : CREATE OR REPLACE garde le propriétaire et les droits.
 ALTER TABLE operator_pause_events
     DROP CONSTRAINT IF EXISTS operator_pause_events_actor_check;
+-- La contrainte est élargie (un acteur admis de plus), jamais resserrée.
+-- ameesh: constraint not tightened
 ALTER TABLE operator_pause_events
     ADD CONSTRAINT operator_pause_events_actor_check
     CHECK (actor ~ '^human:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$'
@@ -58,7 +61,6 @@ BEGIN
     RETURN QUERY SELECT target.name, target.mode, target.operator_paused, was_changed, event_number;
 END;
 $$;
-REVOKE ALL ON FUNCTION ameesh_operator_pause(text, boolean, text, text, text) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION ameesh_operator_resume_if(p_agent text, p_reason text,
                                                      p_actor text, p_principal text,
@@ -106,7 +108,6 @@ BEGIN
     RETURN QUERY SELECT target.name, target.mode, target.operator_paused, was_changed, event_number;
 END;
 $$;
-REVOKE ALL ON FUNCTION ameesh_operator_resume_if(text, text, text, text, text) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION ameesh_operator_pause_before(
     p_agent text, p_paused boolean, p_reason text,
@@ -161,7 +162,6 @@ BEGIN
                         was_changed, event_number, why;
 END;
 $$;
-REVOKE ALL ON FUNCTION ameesh_operator_pause_before(text, boolean, text, text, text, timestamptz) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION ameesh_operator_pause_until(
     p_agent text, p_reason text, p_actor text, p_principal text,
@@ -215,7 +215,6 @@ BEGIN
                         END;
 END;
 $$;
-REVOKE ALL ON FUNCTION ameesh_operator_pause_until(text, text, text, text, timestamptz, timestamptz) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION ameesh_operator_pause_expire(p_agent text DEFAULT NULL)
 RETURNS TABLE(agent text, reason text, by_human text, until_ts double precision,
@@ -264,4 +263,3 @@ BEGIN
     END LOOP;
 END;
 $$;
-REVOKE ALL ON FUNCTION ameesh_operator_pause_expire(text) FROM PUBLIC;

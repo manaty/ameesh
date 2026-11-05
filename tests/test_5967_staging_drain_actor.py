@@ -24,7 +24,7 @@ import time
 import unittest
 from pathlib import Path
 
-from ameesh import agent_pause, registry, serve
+from ameesh import agent_pause, migrations, registry, serve
 
 from .support import PgTestCase
 
@@ -109,6 +109,23 @@ class StagingActorContractTest(PgTestCase):
         with self.assertRaises(Exception):
             self.db.query("SELECT * FROM ameesh_operator_pause('worker', true, 'x',"
                           " 'ameesh:other', 'human:alice')")
+
+    def test_the_migration_is_additive_and_keeps_the_function_grants(self):
+        # Une coupure normale (`migrate --additive-only`) doit pouvoir
+        # l'installer avant la phase 2 de #5495 ; CREATE OR REPLACE garde les
+        # droits de 0517 (aucun EXECUTE pour PUBLIC).
+        (mig,) = [m for m in migrations.discover() if m.version == 550]
+        self.assertEqual(migrations.non_additive(mig), [])
+        for signature in (
+                "ameesh_operator_pause(text, boolean, text, text, text)",
+                "ameesh_operator_resume_if(text, text, text, text, text)",
+                "ameesh_operator_pause_before(text, boolean, text, text, text, timestamptz)",
+                "ameesh_operator_pause_until(text, text, text, text, timestamptz, timestamptz)",
+                "ameesh_operator_pause_expire(text)"):
+            with self.subTest(signature):
+                row = self.db.query("SELECT has_function_privilege('public', %s, 'EXECUTE')"
+                                    " AS ok", (signature,))[0]
+                self.assertFalse(row["ok"])
 
     # -- CLI ----------------------------------------------------------------
     def test_cli_drain_takes_the_owner_of_the_configuration_as_principal(self):
