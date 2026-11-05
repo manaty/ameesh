@@ -185,7 +185,10 @@ class HostLifecycleTest(PgTestCase):
         registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
         found = self.detect_loss()[0]
         self.assertEqual(found["generation"], first["generation"])
-        self.assertIsNone(found["return_ts"])
+        # #5869: the loss keeps the drain's deadline and intent for the
+        # reconciliation; the automatic return is still cancelled below.
+        self.assertAlmostEqual(found["return_ts"], first["return_ts"], delta=1)
+        self.assertTrue(found["lost_from_drain"])
         self.assertEqual(len(self.api.host_lifecycle.agents("source", first["generation"])), 1)
         self.assertEqual(self.api.host_lifecycle.expire_returns(), [])
 

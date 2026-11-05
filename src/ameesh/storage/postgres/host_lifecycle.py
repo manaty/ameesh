@@ -17,7 +17,7 @@ _ROW = ("host, mode, generation, actor, "
         "extract(epoch from requested_at)::float8 AS requested_ts, "
         "extract(epoch from return_at)::float8 AS return_ts, "
         "release_state, hook_state, claims_open, release_epoch, "
-        "release_generation, automatic, "
+        "release_generation, automatic, lost_from_drain, "
         "extract(epoch from released_at)::float8 AS released_ts, "
         "extract(epoch from return_requested_at)::float8 AS return_requested_ts, "
         "return_requested_by, "
@@ -152,8 +152,11 @@ class HostLifecycle(interface.HostLifecycle):
                 if not stale:
                     continue
                 if old and old["mode"] == "draining":
+                    # #5869 : la perte est un constat ; l'échéance du drainage
+                    # et son intention restent, pour que le reconcile rende
+                    # l'hôte à son drainage et non à `available`.
                     row = tx.query("UPDATE host_lifecycle SET mode='lost',actor=%s,"
-                                   "return_at=NULL,release_epoch=release_epoch+1,"
+                                   "lost_from_drain=true,release_epoch=release_epoch+1,"
                                    "updated_at=clock_timestamp() WHERE host=%s RETURNING " + _ROW,
                                    (actor, host))[0]
                 else:
@@ -162,6 +165,7 @@ class HostLifecycle(interface.HostLifecycle):
                         "ON CONFLICT(host) DO UPDATE SET mode='lost',actor=excluded.actor, "
                         "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
                         "return_at=NULL,release_epoch=host_lifecycle.release_epoch+1,"
+                        "lost_from_drain=false,"
                         "updated_at=clock_timestamp() RETURNING " + _ROW,
                         (host, actor))[0]
                 for agent in agents:
@@ -796,9 +800,41 @@ class HostLifecycle(interface.HostLifecycle):
             # predicate is therefore satisfied. Keep the two recorded steps in
             # one transaction so no reader observes `returning` and starts a
             # move back before the host is open.
+            # #5869 : un drainage manuel encore en cours au moment de la perte
+            # garde son intention. L'hôte prouvé revenu reprend `draining`
+            # (même génération, même échéance) ; l'undrain reste le geste de
+            # l'opérateur. Un drainage expiré ou automatique rouvre comme avant.
+            keep = tx.query(
+                "SELECT host FROM host_lifecycle WHERE host=%s AND mode='lost' "
+                "AND lost_from_drain AND NOT automatic "
+                "AND (return_at IS NULL OR return_at > clock_timestamp())", (host,))
+            if keep:
+                tx.query(
+                    "UPDATE host_lifecycle SET mode='draining',actor=%s,"
+                    "lost_from_drain=false,release_epoch=release_epoch+1,"
+                    "updated_at=clock_timestamp() WHERE host=%s AND mode='lost' "
+                    "RETURNING host", (actor, host))
+                evidence = {
+                    "generation": control["generation"], "actor": actor,
+                    "from": "lost", "to": "draining", "lost_ts": lost_ts,
+                    "return_ts": control.get("return_ts"),
+                    "fresh_ts": now["latest_ts"], "readings": len(times) - start,
+                    "coverage_s": covered,
+                    "agents": [row["name"] for row in origins],
+                    "checks": ["fresh_reading", "sustained_readings", "no_reading_gap",
+                               "agents_home", "no_active_handoff", "no_recovery_attempt",
+                               "drain_intent_kept"],
+                }
+                tx.execute(
+                    "INSERT INTO ameesh_events(type,object,project,data) "
+                    "VALUES ('host.reconciled',%s,NULL,%s::jsonb)",
+                    ("host:" + host, json.dumps(evidence, sort_keys=True)))
+                return {"host": host, "mode": "draining", "reconciled": True,
+                        "missing": [], "generation": control["generation"],
+                        "evidence": evidence}
             returned = tx.query(
                 "UPDATE host_lifecycle SET mode='returning',actor=%s,return_at=NULL, "
-                "release_epoch=release_epoch+1, "
+                "release_epoch=release_epoch+1,lost_from_drain=false, "
                 "updated_at=clock_timestamp() WHERE host=%s AND mode='lost' "
                 "RETURNING host", (actor, host))
             if not returned:
