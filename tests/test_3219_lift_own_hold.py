@@ -332,6 +332,27 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
             [item["id"]], W.HOLD_NOTE_PATTERNS)
         return W.active_holds(self.db, events).get(item["id"], {})
 
+    def test_only_requested_carrier_is_closed(self):
+        item = self._delivered()
+        other = work.add(self.db, title="autre lot", assignee="dev-a")
+        with mock.patch.object(type(storage.of(self.db).work), "items",
+                               side_effect=AssertionError("global sweep")):
+            report = plan_git.sync_merges(self.db, self.repo, target="main",
+                                          item_ids=[item["id"], item["id"]])
+        self.assertEqual([r["work_item"] for r in report["results"]], [item["id"]])
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(work.get(self.db, other["id"])["state"], "intake")
+
+    def test_targeted_sync_preserves_pilot_hold(self):
+        item = self._delivered()
+        with bound(""):
+            work.note(self.db, item["id"], "hold: attendre le pilote",
+                      actor="human:proprio")
+        report = plan_git.sync_merges(self.db, self.repo, target="main",
+                                      item_ids=[item["id"]])
+        self.assertEqual(report["results"][0]["result"], "withheld")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
     def test_leve_par_l_assigne_puis_la_passe_ferme(self):
         item = self._delivered()
         with bound("dev-a"):

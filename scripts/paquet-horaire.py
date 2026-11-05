@@ -1850,6 +1850,33 @@ def run(ctx: Context) -> str:
 def tick(ctx: Context) -> str:
     rows = open_lots(ctx)
     carriers = [row for row in rows if is_carrier(row, ctx.project, ctx.target)]
+    reconciled = False
+    for row in carriers:
+        if not is_hourly(row) or "paquet-horaire" not in str(row.get("source") or ""):
+            continue
+        item = show(ctx, int(row["id"]))
+        name = auto.package_name(str(item.get("branch") or ""))
+        if name and composition_in_progress(ctx, name):
+            continue
+        sha = frozen_sha(item)
+        if not sha or not merged_head(ctx, item, sha):
+            continue
+        # #5891 : une note de forge seule ne suffit pas. La cible rafraîchie
+        # doit porter la tête, puis la voie native vérifie contenu, dernier
+        # gel et holds sous le verrou du lot. Un hold garde le porteur ouvert.
+        if ctx.git("merge-base", "--is-ancestor", sha, "origin/" + ctx.target).returncode:
+            continue
+        if ctx.dry_run:
+            continue
+        ctx.must("work", "sync-merges", "--id", str(item["id"]),
+                 "--git-dir", str(ctx.repo), "--target", "origin/" + ctx.target,
+                 what="constat de fusion du porteur #%d" % item["id"])
+        if merged_seen(show(ctx, int(item["id"]))):
+            reconciled = True
+    if reconciled:
+        # Relire aussi les autres réservations : ni récursion ni second tic.
+        rows = open_lots(ctx)
+        carriers = [row for row in rows if is_carrier(row, ctx.project, ctx.target)]
     if carriers:
         own = [row for row in carriers if is_hourly(row)
                and "paquet-horaire" in str(row.get("source") or "")]

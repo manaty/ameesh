@@ -1635,8 +1635,11 @@ def _wake_retention(db, row: dict, retention: dict, *, entry: dict, target: str)
 
 
 def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
-                limit: int = 1000) -> dict:
+                limit: int = 1000, item_ids: list[int] | None = None) -> dict:
     """Ferme les lots dont le contenu gelé est entré dans la cible.
+
+    `item_ids` borne le relevé aux lots nommés, sans lecture globale (#5891).
+    Les preuves et retenues restent celles du balayage ordinaire.
 
     Sans `target` explicite (#1005), la cible est celle du lot
     (`branch_target`), sinon celle du dépôt (`git config ameesh.target`),
@@ -1669,7 +1672,10 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             # aucun `origin/HEAD` ni main/master : la première ref
             # d'intégration tient lieu de cible par défaut
             default, candidates = candidates[0], candidates[1:]
-    rows = [r for r in st.work.items(state=None, assignee=None, limit=limit)
+    # #5891 : le tic clôt son porteur sans balayer tous les lots du projet.
+    candidates_rows = (st.work.get(lot) for lot in sorted(set(item_ids))) \
+        if item_ids is not None else st.work.items(state=None, assignee=None, limit=limit)
+    rows = [r for r in candidates_rows if r is not None
             if r["state"] not in work_mod.MERGED_STATES and r["state"] != "closed"]
     declared: dict = {}
     for ms in st.progress.lot_milestones([int(r["id"]) for r in rows]):
