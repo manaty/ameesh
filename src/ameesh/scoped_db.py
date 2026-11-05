@@ -13,9 +13,11 @@ from . import db as db_mod
 
 
 class ScopedDb:
-    def __init__(self, cfg):
+    def __init__(self, cfg, family=None):
         self.cfg = cfg
         self.name = cfg.driver
+        #: #5976 : famille de ses sessions dans pg_stat_activity
+        self.family = family
         self._local = threading.local()
 
     @contextmanager
@@ -24,7 +26,8 @@ class ScopedDb:
         if active is not None:
             yield active
             return
-        driver = db_mod.connect(self.cfg)
+        with db_mod.application(self.family):
+            driver = db_mod.connect(self.cfg)
         try:
             yield driver
         finally:

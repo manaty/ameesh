@@ -175,7 +175,8 @@ class Publisher:
         while True:
             db = None
             try:
-                db = db_mod.connect(cfg)
+                with db_mod.application("peek", self.agent):
+                    db = db_mod.connect(cfg)
                 if storage.is_remote(db):
                     db.book.hold(self.agent, self.owner, self.epoch)
                 payload = sanitise({"workspace": workspace(self.cwd()), "events":

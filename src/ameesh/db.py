@@ -27,6 +27,7 @@ Règles communes :
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import copy
 import functools
 import json
@@ -36,6 +37,7 @@ import queue
 import re
 import select
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -256,6 +258,74 @@ def _trace_dump() -> None:
 if os.environ.get("AMEESH_DB_TRACE"):
     import atexit
     atexit.register(_trace_dump)
+
+
+# #5976 : nom d'application de chaque session, pour attribuer les sessions
+# dans `pg_stat_activity` (`ameesh/<famille>/<agent ou rôle>@<hôte>`). Posé en
+# `fallback_application_name` (psycopg) ou en PGAPPNAME (psql, seulement s'il
+# est absent) : un `application_name` du DSN ou de l'environnement reste
+# maître. La famille et l'agent viennent de l'appelant, jamais du DSN : aucun
+# secret dans le nom.
+_APP_DEFAULT = {"family": None, "who": None}
+_APP_SCOPE: contextvars.ContextVar = contextvars.ContextVar(
+    "ameesh_db_application", default=None)
+#: NAMEDATALEN - 1 : le serveur tronque au-delà
+APPLICATION_NAME_MAX = 63
+_APP_UNSAFE = re.compile(r"[^A-Za-z0-9._:+-]")
+
+
+def set_application(family: str, who: str | None = None) -> None:
+    """Famille (et agent ou rôle) par défaut des sessions de ce processus."""
+    _APP_DEFAULT["family"] = family or None
+    if who is not None:
+        _APP_DEFAULT["who"] = who or None
+
+
+@contextlib.contextmanager
+def application(family: str | None = None, who: str | None = None):
+    """Famille (et agent) des sessions ouvertes dans ce bloc, pour ce fil ou
+    cette tâche seulement ; le reste vient du défaut du processus."""
+    previous = _APP_SCOPE.get()
+    merged = dict(previous or {})
+    if family:
+        merged["family"] = family
+    if who:
+        merged["who"] = who
+    token = _APP_SCOPE.set(merged)
+    try:
+        yield
+    finally:
+        _APP_SCOPE.reset(token)
+
+
+def set_command_application(command: str) -> None:
+    """Famille d'une commande en ligne : `cli.<commande>`, ou `timer.<rôle>`
+    sous une minuterie de rôle (`ameesh role run` pose AMEESH_ROLE)."""
+    role = (os.environ.get("AMEESH_ROLE") or "").strip()
+    set_application("timer.%s" % role if role else "cli.%s" % command)
+
+
+def _app_part(value: str | None, fallback: str) -> str:
+    text = _APP_UNSAFE.sub("_", str(value or "").strip())
+    return text or fallback
+
+
+def application_name() -> str:
+    """`ameesh/<famille>/<agent ou rôle>@<hôte>`, ASCII, au plus 63 octets."""
+    scope = _APP_SCOPE.get() or {}
+    family = scope.get("family") or _APP_DEFAULT["family"]
+    who = (scope.get("who") or _APP_DEFAULT["who"]
+           or os.environ.get("AMEESH_ROLE") or os.environ.get("AGENT_MAIL_NAME"))
+    try:
+        host = socket.gethostname().split(".", 1)[0]
+    except OSError:
+        host = ""
+    head = "ameesh/%s/" % _app_part(family, "cli")
+    tail = "@%s" % _app_part(host, "-")
+    who = _app_part(who, "-")
+    # trop long : l'agent est raccourci d'abord, l'hôte reste lisible
+    room = max(1, APPLICATION_NAME_MAX - len(head) - len(tail))
+    return (head + who[:room] + tail)[:APPLICATION_NAME_MAX]
 
 
 def startup_options(cfg: Config, existing: str = "") -> str:
@@ -586,6 +656,10 @@ class PsqlDriver:
         #: reste traduit par `lc_messages` — et n'est jamais analysé
         #: (codex #478 r2).
         self.env["LC_ALL"] = "C"
+        # #5976 : psql pose son propre fallback (« psql ») ; PGAPPNAME le
+        # remplace, un application_name du DSN prime encore sur PGAPPNAME.
+        if not self.env.get("PGAPPNAME"):
+            self.env["PGAPPNAME"] = application_name()
         if self.password:
             self.env["PGPASSWORD"] = self.password
         # `VERBOSITY=verbose` : psql imprime alors le code SQLSTATE sur la
@@ -1148,6 +1222,8 @@ class PsycopgDriver:
         options = startup_options(self.cfg, str(existing or ""))
         if options:
             kwargs["options"] = options
+        # #5976 : un application_name du DSN ou PGAPPNAME prime (libpq)
+        kwargs["fallback_application_name"] = application_name()
         TRACE.connect()
         try:
             return self._psycopg.connect(self.cfg.dsn, **kwargs)
