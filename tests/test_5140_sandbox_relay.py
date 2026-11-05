@@ -6,7 +6,7 @@ from types import SimpleNamespace as NS
 from ameesh import relay, runner_sandbox, sandbox_relay, storage
 from ameesh.storage.postgres import sandbox as s1
 from ameesh.storage.postgres import turn_admission
-from .support import PgTestCase
+from .support import PgTestCase, scaled
 from . import test_4872_turn_admission as admission_fixture
 
 
@@ -72,7 +72,11 @@ class SandboxRelayTest(PgTestCase):
                                      admitted_ref='decision:1')
         snapshot = admission_fixture.TurnAdmissionTest.snapshot(self)
         if self._testMethodName == 'test_expiry_uses_database_clock':
-            snapshot['limits']['turn_seconds'] = 1
+            # #5945: a one-second deadline expired before the first issue()
+            # on a loaded bench. Give the admission enough room (scaled by
+            # #5629 under psql) to reach the test body; the test then waits
+            # for the deadline the database actually stored.
+            snapshot['limits']['turn_seconds'] = scaled(1)
         admission_fixture.TurnAdmissionTest.admit(self, sandbox=snapshot)
         self.host = self.db.query("select host from agent_registry where name = 'agent'")[0]['host']
 
@@ -95,9 +99,14 @@ class SandboxRelayTest(PgTestCase):
 
     def test_expiry_uses_database_clock(self):
         token, _ = self.issue()
-        # The deadline is immutable. Wait in the disposable DB, with the
-        # runner's clock deliberately wrong to prove it cannot extend expiry.
-        self.db.query('select pg_sleep(1.1)')
+        # The deadline is immutable. Wait in the disposable DB until the
+        # deadline it actually stored has passed (never assume a duration
+        # from the runner), with the runner's clock deliberately wrong to
+        # prove it cannot extend expiry.
+        self.db.query(
+            "select pg_sleep(greatest(0, extract(epoch from"
+            " deadline_ts - clock_timestamp())) + 0.1)"
+            " from sandbox_turns where turn_id = 'turn-key'")
         with self.assertRaises(relay.TokenError):
             with mock.patch('time.time', return_value=0):
                 sandbox_relay.Tokens(self.db).verify_token(token)
