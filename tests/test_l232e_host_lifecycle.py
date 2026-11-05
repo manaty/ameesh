@@ -185,9 +185,14 @@ class HostLifecycleTest(PgTestCase):
         registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
         found = self.detect_loss()[0]
         self.assertEqual(found["generation"], first["generation"])
-        self.assertIsNone(found["return_ts"])
+        # #5869: the window is kept for a reconciliation back to `draining`;
+        # a lost host never returns automatically, even once it has passed.
+        self.assertEqual(found["return_ts"], first["return_ts"])
         self.assertEqual(len(self.api.host_lifecycle.agents("source", first["generation"])), 1)
+        self.db.execute("UPDATE host_lifecycle SET return_at=clock_timestamp()-interval '1 second' "
+                        "WHERE host='source'")
         self.assertEqual(self.api.host_lifecycle.expire_returns(), [])
+        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
     def test_loss_rechecks_heartbeat_after_waiting_for_gate_lock(self):
         self.age_source()
