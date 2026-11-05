@@ -97,3 +97,49 @@ class LostDrainIntentTest(PgTestCase):
         result = self.come_back()
         self.assertFalse(result["reconciled"])
         self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
+
+    # N-1 compatibility (CONTRIBUTING.md): during a rolling deployment a
+    # detector still on the previous version writes the loss with its own SQL,
+    # which clears return_at and does not know lost_from_drain. The trigger of
+    # migration 0545 keeps the drain's deadline and intent for the new reader.
+    N1_DRAINING_TO_LOST = (
+        "UPDATE host_lifecycle SET mode='lost',actor=%s,return_at=NULL,"
+        "release_epoch=release_epoch+1,updated_at=clock_timestamp() WHERE host=%s")
+    N1_OTHER_TO_LOST = (
+        "INSERT INTO host_lifecycle(host,mode,actor) VALUES (%s,'lost',%s) "
+        "ON CONFLICT(host) DO UPDATE SET mode='lost',actor=excluded.actor, "
+        "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
+        "return_at=NULL,release_epoch=host_lifecycle.release_epoch+1,"
+        "updated_at=clock_timestamp()")
+
+    def n1_lose(self, sql, params):
+        registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
+        self.db.execute("UPDATE host_resources SET sampled_at=clock_timestamp()"
+                        "-interval '1000 seconds' WHERE host='source'")
+        self.previous_write(sql, params, added=["lost_from_drain"])
+        self.db.execute("UPDATE host_lifecycle SET updated_at=clock_timestamp()"
+                        "-interval '900 seconds' WHERE host='source'")
+
+    def test_n1_detector_loss_of_a_manual_drain_is_kept_by_the_new_reader(self):
+        drained = self.drain()
+        self.n1_lose(self.N1_DRAINING_TO_LOST, ("remote", "source"))
+        row = self.api.host_lifecycle.get("source")
+        self.assertEqual(row["mode"], "lost")
+        self.assertTrue(row["lost_from_drain"])
+        self.assertAlmostEqual(row["return_ts"], drained["return_ts"], delta=1)
+        result = self.come_back()
+        self.assertEqual(result["mode"], "draining", result)
+
+    def test_n1_detector_indefinite_drain_is_kept(self):
+        self.drain(duration=None)
+        self.n1_lose(self.N1_DRAINING_TO_LOST, ("remote", "source"))
+        self.assertEqual(self.come_back()["mode"], "draining")
+
+    def test_n1_detector_loss_without_drain_reopens(self):
+        # A stale mark from an earlier drain is cleared by a loss from
+        # another mode, whoever writes it.
+        self.db.execute("INSERT INTO host_lifecycle(host,mode,actor,lost_from_drain) "
+                        "VALUES ('source','available','pilot',true)")
+        self.n1_lose(self.N1_OTHER_TO_LOST, ("source", "remote"))
+        self.assertFalse(self.api.host_lifecycle.get("source")["lost_from_drain"])
+        self.assertEqual(self.come_back()["mode"], "available")

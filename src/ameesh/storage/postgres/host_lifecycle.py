@@ -152,11 +152,11 @@ class HostLifecycle(interface.HostLifecycle):
                 if not stale:
                     continue
                 if old and old["mode"] == "draining":
-                    # #5869 : la perte est un constat ; l'échéance du drainage
-                    # et son intention restent, pour que le reconcile rende
-                    # l'hôte à son drainage et non à `available`.
+                    # #5869 : l'échéance et l'intention du drainage sont
+                    # gardées par le trigger aa_host_lost_drain_intent (0545),
+                    # y compris pour un détecteur N-1 qui écrirait return_at=NULL.
                     row = tx.query("UPDATE host_lifecycle SET mode='lost',actor=%s,"
-                                   "lost_from_drain=true,release_epoch=release_epoch+1,"
+                                   "release_epoch=release_epoch+1,"
                                    "updated_at=clock_timestamp() WHERE host=%s RETURNING " + _ROW,
                                    (actor, host))[0]
                 else:
@@ -165,7 +165,6 @@ class HostLifecycle(interface.HostLifecycle):
                         "ON CONFLICT(host) DO UPDATE SET mode='lost',actor=excluded.actor, "
                         "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
                         "return_at=NULL,release_epoch=host_lifecycle.release_epoch+1,"
-                        "lost_from_drain=false,"
                         "updated_at=clock_timestamp() RETURNING " + _ROW,
                         (host, actor))[0]
                 for agent in agents:
