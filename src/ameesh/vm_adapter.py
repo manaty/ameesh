@@ -4,6 +4,12 @@
 Importing this module makes no provider call. Only `worker` reads credentials.
 The operator's private enrollment fixes one controller host, exact VM/project
 identities and health/reconciliation commands. Runners only call `request`.
+
+#5932: `request` answers 0 only when the worker already completed the state,
+`ameesh.host_release.ADAPTER_WAIT_CODE` (75) when the request is queued and
+pending, and 1 when the request is refused. A queued request is a wait: the
+scanner keeps the previous acknowledged state and closed claims, and the
+worker journals the completion under the same generation/epoch.
 """
 from __future__ import annotations
 
@@ -347,7 +353,14 @@ def main(argv=None):
                     return 1
                 status = q.request(args.host, generation, row['release_epoch'], args.state)
             print('VM adapter: ' + status)
-            return 0 if status == 'done' else 1
+            # #5932: a queued request is a normal asynchronous wait, not an
+            # acknowledgement (0) and not a failure (1). The scanner records
+            # `hook_wait_*` and the operator worker owns the completion.
+            if status == 'done':
+                return 0
+            if status == 'pending':
+                return host_release.ADAPTER_WAIT_CODE
+            return 1
         policy = enrollment(private_json(args.enrollment))
         credentials = private_json(Path(os.environ['CREDENTIALS_DIRECTORY']) / 'scaleway.json')
         provider = Scaleway(credentials['secret_key'], timeout=policy['io_timeout_s'])

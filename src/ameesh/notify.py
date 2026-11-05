@@ -363,6 +363,9 @@ TYPE_LABELS = {
     "host_release_overdue": "host release overdue",
     "host_release_no_runs": "host release blocked by unknown runs",
     "host_release_canon_unreadable": "host release blocked by unreadable canon",
+    # #5932: a queued VM adapter request is a normal wait; this type names the
+    # worker that stopped progressing after a durable poweroff intent.
+    "host_release_adapter_stalled": "VM adapter worker stalled after a stop intent",
     "fingerprints_source_failing": "failure fingerprints source failing",
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)

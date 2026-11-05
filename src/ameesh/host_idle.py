@@ -184,6 +184,9 @@ def apply_release(footprint, control):
         'mode': control.get('mode'),
         'state': control.get('release_state') or 'busy',
         'hook_state': control.get('hook_state'),
+        # #5932: explicit asynchronous wait of the adapter (queued request).
+        'wait_state': control.get('hook_wait_state'),
+        'wait_ts': control.get('hook_wait_ts'),
         'claims_open': bool(control.get('claims_open', True)),
         'automatic': bool(control.get('automatic')),
         'requested_ts': control.get('requested_ts'),
@@ -463,10 +466,17 @@ def line(value):
     release = value.get('release') or {}
     detail = ''
     if release:
-        detail = ('; release %s (hook %s), claims %s%s%s' % (
+        wait = ''
+        if release.get('wait_state'):
+            wait = ', waiting for %s%s' % (
+                release.get('wait_state'),
+                ' since %ds' % int(max(0.0, time.time() - release['wait_ts']))
+                if release.get('wait_ts') else '')
+        detail = ('; release %s (hook %s), claims %s%s%s%s' % (
             release.get('state') or '?', release.get('hook_state') or 'none',
             'open' if release.get('claims_open') else 'closed',
             ', automatic' if release.get('automatic') else '',
+            wait,
             ', error: ' + str(release.get('error'))[:120]
             if release.get('error') else ''))
     return ('footprint  : %s (%s); reserved CPU %s, memory %s bytes; '

@@ -339,6 +339,10 @@ class Config:
     host_release_drain_bound: float = 2100.0
     #: a failed transition is retried after this delay (seconds)
     host_release_retry: float = 300.0
+    #: #5932: a queued adapter request that keeps a durable poweroff intent
+    #: without progressing for this long is a stalled worker, not a normal
+    #: billing/archiving hysteresis. Reported as `host_release_adapter_stalled`.
+    host_release_adapter_stall: float = 900.0
     #: quiet time after the last turn before `idle-drained` is proven
     host_release_settle: float = 60.0
     #: #4148 B1: a released host whose `busy` hook answered is booting; its
@@ -1169,6 +1173,8 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
             pick("AMEESH_HOST_RELEASE_DRAIN_BOUND"), cfg.host_release_drain_bound),
         host_release_retry=_as_bounded_positive(
             pick("AMEESH_HOST_RELEASE_RETRY"), cfg.host_release_retry),
+        host_release_adapter_stall=_as_bounded_positive(
+            pick("AMEESH_HOST_RELEASE_ADAPTER_STALL"), cfg.host_release_adapter_stall),
         host_release_settle=_as_bounded_positive(
             pick("AMEESH_HOST_RELEASE_SETTLE"), cfg.host_release_settle),
         host_release_boot_grace=_as_bounded_positive(
@@ -1357,6 +1363,9 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
         raise SystemExit("invalid AMEESH_HOST_RELEASE_DRAIN_BOUND: 60..86400 seconds expected")
     if cfg.host_release_settle > cfg.host_release_drain_bound:
         raise SystemExit("invalid AMEESH_HOST_RELEASE_SETTLE: beyond the drain bound")
+    if not 60 <= cfg.host_release_adapter_stall <= 86400:
+        raise SystemExit("invalid AMEESH_HOST_RELEASE_ADAPTER_STALL: "
+                         "60..86400 seconds expected")
     if not 60 <= cfg.host_release_boot_grace <= 86400:
         raise SystemExit("invalid AMEESH_HOST_RELEASE_BOOT_GRACE: 60..86400 seconds expected")
     if cfg.canon_ref.startswith("-"):

@@ -22,6 +22,12 @@ no cluster or cloud credential.
   scanner reports it (`host_release_no_runs`);
 * failures keep the previous acknowledged state and the closed claims, and
   raise `host_release_failed` / `host_release_overdue`.
+* #5932: an adapter that accepts the transition asynchronously (the VM queue
+  hook exits `ADAPTER_WAIT_CODE`) is waiting, not failing. The scanner records
+  `hook_wait_*`, keeps the previous acknowledged state and the closed claims,
+  and raises `host_release_adapter_stalled` only when the queued worker stops
+  ticking, keeps a durable poweroff intent too long, or leaves an obsolete
+  intent.
 
 The scanner is serialised per host (`host_release_locks`): the many runners of
 a host do not each call the adapter. The expensive idle projection is spaced
@@ -40,6 +46,10 @@ from . import host_holds
 
 #: the only states the owner decided the hook receives (§3.3)
 STATES = ("busy", "draining", "idle-drained")
+#: #5932: exit code of an adapter that QUEUED the transition asynchronously.
+#: It is neither an acknowledgement (exit 0) nor a failure: the worker owns
+#: the completion, claims stay closed and the scanner records a wait.
+ADAPTER_WAIT_CODE = 75
 #: bounded text kept from a hook
 DETAIL_MAX = 400
 #: a run count is usable only when A published a real source
@@ -362,6 +372,16 @@ def _run_transition(cfg, api, canons, row, state, *, actor, runner=None,
               "duration_s": round(float(result.get("duration_s") or 0.0), 3),
               "previous_hook_state": previous,
               "stdout": result.get("stdout"), "stderr": result.get("stderr")}
+    if result.get("code") == ADAPTER_WAIT_CODE:
+        # #5932: the adapter queued the transition; its worker will journal the
+        # completion. Do not acknowledge, do not fail, and never reopen: only
+        # the explicit wait is recorded. stdout/stderr stay out of the event.
+        return api.wait_transition(
+            host, generation, state, release_epoch=epoch, actor=actor,
+            detail={"command": result.get("command"),
+                    "code": result.get("code"),
+                    "duration_s": detail["duration_s"],
+                    "previous_hook_state": previous})
     error = None if result.get("ok") else hook_error(result)
     return api.finish_transition(host, generation, state, release_epoch=epoch,
                                  actor=actor, detail=detail, error=error)
@@ -746,6 +766,33 @@ def once(cfg, db, *, local_host=None, actor="", now=None, runner=None,
     return {"now": now, "hosts": owners}
 
 
+def _pending_adapter_requests(db, host):
+    """#5932: queued operator requests of a host, oldest first.
+
+    Empty when the adapter is not installed (no #5925 table yet) or cannot be
+    read: the release alerts must never fail because of the optional queue.
+    """
+    try:
+        from .storage.postgres.vm_adapter import Queue
+        return Queue(db).pending_all(host)
+    except Exception:
+        return []
+
+
+def _adapter_worker_seen(db, host):
+    """#5932: last operator tick of the VM adapter for a host, or None.
+
+    The worker writes `vm_adapter_observations` on every tick; a silent
+    observation is the direct evidence that the worker disappeared, even
+    before a durable poweroff intent exists.
+    """
+    try:
+        from .storage.postgres.vm_adapter import Queue
+        return Queue(db).worker_seen(host)
+    except Exception:
+        return None
+
+
 def alerts(cfg, db, now, *, listing=None, orchestrators=()):
     """Agent-facing warnings derived from the durable release controls."""
     from .exploitation import _alert
@@ -795,6 +842,101 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                               host=host, state=control.get("release_error_state"),
                               generation=control.get("generation"),
                               orchestrators=list(orchestrators)))
+            continue
+        # #5932: a queued adapter request is a normal asynchronous wait, not a
+        # failure. Only a durable poweroff intent that stops progressing (or a
+        # queued request whose wave no longer matches the control) names the
+        # operator worker as stalled. Claims stay closed in every case.
+        generation = control.get("generation")
+        epoch = control.get("release_epoch")
+        pending = _pending_adapter_requests(db, host)
+        live = [row for row in pending
+                if row.get("generation") == generation
+                and row.get("release_epoch") == epoch]
+        live_keys = {(row.get("generation"), row.get("release_epoch"))
+                     for row in live}
+        obsolete = [row for row in pending
+                    if (row.get("generation"), row.get("release_epoch"))
+                    not in live_keys]
+        stall = float(cfg.host_release_adapter_stall)
+
+        def _age(row):
+            since = resources.finite_float(row.get("updated_ts"))
+            return None if since is None else max(0.0, now - since)
+
+        stalled = None
+        reason = None
+        worker_seen = _adapter_worker_seen(db, host) if live else None
+        if live:
+            # A queued request is a normal asynchronous wait. Name the worker
+            # only when it stopped progressing: a durable poweroff intent older
+            # than the bound, or no worker tick for that long.
+            poweroff = next((row for row in live
+                             if row.get("result") == "poweroff intent"), None)
+            oldest = live[0]
+            if poweroff is not None and (_age(poweroff) or 0.0) > stall:
+                stalled, reason = poweroff, "poweroff"
+            elif ((worker_seen is None or now - worker_seen > stall)
+                    and (_age(oldest) or 0.0) > stall):
+                stalled, reason = oldest, "worker"
+        else:
+            stalled = next((row for row in obsolete
+                            if (_age(row) or 0.0) > stall), None)
+            reason = "obsolete"
+        if stalled is not None:
+            since = resources.finite_float(stalled.get("updated_ts")) or now
+            if reason == "obsolete":
+                detail = ("Host %s: the VM adapter still has a queued %s request "
+                          "for generation %s/epoch %s, %ds old, while the live "
+                          "control is generation %s/epoch %s: the intent is "
+                          "obsolete and the operator worker has not reconciled it. "
+                          "Claims %s; the acknowledged state (%s) is kept. Check "
+                          "the worker timer/journal (`systemctl status "
+                          "ameesh-vm-adapter.timer`, `journalctl -u "
+                          "ameesh-vm-adapter`); do not clear the hook while a VM "
+                          "may still be stopped." % (
+                              host, stalled.get("state"),
+                              stalled.get("generation"), stalled.get("release_epoch"),
+                              int(_age(stalled) or 0.0), generation, epoch,
+                              "open" if control.get("claims_open") else "closed",
+                              control.get("hook_state") or "none"))
+            elif reason == "worker":
+                seen = ("never been seen" if worker_seen is None
+                        else "not been seen for %ds" % int(max(0.0, now - worker_seen)))
+                detail = ("Host %s: the VM adapter queued %s %ds ago but its "
+                          "operator worker has %s (stall bound %ds): the request "
+                          "is not progressing. Claims %s and the acknowledged "
+                          "state (%s) are kept. Check the worker timer/journal "
+                          "(`systemctl status ameesh-vm-adapter.timer`, "
+                          "`journalctl -u ameesh-vm-adapter`); do not clear the "
+                          "hook while a VM may be stopped." % (
+                              host, stalled.get("state"),
+                              int(_age(stalled) or 0.0), seen, int(stall),
+                              "open" if control.get("claims_open") else "closed",
+                              control.get("hook_state") or "none"))
+            else:
+                detail = ("Host %s: the VM adapter queued idle-drained with a "
+                          "durable poweroff intent %ds ago (stall bound %ds). The VM "
+                          "may be stopped or archiving; claims %s and the "
+                          "acknowledged state (%s) are kept. Check the worker "
+                          "timer/journal (`systemctl status "
+                          "ameesh-vm-adapter.timer`, `journalctl -u "
+                          "ameesh-vm-adapter`) and the provider state; do not "
+                          "clear the hook while the VM is stopped." % (
+                              host, int(_age(stalled) or 0.0), int(stall),
+                              "open" if control.get("claims_open") else "closed",
+                              control.get("hook_state") or "none"))
+            out.append(_alert("host_release_adapter_stalled", None, since,
+                              max(0.0, now - since), stall, detail,
+                              host=host, state=stalled.get("state"),
+                              generation=stalled.get("generation"),
+                              release_epoch=stalled.get("release_epoch"),
+                              reason=reason,
+                              orchestrators=list(orchestrators)))
+            continue
+        if live:
+            # Normal wait: the operator worker owns the completion. The native
+            # drain bound must not be reported as a stuck drain while it ticks.
             continue
         if control.get("mode") != "draining" \
                 or control.get("release_state") == "idle-drained":

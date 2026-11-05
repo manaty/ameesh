@@ -4574,7 +4574,9 @@ class HostLifecycle(Domain):
     state the external adapter acknowledged, `claims_open` the durable claim
     gate of a return. `begin_transition`/`finish_transition` journal a
     successful hook call per (host, generation, state), so a replay never
-    calls it twice. `claim_release_scan` serialises the release scanner of
+    calls it twice. #5932: `wait_transition` records an adapter that queued
+    the transition asynchronously (`hook_wait_*`) without acknowledging it.
+    `claim_release_scan` serialises the release scanner of
     one host across its runners; `next_scan_ts` spaces the expensive idle
     projection without slowing the cheap transitions.
     """
@@ -4629,7 +4631,9 @@ class HostLifecycle(Domain):
 
         None when the transition already succeeded (journal), when it is not
         due yet, when another live attempt holds it (younger than
-        `stale_after`), when a failure is younger than `retry_after`, or when
+        `stale_after`), when a failure is younger than `retry_after`, when an
+        accepted asynchronous wait of the SAME state is younger than
+        `retry_after` (#5932: the worker owns its completion), or when
         `release_epoch` moved (a return or a new withdrawal happened): no
         stale release decision is ever accepted. The state must also be legal
         for the current row (`busy` only while draining/returning,
@@ -4650,6 +4654,22 @@ class HostLifecycle(Domain):
         adapter is ready, not that ameesh may already take a lease). Failure
         keeps the acknowledged state and the closed claims, and stores the
         bounded error for the alert. Returns the updated row.
+        """
+
+    @abc.abstractmethod
+    def wait_transition(self, host: str, generation: int, state: str, *,
+                        release_epoch: int, actor: str,
+                        detail: dict | None = None) -> dict | None:
+        """Record an adapter that accepted an asynchronous request (#5932).
+
+        The queued request is a normal wait, never an acknowledgement: the
+        acknowledged `hook_state`/`release_state` do not move, claims stay
+        closed and no `release_error` is stored. `hook_wait_*` keeps the
+        awaited state and the first instant of this wait (a retry of the same
+        state keeps the first instant) so the scanner and the alert pass can
+        tell a live wait from a stalled worker. None when the generation or
+        the `release_epoch` moved, or when the transition attempt is no
+        longer the current one.
         """
 
     @abc.abstractmethod

@@ -77,6 +77,29 @@ class Queue:
                              "CASE state WHEN 'busy' THEN 0 WHEN 'draining' THEN 1 ELSE 2 END, "
                              "created_at LIMIT 1", (host,))
 
+    def pending_all(self, host):
+        """#5932: every queued request of a host, for the wait/stall alerts.
+
+        Epochs are extracted so the alert pass can age a durable poweroff
+        intent and spot an intent whose generation/epoch no longer matches
+        the live control (the worker has not reconciled it)."""
+        return self.db.query(
+            "SELECT host,generation,release_epoch,state,status,result,"
+            "extract(epoch from created_at)::float8 AS created_ts,"
+            "extract(epoch from updated_at)::float8 AS updated_ts "
+            "FROM vm_adapter_requests WHERE host=%s AND status='pending' "
+            "ORDER BY created_at,state", (host,))
+
+    def worker_seen(self, host):
+        """#5932: epoch of the last worker tick for a host, or None.
+
+        `observe` updates this row on every operator tick, so a stale value is
+        the evidence that the worker stopped progressing."""
+        rows = self.db.query(
+            "SELECT extract(epoch from updated_at)::float8 AS seen_ts "
+            "FROM vm_adapter_observations WHERE host=%s", (host,))
+        return rows[0]["seen_ts"] if rows else None
+
     def finish(self, request, status, result):
         self.db.execute("UPDATE vm_adapter_requests SET status=%s,result=%s,"
                         "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
