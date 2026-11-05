@@ -810,7 +810,7 @@ def candidates(ctx: Context) -> dict:
     """
     if ctx.candidates_cache:
         return ctx.candidates_cache
-    fetched = ctx.git("fetch", "--no-tags", "origin", ctx.target, timeout=300)
+    fetched = ctx.git("fetch", "--tags", "--force", "origin", ctx.target, timeout=300)
     if fetched.returncode != 0:
         raise HoraireError("fetch %s : %s" % (ctx.target, auto._tail(fetched.text, 5)))
     head = ctx.git("rev-parse", "origin/%s^{commit}" % ctx.target)
@@ -1801,7 +1801,7 @@ def check_fresh(ctx: Context) -> None:
     """
     if SCRIPT_DIR != (ctx.repo / "scripts").resolve():
         raise HoraireError("script lancé hors du clone %s (%s)" % (ctx.repo, SCRIPT_DIR))
-    fetched = ctx.git("fetch", "--no-tags", "origin", ctx.target, timeout=300)
+    fetched = ctx.git("fetch", "--tags", "--force", "origin", ctx.target, timeout=300)
     if fetched.returncode != 0:
         raise HoraireError("fetch %s : %s" % (ctx.target, auto._tail(fetched.text, 5)))
     local = ctx.git("rev-parse", "HEAD^{commit}")

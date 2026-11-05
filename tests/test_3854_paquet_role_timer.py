@@ -139,7 +139,7 @@ class RenderTest(unittest.TestCase):
         text = role_timers.render_service(self.spec, role="mesh-design",
                                           bin_path="/opt/ameesh/bin/ameesh")
         self.assertIn("ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull "
-                      "--ff-only --quiet origin ${AMEESH_PAQUET_TARGET}", text)
+                      "--ff-only --tags --force --quiet origin ${AMEESH_PAQUET_TARGET}", text)
         self.assertIn("ExecStart=/opt/ameesh/bin/ameesh role run mesh-design -- "
                       "/usr/bin/env PYTHONPATH=${AMEESH_PAQUET_REPO}/src "
                       "/opt/ameesh/bin/python ${AMEESH_PAQUET_REPO}/scripts/"
