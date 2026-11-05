@@ -1596,13 +1596,13 @@ def connect(cfg: Config, driver: str | None = None, *, writer: bool = True) -> P
 def _writer_connection(db, *, writer: bool):
     """Process admission; diagnostics/migration opt out explicitly.
 
-    No per-statement guard, SQL classification or transaction lock. Long-lived
-    processes must also call require_compatible_writer at their tick boundary.
+    Admission successes are shared for at most five seconds (#5980).
+    Long-lived processes also call require_compatible_writer at tick boundaries.
     """
     if writer and not getattr(db.cfg, 'read_only', False):
-        from .migrations import require_compatible_writer
+        from .migrations import admit_writer_connection
         try:
-            require_compatible_writer(db)
+            admit_writer_connection(db)
         except BaseException:
             db.close()
             raise
