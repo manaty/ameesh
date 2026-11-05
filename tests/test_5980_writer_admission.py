@@ -77,6 +77,19 @@ class WriterAdmissionTest(unittest.TestCase):
         self.admit()
         self.assertEqual(self.inventory.call_count, 3)
 
+    def test_outer_failure_revokes_a_nested_scoped_connection_success(self):
+        def inventory(*args):
+            if self.inventory.call_count == 1:
+                # Une lecture ScopedDb ouvre sa propre connexion admise.
+                self.admit()
+                raise db_mod.Unavailable('outer read failed')
+            return []
+        self.inventory.side_effect = inventory
+        with self.assertRaises(db_mod.Unavailable):
+            migrations.require_compatible_writer(self.db)
+        self.admit()
+        self.assertEqual(self.inventory.call_count, 3)
+
     def test_dsn_schema_code_inventory_and_process_are_isolated(self):
         self.admit()
         for cfg in (dataclasses.replace(self.cfg, dsn='postgresql://other@db/database'),

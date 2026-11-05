@@ -837,7 +837,14 @@ def require_compatible_writer(db, directory: str = MIGRATIONS_DIR) -> None:
     if getattr(getattr(db, 'cfg', None), 'backend', '') == 'mediated':
         return  # requests are admitted by the server running its own code
     with _WRITER_ADMISSION_LOCK:
-        _check_compatible_writer(db, directory, _writer_admission_key(db, directory))
+        key = _writer_admission_key(db, directory)
+        try:
+            _check_compatible_writer(db, directory, key)
+        except BaseException:
+            # ScopedDb peut ouvrir une connexion admise pendant cette lecture.
+            # Son succès imbriqué ne doit pas survivre au refus extérieur.
+            _WRITER_ADMISSIONS.pop(key, None)
+            raise
 
 
 def admit_writer_connection(db, directory: str = MIGRATIONS_DIR) -> None:
