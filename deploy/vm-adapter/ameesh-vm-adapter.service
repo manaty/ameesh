@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=Operator-owned Scaleway VM adapter for ameesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Substitute the existing operator account: never an agent/runner account.
+User=REPLACE_WITH_EXISTING_OPERATOR_ACCOUNT
+UMask=0077
+EnvironmentFile=/etc/ameesh-vm-adapter/database.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+LoadCredential=scaleway.json:/etc/ameesh-vm-adapter/scaleway.json
+ExecStart=/opt/ameesh-vm-adapter/venv/bin/python -m ameesh.vm_adapter worker --enrollment /etc/ameesh-vm-adapter/enrollment.json
+TimeoutStartSec=5min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

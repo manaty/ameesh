@@ -72,6 +72,7 @@ test_5140_sandbox_relay  # #5140: database-clock token expiry, lease fencing and
 test_5586_overview_plan  # stockage : plan d'`overview()` (agrégat unique du courrier) et comptes/canon de la vue sous les deux pilotes (#5586)
 test_5856_begin_turn_refusal  # stockage : diagnostic de refus sous verrou et porte hôte (#5856)
 test_5921_sizing_history  # #5921: daily SQL aggregates and N-1 cgroup counters
+test_5925_vm_adapter  # #5925: generation-fenced operator VM queue and simulated cloud
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)
 test_711_migration_reservations  # storage: atomic scoped migration batches, legacy projection, SHA fencing and lifecycle (#711)
