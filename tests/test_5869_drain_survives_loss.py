@@ -74,15 +74,57 @@ class DrainSurvivesLossTest(PgTestCase):
         self.assertEqual(self.reconcile()["mode"], "draining")
         self.assertIsNone(self.api.host_lifecycle.get("source")["return_ts"])
 
+    # N-1 statements (main 493295c27), copied verbatim. This lot adds no
+    # column: the intent is inferred from `release_generation == generation`
+    # and `release_state`, which those writers already keep (#5690).
+    N1_LOSS_FROM_DRAIN = (
+        "UPDATE host_lifecycle SET mode='lost',actor=%s,"
+        "return_at=NULL,release_epoch=release_epoch+1,"
+        "updated_at=clock_timestamp() WHERE host=%s")
+    N1_LOSS_OTHER = (
+        "INSERT INTO host_lifecycle(host,mode,actor) VALUES (%s,'lost',%s) "
+        "ON CONFLICT(host) DO UPDATE SET mode='lost',actor=excluded.actor, "
+        "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
+        "return_at=NULL,release_epoch=host_lifecycle.release_epoch+1,"
+        "updated_at=clock_timestamp()")
+    N1_RECONCILE = (
+        "UPDATE host_lifecycle SET mode='returning',actor=%s,return_at=NULL, "
+        "release_epoch=release_epoch+1, "
+        "updated_at=clock_timestamp() WHERE host=%s AND mode='lost'",
+        "UPDATE host_lifecycle c SET mode='available',"
+        "claims_open=true,release_state='busy',hook_state='busy',"
+        "updated_at=clock_timestamp() WHERE c.host=%s AND c.mode='returning'")
+
+    def n1_lose(self, statement, params):
+        self.db.execute("UPDATE host_resources SET sampled_at=clock_timestamp()"
+                        "-interval '1000 seconds' WHERE host='source'")
+        self.db.execute(statement, params)
+        self.db.execute("UPDATE host_lifecycle SET updated_at=clock_timestamp()"
+                        "-interval '900 seconds' WHERE host='source'")
+
     def test_a_previous_version_detector_still_restores_the_drain(self):
-        # N-1 detector: draining -> lost with return_at=NULL, generations kept.
-        drained = self.drain(duration=12 * 3600)
-        self.lose()
-        self.db.execute("UPDATE host_lifecycle SET return_at=NULL WHERE host='source'")
+        # B3: the N-1 detector clears return_at; the drain comes back
+        # open-ended (never `available`), the operator's undrain ends it.
+        drained = self.drain(duration=3600)
+        self.n1_lose(self.N1_LOSS_FROM_DRAIN, ("remote", "source"))
         self.returned()
         self.assertEqual(self.reconcile()["mode"], "draining")
         row = self.api.host_lifecycle.get("source")
         self.assertEqual((row["generation"], row["return_ts"]), (drained["generation"], None))
+
+    def test_a_previous_version_reconcile_leaves_no_stale_intent(self):
+        # B4: new loss from a drain, N-1 reconcile to `available`, N-1 loss
+        # from `available`: the new reconcile must not invent a drain.
+        self.drain(duration=3600)
+        self.lose()
+        self.returned()
+        first, second = self.N1_RECONCILE
+        self.db.execute(first, ("runner-old@peer", "source"))
+        self.db.execute(second, ("source",))
+        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "available")
+        self.n1_lose(self.N1_LOSS_OTHER, ("source", "remote"))
+        self.returned()
+        self.assertEqual(self.reconcile()["mode"], "available")
 
     def test_a_backfilled_lost_row_is_no_drain_intent(self):
         # 0507 backfill of a row already lost: generations equal, release busy.
