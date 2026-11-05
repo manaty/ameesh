@@ -15,7 +15,6 @@ from types import SimpleNamespace as NS
 
 from ameesh import canon as canon_mod, config, host_idle, host_release
 
-from .test_4150_host_idle import NOW, HostIdleTest
 from .test_l43_perimetre_hote import HOST as CARD_HOST, _Canons, codes, host
 
 
@@ -54,7 +53,20 @@ class DeclarationTest(unittest.TestCase):
         self.assertEqual(self.load({"vm": "none"}).runs_interfaces, {"vm": "none"})
 
 
-class ProjectionTest(HostIdleTest):
+NOW = 10000
+
+
+class ProjectionTest(unittest.TestCase):
+    def project(self, **kw):
+        reading = dict(sampled_ts=NOW, turns_in_progress=0, cpu_count=8,
+                       mem_total_bytes=16000, mem_available_bytes=12000, app_cpu=0.25,
+                       cgroup={'container': False, 'limits_readable': True})
+        agent = dict(name='worker', host='vm', status='idle', lease_live=True,
+                     session_lot_state=None, actionable_lots=0, unread=0,
+                     passive_unread=0, status_since_ts=7000, last_turn_ts=7000)
+        history = [dict(reading, sampled_ts=t) for t in range(7600, NOW + 1, 60)]
+        return host_idle.project(reading, history, [agent], [], now=NOW, **kw)
+
     def blockers(self, out):
         control = {"host": "vm", "requested_ts": NOW - 600}
         cfg = config.Config(resource_interval=60, host_release_settle=1,
