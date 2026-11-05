@@ -102,7 +102,7 @@ class WorkflowTest(unittest.TestCase):
         # (scripts/ci-agregat.py) ; l'étape lui passe les deux sorties.
         # #5729 : la qualification entre dans les needs de l'agrégat.
         self.assertIn("needs: [qualification, plan, version, psycopg, psql, "
-                      "platform-macos, doc-readers, fs-class]", self.text)
+                      "platform-macos, doc-readers, fs-class, preflight-n1]", self.text)
         self.assertIn('--docs-only "${{ needs.plan.outputs.docs_only }}"', self.text)
         self.assertIn('--doc-readers "${{ needs.doc-readers.result }}"', self.text)
 

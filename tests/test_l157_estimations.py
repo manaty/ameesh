@@ -202,7 +202,7 @@ class VersionOnlyTest(unittest.TestCase):
         # #5729 : la qualification entre dans les needs de l'agrégat.
         self.assertIn('--version-only "${{ needs.plan.outputs.version_only }}"', text)
         self.assertIn("needs: [qualification, plan, version, psycopg, psql, "
-                      "platform-macos, doc-readers, fs-class]", text)
+                      "platform-macos, doc-readers, fs-class, preflight-n1]", text)
 
 
 class EstimatesPgTest(PgTestCase):

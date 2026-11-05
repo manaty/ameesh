@@ -512,7 +512,7 @@ class WorkflowTest(unittest.TestCase):
         # par l'étape « bilan des parts » ; le job `version` reste une
         # dépendance du check requis, comme toutes les parts lues par le bilan.
         self.assertIn("needs: [qualification, plan, version, psycopg, psql, "
-                      "platform-macos, doc-readers, fs-class]", text)
+                      "platform-macos, doc-readers, fs-class, preflight-n1]", text)
         self.assertIn('--version "${{ needs.version.result }}"', text)
         # La version est lue avant les voies version seule et doc seule : le
         # classifieur la vérifie avant ses sorties anticipées
