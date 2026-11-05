@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import time
 import unittest
@@ -18,7 +19,7 @@ from ameesh import (db as db_mod, packet_head, packet_link, plan_git, registry,
                     storage, work)
 
 from .support import PgTestCase
-from .test_canon import _TmpMixin, git
+from .test_canon import _TmpMixin, _git_env, git
 
 
 class PacketLinkTest(_TmpMixin, PgTestCase):
@@ -603,7 +604,9 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
 
     def test_sync_merges_withholds_a_blocked_composition_unit(self):
-        """#2744 s'applique aussi à la fermeture par composition."""
+        """#2744 s'applique aussi à la fermeture par composition. #5778 : le
+        paquet fusionne après l'entrée en blocked (B1 #190438) ; la reprise
+        ferme sans regel."""
         frozen = self.unit_branch("lot/bloque", "bloque.py", "bloque\n", "bloque")
         item = self.lot("unité bloquée")
         self.freeze(item, frozen)
@@ -611,10 +614,13 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
         porteur = self.carrier()
         packet_link.record(self.db, porteur["id"], repo=self.repo, base=self.base,
                            head=head, actor="pilote", cfg=self.cfg)
-        git(self.repo, "checkout", "-q", "main")
-        git(self.repo, "merge", "-q", "--no-ff", "-m", "fusion paquet",
-            "integration/paquet-1")
         work.move(self.db, item["id"], "blocked", note="passe réelle due")
+        git(self.repo, "checkout", "-q", "main")
+        env = _git_env()
+        env["GIT_COMMITTER_DATE"] = "@%d +0000" % (int(time.time()) + 600)
+        subprocess.run(["git", "merge", "-q", "--no-ff", "-m", "fusion paquet",
+                        "integration/paquet-1"], cwd=self.repo, env=env,
+                       check=True, capture_output=True)
         report = plan_git.sync_merges(self.db, self.repo, target="main")
         row = next(r for r in report["results"] if r["work_item"] == item["id"])
         self.assertEqual(row["result"], "withheld", row)

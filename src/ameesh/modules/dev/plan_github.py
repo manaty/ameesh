@@ -1331,7 +1331,9 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                 elif dry_run:
                     from . import plan_git
                     state = item["state"]
-                    retention = (plan_git.dry_run_retention(db, st, item, sha=sha or "", repo=None)
+                    retention = (plan_git.dry_run_retention(
+                        db, st, item, sha=sha or "", repo=None,
+                        entered_before=plan_git.merged_at(merged_ts))   # #5778
                                  if live else None)
                     if retention is not None and not retention.get("lift"):
                         plan_git.mark_retained(entry, retention,
@@ -1346,7 +1348,8 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                     done = work_mod.deliver(
                         db, item_id, connector=work_mod.merge_connector(),
                         evidence={"seen": "sync-github", "sha": sha or "", "pr": ref},
-                        actor=actor, content_guard=plan_git.content_retention)
+                        actor=actor,
+                        content_guard=plan_git.entry_guard(plan_git.merged_at(merged_ts)))
                     entry.update(result=done["result"], detail=done["detail"])
                     if done["result"] in ("withheld", "error") and done.get("retention"):
                         target = pr.get("baseRefName") or "GitHub"

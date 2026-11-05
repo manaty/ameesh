@@ -276,10 +276,32 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
 
     def _delivered(self) -> dict:
         """Un lot gelé dont le contenu est déjà dans `main`, encore en `qa`."""
+        self._branch()
+        self._land()
+        return self._freeze()
+
+    def _branch(self) -> None:
         git(self.repo, "checkout", "-q", "-b", "lot/paquet")
-        sha = self._commit("src/paquet.py", "x = 1\n", "paquet")
+        self._commit("src/paquet.py", "x = 1\n", "paquet")
         git(self.repo, "checkout", "-q", "main")
-        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet 1900", "lot/paquet")
+
+    def _land(self, *, after_s: int = 0) -> None:
+        """Le paquet entre dans `main` ; `after_s` date la fusion dans le
+        futur (#5778 : une fusion postérieure aux attentes déjà posées)."""
+        env = dict(os.environ)
+        if after_s:
+            env["GIT_COMMITTER_DATE"] = "@%d +0000" % (int(time.time()) + after_s)
+        subprocess.run(["git", "-C", self.repo, "merge", "-q", "--no-ff", "-m",
+                        "paquet 1900", "lot/paquet"], check=True,
+                       capture_output=True, env=env)
+
+    def _frozen(self) -> dict:
+        """#5778 : un lot gelé dont le paquet n'est pas encore fusionné."""
+        self._branch()
+        return self._freeze()
+
+    def _freeze(self) -> dict:
+        sha = git(self.repo, "rev-parse", "lot/paquet")
         item = work.add(self.db, title="livré sous hold", assignee="dev-a")
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
@@ -359,14 +381,16 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
     def test_B1_le_hold_de_pilote_recouvert_retient_la_fermeture(self):
         """B1 cx2/dev2 : hold de pilote puis hold de l'assigné (même état) ;
         la passe ne ferme pas sur le seul hold de l'assigné. La levée de
-        l'assigné ne lève que le sien ; le contenu attend le pilote."""
-        item = self._delivered()
+        l'assigné ne lève que le sien ; le contenu attend le pilote.
+        #5778 : le paquet entre sous ces holds (après leur pose)."""
+        item = self._frozen()
         with bound(""):
             work.note(self.db, item["id"], "hold: gestes owner",
                       actor="human:proprio")
         with bound("dev-a"):
             work.note(self.db, item["id"], "hold: j'attends le paquet 1900",
                       actor="dev-a")
+        self._land(after_s=600)
         first = self._sync()[item["id"]]
         self.assertEqual((first["result"], first["retention"]["by"]),
                          ("withheld", "human:proprio"))
@@ -402,11 +426,13 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
 
     def test_un_hold_d_un_autre_ordinaire_retient_la_fermeture(self):
         """Un hold posé par un tiers (QA, pair) garde son effet #2744 : il ne
-        devient pas la retenue ordinaire de l'assigné."""
-        item = self._delivered()
+        devient pas la retenue ordinaire de l'assigné. #5778 : le paquet
+        entre après la pose du hold."""
+        item = self._frozen()
         with bound("dev-b"):
             work.note(self.db, item["id"], "hold: relecture de passage",
                       actor="dev-b")
+        self._land(after_s=600)
         result = self._sync()[item["id"]]
         self.assertEqual((result["result"], result["retention"]["by"]),
                          ("withheld", "dev-b"))
@@ -503,6 +529,99 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
     def test_5774_lot_normal_ferme_par_le_contenu(self):
         item = self._delivered()
         self.assertEqual(self._sync()[item["id"]]["result"], "merged")
+
+    def _stale(self, item: dict) -> None:
+        for dry in (True, False):
+            result = self._sync(dry_run=dry)[item["id"]]
+            self.assertEqual(result["result"], "would-withhold" if dry else "withheld")
+            self.assertEqual(result["retention"]["what"], "stale-freeze")
+
+    def test_5778_5686_sans_waiting_human_blocked_puis_build(self):
+        """#5686 sans décision : gel fusionné, blocked (acte dû), reprise en
+        build : la passe ne ferme rien, le dépendant aval reste bloqué."""
+        from ameesh import work_dependencies
+        item = self._delivered()
+        downstream = work.add(self.db, title="activer en prod", assignee="dev-b")
+        work_dependencies.add(self.db, downstream["id"], item["id"], actor="dev-b")
+        work.move(self.db, item["id"], "blocked", note="acte opérateur encore dû")
+        work.move(self.db, item["id"], "build", note="reprise de l'acte")
+        self._stale(item)
+        self.assertEqual(work.get(self.db, item["id"])["state"], "build")
+        self.assertTrue(work_dependencies.grouped(self.db, [downstream["id"]])
+                        [downstream["id"]][0]["blocking"])
+        self._refreeze(item)
+        self.assertEqual(self._sync()[item["id"]]["result"], "merged")
+
+    def test_5778_qa01_point_1_blocked_puis_qa(self):
+        item = self._delivered()
+        work.move(self.db, item["id"], "blocked", note="acte dû")
+        work.move(self.db, item["id"], "qa", note="reprise")
+        self._stale(item)
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_5778_qa01_point_2_gel_de_reprise_puis_second_blocked(self):
+        from .support import hold_for_owner
+        item = self._delivered()
+        hold_for_owner(self.db, item["id"])
+        work.move(self.db, item["id"], "qa", note="décision reçue")
+        self._refreeze(item)
+        work.move(self.db, item["id"], "blocked", note="second acte dû")
+        work.move(self.db, item["id"], "qa", note="reprise")
+        self._stale(item)
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_5778_B1_paquet_fusionne_apres_la_reprise_ferme(self):
+        """B1 auditeur #190438 : blocked sur une CI rouge d'infrastructure,
+        reprise, puis le paquet fusionne : fermé sans regel."""
+        item = self._frozen()
+        work.move(self.db, item["id"], "blocked", note="CI rouge (infrastructure)")
+        work.move(self.db, item["id"], "qa", note="CI relancée")
+        self._land(after_s=600)
+        self.assertEqual(self._sync(dry_run=True)[item["id"]]["result"], "would-merge")
+        self.assertEqual(self._sync()[item["id"]]["result"], "merged")
+
+    def test_5778_paquet_fusionne_pendant_blocked_ferme_a_la_reprise(self):
+        """Le contenu est entré après l'entrée en blocked : la reprise ferme."""
+        item = self._frozen()
+        work.move(self.db, item["id"], "blocked", note="CI rouge (infrastructure)")
+        self._land(after_s=600)
+        self.assertEqual(self._sync()[item["id"]]["result"], "withheld")
+        work.move(self.db, item["id"], "qa", note="reprise")
+        self.assertEqual(self._sync()[item["id"]]["result"], "merged")
+
+    def test_5778_hold_de_pilote_pose_apres_la_fusion_puis_leve(self):
+        """La garde provisoire de mesh-design : un hold de pilote posé sur un
+        lot dont le gel est déjà fusionné retient, même levé."""
+        item = self._delivered()
+        with bound(""):
+            work.note(self.db, item["id"], "hold: acte opérateur dû",
+                      actor="human:proprio")
+            work.note(self.db, item["id"], "unhold: acte en cours",
+                      actor="human:proprio")
+        self.assertEqual(self._active(item), {})
+        self._stale(item)
+        self._refreeze(item)
+        self.assertEqual(self._sync()[item["id"]]["result"], "merged")
+
+    def test_5778_entree_illisible_retient(self):
+        item = self._delivered()
+        work.move(self.db, item["id"], "blocked", note="acte dû")
+        work.move(self.db, item["id"], "qa", note="reprise")
+        st = storage.of(self.db)
+        row = work.get(self.db, item["id"])
+        retention = plan_git.content_retention(st, row,
+                                               entered_before=lambda since: None)
+        self.assertEqual(retention["what"], "unreadable")
+        # la fusion datée par la forge (sync-github) : avant, après, inconnue
+        since = time.time()
+        slack = plan_git.CLOCK_SLACK_S
+        for merged_ts, what in ((since - 3600, "stale-freeze"),
+                                (since + slack - 1, "stale-freeze"),   # marge prudente
+                                (since + slack + 1, None),
+                                (since + 3600, None), (None, "unreadable")):
+            retention = plan_git.content_retention(
+                st, row, entered_before=plan_git.merged_at(merged_ts))
+            self.assertEqual((retention or {}).get("what"), what)
 
     def test_l_etat_blocked_retient_meme_sous_le_hold_de_l_assigne(self):
         """#3219 n'ouvre que les retenues de règle 1 : un lot `blocked` n'est

@@ -520,6 +520,8 @@ class EntryPointRefusalTest(unittest.TestCase):
         worker.retry_remaining.return_value = 0
         worker.rotation_stopped = False  # #5503 : disjoncteur de rotation
         worker.run_turn.side_effect = migrations.IncompatibleSchema('9999_future')
+        worker._run_under_heartbeat.side_effect = lambda: (
+            runner.AgentWorker._run_under_heartbeat(worker))
         with mock.patch.object(migrations, 'require_compatible_writer'), \
                 mock.patch.object(runner, 'log'), \
                 mock.patch.object(runner, 'log_async') as journal:

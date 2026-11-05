@@ -1175,11 +1175,12 @@ ensemble :
 * `account_turn_starts` porte les débuts de tour du compte ; l'écart minimal
   par défaut est de **30 s**, le plafond de tours actifs de **2** (Codex), pour
   un **compte de forfait** (`type: config_dir`, connexion ChatGPT) seulement.
-  #5783 : une clé d'API mesurée (`type: api_key_env`, `api_key_file`) n'a pas
-  ce bucket de forfait ; elle part sans plafond ni écart par défaut et garde
-  seulement la journalisation des 429 et le cooldown partagé. Un refus porte
-  une raison distincte, `account window: …`, écrite dans `status_text` et
-  lisible dans `ameesh show` (ce n'est pas une pause budget). Le
+  #5783 : une clé d'API mesurée (`type: api_key_env`, avec `key_env` ou
+  `key_file`) n'a pas ce bucket de forfait ; elle part sans plafond ni écart
+  par défaut et garde seulement la journalisation des 429 et le cooldown
+  partagé. Un refus porte une raison distincte, `account window: …`, écrite
+  dans `status_text` et lisible dans `ameesh show` (ce n'est pas une pause
+  budget). Le
   plafond compte les places d'`account_turn_slots`, qui portent le harnais et
   le compte **effectifs** du tour : un agent Claude/DeepSeek qui emprunte Codex
   (repli L242b) compte dans le plafond Codex. La place n'est retenue que si le

@@ -151,7 +151,8 @@ class RaisonsDArretDeBailTest(unittest.TestCase):
         import inspect
         import re
         raisons = []
-        for fn in (AgentWorker.renew, AgentWorker._deadline_watchdog):
+        for fn in (AgentWorker.renew, AgentWorker._renew_serialized,
+                   AgentWorker._deadline_watchdog):
             raisons += re.findall(r'stop_group_now\(\s*"([^"]+)"', inspect.getsource(fn))
         self.assertGreaterEqual(len(raisons), 5)
         for raison in raisons:

@@ -322,9 +322,11 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
             entry.update(how="trailer", ref=unit,
                          detail="composition %s carries `ameesh-work: %d`"
                                 % (unit[:12], lot))
+            entered = plan_git.entered_in(repo_dir, unit, target)   # #5778
             if dry_run:
                 retention = plan_git.dry_run_retention(db, st, row, sha=unit,
-                                                       repo=repo_dir)
+                                                       repo=repo_dir,
+                                                       entered_before=entered)
                 if retention is not None and not retention.get("lift"):
                     plan_git.mark_retained(entry, retention, target=target,
                                            dry_run=True)
@@ -339,7 +341,7 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
                 db, lot, connector=work.merge_connector(),
                 evidence={"seen": "packet manifest (%s)" % sources, "sha": unit},
                 actor=actor or "packet:%s" % target, repo=repo_dir,
-                content_guard=plan_git.content_retention)
+                content_guard=plan_git.entry_guard(entered))
             entry["result"] = done["result"]
             if done["result"] in ("withheld", "error"):
                 plan_git.mark_retained(entry, done["retention"], target=target)
@@ -362,9 +364,11 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
             entry["result"] = "reverted" if found["how"] == "reverted" else "open"
             results.append(entry)
             continue
+        entered = plan_git.entered_in(repo_dir, found["ref"] or sha, target)   # #5778
         if dry_run:
             retention = plan_git.dry_run_retention(db, st, row,
-                                                   sha=found["ref"] or sha, repo=repo_dir)
+                                                   sha=found["ref"] or sha, repo=repo_dir,
+                                                   entered_before=entered)
             if retention is not None and not retention.get("lift"):
                 plan_git.mark_retained(entry, retention, target=target, dry_run=True)
                 results.append(entry)
@@ -379,7 +383,7 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
             evidence={"seen": "packet manifest (%s)" % sources, "sha": found["ref"] or sha},
             actor=actor or "packet:%s" % target,
             frozen_id=int(freeze["id"]) if freeze and freeze.get("id") else None,
-            repo=repo_dir, content_guard=plan_git.content_retention)
+            repo=repo_dir, content_guard=plan_git.entry_guard(entered))
         entry["result"] = done["result"]
         if done["result"] in ("withheld", "error"):
             plan_git.mark_retained(entry, done["retention"], target=target)
