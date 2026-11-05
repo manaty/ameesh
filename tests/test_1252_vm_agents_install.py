@@ -249,6 +249,11 @@ elif 'config.load().host' in code:
     print(os.environ.get('AMEESH_HOST') or '')
 elif 'import psycopg' in code:
     print('psycopg 3.2.0 (fake)')
+elif 'role_timers' in code:
+    # #5937 : le préflight demande au venv installé s'il connaît la passe
+    # de l'auditeur (« - » : code antérieur à #5863).
+    marker = state / 'auditor-pass'
+    print(marker.read_text().strip() if marker.exists() else 'auditeur-court')
 else:
     sys.exit('unexpected database probe: ' + code)
 '''
@@ -1154,6 +1159,33 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertIn('code installé', p.stdout)
         self.assertIn(self.old[:7], p.stdout)
         self.assertNotIn('restart', (self.state / 'systemctl.log').read_text())
+
+    def test_control_checks_the_auditor_timer_when_the_installed_code_knows_it(self):
+        # #5937 : le code installé connaît la passe : le contrôle est dû.
+        p = self.run_vm('controler')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        log = (self.state / 'role-timers.log').read_text()
+        self.assertIn('role timers --role auditeur --check', log)
+        python = (self.state / 'python.log').read_text()
+        self.assertIn('role_timers', python)
+
+    def test_preflight_on_older_code_names_the_auditor_step_without_failing(self):
+        # #5937 : CLI antérieur à #5863 (préflight d'une montée, retour
+        # arrière) : pas de contrôle --role auditeur, étape nommée, vert.
+        (self.state / 'auditor-pass').write_text('-\n')
+        p = self.run_vm('verifier')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        log = (self.state / 'role-timers.log').read_text()
+        self.assertIn('role timers --check', log)
+        self.assertNotIn('--role auditeur', log)
+        self.assertIn("minuterie de l'auditeur (#5863) : le code installé ne la connaît pas",
+                      p.stdout + p.stderr)
+
+    def test_an_unreadable_auditor_probe_fails_the_control(self):
+        (self.state / 'auditor-pass').write_text('')
+        p = self.run_vm('verifier')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("role_timers du venv installé illisible", p.stderr)
 
 
 class VmAgentsBundleInstallTest(VmAgentsHarness):
