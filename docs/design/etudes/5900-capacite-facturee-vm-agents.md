@@ -1,7 +1,7 @@
 ---
 type: Study
 title: "#5900 — billed capacity of the agent VMs, fitted to the work that actually runs"
-description: "Owner request of 05/11/2026 relayed by bureau (manaty/ameesh#4489): a process that fits the cost of ameesh-agents-1/2/3 to what is needed, without slowing Nexlink. Seven-day diagnostic from the mesh database, state of #4147/#4148/#4150/#4151 (release path inert end to end), sourced Scaleway prices including disks and IP, cost per state, options compared, a first bounded target (agents-3 GP1-S → GP1-XS, −71 €/month), hysteresis rules, proposed lots C1–C6 and owner questions Q1–Q3. No code, no machine gesture."
+description: "Owner request of 05/11/2026 relayed by bureau (manaty/ameesh#4489): a process that fits the cost of ameesh-agents-1/2/3 to what is needed, without slowing Nexlink. Seven-day diagnostic from the mesh database, state of #4147/#4148/#4150/#4151 (release path inert end to end), sourced Scaleway prices including disks and IP, cost per state, options compared (no resize fits the load of 05/11, the only out-of-rule saving is archiving agents-3, −139 €/month at a high risk), hysteresis rules, proposed lots C1–C6, one owner question and two operator questions. No code, no machine gesture."
 status: draft
 tags: [capacite, hotes, cout, scaleway, drainage, placement, burst, baseline]
 generated: { by: "mty-amh-impl-18/claude-opus-5-5", at: "2026-11-05T08:30:00Z" }
@@ -35,25 +35,30 @@ sources:
 2. **The lever is the size of the fleet, not its schedule.** Summed minute by
    minute, the work of the three VMs fits on two VMs 98.7 % of the time with
    a 20 % margin, but not on one (memory p99 37 GB, max 45.7 GB). agents-3 is
-   the least loaded: mean concurrency 0.95 turn, memory max 12.4 GB, CPU max
-   6.1 cores (§5). It hosts no elected role.
-3. **First target, bounded and reversible: resize agents-3 from GP1-S
-   (8 vCPU/32 GB) to GP1-XS (4 vCPU/16 GB).** Same family, same local disk
-   (GP1-XS takes up to 150 GB), same agents, same IP. Saving: **≈ 71.5 €/month
-   excl. VAT, 16 % of the fleet**. The power-off that the resize requires also
-   gives the first real measurement of the wake-up delay, which the drain
-   policy needs. It runs after #5869, so the power-off does not turn the
-   host `lost` (§6).
+   the least loaded over the week (mean concurrency 0.95 turn, memory max
+   12.4 GB). It hosts no elected role.
+3. **No resize fits today's load.** The smaller type in the same family,
+   GP1-XS (4 vCPU/16 GB), would save 71.48 €/month on one VM, but neither
+   candidate fits it (§3.6):
+   - claude1 and claude2 moved to agents-3 on 05/11 (#5841). With their
+     measured memory added minute by minute, agents-3 would have peaked at
+     18.1 GB, and spent 441 minutes above 80 % of 16 GB in a week.
+   - agents-1 without them still peaks at 16.3 GB, with 238 minutes above
+     4 cores, and it is the failover host of the elected roles.
+   - Between GP1-XS and GP1-S there is no other size. The other 8 vCPU/32 GB
+     x86 types cost more than GP1-S (§4).
 4. **Repair and run the existing rule now, without waiting.** The release
    half of #4148 is inert end to end (§2). The lots that apply the rule of
    28/10 (C2–C5) need no new owner decision, as the pilot noted. They start
-   now in the order of §8. Only the resize (C1) and option D are outside the
-   rule.
-5. The bigger option, taking agents-3 out and keeping it powered off as a
-   burst reserve (≈ 139 €/month), is riskier. agents-2 alone already
-   saturated its memory on 30/10, and moving six more agents onto agents-1/2
-   could slow Nexlink. The owner can choose it at any time (Q1). C4's
-   per-turn peaks would make that choice safer, but nothing waits for them.
+   now in the order of §8. Only option D (C1) is outside the rule.
+5. **The one large saving is outside the rule, and risky: option D.**
+   Archiving agents-3 as a burst reserve and moving its agents to
+   agents-1/2 saves ≈ 139 €/month (31 % of the fleet). agents-2 alone
+   already saturated its memory on 30/10. Moving eight more agents,
+   including three Nexlink reviewers, onto agents-1/2 could slow Nexlink.
+   This study does not recommend it at today's load. The owner can choose
+   it (Q1). Otherwise C6 re-runs the sizing on C4's per-turn peaks when the
+   load falls, and nothing waits for it.
 
 # 1. The request and its limits
 
@@ -186,7 +191,8 @@ about resources, because DeepSeek and Codex turns are mostly API calls.
   Nexlink implementation, docs and release agents and the GitHub watch.
 - **agents-3**: 6 primary placements (ameesh-cx3, mty-amh-impl-12/13/15/18,
   the Nexlink reviewer mty-nxl-rev-02). claude1 and claude2 are also
-  admitted there (41 turns in a week, mostly at night).
+  admitted there (41 turns in the week, mostly at night). They have run
+  there since 05/11 01:19Z and 04:11Z (#5841, §3.6).
 - The elected roles move only between agents-1 and agents-2, which are their
   candidate hosts (`[ameesh-agents-2, ameesh-agents-1]`).
 - manaty-mesh-1 (DEV1-L, the mesh database) runs no agent and is out of
@@ -201,6 +207,27 @@ about resources, because DeepSeek and Codex turns are mostly API calls.
 - Two agent moves.
 - No `host_idle_reserved` or `baseline_oversized` alert can be counted,
   because they are not journaled.
+
+## 3.6 Load added on agents-3 on 05/11
+
+claude1 and claude2, two Claude agents of Nexlink, moved from agents-1 to
+agents-3 on 05/11, at 01:19Z and 04:11Z (#5841, note of the pilot from
+bureau, #192812). The week above contains almost none of their work on
+agents-3.
+
+- **Since 01:19Z on agents-3:** CPU max 2.2 cores, memory max 7.8 GB, 51
+  turns for the two of them. Only 254 of the 365 minutes have a reading.
+  That window is too short to size a host on.
+- **Projection.** Each runner's memory (`mem_current_bytes`) is read from
+  the `cgroup` field of `host_resources`. Adding claude1 + claude2 (p95
+  3.3 GB, max 7.8 GB) to agents-3 minute by minute over the week gives:
+  memory p95 12.6 GB, max **18.1 GB**, and **441 minutes above 12.8 GB**,
+  which is 80 % of a GP1-XS. CPU per runner is not recorded, so the CPU
+  projection is missing. It can only be higher than §5's 73 minutes above
+  4 cores.
+- **agents-1 without the two.** Memory p95 10.9 GB, max 16.3 GB,
+  179 minutes above 12.8 GB. `app_cpu` was above 4 cores for 238 minutes,
+  an upper bound because it still counts the two agents.
 
 # 4. Prices and cost per state
 
@@ -254,50 +281,49 @@ that GP1 does not include it (Q3).
 |---|---|---|---|---|
 | A. Idle drain of burst hosts (canon of 28/10), repaired | ≤ 6.6 on agents-3 (8 h without a turn in 7 days, upper bound), ≈ 0 on agents-1/2 | none | yes | apply the rule now (C2–C5); small saving today, larger if the load keeps falling |
 | B. Night shutdown of a VM | ≈ 0, would cut work that runs | high | yes | rejected: no night trough |
-| **C. agents-3 GP1-S → GP1-XS** | **71.48** | low to medium: memory fits (max 12.4 GB of 16), CPU does not at its peak (max 6.1 cores of 4, 73 minutes above 4 in 7 days) | yes, the same resize back | **recommended first target** |
-| D. agents-3 archived as a burst reserve, its 6 agents moved to agents-1/2 | 139.24 (keeps 9.02) | medium to high: agents-2 already saturated; 41 agents on two VMs | yes, power on again | owner decision (Q1); safer with C4 data, not blocked by it |
+| C. agents-3 GP1-S → GP1-XS | 71.48 | high since 05/11: projected memory max 18.1 GB of 16 with claude1/2 (§3.6), CPU above 4 cores 73 min a week without them | yes, the same resize back | rejected at today's load |
+| C'. agents-1 GP1-S → GP1-XS | 71.48 | high: max 16.3 GB, 238 min above 4 cores, failover host of the elected roles | yes | rejected |
+| D. agents-3 archived as a burst reserve, its 8 agents moved to agents-1/2 | 139.24 (keeps 9.02) | high: agents-2 already saturated; all 41 agents on two VMs, three Nexlink reviewers among the movers | yes, power on again | owner decision (Q1), not recommended at today's load |
 | E. agents-3 deleted | 148.26 | as D, and no reserve | no | rejected |
 | F. agents-1/2 smaller | — | high (both under memory pressure) | — | rejected |
 | G. Move to POP2/PRO2 | negative (more expensive) | — | — | rejected |
+| H. BASIC2-A8C-32G (8 vCPU/32 GB, 100.59 €/month) | 38.65 per VM | arm64: a new platform (images, binaries, Playwright), not a resize | rebuild | out of scope (new VM) |
 
-**Why option C and not D.**
+**Why no resize, and why D is not recommended.**
 
-- C keeps the three hosts, the placements, the sessions and the elected
-  base. The only thing that changes is the ceiling of one host. Its memory
-  peak fits under the new ceiling; its CPU peak does not (next paragraph).
-- D saves twice as much, but it adds 6 agents to two hosts that have
-  already reached PSI mem above 96 %. The figure of 98.7 % of minutes that
-  fit on two VMs comes from spot readings, not from the per-turn peaks that
-  C4 will store. The Nexlink reviewer mty-nxl-rev-02 would share a VM with
-  the Nexlink orchestrator.
-- D becomes a safer decision once C4 has stored per-turn peaks, or if the
-  turn count keeps falling (§3.1). The owner can still take it earlier.
+- Neither C nor C' fits (§3.6). A host at 18 GB on 16 GB swaps or throttles
+  its turns, and three Nexlink reviewers run on agents-3.
+- D saves the most, but it adds eight agents to two hosts that have already
+  reached PSI mem above 96 %. The figure of 98.7 % of minutes that fit on
+  two VMs comes from spot readings, before claude1/2 moved. Nexlink
+  reviewers would share a VM with the Nexlink orchestrator.
+- D and a resize become sound once C4 has stored per-turn peaks and the
+  load falls. The daily turn count went from 3 120 on 30/10 to 1 237 on
+  04/11 (§3.1). C6 re-runs the sizing then. The owner can still take D
+  earlier (Q1).
 
 **Why each VM stays on.**
 
 - agents-1 and agents-2 carry the elected roles and their failover base. In
   the canon's terms they are the `baseline_hosts` = 2.
 - agents-3 is a burst host that carries work 58 % of the time, at night as
-  well. It goes down a size; it does not go off.
+  well, and since 05/11 three Nexlink reviewers. It is drained and powered
+  off by the repaired rule (C2–C5) when it is idle, and it stays on
+  otherwise.
 
-**The CPU under option C.** GP1-XS has 4 shared cores, and the observed
-peak does not fit under them. Over 7 days (9 611 minutes, 29/10 07:13 →
-05/11 07:12 UTC, a window one hour later than §3.2), agents-3 had
-`app_cpu` above 4 cores for **73 minutes (0.76 %)**, above 3.2 cores (80 %
-of 4) for 174 minutes, and a maximum of 6.07 cores. Its memory was above
-12.8 GB (80 % of 16) for 17 minutes. In those minutes turns slow down:
-CPU PSI rises, but no turn is killed. The host gate already holds back new
-turns under pressure. The cost is about one hour a week of slower turns
-for the 6 agents of agents-3, one of which is the Nexlink reviewer
-mty-nxl-rev-02. The rollback criterion of §6 watches exactly that. `max_agents` on agents-3 stays at 10.
-Per-agent memory caps (6 GB per agent) stay as they are, because the
-kernel is what enforces the ceiling of the host.
+**CPU on agents-3 against 4 cores (for C, and for any later resize).**
+Over 7 days (9 611 minutes, 29/10 07:13 → 05/11 07:12 UTC, a window one
+hour later than §3.2), agents-3 had `app_cpu` above 4 cores for 73 minutes
+(0.76 %), above 3.2 cores for 174 minutes, and a maximum of 6.07 cores,
+before claude1/2 arrived.
 
-# 6. How to apply the first target
+# 6. Runbook for an out-of-rule gesture (D, or a later resize)
 
 This is a runbook for bureau, the only one with the Scaleway rights.
 Agents hold no cloud rights. The owner's go is required because it is a
-change on billed infrastructure, even though it lowers the cost.
+change on billed infrastructure, even though it lowers the cost. It is
+written for agents-3. For D, step 4 stops after the power-off, and the
+agents are moved first, with `ameesh agent move` and a canon placement PR.
 
 1. **Window.** Avoid the 11:00 and 23:00 releases and any batch CI in
    progress. Tell the orchestrator, because mty-nxl-rev-02 reviews Nexlink.
@@ -313,20 +339,21 @@ change on billed infrastructure, even though it lowers the cost.
    and returning hosts). Without #5869, the reading gap of the power-off
    turns agents-3 `lost`. Its agents admitted elsewhere (impl-13, impl-18)
    would then be relocated, which loses their sessions, and reopening would
-   go through `ameesh host reconcile`, as on 05/11 for agents-1. C1
-   therefore runs after #5869 is delivered. Before that, it is possible
+   go through `ameesh host reconcile`, as on 05/11 for agents-1. The
+   gesture therefore runs after #5869 is delivered. Before that, it is possible
    only if the owner accepts this loss and reconciliation path.
-4. **Archive and resize.** `scw instance server stop <id> --wait`, then
-   `scw instance server update <id> commercial-type=GP1-XS`, then
-   `scw instance server start <id> --wait`. Record the timestamps of the
-   three steps: they are the first measurement of a wake-up.
+4. **Archive (D) or resize.** `scw instance server stop <id> --wait`
+   archives the host; D stops here. A resize goes on with
+   `scw instance server update <id> commercial-type=<type>`, then
+   `scw instance server start <id> --wait`. Record the timestamps of each
+   step: they are the first measurement of an archive and a wake-up.
 5. **Health before reopening.**
    - The host is healthy: its runners are alive, `ameesh doctor` is green,
      a mail is delivered and the readings are fresh (canon §14).
    - Release the hold, then `ameesh host undrain`, then reconcile.
 6. **Canon.**
-   - The agents-3 card gets the type, `tarif_eur_h: 0.09282` and the disk
-     and IP lines.
+   - The agents-3 card gets its new state (type and `tarif_eur_h`, or
+     archived) and the disk and IP lines.
    - agents-1 and agents-2 get `capacity: baseline`, which settles the
      baseline without relying on the guard.
    - This goes through a canon PR.
@@ -353,30 +380,30 @@ change on billed infrastructure, even though it lowers the cost.
   credentials.
 - **No power-off on spot averages.** The decision uses the idle state of
   #4147 (turns, leases, runs, mail, wakes), never one reading or the
-  average CPU. Sizing decisions (C1, D) use measured peaks: today the
+  average CPU. Sizing decisions (D, a resize) use measured peaks: today the
   per-minute maximum of `host_resources`, and the per-turn peaks once C4
   stores them.
 - **Wake-up delay before it is measured.** C5 starts with a default of
   15 minutes for the anticipation and the hysteresis. It replaces the
-  default with the delay measured by C1, or by its own first wake-up.
+  default with the delay measured at its own first wake-up.
 
 # 8. Proposed lots
 
 The pilot's note of 05/11 06:50 on the lot, agreed with bureau (#192699),
 says the rule of 28/10 needs no new decision. The lots that apply it, C2–C5,
-follow this study once reviewed, with no owner round trip. C1 is a different
-case: a resize is not in the rule, so it goes to the owner (Q1). Option D is
-also an owner decision.
+follow this study once reviewed, with no owner round trip. C1 (option D) is
+not in the rule, so it goes to the owner (Q1). No resize is proposed
+(§5).
 
 | Lot | Content | Class | Estimate |
 |---|---|---|---|
 | (#5869, exists, P1) | A drained or held host does not turn `lost` on a reading gap | sensitive | — |
-| **C1** | Runbook §6 run by bureau: agents-3 → GP1-XS, wake-up measured, canon cards (`capacity`, `tarif_eur_h`, disk and IP). Owner go | release-like gesture, bureau | 2 h |
+| C1 | Only on the owner's go for D (Q1): move the 8 agents of agents-3 to agents-1/2 (placement PR), then the runbook §6 run by bureau (archive, wake-up measured), canon cards | release-like gesture, bureau | 3 h |
 | C2 | Declared runs: a host card or mesh config can say `runs_interface: none`, so `runs = 0` counts as known. This unblocks `auto_drain_blocker` and `release_blocker` (§2) | sensitive (gate of release) | 0.5 d |
-| C3 | Cost per state: card fields for compute, disk and IP; `ameesh hosts` shows the on/off cost; `host_idle_reserved` and `baseline_oversized` are journaled as events, so they have a history | light | 0.5 d |
+| C3 | Cost per state: card fields for compute, disk and IP, and `capacity: baseline` on agents-1/2; `ameesh hosts` shows the on/off cost; `host_idle_reserved` and `baseline_oversized` are journaled as events, so they have a history | light | 0.5 d |
 | C4 | Sizing history: store the per-turn cgroup `memory.peak` and CPU in `turn_resources`; keep a daily per-host aggregate (p95/max memory, `app_cpu`, concurrency, PSI) for 90 days; one additive migration | sensitive (SQL) | 1 d |
 | C5 | Scaleway VM adapter on one host (§7): request in the database, systemd unit with the key, fresh reading before `busy`, hysteresis and anticipated wake-up, default wake-up delay until measured | sensitive (infra, credentials) | 1 d |
-| C6 | Optional, only if the owner asks for D with figures: re-read §3 with the per-turn peaks stored by C4 since its delivery | study | 2 h |
+| C6 | Sizing review on C4's per-turn peaks, CPU per runner included, once the daily turn count stays below the week of §3.1 for a week, or on the owner's request: resize or D, with figures | study | 2 h |
 
 **Order, with no wait on a duration.**
 
@@ -385,15 +412,26 @@ also an owner decision.
 2. **C5** follows as soon as C2 and #5869 are merged. The release path must
    reach `idle-drained`, and a powered-off host must not turn `lost`. C5
    does not wait for C4 or C6.
-3. **C1** needs the owner's go (Q1) and #5869 (§6, step 3). It is
-   independent of C2–C5.
-4. **C6** blocks nothing. It exists only to inform a later choice of D.
+3. **C1** exists only if the owner chooses D (Q1). It needs #5869 (§6,
+   step 3) and is independent of C2–C5.
+4. **C6** blocks nothing. It is triggered by measured load, not by a fixed
+   delay.
 
-# 9. Questions for the owner
+# 9. Questions
 
-- **Q1.** Go for C1 (agents-3 → GP1-XS, −71.48 €/month, 15–45 min of
-  unavailability for its 6 agents in a window set by bureau)? Or go
-  directly to D (−139.24 €/month, higher risk)?
+For the owner (only the target, its cost, its risk and its interruption,
+as the pilot asked):
+
+- **Q1.** Option D: archive agents-3 and move its 8 agents (three of them
+  Nexlink reviewers) to agents-1/2, for −139.24 €/month excl. VAT. The
+  risk is slower Nexlink turns on hosts that have already saturated their
+  memory, and the interruption is 15–45 min for those agents. This study
+  recommends **no** at today's load. The alternative is to apply the
+  existing rule now (C2–C5, a few €/month today) and let C6 re-run the
+  sizing when the load falls.
+
+For the operator (bureau), not for the owner:
+
 - **Q2.** Is bureau the one who runs the Scaleway gesture with the existing
   key, as for ci-autoscale? And for C5, which host holds the adapter key?
 - **Q3.** Can someone check one Scaleway invoice line: is the local SSD of
