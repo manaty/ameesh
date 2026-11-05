@@ -345,6 +345,7 @@ class ReadCapacityTest(unittest.TestCase):
                 mock.patch("ameesh.account_turn.turn_hold", return_value=""), \
                 mock.patch("ameesh.sous_utilisation.critical_verdict",
                            return_value=(False, False)), \
+                mock.patch("ameesh.host_lifecycle.closed_hosts", return_value={}), \
                 mock.patch("ameesh.sous_utilisation.latest_account_gauges", return_value={}):
             cap = debit.read_capacity(db, cfg=object(), now=T, hours=6, turns=[],
                                       canons=[], unreadable=unreadable)
@@ -378,6 +379,7 @@ class ReadCapacityTest(unittest.TestCase):
                 mock.patch("ameesh.sous_utilisation.waiting_project_lots", return_value=[]), \
                 mock.patch("ameesh.sous_utilisation.critical_verdict",
                            return_value=(False, False)), \
+                mock.patch("ameesh.host_lifecycle.closed_hosts", return_value={}), \
                 mock.patch("ameesh.sous_utilisation.latest_account_gauges", return_value={}):
             cap = debit.read_capacity(db, cfg=object(), now=T, hours=6, turns=[],
                                       canons=[], unreadable=[])
@@ -409,7 +411,8 @@ class ReadCapacityTest(unittest.TestCase):
                     mock.Mock(return_value=(False, False)),
                 "ameesh.sous_utilisation.latest_account_gauges": mock.Mock(return_value={}),
                 "ameesh.planned_waits.read": mock.Mock(return_value={}),
-                "ameesh.account_turn.turn_hold": mock.Mock(return_value="")}
+                "ameesh.account_turn.turn_hold": mock.Mock(return_value=""),
+                "ameesh.host_lifecycle.closed_hosts": mock.Mock(return_value={})}
         base.update(patches)
         with contextlib.ExitStack() as stack:
             for target, value in base.items():

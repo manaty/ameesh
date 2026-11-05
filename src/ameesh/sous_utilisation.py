@@ -1021,7 +1021,8 @@ def session_lot_busy(row: dict, *, waiting_free: bool = False) -> bool:
 
 
 def idle_agents(listing: list, now: float, idle_s: float, *,
-                waiting_free: bool = False, actionable_idle: bool = False) -> list:
+                waiting_free: bool = False, actionable_idle: bool = False,
+                closed_hosts=()) -> list:
     """Les agents réveillables au repos : mode `execute`, exécuteur vivant (pas
     une session attachée), au repos (ni en tour, ni en pause de budget, ni
     arrêtés). Partagé par `idle_capacity`, `backlog_empty` et la prise
@@ -1029,6 +1030,12 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
     consigne en attente et un lot de session qui l'occupe
     (`session_lot_busy`) occupent l'agent, comme pour la prise
     (`backlog._awaited`).
+
+    #5867 : `closed_hosts` (les hôtes de `host_lifecycle.closed_hosts`, un
+    ensemble d'hôtes ou leur dict de raisons) ne sont pas des agents au repos :
+    leur hôte ne peut pas ouvrir de tour (drainage, hôte perdu, porte fermée,
+    pause de l'owner), un lot qu'on leur confierait dormirait jusqu'à
+    l'undrain.
 
     #5694 : ce prédicat dit le repos et la disponibilité, pas la capacité de
     réveil : les alertes de capacité et le débit le croisent avec
@@ -1051,10 +1058,14 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
     le seul calcul du repos, pour que ces appelants l'héritent au lieu de la
     répéter chacun ; la réassignation manuelle reste possible, comme pour la
     désignation (#3411)."""
+    closed = {str(host) for host in (closed_hosts or ())}
     idle = []
     for row in listing:
         # #3480 : vivant ou expiré, un éphémère n'est pas une capacité.
         if row.get("ephemeral"):
+            continue
+        # #5867 : un hôte fermé n'ouvrira pas le tour de cet agent.
+        if row.get("host") in closed:
             continue
         # un agent `externe` n'est jamais compté — dont le chat du
         # propriétaire (L123), qui n'a ni exécuteur ni lot
@@ -1251,11 +1262,17 @@ def waiting_text(blocked: dict, limit: int = 6) -> str:
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
                   lots: list | None = None, designers=(), held=(), held_hosts=(),
-                  pressured: dict | None = None, cfg=None, canons=()) -> list:
+                  pressured: dict | None = None, cfg=None, canons=(),
+                  closed_hosts: dict | None = None) -> list:
     """#254 : `held`, les agents d'un hôte en pause, ni comptés ni à
     réveiller ; `held_hosts` (hôtes en pause) et `pressured` ({hôte:
     verdict} des hôtes sous pression, relevé frais) ne sont jamais proposés :
     leurs agents sont laissés de côté et nommés.
+
+    #5867 : `closed_hosts` ({hôte: raison}, `host_lifecycle.closed_hosts`) —
+    les agents d'un hôte qui ne peut pas ouvrir de tour (drainage, hôte perdu,
+    porte fermée, pause de l'owner) ne sont pas de la capacité disponible non
+    plus. `alerts` passe la lecture partagée ; sans elle, elle est faite ici.
 
     #1021 : `cfg` (l'hôte qui juge) — un agent encore `idle` dont les comptes
     viennent de franchir le seuil n'est pas proposé non plus : la pause n'est
@@ -1272,6 +1289,9 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         return []
     from . import canon as canon_mod
     from . import file_decoupage
+    if closed_hosts is None:
+        from . import host_lifecycle
+        closed_hosts = host_lifecycle.closed_hosts(db)
     try:
         # Même règle que `debit.capacity` et `host_lifecycle` : un canon
         # configuré mais illisible reste configuré (fail-safe critique).
@@ -1288,6 +1308,12 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     on_hold = sorted((row["name"], row.get("host")) for row in idle
                      if row.get("host") in held_hosts)
     idle = [row for row in idle if row.get("host") not in held_hosts]
+    # #5867 : la porte de l'hôte est fermée — l'agent ne prendra pas de tour,
+    # il n'est pas une capacité. Nommé, comme les autres exclusions.
+    gate_closed = sorted((row["name"], row.get("host"),
+                          closed_hosts.get(row.get("host")) or "")
+                         for row in idle if row.get("host") in closed_hosts)
+    idle = [row for row in idle if row.get("host") not in closed_hosts]
     spared = sorted((row["name"], row.get("host")) for row in idle
                     if row.get("host") in pressured)
     idle = [row for row in idle if row.get("host") not in pressured]
@@ -1366,6 +1392,11 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     if on_hold:
         parts.append("left out, their host on hold: %s" % ", ".join(
             "%s on %s" % pair for pair in on_hold))
+    if gate_closed:
+        parts.append("left out, their host cannot open a turn: %s" % ", ".join(
+            "%s on %s (%s)" % (name, host, reason) if reason else "%s on %s" % (name, host)
+            for name, host, reason in gate_closed[:8])
+            + (", …" if len(gate_closed) > 8 else ""))
     if budget_held:
         parts.append("left out, next turn held: %s" % ", ".join(
             "%s (%s)" % (name, reason) for name, reason in sorted(budget_held.items())))
@@ -1673,14 +1704,19 @@ def balance_low(db, listing: list, now: float, *,
 # --------------------------------------------------------------------------
 
 def backlog_empty(db, listing: list, now: float, *,
-                  idle_s: float = DEFAULT_IDLE_CAPACITY_S) -> list:
+                  idle_s: float = DEFAULT_IDLE_CAPACITY_S, closed_hosts=()) -> list:
     """`backlog_empty` : des agents réveillables sont au repos sans lot depuis
     plus de `idle_s` et la file d'amélioration n'a plus d'élément à prendre.
     ameesh ne doit s'arrêter que faute de travail : l'humain responsable est
-    invité à remplir la file (`ameesh work backlog add`)."""
+    invité à remplir la file (`ameesh work backlog add`).
+
+    #5867 : `closed_hosts` (`host_lifecycle.closed_hosts`) ne sont pas des
+    agents au repos — leur hôte n'ouvrira pas de tour, remplir la file ne leur
+    donnerait rien."""
     if idle_s <= 0:
         return []
-    idle = idle_agents(listing, now, idle_s, actionable_idle=True)
+    idle = idle_agents(listing, now, idle_s, actionable_idle=True,
+                       closed_hosts=closed_hosts)
     if not idle:
         return []
     # #1696 (N2 de #1242) : une file dont tous les éléments sont bloqués n'est
@@ -1747,9 +1783,19 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         pressured = pressured_hosts(verdicts, now)
     except Exception:
         verdicts, pressured = {}, {}
+    # #5867 : la porte des hôtes, lue une fois pour la capacité et la file
+    # vide, sur les relevés déjà pris (pas de seconde lecture de `current`).
+    from . import host_lifecycle
+    try:
+        closed_hosts = host_lifecycle.closed_hosts(
+            db, readings=([reading for reading, _verdict in verdicts.values()]
+                          if verdicts else None))
+    except Exception:  # noqa: BLE001 - une porte illisible ne coupe pas les alertes
+        closed_hosts = {}
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid,
                          designers=designers, held=held, held_hosts=held_hosts,
-                         pressured=pressured, cfg=cfg, canons=canons)
+                         pressured=pressured, cfg=cfg, canons=canons,
+                         closed_hosts=closed_hosts)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
                           idle_mail_s=idle_mail_s, canons=canons, verdicts=verdicts)
@@ -1760,7 +1806,8 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         held_hosts=held_hosts, orchestrators=orchestras)
     out += balance_low(db, listing, now, hours=balance_hours, min_usd=balance_min_usd,
                        window_s=balance_window_s, cfg=cfg)
-    out += backlog_empty(db, listing, now, idle_s=backlog_empty_s)
+    out += backlog_empty(db, listing, now, idle_s=backlog_empty_s,
+                         closed_hosts=closed_hosts)
     # #3256 A : la feuille de route notée épuisée sur un lot de découpage
     from . import file_decoupage
     out += file_decoupage.exhausted_alerts(db, listing)

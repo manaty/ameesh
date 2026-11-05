@@ -169,17 +169,26 @@ class Measure:
                 "share": round(self.share(), 3)}
 
 
-def wakeable(listing: list, canons, *, configured: bool) -> list:
+def wakeable(listing: list, canons, *, configured: bool, closed_hosts=()) -> list:
     """§1 : les agents d'exécution réveillables — mode `execute`, ni
     éphémères, ni arrêtés, ni en pause (budget ou opérateur), ni chat de
     l'owner, ni critiques ou relecteurs (rôles critiques du canon ; un
     verdict inconnu vaut critique, `critical_verdict`). Un agent retiré
     (`retired_ts` : le retrait laisse statut, mode et bail) ou sans exécuteur
-    vivant n'est pas une capacité : il diluerait la part au repos."""
+    vivant n'est pas une capacité : il diluerait la part au repos.
+
+    #5867 : `closed_hosts` (`host_lifecycle.closed_hosts`) ne sont pas des
+    agents réveillables — leur hôte n'ouvrira pas de tour (drainage, hôte
+    perdu, porte fermée, pause de l'owner). Les compter diluerait la part au
+    repos et le découpage (#5122) créerait des lots pour une capacité absente.
+    """
     from .chat import is_chat_agent
+    closed = {str(host) for host in (closed_hosts or ())}
     out = []
     for row in listing:
         if row.get("ephemeral") or is_chat_agent(row) or row.get("retired_ts"):
+            continue
+        if row.get("host") in closed:
             continue
         if not su._awake_runner(row):
             continue
@@ -195,20 +204,26 @@ def wakeable(listing: list, canons, *, configured: bool) -> list:
 
 
 def measure(listing: list, lots: list, waits: dict, now: float, canons, *,
-            configured: bool, footprint: dict | None = None) -> dict:
+            configured: bool, footprint: dict | None = None,
+            closed_hosts=()) -> dict:
     """`{projet: Measure}` pour chaque projet d'au moins un agent réveillable.
 
     Au repos : `idle_agents` (sans lot actionnable, #1677). Démarrable : un
     lot ouvert sans assigné ni exécutant externe, hors file d'amélioration,
     qu'aucune attente planifiée ne retient et que la garde d'empreinte
     n'occupe pas (`split_startable`, #3185/#4699) ; `footprint` est la
-    lecture partagée `sous_utilisation.footprint_blockers` (#4717)."""
+    lecture partagée `sous_utilisation.footprint_blockers` (#4717).
+
+    #5867 : `closed_hosts` (`host_lifecycle.closed_hosts`) sortent de la
+    capacité — un hôte en drainage ne réveillera personne."""
     from . import projects as projects_mod
-    pool = wakeable(listing, canons, configured=configured)
+    pool = wakeable(listing, canons, configured=configured,
+                    closed_hosts=closed_hosts)
     names = {row["name"] for row in pool}
-    idle = {row["name"] for row in su.idle_agents(listing, now, 0.0, waiting_free=True,
-                                                  actionable_idle=True)
-            if row["name"] in names}
+    idle = {row["name"] for row in su.idle_agents(
+        listing, now, 0.0, waiting_free=True, actionable_idle=True,
+        closed_hosts=closed_hosts)
+        if row["name"] in names}
     startable, _blocked = su.split_startable(su.waiting_project_lots(lots), waits,
                                              footprint)
     out: dict = {}
@@ -1112,6 +1127,14 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     configured = bool(canons) or cfg is not None
     st = storage.of(db)
     listing = st.operations.listing() if listing is None else listing
+    # #5867 : les agents d'un hôte qui ne peut pas ouvrir de tour (drainage,
+    # hôte perdu, porte fermée, pause de l'owner) ne sont pas une capacité :
+    # les compter ferait créer des lots de découpage pour personne.
+    from . import host_lifecycle
+    try:
+        closed_hosts = host_lifecycle.closed_hosts(db)
+    except Exception:  # noqa: BLE001 - une porte illisible ne coupe pas la passe
+        closed_hosts = {}
     lots = st.operations.open_lots_activity(None)
     waits = planned_waits.read(db, lots, now=now) if lots else {}
     # #4717 : le déclencheur de découpage applique la même garde d'empreinte
@@ -1121,7 +1144,7 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     footprint = (su.footprint_blockers(db, su.waiting_project_lots(lots), lots)
                  if lots else {})
     measures = measure(listing, lots, waits, now, canons, configured=configured,
-                       footprint=footprint)
+                       footprint=footprint, closed_hosts=closed_hosts)
     due, since = held(measures, state.get(STATE_KEY) or {}, now,
                       settings.repos_part, settings.repos_s)
     state[STATE_KEY] = since

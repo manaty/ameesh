@@ -2547,6 +2547,7 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
     (agents, lots ouverts, démarrables, notes, tenues de budget, historique),
     la mesure est rendue mais aucune alerte n'est levée (`gating_ok` faux)."""
     from . import file_decoupage
+    from . import host_lifecycle
     from . import mechanics
     from . import storage
     from . import sous_utilisation
@@ -2622,6 +2623,14 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
         [row for row in listing if not row.get("retired_ts")], now, 0.0,
         waiting_free=True, actionable_idle=True)
     held = attempt("budget holds", lambda: budget_holds(idle), {})
+    # #5867 : un agent dont l'hôte ne peut pas ouvrir de tour (drainage, hôte
+    # perdu, porte fermée, pause de l'owner) n'est pas une capacité disponible
+    # — il ne compte ni dans la part au repos ni dans les heures perdues.
+    closed = attempt("host gates", lambda: host_lifecycle.closed_hosts(db), {})
+    for row in listing:
+        reason = closed.get(row.get("host") or "")
+        if reason:
+            held.setdefault(row["name"], reason)
     notes = attempt("roadmap notes", lambda: _rows(db, _ROADMAP_SQL, (horizon,)), [])
     losses = attempt("account gauges", lambda: plan_losses(
         sous_utilisation.latest_account_gauges(db, now), now), [], gating=False)

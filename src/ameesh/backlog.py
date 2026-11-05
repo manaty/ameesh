@@ -1606,9 +1606,14 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     alerts = alerts or []
     blocked = _blocked_hosts(alerts)
     # #254 : un hôte en pause ne prend pas de travail, ni ses agents
-    from . import host_holds
+    from . import host_holds, host_lifecycle
     holds = host_holds.live(db)
     blocked |= set(holds)
+    # #5867 : un hôte qui ne peut pas ouvrir de tour (drainage, hôte perdu,
+    # porte fermée, pause de l'owner) n'est pas un hôte preneur : le lot
+    # dormirait jusqu'à l'undrain. Même lecture que l'élection (`ameesh role
+    # status` : « host gate closed (draining) »).
+    blocked |= set(host_lifecycle.closed_hosts(db, holds=list(holds.values())))
     held = host_holds.held_agents(listing, holds)
     balance_low = any(a.get("type") == "balance_low" for a in alerts)
     if paid is None:
