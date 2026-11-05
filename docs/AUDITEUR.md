@@ -17,7 +17,8 @@ qu'il ne fait jamais, et comment il en rend compte.
 
 ## Ce qui le réveille
 
-* le courrier « Passage horaire » d'`ameesh`, chaque heure : passage court ;
+* le courrier « Passage court (chaque heure) » d'`ameesh`, chaque heure à :15 :
+  passage court ;
 * le courrier « Alerte urgente : … » d'`ameesh` : passage court, centré sur
   l'alerte ;
 * le courrier « Analyse profonde » d'`ameesh`, chaque nuit, ou une demande du
@@ -1120,21 +1121,16 @@ Depuis #5699, la relance au repos n'ouvre un tour que si une correction est
 due, un avis est dû ou un lot actionnable attend ; tout vide, l'exécuteur
 poste `available: nothing due` et attend, sans tour de modèle. Les passages
 ci-dessous restent donc les seuls tours périodiques de l'auditeur.
-Le passage horaire (`ameesh-auditeur-heure.service` et `.timer`) :
+Le passage court (`ameesh-auditeur-court.service` et `.timer`) n'est plus posé
+à la main (#5863) : `ameesh role timers --role auditeur --install`, lancé par
+le staging (`vm.sh`, `poste.sh`), l'écrit sur chaque hôte candidat du rôle
+`auditeur`, chaque heure à :15, sous `role run auditeur` : seul le détenteur
+du bail envoie le courrier, et la relève emporte la minuterie avec le bail.
+`--check` signale une copie qui diverge (par exemple l'ancienne cadence de
+3 h, `00/3:15`, posée à la main le 24/10). Le service envoie :
 
 ```ini
-# ameesh-auditeur-heure.service
-[Service]
-Type=oneshot
-EnvironmentFile=-%h/.config/ameesh/env
-ExecStart=%h/.local/bin/agent-mail send auditeur "Passage horaire (consigne : ameesh/docs/AUDITEUR.md, à jour)" --from ameesh
-
-# ameesh-auditeur-heure.timer
-[Timer]
-OnCalendar=hourly
-Persistent=true
-[Install]
-WantedBy=timers.target
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run auditeur -- %h/.local/share/ameesh/venv/bin/agent-mail send auditeur "Passage court (chaque heure). Consigne : ameesh/docs/AUDITEUR.md, à jour." --from ameesh
 ```
 
 L'analyse de la nuit (`ameesh-auditeur-nuit.service` et `.timer`), sur le même
@@ -1173,13 +1169,14 @@ nouvelles=$(comm -13 "$vu" "$vu.neuf"); mv "$vu.neuf" "$vu"
 exit 0
 ```
 
-Le « Passage horaire », lui, peut attendre la fenêtre de regroupement du
-courrier (90 s par défaut, L125).
+Le « Passage court (chaque heure) », lui, peut attendre la fenêtre de
+regroupement du courrier (90 s par défaut, L125).
 
 Puis :
 
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now ameesh-runner-agent@auditeur \
-  ameesh-auditeur-heure.timer ameesh-auditeur-nuit.timer ameesh-auditeur-urgent.timer
+  ameesh-auditeur-nuit.timer ameesh-auditeur-urgent.timer
+ameesh role timers --role auditeur --install   # passage court (#5863)
 ```
