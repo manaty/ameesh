@@ -22,23 +22,34 @@ RUNS_UNDECLARED = 'aucune interface de déclaration'
 #: a Host card whose `runs_interface` did not parse keeps this value, so it
 #: still contradicts any other card of the host instead of vanishing
 RUNS_INVALID = 'invalid'
+#: a lending host (`policy.lend`, L159b) whatever its card says: guest jobs
+#: offloaded from other hosts run there, and no interface counts them yet
+RUNS_LENDING = 'lending'
 
 
 def runs_interface(cfg, canons, host):
     """(interface, origin) declared for `host`, or (None, None).
 
-    The per-host configuration wins over the Host card. Two Host cards that
-    disagree declare nothing, nor does a card with an invalid value
-    (`RUNS_INVALID`), even beside a valid one: a run count is never chosen by
-    canon order."""
-    per_host = getattr(cfg, 'runs_interfaces', None) or {}
-    if isinstance(per_host, dict) and per_host.get(host) in RUNS_INTERFACES:
-        return per_host[host], 'configuration'
+    `RUNS_LENDING` is returned as such, so that the projection names why the
+    runs of a lending host stay unknown; it never counts as a declaration.
+
+    A Host card that cannot declare (`RUNS_INVALID`, or `RUNS_LENDING` on a
+    lending host) refuses first, even against the configuration and beside
+    a valid card. Then the per-host configuration wins over the Host card.
+    Two Host cards that disagree declare nothing: a run count is never
+    chosen by canon order."""
     values = {getattr(getattr(card, 'policy', None), 'runs_interface', None)
               for canon in canons or () for card in getattr(canon, 'hosts', ()) or ()
               if getattr(card, 'title', None) == host}
     values.discard(None)
-    if len(values) == 1 and next(iter(values)) in RUNS_INTERFACES:
+    if RUNS_LENDING in values:
+        return RUNS_LENDING, 'Host card'
+    if any(value not in RUNS_INTERFACES for value in values):
+        return None, None
+    per_host = getattr(cfg, 'runs_interfaces', None) or {}
+    if isinstance(per_host, dict) and per_host.get(host) in RUNS_INTERFACES:
+        return per_host[host], 'configuration'
+    if len(values) == 1:
         return next(iter(values)), 'Host card'
     return None, None
 
@@ -52,8 +63,12 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
     without it the run count stays the undeclared placeholder."""
     out = resources.footprint(reading)
     interface, origin = runs_declared or (None, None)
-    source = (RUNS_UNDECLARED if interface not in RUNS_INTERFACES
-              else 'runs_interface: %s (%s)' % (interface, origin))
+    if interface in RUNS_INTERFACES:
+        source = 'runs_interface: %s (%s)' % (interface, origin)
+    elif interface == RUNS_LENDING:
+        source = RUNS_UNDECLARED + ' (hôte prêteur : travaux déportés non comptés)'
+    else:
+        source = RUNS_UNDECLARED
     out.update(active_turns=None, leases=None, runs=0,
                runs_source=source, state='busy',
                idle_since=None, capacity=capacity, cost_eur_h=cost_eur_h,

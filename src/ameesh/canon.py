@@ -1138,9 +1138,9 @@ class HostPolicy:
     lifecycle_hook: str | None = None
     #: #5905 (C2 of #5900): how the host declares its runs (work that outlives
     #: a turn or a lease). `none` = the host runs nothing outside its turns
-    #: and leases, so `runs = 0` is a known count; None = undeclared and
-    #: `invalid` = unreadable value: the release stays refused
-    #: (`host_release_no_runs`).
+    #: and leases, so `runs = 0` is a known count; None = undeclared,
+    #: `invalid` = unreadable value and `lending` = a lending host whose guest
+    #: jobs nothing counts yet: the release stays refused (`host_release_no_runs`).
     runs_interface: str | None = None
     #: #5601 : places de `max_agents` réservées aux agents d'un projet ou à une
     #: classe de priorité (`{"project:<p>": n, "class:<n>": n}`, `ameesh.slot_reservations`) ;
@@ -4251,6 +4251,17 @@ class _Loader:
                              "`policy.lend.%s`: unknown key (ignored)" % key,
                              **where, **subject)
                 policy.lend = offer
+                # #5905: a lending host runs guest jobs offloaded from other
+                # hosts, outside its own turns and leases. No interface counts
+                # them yet (C5): its runs stay unknown, and `none` there would
+                # turn a missing observation into a proven zero.
+                from .host_idle import RUNS_LENDING
+                if policy.runs_interface == "none":
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.runs_interface: none` on a lending host "
+                             "(`policy.lend`): its offloaded guest jobs are runs "
+                             "that no interface counts yet", **where, **subject)
+                policy.runs_interface = RUNS_LENDING
             # L101 : espace de travail et ménage, forme canonique
             # `policy.workspaces` ; les anciennes clés restent lues en alias.
             self._host_workspaces(raw, policy, where, subject)

@@ -48,6 +48,19 @@ class DeclarationTest(unittest.TestCase):
                 json.dump({"runs_interfaces": value}, fh)
             return config.load({"AMEESH_CONFIG": path}, register_credentials=False)
 
+    def test_a_lending_or_invalid_card_wins_over_the_configuration(self):
+        # bureau #192975: a lending host (L159b) receives offloaded guest
+        # jobs; no configuration `none` may turn them into a proven zero
+        cfg = config.Config(runs_interfaces={"vm": "none"})
+        self.assertEqual(host_idle.runs_interface(
+            cfg, [canon_of(host_idle.RUNS_LENDING)], "vm"),
+            (host_idle.RUNS_LENDING, "Host card"))
+        self.assertEqual(host_idle.runs_interface(
+            cfg, [canon_of("none", host_idle.RUNS_LENDING)], "vm"),
+            (host_idle.RUNS_LENDING, "Host card"))
+        self.assertEqual(host_idle.runs_interface(
+            cfg, [canon_of(host_idle.RUNS_INVALID)], "vm"), (None, None))
+
     def test_configuration_refuses_an_unknown_interface(self):
         for value in ({"vm": "journal"}, {"vm": None}, ["vm"]):
             with self.subTest(value=value), self.assertRaises(SystemExit):
@@ -90,8 +103,18 @@ class ProjectionTest(unittest.TestCase):
         self.assertIn('runs 0 (runs_interface: none (Host card))', host_idle.line(out))
         self.assertEqual(blockers(out), (None, None))
 
+    def test_lending_host_names_its_uncounted_guest_jobs(self):
+        out = project(runs_declared=(host_idle.RUNS_LENDING, "Host card"))
+        known, _runs, source = host_release.runs_evidence(out)
+        self.assertFalse(known)
+        self.assertIn("travaux déportés non comptés", source)
+        drain, release = blockers(out)
+        self.assertIn("travaux déportés", drain)
+        self.assertTrue(release.startswith("declared runs unknown"), release)
+
     def test_undeclared_keeps_the_named_refusal(self):
-        for declared in (None, (None, None), ("journal", "Host card")):
+        for declared in (None, (None, None), ("journal", "Host card"),
+                         (host_idle.RUNS_INVALID, "Host card")):
             with self.subTest(declared=declared):
                 out = project(runs_declared=declared)
                 drain, release = blockers(out)
@@ -115,6 +138,29 @@ class CardTest(_Canons, unittest.TestCase):
 
     def test_an_unknown_interface_is_an_error_kept_invalid(self):
         self.assertEqual(self.load("journal"), (host_idle.RUNS_INVALID, True))
+
+    def lending(self, value: str | None, name: str):
+        extra = ("  runs_interface: %s\n" % value) if value else ""
+        text = host("bob", harnesses=("codex",), resources_yaml=extra +
+                    "  lend:\n    cpu_max: 2\n    memory_max: 9GiB\n"
+                    "    disk_max: 40GiB\n")
+        return canon_mod.load(self.acme(name=name, host_text=text), default=False)
+
+    def test_a_lending_card_never_declares_none(self):
+        for value, error in ((None, False), ("none", True)):
+            with self.subTest(value=value):
+                loaded = self.lending(value, "l%s" % bool(value))
+                self.assertIsNotNone(loaded.host(CARD_HOST).policy.lend)
+                self.assertEqual(loaded.host(CARD_HOST).policy.runs_interface,
+                                 host_idle.RUNS_LENDING)
+                self.assertEqual(any("lending host" in f.message
+                                     for f in canon_mod.validate(loaded)), error)
+                cfg = config.Config(runs_interfaces={CARD_HOST: "none"})
+                declared = host_idle.runs_interface(cfg, [loaded], CARD_HOST)
+                out = project(runs_declared=declared)
+                drain, release = blockers(out)
+                self.assertTrue(drain.startswith("declared runs unknown"), drain)
+                self.assertTrue(release.startswith("declared runs unknown"), release)
 
     def test_a_valid_card_beside_an_invalid_one_keeps_both_gates_closed(self):
         # cx3's B on 2f8523f13cbf: two canons really loaded, one `none`, the
