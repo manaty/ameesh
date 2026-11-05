@@ -557,6 +557,8 @@ class HandoffTest(PgTestCase):
     def lose_source(self):
         self.db.execute("INSERT INTO host_lifecycle(host,mode,actor) VALUES ('source','lost','test') "
                         "ON CONFLICT(host) DO UPDATE SET mode='lost'")
+        # setUp does not truncate host_lifecycle: never leak a lost source into later tests.
+        self.addCleanup(self.db.execute, "DELETE FROM host_lifecycle WHERE host='source'")
 
     def test_5864_lost_source_cancels_expired_unused_plan_without_host_effect(self):
         # Real case (#5869): source in lost mode, stale planned handoff blocks its reconcile.
