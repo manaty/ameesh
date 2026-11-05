@@ -521,6 +521,32 @@ class FollowTest(Base):
         self.assertIn("en cours", ph.tick(self.ctx))
         self.assertFalse(self.shell.ran("work", "add"))
 
+    def test_porteur_cree_non_tente_relance_au_tic_suivant(self):
+        # B1 auditeur : un arrêt entre la création et `attempt` ne laisse pas
+        # le porteur « sans gel ni tentative » réserver la cible pour toujours.
+        item = carrier(sha="", created=NOW - 600)
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        ph.tick(self.ctx)
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)]
+        self.assertTrue(auto, "aucune composition relancée")
+        marks = ph.marks(self.shell.items[4000])
+        self.assertTrue(any(mark.startswith(ph.MARK_ATTEMPT + "composition")
+                            for mark in marks), marks)
+
+    def test_porteur_avec_une_ancienne_tentative_et_sans_gel_relance(self):
+        # `pending` ne rend rien quand une tentative a un `base` non vide et
+        # que le porteur n'a plus de gel : `follow` doit lancer la composition.
+        item = carrier(sha="", created=NOW - 600,
+                       notes=("paquet-horaire: tentative composition n=1 base=%s "
+                              "par=hote:1" % HEAD,))
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        out = ph.tick(self.ctx)
+        self.assertNotIn("sans gel ni tentative", out)
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)]
+        self.assertTrue(auto, "aucune composition relancée")
+
     def test_ci_en_cours_rien(self):
         self.open_carrier()
         self.shell.ci[4000] = {"runs": [dict(red_run(), status="running")]}

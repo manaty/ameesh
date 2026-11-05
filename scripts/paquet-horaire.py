@@ -1666,7 +1666,15 @@ def follow(ctx: Context, item: dict) -> str:
     if left is not None:
         return resume(ctx, item, left)
     if not sha:
-        return "#%d sans gel ni tentative : rien à faire" % carrier
+        # #5941 (B1 auditeur) : un porteur ouvert sans gel ni tentative
+        # (arrêt entre la création et `attempt`) ne doit pas réserver la cible
+        # pour toujours. Aucune composition n'est en cours (contrôle plus
+        # haut) ; on lance celle du groupe que le corps/la note du porteur
+        # nomme, comme le ferait une tentative 0 reprise.
+        if not name:
+            return "#%d sans gel ni tentative : rien à faire" % carrier
+        return attempt(ctx, carrier, name,
+                       Attempt(COMPOSITION, 1, "", only=carrier_group(item)))
     # #4319: an unavailable exemption proof requests the ordinary full-CI
     # path, on the same carrier. The marker is scoped to its frozen head.
     requested = any(
