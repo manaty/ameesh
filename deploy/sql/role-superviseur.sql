@@ -407,9 +407,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'return_requested_at', 'return_requested_by', 'release_error_state',
         'release_error_at', 'release_error_since', 'hook_attempt_at',
         'hook_attempt_state', 'hook_attempt_generation', 'hook_attempt_epoch',
-        -- #5932 : asynchronous adapter wait (state and first instant); the
-        -- worker and the stall alert keep claims closed, nothing secret here.
-        'hook_wait_at', 'hook_wait_state'
+        -- #5932 : asynchronous adapter wait (state, first instant and the
+        -- generation/epoch fence that bounds it); the worker and the stall
+        -- alert keep claims closed, nothing secret here.
+        'hook_wait_at', 'hook_wait_state', 'hook_wait_generation', 'hook_wait_epoch'
     ]),
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'

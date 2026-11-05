@@ -35,7 +35,7 @@ _ROW = ("host, mode, generation, actor, "
         "extract(epoch from hook_attempt_at)::float8 AS hook_attempt_ts, "
         "hook_attempt_state, hook_attempt_generation, hook_attempt_epoch, "
         "extract(epoch from hook_wait_at)::float8 AS hook_wait_ts, "
-        "hook_wait_state, "
+        "hook_wait_state, hook_wait_generation, hook_wait_epoch, "
         "extract(epoch from updated_at)::float8 AS updated_ts")
 
 #: #4148: states an adapter can acknowledge, in the strict order of the spec.
@@ -99,12 +99,17 @@ class HostLifecycle(interface.HostLifecycle):
             # stops publishing on purpose. It is idle-drained, not lost; a
             # hook still in flight for that state says the same. #5932: an
             # asynchronous idle-drained wait (queued VM stop) is the same
-            # intentional unavailability while the worker archives the VM.
+            # intentional unavailability while the worker archives the VM,
+            # but only for the wave that queued it: an N-1 writer moves the
+            # generation/epoch without knowing hook_wait_*, so a wait whose
+            # fence no longer matches must not mask a real loss (#5690).
             "   AND NOT EXISTS (SELECT 1 FROM host_lifecycle c"
             "                    WHERE c.host = h.host"
             "                      AND (c.release_state = 'idle-drained'"
             "                           OR c.hook_attempt_state = 'idle-drained'"
-            "                           OR c.hook_wait_state = 'idle-drained'))"
+            "                           OR (c.hook_wait_state = 'idle-drained'"
+            "                               AND c.hook_wait_generation = c.generation"
+            "                               AND c.hook_wait_epoch = c.release_epoch)))"
             # #4148 B1: a released host woken by `busy` is booting; stale
             # readings are expected until the first post-ack reading.
             "   AND NOT EXISTS (SELECT 1 FROM host_lifecycle c"
@@ -172,6 +177,7 @@ class HostLifecycle(interface.HostLifecycle):
                                    "release_epoch=release_epoch+1,"
                                    # #5932: a loss ends any adapter wait.
                                    "hook_wait_at=NULL,hook_wait_state=NULL,"
+                                   "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                                    "updated_at=clock_timestamp() WHERE host=%s RETURNING " + _ROW,
                                    (actor, host))[0]
                 else:
@@ -181,6 +187,7 @@ class HostLifecycle(interface.HostLifecycle):
                         "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
                         "return_at=NULL,release_epoch=host_lifecycle.release_epoch+1,"
                         "hook_wait_at=NULL,hook_wait_state=NULL,"
+                        "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                         "updated_at=clock_timestamp() RETURNING " + _ROW,
                         (host, actor))[0]
                 for agent in agents:
@@ -245,7 +252,8 @@ class HostLifecycle(interface.HostLifecycle):
                 # #5932: a wait belongs to the wave that queued it. A new
                 # generation/epoch supersedes it; unlike an in-flight attempt,
                 # a wait has no external call left to protect.
-                "hook_wait_at=NULL,hook_wait_state=NULL, "
+                "hook_wait_at=NULL,hook_wait_state=NULL,"
+                "hook_wait_generation=NULL,hook_wait_epoch=NULL, "
                 # #4148: NEVER clear an in-flight adapter attempt here. A new
                 # drain from `returning` can start while an idle-drained hook
                 # of the previous wave is still running; erasing its marker
@@ -288,7 +296,8 @@ class HostLifecycle(interface.HostLifecycle):
                 "release_epoch=release_epoch+1, claims_open=%s, "
                 "return_requested_at=NULL,return_requested_by=NULL, "
                 # #5932: the return supersedes any adapter wait of the old wave.
-                "hook_wait_at=NULL,hook_wait_state=NULL, "
+                "hook_wait_at=NULL,hook_wait_state=NULL,"
+                "hook_wait_generation=NULL,hook_wait_epoch=NULL, "
                 # the release state follows the opened gate; a closed return
                 # keeps saying `draining` until the busy hook answers.
                 "release_state=CASE WHEN %s THEN 'busy' ELSE release_state END, "
@@ -353,7 +362,8 @@ class HostLifecycle(interface.HostLifecycle):
                     # the epoch invalidates any transition decided before.
                     "release_epoch=release_epoch+1, "
                     # #5932: the scheduled return supersedes any adapter wait.
-                    "hook_wait_at=NULL,hook_wait_state=NULL, "
+                    "hook_wait_at=NULL,hook_wait_state=NULL,"
+                    "hook_wait_generation=NULL,hook_wait_epoch=NULL, "
                     "claims_open=CASE WHEN %s THEN true ELSE claims_open END, "
                     "release_state=CASE WHEN %s THEN 'busy' ELSE release_state END, "
                     "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
@@ -414,6 +424,10 @@ class HostLifecycle(interface.HostLifecycle):
             "                  THEN c.hook_wait_at END, "
             "hook_wait_state=CASE WHEN c.hook_wait_state IS NOT DISTINCT FROM %s "
             "                     THEN c.hook_wait_state END, "
+            "hook_wait_generation=CASE WHEN c.hook_wait_state IS NOT DISTINCT FROM %s "
+            "                          THEN c.hook_wait_generation END, "
+            "hook_wait_epoch=CASE WHEN c.hook_wait_state IS NOT DISTINCT FROM %s "
+            "                     THEN c.hook_wait_epoch END, "
             "updated_at=clock_timestamp() "
             "WHERE c.host=%s AND c.generation=%s AND c.release_epoch=%s "
             # #5925: the operator owns a durable asynchronous stop intent.
@@ -445,7 +459,8 @@ class HostLifecycle(interface.HostLifecycle):
             "     OR (%s='idle-drained' AND c.mode='draining' AND NOT c.claims_open "
             "         AND c.release_state='draining' AND c.hook_state='draining')) "
             "RETURNING " + _ROW,
-            (state, state, state, host, generation, release_epoch, state, state, state,
+            (state, state, state, state, state, host, generation, release_epoch,
+             state, state, state,
              stale_after, state, retry_after, state, retry_after,
              state, state, state))
         return rows[0] if rows else None
@@ -502,6 +517,7 @@ class HostLifecycle(interface.HostLifecycle):
                     "hook_attempt_epoch=NULL,"
                     # #5932: a new decision ends the wait it superseded.
                     "hook_wait_at=NULL,hook_wait_state=NULL,"
+                    "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                     "updated_at=clock_timestamp() "
                     "WHERE host=%s AND hook_attempt_generation=%s "
                     "AND hook_attempt_epoch=%s AND hook_attempt_state=%s",
@@ -516,6 +532,7 @@ class HostLifecycle(interface.HostLifecycle):
                     # #5932: a real failure replaces any earlier wait; the
                     # dedicated stalled-worker alert must not double up.
                     "hook_wait_at=NULL,hook_wait_state=NULL,"
+                    "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                     "release_error=%s,release_error_state=%s,"
                     "release_error_at=clock_timestamp(),"
                     "release_error_since=coalesce(release_error_since,clock_timestamp()),"
@@ -540,6 +557,7 @@ class HostLifecycle(interface.HostLifecycle):
                     "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
                     "hook_attempt_epoch=NULL,"
                     "hook_wait_at=NULL,hook_wait_state=NULL,"
+                    "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                     "release_error=NULL,release_error_state=NULL,release_error_at=NULL,"
                     "release_error_since=NULL,"
                     "release_state=CASE WHEN %s='busy' THEN 'busy' "
@@ -593,11 +611,16 @@ class HostLifecycle(interface.HostLifecycle):
                 "                  THEN coalesce(hook_wait_at,clock_timestamp()) "
                 "                  ELSE clock_timestamp() END,"
                 "hook_wait_state=%s,"
+                # The wait is fenced to the wave that queued it: a reader must
+                # not trust it once an N-1 writer (or a newer decision) has
+                # moved the generation or the release epoch.
+                "hook_wait_generation=%s,hook_wait_epoch=%s,"
                 "release_error=NULL,release_error_state=NULL,"
                 "release_error_at=NULL,release_error_since=NULL,"
                 "updated_at=clock_timestamp() "
                 "WHERE host=%s AND generation=%s AND release_epoch=%s",
-                (state, state, host, generation, release_epoch))
+                (state, state, generation, release_epoch, host, generation,
+                 release_epoch))
             if first:
                 tx.execute(
                     "INSERT INTO ameesh_events(type,object,project,data) "
@@ -625,6 +648,7 @@ class HostLifecycle(interface.HostLifecycle):
             "return_requested_at=NULL,return_requested_by=NULL,"
             # #5932: reopening ends any adapter wait of the closed gate.
             "hook_wait_at=NULL,hook_wait_state=NULL,"
+            "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
             "updated_at=clock_timestamp() "
             "WHERE host=%s AND generation=%s AND (NOT %s OR hook_state='busy') "
             "AND (%s::bigint IS NULL OR release_epoch=%s) "
@@ -682,6 +706,7 @@ class HostLifecycle(interface.HostLifecycle):
                 "return_requested_at=NULL,return_requested_by=NULL,"
                 # #5932: the return ends the wait of the closed gate.
                 "hook_wait_at=NULL,hook_wait_state=NULL,"
+                "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                 "release_epoch=c.release_epoch+1,updated_at=clock_timestamp() "
                 "WHERE c.host=%s AND c.generation=%s AND c.release_epoch=%s "
                 "AND c.mode IN ('draining','returning') "

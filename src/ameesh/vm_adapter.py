@@ -212,6 +212,26 @@ def current(control, request):
                 and control['release_epoch'] == request['release_epoch'])
 
 
+def settle_obsolete(db, host):
+    """Settle the queued requests the live control no longer owns (#5932).
+
+    A return can reopen the gate before the worker reads the request it
+    superseded. Left pending, that row would keep the stall alert alive
+    forever while the VM serves again (auditeur B1). The single UPDATE is
+    fenced on the request's own generation/epoch and on the live control:
+    a request of the current closed wave is never touched, and a concurrent
+    new drain cannot be caught (its request carries the newer epoch)."""
+    db.execute(
+        "UPDATE vm_adapter_requests v SET status='obsolete',"
+        "result='superseded before the worker read it',"
+        "updated_at=clock_timestamp() "
+        "WHERE v.host=%s AND v.status='pending' AND NOT EXISTS ("
+        " SELECT 1 FROM host_lifecycle c WHERE c.host=v.host"
+        " AND c.generation=v.generation AND c.release_epoch=v.release_epoch"
+        " AND c.mode IN ('draining','returning') AND NOT c.claims_open)",
+        (host,))
+
+
 def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop_evidence):
     """One bounded operator tick; never opens native claims itself."""
     target = policy['targets'][host]
@@ -219,6 +239,7 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
     controls = {c['host']: c for c in store.host_lifecycle.listing()}
     control = controls.get(host)
     if not control or control['mode'] not in ('draining', 'returning') or control['claims_open']:
+        settle_obsolete(db, host)
         return 'inactive'
     # Operator reconciliation may itself need the native gate. Run probes
     # outside our transaction, then revalidate generation, provider and fresh
@@ -241,6 +262,9 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             return 'worker busy'
         control = q.lock(host)
         if not control or control['claims_open'] or control['mode'] not in ('draining', 'returning'):
+            # The gate opened while we were waiting for the lock: settle the
+            # request this return superseded instead of leaving it pending.
+            settle_obsolete(tx, host)
             return 'inactive'
         now = q.now()
         if any(h['host'] == host for h in store.hosts.holds()):

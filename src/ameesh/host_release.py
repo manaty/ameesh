@@ -849,7 +849,15 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
         # operator worker as stalled. Claims stay closed in every case.
         generation = control.get("generation")
         epoch = control.get("release_epoch")
-        pending = _pending_adapter_requests(db, host)
+        # A request is queued only while the gate is closed and the host is
+        # under release (`Queue.request` enforces it). Once a return has
+        # reopened the gate, an older pending row is superseded by definition:
+        # the worker settles it on its next tick, and it must not raise a
+        # permanent "obsolete" alert while the host is serving again
+        # (auditeur B1 on #5932).
+        gate_closed = (control.get("mode") in ("draining", "returning")
+                       and not control.get("claims_open"))
+        pending = _pending_adapter_requests(db, host) if gate_closed else []
         live = [row for row in pending
                 if row.get("generation") == generation
                 and row.get("release_epoch") == epoch]
