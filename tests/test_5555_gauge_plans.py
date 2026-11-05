@@ -74,9 +74,26 @@ def _window_bounded(node) -> bool:
     fenêtre (échéances entre la tête − tolérance et la tête), jamais
     l'historique : ce tri borné est admis. Une seule borne laisse le
     parcours descendre tout l'historique : refusé comme avant.
+
+    #5985 : à volume égal, le planificateur choisit tantôt un `Index Scan`,
+    tantôt un `Bitmap Heap Scan` pour cette fenêtre (coûts à la limite,
+    échantillon d'ANALYZE variable) : les deux lisent la même fenêtre. Le
+    bitmap est admis si chacun de ses `Bitmap Index Scan` est borné des deux
+    côtés.
     """
-    if node.get("Node Type") != "Index Scan" or node.get("Relation Name") != TABLE:
+    if node.get("Relation Name") != TABLE:
         return False
+    kind = node.get("Node Type")
+    if kind == "Index Scan":
+        return _bounded_cond(node)
+    if kind == "Bitmap Heap Scan":
+        leaves = [leaf for leaf in _nodes(node.get("Plans", []))
+                  if leaf.get("Node Type") == "Bitmap Index Scan"]
+        return bool(leaves) and all(_bounded_cond(leaf) for leaf in leaves)
+    return False
+
+
+def _bounded_cond(node) -> bool:
     cond = node.get("Index Cond") or ""
     return bool(_RESETS_LOW.search(cond) and _RESETS_HIGH.search(cond))
 
@@ -282,6 +299,33 @@ class GaugePlanCheckTest(unittest.TestCase):
         self.assertEqual(_table_plan_problems(sort_over(low_only)),
                          ["Sort des lignes de " + TABLE])
         self.assertEqual(_table_plan_problems(sort_over("(harness = 'codex'::text)")),
+                         ["Sort des lignes de " + TABLE])
+
+    def test_a_bitmap_over_one_bounded_window_is_allowed(self):
+        """#5985 : la même fenêtre lue par bitmap (choix de la CI h-31)."""
+        def sort_over(cond):
+            return [{"Node Type": "Limit", "Plans": [{
+                "Node Type": "Sort",
+                "Plans": [{"Node Type": "Bitmap Heap Scan",
+                           "Relation Name": TABLE, "Recheck Cond": cond,
+                           "Plans": [{"Node Type": "Bitmap Index Scan",
+                                      "Index Name":
+                                          "quota_gauge_readings_window_seek_idx",
+                                      "Index Cond": cond}]}],
+            }]}]
+        both = ("((harness = h.harness) AND (gauge_key = h.gauge_key) AND "
+                "(resets_at >= (h.resets_at - '00:05:00'::interval)) AND "
+                "(resets_at <= h.resets_at))")
+        self.assertEqual(_table_plan_problems(sort_over(both)), [])
+        low_only = ("((harness = h.harness) AND "
+                    "(resets_at >= (h.resets_at - '00:05:00'::interval)))")
+        self.assertEqual(_table_plan_problems(sort_over(low_only)),
+                         ["Sort des lignes de " + TABLE])
+        # un bitmap sans feuille d'index (forme inconnue) reste refusé
+        bare = [{"Node Type": "Sort", "Plans": [{
+            "Node Type": "Bitmap Heap Scan", "Relation Name": TABLE,
+            "Recheck Cond": both}]}]
+        self.assertEqual(_table_plan_problems(bare),
                          ["Sort des lignes de " + TABLE])
 
 

@@ -221,6 +221,9 @@ def record(db, source: BalanceSource, account: str | None = None,
             provider=source.provider, account=account, within_s=min_interval_s):
         return []
     rows = []
+    # #5979: no idle backend held during the provider's HTTP call
+    from .scoped_db import release
+    release(db)
     readings = list(source.fetch())
     for reading in readings:
         extra: dict = {}
