@@ -646,6 +646,20 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                         "`scripts/paquet-candidats.py` before acting; the %s may be "
                         "waiting on its author (freeze-not-head, conflict), and the "
                         "composer can only carry a ready %s" % (v.noun, v.noun, v.noun))
+        elif alert.get("packet_missed"):
+            # #5860 : le créneau est passé sans le lot, alors que rien côté
+            # auteur ne le retenait ; le pilote dit pourquoi le composeur l'a
+            # laissé (note du lot) ou le met dans le paquet suivant.
+            missed = alert["packet_missed"]
+            slot = time.strftime("%H:%M", time.gmtime(float(missed.get("slot") or 0)))
+            move = ("%s: the packet slot %sZ passed without the %s (%d slot(s) missed; "
+                    "the clock runs from that slot) — %s say why the composer left it "
+                    "out (ameesh work note %d \"packet: <reason>\", per "
+                    "scripts/paquet-candidats.py) or include it in the next package; "
+                    "do not reassign or nudge its holder"
+                    % ("bureau or auditor" if level >= 3 else "pilot", slot, v.noun,
+                       int(missed.get("count") or 0),
+                       "push the pilot/composer to" if level >= 3 else "either", lot))
         elif alert.get("vehicle_exit_ts") is not None:
             # #4369 : retiré du paquet par sa recomposition ; le temps passé
             # dans le véhicule n'est pas compté, l'horloge part de la sortie.
