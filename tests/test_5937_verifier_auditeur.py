@@ -7,9 +7,11 @@ d'AG1, puis l'aurait fait sur chaque VM. `controler_agents` (partagé par
 `verifier`, `controler` et le retour arrière) lançait
 `role timers --role auditeur --check` avec le CLI encore installé (1.38.0),
 dont le plan --role auditeur rend les passes génériques : cinq unités du vrai
-observateur jugées périmées. Le contrôle reste dû après l'installation ; il
-est conditionné par la présence de `AUDITOR_PASS` dans le role_timers.py du
-code installé, lu par ssh.
+observateur jugées périmées. Le contrôle reste dû quand le code installé
+connaît la passe ; la question est posée au python du venv installé, sous le
+compte ameesh (`python_agents`), jamais par une lecture root dans les dossiers
+d'agent ni sur un chemin supposé (bureau, #193697). Le comportement est
+couvert par tests/test_1252_vm_agents_install.py ; ce module garde la forme.
 """
 from __future__ import annotations
 
@@ -30,30 +32,24 @@ def _controler_agents() -> str:
 
 
 class VerifierAuditeurTest(unittest.TestCase):
-    def test_the_marker_the_script_reads_exists_in_the_source(self):
-        # Le script cherche `^AUDITOR_PASS = ` : un renommage ferait passer
-        # tout code installé pour antérieur à #5863, sans contrôle.
+    def test_the_attribute_the_probe_reads_exists_in_the_source(self):
+        # Un renommage ferait passer tout code installé pour antérieur à #5863.
         source = ROLE_TIMERS.read_text(encoding="utf-8")
         self.assertRegex(source, re.compile(r"^AUDITOR_PASS = ", re.M))
-        self.assertIn("grep -q '^AUDITOR_PASS = '", _controler_agents())
+        self.assertIn('getattr(r, "AUDITOR_PASS", "")', _controler_agents())
 
-    def test_the_auditor_check_runs_only_when_the_installed_code_knows_it(self):
+    def test_the_probe_runs_as_the_agent_account_never_as_root(self):
         body = _controler_agents()
-        checks = [m.start() for m in re.finditer(
-            r"role timers --role auditeur --check", body)]
-        self.assertEqual(len(checks), 1, "un seul contrôle auditeur")
-        guard = body.index("grep -q '^AUDITOR_PASS = '")
-        case = body.index('case "$rc" in', guard)
-        self.assertLess(guard, case)
-        self.assertLess(case, checks[0])
-        branch = body[case:body.index("esac", case)]
-        self.assertRegex(branch, r"0\) ameesh_agents role timers --role auditeur --check")
-        # Code antérieur : étape nommée, pas d'échec ; illisible : échec.
-        self.assertRegex(branch, r'1\) etape "minuterie de l\'auditeur \(#5863\)')
-        self.assertRegex(branch, r"\*\) .*echec=1")
+        probe = body.index("python_agents -c 'from ameesh import role_timers")
+        check = body.index("role timers --role auditeur --check")
+        self.assertLess(probe, check)
+        # Ni grep ni cat root sur le code installé (frontière de #5797).
+        self.assertNotRegex(body, r"ssh_agents [^\n]*role_timers")
+        self.assertNotIn("src-${runtime_sha", body[probe - 600:check])
 
-    def test_the_generic_role_timer_check_stays_unconditional(self):
+    def test_only_one_auditor_check_and_the_generic_one_stays(self):
         body = _controler_agents()
+        self.assertEqual(body.count("role timers --role auditeur --check"), 1)
         self.assertRegex(body, r"\n  ameesh_agents role timers --check \|\| echec=1\n")
 
 

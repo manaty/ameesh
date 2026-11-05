@@ -1931,20 +1931,22 @@ controler_agents() {
   # #5937 : contrôlé seulement si le code INSTALLÉ connaît ce passage. Un CLI
   # antérieur (préflight d'une montée vers #5863, ou retour arrière) rend pour
   # --role auditeur les passes génériques et juge périmées les unités du vrai
-  # observateur : le préflight échouait sur toutes les VM. L'étape est nommée,
-  # jamais sautée en silence ; un code illisible reste un échec.
-  local rt="/home/ameesh/.local/share/ameesh/src-${runtime_sha:0:7}/src/ameesh/role_timers.py"
-  if ! [[ ${runtime_sha:-} =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-    echec=1  # déjà nommé par le contrôle du runtime invité ci-dessus
+  # observateur : le préflight échouait sur toutes les VM. La question est
+  # posée au python du venv qui portera le contrôle, sous le compte ameesh
+  # (python_agents, comme ameesh_agents) : jamais une lecture root dans les
+  # dossiers d'agent, jamais un chemin supposé. L'étape est nommée, jamais
+  # sautée en silence ; une réponse illisible reste un échec.
+  local passe_auditeur
+  rc=0
+  passe_auditeur=$(python_agents -c 'from ameesh import role_timers as r
+print(getattr(r, "AUDITOR_PASS", "") or "-")') || rc=$?
+  if [ "$rc" != 0 ] || [ -z "$passe_auditeur" ]; then
+    echo "minuterie de l'auditeur : role_timers du venv installé illisible (rc $rc)" >&2
+    echec=1
+  elif [ "$passe_auditeur" = - ]; then
+    etape "minuterie de l'auditeur (#5863) : le code installé ne la connaît pas, contrôle après l'installation"
   else
-    # Fichier absent = code sans cette passe (1) ; erreur de lecture ou de
-    # ssh (2, 255) = échec.
-    rc=0; ssh_agents "test -e $rt || exit 1; grep -q '^AUDITOR_PASS = ' $rt" || rc=$?
-    case "$rc" in
-      0) ameesh_agents role timers --role auditeur --check || echec=1 ;;
-      1) etape "minuterie de l'auditeur (#5863) : le code installé ${runtime_sha:0:9} ne la connaît pas, contrôle après l'installation" ;;
-      *) echo "minuterie de l'auditeur : code installé illisible ($rt, rc $rc)" >&2; echec=1 ;;
-    esac
+    ameesh_agents role timers --role auditeur --check || echec=1
   fi
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
   echo "contrôles verts"
