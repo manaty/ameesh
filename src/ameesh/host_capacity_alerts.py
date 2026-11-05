@@ -97,3 +97,56 @@ def alerts(cfg, db, listing, now, *, canons, readings, held_hosts=(), orchestrat
     return project(footprints, listing, now=now, idle_after_s=cfg.idle_after_s,
                    baseline_hosts=cfg.baseline_hosts, held_hosts=held_hosts,
                    draining_hosts=excluded, orchestrators=orchestrators)
+
+
+def _episode(alert):
+    """The journal identity of one alert: its type and host(s), stable while
+    the episode lasts (A2 moves `idle_since` forward at every reading)."""
+    if alert.get('type') == 'host_idle_reserved':
+        return 'host_idle_reserved:%s' % alert.get('host')
+    return 'baseline_oversized:%s' % ','.join(sorted(alert.get('hosts') or ()))
+
+
+def _event_data(alert):
+    """Identifiers, states and figures only (`ameesh_events`: no free text)."""
+    data = {'alert': alert['type'], 'since': alert.get('since')}
+    if alert['type'] == 'host_idle_reserved':
+        fp = alert.get('footprint') or {}
+        data.update(host=alert.get('host'), capacity=fp.get('capacity'),
+                    cost_eur_h=fp.get('cost_eur_h'),
+                    cost_off_eur_h=fp.get('cost_off_eur_h'))
+    else:
+        data.update(hosts=sorted(alert.get('hosts') or ()),
+                    baseline_hosts=alert.get('threshold'),
+                    burst_candidates=list(alert.get('burst_candidates') or ()))
+    return data
+
+
+def journal(state, current, now, record, *, journaled_elsewhere=()):
+    """#5912: `alert.raised` and `alert.resolved` for TYPES, so that idle
+    reserved capacity has a history (study #5900 §2, §3.5).
+
+    These alerts go to the mesh agents only, outside `notify.types`, so the
+    notifier journals none of them. `state` maps an episode to what was
+    raised; `record(kind, object, data)` writes one event. A type that the
+    notifier already journals (`journaled_elsewhere`) is skipped. A failed
+    write keeps the episode unrecorded and retries it at the next pass.
+    Returns the number of events written.
+    """
+    seen = {}
+    for alert in current:
+        if alert.get('type') in TYPES and alert['type'] not in journaled_elsewhere:
+            seen.setdefault(_episode(alert), alert)
+    written = 0
+    for key in sorted(set(state) - set(seen)):
+        entry = state[key]
+        data = dict(entry.get('data') or {}, raised_ts=entry.get('raised_ts'))
+        record('alert.resolved', 'alert:%s' % data.get('alert'), dict(data, key=key))
+        del state[key]
+        written += 1
+    for key in sorted(set(seen) - set(state)):
+        data = _event_data(seen[key])
+        record('alert.raised', 'alert:%s' % data['alert'], dict(data, key=key))
+        state[key] = {'data': data, 'raised_ts': round(float(now), 3)}
+        written += 1
+    return written
