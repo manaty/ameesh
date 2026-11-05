@@ -4393,12 +4393,14 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     (`corrector`).
 
     `require_freeze` (#5993) : la commande `ameesh work move … qa` le pose.
-    Entrer en revue sans gel déclaré est refusé, avec le geste exact : la
-    désignation automatique part du gel (#3467), donc un lot déplacé en `qa`
-    sans gel restait sans relecteur et rien ne le disait avant le seuil de
-    `stale_lot` (#5985, 1 h 45). Le défaut False laisse les transitions
-    internes (le gel écrit son jalon avant de bouger) et les fixtures
-    inchangées ; une correction (`--correct`) n'est jamais concernée.
+    Entrer en revue sans gel de la tête courante est refusé, avec le geste
+    exact : la désignation automatique part du gel (#3467), donc un lot
+    déplacé en `qa` sans gel restait sans relecteur et rien ne le disait
+    avant le seuil de `stale_lot` (#5985, 1 h 45). Un gel antérieur au
+    dernier passage en build ne couvre plus la branche retravaillée (N1) :
+    il est refusé de même. Le défaut False laisse les transitions internes
+    (le gel écrit son jalon avant de bouger) et les fixtures inchangées ;
+    une correction (`--correct`) n'est jamais concernée.
 
     `state` accepte l'orthographe v1 et le nom générique du cycle de vie
     (#4349 : `in_progress` pour `build`, `to_validate` pour `qa`…)."""
@@ -4483,17 +4485,26 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (current, state, current, ", ".join(sorted(transitions[current])) or "none",
                " — state set by mistake: ameesh work move %s %s --correct \"reason\""
                % (item_id, state) if (current, state) in corrections else ""))
-    if (require_freeze and state == lifecycle.QA
-            and not str(item.get("frozen_sha") or "").strip()):
+    if require_freeze and state == lifecycle.QA:
         # #5993 : la désignation automatique part du gel (#3467) ; sans gel,
         # le lot entrait en revue sans relecteur et l'attente n'appartenait à
-        # personne. Le gel est le geste qui entre en `qa` et désigne.
-        raise WorkError(
-            "move refused: lot %s enters qa without a declared freeze; the reviewer "
-            "designation starts at the freeze (#3467), so the lot would wait for "
-            "nobody — nothing changed. Freeze the branch head first: ameesh work "
-            "milestone %s frozen --sha <head> (the freeze enters qa and designates "
-            "the reviewer)" % (item_id, item_id))
+        # personne. Un gel antérieur au dernier passage en build ne couvre
+        # pas la tête retravaillée (#5993 N1) : la désignation ne suivrait
+        # pas non plus. Le gel est le geste qui entre en `qa` et désigne.
+        frozen_sha = str(item.get("frozen_sha") or "").strip()
+        frozen_at = item.get("frozen_at")
+        build_at = item.get("build_at")
+        stale = (bool(frozen_sha) and frozen_at is not None and build_at is not None
+                 and float(frozen_at) < float(build_at))
+        if not frozen_sha or stale:
+            why = ("with a freeze (%s) that predates its last move to build"
+                   % frozen_sha[:12] if stale else "without a declared freeze")
+            raise WorkError(
+                "move refused: lot %s enters qa %s; the reviewer designation "
+                "starts at the freeze (#3467), so the lot would wait for nobody "
+                "— nothing changed. Freeze the branch head first: ameesh work "
+                "milestone %s frozen --sha <head> (the freeze enters qa and "
+                "designates the reviewer)" % (item_id, why, item_id))
     if state == "validated":
         from . import merge_queue
         gate = merge_queue.review_gate_for_item(

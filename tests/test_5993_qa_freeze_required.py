@@ -48,6 +48,29 @@ class QaFreezeRequiredTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
 
+    def test_gel_anterieur_au_dernier_build_est_refuse(self):
+        # N1 (#5993) : gel A, qa → build, branche retravaillée sans regeler.
+        # Le gel A ne couvre pas la tête courante : la désignation ne suivrait
+        # pas, et le lot retomberait dans le cas de #5985.
+        self._freeze_row()
+        self.assertEqual(self._move("qa").returncode, 0)
+        self.assertEqual(self._move("build").returncode, 0)
+        proc = self._move("qa")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("predates its last move to build", proc.stderr)
+        self.assertIn("ameesh work milestone %d frozen --sha" % self.lot,
+                      proc.stderr)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "build")
+
+    def test_regele_apres_le_build_est_accepte(self):
+        self._freeze_row()
+        self.assertEqual(self._move("qa").returncode, 0)
+        self.assertEqual(self._move("build").returncode, 0)
+        self._freeze_row()  # nouveau gel, postérieur au dernier build
+        proc = self._move("qa")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+
     def test_reviewer_explicite_ne_dispense_pas_du_gel(self):
         self.register("relecteur", "codex", cwd=self.tmp)
         proc = self.mesh("work", "move", str(self.lot), "qa",
@@ -71,7 +94,13 @@ class QaFreezeRequiredTest(PgTestCase):
     def test_work_get_porte_la_tete_du_dernier_gel(self):
         # #5993 : le contrat médié n'a pas d'op `work.milestones` ; la tête
         # gelée voyage donc avec `work.get`, pour que le refus fonctionne
-        # aussi depuis une session de VM.
-        self.assertIsNone(work.get(self.db, self.lot)["frozen_sha"])
+        # aussi depuis une session de VM. `frozen_at`/`build_at` permettent de
+        # refuser un gel antérieur au dernier passage en build (N1).
+        item = work.get(self.db, self.lot)
+        self.assertIsNone(item["frozen_sha"])
+        self.assertIsNone(item["frozen_at"])
+        self.assertIsNotNone(item["build_at"])
         self._freeze_row()
-        self.assertEqual(work.get(self.db, self.lot)["frozen_sha"], FROZEN)
+        item = work.get(self.db, self.lot)
+        self.assertEqual(item["frozen_sha"], FROZEN)
+        self.assertGreaterEqual(item["frozen_at"], item["build_at"])
