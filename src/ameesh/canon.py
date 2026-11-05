@@ -1138,8 +1138,9 @@ class HostPolicy:
     lifecycle_hook: str | None = None
     #: #5905 (C2 of #5900): how the host declares its runs (work that outlives
     #: a turn or a lease). `none` = the host runs nothing outside its turns
-    #: and leases, so `runs = 0` is a known count; None = undeclared, the
-    #: release stays refused (`host_release_no_runs`).
+    #: and leases, so `runs = 0` is a known count; None = undeclared and
+    #: `invalid` = unreadable value: the release stays refused
+    #: (`host_release_no_runs`).
     runs_interface: str | None = None
     #: #5601 : places de `max_agents` réservées aux agents d'un projet ou à une
     #: classe de priorité (`{"project:<p>": n, "class:<n>": n}`, `ameesh.slot_reservations`) ;
@@ -4199,13 +4200,15 @@ class _Loader:
                              "`policy.lifecycle_hook`: a non-empty command line expected",
                              **where, **subject)
             # #5905: only a known interface declares runs; anything else is an
-            # error and stays undeclared (never a zero by default).
+            # error kept as `invalid`, so that it still contradicts another
+            # card of the host (never a zero by default, never dropped).
             if raw.get("runs_interface") is not None:
-                from .host_idle import RUNS_INTERFACES
+                from .host_idle import RUNS_INTERFACES, RUNS_INVALID
                 value = raw["runs_interface"]
                 if isinstance(value, str) and value.strip() in RUNS_INTERFACES:
                     policy.runs_interface = value.strip()
                 else:
+                    policy.runs_interface = RUNS_INVALID
                     self.add("host-policy-invalid", ERROR,
                              "`policy.runs_interface`: one of %s expected"
                              % ", ".join(RUNS_INTERFACES), **where, **subject)

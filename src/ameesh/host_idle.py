@@ -19,13 +19,18 @@ DONE = frozenset(lifecycle.COMPLETED)
 RUNS_INTERFACES = ("none",)
 #: the source of an undeclared host: unknown for the release, never zero
 RUNS_UNDECLARED = 'aucune interface de déclaration'
+#: a Host card whose `runs_interface` did not parse keeps this value, so it
+#: still contradicts any other card of the host instead of vanishing
+RUNS_INVALID = 'invalid'
 
 
 def runs_interface(cfg, canons, host):
     """(interface, origin) declared for `host`, or (None, None).
 
     The per-host configuration wins over the Host card. Two Host cards that
-    disagree declare nothing: a run count is never chosen by canon order."""
+    disagree declare nothing, nor does a card with an invalid value
+    (`RUNS_INVALID`), even beside a valid one: a run count is never chosen by
+    canon order."""
     per_host = getattr(cfg, 'runs_interfaces', None) or {}
     if isinstance(per_host, dict) and per_host.get(host) in RUNS_INTERFACES:
         return per_host[host], 'configuration'
