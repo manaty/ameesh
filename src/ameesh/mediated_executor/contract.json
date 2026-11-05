@@ -5167,7 +5167,8 @@
     "reopen_return",
     "release_locks",
     "transition_journal",
-    "undrain"
+    "undrain",
+    "wait_transition"
    ],
    "github_watch": [
     "advance",
