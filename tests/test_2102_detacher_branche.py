@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import time
 from unittest import mock
 
 from ameesh import plan_git, plan_github, radar, registry, storage, work
@@ -20,6 +21,12 @@ from .support import PgTestCase
 from .test_l160b_radar import LOTS, make_repo
 from . import test_merged_work_item_tracking as tracking
 from .test_merged_work_item_tracking import _Base, _git
+
+
+def _after_blocked() -> dict:
+    """#5778 : la fusion entre dans la cible après l'entrée en blocked, hors
+    de `CLOCK_SLACK_S` ; la reprise du lot ferme alors sans nouveau gel."""
+    return {"GIT_COMMITTER_DATE": "@%d +0000" % (int(time.time()) + 600)}
 
 
 class DetachSweepTest(_Base):
@@ -111,7 +118,7 @@ class DetachSweepTest(_Base):
                 work.detach_branch(self.db, n, reason="PR supplantée")
                 _git(self.repo, "checkout", "-q", target)
                 _git(self.repo, "merge", "-q", "--no-ff", "-m",
-                     "Merge branch '%s'" % name, name)
+                     "Merge branch '%s'" % name, name, env=_after_blocked())
                 self.assertEqual(self.sync()["merged"], 0)
                 self.assertEqual(work.get(self.db, n)["state"], "blocked")
                 self.assertIsNone(work.get(self.db, n)["branch"])
@@ -132,7 +139,8 @@ class DetachSweepTest(_Base):
         self.branch(name)
         work.detach_branch(self.db, n, name, reason="PR supplantée")
         _git(self.repo, "merge", "-q", "--no-ff", "-m",
-             "Merge branch '%s'\n\nameesh-work: %d" % (name, n), name)
+             "Merge branch '%s'\n\nameesh-work: %d" % (name, n), name,
+             env=_after_blocked())
         # #2744 : la citation reste une preuve, mais un lot blocked garde sa
         # fermeture tant qu'il n'est pas débloqué.
         self.assertEqual(self.sync()["merged"], 0)

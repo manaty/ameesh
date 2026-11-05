@@ -1526,8 +1526,16 @@ class ContentMergeTest(_PlanDb):
                          ("withheld", "hold"))
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
         self.assertIn("passe réelle due", result["detail"])
-        # Une attente ordinaire levée reste fermable sans regel.
+        # #5778 : le hold d'un tiers posé après l'entrée du contenu dans la
+        # cible retient encore une fois levé ; un nouveau gel ferme.
         work.note(self.db, item["id"], "unhold: passe faite", actor="human:alice")
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["retention"]["what"]),
+                         ("withheld", "stale-freeze"))
+        previous = plan_git.latest_freeze(work.milestones(self.db, item["id"]))
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha=previous["sha"], actor="dev-a", verdict=None,
+            note="ameesh-freeze-absent: main")
         self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
         self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
 

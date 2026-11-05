@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import time
 import unittest
 from unittest import mock
 
 from ameesh import packet_close, work
 from ameesh.storage.postgres.work import WorkItems
 
-from .test_canon import git, write
+from .test_canon import _git_env, git, write
 from .test_plan import _PlanDb
 
 
@@ -49,12 +51,15 @@ class PacketCloseTest(_PlanDb):
 
     def package(self, items: list[dict], *, withdrawn: set | None = None,
                 manifest: bool = True, trailer: bool = True,
-                branch: str = "integration/paquet-test", before_merge=None) -> list[dict]:
+                branch: str = "integration/paquet-test", before_merge=None,
+                merge_after_s: int = 0) -> list[dict]:
         """Compose un paquet de `len(items)` unités, chacune depuis `main`, puis
         fusionne la branche du paquet dans `main`. Rend `[{lot, source, unit}]`.
 
         `withdrawn` : lots inscrits dans la section « Écartés » du manifeste
-        (la ligne de composition reste, le retrait fait foi)."""
+        (la ligne de composition reste, le retrait fait foi). `merge_after_s` :
+        la fusion du paquet est datée dans le futur (#5778 : après les attentes
+        posées par `before_merge`)."""
         withdrawn = set(withdrawn or ())
         git(self.repo, "checkout", "-q", "-b", branch, "main")
         units = []
@@ -91,8 +96,14 @@ class PacketCloseTest(_PlanDb):
         if before_merge is not None:
             before_merge(units)
         git(self.repo, "checkout", "-q", "main")
-        git(self.repo, "merge", "-q", "--no-ff", "-m",
-            "Merge pull request #1 from manaty/%s" % branch, branch)
+        message = "Merge pull request #1 from manaty/%s" % branch
+        if merge_after_s:
+            env = _git_env()
+            env["GIT_COMMITTER_DATE"] = "@%d +0000" % (int(time.time()) + merge_after_s)
+            subprocess.run(["git", "merge", "-q", "--no-ff", "-m", message, branch],
+                           cwd=self.repo, env=env, check=True, capture_output=True)
+        else:
+            git(self.repo, "merge", "-q", "--no-ff", "-m", message, branch)
         return units
 
     def sync(self, **kwargs) -> dict:
@@ -199,7 +210,8 @@ class PacketCloseTest(_PlanDb):
             work.note(self.db, item["id"], "hold: attendre la fenêtre", actor="human:alice")
             work.note(self.db, item["id"], "unhold: fenêtre ouverte", actor="human:alice")
 
-        self.package([item], before_merge=before_merge)
+        # #5778 : le paquet fusionne après l'attente (hors de CLOCK_SLACK_S)
+        self.package([item], before_merge=before_merge, merge_after_s=600)
         self.assertEqual(self.by_lot(self.sync(dry_run=True))[item["id"]]["result"],
                          "would-merge")
         self.assertEqual(self.by_lot(self.sync())[item["id"]]["result"], "merged")
