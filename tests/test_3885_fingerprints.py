@@ -378,6 +378,15 @@ class DeclarationTest(unittest.TestCase):
                          ([], ""))
         self.assertTrue(any("unknown" in warning for warning in warnings), warnings)
 
+    def test_a_relative_token_file_is_refused(self):
+        warnings = []
+        bundle = self.bundle(fiche=types.SimpleNamespace(data={"fingerprints": {
+            "nexlink": {"sources": [{"url": "https://api.example.test/f",
+                                     "token_file": "relative.token"}]}}}))
+        self.assertEqual(fingerprints.declarations([bundle], log=warnings.append),
+                         ([], ""))
+        self.assertTrue(any("absolute" in warning for warning in warnings), warnings)
+
 
 class TickTest(PgTestCase):
     def setUp(self):

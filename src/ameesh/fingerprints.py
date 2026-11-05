@@ -197,7 +197,7 @@ def _environment(value) -> str:
     """Validate a source/lot environment; empty means production."""
     text = str(value or "").strip().lower() or DEFAULT_ENVIRONMENT
     if text not in ENVIRONMENTS:
-        raise FingerprintError("--environment: expected one of %s, not %r"
+        raise FingerprintError("environment: expected one of %s, not %r"
                                % (", ".join(ENVIRONMENTS), value))
     return text
 
@@ -345,8 +345,9 @@ def _open_once(db, *, source, app, title, users, count, fields, actor,
         previous_id = int(previous["id"]) if previous is not None else None
         recurrence = previous_id is not None and previous.get("state") in (
             *work.MERGED_STATES, "closed")
-        new_title = (_recurrence_title(title, previous_id) if recurrence else title)
-        new_title = _environment_title(new_title, environment)
+        new_title = _environment_title(title, environment)
+        if recurrence:
+            new_title = _recurrence_title(new_title, previous_id)
         note = ("récidive du lot #%d (empreinte déjà close)" % previous_id
                 if recurrence else "")
         priority = 1 if users > 0 else 2
@@ -443,6 +444,9 @@ def _source_declaration(project: str, spec, agent: str) -> Declaration:
     token_file = token_file.strip()
     if _CONTROL_RE.search(token_file):
         raise ValueError("token_file: control characters are refused")
+    if token_file and not (token_file.startswith("/")
+                           or token_file.startswith("~/")):
+        raise ValueError("token_file must be absolute or start with ~/")
     return Declaration(project, url, float(interval), agent, environment,
                        token_file)
 
@@ -679,6 +683,7 @@ def _with_since(url: str, cursor: str | None) -> str:
 def read_page(decl: Declaration, cursor: str | None, token: str,
               *, timeout: float = 30.0, opener=None) -> dict:
     """Read one page with the read-only bearer token (HTTPS, no redirect)."""
+    label = "%s/%s" % (decl.project, decl.environment)
     request = urllib.request.Request(
         _with_since(decl.url, cursor),
         headers={"Authorization": "Bearer %s" % token,
@@ -690,23 +695,23 @@ def read_page(decl: Declaration, cursor: str | None, token: str,
             raw = response.read(MAX_PAGE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         raise FingerprintError("fingerprints source %s: HTTP %s"
-                               % (decl.project, exc.code)) from None
+                               % (label, exc.code)) from None
     except urllib.error.URLError as exc:
         raise FingerprintError("fingerprints source %s: unreachable (%s)"
-                               % (decl.project, exc.reason)) from None
+                               % (label, exc.reason)) from None
     except FingerprintError:
         raise
     except Exception as exc:  # noqa: BLE001 - readable refusal, never a traceback
         raise FingerprintError("fingerprints source %s: read failed (%s)"
-                               % (decl.project, type(exc).__name__)) from None
+                               % (label, type(exc).__name__)) from None
     if len(raw) > MAX_PAGE_BYTES:
         raise FingerprintError("fingerprints source %s: page larger than %d bytes"
-                               % (decl.project, MAX_PAGE_BYTES))
+                               % (label, MAX_PAGE_BYTES))
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise FingerprintError("fingerprints source %s: invalid JSON"
-                               % decl.project) from None
+                               % label) from None
     return payload
 
 
