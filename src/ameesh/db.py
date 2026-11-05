@@ -1188,6 +1188,9 @@ class PsycopgDriver:
         self._psycopg = psycopg
         self._dict_row = dict_row
         self.cfg = cfg
+        #: #5986 : nom de session figé à la construction, dans le bloc
+        #: `application` de l'appelant ; une reconnexion (L72) le reprend
+        self._application_name = application_name()
         #: reconnexion après une coupure (L72) : un seul fil rouvre la connexion
         self._reconnect_lock = threading.Lock()
         #: transactions explicites ouvertes : jamais de reconnexion au milieu
@@ -1223,7 +1226,7 @@ class PsycopgDriver:
         if options:
             kwargs["options"] = options
         # #5976 : un application_name du DSN ou PGAPPNAME prime (libpq)
-        kwargs["fallback_application_name"] = application_name()
+        kwargs["fallback_application_name"] = self._application_name
         TRACE.connect()
         try:
             return self._psycopg.connect(self.cfg.dsn, **kwargs)
