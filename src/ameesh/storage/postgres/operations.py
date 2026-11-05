@@ -33,6 +33,11 @@ _WAITING_ON_OTHERS = f"('{lifecycle.QA}', '{lifecycle.VALIDATED}', '{lifecycle.W
 #: L125 : un message passif de la boîte `mb`
 _PASSIVE = PASSIVE_SQL.format(t="mb")
 
+#: #5952 : Codex republie la même échéance à quelques secondes près ; deux
+#: `resets_at` à moins de cette tolérance sont la même fenêtre. Même valeur que
+#: `cost.CODEX_WINDOW_JITTER_S` (#5950), vérifiée par le témoin du lot.
+GAUGE_WINDOW_JITTER_S = 300.0
+
 
 def _sans_compte_nul(rows: list[dict]) -> list[dict]:
     """`account` n'apparaît que s'il est renseigné (L30) : les relevés d'un hôte
@@ -746,6 +751,12 @@ class Operations(interface.Operations):
         l'ordre DANS chaque jauge change (`resets_at` d'abord). L'index additif
         `quota_gauge_readings_window_seek_idx` (migration 0535) porte cet
         ordre, sans quoi le tri parcourrait tout l'historique du compte.
+
+        #5952 : Codex fait gigoter `resets_at` de quelques secondes d'un relevé
+        à l'autre pour une même fenêtre. L'échéance la plus tardive désigne la
+        fenêtre ; parmi les relevés dont l'échéance en est à
+        `GAUGE_WINDOW_JITTER_S` près, le plus récent (production, sinon
+        insertion) l'emporte, et non celui à l'échéance gigotée la plus haute.
         """
         if harness is None or account is None:
             return []
@@ -766,6 +777,11 @@ class Operations(interface.Operations):
         `window_first` (#5542) orders each gauge by `resets_at DESC NULLS LAST`
         before production and insertion, preserving #5466's later-expiry-wins
         invariant; the additive window_seek index (0535) matches that order.
+        #5952: each head then yields to the freshest reading of its gauge whose
+        expiry lies within `GAUGE_WINDOW_JITTER_S` of the head's (same window,
+        jittered expiry): both range bounds keep that lookup a seek on the
+        window_seek index, at most one window's readings, never the gauge's
+        whole history; a head without an expiry stays as is.
         """
         key = "harness, (account IS NULL), coalesce(account, ''), gauge_key"
         extra = ", (account IS NULL) AS unnamed, coalesce(account, '') AS account_key"
@@ -790,6 +806,24 @@ class Operations(interface.Operations):
             params.extend((harness, account))
         order = key + (", resets_at DESC NULLS LAST" if window_first else "")
         order += ", produced_at DESC NULLS LAST, observed_at DESC, id DESC"
+        rows = "heads r"
+        if window_first:
+            same = ("w.harness = h.harness AND (w.account IS NULL) = h.unnamed"
+                    " AND coalesce(w.account, '') = h.account_key"
+                    " AND w.gauge_key = h.gauge_key")
+            if by_source:
+                same += (" AND (w.source IS NULL) = h.anonymous"
+                         " AND coalesce(w.source, '') = h.source_key")
+            if since_s is not None:
+                same += " AND w.observed_at >= (SELECT cutoff FROM bounds)"
+            rows = ("heads h LEFT JOIN LATERAL ("
+                    " SELECT w.id FROM quota_gauge_readings w WHERE " + same +
+                    " AND w.resets_at BETWEEN h.resets_at - make_interval(secs => %s)"
+                    " AND h.resets_at"
+                    " ORDER BY w.produced_at DESC NULLS LAST, w.observed_at DESC,"
+                    " w.id DESC LIMIT 1) j ON true"
+                    " JOIN quota_gauge_readings r ON r.id = coalesce(j.id, h.id)")
+            params.append(GAUGE_WINDOW_JITTER_S)
         return self.db.query(
             "WITH RECURSIVE " + bounds + "heads AS ("
             " (SELECT q.*" + extra + " FROM quota_gauge_readings q WHERE " + scope +
@@ -806,7 +840,7 @@ class Operations(interface.Operations):
             " extract(epoch from r.resets_at)::float8 AS resets_at_ts, r.window_s,"
             " extract(epoch from r.observed_at)::float8 AS observed_ts,"
             " extract(epoch from r.produced_at)::float8 AS produced_ts, r.source, r.account,"
-            " r.overage_capable, r.overage_in_use FROM heads r"
+            " r.overage_capable, r.overage_in_use FROM " + rows +
             " ORDER BY r.harness, r.account, r.gauge_key" + source_order, tuple(params))
 
     def assigners(self, *, since_s) -> list[str]:
