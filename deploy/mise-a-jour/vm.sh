@@ -1928,7 +1928,26 @@ controler_agents() {
   # sain. `ameesh_agents` passe par systemd-run + EnvironmentFile, comme doctor.
   ameesh_agents role timers --check || echec=1
   # #5863 : le passage court de l'auditeur, posé jusqu'ici à la main (3 h).
-  ameesh_agents role timers --role auditeur --check || echec=1
+  # #5937 : contrôlé seulement si le code INSTALLÉ connaît ce passage. Un CLI
+  # antérieur (préflight d'une montée vers #5863, ou retour arrière) rend pour
+  # --role auditeur les passes génériques et juge périmées les unités du vrai
+  # observateur : le préflight échouait sur toutes les VM. La question est
+  # posée au python du venv qui portera le contrôle, sous le compte ameesh
+  # (python_agents, comme ameesh_agents) : jamais une lecture root dans les
+  # dossiers d'agent, jamais un chemin supposé. L'étape est nommée, jamais
+  # sautée en silence ; une réponse illisible reste un échec.
+  local passe_auditeur
+  rc=0
+  passe_auditeur=$(python_agents -c 'from ameesh import role_timers as r
+print(getattr(r, "AUDITOR_PASS", "") or "-")') || rc=$?
+  if [ "$rc" != 0 ] || [ -z "$passe_auditeur" ]; then
+    echo "minuterie de l'auditeur : role_timers du venv installé illisible (rc $rc)" >&2
+    echec=1
+  elif [ "$passe_auditeur" = - ]; then
+    etape "minuterie de l'auditeur (#5863) : le code installé ne la connaît pas, contrôle après l'installation"
+  else
+    ameesh_agents role timers --role auditeur --check || echec=1
+  fi
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
   echo "contrôles verts"
 }
