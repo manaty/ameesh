@@ -891,6 +891,33 @@ class HostReleaseTest(PgTestCase):
         self.assertEqual([alert["type"] for alert in alerts], ["host_release_overdue"])
         self.assertIn("undrain vm", alerts[0]["detail"])
 
+    def test_overdue_manual_window_names_requester_not_undrain(self):
+        # #5866: a manual drain inside its --for is an operator window.
+        self.add_agent()
+        self.api.host_lifecycle.drain("vm", actor="human:op", duration=12 * 3600)
+        self.db.execute("UPDATE host_lifecycle SET requested_at=now()-interval '2 hours' "
+                        "WHERE host='vm'")
+        alerts = host_release.alerts(self.cfg, self.db, time.time())
+        self.assertEqual([alert["type"] for alert in alerts], ["host_release_overdue"])
+        detail = alerts[0]["detail"]
+        self.assertNotIn("undrain vm", detail)
+        self.assertIn("manual drain by human:op until ", detail)
+        self.assertIn("do not undrain it", detail)
+
+    def test_overdue_expired_manual_window_or_automatic_drain_advises_undrain(self):
+        self.add_agent()
+        self.api.host_lifecycle.drain("vm", actor="human:op", duration=12 * 3600)
+        self.db.execute("UPDATE host_lifecycle SET requested_at=now()-interval '2 hours' "
+                        "WHERE host='vm'")
+        later = time.time() + 13 * 3600
+        alerts = host_release.alerts(self.cfg, self.db, later)
+        self.assertEqual([alert["type"] for alert in alerts], ["host_release_overdue"])
+        self.assertIn("undrain vm", alerts[0]["detail"])
+        self.db.execute("UPDATE host_lifecycle SET automatic=true WHERE host='vm'")
+        alerts = host_release.alerts(self.cfg, self.db, time.time())
+        self.assertIn("undrain vm", alerts[0]["detail"])
+        self.assertNotIn("manual drain by", alerts[0]["detail"])
+
 
 class FootprintReleaseTest(unittest.TestCase):
     def test_release_overlays_state_claims_and_declared_runs(self):
