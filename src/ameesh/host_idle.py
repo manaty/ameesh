@@ -304,8 +304,11 @@ def _complete_canons(cfg, canons):
 
 
 def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None,
-             guards=False):
+             guards=False, history_s=None):
     """Read all common sources once, then project each host. No mutations.
+
+    `history_s` extends the quiet evidence window for adapter hysteresis; it
+    does not change the native idle threshold or forgive sample gaps.
 
     `controls` (#4148): the host_lifecycle rows, mapping host to row, when the
     caller already read them. The release state then overlays the footprint
@@ -420,7 +423,7 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None
         history = None
         if host in candidates:
             try:
-                history = storage.of(db).hosts.since(host, idle_s + fresh)
+                history = storage.of(db).hosts.since(host, max(idle_s, history_s or 0) + fresh)
             except Exception:
                 history = None
         out[host] = project(reading, history, members, host_lots, now=now,

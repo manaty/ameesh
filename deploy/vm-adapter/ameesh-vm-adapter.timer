@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=Reconcile operator VM adapter requests
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=ameesh-vm-adapter.service
+
+[Install]
+WantedBy=timers.target
