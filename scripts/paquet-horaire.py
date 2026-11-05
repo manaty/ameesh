@@ -1594,7 +1594,15 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
         reason = "rien composé (%s)" % step
         # #5970 : garder le diagnostic et prévenir avant la clôture ; le
         # courrier lié à un lot clos serait refusé par agent-mail.
-        diagnostic = auto._tail(result.text, 30)
+        lines = result.text.splitlines()
+        kept = set(range(max(0, len(lines) - 30), len(lines)))
+        for i, line in enumerate(lines):
+            if re.match(r"tests (unité #\d+|contrats) : ROUGE", line):
+                # paquet-auto imprime l'en-tête puis les 40 lignes du rouge.
+                kept.update(range(i, min(i + 41, len(lines))))
+            if line.startswith("écarté #"):
+                kept.add(i)
+        diagnostic = "\n".join(lines[i] for i in sorted(kept))
         ctx.note(carrier, "%s%s\n\n%s" % (MARK, reason, diagnostic))
         ctx.mail(ctx.pilot, carrier, "#%d %s : %s, clôture du porteur vide.\n\n%s"
                  % (carrier, name, reason, diagnostic))

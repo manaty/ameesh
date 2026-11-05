@@ -373,8 +373,13 @@ class ComposeTest(Base):
 
     def test_porteur_vide_diagnostic_et_courrier_avant_cloture(self):
         self.shell.auto_out = (
-            "écarté #3801 : tests.test_unite.Test.test_rouge\n"
-            "aucune unité composée : tests par unité rouges\n")
+            "tests unité #3801 : ROUGE (1 modules) — modules : tests.test_unite"
+            " — journal local : /state/test-logs/series-rouge.log\n"
+            "FAIL: test_rouge (tests.test_unite.Test)\nAssertionError: rouge\n"
+            + "détail de trace\n" * 37
+            + "FAILED (failures=1)\n"
+            + "recomposition\n" * 5
+            + "écarté #3801 : rouge\naucune unité composée\n")
         self.shell.items[4000] = carrier()
         original = self.shell.run
         closed = False
