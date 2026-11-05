@@ -15,7 +15,8 @@ puis par l'élection d'un pilote entre hôtes candidats (L165/EP1, version
 `1.8.0`, compatible : voir « Contrat 1.8 »), puis par le brief de relève à
 l'élection (L165/EP3, version `1.9.0`, compatible : voir « Contrat 1.9 »),
 puis par l'identité du tour fermé (version `1.10.0`, compatible : voir
-« Contrat 1.10 »).
+« Contrat 1.10 »), puis par le diagnostic atomique des refus de tour
+(#5856, version `1.11.0`, compatible : voir « Contrat 1.11 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -991,3 +992,17 @@ and fencing; executor allowlists can use aliases. The agent's name, owner,
 epoch and host still have to satisfy the same authority checks. See
 [Agent aliases](AGENT-ALIASES.md) for collisions, signed mail and the deferred
 renaming/rollback migration.
+
+### Contrat 1.11 : refus de lancement diagnostiqué (#5856)
+
+`leases.begin_turn_diagnosed(name, owner, epoch, status_text)` conserve les
+portées et le fencing de `leases.begin_turn`. Son résultat est `started`,
+`lease_lost`, `lease_expired`, `missing`, `handoff_fenced`, `operator_paused`,
+`stopped` ou `host_closed`. Le diagnostic est lu sous le verrou de l'agent,
+conservé jusqu'à l'écriture du début de tour ; l'échéance et la porte hôte
+sont contrôlées à nouveau dans cette écriture. Un refus par le fencing de
+l'enveloppe renvoie `lease_lost`. L'opération booléenne existante est conservée.
+
+Le runner restitue la consigne avant de rendre le bail pour une porte hôte
+fermée ; une perte de bail arrête le worker et les autres refus attendent
+avec une reprise exponentielle bornée.

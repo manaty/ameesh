@@ -2328,6 +2328,23 @@ class AgentWorker(threading.Thread):
                          kwargs={"grace": 1.0}, daemon=True,
                          name="%s-withdraw" % self.name).start()
 
+    def _begin_turn_refused(self, reason: str) -> None:
+        """#5856: a refused admission must not become an immediate retry."""
+        log("[%s] turn admission refused: %s" % (self.name, reason))
+        registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        if reason in ("lease_lost", "lease_expired", "missing", "handoff_fenced", "stopped"):
+            self.lease_lost.set()
+        elif reason == "host_closed":
+            self.host_yield = "turn admission: host claims closed"
+            self._leave_for_host()
+        else:
+            retry = getattr(self, "_begin_turn_retry", None)
+            if retry is None:
+                retry = self._begin_turn_retry = Reprise(self.runner.db_retry_max)
+            delay = retry.echec()
+            self.wake.wait(timeout=self.wait_timeout(delay))
+            self.wake.clear()
+
     def _leave_for_host(self) -> None:
         """L159f : porte d'hôte fermée — plus aucun tour ici. Session écrite,
         consigne éventuelle remise en attente, statut dit ; le bail est rendu
@@ -8620,19 +8637,21 @@ class AgentWorker(threading.Thread):
         # visible des autres runners dès le commit, même avec un écart nul.
         # Un tour refusé ici n'a pas commencé : consigne remise, pas un échec.
         marqueurs = self._marqueurs_durables("%s turn (%s)" % (shown, harness))
+        begin_reason = "unknown"
+
+        def begin(tx):
+            nonlocal begin_reason
+            begin_reason = registry.begin_turn_diagnosed(
+                tx, self.name, self.runner.runner_id, self.epoch, marqueurs)
+            return begin_reason == "started"
+
         admission = account_window.claim_start(
             self.db, harness, getattr(compte, "name", None), self.cfg.host,
             self.name, profile=compte,
-            begin=lambda tx: registry.begin_turn(
-                tx, self.name, self.runner.runner_id, self.epoch, marqueurs))
+            begin=begin)
         if not admission.ok:
             if admission.begin_failed:
-                # L87b: pause may have won the row lock after pick/run_turn.
-                # Return a prompt already taken, without rewriting concurrent status.
-                registry.restore_prompt(self.db, self.name, self.runner.runner_id,
-                                        self.epoch)
-                log("[%s] lease lost, agent stopped or operator paused before the turn"
-                    % self.name)
+                self._begin_turn_refused(begin_reason)
                 return False
             log("[%s] turn postponed: %s" % (self.name, admission.reason))
             self._admission_reportee = True
@@ -8644,15 +8663,11 @@ class AgentWorker(threading.Thread):
                                 status_text=admission.reason)
             return False
         if not admission.begun:
-            if not registry.begin_turn(self.db, self.name, self.runner.runner_id,
-                                       self.epoch, marqueurs):
-                # L87b: pause may have won the row lock after pick/run_turn.
-                # Return a prompt already taken, without rewriting concurrent status.
-                registry.restore_prompt(self.db, self.name, self.runner.runner_id,
-                                        self.epoch)
-                log("[%s] lease lost, agent stopped or operator paused before the turn"
-                    % self.name)
+            if not begin(self.db):
+                self._begin_turn_refused(begin_reason)
                 return False
+        if getattr(self, "_begin_turn_retry", None) is not None:
+            self._begin_turn_retry.retablie()
         if spec.get("_etapes") is not None:
             spec["_etapes"]["admitted_ts"] = time.time()  # #3218
         lot = spec.get("lot")
@@ -10392,7 +10407,7 @@ class AgentWorker(threading.Thread):
                     # la boucle principale se remplace ensuite.
                     log("[%s] outdated runner: no new turn, lease released" % self.name)
                     break
-                if self.runner.gate_holds():
+                if self.host_yield is not None or self.runner.gate_holds():
                     # L159f : porte d'hôte fermée — le bail est rendu (finally)
                     self._leave_for_host()
                     break
@@ -10516,6 +10531,8 @@ class AgentWorker(threading.Thread):
                     self.fast_failures = 0
                     self._host_reason, self._host_delay = "", 0.0  # L106
                     continue
+                if self.lease_lost.is_set():
+                    break
                 if self.host_yield is not None or self.runner.gate_holds():
                     continue  # L112 : retrait de l'hôte, pas un échec de tour
                 if self.fast_failure:

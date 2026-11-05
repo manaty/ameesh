@@ -113,8 +113,8 @@ class TableTest(unittest.TestCase):
         # #286/B14 ajoute mailbox.unread_human_page (curseur au-delà d'un
         # préfixe de plus de 200 humains retenus) ; contrat 1.7 : #288/L80b
         # ajoute turn_costs.insert(inputs) (attribution des messages).
-        self.assertEqual(len(self.c.operations), 72)
-        self.assertEqual(sum(o.write for o in ops), 43)
+        self.assertEqual(len(self.c.operations), 73)
+        self.assertEqual(sum(o.write for o in ops), 44)
         self.assertEqual(sum(not o.write for o in ops), 29)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
         # contrat 1.1 : lignes de la route op servies aussi par session/op
@@ -122,7 +122,7 @@ class TableTest(unittest.TestCase):
                          ["agents.resolve_name", "mailbox.deliver", "mailbox.release", "mailbox.reserve",
                           "mailbox.unread", "mailbox.unread_human",
                           "mailbox.unread_human_page", "threads.index", "threads.recount"])
-        self.assertEqual(self.c.version, "1.10.0")
+        self.assertEqual(self.c.version, "1.11.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 

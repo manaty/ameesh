@@ -1561,27 +1561,48 @@ class Leases(interface.Leases):
         return rows[0]["pending_prompt"] if rows else None
 
     def begin_turn(self, name, owner, epoch, status_text) -> bool:
-        rows = self.db.query(
-            """
-            WITH verrou AS (
-                SELECT name, status, handoff_fenced, operator_paused, lease_owner, lease_epoch, lease_expires_at
-                  FROM agent_registry WHERE name = %s FOR UPDATE
+        return self.begin_turn_diagnosed(name, owner, epoch, status_text) == "started"
+
+    def begin_turn_diagnosed(self, name, owner, epoch, status_text) -> str:
+        # Diagnose from the locked row and the same clock and host gate used
+        # for admission; a later read could describe an unrelated transition.
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                SELECT CASE
+                    WHEN lease_owner IS DISTINCT FROM %s
+                      OR lease_epoch IS DISTINCT FROM %s THEN 'lease_lost'
+                    WHEN lease_expires_at IS NULL
+                      OR lease_expires_at <= clock_timestamp() THEN 'lease_expired'
+                    WHEN handoff_fenced THEN 'handoff_fenced'
+                    WHEN operator_paused THEN 'operator_paused'
+                    WHEN status = 'stopped' THEN 'stopped'
+                    WHEN NOT ameesh_agent_claims_open(host, name) THEN 'host_closed'
+                    ELSE 'started' END AS reason
+                FROM (SELECT * FROM agent_registry WHERE name = %s FOR UPDATE) AS verrou
+                """,
+                (owner, epoch, name),
             )
-            UPDATE agent_registry AS r
-               SET status = 'running', status_text = %s, updated_at = now()
-              FROM verrou
-             WHERE r.name = verrou.name
-               AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
-               AND verrou.lease_expires_at > clock_timestamp()
-               AND NOT verrou.handoff_fenced
-               AND NOT verrou.operator_paused
-               AND ameesh_agent_claims_open(r.host, r.name)
-               AND verrou.status <> 'stopped'   -- arrêté entre lecture et tour (L35)
-            RETURNING r.name
-            """,
-            (name, status_text, owner, epoch),
-        )
-        return bool(rows)
+            reason = rows[0]["reason"] if rows else "missing"
+            if reason != "started":
+                return reason
+            rows = tx.query(
+                """
+                UPDATE agent_registry
+                   SET status = 'running', status_text = %s, updated_at = now()
+                 WHERE name = %s AND lease_expires_at > clock_timestamp()
+                   AND ameesh_agent_claims_open(host, name)
+                RETURNING name
+                """,
+                (status_text, name),
+            )
+            if rows:
+                return "started"
+            rows = tx.query(
+                """SELECT CASE WHEN lease_expires_at <= clock_timestamp()
+                               THEN 'lease_expired' ELSE 'host_closed' END AS reason
+                     FROM agent_registry WHERE name = %s""", (name,))
+            return rows[0]["reason"]
 
     def restore_prompt(self, name, owner, epoch) -> bool:
         rows = self.db.query(
