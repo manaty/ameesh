@@ -798,6 +798,8 @@ class AgentWorker(threading.Thread):
         self._heartbeat_done: threading.Event | None = None
         self._renew_lock = threading.Lock()
         self._preparation_phase: tuple[str, float] | None = None
+        #: #5826 : harnais lancés ; une phase qui en contient un repart à zéro
+        self._launches = 0
         #: r3 : les appels de renouvellement détachés (sans réponse dans
         #: `call_budget()`) : l'un d'eux peut encore prolonger le bail en base
         self.renewals: list[threading.Thread] = []
@@ -1301,6 +1303,27 @@ class AgentWorker(threading.Thread):
         self.lease_held_until = self._held_until()
         return True
 
+    def renew_if_due(self) -> bool:
+        """#5826 : renouvellement explicite **seulement si le battement a pris du retard**.
+
+        Depuis #5806 le battement couvre toute la vie du worker et renouvelle
+        tous les `ttl/3` : renouveler aussi à chaque passe de boucle et à
+        chaque tranche d'attente doublait les appels sur la connexion
+        partagée. Tant que plus de la moitié du bail reste, le battement l'a
+        renouvelé il y a moins d'un demi-intervalle : rien à faire, sans E/S.
+        En deçà (battement affamé, panne), le renouvellement a lieu ici comme
+        avant : la garde de #1270 et #2139 reste entière.
+        """
+        lost = getattr(self, "lease_lost", None)
+        if lost is not None and lost.is_set():
+            return False
+        ttl = float(getattr(self.runner, "lease_ttl", 0) or 0)
+        if ttl > 0 and self.lease_deadline > 0:
+            reste = self.lease_deadline - _clock_of(self).time()
+            if reste > ttl / 2.0:
+                return True
+        return self.renew()
+
     def _held_until(self) -> float:
         return _clock_of(self).monotonic() + float(self.runner.lease_ttl)
 
@@ -1769,13 +1792,56 @@ class AgentWorker(threading.Thread):
 
     @contextmanager
     def _preparing(self, phase: str):
-        """Le battement décrit une préparation lente sans attendre sa fin."""
+        """Le battement décrit une préparation lente sans attendre sa fin.
+
+        #5826 : une phase qui a lancé un harnais (résumé de rotation, tour
+        imbriqué) reprend avec une horloge neuve : la durée du harnais n'est
+        pas de la préparation et ne doit pas atteindre la borne.
+        """
         previous = getattr(self, "_preparation_phase", None)
+        launches = getattr(self, "_launches", 0)
         self._preparation_phase = (phase, _clock_of(self).monotonic())
         try:
             yield
         finally:
+            if previous is not None and getattr(self, "_launches", 0) != launches:
+                previous = (previous[0], _clock_of(self).monotonic())
             self._preparation_phase = previous
+
+    #: #5826 : durée maximale d'une préparation de tour (secondes ; 0 = sans
+    #: borne), sauf `max_preparation` de l'exécuteur (AMEESH_MAX_PREPARATION).
+    MAX_PREPARATION_S = 900.0
+
+    def _preparation_bound(self) -> float:
+        borne = getattr(self.runner, "max_preparation", None)
+        if isinstance(borne, bool) or not isinstance(borne, (int, float)):
+            return self.MAX_PREPARATION_S  # doublure de banc sans réglage
+        return float(borne)
+
+    def _abandon_preparation(self, phase: str, elapsed: float, borne: float) -> None:
+        """#5826 : préparation figée au-delà de la borne — tour abandonné, bail rendu.
+
+        Le fil du worker est bloqué : on ne peut pas le faire revenir. On
+        pose `lease_lost` et le verrou d'arrêt (`stop_group_now`) d'abord,
+        sans E/S, pour qu'aucun harnais ne parte s'il se débloque ; puis le
+        bail est rendu en base (fencé par l'époque) pour qu'un autre
+        exécuteur reprenne l'agent sans attendre l'échéance. Raison distincte
+        de « lease deadline reached » : une préparation lente mais vivante
+        (#5806, IMA : ~75 s) reste très en deçà de la borne.
+        """
+        raison = "preparation stuck %ds in %s (bound %ds)" % (elapsed, phase, borne)
+        self.lease_lost.set()
+        self.stop_group_now(raison, grace=0, hard=True)
+        log_async("[%s] %s: turn abandoned, lease released" % (self.name, raison))
+        try:
+            rendu = registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
+        except Exception as exc:  # base figée elle aussi : l'échéance le rendra
+            log_async("[%s] preparation abandoned: lease not released (%s), "
+                      "it expires within %ds" % (self.name, exc, self.runner.lease_ttl))
+            return
+        if not rendu:
+            log_async("[%s] preparation abandoned: lease already gone (epoch %d)"
+                      % (self.name, self.epoch))
 
     def _heartbeat(self, stop_event: threading.Event) -> None:
         self.ensure_watchdog()
@@ -1796,13 +1862,19 @@ class AgentWorker(threading.Thread):
         attente = self.renew_wait(interval)
         while not stop_event.wait(self.wait_timeout(attente)):
             phase = getattr(self, "_preparation_phase", None)
+            if self.watchdog_stop.is_set() or self.lease_lost.is_set():
+                return
             if phase is not None:
                 elapsed = _clock_of(self).monotonic() - phase[1]
+                borne = self._preparation_bound()
+                # un harnais publié n'est plus une préparation, quelle que soit
+                # la phase restée posée (chemin de lancement oublié)
+                if borne > 0 and elapsed >= borne and getattr(self, "proc", None) is None:
+                    self._abandon_preparation(phase[0], elapsed, borne)
+                    return
                 if elapsed >= interval:
                     log_async("[%s] preparation waiting: %s (%.1fs elapsed)"
                               % (self.name, phase[0], elapsed))
-            if self.watchdog_stop.is_set() or self.lease_lost.is_set():
-                return
             if not self.renew():
                 return
             if self.renew_failures:
@@ -4124,7 +4196,7 @@ class AgentWorker(threading.Thread):
                           % (self.name, quoi, db_mod.explain(exc), int(attente),
                              reprise.echecs))
                 self.runner.stop.wait(self.wait_timeout(attente))
-                if not self.renew() or self.lease_lost.is_set():
+                if not self.renew_if_due() or self.lease_lost.is_set():
                     raise
                 continue
             bilan = reprise.retablie()
@@ -7604,6 +7676,7 @@ class AgentWorker(threading.Thread):
         bail suivant les re-livrera en le disant.
         """
         self._preparation_phase = None  # le harnais a démarré
+        self._launches = getattr(self, "_launches", 0) + 1
         if not spec.get("jeton"):
             return
         self._courrier_lance = True
@@ -8872,6 +8945,12 @@ class AgentWorker(threading.Thread):
             registry.set_status(self.db, self.name, "idle",
                                 status_text="wake outdated: no turn")
             return False
+        if self.lease_lost.is_set():
+            # #5826 : bail perdu pendant la préparation (borne, échéance) : le
+            # harnais ne part pas pour être tué à sa publication.
+            self._annule_tour_avant_lancement(marqueur, spend_key)
+            log_async("[%s] lease lost during preparation: no turn" % self.name)
+            return False
 
         preempt_done = threading.Event()
         preempt_thread = threading.Thread(
@@ -10026,7 +10105,7 @@ class AgentWorker(threading.Thread):
                 return
             self.wake.wait(timeout=self.renew_wait(reste))
             self.wake.clear()
-            if not self.renew():
+            if not self.renew_if_due():
                 return
 
     def _attendre_apres_echec(self, duree: float) -> None:
@@ -10048,7 +10127,7 @@ class AgentWorker(threading.Thread):
             self.wake.clear()
             if reveil or tranche >= reste:
                 return
-            if not self.renew():
+            if not self.renew_if_due():
                 return
 
     def failure_wait(self) -> float:
@@ -10630,6 +10709,8 @@ class Runner:
         self.train_role = train_role
         self.train_service = None
         self.lease_ttl = cfg.lease_ttl
+        #: #5826 : borne d'une préparation de tour (0 = sans borne)
+        self.max_preparation = getattr(cfg, "max_preparation", AgentWorker.MAX_PREPARATION_S)
         #: #2600 : horloge des workers de cet exécuteur (simulée en test).
         self.clock = SYSTEM_CLOCK
         self.idle_nudge = cfg.idle_nudge

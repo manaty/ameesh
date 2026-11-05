@@ -843,8 +843,11 @@ class BailTest(_Base):
         self.assertEqual([round(b - a, 3) for a, b in zip(appels[:3], appels[1:4])],
                          [2.0, 2.0, 2.0],
                          "les essais en panne ne sont pas espacés : %r" % (appels,))
-        # retour de la base : la cadence nominale (ttl/3) reprend
-        self.assertEqual(round(appels[4] - appels[3], 3), 100.0,
+        # retour de la base : la cadence nominale reprend. #5826 : la boucle ne
+        # renouvelle plus qu'au-delà de la moitié du bail (le battement du
+        # worker, figé sur cette horloge virtuelle, s'en charge sinon) : deux
+        # tranches de ttl/3, puis le renouvellement à 100 s de l'échéance.
+        self.assertEqual(round(appels[4] - appels[3], 3), 200.0,
                          "la cadence nominale ne reprend pas : %r" % (appels,))
         self.assertFalse(worker.lease_lost.is_set(),
                          "le bail a été perdu pendant la panne")
@@ -974,6 +977,9 @@ class CadenceTest(unittest.TestCase):
         faux.lease_deadline = time.time() + 1e6
         faux.renew_wait = lambda cap: AgentWorker.renew_wait(faux, cap)
         faux.renew = lambda: (renews.append(round(horloge["t"], 6)), True)[-1]
+        # #5826 : la cadence des tranches est sondée ici, sans le battement
+        # qui ferait sauter ces renouvellements (politique : test_5826)
+        faux.renew_if_due = lambda: faux.renew()
         faux.wake = SimpleNamespace(
             wait=lambda timeout: (horloge.__setitem__("t", horloge["t"] + timeout),
                                   False)[-1],
