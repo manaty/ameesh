@@ -55,22 +55,36 @@ class FingerprintWatch(interface.FingerprintWatch):
         return new_row if freshness(new_row) >= freshness(old_row) else old_row
 
     def failing(self):
-        # The new sources first; the old table covers a production source the
-        # new pass has not written yet (old process held the lease last).
+        # One row per (project, environment): the **most recently written**
+        # state of the two tables.  A 1.39.0 process holding the lease after
+        # the migration writes only the historical table, so its newer failure
+        # must stay visible even when the new table still carries a healthy
+        # row (#5968 review P2); conversely a newer new-table success clears an
+        # older old-table failure.  ``updated_at`` is the last write on either
+        # side; a failure keeps ``last_read_at``, so it is not the freshness
+        # signal here.
         return self.db.query(
-            "SELECT project, environment, url, last_error,"
-            "       extract(epoch FROM last_read_at) AS last_read_ts,"
-            "       extract(epoch FROM updated_at) AS updated_ts"
-            " FROM fingerprint_source_state WHERE last_error <> ''"
-            " UNION ALL"
-            " SELECT w.project, 'production', w.url, w.last_error,"
-            "       extract(epoch FROM w.last_read_at),"
-            "       extract(epoch FROM w.updated_at)"
-            " FROM fingerprint_watch_state w"
-            " WHERE w.last_error <> ''"
-            "   AND NOT EXISTS (SELECT 1 FROM fingerprint_source_state s"
-            "                   WHERE s.project = w.project"
-            "                     AND s.environment = 'production')"
+            "SELECT project, environment, url, last_error, last_read_ts,"
+            "       updated_ts"
+            " FROM ("
+            "   SELECT DISTINCT ON (project, environment)"
+            "          project, environment, url, last_error, last_read_ts,"
+            "          updated_ts"
+            "   FROM ("
+            "     SELECT project, environment, url, last_error,"
+            "            extract(epoch FROM last_read_at) AS last_read_ts,"
+            "            extract(epoch FROM updated_at) AS updated_ts"
+            "     FROM fingerprint_source_state"
+            "     UNION ALL"
+            "     SELECT w.project, 'production', w.url, w.last_error,"
+            "            extract(epoch FROM w.last_read_at),"
+            "            extract(epoch FROM w.updated_at)"
+            "     FROM fingerprint_watch_state w"
+            "   ) AS candidates"
+            "   ORDER BY project, environment, updated_ts DESC,"
+            "            last_read_ts DESC, url"
+            " ) AS latest"
+            " WHERE last_error <> ''"
             " ORDER BY project, environment")
 
     def advance(self, project, url, cursor, *, environment="production", now=None):
@@ -103,6 +117,12 @@ class FingerprintWatch(interface.FingerprintWatch):
             "     updated_at)"
             " VALUES (%s, %s, %s, NULL, NULL, %s, coalesce(to_timestamp(%s), now()))"
             " ON CONFLICT (project, environment) DO UPDATE SET"
+            "    cursor = CASE"
+            "        WHEN fingerprint_source_state.url IS DISTINCT FROM EXCLUDED.url"
+            "        THEN NULL ELSE fingerprint_source_state.cursor END,"
+            "    last_read_at = CASE"
+            "        WHEN fingerprint_source_state.url IS DISTINCT FROM EXCLUDED.url"
+            "        THEN NULL ELSE fingerprint_source_state.last_read_at END,"
             "    url = EXCLUDED.url,"
             "    last_error = EXCLUDED.last_error,"
             "    updated_at = EXCLUDED.updated_at",
@@ -114,9 +134,11 @@ class FingerprintWatch(interface.FingerprintWatch):
         """Keep the N-1 production row current, with its own old contract.
 
         A success moves the old cursor and clears its error; a failure keeps
-        the old cursor and records the error.  The old table's primary key is
-        `project`, so its upsert is `ON CONFLICT (project)` — exactly what a
-        1.39.0 process still in service expects.
+        the old cursor and records the error.  When the URL changed, the old
+        cursor belongs to another journal: the failure drops it (and the read
+        time) so the new journal restarts from its beginning.  The old table's
+        primary key is `project`, so its upsert is `ON CONFLICT (project)` —
+        exactly what a 1.39.0 process still in service expects.
         """
         if success:
             self.db.execute(
@@ -134,6 +156,12 @@ class FingerprintWatch(interface.FingerprintWatch):
                 "INSERT INTO fingerprint_watch_state (" + OLD_COLUMNS + ")"
                 " VALUES (%s, %s, NULL, NULL, %s, coalesce(to_timestamp(%s), now()))"
                 " ON CONFLICT (project) DO UPDATE SET"
+                "    cursor = CASE"
+                "        WHEN fingerprint_watch_state.url IS DISTINCT FROM EXCLUDED.url"
+                "        THEN NULL ELSE fingerprint_watch_state.cursor END,"
+                "    last_read_at = CASE"
+                "        WHEN fingerprint_watch_state.url IS DISTINCT FROM EXCLUDED.url"
+                "        THEN NULL ELSE fingerprint_watch_state.last_read_at END,"
                 "    url = EXCLUDED.url,"
                 "    last_error = EXCLUDED.last_error,"
                 "    updated_at = EXCLUDED.updated_at",

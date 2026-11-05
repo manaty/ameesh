@@ -50,8 +50,8 @@ class SourceStateTest(PgTestCase):
 
     def old_state(self, project):
         rows = self.db.query(
-            "SELECT cursor, last_error FROM fingerprint_watch_state"
-            " WHERE project = %s", (project,))
+            "SELECT cursor, last_error, url, last_read_at"
+            " FROM fingerprint_watch_state WHERE project = %s", (project,))
         return rows[0] if rows else None
 
     # -- the old contract survives the migration ----------------------------
@@ -120,6 +120,56 @@ class SourceStateTest(PgTestCase):
                       environment="staging", now=1000)
         self.assertIsNone(self.old_state("acme"))
         self.assertEqual(len(self.api.failing()), 1)
+
+    def test_a_url_change_drops_the_foreign_cursor_on_the_mirror_too(self):
+        # #5968 review P2: a failure after the endpoint changed must not leave
+        # the old journal's cursor under the new URL — the next read would send
+        # cursor-A to journal B and could skip entries.  The N-1 mirror follows
+        # the same rule, so a 1.39.0 takeover does not inherit it either.
+        self.api.advance("acme", "https://a.acme.test/f", "cursor-a", now=1000)
+        self.api.fail("acme", "https://b.acme.test/f", "HTTP 503", now=1061)
+        state = self.api.state("acme", "production")
+        self.assertEqual(state["url"], "https://b.acme.test/f")
+        self.assertIsNone(state["cursor"])
+        self.assertIsNone(state["last_read_ts"])
+        old = self.old_state("acme")
+        self.assertEqual(old["url"], "https://b.acme.test/f")
+        self.assertIsNone(old["cursor"])
+        self.assertIsNone(old["last_read_at"])
+
+    def test_a_same_url_failure_keeps_the_cursor(self):
+        # The reset is tied to the URL change, never to a transient failure.
+        self.api.advance("acme", "https://prod.acme.test/f", "cursor", now=1000)
+        self.api.fail("acme", "https://prod.acme.test/f", "HTTP 503", now=1061)
+        state = self.api.state("acme", "production")
+        self.assertEqual(state["cursor"], "cursor")
+        self.assertIsNotNone(state["last_read_ts"])
+        old = self.old_state("acme")
+        self.assertEqual(old["cursor"], "cursor")
+        self.assertIsNotNone(old["last_read_at"])
+
+    def test_an_old_failure_after_a_healthy_new_read_is_alerted(self):
+        # #5968 review P2: the migration seeds production, then a 1.39.0
+        # process holding the lease fails.  That failure is the most recent
+        # state of production and must reach the alerts, even though a healthy
+        # new-table row exists.
+        self.api.advance("acme", "https://prod.acme.test/f", "new", now=1000)
+        self.old_fail("acme", "https://prod.acme.test/f", "HTTP 401")
+        failing = self.api.failing()
+        self.assertEqual(len(failing), 1)
+        self.assertEqual(failing[0]["url"], "https://prod.acme.test/f")
+        self.assertEqual(failing[0]["environment"], "production")
+        self.assertIn("HTTP 401", failing[0]["last_error"])
+        # A later successful production read clears it.
+        self.api.advance("acme", "https://prod.acme.test/f", "newer", now=2000)
+        self.assertEqual(self.api.failing(), [])
+
+    def test_a_stale_new_failure_is_cleared_by_a_newer_old_read(self):
+        # The reverse takeover: the old process read later than the new one
+        # failed; the old healthy row is the current production state.
+        self.api.fail("acme", "https://prod.acme.test/f", "HTTP 401", now=1000)
+        self.old_advance("acme", "https://prod.acme.test/f", "old-later")
+        self.assertEqual(self.api.failing(), [])
 
     def test_state_takes_the_most_recent_production_cursor(self):
         # New code advances, then an old process takes the lease back and

@@ -525,6 +525,23 @@ class TickTest(PgTestCase):
                             for note in (row["note"] for row in self.db.query(
                                 "SELECT note FROM work_item_events"))))
 
+    def test_a_changed_endpoint_does_not_lend_its_cursor(self):
+        # #5968 review P2: a failure at the new URL must not leave the old
+        # journal's cursor behind; the next tick reads from the beginning.
+        api = storage.of(self.db).fingerprints
+        api.advance("nexlink", "https://old.example.test/f", "old-cursor",
+                    now=1000.0)
+        api.fail("nexlink", "https://new.example.test/f", "HTTP 503",
+                 now=1000.0)
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([declaration(
+                                   url="https://new.example.test/f")], "")), \
+                mock.patch.object(fingerprints, "read_page",
+                                  return_value=page()) as read:
+            fingerprints.tick(self.cfg, self.db,
+                              token_file=self.token_file(), now=2000.0)
+        self.assertIsNone(read.call_args.args[1])
+
     def test_each_source_reads_its_own_token_file(self):
         staging = declaration(url="https://staging.example.test/f",
                               environment="staging")
