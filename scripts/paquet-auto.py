@@ -3432,6 +3432,14 @@ def lot_author(lot: int, repo: Path) -> str:
     return str(item.get("assignee") or "").strip()
 
 
+def unit_red_bound_label() -> str:
+    """#5989 : la borne de `packet_unit_red`, lue à sa source, jamais recopiée."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+    from ameesh import packet_unit_red
+    hours = packet_unit_red.EXCLUSION_S / 3600
+    return ('%d h' % hours) if hours == int(hours) else ('%g h' % hours)
+
+
 def remember_unit_red(repo: Path, lot: int, source: str, target: str,
                       tests: list[str], sender: str | None, *, base=None) -> bool:
     """#5971 : note durable par base avant recomposition ; False si déjà signalé.
@@ -3499,8 +3507,9 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
             % (removal.lot, name, why, tests))
         if sources is not None:
             body += (' Source : %s. Mémoire sur le lot : cette source est exclue '
-                     'pendant au plus une heure depuis le premier retrait ; '
-                     'une nouvelle source est réadmise immédiatement.' % sources[removal.lot])
+                     'pendant au plus %s depuis le premier retrait ; '
+                     'une nouvelle source est réadmise immédiatement.'
+                     % (sources[removal.lot], unit_red_bound_label()))
         try:
             send_mail(author, removal.lot, body, sender)
         except PaquetAutoError as exc:

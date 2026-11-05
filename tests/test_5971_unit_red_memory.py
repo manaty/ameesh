@@ -137,6 +137,9 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(remember.call_args.kwargs["base"], X)
         mail.assert_called_once()
         self.assertIn('tests.test_bug', mail.call_args.args[2])
+        # #5989 : le courrier lit la borne à sa source, jamais « une heure ».
+        self.assertIn(paquet_auto.unit_red_bound_label(), mail.call_args.args[2])
+        self.assertNotIn('une heure', mail.call_args.args[2])
 
 
 from .support import PgTestCase
