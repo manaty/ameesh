@@ -144,8 +144,44 @@ du code et peut précéder B : il retire immédiatement le coût des sessions
 courtes au serveur sans toucher au code, B et C réduisent ensuite le nombre
 d'allers-retours.
 
+## Preuves serveur (bureau #194529, 19:34-19:35Z)
+
+Reçus sur agents-3 : `/home/ameesh/preparation-5972-20261105/server-evidence/`
+(`5972-central-grouped-activity-20261105.json`,
+`5972-central-TIMEWAIT-two-snapshots-20261105.json`, et les reçus #5764).
+
+- **TIME_WAIT vide** côté serveur et côté clients, aux deux relevés : le
+  stock ne donne pas de taux par IP ici (hypothèse : PostgreSQL dans un
+  espace réseau à part, conteneur ; non vérifié). Aucun processus ameesh
+  natif sur le central : `serve` et les minuteries n'y tournent pas.
+- **Runners par hôte**, lus sur les sessions `LISTEN` longues : agents-2 20,
+  agents-1 16, agents-3 8 ; pc-smichea (10.77.0.2) passe par PgBouncer
+  (`DISCARD ALL`, 4 sessions serveur). Le total de 44 runners recoupe le
+  registre.
+- **Sessions de moins d'1 s : surtout agents-2.** On y voit
+  `schema_non_additive_migrations` (actif, 0,3-0,8 s), `agent_registry.*`
+  (`registry.get`), `INSERT INTO host_release_locks`, `INSERT INTO
+  merge_locks`, `work_items`. La lecture de compatibilité écrivain est à
+  chaque fois l'instruction d'une session neuve, ce qui confirme la source 2.
+  Elle figure aussi 18 fois sur 16 échantillons dans le relevé de 19:00Z
+  (signature 770a6673deab1aaf), juste après `OVERVIEW_SQL` (33) et
+  `registry.get` (20).
+- `merge_locks` et `host_release_locks` désignent le train, le paquet et la
+  libération d'hôte (`train_runner.py`, `host_release_once`, 60 s) : agents-2
+  porte des rôles élus en plus de ses 20 runners. Les ~65/s non expliqués
+  par le taux mesuré par runner (~0,55/s × 44 ≈ 24/s) se concentrent donc
+  vraisemblablement sur agents-2 : passes du train par `ScopedDb`, minuteries
+  de rôle (alertes 30 s, release 60 s, observation 60-90 s), `serve` s'il y
+  tourne. Sans taux par IP, cette part reste une inférence.
+
+Conséquence : sans `application_name`, l'attribution par famille reste une
+inférence. **Le lot A passe en premier** : une seule photo de
+`pg_stat_activity` (ou un relevé de `backend_start` récents) groupée par
+`application_name` donnera ensuite la part exacte de chaque famille.
+
 ## En attente
 
-Lectures serveur demandées au bureau (courrier du 2026-11-05) : TIME_WAIT
-par IP cliente sur 5432 (taux exact par hôte, connexions locales comprises),
-photo `pg_stat_activity` groupée, processus ameesh sur manaty-mesh-1.
+Demandé au bureau, en lecture seule : la valeur de `log_connections` (si
+elle est déjà active, les journaux existants donnent le taux par IP), et la
+liste des processus ameesh hors runners sur agents-2 (serve, minuteries,
+train). Rien ne bloque la création des lots A à G.
