@@ -304,6 +304,10 @@ def body(watch: ProjectWatch, at: dict, payload: dict, *, now: float | None = No
         lines.append("  #%-5d %s  %s" % (lot, str(entry.get("source")
                                                   or entry.get("published_head") or "")[:12],
                                          entry.get("branch") or ""))
+    for entry in payload.get("candidates") or ():
+        for cause in entry.get("causes") or ():
+            if cause.get("code") == "unit-tests-red":
+                lines.append("  #%s %s" % (entry["work_item"], cause["detail"]))
     if payload.get("errors"):
         # #3813 : une erreur propre à un lot laisse les autres composables.
         lines += ["", "Lectures impossibles (lots à écarter) :"]

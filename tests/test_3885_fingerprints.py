@@ -80,24 +80,44 @@ class PrimitiveTest(PgTestCase):
                      "Environnement : production"):
             self.assertIn(text, item["body"])
 
-    def test_a_staging_lot_is_marked_and_the_identity_stays_shared(self):
+    def test_a_staging_lot_is_marked_capped_p2_and_the_identity_stays_shared(self):
         first = self.open(users=1, environment="staging")
         self.assertTrue(first["created"])
         self.assertEqual(first["environment"], "staging")
+        # #5987: one user on staging is a tester, not a P1.
+        self.assertEqual(first["priority"], 2)
         item = work.get(self.db, first["lot"])
         self.assertTrue(item["title"].startswith("[staging] "), item["title"])
         self.assertIn("Environnement : staging", item["body"])
+        self.assertIn("P2 au plus", item["body"])
+        self.assertEqual(item["priority"], 2)
         self.assertEqual(item["source"],
                          "empreinte:ameesh:v1:0123456789abcdef0123456789abcdef")
-        # production sees the same fingerprint: one lot, noted, not a second
+        # production sees the same fingerprint: one lot, noted, not a second,
+        # and a real user there still promotes it to P1.
         second = self.open(users=1, environment="production")
         self.assertFalse(second["created"])
         self.assertTrue(second["noted"])
+        self.assertTrue(second["escalated"])
         self.assertEqual(second["lot"], first["lot"])
+        self.assertEqual(second["priority"], 1)
         self.assertEqual(len(self.rows()), 1)
         self.assertTrue(any("environnement=production" in note
                             for note in self.notes(first["lot"])))
         self.assertTrue(work.get(self.db, first["lot"])["title"].startswith("[staging] "))
+        self.assertEqual(work.get(self.db, first["lot"])["priority"], 1)
+
+    def test_a_staging_occurrence_never_promotes_an_open_lot(self):
+        first = self.open(users=0)
+        second = self.open(users=3, count=9, environment="staging")
+        self.assertFalse(second["created"])
+        self.assertTrue(second["noted"])
+        self.assertFalse(second["escalated"])
+        self.assertEqual(second["priority"], 2)
+        self.assertEqual(work.get(self.db, first["lot"])["priority"], 2)
+        notes = self.notes(first["lot"])
+        self.assertTrue(any("staging : pas d'escalade P1" in note
+                            for note in notes), notes)
 
     def test_an_unknown_environment_is_refused(self):
         with self.assertRaisesRegex(fingerprints.FingerprintError, "environment"):
@@ -524,6 +544,33 @@ class TickTest(PgTestCase):
         self.assertTrue(any("environnement=production" in note
                             for note in (row["note"] for row in self.db.query(
                                 "SELECT note FROM work_item_events"))))
+
+    def test_a_staging_pass_opens_p2_then_a_production_pass_promotes(self):
+        # #5987: a staging-only source never gives P1; the production
+        # occurrence of the same fingerprint still promotes the shared lot.
+        payload = page()
+        staging = declaration(url="https://staging.example.test/f",
+                              environment="staging")
+        production = declaration(url="https://prod.example.test/f")
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([staging], "")), \
+                mock.patch.object(fingerprints, "read_page", return_value=payload):
+            opened = fingerprints.tick(self.cfg, self.db,
+                                       token_file=self.token_file(), now=1000.0)
+        self.assertEqual(len(opened), 2)
+        self.assertEqual([row["priority"] for row in opened], [2, 2])
+        self.assertEqual([row["priority"] for row in self.db.query(
+            "SELECT id, priority FROM work_items ORDER BY id")], [2, 2])
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([production], "")), \
+                mock.patch.object(fingerprints, "read_page", return_value=payload):
+            noted = fingerprints.tick(self.cfg, self.db,
+                                      token_file=self.token_file(), now=1061.0)
+        self.assertEqual(len(noted), 2)
+        self.assertTrue(all(not row["created"] and row["noted"] for row in noted))
+        self.assertEqual([row["escalated"] for row in noted], [True, False])
+        self.assertEqual([row["priority"] for row in self.db.query(
+            "SELECT id, priority FROM work_items ORDER BY id")], [1, 2])
 
     def test_a_changed_endpoint_does_not_lend_its_cursor(self):
         # #5968 review P2: a failure at the new URL must not leave the old

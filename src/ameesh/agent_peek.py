@@ -157,11 +157,15 @@ def sanitise(payload):
 
 
 class Publisher:
-    """One daemon per live worker, own bounded-time connection, no model calls."""
+    """One daemon per live worker, one guarded connection, no model calls."""
     def __init__(self, cfg, *, agent, owner, epoch, cwd, reader, warn=None):
         self.cfg, self.agent, self.owner, self.epoch = cfg, agent, owner, epoch
         self.cwd, self.reader, self.warn = cwd, reader, warn or (lambda _: None)
         self.stop = threading.Event()
+        #: #5981 : la session de publication est gardée d'une capture à l'autre.
+        #: Une connexion neuve toutes les 15 s par worker saturait la base
+        #: centrale ; elle n'est remplacée qu'après une erreur.
+        self._db = None
         self.thread = threading.Thread(target=self._run, name="peek-" + agent, daemon=True)
         self.thread.start()
 
@@ -169,34 +173,49 @@ class Publisher:
         self.stop.set()
         self.thread.join(timeout=1)
 
+    def _connection(self, cfg):
+        """La connexion gardée, ouverte à la première capture qui en a besoin."""
+        if self._db is None:
+            with db_mod.application("peek", self.agent):
+                db = self._db = db_mod.connect(cfg)
+            if storage.is_remote(db):
+                db.book.hold(self.agent, self.owner, self.epoch)
+        return self._db
+
+    def _drop_connection(self):
+        """Ferme et oublie la connexion ; la capture suivante en ouvre une neuve."""
+        db, self._db = self._db, None
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass  # a broken transport must not kill the publisher thread
+
     def _run(self):
         cfg = dataclasses.replace(self.cfg, statement_timeout_ms=3000, connect_timeout=3)
         failing = False
-        while True:
-            db = None
-            try:
-                with db_mod.application("peek", self.agent):
-                    db = db_mod.connect(cfg)
-                if storage.is_remote(db):
-                    db.book.hold(self.agent, self.owner, self.epoch)
-                payload = sanitise({"workspace": workspace(self.cwd()), "events":
-                    selected_events(os.path.join(cfg.agent_dir(self.agent), "events.jsonl"), self.reader())})
-                if not storage.of(db).operations.publish_peek(
-                        self.agent, self.owner, self.epoch, payload):
-                    break  # lease fenced: never overwrite a successor's snapshot
-                failing = False
-            except Exception:
-                # No exception text: a transport error can contain credentials.
-                # Once per failure streak: an old server refuses every capture.
-                if not failing:
-                    self.warn("agent peek %s: snapshot unavailable" % self.agent)
-                failing = True
-            finally:
-                if db is not None:
-                    db.close()
-            if self.stop.is_set():
-                break
-            self.stop.wait(INTERVAL)  # close wakes one final capture, still fenced
+        try:
+            while True:
+                try:
+                    db = self._connection(cfg)
+                    payload = sanitise({"workspace": workspace(self.cwd()), "events":
+                        selected_events(os.path.join(cfg.agent_dir(self.agent), "events.jsonl"), self.reader())})
+                    if not storage.of(db).operations.publish_peek(
+                            self.agent, self.owner, self.epoch, payload):
+                        break  # lease fenced: never overwrite a successor's snapshot
+                    failing = False
+                except Exception:
+                    # No exception text: a transport error can contain credentials.
+                    # Once per failure streak: an old server refuses every capture.
+                    if not failing:
+                        self.warn("agent peek %s: snapshot unavailable" % self.agent)
+                    failing = True
+                    self._drop_connection()
+                if self.stop.is_set():
+                    break
+                self.stop.wait(INTERVAL)  # close wakes one final capture, still fenced
+        finally:
+            self._drop_connection()
 
 
 def snapshot(db, agent, *, human, limit=10, now=None):

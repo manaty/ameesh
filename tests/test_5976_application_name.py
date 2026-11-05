@@ -117,6 +117,18 @@ class DriverWiringTest(_Restore):
                          "ameesh/runner.scoped.balance/a@ameesh-agents-3")
         self.assertNotIn("application_name", connect.call_args.kwargs)
 
+    @unittest.skipUnless(HAVE_PSYCOPG, "psycopg absent (part psql)")
+    def test_psycopg_reconnexion_garde_le_nom(self):
+        # #5986 : la reconnexion (L72) se fait hors du bloc de l'appelant
+        db_mod.set_application("runner.main", "r")
+        with mock.patch("psycopg.connect") as connect:
+            with db_mod.application("test.reconnect", "x"):
+                driver = db_mod.PsycopgDriver(self.cfg())
+            driver._connect()
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual(connect.call_args.kwargs["fallback_application_name"],
+                         "ameesh/test.reconnect/x@ameesh-agents-3")
+
     def test_scoped_db_nomme_la_passe(self):
         db_mod.set_application("runner.main", "a")
         names = []

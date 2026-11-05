@@ -1188,6 +1188,9 @@ class PsycopgDriver:
         self._psycopg = psycopg
         self._dict_row = dict_row
         self.cfg = cfg
+        #: #5986 : nom de session figé à la construction, dans le bloc
+        #: `application` de l'appelant ; une reconnexion (L72) le reprend
+        self._application_name = application_name()
         #: reconnexion après une coupure (L72) : un seul fil rouvre la connexion
         self._reconnect_lock = threading.Lock()
         #: transactions explicites ouvertes : jamais de reconnexion au milieu
@@ -1223,7 +1226,7 @@ class PsycopgDriver:
         if options:
             kwargs["options"] = options
         # #5976 : un application_name du DSN ou PGAPPNAME prime (libpq)
-        kwargs["fallback_application_name"] = application_name()
+        kwargs["fallback_application_name"] = self._application_name
         TRACE.connect()
         try:
             return self._psycopg.connect(self.cfg.dsn, **kwargs)
@@ -1672,13 +1675,13 @@ def connect(cfg: Config, driver: str | None = None, *, writer: bool = True) -> P
 def _writer_connection(db, *, writer: bool):
     """Process admission; diagnostics/migration opt out explicitly.
 
-    No per-statement guard, SQL classification or transaction lock. Long-lived
-    processes must also call require_compatible_writer at their tick boundary.
+    Admission successes are shared for at most five seconds (#5980).
+    Long-lived processes also call require_compatible_writer at tick boundaries.
     """
     if writer and not getattr(db.cfg, 'read_only', False):
-        from .migrations import require_compatible_writer
+        from .migrations import admit_writer_connection
         try:
-            require_compatible_writer(db)
+            admit_writer_connection(db)
         except BaseException:
             db.close()
             raise
