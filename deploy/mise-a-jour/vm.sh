@@ -716,9 +716,34 @@ drain_reprise() {  # raison journalisée par la levée
 # configuré / l'humain déclaré unique, sinon l'utilisateur Unix du poste. Le
 # CLI distant valide le format ; on refuse un acteur illisible plutôt que de
 # consigner un acteur faux.
+# #5967 (#5495, phase 2) : l'exécuteur élu du staging n'est pas un humain. Son
+# unité pose AMEESH_OPERATEUR=ameesh:staging ; vm.sh ne l'admet que prouvé sur
+# l'hôte (preuve_unite_staging) et le CLI de la cible ne l'admet que pour ce
+# drain, avec l'owner de sa configuration pour principal (agent_pause.py).
+ACTEUR_STAGING=ameesh:staging
+UNITE_STAGING=ameesh-staging.service
+# Preuve : ce processus est dans le cgroup de l'unité du contrôleur élu
+# (cgroup v2, « 0::/…/ameesh-staging.service »), hors de tout tour d'agent.
+# Là où le fragment de l'unité est installé, systemd refuse une unité
+# transitoire du même nom. Ce n'est pas une frontière contre l'appelant de
+# vm.sh (il tient déjà la clé de déploiement) : la preuve empêche seulement
+# d'attribuer au service un drain lancé d'ailleurs.
+preuve_unite_staging() {  # $1 : fichier cgroup du processus
+  local ligne
+  [ -z "${AGENT_MAIL_NAME:-}${AMEESH_TURN_ID:-}" ] || return 1
+  [ -r "$1" ] || return 1
+  while IFS= read -r ligne; do
+    [[ $ligne == 0::*/"$UNITE_STAGING" ]] && return 0
+  done <"$1"
+  return 1
+}
 operateur_drain() {
   local h=
-  if [ -n "${AMEESH_OPERATEUR:-}" ]; then
+  if [ "${AMEESH_OPERATEUR:-}" = "$ACTEUR_STAGING" ]; then
+    preuve_unite_staging /proc/self/cgroup || return 1
+    printf '%s' "$ACTEUR_STAGING"
+    return 0
+  elif [ -n "${AMEESH_OPERATEUR:-}" ]; then
     h=$AMEESH_OPERATEUR
   elif [ -x "${AMEESH%/*}/python" ]; then
     h=$("${AMEESH%/*}/python" -c 'from ameesh import config, serve
@@ -727,6 +752,32 @@ print(serve.owner(config.load()))' 2>/dev/null) || h=
   [ -n "$h" ] || h="human:${USER:-$(id -un)}"
   [[ $h =~ ^human:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$ ]] || return 1
   printf '%s' "$h"
+}
+# #5967 : le CLI de la cible doit connaître l'acteur machine pour la pose ET
+# pour la levée ; sinon arrêt prouvé sans drain, comme un CLI sans #2152.
+drain_acteur_supporte() {
+  local action aide
+  for action in pause resume; do
+    if [ "$MODE" = agents ]; then aide=$(ameesh_agents_lecture "$action" --help 2>&1) || return 1
+    else aide=$(ameesh_local_drain "$action" --help 2>&1) || return 1; fi
+    grep -q -- '--actor' <<<"$aide" && grep -qF -- "$ACTEUR_STAGING" <<<"$aide" || return 1
+  done
+}
+choisir_operateur_drain() {  # pose OPERATEUR_DRAIN, sinon DRAIN_ATTENTE=0
+  local operateur
+  if ! operateur=$(operateur_drain); then
+    if [ "${AMEESH_OPERATEUR:-}" = "$ACTEUR_STAGING" ]; then
+      echo "acteur $ACTEUR_STAGING non prouvé (hors de l'unité $UNITE_STAGING, ou dans un tour d'agent) — arrêt sans drain" >&2
+    else
+      echo "opérateur illisible (human:<id> attendu, ou AMEESH_OPERATEUR) — arrêt sans drain" >&2
+    fi
+    DRAIN_ATTENTE=0
+  elif [ "$operateur" = "$ACTEUR_STAGING" ] && ! drain_acteur_supporte; then
+    echo "drain #2152 indisponible : le CLI de la cible ne connaît pas --actor $ACTEUR_STAGING (installer #5967 avant la phase 2 de #5495) — arrêt prouvé sans drain" >&2
+    DRAIN_ATTENTE=0
+  else
+    OPERATEUR_DRAIN=$operateur
+  fi
 }
 drain_supporte() {  # le CLI de la cible connaît la reprise conditionnelle ET l'échéance
   local aide
@@ -739,31 +790,44 @@ drain_supporte() {  # le CLI de la cible connaît la reprise conditionnelle ET l
   else aide=$(ameesh_local_drain pause --help 2>&1) || return 1; fi
   grep -q -- '--not-after' <<<"$aide"
 }
+# #5967 : l'acteur machine n'envoie pas --human : le principal est l'owner
+# de la configuration de la cible, pas une valeur du client.
+drain_acteur() {
+  if [ "$OPERATEUR_DRAIN" = "$ACTEUR_STAGING" ]; then
+    DRAIN_ACTEUR=(--actor "$ACTEUR_STAGING")
+  else
+    DRAIN_ACTEUR=(--human "$OPERATEUR_DRAIN")
+  fi
+}
 pause_operateur() {  # $1 persona, $2 motif, $3 échéance epoch ; --json : « changed »
   local echeance=${3:-}
+  local -a DRAIN_ACTEUR
+  drain_acteur
   if [ "$MODE" = agents ]; then
     if [ -n "$echeance" ]; then
-      ameesh_agents_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" \
+      ameesh_agents_drain pause "$1" --reason "$2" "${DRAIN_ACTEUR[@]}" \
         --not-after "$echeance" --json
     else
-      ameesh_agents_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
+      ameesh_agents_drain pause "$1" --reason "$2" "${DRAIN_ACTEUR[@]}" --json
     fi
   else
     if [ -n "$echeance" ]; then
-      ameesh_local_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" \
+      ameesh_local_drain pause "$1" --reason "$2" "${DRAIN_ACTEUR[@]}" \
         --not-after "$echeance" --json
     else
-      ameesh_local_drain pause "$1" --reason "$2" --human "$OPERATEUR_DRAIN" --json
+      ameesh_local_drain pause "$1" --reason "$2" "${DRAIN_ACTEUR[@]}" --json
     fi
   fi
 }
 reprise_operateur() {  # $1 persona, $2 motif attendu ; lève cette pause-là, ou rien
+  local -a DRAIN_ACTEUR
+  drain_acteur
   if [ "$MODE" = agents ]; then
     ameesh_agents_drain resume "$1" --operator --reason "$(drain_reprise)" \
-      --expect-reason "$2" --human "$OPERATEUR_DRAIN" --json
+      --expect-reason "$2" "${DRAIN_ACTEUR[@]}" --json
   else
     ameesh_local_drain resume "$1" --operator --reason "$(drain_reprise)" \
-      --expect-reason "$2" --human "$OPERATEUR_DRAIN" --json
+      --expect-reason "$2" "${DRAIN_ACTEUR[@]}" --json
   fi
 }
 json_champ() {  # $1 champ ; stdin : objet JSON → « 1 »/« 0 » pour un booléen, sinon la valeur
@@ -1231,14 +1295,7 @@ redemarrer_agents() {
   fi
   # #2184/N6 : l'acteur d'audit est l'opérateur du poste, pas le compte de la
   # VM. Sans acteur lisible, mieux vaut arrêter sans drain que consigner faux.
-  if [ "$DRAIN_ATTENTE" -gt 0 ]; then
-    if ! operateur=$(operateur_drain); then
-      echo "opérateur illisible (human:<id> attendu, ou AMEESH_OPERATEUR) — arrêt sans drain" >&2
-      DRAIN_ATTENTE=0
-    else
-      OPERATEUR_DRAIN=$operateur
-    fi
-  fi
+  if [ "$DRAIN_ATTENTE" -gt 0 ]; then choisir_operateur_drain; fi
   etape "exécuteurs de $HOTE_AGENTS (${#restantes[@]}), arrêt prouvé avant chaque démarrage"
   # #4358 : boucle indexée, `reporter_illisible` ajoute en fin de liste.
   for ((i = 0; i < ${#restantes[@]}; i++)); do
@@ -2199,14 +2256,7 @@ redemarrer() {
   fi
   # #2184/N6 : l'acteur d'audit est l'opérateur du poste, pas le compte de la
   # VM. Sans acteur lisible, mieux vaut arrêter sans drain que consigner faux.
-  if [ "$DRAIN_ATTENTE" -gt 0 ]; then
-    if ! operateur=$(operateur_drain); then
-      echo "opérateur illisible (human:<id> attendu, ou AMEESH_OPERATEUR) — arrêt sans drain" >&2
-      DRAIN_ATTENTE=0
-    else
-      OPERATEUR_DRAIN=$operateur
-    fi
-  fi
+  if [ "$DRAIN_ATTENTE" -gt 0 ]; then choisir_operateur_drain; fi
   # shellcheck disable=SC2206
   restantes=($PERSONAS_VM)
   etape "exécuteurs du serveur (${#restantes[@]}), arrêt prouvé avant chaque démarrage"

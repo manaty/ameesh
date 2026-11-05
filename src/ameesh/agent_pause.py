@@ -24,6 +24,21 @@ HUMAN_RE = re.compile(r"human:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}\Z")
 #: cette identité machine est admise comme acteur non humain ; tous les autres
 #: acteurs non humains restent refusés, et le principal reste humain.
 FILE_DECOUPAGE_ACTOR = "ameesh:file-decoupage"
+#: #5967 (#5495, phase 2) : l'exécuteur élu du staging draine en service, pas
+#: en humain. Cet acteur n'est admis que pour le drain #2152 de vm.sh : pose au
+#: motif exact du drain et sous barrière `not_after`, levée conditionnelle à ce
+#: même motif. Le principal reste l'owner. Le CLI ne l'admet que par
+#: `--actor`, hors de toute session d'agent (`cmd_cli`).
+STAGING_ACTOR = "ameesh:staging"
+MACHINE_ACTORS = (FILE_DECOUPAGE_ACTOR, STAGING_ACTOR)
+#: Le motif et la raison de reprise que pose vm.sh (`drain_motif`,
+#: `drain_reprise`) ; le lieu (mode, action, hôte) et le jeton sont bornés.
+_DRAIN_LIEU = r"\(vm\.sh [^()\[\]\n]{1,200}\)"
+DRAIN_REASON_RE = re.compile(
+    r"drain de déploiement #2152 " + _DRAIN_LIEU + r" \[[A-Za-z0-9._-]{1,200}\]\Z")
+DRAIN_RESUME_RE = re.compile(
+    r"reprise après drain de déploiement #2152 " + _DRAIN_LIEU
+    + r" : redémarrage hors tour effectué\Z")
 
 
 class PauseRefused(ValueError):
@@ -62,16 +77,21 @@ def change(db, name: str, *, paused: bool, reason: str, actor: str,
     #4525 : un acteur non humain n'est admis que pour le geste automatique du
     découpage (`ameesh:file-decoupage`) ; le principal reste un humain (l'owner
     du sommeil). Une pause d'opérateur ordinaire garde ses deux champs humains.
+
+    #5967 : `ameesh:staging` n'est admis que pour le drain #2152 de vm.sh
+    (`_staging_scope`) ; tout autre geste avec cet acteur est refusé.
     """
     principal = actor if principal is None else principal
     actor_ok = (isinstance(actor, str)
-                and (HUMAN_RE.fullmatch(actor)
-                     or actor == FILE_DECOUPAGE_ACTOR))
+                and (HUMAN_RE.fullmatch(actor) or actor in MACHINE_ACTORS))
     if (not actor_ok or not isinstance(principal, str)
             or not HUMAN_RE.fullmatch(principal)):
         raise PauseRefused(
-            "bad_actor", "an actor (human, or %s for the automatic sleep) and a "
-            "human principal are required" % FILE_DECOUPAGE_ACTOR)
+            "bad_actor", "an actor (human, %s for the automatic sleep or %s for "
+            "the staging drain) and a human principal are required"
+            % (FILE_DECOUPAGE_ACTOR, STAGING_ACTOR))
+    if actor == STAGING_ACTOR:
+        _staging_scope(paused, reason, expect_reason, not_after, until, indefinite)
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise PauseRefused("bad_agent", "a valid agent name is required")
     if not isinstance(paused, bool):
@@ -122,6 +142,22 @@ def change(db, name: str, *, paused: bool, reason: str, actor: str,
     return result
 
 
+def _staging_scope(paused, reason, expect_reason, not_after, until, indefinite) -> None:
+    """#5967 : le seul geste de `ameesh:staging` est le drain #2152 de vm.sh."""
+    def texte(value, motif):
+        return isinstance(value, str) and bool(motif.fullmatch(value.strip()))
+    if paused:
+        if not texte(reason, DRAIN_REASON_RE):
+            raise PauseRefused("bad_scope", "%s only sets the #2152 deployment drain "
+                               "pause (exact drain reason)" % STAGING_ACTOR)
+        if not_after is None or until is not None or indefinite:
+            raise PauseRefused("bad_scope", "%s sets the drain pause under a not_after "
+                               "barrier, with the default cap" % STAGING_ACTOR)
+    elif not texte(expect_reason, DRAIN_REASON_RE) or not texte(reason, DRAIN_RESUME_RE):
+        raise PauseRefused("bad_scope", "%s only lifts its own #2152 drain pause "
+                           "(expect_reason = the drain reason)" % STAGING_ACTOR)
+
+
 def expire(db, name: str | None = None) -> list[dict]:
     """#3961 : lève les pauses échues (toutes, ou celle de `name`), une fois
     chacune, avec un événement au nom de l'humain qui les avait posées."""
@@ -170,6 +206,13 @@ def cmd_cli(cfg, args, *, paused: bool) -> int:
             if binding.name or binding.ok:
                 raise PauseRefused("bad_actor", "an agent session cannot act as the local human")
             human = serve.owner(cfg, args.human)
+            # #5967 : l'acteur machine du drain de staging. Jamais avec
+            # `--human` : le principal est l'owner de CETTE configuration, pas
+            # une valeur du client ; la session d'agent est déjà refusée.
+            actor = getattr(args, "actor", None) or human
+            if actor != human and (actor != STAGING_ACTOR or args.human):
+                raise PauseRefused("bad_actor", "--actor %s only, without --human "
+                                   "(the principal is the owner)" % STAGING_ACTOR)
             expect = getattr(args, "expect_reason", None)
             not_after = getattr(args, "not_after", None)
             # #3961 : `--for`, `--until` ou `--indefinite` ; aucun des trois :
@@ -179,7 +222,7 @@ def cmd_cli(cfg, args, *, paused: bool) -> int:
             if pour is not None:
                 until = time.time() + pour
             out = change(db, args.agent, paused=paused, reason=args.reason,
-                         actor=human, principal=human, expect_reason=expect,
+                         actor=actor, principal=human, expect_reason=expect,
                          not_after=not_after, until=until,
                          indefinite=bool(getattr(args, "indefinite", False)))
         except (PauseRefused, ValueError) as exc:
