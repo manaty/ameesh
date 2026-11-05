@@ -2662,6 +2662,11 @@ def main(argv: list[str] | None = None) -> int:
             else any(arg in ("-h", "--help") for arg in rest)):
         print(_doc())
         return 0
+    # #5976 : famille des sessions de la commande dans pg_stat_activity
+    if command == "hook":
+        db_mod.set_application("hook")
+    else:
+        db_mod.set_command_application("mail." + command)
     cfg = config_mod.load()
     try:
         if command == "hook":

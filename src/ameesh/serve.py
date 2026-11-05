@@ -1819,6 +1819,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="ameesh serve: %(message)s")
     cfg = config_mod.load()
+    from . import db as db_mod
+    db_mod.set_application("serve")  # #5976
     try:
         human = owner(cfg, args.human)
         if args.release_key is not None:
