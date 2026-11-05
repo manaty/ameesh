@@ -4363,6 +4363,32 @@ def _adopted_ref(db: Db, item_id: int) -> str:
     return _pinned_ref(get(db, item_id) or {})
 
 
+def _worktree_head_ahead(item: dict, frozen_sha: str) -> str:
+    """La tête du worktree courant quand elle est en avance sur le gel (#5993).
+
+    Le balayage (`branch_head`) peut être en retard sur une poussée : l'auteur
+    qui commande depuis son worktree voit la tête réelle. Seule une tête dont
+    le gel est un ancêtre prouve une poussée postérieure ; un arbre en retard,
+    divergé ou hors dépôt ne conclut rien ('').
+    """
+    branch = str(item.get("branch") or "").strip()
+    frozen = str(frozen_sha or "").strip()
+    if not branch or not frozen:
+        return ""
+    from . import plan_git
+    top = plan_git._out(".", "rev-parse", "--show-toplevel")
+    if not top:
+        return ""
+    if plan_git._out(top, "rev-parse", "--abbrev-ref", "HEAD") != branch:
+        return ""
+    head = plan_git._out(top, "rev-parse", "HEAD") or ""
+    if not head:
+        return ""
+    if plan_git._out(top, "merge-base", "--is-ancestor", frozen, head) is None:
+        return ""
+    return head
+
+
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
          correct: str | None = None, reviewer: str | None = None,
          package_exclusion: bool = False, require_freeze: bool = False) -> dict:
@@ -4503,6 +4529,13 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         published = packet_head.protected_head(
             frozen_sha, frozen_at or 0.0,
             item.get("branch_head") or "", item.get("branch_head_ts") or 0.0)
+        # Un balayage peut être en retard sur la poussée de l'auteur : le
+        # worktree courant, quand il est sur la branche du lot, dit la tête
+        # réelle. Seule une tête en avance sur le gel (le gel est un ancêtre)
+        # conclut ; un arbre en retard ou un autre clone ne dit rien.
+        local_ahead = _worktree_head_ahead(item, frozen_sha)
+        if local_ahead:
+            published = local_ahead
         head_moved = (bool(frozen_sha) and bool(published)
                       and not packet_head.same_commit(published, frozen_sha))
         stale = (bool(frozen_sha) and frozen_at is not None and build_at is not None
@@ -4511,9 +4544,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             if not frozen_sha:
                 why = "without a declared freeze"
             elif head_moved:
-                why = ("with a freeze (%s) that is not its branch head (%s was "
-                       "seen after the freeze)" % (frozen_sha[:12],
-                                                   str(published)[:12]))
+                why = ("with a freeze (%s) that is not its branch head (%s)"
+                       % (frozen_sha[:12], str(published)[:12]))
             else:
                 why = ("with a freeze (%s) that predates its last move to build"
                        % frozen_sha[:12])
