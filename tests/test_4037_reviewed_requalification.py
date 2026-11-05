@@ -173,6 +173,16 @@ class ReviewedMoveTest(unittest.TestCase):
         self.assertEqual(self.execute()['state'], 'requalified')
         self.assertFalse(self.historical_authors.call_args.kwargs['carry_receipts'])
 
+    def test_unreadable_turn_journal_is_named_not_missing(self):
+        """#5965: an unreadable journal is a named doubt, not a missing proof."""
+        self.commit_proof.return_value = None
+        self.historical_authors.side_effect = review.review_authors.JournalUnreadable(
+            'turn journal unreadable for author: disk I/O error')
+        with self.assertRaisesRegex(TrainError, 'provenance unreadable.*disk I/O error'):
+            self.execute()
+        self.assertTrue(self.historical_authors.call_args.kwargs['strict_journal'])
+        self.assert_unchanged()
+
     def test_source_lots_also_come_from_the_gate_receipts(self):
         """#4505: one gate over several PRs reads the lots of its commits.
 
