@@ -584,6 +584,10 @@ class Leases(Domain):
         `stopped` (L35)."""
 
     @abc.abstractmethod
+    def begin_turn_diagnosed(self, name: str, owner: str, epoch: int, status_text: str) -> str:
+        """Admit a turn or return its refusal reason from the locked row."""
+
+    @abc.abstractmethod
     def restore_prompt(self, name: str, owner: str, epoch: int) -> bool:
         """Remet en attente la consigne d'un tour qui n'a pas abouti."""
 

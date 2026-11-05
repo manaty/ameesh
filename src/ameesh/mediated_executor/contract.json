@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.10.0",
+ "version": "1.11.0",
  "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "scopes": {
@@ -959,6 +959,60 @@
     "type": "boolean"
    },
    "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
+   },
+   "rules": []
+  },
+  {
+   "name": "leases.begin_turn_diagnosed",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forced": {},
+   "params": [
+    {
+     "name": "name",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "owner",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "epoch",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": true
+    },
+    {
+     "name": "status_text",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    }
+   ],
+   "result": {
+    "type": "string"
+   },
+   "refusal": "lease_lost",
    "idempotency": {
     "key": "required",
     "natural": true

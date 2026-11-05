@@ -772,6 +772,12 @@ def begin_turn(db: Db, name: str, owner: str, epoch: int, status_text: str) -> b
     return storage.of(db).leases.begin_turn(name, owner, epoch, status_text)
 
 
+def begin_turn_diagnosed(db: Db, name: str, owner: str, epoch: int, status_text: str) -> str:
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.begin_turn_diagnosed")
+    return storage.of(db).leases.begin_turn_diagnosed(name, owner, epoch, status_text)
+
+
 def restore_prompt(db: Db, name: str, owner: str, epoch: int) -> bool:
     """Remet en attente la consigne d'un tour qui n'a pas abouti.
 
