@@ -115,7 +115,7 @@ class HostIdleTest(unittest.TestCase):
                                           ['vm', 'leader', 'reserve'],
                                           protected=['leader', 'reserve'])
         self.assertEqual(caps, dict(vm='burst', leader='baseline', reserve='baseline'))
-        self.assertEqual(costs['vm'], 0.2)
+        self.assertEqual(costs['vm']['on'], 0.2)  # #5912: cost per state
         caps, _ = host_idle.capacities([canon(a={'capacity': 'baseline'}, b={'capacity': 'baseline'})],
                                        ['a', 'b', 'c'], protected=['c'])
         self.assertEqual(caps['c'], 'burst')

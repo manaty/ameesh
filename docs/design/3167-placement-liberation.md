@@ -45,7 +45,11 @@ Ce qui existe déjà et sur quoi on s'appuie :
   dans le cgroup de l'exécuteur (`cpu.max`, `memory.max`), sans aucune API
   Kubernetes. Sur une VM, ou si le cgroup dit `max`, la machine entière
   (nombre de CPU, `MemTotal`). Coût en €/h si la fiche d'hôte du canon donne
-  un tarif (`tarif_eur_h`).
+  un tarif (`tarif_eur_h`). #5912 (étude #5900 §4) : le coût par état vient
+  de `tarif: {calcul_eur_h, disque_eur_h, ip_eur_h, source}` ; allumé = les
+  trois, éteint (archivé) = disque + IP, la veille (standby) étant facturée
+  comme allumée. Un `tarif` incomplet ne chiffre rien et le dit ;
+  `tarif_eur_h` seul reste le coût allumé, éteint inconnu.
 - **Baseline et burst** **[owner]**. Un mesh garde au plus `baseline_hosts`
   hôtes toujours allumés, 2 par défaut : le leader et une réserve pour
   l'élection (règle owner du 2026-10-22). Tous les autres hôtes sont

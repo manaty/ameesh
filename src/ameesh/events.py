@@ -37,7 +37,9 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   receipt.attached     a receipt attached to an action
   approval.recorded    a signed decision of ameesh-approve (mesh_approvals)
   alert.raised         an alert raised, seen by `ameesh notify` (no table: written
-  alert.resolved       by the notifier, outside any transaction of the change)
+  alert.resolved       by the notifier, outside any transaction of the change;
+                       `host_idle_reserved` and `baseline_oversized` are
+                       journaled even outside `notify.types`, #5912)
   pilot.gesture        an elected pilot's gesture (merge, queue, assign,
                        packet, decision, or the drill's no-op canary), in the
                        transaction of its lease check
