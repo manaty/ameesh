@@ -26,19 +26,33 @@ class FingerprintWatch(interface.FingerprintWatch):
             " FROM fingerprint_source_state"
             " WHERE project = %s AND environment = %s",
             (str(project or ""), str(environment or "production")))
-        if rows:
-            return rows[0]
+        new_row = rows[0] if rows else None
         if str(environment or "production") != "production":
-            return None
-        # N-1 takeover: the old process never wrote the new table, its cursor
-        # is the project's historical production source.
+            return new_row
+        # N-1 takeover: the old process writes the historical table, the new
+        # one the source table.  Take the **most recent** production cursor of
+        # the two (same URL), so a takeover never replays a window already
+        # read and opens a false recurrence (#5968 review N1).  A different
+        # URL is not the same source: the new table's row wins.
         rows = self.db.query(
             "SELECT cursor, 'production' AS environment, url,"
             "       extract(epoch FROM last_read_at) AS last_read_ts,"
             "       last_error, extract(epoch FROM updated_at) AS updated_ts"
             " FROM fingerprint_watch_state WHERE project = %s",
             (str(project or ""),))
-        return rows[0] if rows else None
+        old_row = rows[0] if rows else None
+        if new_row is None or old_row is None:
+            return new_row if new_row is not None else old_row
+        if new_row.get("url") != old_row.get("url"):
+            return new_row
+
+        def freshness(row):
+            read = row.get("last_read_ts")
+            tried = row.get("updated_ts")
+            return (float(read) if read is not None else -1.0,
+                    float(tried) if tried is not None else -1.0)
+
+        return new_row if freshness(new_row) >= freshness(old_row) else old_row
 
     def failing(self):
         # The new sources first; the old table covers a production source the

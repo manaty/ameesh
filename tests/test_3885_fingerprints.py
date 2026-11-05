@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ameesh import db as db_mod, fingerprints, migrations, notify, role_timers, storage, work
+from ameesh import db as db_mod, fingerprints, httpkit, migrations, notify, role_timers, storage, work
 
 from .support import PgTestCase
 from .test_l122_numeros_de_migration import AMEESH, _depot
@@ -34,9 +34,9 @@ def page():
 
 
 def declaration(url="https://nexlink.example/api/fingerprints", interval=60,
-                environment="production", token_file=""):
+                environment="production"):
     return fingerprints.Declaration("nexlink", url, float(interval), "watch",
-                                    environment, token_file)
+                                    environment)
 
 
 TOKEN = "a" * 40
@@ -311,13 +311,12 @@ class DeclarationTest(unittest.TestCase):
                                  ([], ""))
                 self.assertTrue(any("interval" in warning for warning in warnings))
 
-    def test_several_sources_carry_their_environment_and_token_file(self):
+    def test_several_sources_carry_their_environment(self):
         bundle = self.bundle(fiche=types.SimpleNamespace(data={"fingerprints": {
             "nexlink": {"sources": [
                 {"url": "https://api.example.test/f", "interval": 60},
                 {"url": "https://api-staging.example.test/f", "interval": 120,
-                 "environment": "staging",
-                 "token_file": "~/.config/ameesh/fingerprints-staging.token"},
+                 "environment": "staging"},
             ]}}}))
         decls, error = fingerprints.declarations([bundle])
         self.assertEqual(error, "")
@@ -325,12 +324,11 @@ class DeclarationTest(unittest.TestCase):
             fingerprints.Declaration("nexlink", "https://api.example.test/f",
                                      60.0, "watcher"),
             fingerprints.Declaration("nexlink", "https://api-staging.example.test/f",
-                                     120.0, "watcher", "staging",
-                                     "~/.config/ameesh/fingerprints-staging.token"),
+                                     120.0, "watcher", "staging"),
         ])
         self.assertEqual(decls[0].token_path(), fingerprints.DEFAULT_TOKEN_FILE)
         self.assertEqual(decls[1].token_path(),
-                         "~/.config/ameesh/fingerprints-staging.token")
+                         fingerprints.DEFAULT_STAGING_TOKEN_FILE)
 
     def test_an_invalid_source_does_not_discard_its_siblings(self):
         warnings = []
@@ -378,14 +376,16 @@ class DeclarationTest(unittest.TestCase):
                          ([], ""))
         self.assertTrue(any("unknown" in warning for warning in warnings), warnings)
 
-    def test_a_relative_token_file_is_refused(self):
+    def test_a_token_file_setting_is_refused(self):
+        # The 0600 path is derived from the environment: a card must not be
+        # able to point the pass at another credential's file (#5968 review B1).
         warnings = []
         bundle = self.bundle(fiche=types.SimpleNamespace(data={"fingerprints": {
             "nexlink": {"sources": [{"url": "https://api.example.test/f",
-                                     "token_file": "relative.token"}]}}}))
+                                     "token_file": "~/.config/gh/hosts.yml"}]}}}))
         self.assertEqual(fingerprints.declarations([bundle], log=warnings.append),
                          ([], ""))
-        self.assertTrue(any("absolute" in warning for warning in warnings), warnings)
+        self.assertTrue(any("unknown" in warning for warning in warnings), warnings)
 
 
 class TickTest(PgTestCase):
@@ -526,34 +526,69 @@ class TickTest(PgTestCase):
                                 "SELECT note FROM work_item_events"))))
 
     def test_each_source_reads_its_own_token_file(self):
-        prod_token = self.token_file(TOKEN, "prod.token")
-        staging_token = self.token_file("b" * 40, "staging.token")
         staging = declaration(url="https://staging.example.test/f",
-                              environment="staging", token_file=staging_token)
-        production = declaration(url="https://prod.example.test/f",
-                                 token_file=prod_token)
+                              environment="staging")
+        production = declaration(url="https://prod.example.test/f")
         seen = []
 
         def read(decl, cursor, token, **kwargs):
             seen.append((decl.url, token))
             return page()
 
+        def token(path, **kwargs):
+            return {fingerprints.DEFAULT_STAGING_TOKEN_FILE: "b" * 40,
+                    fingerprints.DEFAULT_TOKEN_FILE: TOKEN}[path]
+
         with mock.patch.object(fingerprints, "declarations_of_config",
                                return_value=([staging, production], "")), \
-                mock.patch.object(fingerprints, "read_page", side_effect=read):
+                mock.patch.object(fingerprints, "read_page", side_effect=read), \
+                mock.patch.object(httpkit, "read_token_file",
+                                  side_effect=token) as read_token:
             fingerprints.tick(self.cfg, self.db, now=1000.0)
+        self.assertEqual([call.args[0] for call in read_token.call_args_list],
+                         [fingerprints.DEFAULT_STAGING_TOKEN_FILE,
+                          fingerprints.DEFAULT_TOKEN_FILE])
         self.assertEqual(seen, [("https://staging.example.test/f", "b" * 40),
                                 ("https://prod.example.test/f", TOKEN)])
 
-    def test_a_missing_staging_token_does_not_stop_production(self):
-        missing = os.path.join(self.tmp, "missing-staging.token")
+    def test_the_legacy_token_env_only_names_production(self):
+        # #5968 review B2: a staging source must never read the production
+        # token through AMEESH_FINGERPRINTS_TOKEN_FILE.
         staging = declaration(url="https://staging.example.test/f",
-                              environment="staging", token_file=missing)
-        production = declaration(url="https://prod.example.test/f",
-                                 token_file=self.token_file())
+                              environment="staging")
+        production = declaration(url="https://prod.example.test/f")
+        paths = []
+
+        def token(path, **kwargs):
+            paths.append(path)
+            return {fingerprints.DEFAULT_STAGING_TOKEN_FILE: "b" * 40,
+                    "/legacy/fingerprints.token": TOKEN}[path]
+
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_FINGERPRINTS_TOKEN_FILE":
+                              "/legacy/fingerprints.token"}), \
+                mock.patch.object(fingerprints, "declarations_of_config",
+                                  return_value=([staging, production], "")), \
+                mock.patch.object(fingerprints, "read_page", return_value=page()), \
+                mock.patch.object(httpkit, "read_token_file", side_effect=token):
+            fingerprints.tick(self.cfg, self.db, now=1000.0)
+        self.assertEqual(paths, [fingerprints.DEFAULT_STAGING_TOKEN_FILE,
+                                 "/legacy/fingerprints.token"])
+
+    def test_a_missing_staging_token_does_not_stop_production(self):
+        staging = declaration(url="https://staging.example.test/f",
+                              environment="staging")
+        production = declaration(url="https://prod.example.test/f")
+
+        def token(path, **kwargs):
+            if path == fingerprints.DEFAULT_STAGING_TOKEN_FILE:
+                raise ValueError("fingerprints read-only token not found: %s" % path)
+            return TOKEN
+
         with mock.patch.object(fingerprints, "declarations_of_config",
                                return_value=([staging, production], "")), \
-                mock.patch.object(fingerprints, "read_page", return_value=page()):
+                mock.patch.object(fingerprints, "read_page", return_value=page()), \
+                mock.patch.object(httpkit, "read_token_file", side_effect=token):
             with self.assertRaisesRegex(fingerprints.FingerprintError, "not found"):
                 fingerprints.tick(self.cfg, self.db, now=1000.0)
         self.assertEqual(len(self.db.query("SELECT id FROM work_items")), 2)

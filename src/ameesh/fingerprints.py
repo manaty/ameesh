@@ -22,7 +22,7 @@ Nexlink).  This module is the mechanical part on the ameesh side:
   Agent card with the ``github-watch`` role, like ``github_watch``): a project
   may declare one source (legacy ``url``/``interval``) or several
   (``sources``), each with its own ``environment`` and **read-only token**
-  from a 0600 file.  A lot opened from a non-production source is marked with
+  from a 0600 file derived from that environment.  A lot opened from a non-production source is marked with
   that environment; the fingerprint identity stays shared, so the same bug
   seen in staging then production is one lot, noted again.  Without a token
   the pass refuses explicitly instead of reading nothing.  A page is strictly
@@ -104,8 +104,9 @@ class Declaration:
 
     ``environment`` names where the source lives (``production`` by default,
     ``staging`` for a pre-production export); a lot opened from it carries the
-    environment.  ``token_file`` is the 0600 file of that source's read-only
-    token; empty means the environment's default.
+    environment.  The read-only token path is **derived from the environment**,
+    never named by the card: a card cannot point the pass at another
+    credential's 0600 file.
     """
 
     project: str
@@ -113,17 +114,14 @@ class Declaration:
     interval: float
     agent: str = ""
     environment: str = DEFAULT_ENVIRONMENT
-    token_file: str = ""
 
     def as_json(self) -> dict:
         return {"project": self.project, "url": self.url,
                 "interval": self.interval, "agent": self.agent,
-                "environment": self.environment, "token_file": self.token_file}
+                "environment": self.environment}
 
     def token_path(self) -> str:
-        """The 0600 token file of this source (its own, else the environment's)."""
-        if self.token_file:
-            return self.token_file
+        """The 0600 token file of this environment (fixed convention)."""
         if self.environment == "staging":
             return DEFAULT_STAGING_TOKEN_FILE
         return DEFAULT_TOKEN_FILE
@@ -415,7 +413,7 @@ def _https(url: str) -> str:
     return urllib.parse.urlunsplit(parts)
 
 
-SOURCE_FIELDS = frozenset(("url", "interval", "environment", "token_file"))
+SOURCE_FIELDS = frozenset(("url", "interval", "environment"))
 
 
 def _source_declaration(project: str, spec, agent: str) -> Declaration:
@@ -436,19 +434,7 @@ def _source_declaration(project: str, spec, agent: str) -> Declaration:
         raise ValueError("environment must be one of %s"
                          % ", ".join(ENVIRONMENTS))
     environment = environment.strip().lower() or DEFAULT_ENVIRONMENT
-    token_file = spec.get("token_file", "")
-    if token_file is None:
-        token_file = ""
-    if not isinstance(token_file, str):
-        raise ValueError("token_file must be a path")
-    token_file = token_file.strip()
-    if _CONTROL_RE.search(token_file):
-        raise ValueError("token_file: control characters are refused")
-    if token_file and not (token_file.startswith("/")
-                           or token_file.startswith("~/")):
-        raise ValueError("token_file must be absolute or start with ~/")
-    return Declaration(project, url, float(interval), agent, environment,
-                       token_file)
+    return Declaration(project, url, float(interval), agent, environment)
 
 
 def declarations(canons, log=None) -> tuple[list[Declaration], str]:
@@ -463,9 +449,9 @@ def declarations(canons, log=None) -> tuple[list[Declaration], str]:
             url: https://…/internal/fingerprints
             interval: 60
 
-    A project may declare several sources, each with its environment and its
-    own 0600 token file (a staging source does not read production's export
-    with a foreign token)::
+    A project may declare several sources, each with its environment (the
+    0600 token file is derived from it, so a staging source never reads
+    production's export with a foreign token)::
 
         fingerprints:
           nexlink:
@@ -476,9 +462,8 @@ def declarations(canons, log=None) -> tuple[list[Declaration], str]:
               - url: https://api-staging.nexlink.ph/api/internal/fingerprints
                 environment: staging
                 interval: 60
-                token_file: ~/.config/ameesh/fingerprints-staging.token
 
-    ``url``/``interval``/``environment``/``token_file`` are the only settings;
+    ``url``/``interval``/``environment`` are the only settings;
     an unknown setting, a foreign project or an invalid source is logged and
     skipped, never silently applied.  An invalid source does not discard its
     siblings; a duplicate URL is kept once.  On a conflict between two cards
@@ -728,9 +713,9 @@ def tick(cfg, db, *, now: float | None = None, log=None,
 
     Only the elected role runs it (``ameesh role run`` sets ``AMEESH_ROLE``).
     Without a source, nothing is read.  Each source reads its own 0600 token
-    file (``token_file`` overrides every source for a test, the legacy
-    ``TOKEN_ENV`` overrides the default file, never an explicit
-    ``token_file`` of the card).  A source without a token refuses explicitly
+    file derived from its environment (``token_file`` overrides every source
+    for a test; the legacy ``TOKEN_ENV`` names the production file only).  A
+    source without a token refuses explicitly
     and does not stop its siblings.  A page is strictly validated; its cursor
     advances only after every entry was accepted.  Lots are marked with the
     source's environment; the fingerprint identity is shared, so a bug seen in
@@ -749,8 +734,13 @@ def tick(cfg, db, *, now: float | None = None, log=None,
     tokens: dict[str, str] = {}
 
     def token_of(decl: Declaration) -> str:
-        path = (token_file or decl.token_file or os.environ.get(TOKEN_ENV)
-                or decl.token_path())
+        # The path is derived from the environment.  The legacy env override
+        # names the production file only: a staging source never reads
+        # production's token (#5968 review B2).
+        path = token_file
+        if not path and decl.environment == "production":
+            path = os.environ.get(TOKEN_ENV)
+        path = path or decl.token_path()
         if path not in tokens:
             tokens[path] = httpkit.read_token_file(
                 path, what="fingerprints read-only token",

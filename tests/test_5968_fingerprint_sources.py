@@ -120,3 +120,25 @@ class SourceStateTest(PgTestCase):
                       environment="staging", now=1000)
         self.assertIsNone(self.old_state("acme"))
         self.assertEqual(len(self.api.failing()), 1)
+
+    def test_state_takes_the_most_recent_production_cursor(self):
+        # New code advances, then an old process takes the lease back and
+        # advances only the historical table: the new pass must resume from
+        # the old, more recent cursor, not replay and risk a false recurrence.
+        self.api.advance("acme", "https://prod.acme.test/f", "new", now=1000)
+        self.old_advance("acme", "https://prod.acme.test/f", "old-later")
+        self.assertEqual(self.api.state("acme", "production")["cursor"],
+                         "old-later")
+        # And the reverse: a newer new-table read wins.
+        self.api.advance("acme", "https://prod.acme.test/f", "newer",
+                         now=9999999999)
+        self.assertEqual(self.api.state("acme", "production")["cursor"], "newer")
+
+    def test_state_prefers_the_new_source_when_the_url_differs(self):
+        # A different URL is a different journal: its cursor must not be
+        # borrowed from the historical row.
+        self.api.advance("acme", "https://new.acme.test/f", "new", now=1000)
+        self.old_advance("acme", "https://old.acme.test/f", "old")
+        state = self.api.state("acme", "production")
+        self.assertEqual(state["cursor"], "new")
+        self.assertEqual(state["url"], "https://new.acme.test/f")
