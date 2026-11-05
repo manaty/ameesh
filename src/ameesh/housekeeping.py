@@ -380,6 +380,12 @@ ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
 #: periodic pass once its last line is this old, so that it stays in the 24 h
 #: window of the alerts for as long as it exists
 UNATTRIBUTED_REFRESH_S = 12 * 3600.0
+#: #5858: a git work tree left out of the quota eviction is signaled when it
+#: appears, then at most this often per path. Before, the same worktree was
+#: written again at every turn end and every host pass (25 025 lines of
+#: `tmp signaled` in 24 h on ameesh-agents-1), drowning the journal and the
+#: orphan reading; the 24 h report keeps seeing it with this refresh.
+WORKTREE_SIGNAL_REFRESH_S = 12 * 3600.0
 #: #2493 : a temporary directory WITHOUT owner file of this mesh is never
 #: deleted; it is re-signaled at most this often (one `tmp_unowned` alert per
 #: path follows it), so the pass no longer repeats it in `skipped` every time
@@ -1929,10 +1935,51 @@ def tmp_episode(db, host: str, path: str, result: dict, *, now: float) -> dict:
     return out
 
 
+def _last_tmp_line(db, host: str, path: str) -> dict | None:
+    """#5858: last journal line of `path` on `host` (`kind = tmp`), read to
+    know whether a worktree left out of the eviction was already signaled.
+    None without database or host, and on an unreadable journal: the caller
+    then signals, as before."""
+    if db is None or not host:
+        return None
+    try:
+        rows = storage.of(db).housekeeping.latest_by_path(host, "tmp", path=path)
+    except Exception:  # noqa: BLE001 - a journal read never loses the pass
+        return None
+    return rows[0] if rows else None
+
+
+def _recent_signal(previous: dict | None, now: float) -> bool:
+    """#5858: `previous` is a recent `signaled` line of this path: the worktree
+    is still left out of the eviction, saying it again would only rewrite the
+    journal at every pass. An unreadable time never silences the signal."""
+    if not previous or previous.get("action") != "signaled":
+        return False
+    try:
+        at = float(previous.get("at_ts"))
+    except (TypeError, ValueError):
+        return False
+    return now - at < WORKTREE_SIGNAL_REFRESH_S
+
+
+def _signal_since(previous: dict | None, now: float) -> float:
+    """#5858: first observation to carry on a re-signal (as #2933 does for
+    /tmp entries), or `now` when the worktree appears."""
+    if previous and previous.get("action") == "signaled":
+        data = previous.get("data") or {}
+        try:
+            return float(data.get("first_seen") or previous.get("at_ts") or now)
+        except (TypeError, ValueError):
+            return now
+    return now
+
+
 def eviction_entries(result: dict, *, kind: str, path: str, quota: int,
                      agent: str | None = None, lot: str | None = None,
                      since: float | None = None,
-                     resolved: str | None = None) -> list[dict]:
+                     resolved: str | None = None,
+                     db=None, host: str = "",
+                     now: float | None = None) -> list[dict]:
     """#500: the log lines of one `evict_lru` result: the eviction, the files
     this pass cannot remove (`unremovable`, reported as soon as they exist —
     read by the `tmp_unremovable` alert when they block the quota), a
@@ -1948,8 +1995,14 @@ def eviction_entries(result: dict, *, kind: str, path: str, quota: int,
     the truncated listing had no lifting entry before, so `tmp_unscanned`
     stayed raised until its 24 h expiry even after a clean scan. A pass that
     could not read the mount table never writes a `resolved` entry (#718):
-    it proves nothing about the files it did not scan."""
+    it proves nothing about the files it did not scan.
+
+    #5858: with `db` and `host`, a worktree left out is signaled when it
+    appears, then at most every `WORKTREE_SIGNAL_REFRESH_S` per path, by
+    reading the last journal line of that path (`_last_tmp_line`). Without
+    them (dry run, tests, unreadable journal) it is signaled as before."""
     q = resources_mod.fmt_value("q", quota)
+    now = time.time() if now is None else float(now)
     out = []
     data = {"unremovable_bytes": result["unremovable"], "quota": quota,
             "blocked": bool(result["blocked"]), "over_quota": bool(result["over_quota"])}
@@ -2017,12 +2070,20 @@ def eviction_entries(result: dict, *, kind: str, path: str, quota: int,
                     "agent": agent, "lot": lot, "data": data,
                     "detail": detail})
     for tree in result["worktrees"]:
+        previous = _last_tmp_line(db, host, tree)
+        if _recent_signal(previous, now):
+            continue                      # #5858: already said, still the same
         out.append({"kind": kind, "action": "signaled", "path": tree, "agent": agent,
-                    "lot": lot, "data": {"worktree": tree, "quota": quota},
+                    "lot": lot, "data": {"worktree": tree, "quota": quota,
+                                         "first_seen": _signal_since(previous, now)},
                     "detail": "git work tree inside %s left out of the quota eviction" % path})
     for link in result.get("worktree_symlinks", ()):
+        previous = _last_tmp_line(db, host, link)
+        if _recent_signal(previous, now):
+            continue                      # #5858: already said, still the same
         out.append({"kind": kind, "action": "signaled", "path": link, "agent": agent,
-                    "lot": lot, "data": {"worktree": link, "symlink": True, "quota": quota},
+                    "lot": lot, "data": {"worktree": link, "symlink": True, "quota": quota,
+                                         "first_seen": _signal_since(previous, now)},
                     "detail": "git marker `.git` of %s is a symbolic link: not followed, "
                               "the subtree is left out of the eviction" % link})
     return out
@@ -3515,12 +3576,12 @@ class Turn:
                 scanned = list(result.get("worktrees") or ())
                 scan_done = True
                 scan_truncated = bool(result.get("truncated"))
-                episode = tmp_episode(db, host, self.tmp, result,
-                                      now=time.time())
+                now = time.time()
+                episode = tmp_episode(db, host, self.tmp, result, now=now)
                 self.entries.extend(eviction_entries(
                     result, kind="tmp", path=self.tmp, quota=policy.tmp_quota,
                     agent=self.agent, lot=lot, since=episode["since"],
-                    resolved=episode["resolved"]))
+                    resolved=episode["resolved"], db=db, host=host, now=now))
         finally:
             if self.lock is not None:      # L219: the turn is over
                 self.lock.release()
@@ -5703,7 +5764,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 if not dry_run:
                     entries.extend(eviction_entries(
                         result, kind="tmp", path=full, quota=policy.tmp_quota, agent=agent,
-                        since=episode["since"], resolved=episode["resolved"]))
+                        since=episode["since"], resolved=episode["resolved"],
+                        db=db, host=host, now=now))
             finally:
                 if lock is not None:
                     lock.close()
