@@ -511,6 +511,9 @@ class EntryPointRefusalTest(unittest.TestCase):
         worker.runner.draining.is_set.return_value = False
         worker.runner.restart_for_stale = False
         worker.runner.gate_holds.return_value = False
+        # #5856: no host withdrawal is pending. An unset MagicMock field
+        # is not None and would leave the worker before reaching run_turn.
+        worker.host_yield = None
         worker.renew.return_value = True
         worker.lease_lost.is_set.return_value = False
         worker.deadline_passed.return_value = False
