@@ -512,6 +512,8 @@ class EntryPointRefusalTest(unittest.TestCase):
         worker.runner.restart_for_stale = False
         worker.runner.gate_holds.return_value = False
         worker.renew.return_value = True
+        worker.lease_lost.is_set.return_value = False
+        worker.deadline_passed.return_value = False
         worker._consigne_a_restaurer = False
         worker._moved_before_turn.return_value = False
         worker.placed_elsewhere.return_value = None

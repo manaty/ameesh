@@ -42,7 +42,7 @@ from __future__ import annotations
 from ameesh import work_lifecycle as lifecycle
 
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 import dataclasses
 import functools
 import getpass
@@ -1197,10 +1197,19 @@ class AgentWorker(threading.Thread):
 
         def call() -> None:
             try:
-                migrations.require_compatible_writer(self.db)
-                result["expires"] = registry.renew(
-                    self.db, self.name, self.runner.runner_id, self.epoch,
-                    self.runner.lease_ttl)
+                # #5849 : la connexion de sondage peut être occupée pendant
+                # toute la marge du bail. Isoler aussi le contrôle de schéma,
+                # pas seulement l'UPDATE. La connexion appartient à cet appel
+                # (même détaché après call_budget) et se ferme à sa sortie.
+                # Le client médié ouvre déjà une requête par opération.
+                connection = (nullcontext(self.db)
+                              if getattr(self.db.cfg, "backend", "") == "mediated"
+                              else closing(db_mod.connect(self.db.cfg, writer=False)))
+                with connection as renew_db:
+                    migrations.require_compatible_writer(renew_db)
+                    result["expires"] = registry.renew(
+                        renew_db, self.name, self.runner.runner_id, self.epoch,
+                        self.runner.lease_ttl)
             except Exception as exc:  # DbError, mais aussi tout imprévu
                 result["error"] = exc
             if result.get("expires") is not None or "error" in result:
@@ -1781,7 +1790,10 @@ class AgentWorker(threading.Thread):
         # reprise ne peut pas attendre le minimum de 2 s : elle serait après
         # l'échéance (#2483).
         reprise = Reprise(maximum=interval, minimum=min(Reprise.MINIMUM, interval))
-        attente = interval
+        # #5849 : le worker peut démarrer avec un bail déjà entamé. Sans le
+        # renouvellement de tête de boucle, réserver dès le premier battement
+        # une tranche complète pour l'appel, plutôt que viser l'échéance.
+        attente = self.renew_wait(interval)
         while not stop_event.wait(self.wait_timeout(attente)):
             phase = getattr(self, "_preparation_phase", None)
             if phase is not None:
@@ -10305,7 +10317,12 @@ class AgentWorker(threading.Thread):
                     # L159f : porte d'hôte fermée — le bail est rendu (finally)
                     self._leave_for_host()
                     break
-                if not self.renew():
+                # #5849 : le battement renouvelle déjà au pas TTL/3, même au
+                # repos. Une écriture par passe doublait inutilement sa charge.
+                if self.lease_lost.is_set():
+                    break
+                if self.deadline_passed():
+                    self.renew()  # arrêt immédiat, sans appel de base
                     break
                 # L72 : une base injoignable n'arrête plus le worker (son fil
                 # mourait sur l'exception) : tours suspendus, attente
