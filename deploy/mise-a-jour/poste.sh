@@ -846,6 +846,8 @@ timers() {
   # remplacent les passes GitHub du service complet, limité aux alertes.
   etape "minuteries de rôle (EP5)"
   "$AMEESH" role timers --install
+  # #5863 : le passage court de l'auditeur, s'il est candidat du rôle.
+  "$AMEESH" role timers --role auditeur --install
 }
 
 controler() {
@@ -864,6 +866,7 @@ controler() {
   verif controler_notify
   verif controler_executeurs
   verif "$AMEESH" role timers --check
+  verif "$AMEESH" role timers --role auditeur --check
   etape "exécuteurs en échec"
   systemctl --user list-units 'ameesh-*' --state=failed --plain --no-legend || true
   if ancienne; then
