@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#5971 : les tics distincts lisent la mémoire du même lot, pas du porteur."""
+import pathlib
+import unittest
+from unittest import mock
+
+from ameesh import packet_unit_red as memory
+from tests.test_3807_paquet_auto import paquet_auto
+
+X, Y = 'a' * 40, 'b' * 40
+
+
+def candidate(source=X, target='main'):
+    return dict(work_item=1, source=source, target=target, ready=True, causes=[])
+
+
+def event(source=X, stamp=100, tests=('tests.test_bug',)):
+    return dict(work_item_id=1, created_ts=stamp, note=memory.note(source, 'main', tests))
+
+
+class SelectionTest(unittest.TestCase):
+    def test_same_head_is_excluded_on_successive_ticks_but_new_head_is_ready(self):
+        for now in (101, 160, 100 + memory.EXCLUSION_S - 1):
+            rows = [candidate()]
+            memory.apply(rows, [event()], now=now)
+            self.assertFalse(rows[0]['ready'])
+            self.assertEqual(rows[0]['causes'][0]['code'], 'unit-tests-red')
+            self.assertIn('tests.test_bug', rows[0]['causes'][0]['detail'])
+        rows = [candidate(Y)]
+        memory.apply(rows, [event()], now=160)
+        self.assertTrue(rows[0]['ready'])
+
+    def test_expiry_is_bounded_and_repeated_reds_cannot_extend_it(self):
+        rows = [candidate()]
+        memory.apply(rows, [event(stamp=200), event(stamp=100)],
+                     now=100 + memory.EXCLUSION_S)
+        self.assertTrue(rows[0]['ready'])
+
+    def test_other_target_and_other_lot_are_not_excluded(self):
+        rows = [candidate(target='develop'), dict(candidate(), work_item=2)]
+        memory.apply(rows, [event()], now=160)
+        self.assertTrue(all(row['ready'] for row in rows))
+
+    def test_invalid_or_unrelated_notes_do_not_create_a_hold(self):
+        for note in ('not a red', memory.PREFIX + '[]', memory.PREFIX + 'broken',
+                     memory.PREFIX + '{"source":"main"}'):
+            rows = [candidate()]
+            memory.apply(rows, [dict(event(), note=note)], now=160)
+            self.assertTrue(rows[0]['ready'])
+
+
+class PersistenceTest(unittest.TestCase):
+    def test_failed_persistence_stops_before_sending_a_removal_notice(self):
+        removal = paquet_auto.Removal(1, tests=['tests.test_bug'])
+        with mock.patch.object(paquet_auto, 'remember_unit_red',
+                               side_effect=paquet_auto.PaquetAutoError('offline')), \
+                mock.patch.object(paquet_auto, 'send_mail') as mail:
+            with self.assertRaisesRegex(paquet_auto.PaquetAutoError, 'non mémorisé'):
+                paquet_auto.notify_removals(pathlib.Path('.'), 'h-28', [removal],
+                    sender='pilot', sources={1:X}, target='main')
+        mail.assert_not_called()
+
+    def test_notification_is_sent_only_for_a_new_record(self):
+        removal = paquet_auto.Removal(1, tests=['tests.test_bug'], attributed=True)
+        with mock.patch.object(paquet_auto, 'remember_unit_red', side_effect=[True, False]) as remember, \
+                mock.patch.object(paquet_auto, 'lot_author', return_value='author'), \
+                mock.patch.object(paquet_auto, 'send_mail') as mail:
+            for packet in ('h-28', 'h-29'):
+                self.assertEqual(paquet_auto.notify_removals(pathlib.Path('.'), packet, [removal],
+                    sender='pilot', sources={1:X}, target='main', log=lambda _: None), [])
+        self.assertEqual(remember.call_count, 2)
+        mail.assert_called_once()
+        self.assertIn('tests.test_bug', mail.call_args.args[2])
+
+
+from .support import PgTestCase
+
+
+class DurableMemoryTest(PgTestCase):
+    def test_record_survives_another_reader_and_more_than_a_hundred_events(self):
+        from ameesh import storage
+        lot = self.db.query("INSERT INTO work_items (title, state) VALUES (%s, 'qa') RETURNING id",
+                            ('unit red memory',))[0]['id']
+        self.assertTrue(memory.remember(self.db, lot, X, 'main', ['tests.test_bug'], actor='composer'))
+        # Le journal affiché par work show est tronqué à cent événements.
+        self.db.execute("INSERT INTO work_item_events (work_item_id, state, note, actor) "
+                        "SELECT %s, 'qa', 'later note', 'composer' FROM generate_series(1,101)", (lot,))
+        self.assertFalse(memory.remember(self.db, lot, X, 'main', ['tests.test_other'], actor='composer'))
+        rows = storage.of(self.db).progress.lot_hold_events([lot], [memory.PATTERN])
+        marks = [row for row in rows if memory.read_note(row.get('note'))]
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(memory.read_note(marks[0]['note'])['tests'], ['tests.test_bug'])
+        entry = dict(candidate(), work_item=lot)
+        memory.apply([entry], rows, now=marks[0]['created_ts'] + 60)
+        self.assertFalse(entry['ready'])
+        self.assertTrue(memory.remember(self.db, lot, Y, 'main', ['tests.test_other'], actor='composer'))
