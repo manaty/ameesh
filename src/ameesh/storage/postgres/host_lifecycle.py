@@ -13,6 +13,14 @@ _MANUAL_MOVE = (
     "AND e.object='agent:'||r.name AND e.data->>'from'=c.host "
     "AND e.created_at>=c.requested_at)")
 
+# #5869: an origin agent `r` of lifecycle row `c` left the host by the drain
+# itself: a verified `host_drain` handoff from this host since the generation
+# began. Like a manual move, the handoff proved the source runner stopped.
+_DRAIN_MOVE = (
+    "EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
+    "AND h.source=c.host AND h.state='verified' "
+    "AND h.plan->>'reason'='host_drain' AND h.created_at>=c.requested_at)")
+
 _ROW = ("host, mode, generation, actor, "
         "extract(epoch from requested_at)::float8 AS requested_ts, "
         "extract(epoch from return_at)::float8 AS return_ts, "
@@ -780,10 +788,7 @@ class HostLifecycle(interface.HostLifecycle):
                 "EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
                 "        AND h.state NOT IN ('verified','cancelled')) AS active_handoff, "
                 + _MANUAL_MOVE + " AS moved_by_hand, "
-                "EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
-                "        AND h.source=c.host AND h.state='verified' "
-                "        AND h.plan->>'reason'='host_drain' "
-                "        AND h.created_at>=c.requested_at) AS drain_moved "
+                + _DRAIN_MOVE + " AS drain_moved "
                 "FROM host_lifecycle_agents a JOIN agent_registry r ON r.name=a.agent "
                 "JOIN host_lifecycle c ON c.host=a.host "
                 "WHERE a.host=%s AND a.generation=%s ORDER BY r.name FOR UPDATE OF r",
@@ -804,12 +809,11 @@ class HostLifecycle(interface.HostLifecycle):
                        and (control.get("return_ts") is None
                             or float(control["return_ts"]) > now["now_ts"]))
             for row in origins:
-                if restore and row["host"] != host and row["drain_moved"]:
-                    # #5869: an agent the drain itself moved away (verified
-                    # `host_drain` handoff of this generation) is not a
-                    # second executor: that is the withdrawal being restored.
-                    continue
-                if row["host"] != host and not row["moved_by_hand"]:
+                # #5869: an agent the drain itself moved away is not a second
+                # executor, whether the drain is restored or the host returns;
+                # only `agent_moved` is waived, fence and handoffs still refuse.
+                if (row["host"] != host and not row["moved_by_hand"]
+                        and not row["drain_moved"]):
                     missing.append("agent_moved:" + row["name"])
                 if row["handoff_fenced"]:
                     missing.append("handoff_fenced:" + row["name"])
@@ -879,7 +883,7 @@ class HostLifecycle(interface.HostLifecycle):
                 "WHERE c.host=%s AND c.mode='returning' AND NOT EXISTS ("
                 " SELECT 1 FROM host_lifecycle_agents a JOIN agent_registry r ON r.name=a.agent "
                 " WHERE a.host=c.host AND a.generation=c.generation AND ((r.host<>c.host "
-                " AND NOT " + _MANUAL_MOVE + ") OR r.handoff_fenced OR EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
+                " AND NOT " + _MANUAL_MOVE + " AND NOT " + _DRAIN_MOVE + ") OR r.handoff_fenced OR EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
                 " AND h.state NOT IN ('verified','cancelled')))) RETURNING c.host", (host,))
             if not completed:
                 raise ValueError("lost host return proof changed during reconciliation")
@@ -904,6 +908,8 @@ class HostLifecycle(interface.HostLifecycle):
                 # #5887: origin agents that left by a journaled manual move.
                 "moved_by_hand": [row["name"] for row in origins
                                   if row["host"] != host and row["moved_by_hand"]],
+                "moved_by_drain": [row["name"] for row in origins
+                                   if row["host"] != host and row["drain_moved"]],
                 # Informational: the returning machine's own runners had
                 # already taken their leases back; they are not a refusal.
                 "live_lease_agents": [row["name"] for row in origins if row["live"]],

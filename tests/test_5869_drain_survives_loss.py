@@ -187,6 +187,56 @@ class DrainSurvivesLossTest(PgTestCase):
         self.returned()
         self.assertEqual(self.reconcile()["missing"], ["agent_moved:dev"])
 
+    def _moved_by_drain(self, **drain):
+        self.drain(**drain)
+        self.lose()
+        self._move(reason="host_drain")
+
+    def test_a_fenced_agent_moved_by_the_drain_still_blocks(self):
+        self._moved_by_drain(duration=12 * 3600)
+        self.db.execute("UPDATE agent_registry SET handoff_fenced=true WHERE name='dev'")
+        self.returned()
+        self.assertEqual(self.reconcile()["missing"], ["handoff_fenced:dev"])
+        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
+
+    def test_a_later_active_handoff_of_a_drained_agent_still_blocks(self):
+        self._moved_by_drain(duration=12 * 3600)
+        self.db.execute(
+            "INSERT INTO host_handoffs(id,agent,source,target,state,plan,memory_bytes,"
+            "disk_bytes,reserved_until) VALUES ('op-5869-b','dev','target','third',"
+            "'planned','{\"reason\": \"host_drain\"}'::jsonb,1,1,"
+            "clock_timestamp()+interval '5 minutes')")
+        self.returned()
+        self.assertEqual(self.reconcile()["missing"], ["active_handoff:dev"])
+
+    def test_an_expired_drain_that_moved_an_agent_returns_available(self):
+        self._moved_by_drain(duration=12 * 3600)
+        self.db.execute("UPDATE host_lifecycle SET return_at=clock_timestamp()"
+                        "-interval '1 second' WHERE host='source'")
+        self.returned()
+        result = self.reconcile()
+        self.assertEqual(result["mode"], "available", result)
+        self.assertEqual(result["evidence"]["moved_by_drain"], ["dev"])
+
+    def test_an_automatic_drain_that_moved_an_agent_returns_available(self):
+        self._moved_by_drain(duration=12 * 3600, automatic=True)
+        self.returned()
+        self.assertEqual(self.reconcile()["mode"], "available")
+
+    def test_restore_hands_back_an_elected_lease_retaken_at_boot(self):
+        registry.upsert(self.db, "pilot", harness="codex", host="source", cwd="/work/source")
+        self.db.execute("UPDATE agent_registry SET releve='election' WHERE name='pilot'")
+        self.drain(duration=12 * 3600)
+        self.lose()
+        # #3180: the returning host's runner takes its elected lease back.
+        self.db.execute("UPDATE agent_registry SET lease_owner='runner-returning@source', "
+                        "lease_expires_at=clock_timestamp()+interval '5 minutes' "
+                        "WHERE name='pilot'")
+        self.returned()
+        self.assertEqual(self.reconcile()["mode"], "draining")
+        row = self.db.query("SELECT lease_owner FROM agent_registry WHERE name='pilot'")[0]
+        self.assertIsNone(row["lease_owner"])
+
     @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_runner_pass_restores_the_drain_instead_of_reopening(self):
         self.drain(duration=12 * 3600)
