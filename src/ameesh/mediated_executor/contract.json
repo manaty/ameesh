@@ -4655,6 +4655,7 @@
     "record_state",
     "relocate",
     "relocate_operator",
+    "renew_sync",
     "revive",
     "set_default_id",
     "set_election",

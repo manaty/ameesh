@@ -191,6 +191,19 @@ class Canon(interface.Canon):
             "WHERE host = %s AND canon = %s AND sync_token = %s",
             (token, signature, host, canon, token))
 
+    def renew_sync(self, host, canon, token) -> bool:
+        # #5854: a live claimant renews its lease while `sync` runs. Only the
+        # current PENDING claim moves: a replaced token, a claim released by
+        # `fail_sync` (sync_claimed_at NULL) or an already published
+        # completion (completed token equals this one) never comes back.
+        rows = self.db.query(
+            "UPDATE canon_state SET sync_claimed_at = clock_timestamp() "
+            "WHERE host = %s AND canon = %s AND sync_token = %s "
+            "AND sync_claimed_at IS NOT NULL "
+            "AND sync_completed_token IS DISTINCT FROM sync_token "
+            "RETURNING host", (host, canon, token))
+        return bool(rows)
+
     def fail_sync(self, host, canon, token) -> None:
         # #5649: release the claim; keep the last COMPLETED result while the
         # canon state is still `ok`. The signature check in `periodic_sync`

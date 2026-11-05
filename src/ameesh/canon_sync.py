@@ -142,6 +142,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import uuid
 from dataclasses import dataclass, field
 
@@ -360,6 +361,10 @@ class SyncReport:
     #: #1616 : paramètres mécaniques compilés du canon appliqué (constat)
     mechanics: "MechanicsSync | None" = None
     shared: bool = False             # #3963: reused periodic host result
+    #: #5854 : signature du canon RÉELLEMENT appliqué après `catch_up` (il peut
+    #: différer de celui lu par l'appelant). `periodic_sync` publie celle-ci :
+    #: l'instantané partagé doit décrire le registre appliqué, pas l'entrée.
+    applied_signature: str = ""
 
     @property
     def errors(self) -> list[Finding]:
@@ -1543,6 +1548,81 @@ def _same(row: dict, values: dict) -> bool:
     return True
 
 
+def _sync_signature_payload(db: Db, canon: Canon) -> dict:
+    """#3963/#5854: immutable inputs signed for a snapshot.
+
+    Sources, configured trust and loader findings only: two executors of the
+    same snapshot share them; a `catch_up` that rereads a newer commit
+    changes them, and so must the published completion (see `periodic_sync`)."""
+    return {
+        "sources": [(s.member, s.commit, s.mode) for s in canon.sources],
+        "trusted_ref": configured_ref(db, canon),
+        "id": canon.id, "default": canon.is_default,
+        "findings": [str(f) for f in canon.load_findings],
+    }
+
+
+def _sync_signature(db: Db, canon: Canon) -> str:
+    payload = _sync_signature_payload(db, canon)
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+class _SyncClaimRenewal:
+    """#5854: keep a live periodic sync claim fresh while `sync` runs.
+
+    A real sync can exceed `interval_s` (fetch on a loaded host). Without a
+    renewal a second executor replaces the claim after that interval: the
+    first completion is dropped (its token is no longer current) and the
+    host gate stays closed until the replacement completes. The renewal
+    stops with the sync or the process, so a dead claimant's claim still
+    ages out after `interval_s` — the recovery path is unchanged.
+
+    One small connection per beat, closed immediately: the runner's own
+    `ScopedDb` is thread-local and must not be shared with this thread.
+    Failures are silent here; the sync's own outcome and the guarded
+    completion remain the proof.
+    """
+
+    def __init__(self, db: Db, host: str, key: str, token: str, interval_s: float):
+        self.db, self.host, self.key, self.token = db, host, key, token
+        self.interval = max(0.05, float(interval_s) / 3.0)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        # A test double without a connection config has nothing to renew.
+        if getattr(self.db, "cfg", None) is None:
+            return self
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="canon-sync-renewal")
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            conn = None
+            try:
+                conn = db_mod.connect(self.db.cfg)
+                storage.of(conn).canon.renew_sync(self.host, self.key, self.token)
+            except Exception:  # noqa: BLE001 — a missed beat is retried next one
+                pass
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001 — closing cannot judge
+                        pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            # Never hold the pass on a heartbeat blocked in the database: the
+            # thread is a daemon and a late renewal is a no-op once the claim
+            # is completed or released (`renew_sync` guards both).
+            thread.join(timeout=5.0)
+
+
 def _reusable_completed(shared: dict | None, signature: str,
                         max_age_s: float) -> bool:
     """#5653: a completed result is reusable only for this exact snapshot and
@@ -1602,12 +1682,7 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     if interval_s <= 0 or canon.untrusted or not canon.readable or not canon.sources:
         return sync(db, canon, host)
     key = state_key(db, canon, host)
-    signature_payload = {
-        "sources": [(s.member, s.commit, s.mode) for s in canon.sources],
-        "trusted_ref": configured_ref(db, canon),
-        "id": canon.id, "default": canon.is_default,
-        "findings": [str(f) for f in canon.load_findings],
-    }
+    signature_payload = _sync_signature_payload(db, canon)
     signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode()).hexdigest()
     store = storage.of(db).canon
     token = uuid.uuid4().hex
@@ -1664,16 +1739,31 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
             return None
         return SyncReport(host, str(canon.root), False, [], [],
                           status=shared["status"], diagnostic=shared["diagnostic"], shared=True)
+    # #5854: `sync` can outlast `interval_s` (fetch on a loaded host). Keep
+    # the claim fresh while THIS process runs so no second executor replaces
+    # it and drops our completion; a dead claimant stops beating and its
+    # claim still expires after the interval (recovery unchanged).
+    renewal = _SyncClaimRenewal(db, host, key, token, interval_s).start()
     try:
-        report = sync(db, canon, host)
-    except Exception:
         try:
-            store.fail_sync(host, key, token)
-        except Exception:  # the claim then expires after the interval
-            pass
-        raise
-    store.complete_sync(host, key, token, signature)
-    return report
+            report = sync(db, canon, host)
+        except Exception:
+            try:
+                store.fail_sync(host, key, token)
+            except Exception:  # the claim then expires after the interval
+                pass
+            raise
+        # #5854: `sync` may have advanced the snapshot through `catch_up`.
+        # Publish the signature of the canon it APPLIED: signing the entry
+        # one left the next executor with a mismatch and a closed host gate
+        # until the next claim. A test double exposes any attribute, so only
+        # a real signature string replaces the entry one.
+        applied = getattr(report, "applied_signature", "")
+        published = applied if isinstance(applied, str) and applied else signature
+        store.complete_sync(host, key, token, published)
+        return report
+    finally:
+        renewal.stop()
 
 
 def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None, *,
@@ -2117,7 +2207,8 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     return SyncReport(host=host, source=canon.source_label(), untrusted=canon.untrusted,
                       actions=actions, findings=findings, status=status,
                       diagnostic=diagnostic, authenticators=authenticators,
-                      packages=packages, processes=processes, mechanics=machine)
+                      packages=packages, processes=processes, mechanics=machine,
+                      applied_signature=_sync_signature(db, canon))
 
 
 # --------------------------------------------------------------------------

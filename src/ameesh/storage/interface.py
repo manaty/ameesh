@@ -3384,6 +3384,15 @@ class Canon(Domain):
         completion time is published with it (`shared_sync.completed_age_s`)."""
 
     @abc.abstractmethod
+    def renew_sync(self, host: str, canon: str, token: str) -> bool:
+        """#5854: keep this pending claim fresh while its live holder syncs.
+
+        Returns False (and writes nothing) once the claim was replaced,
+        completed, or released: a late beat must not revive a claim that
+        `fail_sync` freed or extend one that `complete_sync` published.
+        """
+
+    @abc.abstractmethod
     def fail_sync(self, host: str, canon: str, token: str) -> None:
         """#5493/#5649: a claimed sync that raised releases its claim, only if
         this claim is still current. The last completed result is kept while
