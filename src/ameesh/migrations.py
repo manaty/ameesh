@@ -15,6 +15,8 @@ import functools
 import json
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 
 from .db import DbError, Unavailable, PsqlDriver, PsycopgDriver, quote_ident
@@ -797,15 +799,78 @@ def incompatible_migrations(db, directory: str = MIGRATIONS_DIR) -> list[dict]:
     return [row for row in rows if known.get(int(row['version'])) != row['checksum']]
 
 
-def require_compatible_writer(db, directory: str = MIGRATIONS_DIR) -> None:
-    if getattr(getattr(db, 'cfg', None), 'backend', '') == 'mediated':
-        return  # requests are admitted by the server running its own code
+#: #5980 : seule l'admission des nouvelles connexions partage un succès.
+#: Les passes longues gardent leur contrôle explicite et frais (writer_tick).
+#: Une minuterie ouvrant seulement des connexions relit au plus tard après 5 s.
+WRITER_ADMISSION_TTL_S = 5.0
+_WRITER_ADMISSIONS = {}
+_WRITER_ADMISSION_LOCK = threading.RLock()
+
+
+def _writer_admission_key(db, directory):
+    cfg = getattr(db, "cfg", None)
+    # Sans identité de cible exploitable, aucun partage (outils et doublures).
+    if cfg is None or not isinstance(getattr(cfg, "dsn", None), str):
+        return None
+    return (os.getpid(), cfg.dsn, cfg.schema, os.path.abspath(directory))
+
+
+def _check_compatible_writer(db, directory, key):
+    # Refus et erreur de transport ne laissent jamais un succès antérieur.
+    _WRITER_ADMISSIONS.pop(key, None)
+    started = time.monotonic()
     incompatible = incompatible_migrations(db, directory)
     if incompatible:
         labels = ", ".join("%04d_%s" % (int(r["version"]), r["name"]) for r in incompatible)
         raise IncompatibleSchema(
             "writes refused: database has non-additive migration(s) unknown to this code: "
             + labels + "; upgrade this executor/CLI before writing")
+    if key is not None:
+        if len(_WRITER_ADMISSIONS) >= 128:
+            _WRITER_ADMISSIONS.pop(next(iter(_WRITER_ADMISSIONS)))
+        # Le temps de lecture compte dans les 5 s, pas seulement l'attente.
+        _WRITER_ADMISSIONS[key] = started + WRITER_ADMISSION_TTL_S
+
+
+def require_compatible_writer(db, directory: str = MIGRATIONS_DIR) -> None:
+    """Contrôle explicite toujours frais ; renouvelle l'admission de la cible."""
+    if getattr(getattr(db, 'cfg', None), 'backend', '') == 'mediated':
+        return  # requests are admitted by the server running its own code
+    with _WRITER_ADMISSION_LOCK:
+        key = _writer_admission_key(db, directory)
+        try:
+            _check_compatible_writer(db, directory, key)
+        except BaseException:
+            # ScopedDb peut ouvrir une connexion admise pendant cette lecture.
+            # Son succès imbriqué ne doit pas survivre au refus extérieur.
+            _WRITER_ADMISSIONS.pop(key, None)
+            raise
+
+
+def admit_writer_connection(db, directory: str = MIGRATIONS_DIR) -> None:
+    """#5980 : partage un succès pendant au plus 5 s entre connexions.
+
+    Portée : processus, DSN exact (identité comprise), schéma et inventaire
+    du code. Aucun cache interprocessus. Les contrôles explicites des passes
+    ne sont jamais sautés. Le verrou empêche qu'un succès concurrent ancien
+    réarme le cache après un refus détecté par un autre fil.
+
+    N = 5 s borne la fenêtre d'admission d'une nouvelle connexion écrivaine
+    après l'apparition d'une migration non additive inconnue. Les processus
+    longs gardent leur contrôle frais par passe ; les migrations non additives
+    exigent toujours l'arrêt des exécuteurs. Un refus détecté invalide le
+    succès immédiatement : la borne n'autorise aucune admission après refus.
+    """
+    if getattr(getattr(db, 'cfg', None), 'backend', '') == 'mediated':
+        return
+    with _WRITER_ADMISSION_LOCK:
+        key = _writer_admission_key(db, directory)
+        if key is not None and time.monotonic() < _WRITER_ADMISSIONS.get(key, 0):
+            return
+        if directory == MIGRATIONS_DIR:
+            require_compatible_writer(db)
+        else:
+            require_compatible_writer(db, directory)
 
 
 @functools.lru_cache(maxsize=16)

@@ -107,6 +107,20 @@ class SchemaGuardTest(unittest.TestCase):
                     self.admin.execute('DELETE FROM schema_migrations')
         self.assertEqual(self.admin.query('SELECT n FROM guard_writes'), [{'n': 0}])
 
+    def test_detected_incompatibility_revokes_shared_connection_admission(self):
+        writer = db_mod.connect(self.cfg)
+        self.addCleanup(writer.close)
+        self.mark_unknown()
+        # Le contrôle de passe voit immédiatement la migration, malgré le
+        # succès récent mémorisé à l'ouverture ; plus aucune nouvelle
+        # connexion ne peut réutiliser ce succès, quel que soit le pilote.
+        with self.assertRaises(migrations.IncompatibleSchema):
+            migrations.require_compatible_writer(writer)
+        for driver in DRIVERS:
+            with self.subTest(driver=driver), self.assertRaises(migrations.IncompatibleSchema):
+                db_mod.connect(self.cfg, driver=driver)
+        self.assertEqual(self.admin.query('SELECT n FROM guard_writes'), [{'n': 0}])
+
     def test_footprint_pass_refuses_unknown_schema_before_refresh(self):
         # #4818 adds a background writer: its pass must obey the same guard.
         writer = db_mod.connect(self.cfg)
