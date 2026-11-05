@@ -173,7 +173,7 @@ def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, tar
     return isinstance(deadline, (float, int)) and deadline <= now + horizon
 
 
-def stop_evidence(cfg, db, host, control, *, now):
+def stop_evidence(cfg, db, host, control, *, now, quiet_s=None):
     """Revalidate native release proof and elected leader/reserve at effect time."""
     canons, unknown = host_release._canon_read(cfg)
     if unknown or not canons:
@@ -182,7 +182,7 @@ def stop_evidence(cfg, db, host, control, *, now):
     reading = store.hosts.latest(host)
     listing = store.operations.listing()
     fp = host_idle.snapshot(cfg, db, canons, {host: reading}, now=now,
-                            listing=listing).get(host)
+                            listing=listing, history_s=quiet_s).get(host)
     if not fp or fp.get('capacity') != 'burst' or fp.get('unknown'):
         raise Refused('idle burst evidence unavailable')
     # Always read elections even when baseline declarations are complete.
@@ -277,9 +277,10 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
                 return 'stopped'
             if state != 'running':
                 return 'provider transition'
-            fp = evidence(cfg, tx, host, control, now=now)
+            quiet_s = max(cfg.idle_after_s, policy['min_on_s'], 2 * delay)
+            fp = evidence(cfg, tx, host, control, now=now, quiet_s=quiet_s)
             quiet = fp.get('idle_since')
-            if (quiet is None or now - quiet < max(cfg.idle_after_s, policy['min_on_s'], 2 * delay)
+            if (quiet is None or now - quiet < quiet_s
                     or observed['on_ts'] is None or now - observed['on_ts'] < policy['min_on_s']):
                 return 'on hysteresis'
             if request.get('result') != 'poweroff intent':

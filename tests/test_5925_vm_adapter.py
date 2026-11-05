@@ -189,6 +189,53 @@ class AdapterTest(PgTestCase):
         self.assertEqual(self.tick(), 'stopped')
         self.assertEqual(self.request(), 'done')
 
+    def test_real_stop_evidence_covers_hysteresis_and_rejects_busy_or_missing_samples(self):
+        # Use the real snapshot/project path, not the injected idle_since of tick().
+        self.request()
+        self.observe_old()
+        self.db.execute("UPDATE host_lifecycle SET requested_at=clock_timestamp()-interval '2 hours'")
+        self.cfg = replace(self.cfg, baseline_hosts=0, runs_interfaces={'burst': 'none'})
+        age = [2400]
+        busy = [False]
+        gap = [False]
+
+        def reading(stamp):
+            return dict(sampled_ts=stamp, turns_in_progress=0, cpu_count=8,
+                        mem_total_bytes=16000, mem_available_bytes=12000,
+                        app_cpu=0.25, cgroup={'container': False, 'limits_readable': True})
+
+        def history(host, seconds):
+            now = self.q.now()
+            rows = [reading(now - offset) for offset in range(0, int(min(seconds, age[0])) + 1, 60)]
+            if busy[0]:
+                rows[10]['turns_in_progress'] = 1
+            if gap[0]:
+                rows = rows[:10] + rows[15:]
+            return rows
+
+        self.hosts.latest.side_effect = lambda host: reading(self.q.now() - 1)
+        self.hosts.since.side_effect = history
+        with mock.patch('ameesh.vm_adapter.storage.of', return_value=self.store), \
+                mock.patch('ameesh.vm_adapter.host_release._canon_read',
+                           return_value=([SimpleNamespace(hosts=[])], False)), \
+                mock.patch('ameesh.host_lifecycle.critical_names', return_value=[]):
+            self.assertEqual(vm.tick_host(self.cfg, self.db, policy(), 'burst',
+                                          self.provider, probe=self.probe), 'on hysteresis')
+            self.hosts.since.assert_called_with('burst', 3780)
+            self.provider.action.assert_not_called()
+            age[0] = 4200
+            for flag in (busy, gap):
+                flag[0] = True
+                with self.assertRaisesRegex(vm.Refused, 'host no longer idle'):
+                    vm.tick_host(self.cfg, self.db, policy(), 'burst', self.provider, probe=self.probe)
+                self.provider.action.assert_not_called()
+                flag[0] = False
+            self.assertEqual(vm.tick_host(self.cfg, self.db, policy(), 'burst',
+                                          self.provider, probe=self.probe), 'stop prepared')
+            self.assertEqual(vm.tick_host(self.cfg, self.db, policy(), 'burst',
+                                          self.provider, probe=self.probe), 'stopping')
+            self.provider.action.assert_called_once_with(TARGET, 'poweroff')
+
     def test_off_hysteresis_and_running_requires_fresh_reading_health_reconciliation(self):
         self.request('busy')
         self.provider.state.return_value = 'stopped'
