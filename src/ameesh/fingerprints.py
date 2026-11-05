@@ -18,12 +18,16 @@ Nexlink).  This module is the mechanical part on the ameesh side:
   advisory lock; the partial unique index added by migration 0492 is the
   database backstop, so two writers can never leave two open lots;
 * :func:`tick` is the **fingerprints** pass of the elected watch role.  The
-  source is declared per project by the canon (``fingerprints`` key of an
-  Agent card with the ``github-watch`` role, like ``github_watch``), read with
-  a **read-only token** from a 0600 file.  Without a token the pass refuses
-  explicitly instead of reading nothing.  A page is strictly validated: only
-  the contract fields are accepted, an unknown field is refused, and a
-  failure of one page never advances its cursor.
+  sources are declared per project by the canon (``fingerprints`` key of an
+  Agent card with the ``github-watch`` role, like ``github_watch``): a project
+  may declare one source (legacy ``url``/``interval``) or several
+  (``sources``), each with its own ``environment`` and **read-only token**
+  from a 0600 file derived from that environment.  A lot opened from a non-production source is marked with
+  that environment; the fingerprint identity stays shared, so the same bug
+  seen in staging then production is one lot, noted again.  Without a token
+  the pass refuses explicitly instead of reading nothing.  A page is strictly
+  validated: only the contract fields are accepted, an unknown field is
+  refused, and a failure of one page never advances its cursor.
 
 The pass is carried only by ``ameesh role timers`` / ``ameesh role run``: the
 full ``ameesh notify`` service never runs it, so only the live lease holder
@@ -57,6 +61,14 @@ ENTRY_FIELDS = frozenset(("fingerprint", "route", "code", "revision",
 #: 0600 file holding the read-only token; the service environment may name it
 TOKEN_ENV = "AMEESH_FINGERPRINTS_TOKEN_FILE"
 DEFAULT_TOKEN_FILE = "~/.config/ameesh/fingerprints.token"
+#: staging has its own token, so it keeps its own 0600 file: one environment
+#: never reads another's export with a foreign token
+DEFAULT_STAGING_TOKEN_FILE = "~/.config/ameesh/fingerprints-staging.token"
+#: the environments a source may declare.  ``production`` is the default so a
+#: legacy card keeps its exact behaviour; an unknown value is refused, never
+#: guessed.
+ENVIRONMENTS = ("production", "staging")
+DEFAULT_ENVIRONMENT = "production"
 #: a page is bounded; a source that grows past this is refused, not truncated
 MAX_PAGE_BYTES = 4 * 1024 * 1024
 MAX_PAGE_ITEMS = 5000
@@ -88,16 +100,31 @@ class FingerprintError(ValueError):
 
 @dataclass(frozen=True)
 class Declaration:
-    """One canon-declared source: a project, an HTTPS endpoint and a cadence."""
+    """One canon-declared source: a project, an HTTPS endpoint and a cadence.
+
+    ``environment`` names where the source lives (``production`` by default,
+    ``staging`` for a pre-production export); a lot opened from it carries the
+    environment.  The read-only token path is **derived from the environment**,
+    never named by the card: a card cannot point the pass at another
+    credential's 0600 file.
+    """
 
     project: str
     url: str
     interval: float
     agent: str = ""
+    environment: str = DEFAULT_ENVIRONMENT
 
     def as_json(self) -> dict:
         return {"project": self.project, "url": self.url,
-                "interval": self.interval, "agent": self.agent}
+                "interval": self.interval, "agent": self.agent,
+                "environment": self.environment}
+
+    def token_path(self) -> str:
+        """The 0600 token file of this environment (fixed convention)."""
+        if self.environment == "staging":
+            return DEFAULT_STAGING_TOKEN_FILE
+        return DEFAULT_TOKEN_FILE
 
 
 @dataclass(frozen=True)
@@ -164,8 +191,17 @@ def _count(value, field: str) -> int:
     return value
 
 
+def _environment(value) -> str:
+    """Validate a source/lot environment; empty means production."""
+    text = str(value or "").strip().lower() or DEFAULT_ENVIRONMENT
+    if text not in ENVIRONMENTS:
+        raise FingerprintError("environment: expected one of %s, not %r"
+                               % (", ".join(ENVIRONMENTS), value))
+    return text
+
+
 def _checked(*, app, key, title, users, count, route, code, revision,
-             first_seen, last_seen):
+             first_seen, last_seen, environment):
     source = source_of(app, key)
     # #3885 relecture cx2 B/P2 : la clé et le projet finissent dans la source,
     # copiée au corps du lot. La garde « pas de donnée personnelle/secrète »
@@ -176,6 +212,7 @@ def _checked(*, app, key, title, users, count, route, code, revision,
     title = _one_line(title, "--title", MAX_TITLE, required=True)
     users = _count(users, "--users")
     count = _count(count, "--count")
+    environment = _environment(environment)
     fields = {
         "route": _one_line(route, "--route", MAX_ROUTE),
         "code": _one_line(code, "--code", MAX_CODE),
@@ -186,18 +223,19 @@ def _checked(*, app, key, title, users, count, route, code, revision,
     for value in fields.values():
         _check_no_secret(value, "the fingerprint")
     _check_no_secret(title, "--title")
-    return source, title, users, count, fields
+    return source, title, users, count, fields, environment
 
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _body(*, source, users, count, fields, previous=None) -> str:
+def _body(*, source, users, count, fields, environment, previous=None) -> str:
     lines = [
         "Empreinte d'échec serveur (canon `processus/lots.md` §16).",
         "",
         "Empreinte : `%s`" % source,
+        "Environnement : %s" % environment,
         "Route : %s" % (fields["route"] or "—"),
         "Code (SQLSTATE ou exception) : %s" % (fields["code"] or "—"),
         "Révision déployée : %s" % (fields["revision"] or "—"),
@@ -222,6 +260,15 @@ def _recurrence_title(title: str, previous_id: int) -> str:
     return title[:room].rstrip() + suffix
 
 
+def _environment_title(title: str, environment: str) -> str:
+    """Prefix a non-production lot with its environment, within MAX_TITLE."""
+    if environment == DEFAULT_ENVIRONMENT:
+        return title
+    prefix = "[%s] " % environment
+    room = max(1, MAX_TITLE - len(prefix))
+    return prefix + title[:room].rstrip()
+
+
 def _open_row(db, source: str) -> dict | None:
     rows = storage.of(db).work.by_source(source)
     for row in rows:
@@ -235,17 +282,19 @@ def _latest_row(db, source: str) -> dict | None:
     return rows[-1] if rows else None
 
 
-def _seen_note(*, fields, count: int, users: int, escalated: bool) -> str:
+def _seen_note(*, fields, count: int, users: int, escalated: bool,
+               environment: str) -> str:
     text = ("Empreinte revue : occurrences=%d, dernière vue=%s, révision=%s, "
-            "utilisateurs touchés=%d"
+            "utilisateurs touchés=%d, environnement=%s"
             % (count, fields["last_seen"] or _now_iso(),
-               fields["revision"] or "—", users))
+               fields["revision"] or "—", users, environment))
     if escalated:
         text += " ; P1 (un utilisateur est touché)"
     return text
 
 
-def _note_seen(db, row: dict, *, fields, count: int, users: int, actor: str) -> bool:
+def _note_seen(db, row: dict, *, fields, count: int, users: int, actor: str,
+               environment: str) -> bool:
     """Note the occurrence on the open lot and promote it to P1 if needed.
 
     Returns True when the priority was changed.  The row is read again under
@@ -261,12 +310,13 @@ def _note_seen(db, row: dict, *, fields, count: int, users: int, actor: str) -> 
         escalated = updated is not None
     work.note(db, int(row["id"]),
               _seen_note(fields=fields, count=count, users=users,
-                         escalated=escalated),
+                         escalated=escalated, environment=environment),
               actor=actor)
     return escalated
 
 
-def _open_once(db, *, source, app, title, users, count, fields, actor) -> dict:
+def _open_once(db, *, source, app, title, users, count, fields, actor,
+               environment) -> dict:
     with db.transaction() as tx:
         # One lock per identity: two hosts (or two processes) serialize here
         # before reading the open lot, so the loser notes the winner.
@@ -281,9 +331,11 @@ def _open_once(db, *, source, app, title, users, count, fields, actor) -> dict:
             if locked is not None and locked.get("state") not in (
                     *work.MERGED_STATES, "closed"):
                 escalated = _note_seen(tx, locked, fields=fields, count=count,
-                                       users=users, actor=actor)
+                                       users=users, actor=actor,
+                                       environment=environment)
                 return {"created": False, "noted": True, "escalated": escalated,
                         "lot": int(locked["id"]), "source": source,
+                        "environment": environment,
                         "recurrence_of": None,
                         "priority": 1 if (escalated or locked.get("priority") == 1)
                         else locked.get("priority")}
@@ -291,7 +343,9 @@ def _open_once(db, *, source, app, title, users, count, fields, actor) -> dict:
         previous_id = int(previous["id"]) if previous is not None else None
         recurrence = previous_id is not None and previous.get("state") in (
             *work.MERGED_STATES, "closed")
-        new_title = (_recurrence_title(title, previous_id) if recurrence else title)
+        new_title = _environment_title(title, environment)
+        if recurrence:
+            new_title = _recurrence_title(new_title, previous_id)
         note = ("récidive du lot #%d (empreinte déjà close)" % previous_id
                 if recurrence else "")
         priority = 1 if users > 0 else 2
@@ -299,10 +353,12 @@ def _open_once(db, *, source, app, title, users, count, fields, actor) -> dict:
             tx, title=new_title, type="bug", priority=priority, source=source,
             app=app, body=_body(source=source, users=users,
                                 count=count, fields=fields,
+                                environment=environment,
                                 previous=previous_id if recurrence else None),
             actor=actor, note=note)
         return {"created": True, "noted": False, "escalated": False,
                 "lot": int(item["id"]), "source": source,
+                "environment": environment,
                 "recurrence_of": previous_id if recurrence else None,
                 "priority": priority}
 
@@ -310,6 +366,7 @@ def _open_once(db, *, source, app, title, users, count, fields, actor) -> dict:
 def open_lot(db, *, app: str, key: str, title: str, users=0, count=0,
              route: str = "", code: str = "", revision: str = "",
              first_seen: str = "", last_seen: str = "",
+             environment: str = DEFAULT_ENVIRONMENT,
              actor: str = "") -> dict:
     """Open one lot for ``empreinte:<app>:<key>``, or note the open one.
 
@@ -317,15 +374,20 @@ def open_lot(db, *, app: str, key: str, title: str, users=0, count=0,
     occurrence (the pass may re-read a window after a failure).  ``users > 0``
     gives priority 1 at creation and promotes an open P2/P3 lot.  A closed
     fingerprint opens a recurrence lot linked to the previous one.
+    ``environment`` (``production`` or ``staging``) marks the lot; the
+    fingerprint identity stays shared across environments, so the same bug
+    seen in staging then production is one lot, noted again.
     """
-    source, title, users, count, fields = _checked(
+    source, title, users, count, fields, environment = _checked(
         app=app, key=key, title=title, users=users, count=count, route=route,
-        code=code, revision=revision, first_seen=first_seen, last_seen=last_seen)
+        code=code, revision=revision, first_seen=first_seen, last_seen=last_seen,
+        environment=environment)
     actor = (actor or "").strip() or os.environ.get("AMEESH_ROLE") or work.SYSTEM_SENDER
     for attempt in (0, 1):
         try:
             return _open_once(db, source=source, app=app.strip(), title=title,
-                              users=users, count=count, fields=fields, actor=actor)
+                              users=users, count=count, fields=fields, actor=actor,
+                              environment=environment)
         except DbError as exc:
             # The advisory lock covers our own writers; this catches a manual
             # row (or an old code path) that inserted without it.  Re-read the
@@ -351,25 +413,65 @@ def _https(url: str) -> str:
     return urllib.parse.urlunsplit(parts)
 
 
+SOURCE_FIELDS = frozenset(("url", "interval", "environment"))
+
+
+def _source_declaration(project: str, spec, agent: str) -> Declaration:
+    """Parse one source mapping; raise ValueError with an actionable message."""
+    if not isinstance(spec, dict):
+        raise ValueError("a source must be a mapping")
+    unknown = sorted(set(spec) - SOURCE_FIELDS)
+    if unknown:
+        raise ValueError("unknown setting(s) %s" % ", ".join(map(str, unknown)))
+    url = _https(spec.get("url"))
+    interval = spec.get("interval", 60)
+    if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+            or not 60 <= interval <= 3600):
+        raise ValueError("interval must be 60..3600 seconds")
+    environment = spec.get("environment", DEFAULT_ENVIRONMENT)
+    if (not isinstance(environment, str)
+            or environment.strip().lower() not in ENVIRONMENTS):
+        raise ValueError("environment must be one of %s"
+                         % ", ".join(ENVIRONMENTS))
+    environment = environment.strip().lower() or DEFAULT_ENVIRONMENT
+    return Declaration(project, url, float(interval), agent, environment)
+
+
 def declarations(canons, log=None) -> tuple[list[Declaration], str]:
-    """The canon's ``fingerprints`` cards: projects, endpoints, cadences.
+    """The canon's ``fingerprints`` cards: project sources, endpoints, cadences.
 
     A card is an Agent fiche with the ``github-watch`` role (the watch role of
-    §11) and a ``fingerprints`` mapping keyed by project::
+    §11) and a ``fingerprints`` mapping keyed by project.  The historical form
+    declares one production source::
 
         fingerprints:
           nexlink:
             url: https://…/internal/fingerprints
             interval: 60
 
-    ``url`` and ``interval`` are the only settings; an unknown setting, a
-    foreign project or an invalid URL is logged and skipped, never silently
-    applied.  On a conflict the first declaration wins.  The second element
-    is a readable error when the canon cannot be read at all, ``""``
-    otherwise.
+    A project may declare several sources, each with its environment (the
+    0600 token file is derived from it, so a staging source never reads
+    production's export with a foreign token)::
+
+        fingerprints:
+          nexlink:
+            sources:
+              - url: https://api.nexlink.ph/api/internal/fingerprints
+                environment: production
+                interval: 60
+              - url: https://api-staging.nexlink.ph/api/internal/fingerprints
+                environment: staging
+                interval: 60
+
+    ``url``/``interval``/``environment`` are the only settings;
+    an unknown setting, a foreign project or an invalid source is logged and
+    skipped, never silently applied.  An invalid source does not discard its
+    siblings; a duplicate URL is kept once.  On a conflict between two cards
+    for the same project, the first card wins.  The second element is a
+    readable error when the canon cannot be read at all, ``""`` otherwise.
     """
     warn = log or (lambda _text: None)
-    found: dict[str, Declaration] = {}
+    found: dict[str, list[Declaration]] = {}
     for bundle in canons:
         for agent in bundle.agents:
             title = getattr(agent, "title", "")
@@ -391,36 +493,58 @@ def declarations(canons, log=None) -> tuple[list[Declaration], str]:
                     warn("%s: fingerprints project %r must belong to the agent; ignored"
                          % (title or "?", project))
                     continue
+                if project in found:
+                    warn("%s: multiple fingerprints cards for %s; keeping %s"
+                         % (title or "?", project,
+                            ", ".join(item.agent or "the first" for item in found[project])))
+                    continue
                 if not isinstance(spec, dict):
                     warn("%s: invalid fingerprints declaration for %s; ignored"
                          % (title or "?", project))
                     continue
-                unknown = set(spec) - {"url", "interval"}
-                if unknown:
-                    warn("%s: unknown fingerprints setting %s for %s; ignored"
-                         % (title or "?", ", ".join(sorted(map(str, unknown))), project))
-                    continue
-                try:
-                    url = _https(spec.get("url"))
-                except ValueError as exc:
-                    warn("%s: fingerprints url for %s: %s; ignored"
-                         % (title or "?", project, exc))
-                    continue
-                interval = spec.get("interval", 60)
-                if (isinstance(interval, bool) or not isinstance(interval, (int, float))
-                        or not 60 <= interval <= 3600):
-                    warn("%s: fingerprints interval must be 60..3600 seconds for %s; "
-                         "ignored" % (title or "?", project))
-                    continue
-                candidate = Declaration(project, url, float(interval), title)
-                current = found.get(project)
-                if current is not None:
-                    if current != candidate:
-                        warn("%s/%s: multiple fingerprints sources; keeping %s"
-                             % (project, url, current.agent or "the first"))
-                    continue
-                found[project] = candidate
-    return list(found.values()), ""
+                if "sources" in spec:
+                    unknown = set(spec) - {"sources"}
+                    if unknown:
+                        warn("%s: unknown fingerprints setting %s for %s; ignored"
+                             % (title or "?",
+                                ", ".join(sorted(map(str, unknown))), project))
+                        continue
+                    raw = spec.get("sources")
+                    if not isinstance(raw, list) or not raw:
+                        warn("%s: fingerprints sources for %s must be a non-empty "
+                             "list; ignored" % (title or "?", project))
+                        continue
+                    items = raw
+                else:
+                    items = [spec]
+                candidates: list[Declaration] = []
+                urls: set[str] = set()
+                environments: set[str] = set()
+                for index, item in enumerate(items):
+                    try:
+                        candidate = _source_declaration(project, item, title)
+                    except ValueError as exc:
+                        where = ("source %d" % (index + 1) if len(items) > 1
+                                 else "declaration")
+                        warn("%s: fingerprints %s for %s: %s; ignored"
+                             % (title or "?", where, project, exc))
+                        continue
+                    if candidate.url in urls:
+                        warn("%s: duplicate fingerprints url %s for %s; ignored"
+                             % (title or "?", candidate.url, project))
+                        continue
+                    if candidate.environment in environments:
+                        # state is keyed by (project, environment): two sources
+                        # would share (and overwrite) one cursor
+                        warn("%s: duplicate fingerprints environment %s for %s; "
+                             "ignored" % (title or "?", candidate.environment, project))
+                        continue
+                    urls.add(candidate.url)
+                    environments.add(candidate.environment)
+                    candidates.append(candidate)
+                if candidates:
+                    found[project] = candidates
+    return [item for candidates in found.values() for item in candidates], ""
 
 
 def declarations_of_config(cfg, log=None) -> tuple[list[Declaration], str]:
@@ -544,6 +668,7 @@ def _with_since(url: str, cursor: str | None) -> str:
 def read_page(decl: Declaration, cursor: str | None, token: str,
               *, timeout: float = 30.0, opener=None) -> dict:
     """Read one page with the read-only bearer token (HTTPS, no redirect)."""
+    label = "%s/%s" % (decl.project, decl.environment)
     request = urllib.request.Request(
         _with_since(decl.url, cursor),
         headers={"Authorization": "Bearer %s" % token,
@@ -555,23 +680,23 @@ def read_page(decl: Declaration, cursor: str | None, token: str,
             raw = response.read(MAX_PAGE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         raise FingerprintError("fingerprints source %s: HTTP %s"
-                               % (decl.project, exc.code)) from None
+                               % (label, exc.code)) from None
     except urllib.error.URLError as exc:
         raise FingerprintError("fingerprints source %s: unreachable (%s)"
-                               % (decl.project, exc.reason)) from None
+                               % (label, exc.reason)) from None
     except FingerprintError:
         raise
     except Exception as exc:  # noqa: BLE001 - readable refusal, never a traceback
         raise FingerprintError("fingerprints source %s: read failed (%s)"
-                               % (decl.project, type(exc).__name__)) from None
+                               % (label, type(exc).__name__)) from None
     if len(raw) > MAX_PAGE_BYTES:
         raise FingerprintError("fingerprints source %s: page larger than %d bytes"
-                               % (decl.project, MAX_PAGE_BYTES))
+                               % (label, MAX_PAGE_BYTES))
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise FingerprintError("fingerprints source %s: invalid JSON"
-                               % decl.project) from None
+                               % label) from None
     return payload
 
 
@@ -587,9 +712,14 @@ def tick(cfg, db, *, now: float | None = None, log=None,
     """The ``fingerprints`` pass: read every declared source, open/note lots.
 
     Only the elected role runs it (``ameesh role run`` sets ``AMEESH_ROLE``).
-    Without a source, nothing is read.  Without a token file, the pass refuses
-    explicitly for every declared project.  A page is strictly validated; its
-    cursor advances only after every entry was accepted.
+    Without a source, nothing is read.  Each source reads its own 0600 token
+    file derived from its environment (``token_file`` overrides every source
+    for a test; the legacy ``TOKEN_ENV`` names the production file only).  A
+    source without a token refuses explicitly
+    and does not stop its siblings.  A page is strictly validated; its cursor
+    advances only after every entry was accepted.  Lots are marked with the
+    source's environment; the fingerprint identity is shared, so a bug seen in
+    staging then production is one lot, noted again.
     """
     emit = log or (lambda _text: None)
     decls, error = declarations_of_config(cfg, emit)
@@ -598,25 +728,34 @@ def tick(cfg, db, *, now: float | None = None, log=None,
     if not decls:
         emit("fingerprints: no source declared in the canon")
         return []
-    path = (token_file or os.environ.get(TOKEN_ENV) or DEFAULT_TOKEN_FILE)
-    try:
-        token = httpkit.read_token_file(
-            path, what="fingerprints read-only token",
-            hint="the source cannot be read without it (0600, on every candidate host)")
-    except ValueError as exc:
-        # Explicit refusal, like a missing GitHub key: never a silent pass.
-        for decl in decls:
-            try:
-                storage.of(db).fingerprints.fail(decl.project, decl.url, str(exc),
-                                                 now=now)
-            except Exception:  # noqa: BLE001 - the refusal is the point
-                pass
-        raise FingerprintError(str(exc)) from None
     actor = (actor or os.environ.get("AMEESH_ROLE") or work.SYSTEM_SENDER).strip()
     results: list[dict] = []
     failures: list[str] = []
+    tokens: dict[str, str] = {}
+
+    def token_of(decl: Declaration) -> str:
+        # The path is derived from the environment.  The legacy env override
+        # names the production file only: a staging source never reads
+        # production's token (#5968 review B2).
+        path = token_file
+        if not path and decl.environment == "production":
+            path = os.environ.get(TOKEN_ENV)
+        path = path or decl.token_path()
+        if path not in tokens:
+            tokens[path] = httpkit.read_token_file(
+                path, what="fingerprints read-only token",
+                hint="the source cannot be read without it (0600, on every "
+                     "candidate host)")
+        return tokens[path]
+
     for decl in decls:
-        state = storage.of(db).fingerprints.state(decl.project)
+        label = "%s/%s" % (decl.project, decl.environment)
+        state = storage.of(db).fingerprints.state(decl.project, decl.environment)
+        if state is not None and state.get("url") != decl.url:
+            # The endpoint of this environment changed: its old cursor belongs
+            # to another journal and could skip entries.  Start at its beginning.
+            emit("fingerprints %s: endpoint changed, cursor restarted" % label)
+            state = None
         cursor = (state or {}).get("cursor")
         # The role timer wakes at most every 90 s for the takeover; the
         # declared cadence is enforced on the persisted read time, like the
@@ -625,7 +764,7 @@ def tick(cfg, db, *, now: float | None = None, log=None,
         last_ts = (state or {}).get("last_read_ts")
         if last_ts is not None and moment - float(last_ts) < decl.interval:
             emit("fingerprints %s: next read in %ds"
-                 % (decl.project, max(1, int(decl.interval - (moment - float(last_ts))))))
+                 % (label, max(1, int(decl.interval - (moment - float(last_ts))))))
             continue
         # #5695: AG2 failed 1 365 times on 03/11 on one rejected token.  A
         # refused token is retried every AUTH_RETRY_S, its refusal kept in
@@ -635,22 +774,38 @@ def tick(cfg, db, *, now: float | None = None, log=None,
         if (auth_refused((state or {}).get("last_error")) and tried_ts is not None
                 and moment - float(tried_ts) < retry):
             emit("fingerprints %s: token refused (%s); next try in %ds"
-                 % (decl.project, (state or {}).get("last_error"),
+                 % (label, (state or {}).get("last_error"),
                     max(1, int(retry - (moment - float(tried_ts))))))
+            continue
+        try:
+            token = token_of(decl)
+        except ValueError as exc:
+            # Explicit refusal, like a missing GitHub key: never a silent pass.
+            text = "fingerprints %s: %s" % (label, exc)
+            failures.append(text)
+            try:
+                storage.of(db).fingerprints.fail(
+                    decl.project, decl.url, text, environment=decl.environment,
+                    now=now)
+            except Exception:  # noqa: BLE001 - the refusal is the point
+                pass
             continue
         try:
             payload = read_page(decl, cursor, token, opener=opener)
             entries, next_cursor = parse_page(payload)
         except FingerprintError as exc:
             failures.append(str(exc))
-            storage.of(db).fingerprints.fail(decl.project, decl.url, str(exc), now=now)
+            storage.of(db).fingerprints.fail(
+                decl.project, decl.url, str(exc),
+                environment=decl.environment, now=now)
             continue
         except Exception as exc:  # noqa: BLE001 - one source never hides another
-            text = ("fingerprints source %s: %s" % (decl.project, type(exc).__name__))
+            text = ("fingerprints source %s: %s" % (label, type(exc).__name__))
             failures.append(text)
-            storage.of(db).fingerprints.fail(decl.project, decl.url, text)
+            storage.of(db).fingerprints.fail(
+                decl.project, decl.url, text, environment=decl.environment)
             continue
-        project_failed = False
+        source_failed = False
         for entry in entries:
             try:
                 result = open_lot(
@@ -658,28 +813,31 @@ def tick(cfg, db, *, now: float | None = None, log=None,
                     title=title_of(entry), users=entry.users,
                     count=entry.occurrences, route=entry.route, code=entry.code,
                     revision=entry.revision, first_seen=entry.first_seen,
-                    last_seen=entry.last_seen, actor=actor)
+                    last_seen=entry.last_seen, environment=decl.environment,
+                    actor=actor)
             except Exception as exc:  # noqa: BLE001 - bounded, readable refusal
-                project_failed = True
+                source_failed = True
                 text = ("fingerprints source %s, entry %s: %s"
-                        % (decl.project, entry.fingerprint[:80], str(exc)[:200]))
+                        % (label, entry.fingerprint[:80], str(exc)[:200]))
                 failures.append(text)
-                storage.of(db).fingerprints.fail(decl.project, decl.url, text)
+                storage.of(db).fingerprints.fail(
+                    decl.project, decl.url, text, environment=decl.environment)
                 break
             results.append(dict(result, project=decl.project,
                                 fingerprint=entry.fingerprint,
                                 occurrences=entry.occurrences, users=entry.users))
             emit("fingerprints %s: lot #%d %s (occurrences %d, users %d)"
-                 % (decl.project, result["lot"],
+                 % (label, result["lot"],
                     "opened" if result["created"] else "noted",
                     entry.occurrences, entry.users))
-        if not project_failed:
+        if not source_failed:
             # #3885 relecture dev1 B/P1 : un `cursor: null` ne recule jamais.
             # Le garder ferait relire tout le journal au passage suivant et
             # rouvrirait chaque empreinte déjà close (récidive à chaque tick).
             effective = next_cursor if next_cursor is not None else cursor
             storage.of(db).fingerprints.advance(
-                decl.project, decl.url, effective, now=now)
+                decl.project, decl.url, effective,
+                environment=decl.environment, now=now)
     if failures:
         raise FingerprintError("; ".join(failures)[:1000])
     return results
@@ -704,10 +862,10 @@ def alerts(db, now: float, *, sources, orchestrators=(),
     """
     from .exploitation import _alert
     out = []
-    active = {decl.project: decl for decl in sources}
+    active = {(decl.project, decl.url): decl for decl in sources}
     for row in storage.of(db).fingerprints.failing():
-        decl = active.get(row["project"])
-        if decl is None or decl.url != row.get("url"):
+        decl = active.get((row["project"], row.get("url")))
+        if decl is None:
             continue
         # A source never read has no healthy moment to wait from: it alerts
         # at once (`since` unknown), a read source after `after_s`.
@@ -717,6 +875,7 @@ def alerts(db, now: float, *, sources, orchestrators=(),
             if now - since < after_s:
                 continue
         project = row["project"]
+        label = "%s/%s" % (project, decl.environment)
         error = str(row.get("last_error") or "")
         if auth_refused(error):
             gesture = ("the source refuses the read-only token: renew it on the source "
@@ -724,18 +883,20 @@ def alerts(db, now: float, *, sources, orchestrators=(),
                        "never read from another process) and write it, 0600, to %s "
                        "(or the file named by %s) on every candidate host of the "
                        "elected role; the pass retries every %gs"
-                       % (DEFAULT_TOKEN_FILE, TOKEN_ENV, max(decl.interval, AUTH_RETRY_S)))
+                       % (decl.token_path(), TOKEN_ENV, max(decl.interval, AUTH_RETRY_S)))
         else:
             gesture = "the pass retries at its declared cadence (%gs)" % decl.interval
         detail = ("Failure fingerprints source %s (%s) failing since %s: %s. "
                   "No new fingerprint lot can open meanwhile (canon §16). Action: %s."
-                  % (project, row.get("url") or "?",
+                  % (label, row.get("url") or "?",
                      time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(since))
                      if since is not None else "its first read",
                      error[:300], gesture))
         out.append(_alert("fingerprints_source_failing", None, since,
                           None if since is None else max(0.0, now - since),
                           after_s, detail,
-                          project=project, auth_refused=auth_refused(error),
+                          project=project, url=row.get("url"),
+                          environment=decl.environment,
+                          auth_refused=auth_refused(error),
                           orchestrators=list(orchestrators)))
     return out
