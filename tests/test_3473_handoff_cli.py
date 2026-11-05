@@ -46,6 +46,7 @@ class OperatorTest(unittest.TestCase):
             self.api.handoffs)
         self.api.handoffs.begin_effect.return_value = operation
         self.api.handoffs.promote_loss.return_value = None
+        self.api.handoffs.cancel_unused.return_value = None
         self.api.host_lifecycle.get.return_value = None
         self.binding.adapter = mock.Mock()
         self.binding.adapter.revalidate.return_value = True

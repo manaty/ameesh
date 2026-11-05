@@ -524,16 +524,18 @@ def cancel(db, operation, adapter):
     # Loss publication uses this same gate lock. Keep the current lifecycle
     # check, restoration and fence release within one boundary.
     with api.cancellation_guard(operation) as guarded:
-        control = storage.of(guarded.db).host_lifecycle.get(op["source"])
-        if control and control["mode"] == "lost":
-            raise HandoffRefusal(Refusal.SOURCE_LOST)
         # #5864: an expired plan that never fenced nor touched a host has
         # nothing to restore; restore_source would re-enable a drained unit.
+        # Checked before the lost-source refusal: closing it has no host
+        # effect, and a stale plan on a lost source would block its reconcile.
         # Journal backend, like begin_effect: a row lock taken on the gate
         # backend would be held until the gate commits and block the intent.
         unused = api.cancel_unused(operation)
         if unused:
             return unused
+        control = storage.of(guarded.db).host_lifecycle.get(op["source"])
+        if control and control["mode"] == "lost":
+            raise HandoffRefusal(Refusal.SOURCE_LOST)
         if adapter is None:
             raise HandoffRefusal(Refusal.ADAPTER_UNAVAILABLE)
         if _effect(api, adapter, "restore_source", op, completion_api=guarded) is not True:

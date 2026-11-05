@@ -554,6 +554,35 @@ class HandoffTest(PgTestCase):
         self.assertEqual(done["evidence"]["cancelled_unused"], "prepared")
         self.assertNotIn("restore_source", self.adapter.calls)
 
+    def lose_source(self):
+        self.db.execute("INSERT INTO host_lifecycle(host,mode,actor) VALUES ('source','lost','test') "
+                        "ON CONFLICT(host) DO UPDATE SET mode='lost'")
+
+    def test_5864_lost_source_cancels_expired_unused_plan_without_host_effect(self):
+        # Real case (#5869): source in lost mode, stale planned handoff blocks its reconcile.
+        op = self.request()
+        self.expire(op)
+        self.lose_source()
+        done = handoffs.cancel(self.db, op["id"], None)
+        self.assertEqual((done["state"], done["fenced"]), ("cancelled", False))
+        self.assertEqual(done["evidence"]["cancelled_unused"], "planned")
+        self.assertIsNone(self.api.handoffs.active("dev"))
+        self.assertEqual(self.adapter.calls, [])
+
+    def test_5864_lost_source_still_refuses_live_or_fenced_plans(self):
+        live = self.request()
+        self.lose_source()
+        with self.assertRaises(handoffs.HandoffRefusal) as refused:
+            handoffs.cancel(self.db, live["id"], self.adapter)
+        self.assertIs(refused.exception.reason, handoffs.Refusal.SOURCE_LOST)
+        self.assertEqual(self.api.handoffs.get(live["id"])["state"], "planned")
+        self.db.execute("UPDATE host_handoffs SET fenced=true WHERE id=%s", (live["id"],))
+        self.expire(live)
+        with self.assertRaises(handoffs.HandoffRefusal) as refused:
+            handoffs.cancel(self.db, live["id"], self.adapter)
+        self.assertIs(refused.exception.reason, handoffs.Refusal.SOURCE_LOST)
+        self.assertNotIn("restore_source", self.adapter.calls)
+
     def test_5864_live_reservation_still_restores_and_refuses_without_adapter(self):
         op = self.request()
         with self.assertRaises(handoffs.HandoffRefusal) as refused:
