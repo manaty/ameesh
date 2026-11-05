@@ -808,6 +808,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               fixes: Iterable[dict] = (),
               vehicle_exit_ts: float | None = None,
               packet_pause: dict | None = None,
+              packet_missed: dict | None = None,
               footprint: dict | None = None) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
@@ -847,6 +848,14 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
 
     #4444 : `packet_pause` (la pause déclarée du paquet horaire que
     `packet_slot` a déjà franchie) est seulement nommée sur la ligne.
+
+    #5860 : `packet_missed` (créneaux franchis sans que le paquet porte le
+    lot, `exploitation._missed_packet_slots`) : `packet_slot` est alors le
+    dernier créneau passé, d'où l'horloge repart. La ligne nomme le manque et
+    monte au moins au niveau 1 — le créneau manqué est un fait à expliquer
+    (cause du composeur), pas un retard compté depuis le premier créneau. Un
+    départ que la retenue, le véhicule ou la dépendance repousse après ce
+    créneau garde sa propre cause : le manque n'y est pas nommé.
 
     #2217 : quand le lot vient d'être pris en charge (dernière ligne
     `assigned to … (before: …)` il y a moins de `HANDOVER_GRACE_S`), les
@@ -1189,9 +1198,20 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     extra["hold_released_ts"] = round(lifted, 3)
                 start = _after_vehicle(start, exited, extra)
                 start = _after_dependency(start, dep_ready, extra)
+                missed = (packet_missed if packet_missed and not packet
+                          and packet_slot is not None
+                          and start == float(packet_slot) else None)
+                if missed:
+                    extra["packet_missed"] = dict(missed)
                 if not dep_open:
-                    out.append(_row(step, start, now=running_now, critical=critical,
-                                    target=target, escalate=not packet, **extra))
+                    row = _row(step, start, now=running_now, critical=critical,
+                               target=target, escalate=not packet, **extra)
+                    if missed and not row["level"] and running_now == now:
+                        # #5860 : le créneau manqué se signale dès qu'il est
+                        # passé, au premier palier, avec sa cause.
+                        row["level"] = 1
+                        row["targets"] = targets(1, critical=critical)
+                    out.append(row)
 
     if state not in lifecycle.COMPLETED:
         step = step_of("green_verdict")
