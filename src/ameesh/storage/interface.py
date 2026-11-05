@@ -4927,6 +4927,12 @@ class TurnResources(Domain):
         contrat, la ligne reste sans cgroup)."""
 
     @abc.abstractmethod
+    def record_usage(self, turn_id: str, *, memory_peak_bytes: int | None,
+                     cpu_usage_usec: int | None) -> None:
+        """#5921: local cgroup counters, unavailable on mediated executors."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def close_turn(self, turn_id: str, *, orphan: bool,
                    containers: Sequence[str] | None = None) -> None:
         """Ferme la ligne : `done` si la ressource est rendue, `orphan` sinon."""

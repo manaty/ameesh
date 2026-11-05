@@ -303,13 +303,18 @@ def _complete_canons(cfg, canons):
     return canons
 
 
-def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None):
+def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None,
+             guards=False):
     """Read all common sources once, then project each host. No mutations.
 
     `controls` (#4148): the host_lifecycle rows, mapping host to row, when the
     caller already read them. The release state then overlays the footprint
     (draining/idle-drained, declared runs); without them the projection stays
     the read-only A view.
+
+    `guards` (#5914): always read the elected leaders and reserves, even when
+    explicit `capacity: baseline` cards fill the baseline. The automatic
+    drain needs `baseline_guard` for its one host whatever the other cards say.
     """
     from . import canon as canon_mod
     from . import planned_waits
@@ -372,7 +377,7 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None
                       < cfg.baseline_hosts)
     oversized_possible = (listing is not None
                           and len(candidates) > cfg.baseline_hosts)
-    if agents is not None and (underspecified or oversized_possible):
+    if agents is not None and (guards or underspecified or oversized_possible):
         from . import election, host_lifecycle
         try:
             # #4377: the canons of this view, when every configured canon is

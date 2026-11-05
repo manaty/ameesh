@@ -33,6 +33,9 @@ K8S = os.path.join(REPO, "deploy", "k8s")
 #: matériel de signature, de reçu et clés : refusé à TOUS les rôles superviseurs
 #: (miroir de l'en-tête de role-superviseur.sql)
 SIGNATURES = {
+    # #5921: internal sizing telemetry; no supervisor grants changed.
+    "turn_resources": {"memory_peak_bytes", "cpu_usage_usec"},
+    "host_resource_daily": {"host", "day", "host_metrics", "turn_metrics"},
     "agent_mailbox": {"signature", "signed_payload", "nonce"},
     "mesh_approvals": {"signature", "signed_payload", "nonce"},
     "mesh_approvals_status": {"signature", "signed_payload", "nonce"},
