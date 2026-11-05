@@ -3433,7 +3433,7 @@ def lot_author(lot: int, repo: Path) -> str:
 
 
 def remember_unit_red(repo: Path, lot: int, source: str, target: str,
-                      tests: list[str], sender: str | None) -> bool:
+                      tests: list[str], sender: str | None, *, base=None) -> bool:
     """#5971 : note durable avant recomposition ; False si déjà signalé.
 
     Ne jamais réarmer la borne d'une tête expirée : la première note reste
@@ -3445,7 +3445,7 @@ def remember_unit_red(repo: Path, lot: int, source: str, target: str,
     try:
         connection = db.connect(config.load())
         return packet_unit_red.remember(connection, lot, source, target, tests,
-                                        actor=sender or '')
+                                        actor=sender or '', base=base)
     except Exception as exc:
         raise PaquetAutoError('mémoire du rouge #%d non enregistrée : %s' % (lot, exc)) from exc
     finally:
@@ -3454,7 +3454,7 @@ def remember_unit_red(repo: Path, lot: int, source: str, target: str,
 
 
 def notify_removals(repo: Path, name: str, removals: list[Removal], *,
-                    sender: str | None, log=print, sources=None, target='') -> list[str]:
+                    sender: str | None, log=print, sources=None, target='', base=None) -> list[str]:
     """Prévient l'auteur de chaque unité retirée (§11 bis, #3931).
 
     Un courrier qui ne part pas n'annule pas la recomposition : il est
@@ -3467,7 +3467,7 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
         if sources is not None:
             try:
                 if not remember_unit_red(repo, removal.lot, sources[removal.lot],
-                                         target, removal.tests, sender):
+                                         target, removal.tests, sender, base=base):
                     continue
             except (PaquetAutoError, ValueError, KeyError) as exc:
                 raise PaquetAutoError('retrait #%d non mémorisé : %s'
@@ -4370,7 +4370,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                     worktree, args.name, removals,
                     sender=getattr(args, 'sender', None),
                     sources={candidate.lot: candidate.source for candidate in candidates},
-                    target=args.target)
+                    target=args.target, base=base_sha)
                 if failed:
                     print('mémoire/courriers de retrait non enregistrés : %s'
                           % ' ; '.join(failed), file=sys.stderr, flush=True)

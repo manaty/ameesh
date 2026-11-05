@@ -30,6 +30,28 @@ class SelectionTest(unittest.TestCase):
         memory.apply(rows, [event()], now=160)
         self.assertTrue(rows[0]['ready'])
 
+    def test_changed_target_head_readmits_the_same_source_early(self):
+        mark = dict(event(), note=memory.note(X, 'main', ['tests.test_bug'], base=X))
+        for base, ready in ((X, False), (Y, True)):
+            rows = [candidate()]
+            memory.apply(rows, [mark], now=160, base=base)
+            self.assertEqual(rows[0]['ready'], ready)
+        rows = [candidate()]
+        memory.apply(rows, [event()], now=160, base=Y)
+        self.assertFalse(rows[0]['ready'])  # legacy note: bounded fallback
+
+    def test_exclusion_names_its_expiry_for_the_ready_list_and_watch(self):
+        from ameesh import packet_watch
+        rows = [candidate()]
+        memory.apply(rows, [event()], now=160)
+        detail = rows[0]['causes'][0]['detail']
+        self.assertIn('01:01 UTC', detail)
+        watch = packet_watch.ProjectWatch('ameesh', ('composer',))
+        text = packet_watch.body(watch, {'label': 'test', 'at': 160},
+                                 {'candidates': rows, 'ready': []}, now=160)
+        self.assertIn(detail, text)
+        self.assertIn('0 lot(s) prêt(s)', text)
+
     def test_expiry_is_bounded_and_repeated_reds_cannot_extend_it(self):
         rows = [candidate()]
         memory.apply(rows, [event(stamp=200), event(stamp=100)],
@@ -67,8 +89,9 @@ class PersistenceTest(unittest.TestCase):
                 mock.patch.object(paquet_auto, 'send_mail') as mail:
             for packet in ('h-28', 'h-29'):
                 self.assertEqual(paquet_auto.notify_removals(pathlib.Path('.'), packet, [removal],
-                    sender='pilot', sources={1:X}, target='main', log=lambda _: None), [])
+                    sender='pilot', sources={1:X}, target='main', base=X, log=lambda _: None), [])
         self.assertEqual(remember.call_count, 2)
+        self.assertEqual(remember.call_args.kwargs["base"], X)
         mail.assert_called_once()
         self.assertIn('tests.test_bug', mail.call_args.args[2])
 

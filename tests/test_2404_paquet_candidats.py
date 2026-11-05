@@ -315,6 +315,18 @@ class InventoryTest(unittest.TestCase):
                                return_value=mark['created_ts'] + packet_unit_red.EXCLUSION_S):
             self.assertIn(1, self.inventory()['ready'])
 
+    def test_unit_red_memory_readmits_when_the_target_head_changes(self):
+        from ameesh import packet_unit_red
+        base = self.inventory()['base']
+        mark = self.hold(1, packet_unit_red.note(
+            self.tips[1], 'main', ['tests.test_bug'], base=base), actor='composer')
+        with mock.patch.object(packet_unit_red.time, 'time', return_value=mark['created_ts'] + 60):
+            self.assertNotIn(1, self.inventory()['ready'])
+            _write(self.repo, 'target-fix.py', 'fixed\n')
+            _commit(self.repo, 'target repair')
+            _git(self.repo, 'push', '-q', 'origin', 'main')
+            self.assertIn(1, self.inventory()['ready'])
+
     def test_unit_red_memory_allows_a_new_frozen_and_reviewed_head(self):
         from ameesh import packet_unit_red
         previous = self.tips[1]

@@ -926,7 +926,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
         try:
             red_events = storage.of(db).progress.lot_hold_events(
                 ready_ids, [packet_unit_red.PATTERN])
-            packet_unit_red.apply(candidates, red_events)
+            packet_unit_red.apply(candidates, red_events, base=fetched_target)
         except Exception as exc:
             raise CandidateError('cannot read unit-test exclusions: %s' % exc) from exc
     for entry in candidates:
