@@ -1658,7 +1658,9 @@ def empty_state() -> dict:
             "fallback": {},
             #: #3761 : verdicts de porte des avis, relus seulement quand le
             #: gel, la cible, les jalons ou le canon changent
-            "gates": {}}
+            "gates": {},
+            #: #5912 : épisodes de capacité réservée déjà journalisés
+            "capacity_journal": {}}
 
 
 #: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
@@ -2667,6 +2669,7 @@ class Notifier:
                 else:
                     self._retry(entry, "raised", now)
             entry.update(severity=level, ack_subjects=subjects)
+        self._journal_capacity(db, current, now)
         self._brief_agents(db, current, router, now, unreadable=unreadable)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
@@ -3184,6 +3187,22 @@ class Notifier:
                           **data)
         except Exception as exc:  # noqa: BLE001 — the notification goes on
             self.log("event %s not recorded: %s" % (kind, type(exc).__name__))
+
+    def _journal_capacity(self, db, current: list, now: float) -> None:
+        """#5912: reserved-capacity alerts journaled although they are not in
+        `notify.types` (`host_capacity_alerts.journal`); never fatal."""
+        if self.dry_run or db is None or not self._delivery_open():
+            return
+        from . import events, host_capacity_alerts
+
+        def record(kind, obj, data):
+            events.record(db, kind, obj, project=None, **data)
+        try:
+            host_capacity_alerts.journal(
+                self.state.setdefault("capacity_journal", {}), current, now, record,
+                journaled_elsewhere=set(self.ncfg.types))
+        except Exception as exc:  # noqa: BLE001 — the notification goes on
+            self.log("capacity alert journal not recorded: %s" % type(exc).__name__)
 
     def _raise(self, entry: dict, router: Router, now: float) -> None:
         if not self._delivery_open():

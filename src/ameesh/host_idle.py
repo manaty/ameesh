@@ -56,11 +56,13 @@ def runs_interface(cfg, canons, host):
 
 def project(reading, history, agents, lots, *, now, idle_after_s=1800,
             fresh_within=180, capacity='burst', cost_eur_h=None, holds=None,
-            runs_declared=None):
+            runs_declared=None, cost=None):
     """Pure projection. None inputs mean unreadable sources, never empty ones.
 
     `runs_declared` (#5905) is the `(interface, origin)` of `runs_interface`;
-    without it the run count stays the undeclared placeholder."""
+    without it the run count stays the undeclared placeholder. `cost` (#5912):
+    the card's cost per state (`cost_states`); it replaces `cost_eur_h`, the
+    cost of the running host."""
     out = resources.footprint(reading)
     interface, origin = runs_declared or (None, None)
     if interface in RUNS_INTERFACES:
@@ -69,9 +71,13 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
         source = RUNS_UNDECLARED + ' (hôte prêteur : travaux déportés non comptés)'
     else:
         source = RUNS_UNDECLARED
+    cost = cost or {}
     out.update(active_turns=None, leases=None, runs=0,
                runs_source=source, state='busy',
-               idle_since=None, capacity=capacity, cost_eur_h=cost_eur_h,
+               idle_since=None, capacity=capacity,
+               cost_eur_h=cost.get('on', cost_eur_h),
+               cost_off_eur_h=cost.get('off'), cost_parts=cost.get('parts'),
+               cost_source=cost.get('source'), cost_problem=cost.get('problem'),
                idle_after_s=idle_after_s, unknown=[])
     unknown = out['unknown']
     reading = reading or {}
@@ -201,16 +207,56 @@ def apply_release(footprint, control):
     return out
 
 
+#: #5912 (study #5900 §4): the billed parts of a host, in EUR/h. A powered
+#: off (archived) VM stops paying `calcul`; its disk and reserved IP stay
+#: billed. Standby is billed as running, so it has no state of its own here.
+COST_PARTS = ('calcul', 'disque', 'ip')
+
+
+def cost_states(cards):
+    """#5912: the cost of a host on and off, from the first readable card.
+
+    `tarif: {calcul_eur_h, disque_eur_h, ip_eur_h, source}` gives both states;
+    a card with only the older `tarif_eur_h` gives the running cost alone (off
+    unknown). A `tarif` with a missing or negative part prices nothing: its
+    problem is shown, never a partial sum. None when no card prices the host.
+    """
+    problem = None
+    for card in cards:
+        tarif = card.get('tarif')
+        if tarif is None:
+            continue
+        if not isinstance(tarif, dict):
+            problem = problem or '`tarif`: a mapping expected'
+            continue
+        parts = {k: resources.finite_float(tarif.get(k + '_eur_h')) for k in COST_PARTS}
+        bad = [k + '_eur_h' for k, v in parts.items() if v is None or v < 0]
+        if bad:
+            problem = problem or '`tarif`: %s missing or negative' % ', '.join(bad)
+            continue
+        source = str(tarif.get('source') or '').strip()[:200] or None
+        return {'on': round(sum(parts.values()), 6),
+                'off': round(parts['disque'] + parts['ip'], 6),
+                'parts': parts, 'source': source, 'problem': None}
+    values = [resources.finite_float(c.get('tarif_eur_h')) for c in cards]
+    legacy = next((v for v in values if v is not None and v >= 0), None)
+    if legacy is None and problem is None:
+        return None
+    return {'on': legacy, 'off': None, 'parts': None, 'source': None,
+            'problem': problem}
+
+
 def capacities(canons, names, *, protected=(), baseline_hosts=2):
-    """Explicit cards plus critical elected leaders/reserves when underspecified."""
+    """Explicit cards plus critical elected leaders/reserves when underspecified.
+
+    `costs` maps each host to its `cost_states` (None when unpriced)."""
     out, costs = {}, {}
     for name in names:
         cards = [host.fiche.data for canon in canons for host in canon.hosts
                  if host.title == name]
         out[name] = ('baseline' if any(c.get('capacity') == 'baseline' for c in cards)
                      else 'burst')
-        values = [resources.finite_float(c.get('tarif_eur_h')) for c in cards]
-        costs[name] = next((v for v in values if v is not None and v >= 0), None)
+        costs[name] = cost_states(cards)
     if sum(v == 'baseline' for v in out.values()) < baseline_hosts:
         for name in protected:
             if name in out:
@@ -374,13 +420,31 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None
                 history = None
         out[host] = project(reading, history, members, host_lots, now=now,
                             idle_after_s=idle_s, fresh_within=fresh,
-                            capacity=capacity[host], cost_eur_h=costs[host], holds=holds,
+                            capacity=capacity[host], cost=costs.get(host), holds=holds,
                             runs_declared=runs_interface(cfg, canons, host))
         out[host]["baseline_guard"] = host in protected
         control = (controls or {}).get(host) if isinstance(controls, dict) else None
         if control is not None:
             out[host] = apply_release(out[host], control)
     return out
+
+
+def cost_line(value):
+    """#5912: `cost on X EUR/h (≈ Y EUR/month), off Z EUR/h …` of a footprint."""
+    def money(v):
+        return 'unknown' if v is None else '%g EUR/h (%.2f EUR/month)' % (v, v * 730)
+    on, off = value.get('cost_eur_h'), value.get('cost_off_eur_h')
+    if on is None and off is None and not value.get('cost_problem'):
+        return 'cost unknown EUR/h'
+    text = 'cost on %s, off %s' % (money(on), money(off))
+    parts = value.get('cost_parts')
+    if parts:
+        text += ' [%s]' % ', '.join('%s %g' % (k, parts[k]) for k in COST_PARTS)
+    if value.get('cost_source'):
+        text += ' (source: %s)' % value['cost_source']
+    if value.get('cost_problem'):
+        text += ' (card: %s)' % value['cost_problem']
+    return text
 
 
 def line(value):
@@ -399,10 +463,10 @@ def line(value):
             if release.get('error') else ''))
     return ('footprint  : %s (%s); reserved CPU %s, memory %s bytes; '
             'used CPU %s, memory %s bytes; turns %s; leases %s; runs %s (%s); '
-            'cost %s EUR/h%s%s' % (
+            '%s%s%s' % (
                 value['state'], value['capacity'], fmt('reserved_cpu'),
                 fmt('reserved_mem_bytes'), fmt('used_cpu'), fmt('used_mem_bytes'),
                 fmt('active_turns'), fmt('leases'), fmt('runs'), value['runs_source'],
-                fmt('cost_eur_h'), detail,
+                cost_line(value), detail,
                 '; unknown: ' + ', '.join(value['unknown'])
                 if value['unknown'] else ''))
