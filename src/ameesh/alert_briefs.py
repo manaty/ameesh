@@ -54,6 +54,9 @@ BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
                  "host_idle_reserved", "baseline_oversized", "host_release_failed",
                  "host_release_overdue", "host_release_no_runs",
                  "host_release_canon_unreadable",
+                 # #5932 : worker de l'adaptateur VM arrêté après une intention
+                 # d'arrêt durable ; une requête en attente jeune reste normale
+                 "host_release_adapter_stalled",
                  # #5695 : l'équipe du projet de la source renouvelle son jeton
                  "fingerprints_source_failing", "idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
@@ -1258,7 +1261,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                      if kind == "operator_pause_host" else _projects(by_name, alert.get("agent")))
         elif kind in ("host_idle_reserved", "baseline_oversized",
                      "host_release_failed", "host_release_overdue",
-                     "host_release_no_runs", "host_release_canon_unreadable"):
+                     "host_release_no_runs", "host_release_canon_unreadable",
+                     "host_release_adapter_stalled"):
             text = alert["detail"]
             teams = set()
         elif kind == "fingerprints_source_failing":

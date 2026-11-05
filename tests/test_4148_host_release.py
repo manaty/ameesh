@@ -152,6 +152,10 @@ class HostReleaseTest(PgTestCase):
                 fail = os.environ.get("HOOK_FAIL", "")
                 if state in fail.split(","):
                     sys.exit(7)
+                # #5932: queued asynchronous transition (normal wait, not 0/1).
+                wait = os.environ.get("HOOK_WAIT", "")
+                if state in wait.split(","):
+                    sys.exit(75)
                 barrier = os.environ.get("HOOK_BARRIER")
                 if barrier and state == "idle-drained":
                     open(barrier + ".started", "w", encoding="utf-8").close()
@@ -161,8 +165,8 @@ class HostReleaseTest(PgTestCase):
         self._env = {"HOOK_LOG": self.log}
         self._old = {key: os.environ.get(key)
                      for key in ("HOOK_LOG", "HOOK_FAIL", "HOOK_RUNS",
-                                 "HOOK_BARRIER")}
-        for key in ("HOOK_FAIL", "HOOK_RUNS", "HOOK_BARRIER"):
+                                 "HOOK_BARRIER", "HOOK_WAIT")}
+        for key in ("HOOK_FAIL", "HOOK_RUNS", "HOOK_BARRIER", "HOOK_WAIT"):
             os.environ.pop(key, None)
         os.environ.update(self._env)
         self.addCleanup(self._restore_env)
@@ -789,6 +793,45 @@ class HostReleaseTest(PgTestCase):
         self.assertEqual(control["hook_state"], "draining")
         self.assertEqual(control["release_error_state"], "idle-drained")
         self.assertFalse(control["claims_open"])
+
+    def test_async_wait_is_not_a_failure_and_stays_closed(self):
+        # #5932: the VM adapter queues `idle-drained` and exits 75 while its
+        # operator worker owns the completion. That is a normal wait: no
+        # release_error, no acknowledgement, no reopen, no hook replay.
+        self.cfg = dataclasses.replace(self.cfg, host_release_retry=3600)
+        self.add_agent()
+        self.quiet_history()
+        self.once(local_host="vm", now=time.time())
+        self.assertEqual(self.control()["hook_state"], "draining")
+        self.reading()
+        os.environ["HOOK_WAIT"] = "idle-drained"
+        self.once(now=time.time())
+        control = self.control()
+        self.assertEqual(control["release_state"], "draining")
+        self.assertEqual(control["hook_state"], "draining")
+        self.assertEqual(control["hook_wait_state"], "idle-drained")
+        self.assertIsNotNone(control["hook_wait_ts"])
+        self.assertIsNone(control["hook_attempt_state"])
+        self.assertIsNone(control["release_error"])
+        self.assertFalse(control["claims_open"])
+        alerts = host_release.alerts(self.cfg, self.db, time.time())
+        self.assertNotIn("host_release_failed",
+                         [alert["type"] for alert in alerts])
+        # The wait paces the scanner: no second adapter call while it is young.
+        self.clear_calls()
+        self.once(now=time.time())
+        self.assertEqual(self.states(), [])
+        self.assertFalse(self.control()["claims_open"])
+        # The worker journals the real completion under the same epoch.
+        control = self.control()
+        self.api.host_lifecycle.finish_transition(
+            "vm", control["generation"], "idle-drained",
+            release_epoch=control["release_epoch"], actor="vm-adapter",
+            detail={"adapter": "test"})
+        control = self.control()
+        self.assertEqual(control["release_state"], "idle-drained")
+        self.assertIsNone(control["hook_wait_state"])
+        self.assertIsNotNone(control["released_ts"])
 
     def test_return_calls_busy_before_any_claim_and_waits_for_a_fresh_reading(self):
         worker = self.add_agent()
