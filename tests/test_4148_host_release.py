@@ -293,6 +293,35 @@ class HostReleaseTest(PgTestCase):
         self.once(local_host="vm", now=now)
         self.assertIsNone(self.control())
 
+    def test_explicit_baseline_cards_never_lift_the_elected_guard(self):
+        # #5914 (cx3's negative test): AG1 and AG2 carry `capacity: baseline`,
+        # which fills the baseline; AG3 (here `vm`) holds an elected role,
+        # then is its ready reserve. The real singleton projection of the
+        # automatic drain must still read the election and refuse the drain.
+        self.add_agent()
+        self.quiet_history()
+        canon = NS(hosts=[NS(title=h, policy=None,
+                             fiche=NS(data={"capacity": "baseline"}))
+                          for h in ("ag1", "ag2")])
+        roles = (dict(holder="vm", candidates=[dict(host="vm", ready=True)]),
+                 dict(holder="ag1", candidates=[dict(host="ag1", ready=True),
+                                                dict(host="vm", ready=True)]))
+        with mock.patch.object(host_release, "_canon_read",
+                               return_value=([canon], False)), \
+                mock.patch.object(host_lifecycle, "critical_names",
+                                  return_value={"pilot"}):
+            for role in roles:
+                with mock.patch("ameesh.election.status", return_value=role):
+                    self.once(local_host="vm", now=time.time())
+                self.assertIsNone(self.control(), role)
+            self.assertEqual(self.states(), [])
+            # Control: without an elected role the same burst host drains.
+            with mock.patch("ameesh.election.status",
+                            return_value=dict(holder="ag1", candidates=[])):
+                self.once(local_host="vm", now=time.time())
+        self.assertEqual(self.control()["mode"], "draining")
+        self.assertEqual(self.states(), ["draining"])
+
     def test_unknown_runs_never_drain_and_raise_the_147_alert(self):
         self.add_agent()
         self.quiet_history()
