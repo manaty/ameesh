@@ -525,8 +525,9 @@ def _auto_drain(cfg, api, db, host, *, owner, listing, canons, holds, controls,
     if reading is None:
         return None
     try:
+        # #5914: explicit baseline cards never lift the elected-role guard.
         footprints = host_idle.snapshot(cfg, db, canons, {host: reading},
-                                        now=now, listing=listing)
+                                        now=now, listing=listing, guards=True)
     except Exception:
         return None
     footprint = footprints.get(host)
