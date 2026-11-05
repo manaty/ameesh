@@ -21,6 +21,7 @@ import unittest
 from unittest import mock
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -125,6 +126,36 @@ def red_run(*, attribution=True, best=(3801,), status="failure", part="psycopg 1
             "units": [{"lot": lot, "best": 4} for lot in best]
             + [{"lot": 3807, "best": 1}]}]}
     return run
+
+
+class FakeLease:
+    """#5941 : le bail de composition d'un banc sans base."""
+
+    def __init__(self, *, owner="paquet-horaire:hote:42:abc", acquired=True,
+                 holder=""):
+        self.owner = owner
+        self.acquired = acquired
+        self.holder = holder
+        self.epoch = 1 if acquired else None
+        self.released = 0
+        self.closed = False
+
+    def acquire(self):
+        if self.acquired:
+            self.epoch = 1
+        return self.acquired
+
+    def release(self):
+        if self.epoch is not None:
+            self.released += 1
+        self.epoch = None
+        return True
+
+    def describe(self):
+        return self.holder or self.owner
+
+    def close(self):
+        self.closed = True
 
 
 class Base(unittest.TestCase):
@@ -341,6 +372,139 @@ class ComposeTest(Base):
         self.assertEqual(self.shell.ran("ci", "run"), [])
 
 
+class CompositionLockTest(Base):
+    """#5941 : le verrou unique, pris après la liste et relu sous le verrou."""
+
+    def test_verrou_pris_apres_la_liste_et_porteur_relu_dessous(self):
+        order = []
+        lease = FakeLease()
+        self.ctx.composition = lambda: order.append("bail") or lease
+        ph.ready_lots = lambda ctx: order.append("candidats") or [3801]
+        fresh = carrier(lot=4444, title="Paquet horaire h-20261027-09 — autre")
+        fresh["branch"] = "integration/paquet-h-20261027-09"
+        calls = {"n": 0}
+
+        def recent(ctx):
+            calls["n"] += 1
+            order.append("recent%d" % calls["n"])
+            return [] if calls["n"] == 1 else [fresh]
+
+        with mock.patch.object(ph, "recent_lots", side_effect=recent):
+            out = ph.tick(self.ctx)
+        self.assertEqual(order, ["recent1", "candidats", "bail", "recent2"])
+        self.assertIn("déjà créé", out)
+        self.assertEqual(self.shell.ran("work", "add"), [])
+        self.assertEqual(lease.released, 1)
+        self.assertTrue(lease.closed)
+
+    def test_verrou_tenu_par_un_autre_composeur_aucun_porteur(self):
+        lease = FakeLease(acquired=False, holder="mty-amh-impl-01:123")
+        self.ctx.composition = lambda: lease
+        out = ph.tick(self.ctx)
+        self.assertIn("composition en cours (mty-amh-impl-01:123)", out)
+        self.assertEqual(self.shell.ran("work", "add"), [])
+        self.assertTrue(lease.closed)
+
+    def test_le_tic_transmet_son_bail_au_work_add(self):
+        lease = FakeLease()
+        self.ctx.composition = lambda: lease
+        self.shell.items[4000] = carrier()
+        ph.tick(self.ctx)
+        add = self.shell.ran("work", "add")[0]
+        self.assertEqual(add[add.index("--composition-owner") + 1], lease.owner)
+        self.assertEqual(lease.released, 1)
+        self.assertTrue(lease.closed)
+
+    def test_refus_du_work_add_arrete_sans_pousser(self):
+        lease = FakeLease()
+        self.ctx.composition = lambda: lease
+        refusal = ph.HoraireError(
+            "création du porteur : rc 1 : error: composition in progress (autre:1): "
+            "no new packet carrier")
+        with mock.patch.object(ph, "_create_carrier", side_effect=refusal):
+            out = ph.tick(self.ctx)
+        self.assertIn("composition en cours : rien de plus créé", out)
+        self.assertFalse([c for c in self.shell.calls
+                          if "paquet-auto.py" in " ".join(c)])
+        self.assertEqual(lease.released, 1)
+
+    def test_bail_rendu_avant_la_composition(self):
+        # Le bail ne couvre que la décision et la création : le garder
+        # pendant paquet-auto le ferait expirer avant le second porteur
+        # d'une paire parallèle (#5941).
+        lease = FakeLease()
+        self.ctx.composition = lambda: lease
+        seen = []
+
+        def attempt(*_args, **_kw):
+            seen.append(lease.epoch)
+            return "composé"
+
+        with mock.patch.object(ph, "attempt", side_effect=attempt):
+            ph.tick(self.ctx)
+        self.assertEqual(seen, [None])
+        self.assertEqual(lease.released, 1)
+
+    def test_le_corps_porte_le_groupe_et_le_premier(self):
+        # B1 cx3 : la paire reste reconnaissable même si l'arrêt tombe entre
+        # la création et la note de journal.
+        first = carrier()
+        first["body"] = "Paquet parallèle #3256 C (1/2) : groupe=101."
+        self.assertEqual(ph.carrier_group(first), [101])
+        second = carrier()
+        second["body"] = ("Paquet parallèle #3256 C (2/2) : groupe=102 "
+                          "premier=#4001.")
+        self.assertEqual(ph.carrier_group(second), [102])
+        self.assertEqual(ph.second_peer(second), 4001)
+
+    def test_echec_du_second_porteur_compose_le_premier(self):
+        # B1 cx3 : un échec du second `work add` ne bloque pas le premier
+        # porteur ; il est composé dans la même passe.
+        lease = FakeLease()
+        self.ctx.composition = lambda: lease
+        calls = []
+
+        def create(ctx, name, group, **_kw):
+            calls.append(name)
+            if len(calls) > 1:
+                raise ph.HoraireError("second porteur : panne passagère")
+            return 4000
+
+        attempted = []
+        with mock.patch.object(ph, "parallel_decision",
+                               return_value={"enabled": True}), \
+                mock.patch.object(ph, "parallel_partition",
+                                  return_value={"first": [101], "second": [102]}), \
+                mock.patch.object(ph, "_create_carrier", side_effect=create), \
+                mock.patch.object(ph, "attempt",
+                                  side_effect=lambda ctx, carrier, name, this:
+                                  attempted.append(carrier) or "composé"):
+            out = ph.compose(self.ctx, [])
+        self.assertEqual(attempted, [4000])
+        self.assertIn("porteur suivant non créé", out)
+        self.assertEqual(lease.released, 1)
+
+    def test_deux_porteurs_sans_note_sont_suivis_pas_reserves(self):
+        # B1 cx3 : deux porteurs créés avant leurs notes (arrêt brutal) ne
+        # laissent pas la cible « réservée » : le corps suffit à les apparier.
+        first = carrier(lot=4001, title="Paquet horaire h-20261027-09 — a")
+        first["branch"] = "integration/paquet-h-20261027-09"
+        first["body"] = "Paquet parallèle #3256 C (1/2) : groupe=101."
+        second = carrier(lot=4002, title="Paquet horaire h-20261027-10 — b")
+        second["branch"] = "integration/paquet-h-20261027-10"
+        second["body"] = ("Paquet parallèle #3256 C (2/2) : groupe=102 "
+                          "premier=#4001.")
+        self.ctx.parallel = SimpleNamespace(max_paquets=2)
+        self.shell.lists["qa"] = [first, second]
+        self.shell.items = {4001: first, 4002: second}
+        with mock.patch.object(ph, "follow",
+                               side_effect=lambda ctx, item: "#%d" % item["id"]):
+            out = ph.tick(self.ctx)
+        self.assertIn("#4001", out)
+        self.assertIn("#4002", out)
+        self.assertNotIn("réservée", out)
+
+
 class FollowTest(Base):
     def open_carrier(self, **kw):
         item = carrier(notes=(ph.MARK_CI + HEAD,), **kw)
@@ -356,6 +520,32 @@ class FollowTest(Base):
         self.shell.ci[4000] = {"runs": [dict(red_run(), status="running")]}
         self.assertIn("en cours", ph.tick(self.ctx))
         self.assertFalse(self.shell.ran("work", "add"))
+
+    def test_porteur_cree_non_tente_relance_au_tic_suivant(self):
+        # B1 auditeur : un arrêt entre la création et `attempt` ne laisse pas
+        # le porteur « sans gel ni tentative » réserver la cible pour toujours.
+        item = carrier(sha="", created=NOW - 600)
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        ph.tick(self.ctx)
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)]
+        self.assertTrue(auto, "aucune composition relancée")
+        marks = ph.marks(self.shell.items[4000])
+        self.assertTrue(any(mark.startswith(ph.MARK_ATTEMPT + "composition")
+                            for mark in marks), marks)
+
+    def test_porteur_avec_une_ancienne_tentative_et_sans_gel_relance(self):
+        # `pending` ne rend rien quand une tentative a un `base` non vide et
+        # que le porteur n'a plus de gel : `follow` doit lancer la composition.
+        item = carrier(sha="", created=NOW - 600,
+                       notes=("paquet-horaire: tentative composition n=1 base=%s "
+                              "par=hote:1" % HEAD,))
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        out = ph.tick(self.ctx)
+        self.assertNotIn("sans gel ni tentative", out)
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)]
+        self.assertTrue(auto, "aucune composition relancée")
 
     def test_ci_en_cours_rien(self):
         self.open_carrier()

@@ -18,6 +18,9 @@ canon), une fois le délai de grâce passé et jusqu'au créneau suivant :
   le projet (un paquet en composition ou en CI occupe la cible, §12), et aucun
   porteur fusionné depuis moins que la grâce (le composeur enchaîne), ni
   paquet déjà fusionné pendant le créneau surveillé ;
+* un composeur tient-il déjà le verrou de composition partagé (#5941) ? Un
+  composeur qui lit les candidats n'a pas encore de porteur visible : alerter
+  désignerait un second composeur, exactement la course h-21/h-22 du 05/11 ;
 * la liste calculée (`packet_candidates.inventory`, la même que
   `scripts/paquet-candidats.py`) rend-elle au moins un lot prêt ?
 
@@ -311,12 +314,15 @@ def body(watch: ProjectWatch, at: dict, payload: dict, *, now: float | None = No
     lines += ["", "Composeur désigné : %s (premier destinataire notify)." % watch.notify[0],
               "Les autres destinataires ne composent pas en parallèle. Repli seulement "
               "après %s, sans réponse du composeur, et après vérification en base "
-              "qu'aucun lot de composition n'est ouvert ; le pilote désigne alors "
-              "un seul remplaçant." % fallback_at,
+              "qu'aucun lot de composition n'est ouvert ni verrou de composition "
+              "tenu ; le pilote désigne alors un seul remplaçant." % fallback_at,
               "Geste pour %s : composer le paquet maintenant depuis "
                   "`scripts/paquet-candidats.py` (canon §11 bis, §12), écarts motivés "
                   "au manifeste. Reprendre le nom de porteur attribué par le composeur "
                   "dans le journal et le manifeste ; le créneau ne donne pas son nom. "
+                  "La création du porteur (`ameesh work add`) prend le verrou de "
+                  "composition partagé avec le composeur horaire : si un autre compose, "
+                  "elle est refusée et le geste s'arrête là, sans rien pousser (#5941). "
                   "Une seule alerte par créneau (#2601)."
               % watch.notify[0]]
     return "\n".join(lines)
@@ -350,8 +356,9 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
     """Un passage pour un projet ; rend `{result, …}` et met `state` à jour.
 
     `result` : `no-cadence`, `grace`, `already-alerted`, `paused` (pause
-    déclarée de la cible, #4466), `busy` (porteur ouvert ou tout juste
-    fusionné), `served`, `nothing-ready`, `alerted`, `would-alert`.
+    déclarée de la cible, #4466), `busy` (porteur ouvert, tout juste fusionné,
+    ou verrou de composition tenu sans porteur encore visible, #5941),
+    `served`, `nothing-ready`, `alerted`, `would-alert`.
     """
     app = watch.app or watch.name
     at = slot(rules, now, watch.grace_s)
@@ -387,6 +394,20 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
         return dict(out, result="served", carriers=held)
     if held["open"] or held["recent"]:
         return dict(out, result="busy", carriers=held)
+    # #5941 : un composeur peut tenir le verrou de composition sans porteur
+    # encore visible (lecture des candidats, création). Ce n'est pas un
+    # créneau manqué : ne pas réveiller un second composeur. Une lecture du
+    # bail impossible ne tait pas l'alerte — la création, elle, reste gardée
+    # par le verrou.
+    if db is not None:
+        try:
+            from . import packet_composition
+            composition = packet_composition.holder(db, app)
+        except Exception as exc:  # noqa: BLE001 - lecture de diagnostic
+            composition = None
+            out["composition_error"] = "%s: %s" % (type(exc).__name__, exc)
+        if composition:
+            return dict(out, result="busy", composition=composition)
     payload = (inventory or (lambda: _inventory(cfg, db, watch, app)))()
     ready = list(payload.get("ready") or ())
     out.update(ready=ready, errors=list(payload.get("errors") or ()),

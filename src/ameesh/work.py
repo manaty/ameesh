@@ -601,6 +601,7 @@ def add(
     external_executor: str | None = None,
     footprint=None,
     impact: dict | None = None,
+    composition_owner: str | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -659,7 +660,17 @@ def add(
     `add_or_note`) et pas seulement le CLI. Sans `cfg` (aucun projet connu),
     rien n'est deviné : l'empreinte reste inconnue. `_decision_lot` appelle
     `_create` directement et n'en porte pas : une question n'occupe pas de
-    fichiers."""
+    fichiers.
+
+    #5941 : la création d'un porteur de paquet (`integration/paquet*`, ou
+    titre « Paquet horaire h-… ») partage le verrou de composition avec le
+    tic horaire (`scripts/paquet-horaire.py`). Sans `composition_owner`, le
+    verrou est pris ici, les porteurs ouverts sont relus **sous** le verrou
+    (après la lecture des candidats de l'appelant), et un porteur concurrent
+    refuse la création (`WorkError`, rien n'est écrit). `composition_owner`
+    est réservé au tic, qui tient déjà ce verrou et peut créer les deux
+    porteurs d'une paire parallèle (#3256 C) : le propriétaire est vérifié,
+    jamais cru."""
     if (body or "").strip() == "-":
         raise WorkError("body refused: `-` alone is not a statement; write the text, "
                         "or pass `--body -` to ameesh work add to read it on standard "
@@ -674,16 +685,65 @@ def add(
             cfg if cfg is not None else getattr(db, "cfg", None), db,
             app=app, title=title, body=body, branch_target=branch_target or "")
         footprint = list(impact["footprint"]) if impact else []
-    return _create(db, title=title, type=type, source=source, app=app, body=body,
-                   issue_ref=issue_ref, workstream=workstream, assignee=assignee,
-                   budget_usd=budget_usd, actor=actor, package=package, externe=externe,
-                   cfg=cfg, branch=branch, branch_target=branch_target, priority=priority,
-                   estimate=estimate, estimate_source=estimate_source, size=size,
-                   note=note, force=force, parent_lot=parent_lot,
-                   mark_item_id=mark_item_id, mark_note=mark_note,
-                   unique_ref=unique_ref, team_queue=True,
-                   external_executor=external_executor, footprint=footprint,
-                   impact=impact)
+    fields = dict(
+        title=title, type=type, source=source, app=app, body=body,
+        issue_ref=issue_ref, workstream=workstream, assignee=assignee,
+        budget_usd=budget_usd, actor=actor, package=package, externe=externe,
+        cfg=cfg, branch=branch, branch_target=branch_target, priority=priority,
+        estimate=estimate, estimate_source=estimate_source, size=size,
+        note=note, force=force, parent_lot=parent_lot,
+        mark_item_id=mark_item_id, mark_note=mark_note,
+        unique_ref=unique_ref, team_queue=True,
+        external_executor=external_executor, footprint=footprint,
+        impact=impact)
+    from . import packet_composition
+    if not packet_composition.is_carrier(branch=branch, title=title):
+        return _create(db, **fields)
+    return _create_packet_carrier(
+        db, fields=fields, app=app, target=branch_target or "",
+        composition_owner=composition_owner)
+
+
+def _create_packet_carrier(db: Db, *, fields: dict, app: str, target: str,
+                           composition_owner: str | None) -> dict:
+    """#5941 : créer un porteur sous le verrou de composition unique.
+
+    Le tic qui tient déjà le verrou le prouve par `composition_owner` ; un
+    autre composeur (agent désigné par l'alerte, `ameesh work add` à la main)
+    prend le verrou ici, relit les porteurs ouverts sous ce verrou et
+    s'arrête avant d'écrire si un autre compose.
+    """
+    from . import packet_composition
+    lease = packet_composition.Lease(
+        db, app or "", owner=packet_composition.owner("work-add"))
+    if composition_owner:
+        try:
+            lease.verify(composition_owner)
+        except packet_composition.CompositionError as exc:
+            raise WorkError(str(exc)) from None
+        return _create(db, **fields)
+    try:
+        taken = lease.acquire()
+    except Exception as exc:  # noqa: BLE001 - bail illisible : aucun porteur
+        raise WorkError("composition lock unreadable: %s; no packet carrier created"
+                        % exc) from exc
+    if not taken:
+        raise WorkError(
+            "composition in progress (%s): no new packet carrier, one composer at a "
+            "time (canon §11 bis, #5941)" % lease.describe())
+    try:
+        busy = packet_composition.carriers(db, app or "", target)
+        if busy:
+            raise WorkError(
+                "packet carrier #%d already reserves %s/%s: no new carrier "
+                "(canon §11 bis, #5941)"
+                % (int(busy[0]), app or "?", target or "?"))
+        return _create(db, **fields)
+    finally:
+        try:
+            lease.release()
+        except Exception:  # noqa: BLE001 - le bail expire seul, jamais un refus
+            pass
 
 
 #: #3209 : les états d'un lot encore ouvert, lus par `open_with_source`
