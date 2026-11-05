@@ -84,7 +84,9 @@ auteurs, avec les mêmes exceptions du canon §2 :
   contenu (le doute conserve, comme #2924) ; une réémission à patch-id
   verbatim identique d'un commit qui porte un reçu exact garde ce reçu, et la
   copie n'est pas attribuée à son committer. Un tiers non relecteur sans reçu
-  et sans auteur Git d'agent reste inconnu : aucun camp ne le suppose. #2721 :
+  et sans auteur Git d'agent reste inconnu : aucun camp ne le suppose, sauf
+  si le journal des tours prouve sa famille à l'instant du commit (#5880 : il
+  est alors auteur, sa famille exclue). #2721 :
   à la désignation, ce repli porte sa trace (`proof: turn-journal`,
   `fallback_commits`), et un committer distinct de la référence doit être au
   registre.
@@ -889,11 +891,14 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
     role = _unreceived_role(actor, author_name, reviewers)
     if role != "reference" and not _registered(db, actor):
         return [], [sha[:12]]
-    if role == "third":
-        # #2721 : un tiers non relecteur sans reçu reste inconnu ; lui seul ne
-        # prouve pas avoir écrit le contenu de la plage.
-        return [], [sha[:12]]
     proven = actor_family(db, actor, stamp, families)
+    if role == "third" and not proven:
+        # #2721 : un tiers non relecteur sans reçu ni famille prouvée reste
+        # inconnu. #5880 : un agent du registre dont le journal des tours
+        # prouve la famille à l'instant du commit (le pilote qui adapte un
+        # test après un alignement) en est l'auteur, comme dans le cas
+        # committer/auteur Git distincts ci-dessus : sa famille est exclue.
+        return [], [sha[:12]]
     if role == "reference" and not proven:
         proven = author_family
     return [{"name": actor, "family": proven, "role": role, "proof": True}], []
@@ -5151,7 +5156,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
     du titulaire de référence reste le sien ; un relecteur désigné reste
     l'auteur de sa correction, avec sa famille de session ; un tiers non
-    relecteur reste inconnu. #3805 : quand l'auteur Git est un agent du
+    relecteur est auteur si le journal des tours prouve sa famille à
+    l'instant du commit (#5880), inconnu sinon. #3805 : quand l'auteur Git est un agent du
     registre différent du committer, les deux familles sont auteurs du contenu
     (le doute conserve) ; une réémission à patch-id verbatim identique d'un
     commit qui porte un reçu exact garde ce reçu et n'est pas attribuée au

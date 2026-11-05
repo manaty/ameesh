@@ -269,6 +269,8 @@ class Config:
     #: jamais lu de l'environnement, posé par `ameesh progress --serve`
     read_only: bool = False
     lease_ttl: float = 300.0
+    #: #5826 : préparation de tour figée au-delà (s) : tour abandonné, bail rendu ; 0 = sans borne
+    max_preparation: float = 900.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
     runner_liveness_interval: float = 60.0  # #508 : écriture groupée, au moins 60 s
@@ -1117,6 +1119,7 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
                  default=cfg.mesh_backup_min_group_share),
             cfg.mesh_backup_min_group_share),
         lease_ttl=_as_float(pick("AMEESH_LEASE_TTL", "AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
+        max_preparation=_as_float(pick("AMEESH_MAX_PREPARATION"), cfg.max_preparation),
         idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
         runner_liveness_interval=max(60.0, _as_float(
