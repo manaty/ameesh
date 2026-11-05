@@ -48,6 +48,8 @@ test_2446_train_shadow  # stockage : plan ombre sur file, historique et prépara
 test_2839_codex_account_gauges  # stockage : seuil et ambiguïté Codex au placement, continuité et rapport (#2839)
 test_2786_freeze_head  # stockage : gel écrit en SHA complet (#2786), balayage et désignation sans ref résolue
 test_2845_github_watch  # stockage : curseur, déduplication et checkpoint de la veille GitHub (#2845)
+test_3885_fingerprints  # stockage : curseur de la passe fingerprints, primitive et contrat de lecture (#3885)
+test_5968_fingerprint_sources  # stockage : état par (projet, environnement), N-1 et recopie prod (#5968)
 test_2893_spend_pending_exact  # stockage : identité exacte du marqueur (created_at, clé 0471) sous extra_float_digits, réparation d'avant 0471 (#2166)
 test_2933_housekeeping_alert_identity  # stockage : première observation stable des orphelins et worktrees malgré les relevés (#2933)
 test_2905_stale_spend_key  # stockage : un spend_key périmé après retour arrière n'est jamais la clé du tour (#2905)

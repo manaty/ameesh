@@ -110,6 +110,29 @@ class PaquetAutoBanc(unittest.TestCase):
         return first, conflict, third
 
     # -- témoins -----------------------------------------------------------
+    def test_fresh_base_rapatrie_un_tag_sans_changement_de_branche(self):
+        clone = pathlib.Path(self.tmp.name) / "composeur"
+        self.git("clone", "--no-tags", str(self.repo), str(clone))
+        self.git("tag", "v1.39.0", cwd=self.repo)
+        self.assertEqual(self.git("tag", "--list", cwd=clone).stdout, "")
+        self.assertEqual(paquet_auto.fresh_base(clone, "main"), self.base)
+        self.assertEqual(self.git("tag", "--list", cwd=clone).stdout.strip(), "v1.39.0")
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository", cwd=clone)
+                         .stdout.strip(), "false")
+
+    def test_fresh_base_remplace_un_tag_local_divergent(self):
+        self.git("tag", "v1.39.0")
+        clone = pathlib.Path(self.tmp.name) / "composeur"
+        self.git("clone", str(self.repo), str(clone))
+        self.write("release.txt", "nouvelle release\n")
+        upstream = self.commit("release")
+        self.git("tag", "--force", "v1.39.0", upstream)
+        self.assertEqual(self.rev("v1.39.0", cwd=clone), self.base)
+        self.assertEqual(paquet_auto.fresh_base(clone, "main"), upstream)
+        self.assertEqual(self.rev("v1.39.0", cwd=clone), upstream)
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository", cwd=clone)
+                         .stdout.strip(), "false")
+
     def test_non_concluant_consigne_sans_retirer_d_unite(self) -> None:
         composition = paquet_auto.Composition(
             units=[paquet_auto.Unit(1, "0" * 40, "1" * 40)],
@@ -152,6 +175,8 @@ class PaquetAutoBanc(unittest.TestCase):
         red = paquet_auto.TestRun(
             "unité #1", ["tests.test_unit"], 1,
             "FAIL: test_x (tests.test_unit.TestX)\nAssertionError", 0.1)
+        red.log_path = "/state/test-logs/series-rouge.log"
+        logs = []
         green = paquet_auto.TestRun(
             "contrats", ["tests.test_contract"], 0,
             "Ran 1 test in 0.1s\n\nOK", 0.1)
@@ -163,7 +188,9 @@ class PaquetAutoBanc(unittest.TestCase):
                                   side_effect=[red, green]):
             runs, faulty, _removals = paquet_auto.check_local_tests(
                 pathlib.Path(self.tmp.name), composition, timeout=1,
-                log=lambda _line: None)
+                log=logs.append)
+        self.assertIn(red.log_path, "\n".join(logs))
+        self.assertIn("tests.test_unit", "\n".join(logs))
         self.assertEqual(faulty, [1])
         self.assertFalse(runs[0].inconclusive)
 

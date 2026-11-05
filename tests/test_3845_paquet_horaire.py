@@ -371,6 +371,41 @@ class ComposeTest(Base):
         self.assertTrue(self.shell.ran("work", "close", "4000", "--abandoned"))
         self.assertEqual(self.shell.ran("ci", "run"), [])
 
+    def test_porteur_vide_diagnostic_et_courrier_avant_cloture(self):
+        self.shell.auto_out = (
+            "tests unité #3801 : ROUGE (1 modules) — modules : tests.test_unite"
+            " — journal local : /state/test-logs/series-rouge.log\n"
+            "FAIL: test_rouge (tests.test_unite.Test)\nAssertionError: rouge\n"
+            + "détail de trace\n" * 37
+            + "FAILED (failures=1)\n"
+            + "recomposition\n" * 5
+            + "écarté #3801 : rouge\naucune unité composée\n")
+        self.shell.items[4000] = carrier()
+        original = self.shell.run
+        closed = False
+
+        def run(cmd, **kwargs):
+            nonlocal closed
+            if cmd[:3] == ["ameesh", "work", "close"]:
+                closed = True
+            if cmd[0] == "agent-mail" and closed:
+                return ph.Result(1, "", "lot #4000 already closed")
+            return original(cmd, **kwargs)
+
+        self.shell.run = run
+        self.assertIn("rien composé", ph.tick(self.ctx))
+        self.assertTrue(closed)
+        diagnostic = next(c for c in self.shell.ran("work", "note", "4000")
+                          if "tests.test_unite" in c[4])
+        for line in self.shell.auto_out.splitlines():
+            self.assertIn(line, diagnostic[4])
+            self.assertIn(line, self.shell.mails[-1][1])
+        calls = self.shell.calls
+        mail = next(c for c in calls if c[0] == "agent-mail")
+        close = self.shell.ran("work", "close", "4000")[0]
+        self.assertLess(calls.index(diagnostic), calls.index(mail))
+        self.assertLess(calls.index(mail), calls.index(close))
+
 
 class CompositionLockTest(Base):
     """#5941 : le verrou unique, pris après la liste et relu sous le verrou."""

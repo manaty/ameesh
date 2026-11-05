@@ -2256,7 +2256,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 users=args.users, count=args.count, route=args.route,
                 code=args.code, revision=args.revision,
                 first_seen=args.first_seen, last_seen=args.last_seen,
-                actor=args.actor)
+                environment=args.environment, actor=args.actor)
             if args.json:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 return 0
@@ -4122,6 +4122,10 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_fp_open.add_argument("--revision", default="", help="deployed revision")
     pw_fp_open.add_argument("--first-seen", default="", help="ISO timestamp of the first view")
     pw_fp_open.add_argument("--last-seen", default="", help="ISO timestamp of the last view")
+    pw_fp_open.add_argument("--environment", default="production",
+                            choices=("production", "staging"),
+                            help="where the failure was seen (default: production); "
+                                 "the lot is marked with it")
     pw_fp_open.add_argument("--actor", default="",
                             help="default: AMEESH_ROLE, else the bound identity")
     pw_fp_open.add_argument("--json", action="store_true")

@@ -795,7 +795,7 @@ def validate_target(repo: Path, target: str) -> None:
 
 def fresh_base(repo: Path, target: str) -> str:
     """La tête fraîche d'`origin/<cible>` ; le SHA exact est noté."""
-    proc = git(repo, "fetch", "--no-tags", "origin", target, check=False,
+    proc = git(repo, "fetch", "--tags", "--force", "origin", target, check=False,
                timeout=GIT_TIMEOUT)
     if proc.returncode != 0:
         raise PaquetAutoError(
@@ -2618,8 +2618,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             mine |= {row["module"].split(".", 1)[1] for row in added
                      if row["reason"] != "carte" or shared.get(row["module"]) == 1}
             pending.append((unit, run, found, proper_names, mine, neighbor))
-            log("tests unité #%d : ROUGE (%d modules)\n%s"
-                % (unit.lot, len(modules), _tail(run.output)))
+            log("tests unité #%d : ROUGE (%d modules) — modules : %s%s\n%s"
+                % (unit.lot, len(modules), ", ".join(modules),
+                   (" — journal local : " + run.log_path) if run.log_path else "",
+                   _tail(run.output)))
         else:
             log("tests unité #%d : vert (%d modules, %d tests)"
                 % (unit.lot, len(modules), run.tests))
