@@ -1136,6 +1136,12 @@ class HostPolicy:
     #: `<command> busy|draining|idle-drained <host>` and never touches the
     #: cluster or the cloud itself. None = no adapter, so no automatic release.
     lifecycle_hook: str | None = None
+    #: #5905 (C2 of #5900): how the host declares its runs (work that outlives
+    #: a turn or a lease). `none` = the host runs nothing outside its turns
+    #: and leases, so `runs = 0` is a known count; None = undeclared,
+    #: `invalid` = unreadable value and `lending` = a lending host whose guest
+    #: jobs nothing counts yet: the release stays refused (`host_release_no_runs`).
+    runs_interface: str | None = None
     #: #5601 : places de `max_agents` réservées aux agents d'un projet ou à une
     #: classe de priorité (`{"project:<p>": n, "class:<n>": n}`, `ameesh.slot_reservations`) ;
     #: None = aucune réservation, l'ordre d'admission reste celui du registre.
@@ -4193,6 +4199,19 @@ class _Loader:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.lifecycle_hook`: a non-empty command line expected",
                              **where, **subject)
+            # #5905: only a known interface declares runs; anything else is an
+            # error kept as `invalid`, so that it still contradicts another
+            # card of the host (never a zero by default, never dropped).
+            if raw.get("runs_interface") is not None:
+                from .host_idle import RUNS_INTERFACES, RUNS_INVALID
+                value = raw["runs_interface"]
+                if isinstance(value, str) and value.strip() in RUNS_INTERFACES:
+                    policy.runs_interface = value.strip()
+                else:
+                    policy.runs_interface = RUNS_INVALID
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.runs_interface`: one of %s expected"
+                             % ", ".join(RUNS_INTERFACES), **where, **subject)
             # #5601 : réservations de places ; une entrée illisible est écartée
             # (elle ne doit pas tenir des places que personne ne peut prendre)
             if raw.get("slot_reservations") is not None:
@@ -4232,6 +4251,17 @@ class _Loader:
                              "`policy.lend.%s`: unknown key (ignored)" % key,
                              **where, **subject)
                 policy.lend = offer
+                # #5905: a lending host runs guest jobs offloaded from other
+                # hosts, outside its own turns and leases. No interface counts
+                # them yet (C5): its runs stay unknown, and `none` there would
+                # turn a missing observation into a proven zero.
+                from .host_idle import RUNS_LENDING
+                if policy.runs_interface == "none":
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.runs_interface: none` on a lending host "
+                             "(`policy.lend`): its offloaded guest jobs are runs "
+                             "that no interface counts yet", **where, **subject)
+                policy.runs_interface = RUNS_LENDING
             # L101 : espace de travail et ménage, forme canonique
             # `policy.workspaces` ; les anciennes clés restent lues en alias.
             self._host_workspaces(raw, policy, where, subject)
