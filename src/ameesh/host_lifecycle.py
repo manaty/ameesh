@@ -155,7 +155,10 @@ def critical_names(cfg, db, *, canons=None):
     except Exception:  # noqa: BLE001 - an unreadable configuration is not "no canon"
         configured = True
     known = sous_utilisation.critical_memory(cfg)
-    for agent in registry.overview(db):
+    # #5982 : la vue complète du registre (jusqu'à 3,3 s) n'apportait que le
+    # nom et le canon ; le verdict se lit sur les fiches, hors SQL. Appelé
+    # toutes les 60 s par chaque exécuteur.
+    for agent in registry.critical_rows(db):
         verdict, _unknown = sous_utilisation.critical_verdict(
             agent, canons, configured=configured,
             known=sous_utilisation.remembered(known, agent["name"]))

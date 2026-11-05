@@ -4633,7 +4633,10 @@
    "agents": [
     "clear_model",
     "count",
+    "critical_rows",
     "human_known",
+    "routing_rows",
+    "served_agents",
     "set_mode",
     "upsert_unleased",
     "wake_check",

@@ -470,6 +470,22 @@ OVERVIEW_SQL = ("""
                .replace("__CLAIM_OK__", canon_claim_predicate_sql("agent_registry"))
                .replace("__PASSIVE__", PASSIVE_SQL.format(t="m")))
 
+#: #5982 : lectures étroites des trois appelants périodiques du runner. Ils ne
+#: prenaient d'`OVERVIEW_SQL` que quelques colonnes : le verdict critique
+#: (`critical_names`, toutes les 60 s par exécuteur, jusqu'à 3,3 s sous
+#: charge), l'hôte et le harnais des agents menés (`served_rows`), le routage
+#: du pilote au repos (`_idle_pilot`). Mêmes colonnes du registre, sans le
+#: courrier, `canon_state`, les baux ni `to_jsonb(agent_registry)`.
+CRITICAL_ROWS_SQL = "SELECT name, canon FROM agent_registry"
+SERVED_AGENTS_SQL = (
+    "SELECT name, harness, mode FROM agent_registry"
+    " WHERE host = %s AND mode = 'execute'"
+    "   AND status IS DISTINCT FROM 'stopped'"
+    " ORDER BY last_seen DESC NULLS LAST")
+ROUTING_ROWS_SQL = (
+    "SELECT name, canon, mode, projects, team, chantier"
+    " FROM agent_registry")
+
 
 class Agents(interface.Agents):
 
@@ -736,6 +752,21 @@ class Agents(interface.Agents):
             "  LEFT JOIN LATERAL ("
             "      SELECT to_jsonb(agent_registry) AS __row OFFSET 0) j ON true"
             " ORDER BY name")
+
+    def critical_rows(self) -> list[dict]:
+        # #5982 : `critical_names` ne garde que ces deux colonnes de la vue
+        # complète ; le verdict se calcule sur les fiches du canon, hors SQL.
+        return self.db.query(CRITICAL_ROWS_SQL)
+
+    def served_agents(self, host) -> list[dict]:
+        # #5982 : même prédicat que `Runner.served_rows` (`mode = 'execute'`,
+        # `status <> 'stopped'`), sur l'index d'hôte du registre.
+        return self.db.query(SERVED_AGENTS_SQL, (host,))
+
+    def routing_rows(self) -> list[dict]:
+        # #5982 : les champs que lit `alert_briefs.project_pilots` pour choisir
+        # le pilote d'un projet ; ni courrier, ni baux, ni état du canon.
+        return self.db.query(ROUTING_ROWS_SQL)
 
     def stopped_with(self, reasons) -> list[str]:
         # #3907 : le balayage #753 de chaque passe ne lit plus `overview()` ;

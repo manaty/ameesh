@@ -362,6 +362,34 @@ class Agents(Domain):
         n'est prise ici, seulement la preuve de joignabilité."""
 
     @abc.abstractmethod
+    def critical_rows(self) -> list[dict]:
+        """#5982 : `name` et `canon` seuls, pour le verdict critique d'un hôte.
+
+        `host_lifecycle.critical_names` calcule ce verdict hors SQL (rôles des
+        fiches du canon) et lisait `overview()` — la vue complète, 1 à 3 s
+        sous charge — toutes les 60 s par exécuteur pour n'en garder que ces
+        deux colonnes."""
+
+    @abc.abstractmethod
+    def served_agents(self, host: str) -> list[dict]:
+        """#5982 : `name`, `harness`, `mode` des agents que `host` mène :
+        `execute`, non arrêtés, dans l'ordre de `last_seen` décroissant.
+
+        `Runner.served_rows` s'en sert au démarrage et à chaque relevé de
+        versions ; `overview()` y joignait le courrier, le canon et les baux
+        de tout le registre."""
+
+    @abc.abstractmethod
+    def routing_rows(self) -> list[dict]:
+        """#5982 : les champs de routage du pilote au repos — `name`, `canon`,
+        `mode`, `projects`, `team`, `chantier` (pas `workstream` : la vue
+        complète ne le rendait pas, `agent_projects` retombait sur `chantier`).
+
+        `_idle_pilot` ne lit que ces colonnes pour choisir le pilote d'un
+        projet, et `overview()` y joignait la vue complète (courrier, baux,
+        état du canon)."""
+
+    @abc.abstractmethod
     def stopped_with(self, reasons: Sequence[str]) -> list[str]:
         """#3907 : les noms des agents `stopped` dont `stop_reason` est dans
         `reasons`, triés ; aucune raison, aucune lecture.
