@@ -495,6 +495,11 @@ os.execvpe(args[7], args[7:], env)
 DB_PYTHON = r'''#!/usr/bin/env python3
 import os, sys, time
 from pathlib import Path
+if sys.argv[1:2] == ['-c'] and 'role_timers' in sys.argv[2]:
+    # #5937 : le contrôle demande au venv installé s'il connaît la passe de
+    # l'auditeur ; ce banc installe un code qui la connaît.
+    print('auditeur-court')
+    sys.exit(0)
 assert os.environ.get('FAKE_REMOTE') == '1'
 assert os.environ.get('AMEESH_DSN') == __import__('json').loads((Path(os.environ['FAKE_STATE']) / 'expected-env.json').read_text())['AMEESH_DSN']
 assert os.environ.get('AMEESH_SCHEMA') == 'test_runner_schema'
