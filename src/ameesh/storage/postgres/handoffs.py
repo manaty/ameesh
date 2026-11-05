@@ -444,6 +444,33 @@ class Handoffs(interface.Handoffs):
             return Handoffs(tx).transition(operation, "session_ready", "switched",
                                            detail="source lease fenced; placement and session switched")
 
+    def cancel_unused(self, operation):
+        """#5864: close a plan that never produced a host effect, without restore_source.
+
+        Only planned/prepared (or held there), never fenced, no intent nor
+        cancellation in flight, not a loss recovery, and its reservation
+        already expired: the source executor was never stopped, so there is
+        nothing to restore. Anything else returns None (ordinary cancel).
+        """
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op:
+                return None
+            agent = tx.query("SELECT handoff_fenced FROM agent_registry WHERE name=%s FOR UPDATE",
+                             (op["agent"],))
+            op = tx.query("SELECT " + COLUMNS + ", reserved_until <= clock_timestamp() AS expired"
+                          " FROM host_handoffs WHERE id=%s FOR UPDATE", (operation,))[0]
+            evidence = op["evidence"]
+            checkpoint = evidence.get("held_at") if op["state"] == "held" else op["state"]
+            if (checkpoint not in ("planned", "prepared") or op["fenced"] or not op["expired"]
+                    or (agent and agent[0]["handoff_fenced"])
+                    or op["plan"].get("reason") == "host_loss"
+                    or "pending_effect" in evidence or evidence.get("cancel_requested")):
+                return None
+            return Handoffs(tx).transition(
+                operation, op["state"], "cancelled", evidence={"cancelled_unused": checkpoint},
+                detail="expired reservation without host effect; cancelled without source restoration")
+
     def unfence(self, operation, expected, state):
         with self.db.transaction() as tx:
             op = Handoffs(tx).get(operation)

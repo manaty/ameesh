@@ -5633,6 +5633,10 @@ class Handoffs(Domain):
         """Yield a journal API whose completion/fence writes share the source gate transaction."""
 
     @abc.abstractmethod
+    def cancel_unused(self, operation: str) -> dict | None:
+        """#5864: cancel an expired, never-fenced plan without host effect; None otherwise."""
+
+    @abc.abstractmethod
     def switch(self, operation: str, *, cwd: str, brief: str) -> dict | None: ...
 
     @abc.abstractmethod

@@ -115,13 +115,25 @@ def _manual_refusal(cfg, db, name: str, source: str, target: str) -> str:
                 % (name, target))
     if target in host_holds.live(db):
         return "host %s is on hold: no agent is moved onto it" % target
-    if storage.of(db).handoffs.active(name):
-        return ("%s has an open host handoff: finish or cancel it before moving it"
-                % name)
+    handoff = storage.of(db).handoffs.active(name)
+    if handoff:
+        return open_handoff_refusal(name, handoff)
     return ("%s was not moved: its source executor on %s still holds a live lease "
             "and reported less than %.0f s ago; stop that executor (or wait for "
             "runner_seen_at to go stale) and retry"
             % (name, source, runner_liveness_s(cfg)))
+
+
+def open_handoff_refusal(name: str, handoff: dict) -> str:
+    """#5864 : le refus nomme l'opération ouverte et la commande de sortie."""
+    state = handoff.get("state") or "?"
+    if state == "held":
+        state = "held at %s" % (handoff.get("evidence") or {}).get("held_at", "?")
+    return ("%s has an open host handoff %s (%s, %s -> %s): inspect it with "
+            "\"ameesh handoff show %s\", then finish it or cancel it with "
+            "\"ameesh handoff cancel %s\" before moving it"
+            % (name, handoff.get("id"), state, handoff.get("source"),
+               handoff.get("target"), handoff.get("id"), handoff.get("id")))
 
 
 def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
@@ -173,10 +185,9 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
             "%s still has a stale 'running' status (no live lease): let the "
             "runner's reap settle it or run \"ameesh resume %s\", then retry"
             % (name, name))
-    if storage.of(db).handoffs.active(name):
-        raise MoveError(
-            "%s has an open host handoff: finish or cancel it before moving it"
-            % name)
+    handoff = storage.of(db).handoffs.active(name)
+    if handoff:
+        raise MoveError(open_handoff_refusal(name, handoff))
     stopped = unit_stopped(cfg, name, source)
     summary = "" if keep_session else FALLBACK_SUMMARY % (source, target)
     diagnostic = ("moved from %s by hand%s: placement to re-evaluate on %s"
