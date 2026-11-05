@@ -6,7 +6,7 @@
 Description=Nexlink release tick (#3529)
 
 [Timer]
-OnBootSec=1min
+OnActiveSec=1min
 OnUnitActiveSec=60s
 AccuracySec=1s
 Persistent=true

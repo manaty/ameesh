@@ -6,7 +6,7 @@
 Description=ameesh release tick (compiled canon cutoffs, #2448)
 
 [Timer]
-OnBootSec=1min
+OnActiveSec=1min
 OnUnitActiveSec=60s
 AccuracySec=1s
 Persistent=true
