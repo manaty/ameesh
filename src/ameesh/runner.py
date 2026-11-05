@@ -1204,10 +1204,12 @@ class AgentWorker(threading.Thread):
                 # pas seulement l'UPDATE. La connexion appartient à cet appel
                 # (même détaché après call_budget) et se ferme à sa sortie.
                 # Le client médié ouvre déjà une requête par opération.
-                connection = (nullcontext(self.db)
-                              if getattr(self.db.cfg, "backend", "") == "mediated"
-                              else closing(db_mod.connect(self.db.cfg, writer=False)))
-                with db_mod.application("lease", self.name), connection as renew_db:
+                # #5976 : nommée « lease » dès son ouverture
+                with db_mod.application("lease", self.name):
+                    connection = (nullcontext(self.db)
+                                  if getattr(self.db.cfg, "backend", "") == "mediated"
+                                  else closing(db_mod.connect(self.db.cfg, writer=False)))
+                with connection as renew_db:
                     migrations.require_compatible_writer(renew_db)
                     result["expires"] = registry.renew(
                         renew_db, self.name, self.runner.runner_id, self.epoch,

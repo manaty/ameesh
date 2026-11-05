@@ -139,6 +139,37 @@ class DriverWiringTest(_Restore):
                                  "ameesh/runner.main/a@ameesh-agents-3"])
 
 
+class LeaseRenewTest(_Restore):
+    """Revue ameesh-cx1 (B) : la session du bail est nommée à son ouverture,
+    pas après (les deux pilotes la nomment dans leur constructeur)."""
+
+    def test_renew_call_nomme_la_session(self):
+        from types import SimpleNamespace
+        from ameesh import runner as runner_mod
+        db_mod.set_application("runner.main", "r")
+        names = []
+
+        class Fake:
+            def close(self):
+                pass
+
+        def connect(cfg, writer=True):
+            names.append(db_mod.application_name())
+            return Fake()
+
+        worker = SimpleNamespace(
+            db=SimpleNamespace(cfg=config_mod.Config(dsn="postgresql://u@h/db")),
+            name="mty-amh-impl-13", epoch=4, lease_held_until=0.0,
+            _held_until=lambda: 0.0, renewals=[], call_budget=lambda: 5.0,
+            runner=SimpleNamespace(runner_id="rid", lease_ttl=100))
+        with mock.patch.object(runner_mod.db_mod, "connect", side_effect=connect), \
+                mock.patch.object(runner_mod.migrations, "require_compatible_writer"), \
+                mock.patch.object(runner_mod.registry, "renew", return_value=123.0):
+            done, expires, error = runner_mod.AgentWorker._renew_call(worker)
+        self.assertEqual((done, expires, error), (True, 123.0, None))
+        self.assertEqual(names, ["ameesh/lease/mty-amh-impl-13@ameesh-agents-3"])
+
+
 class SessionTest(PgTestCase):
     """La session réelle porte le nom ; un application_name du DSN prime."""
 
