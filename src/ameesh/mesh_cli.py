@@ -265,9 +265,16 @@ def _handoff_operator(cfg, db, args):
         raise ValueError("unknown handoff")
     try:
         from . import handoff_factory
-        binding = handoff_factory.load(db)
-        adapter = binding.adapter
-        if "lifecycle_host" in operation.get("plan", {}):
+        try:
+            binding = handoff_factory.load(db)
+        except handoff_factory.FactoryUnavailable:
+            # #5864: an expired plan without host effect cancels without any
+            # adapter; cancel refuses by name if restoration is still needed.
+            if args.handoff_command != "cancel":
+                raise
+            binding = None
+        adapter = binding.adapter if binding else None
+        if binding and "lifecycle_host" in operation.get("plan", {}):
             adapter = host_lifecycle._ReadyAdapter(db, adapter,
                                                   binding.requirements_for)
         if args.handoff_command == "retry":

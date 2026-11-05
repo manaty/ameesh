@@ -517,7 +517,85 @@ class HandoffTest(PgTestCase):
         self.assertNotIn("enable", self.adapter.calls)
         self.assertEqual(registry.get(self.db,"dev")["host"],"source")
         handoffs.cancel(self.db,op["id"],self.adapter)
+        self.assertIn("restore_source", self.adapter.calls)  # fenced: never the #5864 shortcut
         self.assertTrue(registry.begin_turn(self.db,"dev","runner",self.lease["lease_epoch"],"resume"))
+
+    def expire(self, op):
+        self.db.execute("UPDATE host_handoffs SET reserved_until=now()-interval '12 days' WHERE id=%s",
+                        (op["id"],))
+
+    def test_5864_expired_unused_plan_cancels_without_restore_source(self):
+        from ameesh import relocation
+        op = self.request()
+        self.expire(op)
+        # Days later the source lease moved on (unit drained, restarted elsewhere).
+        self.db.execute("UPDATE agent_registry SET lease_epoch=lease_epoch+7,lease_owner=NULL WHERE name='dev'")
+        message = relocation.open_handoff_refusal("dev", self.api.handoffs.active("dev"))
+        self.assertIn(op["id"], message)
+        self.assertIn('"ameesh handoff cancel %s"' % op["id"], message)
+        done = handoffs.cancel(self.db, op["id"], None)  # no adapter: nothing to restore
+        self.assertEqual((done["state"], done["fenced"]), ("cancelled", False))
+        self.assertEqual(done["evidence"]["cancelled_unused"], "planned")
+        self.assertNotIn("pending_effect", done["evidence"])
+        self.assertNotIn("cancel_requested", done["evidence"])
+        self.assertEqual(self.api.handoffs.events(op["id"])[-1]["state"], "cancelled")
+        self.assertIsNone(self.api.handoffs.active("dev"))
+        self.assertEqual(self.adapter.calls, [])
+        self.assertEqual(registry.get(self.db, "dev")["host"], "source")
+
+    def test_5864_expired_prepared_or_held_plan_cancels_without_restore_source(self):
+        op = self.request()
+        self.assertEqual(self.advance(op)["state"], "prepared")
+        self.expire(op)
+        held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", False))
+        done = handoffs.cancel(self.db, op["id"], self.adapter)
+        self.assertEqual(done["state"], "cancelled")
+        self.assertEqual(done["evidence"]["cancelled_unused"], "prepared")
+        self.assertNotIn("restore_source", self.adapter.calls)
+
+    def lose_source(self):
+        self.db.execute("INSERT INTO host_lifecycle(host,mode,actor) VALUES ('source','lost','test') "
+                        "ON CONFLICT(host) DO UPDATE SET mode='lost'")
+        # setUp does not truncate host_lifecycle: never leak a lost source into later tests.
+        self.addCleanup(self.db.execute, "DELETE FROM host_lifecycle WHERE host='source'")
+
+    def test_5864_lost_source_cancels_expired_unused_plan_without_host_effect(self):
+        # Real case (#5869): source in lost mode, stale planned handoff blocks its reconcile.
+        op = self.request()
+        self.expire(op)
+        self.lose_source()
+        done = handoffs.cancel(self.db, op["id"], None)
+        self.assertEqual((done["state"], done["fenced"]), ("cancelled", False))
+        self.assertEqual(done["evidence"]["cancelled_unused"], "planned")
+        self.assertIsNone(self.api.handoffs.active("dev"))
+        self.assertEqual(self.adapter.calls, [])
+
+    def test_5864_lost_source_still_refuses_live_or_fenced_plans(self):
+        live = self.request()
+        self.lose_source()
+        with self.assertRaises(handoffs.HandoffRefusal) as refused:
+            handoffs.cancel(self.db, live["id"], self.adapter)
+        self.assertIs(refused.exception.reason, handoffs.Refusal.SOURCE_LOST)
+        self.assertEqual(self.api.handoffs.get(live["id"])["state"], "planned")
+        self.db.execute("UPDATE host_handoffs SET fenced=true WHERE id=%s", (live["id"],))
+        self.expire(live)
+        with self.assertRaises(handoffs.HandoffRefusal) as refused:
+            handoffs.cancel(self.db, live["id"], self.adapter)
+        self.assertIs(refused.exception.reason, handoffs.Refusal.SOURCE_LOST)
+        self.assertNotIn("restore_source", self.adapter.calls)
+
+    def test_5864_live_reservation_still_restores_and_refuses_without_adapter(self):
+        op = self.request()
+        with self.assertRaises(handoffs.HandoffRefusal) as refused:
+            handoffs.cancel(self.db, op["id"], None)
+        self.assertIs(refused.exception.reason, handoffs.Refusal.ADAPTER_UNAVAILABLE)
+        row = self.api.handoffs.get(op["id"])
+        self.assertEqual(row["state"], "planned")
+        self.assertNotIn("pending_effect", row["evidence"])
+        self.assertNotIn("cancel_requested", row["evidence"])
+        self.assertEqual(handoffs.cancel(self.db, op["id"], self.adapter)["state"], "cancelled")
+        self.assertIn("restore_source", self.adapter.calls)
 
     def test_adapter_proofs_reject_wrong_repo_commit_and_premature_enable(self):
         op=self.drain()
