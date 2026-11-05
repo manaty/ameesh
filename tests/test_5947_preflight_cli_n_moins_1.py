@@ -198,6 +198,67 @@ class RetourFinitParLeControleTest(unittest.TestCase):
 
 
 
+# #5946 : règle statique. Chaque appel du CLI installé (`ameesh_agents`,
+# `python_agents`) dans controler_agents déclare les étapes où il tourne :
+# `verifier` (préflight, CLI N-1 encore installé), `controler` (après
+# l'installation, CLI N) et `retour` (après un retour arrière, CLI N-1). Un
+# contrôle qui ne vaut que pour N (sans `verifier` ni `retour`) nomme la garde
+# qui l'abrite, lue dans le corps avant l'appel. Un contrôle ajouté sans
+# déclaration fait échouer ce test : son auteur doit dire s'il tient sous N-1.
+TOUTES = ('verifier', 'controler', 'retour')
+CONTROLES_CLI = {
+    'ameesh_agents doctor --profiles': dict(etapes=TOUTES),
+    'ameesh_agents doctor': dict(etapes=TOUTES),
+    'ameesh_agents role timers --check': dict(etapes=TOUTES),
+    # sonde du code installé (#5937) : connue de tout CLI, elle décide du suivant
+    'python_agents -c': dict(etapes=TOUTES),
+    'ameesh_agents role timers --role auditeur --check': dict(
+        etapes=('controler',), garde='elif [ "$passe_auditeur" = - ]; then'),
+}
+
+
+def appels_cli_de_controler(texte: str) -> list[tuple[str, int]]:
+    debut = texte.index('controler_agents() {')
+    corps = texte[debut:texte.index('\n}\n', debut)]
+    appels = []
+    for ligne in corps.splitlines():
+        code = ligne.split('#', 1)[0] if ligne.lstrip().startswith('#') else ligne
+        for m in re.finditer(r'\b(ameesh_agents|python_agents)((?: +[-\w]+)*)', code):
+            appels.append((' '.join((m.group(1) + m.group(2)).split()), debut + corps.index(ligne)))
+    return appels
+
+
+class ControlesDeclaresTest(unittest.TestCase):
+    """Tout contrôle de controler_agents déclare ses étapes (#5946)."""
+
+    def test_chaque_appel_du_cli_installe_est_declare(self):
+        texte = SCRIPT.read_text(encoding='utf-8')
+        appels = appels_cli_de_controler(texte)
+        self.assertTrue(appels)
+        trouves = {a for a, _ in appels}
+        self.assertEqual(sorted(trouves - set(CONTROLES_CLI)), [],
+                         'contrôle de controler_agents sans étapes déclarées '
+                         '(CONTROLES_CLI, #5946) : tient-il sous le CLI N-1 ?')
+        self.assertEqual(sorted(set(CONTROLES_CLI) - trouves), [],
+                         'déclaration sans contrôle : retirer de CONTROLES_CLI')
+        for appel, pos in appels:
+            decl = CONTROLES_CLI[appel]
+            self.assertLessEqual(set(decl['etapes']), set(TOUTES), appel)
+            if {'verifier', 'retour'} <= set(decl['etapes']):
+                continue
+            garde = decl.get('garde')
+            self.assertTrue(garde, '%s ne tourne pas sous N-1 : garde à nommer' % appel)
+            debut = texte.index('controler_agents() {')
+            self.assertIn(garde, texte[debut:pos], appel)
+
+    def test_la_regle_voit_un_controle_ajoute(self):
+        texte = SCRIPT.read_text(encoding='utf-8').replace(
+            '  ameesh_agents doctor || echec=1\n',
+            '  ameesh_agents doctor || echec=1\n  ameesh_agents passe-nouvelle --check || echec=1\n', 1)
+        self.assertIn('ameesh_agents passe-nouvelle --check',
+                      {a for a, _ in appels_cli_de_controler(texte)})
+
+
 class BarriereCiTest(unittest.TestCase):
     """La barrière tient en CI : job au clone complet, rouge = `tests` rouge."""
 
