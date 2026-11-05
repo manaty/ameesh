@@ -152,6 +152,8 @@ class PaquetAutoBanc(unittest.TestCase):
         red = paquet_auto.TestRun(
             "unité #1", ["tests.test_unit"], 1,
             "FAIL: test_x (tests.test_unit.TestX)\nAssertionError", 0.1)
+        red.log_path = "/state/test-logs/series-rouge.log"
+        logs = []
         green = paquet_auto.TestRun(
             "contrats", ["tests.test_contract"], 0,
             "Ran 1 test in 0.1s\n\nOK", 0.1)
@@ -163,7 +165,9 @@ class PaquetAutoBanc(unittest.TestCase):
                                   side_effect=[red, green]):
             runs, faulty, _removals = paquet_auto.check_local_tests(
                 pathlib.Path(self.tmp.name), composition, timeout=1,
-                log=lambda _line: None)
+                log=logs.append)
+        self.assertIn(red.log_path, "\n".join(logs))
+        self.assertIn("tests.test_unit", "\n".join(logs))
         self.assertEqual(faulty, [1])
         self.assertFalse(runs[0].inconclusive)
 

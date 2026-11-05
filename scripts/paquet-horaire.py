@@ -1592,12 +1592,24 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
         raise HoraireError("paquet-auto rc %d pour %s" % (result.returncode, name))
     if re.search(r"^(aucun lot prêt|aucune unité)", result.stdout, re.MULTILINE):
         reason = "rien composé (%s)" % step
+        # #5970 : garder le diagnostic et prévenir avant la clôture ; le
+        # courrier lié à un lot clos serait refusé par agent-mail.
+        lines = result.text.splitlines()
+        kept = set(range(max(0, len(lines) - 30), len(lines)))
+        for i, line in enumerate(lines):
+            if re.match(r"tests (unité #\d+|contrats) : ROUGE", line):
+                # paquet-auto imprime l'en-tête puis les 40 lignes du rouge.
+                kept.update(range(i, min(i + 41, len(lines))))
+            if line.startswith("écarté #"):
+                kept.add(i)
+        diagnostic = "\n".join(lines[i] for i in sorted(kept))
+        ctx.note(carrier, "%s%s\n\n%s" % (MARK, reason, diagnostic))
+        ctx.mail(ctx.pilot, carrier, "#%d %s : %s, clôture du porteur vide.\n\n%s"
+                 % (carrier, name, reason, diagnostic))
         if not ctx.dry_run:
             ctx.must("work", "close", str(carrier), "--abandoned",
                      "--note", MARK + reason, "--actor", ctx.actor,
                      what="clôture du porteur vide #%d" % carrier)
-        ctx.mail(ctx.pilot, carrier, "#%d %s : %s, porteur clos.\n\n%s"
-                 % (carrier, name, reason, auto._tail(result.stdout, 15)))
         return "%s : %s" % (name, reason)
     if re.search(r"^%s" % re.escape(auto.MERGED_LINE), result.stdout, re.MULTILINE):
         # #4322 : fusionné au vert pendant les tests par unité (§11 bis) ;
