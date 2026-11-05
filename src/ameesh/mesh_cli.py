@@ -2244,7 +2244,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "fingerprint":
             # #3885 : primitive idempotente de la règle §16 — un lot par
             # empreinte nouvelle, les doublons notés, P1 si un utilisateur est
-            # touché, récidive après clôture.
+            # touché en production (une empreinte staging plafonne à P2, #5987),
+            # récidive après clôture.
             from . import fingerprints
             if getattr(args, "fingerprint_command", None) != "open":
                 print("ameesh work fingerprint: `open` is the only command "
@@ -4108,13 +4109,14 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     fp_sub = pw_fp.add_subparsers(dest="fingerprint_command")
     pw_fp_open = fp_sub.add_parser(
         "open", help=("open a %s for empreinte:<app>:<key>, or note the open one; "
-                     "P1 as soon as one user is touched") % v.noun)
+                     "P1 as soon as one user is touched in production (a staging "
+                     "%s is capped at P2)") % (v.noun, v.noun))
     pw_fp_open.add_argument("--app", required=True, help="the project of the failure")
     pw_fp_open.add_argument("--key", required=True,
                             help="the stable fingerprint key (route+code+revision, a hash, …)")
     pw_fp_open.add_argument("--title", required=True, help=("the %s title") % v.noun)
     pw_fp_open.add_argument("--users", type=int, default=0,
-                            help="number of users touched (P1 when > 0)")
+                            help="number of users touched (P1 when > 0, production only)")
     pw_fp_open.add_argument("--count", type=int, default=0,
                             help="occurrences reported by the source")
     pw_fp_open.add_argument("--route", default="")
