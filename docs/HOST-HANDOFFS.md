@@ -346,9 +346,9 @@ The runner detects a known host as `lost` after its latest resource sample
 is older than the larger of 180 seconds and three resource intervals, and
 none of its executing agents has a live lease. It rechecks both facts after
 locking the host gate and agent rows. An unobserved host is not classified
-as lost. An existing drain retains its generation and agent origins, but
-its automatic return timer is removed. A new heartbeat does not reopen
-claims on a lost host.
+as lost. An existing drain retains its generation, agent origins and return
+time (`return_at`): the loss is a finding, not the end of the drain (#5869).
+A new heartbeat does not reopen claims on a lost host.
 `undrain` refuses a lost host; the planned-return path cannot bypass the
 recovery proof. A returning machine stays withdrawn until a verified
 reconciliation proves a sustained fresh reading history in database time
@@ -361,6 +361,19 @@ proof. The next lifecycle pass of a healthy runner, or `ameesh host reconcile
 HOST`, then records `lost -> returning -> available` with its actor and
 evidence in the event log. A single fresh heartbeat does not reopen claims,
 and an agent moved elsewhere by a recovery keeps the automatic proof closed.
+
+A manual drain (not `automatic`) lost before its `--for` expired is not
+reopened: the same proof records `lost -> draining` instead, with the same
+generation and return time, and its `host.reconciled` event says `to:
+draining` (#5869). The window then ends as any drain does, at its
+`return_at` or on `undrain`. An expired window returns to `available` as
+above. For both, an agent the drain itself moved away (a verified
+`host_drain` handoff) does not count as a second executor; a fenced agent or
+an active handoff still refuses the proof. A detector of the previous
+version clears `return_at` but keeps the generations: the drain is then
+restored without a deadline, never reopened. While such a window is open,
+the `host_release_overdue` alert names the requester and the return time
+and does not advise `undrain` (#5866).
 `ameesh_host_gate_state` names a lost host `lost` (the generic `draining` it
 used to return hid the bound). Lost-host recovery moves agents forward rather
 than restoring an uncertain source executor.

@@ -801,17 +801,27 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                         if row.get("host") == host)
         leases = [row.get("name") for row in listing
                   if row.get("host") == host and row.get("lease_live")]
+        # #5866: a manual drain still inside its `--for` is an announced
+        # operator window; following the usual advice would end it mid-way.
+        return_ts = resources.finite_float(control.get("return_ts"))
+        if not control.get("automatic") and return_ts is not None and return_ts > now:
+            action = ("This is a manual drain by %s until %s: an operator window, "
+                      "do not undrain it; it returns on its own at that time, or "
+                      "its requester undrains it." % (
+                          control.get("actor") or "?",
+                          time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(return_ts))))
+        else:
+            action = ("Check the adapter and the host reading, then `ameesh host "
+                      "undrain %s` to give it back." % host)
         detail = ("Host %s has been draining for %ds (bound %ds) without reaching "
                   "idle-drained: release state %s, hook %s, claims %s; declared runs "
-                  "come from A's host measure (%s). %s Turn/lease holders: %s. Check "
-                  "the adapter and the host reading, then `ameesh host undrain %s` "
-                  "to give it back." % (
+                  "come from A's host measure (%s). %s Turn/lease holders: %s. %s" % (
                       host, int(now - requested), int(cfg.host_release_drain_bound),
                       control.get("release_state"), control.get("hook_state") or "none",
                       "open" if control.get("claims_open") else "closed",
                       "unknown unless the host declares runs_interface",
                       "Agents: %s." % (", ".join(agents) or "none"),
-                      ", ".join(leases) or "none", host))
+                      ", ".join(leases) or "none", action))
         out.append(_alert("host_release_overdue", None, requested,
                           max(0.0, now - requested),
                           float(cfg.host_release_drain_bound), detail,
