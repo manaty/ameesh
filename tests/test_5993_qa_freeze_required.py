@@ -10,6 +10,9 @@ de la commande.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+
 from ameesh import work
 
 from .support import PgTestCase
@@ -25,10 +28,40 @@ class QaFreezeRequiredTest(PgTestCase):
         self.lot = int(self.item["id"])
         work.move(self.db, self.lot, "build", actor="auteur")
 
-    def _freeze_row(self):
+    def _freeze_row(self, sha=FROZEN):
         self.db.execute(
             "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
-            " VALUES (%s, 'frozen', %s, 'auteur')", (self.lot, FROZEN))
+            " VALUES (%s, 'frozen', %s, 'auteur')", (self.lot, sha))
+
+    @staticmethod
+    def _git(repo, *args):
+        subprocess.run(["git", "-C", repo, *args], check=True,
+                       capture_output=True, text=True)
+
+    @classmethod
+    def _rev(cls, repo, rev):
+        return subprocess.run(["git", "-C", repo, "rev-parse", rev],
+                              check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def _git_repo(self):
+        """Un dépôt avec deux commits A (gelé) et B (poussée ou locale)."""
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "t@example.invalid")
+        self._git(repo, "config", "user.name", "t")
+        path = os.path.join(repo, "f")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("a\n")
+        self._git(repo, "add", "f")
+        self._git(repo, "commit", "-qm", "A")
+        a = self._rev(repo, "HEAD")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("b\n")
+        self._git(repo, "add", "f")
+        self._git(repo, "commit", "-qm", "B")
+        return repo, a, self._rev(repo, "HEAD")
 
     def _move(self, state, *args):
         return self.mesh("work", "move", str(self.lot), state, *args,
@@ -95,6 +128,43 @@ class QaFreezeRequiredTest(PgTestCase):
         proc = self._move("qa")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+
+    def test_tete_poussee_en_avance_refusee_meme_worktree_en_retard(self):
+        # La ref distante B est en avance sur le gel A ; le worktree local est
+        # resté à A. La preuve distante ne doit pas être effacée par le local.
+        repo, a, b = self._git_repo()
+        branch = "lot/5993-head"
+        self._git(repo, "update-ref", "refs/remotes/origin/" + branch, b)
+        self._git(repo, "checkout", "-q", a)
+        work.set_branch(self.db, self.lot, branch, actor="auteur")
+        self._freeze_row(a)
+        old = os.getcwd()
+        os.chdir(repo)
+        try:
+            with self.assertRaises(work.WorkError) as caught:
+                work.move(self.db, self.lot, "qa", actor="auteur",
+                          require_freeze=True)
+        finally:
+            os.chdir(old)
+        self.assertIn("not its branch head", str(caught.exception))
+
+    def test_commit_local_non_pousse_ne_refuse_pas(self):
+        # La ref distante est le gel A ; HEAD porte B, non poussé. Un commit
+        # local ne doit ni refuser le move ni être proposé au gel.
+        repo, a, b = self._git_repo()
+        branch = "lot/5993-local"
+        self._git(repo, "update-ref", "refs/remotes/origin/" + branch, a)
+        self._git(repo, "checkout", "-q", b)
+        work.set_branch(self.db, self.lot, branch, actor="auteur")
+        self._freeze_row(a)
+        old = os.getcwd()
+        os.chdir(repo)
+        try:
+            row = work.move(self.db, self.lot, "qa", actor="auteur",
+                            require_freeze=True)
+        finally:
+            os.chdir(old)
+        self.assertEqual(row["state"], "qa")
 
     def test_reviewer_explicite_ne_dispense_pas_du_gel(self):
         self.register("relecteur", "codex", cwd=self.tmp)
