@@ -4517,8 +4517,10 @@ class Operations(Domain):
         la FENÊTRE d'abord : pour un même compte et une même jauge, une
         échéance `resets_at` plus tardive prouve que la fenêtre plus ancienne
         est close, si bien que le relevé de l'ancienne échéance est écarté
-        même s'il a été inséré plus récemment. À échéance égale (même
-        fenêtre), le plus récent par production puis insertion. Mêmes
+        même s'il a été inséré plus récemment. Dans la même fenêtre
+        (échéances à `GAUGE_WINDOW_JITTER_S` près de la plus tardive, #5952),
+        le plus récent par production puis insertion ; la ligne rendue porte
+        alors l'échéance de ce relevé, pas forcément la plus tardive. Mêmes
         colonnes que `gauge_latest` ; aucune ligne pour un compte inconnu."""
 
     @abc.abstractmethod
