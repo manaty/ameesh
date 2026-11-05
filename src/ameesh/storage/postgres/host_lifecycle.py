@@ -152,8 +152,11 @@ class HostLifecycle(interface.HostLifecycle):
                 if not stale:
                     continue
                 if old and old["mode"] == "draining":
+                    # #5869: the loss is a finding, not an end of the drain;
+                    # `return_at` is kept so a reconciliation restores the
+                    # same withdrawal window (same generation).
                     row = tx.query("UPDATE host_lifecycle SET mode='lost',actor=%s,"
-                                   "return_at=NULL,release_epoch=release_epoch+1,"
+                                   "release_epoch=release_epoch+1,"
                                    "updated_at=clock_timestamp() WHERE host=%s RETURNING " + _ROW,
                                    (actor, host))[0]
                 else:
@@ -776,12 +779,31 @@ class HostLifecycle(interface.HostLifecycle):
                 "(r.lease_expires_at > clock_timestamp()) AS live, "
                 "EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
                 "        AND h.state NOT IN ('verified','cancelled')) AS active_handoff, "
-                + _MANUAL_MOVE + " AS moved_by_hand "
+                + _MANUAL_MOVE + " AS moved_by_hand, "
+                "EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
+                "        AND h.source=c.host AND h.state='verified' "
+                "        AND h.plan->>'reason'='host_drain' "
+                "        AND h.created_at>=c.requested_at) AS drain_moved "
                 "FROM host_lifecycle_agents a JOIN agent_registry r ON r.name=a.agent "
                 "JOIN host_lifecycle c ON c.host=a.host "
                 "WHERE a.host=%s AND a.generation=%s ORDER BY r.name FOR UPDATE OF r",
                 (host, control["generation"]))
+            # #5869: a manual drain of this generation that has not expired
+            # keeps its intent through the loss: the proof returns the host to
+            # `draining` (same generation, same `return_at`), never `available`.
+            # Detection keeps the generation of a draining host, so only a
+            # loss observed while draining has `release_generation` equal to
+            # it; an expired window returns as before.
+            restore = (control.get("release_generation") == control["generation"]
+                       and not control.get("automatic")
+                       and (control.get("return_ts") is None
+                            or float(control["return_ts"]) > now["now_ts"]))
             for row in origins:
+                if restore and row["host"] != host and row["drain_moved"]:
+                    # #5869: an agent the drain itself moved away (verified
+                    # `host_drain` handoff of this generation) is not a
+                    # second executor: that is the withdrawal being restored.
+                    continue
                 if row["host"] != host and not row["moved_by_hand"]:
                     missing.append("agent_moved:" + row["name"])
                 if row["handoff_fenced"]:
@@ -791,6 +813,47 @@ class HostLifecycle(interface.HostLifecycle):
             if missing:
                 return {"host": host, "mode": "lost", "reconciled": False,
                         "missing": sorted(set(missing)), "lost_ts": lost_ts}
+
+            if restore:
+                restored = tx.query(
+                    "UPDATE host_lifecycle SET mode='draining',actor=%s, "
+                    "release_epoch=release_epoch+1,updated_at=clock_timestamp() "
+                    "WHERE host=%s AND mode='lost' AND generation=%s "
+                    "RETURNING " + _ROW, (actor, host, control["generation"]))
+                if not restored:
+                    return {"host": host, "mode": "lost", "reconciled": False,
+                            "missing": ["not_lost"], "lost_ts": lost_ts}
+                # Same effect as an idempotent drain: an elected lease taken
+                # back by the returning host is handed over again.
+                _release_elected(tx, host)
+                evidence = {
+                    "generation": control["generation"],
+                    "actor": actor,
+                    "from": "lost",
+                    "to": "draining",
+                    "return_ts": control.get("return_ts"),
+                    "lost_ts": lost_ts,
+                    "first_fresh_ts": times[0],
+                    "suffix_start_ts": times[start],
+                    "fresh_ts": now["latest_ts"],
+                    "readings": len(times) - start,
+                    "readings_since_loss": len(times),
+                    "coverage_s": covered,
+                    "agents": [row["name"] for row in origins],
+                    "moved_by_drain": [row["name"] for row in origins
+                                       if row["host"] != host and row["drain_moved"]],
+                    "live_lease_agents": [row["name"] for row in origins if row["live"]],
+                    "checks": ["fresh_reading", "sustained_readings", "no_reading_gap",
+                               "agents_home_or_drained", "no_active_handoff",
+                               "no_recovery_attempt", "drain_not_expired"],
+                }
+                tx.execute(
+                    "INSERT INTO ameesh_events(type,object,project,data) "
+                    "VALUES ('host.reconciled',%s,NULL,%s::jsonb)",
+                    ("host:" + host, json.dumps(evidence, sort_keys=True)))
+                return {"host": host, "mode": "draining", "reconciled": True,
+                        "missing": [], "generation": control["generation"],
+                        "evidence": evidence}
 
             # The origin rows are home and unfenced; `complete_return`'s own
             # predicate is therefore satisfied. Keep the two recorded steps in

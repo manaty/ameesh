@@ -13142,8 +13142,9 @@ class Runner:
                 result = host_lifecycle.reconcile(self.cfg, db, control["host"],
                                                   actor=self.runner_id)
                 if result.get("reconciled"):
-                    log_async("[%s] lost host %s reconciled (generation %s)"
-                              % (self.runner_id, control["host"], result.get("generation")))
+                    log_async("[%s] lost host %s reconciled to %s (generation %s)"
+                              % (self.runner_id, control["host"], result.get("mode"),
+                                 result.get("generation")))
             for control in controls:
                 if control["mode"] in ("draining", "returning", "lost"):
                     # #4148: a returning host whose `busy` hook has not
