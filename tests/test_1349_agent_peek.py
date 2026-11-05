@@ -105,6 +105,71 @@ class SelectionTest(unittest.TestCase):
             publisher.thread.join(timeout=10)
         self.assertEqual(warnings, ["agent peek worker: snapshot unavailable"])
 
+    def test_publisher_keeps_its_connection_across_captures(self):
+        opened = []
+        operations = mock.Mock()
+        operations.publish_peek.return_value = True
+
+        def connect(cfg):
+            db = mock.Mock()
+            opened.append(db)
+            return db
+
+        with mock.patch.object(peek, "INTERVAL", 0.01), \
+                mock.patch.object(peek.db_mod, "connect", side_effect=connect) as opened_connect, \
+                mock.patch.object(peek.storage, "of",
+                                  return_value=mock.Mock(operations=operations)):
+            publisher = peek.Publisher(config.Config(), agent="worker", owner="runner", epoch=1,
+                                       cwd=lambda: "", reader=lambda: None)
+            try:
+                for _ in range(300):
+                    if operations.publish_peek.call_count >= 3:
+                        break
+                    publisher.stop.wait(0.01)
+                self.assertGreaterEqual(operations.publish_peek.call_count, 3)
+            finally:
+                publisher.close()
+                publisher.thread.join(timeout=10)
+        self.assertEqual(opened_connect.call_count, 1)
+        self.assertEqual(len(opened), 1)
+        opened[0].close.assert_called_once()
+
+    def test_publisher_reconnects_only_after_a_failure(self):
+        opened, published, warnings = [], [], []
+
+        def connect(cfg):
+            db = mock.Mock()
+            opened.append(db)
+            return db
+
+        def publish(*args):
+            published.append(args)
+            if len(published) == 1:
+                raise OSError("PRIVATE transport")
+            return True
+
+        operations = mock.Mock()
+        operations.publish_peek.side_effect = publish
+        with mock.patch.object(peek, "INTERVAL", 0.01), \
+                mock.patch.object(peek.db_mod, "connect", side_effect=connect) as opened_connect, \
+                mock.patch.object(peek.storage, "of",
+                                  return_value=mock.Mock(operations=operations)):
+            publisher = peek.Publisher(config.Config(), agent="worker", owner="runner", epoch=1,
+                                       cwd=lambda: "", reader=lambda: None, warn=warnings.append)
+            try:
+                for _ in range(300):
+                    if len(published) >= 2:
+                        break
+                    publisher.stop.wait(0.01)
+                self.assertGreaterEqual(len(published), 2)
+            finally:
+                publisher.close()
+                publisher.thread.join(timeout=10)
+        self.assertEqual(opened_connect.call_count, 2)
+        opened[0].close.assert_called_once()
+        opened[1].close.assert_called_once()
+        self.assertEqual(warnings, ["agent peek worker: snapshot unavailable"])
+
     def test_cli_denies_agent_context_without_exporting_a_snapshot(self):
         with mock.patch("ameesh.config.load"), mock.patch("ameesh.db.connect") as connect, \
                 mock.patch.object(decisions, "human_session", side_effect=decisions.DecisionError("agent context")), \
