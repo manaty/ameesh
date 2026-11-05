@@ -37,7 +37,7 @@ ROWS = [{"name": name, "canon": "home"} for name in CARDS]
 def critical_names(cfg, canons, rows=ROWS):
     with mock.patch.object(host_lifecycle.work, "configured_canons",
                            return_value=list(canons)), \
-            mock.patch.object(host_lifecycle.registry, "overview",
+            mock.patch.object(host_lifecycle.registry, "critical_rows",
                               return_value=list(rows)):
         return host_lifecycle.critical_names(cfg, None)
 

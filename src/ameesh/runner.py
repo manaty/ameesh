@@ -1899,7 +1899,13 @@ class AgentWorker(threading.Thread):
         écrire personne (jamais un pilote d'une autre équipe par défaut)."""
         try:
             from . import alert_briefs, projects as projects_mod
-            listing = registry.overview(self.db)
+            # #5982 : seuls les champs de routage sont lus ; `overview()`
+            # joignait le courrier, les baux et l'état du canon de tout le
+            # registre pour choisir un pilote. Un exécuteur médié n'a que
+            # l'annuaire réduit du contrat 1.1 (`agents.overview`) : il garde
+            # cette lecture, la seule que son stockage distant admet.
+            listing = (registry.overview(self.db) if storage.is_remote(self.db)
+                       else registry.routing_rows(self.db))
             row = next((r for r in listing if r.get("name") == self.name),
                        self.agent or {})
             by_name = {r["name"]: r for r in listing}
@@ -14601,12 +14607,16 @@ class Runner:
 
     def served_rows(self, db) -> list[dict]:
         """The agents this runner leads: this host, mode `execute`, not
-        stopped, within `--agents`."""
-        return [r for r in registry.overview(db)
-                if (r.get("host") or "") == self.host
-                and (r.get("mode") or "execute") == "execute"
-                and r.get("status") != "stopped"
-                and (self.agents_filter is None or r["name"] in self.agents_filter)]
+        stopped, within `--agents`.
+
+        #5982 : l'hôte, le mode et l'arrêt sont filtrés par la lecture étroite
+        du registre ; `--agents` reste l'admission de cet exécuteur."""
+        if storage.is_remote(db):
+            # L109 : l'annuaire réduit du contrat 1.1 ne porte ni hôte ni
+            # harnais ; l'ancien filtre n'y rendait déjà aucun agent.
+            return []
+        return [r for r in registry.served_agents(db, self.host)
+                if self.agents_filter is None or r["name"] in self.agents_filter]
 
     def harness_version(self, harness: str | None) -> str | None:
         """CTX-03b : la version du binaire de ``harness`` enregistrée pour cet

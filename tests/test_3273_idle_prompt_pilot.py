@@ -50,7 +50,7 @@ class IdlePilotTest(TestCase):
     def pilot_of(self, name, listing=None):
         def pilots(project, listing, **_kw):
             return list(self.PILOTS.get(project, []))
-        with mock.patch.object(registry, "overview",
+        with mock.patch.object(registry, "routing_rows",
                                return_value=listing or self.LISTING), \
                 mock.patch.object(alert_briefs, "project_pilots", side_effect=pilots):
             return runner.AgentWorker._idle_pilot(_worker(name))
@@ -74,7 +74,7 @@ class IdlePilotTest(TestCase):
     def test_no_cross_project_fallback_with_the_real_pilot_router(self):
         listing = [{"name": "ameesh-dev2", "projects": ["ameesh"]},
                    {"name": "orchestrateur", "projects": ["nexlink"]}]
-        with mock.patch.object(registry, "overview", return_value=listing), \
+        with mock.patch.object(registry, "routing_rows", return_value=listing), \
                 mock.patch("ameesh.sous_utilisation.alert_orchestrators",
                            return_value=["orchestrateur"]):
             pilot = runner.AgentWorker._idle_pilot(_worker("ameesh-dev2"))
@@ -85,14 +85,28 @@ class IdlePilotTest(TestCase):
         listing = [{"name": "both", "projects": ["other", "ameesh"]},
                    {"name": "mesh-design", "projects": ["ameesh"]},
                    {"name": "orchestrateur", "projects": ["nexlink"]}]
-        with mock.patch.object(registry, "overview", return_value=listing), \
+        with mock.patch.object(registry, "routing_rows", return_value=listing), \
                 mock.patch("ameesh.sous_utilisation.alert_orchestrators",
                            return_value=["orchestrateur", "mesh-design"]):
             self.assertEqual(runner.AgentWorker._idle_pilot(_worker("both")), "mesh-design")
 
     def test_an_unreadable_registry_writes_to_nobody(self):
-        with mock.patch.object(registry, "overview", side_effect=RuntimeError("db down")):
+        with mock.patch.object(registry, "routing_rows", side_effect=RuntimeError("db down")):
             self.assertEqual(runner.AgentWorker._idle_pilot(_worker("ameesh-dev2")), "")
+
+    def test_a_mediated_executor_keeps_its_reduced_directory(self):
+        # #5982 : le contrat 1.1 ne sert que `agents.overview` (annuaire
+        # réduit) ; l'exécuteur médié garde donc cette lecture.
+        def pilots(project, listing, **_kw):
+            return list(self.PILOTS.get(project, []))
+
+        with mock.patch.object(registry, "overview", return_value=self.LISTING), \
+                mock.patch.object(registry, "routing_rows",
+                                  side_effect=AssertionError("lecture locale")), \
+                mock.patch("ameesh.storage.is_remote", return_value=True), \
+                mock.patch.object(alert_briefs, "project_pilots", side_effect=pilots):
+            self.assertEqual(runner.AgentWorker._idle_pilot(_worker("ameesh-dev2")),
+                             "mesh-design")
 
 
 
@@ -113,7 +127,7 @@ class IdleSpecTest(t1270.TourDeRepriseTest):
     def _idle_pick(self, projects):
         w, listing = self._idle_worker(projects)
         pilots = {"ameesh": ["mesh-design"], "nexlink": ["orchestrateur"]}
-        with mock.patch.object(registry, "overview", return_value=listing), \
+        with mock.patch.object(registry, "routing_rows", return_value=listing), \
                 mock.patch.object(alert_briefs, "project_pilots",
                                   side_effect=lambda p, l, **kw: list(pilots.get(p, []))):
             self.assertTrue(w.idle_due())

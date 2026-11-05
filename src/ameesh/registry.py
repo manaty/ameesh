@@ -162,6 +162,32 @@ def overview(db: Db) -> list[dict]:
     return storage.of(db).agents.overview()
 
 
+def critical_rows(db: Db) -> list[dict]:
+    """#5982 : `name` et `canon` seuls, pour `host_lifecycle.critical_names`.
+
+    Le verdict critique se calcule sur les fiches du canon, pas en SQL ; la vue
+    complète n'apportait rien d'autre et coûtait 1 à 3,3 s sous charge, toutes
+    les 60 s par exécuteur."""
+    return storage.of(db).agents.critical_rows()
+
+
+def served_agents(db: Db, host: str) -> list[dict]:
+    """#5982 : `name`, `harness`, `mode` des agents que `host` mène.
+
+    `Runner.served_rows` n'a besoin que de ces trois colonnes ; la vue
+    complète y joignait le courrier et le canon de tout le registre."""
+    return storage.of(db).agents.served_agents(host)
+
+
+def routing_rows(db: Db) -> list[dict]:
+    """#5982 : champs de routage du pilote au repos (`_idle_pilot`).
+
+    `name`, `canon`, `mode`, `projects`, `team`, `chantier` : ceux que lisait
+    `alert_briefs.project_pilots` dans la vue complète (`workstream` ne faisait
+    pas partie de ses colonnes)."""
+    return storage.of(db).agents.routing_rows()
+
+
 def runner_seen(db: Db, host: str, owner: str, names: Sequence[str] | None) -> None:
     """Preuve de vie du runner, indépendante du bail (#508)."""
     storage.of(db).agents.runner_seen(host, owner, names)

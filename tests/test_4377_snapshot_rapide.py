@@ -78,7 +78,7 @@ class CriticalNamesCanonsTest(unittest.TestCase):
     def test_given_canons_are_not_read_again(self):
         cfg = config.Config()
         with mock.patch.object(work, 'configured_canons') as load, \
-                mock.patch('ameesh.registry.overview', return_value=[]), \
+                mock.patch('ameesh.registry.critical_rows', return_value=[]), \
                 mock.patch('ameesh.sous_utilisation.critical_memory', return_value={}):
             host_lifecycle.critical_names(cfg, 'db', canons=[])
             load.assert_not_called()
