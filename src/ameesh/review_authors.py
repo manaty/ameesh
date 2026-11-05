@@ -642,17 +642,29 @@ def commits_written_by(repo: str, commits: Sequence[str], name: str,
     return None if found is None else bool(found)
 
 
-def actor_family(db, actor: str, at_ts: float, families) -> str:
+class JournalUnreadable(Exception):
+    """#5965 : le journal des tours n'a pas pu être lu (≠ famille absente)."""
+
+
+def actor_family(db, actor: str, at_ts: float, families, *,
+                 strict: bool = False) -> str:
     """La famille de session d'un acteur à l'instant d'un fait, ou "".
 
     `turn_costs` est la seule trace du harnais qui a réellement tourné ; une
     ligne écrite à la fin du tour couvre le commit qui vient d'être créé
-    (`contains=True`, la fenêtre de `review_lot._turns_harness`)."""
+    (`contains=True`, la fenêtre de `review_lot._turns_harness`).
+
+    #5965 : `strict=True` lève `JournalUnreadable` quand le journal est
+    illisible, pour que l'appelant nomme cette cause au lieu d'une provenance
+    absente ; par défaut le doute reste "" (famille inconnue)."""
     if not actor or not at_ts:
         return ""
     try:
         harness = review_lot._turns_harness(db, actor, float(at_ts))
-    except Exception:  # noqa: BLE001 - journal illisible : famille inconnue
+    except Exception as exc:  # noqa: BLE001 - journal illisible : famille inconnue
+        if strict:
+            raise JournalUnreadable("turn journal unreadable for %s: %s"
+                                    % (actor, exc)) from exc
         return ""
     return _family(harness, families)
 
@@ -820,7 +832,8 @@ def _unreceived_role(actor: str, author_name: str, reviewers) -> str:
 def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
                         author_name: str, author_family: str, reviewers,
                         families, provider=None, carry_receipts: bool = True,
-                        cache: Optional[dict] = None) -> tuple[list, list]:
+                        cache: Optional[dict] = None,
+                        strict_journal: bool = False) -> tuple[list, list]:
     """`(lignes, inconnus)` d'un commit sans reçu exact (#2721/#3805).
 
     Chaque ligne est `{name, family, role, proof}` ; `role` vaut `reference`,
@@ -836,7 +849,7 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
     report des gels antérieurs couvre déjà le contenu qui survit (#2924), et
     une plage historique peut avoir beaucoup de commits sans reçu. `cache`
     partage la liste des candidats d'un auteur entre les copies d'une même
-    lecture.
+    lecture. `strict_journal=True` laisse passer `JournalUnreadable` (#5965).
     """
     committer, committer_stamp = commit_actor(repo, sha, db)
     git_author, author_stamp = commit_author(repo, sha, db)
@@ -873,7 +886,8 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
         for actor, stamp in ((committer, committer_stamp),
                              (git_author, author_stamp)):
             role = _unreceived_role(actor, author_name, reviewers)
-            proven = actor_family(db, actor, stamp, families)
+            proven = actor_family(db, actor, stamp, families,
+                                  strict=strict_journal)
             if role == "reference" and not proven:
                 proven = author_family
             if role == "third" and not proven:
@@ -891,7 +905,8 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
     role = _unreceived_role(actor, author_name, reviewers)
     if role != "reference" and not _registered(db, actor):
         return [], [sha[:12]]
-    proven = actor_family(db, actor, stamp, families)
+    proven = actor_family(db, actor, stamp, families,
+                          strict=strict_journal)
     if role == "third" and not proven:
         # #2721 : un tiers non relecteur sans reçu ni famille prouvée reste
         # inconnu. #5880 : un agent du registre dont le journal des tours

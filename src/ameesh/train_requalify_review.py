@@ -163,11 +163,16 @@ def _qualify_range(cfg, db, spec, pin, gate, changed, references, *,
                 for item in source_items:
                     if not item:
                         continue
-                    rows, unknown = review_authors._unreceived_authors(
-                        db, item, spec.canon, commit,
-                        author_name=item.get("assignee") or "", author_family="",
-                        reviewers=item.get("reviewers") or [], families=families,
-                        carry_receipts=False)
+                    try:
+                        rows, unknown = review_authors._unreceived_authors(
+                            db, item, spec.canon, commit,
+                            author_name=item.get("assignee") or "", author_family="",
+                            reviewers=item.get("reviewers") or [], families=families,
+                            carry_receipts=False, strict_journal=True)
+                    except review_authors.JournalUnreadable as exc:
+                        # #5965: an unreadable journal is not a missing proof.
+                        raise TrainError("canon author provenance unreadable for %s: %s"
+                                         % (commit, exc)) from exc
                     if rows and not unknown and all(row.get("family") for row in rows):
                         authors.extend(rows)
                         break
