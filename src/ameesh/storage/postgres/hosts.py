@@ -118,6 +118,7 @@ def _reading(row: dict) -> dict:
 #: colonnes d'une ressource de tour
 TURN_COLUMNS = (
     "id, turn_id, agent, host, pgid, label, containers, cgroup, "
+    "memory_peak_bytes, cpu_usage_usec, "
     "extract(epoch from started_at)::float8 AS started_ts, "
     "extract(epoch from ended_at)::float8 AS ended_ts, status"
 )
@@ -258,6 +259,11 @@ class Hosts(interface.HostResources):
              reading.get("app_cpu"), reading.get("app_cpu"), free_mem,
              sampled_ts if reading.get("app_cpu") is not None else None,
              sampled_ts if reading.get("app_cpu") is not None else None))
+        from . import sizing_history
+        from datetime import datetime, timezone
+        day = datetime.fromtimestamp(sampled_ts, timezone.utc).date().isoformat()
+        sizing_history.refresh_host(self.db, reading.get("host") or "", day)
+        sizing_history.prune(self.db)
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage
         # et la table ne doit pas grandir sans fin. Les tranches suivent la
         # même rétention.
@@ -499,6 +505,25 @@ class TurnResources(interface.TurnResources):
             "UPDATE turn_resources SET cgroup = %s WHERE turn_id = %s RETURNING id",
             (None if cgroup is None else str(cgroup), turn_id),
         )
+
+    def record_usage(self, turn_id, *, memory_peak_bytes, cpu_usage_usec) -> None:
+        from . import sizing_history
+        for value in (memory_peak_bytes, cpu_usage_usec):
+            if value is not None and (not isinstance(value, int) or value < 0):
+                raise ValueError("cgroup counters must be nonnegative integers")
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT host, (started_at AT TIME ZONE 'UTC')::date::text AS day "
+                            "FROM turn_resources WHERE turn_id = %s", (turn_id,))
+            if not rows:
+                return
+            host, day = rows[0]["host"], rows[0]["day"]
+            Hosts._lock_gate(tx, host)
+            tx.execute("UPDATE turn_resources SET memory_peak_bytes = "
+                       "coalesce(%s::bigint, memory_peak_bytes), cpu_usage_usec = "
+                       "coalesce(%s::bigint, cpu_usage_usec) WHERE turn_id = %s",
+                       (memory_peak_bytes, cpu_usage_usec, turn_id))
+            sizing_history.refresh_turns(tx, host, day)
+            sizing_history.prune(tx)
 
     def close_turn(self, turn_id, *, orphan, containers=None) -> None:
         self.db.query(
