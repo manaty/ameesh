@@ -5063,6 +5063,7 @@
    "handoffs": [
     "active",
     "begin_effect",
+    "cancel_unused",
     "cancellation_guard",
     "controller",
     "cooling",

@@ -166,7 +166,7 @@ class OperatorTest(unittest.TestCase):
                     mock.patch.object(handoffs, 'advance') as advance, \
                     mock.patch.object(handoffs, 'cancel') as cancel, \
                     mock.patch.object(handoffs, 'retry') as retry:
-                for command in ('advance', 'cancel', 'retry'):
+                for command in ('advance', 'retry'):
                     with self.subTest(command=command):
                         with self.assertRaisesRegex(ValueError, '^handoff step refused;') as caught:
                             self.invoke(command)
@@ -174,9 +174,13 @@ class OperatorTest(unittest.TestCase):
                         failure = caught.exception.__context__.__context__
                         self.assertIsInstance(failure, module.FactoryError)
                         self.assertEqual(str(failure), 'document:enrollment')
+                # #5864: cancel runs without an adapter; handoffs.cancel closes an
+                # expired unused plan or refuses ADAPTER_UNAVAILABLE by name.
+                cancel.return_value = {'id': 'op', 'state': 'cancelled'}
+                self.invoke('cancel')
                 self.assertEqual(load.call_args_list, [mock.call(source)] * 3)
                 advance.assert_not_called()
-                cancel.assert_not_called()
+                self.assertIsNone(cancel.call_args.args[2])
                 retry.assert_not_called()
 
     def test_unauthorized_never_loads_factory_or_reads_operation(self):
