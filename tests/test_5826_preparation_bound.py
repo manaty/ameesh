@@ -9,11 +9,12 @@ from unittest import mock
 from ameesh import registry
 from ameesh.runner import AgentWorker
 
-from tests.test_5806_preparation_heartbeat import Clock, PreparationHeartbeatTest
+from tests import test_5806_preparation_heartbeat as t5806
+from tests.test_5806_preparation_heartbeat import Clock
 
 
 class PreparationBoundTest(unittest.TestCase):
-    worker = PreparationHeartbeatTest.worker
+    worker = t5806.PreparationHeartbeatTest.worker
 
     def test_stuck_preparation_is_abandoned_and_lease_released(self):
         clock = Clock()
