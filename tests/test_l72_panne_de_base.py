@@ -98,6 +98,17 @@ class PanneDeBaseTest(PgTestCase):
         runner.lease_ttl = ttl
         lease = registry.claim(self.db, name, runner.runner_id, ttl)
         self.assertTrue(lease)
+        # #5849 : une panne de base touche aussi les nouvelles connexions du
+        # battement ; couper seulement l'enveloppe de sondage ne suffit plus.
+        connect = db_mod.connect
+
+        def connect_during_outage(*args, **kwargs):
+            self.pdb._garde()
+            return connect(*args, **kwargs)
+
+        patch = mock.patch.object(db_mod, "connect", side_effect=connect_during_outage)
+        patch.start()
+        self.addCleanup(patch.stop)
         return AgentWorker(runner, registry.get(self.db, name), lease)
 
     def _lance(self, worker) -> threading.Thread:
