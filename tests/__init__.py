@@ -20,3 +20,11 @@ if _tmpdir != tempfile.gettempdir():
 # un drapeau de module, pas une variable : des tests vident l'environnement.
 from ameesh import grep_cache as _grep_cache  # noqa: E402
 _grep_cache.ENABLED = False
+
+# #5804 : le banc garde le HOME du poste (L142), pas son état d'exploitation.
+# Une attestation de fixture matérialisée dans
+# `~/.local/state/ameesh/mise-a-jour` a fait refuser le coupeur (#5748) ;
+# toute écriture d'un test sous `mise-a-jour/` ou `release/` échoue désormais
+# au moment du geste (tests/test_5804_real_state_guard.py).
+from . import state_guard as _state_guard  # noqa: E402
+_state_guard.install()
