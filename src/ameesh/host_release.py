@@ -14,9 +14,12 @@ no cluster or cloud credential.
   that was actually released, a *new* reading must also exist (the VM booted);
   a host that was only draining accepts a fresh post-withdrawal reading;
 * runs: they come from the host measure of part A (#4147, §2.1), never from
-  the hook (`busy`, `draining`, `idle-drained` only, owner decision §3.3). A
-  missing or placeholder run source is unknown, never zero, and forbids both
-  the automatic drain and the idle-drained proof; the scanner reports it;
+  the hook (`busy`, `draining`, `idle-drained` only, owner decision §3.3).
+  A host declares them through `runs_interface` (Host card or the
+  `runs_interfaces` configuration, #5905): `none` makes zero a known count.
+  An undeclared host keeps a placeholder source that is unknown, never zero,
+  and forbids both the automatic drain and the idle-drained proof; the
+  scanner reports it (`host_release_no_runs`);
 * failures keep the previous acknowledged state and the closed claims, and
   raise `host_release_failed` / `host_release_overdue`.
 
@@ -40,7 +43,7 @@ STATES = ("busy", "draining", "idle-drained")
 #: bounded text kept from a hook
 DETAIL_MAX = 400
 #: a run count is usable only when A published a real source
-RUNS_UNKNOWN_SOURCES = ("", "aucune interface de déclaration", "inconnue")
+RUNS_UNKNOWN_SOURCES = ("", host_idle.RUNS_UNDECLARED, "inconnue")
 
 
 def _bounded(text, limit=DETAIL_MAX):
@@ -174,7 +177,8 @@ def runs_evidence(footprint):
 
     #4148 guard: the adapter does not declare runs (owner decision §3.3).
     A's placeholder `runs=0` with `aucune interface de déclaration` is NOT a
-    measurement of zero; until #4147 publishes a source it stays unknown."""
+    measurement of zero: it stays unknown until the host declares a
+    `runs_interface` (#5905)."""
     footprint = footprint or {}
     source = str(footprint.get("runs_source") or "")
     runs = footprint.get("runs")
@@ -804,7 +808,7 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                       host, int(now - requested), int(cfg.host_release_drain_bound),
                       control.get("release_state"), control.get("hook_state") or "none",
                       "open" if control.get("claims_open") else "closed",
-                      "unknown until #4147 publishes a run source",
+                      "unknown unless the host declares runs_interface",
                       "Agents: %s." % (", ".join(agents) or "none"),
                       ", ".join(leases) or "none", host))
         out.append(_alert("host_release_overdue", None, requested,
@@ -830,13 +834,15 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
             continue
         host = lock["host"]
         detail = ("Host %s is idle and classified burst, but its run count is "
-                  "unknown (%s): the A host measure publishes no run source yet, so "
-                  "the automatic release is refused (a run would be killed). Follow "
-                  "#4147: expose runs in the host measure; until then no automatic "
-                  "drain of a burst host. The lifecycle adapter is configured and "
-                  "not at fault." % (
+                  "unknown (%s): the host declares no runs_interface, so the "
+                  "automatic release is refused (a run would be killed). Declare "
+                  "it on the Host card (`policy.runs_interface: none`) or in the "
+                  "configuration (`runs_interfaces`) once nothing runs there "
+                  "outside turns and leases (#5905, #4147); until then no "
+                  "automatic drain of a burst host. The lifecycle adapter is "
+                  "configured and not at fault." % (
                       host, lock.get("blocked_source")
-                      or "aucune interface de déclaration"))
+                      or host_idle.RUNS_UNDECLARED))
         out.append(_alert("host_release_no_runs", None, since,
                           max(0.0, now - since), 0.0, detail,
                           host=host, runs_source=lock.get("blocked_source"),

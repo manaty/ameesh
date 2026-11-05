@@ -326,6 +326,9 @@ class Config:
     #: release. The command also answers the read-only `runs <host>` verb.
     lifecycle_hook: str = ""
     lifecycle_hooks: dict = field(default_factory=dict)
+    #: #5905: per-host run declaration `{host: "none"}`; wins over the Host
+    #: card's `policy.runs_interface`. Undeclared = runs unknown.
+    runs_interfaces: dict = field(default_factory=dict)
     #: a hook that has not answered within this delay is a failure (seconds)
     lifecycle_hook_timeout: float = 300.0
     #: how often the expensive idle projection runs for a host (seconds); the
@@ -1336,6 +1339,16 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
         if (not isinstance(command, str) or not command.strip()
                 or "\x00" in command or len(command.strip()) > 1000):
             raise SystemExit("invalid lifecycle_hooks[%s]: a command line expected" % host)
+    interfaces = cfg.runs_interfaces
+    if not isinstance(interfaces, dict):
+        raise SystemExit("invalid runs_interfaces: an object {host: interface} expected")
+    from .host_idle import RUNS_INTERFACES
+    for host, value in interfaces.items():
+        if not isinstance(host, str) or not NAME_RE.match(host):
+            raise SystemExit("invalid runs_interfaces host: %r" % (host,))
+        if value not in RUNS_INTERFACES:
+            raise SystemExit("invalid runs_interfaces[%s]: one of %s expected"
+                             % (host, ", ".join(RUNS_INTERFACES)))
     if not 30 <= cfg.host_release_interval <= 86400:
         raise SystemExit("invalid AMEESH_HOST_RELEASE_INTERVAL: 30..86400 seconds expected")
     if not 10 <= cfg.lifecycle_hook_timeout <= 3600:
