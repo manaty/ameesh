@@ -238,7 +238,7 @@ class RunsOnTest(unittest.TestCase):
         self.assertEqual(set(self.linux), {"plan", "qualification", "psycopg",
                                            "psql", "doc-readers", "bilan",
                                            "version", "tests", "fs-class",
-                                           "profil-nu"})
+                                           "profil-nu", "preflight-n1"})
         # #1256 x #1468 : `bilan` (hors de la clôture du check requis,
         # continue-on-error) porte, après le pool prioritaire, le repli vers
         # l'hôte prêté quand un prêt est armé ; tous les autres jobs Linux

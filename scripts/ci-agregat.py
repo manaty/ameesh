@@ -264,7 +264,8 @@ def _job_stats(jobs, expected):
 
 def _classify_qualified(*, event, ref, plan, version, version_only, docs_only,
                         doc_readers, psycopg, psycopg_parts, psql, psql_parts,
-                        platform_macos, fs_class, packet, head, tree) -> dict:
+                        platform_macos, fs_class, packet, head, tree,
+                        preflight_n1=None) -> dict:
     """#5729 : le push de main réutilise la suite complète du paquet.
 
     Vert seulement si la preuve est complète **et** qu'aucune part n'a été
@@ -287,7 +288,8 @@ def _classify_qualified(*, event, ref, plan, version, version_only, docs_only,
     for name, value in (("psycopg", psycopg), ("psql", psql),
                         ("doc-readers", doc_readers),
                         ("plateforme macOS", platform_macos),
-                        ("autre système de fichiers", fs_class)):
+                        ("autre système de fichiers", fs_class),
+                        ("préflight N-1", preflight_n1)):
         if _state(value) not in ("skipped", ""):
             problems.append("%s %s (aucune part n'était due)"
                             % (name, _state(value) or "absent"))
@@ -313,7 +315,7 @@ def _classify_qualified(*, event, ref, plan, version, version_only, docs_only,
 
 def classify(*, event, plan, version, version_only, docs_only, doc_readers,
              psycopg, psycopg_parts, psql, psql_parts,
-             platform_macos=None, fs_class=None,
+             platform_macos=None, fs_class=None, preflight_n1=None,
              psycopg_jobs=None, psql_jobs=None, psql_full=False,
              ref="", qualified=False, qualified_packet="",
              qualified_head="", qualified_tree="") -> dict:
@@ -439,7 +441,7 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
             doc_readers=doc_readers, psycopg=psycopg,
             psycopg_parts=psycopg_parts, psql=psql, psql_parts=psql_parts,
             platform_macos=platform_macos, fs_class=fs_class,
-            packet=qualified_packet, head=qualified_head,
+            preflight_n1=preflight_n1, packet=qualified_packet, head=qualified_head,
             tree=qualified_tree)
     plan_state = _state(plan)
     if plan_state != "success":
@@ -498,6 +500,12 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
         # release (ou à la main) ; sautée ailleurs, elle n'a rien à prouver.
         add("autre système de fichiers", fs_class, "", skipped_ok=True,
             required=False)
+    if preflight_n1 is not None:
+        # #5947 : le préflight de vm.sh contre le CLI de la release
+        # précédente. Un rouge est un négatif ; une annulation se consigne
+        # (§3) ; sauté, il n'avait rien à prouver (voie sans code, arbre
+        # qualifié).
+        add("préflight N-1", preflight_n1, "", skipped_ok=True, required=False)
 
     # Décision #128512 : « agrégat requis jamais conclu = preuve absente, donc
     # bloquant ». #3449 : une famille Linux sans part réussie est déjà une
@@ -691,6 +699,7 @@ def _parse(argv=None) -> argparse.Namespace:
                         help="nocturne psql (#3749) : psycopg sans part admise")
     parser.add_argument("--plateforme-macos", dest="platform_macos", default=None)
     parser.add_argument("--autre-fs", dest="fs_class", default=None)
+    parser.add_argument("--preflight-n1", dest="preflight_n1", default=None)
     parser.add_argument("--ref", default="", help="github.ref du run")
     parser.add_argument("--qualified", default="false",
                         help="true: le push main réutilise l'arbre qualifié du "
@@ -722,7 +731,7 @@ def main(argv=None, gh=None, jobs=None) -> int:
             psycopg=args.psycopg, psycopg_parts=args.psycopg_parts,
             psql=args.psql, psql_parts=args.psql_parts,
             platform_macos=args.platform_macos, fs_class=args.fs_class,
-            psycopg_jobs=psycopg_jobs, psql_jobs=psql_jobs,
+            preflight_n1=args.preflight_n1, psycopg_jobs=psycopg_jobs, psql_jobs=psql_jobs,
             psql_full=args.psql_full, ref=args.ref,
             qualified=args.qualified,
             qualified_packet=args.qualified_packet,
