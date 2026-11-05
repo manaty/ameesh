@@ -3434,10 +3434,11 @@ def lot_author(lot: int, repo: Path) -> str:
 
 def remember_unit_red(repo: Path, lot: int, source: str, target: str,
                       tests: list[str], sender: str | None, *, base=None) -> bool:
-    """#5971 : note durable avant recomposition ; False si déjà signalé.
+    """#5971 : note durable par base avant recomposition ; False si déjà signalé.
 
     Ne jamais réarmer la borne d'une tête expirée : la première note reste
-    l'origine de l'exclusion, même si un nouvel essai rougit encore.
+    l'origine de l'exclusion sur cette base, même si un nouvel essai rougit encore.
+    Une nouvelle base a sa propre borne, sans deuxième courrier par source/cible.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
     from ameesh import config, db, packet_unit_red

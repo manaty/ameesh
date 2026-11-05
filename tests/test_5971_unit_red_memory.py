@@ -40,6 +40,22 @@ class SelectionTest(unittest.TestCase):
         memory.apply(rows, [event()], now=160, base=Y)
         self.assertFalse(rows[0]['ready'])  # legacy note: bounded fallback
 
+    def test_new_red_on_new_base_is_excluded_without_rearming_that_base(self):
+        b1 = dict(event(stamp=100), note=memory.note(X, 'main', ['tests.b1'], base=X))
+        b2 = dict(event(stamp=200), note=memory.note(X, 'main', ['tests.b2'], base=Y))
+        repeated = dict(b2, created_ts=300)
+        for notes, base, now, ready in (
+                ([b1], X, 160, False),
+                ([b1], Y, 160, True),
+                ([b1, b2], Y, 260, False),
+                ([repeated, b1, b2], Y, 200 + memory.EXCLUSION_S, True)):
+            rows = [candidate()]
+            memory.apply(rows, notes, now=now, base=base)
+            self.assertEqual(rows[0]['ready'], ready)
+        rows = [candidate()]
+        memory.apply(rows, [b1, b2], now=260, base=Y)
+        self.assertIn('tests.b2', rows[0]['causes'][0]['detail'])
+
     def test_exclusion_names_its_expiry_for_the_ready_list_and_watch(self):
         from ameesh import packet_watch
         rows = [candidate()]
@@ -100,6 +116,29 @@ from .support import PgTestCase
 
 
 class DurableMemoryTest(PgTestCase):
+    def test_new_base_records_a_new_red_but_does_not_notify_again(self):
+        from ameesh import storage
+        lot = self.db.query("INSERT INTO work_items (title, state) VALUES (%s, 'qa') RETURNING id",
+                            ('new base red',))[0]['id']
+        def records():
+            return storage.of(self.db).progress.lot_hold_events([lot], [memory.PATTERN])
+        def ready(base, now):
+            row = dict(candidate(), work_item=lot)
+            memory.apply([row], records(), base=base, now=now)
+            return row['ready']
+        self.assertTrue(memory.remember(self.db, lot, X, 'main', ['tests.b1'], base=X))
+        now = records()[0]['created_ts'] + 1
+        self.assertFalse(ready(X, now))
+        self.assertTrue(ready(Y, now))
+        self.assertFalse(memory.remember(self.db, lot, X, 'main', ['tests.b2'], base=Y))
+        self.assertFalse(ready(Y, now))
+        self.assertFalse(memory.remember(self.db, lot, X, 'main', ['tests.repeated'], base=Y))
+        notes = [memory.read_note(row['note']) for row in records()]
+        self.assertEqual(len(notes), 2)
+        self.assertEqual({row['base'] for row in notes}, {X, Y})
+        expiry = max(row['created_ts'] for row in records()) + memory.EXCLUSION_S
+        self.assertTrue(ready(Y, expiry))
+
     def test_record_survives_another_reader_and_more_than_a_hundred_events(self):
         from ameesh import storage
         lot = self.db.query("INSERT INTO work_items (title, state) VALUES (%s, 'qa') RETURNING id",

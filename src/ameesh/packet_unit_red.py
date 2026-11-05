@@ -2,8 +2,9 @@
 """#5971 : mémoire bornée des sources retirées pour tests par unité rouges.
 
 Une note sur le lot survit au porteur et au clone du composeur. La première
-note d'une source/cible donne au plus une heure d'exclusion ; les retraits
-répétés ne renouvellent ni cette borne ni la notification. Une source neuve
+note d'une source/cible/base donne au plus une heure d'exclusion ; les retraits
+répétés sur la même base ne renouvellent pas cette borne. Le courrier
+reste unique par source/cible, même si la base change. Une source neuve
 ou une nouvelle tête de la cible est admise immédiatement. Les non-concluants ne passent pas par ce chemin :
 paquet-auto ne les retire pas (§3). La borne protège aussi contre un rouge
 initialement attribué au code qui se révèle ensuite instable ou lié au banc.
@@ -60,16 +61,15 @@ def apply(candidates, events, *, now=None, base=None):
         stamp = event.get('created_ts')
         if value is None or not isinstance(stamp, (int, float)):
             continue
-        key = (int(event['work_item_id']), value['source'], value['target'])
+        key = (int(event['work_item_id']), value['source'], value['target'], value.get('base'))
         if key not in first or stamp < first[key][0]:
             first[key] = (stamp, value)
     for entry in candidates:
-        prior = first.get((entry['work_item'], entry.get('source'), entry.get('target')))
+        identity = (entry['work_item'], entry.get('source'), entry.get('target'))
+        prior = first.get((*identity, base)) or first.get((*identity, None))
         if not entry.get('ready') or prior is None:
             continue
         stamp, value = prior
-        if base and value.get("base") and value["base"] != base:
-            continue
         if now >= stamp + EXCLUSION_S:
             continue
         until = datetime.datetime.fromtimestamp(
@@ -83,7 +83,11 @@ def apply(candidates, events, *, now=None, base=None):
 
 
 def remember(db, lot, source, target, tests, *, actor='', base=None):
-    """Une note et une seule notification par tête, sous verrou du lot.
+    """Une note par source/cible/base, une notification par source/cible.
+
+    Rend True seulement si le premier courrier doit être envoyé ; False peut
+    accompagner une nouvelle note sur une autre base. Le verrou du lot couvre
+    la déduplication de ces deux identités.
 
     Lecture ciblée de tout l'historique des marqueurs : work show est limité
     aux cent derniers événements et ne suffit pas pour cette déduplication.
@@ -94,9 +98,12 @@ def remember(db, lot, source, target, tests, *, actor='', base=None):
         st = storage.of(tx)
         if st.work.lock(lot) is None:
             raise work.WorkError('lot %s not found' % lot)
+        seen_source = False
         for event in st.progress.lot_hold_events([lot], [PATTERN]):
             value = read_note(event.get('note'))
             if value and value['source'] == source and value['target'] == target:
-                return False
+                seen_source = True
+                if value.get('base') == base:
+                    return False
         work.note(tx, lot, text, actor=actor, once=True)
-    return True
+    return not seen_source
