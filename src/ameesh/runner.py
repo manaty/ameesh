@@ -7920,6 +7920,13 @@ class AgentWorker(threading.Thread):
         if cgroup:
             from .platform import turn_cgroup
             peak = turn_cgroup.memory_peak(cgroup)
+            if recorded and not getattr(self.runner, "mediated", False):
+                try:
+                    storage.of(self.db).turn_resources.record_usage(
+                        turn_id, **turn_cgroup.usage(cgroup))
+                except Exception as exc:
+                    log("[%s] turn %s usage not recorded (%s)"
+                        % (self.name, turn_id[:8], exc))
             started = time.monotonic()
             try:
                 emptied = turn_cgroup.kill(cgroup)

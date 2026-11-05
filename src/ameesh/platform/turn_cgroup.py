@@ -246,6 +246,35 @@ def memory_peak(path: str, *, root_dir: str = CGROUP_ROOT) -> int | None:
     return None
 
 
+def usage(path: str, *, root_dir: str = CGROUP_ROOT) -> dict:
+    """#5921: kernel peak and cumulative CPU microseconds before removal.
+
+    No memory.current fallback: a spot reading cannot stand for a peak.
+    Unsupported, unreadable and malformed counters stay unknown.
+    """
+    result = {"memory_peak_bytes": None, "cpu_usage_usec": None}
+    target = _target(path, root_dir)
+    if target is None:
+        return result
+    try:
+        value = int((target / "memory.peak").read_text().strip())
+        if value >= 0:
+            result["memory_peak_bytes"] = value
+    except (OSError, ValueError):
+        pass
+    try:
+        for line in (target / "cpu.stat").read_text().splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] == "usage_usec":
+                value = int(fields[1])
+                if value >= 0:
+                    result["cpu_usage_usec"] = value
+                break
+    except (OSError, ValueError):
+        pass
+    return result
+
+
 def kill(path: str, *, timeout: float = KILL_TIMEOUT,
          root_dir: str = CGROUP_ROOT) -> bool:
     """`cgroup.kill`, attente bornée de `populated 0`, puis `rmdir`.

@@ -4976,6 +4976,7 @@
     "work_item_of_turn"
    ],
    "turn_resources": [
+    "record_usage",
     "attach_cgroup",
     "begin_grace",
     "churn",

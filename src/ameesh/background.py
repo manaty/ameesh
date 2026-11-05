@@ -639,6 +639,7 @@ class Tracker:
         False si le cgroup est vidé et enlevé. Les zombies adoptés sont
         moissonnés au passage pour les codes de sortie (télémétrie)."""
         from .platform import turn_cgroup
+        self._record_usage(entry)
         try:
             emptied = turn_cgroup.kill(entry.cgroup)
         except Exception as exc:
@@ -890,6 +891,17 @@ class Tracker:
         with self.lock:
             entry.state = state
 
+    def _record_usage(self, entry: Entry) -> None:
+        if not entry.cgroup or getattr(self.runner, "mediated", False):
+            return
+        from .platform import turn_cgroup
+        try:
+            storage.of(self.runner.db).turn_resources.record_usage(
+                entry.turn_id, **turn_cgroup.usage(entry.cgroup))
+        except Exception as exc:
+            self.log("[%s] turn %s usage not recorded (%s)"
+                     % (entry.agent, entry.turn_id[:8], exc))
+
     def _release_resource(self, entry: Entry, survives: bool) -> None:
         from . import menage as menage_mod
         db, runtime = self.runner.db, self.runner.container_runtime()
@@ -900,6 +912,7 @@ class Tracker:
             except Exception:
                 restants = []
         orphelin = bool(restants) or survives or entry.unverified
+        self._record_usage(entry)
         if entry.cgroup and not orphelin:
             # L498 : le cgroup doit avoir été vidé (par `_kill` à l'échéance,
             # ou de lui-même) ; on enlève le répertoire vide. S'il est encore
