@@ -127,6 +127,36 @@ def red_run(*, attribution=True, best=(3801,), status="failure", part="psycopg 1
     return run
 
 
+class FakeLease:
+    """#5941 : le bail de composition d'un banc sans base."""
+
+    def __init__(self, *, owner="paquet-horaire:hote:42:abc", acquired=True,
+                 holder=""):
+        self.owner = owner
+        self.acquired = acquired
+        self.holder = holder
+        self.epoch = 1 if acquired else None
+        self.released = 0
+        self.closed = False
+
+    def acquire(self):
+        if self.acquired:
+            self.epoch = 1
+        return self.acquired
+
+    def release(self):
+        if self.epoch is not None:
+            self.released += 1
+        self.epoch = None
+        return True
+
+    def describe(self):
+        return self.holder or self.owner
+
+    def close(self):
+        self.closed = True
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.shell = FakeShell()
@@ -339,6 +369,80 @@ class ComposeTest(Base):
         self.assertIn("rien composé", ph.tick(self.ctx))
         self.assertTrue(self.shell.ran("work", "close", "4000", "--abandoned"))
         self.assertEqual(self.shell.ran("ci", "run"), [])
+
+
+class CompositionLockTest(Base):
+    """#5941 : le verrou unique, pris après la liste et relu sous le verrou."""
+
+    def test_verrou_pris_apres_la_liste_et_porteur_relu_dessous(self):
+        order = []
+        lease = FakeLease()
+        self.ctx.composition = lambda: order.append("bail") or lease
+        ph.ready_lots = lambda ctx: order.append("candidats") or [3801]
+        fresh = carrier(lot=4444, title="Paquet horaire h-20261027-09 — autre")
+        fresh["branch"] = "integration/paquet-h-20261027-09"
+        calls = {"n": 0}
+
+        def recent(ctx):
+            calls["n"] += 1
+            order.append("recent%d" % calls["n"])
+            return [] if calls["n"] == 1 else [fresh]
+
+        with mock.patch.object(ph, "recent_lots", side_effect=recent):
+            out = ph.tick(self.ctx)
+        self.assertEqual(order, ["recent1", "candidats", "bail", "recent2"])
+        self.assertIn("déjà créé", out)
+        self.assertEqual(self.shell.ran("work", "add"), [])
+        self.assertEqual(lease.released, 1)
+        self.assertTrue(lease.closed)
+
+    def test_verrou_tenu_par_un_autre_composeur_aucun_porteur(self):
+        lease = FakeLease(acquired=False, holder="mty-amh-impl-01:123")
+        self.ctx.composition = lambda: lease
+        out = ph.tick(self.ctx)
+        self.assertIn("composition en cours (mty-amh-impl-01:123)", out)
+        self.assertEqual(self.shell.ran("work", "add"), [])
+        self.assertTrue(lease.closed)
+
+    def test_le_tic_transmet_son_bail_au_work_add(self):
+        lease = FakeLease()
+        self.ctx.composition = lambda: lease
+        self.shell.items[4000] = carrier()
+        ph.tick(self.ctx)
+        add = self.shell.ran("work", "add")[0]
+        self.assertEqual(add[add.index("--composition-owner") + 1], lease.owner)
+        self.assertEqual(lease.released, 1)
+        self.assertTrue(lease.closed)
+
+    def test_refus_du_work_add_arrete_sans_pousser(self):
+        lease = FakeLease()
+        self.ctx.composition = lambda: lease
+        refusal = ph.HoraireError(
+            "création du porteur : rc 1 : error: composition in progress (autre:1): "
+            "no new packet carrier")
+        with mock.patch.object(ph, "_create_carrier", side_effect=refusal):
+            out = ph.tick(self.ctx)
+        self.assertIn("composition en cours : rien de plus créé", out)
+        self.assertFalse([c for c in self.shell.calls
+                          if "paquet-auto.py" in " ".join(c)])
+        self.assertEqual(lease.released, 1)
+
+    def test_bail_rendu_avant_la_composition(self):
+        # Le bail ne couvre que la décision et la création : le garder
+        # pendant paquet-auto le ferait expirer avant le second porteur
+        # d'une paire parallèle (#5941).
+        lease = FakeLease()
+        self.ctx.composition = lambda: lease
+        seen = []
+
+        def attempt(*_args, **_kw):
+            seen.append(lease.epoch)
+            return "composé"
+
+        with mock.patch.object(ph, "attempt", side_effect=attempt):
+            ph.tick(self.ctx)
+        self.assertEqual(seen, [None])
+        self.assertEqual(lease.released, 1)
 
 
 class FollowTest(Base):

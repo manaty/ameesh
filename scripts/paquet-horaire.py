@@ -88,6 +88,12 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    lancée hors du tic est ainsi « en cours » (`composition en cours
    (hôte:pid)`) au lieu de laisser le tic supprimer son worktree vivant ; le
    verrou tombe avec le processus, une tentative morte reste reprise.
+   #5941 : ce `flock` ne voit qu'un **même nom** dans un **même clone**. Le
+   verrou de composition partagé (bail `merge_locks` sur la base) est pris
+   après la lecture des candidats, puis les porteurs sont relus dessous avant
+   la création ; `ameesh work add` prend le même verrou pour un porteur de
+   paquet, si bien que l'agent désigné par l'alerte « créneau manqué » et la
+   minuterie ne peuvent pas créer deux porteurs (h-21/h-22 du 05/11).
    #4501 : la vie d'une tentative sur cet hôte se lit au **pid vivant**, jamais
    à la ligne de commande (une recomposition peut tourner sous un autre nom) ;
    et si une tête poussée du porteur (gelée, ou vue en avance) a une ci-full en
@@ -381,6 +387,10 @@ class Context:
     #: #4361 : la pause active de la cible (`packet_pause`), None sans pause ;
     #: None ici : aucune lecture (tests)
     pause_of: object = None
+    #: #5941 : fabrique le bail de composition (base partagée) ; None dans les
+    #: bancs sans base, où le verrou n'est pas joué. La fabrique est appelée
+    #: après la lecture des candidats, jamais avant (section critique courte).
+    composition: object = None
     #: #4562 : le clone de recomposition a déjà été vérifié (jamais le dossier
     #: de travail d'un agent) ; la CLI le vérifie avant `check_fresh`
     clone_checked: bool = False
@@ -1009,14 +1019,14 @@ def parallel_partition(ctx: Context, ready: list[int]) -> dict | None:
 
 
 def _create_carrier(ctx: Context, name: str, group: list[int], *,
-                    parallel: int) -> int:
+                    parallel: int, composition_owner: str = "") -> int:
     branch = auto.package_branch(name)
     title = "%s%s — composition automatique (§11 bis, §12)" % (TITLE_PREFIX, name)
     detail = ""
     if parallel:
         detail = (" Paquet parallèle #3256 C (%d/%d) : groupe disjoint %s."
                   % (parallel, 2, ", ".join("#%d" % lot for lot in group)))
-    created = ctx.must(
+    cmd = [
         "work", "add", "--title", title, "--type", "evolution",
         "--app", ctx.project, "--assignee", ctx.pilot, "--priority", "1",
         "--branch", branch, "--target", ctx.target,
@@ -1029,7 +1039,14 @@ def _create_carrier(ctx: Context, name: str, group: list[int], *,
         "--body", "Paquet horaire composé sans agent par le composeur horaire "
                   "(#3845) : %d lot(s) prêt(s) à la lecture (%s).%s"
                   % (len(group), ", ".join("#%d" % lot for lot in group), detail),
-        "--actor", ctx.actor, what="création du porteur")
+        "--actor", ctx.actor,
+    ]
+    if composition_owner:
+        # #5941 : le tic tient déjà le verrou de composition ; la création
+        # d'un second porteur de la même paire parallèle est permise parce
+        # que c'est le même composeur, et le propriétaire est vérifié.
+        cmd += ["--composition-owner", composition_owner]
+    created = ctx.must(*cmd, what="création du porteur")
     found = CREATED_RE.search(created.stdout)
     if not found:
         raise HoraireError("porteur créé sans identifiant lisible : %s"
@@ -1037,6 +1054,53 @@ def _create_carrier(ctx: Context, name: str, group: list[int], *,
     carrier = int(found.group(1))
     ctx.say("porteur #%d : %s" % (carrier, title))
     return carrier
+
+
+#: #5941 : débuts des refus de `work add` qui disent « un autre compose » ou
+#: « un porteur réserve déjà la cible ». Le tic s'arrête proprement : ce n'est
+#: pas un échec opérationnel, rien n'a été poussé.
+COMPOSITION_REFUSALS = ("composition in progress", "already reserves",
+                        "composition lock")
+
+
+#: prend le bail de composition pour la section critique « relire les porteurs
+#: → créer le porteur » ; None si le banc n'en fournit pas (tests sans base).
+def _close_lease(lease) -> None:
+    """Referme la connexion du bail ; une fermeture ne juge pas le geste."""
+    try:
+        lease.close()
+    except Exception:  # noqa: BLE001 - le bail expire seul de toute façon
+        pass
+
+
+def _composition_lease(ctx: Context):
+    if ctx.composition is None:
+        return None
+    try:
+        lease = ctx.composition()
+    except Exception as exc:  # noqa: BLE001 - base illisible : aucun geste
+        raise HoraireError("verrou de composition indisponible (%s) : aucun geste"
+                           % exc) from exc
+    try:
+        taken = lease.acquire()
+    except Exception as exc:  # noqa: BLE001 - bail illisible : aucun geste
+        _close_lease(lease)
+        raise HoraireError("verrou de composition illisible (%s) : aucun geste"
+                           % exc) from exc
+    if not taken:
+        try:
+            holder = lease.describe()
+        except Exception as exc:  # noqa: BLE001 - le refus reste un refus
+            holder = "détenteur illisible (%s)" % exc
+        finally:
+            _close_lease(lease)
+        raise _CompositionBusy(holder)
+    ctx.say("verrou de composition pris (%s)" % lease.owner)
+    return lease
+
+
+class _CompositionBusy(HoraireError):
+    """Un autre composeur tient le bail : le tic n'a rien à faire."""
 
 
 def compose(ctx: Context, rows: list[dict]) -> str:
@@ -1064,18 +1128,63 @@ def compose(ctx: Context, rows: list[dict]) -> str:
                     % (index, len(groups), len(group),
                        ", ".join("#%d" % lot for lot in group)))
         return "essai : %d paquet(s)" % len(groups)
-    first: int | None = None
+    # #5941 : le verrou est pris APRÈS la lecture des candidats (elle peut
+    # durer), puis les porteurs sont relus SOUS le verrou : un porteur créé
+    # entre-temps par un autre composeur arrête le tic avant toute écriture.
+    try:
+        lease = _composition_lease(ctx)
+    except _CompositionBusy as busy:
+        return "composition en cours (%s) : rien à faire" % busy
+    created: list[tuple[int, list[int], str, int]] = []
     results: list[str] = []
-    for index, group in enumerate(groups):
-        name = next_name(ctx)
-        # #4329 : une composition du même paquet vit (lancement à la main ou
-        # tick) ; ne pas créer un porteur qu'elle refuserait.
-        holder = composition_in_progress(ctx, name)
-        if holder:
-            results.append("composition en cours (%s)" % holder)
-            continue
-        carrier = _create_carrier(ctx, name, group,
-                                  parallel=(index + 1 if len(groups) == 2 else 0))
+    try:
+        if lease is not None:
+            fresh = recent_lots(ctx)
+            if slot_served(fresh, ctx.now, ctx.zone, ctx.project, ctx.target, ctx):
+                return ("porteur horaire déjà créé dans l'heure, non fusionné : "
+                        "rien à faire")
+            reserved = [row for row in fresh
+                        if is_carrier(row, ctx.project, ctx.target)
+                        and str(row.get("state") or "") in OPEN_STATES]
+            if reserved:
+                return "%s réservée par %s : rien à faire" % (
+                    ctx.target, ", ".join("#%d" % int(row["id"]) for row in reserved))
+        for index, group in enumerate(groups):
+            name = next_name(ctx)
+            # #4329 : une composition du même paquet vit (lancement à la main ou
+            # tick) ; ne pas créer un porteur qu'elle refuserait.
+            holder = composition_in_progress(ctx, name)
+            if holder:
+                results.append("composition en cours (%s)" % holder)
+                continue
+            try:
+                carrier = _create_carrier(
+                    ctx, name, group,
+                    parallel=(index + 1 if len(groups) == 2 else 0),
+                    composition_owner=(lease.owner if lease is not None else ""))
+            except HoraireError as exc:
+                # #5941 : le bail a expiré ou a été pris entre la relecture et
+                # la création ; le premier porteur, s'il existe, reste suivi.
+                if lease is not None and any(marker in str(exc)
+                                             for marker in COMPOSITION_REFUSALS):
+                    results.append("composition en cours : rien de plus créé (%s)"
+                                   % auto._tail(str(exc), 2))
+                    break
+                raise
+            created.append((index, list(group), name, carrier))
+    finally:
+        # #5941 : le bail ne couvre que la décision et la création. La
+        # composition elle-même (paquet-auto, tests par unité) reste tenue par
+        # le `flock` par nom (#4329) ; le garder ici ferait expirer le bail
+        # avant le second porteur d'une paire parallèle.
+        if lease is not None:
+            try:
+                lease.release()
+            except Exception as exc:  # noqa: BLE001 - le TTL libère le bail
+                ctx.say("bail de composition non rendu : %s" % exc)
+            _close_lease(lease)
+    first: int | None = None
+    for index, group, name, carrier in created:
         if len(groups) == 2:
             if index == 0:
                 first = carrier
@@ -1088,7 +1197,8 @@ def compose(ctx: Context, rows: list[dict]) -> str:
         try:
             results.append(attempt(ctx, carrier, name,
                                    Attempt(COMPOSITION, 1, "",
-                                           only=(list(group) if len(groups) == 2 else []))))
+                                           only=(list(group) if len(groups) == 2
+                                                 else []))))
         except HoraireError as exc:
             # The first carrier's journal already records its attempt. Keep
             # composing the independent second group; the next tick resumes it.
@@ -2146,6 +2256,20 @@ def read_pause(project: str, target: str, *, pilot: str = "mesh-design",
             close()
 
 
+def read_composition(project: str):
+    """#5941 : le bail de composition du tic, sur la base partagée.
+
+    Il n'est fabriqué qu'après la lecture des candidats : la connexion reste
+    ouverte le temps de la section critique (relecture des porteurs, création)
+    et `Lease.close` la referme après la restitution.
+    """
+    from ameesh import packet_composition
+    return packet_composition.Lease(
+        _connect(), project,
+        owner=packet_composition.owner("paquet-horaire", socket.gethostname(),
+                                       os.getpid()))
+
+
 def _zone() -> tuple[ZoneInfo, object]:
     from ameesh import config as config_mod, mechanics
     rules = mechanics.configured(config_mod.load())
@@ -2293,7 +2417,10 @@ def main(argv: list[str] | None = None) -> int:
                   dry_run=args.dry_run, zone=zone, epoch=lease_epoch(),
                   unit_tests=unit_tests, parallel=parallel,
                   pause_of=lambda: read_pause(args.project, args.target,
-                                               pilot=args.pilot, notify=not args.dry_run))
+                                               pilot=args.pilot, notify=not args.dry_run),
+                  # #5941 : le verrou partagé avec `ameesh work add` ; la
+                  # fabrique ne se connecte qu'au moment de composer.
+                  composition=lambda: read_composition(args.project))
     try:
         if args.command == "recompose":
             # geste explicite du pilote (#4237) : la pause (#4361) ne vise que le tic

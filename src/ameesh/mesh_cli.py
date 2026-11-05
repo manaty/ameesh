@@ -2176,7 +2176,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
                 note=note,
                 force=args.force,
-                parent_lot=args.parent_lot, footprint=footprint, impact=impact)
+                parent_lot=args.parent_lot, footprint=footprint, impact=impact,
+                composition_owner=args.composition_owner)
             try:
                 item = work.add(db, assignee=args.assignee, **add_kwargs)
             except storage.FootprintOverlap as exc:
@@ -4094,6 +4095,11 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                              "re-reading) actually read; written as `reviewed head: "
                              "<sha>` in the creation note. A review-born %s without it "
                              "is still created, marked `absent` and warned") % v.noun)
+    # #5941 : interne au tic horaire, qui tient déjà le verrou de composition
+    # et crée les deux porteurs d'une paire parallèle (#3256 C). Un autre
+    # appelant prend le verrou par la création elle-même.
+    pw_add.add_argument("--composition-owner", default=None, metavar="OWNER",
+                        help=argparse.SUPPRESS)
     pw_add.set_defaults(func=cmd_work)
     pw_fp = work_sub.add_parser(
         "fingerprint", help=("#3885: one %s per server-failure fingerprint (canon §16), "
