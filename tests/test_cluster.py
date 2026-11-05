@@ -36,6 +36,11 @@ SIGNATURES = {
     # #5921: internal sizing telemetry; no supervisor grants changed.
     "turn_resources": {"memory_peak_bytes", "cpu_usage_usec"},
     "host_resource_daily": {"host", "day", "host_metrics", "turn_metrics"},
+    # #5925: operator queue and observations are internal, no grants added.
+    "vm_adapter_requests": {"host", "generation", "release_epoch", "state", "status",
+                            "created_at", "updated_at", "result"},
+    "vm_adapter_observations": {"host", "provider_state", "on_since", "off_since",
+                                "poweron_at", "wake_delay_s", "updated_at"},
     "agent_mailbox": {"signature", "signed_payload", "nonce"},
     "mesh_approvals": {"signature", "signed_payload", "nonce"},
     "mesh_approvals_status": {"signature", "signed_payload", "nonce"},
