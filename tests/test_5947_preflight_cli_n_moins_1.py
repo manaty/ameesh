@@ -19,14 +19,26 @@ les faux de test_1252. Toute autre commande lancée par vm.sh va au vrai CLI
 N-1 : un contrôle qu'il ne connaît pas, ou qu'il juge rouge, rend le préflight
 rouge ici avant de le rendre rouge en staging.
 
-L'hôte est candidat du rôle `auditeur` (celui de l'incident) et pas de
-`mesh-design`, dont les passes dépendent du canon et des réglages GitHub, hors
-de ce banc : son contrôle tourne quand même, sur la branche « non candidat ».
+L'hôte est candidat des deux rôles. Celui de l'auditeur est celui de
+l'incident ; celui de `mesh-design`, le rôle par défaut de `role timers`, lit
+le canon et `github.projects` : un canon et des réglages GitHub minimaux les
+rendent jouables sous le CLI N-1 (#5954). Le rejeu de l'incident, dont le CLI
+v1.38.0 précède #5853, remet `mesh-design` non candidat pour rester borné à
+#5863.
 
 Le tag N-1 est le plus récent `v*` atteignable depuis HEAD et qui ne le
 contient pas. Un clone sans tags (CI en profondeur 1) rend ce module sauté,
 sauf sous AMEESH_TEST_N1_REQUIS=1 (job « préflight N-1 » de tests.yml, clone
 complet) où l'absence est un échec : la barrière ne se perd pas en silence.
+
+#5954 : un clone dont les tags n'ont pas suivi la forge est aussi sauté hors
+du job requis. Le clone dédié du composeur de paquets (`git pull --ff-only`,
+sans `--tags`) ne récupère pas les tags de release : le banc y jouerait un N-1
+de plusieurs releases en arrière et son rendu d'unités, différent, ferait
+rougir le retour arrière pour une raison qui ne dit rien du vrai N-1. La
+version du paquet au checkout est celle que la release a taguée : un tag plus
+ancien qu'elle trahit ce clone, et le job CI (clone complet, REQUIS) reste le
+seul juge.
 """
 from __future__ import annotations
 
@@ -61,7 +73,21 @@ def release_precedente(root: Path = ROOT) -> str:
     return tags[0] if tags else ''
 
 
+def version_du_paquet(root: Path = ROOT) -> str:
+    """La version du paquet au checkout, préfixée `v` (vide si illisible)."""
+    try:
+        texte = (root / 'pyproject.toml').read_text(encoding='utf-8')
+    except OSError:
+        return ''
+    trouve = re.search(r'(?m)^version\s*=\s*"(\d+\.\d+\.\d+)"', texte)
+    return 'v' + trouve.group(1) if trouve else ''
+
+
 TAG = release_precedente()
+VERSION = version_du_paquet()
+#: Le tag retenu est celui que la version du paquet a tagué (la release pose
+#: les deux dans le même commit). Sinon les tags du clone sont en retard.
+TAG_FIABLE = not TAG or not VERSION or TAG == VERSION
 
 # Amorce du CLI installé : le code d'un arbre `src` (N-1 ou N) sous l'interpréteur
 # du banc, base et ligne de rôle simulées. `-I` : ni PYTHONPATH ni dossier
@@ -117,9 +143,40 @@ REGISTRE_PYTHON = ("argv[:1] != ['-c'] or any(m in argv[1] for m in ("
                    "'import psycopg'))")
 
 
-@unittest.skipUnless(TAG or REQUIS, 'aucun tag de release atteignable (clone sans tags)')
+#: #5954 : canon minimal du banc. La veille GitHub de `role timers --check`
+#: (rôle par défaut `mesh-design`) lit le canon et les réglages GitHub de
+#: l'hôte ; sans cette carte, l'hôte non candidat rendait le contrôle vert
+#: sans jamais exécuter cette branche. Le passage de l'auditeur, lui, n'en
+#: dépend pas.
+CANON = '''---
+type: Persona
+title: veilleur
+projects: [ameesh]
+roles: [github-watch]
+github_watch:
+  ameesh:
+    repos: [manaty/ameesh]
+    interval: 900
+---
+Veilleur du banc #5954 : la carte rend le rôle mesh-design candidat sur
+l'hôte du banc et fait lire le canon et `github.projects` par `role timers`.
+'''
+
+
+MOTIF_N1 = ('aucun tag de release atteignable (clone sans tags)' if not TAG else
+            'tags du clone en retard : %s alors que le paquet est %s (#5954)'
+            % (TAG, VERSION or 'illisible'))
+
+
+@unittest.skipUnless(REQUIS or (TAG and TAG_FIABLE), MOTIF_N1)
 class PreflightCliPrecedentTest(VmAgentsHarness):
     cli = TAG  # la release dont le code est le CLI installé
+    #: #5954 : l'hôte du banc est candidat du rôle `mesh-design` (le défaut de
+    #: `role timers --check`) pour couvrir ses passes, pas seulement celles de
+    #: l'auditeur. Le rejeu de l'incident le remet non candidat : son CLI
+    #: v1.38.0 précède #5853 et rendrait ce scénario rouge pour une raison
+    #: étrangère à #5863.
+    mesh_design_candidat = True
 
     def setUp(self):
         if not self.cli:
@@ -127,12 +184,27 @@ class PreflightCliPrecedentTest(VmAgentsHarness):
         super().setUp()
         self.n1 = self.extraire(self.cli, 'n1')
         (self.state / 'boot.py').write_text(BOOT)
+        self.canon = self.root / 'canon'
+        (self.canon / 'agents').mkdir(parents=True)
+        (self.canon / 'agents/veilleur.md').write_text(CANON, encoding='utf-8')
+        mesh_design = dict(name='mesh-design', releve='election', host='host-agents',
+                           candidats=['host-agents', 'agents-autre'],
+                           responsible='human:test')
+        if not self.mesh_design_candidat:
+            mesh_design.update(host='agents-autre', candidats=['agents-autre'])
         (self.state / 'roles.json').write_text(json.dumps([
-            dict(name='mesh-design', releve='election', host='agents-autre',
-                 candidats=['agents-autre'], responsible='human:test'),
+            mesh_design,
             dict(name='auditeur', releve='election', host='host-agents',
                  candidats=['host-agents', 'agents-autre'], responsible='human:test')]))
-        (self.vmhome / '.config/ameesh/config.json').write_text('{}\n')
+        config = self.vmhome / '.config/ameesh/config.json'
+        config.write_text(json.dumps({
+            'canon': str(self.canon),
+            'canon_untrusted': True,
+            'github': {'projects': {'ameesh': 'manaty/ameesh'}},
+        }) + '\n')
+        # `role timers --install` lit et peut réécrire cette configuration :
+        # elle refuse un fichier inscriptible par le groupe ou les autres.
+        config.chmod(0o600)
         bin_ = self.venv / 'bin'
         for nom, faux, texte, registre in (('ameesh', 'ameesh-registre', AMEESH, REGISTRE_AMEESH),
                                            ('python', 'python-base', DB_PYTHON, REGISTRE_PYTHON)):
@@ -174,11 +246,36 @@ class PreflightCliPrecedentTest(VmAgentsHarness):
         # le contrôle est bien passé par le CLI réel du tag, pas par un faux
         journal = (self.state / 'cli-n1.log').read_text()
         self.assertIn('role timers --check', journal)
+        if self.mesh_design_candidat:
+            # #5954 : le contrôle par défaut a bien pris la branche candidat
+            # (canon et github.projects), pas la sortie immédiate « non
+            # candidat » qui rendrait le préflight vert sans rien contrôler.
+            self.assertNotIn('not a candidate of role mesh-design', sortie)
+
+    def assert_mesh_design_controle(self, pose):
+        """#5954 : les passes du rôle mesh-design sont posées et contrôlées.
+
+        `vm.sh timers` pose les minuteries du rôle par défaut avec le CLI
+        installé ; leur présence prouve que `role timers --install` a pris la
+        branche candidat (canon + `github.projects`), et le préflight vert
+        qui suit prouve que `role timers --check` la rejoue sous le CLI N-1.
+        """
+        if not self.mesh_design_candidat:
+            return
+        sortie = pose.stdout + pose.stderr
+        self.assertEqual(pose.returncode, 0, sortie)
+        self.assertNotIn('not a candidate of role mesh-design', pose.stdout)
+        self.assertIn('role timers --install', (self.state / 'cli-n1.log').read_text())
+        for nom in ('github-watch', 'issues', 'ci', 'coherence'):
+            unite = (self.vmhome / '.config/systemd/user'
+                     / ('ameesh-role-%s.timer' % nom))
+            self.assertTrue(unite.is_file(), '%s absent après %r :\n%s'
+                            % (nom, self.cli, sortie))
 
     def test_le_preflight_est_vert_avec_le_cli_de_la_release_precedente(self):
         # État laissé par la release N-1 : ses minuteries, posées par SON vm.sh.
         pose = self.run_vm_de(self.n1 / 'deploy/mise-a-jour/vm.sh', 'timers')
-        self.assertEqual(pose.returncode, 0, pose.stdout + pose.stderr)
+        self.assert_mesh_design_controle(pose)
         # Préflight de la montée vers N : vm.sh de N, CLI N-1 encore installé.
         self.assert_vert(self.run_vm('verifier'))
 
@@ -187,7 +284,7 @@ class PreflightCliPrecedentTest(VmAgentsHarness):
         # `retour_agents` finit par controler_agents, rejoué ici tel quel.
         self.installer_cli(ROOT / 'src')
         pose = self.run_vm_de(SCRIPT, 'timers')
-        self.assertEqual(pose.returncode, 0, pose.stdout + pose.stderr)
+        self.assert_mesh_design_controle(pose)
         self.installer_cli(self.n1 / 'src')
         self.assert_vert(self.run_vm('controler'))
 
@@ -210,6 +307,11 @@ def _connu(ref: str) -> bool:
                      'historique de l\'incident absent (clone sans tags)')
 class IncidentRejoueTest(PreflightCliPrecedentTest):
     cli = CLI_INCIDENT
+    #: #5954 : v1.38.0 précède #5853 (OnBootSec → OnActiveSec) ; un rôle
+    #: mesh-design candidat posé par N puis contrôlé par v1.38.0 serait rouge
+    #: pour cette raison, étrangère au scénario #5863. L'hôte reste non
+    #: candidat comme avant ce lot.
+    mesh_design_candidat = False
 
     def setUp(self):
         super().setUp()
