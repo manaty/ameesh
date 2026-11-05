@@ -112,7 +112,7 @@ class InstallTest(unittest.TestCase):
         self.assertIn("TimeoutStartSec=11h30min", service)
         self.assertIn("OnUnitActiveSec=60s", timer)
         deploy = Path(__file__).resolve().parents[1] / "deploy/systemd/ameesh-release.timer"
-        for line in ("OnBootSec=1min", "OnUnitActiveSec=60s", "Persistent=true"):
+        for line in ("OnActiveSec=1min", "OnUnitActiveSec=60s", "Persistent=true"):
             self.assertIn(line, deploy.read_text(encoding="utf-8"))
         self.assertEqual(role_timers.check(plan(), directory=self.dir, apply=False,
                                            bin_path="/opt/ameesh/bin/ameesh"), [])

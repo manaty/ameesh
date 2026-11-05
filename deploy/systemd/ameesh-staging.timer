@@ -3,7 +3,7 @@
 Description=ameesh staging recovery on every candidate (#4880)
 
 [Timer]
-OnBootSec=60s
+OnActiveSec=60s
 OnUnitInactiveSec=60s
 Unit=ameesh-staging.service
 

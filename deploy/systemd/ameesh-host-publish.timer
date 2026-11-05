@@ -5,7 +5,7 @@
 Description=ameesh host reading every 5 minutes (#2022)
 
 [Timer]
-OnBootSec=1min
+OnActiveSec=1min
 OnUnitActiveSec=5min
 RandomizedDelaySec=30s
 Persistent=true
