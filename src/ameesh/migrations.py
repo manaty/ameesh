@@ -854,6 +854,12 @@ def admit_writer_connection(db, directory: str = MIGRATIONS_DIR) -> None:
     du code. Aucun cache interprocessus. Les contrôles explicites des passes
     ne sont jamais sautés. Le verrou empêche qu'un succès concurrent ancien
     réarme le cache après un refus détecté par un autre fil.
+
+    N = 5 s borne la fenêtre d'admission d'une nouvelle connexion écrivaine
+    après l'apparition d'une migration non additive inconnue. Les processus
+    longs gardent leur contrôle frais par passe ; les migrations non additives
+    exigent toujours l'arrêt des exécuteurs. Un refus détecté invalide le
+    succès immédiatement : la borne n'autorise aucune admission après refus.
     """
     if getattr(getattr(db, 'cfg', None), 'backend', '') == 'mediated':
         return
