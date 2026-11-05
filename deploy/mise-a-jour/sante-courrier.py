@@ -43,8 +43,11 @@ Read-only checks, then one real delivery probe:
   replaces it, and the report names the replacement and why (``remplacement``,
   #4126). A target asleep in the automatic roadmap sleep (#3256 §2.3) is not
   waited for: only an assignment or pilot mail lifts it, never the probe, so
-  waiting would just burn the bound and prove nothing (#5312). Only when none
-  is free is the verdict ``sans-sonde``. Delivery alone
+  waiting would just burn the bound and prove nothing (#5312). The replacement
+  is the free persona with the fewest unread active messages: the probe turn
+  reads its whole backlog first, and a pile of a hundred would outlast the
+  bound and leave the probe inconclusive (#5955); the report names that
+  backlog (``non_lus``). Only when none is free is the verdict ``sans-sonde``. Delivery alone
   is recorded when the harness
   starts, before a refused harness exits 127 (#1460): only the answer proves a
   real turn with working tools, and a failed or blocked turn after delivery is
@@ -465,6 +468,30 @@ def revalider(db, candidats: list[dict]):
     return None, premier
 
 
+def charge(db, nom: str) -> int | None:
+    """#5955 : unread active messages of ``nom`` (the backlog the probe turn
+    reads before the probe), or None when they cannot be read."""
+    try:
+        return len(mail.unread_active(db, nom))
+    except Exception:  # noqa: BLE001 — l'ordre seul en depend, pas le verdict
+        return None
+
+
+def par_charge(db, candidats: list[dict]) -> list[dict]:
+    """#5955 : replacement candidates, lightest backlog first.
+
+    A probe dropped behind a hundred unread messages waits for the whole
+    backlog to be read in the same turn and outlasts the bound (inconclusive,
+    staging 1.39.0). The order is stable: equal loads keep the registry order,
+    and an unreadable load goes last without dropping the candidate.
+    """
+    if len(candidats) < 2:
+        return list(candidats)
+    charges = {r["name"]: charge(db, r["name"]) for r in candidats}
+    return sorted(candidats, key=lambda r: (charges[r["name"]] is None,
+                                            charges[r["name"]] or 0))
+
+
 def selection(db, pool: list[dict], sonde: str, borne: float, now: float,
               croise: bool = False):
     """(row, pourquoi, remplacement) : the probe target among ``pool``.
@@ -496,12 +523,14 @@ def selection(db, pool: list[dict], sonde: str, borne: float, now: float,
     if etat is not None:
         return etat, None, None
     # Re-read alternatives after the wait; the snapshot may still say busy.
-    autres = [r for r in pool if r["name"] != sonde]
+    # #5955 : the lightest backlog first, or the probe waits behind it.
+    autres = par_charge(db, [r for r in pool if r["name"] != sonde])
     cible, _ = revalider(db, autres)
     if cible is None:
         return None, "%s ; aucune autre persona menee libre" % motif, None
     remplacement = {"cible_nommee": sonde, "remplacante": cible["name"],
-                    "raison": motif, "attente_s": attendu}
+                    "raison": motif, "attente_s": attendu,
+                    "non_lus": charge(db, cible["name"])}
     return cible, "remplacante %s : %s" % (cible["name"], motif), remplacement
 
 
@@ -636,7 +665,8 @@ def probe(db, row: dict, sha: str, attente: float,
         elif alternatives and time.monotonic() - debut >= attente / 2:
             # Reserve the remaining half of the SAME time budget for one
             # fresh, driven, free target. Never replace a delivered probe.
-            cible, _ = revalider(db, [r for r in alternatives if r["name"] != row["name"]])
+            cible, _ = revalider(db, par_charge(
+                db, [r for r in alternatives if r["name"] != row["name"]]))
             reste = fin - time.monotonic()
             if cible is not None and reste > 0:
                 motif = (budget_vu or ("pause operateur" if pause_vue else
@@ -645,7 +675,8 @@ def probe(db, row: dict, sha: str, attente: float,
                 resultat = probe(db, cible, sha, reste, hote_mesure)
                 resultat["remplacement"] = {
                     "cible_nommee": row["name"], "remplacante": cible["name"],
-                    "raison": motif, "attente_s": attendu}
+                    "raison": motif, "attente_s": attendu,
+                    "non_lus": charge(db, cible["name"])}
                 resultat["tentative_precedente"] = dict(out, attente=motif)
                 return resultat
         time.sleep(min(2.0, max(0.0, fin - time.monotonic())))
