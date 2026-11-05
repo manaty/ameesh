@@ -117,6 +117,8 @@ def add_parsers(work_sub, func) -> None:
     p_merges.add_argument("--repo", default=None,
                           help="owner/repo: failing proof by content, the linked PR")
     p_merges.add_argument("--dry-run", action="store_true", help="report without closing")
+    p_merges.add_argument("--id", type=int, action="append", default=None,
+                          help="examine only this work item (repeatable; #5891)")
     p_merges.add_argument("--json", action="store_true")
     p_merges.set_defaults(func=func)
 
@@ -577,9 +579,12 @@ def _packet_show(db, args: argparse.Namespace, packet_link) -> int:
 
 def _sync_merges(db, args: argparse.Namespace) -> int:
     """Le contenu d'abord (git), puis, à défaut et si `--repo`, la PR liée."""
+    if getattr(args, "id", None) is not None and args.repo:
+        raise work.WorkError("--id cannot be combined with the repository-wide --repo sweep")
     try:
         report = plan_git.sync_merges(db, args.git_dir, target=args.target,
-                                      dry_run=args.dry_run)
+                                      dry_run=args.dry_run,
+                                      item_ids=getattr(args, "id", None))
     except plan_git.MergeProbeError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
