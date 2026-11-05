@@ -193,6 +193,49 @@ class HostReconcileTest(PgTestCase):
         self.assertEqual(result["missing"], ["agent_moved:dev"])
         self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
+    def moved_by_hand(self, *, source="source"):
+        """#5887: what `relocation.move_manual` writes, in one transaction."""
+        self.db.execute("UPDATE agent_registry SET host='target' WHERE name='dev'")
+        self.api.events.record("agent.moved", "agent:dev", None,
+                               {"agent": "dev", "from": source, "to": "target"})
+
+    def test_agent_moved_by_hand_during_the_generation_does_not_block(self):
+        # #5887: claude1/claude2 left AG1 by `ameesh agent move` (#3299); the
+        # journaled move proved the source runner stopped, so it is no
+        # second executor and the host reopens without touching the base.
+        self.returned()
+        self.moved_by_hand()
+        result = self.reconcile()
+        self.assertTrue(result["reconciled"], result)
+        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "available")
+        self.assertEqual(self.event()["data"]["moved_by_hand"], ["dev"])
+
+    def test_agent_moved_by_hand_with_a_recovery_attempt_stays_refused(self):
+        self.returned()
+        self.moved_by_hand()
+        self.add_handoff(state="verified", evidence={"source_recovered": True})
+        result = self.reconcile()
+        self.assertFalse(result["reconciled"])
+        self.assertIn("recovery_attempted:dev", result["missing"])
+        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
+
+    def test_agent_moved_by_hand_and_fenced_stays_refused(self):
+        self.returned()
+        self.moved_by_hand()
+        self.db.execute("UPDATE agent_registry SET handoff_fenced=true WHERE name='dev'")
+        result = self.reconcile()
+        self.assertEqual(result["missing"], ["handoff_fenced:dev"])
+
+    def test_manual_move_from_another_host_or_before_the_generation_is_no_proof(self):
+        self.returned()
+        self.moved_by_hand(source="elsewhere")
+        self.assertEqual(self.reconcile()["missing"], ["agent_moved:dev"])
+        self.moved_by_hand()
+        # The generation began after that move: it proves nothing about it.
+        self.db.execute("UPDATE host_lifecycle SET requested_at=clock_timestamp() "
+                        "WHERE host='source'")
+        self.assertEqual(self.reconcile()["missing"], ["agent_moved:dev"])
+
     def test_live_lease_of_a_returning_agent_does_not_block(self):
         # #3180: the host's own runner takes its lease back as soon as the
         # machine reboots, before the sustained-reading window closes. That

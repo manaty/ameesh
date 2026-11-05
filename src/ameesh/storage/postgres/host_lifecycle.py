@@ -6,6 +6,13 @@ from .. import interface
 from .hosts import Hosts
 
 
+# #5887: an origin agent `r` of lifecycle row `c` left the host by a journaled
+# manual move (`agent.moved`, #3299) from this host since the generation began.
+_MANUAL_MOVE = (
+    "EXISTS (SELECT 1 FROM ameesh_events e WHERE e.type='agent.moved' "
+    "AND e.object='agent:'||r.name AND e.data->>'from'=c.host "
+    "AND e.created_at>=c.requested_at)")
+
 _ROW = ("host, mode, generation, actor, "
         "extract(epoch from requested_at)::float8 AS requested_ts, "
         "extract(epoch from return_at)::float8 AS return_ts, "
@@ -759,16 +766,23 @@ class HostLifecycle(interface.HostLifecycle):
                 "AND evidence ? 'source_recovered' AND updated_at >= to_timestamp(%s) "
                 "ORDER BY id", (host, lost_ts))
             missing.extend("recovery_attempted:" + row["agent"] for row in recovered)
+            # #5887: an origin agent moved away by a journaled `agent move`
+            # (#3299) during this generation is not a second executor: the
+            # move itself proved the source runner stopped, revoked its lease
+            # and refused an open handoff. A move by recovery stays refused
+            # (`recovery_attempted`, fence, active handoff above and below).
             origins = tx.query(
                 "SELECT r.name, r.host, r.handoff_fenced, "
                 "(r.lease_expires_at > clock_timestamp()) AS live, "
                 "EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
-                "        AND h.state NOT IN ('verified','cancelled')) AS active_handoff "
+                "        AND h.state NOT IN ('verified','cancelled')) AS active_handoff, "
+                + _MANUAL_MOVE + " AS moved_by_hand "
                 "FROM host_lifecycle_agents a JOIN agent_registry r ON r.name=a.agent "
+                "JOIN host_lifecycle c ON c.host=a.host "
                 "WHERE a.host=%s AND a.generation=%s ORDER BY r.name FOR UPDATE OF r",
                 (host, control["generation"]))
             for row in origins:
-                if row["host"] != host:
+                if row["host"] != host and not row["moved_by_hand"]:
                     missing.append("agent_moved:" + row["name"])
                 if row["handoff_fenced"]:
                     missing.append("handoff_fenced:" + row["name"])
@@ -796,8 +810,8 @@ class HostLifecycle(interface.HostLifecycle):
                 "updated_at=clock_timestamp() "
                 "WHERE c.host=%s AND c.mode='returning' AND NOT EXISTS ("
                 " SELECT 1 FROM host_lifecycle_agents a JOIN agent_registry r ON r.name=a.agent "
-                " WHERE a.host=c.host AND a.generation=c.generation AND (r.host<>c.host "
-                " OR r.handoff_fenced OR EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
+                " WHERE a.host=c.host AND a.generation=c.generation AND ((r.host<>c.host "
+                " AND NOT " + _MANUAL_MOVE + ") OR r.handoff_fenced OR EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
                 " AND h.state NOT IN ('verified','cancelled')))) RETURNING c.host", (host,))
             if not completed:
                 raise ValueError("lost host return proof changed during reconciliation")
@@ -819,6 +833,9 @@ class HostLifecycle(interface.HostLifecycle):
                 "readings_since_loss": len(times),
                 "coverage_s": covered,
                 "agents": [row["name"] for row in origins],
+                # #5887: origin agents that left by a journaled manual move.
+                "moved_by_hand": [row["name"] for row in origins
+                                  if row["host"] != host and row["moved_by_hand"]],
                 # Informational: the returning machine's own runners had
                 # already taken their leases back; they are not a refusal.
                 "live_lease_agents": [row["name"] for row in origins if row["live"]],
