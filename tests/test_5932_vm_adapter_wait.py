@@ -211,6 +211,50 @@ class WaitStateTest(PgTestCase):
                                                 older_than=180), [])
         self.assertEqual(self.api.get("vm")["mode"], "draining")
 
+    def test_a_wait_committed_between_preselection_and_the_gate_masks_the_loss(self):
+        """#5932 B (cx2): the final revalidation under the gate must re-read
+        the idle-drained wait, not only the acknowledged states. The
+        candidate query runs before the gate; a `begin` then `wait` committed
+        in that window leaves `hook_attempt_state` NULL and only the wait, and
+        must not be erased as a loss."""
+        from ameesh import db as db_mod
+        from ameesh.storage.postgres.hosts import Hosts
+        self._lost_evidence()
+        self.ack_draining()
+        original = Hosts._lock_gate
+        entered = []
+
+        def interleave(tx, host):
+            if not entered:
+                entered.append(host)
+                # Between candidate selection and the gate, a scanner commits
+                # its claim then the asynchronous wait on its own connection.
+                writer = db_mod.connect(self.cfg)
+                try:
+                    api = storage.of(writer).host_lifecycle
+                    control = api.get("vm")
+                    self.assertIsNotNone(api.begin_transition(
+                        "vm", control["generation"], "idle-drained",
+                        release_epoch=control["release_epoch"], actor="scanner",
+                        stale_after=420,
+                        retry_after=float(self.cfg.host_release_retry)))
+                    control = api.get("vm")
+                    self.assertIsNotNone(api.wait_transition(
+                        "vm", control["generation"], "idle-drained",
+                        release_epoch=control["release_epoch"],
+                        actor="scanner", detail={"command": "adapter"}))
+                finally:
+                    writer.close()
+            return original(tx, host)
+
+        with mock.patch.object(Hosts, "_lock_gate", side_effect=interleave):
+            lost = self.api.detect_losses(actor="runner", older_than=180)
+        self.assertEqual(entered, ["vm"])
+        self.assertEqual(lost, [])
+        row = self.api.get("vm")
+        self.assertEqual(row["mode"], "draining")
+        self.assertEqual(row["hook_wait_state"], "idle-drained")
+
     def _lost_evidence(self):
         from ameesh import registry
         registry.upsert(self.db, "worker", harness="deepseek", host="vm",

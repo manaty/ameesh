@@ -141,8 +141,17 @@ class HostLifecycle(interface.HostLifecycle):
                 old = HostLifecycle(tx).get(host)
                 if not agents or (old and old["mode"] == "lost"):
                     continue
-                if old and (old.get("release_state") == "idle-drained"
-                            or old.get("hook_attempt_state") == "idle-drained"):
+                # #5932 B (cx2): the candidate selection ran before this gate.
+                # In between, a scanner may have committed `begin_transition`
+                # then `wait_transition` (idle-drained), which clears the
+                # attempt and leaves only the wait: re-check that wait under
+                # the lock with the same wave fence as the preselection, or a
+                # legitimate stop would be declared lost and its wait erased.
+                waited = old and old.get("hook_wait_state") == "idle-drained" \
+                    and old.get("hook_wait_generation") == old.get("generation") \
+                    and old.get("hook_wait_epoch") == old.get("release_epoch")
+                if waited or (old and (old.get("release_state") == "idle-drained"
+                                       or old.get("hook_attempt_state") == "idle-drained")):
                     # #4148: off by decision, between two readings.
                     continue
                 if old and ((old.get("released_ts") is not None
