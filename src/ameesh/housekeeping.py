@@ -6078,6 +6078,10 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         "ameesh": images["ours"], "others_total": images["others_total"]}
     from . import docker_storage
     report_measure["docker_storage"] = docker_storage.collect(runtime, now=now)
+    if report_measure["docker_storage"] is not None:
+        # #5861 : la cadence de CET hôte, pour juger plus tard de la fraîcheur
+        report_measure["docker_storage"]["pass_period_s"] = docker_storage.pass_period(
+            getattr(cfg, "housekeeping_interval", 0), budget.budget)
     # #3103 : un pont sur le réseau local de l'hôte (incident #3092), relevé
     # pour l'alerte critique `host_network_overlap` ; jamais fatal au passage
     from . import netcheck
