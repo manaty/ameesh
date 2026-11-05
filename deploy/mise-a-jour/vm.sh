@@ -1928,7 +1928,24 @@ controler_agents() {
   # sain. `ameesh_agents` passe par systemd-run + EnvironmentFile, comme doctor.
   ameesh_agents role timers --check || echec=1
   # #5863 : le passage court de l'auditeur, posé jusqu'ici à la main (3 h).
-  ameesh_agents role timers --role auditeur --check || echec=1
+  # #5937 : contrôlé seulement si le code INSTALLÉ connaît ce passage. Un CLI
+  # antérieur (préflight d'une montée vers #5863, ou retour arrière) rend pour
+  # --role auditeur les passes génériques et juge périmées les unités du vrai
+  # observateur : le préflight échouait sur toutes les VM. L'étape est nommée,
+  # jamais sautée en silence ; un code illisible reste un échec.
+  local rt="/home/ameesh/.local/share/ameesh/src-${runtime_sha:0:7}/src/ameesh/role_timers.py"
+  if ! [[ ${runtime_sha:-} =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+    echec=1  # déjà nommé par le contrôle du runtime invité ci-dessus
+  else
+    # Fichier absent = code sans cette passe (1) ; erreur de lecture ou de
+    # ssh (2, 255) = échec.
+    rc=0; ssh_agents "test -e $rt || exit 1; grep -q '^AUDITOR_PASS = ' $rt" || rc=$?
+    case "$rc" in
+      0) ameesh_agents role timers --role auditeur --check || echec=1 ;;
+      1) etape "minuterie de l'auditeur (#5863) : le code installé ${runtime_sha:0:9} ne la connaît pas, contrôle après l'installation" ;;
+      *) echo "minuterie de l'auditeur : code installé illisible ($rt, rc $rc)" >&2; echec=1 ;;
+    esac
+  fi
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
   echo "contrôles verts"
 }
