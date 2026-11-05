@@ -119,6 +119,7 @@ class Check(unittest.TestCase):
         self.assertEqual(data["packet_slot_missed"]["ready"], [2601])
         self.assertIn("#2601", text)
         self.assertIn("nom de porteur attribué par le composeur", text)
+        self.assertIn("#5941", text)
         self.assertNotIn("integration/paquet-h-20261019-0400", text)
         self.assertEqual(self.run_check(at(4, 40), state)["result"], "already-alerted")
         self.assertEqual(len(self.sent), 2)
@@ -142,6 +143,21 @@ class Check(unittest.TestCase):
         self.assertEqual(result["result"], "would-alert")
         self.assertEqual(self.sent, [])
         self.assertNotIn("last_alert_slot", state.get("projects", {}).get("ameesh", {}))
+
+    def test_a_live_composition_lease_is_busy(self):
+        # #5941 : le composeur tient le verrou pendant la lecture des
+        # candidats, sans porteur encore visible ; l'alerte ne doit pas
+        # désigner un second composeur.
+        with mock.patch("ameesh.packet_composition.holder",
+                        return_value={"owner": "paquet-horaire:host:42:abc"}):
+            result = packet_watch.check(
+                self.cfg, object(), self.watch, Hourly(), now=at(4, 20), state={},
+                inventory=lambda: payload(),
+                send=lambda *a: self.sent.append(a))
+        self.assertEqual(result["result"], "busy")
+        self.assertEqual(result["composition"]["owner"],
+                         "paquet-horaire:host:42:abc")
+        self.assertEqual(self.sent, [])
 
     def test_failed_delivery_is_retried(self):
         state = {}

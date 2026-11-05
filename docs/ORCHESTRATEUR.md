@@ -548,7 +548,9 @@ Un créneau manqué ne reste pas muet (#2601) : sur l'hôte opérateur, chaque
 (`packets.cutoffs`) ; passé la grâce (15 min par défaut), si aucun porteur
 `integration/paquet*` ni lot au titre commençant par « Paquet horaire h- »
 n’est ouvert (même sans branche) pour le projet et la cible, ni tout juste fusionné,
-qu'aucun paquet n'a déjà fusionné pendant le créneau et que la liste calculée
+qu'aucun paquet n'a déjà fusionné pendant le créneau, qu'aucun composeur ne
+tient le verrou de composition partagé (#5941 : il lit encore les candidats,
+aucun porteur n'est visible) et que la liste calculée
 rend au moins un lot prêt, une alerte urgente part, une fois
 par créneau, aux destinataires de `packet_watch.projects.<projet>.notify` (le
 composeur et le pilote). Le **premier destinataire** est le seul composeur
@@ -582,12 +584,32 @@ concluant** (délai, base absente, psql/psycopg indisponible) est consigné à l
 PR, au porteur et au courrier, sans retirer d'unité ni arrêter le paquet :
 seul un test négatif bloque (canon §3), la ci-full tranche.
 
-Une composition tient un verrou `flock` **par nom de paquet**, sous le `.git`
-commun du clone (#4329) : une seconde composition du même paquet — le tic et un
-lancement manuel, par exemple — refuse « composition en cours (hôte:pid) »
-(code 3) au lieu de supprimer le worktree vivant, et le tic la compte comme en
-cours. Le verrou tombe avec le processus : le worktree d'une tentative morte
-reste nettoyable comme avant.
+Une composition tient deux verrous distincts :
+
+* un `flock` **par nom de paquet**, sous le `.git` commun du clone (#4329) :
+  une seconde composition du même paquet — le tic et un lancement manuel, par
+  exemple — refuse « composition en cours (hôte:pid) » (code 3) au lieu de
+  supprimer le worktree vivant, et le tic la compte comme en cours. Le verrou
+  tombe avec le processus : le worktree d'une tentative morte reste nettoyable
+  comme avant ;
+* un **verrou de composition partagé** (`merge_locks`, clé
+  `packet-compose:<projet>`, #5941), pris par `ameesh work add` avant de créer
+  un porteur de branche `integration/paquet*` ou de titre « Paquet horaire
+  h-… », et par le tic après la lecture des candidats. Sous ce verrou, les
+  porteurs ouverts sont relus avant toute écriture : un second composeur —
+  l'agent désigné par l'alerte « créneau manqué » comme la minuterie — s'arrête
+  (`composition in progress (…)` ou `packet carrier #N already reserves …`),
+  sans rien pousser. Le tic transmet son propriétaire au `work add` pour créer
+  les deux porteurs d'une paire parallèle (#3256 C) ; tout autre composeur
+  reste refusé. Le bail expire seul (5 min) si son processus meurt.
+
+Un porteur se crée donc par la même commande que le tic :
+
+```sh
+ameesh work add --title "Paquet horaire h-20261027-01 — composition" \
+    --app ameesh --assignee mesh-design --branch integration/paquet-h-20261027-01 \
+    --target main --estimate 165m --source "paquet-horaire (#3845)"
+```
 
 ```sh
 scripts/paquet-auto.py --target main --name h-20261027-01 --carrier 3808
