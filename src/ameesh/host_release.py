@@ -253,8 +253,13 @@ def auto_drain_blocker(footprint, control, *, hook, held=None):
     return None
 
 
-def release_blocker(control, listing, reading, *, footprint, cfg, now):
-    """Why a draining host cannot yet be declared `idle-drained`, or None."""
+def release_blocker(control, listing, reading, *, footprint, cfg, now, adapter_wait=False):
+    """Why a draining host cannot yet be declared `idle-drained`, or None.
+
+    `adapter_wait` (#5925) is only for the operator's already-queued release:
+    billing hysteresis may outlast the drain bound. All live safety evidence
+    still applies; the native scanner keeps its original timeout.
+    """
     if listing is None:
         return "agent activity unreadable"
     known, runs, source = runs_evidence(footprint)
@@ -267,7 +272,7 @@ def release_blocker(control, listing, reading, *, footprint, cfg, now):
         return "withdrawal time unreadable"
     if now - requested < cfg.host_release_settle:
         return "withdrawal just started"
-    if now - requested > cfg.host_release_drain_bound:
+    if not adapter_wait and now - requested > cfg.host_release_drain_bound:
         return "drain is overdue"
     if not reading:
         return "no host reading"
