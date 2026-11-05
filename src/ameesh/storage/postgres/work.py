@@ -905,8 +905,16 @@ class WorkItems(interface.WorkItems):
                         " to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
                         " coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
                         " AS workflow_version")
+        # #5993 : la tête du dernier gel est portée par cette lecture, comme
+        # `workflow_ref` l'est pour le pin. La commande `work move ... qa` la
+        # lit ainsi sans second aller-retour, y compris sur une connexion
+        # d'exécuteur médiée (le contrat n'a pas d'op `work.milestones`).
+        frozen = ("(SELECT m.sha FROM work_item_milestones m"
+                  " WHERE m.work_item_id = work_items.id AND m.kind = 'frozen'"
+                  " ORDER BY m.at DESC, m.id DESC LIMIT 1) AS frozen_sha")
         rows = self.db.query(
-            "SELECT %s, %s FROM work_items WHERE id = %%s" % (item_columns(self.db), workflow),
+            "SELECT %s, %s, %s FROM work_items WHERE id = %%s"
+            % (item_columns(self.db), workflow, frozen),
             (int(item_id),))
         return rows[0] if rows else None
 

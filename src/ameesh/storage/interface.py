@@ -2518,7 +2518,10 @@ class WorkItems(Domain):
         base d'avant la migration 0452). Les commandes historiques
         (`work.move`/`close`/`close_merged`) lisent la garde par cette
         interface, jamais par un SELECT brut : celui-ci est refusé sur une
-        connexion d'exécuteur médié."""
+        connexion d'exécuteur médié. #5993 : `frozen_sha` (la tête du dernier
+        gel, NULL sans gel) est portée par la même lecture — la commande
+        `work move ... qa` exige un gel déclaré sans second aller-retour (le
+        contrat médié n'a pas d'op `work.milestones`)."""
 
     @abc.abstractmethod
     def items(self, *, state: str | None, assignee: str | None, limit: int | None) -> list[dict]:
