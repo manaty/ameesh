@@ -55,8 +55,10 @@ disconnects. This preserves LISTEN/NOTIFY and explicit transactions. Therefore
 pooling does **not** reduce the runner's two persistent sessions to one.
 The third and fourth connections observed on the PC belonged to auxiliary
 passes: their session lifetime spans external work even though each pass
-eventually closes its driver. `ScopedDb` releases these sessions between SQL
-operations; explicit transactions and independent gate/controller locks retain
+eventually closes its driver. `ScopedDb` holds one session per thread for a
+pass (#5979) and returns it at the end of the pass, before a provider HTTP
+call, after one idle second (git, gh, ssh between two statements) and after
+any error; explicit transactions and independent gate/controller locks retain
 their sessions until completion. No transaction is shared across threads.
 
 The VM pool permits 64 ordinary server sessions and 16 reserve sessions, with
