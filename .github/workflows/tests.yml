@@ -1499,12 +1499,6 @@ jobs:
       - name: aide de la commande installée
         run: ameesh --help
 
-  # L98 T2b (#4408) : le cœur au profil nu (`AMEESH_MODULES=bare`), sans module
-  # intégré : registre, modules de projet et frontière L97 (test_generic_core),
-  # puis `ameesh modules` et `canon check` sur le canon d'exemple sans
-  # extensions. Profil de CI et de test seulement (décision 2, #4405) ; hors de
-  # l'agrégat requis `tests` : son rouge se voit sur la PR sans retenir le
-  # paquet tant qu'il n'y est pas versé.
   # #5947 : le préflight de vm.sh (`agents verifier`, et le contrôle qui
   # suit un retour arrière) joué avec, comme CLI installé, le code du dernier
   # tag de release : la CI ne voyait que N, le staging 1.39.0 a échoué deux
@@ -1538,6 +1532,12 @@ jobs:
         run: |
           "$RUNNER_TEMP/n1/bin/python" -m unittest -v tests.test_5947_preflight_cli_n_moins_1
 
+  # L98 T2b (#4408) : le cœur au profil nu (`AMEESH_MODULES=bare`), sans module
+  # intégré : registre, modules de projet et frontière L97 (test_generic_core),
+  # puis `ameesh modules` et `canon check` sur le canon d'exemple sans
+  # extensions. Profil de CI et de test seulement (décision 2, #4405) ; hors de
+  # l'agrégat requis `tests` : son rouge se voit sur la PR sans retenir le
+  # paquet tant qu'il n'y est pas versé.
   profil-nu:
     name: profil nu (modules)
     needs: plan

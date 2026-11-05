@@ -1599,7 +1599,8 @@ class WorkflowRoutingTest(unittest.TestCase):
         closure = self.needs_closure(jobs, self.REQUIRED) | {self.REQUIRED}
         self.assertEqual(closure, {"qualification", "plan", "version",
                                    "psycopg", "psql", "platform-macos",
-                                   "doc-readers", "fs-class", "tests"})
+                                   "doc-readers", "fs-class", "preflight-n1",
+                                   "tests"})
         for job in sorted(closure):
             self.assertNotIn("AMEESH_LENT_RUNS_ON", str(jobs[job].get("runs-on", "")),
                              "%s is part of the required path" % job)

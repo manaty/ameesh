@@ -119,22 +119,13 @@ REGISTRE_PYTHON = ("argv[:1] != ['-c'] or any(m in argv[1] for m in ("
 
 @unittest.skipUnless(TAG or REQUIS, 'aucun tag de release atteignable (clone sans tags)')
 class PreflightCliPrecedentTest(VmAgentsHarness):
+    cli = TAG  # la release dont le code est le CLI installé
+
     def setUp(self):
-        if not TAG:
+        if not self.cli:
             self.fail('AMEESH_TEST_N1_REQUIS=1 : aucun tag v* atteignable depuis HEAD')
         super().setUp()
-        self.n1 = self.root / 'n1'
-        self.n1.mkdir()
-        archive = subprocess.run(['git', '-C', str(ROOT), 'archive', '--format=tar', TAG,
-                                  'src', 'deploy/mise-a-jour'],
-                                 check=True, capture_output=True, timeout=120).stdout
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            tar.extractall(self.n1, filter='data')
-        # vm.sh lit son dépôt (DEPOT) : celui de N-1 est un dépôt d'un commit.
-        subprocess.run(['git', 'init', '-q', str(self.n1)], check=True)
-        self.git(self.n1, 'add', 'deploy')
-        self.git(self.n1, '-c', 'user.email=t@invalid', '-c', 'user.name=test',
-                 'commit', '-q', '-m', TAG)
+        self.n1 = self.extraire(self.cli, 'n1')
         (self.state / 'boot.py').write_text(BOOT)
         (self.state / 'roles.json').write_text(json.dumps([
             dict(name='mesh-design', releve='election', host='agents-autre',
@@ -153,6 +144,22 @@ class PreflightCliPrecedentTest(VmAgentsHarness):
             (bin_ / nom).chmod(0o755)
         self.installer_cli(self.n1 / 'src')
 
+    def extraire(self, ref: str, nom: str) -> Path:
+        """`src` et `deploy/mise-a-jour` de ``ref``, en dépôt d'un commit (vm.sh
+        lit son dépôt, DEPOT)."""
+        dest = self.root / nom
+        dest.mkdir()
+        archive = subprocess.run(['git', '-C', str(ROOT), 'archive', '--format=tar', ref,
+                                  'src', 'deploy/mise-a-jour'],
+                                 check=True, capture_output=True, timeout=120).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            tar.extractall(dest, filter='data')
+        subprocess.run(['git', 'init', '-q', str(dest)], check=True)
+        self.git(dest, 'add', 'deploy')
+        self.git(dest, '-c', 'user.email=t@invalid', '-c', 'user.name=test',
+                 'commit', '-q', '-m', ref)
+        return dest
+
     def installer_cli(self, src: Path):
         (self.state / 'cli-src').write_text(str(src) + '\n')
 
@@ -162,7 +169,7 @@ class PreflightCliPrecedentTest(VmAgentsHarness):
 
     def assert_vert(self, p):
         sortie = p.stdout + p.stderr
-        self.assertEqual(p.returncode, 0, '%s, CLI installé %s :\n%s' % (TAG, TAG, sortie))
+        self.assertEqual(p.returncode, 0, 'CLI installé %s :\n%s' % (self.cli, sortie))
         self.assertIn('contrôles verts', p.stdout)
         # le contrôle est bien passé par le CLI réel du tag, pas par un faux
         journal = (self.state / 'cli-n1.log').read_text()
@@ -183,6 +190,52 @@ class PreflightCliPrecedentTest(VmAgentsHarness):
         self.assertEqual(pose.returncode, 0, pose.stdout + pose.stderr)
         self.installer_cli(self.n1 / 'src')
         self.assert_vert(self.run_vm('controler'))
+
+
+# #5946 : l'incident lui-même. Le dernier tag connaît déjà la passe courte de
+# l'auditeur (#5863) : le banc ci-dessus ne passe jamais par la branche « le
+# code installé ne la connaît pas ». Ici, le CLI est v1.38.0, la dernière
+# release sans #5863, l'état celui des VM du 05/11 (passe de l'auditeur posée,
+# à la main alors, par le vm.sh de N ici) ; vm.sh de #5863 sans #5937
+# (d0f31e7f3) doit être rouge sur ce contrôle, celui de la tête vert.
+CLI_INCIDENT, VM_INCIDENT = 'v1.38.0', 'd0f31e7f3'
+
+
+def _connu(ref: str) -> bool:
+    return subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '-q', '--verify',
+                           ref + '^{commit}'], capture_output=True).returncode == 0
+
+
+@unittest.skipUnless(REQUIS or (_connu(CLI_INCIDENT) and _connu(VM_INCIDENT)),
+                     'historique de l\'incident absent (clone sans tags)')
+class IncidentRejoueTest(PreflightCliPrecedentTest):
+    cli = CLI_INCIDENT
+
+    def setUp(self):
+        super().setUp()
+        # passe de l'auditeur posée par N, CLI N-1 installé ensuite
+        self.installer_cli(ROOT / 'src')
+        pose = self.run_vm_de(SCRIPT, 'timers')
+        self.assertEqual(pose.returncode, 0, pose.stdout + pose.stderr)
+        self.installer_cli(self.n1 / 'src')
+
+    def test_le_preflight_est_vert_avec_le_cli_de_la_release_precedente(self):
+        p = self.run_vm('verifier')
+        self.assert_vert(p)
+        self.assertIn('le code installé ne la connaît pas', p.stdout)
+        self.assertNotIn('role timers --role auditeur --check',
+                         (self.state / 'cli-n1.log').read_text())
+
+    def test_le_controle_apres_retour_arriere_vers_la_release_precedente_est_vert(self):
+        self.assert_vert(self.run_vm('controler'))
+
+    def test_le_vm_sh_de_l_incident_est_rouge(self):
+        incident = self.extraire(VM_INCIDENT, 'incident')
+        p = self.run_vm_de(incident / 'deploy/mise-a-jour/vm.sh', 'verifier')
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('contrôles en échec', p.stderr)
+        self.assertIn('role timers --role auditeur --check',
+                      (self.state / 'cli-n1.log').read_text())
 
 
 class RetourFinitParLeControleTest(unittest.TestCase):
