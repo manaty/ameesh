@@ -1136,6 +1136,11 @@ class HostPolicy:
     #: `<command> busy|draining|idle-drained <host>` and never touches the
     #: cluster or the cloud itself. None = no adapter, so no automatic release.
     lifecycle_hook: str | None = None
+    #: #5905 (C2 of #5900): how the host declares its runs (work that outlives
+    #: a turn or a lease). `none` = the host runs nothing outside its turns
+    #: and leases, so `runs = 0` is a known count; None = undeclared, the
+    #: release stays refused (`host_release_no_runs`).
+    runs_interface: str | None = None
     #: #5601 : places de `max_agents` réservées aux agents d'un projet ou à une
     #: classe de priorité (`{"project:<p>": n, "class:<n>": n}`, `ameesh.slot_reservations`) ;
     #: None = aucune réservation, l'ordre d'admission reste celui du registre.
@@ -4193,6 +4198,17 @@ class _Loader:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.lifecycle_hook`: a non-empty command line expected",
                              **where, **subject)
+            # #5905: only a known interface declares runs; anything else is an
+            # error and stays undeclared (never a zero by default).
+            if raw.get("runs_interface") is not None:
+                from .host_idle import RUNS_INTERFACES
+                value = raw["runs_interface"]
+                if isinstance(value, str) and value.strip() in RUNS_INTERFACES:
+                    policy.runs_interface = value.strip()
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.runs_interface`: one of %s expected"
+                             % ", ".join(RUNS_INTERFACES), **where, **subject)
             # #5601 : réservations de places ; une entrée illisible est écartée
             # (elle ne doit pas tenir des places que personne ne peut prendre)
             if raw.get("slot_reservations") is not None:

@@ -304,6 +304,20 @@ class HostReleaseTest(PgTestCase):
                          ["host_release_no_runs"])
         self.assertIn("#4147", alerts[0]["detail"])
 
+    def test_runs_interface_none_drains_and_releases_without_the_alert(self):
+        # #5905: the real A projection, not a mocked run count
+        self.unknown_runs()
+        self.cfg = dataclasses.replace(self.cfg, runs_interfaces={"vm": "none"})
+        self.add_agent()
+        self.quiet_history()
+        self.once(local_host="vm", now=time.time())
+        self.assertEqual(self.control()["mode"], "draining")
+        self.reading()
+        self.once(local_host="vm", now=time.time() + 1)
+        self.assertEqual(self.states(), ["draining", "idle-drained"])
+        self.assertEqual(self.control()["release_state"], "idle-drained")
+        self.assertEqual(host_release.alerts(self.cfg, self.db, time.time()), [])
+
     def test_declared_zero_runs_and_no_hold_drain_the_idle_burst_host(self):
         self.add_agent()
         self.quiet_history()

@@ -14,14 +14,43 @@ from . import resources, storage
 from .host_lifecycle import staleness_s
 
 DONE = frozenset(lifecycle.COMPLETED)
+#: #5905: the run interfaces a host may declare. `none`: nothing runs on the
+#: host outside its turns and leases, so zero runs is a known count.
+RUNS_INTERFACES = ("none",)
+#: the source of an undeclared host: unknown for the release, never zero
+RUNS_UNDECLARED = 'aucune interface de déclaration'
+
+
+def runs_interface(cfg, canons, host):
+    """(interface, origin) declared for `host`, or (None, None).
+
+    The per-host configuration wins over the Host card. Two Host cards that
+    disagree declare nothing: a run count is never chosen by canon order."""
+    per_host = getattr(cfg, 'runs_interfaces', None) or {}
+    if isinstance(per_host, dict) and per_host.get(host) in RUNS_INTERFACES:
+        return per_host[host], 'configuration'
+    values = {getattr(getattr(card, 'policy', None), 'runs_interface', None)
+              for canon in canons or () for card in getattr(canon, 'hosts', ()) or ()
+              if getattr(card, 'title', None) == host}
+    values.discard(None)
+    if len(values) == 1 and next(iter(values)) in RUNS_INTERFACES:
+        return next(iter(values)), 'Host card'
+    return None, None
 
 
 def project(reading, history, agents, lots, *, now, idle_after_s=1800,
-            fresh_within=180, capacity='burst', cost_eur_h=None, holds=None):
-    """Pure projection. None inputs mean unreadable sources, never empty ones."""
+            fresh_within=180, capacity='burst', cost_eur_h=None, holds=None,
+            runs_declared=None):
+    """Pure projection. None inputs mean unreadable sources, never empty ones.
+
+    `runs_declared` (#5905) is the `(interface, origin)` of `runs_interface`;
+    without it the run count stays the undeclared placeholder."""
     out = resources.footprint(reading)
+    interface, origin = runs_declared or (None, None)
+    source = (RUNS_UNDECLARED if interface not in RUNS_INTERFACES
+              else 'runs_interface: %s (%s)' % (interface, origin))
     out.update(active_turns=None, leases=None, runs=0,
-               runs_source='aucune interface de déclaration', state='busy',
+               runs_source=source, state='busy',
                idle_since=None, capacity=capacity, cost_eur_h=cost_eur_h,
                idle_after_s=idle_after_s, unknown=[])
     unknown = out['unknown']
@@ -325,7 +354,8 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None
                 history = None
         out[host] = project(reading, history, members, host_lots, now=now,
                             idle_after_s=idle_s, fresh_within=fresh,
-                            capacity=capacity[host], cost_eur_h=costs[host], holds=holds)
+                            capacity=capacity[host], cost_eur_h=costs[host], holds=holds,
+                            runs_declared=runs_interface(cfg, canons, host))
         out[host]["baseline_guard"] = host in protected
         control = (controls or {}).get(host) if isinstance(controls, dict) else None
         if control is not None:
