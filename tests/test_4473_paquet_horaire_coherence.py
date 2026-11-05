@@ -132,7 +132,7 @@ class UnitTest(unittest.TestCase):
     def test_the_rendered_unit_gives_the_tree_library_to_the_tick(self):
         text = role_timers.render_paquet_service(
             role="mesh-design", bin_path="/opt/ameesh/bin/ameesh")
-        self.assertIn("pull --ff-only --tags --quiet", text)
+        self.assertIn("pull --ff-only --tags --force --quiet", text)
         self.assertIn(
             "/usr/bin/env PYTHONPATH=${AMEESH_PAQUET_REPO}/src "
             "/opt/ameesh/bin/python ${AMEESH_PAQUET_REPO}/scripts/"
@@ -143,7 +143,7 @@ class UnitTest(unittest.TestCase):
     def test_the_deploy_copy_carries_the_same_binding(self):
         text = (ROOT / "deploy" / "systemd" /
                 "ameesh-paquet-horaire.service").read_text(encoding="utf-8")
-        self.assertIn("pull --ff-only --tags --quiet", text)
+        self.assertIn("pull --ff-only --tags --force --quiet", text)
         # la copie manuelle coupe ses ExecStart par des « \ » de fin de ligne
         flat = " ".join(text.replace("\\\n", " ").split())
         self.assertIn(

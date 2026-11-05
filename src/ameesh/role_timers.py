@@ -815,7 +815,7 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
         "EnvironmentFile=%h/.config/ameesh/env",
         "EnvironmentFile=-%h/.config/ameesh/release.env",
         "EnvironmentFile=%s" % PAQUET_ENV.replace("~", "%h", 1),
-        "ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --tags --quiet "
+        "ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --tags --force --quiet "
         "origin ${AMEESH_PAQUET_TARGET}",
         "# #4473: the script AND its `ameesh` library come from the clone; the",
         "# installed venv only supplies the interpreter (and the `role run` gate).",

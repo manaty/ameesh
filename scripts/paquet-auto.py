@@ -795,7 +795,7 @@ def validate_target(repo: Path, target: str) -> None:
 
 def fresh_base(repo: Path, target: str) -> str:
     """La tête fraîche d'`origin/<cible>` ; le SHA exact est noté."""
-    proc = git(repo, "fetch", "--tags", "origin", target, check=False,
+    proc = git(repo, "fetch", "--tags", "--force", "origin", target, check=False,
                timeout=GIT_TIMEOUT)
     if proc.returncode != 0:
         raise PaquetAutoError(

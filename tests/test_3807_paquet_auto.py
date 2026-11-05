@@ -120,6 +120,19 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "--is-shallow-repository", cwd=clone)
                          .stdout.strip(), "false")
 
+    def test_fresh_base_remplace_un_tag_local_divergent(self):
+        self.git("tag", "v1.39.0")
+        clone = pathlib.Path(self.tmp.name) / "composeur"
+        self.git("clone", str(self.repo), str(clone))
+        self.write("release.txt", "nouvelle release\n")
+        upstream = self.commit("release")
+        self.git("tag", "--force", "v1.39.0", upstream)
+        self.assertEqual(self.rev("v1.39.0", cwd=clone), self.base)
+        self.assertEqual(paquet_auto.fresh_base(clone, "main"), upstream)
+        self.assertEqual(self.rev("v1.39.0", cwd=clone), upstream)
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository", cwd=clone)
+                         .stdout.strip(), "false")
+
     def test_non_concluant_consigne_sans_retirer_d_unite(self) -> None:
         composition = paquet_auto.Composition(
             units=[paquet_auto.Unit(1, "0" * 40, "1" * 40)],
