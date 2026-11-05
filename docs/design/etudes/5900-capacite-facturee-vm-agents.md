@@ -1,7 +1,7 @@
 ---
 type: Study
 title: "#5900 — billed capacity of the agent VMs, fitted to the work that actually runs"
-description: "Owner request of 05/11/2026 relayed by bureau (manaty/ameesh#4489): a process that fits the cost of ameesh-agents-1/2/3 to what is needed, without slowing Nexlink. Seven-day diagnostic from the mesh database, state of #4147/#4148/#4150/#4151 (release path inert end to end), sourced Scaleway prices including disks and IP, cost per state, options compared, a first bounded target (agents-3 GP1-S → GP1-XS, −71 €/month), hysteresis rules, proposed lots C1–C6 and owner questions Q1–Q4. No code, no machine gesture."
+description: "Owner request of 05/11/2026 relayed by bureau (manaty/ameesh#4489): a process that fits the cost of ameesh-agents-1/2/3 to what is needed, without slowing Nexlink. Seven-day diagnostic from the mesh database, state of #4147/#4148/#4150/#4151 (release path inert end to end), sourced Scaleway prices including disks and IP, cost per state, options compared, a first bounded target (agents-3 GP1-S → GP1-XS, −71 €/month), hysteresis rules, proposed lots C1–C6 and owner questions Q1–Q3. No code, no machine gesture."
 status: draft
 tags: [capacite, hotes, cout, scaleway, drainage, placement, burst, baseline]
 generated: { by: "mty-amh-impl-18/claude-opus-5-5", at: "2026-11-05T08:30:00Z" }
@@ -239,7 +239,7 @@ published.
 
 **Fleet today: 3 × 148.26 ≈ 445 €/month excl. VAT.** One caveat: the
 catalog prices local SSD as a separate line. Only an invoice can confirm
-that GP1 does not include it (Q4).
+that GP1 does not include it (Q3).
 
 # 5. Options
 
@@ -341,7 +341,14 @@ change on billed infrastructure, even though it lowers the cost.
 - **No power-off on spot averages.** The decision uses the per-turn memory
   peaks and the history of C4, never one reading or the average CPU.
 
-# 8. Proposed lots (on owner decision)
+# 8. Proposed lots
+
+The pilot's note of 05/11 06:50 on the lot, agreed with bureau (#192699),
+says the rule of 28/10 needs no new decision. The lots that apply it, C2–C5,
+follow this study once reviewed, with no owner round trip. C1 is a different
+case: a resize is not in the rule, so it goes to the owner (Q1). C6 would be
+a decision on infrastructure as well.
+
 
 | Lot | Content | Class | Estimate |
 |---|---|---|---|
@@ -364,7 +371,5 @@ more, or if option D is chosen.
   directly to D (−139.24 €/month, higher risk)?
 - **Q2.** Is bureau the one who runs the Scaleway gesture with the existing
   key, as for ci-autoscale? And for C5, which host holds the adapter key?
-- **Q3.** Should C2–C5 be built now, when they bring no saving under today's
-  load, or only after C6?
-- **Q4.** Can someone check one Scaleway invoice line: is the local SSD of
+- **Q3.** Can someone check one Scaleway invoice line: is the local SSD of
   the GP1 billed apart (5.37 €/month per VM) or included?
