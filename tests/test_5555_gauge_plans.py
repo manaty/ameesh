@@ -63,6 +63,24 @@ def _only_gauge_readings(node) -> bool:
     return bool(children) and all(_only_gauge_readings(child) for child in children)
 
 
+_RESETS_LOW = re.compile(r"\bresets_at\s*>=")
+_RESETS_HIGH = re.compile(r"\bresets_at\s*<=")
+
+
+def _window_bounded(node) -> bool:
+    """#5952 : un parcours d'index borné des DEUX côtés sur `resets_at`.
+
+    Le départage dans une fenêtre gigotée trie les relevés d'une seule
+    fenêtre (échéances entre la tête − tolérance et la tête), jamais
+    l'historique : ce tri borné est admis. Une seule borne laisse le
+    parcours descendre tout l'historique : refusé comme avant.
+    """
+    if node.get("Node Type") != "Index Scan" or node.get("Relation Name") != TABLE:
+        return False
+    cond = node.get("Index Cond") or ""
+    return bool(_RESETS_LOW.search(cond) and _RESETS_HIGH.search(cond))
+
+
 def _table_plan_problems(roots) -> list[str]:
     """Les balayages complets et tris de la table que #5555 interdit."""
     problems = []
@@ -72,7 +90,8 @@ def _table_plan_problems(roots) -> list[str]:
                 and node.get("Relation Name") == TABLE:
             problems.append("Seq Scan sur " + TABLE)
         if kind in ("Sort", "Incremental Sort") and any(
-                _only_gauge_readings(child) for child in node.get("Plans", [])):
+                _only_gauge_readings(child) and not _window_bounded(child)
+                for child in node.get("Plans", [])):
             problems.append("Sort des lignes de " + TABLE)
     return problems
 
@@ -244,6 +263,26 @@ class GaugePlanCheckTest(unittest.TestCase):
             ],
         }]
         self.assertEqual(_table_plan_problems(roots), [])
+
+    def test_a_sort_of_one_bounded_window_is_allowed(self):
+        """#5952 : le départage dans la fenêtre trie une fenêtre, pas l'historique."""
+        def sort_over(cond):
+            return [{"Node Type": "Limit", "Plans": [{
+                "Node Type": "Sort",
+                "Plans": [{"Node Type": "Index Scan",
+                           "Index Name": "quota_gauge_readings_window_seek_idx",
+                           "Relation Name": TABLE, "Index Cond": cond}],
+            }]}]
+        both = ("((harness = h.harness) AND (gauge_key = h.gauge_key) AND "
+                "(resets_at >= (h.resets_at - '00:05:00'::interval)) AND "
+                "(resets_at <= h.resets_at))")
+        self.assertEqual(_table_plan_problems(sort_over(both)), [])
+        low_only = ("((harness = h.harness) AND "
+                    "(resets_at >= (h.resets_at - '00:05:00'::interval)))")
+        self.assertEqual(_table_plan_problems(sort_over(low_only)),
+                         ["Sort des lignes de " + TABLE])
+        self.assertEqual(_table_plan_problems(sort_over("(harness = 'codex'::text)")),
+                         ["Sort des lignes de " + TABLE])
 
 
 # -- garde statique ---------------------------------------------------------
