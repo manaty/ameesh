@@ -30,6 +30,15 @@ Le tag N-1 est le plus récent `v*` atteignable depuis HEAD et qui ne le
 contient pas. Un clone sans tags (CI en profondeur 1) rend ce module sauté,
 sauf sous AMEESH_TEST_N1_REQUIS=1 (job « préflight N-1 » de tests.yml, clone
 complet) où l'absence est un échec : la barrière ne se perd pas en silence.
+
+#5954 : un clone dont les tags n'ont pas suivi la forge est aussi sauté hors
+du job requis. Le clone dédié du composeur de paquets (`git pull --ff-only`,
+sans `--tags`) ne récupère pas les tags de release : le banc y jouerait un N-1
+de plusieurs releases en arrière et son rendu d'unités, différent, ferait
+rougir le retour arrière pour une raison qui ne dit rien du vrai N-1. La
+version du paquet au checkout est celle que la release a taguée : un tag plus
+ancien qu'elle trahit ce clone, et le job CI (clone complet, REQUIS) reste le
+seul juge.
 """
 from __future__ import annotations
 
@@ -64,7 +73,21 @@ def release_precedente(root: Path = ROOT) -> str:
     return tags[0] if tags else ''
 
 
+def version_du_paquet(root: Path = ROOT) -> str:
+    """La version du paquet au checkout, préfixée `v` (vide si illisible)."""
+    try:
+        texte = (root / 'pyproject.toml').read_text(encoding='utf-8')
+    except OSError:
+        return ''
+    trouve = re.search(r'(?m)^version\s*=\s*"(\d+\.\d+\.\d+)"', texte)
+    return 'v' + trouve.group(1) if trouve else ''
+
+
 TAG = release_precedente()
+VERSION = version_du_paquet()
+#: Le tag retenu est celui que la version du paquet a tagué (la release pose
+#: les deux dans le même commit). Sinon les tags du clone sont en retard.
+TAG_FIABLE = not TAG or not VERSION or TAG == VERSION
 
 # Amorce du CLI installé : le code d'un arbre `src` (N-1 ou N) sous l'interpréteur
 # du banc, base et ligne de rôle simulées. `-I` : ni PYTHONPATH ni dossier
@@ -140,7 +163,12 @@ l'hôte du banc et fait lire le canon et `github.projects` par `role timers`.
 '''
 
 
-@unittest.skipUnless(TAG or REQUIS, 'aucun tag de release atteignable (clone sans tags)')
+MOTIF_N1 = ('aucun tag de release atteignable (clone sans tags)' if not TAG else
+            'tags du clone en retard : %s alors que le paquet est %s (#5954)'
+            % (TAG, VERSION or 'illisible'))
+
+
+@unittest.skipUnless(REQUIS or (TAG and TAG_FIABLE), MOTIF_N1)
 class PreflightCliPrecedentTest(VmAgentsHarness):
     cli = TAG  # la release dont le code est le CLI installé
     #: #5954 : l'hôte du banc est candidat du rôle `mesh-design` (le défaut de
