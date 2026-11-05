@@ -319,6 +319,8 @@ TYPE_LABELS = {
     "runner_pressure": "runner at its own memory ceiling",
     "host_unsampled": "host sampler silent",
     "orphan_resource": "orphan resource",
+    # #5857: turn resources of a host whose only reading is publish@
+    "host_no_executor": "host without executor holds turn resources",
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of {work}",
     # #3396 : le doute sur les processus retient les retraits ; #3802 : un
