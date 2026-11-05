@@ -793,8 +793,13 @@ class HostLifecycle(interface.HostLifecycle):
             # `draining` (same generation, same `return_at`), never `available`.
             # Detection keeps the generation of a draining host, so only a
             # loss observed while draining has `release_generation` equal to
-            # it; an expired window returns as before.
+            # it; an expired window returns as before. A detector of the
+            # previous version clears `return_at` but keeps both generations:
+            # the drain is restored open-ended, never reopened. The 0507
+            # backfill gave a row already lost `release_generation=generation`
+            # with `release_state='busy'`; only a drain writes `draining`.
             restore = (control.get("release_generation") == control["generation"]
+                       and control.get("release_state") == "draining"
                        and not control.get("automatic")
                        and (control.get("return_ts") is None
                             or float(control["return_ts"]) > now["now_ts"]))

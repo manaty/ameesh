@@ -74,6 +74,24 @@ class DrainSurvivesLossTest(PgTestCase):
         self.assertEqual(self.reconcile()["mode"], "draining")
         self.assertIsNone(self.api.host_lifecycle.get("source")["return_ts"])
 
+    def test_a_previous_version_detector_still_restores_the_drain(self):
+        # N-1 detector: draining -> lost with return_at=NULL, generations kept.
+        drained = self.drain(duration=12 * 3600)
+        self.lose()
+        self.db.execute("UPDATE host_lifecycle SET return_at=NULL WHERE host='source'")
+        self.returned()
+        self.assertEqual(self.reconcile()["mode"], "draining")
+        row = self.api.host_lifecycle.get("source")
+        self.assertEqual((row["generation"], row["return_ts"]), (drained["generation"], None))
+
+    def test_a_backfilled_lost_row_is_no_drain_intent(self):
+        # 0507 backfill of a row already lost: generations equal, release busy.
+        self.lose()
+        self.db.execute("UPDATE host_lifecycle SET release_generation=generation, "
+                        "release_state='busy' WHERE host='source'")
+        self.returned()
+        self.assertEqual(self.reconcile()["mode"], "available")
+
     def test_an_expired_drain_returns_available_as_before(self):
         self.drain(duration=12 * 3600)
         self.lose()
