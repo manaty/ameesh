@@ -906,14 +906,16 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                 detail = ("Host %s: the VM adapter queued %s %ds ago but its "
                           "operator worker has %s (stall bound %ds): the request "
                           "is not progressing. Claims %s and the acknowledged "
-                          "state (%s) are kept. Check the worker timer/journal "
+                          "state (%s) are kept. A deliberate host hold also "
+                          "pauses the adapter: check `ameesh hosts %s` before "
+                          "acting. Otherwise check the worker timer/journal "
                           "(`systemctl status ameesh-vm-adapter.timer`, "
                           "`journalctl -u ameesh-vm-adapter`); do not clear the "
                           "hook while a VM may be stopped." % (
                               host, stalled.get("state"),
                               int(_age(stalled) or 0.0), seen, int(stall),
                               "open" if control.get("claims_open") else "closed",
-                              control.get("hook_state") or "none"))
+                              control.get("hook_state") or "none", host))
             else:
                 detail = ("Host %s: the VM adapter queued idle-drained with a "
                           "durable poweroff intent %ds ago (stall bound %ds). The VM "
