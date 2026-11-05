@@ -110,6 +110,16 @@ class PaquetAutoBanc(unittest.TestCase):
         return first, conflict, third
 
     # -- témoins -----------------------------------------------------------
+    def test_fresh_base_rapatrie_un_tag_sans_changement_de_branche(self):
+        clone = pathlib.Path(self.tmp.name) / "composeur"
+        self.git("clone", "--no-tags", str(self.repo), str(clone))
+        self.git("tag", "v1.39.0", cwd=self.repo)
+        self.assertEqual(self.git("tag", "--list", cwd=clone).stdout, "")
+        self.assertEqual(paquet_auto.fresh_base(clone, "main"), self.base)
+        self.assertEqual(self.git("tag", "--list", cwd=clone).stdout.strip(), "v1.39.0")
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository", cwd=clone)
+                         .stdout.strip(), "false")
+
     def test_non_concluant_consigne_sans_retirer_d_unite(self) -> None:
         composition = paquet_auto.Composition(
             units=[paquet_auto.Unit(1, "0" * 40, "1" * 40)],
