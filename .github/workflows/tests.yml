@@ -1345,7 +1345,7 @@ jobs:
     # #3198 : hors demande de gel (étiquette `ci-macos`), il saute et change de
     # nom — jamais de `tests` vert sans tests.
     if: always() && github.event.label.name != 'ci-macos'
-    needs: [qualification, plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
+    needs: [qualification, plan, version, psycopg, psql, platform-macos, doc-readers, fs-class, preflight-n1]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
@@ -1429,6 +1429,7 @@ jobs:
             --psql-full "${{ inputs.psql-full }}" \
             --plateforme-macos "${{ needs.platform-macos.result }}" \
             --autre-fs "${{ needs.fs-class.result }}" \
+            --preflight-n1 "${{ needs.preflight-n1.result }}" \
             --ref "${{ github.ref }}" \
             --qualified "${{ needs.plan.outputs.reuse }}" \
             --qualified-packet "${{ needs.qualification.outputs.packet }}" \
@@ -1497,6 +1498,39 @@ jobs:
         run: python -m unittest tests.test_3379_argparse_help -v
       - name: aide de la commande installée
         run: ameesh --help
+
+  # #5947 : le préflight de vm.sh (`agents verifier`, et le contrôle qui
+  # suit un retour arrière) joué avec, comme CLI installé, le code du dernier
+  # tag de release : la CI ne voyait que N, le staging 1.39.0 a échoué deux
+  # fois au préflight (#5937). Les parts ordinaires clonent en profondeur 1,
+  # sans tags, et sautent ce module ; ce job clone l'historique et l'exige
+  # (AMEESH_TEST_N1_REQUIS), son rouge rougit l'agrégat `tests`.
+  preflight-n1:
+    name: préflight N-1 (vm.sh)
+    needs: plan
+    if: github.event.label.name != 'ci-macos' && needs.plan.outputs.reuse != 'true' && needs.plan.outputs.code == 'true'
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      AMEESH_REQUIRE_DB: "0"
+      AMEESH_TEST_N1_REQUIS: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0  # les tags de release : le CLI N-1 en est extrait
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      # venv du job : un runner auto-hébergé ne garde rien dans le Python partagé
+      - name: installation
+        run: |
+          python -m venv "$RUNNER_TEMP/n1"
+          "$RUNNER_TEMP/n1/bin/python" -m pip install -q '.[psycopg,crypto]' 'pyyaml>=6'
+      - name: préflight de vm.sh contre le CLI de la release précédente
+        run: |
+          "$RUNNER_TEMP/n1/bin/python" -m unittest -v tests.test_5947_preflight_cli_n_moins_1
 
   # L98 T2b (#4408) : le cœur au profil nu (`AMEESH_MODULES=bare`), sans module
   # intégré : registre, modules de projet et frontière L97 (test_generic_core),

@@ -100,6 +100,8 @@ class WorkflowContractTest(unittest.TestCase):
         "inputs.psql-full": "--psql-full",
         "needs.platform-macos.result": "--plateforme-macos",
         "needs.fs-class.result": "--autre-fs",
+        # #5947 : le préflight de vm.sh contre le CLI de la release précédente.
+        "needs.preflight-n1.result": "--preflight-n1",
         # #5729 : la décision appliquée par le plan et la réf du run ; les
         # détails de la preuve viennent du job de qualification.
         "github.ref": "--ref",
