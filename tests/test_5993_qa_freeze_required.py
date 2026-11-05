@@ -71,6 +71,31 @@ class QaFreezeRequiredTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
 
+    def test_tete_poussee_apres_le_gel_refusee(self):
+        # N1 par le chemin bloqué : gel A, qa → blocked, poussée de B vue par
+        # le balayage, puis blocked → qa. Aucun passage en build : c'est la
+        # comparaison du gel à la tête de branche qui doit refuser.
+        self._freeze_row()
+        self.assertEqual(self._move("qa").returncode, 0)
+        self.assertEqual(self._move("blocked", "--note", "attente").returncode, 0)
+        self.db.execute(
+            "UPDATE work_items SET branch_head = %s,"
+            " branch_head_at = clock_timestamp() WHERE id = %s",
+            ("b" * 40, self.lot))
+        proc = self._move("qa")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("not its branch head", proc.stderr)
+        self.assertIn("ameesh work milestone %d frozen --sha" % self.lot,
+                      proc.stderr)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "blocked")
+        # le gel de la tête poussée rouvre la revue
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'frozen', %s, 'auteur')", (self.lot, "b" * 40))
+        proc = self._move("qa")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+
     def test_reviewer_explicite_ne_dispense_pas_du_gel(self):
         self.register("relecteur", "codex", cwd=self.tmp)
         proc = self.mesh("work", "move", str(self.lot), "qa",
