@@ -17,7 +17,9 @@ from .resources import parse_bytes
 
 DEFAULT_ORPHAN_VOLUMES = 100
 DEFAULT_BUILD_CACHE = 20 * 1024 ** 3
-MAX_AGE_S = 1800
+#: #5861 : un inventaire est périmé après ce nombre de périodes de la passe
+#: de ménage qui le relève (une passe perdue est tolérée, pas deux)
+STALE_PERIODS = 2
 
 
 def _run(runtime, args):
@@ -108,15 +110,50 @@ def collect(runtime, *, now=None) -> dict | None:
     return out
 
 
-def findings(data: dict, policy, host: str, now: float) -> list[dict]:
-    """Findings from the last persisted measurement, never run Docker here."""
+def pass_period(interval_s, budget_s) -> float | None:
+    """#5861 : the longest wait between two inventories of a host, from the
+    measuring host's own cadence: the housekeeping interval plus the pass
+    budget (the inventory is taken at the end of the pass). None without a
+    periodic pass: nothing to expect then."""
+    try:
+        interval, budget = float(interval_s), float(budget_s)
+    except (TypeError, ValueError):
+        return None
+    if not interval > 0 or not budget >= 0:
+        return None
+    return interval + budget
+
+
+def default_pass_period() -> float:
+    """The period of a measurement that did not record its own (before #5861):
+    the configuration's default interval and the default pass budget."""
+    from .config import Config
+    from .housekeeping import HOST_PASS_BUDGET_S
+    return pass_period(Config.housekeeping_interval, HOST_PASS_BUDGET_S)
+
+
+def findings(data: dict, policy, host: str, now: float, *,
+             executor: bool = True) -> list[dict]:
+    """Findings from the last persisted measurement, never run Docker here.
+
+    #5861 : the inventory is stale after `STALE_PERIODS` periods of the pass
+    that takes it (`pass_period_s`, recorded by the measuring host). A host
+    without an executor (`executor=False`) has no periodic pass: its old
+    inventory raises nothing, the host-level alert says the executor is
+    missing."""
     since = data.get('sampled_ts')
     if not isinstance(since, (int, float)):
         return []
     common = {'host': host, 'agent': None, 'since': None, 'sampled_ts': since}
-    if now - since > MAX_AGE_S:
-        return [dict(common, type='docker_storage_unavailable', value=None, threshold=MAX_AGE_S,
-                     message='Docker storage inventory on %s is stale; run ameesh menage' % host)]
+    period = data.get('pass_period_s', default_pass_period())
+    if executor and isinstance(period, (int, float)) and period > 0:
+        max_age = STALE_PERIODS * period
+        if now - since > max_age:
+            return [dict(common, type='docker_storage_unavailable', value=int(now - since),
+                         threshold=int(max_age),
+                         message='Docker storage inventory on %s is stale (%ds, threshold '
+                                 '%d periods of %ds of the housekeeping pass); run ameesh '
+                                 'menage' % (host, now - since, STALE_PERIODS, period))]
     out = []
     for key, threshold, kind, subject in (
         ('orphan_volumes', policy.docker_orphan_volumes_alert, 'docker_orphan_volumes', 'orphan volumes'),

@@ -1927,6 +1927,8 @@ controler_agents() {
   # appel direct sous runuser n'a pas cet environnement et échoue sur un hôte
   # sain. `ameesh_agents` passe par systemd-run + EnvironmentFile, comme doctor.
   ameesh_agents role timers --check || echec=1
+  # #5863 : le passage court de l'auditeur, posé jusqu'ici à la main (3 h).
+  ameesh_agents role timers --role auditeur --check || echec=1
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
   echo "contrôles verts"
 }
@@ -1938,6 +1940,9 @@ timers_agents() {
   etape "minuteries de rôle (EP5) sur $HOTE_AGENTS"
   # #3311 × #3327 : même environnement que le service (DSN, canon, github).
   ameesh_agents role timers --install
+  # #5863 : le passage court de l'auditeur, chaque heure, sous son bail élu ;
+  # remplace la copie manuelle du même nom. Sans rôle auditeur : rien.
+  ameesh_agents role timers --role auditeur --install
 }
 
 installer_agents() {

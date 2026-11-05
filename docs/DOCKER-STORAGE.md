@@ -8,6 +8,13 @@ avoids `docker system df` and recursive volume-size scans, which were slow
 during the owner's concurrent prune. Podman and an absent Docker runtime are
 not measured by this feature.
 
+The inventory records the measuring host's pass period (`pass_period_s`: the
+housekeeping interval plus the pass budget, #5861). It is reported stale
+(`docker_storage_unavailable`) once older than two such periods, so a single
+lost pass raises nothing. A host without an executor (reading published by
+`ameesh hosts --publish`) has no periodic pass: its old inventory raises no
+staleness alert.
+
 Since #2003 the same pass also **reaps the dangling volumes the mesh has
 declared disposable**, and only those: conservation is the default, and the
 declaration is explicit. Two labels declare it: the generic lifetime label
