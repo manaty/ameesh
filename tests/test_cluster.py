@@ -125,6 +125,9 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #6017 (0552) : sonde admise sur un retour clos, tenue par l'adaptateur VM
+    # et lue par le prédicat de prise ; fermée aux deux rôles, aucun GRANT modifié.
+    "host_lifecycle": {"return_probe"},
     # #5561 / 0536: accounting reconciliation audit stays internal to both roles.
     "spend_marker_events": {"id", "agent", "marker_created_at", "marker_spend_key",
                             "event", "ledger_key", "actor", "reason", "snapshot",

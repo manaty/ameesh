@@ -80,6 +80,10 @@ def enrollment(value, *, local_host=None):
                 raise Refused('exact VM and project UUIDs required') from None
         if not re.fullmatch(r'[a-z]{2}-[a-z]{3}-[1-9]', target.get('zone', '')):
             raise Refused('invalid target zone')
+        # #6017: the one identity the health command runs on a closed return.
+        probe = target.get('probe_agent')
+        if not isinstance(probe, str) or not config.NAME_RE.fullmatch(probe):
+            raise Refused('explicit probe agent required')
         identity = (target['zone'], target['server_id'])
         if identity in seen:
             raise Refused('duplicate VM mapping')
@@ -245,12 +249,16 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
     # outside our transaction, then revalidate generation, provider and fresh
     # reading under the gate before acknowledging. No probe opens claims.
     prepared = Queue(db).pending(host)
-    health_ok = reconciliation_ok = False
+    health_ok = reconciliation_ok = probed = False
+    # #6017: the probe runs only once the closed return admits its identity.
     if (prepared and prepared[0]['state'] == 'busy' and current(control, prepared[0])
+            and control['mode'] == 'returning'
+            and Queue(db).return_probe(host) == target['probe_agent']
             and not any(h['host'] == host for h in store.hosts.holds())
             and provider.state(target) == 'running'
             and host_release._fresh_reading(cfg, db, host, now=Queue(db).now(),
                                             after=control['requested_ts'])):
+        probed = True
         health_ok = probe(target['health_argv'], policy['io_timeout_s'])
         if health_ok:
             reconciliation_ok = probe(target['reconcile_argv'], policy['io_timeout_s'])
@@ -334,9 +342,19 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
         after = max(observed['on_ts'] or now, observed['poweron_ts'] or 0, control['requested_ts'])
         if not host_release._fresh_reading(cfg, tx, host, now=now, after=after):
             return 'fresh reading pending'
+        if control['mode'] != 'returning' or control['return_probe'] != target['probe_agent']:
+            # Running and reporting: admit the probe identity alone, claims
+            # stay closed; the health turn runs on the next tick (#6017).
+            q.admit_probe(request, target['probe_agent'])
+            return 'probe admitted'
         if (not prepared or prepared[0]['generation'] != request['generation']
-                or prepared[0]['release_epoch'] != request['release_epoch'] or not health_ok):
+                or prepared[0]['release_epoch'] != request['release_epoch'] or not probed):
             return 'health pending'
+        if not health_ok:
+            # Back to draining, probe cleared, never lost: the next tick
+            # admits it again while the return is still due.
+            q.refuse_probe(request)
+            return 'health failed'
         if not reconciliation_ok:
             return 'reconciliation pending'
         # Probes cannot substitute for a database reading or reopen claims.

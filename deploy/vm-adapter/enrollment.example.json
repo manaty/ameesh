@@ -15,7 +15,8 @@
       "release_windows": ["11:00", "23:00"],
       "quiesce_argv": ["/opt/ameesh-vm-adapter/checks/quiesce-burst-host"],
       "health_argv": ["/opt/ameesh-vm-adapter/checks/health-burst-host"],
-      "reconcile_argv": ["/opt/ameesh-vm-adapter/checks/reconcile-burst-host"]
+      "reconcile_argv": ["/opt/ameesh-vm-adapter/checks/reconcile-burst-host"],
+      "probe_agent": "burst-host-probe"
     }
   }
 }

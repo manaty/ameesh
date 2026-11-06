@@ -75,7 +75,7 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
 
 ## Préparer l'installation (bureau, feu distinct)
 
-1. Appliquer la migration additive 0547 avant le nouveau code. Installer la
+1. Appliquer les migrations additives 0547 et 0552 (#6017) avant le nouveau code. Installer la
    version revue dans `/opt/ameesh-vm-adapter/venv`, dans un arbre que les agents
    ne peuvent modifier. Aucune installation n'est effectuée par ce lot.
 2. Choisir **l'hôte du détenteur actuel de la clé**, hors des VM cibles.
@@ -101,6 +101,10 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    et vérifie la réconciliation native des exécuteurs/identités, sans ouvrir
    les prises ni forcer un état lost. Utiliser l'accès SSH déjà autorisé,
    avec clé et known_hosts opérateur fixes, aucun login/secret d'agent.
+   `probe_agent` nomme la seule persona de l'hôte que `health_argv` fait
+   tourner (#6017) : au réveil, l'adaptateur passe l'hôte en `returning`
+   prises fermées et n'admet qu'elle ; un échec de santé le remet en
+   `draining`, sans lost.
 6. Faire relire les mappings, les trois commandes, les durées, les créneaux,
    les permissions des fichiers et l'unité avec `systemd-analyze verify`.
    Tester le cycle cloud simulé avant tout feu réel. Faire valider séparément
