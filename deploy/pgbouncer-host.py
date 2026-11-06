@@ -224,12 +224,14 @@ def install(home, state, config):
     private_dir(state / 'socket')
     # Resolve defaults and .pgpass in libpq, without writing secrets to argv.
     with psycopg.connect(cfg.dsn, connect_timeout=10) as conn:
+        # get_parameters() omits values equal to libpq defaults (port 5432,
+        # user or dbname from the environment): read the resolved ones.
         params = conn.info.get_parameters()
+        dbname, user = conn.info.dbname, conn.info.user
+        upstream, port = conn.info.host, str(conn.info.port)
         password = conn.pgconn.password.decode()
         if not conn.pgconn.ssl_in_use:
             raise ValueError('upstream must use TLS')
-    dbname, user = params['dbname'], params['user']
-    upstream, port = params['host'], params['port']
     if not all(re.fullmatch(r'[A-Za-z0-9_.:-]+', value)
                for value in (dbname, user, upstream, port)):
         raise ValueError('unsupported upstream identifiers')
