@@ -155,9 +155,12 @@ class JournalTourTest(unittest.TestCase):
         found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
         self.assertEqual(found["usage"]["input_tokens"], 30_000)
         self.assertEqual(found["peak_usage"]["input_tokens"], 150_000)
+        self.assertFalse(found["peak_partial"])
         # Deux preuves de la même compaction ne comptent qu'une fois.
-        self.assertEqual(found["compaction"], {
-            "pre": 150_000, "post": 30_000, "count": 1})
+        self.assertEqual(found["compaction"]["pre"], 150_000)
+        self.assertEqual(found["compaction"]["post"], 30_000)
+        self.assertEqual(found["compaction"]["count"], 1)
+        self.assertEqual(found["compaction"]["reasons"], [])
 
     def test_deux_compactions_dans_le_meme_tour(self):
         _journal(self.sessions, [
@@ -186,6 +189,70 @@ class JournalTourTest(unittest.TestCase):
         self.assertEqual(found["compaction"]["pre"], 90_000)
         self.assertIsNone(found["compaction"]["post"])
         self.assertEqual(found["compaction"]["count"], 1)
+
+    # -- #6044 B1 : un appel illisible garde sa place et rend le pic partiel
+    def test_pic_minorant_quand_un_appel_est_illisible(self):
+        # Le pic réel peut être l'appel illisible : 100 000 n'est qu'un
+        # minorant, publié `partial` avec sa raison, jamais `measured`.
+        _journal(self.sessions, [
+            _task(2000),
+            _token({"input_tokens": 100_000, "output_tokens": 100}),
+            _token({"output_tokens": 5}),
+            _token({"input_tokens": 50_000, "output_tokens": 50}),
+        ])
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertTrue(found["peak_partial"])
+        self.assertEqual(found["peak_reasons"],
+                         [context_metrics.REASON_CALL_USAGE_UNKNOWN])
+        self.assertEqual(found["peak_usage"]["input_tokens"], 100_000)
+        self.assertIsNone(found["compaction"])
+
+    def test_deux_compactions_separees_par_un_appel_illisible(self):
+        # L'appel illisible ne disparaît pas de la chronologie : il sépare
+        # bien deux compactions, et sa frontière reste inconnue.
+        _journal(self.sessions, [
+            _task(2000),
+            _token({"input_tokens": 100_000, "output_tokens": 100}),
+            _compacted(),
+            _token({"output_tokens": 5}),
+            _compacted(),
+            _token({"input_tokens": 50_000, "output_tokens": 50}),
+        ])
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertEqual(found["compaction"]["count"], 2)
+        self.assertEqual(found["compaction"]["pre"], 100_000)
+        self.assertEqual(found["compaction"]["post"], 50_000)
+        self.assertIn(context_metrics.REASON_CALL_USAGE_UNKNOWN,
+                      found["compaction"]["reasons"])
+
+    def test_apres_compaction_ne_saute_pas_un_appel_illisible(self):
+        # Le premier appel après la frontière est illisible : `post` reste
+        # inconnu, il n'emprunte pas le contexte de l'appel suivant.
+        _journal(self.sessions, [
+            _task(2000),
+            _token({"input_tokens": 100_000, "output_tokens": 100}),
+            _compacted(),
+            _token({"output_tokens": 5}),
+            _token({"input_tokens": 50_000, "output_tokens": 50}),
+        ])
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertEqual(found["compaction"]["count"], 1)
+        self.assertEqual(found["compaction"]["pre"], 100_000)
+        self.assertIsNone(found["compaction"]["post"])
+        self.assertIn(context_metrics.REASON_CALL_USAGE_UNKNOWN,
+                      found["compaction"]["reasons"])
+
+    def test_dernier_appel_illisible_ne_prete_pas_l_usage_precedent(self):
+        # C_last est celui du dernier `token_count`, pas du dernier lisible.
+        _journal(self.sessions, [
+            _task(2000),
+            _token({"input_tokens": 100_000, "output_tokens": 100}),
+            _token({"output_tokens": 5}),
+        ])
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertIsNotNone(found["usage"])
+        self.assertEqual(found["usage"], {"output_tokens": 5})
+        self.assertTrue(found["peak_partial"])
 
     def test_demande_de_compaction_n_est_pas_une_reussite(self):
         # `compaction_trigger` (et l'item de réponse `context_compaction`)
@@ -253,6 +320,22 @@ class NormalizerJournalTest(unittest.TestCase):
         self.assertEqual(measures["C_last"]["value"], 30_000)
         self.assertEqual(measures["C_peak"]["value"], 150_000)
         self.assertEqual(measures["C_peak"]["quality"], "measured")
+
+    def test_pic_minorant_du_journal_est_partiel(self):
+        # #6044 B1 : le runner publie la qualité du pic même quand le dernier
+        # appel, lui, est lisible.
+        normalizer = context_metrics.TurnNormalizer("codex", session="s")
+        normalizer.journal_call(
+            {"input_tokens": 30_000, "output_tokens": 50},
+            peak_usage={"input_tokens": 150_000},
+            peak_partial=True,
+            peak_reasons=(context_metrics.REASON_CALL_USAGE_UNKNOWN,))
+        measures = normalizer.finish()["measures"]
+        self.assertEqual(measures["C_last"]["quality"], "measured")
+        self.assertEqual(measures["C_peak"]["value"], 150_000)
+        self.assertEqual(measures["C_peak"]["quality"], "partial")
+        self.assertIn(context_metrics.REASON_CALL_USAGE_UNKNOWN,
+                      measures["C_peak"]["reasons"])
 
     def test_pic_du_flux_est_le_max_des_appels(self):
         normalizer = context_metrics.TurnNormalizer("claude", session="s")
@@ -412,6 +495,20 @@ class TurnContextCodexTest(PgTestCase):
         self.assertEqual(measures["C_peak"]["value"], 61_000)
         self.assertIsNone(data["context"]["compaction"])
         self.assertIs(data["decision"]["compacted"], False)
+
+    def test_pic_minorant_quand_un_appel_du_journal_est_illisible(self):
+        # #6044 B1 : le runner propage la qualité du pic même quand le
+        # dernier appel du journal, lui, est lisible.
+        worker = self._worker("cx-pic-partiel")
+        self.assertTrue(self._tour(worker, compact="unknown"))
+        data = self._published("cx-pic-partiel")
+        measures = data["context"]["measures"]
+        self.assertEqual(measures["C_last"]["value"], 20_000)
+        self.assertEqual(measures["C_last"]["quality"], "measured")
+        self.assertEqual(measures["C_peak"]["value"], 50_000)
+        self.assertEqual(measures["C_peak"]["quality"], "partial")
+        self.assertIn(context_metrics.REASON_CALL_USAGE_UNKNOWN,
+                      measures["C_peak"]["reasons"])
 
     def test_demande_de_compaction_ne_publie_pas_compacted(self):
         worker = self._worker("cx-demande")

@@ -132,10 +132,14 @@ Règles :
   fait retomber `C_last`. Les compactions se lisent au même endroit : l'item
   de rollout `compacted` et l'événement `context_compacted` prouvent une
   compaction réussie ; un `compaction_trigger` (demande) n'en est pas une
-  (§4.2). Un tour sans relevé garde `null` + `context_unknown` avec son motif
-  (`no_call`, `journal_missing`, `turn_not_in_journal`,
-  `last_token_usage_missing`) ; l'usage d'un tour précédent n'est jamais
-  repris.
+  (§4.2). Un `token_count` sans contexte lisible **garde sa place** dans la
+  chronologie : il peut séparer deux compactions, et il rend le pic
+  `partial` (raison `call_usage_unknown`) au lieu de le présenter comme
+  mesuré ; une frontière de compaction ne saute jamais par-dessus pour
+  emprunter le contexte d'un autre appel. Un tour sans relevé garde `null` +
+  `context_unknown` avec son motif (`no_call`, `journal_missing`,
+  `turn_not_in_journal`, `last_token_usage_missing`) ; l'usage d'un tour
+  précédent n'est jamais repris.
 * **DeepSeek/ACP** : pas de champ d'écriture de cache dans le contrat actuel ;
   un harnais qui en publierait un devrait être qualifié avant d'être agrégé.
 * **`O_last`** : `output_tokens` (Claude, Codex `last_token_usage`) ou
@@ -426,9 +430,11 @@ rôle suivant pour se fabriquer une politique).
   le runner la publie pour un tour résident (le driver, `thread/compacted` ou
   l'item `contextCompaction`) comme non résident (`compact_boundary` du flux
   principal, ou item `compacted`/événement `context_compacted` du journal
-  Codex). `pre` est le dernier contexte d'avant, `post` le premier contexte
-  d'après (jamais inventé), `count` le nombre de compactions observées dans le
-  tour ; deux preuves de la même compaction ne comptent qu'une fois.
+  Codex). `pre` est le contexte de l'appel **immédiatement** avant, `post`
+  celui de l'appel **immédiatement** après (jamais inventé ni emprunté plus
+  loin : un appel illisible laisse `post` `null` et `partial`) ; `count` est
+  le nombre de compactions observées dans le tour, et deux preuves de la même
+  compaction ne comptent qu'une fois.
   `decision.compacted` vaut `true` quand elle est observée, `false` quand le
   tour n'a pas compacté — une compaction demandée par la politique n'est pas
   une réussite (§4.2). Le `false` explicite est ce qui permet au rejeu de

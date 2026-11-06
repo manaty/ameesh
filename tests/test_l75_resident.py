@@ -741,6 +741,17 @@ class CodexAppServerTest(DriverCase):
         self.assertEqual(result.compact["quality"], "partial")
         self.assertIn("post_tokens_unknown", result.compact["reasons"])
 
+    def test_compaction_resident_ignore_une_notification_sans_entree(self):
+        # #6044 B2 : un `tokenUsage` total seul après la frontière ne pose pas
+        # `post=0` ; l'appel suivant, lui, donne le vrai après.
+        driver = self.driver(env={"FAKE_CODEX_COMPACT": "3"})
+        driver.start()
+        result = self.wait(driver.send("hello", input_id="i"))
+        self.assertEqual(result.compact["pre"], 300)
+        self.assertEqual(result.compact["post"], 120)
+        self.assertEqual(result.compact["count"], 1)
+        self.assertEqual(result.compact["quality"], "measured")
+
     def test_steer_in_the_turn(self):
         driver = self.driver()
         driver.start()

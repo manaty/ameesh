@@ -33,7 +33,7 @@ prochaine annonce runtime.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 
 from .context_metrics import DERIVED, FALLBACK, MEASURED, PARTIAL, UNKNOWN
@@ -479,20 +479,32 @@ def publish(observed: Window | Mapping | None = None, *,
 def compaction_from_parts(pre_tokens: int | None, post_tokens: int | None,
                           *, count: int = 1, trigger: str | None = None,
                           pre_reason: str = REASON_PRE_UNKNOWN,
-                          post_reason: str = REASON_POST_UNKNOWN) -> Compaction:
+                          post_reason: str = REASON_POST_UNKNOWN,
+                          extra_reasons: Iterable[str] = ()) -> Compaction:
     """Une compaction observée dont les jetons avant/après sont déjà connus.
 
     #6044 : le journal Codex donne le dernier contexte d'avant et le premier
     d'après, sans ``post_tokens`` nommé. Une compaction demandée n'entre pas
     ici : l'appelant ne construit le bloc que sur une preuve de réussite.
+    ``extra_reasons`` porte les inconnues de frontière (un appel illisible
+    entre deux compactions, par exemple) : une valeur connue reste alors un
+    minorant, et la qualité est ``partial``.
     """
     reasons: list[str] = []
     if pre_tokens is None:
         reasons.append(pre_reason)
     if post_tokens is None:
         reasons.append(post_reason)
-    quality = MEASURED if post_tokens is not None else (
-        PARTIAL if pre_tokens is not None else UNKNOWN)
+    for reason in extra_reasons or ():
+        reason = str(reason)
+        if reason and reason not in reasons:
+            reasons.append(reason)
+    if post_tokens is None:
+        quality = PARTIAL if pre_tokens is not None else UNKNOWN
+    elif reasons:
+        quality = PARTIAL
+    else:
+        quality = MEASURED
     return Compaction(pre_tokens, post_tokens, quality, tuple(reasons), trigger,
                       max(int(count), 1))
 

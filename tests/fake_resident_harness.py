@@ -340,12 +340,22 @@ class Codex:
         # l'item peuvent décrire le même fait ; le driver ne doit le compter
         # qu'une fois, puis mesurer l'après sur l'appel suivant. Le mode `2`
         # s'arrête à la preuve : aucun appel après, donc pas d'« après ».
+        # Le mode `3` intercale une notification total seul (sans `last`) :
+        # elle ne doit pas poser un `post=0` inventé.
         scenario = os.environ.get("FAKE_CODEX_COMPACT")
-        if scenario in ("1", "2"):
+        if scenario in ("1", "2", "3"):
             self.notify("thread/compacted", {"turnId": turn["id"]})
             self.notify("item/completed", {"turnId": turn["id"], "item": {
                 "type": "contextCompaction", "id": "i3"}})
-        if scenario == "1":
+        if scenario == "3":
+            self.notify("thread/tokenUsage/updated", {
+                "turnId": turn["id"], "tokenUsage": {
+                    "total": dict(
+                        self.tokens, reasoningOutputTokens=0,
+                        totalTokens=(self.tokens["inputTokens"]
+                                     + self.tokens["outputTokens"])),
+                    "modelContextWindow": 258400}})
+        if scenario in ("1", "3"):
             after = {"inputTokens": 120, "cachedInputTokens": 20,
                      "outputTokens": 4, "reasoningOutputTokens": 0,
                      "totalTokens": 124}

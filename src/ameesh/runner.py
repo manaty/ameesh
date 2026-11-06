@@ -2843,8 +2843,10 @@ class AgentWorker(threading.Thread):
             peak = result.get("peak_usage") if isinstance(result, dict) else None
             if isinstance(usage, dict) or isinstance(peak, dict):
                 normalizer.journal_call(
-                    usage if isinstance(usage, dict) else None,
-                    peak_usage=peak if isinstance(peak, dict) else None)
+                    usage if isinstance(usage, dict) and usage else None,
+                    peak_usage=peak if isinstance(peak, dict) else None,
+                    peak_partial=bool(result.get("peak_partial")),
+                    peak_reasons=result.get("peak_reasons") or ())
             if isinstance(usage, dict) and usage:
                 return result
             reason = (result.get("reason") if isinstance(result, dict) else None) \
@@ -9658,7 +9660,8 @@ class AgentWorker(threading.Thread):
                     compaction = context_profile.compaction_from_parts(
                         journal_compact.get("pre"),
                         journal_compact.get("post"),
-                        count=journal_compact.get("count") or 1).to_dict()
+                        count=journal_compact.get("count") or 1,
+                        extra_reasons=journal_compact.get("reasons") or ()).to_dict()
                 elif isinstance(resident_compact, dict):
                     compaction = dict(resident_compact)
                 elif compaction_event is not None:

@@ -102,7 +102,7 @@ def main() -> int:
             # (item `compacted`, événement `context_compacted`) et l'appel qui
             # suit, pour mesurer l'après ; `request` n'écrit qu'une demande.
             scenario = os.environ.get("AMEESH_TEST_CODEX_COMPACT")
-            if scenario in ("observed", "request"):
+            if scenario in ("observed", "request", "unknown"):
                 fh.write(json.dumps({"type": "event_msg", "payload": {
                     "type": "token_count",
                     "info": {"last_token_usage": {
@@ -121,6 +121,14 @@ def main() -> int:
                 # une demande n'est jamais une réussite (contrat §4.2)
                 fh.write(json.dumps({"type": "response_item", "payload": {
                     "type": "compaction_trigger"}}) + "\n")
+            elif scenario == "unknown":
+                # un appel du tour sans contexte lisible : le pic est un
+                # minorant, et le dernier appel reste celui du flux
+                fh.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "token_count", "info": {}}}) + "\n")
+                last_usage = {"input_tokens": 20000,
+                              "cached_input_tokens": 500,
+                              "output_tokens": 50}
             fh.write(json.dumps({"type": "event_msg", "payload": {
                 "type": "token_count",
                 "info": {"last_token_usage": last_usage}}}) + "\n")

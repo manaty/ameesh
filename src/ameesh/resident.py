@@ -279,6 +279,19 @@ def _number(value: Any) -> int:
     return 0
 
 
+def _token_or_none(value: Any) -> int | None:
+    """#6044 : un jeton **mesuré**, ou ``None`` (valeur absente/illisible).
+
+    Contrairement à :func:`_number`, un champ manquant ne devient pas ``0`` :
+    les frontières de compaction et le pic ne s'inventent pas.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return max(int(value), 0)
+    return None
+
+
 class LeaderPopen(subprocess.Popen):
     """The leader of a resident harness group, never reaped outside the kill
     path (codex r2, #417): `poll()` and `wait()` see its exit without reaping
@@ -1275,6 +1288,9 @@ class CodexAppServer(ResidentDriver):
         #: `contextCompaction` et la notification dépréciée `thread/compacted`
         #: peuvent décrire le même fait ; il ne compte qu'une fois.
         self._compact_noted = False
+        #: #6044 : dernier contexte réellement mesuré du tour (jamais le 0 de
+        #: `_number` pour un champ absent) ; sert de « avant » à la compaction.
+        self._context_known: int | None = None
         self._watch: threading.Thread | None = None
 
     @property
@@ -1379,6 +1395,7 @@ class CodexAppServer(ResidentDriver):
         with self._lock:
             self._turn_id = None
             self._compact_noted = False
+            self._context_known = None
         self._turn_start(text)
 
     def _steer(self, turn: Turn, text: str, input_id: str,
@@ -1503,8 +1520,9 @@ class CodexAppServer(ResidentDriver):
                 return
             current = self._compact or {}
             pre = current.get("pre")
-            if self._context is not None:
-                pre = self._context if pre is None else max(int(pre), self._context)
+            if self._context_known is not None:
+                pre = self._context_known if pre is None \
+                    else max(int(pre), self._context_known)
             count = int(current.get("count") or 0) + 1
             self._compact = context_profile.compaction_from_parts(
                 pre, None, count=count).to_dict()
@@ -1550,6 +1568,9 @@ class CodexAppServer(ResidentDriver):
             call = {"input_tokens": _number(last.get("inputTokens")),
                     "cached_input_tokens": _number(last.get("cachedInputTokens")),
                     "output_tokens": _number(last.get("outputTokens"))}
+            # #6044 : un `last` sans entrée n'est pas un contexte mesuré ; le
+            # 0 de `_number` reste réservé au legacy.
+            known_input = _token_or_none(last.get("inputTokens"))
             parsed["call_usage"] = call
             parsed["usage"] = call
             # Codex counts the cache inside the input (`adapters.reread_tokens`)
@@ -1558,12 +1579,15 @@ class CodexAppServer(ResidentDriver):
             total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
             with self._lock:
                 self._context = call["input_tokens"]
+                if known_input is not None:
+                    self._context_known = known_input
                 # #6044 : le premier usage qui suit une compaction est son
                 # « après » mesuré ; sans lui, l'après reste None (partial).
+                # Une notification total seul ne doit pas poser post=0.
                 if self._compact is not None and self._compact.get("post") is None \
-                        and call["input_tokens"] is not None:
+                        and known_input is not None:
                     self._compact = context_profile.compaction_from_parts(
-                        self._compact.get("pre"), call["input_tokens"],
+                        self._compact.get("pre"), known_input,
                         count=int(self._compact.get("count") or 1)).to_dict()
                     self._compact_noted = False
                 window = _number(usage.get("modelContextWindow"))

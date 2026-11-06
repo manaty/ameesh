@@ -1777,15 +1777,22 @@ class CostBook:
         ``compacted`` du rollout ou l'événement ``context_compacted``. Un
         ``compaction_trigger`` (demande) n'est jamais une réussite (§4.2) ;
         les deux preuves d'une même compaction, écrites sans appel entre
-        elles, ne comptent qu'une fois. ``pre`` est le dernier contexte d'avant
-        la compaction, ``post`` le premier contexte d'après (``None`` sans
-        appel suivant), ``count`` le nombre de compactions du tour.
+        elles, ne comptent qu'une fois. ``pre`` est le contexte de l'appel
+        **immédiatement** avant la compaction, ``post`` celui de l'appel
+        **immédiatement** après (``None`` si cet appel manque ou est
+        illisible, jamais emprunté plus loin), ``count`` le nombre de
+        compactions du tour. Un ``token_count`` sans contexte lisible garde sa
+        place dans la chronologie : il peut séparer deux compactions et rend
+        le pic ``partial`` (``peak_partial``/``peak_reasons``) au lieu de le
+        présenter comme mesuré.
 
-        Rend ``{"usage", "reason", "turn_started", "peak_usage", "compaction"}``.
+        Rend ``{"usage", "reason", "turn_started", "peak_usage",
+        "peak_partial", "peak_reasons", "compaction"}``.
         Aucune erreur de lecture n'est fatale : le motif est nommé.
         """
         empty = {"usage": None, "reason": None, "turn_started": None,
-                 "peak_usage": None, "compaction": None}
+                 "peak_usage": None, "peak_partial": False,
+                 "peak_reasons": [], "compaction": None}
         path = self.codex_rollout(thread)
         if not path:
             return dict(empty, reason=context_metrics.REASON_JOURNAL_MISSING)
@@ -1797,7 +1804,6 @@ class CostBook:
             return dict(empty,
                         reason=context_metrics.REASON_JOURNAL_UNREADABLE)
 
-        usage: dict | None = None
         saw_token_count = False
         task_seen = False
         task_start: float | None = None
@@ -1846,12 +1852,9 @@ class CostBook:
                 info = payload.get("info")
                 candidate = info.get("last_token_usage") \
                     if isinstance(info, dict) else None
-                if isinstance(candidate, dict) and candidate:
-                    events.append(("usage", candidate))
-                    if usage is None:
-                        usage = candidate
-                else:
-                    events.append(("usage", None))
+                events.append(("usage",
+                               candidate if isinstance(candidate, dict)
+                               else None))
                 continue
             if kind == "context_compacted":
                 # événement de réussite, doublon possible de l'item `compacted`
@@ -1871,40 +1874,83 @@ class CostBook:
             return dict(empty,
                         reason=context_metrics.REASON_TURN_NOT_IN_JOURNAL)
 
-        # Remise dans l'ordre chronologique du tour, puis pic et compactions.
-        # `usages` garde la mesure brute de chaque appel lisible : le pic est
-        # renvoyé tel quel, sans reconstruire un `input_tokens` de synthèse.
-        usages: list[tuple[int, dict]] = []
+        # Chronologie du tour : **un emplacement par `token_count`**, lisible
+        # ou non. Un appel illisible ne disparaît pas : il garde sa place
+        # entre deux compactions (sinon deux compactions deviendraient une),
+        # et il empêche d'emprunter le contexte d'un autre appel comme
+        # `pre`/`post`/pic. `calls` garde la mesure brute de chaque appel.
+        calls: list[dict | None] = []
         positions: list[int] = []
         for kind, data in reversed(events):
             if kind == "usage":
-                value = _codex_context_tokens(data)
-                if value is not None:
-                    usages.append((value, data))
+                calls.append(data if isinstance(data, dict) and data else None)
                 continue
-            position = len(usages)
+            position = len(calls)
             if position not in positions:
                 # Deux preuves de la même compaction (item + événement) sont
                 # écrites sans appel entre elles : même position, un seul fait.
                 positions.append(position)
 
-        peak_usage = None
-        if usages:
-            _, peak_usage = max(usages, key=lambda item: item[0])
+        # Le dernier appel est celui du dernier `token_count`, pas le dernier
+        # appel lisible : un journal muet sur le dernier appel ne prête pas
+        # l'usage d'un appel antérieur.
+        last_call = calls[-1] if calls else None
+        usage = last_call if last_call else None
+
+        # Pic : maximum des contextes connus, mais **minorant** dès qu'un
+        # appel du tour existe sans contexte lisible.
+        peak_values: list[tuple[int, dict]] = []
+        peak_partial = False
+        for call in calls:
+            value = _codex_context_tokens(call)
+            if value is None:
+                peak_partial = True
+            else:
+                peak_values.append((value, call))
+        peak_usage: dict | None = None
+        if peak_values:
+            _, peak_usage = max(peak_values, key=lambda item: item[0])
+        elif calls:
+            # aucun contexte lisible : le pic reste inconnu, avec sa raison
+            peak_usage = {}
+
         compaction: dict | None = None
         if positions:
-            pre_values = [usages[position - 1][0] for position in positions
-                          if position > 0]
+            # `pre`/`post` sont les appels **immédiatement** voisins de la
+            # frontière. Un voisin illisible rend la frontière inconnue ; on
+            # ne saute pas par-dessus pour prendre un appel plus loin.
+            pre_values: list[int] = []
+            boundary_reasons: list[str] = []
+            for position in positions:
+                if position <= 0:
+                    continue
+                value = _codex_context_tokens(calls[position - 1])
+                if value is None:
+                    boundary_reasons.append(
+                        context_metrics.REASON_CALL_USAGE_UNKNOWN)
+                else:
+                    pre_values.append(value)
             last = positions[-1]
+            post: int | None = None
+            if last < len(calls):
+                post = _codex_context_tokens(calls[last])
+                if post is None:
+                    boundary_reasons.append(
+                        context_metrics.REASON_CALL_USAGE_UNKNOWN)
             compaction = {
                 "pre": max(pre_values) if pre_values else None,
-                "post": usages[last][0] if last < len(usages) else None,
+                "post": post,
                 "count": len(positions),
+                "reasons": list(dict.fromkeys(boundary_reasons)),
             }
 
         result = {"usage": usage, "reason": None,
                   "turn_started": task_start,
-                  "peak_usage": peak_usage, "compaction": compaction}
+                  "peak_usage": peak_usage,
+                  "peak_partial": peak_partial,
+                  "peak_reasons": ([context_metrics.REASON_CALL_USAGE_UNKNOWN]
+                                   if peak_partial and calls else []),
+                  "compaction": compaction}
         if usage is not None:
             return result
         if saw_token_count:
