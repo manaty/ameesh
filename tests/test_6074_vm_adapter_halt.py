@@ -176,6 +176,29 @@ class HaltTest(PgTestCase):
         self.assertEqual(self.tick(), 'halt witness pending')
         self.provider.action.assert_not_called()
         self.assertEqual(self.stop()['result'], 'halt sent')
+        self.assertEqual(self.alerts(), [])
+        # ameesh-cx1 B on 90572aaab: the deadline bounds the whole proof,
+        # standby included; no archive without the witness.
+        self.age(301)
+        for _ in range(2):
+            self.assertEqual(self.tick(), 'halt deadline passed')
+            self.assertEqual(self.stop()['result'], 'halt deadline passed')
+        self.provider.action.assert_not_called()
+        self.provider.allowed.assert_not_called()
+        self.assertEqual(self.alerts(), [('host_release_adapter_stalled', 'halt_deadline',
+                                          'burst', self.stop()['generation'])])
+        self.assertEqual(self.native(), ('draining', False, 'idle-drained'))
+        # A late but complete proof is still our halt.
+        self.probe.return_value = True
+        self.assertEqual(self.tick(), 'halt proven')
+        self.assertEqual(self.alerts(), [])
+
+    def test_deadline_in_standby_with_complete_proof_proceeds_at_once(self):
+        self.halt_sent()
+        self.age(301)
+        self.provider.state.return_value = 'stopped in place'
+        self.assertEqual(self.tick(), 'halt proven')
+        self.assertEqual(self.stop()['result'], 'archive intent')
 
     def test_interruption_between_phases_resumes_from_the_intent(self):
         self.assertEqual(self.tick(), 'stop prepared')

@@ -374,13 +374,17 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             result = request.get('result')
             if result in HALTING:
                 q.refresh_stop_intent(host)
-            if result in (HALT_INTENT, HALT_SENT) and state != 'stopped in place':
+            if result in (HALT_INTENT, HALT_SENT):
                 since = q.result_since(request, result)
                 if since is not None and now - since > policy['halt_deadline_s']:
-                    # The OS still answers or the provider never saw it stop:
-                    # no poweroff, never lost; host_release names the host.
+                    # The full proof (provider state AND muted witness) is
+                    # still missing: no poweroff, never lost; host_release
+                    # names the host. A later complete proof stays valid.
                     q.finish(request, 'pending', HALT_LATE)
-                    return 'halt deadline passed'
+                    result = HALT_LATE
+                    request = dict(request, result=HALT_LATE)
+                    if state != 'stopped in place':
+                        return 'halt deadline passed'
             if result in HALTING and not (result == HALT_INTENT and state == 'running'):
                 return halted(q, request, target, policy, provider, state, probe)
             if result == POWEROFF_SENT and state != 'running':
@@ -481,7 +485,7 @@ def halted(q, request, target, policy, provider, state, probe):
         q.finish(request, 'pending', POWEROFF_SENT)
         return 'archiving'
     if not probe(target['halted_argv'], policy['io_timeout_s']):
-        return 'halt witness pending'
+        return 'halt deadline passed' if result == HALT_LATE else 'halt witness pending'
     if 'poweroff' not in provider.allowed(target):
         if result != ARCHIVE_REFUSED:
             q.finish(request, 'pending', ARCHIVE_REFUSED)
