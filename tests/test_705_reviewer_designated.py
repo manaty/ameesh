@@ -259,12 +259,16 @@ class ReviewerDesignationTest(PgTestCase):
         # retour en build (verdict bloquant) : le relecteur connu reste posé
         proc = self.mesh("work", "move", str(lot["id"]), "build")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # #5993 : un gel antérieur au dernier build ne couvre plus la tête ;
+        # la nouvelle revue regel la tête courante.
+        self._freeze_at(lot, "b" * 40)
         proc = self.mesh("work", "move", str(lot["id"]), "qa")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "premier")
         # une nouvelle revue peut redésigner quelqu'un d'autre
         proc = self.mesh("work", "move", str(lot["id"]), "build")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._freeze_at(lot, "c" * 40)
         proc = self.mesh("work", "move", str(lot["id"]), "qa",
                          "--reviewer", "second", "--actor", "chef", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)

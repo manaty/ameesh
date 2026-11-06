@@ -4306,6 +4306,15 @@ def get(db: Db, item_id: int) -> dict | None:
     return storage.of(db).work.get(item_id)
 
 
+def get_brief(db: Db, item_id: int) -> dict | None:
+    """Le lot sans `frozen_sha`/`frozen_at`/`build_at` (#5993).
+
+    Les écrivains isolés des modules (#420) n'ont que SELECT sur `work_items` :
+    `it.item` lit le lot par cette projection, que la garde du move vers qa
+    n'a pas élargie."""
+    return storage.of(db).work.get_brief(item_id)
+
+
 def _canonical_state(state: str) -> str:
     """#4353 : l'orthographe persistée d'un état (v1 ou alias générique),
     sinon `WorkError` nommant les orthographes acceptées."""
@@ -4363,9 +4372,40 @@ def _adopted_ref(db: Db, item_id: int) -> str:
     return _pinned_ref(get(db, item_id) or {})
 
 
+def _worktree_pushed_ahead(item: dict, frozen_sha: str) -> str:
+    """La tête **poussée** de la branche du lot, quand elle est en avance (#5993).
+
+    Le balayage (`branch_head`) peut être en retard sur une poussée ; le
+    worktree local, lui, peut porter un commit pas encore poussé. On lit donc
+    la ref distante (`@{u}`, sinon `origin/<branche>`), jamais `HEAD` : une
+    tête non poussée ne doit ni refuser le move ni être proposée au gel.
+    Seule une tête dont le gel est un ancêtre prouve une poussée postérieure ;
+    un clone en retard, un gel absent ou une divergence ne concluent rien ('').
+    """
+    branch = str(item.get("branch") or "").strip()
+    frozen = str(frozen_sha or "").strip()
+    if not branch or not frozen:
+        return ""
+    from . import plan_git
+    top = plan_git._out(".", "rev-parse", "--show-toplevel")
+    if not top:
+        return ""
+    pushed = (plan_git._commit(top, branch + "@{u}")
+              or plan_git._commit(top, "origin/" + branch))
+    if not pushed or pushed.lower() == frozen.lower():
+        return ""
+    # #2851 : la sonde d'ascendance reste locale (pas de fetch paresseux d'un
+    # clone partiel).
+    probe = plan_git._git(top, "merge-base", "--is-ancestor", frozen, pushed,
+                          env_extra=plan_git.NO_LAZY_FETCH)
+    if probe.returncode != 0:
+        return ""
+    return pushed
+
+
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
          correct: str | None = None, reviewer: str | None = None,
-         package_exclusion: bool = False) -> dict:
+         package_exclusion: bool = False, require_freeze: bool = False) -> dict:
     """Déplace un lot en vérifiant la transition, la boucle QA et le terminal.
 
     `correct` (la raison) : correction d'un état posé par erreur, hors machine
@@ -4391,6 +4431,18 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     `MAX_QA_LOOPS`) : le retrait est un geste du pilote, pas un renvoi de
     relecture. Seulement qa → build ; l'appelant a vérifié qui exclut
     (`corrector`).
+
+    `require_freeze` (#5993) : la commande `ameesh work move … qa` le pose.
+    Entrer en revue sans gel de la tête courante est refusé, avec le geste
+    exact : la désignation automatique part du gel (#3467), donc un lot
+    déplacé en `qa` sans gel restait sans relecteur et rien ne le disait
+    avant le seuil de `stale_lot` (#5985, 1 h 45). Un gel antérieur au
+    dernier passage en build, ou qui n'est plus la tête de branche vue après
+    lui (une poussée non gelée, même règle que #4501), ne couvre plus la
+    branche retravaillée (N1) : il est refusé de même. Le défaut False
+    laisse les transitions internes (le gel écrit son jalon avant de bouger)
+    et les fixtures inchangées ; une correction (`--correct`) n'est jamais
+    concernée.
 
     `state` accepte l'orthographe v1 et le nom générique du cycle de vie
     (#4349 : `in_progress` pour `build`, `to_validate` pour `qa`…)."""
@@ -4475,6 +4527,47 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (current, state, current, ", ".join(sorted(transitions[current])) or "none",
                " — state set by mistake: ameesh work move %s %s --correct \"reason\""
                % (item_id, state) if (current, state) in corrections else ""))
+    if require_freeze and state == lifecycle.QA:
+        # #5993 : la désignation automatique part du gel (#3467) ; sans gel,
+        # le lot entrait en revue sans relecteur et l'attente n'appartenait à
+        # personne. Un gel antérieur au dernier passage en build, ou qui n'est
+        # plus la tête de branche vue après lui (#5993 N1), ne couvre pas la
+        # tête retravaillée : la désignation ne suivrait pas non plus. Le gel
+        # est le geste qui entre en `qa` et désigne.
+        from . import packet_head
+        frozen_sha = str(item.get("frozen_sha") or "").strip()
+        frozen_at = item.get("frozen_at")
+        build_at = item.get("build_at")
+        # La tête observée en avance **après** le gel est une poussée plus
+        # récente, pas encore gelée (#4501, même règle que la composition).
+        swept = packet_head.protected_head(
+            frozen_sha, frozen_at or 0.0,
+            item.get("branch_head") or "", item.get("branch_head_ts") or 0.0)
+        swept_ahead = (swept if swept
+                       and not packet_head.same_commit(swept, frozen_sha) else "")
+        # Un balayage peut être en retard : la ref distante du dépôt courant
+        # dit la tête poussée. Un commit local non poussé ne conclut rien, et
+        # ne doit pas effacer la preuve distante déjà lue.
+        pushed = _worktree_pushed_ahead(item, frozen_sha)
+        moved = pushed or swept_ahead
+        head_moved = bool(frozen_sha) and bool(moved)
+        stale = (bool(frozen_sha) and frozen_at is not None and build_at is not None
+                 and float(frozen_at) < float(build_at))
+        if not frozen_sha or head_moved or stale:
+            if not frozen_sha:
+                why = "without a declared freeze"
+            elif head_moved:
+                why = ("with a freeze (%s) that is not its branch head (%s)"
+                       % (frozen_sha[:12], str(moved)[:12]))
+            else:
+                why = ("with a freeze (%s) that predates its last move to build"
+                       % frozen_sha[:12])
+            raise WorkError(
+                "move refused: lot %s enters qa %s; the reviewer designation "
+                "starts at the freeze (#3467), so the lot would wait for nobody "
+                "— nothing changed. Freeze the branch head first: ameesh work "
+                "milestone %s frozen --sha <head> (the freeze enters qa and "
+                "designates the reviewer)" % (item_id, why, item_id))
     if state == "validated":
         from . import merge_queue
         gate = merge_queue.review_gate_for_item(
