@@ -1,0 +1,8 @@
+[
+  {"type": "event_msg", "payload": {"type": "task_started", "started_at": 2000}},
+  {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 100000, "cached_input_tokens": 1000, "output_tokens": 100}}}},
+  {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 150000, "cached_input_tokens": 2000, "output_tokens": 200}}}},
+  {"type": "compacted", "payload": {"message": "resume du fil", "replacement_history": []}},
+  {"type": "event_msg", "payload": {"type": "context_compacted"}},
+  {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 30000, "cached_input_tokens": 500, "output_tokens": 50}}}}
+]

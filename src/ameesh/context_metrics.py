@@ -8,6 +8,10 @@ et les accumule pour un tour :
 * ``C_last`` : entrée du dernier appel du **fil principal**, cache lu et écrit
   compris quand le harnais les sépare (Claude) ; l'entrée seule quand le cache
   y est déjà inclus (Codex) ;
+* ``C_peak`` : entrée maximale d'un appel du fil principal pendant le tour
+  (#6044) ; c'est le pic réellement atteint, qui reste lisible quand une
+  compaction native a fait retomber ``C_last`` après coup. Sans compaction et
+  pour des appels croissants, ``C_peak == C_last`` ;
 * ``O_last`` : sortie du dernier appel, distincte de ``O`` (sortie du tour) ;
 * ``R_turn`` : entrées cumulées du tour, cache **lu** compris, cache **écrit**
   exclu (c'est une écriture, pas une relecture) ;
@@ -108,6 +112,10 @@ REASON_JOURNAL_MISSING = "journal_missing"
 REASON_JOURNAL_UNREADABLE = "journal_unreadable"
 REASON_TURN_NOT_IN_JOURNAL = "turn_not_in_journal"
 REASON_LAST_USAGE_MISSING = "last_token_usage_missing"
+#: #6044 : un appel du tour existe mais son contexte est illisible (pas de
+#: ``last_token_usage``, ou ni entrée ni cache). Le pic connu est alors un
+#: minorant, et une frontière de compaction peut tomber sur cet appel.
+REASON_CALL_USAGE_UNKNOWN = "call_usage_unknown"
 
 #: une valeur de flux est un entier positif ; au-delà, un flux pathologique ne
 #: fait pas grossir la mémoire du tour (contrat §2.2, budget de performance).
@@ -505,6 +513,13 @@ class TurnNormalizer:
         #: #5148 : dernier appel lu au journal Codex (hors flux), et motif
         #: d'absence du journal. Le premier alimente C_last/O_last seulement.
         self._journal_call: CallMeasure | None = None
+        #: #6044 : pic des contextes du tour lu au journal Codex (le journal
+        #: porte chaque appel, pas seulement le dernier). Il alimente C_peak.
+        self._journal_peak: Measure | None = None
+        #: #6044 : un appel du tour sans contexte lisible rend le pic partiel
+        #: (minorant) et ses raisons sont publiées avec C_peak.
+        self._journal_peak_partial = False
+        self._journal_peak_reasons: tuple[str, ...] = ()
         self._journal_reason: str | None = None
         self._index: dict[tuple[bool, str], int] = {}
         self._count = 0
@@ -661,7 +676,10 @@ class TurnNormalizer:
         return self
 
     # -- journal de session Codex (#5148) --------------------------------
-    def journal_call(self, usage: Mapping | None) -> "TurnNormalizer":
+    def journal_call(self, usage: Mapping | None, *,
+                     peak_usage: Mapping | None = None,
+                     peak_partial: bool = False,
+                     peak_reasons: Iterable[str] = ()) -> "TurnNormalizer":
         """Le dernier appel du fil principal, lu au journal Codex.
 
         ``codex exec --json`` ne publie pas d'usage d'appel : le journal de
@@ -670,12 +688,37 @@ class TurnNormalizer:
         ``C_last``/``O_last`` et n'entre ni dans ``R_turn`` (cumul du tour) ni
         dans les caches cumulés, qui restent mesurés par le flux. Un appel de
         flux, s'il existe, reste prioritaire — jamais les deux additionnés.
+
+        #6044 : ``peak_usage`` porte le ``last_token_usage`` du **plus gros**
+        appel du tour, également lu au journal. Il alimente ``C_peak`` : une
+        compaction native peut faire retomber le dernier contexte, et le pic
+        d'avant reste alors la mesure qui compte. ``usage`` peut être ``None``
+        quand seul le pic est lisible ; le motif d'absence du dernier appel est
+        publié par :meth:`journal_unavailable`.
+
+        ``peak_partial`` et ``peak_reasons`` viennent du journal quand un appel
+        du tour existe sans contexte lisible : le maximum des valeurs connues
+        est alors un **minorant**, publié ``partial`` avec sa raison, jamais
+        présenté comme une mesure complète.
         """
         self._ensure_open()
-        if not isinstance(usage, Mapping) or self._session_mismatch:
+        if self._session_mismatch:
+            return self
+        self._journal_peak_partial = bool(peak_partial)
+        self._journal_peak_reasons = tuple(
+            str(reason) for reason in (peak_reasons or ()) if reason)
+        if self._journal_peak_partial and not self._journal_peak_reasons:
+            self._journal_peak_reasons = (REASON_CALL_USAGE_UNKNOWN,)
+        if isinstance(peak_usage, Mapping):
+            self._journal_peak = call_measure(
+                self.harness, peak_usage, source=SOURCE_JOURNAL).c_last
+        if not isinstance(usage, Mapping):
             return self
         self._journal_call = call_measure(self.harness, usage,
                                           source=SOURCE_JOURNAL)
+        if self._journal_peak is None:
+            # un seul appel lisible : le pic est ce dernier appel
+            self._journal_peak = self._journal_call.c_last
         return self
 
     def journal_unavailable(self, reason: str | None = None) -> "TurnNormalizer":
@@ -759,7 +802,7 @@ class TurnNormalizer:
         if self._dropped:
             reasons = _reasons(reasons, (REASON_CALL_BOUND_REACHED,))
 
-        core = ("C_last", "O_last", "R_turn", "R_session", "O")
+        core = ("C_last", "C_peak", "O_last", "R_turn", "R_session", "O")
         sub_core = ("C_last", "O_last", "R_turn", "O")
         self._finished = {
             "schema": SCHEMA,
@@ -830,6 +873,7 @@ class TurnNormalizer:
         cache_write = self._cache_write_measure()
         return {
             "C_last": c_last,
+            "C_peak": self._peak_measure(self._calls),
             "O_last": o_last,
             "R_turn": r_turn,
             "R_session": self._session_measure(r_turn),
@@ -837,6 +881,45 @@ class TurnNormalizer:
             "cache_read_tokens": cache_read,
             "cache_write_tokens": cache_write,
         }
+
+    def _peak_measure(self, calls: list[CallMeasure]) -> Measure:
+        """#6044 : le plus gros contexte d'appel du tour, fil principal.
+
+        Le pic se lit sur chaque appel retenu (flux) et sur le relevé du
+        journal Codex, sans jamais additionner les deux. Une composante
+        inconnue ne fabrique pas un pic : si aucune valeur n'est lisible, la
+        mesure reste ``None`` avec ses raisons ; sinon elle est ``partial``
+        tant qu'une composante manque (le pic est alors un minorant nommé).
+        """
+        measures = [call.c_last for call in calls]
+        if self._journal_peak is not None:
+            measures.append(self._journal_peak)
+        if not measures:
+            reasons = _reasons((REASON_CONTEXT_UNKNOWN,),
+                               (self._journal_reason,)
+                               if self._journal_reason is not None else (),
+                               self._journal_peak_reasons)
+            if self._journal_reason is not None or self._journal_peak_reasons:
+                return Measure(None, UNKNOWN, reasons, "call", SOURCE_JOURNAL)
+            return Measure(None, UNKNOWN, (REASON_NO_CALL,), "call", "none")
+        known = [measure.value for measure in measures
+                 if measure.value is not None]
+        reasons = _reasons(*(measure.reasons for measure in measures
+                             if measure.quality not in (MEASURED, DERIVED)),
+                           self._journal_peak_reasons)
+        if self._journal_peak is not None and self._journal_reason is not None:
+            # Un appel du journal est illisible : le pic connu est un minorant.
+            reasons = _reasons(reasons, (self._journal_reason,))
+        if not known:
+            return Measure(None, UNKNOWN, reasons or (REASON_CONTEXT_UNKNOWN,),
+                           _aggregate_granularity(measures),
+                           _aggregate_source(measures))
+        quality = PARTIAL if (self._journal_peak_partial or reasons or any(
+            measure.quality not in (MEASURED, DERIVED)
+            for measure in measures)) else MEASURED
+        return Measure(max(known), quality, reasons,
+                       _aggregate_granularity(measures),
+                       _aggregate_source(measures))
 
     def _last_call_measure(self, field: str, unknown_reason: str) -> Measure:
         """C_last/O_last : appel du flux, sinon appel du journal, sinon motif.
