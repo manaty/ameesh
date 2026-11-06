@@ -114,6 +114,15 @@ class Queue:
         self.db.execute("UPDATE host_lifecycle SET hook_attempt_at=clock_timestamp() "
                         "WHERE host=%s AND hook_attempt_state='idle-drained'", (host,))
 
+    def touch(self, request):
+        """#6074: a provider transition still progressing (archive of a local
+        volume): refresh the row without changing its marker."""
+        self.db.execute("UPDATE vm_adapter_requests SET updated_at=clock_timestamp() "
+                        "WHERE host=%s AND generation=%s AND release_epoch=%s AND state=%s "
+                        "AND status='pending'",
+                        (request['host'], request['generation'], request['release_epoch'],
+                         request['state']))
+
     def complete(self, request, result):
         self.finish(request, 'done', result)
         # Async completion must not depend on a scanner retry inside the
@@ -151,6 +160,12 @@ class Queue:
             "SELECT extract(epoch from updated_at)::float8 AS seen_ts "
             "FROM vm_adapter_observations WHERE host=%s", (host,))
         return rows[0]["seen_ts"] if rows else None
+
+    def provider_state(self, host):
+        """#6074: provider state of the last worker tick, or None."""
+        rows = self.db.query("SELECT provider_state FROM vm_adapter_observations "
+                             "WHERE host=%s", (host,))
+        return rows[0]['provider_state'] if rows else None
 
     def finish(self, request, status, result):
         self.db.execute("UPDATE vm_adapter_requests SET status=%s,result=%s,"
