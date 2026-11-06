@@ -2806,13 +2806,32 @@ def report_recipients(cfg, db, project: ProjectRelease) -> list[str]:
 
 def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
                 *, urgent: bool = False) -> None:
+    """Mail a release report and write it in the project's own thread.
+
+    #6014: the mailbox alone left a missed cutoff invisible in the project's
+    thread: the default thread project is the *sender's* (ameesh), so the
+    report only reached the ameesh thread. The project is explicit here, with
+    the same commit-then-record order as `notify._send_module_brief`: a
+    thread failure never loses the delivered message.
+    """
+    from . import fil
     payload = {**(payload or {}), **({"urgent": True} if urgent else {})}
     for recipient in report_recipients(cfg, db, project):
         try:
-            mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="event",
-                      payload=payload)
+            # The thread write is explicit below, in the release project:
+            # `mail.send` would otherwise derive the sender's project.
+            message_id = mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="event",
+                                   payload=payload, thread=False)
         except Exception as exc:  # a report failure never undoes a release
             print("release: report not delivered to %s: %s" % (recipient, exc),
+                  file=sys.stderr)
+            continue
+        try:
+            fil.record(cfg, db, sender=work.SYSTEM_SENDER, recipients=[recipient],
+                       text=body, project=project.name, mailbox_ids=[message_id],
+                       meta={"kind": "event"})
+        except Exception as exc:  # fil.record never raises; keep the report path safe
+            print("release: thread entry not written for %s: %s" % (project.name, exc),
                   file=sys.stderr)
 
 

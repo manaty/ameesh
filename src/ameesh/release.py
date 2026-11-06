@@ -293,10 +293,15 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
 
 
 def _report_error(cfg, db, project, exc, now: float) -> None:
-    """Mail a definitive error once; transient errors go to the journal only."""
+    """Mail an error once per cutoff, transient or definitive (#6014).
+
+    A transient error used to reach the journal only: a cutoff could fail
+    every tick of its window and leave no trace outside the release host.
+    The durable `last_error` is still kept for the missed report's cause, and
+    the de-duplication stays per cutoff so a retry loop mails once.
+    """
     from . import release_cutoff
-    if isinstance(exc, release_cutoff.TransientReleaseError):
-        return
+    transient = isinstance(exc, release_cutoff.TransientReleaseError)
     try:
         state = release_cutoff.load_state(cfg)
         slot = release_cutoff.project_state(state, project.name)
@@ -316,15 +321,20 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
         slot["last_error_at"] = now
         release_cutoff.save_state(cfg, state)
         if db is not None:
-            body = ("Coupe Nexlink en attente : %s. État de reprise conservé ; "
-                    "consulter pending_nexlink pour les branches, tags et runs déjà créés."
-                    % text) if project.model == "nexlink" else (
-                    "Release %s NON faite : %s\n\nAucun tag, aucun déploiement. "
-                    "Corrige la cause ; le prochain tick réessaiera tant que la "
-                    "coupure est dans sa fenêtre." % (project.name, text))
+            if project.model == "nexlink":
+                body = ("Coupe Nexlink en attente%s : %s. État de reprise conservé ; "
+                        "consulter pending_nexlink pour les branches, tags et runs déjà créés."
+                        % (" (erreur transitoire)" if transient else "", text))
+            else:
+                body = ("Release %s NON faite%s : %s\n\nAucun tag, aucun déploiement. "
+                        "Corrige la cause ; le prochain tick réessaiera tant que la "
+                        "coupure est dans sa fenêtre."
+                        % (project.name, " (erreur transitoire)" if transient else "", text))
             report = {"schema": release_cutoff.SCHEMA, "result": "refused",
                       "project": project.name, "cutoff_at": cutoff_at,
                       "label": _label, "completed_at": now, "message": text}
+            if transient:
+                report["transient"] = True
             if cutoff_at is not None:
                 report["report_path"] = release_cutoff.write_report(
                     cfg, project, dict(report, version="refused"))
@@ -374,6 +384,9 @@ def _release_tick(cfg, args, declared) -> int:
                         status = 1
             except release_cutoff.TransientReleaseError as exc:
                 print("%s: %s" % (name, exc), file=sys.stderr)
+                # #6014: a transient failure is still a cutoff not done; say
+                # it once per cutoff instead of leaving it in the journal.
+                _report_error(cfg, db, project, exc, now)
                 status = 1
                 continue
             except release_cutoff.ReleaseError as exc:
