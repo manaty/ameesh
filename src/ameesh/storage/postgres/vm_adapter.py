@@ -43,22 +43,44 @@ class Queue:
 
         draining -> returning without opening claims: the claim predicate then
         admits `probe` alone (0552). Same generation/epoch, so the queued busy
-        request stays current."""
-        return bool(self.db.query(
+        request stays current. #6073: the request journals the admission, the
+        start of the health deadline."""
+        admitted = bool(self.db.query(
             "UPDATE host_lifecycle SET mode='returning',return_probe=%s,"
             "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
             "AND release_epoch=%s AND mode IN ('draining','returning') "
             "AND NOT claims_open RETURNING host",
             (probe, request['host'], request['generation'], request['release_epoch'])))
+        if admitted:
+            self.finish(request, 'pending', 'probe admitted')
+        return admitted
+
+    def result_since(self, request, result):
+        """#6073: epoch at which this pending request entered `result`, or None.
+
+        A phase deadline (`<phase>_deadline_s` in the enrollment) counts from
+        the `finish(request, 'pending', <phase marker>)` that opened it; any
+        later marker, a completion or a new generation/epoch (a new row)
+        ends it. Health uses 'probe admitted'."""
+        rows = self.db.query(
+            "SELECT extract(epoch FROM updated_at)::float8 AS ts FROM vm_adapter_requests "
+            "WHERE host=%s AND generation=%s AND release_epoch=%s AND state=%s "
+            "AND status='pending' AND result=%s",
+            (request['host'], request['generation'], request['release_epoch'],
+             request['state'], result))
+        return rows[0]['ts'] if rows else None
 
     def refuse_probe(self, request):
         """#6017: failed health: back to draining, probe cleared, never lost."""
-        return bool(self.db.query(
+        refused = bool(self.db.query(
             "UPDATE host_lifecycle SET mode='draining',return_probe=NULL,"
             "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
             "AND release_epoch=%s AND mode='returning' AND NOT claims_open "
             "AND return_probe IS NOT NULL RETURNING host",
             (request['host'], request['generation'], request['release_epoch'])))
+        if refused:
+            self.finish(request, 'pending', 'health refused')
+        return refused
 
     def request(self, host, generation, epoch, state):
         rows = self.db.query("""
