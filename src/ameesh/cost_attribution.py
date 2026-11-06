@@ -203,7 +203,7 @@ def _order_value(value: Any) -> tuple[int, Any]:
     """A total order over attribution values, including partial attributions.
 
     A group only carries the keys present in its rows: two groups of the same
-    cost and turn count may compare `"ima"` with `None`, or a text with a
+    cost and turn count may compare `"run"` with `None`, or a text with a
     number. Comparing the raw tuple raises `TypeError` and the whole report
     becomes unavailable; rank the JSON types first so every pair compares.
     """
