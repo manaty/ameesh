@@ -66,6 +66,34 @@ class PublishedVersionTests(unittest.TestCase):
             nx.choose_version(self.project, "11ar")
 
 
+    def remote_ref(self, ref):
+        out = subprocess.check_output(["git", "-C", str(self.remote), "for-each-ref",
+                                       "--format=%(objectname)", ref], text=True)
+        return out.strip() or None
+
+    def test_refused_candidate_ref_is_dropped_then_a_new_sha_lands(self):
+        """B1 cx3 (gel 34030): a refused cutoff left integration/release-11at
+        on the remote; the next cutoff picks 11at again with another SHA."""
+        ref = "refs/heads/integration/release-11at"
+        old, new = self.shas[1], self.shas[2]
+        nx.ensure_ref(self.project, ref, old)
+        with self.assertRaisesRegex(rc.ReleaseError, "immutable ref"):
+            nx.ensure_ref(self.project, ref, new)
+        slot, saves = {"abandoned_integration": {"ref": "integration/release-11at", "sha": old}}, []
+        nx.drop_abandoned(self.project, slot, lambda: saves.append(1))
+        self.assertIsNone(self.remote_ref(ref))
+        self.assertNotIn("abandoned_integration", slot)
+        self.assertEqual(nx.choose_version(self.project), "11at")
+        nx.ensure_ref(self.project, ref, new)
+        self.assertEqual(self.remote_ref(ref), new)
+        # Moved by someone else since: kept, and ensure_ref still refuses.
+        slot = {"abandoned_integration": {"ref": "integration/release-11at", "sha": old}}
+        nx.drop_abandoned(self.project, slot, lambda: None)
+        self.assertEqual(self.remote_ref(ref), new)
+        self.assertNotIn("abandoned_integration", slot)
+        with self.assertRaisesRegex(rc.ReleaseError, "immutable ref"):
+            nx.ensure_ref(self.project, ref, old)
+
 class StagingJobsTests(unittest.TestCase):
     def test_deploy_jobs_of_the_frozen_workflow(self):
         temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
@@ -477,6 +505,7 @@ class HandoffPipelineTests(unittest.TestCase):
             before = len(self.sent)
             with self.subTest(error=type(error).__name__), \
                     mock.patch.object(nx, target, side_effect=error), \
+                    mock.patch.object(nx, "drop_abandoned") as drop, \
                     mock.patch.object(nx, "workflow_step", return_value=True), \
                     mock.patch.object(nx, "publish") as publish:
                 with self.assertRaisesRegex(rc.ReleaseError, expected):
@@ -486,31 +515,41 @@ class HandoffPipelineTests(unittest.TestCase):
                 self.assertNotIn("pending_nexlink", slot)
                 self.assertEqual((slot["last_result"], slot["last_cutoff"]),
                                  ("refused-preflight", 100))
+                drop.assert_called_once()
                 self.assertEqual(len(self.sent), before + 1)
                 self.assertIn("refusée avant le tag", self.sent[-1][0])
                 self.assertIn("--force", self.sent[-1][0])
 
     def test_next_cutoff_runs_after_a_refused_preflight(self):
+        """The ref deletion failed at refusal: kept in the slot, retried
+        before the next candidate (real deletion: PublishedVersionTests)."""
         with mock.patch.object(nx, "migration_requirements",
                                side_effect=OSError("no git")), \
+                mock.patch.object(rc, "_git", side_effect=rc.ReleaseError("offline")), \
                 mock.patch.object(nx, "workflow_step", return_value=True), \
                 mock.patch.object(nx, "publish"):
             with self.assertRaises(rc.ReleaseError):
                 self.run_tick(1000)
+        self.assertEqual(self.slot()["abandoned_integration"],
+                         {"ref": "integration/release-11at", "sha": SHA})
         self.assertEqual(self.run_tick(2000)["result"], "already-recorded")
         self.slot_at = 50000
+        dropped = lambda project, slot, save: (slot.pop("abandoned_integration"), save())
         with mock.patch.object(nx, "snapshot", return_value=("h", "c2", "m2", {}, None)), \
                 mock.patch.object(nx, "choose_version", return_value="11at"), \
                 mock.patch.object(nx, "merge_candidate", return_value="f" * 40), \
                 mock.patch.object(nx, "previous_release", return_value="m2"), \
                 mock.patch.object(rc, "same_tree", return_value=False), \
                 mock.patch.object(rc, "due", return_value={}), \
+                mock.patch.object(nx, "drop_abandoned", side_effect=dropped) as drop, \
                 mock.patch.object(nx, "ci_plan", return_value={
                     "parts": [{"workflow": "backend-suite.yml"}], "max_inflight": 3}), \
                 mock.patch.object(nx, "workflow_step", return_value=False):
             report = self.run_tick(50010)
         self.assertEqual((report["result"], report["version"]), ("waiting-ci", "11at"))
         self.assertEqual(self.slot()["pending_nexlink"]["cutoff_at"], 50000)
+        drop.assert_called_once()
+        self.assertNotIn("abandoned_integration", self.slot())
 
     def test_missing_attestation_announced_once_at_deadline(self):
         self.handed_over()

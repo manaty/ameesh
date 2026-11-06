@@ -752,6 +752,23 @@ def handoff_preflight(project, pending):
                            for row in entries]}
 
 
+def drop_abandoned(project, slot, save):
+    """B1 cx3 (gel 34030): the refused cutoff pushed its integration ref but
+    no tag, so the next cutoff reuses the version. Delete that ref only while
+    it still holds the abandoned candidate (lease); a ref moved by someone
+    else stays, and `ensure_ref` refuses it as before."""
+    stale = slot.get("abandoned_integration")
+    if not stale:
+        return
+    ref = "refs/heads/" + stale["ref"]
+    found = rc._git(project.repo, "ls-remote", project.remote, ref, check=True).stdout.split()
+    if found and found[0] == stale["sha"]:
+        rc._git(project.repo, "push", "--force-with-lease=%s:%s" % (ref, stale["sha"]),
+                project.remote, ":" + ref, check=True)
+    slot.pop("abandoned_integration")
+    save()
+
+
 def _preflight_refused(cfg, db, project, slot, pending, exc, save):
     """B1/B2 dev3 (gel 34015): a refused preflight left no tag; the cutoff
     closes as `refused-preflight` so the next one is not held behind it,
@@ -762,9 +779,14 @@ def _preflight_refused(cfg, db, project, slot, pending, exc, save):
         reason = "git %s timed out" % " ".join(map(str, exc.cmd[-2:]))
     else:
         reason = str(exc) or type(exc).__name__
-    slot.update(last_cutoff=pending["cutoff_at"], last_result="refused-preflight")
+    slot.update(last_cutoff=pending["cutoff_at"], last_result="refused-preflight",
+                abandoned_integration=dict(ref=pending["integration"], sha=pending["sha"]))
     slot.pop("pending_nexlink")
     save()
+    try:
+        drop_abandoned(project, slot, save)
+    except rc.ReleaseError as dropped:  # retried before the next candidate
+        print("release: %s" % dropped)
     _announce(cfg, db, project,
               "Nexlink %s : coupure refusée avant le tag (préflight de remise : %s). "
               "Aucun tag posé ; après correction, `ameesh release cutoff --project %s "
@@ -1065,6 +1087,7 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
             if not (force or passed) and due.get("missed"):
                 return _missed_cutoff(cfg, db, project, slot, at, label, source,
                                       now, save)
+            drop_abandoned(project, slot, save)
             head, base, main, reading, proof = snapshot(project)
             value = choose_version(project, version)
             sha = merge_candidate(project, base, main)
