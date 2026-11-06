@@ -819,22 +819,28 @@ staging n'est pas une release de prod (canon §14), un go owner reste requis
 pour la prod.
 
 La recette PgBouncer autorise aussi `ameesh-agents-3` sous l’utilisateur
-`ameesh`. Elle prévoit pour cet hôte 32 connexions ordinaires et 8 de réserve
-(`max_db_connections = 40`), un plafond de 64 pour `ameesh-agents-1` (48+16,
-#6004) et de 80 pour `ameesh-agents-2` et `pc-smichea`. Si ces quatre hôtes
-passent exclusivement par ces pools, leur budget cumulé est de 264 sous les 297
-sessions ordinaires du serveur (300 moins 3 réservées au superutilisateur),
-soit une marge de 33.
+`ameesh`. Depuis #6054, elle dimensionne chaque hôte sur le pic mesuré par
+#5983 (4,6 clients par persona) et sur la capacité d'admission `max_agents` de
+la fiche d'hôte du canon : `ameesh-agents-1` 72+16 (plafond 88, pour 19),
+`ameesh-agents-2` 80+16 (96, pour 20), `ameesh-agents-3` 40+8 (48, pour 10)
+et `pc-smichea` 24+8 (32). Si ces quatre hôtes passent exclusivement par ces
+pools, leur budget cumulé reste de 264 sous les 297 sessions ordinaires du
+serveur (300 moins 3 réservées au superutilisateur), soit une marge de 33.
+Avant une bascule, le contrôle porte sur `max_agents`
+(`check --max-agents N` : N × 4,6 ≤ `max_db_connections`), pas sur le nombre
+de personas installées. Le `max_agents` 27 du poste est périmé (aucun siège
+exécuteur depuis le 28/10, #133454 a) : un lot compagnon dans `manaty/home`
+l'abaisse à ≤ 32/4,6 = 6.
 
 Au relevé en lecture seule du bureau du 27/10/2026 vers 11:00Z (courrier
-#150697), seul `pc-smichea` dispose de PgBouncer, plafonné à 80 ; les trois
-VM d’agents se connectent directement à Postgres. Les connexions observées
-pour ameesh étaient respectivement de 60 sur agents-1, 50 sur agents-2,
-14 sur le poste et 0 sur agents-3 ; ce relevé ponctuel ne borne pas leur
-croissance. Le budget théorique de la recette ne plafonne donc pas la flotte
-déployée. Cette modification n’installe aucun pool et ne redimensionne aucune
-installation ; une installation ultérieure exige de vérifier aussi les
-connexions directes et les autres clients du serveur.
+#150697), seul `pc-smichea` disposait de PgBouncer, plafonné à 80 à l’époque ;
+les trois VM d’agents se connectaient directement à Postgres. Les connexions
+observées pour ameesh étaient respectivement de 60 sur agents-1, 50 sur
+agents-2, 14 sur le poste et 0 sur agents-3 ; ce relevé ponctuel ne borne pas
+leur croissance. Le budget théorique de la recette ne plafonnait donc pas la
+flotte déployée à ce relevé. Cette modification n’installe aucun pool et ne
+redimensionne aucune installation ; une installation ultérieure exige de
+vérifier aussi les connexions directes et les autres clients du serveur.
 
 ### Suivi indépendant et exécutant élu du staging (#4880)
 

@@ -22,9 +22,10 @@ def recipe_module():
     return module
 
 
-def fake_console(pools, lists=None, config=None):
-    """A minimal admin console: SHOW POOLS, SHOW LISTS, SHOW CONFIG."""
-    answers = {'SHOW POOLS': pools, 'SHOW LISTS': lists or [], 'SHOW CONFIG': config or []}
+def fake_console(pools, lists=None, config=None, servers=None):
+    """A minimal admin console: SHOW POOLS, SHOW LISTS, SHOW CONFIG, SHOW SERVERS."""
+    answers = {'SHOW POOLS': pools, 'SHOW LISTS': lists or [],
+               'SHOW CONFIG': config or [], 'SHOW SERVERS': servers or []}
 
     class Conn:
         def __enter__(self):
@@ -58,9 +59,9 @@ class RecipePoolSizing(unittest.TestCase):
         self.assertIn('admin_users = ameesh', ini)
         self.assertIn('server_tls_sslmode = require', ini)
         self.assertIn('max_client_conn = 250', ini)
-        self.assertIn('default_pool_size = 64', ini)
+        self.assertIn('default_pool_size = 80', ini)
         self.assertIn('reserve_pool_size = 16', ini)
-        self.assertIn('max_db_connections = 80', ini)
+        self.assertIn('max_db_connections = 96', ini)
         # the reserve pool is usable: the database ceiling must allow both
         self.assertGreaterEqual(self.recipe.MAX_DB_CONNECTIONS,
                                 self.recipe.DEFAULT_POOL_SIZE
@@ -70,8 +71,9 @@ class RecipePoolSizing(unittest.TestCase):
         limits = self.recipe.POOL_LIMITS
         self.assertEqual(set(limits), {'pc-smichea', 'ameesh-agents-1',
                                       'ameesh-agents-2', 'ameesh-agents-3'})
-        # #5983 : max_connections 300 moins 3 sessions superuser réservées ;
-        # au moins 30 sessions ordinaires restent aux clients directs.
+        # #6054 : 264 sur 297 places ordinaires (300 moins 3 superuser), soit
+        # 33 pour les clients directs (le test garde au moins 30).
+        self.assertEqual(sum(cap for _, _, cap in limits.values()), 264)
         self.assertLessEqual(sum(cap for _, _, cap in limits.values()), 297 - 30)
         for host, (default, reserve, cap) in limits.items():
             with self.subTest(host=host):
@@ -83,8 +85,51 @@ class RecipePoolSizing(unittest.TestCase):
                 self.assertIn('max_db_connections = %s' % cap, ini)
                 self.assertIn('default_pool_size = %s' % default, ini)
                 self.assertIn('reserve_pool_size = %s' % reserve, ini)
-        self.assertEqual(limits['ameesh-agents-3'], (32, 8, 40))
-        self.assertEqual(limits['ameesh-agents-1'], (48, 16, 64))
+        self.assertEqual(limits['pc-smichea'], (24, 8, 32))
+        self.assertEqual(limits['ameesh-agents-1'], (72, 16, 88))
+        self.assertEqual(limits['ameesh-agents-2'], (80, 16, 96))
+        self.assertEqual(limits['ameesh-agents-3'], (40, 8, 48))
+
+    def test_peak_sizing_covers_the_canonical_admission_capacity(self):
+        # #6054 : le contrôle est max_agents × 4,6 (pic #5983), pas le nombre
+        # de personas installées. 19 / 20 / 10 sont les fiches du canon.
+        self.assertEqual(self.recipe.PEAK_CLIENTS_PER_PERSONA, 4.6)
+        for host, max_agents, needed in (('ameesh-agents-1', 19, 88),
+                                         ('ameesh-agents-2', 20, 92),
+                                         ('ameesh-agents-3', 10, 46)):
+            with self.subTest(host=host):
+                result = self.recipe.capacity(max_agents, host)
+                self.assertEqual(result['needed'], needed)
+                self.assertTrue(result['ok'])
+                self.assertEqual(result['max_agents_covered'], max_agents)
+
+    def test_check_refuses_admission_above_the_max_agents_bound(self):
+        self.assertFalse(self.recipe.capacity(20, 'ameesh-agents-1')['ok'])
+        self.assertFalse(self.recipe.capacity(21, 'ameesh-agents-2')['ok'])
+        self.assertFalse(self.recipe.capacity(11, 'ameesh-agents-3')['ok'])
+        self.assertEqual(self.recipe.capacity(19, 'ameesh-agents-1')['needed'], 88)
+        self.assertTrue(self.recipe.capacity(19, 'ameesh-agents-1')['ok'])
+
+    def test_the_workstation_pool_covers_its_companion_canon_bound(self):
+        # #6054 + #6057 : 24+8=32 porte 6 places d'admission (6 × 4,6 = 27,6).
+        result = self.recipe.capacity(6, 'pc-smichea')
+        self.assertEqual(result['needed'], 28)
+        self.assertEqual(result['max_db_connections'], 32)
+        self.assertEqual(result['max_agents_covered'], 6)
+        self.assertTrue(result['ok'])
+
+    def test_check_prints_the_peak_verdict_and_its_exit_code(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.recipe.check(19, 'ameesh-agents-1'), 0)
+            self.assertEqual(self.recipe.check(20, 'ameesh-agents-1'), 1)
+        text = out.getvalue()
+        self.assertIn('max_agents 19 x 4.6 = 88 server session(s) at peak', text)
+        self.assertIn('pool 72+16 = 88: OK', text)
+        self.assertIn('max_agents 20 x 4.6 = 92', text)
+        self.assertIn('KO, resize before switching', text)
 
 
 def every_startup_setting():
@@ -304,13 +349,20 @@ class ReadPool(unittest.TestCase):
                  sv_idle=0, maxwait=0),
         ]
         lists = [dict(list='used_clients', items=45), dict(list='free_clients', items=205)]
-        config = [dict(key='max_client_conn', value='250')]
-        with mock.patch('psycopg.connect', return_value=fake_console(pools, lists, config)):
+        config = [dict(key='max_client_conn', value='250'),
+                  dict(key='max_db_connections', value='96'),
+                  dict(key='reserve_pool_timeout', value='5s')]
+        servers = [dict(database='ameesh'), dict(database='ameesh'),
+                   dict(database='other'), dict(database='pgbouncer')]
+        with mock.patch('psycopg.connect',
+                        return_value=fake_console(pools, lists, config, servers)):
             reading = pgbouncer_local.read('host=/private/socket dbname=pgbouncer')
         # N1 : `free_clients` (objets clients en cache) n'entre pas dans la
         # lecture ; le plafond est celui de SHOW CONFIG.
         self.assertEqual(reading, dict(waiting=3, maxwait_s=7, clients_active=42,
                                        servers_active=39, servers_idle=6,
+                                       servers_total=3, max_db_connections=96,
+                                       reserve_pool_timeout_s=5.0,
                                        clients_used=45, clients_max=250,
                                        track_extra_parameters=None,
                                        ignore_startup_parameters=None))
@@ -328,17 +380,38 @@ class ReadPool(unittest.TestCase):
                 pgbouncer_local.read('host=/private/socket dbname=pgbouncer')
 
 
+class ConsoleValues(unittest.TestCase):
+    def test_duration_units_and_default(self):
+        self.assertEqual(pgbouncer_local._seconds('5', 9), 5.0)
+        self.assertEqual(pgbouncer_local._seconds('5s', 9), 5.0)
+        self.assertEqual(pgbouncer_local._seconds('500ms', 9), 0.5)
+        self.assertEqual(pgbouncer_local._seconds('250000us', 9), 0.25)
+        self.assertEqual(pgbouncer_local._seconds('not-a-duration', 9), 9)
+        self.assertEqual(pgbouncer_local._seconds(None, 9), 9)
+
+    def test_ceiling_needs_a_positive_running_cap(self):
+        self.assertFalse(pgbouncer_local.at_ceiling(
+            dict(servers_total=100, max_db_connections=0)))
+        self.assertFalse(pgbouncer_local.at_ceiling(dict(servers_total=100)))
+        self.assertFalse(pgbouncer_local.at_ceiling(
+            dict(servers_total=99, max_db_connections=100)))
+        self.assertTrue(pgbouncer_local.at_ceiling(
+            dict(servers_total=100, max_db_connections=100)))
+
+
 class Pressured(unittest.TestCase):
     def test_a_real_queue_is_required(self):
         reading = dict(waiting=0, maxwait_s=0, clients_active=0, servers_active=0,
                        servers_idle=0, clients_used=None, clients_max=None)
         for waiting, maxwait, expected in ((0, 0, False), (0, 9, False),
-                                           (1, 0, False), (1, 1, True),
-                                           (3, 30, True)):
+                                           (1, 0, False), (1, 4, False),
+                                           (1, 5, True), (3, 30, True)):
             with self.subTest(waiting=waiting, maxwait=maxwait):
                 self.assertEqual(
                     pgbouncer_local.pressured(dict(reading, waiting=waiting,
                                                    maxwait_s=maxwait)), expected)
+        self.assertTrue(pgbouncer_local.pressured(dict(
+            reading, waiting=1, maxwait_s=2, reserve_pool_timeout_s=2)))
 
     def test_line_names_the_queue_and_the_unknown_slots(self):
         text = pgbouncer_local.line(dict(waiting=60, maxwait_s=30, clients_active=40,
@@ -346,6 +419,7 @@ class Pressured(unittest.TestCase):
                                          clients_used=None, clients_max=None))
         self.assertIn('60 client(s) waiting', text)
         self.assertIn('oldest 30s', text)
+        self.assertIn('warning at 5s', text)
         self.assertIn('client slots unknown', text)
 
     def test_line_reads_the_real_client_ceiling(self):
@@ -361,7 +435,8 @@ class PoolAlerts(unittest.TestCase):
     cfg = types.SimpleNamespace(dsn='host=/private/socket dbname=ameesh', backend='pg',
                                 host='pc-smichea')
     saturated = dict(waiting=60, maxwait_s=30, clients_active=40, servers_active=40,
-                     servers_idle=0, clients_used=100, clients_max=250)
+                     servers_idle=0, servers_total=40, max_db_connections=80,
+                     reserve_pool_timeout_s=5, clients_used=100, clients_max=250)
 
     def db(self):
         return types.SimpleNamespace(cfg=self.cfg)
@@ -381,12 +456,40 @@ class PoolAlerts(unittest.TestCase):
         alert = alerts[0]
         self.assertEqual(alert['type'], 'pgbouncer_pool_waiting')
         self.assertEqual(alert['value'], 60)
-        self.assertEqual(alert['threshold'], 1)
+        self.assertEqual(alert['threshold'], 5)
         self.assertEqual(alert['host'], 'pc-smichea')
         self.assertIn('60 client(s) waiting', alert['detail'])
         # the notifier dedupes on this key: a lasting queue is one alert
         self.assertEqual(exploitation.alert_key(alert),
                          exploitation.alert_key(dict(alert, value=61, detail='other')))
+
+    def test_the_ceiling_is_its_own_alert(self):
+        # #6054 : toutes les sessions serveur sont ouvertes, même sans file.
+        at_ceiling = dict(self.saturated, waiting=0, maxwait_s=0, servers_total=80)
+        with mock.patch.object(pgbouncer_local, 'admin_dsn', return_value='admin'), \
+                mock.patch.object(pgbouncer_local, 'read', return_value=at_ceiling):
+            alerts = pgbouncer_local.alerts(self.db())
+        self.assertEqual([a['type'] for a in alerts], ['pgbouncer_pool_at_ceiling'])
+        self.assertEqual(alerts[0]['value'], 80)
+        self.assertEqual(alerts[0]['threshold'], 80)
+        self.assertIn('80/80 server session(s) at the pool ceiling', alerts[0]['detail'])
+        self.assertIn('pgbouncer_pool_at_ceiling', exploitation.ALERT_TYPES)
+
+    def test_the_ceiling_takes_precedence_over_the_queue(self):
+        # Une seule alerte par pool : le plafond nomme le fait le plus dur,
+        # son détail porte encore la file.
+        both = dict(self.saturated, servers_total=80)
+        with mock.patch.object(pgbouncer_local, 'admin_dsn', return_value='admin'), \
+                mock.patch.object(pgbouncer_local, 'read', return_value=both):
+            alerts = pgbouncer_local.alerts(self.db())
+        self.assertEqual([a['type'] for a in alerts], ['pgbouncer_pool_at_ceiling'])
+        self.assertIn('60 client(s) waiting', alerts[0]['detail'])
+
+    def test_a_queue_below_the_reserve_timeout_is_not_an_alert(self):
+        normal = dict(self.saturated, maxwait_s=1)
+        with mock.patch.object(pgbouncer_local, 'admin_dsn', return_value='admin'), \
+                mock.patch.object(pgbouncer_local, 'read', return_value=normal):
+            self.assertEqual(pgbouncer_local.alerts(self.db()), [])
 
     def test_probe_reads_from_the_configuration_alone(self):
         # B1 : le repli sans base lit la même console depuis `cfg` seule.
@@ -447,7 +550,9 @@ class LocalFallback(unittest.TestCase):
         pools = [dict(database='ameesh', cl_active=40, cl_waiting=waiting,
                       sv_active=40, sv_idle=0, maxwait=maxwait)]
         return fake_console(pools, [dict(list='used_clients', items=used)],
-                            [dict(key='max_client_conn', value=str(cap))])
+                            [dict(key='max_client_conn', value=str(cap)),
+                             dict(key='max_db_connections', value='80'),
+                             dict(key='reserve_pool_timeout', value='5')])
 
     def state_path(self):
         return os.path.join(self.state_dir, 'notify', 'state.json')
@@ -538,11 +643,14 @@ class LocalFallback(unittest.TestCase):
 
 class AlertWiring(unittest.TestCase):
     def test_type_is_ordered_pushed_and_labelled(self):
-        self.assertIn('pgbouncer_pool_waiting', exploitation.ALERT_TYPES)
-        self.assertIn('pgbouncer_pool_waiting', notify.DEFAULT_TYPES)
-        self.assertIn('pgbouncer_pool_waiting', notify.URGENT_TYPES)
-        self.assertIn('pgbouncer_pool_waiting', notify.LOCAL_TYPES)
-        self.assertIn('pgbouncer_pool_waiting', notify.TYPE_LABELS)
+        for kind in ('pgbouncer_pool_waiting', 'pgbouncer_pool_at_ceiling'):
+            with self.subTest(kind=kind):
+                self.assertIn(kind, exploitation.ALERT_TYPES)
+                self.assertIn(kind, notify.DEFAULT_TYPES)
+                self.assertIn(kind, notify.URGENT_TYPES)
+                self.assertIn(kind, notify.LOCAL_TYPES)
+                self.assertIn(kind, notify.PGBOUNCER_TYPES)
+                self.assertIn(kind, notify.TYPE_LABELS)
 
 
 if __name__ == '__main__':

@@ -154,6 +154,8 @@ class ResolutionUnobservableTest(unittest.TestCase):
     def test_console_muette_ne_resout_pas_la_file(self):
         self.assertTrue(exploitation._resolution_unobservable(
             {"type": "pgbouncer_pool_waiting"}, [pgbouncer_local.FAMILY], self.cfg))
+        self.assertTrue(exploitation._resolution_unobservable(
+            {"type": "pgbouncer_pool_at_ceiling"}, [pgbouncer_local.FAMILY], self.cfg))
 
     def test_console_muette_ne_bloque_pas_les_autres_types(self):
         self.assertFalse(exploitation._resolution_unobservable(

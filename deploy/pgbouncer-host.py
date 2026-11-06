@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pwd
 from pathlib import Path
@@ -30,32 +31,68 @@ APPROVED_OPERATORS = {
     'ameesh-agents-2': 'ameesh',
     'ameesh-agents-3': 'ameesh',
 }
-#: Pool sizing (#532). Session mode holds one server session per client
+#: Pool sizing (#532, #6054). Session mode holds one server session per client
 #: session, so a host of runners needs one client slot and one server slot per
 #: resting or working session, plus the CLI bursts. The original 100 clients /
 #: 32+8 servers / 40 total saturated on 2026-10-13 (40 active, 60 waiting,
-#: then `no more connections allowed`): these are the values applied by hand on
-#: pc-smichea and kept here so a redeployment does not lower them again.
+#: then `no more connections allowed`): the fallback below keeps the raised
+#: 2026-10-13 values for a host not named in `POOL_LIMITS`.
 #: `default_pool_size + reserve_pool_size` must not exceed
-#: `max_db_connections`. #5983 sizes each host on the measured ratio of about
-#: 2.5 sessions per persona (bureau reading of 2026-11-06 00:47Z): agents-1
-#: drops to 48+16 = 64, the others keep #3965's sizing, so 80+64+80+40 = 264
-#: of the 297 ordinary slots (max_connections 300, 3 superuser reserved),
-#: leaving 33 for direct clients IF all four hosts use these pools exclusively.
-#: Bureau #150697 (2026-10-27): only pc-smichea currently has a pool; the
-#: three agent VMs connect directly. These recipe limits do not cap direct
-#: clients, and no existing installation is resized here.
+#: `max_db_connections`. #6054 sizes each host on the peak measured by #5983
+#: on 2026-11-06: 4.6 concurrent clients per persona (agents-2: 92 clients
+#: for 20 personas), one server session per active client in session mode.
+#: The pre-switch control is the host card's **admission capacity**, not the
+#: installed runner count: `max_agents * 4.6` must fit `max_db_connections`.
+#: agents-1 (19) -> 87.4 -> 88 = 72+16; agents-2 (20) -> 92 -> 96 = 80+16;
+#: agents-3 (10) -> 46 -> 48 = 40+8. pc-smichea carries no execution agent
+#: since 2026-10-28 (decision #133454 a, lot #3463) and its canon
+#: `max_agents` 27 is stale: its provisional pool is 24+8 = 32, pending the
+#: bureau's measured peak, and a companion canon lot lowers `max_agents` to
+#: what the pool carries. The total is 88+96+48+32 = 264 of the 297 ordinary
+#: slots (max_connections 300, 3 superuser reserved), leaving 33 for direct
+#: clients. Before a switch, run `check --max-agents N` with the canon value.
 MAX_CLIENT_CONN = 250
 DEFAULT_POOL_SIZE = 64
 RESERVE_POOL_SIZE = 16
 MAX_DB_CONNECTIONS = 80
+#: Peak concurrent clients per persona measured by #5983 on 2026-11-06
+#: (agents-2: 92 clients / 20 personas). In session mode each active client
+#: holds one server session, so this also sizes the server pool.
+PEAK_CLIENTS_PER_PERSONA = 4.6
 # Named runner hosts, including the workstation whose pool is installed separately.
 POOL_LIMITS = {
-    'pc-smichea': (64, 16, 80),
-    'ameesh-agents-1': (48, 16, 64),
-    'ameesh-agents-2': (64, 16, 80),
-    'ameesh-agents-3': (32, 8, 40),
+    'pc-smichea': (24, 8, 32),
+    'ameesh-agents-1': (72, 16, 88),
+    'ameesh-agents-2': (80, 16, 96),
+    'ameesh-agents-3': (40, 8, 48),
 }
+
+
+def capacity(max_agents, host=None):
+    """Server sessions the canonical admission ceiling needs at peak (#6054)."""
+    if isinstance(max_agents, bool) or not isinstance(max_agents, int) or max_agents < 1:
+        raise ValueError('max_agents must be a positive integer')
+    host = host or socket.gethostname()
+    default, reserve, ceiling = POOL_LIMITS.get(
+        host, (DEFAULT_POOL_SIZE, RESERVE_POOL_SIZE, MAX_DB_CONNECTIONS))
+    needed = math.ceil(max_agents * PEAK_CLIENTS_PER_PERSONA)
+    return dict(host=host, max_agents=max_agents, needed=needed,
+                default_pool_size=default, reserve_pool_size=reserve,
+                max_db_connections=ceiling, ok=needed <= ceiling,
+                max_agents_covered=math.floor(ceiling / PEAK_CLIENTS_PER_PERSONA))
+
+
+def check(max_agents, host=None):
+    """Print the peak verdict and return 0 when the pool covers it (#6054)."""
+    result = capacity(max_agents, host)
+    print('%s: max_agents %d x %.1f = %d server session(s) at peak; '
+          'pool %d+%d = %d: %s (covers up to %d max_agents)'
+          % (result['host'], result['max_agents'], PEAK_CLIENTS_PER_PERSONA,
+             result['needed'], result['default_pool_size'],
+             result['reserve_pool_size'], result['max_db_connections'],
+             'OK' if result['ok'] else 'KO, resize before switching',
+             result['max_agents_covered']))
+    return 0 if result['ok'] else 1
 
 
 def approved_home():
@@ -420,10 +457,17 @@ def verify(state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['install', 'verify', 'switch', 'rollback', 'measure'])
+    parser.add_argument('action', choices=['install', 'verify', 'switch', 'rollback',
+                                           'measure', 'check'])
     parser.add_argument('--label', choices=['before', 'after', 'rollback'], default='before')
+    parser.add_argument('--max-agents', type=int,
+                        help='canonical max_agents of the host card, for check')
     args = parser.parse_args()
     home = approved_home()
+    if args.action == 'check':
+        if args.max_agents is None:
+            parser.error('check requires --max-agents N')
+        return check(args.max_agents, socket.gethostname())
     # Plain reviewed paths are required by PgBouncer and systemd unit syntax.
     if not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(home)):
         raise ValueError('unsupported home path')
@@ -441,8 +485,9 @@ def main():
 
 if __name__ == '__main__':
     try:
-        main()
+        code = main()
     except Exception as error:
         print('Operation failed (%s); no exception text or DSN logged. Inspect privately.' %
               type(error).__name__)
         raise SystemExit(1)
+    raise SystemExit(code or 0)

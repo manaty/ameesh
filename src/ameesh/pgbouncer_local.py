@@ -34,6 +34,14 @@ it. `startup_lines` compares the settings an ameesh session really sends with
 the *running* pool's tracked set (`SHOW CONFIG`, not the file:
 `track_extra_parameters` is not reloaded by a HUP), so the next setting added
 to `db.startup_options` is named by `doctor` instead of failing every runner.
+
+#6054: the same console sizes the warning on the *running* pool, not on fixed
+thresholds. `max_db_connections` and `reserve_pool_timeout` come from
+`SHOW CONFIG`; `SHOW SERVERS` counts the server sessions actually open. A queue
+is saturation once its oldest client has waited at least `reserve_pool_timeout`
+(the reserve pool's own deadline), and the pool is at its ceiling once every
+server session `max_db_connections` allows is open. The previous one-second
+threshold was stricter than the design (#5983).
 """
 from __future__ import annotations
 
@@ -44,10 +52,14 @@ import threading
 from pathlib import Path
 
 CONFIG_PATH = '.config/pgbouncer/pgbouncer.ini'
-#: how long the oldest queued client must have waited before warning (seconds)
-WAIT_THRESHOLD_S = 1
+#: default `reserve_pool_timeout` when `SHOW CONFIG` does not name it: a client
+#: queued longer than this is past the reserve pool's own deadline (#6054).
+RESERVE_POOL_TIMEOUT_S = 5.0
+#: kept as the fallback for callers that pass a reading without the running
+#: value; `probe` uses `SHOW CONFIG`'s `reserve_pool_timeout` when readable.
+WAIT_THRESHOLD_S = RESERVE_POOL_TIMEOUT_S
 CONNECT_TIMEOUT_S = 5
-#: #2582: hard deadline of one console probe (connection and the three SHOW
+#: #2582: hard deadline of one console probe (connection and the four SHOW
 #: queries), in seconds. `connect_timeout` is ignored by libpq on a Unix-domain
 #: socket and the console has no statement timeout: a console that accepts the
 #: connection and stops answering would hang `ameesh alerts` (and the notifier's
@@ -135,16 +147,42 @@ def _number(value) -> int | None:
         return None
 
 
-def _reading(pools, lists, config) -> dict:
+#: a `SHOW CONFIG` duration in seconds, milliseconds or microseconds
+_DURATION = re.compile(r'(\d+(?:\.\d+)?)\s*(us|ms|s)?', re.IGNORECASE)
+
+
+def _seconds(value, default: float) -> float:
+    match = _DURATION.fullmatch(str(value).strip()) if value is not None else None
+    if match is None:
+        return default
+    number = float(match.group(1))
+    unit = (match.group(2) or 's').lower()
+    if unit == 'us':
+        return number / 1_000_000
+    if unit == 'ms':
+        return number / 1_000
+    return number
+
+
+def _reading(pools, lists, config, servers=()) -> dict:
     # The console's own pool (`pgbouncer` database) is this probe's session,
     # never a mesh client: it must not count as load.
     rows = [row for row in pools if row.get('database') != 'pgbouncer']
+    # `SHOW SERVERS` counts every server connection the pool holds, idle ones
+    # included: they still occupy a `max_db_connections` slot. The local
+    # recipe serves one database, so the aggregate is the ceiling comparison;
+    # a multi-database pool would need one count per database.
     return {
         'waiting': _total(rows, 'cl_waiting'),
         'maxwait_s': max((int(row.get('maxwait') or 0) for row in rows), default=0),
         'clients_active': _total(rows, 'cl_active'),
         'servers_active': _total(rows, 'sv_active'),
         'servers_idle': _total(rows, 'sv_idle'),
+        'servers_total': sum(row.get('database') != 'pgbouncer' for row in servers),
+        # #6054: the running pool's own ceiling and reserve deadline
+        'max_db_connections': _number(config.get('max_db_connections')),
+        'reserve_pool_timeout_s': _seconds(config.get('reserve_pool_timeout'),
+                                           WAIT_THRESHOLD_S),
         # `free_clients` counts client objects kept for reuse, not free
         # capacity: the ceiling of connected clients is `max_client_conn`
         # (`SHOW CONFIG`), the only honest denominator here.
@@ -157,7 +195,7 @@ def _reading(pools, lists, config) -> dict:
 
 
 def read(dsn) -> dict:
-    """SHOW POOLS, SHOW LISTS and SHOW CONFIG of the local console, aggregated.
+    """SHOW POOLS, SHOW LISTS, SHOW CONFIG and SHOW SERVERS, aggregated.
 
     Raises `db.Unavailable` when the console cannot be read: an unobserved
     pool is not a healthy pool."""
@@ -175,27 +213,52 @@ def read(dsn) -> dict:
                      for row in conn.execute('SHOW LISTS').fetchall()}
             config = {str(row['key']): row.get('value')
                       for row in conn.execute('SHOW CONFIG').fetchall()}
-        return _reading(pools, lists, config)
+            servers = conn.execute('SHOW SERVERS').fetchall()
+        return _reading(pools, lists, config, servers)
     except Exception as exc:  # psycopg errors, and an ill-typed console answer
         raise Unavailable('pgbouncer admin console: %s' % _one_line(exc)) from exc
 
 
 def pressured(reading: dict) -> bool:
-    """A client really queued: `maxwait` is whole seconds, so a queue that
-    clears within the second it formed is contention, not saturation."""
-    return reading['waiting'] > 0 and reading['maxwait_s'] >= WAIT_THRESHOLD_S
+    """A client queued past the running pool's `reserve_pool_timeout` (#6054).
+
+    The reserve pool is the pool's first answer to a full ordinary pool; a
+    queue that outlives its deadline is saturation, not the normal session-mode
+    wait (#5983). Readings without the running value fall back to 5 s."""
+    threshold = reading.get('reserve_pool_timeout_s', WAIT_THRESHOLD_S)
+    return reading.get('waiting', 0) > 0 and reading.get('maxwait_s', 0) >= threshold
+
+
+def at_ceiling(reading: dict) -> bool:
+    """Every server session `max_db_connections` allows is open (#6054)."""
+    ceiling = reading.get('max_db_connections')
+    total = reading.get('servers_total')
+    return bool(ceiling and ceiling > 0 and total is not None and total >= ceiling)
 
 
 def line(reading: dict) -> str:
-    slots = ('%s/%s client slots used'
-             % (reading['clients_used'], reading['clients_max'])
-             if reading['clients_used'] is not None and reading['clients_max'] is not None
+    threshold = reading.get('reserve_pool_timeout_s', WAIT_THRESHOLD_S)
+    total = reading.get('servers_total')
+    if total is None:
+        total = reading.get('servers_active', 0) + reading.get('servers_idle', 0)
+    ceiling = reading.get('max_db_connections')
+    used, maximum = reading.get('clients_used'), reading.get('clients_max')
+    slots = ('%s/%s client slots used' % (used, maximum)
+             if used is not None and maximum is not None
              else 'client slots unknown')
-    return ('local PgBouncer: %d client(s) waiting, oldest %ds (warning at %ds); '
-            '%d active client(s), %d/%d server session(s) busy, %s' % (
-                reading['waiting'], reading['maxwait_s'], WAIT_THRESHOLD_S,
-                reading['clients_active'], reading['servers_active'],
-                reading['servers_active'] + reading['servers_idle'], slots))
+    return ('local PgBouncer: %d client(s) waiting, oldest %ds (warning at %gs); '
+            '%d active client(s), %d/%s server session(s) used, %s' % (
+                reading.get('waiting', 0), reading.get('maxwait_s', 0), threshold,
+                reading.get('clients_active', 0), total,
+                ceiling if ceiling else '?', slots))
+
+
+def ceiling_line(reading: dict) -> str:
+    return ('local PgBouncer: %d/%d server session(s) at the pool ceiling; '
+            '%d client(s) waiting, oldest %ds (reserve_pool_timeout %gs)' % (
+                reading['servers_total'], reading['max_db_connections'],
+                reading.get('waiting', 0), reading.get('maxwait_s', 0),
+                reading.get('reserve_pool_timeout_s', WAIT_THRESHOLD_S)))
 
 
 class _ConsoleProbe:
@@ -259,21 +322,39 @@ def probe(cfg) -> list[dict]:
     the configuration. Raises `db.Unavailable` when the console cannot be
     read — including when it does not answer within `PROBE_TIMEOUT_S`
     (#2582) — so the caller keeps an active warning instead of resolving it
-    unobserved."""
+    unobserved.
+
+    #6054: the ceiling alert takes precedence over the queue alert. Both are
+    saturation; the ceiling names the harder fact, and its detail still carries
+    the queue. The notifier's pass interval and dedupe make a ceiling reading
+    an episode, not a per-tick message."""
     dsn = admin_dsn(cfg)
     if dsn is None:
         return []
     reading = _read_bounded(dsn)
+    common = dict(host=getattr(cfg, 'host', None),
+                  maxwait_s=reading.get('maxwait_s', 0),
+                  waiting=reading.get('waiting', 0),
+                  clients_active=reading.get('clients_active', 0),
+                  servers_active=reading.get('servers_active', 0),
+                  servers_idle=reading.get('servers_idle', 0),
+                  servers_total=reading.get('servers_total'),
+                  max_db_connections=reading.get('max_db_connections'),
+                  reserve_pool_timeout_s=reading.get(
+                      'reserve_pool_timeout_s', WAIT_THRESHOLD_S),
+                  clients_used=reading.get('clients_used'),
+                  clients_max=reading.get('clients_max'))
+    if at_ceiling(reading):
+        return [dict(schema='ameesh-alert/1', type='pgbouncer_pool_at_ceiling',
+                     agent=None, since=None, value=reading['servers_total'],
+                     threshold=reading['max_db_connections'],
+                     detail=ceiling_line(reading), **common)]
     if not pressured(reading):
         return []
     return [dict(schema='ameesh-alert/1', type='pgbouncer_pool_waiting', agent=None,
-                 since=None, value=reading['waiting'], threshold=WAIT_THRESHOLD_S,
-                 host=getattr(cfg, 'host', None), maxwait_s=reading['maxwait_s'],
-                 clients_active=reading['clients_active'],
-                 servers_active=reading['servers_active'],
-                 servers_idle=reading['servers_idle'],
-                 clients_used=reading['clients_used'], clients_max=reading['clients_max'],
-                 detail=line(reading))]
+                 since=None, value=reading['waiting'],
+                 threshold=reading.get('reserve_pool_timeout_s', WAIT_THRESHOLD_S),
+                 detail=line(reading), **common)]
 
 
 def option_names(options: str) -> list[str]:
