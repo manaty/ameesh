@@ -242,7 +242,11 @@ FERMEES = {
     # #2421 (0464) : le payload d'usage résident d'un tour non réglé est un état
     # interne borné au tour (réparation d'un worker mort), pas un état de
     # supervision ; colonne fermée aux deux rôles, aucun GRANT modifié.
-    "spend_pending": {"resident_usage"},
+    # #6005 / 0551 (#4592) : l'attribution d'appelant portée par le marqueur
+    # comptable et son instant de pose servent la réparation d'un tour
+    # interrompu (identité du marqueur, N-1) et le rapport de coûts local, pas
+    # la supervision ; colonnes fermées aux deux rôles, aucun GRANT modifié.
+    "spend_pending": {"resident_usage", "attribution", "attribution_at"},
     # L165 (EP1, 0473) : verdicts de placement par hôte candidat, lus par la
     # condition de réclamation et non par le rôle superviseur ; table interne
     # fermée aux deux rôles, aucun GRANT ajouté.
@@ -281,7 +285,11 @@ FERMEES = {
     # (`turn_costs.inputs`), consommée par le rapport local
     # `ameesh cost turns --message` ; le contrat des rôles superviseur reste
     # inchangé : colonne fermée aux deux rôles, aucun GRANT modifié.
-    "turn_costs": {"inputs", "relay_call_id"},
+    # #6005 / 0551 (#4592) : l'attribution d'appelant d'un tour hors lot est
+    # une donnée du grand livre lue par le rapport local `ameesh cost
+    # attribution` et la réparation d'un tour interrompu, pas un état de
+    # supervision ; colonne fermée aux deux rôles, aucun GRANT modifié.
+    "turn_costs": {"inputs", "relay_call_id", "attribution"},
     # L165 (EP2, 0476) : scores de candidats d'un rôle élu, lus par les
     # exécuteurs candidats et `ameesh role status`, pas par le rôle
     # superviseur ; table interne fermée aux deux rôles, aucun GRANT ajouté.
