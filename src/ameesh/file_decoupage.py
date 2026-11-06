@@ -92,6 +92,8 @@ SLEEP_REASON_RE = re.compile(r"^roadmap\s*:\s*épuisée\s+(\S+)\s+\(#3256\s+§2\
 REOPEN_MARK = "sleep lifted: roadmap reopened"
 #: préfixe de la note d'exemption écrite sur le lot de découpage
 SLEEP_EXEMPT_PREFIX = "sleep exempted:"
+#: #5149, #6010 : les motifs d'exemption qui tiennent un siège de relecture.
+REVIEW_SEAT_WHY = ("designated review pending", "only eligible reviewer")
 #: #5129 : préfixe de la levée motivée par un gel qui manque une famille
 WAKE_REVIEW_PREFIX = "sleep lifted for review:"
 #: #5151 : lots attribués écartés au moment du sommeil, et pourquoi
@@ -310,6 +312,17 @@ def roadmap_state(notes: list, project: str) -> str | None:
         if match and match.group(1).strip(".,;:") == project:
             state = REOPENED_STATE
     return state
+
+
+def _exhausted_since(notes: list, project: str) -> float:
+    """#6010 : l'instant de la dernière note d'épuisement du projet (0 sans
+    note datée) ; les traces d'exemption valent pour cet épuisement-là."""
+    since = 0.0
+    for row in _roadmap_order(notes):
+        match = EXHAUSTED_RE.match(str((row or {}).get("note") or ""))
+        if match and match.group(1).strip(".,;:") == project:
+            since = float(row.get("created_ts") or 0.0)
+    return since
 
 
 def exhausted(notes: list, project: str) -> bool:
@@ -654,18 +667,27 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
     return pending, keep, None
 
 
-def _journal_exemption(db, split_id, name: str, why: str) -> None:
+def _journal_exemption(db, split_id, name: str, why: str, *,
+                       since_ts: float = 0.0) -> None:
     """Écrit une fois le motif d'exemption sur le lot de découpage (#4525).
 
     Une note par agent (ou par cause globale), pas une par passage : le motif
     est une trace, pas un journal de boucle. Une trace en échec ne défait pas
     le sommeil.
+
+    #6010 : la trace vaut pour l'épuisement en cours (`since_ts`, l'instant
+    de sa note) : un nouvel épuisement la réécrit. Un siège de relecture
+    (`REVIEW_SEAT_WHY`) est noté par lot cité : un siège sur un autre gel est
+    une autre trace, que `ameesh debit` lit comme l'état de l'agent.
     """
     if split_id is None:
         return
     prefix = "%s %s:" % (SLEEP_EXEMPT_PREFIX, name)
     try:
-        if work.events_noted(db, int(split_id), prefix):
+        noted = work.events_noted(db, int(split_id), prefix, float(since_ts or 0.0))
+        if noted and not why.startswith(REVIEW_SEAT_WHY):
+            return
+        if noted and str(noted[-1].get("note") or "").strip() == "%s %s" % (prefix, why):
             return
         work.note(db, int(split_id), "%s %s" % (prefix, why), actor=SLEEP_ACTOR)
     except Exception:  # noqa: BLE001 - une trace ne bloque jamais le geste
@@ -772,7 +794,7 @@ def _recent_mail(db, name: str, *, now: float, senders, window_s=None) -> tuple:
 
 def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
            split_id=None, lots=(), listing=(), cfg=None, canons=None,
-           mail_window_s=None, waits=None) -> list:
+           mail_window_s=None, waits=None, since_ts: float = 0.0) -> list:
     """Met en sommeil les agents d'exécution au repos du projet (§2.3).
 
     #4525 : une relecture désignée ouverte n'est jamais endormie, et le dernier
@@ -790,14 +812,14 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
         db, project, lots, listing, cfg=cfg, canons=canons)
     if unreadable:
         why = "review exemptions unreadable: %s" % unreadable
-        _journal_exemption(db, split_id, "*", why)
+        _journal_exemption(db, split_id, "*", why, since_ts=since_ts)
         for name in item.idle:
             out.append({"agent": name, "slept": False, "why": why})
         return out
     fresh, fresh_error = _fresh_state(db, item.idle)
     if fresh_error:
         why = "fresh state unreadable: %s" % fresh_error
-        _journal_exemption(db, split_id, "*", why)
+        _journal_exemption(db, split_id, "*", why, since_ts=since_ts)
         for name in item.idle:
             out.append({"agent": name, "slept": False, "why": why})
         return out
@@ -811,14 +833,14 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
             why = ("designated review pending on #%s"
                    % (pending_rows[0].get("lot") or "?"))
             out.append({"agent": name, "slept": False, "why": why})
-            _journal_exemption(db, split_id, name, why)
+            _journal_exemption(db, split_id, name, why, since_ts=since_ts)
             continue
         kept = keep.get(name)
         if kept is not None:
             why = ("only eligible reviewer of family %s for pending freeze #%s"
                    % (kept[0], kept[1]))
             out.append({"agent": name, "slept": False, "why": why})
-            _journal_exemption(db, split_id, name, why)
+            _journal_exemption(db, split_id, name, why, since_ts=since_ts)
             continue
         row = fresh.get(name) or by_name.get(name) or {}
         if int(row.get("actionable_lots") or 0) > 0:
@@ -829,7 +851,7 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
             why = ("assigned actionable lot #%s" % lot_id if lot_id
                    else "actionable work due")
             out.append({"agent": name, "slept": False, "why": why})
-            _journal_exemption(db, split_id, name, why)
+            _journal_exemption(db, split_id, name, why, since_ts=since_ts)
             continue
         if int(row.get("unread") or 0):
             senders, mail_error = mail_lifters(cfg, db, listing, row,
@@ -837,21 +859,21 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
             if mail_error:
                 why = "mail exemptions unreadable: %s" % mail_error
                 out.append({"agent": name, "slept": False, "why": why})
-                _journal_exemption(db, split_id, name, why)
+                _journal_exemption(db, split_id, name, why, since_ts=since_ts)
                 continue
             recent, mail_error = _recent_mail(
                 db, name, now=now, senders=senders, window_s=mail_window_s)
             if mail_error:
                 why = "mail exemptions unreadable: %s" % mail_error
                 out.append({"agent": name, "slept": False, "why": why})
-                _journal_exemption(db, split_id, name, why)
+                _journal_exemption(db, split_id, name, why, since_ts=since_ts)
                 continue
             if recent:
                 age = now - float(recent[0].get("created_ts") or now)
                 why = "unread mail from %s (%s)" % (
                     recent[0].get("sender"), su._duration(age))
                 out.append({"agent": name, "slept": False, "why": why})
-                _journal_exemption(db, split_id, name, why)
+                _journal_exemption(db, split_id, name, why, since_ts=since_ts)
                 continue
         try:
             done = agent_pause.change(db, name, paused=True, reason=reason,
@@ -1185,7 +1207,8 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
                 slept = _sleep(db, project, item, by_name, now,
                                split_id=int(split["id"]), lots=lots, listing=listing,
                                cfg=cfg, canons=canons,
-                               mail_window_s=settings.mail_window(), waits=waits)
+                               mail_window_s=settings.mail_window(), waits=waits,
+                               since_ts=_exhausted_since(notes, project))
                 if slept:
                     out.append({"kind": "sleep", "project": project,
                                 "lot": int(split["id"]), "agents": slept})
