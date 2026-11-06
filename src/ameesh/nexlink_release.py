@@ -739,13 +739,25 @@ def _announce(cfg, db, project, body, report, *, urgent=True):
                        also=(project.staging_handoff,))
 
 
-def _handoff_open(cfg, db, project, pending, now, save):
-    """Tag published: hand staging over, once, and say what to attest."""
+def handoff_preflight(project, pending):
+    """B1 dev3: every check that can refuse a handoff, run before the tag.
+
+    The frozen staging workflows (closed list, deploy jobs) and the delta's
+    migrations; a refusal here leaves no tag and no orphan cutoff."""
     for workflow in STAGING_WORKFLOWS:
-        staging_jobs(project, pending["sha"], workflow)  # refused before handing over
+        staging_jobs(project, pending["sha"], workflow)
     required = migration_requirements(project, pending["sha"], pending["main"])
-    rows = [{"target": target, "version": row["version"], "name": row["name"]}
-            for target, entries in sorted(required.items()) for row in entries]
+    return {"migrations": [{"target": target, "version": row["version"], "name": row["name"]}
+                           for target, entries in sorted(required.items())
+                           for row in entries]}
+
+
+def _handoff_open(cfg, db, project, pending, now, save):
+    """Tag published: hand staging over, once, and say what to attest.
+
+    Nothing here may fail before `pending["handoff"]` is saved: the checks
+    that can refuse (`handoff_preflight`) ran before the tag (B1 dev3)."""
+    rows = pending["handoff_preflight"]["migrations"]
     deadline = now + float(project.attestation_timeout_s)
     command = ("ameesh release attest --project %s --version %s --sha %s %s%s"
                % (project.name, pending["version"], pending["sha"],
@@ -769,9 +781,10 @@ def _handoff_open(cfg, db, project, pending, now, save):
     save()
     if db is not None:
         from . import work
+        from .db import DbError
         try:
             pending["handoff"]["lot"] = open_handoff_lot(db, project, pending)
-        except work.WorkError as exc:
+        except (work.WorkError, DbError) as exc:
             # The tag is out: the wait still runs and the next tick retries.
             pending["handoff"]["lot_error"] = str(exc)
         save()
@@ -845,10 +858,11 @@ def _handoff_resolution_guarded(cfg, db, project, pending, save):
     """B2 impl-03: a read failure (GitHub, journal, lot) is said once per
     distinct error and never skips the deadline and held-cutoff announcements."""
     from . import work
+    from .db import DbError
     handoff = pending["handoff"]
     try:
         outcome = _handoff_resolution(cfg, db, project, pending, save)
-    except (rc.ReleaseError, work.WorkError, OSError,
+    except (rc.ReleaseError, work.WorkError, DbError, OSError,
             subprocess.SubprocessError) as exc:
         text = str(exc) or type(exc).__name__
         if handoff.get("error") != text:
@@ -1065,6 +1079,14 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 active += 1
         if not ready:
             return dict(pending, result="waiting-ci")
+        if (not pending["empty"] and project.staging_handoff
+                and "handoff_preflight" not in pending):
+            try:
+                pending["handoff_preflight"] = handoff_preflight(project, pending)
+            except subprocess.CalledProcessError as exc:
+                raise rc.ReleaseError("Nexlink staging handoff preflight: git %s failed"
+                                      % " ".join(map(str, exc.cmd[-3:]))) from exc
+            save()
         pending["pr"] = publish(project, pending)
         save()
         if not pending["empty"] and project.staging_handoff:

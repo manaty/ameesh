@@ -421,30 +421,62 @@ class HandoffPipelineTests(unittest.TestCase):
             self.assertEqual(self.run_tick(2100)["result"], "staging-unattested")
 
     def test_read_failure_keeps_the_bounded_wait(self):
-        """B2 impl-03: a journal or GitHub failure never skips the announcements."""
+        """B2 impl-03: a journal (DbError, its real class) or GitHub failure
+        never skips the announcements."""
         from ameesh import work
-        self.handed_over()
-        before = len(self.sent)
-        with mock.patch.object(work, "events_noted",
-                               side_effect=rc.TransientReleaseError("journal down")):
-            for now in (4700, 4800):
-                self.assertEqual(self.run_tick(now)["result"], "waiting-attestation")
-        bodies = [body for body, _r, _k in self.sent[before:]]
-        self.assertEqual(len(bodies), 2)
-        self.assertIn("lecture de l'attestation de staging en échec : journal down", bodies[0])
-        self.assertIn("attestation de staging absente", bodies[1])
+        from ameesh.db import DbError, Unavailable
+        for error in (DbError("journal down"), Unavailable("journal down"),
+                      rc.TransientReleaseError("journal down")):
+            with self.subTest(error=type(error).__name__):
+                rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {
+                    "nexlink": {"pending_nexlink": json.loads(json.dumps(self.pending))}}})
+                self.handed_over()
+                before = len(self.sent)
+                with mock.patch.object(work, "events_noted", side_effect=error):
+                    for now in (4700, 4800):
+                        self.assertEqual(self.run_tick(now)["result"], "waiting-attestation")
+                bodies = [body for body, _r, _k in self.sent[before:]]
+                self.assertEqual(len(bodies), 2)
+                self.assertIn("lecture de l'attestation de staging en échec : journal down",
+                              bodies[0])
+                self.assertIn("attestation de staging absente", bodies[1])
 
     def test_lot_that_cannot_open_is_reported_and_retried(self):
         from ameesh import work
-        with mock.patch.object(nx, "open_handoff_lot",
-                               side_effect=work.WorkError("bureau is not external")):
-            self.assertEqual(self.handed_over()["result"], "waiting-attestation")
-        self.assertIn("Lot d'attestation NON ouvert : bureau is not external", self.sent[-1][0])
-        self.assertEqual(self.slot()["pending_nexlink"]["handoff"]["lot_error"],
-                         "bureau is not external")
-        self.attest(5)
-        with self.gh_runs():
-            self.assertEqual(self.run_tick(2000)["result"], "released")
+        from ameesh.db import DbError
+        for error in (work.WorkError("bureau is not external"), DbError("base down")):
+            with self.subTest(error=type(error).__name__):
+                rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {
+                    "nexlink": {"pending_nexlink": json.loads(json.dumps(self.pending))}}})
+                with mock.patch.object(nx, "open_handoff_lot", side_effect=error):
+                    self.assertEqual(self.handed_over()["result"], "waiting-attestation")
+                self.assertIn("Lot d'attestation NON ouvert : %s" % error, self.sent[-1][0])
+                self.assertEqual(self.slot()["pending_nexlink"]["handoff"]["lot_error"],
+                                 str(error))
+                self.notes = []
+                self.attest(5)
+                with self.gh_runs():
+                    self.assertEqual(self.run_tick(2000)["result"], "released")
+
+    def test_preflight_refusal_leaves_no_tag(self):
+        """B1/B2 dev3: an invalid staging workflow or a git failure is refused
+        before publish: no tag, no orphan cutoff."""
+        import subprocess as sp
+        for error, expected in (
+                (rc.ReleaseError("Deployment environment must be literal staging"),
+                 "literal staging"),
+                (sp.CalledProcessError(128, ["git", "show", "x:.github/workflows/deploy-api.yml"]),
+                 "preflight: git")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(nx, "staging_jobs", side_effect=error), \
+                    mock.patch.object(nx, "workflow_step", return_value=True), \
+                    mock.patch.object(nx, "publish") as publish:
+                with self.assertRaisesRegex(rc.ReleaseError, expected):
+                    self.run_tick(1000)
+                publish.assert_not_called()
+                pending = self.slot()["pending_nexlink"]
+                self.assertNotIn("handoff", pending)
+                self.assertNotIn("handoff_preflight", pending)
 
     def test_missing_attestation_announced_once_at_deadline(self):
         self.handed_over()
