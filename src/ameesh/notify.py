@@ -3554,7 +3554,7 @@ class Notifier:
                                       project=alert.get("project"), lot=alert.get("lot"),
                                       meta=meta) is None:
                             continue
-                    elif kind == "module_deviation":
+                    elif kind in ("module_deviation", "release_project_undeclared"):
                         if not self._send_module_brief(db, alert, name, text, meta):
                             continue
                     else:
