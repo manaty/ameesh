@@ -75,7 +75,7 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
 
 ## Préparer l'installation (bureau, feu distinct)
 
-1. Appliquer la migration additive 0547 avant le nouveau code. Installer la
+1. Appliquer les migrations additives 0547 et 0552 (#6017) avant le nouveau code. Installer la
    version revue dans `/opt/ameesh-vm-adapter/venv`, dans un arbre que les agents
    ne peuvent modifier. Aucune installation n'est effectuée par ce lot.
 2. Choisir **l'hôte du détenteur actuel de la clé**, hors des VM cibles.

@@ -30,7 +30,7 @@ class Queue:
         rows = self.db.query('SELECT return_probe FROM host_lifecycle WHERE host=%s FOR UPDATE',
                              (host,))
         control = self.control(host)
-        if control:
+        if control and rows:
             control['return_probe'] = rows[0]['return_probe']
         return control
 
