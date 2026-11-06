@@ -4343,11 +4343,12 @@ class Operations(Domain):
     SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens",
                 "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "lot_wake",
                 "harness_bin", "session_max_tokens", "turn_reread_budget",
-                "session_reread_budget")
+                "session_reread_budget", "compact_tokens")
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
     INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
                         "turn_grace_seconds", "session_max_tokens",
-                        "turn_reread_budget", "session_reread_budget")
+                        "turn_reread_budget", "session_reread_budget",
+                        "compact_tokens")
 
     @abc.abstractmethod
     def publish_peek(self, name: str, owner: str, epoch: int, payload: dict) -> bool:

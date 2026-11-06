@@ -66,6 +66,8 @@ AGENT_COLUMNS = """
     turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake,
     -- #5250 (0531) : politique de contexte de cet agent, état du pilote
     session_max_tokens, turn_reread_budget, session_reread_budget, context_pilot,
+    -- #6040 (0553) : seuil de compaction native du harnais
+    compact_tokens,
     -- #1037 : le harnais, le dossier et l'id d'OUVERTURE de la session ACTIVE
     -- (0384) ; NULL hors d'une session ouverte par l'exécuteur. Le harnais
     -- déclaré (`harness`) ne dit pas sous lequel la session tourne (L242b).

@@ -69,7 +69,7 @@ BINARY_TARGETS = ("darwin-aarch64", "darwin-x86_64", "linux-aarch64", "linux-x86
 AUTH_TYPES = ("agent", "terminal")
 #: clés connues sous `ameesh`
 AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "interactive",
-               "interactive_permission", "session", "stream", "env", "model", "effort", "tier", "hooks",
+               "interactive_permission", "session", "stream", "env", "model", "effort", "tier", "compact", "hooks",
                "cost", "permissions", "acp", "accounts", "install", "resident", "backup", "refusal")
 #: #5529 : contrat de preuve de refus avant tout appel fournisseur
 REFUSAL_SCHEMAS = ("ameesh-refusal/1",)
@@ -173,6 +173,9 @@ class HarnessDescriptor:
     model: Setting = Setting()
     effort: Setting = Setting()
     tier: Setting = Setting()
+    #: #6040 : seuil de compaction native du harnais, en arguments seulement
+    #: (`{compact}` = jetons) ; vide = le harnais ne se règle pas
+    compact: Setting = Setting()
     hooks: Mapping[str, Any] = field(default_factory=dict)
     cost: Mapping[str, Any] = field(default_factory=dict)
     permissions: Mapping[str, Any] = field(default_factory=dict)
@@ -824,6 +827,12 @@ def validate(document: Any, *, path: str = "") -> list[Finding]:
         findings.append(Finding("harness-option-invalid", ERROR,
                                 "only one setting can be delivered by file "
                                 "(model, effort or tier)", path))
+    if "compact" in ameesh:
+        # #6040 : un seuil en jetons, livré en arguments seulement.
+        _check_setting("compact", ameesh.get("compact"), findings)
+        if isinstance(ameesh.get("compact"), dict) and ameesh["compact"].get("file") is not None:
+            findings.append(Finding("harness-option-invalid", ERROR,
+                                    "`ameesh.compact`: delivered by arguments only", path))
     _check_shape(ameesh.get("hooks"), "hooks", findings, path)
     cost = ameesh.get("cost")
     if cost is not None:
@@ -1301,6 +1310,7 @@ def _build(document: dict, path: str, source: str) -> HarnessDescriptor:
         model=_setting(ameesh.get("model")),
         effort=_setting(ameesh.get("effort")),
         tier=_setting(ameesh.get("tier")),
+        compact=_setting(ameesh.get("compact")),
         hooks=ameesh.get("hooks") if isinstance(ameesh.get("hooks"), dict) else {},
         cost=ameesh.get("cost") if isinstance(ameesh.get("cost"), dict) else {},
         permissions=ameesh.get("permissions")

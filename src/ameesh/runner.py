@@ -941,6 +941,8 @@ class AgentWorker(threading.Thread):
         #: CTX-02b : motif de clôture observé (L105) et dernière rotation
         #: réussie, publiés avec le tour — jamais lus par une décision.
         self._turn_close_observation: dict | None = None
+        #: #6040 : seuil de compaction réellement passé au harnais de ce tour
+        self._turn_compact_tokens: int | None = None
         self._last_rotation_observation: dict | None = None
         #: CTX-04b (#4971) : `C_last`/`O_last` du dernier tour mesuré, pour la
         #: projection de fenêtre ; None après une compaction (la prochaine
@@ -2511,6 +2513,12 @@ class AgentWorker(threading.Thread):
         """Budget `R_session` (CTX-04a) : réglage de l'agent (#5250), sinon exécuteur."""
         from .exploitation import effective_session_reread_budget
         return effective_session_reread_budget(self.cfg, getattr(self, "agent", None))
+
+    def compact_tokens(self) -> int | None:
+        """Seuil de compaction native du harnais (#6040) : réglage de l'agent,
+        sinon None (défaut du harnais)."""
+        from .exploitation import effective_compact_tokens
+        return effective_compact_tokens(getattr(self, "agent", None))
 
     def turn_max_seconds(self) -> int:
         """Durée maximale d'un tour (L105) : réglage de l'agent
@@ -5429,6 +5437,10 @@ class AgentWorker(threading.Thread):
                     # CTX-04b : présent seulement en opt-in.
                     **({"window_maintenance_share": self.cfg.window_maintenance_share}
                        if self.cfg.window_maintenance_share > 0 else {}),
+                    # #6040 : le seuil réellement passé au harnais du tour,
+                    # pas le réglage (harnais emprunté ou sans option : absent).
+                    **({"compact_tokens": self._turn_compact_tokens}
+                       if self._turn_compact_tokens else {}),
                 },
                 # Le journal partagé porte des états, pas du texte libre : le
                 # motif est normalisé (`kind`), les valeurs qui l'ont déclenché
@@ -5467,6 +5479,7 @@ class AgentWorker(threading.Thread):
             self._context_profile_mode = None
             self._turn_close_observation = None
             self._last_rotation_observation = None
+            self._turn_compact_tokens = None
 
     def _compta_repare(self) -> None:
         """Avant un tour : rejoue le travail en attente ; `{}` suspend."""
@@ -8643,9 +8656,13 @@ class AgentWorker(threading.Thread):
             except (memory_mod.MemoryError, db_mod.DbError, OSError, subprocess.SubprocessError) as exc:
                 log("[%s] persona memory unavailable for this turn: %s" % (self.name, exc))
         resume += memory_preface
+        # #6040 : seuil de compaction native (Codex : en cours de tour) ; un
+        # compte emprunté garde les défauts de son harnais, comme l'effort.
+        compact = None if emprunte else self.compact_tokens()
+        self._turn_compact_tokens = compact if compact and adapter.supports_compact() else None
         argv = adapter.command(resume + spec["prompt"], session,
                                model=model or None, effort=effort or None, patch=patch,
-                               tier=tier or None)
+                               tier=tier or None, compact=compact)
         label = {"prompt": "consigne", "mail": "messages", "event": "événements",
                  "urgent": "prioritaire", "idle": "reprise",
                  "suite": "suite"}[spec["kind"]]
@@ -9128,6 +9145,10 @@ class AgentWorker(threading.Thread):
                         adapter, key=cle_resident, session=session, cwd=cwd, env=env,
                         model=model, effort=effort, tier=tier, lot=lot_du_tour,
                         stderr_path=stderr_path)
+                    if rp is not None:
+                        # #6040 : le résident ne reçoit pas le seuil (exec
+                        # seul) ; `turn.context` ne publie que ce qui est passé.
+                        self._turn_compact_tokens = None
                 if rp is None:
                     # L498 : le cgroup délégué ne concerne que le lancement d'un
                     # harnais par événement ; le processus résident (L76) sert
