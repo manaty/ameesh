@@ -16,7 +16,9 @@ puis par l'élection d'un pilote entre hôtes candidats (L165/EP1, version
 l'élection (L165/EP3, version `1.9.0`, compatible : voir « Contrat 1.9 »),
 puis par l'identité du tour fermé (version `1.10.0`, compatible : voir
 « Contrat 1.10 »), puis par le diagnostic atomique des refus de tour
-(#5856, version `1.11.0`, compatible : voir « Contrat 1.11 »).
+(#5856, version `1.11.0`, compatible : voir « Contrat 1.11 »), puis par
+l'attribution d'appelant des tours hors lot (#6005, version `1.12.0`,
+compatible : voir « Contrat 1.12 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -1006,3 +1008,25 @@ l'enveloppe renvoie `lease_lost`. L'opération booléenne existante est conserv�
 Le runner restitue la consigne avant de rendre le bail pour une porte hôte
 fermée ; une perte de bail arrête le worker et les autres refus attendent
 avec une reprise exponentielle bornée.
+
+### Contrat 1.12 : attribution d'appelant des tours hors lot (#6005)
+
+Deux paramètres facultatifs portent l'attribution d'appelant d'un tour hors
+lot (`manaty/ameesh#4592`), un petit objet JSON à clés allow-listées et borné :
+
+- `pending_spend.put(..., attribution=None)` : le marqueur comptable la
+  conserve, donc la ligne écrite par la réparation d'un tour interrompu — par
+  le même exécuteur ou un autre — porte la même attribution ;
+- `turn_costs.insert(..., attribution=None)` : la ligne du grand livre la
+  reçoit, à côté de `work_item_id`.
+
+L'attribution est une **donnée**, jamais une admission, un budget ou une
+autorisation. Elle est bornée et validée côté appelant (`ameesh
+cost_attribution`) ; un serveur d'avant la 1.12 qui répond `bad_args` sur le
+paramètre inconnu est réessayé sans elle (le tour reste compté, l'attribution
+est perdue et journalisée). Un client 1.11 omet simplement les deux
+paramètres. Les lignes antérieures restent sans attribution.
+
+L'opération n'ajoute aucune ligne à la table du contrat : le rapport
+`ameesh cost attribution` lit `turn_costs.ledger` (déjà refusé à l'appareil)
+et regroupe côté mesh.

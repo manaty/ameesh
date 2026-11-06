@@ -162,7 +162,8 @@ class TurnCosts(interface.TurnCosts):
                spend_key=None, source=None, executor=None, lease_owner=None,
                lease_epoch=None, void_reason=None, price_fallback=None,
                cache_write_tokens=None, work_item_id=None, started_at=None,
-               turn_id=None, inputs=None, relay_call_id=None) -> bool:
+               turn_id=None, inputs=None, relay_call_id=None,
+               attribution=None) -> bool:
         cols = ["agent", "harness", "turn", "model", "session", "usd",
                 "input_tokens", "cached_input_tokens", "output_tokens",
                 "cum_usd", "cum_input_tokens", "cum_cached_input_tokens",
@@ -211,6 +212,12 @@ class TurnCosts(interface.TurnCosts):
             # L80b (0472) : les messages servis par ce tour, en JSON array.
             cols.append("inputs")
             values.append(json.dumps([str(i) for i in inputs], ensure_ascii=False))
+        if attribution is not None:
+            # #6005 (0551) : l'attribution d'appelant du tour hors lot, à
+            # côté du lot. C'est une donnée : aucun tri, budget ni droit.
+            cols.append("attribution")
+            values.append(json.dumps(dict(attribution), ensure_ascii=False,
+                                     sort_keys=True))
         if source == "relay" and turn_id:
             reservations = self.db.query(
                 "select r.billing_account from tranche_reservations r"
@@ -235,7 +242,7 @@ class TurnCosts(interface.TurnCosts):
             suffix = " on conflict (spend_key) do nothing"
         sql = ("insert into turn_costs (" + ", ".join(cols) + ") values ("
                + ", ".join("to_timestamp(%s)" if c == "started_at"
-                           else "%s::jsonb" if c == "inputs" else "%s"
+                           else "%s::jsonb" if c in ("inputs", "attribution") else "%s"
                            for c in cols) + ")")
         if not suffix:
             self.db.execute(sql, tuple(values))
@@ -322,6 +329,8 @@ class TurnCosts(interface.TurnCosts):
                " t.output_tokens, t.cum_usd::float8 AS cum_usd, t.cum_input_tokens,"
                " t.cum_cached_input_tokens, t.cum_output_tokens,"
                " to_jsonb(t)->>'void_reason' AS void_reason,"
+               " to_jsonb(t)->>'source' AS source,"
+               " to_jsonb(t)->'attribution' AS attribution,"
                " (to_jsonb(t)->>'cache_write_tokens')::bigint AS cache_write_tokens,"
                " extract(epoch from t.recorded_at)::float8 AS recorded_ts"
                " FROM turn_costs t")

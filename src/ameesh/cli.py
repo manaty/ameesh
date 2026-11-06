@@ -23,6 +23,14 @@
                                                  names suggested), to a stopped agent
                                                  (unless --queue) and from a stopped identity
                        [--urgent] [--ack] [--info] [--cc NAME[,NAME…]] [--request-expires 2h]
+                       [--attribution JSON]
+                                                 --attribution (#6005) records the caller
+                                                 attribution of the turn this message opens
+                                                 (a JSON object with source, environment,
+                                                 run_type, run_id, repo, issue_number,
+                                                 pr_number, run_kind), stored on the turn
+                                                 ledger beside the {work}; it is data only,
+                                                 never admission, budget or authorization
                                                  a request deadline (`request_expires_ts`,
                                                  distinct from the signature TTL): after it,
                                                  no turn starts, the sender is notified and
@@ -359,6 +367,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     new_lot = None
     parent_lot = None
     app = None
+    attribution = None
     kind = "notify"
     urgent = False
     args = list(args)
@@ -405,7 +414,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     estimate = None
     force = None
     for flag in ("--from", "--key", "--expires", "--request-expires", "--lot",
-                 "--new-lot", "--parent-lot", "--kind", "--estimate", "--app", "--force"):
+                 "--new-lot", "--parent-lot", "--kind", "--estimate", "--app", "--force",
+                 "--attribution"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -431,6 +441,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             elif flag == "--force":
                 # #540 : forcer la file d'équipe, avec sa raison (journal du lot)
                 force = value if value is not None else ""
+            elif flag == "--attribution":
+                # #6005 : attribution d'appelant du tour que ce message ouvre
+                attribution = value if value is not None else ""
             else:
                 kind = value
     if "--urgent" in args:
@@ -443,6 +456,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if kind not in ("request", "reply", "notify", "event"):
         print("invalid kind: %r (request|reply|notify|event)" % (kind,), file=sys.stderr)
         return 2
+    if attribution is not None:
+        # #6005 : refusé à l'envoi, pas au tour suivant — une attribution
+        # illisible ne doit pas être découverte quand le tour est déjà dû.
+        from . import cost_attribution
+        try:
+            attribution = cost_attribution.parse(attribution)
+        except cost_attribution.AttributionError as exc:
+            print("--attribution: %s" % exc, file=sys.stderr)
+            return 2
     # L125 : --urgent vaut pour tout message (réveil sans délai) ; il
     # n'interrompt un tour en cours que d'un expéditeur habilité (0018)
     if ack and urgent:
@@ -483,7 +505,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
               "[--kind request|reply|notify|event] "
               "[--urgent] [--verdict|--arbitration] "
               "[--ack] [--info] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] "
-              "[--request-expires 2h] [--queue]\n"
+              "[--request-expires 2h] [--attribution JSON] [--queue]\n"
               "       a body of `-` is read on standard input "
               "(send <dest> - <<'EOF' … EOF: a quoted delimiter expands nothing); "
               "`--` before a body that starts with `--`",
@@ -703,6 +725,11 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     payload: dict = {"human": True} if human else {}
     if human_proof:
         payload["human_account"] = human_proof
+    if attribution:
+        # #6005 : l'attribution d'appelant voyage avec le message ; le tour
+        # qu'il ouvre l'écrit sur sa ligne `turn_costs`, à côté du lot. Donnée
+        # seule, jamais admission, budget ni autorisation.
+        payload["attribution"] = attribution
     payload.update((key, True) for key in marks)
     if ack or (not urgent and not sign and not human and not marks and dest != "all"
                and lot is None and new_lot is None and kind in ("notify", "reply")
