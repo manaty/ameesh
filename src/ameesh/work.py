@@ -4644,6 +4644,13 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
         # commande du pilote l'écrit, après contrôle de son autorité.
         raise WorkError("note refused: `%s` is reserved to the review floor; use "
                         "ameesh work reviewer %s --floor N" % (review_floor.PREFIX, item_id))
+    from . import nexlink_release
+    if text.startswith(nexlink_release.RESERVED_PREFIXES):
+        # #6020 : l'attestation de staging remis et le passage du pilote sont
+        # lus avec l'auteur du journal ; seule `ameesh release attest` les
+        # écrit, sous l'identité liée de la session (jamais un --actor).
+        raise WorkError("note refused: `%s` is reserved to ameesh release attest"
+                        % text.split(":", 1)[0])
     from . import planned_waits
     note_text = text
     # #3219 (B2) : le détenteur est lu, l'auteur autorisé et la note écrite
