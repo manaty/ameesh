@@ -61,8 +61,9 @@ call, after one idle second (git, gh, ssh between two statements) and after
 any error; explicit transactions and independent gate/controller locks retain
 their sessions until completion. No transaction is shared across threads.
 
-The VM pool permits 64 ordinary server sessions and 16 reserve sessions, with
-a total ceiling of 80. Clients have a ceiling of 250. Idle *unassigned* server
+The pool of pc-smichea and agents-2 permits 64 ordinary server sessions and
+16 reserve sessions, with a total ceiling of 80; agents-1 has 48+16 (ceiling
+64) and agents-3 32+8 (ceiling 40), see below. Clients have a ceiling of 250. Idle *unassigned* server
 sessions are closed after 30 seconds. These limits were raised after the
 2026-10-13 incident on pc-smichea: the original pool (32+8, ceiling 40,
 100 clients) saturated in session mode (40 active, 60 waiting, then `no more
@@ -82,8 +83,10 @@ refuses an existing installation, and a fresh installation elsewhere cannot
 raise the limits of a running one — an installation still carrying the earlier
 200/32/8/40 sizing is the case this covers. Back up
 `~/.config/pgbouncer/pgbouncer.ini` first (dated name, 0600), then set
-`max_client_conn = 250`, `default_pool_size = 64`, `reserve_pool_size = 16`,
-`max_db_connections = 80` and `server_idle_timeout = 30`. Reload without
+`max_client_conn = 250`, `server_idle_timeout = 30` and the host's own
+`default_pool_size`, `reserve_pool_size` and `max_db_connections`
+(`POOL_LIMITS` in `pgbouncer-host.py`: 64/16/80 on pc-smichea and agents-2,
+48/16/64 on agents-1, 32/8/40 on agents-3). Reload without
 dropping clients:
 
 ```sh

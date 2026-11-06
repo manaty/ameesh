@@ -820,9 +820,11 @@ pour la prod.
 
 La recette PgBouncer autorise aussi `ameesh-agents-3` sous l’utilisateur
 `ameesh`. Elle prévoit pour cet hôte 32 connexions ordinaires et 8 de réserve
-(`max_db_connections = 40`), et conserve un plafond de 80 pour chacun des
-trois hôtes de runners antérieurs. Si ces quatre hôtes passent exclusivement
-par ces pools, leur budget cumulé est de 280 sous le plafond serveur de 300.
+(`max_db_connections = 40`), un plafond de 64 pour `ameesh-agents-1` (48+16,
+#6004) et de 80 pour `ameesh-agents-2` et `pc-smichea`. Si ces quatre hôtes
+passent exclusivement par ces pools, leur budget cumulé est de 264 sous les 297
+sessions ordinaires du serveur (300 moins 3 réservées au superutilisateur),
+soit une marge de 33.
 
 Au relevé en lecture seule du bureau du 27/10/2026 vers 11:00Z (courrier
 #150697), seul `pc-smichea` dispose de PgBouncer, plafonné à 80 ; les trois
