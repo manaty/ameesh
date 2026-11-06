@@ -1238,14 +1238,27 @@ class HarnessAdapter:
         """Le descripteur sait-il passer un tier au harnais ?"""
         return bool(self.spec.tier_flags or self.spec.tier_file)
 
+    def supports_compact(self) -> bool:
+        """#6040 : le descripteur sait-il passer un seuil de compaction ?"""
+        return bool(self.descriptor.compact.flag)
+
+    def _compact_options(self, compact: int | None) -> list[str]:
+        """#6040 : seuil de compaction native, en jetons ; rien sans réglage
+        ou sur un harnais qui n'en déclare pas (il garde son défaut)."""
+        if not compact or not self.supports_compact():
+            return []
+        return [flag.format(compact=int(compact)) for flag in self.descriptor.compact.flag]
+
     def command(self, text: str, session_id: str | None = None,
                 model: str | None = None, effort: str | None = None,
-                patch: str | None = None, tier: str | None = None) -> list[str]:
+                patch: str | None = None, tier: str | None = None,
+                compact: int | None = None) -> list[str]:
         """Ligne de commande d'un tour sans tête (le texte est la consigne)."""
         if self.descriptor.protocol == "acp":
             return self._acp_command(text, session_id, model, effort, tier)
         return self._argv(self.spec.headless, session_id, text,
-                          extra=self._options(model, effort, tier, patch))
+                          extra=self._options(model, effort, tier, patch)
+                          + self._compact_options(compact))
 
     def _acp_command(self, text: str, session_id: str | None, model: str | None,
                      effort: str | None, tier: str | None) -> list[str]:

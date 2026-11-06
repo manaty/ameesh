@@ -185,6 +185,7 @@ class Operations(interface.Operations):
                    r.session_policy, r.lot_wake, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
                    r.turn_grace_seconds,
                    r.session_max_tokens, r.turn_reread_budget, r.session_reread_budget,
+                   r.compact_tokens,
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,

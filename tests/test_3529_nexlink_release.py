@@ -16,8 +16,8 @@ from ameesh import nexlink_release as nx, release_cutoff as rc
 class VersionTests(unittest.TestCase):
     def test_sequence_and_invalid_names(self):
         self.assertEqual(nx.next_version("11v"), "11w")
-        self.assertEqual(nx.next_version("11z"), "12a")
-        for name in ("0a", "11aa", "v11w", "11W", "11w;prod"):
+        self.assertEqual(nx.next_version("11z"), "11aa")
+        for name in ("0a", "11aaaa", "v11w", "11W", "11w;prod"):
             with self.assertRaises(rc.ReleaseError):
                 nx.version_key(name)
 

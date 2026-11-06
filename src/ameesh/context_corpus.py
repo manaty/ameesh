@@ -110,7 +110,7 @@ WINDOW_KEYS = frozenset({"C_last", "O_last", "W", "C_next_input", "C_next",
                          "unknowns"})
 POLICY_KEYS = frozenset({"session", "context_max_tokens", "session_max_tokens",
                          "turn_reread_budget", "session_reread_budget",
-                         "window_maintenance_share"})
+                         "window_maintenance_share", "compact_tokens"})
 SOURCE_KEYS = frozenset({"event_id", "observation_id", "ledger_id", "schema",
                          "host"})
 _OPAQUE_SESSION_RE = re.compile(r"^sha256:[0-9a-f]{32,64}$")
@@ -332,6 +332,8 @@ def _policy(payload: Mapping) -> dict:
         "session_reread_budget": _number(raw.get("session_reread_budget")),
         "window_maintenance_share": _number(
             raw.get("window_maintenance_share")),
+        # #6040 : seuil de compaction native passé au harnais, s'il y en a un
+        "compact_tokens": _number(raw.get("compact_tokens")),
     }
 
 

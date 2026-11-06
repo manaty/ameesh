@@ -43,6 +43,7 @@ import types
 import uuid
 
 from . import canon as canon_mod
+from . import config
 from . import land
 from . import mail
 from . import mechanics
@@ -59,6 +60,9 @@ WINDOW_S = 1800.0
 #: #5450: global fallback of a launcher without heartbeat (11 h), below the
 #: 12 h between two cutoffs. The service unit is bounded 30 min later.
 STAGING_TIMEOUT_S = staging_watch.STAGING_FALLBACK_S
+#: #6020: bound on the bureau's staging attestation before an announcement
+#: (pilot decision, 06/11 03:50Z: 4 h)
+ATTESTATION_TIMEOUT_S = 4 * 3600.0
 #: after a staging stop, how long the workstation's transient units
 #: (`poste-maj-staging-<pid>-*`, restart and rollback, #3039) may finish before
 #: they are stopped: they run from the release worktree (#3049)
@@ -1132,6 +1136,11 @@ class ProjectRelease:
     version_bump: str = "level"
     suite_tolerated: tuple = ()
     model: str = "semver"
+    #: #6020: Nexlink staging handed to this agent (the bureau): the cutoff
+    #: tags and reports, the agent applies migrations and dispatches staging,
+    #: then attests (`ameesh release attest`, #6020); no staging credential here.
+    staging_handoff: str = ""
+    attestation_timeout_s: float = ATTESTATION_TIMEOUT_S
 
     @classmethod
     def from_config(cls, cfg, name: str, entry: dict) -> "ProjectRelease":
@@ -1139,7 +1148,8 @@ class ProjectRelease:
             raise ReleaseError("release.projects.%s: an object is required" % name)
         unknown = set(entry) - {"repo", "target", "remote", "staging", "report",
                                 "github", "window_s", "staging_timeout_s", "staging_executor",
-                                "lock_ttl_s", "lock_wait_s", "version_bump", "model"}
+                                "lock_ttl_s", "lock_wait_s", "version_bump", "model",
+                                "staging_handoff", "attestation_timeout_s"}
         if unknown:
             raise ReleaseError("release.projects.%s: unknown key(s) %s"
                                % (name, ", ".join(sorted(unknown))))
@@ -1162,6 +1172,11 @@ class ProjectRelease:
                                     or "staging" in entry):
             raise ReleaseError("nexlink model requires project nexlink, target develop, "
                                "and its closed staging workflow list (no staging script)")
+        handoff = entry.get("staging_handoff", "")
+        if handoff and (model != "nexlink" or not isinstance(handoff, str)
+                        or not config.NAME_RE.fullmatch(handoff)):
+            raise ReleaseError("release.projects.%s.staging_handoff: an agent name, "
+                               "nexlink model only" % name)
         elected_role = ((getattr(cfg, "release", None) or {}).get("role")
                         or (getattr(cfg, "packet_watch", None) or {}).get("role"))
         executor = entry.get("staging_executor")
@@ -1198,12 +1213,15 @@ class ProjectRelease:
             staging_timeout_s=number("staging_timeout_s", STAGING_TIMEOUT_S),
             lock_ttl_s=number("lock_ttl_s", LOCK_TTL_S),
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
-            suite_tolerated=tolerated, model=model)
+            suite_tolerated=tolerated, model=model, staging_handoff=handoff or "",
+            attestation_timeout_s=number("attestation_timeout_s", ATTESTATION_TIMEOUT_S))
 
 
 def child_credentials(project) -> frozenset[str]:
     """Credentials needed by the selected release model's guarded child."""
     if getattr(project, "model", "semver") == "nexlink":
+        if getattr(project, "staging_handoff", ""):
+            return frozenset()  # #6020: the bureau holds staging credentials
         from . import nexlink_release
         return nexlink_release.CHILD_CREDENTIALS
     return frozenset()
@@ -2805,18 +2823,21 @@ def report_recipients(cfg, db, project: ProjectRelease) -> list[str]:
 
 
 def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
-                *, urgent: bool = False) -> None:
+                *, urgent: bool = False, also: tuple = ()) -> None:
     """Mail a release report and write it in the project's own thread.
 
     #6014: the mailbox alone left a missed cutoff invisible in the project's
     thread: the default thread project is the *sender's* (ameesh), so the
     report only reached the ameesh thread. The project is explicit here, with
     the same commit-then-record order as `notify._send_module_brief`: a
-    thread failure never loses the delivered message.
+    thread failure never loses the delivered message. `also` (#6020) adds
+    recipients in copy, such as the agent a staging is handed to.
     """
     from . import fil
     payload = {**(payload or {}), **({"urgent": True} if urgent else {})}
-    for recipient in report_recipients(cfg, db, project):
+    recipients = report_recipients(cfg, db, project)
+    recipients += [name for name in also if name and name not in recipients]
+    for recipient in recipients:
         try:
             # The thread write is explicit below, in the release project:
             # `mail.send` would otherwise derive the sender's project.
