@@ -27,7 +27,7 @@ TARGET = dict(zone='fr-par-1', server_id='11111111-1111-4111-8111-111111111111',
 def policy(**over):
     return dict(dict(enabled=True, controller_host='controller', min_on_s=3600,
                      min_off_s=60, wake_delay_s=900, observation_gap_s=90,
-                     io_timeout_s=10, targets={'burst': dict(TARGET)}), **over)
+                     io_timeout_s=10, health_deadline_s=900, targets={'burst': dict(TARGET)}), **over)
 
 
 class DecisionTest(unittest.TestCase):
@@ -310,7 +310,7 @@ class AdapterTest(PgTestCase):
         self.observe_old()
         other = self.connect()
         locks = []
-        def reconcile(argv, timeout):
+        def reconcile(argv, timeout, **_):
             with other.transaction() as tx:
                 locks.append(tx.query(
                     "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS ok",
@@ -328,7 +328,7 @@ class AdapterTest(PgTestCase):
     def test_generation_change_during_health_invalidates_completion(self):
         self.request('busy')
         self.observe_old()
-        def changed(argv, timeout):
+        def changed(argv, timeout, **_):
             self.db.execute("UPDATE host_lifecycle SET generation=generation+1 WHERE host='burst'")
             return True
         self.probe.side_effect = changed

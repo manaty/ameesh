@@ -6,6 +6,7 @@
   "wake_delay_s": 900,
   "observation_gap_s": 90,
   "io_timeout_s": 10,
+  "health_deadline_s": 900,
   "targets": {
     "burst-host": {
       "zone": "fr-par-1",
