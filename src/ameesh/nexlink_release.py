@@ -17,7 +17,12 @@ import re
 
 from . import release_cutoff as rc
 
-_VERSION = re.compile(r"^([1-9][0-9]*)([a-z])$")
+# #6020: the real sequence (release-11ac … release-11as, after release/11z)
+# counts its letters like spreadsheet columns: 11z → 11aa, 11az → 11ba; the
+# number only moves by an explicit `--version`.
+_VERSION = re.compile(r"^([1-9][0-9]*)([a-z]{1,3})$")
+#: the existing Nexlink tags are `release-<version>`
+TAG_PREFIX = "release-"
 # Closed lists: host configuration cannot substitute a production workflow or
 # pass deployment inputs. CI uses the existing frozen-head integration contract.
 STAGING_WORKFLOWS = ("deploy-api.yml", "deploy-web.yml", "deploy-media-worker.yml")
@@ -118,24 +123,50 @@ def validate_staging(project, sha, workflow):
 def version_key(value):
     match = _VERSION.fullmatch(value)
     if not match:
-        raise rc.ReleaseError("Nexlink version must be a number and one lowercase letter")
-    return int(match[1]), ord(match[2]) - ord("a")
+        raise rc.ReleaseError("Nexlink version must be a number and one to three "
+                              "lowercase letters")
+    return int(match[1]), len(match[2]), match[2]
 
 
 def next_version(value):
-    number, letter = version_key(value)
-    return "%d%s" % (number + (letter == 25), chr(ord("a") + (letter + 1) % 26))
+    number, _size, letters = version_key(value)
+    letters = list(letters)
+    position = len(letters) - 1
+    while position >= 0 and letters[position] == "z":
+        letters[position] = "a"
+        position -= 1
+    if position < 0:
+        letters.insert(0, "a")
+    else:
+        letters[position] = chr(ord(letters[position]) + 1)
+    value = "%d%s" % (number, "".join(letters))
+    version_key(value)
+    return value
 
 
 def branches(project):
-    proc = rc._git(project.repo, "ls-remote", "--heads", project.remote,
-                   "refs/heads/release/*", check=True)
-    result = {}
+    """Published versions: `release/<v>` branches and `release-<v>` tags.
+
+    #6020: the manual cutoffs since 11ac publish a tag without a branch; the
+    branch commit wins when both exist, a tag reads its peeled commit.
+    """
+    proc = rc._git(project.repo, "ls-remote", project.remote, "refs/heads/release/*",
+                   "refs/tags/" + TAG_PREFIX + "*", check=True)
+    result, tags = {}, {}
     for line in proc.stdout.splitlines():
         sha, ref = line.split()
-        value = ref.removeprefix("refs/heads/release/")
-        if _VERSION.fullmatch(value):
-            result[value] = sha
+        if ref.startswith("refs/heads/release/"):
+            value = ref.removeprefix("refs/heads/release/")
+            if _VERSION.fullmatch(value):
+                result[value] = sha
+            continue
+        value = ref.removeprefix("refs/tags/" + TAG_PREFIX)
+        peeled = value.endswith("^{}")
+        value = value.removesuffix("^{}")
+        if _VERSION.fullmatch(value) and (peeled or value not in tags):
+            tags[value] = sha
+    for value, sha in tags.items():
+        result.setdefault(value, sha)
     return result
 
 
@@ -156,7 +187,10 @@ def previous_release(project, fallback):
     if not known:
         return fallback
     latest = max(known, key=version_key)
-    rc.fetch(project.repo, project.remote, "release/" + latest)
+    # A tag-only version was fetched with the target (`rc.fetch` takes --tags).
+    if rc._git(project.repo, "ls-remote", "--heads", project.remote,
+               "refs/heads/release/" + latest, check=True).stdout.strip():
+        rc.fetch(project.repo, project.remote, "release/" + latest)
     return known[latest]
 
 
@@ -471,6 +505,241 @@ def publish(project, pending):
                         "Frozen final tree: %s. Staging only; production requires owner go."
                         % sha]).strip()
 
+# #6020: staging handed to the bureau (`staging_handoff`). The cutoff runs
+# the final-tree CI, tags and reports; the bureau applies the migrations,
+# dispatches STAGING_WORKFLOWS on release/<v>, then attests with
+# `ameesh release attest`, wherever it runs. The attestation, or the pilot's
+# decision to pass, is an event of the shared log: the release host reads it,
+# checks each run on GitHub and the migrations against its own Git delta, and
+# never reads a staging credential.
+HANDOFF_EVENT = "release.handoff"
+HANDOFF_DAYS = 30
+HANDOFF_LIMIT = 50
+HANDOFF_DECISIONS = ("attested", "passed")
+_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def handoff_object(project_name, version):
+    return "release:%s:%s" % (project_name, version)
+
+
+def parse_runs(texts):
+    """`WORKFLOW=RUN_ID`, exactly one per staging workflow."""
+    runs = {}
+    for text in texts or ():
+        workflow, _, run_id = str(text).partition("=")
+        if workflow not in STAGING_WORKFLOWS or not run_id.isdigit() or workflow in runs:
+            raise rc.ReleaseError("--run WORKFLOW=RUN_ID expected once for each of %s"
+                                  % ", ".join(STAGING_WORKFLOWS))
+        runs[workflow] = int(run_id)
+    if set(runs) != set(STAGING_WORKFLOWS):
+        raise rc.ReleaseError("one run per staging workflow is required: %s"
+                              % ", ".join(STAGING_WORKFLOWS))
+    return runs
+
+
+def parse_migrations(texts):
+    """`TARGET:VERSION`, TARGET among the staging databases."""
+    rows = set()
+    for text in texts or ():
+        target, _, version = str(text).partition(":")
+        if target not in STAGING_DATABASES or not version.isdigit():
+            raise rc.ReleaseError("--migration TARGET:VERSION expected, TARGET in %s"
+                                  % ", ".join(sorted(STAGING_DATABASES)))
+        rows.add((target, int(version)))
+    return [{"target": target, "version": version} for target, version in sorted(rows)]
+
+
+def handoff_shape_error(data):
+    """Why a handoff event is malformed, or ""."""
+    if not isinstance(data, dict) or data.get("decision") not in HANDOFF_DECISIONS:
+        return "unknown decision"
+    if not isinstance(data.get("actor"), str) or not data["actor"]:
+        return "no actor"
+    if data["decision"] == "passed":
+        return ""
+    if not isinstance(data.get("sha"), str) or not _SHA.fullmatch(data["sha"]):
+        return "no attested commit"
+    try:
+        parse_runs("%s=%s" % item for item in (data.get("runs") or {}).items())
+        parse_migrations("%s:%s" % (row["target"], row["version"])
+                         for row in data.get("migrations") or ())
+    except (rc.ReleaseError, AttributeError, KeyError, TypeError) as exc:
+        return str(exc) or "malformed attestation"
+    return ""
+
+
+def record_handoff(db, *, project, version, decision, actor, authority, sha="",
+                   runs=None, migrations=None, now):
+    """The bureau's attestation or the pilot's pass, as one shared event."""
+    from . import events
+    version_key(version)
+    data = dict(schema=rc.SCHEMA, version=version, decision=decision, actor=actor,
+                authority=authority, at=float(now))
+    if decision == "attested":
+        data.update(sha=sha, runs=runs or {}, migrations=migrations or [])
+    why = handoff_shape_error(data)
+    if why:
+        raise rc.ReleaseError("release handoff refused: " + why)
+    return events.record(db, HANDOFF_EVENT, handoff_object(project, version),
+                         project=project, **data)
+
+
+def handoff_events(db, project, version):
+    """The handoff events of one version, oldest first: [(id, data)]."""
+    from . import storage
+    rows = storage.of(db).events.recent_type(
+        HANDOFF_EVENT, HANDOFF_DAYS, HANDOFF_LIMIT,
+        object=handoff_object(project.name, version))
+    return sorted((int(row["id"]), row.get("data")) for row in rows or ()
+                  if isinstance(row, dict))
+
+
+def verify_attestation(project, pending, data):
+    """("ok", evidence) | ("wait", why) | ("reject", why), without credential."""
+    sha, version = pending["sha"], pending["version"]
+    if data["sha"] != sha:
+        return "reject", "attested commit %s is not the frozen candidate %s" % (
+            data["sha"][:12], sha[:12])
+    attested = {(row["target"], int(row["version"])) for row in data["migrations"]}
+    for target, rows in migration_requirements(project, sha, pending["main"]).items():
+        for row in rows:
+            if (target, row["version"]) not in attested:
+                return "reject", "migration %s on %s not attested" % (row["name"], target)
+    slug = rc.github_slug(project)
+    evidence = []
+    for workflow in STAGING_WORKFLOWS:
+        run_id = int(data["runs"][workflow])
+        try:
+            run = json.loads(gh(project, ["api", "repos/%s/actions/runs/%d" % (slug, run_id)]))
+        except ValueError as exc:
+            raise rc.TransientReleaseError("Nexlink run %d unreadable" % run_id) from exc
+        path = str(run.get("path") or "").split("@")[0]
+        if (path != ".github/workflows/" + workflow or run.get("head_sha") != sha
+                or run.get("head_branch") != "release/" + version
+                or run.get("event") != "workflow_dispatch"):
+            return "reject", "run %d is not %s dispatched on release/%s @ %s" % (
+                run_id, workflow, version, sha[:12])
+        if run.get("status") != "completed":
+            return "wait", "run %d (%s) still %s" % (run_id, workflow, run.get("status"))
+        if run.get("conclusion") != "success":
+            return "reject", "run %d (%s) concluded %s" % (
+                run_id, workflow, run.get("conclusion"))
+        evidence.append({"workflow": workflow, "id": run_id, "url": run.get("html_url")})
+    return "ok", {"runs": evidence, "migrations": data["migrations"]}
+
+
+def _announce(cfg, db, project, body, report, *, urgent=True):
+    if db is not None:
+        rc.send_report(cfg, db, project, body, report, urgent=urgent,
+                       also=(project.staging_handoff,))
+
+
+def _handoff_open(cfg, db, project, pending, now, save):
+    """Tag published: hand staging over, once, and say what to attest."""
+    required = migration_requirements(project, pending["sha"], pending["main"])
+    rows = [{"target": target, "version": row["version"], "name": row["name"]}
+            for target, entries in sorted(required.items()) for row in entries]
+    pending["handoff"] = dict(to=project.staging_handoff, at=now, migrations=rows,
+                              deadline=now + float(project.handoff_timeout_s), rejected={})
+    save()
+    deadline = datetime.datetime.fromtimestamp(pending["handoff"]["deadline"],
+                                               datetime.timezone.utc)
+    command = ("ameesh release attest --project %s --version %s --sha %s %s%s"
+               % (project.name, pending["version"], pending["sha"],
+                  " ".join("--run %s=<id>" % workflow for workflow in STAGING_WORKFLOWS),
+                  "".join(" --migration %s:%d" % (row["target"], row["version"])
+                          for row in rows)))
+    body = ("Nexlink %s : CI de l'arbre final verte, tag %s posé sur %s "
+            "(branche release/%s, %s).\n"
+            "Staging remis à %s : appliquer les migrations de staging (%s), puis "
+            "lancer %s sur release/%s, puis attester :\n%s\n"
+            "Sans attestation à %s, annonce au pilote."
+            % (pending["version"], pending["tag"], pending["sha"], pending["version"],
+               pending.get("pr") or "PR à venir", project.staging_handoff,
+               ", ".join("%s %s" % (row["target"], row["name"]) for row in rows) or "aucune",
+               ", ".join(STAGING_WORKFLOWS), pending["version"], command,
+               deadline.strftime("%d/%m %H:%MZ")))
+    _announce(cfg, db, project, body, dict(pending, result="waiting-attestation"),
+              urgent=False)
+    return dict(pending, result="waiting-attestation")
+
+
+def _handoff_resolution(cfg, db, project, pending, save):
+    """The first valid decision of the shared log, or None (still waiting)."""
+    handoff = pending["handoff"]
+    rejected = handoff.setdefault("rejected", {})
+    handoff.pop("waiting", None)
+    for event_id, data in (handoff_events(db, project, pending["version"])
+                           if db is not None else ()):
+        if str(event_id) in rejected:
+            continue
+        why = handoff_shape_error(data)
+        if not why and data.get("authority") != "corrector" and (
+                data["decision"] == "passed" or data["actor"] != project.staging_handoff):
+            why = "%s may not %s this release" % (
+                data["actor"], "pass" if data["decision"] == "passed" else "attest")
+        if not why:
+            if data["decision"] == "passed":
+                return "passed", dict(event=event_id, actor=data["actor"])
+            verdict, detail = verify_attestation(project, pending, data)
+            if verdict == "ok":
+                return "attested", dict(detail, event=event_id, actor=data["actor"])
+            if verdict == "wait":
+                handoff["waiting"] = detail
+                save()
+                return None
+            why = detail
+        rejected[str(event_id)] = why
+        save()
+        _announce(cfg, db, project, "Nexlink %s : attestation de staging #%d refusée : %s. "
+                  "Corriger puis attester de nouveau." % (pending["version"], event_id, why),
+                  dict(pending, result="attestation-refused", event=event_id, message=why))
+    return None
+
+
+def _handoff_waiting(cfg, db, project, pending, at, label, now, save):
+    """Bounded wait: the deadline and a blocked next cutoff are each said once."""
+    handoff = pending["handoff"]
+    if now >= float(handoff["deadline"]) and not handoff.get("overdue_at"):
+        handoff["overdue_at"] = now
+        save()
+        _announce(cfg, db, project, "Nexlink %s : attestation de staging absente après "
+                  "%.1f h (remis à %s le %s). Le tag %s reste posé ; la coupure attend."
+                  % (pending["version"], (now - float(handoff["at"])) / 3600.0,
+                     handoff["to"], datetime.datetime.fromtimestamp(
+                         float(handoff["at"]), datetime.timezone.utc).strftime("%d/%m %H:%MZ"),
+                     pending["tag"]), dict(pending, result="attestation-overdue"))
+    if at > float(pending["cutoff_at"]) and handoff.get("blocked_cutoff") != at:
+        handoff["blocked_cutoff"] = at
+        save()
+        _announce(cfg, db, project, "Nexlink : la coupure %s est due, mais %s attend "
+                  "l'attestation de staging de %s. Décision du pilote : attendre "
+                  "(rien à faire), ou passer : ameesh release pass --project %s "
+                  "--version %s (la coupure %s part alors au tic suivant)."
+                  % (label, pending["version"], handoff["to"], project.name,
+                     pending["version"], label),
+                  dict(pending, result="cutoff-blocked", blocked_cutoff=at))
+    return dict(pending, result="waiting-attestation")
+
+
+def _close(cfg, db, project, slot, pending, result, save):
+    report = dict(pending, result=result, project=project.name,
+                  staging_ok=result == "released")
+    slot.update(last_cutoff=pending["cutoff_at"], last_result=result)
+    slot.pop("pending_nexlink")
+    save()
+    rc.write_report(cfg, project, report)
+    body = "Nexlink %s : %s ; %s" % (pending["version"], result, pending.get("pr"))
+    attestation = pending.get("staging_attestation")
+    if attestation:
+        body += " ; staging attesté par %s : %s" % (attestation["actor"], ", ".join(
+            "%s run %s" % (run["workflow"], run["id"]) for run in attestation["runs"]))
+    if result == "not-attested":
+        body += " ; staging non attesté, passé par %s" % pending["handoff_passed"]["actor"]
+    _announce(cfg, db, project, body, report, urgent=result == "not-attested")
+    return report
+
 
 def _train_pause(db, project, now):
     """The project train paused, as a cause for a missed cutoff (#6014)."""
@@ -556,13 +825,27 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
         at, label = rc.cutoff_slot(rules, now)
         save = lambda: rc.save_state(cfg, state)
         pending = slot.get("pending_nexlink")
+        passed = None
+        if pending is not None and pending.get("handoff"):
+            outcome = _handoff_resolution(cfg, db, project, pending, save)
+            if outcome is None:
+                return _handoff_waiting(cfg, db, project, pending, at, label, now, save)
+            kind, detail = outcome
+            if kind == "attested":
+                pending["staging_attestation"] = detail
+                return _close(cfg, db, project, slot, pending, "released", save)
+            # The pilot passed: this cutoff closes without staging and the due
+            # one starts now, even past its window (it was held, not missed).
+            pending["handoff_passed"] = detail
+            passed = _close(cfg, db, project, slot, pending, "not-attested", save)
+            pending = None
         if pending is None:
             if not force and float(slot.get("last_cutoff") or 0) >= at:
-                return {"result": "already-recorded", "cutoff_at": at}
+                return passed or {"result": "already-recorded", "cutoff_at": at}
             due = rc.due(rules, now, slot, project.window_s)
-            if not force and due is None:
+            if not (force or passed) and due is None:
                 return {"result": "not-due", "cutoff_at": at}
-            if not force and due.get("missed"):
+            if not (force or passed) and due.get("missed"):
                 return _missed_cutoff(cfg, db, project, slot, at, label, source,
                                       now, save)
             head, base, main, reading, proof = snapshot(project)
@@ -571,7 +854,7 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
             previous = previous_release(project, main)
             pending = slot["pending_nexlink"] = dict(
                 schema=rc.SCHEMA, project=project.name,
-                version=value, tag="nexlink-" + value, integration="integration/release-" + value,
+                version=value, tag=TAG_PREFIX + value, integration="integration/release-" + value,
                 head=head, base=base, main=main, sha=sha, cutoff_at=at, label=label,
                 previous=previous, empty=rc.same_tree(project.repo, previous, sha),
                 canon_commit=source.commit, tree_green=proof)
@@ -602,19 +885,13 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
             return dict(pending, result="waiting-ci")
         pending["pr"] = publish(project, pending)
         save()
+        if not pending["empty"] and project.staging_handoff:
+            return _handoff_open(cfg, db, project, pending, now, save)
         if not pending["empty"]:
             pending["migration_attestation"] = migration_gate(cfg, project, pending)
             save()
             for workflow in STAGING_WORKFLOWS:
                 if not workflow_step(project, pending, workflow, staging=True, save=save, now=now):
                     return dict(pending, result="waiting-staging")
-        report = dict(pending, result="empty" if pending["empty"] else "released",
-                      project=project.name, staging_ok=not pending["empty"])
-        slot.update(last_cutoff=pending["cutoff_at"], last_result=report["result"])
-        slot.pop("pending_nexlink")
-        save()
-        rc.write_report(cfg, project, report)
-        if db is not None:
-            rc.send_report(cfg, db, project, "Nexlink %s : %s ; %s" %
-                           (pending["version"], report["result"], pending["pr"]), report)
-        return report
+        return _close(cfg, db, project, slot, pending,
+                      "empty" if pending["empty"] else "released", save)

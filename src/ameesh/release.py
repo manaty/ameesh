@@ -451,7 +451,8 @@ def _release_tick(cfg, args, declared) -> int:
                                     if report.get("version") else ""))
             if report.get("result") not in ("released", "reconciled", "nothing-new",
                                             "already-recorded", "not-due", "missed",
-                                            "kept-active", "waiting-ci", "waiting-staging", "empty"):
+                                            "kept-active", "waiting-ci", "waiting-staging", "empty",
+                                            "waiting-attestation", "not-attested"):
                 status = 1
         return status
     finally:
@@ -560,10 +561,60 @@ def _elected_tick(cfg, args):
         min_left=0, dry_run=False, json=False), credentials=credentials)
 
 
+def _handoff_actor(cfg, db, explicit, *, what, agent_allowed):
+    """#6020: who records a staging handoff decision, and with what authority.
+
+    A pilot, orchestrator or human (`work.corrector`) may attest or pass; the
+    session's own bound agent may attest only, and the release host accepts
+    it only from the agent the staging was handed to.
+    """
+    from . import identity
+    try:
+        return work.corrector(cfg, db, explicit, what=what, history=False), "corrector"
+    except work.WorkError:
+        if not agent_allowed:
+            raise
+        binding = identity.resolve_binding(cfg, db)
+        if binding.ok and binding.name and (not explicit or explicit == binding.name):
+            return binding.name, "agent"
+        raise
+
+
+def _handoff(cfg, args) -> int:
+    """`ameesh release attest|pass` (#6020): one event of the shared log."""
+    from . import nexlink_release, release_cutoff
+    from .db import open_db
+    db = open_db(cfg)
+    try:
+        attest = args.release_command == "attest"
+        actor, authority = _handoff_actor(
+            cfg, db, args.actor, what="release " + args.release_command,
+            agent_allowed=attest)
+        extra = {}
+        if attest:
+            extra = dict(sha=args.sha, runs=nexlink_release.parse_runs(args.run),
+                         migrations=nexlink_release.parse_migrations(args.migration))
+        event_id = nexlink_release.record_handoff(
+            db, project=args.project, version=args.version,
+            decision="attested" if attest else "passed", actor=actor,
+            authority=authority, now=time.time(), **extra)
+        print("release %s %s: %s recorded (event %d) by %s; the release tick checks it"
+              % (args.project, args.version, "attestation" if attest else "pass",
+                 event_id, actor))
+        return 0
+    except (work.WorkError, release_cutoff.ReleaseError, ValueError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    finally:
+        db.close()
+
+
 def run(cfg, args) -> int:
-    """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch`."""
+    """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest|pass`."""
     from . import release_cutoff
     command = args.release_command
+    if command in ("attest", "pass"):
+        return _handoff(cfg, args)
     if (command in ("tick", "packet-watch", "cutoff")
             or command == "staging-needed" and getattr(args, "apply", False)):
         status = _elected_tick(cfg, args)
@@ -711,3 +762,23 @@ def add_parser(sub, func) -> None:
     reason_p.add_argument("--text", required=True)
     reason_p.add_argument("--actor", default="")
     reason_p.set_defaults(func=func)
+    attest_p = rel.add_parser(
+        "attest", help="#6020: the bureau attests a handed-over Nexlink staging "
+                       "(migrations, then the staging dispatches); the release tick "
+                       "checks the runs on GitHub and closes the cutoff")
+    attest_p.add_argument("--project", default="nexlink")
+    attest_p.add_argument("--version", required=True)
+    attest_p.add_argument("--sha", required=True, help="the tagged commit")
+    attest_p.add_argument("--run", action="append", default=[],
+                          help="WORKFLOW=RUN_ID, once per staging workflow")
+    attest_p.add_argument("--migration", action="append", default=[],
+                          help="TARGET:VERSION applied on staging (hub, content)")
+    attest_p.add_argument("--actor", default=None)
+    attest_p.set_defaults(func=func)
+    pass_p = rel.add_parser(
+        "pass", help="#6020: the pilot stops waiting for a staging attestation; the "
+                     "held cutoff closes without staging and the due one starts")
+    pass_p.add_argument("--project", default="nexlink")
+    pass_p.add_argument("--version", required=True)
+    pass_p.add_argument("--actor", default=None)
+    pass_p.set_defaults(func=func)

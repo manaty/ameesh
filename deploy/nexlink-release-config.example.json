@@ -7,7 +7,9 @@
         "github": "manaty/nexlink",
         "target": "develop",
         "remote": "origin",
-        "model": "nexlink"
+        "model": "nexlink",
+        "staging_handoff": "bureau",
+        "handoff_timeout_s": 7200
       }
     }
   }
