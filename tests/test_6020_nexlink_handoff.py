@@ -459,24 +459,58 @@ class HandoffPipelineTests(unittest.TestCase):
                     self.assertEqual(self.run_tick(2000)["result"], "released")
 
     def test_preflight_refusal_leaves_no_tag(self):
-        """B1/B2 dev3: an invalid staging workflow or a git failure is refused
-        before publish: no tag, no orphan cutoff."""
+        """B1/B2 dev3: an invalid staging workflow or a git failure (error,
+        timeout, OSError) is refused before publish: no tag, and the cutoff
+        closes as refused-preflight instead of holding the next one."""
         import subprocess as sp
-        for error, expected in (
-                (rc.ReleaseError("Deployment environment must be literal staging"),
+        staging, migrations = "staging_jobs", "migration_requirements"
+        for target, error, expected in (
+                (staging, rc.ReleaseError("Deployment environment must be literal staging"),
                  "literal staging"),
-                (sp.CalledProcessError(128, ["git", "show", "x:.github/workflows/deploy-api.yml"]),
-                 "preflight: git")):
+                (staging, sp.CalledProcessError(128, ["git", "show", "x:.github/workflows/deploy-api.yml"]),
+                 "preflight: git show"),
+                (migrations, sp.TimeoutExpired(["git", "-C", "/r", "show", "x:y.sql"], 30),
+                 "timed out"),
+                (migrations, OSError("no git"), "no git")):
+            rc.save_state(self.cfg, {"schema": rc.SCHEMA,
+                                     "projects": {"nexlink": {"pending_nexlink": dict(self.pending)}}})
+            before = len(self.sent)
             with self.subTest(error=type(error).__name__), \
-                    mock.patch.object(nx, "staging_jobs", side_effect=error), \
+                    mock.patch.object(nx, target, side_effect=error), \
                     mock.patch.object(nx, "workflow_step", return_value=True), \
                     mock.patch.object(nx, "publish") as publish:
                 with self.assertRaisesRegex(rc.ReleaseError, expected):
                     self.run_tick(1000)
                 publish.assert_not_called()
-                pending = self.slot()["pending_nexlink"]
-                self.assertNotIn("handoff", pending)
-                self.assertNotIn("handoff_preflight", pending)
+                slot = self.slot()
+                self.assertNotIn("pending_nexlink", slot)
+                self.assertEqual((slot["last_result"], slot["last_cutoff"]),
+                                 ("refused-preflight", 100))
+                self.assertEqual(len(self.sent), before + 1)
+                self.assertIn("refusée avant le tag", self.sent[-1][0])
+                self.assertIn("--force", self.sent[-1][0])
+
+    def test_next_cutoff_runs_after_a_refused_preflight(self):
+        with mock.patch.object(nx, "migration_requirements",
+                               side_effect=OSError("no git")), \
+                mock.patch.object(nx, "workflow_step", return_value=True), \
+                mock.patch.object(nx, "publish"):
+            with self.assertRaises(rc.ReleaseError):
+                self.run_tick(1000)
+        self.assertEqual(self.run_tick(2000)["result"], "already-recorded")
+        self.slot_at = 50000
+        with mock.patch.object(nx, "snapshot", return_value=("h", "c2", "m2", {}, None)), \
+                mock.patch.object(nx, "choose_version", return_value="11at"), \
+                mock.patch.object(nx, "merge_candidate", return_value="f" * 40), \
+                mock.patch.object(nx, "previous_release", return_value="m2"), \
+                mock.patch.object(rc, "same_tree", return_value=False), \
+                mock.patch.object(rc, "due", return_value={}), \
+                mock.patch.object(nx, "ci_plan", return_value={
+                    "parts": [{"workflow": "backend-suite.yml"}], "max_inflight": 3}), \
+                mock.patch.object(nx, "workflow_step", return_value=False):
+            report = self.run_tick(50010)
+        self.assertEqual((report["result"], report["version"]), ("waiting-ci", "11at"))
+        self.assertEqual(self.slot()["pending_nexlink"]["cutoff_at"], 50000)
 
     def test_missing_attestation_announced_once_at_deadline(self):
         self.handed_over()

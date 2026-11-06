@@ -752,6 +752,27 @@ def handoff_preflight(project, pending):
                            for row in entries]}
 
 
+def _preflight_refused(cfg, db, project, slot, pending, exc, save):
+    """B1/B2 dev3 (gel 34015): a refused preflight left no tag; the cutoff
+    closes as `refused-preflight` so the next one is not held behind it,
+    and the pilot reruns this one with `release cutoff --force` once fixed."""
+    if isinstance(exc, subprocess.CalledProcessError):
+        reason = "git %s failed" % " ".join(map(str, exc.cmd[-2:]))
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        reason = "git %s timed out" % " ".join(map(str, exc.cmd[-2:]))
+    else:
+        reason = str(exc) or type(exc).__name__
+    slot.update(last_cutoff=pending["cutoff_at"], last_result="refused-preflight")
+    slot.pop("pending_nexlink")
+    save()
+    _announce(cfg, db, project,
+              "Nexlink %s : coupure refusée avant le tag (préflight de remise : %s). "
+              "Aucun tag posé ; après correction, `ameesh release cutoff --project %s "
+              "--force`." % (pending["version"], reason, project.name),
+              dict(pending, result="refused-preflight", error=reason))
+    raise rc.ReleaseError("Nexlink staging handoff preflight: %s" % reason) from exc
+
+
 def _handoff_open(cfg, db, project, pending, now, save):
     """Tag published: hand staging over, once, and say what to attest.
 
@@ -1083,9 +1104,8 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 and "handoff_preflight" not in pending):
             try:
                 pending["handoff_preflight"] = handoff_preflight(project, pending)
-            except subprocess.CalledProcessError as exc:
-                raise rc.ReleaseError("Nexlink staging handoff preflight: git %s failed"
-                                      % " ".join(map(str, exc.cmd[-3:]))) from exc
+            except (rc.ReleaseError, subprocess.SubprocessError, OSError) as exc:
+                _preflight_refused(cfg, db, project, slot, pending, exc, save)
             save()
         pending["pr"] = publish(project, pending)
         save()
