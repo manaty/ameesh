@@ -216,6 +216,24 @@ class StorageTest(PgTestCase):
         self.assertEqual(code, 2)
         self.assertIn("unknown group key", stderr.getvalue())
 
+    def test_cli_report_bounds_the_period(self):
+        """`ledger(since_ts=…)` veut un instant : une ligne de deux jours ne
+        doit pas entrer dans la fenêtre de 24 h."""
+        self._insert({"source": "ima"}, usd=2.0)
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, usd, recorded_at, attribution)"
+            " VALUES ('attributed', 'deepseek', 5.0, now() - interval '2 days',"
+            " '{\"source\": \"old\"}'::jsonb)")
+        args = argparse.Namespace(since="24h", until=None, by="source",
+                                  agent=None, json=True)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = mesh_cli._cost_attribution(self.db, args)
+        self.assertEqual(code, 0)
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["total"], {"turns": 1, "usd": 2.0})
+        self.assertEqual([g["values"] for g in data["groups"]], [{"source": "ima"}])
+
 
 class MailTest(PgTestCase):
     def test_send_refuses_an_invalid_attribution(self):

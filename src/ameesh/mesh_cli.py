@@ -5090,8 +5090,10 @@ def _cost_attribution(db, args) -> int:
     now = time.time()
     keys = tuple(key.strip() for key in (args.by or "").split(",") if key.strip())
     try:
-        since = _since_seconds(args.since)
-        until = _since_seconds(args.until) if args.until else now
+        # `ledger(since_ts=…)` attend un INSTANT epoch, pas une durée : on
+        # convertit les deux bornes avec `parse_since` (durée ou date ISO).
+        since = progress.parse_since(args.since, now)
+        until = progress.parse_since(args.until, now) if args.until else now
         if until < since:
             raise progress.ProgressError("--until is before --since")
         data = cost_attribution.report(
