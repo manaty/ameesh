@@ -2814,7 +2814,7 @@ class AgentWorker(threading.Thread):
         return adapters.context_tokens("codex", usage) if usage is not None else None
 
     def _observer_journal_codex(self, normalizer, session: str | None,
-                                started: float, ended: float) -> None:
+                                started: float, ended: float) -> dict | None:
         """#5148 : complète ``C_last``/``O_last`` du tour Codex au journal.
 
         ``codex exec --json`` ne publie pas d'usage d'appel ; le journal de
@@ -2824,17 +2824,31 @@ class AgentWorker(threading.Thread):
         ``C_last`` inconnu avec son motif, jamais l'usage d'un tour précédent.
         Observation seule : ``R_turn`` et les caches cumulés restent au flux ;
         aucune erreur n'est fatale au tour.
+
+        #6044 : le même relevé donne le pic du tour (``peak_usage``) et les
+        compactions natives observées ; ils sont confiés au normalisateur et
+        rendus à l'appelant pour ``turn.context.compaction`` et
+        ``decision.compacted``. Une demande n'est jamais une réussite : le
+        journal ne publie que l'item ``compacted`` et l'événement
+        ``context_compacted``.
         """
         reason: str | None = context_metrics.REASON_JOURNAL_UNREADABLE
+        result: dict | None = None
         try:
             book = cost_mod.CostBook(
                 state_dir=self.cfg.state_dir,
                 codex_homes=accounts_mod.homes(self.cfg, "codex"))
             result = book.codex_turn_last_call_usage(session, started, ended)
             usage = result.get("usage") if isinstance(result, dict) else None
+            peak = result.get("peak_usage") if isinstance(result, dict) else None
+            if isinstance(usage, dict) or isinstance(peak, dict):
+                normalizer.journal_call(
+                    usage if isinstance(usage, dict) and usage else None,
+                    peak_usage=peak if isinstance(peak, dict) else None,
+                    peak_partial=bool(result.get("peak_partial")),
+                    peak_reasons=result.get("peak_reasons") or ())
             if isinstance(usage, dict) and usage:
-                normalizer.journal_call(usage)
-                return
+                return result
             reason = (result.get("reason") if isinstance(result, dict) else None) \
                 or context_metrics.REASON_JOURNAL_MISSING
         except Exception as exc:  # mesure seulement : jamais fatale au tour
@@ -2845,6 +2859,7 @@ class AgentWorker(threading.Thread):
         except Exception as exc:  # noqa: BLE001 — observation seule
             log_async("[%s] codex journal reason not published (%s)"
                       % (self.name, " ".join(str(exc).split())[:160]))
+        return result
 
     def context_rotation_due(self) -> bool:
         """Le contexte de la session dépasse-t-il le plafond ? (L60)
@@ -9596,8 +9611,9 @@ class AgentWorker(threading.Thread):
             # #5148 : le flux Codex ne publie pas d'usage d'appel ; le journal
             # du fil le porte. La lecture est bornée au tour observé et n'est
             # pas conditionnée par `plafonne` (les tours de résumé en ont un).
+            journal = None
             if normalizer.harness == "codex":
-                self._observer_journal_codex(
+                journal = self._observer_journal_codex(
                     normalizer,
                     session_new or session or normalizer.session,
                     started, started + duration)
@@ -9630,11 +9646,23 @@ class AgentWorker(threading.Thread):
                 self._context_profile_mode = (
                     "resident" if rp is not None else "non-resident")
                 # CTX-03b : la compaction native du tour, résidente (driver)
-                # ou non résidente (`compact_boundary` du flux). Absente, le
-                # document la garde à None et la décision dit `compacted=false`
-                # explicitement, pour que le rejeu ne suppose rien.
+                # ou non résidente (`compact_boundary` du flux). #6044 : pour
+                # Codex, le journal est la preuve durable de la compaction et
+                # porte ses jetons avant/après et son nombre ; le driver
+                # (`thread/compacted`) et le flux restent les replis. Absente,
+                # le document la garde à None et la décision dit
+                # `compacted=false` explicitement, pour que le rejeu ne
+                # suppose rien.
                 resident_compact = getattr(fin_resident, "compact", None)
-                if isinstance(resident_compact, dict):
+                journal_compact = (journal.get("compaction")
+                                   if isinstance(journal, dict) else None)
+                if isinstance(journal_compact, dict):
+                    compaction = context_profile.compaction_from_parts(
+                        journal_compact.get("pre"),
+                        journal_compact.get("post"),
+                        count=journal_compact.get("count") or 1,
+                        extra_reasons=journal_compact.get("reasons") or ()).to_dict()
+                elif isinstance(resident_compact, dict):
                     compaction = dict(resident_compact)
                 elif compaction_event is not None:
                     compaction = context_profile.compaction(compaction_event).to_dict()
@@ -9643,8 +9671,7 @@ class AgentWorker(threading.Thread):
                 document["compaction"] = compaction
                 self._context_observation = document
                 self._remember_context_session(document, session_new or session)
-                self._window_measure_keep(
-                    document, bool(getattr(fin_resident, "compact", None)))
+                self._window_measure_keep(document, compaction is not None)
             except Exception as exc:  # noqa: BLE001 — observation seule
                 log_async("[%s] context observation not published (%s)"
                           % (self.name, " ".join(str(exc).split())[:160]))

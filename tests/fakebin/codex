@@ -98,6 +98,37 @@ def main() -> int:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(json.dumps({"type": "event_msg", "payload": {
                 "type": "task_started", "started_at": int(time.time())}}) + "\n")
+            # #6044 : compaction native du tour. Deux preuves de réussite
+            # (item `compacted`, événement `context_compacted`) et l'appel qui
+            # suit, pour mesurer l'après ; `request` n'écrit qu'une demande.
+            scenario = os.environ.get("AMEESH_TEST_CODEX_COMPACT")
+            if scenario in ("observed", "request", "unknown"):
+                fh.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "token_count",
+                    "info": {"last_token_usage": {
+                        "input_tokens": 50000, "cached_input_tokens": 1000,
+                        "output_tokens": 100}}}}) + "\n")
+            if scenario == "observed":
+                fh.write(json.dumps({
+                    "type": "compacted", "payload": {"message": "resume"}},
+                    ensure_ascii=False) + "\n")
+                fh.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "context_compacted"}}) + "\n")
+                last_usage = {"input_tokens": 20000,
+                              "cached_input_tokens": 500,
+                              "output_tokens": 50}
+            elif scenario == "request":
+                # une demande n'est jamais une réussite (contrat §4.2)
+                fh.write(json.dumps({"type": "response_item", "payload": {
+                    "type": "compaction_trigger"}}) + "\n")
+            elif scenario == "unknown":
+                # un appel du tour sans contexte lisible : le pic est un
+                # minorant, et le dernier appel reste celui du flux
+                fh.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "token_count", "info": {}}}) + "\n")
+                last_usage = {"input_tokens": 20000,
+                              "cached_input_tokens": 500,
+                              "output_tokens": 50}
             fh.write(json.dumps({"type": "event_msg", "payload": {
                 "type": "token_count",
                 "info": {"last_token_usage": last_usage}}}) + "\n")
