@@ -20,7 +20,8 @@ from ameesh.storage.postgres.vm_adapter import Queue
 TARGET = dict(zone='fr-par-1', server_id='11111111-1111-4111-8111-111111111111',
               project_id='22222222-2222-4222-8222-222222222222', timezone='Europe/Paris',
               release_windows=['11:00', '23:00'], health_argv=['/health'],
-              reconcile_argv=['/reconcile'], quiesce_argv=['/quiesce'])
+              reconcile_argv=['/reconcile'], quiesce_argv=['/quiesce'],
+              probe_agent='burst-probe')
 
 
 def policy(**over):
@@ -41,6 +42,11 @@ class DecisionTest(unittest.TestCase):
         bad['targets']['burst']['health_argv'] = ['relative/script']
         with self.assertRaises(vm.Refused):
             vm.enrollment(bad, local_host='controller')
+        for probe in (None, '', '-x', 'a b', 'x' * 65):
+            bad = policy()
+            bad['targets']['burst']['probe_agent'] = probe
+            with self.assertRaisesRegex(vm.Refused, 'probe agent'):
+                vm.enrollment(bad, local_host='controller')
         default = policy()
         del default['wake_delay_s']
         self.assertEqual(vm.enrollment(default, local_host='controller')['wake_delay_s'], 900)
@@ -249,6 +255,8 @@ class AdapterTest(PgTestCase):
             self.assertEqual(self.tick(), 'fresh reading pending')
         self.probe.assert_not_called()
         with mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value={'sampled_ts': 1}):
+            self.assertEqual(self.tick(), 'probe admitted')
+            self.probe.assert_not_called()
             self.probe.side_effect = [True, False]
             self.assertEqual(self.tick(), 'reconciliation pending')
             self.assertEqual(self.request('busy'), 'pending')
@@ -311,6 +319,7 @@ class AdapterTest(PgTestCase):
         self.probe.side_effect = reconcile
         try:
             with mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value={'sampled_ts': 1}):
+                self.assertEqual(self.tick(), 'probe admitted')
                 self.assertEqual(self.tick(), 'ready')
             self.assertEqual(locks, [True, True])
         finally:
@@ -324,7 +333,9 @@ class AdapterTest(PgTestCase):
             return True
         self.probe.side_effect = changed
         with mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value={'sampled_ts': 1}):
+            self.assertEqual(self.tick(), 'probe admitted')
             self.assertEqual(self.tick(), 'obsolete')
+        self.assertIsNone(self.q.return_probe('burst'))
         self.provider.action.assert_not_called()
         self.assertFalse(self.q.control('burst')['claims_open'])
 
@@ -385,3 +396,70 @@ class AdapterTest(PgTestCase):
             actor='scanner', stale_after=420, retry_after=0)
         self.assertIsNone(attempt)
         self.assertEqual(self.q.control('burst')['hook_attempt_state'], 'idle-drained')
+
+    def admitted(self, agent):
+        return self.db.query('SELECT ameesh_agent_claims_open(%s,%s) AS ok',
+                             ('burst', agent))[0]['ok']
+
+    def test_6017_wake_admits_probe_alone_then_busy_reopens_and_clears_it(self):
+        self.request('busy')
+        self.observe_old()
+        self.assertFalse(self.admitted('burst-probe'))
+        with mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value={'sampled_ts': 1}):
+            self.assertEqual(self.tick(), 'probe admitted')
+            self.probe.assert_not_called()
+            control = self.q.control('burst')
+            self.assertEqual((control['mode'], control['claims_open']), ('returning', False))
+            self.assertTrue(self.admitted('burst-probe'))
+            self.assertFalse(self.admitted('other-agent'))
+            self.assertEqual(self.tick(), 'ready')
+        self.assertEqual(self.request('busy'), 'done')
+        control = self.q.control('burst')
+        reopened = storage.of(self.db).host_lifecycle.reopen_return(
+            'burst', generation=control['generation'],
+            release_epoch=control['release_epoch'], actor='scanner')
+        self.assertTrue(reopened['claims_open'])
+        self.assertIsNone(self.q.return_probe('burst'))
+        self.assertTrue(self.admitted('other-agent'))
+
+    def test_6017_failed_health_returns_to_draining_without_loss(self):
+        self.request('busy')
+        self.observe_old()
+        self.probe.return_value = False
+        with mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value={'sampled_ts': 1}):
+            self.assertEqual(self.tick(), 'probe admitted')
+            self.assertEqual(self.tick(), 'health failed')
+            control = self.q.control('burst')
+            self.assertEqual((control['mode'], control['claims_open']), ('draining', False))
+            self.assertIsNone(self.q.return_probe('burst'))
+            self.assertFalse(self.admitted('burst-probe'))
+            self.assertEqual(self.request('busy'), 'pending')
+            # The return is still due: the next tick admits the probe again.
+            self.assertEqual(self.tick(), 'probe admitted')
+        self.probe.assert_called_once()
+
+    def test_6017_draining_lost_and_live_fence_keep_return_probe_closed(self):
+        self.db.execute("UPDATE host_lifecycle SET return_probe='burst-probe' WHERE host='burst'")
+        self.assertFalse(self.admitted('burst-probe'))  # draining: trigger cleared it
+        self.assertIsNone(self.q.return_probe('burst'))
+        self.db.execute("UPDATE host_lifecycle SET mode='returning',return_probe='burst-probe' "
+                        "WHERE host='burst'")
+        self.assertTrue(self.admitted('burst-probe'))
+        self.db.execute("INSERT INTO host_release_operations(operation,host,manifest_digest) "
+                        "VALUES ('op-6017','burst',repeat('a',64))")
+        self.db.execute("INSERT INTO host_release_fences(host,operation,probe) "
+                        "VALUES ('burst','op-6017','fence-probe')")
+        try:
+            self.assertFalse(self.admitted('burst-probe'))
+            self.assertTrue(self.admitted('fence-probe'))
+        finally:
+            self.db.execute("DELETE FROM host_release_fences WHERE host='burst'")
+            self.db.execute("DELETE FROM host_release_operations WHERE operation='op-6017'")
+        self.assertTrue(self.admitted('burst-probe'))
+        self.db.execute("UPDATE host_lifecycle SET mode='lost' WHERE host='burst'")
+        self.assertFalse(self.admitted('burst-probe'))
+        self.assertIsNone(self.q.return_probe('burst'))
+        self.db.execute("UPDATE host_lifecycle SET mode='returning',return_probe='burst-probe' "
+                        "WHERE host='burst'")
+        self.db.execute("UPDATE host_lifecycle SET release_epoch=release_epoch+1 WHERE host='burst'")
+        self.assertIsNone(self.q.return_probe('burst'))

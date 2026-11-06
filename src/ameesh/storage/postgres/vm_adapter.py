@@ -27,8 +27,38 @@ class Queue:
         Hosts._lock_gate(self.db, host)
         # Native transition attempts and return intents also update this row
         # directly. Fence them through the bounded provider action as well.
-        self.db.query('SELECT host FROM host_lifecycle WHERE host=%s FOR UPDATE', (host,))
-        return self.control(host)
+        rows = self.db.query('SELECT return_probe FROM host_lifecycle WHERE host=%s FOR UPDATE',
+                             (host,))
+        control = self.control(host)
+        if control and rows:
+            control['return_probe'] = rows[0]['return_probe']
+        return control
+
+    def return_probe(self, host):
+        rows = self.db.query('SELECT return_probe FROM host_lifecycle WHERE host=%s', (host,))
+        return rows[0]['return_probe'] if rows else None
+
+    def admit_probe(self, request, probe):
+        """#6017: closed return naming the one identity the health turn runs.
+
+        draining -> returning without opening claims: the claim predicate then
+        admits `probe` alone (0552). Same generation/epoch, so the queued busy
+        request stays current."""
+        return bool(self.db.query(
+            "UPDATE host_lifecycle SET mode='returning',return_probe=%s,"
+            "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
+            "AND release_epoch=%s AND mode IN ('draining','returning') "
+            "AND NOT claims_open RETURNING host",
+            (probe, request['host'], request['generation'], request['release_epoch'])))
+
+    def refuse_probe(self, request):
+        """#6017: failed health: back to draining, probe cleared, never lost."""
+        return bool(self.db.query(
+            "UPDATE host_lifecycle SET mode='draining',return_probe=NULL,"
+            "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
+            "AND release_epoch=%s AND mode='returning' AND NOT claims_open "
+            "AND return_probe IS NOT NULL RETURNING host",
+            (request['host'], request['generation'], request['release_epoch'])))
 
     def request(self, host, generation, epoch, state):
         rows = self.db.query("""

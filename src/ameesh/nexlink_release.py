@@ -472,9 +472,83 @@ def publish(project, pending):
                         % sha]).strip()
 
 
+def _train_pause(db, project, now):
+    """The project train paused, as a cause for a missed cutoff (#6014)."""
+    if db is None:
+        return ""
+    key = "%s:%s" % (project.name, project.target)
+    try:
+        from . import storage
+        state = storage.of(db).work.train_read(key)
+    except Exception:  # noqa: BLE001 - a cause is a bonus, never a second failure
+        return ""
+    if not isinstance(state, dict) or state.get("phase") != "paused":
+        return ""
+    started = state.get("started_ts") or (state.get("plan") or {}).get("created_ts")
+    if started is None:
+        return "train %s paused (revision %s)" % (key, state.get("revision"))
+    since = datetime.datetime.fromtimestamp(float(started), datetime.timezone.utc)
+    age_h = max(0.0, now - float(started)) / 3600.0
+    return "train %s paused since %s (%.1f h, revision %s)" % (
+        key, since.strftime("%Y-%m-%dT%H:%MZ"), age_h, state.get("revision"))
+
+
+def _missed_cutoff(cfg, db, project, slot, at, label, source, now, save):
+    """#6014: a due Nexlink cutoff outside its window announces itself once.
+
+    The semver model already did this; the Nexlink model recorded the slot and
+    returned in silence. The report goes through `send_report`, which writes
+    the project's thread as well as the mailbox, and names the known causes
+    (the previous attempt's error, the project train paused, the local state
+    and host) instead of a bare "missed".
+    """
+    failure = slot.get("last_error")
+    failure_at = float(slot.get("last_error_at") or 0)
+    causes = ["the automatic tick did not start inside its %ss window"
+              % int(project.window_s)]
+    report = {
+        "schema": rc.SCHEMA, "result": "missed", "cutoff_at": at, "label": label,
+        "project": project.name, "canon_commit": source.commit,
+        "completed_at": now, "window_s": float(project.window_s),
+        "host": str(getattr(cfg, "host", "") or ""),
+        "state_path": rc.state_path(cfg),
+    }
+    if failure and at <= failure_at <= now:
+        causes.append("the last attempt failed: %s" % failure)
+        report["attempt_error"] = failure
+    if db is not None:
+        train = _train_pause(db, project, now)
+        if train:
+            causes.append(train)
+            report["train"] = train
+    report["causes"] = causes
+    report["message"] = "; ".join(causes)
+    slot["last_cutoff"] = at
+    slot["last_result"] = "missed"
+    slot["last_label"] = label
+    save()
+    when = datetime.datetime.fromtimestamp(at, datetime.timezone.utc)
+    body = (
+        "Nexlink : coupure %s du %s MANQUÉE — aucun tag ni déploiement "
+        "automatique n'a été produit par le moteur de release.\n"
+        "Le tic n'a pas démarré dans sa fenêtre de %ss (état local : %s, hôte %s).\n"
+        "Causes connues : %s.\n"
+        "Vérifier le minuteur et l'hôte de la coupe nexlink, puis poser le tag "
+        "à la main si la version reste à publier."
+        % (when.strftime("%H:%MZ"), when.strftime("%d/%m/%Y"),
+           int(project.window_s), rc.state_path(cfg), report["host"],
+           ", ".join(causes)))
+    if db is not None:
+        rc.send_report(cfg, db, project, body, report, urgent=True)
+    return report
+
+
 def execute(cfg, db, project, *, now, force=False, no_staging=False, version=None):
-    if no_staging:
-        raise rc.ReleaseError("Nexlink cutoff cannot bypass staging with --no-staging")
+    # #6014: `--no-staging` selects the semver local staging script. The
+    # Nexlink model stages only through its closed workflow list, so the flag
+    # is ignored here instead of refusing: a host whose elected generic tick
+    # still carries the legacy ameesh drop-in can release Nexlink too, and
+    # nothing ever *skips* the model's staging.
     with rc._locked(os.path.join(cfg.state_dir, "release", "release.lock")):
         state = rc.load_state(cfg)
         slot = rc.project_state(state, project.name)
@@ -489,9 +563,8 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
             if not force and due is None:
                 return {"result": "not-due", "cutoff_at": at}
             if not force and due.get("missed"):
-                slot["last_cutoff"] = at
-                save()
-                return {"result": "missed", "cutoff_at": at}
+                return _missed_cutoff(cfg, db, project, slot, at, label, source,
+                                      now, save)
             head, base, main, reading, proof = snapshot(project)
             value = choose_version(project, version)
             sha = merge_candidate(project, base, main)

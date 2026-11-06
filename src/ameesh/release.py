@@ -223,10 +223,10 @@ def render(report: dict) -> list[str]:
 def _project_names(cfg, args) -> list[str]:
     from . import release_cutoff
     declared = release_cutoff.projects(cfg)
-    if not declared:
-        return []
     wanted = getattr(args, "project", None)
     if wanted:
+        # #6014: an explicit --project (a dedicated unit) must fail visibly
+        # when the project is absent, even when no project is declared at all.
         if wanted not in declared:
             raise release_cutoff.ReleaseError(
                 "project %r is not declared under release.projects" % wanted)
@@ -293,10 +293,15 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
 
 
 def _report_error(cfg, db, project, exc, now: float) -> None:
-    """Mail a definitive error once; transient errors go to the journal only."""
+    """Mail an error once per cutoff, transient or definitive (#6014).
+
+    A transient error used to reach the journal only: a cutoff could fail
+    every tick of its window and leave no trace outside the release host.
+    The durable `last_error` is still kept for the missed report's cause, and
+    the de-duplication stays per cutoff so a retry loop mails once.
+    """
     from . import release_cutoff
-    if isinstance(exc, release_cutoff.TransientReleaseError):
-        return
+    transient = isinstance(exc, release_cutoff.TransientReleaseError)
     try:
         state = release_cutoff.load_state(cfg)
         slot = release_cutoff.project_state(state, project.name)
@@ -316,21 +321,73 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
         slot["last_error_at"] = now
         release_cutoff.save_state(cfg, state)
         if db is not None:
-            body = ("Coupe Nexlink en attente : %s. État de reprise conservé ; "
-                    "consulter pending_nexlink pour les branches, tags et runs déjà créés."
-                    % text) if project.model == "nexlink" else (
-                    "Release %s NON faite : %s\n\nAucun tag, aucun déploiement. "
-                    "Corrige la cause ; le prochain tick réessaiera tant que la "
-                    "coupure est dans sa fenêtre." % (project.name, text))
+            if project.model == "nexlink":
+                body = ("Coupe Nexlink en attente%s : %s. État de reprise conservé ; "
+                        "consulter pending_nexlink pour les branches, tags et runs déjà créés."
+                        % (" (erreur transitoire)" if transient else "", text))
+            else:
+                body = ("Release %s NON faite%s : %s\n\nAucun tag, aucun déploiement. "
+                        "Corrige la cause ; le prochain tick réessaiera tant que la "
+                        "coupure est dans sa fenêtre."
+                        % (project.name, " (erreur transitoire)" if transient else "", text))
             report = {"schema": release_cutoff.SCHEMA, "result": "refused",
                       "project": project.name, "cutoff_at": cutoff_at,
                       "label": _label, "completed_at": now, "message": text}
+            if transient:
+                report["transient"] = True
             if cutoff_at is not None:
                 report["report_path"] = release_cutoff.write_report(
                     cfg, project, dict(report, version="refused"))
             release_cutoff.send_report(cfg, db, project, body, report, urgent=True)
     except Exception:  # a report never masks the original error
         pass
+
+
+CONFIG_ERROR_INTERVAL_S = 6 * 3600.0
+
+
+def _report_configuration_error(cfg, name: str, exc, now: float | None = None) -> None:
+    """#6014: an explicit release project that this host cannot cut.
+
+    `release tick --project nexlink` used to fail in the journal alone when
+    the host's `release.projects` did not declare it — exactly the state that
+    left the 05/11 cutoffs without a tag and without a report. Say it once
+    per interval, in the project's thread and to its pilot.
+    """
+    from . import release_cutoff
+    now = time.time() if now is None else float(now)
+    try:
+        state = release_cutoff.load_state(cfg)
+        slot = release_cutoff.project_state(state, name)
+        if now - float(slot.get("last_config_error_at") or 0) < CONFIG_ERROR_INTERVAL_S:
+            return
+        slot["last_config_error_at"] = now
+        slot["last_config_error"] = str(exc)
+        release_cutoff.save_state(cfg, state)
+    except Exception as error:  # noqa: BLE001 - a report never masks the error
+        print("release: configuration error not recorded: %s" % error, file=sys.stderr)
+        return
+    try:
+        from .db import open_db
+        db = open_db(cfg)
+    except Exception as error:  # noqa: BLE001 - no database, no message
+        print("release: configuration error not delivered: %s" % error, file=sys.stderr)
+        return
+    try:
+        project = release_cutoff.ProjectRelease(name, repo="", target="", github="")
+        body = ("Coupe %s impossible sur cet hôte : %s.\n\n"
+                "Le projet n'est pas déclaré dans release.projects de %s ; "
+                "aucune coupure ne part et le chemin « missed » ne peut pas "
+                "s'appliquer. Ajouter le bloc (repo, github, target, model) ou "
+                "retirer l'unité qui demande ce projet."
+                % (name, exc, str(getattr(cfg, "host", "") or "cet hôte")))
+        report = {"schema": release_cutoff.SCHEMA,
+                  "result": "configuration-error", "project": name,
+                  "completed_at": now, "message": str(exc),
+                  "host": str(getattr(cfg, "host", "") or "")}
+        release_cutoff.send_report(cfg, db, project, body, report, urgent=True)
+    finally:
+        db.close()
 
 
 def _release_tick(cfg, args, declared) -> int:
@@ -340,6 +397,8 @@ def _release_tick(cfg, args, declared) -> int:
         names = _project_names(cfg, args)
     except release_cutoff.ReleaseError as exc:
         print("error: %s" % exc, file=sys.stderr)
+        if getattr(args, "project", None):
+            _report_configuration_error(cfg, str(args.project), exc)
         return 1
     now = time.time() if args.now is None else float(args.now)
     if getattr(args, "dry_run", False):
@@ -374,6 +433,9 @@ def _release_tick(cfg, args, declared) -> int:
                         status = 1
             except release_cutoff.TransientReleaseError as exc:
                 print("%s: %s" % (name, exc), file=sys.stderr)
+                # #6014: a transient failure is still a cutoff not done; say
+                # it once per cutoff instead of leaving it in the journal.
+                _report_error(cfg, db, project, exc, now)
                 status = 1
                 continue
             except release_cutoff.ReleaseError as exc:
