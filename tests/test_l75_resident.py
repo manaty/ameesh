@@ -717,6 +717,19 @@ class CodexAppServerTest(DriverCase):
         self.assertEqual(self.methods("turn/start")[0]["effort"], "low")
         self.assertTrue(any(p.get("safe_point") for _r, p in self.events))
 
+    def test_compaction_native_du_fil_codex(self):
+        # #6044 : `thread/compacted` et l'item `contextCompaction` sont deux
+        # preuves du même fait ; le contexte d'après est l'appel suivant.
+        driver = self.driver(env={"FAKE_CODEX_COMPACT": "1"})
+        driver.start()
+        result = self.wait(driver.send("hello", input_id="i"))
+        self.assertEqual(result.status, resident.COMPLETED)
+        self.assertEqual(result.compact["pre"], 300)
+        self.assertEqual(result.compact["post"], 120)
+        self.assertEqual(result.compact["count"], 1)
+        self.assertEqual(result.compact["quality"], "measured")
+        self.assertFalse(result.compact["reasons"])
+
     def test_steer_in_the_turn(self):
         driver = self.driver()
         driver.start()

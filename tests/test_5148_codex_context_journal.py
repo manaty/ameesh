@@ -17,6 +17,13 @@ Ces tests couvrent :
 * ``C_last``/``O_last`` alimentés au journal sans doubler ``R_turn`` ;
 * un tour Codex réel du banc, y compris un tour de résumé, qui publie
   ``turn.context`` avec ``C_last`` mesuré (source ``journal``).
+
+#6044 (volet B) ajoute, dans le même parcours du journal :
+* les compactions natives observées (item ``compacted`` et événement
+  ``context_compacted``), avec avant/après et nombre par tour ; une
+  ``compaction_trigger`` (demande) n'est jamais une réussite ;
+* ``C_peak``, plus gros contexte d'appel du tour, publié à côté de ``C_last``
+  et repris par le corpus de rejeu.
 """
 from __future__ import annotations
 
@@ -26,7 +33,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import adapters, context_metrics, cost, registry
+from ameesh import adapters, context_corpus, context_metrics, cost, registry
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -50,6 +57,16 @@ def _task(started_at: float | None) -> dict:
 def _token(usage: dict | None) -> dict:
     info = {} if usage is None else {"last_token_usage": usage}
     return _event({"type": "token_count", "info": info})
+
+
+def _compacted() -> dict:
+    """L'item de rollout écrit après une compaction réussie."""
+    return {"type": "compacted", "payload": {"message": "resume du fil"}}
+
+
+def _context_compacted() -> dict:
+    """L'événement de réussite ; il double l'item `compacted`."""
+    return _event({"type": "context_compacted"})
 
 
 def _journal(sessions: str, events: list) -> str:
@@ -126,6 +143,84 @@ class JournalTourTest(unittest.TestCase):
         self.assertEqual(found["reason"],
                          context_metrics.REASON_TURN_NOT_IN_JOURNAL)
 
+    # -- #6044 : compaction observée et pic du tour ----------------------
+    def test_compaction_avant_apres_et_pic(self):
+        # Journal réel : deux appels avant, la preuve de compaction (item +
+        # événement), puis l'appel qui mesure l'après.
+        path = os.path.join(os.path.dirname(__file__), "fixtures", "context",
+                            "codex_journal_compaction.json")
+        with open(path, encoding="utf-8") as fh:
+            events = json.load(fh)
+        _journal(self.sessions, events)
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertEqual(found["usage"]["input_tokens"], 30_000)
+        self.assertEqual(found["peak_usage"]["input_tokens"], 150_000)
+        # Deux preuves de la même compaction ne comptent qu'une fois.
+        self.assertEqual(found["compaction"], {
+            "pre": 150_000, "post": 30_000, "count": 1})
+
+    def test_deux_compactions_dans_le_meme_tour(self):
+        _journal(self.sessions, [
+            _task(2000),
+            _token({"input_tokens": 100_000, "output_tokens": 100}),
+            _compacted(),
+            _token({"input_tokens": 40_000, "output_tokens": 100}),
+            _context_compacted(),
+            _token({"input_tokens": 30_000, "output_tokens": 50}),
+        ])
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertEqual(found["peak_usage"]["input_tokens"], 100_000)
+        self.assertEqual(found["compaction"]["count"], 2)
+        self.assertEqual(found["compaction"]["pre"], 100_000)
+        self.assertEqual(found["compaction"]["post"], 30_000)
+
+    def test_compaction_sans_appel_apres_garde_l_avant(self):
+        # L'après n'est pas inventé : il reste None, le contrat le dit.
+        _journal(self.sessions, [
+            _task(2000),
+            _token({"input_tokens": 90_000, "output_tokens": 100}),
+            _compacted(),
+        ])
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertEqual(found["usage"]["input_tokens"], 90_000)
+        self.assertEqual(found["compaction"]["pre"], 90_000)
+        self.assertIsNone(found["compaction"]["post"])
+        self.assertEqual(found["compaction"]["count"], 1)
+
+    def test_demande_de_compaction_n_est_pas_une_reussite(self):
+        # `compaction_trigger` (et l'item de réponse `context_compaction`)
+        # demandent une compaction ; seuls `compacted`/`context_compacted`
+        # prouvent qu'elle a eu lieu (contrat §4.2).
+        _journal(self.sessions, [
+            _task(2000),
+            _token({"input_tokens": 90_000, "output_tokens": 100}),
+            {"type": "response_item", "payload": {"type": "compaction_trigger"}},
+            {"type": "response_item", "payload": {"type": "context_compaction"}},
+        ])
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertIsNone(found["compaction"])
+
+    def test_sans_compaction_le_pic_est_le_dernier_appel(self):
+        _journal(self.sessions, [
+            _task(2000),
+            _token({"input_tokens": 20_000, "output_tokens": 100}),
+            _token({"input_tokens": 30_000, "output_tokens": 200}),
+        ])
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertIsNone(found["compaction"])
+        self.assertEqual(found["peak_usage"]["input_tokens"],
+                         found["usage"]["input_tokens"])
+
+    def test_compaction_d_un_autre_tour_n_est_pas_reprise(self):
+        _journal(self.sessions, [
+            _task(1000), _token({"input_tokens": 90_000}),
+            _compacted(), _token({"input_tokens": 20_000}),
+            _task(2000), _token({"input_tokens": 50_000}),
+        ])
+        found = self.book.codex_turn_last_call_usage(FIL, 1995, 2010)
+        self.assertIsNone(found["compaction"])
+        self.assertEqual(found["peak_usage"]["input_tokens"], 50_000)
+
 
 class NormalizerJournalTest(unittest.TestCase):
     def test_journal_alimente_c_last_sans_doubler_r_turn(self):
@@ -145,6 +240,43 @@ class NormalizerJournalTest(unittest.TestCase):
         self.assertIsNone(measures["R_turn"]["value"])
         self.assertEqual(measures["R_turn"]["source"], "total")
         self.assertEqual(document["counts"]["journal_calls"], 1)
+        # Sans compaction, le pic est ce dernier appel du journal.
+        self.assertEqual(measures["C_peak"]["value"], 61_000)
+        self.assertEqual(measures["C_peak"]["source"], "journal")
+
+    def test_pic_du_journal_superieur_au_dernier_appel(self):
+        normalizer = context_metrics.TurnNormalizer("codex", session="s")
+        normalizer.journal_call(
+            {"input_tokens": 30_000, "output_tokens": 50},
+            peak_usage={"input_tokens": 150_000})
+        measures = normalizer.finish()["measures"]
+        self.assertEqual(measures["C_last"]["value"], 30_000)
+        self.assertEqual(measures["C_peak"]["value"], 150_000)
+        self.assertEqual(measures["C_peak"]["quality"], "measured")
+
+    def test_pic_du_flux_est_le_max_des_appels(self):
+        normalizer = context_metrics.TurnNormalizer("claude", session="s")
+        normalizer.call({"input_tokens": 100,
+                         "cache_read_input_tokens": 10,
+                         "cache_creation_input_tokens": 5,
+                         "output_tokens": 5}, "c1")
+        normalizer.call({"input_tokens": 150,
+                         "cache_read_input_tokens": 20,
+                         "cache_creation_input_tokens": 5,
+                         "output_tokens": 5}, "c2")
+        measures = normalizer.finish()["measures"]
+        self.assertEqual(measures["C_last"]["value"], 175)
+        self.assertEqual(measures["C_peak"]["value"], 175)
+
+    def test_pic_sans_releve_reste_null_avec_sa_raison(self):
+        normalizer = context_metrics.TurnNormalizer("codex", session="s")
+        normalizer.journal_unavailable(
+            context_metrics.REASON_JOURNAL_MISSING)
+        measures = normalizer.finish()["measures"]
+        self.assertIsNone(measures["C_peak"]["value"])
+        self.assertEqual(measures["C_peak"]["quality"], "unknown")
+        self.assertIn("context_unknown", measures["C_peak"]["reasons"])
+        self.assertIn("journal_missing", measures["C_peak"]["reasons"])
 
     def test_journal_muet_qualifie_l_absence(self):
         normalizer = context_metrics.TurnNormalizer("codex", session="s")
@@ -188,7 +320,7 @@ class TurnContextCodexTest(PgTestCase):
         return worker
 
     def _tour(self, worker, prompt: str = "travail", *,
-              journal: bool = True) -> bool:
+              journal: bool = True, compact: str | None = None) -> bool:
         env = {
             "AMEESH_BIN_DIR": FAKEBIN,
             "AMEESH_TEST_LOG": self.turns_log,
@@ -203,6 +335,8 @@ class TurnContextCodexTest(PgTestCase):
             # temps passé à créer le worker (CI lente).
             env["AMEESH_TEST_CODEX_JOURNAL"] = self.sessions
             env["AMEESH_TEST_CODEX_LAST_USAGE"] = json.dumps(CALL)
+        if compact:
+            env["AMEESH_TEST_CODEX_COMPACT"] = compact
         with mock.patch.dict(os.environ, env, clear=False):
             return worker.run_turn({"kind": "prompt", "prompt": prompt,
                                     "ids": []})
@@ -249,6 +383,91 @@ class TurnContextCodexTest(PgTestCase):
         self.assertIn("context_unknown", measures["C_last"]["reasons"])
         self.assertIn("journal_missing", measures["C_last"]["reasons"])
         self.assertIsNone(data["legacy"]["context_tokens"])
+
+    # -- #6044 : pic et compaction dans turn.context ---------------------
+    def test_compaction_codex_publiee_dans_turn_context(self):
+        worker = self._worker("cx-compaction")
+        self.assertTrue(self._tour(worker, compact="observed"))
+        data = self._published("cx-compaction")
+        measures = data["context"]["measures"]
+        # Le dernier appel suit la compaction ; le pic est l'avant.
+        self.assertEqual(measures["C_last"]["value"], 20_000)
+        self.assertEqual(measures["C_peak"]["value"], 50_000)
+        self.assertEqual(measures["C_peak"]["source"], "journal")
+        compaction = data["context"]["compaction"]
+        self.assertEqual(compaction["pre"], 50_000)
+        self.assertEqual(compaction["post"], 20_000)
+        self.assertEqual(compaction["count"], 1)
+        self.assertEqual(compaction["quality"], "measured")
+        self.assertIs(data["decision"]["compacted"], True)
+        # Le legacy garde sa lecture : le dernier appel du journal.
+        self.assertEqual(data["legacy"]["context_tokens"], 20_000)
+
+    def test_pic_codex_publie_sans_compaction(self):
+        worker = self._worker("cx-pic")
+        self.assertTrue(self._tour(worker))
+        data = self._published("cx-pic")
+        measures = data["context"]["measures"]
+        self.assertEqual(measures["C_last"]["value"], 61_000)
+        self.assertEqual(measures["C_peak"]["value"], 61_000)
+        self.assertIsNone(data["context"]["compaction"])
+        self.assertIs(data["decision"]["compacted"], False)
+
+    def test_demande_de_compaction_ne_publie_pas_compacted(self):
+        worker = self._worker("cx-demande")
+        self.assertTrue(self._tour(worker, compact="request"))
+        data = self._published("cx-demande")
+        self.assertIsNone(data["context"]["compaction"])
+        self.assertIs(data["decision"]["compacted"], False)
+        # La demande ne modifie pas la mesure du dernier appel.
+        self.assertEqual(data["context"]["measures"]["C_last"]["value"], 61_000)
+
+
+class CorpusPeakCompactionTest(unittest.TestCase):
+    """#6044 : le corpus de rejeu porte C_peak et le nombre de compactions."""
+
+    def _payload(self, *, compaction=None, peak=50_000):
+        context = {
+            "measures": {
+                "C_last": {"value": 20_000, "quality": "measured",
+                           "reasons": [], "granularity": "call",
+                           "source": "journal"},
+            },
+            "partial": False,
+        }
+        if peak is not None:
+            context["measures"]["C_peak"] = {
+                "value": peak, "quality": "measured", "reasons": [],
+                "granularity": "call", "source": "journal"}
+        if compaction is not None:
+            context["compaction"] = compaction
+        return {
+            "schema": "ameesh-context/1", "turn_id": "turn-6044",
+            "agent": "cx-corpus", "harness": "codex", "model": "gpt-x",
+            "model_quality": "requested", "mode": "non-resident",
+            "role": "build", "session": "session-6044",
+            "context": context,
+            "decision": {
+                "compacted": compaction is not None,
+                "policy": {"session": "taille", "context_max_tokens": 15_000_000,
+                           "session_max_tokens": 150_000},
+            },
+        }
+
+    def test_c_peak_et_nombre_de_compactions_dans_le_corpus(self):
+        line = context_corpus.corpus_line(self._payload(compaction={
+            "pre": 50_000, "post": 20_000, "quality": "measured",
+            "reasons": [], "trigger": None, "count": 2}))
+        context_corpus.validate_line(line)
+        self.assertEqual(line["C_peak"]["value"], 50_000)
+        self.assertEqual(line["decision"]["compacted"], True)
+        self.assertEqual(line["decision"]["compaction"]["count"], 2)
+
+    def test_corpus_ancien_sans_c_peak_reste_lisible(self):
+        line = context_corpus.corpus_line(self._payload(peak=None))
+        context_corpus.validate_line(line)
+        self.assertIsNone(line["C_peak"]["value"])
+        self.assertIn("context_unknown", line["C_peak"]["reasons"])
 
 
 if __name__ == "__main__":

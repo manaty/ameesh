@@ -1770,90 +1770,147 @@ class CostBook:
         ``last_token_usage`` donne ``no_call`` ; un tour sans marqueur dans la
         fenêtre donne ``turn_not_in_journal``.
 
-        Rend ``{"usage": dict|None, "reason": str|None, "turn_started": float|None}``.
+        #6044 : le même parcours relève le **pic** du tour (``peak_usage``,
+        plus gros ``last_token_usage``) et les **compactions natives**
+        observées (``compaction``), sans second passage sur le journal. Une
+        compaction n'est comptée que sur une preuve de réussite : l'item
+        ``compacted`` du rollout ou l'événement ``context_compacted``. Un
+        ``compaction_trigger`` (demande) n'est jamais une réussite (§4.2) ;
+        les deux preuves d'une même compaction, écrites sans appel entre
+        elles, ne comptent qu'une fois. ``pre`` est le dernier contexte d'avant
+        la compaction, ``post`` le premier contexte d'après (``None`` sans
+        appel suivant), ``count`` le nombre de compactions du tour.
+
+        Rend ``{"usage", "reason", "turn_started", "peak_usage", "compaction"}``.
         Aucune erreur de lecture n'est fatale : le motif est nommé.
         """
+        empty = {"usage": None, "reason": None, "turn_started": None,
+                 "peak_usage": None, "compaction": None}
         path = self.codex_rollout(thread)
         if not path:
-            return {"usage": None,
-                    "reason": context_metrics.REASON_JOURNAL_MISSING,
-                    "turn_started": None}
+            return dict(empty, reason=context_metrics.REASON_JOURNAL_MISSING)
         try:
             if not os.access(path, os.R_OK) or os.path.getsize(path) <= 0:
-                return {"usage": None,
-                        "reason": context_metrics.REASON_JOURNAL_UNREADABLE,
-                        "turn_started": None}
+                return dict(empty,
+                            reason=context_metrics.REASON_JOURNAL_UNREADABLE)
         except OSError:
-            return {"usage": None,
-                    "reason": context_metrics.REASON_JOURNAL_UNREADABLE,
-                    "turn_started": None}
+            return dict(empty,
+                        reason=context_metrics.REASON_JOURNAL_UNREADABLE)
 
         usage: dict | None = None
         saw_token_count = False
         task_seen = False
         task_start: float | None = None
+        # Événements du tour, lus de la fin vers le début puis remis dans
+        # l'ordre : `("usage", dict|None)` et `("compaction", None)`.
+        events: list[tuple[str, dict | None]] = []
         # Parcours de la fin vers le début : le premier `token_count` lisible
         # est le dernier du journal ; le `task_started` rencontré ensuite est
         # celui du même tour (les relevés antérieurs sont plus haut dans le
         # fichier, donc jamais atteints).
         for ligne in _lines_reverse(path):
-            if b"token_count" not in ligne and b"task_started" not in ligne:
+            if (b"token_count" not in ligne and b"task_started" not in ligne
+                    and b'"compacted"' not in ligne
+                    and b"context_compacted" not in ligne):
                 continue
             try:
                 event = json.loads(ligne)
             except ValueError:
                 continue
+            top = event.get("type") if isinstance(event, dict) else None
             payload = event.get("payload") if isinstance(event, dict) else None
+            if top == "compacted":
+                # item de rollout écrit APRÈS une compaction réussie
+                events.append(("compaction", None))
+                continue
             if not isinstance(payload, dict):
                 continue
             kind = payload.get("type")
+            if kind == "task_started":
+                task_seen = True
+                raw_start = payload.get("started_at")
+                if isinstance(raw_start, (int, float)) \
+                        and not isinstance(raw_start, bool):
+                    task_start = float(raw_start)
+                else:
+                    stamp = event.get("timestamp") if isinstance(event, dict) else None
+                    if isinstance(stamp, str):
+                        try:
+                            task_start = _dt.datetime.fromisoformat(
+                                stamp.replace("Z", "+00:00")).timestamp()
+                        except ValueError:
+                            task_start = None
+                break
             if kind == "token_count":
                 saw_token_count = True
-                if usage is None:
-                    info = payload.get("info")
-                    candidate = info.get("last_token_usage") \
-                        if isinstance(info, dict) else None
-                    if isinstance(candidate, dict) and candidate:
+                info = payload.get("info")
+                candidate = info.get("last_token_usage") \
+                    if isinstance(info, dict) else None
+                if isinstance(candidate, dict) and candidate:
+                    events.append(("usage", candidate))
+                    if usage is None:
                         usage = candidate
+                else:
+                    events.append(("usage", None))
                 continue
-            if kind != "task_started":
-                continue
-            task_seen = True
-            raw_start = payload.get("started_at")
-            if isinstance(raw_start, (int, float)) and not isinstance(raw_start, bool):
-                task_start = float(raw_start)
-            else:
-                stamp = event.get("timestamp") if isinstance(event, dict) else None
-                if isinstance(stamp, str):
-                    try:
-                        task_start = _dt.datetime.fromisoformat(
-                            stamp.replace("Z", "+00:00")).timestamp()
-                    except ValueError:
-                        task_start = None
-            break
+            if kind == "context_compacted":
+                # événement de réussite, doublon possible de l'item `compacted`
+                events.append(("compaction", None))
 
         if task_seen and task_start is not None:
             if task_start < float(started) - 3.0 \
                     or (ended is not None and task_start > float(ended) + 1.0):
                 # le dernier tour du journal n'est pas celui qu'on observe :
                 # ne jamais lui emprunter son usage
-                return {"usage": None,
-                        "reason": context_metrics.REASON_TURN_NOT_IN_JOURNAL,
-                        "turn_started": task_start}
+                return dict(empty,
+                            reason=context_metrics.REASON_TURN_NOT_IN_JOURNAL,
+                            turn_started=task_start)
         if not task_seen:
             # Journal sans marqueur de tour (format ancien ou écriture
             # partielle) : rien ne prouve que l'usage est celui du tour.
-            return {"usage": None,
-                    "reason": context_metrics.REASON_TURN_NOT_IN_JOURNAL,
-                    "turn_started": None}
+            return dict(empty,
+                        reason=context_metrics.REASON_TURN_NOT_IN_JOURNAL)
+
+        # Remise dans l'ordre chronologique du tour, puis pic et compactions.
+        # `usages` garde la mesure brute de chaque appel lisible : le pic est
+        # renvoyé tel quel, sans reconstruire un `input_tokens` de synthèse.
+        usages: list[tuple[int, dict]] = []
+        positions: list[int] = []
+        for kind, data in reversed(events):
+            if kind == "usage":
+                value = _codex_context_tokens(data)
+                if value is not None:
+                    usages.append((value, data))
+                continue
+            position = len(usages)
+            if position not in positions:
+                # Deux preuves de la même compaction (item + événement) sont
+                # écrites sans appel entre elles : même position, un seul fait.
+                positions.append(position)
+
+        peak_usage = None
+        if usages:
+            _, peak_usage = max(usages, key=lambda item: item[0])
+        compaction: dict | None = None
+        if positions:
+            pre_values = [usages[position - 1][0] for position in positions
+                          if position > 0]
+            last = positions[-1]
+            compaction = {
+                "pre": max(pre_values) if pre_values else None,
+                "post": usages[last][0] if last < len(usages) else None,
+                "count": len(positions),
+            }
+
+        result = {"usage": usage, "reason": None,
+                  "turn_started": task_start,
+                  "peak_usage": peak_usage, "compaction": compaction}
         if usage is not None:
-            return {"usage": usage, "reason": None, "turn_started": task_start}
+            return result
         if saw_token_count:
-            return {"usage": None,
-                    "reason": context_metrics.REASON_LAST_USAGE_MISSING,
-                    "turn_started": task_start}
-        return {"usage": None, "reason": context_metrics.REASON_NO_CALL,
-                "turn_started": task_start}
+            return dict(result,
+                        reason=context_metrics.REASON_LAST_USAGE_MISSING)
+        return dict(result, reason=context_metrics.REASON_NO_CALL)
 
     def codex_session_roots(self) -> list:
         """Les dossiers de sessions Codex de la machine : le défaut, puis ceux
@@ -3393,6 +3450,21 @@ def _claude_account_tail(path: str) -> tuple[list, os.stat_result, bool]:
 def _num(usage: dict, key: str) -> int:
     value = usage.get(key) if isinstance(usage, dict) else None
     return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _codex_context_tokens(usage: dict | None) -> int | None:
+    """#6044 : le contexte d'un appel Codex, dans sa convention (cache inclus).
+
+    ``input_tokens`` d'abord ; à défaut ``cached_input_tokens`` (repli nommé
+    par ``call_measure``). Une valeur absente reste ``None``, jamais ``0``.
+    """
+    if not isinstance(usage, dict):
+        return None
+    for key in ("input_tokens", "cached_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return max(int(value), 0)
+    return None
 
 
 def _amount(value) -> float | None:

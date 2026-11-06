@@ -336,6 +336,26 @@ class Codex:
             "total": dict(self.tokens, reasoningOutputTokens=0,
                           totalTokens=self.tokens["inputTokens"] + self.tokens["outputTokens"]),
             "modelContextWindow": 258400}})
+        # #6044 : compaction native réussie. La notification dépréciée et
+        # l'item peuvent décrire le même fait ; le driver ne doit le compter
+        # qu'une fois, puis mesurer l'après sur l'appel suivant.
+        if os.environ.get("FAKE_CODEX_COMPACT") == "1":
+            self.notify("thread/compacted", {"turnId": turn["id"]})
+            self.notify("item/completed", {"turnId": turn["id"], "item": {
+                "type": "contextCompaction", "id": "i3"}})
+            after = {"inputTokens": 120, "cachedInputTokens": 20,
+                     "outputTokens": 4, "reasoningOutputTokens": 0,
+                     "totalTokens": 124}
+            for key in self.tokens:
+                self.tokens[key] += after[key]
+            self.notify("thread/tokenUsage/updated", {
+                "turnId": turn["id"], "tokenUsage": {
+                    "last": after,
+                    "total": dict(
+                        self.tokens, reasoningOutputTokens=0,
+                        totalTokens=(self.tokens["inputTokens"]
+                                     + self.tokens["outputTokens"])),
+                    "modelContextWindow": 258400}})
         error = {"message": "boom"} if status == "failed" else None
         self.notify("turn/completed", {"turn": {"id": turn["id"], "status": status,
                                                 "error": error, "items": []}})

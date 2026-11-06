@@ -78,7 +78,7 @@ LINE_KEYS = frozenset({
     "schema", "turn_id", "agent", "started_ts", "ended_ts", "duration_s",
     "harness", "model", "model_quality", "mode", "role", "session",
     "session_seq", "W", "auxiliary_models",
-    "C_last", "O_last", "C_next_input", "C_next", "R_turn", "R_session",
+    "C_last", "C_peak", "O_last", "C_next_input", "C_next", "R_turn", "R_session",
     "R_session_base", "O", "S_hist", "cache_read_tokens", "cache_write_tokens",
     "decision", "policy", "legacy", "quality", "reasons", "source",
 })
@@ -93,9 +93,13 @@ REQUIRED_LINE_KEYS = frozenset({
 MEASURE_KEYS = frozenset({"value", "quality", "reasons", "granularity", "source"})
 CORE_MEASURES = ("C_last", "O_last", "R_turn", "R_session", "R_session_base",
                  "O", "S_hist", "cache_read_tokens", "cache_write_tokens")
-ALL_MEASURES = ("W", "C_last", "O_last", "C_next_input", "C_next", "R_turn",
-                "R_session", "R_session_base", "O", "S_hist",
+#: #6044 : `C_peak` est publiable sans être requis, pour qu'un corpus produit
+#: avant son ajout reste lisible (même schéma `ameesh-context-corpus/1`).
+ALL_MEASURES = ("W", "C_last", "C_peak", "O_last", "C_next_input", "C_next",
+                "R_turn", "R_session", "R_session_base", "O", "S_hist",
                 "cache_read_tokens", "cache_write_tokens")
+#: mesures publiées après le schéma r1 initial, tolérées absentes en lecture
+OPTIONAL_MEASURES = frozenset({"C_peak"})
 DECISION_KEYS = frozenset({"observed", "cause", "compacted", "close",
                            "rotation", "compaction", "window"})
 OBSERVED_DECISIONS = ("none", "close", "rotation", "compaction")
@@ -104,7 +108,7 @@ CLOSE_KEYS = frozenset({"kind", "context_tokens", "context_max_tokens",
                         "budget"})
 ROTATION_KEYS = frozenset({"kind", "previous_session"})
 COMPACTION_KEYS = frozenset({"pre_tokens", "post_tokens", "quality", "reasons",
-                             "trigger", "requested", "observed"})
+                             "trigger", "requested", "observed", "count"})
 WINDOW_KEYS = frozenset({"C_last", "O_last", "W", "C_next_input", "C_next",
                          "O_reserve_next", "share", "near", "decision",
                          "unknowns"})
@@ -457,6 +461,11 @@ def _compaction(context: Mapping, window: Mapping | None) -> dict:
         reasons = _reasons(raw.get("reasons"))
         if post is None and REASON_POST_TOKENS_UNKNOWN not in reasons:
             reasons.append(REASON_POST_TOKENS_UNKNOWN)
+        # #6044 : nombre de compactions du tour. Un bloc observé en vaut au
+        # moins une ; un bloc antérieur qui ne le publie pas reste lisible.
+        count = _token(raw.get("count"))
+        if count is None or count < 1:
+            count = 1
         return {
             "pre_tokens": pre,
             "post_tokens": post,
@@ -465,6 +474,7 @@ def _compaction(context: Mapping, window: Mapping | None) -> dict:
             "trigger": _trigger(raw.get("trigger")),
             "requested": bool(raw.get("requested", False)) or requested,
             "observed": True,
+            "count": count,
         }
     if requested:
         # Une compaction DEMANDÉE n'est pas une compaction réussie : l'après
@@ -477,6 +487,7 @@ def _compaction(context: Mapping, window: Mapping | None) -> dict:
             "trigger": "window_maintenance",
             "requested": True,
             "observed": None,
+            "count": 0,
         }
     return {
         "pre_tokens": None,
@@ -486,6 +497,7 @@ def _compaction(context: Mapping, window: Mapping | None) -> dict:
         "trigger": None,
         "requested": False,
         "observed": None,
+        "count": None,
     }
 
 
@@ -739,6 +751,10 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
         "auxiliary_models": auxiliary_models,
         "C_last": _copy_measure(
             measures_raw.get("C_last"), context_metrics.REASON_CONTEXT_UNKNOWN),
+        # #6044 : pic du tour, à côté du dernier appel. Absent d'un événement
+        # antérieur : null avec `context_unknown`, jamais recopié de C_last.
+        "C_peak": _copy_measure(
+            measures_raw.get("C_peak"), context_metrics.REASON_CONTEXT_UNKNOWN),
         "O_last": _copy_measure(
             measures_raw.get("O_last"), context_metrics.REASON_OUTPUT_UNKNOWN),
         "R_turn": _copy_measure(
@@ -906,6 +922,13 @@ def _validate_compaction(raw, name: str) -> None:
         raise CorpusError("%s.observed must be a boolean or null" % name)
     if "observed" not in mapping:
         raise CorpusError("%s.observed is required" % name)
+    count = mapping.get("count")
+    if count is not None and (isinstance(count, bool)
+                              or not isinstance(count, int) or count < 0):
+        raise CorpusError("%s.count must be a non-negative integer or null"
+                          % name)
+    # `count` reste optionnel : un corpus produit avant #6044 (compaction
+    # observée sans nombre) doit rester lisible ; le rebuild le normalise à 1.
     trigger = mapping.get("trigger")
     if trigger is not None and not isinstance(trigger, str):
         raise CorpusError("%s.trigger must be a string or null" % name)
@@ -1069,6 +1092,8 @@ def validate_line(line) -> dict:
                                     or session_seq < 1):
         raise CorpusError("line.session_seq must be a positive integer or null")
     for name in ALL_MEASURES:
+        if name in OPTIONAL_MEASURES and name not in mapping:
+            continue
         _validate_measure(mapping.get(name), name)
     auxiliary = mapping.get("auxiliary_models")
     if not isinstance(auxiliary, list) or any(not _text(item) for item in auxiliary):

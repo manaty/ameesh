@@ -2,9 +2,9 @@
 
 | Champ | Valeur |
 |---|---|
-| **Version** | `ameesh-context/1`, révision 1 |
+| **Version** | `ameesh-context/1`, révision 3 |
 | **Statut** | proposition soumise à relecture ; stable à la fusion après verdict |
-| **Date** | 2026-10-29 |
+| **Date** | 2026-10-29 ; révision 2 du 2026-11-06 (`compact_tokens`) ; révision 3 du 2026-11-06 (`C_peak`, compactions Codex) |
 | **Source** | plan `e18` (CTX-01), `conversation:smichea:2026-10-17:roadmap-gestion-contexte` ; découpage #4510 |
 | **Base de code** | `main` `a02b97c9b` (release 1.29.0) ; canon appliqué `5a488730` |
 | **Classe** | légère (documentation/contrat), avis d'une autre famille, pas de CI lourde |
@@ -23,13 +23,16 @@ fenêtres observées sont des **faits de runtime**, pas un catalogue universel.
 
 ## 1. Décision en une page
 
-1. **Sept grandeurs principales** : entrée du dernier appel (`C_last`),
+1. **Huit grandeurs principales** : entrée du dernier appel (`C_last`), pic
+   d'entrée du tour (`C_peak`, entrée maximale d'un appel du fil principal),
    occupation projetée du prochain (`C_next`, décomposée en entrée projetée
    `C_next_input` et occupation avec réserve de sortie), entrées cumulées du
    tour (`R_turn`), entrées cumulées de la session (`R_session`), sortie (`O`),
    durée (`D`) et coût (`Cost`). `O_last`, sortie du dernier appel, alimente la
    projection et ne se confond pas avec `O`. Aucune grandeur ne peut servir à
-   la place d'une autre.
+   la place d'une autre. `C_peak` est le pic **réellement atteint** : une
+   compaction native peut faire retomber `C_last` après coup, et le pic d'avant
+   reste alors la mesure qui compte pour juger l'entretien de fenêtre.
 2. **`context_max_tokens` n'est pas un budget de relecture** : depuis #2336, il
    plafonne `C_last`, la taille du contexte du dernier appel du fil principal
    (fenêtre), cache lu **et** écrit compris. Un budget cumulé de relecture est
@@ -74,6 +77,7 @@ valeur supposée.
 | Id | Grandeur | Unité | Périmètre | Source | Cache | Remise à zéro | Déduplication | Absence |
 |---|---|---|---|---|---|---|---|---|
 | `C_last` | entrée du dernier appel au modèle | jetons | un appel du **fil principal** | flux du harnais (usage de l'appel) ; Codex : journal de session du fil | Claude : entrée + cache lu + cache écrit ; Codex : entrée (cache inclus) ; DeepSeek/ACP : entrée + cache lu | à chaque appel ; dernière valeur du tour | un appel = un `call_id` quand il existe ; blocs répétés d'un même message comptés une fois ; Codex : un `last_token_usage` par tour | `null` + `context_unknown` ; jamais `0` ; jamais la valeur du modèle précédent |
+| `C_peak` | entrée maximale d'un appel pendant le tour | jetons | un tour, **fil principal** | max des `C_last` des appels du tour ; Codex : chaque `last_token_usage` du journal, pas seulement le dernier | même convention que `C_last` | au début du tour | un appel une fois ; Codex : un `token_count` par appel, jamais la somme | `null` + `context_unknown` (et le motif du journal) ; un pic incomplet est `partial` ; sans compaction et à appels croissants, `C_peak = C_last` |
 | `O_last` | sortie du dernier appel | jetons | dernier appel du fil principal | usage de l'appel (`output_tokens` / `outputTokens` ; Codex : `last_token_usage.output_tokens`) | sans objet (sortie) | à chaque appel ; dernière valeur du tour | un appel compté une fois ; jamais `O` du tour | `null` + `output_unknown` ; ne jamais remplacer par `O` du tour ni par `0` |
 | `C_next` | occupation projetée du prochain appel | jetons | prochain appel du fil principal | **dérivée** : `C_next_input` + réserve de sortie du prochain appel (§2.3) | idem `C_last` pour la part déjà mesurée | à chaque appel | ne pas ajouter ce qui est déjà dans `C_last` ; `O_last` une seule fois ; `O` du tour jamais | `null` si `O_last` ou une composante est inconnue ; `C_next_input` peut rester connu ; intervalle possible, jamais un point supposé |
 | `R_turn` | entrées cumulées du tour | jetons | un tour, fil principal | somme des entrées des appels du tour | Claude/DeepSeek/ACP : entrée + cache lu, **hors cache écrit** ; Codex : entrée (cache inclus) | au début du tour | un appel une fois ; cumuls Codex en delta | `null` si le tour n'a aucune mesure ; somme partielle marquée `partial` |
@@ -122,10 +126,16 @@ Règles :
   d'appel (seulement le cumul de `turn.completed`) ; `C_last` et `O_last` se
   lisent dans le `last_token_usage` du `token_count` du tour, borné par le
   `task_started` du même tour. Le journal ne remplace pas `R_turn` : il ne
-  porte qu'un appel, pas le cumul du tour. Un tour sans relevé garde `null` +
-  `context_unknown` avec son motif (`no_call`, `journal_missing`,
-  `turn_not_in_journal`, `last_token_usage_missing`) ; l'usage d'un tour
-  précédent n'est jamais repris.
+  porte pas le cumul du tour. `C_peak` se lit dans **tous** les
+  `last_token_usage` de la fenêtre du tour, pas seulement le dernier : c'est
+  le maximum des entrées d'appel, et il reste lisible quand une compaction a
+  fait retomber `C_last`. Les compactions se lisent au même endroit : l'item
+  de rollout `compacted` et l'événement `context_compacted` prouvent une
+  compaction réussie ; un `compaction_trigger` (demande) n'en est pas une
+  (§4.2). Un tour sans relevé garde `null` + `context_unknown` avec son motif
+  (`no_call`, `journal_missing`, `turn_not_in_journal`,
+  `last_token_usage_missing`) ; l'usage d'un tour précédent n'est jamais
+  repris.
 * **DeepSeek/ACP** : pas de champ d'écriture de cache dans le contrat actuel ;
   un harnais qui en publierait un devrait être qualifié avant d'être agrégé.
 * **`O_last`** : `output_tokens` (Claude, Codex `last_token_usage`) ou
@@ -389,8 +399,8 @@ rôle suivant pour se fabriquer une politique).
 |---|---|---|---|---|---|---|
 | Claude non-résident | oui (`--autocompact`) | `auto` par défaut ; valeur exacte **non établie** ; explicite 100k–1M si fourni | `system/compact_boundary`, `compact_metadata` avant/après | après absent : pas de mesure d'après ; aucun échec exploité par Ameesh | aucun en non-résident | Ameesh ne demande pas `/compact` ; il ne peut que tourner au plafond |
 | Claude résident | oui | natif `auto` + override Ameesh **50 % de `W`** (`COMPACT_SHARE`) | idem ; l'après met à jour `C_last` | pas d'après : garder l'avant, marquer `partial` ; retry 600 s borné ; pas de boucle | `/compact` à 50 % ; retry 600 s | la commande n'est pas un succès ; la rotation gagne sur le compactage |
-| Codex non-résident | oui au protocole | `model_auto_compact_token_limit` ; défaut **non établi** ; opt-in par agent `compact_tokens` (#6040) | `ContextCompaction` / `thread/compacted` ; non lus par Ameesh | inconnu ; Ameesh ne mesure pas l'après | seuil passé au lancement (`-c`), sans demande en cours de tour | `codex exec --json` n'expose pas de contrôle en cours de tour ; le seuil est la seule prise ; plafond entre tours sinon |
-| Codex résident | oui au protocole | idem ; **non établi** | `thread/compacted` / item de compaction ; non lus par Ameesh | inconnu | aucun ; Ameesh ne lance pas `thread/compact/start` | fenêtre `modelContextWindow` mesurée, mais décision de compaction non pilotée |
+| Codex non-résident | oui au protocole | `model_auto_compact_token_limit` ; défaut **non établi** ; opt-in par agent `compact_tokens` (#6040) | item de rollout `compacted`, événement `context_compacted` ; lus par Ameesh (#6044) | après absent : `post` null, `C_last` garde l'avant, qualité `partial` | seuil passé au lancement (`-c`), sans demande en cours de tour | `codex exec --json` n'expose pas de contrôle en cours de tour ; le seuil est la seule prise ; plafond entre tours sinon |
+| Codex résident | oui au protocole | idem ; **non établi** | `thread/compacted` (déprécié) et item `contextCompaction` ; lus par Ameesh (#6044) | après absent : `post` null, `partial` | aucun ; Ameesh ne lance pas `thread/compact/start` | fenêtre `modelContextWindow` mesurée, mais décision de compaction non pilotée |
 | DeepSeek/dsh et ACP | non établi | non établi | aucun événement de compaction dans le pont ACP actuel | inconnu | aucun | seule la rotation au plafond est disponible |
 
 ### 4.2 Règles
@@ -412,13 +422,17 @@ rôle suivant pour se fabriquer une politique).
   #6040 : un seuil fixé avant le tour (`compact_tokens`) laisse Codex décider
   lui-même ; Ameesh ne décide rien en cours de tour.
 * **Publication** : `turn.context.compaction` porte la compaction native
-  observée du tour (`pre`, `post`, `quality`, `reasons`, `trigger`) ; le
-  runner la publie pour un tour résident (le driver) comme non résident
-  (`compact_boundary` du flux principal). `decision.compacted` vaut `true`
-  quand elle est observée, `false` quand le tour n'a pas compacté — une
-  compaction demandée par la politique n'est pas une réussite (§4.2). Le
-  `false` explicite est ce qui permet au rejeu de juger la fenêtre ; `null`
-  reste réservé au tour dont la mesure est perdue.
+  observée du tour (`pre`, `post`, `quality`, `reasons`, `trigger`, `count`) ;
+  le runner la publie pour un tour résident (le driver, `thread/compacted` ou
+  l'item `contextCompaction`) comme non résident (`compact_boundary` du flux
+  principal, ou item `compacted`/événement `context_compacted` du journal
+  Codex). `pre` est le dernier contexte d'avant, `post` le premier contexte
+  d'après (jamais inventé), `count` le nombre de compactions observées dans le
+  tour ; deux preuves de la même compaction ne comptent qu'une fois.
+  `decision.compacted` vaut `true` quand elle est observée, `false` quand le
+  tour n'a pas compacté — une compaction demandée par la politique n'est pas
+  une réussite (§4.2). Le `false` explicite est ce qui permet au rejeu de
+  juger la fenêtre ; `null` reste réservé au tour dont la mesure est perdue.
 
 ---
 
@@ -621,6 +635,8 @@ devient jamais une valeur par défaut silencieuse.
 | `ameesh-context/1` r1 | 2026-10-29 | création : contrat, profils, décisions, cinq reproductions, compatibilité legacy |
 | `ameesh-context-corpus/1` r1 | 2026-10-31 | corpus de rejeu CTX-05a (§8) |
 | `ameesh-context/1` r2 | 2026-11-06 | #6040 : seuil de compaction native Codex par agent (`compact_tokens`, §4.1) ; `policy.compact_tokens` dans `turn.context` et le corpus |
+| `ameesh-context/1` r3 | 2026-11-06 | #6044 : `C_peak` (pic d'entrée du tour) ; compactions Codex lues au journal (`compacted`, `context_compacted`) et au résident (`thread/compacted`, `contextCompaction`) ; `compaction.count` |
+| `ameesh-context-corpus/1` r2 | 2026-11-06 | #6044 : `C_peak` (optionnel en lecture) et `decision.compaction.count` |
 
 ---
 
@@ -649,8 +665,8 @@ raison, jamais `0` (§2.4).
 | `session_seq` | rang du tour dans sa session (1..N), stable et suffisant au rejeu |
 | `W` | fenêtre du modèle effectif : `value`, `quality`, `reasons`, `granularity`, `source` (provenance runtime) |
 | `auxiliary_models` | modèles auxiliaires observés (jamais utilisés pour `W`) |
-| `C_last`, `O_last`, `C_next_input`, `C_next`, `R_turn`, `R_session`, `R_session_base`, `O`, `S_hist`, `cache_read_tokens`, `cache_write_tokens` | mesures au même format `{value, quality, reasons, granularity, source}` ; `R_session_base` est le cumul de relecture **avant** le tour |
-| `decision` | décision **observée** : `observed` ∈ `none`/`close`/`rotation`/`compaction`, `cause` normalisée, `compacted` (vrai si une compaction est publiée, `null` sinon), et les blocs `close`, `rotation`, `compaction`, `window` ; `compaction.observed`/`requested` séparent la réussite de la demande |
+| `C_last`, `C_peak`, `O_last`, `C_next_input`, `C_next`, `R_turn`, `R_session`, `R_session_base`, `O`, `S_hist`, `cache_read_tokens`, `cache_write_tokens` | mesures au même format `{value, quality, reasons, granularity, source}` ; `C_peak` est le pic d'entrée du tour (#6044, absent `null` sur un événement antérieur) ; `R_session_base` est le cumul de relecture **avant** le tour |
+| `decision` | décision **observée** : `observed` ∈ `none`/`close`/`rotation`/`compaction`, `cause` normalisée, `compacted` (vrai si une compaction est publiée, `null` sinon), et les blocs `close`, `rotation`, `compaction`, `window` ; `compaction.observed`/`requested` séparent la réussite de la demande, `compaction.count` donne le nombre de compactions du tour (#6044) |
 | `policy` | politique en vigueur au tour : `session`, `context_max_tokens`, `session_max_tokens`, budgets opt-in, part d'entretien, seuil de compaction native `compact_tokens` (#6040) |
 | `legacy` | les onze compteurs legacy publiés à côté des mesures |
 | `quality`, `reasons` | qualité d'ensemble (mesures principales) et raisons, triées |
@@ -672,7 +688,12 @@ livre reste la mesure de référence, l'écart est nommé.
 publiés (`decision.window`) ; sinon ils restent `null` avec
 `projection_not_published`. Une compaction **demandée** n'est pas une
 compaction réussie : `post_tokens` reste `null`, la raison
-`post_tokens_unknown` le dit (§4.2).
+`post_tokens_unknown` le dit (§4.2). #6044 : `C_peak` est recopié de
+`turn.context` quand il existe ; un événement antérieur le laisse `null` avec
+`context_unknown`, jamais recopié de `C_last`. Le nombre de compactions
+(`decision.compaction.count`) et le pic permettent de juger au rejeu le seuil
+`compact_tokens` d'un agent sans confondre l'après-compaction avec le pic du
+tour.
 
 ### 8.2 Export et bornes
 

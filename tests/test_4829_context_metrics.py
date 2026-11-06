@@ -553,7 +553,7 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual(result["schema"], context_metrics.SCHEMA)
         self.assertEqual(
             set(result["measures"]),
-            {"C_last", "O_last", "R_turn", "R_session", "O"})
+            {"C_last", "C_peak", "O_last", "R_turn", "R_session", "O"})
         for measure in result["measures"].values():
             self.assertIn(measure["quality"], context_metrics.QUALITIES)
         self.assertEqual(
