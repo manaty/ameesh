@@ -33,6 +33,14 @@ class MoveLotOfAnotherTest(PgTestCase):
     def lot_state(self, lot=None):
         return work.get(self.db, lot or self.lot)["state"]
 
+    def _freeze(self):
+        # #5993 : `work move … qa` exige un gel de la tête ; ces tests
+        # vérifient l'identité du déplacement, et le gel n'est que la
+        # condition d'entrée en revue. Jalon direct : aucune désignation.
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'frozen', %s, 'porteur')", (self.lot, "a" * 40))
+
     def test_un_tiers_est_refuse_et_rien_ne_change(self):
         proc = self.move("build", session="tiers")
         self.assertNotEqual(proc.returncode, 0)
@@ -52,6 +60,8 @@ class MoveLotOfAnotherTest(PgTestCase):
 
     def test_le_move_journalise_l_identite_liee_malgre_actor(self):
         for state, actor in (("build", "tiers"), ("qa", "human:owner")):
+            if state == "qa":
+                self._freeze()  # #5993 : le move vers qa exige un gel
             proc = self.move(state, "--actor", actor, session="porteur")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(work.events(self.db, self.lot)[0]["actor"], "porteur")
@@ -77,6 +87,7 @@ class MoveLotOfAnotherTest(PgTestCase):
     def test_humain_et_session_sans_identite_passent(self):
         proc = self.move("build", "--actor", "human:owner")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._freeze()  # #5993 : le move vers qa exige un gel
         proc = self.move("qa")
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
