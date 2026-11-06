@@ -108,12 +108,17 @@ agent reads `paused/…` in the STATUS column (never the truncated
 
 ```bash
 ameesh cost turns   [--agent A] [--since 24h] [--limit 500] [--json]   # ameesh-turns/1
+ameesh cost attribution [--since 24h] [--by K1,K2] [--agent A] [--json] # ameesh-cost-attribution/1
 ameesh cost gauges  [--harness claude|codex] [--since 7d] [--json]     # ameesh-gauges/1
 ameesh cost balance [--provider deepseek] [--record] [--since 7d] [--json]   # ameesh-balance/1
 ```
 
 - **turns**: the per-turn ledger as is, most recent first: agent, harness,
-  turn, model, session, USD, input, cached input and output tokens.
+  turn, model, session, USD, input, cached input and output tokens, and the
+  caller attribution when the turn carries one (#6005).
+- **attribution**: USD grouped by caller attribution over a period (default
+  keys: everything except `run_id`); the `unattributed` remainder is always
+  shown.
 - **gauges**: history of the subscription gauges, recorded where they are
   already read (budget guard, `cost report`, `progress`): one row when a gauge
   changes, or at most every ten minutes. A history failure never breaks the

@@ -740,13 +740,17 @@ class PendingSpend(Domain):
 
     @abc.abstractmethod
     def put(self, name: str, start_index: int, turn: str | None, model: str | None,
-            work_item_id: int | None = None, turn_id: str | None = None) -> bool:
+            work_item_id: int | None = None, turn_id: str | None = None,
+            attribution: dict | None = None) -> bool:
         """Pose (atomiquement) le marqueur du tour, en remplaçant le précédent.
         `work_item_id` (#796, migration 0423) : le lot du tour, pour que la
         ligne écrite à la réparation — par le même exécuteur ou un autre —
         garde l'attribution ; None = lot inconnu.
         `turn_id` (#796) : l'identifiant du tour (`turn_resources.turn_id`),
-        pour la même raison ; None = tour inconnu."""
+        pour la même raison ; None = tour inconnu.
+        `attribution` (#6005, migration 0551) : l'attribution d'appelant du
+        tour hors lot, pour la même raison — la réparation écrit la même
+        ligne ; None = pas d'attribution. Donnée seule, jamais autorité."""
 
     @abc.abstractmethod
     def set_model(self, name: str, model: str | None) -> bool:
@@ -767,20 +771,24 @@ class PendingSpend(Domain):
     def get(self, name: str) -> dict | None:
         """Le marqueur (agent, start_index, turn, model, created_at,
         created_ts, spend_key, ledger_key, ledger_ambiguous, work_item_id,
-        turn_id, resident_usage), ou None. `created_at` est l'identité exacte
-        (#2166) ; `spend_key` est l'identité brute portée par la colonne (NULL
-        avant 0471 ; elle borne `clear_if`/`set_resident_usage` et peut être
-        périmée après un retour arrière, #2905) ; `ledger_key` est la clé fiable
-        déjà écrite par ce tour — celle du marqueur seulement si la colonne EST
-        son identité (`agent:index:created_at`, le format de `put`), ou celle
-        l'identité du tour (`turn_id`, instant de pose, époque de la clé égale
-        à un arrondi historique exact du marqueur, jamais une fenêtre), et la
-        ligne/réservation doit suivre le marqueur — jamais par le seul index
-        de début ni par ordre temporel ;
+        turn_id, attribution, resident_usage), ou None. `created_at` est
+        l'identité exacte (#2166) ; `spend_key` est l'identité brute portée par
+        la colonne (NULL avant 0471 ; elle borne `clear_if`/`set_resident_usage`
+        et peut être périmée après un retour arrière, #2905) ; `ledger_key` est
+        la clé fiable déjà écrite par ce tour — celle du marqueur seulement si
+        la colonne EST son identité (`agent:index:created_at`, le format de
+        `put`), ou celle l'identité du tour (`turn_id`, instant de pose, époque
+        de la clé égale à un arrondi historique exact du marqueur, jamais une
+        fenêtre), et la ligne/réservation doit suivre le marqueur — jamais par
+        le seul index de début ni par ordre temporel ;
         `ledger_ambiguous` vrai interdit de deviner et suspend la comptabilité
         (B1, notamment une réservation étrangère au même index) ;
         `created_ts` reste l'epoch float8 pour le début du tour
-        (`turn_costs.started_at`)."""
+        (`turn_costs.started_at`). `attribution` (#6005, migration 0551) :
+        l'attribution d'appelant du tour hors lot, telle que la ligne du grand
+        livre la portera ; NULL si aucune, ou si un écrivain N-1 a remplacé le
+        marqueur sans réécrire l'attribution (sa pose n'est lue que sur
+        l'identité du marqueur)."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:
@@ -889,7 +897,8 @@ class TurnCosts(Domain):
                work_item_id: int | None = None,
                started_at: float | None = None,
                turn_id: str | None = None,
-               inputs: Sequence[str] | None = None) -> bool:
+               inputs: Sequence[str] | None = None,
+               attribution: dict | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
         compte qui a porté le tour ; None = colonne non écrite. `spend_key`
@@ -908,7 +917,11 @@ class TurnCosts(Domain):
         inconnu, colonne non écrite. `turn_id` (#796) : l'identifiant du tour
         (`turn_resources.turn_id`), pour relier la ligne à ses ressources ;
         None = inconnu. `inputs` (L80b, migration 0472) : les identifiants des
-        messages servis par le tour (JSON array) ; None = colonne non écrite."""
+        messages servis par le tour (JSON array) ; None = colonne non écrite.
+        `attribution` (#6005, migration 0551) : l'attribution d'appelant du
+        tour hors lot — un objet JSON à clés allow-listées, borné — écrite à
+        côté de `work_item_id` ; None = pas d'attribution. Donnée seule :
+        jamais une admission, un budget ou une autorisation."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
@@ -955,8 +968,10 @@ class TurnCosts(Domain):
         """L95 : les lignes du grand livre (depuis `since_ts` si donné), dans
         l'ordre d'écriture (`recorded_ts`, `id`) : id, agent, harness, turn,
         model, session, account, usd, input_tokens, cached_input_tokens,
-        output_tokens, cum_*, recorded_ts, et `void_reason` (None si la
-        migration 0043 n'est pas passée). Lecture seule."""
+        output_tokens, cum_*, recorded_ts, `void_reason` (None si la
+        migration 0043 n'est pas passée), `source` et `attribution` (#6005 :
+        None si la migration 0551 n'est pas passée ou si le tour n'en a pas).
+        Lecture seule."""
 
     @abc.abstractmethod
     def correct(self, *, run_id: str, actor: str, corrections: Sequence[dict]) -> int:
@@ -4490,6 +4505,8 @@ class Operations(Domain):
         cached_input_tokens, output_tokens, work_item_id, started_ts,
         recorded_ts, inputs. `work_item_id` et `started_ts` (#796) valent None
         pour une ligne d'avant la migration 0423 ou un tour sans lot.
+        `attribution` (#6005) est l'attribution d'appelant du tour hors lot
+        (None sans attribution, ou avant la migration 0551).
         `message` (L80b) restreint aux tours qui ont servi ce message
         (`inputs` contient son identifiant)."""
 

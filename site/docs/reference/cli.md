@@ -39,7 +39,7 @@ on its first line.
 agent-mail send <dest|all> <text…|-> [--from NAME] [--lot ID|REF]
                 [--new-lot "title" [--estimate 2h] [--app PROJECT]]
                 [--kind request|reply|notify|event] [--urgent] [--ack] [--cc NAME[,NAME…]]
-                [--sign --key FILE] [--expires 24h] [--queue]
+                [--attribution JSON] [--sign --key FILE] [--expires 24h] [--queue]
                 # a body of `-` is read on standard input: send <dest> - <<'EOF' … EOF
                 # (quoted delimiter: nothing is expanded, no shell command runs)
 agent-mail forward <OLD> <NEW> [--dry-run] [--json]   # redeliver a dead mailbox
@@ -76,6 +76,28 @@ refused. An argument body containing the confirmation of an ameesh command
 (`delivered to …`, `milestone … added to lot #…`, `decision #…`,
 `work item #… closed:`, `lot #… → merged (commit …)`) gets a warning on
 standard error: it probably came from command substitution.
+
+**Caller attribution (#6005).** A caller that starts role turns outside any
+ameesh lot (an IMA run, for instance) can attach a small attribution to the
+message that opens the turn:
+
+```sh
+agent-mail send builder - --attribution \
+  '{"source":"ima","environment":"staging","run_type":"builder","run_id":"r-42","repo":"thepackengers/issue-manager-agent","issue_number":1679,"run_kind":"fix"}' <<'EOF'
+Build the fix for the reported issue.
+EOF
+```
+
+The JSON object is bounded (1 KiB serialized) and its keys are allow-listed:
+`source`, `environment`, `run_type`, `run_id`, `repo`, `issue_number`,
+`pr_number`, `run_kind`. Text values are at most 128 characters,
+`issue_number`/`pr_number` are positive integers; an unknown key, a control
+character or an oversized value is refused at send time. The turn that serves
+the message records it on its `turn_costs` row beside `work_item_id` (turns
+inside a lot keep the lot as the authority); several different attributions
+on one turn leave it unattributed rather than guessing. It is **data only**:
+never admission, budgets or authorization. `ameesh cost turns` shows it and
+`ameesh cost attribution` groups spend by it.
 
 The session identity is `$AGENT_MAIL_NAME` (set by the runner). If
 `$AMEESH_RUNNER_ID` and `$AMEESH_LEASE_EPOCH` are also set, the lease must be
@@ -243,6 +265,8 @@ ameesh cost report [--json]                # agent, harness, model, spend, gauge
 ameesh cost spent [agent] [seconds]        # spend (USD) over a sliding window
 ameesh cost over [agent]                   # exit 0 if the plan's pace is exceeded
 ameesh cost turns [--agent A] [--since SINCE] [--limit N] [--json]      # usage per turn
+ameesh cost attribution [--since SINCE] [--until UNTIL] [--by K1,K2] [--agent A] [--json]
+                                           # spend grouped by caller attribution (#6005)
 ameesh cost gauges [--harness H] [--since SINCE] [--json]               # history of plan gauges
 ameesh cost balance [--provider deepseek] [--record] [--since SINCE] [--json]
 ```
@@ -269,6 +293,15 @@ outside `ameesh heavy` gets the same cap, recognised on its argv (#453).
 
 `--since` takes a duration (`16h`, `2d`) or an ISO date. `cost balance
 --record` reads the balance now (read-only, free).
+
+`ameesh cost attribution` (read-only) groups the ledger's USD by caller
+attribution over the period: `--by` picks the keys (default: every key except
+`run_id`, i.e. `source`, `environment`, `run_type`, `run_kind`, `repo`,
+`issue_number`, `pr_number`), `--until` bounds the end. The `unattributed` line
+is always shown
+— turns without attribution, inside or outside a lot — and the JSON form
+carries the same groups, the remainder and the total. Voided rows and mediated
+device declarations are excluded, as in `cost spent`.
 
 `ameesh list` shows a **PROJECT** column (the agent's team, else its
 chantier, the `--chantier` of `register` and `adopt`) and groups agents by project, a **LOTS** column (open lots assigned
