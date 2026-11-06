@@ -42,6 +42,7 @@ reservation, so two agents or two hosts cannot both drive the same train.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -274,6 +275,8 @@ def assemble(cfg, *, notify=None) -> Assembly:
     gate = ("role %s" % settings.role) if settings.role else "host pin"
 
     refusals = {}  # last automatic refusal per project, cleared on recovery
+    alerted = set()  # #6034: (project, pin) already alerted as unjournaled
+    _startup_pins(cfg, passages, report, alerted)
 
     def refresh():
         # #3366: read the same configuration file the service was assembled
@@ -282,7 +285,8 @@ def assemble(cfg, *, notify=None) -> Assembly:
         # restart, never a silent half-reload of a running service.
         return reload(passages, expected=settings, host=cfg.host,
                       config_path=getattr(cfg, "config_path", "") or "",
-                      automatic=True, report=report, refusals=refusals)
+                      automatic=True, report=report, refusals=refusals,
+                      alerted=alerted)
     return Assembly(settings, passages, lease, "%s mode, %d passage(s), %s"
                     % (settings.mode, len(passages), gate), role=settings.role,
                     refresh=refresh)
@@ -291,6 +295,113 @@ def assemble(cfg, *, notify=None) -> Assembly:
 #: #3366: a canon diff touching one of these files changes the train's rules:
 #: the pin cannot be requalified mechanically, a pilot must review the change.
 REQUALIFY_GUARD = ("processus/mecanique.yaml", "federation.yaml")
+
+#: #6034: the host journal of every legitimate pin move
+#: (:func:`ameesh.train_requalify.journal`), next to the host configuration.
+JOURNAL = "train-canon.jsonl"
+
+
+def journal_path(cfg):
+    """The journal of the host whose configuration ``cfg`` reads, or ""."""
+    base = str(getattr(cfg, "config_base", "") or getattr(cfg, "config_path", "")
+               or "").strip()
+    return os.path.join(os.path.dirname(os.path.abspath(base)), JOURNAL) if base else ""
+
+
+def journaled(path, project):
+    """The pins journaled as reached by ``project``, or None without a journal.
+
+    A malformed line is no move. An unreadable journal reads as empty, so a
+    changed pin is refused rather than followed on an unverifiable trace.
+    """
+    try:
+        with open(path, encoding="utf-8") as source:
+            lines = source.readlines()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return set()
+    gates = set()
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(row, dict) and row.get("event") == "canon-requalified"
+                and row.get("project") == project and isinstance(row.get("gate"), str)):
+            gates.add(row["gate"].strip().lower())
+    return gates
+
+
+def _pin_files(cfg, project):
+    try:
+        from . import train_requalify
+        return [path for path, _raw in train_requalify._paths(cfg, project)]
+    except Exception:  # noqa: BLE001 - the alert names what it can
+        return [path for path in (getattr(cfg, "config_path", ""),) if path]
+
+
+def _unjournaled(cfg, passage, project, previous, pin, report, alerted, *, startup):
+    """#6034: name a pin no journaled requalification reaches, once per value."""
+    key = (project, pin)
+    if key in alerted:
+        return
+    alerted.add(key)
+    files = ", ".join(_pin_files(cfg, project)) or "?"
+    if startup:
+        effect = "assembled as configured at startup"
+        text = ("train canon pin unjournaled for %s: %s at startup matches no "
+                "%s entry (config: %s); %s" % (project, pin[:12], JOURNAL, files,
+                                              effect))
+    else:
+        effect = "refused, the train keeps %s" % previous[:12]
+        text = ("train canon pin refused for %s: %s -> %s has no %s entry "
+                "(config: %s); a pin moves only by requalify (mechanical or "
+                "--reviewed) or the automatic follow (#3483)"
+                % (project, previous[:12], pin[:12], JOURNAL, files))
+    report(text)
+    watch = getattr(passage, "canon", None)
+    pilot = getattr(watch, "pilot", None)
+    if pilot is None:
+        return
+    db = None
+    try:
+        from . import mail
+        from .scoped_db import ScopedDb
+        db = ScopedDb(cfg, family="runner.scoped.train.assembly")
+        recipient = pilot(db)
+        if recipient:
+            body = "\n".join([
+                "Train %s : épingle canon sans entrée dans %s (#6034)." % (project, JOURNAL),
+                "",
+                "- Épingle : %s ; nouvelle épingle : %s." % (previous or "?", pin),
+                "- Fichiers : %s." % files,
+                "- Effet : %s." % effect,
+                "- Une épingle ne bouge que par requalify (mécanique ou --reviewed) "
+                "ou le suivi automatique (#3483), qui journalisent le mouvement.",
+            ])
+            mail.send(db, train_canon.SENDER, recipient, body,
+                      payload={"train_canon_unjournaled": {
+                          "project": project, "pin": previous, "new_pin": pin,
+                          "files": files.split(", "), "startup": startup}})
+    except Exception:  # noqa: BLE001 - the logged refusal stands without the mail
+        pass
+    finally:
+        if db is not None:
+            db.close()
+
+
+def _startup_pins(cfg, passages, report, alerted):
+    """A startup pin stays assembled; alert it when a journal knows other pins."""
+    path = journal_path(cfg)
+    if not path:
+        return
+    for passage in passages:
+        name = str(getattr(getattr(passage, "project", None), "name", "") or "")
+        pin = str(getattr(passage, "policy_commit", "") or "").lower()
+        gates = journaled(path, name)
+        if gates and pin not in gates:
+            _unjournaled(cfg, passage, name, "", pin, report, alerted, startup=True)
 
 
 def project_of(cfg, name):
@@ -359,7 +470,7 @@ def _same_assembly(expected, fresh):
 
 
 def reload(passages, *, expected=None, load=None, host=None, config_path=None,
-           automatic=False, report=None, refusals=None):
+           automatic=False, report=None, refusals=None, alerted=None):
     """#3366: re-read the effective ``train.projects.<p>.canon_commit``.
 
     The service used to keep the pin assembled at startup, so a requalified pin
@@ -376,6 +487,11 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None,
     refuses by name and waits for a restart. The whole reload is validated
     before any passage is mutated, so a refused reload leaves every passage
     on its previous pin.
+
+    #6034: a changed pin is followed only when the host journal records a
+    requalification whose gate is that pin (mechanical, reviewed or
+    automatic). A pin edited by hand keeps the passage on its previous pin and
+    is alerted once per value; the other projects still follow theirs.
     """
     if load is None:
         env = (dict(os.environ, AMEESH_CONFIG=config_path)
@@ -393,10 +509,11 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None,
                                  % (settings.host, this_host or "?"))
     if expected is not None:
         _same_assembly(expected, settings)
+    report = report or (lambda message: print("train: " + message, file=sys.stderr))
+    alerted = set() if alerted is None else alerted
     if automatic:
         from . import train_requalify
         from .scoped_db import ScopedDb
-        report = report or (lambda message: print("train: " + message, file=sys.stderr))
         refusals = {} if refusals is None else refusals
         for spec in settings.projects:
             db = None
@@ -418,9 +535,10 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None,
         # reload: a pilot may already have qualified an intermediate commit.
         # canon_refusal still guards new composition against the gate.
         return reload(passages, expected=expected, load=load, host=host,
-                      config_path=config_path)
+                      config_path=config_path, report=report, alerted=alerted)
     by_name = {spec.name: spec for spec in settings.projects}
-    pending = []
+    journal = journal_path(fresh)
+    pending, refused = [], []
     for passage in passages or ():
         project = getattr(passage, "project", None)
         name = str(getattr(project, "name", "") or "").strip()
@@ -433,7 +551,14 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None,
         previous = str(getattr(passage, "policy_commit", "") or "")
         if previous == commit and str(getattr(passage, "policy_path", "") or "") == spec.canon:
             continue
+        if previous and previous != commit and journal:
+            if commit.lower() not in (journaled(journal, name) or ()):
+                refused.append((passage, name, previous, commit))
+                continue
         pending.append((passage, name, spec.canon, commit, previous))
+    for passage, name, previous, commit in refused:
+        _unjournaled(fresh, passage, name, previous, commit, report, alerted,
+                     startup=False)
     changes = []
     for passage, name, canon_path, commit, previous in pending:
         passage.policy_path = canon_path

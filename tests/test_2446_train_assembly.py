@@ -356,6 +356,10 @@ class AssemblyTest(unittest.TestCase):
         result = train_assembly.assemble(cfg)
         passage, = result.passages
         self.assertEqual(passage.policy_commit, self.commit)
+        # #6034: the move is followed once a requalification journals it
+        with open(os.path.join(self.tmp.name, "train-canon.jsonl"), "w") as journal:
+            journal.write(json.dumps({"event": "canon-requalified", "project": "ameesh",
+                                      "pin": self.commit, "gate": new}) + "\n")
         changes = result.refresh()
         self.assertEqual(changes, [{"project": "ameesh", "previous": self.commit,
                                     "pin": new, "canon": self.canon.root}])
