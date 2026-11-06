@@ -4306,6 +4306,15 @@ def get(db: Db, item_id: int) -> dict | None:
     return storage.of(db).work.get(item_id)
 
 
+def get_brief(db: Db, item_id: int) -> dict | None:
+    """Le lot sans `frozen_sha`/`frozen_at`/`build_at` (#5993).
+
+    Les écrivains isolés des modules (#420) n'ont que SELECT sur `work_items` :
+    `it.item` lit le lot par cette projection, que la garde du move vers qa
+    n'a pas élargie."""
+    return storage.of(db).work.get_brief(item_id)
+
+
 def _canonical_state(state: str) -> str:
     """#4353 : l'orthographe persistée d'un état (v1 ou alias générique),
     sinon `WorkError` nommant les orthographes acceptées."""

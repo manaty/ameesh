@@ -2522,7 +2522,23 @@ class WorkItems(Domain):
         tête du dernier gel et son instant) et `build_at` (le dernier passage
         en build) sont portés par la même lecture — la commande
         `work move ... qa` exige un gel de la tête courante sans second
-        aller-retour (le contrat médié n'a pas d'op `work.milestones`)."""
+        aller-retour (le contrat médié n'a pas d'op `work.milestones`).
+        Cette lecture exige donc `SELECT` sur les jalons et le journal du lot.
+
+        Un lecteur restreint qui n'a que `work_items` (les écrivains isolés
+        des modules, #420) lit le lot par `get_brief`, qui ne porte pas ces
+        trois champs."""
+
+    def get_brief(self, item_id: int) -> dict | None:
+        """Un lot sans `frozen_sha`/`frozen_at`/`build_at` (#5993).
+
+        `ameesh_it_qa` et `ameesh_it_proof` n'ont que `SELECT` sur
+        `work_items` (et les objets du module) : `it.item` lit le lot par
+        cette projection, comme avant la garde du move vers qa. Le défaut
+        rend `get` : un pilote qui ne restreint pas la lecture n'a rien à
+        en faire, et la connexion médiée continue de servir `work.get` avec
+        les champs."""
+        return self.get(item_id)
 
     @abc.abstractmethod
     def items(self, *, state: str | None, assignee: str | None, limit: int | None) -> list[dict]:

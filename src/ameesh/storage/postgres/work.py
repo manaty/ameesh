@@ -885,7 +885,7 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state,
                     "pipeline adopted: %s version %s stage %s" % (ref, version, stage), actor)
 
-    def get(self, item_id) -> dict | None:
+    def _workflow_columns(self) -> str:
         # #1922/B5 : `workflow_ref` (0452) est porté par la lecture, comme
         # `reviewer` (#705) l'est par `item_columns` — `to_jsonb` rend '' sur
         # une base d'avant la migration. Les commandes historiques le lisent
@@ -897,14 +897,15 @@ class WorkItems(interface.WorkItems):
         # champs (sinon `projection-stage-missing` sur un lot sain). Une base
         # pré-0452 rend '', NULL, 0, derrière la sonde #5404.
         if has_current_item_columns(self.db):
-            workflow = ("coalesce(workflow_ref, '') AS workflow_ref,"
-                        " workflow_stage,"
-                        " coalesce(workflow_version, 0) AS workflow_version")
-        else:
-            workflow = ("coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref,"
-                        " to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
-                        " coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
-                        " AS workflow_version")
+            return ("coalesce(workflow_ref, '') AS workflow_ref,"
+                    " workflow_stage,"
+                    " coalesce(workflow_version, 0) AS workflow_version")
+        return ("coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref,"
+                " to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
+                " coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
+                " AS workflow_version")
+
+    def get(self, item_id) -> dict | None:
         # #5993 : la tête du dernier gel et son instant, plus le dernier
         # passage en build, sont portés par cette lecture — comme
         # `workflow_ref` l'est pour le pin. La commande `work move ... qa` les
@@ -912,6 +913,8 @@ class WorkItems(interface.WorkItems):
         # d'exécuteur médiée (le contrat n'a pas d'op `work.milestones`).
         # Un gel antérieur au dernier passage en build ne couvre pas la tête
         # retravaillée : c'est le cas que la garde refuse (#5993 N1).
+        # Cette lecture exige SELECT sur les jalons et le journal : les
+        # écrivains isolés des modules lisent par `get_brief` (#420, #5993).
         rows = self.db.query(
             "SELECT %s, %s, f.frozen_sha,"
             " extract(epoch from f.frozen_at)::float8 AS frozen_at,"
@@ -928,7 +931,18 @@ class WorkItems(interface.WorkItems):
             "    WHERE e.work_item_id = work_items.id AND e.state = 'build'"
             "    ORDER BY e.id DESC LIMIT 1) b ON true"
             " WHERE work_items.id = %%s"
-            % (item_columns(self.db), workflow),
+            % (item_columns(self.db), self._workflow_columns()),
+            (int(item_id),))
+        return rows[0] if rows else None
+
+    def get_brief(self, item_id) -> dict | None:
+        # #5993 : projection d'avant la garde, sans jalons ni journal. Les
+        # écrivains isolés des modules (#420) n'ont que SELECT sur
+        # `work_items` ; `it.item` lit le lot par ici sous `ameesh_it_qa` /
+        # `ameesh_it_proof`.
+        rows = self.db.query(
+            "SELECT %s, %s FROM work_items WHERE id = %%s"
+            % (item_columns(self.db), self._workflow_columns()),
             (int(item_id),))
         return rows[0] if rows else None
 
