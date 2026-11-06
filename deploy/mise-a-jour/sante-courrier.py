@@ -42,12 +42,21 @@ Read-only checks, then one real delivery probe:
   busy at the bound, another driven and free persona of the same pool
   replaces it, and the report names the replacement and why (``remplacement``,
   #4126). A target asleep in the automatic roadmap sleep (#3256 §2.3) is not
-  waited for: only an assignment or pilot mail lifts it, never the probe, so
+  waited for: only an assignment or pilot mail lifts it, never the wait, so
   waiting would just burn the bound and prove nothing (#5312). The replacement
   is the free persona with the fewest unread active messages: the probe turn
   reads its whole backlog first, and a pile of a hundred would outlast the
   bound and leave the probe inconclusive (#5955); the report names that
-  backlog (``non_lus``). Only when none is free is the verdict ``sans-sonde``. Delivery alone
+  backlog (``non_lus``). When none is free and the host's driven personas
+  sleep the automatic roadmap sleep (every night), one of them takes the
+  host's probe seat (#6013): the named target first, otherwise the lightest
+  backlog. Its exact sleep is lifted for the probe alone, after the probe is
+  dropped (an unread message keeps it out of the automatic take), put back as
+  soon as the probe turn starts (the pause refuses any new turn, the current
+  one ends), and always put back at the end; a lot that became actionable
+  meanwhile keeps it awake, named in ``siege``. Budget and human operator
+  pauses are never touched. Only when no seat exists either is the verdict
+  ``sans-sonde``. Delivery alone
   is recorded when the harness
   starts, before a refused harness exits 127 (#1460): only the answer proves a
   real turn with working tools, and a failed or blocked turn after delivery is
@@ -94,8 +103,8 @@ import secrets
 import sys
 import time
 
-from ameesh import (budget, chat, config, db as db_mod, file_decoupage, mail,
-                    registry, storage, work)
+from ameesh import (agent_pause, budget, chat, config, db as db_mod,
+                    file_decoupage, mail, registry, storage, work)
 
 #: seconds allowed for delivery, tool answer and a clean turn end (bounded)
 DEFAULT_ATTENTE = 300.0
@@ -107,6 +116,11 @@ DEFAULT_ATTENTE_CIBLE = 300.0
 INTERVALLE_CIBLE = 5.0
 #: etats d'un lot qui prouvent un tour de travail (pas une simple prise, #4181)
 ETATS_TRAVAIL = ("build", "qa")
+#: #6013 : levees du sommeil pour une meme sonde (la passe de decoupage peut
+#: le reposer avant le tour) ; au-dela, la sonde reste non remise
+LEVEES_MAX = 3
+#: #6013 : raison journalisee de la levee bornee (prefixe du decoupage, #4610)
+LEVEE_SONDE = "%s sonde %s %s (siege de sonde staging, #6013)"
 
 PROBE_TEMPLATE = """Sonde de sante staging (#1155), hote {hote}, commit {sha}.
 Message automatique du systeme : il verifie qu'un tour reel s'execute sur cet
@@ -186,6 +200,35 @@ def cible_occupee(row: dict, nommee: bool = False) -> str:
     return ("cible %s%s occupee (%s) ; la file d'un agent occupe ou en pause "
             "ne mesure pas la chaine" % ("nommee " if nommee else "",
                                         row["name"], motif_non_libre(row)))
+
+
+def siege_possible(row: dict) -> bool:
+    """#6013 : la persona peut tenir le siege de sonde de l'hote.
+
+    Seul le sommeil automatique de la feuille de route (#5312) la retient :
+    au repos, sans attente budget. Une pause humaine ou budget n'est jamais
+    levee par la sonde.
+    """
+    return (sommeil_auto(row) and (row.get("status") or "idle") == "idle"
+            and not attente_budget(row))
+
+
+def siege(db, pool: list[dict], nommee: str | None = None):
+    """#6013 : la persona menee qui tient le siege de sonde, ou None.
+
+    Aucune persona menee n'est libre, mais une dort du sommeil automatique :
+    la cible nommee d'abord, sinon la moins chargee (#5955), relue avant
+    usage. Le choix est deterministe : charge, puis ordre du registre.
+    """
+    now = time.time()
+    dormeurs = par_charge(db, [r for r in pool
+                               if driven(r, now) and siege_possible(r)])
+    dormeurs.sort(key=lambda r: r["name"] != nommee)
+    for row in dormeurs:
+        etat = registry.get(db, row["name"])
+        if etat is not None and driven(etat, time.time()) and siege_possible(etat):
+            return etat
+    return None
 
 
 def stuck(db, rows: list[dict], souffrance: float, now: float) -> list[dict]:
@@ -425,8 +468,9 @@ def attendre_cible(db, nom: str, borne: float):
     re-read until it is free, within ``borne`` seconds, then probed. A target
     gone or without a live lease is not waited for: no turn will free it.
     #5312 : neither is a target asleep in the automatic roadmap sleep — only
-    an assignment or pilot mail lifts that pause, not the probe, so waiting
-    would just burn the bound (the normal state between roadmap waves).
+    an assignment or pilot mail lifts that pause, not the wait, so waiting
+    would just burn the bound (the normal state between roadmap waves). With
+    no free persona, it can still take the probe seat (#6013, ``siege``).
     """
     debut = time.monotonic()
     while True:
@@ -439,7 +483,7 @@ def attendre_cible(db, nom: str, borne: float):
         if sommeil_auto(etat):
             return None, attendu, (
                 "cible nommee %s en sommeil automatique (feuille de route "
-                "epuisee) : ni l'attente ni la sonde ne levent ce sommeil" % nom)
+                "epuisee) : l'attente ne leve pas ce sommeil" % nom)
         reste = borne - (time.monotonic() - debut)
         if reste <= 0:
             return None, attendu, "cible nommee %s occupee (%s) apres %ss d'attente" % (
@@ -512,9 +556,13 @@ def selection(db, pool: list[dict], sonde: str, borne: float, now: float,
         if not menes:
             return None, "aucune persona menee (bail vivant) %s" % portee, None
         libres = [r for r in menes if libre(r)]
-        if not libres:
-            return None, pourquoi_occupees(portee, menes), None
-        cible, pourquoi = revalider(db, libres)
+        cible, pourquoi = (revalider(db, libres) if libres
+                           else (None, pourquoi_occupees(portee, menes)))
+        if cible is None:
+            dormeur = siege(db, menes)
+            if dormeur is not None:
+                return dormeur, "%s ; siege de sonde : %s" % (
+                    pourquoi, dormeur["name"]), None
         return cible, pourquoi, None
     if not any(r["name"] == sonde for r in pool):
         raise SystemExit("sonde : %s n'est pas une persona %s" % (
@@ -527,7 +575,18 @@ def selection(db, pool: list[dict], sonde: str, borne: float, now: float,
     autres = par_charge(db, [r for r in pool if r["name"] != sonde])
     cible, _ = revalider(db, autres)
     if cible is None:
-        return None, "%s ; aucune autre persona menee libre" % motif, None
+        motif = "%s ; aucune autre persona menee libre" % motif
+        # #6013 : le siege de sonde, la cible nommee d'abord si elle dort
+        dormeur = siege(db, pool, sonde)
+        if dormeur is None:
+            return None, motif, None
+        pourquoi = "%s ; siege de sonde : %s" % (motif, dormeur["name"])
+        if dormeur["name"] == sonde:
+            return dormeur, pourquoi, None
+        return dormeur, pourquoi, {
+            "cible_nommee": sonde, "remplacante": dormeur["name"],
+            "raison": motif, "attente_s": attendu,
+            "non_lus": charge(db, dormeur["name"])}
     remplacement = {"cible_nommee": sonde, "remplacante": cible["name"],
                     "raison": motif, "attente_s": attendu,
                     "non_lus": charge(db, cible["name"])}
@@ -585,8 +644,117 @@ def travail_en_cours(db, name: str) -> dict | None:
     return None
 
 
+def principal_sommeil(row: dict) -> str | None:
+    """L'humain qui porte le sommeil (#4525) : principal de la levee et de la pose."""
+    return (row.get("operator_pause_for") or file_decoupage._owner_of([row])
+            or None)
+
+
+def lever_sommeil(db, siege_: dict) -> bool:
+    """#6013 : leve le seul sommeil automatique du siege, pour la sonde.
+
+    La levee est conditionnelle (``expect_reason``) : une pause humaine ou
+    budget qui aurait remplace le sommeil n'est jamais levee. Bornee a
+    ``LEVEES_MAX`` par sonde. Rend True si le sommeil est leve.
+    """
+    if siege_["levees"] >= LEVEES_MAX:
+        siege_["pourquoi"] = "sommeil repose %d fois avant le tour" % LEVEES_MAX
+        return False
+    etat = registry.get(db, siege_["persona"]) or {}
+    if not sommeil_auto(etat) or etat.get("operator_pause_reason") != siege_["sommeil"]:
+        siege_["pourquoi"] = "plus le sommeil automatique (%s)" % motif_non_libre(etat)
+        return False
+    principal = principal_sommeil(etat)
+    if not principal:
+        siege_["pourquoi"] = "aucun humain ne porte le sommeil"
+        return False
+    try:
+        fait = agent_pause.change(
+            db, siege_["persona"], paused=False,
+            reason=LEVEE_SONDE % (file_decoupage.SLEEP_LIFT_PREFIX, siege_["hote"],
+                                  siege_["message"]),
+            actor=agent_pause.FILE_DECOUPAGE_ACTOR, principal=principal,
+            expect_reason=siege_["sommeil"])
+    except Exception as exc:  # noqa: BLE001 — le sommeil reste, la sonde non concluante
+        siege_["pourquoi"] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+        return False
+    if not fait.get("changed"):
+        siege_["pourquoi"] = "sommeil non leve (deja leve ou remplace)"
+        return False
+    siege_["levees"] += 1
+    siege_["leve"] = True
+    siege_["principal"] = principal
+    siege_["until"] = etat.get("operator_pause_until_ts")
+    return True
+
+
+def retablir_sommeil(db, siege_: dict) -> None:
+    """#6013 : repose le sommeil leve pour la sonde, une fois.
+
+    Le sommeil est repose des que le tour de sonde commence : la pause refuse
+    tout nouveau tour, le tour en cours finit (pas de prise de lot entre la fin
+    du tour et la pose). Il ne l'est pas si une pause est deja en place (la
+    passe de decoupage l'a reposee : retabli si c'est le sommeil), ni si un lot
+    actionnable est arrive entre-temps : ce reveil-la est legitime (#4610).
+    """
+    if not siege_.get("leve") or siege_.get("retabli") is not None:
+        return
+    nom = siege_["persona"]
+    siege_["retabli"] = False
+    try:
+        etat = registry.get(db, nom) or {}
+        if etat.get("retired_ts"):
+            siege_["retablissement"] = "persona retiree"
+            return
+        if etat.get("operator_paused"):
+            siege_["retabli"] = sommeil_auto(etat)
+            siege_["retablissement"] = "deja en pause (%s)" % motif_non_libre(etat)
+            return
+        actuel = next((r for r in storage.of(db).operations.listing() or ()
+                       if r.get("name") == nom), {})
+        if int(actuel.get("actionable_lots") or 0) > 0:
+            siege_["retablissement"] = (
+                "lot actionnable #%s : le sommeil reste leve"
+                % (actuel.get("actionable_lot_id") or "?"))
+            return
+        until = float(siege_.get("until") or 0)
+        fait = agent_pause.change(
+            db, nom, paused=True, reason=siege_["sommeil"],
+            actor=agent_pause.FILE_DECOUPAGE_ACTOR, principal=siege_["principal"],
+            until=until if until > time.time() else None)
+    except Exception as exc:  # noqa: BLE001 — nomme dans le rapport, la passe le reposera
+        siege_["retablissement"] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+        return
+    siege_["retabli"] = bool(fait.get("changed"))
+    siege_["retablissement"] = "sommeil repose" if siege_["retabli"] else "pose refusee"
+
+
 def probe(db, row: dict, sha: str, attente: float,
           hote_mesure: str | None = None, *, alternatives: list[dict] | None = None) -> dict:
+    """The probe; #6013 : on a seat persona, the sleep is lifted, then put back.
+
+    ``siege`` in the result names the persona, its sleep and whether it was
+    lifted and put back. A seat probe takes no replacement: no persona is free.
+    """
+    if not sommeil_auto(row):
+        return _probe(db, row, sha, attente, hote_mesure, alternatives=alternatives)
+    siege_ = {"persona": row["name"], "hote": hote_mesure or row.get("host") or "",
+              "sommeil": row.get("operator_pause_reason"), "message": None,
+              "levees": 0,
+              "leve": False, "retabli": None, "pourquoi": None}
+    try:
+        resultat = _probe(db, row, sha, attente, hote_mesure, siege_=siege_)
+    finally:
+        retablir_sommeil(db, siege_)
+    for cle in ("principal", "until"):
+        siege_.pop(cle, None)
+    resultat["siege"] = siege_
+    return resultat
+
+
+def _probe(db, row: dict, sha: str, attente: float,
+           hote_mesure: str | None = None, *, alternatives: list[dict] | None = None,
+           siege_: dict | None = None) -> dict:
     """Drop one system message and wait (bounded) for the answered, ended turn.
 
     An answered turn still running is conclusive when the target is working a
@@ -619,6 +787,12 @@ def probe(db, row: dict, sha: str, attente: float,
         # rien n'est mesure sur l'hote. Non concluant, jamais un KO (canon §3).
         return dict(out, concluant=False, tour="cible retiree avant l'envoi")
     out["message"] = message_id
+    if siege_ is not None:
+        siege_["message"] = message_id
+    if siege_ is not None and not lever_sommeil(db, siege_):
+        # #6013 : le sommeil n'a pas ete leve : rien n'est mesure sur l'hote
+        return dict(out, concluant=False,
+                    tour="non remis (siege : %s)" % siege_["pourquoi"])
     fin = debut + attente
     repondu = False
     budget_vu = ""
@@ -637,6 +811,10 @@ def probe(db, row: dict, sha: str, attente: float,
         if livre:
             if out["remise_s"] is None:
                 out["remise_s"] = round(time.monotonic() - debut, 1)
+            if siege_ is not None:
+                # #6013 : le tour de sonde a commence ; le sommeil revient
+                # avant sa fin, aucun autre tour ne s'ouvre ensuite
+                retablir_sommeil(db, siege_)
             repondu = repondu or answered(db, row["name"], jeton)
             # one registry read for both verdicts: a turn ending in error
             # between two reads must not be taken for a clean end
@@ -662,6 +840,9 @@ def probe(db, row: dict, sha: str, attente: float,
                                 travail={"lot": travail.get("id"),
                                          "state": travail.get("state")})
                 out["tour"] = "reponse vue, tour non termine"
+        elif siege_ is not None and sommeil_auto(etat):
+            # #6013 : la passe de decoupage a repose le sommeil avant le tour
+            lever_sommeil(db, siege_)
         elif alternatives and time.monotonic() - debut >= attente / 2:
             # Reserve the remaining half of the SAME time budget for one
             # fresh, driven, free target. Never replace a delivered probe.
@@ -672,7 +853,7 @@ def probe(db, row: dict, sha: str, attente: float,
                 motif = (budget_vu or ("pause operateur" if pause_vue else
                          "sonde non remise, cible %s" % (etat.get("status") or "?")))
                 attendu = round(time.monotonic() - debut, 1)
-                resultat = probe(db, cible, sha, reste, hote_mesure)
+                resultat = _probe(db, cible, sha, reste, hote_mesure)
                 resultat["remplacement"] = {
                     "cible_nommee": row["name"], "remplacante": cible["name"],
                     "raison": motif, "attente_s": attendu,
@@ -825,6 +1006,12 @@ def main(argv: list[str] | None = None) -> int:
                      resultat["message"], via))
         if rapport.get("remplacement"):
             print("courrier %s : %s" % (args.hote, rapport["pourquoi"]))
+        siege_ = (resultat or {}).get("siege")
+        if siege_:
+            print("courrier %s : siege de sonde %s, sommeil %s, %s"
+                  % (args.hote, siege_["persona"],
+                     "leve" if siege_["leve"] else "non leve",
+                     siege_.get("retablissement") or siege_.get("pourquoi") or "-"))
     return {"ko": 1, "non-concluant": 3}.get(rapport["verdict"], 0)
 
 
