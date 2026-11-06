@@ -479,13 +479,31 @@ def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = No
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.pending_spend_put")
     api = storage.of(db).pending_spend
+    return _pending_spend_call(api, "put", attribution,
+                               name, start_index, turn, model, work_item_id, turn_id)
+
+
+def _pending_spend_call(api, method: str, attribution: dict | None, *args, **kwargs):
+    """Appelle une écriture de marqueur, avec l'attribution quand elle existe.
+
+    #6005 B2 : l'attribution absente n'est **pas** transmise. Le client
+    distant transmet ses kwargs tels quels, et un serveur médié d'avant la
+    1.12 refuse `attribution=None` comme un paramètre inconnu : le marqueur
+    d'un tour ordinaire ne serait jamais posé et le tour ne partirait pas.
+    Si un serveur refuse malgré tout ce paramètre quand l'attribution existe,
+    le marqueur est reposé sans elle (c'est une donnée, jamais une condition
+    du tour). Un autre refus remonte : une panne ou un bail perdu ne se
+    rejoue pas en silence.
+    """
+    call = getattr(api, method)
+    if attribution is None:
+        return call(*args, **kwargs)
     try:
-        return api.put(name, start_index, turn, model, work_item_id,
-                       turn_id, attribution=attribution)
+        return call(*args, **kwargs, attribution=attribution)
     except Exception as exc:  # noqa: BLE001 — repli borné au paramètre inconnu
-        if attribution is None or not _unknown_parameter(exc):
+        if not _unknown_parameter(exc):
             raise
-        return api.put(name, start_index, turn, model, work_item_id, turn_id)
+        return call(*args, **kwargs)
 
 
 def pending_spend_begin(db: Db, name: str, start_index: int, turn: str | None = None,
@@ -500,30 +518,18 @@ def pending_spend_begin(db: Db, name: str, start_index: int, turn: str | None = 
     `pending_spend_put`. `attribution` (#6005) aussi : la réparation écrit la
     même ligne. Un serveur médié d'avant la 1.12 refuse le paramètre inconnu :
     le marqueur est alors reposé sans attribution (l'attribution est une
-    donnée — elle ne bloque jamais un tour), et l'appelant est journalisé.
+    donnée — elle ne bloque jamais un tour).
     """
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.pending_spend_begin")
     api = storage.of(db).pending_spend
     if hasattr(api, "put_get"):
-        try:
-            return _pending_spend_row(api.put_get(name, start_index, turn, model,
-                                                  work_item_id=work_item_id,
-                                                  turn_id=turn_id,
-                                                  attribution=attribution))
-        except Exception as exc:  # noqa: BLE001 — repli borné au paramètre inconnu
-            if attribution is None or not _unknown_parameter(exc):
-                raise
-            return _pending_spend_row(api.put_get(name, start_index, turn, model,
-                                                  work_item_id=work_item_id,
-                                                  turn_id=turn_id))
-    try:
-        written = api.put(name, start_index, turn, model, work_item_id, turn_id,
-                          attribution=attribution)
-    except Exception as exc:  # noqa: BLE001 — même repli sur un serveur ancien
-        if attribution is None or not _unknown_parameter(exc):
-            raise
-        written = api.put(name, start_index, turn, model, work_item_id, turn_id)
+        return _pending_spend_row(_pending_spend_call(
+            api, "put_get", attribution, name, start_index, turn, model,
+            work_item_id=work_item_id, turn_id=turn_id))
+    written = _pending_spend_call(api, "put", attribution,
+                                  name, start_index, turn, model,
+                                  work_item_id, turn_id)
     if not written:
         return None
     return pending_spend_get(db, name)

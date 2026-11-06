@@ -124,6 +124,35 @@ class ReportTest(unittest.TestCase):
         data = ca.report(self._rows(), keys=("source",), until_ts=12.0)
         self.assertEqual(data["total"], {"turns": 2, "usd": 3.0})
 
+    def test_partial_attributions_with_equal_cost_and_turns_are_ordered(self):
+        """B1 : deux groupes partiels de même coût et même nombre de tours ne
+        comparent jamais `str` avec `None` (TypeError, rapport indisponible)."""
+        rows = [
+            {"agent": "a", "usd": 1.0, "recorded_ts": 1.0,
+             "attribution": {"source": "ima"}},
+            {"agent": "a", "usd": 1.0, "recorded_ts": 2.0,
+             "attribution": {"run_type": "builder"}},
+        ]
+        data = ca.report(rows, keys=("source", "run_type"))
+        self.assertEqual(data["total"], {"turns": 2, "usd": 2.0})
+        self.assertEqual([group["values"] for group in data["groups"]],
+                         [{"source": None, "run_type": "builder"},
+                          {"source": "ima", "run_type": None}])
+
+    def test_mixed_number_and_text_values_are_ordered(self):
+        """B1 : l'ordre reste total quand deux groupes partiels mêlent un
+        texte et un entier, au lieu de lever une TypeError."""
+        rows = [
+            {"agent": "a", "usd": 1.0, "recorded_ts": 1.0,
+             "attribution": {"source": "ima"}},
+            {"agent": "a", "usd": 1.0, "recorded_ts": 2.0,
+             "attribution": {"issue_number": 7}},
+        ]
+        data = ca.report(rows, keys=("source", "issue_number"))
+        self.assertEqual([group["values"] for group in data["groups"]],
+                         [{"source": None, "issue_number": 7},
+                          {"source": "ima", "issue_number": None}])
+
     def test_unknown_group_key_is_refused(self):
         with self.assertRaises(ca.AttributionError):
             ca.report(self._rows(), keys=("nope",))
@@ -370,6 +399,101 @@ class MediatedCompatTest(unittest.TestCase):
             with self.assertRaises(db_mod.DbError):
                 self._book()._insert_turn_cost(
                     agent="a1", attribution={"source": "ima"})
+
+
+class MarkerCompatTest(unittest.TestCase):
+    """B2 : un serveur d'avant la 1.12 ne doit jamais empêcher le marqueur.
+
+    Le client médié transmet le kwarg tel quel : `attribution=None` est un
+    paramètre inconnu pour un serveur 1.11, et le marqueur d'un tour ordinaire
+    ne serait jamais posé. Le paramètre absent n'est donc pas transmis ; s'il
+    est refusé alors qu'une attribution existe, le marqueur est reposé sans
+    elle (donnée seule, jamais une condition du tour).
+    """
+
+    def _row(self, name="a"):
+        return {"agent": name, "start_index": 0, "turn": "tour", "model": "",
+                "created_at": "2026-11-06T00:00:00.000000Z", "created_ts": 0.0,
+                "spend_key": None, "ledger_key": None, "ledger_ambiguous": False,
+                "work_item_id": None, "turn_id": None, "attribution": None,
+                "resident_usage": None}
+
+    def _old_api(self, error, *, put_get=False):
+        calls = []
+
+        def write(*args, **kwargs):
+            calls.append(dict(kwargs))
+            if "attribution" in kwargs:
+                raise error
+            return True
+
+        def write_get(*args, **kwargs):
+            write(*args, **kwargs)
+            return self._row()
+
+        api = SimpleNamespace(put=write, get=lambda name: self._row(name))
+        if put_get:
+            api.put_get = write_get
+        return api, calls
+
+    def _run(self, api, method, attribution):
+        fake = SimpleNamespace(pending_spend=api)
+        with mock.patch.object(registry.storage, "of", return_value=fake), \
+                mock.patch("ameesh.agent_names.resolve",
+                           side_effect=lambda name, **kw: name):
+            if method == "put":
+                return registry.pending_spend_put(
+                    None, "a", 0, "tour", "", attribution=attribution)
+            return registry.pending_spend_begin(
+                None, "a", 0, "tour", "", attribution=attribution)
+
+    def test_put_without_attribution_omits_the_parameter(self):
+        api, calls = self._old_api(TypeError(
+            "put() got an unexpected keyword argument 'attribution'"))
+        self.assertTrue(self._run(api, "put", None))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("attribution", calls[0])
+
+    def test_put_with_attribution_falls_back(self):
+        api, calls = self._old_api(db_mod.DbError(
+            "bad_args (400) : pending_spend.put : paramètre inconnu attribution"))
+        self.assertTrue(self._run(api, "put", {"source": "ima"}))
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("attribution", calls[1])
+
+    def test_begin_without_attribution_omits_the_parameter(self):
+        api, calls = self._old_api(TypeError(
+            "put() got an unexpected keyword argument 'attribution'"))
+        marker = self._run(api, "begin", None)
+        self.assertEqual(marker["agent"], "a")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("attribution", calls[0])
+
+    def test_begin_with_attribution_falls_back(self):
+        api, calls = self._old_api(db_mod.DbError(
+            "bad_args (400) : pending_spend.put : paramètre inconnu attribution"))
+        marker = self._run(api, "begin", {"source": "ima"})
+        self.assertEqual(marker["agent"], "a")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("attribution", calls[1])
+
+    def test_put_get_without_attribution_omits_the_parameter(self):
+        api, calls = self._old_api(TypeError(
+            "put_get() got an unexpected keyword argument 'attribution'"),
+            put_get=True)
+        marker = self._run(api, "begin", None)
+        self.assertEqual(marker["agent"], "a")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("attribution", calls[0])
+
+    def test_put_get_with_attribution_falls_back(self):
+        api, calls = self._old_api(db_mod.DbError(
+            "bad_args (400) : pending_spend.put_get : paramètre inconnu attribution"),
+            put_get=True)
+        marker = self._run(api, "begin", {"source": "ima"})
+        self.assertEqual(marker["agent"], "a")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("attribution", calls[1])
 
 
 if __name__ == "__main__":

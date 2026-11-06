@@ -199,6 +199,27 @@ def _clean_attribution(value: Any) -> dict | None:
     return dict(value)
 
 
+def _order_value(value: Any) -> tuple[int, Any]:
+    """A total order over attribution values, including partial attributions.
+
+    A group only carries the keys present in its rows: two groups of the same
+    cost and turn count may compare `"ima"` with `None`, or a text with a
+    number. Comparing the raw tuple raises `TypeError` and the whole report
+    becomes unavailable; rank the JSON types first so every pair compares.
+    """
+    if value is None or value == "":
+        return (0, "")
+    if isinstance(value, bool):
+        return (1, int(value))
+    if isinstance(value, (int, float)):
+        return (1, value)
+    if isinstance(value, str):
+        return (2, value)
+    # Unknown shapes (a hand-written jsonb row) still get a deterministic
+    # total order instead of breaking the report.
+    return (3, json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
+
+
 def report(rows: Iterable[Mapping], *, keys: Sequence[str] = DEFAULT_KEYS,
            until_ts: float | None = None, agent: str | None = None) -> dict:
     """Group ledger rows by attribution keys, keeping the unattributed part.
@@ -241,8 +262,9 @@ def report(rows: Iterable[Mapping], *, keys: Sequence[str] = DEFAULT_KEYS,
         entry = groups.setdefault(values, {"values": values, "turns": 0, "usd": 0.0})
         entry["turns"] += 1
         entry["usd"] += usd
-    ordered = sorted(groups.values(), key=lambda item: (-item["usd"], item["turns"],
-                                                        item["values"]))
+    ordered = sorted(groups.values(), key=lambda item: (
+        -item["usd"], item["turns"],
+        tuple(_order_value(value) for value in item["values"])))
     return {
         "schema": SCHEMA,
         "keys": list(keys),
