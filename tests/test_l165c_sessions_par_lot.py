@@ -312,6 +312,27 @@ class StockageTest(_Base):
         self.assertEqual([r["work_item_id"] for r in purges], [a])
         self.assertEqual(self.st.listing("rev3"), [])
 
+    def test_purge_d_un_lot_rendu_a_la_file_sans_assigne(self):
+        """#6012 (B auditeur) : un lot rendu à la file (`assignee` NULL) ne
+        porte plus la session ; la purge doit la supprimer — un
+        `NOT (NULL OR false)` resterait NULL et garderait la ligne."""
+        runner, lease = self.bail("rev7")
+        a = work.add(self.db, title="A", assignee="rev7", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="rev7", force=_FORCE)["id"]
+        epoch = lease["lease_epoch"]
+        cle = dict(harness="claude", account=None, cwd="/w")
+        storage.of(self.db).operations.set_session_work_item(
+            "rev7", runner.runner_id, epoch, str(a))
+        registry.set_session(self.db, "rev7", "sess-a", None,
+                             harness="claude", cwd="/w")
+        self.st.switch("rev7", runner.runner_id, epoch, to_lot=str(b),
+                       current="sess-a", **cle)
+        self.db.execute("UPDATE work_items SET assignee = NULL WHERE id = %s", (a,))
+        purges = self.st.purge()
+        self.assertEqual([r["work_item_id"] for r in purges], [a],
+                         "le lot rendu à la file ne porte plus sa session")
+        self.assertNotIn(a, [r["work_item_id"] for r in self.st.listing("rev7")])
+
     def test_bascule_fencee_par_le_bail(self):
         runner, lease = self.bail("a3")
         a = work.add(self.db, title="A", assignee="a3", force=_FORCE)["id"]
@@ -706,6 +727,32 @@ class RoutageTest(_Base):
             self.assertEqual(argv[argv.index("--resume") + 1], "sess-A",
                              "la session de relecture du lot est reprise")
             self.assertNotIn("dedicated to lot", " ".join(argv))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_session_de_relecture_geante_tourne_avant_reprise(self):
+        """#6012 : la borne de session géante reste en place. Après une
+        rotation forcée, le réveil suivant sur le même lot relu n'ouvre pas
+        `--resume` sur l'ancienne session : il part du résumé payé."""
+        worker = self._worker("rev6")
+        try:
+            a = self.lot_relu("A relu", "rev6", assignee="human:alice")
+            mail.settle_review_requests(self.db, "rev6", a)
+            mail.send(self.db, "orch", "rev6", "relis A", work_item_id=str(a))
+            with mock.patch.dict(os.environ, {
+                    "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+                    "AMEESH_SESSION_STORE_CHECK": "0",
+                    "AMEESH_TEST_NEW_SESSION": "sess-A",
+                    "AMEESH_TEST_RESULT": "RESUME-PAYE"}):
+                spec = worker.rotate_for_lot(worker.pick())
+                self.assertEqual(spec["lot"], str(a))
+                self.assertTrue(worker.run_turn(spec))
+                worker.rotation_forcee = "banc"
+                self.assertTrue(worker.maybe_rotate())
+            self.assertIsNone(registry.get(self.db, "rev6")["session_id"])
+            argv = self.tour(worker, a, "suite de A", session="sess-A2")
+            self.assertNotIn("--resume", argv)
+            self.assertIn("dedicated to lot #%d" % a, " ".join(argv))
         finally:
             worker.watchdog_stop.set()
 

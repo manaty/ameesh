@@ -42,12 +42,19 @@ def _holds_sql(agent: str, *, reviewers: bool) -> str:
 
     Schéma d'avant la migration 0456 (`reviewers` absente) : l'ancien champ
     `reviewer` seul fait foi, comme les autres lecteurs.
+
+    Les comparaisons sont `coalesce(…, false)` : un lot rendu à la file
+    (`assignee` NULL) ou un ancien `reviewer` NULL ne doit pas rendre le
+    prédicat NULL. Sans cela, `NOT (NULL OR false)` vaut NULL et la purge
+    garderait la session d'un lot que plus personne ne porte (B de la
+    relecture, 06/11).
     """
     if reviewers:
-        return ("(w.assignee = " + agent
-                + " OR coalesce(w.reviewers, '{}'::text[]) @> ARRAY["
+        return ("(coalesce(w.assignee = " + agent + ", false)"
+                " OR coalesce(w.reviewers, '{}'::text[]) @> ARRAY["
                 + agent + "]::text[])")
-    return "(w.assignee = " + agent + " OR w.reviewer = " + agent + ")"
+    return ("(coalesce(w.assignee = " + agent + ", false)"
+            " OR coalesce(w.reviewer = " + agent + ", false))")
 
 
 class LotSessions(interface.LotSessions):
