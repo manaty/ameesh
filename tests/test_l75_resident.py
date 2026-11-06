@@ -752,6 +752,31 @@ class CodexAppServerTest(DriverCase):
         self.assertEqual(result.compact["count"], 1)
         self.assertEqual(result.compact["quality"], "measured")
 
+    def test_compaction_resident_ne_saute_pas_un_appel_incomplet(self):
+        # #6044 B1 résident : un vrai appel dont l'entrée est illisible occupe
+        # la place juste après la compaction ; `post` reste inconnu et ne
+        # saute pas jusqu'à l'appel suivant.
+        driver = self.driver(env={"FAKE_CODEX_COMPACT": "4"})
+        driver.start()
+        result = self.wait(driver.send("hello", input_id="i"))
+        self.assertEqual(result.compact["pre"], 300)
+        self.assertIsNone(result.compact["post"])
+        self.assertEqual(result.compact["count"], 1)
+        self.assertEqual(result.compact["quality"], "partial")
+        self.assertIn("call_usage_unknown", result.compact["reasons"])
+
+    def test_compaction_resident_compte_la_seconde_apres_un_appel_incomplet(self):
+        # L'appel incomplet garde sa place : la seconde compaction est
+        # comptée, et la frontière inconnue laisse le bloc `partial`.
+        driver = self.driver(env={"FAKE_CODEX_COMPACT": "5"})
+        driver.start()
+        result = self.wait(driver.send("hello", input_id="i"))
+        self.assertEqual(result.compact["count"], 2)
+        self.assertEqual(result.compact["pre"], 300)
+        self.assertEqual(result.compact["post"], 120)
+        self.assertEqual(result.compact["quality"], "partial")
+        self.assertIn("call_usage_unknown", result.compact["reasons"])
+
     def test_steer_in_the_turn(self):
         driver = self.driver()
         driver.start()

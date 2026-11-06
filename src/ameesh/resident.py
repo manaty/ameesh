@@ -67,6 +67,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from . import __version__, acp, adapters, context_profile, harness_versions
+from .context_metrics import REASON_CALL_USAGE_UNKNOWN
 from .adapters import HarnessAdapter
 
 #: start of the harness up to an open session (hooks, MCP servers, login)
@@ -1284,13 +1285,13 @@ class CodexAppServer(ResidentDriver):
         #: number of the last `turn/start`: a late answer to an earlier one
         #: never overwrites the turn id (codex r1, #325)
         self._start_seq = 0
-        #: #6044 : une compaction déjà notée dans ce tour. L'item
-        #: `contextCompaction` et la notification dépréciée `thread/compacted`
-        #: peuvent décrire le même fait ; il ne compte qu'une fois.
-        self._compact_noted = False
-        #: #6044 : dernier contexte réellement mesuré du tour (jamais le 0 de
-        #: `_number` pour un champ absent) ; sert de « avant » à la compaction.
-        self._context_known: int | None = None
+        #: #6044 : contexte de chaque appel du tour, `None` si l'entrée est
+        #: illisible (un vrai appel garde sa place, une notification total
+        #: seul n'en est pas un). Sert de frontière `pre`/`post`.
+        self._usage_calls: list[int | None] = []
+        #: #6044 : positions des compactions, exprimées en nombre d'appels
+        #: déjà vus. Deux preuves du même fait tombent sur la même position.
+        self._compaction_positions: list[int] = []
         self._watch: threading.Thread | None = None
 
     @property
@@ -1394,8 +1395,8 @@ class CodexAppServer(ResidentDriver):
     def _begin(self, text: str, input_id: str) -> None:
         with self._lock:
             self._turn_id = None
-            self._compact_noted = False
-            self._context_known = None
+            self._usage_calls = []
+            self._compaction_positions = []
         self._turn_start(text)
 
     def _steer(self, turn: Turn, text: str, input_id: str,
@@ -1502,31 +1503,61 @@ class CodexAppServer(ResidentDriver):
         raise acp.AcpRpcError(-32601, "not supported by the ameesh resident client: %s"
                               % method)
 
+    def _refresh_compaction_locked(self) -> None:
+        """#6044 : reconstruit le bloc de compaction depuis les frontières.
+
+        Le verrou est tenu par l'appelant. `pre`/`post` sont les appels
+        **immédiatement** voisins de la frontière ; un voisin illisible les
+        laisse inconnus (jamais d'emprunt plus loin) et marque le bloc
+        `partial`. Le nombre de compactions est celui des positions retenues.
+        """
+        if not self._compaction_positions:
+            self._compact = None
+            return
+        pre_values: list[int] = []
+        reasons: list[str] = []
+        for position in self._compaction_positions:
+            if position <= 0:
+                continue
+            value = self._usage_calls[position - 1]
+            if value is None:
+                reasons.append(REASON_CALL_USAGE_UNKNOWN)
+            else:
+                pre_values.append(value)
+        last = self._compaction_positions[-1]
+        post: int | None = None
+        if last < len(self._usage_calls):
+            post = self._usage_calls[last]
+            if post is None:
+                reasons.append(REASON_CALL_USAGE_UNKNOWN)
+        self._compact = context_profile.compaction_from_parts(
+            max(pre_values) if pre_values else None, post,
+            count=len(self._compaction_positions),
+            extra_reasons=reasons).to_dict()
+
     def _note_compaction(self, turn_id: str | None = None) -> None:
         """#6044 : une compaction native **réussie** du fil principal.
 
         ``thread/compacted`` (déprécié) et l'item ``contextCompaction`` sont
         des notifications de réussite : Ameesh ne demande pas
-        ``thread/compact/start``. Le contexte d'avant est le dernier
-        ``tokenUsage.last`` connu ; le contexte d'après reste inconnu jusqu'au
-        premier usage qui suit — le contrat interdit d'inventer l'après. Deux
-        notifications du même fait ne comptent qu'une fois ; une notification
-        tardive d'un autre tour du même fil n'est pas attribuée à celui-ci.
+        ``thread/compact/start``. Une compaction est une **position** dans la
+        chronologie des appels : deux notifications du même fait tombent sur
+        la même position et ne comptent qu'une fois ; un vrai appel incomplet
+        entre deux compactions garde sa place, donc la suivante est bien
+        comptée et les frontières restent inconnues. Une notification tardive
+        d'un autre tour du même fil n'est pas attribuée à celui-ci.
         """
         with self._lock:
-            if self._turn is None or self._compact_noted:
+            if self._turn is None:
                 return
             if turn_id and self._turn_id and str(turn_id) != self._turn_id:
                 return
-            current = self._compact or {}
-            pre = current.get("pre")
-            if self._context_known is not None:
-                pre = self._context_known if pre is None \
-                    else max(int(pre), self._context_known)
-            count = int(current.get("count") or 0) + 1
-            self._compact = context_profile.compaction_from_parts(
-                pre, None, count=count).to_dict()
-            self._compact_noted = True
+            position = len(self._usage_calls)
+            if self._compaction_positions \
+                    and self._compaction_positions[-1] == position:
+                return  # seconde preuve de la même compaction
+            self._compaction_positions.append(position)
+            self._refresh_compaction_locked()
 
     def _on_notification(self, method: str, params: dict) -> None:
         raw = {"method": method, "params": params}
@@ -1564,32 +1595,31 @@ class CodexAppServer(ResidentDriver):
             parsed["display"] = ["[compaction] thread/compacted"]
         elif method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage") or {}
-            last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
+            raw_last = usage.get("last")
+            # #6044 : `last` présent = vrai appel, même si son entrée est
+            # illisible ; sans `last`, la notification ne porte qu'un total et
+            # n'occupe aucune position d'appel.
+            has_call = isinstance(raw_last, dict)
+            last = raw_last if has_call else {}
             call = {"input_tokens": _number(last.get("inputTokens")),
                     "cached_input_tokens": _number(last.get("cachedInputTokens")),
                     "output_tokens": _number(last.get("outputTokens"))}
-            # #6044 : un `last` sans entrée n'est pas un contexte mesuré ; le
-            # 0 de `_number` reste réservé au legacy.
-            known_input = _token_or_none(last.get("inputTokens"))
-            parsed["call_usage"] = call
+            observed = {"input_tokens": _token_or_none(last.get("inputTokens")),
+                        "cached_input_tokens": _token_or_none(
+                            last.get("cachedInputTokens")),
+                        "output_tokens": _token_or_none(last.get("outputTokens"))}
             parsed["usage"] = call
+            if has_call:
+                parsed["call_usage"] = observed
             # Codex counts the cache inside the input (`adapters.reread_tokens`)
             self._add_usage(max(call["input_tokens"] - call["cached_input_tokens"], 0),
                             call["cached_input_tokens"], 0, call["output_tokens"])
             total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
             with self._lock:
                 self._context = call["input_tokens"]
-                if known_input is not None:
-                    self._context_known = known_input
-                # #6044 : le premier usage qui suit une compaction est son
-                # « après » mesuré ; sans lui, l'après reste None (partial).
-                # Une notification total seul ne doit pas poser post=0.
-                if self._compact is not None and self._compact.get("post") is None \
-                        and known_input is not None:
-                    self._compact = context_profile.compaction_from_parts(
-                        self._compact.get("pre"), known_input,
-                        count=int(self._compact.get("count") or 1)).to_dict()
-                    self._compact_noted = False
+                if has_call:
+                    self._usage_calls.append(observed["input_tokens"])
+                    self._refresh_compaction_locked()
                 window = _number(usage.get("modelContextWindow"))
                 if window:
                     # legacy decision path, unchanged

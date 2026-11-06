@@ -343,7 +343,7 @@ class Codex:
         # Le mode `3` intercale une notification total seul (sans `last`) :
         # elle ne doit pas poser un `post=0` inventé.
         scenario = os.environ.get("FAKE_CODEX_COMPACT")
-        if scenario in ("1", "2", "3"):
+        if scenario in ("1", "2", "3", "4", "5"):
             self.notify("thread/compacted", {"turnId": turn["id"]})
             self.notify("item/completed", {"turnId": turn["id"], "item": {
                 "type": "contextCompaction", "id": "i3"}})
@@ -355,7 +355,22 @@ class Codex:
                         totalTokens=(self.tokens["inputTokens"]
                                      + self.tokens["outputTokens"])),
                     "modelContextWindow": 258400}})
-        if scenario in ("1", "3"):
+        if scenario in ("4", "5"):
+            # vrai appel dont l'entrée est illisible : il occupe la place
+            # juste après la compaction, sans devenir un `post` mesuré
+            self.notify("thread/tokenUsage/updated", {
+                "turnId": turn["id"], "tokenUsage": {
+                    "last": {"outputTokens": 5},
+                    "total": dict(self.tokens, reasoningOutputTokens=0,
+                                  totalTokens=(self.tokens["inputTokens"]
+                                               + self.tokens["outputTokens"])),
+                    "modelContextWindow": 258400}})
+        if scenario == "5":
+            # seconde compaction après l'appel incomplet
+            self.notify("thread/compacted", {"turnId": turn["id"]})
+            self.notify("item/completed", {"turnId": turn["id"], "item": {
+                "type": "contextCompaction", "id": "i4"}})
+        if scenario in ("1", "3", "4", "5"):
             after = {"inputTokens": 120, "cachedInputTokens": 20,
                      "outputTokens": 4, "reasoningOutputTokens": 0,
                      "totalTokens": 124}
