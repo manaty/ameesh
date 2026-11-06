@@ -2858,7 +2858,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             # chez le fournisseur avant de figer la pause, puis rejouer la
             # décision sur les relevés frais — même défaut que la pause au
             # seuil : sans tour, aucun relevé neuf n'est publié.
-            if withheld and not simulate:
+            if withheld and probe and not simulate:
                 refreshed = False
                 for p in items:
                     state = cache[p.name]

@@ -157,6 +157,7 @@ def merge(local, fresh, *, now: float) -> Gauges:
     sur l'union : une courte encore saturée reste un dépassement, une
     hebdomadaire remise à zéro ne l'est plus.
     """
+    fresh_overage = getattr(fresh, "overage", None)
     fresh = list(fresh or ())
     if not fresh:
         return local
@@ -167,7 +168,6 @@ def merge(local, fresh, *, now: float) -> Gauges:
         merged.append(replacement.get(gauge.key, gauge))
         seen.add(gauge.key)
     merged.extend(gauge for gauge in fresh if gauge.key not in seen)
-    fresh_overage = getattr(fresh, "overage", None)
     local_overage = getattr(local, "overage", None)
     capable = (fresh_overage.capable if fresh_overage is not None
                and fresh_overage.capable is not None

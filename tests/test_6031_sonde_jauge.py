@@ -114,6 +114,17 @@ class MergeTest(unittest.TestCase):
         # une courte encore saturée garde l'overage sur l'union
         self.assertTrue(merged.overage.in_use)
 
+    def test_provider_credit_capability_replaces_the_local_value(self):
+        for previous, current in ((True, False), (False, True)):
+            with self.subTest(previous=previous, current=current):
+                local = reading(1.0, read_at=NOW - 7200,
+                                overage=cost.Overage(previous, previous))
+                fresh = reading(1.0, read_at=NOW,
+                                overage=cost.Overage(current, current))
+                merged = gauge_probe.merge(local, fresh, now=NOW)
+                self.assertIs(merged.overage.capable, current)
+                self.assertIs(merged.overage.in_use, current)
+
     def test_a_cleared_weekly_no_longer_carries_the_overage(self):
         local = cost.Gauges([cost.Gauge("codex", "codex-10080min", 1.0,
                                         NOW + 3 * 86400, WEEK, read_at=NOW - 2 * 3600,
@@ -342,6 +353,21 @@ class WithheldTest(PgTestCase):
                                        path=home, declared=True,
                                        check_credentials=False)]
         self.book = _Book(self.db)
+
+    def test_probe_false_never_refreshes_a_withheld_reading(self):
+        now = time.time()
+        partial = cost.Gauges([
+            cost.Gauge("codex", "codex-300min", 1.0, now - 3600, 5 * 3600,
+                       read_at=now - 3 * 3600),
+            cost.Gauge("codex", "codex-10080min", 0.5, now + 1800, WEEK,
+                       read_at=now - 3 * 3600),
+        ])
+        with mock.patch.object(accounts, "gauges_of", return_value=partial), \
+                mock.patch.object(gauge_probe, "refresh") as refresh:
+            choice = accounts.choose(self.db, self.cfg.host, "codex", self.items,
+                                     self.book, now=now, cfg=self.cfg, probe=False)
+        self.assertIsNone(choice.profile)
+        refresh.assert_not_called()
 
     def test_a_stale_partial_reading_is_refreshed_then_placed(self):
         now = time.time()
