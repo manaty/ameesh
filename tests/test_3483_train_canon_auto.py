@@ -248,6 +248,10 @@ class AutomaticCanonTest(unittest.TestCase):
                     raw['train']['projects']['ameesh']['canon_commit'] = reviewed
                     with open(path, 'w') as out:
                         json.dump(raw, out)
+                # #6034: the reviewed requalification journals its move.
+                with train_requalify.journal(cfg, {'project': 'ameesh', 'pin': self.pin,
+                                                   'gate': reviewed}, actor='pilot', lot=1):
+                    pass
                 report = mock.Mock()
                 def refresh():
                     return train_assembly.reload((passage,),
