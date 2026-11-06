@@ -3003,9 +3003,13 @@ def _tests_summary(tests: list[TestRun]) -> str:
     # #4814 : une série arrêtée par sa borne n'a joué aucun de ses modules
     # jusqu'au bout ; le rapport ne les compte plus comme joués
     finished = {module for run in tests if run.finished for module in run.modules}
+    # #6042 : le compte des sautés est un compte de tests ; la liste qui le
+    # suivait est celle des modules des séries, pas celle des modules sautés
+    # (unittest -q ne nomme pas les tests sautés). Elle est donc nommée.
     return ("%d séries, %d modules dont %d joués jusqu'au bout, %d tests "
             "exécutés, %d échec(s), %d run(s) rouge(s) sans effet, "
-            "%d non concluant(s), %d sauté(s) : %s"
+            "%d non concluant(s), %d test(s) sauté(s) ; "
+            "modules des séries : %s"
             % (len(tests), len(modules), len(finished), total, red, ignored,
                inconclusive, skipped,
                ", ".join("`%s`" % module for module in modules) or "aucun"))
