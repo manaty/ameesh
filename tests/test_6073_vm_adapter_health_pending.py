@@ -75,12 +75,12 @@ class HealthPendingTest(PgTestCase):
     def test_75_keeps_returning_without_refusal(self):
         with FRESH:
             self.assertEqual(self.tick(), 'probe admitted')
-            admitted = self.q.probe_admitted(self.busy())
+            admitted = self.q.result_since(self.busy(), 'probe admitted')
             self.assertIsNotNone(admitted)
             for _ in range(3):
                 self.assertEqual(self.tick(), 'health pending')
                 self.assertEqual(self.control(), ('returning', False, 'burst-probe'))
-        self.assertEqual(self.q.probe_admitted(self.busy()), admitted)
+        self.assertEqual(self.q.result_since(self.busy(), 'probe admitted'), admitted)
         self.assertEqual(self.busy()['status'], 'pending')
         self.assertEqual(self.probe.call_count, 3)
         self.assertEqual(self.probe.call_args.kwargs, {'pending': True})
@@ -94,7 +94,7 @@ class HealthPendingTest(PgTestCase):
             self.assertEqual(self.tick(), 'health deadline passed')
             self.assertEqual(self.control(), ('draining', False, None))
             self.assertEqual(self.busy()['status'], 'pending')
-            self.assertIsNone(self.q.probe_admitted(self.busy()))
+            self.assertIsNone(self.q.result_since(self.busy(), 'probe admitted'))
             # The return is still due: a new admission restarts the deadline.
             self.assertEqual(self.tick(), 'probe admitted')
             self.assertEqual(self.tick(), 'health pending')

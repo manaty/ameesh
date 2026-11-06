@@ -369,7 +369,7 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
         if health == 'pending':
             # #6073: the probe turn is still running. Same closed return,
             # same probe, no refusal, until the enrolled deadline passes.
-            admitted = q.probe_admitted(request)
+            admitted = q.result_since(request, 'probe admitted')
             if admitted is not None and now - admitted <= policy['health_deadline_s']:
                 return 'health pending'
         if health is not True:

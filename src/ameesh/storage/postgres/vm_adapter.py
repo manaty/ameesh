@@ -55,13 +55,19 @@ class Queue:
             self.finish(request, 'pending', 'probe admitted')
         return admitted
 
-    def probe_admitted(self, request):
-        """#6073: epoch of this request's probe admission, or None."""
+    def result_since(self, request, result):
+        """#6073: epoch at which this pending request entered `result`, or None.
+
+        A phase deadline (`<phase>_deadline_s` in the enrollment) counts from
+        the `finish(request, 'pending', <phase marker>)` that opened it; any
+        later marker, a completion or a new generation/epoch (a new row)
+        ends it. Health uses 'probe admitted'."""
         rows = self.db.query(
             "SELECT extract(epoch FROM updated_at)::float8 AS ts FROM vm_adapter_requests "
             "WHERE host=%s AND generation=%s AND release_epoch=%s AND state=%s "
-            "AND status='pending' AND result='probe admitted'",
-            (request['host'], request['generation'], request['release_epoch'], request['state']))
+            "AND status='pending' AND result=%s",
+            (request['host'], request['generation'], request['release_epoch'],
+             request['state'], result))
         return rows[0]['ts'] if rows else None
 
     def refuse_probe(self, request):
