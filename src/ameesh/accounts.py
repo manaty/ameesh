@@ -156,7 +156,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Callable, NamedTuple
 
-from . import auth_failure, harnesses, platform, storage
+from . import auth_failure, gauge_probe, harnesses, platform, storage
 from .config import NAME_RE
 from .cost import PACE_CEILING, reading_outdated, stale_reading
 
@@ -1635,7 +1635,8 @@ def _release(profile: Profile, depasses, hard, now: float,
 
 def evaluate(book, profile: Profile, items: list[Profile], now: float,
              environ=None, *, record: bool = True, critical: bool = False,
-             reserve: bool = False, model=None) -> Evaluation:
+             reserve: bool = False, model=None, probe: bool = False,
+             _gauges=None) -> Evaluation:
     """Le compte est-il sous le seuil de la garde (0019) ? Ne lit aucun secret.
 
     `record=False` (simulation, L39) : l'historique des jauges n'est pas écrit.
@@ -1649,6 +1650,14 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     #1176 : le plafond de rythme est celui du compte (`pace_ceiling`), relevé
     en fin de fenêtre (`pace_ceiling_end`) quand `overage_impossible` le
     prouve ; le refus d'overage (`in_overage`) et ses règles sont inchangés.
+
+    `probe` (#6031) : quand la décision est réelle (`record`) et que la pause
+    repose sur un relevé daté de plus d'une heure, relit la jauge chez le
+    fournisseur sans tour (`gauge_probe.refresh`) et rejoue la décision sur ce
+    relevé frais. Faux par défaut : seuls l'exécuteur (via `choose`) et les
+    commandes qui le demandent relisent le fournisseur ; un affichage ne
+    déclenche aucune E/S réseau. `_gauges` est la relecture interne qui
+    n'ouvre pas une seconde sonde.
     """
     result = Evaluation(profile)
     result.problems = check(profile, environ)
@@ -1659,12 +1668,16 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         result.hard = bool(getattr(profile, "refused", ""))
         return result
     from .codex_gauges import AmbiguousCodexGauges
-    try:
-        result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
-    except AmbiguousCodexGauges as exc:
-        result.reason = str(exc)
-        result.hard = True
-        return result
+    if _gauges is not None:
+        result.gauges = _gauges
+    else:
+        try:
+            result.gauges = gauges_of(book, profile, items, environ, model=model,
+                                      now=now)
+        except AmbiguousCodexGauges as exc:
+            result.reason = str(exc)
+            result.hard = True
+            return result
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
@@ -1677,6 +1690,15 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         resets = [g.resets_at for g in spent if g.resets_at]
         # (none dated, or a reading without windows: no date, never a guess)
         result.until = max(resets) if resets and len(resets) == len(spent) else None
+        if probe and record:
+            fresh = gauge_probe.refresh(profile, result.gauges, environ=environ,
+                                        now=now)
+            if fresh is not None:
+                return evaluate(book, profile, items, now, environ, record=True,
+                                critical=critical, reserve=reserve, model=model,
+                                probe=False,
+                                _gauges=gauge_probe.merge(result.gauges, fresh,
+                                                          now=now))
         return result
     result.ceilings = pace_ceilings(profile, result.gauges, now)
     floors = underused_floors(profile, result.gauges, now)
@@ -1723,6 +1745,15 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
                                       RESERVE if reserve else 0.0, result.ceilings)
         if late is not None:
             result.held = (late.key, late.used)
+        if probe and record:
+            fresh = gauge_probe.refresh(profile, result.gauges, held=result.held[0],
+                                        environ=environ, now=now)
+            if fresh is not None:
+                return evaluate(book, profile, items, now, environ, record=True,
+                                critical=critical, reserve=reserve, model=model,
+                                probe=False,
+                                _gauges=gauge_probe.merge(result.gauges, fresh,
+                                                          now=now))
         return result
     if profile.hourly_usd > 0 and book.db is not None:
         spent = book.spent("all", 3600, account=profile.name, harnesses=[profile.harness])
@@ -1936,10 +1967,38 @@ _PAUSE_NATURE = re.compile(
 #: #4781 : l'échéance absolue de `pause_label`, sur le préambule seul
 _PAUSE_DEADLINE = re.compile(r"\bpause \(account (?:\(default\)|[^,)]+)[^)]*\) until [^;@]+@(\d+);")
 
+#: #6031 : le compte que nomme le préambule d'une pause (`pause_label`), pour
+#: retrouver le relevé qui la fonde dans l'historique des jauges. Le marqueur
+#: d'un agent critique (`critical agent: `) précède le préambule.
+_PAUSE_ACCOUNT = re.compile(
+    r"^(?:critical agent: )?pause \(account (?P<compte>\(default\)|[^,)]+)")
+
 #: #2934 : les mesures continues d'une raison sans ce préambule (plafond du
 #: mesh ou du compte payé au token, solde d'API). Elles changent à chaque
 #: contrôle sans que la pause change de nature.
 _PAUSE_MEASURE = re.compile(r"\d+(?:[.,]\d+)?\s*(?:%|\$|€|USD\b|EUR\b)")
+
+
+def pause_account(reason: str) -> str | None:
+    """Le compte nommé par une raison de pause, ou None (#6031).
+
+    Sert à retrouver le relevé qui fonde `budget_pause_long` : une pause peut
+    durer parce qu'elle repose sur un relevé ancien, et l'alerte doit en dire
+    l'âge. Le nom est rendu tel qu'affiché (`(default)` compris), sans jamais
+    exposer de secret.
+    """
+    found = _PAUSE_ACCOUNT.match(str(reason or "").strip())
+    return found.group("compte") if found else None
+
+
+def pause_gauge(reason: str) -> str | None:
+    """La fenêtre que nomme une raison de pause (`pause_label`), ou None."""
+    text = str(reason or "").strip()
+    mark = "critical agent: "
+    if text.startswith(mark):
+        text = text[len(mark):]
+    found = _PAUSE_NATURE.match(text)
+    return found.group("fenetre") if found else None
 
 
 def pause_nature(reason: str) -> str:
@@ -2475,7 +2534,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
            paced: bool = True, critical: bool = False, margin: bool = False,
-           model: str = "", cfg=None) -> Choice:
+           model: str = "", cfg=None, probe: bool = False) -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     `session_account` : le compte sous lequel tourne la session en cours de
@@ -2519,6 +2578,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     seaux propres (widget omarchy) comptent pour lui seul. Défaut `''` :
     modèle inconnu, les seaux de modèle sont écartés — jamais attribués au
     hasard ; l'appelant qui connaît le modèle de l'agent le passe.
+
+    `probe` (#6031) : relit la jauge chez le fournisseur (sans tour) quand une
+    pause repose sur un relevé de plus d'une heure, puis rejoue la décision.
+    Faux par défaut : seuls l'exécuteur (`account_turn.choose`/`fallback`) et
+    un test explicite l'activent ; une simulation (L39) ne sonde jamais.
     """
     now = time.time() if now is None else now
     # #2580 : le refus d'un compte partagé avec un autre mesh est appliqué à
@@ -2545,7 +2609,12 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             cache[profile.name] = evaluate(book, profile, items, now, environ,
                                            record=not simulate,
                                            reserve=margin or not critical,
-                                           model=model)
+                                           model=model,
+                                           # #6031 : le fournisseur n'est relu
+                                           # que par une décision réelle, pas
+                                           # par une simulation (L39) ni par un
+                                           # affichage ou un test.
+                                           probe=probe and not simulate)
         return cache[profile.name]
 
     active_name = row.get("account")
@@ -2718,7 +2787,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 if profile.default and profile.cap is None:
                     relaxed[profile.name] = evaluate(book, profile, items, now, environ,
                                                      record=False, critical=True,
-                                                     reserve=margin)
+                                                     reserve=margin, probe=False)
             # le rythme tient ici même garde désactivée (#324 r1)
             ranked = rank(candidates, relaxed, now)
             if ranked:
@@ -2783,6 +2852,31 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 why = ("%sno %s account to place: reading older than every open "
                        "window (%s) — %s" % (pause_label(cache), harness,
                                              ", ".join(withheld), _label(cache)))
+            # #6031 : un relevé partiel trop ancien pour engager un tour
+            # (#1672) retient le compte sans que `evaluate` ait une raison de
+            # pause (la fenêtre ouverte est sous son plafond). Relire la jauge
+            # chez le fournisseur avant de figer la pause, puis rejouer la
+            # décision sur les relevés frais — même défaut que la pause au
+            # seuil : sans tour, aucun relevé neuf n'est publié.
+            if withheld and not simulate:
+                refreshed = False
+                for p in items:
+                    state = cache[p.name]
+                    if p.name in sick or not state.gauges \
+                            or not reading_outdated(state.gauges, now):
+                        continue
+                    fresh = gauge_probe.refresh(p, state.gauges, environ=environ,
+                                                now=now)
+                    if fresh is None:
+                        continue
+                    cache[p.name] = evaluate(
+                        book, p, items, now, environ, record=True,
+                        critical=critical, reserve=margin or not critical,
+                        model=model, probe=False,
+                        _gauges=gauge_probe.merge(state.gauges, fresh, now=now))
+                    refreshed = True
+                if refreshed:
+                    return decide(retenus, conflits, sick)
             return Choice(None, active, reason=why)
         target = ranked[0]
         why = reason_of(ranked, cache, now)

@@ -69,7 +69,8 @@ def session_model(worker, book) -> str:
     return (getattr(worker, "agent", None) or {}).get("model") or book.model_of(worker.name)
 
 
-def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None) -> str | None:
+def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None,
+           probe: bool = False) -> str | None:
     """Choisit le compte du prochain tour. None : aucun compte déclaré.
 
     Rend '' quand un compte est retenu (posé dans `worker._account`), la raison
@@ -80,6 +81,10 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
 
     `margin` (L242b) : la réserve des non-critiques sous le rythme ; par
     défaut, pour un non-critique seulement (`accounts.choose`).
+
+    `probe` (#6031) : relit la jauge Codex chez le fournisseur si la pause
+    repose sur un relevé de plus d'une heure. Réservé à l'exécuteur (garde de
+    budget) : une simulation, un affichage ou un test ne sonde pas le réseau.
     """
     harness = own_harness(worker)        # L242b (3) : toujours le sien d'abord
     try:
@@ -106,7 +111,7 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
                                  model=session_model(worker, book),
                                  # #2580 : politique et registre des comptes
                                  # partagés de l'hôte
-                                 cfg=worker.cfg)
+                                 cfg=worker.cfg, probe=probe)
     except db_mod.Unavailable:
         # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
         # de migration — l'exécuteur suspend les tours et réessaie, avec son
@@ -144,12 +149,15 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
     return ""
 
 
-def fallback(worker, reason: str, limits=None) -> str:
+def fallback(worker, reason: str, limits=None, *, probe: bool = False) -> str:
     """L242b (3) : un agent critique en pause budget sur son harnais tourne
     sous un autre, dans l'ordre de `critical_fallback_harnesses` (Codex au
     forfait, puis DeepSeek à clé d'API). Le premier qui a de la marge est
     retenu (`worker._borrowed = (harnais, compte ou None)`, `worker._account`)
     et '' est rendu ; sinon `reason`, inchangée.
+
+    `probe` (#6031) : même relecture de jauge que `choose`, réservée à la
+    décision réelle de l'exécuteur.
 
     Un harnais retenu doit être installé (`adapters.adapter_for`), avoir un
     compte sous son seuil (choix propre à l'agent, `critical=True` ; sans
@@ -181,7 +189,7 @@ def fallback(worker, reason: str, limits=None) -> str:
                     # #1580 (tranche 3) : sous un harnais emprunté, le tour
                     # part sans modèle (runner) : modèle inconnu, les seaux
                     # de modèle sont écartés
-                    model="", cfg=worker.cfg)
+                    model="", cfg=worker.cfg, probe=probe)
                 if choice.profile is None or choice.auth_blocked:
                     continue
                 profile = choice.profile
