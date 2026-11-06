@@ -233,9 +233,21 @@ class MeshCliTest(PgTestCase):
         self.assertEqual(rows[0]["state"], "intake")
         self.assertEqual(rows[0]["assignee"], AGENT)
 
+        # #5993 : entrer en qa par la commande exige un gel postérieur au
+        # dernier passage en build ; ce parcours de la machine à états n'a pas
+        # de dépôt, le jalon est posé directement (même fixture que les autres
+        # témoins de gel).
+        def freeze():
+            self.db.execute(
+                "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+                " VALUES (1, 'frozen', %s, 'orchestrateur')", ("a" * 40,))
+
         for state in ("build", "qa", "build", "qa", "build"):
+            if state == "qa":
+                freeze()
             proc = self.mesh("work", "move", "1", state, "--actor", AGENT)
             self.assertEqual(proc.returncode, 0, proc.stderr)
+        freeze()
         proc = self.mesh("work", "move", "1", "qa")
         self.assertEqual(proc.returncode, 0)
         proc = self.mesh("work", "move", "1", "build")  # 3e retour : refusé

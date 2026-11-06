@@ -557,7 +557,10 @@ class SessionTest(unittest.TestCase):
         # non pinné) ; la garde des commandes historiques le lit dans
         # l'élément, sans SELECT brut — interdit sur une connexion médiée.
         lot = {"id": 812, "project": "site", "title": "Page d'accueil", "state": "build",
-               "assignee": "inge-front", "loops": 0, "workflow_ref": ""}
+               "assignee": "inge-front", "loops": 0, "workflow_ref": "",
+               # #5993 : `work move … qa` exige un gel ; la tête gelée voyage
+               # avec `work.get` (le contrat médié n'a pas d'op dédiée).
+               "frozen_sha": "a" * 40}
         self.responder.script["work.get"] = lot
         self.responder.script["work.move"] = dict(lot, state="qa")
         self.responder.script["work.note"] = None

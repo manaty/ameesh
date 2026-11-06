@@ -30,6 +30,11 @@ class ReviewerFamilyWarningTest(PgTestCase):
     def _qa(self, lot, *args):
         proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # #5993 : `work move … qa` exige un gel déclaré ; la désignation
+        # manuelle se juge sur un lot déjà en revue.
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'frozen', %s, 'chef')", (lot["id"], "a" * 40))
         return self.mesh("work", "move", str(lot["id"]), "qa", *args,
                          "--actor", "chef", env=self._env())
 
