@@ -10,6 +10,11 @@ identities and health/reconciliation commands. Runners only call `request`.
 pending, and 1 when the request is refused. A queued request is a wait: the
 scanner keeps the previous acknowledged state and closed claims, and the
 worker journals the completion under the same generation/epoch.
+
+#6073: the health command answers the same three ways. 0 is healthy, 75 is
+a probe turn still in flight (the host stays `returning`, same probe), any
+other code is a failure. The wait is bounded by `health_deadline_s` counted
+from the probe admission; past it the return goes back to `draining`.
 """
 from __future__ import annotations
 
@@ -60,6 +65,12 @@ def enrollment(value, *, local_host=None):
             raise Refused('positive adapter timing required')
     if value['io_timeout_s'] > 10:
         raise Refused('external call timeout exceeds 10 seconds')
+    # #6073: explicit bound on a health turn still in flight (75), counted
+    # from the probe admission; a probe turn waits up to 300 s for its mail.
+    bound = value.get('health_deadline_s')
+    if (isinstance(bound, bool) or not isinstance(bound, (float, int)) or not math.isfinite(bound)
+            or not value['io_timeout_s'] < bound <= 3600):
+        raise Refused('explicit health deadline required (at most 3600 seconds)')
     delay = value.setdefault('wake_delay_s', 900)  # study #5900 §7, 05/11/2026
     if isinstance(delay, bool) or not isinstance(delay, (float, int)) or not math.isfinite(delay) or delay <= 0:
         raise Refused('invalid wake delay')
@@ -145,13 +156,17 @@ class Scaleway:
         self._call(target, action)
 
 
-def run_probe(argv, timeout):
+def run_probe(argv, timeout, *, pending=False):
+    """True on 0; with `pending`, 'pending' on 75 (#6073); False otherwise."""
     try:
-        return subprocess.run(argv, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'},
+        code = subprocess.run(argv, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'},
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=timeout).returncode == 0
+                              stderr=subprocess.DEVNULL, timeout=timeout).returncode
     except (OSError, subprocess.SubprocessError):
         return False
+    if pending and code == host_release.ADAPTER_WAIT_CODE:
+        return 'pending'
+    return code == 0
 
 
 def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, target):
@@ -249,7 +264,8 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
     # outside our transaction, then revalidate generation, provider and fresh
     # reading under the gate before acknowledging. No probe opens claims.
     prepared = Queue(db).pending(host)
-    health_ok = reconciliation_ok = probed = False
+    health = None
+    reconciliation_ok = probed = False
     # #6017: the probe runs only once the closed return admits its identity.
     if (prepared and prepared[0]['state'] == 'busy' and current(control, prepared[0])
             and control['mode'] == 'returning'
@@ -259,8 +275,8 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             and host_release._fresh_reading(cfg, db, host, now=Queue(db).now(),
                                             after=control['requested_ts'])):
         probed = True
-        health_ok = probe(target['health_argv'], policy['io_timeout_s'])
-        if health_ok:
+        health = probe(target['health_argv'], policy['io_timeout_s'], pending=True)
+        if health is True:
             reconciliation_ok = probe(target['reconcile_argv'], policy['io_timeout_s'])
     # A transaction-scoped adapter lock makes duplicate worker invocations
     # harmless; the native gate serializes effects with claims and drains.
@@ -350,11 +366,17 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
         if (not prepared or prepared[0]['generation'] != request['generation']
                 or prepared[0]['release_epoch'] != request['release_epoch'] or not probed):
             return 'health pending'
-        if not health_ok:
+        if health == 'pending':
+            # #6073: the probe turn is still running. Same closed return,
+            # same probe, no refusal, until the enrolled deadline passes.
+            admitted = q.result_since(request, 'probe admitted')
+            if admitted is not None and now - admitted <= policy['health_deadline_s']:
+                return 'health pending'
+        if health is not True:
             # Back to draining, probe cleared, never lost: the next tick
             # admits it again while the return is still due.
             q.refuse_probe(request)
-            return 'health failed'
+            return 'health deadline passed' if health == 'pending' else 'health failed'
         if not reconciliation_ok:
             return 'reconciliation pending'
         # Probes cannot substitute for a database reading or reopen claims.

@@ -104,7 +104,15 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    `probe_agent` nomme la seule persona de l'hôte que `health_argv` fait
    tourner (#6017) : au réveil, l'adaptateur passe l'hôte en `returning`
    prises fermées et n'admet qu'elle ; un échec de santé le remet en
-   `draining`, sans lost.
+   `draining`, sans lost. Un tour de sonde dure plus qu'un appel borné
+   (jusqu'à 300 s pour le courrier) : `health_argv` rend `75`
+   (`EX_TEMPFAIL`) tant que le reçu strict de ce tour, lié à la génération,
+   à l'époque et à `probe_agent`, n'est pas complet (#6073). L'hôte reste
+   alors `returning`, même sonde, sans refus, jusqu'à `health_deadline_s`
+   (explicite, au plus 3600 s, compté depuis l'admission de la sonde) ;
+   au-delà, retour en `draining` comme un échec. Le wrapper opérateur lance
+   la sonde **une seule fois**, en asynchrone, et ne rend jamais `0` sur une
+   livraison seule ni sur une preuve ancienne ; tout autre code est un échec.
 6. Faire relire les mappings, les trois commandes, les durées, les créneaux,
    les permissions des fichiers et l'unité avec `systemd-analyze verify`.
    Tester le cycle cloud simulé avant tout feu réel. Faire valider séparément
