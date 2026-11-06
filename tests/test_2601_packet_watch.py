@@ -170,6 +170,53 @@ class Check(unittest.TestCase):
         self.assertEqual(self.run_check(at(4, 25), state)["result"], "alerted")
 
 
+    def test_fresh_ready_lot_waits_for_the_hourly_composer(self):
+        """#6062 : prêt 3 min avant le contrôle → silence ; 20 min → alerte."""
+        state = {}
+        result = self.run_check(at(4, 20), state, since=lambda ids: {2601: at(4, 17)})
+        self.assertEqual(result["result"], "fresh")
+        self.assertEqual(result["fresh"], {2601: at(4, 17)})
+        self.assertEqual(self.sent, [])
+        self.assertNotIn("last_alert_slot", state.get("projects", {}).get("ameesh", {}))
+        # toujours servi par personne au passage suivant : le lot n'est plus frais
+        result = self.run_check(at(4, 40), state, since=lambda ids: {2601: at(4, 17)})
+        self.assertEqual(result["result"], "alerted")
+        self.assertEqual(self.run_check(at(5, 20), {}, since=lambda ids: {2601: at(5, 0)})
+                         ["result"], "alerted")
+
+    def test_one_stale_lot_is_enough_and_unknown_or_unreadable_counts_as_stale(self):
+        both = (2601, 2602)
+        result = self.run_check(at(4, 20), {}, ready=both,
+                                since=lambda ids: {2601: at(4, 17), 2602: at(3, 50)})
+        self.assertEqual(result["result"], "alerted")
+        self.assertEqual(result["fresh"], {2601: at(4, 17)})
+        self.assertEqual(self.run_check(at(4, 20), {}, ready=both,
+                                        since=lambda ids: {2601: at(4, 17)})["result"],
+                         "alerted")
+
+        def unreadable(_ids):
+            raise RuntimeError("db down")
+        result = self.run_check(at(4, 20), {}, since=unreadable)
+        self.assertEqual(result["result"], "alerted")
+        self.assertIn("db down", result["ready_since_error"])
+
+    def test_ready_since_takes_the_latest_transition_or_ready_mark(self):
+        progress = mock.Mock()
+        progress.lot_transitions.return_value = [
+            {"work_item_id": 2601, "state": "qa", "created_ts": 100.0},
+            {"work_item_id": 2602, "state": "validated", "created_ts": 50.0}]
+        progress.lot_milestones.return_value = [
+            {"work_item_id": 2601, "kind": "verdict", "at_ts": 90.0},
+            {"work_item_id": 2602, "kind": "frozen", "at_ts": 70.0},
+            {"work_item_id": 2602, "kind": "closed", "at_ts": 500.0},
+            {"work_item_id": 2603, "kind": "frozen", "at_ts": 900.0}]
+        with mock.patch.object(packet_watch.storage, "of",
+                               return_value=mock.Mock(progress=progress)):
+            self.assertEqual(packet_watch.ready_since(object(), [2601, 2602]),
+                             {2601: 100.0, 2602: 70.0})
+        self.assertEqual(packet_watch.ready_since(None, [2601]), {})
+
+
 class Carriers(unittest.TestCase):
     def test_open_and_recent_carriers_of_the_project(self):
         now = at(4, 20)
