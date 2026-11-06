@@ -41,6 +41,18 @@ class _Base(PgTestCase):
                             "  FROM agent_registry WHERE name = %s", (name,))[0]
         return (row["session_harness"], row["session_cwd"], row["session_origin"])
 
+    def lot_relu(self, title: str, reviewer: str, *, assignee: str) -> int:
+        """#6012 : un lot en `qa` porté par `assignee` et relu par `reviewer`.
+
+        Le relecteur est désigné par un humain ; la demande de relecture est
+        déposée chez lui comme en production."""
+        lot = work.add(self.db, title=title, assignee=assignee, force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        work.move(self.db, lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, lot, reviewer,
+                                actor="human:alice")
+        return lot
+
     @property
     def st(self):
         return storage.of(self.db).lot_sessions
@@ -225,6 +237,101 @@ class StockageTest(_Base):
                 self.assertIsNone(out["parked"])
                 lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("a7")}
                 self.assertIsNone(lignes.get(a))
+
+    def test_session_de_relecture_parquee_puis_reprise(self):
+        """#6012 : la session d'un lot RELU, non assigné à l'agent, est mise de
+        côté à la bascule et reprise au réveil sur le même lot — le relecteur
+        n'a pas besoin d'être l'assigné pour que son contexte survive."""
+        runner, lease = self.bail("rev1")
+        self.bail("auteur1")
+        a = self.lot_relu("A", "rev1", assignee="auteur1")
+        b = work.add(self.db, title="B", assignee="rev1", force=_FORCE)["id"]
+        epoch = lease["lease_epoch"]
+        cle = dict(harness="claude", account="compte", cwd="/w")
+        storage.of(self.db).operations.set_session_work_item(
+            "rev1", runner.runner_id, epoch, str(a))
+        registry.set_session(self.db, "rev1", "sess-rev", "compte",
+                             harness="claude", cwd="/w")
+        out = self.st.switch("rev1", runner.runner_id, epoch, to_lot=str(b),
+                             current="sess-rev", **cle)
+        self.assertEqual(out["parked"], "sess-rev",
+                         "la session de relecture est gardée pour son lot")
+        self.assertEqual(registry.get(self.db, "rev1")["session_work_item"], str(b))
+        out = self.st.switch("rev1", runner.runner_id, epoch, to_lot=str(a),
+                             current=None, **cle)
+        self.assertEqual((out["resumed"], out["discarded"]), ("sess-rev", None))
+        self.assertEqual((registry.get(self.db, "rev1")["session_id"],
+                          registry.get(self.db, "rev1")["session_work_item"]),
+                         ("sess-rev", str(a)))
+
+    def test_relecteur_ecarte_ne_reprend_pas_sa_session(self):
+        """#6012 : un siège de relecture retiré (§2, relecteur exclu après
+        correction) ne porte plus le lot : la session mise de côté est
+        écartée, jamais reprise."""
+        runner, lease = self.bail("rev2")
+        self.bail("auteur2")
+        a = self.lot_relu("A", "rev2", assignee="auteur2")
+        b = work.add(self.db, title="B", assignee="rev2", force=_FORCE)["id"]
+        epoch = lease["lease_epoch"]
+        cle = dict(harness="claude", account=None, cwd="/w")
+        storage.of(self.db).operations.set_session_work_item(
+            "rev2", runner.runner_id, epoch, str(a))
+        registry.set_session(self.db, "rev2", "sess-rev", None,
+                             harness="claude", cwd="/w")
+        self.assertEqual(self.st.switch("rev2", runner.runner_id, epoch,
+                                        to_lot=str(b), current="sess-rev",
+                                        **cle)["parked"], "sess-rev")
+        work.designate_reviewer(self.cfg, self.db, a, "rev2",
+                                actor="human:alice", remove=True)
+        out = self.st.switch("rev2", runner.runner_id, epoch, to_lot=str(a),
+                             current=None, **cle)
+        self.assertEqual((out["resumed"], out["discarded"], out["discard_reason"]),
+                         (None, "sess-rev", "lot"))
+        self.assertIsNone(registry.get(self.db, "rev2")["session_id"])
+
+    def test_purge_garde_la_session_d_un_relecteur_designe(self):
+        """#6012 : la purge périodique ne jette pas la session d'un lot relu
+        tant que le siège est désigné ; elle la jette quand il est retiré."""
+        runner, lease = self.bail("rev3")
+        self.bail("auteur3")
+        a = self.lot_relu("A", "rev3", assignee="auteur3")
+        b = work.add(self.db, title="B", assignee="rev3", force=_FORCE)["id"]
+        epoch = lease["lease_epoch"]
+        cle = dict(harness="claude", account=None, cwd="/w")
+        storage.of(self.db).operations.set_session_work_item(
+            "rev3", runner.runner_id, epoch, str(a))
+        registry.set_session(self.db, "rev3", "sess-rev", None,
+                             harness="claude", cwd="/w")
+        self.st.switch("rev3", runner.runner_id, epoch, to_lot=str(b),
+                       current="sess-rev", **cle)
+        self.assertEqual(self.st.purge(), [],
+                         "un lot relu par l'agent reste porté")
+        work.designate_reviewer(self.cfg, self.db, a, "rev3",
+                                actor="human:alice", remove=True)
+        purges = self.st.purge()
+        self.assertEqual([r["work_item_id"] for r in purges], [a])
+        self.assertEqual(self.st.listing("rev3"), [])
+
+    def test_purge_d_un_lot_rendu_a_la_file_sans_assigne(self):
+        """#6012 (B auditeur) : un lot rendu à la file (`assignee` NULL) ne
+        porte plus la session ; la purge doit la supprimer — un
+        `NOT (NULL OR false)` resterait NULL et garderait la ligne."""
+        runner, lease = self.bail("rev7")
+        a = work.add(self.db, title="A", assignee="rev7", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="rev7", force=_FORCE)["id"]
+        epoch = lease["lease_epoch"]
+        cle = dict(harness="claude", account=None, cwd="/w")
+        storage.of(self.db).operations.set_session_work_item(
+            "rev7", runner.runner_id, epoch, str(a))
+        registry.set_session(self.db, "rev7", "sess-a", None,
+                             harness="claude", cwd="/w")
+        self.st.switch("rev7", runner.runner_id, epoch, to_lot=str(b),
+                       current="sess-a", **cle)
+        self.db.execute("UPDATE work_items SET assignee = NULL WHERE id = %s", (a,))
+        purges = self.st.purge()
+        self.assertEqual([r["work_item_id"] for r in purges], [a],
+                         "le lot rendu à la file ne porte plus sa session")
+        self.assertNotIn(a, [r["work_item_id"] for r in self.st.listing("rev7")])
 
     def test_bascule_fencee_par_le_bail(self):
         runner, lease = self.bail("a3")
@@ -596,6 +703,75 @@ class RoutageTest(_Base):
             self.assertEqual(argv[argv.index("--resume") + 1], "sess-B")
             lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("w1")}
             self.assertEqual(lignes, {a: "sess-A", b: None})
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_reveil_sur_le_meme_lot_relu_reprend_la_session(self):
+        """#6012 : au réveil sur le MÊME lot relu (nouveau gel), le relecteur
+        reprend sa session de relecture — même après un tour sur un autre lot,
+        qui la met de côté au lieu de la perdre."""
+        worker = self._worker("rev4")
+        try:
+            a = self.lot_relu("A relu", "rev4", assignee="human:alice")
+            b = work.add(self.db, title="B", assignee="rev4", force=_FORCE)["id"]
+            # la demande de relecture de la désignation est réglée : le tour
+            # de banc choisit le lot de SON message, sans ambiguïté de boîte.
+            mail.settle_review_requests(self.db, "rev4", a)
+            argv = self.tour(worker, a, "relis A", session="sess-A")
+            self.assertNotIn("--resume", argv)
+            self.assertEqual(registry.get(self.db, "rev4")["session_id"], "sess-A")
+            argv = self.tour(worker, b, "travaille B", session="sess-B")
+            self.assertNotIn("--resume", argv)
+            self.assertEqual(registry.get(self.db, "rev4")["session_work_item"], str(b))
+            argv = self.tour(worker, a, "nouveau gel sur A", session="sess-A2")
+            self.assertEqual(argv[argv.index("--resume") + 1], "sess-A",
+                             "la session de relecture du lot est reprise")
+            self.assertNotIn("dedicated to lot", " ".join(argv))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_session_de_relecture_geante_tourne_avant_reprise(self):
+        """#6012 : la borne de session géante reste en place. Après une
+        rotation forcée, le réveil suivant sur le même lot relu n'ouvre pas
+        `--resume` sur l'ancienne session : il part du résumé payé."""
+        worker = self._worker("rev6")
+        try:
+            a = self.lot_relu("A relu", "rev6", assignee="human:alice")
+            mail.settle_review_requests(self.db, "rev6", a)
+            mail.send(self.db, "orch", "rev6", "relis A", work_item_id=str(a))
+            with mock.patch.dict(os.environ, {
+                    "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+                    "AMEESH_SESSION_STORE_CHECK": "0",
+                    "AMEESH_TEST_NEW_SESSION": "sess-A",
+                    "AMEESH_TEST_RESULT": "RESUME-PAYE"}):
+                spec = worker.rotate_for_lot(worker.pick())
+                self.assertEqual(spec["lot"], str(a))
+                self.assertTrue(worker.run_turn(spec))
+                worker.rotation_forcee = "banc"
+                self.assertTrue(worker.maybe_rotate())
+            self.assertIsNone(registry.get(self.db, "rev6")["session_id"])
+            argv = self.tour(worker, a, "suite de A", session="sess-A2")
+            self.assertNotIn("--resume", argv)
+            self.assertIn("dedicated to lot #%d" % a, " ".join(argv))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_un_autre_lot_relu_ouvre_une_session_neuve(self):
+        """#6012 : un lot DIFFÉRENT garde l'indépendance entre relectures —
+        sa session est neuve, jamais celle du lot relu précédent."""
+        worker = self._worker("rev5")
+        try:
+            a = self.lot_relu("A relu", "rev5", assignee="human:alice")
+            c = self.lot_relu("C relu", "rev5", assignee="human:alice")
+            mail.settle_review_requests(self.db, "rev5", a)
+            mail.settle_review_requests(self.db, "rev5", c)
+            argv = self.tour(worker, a, "relis A", session="sess-A")
+            self.assertNotIn("--resume", argv)
+            argv = self.tour(worker, c, "relis C", session="sess-C")
+            self.assertNotIn("--resume", argv)
+            self.assertIn("dedicated to lot #%d" % c, " ".join(argv))
+            argv = self.tour(worker, a, "retour sur A")
+            self.assertEqual(argv[argv.index("--resume") + 1], "sess-A")
         finally:
             worker.watchdog_stop.set()
 
