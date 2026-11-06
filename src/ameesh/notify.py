@@ -248,8 +248,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # mesh ou sur une autre base configurée de l'hôte
                  "migration_pending_non_additive",
                  "host_migration_pending_non_additive",
-                 # #532: a local PgBouncer pool queues its mesh clients
-                 "pgbouncer_pool_waiting")
+                 # #532/#6054: a local PgBouncer pool queues its clients or
+                 # reaches its server-session ceiling
+                 "pgbouncer_pool_waiting", "pgbouncer_pool_at_ceiling")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack", "app", "nexlink")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -299,6 +300,7 @@ TYPE_LABELS = {
     "host_migration_pending_non_additive": (
         "non-additive migration waiting on a host base"),
     "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
+    "pgbouncer_pool_at_ceiling": "local PgBouncer pool at server-session ceiling",
     "pgbouncer_console_unreadable": "local PgBouncer console unreadable",
     "stopped_with_mail": "agent stopped with mail",
     "orphan_lot": "orphan {work}",
@@ -455,6 +457,7 @@ URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "orphan_lot", "dead_runne
                 "account_config_invalid",
                 "owner_key_registered",
                 "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting",
+                "pgbouncer_pool_at_ceiling",
                 "host_network_overlap")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
@@ -468,12 +471,14 @@ QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
 #: #5692 : la base secondaire d'un hôte n'est lisible que sur cet hôte ; son
 #: alerte est locale comme la console du pool (#532), jamais résolue par la
 #: passe ordinaire d'un autre hôte qui ne voit pas ce fichier.
-LOCAL_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_console_unreadable",
+LOCAL_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_pool_at_ceiling",
+               "pgbouncer_console_unreadable",
                "host_migration_pending_non_additive")
-#: #5692 : les deux types d'une même source (la console du pool), pour ne
-#: retenir que la source qui n'a pas conclu — une base secondaire illisible ne
-#: doit pas figer une alerte de console qui, elle, a été observée et résolue.
-PGBOUNCER_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_console_unreadable")
+#: #5692 : les types d'une même source (la console du pool), pour ne retenir
+#: que la source qui n'a pas conclu — une base secondaire illisible ne doit pas
+#: figer une alerte de console qui, elle, a été observée et résolue.
+PGBOUNCER_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_pool_at_ceiling",
+                   "pgbouncer_console_unreadable")
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")

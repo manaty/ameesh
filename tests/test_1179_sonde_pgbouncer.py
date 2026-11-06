@@ -86,6 +86,8 @@ class OrdinaryPass(unittest.TestCase):
     def test_local_types_keep_the_console_line(self):
         self.assertIn('pgbouncer_console_unreadable', notify.LOCAL_TYPES)
         self.assertIn('pgbouncer_console_unreadable', notify.TYPE_LABELS)
+        self.assertIn('pgbouncer_pool_at_ceiling', notify.LOCAL_TYPES)
+        self.assertIn('pgbouncer_pool_at_ceiling', notify.TYPE_LABELS)
 
 
 if __name__ == '__main__':
