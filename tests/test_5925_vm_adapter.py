@@ -21,13 +21,13 @@ TARGET = dict(zone='fr-par-1', server_id='11111111-1111-4111-8111-111111111111',
               project_id='22222222-2222-4222-8222-222222222222', timezone='Europe/Paris',
               release_windows=['11:00', '23:00'], health_argv=['/health'],
               reconcile_argv=['/reconcile'], quiesce_argv=['/quiesce'],
-              probe_agent='burst-probe')
+              halt_argv=['/halt'], halted_argv=['/halted'], probe_agent='burst-probe')
 
 
 def policy(**over):
     return dict(dict(enabled=True, controller_host='controller', min_on_s=3600,
                      min_off_s=60, wake_delay_s=900, observation_gap_s=90,
-                     io_timeout_s=10, health_deadline_s=900, targets={'burst': dict(TARGET)}), **over)
+                     io_timeout_s=10, health_deadline_s=900, halt_deadline_s=300, targets={'burst': dict(TARGET)}), **over)
 
 
 class DecisionTest(unittest.TestCase):
@@ -149,6 +149,7 @@ class AdapterTest(PgTestCase):
         self.cfg = replace(self.cfg, idle_after_s=1800)
         self.provider = mock.Mock()
         self.provider.state.return_value = 'running'
+        self.provider.allowed.return_value = {'poweron', 'poweroff'}
         self.operations = mock.Mock()
         self.operations.listing.return_value = []
         self.operations.open_lots_activity.return_value = []
@@ -188,7 +189,15 @@ class AdapterTest(PgTestCase):
         self.provider.action.assert_not_called()
         self.observe_old()
         self.assertEqual(self.tick(), 'stop prepared')
-        self.assertEqual(self.tick(), 'stopping')
+        # #6074: halt the OS first; the provider poweroff archives only after
+        # `stopped in place` and the muted SSH witness prove the halt.
+        self.assertEqual(self.tick(), 'halt prepared')
+        self.assertEqual(self.tick(), 'halt sent')
+        self.probe.assert_called_with(['/halt'], 10)
+        self.provider.action.assert_not_called()
+        self.provider.state.return_value = 'stopped in place'
+        self.assertEqual(self.tick(), 'halt proven')
+        self.assertEqual(self.tick(), 'archiving')
         self.provider.action.assert_called_once_with(TARGET, 'poweroff')
         self.assertEqual(self.q.pending('burst')[0]['status'], 'pending')
         self.provider.state.return_value = 'stopped'
@@ -239,8 +248,10 @@ class AdapterTest(PgTestCase):
             self.assertEqual(vm.tick_host(self.cfg, self.db, policy(), 'burst',
                                           self.provider, probe=self.probe), 'stop prepared')
             self.assertEqual(vm.tick_host(self.cfg, self.db, policy(), 'burst',
-                                          self.provider, probe=self.probe), 'stopping')
-            self.provider.action.assert_called_once_with(TARGET, 'poweroff')
+                                          self.provider, probe=self.probe), 'halt prepared')
+            self.assertEqual(vm.tick_host(self.cfg, self.db, policy(), 'burst',
+                                          self.provider, probe=self.probe), 'halt sent')
+            self.provider.action.assert_not_called()
 
     def test_off_hysteresis_and_running_requires_fresh_reading_health_reconciliation(self):
         self.request('busy')
@@ -289,10 +300,15 @@ class AdapterTest(PgTestCase):
         self.request()
         self.observe_old()
         self.assertEqual(self.tick(), 'stop prepared')
+        self.assertEqual(self.tick(), 'halt prepared')
+        self.assertEqual(self.tick(), 'halt sent')
+        self.provider.state.return_value = 'stopped in place'
+        self.assertEqual(self.tick(), 'halt proven')
         self.provider.action.side_effect = vm.Refused('provider unavailable')
         with self.assertRaises(vm.Refused):
             self.tick()
         self.assertEqual(self.request(), 'pending')
+        self.assertEqual(self.q.pending('burst')[0]['result'], 'archive intent')
         self.assertFalse(self.q.control('burst')['claims_open'])
         self.provider.state.return_value = 'stopped'
         self.assertEqual(self.tick(), 'stopped')

@@ -7,6 +7,7 @@
   "observation_gap_s": 90,
   "io_timeout_s": 10,
   "health_deadline_s": 900,
+  "halt_deadline_s": 300,
   "targets": {
     "burst-host": {
       "zone": "fr-par-1",
@@ -15,6 +16,8 @@
       "timezone": "Europe/Paris",
       "release_windows": ["11:00", "23:00"],
       "quiesce_argv": ["/opt/ameesh-vm-adapter/checks/quiesce-burst-host"],
+      "halt_argv": ["/opt/ameesh-vm-adapter/checks/halt-burst-host"],
+      "halted_argv": ["/opt/ameesh-vm-adapter/checks/halted-burst-host"],
       "health_argv": ["/opt/ameesh-vm-adapter/checks/health-burst-host"],
       "reconcile_argv": ["/opt/ameesh-vm-adapter/checks/reconcile-burst-host"],
       "probe_agent": "burst-host-probe"
