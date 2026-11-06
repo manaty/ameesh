@@ -309,7 +309,7 @@ def journal_path(cfg):
 
 
 def journaled(path, project):
-    """The pins journaled as reached by ``project``, or None without a journal.
+    """The ``(pin, gate)`` moves journaled for ``project``, or None without a journal.
 
     A malformed line is no move. An unreadable journal reads as empty, so a
     changed pin is refused rather than followed on an unverifiable trace.
@@ -320,8 +320,8 @@ def journaled(path, project):
     except FileNotFoundError:
         return None
     except OSError:
-        return set()
-    gates = set()
+        return []
+    moves = []
     for line in lines:
         try:
             row = json.loads(line)
@@ -329,8 +329,28 @@ def journaled(path, project):
             continue
         if (isinstance(row, dict) and row.get("event") == "canon-requalified"
                 and row.get("project") == project and isinstance(row.get("gate"), str)):
-            gates.add(row["gate"].strip().lower())
-    return gates
+            moves.append((str(row.get("pin") or "").strip().lower(),
+                          row["gate"].strip().lower()))
+    return moves
+
+
+def reached(moves, previous, pin):
+    """True when journaled moves lead from ``previous`` to ``pin``.
+
+    A gate journaled from another pin is not enough: a pin set by hand, then
+    requalified onward, would launder the unreviewed first step (#6034).
+    """
+    previous, pin = previous.lower(), pin.lower()
+    seen, frontier = {previous}, [previous]
+    while frontier:
+        current = frontier.pop()
+        for start, gate in moves or ():
+            if start == current and gate not in seen:
+                if gate == pin:
+                    return True
+                seen.add(gate)
+                frontier.append(gate)
+    return False
 
 
 def _pin_files(cfg, project):
@@ -392,15 +412,16 @@ def _unjournaled(cfg, passage, project, previous, pin, report, alerted, *, start
 
 
 def _startup_pins(cfg, passages, report, alerted):
-    """A startup pin stays assembled; alert it when a journal knows other pins."""
+    """A startup pin stays assembled; alert it when an existing journal
+    (even empty or unreadable) records no move to it."""
     path = journal_path(cfg)
     if not path:
         return
     for passage in passages:
         name = str(getattr(getattr(passage, "project", None), "name", "") or "")
         pin = str(getattr(passage, "policy_commit", "") or "").lower()
-        gates = journaled(path, name)
-        if gates and pin not in gates:
+        moves = journaled(path, name)
+        if moves is not None and pin not in {gate for _start, gate in moves}:
             _unjournaled(cfg, passage, name, "", pin, report, alerted, startup=True)
 
 
@@ -488,10 +509,11 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None,
     before any passage is mutated, so a refused reload leaves every passage
     on its previous pin.
 
-    #6034: a changed pin is followed only when the host journal records a
-    requalification whose gate is that pin (mechanical, reviewed or
-    automatic). A pin edited by hand keeps the passage on its previous pin and
-    is alerted once per value; the other projects still follow theirs.
+    #6034: a changed pin is followed only when the host journal's moves
+    (mechanical, reviewed or automatic requalifications) lead from the live
+    pin to it. A pin edited by hand keeps the passage on its previous pin, is
+    alerted once per value and is never requalified onward automatically;
+    the other projects still follow theirs.
     """
     if load is None:
         env = (dict(os.environ, AMEESH_CONFIG=config_path)
@@ -515,7 +537,18 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None,
         from . import train_requalify
         from .scoped_db import ScopedDb
         refusals = {} if refusals is None else refusals
+        live = {str(getattr(getattr(passage, "project", None), "name", "") or ""):
+                str(getattr(passage, "policy_commit", "") or "")
+                for passage in passages or ()}
+        journal = journal_path(fresh)
         for spec in settings.projects:
+            previous = live.get(spec.name, "")
+            if (journal and previous and previous != spec.canon_commit
+                    and not reached(journaled(journal, spec.name), previous,
+                                    spec.canon_commit)):
+                # #6034: never qualify onward from a pin set by hand; the
+                # reload below refuses it and names it.
+                continue
             db = None
             try:
                 db = ScopedDb(fresh, family="runner.scoped.train.assembly")
@@ -552,7 +585,7 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None,
         if previous == commit and str(getattr(passage, "policy_path", "") or "") == spec.canon:
             continue
         if previous and previous != commit and journal:
-            if commit.lower() not in (journaled(journal, name) or ()):
+            if not reached(journaled(journal, name), previous, commit):
                 refused.append((passage, name, previous, commit))
                 continue
         pending.append((passage, name, spec.canon, commit, previous))
