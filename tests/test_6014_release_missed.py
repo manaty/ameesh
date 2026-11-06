@@ -131,6 +131,52 @@ class NoStagingTest(unittest.TestCase):
                          set(nx.STAGING_WORKFLOWS))
 
 
+class UndeclaredReleaseTest(unittest.TestCase):
+    AT = 1_800_000_000.0
+
+    def setUp(self):
+        self.cfg = types.SimpleNamespace(
+            host="release-candidate",
+            release={"role": "mesh-design", "projects": {}},
+            github={"projects": {"ameesh": "manaty/ameesh",
+                                 "nexlink": {"repo": "manaty/nexlink"}}})
+
+    def test_a_due_cutoff_for_an_undeclared_project_is_alerted(self):
+        with mock.patch.object(rc, "cutoff_slot", return_value=(self.AT, "11:00")):
+            alerts = exploitation._release_undeclared(
+                self.cfg, None, self.AT + rc.WINDOW_S + 1,
+                projects={"ameesh", "nexlink"}, declared={"ameesh"},
+                candidate=True, rules_of=lambda name: object())
+        self.assertEqual(len(alerts), 1)
+        alert = alerts[0]
+        self.assertEqual(alert["type"], "release_project_undeclared")
+        self.assertEqual(alert["project"], "nexlink")
+        self.assertIn("release.projects.nexlink", alert["detail"])
+        self.assertIn("mesh-design", alert["detail"])
+
+    def test_a_declared_project_or_an_out_of_window_cutoff_is_silent(self):
+        with mock.patch.object(rc, "cutoff_slot", return_value=(self.AT, "11:00")):
+            self.assertEqual(exploitation._release_undeclared(
+                self.cfg, None, self.AT + rc.WINDOW_S + 1,
+                projects={"nexlink"}, declared={"nexlink"},
+                candidate=True, rules_of=lambda name: object()), [])
+            self.assertEqual(exploitation._release_undeclared(
+                self.cfg, None, self.AT + 1,
+                projects={"nexlink"}, declared={"ameesh"},
+                candidate=True, rules_of=lambda name: object()), [])
+
+    def test_a_host_outside_the_release_role_is_silent(self):
+        with mock.patch.object(rc, "cutoff_slot", return_value=(self.AT, "11:00")):
+            self.assertEqual(exploitation._release_undeclared(
+                self.cfg, None, self.AT + rc.WINDOW_S + 1,
+                projects={"nexlink"}, declared={"ameesh"},
+                candidate=False, rules_of=lambda name: object()), [])
+
+    def test_the_alert_is_registered_and_briefed(self):
+        self.assertIn("release_project_undeclared", exploitation.ALERT_TYPES)
+        self.assertIn("release_project_undeclared", alert_briefs.BRIEFED_TYPES)
+
+
 class ConfigurationErrorTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
@@ -193,8 +239,9 @@ class TrainPausedAlertTest(unittest.TestCase):
         alert = alerts[0]
         self.assertEqual(alert["type"], "train_paused")
         self.assertEqual(alert["project"], "nexlink")
-        self.assertIn("paused since", alert["detail"])
+        self.assertIn("still paused", alert["detail"])
         self.assertIn("train_paused", alert_briefs.BRIEFED_TYPES)
+        self.assertIn("release_project_undeclared", alert_briefs.BRIEFED_TYPES)
 
     def test_a_non_paused_train_is_ignored(self):
         db = self.Db([{"target_key": "nexlink:develop", "revision": 134,
