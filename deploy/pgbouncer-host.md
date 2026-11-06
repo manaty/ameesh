@@ -67,10 +67,15 @@ sessions are closed after 30 seconds. These limits were raised after the
 2026-10-13 incident on pc-smichea: the original pool (32+8, ceiling 40,
 100 clients) saturated in session mode (40 active, 60 waiting, then `no more
 connections allowed (max_client_conn)`), which blocked every mesh CLI of the
-host. Bureau checks `2 × runner_count + burst headroom < 80` before switching,
-and keeps the three hosts (pc-smichea, agents-1, agents-2) under the server's
-300 with 3 × 80 `max_db_connections`. Increasing agent count beyond this
-capacity requires review.
+host. Pools are sized on the measured ratio of about **2.5 server sessions
+per persona** (bureau reading of 2026-11-06 00:47Z: 39 sessions for 16
+personas, 49 for 20, 18 for 8), not on `2 × runner_count`. Before switching a
+host, bureau checks `max_agents × 2.5 < max_db_connections` of its pool.
+#5983 sets agents-1 to 48+16 (ceiling 64); pc-smichea and agents-2 keep 64+16
+(80), agents-3 32+8 (40): 264 in total, which leaves 33 of the server's 297
+ordinary slots (`max_connections` 300 minus 3 `superuser_reserved_connections`)
+to direct clients; the recipe test keeps at least 30. Increasing agent count
+beyond this capacity requires review.
 
 An installation made before this sizing is raised **by hand**: the recipe
 refuses an existing installation, and a fresh installation elsewhere cannot
