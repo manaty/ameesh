@@ -139,8 +139,9 @@ FERMEES = {
     # neither supervisor role receives additional access.
     # #5250 (0531) : politique de contexte par agent et état du pilote : rien à
     # superviser au-delà de `turn.context`, aucun droit de plus.
+    # #6040 (0553) : seuil de compaction par agent, même classement.
     "agent_registry": {"review_hold", "session_max_tokens", "turn_reread_budget",
-                       "session_reread_budget", "context_pilot"},
+                       "session_reread_budget", "context_pilot", "compact_tokens"},
     "work_review_withdrawals": {"work_item_id", "reviewer", "withdrawn"},
     # #4872 / 0526: budget authority and relay accounting remain closed to
     # supervisor roles; classification grants no additional access.

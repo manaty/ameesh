@@ -15,6 +15,7 @@ import unittest
 
 from ameesh import adapters, cost, exploitation, harnesses, registry
 
+from .support import PgTestCase
 from .test_l105_plafonds_du_tour import _Base
 
 CODEX = os.path.join(harnesses.package_dir(), "codex.json")
@@ -110,6 +111,52 @@ class ReglageTest(_Base):
         data = rows[0]["data"]
         data = json.loads(data) if isinstance(data, str) else data
         self.assertEqual(data["policy"]["compact_tokens"], 120000)
+
+    def test_tour_resident_ne_publie_pas_le_seuil(self):
+        """B2 (ameesh-cx3) : le résident ne reçoit pas le seuil (exec seul) ;
+        la politique du tour ne le publie donc pas comme passé."""
+        from types import SimpleNamespace
+        from unittest import mock
+        from ameesh import resident as resident_mod
+        from ameesh.runner import AgentWorker, Runner
+        runner = Runner(self.cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "cdx-rp")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("cdx-rp", "codex", cwd=cwd)
+        self.mesh("set", "cdx-rp", "compact_tokens=120k")
+        lease = registry.claim(self.db, "cdx-rp", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "cdx-rp"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        vu = []
+
+        class _Driver:
+            busy = False
+
+            def send(self, text):
+                vu.append(worker._turn_compact_tokens)
+                raise resident_mod.ResidentError("arrêt du banc")
+
+        rp = SimpleNamespace(
+            driver=_Driver(), alive=True, closing=False, turns=0, last_used=0.0,
+            proc=None, pgid=None, resource_open=False, life_id="fake",
+            session=None, drain=lambda: None, mark_alive=lambda: None,
+            close=lambda *a, **k: None)
+        with self._env(), \
+                mock.patch.object(worker, "_resident_refusal", return_value=""), \
+                mock.patch.object(worker, "_resident_for_turn", return_value=rp):
+            worker.run_turn({"kind": "prompt", "prompt": "x", "ids": []})
+        self.assertEqual(vu, [None])
+
+
+class CompatibiliteN1Test(PgTestCase):
+    def test_ligne_ecrite_par_l_ancien_code(self):
+        """N-1 : une inscription d'avant 0553 se lit sans seuil (défaut du harnais)."""
+        self.previous_insert("agent_registry", {
+            "name": "cdx-n1", "harness": "codex", "host": "", "cwd": "/tmp",
+            "status": "idle"}, added=("compact_tokens",))
+        ligne = registry.get(self.db, "cdx-n1")
+        self.assertIsNone(ligne["compact_tokens"])
+        self.assertIsNone(exploitation.effective_compact_tokens(ligne))
 
 
 if __name__ == "__main__":

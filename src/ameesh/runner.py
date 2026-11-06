@@ -9123,6 +9123,10 @@ class AgentWorker(threading.Thread):
                         adapter, key=cle_resident, session=session, cwd=cwd, env=env,
                         model=model, effort=effort, tier=tier, lot=lot_du_tour,
                         stderr_path=stderr_path)
+                    if rp is not None:
+                        # #6040 : le résident ne reçoit pas le seuil (exec
+                        # seul) ; `turn.context` ne publie que ce qui est passé.
+                        self._turn_compact_tokens = None
                 if rp is None:
                     # L498 : le cgroup délégué ne concerne que le lancement d'un
                     # harnais par événement ; le processus résident (L76) sert
