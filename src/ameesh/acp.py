@@ -522,19 +522,26 @@ def _open_root(cwd: str) -> int:
     racine par son nom, donc un remplacement du chemin après l'acquisition ne
     déplace pas la frontière.
 
+    Les ancêtres ne sont que **traversés** (#6061) : ouverts en `O_PATH`, ils
+    n'exigent que le droit de recherche, comme une résolution de chemin
+    ordinaire ; un ancêtre `--x` (`/srv/ameesh-guest`, un `$HOME` en 711)
+    n'est donc pas un refus. Seul le dossier de travail est ouvert en lecture.
+
     Lève `AcpRpcError` (`-32002`) si le dossier n'est pas ouvrable sans suivre
     de lien, ou si l'un de ses ancêtres en est un.
     """
     racine = os.path.abspath(cwd)
     composants = [c for c in racine.split(os.sep) if c]
+    traverse = getattr(os, "O_PATH", os.O_RDONLY)
     try:
-        fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(os.sep, (traverse if composants else os.O_RDONLY) | os.O_DIRECTORY)
     except OSError as exc:  # pragma: no cover : tout système POSIX a une racine
         raise AcpRpcError(-32002, "filesystem root unreadable: %s" % exc)
     try:
-        for composant in composants:
+        for rang, composant in enumerate(composants, 1):
+            mode = os.O_RDONLY if rang == len(composants) else traverse
             suivant = os.open(composant,
-                              os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                              mode | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = suivant
     except OSError as exc:

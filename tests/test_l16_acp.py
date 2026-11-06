@@ -387,6 +387,19 @@ class ConfinementTest(unittest.TestCase):
         os.symlink(self.racine, lien)
         with self.assertRaises(acp.AcpRpcError):
             acp._open_root(lien)
+        # #6061 : un ancêtre traversé en O_PATH reste refusé s'il est un lien
+        with self.assertRaises(acp.AcpRpcError):
+            acp._open_root(os.path.join(lien, "sous"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root lit tout dossier : pas de refus à observer")
+    def test_ancetre_traversable_sans_lecture_admis(self):
+        """#6061 : un ancêtre `--x` (`/srv/ameesh-guest` du guest, un `$HOME`
+        en 711) se traverse ; seul le dossier de travail est ouvert en lecture."""
+        with open(os.path.join(self.racine, "a.txt"), "w", encoding="utf-8") as fh:
+            fh.write("a")
+        os.chmod(self.tmp, 0o311)
+        self.addCleanup(os.chmod, self.tmp, 0o700)
+        self.assertEqual(self.lire("a.txt"), "a")
 
     def test_racine_epinglee_ne_suit_pas_le_remplacement_du_chemin(self):
         """La racine est un fd : remplacer son chemin ne déplace pas la frontière."""
