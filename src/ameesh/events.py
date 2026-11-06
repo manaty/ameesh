@@ -51,10 +51,6 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        the launching turn, reused by candidate takeover (#4880)
   git.lock_removed     an orphan git lock removed from a radar clone: path, age,
                        size (no table: written by `resolutions`, #5179)
-  release.handoff      the bureau's attestation of a handed-over Nexlink staging
-                       (commit, run ids, migrations) or the pilot's pass, read
-                       by the release tick (no table: `ameesh release attest|pass`,
-                       #6020)
   packet.pause         a pause with a deadline (alert or automatic end) of the hourly packet tick, or its end
                        (no table: written by `paquet-horaire.py pause|resume`,
                        read by its tick and `role timers --check`, #4361)
@@ -112,7 +108,7 @@ TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
          "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request", "git.lock_removed",
-         "packet.pause", "release.handoff")
+         "packet.pause")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365
 #: the table refuses to delete an event younger than this (migration 0396)

@@ -9,7 +9,7 @@
         "remote": "origin",
         "model": "nexlink",
         "staging_handoff": "bureau",
-        "handoff_timeout_s": 7200
+        "attestation_timeout_s": 14400
       }
     }
   }

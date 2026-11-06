@@ -476,23 +476,18 @@ def migration_gate(cfg, project, pending):
 def publish(project, pending):
     sha, tag = pending["sha"], pending["tag"]
     ensure_ref(project, "refs/heads/release/" + pending["version"], sha)
+    # #6020: lightweight, like the existing release-11ac … release-11as
+    # (orchestrator, 06/11). `remote_tag` reads the peeled commit either way.
     remote = rc.remote_tag(project.repo, project.remote, tag)
     if remote and remote != sha:
-        raise rc.ReleaseError("Nexlink annotated tag already points elsewhere")
-    if remote:
-        rc._git(project.repo, "fetch", project.remote, "refs/tags/" + tag, check=True)
-        if rc._out(project.repo, "cat-file", "-t", "FETCH_HEAD") != "tag":
-            raise rc.ReleaseError("Nexlink release tag must be annotated")
+        raise rc.ReleaseError("Nexlink release tag already points elsewhere")
     if not remote:
         local = rc._git(project.repo, "rev-parse", "--verify", "refs/tags/" + tag)
         if local.returncode == 0:
-            if (rc.commit_of(project.repo, tag) != sha
-                    or rc._out(project.repo, "cat-file", "-t", tag) != "tag"):
+            if rc.commit_of(project.repo, tag) != sha:
                 raise rc.ReleaseError("Nexlink local tag differs from frozen candidate")
         else:
-            rc._git(project.repo, "-c", "user.name=ameesh release", "-c",
-                    "user.email=ameesh-release@localhost", "tag", "-a", tag,
-                    sha, "-m", "Nexlink " + pending["version"], check=True)
+            rc._git(project.repo, "tag", tag, sha, check=True)
         rc._git(project.repo, "push", project.remote, "refs/tags/" + tag, check=True)
     slug = rc.github_slug(project)
     head = "release/" + pending["version"]
@@ -506,21 +501,23 @@ def publish(project, pending):
                         % sha]).strip()
 
 # #6020: staging handed to the bureau (`staging_handoff`). The cutoff runs
-# the final-tree CI, tags and reports; the bureau applies the migrations,
-# dispatches STAGING_WORKFLOWS on release/<v>, then attests with
-# `ameesh release attest`, wherever it runs. The attestation, or the pilot's
-# decision to pass, is an event of the shared log: the release host reads it,
-# checks each run on GitHub and the migrations against its own Git delta, and
-# never reads a staging credential.
-HANDOFF_EVENT = "release.handoff"
-HANDOFF_DAYS = 30
-HANDOFF_LIMIT = 50
-HANDOFF_DECISIONS = ("attested", "passed")
+# the final-tree CI, tags and reports, then opens one attestation lot
+# reserved to that agent (decision of the pilot, 06/11 03:50Z: no table, no
+# migration). The bureau applies the migrations, dispatches STAGING_WORKFLOWS
+# on release/<v>, then attests with `ameesh release attest`, which writes a
+# note under a reserved prefix: `work.note` refuses it, so its journal author
+# is the session's bound identity, never an `--actor`. The release host
+# reads it, checks each run on GitHub and the migrations against its own Git
+# delta, and never reads a staging credential.
+ATTEST_PREFIX = "release-attest:"
+SKIP_PREFIX = "release-skip:"
+RESERVED_PREFIXES = (ATTEST_PREFIX, SKIP_PREFIX)
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
-def handoff_object(project_name, version):
-    return "release:%s:%s" % (project_name, version)
+def handoff_source(project_name, version):
+    """The `source` of the attestation lot of one cutoff."""
+    return "release-handoff:%s:%s" % (project_name, version)
 
 
 def parse_runs(texts):
@@ -550,49 +547,78 @@ def parse_migrations(texts):
     return [{"target": target, "version": version} for target, version in sorted(rows)]
 
 
-def handoff_shape_error(data):
-    """Why a handoff event is malformed, or ""."""
-    if not isinstance(data, dict) or data.get("decision") not in HANDOFF_DECISIONS:
-        return "unknown decision"
-    if not isinstance(data.get("actor"), str) or not data["actor"]:
-        return "no actor"
-    if data["decision"] == "passed":
-        return ""
-    if not isinstance(data.get("sha"), str) or not _SHA.fullmatch(data["sha"]):
-        return "no attested commit"
-    try:
-        parse_runs("%s=%s" % item for item in (data.get("runs") or {}).items())
-        parse_migrations("%s:%s" % (row["target"], row["version"])
-                         for row in data.get("migrations") or ())
-    except (rc.ReleaseError, AttributeError, KeyError, TypeError) as exc:
-        return str(exc) or "malformed attestation"
-    return ""
+def attestation_text(project_name, version, *, sha, runs, migrations):
+    return "%s%s:%s %s" % (ATTEST_PREFIX, project_name, version, json.dumps(
+        {"sha": sha, "runs": runs, "migrations": migrations}, sort_keys=True,
+        separators=(",", ":")))
 
 
-def record_handoff(db, *, project, version, decision, actor, authority, sha="",
-                   runs=None, migrations=None, now):
-    """The bureau's attestation or the pilot's pass, as one shared event."""
-    from . import events
-    version_key(version)
-    data = dict(schema=rc.SCHEMA, version=version, decision=decision, actor=actor,
-                authority=authority, at=float(now))
-    if decision == "attested":
-        data.update(sha=sha, runs=runs or {}, migrations=migrations or [])
-    why = handoff_shape_error(data)
-    if why:
-        raise rc.ReleaseError("release handoff refused: " + why)
-    return events.record(db, HANDOFF_EVENT, handoff_object(project, version),
-                         project=project, **data)
+def skip_text(project_name, version, reason):
+    return "%s%s:%s %s" % (SKIP_PREFIX, project_name, version,
+                           " ".join(str(reason or "").split())[:300])
 
 
-def handoff_events(db, project, version):
-    """The handoff events of one version, oldest first: [(id, data)]."""
-    from . import storage
-    rows = storage.of(db).events.recent_type(
-        HANDOFF_EVENT, HANDOFF_DAYS, HANDOFF_LIMIT,
-        object=handoff_object(project.name, version))
-    return sorted((int(row["id"]), row.get("data")) for row in rows or ()
-                  if isinstance(row, dict))
+def read_decision(project_name, version, note):
+    """("attested", data) | ("skipped", reason) | None for another note.
+
+    A malformed attestation of this version is ("malformed", why)."""
+    for prefix, kind in ((ATTEST_PREFIX, "attested"), (SKIP_PREFIX, "skipped")):
+        head = "%s%s:%s " % (prefix, project_name, version)
+        if not (note or "").startswith(head):
+            continue
+        rest = note[len(head):]
+        if kind == "skipped":
+            return kind, rest
+        try:
+            data = json.loads(rest)
+            if not isinstance(data, dict) or not _SHA.fullmatch(str(data.get("sha"))):
+                raise ValueError("no attested commit")
+            parse_runs("%s=%s" % item for item in (data.get("runs") or {}).items())
+            parse_migrations("%s:%s" % (row["target"], row["version"])
+                             for row in data.get("migrations") or ())
+        except (ValueError, rc.ReleaseError, AttributeError, KeyError, TypeError) as exc:
+            return "malformed", str(exc) or "malformed attestation"
+        return kind, data
+    return None
+
+
+def open_handoff_lot(db, project, pending):
+    """The cutoff's attestation lot, created once, reserved to the bureau.
+
+    Written through storage, like the split lot (#3256 A): the reservation
+    is the release configuration's (`staging_handoff`), not a session's
+    gesture. The advisory lock and the source make a retry find it again."""
+    from . import storage, work
+    source = handoff_source(project.name, pending["version"])
+    executor = work.check_external_executor(db, project.staging_handoff)
+    handoff = pending["handoff"]
+    deadline = datetime.datetime.fromtimestamp(float(handoff["deadline"]),
+                                               datetime.timezone.utc)
+    with db.transaction() as tx:
+        tx.query("SELECT pg_advisory_xact_lock(hashtextextended(lower(%s), 0))", (source,))
+        existing = work.open_with_source(tx, source)
+        if existing is not None:
+            return int(existing["id"])
+        created = storage.of(tx).work.add(
+            type="evolution", source=source, app=project.name,
+            title="staging %s %s : attestation (échéance %s)" % (
+                project.name, pending["version"], deadline.strftime("%d/%m %H:%MZ")),
+            body=handoff["instructions"], issue_ref=None, workstream=None,
+            assignee=None, budget_usd=None, priority=1, actor=work.SYSTEM_SENDER,
+            note="created by the %s cutoff %s; reserved to external executor %s"
+                 % (project.name, pending["version"], executor),
+            external_executor=executor, footprint=[])
+    return int(created["id"])
+
+
+def write_decision(db, project_name, version, text, actor):
+    """Write a reserved attestation/skip note on the open attestation lot."""
+    from . import storage, work
+    item = work.open_with_source(db, handoff_source(project_name, version))
+    if item is None:
+        raise rc.ReleaseError("no open attestation lot for %s %s" % (project_name, version))
+    storage.of(db).work.note(int(item["id"]), item["state"], text, actor)
+    return int(item["id"])
 
 
 def verify_attestation(project, pending, data):
@@ -601,7 +627,7 @@ def verify_attestation(project, pending, data):
     if data["sha"] != sha:
         return "reject", "attested commit %s is not the frozen candidate %s" % (
             data["sha"][:12], sha[:12])
-    attested = {(row["target"], int(row["version"])) for row in data["migrations"]}
+    attested = {(row["target"], int(row["version"])) for row in data.get("migrations") or ()}
     for target, rows in migration_requirements(project, sha, pending["main"]).items():
         for row in rows:
             if (target, row["version"]) not in attested:
@@ -626,7 +652,7 @@ def verify_attestation(project, pending, data):
             return "reject", "run %d (%s) concluded %s" % (
                 run_id, workflow, run.get("conclusion"))
         evidence.append({"workflow": workflow, "id": run_id, "url": run.get("html_url")})
-    return "ok", {"runs": evidence, "migrations": data["migrations"]}
+    return "ok", {"runs": evidence, "migrations": data.get("migrations") or []}
 
 
 def _announce(cfg, db, project, body, report, *, urgent=True):
@@ -640,87 +666,124 @@ def _handoff_open(cfg, db, project, pending, now, save):
     required = migration_requirements(project, pending["sha"], pending["main"])
     rows = [{"target": target, "version": row["version"], "name": row["name"]}
             for target, entries in sorted(required.items()) for row in entries]
-    pending["handoff"] = dict(to=project.staging_handoff, at=now, migrations=rows,
-                              deadline=now + float(project.handoff_timeout_s), rejected={})
-    save()
-    deadline = datetime.datetime.fromtimestamp(pending["handoff"]["deadline"],
-                                               datetime.timezone.utc)
+    deadline = now + float(project.attestation_timeout_s)
     command = ("ameesh release attest --project %s --version %s --sha %s %s%s"
                % (project.name, pending["version"], pending["sha"],
                   " ".join("--run %s=<id>" % workflow for workflow in STAGING_WORKFLOWS),
                   "".join(" --migration %s:%d" % (row["target"], row["version"])
                           for row in rows)))
-    body = ("Nexlink %s : CI de l'arbre final verte, tag %s posé sur %s "
-            "(branche release/%s, %s).\n"
-            "Staging remis à %s : appliquer les migrations de staging (%s), puis "
-            "lancer %s sur release/%s, puis attester :\n%s\n"
-            "Sans attestation à %s, annonce au pilote."
-            % (pending["version"], pending["tag"], pending["sha"], pending["version"],
-               pending.get("pr") or "PR à venir", project.staging_handoff,
-               ", ".join("%s %s" % (row["target"], row["name"]) for row in rows) or "aucune",
-               ", ".join(STAGING_WORKFLOWS), pending["version"], command,
-               deadline.strftime("%d/%m %H:%MZ")))
+    when = datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc)
+    instructions = (
+        "Nexlink %s : CI de l'arbre final verte, tag %s posé sur %s "
+        "(branche release/%s, %s).\n"
+        "Staging remis à %s : appliquer les migrations de staging (%s), puis "
+        "lancer %s sur release/%s, puis attester (depuis la session de %s) :\n%s\n"
+        "Sans attestation à %s, annonce au pilote."
+        % (pending["version"], pending["tag"], pending["sha"], pending["version"],
+           pending.get("pr") or "PR à venir", project.staging_handoff,
+           ", ".join("%s %s" % (row["target"], row["name"]) for row in rows) or "aucune",
+           ", ".join(STAGING_WORKFLOWS), pending["version"], project.staging_handoff,
+           command, when.strftime("%d/%m %H:%MZ")))
+    pending["handoff"] = dict(to=project.staging_handoff, at=now, migrations=rows,
+                              deadline=deadline, rejected={}, instructions=instructions)
+    save()
+    if db is not None:
+        pending["handoff"]["lot"] = open_handoff_lot(db, project, pending)
+        save()
+    body = instructions
+    if pending["handoff"].get("lot"):
+        body += "\nLot d'attestation : #%d." % pending["handoff"]["lot"]
     _announce(cfg, db, project, body, dict(pending, result="waiting-attestation"),
               urgent=False)
     return dict(pending, result="waiting-attestation")
 
 
 def _handoff_resolution(cfg, db, project, pending, save):
-    """The first valid decision of the shared log, or None (still waiting)."""
+    """The first applicable decision of the attestation lot, or None.
+
+    An attestation whose runs are still running waits, but later notes are
+    still read: a skip, or a newer valid attestation, is never held behind it."""
+    from . import work
     handoff = pending["handoff"]
     rejected = handoff.setdefault("rejected", {})
-    handoff.pop("waiting", None)
-    for event_id, data in (handoff_events(db, project, pending["version"])
-                           if db is not None else ()):
-        if str(event_id) in rejected:
+    if db is None:
+        return None
+    if not handoff.get("lot"):
+        handoff["lot"] = open_handoff_lot(db, project, pending)
+        save()
+    waiting = None
+    for row in work.events_noted(db, handoff["lot"], "release-"):
+        event_id, actor = str(row["id"]), str(row.get("actor") or "")
+        if event_id in rejected:
             continue
-        why = handoff_shape_error(data)
-        if not why and data.get("authority") != "corrector" and (
-                data["decision"] == "passed" or data["actor"] != project.staging_handoff):
-            why = "%s may not %s this release" % (
-                data["actor"], "pass" if data["decision"] == "passed" else "attest")
+        decision = read_decision(project.name, pending["version"], row.get("note"))
+        if decision is None:
+            continue
+        kind, data = decision
+        if kind == "skipped":
+            return "skipped", dict(event=int(row["id"]), actor=actor, reason=data)
+        why = data if kind == "malformed" else ""
+        if not why and actor != project.staging_handoff:
+            why = "%s is not the staging agent %s" % (actor or "?", project.staging_handoff)
         if not why:
-            if data["decision"] == "passed":
-                return "passed", dict(event=event_id, actor=data["actor"])
             verdict, detail = verify_attestation(project, pending, data)
             if verdict == "ok":
-                return "attested", dict(detail, event=event_id, actor=data["actor"])
+                return "attested", dict(detail, event=int(row["id"]), actor=actor)
             if verdict == "wait":
-                handoff["waiting"] = detail
-                save()
-                return None
+                waiting = waiting or detail
+                continue
             why = detail
-        rejected[str(event_id)] = why
+        rejected[event_id] = why
         save()
-        _announce(cfg, db, project, "Nexlink %s : attestation de staging #%d refusée : %s. "
-                  "Corriger puis attester de nouveau." % (pending["version"], event_id, why),
-                  dict(pending, result="attestation-refused", event=event_id, message=why))
+        _announce(cfg, db, project, "Nexlink %s : attestation de staging (note %s du lot "
+                  "#%d) refusée : %s. Corriger puis attester de nouveau."
+                  % (pending["version"], event_id, handoff["lot"], why),
+                  dict(pending, result="attestation-refused", event=int(row["id"]),
+                       message=why))
+    if waiting:
+        handoff["waiting"] = waiting
+    else:
+        handoff.pop("waiting", None)
+    save()
     return None
 
 
 def _handoff_waiting(cfg, db, project, pending, at, label, now, save):
-    """Bounded wait: the deadline and a blocked next cutoff are each said once."""
+    """Bounded wait: the deadline and a held next cutoff are each said once."""
     handoff = pending["handoff"]
+    lot = " (lot #%d)" % handoff["lot"] if handoff.get("lot") else ""
     if now >= float(handoff["deadline"]) and not handoff.get("overdue_at"):
         handoff["overdue_at"] = now
         save()
         _announce(cfg, db, project, "Nexlink %s : attestation de staging absente après "
-                  "%.1f h (remis à %s le %s). Le tag %s reste posé ; la coupure attend."
+                  "%.1f h (remis à %s le %s%s). Le tag %s reste posé ; la coupure attend."
                   % (pending["version"], (now - float(handoff["at"])) / 3600.0,
                      handoff["to"], datetime.datetime.fromtimestamp(
                          float(handoff["at"]), datetime.timezone.utc).strftime("%d/%m %H:%MZ"),
-                     pending["tag"]), dict(pending, result="attestation-overdue"))
-    if at > float(pending["cutoff_at"]) and handoff.get("blocked_cutoff") != at:
-        handoff["blocked_cutoff"] = at
+                     lot, pending["tag"]), dict(pending, result="attestation-overdue"))
+    if at > float(pending["cutoff_at"]) and handoff.get("held_cutoff") != at:
+        handoff["held_cutoff"] = at
         save()
         _announce(cfg, db, project, "Nexlink : la coupure %s est due, mais %s attend "
-                  "l'attestation de staging de %s. Décision du pilote : attendre "
-                  "(rien à faire), ou passer : ameesh release pass --project %s "
-                  "--version %s (la coupure %s part alors au tic suivant)."
-                  % (label, pending["version"], handoff["to"], project.name,
-                     pending["version"], label),
-                  dict(pending, result="cutoff-blocked", blocked_cutoff=at))
+                  "l'attestation de staging de %s%s. Décision du pilote : attendre "
+                  "(rien à faire), ou passer : ameesh release attest --project %s "
+                  "--version %s --skip --reason \"…\" (la coupure %s part alors au tic "
+                  "suivant)." % (label, pending["version"], handoff["to"], lot,
+                                 project.name, pending["version"], label),
+                  dict(pending, result="held-attestation", held_cutoff=at))
+        return dict(pending, result="held-attestation")
     return dict(pending, result="waiting-attestation")
+
+
+def _close_handoff_lot(db, pending, note):
+    from . import work
+    lot = (pending.get("handoff") or {}).get("lot")
+    if db is None or not lot:
+        return
+    try:
+        work.close(db, int(lot), done=True, note=note, actor=work.SYSTEM_SENDER)
+    except work.WorkError as exc:  # already closed by hand: the cutoff still closes
+        print("release: attestation lot #%s not closed: %s" % (lot, exc))
 
 
 def _close(cfg, db, project, slot, pending, result, save):
@@ -735,9 +798,13 @@ def _close(cfg, db, project, slot, pending, result, save):
     if attestation:
         body += " ; staging attesté par %s : %s" % (attestation["actor"], ", ".join(
             "%s run %s" % (run["workflow"], run["id"]) for run in attestation["runs"]))
-    if result == "not-attested":
-        body += " ; staging non attesté, passé par %s" % pending["handoff_passed"]["actor"]
-    _announce(cfg, db, project, body, report, urgent=result == "not-attested")
+    skipped = pending.get("handoff_skipped")
+    if skipped:
+        body += " ; staging non attesté, passé par %s (%s)" % (
+            skipped["actor"], skipped["reason"] or "sans raison")
+    if pending.get("handoff"):
+        _close_handoff_lot(db, pending, body)
+    _announce(cfg, db, project, body, report, urgent=result == "staging-unattested")
     return report
 
 
@@ -834,10 +901,10 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
             if kind == "attested":
                 pending["staging_attestation"] = detail
                 return _close(cfg, db, project, slot, pending, "released", save)
-            # The pilot passed: this cutoff closes without staging and the due
+            # The pilot skipped: this cutoff closes without staging and the due
             # one starts now, even past its window (it was held, not missed).
-            pending["handoff_passed"] = detail
-            passed = _close(cfg, db, project, slot, pending, "not-attested", save)
+            pending["handoff_skipped"] = detail
+            passed = _close(cfg, db, project, slot, pending, "staging-unattested", save)
             pending = None
         if pending is None:
             if not force and float(slot.get("last_cutoff") or 0) >= at:

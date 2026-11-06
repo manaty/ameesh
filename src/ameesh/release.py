@@ -452,7 +452,8 @@ def _release_tick(cfg, args, declared) -> int:
             if report.get("result") not in ("released", "reconciled", "nothing-new",
                                             "already-recorded", "not-due", "missed",
                                             "kept-active", "waiting-ci", "waiting-staging", "empty",
-                                            "waiting-attestation", "not-attested"):
+                                            "waiting-attestation", "held-attestation",
+                                            "staging-unattested"):
                 status = 1
         return status
     finally:
@@ -561,48 +562,49 @@ def _elected_tick(cfg, args):
         min_left=0, dry_run=False, json=False), credentials=credentials)
 
 
-def _handoff_actor(cfg, db, explicit, *, what, agent_allowed):
-    """#6020: who records a staging handoff decision, and with what authority.
+def _attest(cfg, args) -> int:
+    """`ameesh release attest` (#6020): a reserved note on the attestation lot.
 
-    A pilot, orchestrator or human (`work.corrector`) may attest or pass; the
-    session's own bound agent may attest only, and the release host accepts
-    it only from the agent the staging was handed to.
+    The journal author is what the release tick trusts: the session's bound
+    identity for an attestation (the tick keeps only the `staging_handoff`
+    agent's), a verified pilot for `--skip` (`work.corrector`). `--actor` is
+    never an author: it only names the human at a terminal for `--skip`.
     """
-    from . import identity
-    try:
-        return work.corrector(cfg, db, explicit, what=what, history=False), "corrector"
-    except work.WorkError:
-        if not agent_allowed:
-            raise
-        binding = identity.resolve_binding(cfg, db)
-        if binding.ok and binding.name and (not explicit or explicit == binding.name):
-            return binding.name, "agent"
-        raise
-
-
-def _handoff(cfg, args) -> int:
-    """`ameesh release attest|pass` (#6020): one event of the shared log."""
-    from . import nexlink_release, release_cutoff
+    from . import identity, nexlink_release, release_cutoff
     from .db import open_db
     db = open_db(cfg)
     try:
-        attest = args.release_command == "attest"
-        actor, authority = _handoff_actor(
-            cfg, db, args.actor, what="release " + args.release_command,
-            agent_allowed=attest)
-        extra = {}
-        if attest:
-            extra = dict(sha=args.sha, runs=nexlink_release.parse_runs(args.run),
-                         migrations=nexlink_release.parse_migrations(args.migration))
-        event_id = nexlink_release.record_handoff(
-            db, project=args.project, version=args.version,
-            decision="attested" if attest else "passed", actor=actor,
-            authority=authority, now=time.time(), **extra)
-        print("release %s %s: %s recorded (event %d) by %s; the release tick checks it"
-              % (args.project, args.version, "attestation" if attest else "pass",
-                 event_id, actor))
+        nexlink_release.version_key(args.version)
+        if args.skip:
+            if args.sha or args.run or args.migration:
+                raise release_cutoff.ReleaseError("--skip takes no --sha, --run or --migration")
+            if not (args.reason or "").strip():
+                raise release_cutoff.ReleaseError("--skip requires --reason")
+            actor = work.corrector(cfg, db, args.actor, what="release attest --skip",
+                                   history=False)
+            text = nexlink_release.skip_text(args.project, args.version, args.reason)
+        else:
+            if args.actor:
+                raise release_cutoff.ReleaseError(
+                    "an attestation is signed by the session's own identity, not --actor")
+            binding = identity.resolve_binding(cfg, db)
+            if not (binding.ok and binding.name):
+                raise release_cutoff.ReleaseError(
+                    "attestation refused: no bound session identity (%s)"
+                    % (binding.reason or "unbound"))
+            actor = binding.name
+            if not args.sha or not re.fullmatch(r"[0-9a-f]{40}", args.sha):
+                raise release_cutoff.ReleaseError("--sha: the full tagged commit is required")
+            text = nexlink_release.attestation_text(
+                args.project, args.version, sha=args.sha,
+                runs=nexlink_release.parse_runs(args.run),
+                migrations=nexlink_release.parse_migrations(args.migration))
+        lot = nexlink_release.write_decision(db, args.project, args.version, text, actor)
+        print("release %s %s: %s noted on lot #%d by %s; the release tick checks it"
+              % (args.project, args.version, "skip" if args.skip else "attestation",
+                 lot, actor))
         return 0
-    except (work.WorkError, release_cutoff.ReleaseError, ValueError) as exc:
+    except (work.WorkError, release_cutoff.ReleaseError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
     finally:
@@ -610,11 +612,11 @@ def _handoff(cfg, args) -> int:
 
 
 def run(cfg, args) -> int:
-    """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest|pass`."""
+    """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest`."""
     from . import release_cutoff
     command = args.release_command
-    if command in ("attest", "pass"):
-        return _handoff(cfg, args)
+    if command == "attest":
+        return _attest(cfg, args)
     if (command in ("tick", "packet-watch", "cutoff")
             or command == "staging-needed" and getattr(args, "apply", False)):
         status = _elected_tick(cfg, args)
@@ -763,22 +765,19 @@ def add_parser(sub, func) -> None:
     reason_p.add_argument("--actor", default="")
     reason_p.set_defaults(func=func)
     attest_p = rel.add_parser(
-        "attest", help="#6020: the bureau attests a handed-over Nexlink staging "
-                       "(migrations, then the staging dispatches); the release tick "
-                       "checks the runs on GitHub and closes the cutoff")
+        "attest", help="#6020: the staging agent attests a handed-over Nexlink staging "
+                       "(migrations, then the staging dispatches) on the cutoff's "
+                       "attestation lot; --skip: the pilot stops waiting")
     attest_p.add_argument("--project", default="nexlink")
     attest_p.add_argument("--version", required=True)
-    attest_p.add_argument("--sha", required=True, help="the tagged commit")
+    attest_p.add_argument("--sha", default=None, help="the tagged commit")
     attest_p.add_argument("--run", action="append", default=[],
                           help="WORKFLOW=RUN_ID, once per staging workflow")
     attest_p.add_argument("--migration", action="append", default=[],
                           help="TARGET:VERSION applied on staging (hub, content)")
-    attest_p.add_argument("--actor", default=None)
+    attest_p.add_argument("--skip", action="store_true",
+                          help="pilot only: close the held cutoff without staging")
+    attest_p.add_argument("--reason", default="")
+    attest_p.add_argument("--actor", default=None,
+                          help="--skip at a human terminal: human:<id>")
     attest_p.set_defaults(func=func)
-    pass_p = rel.add_parser(
-        "pass", help="#6020: the pilot stops waiting for a staging attestation; the "
-                     "held cutoff closes without staging and the due one starts")
-    pass_p.add_argument("--project", default="nexlink")
-    pass_p.add_argument("--version", required=True)
-    pass_p.add_argument("--actor", default=None)
-    pass_p.set_defaults(func=func)

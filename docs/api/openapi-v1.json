@@ -1020,8 +1020,7 @@
               "staging.sequence",
               "staging.request",
               "git.lock_removed",
-              "packet.pause",
-              "release.handoff"
+              "packet.pause"
             ]
           }
         },

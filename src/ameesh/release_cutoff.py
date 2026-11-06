@@ -61,7 +61,8 @@ WINDOW_S = 1800.0
 #: 12 h between two cutoffs. The service unit is bounded 30 min later.
 STAGING_TIMEOUT_S = staging_watch.STAGING_FALLBACK_S
 #: #6020: bound on the bureau's staging attestation before an announcement
-HANDOFF_TIMEOUT_S = 2 * 3600.0
+#: (pilot decision, 06/11 03:50Z: 4 h)
+ATTESTATION_TIMEOUT_S = 4 * 3600.0
 #: after a staging stop, how long the workstation's transient units
 #: (`poste-maj-staging-<pid>-*`, restart and rollback, #3039) may finish before
 #: they are stopped: they run from the release worktree (#3049)
@@ -1137,9 +1138,9 @@ class ProjectRelease:
     model: str = "semver"
     #: #6020: Nexlink staging handed to this agent (the bureau): the cutoff
     #: tags and reports, the agent applies migrations and dispatches staging,
-    #: then attests (`ameesh release attest`); no staging credential here.
+    #: then attests (`ameesh release attest`, #6020); no staging credential here.
     staging_handoff: str = ""
-    handoff_timeout_s: float = HANDOFF_TIMEOUT_S
+    attestation_timeout_s: float = ATTESTATION_TIMEOUT_S
 
     @classmethod
     def from_config(cls, cfg, name: str, entry: dict) -> "ProjectRelease":
@@ -1148,7 +1149,7 @@ class ProjectRelease:
         unknown = set(entry) - {"repo", "target", "remote", "staging", "report",
                                 "github", "window_s", "staging_timeout_s", "staging_executor",
                                 "lock_ttl_s", "lock_wait_s", "version_bump", "model",
-                                "staging_handoff", "handoff_timeout_s"}
+                                "staging_handoff", "attestation_timeout_s"}
         if unknown:
             raise ReleaseError("release.projects.%s: unknown key(s) %s"
                                % (name, ", ".join(sorted(unknown))))
@@ -1213,7 +1214,7 @@ class ProjectRelease:
             lock_ttl_s=number("lock_ttl_s", LOCK_TTL_S),
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
             suite_tolerated=tolerated, model=model, staging_handoff=handoff or "",
-            handoff_timeout_s=number("handoff_timeout_s", HANDOFF_TIMEOUT_S))
+            attestation_timeout_s=number("attestation_timeout_s", ATTESTATION_TIMEOUT_S))
 
 
 def child_credentials(project) -> frozenset[str]:
