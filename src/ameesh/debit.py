@@ -1815,8 +1815,13 @@ def _roadmap_verdicts(notes: Iterable[Mapping[str, Any]]) -> dict[str, dict]:
 #: `… pending freeze #N`) ; les autres (lot actionnable, courrier) se lisent
 #: déjà à l'agent.
 _SEAT_LOT_RE = re.compile(r"#(\d+)\s*$")
-#: #6010 : un lot fusionné, livré ou classé n'attend plus d'avis.
-_SEAT_CLOSED_STATES = frozenset({"merged", "promoted", "delivered", "closed"})
+#: #6010 : un lot validé, fusionné, livré ou classé n'attend plus d'avis
+#: (#6024 : `validated`).
+_SEAT_CLOSED_STATES = frozenset({"validated", "merged", "promoted", "delivered",
+                                 "closed"})
+#: #6024 : le représentant de famille n'est gardé que pour un gel en `qa`,
+#: comme `file_decoupage._reviewer_spares`.
+_SPARE_WHY = "only eligible reviewer"
 
 
 def _review_seats(notes: Iterable[Mapping[str, Any]],
@@ -1829,11 +1834,12 @@ def _review_seats(notes: Iterable[Mapping[str, Any]],
 
     #6010 : la note est une trace, pas l'état : seule la dernière note de
     l'agent vaut, et le siège tombe dès que le lot qu'elle cite (`#N`) n'est
-    plus ouvert ou a passé sa fusion — le gel n'attend plus d'avis."""
+    plus ouvert ou a passé sa fusion — le gel n'attend plus d'avis.
+
+    #6024 : le siège « only eligible reviewer » exige en plus un lot en `qa`."""
     from .file_decoupage import REVIEW_SEAT_WHY, SLEEP_EXEMPT_PREFIX
-    waiting = {int(lot["id"]) for lot in open_lots or ()
-               if lot.get("id") is not None
-               and str(lot.get("state") or "") not in _SEAT_CLOSED_STATES}
+    states = {int(lot["id"]): str(lot.get("state") or "")
+              for lot in open_lots or () if lot.get("id") is not None}
     latest: dict[str, str] = {}
     for note in sorted(notes or (), key=lambda r: float(r.get("at_ts") or 0.0)):
         text = str(note.get("note") or "").strip()
@@ -1852,7 +1858,10 @@ def _review_seats(notes: Iterable[Mapping[str, Any]],
         if not why.startswith(REVIEW_SEAT_WHY):
             continue
         cited = _SEAT_LOT_RE.search(why)
-        if cited is None or int(cited.group(1)) not in waiting:
+        state = states.get(int(cited.group(1))) if cited else None
+        if state is None or state in _SEAT_CLOSED_STATES:
+            continue
+        if why.startswith(_SPARE_WHY) and state != "qa":
             continue
         out[name] = "review seat: %s" % why
     return out
