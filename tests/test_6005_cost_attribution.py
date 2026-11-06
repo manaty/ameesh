@@ -163,6 +163,29 @@ class ReportTest(unittest.TestCase):
         self.assertIn("total", text)
 
 
+#: `pending_spend.put_get` de la version N-1 (main@782080628c28), avant
+#: #6005 : l'ON CONFLICT remplace l'identité du marqueur mais ne connaît ni
+#: `attribution` ni `attribution_at`.
+_OLD_PENDING_SPEND_PUT_GET = """
+INSERT INTO spend_pending (agent, start_index, turn, model, work_item_id,
+                           turn_id, spend_key, created_at)
+VALUES (%s, %s, %s, %s, %s, %s,
+        %s || ':' || %s || ':' ||
+        to_char(now() at time zone 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+        now())
+ON CONFLICT (agent) DO UPDATE SET
+    start_index  = excluded.start_index,
+    turn         = excluded.turn,
+    model        = excluded.model,
+    work_item_id = excluded.work_item_id,
+    turn_id      = excluded.turn_id,
+    spend_key    = excluded.spend_key,
+    resident_usage = null,
+    created_at   = now()
+"""
+
+
 class StorageTest(PgTestCase):
     def test_migration_adds_both_columns(self):
         rows = self.db.query(
@@ -172,6 +195,14 @@ class StorageTest(PgTestCase):
             " AND column_name = 'attribution' ORDER BY table_name")
         self.assertEqual([(r["table_name"]) for r in rows],
                          ["spend_pending", "turn_costs"])
+
+    def test_migration_adds_the_marker_identity_for_attribution(self):
+        rows = self.db.query(
+            "SELECT table_name, data_type FROM information_schema.columns"
+            " WHERE table_schema = current_schema()"
+            " AND table_name = 'spend_pending' AND column_name = 'attribution_at'")
+        self.assertEqual([(r["table_name"], r["data_type"]) for r in rows],
+                         [("spend_pending", "timestamp with time zone")])
 
     def _insert(self, attribution, *, agent="attributed", usd=1.25):
         storage.of(self.db).turn_costs.insert(
@@ -216,11 +247,43 @@ class StorageTest(PgTestCase):
         self.previous_insert(
             "spend_pending",
             {"agent": "attributed", "start_index": 0, "turn": "tour", "model": ""},
-            added=("attribution",))
+            added=("attribution", "attribution_at"))
         marker = registry.pending_spend_get(self.db, "attributed")
         self.assertIsNotNone(marker)
         self.assertIsNone(marker["attribution"])
         registry.pending_spend_clear(self.db, "attributed")
+
+    def test_new_writer_replacement_replaces_or_clears_attribution(self):
+        self.assertTrue(registry.pending_spend_put(
+            self.db, "rewritten", 0, "tour-a", "",
+            attribution={"source": "ima"}))
+        self.assertTrue(registry.pending_spend_put(
+            self.db, "rewritten", 1, "tour-b", ""))
+        self.assertIsNone(registry.pending_spend_get(
+            self.db, "rewritten")["attribution"])
+        self.assertTrue(registry.pending_spend_put(
+            self.db, "rewritten", 2, "tour-c", "",
+            attribution={"source": "builder"}))
+        self.assertEqual(registry.pending_spend_get(
+            self.db, "rewritten")["attribution"], {"source": "builder"})
+        registry.pending_spend_clear(self.db, "rewritten")
+
+    def test_old_writer_replacement_does_not_lend_its_attribution(self):
+        """N-1 : l'`ON CONFLICT` de 782080628 remplace le marqueur sans
+        `attribution` ; le nouveau lecteur ne doit pas hériter celle du
+        marqueur précédent pour le tour suivant."""
+        self.assertTrue(registry.pending_spend_put(
+            self.db, "replaced", 0, "tour-a", "",
+            attribution={"source": "ima", "run_id": "r-a"}))
+        self.previous_write(
+            _OLD_PENDING_SPEND_PUT_GET,
+            ("replaced", 1, "tour-b", "", None, None, "replaced", 1),
+            added=("attribution", "attribution_at"))
+        marker = registry.pending_spend_get(self.db, "replaced")
+        self.assertEqual(marker["start"], 1)
+        self.assertEqual(marker["turn"], "tour-b")
+        self.assertIsNone(marker["attribution"])
+        registry.pending_spend_clear(self.db, "replaced")
 
     def test_cli_report_groups_and_shows_unattributed(self):
         self._insert({"source": "ima", "run_type": "builder"}, usd=2.0)
@@ -353,6 +416,29 @@ class TurnTest(PgTestCase):
             "SELECT attribution FROM turn_costs WHERE agent = 'attributed'"
             " ORDER BY id DESC LIMIT 1")[0]
         self.assertEqual(row["attribution"], attribution)
+        self.assertIsNone(registry.pending_spend_get(self.db, "attributed"))
+        worker.watchdog_stop.set()
+
+    def test_repair_after_an_old_writer_replacement_has_no_inherited_attribution(self):
+        """N-1 : la réparation d'un marqueur remplacé par l'ancien writer ne
+        doit pas écrire sur le grand livre l'attribution du tour précédent."""
+        runner, worker = self._worker()
+        self.assertTrue(worker._compta_marque(
+            0, "tour-a", "", attribution={"source": "ima", "run_id": "r-a"}))
+        self.previous_write(
+            _OLD_PENDING_SPEND_PUT_GET,
+            ("attributed", 1, "tour-b", "", None, None, "attributed", 1),
+            added=("attribution", "attribution_at"))
+        # un autre worker répare (même bail, autre session)
+        worker2 = AgentWorker(runner, registry.get(self.db, "attributed"), {
+            "lease_epoch": worker.epoch,
+            "lease_expires_ts": time.time() + 3600,
+        })
+        worker2._compta_termine()
+        row = self.db.query(
+            "SELECT attribution, turn FROM turn_costs WHERE agent = 'attributed'"
+            " ORDER BY id DESC LIMIT 1")[0]
+        self.assertIsNone(row["attribution"])
         self.assertIsNone(registry.pending_spend_get(self.db, "attributed"))
         worker.watchdog_stop.set()
 

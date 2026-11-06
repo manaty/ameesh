@@ -18,12 +18,23 @@
 -- ou un autre — garde la même attribution, comme le lot et l'identifiant du
 -- tour (0423, #796).
 --
+-- N-1 : un écrivain d'avant #6005 remplace le marqueur (`ON CONFLICT (agent)`)
+-- sans connaître les deux colonnes ajoutées ici. `attribution` survivrait donc
+-- à un nouveau tour sans attribut et serait héritée par la réparation.
+-- `attribution_at` est l'instant de pose de l'attribution : la lecture ne la
+-- rend que si `attribution_at = created_at` (l'identité du marqueur). Un ancien
+-- écrivain change `created_at` sans `attribution_at` : la paire devient
+-- périmée et la nouvelle lecture rend NULL.
+--
 -- Migration additive : les lignes antérieures restent NULL (aucun backfill),
--- et la nouvelle colonne est absente des vues d'avant.
+-- et les nouvelles colonnes sont absentes des vues d'avant.
 alter table turn_costs add column if not exists attribution jsonb;
 alter table spend_pending add column if not exists attribution jsonb;
+alter table spend_pending add column if not exists attribution_at timestamptz;
 
 comment on column turn_costs.attribution is
     'manaty/ameesh#4592 : attribution d''appelant du tour hors lot (JSON borné, clés allow-listées), donnée seule, jamais autorité';
 comment on column spend_pending.attribution is
     'manaty/ameesh#4592 : attribution d''appelant portée par le marqueur comptable, pour que la réparation écrive la même ligne';
+comment on column spend_pending.attribution_at is
+    'manaty/ameesh#4592 : instant de pose de l''attribution ; elle n''est lue que si attribution_at = created_at (identité du marqueur), pour qu''un écrivain N-1 qui remplace le marqueur ne la transmette pas au tour suivant';

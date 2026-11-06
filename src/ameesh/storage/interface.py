@@ -786,7 +786,9 @@ class PendingSpend(Domain):
         `created_ts` reste l'epoch float8 pour le début du tour
         (`turn_costs.started_at`). `attribution` (#6005, migration 0551) :
         l'attribution d'appelant du tour hors lot, telle que la ligne du grand
-        livre la portera ; NULL si aucune."""
+        livre la portera ; NULL si aucune, ou si un écrivain N-1 a remplacé le
+        marqueur sans réécrire l'attribution (sa pose n'est lue que sur
+        l'identité du marqueur)."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:

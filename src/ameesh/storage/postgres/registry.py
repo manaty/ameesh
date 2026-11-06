@@ -1728,7 +1728,12 @@ class PendingSpend(interface.PendingSpend):
         return f"""
 WITH marqueur_brut AS (
     SELECT agent, start_index, turn, model, work_item_id, turn_id,
-           attribution, resident_usage, spend_key,
+           -- N-1 : un ancien writer remplace l'identité du marqueur sans
+           -- `attribution_at` ; seule une attribution posée sur CETTE
+           -- identité (attribution_at = created_at) est rendue.
+           CASE WHEN attribution_at = created_at
+                THEN attribution END AS attribution,
+           resident_usage, spend_key,
            {self._EXACT_CREATED_AT} AS created_at,
            extract(epoch from created_at)::float8 AS created_ts,
            extract(epoch from created_at)::numeric AS epoch
@@ -2011,8 +2016,9 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
         rows = self.db.query(
             """
             INSERT INTO spend_pending (agent, start_index, turn, model, work_item_id,
-                                       turn_id, attribution, spend_key, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb,
+                                       turn_id, attribution, attribution_at,
+                                       spend_key, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, now(),
                     %s || ':' || %s || ':' ||
                     to_char(now() at time zone 'UTC',
                             'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
@@ -2024,11 +2030,16 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
                 work_item_id = excluded.work_item_id,
                 turn_id      = excluded.turn_id,
                 attribution  = excluded.attribution,
+                attribution_at = excluded.attribution_at,
                 spend_key    = excluded.spend_key,
                 resident_usage = null,
                 created_at   = now()
             RETURNING agent, start_index, turn, model, work_item_id, turn_id,
-                      attribution, resident_usage, spend_key,
+                      -- N-1 : un ancien writer remplace l'identité sans
+                      -- `attribution_at` ; la paire périmée ne se lit pas.
+                      CASE WHEN attribution_at = created_at
+                           THEN attribution END AS attribution,
+                      resident_usage, spend_key,
                       """ + self._EXACT_CREATED_AT + """ as created_at,
                       extract(epoch from created_at)::float8 as created_ts
             """,
