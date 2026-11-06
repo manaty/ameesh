@@ -131,6 +131,45 @@ class NoStagingTest(unittest.TestCase):
                          set(nx.STAGING_WORKFLOWS))
 
 
+class ConfigurationErrorTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = types.SimpleNamespace(state_dir=self.temp.name, host="test-host",
+                                         humans="", release={"projects": {}})
+
+    def test_an_explicit_project_must_be_declared_even_with_no_projects(self):
+        with self.assertRaises(rc.ReleaseError):
+            release._project_names(self.cfg, types.SimpleNamespace(project="nexlink"))
+        self.cfg.release = {"projects": {"nexlink": {"repo": "/unused", "target": "develop",
+                                                     "github": "acme/nexlink",
+                                                     "model": "nexlink"}}}
+        self.assertEqual(
+            release._project_names(self.cfg, types.SimpleNamespace(project="nexlink")),
+            ["nexlink"])
+
+    def test_configuration_error_is_reported_then_throttled(self):
+        fake_db = types.SimpleNamespace(close=lambda: None)
+        with mock.patch("ameesh.db.open_db", return_value=fake_db), \
+                mock.patch.object(rc, "send_report") as send:
+            release._report_configuration_error(self.cfg, "nexlink",
+                                                RuntimeError("not declared"), now=1_800_000_000.0)
+            release._report_configuration_error(self.cfg, "nexlink",
+                                                RuntimeError("not declared"), now=1_800_000_001.0)
+            release._report_configuration_error(self.cfg, "nexlink",
+                                                RuntimeError("not declared"),
+                                                now=1_800_000_000.0 + 6 * 3600 + 1)
+        self.assertEqual(send.call_count, 2)
+        self.assertIn("not declared", send.call_args.args[3])
+
+    def test_tick_reports_an_undeclared_explicit_project(self):
+        args = types.SimpleNamespace(project="nexlink", now=None, dry_run=False, json=False)
+        with mock.patch.object(release, "_report_configuration_error") as report:
+            self.assertEqual(release._release_tick(self.cfg, args, {}), 1)
+        report.assert_called_once()
+        self.assertEqual(report.call_args.args[1], "nexlink")
+
+
 class TrainPausedAlertTest(unittest.TestCase):
     class Db:
         def __init__(self, rows):
