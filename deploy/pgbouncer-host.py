@@ -37,9 +37,11 @@ APPROVED_OPERATORS = {
 #: then `no more connections allowed`): these are the values applied by hand on
 #: pc-smichea and kept here so a redeployment does not lower them again.
 #: `default_pool_size + reserve_pool_size` must not exceed
-#: `max_db_connections`. #3965 keeps the 80-slot recipe for the three original runner hosts
-#: and gives agents-3 32+8 slots: 80+80+80+40 = 280 < 300, with 20 slots
-#: left for other clients IF all four hosts use these pools exclusively.
+#: `max_db_connections`. #5983 sizes each host on the measured ratio of about
+#: 2.5 sessions per persona (bureau reading of 2026-11-06 00:47Z): agents-1
+#: drops to 48+16 = 64, the others keep #3965's sizing, so 80+64+80+40 = 264
+#: of the 297 ordinary slots (max_connections 300, 3 superuser reserved),
+#: leaving 33 for direct clients IF all four hosts use these pools exclusively.
 #: Bureau #150697 (2026-10-27): only pc-smichea currently has a pool; the
 #: three agent VMs connect directly. These recipe limits do not cap direct
 #: clients, and no existing installation is resized here.
@@ -50,7 +52,7 @@ MAX_DB_CONNECTIONS = 80
 # Named runner hosts, including the workstation whose pool is installed separately.
 POOL_LIMITS = {
     'pc-smichea': (64, 16, 80),
-    'ameesh-agents-1': (64, 16, 80),
+    'ameesh-agents-1': (48, 16, 64),
     'ameesh-agents-2': (64, 16, 80),
     'ameesh-agents-3': (32, 8, 40),
 }
