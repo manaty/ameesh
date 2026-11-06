@@ -388,6 +388,8 @@ class OperatorRecipe(unittest.TestCase):
                 conn.__enter__.return_value = conn
                 conn.info.get_parameters.return_value = dict(
                     dbname='test', user='ameesh', host='upstream', port='5432', sslmode='require')
+                conn.info.dbname, conn.info.user = 'test', 'ameesh'
+                conn.info.host, conn.info.port = 'upstream', 5432
                 conn.pgconn.password = b'fake-secret'
                 conn.pgconn.ssl_in_use = True
 
@@ -471,6 +473,73 @@ class OperatorRecipe(unittest.TestCase):
                     self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
                     self.assertTrue(unit.exists())
                     self.assertEqual(original.read_bytes(), raw)
+
+    def test_install_reads_libpq_resolved_upstream_parameters(self):
+        # #6029 : get_parameters() omet les valeurs par défaut (port 5432,
+        # user et dbname venus de l'environnement) ; seules les valeurs
+        # résolues de conn.info font foi.
+        try:
+            import psycopg
+        except ImportError:
+            self.skipTest('operator recipe requires psycopg')
+        from ameesh import config as config_mod
+        cases = (
+            ('default port', dict(host='upstream', sslmode='require'),
+             dict(host='upstream', port=5432, dbname='test', user='ameesh'), True, None),
+            ('custom port', dict(host='upstream', port='6543', sslmode='verify-full'),
+             dict(host='upstream', port=6543, dbname='test', user='ameesh'), True, None),
+            ('environment', dict(),
+             dict(host='db.example', port=5432, dbname='envdb', user='envuser'), True, None),
+            ('no TLS', dict(host='upstream'),
+             dict(host='upstream', port=5432, dbname='test', user='ameesh'), False, 'TLS'),
+            ('bad user', dict(host='upstream'),
+             dict(host='upstream', port=5432, dbname='test', user='bad user'), True,
+             'unsupported upstream identifiers'),
+        )
+        for name, params, resolved, tls, refusal in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                original = home / '.config/ameesh/config.json'
+                original.parent.mkdir(parents=True)
+                original.write_text('{"dsn":"sslmode=require"}')
+                state = home / '.local/state/pgbouncer'
+                config = home / '.config/pgbouncer/pgbouncer.ini'
+                conn = mock.MagicMock()
+                conn.__enter__.return_value = conn
+                conn.info.get_parameters.return_value = params
+                for key, value in resolved.items():
+                    setattr(conn.info, key, value)
+                conn.pgconn.password = b'fake-secret'
+                conn.pgconn.ssl_in_use = tls
+
+                def compile_fake(_home, create):
+                    binary = _home / '.local/bin/pgbouncer'
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    create(binary, b'fake pinned binary', 0o755)
+
+                with mock.patch.object(config_mod, 'load', return_value=types.SimpleNamespace(
+                        backend='postgres', dsn='sslmode=require')), \
+                        mock.patch.object(psycopg, 'connect', return_value=conn), \
+                        mock.patch.object(self.recipe, 'compile_binary', side_effect=compile_fake), \
+                        mock.patch.object(self.recipe.subprocess, 'run', return_value=types.SimpleNamespace(
+                            stdout='PgBouncer ' + self.recipe.VERSION)), \
+                        mock.patch.object(self.recipe, 'run'), \
+                        mock.patch.object(self.recipe, 'socket_conninfo',
+                                          return_value='host=/private/socket sslmode=disable'):
+                    if refusal:
+                        with self.assertRaisesRegex(ValueError, refusal):
+                            self.recipe.install(home, state, config)
+                        self.assertFalse(config.exists())
+                        self.assertFalse((home / '.local/bin/pgbouncer').exists())
+                        continue
+                    self.recipe.install(home, state, config)
+                ini = config.read_text()
+                self.assertIn(f"{resolved['dbname']} = host={resolved['host']} "
+                              f"port={resolved['port']} dbname={resolved['dbname']}", ini)
+                self.assertIn(f"admin_users = {resolved['user']}", ini)
+                self.assertIn(f'"{resolved["user"]}" "fake-secret"',
+                              (config.parent / 'userlist.txt').read_text())
+                self.assertIn(f"server_tls_sslmode = {params.get('sslmode', 'require')}", ini)
 
     def test_failed_exclusive_write_removes_partial_file(self):
         with tempfile.TemporaryDirectory() as directory:
