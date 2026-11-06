@@ -336,6 +336,9 @@ CONTEXT_RESUME_EVENTS = 200
 #: CTX-04a (#4970) : motif d'une clôture sur budget de relecture opt-in, publié
 #: dans `turn.context` ; ni rotation ni compactage pour ce seul motif.
 REREAD_BUDGET_CLOSE = "reread_budget"
+#: #6046 : bloc `session` du canon pas encore lu pour ce tour (`None` est une
+#: lecture faite : pas de canon ou pas de bloc)
+_SESSION_UNREAD = object()
 #: #3070 : levée des portes d'appareil indisponible, au plus toutes les 5 min
 DEVICE_GATES_EVERY_S = 300.0
 #: #2096 : bornes de l'affichage gardé pour un tour de résumé (repli d'un flux
@@ -2504,10 +2507,23 @@ class AgentWorker(threading.Thread):
         from .exploitation import effective_context_max
         return effective_context_max(self.cfg, self.agent)
 
+    def canon_session(self):
+        """#6046 : le bloc `session` du canon appliqué, lu au premier besoin
+        du tour puis gardé jusqu'au tour suivant (`_run_turn` l'oublie) : le
+        budget de relecture se relit à chaque usage du flux, la découverte du
+        canon ne doit pas suivre ce rythme."""
+        block = getattr(self, "_canon_session", _SESSION_UNREAD)
+        if block is _SESSION_UNREAD:
+            from . import mechanics
+            block = self._canon_session = mechanics.session_block(self.cfg)
+        return block
+
     def turn_reread_budget(self) -> int:
-        """Budget `R_turn` (CTX-04a) : réglage de l'agent (#5250), sinon exécuteur."""
+        """Budget `R_turn` (CTX-04a) : réglage de l'agent (#5250), sinon son
+        rôle (#6046), sinon exécuteur."""
         from .exploitation import effective_turn_reread_budget
-        return effective_turn_reread_budget(self.cfg, getattr(self, "agent", None))
+        return effective_turn_reread_budget(self.cfg, getattr(self, "agent", None),
+                                            AgentWorker.canon_session(self))
 
     def session_reread_budget(self) -> int:
         """Budget `R_session` (CTX-04a) : réglage de l'agent (#5250), sinon exécuteur."""
@@ -2516,9 +2532,18 @@ class AgentWorker(threading.Thread):
 
     def compact_tokens(self) -> int | None:
         """Seuil de compaction native du harnais (#6040) : réglage de l'agent,
-        sinon None (défaut du harnais)."""
+        sinon son rôle (#6046), sinon None (défaut du harnais)."""
         from .exploitation import effective_compact_tokens
-        return effective_compact_tokens(getattr(self, "agent", None))
+        return effective_compact_tokens(getattr(self, "agent", None),
+                                        AgentWorker.canon_session(self))
+
+    def context_setting_sources(self) -> dict:
+        """#6046 : la source de chaque réglage de contexte par rôle (`agent`,
+        `role:<classe>`, `host`, `default`), publiée dans `turn.context.policy`."""
+        from .exploitation import compact_tokens_source, turn_reread_budget_source
+        agent, session = getattr(self, "agent", None), AgentWorker.canon_session(self)
+        return {"turn_reread_budget": turn_reread_budget_source(self.cfg, agent, session)[1],
+                "compact_tokens": compact_tokens_source(agent, session)[1]}
 
     def turn_max_seconds(self) -> int:
         """Durée maximale d'un tour (L105) : réglage de l'agent
@@ -5438,6 +5463,12 @@ class AgentWorker(threading.Thread):
                 "context_max_tokens": self.context_max_tokens(),
                 "session_max_tokens": self.session_max_tokens(),
             }
+            # #6046 : la source des seuls réglages publiés dans la politique
+            publies = {"turn_reread_budget": self.turn_reread_budget() > 0,
+                       "compact_tokens": bool(self._turn_compact_tokens)}
+            sources = {key: source
+                       for key, source in self.context_setting_sources().items()
+                       if publies[key]}
             decision = {
                 "policy": {
                     "contract": context_metrics.SCHEMA,
@@ -5456,6 +5487,8 @@ class AgentWorker(threading.Thread):
                     # pas le réglage (harnais emprunté ou sans option : absent).
                     **({"compact_tokens": self._turn_compact_tokens}
                        if self._turn_compact_tokens else {}),
+                    # #6046 : d'où viennent ces réglages (agent, rôle, hôte).
+                    **({"sources": sources} if sources else {}),
                 },
                 # Le journal partagé porte des états, pas du texte libre : le
                 # motif est normalisé (`kind`), les valeurs qui l'ont déclenché
@@ -8564,6 +8597,8 @@ class AgentWorker(threading.Thread):
         #: ou processus résident) ; l'échéance d'un réveil programmé n'est
         #: consommée qu'à ce moment.
         self._turn_launched = False
+        # #6046 : le bloc `session` du canon se relit à chaque tour
+        self._canon_session = _SESSION_UNREAD
         with self._lease_heartbeat():
             try:
                 with self._preparing("turn setup"):

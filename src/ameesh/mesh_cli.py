@@ -1392,6 +1392,16 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             print("credits  : %s ok (no credit exhaustion seen)" % credit_harness)
         print("lease    : %s" % _lease(row))
         print("model    : %-9s budget: %s" % (row.get("model") or "—", _budget(row)))
+        # #6046 : réglages de contexte et leur source (agent, role:<classe>,
+        # host, default)
+        from . import exploitation, mechanics
+        session = mechanics.session_block(cfg)
+        relecture, relecture_source = exploitation.turn_reread_budget_source(
+            cfg, row, session)
+        compact, compact_source = exploitation.compact_tokens_source(row, session)
+        print("context  : turn_reread_budget=%s (%s)   compact_tokens=%s (%s)" % (
+            relecture or "off", relecture_source,
+            compact or "harness default", compact_source))
         print("responsible: %s   team: %s%s" % (
             row.get("responsible") or "none (not claimable if required)",
             row.get("team") or "—",
@@ -3624,7 +3634,7 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "default"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "default"
         politique = agent.get("session_policy") or "default (%s)" % cfg.session_policy
-        from .exploitation import (effective_compact_tokens, effective_context_max,
+        from .exploitation import (compact_tokens_source, effective_context_max,
                                    effective_turn_grace_seconds,
                                    effective_turn_mail_max, effective_turn_max_seconds)
 
@@ -3648,8 +3658,14 @@ def cmd_set(cfg: Config, args) -> int:
         regroupement_txt = ("immediate" if secondes == 0 else "%ds" % secondes) + (
             "" if regroupement else " (default)")
         reveil_txt = agent.get("lot_wake") or "default (%s)" % ("on" if cfg.lot_wake else "off")
-        # #6040 : seuil de compaction native, sinon le défaut du harnais
-        compact_txt = str(effective_compact_tokens(agent) or "harness default")
+        # #6040 : seuil de compaction native, sinon le défaut du harnais ;
+        # #6046 : un seuil venu du rôle (canon) le dit
+        from . import mechanics
+        compact_valeur, compact_source = compact_tokens_source(
+            agent, mechanics.session_block(cfg))
+        compact_txt = ("harness default" if compact_valeur is None
+                       else "%d" % compact_valeur if compact_source == "agent"
+                       else "%d (%s)" % (compact_valeur, compact_source))
         print("%s: model=%s effort=%s tier=%s session=%s mode=%s context=%s compact=%s "
               "turn_max_s=%s mail_per_turn=%s background_grace_s=%s mail_batch=%s "
               "lot_wake=%s harness_bin=%s (takes effect at the next turn)"

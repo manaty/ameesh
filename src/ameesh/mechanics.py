@@ -65,6 +65,11 @@ mécanique, ce que l'outillage exécute sans agent :
   (`claude`, `codex`, `deepseek`, une famille déclarée). Bloc absent : la
   valeur locale de l'exécuteur (`AMEESH_SESSION_MAX_TOKENS`), jamais un seuil
   supposé ; un harnais sans surcharge prend la valeur commune.
+- `session.by_role.<classe>.turn_reread_budget` et `….compact_tokens` (#6046,
+  clé optionnelle du bloc) : les réglages de contexte d'une classe de rôle du
+  contrat (`pilot`, `review`, `build`…). Ordre de lecture, champ par champ :
+  agent (registre) → rôle (canon) → hôte (`AMEESH_*`) → défaut du harnais ;
+  un agent à plusieurs rôles prend la valeur la plus stricte de ses classes.
 
 Les classes sensibles et le nombre d'avis par chemin ne sont pas répétés : ils
 viennent de `federation.yaml` (`review_policies.risk_classes` et
@@ -146,8 +151,15 @@ _PACKET_TESTS_OPTIONAL = ("total_timeout_seconds",)
 _FILE_KEYS = ("repos_part", "repos_s", "wake_mail_s")
 #: #5005 : routage temporaire des prises automatiques.
 _AUTO_TAKE_KEYS = ("excluded_families", "expire")
-#: #4448 : clés du bloc optionnel `session` (rotation par harnais)
-_SESSION_KEYS = ("max_tokens", "max_tokens_by_harness")
+#: #4448 : clés du bloc optionnel `session` (rotation par harnais) ; #6046 :
+#: `by_role`, les réglages de contexte par classe de rôle
+_SESSION_KEYS = ("max_tokens", "max_tokens_by_harness", "by_role")
+#: #6046 : réglages admis sous `session.by_role.<classe>`
+ROLE_SETTINGS = ("turn_reread_budget", "compact_tokens")
+#: #6040 : plus petit seuil de compaction native admis (jamais 0 : compaction
+#: à chaque appel) — la borne de l'agent (`mesh_cli.COMPACT_TOKENS_MIN`,
+#: contrainte de 0553), répétée ici sans importer la CLI ; un test les lie
+COMPACT_TOKENS_MIN = 10_000
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
 _VALUE_SCORE = (1, 100)
 
@@ -266,10 +278,15 @@ class Session:
     `max_tokens` est la valeur commune (jetons cumulés de la session) ;
     `by_harness` la surcharge d'un harnais déclaré, `()` si aucune. Un harnais
     absent de la table prend la valeur commune — jamais un seuil local
-    implicite quand le bloc est là."""
+    implicite quand le bloc est là.
+
+    #6046 : `by_role` porte les réglages de contexte d'une classe de rôle
+    (`((classe, ((clé, valeur), …)), …)`, `()` si aucun) ; ils ne passent
+    qu'après le réglage propre de l'agent."""
 
     max_tokens: int
     by_harness: tuple[tuple[str, int], ...] = ()
+    by_role: tuple[tuple[str, tuple[tuple[str, int], ...]], ...] = ()
 
     def max_tokens_for(self, harness: str) -> float:
         """Le seuil du harnais, sinon la valeur commune du bloc."""
@@ -278,11 +295,27 @@ class Session:
                 return float(value)
         return float(self.max_tokens)
 
+    def role_value(self, classes, key: str) -> tuple[int, str] | None:
+        """#6046 : la valeur la plus stricte (la plus petite) de `key` parmi
+        les classes de rôle données, avec sa classe ; `None` si aucune de ces
+        classes ne la déclare. À égalité, la première classe donnée."""
+        best: tuple[int, str] | None = None
+        for klass in classes:
+            for name, settings in self.by_role:
+                if name != klass:
+                    continue
+                value = dict(settings).get(key)
+                if value is not None and (best is None or value < best[0]):
+                    best = (value, klass)
+        return best
+
     def to_dict(self) -> dict:
         out: dict = {"max_tokens": self.max_tokens}
         if self.by_harness:
             out["max_tokens_by_harness"] = {
                 name: value for name, value in self.by_harness}
+        if self.by_role:
+            out["by_role"] = {name: dict(settings) for name, settings in self.by_role}
         return out
 
 
@@ -1020,7 +1053,45 @@ def _session(value, where: str, families: tuple[str, ...]) -> Session:
                 % (where, name, ", ".join(families)))
         items.append((name, _positive_int(
             tokens, "%s.max_tokens_by_harness.%s" % (where, name))))
-    return Session(max_tokens=common, by_harness=tuple(sorted(items)))
+    return Session(max_tokens=common, by_harness=tuple(sorted(items)),
+                   by_role=_by_role(data.get("by_role", {}), where + ".by_role"))
+
+
+def _by_role(value, where: str) -> tuple[tuple[str, tuple[tuple[str, int], ...]], ...]:
+    """#6046 : `session.by_role`, les réglages de contexte par classe de rôle.
+
+    Chaque clé est une classe du contrat de contexte (`pilot`, `review`,
+    `build`…, `context_profile.ROLES`) : un nom fin de fiche ou une faute de
+    frappe refuse, il ne crée pas un rôle silencieux. Chaque classe déclare au
+    moins un réglage de `ROLE_SETTINGS`, en entier strictement positif
+    (`0` n'éteint rien ici : l'extinction reste un réglage d'agent) ;
+    `compact_tokens` au moins `COMPACT_TOKENS_MIN`.
+    """
+    from .context_profile import ROLES
+
+    if not isinstance(value, dict):
+        raise MechanicsError("%s: a mapping is required" % where)
+    out: list[tuple[str, tuple[tuple[str, int], ...]]] = []
+    for role, settings in value.items():
+        name = _name(role, where)
+        if name not in ROLES:
+            raise MechanicsError("%s.%s: not a role class (%s)"
+                                 % (where, name, ", ".join(ROLES)))
+        data = _mapping(settings, "%s.%s" % (where, name), ROLE_SETTINGS)
+        if not data:
+            raise MechanicsError("%s.%s: at least one of %s is required"
+                                 % (where, name, ", ".join(ROLE_SETTINGS)))
+        pairs: list[tuple[str, int]] = []
+        for key in ROLE_SETTINGS:
+            if key not in data:
+                continue
+            number = _positive_int(data[key], "%s.%s.%s" % (where, name, key))
+            if key == "compact_tokens" and number < COMPACT_TOKENS_MIN:
+                raise MechanicsError("%s.%s.compact_tokens: at least %d"
+                                     % (where, name, COMPACT_TOKENS_MIN))
+            pairs.append((key, number))
+        out.append((name, tuple(pairs)))
+    return tuple(sorted(out))
 
 
 def _name(value, where: str) -> str:
@@ -1298,6 +1369,34 @@ def session_max_tokens(cfg, harness: str, fallback: float) -> float:
     except Exception:  # noqa: BLE001 — canon absent/illisible : repli local, jamais fatal
         return float(fallback)
     return document.session_max_tokens(harness, fallback)
+
+
+def session_block(cfg) -> Session | None:
+    """#6046 : le bloc `session` du canon appliqué, ou `None` (canon absent ou
+    illisible, document sans bloc). Une lecture coûte la découverte du canon :
+    l'appelant la fait une fois (par tour, par listing), puis passe le bloc à
+    `role_setting`."""
+    try:
+        return configured(cfg).session
+    except Exception:  # noqa: BLE001 — canon absent/illisible : niveau suivant
+        return None
+
+
+def role_setting(session: Session | None, roles, key: str) -> tuple[int, str] | None:
+    """#6046 : le réglage `key` de `session.by_role` pour ces rôles de fiche.
+
+    Rend `(valeur, "role:<classe>")`, la plus stricte des classes de tous les
+    rôles déclarés (`context_profile.role_classes`), ou `None` : pas de bloc
+    (`session_block` rendu `None`) ou aucune valeur pour ces classes. Le
+    niveau suivant (hôte, défaut du harnais) s'applique alors, comme avant
+    #6046 — jamais une valeur supposée.
+    """
+    from .context_profile import role_classes
+
+    if session is None:
+        return None
+    found = session.role_value(role_classes(roles or ()), key)
+    return None if found is None else (found[0], "role:" + found[1])
 
 
 @functools.lru_cache(maxsize=256)

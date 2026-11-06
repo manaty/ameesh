@@ -109,6 +109,7 @@ SCHEMA_KEYS = (
     "auto_take.expire",
     "session.max_tokens",
     "session.max_tokens_by_harness",
+    "session.by_role",
     "production.branch",
     "projects",
 )
@@ -174,6 +175,8 @@ BINDINGS = {
     "session_max_tokens": "session.max_tokens",
     "session_max_tokens_by_harness": "session.max_tokens_by_harness",
     "max_tokens_by_harness": "session.max_tokens_by_harness",
+    # #6046 : les réglages de contexte par classe de rôle
+    "session_by_role": "session.by_role",
 }
 
 #: constantes d'implémentation historiques dont le nom ne porte pas la clé
@@ -226,6 +229,8 @@ DICT_BINDINGS = {
     "wake_mail_s": "file.wake_mail_s",
     # #4448 : une table de seuils par harnais recopiée dans un mapping
     "max_tokens_by_harness": "session.max_tokens_by_harness",
+    # #6046 : une table de réglages par rôle recopiée dans un mapping
+    "by_role": "session.by_role",
 }
 #: clés du bloc `prevalidation` dans un mapping, seulement dans un fichier
 #: qui parle de prévalidation
@@ -559,6 +564,9 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "session.max_tokens_by_harness":
         # #4448 : la table des seuils par harnais, recopiée en mapping
         return value == "<dict>"
+    if key == "session.by_role":
+        # #6046 : la table des réglages par classe de rôle, recopiée en mapping
+        return value == "<dict>"
     if key == "production.branch":
         # #3022 : la branche de prod d'un projet se lit dans le canon
         # (`projects.<projet>.production.branch`), jamais recopiée en dur.
@@ -610,6 +618,8 @@ def _binding_key(name: str, value, train_context: bool,
         key = "file.wake_mail_s"
     if key is None and lower.endswith("session_max_tokens_by_harness"):
         key = "session.max_tokens_by_harness"
+    if key is None and lower.endswith("session_by_role"):
+        key = "session.by_role"
     if key is None and lower.endswith("session_max_tokens"):
         key = "session.max_tokens"
     if key is None:

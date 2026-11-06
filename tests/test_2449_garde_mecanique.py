@@ -145,6 +145,8 @@ POSITIVE = {
     "session.max_tokens": "SESSION_MAX_TOKENS = 150000\n",
     "session.max_tokens_by_harness":
         'SESSION_MAX_TOKENS_BY_HARNESS = {"codex": 2000000}\n',
+    "session.by_role":
+        'SESSION_BY_ROLE = {"review": {"compact_tokens": 100000}}\n',
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',
     "production.branch": 'production_branch = "main"\n',
 }

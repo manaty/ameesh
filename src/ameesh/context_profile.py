@@ -132,6 +132,29 @@ def role_of(roles) -> str:
     return ROLE_OTHER
 
 
+def role_classes(roles) -> tuple[str, ...]:
+    """Les classes de politique de **tous** les rôles déclarés (#6046).
+
+    Contrairement à :func:`role_of` (le rôle principal, que le profil date),
+    un budget par rôle (`session.by_role`) doit voir chaque rôle de la fiche :
+    la valeur la plus stricte l'emporte. Ordre de déclaration, sans doublon ;
+    un rôle hors vocabulaire vaut ``other``, une fiche sans rôle ``(other,)``.
+    """
+    if isinstance(roles, str):
+        roles = [roles]
+    if isinstance(roles, (set, frozenset)):
+        roles = sorted(roles, key=lambda item: str(item))
+    out: list[str] = []
+    for role in roles if isinstance(roles, (list, tuple)) else ():
+        name = str(role or "").strip().lower()
+        if not name:
+            continue
+        klass = name if name in ROLES else ROLE_BY_CANON.get(name, ROLE_OTHER)
+        if klass not in out:
+            out.append(klass)
+    return tuple(out) or (ROLE_OTHER,)
+
+
 def _name(value) -> str | None:
     """Un nom de modèle non vide, ou ``None`` (jamais une chaîne vide)."""
     if not isinstance(value, str):
