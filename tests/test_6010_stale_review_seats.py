@@ -46,6 +46,23 @@ class StaleSeatTest(unittest.TestCase):
         cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
         self.assertEqual(cap["held"], [])
 
+    def test_a_seat_on_a_validated_lot_holds_nobody(self):
+        # #6024 : validé, le lot n'attend plus d'avis
+        notes = [exhausted(), seat("ameesh-idle-0", "designated review pending on #130")]
+        lots = [{"id": 130, "app": "ameesh", "state": "validated"}]
+        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
+        self.assertEqual(cap["held"], [])
+
+    def test_the_only_eligible_seat_requires_qa(self):
+        # #6024 : comme `_reviewer_spares`, hors `qa` pas de représentant
+        why = "only eligible reviewer of family deepseek for pending freeze #130"
+        notes = [exhausted(), seat("ameesh-idle-0", why)]
+        for state, held in (("build", []), ("qa", [{
+                "agent": "ameesh-idle-0", "reason": "review seat: " + why}])):
+            lots = [{"id": 130, "app": "ameesh", "state": state}]
+            cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
+            self.assertEqual(cap["held"], held, state)
+
     def test_a_seat_on_a_waiting_lot_still_holds(self):
         notes = [exhausted(), seat("ameesh-idle-0", "designated review pending on #130")]
         lots = [{"id": 130, "app": "ameesh", "state": "qa"}]
