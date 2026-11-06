@@ -120,7 +120,7 @@ ETATS_TRAVAIL = ("build", "qa")
 #: le reposer avant le tour) ; au-dela, la sonde reste non remise
 LEVEES_MAX = 3
 #: #6013 : raison journalisee de la levee bornee (prefixe du decoupage, #4610)
-LEVEE_SONDE = "%s siege de sonde staging, hote %s (#6013)"
+LEVEE_SONDE = "%s sonde %s %s (siege de sonde staging, #6013)"
 
 PROBE_TEMPLATE = """Sonde de sante staging (#1155), hote {hote}, commit {sha}.
 Message automatique du systeme : il verifie qu'un tour reel s'execute sur cet
@@ -671,7 +671,8 @@ def lever_sommeil(db, siege_: dict) -> bool:
     try:
         fait = agent_pause.change(
             db, siege_["persona"], paused=False,
-            reason=LEVEE_SONDE % (file_decoupage.SLEEP_LIFT_PREFIX, siege_["hote"]),
+            reason=LEVEE_SONDE % (file_decoupage.SLEEP_LIFT_PREFIX, siege_["hote"],
+                                  siege_["message"]),
             actor=agent_pause.FILE_DECOUPAGE_ACTOR, principal=principal,
             expect_reason=siege_["sommeil"])
     except Exception as exc:  # noqa: BLE001 — le sommeil reste, la sonde non concluante
@@ -738,7 +739,8 @@ def probe(db, row: dict, sha: str, attente: float,
     if not sommeil_auto(row):
         return _probe(db, row, sha, attente, hote_mesure, alternatives=alternatives)
     siege_ = {"persona": row["name"], "hote": hote_mesure or row.get("host") or "",
-              "sommeil": row.get("operator_pause_reason"), "levees": 0,
+              "sommeil": row.get("operator_pause_reason"), "message": None,
+              "levees": 0,
               "leve": False, "retabli": None, "pourquoi": None}
     try:
         resultat = _probe(db, row, sha, attente, hote_mesure, siege_=siege_)
@@ -785,6 +787,8 @@ def _probe(db, row: dict, sha: str, attente: float,
         # rien n'est mesure sur l'hote. Non concluant, jamais un KO (canon §3).
         return dict(out, concluant=False, tour="cible retiree avant l'envoi")
     out["message"] = message_id
+    if siege_ is not None:
+        siege_["message"] = message_id
     if siege_ is not None and not lever_sommeil(db, siege_):
         # #6013 : le sommeil n'a pas ete leve : rien n'est mesure sur l'hote
         return dict(out, concluant=False,

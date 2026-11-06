@@ -142,7 +142,9 @@ class SiegeSondeTest(unittest.TestCase):
         self.assertEqual(levee['expect'], SOMMEIL)
         self.assertEqual(levee['actor'], 'ameesh:file-decoupage')
         self.assertEqual(levee['principal'], 'human:smichea')
-        self.assertIn('#6013', levee['reason'])
+        # pilote 01:40Z : la raison nomme la sonde, l'hote et le message
+        self.assertIn('sonde ameesh-agents-3 7 ', levee['reason'])
+        self.assertTrue(levee['reason'].startswith('automatic sleep lifted:'))
         self.assertTrue(pose['paused'])
         self.assertEqual(pose['reason'], SOMMEIL)
         self.assertEqual(pose['until'], MAINTENANT + 3600)
@@ -227,6 +229,20 @@ class SiegeSondeTest(unittest.TestCase):
         self.assertFalse(resultat['siege']['retabli'])
         self.assertIn('#42', resultat['siege']['retablissement'])
         self.assertEqual(len(monde.gestes), 1)
+
+    def test_tour_en_echec_sommeil_repose(self):
+        """Une erreur pendant la sonde : le sommeil est repose (finally)."""
+        monde = Monde(self.rangs())
+        rows = self.rangs()
+        with _ensemble(monde.patches(self.mod)), \
+                mock.patch.object(self.mod.mail, 'get', side_effect=RuntimeError('base')):
+            cible, _, _ = self.mod.selection(object(), rows, 'auto', 300.0, MAINTENANT)
+            with self.assertRaises(RuntimeError):
+                self.mod.probe(object(), cible, 'abc', 300.0, 'ameesh-agents-3')
+        levee, pose = monde.gestes
+        self.assertFalse(levee['paused'])
+        self.assertTrue(pose['paused'])
+        self.assertEqual(monde.etats['impl-13']['operator_pause_reason'], SOMMEIL)
 
     def test_non_remise_sommeil_repose_a_la_fin(self):
         """Executeur absent : la borne passe, le sommeil est repose quand meme."""
