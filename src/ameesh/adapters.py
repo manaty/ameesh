@@ -306,7 +306,9 @@ LOT_WAKE_PROMPT = (
     "assigned to you and actionable. Continue it now. If it cannot advance "
     "(waiting on someone or something), record why with: ameesh work note %(id)d "
     "\"hold: <reason>\" (or move it to blocked), and you will not be woken for it "
-    "again; once it is ready for review, move it to qa."
+    "again; once it is ready for review, freeze it with: ameesh work milestone "
+    "%(id)d frozen --sha <reviewed head> (moves it to qa and designates its "
+    "reviewers; work move qa does not freeze)."
 )
 
 #: #2466 : réveil programmé (séance owner, relecture planifiée, échéance de
