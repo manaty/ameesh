@@ -38,6 +38,11 @@ l'hôte en retrait : une fois le retour acquis, le worker solde la demande
 périmée et l'alerte disparaît. Ces alertes nomment le worker et le couple
 génération/époque ; elles ne demandent pas de retirer le hook d'une VM
 encore arrêtée.
+La même alerte part sans attendre (#6074, motif `halt_deadline`,
+`archive_refused`, `provider_locked` ou `stopped_in_place`) quand l'arrêt de
+l'OS n'est pas prouvé à l'échéance, quand l'archivage n'est pas permis, quand
+la VM est `locked`, ou quand elle est en veille sans intention halt de la
+vague.
 
 Un seul hôte opérateur, externe aux VM qu'il gère, exécute le timer. Son
 inscription privée fixe les UUID VM/projet et la zone ; aucune identité,
@@ -49,13 +54,62 @@ borné à dix secondes au maximum. Les contrôles de santé et de réconciliatio
 s'exécutent hors de ce verrou, puis génération et relevé frais sont revérifiés
 sous verrou avant l'acquittement. Un tick ne boucle ni sur l'API ni sur la santé.
 
-L'arrêt est `poweroff`, jamais `stop_in_place`, arrêt du seul OS, suppression,
-redimensionnement ou création. L'API doit ensuite rendre `stopped` avant
-acquittement. Le calcul cesse alors d'être facturé ; disques et IP restent
-facturés. Voir les sources opérateur :
+L'arrêt se fait en deux phases (#6074), sous la même génération/époque, et
+chaque effet est précédé d'une intention durable (marqueur `result` de la
+demande `idle-drained`) :
+
+1. `poweroff intent` : hystérésis passée, tentative native durable.
+2. `halt intent` : preuves de repos et d'élection revérifiées, `quiesce_argv`
+   à 0. Au tick suivant, preuves et quiesce sont revérifiées, puis
+   `halt_argv` s'exécute une seule fois (`halt sent`). Son code de retour ne
+   prouve rien. La doc Scaleway demande d'arrêter l'OS avant le poweroff
+   (« Before powering off your Instance, shut down the OS [...] executing the
+   halt command », `pages/instances/how-to/power-off-instance.mdx`). Un
+   `poweroff` lancé dans l'invité met la VM en veille, état `stopped in place`
+   (« will shut down your Instance and switch it to standby mode »,
+   `use-standby-mode.mdx`). Une VM en veille reste facturée.
+3. Preuve : l'état fournisseur `stopped in place` est observé après l'intention
+   halt de cette vague, **et** `halted_argv` rend 0 (SSH opérateur muet, borné).
+   Un SSH muet ne suffit jamais seul : tant que le fournisseur dit `running`,
+   aucun poweroff n'est envoyé et le témoin n'est pas consulté.
+   `archive intent` est alors persistée.
+4. Au tick suivant, le poweroff fournisseur (archivage) part seulement si le
+   GET du serveur liste `poweroff` dans `allowed_actions`. Ce champ est
+   obligatoire dans l'objet `Server` (SDK `scaleway-sdk-python`,
+   `instance/v1/types.py`). Sinon : `archive refused` et alerte, aucune action.
+   La réponse POST ne vaut pas preuve : le GET doit ensuite rendre `stopped`
+   avant l'acquittement.
+
+`halt_deadline_s` (explicite, au plus 3600 s) borne les phases 2 et 3, compté
+depuis l'intention. À l'échéance sans preuve : `halt deadline passed`, une
+alerte qui nomme l'hôte et la génération, aucun poweroff, jamais `lost`. Une
+preuve qui arrive après l'échéance reste valable. Un `stopped in place` sans
+intention halt de la vague est une anomalie : il est alerté et jamais archivé
+automatiquement. Un retour demandé pendant ces phases passe par la demande
+`busy` : depuis la veille, `poweron` part si `allowed_actions` le permet,
+puis running, relevé frais, santé et réconciliation, comme tout réveil. Une
+interruption se relit depuis le dernier marqueur, et le GET fournisseur
+précède toute action.
+
+Jamais `stop_in_place` par l'API, ni suppression, redimensionnement ou
+création. Une fois `stopped`, le calcul cesse d'être facturé ; disques et IP
+restent facturés. Sources opérateur, lues dans `scaleway/docs-content`
+(`pages/instances/how-to/power-off-instance.mdx`, `use-standby-mode.mdx`,
+`concepts.mdx`) et :
 [états Scaleway](https://www.scaleway.com/en/docs/instances/reference-content/instance-states/),
 [actions Instance](https://www.scaleway.com/en/developers/cli/instance/) et
 [facturation](https://www.scaleway.com/en/docs/instances/reference-content/understanding-instance-pricing/).
+
+Le type de volume change la durée de l'arrêt. AG3 (GP1-S, relevé GET du
+bureau du 06/11/2026) a un volume unique `l_ssd` local de 150 Go. Le
+poweroff le copie vers le stockage de volumes (« Powering off may take some
+time, depending on the amount of data in the Instance's local volume »), et
+le poweron le restaure : `stopping` et `starting` peuvent durer. Tant que le
+fournisseur dit `stopping`, la demande est rafraîchie : un archivage qui
+avance ne lève pas `host_release_adapter_stalled`. `locked` lève l'alerte en
+nommant l'hôte, sans `lost`. Les durées réelles viennent du premier cycle
+mesuré, jamais d'une estimation ; le délai de réveil mesuré inclut la
+restauration.
 
 Le drainage natif reste à sa durée canonique. L'hystérésis est distincte :
 minimum allumé, repos prouvé au moins égal au maximum du drainage, du minimum
@@ -92,12 +146,20 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    dans les courriers, dans le dépôt ou dans les erreurs. Écrire
    `database.env` (0600) avec le chemin `AMEESH_CONFIG` de la connexion mesh
    de l'opérateur. Le DSN ne contient aucune clé cloud.
-5. Fournir trois commandes fixes par VM, détenues par l'opérateur et non
+5. Fournir cinq commandes fixes par VM, détenues par l'opérateur et non
    modifiables par les agents. Elles n'héritent d'aucune variable de secret
    cloud ; argv absolu, pas de shell, sorties supprimées, échec = attente.
-   `quiesce_argv` vérifie l'arrêt propre de l'OS avant archivage, sans toucher
-   à une autre VM. `health_argv` vérifie version/mode réellement actifs,
-   runners vivants, doctor vert et courrier livré. `reconcile_argv` termine
+   `quiesce_argv` vérifie en lecture seule que l'OS peut s'arrêter proprement
+   (aucun tour, aucune écriture en cours), sans toucher à une autre VM.
+   `halt_argv` arrête l'OS de la seule VM cible par l'accès SSH opérateur
+   (`poweroff` dans l'invité, qui la met en veille côté fournisseur), en au
+   plus 10 s ; il ne bloque pas sur la déconnexion. `halted_argv` rend 0
+   seulement si l'accès SSH opérateur de cette VM ne répond plus dans sa
+   borne (témoin, jamais preuve seule). `health_argv` vérifie version/mode réellement actifs,
+   runners vivants, doctor vert et courrier livré ; après un arrêt de
+   l'adaptateur, il vérifie aussi que le journal du boot précédent
+   (`journalctl -b -1`) se termine par un arrêt propre (#6074, lecture seule :
+   aucune récupération de journal ni de système de fichiers). `reconcile_argv` termine
    et vérifie la réconciliation native des exécuteurs/identités, sans ouvrir
    les prises ni forcer un état lost. Utiliser l'accès SSH déjà autorisé,
    avec clé et known_hosts opérateur fixes, aucun login/secret d'agent.
@@ -113,10 +175,13 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    au-delà, retour en `draining` comme un échec. Le wrapper opérateur lance
    la sonde **une seule fois**, en asynchrone, et ne rend jamais `0` sur une
    livraison seule ni sur une preuve ancienne ; tout autre code est un échec.
-6. Faire relire les mappings, les trois commandes, les durées, les créneaux,
+6. Faire relire les mappings, les cinq commandes, les durées
+   (`halt_deadline_s`, `health_deadline_s`), les créneaux,
    les permissions des fichiers et l'unité avec `systemd-analyze verify`.
-   Tester le cycle cloud simulé avant tout feu réel. Faire valider séparément
-   le premier arrêt/réveil et son temps mesuré par le bureau.
+   Tester le cycle cloud simulé avant tout feu réel (séquence halt → preuve
+   → poweroff). Faire valider séparément le premier arrêt/réveil par le
+   bureau, avec ses temps mesurés : halt jusqu'à `stopped in place`,
+   archivage jusqu'à `stopped`, restauration jusqu'à la santé.
 7. Au feu d'installation seulement : rendre l'inscription active, poser les
    unités, recharger systemd et activer le timer sur ce seul hôte. Déclarer
    le hook sans secret dans la configuration des seuls hôtes autorisés.

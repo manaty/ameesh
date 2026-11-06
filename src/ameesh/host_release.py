@@ -27,7 +27,9 @@ no cluster or cloud credential.
   `hook_wait_*`, keeps the previous acknowledged state and the closed claims,
   and raises `host_release_adapter_stalled` only when the queued worker stops
   ticking, keeps a durable poweroff intent too long, or leaves an obsolete
-  intent.
+  intent; #6074: also at once for a halt past its deadline, an archive the
+  provider does not allow, a `locked` VM or a `stopped in place` VM without
+  a halt intent of the wave.
 
 The scanner is serialised per host (`host_release_locks`): the many runners of
 a host do not each call the adapter. The expensive idle projection is spaced
@@ -50,6 +52,14 @@ STATES = ("busy", "draining", "idle-drained")
 #: It is neither an acknowledgement (exit 0) nor a failure: the worker owns
 #: the completion, claims stay closed and the scanner records a wait.
 ADAPTER_WAIT_CODE = 75
+# #6074: VM adapter request markers (`ameesh.vm_adapter`). The first ones age
+# against the stall bound (an archive still `stopping` refreshes its row); the
+# halt phase has its own enrolled deadline; the last ones alert at once.
+ADAPTER_AGING = ("poweroff intent", "archive intent", "poweroff sent")
+ADAPTER_HALTING = ("halt intent", "halt sent", "halt deadline passed",
+                   "archive intent", "archive refused")
+ADAPTER_IMMEDIATE = {"halt deadline passed": "halt_deadline",
+                     "archive refused": "archive_refused"}
 #: bounded text kept from a hook
 DETAIL_MAX = 400
 #: a run count is usable only when A published a real source
@@ -793,6 +803,15 @@ def _adapter_worker_seen(db, host):
         return None
 
 
+def _adapter_provider_state(db, host):
+    """#6074: provider state seen by the last VM adapter tick, or None."""
+    try:
+        from .storage.postgres.vm_adapter import Queue
+        return Queue(db).provider_state(host)
+    except Exception:
+        return None
+
+
 def alerts(cfg, db, now, *, listing=None, orchestrators=()):
     """Agent-facing warnings derived from the durable release controls."""
     from .exploitation import _alert
@@ -880,9 +899,23 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
             # only when it stopped progressing: a durable poweroff intent older
             # than the bound, or no worker tick for that long.
             poweroff = next((row for row in live
-                             if row.get("result") == "poweroff intent"), None)
+                             if row.get("result") in ADAPTER_AGING), None)
             oldest = live[0]
-            if poweroff is not None and (_age(poweroff) or 0.0) > stall:
+            immediate = next((row for row in live
+                              if row.get("result") in ADAPTER_IMMEDIATE), None)
+            provider = _adapter_provider_state(db, host)
+            if immediate is not None:
+                stalled, reason = immediate, ADAPTER_IMMEDIATE[immediate["result"]]
+            elif provider == "locked":
+                stalled, reason = oldest, "provider_locked"
+            elif provider == "stopped in place" and not any(
+                    row.get("state") == "busy"
+                    or row.get("result") in ADAPTER_HALTING + ("poweroff sent",)
+                    for row in live):
+                # Standby without our halt intent: still billed, never
+                # archived automatically (#6074).
+                stalled, reason = oldest, "stopped_in_place"
+            elif poweroff is not None and (_age(poweroff) or 0.0) > stall:
                 stalled, reason = poweroff, "poweroff"
             elif ((worker_seen is None or now - worker_seen > stall)
                     and (_age(oldest) or 0.0) > stall):
@@ -906,6 +939,32 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                               host, stalled.get("state"),
                               stalled.get("generation"), stalled.get("release_epoch"),
                               int(_age(stalled) or 0.0), generation, epoch,
+                              "open" if control.get("claims_open") else "closed",
+                              control.get("hook_state") or "none"))
+            elif reason in ("halt_deadline", "archive_refused",
+                            "provider_locked", "stopped_in_place"):
+                what = {
+                    "halt_deadline": "the OS halt was not proven before the "
+                                     "enrolled halt deadline (provider not `stopped "
+                                     "in place`, or SSH still answers); no provider "
+                                     "poweroff is sent",
+                    "archive_refused": "the OS halt is proven but the server "
+                                       "GET does not allow `poweroff` "
+                                       "(allowed_actions); no archive is sent and "
+                                       "the VM stays in standby, still billed",
+                    "provider_locked": "the provider reports the VM `locked`",
+                    "stopped_in_place": "the provider reports the VM `stopped in "
+                                        "place` (standby, still billed) without a "
+                                        "halt intent of this wave; it is never "
+                                        "archived automatically",
+                }[reason]
+                detail = ("Host %s, generation %s/epoch %s: %s. Claims %s and the "
+                          "acknowledged state (%s) are kept; the host is not "
+                          "lost. Check the VM and the worker journal "
+                          "(`journalctl -u ameesh-vm-adapter`); a return "
+                          "request powers a standby VM back on." % (
+                              host, stalled.get("generation"),
+                              stalled.get("release_epoch"), what,
                               "open" if control.get("claims_open") else "closed",
                               control.get("hook_state") or "none"))
             elif reason == "worker":

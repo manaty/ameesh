@@ -15,6 +15,16 @@ worker journals the completion under the same generation/epoch.
 a probe turn still in flight (the host stays `returning`, same probe), any
 other code is a failure. The wait is bounded by `health_deadline_s` counted
 from the probe admission; past it the return goes back to `draining`.
+
+#6074: the native stop has two phases under one generation/epoch, each effect
+preceded by a durable intent (the request `result`). The OS is halted first
+(`halt_argv`, Scaleway power-off-instance.mdx: "Before powering off your
+Instance, shut down the OS [...] halt"); an in-guest poweroff leaves the VM
+`stopped in place` (use-standby-mode.mdx, still billed). Only that provider
+state observed after our halt intent, plus a muted SSH witness
+(`halted_argv`), proves the halt; the provider `poweroff` (archive) then runs
+only if the server GET lists it in `allowed_actions`. A running VM is never
+powered off, whatever SSH says; past `halt_deadline_s` the worker alerts.
 """
 from __future__ import annotations
 
@@ -38,6 +48,19 @@ from .storage.postgres.vm_adapter import Queue
 
 class Refused(ValueError):
     pass
+
+
+# #6074: `vm_adapter_requests.result` markers of the idle-drained request, in
+# order. Each one is committed before the effect that follows it.
+STOP_PREPARED = 'poweroff intent'   # hysteresis passed, native attempt durable
+HALT_INTENT = 'halt intent'         # quiesce ok; halt_argv may run next tick
+HALT_SENT = 'halt sent'             # halt_argv ran once; its return is no proof
+HALT_LATE = 'halt deadline passed'  # OS still up at the deadline: alert only
+ARCHIVE_INTENT = 'archive intent'   # halt proven; provider poweroff next tick
+ARCHIVE_REFUSED = 'archive refused'  # halt proven, poweroff not allowed: alert
+POWEROFF_SENT = 'poweroff sent'     # provider accepted; `stopped` still required
+HALTING = (HALT_INTENT, HALT_SENT, HALT_LATE, ARCHIVE_INTENT, ARCHIVE_REFUSED)
+PHASES = (STOP_PREPARED, POWEROFF_SENT) + HALTING
 
 
 def private_json(path):
@@ -65,6 +88,11 @@ def enrollment(value, *, local_host=None):
             raise Refused('positive adapter timing required')
     if value['io_timeout_s'] > 10:
         raise Refused('external call timeout exceeds 10 seconds')
+    # #6074: explicit bound on the halt phase, counted from the halt intent.
+    bound = value.get('halt_deadline_s')
+    if (isinstance(bound, bool) or not isinstance(bound, (float, int)) or not math.isfinite(bound)
+            or not value['io_timeout_s'] < bound <= 3600):
+        raise Refused('explicit halt deadline required (at most 3600 seconds)')
     # #6073: explicit bound on a health turn still in flight (75), counted
     # from the probe admission; a probe turn waits up to 300 s for its mail.
     bound = value.get('health_deadline_s')
@@ -99,7 +127,7 @@ def enrollment(value, *, local_host=None):
         if identity in seen:
             raise Refused('duplicate VM mapping')
         seen.add(identity)
-        for key in ('health_argv', 'reconcile_argv', 'quiesce_argv'):
+        for key in ('health_argv', 'reconcile_argv', 'quiesce_argv', 'halt_argv', 'halted_argv'):
             argv = target.get(key)
             if (not isinstance(argv, list) or not argv or not all(
                     isinstance(a, str) and a and '\x00' not in a for a in argv)
@@ -141,14 +169,24 @@ class Scaleway:
             # No URL, provider body, header, token or exception text is logged.
             raise Refused('provider unavailable; reconcile on next tick') from None
 
-    def state(self, target):
+    def _server(self, target):
         server = self._call(target).get('server', {})
         if (server.get('id') != target['server_id'] or server.get('project') != target['project_id']):
             raise Refused('provider identity mismatch')
-        state = server.get('state')
+        return server
+
+    def state(self, target):
+        # The SDK enum spells it `stopped_in_place`; one name in the journal.
+        state = str(self._server(target).get('state')).replace('_', ' ')
         if state not in ('running', 'stopped', 'starting', 'stopping', 'stopped in place', 'locked'):
             raise Refused('unknown provider state')
         return state
+
+    def allowed(self, target):
+        """#6074: `allowed_actions` of the server GET (ServerAction enum), or an
+        empty set when absent: no action is then deduced as allowed."""
+        actions = self._server(target).get('allowed_actions')
+        return set(actions) if isinstance(actions, list) else set()
 
     def action(self, target, action):
         if action not in ('poweron', 'poweroff'):
@@ -313,11 +351,15 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             return 'obsolete'
         verb = request['state']
         if (control.get('hook_attempt_state') == verb
-                and (verb != 'idle-drained' or request.get('result') != 'poweroff intent')
+                and (verb != 'idle-drained' or request.get('result') not in PHASES)
                 and now - (control.get('hook_attempt_ts') or 0) < host_release._attempt_bound(cfg)):
             return 'native hook in flight'
         if state == 'stopping':
             q.refresh_stop_intent(host)
+            if request.get('result') in (ARCHIVE_INTENT, POWEROFF_SENT):
+                # #6074: archiving a local volume takes long; progress is not
+                # a stall (host_release_adapter_stalled ages this row).
+                q.touch(request)
         if verb == 'draining':
             q.complete(request, 'claims closed; no cloud effect')
             return 'draining'
@@ -329,6 +371,24 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             if state == 'stopped':
                 q.complete(request, 'compute stopped')
                 return 'stopped'
+            result = request.get('result')
+            if result in HALTING:
+                q.refresh_stop_intent(host)
+            if result in (HALT_INTENT, HALT_SENT) and state != 'stopped in place':
+                since = q.result_since(request, result)
+                if since is not None and now - since > policy['halt_deadline_s']:
+                    # The OS still answers or the provider never saw it stop:
+                    # no poweroff, never lost; host_release names the host.
+                    q.finish(request, 'pending', HALT_LATE)
+                    return 'halt deadline passed'
+            if result in HALTING and not (result == HALT_INTENT and state == 'running'):
+                return halted(q, request, target, policy, provider, state, probe)
+            if result == POWEROFF_SENT and state != 'running':
+                return 'provider transition'
+            if state == 'stopped in place':
+                # Not after our halt intent: anomaly alerted by host_release
+                # (still billed), never archived automatically.
+                return 'stopped in place without halt'
             if state != 'running':
                 return 'provider transition'
             quiet_s = max(cfg.idle_after_s, policy['min_on_s'], 2 * delay)
@@ -337,16 +397,30 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             if (quiet is None or now - quiet < quiet_s
                     or observed['on_ts'] is None or now - observed['on_ts'] < policy['min_on_s']):
                 return 'on hysteresis'
-            if request.get('result') != 'poweroff intent':
+            if result not in (STOP_PREPARED, HALT_INTENT):
                 q.stop_intent(request)
                 return 'stop prepared'
             q.refresh_stop_intent(host)
             if not probe(target['quiesce_argv'], policy['io_timeout_s']):
                 return 'quiesce pending'
-            provider.action(target, 'poweroff')
-            # Provider acceptance is not completion. Next tick must see stopped.
-            q.finish(request, 'pending', 'poweroff intent')
-            return 'stopping'
+            if result == STOP_PREPARED:
+                q.finish(request, 'pending', HALT_INTENT)
+                return 'halt prepared'
+            # The halt intent was committed by an earlier tick and the idle,
+            # election and quiesce proofs hold again now. The command cannot
+            # attest its own end: only the provider state proves the halt.
+            probe(target['halt_argv'], policy['io_timeout_s'])
+            q.finish(request, 'pending', HALT_SENT)
+            return 'halt sent'
+        if state == 'stopped in place':
+            # #6074: a return between halt and archive. Standby keeps the
+            # local volume (use-standby-mode.mdx): power on when the server
+            # GET allows it; claims still wait for running, health, reconcile.
+            if 'poweron' not in provider.allowed(target):
+                return 'poweron not allowed'
+            q.started(host)
+            provider.action(target, 'poweron')
+            return 'starting'
         if state == 'stopped':
             if observed['off_ts'] is None or now - observed['off_ts'] < policy['min_off_s']:
                 return 'off hysteresis'
@@ -385,6 +459,35 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
         q.healthy(host)
         q.complete(request, 'healthy and reconciled')
         return 'ready'
+
+
+def halted(q, request, target, policy, provider, state, probe):
+    """#6074: second phase, after the committed halt intent of this request.
+
+    `request` is current (same generation/epoch as the control), so a
+    `stopped in place` seen here comes after our own halt intent. Proof =
+    that state AND a muted operator SSH witness; then the archive intent is
+    committed, and the provider poweroff runs on the next tick only if the
+    server GET still allows it. Running is never powered off."""
+    result = request['result']
+    if state != 'stopped in place':
+        return 'halt deadline passed' if result == HALT_LATE else 'halt pending'
+    if result == ARCHIVE_INTENT:
+        if 'poweroff' not in provider.allowed(target):
+            q.finish(request, 'pending', ARCHIVE_REFUSED)
+            return 'archive not allowed'
+        provider.action(target, 'poweroff')
+        # Provider acceptance is not completion. Next tick must see stopped.
+        q.finish(request, 'pending', POWEROFF_SENT)
+        return 'archiving'
+    if not probe(target['halted_argv'], policy['io_timeout_s']):
+        return 'halt witness pending'
+    if 'poweroff' not in provider.allowed(target):
+        if result != ARCHIVE_REFUSED:
+            q.finish(request, 'pending', ARCHIVE_REFUSED)
+        return 'archive not allowed'
+    q.finish(request, 'pending', ARCHIVE_INTENT)
+    return 'halt proven'
 
 
 def main(argv=None):
