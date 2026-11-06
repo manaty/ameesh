@@ -120,6 +120,26 @@ def validate_staging(project, sha, workflow):
         raise rc.ReleaseError("Malformed staging workflow") from exc
 
 
+def staging_jobs(project, sha, workflow):
+    """#6020: the display names of the frozen workflow's staging deploy jobs.
+
+    A green run whose deploy job was skipped (`test_only`) deployed nothing:
+    the attestation must show each of these jobs successful. A name built
+    from an expression cannot be matched and is refused."""
+    from .canon import load_yaml, YamlError
+    validate_staging(project, sha, workflow)
+    text = rc._git(project.repo, "show", sha + ":.github/workflows/" + workflow,
+                   check=True).stdout
+    try:
+        names = [str(job.get("name") or key) for key, job in load_yaml(text)["jobs"].items()
+                 if job.get("environment") == "staging"]
+    except (AttributeError, TypeError, KeyError, YamlError) as exc:
+        raise rc.ReleaseError("Malformed staging workflow") from exc
+    if any("${{" in name for name in names):
+        raise rc.ReleaseError("staging deploy job name is an expression: %s" % workflow)
+    return names
+
+
 def version_key(value):
     match = _VERSION.fullmatch(value)
     if not match:
@@ -611,14 +631,44 @@ def open_handoff_lot(db, project, pending):
     return int(created["id"])
 
 
-def write_decision(db, project_name, version, text, actor):
-    """Write a reserved attestation/skip note on the open attestation lot."""
-    from . import storage, work
+#: #6020 (B1 cx3): the structured proof of a decision note, written only by
+#: `write_decision`; no free-text journal write (`work move --note` …) fills
+#: `evidence`, like the review floor (#3183).
+DECISION_SCHEMA = "ameesh-release-handoff/1"
+
+
+def write_decision(db, project_name, version, kind, text, actor):
+    """Write a decision note, with its proof, on the open attestation lot."""
+    from . import work, work_lifecycle
     item = work.open_with_source(db, handoff_source(project_name, version))
     if item is None:
         raise rc.ReleaseError("no open attestation lot for %s %s" % (project_name, version))
-    storage.of(db).work.note(int(item["id"]), item["state"], text, actor)
+    evidence = {"schema": DECISION_SCHEMA, "kind": kind, "project": project_name,
+                "version": version, "actor": actor}
+    with db.transaction() as tx:
+        tx.execute("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                   (int(item["id"]),))
+        tx.execute("INSERT INTO work_item_events (work_item_id, state, note, actor, evidence)"
+                   " VALUES (%s, %s, %s, %s, %s::jsonb)",
+                   (int(item["id"]), work_lifecycle.phase(item), text, actor,
+                    json.dumps(evidence)))
+        tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
+                   (int(item["id"]),))
     return int(item["id"])
+
+
+def decision_authentic(row, project_name, version, kind):
+    """The note carries the proof `write_decision` wrote, for its own author."""
+    evidence = row.get("evidence")
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except ValueError:
+            return False
+    return (isinstance(evidence, dict) and evidence.get("schema") == DECISION_SCHEMA
+            and evidence.get("kind") == kind and evidence.get("project") == project_name
+            and evidence.get("version") == version
+            and evidence.get("actor") == (row.get("actor") or "") and bool(row.get("actor")))
 
 
 def verify_attestation(project, pending, data):
@@ -637,9 +687,23 @@ def verify_attestation(project, pending, data):
     for workflow in STAGING_WORKFLOWS:
         run_id = int(data["runs"][workflow])
         try:
+            # B1 impl-03: the frozen workflow is the closed staging one.
+            jobs = staging_jobs(project, sha, workflow)
+        except rc.TransientReleaseError:
+            raise
+        except (rc.ReleaseError, subprocess.CalledProcessError) as exc:
+            return "reject", "%s at %s is not a staging workflow: %s" % (
+                workflow, sha[:12], exc)
+        try:
             run = json.loads(gh(project, ["api", "repos/%s/actions/runs/%d" % (slug, run_id)]))
-        except ValueError as exc:
-            raise rc.TransientReleaseError("Nexlink run %d unreadable" % run_id) from exc
+            if not isinstance(run, dict):
+                raise ValueError("not a run")
+        except rc.TransientReleaseError as exc:
+            if "404" in str(exc) or "Not Found" in str(exc):
+                return "reject", "run %d (%s) not found" % (run_id, workflow)
+            return "wait", "run %d (%s) unreadable: %s" % (run_id, workflow, exc)
+        except ValueError:
+            return "wait", "run %d (%s) unreadable" % (run_id, workflow)
         path = str(run.get("path") or "").split("@")[0]
         if (path != ".github/workflows/" + workflow or run.get("head_sha") != sha
                 or run.get("head_branch") != "release/" + version
@@ -651,7 +715,21 @@ def verify_attestation(project, pending, data):
         if run.get("conclusion") != "success":
             return "reject", "run %d (%s) concluded %s" % (
                 run_id, workflow, run.get("conclusion"))
-        evidence.append({"workflow": workflow, "id": run_id, "url": run.get("html_url")})
+        # B2 cx3: a green run with its deploy job skipped deployed nothing.
+        try:
+            listed = json.loads(gh(project, ["api", "repos/%s/actions/runs/%d/jobs?per_page=100"
+                                             % (slug, run_id)])).get("jobs") or []
+        except (rc.TransientReleaseError, ValueError, AttributeError) as exc:
+            return "wait", "jobs of run %d (%s) unreadable: %s" % (run_id, workflow, exc)
+        for name in jobs:
+            done = [job for job in listed if isinstance(job, dict) and (
+                job.get("name") == name or str(job.get("name") or "").startswith(name + " ("))]
+            if not done or any(job.get("conclusion") != "success" for job in done):
+                return "reject", "run %d (%s): deploy job %s did not succeed (%s)" % (
+                    run_id, workflow, name, ", ".join(
+                        str(job.get("conclusion")) for job in done) or "absent")
+        evidence.append({"workflow": workflow, "id": run_id, "url": run.get("html_url"),
+                         "jobs": jobs})
     return "ok", {"runs": evidence, "migrations": data.get("migrations") or []}
 
 
@@ -663,6 +741,8 @@ def _announce(cfg, db, project, body, report, *, urgent=True):
 
 def _handoff_open(cfg, db, project, pending, now, save):
     """Tag published: hand staging over, once, and say what to attest."""
+    for workflow in STAGING_WORKFLOWS:
+        staging_jobs(project, pending["sha"], workflow)  # refused before handing over
     required = migration_requirements(project, pending["sha"], pending["main"])
     rows = [{"target": target, "version": row["version"], "name": row["name"]}
             for target, entries in sorted(required.items()) for row in entries]
@@ -688,11 +768,19 @@ def _handoff_open(cfg, db, project, pending, now, save):
                               deadline=deadline, rejected={}, instructions=instructions)
     save()
     if db is not None:
-        pending["handoff"]["lot"] = open_handoff_lot(db, project, pending)
+        from . import work
+        try:
+            pending["handoff"]["lot"] = open_handoff_lot(db, project, pending)
+        except work.WorkError as exc:
+            # The tag is out: the wait still runs and the next tick retries.
+            pending["handoff"]["lot_error"] = str(exc)
         save()
     body = instructions
     if pending["handoff"].get("lot"):
         body += "\nLot d'attestation : #%d." % pending["handoff"]["lot"]
+    if pending["handoff"].get("lot_error"):
+        body += ("\nLot d'attestation NON ouvert : %s. Corriger staging_handoff ; "
+                 "le tic suivant réessaie." % pending["handoff"]["lot_error"])
     _announce(cfg, db, project, body, dict(pending, result="waiting-attestation"),
               urgent=False)
     return dict(pending, result="waiting-attestation")
@@ -710,6 +798,7 @@ def _handoff_resolution(cfg, db, project, pending, save):
         return None
     if not handoff.get("lot"):
         handoff["lot"] = open_handoff_lot(db, project, pending)
+        handoff.pop("lot_error", None)
         save()
     waiting = None
     for row in work.events_noted(db, handoff["lot"], "release-"):
@@ -720,6 +809,10 @@ def _handoff_resolution(cfg, db, project, pending, save):
         if decision is None:
             continue
         kind, data = decision
+        if not decision_authentic(row, project.name, pending["version"],
+                                  "skipped" if kind == "skipped" else "attested"):
+            # B1 cx3: same text through another journal write (`move --note`).
+            kind, data = "malformed", "note without the proof of ameesh release attest"
         if kind == "skipped":
             return "skipped", dict(event=int(row["id"]), actor=actor, reason=data)
         why = data if kind == "malformed" else ""
@@ -746,6 +839,28 @@ def _handoff_resolution(cfg, db, project, pending, save):
         handoff.pop("waiting", None)
     save()
     return None
+
+
+def _handoff_resolution_guarded(cfg, db, project, pending, save):
+    """B2 impl-03: a read failure (GitHub, journal, lot) is said once per
+    distinct error and never skips the deadline and held-cutoff announcements."""
+    from . import work
+    handoff = pending["handoff"]
+    try:
+        outcome = _handoff_resolution(cfg, db, project, pending, save)
+    except (rc.ReleaseError, work.WorkError, OSError,
+            subprocess.SubprocessError) as exc:
+        text = str(exc) or type(exc).__name__
+        if handoff.get("error") != text:
+            handoff["error"] = text
+            save()
+            _announce(cfg, db, project, "Nexlink %s : lecture de l'attestation de staging "
+                      "en échec : %s. L'attente continue." % (pending["version"], text),
+                      dict(pending, result="attestation-unreadable", message=text))
+        return None
+    if handoff.pop("error", None) is not None:
+        save()
+    return outcome
 
 
 def _handoff_waiting(cfg, db, project, pending, at, label, now, save):
@@ -894,7 +1009,7 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
         pending = slot.get("pending_nexlink")
         passed = None
         if pending is not None and pending.get("handoff"):
-            outcome = _handoff_resolution(cfg, db, project, pending, save)
+            outcome = _handoff_resolution_guarded(cfg, db, project, pending, save)
             if outcome is None:
                 return _handoff_waiting(cfg, db, project, pending, at, label, now, save)
             kind, detail = outcome

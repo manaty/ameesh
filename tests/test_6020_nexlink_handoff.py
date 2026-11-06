@@ -66,6 +66,43 @@ class PublishedVersionTests(unittest.TestCase):
             nx.choose_version(self.project, "11ar")
 
 
+class StagingJobsTests(unittest.TestCase):
+    def test_deploy_jobs_of_the_frozen_workflow(self):
+        temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(temp.cleanup)
+        repo = Path(temp.name)
+        subprocess.check_call(["git", "init", "-q", str(repo)])
+        workflow = repo / ".github" / "workflows" / "deploy-web.yml"
+        workflow.parent.mkdir(parents=True)
+        good = """env:
+  SERVICE: nexlink-web-staging
+jobs:
+  runner-guard:
+    steps: []
+  deploy:
+    environment: staging
+    steps:
+      - with:
+          service_account: '${{ vars.GCP_STAGING_DEPLOYER_SA }}'
+"""
+        project = rc.ProjectRelease("nexlink", str(repo), model="nexlink")
+
+        def commit(text):
+            workflow.write_text(text)
+            subprocess.check_call(["git", "-C", str(repo), "add", "."])
+            subprocess.check_call(["git", "-C", str(repo), "-c", "user.name=t", "-c",
+                                   "user.email=t@localhost", "commit", "-qm", "w"])
+            return subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                           text=True).strip()
+        self.assertEqual(nx.staging_jobs(project, commit(good), "deploy-web.yml"), ["deploy"])
+        named = commit(good.replace("  deploy:\n", "  deploy:\n    name: Deploy ${{ x }}\n"))
+        with self.assertRaisesRegex(rc.ReleaseError, "expression"):
+            nx.staging_jobs(project, named, "deploy-web.yml")
+        prod = commit(good.replace("environment: staging", "environment: production"))
+        with self.assertRaises(rc.ReleaseError):
+            nx.staging_jobs(project, prod, "deploy-web.yml")
+
+
 class ConfigurationTests(unittest.TestCase):
     def test_handoff_is_a_nexlink_key_without_credential(self):
         cfg = types.SimpleNamespace(humans="", radar={})
@@ -144,8 +181,9 @@ class AttestCommandTests(unittest.TestCase):
     def test_attestation_author_is_the_bound_identity(self):
         status, write = self.run_attest(self.args())
         self.assertEqual(status, 0)
-        project, version, text, actor = write.call_args.args[1:]
-        self.assertEqual((project, version, actor), ("nexlink", "11at", "bureau"))
+        project, version, kind, text, actor = write.call_args.args[1:]
+        self.assertEqual((project, version, kind, actor),
+                         ("nexlink", "11at", "attested", "bureau"))
         self.assertEqual(nx.read_decision("nexlink", "11at", text)[0], "attested")
         for args in (self.args(actor="bureau"), self.args(sha="abc"),
                      self.args(run=["deploy-api.yml=1"])):
@@ -164,7 +202,7 @@ class AttestCommandTests(unittest.TestCase):
         write.assert_not_called()
         status, write = self.run_attest(skip, corrector=lambda *a, **k: "mesh-design")
         self.assertEqual(status, 0)
-        self.assertEqual(write.call_args.args[4], "mesh-design")
+        self.assertEqual(write.call_args.args[3:6:2], ("skipped", "mesh-design"))
         no_reason = self.args(sha=None, run=[], migration=[], skip=True)
         self.assertEqual(self.run_attest(no_reason,
                                          corrector=lambda *a, **k: "mesh-design")[0], 1)
@@ -178,8 +216,27 @@ def api_run(workflow, run_id, **change):
     return row
 
 
-def note(event_id, actor, text):
-    return {"id": event_id, "actor": actor, "note": text}
+def note(event_id, actor, text, *, proof=True):
+    kind = "skipped" if text.startswith(nx.SKIP_PREFIX) else "attested"
+    evidence = ({"schema": nx.DECISION_SCHEMA, "kind": kind, "project": "nexlink",
+                 "version": "11at", "actor": actor} if proof else None)
+    return {"id": event_id, "actor": actor, "note": text, "evidence": evidence}
+
+
+def fake_gh(runs, jobs=None):
+    """GitHub API: runs/<id> and runs/<id>/jobs; unknown id → 404."""
+    jobs = jobs or {}
+
+    def call(project, args):
+        path = args[1].split("?")[0].split("/")
+        run_id = int(path[path.index("runs") + 1])
+        if run_id not in runs:
+            raise rc.TransientReleaseError("Nexlink GitHub operation failed: HTTP 404: Not Found")
+        if path[-1] == "jobs":
+            return json.dumps({"jobs": jobs.get(run_id, [{"name": "deploy",
+                                                          "conclusion": "success"}])})
+        return json.dumps(runs[run_id])
+    return call
 
 
 class HandoffPipelineTests(unittest.TestCase):
@@ -207,6 +264,7 @@ class HandoffPipelineTests(unittest.TestCase):
                    mock.patch.object(rc, "fetch"), mock.patch.object(rc, "write_report"),
                    mock.patch.object(nx, "ensure_ref"),
                    mock.patch.object(nx, "open_handoff_lot", return_value=77),
+                   mock.patch.object(nx, "staging_jobs", return_value=["deploy"]),
                    mock.patch.object(work, "events_noted",
                                      side_effect=lambda db, lot, prefix: list(self.notes)),
                    mock.patch.object(nx, "migration_requirements", return_value={
@@ -245,12 +303,12 @@ class HandoffPipelineTests(unittest.TestCase):
         data.update(change)
         self.notes.append(note(event_id, actor, nx.attestation_text("nexlink", "11at", **data)))
 
-    def gh_runs(self, change=None):
+    def gh_runs(self, change=None, jobs=None, extra=None):
         change = change or {}
         runs = {run_id: api_run(workflow, run_id, **change.get(run_id, {}))
                 for workflow, run_id in RUNS.items()}
-        return mock.patch.object(nx, "gh", side_effect=lambda project, args: json.dumps(
-            runs[int(args[1].rsplit("/", 1)[1])]))
+        runs.update(extra or {})
+        return mock.patch.object(nx, "gh", side_effect=fake_gh(runs, jobs))
 
     def test_cutoff_tags_reports_and_opens_the_attestation_lot(self):
         with mock.patch.dict(os.environ, {"SUPABASE_ACCESS_TOKEN": ""}):
@@ -301,11 +359,8 @@ class HandoffPipelineTests(unittest.TestCase):
         """cx1 B1: [running attestation, newer valid one] and [running, skip]."""
         self.handed_over()
         self.attest(5, runs=dict(RUNS, **{"deploy-api.yml": 21}))
-        running = {21: dict(status="in_progress", conclusion=None)}
-        runs = {21: api_run("deploy-api.yml", 21, **running[21])}
-        runs.update({run_id: api_run(workflow, run_id) for workflow, run_id in RUNS.items()})
-        gh = mock.patch.object(nx, "gh", side_effect=lambda project, args: json.dumps(
-            runs[int(args[1].rsplit("/", 1)[1])]))
+        gh = self.gh_runs(extra={21: api_run("deploy-api.yml", 21, status="in_progress",
+                                             conclusion=None)})
         with gh:
             self.assertEqual(self.run_tick(2000)["result"], "waiting-attestation")
         self.assertIn("still in_progress", self.slot()["pending_nexlink"]["handoff"]["waiting"])
@@ -323,6 +378,73 @@ class HandoffPipelineTests(unittest.TestCase):
             report = self.run_tick(2000)
         self.assertEqual(report["result"], "staging-unattested")
         self.assertIn("passé par mesh-design (on passe)", self.sent[-1][0])
+
+    def test_forged_notes_without_proof_are_refused(self):
+        """B1 cx3: the reserved text through `work move --note` carries no proof."""
+        self.handed_over()
+        self.notes.append(note(5, "mty-amh-impl-3", nx.skip_text("nexlink", "11at", "x"),
+                               proof=False))
+        self.notes.append(note(6, "bureau", nx.attestation_text(
+            "nexlink", "11at", sha=SHA, runs=dict(RUNS),
+            migrations=[{"target": "hub", "version": 540}]), proof=False))
+        with self.gh_runs():
+            self.assertEqual(self.run_tick(2000)["result"], "waiting-attestation")
+        rejected = self.slot()["pending_nexlink"]["handoff"]["rejected"]
+        self.assertEqual(sorted(rejected), ["5", "6"])
+        self.assertIn("without the proof", rejected["5"])
+
+    def test_staging_workflow_and_deploy_job_are_checked(self):
+        """B1 impl-03 (frozen workflow) and B2 cx3 (deploy job skipped)."""
+        self.handed_over()
+        self.attest(5)
+        with self.gh_runs(jobs={11: [{"name": "deploy", "conclusion": "skipped"},
+                                     {"name": "test", "conclusion": "success"}]}):
+            self.run_tick(2000)
+        self.attest(6)
+        with self.gh_runs(), mock.patch.object(
+                nx, "staging_jobs", side_effect=rc.ReleaseError("environment must be staging")):
+            self.assertEqual(self.run_tick(2100)["result"], "waiting-attestation")
+        rejected = self.slot()["pending_nexlink"]["handoff"]["rejected"]
+        self.assertIn("deploy job deploy did not succeed (skipped)", rejected["5"])
+        self.assertIn("is not a staging workflow", rejected["6"])
+
+    def test_unknown_run_then_skip(self):
+        """B2 impl-03: a run id GitHub does not know is refused, a skip still lands."""
+        self.handed_over()
+        self.attest(5, runs=dict(RUNS, **{"deploy-web.yml": 999}))
+        with self.gh_runs():
+            self.assertEqual(self.run_tick(2000)["result"], "waiting-attestation")
+        self.assertIn("999 (deploy-web.yml) not found",
+                      self.slot()["pending_nexlink"]["handoff"]["rejected"]["5"])
+        self.notes.append(note(6, "mesh-design", nx.skip_text("nexlink", "11at", "run perdu")))
+        with self.gh_runs():
+            self.assertEqual(self.run_tick(2100)["result"], "staging-unattested")
+
+    def test_read_failure_keeps_the_bounded_wait(self):
+        """B2 impl-03: a journal or GitHub failure never skips the announcements."""
+        from ameesh import work
+        self.handed_over()
+        before = len(self.sent)
+        with mock.patch.object(work, "events_noted",
+                               side_effect=rc.TransientReleaseError("journal down")):
+            for now in (4700, 4800):
+                self.assertEqual(self.run_tick(now)["result"], "waiting-attestation")
+        bodies = [body for body, _r, _k in self.sent[before:]]
+        self.assertEqual(len(bodies), 2)
+        self.assertIn("lecture de l'attestation de staging en échec : journal down", bodies[0])
+        self.assertIn("attestation de staging absente", bodies[1])
+
+    def test_lot_that_cannot_open_is_reported_and_retried(self):
+        from ameesh import work
+        with mock.patch.object(nx, "open_handoff_lot",
+                               side_effect=work.WorkError("bureau is not external")):
+            self.assertEqual(self.handed_over()["result"], "waiting-attestation")
+        self.assertIn("Lot d'attestation NON ouvert : bureau is not external", self.sent[-1][0])
+        self.assertEqual(self.slot()["pending_nexlink"]["handoff"]["lot_error"],
+                         "bureau is not external")
+        self.attest(5)
+        with self.gh_runs():
+            self.assertEqual(self.run_tick(2000)["result"], "released")
 
     def test_missing_attestation_announced_once_at_deadline(self):
         self.handed_over()

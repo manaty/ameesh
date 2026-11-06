@@ -599,7 +599,9 @@ def _attest(cfg, args) -> int:
                 args.project, args.version, sha=args.sha,
                 runs=nexlink_release.parse_runs(args.run),
                 migrations=nexlink_release.parse_migrations(args.migration))
-        lot = nexlink_release.write_decision(db, args.project, args.version, text, actor)
+        lot = nexlink_release.write_decision(db, args.project, args.version,
+                                             "skipped" if args.skip else "attested",
+                                             text, actor)
         print("release %s %s: %s noted on lot #%d by %s; the release tick checks it"
               % (args.project, args.version, "skip" if args.skip else "attestation",
                  lot, actor))
