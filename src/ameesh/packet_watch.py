@@ -23,6 +23,9 @@ canon), une fois le délai de grâce passé et jusqu'au créneau suivant :
   désignerait un second composeur, exactement la course h-21/h-22 du 05/11 ;
 * la liste calculée (`packet_candidates.inventory`, la même que
   `scripts/paquet-candidats.py`) rend-elle au moins un lot prêt ?
+* #6062 : ce lot est-il prêt depuis plus que la grâce ? Un lot devenu prêt
+  juste après un passage du composeur horaire (toutes les 10 min) sera pris
+  au suivant : il n'appelle aucune alerte tant qu'il est frais.
 
 Si oui, une alerte urgente part, une seule fois par créneau, aux destinataires
 déclarés (le premier est le seul composeur désigné, les autres sont informés).
@@ -55,7 +58,7 @@ import shutil
 import tempfile
 import types
 
-from . import mail, work, work_lifecycle as lifecycle
+from . import mail, storage, work, work_lifecycle as lifecycle
 
 SCHEMA = "ameesh-packet-watch/1"
 #: délai laissé au composeur après le créneau avant l'alerte
@@ -66,6 +69,8 @@ CARRIER_PREFIX = "integration/paquet"
 OPEN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, *lifecycle.TO_VALIDATE, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN)
 #: porteurs fusionnés relus pour « vient d'être fusionné »
 RECENT_MERGED = 50
+#: jalons qui peuvent rendre un lot prêt (gel, avis, feu)
+READY_MARKS = ("frozen", "verdict", "fire", "unfire")
 
 
 class WatchError(RuntimeError):
@@ -355,8 +360,38 @@ def _paused(db, watch: ProjectWatch, target: str, now: float) -> dict:
                       "by": data.get("by") or "", "target": target}}
 
 
+def ready_since(db, ids) -> dict[int, float]:
+    """#6062 : `{lot: instant}` où chaque lot a pu devenir prêt au plus tôt,
+    soit la plus récente de sa dernière transition d'état (entrée en `qa` ou
+    `validated`) et de ses jalons de gel, d'avis ou de feu.
+
+    Le maximum peut être postérieur au vrai moment (un avis de plus) : l'alerte
+    part alors au plus une grâce plus tard, jamais à tort. Un lot sans trace
+    lisible est absent : il compte comme ancien (l'alerte part comme avant).
+    """
+    lots = [int(lot) for lot in ids]
+    if db is None or not lots:
+        return {}
+    progress = storage.of(db).progress
+    out: dict[int, float] = {}
+
+    def bump(lot, ts) -> None:
+        try:
+            lot, ts = int(lot), float(ts)
+        except (TypeError, ValueError):
+            return
+        if lot in lots:
+            out[lot] = max(out.get(lot, ts), ts)
+    for ev in progress.lot_transitions(lots):
+        bump(ev.get("work_item_id"), ev.get("created_ts"))
+    for mark in progress.lot_milestones(lots):
+        if mark.get("kind") in READY_MARKS:
+            bump(mark.get("work_item_id"), mark.get("at_ts"))
+    return out
+
+
 def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
-          inventory=None, send=None, dry_run: bool = False) -> dict:
+          inventory=None, send=None, dry_run: bool = False, since=None) -> dict:
     """Un passage pour un projet ; rend `{result, …}` et met `state` à jour.
 
     `result` : `no-cadence`, `grace`, `already-alerted`, `paused` (pause
@@ -418,6 +453,19 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
                base=payload.get("base"))
     if not ready:
         return dict(out, result="nothing-ready")
+    # #6062 : un lot prêt depuis moins que la grâce attend le prochain passage
+    # du composeur horaire ; une lecture impossible ne tait rien.
+    try:
+        known = (since or (lambda ids: ready_since(db, ids)))(ready)
+    except Exception as exc:  # noqa: BLE001 - jalons illisibles : l'alerte part
+        known = {}
+        out["ready_since_error"] = "%s: %s" % (type(exc).__name__, exc)
+    fresh = {lot: known[lot] for lot in ready
+             if lot in known and float(now) - known[lot] < watch.grace_s}
+    if fresh:
+        out["fresh"] = fresh
+    if len(fresh) == len(ready):
+        return dict(out, result="fresh")
     text = body(watch, at, payload, now=now)
     if dry_run:
         return dict(out, result="would-alert", body=text, notify=list(watch.notify))
