@@ -4938,7 +4938,7 @@ class AgentWorker(threading.Thread):
         rythme (réserve, sans comptes déclarés ; avec, `accounts.choose` la
         prend) et à une part du plafond horaire payé au token du mesh."""
         from . import accounts as accounts_mod
-        raison = account_turn.choose(self, book, margin=margin)
+        raison = account_turn.choose(self, book, margin=margin, probe=True)
         part = getattr(self.cfg, "noncritical_hourly_share", 0.75) if margin else 1.0
         if raison is None:
             return book.over(self.name, reserve=accounts_mod.RESERVE if margin else 0.0,
@@ -4953,7 +4953,7 @@ class AgentWorker(threading.Thread):
         if not raison or raison.startswith(("invalid account configuration",
                                             "account state unavailable")):
             return raison
-        return account_turn.fallback(self, raison, limites)
+        return account_turn.fallback(self, raison, limites, probe=True)
 
     def budget_ok(self) -> bool:
         """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
@@ -4973,7 +4973,7 @@ class AgentWorker(threading.Thread):
             # L30 : bascule sans pause de rythme ; L226b : jamais un compte en
             # overage ou au-dessus d'un plafond fixe, quels que soient les
             # réglages de budget — sans autre compte, pas de tour
-            raison = account_turn.choose(self, None, pause=False) or ""
+            raison = account_turn.choose(self, None, pause=False, probe=True) or ""
             if raison and account_turn.is_critical(self):
                 raison = self._critical_fallback(raison, self.runner.budget_limits(self.db))
         else:
