@@ -5280,14 +5280,17 @@ class LotSessions(Domain):
                current: str | None = None) -> dict | None:
         """Change le lot de la session active, **fencé par le bail**, en une
         transaction : la session active `current` est mise de côté pour le lot
-        de session noté au registre (s'il est un lot encore ouvert et assigné
-        à l'agent), avec l'origine notée à son OUVERTURE (`session_harness`,
+        de session noté au registre (s'il est un lot encore ouvert et porté
+        par l'agent — assigné à lui, ou relecteur désigné de ce lot, #6012),
+        avec l'origine notée à son OUVERTURE (`session_harness`,
         `session_cwd`, `session_account` si `session_origin` est `current` ;
         inconnue sinon, elle ne sera pas reprise) ; puis celle mise de côté
-        pour `to_lot` devient active si ce lot est encore ouvert et assigné à
-        l'agent et qu'elle a été ouverte sous les harnais `harness`, compte
-        `account` (celui du prochain tour) et dossier `cwd` (sinon elle est
-        écartée et la session active est vide : une session neuve s'ouvrira).
+        pour `to_lot` devient active si ce lot est encore ouvert et porté par
+        l'agent (assigné ou relecteur désigné) et qu'elle a été ouverte sous
+        les harnais `harness`, compte `account` (celui du prochain tour) et
+        dossier `cwd` (sinon elle est écartée et la session active est vide :
+        une session neuve s'ouvrira). Un siège de relecture retiré ne porte
+        plus le lot : sa session n'est pas reprise (relecteur exclu, §2).
         `to_lot=None` : la session active est mise de côté pour son lot et
         AUCUNE ne devient active (`session_work_item` remis à NULL) — le tour
         part dans une session sans lot (#2055).
@@ -5362,7 +5365,8 @@ class LotSessions(Domain):
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:
         """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
-        sont plus assignés à leur agent ; rend les lignes supprimées. Ne touche
+        sont plus portés par leur agent (ni assigné ni relecteur désigné,
+        #6012) ; rend les lignes supprimées. Ne touche
         pas au registre : la session ACTIVE d'un lot fini est fermée par
         l'agent qui la détient, à son tour suivant, sous son bail (#794,
         revue Claude B1 : ce balayage n'a pas le bail et peut tomber en plein

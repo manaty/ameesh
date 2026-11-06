@@ -10,7 +10,7 @@ import time
 
 from .. import interface
 from ..interface import HOLD_NOTE_WHITESPACE
-from .work import has_wake_at
+from .work import has_reviewers, has_wake_at
 from .work_dependencies import owed_by_assignee, start_defers, wake_defers
 
 _CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
@@ -30,10 +30,38 @@ def _moment(ts) -> str:
         timespec="seconds")
 
 
+def _holds_sql(agent: str, *, reviewers: bool) -> str:
+    """Prédicat SQL : le lot est porté par `agent` (#6012).
+
+    `agent` est une expression SQL (un paramètre `%s`, ou `l.agent` dans une
+    jointure). Un lot est porté par un agent qui en est **assigné** ou qui en
+    est **relecteur désigné** — la même lecture que `turn_lot` /
+    `work_reviewers.designated`, jamais le nom. La session d'une relecture est
+    ainsi mise de côté et reprise comme celle d'un lot assigné, au lieu d'être
+    perdue à chaque bascule puis rouverte au réveil suivant.
+
+    Schéma d'avant la migration 0456 (`reviewers` absente) : l'ancien champ
+    `reviewer` seul fait foi, comme les autres lecteurs.
+    """
+    if reviewers:
+        return ("(w.assignee = " + agent
+                + " OR coalesce(w.reviewers, '{}'::text[]) @> ARRAY["
+                + agent + "]::text[])")
+    return "(w.assignee = " + agent + " OR w.reviewer = " + agent + ")"
+
+
 class LotSessions(interface.LotSessions):
 
     def switch(self, name, owner, epoch, *, to_lot, harness, account, cwd, current=None):
-        """`to_lot=None` : mise de côté de la session active seulement (#2055)."""
+        """`to_lot=None` : mise de côté de la session active seulement (#2055).
+
+        #6012 : un lot porté par l'agent comme **relecteur désigné** (pas
+        seulement comme assigné) garde sa session, qui est reprise au réveil
+        sur le même lot. Un siège retiré (relecteur exclu après correction,
+        §2) ne la reprend pas : le prédicat se relit à la bascule, et le lot
+        n'est plus porté.
+        """
+        reviewers = has_reviewers(self.db)
         with self.db.transaction() as tx:
             reg = tx.query(
                 "SELECT session_work_item,"
@@ -60,26 +88,28 @@ class LotSessions(interface.LotSessions):
             courant = str(r.get("session_work_item") or "").strip()
             if current and courant.isdigit() and courant != cible:
                 # la session active est gardée pour son lot s'il est encore
-                # ouvert et assigné à l'agent (sinon la purge l'effacerait)
+                # ouvert et porté par l'agent (sinon la purge l'effacerait) :
+                # assigné, ou relecteur désigné (#6012).
                 rows = tx.query(
                     "INSERT INTO agent_lot_sessions AS l"
                     "       (agent, work_item_id, session_id, harness, account, cwd, parked_at)"
                     " SELECT %s, w.id, %s, %s, %s, %s, clock_timestamp()"
                     "   FROM work_items w"
-                    "  WHERE w.id = %s AND w.assignee = %s"
-                    "    AND w.state NOT IN " + _CLOSED +
+                    "  WHERE w.id = %s AND " + _holds_sql("%s", reviewers=reviewers)
+                    + "    AND w.state NOT IN " + _CLOSED +
                     " ON CONFLICT (agent, work_item_id) DO UPDATE"
                     "    SET session_id = excluded.session_id, harness = excluded.harness,"
                     "        account = excluded.account, cwd = excluded.cwd,"
                     "        parked_at = excluded.parked_at"
                     " RETURNING l.session_id",
-                    (name, current, *origine, int(courant), name))
+                    (name, current, *origine, int(courant), name, name))
                 parked = rows[0]["session_id"] if rows else None
             resumed = discarded = raison = None
             if cible.isdigit():
                 rows = tx.query(
                     "SELECT l.session_id, l.harness, l.account, l.cwd,"
-                    "       (w.assignee = l.agent AND w.state NOT IN " + _CLOSED + ") AS ouvert"
+                    "       (w.state NOT IN " + _CLOSED + " AND "
+                    + _holds_sql("l.agent", reviewers=reviewers) + ") AS ouvert"
                     "  FROM agent_lot_sessions l JOIN work_items w ON w.id = l.work_item_id"
                     " WHERE l.agent = %s AND l.work_item_id = %s FOR UPDATE OF l",
                     (name, int(cible)))
@@ -285,7 +315,8 @@ class LotSessions(interface.LotSessions):
 
     def purge(self, name=None):
         """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
-        sont plus assignés à leur agent ; rend les lignes supprimées.
+        sont plus portés par leur agent (ni assigné ni relecteur désigné,
+        #6012) ; rend les lignes supprimées.
 
         Ne touche JAMAIS à `agent_registry` (#794, revue Claude B1 du
         2026-10-14) : ce balayage n'a pas le bail de l'agent et peut tomber en
@@ -293,11 +324,14 @@ class LotSessions(interface.LotSessions):
         la détient, à son tour suivant, sous son bail
         (`AgentWorker._close_finished_lot_session`) ; un lot seulement
         réassigné (relecture, pilotage, audit) ne ferme jamais la session de
-        celui qui travaille dessus.
+        celui qui travaille dessus. Un siège de relecture retiré (#6012) ne
+        porte plus le lot : la session mise de côté est purgée.
         """
+        reviewers = has_reviewers(self.db)
         sql = ("DELETE FROM agent_lot_sessions l USING work_items w"
                " WHERE w.id = l.work_item_id"
-               "   AND (w.state IN " + _CLOSED + " OR w.assignee IS DISTINCT FROM l.agent)")
+               "   AND (w.state IN " + _CLOSED + " OR NOT "
+               + _holds_sql("l.agent", reviewers=reviewers) + ")")
         params: tuple = ()
         if name is not None:
             sql += " AND l.agent = %s"
