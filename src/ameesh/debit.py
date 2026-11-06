@@ -1810,21 +1810,32 @@ def _roadmap_verdicts(notes: Iterable[Mapping[str, Any]]) -> dict[str, dict]:
     return out
 
 
-#: #5149 : les motifs d'exemption du sommeil qui tiennent un siège de
-#: relecture (`file_decoupage._sleep`) ; les autres (lot actionnable,
-#: courrier) se lisent déjà à l'agent.
-_REVIEW_SEAT_WHY = ("designated review pending", "only eligible reviewer")
+#: #5149, #6010 : un motif d'exemption du sommeil qui tient un siège de
+#: relecture (`file_decoupage.REVIEW_SEAT_WHY`) cite son lot (`… on #N`,
+#: `… pending freeze #N`) ; les autres (lot actionnable, courrier) se lisent
+#: déjà à l'agent.
+_SEAT_LOT_RE = re.compile(r"#(\d+)\s*$")
+#: #6010 : un lot fusionné, livré ou classé n'attend plus d'avis.
+_SEAT_CLOSED_STATES = frozenset({"merged", "promoted", "delivered", "closed"})
 
 
 def _review_seats(notes: Iterable[Mapping[str, Any]],
-                  exhausted: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
+                  exhausted: Mapping[str, Mapping[str, Any]],
+                  open_lots: Iterable[Mapping[str, Any]] = ()) -> dict[str, str]:
     """#5149 : `{agent: raison}` des agents épargnés du sommeil pour un siège
     de relecture, lus aux notes `sleep exempted: <agent>: <motif>` du lot de
     découpage d'un projet épuisé, postérieures à sa note d'épuisement. Un
-    siège tenu pour un avis n'est pas de la capacité au repos."""
-    from .file_decoupage import SLEEP_EXEMPT_PREFIX
-    out: dict[str, str] = {}
-    for note in notes or ():
+    siège tenu pour un avis n'est pas de la capacité au repos.
+
+    #6010 : la note est une trace, pas l'état : seule la dernière note de
+    l'agent vaut, et le siège tombe dès que le lot qu'elle cite (`#N`) n'est
+    plus ouvert ou a passé sa fusion — le gel n'attend plus d'avis."""
+    from .file_decoupage import REVIEW_SEAT_WHY, SLEEP_EXEMPT_PREFIX
+    waiting = {int(lot["id"]) for lot in open_lots or ()
+               if lot.get("id") is not None
+               and str(lot.get("state") or "") not in _SEAT_CLOSED_STATES}
+    latest: dict[str, str] = {}
+    for note in sorted(notes or (), key=lambda r: float(r.get("at_ts") or 0.0)):
         text = str(note.get("note") or "").strip()
         if not text.startswith(SLEEP_EXEMPT_PREFIX):
             continue
@@ -1834,8 +1845,16 @@ def _review_seats(notes: Iterable[Mapping[str, Any]],
             continue
         name, _, why = text[len(SLEEP_EXEMPT_PREFIX):].partition(":")
         name, why = name.strip(), why.strip()
-        if name and name != "*" and why.startswith(_REVIEW_SEAT_WHY):
-            out[name] = "review seat: %s" % why
+        if name and name != "*":
+            latest[name] = why
+    out: dict[str, str] = {}
+    for name, why in latest.items():
+        if not why.startswith(REVIEW_SEAT_WHY):
+            continue
+        cited = _SEAT_LOT_RE.search(why)
+        if cited is None or int(cited.group(1)) not in waiting:
+            continue
+        out[name] = "review seat: %s" % why
     return out
 
 
@@ -1928,7 +1947,8 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       dernière fait foi comme pour le sommeil et `ameesh alerts` (#5149) : une
       note `roadmap: rouverte` ou un lot démarrable de l'instant rouvrent la
       route ; un lot déjà pris ne la rouvre pas. Les notes `sleep exempted:`
-      d'un siège de relecture tiennent l'agent hors de la capacité.
+      d'un siège de relecture tiennent l'agent hors de la capacité tant
+      que le lot qu'elles citent est ouvert et non fusionné (#6010).
     * `losses` : la perte au reset par compte, comme `ameesh accounts`.
     * `gating_ok` : faux quand une lecture dont dépend l'alerte a échoué
       (lots ouverts, notes, tenues de budget, historique) ; la mesure reste
@@ -1945,7 +1965,8 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     held = dict(held or {})
     roadmap_notes = list(roadmap_notes or ())
     exhausted = _roadmap_verdicts(roadmap_notes)
-    for name, why in _review_seats(roadmap_notes, exhausted).items():
+    for name, why in _review_seats(roadmap_notes, exhausted,
+                                     open_lots).items():
         held.setdefault(name, why)
     min_gap = float(repos_s) if repos_s is not None else 0.0
     rows = [dict(row) for row in agents or ()]

@@ -160,7 +160,9 @@ class TriggerTest(unittest.TestCase):
                           "family deepseek for pending freeze #130"},
                  {"work_item_id": 90, "source": SPLIT, "at_ts": T - H,
                   "note": "sleep exempted: ameesh-idle-1: unread mail from pilote (5 min)"}]
-        cap = measure(team(2, 8), roadmap_notes=notes)
+        # #6010 : le siège tient tant que le lot cité attend son avis
+        lots = [{"id": 130, "app": "ameesh", "state": "qa", "assignee": "ameesh-busy-0"}]
+        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
         self.assertEqual(cap["projects"][0]["idle_agents"], ["ameesh-idle-1"])
         self.assertEqual(cap["projects"][0]["wakeable"], 9)
         self.assertIn({"agent": "ameesh-idle-0", "reason": "review seat: only eligible "
