@@ -357,6 +357,14 @@ def _copy_atomic(source: str, target: str) -> None:
         raise
 
 
+def _card_prov(card: dict, origin: str, age: float | None) -> dict:
+    """La provenance d'une carte lue : `lue`, ou `périmée` au-delà de 48 h."""
+    return {"status": "périmée" if age is not None and age > CARD_STALE_S
+            else "lue", "origin": origin, "commit": _text(card.get("commit")),
+            "genere": _text(card.get("genere")),
+            "age_s": None if age is None else int(age)}
+
+
 def carte_for(cfg, slug: str, *, repo: str = "", fetch=None, now: float | None = None,
               download: bool = True):
     """La carte mesurée du dépôt, avec sa provenance, ou (None, provenance).
@@ -364,7 +372,12 @@ def carte_for(cfg, slug: str, *, repo: str = "", fetch=None, now: float | None =
     Ordre : carte du clone (`carte/carte.json.gz`), puis cache de l'hôte
     (`<state>/packet-red/`), puis téléchargement de l'artefact `carte` de la
     dernière exécution verte (`prevalidation_calls.map_for`). Une carte de plus
-    de 48 h est dite périmée ; au-delà de 7 jours elle n'est plus lue. Le
+    de 48 h est dite périmée ; au-delà de 7 jours elle n'est plus lue.
+
+    Avec `download=True`, une carte locale périmée n'est plus rendue d'emblée
+    (#6038) : l'artefact du jour est tenté d'abord et n'est retenu que s'il est
+    plus récent ; sinon la carte périmée est rendue en repli, avec son statut
+    `périmée`. `download=False` ne lit que le clone et le cache. Le
     téléchargement est borné (#2665) et un échec rend `absent`, jamais une
     exception.
     """
@@ -376,6 +389,9 @@ def carte_for(cfg, slug: str, *, repo: str = "", fetch=None, now: float | None =
     cache = _state_cache(cfg, slug)
     if cache:
         candidates.append(("cache", cache))
+    #: la meilleure carte locale périmée, rendue seulement si l'artefact du
+    #: jour manque ou n'est pas plus récent qu'elle (#6038)
+    fallback = None
     for origin, path in candidates:
         if not path or not os.path.isfile(path):
             continue
@@ -385,55 +401,56 @@ def carte_for(cfg, slug: str, *, repo: str = "", fetch=None, now: float | None =
         age = _card_age(card, path, now=now)
         if age is not None and age > CARD_MAX_S:
             continue
-        prov = {"status": "périmée" if age is not None and age > CARD_STALE_S
-                else "lue", "origin": origin, "commit": _text(card.get("commit")),
-                "genere": _text(card.get("genere")),
-                "age_s": None if age is None else int(age)}
+        prov = _card_prov(card, origin, age)
+        if download and age is not None and age > CARD_STALE_S:
+            if fallback is None or age < fallback[0]:
+                fallback = (age, card, prov)
+            continue
         return card, prov
     if not download:
         return None, {"status": "absente", "origin": "", "commit": "", "age_s": None,
                       "why": "aucune carte locale"}
+
+    def repli(why: str):
+        """La carte locale périmée en repli, ou une provenance `absente`."""
+        if fallback is None:
+            return None, {"status": "absente", "origin": "", "commit": "",
+                          "age_s": None, "why": why}
+        prov = dict(fallback[2], why=why)
+        return fallback[1], prov
+
     if fetch is None:
         try:
             from . import prevalidation_calls
             from .deadline import Deadline
+            #: `repo` n'est pas passé : `map_for` relirait le `carte/` du clone
+            #: que la boucle ci-dessus vient de juger périmé (#6038).
             fetch = lambda: prevalidation_calls.map_for(  # noqa: E731
-                slug, repo=repo, deadline=Deadline(30))
+                slug, deadline=Deadline(30))
         except Exception as exc:  # noqa: BLE001 - le lecteur absent n'est pas fatal
-            return None, {"status": "absente", "origin": "", "commit": "",
-                          "age_s": None, "why": "lecteur de carte absent : %s"
-                                                 % type(exc).__name__}
+            return repli("lecteur de carte absent : %s" % type(exc).__name__)
     try:
         found = fetch()
     except Exception as exc:  # noqa: BLE001 - pas de carte, pas d'exception
-        return None, {"status": "absente", "origin": "", "commit": "",
-                      "age_s": None, "why": "téléchargement impossible : %s"
-                                             % type(exc).__name__}
+        return repli("téléchargement impossible : %s" % type(exc).__name__)
     path, scratch = (found if isinstance(found, tuple) else (found, ""))
     try:
         if not path or not os.path.isfile(path):
-            return None, {"status": "absente", "origin": "", "commit": "",
-                          "age_s": None, "why": "artefact carte introuvable"}
+            return repli("artefact carte introuvable")
         card = _load_card(path)
         if card is None:
-            return None, {"status": "absente", "origin": "", "commit": "",
-                          "age_s": None, "why": "artefact carte illisible"}
+            return repli("artefact carte illisible")
         age = _card_age(card, path, now=now)
         if age is not None and age > CARD_MAX_S:
-            return None, {"status": "absente", "origin": "",
-                          "commit": _text(card.get("commit")),
-                          "age_s": int(age),
-                          "why": "artefact carte trop vieux (> 7 jours)"}
+            return repli("artefact carte trop vieux (> 7 jours)")
+        if fallback is not None and (age is None or age >= fallback[0]):
+            return repli("artefact carte pas plus récent que la carte locale")
         if cache:
             try:
                 _copy_atomic(path, cache)
             except OSError:
                 pass
-        return card, {"status": "périmée" if age is not None and age > CARD_STALE_S
-                      else "lue", "origin": "téléchargée",
-                      "commit": _text(card.get("commit")),
-                      "genere": _text(card.get("genere")),
-                      "age_s": None if age is None else int(age)}
+        return card, _card_prov(card, "téléchargée", age)
     finally:
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)

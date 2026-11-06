@@ -23,10 +23,17 @@ from unittest import mock
 
 from ameesh import packet_red
 
+#: une horloge fixe : les âges de carte ne dépendent ni du jour ni du fuseau
+NOW = 1_800_000_000.0
+
+
+def stamp(when):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
+
 
 def card(**over):
     out = {"schema": "ameesh-carte/1", "commit": "c" * 40,
-           "genere": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "genere": stamp(time.time()),
            "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}}
     out.update(over)
     return out
@@ -356,12 +363,91 @@ class CarteTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.tmp, "state", "packet-red", "carte-manaty-ameesh.json.gz")))
 
+    def stale_cache(self, *, age_h=72, commit="a" * 40):
+        path = os.path.join(self.tmp, "packet-red", "carte-manaty-ameesh.json.gz")
+        self.write(path, card(commit=commit, genere=stamp(NOW - age_h * 3600)))
+        return path
+
+    def test_cache_perime_remplace_par_artefact_frais(self):
+        cache = self.stale_cache()
+        source = os.path.join(self.tmp, "download", "carte.json.gz")
+        self.write(source, card(commit="b" * 40, genere=stamp(NOW - 3600)))
+        cfg = types.SimpleNamespace(state_dir=self.tmp)
+        found, prov = packet_red.carte_for(
+            cfg, "manaty/ameesh", fetch=lambda: (source, ""), now=NOW)
+        self.assertEqual(found["commit"], "b" * 40)
+        self.assertEqual(prov["origin"], "téléchargée")
+        self.assertEqual(prov["status"], "lue")
+        with gzip.open(cache, "rt", encoding="utf-8") as stream:
+            self.assertEqual(json.load(stream)["commit"], "b" * 40)
+
+    def test_cache_perime_repli_si_telechargement_echoue(self):
+        cache = self.stale_cache()
+
+        def fetch():
+            raise RuntimeError("gh absent")
+
+        cfg = types.SimpleNamespace(state_dir=self.tmp)
+        found, prov = packet_red.carte_for(cfg, "manaty/ameesh", fetch=fetch, now=NOW)
+        self.assertEqual(found["commit"], "a" * 40)
+        self.assertEqual(prov["status"], "périmée")
+        self.assertEqual(prov["origin"], "cache")
+        self.assertIn("téléchargement impossible", prov["why"])
+        with gzip.open(cache, "rt", encoding="utf-8") as stream:
+            self.assertEqual(json.load(stream)["commit"], "a" * 40)
+
+    def test_cache_perime_artefact_pas_plus_recent(self):
+        cache = self.stale_cache(age_h=72)
+        source = os.path.join(self.tmp, "download", "carte.json.gz")
+        self.write(source, card(commit="b" * 40, genere=stamp(NOW - 96 * 3600)))
+        cfg = types.SimpleNamespace(state_dir=self.tmp)
+        found, prov = packet_red.carte_for(
+            cfg, "manaty/ameesh", fetch=lambda: (source, ""), now=NOW)
+        self.assertEqual(found["commit"], "a" * 40)
+        self.assertEqual(prov["status"], "périmée")
+        self.assertIn("pas plus récent", prov["why"])
+        with gzip.open(cache, "rt", encoding="utf-8") as stream:
+            self.assertEqual(json.load(stream)["commit"], "a" * 40)
+
+    def test_cache_frais_ne_telecharge_pas(self):
+        self.stale_cache(age_h=1)
+        calls = []
+
+        def fetch():
+            calls.append(1)
+            raise AssertionError("téléchargement inattendu")
+
+        cfg = types.SimpleNamespace(state_dir=self.tmp)
+        found, prov = packet_red.carte_for(cfg, "manaty/ameesh", fetch=fetch, now=NOW)
+        self.assertEqual(calls, [])
+        self.assertEqual(found["commit"], "a" * 40)
+        self.assertEqual(prov["origin"], "cache")
+        self.assertEqual(prov["status"], "lue")
+
+    def test_telechargement_par_defaut_ignore_le_clone_perime(self):
+        self.write(os.path.join(self.tmp, "carte", "carte.json.gz"),
+                   card(commit="a" * 40, genere=stamp(NOW - 72 * 3600)))
+        source = os.path.join(self.tmp, "download", "carte.json.gz")
+        self.write(source, card(commit="b" * 40, genere=stamp(NOW - 3600)))
+        fetch = mock.Mock(return_value=(source, ""))
+        from ameesh import prevalidation_calls
+        with mock.patch.object(prevalidation_calls, "map_for", fetch):
+            found, prov = packet_red.carte_for(
+                types.SimpleNamespace(state_dir=os.path.join(self.tmp, "state")),
+                "manaty/ameesh", repo=self.tmp, now=NOW)
+        self.assertEqual(found["commit"], "b" * 40)
+        self.assertEqual(prov["origin"], "téléchargée")
+        fetch.assert_called_once()
+        # `repo` n'est pas passé : `map_for` relirait le clone jugé périmé.
+        self.assertNotIn("repo", fetch.call_args.kwargs)
+
     def test_carte_perimee_et_trop_vieille(self):
         old = time.time() - 3 * 24 * 3600
         stale = card(genere=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(old)))
         path = os.path.join(self.tmp, "carte", "carte.json.gz")
         self.write(path, stale)
-        found, prov = packet_red.carte_for(None, "manaty/ameesh", repo=self.tmp)
+        found, prov = packet_red.carte_for(None, "manaty/ameesh", repo=self.tmp,
+                                           download=False)
         self.assertIsNotNone(found)
         self.assertEqual(prov["status"], "périmée")
         too_old = time.time() - 8 * 24 * 3600
