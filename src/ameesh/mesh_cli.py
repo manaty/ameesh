@@ -2660,7 +2660,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 work.check_mover(cfg, db, args.id, args.state, args.actor)
             item = work.move(db, args.id, args.state, note=note, actor=args.actor,
                              correct=args.correct, reviewer=args.reviewer,
-                             package_exclusion=args.package_exclusion)
+                             package_exclusion=args.package_exclusion,
+                             # #5993 : entrer en qa par la commande exige un
+                             # gel déclaré, sinon aucune désignation ne suit.
+                             require_freeze=True)
             print(('%s #%d → %s (loops %s)%s%s') % (v.noun, item["id"], item["state"], item["loops"], " — reviewer %s" % item["reviewer"] if item.get("reviewer") else "", " — correction recorded in the log, by %s" % args.actor
                 if args.correct is not None else ""))
             # #800 : la désignation est conservée ; l'avertissement de famille

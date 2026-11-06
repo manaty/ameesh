@@ -905,8 +905,30 @@ class WorkItems(interface.WorkItems):
                         " to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
                         " coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
                         " AS workflow_version")
+        # #5993 : la tête du dernier gel et son instant, plus le dernier
+        # passage en build, sont portés par cette lecture — comme
+        # `workflow_ref` l'est pour le pin. La commande `work move ... qa` les
+        # lit sans second aller-retour, y compris sur une connexion
+        # d'exécuteur médiée (le contrat n'a pas d'op `work.milestones`).
+        # Un gel antérieur au dernier passage en build ne couvre pas la tête
+        # retravaillée : c'est le cas que la garde refuse (#5993 N1).
         rows = self.db.query(
-            "SELECT %s, %s FROM work_items WHERE id = %%s" % (item_columns(self.db), workflow),
+            "SELECT %s, %s, f.frozen_sha,"
+            " extract(epoch from f.frozen_at)::float8 AS frozen_at,"
+            " extract(epoch from b.build_at)::float8 AS build_at"
+            " FROM work_items"
+            " LEFT JOIN LATERAL ("
+            "   SELECT m.sha AS frozen_sha, m.at AS frozen_at"
+            "     FROM work_item_milestones m"
+            "    WHERE m.work_item_id = work_items.id AND m.kind = 'frozen'"
+            "    ORDER BY m.at DESC, m.id DESC LIMIT 1) f ON true"
+            " LEFT JOIN LATERAL ("
+            "   SELECT e.created_at AS build_at"
+            "     FROM work_item_events e"
+            "    WHERE e.work_item_id = work_items.id AND e.state = 'build'"
+            "    ORDER BY e.id DESC LIMIT 1) b ON true"
+            " WHERE work_items.id = %%s"
+            % (item_columns(self.db), workflow),
             (int(item_id),))
         return rows[0] if rows else None
 
