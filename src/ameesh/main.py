@@ -208,8 +208,8 @@
   ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
         context_max_tokens=15M|0 session_max_tokens=1M turn_reread_budget=1.5M|0
-        session_reread_budget=40M|0 turn_max_seconds=30m|2h|0 turn_mail_max=20|0
-        turn_grace_seconds=20m|0
+        session_reread_budget=40M|0 compact_tokens=100k turn_max_seconds=30m|2h|0
+        turn_mail_max=20|0 turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
   ameesh turn current [--local] [--expect-turn ID] [--json]

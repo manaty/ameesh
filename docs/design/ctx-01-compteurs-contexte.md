@@ -389,7 +389,7 @@ rôle suivant pour se fabriquer une politique).
 |---|---|---|---|---|---|---|
 | Claude non-résident | oui (`--autocompact`) | `auto` par défaut ; valeur exacte **non établie** ; explicite 100k–1M si fourni | `system/compact_boundary`, `compact_metadata` avant/après | après absent : pas de mesure d'après ; aucun échec exploité par Ameesh | aucun en non-résident | Ameesh ne demande pas `/compact` ; il ne peut que tourner au plafond |
 | Claude résident | oui | natif `auto` + override Ameesh **50 % de `W`** (`COMPACT_SHARE`) | idem ; l'après met à jour `C_last` | pas d'après : garder l'avant, marquer `partial` ; retry 600 s borné ; pas de boucle | `/compact` à 50 % ; retry 600 s | la commande n'est pas un succès ; la rotation gagne sur le compactage |
-| Codex non-résident | oui au protocole | `model_auto_compact_token_limit` ; valeur exacte **non établie** | `ContextCompaction` / `thread/compacted` ; non lus par Ameesh | inconnu ; Ameesh ne mesure pas l'après | aucun | `codex exec --json` n'expose pas de contrôle en cours de tour ; plafond entre tours seulement |
+| Codex non-résident | oui au protocole | `model_auto_compact_token_limit` ; défaut **non établi** ; opt-in par agent `compact_tokens` (#6040) | `ContextCompaction` / `thread/compacted` ; non lus par Ameesh | inconnu ; Ameesh ne mesure pas l'après | seuil passé au lancement (`-c`), sans demande en cours de tour | `codex exec --json` n'expose pas de contrôle en cours de tour ; le seuil est la seule prise ; plafond entre tours sinon |
 | Codex résident | oui au protocole | idem ; **non établi** | `thread/compacted` / item de compaction ; non lus par Ameesh | inconnu | aucun ; Ameesh ne lance pas `thread/compact/start` | fenêtre `modelContextWindow` mesurée, mais décision de compaction non pilotée |
 | DeepSeek/dsh et ACP | non établi | non établi | aucun événement de compaction dans le pont ACP actuel | inconnu | aucun | seule la rotation au plafond est disponible |
 
@@ -409,6 +409,8 @@ rôle suivant pour se fabriquer une politique).
 * **Pas de compaction en cours de tour non résident** : Claude/DeepSeek/ACP
   peuvent seulement clôturer au point sûr ; Codex non-résident n'a aucune
   mesure par appel, donc aucune décision de compaction en cours de tour.
+  #6040 : un seuil fixé avant le tour (`compact_tokens`) laisse Codex décider
+  lui-même ; Ameesh ne décide rien en cours de tour.
 * **Publication** : `turn.context.compaction` porte la compaction native
   observée du tour (`pre`, `post`, `quality`, `reasons`, `trigger`) ; le
   runner la publie pour un tour résident (le driver) comme non résident
@@ -618,6 +620,7 @@ devient jamais une valeur par défaut silencieuse.
 |---|---|---|
 | `ameesh-context/1` r1 | 2026-10-29 | création : contrat, profils, décisions, cinq reproductions, compatibilité legacy |
 | `ameesh-context-corpus/1` r1 | 2026-10-31 | corpus de rejeu CTX-05a (§8) |
+| `ameesh-context/1` r2 | 2026-11-06 | #6040 : seuil de compaction native Codex par agent (`compact_tokens`, §4.1) ; `policy.compact_tokens` dans `turn.context` et le corpus |
 
 ---
 
@@ -648,7 +651,7 @@ raison, jamais `0` (§2.4).
 | `auxiliary_models` | modèles auxiliaires observés (jamais utilisés pour `W`) |
 | `C_last`, `O_last`, `C_next_input`, `C_next`, `R_turn`, `R_session`, `R_session_base`, `O`, `S_hist`, `cache_read_tokens`, `cache_write_tokens` | mesures au même format `{value, quality, reasons, granularity, source}` ; `R_session_base` est le cumul de relecture **avant** le tour |
 | `decision` | décision **observée** : `observed` ∈ `none`/`close`/`rotation`/`compaction`, `cause` normalisée, `compacted` (vrai si une compaction est publiée, `null` sinon), et les blocs `close`, `rotation`, `compaction`, `window` ; `compaction.observed`/`requested` séparent la réussite de la demande |
-| `policy` | politique en vigueur au tour : `session`, `context_max_tokens`, `session_max_tokens`, budgets opt-in, part d'entretien |
+| `policy` | politique en vigueur au tour : `session`, `context_max_tokens`, `session_max_tokens`, budgets opt-in, part d'entretien, seuil de compaction native `compact_tokens` (#6040) |
 | `legacy` | les onze compteurs legacy publiés à côté des mesures |
 | `quality`, `reasons` | qualité d'ensemble (mesures principales) et raisons, triées |
 | `source` | `event_id`, `observation_id`, `ledger_id`, schéma source, hôte |

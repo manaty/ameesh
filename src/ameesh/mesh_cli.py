@@ -3354,9 +3354,13 @@ SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_to
             "resident_reread_max",
             # #5250 : politique de contexte de cet agent (CTX-06)
             "session_max_tokens", "turn_reread_budget", "session_reread_budget",
+            # #6040 : seuil de compaction native du harnais (Codex)
+            "compact_tokens",
             # #4293 : binaire du harnais pour cet agent (canari d'adoption) ;
             # vide = revenir au binaire de l'hôte (PATH / harness_bins)
             "harness_bin")
+#: #6040 : plancher du seuil de compaction (contrainte de la migration 0553)
+COMPACT_TOKENS_MIN = 10_000
 #: L76: settings written in the local state of the agent's host only
 LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep",
                   "resident_reread_max")
@@ -3452,7 +3456,7 @@ def cmd_set(cfg: Config, args) -> int:
                 print("usage: ameesh set <agent> model=… effort=… tier=… "
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
                       "session_max_tokens=N|1M turn_reread_budget=N|1.5M|0 "
-                      "session_reread_budget=N|40M|0 "
+                      "session_reread_budget=N|40M|0 compact_tokens=N|100k "
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
                       "permission_mode=auto|acceptEdits|… lot_wake=on|off "
@@ -3501,6 +3505,23 @@ def cmd_set(cfg: Config, args) -> int:
                     print("invalid %s: %r (e.g. 1M, 1.5M; 0 turns a budget off, "
                           "never the session threshold)" % (cle, valeur),
                           file=sys.stderr)
+                    return 2
+            if cle == "compact_tokens" and valeur:
+                # #6040 : un seuil en jetons, jamais 0 (compaction à chaque
+                # appel) ; refusé sur un harnais qui ne sait pas le recevoir.
+                try:
+                    valeur = str(parse_token_count(valeur))
+                    if int(valeur) < COMPACT_TOKENS_MIN:
+                        raise ValueError(valeur)
+                except ValueError:
+                    print("invalid compact_tokens: %r (e.g. 100k; at least %d; "
+                          "empty = harness default)" % (valeur, COMPACT_TOKENS_MIN),
+                          file=sys.stderr)
+                    return 2
+                descriptor = harnesses.get(harness)
+                if descriptor is None or not descriptor.compact.flag:
+                    print("compact_tokens: harness %r declares no compaction "
+                          "threshold (`ameesh.compact`)" % harness, file=sys.stderr)
                     return 2
             if cle == "turn_max_seconds" and valeur:
                 try:
@@ -3602,7 +3623,8 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "default"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "default"
         politique = agent.get("session_policy") or "default (%s)" % cfg.session_policy
-        from .exploitation import (effective_context_max, effective_turn_grace_seconds,
+        from .exploitation import (effective_compact_tokens, effective_context_max,
+                                   effective_turn_grace_seconds,
                                    effective_turn_mail_max, effective_turn_max_seconds)
 
         def _txt(valeur: int, cle: str, zero: str) -> str:
@@ -3625,11 +3647,14 @@ def cmd_set(cfg: Config, args) -> int:
         regroupement_txt = ("immediate" if secondes == 0 else "%ds" % secondes) + (
             "" if regroupement else " (default)")
         reveil_txt = agent.get("lot_wake") or "default (%s)" % ("on" if cfg.lot_wake else "off")
-        print("%s: model=%s effort=%s tier=%s session=%s mode=%s context=%s "
+        # #6040 : seuil de compaction native, sinon le défaut du harnais
+        compact_txt = str(effective_compact_tokens(agent) or "harness default")
+        print("%s: model=%s effort=%s tier=%s session=%s mode=%s context=%s compact=%s "
               "turn_max_s=%s mail_per_turn=%s background_grace_s=%s mail_batch=%s "
               "lot_wake=%s harness_bin=%s (takes effect at the next turn)"
               % (args.agent, modele, effort, tier, politique,
-                 agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
+                 agent.get("mode") or "execute", plafond_txt, compact_txt,
+                 duree_txt, courrier_txt,
                  grace_txt, regroupement_txt, reveil_txt,
                  agent.get("harness_bin") or "host binary"))
         for local in LOCAL_SET_KEYS:
@@ -4675,6 +4700,7 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                             "context_max_tokens=15M|0 "
                             "session_max_tokens=1M "
                             "turn_reread_budget=1.5M|0 session_reread_budget=40M|0 "
+                            "compact_tokens=100k "
                             "turn_max_seconds=30m|2h|0 turn_mail_max=20|0 "
                             "turn_grace_seconds=20m|0 "
                             "mail_batch=90s|2m|0 (L125, local state of the host) "

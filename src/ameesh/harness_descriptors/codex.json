@@ -26,6 +26,7 @@
     "model": {"flag": ["-m", "{model}"]},
     "effort": {"flag": ["-c", "model_reasoning_effort=\"{effort}\""]},
     "tier": {"flag": ["-c", "service_tier=\"{tier}\""]},
+    "compact": {"flag": ["-c", "model_auto_compact_token_limit={compact}"]},
     "hooks": {
       "mail": {
         "command": ["agent-mail", "hook", "codex"],
