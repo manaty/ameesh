@@ -274,11 +274,10 @@ def _apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None,
     if reviewed:
         text += "; reviews: " + json.dumps(result["reviews"], ensure_ascii=False)
     try:
-        if reviewed:
+        if record is None:
+            # #6034: the reload follows only a journaled move, mechanical too.
             with journal(cfg, result, actor=actor, lot=int(lot)):
                 work.note(db, int(lot), text, actor=actor)
-        elif record is None:
-            work.note(db, int(lot), text, actor=actor)
         else:
             record(result)
     except BaseException:
@@ -315,11 +314,12 @@ def journal(cfg, result, *, actor, lot=None):
 
     The caller holds .train-canon.lock for the whole pin and journal move.
     """
-    directory = os.path.dirname(os.path.abspath(cfg.config_base or cfg.config_path))
+    path = train_assembly.journal_path(cfg)
+    directory = os.path.dirname(path)
     row = dict(result, host=cfg.host, actor=actor, lot=lot, event="canon-requalified",
                at=datetime.now(timezone.utc).isoformat(),
                guard=list(train_assembly.REQUALIFY_GUARD))
-    with open(os.path.join(directory, "train-canon.jsonl"), "a+",
+    with open(path, "a+",
               encoding="utf-8") as stream:
         stream.seek(0, os.SEEK_END)
         before = stream.tell()

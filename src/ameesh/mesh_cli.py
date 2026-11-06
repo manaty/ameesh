@@ -73,6 +73,7 @@ from . import agent_pause
 from . import account_window
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
+from . import cost_attribution
 from . import migrations, placement, progress, registry
 from . import rebalance as rebalance_mod
 from . import fil, release, signing, storage, vocab, work, work_lifecycle
@@ -4587,6 +4588,20 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                                "the cost shown is the turn's")
     pc_turns.add_argument("--json", action="store_true")
     pc_turns.set_defaults(func=cmd_cost)
+    # #6005 : coût regroupé par attribution d'appelant (tours hors lot)
+    pc_attr = cost_sub.add_parser(
+        "attribution",
+        help="cost grouped by caller attribution, unattributed remainder shown")
+    pc_attr.add_argument("--since", default="24h", help="duration (16h, 2d) or ISO date")
+    pc_attr.add_argument("--until", default=None,
+                         help="end of the period (duration or ISO date; default: now)")
+    pc_attr.add_argument(
+        "--by", default=",".join(cost_attribution.DEFAULT_KEYS),
+        help="comma-separated attribution keys to group by (allowed: %s)"
+             % ", ".join(cost_attribution.KEYS))
+    pc_attr.add_argument("--agent", default=None)
+    pc_attr.add_argument("--json", action="store_true")
+    pc_attr.set_defaults(func=cmd_cost)
     pc_gauges = cost_sub.add_parser("gauges", help="plan gauge history")
     pc_gauges.add_argument("--harness", default=None)
     pc_gauges.add_argument("--since", default="7d")
@@ -4766,6 +4781,8 @@ def cmd_cost(cfg: Config, args) -> int:
     try:
         if what in ("turns", "gauges", "balance"):
             return _cost_l26(cfg, db, what, args)
+        if what == "attribution":
+            return _cost_attribution(db, args)
         if what == "report":
             # L61 : le rapport lisait la dépense agent par agent (deux
             # requêtes chacun, ~67 s vers une base distante) : ses lectures
@@ -5063,6 +5080,40 @@ def _since_seconds(text: str) -> float:
     return max(0.0, now - progress.parse_since(text, now))
 
 
+def _cost_attribution(db, args) -> int:
+    """#6005 : `cost attribution` — coût par attribution d'appelant.
+
+    Lecture seule du grand livre sur la période (`ledger`, déjà borné par le
+    temps) ; le regroupement se fait en Python, donc l'opération reste la même
+    pour tous les pilotes et aucun SQL dynamique ne porte les clés. Le reste
+    non attribué est toujours affiché, jamais noyé dans un total."""
+    now = time.time()
+    keys = tuple(key.strip() for key in (args.by or "").split(",") if key.strip())
+    try:
+        # `ledger(since_ts=…)` attend un INSTANT epoch, pas une durée : on
+        # convertit les deux bornes avec `parse_since` (durée ou date ISO).
+        since = progress.parse_since(args.since, now)
+        until = progress.parse_since(args.until, now) if args.until else now
+        if until < since:
+            raise progress.ProgressError("--until is before --since")
+        data = cost_attribution.report(
+            storage.of(db).turn_costs.ledger(since_ts=since),
+            keys=keys or cost_attribution.DEFAULT_KEYS, until_ts=until,
+            agent=args.agent)
+    except (cost_attribution.AttributionError, progress.ProgressError) as exc:
+        print("cost attribution: %s" % exc, file=sys.stderr)
+        return 2
+    data.update(since_ts=since, until_ts=until, agent=args.agent, period=args.since)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print("caller attribution — period %s (until %s)%s"
+          % (args.since, time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(until)),
+             " · agent %s" % args.agent if args.agent else ""))
+    print(cost_attribution.format_report(data))
+    return 0
+
+
 def _cost_l26(cfg: Config, db, what: str, args) -> int:
     """`cost turns|gauges|balance` (L26) : lectures du grand livre, de
     l'historique des jauges et des soldes ; le calcul des coûts n'est pas
@@ -5094,15 +5145,18 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
             # L80b : le coût est celui du TOUR qui a servi le message, partagé
             # avec les autres messages du même tour — jamais divisé.
             print("turns serving message %s (turn cost, not divided)" % args.message)
-        print("%-19s %-16s %-6s %-9s %10s %10s %9s %10s" % (
-            "WHEN", "AGENT", "LOT", "HARNESS", "INPUT", "CACHE", "OUTPUT", "USD"))
+        print("%-19s %-16s %-6s %-9s %10s %10s %9s %10s  %s" % (
+            "WHEN", "AGENT", "LOT", "HARNESS", "INPUT", "CACHE", "OUTPUT", "USD",
+            "ATTRIBUTION"))
         for row in rows:
-            print("%-19s %-16s %-6s %-9s %10d %10d %9d %10.4f" % (
+            # #6005 : l'attribution d'appelant du tour hors lot, à côté du lot
+            attribution = cost_attribution.render(row.get("attribution"))
+            print("%-19s %-16s %-6s %-9s %10d %10d %9d %10.4f  %s" % (
                 _fmt_moment(row["recorded_ts"]), row["agent"][:16],
                 "#%d" % row["work_item_id"] if row.get("work_item_id") else "—",
                 row["harness"][:9],
                 row["input_tokens"], row["cached_input_tokens"], row["output_tokens"],
-                row["usd"]))
+                row["usd"], attribution[:60] + ("…" if len(attribution) > 60 else "")))
         return 0
     if what == "gauges":
         if args.record:

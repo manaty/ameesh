@@ -112,7 +112,10 @@ class TableTest(unittest.TestCase):
         # file résidente, filtré dans la requête du serveur) ; contrat 1.6 :
         # #286/B14 ajoute mailbox.unread_human_page (curseur au-delà d'un
         # préfixe de plus de 200 humains retenus) ; contrat 1.7 : #288/L80b
-        # ajoute turn_costs.insert(inputs) (attribution des messages).
+        # ajoute turn_costs.insert(inputs) (attribution des messages) ;
+        # contrat 1.12 : #6005 ajoute turn_costs.insert(attribution) et
+        # pending_spend.put(attribution) (attribution d'appelant des tours
+        # hors lot), deux paramètres facultatifs.
         self.assertEqual(len(self.c.operations), 73)
         self.assertEqual(sum(o.write for o in ops), 44)
         self.assertEqual(sum(not o.write for o in ops), 29)
@@ -122,7 +125,7 @@ class TableTest(unittest.TestCase):
                          ["agents.resolve_name", "mailbox.deliver", "mailbox.release", "mailbox.reserve",
                           "mailbox.unread", "mailbox.unread_human",
                           "mailbox.unread_human_page", "threads.index", "threads.recount"])
-        self.assertEqual(self.c.version, "1.11.0")
+        self.assertEqual(self.c.version, "1.12.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 
@@ -159,6 +162,34 @@ class TableTest(unittest.TestCase):
         self.assertIsNone(self.c.bind("turn_costs.insert", kwargs=dict(req))["inputs"])
         with self.assertRaises(ValueError):
             self.c.bind("turn_costs.insert", kwargs=dict(req, inputs=[1]))
+
+    def test_turn_costs_insert_accepts_the_optional_attribution(self):
+        """Contrat 1.12 (#6005) : attribution d'appelant, objet facultatif."""
+        req = {"agent": "a", "harness": "dsh", "turn": None, "model": None,
+               "session": None, "usd": 0.1, "input_tokens": 1,
+               "cached_input_tokens": 0, "output_tokens": 1, "cum_usd": None,
+               "cum_input_tokens": None, "cum_cached_input_tokens": None,
+               "cum_output_tokens": None}
+        attribution = {"source": "ima", "run_type": "builder", "issue_number": 1679}
+        bound = self.c.bind("turn_costs.insert",
+                            kwargs=dict(req, attribution=attribution))
+        self.assertEqual(bound["attribution"], attribution)
+        self.assertIsNone(
+            self.c.bind("turn_costs.insert", kwargs=dict(req))["attribution"])
+        with self.assertRaises(ValueError):
+            self.c.bind("turn_costs.insert", kwargs=dict(req, attribution="ima"))
+
+    def test_pending_spend_put_accepts_the_optional_attribution(self):
+        """Contrat 1.12 (#6005) : le marqueur porte aussi l'attribution."""
+        bound = self.c.bind("pending_spend.put",
+                            args=("a", 1, "tour", "", None, None,
+                                  {"source": "ima"}))
+        self.assertEqual(bound["attribution"], {"source": "ima"})
+        self.assertIsNone(self.c.bind("pending_spend.put",
+                                      args=("a", 1, "tour", "", None, None))["attribution"])
+        with self.assertRaises(ValueError):
+            self.c.bind("pending_spend.put",
+                        args=("a", 1, "tour", "", None, None, "ima"))
 
     def test_l_interface_entiere_est_classee(self):
         """Toute opération de l'interface est admise OU refusée, jamais les

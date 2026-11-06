@@ -63,6 +63,7 @@ import uuid
 
 from . import account_budget, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
+from . import cost_attribution
 from . import context_metrics, context_profile
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, refusal, sentinel, storage
 from . import rate_limit as rate_limit_mod
@@ -4937,7 +4938,7 @@ class AgentWorker(threading.Thread):
         rythme (réserve, sans comptes déclarés ; avec, `accounts.choose` la
         prend) et à une part du plafond horaire payé au token du mesh."""
         from . import accounts as accounts_mod
-        raison = account_turn.choose(self, book, margin=margin)
+        raison = account_turn.choose(self, book, margin=margin, probe=True)
         part = getattr(self.cfg, "noncritical_hourly_share", 0.75) if margin else 1.0
         if raison is None:
             return book.over(self.name, reserve=accounts_mod.RESERVE if margin else 0.0,
@@ -4952,7 +4953,7 @@ class AgentWorker(threading.Thread):
         if not raison or raison.startswith(("invalid account configuration",
                                             "account state unavailable")):
             return raison
-        return account_turn.fallback(self, raison, limites)
+        return account_turn.fallback(self, raison, limites, probe=True)
 
     def budget_ok(self) -> bool:
         """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
@@ -4972,7 +4973,7 @@ class AgentWorker(threading.Thread):
             # L30 : bascule sans pause de rythme ; L226b : jamais un compte en
             # overage ou au-dessus d'un plafond fixe, quels que soient les
             # réglages de budget — sans autre compte, pas de tour
-            raison = account_turn.choose(self, None, pause=False) or ""
+            raison = account_turn.choose(self, None, pause=False, probe=True) or ""
             if raison and account_turn.is_critical(self):
                 raison = self._critical_fallback(raison, self.runner.budget_limits(self.db))
         else:
@@ -5187,7 +5188,8 @@ class AgentWorker(threading.Thread):
 
     def _compta_marque(self, start: int, tour: str, model: str | None,
                        work_item_id: str | None = None,
-                       turn_id: str | None = None) -> bool:
+                       turn_id: str | None = None,
+                       attribution: dict | None = None) -> bool:
         """Pose le marqueur **avant** le tour, atomiquement en base (L13 B5).
 
         Si la pose échoue, le tour ne démarre pas : aucune dépense sans trace
@@ -5197,6 +5199,8 @@ class AgentWorker(threading.Thread):
         ligne du grand livre le porte même si elle est écrite par la réparation
         d'un autre worker après une panne. `turn_id` (#796) : l'identifiant du
         tour, pour la même raison — il relie la ligne à `turn_resources`.
+        `attribution` (#6005) : l'attribution d'appelant d'un tour hors lot,
+        pour la même raison ; donnée seule, jamais une autorité.
         """
         self._annonce_ram = ""  # un tour neuf n'a encore rien annoncé
         try:
@@ -5205,7 +5209,8 @@ class AgentWorker(threading.Thread):
             self._compta_travail = registry.pending_spend_begin(
                 self.db, self.name, int(start), tour,
                 model if model is not None else "",
-                work_item_id=work_item_id, turn_id=turn_id)
+                work_item_id=work_item_id, turn_id=turn_id,
+                attribution=attribution)
             return self._compta_travail is not None
         except db_mod.Unavailable:
             raise  # L72 : rien lancé ; la consigne est remise au retour de la base
@@ -5319,7 +5324,11 @@ class AgentWorker(threading.Thread):
                                 # #796 (0423) : l'identifiant du tour, même
                                 # provenance — il relie la ligne à ses
                                 # ressources (`turn_resources`)
-                                turn_id=travail.get("turn_id"))
+                                turn_id=travail.get("turn_id"),
+                                # #6005 (0551) : l'attribution d'appelant,
+                                # même provenance que le lot — la réparation
+                                # d'un autre worker écrit la même ligne
+                                attribution=travail.get("attribution"))
             # Mesure du plafond de contexte (L60), lue sur la ligne écrite.
             self.last_turn_reread = usage.reread_tokens
             self.last_turn_reread_session = usage.session
@@ -7258,6 +7267,10 @@ class AgentWorker(threading.Thread):
         prompt, retenus, reste = mail.prompt_for(self.db, messages, kind=kind,
                                                  budget=self._budget_courrier())
         ids = [int(m["id"]) for m in retenus if m.get("id") is not None]
+        # #6005 : l'attribution d'appelant du tour est celle des messages
+        # réellement servis ; plusieurs attributions différentes = ambigu, le
+        # tour reste non attribué (jamais deviné, jamais une autorité).
+        attribution = cost_attribution.from_messages(retenus)
         # #2810 : le tour choisi sert ces messages. Publié sous le verrou de
         # préemption : le NOTIFY de l'un d'eux, traité après `_pick`, ne
         # l'arrêtera pas ; une demande pour un AUTRE message, elle, reste un
@@ -7270,6 +7283,7 @@ class AgentWorker(threading.Thread):
             "rows": retenus,
             "candidats": list(messages),
             "remaining": reste,
+            "attribution": attribution,
             "_etapes": self._etapes_initiales(retenus),
         }
 
@@ -7317,6 +7331,7 @@ class AgentWorker(threading.Thread):
             "rows": retenus,
             "candidats": list(messages),
             "remaining": reste,
+            "attribution": cost_attribution.from_messages(retenus),
             "envelopes": envelopes,
             "human": True,
             "_etapes": self._etapes_initiales(retenus),
@@ -7687,7 +7702,10 @@ class AgentWorker(threading.Thread):
         hors = [int(m["id"]) for m in reserves if int(m["id"]) not in ids]
         if hors:  # par construction vide ; jamais réservé sans être montré
             mail.release(self.db, self.name, jeton, hors)
-        spec = dict(spec, prompt=prompt, rows=inclus, ids=ids, jeton=jeton)
+        spec = dict(spec, prompt=prompt, rows=inclus, ids=ids, jeton=jeton,
+                    # #6005 : la réservation peut différer de la sélection —
+                    # l'attribution suit les messages RÉELLEMENT servis.
+                    attribution=cost_attribution.from_messages(inclus))
         self._courrier_lance = False
         return self._run_turn_settled(
             spec,
@@ -8740,6 +8758,9 @@ class AgentWorker(threading.Thread):
         # gardent le lot de session (hygiène du dossier), pas la comptabilité.
         lot_comptable = cost_mod.turn_attribution_lot(
             spec, self.agent.get("session_work_item"))
+        # #6005 : l'attribution d'appelant du tour (courrier IMA, par exemple),
+        # à côté du lot — donnée seule, jamais admission, budget ni droit.
+        attribution = cost_attribution.from_spec(spec)
         turn_label = containers_mod.turn_labels(
             turn_id, self.name, str(lot_du_tour) if lot_du_tour else None)
         identite = {
@@ -8913,7 +8934,8 @@ class AgentWorker(threading.Thread):
         if not self._compta_marque(events_start, label, model,
                                    work_item_id=(str(lot_comptable)
                                                  if lot_comptable else None),
-                                   turn_id=turn_id):
+                                   turn_id=turn_id,
+                                   attribution=attribution):
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
             return False

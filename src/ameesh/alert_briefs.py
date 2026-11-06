@@ -845,12 +845,18 @@ def _account_config_invalid(alert: dict) -> str:
 
 def _budget_pause_long(alert: dict) -> str:
     """#1466 : une pause budget qui dure n'est plus ordinaire. Aux
-    orchestrateurs de l'équipe et aux auditeurs."""
+    orchestrateurs de l'équipe et aux auditeurs.
+
+    #6031 : l'âge du relevé est dans le détail ; un relevé ancien est une
+    cause possible de la pause (la fenêtre du fournisseur a pu changer sans
+    qu'aucun tour ne publie de relevé neuf)."""
     return ("Agent paused on budget for a long time: %s. Expected action: check the caps "
             "(ameesh budget), the accounts (ameesh accounts list) and the configuration "
             "the runner reads (ameesh doctor; a profile can diverge from the host's "
             "config.json); free an account, fix the profile, or have the runner restart, "
-            "then `ameesh resume` the agent if its runner is not live."
+            "then `ameesh resume` the agent if its runner is not live. If the detail "
+            "says the last gauge reading is old, that reading may be stale and hold the "
+            "pause after its window reset — check it with `ameesh accounts list`."
             % (alert.get("detail") or "?"))
 
 

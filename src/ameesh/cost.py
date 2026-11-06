@@ -55,6 +55,7 @@ from typing import Callable, Iterable, Iterator, Sequence
 
 from . import config as config_mod
 from . import context_metrics
+from . import cost_attribution
 from . import harnesses
 from . import storage
 from .gauge_cache import CLAUDE_GAUGES
@@ -2107,36 +2108,46 @@ class CostBook:
                          input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout,
                          **(marque if tin or tcache or tout else {}))
 
-    def _insert_turn_cost(self, *, inputs=None, **kwargs) -> None:
-        """Écrit la ligne du tour ; l'attribution de messages est facultative.
+    def _insert_turn_cost(self, *, inputs=None, attribution=None, **kwargs) -> None:
+        """Écrit la ligne du tour ; messages et attribution sont facultatifs.
 
         L80b : un exécuteur médié peut parler à un serveur **1.6**, dont la
-        table ne connaît pas `inputs`. Le refus (`bad_args`) ne doit jamais
-        suspendre la comptabilité : on réessaie sans l'attribution — le coût du
-        tour reste compté, l'attribution est perdue et journalisée. Sans
-        `inputs`, le paramètre n'est pas transmis du tout (compatible 1.6)."""
+        table ne connaît pas `inputs` ; #6005 : un serveur **1.11** ne connaît
+        pas `attribution`. Le refus (`bad_args`) ne doit jamais suspendre la
+        comptabilité : on réessaie sans le paramètre inconnu — le coût du tour
+        reste compté, l'attribution est perdue et journalisée. Sans ces
+        paramètres, ils ne sont pas transmis du tout (compatible ancien)."""
         insert = dict(kwargs)
+        if attribution is not None:
+            insert["attribution"] = attribution
         if inputs is not None:
             insert["inputs"] = inputs
-        try:
-            storage.of(self.db).turn_costs.insert(**insert)
-        except Exception as exc:  # noqa: BLE001 - réessai limité au refus 1.6
-            from . import db as db_mod
-            texte = str(exc)
-            if inputs is None or not isinstance(exc, db_mod.DbError) \
-                    or ("bad_args" not in texte and "paramètre inconnu" not in texte):
-                raise
-            log("serveur médié sans `inputs` (%s) : tour compté sans attribution "
-                "de messages" % texte[:160])
-            insert.pop("inputs", None)
-            storage.of(self.db).turn_costs.insert(**insert)
+        for optional in ("attribution", "inputs"):
+            if optional not in insert:
+                continue
+            try:
+                storage.of(self.db).turn_costs.insert(**insert)
+                return
+            except Exception as exc:  # noqa: BLE001 - réessai borné au refus de paramètre
+                from . import db as db_mod
+                texte = str(exc)
+                if not isinstance(exc, db_mod.DbError) \
+                        or ("bad_args" not in texte and "paramètre inconnu" not in texte):
+                    raise
+                log("serveur médié sans `%s` (%s) : tour compté sans %s"
+                    % (optional, texte[:160],
+                       "attribution d'appelant" if optional == "attribution"
+                       else "attribution de messages"))
+                insert.pop(optional)
+        storage.of(self.db).turn_costs.insert(**insert)
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
                key: str | None = None, ended: float | None = None,
                work_item_id: int | None = None,
                started_at: float | None = None,
-               turn_id: str | None = None) -> TurnUsage:
+               turn_id: str | None = None,
+               attribution: dict | None = None) -> TurnUsage:
         """Compte le tour qui vient de finir : **une** ligne `turn_costs`.
 
         La ligne porte le cumul brut du harnais, qui sert de repère au tour
@@ -2156,7 +2167,9 @@ class CostBook:
         l'appelant : une réparation par un autre worker écrit la même
         attribution, ou aucune si elle n'y était pas. `turn_id` (#796) :
         l'identifiant du tour (`turn_resources.turn_id`), même provenance, pour
-        relier la ligne à ses ressources.
+        relier la ligne à ses ressources. `attribution` (#6005) : l'attribution
+        d'appelant d'un tour hors lot, même provenance (le marqueur) — donnée
+        seule, jamais admission, budget ou autorisation.
         """
         if self.db is None:
             raise CostError("record without a database: the cumulative baseline lives in turn_costs")
@@ -2204,13 +2217,14 @@ class CostBook:
         # L80b : les messages servis par ce tour. Codex/ACP les mettent dans
         # `resident.turn.inputs` ; Claude, dont le flux porte déjà l'usage, et
         # depuis #3452 tout tour non résident, dans l'événement séparé
-        # `resident.inputs` (écrit par l'exécuteur avant la ligne).
-        attribution = resident if resident is not None \
+        # `resident.inputs` (écrit par l'exécuteur avant la ligne). Le nom
+        # local ne doit pas masquer l'attribution d'appelant (#6005).
+        inputs_event = resident if resident is not None \
             else _resident_inputs_event(events)
         inputs = None
-        if attribution is not None \
-                and isinstance(attribution.get("inputs"), (list, tuple)):
-            inputs = tuple(str(i) for i in attribution["inputs"] if i is not None)
+        if inputs_event is not None \
+                and isinstance(inputs_event.get("inputs"), (list, tuple)):
+            inputs = tuple(str(i) for i in inputs_event["inputs"] if i is not None)
         self._insert_turn_cost(
             inputs=inputs,
             agent=row["agent"], harness=row["harness"], turn=row["turn"],
@@ -2225,7 +2239,10 @@ class CostBook:
             work_item_id=None if work_item_id is None else int(work_item_id),
             started_at=None if started_at is None else float(started_at),
             # #796 (0423) : l'identifiant du tour, pour le relier à ses ressources
-            turn_id=turn_id)
+            turn_id=turn_id,
+            # #6005 (0551) : l'attribution d'appelant d'un tour hors lot, à
+            # côté du lot ; donnée seule, jamais une autorité
+            attribution=attribution)
         return usage
 
     def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:

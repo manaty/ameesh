@@ -34,6 +34,16 @@ ameesh only **reads** the harnesses' own logs, never writes to them:
   seven-day windows);
 - Codex: `rate_limits` primary and secondary in the local session logs.
 
+A paused agent publishes no new turn, hence no new gauge reading: a reading
+that is no longer the provider's current window would keep the pause alive by
+itself. When a pause rests on a reading older than one hour, the runner
+re-reads the Codex gauge **without a turn** through the provider's read-only
+`account/rateLimits/read` (a short-lived `codex app-server`), publishes the
+fresh windows in the shared gauge history and replays the budget decision.
+The probe spends no tokens and never overrides a cap: a still-saturated
+reading keeps the pause. The `budget_pause_long` alert says how old the last
+known reading is and names a stale reading as a possible cause.
+
 ## Provider balance
 
 For a pay-per-token provider (DeepSeek in this version), `ameesh cost balance`

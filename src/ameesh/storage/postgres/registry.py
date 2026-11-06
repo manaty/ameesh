@@ -1728,6 +1728,11 @@ class PendingSpend(interface.PendingSpend):
         return f"""
 WITH marqueur_brut AS (
     SELECT agent, start_index, turn, model, work_item_id, turn_id,
+           -- N-1 : un ancien writer remplace l'identité du marqueur sans
+           -- `attribution_at` ; seule une attribution posée sur CETTE
+           -- identité (attribution_at = created_at) est rendue.
+           CASE WHEN attribution_at = created_at
+                THEN attribution END AS attribution,
            resident_usage, spend_key,
            {self._EXACT_CREATED_AT} AS created_at,
            extract(epoch from created_at)::float8 AS created_ts,
@@ -1866,7 +1871,7 @@ WITH marqueur_brut AS (
       EXISTS (SELECT 1 FROM reservations_etrangeres) AS reservation_etrangere
 )
 SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
-       m.resident_usage, m.spend_key, m.created_at, m.created_ts,
+       m.attribution, m.resident_usage, m.spend_key, m.created_at, m.created_ts,
        CASE
          WHEN resolution.ledger_key IS NOT NULL THEN resolution.ledger_key
          WHEN m.cle_exacte IS NOT NULL THEN m.cle_exacte
@@ -1994,18 +1999,26 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
                      (json.dumps({'scope': 'agent:' + name}),))
             return dict(event_row, agent=name, event=event, ledger_key=spend_key)
 
-    def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
+    def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None,
+            attribution=None) -> bool:
         return self.put_get(name, start_index, turn, model,
-                            work_item_id=work_item_id, turn_id=turn_id) is not None
+                            work_item_id=work_item_id, turn_id=turn_id,
+                            attribution=attribution) is not None
 
     def put_get(self, name, start_index, turn, model,
-                work_item_id=None, turn_id=None) -> dict | None:
+                work_item_id=None, turn_id=None, attribution=None) -> dict | None:
         """Return THIS marker in its write, before any replacement can change it."""
+        # #6005 (0551) : l'attribution d'appelant voyage avec le marqueur, donc
+        # la ligne écrite par la réparation d'un autre worker la garde.
+        attribution_json = (None if attribution is None
+                            else json.dumps(dict(attribution), ensure_ascii=False,
+                                            sort_keys=True))
         rows = self.db.query(
             """
             INSERT INTO spend_pending (agent, start_index, turn, model, work_item_id,
-                                       turn_id, spend_key, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s,
+                                       turn_id, attribution, attribution_at,
+                                       spend_key, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, now(),
                     %s || ':' || %s || ':' ||
                     to_char(now() at time zone 'UTC',
                             'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
@@ -2016,17 +2029,23 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
                 model        = excluded.model,
                 work_item_id = excluded.work_item_id,
                 turn_id      = excluded.turn_id,
+                attribution  = excluded.attribution,
+                attribution_at = excluded.attribution_at,
                 spend_key    = excluded.spend_key,
                 resident_usage = null,
                 created_at   = now()
             RETURNING agent, start_index, turn, model, work_item_id, turn_id,
+                      -- N-1 : un ancien writer remplace l'identité sans
+                      -- `attribution_at` ; la paire périmée ne se lit pas.
+                      CASE WHEN attribution_at = created_at
+                           THEN attribution END AS attribution,
                       resident_usage, spend_key,
                       """ + self._EXACT_CREATED_AT + """ as created_at,
                       extract(epoch from created_at)::float8 as created_ts
             """,
             (name, int(start_index), turn, model,
              None if work_item_id is None else int(work_item_id),
-             turn_id or None, name, int(start_index)),
+             turn_id or None, attribution_json, name, int(start_index)),
         )
         if not rows:
             return None
