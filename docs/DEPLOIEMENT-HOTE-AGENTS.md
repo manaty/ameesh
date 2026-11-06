@@ -820,13 +820,17 @@ pour la prod.
 
 La recette PgBouncer autorise aussi `ameesh-agents-3` sous l’utilisateur
 `ameesh`. Depuis #6054, elle dimensionne chaque hôte sur le pic mesuré par
-#5983 (4,6 clients par persona) et non sur la moyenne : `ameesh-agents-1`
-64+16 (plafond 80), `ameesh-agents-2` 80+16 (96), `ameesh-agents-3` 32+8 (40)
-et `pc-smichea` 32+16 (48). Si ces quatre hôtes passent exclusivement par ces
+#5983 (4,6 clients par persona) et sur la capacité d'admission `max_agents` de
+la fiche d'hôte du canon : `ameesh-agents-1` 72+16 (plafond 88, pour 19),
+`ameesh-agents-2` 80+16 (96, pour 20), `ameesh-agents-3` 40+8 (48, pour 10)
+et `pc-smichea` 24+8 (32). Si ces quatre hôtes passent exclusivement par ces
 pools, leur budget cumulé reste de 264 sous les 297 sessions ordinaires du
 serveur (300 moins 3 réservées au superutilisateur), soit une marge de 33.
-Avant une bascule, le contrôle porte sur les personas installées
-(`check --personas N` : N × 4,6 ≤ `max_db_connections`), pas sur `max_agents`.
+Avant une bascule, le contrôle porte sur `max_agents`
+(`check --max-agents N` : N × 4,6 ≤ `max_db_connections`), pas sur le nombre
+de personas installées. Le `max_agents` 27 du poste est périmé (aucun siège
+exécuteur depuis le 28/10, #133454 a) : un lot compagnon dans `manaty/home`
+l'abaisse à ≤ 32/4,6 = 6.
 
 Au relevé en lecture seule du bureau du 27/10/2026 vers 11:00Z (courrier
 #150697), seul `pc-smichea` disposait de PgBouncer, plafonné à 80 à l’époque ;

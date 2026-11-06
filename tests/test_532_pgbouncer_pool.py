@@ -85,42 +85,50 @@ class RecipePoolSizing(unittest.TestCase):
                 self.assertIn('max_db_connections = %s' % cap, ini)
                 self.assertIn('default_pool_size = %s' % default, ini)
                 self.assertIn('reserve_pool_size = %s' % reserve, ini)
-        self.assertEqual(limits['pc-smichea'], (32, 16, 48))
-        self.assertEqual(limits['ameesh-agents-1'], (64, 16, 80))
+        self.assertEqual(limits['pc-smichea'], (24, 8, 32))
+        self.assertEqual(limits['ameesh-agents-1'], (72, 16, 88))
         self.assertEqual(limits['ameesh-agents-2'], (80, 16, 96))
-        self.assertEqual(limits['ameesh-agents-3'], (32, 8, 40))
+        self.assertEqual(limits['ameesh-agents-3'], (40, 8, 48))
 
-    def test_peak_sizing_covers_the_measured_personas(self):
-        # #5983, 06/11 : 16 personas sur AG1 (pic 56 clients), 20 sur AG2
-        # (pic 92, soit 4,6 par persona), 8 sur AG3 (juste sous 40).
+    def test_peak_sizing_covers_the_canonical_admission_capacity(self):
+        # #6054 : le contrôle est max_agents × 4,6 (pic #5983), pas le nombre
+        # de personas installées. 19 / 20 / 10 sont les fiches du canon.
         self.assertEqual(self.recipe.PEAK_CLIENTS_PER_PERSONA, 4.6)
-        for host, personas, needed in (('ameesh-agents-1', 16, 74),
-                                       ('ameesh-agents-2', 20, 92),
-                                       ('ameesh-agents-3', 8, 37)):
+        for host, max_agents, needed in (('ameesh-agents-1', 19, 88),
+                                         ('ameesh-agents-2', 20, 92),
+                                         ('ameesh-agents-3', 10, 46)):
             with self.subTest(host=host):
-                result = self.recipe.capacity(personas, host)
+                result = self.recipe.capacity(max_agents, host)
                 self.assertEqual(result['needed'], needed)
                 self.assertTrue(result['ok'])
-                self.assertGreaterEqual(result['max_db_connections'], needed)
+                self.assertEqual(result['max_agents_covered'], max_agents)
 
-    def test_check_refuses_admission_above_the_persona_bound(self):
-        self.assertFalse(self.recipe.capacity(18, 'ameesh-agents-1')['ok'])
+    def test_check_refuses_admission_above_the_max_agents_bound(self):
+        self.assertFalse(self.recipe.capacity(20, 'ameesh-agents-1')['ok'])
         self.assertFalse(self.recipe.capacity(21, 'ameesh-agents-2')['ok'])
-        self.assertFalse(self.recipe.capacity(9, 'ameesh-agents-3')['ok'])
-        self.assertEqual(self.recipe.capacity(17, 'ameesh-agents-1')['needed'], 79)
-        self.assertTrue(self.recipe.capacity(17, 'ameesh-agents-1')['ok'])
+        self.assertFalse(self.recipe.capacity(11, 'ameesh-agents-3')['ok'])
+        self.assertEqual(self.recipe.capacity(19, 'ameesh-agents-1')['needed'], 88)
+        self.assertTrue(self.recipe.capacity(19, 'ameesh-agents-1')['ok'])
+
+    def test_the_workstation_pool_covers_its_companion_canon_bound(self):
+        # #6054 + #6057 : 24+8=32 porte 6 places d'admission (6 × 4,6 = 27,6).
+        result = self.recipe.capacity(6, 'pc-smichea')
+        self.assertEqual(result['needed'], 28)
+        self.assertEqual(result['max_db_connections'], 32)
+        self.assertEqual(result['max_agents_covered'], 6)
+        self.assertTrue(result['ok'])
 
     def test_check_prints_the_peak_verdict_and_its_exit_code(self):
         import contextlib
         import io
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(self.recipe.check(16, 'ameesh-agents-1'), 0)
-            self.assertEqual(self.recipe.check(19, 'ameesh-agents-1'), 1)
+            self.assertEqual(self.recipe.check(19, 'ameesh-agents-1'), 0)
+            self.assertEqual(self.recipe.check(20, 'ameesh-agents-1'), 1)
         text = out.getvalue()
-        self.assertIn('16 persona(s) x 4.6 = 74 server session(s) at peak', text)
-        self.assertIn('pool 64+16 = 80: OK', text)
-        self.assertIn('19 persona(s) x 4.6 = 88', text)
+        self.assertIn('max_agents 19 x 4.6 = 88 server session(s) at peak', text)
+        self.assertIn('pool 72+16 = 88: OK', text)
+        self.assertIn('max_agents 20 x 4.6 = 92', text)
         self.assertIn('KO, resize before switching', text)
 
 

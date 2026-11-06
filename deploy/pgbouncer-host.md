@@ -61,9 +61,9 @@ call, after one idle second (git, gh, ssh between two statements) and after
 any error; explicit transactions and independent gate/controller locks retain
 their sessions until completion. No transaction is shared across threads.
 
-The pool of pc-smichea permits 32 ordinary server sessions and 16 reserve
-sessions, with a total ceiling of 48; agents-1 has 64+16 (ceiling 80),
-agents-2 80+16 (96) and agents-3 32+8 (40), see below. Clients have a ceiling
+The pool of pc-smichea permits 24 ordinary server sessions and 8 reserve
+sessions, with a total ceiling of 32; agents-1 has 72+16 (ceiling 88),
+agents-2 80+16 (96) and agents-3 40+8 (48), see below. Clients have a ceiling
 of 250. Idle *unassigned* server sessions are closed after 30 seconds. These
 limits descend from the 2026-10-13 incident on pc-smichea: the original pool
 (32+8, ceiling 40, 100 clients) saturated in session mode (40 active, 60
@@ -72,22 +72,27 @@ every mesh CLI of the host. Pools are sized on the **peak** measured on
 2026-11-06 by #5983, not on the average: agents-2 saw 92 clients for 20
 personas (4.6 per persona) and 75/80 server sessions while most agents were
 paused; agents-1 saw 56 clients for 16 personas (3.5) and 50/64 sessions;
-agents-3 (8 personas) stayed just under 40. At full activity the same 4.6
-clients per persona are taken, one server session per active client in
-session mode: 16 × 4.6 = 74 ≤ 80 for agents-1, 20 × 4.6 = 92 ≤ 96 for
-agents-2, 8 × 4.6 = 37 ≤ 40 for agents-3. The workstation carries no
-execution agent today; its pool drops to 32+16 (48), 3.4× the 14 connections
-measured there on 27/10. The total is 80+96+40+48 = 264 of the server's 297
+agents-3 (8 personas) stayed just under 40. Those observed counts are not the
+admission ceilings: the canon host cards allow 19/20/10 for agents-1/2/3. The
+pre-switch control is the host card's **admission capacity**, not the installed
+runner count:
+`max_agents × 4.6` must fit `max_db_connections` (one server session per
+active client in session mode). agents-1 (19) needs 87.4 → 72+16 = 88,
+agents-2 (20) needs 92 → 80+16 = 96, agents-3 (10) needs 46 → 40+8 = 48.
+pc-smichea carries no execution agent since 2026-10-28 (decision #133454 a,
+lot #3463) and only its bureau session; its canon `max_agents` 27 is stale.
+Its provisional pool is 24+8 = 32: ask the bureau for the current peak of its
+pool before fixing the figure, and if that peak exceeds 24, resize instead of
+leaving the reserve short. A companion lot in `manaty/home` lowers its
+`max_agents` to at most `floor(32 / 4.6) = 6`, citing #6054 and #133454 a.
+Until that lot lands, readmitting execution agents on the workstation requires
+resizing its pool first. The total is 88+96+48+32 = 264 of the server's 297
 ordinary slots (`max_connections` 300 minus 3 `superuser_reserved_connections`),
 leaving 33 for direct clients; the recipe test keeps at least 30. Before
-switching a host, bureau counts the installed runner units
-(`systemctl --user list-units 'ameesh-runner-agent@*' --no-legend`) and runs
-`python3 deploy/pgbouncer-host.py check --personas N`: N × 4.6 must not exceed
-the host's `max_db_connections`. A host whose canon `max_agents` is above
-`floor(max_db_connections / 4.6)` (17 on agents-1, 20 on agents-2, 8 on
-agents-3) can admit more agents than its pool covers: resize before admitting
-them, or bound `max_agents`. Increasing the runner count beyond this capacity
-requires review.
+switching a host, bureau reads `max_agents` from its canon host card and runs
+`python3 deploy/pgbouncer-host.py check --max-agents N`: N × 4.6 must not
+exceed the host's `max_db_connections`. Increasing an admission ceiling
+requires resizing its pool first.
 
 An installation made before this sizing is raised **by hand**: the recipe
 refuses an existing installation, and a fresh installation elsewhere cannot
@@ -97,8 +102,8 @@ agents-1, 64+16 on agents-2 and pc-smichea) is the case this covers. Back up
 `~/.config/pgbouncer/pgbouncer.ini` first (dated name, 0600), then set
 `max_client_conn = 250`, `server_idle_timeout = 30` and the host's own
 `default_pool_size`, `reserve_pool_size` and `max_db_connections`
-(`POOL_LIMITS` in `pgbouncer-host.py`: 32/16/48 on pc-smichea, 64/16/80 on
-agents-1, 80/16/96 on agents-2, 32/8/40 on agents-3). Reload without
+(`POOL_LIMITS` in `pgbouncer-host.py`: 24/8/32 on pc-smichea, 72/16/88 on
+agents-1, 80/16/96 on agents-2, 40/8/48 on agents-3). Reload without
 dropping clients:
 
 ```sh
@@ -118,16 +123,17 @@ psql "host=$HOME/.local/state/pgbouncer/socket port=6432 user=ameesh dbname=pgbo
 `SHOW CONFIG` must show the five values above.
 
 #6054 moves the four hosts from the #5983 sizing (80/64/80/40) to
-48/80/96/40: agents-1 and agents-2 are raised, agents-3 is unchanged, and
-pc-smichea is lowered. The sum stays 264. Apply the same backup, values and
-HUP per host; lowering the workstation is safe because it carries no execution
-agent today. The recipe's `check --personas N` is the pre-switch control
-(N × 4.6 against the host's `max_db_connections`).
+32/88/96/48: all three agent VMs are raised, and pc-smichea is lowered. The
+sum stays 264. Apply the same backup, values and HUP per host; lowering the
+workstation is safe because it carries no execution agent, only the bureau
+session, since 2026-10-28. The recipe's `check --max-agents N` is the
+pre-switch control (canon `max_agents` × 4.6 against the host's
+`max_db_connections`).
 
 Known gap (2026-10-13): `pc-smichea` still carries the `server_idle_timeout = 600`
 written by hand at the first installation, while this recipe targets 30 s; its
 other four limits were raised during the incident (250/64/16/80), and #6054
-sets them to 32/16/48. The gap only delays closing an idle server session, it
+sets them to 24/8/32. The gap only delays closing an idle server session, it
 does not affect correctness. It is to be reconciled at the next planned
 restart of the host — not during a release window — with the reload above or by
 writing these values at that restart.
