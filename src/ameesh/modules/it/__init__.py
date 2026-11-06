@@ -68,7 +68,9 @@ def descriptor(options=None):
 def item(db, item_id):
     from ... import work
     from ..storage import ModuleStore
-    row = work.get(db, item_id)
+    # #5993 : lecture étroite — le rôle QA isolé n'a pas SELECT sur les
+    # jalons/journal que `work.get` lit pour la garde du move vers qa.
+    row = work.get_brief(db, item_id)
     if row is None:
         raise ValueError("lot %s does not exist" % item_id)
     project = row.get("app") or row.get("workstream") or ""

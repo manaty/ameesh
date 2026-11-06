@@ -38,6 +38,11 @@ class ReviewerAuditorTest(PgTestCase):
     def _qa(self, lot):
         proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # #5993 : `work move … qa` exige un gel déclaré ; la désignation
+        # manuelle qui suit se juge sur un lot déjà en revue.
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'frozen', %s, 'chef')", (lot["id"], "a" * 40))
         proc = self.mesh("work", "move", str(lot["id"]), "qa", "--actor", "chef",
                          env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -109,6 +114,10 @@ class ReviewerAuditorTest(PgTestCase):
         lot = self._lot()
         proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # #5993 : le geste d'entrée en revue exige un gel déclaré.
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'frozen', %s, 'auditeur')", (lot["id"], "a" * 40))
 
         proc = self.mesh("work", "move", str(lot["id"]), "qa",
                          "--reviewer", "relecteur", "--actor", "auditeur",
