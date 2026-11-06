@@ -338,11 +338,14 @@ class Codex:
             "modelContextWindow": 258400}})
         # #6044 : compaction native réussie. La notification dépréciée et
         # l'item peuvent décrire le même fait ; le driver ne doit le compter
-        # qu'une fois, puis mesurer l'après sur l'appel suivant.
-        if os.environ.get("FAKE_CODEX_COMPACT") == "1":
+        # qu'une fois, puis mesurer l'après sur l'appel suivant. Le mode `2`
+        # s'arrête à la preuve : aucun appel après, donc pas d'« après ».
+        scenario = os.environ.get("FAKE_CODEX_COMPACT")
+        if scenario in ("1", "2"):
             self.notify("thread/compacted", {"turnId": turn["id"]})
             self.notify("item/completed", {"turnId": turn["id"], "item": {
                 "type": "contextCompaction", "id": "i3"}})
+        if scenario == "1":
             after = {"inputTokens": 120, "cachedInputTokens": 20,
                      "outputTokens": 4, "reasoningOutputTokens": 0,
                      "totalTokens": 124}

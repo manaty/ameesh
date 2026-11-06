@@ -730,6 +730,17 @@ class CodexAppServerTest(DriverCase):
         self.assertEqual(result.compact["quality"], "measured")
         self.assertFalse(result.compact["reasons"])
 
+    def test_compaction_resident_sans_apres_reste_partielle(self):
+        # Sans appel après la frontière, l'« après » n'est pas inventé (§4.2).
+        driver = self.driver(env={"FAKE_CODEX_COMPACT": "2"})
+        driver.start()
+        result = self.wait(driver.send("hello", input_id="i"))
+        self.assertEqual(result.compact["pre"], 300)
+        self.assertIsNone(result.compact["post"])
+        self.assertEqual(result.compact["count"], 1)
+        self.assertEqual(result.compact["quality"], "partial")
+        self.assertIn("post_tokens_unknown", result.compact["reasons"])
+
     def test_steer_in_the_turn(self):
         driver = self.driver()
         driver.start()
