@@ -51,7 +51,7 @@ class RecipePoolSizing(unittest.TestCase):
         ini = self.recipe.pool_ini('ameesh', '10.77.0.1', '5432',
                                    socket_dir=Path('/private/socket'),
                                    auth_file=Path('/private/userlist.txt'),
-                                   admin_user='ameesh', tls='require', host='ameesh-agents-1')
+                                   admin_user='ameesh', tls='require', host='ameesh-agents-2')
         self.assertIn('pool_mode = session', ini)
         self.assertIn('unix_socket_dir = /private/socket', ini)
         self.assertIn('auth_file = /private/userlist.txt', ini)
@@ -70,7 +70,9 @@ class RecipePoolSizing(unittest.TestCase):
         limits = self.recipe.POOL_LIMITS
         self.assertEqual(set(limits), {'pc-smichea', 'ameesh-agents-1',
                                       'ameesh-agents-2', 'ameesh-agents-3'})
-        self.assertLess(sum(cap for _, _, cap in limits.values()), 300)
+        # #5983 : max_connections 300 moins 3 sessions superuser réservées ;
+        # au moins 30 sessions ordinaires restent aux clients directs.
+        self.assertLessEqual(sum(cap for _, _, cap in limits.values()), 297 - 30)
         for host, (default, reserve, cap) in limits.items():
             with self.subTest(host=host):
                 self.assertLessEqual(default + reserve, cap)
@@ -82,6 +84,7 @@ class RecipePoolSizing(unittest.TestCase):
                 self.assertIn('default_pool_size = %s' % default, ini)
                 self.assertIn('reserve_pool_size = %s' % reserve, ini)
         self.assertEqual(limits['ameesh-agents-3'], (32, 8, 40))
+        self.assertEqual(limits['ameesh-agents-1'], (48, 16, 64))
 
 
 def every_startup_setting():
