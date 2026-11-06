@@ -4485,6 +4485,17 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                 "move it to qa")
     if state == lifecycle.WAITING_HUMAN and not storage.of(db).decisions.pending_for_lot(str(item_id)):
         raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
+    unfrozen = ""
+    if (state == lifecycle.QA and current == lifecycle.IN_PROGRESS and reviewer is None
+            and actor != SYSTEM_SENDER and (item.get("branch") or "").strip()
+            and not any(m.get("kind") == "frozen" for m in milestones(db, item_id))):
+        # #6066 : un lot à branche jamais gelé entre en qa sans relecteur
+        # désigné (« waiting: freeze ») et sa CI est refusée (« not frozen ») :
+        # le gel est le geste qui passe en qa et désigne. Avertissement et non
+        # refus : des appelants (fixtures, pilote) entrent encore en qa ainsi.
+        unfrozen = ("lot %s has a branch but no freeze: nobody is designated and its CI "
+                    "is refused until ameesh work milestone %s frozen --sha <reviewed "
+                    "head> (#6066)" % (item_id, item_id))
     if package_exclusion and current not in TO_VALIDATE:
         raise WorkError("--package-exclusion: lot %s is in %s, not in qa: only a "
                         "frozen lot under review is in a package" % (item_id, current))
@@ -4512,6 +4523,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     stranger = non_assignee_warning(getattr(db, "cfg", None), db, item, actor)
     if stranger:
         text = "%s\n%s" % (text, stranger)
+    if unfrozen:
+        text = "%s\n%s" % (text, unfrozen)
     from . import planned_waits
     guarded = (planned_waits.is_hold_note(note)
                or planned_waits.is_lift_note(note))
@@ -4560,6 +4573,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         row.update(_reviewer_request(db, item, reviewer, actor))
     if stranger:
         row["assignee_warning"] = stranger
+    if unfrozen:
+        row["freeze_warning"] = unfrozen
     return row
 
 

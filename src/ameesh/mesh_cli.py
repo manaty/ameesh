@@ -2684,6 +2684,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # #5006 : un move par un agent qui n'est plus l'assigné
             if item.get("assignee_warning"):
                 print("warning: %s" % item["assignee_warning"], file=sys.stderr)
+            # #6066 : entré en qa sans gel, le lot n'a ni relecteur ni CI
+            if item.get("freeze_warning"):
+                print("warning: %s" % item["freeze_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
             # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
