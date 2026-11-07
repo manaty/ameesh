@@ -15,7 +15,7 @@ from unittest import mock
 
 from ameesh import debit, file_decoupage
 
-from tests.test_3256_debit_capacity import H, SPLIT, T, measure, team
+from tests.test_3256_debit_capacity import H, SPLIT, T, measure, split_lot, team
 
 
 def exhausted(at=T - 2 * H):
@@ -35,7 +35,7 @@ class StaleSeatTest(unittest.TestCase):
                  seat("ameesh-idle-0", "only eligible reviewer of family deepseek "
                                        "for pending freeze #130"),
                  seat("ameesh-idle-1", "designated review pending on #131")]
-        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[])
+        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[split_lot()])
         self.assertEqual(cap["held"], [])
         self.assertEqual(sorted(cap["projects"][0]["idle_agents"]),
                          ["ameesh-idle-0", "ameesh-idle-1"])
@@ -43,14 +43,16 @@ class StaleSeatTest(unittest.TestCase):
     def test_a_seat_on_a_merged_lot_holds_nobody(self):
         notes = [exhausted(), seat("ameesh-idle-0", "designated review pending on #130")]
         lots = [{"id": 130, "app": "ameesh", "state": "merged"}]
-        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
+        cap = measure(team(2, 8), roadmap_notes=notes,
+                      open_lots=[split_lot()] + lots)
         self.assertEqual(cap["held"], [])
 
     def test_a_seat_on_a_validated_lot_holds_nobody(self):
         # #6024 : validé, le lot n'attend plus d'avis
         notes = [exhausted(), seat("ameesh-idle-0", "designated review pending on #130")]
         lots = [{"id": 130, "app": "ameesh", "state": "validated"}]
-        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
+        cap = measure(team(2, 8), roadmap_notes=notes,
+                      open_lots=[split_lot()] + lots)
         self.assertEqual(cap["held"], [])
 
     def test_the_only_eligible_seat_requires_qa(self):
@@ -60,13 +62,15 @@ class StaleSeatTest(unittest.TestCase):
         for state, held in (("build", []), ("qa", [{
                 "agent": "ameesh-idle-0", "reason": "review seat: " + why}])):
             lots = [{"id": 130, "app": "ameesh", "state": state}]
-            cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
+            cap = measure(team(2, 8), roadmap_notes=notes,
+                          open_lots=[split_lot()] + lots)
             self.assertEqual(cap["held"], held, state)
 
     def test_a_seat_on_a_waiting_lot_still_holds(self):
         notes = [exhausted(), seat("ameesh-idle-0", "designated review pending on #130")]
         lots = [{"id": 130, "app": "ameesh", "state": "qa"}]
-        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
+        cap = measure(team(2, 8), roadmap_notes=notes,
+                      open_lots=[split_lot()] + lots)
         self.assertEqual(cap["held"], [{"agent": "ameesh-idle-0", "reason":
                                         "review seat: designated review pending on #130"}])
 
@@ -77,14 +81,15 @@ class StaleSeatTest(unittest.TestCase):
         notes = [exhausted(),
                  seat("ameesh-idle-0", "designated review pending on #130", T - H),
                  seat("ameesh-idle-0", "designated review pending on #140", T - H / 2)]
-        seats = debit._review_seats(notes, debit._roadmap_verdicts(notes), lots)
+        seats = debit._review_seats(notes, debit._roadmap_verdicts(notes, [split_lot()]),
+                                     lots)
         self.assertEqual(seats, {"ameesh-idle-0":
                                  "review seat: designated review pending on #140"})
         notes = [exhausted(),
                  seat("ameesh-idle-0", "designated review pending on #140", T - H),
                  seat("ameesh-idle-0", "unread mail from pilote (5 min)", T - H / 2)]
-        self.assertEqual(debit._review_seats(notes, debit._roadmap_verdicts(notes),
-                                             lots), {})
+        self.assertEqual(debit._review_seats(
+            notes, debit._roadmap_verdicts(notes, [split_lot()]), lots), {})
 
 
 class JournalExemptionTest(unittest.TestCase):
@@ -119,8 +124,8 @@ class JournalExemptionTest(unittest.TestCase):
         notes = [{"id": 1, "note": "roadmap: épuisée ameesh", "created_ts": 10.0},
                  {"id": 2, "note": "roadmap: rouverte ameesh", "created_ts": 20.0},
                  {"id": 3, "note": "roadmap: épuisée ameesh", "created_ts": 30.0}]
-        self.assertEqual(file_decoupage._exhausted_since(notes, "ameesh"), 30.0)
-        self.assertEqual(file_decoupage._exhausted_since([], "ameesh"), 0.0)
+        self.assertEqual(file_decoupage.exhausted_since(notes, "ameesh"), 30.0)
+        self.assertEqual(file_decoupage.exhausted_since([], "ameesh"), 0.0)
 
 
 if __name__ == "__main__":

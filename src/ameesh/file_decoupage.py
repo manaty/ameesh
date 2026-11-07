@@ -314,14 +314,22 @@ def roadmap_state(notes: list, project: str) -> str | None:
     return state
 
 
-def _exhausted_since(notes: list, project: str) -> float:
+def exhausted_since(notes: list, project: str) -> float:
     """#6010 : l'instant de la dernière note d'épuisement du projet (0 sans
-    note datée) ; les traces d'exemption valent pour cet épuisement-là."""
+    note datée) ; les traces d'exemption valent pour cet épuisement-là.
+
+    #6215 : public, partagé avec le débit (`debit._roadmap_verdicts`) : les
+    deux lecteurs datent l'épuisement par la même fonction, jamais par une
+    copie du filtre."""
     since = 0.0
     for row in _roadmap_order(notes):
         match = EXHAUSTED_RE.match(str((row or {}).get("note") or ""))
         if match and match.group(1).strip(".,;:") == project:
-            since = float(row.get("created_ts") or 0.0)
+            # #6215 : le journal (`created_ts`) et la lecture SQL du débit
+            # (`at_ts`) portent le même instant sous deux noms ; la fonction
+            # partagée lit les deux, jamais un tri de notes séparé.
+            since = float((row or {}).get("created_ts")
+                          or (row or {}).get("at_ts") or 0.0)
     return since
 
 
@@ -1208,7 +1216,7 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
                                split_id=int(split["id"]), lots=lots, listing=listing,
                                cfg=cfg, canons=canons,
                                mail_window_s=settings.mail_window(), waits=waits,
-                               since_ts=_exhausted_since(notes, project))
+                               since_ts=exhausted_since(notes, project))
                 if slept:
                     out.append({"kind": "sleep", "project": project,
                                 "lot": int(split["id"]), "agents": slept})

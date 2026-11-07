@@ -56,6 +56,16 @@ def team(idle, working, project="ameesh"):
             + [busy("%s-busy-%d" % (project, i), project) for i in range(working)])
 
 
+def split_lot(ident=90, project="ameesh", state="intake", **extra):
+    """Le lot de découpage du projet : seule une note posée sur lui vaut
+    (#6215, comme `file_decoupage._open_split`)."""
+    row = {"id": ident, "source": "file-decoupage:%s" % project,
+           "app": project, "state": state, "created_ts": T - 2 * H,
+           "title": "Découper la feuille de route de %s" % project}
+    row.update(extra)
+    return row
+
+
 def mechanics_doc(*, families=("claude", "codex", "deepseek"), excluded=()):
     """Le document `mechanics.configured` réduit à ce que `read_capacity` lit."""
     from types import SimpleNamespace
@@ -110,14 +120,14 @@ class TriggerTest(unittest.TestCase):
     def test_an_exhausted_roadmap_is_quiet_and_counts_no_hours(self):
         notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh (feuille "
                   "docs/roadmap.md, décision owner)", "at_ts": T - H}]
-        cap = measure(team(2, 8), roadmap_notes=notes)
+        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[split_lot()])
         self.assertEqual(cap["alerts"], [])
         self.assertEqual(cap["projects"][0]["idle_agent_hours"], 0.0)
         self.assertEqual(cap["projects"][0]["roadmap_exhausted"]["lot"], 90)
 
     def test_a_startable_lot_reopens_an_exhausted_roadmap(self):
         notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - H}]
-        cap = measure(team(2, 8), roadmap_notes=notes,
+        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[split_lot()],
                       startable=[{"id": 12, "app": "ameesh"}])
         self.assertIsNone(cap["projects"][0]["roadmap_exhausted"])
         self.assertEqual(len(cap["alerts"]), 1)
@@ -127,7 +137,7 @@ class TriggerTest(unittest.TestCase):
         # `ameesh alerts` (#4623)
         notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - 2 * H},
                  {"work_item_id": 90, "source": SPLIT, "note": "roadmap: rouverte ameesh", "at_ts": T - H}]
-        cap = measure(team(2, 8), roadmap_notes=notes)
+        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[split_lot()])
         self.assertIsNone(cap["projects"][0]["roadmap_exhausted"])
         self.assertEqual(len(cap["alerts"]), 1)
         self.assertGreater(cap["projects"][0]["idle_agent_hours"], 0)
@@ -135,7 +145,7 @@ class TriggerTest(unittest.TestCase):
     def test_an_exhaustion_after_a_reopening_holds(self):
         notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: rouverte ameesh", "at_ts": T - 2 * H},
                  {"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - H}]
-        cap = measure(team(2, 8), roadmap_notes=notes)
+        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[split_lot()])
         self.assertEqual(cap["projects"][0]["roadmap_exhausted"]["lot"], 90)
         self.assertEqual(cap["alerts"], [])
 
@@ -145,7 +155,8 @@ class TriggerTest(unittest.TestCase):
         # `ameesh alerts` le dit
         notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh",
                   "at_ts": T - 2 * H}]
-        lots = [{"id": 91, "app": "ameesh", "state": "qa", "assignee": "bureau",
+        lots = [split_lot(),
+                {"id": 91, "app": "ameesh", "state": "qa", "assignee": "bureau",
                  "created_ts": T - H}]
         cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
         self.assertIsNotNone(cap["projects"][0]["roadmap_exhausted"])
@@ -161,7 +172,8 @@ class TriggerTest(unittest.TestCase):
                  {"work_item_id": 90, "source": SPLIT, "at_ts": T - H,
                   "note": "sleep exempted: ameesh-idle-1: unread mail from pilote (5 min)"}]
         # #6010 : le siège tient tant que le lot cité attend son avis
-        lots = [{"id": 130, "app": "ameesh", "state": "qa", "assignee": "ameesh-busy-0"}]
+        lots = [split_lot(),
+                {"id": 130, "app": "ameesh", "state": "qa", "assignee": "ameesh-busy-0"}]
         cap = measure(team(2, 8), roadmap_notes=notes, open_lots=lots)
         self.assertEqual(cap["projects"][0]["idle_agents"], ["ameesh-idle-1"])
         self.assertEqual(cap["projects"][0]["wakeable"], 9)
@@ -172,17 +184,24 @@ class TriggerTest(unittest.TestCase):
         notes = [{"work_item_id": 90, "source": SPLIT, "at_ts": T - 3 * H,
                   "note": "sleep exempted: ameesh-idle-0: designated review pending on #130"},
                  {"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - 2 * H}]
-        cap = measure(team(2, 8), roadmap_notes=notes)
+        cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[split_lot()])
         self.assertEqual(cap["projects"][0]["idle"], 2)
         self.assertEqual(cap["held"], [])
 
-    def test_a_note_outside_the_split_lot_does_not_count(self):
-        # B4 (impl-03) : la note se pose sur le lot de découpage du projet
-        for source in ("", "github:issue", "file-decoupage:nexlink"):
-            with self.subTest(source=source):
-                notes = [{"work_item_id": 999, "source": source,
+    def test_a_note_outside_the_open_split_lot_does_not_count(self):
+        # B4 (impl-03), #6215 : la note se pose sur le lot de découpage ouvert
+        # du projet ; une note sur un autre lot (ordinaire, fermé, ou d'un
+        # autre projet) ne vaut pas, comme pour le sommeil.
+        for source, work_item_id in (
+                ("", 999), ("github:issue", 999),
+                ("file-decoupage:nexlink", 999),
+                ("file-decoupage:ameesh", 91)):
+            with self.subTest(source=source, work_item_id=work_item_id):
+                notes = [{"work_item_id": work_item_id, "source": source,
                           "note": "roadmap: épuisée ameesh", "at_ts": T - H}]
-                cap = measure(team(2, 8), roadmap_notes=notes)
+                closed = split_lot(91, state="closed")
+                cap = measure(team(2, 8), roadmap_notes=notes,
+                              open_lots=[split_lot(), closed])
                 self.assertIsNone(cap["projects"][0]["roadmap_exhausted"])
                 self.assertEqual(len(cap["alerts"]), 1)
 
@@ -203,7 +222,8 @@ class TriggerTest(unittest.TestCase):
 
     def test_the_mesh_does_not_count_an_exhausted_project_hours(self):
         notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - H}]
-        cap = measure(team(2, 0, "ameesh") + team(1, 0, "nexlink"), roadmap_notes=notes)
+        cap = measure(team(2, 0, "ameesh") + team(1, 0, "nexlink"), roadmap_notes=notes,
+                      open_lots=[split_lot()])
         nexlink = [row for row in cap["projects"] if row["project"] == "nexlink"][0]
         self.assertEqual(nexlink["idle_agent_hours"], 6.0)
         self.assertEqual(cap["mesh"]["idle_agent_hours"], 6.0)
