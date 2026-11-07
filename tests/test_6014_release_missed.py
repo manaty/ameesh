@@ -112,6 +112,9 @@ class NoStagingTest(unittest.TestCase):
         patcher = mock.patch.object(nx, "ensure_ref")
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(nx, "release_tags", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_no_staging_does_not_refuse_the_nexlink_model(self):
         with mock.patch.object(nx, "workflow_step", return_value=False):

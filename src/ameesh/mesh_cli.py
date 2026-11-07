@@ -3216,7 +3216,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # vérifié) est dans la note du jalon ; la sortie le dit aussi,
                 # sans en faire un refus.
                 for line in str(row.get("note") or "").splitlines():
-                    if line.startswith((work.FREEZE_UNPUBLISHED_MARK,
+                    if line.startswith(("ameesh-freeze-missing-branch:",
+                                        work.FREEZE_UNPUBLISHED_MARK,
                                         work.FREEZE_UNVERIFIED_MARK,
                                         work.NON_ASSIGNEE_MARK)):
                         print("warning: %s" % line, file=sys.stderr)
