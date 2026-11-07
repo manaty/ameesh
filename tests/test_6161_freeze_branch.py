@@ -79,15 +79,16 @@ class FreezeBranchTest(PgTestCase):
         self.publish()
         work.set_branch(self.db, self.lot, "agent/basket", actor="human:test")
         work.detach_branch(self.db, self.lot, reason="explicit choice", actor="human:test")
-        with self.assertRaisesRegex(work.WorkError, "branch-not-associated"):
-            self.freeze()
+        row = self.freeze()
+        self.assertIn("explicitly detached", row["note"])
+        self.assertIn(freeze_branch.MISSING_MARK, row["note"])
         self.assertIsNone(work.get(self.db, self.lot)["branch"])
 
     def test_concurrent_explicit_branch_is_not_overwritten(self):
         self.publish()
         lookup = freeze_branch.published_branch
-        def associate(repo, sha):
-            result = lookup(repo, sha)
+        def associate(repo, sha, **kwargs):
+            result = lookup(repo, sha, **kwargs)
             work.set_branch(self.db, self.lot, "explicit", actor="human:test")
             return result
         with mock.patch.object(freeze_branch, "published_branch", side_effect=associate):
@@ -103,6 +104,56 @@ class FreezeBranchTest(PgTestCase):
 
     def test_remote_unavailable_warns(self):
         git(self.repo, "remote", "set-url", "origin", os.path.join(self.root, "absent.git"))
+        branch, warning = freeze_branch.published_branch(self.repo, self.sha)
+        self.assertIsNone(branch)
+        self.assertIn("remote heads unavailable", warning)
+
+    def test_remote_other_than_origin_is_inferred(self):
+        self.publish()
+        git(self.repo, "remote", "rename", "origin", "forge")
+        row = self.freeze()
+        self.assertNotIn(freeze_branch.MISSING_MARK, row["note"])
+        self.assertEqual(work.get(self.db, self.lot)["branch"], "agent/basket")
+
+    def test_same_branch_on_two_remotes_is_one_candidate(self):
+        self.publish()
+        git(self.repo, "remote", "add", "mirror", self.forge)
+        branch, warning = freeze_branch.published_branch(self.repo, self.sha)
+        self.assertEqual((branch, warning), ("agent/basket", ""))
+
+    def test_distinct_branches_across_remotes_are_ambiguous(self):
+        self.publish()
+        other = os.path.join(self.root, "other.git")
+        os.makedirs(other)
+        git(other, "init", "-q", "--bare")
+        git(self.repo, "remote", "add", "other", other)
+        git(self.repo, "push", "-q", "other", "HEAD:refs/heads/other-branch")
+        with self.assertRaises(work.WorkError) as caught:
+            self.freeze()
+        self.assertIn("branch-ambiguous", str(caught.exception))
+        self.assertIn("ameesh work branch %s BRANCH_NAME" % self.lot, str(caught.exception))
+        self.assertNotIn("<id>", str(caught.exception))
+
+    def test_cli_warning_names_the_lot(self):
+        proc = self.mesh("work", "milestone", str(self.lot), "frozen",
+                         "--sha", self.sha, "--repo", self.repo, "--actor", "human:test")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("warning: " + freeze_branch.MISSING_MARK, proc.stderr)
+        self.assertIn("ameesh work branch %s BRANCH_NAME" % self.lot, proc.stderr)
+        self.assertNotIn("<id>", proc.stderr)
+
+    def test_detached_terminal_lot_can_freeze_with_warning(self):
+        self.publish()
+        work.set_branch(self.db, self.lot, "agent/basket", actor="human:test")
+        work.detach_branch(self.db, self.lot, reason="explicit choice", actor="human:test")
+        work.close(self.db, self.lot, done=True, actor="human:test")
+        row = self.freeze()
+        self.assertIn("explicitly detached", row["note"])
+        self.assertIsNone(work.get(self.db, self.lot)["branch"])
+
+    def test_unreadable_remote_prevents_partial_inference(self):
+        self.publish()
+        git(self.repo, "remote", "add", "unreadable", os.path.join(self.root, "absent.git"))
         branch, warning = freeze_branch.published_branch(self.repo, self.sha)
         self.assertIsNone(branch)
         self.assertIn("remote heads unavailable", warning)

@@ -7,39 +7,56 @@ import subprocess
 MISSING_MARK = "ameesh-freeze-missing-branch:"
 
 
-def published_branch(repo: str, sha: str) -> tuple[str | None, str]:
+def missing_warning(item_id: int | None = None) -> str:
+    """Shared machine marker and a shell-safe, concrete lot identifier."""
+    lot = str(item_id) if item_id is not None else "LOT_ID"
+    return ("%s no branch associated: the composer will not see this lot; "
+            "set it with ameesh work branch %s BRANCH_NAME" % (MISSING_MARK, lot))
+
+
+def published_branch(repo: str, sha: str, *, item_id: int | None = None) -> tuple[str | None, str]:
     """Lecture réseau avant la transaction ; seule une tête exacte fait preuve.
 
     Un ancêtre commun ne permet pas de choisir la branche de travail. Les refs
-    locales périmées, tags et alias origin/HEAD ne sont jamais des candidats.
+    locales périmées, tags et alias distants HEAD ne sont jamais des candidats.
     """
     from .work import WorkError
 
-    warning = ("%s no branch associated: the composer will not see this lot; "
-               "set it with ameesh work branch <id> <branch>" % MISSING_MARK)
+    lot = str(item_id) if item_id is not None else "LOT_ID"
+    remedy = "ameesh work branch %s BRANCH_NAME" % lot
+    warning = missing_warning(item_id)
     if not repo:
         return None, warning + " (no readable repository)"
+    candidates = set()
     try:
-        result = subprocess.run(
-            ["git", "-C", repo, "ls-remote", "--heads", "origin"],
-            capture_output=True, text=True, timeout=20, check=False)
+        remotes = subprocess.run(
+            ["git", "-C", repo, "remote"], capture_output=True, text=True,
+            timeout=20, check=False)
+        if remotes.returncode:
+            return None, warning + " (remotes unavailable)"
+        names = remotes.stdout.splitlines()
+        if not names:
+            return None, warning + " (no configured remote)"
+        for remote in names:
+            result = subprocess.run(
+                ["git", "-C", repo, "ls-remote", "--heads", "--", remote],
+                capture_output=True, text=True, timeout=20, check=False)
+            if result.returncode:
+                return None, warning + " (remote heads unavailable)"
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) != 2:
+                    return None, warning + " (invalid remote heads response)"
+                head, ref = fields
+                if head.lower() == sha.lower() and ref.startswith("refs/heads/"):
+                    candidates.add(ref.removeprefix("refs/heads/"))
     except (OSError, subprocess.TimeoutExpired):
         return None, warning + " (remote heads unavailable)"
-    if result.returncode:
-        return None, warning + " (remote heads unavailable)"
-    candidates = set()
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) != 2:
-            return None, warning + " (invalid remote heads response)"
-        head, ref = fields
-        if head.lower() == sha.lower() and ref.startswith("refs/heads/"):
-            candidates.add(ref.removeprefix("refs/heads/"))
     candidates = sorted(candidates)
     if len(candidates) > 1:
         raise WorkError("freeze refused (branch-ambiguous): several published branches "
-                        "point to %s: %s; associate one with ameesh work branch "
-                        "<id> <branch> before freezing" % (sha[:12], ", ".join(candidates)))
+                        "point to %s: %s; associate one with %s before freezing"
+                        % (sha[:12], ", ".join(candidates), remedy))
     return (candidates[0], "") if candidates else (None, warning + " (no published tip matches)")
 
 
