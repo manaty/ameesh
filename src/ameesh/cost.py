@@ -654,6 +654,154 @@ def context_publication(document: dict, *, legacy: dict, decision: dict,
     }
 
 
+#: #6045 : seuil d'entrée de ``cost turns --over`` — un nombre de jetons, avec
+#: un suffixe ``k`` (milliers) ou ``M`` (millions) facultatif.
+_TOKEN_COUNT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*$")
+
+#: #6045 : raisons d'un tour au-dessus du seuil. ``close``, ``rotation`` et
+#: ``compaction`` reprennent la décision observée du corpus (CTX-05a) ;
+#: ``unbounded`` : l'événement est publié et aucune garde n'a joué ;
+#: ``not_published`` : aucun ``turn.context`` pour ce tour ;
+#: ``event_invalid`` : un événement existe mais n'est pas un ``ameesh-context/1``.
+OVER_REASONS = ("close", "rotation", "compaction", "unbounded",
+                "not_published", "event_invalid")
+#: les mesures du tour rendues par ``cost turns --over``
+OVER_MEASURES = ("R_turn", "C_last", "C_peak")
+#: la politique en vigueur rendue à côté (absente de l'événement = null)
+OVER_POLICY = ("turn_reread_budget", "compact_tokens")
+#: marge de lecture des événements avant le premier tour retenu : l'événement
+#: est publié à la fin du tour, après son début
+_OVER_EVENT_MARGIN_S = 3600.0
+_OVER_EVENT_BATCH = 1000
+
+
+def parse_token_count(text) -> int:
+    """``2M`` → 2 000 000, ``500k`` → 500 000, ``1500000`` → 1 500 000.
+
+    Lève :class:`CostError` pour un texte illisible ou un seuil négatif."""
+    match = _TOKEN_COUNT_RE.match(str(text or ""))
+    if not match:
+        raise CostError("unreadable token threshold: %r (e.g. 2M, 500k, 1500000)"
+                        % text)
+    factor = {"": 1, "k": 1_000, "m": 1_000_000}[match.group(2).lower()]
+    return int(round(float(match.group(1)) * factor))
+
+
+def ledger_reread(row: dict) -> int:
+    """L'entrée relue d'une ligne du grand livre (convention de
+    :attr:`TurnUsage.reread_tokens`) : entrée + cache lu, Codex compte déjà le
+    cache dans son entrée."""
+    input_tokens = int(row.get("input_tokens") or 0)
+    cached = int(row.get("cached_input_tokens") or 0)
+    if row.get("harness") == "codex":
+        return max(input_tokens, cached)
+    return input_tokens + cached
+
+
+def _unknown_measure(reason: str) -> dict:
+    return {"value": None, "quality": context_metrics.UNKNOWN,
+            "reasons": [reason]}
+
+
+def explain_turns(db, rows: Sequence[dict], *,
+                  until_ts: float | None = None) -> list[dict]:
+    """#6045 : la raison et le pic de chaque tour du grand livre donné.
+
+    Lecture seule. Chaque ligne (``ops.turns``) est reliée par ``turn_id`` à
+    son événement ``turn.context`` (CTX-02b) ; la décision, les mesures et la
+    politique en sont relues par le constructeur du corpus (CTX-05a), qui ne
+    recopie que des champs de liste blanche : aucun texte libre de harnais ne
+    sort. Une mesure inconnue est ``null`` avec sa raison, jamais ``0`` ; un
+    tour sans événement a la raison ``not_published``.
+
+    Rend une entrée par ligne, dans l'ordre reçu : ``recorded_ts``, ``agent``,
+    ``harness``, ``work_item_id``, ``turn_id``, ``input_tokens``,
+    ``cached_input_tokens``, ``reread_tokens``, ``usd``, ``reason``,
+    ``cause``, ``close``, ``rotation``, ``compacted``, les mesures
+    :data:`OVER_MEASURES` (``value``, ``quality``, ``reasons``) et ``policy``.
+    """
+    from . import context_corpus  # import local : context_corpus lit ce module
+
+    events: dict[str, tuple[int, dict]] = {}
+    wanted = {str(row["turn_id"]) for row in rows if row.get("turn_id")}
+    if wanted:
+        moments = [float(row[key]) for row in rows
+                   for key in ("started_ts", "recorded_ts")
+                   if isinstance(row.get(key), (int, float))]
+        since = (min(moments) if moments else 0.0) - _OVER_EVENT_MARGIN_S
+        until = time.time() if until_ts is None else float(until_ts)
+        store = storage.of(db)
+        after_id = 0
+        while True:
+            batch = store.events.context_events(
+                since, until, _OVER_EVENT_BATCH, after_id=after_id)
+            for event in batch:
+                data = event.get("data")
+                turn_id = data.get("turn_id") if isinstance(data, dict) else None
+                if turn_id in wanted:
+                    # le dernier publié l'emporte (ordre des identifiants)
+                    events[turn_id] = (int(event["id"]), data)
+            if len(batch) < _OVER_EVENT_BATCH:
+                break
+            after_id = int(batch[-1]["id"])
+
+    out = []
+    for row in rows:
+        entry = {
+            "recorded_ts": row.get("recorded_ts"),
+            "agent": row.get("agent"),
+            "harness": row.get("harness"),
+            "work_item_id": row.get("work_item_id"),
+            "turn_id": row.get("turn_id"),
+            "input_tokens": int(row.get("input_tokens") or 0),
+            "cached_input_tokens": int(row.get("cached_input_tokens") or 0),
+            "reread_tokens": ledger_reread(row),
+            "usd": row.get("usd"),
+        }
+        found = events.get(str(row.get("turn_id"))) if row.get("turn_id") else None
+        line = None
+        reason = "not_published"
+        if found is not None:
+            try:
+                line = context_corpus.corpus_line(found[1], event_id=found[0])
+            except context_corpus.CorpusError:
+                reason = "event_invalid"
+        if line is None:
+            entry.update({"reason": reason, "cause": None, "close": None,
+                          "rotation": None, "compacted": None})
+            for name in OVER_MEASURES:
+                entry[name] = _unknown_measure(reason)
+            entry["policy"] = None
+            out.append(entry)
+            continue
+        decision = line["decision"]
+        observed = decision.get("observed")
+        close = decision.get("close")
+        if isinstance(close, dict) and close.get("measure"):
+            # le corpus met les jetons en minuscules : la mesure retrouve le
+            # nom canonique de ``ameesh-context/1`` (``r_turn`` → ``R_turn``)
+            canonical = {name.lower(): name
+                         for name in context_corpus.ALL_MEASURES}
+            close = dict(close, measure=canonical.get(close["measure"],
+                                                      close["measure"]))
+        entry.update({
+            "reason": observed if observed in OVER_REASONS
+            and observed != "none" else "unbounded",
+            "cause": decision.get("cause"),
+            "close": close,
+            "rotation": decision.get("rotation"),
+            "compacted": decision.get("compacted"),
+        })
+        for name in OVER_MEASURES:
+            item = line.get(name) or {}
+            entry[name] = {"value": item.get("value"),
+                           "quality": item.get("quality"),
+                           "reasons": list(item.get("reasons") or ())}
+        entry["policy"] = {name: line["policy"].get(name) for name in OVER_POLICY}
+        out.append(entry)
+    return out
+
+
 def session_reread(db, agent: str, session: str) -> dict | None:
     """Le cumul ``R_session`` des tours **précédents** d'une session, ou None.
 
