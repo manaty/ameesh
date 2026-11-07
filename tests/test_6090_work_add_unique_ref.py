@@ -21,7 +21,7 @@ import json
 import threading
 from unittest import mock
 
-from ameesh import lot_schedule, mesh_cli, work
+from ameesh import lot_schedule, mesh_cli, storage, work
 from ameesh.db import DbError
 
 from .test_l119_backlog import _Base
@@ -239,6 +239,50 @@ class UniqueRefCliTest(_Base):
         scheduled.assert_not_called()
         self.assertTrue(args.created_item.get("existing"))
         self.assertEqual(args.created_item["id"], winner["id"])
+        rows = self.db.query("SELECT planned_start FROM work_items WHERE id = %s",
+                            (winner["id"],))
+        self.assertIsNone(rows[0]["planned_start"])
+
+    def test_the_cli_footprint_fallback_returns_the_winner_without_planning(self):
+        """N/P3 #6145 : quand la première création est refusée pour empreinte,
+        le repli sans assigné peut rendre le gagnant de la course ; le CLI
+        s'arrête là, sans planifier, et le JSON dit `created: false`."""
+        winner = work.add(self.db, title="gagnant", app="t6090",
+                          actor="human:proprio", unique_ref=KEY)
+        original_add = work.add
+        calls: list[dict] = []
+
+        def add_with_overlap(db, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise storage.FootprintOverlap([{"id": winner["id"]}])
+            return original_add(db, **kwargs)
+
+        args = mesh_cli.build_parser().parse_args([
+            "work", "add", "--title", "perdant", "--app", "t6090",
+            "--new-project", "--actor", "human:proprio",
+            "--assignee", "ameesh-cx3", "--unique-ref", KEY, "--json"])
+        db = self.connect()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh_cli, "_open", return_value=db), \
+                mock.patch.object(mesh_cli, "_work_actor"), \
+                mock.patch.object(work, "check_assignee",
+                                  return_value={"assignee": "ameesh-cx3"}), \
+                mock.patch.object(work, "existing_by_unique_ref", return_value=None), \
+                mock.patch.object(work, "add", side_effect=add_with_overlap) as added, \
+                mock.patch.object(lot_schedule, "schedule_new") as scheduled, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = mesh_cli.cmd_work(self.cfg, args)
+        self.assertEqual(code, 0, err.getvalue())
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["created"])
+        self.assertEqual(payload["lot"]["id"], winner["id"])
+        self.assertEqual(added.call_count, 2)
+        self.assertIsNotNone(calls[0].get("assignee"))
+        self.assertIsNone(calls[1].get("assignee"))
+        self.assertIn("already exists", err.getvalue())
+        self.assertNotIn("created in", err.getvalue())
+        scheduled.assert_not_called()
         rows = self.db.query("SELECT planned_start FROM work_items WHERE id = %s",
                             (winner["id"],))
         self.assertIsNone(rows[0]["planned_start"])
