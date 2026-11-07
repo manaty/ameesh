@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import datetime
+import functools
 import importlib.util
 import io
 import json
@@ -69,11 +70,40 @@ def _git(repo: pathlib.Path, *args: str) -> str:
                           text=True).stdout.strip()
 
 
+def setUpModule():
+    # Each test gets an independent writable copy of this initial Git history.
+    # No working tree, index or subsequent commit is shared between tests.
+    seed = _Repo()
+    unittest.addModuleCleanup(seed.close)
+    _Repo.seed = seed
+    unittest.addModuleCleanup(setattr, _Repo, "seed", None)
+    # Only the immutable checked-out test inventory is cached; temporary test
+    # directories (and overrides in individual tests) retain live reads.
+    for module in (parts, plan.parts):
+        original = module.test_count
+        cached = functools.lru_cache(maxsize=None)(original)
+
+        def count(name, tests=module.TESTS, *, _original=original, _cached=cached):
+            return (_cached(name, tests) if tests == REPO / "tests"
+                    else _original(name, tests))
+
+        patcher = mock.patch.object(module, "test_count", count)
+        patcher.start()
+        unittest.addModuleCleanup(patcher.stop)
+
+
 class _Repo:
     """A throwaway git repository, its first commit standing for the map commit."""
 
+    seed = None
+
     def __init__(self) -> None:
         self.path = pathlib.Path(tempfile.mkdtemp())
+        if self.seed is not None:
+            shutil.copytree(self.seed.path, self.path, dirs_exist_ok=True)
+            self.base = self.seed.base
+            self.code = CODE_V1
+            return
         _git(self.path, "init", "-q")
         for k, v in (("user.name", "t"), ("user.email", "t@t.invalid"),
                      ("commit.gpgsign", "false")):
@@ -1002,8 +1032,14 @@ class MapTest(unittest.TestCase):
             source = f.read_text(encoding="utf-8")
             def prints(blocks):
                 return {k: v["empreinte"] for k, v in blocks.items()}
-            self.assertEqual(prints(plan._without_new_functions(source, set())),
-                             prints(map_mod.blocks(source)[0]), f)
+            # Dynamic modules delegate to blocks(source) unchanged. Compute
+            # that pure result once, while still comparing every file and
+            # every fingerprint; static modules also exercise the unparse
+            # path with its distinct source and therefore a distinct cache key.
+            cached = functools.lru_cache(maxsize=2)(map_mod.blocks)
+            with mock.patch.object(map_mod, "blocks", cached):
+                self.assertEqual(prints(plan._without_new_functions(source, set())),
+                                 prints(map_mod.blocks(source)[0]), f)
 
 
 class ImportGraphTest(unittest.TestCase):
@@ -1746,6 +1782,20 @@ class PartialMeasureTest(unittest.TestCase):
     """#1257 R1 B3 : de la collecte (`scripts/map.py`) à la décision de
     sélection (`scripts/test-plan.py`)."""
 
+    def setUp(self):
+        # Coverage-loss semantics need one measured module and a valid Git
+        # ancestor, not a fresh fingerprint of the entire application per map.
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+        self.repo.write("src/ameesh/db.py", "def connect():\n    return None\n")
+        self.repo.commit()
+        for name, value in (("REPO", self.repo.path),
+                            ("SRC", self.repo.path / "src"),
+                            ("MIGRATIONS", self.repo.path / "src/ameesh/migrations")):
+            patcher = mock.patch.object(map_mod, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @unittest.skipUnless(_coverage_disponible(), "coverage requis")
     def test_collection_to_plan_refuses_a_partial_card(self):
         """Une part dont un fichier de couverture est illisible donne une carte
@@ -1757,7 +1807,7 @@ class PartialMeasureTest(unittest.TestCase):
         (part / "cov").mkdir(parents=True)
         (part / "cov" / ".coverage.tronquee").write_bytes(b"pas du sqlite")
         # carte fraîche et ancêtre de HEAD : seule la perte la rend inutilisable
-        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        card = map_mod.merge([str(part)], _git(self.repo.path, "rev-parse", "HEAD"))
         self.assertEqual(len(card["mesure"]["couverture_ignoree"]), 1)
         # #1690 : le meme artefact tronque est aussi nomme dans
         # `artefacts_incomplets` ; le temoin du temoin doit retirer les DEUX
@@ -1765,10 +1815,10 @@ class PartialMeasureTest(unittest.TestCase):
         mesure = dict(card["mesure"], couverture_ignoree=[],
                       artefacts_incomplets=[])
         saine = dict(card, measure=mesure, mesure=mesure)  # témoin du témoin
-        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
-        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", self.repo.path)[0], "")
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", self.repo.path)
         self.assertIn("partial measure", probleme)
-        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=self.repo.path)
         self.assertFalse(out["map"]["used"])
         self.assertFalse(out["sure"])
         self.assertFalse(out["phase2_safe"])
@@ -1789,24 +1839,24 @@ class PartialMeasureTest(unittest.TestCase):
         vide.write_bytes(b"")
         valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
         valide.set_context("tests.test_l1.T.test_a")
-        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1}})
+        valide.add_lines({str(self.repo.path / "src" / "ameesh" / "db.py"): {1}})
         valide.write()
-        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        card = map_mod.merge([str(part)], _git(self.repo.path, "rev-parse", "HEAD"))
         ignorees = card["mesure"]["couverture_ignoree"]
         self.assertEqual(len(ignorees), 1)
         self.assertIn("vide (0 octet)", ignorees[0]["raison"])
-        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", self.repo.path)
         self.assertIn("partial measure", probleme)
-        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=self.repo.path)
         self.assertFalse(out["map"]["used"])
         self.assertFalse(out["sure"])
         self.assertFalse(out["phase2_safe"])
         self.assertIn("partial measure", out["unsure"][0])
         # témoin du témoin : sans le fichier vide, la même mesure est utilisable
         vide.unlink()
-        saine = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        saine = map_mod.merge([str(part)], _git(self.repo.path, "rev-parse", "HEAD"))
         self.assertEqual(saine["mesure"]["couverture_ignoree"], [])
-        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", self.repo.path)[0], "")
 class InheritedFoundationTest(unittest.TestCase):
     """#1314 : le socle CI que la cible a déjà changé depuis la carte ne force
     plus la suite complète d'une branche de lot ; le changement du socle par
@@ -2041,6 +2091,24 @@ class PushLaneTest(unittest.TestCase):
 
 
 class PlanTest(unittest.TestCase):
+    def setUp(self):
+        # Fallback scenarios need a code diff, not the unrelated (and possibly
+        # huge or documentation-only) last commit of the working checkout.
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        make_plan = plan.make_plan
+
+        def with_fixture(event, card, now=None, **kwargs):
+            if card is None:
+                kwargs.setdefault("repo", self.repo.path)
+            return make_plan(event, card, now, **kwargs)
+
+        patcher = mock.patch.object(plan, "make_plan", with_fixture)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_fallback_without_a_map(self):
         p = plan.make_plan("push", None, NOW)
         self.assertFalse(p["sure"])

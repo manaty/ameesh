@@ -58,14 +58,25 @@ class _PuitsJournalSature:
         return self.fin.wait(timeout)
 
 
-class EventsTest(PgTestCase):
+class _AgentFixture(PgTestCase):
+    def _register_agent(self, name, *, cwd):
+        # Register is not under test here. Use the same storage API directly;
+        # these directories are not Git worktrees and need no worktree marker.
+        registry.upsert(self.db, name, harness="claude", host=self.cfg.host, cwd=cwd)
+        self.db.execute(
+            "UPDATE agent_registry SET capabilities ="
+            " ARRAY['read','report-drift','propose'], roles = ARRAY['implementation']"
+            " WHERE name = %s", (name,))
+
+
+class EventsTest(_AgentFixture):
     def _worker(self, name: str = "evt", *, senders=()):
         cfg = dataclasses.replace(self.cfg, interrupt_senders=tuple(senders))
         runner = Runner(cfg, self.db, once=True)
         runner.event_coalesce = 120.0
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        self.register(name, "claude", cwd=cwd)
+        self._register_agent(name, cwd=cwd)
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         self.assertIsNotNone(lease)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
@@ -127,7 +138,7 @@ class EventsTest(PgTestCase):
     def test_tour_evenement_remis_par_le_runner(self):
         cwd = os.path.join(self.tmp, "work", "evt-run")
         os.makedirs(cwd, exist_ok=True)
-        self.register("evt-run", "claude", cwd=cwd)
+        self._register_agent("evt-run", cwd=cwd)
         mail.send(self.db, "src", "evt-run", "événement de bout en bout", kind="event")
         proc = self.runner("--once", "--agents", "evt-run")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -152,11 +163,11 @@ class EventsTest(PgTestCase):
         self.assertEqual(proc.returncode, 2)
 
 
-class AttachTest(PgTestCase):
+class AttachTest(_AgentFixture):
     def _agent(self, name: str = "att") -> dict:
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        self.register(name, "claude", cwd=cwd)
+        self._register_agent(name, cwd=cwd)
         return registry.get(self.db, name)
 
     def _env(self) -> dict:
@@ -354,7 +365,7 @@ class AttachTest(PgTestCase):
         self._agent("att")
         # éphémère issu d'un agent manuel : non gouverné par le canon, donc
         # seule la règle de l'éphémère échu s'applique ici (fail closed L2).
-        self.register("parent", "claude", cwd=self.tmp)
+        self._register_agent("parent", cwd=self.tmp)
         self.db.execute(
             "UPDATE agent_registry SET created_by = 'parent', ephemeral = true, "
             "ephemeral_expires_at = now() - interval '1 second' WHERE name = 'att'")
