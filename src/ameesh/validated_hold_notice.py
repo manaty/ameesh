@@ -74,8 +74,10 @@ def notify(db, lot: int) -> list[str]:
                    _moment(hold.get("since")), lot, lot))
         try:
             mail.send(db, work.SYSTEM_SENDER, who, body, work_item_id=str(lot),
-                      payload={"info": True,
-                               "validated_hold": {"lot": lot, "by": who,
+                      # #6096 : une demande de geste, pas une information
+                      # passive (`mail.passive_reason`) : elle réveille le
+                      # détenteur au repos.
+                      payload={"validated_hold": {"lot": lot, "by": who,
                                                   "since": hold.get("since")}},
                       idempotency_key="validated-hold:%d:%s:%s"
                                       % (lot, who, _key_moment(hold.get("since"))))

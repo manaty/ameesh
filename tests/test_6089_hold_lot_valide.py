@@ -124,6 +124,8 @@ class QuorumNotifiesHolderTest(PgTestCase):
         self.assertEqual(len(notices), 1)
         self.assertIn("#%d" % self.lot, notices[0]["body"])
         self.assertIn("unhold:", notices[0]["body"])
+        # #6096 : une demande de geste réveille le détenteur au repos
+        self.assertEqual(mail.passive_reason(notices[0]), "")
         # le hold ordinaire, lui, tombe avec la transition (#5758) : pas d'avis
         self.assertEqual(self.notices("mty-amh-impl-05"), [])
         # #5758 : le hold tient toujours
