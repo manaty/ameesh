@@ -964,6 +964,7 @@ class MapTest(unittest.TestCase):
                                   "test_4299_agent_rename",
                                   "test_5588_housekeeping_retention",
                                   "test_6011_contrat_ecrivains_isoles",
+                                  "test_6090_work_add_unique_ref",
                                   "test_cluster", "test_events_attach", "test_l31_orphans",
                                   "test_l50_group_orphan_work_items",
                                   "test_l72_panne_de_base", "test_migrations",

@@ -78,6 +78,7 @@ test_5925_vm_adapter  # #5925: generation-fenced operator VM queue and simulated
 test_5932_vm_adapter_wait  # #5932: explicit asynchronous adapter wait and stalled-intent alert, under both drivers
 test_5982_overview_etroit  # stockage : lectures étroites (critique, hôte, routage) sans la vue complète, valeurs et plan (#5982)
 test_6074_vm_adapter_halt  # #6074: halt then archive, stall markers and return during archive, under both drivers (#6079)
+test_6090_work_add_unique_ref  # stockage : clé durable `unique_ref` (0555), index unique partiel, N-1 et course des deux créations, sous les deux pilotes (#6090, #6145)
 test_6161_freeze_branch  # #6161: inferred branch and freeze share a transaction
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)

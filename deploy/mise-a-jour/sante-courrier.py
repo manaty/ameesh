@@ -56,7 +56,8 @@ Read-only checks, then one real delivery probe:
   one ends), and always put back at the end; a lot that became actionable
   meanwhile keeps it awake, named in ``siege``. Budget and human operator
   pauses are never touched. Only when no seat exists either is the verdict
-  ``sans-sonde``. Delivery alone
+  ``sans-sonde``. ``--sonde siege`` forces the seat even when a persona is
+  free: the seat's real witness, once by hand (#6106). Delivery alone
   is recorded when the harness
   starts, before a refused harness exits 127 (#1460): only the answer proves a
   real turn with working tools, and a failed or blocked turn after delivery is
@@ -551,6 +552,14 @@ def selection(db, pool: list[dict], sonde: str, borne: float, now: float,
     portee = "sur un autre hote" if croise else "sur cet hote"
     if sonde == "jamais":
         return None, "sonde desactivee", None
+    if sonde == "siege":
+        # #6106 : temoin du siege de sonde, exerce meme si une persona est
+        # libre ; sans dormeur, rien a exercer (sans-sonde, nomme).
+        dormeur = siege(db, pool)
+        if dormeur is None:
+            return None, ("siege de sonde force : aucune persona menee en "
+                          "sommeil automatique %s" % portee), None
+        return dormeur, "siege de sonde force : %s" % dormeur["name"], None
     if sonde == "auto":
         menes = [r for r in pool if driven(r, now)]
         if not menes:
@@ -880,7 +889,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="sante du courrier d'un hote (#1155)")
     parser.add_argument("--hote", required=True)
     parser.add_argument("--sonde", default="auto",
-                        help="auto (premiere persona menee libre), jamais, ou un nom")
+                        help="auto (premiere persona menee libre), jamais, "
+                        "siege (siege de sonde force, temoin #6106) ou un nom")
     parser.add_argument("--serveur", action="store_true",
                         help="hote sans executant : sonde croisee vers un autre hote")
     parser.add_argument("--attente", type=float, default=DEFAULT_ATTENTE)
