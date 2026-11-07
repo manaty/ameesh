@@ -502,6 +502,9 @@ _PRIVILEGES_CHECKED_AFTER = 528
 _REVOKE = re.compile(r"\brevoke\b[^;]*?\bon\s+(?:(table|function|sequence)\s+)?([\w.\"]+)"
                      r"\s*(\([^)]*\))?\s*(from\b)?|\brevoke\b")
 _DOLLAR_TAG = re.compile(r"\$(?:[^\W\d]\w*)?\$")
+#: début d'instruction qui attend le texte d'un COMMENT ON (E'' compris, et la
+#: suite '…' '…' d'un littéral coupé par une fin de ligne)
+_COMMENT_IS = re.compile(r"^\s*comment\s+on\s[^;]*\bis(?:\s*|\s+e)$", re.IGNORECASE)
 #: lu, comme _REVOKE, sur le texte sans chaînes : ses `;` et ses mots sont du code
 _ALTER_TABLE = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s[^;]*")
 #: mots qui, dans une chaîne, peuvent être du code exécuté : la forme n'est plus simple
@@ -563,15 +566,19 @@ def non_additive(migration: Migration) -> list[str]:
     return reasons
 
 
-def _lex(sql: str) -> tuple[list[str], str, bool]:
-    """(chaînes, texte sans commentaires ni chaînes, lecture sûre), en une seule
-    passe : le délimiteur d'une chaîne ne se lit jamais dans un commentaire, ni
-    l'inverse. Un identifiant cité devient un jeton neutre : son contenu n'est
-    pas du code et sa casse ne survit pas aux minuscules. La lecture n'est pas
-    sûre si un commentaire bloc coupe une instruction ou si une fin manque ; un
-    commentaire de ligne est sans effet (il finit au LF ou au CR seul, comme
-    PostgreSQL)."""
+def _lex(sql: str) -> tuple[list[str], str, bool, str]:
+    """(chaînes, texte sans commentaires ni chaînes, lecture sûre, source sans
+    documentation), en une seule passe : le délimiteur d'une chaîne ne se lit
+    jamais dans un commentaire, ni l'inverse. Un identifiant cité devient un
+    jeton neutre : son contenu n'est pas du code et sa casse ne survit pas aux
+    minuscules. La lecture n'est pas sûre si un commentaire bloc coupe une
+    instruction ou si une fin manque ; un commentaire de ligne est sans effet
+    (il finit au LF ou au CR seul, comme PostgreSQL). #6153 : le littéral
+    '…' d'un COMMENT ON … IS hors chaîne est de la documentation, jamais
+    exécutée : il n'est ni dans les chaînes ni dans la source rendue ; un
+    littéral $$ y reste une chaîne, par prudence."""
     strings, code, at, size, sure = [], [], 0, len(sql), True
+    prose = []
     while at < size:
         two = sql[at:at + 2]
         dollar = _DOLLAR_TAG.match(sql, at) if sql[at] == "$" else None
@@ -614,13 +621,19 @@ def _lex(sql: str) -> tuple[list[str], str, bool]:
             sure = sure and not (dollar and closing < 0)
             if sql[at] == '"':
                 code.append('"_"')
+            elif not dollar and _COMMENT_IS.search("".join(code).rsplit(";", 1)[-1]):
+                prose.append((at, end)), code.append(" ")
             else:
                 strings.append(sql[at:end]), code.append(" ")
             at = end
         else:
             code.append(sql[at])
             at += 1
-    return strings, "".join(code), sure
+    source, last = [], 0
+    for start, end in prose:
+        source.append(sql[last:start] + " ")
+        last = end
+    return strings, "".join(code), sure, "".join(source) + sql[last:]
 
 
 def _param_types(params: str, *, named: bool) -> list[str]:
@@ -661,9 +674,9 @@ def _privilege_reasons(sql: str) -> list[str]:
     def normal(value: str) -> str:
         return re.sub(r"\s+", " ", value.lower())
 
-    strings, code, sure = _lex(sql)
+    strings, code, sure, source = _lex(sql)
     code, strings = normal(code), [normal(value) for value in strings]
-    simple = sure and not re.search(r"[$\"\\]", sql) \
+    simple = sure and not re.search(r"[$\"\\]", source) \
         and not re.search(r"\bdo\b", code) \
         and not any(_SENSITIVE.search(value) for value in strings)
     reasons = []
@@ -691,7 +704,7 @@ def _guard_reasons(sql: str) -> list[str]:
     """Triggers, règles et politiques qui changent l'écriture du code d'avant (#5142).
     Un CREATE nu hors chaîne prouve la table neuve, même à côté de la fonction `$$`
     de son trigger : ce qu'une chaîne exécuterait y est classé à part, sans analyse."""
-    strings, code, sure = _lex(sql)
+    strings, code, sure, _ = _lex(sql)
     code = re.sub(r"\s+", " ", code.lower())
     trigger_declared = bool(_TRIGGER_MARKER.search(sql))
 
