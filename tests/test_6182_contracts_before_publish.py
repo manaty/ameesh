@@ -14,6 +14,23 @@ from tests.test_4304_paquet_poussee_precoce import Flux, green, paquet_auto as a
 from tests.test_4271_paquet_series import DOCUMENT, paquet_horaire as hourly
 
 
+#: #6228 : `prepublication_contracts` écrit la preuve de série sous l'état du
+#: poste (`_state_dir`). Sans isolation, chaque passe de ce module écrivait
+#: dans le vrai ~/.local/state/ameesh/roles/mesh-design/test-logs (paquet h-27,
+#: 07/11 21:28Z) ; le bac pointe `_state_dir` sur un dossier temporaire pour
+#: tout le module. `test_series_logs_stay_in_the_temporary_state` le vérifie.
+_STATE = None
+
+
+def setUpModule():
+    global _STATE
+    _STATE = tempfile.TemporaryDirectory(prefix='paquet-6182-state-')
+    unittest.addModuleCleanup(_STATE.cleanup)
+    patch = mock.patch.object(auto, '_state_dir', return_value=_STATE.name)
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
+
+
 class PublicationTest(unittest.TestCase):
     def composition(self):
         return auto.Composition([auto.Unit(6179, 'a' * 40, 'b' * 40)], [], 'c' * 40)
@@ -111,6 +128,19 @@ class ScopeAndBudgetTest(unittest.TestCase):
     def git(self, *args):
         return subprocess.run(['git', '-C', str(self.repo), *args], check=True,
                               capture_output=True, text=True).stdout.strip()
+
+    def test_series_logs_stay_in_the_temporary_state(self):
+        # #6228 : la preuve de série de la passe contrats ne touche jamais
+        # l'état réel du poste, seulement le bac temporaire du module.
+        with mock.patch.object(auto.shutil, 'which', return_value='/bin/ameesh'), \
+                mock.patch.object(auto, 'contract_modules', return_value=['tests.test_x']), \
+                mock.patch.object(auto, 'run_tests', return_value=green('contrats')):
+            report = auto.prepublication_contracts(self.repo, base='base', budget=12)
+        log = Path(report.run.log_path)
+        self.assertTrue(log.is_file(), log)
+        self.assertEqual(log.parent,
+                         Path(_STATE.name) / 'roles' / 'mesh-design' / 'test-logs')
+        self.assertIn('contrats', log.read_text(encoding='utf-8'))
 
     def test_one_budget_includes_plan_and_heavy_slot_wait(self):
         clock = [0.0]
