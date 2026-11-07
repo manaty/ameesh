@@ -7,6 +7,7 @@ touche les données de production ni les vrais harnais.
 """
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import json
 import os
@@ -115,6 +116,35 @@ for _name in list(os.environ):
     elif (_name.startswith(("AMEESH_", "AGENT_MESH_", "AGENT_MAIL_"))
             and _name not in BENCH_ENV_VARS):
         del os.environ[_name]
+
+#: #6228 : les dossiers temporaires du banc sont créés à l'import du module et
+#: vivaient jusqu'à la mort du processus ; le TMPDIR de `paquet-auto` en
+#: gardait des milliers par jour. On ne retire QUE les dossiers que ce
+#: processus a créés (jamais un dossier fourni par l'environnement), et
+#: seulement à sa sortie : leur rôle d'isolement pendant la suite est inchangé.
+_TEMP_DIRS: list[str] = []
+#: le processus qui a créé ces dossiers : un enfant forké qui sort normalement
+#: (sans `os._exit`) hérite de la liste et ne doit pas retirer ceux du parent.
+_TEMP_DIRS_PID = os.getpid()
+
+
+def _mkdtemp(prefix: str) -> str:
+    """Dossier temporaire du banc, retiré à la sortie de ce processus."""
+    path = tempfile.mkdtemp(prefix=prefix)
+    _TEMP_DIRS.append(path)
+    return path
+
+
+def _cleanup_temp_dirs() -> None:
+    """#6228 : retire les dossiers temporaires créés par CE processus."""
+    if os.getpid() != _TEMP_DIRS_PID:
+        return
+    while _TEMP_DIRS:
+        shutil.rmtree(_TEMP_DIRS.pop(), ignore_errors=True)
+
+
+atexit.register(_cleanup_temp_dirs)
+
 #: et la configuration de l'hôte (~/.config/ameesh/config.json, ou l'ancienne
 #: ~/.config/agent-mesh/config.json) n'est jamais lue : ses canons imposent un
 #: responsable humain, fixent fils et hôte. Les tests de configuration posent
@@ -122,7 +152,7 @@ for _name in list(os.environ):
 #: « Aucune config » se dit par un fichier VIDE mais EXISTANT : un chemin
 #: explicite absent est refusé (#1127), et un chemin absent ne peut donc plus
 #: servir de sentinelle.
-EMPTY_CONFIG = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-config-"), "empty.json")
+EMPTY_CONFIG = os.path.join(_mkdtemp(prefix="ameesh-test-config-"), "empty.json")
 with open(EMPTY_CONFIG, "w", encoding="utf-8") as _fh:
     _fh.write("{}\n")
 os.environ["AMEESH_CONFIG"] = EMPTY_CONFIG
@@ -188,29 +218,29 @@ def apply_authenticators(db, members, **kwargs) -> dict:
 
 
 #: dossier Codex vide, partagé par les sous-processus de test
-EMPTY_CODEX_HOME = tempfile.mkdtemp(prefix="ameesh-test-codex-home-")
+EMPTY_CODEX_HOME = _mkdtemp(prefix="ameesh-test-codex-home-")
 # aussi pour les tests qui lisent les jauges dans le processus même
 os.environ["CODEX_HOME"] = EMPTY_CODEX_HOME
 
 #: #2580 : le registre des comptes partagés de l'hôte (XDG) ne doit jamais
 #: écrire dans le `~/.local/state` réel d'un exécuteur de test.
-EMPTY_XDG_STATE = tempfile.mkdtemp(prefix="ameesh-test-xdg-state-")
+EMPTY_XDG_STATE = _mkdtemp(prefix="ameesh-test-xdg-state-")
 os.environ["XDG_STATE_HOME"] = EMPTY_XDG_STATE
 
 #: dossier de descripteurs de harnais vide (L16) : les tests ne voient jamais
 #: ceux de l'hôte, et posent les leurs explicitement quand ils en ont besoin
-EMPTY_HARNESS_DIR = tempfile.mkdtemp(prefix="ameesh-test-harnesses-")
+EMPTY_HARNESS_DIR = _mkdtemp(prefix="ameesh-test-harnesses-")
 os.environ["AMEESH_HARNESSES_DIR"] = EMPTY_HARNESS_DIR
 
 #: barème de prix ABSENT : le fichier de prix de l'hôte
 #: (~/.config/nexlink-agents/prices.json) ne fuit pas dans les tests, ni dans
 #: le processus (l'exécuteur construit son `CostBook` en mémoire) ni dans les
 #: sous-processus. Les tests de tarif posent leur propre `AMEESH_PRICES`.
-EMPTY_PRICES = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-prices-"), "absent.json")
+EMPTY_PRICES = os.path.join(_mkdtemp(prefix="ameesh-test-prices-"), "absent.json")
 os.environ["AMEESH_PRICES"] = EMPTY_PRICES
 #: L73 : le /tmp du système vu par le ménage, vide et propre à la suite (le
 #: vrai /tmp de la machine n'est ni mesuré ni balayé par les tests)
-EMPTY_SYSTEM_TMP = tempfile.mkdtemp(prefix="ameesh-test-system-tmp-")
+EMPTY_SYSTEM_TMP = _mkdtemp(prefix="ameesh-test-system-tmp-")
 os.environ["AMEESH_SYSTEM_TMP"] = EMPTY_SYSTEM_TMP
 #: L125 : pas de fenêtre de regroupement du courrier dans le banc — un message
 #: réveille son destinataire tout de suite, comme avant L125 ; les tests du
@@ -229,12 +259,12 @@ os.environ["AMEESH_SYSTEMCTL"] = ""
 #: d'un id inconnu du stockage du harnais n'est vérifiée que par les tests de
 #: L224, qui posent leur propre stockage
 os.environ["AMEESH_SESSION_STORE_CHECK"] = "0"
-EMPTY_POWER_SUPPLY = tempfile.mkdtemp(prefix="ameesh-test-power-")
+EMPTY_POWER_SUPPLY = _mkdtemp(prefix="ameesh-test-power-")
 os.environ["AMEESH_POWER_SUPPLY_DIR"] = EMPTY_POWER_SUPPLY
 #: #1580 (tranche 3) : jamais les jauges du widget omarchy du poste (pc-smichea
 #: en a de fraîches, dans ~/.local/state/omarchy/agents/usage) ; un test qui en
 #: veut pointe la variable sur son propre dossier
-EMPTY_USAGE_WIDGET = tempfile.mkdtemp(prefix="ameesh-test-usage-")
+EMPTY_USAGE_WIDGET = _mkdtemp(prefix="ameesh-test-usage-")
 os.environ["AMEESH_USAGE_WIDGET_DIR"] = EMPTY_USAGE_WIDGET
 for _bin_var in ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN", "AMEESH_CODEX_BIN",
                  "AGENT_MESH_CODEX_BIN", "AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"):
