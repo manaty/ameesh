@@ -44,7 +44,10 @@ déclarer une **fenêtre d'observation** — une attente voulue et datée
 (`hold: fenêtre : …`, échéance armée par `--wake-at`) ; jusqu'à l'échéance,
 le débit la range dans `window_waits`, hors `slow_waits`, et `--check` ne
 sort pas 2 : rien n'est actionnable avant. À l'échéance, le hold redevient
-une attente ordinaire et le réveil échu la signale.
+une attente ordinaire et le réveil échu la signale. #6089 : un hold de pilote
+sur un lot que le quorum a validé (il survit à la transition, #5758) est une
+attente `hold_validated`, jamais humaine : au-delà du seuil compté depuis la
+validation (ou un hold reposé depuis), `--check` sort 2.
 
 Un lot relu (tous ses avis rendus) dont `branch_target` est la branche d'un
 autre lot **ouvert** n'est pas une attente de paquet : il ne peut entrer
@@ -140,6 +143,9 @@ GESTURES = {
                        "hors créneau (canon §11 bis) ou la levée du hold",
     "hold": "relancer le détenteur du hold ({who}) ; s'il est sans objet, "
             "demander sa levée au pilote",
+    "hold_validated": "avis acquis, lot validé sous un hold de pilote : "
+                      "demander à {who} si le hold tient encore, le lever "
+                      "(`unhold:`) ou en redire la cause (`hold:`) (#6089)",
     "hold_external": "relancer {actor} sur le geste attendu : {gesture} "
                      "(attente externe déclarée, pas un agent à assigner ; "
                      "canon §10)",
@@ -613,6 +619,23 @@ def _human_wait(state: str | None, *texts: Any) -> bool:
     if state == "waiting_human":
         return True
     return any(_HUMAN_WAIT_RE.search(str(text or "")) for text in texts)
+
+
+def _entered_state(events: list[dict], state: str) -> float | None:
+    """L'instant où le lot est entré dans l'état courant `state`, lu au journal.
+
+    None si le lot n'y est pas (ou plus) ; une suite d'événements du même état
+    ne le date pas à nouveau."""
+    entered = None
+    previous = None
+    for event in events or ():
+        current = event.get("state")
+        if not current:
+            continue
+        if current != previous:
+            entered = float(event.get("at_ts") or 0.0) if current == state else None
+        previous = current
+    return entered
 
 
 def _mark_int(value: Any) -> int | None:
@@ -1486,6 +1509,20 @@ def build(*, items: Iterable[Mapping[str, Any]],
                      GESTURES["hold_undeployed"], level=2,
                      version=row.get("version"), human=human,
                      **dependents_of(row["lot"]))
+        elif row.get("pilot") and state == lifecycle.VALIDATED:
+            # #6089 : le quorum a validé le lot sous un hold de pilote, qui
+            # lui survit (#5758). La condition du hold peut être remplie sans
+            # que personne le dise : ce n'est jamais une attente humaine, même
+            # si la cause cite un geste de l'owner. L'âge part de la
+            # validation, ou d'un hold reposé depuis (le pilote a répondu).
+            validated_ts = _entered_state(
+                events_by_lot.get(int(row["lot"]), []), lifecycle.VALIDATED)
+            since = max(float(row.get("since_ts") or 0.0),
+                        float(validated_ts or 0.0)) or row["since_ts"]
+            add_wait("hold_validated", row, since, row.get("by") or "?",
+                     GESTURES["hold_validated"].format(who=row.get("by") or "?"),
+                     level=2, human=False, cause=row.get("cause") or None,
+                     validated=_iso(validated_ts), **dependents_of(row["lot"]))
         else:
             add_wait("hold", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold"].format(who=row.get("by") or "?"), level=2,

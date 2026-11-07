@@ -2388,6 +2388,14 @@ class WorkItems(interface.WorkItems):
             if rows:
                 WorkItems(tx)._event(int(item_id), "validated",
                                     "qa → validated — review quorum (#4423)", actor)
+        if rows:
+            # #6089 : après le commit, le détenteur d'un hold de pilote (qui
+            # survit au quorum, #5758) apprend que les avis sont acquis.
+            from ... import validated_hold_notice
+            try:
+                validated_hold_notice.notify(self.db, int(item_id))
+            except Exception:  # noqa: BLE001 - l'avis ne défait pas le quorum
+                pass
 
     def _lapse_waiver(self, item_id, milestone, actor) -> None:
         """#1979 : un gel d'une AUTRE tête lève la dispense de re-verdict
