@@ -2074,7 +2074,8 @@ class WorkItems(Domain):
             estimate_source: str | None = None, change_size: str | None = None,
             queued_note: str | None = None, forced_note: str | None = None,
             mark_item_id: int | None = None, mark_note: str = "",
-            parent_lot: int | None = None, unique_ref: bool = False,
+            parent_lot: int | None = None, unique_execution: bool = False,
+            unique_ref: str | None = None,
             external_executor: str | None = None,
             footprint: list | None = None, footprint_unknown: bool = False) -> dict:
         """#4173 : `footprint`, l'empreinte d'intake écrite avec le lot ; un lot
@@ -2111,16 +2112,23 @@ class WorkItems(Domain):
         journal trace if it is already finished, everything rolled back if it
         is unknown.
 
-        `unique_ref` (#2954): with an `issue_ref`, take a transaction advisory
-        lock on the reference and refuse the creation (`DbError`) when any lot,
-        whatever its state, already carries it. Two hosts creating the incident
-        of the same run serialize: the second sees the first and the caller
-        re-reads the winner. #3607 : the re-read covers the exact `source` too,
-        not only `issue_ref` — the identity of an execution is also carried
-        there (`ci-incident:<repo>:<run>`), and the ticket sync may have moved
-        the winner's `issue_ref` to its mirror ticket between the lock wait and
-        the re-read. Off by default: several lots may legitimately share a
-        reference except where the identity is one per execution.
+        `unique_execution` (#2954): with an `issue_ref`, take a transaction
+        advisory lock on the reference and refuse the creation (`DbError`) when
+        any lot, whatever its state, already carries it. Two hosts creating the
+        incident of the same run serialize: the second sees the first and the
+        caller re-reads the winner. #3607 : the re-read covers the exact
+        `source` too, not only `issue_ref` — the identity of an execution is
+        also carried there (`ci-incident:<repo>:<run>`), and the ticket sync may
+        have moved the winner's `issue_ref` to its mirror ticket between the
+        lock wait and the re-read. Off by default: several lots may legitimately
+        share a reference except where the identity is one per execution.
+
+        `unique_ref` (#6090) : clé d'idempotence durable fournie par
+        l'appelant. Sous un verrou consultatif propre à la clé, le lot qui la
+        porte déjà est relu **quel que soit son état** et rendu marqué
+        `existing` : la seconde création ne lève pas et n'écrit rien. Le
+        premier créateur gagne ; la clé est globale au mesh et comparée
+        exactement (opaque, à la casse près).
 
         `external_executor` (#3447) : le lot est créé réservé à un exécutant
         externe déclaré (agent `externe` avec responsable humain, ou humain),
@@ -2519,6 +2527,13 @@ class WorkItems(Domain):
         l'incident. Aucun motif : préfixe et suffixe ne matchent pas, et une
         `source` vide ne désigne rien (sans la garde, elle rendrait tous les
         lots sans source)."""
+
+    @abc.abstractmethod
+    def by_unique_ref(self, key: str) -> dict | None:
+        """#6090 : le lot qui porte exactement cette clé d'idempotence
+        durable, **quel que soit son état**, ou None. La comparaison est à la
+        casse près : la clé est opaque, fournie par l'appelant. Une clé vide ne
+        désigne rien."""
 
     @abc.abstractmethod
     def lock(self, item_id: int) -> dict | None:

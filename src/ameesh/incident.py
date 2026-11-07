@@ -51,7 +51,7 @@ un correctif en cours n'est pas doublé (#5600/#5599, #5626/#5606).
 
 Le relevé Git/API (commits de l'atterrissage) reste chez `ci` : ce module ne
 parle ni à GitHub ni au réseau. Deux passages **concurrents** (deux hôtes dans
-la même fenêtre) sont sérialisés par `work.add(unique_ref=True)` : un seul lot
+la même fenêtre) sont sérialisés par `work.add(unique_execution=True)` : un seul lot
 par exécution, les passages suivants restant idempotents par `issue_ref` et par
 `source`.
 """
@@ -694,7 +694,7 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
     (#3607) autant que dans `issue_ref` : un lot ouvert à la main pour la même
     exécution, dont l'`issue_ref` est devenu le ticket miroir
     (`owner/repo#N`), empêche l'ouverture automatique d'un second lot — c'est
-    le cas #3600/#3603. La création passe par `work.add` avec `unique_ref`
+    le cas #3600/#3603. La création passe par `work.add` avec `unique_execution`
     (#2954) : verrou consultatif de transaction sur la référence puis
     relecture de l'`issue_ref` **et** de la `source`, tous états confondus ; le
     perdant reçoit `DbError` et relit le gagnant ci-dessous. Une fois la course
@@ -735,7 +735,7 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
                          workflow=workflow, url=url, modules=attribution["modules"],
                          tests=tests, attribution=attribution, author=author,
                          diagnosis=diagnosis),
-            issue_ref=ref, actor=actor, unique_ref=True)
+            issue_ref=ref, actor=actor, unique_execution=True)
     except Exception as exc:  # noqa: BLE001 - l'incident ne fait jamais tomber le relevé
         existing = _open(ops, ref)
         if existing is not None:
