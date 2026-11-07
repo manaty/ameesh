@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #6157 — mesure quotidienne de la carte d'impact à 03:30Z, déclenchée par
+# l'hôte : le cron GitHub de carte.yml démarre avec six à huit heures de
+# retard. `Persistent=true` rattrape un passage manqué ; un rattrapage hors de
+# la fenêtre [00:00, 07:00)Z est sauté par le garde du workflow, sans échec.
+[Unit]
+Description=ameesh daily impact map measurement dispatch (#6157)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+AccuracySec=60s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

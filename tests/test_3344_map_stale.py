@@ -28,10 +28,13 @@ def _iso(ts: float) -> str:
 class _Api:
     """Le client GitHub du relevé : workflows découverts et dernière carte."""
 
-    def __init__(self, *, workflows=("tests.yml", "carte.yml"), runs=None, error=None):
+    def __init__(self, *, workflows=("tests.yml", "carte.yml"), runs=None, error=None,
+                 skipped=()):
         self.workflows = workflows
         self.runs = [] if runs is None else runs
         self.error = error
+        #: #6157 : runs dont la fenêtre a sauté la mesure (job `carte` sauté)
+        self.skipped = set(skipped)
         self.calls: list[str] = []
 
     def __call__(self, path):
@@ -43,6 +46,11 @@ class _Api:
             if self.error is not None:
                 raise self.error
             return {"workflow_runs": self.runs}
+        if "/actions/runs/" in path and path.split("?")[0].endswith("/jobs"):
+            run_id = int(path.split("/actions/runs/")[1].split("/")[0])
+            return {"jobs": [{"name": "fenêtre de mesure", "conclusion": "success"},
+                             {"name": "carte", "conclusion": "skipped"
+                              if run_id in self.skipped else "success"}]}
         raise AssertionError("appel inattendu : " + path)
 
     def map_calls(self):
@@ -120,6 +128,31 @@ class MapStaleTest(PgTestCase):
         self.age_reading(ci.MAP_READ_S + 5)
         watcher._map(self.db, REPO, ("main",))
         self.assertEqual(len(api.map_calls()), 2)
+
+    def test_a_green_run_without_map_is_not_the_last_map(self):
+        """#6157 : la fenêtre saute la mesure planifiée — run vert, job `carte`
+        sauté, aucune carte ; le relevé retient le run précédent qui a publié."""
+        published = time.time() - 2 * DAY
+        api = _Api(runs=[{"id": 9, "head_sha": "c", "updated_at": _iso(time.time())},
+                         {"id": 8, "head_sha": "d", "updated_at": _iso(published)}],
+                   skipped={9})
+        self.watcher(api)._map(self.db, REPO, ("main",))
+        row = self.row()
+        self.assertEqual(row["run_id"], 8)
+        self.assertAlmostEqual(row["published_ts"], round(published), delta=1)
+
+    def test_only_skipped_runs_keep_the_previous_reading_aging(self):
+        published = time.time() - 3 * DAY
+        self.watcher(_Api(runs=[{"id": 7, "head_sha": "b",
+                                 "updated_at": _iso(published)}]))._map(
+            self.db, REPO, ("main",))
+        self.age_reading(ci.MAP_READ_S + 5)
+        self.watcher(_Api(runs=[{"id": 9, "head_sha": "c",
+                                 "updated_at": _iso(time.time())}], skipped={9}))._map(
+            self.db, REPO, ("main",))
+        row = self.row()
+        self.assertEqual(row["run_id"], 7)
+        self.assertAlmostEqual(row["published_ts"], round(published), delta=1)
 
     def test_github_error_is_logged_and_keeps_the_previous_reading(self):
         published = time.time() - DAY

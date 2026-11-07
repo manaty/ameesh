@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# ameesh : déclenche la mesure quotidienne de la carte d'impact (#6157).
+# Service UTILISATEUR, sur UN hôte du mesh muni d'un `gh` authentifié (droit
+# `actions: write` sur le dépôt) : un `workflow_dispatch` de carte.yml sur
+# main avec `planifie=true`. Le workflow garde la décision (job `fenetre`,
+# scripts/carte-fenetre.py) : hors fenêtre, carte fraîche, autre mesure ou
+# paquet en cours → mesure sautée ; un second hôte qui le lancerait aussi ne
+# doublerait donc pas la mesure. Le dépôt vient de la configuration de l'hôte
+# (`AMEESH_CARTE_REPO`), sans valeur en dur.
+#
+# Install:
+#   install -m 0644 deploy/systemd/ameesh-carte.service \
+#                      deploy/systemd/ameesh-carte.timer ~/.config/systemd/user/
+#   echo 'AMEESH_CARTE_REPO=<propriétaire>/<dépôt>' >> ~/.config/ameesh/env
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ameesh-carte.timer
+#   journalctl --user -u ameesh-carte -f
+[Unit]
+Description=ameesh daily impact map measurement dispatch (#6157)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/ameesh/env
+ExecStart=/bin/sh -c 'exec gh workflow run carte.yml --repo "$AMEESH_CARTE_REPO" --ref main -f planifie=true'
+TimeoutStartSec=2min
+NoNewPrivileges=yes

@@ -186,6 +186,8 @@ BASE_BRANCHES = ("main",)
 #: dépôt suffit à une alerte dont le seuil est de 48 h
 MAP_WORKFLOW = "carte.yml"
 MAP_READ_S = 3600.0
+#: #6157 : le job de carte.yml qui publie la carte (cache et artefact)
+MAP_JOB = "carte"
 #: #1483 : taille des pages de listes d'exécutions du veilleur (l'API GitHub
 #: plafonne à 100). À 50, une file de plus de 50 exécutions — tous workflows
 #: confondus — pouvait cacher une exécution suivie, que seul le rattrapage
@@ -1671,7 +1673,7 @@ class Watcher:
                      % (repo, MAP_WORKFLOW, " ".join(str(exc).split())[:200]))
             return
         runs = list(data.get("workflow_runs") or ())
-        run = runs[0] if runs else {}
+        run = self._published_map(repo, runs)
         # #5753 : carte.yml n'est pas une suite suivie par _failures. Ses
         # parts peuvent absorber exit 75 et finir vertes ; lire leurs notices
         # dans ce relevé déjà borné, sans fabriquer de verdict de test.
@@ -1680,9 +1682,40 @@ class Watcher:
                 self._github_disk_refusals(db, repo, dict(
                     run_id=candidate["id"], run_attempt=candidate.get("run_attempt") or 1),
                     terminal="success")
+        if run is None:
+            return  # aucune carte publiée parmi les runs lus : le relevé vieillit
         st.ci.observe_map(repo, branch=branch, run_id=run.get("id"),
                           head_sha=run.get("head_sha"),
                           published_at=run.get("updated_at") or None)
+
+    def _published_map(self, repo: str, runs: list[dict]) -> dict | None:
+        """#6157 : le plus récent run vert dont le job `carte` a publié.
+
+        La fenêtre de carte.yml saute la mesure planifiée hors de son créneau :
+        le run finit vert, job `carte` sauté, sans carte. Le compter pour la
+        dernière carte effacerait `map_stale`. Aucun run (dépôt jamais mesuré)
+        rend ``{}`` ; une lecture de jobs impossible rend ``None`` (le relevé
+        précédent vieillit, comme pour une erreur de liste)."""
+        from . import plan_github
+        if not runs:
+            return {}
+        for run in runs:
+            if not run.get("id"):
+                continue
+            try:
+                jobs = self.api("repos/%s/actions/runs/%s/jobs?per_page=100"
+                                % (repo, run["id"])) or {}
+            except plan_github.GithubRateLimited:
+                raise
+            except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+                self.log("CI %s: %s run %s jobs unreadable (%s)"
+                         % (repo, MAP_WORKFLOW, run["id"],
+                            " ".join(str(exc).split())[:200]))
+                return None
+            if any(j.get("name") == MAP_JOB and j.get("conclusion") == "success"
+                   for j in jobs.get("jobs") or ()):
+                return run
+        return None
 
     def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str],
                   bases=BASE_BRANCHES) -> list[dict]:
