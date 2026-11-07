@@ -966,7 +966,20 @@ class MapTest(unittest.TestCase):
                                   "test_6011_contrat_ecrivains_isoles",
                                   "test_cluster", "test_events_attach", "test_l31_orphans",
                                   "test_l50_group_orphan_work_items",
-                                  "test_l72_panne_de_base", "test_migrations"])
+                                  "test_l72_panne_de_base", "test_migrations",
+                                  "test_migrations_additives"])
+
+    def test_migrations_additives_follows_a_migration_change(self):
+        # #6147 : le contrat additif du staging (canon §11 bis) doit être
+        # déclenché par tout changement sous src/ameesh/migrations/. Sans lui,
+        # la migration 0555 de #6090, non additive, a traversé les deux séries
+        # locales du paquet (146 modules) ; seule la ci-full l'a vue.
+        always = plan.read_list(plan.ALWAYS_FILE, parts.modules())
+        self.assertIn("test_migrations_additives", always)
+        change = [("A", "src/ameesh/migrations/0555_non_additive.sql")]
+        self.assertEqual(
+            plan.always_hits(change, always).get("test_migrations_additives"),
+            "always list (src/ameesh/migrations/0555_non_additive.sql)")
 
     def test_psql_pr_modules_adds_the_triggered_always_list(self):
         # #749 : la liste « always » declenchee rejoint le pilote psql d'une PR ;

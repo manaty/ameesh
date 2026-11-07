@@ -1206,5 +1206,17 @@ class KeepCompositionOptionTest(unittest.TestCase):
                               "--keep-composition", "b" * 40]), 2)
 
 
+class ContratAdditifTest(unittest.TestCase):
+    """#6147 : la série locale du composeur joue le contrat additif du staging."""
+
+    def test_la_liste_toujours_du_paquet_porte_le_contrat_additif(self) -> None:
+        # #6147 : les deux séries locales du composeur (146 modules, vertes)
+        # lisent tests/parts/toujours.txt ; sans `test_migrations_additives`,
+        # la migration 0555 de #6090, non additive, ne les a pas fait rougir et
+        # seule la ci-full l'a vue (run 42360221506).
+        modules = paquet_auto.contract_modules(REPO)
+        self.assertIn("tests.test_migrations_additives", modules)
+
+
 if __name__ == "__main__":
     unittest.main()
