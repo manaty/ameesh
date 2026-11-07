@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#6020: Nexlink staging handed to the bureau, two-letter versions, release-<v> tags."""
 import json
+import dataclasses
 import os
 import subprocess
 import tempfile
@@ -13,16 +14,19 @@ from ameesh import nexlink_release as nx, release_cutoff as rc
 
 SHA = "a" * 40
 RUNS = {"deploy-api.yml": 11, "deploy-web.yml": 12, "deploy-media-worker.yml": 13}
+CHECKSUM = "c" * 64
 
 
 class VersionTests(unittest.TestCase):
     def test_letters_count_like_columns(self):
         for value, expected in (("11ar", "11as"), ("11az", "11ba"), ("11z", "11aa"),
-                                ("11zz", "11aaa"), ("11v", "11w")):
+                                ("11zz", "11aaa"), ("11zzz", "11aaaa"),
+                                ("11v", "11w")):
             self.assertEqual(nx.next_version(value), expected)
-        ordered = ["11y", "11z", "11aa", "11ar", "11az", "11ba", "11zz", "11aaa", "12a"]
+        ordered = ["11y", "11z", "11aa", "11ar", "11az", "11ba", "11zz", "11aaa",
+                   "11aaaa", "12a"]
         self.assertEqual(sorted(reversed(ordered), key=nx.version_key), ordered)
-        for name in ("11", "11aaaa", "11A", "release-11as"):
+        for name in ("11", "11A", "release-11as"):
             with self.assertRaises(rc.ReleaseError):
                 nx.version_key(name)
 
@@ -152,12 +156,39 @@ class ConfigurationTests(unittest.TestCase):
                     rc.ProjectRelease.from_config(
                         cfg, "nexlink" if "model" in entry else "ameesh", entry)
 
+    def test_handoff_alias_is_canonicalized_at_configuration(self):
+        """#6039 N4: the config resolves the registry alias, not the tick alone."""
+        cfg = types.SimpleNamespace(humans="", radar={})
+        with mock.patch.object(rc.radar, "settings_of",
+                               return_value=types.SimpleNamespace(projects={})), \
+                mock.patch("ameesh.agent_names.resolve", return_value="bureau") as resolve:
+            project = rc.ProjectRelease.from_config(cfg, "nexlink", {
+                "repo": ".", "target": "develop", "model": "nexlink",
+                "staging_handoff": "bureau-alias"})
+        self.assertEqual(project.staging_handoff, "bureau")
+        self.assertEqual(resolve.call_args.args[0], "bureau-alias")
+
+    def test_canonical_handoff_refuses_an_unknown_registry_name(self):
+        """#6039 N4: the tick's database check is the authority, before a tag."""
+        db = object()
+        with mock.patch("ameesh.agent_names.resolve", return_value="bureau"), \
+                mock.patch("ameesh.registry.get", return_value={"name": "bureau"}):
+            self.assertEqual(rc.canonical_handoff(types.SimpleNamespace(), db,
+                                                  "bureau-alias"), "bureau")
+        with mock.patch("ameesh.agent_names.resolve", return_value="buro"), \
+                mock.patch("ameesh.registry.get", return_value=None):
+            with self.assertRaisesRegex(rc.ReleaseError, "not a registered agent"):
+                rc.canonical_handoff(types.SimpleNamespace(), db, "buro")
+
 
 class NoteTests(unittest.TestCase):
     def test_attestation_round_trip_and_malformed(self):
-        migrations = nx.parse_migrations(["hub:540", "content:540", "hub:540"])
-        self.assertEqual(migrations, [{"target": "content", "version": 540},
-                                      {"target": "hub", "version": 540}])
+        migrations = nx.parse_migrations(["hub:540:" + CHECKSUM, "content:540:" + CHECKSUM,
+                                          "hub:540:" + CHECKSUM])
+        self.assertEqual(migrations, [{"target": "content", "version": 540,
+                                       "checksum": CHECKSUM},
+                                      {"target": "hub", "version": 540,
+                                       "checksum": CHECKSUM}])
         text = nx.attestation_text("nexlink", "11at", sha=SHA, runs=dict(RUNS),
                                    migrations=migrations)
         kind, data = nx.read_decision("nexlink", "11at", text)
@@ -170,12 +201,18 @@ class NoteTests(unittest.TestCase):
                     json.dumps({"sha": SHA, "runs": {"deploy-api.yml": 1}})):
             self.assertEqual(nx.read_decision(
                 "nexlink", "11at", "release-attest:nexlink:11at " + bad)[0], "malformed")
+        # #6039 N3: a version without the content checksum is not an attestation.
+        self.assertEqual(nx.read_decision(
+            "nexlink", "11at", nx.attestation_text(
+                "nexlink", "11at", sha=SHA, runs=dict(RUNS),
+                migrations=[{"target": "hub", "version": 540}]))[0], "malformed")
         for texts in (["deploy-api.yml=1"], ["deploy-api-prod.yml=1", "deploy-web.yml=2",
                                              "deploy-media-worker.yml=3"]):
             with self.assertRaises(rc.ReleaseError):
                 nx.parse_runs(texts)
-        with self.assertRaises(rc.ReleaseError):
-            nx.parse_migrations(["prod:540"])
+        for bad in (["prod:540:" + CHECKSUM], ["hub:540"], ["hub:540:abc"]):
+            with self.assertRaises(rc.ReleaseError):
+                nx.parse_migrations(bad)
 
     def test_reserved_prefix_refused_by_work_note(self):
         from ameesh import work
@@ -191,7 +228,7 @@ class AttestCommandTests(unittest.TestCase):
     def args(self, **change):
         values = dict(project="nexlink", version="11at", sha=SHA,
                       run=["%s=%d" % item for item in RUNS.items()],
-                      migration=["hub:540"], skip=False, reason="", actor=None)
+                      migration=["hub:540:" + CHECKSUM], skip=False, reason="", actor=None)
         values.update(change)
         return types.SimpleNamespace(**values)
 
@@ -296,10 +333,14 @@ class HandoffPipelineTests(unittest.TestCase):
                    mock.patch.object(work, "events_noted",
                                      side_effect=lambda db, lot, prefix: list(self.notes)),
                    mock.patch.object(nx, "migration_requirements", return_value={
-                       "hub": [{"version": 540, "name": "540_x", "checksum": "c"}]})]
+                       "hub": [{"version": 540, "name": "540_x", "checksum": CHECKSUM}]})]
         for patcher in patches:
             patcher.start()
             self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(rc, "canonical_handoff",
+                                    side_effect=lambda cfg, db, name: name)
+        self.canonical_handoff = patcher.start()
+        self.addCleanup(patcher.stop)
         patcher = mock.patch.object(work, "close")
         self.close = patcher.start()
         self.addCleanup(patcher.stop)
@@ -327,7 +368,9 @@ class HandoffPipelineTests(unittest.TestCase):
         return report
 
     def attest(self, event_id, actor="bureau", **change):
-        data = dict(sha=SHA, runs=dict(RUNS), migrations=[{"target": "hub", "version": 540}])
+        data = dict(sha=SHA, runs=dict(RUNS),
+                    migrations=[{"target": "hub", "version": 540,
+                                 "checksum": CHECKSUM}])
         data.update(change)
         self.notes.append(note(event_id, actor, nx.attestation_text("nexlink", "11at", **data)))
 
@@ -348,8 +391,57 @@ class HandoffPipelineTests(unittest.TestCase):
         body, _report, kw = self.sent[-1]
         self.assertEqual(kw["also"], ("bureau",))
         self.assertIn("release-11at", body)
-        self.assertIn("--migration hub:540", body)
+        self.assertIn("--migration hub:540:" + CHECKSUM, body)
         self.assertIn("Lot d'attestation : #77", body)
+        self.assertTrue(handoff["reported"])
+
+    def test_handoff_alias_is_canonicalized_before_the_tag(self):
+        """#6039 N4: alias resolved and used for report and attestation match."""
+        self.project = dataclasses.replace(self.project,
+                                           staging_handoff="bureau-alias")
+        self.canonical_handoff.side_effect = (
+            lambda cfg, db, name: "bureau" if name == "bureau-alias" else name)
+        self.assertEqual(self.handed_over()["result"], "waiting-attestation")
+        handoff = self.slot()["pending_nexlink"]["handoff"]
+        self.assertEqual(handoff["to"], "bureau")
+        self.assertEqual(self.sent[-1][2]["also"], ("bureau",))
+
+    def test_unknown_handoff_is_refused_before_any_tag(self):
+        """#6039 N4: a typo is a configuration refusal, not a lost report."""
+        rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {"nexlink": {}}})
+        self.canonical_handoff.side_effect = rc.ReleaseError(
+            "staging_handoff: 'buro' is not a registered agent")
+        with mock.patch.object(nx, "publish") as publish:
+            with self.assertRaisesRegex(rc.ReleaseError, "not a registered agent"):
+                self.run_tick(1000)
+        publish.assert_not_called()
+        self.assertNotIn("pending_nexlink", self.slot())
+
+    def test_handoff_report_is_retried_after_a_failed_send(self):
+        """#6039 N5: the command is not lost between the durable save and the send."""
+        calls = []
+
+        def flaky(cfg, db, project, body, report, **kw):
+            calls.append(body)
+            if len(calls) == 1:
+                raise rc.TransientReleaseError("mail down")
+            self.sent.append((body, report, kw))
+
+        with mock.patch.object(rc, "send_report", side_effect=flaky):
+            with self.assertRaises(rc.TransientReleaseError):
+                self.handed_over()
+        handoff = self.slot()["pending_nexlink"]["handoff"]
+        self.assertFalse(handoff["reported"])
+        self.assertEqual(handoff["lot"], 77)
+        with mock.patch.object(rc, "send_report",
+                               side_effect=lambda cfg, db, project, body, report, **kw:
+                               (calls.append(body),
+                                self.sent.append((body, report, kw)))):
+            self.assertEqual(self.run_tick(1100)["result"], "waiting-attestation")
+        self.assertTrue(self.slot()["pending_nexlink"]["handoff"]["reported"])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--migration hub:540:" + CHECKSUM, calls[1])
+        self.assertIn("Lot d'attestation : #77", calls[1])
 
     def test_valid_attestation_closes_cutoff_and_lot(self):
         self.handed_over()
@@ -383,6 +475,21 @@ class HandoffPipelineTests(unittest.TestCase):
         self.assertIn("concluded failure", rejected["9"])
         self.assertEqual(len(self.sent) - before, 5)
 
+    def test_migration_content_checksum_is_compared(self):
+        """#6039 N3: the version is not enough; the file's SHA256 must match."""
+        self.handed_over()
+        self.attest(5, migrations=[{"target": "hub", "version": 540,
+                                    "checksum": "d" * 64}])
+        with self.gh_runs():
+            self.assertEqual(self.run_tick(2000)["result"], "waiting-attestation")
+        rejected = self.slot()["pending_nexlink"]["handoff"]["rejected"]
+        self.assertIn("attested content differs", rejected["5"])
+        self.attest(6)
+        with self.gh_runs():
+            report = self.run_tick(2100)
+        self.assertEqual((report["result"], report["staging_attestation"]["event"]),
+                         ("released", 6))
+
     def test_running_attestation_never_holds_a_later_decision(self):
         """cx1 B1: [running attestation, newer valid one] and [running, skip]."""
         self.handed_over()
@@ -414,7 +521,8 @@ class HandoffPipelineTests(unittest.TestCase):
                                proof=False))
         self.notes.append(note(6, "bureau", nx.attestation_text(
             "nexlink", "11at", sha=SHA, runs=dict(RUNS),
-            migrations=[{"target": "hub", "version": 540}]), proof=False))
+            migrations=[{"target": "hub", "version": 540,
+                         "checksum": CHECKSUM}]), proof=False))
         with self.gh_runs():
             self.assertEqual(self.run_tick(2000)["result"], "waiting-attestation")
         rejected = self.slot()["pending_nexlink"]["handoff"]["rejected"]
@@ -488,8 +596,8 @@ class HandoffPipelineTests(unittest.TestCase):
 
     def test_preflight_refusal_leaves_no_tag(self):
         """B1/B2 dev3: an invalid staging workflow or a git failure (error,
-        timeout, OSError) is refused before publish: no tag, and the cutoff
-        closes as refused-preflight instead of holding the next one."""
+        OSError) is refused before publish: no tag, and the cutoff closes as
+        refused-preflight instead of holding the next one."""
         import subprocess as sp
         staging, migrations = "staging_jobs", "migration_requirements"
         for target, error, expected in (
@@ -497,8 +605,6 @@ class HandoffPipelineTests(unittest.TestCase):
                  "literal staging"),
                 (staging, sp.CalledProcessError(128, ["git", "show", "x:.github/workflows/deploy-api.yml"]),
                  "preflight: git show"),
-                (migrations, sp.TimeoutExpired(["git", "-C", "/r", "show", "x:y.sql"], 30),
-                 "timed out"),
                 (migrations, OSError("no git"), "no git")):
             rc.save_state(self.cfg, {"schema": rc.SCHEMA,
                                      "projects": {"nexlink": {"pending_nexlink": dict(self.pending)}}})
@@ -519,6 +625,41 @@ class HandoffPipelineTests(unittest.TestCase):
                 self.assertEqual(len(self.sent), before + 1)
                 self.assertIn("refusée avant le tag", self.sent[-1][0])
                 self.assertIn("--force", self.sent[-1][0])
+
+    def test_preflight_refusal_is_not_reported_twice(self):
+        """#6039 N8: `_report_error` must not claim a closed pending is kept."""
+        from ameesh import release
+        rc.save_state(self.cfg, {"schema": rc.SCHEMA,
+                                 "projects": {"nexlink": {"pending_nexlink":
+                                                          dict(self.pending)}}})
+        with mock.patch.object(nx, "staging_jobs",
+                               side_effect=rc.ReleaseError("bad workflow")), \
+                mock.patch.object(nx, "workflow_step", return_value=True), \
+                mock.patch.object(nx, "publish"):
+            with self.assertRaises(rc.ReleaseError) as caught:
+                self.run_tick(1000)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("refusée avant le tag", self.sent[0][0])
+        release._report_error(self.cfg, self.db, self.project, caught.exception, 1000)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_transient_preflight_keeps_the_pending(self):
+        """#6039 N9: a git timeout is retried, never closed as refused-preflight."""
+        import subprocess as sp
+        for error in (sp.TimeoutExpired(["git", "-C", "/r", "show", "x:y.sql"], 30),
+                      rc.TransientReleaseError("git show timed out")):
+            with self.subTest(error=type(error).__name__):
+                rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {
+                    "nexlink": {"pending_nexlink": json.loads(json.dumps(self.pending))}}})
+                with mock.patch.object(nx, "migration_requirements", side_effect=error), \
+                        mock.patch.object(nx, "workflow_step", return_value=True), \
+                        mock.patch.object(nx, "publish") as publish:
+                    with self.assertRaises(rc.TransientReleaseError):
+                        self.run_tick(1000)
+                publish.assert_not_called()
+                slot = self.slot()
+                self.assertIn("pending_nexlink", slot)
+                self.assertNotEqual(slot.get("last_result"), "refused-preflight")
 
     def test_next_cutoff_runs_after_a_refused_preflight(self):
         """The ref deletion failed at refusal: kept in the slot, retried
@@ -597,6 +738,136 @@ class HandoffPipelineTests(unittest.TestCase):
         report = self.run_tick(2000)
         self.assertEqual(report["result"], "staging-unattested")
         self.assertNotIn("pending_nexlink", self.slot())
+
+
+class _FakeWork:
+    """The storage surface `open_handoff_lot` and `write_decision` read/write."""
+
+    def __init__(self):
+        self.rows = []
+        self.added = []
+
+    def items(self, *, state=None, assignee=None, limit=None):
+        return [dict(row) for row in self.rows if row["state"] == state]
+
+    def add(self, **kwargs):
+        self.added.append(dict(kwargs))
+        row = {"id": 100 + len(self.added), "state": "intake",
+               "source": kwargs["source"], "title": kwargs["title"],
+               "body": kwargs["body"],
+               "external_executor": kwargs.get("external_executor")}
+        self.rows.append(row)
+        return dict(row)
+
+
+class _FakeTx:
+    def __init__(self):
+        self.statements = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def query(self, sql, params=()):
+        self.statements.append(("query", sql, params))
+        return []
+
+    def execute(self, sql, params=()):
+        self.statements.append(("execute", sql, params))
+        return []
+
+
+class _FakeDb:
+    def __init__(self):
+        self.tx = _FakeTx()
+
+    def transaction(self):
+        return self.tx
+
+
+class HandoffLotStorageTests(unittest.TestCase):
+    """#6039 N6: the real lot path on a fake storage, no lot helper mocked."""
+
+    def setUp(self):
+        from ameesh import work
+        self.work = work
+        self.db = _FakeDb()
+        self.store = _FakeWork()
+        for patcher in (
+                mock.patch("ameesh.storage.of",
+                           return_value=types.SimpleNamespace(work=self.store)),
+                mock.patch("ameesh.agent_names.resolve", side_effect=lambda name, **kw: name)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.project = rc.ProjectRelease("nexlink", "/unused", target="develop",
+                                         model="nexlink",
+                                         staging_handoff="bureau")
+
+    def pending(self):
+        return {"version": "11at", "handoff": {"deadline": 4102444800.0,
+                                               "instructions": "attester"}}
+
+    def test_lot_is_reserved_to_the_external_agent_and_created_once(self):
+        row = {"name": "bureau", "mode": "externe",
+               "responsible": "human:smichea"}
+        with mock.patch("ameesh.registry.get", return_value=row):
+            lot = nx.open_handoff_lot(self.db, self.project, self.pending())
+            again = nx.open_handoff_lot(self.db, self.project, self.pending())
+        self.assertEqual((lot, again), (101, 101))
+        self.assertEqual(len(self.store.added), 1)
+        added = self.store.added[0]
+        self.assertEqual((added["type"], added["source"], added["app"],
+                          added["priority"], added["actor"],
+                          added["external_executor"], added["footprint"]),
+                         ("evolution", "release-handoff:nexlink:11at", "nexlink",
+                          1, self.work.SYSTEM_SENDER, "bureau", []))
+        self.assertEqual(added["body"], "attester")
+        self.assertIn("attestation", added["title"])
+        self.assertTrue(any("pg_advisory_xact_lock" in sql
+                            for kind, sql, _params in self.db.tx.statements
+                            if kind == "query"))
+
+    def test_non_external_agent_is_refused_before_any_lot(self):
+        with mock.patch("ameesh.registry.get",
+                        return_value={"name": "bureau", "mode": "execute",
+                                      "responsible": "human:smichea"}):
+            with self.assertRaisesRegex(self.work.WorkError, "not an external"):
+                nx.open_handoff_lot(self.db, self.project, self.pending())
+        self.assertEqual(self.store.added, [])
+
+    def test_write_decision_carries_its_proof(self):
+        source = nx.handoff_source("nexlink", "11at")
+        self.store.rows.append({"id": 42, "state": "intake", "source": source})
+        text = nx.attestation_text("nexlink", "11at", sha=SHA, runs=dict(RUNS),
+                                   migrations=[{"target": "hub", "version": 540,
+                                                "checksum": CHECKSUM}])
+        lot = nx.write_decision(self.db, "nexlink", "11at", "attested", text, "bureau")
+        self.assertEqual(lot, 42)
+        inserts = [params for kind, sql, params in self.db.tx.statements
+                   if kind == "execute" and "INSERT INTO work_item_events" in sql]
+        self.assertEqual(len(inserts), 1)
+        item_id, phase, note, actor, evidence = inserts[0]
+        self.assertEqual((item_id, phase, note, actor), (42, "intake", text, "bureau"))
+        proof = json.loads(evidence)
+        self.assertEqual((proof["schema"], proof["kind"], proof["project"],
+                          proof["version"], proof["actor"]),
+                         (nx.DECISION_SCHEMA, "attested", "nexlink", "11at", "bureau"))
+        self.assertTrue(nx.decision_authentic(
+            {"actor": "bureau", "evidence": evidence}, "nexlink", "11at", "attested"))
+        self.assertFalse(nx.decision_authentic(
+            {"actor": "other", "evidence": evidence}, "nexlink", "11at", "attested"))
+
+    def test_close_handoff_lot_closes_only_an_opened_lot(self):
+        with mock.patch.object(self.work, "close") as close:
+            nx._close_handoff_lot(self.db, {"handoff": {"lot": 42}}, "released")
+            close.assert_called_once_with(
+                self.db, 42, done=True, note="released",
+                actor=self.work.SYSTEM_SENDER)
+            close.reset_mock()
+            nx._close_handoff_lot(self.db, {"handoff": {}}, "released")
+            close.assert_not_called()
 
 
 if __name__ == "__main__":

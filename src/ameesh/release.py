@@ -301,6 +301,10 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
     the de-duplication stays per cutoff so a retry loop mails once.
     """
     from . import release_cutoff
+    if getattr(exc, "already_reported", False):
+        # #6039 N8: the raiser already sent the one coherent message (refused
+        # preflight closes its pending; there is no state to resume).
+        return
     transient = isinstance(exc, release_cutoff.TransientReleaseError)
     try:
         state = release_cutoff.load_state(cfg)
@@ -322,9 +326,18 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
         release_cutoff.save_state(cfg, state)
         if db is not None:
             if project.model == "nexlink":
-                body = ("Coupe Nexlink en attente%s : %s. État de reprise conservé ; "
-                        "consulter pending_nexlink pour les branches, tags et runs déjà créés."
-                        % (" (erreur transitoire)" if transient else "", text))
+                if slot.get("pending_nexlink"):
+                    body = ("Coupe Nexlink en attente%s : %s. État de reprise conservé ; "
+                            "consulter pending_nexlink pour les branches, tags et runs "
+                            "déjà créés."
+                            % (" (erreur transitoire)" if transient else "", text))
+                else:
+                    # #6039 N8: a closed pending (refused preflight, unknown
+                    # handoff agent) is not a resumable state; never say it is.
+                    body = ("Coupe Nexlink NON faite%s : %s. Aucun tag ni déploiement "
+                            "n'a été posé pour cette coupure ; corriger la cause, puis "
+                            "la relancer si elle reste due."
+                            % (" (erreur transitoire)" if transient else "", text))
             else:
                 body = ("Release %s NON faite%s : %s\n\nAucun tag, aucun déploiement. "
                         "Corrige la cause ; le prochain tick réessaiera tant que la "
@@ -776,7 +789,7 @@ def add_parser(sub, func) -> None:
     attest_p.add_argument("--run", action="append", default=[],
                           help="WORKFLOW=RUN_ID, once per staging workflow")
     attest_p.add_argument("--migration", action="append", default=[],
-                          help="TARGET:VERSION applied on staging (hub, content)")
+                          help="TARGET:VERSION:SHA256 applied on staging (hub, content)")
     attest_p.add_argument("--skip", action="store_true",
                           help="pilot only: close the held cutoff without staging")
     attest_p.add_argument("--reason", default="")

@@ -1177,6 +1177,10 @@ class ProjectRelease:
                         or not config.NAME_RE.fullmatch(handoff)):
             raise ReleaseError("release.projects.%s.staging_handoff: an agent name, "
                                "nexlink model only" % name)
+        if handoff:
+            # #6039 N4: canonicalize an alias as early as the configuration,
+            # without the registry (which the tick reads before any tag).
+            handoff = canonical_handoff(cfg, None, handoff)
         elected_role = ((getattr(cfg, "release", None) or {}).get("role")
                         or (getattr(cfg, "packet_watch", None) or {}).get("role"))
         executor = entry.get("staging_executor")
@@ -1215,6 +1219,42 @@ class ProjectRelease:
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
             suite_tolerated=tolerated, model=model, staging_handoff=handoff or "",
             attestation_timeout_s=number("attestation_timeout_s", ATTESTATION_TIMEOUT_S))
+
+
+def canonical_handoff(cfg, db, name: str) -> str:
+    """#6039 N4: the canonical agent of `staging_handoff`.
+
+    The configuration may spell an alias; the tick compares the attestation's
+    bound author with this name and sends the report to it, so both must use
+    the primary registry name. Without a database the canon's aliases are
+    resolved best-effort (a listing must not fail on an unreadable canon);
+    with the tick's database an unknown name is refused before any tag."""
+    from . import registry
+    from .agent_names import resolve
+    from .db import DbError
+    try:
+        canonical = resolve(name, db=db, cfg=cfg,
+                            operation="release.staging_handoff")
+    except (canon_mod.CanonError, OSError):
+        # The tick reads the canon again for its calendar; keep the spelling
+        # here, and the registry check below still refuses an unknown name.
+        canonical = name
+    except ValueError as exc:
+        raise ReleaseError("release.projects.staging_handoff: ambiguous agent %r: %s"
+                           % (name, exc)) from exc
+    except DbError as exc:
+        raise TransientReleaseError("release staging_handoff unreadable: %s" % exc) from exc
+    if db is not None and canonical:
+        try:
+            known = registry.get(db, canonical)
+        except DbError as exc:
+            raise TransientReleaseError("release staging_handoff unreadable: %s" % exc) from exc
+        if known is None:
+            raise ReleaseError(
+                "release.projects.staging_handoff: %r is not a registered agent; the "
+                "attestation author and the report recipient must be one known agent"
+                % name)
+    return canonical
 
 
 def child_credentials(project) -> frozenset[str]:
