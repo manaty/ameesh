@@ -128,3 +128,22 @@ class AttestationTest(unittest.TestCase):
         for value in (float("nan"), {1: "key"}, ("tuple",)):
             with self.assertRaises(a.AttestationError):
                 a.canonical_json(value)
+
+    def test_isolated_surrogates_are_named_errors(self):
+        for value in ("\ud800", "\udfff", {"\ud800": "value"},
+                      {"nested": ["\udfff"]}):
+            with self.subTest(value=ascii(value)):
+                with self.assertRaisesRegex(a.AttestationError, "^invalid-unicode$"):
+                    a.canonical_json(value)
+        envelope = a.seal(self.payload)
+        envelope["payload"]["links"] = ["\ud800"]
+        with self.assertRaisesRegex(a.AttestationError, "^invalid-unicode$"):
+            a.validate(envelope)
+        self.assertEqual(a.canonical_json({"é": "😀"}), '{"é":"😀"}')
+
+    def test_now_requires_timezone_aware_datetime(self):
+        for now in (None, "2026-11-07T14:10:00Z", 42, object(),
+                    datetime(2026, 11, 7, 14, 10)):
+            with self.subTest(now=repr(now)):
+                with self.assertRaisesRegex(a.AttestationError, "^invalid-now$"):
+                    self.reuse(now=now)
