@@ -22,21 +22,28 @@
 # same line, alphabetical order, no duplicate (scripts/test-parts.py refuses
 # an unsorted list).
 
+# #6180 : observation additive du registre contrats.json ; conserver cette liste
+# pour les lecteurs N-1. Aucun contrat existant n’est retiré.
+
 test_2340_auditeur_role  # #2340: auditeur login role, read-only, two supervisory contracts, refusals
 test_2449_garde_mecanique  # #2449: canon mechanics (no hardcoded parameter, named/dated exemptions), ui workflow trigger
 test_2457_garde_non_python  # #2457: shell/systemd/workflow mechanics guard and tracked-file scope
 test_339_orphan_settle  # #749: orphan turn groups settled without a reboot, outside the measured blocks
+test_3752_gabarit  # #3752: a migration changes the template every class clones (clone ≡ migrate)
 test_4256_validation_deadlines  # #4256: validation authority, private audit and single-winner escalation (SQL contract)
 test_4259_client_literals  # #4574: client literals guard, reads src/ameesh as text (no map link)
+test_4299_agent_rename  # #4299: every agent-name column of the schema is classified for the rename
 test_5588_housekeeping_retention  # #5588: additive retention index and 30-day SQL contract
 test_6011_contrat_ecrivains_isoles  # #6011: it.item reads the lot with the module-writers' exact GRANTs
 test_6090_work_add_unique_ref  # #6090: migration 0555 (colonne `unique_ref`, index unique partiel) et écriture N-1 sous contrat
 test_cluster  # roles created on the cluster (supervisor, approve), grants checked against every column
+test_contract_registry_ameesh  # #6180: registre initial, observation additive et régressions du 07/11
+test_contract_selection  # #6179: lecteur du registre, repli conservateur et compatibilité N-1
 test_events_attach  # LISTEN/NOTIFY channels, global to the cluster
+test_l102_cli_vocab  # #6180: contrat du parseur CLI et vocabulaire des commandes
+test_l107_executor_contract  # #6180: contrat du stockage médié (régression #6090 h-13)
 test_l31_orphans  # #749: orphan resources of a turn, lease and alert contract (the release red module)
 test_l50_group_orphan_work_items  # #749: orphan work items of a group reattached, lease contract
 test_l72_panne_de_base  # database outage and reconnection
 test_migrations  # migrations: application, idempotence, immuabilité (contrat, L1211)
 test_migrations_additives  # #6147: contrat additif du staging (§11 bis) : une migration non additive est refusée
-test_3752_gabarit  # #3752: a migration changes the template every class clones (clone ≡ migrate)
-test_4299_agent_rename  # #4299: every agent-name column of the schema is classified for the rename
