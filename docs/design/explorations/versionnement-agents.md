@@ -6,6 +6,9 @@ title: "Versionnement pour agents : dépendances explicites et attestation par c
 
 # Versionnement pour agents : dépendances explicites et attestation par changement
 
+Cette piste dispose désormais d’une [étude décidée](../etudes/versionnement-agents.md).
+La présente fiche conserve les questions initiales.
+
 ## Problème
 
 Des lots verts séparément peuvent se contredire une fois composés : le
@@ -74,5 +77,5 @@ Contexte : [Étude tests par impact](../etudes/l161-tests-par-impact.md)
 (carte test → code), [Radar de conflits](../etudes/l160-radar-de-conflits.md),
 [Pilote Mergiraf](../etudes/l160g-mergiraf-pilot.md), et le
 [processus de lot](https://github.com/manaty/home/blob/main/processus/lots.md)
-(paquets horaires). Ces références éclairent la question ; elles ne
-promeuvent pas cette fiche en étude ou en travail décidé.
+(paquets horaires). Ces références éclairent la question ; le périmètre retenu est porté par
+l’étude liée en tête de cette fiche.
