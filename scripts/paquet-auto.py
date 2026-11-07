@@ -1668,6 +1668,7 @@ def contract_modules(worktree: Path, *, base: str = "",
         if not name:
             continue
         modules.append(name if name.startswith("tests.") else "tests." + name)
+    modules.extend(CONTRACT_MODULES)
     if base and (worktree / "src/ameesh/contract_plan.py").is_file():
         # The candidate's L161f serializes the very same registry/impact union
         # as CI and prevalidation. Map absence keeps the packet contract-only
@@ -1697,7 +1698,6 @@ def contract_modules(worktree: Path, *, base: str = "",
                 chosen = (shared["modules"] if (plan.get("map") or {}).get("used")
                           else shared["contracts"])
                 modules.extend("tests." + name for name in chosen)
-    modules.extend(CONTRACT_MODULES)
     return _dedupe_modules(worktree, modules)
 
 
@@ -1964,7 +1964,7 @@ def run_walled(cmd: list[str], *, cwd: Path, env: dict,
 
 def run_tests(worktree: Path, label: str, modules: list[str], *,
               timeout: int, heavy: bool = False,
-              wall: int | None = None) -> TestRun:
+              wall: int | None = None, failfast: bool = False) -> TestRun:
     """Une série unittest bornée par `timeout` (au-delà : non concluant).
 
     #4271 : avec `heavy`, la série prend un créneau de l'hôte
@@ -1979,7 +1979,8 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
         return TestRun(label=label, modules=[], returncode=0, output="",
                        seconds=0.0)
     start = time.monotonic()
-    cmd = [project_python(worktree), "-m", "unittest", "-q", *modules]
+    cmd = [project_python(worktree), "-m", "unittest", "-q",
+           *(["-f"] if failfast else []), *modules]
     env = python_env(worktree)
     wait = 0
     wrapper = shutil.which("ameesh") if heavy else None
@@ -2061,7 +2062,7 @@ def prepublication_contracts(worktree: Path, *, base: str,
             run = budget_spent("contrats", modules)
         else:
             run = run_tests(worktree, "contrats", modules, timeout=remaining,
-                            heavy=True, wall=remaining)
+                            heavy=True, wall=remaining, failfast=True)
     except PaquetAutoError as exc:
         run = save_test_log(TestRun("contrats", modules, None, str(exc),
                                    time.monotonic() - start, timed_out=True))

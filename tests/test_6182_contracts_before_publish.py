@@ -2,6 +2,7 @@
 """#6182: composed contracts before publication, scoped and bounded."""
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -84,7 +85,7 @@ class ScopeAndBudgetTest(unittest.TestCase):
             clock[0] += 3
             return ['tests.test_x']
         def execute(*args, **kwargs):
-            self.assertEqual(kwargs, {'timeout': 9, 'heavy': True, 'wall': 9})
+            self.assertEqual(kwargs, {'timeout': 9, 'heavy': True, 'wall': 9, 'failfast': True})
             clock[0] += 9
             return auto.TestRun('contrats', ['tests.test_x'], None, 'slot timeout', 9, timed_out=True)
         with mock.patch.object(auto.time, 'monotonic', side_effect=lambda: clock[0]), \
@@ -110,6 +111,23 @@ class ScopeAndBudgetTest(unittest.TestCase):
                     with self.assertRaisesRegex(auto.PaquetAutoError, 'hors portée'):
                         auto.prepublication_contracts(self.repo, base='base', budget=12)
                 self.git('reset', '--hard', 'HEAD')
+
+    def test_first_negative_stops_before_a_later_module_can_time_out(self):
+        tests = self.repo / 'tests'
+        tests.mkdir()
+        (tests / '__init__.py').write_text('')
+        (tests / 'test_early.py').write_text(
+            'import unittest\nclass T(unittest.TestCase):\n'
+            ' def test_fail(self): self.fail("regression A/B")\n')
+        (tests / 'test_late.py').write_text(
+            'import unittest\nfrom pathlib import Path\nclass T(unittest.TestCase):\n'
+            ' def test_later(self): Path("late-ran").write_text("ran")\n')
+        with mock.patch.object(auto, 'project_python', return_value=sys.executable), \
+                mock.patch.object(auto, 'save_test_log', side_effect=lambda run: run):
+            run = auto.run_tests(self.repo, 'contrats', ['tests.test_early', 'tests.test_late'],
+                                 timeout=10, failfast=True)
+        self.assertTrue(run.real_failure, run.output)
+        self.assertFalse((self.repo / 'late-ran').exists())
 
     def test_changed_head_before_pass_cannot_qualify_another_candidate(self):
         with mock.patch.object(auto, 'run_tests') as tests:
