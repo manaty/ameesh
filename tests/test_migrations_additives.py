@@ -72,6 +72,15 @@ class NonAdditiveTest(unittest.TestCase):
             " alter table n add unique (id);",
             "create table n (id int, -- l'apostrophe et le ; ne sont pas du code\n"
             " x text default 'a'); revoke insert on n from app;",
+            # #6153 : le texte d'un COMMENT ON est de la documentation (0555, #6090)
+            "alter table t add column if not exists u text;"
+            " create unique index if not exists t_u on t (u) where u is not null;"
+            " comment on column t.u is 'key of `work add --unique-ref`';",
+            "comment on index t_u is e'add a unique \\'key\\'; create trigger g on t';",
+            "comment on column t.c is 'doc'\n 'add unique';",
+            "comment on table t is 'drop constraint; add check'; alter table t add column d int;",
+            "create table n (id int); comment on table n is 'a \"$\" add unique';"
+            " revoke insert on n from app;",
         ):
             with self.subTest(sql=sql):
                 self.assertEqual(migrations.non_additive(_migration(sql)), [])
@@ -184,6 +193,17 @@ class NonAdditiveTest(unittest.TestCase):
             ('create table "n" (id int); revoke insert on n from app;', "revoke on n"),
             ("create table n (id int, c text default 'drop'); revoke insert on n from app;",
              "revoke on n"),
+            # #6153 : seul le texte d'un COMMENT ON est de la documentation
+            ("comment on table t is 'doc'; execute 'alter table t add constraint k unique (c)';",
+             "in a string (not analysed)"),
+            ("comment on table t is 'doc';"
+             " do $$ begin execute 'alter table t add unique (c)'; end $$;",
+             "in a string (not analysed)"),
+            ("comment on table t is $$add unique$$;", "in a string (not analysed)"),
+            ("select format('alter table %I add unique (c)', 't');", "in a string (not analysed)"),
+            ("comment on table t is 'add unique'; revoke insert on t from app;", "revoke on t"),
+            ("create table n (id int); comment on table n is 'x';"
+             " select 'is'; revoke insert on n from app; execute 'drop';", "revoke on n"),
         ):
             with self.subTest(sql=sql):
                 reasons = migrations.non_additive(_migration(sql))

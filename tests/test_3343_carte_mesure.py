@@ -33,6 +33,7 @@ PATHS_MESURE = (
     "scripts/test-parts.py",
     "tests/support.py",
     ".github/workflows/carte.yml",
+    "scripts/carte-fenetre.py",  # #6157
 )
 
 
