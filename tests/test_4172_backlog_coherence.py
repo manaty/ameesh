@@ -9,13 +9,14 @@ go into one digest for the PO. A second pass sends no second digest.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import subprocess
 import tempfile
 import time
 import unittest
 
-from ameesh import backlog_coherence, work
+from ameesh import backlog_coherence, config, work
 
 from .support import PgTestCase
 
@@ -193,6 +194,79 @@ class CoherenceTest(PgTestCase):
         self.assertIn("branch", refused[0]["reason"])
         self.assertEqual(work.get(self.db, self.already_ref["id"])["state"], "intake")
 
+    def _cfg_with_recipients(self, recipients):
+        return dataclasses.replace(
+            self.test_cfg, coherence={"recipients": recipients})
+
+    def _sent(self):
+        return self.db.query("SELECT recipient, body FROM agent_mailbox ORDER BY id")
+
+    def test_configured_recipients_win_over_the_default_human(self):
+        cfg = self._cfg_with_recipients({"p": "human:owner"})
+        report = backlog_coherence.scan(self.db, "p", cfg=cfg, repo=self.repo)
+        applied = backlog_coherence.apply_report(self.db, report, cfg=cfg)
+        self.assertTrue(applied["digest"]["sent"], applied["digest"])
+        self.assertEqual(applied["digest"]["recipient"], "human:owner")
+        self.assertEqual([row["recipient"] for row in self._sent()],
+                         ["human:owner"])
+
+    def test_a_project_not_declared_keeps_the_default_human(self):
+        cfg = self._cfg_with_recipients({"other": "human:other"})
+        report = backlog_coherence.scan(self.db, "p", cfg=cfg, repo=self.repo)
+        applied = backlog_coherence.apply_report(self.db, report, cfg=cfg)
+        self.assertTrue(applied["digest"]["sent"], applied["digest"])
+        self.assertEqual([row["recipient"] for row in self._sent()],
+                         ["human:po"])
+
+    def test_several_recipients_each_get_the_digest(self):
+        cfg = self._cfg_with_recipients({"p": ["po", "human:po2"]})
+        report = backlog_coherence.scan(self.db, "p", cfg=cfg, repo=self.repo)
+        applied = backlog_coherence.apply_report(self.db, report, cfg=cfg)
+        self.assertTrue(applied["digest"]["sent"], applied["digest"])
+        self.assertEqual(applied["digest"]["recipients"],
+                         ["human:po", "human:po2"])
+        sent = self._sent()
+        self.assertEqual([row["recipient"] for row in sent],
+                         ["human:po", "human:po2"])
+        self.assertEqual(sent[0]["body"], sent[1]["body"])
+        # the idempotence key is per recipient: a second pass re-sends nothing
+        again = backlog_coherence.scan(self.db, "p", cfg=cfg, repo=self.repo)
+        backlog_coherence.apply_report(self.db, again, cfg=cfg)
+        self.assertEqual(len(self._sent()), 2)
+
+    def test_configured_recipients_win_over_the_responsible_package(self):
+        self.db.execute(
+            "INSERT INTO work_packages (id, kind, title, responsible, team,"
+            " canon_ref, present) VALUES ('p-package', 'epic', 'p package',"
+            " 'human:pkg', 'p', 'test', true)")
+        cfg = self._cfg_with_recipients({"p": "human:owner"})
+        report = backlog_coherence.scan(self.db, "p", cfg=cfg, repo=self.repo)
+        applied = backlog_coherence.apply_report(self.db, report, cfg=cfg)
+        self.assertEqual(applied["digest"]["recipient"], "human:owner")
+        self.assertEqual([row["recipient"] for row in self._sent()],
+                         ["human:owner"])
+
+    def test_invalid_recipient_config_is_reported_never_sent(self):
+        cfg = self._cfg_with_recipients({"p": "agent:robot"})
+        report = backlog_coherence.scan(self.db, "p", cfg=cfg, repo=self.repo)
+        applied = backlog_coherence.apply_report(self.db, report, cfg=cfg)
+        self.assertFalse(applied["digest"]["sent"])
+        self.assertIn("coherence.recipients.p", applied["digest"]["error"])
+        self.assertIn("human:<id>", applied["digest"]["error"])
+        self.assertEqual(self._sent(), [])
+        # the deterministic closures do not depend on the digest's recipient
+        self.assertEqual(
+            work.get(self.db, self.already_ref["id"])["state"], "closed")
+
+    def test_unknown_coherence_config_key_is_reported(self):
+        cfg = dataclasses.replace(
+            self.test_cfg, coherence={"recipient": {"p": "human:po"}})
+        report = backlog_coherence.scan(self.db, "p", cfg=cfg, repo=self.repo)
+        applied = backlog_coherence.apply_report(self.db, report, cfg=cfg)
+        self.assertFalse(applied["digest"]["sent"])
+        self.assertIn("coherence: unknown key", applied["digest"]["error"])
+        self.assertEqual(self._sent(), [])
+
     def test_cli_reads(self):
         result = self.mesh("work", "coherence", "--project", "p", "--repo", self.repo,
                           "--json")
@@ -206,6 +280,21 @@ class CoherenceTest(PgTestCase):
         self.assertIn("probably done", result.stdout)
         self.assertIn("probably obsolete", result.stdout)
         self.assertEqual(work.get(self.db, self.already_ref["id"])["state"], "intake")
+
+
+class CoherenceConfigTest(unittest.TestCase):
+    """The recipients travel from the host configuration file to the pass."""
+
+    def test_host_configuration_carries_the_project_recipients(self):
+        with tempfile.TemporaryDirectory(prefix="coh-config-") as directory:
+            path = os.path.join(directory, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"coherence": {"recipients": {
+                    "p": ["human:po", "human:po2"]}}}, fh)
+            cfg = config.load(env={"AMEESH_CONFIG": path},
+                              register_credentials=False)
+        self.assertEqual(backlog_coherence.parse_config(cfg),
+                         {"p": ("human:po", "human:po2")})
 
 
 if __name__ == "__main__":

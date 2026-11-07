@@ -577,6 +577,13 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: #6093 : destinataires du digest de cohérence du backlog, par projet
+    #: (clé `coherence` du fichier de l'HÔTE) —
+    #: `{"recipients": {"<projet>": "human:<id>" | ["human:<id>", …]}}`,
+    #: validée par `ameesh.backlog_coherence`. Un projet absent garde la
+    #: chaîne WorkPackage responsable → `notify.default_human` ; aucun nom de
+    #: projet ni de personne n'est codé en dur (canon §7).
+    coherence: dict = field(default_factory=dict)
     #: identité des humains par OIDC (L86, 0033 §4) : la clé `identity` de
     #: l'hôte (`binding` : `subject` par défaut ou `email` ; `providers` :
     #: issuer, client_id, domains), lue par `ameesh.oidc`. Jamais de secret
