@@ -61,6 +61,11 @@ ARCHIVE_REFUSED = 'archive refused'  # halt proven, poweroff not allowed: alert
 POWEROFF_SENT = 'poweroff sent'     # provider accepted; `stopped` still required
 HALTING = (HALT_INTENT, HALT_SENT, HALT_LATE, ARCHIVE_INTENT, ARCHIVE_REFUSED)
 PHASES = (STOP_PREPARED, POWEROFF_SENT) + HALTING
+# #6080: marker of the busy request. A return found the VM in standby and the
+# server GET did not allow `poweron`; committed once, so the row ages from the
+# first refusal and host_release names the host past the stall bound.
+POWERON_REFUSED = 'poweron refused'
+POWERON_SENT = 'poweron sent'
 
 
 def private_json(path):
@@ -421,9 +426,13 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             # local volume (use-standby-mode.mdx): power on when the server
             # GET allows it; claims still wait for running, health, reconcile.
             if 'poweron' not in provider.allowed(target):
+                if request.get('result') != POWERON_REFUSED:
+                    q.finish(request, 'pending', POWERON_REFUSED)
                 return 'poweron not allowed'
             q.started(host)
             provider.action(target, 'poweron')
+            if request.get('result') == POWERON_REFUSED:
+                q.finish(request, 'pending', POWERON_SENT)
             return 'starting'
         if state == 'stopped':
             if observed['off_ts'] is None or now - observed['off_ts'] < policy['min_off_s']:
