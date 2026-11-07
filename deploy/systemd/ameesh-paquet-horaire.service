@@ -45,7 +45,11 @@ EnvironmentFile=-%h/.config/ameesh/release.env
 EnvironmentFile=%h/.config/ameesh/paquet-horaire.env
 # Fatal (#3845, revue cx2) : un clone qui n'avance pas n'a pas de tic ; le
 # script revérifie aussi que sa tête est celle de origin/<cible>.
-ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --tags --force --quiet origin ${AMEESH_PAQUET_TARGET}
+# #6128 : `fetch` puis `merge --ff-only` sur la référence nommée, jamais
+# `pull` — un fetch concurrent (recomposition pilote) laisse deux têtes dans
+# FETCH_HEAD et `pull` meurt sur « Cannot fast-forward to multiple branches ».
+ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} fetch --tags --force --quiet origin ${AMEESH_PAQUET_TARGET}
+ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} merge --ff-only --quiet origin/${AMEESH_PAQUET_TARGET}
 # #4473 : le script ET sa bibliothèque `ameesh` viennent du clone ; le venv
 # installé ne fournit que l'interpréteur (et la porte `role run`).
 ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run mesh-design -- \
