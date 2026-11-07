@@ -43,6 +43,10 @@ La même alerte part sans attendre (#6074, motif `halt_deadline`,
 l'OS n'est pas prouvé à l'échéance, quand l'archivage n'est pas permis, quand
 la VM est `locked`, ou quand elle est en veille sans intention halt de la
 vague.
+Un retour bloqué en veille (#6080, motif `poweron_refused`) alerte une fois
+passé `host_release_adapter_stall` depuis le premier refus : `allowed_actions`
+ne permet pas `poweron` (ou manque). La VM n'est pas démarrée, les claims
+restent fermés ; dès que `poweron` est permis, le démarrage reprend.
 
 Un seul hôte opérateur, externe aux VM qu'il gère, exécute le timer. Son
 inscription privée fixe les UUID VM/projet et la zone ; aucune identité,
@@ -86,9 +90,9 @@ alerte qui nomme l'hôte et la génération, aucun poweroff, jamais `lost`. Une
 preuve qui arrive après l'échéance reste valable. Un `stopped in place` sans
 intention halt de la vague est une anomalie : il est alerté et jamais archivé
 automatiquement. Un retour demandé pendant ces phases passe par la demande
-`busy` : depuis la veille, `poweron` part si `allowed_actions` le permet,
-puis running, relevé frais, santé et réconciliation, comme tout réveil. Une
-interruption se relit depuis le dernier marqueur, et le GET fournisseur
+`busy` : depuis la veille, `poweron` part si `allowed_actions` le permet
+(sinon alerte `poweron_refused` après la borne de blocage), puis running,
+relevé frais, santé et réconciliation, comme tout réveil. Une interruption se relit depuis le dernier marqueur, et le GET fournisseur
 précède toute action.
 
 Jamais `stop_in_place` par l'API, ni suppression, redimensionnement ou

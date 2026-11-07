@@ -37,6 +37,7 @@ class EnrollmentTest(unittest.TestCase):
         self.assertEqual(set(host_release.ADAPTER_HALTING), set(vm.HALTING))
         self.assertLessEqual(set(host_release.ADAPTER_AGING), set(vm.PHASES))
         self.assertLessEqual(set(host_release.ADAPTER_IMMEDIATE), set(vm.HALTING))
+        self.assertEqual(host_release.ADAPTER_POWERON_REFUSED, vm.POWERON_REFUSED)
 
     def test_provider_reads_standby_spelling_and_allowed_actions(self):
         def api(server):
@@ -258,6 +259,34 @@ class HaltTest(PgTestCase):
         with FRESH:
             self.assertEqual(self.tick(), 'probe admitted')
         self.assertFalse(self.q.control('burst')['claims_open'])
+
+    def test_return_blocked_in_standby_alerts_past_the_stall_bound(self):
+        # #6080: standby, return due, `poweron` not allowed (or the field is
+        # absent): never silent, the host is named, claims stay closed.
+        self.halt_sent()
+        self.q.return_intent('burst')
+        self.provider.state.return_value = 'stopped in place'
+        self.provider.allowed.return_value = set()
+        busy = lambda: self.db.query("SELECT * FROM vm_adapter_requests "
+                                     "WHERE state='busy'")[0]
+        self.assertEqual(self.tick(), 'poweron not allowed')
+        self.assertEqual(busy()['result'], 'poweron refused')
+        self.assertEqual(self.alerts(), [])
+        self.age(901)
+        for _ in range(3):
+            self.assertEqual(self.tick(), 'poweron not allowed')
+        self.provider.action.assert_not_called()
+        # The refusal is not re-committed: the row keeps aging.
+        self.assertEqual(self.alerts(), [('host_release_adapter_stalled', 'poweron_refused',
+                                          'burst', busy()['generation'])])
+        self.assertFalse(self.q.control('burst')['claims_open'])
+        # Allowed again: normal start, the marker is replaced, alert gone.
+        self.provider.allowed.return_value = {'poweron'}
+        self.assertEqual(self.tick(), 'starting')
+        self.provider.action.assert_called_once_with(TARGET, 'poweron')
+        self.assertEqual(busy()['result'], 'poweron sent')
+        self.assertFalse(self.q.control('burst')['claims_open'])
+        self.assertEqual(self.alerts(), [])
 
     def test_stopped_in_place_without_halt_intent_is_alerted_not_archived(self):
         self.assertEqual(self.tick(), 'stop prepared')
