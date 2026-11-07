@@ -238,7 +238,13 @@ COMMENT_MARKER = r'''
 def _annotated(argv):
     if not (os.environ.get("AGENT_MAIL_NAME") and os.environ.get("AMEESH_TURN_ID")):
         return argv
-    if len(argv) < 2 or argv[0] not in ("issue", "pr") or argv[1] != "comment":
+    if len(argv) < 2 or argv[0] not in ("issue", "pr"):
+        return argv
+    if argv[1] in ("close", "reopen"):
+        closing = True
+    elif argv[1] == "comment":
+        closing = False
+    else:
         return argv
     if "--delete-last" in argv:
         return argv
@@ -256,6 +262,25 @@ def _annotated(argv):
         with open(path, encoding="utf-8", errors="replace") as handle:
             return handle.read()
 
+    if closing:
+        # #6103 : `close`/`reopen --comment` pose aussi un commentaire du
+        # ticket ; sans marqueur, la veille GitHub le lisait comme une entrée
+        # externe (escalade #196831).
+        for index, arg in enumerate(argv):
+            if arg in ("--comment", "-c"):
+                if index + 1 < len(argv):
+                    argv[index + 1] = annotated(argv[index + 1])
+                return argv
+            if arg.startswith("--comment="):
+                argv[index] = "--comment=" + annotated(arg[len("--comment="):])
+                return argv
+            if arg.startswith("-c") and len(arg) > 2 and not arg.startswith("--"):
+                body = arg[2:]
+                if body.startswith("="):
+                    body = body[1:]
+                argv[index] = "-c" + annotated(body)
+                return argv
+        return argv
     for index, arg in enumerate(argv):
         if arg in ("--body", "-b"):
             if index + 1 < len(argv):

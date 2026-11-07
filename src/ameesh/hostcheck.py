@@ -431,12 +431,30 @@ def runner_coverage(names: list[str], run=_systemctl, *, db=None) -> dict | None
         for scope, template in (((), RUNNER_TEMPLATE), ((SYSTEM,), SYSTEM_RUNNER_TEMPLATE)):
             if scope not in [s for s, _listing in scopes]:
                 continue
-            unit = template % name
-            state = (run(*scope, "is-enabled", unit) or "").strip().splitlines()
-            if state and state[0] in ENABLED_STATES:
-                out[name] = unit
+            for spelling in [name, *_aliases(db, name)]:
+                unit = template % spelling
+                state = (run(*scope, "is-enabled", unit) or "").strip().splitlines()
+                if state and state[0] in ENABLED_STATES:
+                    out[name] = unit
+                    break
+            if out[name]:
                 break
     return out
+
+
+def _aliases(db, name: str) -> list[str]:
+    """#6103 : les anciens noms d'un agent, ou [] (sans base, registre illisible).
+
+    `list-unit-files` ne liste pas les instances d'un modèle : une unité
+    `ameesh-runner-agent@<ancien nom>` activée avant le renommage ne se voit
+    que par `is-enabled` sous ce nom (doctor d'AG3, rapport BG #196696)."""
+    if db is None:
+        return []
+    try:
+        row = registry.get(db, name) or {}
+    except Exception:  # noqa: BLE001 - registre illisible : le nom primaire seul
+        return []
+    return [str(alias) for alias in row.get("aliases") or () if alias]
 
 
 def packet_watch_lines(cfg, run=_systemctl) -> list[str]:
