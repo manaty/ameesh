@@ -2585,7 +2585,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                       prefix=None,
                       parallel: int = DEFAULT_PARALLEL,
                       deadline: float | None = None,
-                      contract_run: TestRun | None = None) -> tuple[list[TestRun], list[int],
+                      contract_report: ContractPass | None = None) -> tuple[list[TestRun], list[int],
                                                               list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
@@ -2628,6 +2628,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     compte dans ce temps (`run_tests(wall=…)`) : à l'échéance la série est
     arrêtée, au plus `WALL_GRACE_S` après.
     """
+    contract_run = None
+    if contract_report is not None:
+        verify_contract_scope(worktree, contract_report)
+        contract_run = contract_report.run
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
     own: dict[int, list[dict]] = {}
@@ -4448,7 +4452,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                     worktree, composition, timeout=args.tests_timeout,
                     base_sha=base_sha, guard=tests_guard,
                     parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
-                    deadline=deadline, contract_run=contract_run)
+                    deadline=deadline, contract_report=contract_report)
             except CarrierSettled as settled:
                 rc = interrupted_by_carrier(args, worktree, branch, head,
                                             settled.state)

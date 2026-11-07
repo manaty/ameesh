@@ -19,7 +19,7 @@ class PublicationTest(unittest.TestCase):
     def test_contracts_precede_push_and_ci_and_report_is_reused(self):
         run = green('contrats')
         def unit_tests(**kwargs):
-            self.assertIs(kwargs['contract_run'], run)
+            self.assertIs(kwargs['contract_report'].run, run)
             return [run], [], []
         flow = Flux(self, tests=[unit_tests], compositions=[self.composition()],
                     contract_result=run)
@@ -54,10 +54,13 @@ class PublicationTest(unittest.TestCase):
     def test_local_pass_does_not_reexecute_supplied_report(self):
         run = green('contrats')
         with mock.patch.object(auto, 'contract_modules', side_effect=AssertionError('duplicate plan')), \
-                mock.patch.object(auto, 'run_tests', side_effect=AssertionError('duplicate tests')):
+                mock.patch.object(auto, 'run_tests', side_effect=AssertionError('duplicate tests')), \
+                mock.patch.object(auto, 'verify_contract_scope') as verify:
             runs, faulty, removed = auto.check_local_tests(
                 Path('.'), auto.Composition([], [], 'a' * 40), timeout=10,
-                select=lambda *_: ({}, ''), parallel=1, contract_run=run, log=lambda *_: None)
+                select=lambda *_: ({}, ''), parallel=1,
+                contract_report=auto.ContractPass('a' * 40, 'b' * 40, run), log=lambda *_: None)
+        verify.assert_called_once()
         self.assertEqual(runs, [run])
         self.assertEqual((faulty, removed), ([], []))
 
@@ -134,6 +137,17 @@ class ScopeAndBudgetTest(unittest.TestCase):
             with self.assertRaisesRegex(auto.PaquetAutoError, 'hors portée'):
                 auto.prepublication_contracts(self.repo, base='base', budget=12,
                                               expected_head='0' * 40)
+        tests.assert_not_called()
+
+    def test_a_report_from_another_tree_is_not_reused(self):
+        head, tree = auto.contract_scope(self.repo)
+        report = auto.ContractPass(head, tree, green('contrats'))
+        (self.repo / 'manifest.md').write_text('new tree')
+        self.git('commit', '-qam', 'changed after pass')
+        with mock.patch.object(auto, 'run_tests') as tests:
+            with self.assertRaisesRegex(auto.PaquetAutoError, 'hors portée'):
+                auto.check_local_tests(self.repo, auto.Composition([], [], head),
+                                       timeout=10, contract_report=report)
         tests.assert_not_called()
 
     def test_missing_slot_is_nonconclusive_and_never_runs_unisolated(self):
