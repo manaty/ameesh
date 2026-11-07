@@ -46,7 +46,11 @@ The JSON output is one object:
                              "evidence": "merged change … references the lot"}],
                "closures": [{"lot": 4172, "kind": "already_done",
                              "result": "closed", "reason": "done"}],
-               "digest": {"sent": true, "message_id": 123,
+               "digest": {"sent": true,
+                          "recipients": ["human:smichea"],
+                          "messages": [{"recipient": "human:smichea",
+                                        "message_id": 123}],
+                          "message_id": 123,
                           "recipient": "human:smichea"}}]}
 ```
 
@@ -84,10 +88,46 @@ The JSON output is one object:
 * **One digest per project.** The digest is idempotent: its body is stable
   while findings do not change, and `mail.send` deduplicates it on its
   `idempotency_key`; a periodic timer does not repeat the same message every
-  tick. It is addressed to the project's responsible WorkPackage when the canon
-  declares one, else to `notify.default_human`.
+  tick. It is addressed to the recipients declared for the project (see
+  [Recipients](#recipients) below), else to the project's responsible
+  WorkPackage when the canon declares one, else to `notify.default_human`.
 * **Bounded work.** At most 2000 open lots per project and 5000 commits are
   read per pass; git calls are bounded (`GIT_TIMEOUT`, 30 s).
+
+## Recipients
+
+The digest recipients are a **host-configuration** setting, never a value of
+the code or of a client (canon §7). The optional `coherence` block of
+`~/.config/ameesh/config.json` (or the file named by `AMEESH_CONFIG`) maps a
+project to its recipients:
+
+```json
+{
+  "coherence": {
+    "recipients": {
+      "ameesh": "human:smichea",
+      "issue-manager-agent": ["human:sebastien", "human:julian"]
+    }
+  }
+}
+```
+
+* The key is the lot's project (`work_items.app`), not its repository.
+* The value is one identity or a list of identities; an identity is
+  `human:<id>`. A bare id is read as `human:<id>`, like
+  `notify.default_human`. A project that is not named keeps the historical
+  chain: the project's responsible WorkPackage when the canon declares one,
+  else `notify.default_human`, else the only declared human.
+* A project named in the configuration wins over the WorkPackage and over
+  `notify.default_human`: routing is explicit, and no project or person name
+  is hard-coded.
+* Several recipients each receive the same digest in their own mailbox (one
+  message per human, same body); the idempotence key is per recipient, so a
+  retried pass re-sends nothing to a human already served.
+* A malformed block is **refused, not ignored**: the report's `digest.error`
+  carries the reason and no digest is sent. A typo must not route a project's
+  digest to the default human. The deterministic closures do not depend on the
+  digest's recipient and still apply.
 
 ## Periodicity
 
@@ -111,4 +151,8 @@ elected host is enough, and the digest is idempotent across ticks.
 request filed after a deletion, and a contradiction. It checks that only the
 already-done reference is closed, that the probably-done/probably-obsolete
 lots, the duplicate and the contradiction stay open, that exactly one digest is
-sent to the PO, and that a second pass sends no second digest.
+sent to the PO, and that a second pass sends no second digest. Further tests
+cover the per-project recipients (#6093): the configuration wins over the
+default human and over the responsible WorkPackage, a project it does not name
+keeps the default, several recipients each get one message, and a malformed
+block is reported without sending anything.
