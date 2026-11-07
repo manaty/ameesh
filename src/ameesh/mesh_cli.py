@@ -2220,6 +2220,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 parent_lot=args.parent_lot, footprint=footprint, impact=impact,
                 unique_ref=unique_ref,
                 composition_owner=args.composition_owner)
+            overlap = None
             try:
                 item = work.add(db, assignee=args.assignee, **add_kwargs)
             except storage.FootprintOverlap as exc:
@@ -2229,17 +2230,29 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # l'attribution à un agent externe) n'a plus d'objet : le garder
                 # ferait échouer la seconde création (« --externe without
                 # assignee ») et le lot ne naîtrait pas du tout.
+                overlap = exc
                 add_kwargs["externe"] = False
                 item = work.add(db, assignee=None, **add_kwargs)
                 # le lot est libre : l'attribution de la tentative refusée ne
                 # doit plus s'afficher (`_print_assignment` plus bas).
                 check = None
-                print("warning: created unassigned: %s"
-                      % work_footprints.refusal(item["id"], exc.overlaps,
-                                                cap=getattr(exc, "cap", None),
-                                                in_flight=getattr(exc, "in_flight", None)),
-                      file=sys.stderr)
             args.created_item = item
+            if item.get("existing"):
+                # B/P2 ameesh-cx2 (#6090) : un premier appel concurrent a gagné
+                # entre la prélecture et l'écriture. Le magasin rend le gagnant ;
+                # aucun effet de création (planification, référence, empreinte,
+                # attribution) ne doit s'appliquer, et le texte ne doit pas dire
+                # « created ».
+                print(('%s #%d already exists (unique-ref %s, %s): %s')
+                      % (v.noun, int(item["id"]), unique_ref,
+                         item.get("state") or "?", item.get("title") or ""))
+                return 0
+            if overlap is not None:
+                print("warning: created unassigned: %s"
+                      % work_footprints.refusal(item["id"], overlap.overlaps,
+                                                cap=getattr(overlap, "cap", None),
+                                                in_flight=getattr(overlap, "in_flight", None)),
+                      file=sys.stderr)
             print(('%s #%d created in %s: %s%s%s%s') % (v.noun, item["id"], item["state"], item["title"], " (plan: %s)" % item["package_id"] if item.get("package_id") else "", " (priority %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
                 if item.get("priority") else "", " — estimated %s" % estimates.label(minutes) if minutes else ""))
             if item.get("external_executor"):

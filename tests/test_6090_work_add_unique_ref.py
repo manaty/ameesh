@@ -15,11 +15,13 @@ N-1 (sans la colonne) qui reste lisible et ne bloque pas une clé neuve.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import threading
 from unittest import mock
 
-from ameesh import work
+from ameesh import lot_schedule, mesh_cli, work
 from ameesh.db import DbError
 
 from .test_l119_backlog import _Base
@@ -212,6 +214,34 @@ class UniqueRefCliTest(_Base):
         created = self.mesh_add()
         self.assertEqual(created.returncode, 0, created.stderr)
         self.assertTrue(json.loads(created.stdout)["created"])
+
+    def test_the_cli_loser_of_the_race_returns_the_winner_without_planning(self):
+        """B/P2 ameesh-cx2 : la prélecture du CLI perd la course, `work.add`
+        rend le gagnant sous le verrou ; le CLI doit s'arrêter là, sans dire
+        « created » ni planifier le lot existant."""
+        winner = work.add(self.db, title="gagnant", app="t6090",
+                          actor="human:proprio", unique_ref=KEY)
+        args = mesh_cli.build_parser().parse_args([
+            "work", "add", "--title", "perdant", "--app", "t6090",
+            "--new-project", "--actor", "human:proprio",
+            "--unique-ref", KEY])
+        db = self.connect()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh_cli, "_open", return_value=db), \
+                mock.patch.object(mesh_cli, "_work_actor"), \
+                mock.patch.object(work, "existing_by_unique_ref", return_value=None), \
+                mock.patch.object(lot_schedule, "schedule_new") as scheduled, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = mesh_cli.cmd_work(self.cfg, args)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("already exists", out.getvalue())
+        self.assertNotIn("created in", out.getvalue())
+        scheduled.assert_not_called()
+        self.assertTrue(args.created_item.get("existing"))
+        self.assertEqual(args.created_item["id"], winner["id"])
+        rows = self.db.query("SELECT planned_start FROM work_items WHERE id = %s",
+                            (winner["id"],))
+        self.assertIsNone(rows[0]["planned_start"])
 
     def test_work_show_exposes_the_key(self):
         lot_id = json.loads(self.mesh_add().stdout)["lot"]["id"]
