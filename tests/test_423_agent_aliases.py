@@ -235,6 +235,21 @@ class AgentAliasTest(PgTestCase):
         self.assertTrue(self.db.query(
             "SELECT 1 FROM agent_name_resolutions WHERE operation='systemd.runner'"))
 
+    def test_enabled_instance_under_an_alias_covers_the_primary(self):
+        # #6103 : `list-unit-files` ne liste que le modèle (`indirect`) ;
+        # l'instance activée sous l'ancien nom ne se voit que par is-enabled.
+        from ameesh import hostcheck
+        commands = {
+            ('list-unit-files', '--type=service', '--no-legend', '--plain'):
+                'ameesh-runner-agent@.service indirect enabled\n',
+            ('is-enabled', 'ameesh-runner-agent@old-worker.service'): 'enabled\n',
+        }
+        coverage = hostcheck.runner_coverage(
+            ['worker', 'reviewer'], db=self.db,
+            run=lambda *args: commands.get(args, 'disabled\n'))
+        self.assertEqual(coverage, {'worker': 'ameesh-runner-agent@old-worker.service',
+                                    'reviewer': None})
+
     def test_register_alias_keeps_worktree_marker_in_primary_state(self):
         import subprocess
         from pathlib import Path

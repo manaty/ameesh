@@ -377,6 +377,24 @@ class MarqueurCommentaireTest(Base):
                 self.assertIn("<!-- ameesh:work-stage:v1 lot=2848 event=manual -->",
                               sortie.stdout)
 
+    def test_close_et_reopen_avec_commentaire_marques(self):
+        # #6103 : `gh pr close --comment` d'un tour revenait comme entrée
+        # externe à la veille GitHub (escalade #196831).
+        env, _ = self.env_tour(agent="dev-x", lot="2848")
+        for args in (("pr", "close", "7", "--comment", "Remplacé"),
+                     ("issue", "close", "12", "-c", "Remplacé"),
+                     ("pr", "reopen", "7", "--comment=Remplacé"),
+                     ("issue", "reopen", "12", "-cRemplacé")):
+            with self.subTest(args=args):
+                sortie = self.lancer(env, *args)
+                self.assertEqual(sortie.returncode, 3)
+                self.assertIn("Remplacé", sortie.stdout)
+                self.assertEqual(sortie.stdout.count("<!-- ameesh:"), 1)
+                self.assertIn("<!-- ameesh:work-stage:v1 lot=2848 event=manual -->",
+                              sortie.stdout)
+        sortie = self.lancer(env, "pr", "close", "7")
+        self.assertNotIn("<!-- ameesh:", sortie.stdout)
+
     def test_marqueur_existant_preserve(self):
         env, _ = self.env_tour(lot="2848")
         body = "Done\n\n<!-- ameesh:work-stage:v1 lot=2848 event=freeze -->"
