@@ -166,6 +166,7 @@ from __future__ import annotations
 from ameesh import work_lifecycle as lifecycle
 
 from .conversations import Conversations
+from .external_executors import SYSTEM_PREFIX, ExternalExecutors
 from .provenance import Provenance
 from .work_dependencies import WorkDependencies
 from .work_footprints import WorkFootprints
@@ -2005,6 +2006,17 @@ class RepositoryCapReached(FootprintOverlap):
         self.overlaps = []
         RuntimeError.__init__(self, "repository in-flight cap reached (%d/%d)"
                               % (self.in_flight, self.cap))
+
+
+class ExternalExecutorUnavailable(RuntimeError):
+    """#6091 : la déclaration `system:…` a été retirée (ou a disparu) entre la
+    lecture et l'écriture de la réservation. Le contrôle actif et l'écriture
+    sont sérialisés avec `retire` par un verrou de ligne ; ce refus dit que le
+    retrait a gagné la course et que **rien n'a été écrit**."""
+
+    def __init__(self, name: str):
+        self.name = str(name)
+        super().__init__("external executor %s is retired or unknown" % self.name)
 
 
 class BasketEstimateRequired(RuntimeError):
@@ -5986,6 +5998,7 @@ class Storage(abc.ABC):
     approvals: Approvals
     nonces: Nonces
     work: WorkItems
+    external_executors: ExternalExecutors
     work_dependencies: WorkDependencies
     work_footprints: WorkFootprints
     provenance: Provenance
