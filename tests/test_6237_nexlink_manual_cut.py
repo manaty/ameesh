@@ -4,7 +4,9 @@
 07/11: rel-01 tagged release-11aw on fb68c58db for the 22:00Z slot; develop
 then moved to 3f6b7c618, so the base of the 23:28Z tick was not tagged and
 #6152's exact-base proof missed it: the tick froze 11ax for the same slot.
-A version newer than the last one the state recorded is that manual cutoff.
+The first tick of the hour before a cutoff records the published versions;
+a version that appears afterwards was posted for that slot. Version order
+alone proves nothing: an off-slot fix is newer too (review B/P2 #6237).
 """
 import os
 import subprocess
@@ -17,159 +19,149 @@ from unittest import mock
 from ameesh import nexlink_release as nx, release_cutoff as rc
 
 
-class CutSinceTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
-        self.addCleanup(self.temp.cleanup)
-        self.remote = Path(self.temp.name) / "remote.git"
-        subprocess.check_output(["git", "init", "-q", "--bare", str(self.remote)])
-        self.repo = Path(self.temp.name) / "repo"
-        self.repo.mkdir()
-        self.git("init", "-q", "-b", "develop")
-        self.git("config", "user.name", "test")
-        self.git("config", "user.email", "test@localhost")
-        self.git("remote", "add", "origin", str(self.remote))
-        self.project = rc.ProjectRelease("nexlink", str(self.repo), target="develop",
-                                         model="nexlink")
-
-    def git(self, *args):
-        return subprocess.check_output(["git", "-C", str(self.repo), *args], text=True,
-                                       stderr=subprocess.STDOUT).strip()
-
-    def commit(self, name):
-        (self.repo / name).write_text(name)
-        self.git("add", ".")
-        self.git("commit", "-qm", name)
-        return self.git("rev-parse", "HEAD")
-
-    def tag(self, version, sha):
-        self.git("tag", "release-" + version, sha)
-        self.git("push", "-q", "origin", "refs/tags/release-" + version)
-
-    def test_manual_tag_then_develop_moves_is_a_cut(self):
-        """Witness: manual cut, develop moves on, the tick's base is untagged."""
-        self.tag("11av", self.commit("previous"))
-        manual = self.commit("fb68c58db")
-        self.tag("11aw", manual)
-        moved = self.commit("3f6b7c618")
-        self.git("push", "-q", "origin", "develop")
-        self.assertIsNone(nx.already_cut(self.project, moved, manual))
-        self.assertEqual(nx.cut_since(self.project, "11av"), "11aw")
-
-    def test_nothing_newer_than_the_record_is_not_a_cut(self):
-        self.tag("11av", self.commit("previous"))
-        self.commit("fresh")
-        self.assertIsNone(nx.cut_since(self.project, "11av"))
-        # A frozen version abandoned before its tag (reused next time).
-        self.assertIsNone(nx.cut_since(self.project, "11aw"))
-
-    def test_no_record_infers_nothing(self):
-        self.tag("11aw", self.commit("manual"))
-        self.assertIsNone(nx.cut_since(self.project, None))
-        self.assertIsNone(nx.cut_since(self.project, "not a version"))
+HOUR = 3600.0
+C1, C2 = 10 * HOUR, 22 * HOUR
 
 
-class ExecuteTests(unittest.TestCase):
+class Rules:
+    """Two cutoffs a day, at C1 and C2 (mod 24 h)."""
+
+    def cutoff(self, now):
+        day = (now // (24 * HOUR)) * 24 * HOUR
+        for at in (day + C2, day + C1):
+            if at <= now:
+                return at
+        return day - 24 * HOUR + C2
+
+
+class Remote:
+    """A remote whose published versions the test changes over time."""
+
+    def __init__(self, *versions):
+        self.versions = {value: "1" * 40 for value in versions}
+
+    def tag(self, value):
+        self.versions[value] = "2" * 40
+
+    def __call__(self, project):
+        return dict(self.versions)
+
+
+class TickTests(unittest.TestCase):
+    """Real ticks over a day: record, manual tag, develop moves, due tick."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
         self.addCleanup(self.temp.cleanup)
         self.cfg = types.SimpleNamespace(state_dir=self.temp.name, host="h")
         self.project = rc.ProjectRelease("nexlink", "/unused", target="develop",
                                          github="acme/nexlink", model="nexlink")
-        for name, value in (("compiled_rules", (object(), types.SimpleNamespace(commit="d" * 40))),
-                            ("cutoff_slot", (1000, "23:00")),
-                            ("due", {"missed": False}),
+        self.remote = Remote("11av")
+        label = lambda rules, now: (Rules().cutoff(now), "x")
+        for name, value in (("compiled_rules", (Rules(), types.SimpleNamespace(commit="d" * 40))),
                             ("fetch", None),
                             ("send_report", {}),
                             ("write_report", "/tmp/report.json")):
             patcher = mock.patch.object(rc, name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        for name, value in (("snapshot", ("b" * 40, "c" * 40, "a" * 40, {}, None)),
-                            ("previous_release", "a" * 40),
-                            ("tagged_at", set()),
-                            ("drop_abandoned", None)):
-            patcher = mock.patch.object(nx, name, return_value=value)
+        for target, name, kwargs in (
+                (rc, "cutoff_slot", dict(side_effect=label)),
+                (rc, "due", dict(side_effect=self.due)),
+                (nx, "release_tags", dict(side_effect=self.remote)),
+                # develop moved past the manual tag: the tick's base is untagged
+                (nx, "snapshot", dict(return_value=("b" * 40, "c" * 40, "a" * 40, {}, None))),
+                (nx, "previous_release", dict(return_value="a" * 40)),
+                (nx, "tagged_at", dict(return_value=set())),
+                (nx, "drop_abandoned", dict(return_value=None)),
+                (nx, "branches", dict(side_effect=self.remote)),
+                (nx, "ensure_ref", dict(return_value=None)),
+                (nx, "ci_plan", dict(return_value={"parts": [{"workflow": "w.yml"}],
+                                                   "max_inflight": 2})),
+                (nx, "workflow_step", dict(return_value=False)),
+                (rc, "same_tree", dict(return_value=False))):
+            patcher = mock.patch.object(target, name, **kwargs)
             patcher.start()
             self.addCleanup(patcher.stop)
+        merge = mock.patch.object(nx, "merge_candidate", return_value="e" * 40)
+        self.merge = merge.start()
+        self.addCleanup(merge.stop)
 
-    def save_slot(self, **slot):
-        rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {"nexlink": slot}})
+    @staticmethod
+    def due(rules, now, slot, window):
+        at = Rules().cutoff(now)
+        if float(slot.get("last_cutoff") or 0) >= at or now - at > window:
+            return None
+        return {"missed": False}
+
+    def tick(self, now):
+        return nx.execute(self.cfg, object(), self.project, now=now)
 
     def slot(self):
         return rc.load_state(self.cfg)["projects"]["nexlink"]
 
-    def cut(self, known):
-        with mock.patch.object(nx, "branches", return_value=known), \
-                mock.patch.object(nx, "merge_candidate", return_value="e" * 40) as merge, \
-                mock.patch.object(nx, "ensure_ref") as ensure, \
-                mock.patch.object(nx, "ci_plan",
-                                  return_value={"parts": [{"workflow": "backend-suite.yml"}],
-                                                "max_inflight": 2}), \
-                mock.patch.object(nx, "workflow_step", return_value=False), \
-                mock.patch.object(nx, "publish") as publish, \
-                mock.patch.object(rc, "same_tree", return_value=False):
-            report = nx.execute(self.cfg, object(), self.project, now=1000)
-        return report, merge, ensure, publish
-
-    def test_manual_cut_since_the_last_slot_skips_the_slot(self):
-        """The real 11ax: 11av recorded, 11aw tagged by hand on an older commit."""
-        self.save_slot(last_cutoff=500, last_result="released", release_seen="11av")
-        report, merge, ensure, publish = self.cut({"11av": "1" * 40, "11aw": "2" * 40})
+    def test_manual_cut_for_the_slot_then_develop_moves_skips_it(self):
+        """Witness: the real 11aw (22:00Z slot), then 3f6b7c618, then the tick."""
+        self.tick(C2 - 50 * 60)          # the record of the 22:00 slot
+        self.assertEqual(self.slot()["manual_watch"],
+                         {"cutoff_at": C2, "versions": ["11av"]})
+        self.remote.tag("11aw")          # rel-01, by hand, for this slot
+        report = self.tick(C2 + 60)
         self.assertEqual(report["result"], "skipped")
         self.assertEqual(report["version"], "11aw")
-        self.assertEqual(report["tag"], "release-11aw")
         self.assertIn("déjà coupé à la main en release-11aw", report["message"])
-        merge.assert_not_called()
-        ensure.assert_not_called()
-        publish.assert_not_called()
-        slot = self.slot()
-        self.assertEqual(slot["last_result"], "skipped")
-        self.assertEqual(slot["last_cutoff"], 1000)
-        self.assertEqual(slot["release_seen"], "11aw")
-        self.assertNotIn("pending_nexlink", slot)
-        self.assertFalse(rc.send_report.call_args.kwargs["urgent"])
+        self.merge.assert_not_called()
+        self.assertEqual(self.slot()["last_result"], "skipped")
+        self.assertNotIn("pending_nexlink", self.slot())
 
-    def test_next_slot_after_the_manual_cut_cuts_normally(self):
-        self.save_slot(last_cutoff=500, last_result="skipped", release_seen="11aw")
-        report, merge, _, _ = self.cut({"11av": "1" * 40, "11aw": "2" * 40})
+    def test_manual_cut_of_the_previous_slot_does_not_skip_the_next(self):
+        """B/P2: 10:00 slot recorded 11av; 11aw by hand, then develop moves."""
+        self.tick(C1 - 30 * 60)
+        self.remote.tag("11aw")          # manual cut for 10:00 (before its tick)
+        self.assertEqual(self.tick(C1 + 60)["result"], "skipped")
+        self.remote.tag("11ax")          # off-slot fix at 15:00
+        self.tick(C2 - 40 * 60)          # the 22:00 record sees 11aw and 11ax
+        report = self.tick(C2 + 60)
+        self.assertEqual(report["result"], "waiting-ci")
+        self.assertEqual(report["version"], "11ay")
+        self.merge.assert_called_once()
+
+    def test_without_a_record_the_slot_cuts(self):
+        """A host that did not tick before the cutoff infers nothing."""
+        self.remote.tag("11aw")
+        report = self.tick(C2 + 60)
+        self.assertEqual(report["version"], "11ax")
+        self.merge.assert_called_once()
+
+    def test_the_engine_publication_is_not_a_manual_cut(self):
+        """A pending of the previous slot published inside the next record."""
+        self.tick(C1 + 60)               # freezes 11aw for 10:00, CI pending
+        self.tick(C2 - 30 * 60)          # record of 22:00 (11aw not yet tagged)
+        with mock.patch.object(nx, "workflow_step", return_value=True), \
+                mock.patch.object(nx, "migration_gate", return_value={}), \
+                mock.patch.object(nx, "publish",
+                                  side_effect=lambda project, pending:
+                                  self.remote.tag(pending["version"])):
+            self.assertEqual(self.tick(C2 - 20 * 60)["result"], "released")
+        self.assertIn("11aw", self.slot()["manual_watch"]["versions"])
+        report = self.tick(C2 + 60)
         self.assertEqual(report["result"], "waiting-ci")
         self.assertEqual(report["version"], "11ax")
-        merge.assert_called_once()
-        self.assertEqual(self.slot()["release_seen"], "11ax")
 
-    def test_without_record_the_slot_cuts_and_records(self):
-        self.save_slot(last_cutoff=500, last_result="released")
-        report, merge, _, _ = self.cut({"11aw": "2" * 40})
-        self.assertEqual(report["version"], "11ax")
-        merge.assert_called_once()
-        self.assertEqual(self.slot()["release_seen"], "11ax")
+    def test_the_record_is_taken_once_per_slot(self):
+        self.tick(C2 - 50 * 60)
+        self.remote.tag("11aw")
+        self.tick(C2 - 10 * 60)
+        self.assertEqual(self.slot()["manual_watch"]["versions"], ["11av"])
 
-    def test_tagged_base_still_wins_over_the_record(self):
+    def test_tagged_base_still_wins(self):
         """#6152 unchanged: the exact base names its own version."""
-        self.save_slot(last_cutoff=500, last_result="released", release_seen="11av")
-        with mock.patch.object(nx, "tagged_at", return_value={"11aw"}):
-            report, merge, _, _ = self.cut({"11av": "1" * 40, "11aw": "c" * 40})
-        self.assertEqual(report["version"], "11aw")
-        self.assertIn("tête déjà coupée en release-11aw", report["message"])
-        merge.assert_not_called()
-
-    def test_missed_slot_forgets_the_record(self):
-        """A manual remedy tag for a missed slot is not the next slot's cut."""
-        self.save_slot(last_cutoff=500, last_result="released", release_seen="11av")
-        with mock.patch.object(rc, "due", return_value={"missed": True}):
-            report = nx.execute(self.cfg, None, self.project, now=1000)
-        self.assertEqual(report["result"], "missed")
-        self.assertNotIn("release_seen", self.slot())
-
-    def test_close_records_the_published_version(self):
-        slot = {"pending_nexlink": {}, "release_seen": "11av"}
-        pending = {"version": "11aw", "cutoff_at": 1000, "pr": None}
-        with mock.patch.object(nx, "_announce"):
-            nx._close(self.cfg, None, self.project, slot, pending, "released", lambda: None)
-        self.assertEqual(slot["release_seen"], "11aw")
-        nx._see(slot, "11av")
-        self.assertEqual(slot["release_seen"], "11aw")
+        self.tick(C2 - 50 * 60)
+        self.remote.tag("11aw")
+        with mock.patch.object(nx, "tagged_at", return_value={"11av"}):
+            report = self.tick(C2 + 60)
+        self.assertEqual(report["version"], "11av")
+        self.assertIn("tête déjà coupée en release-11av", report["message"])
 
 
 if __name__ == "__main__":
