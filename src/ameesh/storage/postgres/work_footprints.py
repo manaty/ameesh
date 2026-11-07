@@ -6,7 +6,7 @@ from ameesh import work_lifecycle as lifecycle
 
 from ..work_footprints import WorkFootprints as Contract
 from .catalog import _text_array
-from .work_dependencies import _DONE_SQL, _LOCK as _GRAPH_LOCK
+from .work_dependencies import _DONE_SQL, _LOCK as _GRAPH_LOCK, _UNPINNED
 
 #: Le préfixe de `source` d'un panier (`backlog.BASKET_PREFIX`).
 BASKET_PREFIX = "backlog-basket:"
@@ -451,3 +451,30 @@ class WorkFootprints(Contract):
             "   AND NOT " + exempt_sql("w") +
             "   AND " + occupying_sql("w") + app_filter +
             " ORDER BY w.id LIMIT %s", params + (int(limit),))
+
+    def release(self, item_id, *, state, assignee, executor, note, actor):
+        # #6092 : sous le verrou de la garde, comme la prise et l'attribution :
+        # une prise qui lit l'occupation ne croise jamais une libération à
+        # moitié écrite. CAS sur l'état, l'assigné et la réservation
+        # d'exécutant externe lus par l'appelant (B2 de cx1).
+        with self.db.transaction() as tx:
+            tx.execute(_GRAPH_LOCK)
+            rows = tx.query(
+                "UPDATE work_items SET state = %s, assignee = NULL, updated_at = now(),"
+                "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+                " WHERE id = %s AND state = %s AND assignee IS NOT DISTINCT FROM %s"
+                "   AND coalesce(btrim(to_jsonb(work_items)->>'external_executor'), '') = %s"
+                "   AND " + _UNPINNED +
+                " RETURNING id, state, assignee",
+                (lifecycle.REQUESTED, int(item_id), str(state), assignee,
+                 (executor or "").strip()))
+            if not rows:
+                return None
+            tx.execute("UPDATE work_item_delegations SET outcome = 'annulee',"
+                       " resolved_at = now(), resolved_by = %s"
+                       " WHERE work_item_id = %s AND outcome IS NULL",
+                       (actor or "", int(item_id)))
+            tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor,"
+                       " created_at) VALUES (%s, %s, %s, %s, clock_timestamp())",
+                       (int(item_id), lifecycle.REQUESTED, note, actor))
+            return dict(rows[0])

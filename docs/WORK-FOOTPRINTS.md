@@ -14,6 +14,8 @@ ameesh work footprint 212 --set src/ameesh/backlog.py docs
 ameesh work footprint 212 --set .              # the whole repository (pilot gesture)
 ameesh work footprint 212 --estimate           # rerun the impact analysis
 ameesh work footprint 212 --refresh            # refine from the branch's actual diff
+ameesh work footprint 212 --refresh --forge    # same, read at the forge (no clone needed)
+ameesh work footprint 212 --release --reason "run failed"   # stop occupying, lot stays open
 ameesh work footprint 212 --clear              # drop the estimate (diff rows stay)
 ameesh work footprint 212 --clear-diff         # drop wrong diff rows (pilot gesture)
 ```
@@ -48,6 +50,14 @@ The footprint is the union of three sources (`work_item_footprints`, 0502):
   commit, no ref moved; a mute forge falls back to the clone's ref) and says
   when the base is only the clone's last fetch, instead of passing it for the
   target of the day.
+  Without a local clone of the repository (an external executor, a host
+  without the checkout), or with `--forge`, `--refresh` reads the diff at the
+  forge (#6092): `repos/<repo>/compare/<target>...<branch>`, the same
+  three-dot semantics, with a renamed file counting both paths. The repository
+  is the lot's (`issue_ref`, else the project's `github.projects`), the target
+  its `branch_target`, else the project's, else the forge's default branch;
+  the base is fresh by construction. A list the forge truncates (300 files)
+  is refused rather than written short: refresh it from a clone (`--repo`).
 
 Without a local clone, a bare file name cited at intake (`foo.py`) stays at the
 repository root and may be narrower than the real path (`src/foo.py`):
@@ -183,6 +193,15 @@ A lot **occupies** its footprint from the moment it is assigned or started
 until it is merged, promoted or closed: `build`, `qa`, `waiting_human` and
 `blocked` lots occupy it, and so does a `build` lot returned to the queue
 (its branch exists).
+
+After a failed run, `--release` frees the occupation **without closing the
+lot** (#6092): an `intake`, `build` or `blocked` lot goes back to `intake`
+without assignee (and its pending delegation is cancelled), under the guard's
+lock, compare-and-set on the state and assignee read. Branch, milestones,
+footprint rows and the external-executor reservation (#3447) stay; the lot is
+taken again by the usual gesture. Allowed to the assignee, the reserved
+external executor, a human or a pilot; a lot under review (`qa`) is refused,
+and a lot that occupies nothing is left untouched (idempotent).
 
 An `intake` lot whose footprint overlaps an occupying lot of the same
 repository, or whose repository has reached its in-flight cap:
