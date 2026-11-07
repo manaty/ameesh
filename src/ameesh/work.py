@@ -1675,8 +1675,8 @@ def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
 
 #: préfixe d'un assigné humain : un lot qui attend un humain n'a rien à réveiller
 HUMAN_PREFIX = "human:"
-#: #6091 : préfixe d'un exécutant externe NON-AGENT déclaré (le serveur IMA,
-#: par exemple) : jamais réveillé, jamais assignable, un responsable humain.
+#: #6091 : préfixe d'un exécutant externe NON-AGENT déclaré (un serveur
+#: externe, par exemple) : jamais réveillé, jamais assignable, un responsable humain.
 #: La constante vit avec le stockage, seul lecteur de la déclaration.
 SYSTEM_PREFIX = interface.SYSTEM_PREFIX
 #: #6091 : forme du suffixe d'un `system:…` — celle d'un nom d'agent
@@ -2153,7 +2153,7 @@ def check_external_executor(db: Db, executor: str, *, cfg=None) -> str:
     (l'agent externe ne se réveille pas, 0030), mais il porte le nom de celui
     qui doit le faire — le bureau (`mode=externe` avec un responsable humain),
     un humain (`human:…`, nom nu connu normalisé comme pour l'assignation), ou
-    un système non-agent déclaré (`system:…`, #6091 : le serveur IMA, jamais
+    un système non-agent déclaré (`system:…`, #6091 : un serveur externe, jamais
     réveillé, jamais assignable, avec son responsable humain).
 
     Un agent `execute` est refusé : il s'attribue (`work assign`), il ne se

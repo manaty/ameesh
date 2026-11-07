@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- 0554_external_executors — #6091 (manaty/ameesh#4642, écart 4) : un
--- exécutant externe non-agent (un système, par exemple le serveur IMA) se
+-- exécutant externe non-agent (un système, par exemple un serveur externe) se
 -- déclare avec son responsable humain.
 --
 -- #3447 nomme l'exécutant externe d'un lot dans `work_items.external_executor`
@@ -38,7 +38,7 @@ CREATE TABLE external_executors (
 );
 
 COMMENT ON TABLE external_executors IS
-    '#6091: declared non-agent external executors (systems such as the IMA server) with their human responsible; never an agent, never woken, never assignable.';
+    '#6091: declared non-agent external executors (systems such as an external server) with their human responsible; never an agent, never woken, never assignable.';
 COMMENT ON COLUMN external_executors.name IS
     '#6091: qualified `system:<name>`; the value carried by work_items.external_executor.';
 COMMENT ON COLUMN external_executors.responsible IS

@@ -21,7 +21,7 @@
   agent-mesh work wake <id> --at ISO | --in DURATION | --cancel   scheduled wake, even under hold (#2466)
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
   agent-mesh work external-executor <id> <agent> | --clear   reserve a {work} to an external executor (#3447)
-  agent-mesh work external-executor --declare system:ima --responsible human:H | --list | --retire system:ima   declare a non-agent executor (#6091)
+  agent-mesh work external-executor --declare system:<nom> --responsible human:H | --list | --retire system:<nom>   declare a non-agent executor (#6091)
   agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the {work}'s migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
@@ -4484,7 +4484,7 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
         "external-executor",
         help=("#3447: declare the external executor a %s is reserved to (an `externe` "
              "agent with a human owner, a human, or a declared non-agent system such as "
-             "system:ima), or clear the reservation; #6091: declare/list/retire the "
+             "system:<name>), or clear the reservation; #6091: declare/list/retire the "
              "non-agent systems") % v.noun)
     pw_executor.add_argument("id", type=int, nargs="?", default=None)
     pw_executor.add_argument("agent", nargs="?", default=None,
