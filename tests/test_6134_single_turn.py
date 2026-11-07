@@ -15,6 +15,9 @@ Deux gardes :
 * un réveil armé par une note `hold:` appartient au plan de cette retenue : si
   elle est levée avant l'échéance, l'exécuteur annule le réveil (ligne
   `wake: cancelled …`) au lieu de réveiller une session sur un plan abandonné.
+  L'annulation est un CAS (échéance, armement, claim **vivant**) : un claim
+  expiré est une livraison abandonnée et ne bloque pas l'effacement, sans quoi
+  le réveil serait relu et refusé à chaque passage, sans fin (#6134 B/P2).
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ import os
 import time
 import unittest
 
-from ameesh import registry, work
+from ameesh import registry, storage, work
 from ameesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase
@@ -156,6 +159,65 @@ class WakeAfterLiftTest(_Base):
                                    expect=old, arm_id=arm_id),
                 "le réarmement concurrent n'est pas écrasé")
             self.assertAlmostEqual(work.get(self.db, lot)["wake_ts"], before, delta=2)
+            self.assertFalse(any(note.startswith("wake: cancelled")
+                                 for note in self._notes(lot)))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_an_expired_claim_does_not_block_the_cancellation(self):
+        """B/P2 : un claim expiré est une livraison abandonnée, pas un détenteur.
+
+        Réveil réclamé puis lancement abandonné (ou runner interrompu), hold
+        levé : sans la distinction vivant/expiré, `due_wakes` rend le réveil,
+        l'annulation refuse d'écrire (claim non nul) et la boucle se répète
+        sans fin."""
+        worker = self._worker("w5")
+        try:
+            lot = self._lot(worker)
+            old = time.time() - 1
+            work.note(self.db, lot, "hold: attendre le paquet 452", actor="w5",
+                      wake_ts=old)
+            work.note(self.db, lot, "unhold: le paquet 452 est fusionné",
+                      actor="human:owner")
+            self.assertIsNotNone(
+                storage.of(self.db).lot_sessions.claim_wake(
+                    worker.name, lot, time.time(), worker.WAKE_CLAIM_TTL),
+                "le réveil est d'abord réclamé par une livraison")
+            self.db.execute(
+                "UPDATE work_items SET wake_claim_at ="
+                " clock_timestamp() - make_interval(secs => %s) WHERE id = %s",
+                (worker.WAKE_CLAIM_TTL * 2.5, lot))
+            worker._scheduled_wake_checked = float("-inf")
+            self.assertIsNone(worker._scheduled_wake_spec())
+            self.assertIsNone(work.get(self.db, lot)["wake_ts"],
+                              "le claim expiré n'empêche pas l'annulation")
+            self.assertTrue(any(note.startswith("wake: cancelled")
+                                for note in self._notes(lot)),
+                            "l'annulation est nommée au journal du lot")
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_a_live_claim_still_blocks_the_cancellation(self):
+        """B/P2 : entre la lecture et le CAS, une livraison vivante est gardée."""
+        worker = self._worker("w6")
+        try:
+            lot = self._lot(worker)
+            old = time.time() - 1
+            work.note(self.db, lot, "hold: attendre", actor="w6", wake_ts=old)
+            work.note(self.db, lot, "unhold: lever", actor="human:owner")
+            reason, arm_id = worker._wake_abandoned_by_lift(lot)
+            self.assertTrue(reason)
+            self.assertIsNotNone(
+                storage.of(self.db).lot_sessions.claim_wake(
+                    worker.name, lot, time.time(), worker.WAKE_CLAIM_TTL),
+                "un autre passage réclame le réveil entre la lecture et le CAS")
+            self.assertIsNone(
+                work.schedule_wake(self.db, lot, None, text=reason, actor="ameesh",
+                                   expect=old, arm_id=arm_id,
+                                   claim_ttl=worker.WAKE_CLAIM_TTL),
+                "le claim vivant n'est pas écrasé par l'annulation")
+            self.assertAlmostEqual(work.get(self.db, lot)["wake_ts"], old, delta=2,
+                                   msg="l'échéance réclamée reste armée")
             self.assertFalse(any(note.startswith("wake: cancelled")
                                  for note in self._notes(lot)))
         finally:

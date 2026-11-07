@@ -4821,7 +4821,8 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
 def schedule_wake(db: Db, item_id: int, wake_ts: float | None, *,
                   text: str = "", actor: str = "",
                   expect: float | None = None,
-                  arm_id: int | None = None) -> dict | None:
+                  arm_id: int | None = None,
+                  claim_ttl: float | None = None) -> dict | None:
     """#2466 : pose ou efface le réveil programmé d'un lot ouvert.
 
     Le geste est journalisé (`wake: …`) et ne change pas la retenue d'un lot
@@ -4830,9 +4831,10 @@ def schedule_wake(db: Db, item_id: int, wake_ts: float | None, *,
     retirée quand il y en avait une.
 
     #6134 : `expect`/`arm_id` rendent l'annulation conditionnelle — le réveil
-    doit encore porter cette échéance, ne pas être réclamé, et (si `arm_id`)
-    avoir le même événement d'armement. Un réarmement concurrent n'est pas
-    écrasé ; la fonction rend alors None au lieu de lever."""
+    doit encore porter cette échéance, avoir le même événement d'armement (si
+    `arm_id`) et aucun claim **vivant** (`claim_ttl` ; un claim expiré est une
+    livraison abandonnée, pas un détenteur). Un réarmement concurrent n'est
+    pas écrasé ; la fonction rend alors None au lieu de lever."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -4850,7 +4852,8 @@ def schedule_wake(db: Db, item_id: int, wake_ts: float | None, *,
         label = "wake: " + (why or "scheduled wake")
         label += " (due %s)" % _wake_moment(float(wake_ts))
     row = storage.of(db).work.schedule_wake(item_id, wake_ts, text=label, actor=actor,
-                                           expect=expect, arm_id=arm_id)
+                                           expect=expect, arm_id=arm_id,
+                                           claim_ttl=claim_ttl)
     if row is None:
         if expect is not None:
             return None  # réarmé, réclamé ou fermé entre-temps : rien annulé

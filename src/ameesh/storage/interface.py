@@ -2670,11 +2670,20 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def schedule_wake(self, item_id: int, wake_ts: float | None, *, text: str,
-                      actor: str) -> dict | None:
+                      actor: str, expect: float | None = None,
+                      arm_id: int | None = None,
+                      claim_ttl: float | None = None) -> dict | None:
         """#2466 : pose (ou efface avec `wake_ts=None`) le réveil programmé du
         lot et journalise le geste, en une transaction ; rend le lot relu, ou
         None s'il n'existe pas ou n'est plus ouvert. Un seul réveil par lot :
-        le dernier posé remplace le précédent."""
+        le dernier posé remplace le précédent.
+
+        #6134 : avec `expect`, l'effacement est conditionnel — le réveil doit
+        encore porter cette échéance, le même événement d'armement (si
+        `arm_id`) et aucun claim **vivant** (plus jeune que `claim_ttl` ; un
+        claim expiré est une livraison abandonnée). Sinon rien n'est écrit et
+        la méthode rend None : un réarmement concurrent n'est jamais écrasé,
+        mais le réveil dû dont le claim a expiré reste annulable."""
 
     @abc.abstractmethod
     def log_review_attempt(self, item_id: int, state: str, text: str, actor: str) -> None:

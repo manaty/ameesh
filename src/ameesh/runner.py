@@ -6938,14 +6938,17 @@ class AgentWorker(threading.Thread):
                 abandon, arm_id = self._wake_abandoned_by_lift(int(row["id"]))
                 if abandon:
                     # #6134 : le réveil ne part pas ; l'échéance inspectée est
-                    # retirée avec une ligne nommée. Le CAS (échéance, claim et
-                    # armement) empêche d'écraser un réarmement concurrent :
-                    # dans ce cas rien n'est annulé et le réveil reste dû.
+                    # retirée avec une ligne nommée. Le CAS (échéance, armement,
+                    # claim vivant) empêche d'écraser un réarmement concurrent :
+                    # dans ce cas rien n'est annulé et le réveil reste dû. Un
+                    # claim expiré est une livraison abandonnée, pas un
+                    # détenteur : il n'empêche pas l'annulation (#6134 B/P2).
                     try:
                         cancelled = work_mod.schedule_wake(
                             self.db, int(row["id"]), None,
                             text=abandon, actor="ameesh",
-                            expect=float(row["wake_ts"]), arm_id=arm_id)
+                            expect=float(row["wake_ts"]), arm_id=arm_id,
+                            claim_ttl=self.WAKE_CLAIM_TTL)
                     except (work_mod.WorkError, db_mod.DbError) as exc:
                         log_async("[%s] abandoned wake for lot #%s not cancelled "
                                   "(%s)" % (self.name, row["id"], exc))

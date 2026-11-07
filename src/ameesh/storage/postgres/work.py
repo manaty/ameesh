@@ -2005,14 +2005,17 @@ class WorkItems(interface.WorkItems):
             return updated[0]
 
     def schedule_wake(self, item_id, wake_ts, *, text, actor,
-                      expect=None, arm_id=None) -> dict | None:
+                      expect=None, arm_id=None, claim_ttl=None) -> dict | None:
         """#2466 : pose (ou efface) le réveil programmé et journalise, atomique.
 
         #6134 : avec `expect`, l'effacement n'a lieu que si le réveil est
-        encore celui inspecté : même échéance, non réclamé, et (si `arm_id`)
-        même événement d'armement. Un réarmement concurrent par `ameesh work
-        wake` ou une note `hold:` n'est jamais écrasé ; la méthode rend alors
-        None sans rien écrire (ni journal, ni colonne)."""
+        encore celui inspecté : même échéance, même événement d'armement (si
+        `arm_id`) et aucun claim **vivant**. Un claim expiré (livraison
+        abandonnée, `claim_ttl`) ne bloque pas : sans cela, après un hold levé,
+        chaque passage verrait le réveil dû, refuserait de l'annuler et
+        boucherait sans fin. Un réarmement concurrent par `ameesh work wake`
+        ou une note `hold:` n'est jamais écrasé ; la méthode rend alors None
+        sans rien écrire (ni journal, ni colonne)."""
         if not has_wake_at(self.db):
             raise DbError("work_items.wake_at is missing: apply migration 0466 "
                           "(`ameesh migrate`) before scheduling a wake")
@@ -2020,7 +2023,9 @@ class WorkItems(interface.WorkItems):
         with self.db.transaction() as tx:
             rows = tx.query(
                 "SELECT state, extract(epoch from wake_at)::float8 AS wake_ts,"
-                "       (wake_claim_at IS NOT NULL) AS claimed"
+                "       (wake_claim_at IS NOT NULL) AS claimed,"
+                "       extract(epoch from (clock_timestamp() - wake_claim_at))::float8"
+                "         AS claim_age_s"
                 "  FROM work_items WHERE id = %s AND state NOT IN"
                 f" ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}') FOR NO KEY UPDATE",
                 (item_id,))
@@ -2032,7 +2037,9 @@ class WorkItems(interface.WorkItems):
                         or abs(float(row["wake_ts"]) - float(expect)) >= 0.001:
                     return None
                 if row["claimed"]:
-                    return None
+                    if claim_ttl is None or row["claim_age_s"] is None \
+                            or float(row["claim_age_s"]) < float(claim_ttl):
+                        return None
                 if arm_id is not None:
                     current = tx.query(
                         "SELECT id FROM work_item_events"
