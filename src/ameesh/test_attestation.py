@@ -36,14 +36,21 @@ class AttestationError(ValueError):
 def canonical_json(value: Any) -> str:
     """UTF-8 JSON, sorted object keys, ordered arrays, no non-finite numbers."""
     def check(item):
-        if item is None or type(item) in (str, bool, int):
+        if type(item) is str:
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                raise AttestationError("invalid-unicode") from None
+            return
+        if item is None or type(item) in (bool, int):
             return
         if type(item) is list:
             for child in item:
                 check(child)
             return
         if type(item) is dict and all(type(k) is str for k in item):
-            for child in item.values():
+            for key, child in item.items():
+                check(key)
                 check(child)
             return
         raise AttestationError("invalid-json")
@@ -164,7 +171,7 @@ def reuse(envelope: dict, *, candidate_sha: str, tree: str, scope: dict,
     _scope(scope)
     if not _oid(candidate_sha) or not _oid(tree):
         raise AttestationError("invalid-candidate")
-    if now.tzinfo is None:
+    if not isinstance(now, datetime) or now.tzinfo is None:
         raise AttestationError("invalid-now")
     causes = []
     if payload["tree"] != tree:
