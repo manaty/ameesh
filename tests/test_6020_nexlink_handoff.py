@@ -329,6 +329,7 @@ class HandoffPipelineTests(unittest.TestCase):
                                      side_effect=lambda rules, now: (self.slot_at, "23:00")),
                    mock.patch.object(rc, "fetch"), mock.patch.object(rc, "write_report"),
                    mock.patch.object(nx, "ensure_ref"),
+                   mock.patch.object(nx, "release_tags", return_value={}),
                    mock.patch.object(nx, "open_handoff_lot", return_value=77),
                    mock.patch.object(nx, "staging_jobs", return_value=["deploy"]),
                    mock.patch.object(work, "events_noted",

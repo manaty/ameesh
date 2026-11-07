@@ -193,6 +193,78 @@ def branches(project):
     return result
 
 
+def release_tags(project):
+    """The remote `release-*` tags, version -> commit (peeled when annotated).
+
+    The remote is authoritative: a pending resumed on another host must not
+    miss the tag because its local tags are stale. `branches` lets a release
+    branch win over its tag, and the branch may have received `main` after
+    the tag (real 11au case, 07/11: the tag is on develop's head, the branch
+    one merge ahead), so the tags are also exposed on their own.
+    """
+    proc = rc._git(project.repo, "ls-remote", project.remote,
+                   "refs/tags/" + TAG_PREFIX + "*", check=True)
+    versions = {}
+    for line in proc.stdout.splitlines():
+        commit, ref = line.split()
+        value = ref.removeprefix("refs/tags/" + TAG_PREFIX)
+        peeled = value.endswith("^{}")
+        value = value.removesuffix("^{}")
+        if _VERSION.fullmatch(value) and (peeled or value not in versions):
+            versions[value] = commit
+    return versions
+
+
+def tagged_at(project, sha):
+    """#6152: `release-*` tag versions naming exactly `sha`."""
+    return {value for value, commit in release_tags(project).items() if commit == sha}
+
+
+def already_cut(project, base, previous):
+    """#6152: the version whose release already names `base`, or None.
+
+    A manual cutoff tags develop's head (rel-01, 07/11 09:42Z); the next
+    automatic tick would cut the same tree again under the next version
+    (11av). A tag on the chosen base is the durable proof; `previous_release
+    == base` states the same fact when the release ref is a branch. The
+    caller then skips the slot: no tag, no branch, no failure mail.
+    """
+    tagged = tagged_at(project, base)
+    if tagged:
+        return max(tagged, key=version_key)
+    if previous == base:
+        known = branches(project)
+        matches = [value for value, sha in known.items() if sha == base]
+        if matches:
+            return max(matches, key=version_key)
+    return None
+
+
+def pending_already_cut(project, pending):
+    """#6152: a frozen candidate whose base is already another release.
+
+    A pending opened before this guard survives in the state (the real 11av
+    at 10:00Z, base tagged 11au); resuming it would tag the same tree twice.
+    Its own tag is looked up by *version*, not on the base: `publish` tags
+    `pending["sha"]`, the merge candidate, which can differ from the base
+    (review B/P1). A crash after that push must reconcile, not skip.
+    """
+    version = pending.get("version")
+    tags = release_tags(project)
+    if version in tags:
+        return None
+    at_base = {value for value, commit in tags.items() if commit == pending["base"]}
+    if at_base:
+        return max(at_base, key=version_key)
+    if pending.get("previous") == pending["base"]:
+        known = branches(project)
+        matches = [value for value, sha in known.items()
+                   if sha == pending["base"] and value != version]
+        if matches:
+            return max(matches, key=version_key)
+    return None
+
+
 def choose_version(project, explicit=None):
     known = branches(project)
     latest = max(known, key=version_key) if known else None
@@ -307,10 +379,14 @@ def plan(cfg, project, *, now, version=None):
     rules, source = rc.compiled_rules(cfg, project.name)
     at, label = rc.cutoff_slot(rules, now)
     head, base, main, reading, proof = snapshot(project)
-    value = choose_version(project, version)
     previous = previous_release(project, main)
+    skipped = already_cut(project, base, previous)
+    value = skipped or choose_version(project, version)
     notes = "Merge develop %s + main %s; final-tree CI pending." % (base, main)
-    if proof is not None:
+    if skipped:
+        notes = ("Créneau sauté : la base %s porte déjà release-%s ; aucun tag, "
+                 "aucune branche." % (base, skipped))
+    elif proof is not None:
         notes += " " + tree_proof_text(head, proof)
     return rc.Plan(project=project, rules=rules, canon_commit=source.commit,
                    cutoff_at=at, cutoff_label=label, head=head, ci=reading,
@@ -319,7 +395,7 @@ def plan(cfg, project, *, now, version=None):
                    floor="patch", floor_reason="Nexlink release branch sequence",
                    packets=[], direct=[], migrations=[], included=[], excluded=[],
                    notes=notes, empty=rc.same_tree(project.repo, base, previous),
-                   tree_green=proof)
+                   tree_green=proof, skipped=skipped)
 
 
 def merge_candidate(project, base, main):
@@ -1079,6 +1155,39 @@ def _train_pause(db, project, now):
         key, since.strftime("%Y-%m-%dT%H:%MZ"), age_h, state.get("revision"))
 
 
+def _skip_cutoff(cfg, db, project, slot, at, label, source, now, save, *,
+                 version, head, base):
+    """#6152: the base is already a release; skip the slot, never cut it twice.
+
+    A manual cutoff (rel-01, 07/11 09:42Z) tagged develop's head; the 10:00Z
+    tick would have cut the same tree again as 11av. The slot is recorded as
+    `skipped` (not `missed`), nothing is tagged, branched or dispatched, and
+    the short announcement is not a failure report.
+    """
+    # Never move the recorded slot backwards: a stale pending is skipped on
+    # its own cutoff, then the current tick still handles the due one.
+    slot["last_cutoff"] = max(float(slot.get("last_cutoff") or 0), at)
+    slot["last_result"] = "skipped"
+    slot["last_label"] = label
+    slot.pop("pending_nexlink", None)
+    save()
+    message = "créneau sauté : tête déjà coupée en release-%s" % version
+    report = {
+        "schema": rc.SCHEMA, "result": "skipped", "cutoff_at": at, "label": label,
+        "project": project.name, "canon_commit": source.commit,
+        "completed_at": now, "version": version, "tag": TAG_PREFIX + version,
+        "head": head, "base": base, "message": message,
+        "host": str(getattr(cfg, "host", "") or ""),
+        "state_path": rc.state_path(cfg),
+    }
+    rc.write_report(cfg, project, report)
+    if db is not None:
+        body = ("Nexlink : %s (%s). Aucun tag ni branche créés, aucun "
+                "déploiement produit pour ce créneau." % (message, base[:12]))
+        rc.send_report(cfg, db, project, body, report, urgent=False)
+    return report
+
+
 def _missed_cutoff(cfg, db, project, slot, at, label, source, now, save):
     """#6014: a due Nexlink cutoff outside its window announces itself once.
 
@@ -1157,6 +1266,24 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
             pending["handoff"]["reported"] = False
             save()
         passed = None
+        if pending is not None:
+            earlier = pending_already_cut(project, pending)
+            if earlier:
+                # #6152: a pending opened before this guard (the real 11av at
+                # 10:00Z, base already tagged 11au) must not resume and tag the
+                # same tree twice. Drop its integration candidate (lease) and
+                # record its slot as skipped, then let a due slot proceed.
+                slot["abandoned_integration"] = {
+                    "ref": pending["integration"], "sha": pending["sha"]}
+                try:
+                    drop_abandoned(project, slot, save)
+                except rc.ReleaseError as dropped:  # retried with the next tick
+                    print("release: %s" % dropped)
+                passed = _skip_cutoff(
+                    cfg, db, project, slot, pending["cutoff_at"],
+                    pending.get("label") or label, source, now, save,
+                    version=earlier, head=pending["head"], base=pending["base"])
+                pending = None
         if pending is not None and pending.get("handoff"):
             _handoff_reannounce(cfg, db, project, pending, save)
             outcome = _handoff_resolution_guarded(cfg, db, project, pending, save)
@@ -1182,9 +1309,15 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                                       now, save)
             drop_abandoned(project, slot, save)
             head, base, main, reading, proof = snapshot(project)
+            previous = previous_release(project, main)
+            skipped = already_cut(project, base, previous)
+            if skipped:
+                # #6152: never cut a tree a manual (or earlier) cutoff already
+                # tagged; the slot is skipped, not missed, before any tag.
+                return _skip_cutoff(cfg, db, project, slot, at, label, source,
+                                    now, save, version=skipped, head=head, base=base)
             value = choose_version(project, version)
             sha = merge_candidate(project, base, main)
-            previous = previous_release(project, main)
             pending = slot["pending_nexlink"] = dict(
                 schema=rc.SCHEMA, project=project.name,
                 version=value, tag=TAG_PREFIX + value, integration="integration/release-" + value,

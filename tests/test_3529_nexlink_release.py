@@ -242,6 +242,9 @@ class PipelineTests(unittest.TestCase):
         patcher = mock.patch.object(nx, "ensure_ref")
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(nx, "release_tags", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_resume_frozen_cutoff_outside_window_without_new_snapshot(self):
         with mock.patch.object(nx, "snapshot") as snapshot, \
