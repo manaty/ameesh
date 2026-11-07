@@ -3215,8 +3215,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # #2962 : l'avertissement de publication (ou de gel distant non
                 # vérifié) est dans la note du jalon ; la sortie le dit aussi,
                 # sans en faire un refus.
+                from .freeze_branch import MISSING_MARK
                 for line in str(row.get("note") or "").splitlines():
-                    if line.startswith(("ameesh-freeze-missing-branch:",
+                    if line.startswith((MISSING_MARK,
                                         work.FREEZE_UNPUBLISHED_MARK,
                                         work.FREEZE_UNVERIFIED_MARK,
                                         work.NON_ASSIGNEE_MARK)):

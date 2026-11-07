@@ -850,7 +850,11 @@ def milestone(
     est couverte par un report de verdicts (#2442) est reconnu par
     `verdict_carry.would_carry` : la désignation s'abstient alors et garde les
     relecteurs reportés, sans courrier (#2487). Le plan est lu **avant** la
-    transaction du jalon : la transaction ne fait aucune lecture réseau.
+    transaction du jalon. Sur une connexion racine, aucune lecture réseau
+    ne se fait dans cette transaction. Un appel imbriqué reste dans la
+    transaction de l'appelant, y compris ses lectures préparatoires Git/forge
+    (dont l'inférence de branche) : l'appelant doit préférer la connexion
+    racine s'il exige de ne tenir aucun verrou pendant ces lectures.
 
     Un regel de la **même tête** (#5481) ne redésigne pas : le hook garde les
     relecteurs et les avis acquis, sans courrier, et le lot reste `validated`
@@ -928,8 +932,14 @@ def milestone(
         # #6161 : ne pas laisser un gel validé invisible au composeur.
         if not str(item.get("branch") or "").strip():
             from . import freeze_branch
+            from .work import is_detached
             inferred_branch, branch_warning = freeze_branch.published_branch(
-                repo or str(freeze_info.get("repo") or ""), sha)
+                repo or str(freeze_info.get("repo") or ""), sha, item_id=item_id)
+            if inferred_branch and is_detached(
+                    storage.of(db), item_id, inferred_branch):
+                branch_warning = (freeze_branch.missing_warning(item_id)
+                                  + " (published branch explicitly detached)")
+                inferred_branch = None
             if inferred_branch:
                 item = dict(item, branch=inferred_branch)
             elif branch_warning:
