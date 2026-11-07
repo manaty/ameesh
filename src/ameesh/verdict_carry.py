@@ -1270,6 +1270,17 @@ def _host(db) -> str:
     return str(getattr(getattr(db, "cfg", None), "host", "") or "").strip()
 
 
+def _notify_held(db, lot: int) -> None:
+    """#6089 : le quorum reporté valide le lot ; un hold de pilote y survit
+    (#5758) et son détenteur l'apprend. L'avis ne défait jamais la
+    validation."""
+    from . import validated_hold_notice
+    try:
+        validated_hold_notice.notify(db, int(lot))
+    except Exception:  # noqa: BLE001 - l'avis est une suite, pas une condition
+        pass
+
+
 def promote_carried(db, lot: int, *, freeze=None) -> dict:
     """La transition de quorum d'un verdict reporté, comme pour un avis rendu.
 
@@ -1344,9 +1355,11 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
         exc = None
         try:
             _attempt()
-            return {"result": "validated"}
         except Exception as caught:  # noqa: BLE001 - classée ci-dessous
             exc = caught
+        else:
+            _notify_held(db, lot)
+            return {"result": "validated"}
         # La porte est ouverte mais l'écriture a échoué (course, transaction).
         # Une seconde lecture bornée dit si elle l'est encore : un second
         # essai, sinon la reprise au passage suivant.
@@ -1354,9 +1367,11 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
         if isinstance(gate2, dict) and gate2.get("ok") and not gate2.get("error"):
             try:
                 _attempt()
-                return {"result": "validated"}
             except Exception as caught:  # noqa: BLE001 - reprise au passage suivant
                 exc = caught
+            else:
+                _notify_held(db, lot)
+                return {"result": "validated"}
         elif isinstance(gate2, dict) and not gate2.get("error"):
             return {"result": "closed", "detail": gate2.get("why") or ""}
         elif gate2_exc is not None:
