@@ -240,6 +240,34 @@ def already_cut(project, base, previous):
     return None
 
 
+def cut_since(project, seen):
+    """#6237: the version published since the last recorded slot, or None.
+
+    A manual cutoff is not always on the base the tick picks: on 07/11 rel-01
+    tagged release-11aw on fb68c58db for the 22:00Z slot, develop then moved
+    (3f6b7c618) and the 23:28Z tick froze 11ax for the same slot. The state
+    records the latest version known when a slot closes (`release_seen`); a
+    newer one on the remote is that manual cutoff, and the due slot is cut.
+    Without a record (first tick, a missed slot, another host) nothing is
+    inferred: the exact-base proof of `already_cut` still applies.
+    """
+    if not seen or not _VERSION.fullmatch(str(seen)):
+        return None
+    known = branches(project)
+    if not known:
+        return None
+    latest = max(known, key=version_key)
+    return latest if version_key(latest) > version_key(seen) else None
+
+
+def _see(slot, version):
+    """Record `version` as known to the slot, never moving it backwards."""
+    seen = slot.get("release_seen")
+    if not seen or not _VERSION.fullmatch(str(seen)) \
+            or version_key(version) > version_key(seen):
+        slot["release_seen"] = version
+
+
 def pending_already_cut(project, pending):
     """#6152: `(version, empty)` when a frozen candidate must not resume.
 
@@ -1125,6 +1153,7 @@ def _close(cfg, db, project, slot, pending, result, save):
     report = dict(pending, result=result, project=project.name,
                   staging_ok=result == "released")
     slot.update(last_cutoff=pending["cutoff_at"], last_result=result)
+    _see(slot, pending["version"])
     slot.pop("pending_nexlink")
     save()
     rc.write_report(cfg, project, report)
@@ -1165,7 +1194,7 @@ def _train_pause(db, project, now):
 
 
 def _skip_cutoff(cfg, db, project, slot, at, label, source, now, save, *,
-                 version, head, base, empty=False):
+                 version, head, base, empty=False, manual=False):
     """#6152: the base is already a release; skip the slot, never cut it twice.
 
     A manual cutoff (rel-01, 07/11 09:42Z) tagged develop's head; the 10:00Z
@@ -1173,7 +1202,8 @@ def _skip_cutoff(cfg, db, project, slot, at, label, source, now, save, *,
     `skipped` (not `missed`), nothing is tagged, branched or dispatched, and
     the short announcement is not a failure report. `empty` names the other
     reason: a frozen candidate with no content to publish, which never had a
-    release tag to name.
+    release tag to name; `manual` a version published since the last recorded
+    slot on another commit than the base (#6237).
     """
     # Never move the recorded slot backwards: a stale pending is skipped on
     # its own cutoff, then the current tick still handles the due one.
@@ -1181,11 +1211,16 @@ def _skip_cutoff(cfg, db, project, slot, at, label, source, now, save, *,
     slot["last_result"] = "skipped"
     slot["last_label"] = label
     slot.pop("pending_nexlink", None)
+    _see(slot, version)
     save()
     if empty:
         message = ("créneau sauté : coupe vide, aucun contenu nouveau à publier "
                    "(release-%s non posée)" % version)
         tag = None
+    elif manual:
+        message = ("créneau sauté : déjà coupé à la main en release-%s, la tête "
+                   "part au créneau suivant" % version)
+        tag = TAG_PREFIX + version
     else:
         message = "créneau sauté : tête déjà coupée en release-%s" % version
         tag = TAG_PREFIX + version
@@ -1237,6 +1272,9 @@ def _missed_cutoff(cfg, db, project, slot, at, label, source, now, save):
     report["message"] = "; ".join(causes)
     slot["last_cutoff"] = at
     slot["last_result"] = "missed"
+    # #6237: the mail asks for a manual tag of this slot; that tag must not
+    # pass for a cut of the next one.
+    slot.pop("release_seen", None)
     slot["last_label"] = label
     save()
     when = datetime.datetime.fromtimestamp(at, datetime.timezone.utc)
@@ -1337,6 +1375,13 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 # tagged; the slot is skipped, not missed, before any tag.
                 return _skip_cutoff(cfg, db, project, slot, at, label, source,
                                     now, save, version=skipped, head=head, base=base)
+            manual = cut_since(project, slot.get("release_seen"))
+            if manual:
+                # #6237: a release tagged by hand since the last recorded slot
+                # (on a base develop has since moved past) cuts this slot.
+                return _skip_cutoff(cfg, db, project, slot, at, label, source,
+                                    now, save, version=manual, head=head, base=base,
+                                    manual=True)
             value = choose_version(project, version)
             sha = merge_candidate(project, base, main)
             pending = slot["pending_nexlink"] = dict(
@@ -1345,6 +1390,7 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 head=head, base=base, main=main, sha=sha, cutoff_at=at, label=label,
                 previous=previous, empty=rc.same_tree(project.repo, previous, sha),
                 canon_commit=source.commit, tree_green=proof)
+            _see(slot, value)
             save()
         elif version and version != pending["version"]:
             raise rc.ReleaseError("a frozen Nexlink cutoff is already in progress")

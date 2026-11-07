@@ -738,6 +738,7 @@ class HandoffPipelineTests(unittest.TestCase):
         self.notes.append(note(9, "mesh-design", nx.skip_text("nexlink", "11at", "attente")))
         with mock.patch.object(nx, "snapshot", return_value=("h", "c2", "m2", {}, None)), \
                 mock.patch.object(nx, "choose_version", return_value="11au"), \
+                mock.patch.object(nx, "branches", return_value={"11at": "c" * 40}), \
                 mock.patch.object(nx, "merge_candidate", return_value="f" * 40), \
                 mock.patch.object(nx, "previous_release", return_value="m2"), \
                 mock.patch.object(rc, "same_tree", return_value=False), \
