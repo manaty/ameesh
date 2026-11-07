@@ -160,6 +160,9 @@ def add_parsers(work_sub, func) -> None:
         "plan", help="planned dates of a task or a WorkPackage (L96)")
     p_plan.add_argument("target", nargs="?", help="task number, or package id")
     p_plan.add_argument("--project", help="read the project dispatch plan and waiting reasons")
+    p_plan.add_argument("--executor", metavar="NAME",
+                        help="#6043: with --project, the lots reserved to this external "
+                             "executor count as ready for it")
     p_plan.add_argument("--capacity-plan", metavar="JSON", help="forecast a capacity/graph snapshot (#4201)")
     p_plan.add_argument("--previous-plan", metavar="JSON", help="previous capacity forecast; report moved lots")
     p_plan.add_argument("--start", dest="debut", default=None,
@@ -395,7 +398,7 @@ def _plan(db, args: argparse.Namespace, cfg=None) -> int:
                 ("debut", "fin", "livraison", "estimate", "source", "estimate_source")):
             raise work.WorkError("--project is read-only; use work plan <id> to edit dates")
         from . import project_plan
-        out = project_plan.report(db, project)
+        out = project_plan.report(db, project, executor=getattr(args, "executor", None))
         from . import capacity_replan
         saved = capacity_replan.latest(db, project)
         if saved:
@@ -418,6 +421,8 @@ def _plan(db, args: argparse.Namespace, cfg=None) -> int:
                     eta = projected[row["id"]]
                     print("  capacity: %s → %s" % (eta["start"], eta["end"]))
         return 0
+    if getattr(args, "executor", None):
+        raise work.WorkError("--executor goes with --project P")
     if args.target is None:
         raise work.WorkError("work plan requires a target or --project P")
 

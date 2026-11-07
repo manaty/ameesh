@@ -2036,6 +2036,18 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
 
 
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
+    if args.work_command == "add" and getattr(args, "json", False):
+        # #6043 : un exécutant externe (adaptateur IMA) lit le lot créé sans
+        # relire le plan ; le texte habituel passe sur stderr.
+        import contextlib
+        args.json = False
+        with contextlib.redirect_stdout(sys.stderr):
+            code = cmd_work(cfg, args)
+        item = getattr(args, "created_item", None)
+        if item is not None:
+            print(json.dumps({"schema": "ameesh.work.add/1", "lot": item},
+                             ensure_ascii=False, indent=2, default=str))
+        return code
     v = _vocabulary()
     from . import plan, plan_cli, prevalidation, stagnation  # plan de travail (L29)
     db = _open(cfg)
@@ -2208,6 +2220,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                                 cap=getattr(exc, "cap", None),
                                                 in_flight=getattr(exc, "in_flight", None)),
                       file=sys.stderr)
+            args.created_item = item
             print(('%s #%d created in %s: %s%s%s%s') % (v.noun, item["id"], item["state"], item["title"], " (plan: %s)" % item["package_id"] if item.get("package_id") else "", " (priority %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
                 if item.get("priority") else "", " — estimated %s" % estimates.label(minutes) if minutes else ""))
             if item.get("external_executor"):
@@ -4119,6 +4132,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_add.add_argument("--externe", action="store_true",
                         help="force assignment to an external agent that has a human "
                              "responsible (L37, 0030)")
+    pw_add.add_argument("--json", action="store_true",
+                        help=("#6043: print the created %s as JSON on stdout "
+                              "(the usual text goes to stderr)") % v.noun)
     pw_add.add_argument("--external-executor", default=None, metavar="AGENT",
                         help=("#3447: declare the %s reserved to an external executor "
                              "(an `externe` agent with a human owner, or human:<id>) "
