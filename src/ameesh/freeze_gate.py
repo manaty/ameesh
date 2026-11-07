@@ -881,6 +881,7 @@ def milestone(
         raise WorkError("a verdict only makes sense for the `verdict` milestone")
     if on_frozen is not None and kind != "frozen":
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
+    inferred_branch = None
     replaced: list[int] = []
     if supersedes is not None:
         if kind != "frozen":
@@ -924,6 +925,15 @@ def milestone(
         freeze_info: dict = {}
         sha = freeze_head(db, item, sha, repo=repo, refreshed=refreshed,
                           outcome=freeze_info)
+        # #6161 : ne pas laisser un gel validé invisible au composeur.
+        if not str(item.get("branch") or "").strip():
+            from . import freeze_branch
+            inferred_branch, branch_warning = freeze_branch.published_branch(
+                repo or str(freeze_info.get("repo") or ""), sha)
+            if inferred_branch:
+                item = dict(item, branch=inferred_branch)
+            elif branch_warning:
+                note = (note + "\n" if note else "") + branch_warning
         # #3589 : un lot empilé sur un parent ouvert ne gèle pas des copies
         # de la tête gelée de ce parent (même patch-id, tête absente) : le
         # refus donne le `git rebase --onto` exact. Lecture seule, avant
@@ -1162,6 +1172,9 @@ def milestone(
             if on_frozen is not None and after_commit is None:
                 after_commit = []
                 drain = after_commit
+    if inferred_branch:
+        from . import freeze_branch
+        on_frozen = freeze_branch.attach_hook(item_id, inferred_branch, sha, actor, on_frozen)
     row = storage.of(db).work.add_milestone(
         item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
         on_frozen=on_frozen, after_commit=after_commit, proof=proof)
