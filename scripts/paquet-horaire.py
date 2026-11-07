@@ -1410,6 +1410,12 @@ def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
                 and freeze_foreign(item, last.ts) and not running(ctx, last):
             return None
     if found and found[-1].base == sha:
+        # #6183 : --publish conserve la tête/base ; sa CI demandée clôt
+        # la tentative. Une recomposition ordinaire doit encore reprendre,
+        # même si une ancienne CI existe déjà sur sa base.
+        last = found[-1]
+        if sha and last.publish.endswith("@" + sha) and achieved(item, sha, last.ts):
+            return None
         return found[-1]
     if found and sha:
         last = found[-1]

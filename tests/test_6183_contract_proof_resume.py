@@ -131,6 +131,37 @@ class HourlyProofTest(Base):
         self.assertEqual(proof.read(self.item, head=HEAD, tree=TREE,
                                    target='main')['result']['state'], 'inconclusive')
 
+    def test_successful_publish_recovery_follows_same_head_ci(self):
+        for status in ('success', 'failure'):
+            with self.subTest(status=status):
+                self.item['events'] = []
+                self.shell.calls.clear()
+                self.shell.auto_out = proof.encode(report(), base=BASE, target='main') + '\n'
+                self.assertIn('ci-full demandée', ph.publish(self.ctx, self.item))
+                current = ph.attempts(self.item)[-1]
+                self.assertEqual(current.base, HEAD)
+                self.assertEqual(current.publish, self.item['branch'] + '@' + HEAD)
+                self.assertIsNone(ph.pending(self.ctx, self.item, HEAD))
+                self.shell.ci[4000] = {'runs': [dict(red_run(), status=status)]}
+                self.shell.calls.clear()
+                with mock.patch.object(ph, 'resume', side_effect=AssertionError('already published')), \
+                        mock.patch.object(ph, 'recompose', return_value='red classified') as recompose:
+                    out = ph.follow(self.ctx, self.item)
+                if status == 'success':
+                    self.assertIn('ci-full verte', out)
+                    recompose.assert_not_called()
+                else:
+                    self.assertEqual(out, 'red classified')
+                    recompose.assert_called_once()
+                self.assertFalse(self.shell.ran(str(Path(ph.SCRIPT_DIR) / 'paquet-auto.py')))
+                self.assertFalse(self.shell.ran('ameesh', 'ci', 'run'))
+
+    def test_unfinished_recomposition_stays_pending_despite_old_base_ci(self):
+        self.item['events'] = [{'note': ph.MARK_CI + HEAD, 'created_ts': 1},
+                               {'note': ph.MARK_ATTEMPT + 'recomposition n=1 base=' + HEAD
+                                + ' par=old:1 run=failed-ci sans=3801', 'created_ts': 2}]
+        self.assertIsNotNone(ph.pending(self.ctx, self.item, HEAD))
+
     def test_ci_red_recomposition_preserves_exclusions_and_original_members(self):
         self.shell.items[3801] = {'id': 3801, 'assignee': 'author'}
         with mock.patch.object(ph, 'after_compose', return_value='composed'):
