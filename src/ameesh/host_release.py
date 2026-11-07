@@ -60,6 +60,9 @@ ADAPTER_HALTING = ("halt intent", "halt sent", "halt deadline passed",
                    "archive intent", "archive refused")
 ADAPTER_IMMEDIATE = {"halt deadline passed": "halt_deadline",
                      "archive refused": "archive_refused"}
+# #6080: a return blocked in standby (poweron not allowed) ages against the
+# stall bound from its first refusal.
+ADAPTER_POWERON_REFUSED = "poweron refused"
 #: bounded text kept from a hook
 DETAIL_MAX = 400
 #: a run count is usable only when A published a real source
@@ -903,11 +906,15 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
             oldest = live[0]
             immediate = next((row for row in live
                               if row.get("result") in ADAPTER_IMMEDIATE), None)
+            refused = next((row for row in live
+                            if row.get("result") == ADAPTER_POWERON_REFUSED), None)
             provider = _adapter_provider_state(db, host)
             if immediate is not None:
                 stalled, reason = immediate, ADAPTER_IMMEDIATE[immediate["result"]]
             elif provider == "locked":
                 stalled, reason = oldest, "provider_locked"
+            elif refused is not None and (_age(refused) or 0.0) > stall:
+                stalled, reason = refused, "poweron_refused"
             elif provider == "stopped in place" and not any(
                     row.get("state") == "busy"
                     or row.get("result") in ADAPTER_HALTING + ("poweroff sent",)
@@ -942,7 +949,8 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                               "open" if control.get("claims_open") else "closed",
                               control.get("hook_state") or "none"))
             elif reason in ("halt_deadline", "archive_refused",
-                            "provider_locked", "stopped_in_place"):
+                            "provider_locked", "stopped_in_place",
+                            "poweron_refused"):
                 what = {
                     "halt_deadline": "the OS halt was not proven before the "
                                      "enrolled halt deadline (provider not `stopped "
@@ -957,6 +965,12 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                                         "place` (standby, still billed) without a "
                                         "halt intent of this wave; it is never "
                                         "archived automatically",
+                    "poweron_refused": "a return found the VM `stopped in "
+                                       "place` (standby, still billed) and the "
+                                       "server GET has not allowed `poweron` "
+                                       "(allowed_actions) for longer than the "
+                                       "stall bound; the VM is not started and "
+                                       "claims are not reopened",
                 }[reason]
                 detail = ("Host %s, generation %s/epoch %s: %s. Claims %s and the "
                           "acknowledged state (%s) are kept; the host is not "
