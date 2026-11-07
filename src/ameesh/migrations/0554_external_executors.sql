@@ -18,7 +18,7 @@
 -- lisibles tels quels ; `external_executor` n'est pas retouché.
 SET LOCAL lock_timeout = '5s';
 
-CREATE TABLE IF NOT EXISTS external_executors (
+CREATE TABLE external_executors (
     name         text PRIMARY KEY,
     responsible  text NOT NULL,
     note         text NOT NULL DEFAULT '',
@@ -45,3 +45,11 @@ COMMENT ON COLUMN external_executors.responsible IS
     '#6091: human:<id> accountable for the system; shown by `work external-executor --list` and by `work show` on a reserved lot.';
 COMMENT ON COLUMN external_executors.retired_at IS
     '#6091: retired declaration: no new reservation, existing lots keep the name until cleared or closed.';
+
+-- #4299 : `declared_by` et `retired_by` nomment l'autorité du geste de pilote
+-- (un agent, ou `human:<id>`) ; un nom d'agent suit le renommage, à l'écriture
+-- comme au renommage, comme les autres colonnes d'identité. `name` reste le
+-- nom du système et ne bouge jamais (classé hors identité dans test_4299).
+CREATE TRIGGER ameesh_agent_spelling
+    BEFORE INSERT OR UPDATE OF declared_by, retired_by ON external_executors
+    FOR EACH ROW EXECUTE FUNCTION ameesh_agent_spelling('declared_by retired_by');
