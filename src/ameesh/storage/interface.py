@@ -4519,7 +4519,8 @@ class Operations(Domain):
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int,
-              message: str | None = None) -> list[dict]:
+              message: str | None = None,
+              min_reread: int | None = None) -> list[dict]:
         """Lignes du grand livre `turn_costs` des `since_s` dernières
         secondes (de l'agent si donné), les plus récentes d'abord : id,
         agent, harness, turn, model, session, usd, input_tokens,
@@ -4527,7 +4528,11 @@ class Operations(Domain):
         recorded_ts, inputs. `work_item_id` et `started_ts` (#796) valent None
         pour une ligne d'avant la migration 0423 ou un tour sans lot.
         `attribution` (#6005) est l'attribution d'appelant du tour hors lot
-        (None sans attribution, ou avant la migration 0551).
+        (None sans attribution, ou avant la migration 0551). `turn_id`
+        (#6045) relie la ligne à son événement `turn.context` (None avant la
+        migration 0423). `min_reread` (#6045) ne garde que les tours dont
+        l'entrée relue (entrée + cache lu ; Codex : le plus grand des deux)
+        dépasse strictement ce nombre, avant la limite.
         `message` (L80b) restreint aux tours qui ont servi ce message
         (`inputs` contient son identifiant)."""
 

@@ -4633,6 +4633,10 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pc_turns.add_argument("--message", default=None,
                           help="only turns that served this message (mail id); "
                                "the cost shown is the turn's")
+    pc_turns.add_argument("--over", default=None, metavar="TOKENS",
+                          help="only turns whose input read (input + cache read) "
+                               "exceeds this count (2M, 500k), with their reason, "
+                               "peak and policy from turn.context (#6045)")
     pc_turns.add_argument("--json", action="store_true")
     pc_turns.set_defaults(func=cmd_cost)
     # #6005 : coût regroupé par attribution d'appelant (tours hors lot)
@@ -5162,6 +5166,48 @@ def _cost_attribution(db, args) -> int:
     return 0
 
 
+def _cost_turns_over(db, rows, over: int, limit: int, truncated: bool,
+                     args) -> int:
+    """#6045 : `cost turns --over N` — les tours au-dessus du seuil d'entrée
+    (entrée + cache lu), avec leur raison normalisée, R_turn, C_last, C_peak
+    et la politique en vigueur, relus de `turn.context`. Lecture seule ; une
+    mesure inconnue est null avec sa raison."""
+    turns = cost_mod.explain_turns(db, rows)
+    if args.json:
+        print(json.dumps({"schema": "ameesh-turns-over/1", "over": over,
+                          "turns": turns, "truncated": truncated,
+                          "limit": limit}, ensure_ascii=False, indent=2))
+        if truncated:
+            print("note: window truncated at %d turn(s); raise --limit to see "
+                  "the rest" % limit, file=sys.stderr)
+        return 0
+    if truncated:
+        print("note: window truncated at %d turn(s); raise --limit to see the rest"
+              % limit, file=sys.stderr)
+
+    def tokens(value) -> str:
+        return "—" if value is None else "%d" % value
+
+    print("%-19s %-16s %-6s %10s %10s %10s %10s %10s  %-13s %s" % (
+        "WHEN", "AGENT", "LOT", "INPUT", "CACHE", "R_TURN", "C_LAST", "C_PEAK",
+        "REASON", "POLICY"))
+    for turn in turns:
+        policy = turn.get("policy")
+        if policy is None:
+            shown = "—"
+        else:
+            shown = " ".join("%s=%s" % (name, tokens(policy.get(name)))
+                             for name in cost_mod.OVER_POLICY)
+        reason = turn["reason"] + (":%s" % turn["cause"] if turn.get("cause") else "")
+        print("%-19s %-16s %-6s %10d %10d %10s %10s %10s  %-13s %s" % (
+            _fmt_moment(turn["recorded_ts"]), (turn["agent"] or "")[:16],
+            "#%d" % turn["work_item_id"] if turn.get("work_item_id") else "—",
+            turn["input_tokens"], turn["cached_input_tokens"],
+            tokens(turn["R_turn"]["value"]), tokens(turn["C_last"]["value"]),
+            tokens(turn["C_peak"]["value"]), reason, shown))
+    return 0
+
+
 def _cost_l26(cfg: Config, db, what: str, args) -> int:
     """`cost turns|gauges|balance` (L26) : lectures du grand livre, de
     l'historique des jauges et des soldes ; le calcul des coûts n'est pas
@@ -5169,15 +5215,25 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
     ops = storage.of(db).operations
     if what == "turns":
         limit = int(args.limit)
+        over = None
+        if getattr(args, "over", None) is not None:
+            try:
+                over = cost_mod.parse_token_count(args.over)
+            except cost_mod.CostError as exc:
+                print(USAGE_HINT % exc, file=sys.stderr)
+                return 2
         rows = ops.turns(agent=args.agent, since_s=_since_seconds(args.since),
                          limit=limit + 1 if limit > 0 else limit,
-                         message=getattr(args, "message", None))
+                         message=getattr(args, "message", None),
+                         **({"min_reread": over} if over is not None else {}))
         # #3452 : le plafond s'appliquait sans le dire — 500 tours sur ~4 h 30
         # d'une nuit se lisaient comme la fenêtre entière. La troncature est
         # désormais dite, en JSON comme en texte.
         truncated = limit > 0 and len(rows) > limit
         if truncated:
             rows = rows[:limit]
+        if over is not None:
+            return _cost_turns_over(db, rows, over, limit, truncated, args)
         if args.json:
             payload = {"schema": "ameesh-turns/1", "turns": rows,
                        "truncated": truncated, "limit": limit}
