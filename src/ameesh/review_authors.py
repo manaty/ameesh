@@ -23,7 +23,9 @@ auteurs, avec les mêmes exceptions du canon §2 :
   relecteurs par son nom (#2739). Exception #3518/#3577 : une correction dont
   tous les chemins sont des tests reconnus (§11 bis), hors plan CI, garde
   seulement cette exclusion personnelle, même sous un chemin sensible ; la
-  classe du lot ne change pas ;
+  classe du lot ne change pas. #6103 : l'adaptation de test d'un **tiers**
+  (ni référence ni relecteur, canon §2 « adaptation de test : aucun avis »)
+  suit la même exception quand tous ses commits survivants sont des tests ;
 * une réécriture d'historique **à contenu identique** n'efface pas la
   provenance (#2924) : les auteurs des gels antérieurs du même lot dont le
   contenu subsiste restent auteurs de la tête. Une consolidation sur une cible
@@ -3706,6 +3708,8 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     # vient d'une réémission ambiguë, par commit ; la promotion en auteur les
     # réunit pour les seuls commits retenus.
     review_families: dict[str, dict[str, set]] = {}
+    # #6103 : commits des tiers (ni référence ni relecteur), par acteur.
+    third_commits: dict[str, list] = {}
     unknown: list[str] = []
     cache = {} if cache is None else cache
     commits = _not_in_target(repo, commits, target, head=head, cache=cache)
@@ -3764,6 +3768,11 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                         sha, set()).update(values)
                 else:
                     by_name.setdefault(actor, set()).update(values)
+                    if row["role"] == "third":
+                        third_commits.setdefault(actor, []).append(
+                            (sha, row["family"]))
+                        review_families.setdefault(actor, {}).setdefault(
+                            sha, set()).update(values)
             continue
         actor = str(receipt.get("actor") or "").strip()
         if not actor:
@@ -3775,6 +3784,18 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             review_commits.setdefault(actor, []).append((sha, proven))
         else:
             by_name.setdefault(actor, set()).add(proven)
+            if actor != author_name:
+                third_commits.setdefault(actor, []).append((sha, proven))
+    # #6103 : l'adaptation de test d'un tiers est lue comme dans `reading` :
+    # tests seuls, elle devient une correction `test_only` (exclusion par le
+    # nom, via `_prior_correctors`), pas un auteur du gel antérieur.
+    for actor, entries in third_commits.items():
+        if (author_name and actor.casefold() == author_name.casefold()) \
+                or actor in review_commits:
+            continue
+        if _test_only_correction(repo, entries, str(item.get("app") or "")):
+            by_name.pop(actor, None)
+            review_commits[actor] = list(entries)
     # #2924 B4 : la lecture courante promeut tout commit de relecteur en auteur
     # (#2888). La lecture d'un gel antérieur doit faire de même, même quand le
     # commit n'a pas de reçu exact et que la famille vient du journal des tours
@@ -5396,6 +5417,24 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             for key in [name for name in commits_out
                         if name.lower() == actor.lower()]:
                 commits_out[key] = list(kept)
+    # #6103 : une adaptation de test d'un tiers (canon §2 : « adaptation de
+    # test : aucun avis ») suit l'exception #3518/#3577 des correctifs de
+    # relecteur : exclu par son nom, sa famille reste éligible. Il faut que
+    # **tous** ses commits survivants soient des tests ; un seul chemin produit
+    # (ou une lecture impossible) le garde auteur.
+    third_tests: dict[str, set] = {}
+    for actor in sorted(third_commits):
+        kept = third_surviving.get(actor) or []
+        if (not kept or actor not in by_name
+                or (author_name and str(actor).casefold() == author_name.casefold())):
+            continue
+        if _test_only_correction(repo, [(sha, "") for sha in kept],
+                                 str(item.get("app") or "")):
+            third_tests[actor] = by_name.pop(actor)
+            if commits_out is not None:
+                for key in [name for name in commits_out
+                            if name.lower() == actor.lower()]:
+                    commits_out.pop(key, None)
     # #3335 : un correctif de relecteur ne pèse que s'il est encore dans la
     # tête. La promotion en auteur (#2888) et la trace « correcteur » suivent la
     # survie du contenu (#3220) : un commit de relecteur dont aucune ligne ne
@@ -5527,6 +5566,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         for sha, _value in review_commits[actor]:
             proven |= review_families.get(actor, {}).get(sha, set())
         record_corrector(actor, "", proven, test_only=actor in test_correctors)
+    for actor, proven in sorted(third_tests.items()):
+        record_corrector(actor, "", proven, test_only=True)
     # #2924 : un correcteur d'un gel antérieur dont le correctif subsiste garde
     # sa trace. Hors tests seuls (#3518), il est aussi auteur de la tête ;
     # une correction produit ancienne ne devient jamais une dispense de famille.
