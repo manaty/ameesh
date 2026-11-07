@@ -1667,6 +1667,12 @@ def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
 
 #: préfixe d'un assigné humain : un lot qui attend un humain n'a rien à réveiller
 HUMAN_PREFIX = "human:"
+#: #6091 : préfixe d'un exécutant externe NON-AGENT déclaré (le serveur IMA,
+#: par exemple) : jamais réveillé, jamais assignable, un responsable humain.
+SYSTEM_PREFIX = "system:"
+#: #6091 : forme du suffixe d'un `system:…` — celle d'un nom d'agent
+#: (config.NAME_RE), le deux-points du préfixe en plus.
+_SYSTEM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def configured_canons(cfg) -> list:
@@ -2137,11 +2143,15 @@ def check_external_executor(db: Db, executor: str, *, cfg=None) -> str:
     C'est un *déclaratif*, pas une attribution : le lot reste sans `assignee`
     (l'agent externe ne se réveille pas, 0030), mais il porte le nom de celui
     qui doit le faire — le bureau (`mode=externe` avec un responsable humain),
-    ou un humain (`human:…`, nom nu connu normalisé comme pour l'assignation).
+    un humain (`human:…`, nom nu connu normalisé comme pour l'assignation), ou
+    un système non-agent déclaré (`system:…`, #6091 : le serveur IMA, jamais
+    réveillé, jamais assignable, avec son responsable humain).
 
     Un agent `execute` est refusé : il s'attribue (`work assign`), il ne se
     réserve pas. Un agent externe sans responsable humain est refusé (0030,
-    il ne porterait ni l'attente ni les alertes). Rend le nom normalisé.
+    il ne porterait ni l'attente ni les alertes). Un `system:…` inconnu ou
+    retiré est refusé : il se déclare d'abord (`declare_external_executor`).
+    Rend le nom normalisé.
     """
     from . import registry
 
@@ -2151,6 +2161,18 @@ def check_external_executor(db: Db, executor: str, *, cfg=None) -> str:
         raise WorkError("empty external executor")
     if name.startswith(HUMAN_PREFIX):
         return name
+    if name.startswith(SYSTEM_PREFIX):
+        row = storage.of(db).external_executors.get(name)
+        if row is None:
+            raise WorkError("external executor refused: %s is not declared; a non-agent "
+                            "external executor is declared first: `ameesh work "
+                            "external-executor --declare %s --responsible human:<id>`"
+                            % (name, name))
+        if row.get("retired_at"):
+            raise WorkError("external executor refused: %s was retired; declare a "
+                            "current system instead (a retired name takes no new "
+                            "reservation)" % name)
+        return name
     cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     row = registry.get(db, name)
     if row is None:
@@ -2159,7 +2181,8 @@ def check_external_executor(db: Db, executor: str, *, cfg=None) -> str:
             return human
         raise WorkError("external executor refused: %s is not in the registry; "
                         "an external executor is a registered `externe` agent with a "
-                        "human owner, or a human (human:<id>)" % name)
+                        "human owner, a human (human:<id>), or a declared system "
+                        "(system:<name>)" % name)
     if (row.get("mode") or "execute") != "externe":
         raise WorkError("external executor refused: %s is a %s agent, not an external "
                         "one — assign it instead (`ameesh work assign <lot> %s`)"
@@ -2169,6 +2192,83 @@ def check_external_executor(db: Db, executor: str, *, cfg=None) -> str:
                         "owner (0030); set one first (canon, or `ameesh set %s "
                         "responsible=human:<id>`)" % (name, name))
     return name
+
+
+def declare_external_executor(db: Db, name: str, responsible: str, *,
+                              note: str = "", actor: str = "", cfg=None) -> dict:
+    """#6091 : déclare un exécutant externe NON-AGENT (`system:<nom>`) avec son
+    responsable humain.
+
+    Geste de pilote (`corrector`, `history=False`), comme la réservation d'un
+    lot : c'est une donnée d'identité durable, jamais une attribution. Le nom
+    doit porter le préfixe `system:` et un suffixe de forme d'agent ; il ne
+    peut donc pas se confondre avec un agent (`NAME_RE` interdit `:`) ni avec
+    un humain (`human:`). Le responsable est un `human:<id>`, ou un nom nu
+    d'humain connu normalisé. Rend la déclaration.
+
+    Redéclarer le même nom avec le même responsable met à jour la note ; un
+    autre responsable est refusé (on ne change pas l'identité en silence),
+    une déclaration retirée n'est pas ressuscitée.
+    """
+    from .agent_names import resolve
+
+    who = corrector(cfg, db, actor, what="external executor", history=False)
+    name = (name or "").strip()
+    if not name.startswith(SYSTEM_PREFIX):
+        raise WorkError("non-agent external executors are named `%s<name>`: %r is not "
+                        "one (an agent is declared in the registry, a human is "
+                        "human:<id>)" % (SYSTEM_PREFIX, name))
+    suffix = name[len(SYSTEM_PREFIX):]
+    if not _SYSTEM_NAME_RE.match(suffix):
+        raise WorkError("invalid system name: %r (letters, digits, dot, dash, "
+                        "underscore; 1 to 64 characters)" % suffix)
+    responsible = resolve((responsible or "").strip(), db=db,
+                          operation="work.external-executor.responsible")
+    if not responsible:
+        raise WorkError("say the human responsible for %s (--responsible human:<id>)"
+                        % name)
+    if not responsible.startswith(HUMAN_PREFIX) or len(responsible) <= len(HUMAN_PREFIX):
+        human = known_human(db, responsible, cfg)
+        if not human:
+            raise WorkError("the responsible of %s is a human (human:<id>), not %r"
+                            % (name, responsible))
+        responsible = human
+    row = storage.of(db).external_executors.declare(
+        name, responsible, note=" ".join(str(note or "").split()), actor=who)
+    if row is not None:
+        return row
+    current = storage.of(db).external_executors.get(name)
+    if current is None:
+        raise WorkError("%s changed in the meantime: retry" % name)
+    if current.get("retired_at"):
+        raise WorkError("%s was retired by %s: a retired declaration takes no new "
+                        "reservation" % (name, current.get("retired_by") or "?"))
+    raise WorkError("%s is already declared with responsible %s; a declaration's "
+                    "responsible is not changed in silence — declare a new system "
+                    "name with the right responsible, or retire this one (a retired "
+                    "name is not reused)" % (name, current.get("responsible")))
+
+
+def external_executors(db: Db, *, include_retired: bool = False) -> list[dict]:
+    """#6091 : les exécutants externes non-agents déclarés, par nom."""
+    return storage.of(db).external_executors.rows(include_retired=include_retired)
+
+
+def retire_external_executor(db: Db, name: str, *, actor: str = "", cfg=None) -> dict:
+    """#6091 : retire une déclaration `system:…` (geste de pilote, idempotent).
+
+    Aucun lot n'est modifié : une réservation existante garde le nom jusqu'à
+    sa levée (`work external-executor <lot> --clear`) ou la fermeture du lot ;
+    un nouveau lot ne peut plus s'y réserver."""
+    who = corrector(cfg, db, actor, what="external executor", history=False)
+    name = (name or "").strip()
+    if not name.startswith(SYSTEM_PREFIX):
+        raise WorkError("only a declared non-agent external executor (%s<name>) is "
+                        "retired; %r is not one" % (SYSTEM_PREFIX, name))
+    row = storage.of(db).external_executors.retire(name, actor=who)
+    if row is None:
+        raise WorkError("%s is not declared as a non-agent external executor" % name)
+    return row
 
 
 def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) -> dict:

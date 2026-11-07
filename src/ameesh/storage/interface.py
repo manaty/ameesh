@@ -166,6 +166,7 @@ from __future__ import annotations
 from ameesh import work_lifecycle as lifecycle
 
 from .conversations import Conversations
+from .external_executors import ExternalExecutors
 from .provenance import Provenance
 from .work_dependencies import WorkDependencies
 from .work_footprints import WorkFootprints
@@ -5986,6 +5987,7 @@ class Storage(abc.ABC):
     approvals: Approvals
     nonces: Nonces
     work: WorkItems
+    external_executors: ExternalExecutors
     work_dependencies: WorkDependencies
     work_footprints: WorkFootprints
     provenance: Provenance
