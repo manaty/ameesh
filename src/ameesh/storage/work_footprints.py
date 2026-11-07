@@ -37,6 +37,16 @@ class WorkFootprints(abc.ABC):
         ligne par paire de chemins, `id`, `state`, `assignee`, `path` (le
         chemin de `item_id`), `other_path`. Même prédicat que la prise."""
 
+    @abc.abstractmethod
+    def release(self, item_id: int, *, state: str, assignee: str | None,
+                note: str, actor: str) -> dict | None:
+        """#6092 : libère l'occupation du lot sans le clore — il revient en
+        `intake` sans assigné (ni délégation), sous le verrou de la garde, si
+        son état est encore `state` et son assigné `assignee` (CAS) et s'il
+        n'est pas pinné ; la délégation en cours est annulée et `note` part
+        au journal, dans la même transaction. Branche, jalons, empreinte et
+        réservation d'exécutant externe restent. None si rien n'est écrit."""
+
     # #4818 (manaty/ameesh#3643) : plafond, politiques et analyses d'impact
 
     @abc.abstractmethod

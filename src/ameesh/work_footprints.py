@@ -12,10 +12,12 @@ dont elle est l'union (`work_item_footprints`, 0502) :
 * `manual` : posée par `ameesh work footprint <lot> --set …`, elle remplace
   l'estimation (une estimation fausse se corrige, avec sa ligne au journal) ;
 * `diff` : les fichiers réellement changés par la branche du lot, depuis sa
-  base — rafraîchie au gel et par `ameesh work footprint <lot> --refresh`.
+  base — rafraîchie au gel et par `ameesh work footprint <lot> --refresh`,
+  lue dans un clone local, sinon à la forge (API de comparaison, #6092).
 
 Un lot OCCUPE son empreinte dès qu'il est confié ou démarré, jusqu'à sa
-fusion ou sa fermeture. L'ordonnanceur ne confie jamais un lot `intake` dont
+fusion ou sa fermeture, ou jusqu'à ce qu'il la libère sans être clos
+(`--release`, #6092 : retour en `intake` sans assigné). L'ordonnanceur ne confie jamais un lot `intake` dont
 l'empreinte chevauche celle d'un lot occupant du même dépôt : la prise au
 repos (L165) ne le voit pas (`unassigned_lots`) et l'attribution le refuse
 sous le verrou du graphe des dépendances (`_assign_locked`). Il attend la
@@ -30,7 +32,7 @@ import posixpath
 import sys
 from typing import Iterable, Optional
 
-from . import storage, work
+from . import storage, work, work_lifecycle as lifecycle
 
 SOURCES = ("intake", "manual", "diff")
 ESTIMATE_SOURCES = ("intake", "manual")
@@ -48,6 +50,12 @@ RETRY_AFTER_S = 1800
 PASS_LIMIT = 5
 #: au plus tant de candidats au diff inspectés par passe (curseur, B2 de cx1)
 PASS_SCAN = 100
+#: #6092 : l'API de comparaison de la forge tronque la liste des fichiers à
+#: ce nombre ; une liste pleine n'est pas un diff complet
+FORGE_FILES_CAP = 300
+#: #6092 : les états dont l'occupation se libère sans clore le lot (un lot en
+#: revue attend son relecteur, pas son exécutant)
+RELEASE_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.BLOCKED)
 
 
 def normalize(path: str) -> Optional[str]:
@@ -400,7 +408,7 @@ def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = No
 
 
 def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
-            repo: Optional[str] = None) -> dict:
+            repo: Optional[str] = None, forge: bool = False, gh=None) -> dict:
     """Le diff réel de la branche du lot (ou de `head`, la tête gelée)
     remplace les lignes `diff` de l'empreinte.
 
@@ -409,14 +417,26 @@ def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
     pointe publiée est relue à la forge quand elle répond, et `fresh` dit si
     la base est prouvée fraîche ou seulement la ref du dernier fetch. Un diff
     qui trouve des fichiers fait tomber le marqueur d'empreinte inconnue (`.`)
-    de l'analyse (#4818)."""
+    de l'analyse (#4818).
+
+    #6092 : sans clone local du dépôt (ou avec `forge`), le diff est lu à la
+    forge (`forge_diff`) : la base est alors la cible publiée, fraîche par
+    construction, et `source` vaut `forge`."""
     item = work.get(db, item_id)
     if item is None:
         raise work.WorkError("lot %s not found" % item_id)
     tip = (head or "").strip() or (item.get("branch") or "").strip()
     if not tip:
         raise work.WorkError("lot %s has no branch: nothing to diff" % item_id)
-    clone, target = _clone_and_target(cfg, item, repo)
+    clone, target = (None, "") if forge else _clone_and_target(cfg, item, repo)
+    if not clone and (forge or not repo):
+        # #6092 : sans clone local (exécutant externe, hôte sans le dépôt),
+        # le diff se lit à la forge ; un `--repo` invalide reste un refus
+        paths, found = forge_diff(cfg, item, tip, gh=gh)
+        result = storage.of(db).work_footprints.replace(
+            item_id, "diff", paths, actor=actor, head=tip if head else None)
+        result.update(found)
+        return result
     if not clone or not target:
         raise work.WorkError("lot %s: no local clone of %s with a known target"
                              % (item_id, item.get("app") or "its repository"))
@@ -427,8 +447,122 @@ def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
                              % (item_id, target, tip, clone))
     result = storage.of(db).work_footprints.replace(
         item_id, "diff", paths, actor=actor, head=tip if head else None)
-    result.update({"target": target, "base": base, "fresh": fresh})
+    result.update({"target": target, "base": base, "fresh": fresh, "source": "clone"})
     return result
+
+
+def forge_diff(cfg, item: dict, head: str, *, gh=None) -> tuple:
+    """#6092 : les fichiers changés par `head` depuis sa base sur la cible,
+    lus à la forge par l'API de comparaison (`repos/<dépôt>/compare/
+    <cible>...<tête>`, même sémantique que `git diff cible...tête`), sans
+    clone local. Un renommage compte ses deux chemins (`--no-renames`).
+
+    Le dépôt est celui du lot (`work.lot_repository`), la cible son
+    `branch_target`, sinon celle du projet, sinon la branche par défaut de la
+    forge. Rend `(chemins, {target, base, fresh, source, repository})` ; lève
+    `WorkError` si la forge ne répond pas ou tronque la liste (un diff
+    partiel sous-estimerait l'empreinte : `--repo` sur un clone le lit)."""
+    from urllib.parse import quote
+    from . import intake_neighbors, land, plan_git
+    gh = gh or land._gh
+    slug = work.lot_repository(item, cfg)
+    target = plan_git.short_branch(item.get("branch_target"))
+    if not target and cfg is not None:
+        try:
+            target = intake_neighbors.project_target(cfg, item.get("app") or "")
+        except Exception:  # noqa: BLE001 - configuration illisible : défaut de la forge
+            target = ""
+    if not target:
+        proc = gh(["api", "repos/%s" % slug])
+        try:
+            data = land._json(proc, "gh api repos/%s" % slug, dict) \
+                if proc.returncode == 0 else {}
+        except land.LandError:
+            data = {}
+        target = str(data.get("default_branch") or "").strip()
+        if not target:
+            raise work.WorkError("lot %s: no target known for %s (branch target, project "
+                                 "target or forge default branch): nothing to diff"
+                                 % (item["id"], slug))
+    tip = plan_git.short_branch(head) or head
+    what = "%s...%s" % (target, tip)
+    proc = gh(["api", "repos/%s/compare/%s...%s"
+               % (slug, quote(target, safe="/"), quote(tip, safe="/"))])
+    if proc.returncode != 0:
+        raise work.WorkError("lot %s: %s unreadable at the forge (%s): %s"
+                             % (item["id"], what, slug,
+                                (proc.stderr or proc.stdout or "").strip()[:300]))
+    try:
+        data = land._json(proc, "gh api compare %s" % what, dict)
+    except land.LandError as exc:
+        raise work.WorkError("lot %s: %s" % (item["id"], exc)) from exc
+    files = data.get("files")
+    if not isinstance(files, list):
+        raise work.WorkError("lot %s: %s at the forge lists no files" % (item["id"], what))
+    if len(files) >= FORGE_FILES_CAP:
+        raise work.WorkError("lot %s: %s changes %d+ files, the forge truncates the list: "
+                             "refresh it from a clone (--repo)"
+                             % (item["id"], what, FORGE_FILES_CAP))
+    paths = []
+    for row in files:
+        if isinstance(row, dict):
+            paths.extend(str(row.get(key) or "")
+                         for key in ("filename", "previous_filename"))
+    base = str(((data.get("base_commit") or {}) or {}).get("sha") or "")
+    return _clean(paths), {"target": target, "base": base, "fresh": True,
+                           "source": "forge", "repository": slug}
+
+
+def release(db, cfg, item_id: int, *, actor: str, reason: str = "") -> dict:
+    """#6092 (manaty/ameesh#4642, écart 5) : libère l'occupation d'un lot
+    sans le clore, après un run échoué. Le lot revient en `intake` sans
+    assigné : il n'occupe plus son empreinte (`_OCCUPYING`), les lots qu'il
+    retenait redeviennent prenables, et il se reprend plus tard par le geste
+    habituel. Branche, jalons, empreinte et réservation d'exécutant externe
+    (#3447) restent ; la délégation en cours est annulée.
+
+    Seuls `intake`, `build` et `blocked` se libèrent (`RELEASE_STATES`) : un
+    lot en revue attend son relecteur. Autorité : l'assigné, l'exécutant
+    externe réservé, un humain ou un pilote. Idempotent : un lot qui
+    n'occupe rien rend `released: False` sans rien écrire."""
+    item = work.get(db, item_id)
+    if item is None:
+        raise work.WorkError("lot %s not found" % item_id)
+    state = str(item.get("state") or "")
+    current = (item.get("assignee") or "").strip() or None
+    if state == lifecycle.REQUESTED and current is None:
+        return {"id": int(item_id), "released": False, "state": state}
+    if state not in RELEASE_STATES:
+        raise work.WorkError("lot %s is %s: only an intake, build or blocked lot releases "
+                             "its occupation (closing it: ameesh work close)"
+                             % (item_id, state))
+    pinned = work._pinned_ref(item)
+    if pinned:
+        raise work._pinned_transition_error(item_id, pinned)
+    who = (actor or "").strip()
+    reserved = (item.get("external_executor") or "").strip()
+    if not who or (who != current and who != reserved
+                   and not who.startswith(work.HUMAN_PREFIX)
+                   and not work.is_pilot(cfg, db, who)):
+        raise work.WorkError(
+            "release refused: %s is neither the assignee (%s), the reserved external "
+            "executor (%s), a human, nor an orchestrator/design agent"
+            % (who or "nobody", current or "none", reserved or "none"))
+    note = "occupation released by %s (%s → intake, assignee %s → none; #6092)" % (
+        who, state, current or "none")
+    if reason.strip():
+        note += ": %s" % " ".join(str(reason).split())
+    row = storage.of(db).work_footprints.release(
+        item_id, state=state, assignee=current, note=note, actor=who)
+    if row is None:
+        raise work.WorkError("lot %s changed in the meantime: re-read it and retry" % item_id)
+    out = {"id": int(item_id), "released": True, "state": lifecycle.REQUESTED, "before": state,
+           "previous_assignee": current}
+    if current and current != who:
+        _notified, warning = work._notify_reassigned(db, item, current, "", who)
+        if warning:
+            out["warning"] = warning
+    return out
 
 
 def _path_label(path: str) -> str:
@@ -661,7 +795,18 @@ def add_parser(sub, func):
                       help="replace the diff rows from the branch's actual diff against "
                            "its target (branch target, else the project's declared "
                            "target, else the repository default)")
-    p.add_argument("--repo", help="local clone of the lot's repository")
+    mode.add_argument("--release", action="store_true",
+                      help="release the lot's occupation without closing it (#6092): "
+                           "an intake, build or blocked lot goes back to intake without "
+                           "assignee; branch, milestones, footprint and external-executor "
+                           "reservation stay (the assignee, the reserved executor, a human "
+                           "or a pilot)")
+    p.add_argument("--repo", help="local clone of the lot's repository (without one, "
+                                  "--refresh reads the diff at the forge)")
+    p.add_argument("--forge", action="store_true",
+                   help="with --refresh: read the diff at the forge (compare API) even "
+                        "when a local clone exists")
+    p.add_argument("--reason", default="", help="with --release: why (journaled)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--actor", default="")
     p.set_defaults(func=func)
@@ -679,8 +824,16 @@ def run(cfg, db, args) -> int:
         raise work.WorkError("footprint --set/--clear/--clear-diff refused: %s is neither "
                              "a human nor an orchestrator/design agent (pilot gesture)"
                              % (actor or "nobody"))
+    if getattr(args, "forge", False) and not args.refresh:
+        raise work.WorkError("--forge goes with --refresh")
+    if getattr(args, "forge", False) and args.repo:
+        raise work.WorkError("--forge and --repo are exclusive: the diff is read at the "
+                             "forge or in that clone")
     refreshed = None
-    if args.paths:
+    released = None
+    if getattr(args, "release", False):
+        released = release(db, cfg, args.id, actor=actor, reason=args.reason or "")
+    elif args.paths:
         set_paths(db, args.id, args.paths, actor=actor)
     elif args.clear:
         storage.of(db).work_footprints.replace(args.id, "manual", [], actor=actor,
@@ -704,18 +857,31 @@ def run(cfg, db, args) -> int:
                 print("lot #%d: estimate not written: a manual footprint or a basket with an "
                       "unknown line — the branch diff or --set PATH… settles it" % args.id)
     elif args.refresh:
-        refreshed = refresh(db, cfg, args.id, actor=actor, repo=args.repo)
+        refreshed = refresh(db, cfg, args.id, actor=actor, repo=args.repo,
+                            forge=bool(getattr(args, "forge", False)))
     found = describe(db, args.id)
+    if released is not None:
+        found["release"] = released
+        if released.get("warning"):
+            print("warning: %s" % released["warning"], file=sys.stderr)
+        if not args.json:
+            print("lot #%d: %s" % (args.id, (
+                "occupation released (%s → intake, no assignee); the lot stays open"
+                % released["before"]) if released["released"]
+                else "occupies nothing (intake, no assignee): nothing released"))
     if refreshed is not None:
-        found["refresh"] = {key: refreshed.get(key) for key in ("target", "base", "fresh")}
+        found["refresh"] = {key: refreshed.get(key)
+                            for key in ("target", "base", "fresh", "source", "repository")}
         if not refreshed.get("fresh"):
             print("warning: lot #%d: base %s of %s was not proven fresh (the clone's "
                   "last fetch only): fetch it, or rerun when the forge answers"
                   % (args.id, refreshed.get("base") or "?",
                      refreshed.get("target") or "?"), file=sys.stderr)
         elif not args.json:
-            print("lot #%d: diff base %s @%s (fresh)" % (
-                args.id, refreshed["target"], refreshed["base"][:12]))
+            print("lot #%d: diff base %s @%s (fresh%s)" % (
+                args.id, refreshed["target"], (refreshed.get("base") or "?")[:12],
+                ", read at the forge %s" % refreshed.get("repository")
+                if refreshed.get("source") == "forge" else ""))
     if args.json:
         print(json.dumps(found, ensure_ascii=False, indent=2, default=str))
         return 0
