@@ -120,7 +120,8 @@ _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
                   "merge", "prevalidation", "backlog", "staging", "accounts",
                   "paquet", "packet_tests", "file", "session", "auto_take", "projects")
-_OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production")
+_OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
+                  "contract_selection")
 _PRODUCTION_KEYS = ("branch",)
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
 #: ni fin en `/`, `.` ou `.lock` — jamais une ref arbitraire ni un commit
@@ -177,6 +178,23 @@ class MechanicsAbsent(MechanicsError):
 
 
 @dataclass(frozen=True)
+class ContractSelection:
+    """#6179: project registry path, absent in N-1 canon."""
+
+    registry: str
+
+
+def _contract_selection(value, where: str) -> ContractSelection:
+    from .contract_selection import relative_path
+
+    data = _mapping(value, where, ("registry",))
+    path = data.get("registry")
+    if not relative_path(path) or any(c in path for c in "*?[]"):
+        raise MechanicsError(where + ".registry: repository-relative file required")
+    return ContractSelection(path)
+
+
+@dataclass(frozen=True)
 class ProjectOverride:
     """Les blocs qu'un projet remplace, tels que déclarés (None : non déclaré)."""
 
@@ -191,6 +209,7 @@ class ProjectOverride:
     ci_faulty_lot: str | None = None
     #: #3022 : la branche de prod du projet (`production.branch`)
     production_branch: str | None = None
+    contract_selection: ContractSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -564,6 +583,8 @@ class Mechanics:
     #: #4448 : seuil de rotation de session par harnais ; None = bloc absent
     session: Session | None = None
 
+    contract_selection: ContractSelection | None = None
+
     # -- coupures -----------------------------------------------------------
 
     def zone(self) -> ZoneInfo:
@@ -735,6 +756,8 @@ class Mechanics:
             payload["staging"] = self.staging.to_dict()
         if self.paquet is not None:
             payload["paquet"] = self.paquet.to_dict()
+        if self.contract_selection is not None:
+            payload["contract_selection"] = {"registry": self.contract_selection.registry}
         if self.source:
             payload["source"] = self.source
         return payload
@@ -999,7 +1022,10 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
                                    ci_incident_label=label,
                                    ci_environment_red=environment,
                                    ci_faulty_lot=faulty,
-                                   production_branch=production))
+                                   production_branch=production,
+                                   contract_selection=(_contract_selection(
+                                       data["contract_selection"], scope + ".contract_selection")
+                                       if "contract_selection" in data else None)))
     return tuple(out)
 
 
@@ -1590,4 +1616,5 @@ def load(repo: str, commit: str, project: str, *,
         staging=document.staging,
         paquet=document.paquet,
         session=document.session,
+        contract_selection=override.contract_selection if override else None,
     )
