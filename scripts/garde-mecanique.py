@@ -111,6 +111,7 @@ SCHEMA_KEYS = (
     "session.max_tokens_by_harness",
     "session.by_role",
     "production.branch",
+    "contract_selection.registry",
     "projects",
 )
 
@@ -168,6 +169,7 @@ BINDINGS = {
     "repos_s": "file.repos_s",
     "wake_mail_s": "file.wake_mail_s",
     "production_branch": "production.branch",
+    "contract_selection_registry": "contract_selection.registry",
     # #4448 : le seuil commun et sa table par harnais
     "auto_take_excluded_families": "auto_take.excluded_families",
     "excluded_families": "auto_take.excluded_families",
@@ -567,6 +569,8 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "session.by_role":
         # #6046 : la table des réglages par classe de rôle, recopiée en mapping
         return value == "<dict>"
+    if key == "contract_selection.registry":
+        return isinstance(value, str) and bool(value.strip())
     if key == "production.branch":
         # #3022 : la branche de prod d'un projet se lit dans le canon
         # (`projects.<projet>.production.branch`), jamais recopiée en dur.
