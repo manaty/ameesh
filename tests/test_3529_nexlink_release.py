@@ -17,7 +17,8 @@ class VersionTests(unittest.TestCase):
     def test_sequence_and_invalid_names(self):
         self.assertEqual(nx.next_version("11v"), "11w")
         self.assertEqual(nx.next_version("11z"), "11aa")
-        for name in ("0a", "11aaaa", "v11w", "11W", "11w;prod"):
+        self.assertEqual(nx.next_version("11zzz"), "11aaaa")
+        for name in ("0a", "11", "v11w", "11W", "11w;prod"):
             with self.assertRaises(rc.ReleaseError):
                 nx.version_key(name)
 

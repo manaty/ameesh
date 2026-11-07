@@ -44,8 +44,9 @@ class SendReportThreadTest(unittest.TestCase):
         with mock.patch.object(rc, "report_recipients", return_value=["orchestrateur"]), \
                 mock.patch.object(rc.mail, "send", side_effect=RuntimeError("db down")), \
                 mock.patch("ameesh.fil.record") as record:
-            rc.send_report(self.cfg, object(), self.project, "corps", {})
+            delivered = rc.send_report(self.cfg, object(), self.project, "corps", {})
         record.assert_not_called()
+        self.assertEqual(delivered, {"orchestrateur": False})
 
 
 class NexlinkMissedTest(unittest.TestCase):

@@ -1177,6 +1177,10 @@ class ProjectRelease:
                         or not config.NAME_RE.fullmatch(handoff)):
             raise ReleaseError("release.projects.%s.staging_handoff: an agent name, "
                                "nexlink model only" % name)
+        if handoff:
+            # #6039 N4: canonicalize an alias as early as the configuration,
+            # without the registry (which the tick reads before any tag).
+            handoff = canonical_handoff(cfg, None, handoff)
         elected_role = ((getattr(cfg, "release", None) or {}).get("role")
                         or (getattr(cfg, "packet_watch", None) or {}).get("role"))
         executor = entry.get("staging_executor")
@@ -1215,6 +1219,42 @@ class ProjectRelease:
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
             suite_tolerated=tolerated, model=model, staging_handoff=handoff or "",
             attestation_timeout_s=number("attestation_timeout_s", ATTESTATION_TIMEOUT_S))
+
+
+def canonical_handoff(cfg, db, name: str) -> str:
+    """#6039 N4: the canonical agent of `staging_handoff`.
+
+    The configuration may spell an alias; the tick compares the attestation's
+    bound author with this name and sends the report to it, so both must use
+    the primary registry name. Without a database the canon's aliases are
+    resolved best-effort (a listing must not fail on an unreadable canon);
+    with the tick's database an unknown name is refused before any tag."""
+    from . import registry
+    from .agent_names import resolve
+    from .db import DbError
+    try:
+        canonical = resolve(name, db=db, cfg=cfg,
+                            operation="release.staging_handoff")
+    except (canon_mod.CanonError, OSError):
+        # The tick reads the canon again for its calendar; keep the spelling
+        # here, and the registry check below still refuses an unknown name.
+        canonical = name
+    except ValueError as exc:
+        raise ReleaseError("release.projects.staging_handoff: ambiguous agent %r: %s"
+                           % (name, exc)) from exc
+    except DbError as exc:
+        raise TransientReleaseError("release staging_handoff unreadable: %s" % exc) from exc
+    if db is not None and canonical:
+        try:
+            known = registry.get(db, canonical)
+        except DbError as exc:
+            raise TransientReleaseError("release staging_handoff unreadable: %s" % exc) from exc
+        if known is None:
+            raise ReleaseError(
+                "release.projects.staging_handoff: %r is not a registered agent; the "
+                "attestation author and the report recipient must be one known agent"
+                % name)
+    return canonical
 
 
 def child_credentials(project) -> frozenset[str]:
@@ -2823,7 +2863,7 @@ def report_recipients(cfg, db, project: ProjectRelease) -> list[str]:
 
 
 def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
-                *, urgent: bool = False, also: tuple = ()) -> None:
+                *, urgent: bool = False, also: tuple = ()) -> dict[str, bool]:
     """Mail a release report and write it in the project's own thread.
 
     #6014: the mailbox alone left a missed cutoff invisible in the project's
@@ -2832,11 +2872,17 @@ def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
     the same commit-then-record order as `notify._send_module_brief`: a
     thread failure never loses the delivered message. `also` (#6020) adds
     recipients in copy, such as the agent a staging is handed to.
+
+    #6039 N5: returns the delivery result **per recipient**. The function
+    catches a mail failure so a report never undoes a release, but a caller
+    that hands staging over must know whether its recipient got the message;
+    a `None` would make a failed send look reported.
     """
     from . import fil
     payload = {**(payload or {}), **({"urgent": True} if urgent else {})}
     recipients = report_recipients(cfg, db, project)
     recipients += [name for name in also if name and name not in recipients]
+    delivered: dict[str, bool] = {}
     for recipient in recipients:
         try:
             # The thread write is explicit below, in the release project:
@@ -2844,9 +2890,11 @@ def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
             message_id = mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="event",
                                    payload=payload, thread=False)
         except Exception as exc:  # a report failure never undoes a release
+            delivered[recipient] = False
             print("release: report not delivered to %s: %s" % (recipient, exc),
                   file=sys.stderr)
             continue
+        delivered[recipient] = True
         try:
             fil.record(cfg, db, sender=work.SYSTEM_SENDER, recipients=[recipient],
                        text=body, project=project.name, mailbox_ids=[message_id],
@@ -2854,6 +2902,7 @@ def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
         except Exception as exc:  # fil.record never raises; keep the report path safe
             print("release: thread entry not written for %s: %s" % (project.name, exc),
                   file=sys.stderr)
+    return delivered
 
 
 def write_report(cfg, project: ProjectRelease, report: dict) -> str:
