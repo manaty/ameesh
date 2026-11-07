@@ -452,19 +452,22 @@ class WorkFootprints(Contract):
             "   AND " + occupying_sql("w") + app_filter +
             " ORDER BY w.id LIMIT %s", params + (int(limit),))
 
-    def release(self, item_id, *, state, assignee, note, actor):
+    def release(self, item_id, *, state, assignee, executor, note, actor):
         # #6092 : sous le verrou de la garde, comme la prise et l'attribution :
         # une prise qui lit l'occupation ne croise jamais une libération à
-        # moitié écrite. CAS sur l'état et l'assigné lus par l'appelant.
+        # moitié écrite. CAS sur l'état, l'assigné et la réservation
+        # d'exécutant externe lus par l'appelant (B2 de cx1).
         with self.db.transaction() as tx:
             tx.execute(_GRAPH_LOCK)
             rows = tx.query(
                 "UPDATE work_items SET state = %s, assignee = NULL, updated_at = now(),"
                 "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
                 " WHERE id = %s AND state = %s AND assignee IS NOT DISTINCT FROM %s"
+                "   AND coalesce(btrim(external_executor), '') = %s"
                 "   AND " + _UNPINNED +
                 " RETURNING id, state, assignee",
-                (lifecycle.REQUESTED, int(item_id), str(state), assignee))
+                (lifecycle.REQUESTED, int(item_id), str(state), assignee,
+                 (executor or "").strip()))
             if not rows:
                 return None
             tx.execute("UPDATE work_item_delegations SET outcome = 'annulee',"

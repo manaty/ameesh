@@ -14,7 +14,7 @@ import json
 import subprocess
 from unittest import mock
 
-from ameesh import storage, work, work_footprints as fp
+from ameesh import identity, storage, work, work_footprints as fp
 from ameesh.storage.postgres.work import WorkItems
 
 from .test_4173_empreinte import _Empreintes
@@ -178,10 +178,57 @@ class ReleaseTest(_Empreintes):
         premier, _second = self.occupied()
         store = storage.of(self.db).work_footprints
         self.assertIsNone(store.release(premier["id"], state="build", assignee="claude2",
-                                        note="t", actor="t"))
+                                        executor=None, note="t", actor="t"))
         self.assertIsNone(store.release(premier["id"], state="blocked", assignee="claude1",
-                                        note="t", actor="t"))
+                                        executor=None, note="t", actor="t"))
         self.assertEqual(work.get(self.db, premier["id"])["state"], "build")
+
+    def test_b2_reservation_remplacee_entre_lecture_et_ecriture(self):
+        for name in ("ima", "ima2"):
+            self.agent(name, harness="codex")
+            self.db.execute("UPDATE agent_registry SET mode = 'externe' WHERE name = %s",
+                            (name,))
+        lot = work.add(self.db, title="réservé", app="nexlink", external_executor="ima",
+                       actor="human:proprio", cfg=self.cfg)
+        self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s", (lot["id"],))
+        read = work.get(self.db, lot["id"])
+        # le pilote remplace la réservation entre la lecture et l'écriture
+        work.set_external_executor(self.db, lot["id"], "ima2", actor="human:proprio",
+                                   cfg=self.cfg)
+        with mock.patch.object(work, "get", return_value=read):
+            with self.assertRaises(work.WorkError):
+                fp.release(self.db, self.cfg, lot["id"], actor="ima")
+        after = work.get(self.db, lot["id"])
+        self.assertEqual((after["state"], after["external_executor"]), ("build", "ima2"))
+
+    def cli(self, *argv):
+        parser = argparse.ArgumentParser()
+        fp.add_parser(parser.add_subparsers(), func=None)
+        return fp.run(self.cfg, self.db, parser.parse_args(["footprint", *argv]))
+
+    def test_b1_actor_emprunte_refuse_sans_mutation(self):
+        self.agent("claude1", team="nexlink")
+        self.agent("claude2", team="nexlink")
+        premier, _second = self.occupied()
+        lot = str(premier["id"])
+        tiers = identity.Binding(name="claude2", source="runner", ok=True)
+        anonyme = identity.Binding()
+        for binding, actor in ((tiers, "claude1"), (tiers, "human:proprio"),
+                               (anonyme, "claude1")):
+            with mock.patch.object(identity, "resolve_binding", return_value=binding):
+                with self.assertRaises(work.WorkError):
+                    self.cli(lot, "--release", "--actor", actor)
+            item = work.get(self.db, premier["id"])
+            self.assertEqual((item["state"], item["assignee"]), ("build", "claude1"))
+        # le porteur lié se libère lui-même ; le journal le nomme
+        porteur = identity.Binding(name="claude1", source="runner", ok=True)
+        with mock.patch.object(identity, "resolve_binding", return_value=porteur):
+            self.assertEqual(self.cli(lot, "--release", "--actor", "claude1"), 0)
+        self.assertEqual(work.get(self.db, premier["id"])["state"], "intake")
+        notes = [r["actor"] for r in self.db.query(
+            "SELECT actor FROM work_item_events WHERE work_item_id = %s"
+            " AND note LIKE 'occupation released%%'", (premier["id"],))]
+        self.assertEqual(notes, ["claude1"])
 
     def test_cli_forge_sans_refresh_refuse(self):
         parser = argparse.ArgumentParser()

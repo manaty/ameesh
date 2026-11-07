@@ -39,10 +39,11 @@ class WorkFootprints(abc.ABC):
 
     @abc.abstractmethod
     def release(self, item_id: int, *, state: str, assignee: str | None,
-                note: str, actor: str) -> dict | None:
+                executor: str | None, note: str, actor: str) -> dict | None:
         """#6092 : libère l'occupation du lot sans le clore — il revient en
         `intake` sans assigné (ni délégation), sous le verrou de la garde, si
-        son état est encore `state` et son assigné `assignee` (CAS) et s'il
+        son état est encore `state`, son assigné `assignee` et son exécutant
+        externe réservé `executor` (CAS, None ou "" : aucun) et s'il
         n'est pas pinné ; la délégation en cours est annulée et `note` part
         au journal, dans la même transaction. Branche, jalons, empreinte et
         réservation d'exécutant externe restent. None si rien n'est écrit."""

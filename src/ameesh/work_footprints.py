@@ -524,7 +524,10 @@ def release(db, cfg, item_id: int, *, actor: str, reason: str = "") -> dict:
     Seuls `intake`, `build` et `blocked` se libèrent (`RELEASE_STATES`) : un
     lot en revue attend son relecteur. Autorité : l'assigné, l'exécutant
     externe réservé, un humain ou un pilote. Idempotent : un lot qui
-    n'occupe rien rend `released: False` sans rien écrire."""
+    n'occupe rien rend `released: False` sans rien écrire. L'écriture est un
+    CAS sur l'état, l'assigné ET la réservation lus (B2 de cx1) : une
+    réservation remplacée entre la lecture et l'écriture n'est pas libérée
+    au nom de l'ancien exécutant."""
     item = work.get(db, item_id)
     if item is None:
         raise work.WorkError("lot %s not found" % item_id)
@@ -553,7 +556,7 @@ def release(db, cfg, item_id: int, *, actor: str, reason: str = "") -> dict:
     if reason.strip():
         note += ": %s" % " ".join(str(reason).split())
     row = storage.of(db).work_footprints.release(
-        item_id, state=state, assignee=current, note=note, actor=who)
+        item_id, state=state, assignee=current, executor=reserved, note=note, actor=who)
     if row is None:
         raise work.WorkError("lot %s changed in the meantime: re-read it and retry" % item_id)
     out = {"id": int(item_id), "released": True, "state": lifecycle.REQUESTED, "before": state,
@@ -832,6 +835,11 @@ def run(cfg, db, args) -> int:
     refreshed = None
     released = None
     if getattr(args, "release", False):
+        # B1 de cx1 : l'autorité de la libération est l'identité liée de la
+        # session, jamais un `--actor` emprunté (même garde que les jalons) ;
+        # le journal nomme cet acteur vérifié
+        actor = work.milestone_actor(cfg, db, args.actor, kind="occupation",
+                                     what="release")
         released = release(db, cfg, args.id, actor=actor, reason=args.reason or "")
     elif args.paths:
         set_paths(db, args.id, args.paths, actor=actor)

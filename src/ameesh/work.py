@@ -512,7 +512,8 @@ def publisher(cfg, db, explicit: str | None = None) -> str:
         "its own bound session, a human terminal says --actor human:<id>" % text)
 
 
-def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> str:
+def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "",
+                    what: str = "milestone") -> str:
     """#2928 : l'auteur d'un jalon `frozen`/`verdict`, vérifié au chemin d'écriture.
 
     Même garde que `forcer` (#540), pour la même raison : un jalon est une
@@ -526,6 +527,9 @@ def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> 
 
     La provenance exacte (#1465) est ensuite écrite dans la même transaction
     que le jalon ; un tour managé ne peut signer que sa propre preuve.
+
+    #6092 : `what` nomme un autre geste gardé de même (la libération d'une
+    occupation, `work footprint --release`) dans les refus.
     """
     from . import identity
 
@@ -538,14 +542,14 @@ def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> 
     binding = identity.resolve_binding(cfg, db)
     if not binding.ok and (binding.name or binding.source != "none"
                            or os.environ.get("AGENT_MAIL_NAME")):
-        raise WorkError("milestone refused: invalid session identity (%s)"
-                        % (binding.reason or "unbound identity"))
+        raise WorkError("%s refused: invalid session identity (%s)"
+                        % (what, binding.reason or "unbound identity"))
     if binding.name:
         if text and text != binding.name:
             raise WorkError(
-                "milestone refused: this session belongs to %s, it does not post a "
-                "%s milestone on behalf of %s"
-                % (binding.name, kind or "work", text))
+                "%s refused: this session belongs to %s, it does not post a "
+                "%s %s on behalf of %s"
+                % (what, binding.name, kind or "work", what, text))
         return binding.name
     if not text:
         # aucun nom : le jalon reste anonyme (« inconnu », origine inconnue),
@@ -554,9 +558,10 @@ def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> 
     if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
         return text
     raise WorkError(
-        "milestone refused: %s is not a human and this session has no bound agent "
-        "identity (runner lease or `ameesh mail bind`); an agent posts a milestone "
-        "from its own bound session, a human terminal says --actor human:<id>" % text)
+        "%s refused: %s is not a human and this session has no bound agent "
+        "identity (runner lease or `ameesh mail bind`); an agent posts a %s "
+        "from its own bound session, a human terminal says --actor human:<id>"
+        % (what, text, what))
 
 
 def pin_authority(cfg, db, actor: str | None = None) -> str | None:
