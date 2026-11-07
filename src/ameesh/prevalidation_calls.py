@@ -741,6 +741,14 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
         runner=bounded)
     if problem:
         return None
+    shared = plan.get("contract_plan")
+    if isinstance(shared, dict) and shared.get("active"):
+        from . import contract_plan
+        try:
+            contract_plan.consume(shared)
+        except ValueError:
+            return None
+        required = tuple(sorted(set(required) | set(shared["contracts"])))
     if deadline is not None and deadline.expired():
         raise prevalidation.PrevalidationError(
             "run-incomplete",
