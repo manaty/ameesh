@@ -241,13 +241,20 @@ def already_cut(project, base, previous):
 
 
 def pending_already_cut(project, pending):
-    """#6152: a frozen candidate whose base is already another release.
+    """#6152: `(version, empty)` when a frozen candidate must not resume.
 
     A pending opened before this guard survives in the state (the real 11av
     at 10:00Z, base tagged 11au); resuming it would tag the same tree twice.
     Its own tag is looked up by *version*, not on the base: `publish` tags
     `pending["sha"]`, the merge candidate, which can differ from the base
     (review B/P1). A crash after that push must reconcile, not skip.
+
+    An empty candidate left by an earlier tick has nothing to publish either:
+    resuming it would tag an empty release, and a failing CI part can keep it
+    pending forever (real 11av, sql-invariant.yml). It closes `skipped`, with
+    no tag; the returned flag says so, so the announcement does not claim a
+    release that never existed. Its own tag still wins: a published candidate
+    reconciles even when empty.
     """
     version = pending.get("version")
     tags = release_tags(project)
@@ -255,13 +262,15 @@ def pending_already_cut(project, pending):
         return None
     at_base = {value for value, commit in tags.items() if commit == pending["base"]}
     if at_base:
-        return max(at_base, key=version_key)
+        return max(at_base, key=version_key), False
     if pending.get("previous") == pending["base"]:
         known = branches(project)
         matches = [value for value, sha in known.items()
                    if sha == pending["base"] and value != version]
         if matches:
-            return max(matches, key=version_key)
+            return max(matches, key=version_key), False
+    if pending.get("empty"):
+        return version, True
     return None
 
 
@@ -1156,13 +1165,15 @@ def _train_pause(db, project, now):
 
 
 def _skip_cutoff(cfg, db, project, slot, at, label, source, now, save, *,
-                 version, head, base):
+                 version, head, base, empty=False):
     """#6152: the base is already a release; skip the slot, never cut it twice.
 
     A manual cutoff (rel-01, 07/11 09:42Z) tagged develop's head; the 10:00Z
     tick would have cut the same tree again as 11av. The slot is recorded as
     `skipped` (not `missed`), nothing is tagged, branched or dispatched, and
-    the short announcement is not a failure report.
+    the short announcement is not a failure report. `empty` names the other
+    reason: a frozen candidate with no content to publish, which never had a
+    release tag to name.
     """
     # Never move the recorded slot backwards: a stale pending is skipped on
     # its own cutoff, then the current tick still handles the due one.
@@ -1171,11 +1182,17 @@ def _skip_cutoff(cfg, db, project, slot, at, label, source, now, save, *,
     slot["last_label"] = label
     slot.pop("pending_nexlink", None)
     save()
-    message = "créneau sauté : tête déjà coupée en release-%s" % version
+    if empty:
+        message = ("créneau sauté : coupe vide, aucun contenu nouveau à publier "
+                   "(release-%s non posée)" % version)
+        tag = None
+    else:
+        message = "créneau sauté : tête déjà coupée en release-%s" % version
+        tag = TAG_PREFIX + version
     report = {
         "schema": rc.SCHEMA, "result": "skipped", "cutoff_at": at, "label": label,
         "project": project.name, "canon_commit": source.commit,
-        "completed_at": now, "version": version, "tag": TAG_PREFIX + version,
+        "completed_at": now, "version": version, "tag": tag, "empty": empty,
         "head": head, "base": base, "message": message,
         "host": str(getattr(cfg, "host", "") or ""),
         "state_path": rc.state_path(cfg),
@@ -1267,12 +1284,14 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
             save()
         passed = None
         if pending is not None:
-            earlier = pending_already_cut(project, pending)
-            if earlier:
+            skip = pending_already_cut(project, pending)
+            if skip:
                 # #6152: a pending opened before this guard (the real 11av at
-                # 10:00Z, base already tagged 11au) must not resume and tag the
-                # same tree twice. Drop its integration candidate (lease) and
+                # 10:00Z, base already tagged 11au), or an empty candidate left
+                # by an earlier tick, must not resume and tag a tree a release
+                # already covers. Drop its integration candidate (lease) and
                 # record its slot as skipped, then let a due slot proceed.
+                earlier, empty = skip
                 slot["abandoned_integration"] = {
                     "ref": pending["integration"], "sha": pending["sha"]}
                 try:
@@ -1282,7 +1301,9 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 passed = _skip_cutoff(
                     cfg, db, project, slot, pending["cutoff_at"],
                     pending.get("label") or label, source, now, save,
-                    version=earlier, head=pending["head"], base=pending["base"])
+                    version=earlier,
+                    head=pending.get("head") or pending["base"],
+                    base=pending["base"], empty=empty)
                 pending = None
         if pending is not None and pending.get("handoff"):
             _handoff_reannounce(cfg, db, project, pending, save)

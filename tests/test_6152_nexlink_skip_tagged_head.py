@@ -96,9 +96,25 @@ class TagTests(unittest.TestCase):
         self.git("branch", "release/11au", self.base)
         self.git("push", "-q", "origin", "release/11au")
         pending = {"version": "11av", "base": self.base, "previous": self.base}
-        self.assertEqual(nx.pending_already_cut(self.project, pending), "11au")
+        self.assertEqual(nx.pending_already_cut(self.project, pending),
+                         ("11au", False))
         own = dict(pending, version="11au")
         self.assertIsNone(nx.pending_already_cut(self.project, own))
+
+    def test_empty_pending_without_any_tag_is_skipped(self):
+        """The live 11av shape without the 11au tag: nothing to publish."""
+        pending = {"version": "11av", "base": self.base, "previous": "a" * 40,
+                   "sha": "e" * 40, "empty": True}
+        self.assertEqual(nx.pending_already_cut(self.project, pending),
+                         ("11av", True))
+
+    def test_empty_pending_with_its_own_tag_resumes(self):
+        """A crash after the empty candidate's tag push still reconciles."""
+        self.git("tag", "release-11av", self.base)
+        self.git("push", "-q", "origin", "refs/tags/release-11av")
+        pending = {"version": "11av", "base": self.base, "previous": "a" * 40,
+                   "sha": self.base, "empty": True}
+        self.assertIsNone(nx.pending_already_cut(self.project, pending))
 
 
 class PlanTests(unittest.TestCase):
@@ -201,6 +217,33 @@ class ExecuteTests(unittest.TestCase):
         self.assertNotIn("pending_nexlink", slot)
         self.assertEqual(slot["last_result"], "skipped")
         self.assertEqual(slot["last_cutoff"], 1000)
+
+    def test_empty_pending_from_older_tick_is_skipped_before_any_tag(self):
+        """Witness: empty pending, then tick, then no pending and no tag."""
+        self.save_pending()
+        dropped = lambda project, slot, save: (slot.pop("abandoned_integration"), save())
+        with mock.patch.object(nx, "release_tags", return_value={}), \
+                mock.patch.object(nx, "drop_abandoned", side_effect=dropped) as drop, \
+                mock.patch.object(nx, "ensure_ref") as ensure, \
+                mock.patch.object(nx, "merge_candidate") as merge, \
+                mock.patch.object(nx, "publish") as publish, \
+                mock.patch.object(nx, "workflow_step") as dispatch:
+            report = nx.execute(self.cfg, object(), self.project, now=1000)
+        self.assertEqual(report["result"], "skipped")
+        self.assertEqual(report["version"], "11av")
+        self.assertTrue(report["empty"])
+        self.assertIsNone(report["tag"])
+        self.assertIn("coupe vide", report["message"])
+        drop.assert_called_once()
+        ensure.assert_not_called()
+        merge.assert_not_called()
+        publish.assert_not_called()
+        dispatch.assert_not_called()
+        slot = rc.load_state(self.cfg)["projects"]["nexlink"]
+        self.assertNotIn("pending_nexlink", slot)
+        self.assertEqual(slot["last_result"], "skipped")
+        self.assertEqual(slot["last_cutoff"], 1000)
+        self.assertFalse(rc.send_report.call_args.kwargs["urgent"])
 
     def test_pending_with_its_own_tag_resumes_instead_of_skipping(self):
         """A crash after the pending's own tag push must reconcile, not skip."""

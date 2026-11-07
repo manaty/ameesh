@@ -264,18 +264,30 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("pending_nexlink", rc.load_state(self.cfg)["projects"]["nexlink"])
 
     def test_empty_cut_creates_branch_without_staging_or_migration_read(self):
-        state = rc.load_state(self.cfg)
-        state["projects"]["nexlink"]["pending_nexlink"]["empty"] = True
-        rc.save_state(self.cfg, state)
-        with mock.patch.object(nx, "workflow_step", return_value=True) as dispatch, \
+        # A fresh empty cutoff (created and closed by the same tick) still
+        # publishes; only a pending left by an earlier tick is skipped (#6152).
+        rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {"nexlink": {}}})
+        with mock.patch.object(nx, "snapshot",
+                               return_value=("b" * 40, "c" * 40, "a" * 40, {}, None)), \
+                mock.patch.object(nx, "previous_release", return_value="a" * 40), \
+                mock.patch.object(nx, "choose_version", return_value="11w"), \
+                mock.patch.object(nx, "merge_candidate", return_value="a" * 40), \
+                mock.patch.object(nx, "ci_plan",
+                                  return_value={"parts": [{"workflow": "backend-suite.yml"}],
+                                                "max_inflight": 2}), \
+                mock.patch.object(rc, "same_tree", return_value=True), \
+                mock.patch.object(nx, "workflow_step", return_value=True) as dispatch, \
                 mock.patch.object(nx, "publish", return_value="https://example/pr/1") as publish, \
                 mock.patch.object(nx, "migration_gate") as migration:
-            report = rc.execute(self.cfg, None, self.project, now=100000)
-            self.assertEqual(report["result"], "empty")
-            publish.assert_called_once()
-            migration.assert_not_called()
-            self.assertTrue(all(not call.kwargs["staging"] for call in dispatch.call_args_list))
-            self.assertEqual(rc.load_state(self.cfg)["projects"]["nexlink"]["last_cutoff"], 100)
+            report = rc.execute(self.cfg, None, self.project, now=1100)
+        self.assertEqual(report["result"], "empty")
+        self.assertTrue(report["empty"])
+        publish.assert_called_once()
+        migration.assert_not_called()
+        self.assertTrue(all(not call.kwargs["staging"] for call in dispatch.call_args_list))
+        slot = rc.load_state(self.cfg)["projects"]["nexlink"]
+        self.assertEqual(slot["last_cutoff"], 1000)
+        self.assertNotIn("pending_nexlink", slot)
 
     def test_wave_starts_at_most_three_parts(self):
         state = rc.load_state(self.cfg)
