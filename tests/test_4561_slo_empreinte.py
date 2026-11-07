@@ -414,7 +414,11 @@ class CapacityTest(unittest.TestCase):
         # 3 h sans mouvement : le bloqueur est nommé comme tel
         self.assertIn("sans mouvement depuis 3 h", gesture)
 
-    def test_une_feuille_de_route_epuisee_reste_ouverte_par_l_attente(self):
+    def test_une_feuille_de_route_epuisee_garde_l_attente_d_empreinte_visible(self):
+        # #4561, #6215 : l'attente d'empreinte ne rouvre plus la route — un
+        # lot retenu n'est pas démarrable, le sommeil endort donc les agents
+        # (#4717) — mais le projet ne se tait pas : la ligne dit la feuille de
+        # route épuisée et l'alerte nomme l'attente et son geste.
         split = {"id": 90, "source": "file-decoupage:ameesh", "state": "intake",
                  "app": "ameesh", "created_ts": T - 2 * H,
                  "title": "Découper la feuille de route de ameesh"}
@@ -426,7 +430,7 @@ class CapacityTest(unittest.TestCase):
                                         {"id": 7, "state": "qa", "assignee": "dev1",
                                          "app": "ameesh", "last_activity_ts": T - H}],
                              roadmap_notes=notes)
-        self.assertIsNone(cap["projects"][0]["roadmap_exhausted"])
+        self.assertIsNotNone(cap["projects"][0]["roadmap_exhausted"])
         self.assertIn("en attente d'empreinte", cap["alerts"][0]["gesture"])
 
 
