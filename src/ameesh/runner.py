@@ -632,6 +632,26 @@ def agent_adapter(harness: str, harness_bin: str | None,
 #: l'écriture des réservations ; pris AVANT `Runner.lock`, jamais l'inverse.
 _SLOT_RESERVATIONS_LOCK = threading.Lock()
 
+#: #6134 : ce qui, dans le journal d'un lot, dit qu'une note a armé le réveil
+#: courant — `--wake-at` ajoute `[réveil programmé: …]` à sa note et
+#: `ameesh work wake` écrit `wake: … (due …)`. Une délivrance ou une annulation
+#: n'arme rien.
+_WAKE_ARM_MARK = "[réveil programmé:"
+_WAKE_ARM_PREFIX = "wake: "
+_WAKE_DONE_PREFIXES = ("wake: scheduled wake delivered", "wake: cancelled")
+
+
+def _wake_arming_event(events) -> dict | None:
+    """#6134 : le dernier événement qui a armé le réveil du lot, ou None."""
+    for event in events or ():
+        note = str(event.get("note") or "").strip()
+        if note.startswith(_WAKE_DONE_PREFIXES):
+            continue
+        if _WAKE_ARM_MARK in note.lower() or (
+                note.startswith(_WAKE_ARM_PREFIX) and "(due " in note):
+            return event
+    return None
+
 
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
@@ -6842,6 +6862,44 @@ class AgentWorker(threading.Thread):
             return True
         return bool(taken) and abs(float(taken["wake_ts"]) - claim["wake_ts"]) < 0.001
 
+    def _wake_abandoned_by_lift(self, lot: int) -> str:
+        """#6134 : le réveil échu est-il armé par une note `hold:` dont la
+        retenue a été levée avant sa délivrance ?
+
+        Un réveil armé par une note de retenue (`ameesh work note … --wake-at`)
+        appartient au plan de cette retenue. Si la retenue est levée avant
+        l'échéance, le rendez-vous n'a plus d'objet : l'exécuteur l'annule et
+        laisse une ligne `wake: cancelled …` au journal du lot, au lieu de
+        réveiller la session sur un plan abandonné (#6134 : deux sessions du
+        même agent, l'une armée et l'autre réveillée après un `unhold:`).
+        L'événement d'armement est la dernière note portant
+        `[réveil programmé: …]` ou le dernier `wake: … (due …)` ; une ligne de
+        délivrance ou d'annulation n'arme rien. Rend la raison, ou '' quand le
+        réveil peut être délivré (retenue encore active, ou armé autrement).
+        Sur un exécuteur médié, le journal du lot n'est pas au contrat (L107) :
+        le réveil reste délivré et l'annulation y est un suivi."""
+        if getattr(self.runner, "mediated", False):
+            return ""  # le journal du lot n'est pas au contrat médié
+        from . import planned_waits, work
+        try:
+            arm = _wake_arming_event(
+                storage.of(self.db).work.events(int(lot), 200))
+            if arm is None or not planned_waits.is_hold_note(arm.get("note")):
+                return ""
+            holds = planned_waits.active_holds(
+                self.db,
+                storage.of(self.db).progress.lot_hold_events(
+                    [int(lot)], planned_waits.HOLD_NOTE_PATTERNS),
+                cfg=self.cfg)
+        except (db_mod.DbError, AttributeError) as exc:
+            log_async("[%s] wake arming note unreadable for lot #%s (%s)"
+                      % (self.name, lot, exc))
+            return ""
+        if (holds.get(int(lot)) or {}).get(str(arm.get("actor") or "")):
+            return ""
+        return ("the hold note that armed it (%s) was lifted before delivery"
+                % (arm.get("actor") or "unknown author"))
+
     def _scheduled_wake_spec(self) -> dict | None:
         """#2466 : réveil programmé échu d'un lot de l'agent.
 
@@ -6860,16 +6918,35 @@ class AgentWorker(threading.Thread):
         budget, porte et pression d'hôte, authentification) sont déjà passées ;
         un lot sans dossier reste armé (#811). Sur un exécuteur médié, les
         trois opérations passent par le contrat
-        (`lot_sessions.due_wakes/claim_wake/consume_wake`, #2613)."""
+        (`lot_sessions.due_wakes/claim_wake/consume_wake`, #2613). Un réveil
+        armé par une note `hold:` est annulé si cette retenue est levée avant
+        la délivrance : le rendez-vous appartient au plan de la retenue, il ne
+        réveille plus une session pour un plan abandonné (#6134)."""
         if time.monotonic() - getattr(self, "_scheduled_wake_checked",
                                       float("-inf")) < self.SCHEDULED_WAKE_CHECK_S:
             return None
         self._scheduled_wake_checked = time.monotonic()
+        from . import work as work_mod
         st = storage.of(self.db).lot_sessions
         now = time.time()
         try:
             for row in st.due_wakes(self.name, now, self.WAKE_CLAIM_TTL):
                 if self._lot_workdir_blocked(row["id"]):
+                    continue
+                abandon = self._wake_abandoned_by_lift(int(row["id"]))
+                if abandon:
+                    # #6134 : le réveil ne part pas ; l'échéance est retirée
+                    # avec une ligne nommée, jamais laissée due pour un autre
+                    # passage (elle serait réclamée en boucle).
+                    try:
+                        work_mod.schedule_wake(
+                            self.db, int(row["id"]), None,
+                            text=abandon, actor="ameesh")
+                    except (work_mod.WorkError, db_mod.DbError) as exc:
+                        log_async("[%s] abandoned wake for lot #%s not cancelled "
+                                  "(%s)" % (self.name, row["id"], exc))
+                    log_async("[%s] scheduled wake for lot #%s cancelled: %s"
+                              % (self.name, row["id"], abandon))
                     continue
                 taken = st.claim_wake(self.name, int(row["id"]), now,
                                       self.WAKE_CLAIM_TTL)
@@ -11248,6 +11325,21 @@ class Runner:
         if agent.get("last_error") != error:
             storage.of(self.db).agents.note_unleased(agent["name"], self.host, error)
 
+    def _same_owner_turn_in_progress(self, name: str) -> bool:
+        """#6134 : ce bail vivant est-il tenu par CET identifiant d'exécuteur
+        avec un tour en cours ? L'ancien processus ne verrait la perte de son
+        epoch qu'au battement suivant (`lease_ttl / 3`) : le nouveau détenteur
+        ne réclame pas avant la fin du tour ou l'échéance du bail."""
+        if getattr(self, "mediated", False):
+            return False  # L107 : l'état natif du bail n'est pas au contrat
+        try:
+            state = storage.of(self.db).leases.state(name)
+        except db_mod.DbError:
+            return False
+        return bool(state and state.get("live")
+                    and state.get("lease_owner") == self.runner_id
+                    and state.get("status") == "running")
+
     def election_brief_for(self, agent: dict) -> str | None:
         """L165 (EP3) : briefing de reprise d'une relève CROISÉE, ou None.
 
@@ -12099,6 +12191,18 @@ class Runner:
                                        election_brief=election_brief or None)
                 if not lease:
                     self._release_slot(agent["name"])
+                    # #6134 : même identifiant, tour encore en cours — la
+                    # réclamation attend la fin du tour ou l'échéance. Le
+                    # refus est nommé, une fois par changement d'erreur.
+                    if self._same_owner_turn_in_progress(agent["name"]):
+                        reason = ("the same runner identity holds a turn in progress: "
+                                  "the lease is not taken again until the turn ends or "
+                                  "its lease expires")
+                        if agent.get("last_error") != "lease_not_taken: " + reason:
+                            log_async("[%s] same runner identity: a turn is already "
+                                      "in progress; waiting for its lease to expire"
+                                      % agent["name"])
+                        self._note_unleased(agent, reason)
                     continue  # un autre exécuteur a gagné la course
                 self._election_free_since.pop(agent["name"], None)
                 if agent.get("releve") == "election":

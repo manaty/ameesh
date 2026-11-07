@@ -1012,6 +1012,13 @@ class Leases(interface.Leases):
         `WHERE` sans nouvelle version — grille codex3). Mêmes règles que
         `claimable`, dans la même instruction.
 
+        #6134 : un même `owner` ne reprend pas un bail vivant dont le tour est
+        en cours (`status = running`) : il attend la fin du tour ou l'échéance.
+        Sans cette condition, deux processus du même identifiant d'exécuteur
+        pouvaient se chevaucher pendant `lease_ttl / 3` (le temps que l'ancien
+        voie la perte de son epoch). Entre deux tours, la reprise immédiate
+        reste permise — un redémarrage propre ne perd pas sa session.
+
         L165 (EP1) : pour un agent `releve: election`, `host` est l'hôte
         candidat qui réclame. La réclamation déplace la ligne sur cet hôte
         (dossier et verdict de placement du candidat, lus dans
@@ -1160,8 +1167,17 @@ class Leases(interface.Leases):
                -- force le brief à null) : le CAS refuse, sans rien écrire.
                AND (r.releve <> 'election' OR verrou.host = __H__
                     OR p.brief IS NOT NULL)
-               AND (r.lease_owner IS NULL OR r.lease_owner = %s
-                    OR r.lease_expires_at < clock_timestamp())
+               -- #6134 : le même identifiant d'exécuteur ne reprend pas un
+               -- tour EN COURS tant que son bail est vivant. L'ancien
+               -- processus ne verrait la perte de son epoch qu'au battement
+               -- suivant (`lease_ttl / 3`, 100 s par défaut) : deux tours du
+               -- même agent pouvaient se chevaucher et écrire la même
+               -- branche. Une reprise après redémarrage attend donc
+               -- l'échéance ; entre deux tours (`status` <> 'running'), la
+               -- reprise immédiate du même exécuteur reste permise.
+               AND (r.lease_owner IS NULL
+                    OR r.lease_expires_at < clock_timestamp()
+                    OR (r.lease_owner = %s AND r.status <> 'running'))
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
                -- #254 : sur un hôte en pause, aucun nouveau bail (le sien,
                -- encore vivant, se renouvelle)
