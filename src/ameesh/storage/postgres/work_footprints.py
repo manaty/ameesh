@@ -463,7 +463,7 @@ class WorkFootprints(Contract):
                 "UPDATE work_items SET state = %s, assignee = NULL, updated_at = now(),"
                 "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
                 " WHERE id = %s AND state = %s AND assignee IS NOT DISTINCT FROM %s"
-                "   AND coalesce(btrim(external_executor), '') = %s"
+                "   AND coalesce(btrim(to_jsonb(work_items)->>'external_executor'), '') = %s"
                 "   AND " + _UNPINNED +
                 " RETURNING id, state, assignee",
                 (lifecycle.REQUESTED, int(item_id), str(state), assignee,
