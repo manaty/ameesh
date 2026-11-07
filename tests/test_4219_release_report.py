@@ -93,12 +93,26 @@ class RecipientsTest(unittest.TestCase):
         with mock.patch.object(release_cutoff, "report_recipients",
                                return_value=["smichea", "mesh-design"]), \
                 mock.patch.object(release_cutoff.mail, "send") as send:
-            release_cutoff.send_report(object(), object(), self.project("smichea"),
-                                       "corps", {"tag": "v1.27.0"}, urgent=True)
+            delivered = release_cutoff.send_report(
+                object(), object(), self.project("smichea"),
+                "corps", {"tag": "v1.27.0"}, urgent=True)
         self.assertEqual([call.args[2] for call in send.call_args_list],
                          ["smichea", "mesh-design"])
         self.assertTrue(all(call.kwargs["payload"]["urgent"]
                             for call in send.call_args_list))
+        # #6039 N5: the caller learns which recipient actually got the report.
+        self.assertEqual(delivered, {"smichea": True, "mesh-design": True})
+
+    def test_delivery_result_is_per_recipient(self):
+        with mock.patch.object(release_cutoff, "report_recipients",
+                               return_value=["smichea", "mesh-design"]), \
+                mock.patch.object(release_cutoff.mail, "send",
+                                  side_effect=[RuntimeError("mail down"), 42]), \
+                mock.patch("ameesh.fil.record"), \
+                mock.patch("builtins.print"):
+            delivered = release_cutoff.send_report(
+                object(), object(), self.project("smichea"), "corps", {})
+        self.assertEqual(delivered, {"smichea": False, "mesh-design": True})
 
 
 if __name__ == "__main__":
