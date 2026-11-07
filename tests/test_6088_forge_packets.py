@@ -69,7 +69,7 @@ class ForgePacketTest(unittest.TestCase):
         found = forge_packets.vehicle(None, {"id": 42}, self.frozen_ms(self.frozen),
                                       gh=self.gh([self.pr()]), cache={})
         self.assertEqual(found, {"pr": 9, "branch": "integration/paquet-9-x",
-                                 "head": self.head})
+                                 "head": self.head, "created_ts": None, "ci": "none"})
 
     def test_unit_not_cited_is_not_carried(self):
         found = forge_packets.vehicle(None, {"id": 43}, self.frozen_ms(self.other),
