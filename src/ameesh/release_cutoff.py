@@ -2863,7 +2863,7 @@ def report_recipients(cfg, db, project: ProjectRelease) -> list[str]:
 
 
 def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
-                *, urgent: bool = False, also: tuple = ()) -> None:
+                *, urgent: bool = False, also: tuple = ()) -> dict[str, bool]:
     """Mail a release report and write it in the project's own thread.
 
     #6014: the mailbox alone left a missed cutoff invisible in the project's
@@ -2872,11 +2872,17 @@ def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
     the same commit-then-record order as `notify._send_module_brief`: a
     thread failure never loses the delivered message. `also` (#6020) adds
     recipients in copy, such as the agent a staging is handed to.
+
+    #6039 N5: returns the delivery result **per recipient**. The function
+    catches a mail failure so a report never undoes a release, but a caller
+    that hands staging over must know whether its recipient got the message;
+    a `None` would make a failed send look reported.
     """
     from . import fil
     payload = {**(payload or {}), **({"urgent": True} if urgent else {})}
     recipients = report_recipients(cfg, db, project)
     recipients += [name for name in also if name and name not in recipients]
+    delivered: dict[str, bool] = {}
     for recipient in recipients:
         try:
             # The thread write is explicit below, in the release project:
@@ -2884,9 +2890,11 @@ def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
             message_id = mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="event",
                                    payload=payload, thread=False)
         except Exception as exc:  # a report failure never undoes a release
+            delivered[recipient] = False
             print("release: report not delivered to %s: %s" % (recipient, exc),
                   file=sys.stderr)
             continue
+        delivered[recipient] = True
         try:
             fil.record(cfg, db, sender=work.SYSTEM_SENDER, recipients=[recipient],
                        text=body, project=project.name, mailbox_ids=[message_id],
@@ -2894,6 +2902,7 @@ def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
         except Exception as exc:  # fil.record never raises; keep the report path safe
             print("release: thread entry not written for %s: %s" % (project.name, exc),
                   file=sys.stderr)
+    return delivered
 
 
 def write_report(cfg, project: ProjectRelease, report: dict) -> str:

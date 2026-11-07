@@ -754,10 +754,17 @@ def verify_attestation(project, pending, data):
     return "ok", {"runs": evidence, "migrations": data.get("migrations") or []}
 
 
-def _announce(cfg, db, project, body, report, *, urgent=True):
-    if db is not None:
-        rc.send_report(cfg, db, project, body, report, urgent=urgent,
-                       also=(project.staging_handoff,))
+def _announce(cfg, db, project, body, report, *, urgent=True, also=None):
+    if db is None:
+        return {}
+    recipients = (project.staging_handoff,) if also is None else tuple(also)
+    return rc.send_report(cfg, db, project, body, report, urgent=urgent,
+                          also=recipients)
+
+
+def _handoff_delivered(delivery, recipient) -> bool:
+    """#6039 N5: the bureau itself got the report, not merely "a send ran"."""
+    return bool(recipient and isinstance(delivery, dict) and delivery.get(recipient))
 
 
 def handoff_preflight(project, pending):
@@ -866,9 +873,10 @@ def _handoff_open(cfg, db, project, pending, now, save):
            ", ".join("%s %s" % (row["target"], row["name"]) for row in rows) or "aucune",
            ", ".join(STAGING_WORKFLOWS), pending["version"], project.staging_handoff,
            command, when.strftime("%d/%m %H:%MZ")))
-    # #6039 N5: `reported` is durable after the send, not before: a crash or
-    # a failed send between this save and `_announce` is retried by the next
-    # tick (`_handoff_reannounce`), without waiting for the deadline notice.
+    # #6039 N5: `reported` is durable after the bureau's delivery, not before:
+    # a crash or a caught mail failure between this save and `_announce` is
+    # retried by the next tick (`_handoff_reannounce`), without waiting for
+    # the deadline notice.
     pending["handoff"] = dict(to=project.staging_handoff, at=now, migrations=rows,
                               deadline=deadline, rejected={}, reported=False,
                               instructions=instructions)
@@ -882,28 +890,33 @@ def _handoff_open(cfg, db, project, pending, now, save):
             # The tag is out: the wait still runs and the next tick retries.
             pending["handoff"]["lot_error"] = str(exc)
         save()
-    _announce(cfg, db, project, _handoff_body(pending),
-              dict(pending, result="waiting-attestation"), urgent=False)
-    pending["handoff"]["reported"] = True
-    save()
+    delivery = _announce(cfg, db, project, _handoff_body(pending),
+                         dict(pending, result="waiting-attestation"), urgent=False,
+                         also=(pending["handoff"]["to"],))
+    if _handoff_delivered(delivery, pending["handoff"]["to"]):
+        pending["handoff"]["reported"] = True
+        save()
     return dict(pending, result="waiting-attestation")
 
 
 def _handoff_reannounce(cfg, db, project, pending, save):
-    """#6039 N5: a handoff report is at-least-once.
+    """#6039 N5: a handoff report is at-least-once, to the bureau itself.
 
     The tag is already out when the report is built; if the process stops
-    between the durable `handoff` save and the send (or the send fails), the
-    bureau would never receive the attestation command. Every tick re-sends
-    it until `reported` is saved, and the deadline notice keeps its own
-    deduplication."""
+    between the durable `handoff` save and the send, or `send_report` caught a
+    mail failure, the bureau would never receive the attestation command.
+    Every tick re-sends it until the delivery map says the recipient got it;
+    the deadline notice keeps its own deduplication."""
     handoff = pending["handoff"]
     if handoff.get("reported"):
         return
-    _announce(cfg, db, project, _handoff_body(pending),
-              dict(pending, result="waiting-attestation"), urgent=False)
-    handoff["reported"] = True
-    save()
+    recipient = handoff.get("to") or project.staging_handoff
+    delivery = _announce(cfg, db, project, _handoff_body(pending),
+                         dict(pending, result="waiting-attestation"), urgent=False,
+                         also=(recipient,))
+    if _handoff_delivered(delivery, recipient):
+        handoff["reported"] = True
+        save()
 
 
 def _handoff_resolution(cfg, db, project, pending, save):

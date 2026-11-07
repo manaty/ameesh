@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#6020: Nexlink staging handed to the bureau, two-letter versions, release-<v> tags."""
-import json
+import contextlib
 import dataclasses
+import json
 import os
 import subprocess
 import tempfile
@@ -345,8 +346,13 @@ class HandoffPipelineTests(unittest.TestCase):
         self.close = patcher.start()
         self.addCleanup(patcher.stop)
         self.sent = []
-        patcher = mock.patch.object(rc, "send_report", side_effect=lambda cfg, db, project, body,
-                                    report, **kw: self.sent.append((body, report, kw)))
+        self.real_send_report = rc.send_report
+
+        def record_send(cfg, db, project, body, report, *, urgent=False, also=()):
+            self.sent.append((body, report, {"urgent": urgent, "also": also}))
+            return {name: True for name in (project.report, *also) if name}
+
+        patcher = mock.patch.object(rc, "send_report", side_effect=record_send)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -417,31 +423,44 @@ class HandoffPipelineTests(unittest.TestCase):
         publish.assert_not_called()
         self.assertNotIn("pending_nexlink", self.slot())
 
-    def test_handoff_report_is_retried_after_a_failed_send(self):
-        """#6039 N5: the command is not lost between the durable save and the send."""
-        calls = []
+    def test_handoff_report_is_retried_until_the_bureau_receives_it(self):
+        """#6039 N5: real `send_report` catches the mail failure; the bureau
+        recipient's own delivery decides `reported`, not the absence of a raise."""
+        state = {"fail": True}
+        mail_sent = []
 
-        def flaky(cfg, db, project, body, report, **kw):
-            calls.append(body)
-            if len(calls) == 1:
-                raise rc.TransientReleaseError("mail down")
-            self.sent.append((body, report, kw))
+        def mail_send(db, sender, recipient, body, **kwargs):
+            if state["fail"] and recipient == "bureau":
+                raise RuntimeError("bureau mail down")
+            mail_sent.append((recipient, body))
+            return 42
 
-        with mock.patch.object(rc, "send_report", side_effect=flaky):
-            with self.assertRaises(rc.TransientReleaseError):
-                self.handed_over()
+        def report_paths():
+            stack = contextlib.ExitStack()
+            stack.enter_context(mock.patch.object(
+                rc, "report_recipients", return_value=["human:smichea"]))
+            stack.enter_context(mock.patch.object(
+                rc, "send_report", side_effect=self.real_send_report))
+            stack.enter_context(mock.patch("ameesh.mail.send", side_effect=mail_send))
+            stack.enter_context(mock.patch("ameesh.fil.record"))
+            stack.enter_context(mock.patch("builtins.print"))
+            return stack
+
+        with report_paths():
+            self.assertEqual(self.handed_over()["result"], "waiting-attestation")
         handoff = self.slot()["pending_nexlink"]["handoff"]
         self.assertFalse(handoff["reported"])
         self.assertEqual(handoff["lot"], 77)
-        with mock.patch.object(rc, "send_report",
-                               side_effect=lambda cfg, db, project, body, report, **kw:
-                               (calls.append(body),
-                                self.sent.append((body, report, kw)))):
+        # The human recipient got it; only the bureau's own delivery is missing.
+        self.assertEqual([recipient for recipient, _body in mail_sent], ["human:smichea"])
+        state["fail"] = False
+        with report_paths():
             self.assertEqual(self.run_tick(1100)["result"], "waiting-attestation")
         self.assertTrue(self.slot()["pending_nexlink"]["handoff"]["reported"])
-        self.assertEqual(len(calls), 2)
-        self.assertIn("--migration hub:540:" + CHECKSUM, calls[1])
-        self.assertIn("Lot d'attestation : #77", calls[1])
+        bureau = [body for recipient, body in mail_sent if recipient == "bureau"]
+        self.assertEqual(len(bureau), 1)
+        self.assertIn("--migration hub:540:" + CHECKSUM, bureau[0])
+        self.assertIn("Lot d'attestation : #77", bureau[0])
 
     def test_valid_attestation_closes_cutoff_and_lot(self):
         self.handed_over()
