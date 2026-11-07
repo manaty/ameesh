@@ -124,6 +124,12 @@ du serveur ; `mail send --lot` n'est pas disponible depuis un appareil.
 (L118's `work.open_with_branch` has since become `work.open_for_sweep` on
 main; it stays refused.)
 
+`work.by_unique_ref` (#6090), la relecture de la clé durable de
+`work add --unique-ref`, reste refusée pour la même raison : c'est la CLI du
+mesh qui crée les lots, l'exécuteur médié n'appelle pas `work.add` et n'a
+aucune clé à relire. La création idempotente est un geste de l'adaptateur
+externe côté mesh, pas une opération de l'appareil.
+
 The 46 operations added to the interface by main up to 1.9.0 are refused
 as well, so contract 1.1 is unchanged: `ci.*` (CI results, L161),
 `decisions.*` (owner decision requests, L124), `mailbox.unread_active`,

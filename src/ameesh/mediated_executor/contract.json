@@ -5042,6 +5042,7 @@
     "by_issue_ref",
     "by_package",
     "by_source",
+    "by_unique_ref",
     "claim_review_proposal",
     "close",
     "close_merged",
