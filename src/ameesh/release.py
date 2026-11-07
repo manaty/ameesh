@@ -254,13 +254,20 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
         "notes": plan.notes, "empty": plan.empty,
         "tree_green": plan.tree_green,
         "kept_active": plan.kept_active,
+        "result": "skipped" if plan.skipped else "planned",
+        "skipped": plan.skipped,
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
     elif project.model == "nexlink":
-        print("Nexlink %s — develop %s + main %s ; CI arbre final à produire%s"
-              % (plan.version, plan.base[:12], plan.previous["commit"][:12],
-                 " ; delta vide : branche créée sans staging" if plan.empty else ""))
+        if plan.skipped:
+            # #6152: a manual cutoff already tagged the base; no second cut.
+            print("créneau sauté : tête déjà coupée en release-%s (%s) — skipped, "
+                  "aucun tag ni branche" % (plan.skipped, plan.base[:12]))
+        else:
+            print("Nexlink %s — develop %s + main %s ; CI arbre final à produire%s"
+                  % (plan.version, plan.base[:12], plan.previous["commit"][:12],
+                     " ; delta vide : branche créée sans staging" if plan.empty else ""))
     elif plan.kept_active:
         print("actif conservé — candidate %s plus ancienne ou divergente : aucun tag, "
               "aucun déploiement" % plan.base[:12])
@@ -464,9 +471,9 @@ def _release_tick(cfg, args, declared) -> int:
                                     if report.get("version") else ""))
             if report.get("result") not in ("released", "reconciled", "nothing-new",
                                             "already-recorded", "not-due", "missed",
-                                            "kept-active", "waiting-ci", "waiting-staging", "empty",
-                                            "waiting-attestation", "held-attestation",
-                                            "staging-unattested"):
+                                            "kept-active", "waiting-ci", "waiting-staging",
+                                            "empty", "skipped", "waiting-attestation",
+                                            "held-attestation", "staging-unattested"):
                 status = 1
         return status
     finally:

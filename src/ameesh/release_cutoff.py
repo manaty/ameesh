@@ -1335,6 +1335,9 @@ class Plan:
     notes: str
     # N4: the base carries the previous tag's exact tree, nothing to release.
     empty: bool = False
+    #: #6152: the release version already naming the chosen base (a manual
+    #: cutoff tagged it); the slot is skipped, no tag or branch is produced.
+    skipped: str | None = None
     #: #2692: the target head's CI is not green (#3633: red, cancelled, absent
     #: or in progress), but its tree is the packet head's green content; the
     #: evidence (head, runs) or None.

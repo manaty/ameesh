@@ -162,6 +162,8 @@ class PlanTest(Fixture, unittest.TestCase):
                 mock.patch.object(rc, "cutoff_slot", return_value=(1000, "11:00")), \
                 mock.patch.object(nx, "choose_version", return_value="11w"), \
                 mock.patch.object(nx, "previous_release", return_value=self.base), \
+                mock.patch.object(nx, "tagged_at", return_value=set()), \
+                mock.patch.object(nx, "branches", return_value={}), \
                 mock.patch.object(rc, "ci_reading", side_effect=lambda p, s: self.readings[s]), \
                 mock.patch.object(rc, "suite_reading", side_effect=lambda p, s: self.suites[s]):
             return nx.plan(None, self.project, now=1000)
