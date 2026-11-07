@@ -1622,7 +1622,7 @@ def _note_inherited_incident(db, row: dict, *, slug: str, base: str, number: int
                 title=incident.title_of(branch=base, run_id=rid,
                                         workflow=run.get("workflow") or ""),
                 type="bug", priority=1, app=str(row.get("app") or ""),
-                source=source, issue_ref=source, unique_ref=True,
+                source=source, issue_ref=source, unique_execution=True,
                 body=incident.body_of(
                     repo=slug, branch=base, run_id=rid,
                     head_sha=run.get("head_sha") or "",

@@ -699,6 +699,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('work_items', ARRAY[
         'id', 'type', 'source', 'app', 'title', 'issue_ref', 'workstream',
+        -- #6090 (0555) : clé d'idempotence durable de `work add --unique-ref`
+        -- (opaque, de l'ÉTAT ; NULL = création ordinaire) — le superviseur
+        -- lit la ligne entière, la clé n'est ni un secret ni un contenu
+        'unique_ref',
         'state', 'legacy_state', 'assignee', 'loops', 'budget_usd', 'spent_usd',
         'created_at', 'updated_at', 'closed_at',
         'package_id', 'package_parent', 'pr_ref', 'close_reason', 'superseded_by',

@@ -3,7 +3,7 @@
 
 Le défaut constaté (#2974/#2975, run 39554271532) : deux hôtes ont ouvert
 l'incident de la même exécution dans la même fenêtre, chacun ayant lu
-`issue_ref` avant l'insertion de l'autre. `work.add(..., unique_ref=True)`
+`issue_ref` avant l'insertion de l'autre. `work.add(..., unique_execution=True)`
 prend un verrou consultatif de transaction sur la référence puis la relit,
 quel que soit l'état des lots : le second créateur reçoit `DbError` et
 `incident.open_incident` relit le gagnant.
@@ -32,7 +32,7 @@ class IncidentUniqueRefTest(PgTestCase):
     def add(self, *, ref=REF, unique=True, title="Incident"):
         return work.add(self.db, title=title, type="bug", priority=1, app="ameesh",
                         source=ref, issue_ref=ref, actor="test",
-                        unique_ref=unique)
+                        unique_execution=unique)
 
     def count(self, ref=REF):
         rows = self.db.query(
@@ -65,7 +65,7 @@ class IncidentUniqueRefTest(PgTestCase):
 
     def test_the_mirror_ticket_move_does_not_reopen_the_identity(self):
         # #3607 : après la synchro, l'`issue_ref` du gagnant devient le ticket
-        # miroir ; la relecture sous le verrou unique_ref le reconnaît par sa
+        # miroir ; la relecture sous le verrou unique_execution le reconnaît par sa
         # `source` et refuse le second lot.
         winner = self.add()
         self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
@@ -117,8 +117,8 @@ class IncidentUniqueRefTest(PgTestCase):
         self.assertEqual(self.count(), 2)
 
     def test_without_issue_ref_the_option_is_inert(self):
-        first = work.add(self.db, title="Sans ref", type="bug", unique_ref=True,
+        first = work.add(self.db, title="Sans ref", type="bug", unique_execution=True,
                          actor="test")
-        second = work.add(self.db, title="Sans ref 2", type="bug", unique_ref=True,
+        second = work.add(self.db, title="Sans ref 2", type="bug", unique_execution=True,
                           actor="test")
         self.assertNotEqual(first["id"], second["id"])

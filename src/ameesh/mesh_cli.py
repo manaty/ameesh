@@ -2046,7 +2046,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             code = cmd_work(cfg, args)
         item = getattr(args, "created_item", None)
         if item is not None:
-            print(json.dumps({"schema": "ameesh.work.add/1", "lot": item},
+            item = dict(item)
+            # #6090 : un rejeu de `--unique-ref` rend le lot existant, jamais un
+            # second ; `created` le dit sans changer la forme du lot.
+            created = not item.pop("existing", False)
+            print(json.dumps({"schema": "ameesh.work.add/1", "created": created,
+                              "lot": item},
                              ensure_ascii=False, indent=2, default=str))
         return code
     v = _vocabulary()
@@ -2144,6 +2149,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # L157 : durée estimée, obligatoire pour un agent (refus AVANT la
             # création), avertissement pour un humain
             from . import estimates
+            # #6090 : une clé durable déjà consommée rend son lot avant toute
+            # garde et toute analyse — un rejeu ne dépend ni de l'agent, ni du
+            # clone local, ni du projet introduit la première fois.
+            unique_ref = work.normalize_unique_ref(getattr(args, "unique_ref", None))
+            if unique_ref is not None:
+                existing = work.existing_by_unique_ref(db, unique_ref)
+                if existing is not None:
+                    args.created_item = existing
+                    print(('%s #%d already exists (unique-ref %s, %s): %s')
+                          % (v.noun, int(existing["id"]), unique_ref,
+                             existing.get("state") or "?", existing.get("title") or ""))
+                    return 0
             from . import identity, intake_neighbors, work_projects
             binding = identity.resolve_binding(cfg, db)
             creator = binding.name if binding.ok else args.actor
@@ -2201,7 +2218,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 note=note,
                 force=args.force,
                 parent_lot=args.parent_lot, footprint=footprint, impact=impact,
+                unique_ref=unique_ref,
                 composition_owner=args.composition_owner)
+            overlap = None
             try:
                 item = work.add(db, assignee=args.assignee, **add_kwargs)
             except storage.FootprintOverlap as exc:
@@ -2211,17 +2230,29 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # l'attribution à un agent externe) n'a plus d'objet : le garder
                 # ferait échouer la seconde création (« --externe without
                 # assignee ») et le lot ne naîtrait pas du tout.
+                overlap = exc
                 add_kwargs["externe"] = False
                 item = work.add(db, assignee=None, **add_kwargs)
                 # le lot est libre : l'attribution de la tentative refusée ne
                 # doit plus s'afficher (`_print_assignment` plus bas).
                 check = None
-                print("warning: created unassigned: %s"
-                      % work_footprints.refusal(item["id"], exc.overlaps,
-                                                cap=getattr(exc, "cap", None),
-                                                in_flight=getattr(exc, "in_flight", None)),
-                      file=sys.stderr)
             args.created_item = item
+            if item.get("existing"):
+                # B/P2 ameesh-cx2 (#6090) : un premier appel concurrent a gagné
+                # entre la prélecture et l'écriture. Le magasin rend le gagnant ;
+                # aucun effet de création (planification, référence, empreinte,
+                # attribution) ne doit s'appliquer, et le texte ne doit pas dire
+                # « created ».
+                print(('%s #%d already exists (unique-ref %s, %s): %s')
+                      % (v.noun, int(item["id"]), unique_ref,
+                         item.get("state") or "?", item.get("title") or ""))
+                return 0
+            if overlap is not None:
+                print("warning: created unassigned: %s"
+                      % work_footprints.refusal(item["id"], overlap.overlaps,
+                                                cap=getattr(overlap, "cap", None),
+                                                in_flight=getattr(overlap, "in_flight", None)),
+                      file=sys.stderr)
             print(('%s #%d created in %s: %s%s%s%s') % (v.noun, item["id"], item["state"], item["title"], " (plan: %s)" % item["package_id"] if item.get("package_id") else "", " (priority %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
                 if item.get("priority") else "", " — estimated %s" % estimates.label(minutes) if minutes else ""))
             if item.get("external_executor"):
@@ -2569,6 +2600,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
+            if item.get("unique_ref"):
+                print("unique-ref: %s (durable idempotency key, #6090)"
+                      % item["unique_ref"])
             from . import intake_neighbors
             reviewed = intake_neighbors.format_reviewed_line(item.get("reviewed"))
             if reviewed:
@@ -4202,6 +4236,12 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                         help=("the %s's statement; `-` reads it on standard input "
                              "(heredoc <<'EOF', #3744)") % v.noun)
     pw_add.add_argument("--issue-ref", default=None)
+    pw_add.add_argument("--unique-ref", default=None, metavar="KEY",
+                        help=("#6090: durable idempotency key; a second `work add` with "
+                              "the same key returns the existing %s (whatever its state) "
+                              "instead of creating one — opaque, exact match, 1 to %d "
+                              "characters, global to the mesh"
+                              % (v.noun, work.UNIQUE_REF_MAX)))
     pw_add.add_argument("--workstream", default=None)
     pw_add.add_argument("--assignee", default=None)
     pw_add.add_argument("--budget", type=float, default=None)
@@ -4215,7 +4255,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                              "responsible (L37, 0030)")
     pw_add.add_argument("--json", action="store_true",
                         help=("#6043: print the created %s as JSON on stdout "
-                              "(the usual text goes to stderr)") % v.noun)
+                              "(the usual text goes to stderr); #6090: `created` says "
+                              "whether it was created or returned for an existing "
+                              "unique-ref") % v.noun)
     pw_add.add_argument("--external-executor", default=None, metavar="AGENT",
                         help=("#3447: declare the %s reserved to an external executor "
                              "(an `externe` agent with a human owner, or human:<id>) "
