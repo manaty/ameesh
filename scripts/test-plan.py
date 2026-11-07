@@ -193,7 +193,7 @@ PILOT_FILE = REPO / "tests" / "parts" / "pilote-psql.txt"
 #: dépôt, versionné avec la sélection ; la déclaration voyage avec l'arbre du
 #: candidat, comme le sélecteur lui-même.
 sys.path.insert(0, str(REPO / "src"))
-from ameesh import transverse_contracts  # noqa: E402
+from ameesh import transverse_contracts, contract_plan  # noqa: E402
 
 #: une carte plus vieille est « périmée » (#3343/#3344) : un lot la garde pour
 #: juger son propre diff (#3450), la voie documentation et la prévalidation
@@ -1892,7 +1892,8 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
               base: str = "HEAD^1", ref: str = "",
               base_ref: str | None = None, head_ref: str | None = None,
               mode: str = "auto", psql_full: bool = False,
-              reuse: bool = False, reuse_detail: str = "") -> dict:
+              reuse: bool = False, reuse_detail: str = "",
+              contract_policy="configured") -> dict:
     """The plan of one run; `mode` says which CI this is (canon §3).
 
     `auto` (default): inferred from the event, as before — a pull request
@@ -1986,6 +1987,19 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         plan["unsure"] = list(plan.get("unsure") or ()) + [contract_problem]
         plan["sure"] = plan["lot_safe"] = plan["phase2_safe"] = False
         plan["phase2_why"] = contract_problem
+    policy = (contract_plan.configured_policy("ameesh")
+              if contract_policy == "configured" else contract_policy)
+    shared = contract_plan.build(
+        repo, plan["tested"], _rev(base, repo), modules,
+        plan.get("contract", []),
+        [m for m, c in plan["classes"].items() if c[0] in ("P0", "P1")], policy)
+    plan["contract_plan"] = shared
+    plan["contract"] = shared["contracts"]
+    if shared["full_suite_required"]:
+        reason = "registry: " + ", ".join(shared["fallback_reasons"])
+        plan["unsure"] = list(plan.get("unsure") or ()) + [reason]
+        plan["sure"] = plan["lot_safe"] = plan["phase2_safe"] = False
+        plan["phase2_why"] = reason
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
     #: #749 : modules « always » declenches par le diff (contrat de base, baux
     #: et orphelins), a rejoindre au pilote psql sur une PR.
@@ -2406,6 +2420,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("plan", help="classes and parts of this run")
     p.add_argument("--out", required=True)
     p.add_argument("--map", help="carte.json.gz (scripts/map.py)")
+    p.add_argument("--local-map", action="store_true",
+                   help="read the packet local/cache map without downloading")
     p.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch"))
     p.add_argument("--base", default="HEAD^1",
                    help="tip before a push (github.event.before); HEAD^1 by default, "
@@ -2467,6 +2483,11 @@ def main(argv: list[str] | None = None) -> int:
         psql_full = args.psql_full.strip().lower() == "true"
         reuse = args.reuse.strip().lower() == "true"
         card, why = _load_map(args.map)
+        if args.local_map and not args.map:
+            from ameesh import config
+            attribution = _load("_contract_plan_attribution", "paquet-attribution.py")
+            card, _ = attribution.read_card(
+                REPO, attribution.repository_slug(REPO), pathlib.Path(config.load().state_dir))
         if card is None and args.map:
             print(f"map: {why}", file=sys.stderr)
         try:

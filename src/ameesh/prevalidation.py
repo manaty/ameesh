@@ -1115,7 +1115,8 @@ def contract_modules(paths, repo: str = "", *, head: str = "",
 
 def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
                 runner=subprocess.run,
-                excluded: Sequence[dict] = ()) -> tuple[bool, str]:
+                excluded: Sequence[dict] = (),
+                contract_policy="configured", deadline=None) -> tuple[bool, str]:
     """La sélection du plan tient-elle exactement dans le canon ?
 
     Le canon déclare les classes retenues et les fichiers de contrat ; le plan
@@ -1142,6 +1143,32 @@ def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
                                         head=head, runner=runner)
     if problem:
         return False, problem
+    from . import contract_plan
+    policy = (contract_plan.configured_policy("ameesh")
+              if contract_policy == "configured" else contract_policy)
+    shared = plan.get("contract_plan")
+    if policy is not None and (not isinstance(shared, dict) or not shared.get("active")):
+        return False, "active contract policy missing from plan"
+    if shared is not None:
+        try:
+            contract_plan.consume(shared)
+            if shared.get("commit") != head:
+                return False, "contract plan candidate differs"
+            if shared.get("active"):
+                if policy is None:
+                    return False, "contract plan policy unavailable"
+                inventory = contract_plan.git(
+                    repo, "ls-tree", "-r", "--name-only", head, "--", "tests", deadline=deadline).splitlines()
+                inventory = [p[6:-3] for p in inventory
+                             if re.fullmatch(r"tests/test[^/]*\.py", p)]
+                verified = contract_plan.build(
+                    repo, head, shared["base"], inventory, required, (), policy, deadline=deadline)
+                if (shared.get("registry_digest") != verified["registry_digest"]
+                        or shared["contracts"] != verified["contracts"]):
+                    return False, "contract plan registry or contracts differ"
+                required = tuple(verified["contracts"])
+        except (ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
+            return False, "contract plan unreadable: " + str(exc)
     required = tuple(name for name in required if name not in skipped)
     contract = {str(m) for m in (plan.get("contract") or ())} - skipped
     chosen = set(planned_modules(plan)) - skipped
@@ -1263,7 +1290,7 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
         if applied:
             text = json.dumps(plan, indent=1, ensure_ascii=False) + "\n"
     within, why = meets_canon(plan, params, root, head=head, runner=git_runner,
-                              excluded=excluded)
+                              excluded=excluded, deadline=deadline)
     chosen = selection(plan, head=head, base=base, plan_path=plan_path,
                        excluded=applied)
     if not chosen.ok:
