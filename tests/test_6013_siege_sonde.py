@@ -273,6 +273,36 @@ class SiegeSondeTest(unittest.TestCase):
         self.assertEqual(resultat['siege']['levees'], 2)
         self.assertTrue(resultat['siege']['retabli'])
 
+    def test_siege_force_malgre_une_persona_libre(self):
+        # #6106 : le temoin exerce le siege meme si une persona est libre
+        rows = self.rangs()
+        rows[1].update(operator_paused=False, operator_pause_reason=None)
+        monde = Monde(rows)
+        cible, pourquoi, remplacement, resultat = self.lancer(monde, rows, sonde='siege')
+        self.assertEqual(cible['name'], 'impl-13')
+        self.assertEqual(pourquoi, 'siege de sonde force : impl-13')
+        self.assertIsNone(remplacement)
+        self.assertEqual(resultat['tour'], 'ok')
+        self.assertTrue(resultat['siege']['leve'])
+        self.assertTrue(resultat['siege']['retabli'])
+        self.assertEqual([g['paused'] for g in monde.gestes], [False, True])
+
+    def test_siege_force_sans_dormeur_sans_sonde(self):
+        rows = self.rangs(operator_paused=False, operator_pause_reason=None)
+        monde = Monde(rows)
+        cible, pourquoi, _, resultat = self.lancer(monde, rows, sonde='siege')
+        self.assertIsNone(cible)
+        self.assertIsNone(resultat)
+        self.assertIn('aucune persona menee en sommeil automatique', pourquoi)
+        self.assertEqual(monde.gestes, [])
+
+    def test_siege_force_pause_humaine_jamais_levee(self):
+        rows = self.rangs(operator_pause_reason='maintenance disque')
+        monde = Monde(rows)
+        cible, _, _, _ = self.lancer(monde, rows, sonde='siege')
+        self.assertIsNone(cible)
+        self.assertEqual(monde.gestes, [])
+
     def test_hote_libre_inchange(self):
         """Une persona libre : pas de siege, aucune pause touchee."""
         rows = self.rangs()
