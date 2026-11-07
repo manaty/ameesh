@@ -42,6 +42,6 @@ COMMENT ON TABLE external_executors IS
 COMMENT ON COLUMN external_executors.name IS
     '#6091: qualified `system:<name>`; the value carried by work_items.external_executor.';
 COMMENT ON COLUMN external_executors.responsible IS
-    '#6091: human:<id> accountable for the system; the reservation and its alerts have somebody to go to.';
+    '#6091: human:<id> accountable for the system; shown by `work external-executor --list` and by `work show` on a reserved lot.';
 COMMENT ON COLUMN external_executors.retired_at IS
     '#6091: retired declaration: no new reservation, existing lots keep the name until cleared or closed.';

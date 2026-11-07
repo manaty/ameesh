@@ -5,12 +5,17 @@ non-agents (`system:…`) et de leur responsable humain.
 Un système déclaré n'est PAS un agent : aucune ligne d'`agent_registry`, aucun
 bail, aucun réveil, aucune attribution. Un lot le porte seulement comme
 `external_executor` (#3447), et L165 ne le prend pas. Sa déclaration durable
-porte le responsable humain, celui à qui l'attente et les alertes du lot ont
-quelqu'un à qui aller.
+porte le responsable humain, la personne à qui le pilote s'adresse pour ce
+système.
 """
 from __future__ import annotations
 
 import abc
+
+#: #6091 : préfixe d'un exécutant externe NON-AGENT déclaré (`system:<nom>`).
+#: Le deux-points ne peut pas apparaître dans un nom d'agent (`config.NAME_RE`),
+#: donc le nom ne se confond ni avec un agent ni avec un humain (`human:`).
+SYSTEM_PREFIX = "system:"
 
 
 class ExternalExecutors(abc.ABC):

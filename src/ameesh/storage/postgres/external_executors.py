@@ -8,10 +8,34 @@ dans `ameesh.work`.
 """
 from __future__ import annotations
 
+from .. import interface
+from ..external_executors import SYSTEM_PREFIX
 from ..external_executors import ExternalExecutors as Contract
 
 _COLUMNS = ("name, responsible, note, declared_by, declared_at,"
             " retired_at, retired_by")
+
+
+def require_active(db, name):
+    """#6091 : la déclaration `system:…` est-elle encore active, sous verrou ?
+
+    Un `SELECT … FOR SHARE` sur la ligne de la déclaration sérialise cette
+    lecture avec `retire` (un `UPDATE` de la même ligne). Si le retrait a
+    commité avant, aucune ligne n'est rendue et l'écriture du lot est refusée ;
+    s'il arrive après, il attend le commit de la réservation. Le verrou tient
+    jusqu'à la fin de la transaction de l'appelant (`work.add`,
+    `set_external_executor`), pas au-delà.
+
+    Un nom qui n'est pas un `system:…` (agent `externe`, humain) n'a pas de
+    déclaration : rien à verrouiller, la règle #3447 existante s'applique.
+    """
+    if not str(name or "").startswith(SYSTEM_PREFIX):
+        return
+    rows = db.query(
+        "SELECT 1 AS ok FROM external_executors"
+        " WHERE name = %s AND retired_at IS NULL FOR SHARE", (name,))
+    if not rows:
+        raise interface.ExternalExecutorUnavailable(name)
 
 
 class ExternalExecutors(Contract):

@@ -925,12 +925,20 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             **({"footprint": list(footprint)} if footprint else {}),
             **({"footprint_unknown": True} if impact and impact.get("unknown") else {}))
 
-    if fence is None:
-        item = create(db)
-    else:
-        with db.transaction() as tx:
-            fence.hold(tx)
-            item = create(tx)
+    try:
+        if fence is None:
+            item = create(db)
+        else:
+            with db.transaction() as tx:
+                fence.hold(tx)
+                item = create(tx)
+    except interface.ExternalExecutorUnavailable as exc:
+        # #6091 : le `SELECT … FOR SHARE` de la création a vu la déclaration
+        # retirée (ou disparue) depuis la lecture de `check_external_executor` :
+        # rien n'est écrit, pas même le lot.
+        raise WorkError("external executor refused: %s was retired before the lot was "
+                        "written; nothing changed — declare a current system instead"
+                        % exc.name) from exc
     if impact:
         # #4818 : une ligne de journal par estimation, et la dernière analyse,
         # avec la politique appliquée à l'écriture
@@ -1669,7 +1677,8 @@ def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
 HUMAN_PREFIX = "human:"
 #: #6091 : préfixe d'un exécutant externe NON-AGENT déclaré (le serveur IMA,
 #: par exemple) : jamais réveillé, jamais assignable, un responsable humain.
-SYSTEM_PREFIX = "system:"
+#: La constante vit avec le stockage, seul lecteur de la déclaration.
+SYSTEM_PREFIX = interface.SYSTEM_PREFIX
 #: #6091 : forme du suffixe d'un `system:…` — celle d'un nom d'agent
 #: (config.NAME_RE), le deux-points du préfixe en plus.
 _SYSTEM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -2696,7 +2705,12 @@ def set_external_executor(db: Db, item_id: int, executor: str | None, *,
         if name == previous:
             raise WorkError("lot %s is already reserved to %s" % (item_id, name))
         note = "%s %s" % (interface.EXTERNAL_EXECUTOR_NOTE, name)
-    row = storage.of(db).work.set_external_executor(item_id, name, note=note, actor=who)
+    try:
+        row = storage.of(db).work.set_external_executor(item_id, name, note=note, actor=who)
+    except interface.ExternalExecutorUnavailable as exc:
+        raise WorkError("lot %s: external executor %s was retired before the reservation "
+                        "was written; nothing changed — declare a current system instead"
+                        % (item_id, exc.name)) from exc
     if row is None:
         current = get(db, item_id)
         holder = (current or {}).get("assignee")

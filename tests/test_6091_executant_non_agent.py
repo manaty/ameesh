@@ -5,7 +5,8 @@ externe, et n'est jamais confondu avec un agent réveillable."""
 from __future__ import annotations
 
 import json
-import time
+import threading
+from unittest import mock
 
 from ameesh import registry, storage, work
 
@@ -130,6 +131,76 @@ class ExecutantNonAgentTest(_Base):
         self.assertEqual([r["name"] for r in work.external_executors(
             self.db, include_retired=True)], ["system:ima"])
         self.assertEqual(work.external_executors(self.db), [])
+
+    def _course_retrait(self, action):
+        """#6091 (B cx1) : le retrait commite APRÈS la lecture active mais
+        AVANT l'écriture du lot. La relecture `SELECT … FOR SHARE` de la
+        transaction d'écriture doit voir le retrait et refuser sans rien
+        écrire. `action(db)` est la réservation (création ou pose)."""
+        self.declare()
+        lue = threading.Event()
+        reprendre = threading.Event()
+        vrai = work.check_external_executor
+        resultat = {}
+
+        def check_puis_attendre(db, executor, *, cfg=None):
+            out = vrai(db, executor, cfg=cfg)
+            lue.set()
+            reprendre.wait(timeout=60)
+            return out
+
+        db1, db2 = self.connect(), self.connect()
+
+        def reserver():
+            try:
+                resultat["out"] = action(db1)
+            except Exception as exc:  # noqa: BLE001 - rendu au test
+                resultat["refus"] = exc
+
+        def retirer():
+            try:
+                if not lue.wait(timeout=60):
+                    resultat["retrait"] = "lecture non atteinte"
+                    return
+                resultat["retrait"] = work.retire_external_executor(
+                    db2, "system:ima", actor="human:proprio", cfg=self.cfg)
+            except Exception as exc:  # noqa: BLE001 - rendu au test
+                resultat["retrait"] = exc
+            finally:
+                reprendre.set()
+
+        try:
+            with mock.patch.object(work, "check_external_executor",
+                                   side_effect=check_puis_attendre):
+                threads = [threading.Thread(target=reserver),
+                           threading.Thread(target=retirer)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=90)
+                self.assertFalse(any(thread.is_alive() for thread in threads))
+        finally:
+            db1.close()
+            db2.close()
+        self.assertIn("refus", resultat, resultat)
+        self.assertIn("was retired before", str(resultat["refus"]))
+        self.assertIsNone(resultat.get("out"))
+        self.assertIsNotNone(resultat.get("retrait"))
+
+    def test_course_retrait_pendant_la_creation_refusee_sans_lot(self):
+        self._course_retrait(lambda db: work.add(
+            db, title="geste ima", app="nexlink",
+            external_executor="system:ima", actor="human:proprio", cfg=self.cfg))
+        rows = self.db.query("SELECT count(*) AS n FROM work_items"
+                             " WHERE title = %s", ("geste ima",))
+        self.assertEqual(int(rows[0]["n"]), 0)
+
+    def test_course_retrait_pendant_la_reservation_refusee(self):
+        lot = work.add(self.db, title="lot à réserver", app="nexlink",
+                       actor="human:proprio", cfg=self.cfg)
+        self._course_retrait(lambda db: work.set_external_executor(
+            db, lot["id"], "system:ima", actor="human:proprio", cfg=self.cfg))
+        self.assertIsNone(work.get(self.db, lot["id"])["external_executor"])
 
     def test_les_agents_externes_existants_ne_changent_pas(self):
         self.agent("bureau", harness="codex", responsible="human:proprio")
