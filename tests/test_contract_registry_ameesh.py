@@ -76,7 +76,8 @@ class AmeeshRegistryTests(unittest.TestCase):
         for path in ('tests/parts/contrats.json', 'tests/parts/toujours.txt',
                      'src/ameesh/contract_selection.py', 'scripts/test-plan.py',
                      'src/ameesh/mechanics.py', 'scripts/paquet-auto.py',
-                     'tests/test_l161f_plan.py'):
+                     'tests/test_l161f_plan.py', 'src/ameesh/contract_plan.py',
+                     'src/ameesh/prevalidation_calls.py'):
             result = self.select(cs.Change('M', path))
             self.assertFalse(result.full_suite_required, result.fallback_reasons)
             self.assertEqual(set(result.modules), known)
@@ -90,7 +91,7 @@ class AmeeshRegistryTests(unittest.TestCase):
         legacy = always_contracts()
         universal = {m for r in self.registry.rules if not r.paths for m in r.modules}
         self.assertEqual(universal, legacy)
-        self.assertEqual(declared, legacy | {"test_l161f_plan"})
+        self.assertEqual(declared, legacy | {"test_l161f_plan", "test_contract_plan"})
         for changes in ((), (cs.Change('M', 'src/ameesh/storage/interface.py'),),
                         (cs.Change('A', 'unknown/new.file'),)):
             result = self.select(*changes)
