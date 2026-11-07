@@ -78,6 +78,16 @@ name: carte
 # des coupures 09:00Z/21:00Z et des paquets de nuit, garde la carte sous 48 h ;
 # le dispatch manuel reste disponible, et les PR qui touchent la mesure sont
 # mesurées pour contrôle. Une carte de plus de 48 h est signalée par le plan.
+#
+# #6157 (07/11/2026) — GitHub démarre ce cron avec six à huit heures de retard,
+# chaque jour (05/11 11:25Z, 06/11 11:24Z, 07/11 10:37Z, run 42364733479 : 11
+# des 12 runners pendant que la ci-full du paquet h-20261107-13 attendait).
+# La mesure planifiée part donc d'une minuterie d'hôte
+# (deploy/systemd/ameesh-carte.timer : dispatch `planifie=true` à 03:30Z) ; le
+# cron reste un filet de secours. Les deux passent par le job `fenetre`
+# (scripts/carte-fenetre.py) : hors de [00:00, 07:00)Z, carte de main de moins
+# de 12 h, autre mesure en cours ou paquet en file → mesure sautée, job vert,
+# raison en annotation (une mesure sautée n'est pas un échec).
 on:
   schedule:
     - cron: "30 3 * * *"
@@ -88,7 +98,13 @@ on:
       - scripts/test-parts.py
       - tests/support.py
       - .github/workflows/carte.yml
+      - scripts/carte-fenetre.py
   workflow_dispatch:
+    inputs:
+      planifie:
+        description: "mesure planifiée (minuterie d'hôte) : garde de fenêtre #6157"
+        type: boolean
+        default: false
 
 # #1314 — une carte de main n'est jamais annulée par la poussée suivante : la
 # mesure est longue, la main bouge toutes les quelques minutes, et
@@ -138,6 +154,34 @@ env:
 # repository is public: its code would run on a shared, persistent machine);
 # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
 jobs:
+  # #6157 — la mesure planifiée (cron en retard, minuterie d'hôte) n'est due
+  # que dans sa fenêtre et sans paquet en file ; un dispatch manuel et une PR
+  # mesurent toujours. Runner hébergé : le garde ne prend jamais un runner du
+  # pool. Un garde en panne laisse mesurer (non concluant, canon §3).
+  fenetre:
+    name: fenêtre de mesure
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      mesurer: ${{ steps.garde.outputs.mesurer }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/carte-fenetre.py
+          sparse-checkout-cone-mode: false
+      - name: garde de fenêtre
+        id: garde
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLANIFIE: ${{ inputs.planifie }}
+        run: |
+          python3 scripts/carte-fenetre.py --event "$GITHUB_EVENT_NAME" --planifie "${PLANIFIE:-false}" ||
+            { echo "::warning::garde de fenêtre en échec : non concluant, mesure maintenue"; echo "mesurer=true" >> "$GITHUB_OUTPUT"; }
+
   # #1341 R1 — le plan de la mesure, calculé une seule fois par run : toutes
   # les parts lisent le même découpage (`--plan`). Le découpage ne dépend donc
   # plus de la carte présente sur chaque runner au moment où le job démarre.
@@ -147,7 +191,9 @@ jobs:
     # le lot d'origine a été mesuré sur sa propre PR, la carte quotidienne
     # couvre le reste. La garde est répétée sur chaque job : `carte` et
     # `menage-mesures` portent `always()`, qui les recréerait malgré ce saut.
-    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-')
+    # #6157 : la fenêtre décide de la mesure planifiée.
+    needs: fenetre
+    if: needs.fenetre.outputs.mesurer == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-'))
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
@@ -205,6 +251,9 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # #6157 : jamais plus de 8 runners du pool (12) — une ci-full de paquet
+      # mise en file pendant la mesure garde des runners libres.
+      max-parallel: 8
       matrix:
         include:
           - { pilote: psycopg, part: 1, parts: 12 }
@@ -309,8 +358,9 @@ jobs:
     # #876 : la mesure n'est jamais bloquante, mais une exécution annulée ne
     # doit pas laisser cet agrégat en file des heures (always() seul le recrée).
     # #3838 : et jamais sur une PR de paquet — `always()` recréerait ce job
-    # malgré le saut de `mesure`.
-    if: always() && !cancelled() && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-'))
+    # malgré le saut de `mesure`. #6157 : ni sur une mesure sautée par la
+    # fenêtre (`mesure` skipped), qui n'est pas un échec.
+    if: always() && !cancelled() && needs.mesure.result != 'skipped' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-'))
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # #2175 : l'assemblage d'une carte complète (10 parts) coûte ~11 min à 100 % CPU
     # localement ; à 15 min il a été annulé à 15m20 au run 38985327391 alors que les

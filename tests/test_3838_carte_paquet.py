@@ -38,6 +38,8 @@ JOB = re.compile(r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\s*$|\
 IF = re.compile(r"(?m)^    if:\s*(.+?)\s*$")
 NEEDS = re.compile(r"(?m)^    needs:\s*(.+?)\s*$")
 NEED_RESULT = re.compile(r"needs\.([a-z0-9-]+)\.result")
+#: #6157 : la sortie `mesurer` du garde de fenêtre ; ici, mesure due.
+NEED_OUTPUT = re.compile(r"needs\.([a-z0-9-]+)\.outputs\.([a-z_]+)")
 
 
 def jobs() -> dict[str, str]:
@@ -78,6 +80,7 @@ def holds(nom: str, *, event_name: str, head_ref: str = "",
         expr = expr[3:-2].strip()
     expr = NEED_RESULT.sub(
         lambda m: repr(need_results.get(m.group(1), "success")), expr)
+    expr = NEED_OUTPUT.sub(lambda m: repr("true"), expr)
     expr = expr.replace("github.event.pull_request.head.repo.full_name",
                         "head_repo_full_name")
     expr = expr.replace("github.repository", "repo_full_name")
@@ -125,7 +128,7 @@ class CarteHorsPaquetTest(unittest.TestCase):
 
     def setUp(self):
         self.jobs = jobs()
-        for nom in ("plan-mesure", "mesure", "carte", "menage-mesures"):
+        for nom in ("fenetre", "plan-mesure", "mesure", "carte", "menage-mesures"):
             self.assertIn(nom, self.jobs, f"job {nom} introuvable dans carte.yml")
 
     def test_une_pr_de_paquet_ne_lance_aucun_job_de_carte(self):
