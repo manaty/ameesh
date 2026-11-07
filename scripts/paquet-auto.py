@@ -2014,6 +2014,88 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
 
 
 @dataclass
+class ContractTestRun(TestRun):
+    """Merged module reports, retaining partial/inconclusive evidence."""
+    children: list[TestRun] = field(default_factory=list)
+
+    def _summary(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for child in self.children:
+            for key, value in child._summary().items():
+                out[key] = out.get(key, 0) + value
+        return out
+
+    @property
+    def tests(self) -> int:
+        return sum(child.tests for child in self.children)
+
+    @property
+    def skipped(self) -> int:
+        return sum(child.skipped for child in self.children)
+
+    @property
+    def finished(self) -> bool:
+        return bool(self.children) and all(child.finished for child in self.children)
+
+
+def contract_order(worktree: Path, modules: list[str]) -> list[str]:
+    """Longest measured modules first, historical invariants before fallback."""
+    try:
+        data = json.loads((worktree / "tests/parts/durees.json").read_text())
+        table = data.get(test_driver(worktree), {}) if isinstance(data, dict) else {}
+        if not isinstance(table, dict):
+            table = {}
+    except (OSError, ValueError):
+        table = {}
+    try:
+        names = [line.split("#", 1)[0].strip()
+                 for line in (worktree / CONTRACT_ALWAYS).read_text().splitlines()]
+        legacy = {name if name.startswith("tests.") else "tests." + name
+                  for name in names if name}
+    except OSError:
+        legacy = set()
+    legacy.update(CONTRACT_MODULES)
+    def order(module):
+        duration = table.get(module.removeprefix("tests."), 0)
+        if not isinstance(duration, (int, float)):
+            duration = 0
+        return module not in legacy, -duration, module
+    return sorted(modules, key=order)
+
+
+def run_contract_modules(worktree: Path, modules: list[str], *,
+                         end: float, parallel: int) -> ContractTestRun:
+    """One isolated heavy process per module under a shared wall deadline."""
+    if not modules:
+        return ContractTestRun("contrats", [], None, "aucun contrat sélectionné", 0.0)
+    stop = threading.Event()
+    def module_job(module):
+        def run():
+            remaining = int(end - time.monotonic())
+            if stop.is_set():
+                return TestRun("contrats", [module], None,
+                               "module non joué après un contrat négatif", 0.0)
+            if remaining <= 0:
+                return budget_spent("contrats", [module])
+            result = run_tests(worktree, "contrats " + module, [module], timeout=remaining,
+                               heavy=True, wall=remaining, failfast=True)
+            if result.real_failure:
+                stop.set()
+            return result
+        return run
+    children = _run_series([module_job(m) for m in contract_order(worktree, modules)],
+                           parallel=max(1, parallel))
+    negative = any(run.real_failure for run in children)
+    incomplete = any(run.inconclusive for run in children)
+    rc = 1 if negative else (None if incomplete else 0)
+    output = "\n".join("=== %s (%.3f s, rc=%s) ===\n%s" % (
+        ", ".join(run.modules), run.seconds, run.returncode, run.output) for run in children)
+    return ContractTestRun("contrats", list(modules), rc, output, 0.0,
+                           timed_out=not negative and any(r.timed_out for r in children),
+                           children=children)
+
+
+@dataclass
 class ContractPass:
     """Result bound to the final, clean Git tree, including its manifest."""
     head: str
@@ -2036,7 +2118,8 @@ def verify_contract_scope(worktree: Path, report: ContractPass) -> None:
 
 
 def prepublication_contracts(worktree: Path, *, base: str,
-                             budget: int | None, guard=None, expected_head: str = "") -> ContractPass:
+                             budget: int | None, guard=None, expected_head: str = "",
+                             parallel: int = DEFAULT_PARALLEL) -> ContractPass:
     """Plan + slot wait + isolated execution share one canon budget (#6182).
 
     A timeout/absent prerequisite records an inconclusive pass, never a green
@@ -2061,8 +2144,7 @@ def prepublication_contracts(worktree: Path, *, base: str,
         if remaining <= 0:
             run = budget_spent("contrats", modules)
         else:
-            run = run_tests(worktree, "contrats", modules, timeout=remaining,
-                            heavy=True, wall=remaining, failfast=True)
+            run = run_contract_modules(worktree, modules, end=end, parallel=parallel)
     except PaquetAutoError as exc:
         run = save_test_log(TestRun("contrats", modules, None, str(exc),
                                    time.monotonic() - start, timed_out=True))
@@ -2072,6 +2154,8 @@ def prepublication_contracts(worktree: Path, *, base: str,
     if guard is not None:
         guard()
     verify_contract_scope(worktree, report)
+    if isinstance(run, ContractTestRun):
+        save_test_log(run)
     return report
 
 
@@ -4410,7 +4494,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                     "ci-dessus" % head[:12])
             print("inclusion : vert", flush=True)
             contract_report = prepublication_contracts(
-                worktree, base=base_sha, budget=contract_budget(args), guard=guard, expected_head=head)
+                worktree, base=base_sha, budget=contract_budget(args), guard=guard, expected_head=head,
+                parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
             contract_run = contract_report.run
             print("contrats avant publication : %s (%.1f s)%s" % (
                 "NON CONCLUANT" if contract_run.inconclusive else

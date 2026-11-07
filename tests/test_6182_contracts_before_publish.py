@@ -3,6 +3,8 @@
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 import tempfile
 import unittest
 from unittest import mock
@@ -138,6 +140,55 @@ class ScopeAndBudgetTest(unittest.TestCase):
                 auto.prepublication_contracts(self.repo, base='base', budget=12,
                                               expected_head='0' * 40)
         tests.assert_not_called()
+
+    def test_parallel_modules_are_isolated_and_report_counts_are_merged(self):
+        barrier = threading.Barrier(2)
+        schemas = []
+        lock = threading.Lock()
+        def execute(cmd, **kwargs):
+            with lock:
+                schemas.append(kwargs['env']['AMEESH_SCHEMA'])
+            barrier.wait(timeout=5)
+            return subprocess.CompletedProcess(cmd, 0, b'Ran 2 tests in 0.1s\nOK (skipped=1)\n', b'')
+        with mock.patch.object(auto.shutil, 'which', return_value='/bin/ameesh'), \
+                mock.patch.object(auto, 'contract_order', side_effect=lambda _, modules: modules), \
+                mock.patch.object(auto, 'project_python', return_value=sys.executable), \
+                mock.patch.object(auto, 'save_test_log', side_effect=lambda run: run), \
+                mock.patch.object(auto, 'run_walled', side_effect=execute):
+            run = auto.run_contract_modules(self.repo, ['tests.test_a', 'tests.test_b'],
+                                            end=time.monotonic() + 10, parallel=2)
+        self.assertEqual(len(set(schemas)), 2)
+        self.assertEqual((run.tests, run.skipped), (4, 2))
+        self.assertTrue(run.green)
+        self.assertTrue(run.finished)
+        self.assertEqual(len(run.children), 2)
+
+    def test_negative_parallel_result_survives_another_modules_timeout(self):
+        fail = auto.TestRun('contrats', ['tests.test_a'], 1, 'FAIL: regression\n', 0.1)
+        timeout = auto.TestRun('contrats', ['tests.test_b'], None, 'timeout', 1, timed_out=True)
+        with mock.patch.object(auto, '_run_series', return_value=[fail, timeout]), \
+                mock.patch.object(auto, 'contract_order', side_effect=lambda _, modules: modules):
+            run = auto.run_contract_modules(self.repo, ['tests.test_a', 'tests.test_b'],
+                                            end=time.monotonic() + 10, parallel=2)
+        self.assertTrue(run.real_failure)
+        self.assertFalse(run.inconclusive)
+        self.assertFalse(run.finished)
+
+    def test_waiting_modules_use_remaining_global_budget(self):
+        clock = [0.0]
+        def execute(*args, **kwargs):
+            clock[0] = 11.0
+            return auto.TestRun('contrats', ['tests.test_a'], None, 'timeout', 10, timed_out=True)
+        with mock.patch.object(auto.time, 'monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(auto, 'contract_order', side_effect=lambda _, modules: modules), \
+                mock.patch.object(auto, 'run_tests', side_effect=execute) as tests, \
+                mock.patch.object(auto, 'save_test_log', side_effect=lambda run: run):
+            run = auto.run_contract_modules(self.repo, ['tests.test_a', 'tests.test_b'],
+                                            end=10, parallel=1)
+        self.assertEqual(tests.call_count, 1)
+        self.assertTrue(run.inconclusive)
+        self.assertFalse(run.green)
+        self.assertFalse(run.finished)
 
     def test_a_report_from_another_tree_is_not_reused(self):
         head, tree = auto.contract_scope(self.repo)
