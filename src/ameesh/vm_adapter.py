@@ -361,10 +361,14 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             return 'native hook in flight'
         if state == 'stopping':
             q.refresh_stop_intent(host)
-            if request.get('result') in (ARCHIVE_INTENT, POWEROFF_SENT):
-                # #6074: archiving a local volume takes long; progress is not
-                # a stall (host_release_adapter_stalled ages this row).
-                q.touch(request)
+        if state in ('stopping', 'starting'):
+            # #6074: archiving a local volume takes long; progress is not
+            # a stall (host_release_adapter_stalled ages these rows). #6079:
+            # a return queues a busy request ahead of the archiving row, which
+            # is refreshed too while the provider transits.
+            for row in q.pending_all(host):
+                if current(control, row) and row.get('result') in (ARCHIVE_INTENT, POWEROFF_SENT):
+                    q.touch(row)
         if verb == 'draining':
             q.complete(request, 'claims closed; no cloud effect')
             return 'draining'

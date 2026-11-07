@@ -260,6 +260,22 @@ class HaltTest(PgTestCase):
             self.assertEqual(self.tick(), 'probe admitted')
         self.assertFalse(self.q.control('burst')['claims_open'])
 
+    def test_return_during_archive_is_no_stall(self):
+        # #6079: the busy request goes ahead of the archiving row; while the
+        # provider is stopping then starting, that row is progress, not a stall.
+        self.halt_sent()
+        self.provider.state.return_value = 'stopped in place'
+        self.assertEqual(self.tick(), 'halt proven')
+        self.assertEqual(self.tick(), 'archiving')
+        self.q.return_intent('burst')
+        for state in ('stopping', 'starting'):
+            self.provider.state.return_value = state
+            self.age(2000)
+            self.assertEqual(self.tick(), 'provider transition')
+            self.assertEqual(self.stop()['result'], 'poweroff sent')
+            self.assertEqual(self.alerts(), [])
+        self.provider.action.assert_called_once_with(TARGET, 'poweroff')
+
     def test_return_blocked_in_standby_alerts_past_the_stall_bound(self):
         # #6080: standby, return due, `poweron` not allowed (or the field is
         # absent): never silent, the host is named, claims stay closed.
