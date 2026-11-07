@@ -339,6 +339,12 @@ FERMEES = {
     # n'est pas modifiée.
     "fingerprint_source_state": {"project", "environment", "url", "cursor",
                                  "last_read_at", "last_error", "updated_at"},
+    # #6091 (0554) : registre des exécutants externes non-agents (nom
+    # `system:<nom>` et responsable humain), tenu et lu par les gestes de
+    # pilote (`work external-executor`, réservation) ; identité interne fermée
+    # aux deux rôles superviseur, aucun GRANT modifié.
+    "external_executors": {"name", "responsible", "note", "declared_by",
+                           "declared_at", "retired_at", "retired_by"},
     # #4164 (0500) : crédits du compte fournisseur ; l'état est accordé au rôle
     # superviseur (alertes), le texte d'erreur libre du fournisseur reste fermé
     "provider_account_credits": {"detail"},

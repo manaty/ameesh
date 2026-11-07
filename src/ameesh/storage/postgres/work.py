@@ -24,6 +24,7 @@ from ...db import DbError, in_transaction, is_unique_violation
 from ...slo import VEHICLE_EXIT_MARK
 from .. import interface
 from . import catalog as _catalog
+from .external_executors import require_active as require_external_executor_active
 from .work_footprints import (cap_reached_sql as footprint_cap_sql,
                               cap_rows_sql as footprint_cap_rows_sql,
                               held_sql as footprint_held_sql,
@@ -737,6 +738,13 @@ class WorkItems(interface.WorkItems):
         lot, ordre de la prise), une empreinte qui chevauche celle d'un lot
         occupant du même dépôt lève `FootprintOverlap` et annule la création."""
         with self.db.transaction() as tx:
+            if external_executor:
+                # #6091 : un `system:…` doit être encore déclaré actif SOUS le
+                # verrou de sa ligne, tenu jusqu'à l'écriture du lot. Un
+                # `retire` concurrent (UPDATE de la même ligne) attend ce
+                # commit s'il arrive après ; s'il a déjà commité, la
+                # déclaration n'est plus active et la création est refusée.
+                require_external_executor_active(tx, external_executor)
             if unique_ref and str(issue_ref or "").strip():
                 # #2954 : deux watchers (deux hôtes) peuvent ouvrir l'incident
                 # du même run dans la même fenêtre. Le verrou est pris avant
@@ -1627,6 +1635,8 @@ class WorkItems(interface.WorkItems):
         est fermé ou si la pose perd la course contre une attribution : sous le
         verrou de la ligne, la condition est relue, pas devinée."""
         with self.db.transaction() as tx:
+            if executor:
+                require_external_executor_active(tx, executor)
             rows = tx.query(
                 ("UPDATE work_items SET external_executor = %s, updated_at = now()"
                  f" WHERE id = %s AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
