@@ -88,6 +88,9 @@ CARTE_ARTIFACT = "carte"
 #: la cible, que `scripts/test-plan.py` refusait ensuite (`card-stale`)
 #: jusqu'au prochain run carte de `main`.
 CARTE_BRANCH = "main"
+#: #6157 : runs verts essayés, du plus récent au plus ancien — une mesure
+#: planifiée sautée par sa fenêtre finit verte sans artefact `carte`.
+CARTE_RUNS = 5
 #: #2644/N dev1 : la prévalidation du train tourne avant `_held()`, mais le
 #: bail de la cible (land.LOCK_TTL_S, 1800 s par défaut) court déjà. Ces deux
 #: plafonds bornent le plan et le run ; ils ne composent pas une borne du
@@ -343,29 +346,33 @@ def map_for(repo_slug: str, repo: str = "", *, explicit: str = "",
     if deadline is not None and deadline.expired():
         return "", ""
     try:
+        # #6157 : un run vert n'a pas toujours publié de carte — la fenêtre
+        # saute la mesure planifiée hors de son créneau (job `fenetre`, run
+        # vert sans artefact) ; les runs suivants sont essayés dans l'ordre.
         listed = runner(["gh", "run", "list", "--repo", slug, "--workflow",
                          CARTE_WORKFLOW, "--branch", CARTE_BRANCH,
-                         "--status", "success", "--limit", "1",
+                         "--status", "success", "--limit", str(CARTE_RUNS),
                          "--json", "databaseId"], capture_output=True, text=True,
                         timeout=deadline.timeout(30) if deadline is not None else 30)
         if listed.returncode:
             return "", ""
         runs = json.loads(listed.stdout or "[]")
-        ident = runs[0].get("databaseId") if runs else None
-        if not ident:
-            return "", ""
-        if deadline is not None and deadline.expired():
-            return "", ""
-        tmp = tempfile.mkdtemp(prefix="ameesh-carte-")
-        got = runner(["gh", "run", "download", str(ident), "--repo", slug, "-n",
-                      CARTE_ARTIFACT, "-D", tmp], capture_output=True, text=True,
-                     timeout=deadline.timeout(120) if deadline is not None else 120)
-        path = os.path.join(tmp, "carte.json.gz")
-        if got.returncode or not os.path.isfile(path):
+        for run in runs:
+            ident = run.get("databaseId")
+            if not ident:
+                continue
+            if deadline is not None and deadline.expired():
+                return "", ""
+            tmp = tempfile.mkdtemp(prefix="ameesh-carte-")
+            got = runner(["gh", "run", "download", str(ident), "--repo", slug, "-n",
+                          CARTE_ARTIFACT, "-D", tmp], capture_output=True, text=True,
+                         timeout=deadline.timeout(120) if deadline is not None else 120)
+            path = os.path.join(tmp, "carte.json.gz")
+            if not got.returncode and os.path.isfile(path):
+                return path, tmp
             shutil.rmtree(tmp, ignore_errors=True)
-            return "", ""
-        return path, tmp
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return "", ""
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
         return "", ""
 
 

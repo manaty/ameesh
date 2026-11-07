@@ -102,6 +102,11 @@ class DecisionTest(unittest.TestCase):
         self.assertFalse(fenetre.paquet_actif(runs[:1]))
         self.assertFalse(fenetre.autre_carte(runs, "1"), "le garde ne se compte pas")
         self.assertTrue(fenetre.autre_carte(runs, "9"))
+        # deux gardes simultanés (runs 5 et 6) : l'aîné mesure, le cadet cède
+        deux = [{"id": 5, "path": ".github/workflows/carte.yml"},
+                {"id": 6, "path": ".github/workflows/carte.yml"}]
+        self.assertFalse(fenetre.autre_carte(deux, "5"))
+        self.assertTrue(fenetre.autre_carte(deux, "6"))
 
     def test_main_ecrit_la_sortie_sans_api_pour_une_pr(self):
         with tempfile.TemporaryDirectory() as d:

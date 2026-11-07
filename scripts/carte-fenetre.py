@@ -16,8 +16,9 @@ Les deux passent par ce garde, exécuté par le job `fenetre` sur un runner
 hébergé (il ne prend jamais un runner du pool) :
 
   - pas due : une carte de main a été publiée il y a moins de 12 h, ou une
-    autre mesure de la carte est en file ou en cours (le cron en retard
-    derrière une mesure de la minuterie) ;
+    mesure plus ancienne de la carte est en file ou en cours (le cron en
+    retard derrière une mesure de la minuterie ; de deux gardes simultanés,
+    l'aîné mesure) ;
   - hors fenêtre : l'heure UTC n'est pas dans [00:00, 07:00) — loin des
     coupures 10:00Z/22:00Z (11:00/23:00 Europe/Paris) et des heures de
     paquets de jour ;
@@ -122,9 +123,20 @@ def paquet_actif(runs: list[dict]) -> bool:
 
 
 def autre_carte(runs: list[dict], run_id: str) -> bool:
-    """Une autre exécution de carte.yml (jamais celle du garde lui-même)."""
+    """Une exécution de carte.yml plus ancienne que celle du garde.
+
+    Priorité déterministe (relecture #6157) : deux gardes simultanés se voient
+    l'un l'autre ; seul le plus récent (identifiant de run plus grand) cède,
+    l'aîné mesure. Un identifiant illisible compte comme plus ancien."""
+    def rang(valeur) -> int:
+        try:
+            return int(valeur)
+        except (TypeError, ValueError):
+            return -1
+    soi = rang(run_id)
     return any(str(r.get("path") or "").endswith("/carte.yml")
-               and str(r.get("id")) != str(run_id) for r in runs)
+               and str(r.get("id")) != str(run_id)
+               and (soi < 0 or rang(r.get("id")) < soi) for r in runs)
 
 
 def _lire(fonction, quoi: str):

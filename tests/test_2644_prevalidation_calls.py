@@ -1418,6 +1418,41 @@ class MapTest(unittest.TestCase):
         self.assertTrue(cleanup)
         shutil.rmtree(cleanup, ignore_errors=True)
 
+    def test_carte_skips_a_green_run_without_artifact(self):
+        """#6157 : une mesure planifiée sautée par sa fenêtre finit verte sans
+        artefact `carte` ; le run vert précédent fournit la carte."""
+        root = tempfile.mkdtemp(prefix="ameesh-2644-map-")
+        self.addCleanup(shutil.rmtree, root, True)
+        downloads = []
+
+        def runner(argv, **kw):
+            if argv[:3] == ["gh", "run", "list"]:
+                self.assertEqual(argv[argv.index("--limit") + 1], str(calls.CARTE_RUNS))
+                return SimpleNamespace(returncode=0,
+                                       stdout='[{"databaseId": 43}, {"databaseId": 42}]')
+            if argv[:3] == ["gh", "run", "download"]:
+                downloads.append(argv[3])
+                if argv[3] == "43":
+                    return SimpleNamespace(returncode=1, stdout="")  # aucun artefact
+                target = argv[argv.index("-D") + 1]
+                with open(os.path.join(target, "carte.json.gz"), "wb") as fh:
+                    fh.write(b"x")
+                return SimpleNamespace(returncode=0, stdout="")
+            raise AssertionError(argv)
+
+        path, cleanup = calls.map_for("manaty/ameesh", root, runner=runner)
+        self.assertEqual(downloads, ["43", "42"])
+        self.assertTrue(os.path.isfile(path))
+        shutil.rmtree(cleanup, ignore_errors=True)
+
+        # aucun run n'a d'artefact : pas de carte, aucun répertoire laissé
+        def none(argv, **kw):
+            if argv[:3] == ["gh", "run", "list"]:
+                return SimpleNamespace(returncode=0, stdout='[{"databaseId": 43}]')
+            return SimpleNamespace(returncode=1, stdout="")
+
+        self.assertEqual(calls.map_for("manaty/ameesh", root, runner=none), ("", ""))
+
     def test_carte_artifact_is_only_read_from_main(self):
         """#3352 : un run carte de PR ne fournit jamais la carte de la cible."""
         root = tempfile.mkdtemp(prefix="ameesh-2644-map-")
@@ -1435,7 +1470,7 @@ class MapTest(unittest.TestCase):
         self.assertEqual(seen, [[
             "gh", "run", "list", "--repo", "manaty/ameesh", "--workflow",
             "carte.yml", "--branch", "main", "--status", "success",
-            "--limit", "1", "--json", "databaseId"]])
+            "--limit", str(calls.CARTE_RUNS), "--json", "databaseId"]])
 
     def test_no_map_is_not_an_error(self):
         self.assertEqual(calls.map_for("", ""), ("", ""))
