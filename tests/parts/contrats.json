@@ -1,0 +1,194 @@
+{
+  "schema": "ameesh-contracts/1",
+  "rules": [
+    {
+      "id": "observation-always",
+      "paths": [],
+      "operations": [
+        "A",
+        "C",
+        "D",
+        "M",
+        "R",
+        "T",
+        "U"
+      ],
+      "modules": [
+        "test_2340_auditeur_role",
+        "test_2449_garde_mecanique",
+        "test_2457_garde_non_python",
+        "test_339_orphan_settle",
+        "test_3752_gabarit",
+        "test_4256_validation_deadlines",
+        "test_4259_client_literals",
+        "test_4299_agent_rename",
+        "test_5588_housekeeping_retention",
+        "test_6011_contrat_ecrivains_isoles",
+        "test_6090_work_add_unique_ref",
+        "test_cluster",
+        "test_contract_registry_ameesh",
+        "test_contract_selection",
+        "test_events_attach",
+        "test_l102_cli_vocab",
+        "test_l107_executor_contract",
+        "test_l31_orphans",
+        "test_l50_group_orphan_work_items",
+        "test_l72_panne_de_base",
+        "test_migrations",
+        "test_migrations_additives"
+      ]
+    },
+    {
+      "id": "mediated-storage",
+      "paths": [
+        "src/ameesh/mediated_executor/*",
+        "src/ameesh/storage/*"
+      ],
+      "operations": [
+        "A",
+        "C",
+        "D",
+        "M",
+        "R",
+        "T",
+        "U"
+      ],
+      "modules": [
+        "test_l107_executor_contract"
+      ]
+    },
+    {
+      "id": "migrations",
+      "paths": [
+        "src/ameesh/db.py",
+        "src/ameesh/migrations.py",
+        "src/ameesh/migrations/*",
+        "src/ameesh/train_migrations.py"
+      ],
+      "operations": [
+        "A",
+        "C",
+        "D",
+        "M",
+        "R",
+        "T",
+        "U"
+      ],
+      "modules": [
+        "test_3752_gabarit",
+        "test_6090_work_add_unique_ref",
+        "test_cluster",
+        "test_migrations",
+        "test_migrations_additives"
+      ]
+    },
+    {
+      "id": "cli",
+      "paths": [
+        "src/ameesh/actions_cli.py",
+        "src/ameesh/approve/cli.py",
+        "src/ameesh/canon_cli.py",
+        "src/ameesh/cli.py",
+        "src/ameesh/github_cli.py",
+        "src/ameesh/harness_cli.py",
+        "src/ameesh/host_cli.py",
+        "src/ameesh/login_cli.py",
+        "src/ameesh/main.py",
+        "src/ameesh/mesh_cli.py",
+        "src/ameesh/modules/dev.py",
+        "src/ameesh/pipeline_cli.py",
+        "src/ameesh/plan_cli.py",
+        "src/ameesh/process_approvals_cli.py",
+        "src/ameesh/process_observations_cli.py",
+        "src/ameesh/receipts_cli.py",
+        "src/ameesh/sandbox_cli.py",
+        "src/ameesh/train_cli.py",
+        "src/ameesh/veille_cli.py"
+      ],
+      "operations": [
+        "A",
+        "C",
+        "D",
+        "M",
+        "R",
+        "T",
+        "U"
+      ],
+      "modules": [
+        "test_4259_client_literals",
+        "test_l102_cli_vocab"
+      ]
+    },
+    {
+      "id": "sql-roles",
+      "paths": [
+        "deploy/sql/*",
+        "tests/role_acl.py"
+      ],
+      "operations": [
+        "A",
+        "C",
+        "D",
+        "M",
+        "R",
+        "T",
+        "U"
+      ],
+      "modules": [
+        "test_2340_auditeur_role",
+        "test_4256_validation_deadlines",
+        "test_6011_contrat_ecrivains_isoles",
+        "test_cluster"
+      ]
+    },
+    {
+      "id": "registry-and-selection",
+      "paths": [
+        "scripts/paquet-auto.py",
+        "scripts/test-parts.py",
+        "scripts/test-plan.py",
+        "src/ameesh/contract_selection.py",
+        "src/ameesh/mechanics.py",
+        "src/ameesh/prevalidation.py",
+        "tests/parts/*",
+        "tests/test_contract_registry_ameesh.py",
+        "tests/test_contract_selection.py",
+        "tests/test_l161f_plan.py"
+      ],
+      "operations": [
+        "A",
+        "C",
+        "D",
+        "M",
+        "R",
+        "T",
+        "U"
+      ],
+      "modules": [
+        "test_2340_auditeur_role",
+        "test_2449_garde_mecanique",
+        "test_2457_garde_non_python",
+        "test_339_orphan_settle",
+        "test_3752_gabarit",
+        "test_4256_validation_deadlines",
+        "test_4259_client_literals",
+        "test_4299_agent_rename",
+        "test_5588_housekeeping_retention",
+        "test_6011_contrat_ecrivains_isoles",
+        "test_6090_work_add_unique_ref",
+        "test_cluster",
+        "test_contract_registry_ameesh",
+        "test_contract_selection",
+        "test_events_attach",
+        "test_l102_cli_vocab",
+        "test_l107_executor_contract",
+        "test_l161f_plan",
+        "test_l31_orphans",
+        "test_l50_group_orphan_work_items",
+        "test_l72_panne_de_base",
+        "test_migrations",
+        "test_migrations_additives"
+      ]
+    }
+  ]
+}
