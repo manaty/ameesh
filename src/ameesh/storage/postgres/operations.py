@@ -615,8 +615,10 @@ class Operations(interface.Operations):
             (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
-    def turns(self, *, agent, since_s, limit, message=None) -> list[dict]:
-        sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
+    def turns(self, *, agent, since_s, limit, message=None,
+              min_reread=None) -> list[dict]:
+        sql = ("SELECT id, agent, harness, turn, turn_id, model, session,"
+               " usd::float8 AS usd,"
                " input_tokens, cached_input_tokens, output_tokens, work_item_id,"
                " inputs, to_jsonb(turn_costs)->'attribution' AS attribution,"
                " extract(epoch from recorded_at)::float8 AS recorded_ts,"
@@ -632,6 +634,14 @@ class Operations(interface.Operations):
             # contenant). Le coût rendu est celui du tour entier, jamais divisé.
             sql += " AND inputs @> %s::jsonb"
             params.append(json.dumps([str(message)]))
+        if min_reread is not None:
+            # #6045 : le seuil porte sur l'entrée relue (entrée + cache lu),
+            # filtrée AVANT la limite ; Codex compte déjà le cache dans son
+            # entrée (même convention que `TurnUsage.reread_tokens`).
+            sql += (" AND (CASE WHEN harness = 'codex'"
+                    " THEN greatest(input_tokens, cached_input_tokens)"
+                    " ELSE input_tokens + cached_input_tokens END) > %s")
+            params.append(int(min_reread))
         sql += " ORDER BY recorded_at DESC, id DESC LIMIT %s"
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
