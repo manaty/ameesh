@@ -163,7 +163,9 @@ def add_links_parser(sub, func):
     parser = sub.add_parser(
         "links", help="#4167: inspect or edit typed links between lots (duplicates, "
                       "supersedes, part_of, conflicts_with)")
-    parser.add_argument("id", type=int, help="lot")
+    parser.add_argument("id", type=int, nargs="?", help="lot")
+    parser.add_argument("--project", default=None,
+                        help="#6043: read the typed links of every open lot of the project")
     edit = parser.add_mutually_exclusive_group()
     edit.add_argument("--add", type=int, metavar="LOT",
                       help="add the link: <id> <kind> LOT (with --kind)")
@@ -178,7 +180,37 @@ def add_links_parser(sub, func):
     parser.set_defaults(func=func)
 
 
+def project_links(db, project):
+    """#6043 : les liens typés des lots ouverts d'un projet, en une lecture
+    bornée (le plan ouvert du projet), pour un exécutant externe."""
+    rows = storage.of(db).work.project_plan_rows(project)
+    found = links(db, [int(r["id"]) for r in rows])
+    return {"project": project,
+            "lots": [{"id": int(r["id"]), "state": r["state"],
+                      "links": found.get(int(r["id"]), [])}
+                     for r in sorted(rows, key=lambda r: int(r["id"]))]}
+
+
 def run_links(db, args):
+    project = (getattr(args, "project", None) or "").strip()
+    if project:
+        if args.id is not None or args.add is not None or args.remove is not None \
+                or args.decide is not None or args.kind or args.decision:
+            raise work.WorkError("--project reads every open lot's links; no lot, no edit")
+        out = project_links(db, project)
+        if args.json:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 0
+        shown = 0
+        for lot in out["lots"]:
+            for row in lot["links"]:
+                print("#%d %s #%d (%s)" % (lot["id"], row["label"], row["lot"], row["state"]))
+                shown += 1
+        if not shown:
+            print("%s: no typed link on its open lots" % project)
+        return 0
+    if args.id is None:
+        raise work.WorkError("work links needs a lot, or --project P")
     _id(args.id)
     if work.get(db, args.id) is None:
         raise work.WorkError("lot #%d not found" % args.id)
