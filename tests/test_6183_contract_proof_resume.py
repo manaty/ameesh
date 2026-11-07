@@ -26,6 +26,13 @@ def event(run=None, **changes):
 
 
 class PolicyTest(TestCase):
+    def test_unreadable_canon_keeps_contracts_first(self):
+        for error in (OSError('unreadable'), ValueError('invalid'),
+                      mechanics.MechanicsError('no readable canon')):
+            with self.subTest(error=error), mock.patch(
+                    'ameesh.mechanics.configured', side_effect=error):
+                self.assertEqual(proof.policy('demo'), 'contracts-first')
+
     def compile(self, extra=''):
         return mechanics.compile_document(MECHANICS.replace('projects: {}', 'projects:\n  demo:\n    contract_selection:\n      registry: tests/parts/contrats.json\n' + extra))
 

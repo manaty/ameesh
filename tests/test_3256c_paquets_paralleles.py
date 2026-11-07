@@ -344,6 +344,7 @@ class ComposerParallelTest(unittest.TestCase):
                               pilot="mesh-design", actor="mesh-design",
                               shell=self.shell, python="python3", now=NOW,
                               zone=ZONE,
+                              contract_publication="legacy",
                               parallel=SimpleNamespace(attente_mediane_s=3600.0,
                                                        max_paquets=2))
         self._saved = (ph.ready_lots, ph.candidates, ph.manifest_at,

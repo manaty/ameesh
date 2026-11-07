@@ -11,7 +11,12 @@ SCHEMA = "ameesh-packet-contract-result/1"
 
 def policy(project):
     from . import config, mechanics
-    document = mechanics.configured(config.load())
+    try:
+        document = mechanics.configured(config.load())
+    except (OSError, ValueError, mechanics.MechanicsError):
+        # Like the composer's budget reader, direct calls may lack a canon.
+        # Keep D's contracts-first path; never enable legacy proof bypass.
+        return "contracts-first"
     return from_document(document, project)
 
 
