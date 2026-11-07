@@ -46,6 +46,7 @@ _COLUMNS_TEMPLATE = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
     __REVIEWER__,
     __EXTERNAL__,
+    __UNIQUE__,
     __LIFECYCLE__,
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
     superseded_by, delegated_by,
@@ -154,7 +155,8 @@ def has_migration_slots(db) -> bool:
 
 
 #: #5404 : les colonnes optionnelles lues par `item_columns` et `work.get`.
-_OPTIONAL_ITEM_COLUMNS = ("reviewer", "reviewers", "external_executor", "wake_at", "legacy_state",
+_OPTIONAL_ITEM_COLUMNS = ("reviewer", "reviewers", "external_executor", "unique_ref",
+                          "wake_at", "legacy_state",
                           "workflow_ref", "workflow_stage", "workflow_version")
 
 
@@ -204,7 +206,10 @@ def item_columns(db, ref: str | None = None, migrations: str | None = None) -> s
     d'une milliseconde par ligne (corps compris, quatre fois par ligne) : la
     moitié d'`ameesh alerts`. Il ne reste que le repli sans `ref` d'une base en
     retard sur le schéma (fenêtre de migration, #2339), derrière une sonde mise
-    en cache. `to_jsonb(colonne)` garde la forme JSON de `reviewers`."""
+    en cache. `to_jsonb(colonne)` garde la forme JSON de `reviewers`.
+
+    #6090 : `unique_ref` est la clé durable de `work add --unique-ref` ; une
+    base d'avant 0555 la rend NULL par le repli `to_jsonb`, sans erreur."""
     col = "%s." % ref if ref else ""
     if ref:
         reviewer = "coalesce(%sreviewer, '') AS reviewer" % col
@@ -215,12 +220,14 @@ def item_columns(db, ref: str | None = None, migrations: str | None = None) -> s
     if ref or has_current_item_columns(db):
         reviewers = "to_jsonb(%sreviewers) AS reviewers" % col
         external = "%sexternal_executor AS external_executor" % col
+        unique_ref = "%sunique_ref AS unique_ref" % col
         wake = "extract(epoch from %swake_at)::float8 as wake_ts" % col
         lifecycle_columns = ("%slegacy_state AS legacy_state, "
                              "%sworkflow_stage AS workflow_stage" % (col, col))
     else:
         reviewers = "to_jsonb(work_items)->'reviewers' AS reviewers"
         external = "to_jsonb(work_items)->>'external_executor' AS external_executor"
+        unique_ref = "to_jsonb(work_items)->>'unique_ref' AS unique_ref"
         wake = ("extract(epoch from (to_jsonb(work_items)->>'wake_at')::timestamptz)::float8"
                 " as wake_ts")
         lifecycle_columns = ("to_jsonb(work_items)->>'legacy_state' AS legacy_state, "
@@ -242,6 +249,7 @@ def item_columns(db, ref: str | None = None, migrations: str | None = None) -> s
     return (_COLUMNS_TEMPLATE
             .replace("__REVIEWER__", reviewer + ", " + reviewers)
             .replace("__EXTERNAL__", external)
+            .replace("__UNIQUE__", unique_ref)
             .replace("__LIFECYCLE__", lifecycle_columns)
             .replace("__WAKE__", wake)
             .replace("__MIGRATIONS__", migrations_column))
@@ -693,7 +701,8 @@ class WorkItems(interface.WorkItems):
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
             estimate_source=None, change_size=None, queued_note=None,
             forced_note=None, mark_item_id=None, mark_note="",
-            parent_lot=None, unique_ref=False, external_executor=None,
+            parent_lot=None, unique_execution=False, unique_ref=None,
+            external_executor=None,
             footprint=None, footprint_unknown=False) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
@@ -704,7 +713,7 @@ class WorkItems(interface.WorkItems):
         `issue_ref` est relue sous ce verrou : deux appels concurrents ne
         peuvent pas créer deux lots pour la même référence (revue #544 r2).
 
-        #2954 : `unique_ref` prend d'abord un verrou consultatif de
+        #2954 : `unique_execution` prend d'abord un verrou consultatif de
         transaction sur `issue_ref` puis relit la référence, quel que soit
         l'état des lots ; deux hôtes qui créent l'incident du même run se
         sérialisent et le second reçoit `DbError` (son appelant relit le
@@ -716,6 +725,15 @@ class WorkItems(interface.WorkItems):
         (`ci-incident:<repo>:<run>`) et la synchro des tickets peut avoir
         déplacé l'`issue_ref` du gagnant vers son ticket miroir pendant
         l'attente du verrou.
+
+        #6090 : `unique_ref` est la clé d'idempotence durable fournie par
+        l'appelant (`work add --unique-ref`). Sous un verrou consultatif
+        propre à la clé, le lot qui la porte déjà est relu **quel que soit son
+        état** et rendu tel quel (marqué `existing`) : le second appel ne crée
+        rien et ne lève pas. Le premier créateur gagne ; la clé est globale au
+        mesh et comparée exactement (opaque, à la casse près). L'index unique
+        partiel de 0555 est la barrière de dernier recours, le verrou la
+        sérialisation.
 
         `parent_lot` (#1193): the explicit parent of a suite lot. The parent is
         read back **under lock in the same transaction**: still open, the
@@ -738,6 +756,18 @@ class WorkItems(interface.WorkItems):
         lot, ordre de la prise), une empreinte qui chevauche celle d'un lot
         occupant du même dépôt lève `FootprintOverlap` et annule la création."""
         with self.db.transaction() as tx:
+            if unique_ref:
+                # #6090 : la clé durable est relue sous son verrou avant toute
+                # écriture. Le second appelant attend le commit du premier,
+                # puis rend son lot au lieu d'en créer un ; un lot fermé garde
+                # sa clé, comme l'identité d'exécution de #2954.
+                tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                         ("work-add-unique-ref:" + unique_ref,))
+                existing = tx.query(
+                    "SELECT %s FROM work_items WHERE unique_ref = %%s"
+                    % item_columns(self.db), (unique_ref,))
+                if existing:
+                    return dict(existing[0], existing=True)
             if external_executor:
                 # #6091 : un `system:…` doit être encore déclaré actif SOUS le
                 # verrou de sa ligne, tenu jusqu'à l'écriture du lot. Un
@@ -745,7 +775,7 @@ class WorkItems(interface.WorkItems):
                 # commit s'il arrive après ; s'il a déjà commité, la
                 # déclaration n'est plus active et la création est refusée.
                 require_external_executor_active(tx, external_executor)
-            if unique_ref and str(issue_ref or "").strip():
+            if unique_execution and str(issue_ref or "").strip():
                 # #2954 : deux watchers (deux hôtes) peuvent ouvrir l'incident
                 # du même run dans la même fenêtre. Le verrou est pris avant
                 # toute ligne de lot ; la relecture ci-dessous, après le
@@ -785,7 +815,7 @@ class WorkItems(interface.WorkItems):
                 if duplicate:
                     raise DbError("issue_ref %s is already carried by lot #%d"
                                   % (issue_ref, int(duplicate[0]["id"])))
-            if unique_ref and str(issue_ref or "").strip():
+            if unique_execution and str(issue_ref or "").strip():
                 # #2954 : sous le verrou consultatif, la relecture voit le
                 # premier créateur (son commit précède l'acquisition) ; un lot
                 # fermé garde l'identité de l'exécution, comme `_open`.
@@ -810,9 +840,9 @@ class WorkItems(interface.WorkItems):
                     (type, source, app, title, body, issue_ref, workstream, assignee,
                      budget_usd, state, package_id, package_parent, branch, branch_target,
                      priority, estimate_minutes, estimate_source, estimate_by, estimate_at,
-                     change_size, external_executor)
+                     change_size, external_executor, unique_ref)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s, %s,
-                        %s, %s, %s, CASE WHEN %s THEN now() END, %s, %s)
+                        %s, %s, %s, CASE WHEN %s THEN now() END, %s, %s, %s)
                 RETURNING __COLUMNS__
                 """.replace("__COLUMNS__", item_columns(self.db)),
                 (type, source, app, title, body, issue_ref, workstream, assignee,
@@ -820,7 +850,7 @@ class WorkItems(interface.WorkItems):
                  None if priority is None else int(priority),
                  estimate_minutes, estimate_source if estimate_minutes else None,
                  (actor or "") if estimate_minutes else None, bool(estimate_minutes),
-                 change_size or None, external_executor or None),
+                 change_size or None, external_executor or None, unique_ref or None),
             )
             item = rows[0]
             if estimate_minutes:
@@ -3680,6 +3710,19 @@ class WorkItems(interface.WorkItems):
         return self.db.query(
             "SELECT %s FROM work_items WHERE lower(source) = lower(%%s)"
             " ORDER BY id" % item_columns(self.db), (text,))
+
+    def by_unique_ref(self, key) -> dict | None:
+        """#6090 : le lot qui porte exactement cette clé durable, quel que soit
+        son état, ou None. La comparaison est à la casse près : la clé est
+        opaque, fournie par l'appelant (l'espacement par source lui revient).
+        Une clé vide ne désigne rien, comme une source vide."""
+        text = str(key or "").strip()
+        if not text:
+            return None
+        rows = self.db.query(
+            "SELECT %s FROM work_items WHERE unique_ref = %%s"
+            % item_columns(self.db), (text,))
+        return rows[0] if rows else None
 
     def by_package(self, package_id) -> list[dict]:
         return self.db.query(

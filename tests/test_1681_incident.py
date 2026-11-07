@@ -401,7 +401,7 @@ class TestOuverture(unittest.TestCase):
             self.assertEqual(out["id"], 9001)
             self.assertTrue(out["assigned"])
             self.assertEqual(add.call_args.kwargs["issue_ref"], "ci-incident:manaty/nexlink:77")
-            self.assertTrue(add.call_args.kwargs["unique_ref"],
+            self.assertTrue(add.call_args.kwargs["unique_execution"],
                             "#2954 : la création de l'incident est unique par exécution")
             self.assertEqual(add.call_args.kwargs["priority"], 1)
             self.assertIsNone(add.call_args.kwargs.get("assignee"))
@@ -486,7 +486,7 @@ class TestOuverture(unittest.TestCase):
         self.assertEqual(store.by_source_refs, [ref])
 
     def test_course_perdue_rend_le_gagnant_au_ticket_miroir(self):
-        """#3607 : sous le verrou unique_ref, le gagnant a déjà reçu son ticket
+        """#3607 : sous le verrou unique_execution, le gagnant a déjà reçu son ticket
         miroir quand le perdant relit ; `source` garde l'identité de
         l'exécution et le perdant rend le gagnant, sans second lot."""
         ref = "ci-incident:manaty/nexlink:79"
