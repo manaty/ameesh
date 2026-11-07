@@ -3,7 +3,8 @@
 
 Registry schema ``ameesh-contracts/1``: ``rules`` is a nonempty list of
 {id, paths, operations, modules}. Paths use case-sensitive fnmatch globs
-(``*`` includes slashes); an empty paths list declares a universal rule.
+(``*`` includes slashes); an empty paths list declares a universal rule
+whose operations must include every Git status (it applies even to an empty diff).
 Operations are Git A/M/D/R/C/T/U statuses. Overlapping path rules are
 ambiguous and trigger the conservative fallback; universal rules are additive.
 
@@ -114,6 +115,8 @@ def compile_registry(text: str) -> Registry:
         modules = _strings(item["modules"])
         if any(not relative_path(p) for p in paths) or not set(operations) <= OPERATIONS:
             raise RegistryError("invalid paths or operations")
+        if not paths and set(operations) != OPERATIONS:
+            raise RegistryError("universal rule requires all operations")
         if any(not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", m) for m in modules):
             raise RegistryError("invalid module name")
         rules.append(Rule(name, paths, operations, modules))
@@ -133,7 +136,10 @@ def select(registry: Registry | None, changes, inventory, *, commit: str,
         raise RegistryError("exact candidate commit required")
     if isinstance(inventory, str):
         raise RegistryError("module inventory must be a collection")
-    supplied = tuple(inventory)
+    try:
+        supplied = tuple(inventory)
+    except TypeError as exc:
+        raise RegistryError("module inventory must be iterable") from exc
     if not supplied or any(not isinstance(m, str) or not m for m in supplied):
         raise RegistryError("nonempty candidate module inventory required")
     modules = tuple(sorted(set(supplied)))

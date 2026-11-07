@@ -39,6 +39,25 @@ class SelectionTests(unittest.TestCase):
                          dict(reasons=["rule:storage"], paths=["src/storage/db.py"]))
         self.assertEqual(len(result.registry_digest), 64)
 
+    def test_universal_requires_every_operation(self):
+        for operation in sorted(cs.OPERATIONS):
+            declaration = rule("global", [], ["test_global"])
+            declaration["operations"].remove(operation)
+            with self.subTest(missing=operation), self.assertRaisesRegex(
+                    cs.RegistryError, "universal rule requires all operations"):
+                cs.compile_registry(document(declaration))
+        result = self.select([])
+        self.assertEqual(result.modules, ("test_global",))
+        self.assertFalse(result.full_suite_required)
+
+    def test_non_iterable_inventory_has_named_error(self):
+        for inventory in (None, 42, True, object()):
+            with self.subTest(inventory=inventory), self.assertRaisesRegex(
+                    cs.RegistryError, "module inventory must be iterable"):
+                cs.select(registry(), [], inventory, commit=SHA)
+        result = cs.select(registry(), [], iter(INVENTORY), commit=SHA)
+        self.assertEqual(result.modules, ("test_global",))
+
     def test_rename_checks_old_and_new_and_delete_checks_old(self):
         result = self.select([cs.Change("R", "new/db.py", "src/storage/db.py")])
         self.assertEqual(result.modules, tuple(sorted(INVENTORY)))
