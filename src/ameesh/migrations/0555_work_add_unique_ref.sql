@@ -27,6 +27,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS work_items_unique_ref_idx
     WHERE unique_ref IS NOT NULL;
 
 COMMENT ON COLUMN work_items.unique_ref IS
-    '#6090: durable caller-supplied idempotency key of `work add --unique-ref`; NULL for an ordinary creation. Global to the mesh, exact match, any state.';
+    '#6090 durable caller-supplied idempotency key carried by a lot (NULL means an ordinary lot). Exact match, any state, global to the mesh.';
 COMMENT ON INDEX work_items_unique_ref_idx IS
-    '#6090: at most one lot per unique_ref; partial so ordinary lots (NULL) are unaffected.';
+    '#6090 at most one lot per key. Partial so ordinary lots (NULL) are unaffected.';
