@@ -79,14 +79,18 @@ def _disjoint_selection(ordered, policies):
 
 
 def evaluate(rows, *, project, rule=None, holds=None, now=None, can_take=None, phase=True,
-             policies=None):
+             policies=None, executor=None):
     """Readiness, optionally scoped to an agent before bug preemption.
 
     ``phase=False`` retains both kinds for the initial dispatcher candidate
     pool; each agent applies its own phase without deleting others' candidates.
     #4818: ``policies`` (repository footprint policies, by app) let the plan
     pick a set of ready lots with pairwise disjoint footprints.
+    #6043: ``executor`` reads the plan for that external executor: its own
+    reserved lots lose the reservation reason (ready for it); the dispatcher
+    never passes it, so L165 agents still never take them.
     """
+    executor = (executor or "").strip() or None
     from . import backlog
     stamp = time.time() if now is None else float(now)
     today = dt.datetime.fromtimestamp(stamp).date().isoformat()
@@ -100,7 +104,8 @@ def evaluate(rows, *, project, rule=None, holds=None, now=None, can_take=None, p
             reasons.append("assigned to %s" % row["assignee"])
         if state == "build" and not row.get("returned_to_queue"):
             reasons.append("already in progress")
-        if row.get("external_executor"):
+        reserved = (row.get("external_executor") or "").strip()
+        if reserved and reserved != executor:
             reasons.append("reserved for external executor")
         if not (row.get("lot_team") or "").strip():
             reasons.append("project/team missing")
@@ -162,7 +167,8 @@ def acceptance_rule(cfg, project):
     return entry.get("spec_acceptance")
 
 
-def report(db, project, *, cfg=None, now=None, can_take=None, phase=True, snapshots=None):
+def report(db, project, *, cfg=None, now=None, can_take=None, phase=True, snapshots=None,
+           executor=None):
     from . import backlog
     cfg = cfg or getattr(db, "cfg", None)
     rule = acceptance_rule(cfg, project)
@@ -176,7 +182,7 @@ def report(db, project, *, cfg=None, now=None, can_take=None, phase=True, snapsh
     from . import work_footprints
     policies = work_footprints.policies_of(db, {str(r.get("app") or "") for r in rows})
     return evaluate(rows, project=project, rule=rule, holds=holds, now=now,
-                    can_take=can_take, phase=phase, policies=policies)
+                    can_take=can_take, phase=phase, policies=policies, executor=executor)
 
 
 def eligible(db, items, *, cfg=None, now=None, can_take=None, phase=True, snapshots=None):
