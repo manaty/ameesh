@@ -32,17 +32,46 @@ class PublicationTest(unittest.TestCase):
             self.assertLess(names.index(before), names.index(after))
         self.assertEqual(len(flow.calls('contracts')), 1)
 
-    def test_regressions_A_and_B_suspend_attempt_before_publication(self):
+    def test_regressions_A_and_B_reach_existing_attribution_with_full_ci(self):
         for module, test in (('test_2449_garde_mecanique', 'test_the_guard_keys_are_the_reader_keys'),
                              ('test_l161f_plan', 'test_always_list_sorted_and_known')):
             with self.subTest(module=module):
                 run = auto.TestRun('contrats', ['tests.' + module], 1,
                                    'FAIL: ' + test + ' (tests.' + module + '.T.' + test + ')\n', 1)
-                flow = Flux(self, tests=[], compositions=[self.composition()], contract_result=run)
-                with self.assertRaisesRegex(auto.PaquetAutoError, 'avant publication'):
+                def attribute(**kwargs):
+                    self.assertIs(kwargs['contract_report'].run, run)
+                    raise auto.PaquetAutoError('existing attribution attempted')
+                flow = Flux(self, tests=[attribute], compositions=[self.composition()],
+                            contract_result=run)
+                with self.assertRaisesRegex(auto.PaquetAutoError, 'existing attribution attempted'):
                     flow.run()
-                for operation in ('push', 'pr', 'freeze', 'ci-full', 'tests', 'withdraw', 'recompose'):
-                    self.assertEqual(flow.calls(operation), [])
+                names = flow.names()
+                for before, after in (('contracts', 'push'), ('push', 'ci-full'),
+                                      ('ci-full', 'tests')):
+                    self.assertLess(names.index(before), names.index(after))
+                self.assertEqual(len(flow.calls('contracts')), 1)
+
+    def test_supplied_partial_red_report_still_removes_attributed_unit(self):
+        name = 'tests.test_2449_garde_mecanique.T.test_keys'
+        run = auto.ContractTestRun(
+            'contrats', ['tests.test_2449_garde_mecanique', 'tests.test_unplayed'],
+            1, 'FAIL: test_keys (' + name + ')\n', 1)
+        attribution = {'status': 'ok', 'tests': [{
+            'test': name, 'status': 'probable', 'units': [{
+                'lot': 6179, 'best': 6, 'evidence': [{
+                    'kind': 'migration', 'file': 'src/ameesh/migrations/test.sql'}]}]}]}
+        with mock.patch.object(auto, 'verify_contract_scope'), \
+                mock.patch.object(auto, 'unit_test_modules', return_value=[]), \
+                mock.patch.object(auto, 'contract_modules', side_effect=AssertionError('duplicate plan')), \
+                mock.patch.object(auto, 'run_tests', side_effect=AssertionError('duplicate tests')):
+            runs, faulty, removals = auto.check_local_tests(
+                Path('.'), self.composition(), timeout=10,
+                select=lambda *_: ({}, ''), parallel=1,
+                contract_report=auto.ContractPass('a' * 40, 'b' * 40, run),
+                attribute=lambda *_: attribution, log=lambda *_: None)
+        self.assertEqual(runs, [run])
+        self.assertEqual(faulty, [6179])
+        self.assertTrue(removals[0].attributed)
 
     def test_timeout_is_published_with_full_ci_and_no_second_contract_series(self):
         run = auto.TestRun('contrats', ['tests.test_x'], None, 'slot wait exhausted', 10, timed_out=True)

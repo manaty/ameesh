@@ -4501,10 +4501,10 @@ def compose_packet(args: argparse.Namespace) -> int:
                 "NON CONCLUANT" if contract_run.inconclusive else
                 ("vert" if contract_run.green else "ROUGE"), contract_run.seconds,
                 (" — " + contract_run.log_path) if contract_run.log_path else ""), flush=True)
-            if contract_run.real_failure:
-                raise PaquetAutoError(
-                    "contrats rouges avant publication : tentative suspendue sans poussée ; "
-                    "les autres lots restent disponibles :\n" + _tail(contract_run.output))
+            # A red report must reach the existing attribution/removal path.
+            # Until prepublication attribution is available (#6183), publish
+            # with ci-full rather than suspend the same candidates forever.
+            # check_local_tests consumes this exact report without replaying it.
             if not args.local:
                 if guard is not None:
                     guard()
