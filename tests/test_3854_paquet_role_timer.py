@@ -9,6 +9,7 @@ remplacée, pas doublée) ; sans clone, la passe est un avertissement, jamais un
 """
 from __future__ import annotations
 
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -138,8 +139,11 @@ class RenderTest(unittest.TestCase):
     def test_the_service_ticks_the_clone_script_under_the_role_lease(self):
         text = role_timers.render_service(self.spec, role="mesh-design",
                                           bin_path="/opt/ameesh/bin/ameesh")
-        self.assertIn("ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull "
-                      "--ff-only --tags --force --quiet origin ${AMEESH_PAQUET_TARGET}", text)
+        self.assertIn("ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} fetch "
+                      "--tags --force --quiet origin ${AMEESH_PAQUET_TARGET}", text)
+        self.assertIn("ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} merge "
+                      "--ff-only --quiet origin/${AMEESH_PAQUET_TARGET}", text)
+        self.assertNotIn("pull --ff-only", text)
         self.assertIn("ExecStart=/opt/ameesh/bin/ameesh role run mesh-design -- "
                       "/usr/bin/env PYTHONPATH=${AMEESH_PAQUET_REPO}/src "
                       "/opt/ameesh/bin/python ${AMEESH_PAQUET_REPO}/scripts/"
@@ -155,6 +159,97 @@ class RenderTest(unittest.TestCase):
         text = role_timers.render_timer(self.spec)
         self.assertIn("OnCalendar=*:0/10", text)
         self.assertNotIn("OnUnitActiveSec", text)
+
+
+class PacketFetchTest(unittest.TestCase):
+    """#6128: a pilot fetch in the same clone must not lose the packet tick.
+
+    `git pull` merges `FETCH_HEAD` after its own fetch. A pilot composition
+    fetching in the same clone at that instant leaves two heads there, and
+    the merge dies with ``fatal: Cannot fast-forward to multiple branches``.
+    The generated pre-step fetches, then fast-forwards on the named remote
+    ref, so `FETCH_HEAD` is never read.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="6128-fetch-")
+        self.root = Path(self.tmp.name)
+        self.origin = self.root / "origin.git"
+        self.seed = self.root / "seed"
+        self.clone = self.root / "clone"
+        self.git("init", "-q", "--bare", "--initial-branch=main", str(self.origin))
+        self.git("init", "-q", "--initial-branch=main", str(self.seed))
+        (self.seed / "file.txt").write_text("one\n", encoding="utf-8")
+        self.git("add", "file.txt", cwd=self.seed)
+        self.git("commit", "-q", "-m", "one", cwd=self.seed)
+        self.git("branch", "pilot", cwd=self.seed)
+        self.git("remote", "add", "origin", str(self.origin), cwd=self.seed)
+        self.git("push", "-q", "origin", "main", "pilot", cwd=self.seed)
+        self.git("clone", "-q", str(self.origin), str(self.clone))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, *args, cwd=None, check=True):
+        proc = subprocess.run(
+            ["git", "-c", "user.name=6128", "-c", "user.email=6128@ameesh.invalid",
+             *args], cwd=str(cwd or self.root), capture_output=True, text=True)
+        if check and proc.returncode != 0:
+            self.fail("git %s: %s" % (" ".join(args), proc.stderr.strip()))
+        return proc
+
+    def pre_steps(self):
+        """The unit's fetch and merge `ExecStartPre`, variables resolved."""
+        text = role_timers.render_paquet_service(role="mesh-design")
+        lines = [line[len("ExecStartPre="):] for line in text.splitlines()
+                 if line.startswith("ExecStartPre=")]
+        self.assertTrue(lines, "the generated unit has no pre-step")
+        for line in lines:
+            self.assertNotIn(" pull ", line)
+            self.assertNotIn("FETCH_HEAD", line)
+        commands = [shlex.split(line.replace("${AMEESH_PAQUET_REPO}", str(self.clone))
+                                .replace("${AMEESH_PAQUET_TARGET}", "main"))
+                    for line in lines]
+        fetch = [i for i, command in enumerate(commands) if "fetch" in command]
+        merge = [i for i, command in enumerate(commands) if "merge" in command]
+        self.assertEqual(len(fetch), 1, "one fetch pre-step: %r" % commands)
+        self.assertEqual(len(merge), 1, "one merge pre-step: %r" % commands)
+        self.assertLess(fetch[0], merge[0], "the fetch runs before the merge")
+        self.assertIn("--tags", commands[fetch[0]])
+        self.assertIn("--ff-only", commands[merge[0]])
+        self.assertEqual(commands[merge[0]][-1], "origin/main")
+        return commands[fetch[0]], commands[merge[0]]
+
+    def run_step(self, command):
+        return subprocess.run(command, capture_output=True, text=True)
+
+    def test_a_concurrent_pilot_fetch_does_not_lose_the_tick(self):
+        fetch, merge = self.pre_steps()
+        # a commit lands on origin/main while pilot advances elsewhere
+        (self.seed / "file.txt").write_text("two\n", encoding="utf-8")
+        self.git("commit", "-q", "-a", "-m", "two", cwd=self.seed)
+        self.git("push", "-q", "origin", "main", cwd=self.seed)
+        self.git("switch", "-q", "pilot", cwd=self.seed)
+        (self.seed / "pilot.txt").write_text("three\n", encoding="utf-8")
+        self.git("add", "pilot.txt", cwd=self.seed)
+        self.git("commit", "-q", "-m", "three", cwd=self.seed)
+        self.git("push", "-q", "origin", "pilot", cwd=self.seed)
+        self.git("fetch", "-q", "origin", "main", "pilot", cwd=self.clone)
+        main = self.git("rev-parse", "origin/main", cwd=self.clone).stdout.strip()
+        pilot = self.git("rev-parse", "origin/pilot", cwd=self.clone).stdout.strip()
+        self.assertNotEqual(main, pilot)
+        step = self.run_step(fetch)
+        self.assertEqual(step.returncode, 0, step.stderr)
+        # the pilot's fetch lands between the two steps: two heads, the state
+        # `git pull` used to read
+        (self.clone / ".git" / "FETCH_HEAD").write_text(
+            "%s\t\tbranch 'main' of origin\n%s\t\tbranch 'pilot' of origin\n"
+            % (main, pilot), encoding="utf-8")
+        step = self.run_step(merge)
+        self.assertEqual(step.returncode, 0, step.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.clone).stdout.strip(),
+                         main)
+        self.assertEqual((self.clone / "file.txt").read_text(encoding="utf-8"), "two\n")
 
 
 class InstallTest(unittest.TestCase):

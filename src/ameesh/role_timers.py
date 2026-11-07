@@ -792,6 +792,12 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
     also the clone's (``PYTHONPATH=<clone>/src``), never the installed one: a
     host rolled back to an older version must not make the target's script
     import an older library.
+
+    #6128: the advance is a ``fetch`` then a ``merge --ff-only`` on the named
+    remote ref, never a ``pull``. ``pull`` merges ``FETCH_HEAD`` after its own
+    fetch, and a pilot composition fetching in the same clone at that instant
+    can leave two heads there (``fatal: Cannot fast-forward to multiple
+    branches``), which loses the tick.
     """
     binary = _check_bin(bin_path)
     python = binary.rsplit("/", 1)[0] + "/python" if "/" in binary else "python3"
@@ -815,8 +821,14 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
         "EnvironmentFile=%h/.config/ameesh/env",
         "EnvironmentFile=-%h/.config/ameesh/release.env",
         "EnvironmentFile=%s" % PAQUET_ENV.replace("~", "%h", 1),
-        "ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --tags --force --quiet "
+        # #6128: two steps, and the merge names the remote ref. `git pull`
+        # reads FETCH_HEAD after its own fetch; a concurrent fetch in the same
+        # clone makes it two heads ("Cannot fast-forward to multiple
+        # branches"), so the pre-step would lose the tick.
+        "ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} fetch --tags --force --quiet "
         "origin ${AMEESH_PAQUET_TARGET}",
+        "ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} merge --ff-only --quiet "
+        "origin/${AMEESH_PAQUET_TARGET}",
         "# #4473: the script AND its `ameesh` library come from the clone; the",
         "# installed venv only supplies the interpreter (and the `role run` gate).",
         "ExecStart=%s role run %s -- /usr/bin/env PYTHONPATH=${AMEESH_PAQUET_REPO}/src "

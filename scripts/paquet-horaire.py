@@ -1794,10 +1794,12 @@ def exclude(ctx: Context, lot: int, carrier: int, name: str, run_id: str,
 def check_fresh(ctx: Context) -> None:
     """Le code exécuté est-il celui de la tête exacte de la cible ? Sinon, rien.
 
-    Le `git pull` de la minuterie peut échouer (réseau, divergence, autre
-    branche) : ce tic chargerait alors un ancien orchestrateur et écrirait
-    quand même. Il faut donc ce script dans le clone, la tête locale égale à
-    `origin/<cible>` tout juste lue, et aucun fichier suivi modifié.
+    La synchronisation de la minuterie (`git fetch` puis `git merge
+    --ff-only` sur la référence nommée, #6128) peut échouer (réseau,
+    divergence, autre branche) : ce tic chargerait alors un ancien
+    orchestrateur et écrirait quand même. Il faut donc ce script dans le
+    clone, la tête locale égale à `origin/<cible>` tout juste lue, et aucun
+    fichier suivi modifié.
     """
     if SCRIPT_DIR != (ctx.repo / "scripts").resolve():
         raise HoraireError("script lancé hors du clone %s (%s)" % (ctx.repo, SCRIPT_DIR))
