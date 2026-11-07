@@ -92,6 +92,10 @@ demande pas à l'auditeur de traiter un goulot d'agent à leur place. #3447 : le
 lots réservés à un exécutant externe déclaré (`external_executor` : bureau,
 owner) sont eux aussi listés à part (« attentes externes »), avec leur
 exécutant ; ce ne sont pas des lots sans assigné et ils ne font pas sortir 2.
+#6105 : pour un `system:…` déclaré, la ligne et sa relance nomment le
+responsable humain ; si la déclaration a été retirée, la ligne est marquée et
+le pilote doit lever la réservation ou réaffecter le lot, au lieu de laisser
+une attente orpheline.
 #3498 : un **hold de pilote** peut nommer le même exécutant et le geste
 attendu (`ameesh work note <lot> "hold: attente bureau : <geste>"`, ou
 `attente owner`) ; le débit le range dans les mêmes attentes externes, avec

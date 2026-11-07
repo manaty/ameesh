@@ -2268,12 +2268,25 @@ def external_executors(db: Db, *, include_retired: bool = False) -> list[dict]:
     return storage.of(db).external_executors.rows(include_retired=include_retired)
 
 
+def external_executor_declarations(db: Db) -> dict[str, dict]:
+    """#6105 : les déclarations `system:…` par nom, retirées comprises.
+
+    Le retrait ne touche à aucun lot déjà réservé (#6091) : le débit et les
+    briefs relisent donc aussi les déclarations retirées, pour nommer le
+    responsable humain d'une attente réservée, ou pour rendre au pilote une
+    réservation dont le système n'existe plus."""
+    return {row["name"]: row
+            for row in storage.of(db).external_executors.rows(include_retired=True)}
+
+
 def retire_external_executor(db: Db, name: str, *, actor: str = "", cfg=None) -> dict:
     """#6091 : retire une déclaration `system:…` (geste de pilote, idempotent).
 
     Aucun lot n'est modifié : une réservation existante garde le nom jusqu'à
     sa levée (`work external-executor <lot> --clear`) ou la fermeture du lot ;
-    un nouveau lot ne peut plus s'y réserver."""
+    un nouveau lot ne peut plus s'y réserver. #6105 : la déclaration rendue
+    nomme les lots ouverts encore réservés (`open_lots`) ; le débit et les
+    briefs les signalent ensuite au pilote, jamais en silence."""
     who = corrector(cfg, db, actor, what="external executor", history=False)
     name = (name or "").strip()
     if not name.startswith(SYSTEM_PREFIX):
@@ -2282,7 +2295,18 @@ def retire_external_executor(db: Db, name: str, *, actor: str = "", cfg=None) ->
     row = storage.of(db).external_executors.retire(name, actor=who)
     if row is None:
         raise WorkError("%s is not declared as a non-agent external executor" % name)
-    return row
+    out = dict(row)
+    # #6105 : le geste de retrait dit tout de suite quelles réservations
+    # restent ouvertes ; le débit les reprend à chaque passage. Une lecture
+    # impossible ne défait pas le retrait : la ligne reste, sans la liste.
+    try:
+        out["open_lots"] = sorted(
+            int(lot["id"]) for lot in
+            storage.of(db).operations.open_lots_activity(None)
+            if str(lot.get("external_executor") or "").strip() == name)
+    except Exception:  # noqa: BLE001 - le retrait est écrit ; le débit le dira
+        out["open_lots"] = None
+    return out
 
 
 def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) -> dict:

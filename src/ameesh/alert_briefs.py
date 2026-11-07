@@ -343,6 +343,29 @@ def _verdict_due(alert: dict) -> str:
                 sous_utilisation._duration(alert.get("value") or 0), lot, v.noun, lot))
 
 
+def _reserved_label(alert: dict) -> str | None:
+    """#6105 : comment nommer l'exécutant d'un lot réservé dans un brief.
+
+    Un `system:…` déclaré nomme son responsable humain — c'est à lui que la
+    relance s'adresse, pas à un système qui n'agit pas. Une déclaration
+    retirée ne porte plus personne : le brief dit au pilote de lever la
+    réservation au lieu de laisser le lot attendre en silence. Un agent
+    `externe` ou un humain garde le texte #3447 (« external executor »).
+    Rend None pour un lot non réservé."""
+    external = (alert.get("external_executor") or "").strip() or None
+    if not external:
+        return None
+    if alert.get("external_retired"):
+        retired_by = (alert.get("external_retired_by") or "").strip()
+        return ("%s (retired non-agent system%s; the pilot clears or reassigns)"
+                % (external, ", retired by %s" % retired_by if retired_by else ""))
+    responsible = (alert.get("external_responsible") or "").strip() or None
+    if responsible:
+        return ("%s (external executor, declared responsible %s)"
+                % (external, responsible))
+    return "%s (external executor)" % external
+
+
 def _stale_move(alert: dict, lot: int, who: str | None) -> str:
     """L'action proposée pour un lot stagnant (#1773).
 
@@ -368,6 +391,20 @@ def _stale_move(alert: dict, lot: int, who: str | None) -> str:
     if external:
         # #3447 : réservé, pas sans assigné — le geste est celui de
         # l'exécutant, ou la levée préalable par le pilote.
+        if alert.get("external_retired"):
+            # #6105 : le système déclaré n'existe plus ; personne n'agit.
+            return ("this %s is reserved to %s, a retired non-agent system: nobody "
+                    "acts — the pilot clears the reservation and reassigns the lot: "
+                    "ameesh work external-executor %d --clear"
+                    % (v.noun, external, lot))
+        responsible = (alert.get("external_responsible") or "").strip() or None
+        if responsible:
+            # #6105 : la relance va au responsable humain déclaré, nommé.
+            return ("this %s is reserved to %s, a non-agent system; its declared "
+                    "responsible %s acts (not an agent, never woken) — or tells the "
+                    "pilot the reservation is without object, who clears it: ameesh "
+                    "work external-executor %d --clear"
+                    % (v.noun, external, responsible, lot))
         return ("this %s is reserved to %s (external executor, not an assignee): the "
                 "executor acts; if the reservation is without object, the pilot clears "
                 "it first: ameesh work external-executor %d --clear"
@@ -404,7 +441,7 @@ def _stale_lot(alert: dict) -> str:
         v.noun, lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
         sous_utilisation._duration(alert.get("value") or 0),
         "assigned to %s" % who if who
-        else "reserved to %s (external executor)" % external if external
+        else "reserved to %s" % _reserved_label(alert) if external
         else "unassigned",
         ", waiting for: %s" % alert["waiting_for"] if alert.get("waiting_for") else "")
     move = _stale_move(alert, lot, who)
@@ -559,7 +596,8 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
 
     #3447 : un lot réservé à un exécutant externe n'est pas « unassigned » —
     le texte nomme l'exécutant (bureau, owner) et le fait que ce n'est pas une
-    attribution."""
+    attribution. #6105 : pour un `system:…` déclaré, il nomme le responsable
+    humain ; retiré, il dit que le pilote doit lever la réservation."""
     lot = int(alert["lot"])
     title = alert.get("title")
     level = int(alert.get("level") or 1) if level is None else int(level)
@@ -575,7 +613,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                (", owed by reviewer %s" % who if alert.get("step") == "green_verdict"
                 else ", fix owed by %s" % who if alert.get("step") == "blocked_freeze"
                 else ", assigned to %s" % who if who
-                else ", reserved to %s (external executor)" % external if external
+                else ", reserved to %s" % _reserved_label(alert) if external
                 else ", unassigned")))
     # #2016 : quand la commande est proposée, elle porte le titulaire lu
     # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
@@ -789,7 +827,33 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         # #3447 : le lot est réservé, pas assigné — le geste n'est ni une
         # relance d'assigné ni une réassignation directe (refusée par
         # `work assign`) mais l'action de l'exécutant ou la levée préalable.
-        if level >= 3:
+        # #6105 : pour un `system:…` déclaré, l'action nomme son responsable
+        # humain ; retiré, elle revient au pilote, seul à pouvoir lever.
+        responsible = (alert.get("external_responsible") or "").strip() or None
+        if alert.get("external_retired"):
+            move = ("pilot: %s is reserved to %s, a retired non-agent system — nobody "
+                    "acts for it; clear the reservation and reassign the lot (ameesh "
+                    "work external-executor %d --clear)"
+                    % (v.label(lot), external, lot))
+        elif responsible and level >= 3:
+            move = ("bureau or auditor: %s is reserved to %s, a non-agent system whose "
+                    "declared responsible is %s — this is not an assignment; the "
+                    "responsible acts, or the pilot clears the reservation before any "
+                    "reassignment (ameesh work external-executor %d --clear)"
+                    % (v.label(lot), external, responsible, lot))
+        elif responsible and level >= 2:
+            move = ("pilot: %s is reserved to %s, a non-agent system (declared "
+                    "responsible %s) — do not assign it; have the responsible act, or "
+                    "clear the reservation before reassigning (ameesh work "
+                    "external-executor %d --clear)"
+                    % (v.label(lot), external, responsible, lot))
+        elif responsible:
+            move = ("%s (declared responsible for the non-agent system %s): %s is "
+                    "reserved to that system; act on it, or tell the pilot the "
+                    "reservation is without object (the pilot clears it with ameesh "
+                    "work external-executor %d --clear)"
+                    % (responsible, external, v.label(lot), lot))
+        elif level >= 3:
             move = ("bureau or auditor: %s is reserved to %s (external executor, not "
                     "an assignee) — this is not an assignment; the executor acts, or the "
                     "pilot clears the reservation before any reassignment (ameesh work "
