@@ -1087,6 +1087,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
           fixes: Iterable[Mapping[str, Any]] | None = None,
           packets: Iterable[Mapping[str, Any]] = (),
           dependencies: Mapping[int, Iterable[Mapping[str, Any]]] | None = None,
+          roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None,
           families: Iterable[str] = (),
           external_executors: Mapping[str, Mapping[str, Any]] | None = None,
           review_pilots: Mapping[str, str] | None = None,
@@ -1126,7 +1127,15 @@ def build(*, items: Iterable[Mapping[str, Any]],
     (`work_dependencies.grouped`). Un lot relu dont un prérequis est encore
     bloquant n'est pas une attente `qa_merge` : l'attente est celle du
     prérequis, qui nomme alors le lot dépendant. Une contrainte non bloquante
-    (prérequis fusionné ou fermé) ne change rien."""
+    (prérequis fusionné ou fermé) ne change rien.
+
+    `roadmap_exhausted` (#6215) : `{projet: {"lot", "at_ts"}}` des feuilles de
+    route épuisées, calculées une fois par `_roadmap_verdicts` — la même règle
+    que le sommeil, via `file_decoupage.roadmap_state`. Un hold posé sur le lot
+    de découpage **avant** la note d'épuisement est couvert par elle : il ne
+    compte plus comme attente lente (`roadmap_waits`, hors `--check`), le lot
+    de découpage restant ouvert dans l'état documenté du canon §4. Un hold
+    reposé après la note est un geste nouveau et garde son traitement."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
     # la déclaration d'attente externe d'un hold.
@@ -1139,6 +1148,12 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if devices is None else dict(devices)
     items = [dict(row) for row in items or ()]
     by_id = {int(row["id"]): row for row in items}
+    # #6215 : le lot de découpage d'un projet épuisé, pour reconnaître un hold
+    # que la note d'épuisement couvre (`roadmap_waits`, hors --check).
+    roadmap_by_lot = {
+        int(entry["lot"]): (project, entry)
+        for project, entry in (roadmap_exhausted or {}).items()
+        if entry.get("lot") is not None}
     # #6214 : les prérequis explicites encore bloquants, groupés par lot
     # (`work_dependencies.grouped`). Une contrainte non bloquante (prérequis
     # fusionné ou fermé) ne retient rien, comme #3437 ignore un parent terminé.
@@ -1234,6 +1249,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
     undeployed_holds: list[dict] = []
     external_waits: list[dict] = []
     window_waits: list[dict] = []
+    #: #6215 : holds du lot de découpage couverts par la note d'épuisement
+    roadmap_waits: list[dict] = []
     unreadable: list[str] = list(devices.get("unreadable") or ())
 
     for ident, item in by_id.items():
@@ -1574,6 +1591,32 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if (window is not None
                 and now < float(window["observation"]["due_ts"])):
             continue                # #4235 : fenêtre voulue et datée, à part
+        # #6215 : un hold posé sur le lot de découpage avant la note
+        # `roadmap: épuisée` est couvert par elle. Le lot reste ouvert dans
+        # l'état documenté du canon §4 (« laissez ce lot ouvert ») : ce n'est
+        # pas une attente d'agent à relancer, et la ligne de capacité dit déjà
+        # la feuille de route épuisée. Il reste listé, à part, et hors
+        # `--check`. Un hold reposé après la note est un geste nouveau.
+        roadmap = roadmap_by_lot.get(int(row["lot"]))
+        if (roadmap is not None
+                and float(row.get("since_ts") or 0.0)
+                <= float(roadmap[1].get("at_ts") or 0.0)):
+            roadmap_waits.append({
+                "lot": row["lot"], "title": row.get("title") or "",
+                "app": row.get("app") or None,
+                "assignee": row.get("assignee") or None,
+                "by": row.get("by"), "kind": "hold_roadmap",
+                "project": roadmap[0],
+                "state": state_by_lot.get(int(row["lot"])),
+                "since_ts": row.get("since_ts"), "since": row.get("since"),
+                "age_s": row.get("age_s"), "cause": row.get("cause"),
+                "roadmap_exhausted": dict(roadmap[1]),
+                "gesture": ("feuille de route épuisée : ajouter des entrées "
+                            "ou une décision owner (`ameesh decide`), ou noter "
+                            "`roadmap: rouverte %s` sur le lot ; le hold peut "
+                            "être levé" % roadmap[0]),
+            })
+            continue
         state = state_by_lot.get(int(row["lot"]))
         # canon §11 bis : un correctif fusionné non déployé se traite sans
         # l'owner ; même une note qui cite une règle ou un go de l'owner ne
@@ -1827,6 +1870,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "external_reminders": len([row for row in external_waits
                                    if row.get("reminder_due")]),
         "window_waits": len(window_waits),
+        "roadmap_waits": len(roadmap_waits),
         "slow_ci_runs": len([run for run in runs
                              if float(run["duration_s"]) > ci_slow_s]),
     }
@@ -1849,6 +1893,10 @@ def build(*, items: Iterable[Mapping[str, Any]],
             key=lambda row: (-float(row.get("age_s") or 0.0), row["lot"])),
         "window_waits": sorted(
             window_waits, key=lambda row: (float(row["due_ts"]), row["lot"])),
+        #: #6215 : holds couverts par une note d'épuisement, hors --check
+        "roadmap_waits": sorted(
+            roadmap_waits,
+            key=lambda row: (-float(row.get("age_s") or 0.0), row["lot"])),
         "qa": sorted(qa, key=lambda row: (-float(row["age_s"] or 0.0), row["lot"])),
         "blocked_reviews": sorted(blocked_reviews,
                                   key=lambda row: (-float(row["age_s"] or 0.0),
@@ -1897,33 +1945,53 @@ def _decoupage_project(lot: Mapping[str, Any]) -> str | None:
     return source[len(SOURCE_PREFIX):] or None
 
 
-def _exhausted_project(note: Any) -> str | None:
-    """Le projet d'une note `roadmap: épuisée <projet>` (#4273), sinon None."""
-    from .file_decoupage import EXHAUSTED_RE
-    match = EXHAUSTED_RE.match(str(note or ""))
-    return match.group(1).strip(".,;:") if match else None
+def _roadmap_verdicts(notes: Iterable[Mapping[str, Any]],
+                      open_lots: Iterable[Mapping[str, Any]] = ()) -> dict[str, dict]:
+    """#5149, #6215 : `{projet: {"lot", "at_ts"}}` des feuilles de route
+    épuisées, lues par la règle de `file_decoupage` — celle du sommeil et de
+    `ameesh alerts` (#4623) : **la dernière note du lot de découpage ouvert du
+    projet fait foi**, une note `roadmap: rouverte <projet>` postérieure
+    l'annule.
 
+    #6215 : aucun filtre de note n'est refait ici. `file_decoupage.roadmap_state`
+    lit le texte (formes réelles comprises) et `exhausted_since` le date ; les
+    deux lecteurs partagent donc la même fonction. Une note posée sur un autre
+    lot — fermé, d'un autre projet, ou ordinaire — est ignorée, comme pour le
+    sommeil, qui ne lit que `_open_split(projet)`.
 
-def _roadmap_verdicts(notes: Iterable[Mapping[str, Any]]) -> dict[str, dict]:
-    """#5149 : `{projet: note d'épuisement}` des projets dont la **dernière**
-    note de feuille de route, posée sur le lot de découpage du même projet
-    (§1), est `roadmap: épuisée <projet>` — la règle de `roadmap_state` que
-    suivent le sommeil et `ameesh alerts` (#4623) : une note `roadmap:
-    rouverte <projet>` postérieure la retire. Les notes sont lues dans l'ordre
-    du journal (`at_ts`, puis ordre d'entrée)."""
-    from .file_decoupage import REOPENED_RE
-    out: dict[str, dict] = {}
-    for note in sorted(notes or (), key=lambda r: float(r.get("at_ts") or 0.0)):
-        text = str(note.get("note") or "")
-        project = _exhausted_project(text)
-        if project and _decoupage_project(note) == project:
-            out[project] = {"lot": note.get("work_item_id"),
-                            "at_ts": float(note.get("at_ts") or 0.0)}
+    `open_lots` : les lots ouverts, où le lot de découpage se lit à sa `source`
+    (`file-decoupage:<projet>`, #4273). Le plus ancien lot ouvert de la source
+    fait foi, comme `work.open_with_source` ; sans lot de découpage ouvert,
+    aucune note ne vaut.
+    """
+    from . import file_decoupage
+    from .work import OPEN_STATES
+    splits: dict[str, int] = {}
+    for lot in open_lots or ():
+        state = str(lot.get("state") or "")
+        if state and state not in OPEN_STATES:
+            # `work.open_with_source` ne lit que les états ouverts : le lot de
+            # découpage fermé #4952 ne doit pas primer sur le lot ouvert.
             continue
-        match = REOPENED_RE.match(text)
-        project = match.group(1).strip(".,;:") if match else None
-        if project and _decoupage_project(note) == project:
-            out.pop(project, None)
+        project = _decoupage_project(lot)
+        if not project:
+            continue
+        ident = int(lot["id"])
+        if project not in splits or ident < splits[project]:
+            splits[project] = ident
+    by_lot: dict[int, list[dict]] = {}
+    for note in notes or ():
+        try:
+            ident = int(note.get("work_item_id"))
+        except (TypeError, ValueError):
+            continue
+        by_lot.setdefault(ident, []).append(dict(note))
+    out: dict[str, dict] = {}
+    for project, ident in splits.items():
+        lot_notes = by_lot.get(ident, [])
+        if file_decoupage.exhausted(lot_notes, project):
+            out[project] = {"lot": ident,
+                            "at_ts": file_decoupage.exhausted_since(lot_notes, project)}
     return out
 
 
@@ -2031,6 +2099,7 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
              footprint: Mapping[int, Iterable[Mapping[str, Any]]] | None = None,
              open_lots: Iterable[Mapping[str, Any]] = (),
              roadmap_notes: Iterable[Mapping[str, Any]] = (),
+             roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None,
              losses: Iterable[Mapping[str, Any]] = (),
              now: float, window_s: float,
              repos_part: float | None, repos_s: float | None,
@@ -2069,20 +2138,26 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       de leur bloqueur et se lisent à part (`footprint_lots`) ; `open_lots` :
       les lots ouverts, où le lot de découpage se lit à sa `source`.
     * `roadmap_notes` : `{note, at_ts, work_item_id, source}` ; seule une
-      note posée **sur un lot de découpage du même projet** vaut (§1), et la
-      dernière fait foi comme pour le sommeil et `ameesh alerts` (#5149) : une
-      note `roadmap: rouverte` ou un lot démarrable de l'instant rouvrent la
-      route ; un lot déjà pris ne la rouvre pas. Les notes `sleep exempted:`
-      d'un siège de relecture tiennent l'agent hors de la capacité tant
-      que le lot qu'elles citent est ouvert et non fusionné (#6010).
+      note posée **sur le lot de découpage ouvert du même projet** vaut (§1),
+      et la dernière fait foi comme pour le sommeil et `ameesh alerts`
+      (#5149, #6215) : une note `roadmap: rouverte` l'annule ; un lot
+      démarrable de l'instant rouvre la route, un lot retenu par la garde
+      d'empreinte ne la rouvre pas (il n'est pas démarrable, #4717). Les notes
+      `sleep exempted:` d'un siège de relecture tiennent l'agent hors de la
+      capacité tant que le lot qu'elles citent est ouvert et non fusionné
+      (#6010). `roadmap_exhausted` : les verdicts déjà calculés par
+      `_roadmap_verdicts` (une seule lecture pour `build` et la capacité) ;
+      absent, ils sont recalculés depuis `roadmap_notes` et `open_lots`.
     * `losses` : la perte au reset par compte, comme `ameesh accounts`.
     * `gating_ok` : faux quand une lecture dont dépend l'alerte a échoué
       (lots ouverts, notes, tenues de budget, historique) ; la mesure reste
       rendue, mais aucune alerte n'est levée sur une lecture incomplète.
 
-    Une alerte par projet quand `idle_share ≥ repos_part`, que la feuille de
-    route n'est pas épuisée et qu'aucun lot de découpage n'a moins de
-    `file_decoupage.FALLBACK_S` : c'est elle qui fait sortir `--check` 2."""
+    Une alerte par projet quand `idle_share ≥ repos_part`, qu'aucun lot de
+    découpage n'a moins de `file_decoupage.FALLBACK_S` et que le projet n'est
+    pas silencieux : une route épuisée n'est pas une alerte, sauf si un lot
+    démarrable ou retenu par la garde d'empreinte y attend encore (#6215,
+    #4561). C'est cette alerte qui fait sortir `--check` 2."""
     from . import file_decoupage
     from . import projects as projects_mod
     from . import sous_utilisation
@@ -2090,7 +2165,12 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     start = now - float(window_s)
     held = dict(held or {})
     roadmap_notes = list(roadmap_notes or ())
-    exhausted = _roadmap_verdicts(roadmap_notes)
+    open_lots = list(open_lots or ())
+    if roadmap_exhausted is None:
+        exhausted = _roadmap_verdicts(roadmap_notes, open_lots)
+    else:
+        exhausted = {str(project): dict(entry)
+                     for project, entry in roadmap_exhausted.items()}
     for name, why in _review_seats(roadmap_notes, exhausted,
                                      open_lots).items():
         held.setdefault(name, why)
@@ -2162,9 +2242,14 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         if current is None or (created or 0.0) > (current.get("created_ts") or 0.0):
             decoupage[project] = entry
     for project in list(exhausted):
-        # un lot en attente d'empreinte est du travail réel, pas une feuille
-        # de route épuisée : le projet ne se tait pas (#4561).
-        if startable_by.get(project) or footprint_by.get(project):
+        # #6215 : un lot démarrable de l'instant rouvre la route, comme le
+        # sommeil (`run`: `if item.startable`). Un lot **retenu par la garde
+        # d'empreinte** ne la rouvre plus : `split_startable` ne le compte pas
+        # démarrable (#4717) et le sommeil endort donc les agents — les deux
+        # lecteurs suivent la même règle. Le projet ne se tait pas pour
+        # autant : l'alerte de capacité continue de nommer l'attente
+        # d'empreinte (#4561), sous la ligne « feuille de route épuisée ».
+        if startable_by.get(project):
             del exhausted[project]
 
     by_project: dict[str, list[dict]] = {}
@@ -2205,9 +2290,15 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         projects_out.append(entry)
         fresh = entry["decoupage"] is not None and (
             entry["decoupage"].get("age_s") or 0.0) < file_decoupage.FALLBACK_S
+        # #6215 : une route épuisée ne tait un projet que si rien n'y attend.
+        # Un lot démarrable (qui a rouvert la route) ou un lot retenu par la
+        # garde d'empreinte est du travail réel : l'alerte le nomme et porte
+        # son geste (#4561).
+        pending = entry["startable_lots"] or entry["footprint_lots"]
         if (gating_ok and repos_part is not None and entry["wakeable"]
                 and entry["idle_share"] >= float(repos_part)
-                and entry["roadmap_exhausted"] is None and not fresh):
+                and (entry["roadmap_exhausted"] is None or pending)
+                and not fresh):
             alerts.append({
                 "project": project, "idle": entry["idle"],
                 "wakeable": entry["wakeable"], "idle_share": entry["idle_share"],
@@ -2322,10 +2413,13 @@ def _rows(db, sql: str, params=()) -> list[dict]:
 
 #: les colonnes d'un lot lues sont des **étiquettes** (id, titre, projet,
 #: assigné, exécutant externe déclaré, instant de création, branche et cible) ;
-#: jamais state, reviewer(s), wake_at ni updated_at (canon 24/10). L'état
-#: courant d'un lot se lit au journal (`state_by_lot`), pas dans sa colonne.
+#: jamais reviewer(s), wake_at ni updated_at (canon 24/10). L'état courant d'un
+#: lot se lit au journal (`state_by_lot`), pas dans sa colonne. `state` et
+#: `source` ne servent qu'à reconnaître le **lot de découpage ouvert** d'un
+#: projet (#6215, `file-decoupage:<projet>`) ; aucun verdict d'attente n'en
+#: dépend.
 _ITEMS_SQL = f"""
-    SELECT w.id, w.title, w.app, w.assignee, w.priority,
+    SELECT w.id, w.title, w.app, w.assignee, w.priority, w.state, w.source,
            to_jsonb(w)->>'external_executor' AS external_executor,
            extract(epoch FROM w.created_at)::float8 AS created_ts,
            w.branch, w.branch_target
@@ -2403,9 +2497,11 @@ _TURNS_SQL = """
 """
 
 #: #3256 : les notes `roadmap:` avec la `source` de leur lot (seule une note
-#: sur un lot de découpage du projet vaut, spec §1).
+#: sur un lot de découpage du projet vaut, spec §1). #6215 : l'`id` de
+#: l'événement est joint pour que `file_decoupage.roadmap_state` ordonne les
+#: notes par le journal, comme le sommeil — jamais par un tri d'`at_ts` à part.
 _ROADMAP_SQL = """
-    SELECT e.work_item_id, e.note, w.source,
+    SELECT e.id, e.work_item_id, e.note, w.source,
            extract(epoch FROM e.created_at)::float8 AS at_ts
       FROM work_item_events e
       JOIN work_items w ON w.id = e.work_item_id
@@ -2476,6 +2572,16 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
     items = _rows(db, _ITEMS_SQL, (horizon, horizon, MAX_ITEMS))
     if len(items) >= MAX_ITEMS:
         unreadable.append("open-lot limit reached (%d): list truncated" % MAX_ITEMS)
+    # #6215 : une seule lecture des notes de feuille de route, partagée par
+    # `build` (hold couvert par l'épuisement) et par la capacité. La règle de
+    # verdict est celle de `file_decoupage.roadmap_state`, jamais une copie.
+    roadmap_error = None
+    try:
+        roadmap_notes = _rows(db, _ROADMAP_SQL, (horizon,))
+    except Exception as exc:  # noqa: BLE001 - lecture nommée, la capacité juge
+        roadmap_notes = []
+        roadmap_error = " ".join(str(exc).split())[:200]
+    roadmap_exhausted = _roadmap_verdicts(roadmap_notes, items)
     ids = [int(row["id"]) for row in items]
     # #6214 : les prérequis explicites des lots lus (`ameesh work
     # dependencies`). Une lecture en échec est nommée, et le repli garde
@@ -2644,13 +2750,17 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    holds=holds, closure_allowed=closure_allowed,
                    ci_unreadable=ci_unreadable, fixes=fixes,
                    packets=packets, dependencies=dependencies,
+                   roadmap_exhausted=roadmap_exhausted,
                    families=families,
                    external_executors=external_executors,
                    review_pilots=review_pilots,
                    closed_hosts=closed_hosts, zone=zone)
     annotate_candidate_causes(db, cfg, report, milestones, unreadable)
     report["capacity"] = read_capacity(db, cfg=cfg, now=now, hours=hours, turns=turns,
-                                       canons=canons, unreadable=unreadable)
+                                       canons=canons, unreadable=unreadable,
+                                       roadmap_notes=roadmap_notes,
+                                       roadmap_error=roadmap_error,
+                                       roadmap_exhausted=roadmap_exhausted)
     report["totals"]["capacity_alerts"] = len(report["capacity"]["alerts"])
     report["unreadable"] = list(dict.fromkeys(list(report["unreadable"]) + unreadable))
     return report
@@ -2713,11 +2823,19 @@ def annotate_candidate_causes(db, cfg, report: Mapping[str, Any],
 
 
 def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
-                  canons=None, unreadable: list) -> dict:
+                  canons=None, unreadable: list,
+                  roadmap_notes: Iterable[Mapping[str, Any]] | None = None,
+                  roadmap_error: str | None = None,
+                  roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None) -> dict:
     """#3256 B : lit ce que `capacity` calcule. Chaque lecture en échec est
     nommée dans `unreadable` ; si l'une de celles dont dépend l'alerte manque
     (agents, lots ouverts, démarrables, notes, tenues de budget, historique),
-    la mesure est rendue mais aucune alerte n'est levée (`gating_ok` faux)."""
+    la mesure est rendue mais aucune alerte n'est levée (`gating_ok` faux).
+
+    #6215 : `read` fournit les notes et les verdicts de feuille de route déjà
+    lus (`roadmap_notes`, `roadmap_exhausted`) et l'échec éventuel de cette
+    lecture (`roadmap_error`) ; sans eux (appel direct), la lecture et le
+    calcul restent locaux, comme avant."""
     from . import file_decoupage
     from . import host_lifecycle
     from . import mechanics
@@ -2803,12 +2921,23 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
         reason = closed.get(row.get("host") or "")
         if reason:
             held.setdefault(row["name"], reason)
-    notes = attempt("roadmap notes", lambda: _rows(db, _ROADMAP_SQL, (horizon,)), [])
+    if roadmap_notes is None:
+        notes = attempt("roadmap notes",
+                        lambda: _rows(db, _ROADMAP_SQL, (horizon,)), [])
+    else:
+        # #6215 : la lecture de `read` fait foi ; son échec est déjà nommé et
+        # ferme l'alerte de capacité, comme une lecture locale en échec.
+        notes = list(roadmap_notes)
+        if roadmap_error:
+            unreadable.append("capacity: roadmap notes unreadable: %s"
+                              % roadmap_error)
+            failed.append("roadmap notes")
     losses = attempt("account gauges", lambda: plan_losses(
         sous_utilisation.latest_account_gauges(db, now), now), [], gating=False)
     out = capacity(agents=listing, turns=turns, startable=startable,
                    footprint=footprint, open_lots=lots,
-                   roadmap_notes=notes, losses=losses, now=now,
+                   roadmap_notes=notes, roadmap_exhausted=roadmap_exhausted,
+                   losses=losses, now=now,
                    window_s=int(hours) * 3600,
                    repos_part=rule.repos_part if rule else None,
                    repos_s=rule.repos_s if rule else None,
@@ -2979,6 +3108,20 @@ def format_text(report: Mapping[str, Any]) -> str:
                          % (row.get("due") or "?", row.get("gesture")))
     else:
         lines.append("Fenêtres d'observation, hors --check : aucune.")
+    roadmap = report.get("roadmap_waits") or []
+    if roadmap:
+        lines.append("")
+        lines.append("Feuilles de route épuisées, hors --check (%d) — le lot de "
+                     "découpage reste ouvert, la note fait foi :" % len(roadmap))
+        for row in roadmap[:20]:
+            lines.append("  #%-6d %-16s %8s  %-22s %s"
+                         % (int(row.get("lot") or 0), str(row.get("kind")),
+                            _duration(row.get("age_s")),
+                            str(row.get("by") or "?")[:22],
+                            str(row.get("title") or "")[:48]))
+            lines.append("         → %s" % row.get("gesture"))
+    else:
+        lines.append("Feuilles de route épuisées, hors --check : aucune.")
     reviews = report.get("reviews_by_reviewer") or []
     lines.append("")
     lines.append("Avis dus par relecteur : %s" % (
