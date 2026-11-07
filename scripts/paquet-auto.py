@@ -1652,7 +1652,8 @@ def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
 # ---------------------------------------------------------------------------
 
 
-def contract_modules(worktree: Path) -> list[str]:
+def contract_modules(worktree: Path, *, base: str = "",
+                     timeout: float = GIT_TIMEOUT) -> list[str]:
     """La liste « toujours », `test_l161f_plan` et `test_cluster`."""
     path = worktree / CONTRACT_ALWAYS
     if not path.is_file():
@@ -1663,6 +1664,35 @@ def contract_modules(worktree: Path) -> list[str]:
         if not name:
             continue
         modules.append(name if name.startswith("tests.") else "tests." + name)
+    if base and (worktree / "src/ameesh/contract_plan.py").is_file():
+        # The candidate's L161f serializes the very same registry/impact union
+        # as CI and prevalidation. Map absence keeps the packet contract-only
+        # fallback; neither the neighbor budget nor the map may drop a contract.
+        with tempfile.TemporaryDirectory(prefix="contract-plan-") as temporary:
+            output = Path(temporary) / "plan.json"
+            proc = run_command(
+                [project_python(worktree), str(worktree / "scripts/test-plan.py"),
+                 "plan", "--out", str(output), "--base", base, "--mode", "lot",
+                 "--local-map"], cwd=worktree, timeout=max(0.1, timeout),
+                env=python_env(worktree))
+            if proc.returncode:
+                raise PaquetAutoError("plan commun de contrats illisible : " + _tail(_output(proc), 3))
+            try:
+                plan = json.loads(output.read_text())
+                shared = plan["contract_plan"]
+                # Use the reader from this script's environment only for the
+                # stable serialized schema; candidate generation owns selection.
+                sys.path.insert(0, str(worktree / "src"))
+                from ameesh import contract_plan
+                contract_plan.consume(shared)
+                if shared["commit"] != _decode(git(worktree, "rev-parse", "HEAD").stdout).strip():
+                    raise ValueError("contract plan candidate differs")
+            except (OSError, ValueError, KeyError) as exc:
+                raise PaquetAutoError("plan commun de contrats illisible : " + str(exc)) from exc
+            if shared["active"]:
+                chosen = (shared["modules"] if (plan.get("map") or {}).get("used")
+                          else shared["contracts"])
+                modules.extend("tests." + name for name in chosen)
     modules.extend(CONTRACT_MODULES)
     return _dedupe_modules(worktree, modules)
 
@@ -2571,7 +2601,16 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         return lambda: bounded(label, modules)
 
     def contract_job():
-        return bounded("contrats", contract_modules(worktree))
+        remaining = max(0.1, deadline - time.monotonic()) if deadline is not None else GIT_TIMEOUT
+        try:
+            modules = contract_modules(worktree, base=base_sha, timeout=remaining)
+        except PaquetAutoError as exc:
+            # Unavailable planning is not a negative test. CI still runs the
+            # full suite; this pass records no qualification of the contracts.
+            log("tests contrats : plan indisponible (non concluant) : %s" % exc)
+            return TestRun("contrats", [], None, "plan indisponible : %s" % exc,
+                           0.0, timed_out=True)
+        return bounded("contrats", modules)
 
     jobs = [unit_job("unité #%d" % unit.lot, modules)
             for unit, _proper, _added, modules in planned] + [contract_job]
