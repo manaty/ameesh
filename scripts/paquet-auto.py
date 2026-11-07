@@ -32,9 +32,13 @@ l'ordre, sans agent :
    `ameesh work milestone <porteur> frozen --sha <tête>` et demande
    `ameesh ci run <porteur> --full` — la CI complète part sans attendre les
    tests par unité ;
-8. les tests par unité, pendant la CI : `tests/parts/toujours.txt`,
-   `tests.test_l161f_plan`, `tests.test_cluster` et les modules de test
-   apportés par chaque unité. Un test ciblé **rouge** d'un module **voisin**
+8. les tests par unité, pendant la CI : les modules de test apportés par
+   chaque unité et leurs voisins. La passe de contrats de l'arbre final
+   (plan commun, #6182) précède déjà la poussée, le gel et la ci-full :
+   budget canon, attente de créneau comprise, résultat réutilisé sans rejeu.
+   Une expiration est non concluante et laisse publier avec ci-full ; un
+   contrat négatif suspend cette tentative avant publication ; un arbre
+   modifié invalide la passe et demande une nouvelle composition. Un test ciblé **rouge** d'un module **voisin**
    est situé en rejouant ce test sur les préfixes de l'empilement, dans
    l'ordre (`base + u1`, `base + u1 + u2`, …) : la première unité où il
    apparaît est retirée, son auteur est prévenu, et le paquet est recomposé
@@ -2008,6 +2012,87 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
     return save_test_log(result)
 
 
+@dataclass
+class ContractPass:
+    """Result bound to the final, clean Git tree, including its manifest."""
+    head: str
+    tree: str
+    run: TestRun
+
+
+def contract_scope(worktree: Path) -> tuple[str, str]:
+    head = _decode(git(worktree, "rev-parse", "HEAD").stdout).strip()
+    tree = _decode(git(worktree, "rev-parse", "HEAD^{tree}").stdout).strip()
+    dirty = _decode(git(worktree, "status", "--porcelain", "--untracked-files=all").stdout)
+    if dirty.strip():
+        raise PaquetAutoError("arbre des contrats hors portée : contenu local modifié ; recomposer")
+    return head, tree
+
+
+def verify_contract_scope(worktree: Path, report: ContractPass) -> None:
+    if contract_scope(worktree) != (report.head, report.tree):
+        raise PaquetAutoError("arbre des contrats hors portée : tête ou arbre changé ; recomposer")
+
+
+def prepublication_contracts(worktree: Path, *, base: str,
+                             budget: int | None, guard=None, expected_head: str = "") -> ContractPass:
+    """Plan + slot wait + isolated execution share one canon budget (#6182).
+
+    A timeout/absent prerequisite records an inconclusive pass, never a green
+    proof. A changed tree refuses this attempt before any publication.
+    """
+    if guard is not None:
+        guard()
+    head, tree = contract_scope(worktree)
+    if expected_head and head != expected_head:
+        raise PaquetAutoError("arbre des contrats hors portée : tête composée changée avant la passe")
+    start = time.monotonic()
+    end = start + budget if budget else start
+    modules = []
+    try:
+        if not budget:
+            raise PaquetAutoError("budget de contrats absent du canon")
+        if shutil.which("ameesh") is None:
+            raise PaquetAutoError("créneau heavy indisponible")
+        modules = contract_modules(worktree, base=base,
+                                   timeout=max(0.1, end - time.monotonic()))
+        remaining = int(end - time.monotonic())
+        if remaining <= 0:
+            run = budget_spent("contrats", modules)
+        else:
+            run = run_tests(worktree, "contrats", modules, timeout=remaining,
+                            heavy=True, wall=remaining)
+    except PaquetAutoError as exc:
+        run = save_test_log(TestRun("contrats", modules, None, str(exc),
+                                   time.monotonic() - start, timed_out=True))
+    run.seconds = time.monotonic() - start
+    report = ContractPass(head, tree, run)
+    verify_contract_scope(worktree, report)
+    if guard is not None:
+        guard()
+    verify_contract_scope(worktree, report)
+    return report
+
+
+def contract_budget(args) -> int | None:
+    """CLI value supplied by the scheduler, otherwise existing compiled policy.
+
+    N-1 keeps its declared unit budget until the new optional key is adopted.
+    No local numeric default silently becomes the prepublication policy.
+    """
+    supplied = getattr(args, "contracts_budget", None)
+    if supplied is not None:
+        return supplied
+    from ameesh import config, mechanics
+    try:
+        policy = mechanics.configured(config.load()).packet_tests
+    except (OSError, ValueError, mechanics.MechanicsError):
+        return None
+    if policy is None:
+        return None
+    return getattr(policy, "contracts_timeout_seconds", None) or policy.unit_timeout_seconds
+
+
 def run_freeze_checks(worktree: Path, *, timeout: int) -> tuple[int, str, float]:
     script = worktree / FREEZE_CHECKS_SCRIPT
     if not script.is_file():
@@ -2498,7 +2583,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                       select=None, on_base=None, guard=None,
                       prefix=None,
                       parallel: int = DEFAULT_PARALLEL,
-                      deadline: float | None = None) -> tuple[list[TestRun], list[int],
+                      deadline: float | None = None,
+                      contract_run: TestRun | None = None) -> tuple[list[TestRun], list[int],
                                                               list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
@@ -2613,7 +2699,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         return bounded("contrats", modules)
 
     jobs = [unit_job("unité #%d" % unit.lot, modules)
-            for unit, _proper, _added, modules in planned] + [contract_job]
+            for unit, _proper, _added, modules in planned]
+    if contract_run is None:
+        jobs.append(contract_job)
     # #4887 : la part de chaque série est calculée au départ, pas à la
     # composition : une série qui finit tôt rend sa part aux suivantes. Une
     # réserve reste pour le rejeu d'un rouge de voisin (base, préfixes), sans
@@ -2638,7 +2726,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             "borne %d s par série, part de la borne totale (#4887)"
             % (len(jobs), min(parallel, len(jobs)), timeout))
     results = _run_series(jobs, parallel=parallel, guard=guard)
-    contract = results.pop()
+    contract = results.pop() if contract_run is None else contract_run
     pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str],
                         set[str]]] = []
     for (unit, proper, added, modules), run in zip(planned, results):
@@ -3001,6 +3089,9 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     ]
     if tests is None:
         lines.append(TESTS_PARALLEL_LINE)
+        lines.append("- Contrats du plan commun : passe bornée sur cet arbre après "
+                     "inclusion et avant poussée ; rapport réutilisé par les tests "
+                     "locaux, résultat à la PR et au porteur (#6182).")
         lines.append("- Modules directs par lot : lus au corps de la PR après "
                      "les tests (#4887).")
         tests = []
@@ -4313,6 +4404,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                     "contrôle d'inclusion rouge sur la tête %s : voir le rapport "
                     "ci-dessus" % head[:12])
             print("inclusion : vert", flush=True)
+            contract_report = prepublication_contracts(
+                worktree, base=base_sha, budget=contract_budget(args), guard=guard, expected_head=head)
+            contract_run = contract_report.run
+            print("contrats avant publication : %s (%.1f s)%s" % (
+                "NON CONCLUANT" if contract_run.inconclusive else
+                ("vert" if contract_run.green else "ROUGE"), contract_run.seconds,
+                (" — " + contract_run.log_path) if contract_run.log_path else ""), flush=True)
+            if contract_run.real_failure:
+                raise PaquetAutoError(
+                    "contrats rouges avant publication : tentative suspendue sans poussée ; "
+                    "les autres lots restent disponibles :\n" + _tail(contract_run.output))
             if not args.local:
                 if guard is not None:
                     guard()
@@ -4325,6 +4427,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                             % (branch, state.lower()))
                 check_pause(worktree, getattr(args, "pause_project", "") or "",
                             args.target)
+                verify_contract_scope(worktree, contract_report)
                 push_branch(worktree, branch, force_lease=lease)
                 print("poussée : %s%s" % (branch, " (recomposition)"
                                           if lease else ""), flush=True)
@@ -4344,7 +4447,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                     worktree, composition, timeout=args.tests_timeout,
                     base_sha=base_sha, guard=tests_guard,
                     parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
-                    deadline=deadline)
+                    deadline=deadline, contract_run=contract_run)
             except CarrierSettled as settled:
                 rc = interrupted_by_carrier(args, worktree, branch, head,
                                             settled.state)
@@ -4578,6 +4681,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--python", default=None,
                         help="interpréteur des outils enfants (défaut : un "
                              "Python du projet qui porte psycopg)")
+    parser.add_argument("--contracts-budget", type=int, default=None,
+                        help="borne canon de la passe avant publication, attente comprise")
     parser.add_argument("--tests-timeout", type=int, default=DEFAULT_TIMEOUT,
                         help="borne d'une exécution unittest (défaut : %d s)"
                         % DEFAULT_TIMEOUT)
@@ -4621,6 +4726,8 @@ def main(argv: list[str] | None = None) -> int:
         _PYTHON_OVERRIDE = str(Path(args.python).resolve())
 
     try:
+        if args.contracts_budget is not None and args.contracts_budget <= 0:
+            raise InputError("--contracts-budget doit être strictement positif")
         if args.replay:
             if args.carrier or args.local:
                 raise InputError("--replay : ni --carrier ni --local")

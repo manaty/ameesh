@@ -778,6 +778,9 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
     if ctx.unit_tests is not None:
         cmd += ["--tests-timeout", str(ctx.unit_tests.unit_timeout_seconds),
                 "--tests-parallel", str(ctx.unit_tests.parallel)]
+        contract_budget = (getattr(ctx.unit_tests, "contracts_timeout_seconds", None)
+                           or ctx.unit_tests.unit_timeout_seconds)
+        cmd += ["--contracts-budget", str(contract_budget)]
         total = getattr(ctx.unit_tests, "total_timeout_seconds", None)
         if total:
             cmd += ["--tests-budget", str(total)]
