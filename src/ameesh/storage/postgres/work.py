@@ -2004,20 +2004,46 @@ class WorkItems(interface.WorkItems):
                     (int(item_id), updated[0]["state"], note, actor or ""))
             return updated[0]
 
-    def schedule_wake(self, item_id, wake_ts, *, text, actor) -> dict | None:
-        """#2466 : pose (ou efface) le réveil programmé et journalise, atomique."""
+    def schedule_wake(self, item_id, wake_ts, *, text, actor,
+                      expect=None, arm_id=None) -> dict | None:
+        """#2466 : pose (ou efface) le réveil programmé et journalise, atomique.
+
+        #6134 : avec `expect`, l'effacement n'a lieu que si le réveil est
+        encore celui inspecté : même échéance, non réclamé, et (si `arm_id`)
+        même événement d'armement. Un réarmement concurrent par `ameesh work
+        wake` ou une note `hold:` n'est jamais écrasé ; la méthode rend alors
+        None sans rien écrire (ni journal, ni colonne)."""
         if not has_wake_at(self.db):
             raise DbError("work_items.wake_at is missing: apply migration 0466 "
                           "(`ameesh migrate`) before scheduling a wake")
         item_id = int(item_id)
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT state, extract(epoch from wake_at)::float8 AS wake_ts"
+                "SELECT state, extract(epoch from wake_at)::float8 AS wake_ts,"
+                "       (wake_claim_at IS NOT NULL) AS claimed"
                 "  FROM work_items WHERE id = %s AND state NOT IN"
                 f" ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}') FOR NO KEY UPDATE",
                 (item_id,))
             if not rows:
                 return None
+            if wake_ts is None and expect is not None:
+                row = rows[0]
+                if row["wake_ts"] is None \
+                        or abs(float(row["wake_ts"]) - float(expect)) >= 0.001:
+                    return None
+                if row["claimed"]:
+                    return None
+                if arm_id is not None:
+                    current = tx.query(
+                        "SELECT id FROM work_item_events"
+                        " WHERE work_item_id = %s"
+                        "   AND (note LIKE %s OR (note LIKE %s AND note LIKE %s))"
+                        "   AND note NOT LIKE %s AND note NOT LIKE %s"
+                        " ORDER BY id DESC LIMIT 1",
+                        (item_id, "%[réveil programmé:%", "wake: %", "%(due %",
+                         "wake: scheduled wake delivered%", "wake: cancelled%"))
+                    if not current or int(current[0]["id"]) != int(arm_id):
+                        return None
             tx.execute(
                 "INSERT INTO work_item_events (work_item_id, state, note, actor) "
                 "VALUES (%s, %s, %s, %s)",

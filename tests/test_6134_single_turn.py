@@ -136,6 +136,31 @@ class WakeAfterLiftTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
+    def test_a_concurrent_rearm_is_not_cancelled(self):
+        """B/P2 : l'annulation est un CAS ; un réarmement concurrent survit."""
+        worker = self._worker("w4")
+        try:
+            lot = self._lot(worker)
+            old = time.time() - 1
+            work.note(self.db, lot, "hold: attendre", actor="w4", wake_ts=old)
+            work.note(self.db, lot, "unhold: lever", actor="human:owner")
+            reason, arm_id = worker._wake_abandoned_by_lift(lot)
+            self.assertTrue(reason)
+            self.assertIsNotNone(arm_id)
+            new_ts = time.time() + 600
+            work.schedule_wake(self.db, lot, new_ts, text="reprise concurrente",
+                               actor="w4")
+            before = work.get(self.db, lot)["wake_ts"]
+            self.assertIsNone(
+                work.schedule_wake(self.db, lot, None, text=reason, actor="ameesh",
+                                   expect=old, arm_id=arm_id),
+                "le réarmement concurrent n'est pas écrasé")
+            self.assertAlmostEqual(work.get(self.db, lot)["wake_ts"], before, delta=2)
+            self.assertFalse(any(note.startswith("wake: cancelled")
+                                 for note in self._notes(lot)))
+        finally:
+            worker.watchdog_stop.set()
+
     def test_a_wake_still_under_its_hold_is_delivered(self):
         worker = self._worker("w3")
         try:

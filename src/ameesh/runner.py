@@ -6862,7 +6862,7 @@ class AgentWorker(threading.Thread):
             return True
         return bool(taken) and abs(float(taken["wake_ts"]) - claim["wake_ts"]) < 0.001
 
-    def _wake_abandoned_by_lift(self, lot: int) -> str:
+    def _wake_abandoned_by_lift(self, lot: int) -> tuple[str, int | None]:
         """#6134 : le réveil échu est-il armé par une note `hold:` dont la
         retenue a été levée avant sa délivrance ?
 
@@ -6874,18 +6874,20 @@ class AgentWorker(threading.Thread):
         même agent, l'une armée et l'autre réveillée après un `unhold:`).
         L'événement d'armement est la dernière note portant
         `[réveil programmé: …]` ou le dernier `wake: … (due …)` ; une ligne de
-        délivrance ou d'annulation n'arme rien. Rend la raison, ou '' quand le
-        réveil peut être délivré (retenue encore active, ou armé autrement).
+        délivrance ou d'annulation n'arme rien. Rend `(raison, id de
+        l'armement)` ; `("", None)` quand le réveil peut être délivré (retenue
+        encore active, ou armé autrement). L'id sert au CAS de l'annulation :
+        un réarmement concurrent n'est jamais écrasé.
         Sur un exécuteur médié, le journal du lot n'est pas au contrat (L107) :
         le réveil reste délivré et l'annulation y est un suivi."""
         if getattr(self.runner, "mediated", False):
-            return ""  # le journal du lot n'est pas au contrat médié
-        from . import planned_waits, work
+            return "", None  # le journal du lot n'est pas au contrat médié
+        from . import planned_waits
         try:
             arm = _wake_arming_event(
                 storage.of(self.db).work.events(int(lot), 200))
             if arm is None or not planned_waits.is_hold_note(arm.get("note")):
-                return ""
+                return "", None
             holds = planned_waits.active_holds(
                 self.db,
                 storage.of(self.db).progress.lot_hold_events(
@@ -6894,11 +6896,11 @@ class AgentWorker(threading.Thread):
         except (db_mod.DbError, AttributeError) as exc:
             log_async("[%s] wake arming note unreadable for lot #%s (%s)"
                       % (self.name, lot, exc))
-            return ""
+            return "", None
         if (holds.get(int(lot)) or {}).get(str(arm.get("actor") or "")):
-            return ""
+            return "", None
         return ("the hold note that armed it (%s) was lifted before delivery"
-                % (arm.get("actor") or "unknown author"))
+                % (arm.get("actor") or "unknown author"), arm.get("id"))
 
     def _scheduled_wake_spec(self) -> dict | None:
         """#2466 : réveil programmé échu d'un lot de l'agent.
@@ -6933,20 +6935,28 @@ class AgentWorker(threading.Thread):
             for row in st.due_wakes(self.name, now, self.WAKE_CLAIM_TTL):
                 if self._lot_workdir_blocked(row["id"]):
                     continue
-                abandon = self._wake_abandoned_by_lift(int(row["id"]))
+                abandon, arm_id = self._wake_abandoned_by_lift(int(row["id"]))
                 if abandon:
-                    # #6134 : le réveil ne part pas ; l'échéance est retirée
-                    # avec une ligne nommée, jamais laissée due pour un autre
-                    # passage (elle serait réclamée en boucle).
+                    # #6134 : le réveil ne part pas ; l'échéance inspectée est
+                    # retirée avec une ligne nommée. Le CAS (échéance, claim et
+                    # armement) empêche d'écraser un réarmement concurrent :
+                    # dans ce cas rien n'est annulé et le réveil reste dû.
                     try:
-                        work_mod.schedule_wake(
+                        cancelled = work_mod.schedule_wake(
                             self.db, int(row["id"]), None,
-                            text=abandon, actor="ameesh")
+                            text=abandon, actor="ameesh",
+                            expect=float(row["wake_ts"]), arm_id=arm_id)
                     except (work_mod.WorkError, db_mod.DbError) as exc:
                         log_async("[%s] abandoned wake for lot #%s not cancelled "
                                   "(%s)" % (self.name, row["id"], exc))
-                    log_async("[%s] scheduled wake for lot #%s cancelled: %s"
-                              % (self.name, row["id"], abandon))
+                        cancelled = None
+                    if cancelled is None:
+                        log_async("[%s] abandoned wake for lot #%s re-armed or "
+                                  "claimed meanwhile: not cancelled"
+                                  % (self.name, row["id"]))
+                    else:
+                        log_async("[%s] scheduled wake for lot #%s cancelled: %s"
+                                  % (self.name, row["id"], abandon))
                     continue
                 taken = st.claim_wake(self.name, int(row["id"]), now,
                                       self.WAKE_CLAIM_TTL)
