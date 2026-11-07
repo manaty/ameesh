@@ -132,6 +132,24 @@ class AgentRenameTest(PgTestCase):
             "SELECT updated_by FROM repository_footprint_policies WHERE app = 'demo-4299'"
         )[0]['updated_by'], 'new-worker')
 
+    def test_rename_moves_the_external_executor_trace(self):
+        # #6091 (0554): the declaration and retirement trace names the pilot
+        # authority (an agent, or human:<id>); an agent spelling follows the
+        # renamed identity, while `name` stays the system identity.
+        with mock.patch.object(work, 'corrector', return_value='worker'):
+            work.declare_external_executor(self.db, 'system:ima', 'human:owner',
+                                           cfg=self.cfg)
+            work.retire_external_executor(self.db, 'system:ima', cfg=self.cfg)
+
+        result = self.rename('worker', 'new-worker')
+
+        self.assertEqual(result['rewritten']['external_executors.declared_by'], 1)
+        self.assertEqual(result['rewritten']['external_executors.retired_by'], 1)
+        row = self.db.query("SELECT name, declared_by, retired_by FROM external_executors"
+                            " WHERE name = 'system:ima'")[0]
+        self.assertEqual((row['name'], row['declared_by'], row['retired_by']),
+                         ('system:ima', 'new-worker', 'new-worker'))
+
     def test_rename_moves_the_same_identity_and_keeps_old_as_alias(self):
         claimed = registry.claim(self.db, 'worker', 'runner-test', 120)
         registry.release(self.db, 'worker', 'runner-test', claimed['lease_epoch'])
@@ -504,6 +522,10 @@ IGNORED = {
     # #4148 (0507): a scanner lock token "<actor>:<host>", not an agent name;
     # it expires within the scan, a rename never needs to move it.
     "host_release_locks.owner",
+    # #6091 (0554): the declared non-agent executor is `system:<name>`, a
+    # system identity that can never collide with an agent (`NAME_RE` forbids
+    # the colon); a rename never moves it.
+    "external_executors.name",
 }
 
 

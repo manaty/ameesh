@@ -21,6 +21,7 @@
   agent-mesh work wake <id> --at ISO | --in DURATION | --cancel   scheduled wake, even under hold (#2466)
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
   agent-mesh work external-executor <id> <agent> | --clear   reserve a {work} to an external executor (#3447)
+  agent-mesh work external-executor --declare system:<nom> --responsible human:H | --list | --retire system:<nom>   declare a non-agent executor (#6091)
   agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the {work}'s migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
@@ -2325,6 +2326,64 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "external-executor":
             # #3447 : réservation déclarative à un exécutant externe (bureau,
             # owner), jamais une attribution.
+            # #6091 : déclaration des exécutants non-agents (`system:…`), qui
+            # ne sont ni réveillés ni assignables.
+            if args.list:
+                if args.id is not None or args.agent or args.clear or args.declare \
+                        or args.retire or args.responsible or args.note:
+                    raise work.WorkError("--list goes alone")
+                rows = work.external_executors(
+                    db, include_retired=args.include_retired)
+                if args.json:
+                    print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+                    return 0
+                if not rows:
+                    print("no declared non-agent external executor")
+                    return 0
+                for row in rows:
+                    print("%-24s responsible: %-20s%s%s" % (
+                        row["name"], row.get("responsible") or "?",
+                        " (retired %s)" % row.get("retired_by") if row.get("retired_at") else "",
+                        " — %s" % row["note"] if row.get("note") else ""))
+                return 0
+            if args.declare or args.retire:
+                if args.declare and args.retire:
+                    raise work.WorkError("--declare and --retire are two different gestures")
+                if args.id is not None or args.agent or args.clear \
+                        or args.include_retired:
+                    raise work.WorkError("--declare/--retire go without a lot and without "
+                                         "an executor name")
+                if args.retire:
+                    if args.responsible or args.note:
+                        raise work.WorkError("--retire takes no --responsible/--note")
+                    row = work.retire_external_executor(
+                        db, args.retire, actor=args.actor, cfg=cfg)
+                    if args.json:
+                        print(json.dumps(row, ensure_ascii=False, indent=2, default=str))
+                        return 0
+                    print("non-agent external executor %s retired (was responsible: %s); "
+                          "no new lot can be reserved to it, existing lots keep the "
+                          "name until cleared or closed"
+                          % (row["name"], row.get("responsible") or "?"))
+                    return 0
+                if not args.responsible:
+                    raise work.WorkError("--declare needs --responsible human:<id>")
+                row = work.declare_external_executor(
+                    db, args.declare, args.responsible, note=args.note,
+                    actor=args.actor, cfg=cfg)
+                if args.json:
+                    print(json.dumps(row, ensure_ascii=False, indent=2, default=str))
+                    return 0
+                print("non-agent external executor %s declared (responsible: %s; never "
+                      "woken, never assignable — reserve a lot with ameesh work "
+                      "external-executor <id> %s)"
+                      % (row["name"], row.get("responsible"), row["name"]))
+                return 0
+            if args.responsible or args.note or args.include_retired:
+                raise work.WorkError("--responsible/--note go with --declare, "
+                                     "--include-retired with --list")
+            if args.id is None:
+                raise work.WorkError("name the lot, or use --declare/--retire/--list")
             if args.clear and args.agent:
                 raise work.WorkError("--clear goes without an executor name")
             if not args.clear and not args.agent:
@@ -2482,8 +2541,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if phase != item["state"]:
                 print("phase    : %s (delivery stage)" % phase)
             if item.get("external_executor"):
-                print("executor : %s (external, reserved; not assignable)" % (
-                    item["external_executor"]))
+                external = item["external_executor"]
+                detail = ""
+                if external.startswith(work.SYSTEM_PREFIX):
+                    declared = storage.of(db).external_executors.get(external)
+                    if declared:
+                        detail = ", non-agent system, responsible %s" % (
+                            declared.get("responsible") or "?")
+                print("executor : %s (external, reserved; not assignable%s)" % (
+                    external, detail))
             print("app      : %-10s source: %-12s workstream: %s" % (
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
@@ -4417,13 +4483,33 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_executor = work_sub.add_parser(
         "external-executor",
         help=("#3447: declare the external executor a %s is reserved to (an `externe` "
-             "agent with a human owner, or a human), or clear the reservation") % v.noun)
-    pw_executor.add_argument("id", type=int)
+             "agent with a human owner, a human, or a declared non-agent system such as "
+             "system:<name>), or clear the reservation; #6091: declare/list/retire the "
+             "non-agent systems") % v.noun)
+    pw_executor.add_argument("id", type=int, nargs="?", default=None)
     pw_executor.add_argument("agent", nargs="?", default=None,
-                             help="the external executor (registered `externe` agent, or "
-                                  "human:<id>); omitted with --clear")
+                             help="the external executor (registered `externe` agent, "
+                                  "human:<id>, or declared system:<name>); omitted with "
+                                  "--clear")
     pw_executor.add_argument("--clear", action="store_true",
                              help=("clear the reservation (the %s returns to the ordinary queue)") % v.noun)
+    pw_executor.add_argument("--declare", default=None, metavar="SYSTEM",
+                             help=("#6091: declare the non-agent external executor "
+                                  "system:<name> with --responsible; never an agent, never "
+                                  "woken, never assignable"))
+    pw_executor.add_argument("--responsible", default=None, metavar="HUMAN",
+                             help="#6091: the human responsible of the declared system "
+                                  "(human:<id>, or a known bare name)")
+    pw_executor.add_argument("--note", default="", metavar="TEXT",
+                             help="#6091: why the system is declared (kept on the "
+                                  "declaration)")
+    pw_executor.add_argument("--retire", default=None, metavar="SYSTEM",
+                             help="#6091: retire a declared system (no new reservation; "
+                                  "existing lots keep the name until cleared or closed)")
+    pw_executor.add_argument("--list", action="store_true",
+                             help="#6091: list the declared non-agent external executors")
+    pw_executor.add_argument("--include-retired", action="store_true",
+                             help="#6091: with --list, include retired declarations")
     pw_executor.add_argument("--json", action="store_true")
     pw_executor.add_argument("--actor", default="")
     pw_executor.set_defaults(func=cmd_work)

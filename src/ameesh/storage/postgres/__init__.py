@@ -28,6 +28,7 @@ from .costs import TurnCosts
 from .conversations import Conversations
 from .credentials import Credentials
 from .events import Events
+from .external_executors import ExternalExecutors
 from .grants import Grants
 from .host_lifecycle import HostLifecycle
 from .handoffs import Handoffs
@@ -89,6 +90,7 @@ class PostgresStorage(interface.Storage):
         self.approvals = Approvals(db)
         self.nonces = Nonces(db)
         self.work = WorkItems(db)
+        self.external_executors = ExternalExecutors(db)
         self.work_dependencies = WorkDependencies(db)
         self.work_footprints = WorkFootprints(db)
         self.provenance = Provenance(db)
