@@ -129,6 +129,9 @@ PRIORITIES = (1, 2, 3)
 PRIORITY_LABELS = {1: "high", 2: "normal", 3: "low"}
 #: L157b : taille déclarée du changement d'un lot (petit, moyen, gros)
 SIZES = ("s", "m", "l")
+#: #6090 : longueur maximale d'une clé d'idempotence durable
+#: (`work add --unique-ref`). La clé est opaque et fournie par l'appelant.
+UNIQUE_REF_MAX = 256
 #: #2954 : les types de lot que porte la base (mêmes valeurs que la projection
 #: GitHub, `plan_github.LOT_TYPES`). Un lot `improvement` est un panier, avec
 #: ses champs de valeur ; `bug` et `evolution` suivent le chemin de correction.
@@ -575,6 +578,43 @@ def pin_authority(cfg, db, actor: str | None = None) -> str | None:
         return None
 
 
+def normalize_unique_ref(key) -> str | None:
+    """#6090 : la clé d'idempotence durable de `work add --unique-ref`, ou None.
+
+    Une clé est opaque : seuls les espaces de bord sont retirés, la casse est
+    significative. Une chaîne vide (ou blanche) est refusée, ainsi qu'une clé
+    de plus de `UNIQUE_REF_MAX` caractères ; aucune autre transformation, pour
+    que deux appelants qui fournissent la même clé la retrouvent telle quelle.
+    Un booléen est refusé : `unique_ref` n'est plus l'option interne de #2954
+    (`unique_execution`), une confusion silencieuse créerait deux lots.
+    """
+    if key is None:
+        return None
+    if isinstance(key, bool):
+        raise WorkError("unique_ref: a durable key is a string, not a boolean "
+                        "(#6090; the execution identity option is `unique_execution`)")
+    text = str(key).strip()
+    if not text:
+        raise WorkError("--unique-ref: a non-empty key is required")
+    if len(text) > UNIQUE_REF_MAX:
+        raise WorkError("--unique-ref: at most %d characters (got %d)"
+                        % (UNIQUE_REF_MAX, len(text)))
+    if "\x00" in text:
+        raise WorkError("--unique-ref: NUL is not allowed in a key")
+    return text
+
+
+def existing_by_unique_ref(db: Db, key) -> dict | None:
+    """#6090 : le lot qui porte déjà cette clé durable, quel que soit son état,
+    ou None. Le lot rendu est marqué `existing` ; la clé vide n'est pas une
+    requête (elle ne désigne rien)."""
+    text = normalize_unique_ref(key)
+    if text is None:
+        return None
+    row = storage.of(db).work.by_unique_ref(text)
+    return dict(row, existing=True) if row is not None else None
+
+
 def add(
     db: Db,
     *,
@@ -602,7 +642,8 @@ def add(
     parent_lot: int | None = None,
     mark_item_id: int | None = None,
     mark_note: str = "",
-    unique_ref: bool = False,
+    unique_execution: bool = False,
+    unique_ref: str | None = None,
     external_executor: str | None = None,
     footprint=None,
     impact: dict | None = None,
@@ -626,10 +667,19 @@ def add(
     with --new-project). L539 : `mark_item_id` et `mark_note` écrivent la
     marque d'idempotence du lot de relecture au journal de ce lot, dans la
     même transaction que la création (`{lot}` y vaut l'identifiant créé).
-    `unique_ref` (#2954) : une seule création par `issue_ref`, toutes états
-    confondus — le verrou consultatif (repo, run) sérialise deux hôtes
+    `unique_execution` (#2954) : une seule création par `issue_ref`, toutes
+    états confondus — le verrou consultatif (repo, run) sérialise deux hôtes
     concurrents et le second reçoit `DbError` ; l'appelant relit le gagnant
     (`open_incident`).
+
+    `unique_ref` (#6090) : clé d'idempotence durable fournie par l'appelant
+    (`work add --unique-ref`). Elle est d'abord relue ici, avant les gardes et
+    l'analyse d'empreinte ; si un lot la porte déjà, il est rendu marqué
+    `existing`, **quel que soit son état**, et rien n'est créé. La course entre
+    deux premiers appels se referme dans le magasin, sous le verrou consultatif
+    de la clé : le perdant relit le gagnant et le rend. La clé est globale au
+    mesh, normalisée (`normalize_unique_ref`) et comparée exactement ; le
+    premier contenu gagne, un rejeu avec un autre titre ne réécrit rien.
 
     #540 : un agent qui a déjà un lot non démarré ne reçoit pas celui-ci : il
     va dans la file d'équipe (`queued_behind`, `queue_warning`). `force` : la
@@ -680,6 +730,15 @@ def add(
         raise WorkError("body refused: `-` alone is not a statement; write the text, "
                         "or pass `--body -` to ameesh work add to read it on standard "
                         "input")
+    # #6090 : une clé déjà consommée rend son lot AVANT les gardes et l'analyse
+    # d'empreinte — un rejeu ne dépend ni de l'état de l'agent, ni du clone, ni
+    # de la disponibilité d'un exécutant externe. La course entre deux premiers
+    # appels reste fermée dans le magasin (même verrou, relecture).
+    unique_ref = normalize_unique_ref(unique_ref)
+    if unique_ref is not None:
+        existing = existing_by_unique_ref(db, unique_ref)
+        if existing is not None:
+            return existing
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
     if footprint is None and not _is_vehicle_branch(branch):
@@ -698,7 +757,7 @@ def add(
         estimate=estimate, estimate_source=estimate_source, size=size,
         note=note, force=force, parent_lot=parent_lot,
         mark_item_id=mark_item_id, mark_note=mark_note,
-        unique_ref=unique_ref, team_queue=True,
+        unique_execution=unique_execution, unique_ref=unique_ref, team_queue=True,
         external_executor=external_executor, footprint=footprint,
         impact=impact)
     from . import packet_composition
@@ -835,7 +894,8 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             actor="", package=None, externe=False, cfg=None, branch=None,
             branch_target=None, priority=None, estimate=None, estimate_source=None,
             size=None, note="", force=None, parent_lot=None, mark_item_id=None,
-            mark_note="", unique_ref: bool = False, team_queue: bool,
+            mark_note="", unique_execution: bool = False,
+            unique_ref: str | None = None, team_queue: bool,
             external_executor=None, footprint=None, impact=None) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
@@ -922,7 +982,8 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             queued_note=queued and _queued_note(queued, created),
             forced_note=queued and _forced_note(queued, created, force, actor),
             mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot,
-            unique_ref=unique_ref, external_executor=external_executor,
+            unique_execution=unique_execution, unique_ref=unique_ref,
+            external_executor=external_executor,
             # #4173 : l'empreinte d'intake est écrite par la création même ;
             # attribuée, celle-ci est refusée si elle chevauche un lot en cours
             # (`FootprintOverlap`, rien n'est écrit). #4818 : une analyse
@@ -944,6 +1005,11 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         raise WorkError("external executor refused: %s was retired before the lot was "
                         "written; nothing changed — declare a current system instead"
                         % exc.name) from exc
+    if item.get("existing"):
+        # #6090 : un premier appel concurrent a gagné sous le verrou de la clé ;
+        # rien n'a été écrit ici, aucun effet de création ne doit suivre
+        # (empreinte, analyse profonde, route de panier).
+        return item
     if impact:
         # #4818 : une ligne de journal par estimation, et la dernière analyse,
         # avec la politique appliquée à l'écriture
