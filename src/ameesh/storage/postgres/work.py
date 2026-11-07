@@ -2014,20 +2014,53 @@ class WorkItems(interface.WorkItems):
                     (int(item_id), updated[0]["state"], note, actor or ""))
             return updated[0]
 
-    def schedule_wake(self, item_id, wake_ts, *, text, actor) -> dict | None:
-        """#2466 : pose (ou efface) le réveil programmé et journalise, atomique."""
+    def schedule_wake(self, item_id, wake_ts, *, text, actor,
+                      expect=None, arm_id=None, claim_ttl=None) -> dict | None:
+        """#2466 : pose (ou efface) le réveil programmé et journalise, atomique.
+
+        #6134 : avec `expect`, l'effacement n'a lieu que si le réveil est
+        encore celui inspecté : même échéance, même événement d'armement (si
+        `arm_id`) et aucun claim **vivant**. Un claim expiré (livraison
+        abandonnée, `claim_ttl`) ne bloque pas : sans cela, après un hold levé,
+        chaque passage verrait le réveil dû, refuserait de l'annuler et
+        boucherait sans fin. Un réarmement concurrent par `ameesh work wake`
+        ou une note `hold:` n'est jamais écrasé ; la méthode rend alors None
+        sans rien écrire (ni journal, ni colonne)."""
         if not has_wake_at(self.db):
             raise DbError("work_items.wake_at is missing: apply migration 0466 "
                           "(`ameesh migrate`) before scheduling a wake")
         item_id = int(item_id)
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT state, extract(epoch from wake_at)::float8 AS wake_ts"
+                "SELECT state, extract(epoch from wake_at)::float8 AS wake_ts,"
+                "       (wake_claim_at IS NOT NULL) AS claimed,"
+                "       extract(epoch from (clock_timestamp() - wake_claim_at))::float8"
+                "         AS claim_age_s"
                 "  FROM work_items WHERE id = %s AND state NOT IN"
                 f" ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}') FOR NO KEY UPDATE",
                 (item_id,))
             if not rows:
                 return None
+            if wake_ts is None and expect is not None:
+                row = rows[0]
+                if row["wake_ts"] is None \
+                        or abs(float(row["wake_ts"]) - float(expect)) >= 0.001:
+                    return None
+                if row["claimed"]:
+                    if claim_ttl is None or row["claim_age_s"] is None \
+                            or float(row["claim_age_s"]) < float(claim_ttl):
+                        return None
+                if arm_id is not None:
+                    current = tx.query(
+                        "SELECT id FROM work_item_events"
+                        " WHERE work_item_id = %s"
+                        "   AND (note LIKE %s OR (note LIKE %s AND note LIKE %s))"
+                        "   AND note NOT LIKE %s AND note NOT LIKE %s"
+                        " ORDER BY id DESC LIMIT 1",
+                        (item_id, "%[réveil programmé:%", "wake: %", "%(due %",
+                         "wake: scheduled wake delivered%", "wake: cancelled%"))
+                    if not current or int(current[0]["id"]) != int(arm_id):
+                        return None
             tx.execute(
                 "INSERT INTO work_item_events (work_item_id, state, note, actor) "
                 "VALUES (%s, %s, %s, %s)",

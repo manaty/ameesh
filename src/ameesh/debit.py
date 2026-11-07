@@ -30,7 +30,10 @@ simple mention d'une règle ou d'une consigne de l'owner ne suffit pas, et un
 `hold_undeployed` n'est jamais humain. #3447 : les lots réservés à un exécutant
 externe déclaré (`external_executor`) sont, de même, listés à part (« attentes
 externes ») : ce n'est ni un lot sans assigné ni une attente d'agent, et ce
-n'est pas `--check` qui la pousse. #3498 : un hold peut nommer son exécutant
+n'est pas `--check` qui la pousse. #6105 : pour un `system:…` déclaré, la
+ligne nomme son responsable humain et la relance s'adresse à lui ; une
+déclaration retirée marque la ligne et renvoie la réservation au pilote, au
+lieu de laisser une attente orpheline. #3498 : un hold peut nommer son exécutant
 externe et le geste attendu (`hold: attente bureau : …`,
 `hold: attente owner : …`) ; le débit le range dans les mêmes « attentes
 externes », avec une relance à cet exécutant — à l'échéance déclarée
@@ -1080,6 +1083,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
           fixes: Iterable[Mapping[str, Any]] | None = None,
           packets: Iterable[Mapping[str, Any]] = (),
           families: Iterable[str] = (),
+          external_executors: Mapping[str, Mapping[str, Any]] | None = None,
           review_pilots: Mapping[str, str] | None = None,
           closed_hosts: Iterable[str] = (),
           zone: str = "UTC") -> dict:
@@ -1105,7 +1109,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
     #5430 : `families` sont les familles du canon compilé ; avec le `harness`
     des agents, elles prouvent la famille d'un verdict et donc le nombre de
     familles **distinctes** qui ont relu la tête. Sans elles, un verdict
-    compte pour une famille inconnue, jamais pour plusieurs."""
+    compte pour une famille inconnue, jamais pour plusieurs.
+
+    `external_executors` (#6105) : les déclarations `system:…` par nom,
+    retirées comprises (`work.external_executor_declarations`). Elles nomment
+    le responsable humain d'une réservation et font dire au débit qu'une
+    réservation dont le système est retiré n'a plus personne : le pilote la
+    lève. Sans cette lecture, la ligne garde le texte générique de #3447."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
     # la déclaration d'attente externe d'un hold.
@@ -1227,15 +1237,47 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 if at is not None and (since is None or float(at) > float(since)):
                     since = float(at)
             age = _age(now, since)
+            # #6105 : une déclaration `system:…` porte le responsable humain à
+            # qui la relance s'adresse ; retirée, elle ne porte plus personne
+            # et la réservation revient au pilote au lieu d'attendre en
+            # silence. Un agent `externe` ou un humain n'a pas de déclaration :
+            # le texte #3447 reste.
+            declaration = dict((external_executors or {}).get(external) or {})
+            responsible = str(declaration.get("responsible") or "").strip() or None
+            retired = bool(declaration.get("retired_at"))
+            retired_by = str(declaration.get("retired_by") or "").strip() or None
+            if retired:
+                gesture = ("reserved to %s, a RETIRED non-agent system%s — nobody "
+                           "acts for it now: the pilot clears the reservation and "
+                           "hands the lot back (`ameesh work external-executor %d "
+                           "--clear`)" % (
+                               external,
+                               " (retired by %s)" % retired_by if retired_by else "",
+                               ident))
+            elif responsible:
+                gesture = ("the external executor %s is a non-agent system; its "
+                           "declared responsible %s acts (not an agent, never "
+                           "woken), or tells the pilot the reservation is without "
+                           "object (`ameesh work external-executor %d --clear`)"
+                           % (external, responsible, ident))
+            else:
+                gesture = ("the external executor %s acts (bureau/owner, not an "
+                           "agent); the pilot clears the reservation if it is no "
+                           "longer wanted (`ameesh work external-executor %d "
+                           "--clear`)" % (external, ident))
+            reminder_ts = (float(since) + max(float(wait_s), 60.0)
+                           if responsible and not retired and since is not None
+                           else None)
             external_waits.append({
                 "lot": ident, "title": item.get("title") or "",
                 "app": item.get("app") or None, "who": external,
+                "responsible": responsible,
+                "retired": retired, "retired_by": retired_by,
                 "kind": "external", "state": state,
                 "since_ts": since, "since": _iso(since), "age_s": age,
-                "gesture": "the external executor %s acts (bureau/owner, not an "
-                           "agent); the pilot clears the reservation if it is no "
-                           "longer wanted (`ameesh work external-executor %d "
-                           "--clear`)" % (external, ident),
+                "reminder_ts": reminder_ts, "reminder": _iso(reminder_ts),
+                "reminder_due": bool(reminder_ts is not None and now >= reminder_ts),
+                "gesture": gesture,
             })
         if terminal_ts is None:
             branch = _branch_name(item.get("branch"))
@@ -2534,6 +2576,17 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
         from . import review_family_paused
         review_pilots, closed_hosts = review_family_paused.exclusions(
             cfg, db, [item.get("app") or "" for item in items], agents)
+    # #6105 : les déclarations `system:…` nomment le responsable humain d'une
+    # réservation et disent qu'un système retiré ne portera plus son lot. Une
+    # lecture en échec laisse le texte générique de #3447 ; elle ne fait pas
+    # tomber le débit, et se dit dans `unreadable`.
+    external_executors: dict[str, dict] = {}
+    try:
+        from . import work
+        external_executors = work.external_executor_declarations(db)
+    except Exception as exc:  # noqa: BLE001 - une déclaration illisible se dit
+        unreadable.append("external executor declarations unreadable: %s"
+                          % " ".join(str(exc).split())[:160])
     report = build(items=items, milestones=milestones, events=events,
                    agents=agents, turns=turns, merges=merges, ci_runs=ci_runs,
                    jobs=jobs_rows,
@@ -2541,7 +2594,9 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
                    holds=holds, closure_allowed=closure_allowed,
                    ci_unreadable=ci_unreadable, fixes=fixes,
-                   packets=packets, families=families, review_pilots=review_pilots,
+                   packets=packets, families=families,
+                   external_executors=external_executors,
+                   review_pilots=review_pilots,
                    closed_hosts=closed_hosts, zone=zone)
     annotate_candidate_causes(db, cfg, report, milestones, unreadable)
     report["capacity"] = read_capacity(db, cfg=cfg, now=now, hours=hours, turns=turns,
@@ -2823,12 +2878,15 @@ def format_text(report: Mapping[str, Any]) -> str:
     external = report.get("external_waits") or []
     if external:
         reminders = [row for row in external if row.get("reminder_due")]
+        retired = [row for row in external if row.get("retired")]
         lines.append("")
         lines.append("Attentes externes, hors --check (%d) — exécutant ou tiers "
-                     "déclaré, pas un agent à assigner%s :"
+                     "déclaré, pas un agent à assigner%s%s :"
                      % (len(external),
                         " ; %d relance(s) due(s)" % len(reminders)
-                        if reminders else ""))
+                        if reminders else "",
+                        " ; %d réservation(s) d'un système retiré — pilote"
+                        % len(retired) if retired else ""))
         for row in external[:20]:
             lines.append("  #%-6d %-16s %8s  %-22s %s"
                          % (int(row.get("lot") or 0), str(row.get("kind")),
@@ -2836,14 +2894,24 @@ def format_text(report: Mapping[str, Any]) -> str:
                             str(row.get("who") or "?")[:22],
                             str(row.get("title") or "")[:48]))
             lines.append("         → %s" % row.get("gesture"))
+            if row.get("retired"):
+                # #6105 : le système déclaré n'existe plus ; la réservation
+                # n'attend plus personne et revient au pilote.
+                lines.append("         ! système retiré : le pilote lève la réservation "
+                             "ou réaffecte le lot")
             if row.get("reminder_due"):
                 # #3773 : un tiers extérieur (`externe`) se suit au bureau ;
                 # les autres exécutants gardent la règle #3498 (bureau, sinon
-                # owner).
-                lines.append("         ! relance due le %s — porter au %s (canon §10)"
-                             % (row.get("reminder") or "?",
-                                "bureau" if row.get("who") in ("bureau", "externe")
-                                else "owner"))
+                # owner). #6105 : un système déclaré nomme son responsable
+                # humain, et c'est à lui que la relance s'adresse.
+                recipient = (row.get("responsible")
+                             or ("bureau" if row.get("who") in ("bureau", "externe")
+                                 else "owner"))
+                lines.append(
+                    "         ! relance due le %s — porter %s %s%s (canon §10)"
+                    % (row.get("reminder") or "?",
+                       "à" if row.get("responsible") else "au", recipient,
+                       " (responsable déclaré)" if row.get("responsible") else ""))
     else:
         lines.append("Attentes externes, hors --check : aucune.")
     windows = report.get("window_waits") or []

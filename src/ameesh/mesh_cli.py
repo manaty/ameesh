@@ -2361,10 +2361,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     if args.json:
                         print(json.dumps(row, ensure_ascii=False, indent=2, default=str))
                         return 0
+                    affected = row.get("open_lots")
+                    # #6105 : le retrait ne touche pas aux lots réservés, mais
+                    # il les nomme tout de suite — le débit les signalera
+                    # ensuite au pilote.
                     print("non-agent external executor %s retired (was responsible: %s); "
                           "no new lot can be reserved to it, existing lots keep the "
-                          "name until cleared or closed"
-                          % (row["name"], row.get("responsible") or "?"))
+                          "name until cleared or closed%s"
+                          % (row["name"], row.get("responsible") or "?",
+                             "; %d open lot(s) still reserved: %s — the pilot clears or "
+                             "reassigns them (the debit signals them as retired)"
+                             % (len(affected), ", ".join("#%d" % int(i) for i in affected))
+                             if affected else ""))
                     return 0
                 if not args.responsible:
                     raise work.WorkError("--declare needs --responsible human:<id>")
@@ -2546,8 +2554,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 if external.startswith(work.SYSTEM_PREFIX):
                     declared = storage.of(db).external_executors.get(external)
                     if declared:
-                        detail = ", non-agent system, responsible %s" % (
-                            declared.get("responsible") or "?")
+                        if declared.get("retired_at"):
+                            # #6105 : la réservation d'un système retiré n'a
+                            # plus personne ; le pilote la lève ou réaffecte.
+                            detail = (", retired non-agent system (was responsible: %s; "
+                                      "the pilot clears or reassigns)"
+                                      % (declared.get("responsible") or "?"))
+                        else:
+                            detail = ", non-agent system, responsible %s" % (
+                                declared.get("responsible") or "?")
                 print("executor : %s (external, reserved; not assignable%s)" % (
                     external, detail))
             print("app      : %-10s source: %-12s workstream: %s" % (
