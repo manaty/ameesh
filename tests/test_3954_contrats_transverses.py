@@ -200,8 +200,12 @@ class PlanTest(unittest.TestCase):
                           "test_migrations_additives":
                           "src/ameesh/migrations/0534_x.sql"})
         self.assertEqual(state["classes"]["test_migrations_additives"][0], "P1")
-        self.assertIn("contrat transverse",
-                      state["classes"]["test_migrations_additives"][1])
+        # #6147 : le contrat additif entre aussi dans la liste « toujours »,
+        # déclenchée par les migrations ; le motif retenu peut donc être celui
+        # de la liste, la déclaration transverse restant due (state["transverse"]).
+        self.assertIn(state["classes"]["test_migrations_additives"][1],
+                      ("contrat transverse: src/ameesh/migrations/0534_x.sql",
+                       "always list (src/ameesh/migrations/0534_x.sql)"))
 
 
 CODE_V1_CHANGED = ('"""Module."""\nLIMIT = 4\n\n\ndef used(x):\n    return x + 1\n')

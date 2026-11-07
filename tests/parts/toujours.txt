@@ -36,5 +36,6 @@ test_l31_orphans  # #749: orphan resources of a turn, lease and alert contract (
 test_l50_group_orphan_work_items  # #749: orphan work items of a group reattached, lease contract
 test_l72_panne_de_base  # database outage and reconnection
 test_migrations  # migrations: application, idempotence, immuabilité (contrat, L1211)
+test_migrations_additives  # #6147: contrat additif du staging (§11 bis) : une migration non additive est refusée
 test_3752_gabarit  # #3752: a migration changes the template every class clones (clone ≡ migrate)
 test_4299_agent_rename  # #4299: every agent-name column of the schema is classified for the rename
