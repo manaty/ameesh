@@ -126,7 +126,7 @@ _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "re
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
                   "contract_selection")
 _PRODUCTION_KEYS = ("branch",)
-_CONTRACT_SELECTION_KEYS = ("registry",)
+_CONTRACT_SELECTION_KEYS = ("registry", "publish")
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
 #: ni fin en `/`, `.` ou `.lock` — jamais une ref arbitraire ni un commit
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -187,6 +187,13 @@ class ContractSelection:
     """#6179: project registry path, absent in N-1 canon."""
 
     registry: str
+    publish: str = "contracts-first"
+
+
+def _contract_publication(value, where: str) -> str:
+    if value not in ("contracts-first", "legacy"):
+        raise MechanicsError(where + ": contracts-first or legacy required")
+    return value
 
 
 def _contract_selection(value, where: str) -> ContractSelection:
@@ -196,7 +203,8 @@ def _contract_selection(value, where: str) -> ContractSelection:
     path = data.get("registry")
     if not relative_path(path) or any(c in path for c in "*?[]"):
         raise MechanicsError(where + ".registry: repository-relative file required")
-    return ContractSelection(path)
+    publish = _contract_publication(data.get("publish", "contracts-first"), where + ".publish")
+    return ContractSelection(path, publish)
 
 
 @dataclass(frozen=True)
@@ -765,7 +773,8 @@ class Mechanics:
         if self.paquet is not None:
             payload["paquet"] = self.paquet.to_dict()
         if self.contract_selection is not None:
-            payload["contract_selection"] = {"registry": self.contract_selection.registry}
+            payload["contract_selection"] = {"registry": self.contract_selection.registry,
+                                             "publish": self.contract_selection.publish}
         if self.source:
             payload["source"] = self.source
         return payload
