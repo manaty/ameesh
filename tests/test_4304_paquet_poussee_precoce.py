@@ -51,9 +51,11 @@ class Flux:
     """Le flux de `compose_packet`, chaque geste extérieur consigné dans l'ordre."""
 
     def __init__(self, test, *, tests, compositions, states=("OPEN",), local=False,
-                 record=False, **extra):
+                 record=False, contract_result=None, **extra):
         self.test = test
         self.extra = extra
+        self.extra.setdefault("contracts_budget", 10)
+        self.contract_result = contract_result
         self.events: list[tuple] = []
         self.tests = list(tests)
         self.compositions = list(compositions)
@@ -124,6 +126,10 @@ class Flux:
             mock.patch.object(paquet_auto, "notify_removals", return_value=[]),
             mock.patch.object(paquet_auto, "run_freeze_checks",
                               side_effect=self.log("freeze-checks", (0, "ok", 0.1))),
+            mock.patch.object(paquet_auto, "prepublication_contracts",
+                              side_effect=self.log("contracts", paquet_auto.ContractPass(
+                                  "d" * 40, "e" * 40, self.contract_result or green("contrats")))),
+            mock.patch.object(paquet_auto, "verify_contract_scope"),
             mock.patch.object(paquet_auto, "check_local_tests", side_effect=tests),
             mock.patch.object(paquet_auto, "composition_table", return_value="## Composition\n"),
             mock.patch.object(paquet_auto, "build_manifest", side_effect=manifest),
@@ -179,7 +185,7 @@ class PousseePrecoceTest(unittest.TestCase):
                         "freeze", "ci-full"):
             self.assertLess(names.index(gesture), first_test, (gesture, names))
         self.assertEqual(names[:first_test],
-                         ["freeze-checks", "manifest", "inclusion", "push", "pr",
+                         ["freeze-checks", "manifest", "inclusion", "contracts", "push", "pr",
                           "freeze", "ci-full"])
         head = flux.calls("manifest")[0][1][0]
         self.assertEqual(flux.calls("freeze")[0][1][2], head)

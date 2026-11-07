@@ -328,6 +328,11 @@ class PaquetAutoBanc(unittest.TestCase):
                                                 {"ready": [1], "waiting": []})), \
                 mock.patch.object(paquet_auto, "compose_candidates",
                                   return_value=composition), \
+                mock.patch.multiple(paquet_auto,
+                    contract_budget=mock.Mock(return_value=10),
+                    prepublication_contracts=mock.Mock(return_value=paquet_auto.ContractPass(
+                        "d" * 40, "e" * 40, paquet_auto.TestRun("contrats", [], 0, "", 0.0))),
+                    verify_contract_scope=mock.Mock()), \
                 mock.patch.object(paquet_auto, "run_freeze_checks",
                                   return_value=(0, "ok", 0.1)), \
                 mock.patch.object(paquet_auto, "check_local_tests",
@@ -388,6 +393,11 @@ class PaquetAutoBanc(unittest.TestCase):
                                       {"ready": [1, 2], "waiting": []})), \
                 mock.patch.object(paquet_auto, "compose_candidates",
                                   side_effect=compose_side_effect), \
+                mock.patch.multiple(paquet_auto,
+                    contract_budget=mock.Mock(return_value=10),
+                    prepublication_contracts=mock.Mock(return_value=paquet_auto.ContractPass(
+                        "d" * 40, "e" * 40, paquet_auto.TestRun("contrats", [], 0, "", 0.0))),
+                    verify_contract_scope=mock.Mock()), \
                 mock.patch.object(paquet_auto, "run_freeze_checks",
                                   return_value=(0, "ok", 0.1)), \
                 mock.patch.object(paquet_auto, "check_local_tests",
@@ -444,6 +454,11 @@ class PaquetAutoBanc(unittest.TestCase):
                                       payload)), \
                 mock.patch.object(paquet_auto, "compose_candidates",
                                   side_effect=compose_side_effect), \
+                mock.patch.multiple(paquet_auto,
+                    contract_budget=mock.Mock(return_value=10),
+                    prepublication_contracts=mock.Mock(return_value=paquet_auto.ContractPass(
+                        "d" * 40, "e" * 40, paquet_auto.TestRun("contrats", [], 0, "", 0.0))),
+                    verify_contract_scope=mock.Mock()), \
                 mock.patch.object(paquet_auto, "run_freeze_checks",
                                   return_value=(0, "ok", 0.1)), \
                 mock.patch.object(paquet_auto, "check_local_tests",
@@ -659,6 +674,11 @@ class PaquetAutoBanc(unittest.TestCase):
                                       {"ready": [1, 2, 3], "waiting": []})), \
                 mock.patch.object(paquet_auto, "compose_candidates",
                                   side_effect=fake_compose), \
+                mock.patch.multiple(paquet_auto,
+                    contract_budget=mock.Mock(return_value=10),
+                    prepublication_contracts=mock.Mock(return_value=paquet_auto.ContractPass(
+                        "d" * 40, "e" * 40, paquet_auto.TestRun("contrats", [], 0, "", 0.0))),
+                    verify_contract_scope=mock.Mock()), \
                 mock.patch.object(paquet_auto, "run_freeze_checks",
                                   return_value=(0, "ok", 0.1)), \
                 mock.patch.object(paquet_auto, "check_local_tests",
@@ -714,6 +734,11 @@ class PaquetAutoBanc(unittest.TestCase):
                                       {"ready": [1, 2], "waiting": []})), \
                 mock.patch.object(paquet_auto, "compose_candidates",
                                   return_value=composition), \
+                mock.patch.multiple(paquet_auto,
+                    contract_budget=mock.Mock(return_value=10),
+                    prepublication_contracts=mock.Mock(return_value=paquet_auto.ContractPass(
+                        "d" * 40, "e" * 40, paquet_auto.TestRun("contrats", [], 0, "", 0.0))),
+                    verify_contract_scope=mock.Mock()), \
                 mock.patch.object(paquet_auto, "run_freeze_checks",
                                   return_value=(0, "ok", 0.1)), \
                 mock.patch.object(paquet_auto, "check_local_tests",

@@ -32,9 +32,13 @@ l'ordre, sans agent :
    `ameesh work milestone <porteur> frozen --sha <tête>` et demande
    `ameesh ci run <porteur> --full` — la CI complète part sans attendre les
    tests par unité ;
-8. les tests par unité, pendant la CI : `tests/parts/toujours.txt`,
-   `tests.test_l161f_plan`, `tests.test_cluster` et les modules de test
-   apportés par chaque unité. Un test ciblé **rouge** d'un module **voisin**
+8. les tests par unité, pendant la CI : les modules de test apportés par
+   chaque unité et leurs voisins. La passe de contrats de l'arbre final
+   (plan commun, #6182) précède déjà la poussée, le gel et la ci-full :
+   budget canon, attente de créneau comprise, résultat réutilisé sans rejeu.
+   Une expiration est non concluante et laisse publier avec ci-full ; un
+   contrat négatif suspend cette tentative avant publication ; un arbre
+   modifié invalide la passe et demande une nouvelle composition. Un test ciblé **rouge** d'un module **voisin**
    est situé en rejouant ce test sur les préfixes de l'empilement, dans
    l'ordre (`base + u1`, `base + u1 + u2`, …) : la première unité où il
    apparaît est retirée, son auteur est prévenu, et le paquet est recomposé
@@ -1664,6 +1668,7 @@ def contract_modules(worktree: Path, *, base: str = "",
         if not name:
             continue
         modules.append(name if name.startswith("tests.") else "tests." + name)
+    modules.extend(CONTRACT_MODULES)
     if base and (worktree / "src/ameesh/contract_plan.py").is_file():
         # The candidate's L161f serializes the very same registry/impact union
         # as CI and prevalidation. Map absence keeps the packet contract-only
@@ -1693,7 +1698,6 @@ def contract_modules(worktree: Path, *, base: str = "",
                 chosen = (shared["modules"] if (plan.get("map") or {}).get("used")
                           else shared["contracts"])
                 modules.extend("tests." + name for name in chosen)
-    modules.extend(CONTRACT_MODULES)
     return _dedupe_modules(worktree, modules)
 
 
@@ -1960,7 +1964,7 @@ def run_walled(cmd: list[str], *, cwd: Path, env: dict,
 
 def run_tests(worktree: Path, label: str, modules: list[str], *,
               timeout: int, heavy: bool = False,
-              wall: int | None = None) -> TestRun:
+              wall: int | None = None, failfast: bool = False) -> TestRun:
     """Une série unittest bornée par `timeout` (au-delà : non concluant).
 
     #4271 : avec `heavy`, la série prend un créneau de l'hôte
@@ -1975,7 +1979,8 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
         return TestRun(label=label, modules=[], returncode=0, output="",
                        seconds=0.0)
     start = time.monotonic()
-    cmd = [project_python(worktree), "-m", "unittest", "-q", *modules]
+    cmd = [project_python(worktree), "-m", "unittest", "-q",
+           *(["-f"] if failfast else []), *modules]
     env = python_env(worktree)
     wait = 0
     wrapper = shutil.which("ameesh") if heavy else None
@@ -2006,6 +2011,171 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
                        output=str(exc), seconds=time.monotonic() - start,
                        timed_out=True)
     return save_test_log(result)
+
+
+@dataclass
+class ContractTestRun(TestRun):
+    """Merged module reports, retaining partial/inconclusive evidence."""
+    children: list[TestRun] = field(default_factory=list)
+
+    def _summary(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for child in self.children:
+            for key, value in child._summary().items():
+                out[key] = out.get(key, 0) + value
+        return out
+
+    @property
+    def tests(self) -> int:
+        return sum(child.tests for child in self.children)
+
+    @property
+    def skipped(self) -> int:
+        return sum(child.skipped for child in self.children)
+
+    @property
+    def finished(self) -> bool:
+        return bool(self.children) and all(child.finished for child in self.children)
+
+
+def contract_order(worktree: Path, modules: list[str]) -> list[str]:
+    """Longest measured modules first, historical invariants before fallback."""
+    try:
+        data = json.loads((worktree / "tests/parts/durees.json").read_text())
+        table = data.get(test_driver(worktree), {}) if isinstance(data, dict) else {}
+        if not isinstance(table, dict):
+            table = {}
+    except (OSError, ValueError):
+        table = {}
+    try:
+        names = [line.split("#", 1)[0].strip()
+                 for line in (worktree / CONTRACT_ALWAYS).read_text().splitlines()]
+        legacy = {name if name.startswith("tests.") else "tests." + name
+                  for name in names if name}
+    except OSError:
+        legacy = set()
+    legacy.update(CONTRACT_MODULES)
+    def order(module):
+        duration = table.get(module.removeprefix("tests."), 0)
+        if not isinstance(duration, (int, float)):
+            duration = 0
+        return module not in legacy, -duration, module
+    return sorted(modules, key=order)
+
+
+def run_contract_modules(worktree: Path, modules: list[str], *,
+                         end: float, parallel: int) -> ContractTestRun:
+    """One isolated heavy process per module under a shared wall deadline."""
+    if not modules:
+        return ContractTestRun("contrats", [], None, "aucun contrat sélectionné", 0.0)
+    stop = threading.Event()
+    def module_job(module):
+        def run():
+            remaining = int(end - time.monotonic())
+            if stop.is_set():
+                return TestRun("contrats", [module], None,
+                               "module non joué après un contrat négatif", 0.0)
+            if remaining <= 0:
+                return budget_spent("contrats", [module])
+            result = run_tests(worktree, "contrats " + module, [module], timeout=remaining,
+                               heavy=True, wall=remaining, failfast=True)
+            if result.real_failure:
+                stop.set()
+            return result
+        return run
+    children = _run_series([module_job(m) for m in contract_order(worktree, modules)],
+                           parallel=max(1, parallel))
+    negative = any(run.real_failure for run in children)
+    incomplete = any(run.inconclusive for run in children)
+    rc = 1 if negative else (None if incomplete else 0)
+    output = "\n".join("=== %s (%.3f s, rc=%s) ===\n%s" % (
+        ", ".join(run.modules), run.seconds, run.returncode, run.output) for run in children)
+    return ContractTestRun("contrats", list(modules), rc, output, 0.0,
+                           timed_out=not negative and any(r.timed_out for r in children),
+                           children=children)
+
+
+@dataclass
+class ContractPass:
+    """Result bound to the final, clean Git tree, including its manifest."""
+    head: str
+    tree: str
+    run: TestRun
+
+
+def contract_scope(worktree: Path) -> tuple[str, str]:
+    head = _decode(git(worktree, "rev-parse", "HEAD").stdout).strip()
+    tree = _decode(git(worktree, "rev-parse", "HEAD^{tree}").stdout).strip()
+    dirty = _decode(git(worktree, "status", "--porcelain", "--untracked-files=all").stdout)
+    if dirty.strip():
+        raise PaquetAutoError("arbre des contrats hors portée : contenu local modifié ; recomposer")
+    return head, tree
+
+
+def verify_contract_scope(worktree: Path, report: ContractPass) -> None:
+    if contract_scope(worktree) != (report.head, report.tree):
+        raise PaquetAutoError("arbre des contrats hors portée : tête ou arbre changé ; recomposer")
+
+
+def prepublication_contracts(worktree: Path, *, base: str,
+                             budget: int | None, guard=None, expected_head: str = "",
+                             parallel: int = DEFAULT_PARALLEL) -> ContractPass:
+    """Plan + slot wait + isolated execution share one canon budget (#6182).
+
+    A timeout/absent prerequisite records an inconclusive pass, never a green
+    proof. A changed tree refuses this attempt before any publication.
+    """
+    if guard is not None:
+        guard()
+    head, tree = contract_scope(worktree)
+    if expected_head and head != expected_head:
+        raise PaquetAutoError("arbre des contrats hors portée : tête composée changée avant la passe")
+    start = time.monotonic()
+    end = start + budget if budget else start
+    modules = []
+    try:
+        if not budget:
+            raise PaquetAutoError("budget de contrats absent du canon")
+        if shutil.which("ameesh") is None:
+            raise PaquetAutoError("créneau heavy indisponible")
+        modules = contract_modules(worktree, base=base,
+                                   timeout=max(0.1, end - time.monotonic()))
+        remaining = int(end - time.monotonic())
+        if remaining <= 0:
+            run = budget_spent("contrats", modules)
+        else:
+            run = run_contract_modules(worktree, modules, end=end, parallel=parallel)
+    except PaquetAutoError as exc:
+        run = save_test_log(TestRun("contrats", modules, None, str(exc),
+                                   time.monotonic() - start, timed_out=True))
+    run.seconds = time.monotonic() - start
+    report = ContractPass(head, tree, run)
+    verify_contract_scope(worktree, report)
+    if guard is not None:
+        guard()
+    verify_contract_scope(worktree, report)
+    if isinstance(run, ContractTestRun):
+        save_test_log(run)
+    return report
+
+
+def contract_budget(args) -> int | None:
+    """CLI value supplied by the scheduler, otherwise existing compiled policy.
+
+    N-1 keeps its declared unit budget until the new optional key is adopted.
+    No local numeric default silently becomes the prepublication policy.
+    """
+    supplied = getattr(args, "contracts_budget", None)
+    if supplied is not None:
+        return supplied
+    from ameesh import config, mechanics
+    try:
+        policy = mechanics.configured(config.load()).packet_tests
+    except (OSError, ValueError, mechanics.MechanicsError):
+        return None
+    if policy is None:
+        return None
+    return getattr(policy, "contracts_timeout_seconds", None) or policy.unit_timeout_seconds
 
 
 def run_freeze_checks(worktree: Path, *, timeout: int) -> tuple[int, str, float]:
@@ -2498,7 +2668,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                       select=None, on_base=None, guard=None,
                       prefix=None,
                       parallel: int = DEFAULT_PARALLEL,
-                      deadline: float | None = None) -> tuple[list[TestRun], list[int],
+                      deadline: float | None = None,
+                      contract_report: ContractPass | None = None) -> tuple[list[TestRun], list[int],
                                                               list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
@@ -2541,6 +2712,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     compte dans ce temps (`run_tests(wall=…)`) : à l'échéance la série est
     arrêtée, au plus `WALL_GRACE_S` après.
     """
+    contract_run = None
+    if contract_report is not None:
+        verify_contract_scope(worktree, contract_report)
+        contract_run = contract_report.run
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
     own: dict[int, list[dict]] = {}
@@ -2613,7 +2788,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         return bounded("contrats", modules)
 
     jobs = [unit_job("unité #%d" % unit.lot, modules)
-            for unit, _proper, _added, modules in planned] + [contract_job]
+            for unit, _proper, _added, modules in planned]
+    if contract_run is None:
+        jobs.append(contract_job)
     # #4887 : la part de chaque série est calculée au départ, pas à la
     # composition : une série qui finit tôt rend sa part aux suivantes. Une
     # réserve reste pour le rejeu d'un rouge de voisin (base, préfixes), sans
@@ -2638,7 +2815,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             "borne %d s par série, part de la borne totale (#4887)"
             % (len(jobs), min(parallel, len(jobs)), timeout))
     results = _run_series(jobs, parallel=parallel, guard=guard)
-    contract = results.pop()
+    contract = results.pop() if contract_run is None else contract_run
     pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str],
                         set[str]]] = []
     for (unit, proper, added, modules), run in zip(planned, results):
@@ -3001,6 +3178,9 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     ]
     if tests is None:
         lines.append(TESTS_PARALLEL_LINE)
+        lines.append("- Contrats du plan commun : passe bornée sur cet arbre après "
+                     "inclusion et avant poussée ; rapport réutilisé par les tests "
+                     "locaux, résultat à la PR et au porteur (#6182).")
         lines.append("- Modules directs par lot : lus au corps de la PR après "
                      "les tests (#4887).")
         tests = []
@@ -4313,6 +4493,18 @@ def compose_packet(args: argparse.Namespace) -> int:
                     "contrôle d'inclusion rouge sur la tête %s : voir le rapport "
                     "ci-dessus" % head[:12])
             print("inclusion : vert", flush=True)
+            contract_report = prepublication_contracts(
+                worktree, base=base_sha, budget=contract_budget(args), guard=guard, expected_head=head,
+                parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+            contract_run = contract_report.run
+            print("contrats avant publication : %s (%.1f s)%s" % (
+                "NON CONCLUANT" if contract_run.inconclusive else
+                ("vert" if contract_run.green else "ROUGE"), contract_run.seconds,
+                (" — " + contract_run.log_path) if contract_run.log_path else ""), flush=True)
+            # A red report must reach the existing attribution/removal path.
+            # Until prepublication attribution is available (#6183), publish
+            # with ci-full rather than suspend the same candidates forever.
+            # check_local_tests consumes this exact report without replaying it.
             if not args.local:
                 if guard is not None:
                     guard()
@@ -4325,6 +4517,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                             % (branch, state.lower()))
                 check_pause(worktree, getattr(args, "pause_project", "") or "",
                             args.target)
+                verify_contract_scope(worktree, contract_report)
                 push_branch(worktree, branch, force_lease=lease)
                 print("poussée : %s%s" % (branch, " (recomposition)"
                                           if lease else ""), flush=True)
@@ -4344,7 +4537,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                     worktree, composition, timeout=args.tests_timeout,
                     base_sha=base_sha, guard=tests_guard,
                     parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
-                    deadline=deadline)
+                    deadline=deadline, contract_report=contract_report)
             except CarrierSettled as settled:
                 rc = interrupted_by_carrier(args, worktree, branch, head,
                                             settled.state)
@@ -4578,6 +4771,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--python", default=None,
                         help="interpréteur des outils enfants (défaut : un "
                              "Python du projet qui porte psycopg)")
+    parser.add_argument("--contracts-budget", type=int, default=None,
+                        help="borne canon de la passe avant publication, attente comprise")
     parser.add_argument("--tests-timeout", type=int, default=DEFAULT_TIMEOUT,
                         help="borne d'une exécution unittest (défaut : %d s)"
                         % DEFAULT_TIMEOUT)
@@ -4621,6 +4816,8 @@ def main(argv: list[str] | None = None) -> int:
         _PYTHON_OVERRIDE = str(Path(args.python).resolve())
 
     try:
+        if args.contracts_budget is not None and args.contracts_budget <= 0:
+            raise InputError("--contracts-budget doit être strictement positif")
         if args.replay:
             if args.carrier or args.local:
                 raise InputError("--replay : ni --carrier ni --local")
