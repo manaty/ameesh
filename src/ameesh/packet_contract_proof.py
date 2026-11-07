@@ -61,14 +61,15 @@ def read(item, *, head, tree, target):
         note = str(event.get("note") or "")
         if not note.startswith(MARK):
             continue
+        # Every later projection supersedes the previous evidence, even when
+        # its payload or scope cannot be verified.
+        found = None
         try:
             value = json.loads(note[len(MARK):])
         except ValueError:
             continue
         if not isinstance(value, dict) or value.get("head") != head:
             continue
-        # A later malformed/stale projection cannot revive an earlier green.
-        found = None
         if (value.get("schema") == SCHEMA and value.get("tree") == tree and
                 value.get("target") == target and
                 isinstance(value.get("base"), str) and

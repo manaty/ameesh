@@ -53,6 +53,15 @@ class EvidenceTest(TestCase):
         self.assertEqual(self.read(event())['result']['state'], 'green')
         self.assertIsNone(self.read(event(), event(tree='f' * 40)))
 
+    def test_later_unverifiable_projection_invalidates_green(self):
+        for payload in ('{', 'null', '[]', '{}', '{"head": null}',
+                        '{"head": []}', '{"head": "unreadable"}'):
+            with self.subTest(payload=payload):
+                self.assertIsNone(self.read(event(), {'note': proof.MARK + payload}))
+        self.assertIsNone(self.read(event(), event(head='f' * 40)))
+        self.assertEqual(self.read(event(), {'note': 'unrelated'})['result']['state'], 'green')
+        self.assertEqual(self.read({'note': proof.MARK + '{'}, event())['result']['state'], 'green')
+
     def test_partial_negative_has_priority_and_timeout_is_not_green(self):
         red = auto.TestRun('a', ['tests.test_a'], 1,
                            'FAIL: test_a (tests.test_a.T.test_a)\n', 1)
