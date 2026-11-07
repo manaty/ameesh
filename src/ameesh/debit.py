@@ -56,6 +56,10 @@ Un lot relu (tous ses avis rendus) dont `branch_target` est la branche d'un
 autre lot **ouvert** n'est pas une attente de paquet : il ne peut entrer
 qu'avec ce lot, dont le hold couvre déjà l'attente. Le rapport le marque
 `depends_on` et ne produit ni `qa_merge` ni sortie 2 pour lui (#3437).
+#6214 : un prérequis explicite (`ameesh work dependencies`) encore bloquant
+suit la même règle — le lot n'est pas une attente de paquet, le rapport nomme
+le prérequis (`depends_on`, `blocking_dependencies`) et `--check` ne sort 2
+que si le prérequis lui-même dépasse son seuil.
 
 #3256 B : la section `capacity` (spec `docs/design/3256-debit-file.md` §3) —
 agents réveillables au repos, heures-agent au repos, lots démarrables, lot de
@@ -1082,6 +1086,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
           ci_unreadable: Iterable[str] = (),
           fixes: Iterable[Mapping[str, Any]] | None = None,
           packets: Iterable[Mapping[str, Any]] = (),
+          dependencies: Mapping[int, Iterable[Mapping[str, Any]]] | None = None,
           families: Iterable[str] = (),
           external_executors: Mapping[str, Mapping[str, Any]] | None = None,
           review_pilots: Mapping[str, str] | None = None,
@@ -1115,7 +1120,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
     retirées comprises (`work.external_executor_declarations`). Elles nomment
     le responsable humain d'une réservation et font dire au débit qu'une
     réservation dont le système est retiré n'a plus personne : le pilote la
-    lève. Sans cette lecture, la ligne garde le texte générique de #3447."""
+    lève. Sans cette lecture, la ligne garde le texte générique de #3447.
+
+    `dependencies` (#6214) : les prérequis explicites, groupés par lot
+    (`work_dependencies.grouped`). Un lot relu dont un prérequis est encore
+    bloquant n'est pas une attente `qa_merge` : l'attente est celle du
+    prérequis, qui nomme alors le lot dépendant. Une contrainte non bloquante
+    (prérequis fusionné ou fermé) ne change rien."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
     # la déclaration d'attente externe d'un hold.
@@ -1128,6 +1139,24 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if devices is None else dict(devices)
     items = [dict(row) for row in items or ()]
     by_id = {int(row["id"]): row for row in items}
+    # #6214 : les prérequis explicites encore bloquants, groupés par lot
+    # (`work_dependencies.grouped`). Une contrainte non bloquante (prérequis
+    # fusionné ou fermé) ne retient rien, comme #3437 ignore un parent terminé.
+    blocked_by: dict[int, set[int]] = {}
+    for ident, edges in (dependencies or {}).items():
+        try:
+            lot = int(ident)
+        except (TypeError, ValueError):
+            continue
+        for edge in edges or ():
+            if not edge.get("blocking"):
+                continue
+            try:
+                blocker = int(edge.get("blocker_id"))
+            except (TypeError, ValueError):
+                continue
+            if blocker != lot:
+                blocked_by.setdefault(lot, set()).add(blocker)
     agents = [dict(row) for row in agents or ()]
     # #5430 : la famille d'un verdict est prouvée par le registre (harness)
     # et les familles du canon, jamais supposée du nom. Un harnais inconnu ne
@@ -1461,13 +1490,22 @@ def build(*, items: Iterable[Mapping[str, Any]],
 
     # Une cible qui est la branche d'un lot encore ouvert est une dépendance :
     # le lot ne peut pas entrer seul dans un paquet, il suit le lot parent
-    # (dont le hold, s'il y en a un, porte déjà l'attente) (#3437).
+    # (dont le hold, s'il y en a un, porte déjà l'attente) (#3437). #6214 :
+    # un prérequis explicite encore bloquant suit la même règle ; le rapport
+    # le nomme, et le prérequis porte le lot dépendant.
     dependents_by_lot: dict[int, list[int]] = {}
     for row in qa:
-        parent = _target_lot(int(row["lot"]), by_id[int(row["lot"])], open_branches)
+        ident = int(row["lot"])
+        parent = _target_lot(ident, by_id[ident], open_branches)
         if parent is not None:
             row["depends_on"] = parent
-            dependents_by_lot.setdefault(parent, []).append(int(row["lot"]))
+            dependents_by_lot.setdefault(parent, []).append(ident)
+        prerequisites = sorted(blocked_by.get(ident, ()))
+        if prerequisites:
+            row.setdefault("depends_on", prerequisites[0])
+            row["blocking_dependencies"] = prerequisites
+            for blocker in prerequisites:
+                dependents_by_lot.setdefault(blocker, []).append(ident)
 
     # -- tableau des attentes de plus de 2 h --------------------------------
     waits: list[dict] = []
@@ -1475,7 +1513,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
     def dependents_of(lot) -> dict:
         """Les lots relus que ce lot transporte : leur attente est la sienne."""
         children = dependents_by_lot.get(int(lot))
-        return {"dependents": sorted(children)} if children else {}
+        return {"dependents": sorted(set(children))} if children else {}
 
     def add_wait(kind, entry, since, who, gesture, level=1, human=False, **extra):
         age = _age(now, since)
@@ -1518,8 +1556,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
                      human=_human_wait(state), cause=cause or None,
                      missing=int(row.get("missing_reviews") or 0))
         else:
-            if row.get("depends_on"):
-                continue                # l'attente est celle du lot parent
+            if row.get("depends_on") or row.get("blocking_dependencies"):
+                continue                # l'attente est celle du prérequis
             add_wait("qa_merge", row, row["frozen_ts"], "paquet",
                      GESTURES["qa_merge"], level=2, human=_human_wait(state),
                      **dependents_of(row["lot"]))
@@ -2439,6 +2477,17 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
     if len(items) >= MAX_ITEMS:
         unreadable.append("open-lot limit reached (%d): list truncated" % MAX_ITEMS)
     ids = [int(row["id"]) for row in items]
+    # #6214 : les prérequis explicites des lots lus (`ameesh work
+    # dependencies`). Une lecture en échec est nommée, et le repli garde
+    # l'ancien comportement : le rapport ne retire pas un lot sur une lecture
+    # absente, l'auditeur voit l'échec dans `unreadable`.
+    dependencies: dict[int, list[dict]] = {}
+    try:
+        from . import work_dependencies
+        dependencies = work_dependencies.grouped(db, ids)
+    except Exception as exc:  # noqa: BLE001 - lecture nommée, jamais devinée
+        unreadable.append("blocking dependencies unreadable: %s"
+                          % " ".join(str(exc).split())[:200])
     # #3256 C : la mesure qa_merge part des **membres de paquet** de la
     # fenêtre, jamais des seuls lots ouverts (`_ITEMS_SQL` écarte un lot
     # fusionné, alors que son attente est justement mesurée). Les jalons de ces
@@ -2594,7 +2643,8 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
                    holds=holds, closure_allowed=closure_allowed,
                    ci_unreadable=ci_unreadable, fixes=fixes,
-                   packets=packets, families=families,
+                   packets=packets, dependencies=dependencies,
+                   families=families,
                    external_executors=external_executors,
                    review_pilots=review_pilots,
                    closed_hosts=closed_hosts, zone=zone)
