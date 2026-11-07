@@ -23,10 +23,11 @@ project, periodically:
 Only `already done` is **deterministic**: the pass closes it itself (`closed`,
 reason `done`), with the proof written in the lot's journal. Duplicates,
 contradictions and probably-done/obsolete lots are **never** closed here: they
-go into **one digest per project** addressed to the project's PO
-(`notify.default_human` when the canon has no responsible package), so the PO
-can answer with a typed link (`duplicates`, `conflicts_with`) or a justified
-closure.
+go into **one digest per project** addressed to the project's recipients (the
+ones declared for the project under `coherence.recipients` in the host
+configuration, else the responsible WorkPackage, else `notify.default_human`),
+so the PO can answer with a typed link (`duplicates`, `conflicts_with`) or a
+justified closure.
 
 Command::
 
@@ -608,6 +609,65 @@ def _note(finding: dict, report: dict) -> str:
                (report.get("base_sha") or "?")[:12]))
 
 
+#: the host-configuration key of the digest recipients (canon §7: no project
+#: name here, every value comes from the configuration)
+CONFIG_KEY = "coherence"
+#: the only sub-key of `coherence` today
+CONFIG_KEYS = ("recipients",)
+
+
+def parse_config(cfg) -> dict[str, tuple[str, ...]]:
+    """The digest recipients declared per project in the host configuration.
+
+    Shape::
+
+        {"coherence": {"recipients": {"<project>": "human:<id>",
+                                      "<other>": ["human:<id>", …]}}}
+
+    A bare human id (`po`) is read as `human:po`, like `notify.default_human`.
+    The block is optional: a project it does not name keeps the historical
+    resolution (`_po_of`). A malformed block raises `CoherenceError` instead
+    of falling back silently to the default human: a typo must not send a
+    project's digest to the wrong inbox. No project or human name is
+    hard-coded here (canon §7).
+    """
+    raw = getattr(cfg, CONFIG_KEY, None)
+    if raw in (None, {}, ""):
+        return {}
+    if not isinstance(raw, dict):
+        raise CoherenceError("coherence: a JSON object is expected")
+    unknown = sorted(set(raw) - set(CONFIG_KEYS))
+    if unknown:
+        raise CoherenceError("coherence: unknown key(s) %s" % ", ".join(unknown))
+    declared = raw.get("recipients")
+    if declared is None:
+        declared = {}
+    if not isinstance(declared, dict):
+        raise CoherenceError(
+            "coherence.recipients: an object {project: human:<id>} is expected")
+    from .notify import normalize_human
+    out: dict[str, tuple[str, ...]] = {}
+    for project, value in declared.items():
+        name = str(project or "").strip()
+        if not name:
+            raise CoherenceError("coherence.recipients: an empty project name")
+        values = list(value) if isinstance(value, (list, tuple)) else [value]
+        if not values:
+            raise CoherenceError(
+                "coherence.recipients.%s: at least one recipient is required" % name)
+        recipients: list[str] = []
+        for item in values:
+            human = normalize_human(item)
+            if human is None:
+                raise CoherenceError(
+                    "coherence.recipients.%s: `human:<id>` expected, not %r"
+                    % (name, item))
+            if human not in recipients:
+                recipients.append(human)
+        out[name] = tuple(recipients)
+    return out
+
+
 def _po_of(db, cfg, project: str) -> Optional[str]:
     """The project's PO: a responsible WorkPackage, else the default human."""
     try:
@@ -639,6 +699,15 @@ def _po_of(db, cfg, project: str) -> Optional[str]:
     except Exception:  # noqa: BLE001 - no declared human
         pass
     return None
+
+
+def _recipients_of(db, cfg, project: str) -> list[str]:
+    """The digest recipients of `project`: configuration first, then the PO."""
+    configured = parse_config(cfg)
+    if project in configured:
+        return list(configured[project])
+    po = _po_of(db, cfg, project)
+    return [po] if po else []
 
 
 def _open(item: dict) -> bool:
@@ -721,26 +790,43 @@ def apply_report(db, report: dict, *, cfg=None, actor: str = ACTOR,
         pending.extend(refused)
     if not digest or not pending:
         return report
-    recipient = _po_of(db, cfg, project)
-    if not recipient:
+    try:
+        recipients = _recipients_of(db, cfg, project)
+    except CoherenceError as exc:  # a typo never falls back to the wrong inbox
+        report["digest"] = {"sent": False, "error": str(exc)[:300]}
+        return report
+    if not recipients:
         report["digest"] = {"sent": False, "error": "no PO found for %s" % project}
         return report
     body = format_digest(project, pending, report)
     key = "coherence:%s:%s" % (
         re.sub(r"[^A-Za-z0-9._-]+", "-", project) or "project",
         hashlib.sha256(body.encode("utf-8")).hexdigest()[:32])
-    try:
-        message_id = mail.send(
-            db, actor, recipient, body, kind="event",
-            payload={"coherence": {"project": project,
-                                   "findings": len(pending)}},
-            idempotency_key=key)
-    except Exception as exc:  # noqa: BLE001 - the closures stay, the digest is reported
-        report["digest"] = {"sent": False, "error": str(exc)[:300],
-                            "recipient": recipient}
-        return report
-    report["digest"] = {"sent": True, "message_id": int(message_id),
-                        "recipient": recipient, "findings": len(pending)}
+    messages = []
+    errors = []
+    for recipient in recipients:
+        try:
+            message_id = mail.send(
+                db, actor, recipient, body, kind="event",
+                payload={"coherence": {"project": project,
+                                       "findings": len(pending)}},
+                idempotency_key=key)
+        except Exception as exc:  # noqa: BLE001 - one recipient never hides another
+            errors.append("%s: %s" % (recipient, str(exc)[:200]))
+            continue
+        messages.append({"recipient": recipient, "message_id": int(message_id)})
+    digest = {"sent": not errors and bool(messages),
+              "recipients": list(recipients),
+              "messages": messages,
+              "findings": len(pending)}
+    if len(recipients) == 1:
+        # historical shape: one recipient and its message id (docs, scripts)
+        digest["recipient"] = recipients[0]
+        if messages:
+            digest["message_id"] = messages[0]["message_id"]
+    if errors:
+        digest["error"] = "; ".join(errors)[:300]
+    report["digest"] = digest
     return report
 
 
@@ -877,10 +963,16 @@ def format_report(report: dict) -> str:
                         closure.get("reason") or "?",
                         closure.get("kind") or "?"))
     digest = report.get("digest") or {}
-    if digest.get("sent"):
+    messages = digest.get("messages") or []
+    if messages:
+        for message in messages:
+            lines.append("  digest        %s (message %s)"
+                         % (message.get("recipient") or "?",
+                            message.get("message_id")))
+    elif digest.get("sent"):  # reports kept before #6093
         lines.append("  digest        %s (message %s)"
                      % (digest.get("recipient") or "?",
                         digest.get("message_id")))
-    elif digest.get("error"):
+    if digest.get("error"):
         lines.append("  digest        refusé — %s" % digest["error"])
     return "\n".join(lines)
