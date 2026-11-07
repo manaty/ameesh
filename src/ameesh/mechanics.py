@@ -123,6 +123,7 @@ _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "re
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
                   "contract_selection")
 _PRODUCTION_KEYS = ("branch",)
+_CONTRACT_SELECTION_KEYS = ("registry",)
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
 #: ni fin en `/`, `.` ou `.lock` — jamais une ref arbitraire ni un commit
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -187,7 +188,7 @@ class ContractSelection:
 def _contract_selection(value, where: str) -> ContractSelection:
     from .contract_selection import relative_path
 
-    data = _mapping(value, where, ("registry",))
+    data = _mapping(value, where, _CONTRACT_SELECTION_KEYS)
     path = data.get("registry")
     if not relative_path(path) or any(c in path for c in "*?[]"):
         raise MechanicsError(where + ".registry: repository-relative file required")
