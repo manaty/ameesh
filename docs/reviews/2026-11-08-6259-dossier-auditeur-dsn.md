@@ -1,4 +1,4 @@
-# #6259 — Mise en service de la lecture seule de l'auditeur : dossier préparé (bureau, aucun geste fait) — v2
+# #6259 — Mise en service de la lecture seule de l'auditeur : dossier préparé (bureau, aucun geste fait) — v3
 
 Préparé le 2026-11-08T02:58Z par BG (bureau, famille claude). Source : ameesh v1.44.0 `e256558523b3c354554ed69790db61a17607b65b`.
 
@@ -23,14 +23,19 @@ Tous transactionnels et idempotents ; ils échouent et annulent tout si le contr
 ## 3. Geste owner (sur l'hôte central, rôle superuser), dans cet ordre — STOP au premier échec
 
 ```sh
-cd <checkout ameesh @ e256558523b3c354554ed69790db61a17607b65b>
-export PGOPTIONS='-c search_path=public'
-DSN='<DSN superuser local de la base ameesh>'
-psql "$DSN" -X -v ON_ERROR_STOP=1 -f deploy/sql/role-superviseur.sql
-psql "$DSN" -X -v ON_ERROR_STOP=1 -f deploy/sql/role-superviseur-contenus.sql
-psql "$DSN" -X -v ON_ERROR_STOP=1 -f deploy/sql/role-auditeur.sql
-psql "$DSN" -X -c '\password auditeur_lecture'     # mot de passe généré, jamais en courrier
+(
+  set -eu
+  cd <checkout ameesh @ e256558523b3c354554ed69790db61a17607b65b>
+  export PGOPTIONS='-c search_path=public'
+  DSN='<DSN superuser local de la base ameesh>'
+  psql "$DSN" -X -v ON_ERROR_STOP=1 -f deploy/sql/role-superviseur.sql
+  psql "$DSN" -X -v ON_ERROR_STOP=1 -f deploy/sql/role-superviseur-contenus.sql
+  psql "$DSN" -X -v ON_ERROR_STOP=1 -f deploy/sql/role-auditeur.sql
+  psql "$DSN" -X -c '\password auditeur_lecture'     # mot de passe généré, jamais en courrier
+)
 ```
+
+`set -e` dans le sous-shell arrête la séquence au premier psql en échec (ON_ERROR_STOP n'arrête que le psql courant). **Transaction par script** : chacun ouvre et valide la sienne ; il n'y a pas de transaction globale des trois. Un échec au 2e ou 3e laisse les précédents appliqués (idempotents, relançables) ; rien à défaire avant de corriger et relancer.
 
 Contrôle après (lecture) : `SELECT rolname, rolcanlogin, rolconfig FROM pg_roles WHERE rolname='auditeur_lecture';` → LOGIN, `{default_transaction_read_only=on,jit=off}`.
 
@@ -49,3 +54,6 @@ Le `.pgpass` de `ameesh` sur AG2 est lisible par **tous** les agents qui tournen
 ## 6. Retour arrière
 
 `DROP ROLE auditeur_lecture` (après `REVOKE` des deux appartenances) par l'owner ; retrait du drop-in et de la ligne .pgpass ; les rôles superviseur NOLOGIN peuvent rester (aucune connexion possible sous leur nom).
+
+
+v3 (03:1xZ) : §3 en sous-shell `set -eu`, transaction par script explicitée (avis B ameesh-cx3 #199936).
