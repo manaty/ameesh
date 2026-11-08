@@ -44,7 +44,7 @@ class FakeVM:
     def __init__(self):
         self.up, self.provider = True, 'running'
         self.calls, self.launches, self.receipt = [], [], None
-        self.failing = set()
+        self.failing, self.unreachable = set(), {}
         self.on_halt = self.on_start = None
 
     def run(self, argv, timeout, *, capture=False):
@@ -54,6 +54,8 @@ class FakeVM:
         if not self.up:
             return 255, b'', b'ssh: connect to host 192.0.2.10 port 22: Connection timed out\n'
         name = remote[0].rsplit('/', 1)[-1]
+        if name in self.unreachable:  # the transport, not the guest
+            return self.unreachable[name], b'', b''
         if name in self.failing:
             return 1, b'', b''
         if name == 'sudo':
@@ -94,11 +96,12 @@ class Files:
         self.addCleanup(shutil.rmtree, self.dir, True)
         state = self.dir / 'state'
         state.mkdir(mode=0o700)
-        for name in ('key', 'known_hosts'):
+        for name in ('key', 'known_hosts', 'ameesh.toml'):
             (self.dir / name).write_text('x')
             os.chmod(self.dir / name, 0o600)
         self.cible = example()
-        self.cible.update(host='burst', probe_agent='burst-probe', state_dir=str(state))
+        self.cible.update(host='burst', probe_agent='burst-probe', state_dir=str(state),
+                          ameesh_config=str(self.dir / 'ameesh.toml'))
         self.cible['ssh'].update(identity_file=str(self.dir / 'key'),
                                  known_hosts=str(self.dir / 'known_hosts'))
         self.path = self.dir / 'cible.json'
@@ -148,12 +151,18 @@ class TargetTest(Files, unittest.TestCase):
         bad(lambda v: v['remote'].update(health=[]))
         bad(lambda v: v['remote'].pop('alive'))
         bad(lambda v: v.update(previous_boot_end='('))
+        bad(lambda v: v['remote'].update(halt=['poweroff']))
+        bad(lambda v: v['remote'].update(health=[['/bin/true'], ['doctor']]))
 
     def test_private_files_required(self):
         os.chmod(self.path, 0o644)
         self.assertEqual(cmd.main(['quiesce', str(self.path)], natif=mock.Mock(),
                                   runner=self.vm.run), 1)
         self.write()
+        os.chmod(self.dir / 'ameesh.toml', 0o644)
+        self.assertEqual(cmd.main(['quiesce', str(self.path)], natif=mock.Mock(),
+                                  runner=self.vm.run), 1)
+        os.chmod(self.dir / 'ameesh.toml', 0o600)
         os.chmod(self.dir / 'key', 0o640)
         self.assertEqual(cmd.main(['quiesce', str(self.path)], natif=mock.Mock(),
                                   runner=self.vm.run), 1)
@@ -417,6 +426,25 @@ class CloudCycleTest(Files, PgTestCase):
         with FRESH:
             self.assertEqual(self.tick(), 'health pending')  # same launch, no second one
             self.complete()
+            self.assertEqual(self.tick(), 'ready')
+        self.assertEqual(len(self.vm.launches), 1)
+
+    def test_transport_cut_after_the_receipt_is_a_wait(self):
+        # #6252 B (impl-03): no answer from ssh says nothing about the guest.
+        self.returning()
+        self.cible_marker()
+        with FRESH:
+            self.assertEqual(self.tick(), 'probe admitted')
+            self.assertEqual(self.tick(), 'health pending')
+            self.complete()
+            for cut in (None, 255, 'unstarted'):
+                self.vm.unreachable = {'runners': cut}
+                self.assertEqual(self.tick(), 'health pending')
+                self.assertEqual(self.control(), ('returning', False, 'burst-probe'))
+            self.vm.unreachable = {'journalctl': None}
+            self.assertEqual(self.tick(), 'health pending')
+            self.assertTrue(self.marker('halt').exists())
+            self.vm.unreachable = {}
             self.assertEqual(self.tick(), 'ready')
         self.assertEqual(len(self.vm.launches), 1)
 

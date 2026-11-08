@@ -209,9 +209,10 @@ privée au compte opérateur (0600, sans lien). Elle fixe :
   `known_hosts` (non inscriptible par d'autres) ;
 - `connect_timeout_s` et `budget_s` (au plus 9,5 s, sous la borne de 10 s du
   worker) ;
-- `ameesh_config`, la configuration de lecture de la base, sans clé cloud ;
+- `ameesh_config`, la configuration de lecture de la base, sans clé cloud,
+  privée elle aussi ;
 - `state_dir`, le `StateDirectory` de l'unité (0700) ;
-- `previous_boot_end` et les argv distants.
+- `previous_boot_end` et les argv distants, chacun d'exécutable absolu.
 
 Chaque appel prend d'abord le verrou opérateur de sa VM (`flock` non
 bloquant sur `lock.<hôte>.json` dans `state_dir`). Deux invocations
@@ -246,7 +247,10 @@ SSH tourne en `-F none` et `BatchMode`, avec `StrictHostKeyChecking=yes`,
   courrier), tous à 0. Après un `halt`, la dernière ligne de `previous_boot`
   (`journalctl -b -1`) doit correspondre à `previous_boot_end`. Une
   réadmission (après un refus) relance une seule sonde, avec un nouveau nonce.
-  Base ou transport indisponible : 75, borné par `health_deadline_s`.
+  Base ou transport indisponible (borne atteinte, `ssh` non lancé, 255 de
+  `ssh` lui-même) : 75, borné par `health_deadline_s`, y compris pendant les
+  contrôles de santé et la lecture du journal précédent. Seule une commande
+  distante qui répond non zéro est un échec (1).
 - `reconcile` : contrôle fermé en `returning` sur `probe_agent`, puis chaque
   argv distant `reconcile` à 0 ; n'ouvre jamais les prises et ne force jamais
   `lost`.

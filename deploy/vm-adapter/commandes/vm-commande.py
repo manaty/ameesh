@@ -117,6 +117,8 @@ def _argv(value, *, templated=False):
             or not all(isinstance(a, str) and a and '\x00' not in a and '\n' not in a
                        for a in value)):
         raise Refus('fixed remote argv required')
+    if not value[0].startswith('/'):
+        raise Refus('absolute remote executable required')
     if not templated and any('{' + f + '}' in a for a in value for f in FIELDS):
         raise Refus('substitution outside the probe commands')
     return list(value)
@@ -252,13 +254,24 @@ class Commande:
 
     def checks(self, key):
         """Every remote argv of `key` answers 0, in order, within the budget."""
-        return all(self.ssh(argv)[0] == 0 for argv in self.t['remote'][key])
+        return self.outcome(key) == 'ok'
+
+    def outcome(self, key):
+        """'ok', 'transport' (no answer: bound reached, ssh not started, ssh's
+        own 255) or 'failed' (a remote command answered non-zero). Stops at
+        the first argv that is not 'ok'."""
+        for argv in self.t['remote'][key]:
+            verdict = transport(self.ssh(argv)[0])
+            if verdict != 'ok':
+                return verdict
+        return 'ok'
 
     def preflight(self):
         s = self.t['ssh']
         _private(s['identity_file'])
         _private(s['known_hosts'], readable_by_others=True)
         _private(self.t['state_dir'], directory=True)
+        _private(self.t['ameesh_config'])
 
     # -- private state ---------------------------------------------------------
     def path(self, name):
@@ -280,6 +293,12 @@ class Commande:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp, path)
+        # The intent survives a crash only once the directory entry is durable.
+        directory = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     def exclusive(self):
         """The operator lock of this VM, held by the caller until it closes
@@ -373,10 +392,15 @@ class Commande:
         verdict = receipt(out, launch) if code == 0 else 'pending'
         if verdict != 'ok':
             return WAIT if verdict == 'pending' else 1
-        if not self.checks('health'):
-            return 1
+        # Transport unavailable is a wait (bounded by health_deadline_s), a
+        # remote check that answers non-zero is a real health failure.
+        verdict = self.outcome('health')
+        if verdict != 'ok':
+            return WAIT if verdict == 'transport' else 1
         if self.load('halt') is not None:
             code, out, _err = self.ssh(self.t['remote']['previous_boot'], capture=True)
+            if transport(code) == 'transport':
+                return WAIT
             lines = [l for l in out.decode('utf-8', 'replace').splitlines() if l.strip()]
             if (code != 0 or len(out) > OUTPUT or not lines
                     or not re.fullmatch(self.t['previous_boot_end'], lines[-1].strip())):
@@ -389,6 +413,14 @@ class Commande:
         if control.get('return_probe') != self.t['probe_agent']:
             return 1
         return 0 if self.checks('reconcile') else 1
+
+
+def transport(code):
+    """ssh's own 255, a bound reached (None) or no ssh at all ('unstarted')
+    say nothing about the guest; only a remote answer is a verdict."""
+    if code == 0:
+        return 'ok'
+    return 'transport' if code in (None, 'unstarted', 255) else 'failed'
 
 
 def receipt(raw, launch):
