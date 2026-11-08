@@ -77,7 +77,17 @@ MAX_MANIFESTE_BYTES = 1024 * 1024
 #: normal), crypto (canal nexlink) et contrats (coverage/PyYAML, passe du
 #: composeur, #6309). La préparation les installe et les contrôle AVANT la
 #: bascule : une dépendance manquante ne rejoint jamais le venv vivant.
+#: Sur ce chemin historique, pip résout les bornes basses du pyproject
+#: (coverage>=7.10, pyyaml>=6) depuis l'index, comme psycopg>=3.2 et
+#: cryptography>=41 : les versions peuvent s'écarter des épingles exactes de
+#: `runtime-pins.txt` (coverage 7.17.2, pyyaml 6.0.3). Écart accepté (#6311) :
+#: la source commune est le chemin verrouillé (#5711), seul à installer les
+#: épingles, et la pose L2 décide du basculement.
 HOST_EXTRAS = "psycopg,crypto,contrats"
+#: #6311 : extras qu'une source ancienne peut ne pas déclarer (`contrats`
+#: avant #6309). Un bascule.py copié du poste ne les exige que si le
+#: pyproject de `--src` les déclare ; illisible, la règle reste stricte.
+EXTRAS_SELON_SOURCE = ("contrats",)
 CURRENT = "venv-courant"         # lien : version vivante
 REPORT = "venv.precedent"        # fichier : version précédente enregistrée
 LAUNCHERS = ".bascule-lanceurs"  # marqueur : <venv> porte les lanceurs
@@ -218,10 +228,31 @@ def _creer_venv(directory, python):
     _run([python, "-m", "venv", directory])
 
 
+def _extras_hote(src):
+    """Les extras d'hôte que la source `src` permet d'exiger (#6311).
+
+    Un extra de `EXTRAS_SELON_SOURCE` n'est retiré que si le pyproject de la
+    source est lu et ne le déclare pas (ancien SHA) : pip l'ignorerait avec
+    un simple avertissement, puis les contrôles refuseraient ses modules.
+    Pyproject absent ou illisible : tous les extras restent exigés.
+    """
+    extras = HOST_EXTRAS.split(",")
+    try:
+        import tomllib
+        with open(os.path.join(src, "pyproject.toml"), "rb") as handle:
+            declares = tomllib.load(handle)["project"]["optional-dependencies"]
+    except (ImportError, OSError, ValueError, KeyError, TypeError):
+        return extras
+    if not isinstance(declares, dict):
+        return extras
+    return [extra for extra in extras
+            if extra not in EXTRAS_SELON_SOURCE or extra in declares]
+
+
 def _pip_install(directory, src):
     pip = os.path.join(directory, "bin", "pip")
     _run([pip, "install", "-q", "--force-reinstall", "--no-deps", src])
-    _run([pip, "install", "-q", "%s[%s]" % (src, HOST_EXTRAS)])
+    _run([pip, "install", "-q", "%s[%s]" % (src, ",".join(_extras_hote(src)))])
 
 
 def marqueur_verrouille(version, lock_sha256):
@@ -434,7 +465,7 @@ def _verifier_shebang(ameesh, python):
         refuser("ligne 2 %r : interpréteur attendu %r" % (execution, python))
 
 
-def _controles(directory, env=None, cryptography=True):
+def _controles(directory, env=None, cryptography=True, contrats=True):
     """Imports, point d'entrée et shebang : tout doit répondre AVANT la bascule.
 
     #3619 : le venv historique d'hôte porte l'extra `cryptography` (canal
@@ -445,13 +476,19 @@ def _controles(directory, env=None, cryptography=True):
     extra (ni canal nexlink, ni passe de contrats du composeur) : ses
     contrôles portent sur psycopg, psutil et ameesh, et le manifeste scellé
     pinne déjà l'inventaire exact des distributions.
+    #6311 : `contrats` faux (source sans cet extra) ne retire que coverage
+    et yaml des imports exigés.
     """
     python = os.path.join(directory, "bin", "python")
     ameesh = os.path.join(directory, "bin", "ameesh")
     _verifier_shebang(ameesh, python)
-    imports = ("import psycopg, cryptography, coverage, yaml, ameesh; print('imports ok')"
-               if cryptography else
-               "import psycopg, psutil, ameesh; print('imports ok')")
+    if not cryptography:
+        imports = "import psycopg, psutil, ameesh; print('imports ok')"
+    elif contrats:
+        imports = ("import psycopg, cryptography, coverage, yaml, ameesh; "
+                   "print('imports ok')")
+    else:
+        imports = "import psycopg, cryptography, ameesh; print('imports ok')"
     _run([python, "-c", imports], stdout=subprocess.DEVNULL, env=env)
     _run([ameesh, "--version"], stdout=subprocess.DEVNULL, env=env)
 
@@ -517,7 +554,11 @@ def preparer(args):
         else:
             _creer_venv(cible, args.python)
             _pip_install(cible, src)
-            _controles(cible)
+            contrats = "contrats" in _extras_hote(src)
+            if not contrats:
+                print("bascule: source sans extra contrats (antérieure à "
+                      "#6309) : coverage et yaml non exigés")
+            _controles(cible, contrats=contrats)
             _sceller(cible)
             with open(os.path.join(cible, MARKER), "w", encoding="utf-8") as handle:
                 json.dump({"version": version, "src": src, "at": time.time()},

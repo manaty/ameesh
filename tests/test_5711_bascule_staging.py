@@ -112,9 +112,27 @@ class PreparationVerrouilleeTest(unittest.TestCase):
                     wheelhouse=cls.paquet.wheelhouse,
                     python=cls.paquet.python,
                     output=cls.paquet.sortie / 'scelle.json',
-                    travail=cls.root / 'travail', scelle=True)
+                    travail=cls.root / cls._travail(), scelle=True)
         cls.manifeste = cls.paquet.sortie / 'scelle.json'
         cls.lock_sha256 = cls.document['lock']['sha256']
+
+    #: `hote-` + suffixe de `mkdtemp` (8 caractères), voir `setUp`.
+    HOTE = 'hote-XXXXXXXX'
+
+    @classmethod
+    def _travail(cls):
+        """Dossier de travail dont `venv` a la longueur du venv cible.
+
+        pip écrit un lanceur `sh-preamble` au lieu d'un shebang direct quand
+        le chemin de l'interpréteur dépasse la limite du noyau (127 octets) ;
+        le contrat #5666 hache la forme du lanceur. Sous les TMPDIR longs des
+        agents, `travail/venv` restait sous la limite et `hote-…/venv-<sha7>`
+        la dépassait : écart des scripts d'entrée, vert en CI seulement
+        (#6311). À longueur égale, les deux venvs reçoivent la même forme,
+        quel que soit le chemin temporaire.
+        """
+        cible = len('%s/venv-%s' % (cls.HOTE, cls.sha7))
+        return 'travail'.ljust(cible - len('/venv'), '-')
 
     @classmethod
     def tearDownClass(cls):
@@ -126,6 +144,7 @@ class PreparationVerrouilleeTest(unittest.TestCase):
         self.src.mkdir()
         self.venv = self.hote / 'venv'
         self.cible = self.hote / ('venv-' + self.sha7)
+        self.assertEqual(len(self.HOTE), len(self.hote.name))
 
     def preparer(self, manifeste=None, version=None, options=None):
         manifeste = manifeste or self.manifeste

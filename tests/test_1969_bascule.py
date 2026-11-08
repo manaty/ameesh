@@ -514,6 +514,46 @@ class BasculeTest(unittest.TestCase):
                 self.assertTrue((cible / bascule.MARKER).is_file())
                 bascule._supprimer(str(cible))
 
+    def test_source_sans_extra_contrats_ne_les_exige_pas(self):
+        """#6311 : un ancien pyproject sans `contrats` n'exige ni coverage ni yaml."""
+        faux_venv(self.base, "active")
+        os.rename(self.base / "venv-active", self.venv)
+        optionnels = {
+            "ancien": '[project.optional-dependencies]\ncrypto = ["c"]\n',
+            "recent": ('[project.optional-dependencies]\ncrypto = ["c"]\n'
+                       'contrats = ["coverage"]\n'),
+            "illisible": '[project\n',
+        }
+        attendus = {"ancien": "psycopg,crypto", "recent": bascule.HOST_EXTRAS,
+                    "illisible": bascule.HOST_EXTRAS}
+        for version, pyproject in optionnels.items():
+            source = self.base / ("src-" + version)
+            source.mkdir()
+            (source / "pyproject.toml").write_text("[project]\n" + pyproject)
+            self.assertEqual(attendus[version],
+                             ",".join(bascule._extras_hote(str(source))))
+            cible = self.base / ("venv-" + version)
+            args = SimpleNamespace(venv=str(self.venv), src=str(source),
+                                   version=version, python=sys.executable)
+
+            def creer(directory, python, version=version):
+                vrai_venv(self.base, version, version, "late")
+
+            def installer(directory, src):
+                site = next(Path(directory).glob("lib/python3*/site-packages"))
+                for module in ("psycopg", "cryptography", "ameesh"):
+                    (site / (module + ".py")).write_text("")
+
+            with self.subTest(version=version), \
+                    mock.patch.dict(os.environ, {"PYTHONPATH": "", "PYTHONNOUSERSITE": "1"}), \
+                    mock.patch.object(bascule, "_creer_venv", side_effect=creer), \
+                    mock.patch.object(bascule, "_pip_install", side_effect=installer), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                code = bascule.preparer(args)
+            self.assertEqual(0 if version == "ancien" else 1, code)
+            self.assertEqual(version == "ancien", (cible / bascule.MARKER).is_file())
+            self.assertEqual((0, "active"), lire(self.venv))
+
     def test_controles_acceptent_le_shebang_python3_de_pip(self):
         cible = self.base / "venv-v2"
         (cible / "bin").mkdir(parents=True)
