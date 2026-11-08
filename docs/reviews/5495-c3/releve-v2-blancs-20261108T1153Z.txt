@@ -1,0 +1,95 @@
+# blancs après la fin du staging hors créneau ; aucun --apply
+pose C3 v2 mode=prealables apply=0 TS=20261108T1153Z
+contrôles OK (AG1) : canon ab4ae5b1d6f3d91b2c477db7bb7a1acb2de0c5a5 → b8c4ea12ca5fcac799329dd5ac54386384cbe223 (arbre 219caba46b93c12085829fe872c8e498dbe9da0e) ; minuterie → d59f9a50f6f7572ea95b17d7f21c3e9ac7c12301987cb9e546bf7afa0e3563d6
+à blanc : aucun geste (relancer avec --apply)
+GESTE [AG1] : reçus /root/ameesh-operator-C3-AG1-20261108T1153Z (0700) et copies avant
+GESTE [AG1] : archive et reçu du canon vers /root/ameesh-operator-C3-AG1-20261108T1153Z/, contrôle des membres
+GESTE [AG1] : extraction sous 980 dans /home/ameesh-staging/staging/canon-b8c4ea12-prepared
+GESTE [AG1] : vérification du clone préparé (HEAD, arbre, propre, sans hook, .git/config, fichiers suivis)
+GESTE [AG1] : bascule du canon (ancien conservé : /home/ameesh-staging/staging/canon-ab4ae5b1-retained-before-b8c4ea12) et canon_ref=b8c4ea12ca5fcac799329dd5ac54386384cbe223
+GESTE [AG1] : minuterie 1.44.1 (d59f9a50f6f7572ea95b17d7f21c3e9ac7c12301987cb9e546bf7afa0e3563d6) sous 980, daemon-reload, toujours désactivée
+GESTE [AG1] : arguments = ceux de BG, copie 980 puis /etc/ameesh/staging-submit.json (octets identiques)
+fin prealables AG1 ; TS=20261108T1153Z (retour : retour-c3-v2.sh prealables AG1 20261108T1153Z)
+rc=0
+pose C3 v2 mode=prealables apply=0 TS=20261108T1153Z
+contrôles OK (AG2) : canon c336c53c5648912529cfac682a6dcda9858ce96a → b8c4ea12ca5fcac799329dd5ac54386384cbe223 (arbre 219caba46b93c12085829fe872c8e498dbe9da0e) ; minuterie → d59f9a50f6f7572ea95b17d7f21c3e9ac7c12301987cb9e546bf7afa0e3563d6
+à blanc : aucun geste (relancer avec --apply)
+GESTE [AG2] : reçus /root/ameesh-operator-C3-AG2-20261108T1153Z (0700) et copies avant
+GESTE [AG2] : archive et reçu du canon vers /root/ameesh-operator-C3-AG2-20261108T1153Z/, contrôle des membres
+GESTE [AG2] : extraction sous 980 dans /home/ameesh-staging/staging/canon-b8c4ea12-prepared
+GESTE [AG2] : vérification du clone préparé (HEAD, arbre, propre, sans hook, .git/config, fichiers suivis)
+GESTE [AG2] : bascule du canon (ancien conservé : /home/ameesh-staging/staging/canon-c336c53c-retained-before-b8c4ea12) et canon_ref=b8c4ea12ca5fcac799329dd5ac54386384cbe223
+GESTE [AG2] : minuterie 1.44.1 (d59f9a50f6f7572ea95b17d7f21c3e9ac7c12301987cb9e546bf7afa0e3563d6) sous 980, daemon-reload, toujours désactivée
+GESTE [AG2] : arguments = ceux de BG, copie 980 puis /etc/ameesh/staging-submit.json (octets identiques)
+GESTE [AG2] : bascule.env : AMEESH_OPERATEUR=human:smichea → ameesh:staging (= PUBLIC_ENV 1223707f), 980:0600
+GESTE [AG2] : garde 4bde802e (980 0755) depuis l'archive V6 relue
+GESTE [AG2] : drop-in 10-native-actor.conf (ce3ed09c, 980 0644), daemon-reload
+fin prealables AG2 ; TS=20261108T1153Z (retour : retour-c3-v2.sh prealables AG2 20261108T1153Z)
+rc=0
+pose C3 v2 mode=activer apply=0 TS=20261108T1153Z
+sonde C3 v2 #5495 mode=go hôtes=AG1 AG2 2026-11-08T11:53:33Z
+OK  AG1 guard sha256 (4bde802e931ab7017934f0ee2f42f07b33b2408905a8aabe3a98063ebeeffdd9)
+OK  AG1 DropInPaths (un seul) (/home/ameesh-staging/.config/systemd/user/ameesh-staging.service.d/10-native-actor.conf)
+OK  AG1 drop-in sha256 (ce3ed09c7a816b1f02358bd6301a1d8bdde0ee3110228a2fe10ea5e0a5a334cc)
+OK  AG1 dossier drop-in (10-native-actor.conf )
+OK  AG1 FragmentPath (/home/ameesh-staging/.config/systemd/user/ameesh-staging.service)
+OK  AG1 service sha256 (f8add4eb6e5cecdb4c79471a1558f7a3ad30e689ad013456af6e305bf13d8bec)
+KO  AG1 timer sha256 : lu « f6460989527742e6d9abbe32758f9f3ee417aebfbb722f0c7b85b3d309b0f425 », attendu « d59f9a50f6f7572ea95b17d7f21c3e9ac7c12301987cb9e546bf7afa0e3563d6 »
+OK  AG1 unités ameesh-staging* (service, timer, .d) (3)
+OK  AG1 bascule.env 980:0600 = PUBLIC_ENV (980:600 1223707f)
+OK  AG1 garde (lecture) sous 980 (0)
+OK  AG1 venv-courant (venv-5c1e679)
+OK  AG1 config exécuteur = staging-submit (1)
+KO  AG1 arguments = ceux de BG : lu « ['--sans-poste'] », attendu « ['--sans-poste', '--absent', 'manaty-mesh-1=central runtime deferred; follow up separately', '--rapporteurs', 'bureau mesh-design auditeur'] »
+OK  AG1 empreintes attendues (fichiers) = réelles (fichiers OK)
+OK  AG1 canon 980 = canon_ref (ab4ae5b1d6f3d91b2c477db7bb7a1acb2de0c5a5)
+KO  AG1 canon_ref = canon des agents : lu « ab4ae5b1d6f3d91b2c477db7bb7a1acb2de0c5a5 », attendu « b8c4ea12ca5fcac799329dd5ac54386384cbe223 »
+OK  AG1 canon 980 propre (0)
+OK  AG1→AG1 ssh root (uid 980) (0)
+OK  AG1→AG2 ssh root (uid 980) (0)
+OK  AG1→AG3 ssh root (uid 980) (0)
+OK  AG1 clé privée illisible par ameesh (refus)
+OK  AG1 minuterie L2 (disabled)
+OK  AG1 drop-in --no-staging de la release (present)
+OK  AG1 tick de release avec --no-staging (1)
+OK  AG1 config de soumission (compte ameesh) (absent)
+KO  AG2 guard sha256 : lu «  », attendu « 4bde802e931ab7017934f0ee2f42f07b33b2408905a8aabe3a98063ebeeffdd9 »
+KO  AG2 DropInPaths (un seul) : lu «  », attendu « /home/ameesh-staging/.config/systemd/user/ameesh-staging.service.d/10-native-actor.conf »
+KO  AG2 drop-in sha256 : lu «  », attendu « ce3ed09c7a816b1f02358bd6301a1d8bdde0ee3110228a2fe10ea5e0a5a334cc »
+KO  AG2 dossier drop-in : lu «  », attendu « 10-native-actor.conf  »
+OK  AG2 FragmentPath (/home/ameesh-staging/.config/systemd/user/ameesh-staging.service)
+OK  AG2 service sha256 (f8add4eb6e5cecdb4c79471a1558f7a3ad30e689ad013456af6e305bf13d8bec)
+KO  AG2 timer sha256 : lu « f6460989527742e6d9abbe32758f9f3ee417aebfbb722f0c7b85b3d309b0f425 », attendu « d59f9a50f6f7572ea95b17d7f21c3e9ac7c12301987cb9e546bf7afa0e3563d6 »
+KO  AG2 unités ameesh-staging* (service, timer, .d) : lu « 2 », attendu « 3 »
+KO  AG2 bascule.env 980:0600 = PUBLIC_ENV : lu « 980:600 15887afb », attendu « 980:600 1223707f »
+KO  AG2 garde (lecture) sous 980 : lu « refus », attendu « 0 »
+OK  AG2 venv-courant (venv-5c1e679)
+OK  AG2 config exécuteur = staging-submit (1)
+KO  AG2 arguments = ceux de BG : lu « ['--sans-poste'] », attendu « ['--sans-poste', '--absent', 'manaty-mesh-1=central runtime deferred; follow up separately', '--rapporteurs', 'bureau mesh-design auditeur'] »
+OK  AG2 empreintes attendues (fichiers) = réelles (fichiers OK)
+OK  AG2 canon 980 = canon_ref (c336c53c5648912529cfac682a6dcda9858ce96a)
+KO  AG2 canon_ref = canon des agents : lu « c336c53c5648912529cfac682a6dcda9858ce96a », attendu « b8c4ea12ca5fcac799329dd5ac54386384cbe223 »
+OK  AG2 canon 980 propre (0)
+OK  AG2→AG1 ssh root (uid 980) (0)
+OK  AG2→AG2 ssh root (uid 980) (0)
+OK  AG2→AG3 ssh root (uid 980) (0)
+OK  AG2 clé privée illisible par ameesh (refus)
+OK  AG2 minuterie L2 (disabled)
+OK  AG2 drop-in --no-staging de la release (present)
+OK  AG2 tick de release avec --no-staging (1)
+OK  AG2 config de soumission (compte ameesh) (absent)
+OK  BG : aucune séquence staging active (0)
+OK  détenteur mesh-design = ameesh-agents-2 (porteur de ce C3)
+OK  migrations non additives inconnues du runtime L2 (0)
+OK  demande mesh-staging en cours (False)
+verdict : KO (13)
+STOP : sonde go KO : pas d'activation (BG porte la coupure)
+rc(activer, attendu STOP car go KO)=1
+retour C3 v2 mode=activation apply=0 TS=20261108T1154Z
+GESTE [AG1] : minuterie L2 désactivée
+GESTE [AG2] : minuterie L2 désactivée
+STOP : AG1 : drop-in de release absent des reçus /root/ameesh-operator-C3-AG1-activation-20261109T0945Z
+rc=1
+retour C3 v2 mode=prealables apply=0 TS=20261108T1154Z
+STOP : AG2 reçus /root/ameesh-operator-C3-AG2-20261109T0900Z absents
+rc(attendu STOP, reçus absents)=1

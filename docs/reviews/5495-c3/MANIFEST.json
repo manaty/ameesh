@@ -1,16 +1,26 @@
 {
  "auteur": "bureau (BG)",
- "files": {
+ "demande": "mesh-design #200619, r\u00e9ponses #200655",
+ "gestes": "aucun",
+ "lot": 5495,
+ "remplace": "v1 (conserv\u00e9e)",
+ "schema": "ameesh-5495-c3-dossier/2",
+ "v1": {
   "DOSSIER-C3-v1.md": "c88b4306981317948ed0c668b2b50bbc872fbef6178d63b08e08e513025fa7ec",
-  "analyse/attrs.py": "d67851674b9a5f87f8e5d3367507a797e9677611532cf9499ad6b1e4304f4cff",
   "pose-c3-AG1.sh": "d687eefe2818b22a2defac8b332b30feaa586d2dd72e35a90f3492972e40692e",
-  "preparer-canon-c3.sh": "f5bde6c4fdadb8ed1b7e0886f8f6f5a0298966ec4c4c26c06e57687dada9d079",
   "releve-prealables-20261108T1100Z.txt": "aca16328e29c4f9c5cb0949c8c44ee93907265105d89a032c37efc978897b03a",
   "retour-c3-AG1.sh": "db8365adcafdfbfea740d6a254a908c4ee45df34e1a09ff31901128e533e7722",
   "sonde-c3.sh": "ec6a8dfd7aa713c63771ceccbdd748d9e9e65ab87734c2cf0a2ae68ad1bf2fd0"
  },
- "gestes": "aucun",
- "lot": 5495,
- "schema": "ameesh-5495-c3-dossier/1",
- "version": "v1"
+ "v2": {
+  "DOSSIER-C3-v2.md": "9ff30a590c3041705f1ce2a2a1d305febe07d66ebcf6cd5322c1c2eb47d7a241",
+  "analyse/attrs.py": "d67851674b9a5f87f8e5d3367507a797e9677611532cf9499ad6b1e4304f4cff",
+  "pose-c3-v2.sh": "5901e5cf1b278f8ced32b71b6061d2d9279f379dbb8849c2f141627479dbf250",
+  "preparer-canon-c3.sh": "f5bde6c4fdadb8ed1b7e0886f8f6f5a0298966ec4c4c26c06e57687dada9d079",
+  "releve-v2-blancs-20261108T1153Z.txt": "fe7693b40e45c8a626c32ddf061699bcb25f71298127e6baea3d8581f851ef94",
+  "releve-v2-sonde-prealables-20261108T1152Z.txt": "6d01e790f8941bd7538ace362be8d6a588dd4c6eca23557a124ab2378566676d",
+  "retour-c3-v2.sh": "523abf0bc566e5a878d7e592b636203ee7957ac78d65ca7d96791377b140d475",
+  "sonde-c3-v2.sh": "ed61763f5f723fff51c03c995ce6f2e3d3e8c647f3ecc6bbd2af6ec60f73f883"
+ },
+ "version": "v2"
 }
