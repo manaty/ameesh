@@ -100,6 +100,30 @@ class A1Test(unittest.TestCase):
         # un refus ne recopie aucun texte de l'alerte
         self.assertNotIn("slo_breach", json.dumps(a1))
 
+    def test_meme_cle_levee_n_fois_une_enveloppe_et_n_occurrences(self):
+        """Une alerte relevée N fois compte un signal distinct et N levées."""
+        report = build(
+            signal_alerts=[
+                alert_row(cree=END - 3600.0),
+                alert_row(cree=END - 1800.0),
+                alert_row(cree=END - 900.0, revision=SHA),
+                alert_row(cle=KEY2, cree=END - 60.0),
+            ],
+            active=active(SHA))
+        a1 = capability(report, "A1")["counters"]
+        self.assertEqual(a1["signaux_recus"], 2)
+        self.assertEqual(a1["signaux_occurrences"], 4)
+        self.assertEqual(a1["signaux_par_source"], {"alerts": 2})
+        self.assertEqual(a1["signaux_par_issue"], {"pending": 2})
+        # le compteur suit les enveloppes distinctes, pas les levées : KEY2
+        # seule est sans révision, la dernière levée de KEY en porte une
+        self.assertEqual(a1["signaux_sans_version_observee"], 1)
+        a4 = capability(report, "A4")["counters"]
+        # KEY est corrélée une fois (dernière levée), pas une fois par levée
+        self.assertEqual(a4["signaux_correles"], 1)
+        self.assertEqual(a4["correlations_par_verdict"],
+                         {"inconnu": 1, "version-active": 1})
+
     def test_sans_aucune_alerte_le_zero_est_mesure(self):
         report = build(signal_alerts=[])
         a1 = capability(report, "A1")
@@ -237,6 +261,30 @@ class RepairReportRaccordDatabaseTest(PgTestCase):
             "SELECT count(*) AS n FROM ameesh_events")[0]["n"], 4)
         self.assertEqual(self.db.query(
             "SELECT count(*) AS n FROM work_items")[0]["n"], 0)
+
+    def test_cle_levee_plusieurs_fois_une_enveloppe_et_derniere_observation(self):
+        """La clé est l'identité : N levées, une enveloppe, la dernière gagne."""
+        self.raised(KEY, END - 3600.0, host="ameesh-agents-1")
+        self.raised(KEY, END - 1800.0, host="ameesh-agents-1")
+        self.raised(KEY, END - 900.0, host="ameesh-agents-1", revision=SHA)
+        self.attested(SHA, END - 7200.0)
+        with mock.patch.object(repair_correlation, "active_view",
+                               return_value=active(SHA)), \
+                mock.patch.object(repair_correlation, "journal_view",
+                                 return_value=[]):
+            report = repair_report.read(
+                self.db, project="ameesh", now=END,
+                start=repair_report.iso_z(START),
+                end=repair_report.iso_z(END))
+        a1 = capability(report, "A1")["counters"]
+        self.assertEqual(a1["signaux_recus"], 1)
+        self.assertEqual(a1["signaux_occurrences"], 3)
+        self.assertEqual(a1["signaux_par_source"], {"alerts": 1})
+        # la dernière levée porte la révision : elle représente l'enveloppe
+        self.assertEqual(a1["signaux_sans_version_observee"], 0)
+        a4 = capability(report, "A4")["counters"]
+        self.assertEqual(a4["signaux_correles"], 1)
+        self.assertEqual(a4["correlations_par_verdict"], {"version-active": 1})
 
     def test_borne_de_fin_exclusive(self):
         self.raised(KEY, END - 3600.0, host="ameesh-agents-1")
