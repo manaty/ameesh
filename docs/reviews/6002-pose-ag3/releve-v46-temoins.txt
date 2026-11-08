@@ -1,0 +1,10 @@
+OK   verifier : pose v4.5 reconnue à M
+OK   appliquer : rc 0
+OK   lien venv → venv-242ced700d6e
+OK   vm-remote.py de M' (vm_probe_receipt, plus d accès direct à agent_mailbox)
+OK   unité de santé de M' (StandardError=journal), ameesh
+OK   daemon-reload du gestionnaire ameesh demandé
+OK   reçus avant/après écrits
+OK   retour : lien et fichiers de M remis, M' conservé (2 src)
+OK   carte qui nommerait un src-<sha> : STOP
+à blanc : pip accepte ./src-242ced700d6e (python3.12, venv jetable retiré)

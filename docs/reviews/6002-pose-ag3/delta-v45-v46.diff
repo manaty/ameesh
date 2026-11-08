@@ -1,0 +1,251 @@
+--- pose-DB-vm_probe-v42.sh	2026-11-08 13:32:50.001928166 +0000
++++ pose-DB-vm_probe-v46.sh	2026-11-08 17:03:53.519996752 +0000
+@@ -1,5 +1,8 @@
+ #!/bin/bash
+-# #6002 v4.2 — trap posé AVANT l'installation du rôle (N impl-03 #200830). v4.1 — (traps : aucun vérificateur résiduel sur mesh-1 ni AG3 en cas d'échec) ; v4 — étape 2 (rôle DB) : deploy/sql/role-vm-probe.sql à M (97285a07) sur la base centrale, puis
++# #6002 v4.6 — rôle pris à M' = 242ced700d6e (#6329 : vm_probe_receipt, plus aucun SELECT d'agent_mailbox
++#   pour vm_probe) ; vérificateur SCRAM RÉUTILISÉ depuis les reçus de la pose AG3 (non régénéré) et gardé
++#   sur AG3 tant que ALTER ROLE n'a pas réussi (une relance reste possible) ; audit seul relancé une fois en
++#   cas de refus (course connue #6364). v4.2 — trap posé AVANT l'installation du rôle (N impl-03 #200830). v4.1 — (traps : aucun vérificateur résiduel sur mesh-1 ni AG3 en cas d'échec) ; v4 — étape 2 (rôle DB) : deploy/sql/role-vm-probe.sql à M (97285a07) sur la base centrale, puis
+ # audit deploy/sql/_contrat-vm-probe.sql (refuse tout écart). Route root : BG → AG2 → runuser
+ # ameesh-staging ssh root@10.77.0.1 (go owner 08/11). Exécution en superutilisateur postgres (peer),
+ # search_path du mesh = public. Aucun secret ici : seul le VÉRIFICATEUR SCRAM produit sur AG3 par
+@@ -7,8 +10,8 @@
+ # puis ALTER ROLE vm_probe PASSWORD :'v' (lu par \set depuis un fichier root:postgres 0640 détruit après).
+ #   ./pose-DB-vm_probe.sh [--apply] <TS de la pose AG3>
+ set -euo pipefail
+-AG2=78.232.60.1 AG3=51.15.137.245; M=97285a076dee285097c412d3bd0f2649438a3257
+-ROLE_SHA=2a87ee04d0c4af4a; CONTRAT_SHA=4c9eecb0532b0704   # 16 premiers hexa, git show M:<fichier> | sha256sum
++AG2=78.232.60.1 AG3=51.15.137.245; M=242ced700d6ec1a63fc9d72643bc9faad175f72f
++ROLE_SHA=98cac000079d8949; CONTRAT_SHA=cf371e77ddc207c7   # 16 premiers hexa, git show M':<fichier> | sha256sum (#201411)
+ APPLY=0; [ "${1:-}" = --apply ] && { APPLY=1; shift; }
+ POSE=${1:?TS de la pose AG3 (dossier /root/ameesh-operator-6002-AG3-<TS>)}
+ C() { ssh -F none -o BatchMode=yes -o ConnectTimeout=10 "root@$AG2" "runuser -u ameesh-staging -- ssh -o BatchMode=yes root@10.77.0.1 $*"; }
+@@ -31,7 +34,10 @@
+ ssh -F none -o BatchMode=yes "root@$AG3" "test -s $OPS/vm_probe.scram && grep -q '^SCRAM-SHA-256\\\$4096:' $OPS/vm_probe.scram" || stop "vérificateur absent sur AG3 ($OPS)"
+ TS=$(date -u +%Y%m%dT%H%M%SZ)-$$; D=/var/tmp/ameesh-6002-vm-probe-$TS
+ # v4.2 : dès ici, toute sortie (échec compris) détruit le vérificateur sur mesh-1 et sur AG3.
+-trap 'C "shred -u $D/v 2>/dev/null; true" || true; ssh -F none -o BatchMode=yes "root@$AG3" "shred -u $OPS/vm_probe.scram 2>/dev/null; true" || true' EXIT
++# v4.6 : à toute sortie, la copie de mesh-1 est détruite. Celle d'AG3 (root 0600 dans les reçus de la pose)
++# n'est détruite qu'APRÈS un ALTER ROLE réussi : sinon le passfile vm-operator ne correspondrait plus à aucun
++# vérificateur et la relance exigerait un nouveau secret (retour AG3 puis repose).
++trap 'C "shred -u $D/v 2>/dev/null; true" || true' EXIT
+ 
+ # 1. pièces SQL de M dans un dossier root:postgres 0750 (postgres doit les lire, \ir relatif)
+ C "install -d -m 750 -o root -g postgres $D"
+@@ -56,7 +62,12 @@
+ EOS
+ ssh -F none -o BatchMode=yes "root@$AG3" "shred -u $OPS/vm_probe.scram && echo 'vérificateur détruit sur AG3'"
+ # 4. audit seul du contrat, mot de passe compris (SCRAM dédié), puis ménage
+-out=$(C "runuser -u postgres -- env PGOPTIONS='-c search_path=public' psql -d ameesh -X -v ON_ERROR_STOP=1 -f $D/_contrat-vm-probe.sql" 2>&1) || { echo "$out"; stop "contrat refusé après mot de passe : retour-DB-vm_probe.sh"; }
++audit() { C "runuser -u postgres -- env PGOPTIONS='-c search_path=public' psql -d ameesh -X -v ON_ERROR_STOP=1 -f $D/_contrat-vm-probe.sql" 2>&1; }
++# Course connue du contrat (#6364, DROP concurrent d'une fonction definer) : l'audit SEUL est relancé une fois.
++if ! out=$(audit) || ! printf '%s\n' "$out" | grep -q 'vm_probe contract held'; then
++  echo "$out"; echo "audit refusé : relance unique de l'audit seul (course #6364 possible)"; sleep 5
++  out=$(audit) || { echo "$out"; stop "contrat refusé deux fois après mot de passe : retour-DB-vm_probe.sh"; }
++fi
+ echo "$out"; printf '%s\n' "$out" | grep -q 'vm_probe contract held' || stop "contrat non confirmé après mot de passe"
+ C "runuser -u postgres -- psql -d ameesh -X -At -c \"select rolname, rolcanlogin, left(rolpassword,14) from pg_authid where rolname in ('vm_probe','vm_probe_writer') order by 1\"; rm -f $D/role-vm-probe.sql $D/_contrat-vm-probe.sql; rmdir $D"
+-echo "rôle vm_probe posé et audité ($TS). Suite : tests-AG3-vm-operator-v4.sh B."
++echo "rôle vm_probe posé et audité ($TS). Suite : tests-AG3-vm-operator-v46.sh B."
+--- tests-AG3-vm-operator-v42.sh	2026-11-08 13:32:50.000928157 +0000
++++ tests-AG3-vm-operator-v46.sh	2026-11-08 17:03:53.623997659 +0000
+@@ -1,5 +1,7 @@
+ #!/bin/bash
+-# #6002 v4.2 — preuves après pose. Lecture seule : aucune écriture tentée en base. set -u respecté.
++# #6002 v4.6 — preuves après la mise à jour M' et le rôle de M' : vm_probe ne lit plus agent_mailbox
++#   (6 relations lisibles), vm_probe_receipt exécutable (lecture via la fonction), SELECT direct
++#   d'agent_mailbox refusé. v4.2 — preuves après pose. Lecture seule : aucune écriture tentée en base. set -u respecté.
+ #   A : après pose AG3, avant le rôle DB → commandes DB refusées (rc 1), true admis.
+ #   B : après pose-DB-vm_probe-v42.sh → santé #6296 réelle (version-mode, doctor rc 0, reçu frais) ;
+ #       quiesce et runners rc 1 (porte AG3 absente, hors vague fermée : attesté en garde dure par la
+@@ -7,7 +9,7 @@
+ #       ACL --x, nouveau venv lisible, carte producteur ; refus de lecture hors contrat.
+ # Chaque attendu est asserté ; échec = rc 1.
+ set -u
+-PHASE=${1:?usage: tests-AG3-vm-operator-v42.sh A|B}; case $PHASE in A|B) ;; *) echo "phase A ou B" >&2; exit 2;; esac
++PHASE=${1:?usage: tests-AG3-vm-operator-v46.sh A|B}; case $PHASE in A|B) ;; *) echo "phase A ou B" >&2; exit 2;; esac
+ AG3=51.15.137.245; P=/opt/ameesh-vm-adapter/remote
+ O=(-F none -o BatchMode=yes -o IdentitiesOnly=yes -o "IdentityFile=$HOME/.ssh/id_ed25519" -o StrictHostKeyChecking=yes -o ConnectTimeout=8)
+ ECHEC=0
+@@ -72,6 +74,9 @@
+ SELECT 'qui|' || current_user || '|' || (SELECT count(*) FROM (SELECT host, mode, claims_open FROM public.host_lifecycle) t);
+ SELECT 'registre|' || count(*) FROM (SELECT name, host, mode, status FROM public.agent_registry) t;
+ SELECT 'porte_ag3|' || count(*) FROM public.host_lifecycle WHERE host = 'ameesh-agents-3';
++SELECT 'recu_fonction|' || count(*) FROM public.vm_probe_receipt('ameesh-agents-3', 'mty-amh-impl-15', 1, 0, '0123456789abcdef0123456789abcdef', 1);
++DO $$ BEGIN PERFORM 1 FROM public.agent_mailbox LIMIT 0; RAISE NOTICE 'mailbox=LISIBLE';
++EXCEPTION WHEN insufficient_privilege THEN RAISE NOTICE 'mailbox=refus'; END $$;
+ DO $$
+ DECLARE k record; ok text[] := '{}'; etoile text[] := '{}';
+ BEGIN
+@@ -89,10 +94,12 @@
+ SQL
+ )
+   echo "$res" | sed 's/^/     /'
+-  attendu_lisibles="public.agent_mailbox,public.agent_registry,public.host_handoffs,public.host_lifecycle,public.host_lifecycle_agents,public.turn_resources,public.vm_adapter_requests"
++  attendu_lisibles="public.agent_registry,public.host_handoffs,public.host_lifecycle,public.host_lifecycle_agents,public.turn_resources,public.vm_adapter_requests"
++  echo "$res" | grep -q '^recu_fonction|0$' && echo "OK   vm_probe_receipt exécutable sous vm_probe (lecture par la fonction, 0 ligne hors vague)" || { echo "ECHEC vm_probe_receipt"; ECHEC=1; }
++  echo "$res" | grep -q 'mailbox=refus' && echo "OK   SELECT direct d agent_mailbox refusé à vm_probe" || { echo "ECHEC agent_mailbox lisible par vm_probe"; ECHEC=1; }
+   echo "$res" | grep -q '^porte_ag3|0$' && echo "OK   aucune ligne host_lifecycle pour AG3 (justifie quiesce/runners rc 1)" || { echo "ECHEC porte AG3 : « $(echo "$res" | grep '^porte_ag3|') » — rc 1 de quiesce/runners non justifié"; ECHEC=1; }
+   echo "$res" | grep -q '^qui|vm_probe|' && echo "OK   connexion vm_probe et lecture host_lifecycle" || { echo "ECHEC connexion/lecture vm_probe"; ECHEC=1; }
+-  echo "$res" | grep -q "lisibles=$attendu_lisibles\$" && echo "OK   seules les 7 relations du contrat sont lisibles" || { echo "ECHEC relations lisibles hors contrat"; ECHEC=1; }
++  echo "$res" | grep -q "lisibles=$attendu_lisibles\$" && echo "OK   seules les 6 relations du contrat de M' sont lisibles" || { echo "ECHEC relations lisibles hors contrat"; ECHEC=1; }
+   echo "$res" | grep -q 'etoile=$' && echo "OK   SELECT * refusé partout (colonnes hors contrat)" || { echo "ECHEC SELECT * admis quelque part"; ECHEC=1; }
+ fi
+ exit $ECHEC
+--- /dev/null	2026-10-24 06:27:50.783000000 +0000
++++ maj-adaptateur-AG3-v46.sh	2026-11-08 17:03:18.247688984 +0000
+@@ -0,0 +1,41 @@
++#!/bin/bash
++# #6002 v4.6 — mise à jour de l'adaptateur DÉJÀ posé (v4.5, M = 97285a07) vers M' = 242ced700d6e (#6329 :
++# vm-remote.py n'accède plus à agent_mailbox, il appelle vm_probe_receipt et vm_probe_send). Lancé
++# depuis BG. Ordre (#201411) : CETTE mise à jour, puis pose-DB-vm_probe-v46.sh, puis tests B (v46).
++#   ./maj-adaptateur-AG3-v46.sh                 à blanc : vérification distante + pip --dry-run ./src-<M'>
++#   ./maj-adaptateur-AG3-v46.sh --apply         reçu avant, code et venv de M', bascule, reçu après
++#   ./maj-adaptateur-AG3-v46.sh --apply --retour  lien et fichiers de M remis (M' conservé)
++set -euo pipefail
++ICI=$(cd "$(dirname "$0")" && pwd)
++AG3=51.15.137.245
++M=97285a076dee285097c412d3bd0f2649438a3257; N=242ced700d6ec1a63fc9d72643bc9faad175f72f
++SRC=/home/agent/development/manaty/ameesh; DIST="$ICI/maj-adaptateur-distant-v46.sh"
++APPLY=0 RETOUR=0
++while [ $# -gt 0 ]; do case $1 in --apply) APPLY=1;; --retour) RETOUR=1;; *) echo "argument $1"; exit 2;; esac; shift; done
++stop() { echo "STOP: $*" >&2; exit 2; }
++D() { ssh -F none -o BatchMode=yes -o ConnectTimeout=10 "root@$AG3" "bash -s -- $*" < "$DIST"; }
++git -C "$SRC" cat-file -e "$N^{commit}" && git -C "$SRC" merge-base --is-ancestor "$N" origin/main || stop "M' absent du clone ou hors de main"
++[ "$(sha256sum < "$DIST" | cut -c1-64)" = "$(awk '$2 ~ /maj-adaptateur-distant-v46.sh$/ {print $1}' "$ICI/SHA256SUMS-v46")" ] || stop "partie distante ≠ SHA256SUMS-v46"
++TS=$(date -u +%Y%m%dT%H%M%SZ)-$$; OPS=/root/ameesh-operator-6002-AG3-maj-$TS
++if [ $RETOUR = 1 ]; then
++  [ $APPLY = 1 ] || { echo "(retour à blanc : rien)"; exit 0; }
++  ssh -F none -o BatchMode=yes "root@$AG3" "install -d -m 700 $OPS"
++  D retour "$M" "$N" "$OPS"; exit 0
++fi
++D verifier "$M" "$N" /nonexistent
++if [ $APPLY = 0 ]; then
++  # Essai à blanc de l'étape pip, comme v4.5 : venv jetable sous /tmp, retiré, rien sous /opt.
++  TARB=$(mktemp "${TMPDIR:-/tmp}/6002-maj-blanc.XXXXXX"); trap 'rm -f "$TARB"' EXIT
++  git -C "$SRC" archive --format=tar --prefix="src-${N:0:12}/" "$N" > "$TARB"
++  BLANC='set -euo pipefail; S12=${1:0:12}; T=$(mktemp -d /tmp/6002-blanc.XXXXXX); trap "rm -rf \"$T\"" EXIT
++tar -C "$T" -xf -; cd "$T"; python3.12 -m venv venv
++venv/bin/pip install -q --dry-run --no-deps --no-compile "./src-$S12"
++echo "à blanc : pip accepte ./src-$S12 (python3.12, venv jetable retiré)"'
++  ssh -F none -o BatchMode=yes -o ConnectTimeout=10 "root@$AG3" bash -c "$(printf %q "$BLANC")" _ "$N" < "$TARB" || stop "pip --dry-run refusé"
++  echo "(contrôle seul, aucun effet hors du répertoire temporaire)"; exit 0
++fi
++TAR=$(mktemp "${TMPDIR:-/tmp}/6002-maj.XXXXXX"); trap 'rm -f "$TAR"' EXIT
++git -C "$SRC" archive --format=tar --prefix="src-${N:0:12}/" "$N" > "$TAR"
++ssh -F none -o BatchMode=yes "root@$AG3" "install -d -m 700 $OPS && umask 077 && cat > $OPS/src.tar" < "$TAR"
++D appliquer "$M" "$N" "$OPS"
++echo "TS=$TS (reçus $OPS ; retour : ./maj-adaptateur-AG3-v46.sh --apply --retour). Suite : pose-DB-vm_probe-v46.sh --apply 20261108T141112Z-2455349"
+--- /dev/null	2026-10-24 06:27:50.783000000 +0000
++++ maj-adaptateur-distant-v46.sh	2026-11-08 17:03:03.452559859 +0000
+@@ -0,0 +1,74 @@
++#!/bin/bash
++# #6002 v4.6 — partie DISTANTE (exécutée en root sur AG3, octets envoyés par maj-adaptateur-AG3-v46.sh sur
++# l'entrée standard ; exécutée telle quelle par temoin-maj-v46.sh en conteneur). Mise à jour d'une pose
++# EXISTANTE (v4.5, M) vers M' : code et venv neufs à côté des anciens, lien venv basculé atomiquement,
++# vm-remote.py / health.py / unité de santé de M' ; rien d'autre (cartes, compte, sshd, sudoers inchangés).
++#   maj-adaptateur-distant-v46.sh verifier  <M> <M'> <reçus>   lecture seule
++#   maj-adaptateur-distant-v46.sh appliquer <M> <M'> <reçus>   (src.tar de M' déjà dans <reçus>)
++#   maj-adaptateur-distant-v46.sh retour    <M> <M'> <reçus>   lien et fichiers de M remis ; M' conservé
++# Empreintes attendues des fichiers installés (git show <sha>:<chemin> | sha256sum) :
++set -euo pipefail
++MODE=$1; OLD=$2; NEW=$3; OPS=$4; O=/opt/ameesh-vm-adapter; O12=${OLD:0:12}; N12=${NEW:0:12}
++U=/home/ameesh/.config/systemd/user; E=/etc/ameesh-vm-adapter
++declare -A A_M=([remote/vm-remote.py]=a4ffc047239825705db03f72e6801f363e390077d3155dd6574a0cbc81df4171
++                [checks/health.py]=15919bc1718fcc0926118d755af0d22ebb48aa6defe7b6875db7769519b6291b
++                [checks/venv-processus.py]=412b1b76248e637dc876c44680c3457148f485a00e3060eb527ded9717cd953c
++                [unit]=497e2d2ebe1a5b5697e93fefc5ef759b1c61f1ef55852b25a2f62962eb9435cc)
++declare -A A_N=([remote/vm-remote.py]=b9872817133779165674e659996c42663a60e93cda108c5a9f206019fe487cb0
++                [checks/health.py]=e7f1f4f9b20c6bca76bc48c157f51d5bd8289cf65c60ece811ec76dded6a63cc
++                [checks/venv-processus.py]=412b1b76248e637dc876c44680c3457148f485a00e3060eb527ded9717cd953c
++                [unit]=0f2554be824330ceb541ead33d16df032443ef1a055c1fedbbadb16f33da7ebf)
++stop() { echo "STOP : $*" >&2; exit 1; }
++sha() { sha256sum < "$1" | cut -c1-64; }
++etat() {  # $1 = M ou N : empreintes installées attendues
++  local -n A=A_$1; local f
++  for f in remote/vm-remote.py checks/health.py checks/venv-processus.py; do [ "$(sha "$O/$f")" = "${A[$f]}" ] || return 1; done
++  [ "$(sha "$U/ameesh-vm-health.service")" = "${A[unit]}" ]
++}
++releve() {
++  echo "lien venv : $(readlink "$O/venv")"
++  for f in remote/vm-remote.py checks/health.py checks/venv-processus.py; do echo "$(sha "$O/$f") $f $(stat -c '%a %U:%G' "$O/$f")"; done
++  echo "$(sha "$U/ameesh-vm-health.service") ameesh-vm-health.service $(stat -c '%a %U:%G' "$U/ameesh-vm-health.service")"
++}
++# Les cartes root et les unités ne nomment aucun src-<sha> ni venv-<sha> : seul le lien venv bouge.
++refs=$(grep -l -E 'src-[0-9a-f]{12}|venv-[0-9a-f]{12}' "$E"/* "$U"/ameesh-vm-health.* 2>/dev/null || true)
++[ -z "$refs" ] || stop "référence à un src-/venv-<sha> dans : $refs"
++installer() {  # $1 = sha12 source, $2 = propriétaire de l'unité ; écriture temporaire puis renommage
++  local s=$O/src-$1
++  install -m 644 -o root -g root "$s/deploy/vm-adapter/remote/vm-remote.py" "$O/remote/.vm-remote.py.maj" && mv -f "$O/remote/.vm-remote.py.maj" "$O/remote/vm-remote.py"
++  install -m 644 -o root -g root "$s/deploy/vm-adapter/remote/checks/health.py" "$O/checks/.health.py.maj" && mv -f "$O/checks/.health.py.maj" "$O/checks/health.py"
++  install -m 644 -o ameesh -g ameesh "$s/deploy/vm-adapter/remote/checks/ameesh-vm-health.service" "$U/.ameesh-vm-health.service.maj" && mv -f "$U/.ameesh-vm-health.service.maj" "$U/ameesh-vm-health.service"
++  systemctl --user -M ameesh@ daemon-reload
++}
++lier() { ln -sfn "venv-$1" "$O/venv.maj" && mv -T "$O/venv.maj" "$O/venv"; }
++controles() {
++  local w n; w=$(find "$O" -xdev \( -perm -g+w -o -perm -o+w \) ! -type l); [ -z "$w" ] || stop "inscriptible : $w"
++  n=$(find "$O" -xdev ! -user root); [ -z "$n" ] || stop "non root : $n"
++  "$O/venv/bin/python" -I -c 'import ameesh' || stop "ameesh non importable depuis $O/venv"
++}
++case $MODE in
++verifier)
++  [ "$(readlink "$O/venv")" = "venv-$O12" ] && etat M || stop "pose v4.5 attendue (lien venv-$O12, fichiers de M)"
++  [ -d "$O/src-$O12" ] && [ -d "$O/venv-$O12" ] || stop "src-/venv-$O12 absents"
++  [ ! -e "$O/src-$N12" ] && [ ! -e "$O/venv-$N12" ] || stop "src-/venv-$N12 déjà présents : réconcilier"
++  releve; echo "vérification OK : pose à M, place libre pour M'" ;;
++appliquer)
++  [ "$(readlink "$O/venv")" = "venv-$O12" ] && etat M || stop "pose v4.5 attendue"
++  [ ! -e "$O/src-$N12" ] && [ ! -e "$O/venv-$N12" ] || stop "src-/venv-$N12 déjà présents"
++  [ -f "$OPS/src.tar" ] || stop "archive de M' absente des reçus"
++  releve > "$OPS/recu-avant.txt"
++  tar -C "$O" -xf "$OPS/src.tar"; chown -R root:root "$O/src-$N12"; chmod -R go-w "$O/src-$N12"
++  ( cd "$O" && python3.12 -m venv "venv-$N12" && "venv-$N12/bin/pip" install -q --no-compile "./src-$N12" >/dev/null )
++  chown -R root:root "$O/venv-$N12"; chmod -R go-w "$O/venv-$N12"
++  "$O/venv-$N12/bin/python" -I -c 'import ameesh' || stop "venv-$N12 : ameesh non importable (lien inchangé)"
++  echo "intention : bascule vers $N12" > "$OPS/intention-bascule"
++  lier "$N12"; installer "$N12"
++  etat N || stop "empreintes de M' non atteintes après bascule : retour conseillé"
++  controles; releve > "$OPS/recu-apres.txt"; cat "$OPS/recu-apres.txt"; echo "mise à jour vers $N12 OK ; M conservé pour le retour" ;;
++retour)
++  [ -d "$O/src-$O12" ] && [ -d "$O/venv-$O12" ] || stop "src-/venv-$O12 absents : retour impossible"
++  lier "$O12"; installer "$O12"
++  etat M || stop "empreintes de M non atteintes après retour"
++  controles; releve > "$OPS/recu-retour.txt"; cat "$OPS/recu-retour.txt"; echo "retour vers $O12 OK ; src-/venv-$N12 conservés" ;;
++*) stop "mode inconnu" ;;
++esac
+--- /dev/null	2026-10-24 06:27:50.783000000 +0000
++++ temoin-maj-v46.sh	2026-11-08 17:04:17.876209217 +0000
+@@ -0,0 +1,32 @@
++#!/usr/bin/env bash
++# #6002 v4.6 — témoin qui EXERCE la mise à jour M → M' et son retour en conteneur jetable (image du
++# constructeur, python3.12 = AG3) : l'état « pose v4.5 » est construit par le bloc de l'étape 2 extrait à
++# l'octet de pose-AG3-vm-operator-v45.sh, puis maj-adaptateur-distant-v46.sh (octets du dossier) est lancé
++# en verifier / appliquer / retour. systemctl est simulé (journal des appels) ; aucun réseau vers une VM.
++set -u
++ICI=$(cd "$(dirname "$0")" && pwd); W=$(mktemp -d)
++trap 'docker run --rm -v "$W":/w ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 rm -rf /w/x >/dev/null 2>&1; rm -rf "$W"' EXIT
++M=97285a076dee285097c412d3bd0f2649438a3257; N=242ced700d6ec1a63fc9d72643bc9faad175f72f; S=/home/agent/development/manaty/ameesh
++mkdir -p "$W/x"; git -C $S archive --format=tar --prefix="src-${M:0:12}/" $M > "$W/x/srcM.tar"; git -C $S archive --format=tar --prefix="src-${N:0:12}/" $N > "$W/x/srcN.tar"
++git -C $S show $M:deploy/vm-adapter/remote/checks/ameesh-vm-health.service > "$W/x/unitM"
++awk '/^R "\$M" "\$OPS" <<.EOS.$/{k++; if(k==1){on=1; next}} on&&/^EOS$/{on=0} on' "$ICI/pose-AG3-vm-operator-v45.sh" > "$W/x/etape2.sh"
++cp "$ICI/maj-adaptateur-distant-v46.sh" "$W/x/"
++docker run --rm --user 0 -v "$W/x":/x:ro ameesh-l2-builder:p6-97285a0 bash -c '
++set -u; ok() { echo "OK   $*"; }; ko() { echo "ECHEC $*"; E=1; }; E=0
++useradd -m -d /home/ameesh ameesh; mkdir -p /usr/local/fbin; printf "#!/bin/sh\necho \"systemctl \$*\" >> /tmp/systemctl.log\n" > /usr/local/fbin/systemctl; chmod 755 /usr/local/fbin/systemctl; export PATH=/usr/local/fbin:$PATH
++mkdir /ops && cp /x/srcM.tar /ops/src.tar && bash /x/etape2.sh '$M' /ops >/dev/null || { echo "ECHEC état v4.5"; exit 1; }
++U=/home/ameesh/.config/systemd/user; mkdir -p $U /etc/ameesh-vm-adapter; install -m 644 -o ameesh -g ameesh /x/unitM $U/ameesh-vm-health.service
++printf "{\"checks\":{\"doctor\":[\"/usr/bin/python3.12\",\"-I\",\"/opt/ameesh-vm-adapter/checks/health.py\",\"doctor\"]}}\n" > /etc/ameesh-vm-adapter/remote.json
++D=/x/maj-adaptateur-distant-v46.sh
++bash $D verifier '$M' '$N' /nonexistent >/dev/null && ok "verifier : pose v4.5 reconnue à M" || ko "verifier"
++mkdir -m 700 /maj && cp /x/srcN.tar /maj/src.tar
++bash $D appliquer '$M' '$N' /maj > /tmp/appl.out 2>&1 && ok "appliquer : rc 0" || { ko "appliquer"; cat /tmp/appl.out; }
++[ "$(readlink /opt/ameesh-vm-adapter/venv)" = venv-'${N:0:12}' ] && ok "lien venv → venv-'${N:0:12}'" || ko "lien"
++grep -q vm_probe_receipt /opt/ameesh-vm-adapter/remote/vm-remote.py && ! grep -q "FROM agent_mailbox" /opt/ameesh-vm-adapter/remote/vm-remote.py && ok "vm-remote.py de M'"'"' (vm_probe_receipt, plus d accès direct à agent_mailbox)" || ko "vm-remote.py"
++grep -q "^StandardError=journal" $U/ameesh-vm-health.service && [ "$(stat -c %U $U/ameesh-vm-health.service)" = ameesh ] && ok "unité de santé de M'"'"' (StandardError=journal), ameesh" || ko "unité"
++grep -q "daemon-reload" /tmp/systemctl.log && ok "daemon-reload du gestionnaire ameesh demandé" || ko "daemon-reload"
++[ -f /maj/recu-avant.txt ] && [ -f /maj/recu-apres.txt ] && ok "reçus avant/après écrits" || ko "reçus"
++bash $D retour '$M' '$N' /maj > /tmp/ret.out 2>&1 && [ "$(readlink /opt/ameesh-vm-adapter/venv)" = venv-'${M:0:12}' ] && ok "retour : lien et fichiers de M remis, M'"'"' conservé ($(ls -d /opt/ameesh-vm-adapter/src-* | wc -l) src)" || { ko "retour"; cat /tmp/ret.out; }
++printf "{\"x\":\"/opt/ameesh-vm-adapter/src-'${M:0:12}'/y\"}\n" > /etc/ameesh-vm-adapter/remote.json
++bash $D verifier '$M' '$N' /nonexistent >/dev/null 2>&1 && ko "carte avec src-<sha> acceptée" || ok "carte qui nommerait un src-<sha> : STOP"
++exit $E'
