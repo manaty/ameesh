@@ -12,7 +12,8 @@ root, in a new directory, without publishing anything:
 * a fresh venv from `/usr/bin/python3`, with no pip in the final tree;
 * the `ameesh` wheel built from the exact commit, never from checkout bytes;
 * the wheel's complete dependency closure (`psycopg[binary]`, `psutil` and
-  their transitive dependencies), pinned by version and SHA-256 in
+  their transitive dependencies) plus the contract-module tools `coverage`
+  and `pyyaml` (#6291), pinned by version and SHA-256 in
   `runtime-pins.txt`, installed with `--require-hashes --only-binary=:all:`;
 * the wheel build backend pinned in `runtime-build-pins.txt` and installed in
   a disposable tools venv, never in the runtime;
@@ -174,9 +175,11 @@ def read_pins(path, *, kind):
     if not records:
         raise BuildError('empty pin file refused')
     if kind == 'runtime':
-        missing = {'psycopg', 'psycopg-binary', 'psutil'} - set(records)
+        # #6291 : coverage et pyyaml, outils des modules de contrats du composeur
+        missing = {'psycopg', 'psycopg-binary', 'psutil', 'coverage', 'pyyaml'} - set(records)
         if missing:
-            raise BuildError('runtime pins must cover psycopg[binary], psycopg-binary and psutil')
+            raise BuildError('runtime pins must cover psycopg[binary], psycopg-binary, psutil, '
+                             'coverage and pyyaml')
     elif 'setuptools' not in records:
         raise BuildError('build pins must pin setuptools')
     return dict(records=records, digest=hashlib.sha256(data).hexdigest(), bytes=len(data))
@@ -410,8 +413,9 @@ def check_runtime(tools, runtime_dir, pins, wheel, *, env):
         raise BuildError('installed wheel version differs from the build')
     pip(tools, '--python', str(runtime_dir / 'bin' / 'python'), 'check', env=env)
     _target(runtime_dir,
-            'import ameesh, psycopg, psutil\n'
-            'print(ameesh.__version__, psycopg.__version__, psutil.__version__)\n',
+            'import ameesh, coverage, psycopg, psutil, yaml\n'
+            'print(ameesh.__version__, psycopg.__version__, psutil.__version__,\n'
+            '      coverage.__version__, yaml.__version__)\n',
             env=env)
 
 

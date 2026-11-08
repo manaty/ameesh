@@ -96,6 +96,7 @@ class AmeeshRegistryTests(unittest.TestCase):
                                              "test_6183_contract_proof_resume",
                                              "test_6186_project_plan",
                                              "test_6274_composeur_plan_declare",
+                                             "test_6296_vm_local_checks",
                                              "test_6264_packet_mechanics_contracts"})
         for changes in ((), (cs.Change('M', 'src/ameesh/storage/interface.py'),),
                         (cs.Change('A', 'unknown/new.file'),)):

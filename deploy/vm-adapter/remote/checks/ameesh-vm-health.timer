@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=Refresh VM operator health receipt every minute
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=ameesh-vm-health.service
+
+[Install]
+WantedBy=timers.target

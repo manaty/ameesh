@@ -220,7 +220,27 @@
         "test_l50_group_orphan_work_items",
         "test_l72_panne_de_base",
         "test_migrations",
-        "test_migrations_additives"
+        "test_migrations_additives",
+        "test_6296_vm_local_checks"
+      ]
+    },
+    {
+      "id": "vm-local-health",
+      "paths": [
+        "deploy/vm-adapter/**",
+        "deploy/mise-a-jour/venv-processus.py"
+      ],
+      "operations": [
+        "A",
+        "C",
+        "D",
+        "M",
+        "R",
+        "T",
+        "U"
+      ],
+      "modules": [
+        "test_6296_vm_local_checks"
       ]
     }
   ]

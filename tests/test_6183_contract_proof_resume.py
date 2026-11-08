@@ -248,6 +248,30 @@ class SingleProjectionTest(Base):
         self.assertEqual(proof.projection(report(), base=BASE, target='main')
                          ['result']['state'], 'green')
 
+    def test_6291_an_inconclusive_leaf_says_why_and_stays_readable(self):
+        """#6291: h-06..h-08 named three inconclusive modules without a cause
+        (skips from absent host tools). The leaf now carries it; a green node
+        carries none, and the note is still read as this scope's evidence."""
+        skipped = auto.TestRun('contrats', ['tests.test_x'], 0,
+                               'Ran 3 tests in 0.1s\n\nOK (skipped=2)\n', 0.1)
+        timed_out = auto.TestRun('contrats', ['tests.test_z'], None, '', 1.0,
+                                 timed_out=True)
+        merged = auto.ContractTestRun(
+            'contrats', ['tests.test_x', 'tests.test_y', 'tests.test_z'], 0, '', 0.2,
+            children=[skipped, green('y'), timed_out])
+        result = proof.projection(report(merged), base=BASE, target='main')['result']
+        self.assertEqual(result['state'], 'inconclusive')
+        self.assertNotIn('reason', result)
+        leaf_skipped, leaf_green, leaf_timed_out = result['children']
+        self.assertIn('2 test(s) sauté(s)', leaf_skipped['reason'])
+        self.assertEqual(leaf_timed_out['reason'], 'délai dépassé')
+        self.assertNotIn('reason', leaf_green)
+        self.assertNotIn('reason', proof.projection(report(), base=BASE,
+                                                    target='main')['result'])
+        note = proof.encode(report(merged), base=BASE, target='main')
+        found = proof.read(carrier(notes=[note]), head=HEAD, tree=TREE, target='main')
+        self.assertEqual(found['result'], result)
+
     def compose(self, *notes):
         self.shell.auto_out = ''.join(note + '\n' for note in notes)
         current = ph.Attempt(ph.COMPOSITION, 1, BASE)
