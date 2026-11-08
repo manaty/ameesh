@@ -2,8 +2,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#6296: same-user health producer and unprivileged, fail-closed readers.
 
-No process environment is read. Paths and unit names come only from root
-installed cards. The receipt proves health, not resistance to its producer.
+Paths and unit names come only from root installed cards, never from the
+process environment. The producer service still loads the ameesh
+EnvironmentFile (its doctor and readiness children need it), and the
+venv_processus verifier resolves its state directory from XDG_STATE_HOME.
+The receipt proves health, not resistance to its producer.
+
+version_mode and doctor are proven separately: version_mode needs the same
+live execute runners and venv before and after the probe; doctor also needs
+`ameesh doctor` and each runner's readiness, read from the lease its own
+launched process (with its drop-ins) holds, never from a re-created context.
 """
 import importlib.util
 import json
@@ -21,6 +29,9 @@ REMOTE = Path('/etc/ameesh-vm-adapter/health-reader.json')
 CARD = Path('/etc/ameesh-vm-adapter/health-producer.json')
 BOOT = Path('/proc/sys/kernel/random/boot_id')
 SCHEMA = 'ameesh-vm-health/1'
+# Runner blocks that mean "this host is not ready" (runner.py HOST_STATUS,
+# DB_STATUS, WORKDIR_STATUS); other blocks (account, budget) are not health.
+HOST_BLOCKS = frozenset({'hôte non prêt', 'base injoignable', 'dossier absent'})
 
 
 def document(path, uid, mode):
@@ -59,8 +70,12 @@ def installed(venv):
 def check(kind, *, remote=REMOTE, boot=BOOT, now=time.time, reader=document):
     policy = health_policy(reader(remote, 0, 0o640))
     receipt = reader(Path(policy['receipt']), policy['producer_uid'], 0o640)
-    if set(receipt) != {'schema', 'boot_id', 'timestamp', 'version', 'sha', 'mode',
-                        'pids', 'version_mode', 'doctor', 'venv'}:
+    keys = {'schema', 'boot_id', 'timestamp', 'version', 'sha', 'mode',
+            'pids', 'version_mode', 'doctor', 'venv'}
+    # A red doctor keeps its bounded reason next to a still proven version_mode.
+    if (set(receipt) - {'reason'} != keys
+            or ('reason' in receipt) == (receipt['doctor'] is True)
+            or not re.fullmatch('[a-z-]+:[A-Za-z]+', str(receipt.get('reason', 'x:X')))):
         return 1
     stamp = receipt['timestamp']
     if (receipt['schema'] != SCHEMA or receipt['boot_id'] != boot.read_text().strip()
@@ -106,7 +121,27 @@ def runner_state(unit, venv, verifier, end, *, proc=Path('/proc'), run=command):
     if b'--once' in argv or b'--max-turns' in argv:
         raise ValueError('finite runner is not a permanent service')
     mode = 'dry-run' if b'--dry-run' in argv else 'execute'
-    return int(pid), mode
+    ids = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == b'--runner-id']
+    if len(ids) != 1 or not re.fullmatch(rb'[A-Za-z0-9_.@-]{1,200}', ids[0]):
+        raise ValueError('runner id not proven')
+    return int(pid), mode, ids[0].decode()
+
+
+def readiness(rows, runner_ids, now):
+    """Each launched runner holds a live lease and reports no host block."""
+    if not isinstance(rows, list):
+        raise ValueError('invalid agent overview')
+    for runner_id in runner_ids:
+        held = [row for row in rows if isinstance(row, dict)
+                and row.get('lease_owner') == runner_id]
+        if not held:
+            raise ValueError('runner holds no lease')
+        for row in held:
+            expires = row.get('lease_expires_ts')
+            if type(expires) not in (float, int) or not math.isfinite(expires) or expires <= now:
+                raise ValueError('runner lease expired')
+            if row.get('status') == 'blocked' and row.get('status_text') in HOST_BLOCKS:
+                raise ValueError('runner reports host not ready')
 
 
 def atomic_receipt(path, value):
@@ -171,7 +206,7 @@ def produce(*, card=CARD, boot=BOOT, reader=document):
             raise ValueError('active runner inventory differs from card')
         stage = 'runners-before'
         before = [runner_state(unit, venv, verifier, end) for unit in cfg['units']]
-        if {mode for pid, mode in before} != {'execute'}:
+        if {state[1] for state in before} != {'execute'}:
             raise ValueError('runner mode is not execute')
         stage = 'venv'
         live = verifier.venv_installe(venv)
@@ -190,23 +225,37 @@ def produce(*, card=CARD, boot=BOOT, reader=document):
         if not re.fullmatch('[0-9a-f]{7,40}', sha):
             raise ValueError('unproven source SHA')
         result.update(version=metadata['version'], sha=sha, mode=before[0][1], venv=str(live),
-                      pids=[pid for pid, mode in before])
-        stage = 'doctor'
-        command(['/usr/bin/systemd-run', '--user', '--pipe', '--wait', '--quiet',
-                 '--property=RuntimeMaxSec=35', '--property=TimeoutStopSec=1',
-                 '--property=EnvironmentFile=' + cfg['environment_file'],
-                 '--', str(python), '-I', '-m', 'ameesh', 'doctor'], end, capture=False)
+                      pids=[state[0] for state in before])
+
+        def transient(seconds, *verb):
+            return ['/usr/bin/systemd-run', '--user', '--pipe', '--wait', '--quiet',
+                    '--property=RuntimeMaxSec=%d' % seconds, '--property=TimeoutStopSec=1',
+                    '--property=EnvironmentFile=' + cfg['environment_file'],
+                    '--', str(python), '-I', '-m', 'ameesh', *verb]
+        try:
+            stage = 'doctor'
+            command(transient(30, 'doctor'), end, capture=False)
+            stage = 'readiness'
+            # Bounded: one registry read, after doctor, for the runners above.
+            readiness(json.loads(command(transient(8, 'list', '--json'), end)),
+                      [state[2] for state in before], time.time())
+            healthy = True
+        except Exception as error:
+            # doctor red does not hide version_mode, still proven below.
+            reason, healthy = failure(stage, error), False
         stage = 'runners-after'
         after = [runner_state(unit, venv, verifier, end) for unit in cfg['units']]
         if before != after or verifier.venv_installe(venv) != live:
             raise ValueError('runner changed during health probe')
-        result.update(version_mode=True, doctor=True)
+        result.update(version_mode=True, doctor=healthy)
+        if not healthy:
+            result['reason'] = reason
     except Exception as error:
         reason = failure(stage, error)
         if result is None:
             return 1
         # Red receipts alone gain a reason; green schema remains unchanged.
-        result['reason'] = reason
+        result.update(version_mode=False, doctor=False, reason=reason)
     try:
         atomic_receipt(Path(cfg['receipt']), result)
     except Exception as error:
