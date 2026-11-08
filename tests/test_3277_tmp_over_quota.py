@@ -21,6 +21,7 @@ removed whole, while a recent or protected one is kept.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import stat
 import subprocess
@@ -264,10 +265,6 @@ class OverQuotaTest(PgTestCase):
         # offload and left there when the prevalidation tree was not closed;
         # it is generated, not user work (#6258). A clean, pushed worktree
         # must become recoverable once that single untracked file is gone.
-        # the guest runs under a user systemd whose processes are not
-        # dumpable; the host's unreadable_ok policy is what excuses them.
-        self.pol = dataclasses.replace(
-            self.pol, unreadable_ok=("systemd", "sd-pam", "(sd-pam)"))
         repo = os.path.join(self.state, "repo")
         os.makedirs(repo)
 
@@ -294,11 +291,20 @@ class OverQuotaTest(PgTestCase):
         git("worktree", "add", "-q", tree, "HEAD")
         _write(os.path.join(tree, "ameesh-prevalidation-plan.json"), 2)
         _age(self.old, 2 * DAY)
-        report = self._pass(self._former(), later=LATER)
-        self.assertFalse(os.path.exists(tree))
-        self.assertFalse(os.path.exists(os.path.join(self.old, "ameesh-prevalidation-test")))
+        # Deterministic: the runner's real /proc may contain an unreadable
+        # holder (systemd, sd-pam, a daemon) that would keep the worktree,
+        # which is the right fallback but not what this test probes.
+        with mock.patch.object(hk.platform, "holders", return_value=[]):
+            report = self._pass(self._former(), later=LATER)
+        detail = json.dumps({"entries": report["entries"],
+                             "skipped": report["skipped"],
+                             "plan": report["plan"]},
+                            ensure_ascii=False, default=str)
+        self.assertFalse(os.path.exists(tree), detail)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.old, "ameesh-prevalidation-test")), detail)
         self.assertIn("deleted", [e["action"] for e in report["entries"]
-                                  if e["kind"] == "tmp"])
+                                  if e["kind"] == "tmp"], detail)
 
     def test_former_key_under_quota_ignores_a_future_mtime(self):
         # #6258: test fixtures left mtimes in 2027 under ameesh-cx1; the max
