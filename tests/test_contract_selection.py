@@ -141,7 +141,7 @@ class CanonAndGitTests(unittest.TestCase):
             sha = git("rev-parse", "HEAD")
             policy = mechanics.load(tmp, sha, "ameesh").contract_selection
             self.assertEqual(mechanics.load(tmp, sha, "ameesh").to_dict()["contract_selection"],
-                             {"registry": "contracts.json"})
+                             {"registry": "contracts.json", "publish": "contracts-first"})
             Path(tmp, "contracts.json").write_text("invalid")
             result = cs.load_and_select(tmp, sha, policy, [], INVENTORY)
             self.assertFalse(result.full_suite_required)

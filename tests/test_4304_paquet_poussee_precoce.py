@@ -185,7 +185,7 @@ class PousseePrecoceTest(unittest.TestCase):
                         "freeze", "ci-full"):
             self.assertLess(names.index(gesture), first_test, (gesture, names))
         self.assertEqual(names[:first_test],
-                         ["freeze-checks", "manifest", "inclusion", "contracts", "push", "pr",
+                         ["freeze-checks", "manifest", "inclusion", "contracts", "note", "push", "pr",
                           "freeze", "ci-full"])
         head = flux.calls("manifest")[0][1][0]
         self.assertEqual(flux.calls("freeze")[0][1][2], head)

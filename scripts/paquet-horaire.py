@@ -374,6 +374,7 @@ class Context:
     #: séries simultanées, #4463 borne totale) ; None : bloc absent, les
     #: défauts de paquet-auto
     unit_tests: object = None
+    contract_publication: str | None = None  # compiled project policy
     now: float = field(default_factory=time.time)
     host: str = field(default_factory=socket.gethostname)
     pid: int = field(default_factory=os.getpid)
@@ -755,6 +756,14 @@ def manifest_at(ctx: Context, item: dict, sha: str) -> str:
     return result.stdout
 
 
+CONTRACT_PROOF_RUN = "contracts-proof"
+
+
+def publication_mode(ctx: Context):
+    from ameesh.packet_contract_proof import policy
+    return ctx.contract_publication or policy(ctx.project)
+
+
 def paquet_auto(ctx: Context, name: str, carrier: int, *,
                 exclude: list[int] = (), exclude_reasons: list[str] = (),
                 only: list[int] = (), force: bool = False,
@@ -770,6 +779,7 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
            "--pilot", ctx.pilot, "--from", ctx.actor,
            # #5084 : la pause posée après le départ du tic est relue avant de pousser
            "--pause-project", ctx.project]
+    cmd += ["--contract-publication", publication_mode(ctx)]
     if publish:
         ref, _, sha = publish.rpartition("@")
         cmd += ["--publish", ref, "--publish-sha", sha]
@@ -1400,6 +1410,12 @@ def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
                 and freeze_foreign(item, last.ts) and not running(ctx, last):
             return None
     if found and found[-1].base == sha:
+        # #6183 : --publish conserve la tête/base ; sa CI demandée clôt
+        # la tentative. Une recomposition ordinaire doit encore reprendre,
+        # même si une ancienne CI existe déjà sur sa base.
+        last = found[-1]
+        if sha and last.publish.endswith("@" + sha) and achieved(item, sha, last.ts):
+            return None
         return found[-1]
     if found and sha:
         last = found[-1]
@@ -1535,8 +1551,9 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
     step = this.step
     # La sauvegarde Git réussit parfois alors que sa note échoue ; récupérer
     # la marque exacte de la sortie avant de journaliser le refus de garde.
+    from ameesh.packet_contract_proof import MARK as CONTRACT_MARK
     for line in result.stdout.splitlines():
-        if auto.TESTED_RE.match(line):
+        if auto.TESTED_RE.match(line) or line.startswith(CONTRACT_MARK):
             ctx.note(carrier, line)
     # N1 de relecture : la fin de la sortie seulement (l'erreur qui arrête
     # paquet-auto), pas une phrase citée plus haut par un test rouge
@@ -1566,11 +1583,13 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                     only = carrier_group(show(ctx, carrier))
                 except HoraireError:
                     only = []
-            return attempt(ctx, carrier, name, Attempt(step, this.n + 1, this.base,
-                                                       run_id=this.run_id,
-                                                       exclude=list(this.exclude),
-                                                       only=only,
-                                                       reasons=list(this.reasons)))
+            strict = publication_mode(ctx) != "legacy"
+            return attempt(ctx, carrier, name, Attempt(
+                RECOMPOSITION if strict else step, this.n + 1,
+                this.publish.rsplit("@", 1)[-1] if strict else this.base,
+                run_id=CONTRACT_PROOF_RUN if strict else this.run_id,
+                exclude=list(this.exclude), only=only,
+                reasons=list(this.reasons)))
     elif result.returncode == auto.PAUSED_RC:
         # #5084 : pause posée pendant la tentative, relue avant de pousser ;
         # rien n'est poussé, la tentative n'est pas décomptée (comme un refus
@@ -1623,6 +1642,16 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
     return publish(ctx, item)
 
 
+def contract_result_at(ctx: Context, item: dict, sha: str):
+    from ameesh.packet_contract_proof import read
+    # Fetch the frozen object before resolving its tree, including a carrier
+    # composed by another host. Never substitute the target's current tree.
+    manifest_at(ctx, item, sha)
+    result = ctx.git("rev-parse", sha + "^{tree}")
+    tree = result.stdout.strip() if result.returncode == 0 else ""
+    return read(item, head=sha, tree=tree, target=ctx.target) if tree else None
+
+
 def publish(ctx: Context, item: dict) -> str:
     """Tête gelée : « verdict non requis » si aucune résolution, puis ci-full."""
     carrier = int(item["id"])
@@ -1635,6 +1664,16 @@ def publish(ctx: Context, item: dict) -> str:
         # le retour de paquet-auto ; ni verdict ni ci-full sur un porteur clos
         return "#%d déjà %s : rien à publier" % (
             carrier, "fusionné" if landed else "clos")
+    if publication_mode(ctx) != "legacy":
+        proof = contract_result_at(ctx, item, sha)
+        if proof is None or proof["result"]["state"] == "red":
+            return attempt(ctx, carrier, auto.package_name(str(item.get("branch") or "")),
+                           Attempt(RECOMPOSITION, 1, sha, run_id=CONTRACT_PROOF_RUN,
+                                   only=carrier_group(item),
+                                   publish=str(item["branch"]) + "@" + sha))
+        if proof["result"]["state"] == "inconclusive":
+            ctx.say("#%d : contrats NON CONCLUANTS sur %s ; ci-full requise, aucune preuve verte"
+                    % (carrier, sha[:12]))
     units = composition_units(manifest_at(ctx, item, sha))
     resolutions = [unit for unit in units if unit.resolution]
     lines = ["#%d %s : tête gelée %s, %d unité(s)."
@@ -1703,6 +1742,11 @@ def follow(ctx: Context, item: dict) -> str:
     noted = marks(item)
     if MARK_CI + sha not in noted:
         return publish(ctx, item)
+    if publication_mode(ctx) != "legacy":
+        proof = contract_result_at(ctx, item, sha)
+        state = proof["result"]["state"] if proof else "absent (non qualifié)"
+        ctx.say("#%d : résultat contrats %s sur %s ; résultat ci-full lu séparément"
+                % (carrier, state, sha[:12]))
     run = run_for(ci_status(ctx, carrier), sha)
     if run is None or run.get("status") in ("running", "queued", "pending", None):
         return "#%d : ci-full en cours sur %s" % (carrier, sha[:12])
@@ -1719,7 +1763,7 @@ def follow(ctx: Context, item: dict) -> str:
     # #4237 : une recomposition du pilote n'use pas le retrait automatique
     recomposed = len({a.run_id for a in attempts(item)
                       if a.step == RECOMPOSITION
-                      and a.run_id not in (PILOT_RUN, "parallel-proof")})
+                      and a.run_id not in (PILOT_RUN, "parallel-proof", CONTRACT_PROOF_RUN)})
     if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
         return recompose(ctx, item, run, verdict)
     reason = verdict.why if not verdict.deterministic else \
@@ -2458,6 +2502,8 @@ def main(argv: list[str] | None = None) -> int:
         zone, document = _zone()
         unit_tests = getattr(document, "packet_tests", None)
         parallel = getattr(document, "paquet", None)
+        from ameesh.packet_contract_proof import from_document
+        contract_publication = from_document(document, args.project)
     except Exception as error:  # noqa: BLE001 - sans canon, aucune heure sûre
         print("paquet-horaire : fuseau du canon compilé illisible (%s)" % error,
               file=sys.stderr)
@@ -2467,6 +2513,7 @@ def main(argv: list[str] | None = None) -> int:
                   python=args.python or auto.project_python(repo),
                   dry_run=args.dry_run, zone=zone, epoch=lease_epoch(),
                   unit_tests=unit_tests, parallel=parallel,
+                  contract_publication=contract_publication,
                   pause_of=lambda: read_pause(args.project, args.target,
                                                pilot=args.pilot, notify=not args.dry_run),
                   # #5941 : le verrou partagé avec `ameesh work add` ; la

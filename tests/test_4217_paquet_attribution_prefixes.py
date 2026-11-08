@@ -367,6 +367,7 @@ class ComposePacketPilotMailTest(unittest.TestCase):
                 mock.patch.object(paquet_auto, "compose_candidates",
                                   return_value=composition), \
                 mock.patch.multiple(paquet_auto,
+                    note_carrier=mock.Mock(return_value="note"),
                     contract_budget=mock.Mock(return_value=10),
                     prepublication_contracts=mock.Mock(return_value=paquet_auto.ContractPass(
                         "d" * 40, "e" * 40, paquet_auto.TestRun("contrats", [], 0, "", 0.0))),

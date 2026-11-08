@@ -164,6 +164,7 @@ class Base(unittest.TestCase):
         self.ctx = ph.Context(repo=ROOT, target="main", project="ameesh",
                               pilot="mesh-design", actor="mesh-design",
                               shell=self.shell, python="python3", now=NOW,
+                              contract_publication="legacy",
                               zone=ZONE)
         self._saved = (ph.ready_lots, ph.manifest_at, ph.replay_locally,
                        ph.auto.composition_holder)

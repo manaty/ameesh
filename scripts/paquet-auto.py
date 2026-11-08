@@ -37,7 +37,7 @@ l'ordre, sans agent :
    (plan commun, #6182) précède déjà la poussée, le gel et la ci-full :
    budget canon, attente de créneau comprise, résultat réutilisé sans rejeu.
    Une expiration est non concluante et laisse publier avec ci-full ; un
-   contrat négatif suspend cette tentative avant publication ; un arbre
+   contrat négatif rejoint contract_red après publication avec ci-full ; un arbre
    modifié invalide la passe et demande une nouvelle composition. Un test ciblé **rouge** d'un module **voisin**
    est situé en rejouant ce test sur les préfixes de l'empilement, dans
    l'ordre (`base + u1`, `base + u1 + u2`, …) : la première unité où il
@@ -2159,6 +2159,25 @@ def prepublication_contracts(worktree: Path, *, base: str,
     return report
 
 
+def publication_policy(args):
+    supplied = getattr(args, "contract_publication", None)
+    if supplied:
+        return supplied
+    project = getattr(args, "pause_project", "") or ""
+    if not project:
+        return "contracts-first"  # D compatibility for direct, non-project calls
+    from ameesh.packet_contract_proof import policy
+    return policy(project)
+
+
+def record_contract_result(worktree, carrier, report, *, base, target):
+    from ameesh.packet_contract_proof import encode
+    verify_contract_scope(worktree, report)
+    note = encode(report, base=base, target=target)
+    print(note, flush=True)  # scheduler can recover a failed journal write
+    print(note_carrier(worktree, carrier, note), flush=True)
+
+
 def contract_budget(args) -> int | None:
     """CLI value supplied by the scheduler, otherwise existing compiled policy.
 
@@ -2491,6 +2510,82 @@ def prefix_failures(worktree: Path, composition: Composition,
         remove_worktree(worktree, path)
 
 
+def earlier_red(worktree: Path, composition: Composition,
+                removals: list[Removal], *, timeout: int,
+                replay=None, log=print, guard=None,
+                deadline: float | None = None) -> dict[int, int]:
+    """#6232 : les retraits dont le rouge vient d'une unité antérieure retirée.
+
+    Pour chaque retrait hors préfixes (repli, preuve #3801), dans l'ordre de
+    l'empilement, les tests rouges de l'unité sont rejoués sur le préfixe qui
+    s'arrête à la dernière unité antérieure retirée. S'ils y sont **tous**
+    rouges, le rouge précède l'unité : elle est innocente, ni retirée ni
+    marquée `packet-unit-red`. Un rejeu non concluant, un retrait sans nom de
+    test ou un test seulement en partie rouge garde le retrait (geste
+    antérieur). Rend `{lot innocent: lot antérieur retiré}`.
+    """
+    positions = {unit.lot: index for index, unit in enumerate(composition.units)}
+    ordered = sorted((removal for removal in removals
+                      if removal.lot in positions),
+                     key=lambda removal: positions[removal.lot])
+    if len(ordered) < 2:
+        return {}
+    replay = replay or run_tests
+    innocent: dict[int, int] = {}
+    kept: list[Removal] = []
+    path: Path | None = None
+    try:
+        for removal in ordered:
+            earlier = kept[-1] if kept else None
+            names = [name for name in removal.tests if name]
+            if earlier is None or removal.proof == "prefixes" or not names \
+                    or len(names) != len(removal.tests):
+                kept.append(removal)
+                continue
+            limit = series_timeout(timeout, deadline)
+            if limit is None:
+                kept.append(removal)
+                continue
+            if guard is not None:
+                guard()
+            commit = composition.units[positions[earlier.lot]].commit
+            if path is None:
+                parent = temporary_parent()
+                path = Path(tempfile.mkdtemp(prefix="paquet-auto-anterieur-",
+                                             dir=str(parent)))
+                path.rmdir()
+                added = git(worktree, "worktree", "add", "--detach", str(path),
+                            commit, check=False)
+                if added.returncode != 0:
+                    shutil.rmtree(path, ignore_errors=True)
+                    path = None
+                    log("tests ciblés : préfixe antérieur impossible, retraits "
+                        "gardés : %s" % _tail(_decode(added.stderr), 3))
+                    return {}
+            else:
+                moved = git(path, "reset", "--hard", commit, check=False)
+                git(path, "clean", "-fdq", check=False)
+                if moved.returncode != 0:
+                    kept.append(removal)
+                    continue
+            label = "préfixe de #%d (rouge de #%d)" % (earlier.lot, removal.lot)
+            run = replay(path, label, names, timeout=limit,
+                         **({"wall": limit} if deadline is not None else {}))
+            failed = ({entry["test"] for entry in unittest_failures(run.output)}
+                      if not run.inconclusive and not run.green else set())
+            if failed and all(_failure_matches(name, failed) for name in names):
+                innocent[removal.lot] = earlier.lot
+                log("tests unité #%d : rouge déjà présent sur le préfixe de #%d "
+                    "(retirée) — unité innocente, gardée : %s"
+                    % (removal.lot, earlier.lot, ", ".join(names[:5])))
+            else:
+                kept.append(removal)
+    finally:
+        if path is not None:
+            remove_worktree(worktree, path)
+    return innocent
+
+
 def designated_removals(attribution: dict, failures: list[dict], *,
                         known_lots=None) -> tuple[list[Removal], str]:
     """Les unités désignées sans ambiguïté pour **tous** les échecs.
@@ -2666,10 +2761,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
                       select=None, on_base=None, guard=None,
-                      prefix=None,
+                      prefix=None, earlier=None,
                       parallel: int = DEFAULT_PARALLEL,
                       deadline: float | None = None,
-                      contract_report: ContractPass | None = None) -> tuple[list[TestRun], list[int],
+                      contract_report: ContractPass | None = None,
+                      legacy_contracts: bool = False) -> tuple[list[TestRun], list[int],
                                                               list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
@@ -2693,6 +2789,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     est **consigné** dans `runs` et ne retire aucune unité : le canon §3 veut
     qu'il ne retienne ni paquet ni release ; la ci-full tranche.
     `attribute` est injectable pour les témoins (`attribute_composition`).
+
+    #6232 : un retrait dont les tests rouges le sont déjà sur le préfixe d'une
+    unité antérieure retirée est abandonné (`earlier_red`, injectable par
+    `earlier`) : l'unité innocente n'est pas retirée avec la fautive.
 
     #4025 : la série d'une unité joue aussi ses modules voisins
     (`neighbor_modules`, injectable par `select`). Dans le geste antérieur,
@@ -2778,7 +2878,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     def contract_job():
         remaining = max(0.1, deadline - time.monotonic()) if deadline is not None else GIT_TIMEOUT
         try:
-            modules = contract_modules(worktree, base=base_sha, timeout=remaining)
+            modules = contract_modules(worktree, base="" if legacy_contracts else base_sha, timeout=remaining)
         except PaquetAutoError as exc:
             # Unavailable planning is not a negative test. CI still runs the
             # full suite; this pass records no qualification of the contracts.
@@ -3061,6 +3161,16 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             log("tests contrats : rouge non attribuable (%s) — retrait des "
                 "unités aux tests propres rouges, puis recomposition"
                 % (why or "attribution incertaine"))
+    if len(removals) > 1:
+        if guard is not None:
+            guard()
+        bounds = ({"guard": guard} if guard is not None else {}) | (
+            {"deadline": deadline} if deadline is not None else {})
+        innocent = (earlier or earlier_red)(
+            worktree, composition, removals, timeout=timeout, log=log,
+            **bounds)
+        removals = [removal for removal in removals
+                    if removal.lot not in innocent]
     if removals:
         how = why
         if not how and any(removal.proof == "prefixes" for removal in removals):
@@ -4207,10 +4317,23 @@ def publish_tested(args: argparse.Namespace) -> int:
               flush=True)
         units = "\n".join("- %s `%s`" % (", ".join("#%d" % lot for lot in row_lots),
                                          source[:12]) for row_lots, source in specs)
+        contract_note = "Repli legacy : aucun résultat de contrats réutilisé."
+        if publication_policy(args) != "legacy":
+            report = prepublication_contracts(
+                worktree, base=base_sha, budget=contract_budget(args), guard=guard,
+                expected_head=head, parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+            record_contract_result(worktree, args.carrier, report, base=base_sha, target=args.target)
+            from ameesh.packet_contract_proof import projection
+            contract_state = projection(report, base=base_sha, target=args.target)["result"]["state"]
+            contract_note = "Contrats de reprise : " + contract_state
+            if contract_state == "red":
+                # Returning PUBLISH_REFUSED enters the scheduler's existing
+                # recomposition path, where contract_red attributes/removes.
+                raise ChainRefused("contrats rouges sur la tête reprise : recomposer pour attribution")
         origin = ("Tête `%s` poussée et gelée par un détenteur précédent du bail, "
-                  "tests par unité verts, refusée au geste suivant ; fin publiée "
-                  "par reprise (#4237), tests non rejoués : résumé à la marque "
-                  "« tête testée » du porteur #%d." % (head[:12], args.carrier))
+                  "fin publiée par reprise (#4237), tests par unité non rejoués : "
+                  "leur qualification reste celle du journal d'origine du porteur #%d "
+                  "et n'est pas déduite de cette reprise." % (head[:12], args.carrier)) + " " + contract_note
         guard()
         state = pull_request_state(worktree, branch)
         pr_number: int | None = None
@@ -4234,7 +4357,7 @@ def publish_tested(args: argparse.Namespace) -> int:
         print(note_carrier(
             worktree, args.carrier,
             "paquet %s : fin publiée par scripts/paquet-auto.py --publish (#4237) "
-            "sur la tête poussée %s, tests par unité d'origine verts (non rejoués) ; "
+            "sur la tête poussée %s, tests par unité non rejoués (qualification au journal d'origine) ; "
             "manifeste %s" % (args.name, head[:12], rel)), flush=True)
         check_pause(worktree, getattr(args, "pause_project", "") or "", args.target)
         print(request_full_ci(worktree, args.carrier, head), flush=True)
@@ -4493,18 +4616,19 @@ def compose_packet(args: argparse.Namespace) -> int:
                     "contrôle d'inclusion rouge sur la tête %s : voir le rapport "
                     "ci-dessus" % head[:12])
             print("inclusion : vert", flush=True)
-            contract_report = prepublication_contracts(
-                worktree, base=base_sha, budget=contract_budget(args), guard=guard, expected_head=head,
-                parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
-            contract_run = contract_report.run
-            print("contrats avant publication : %s (%.1f s)%s" % (
-                "NON CONCLUANT" if contract_run.inconclusive else
-                ("vert" if contract_run.green else "ROUGE"), contract_run.seconds,
-                (" — " + contract_run.log_path) if contract_run.log_path else ""), flush=True)
-            # A red report must reach the existing attribution/removal path.
-            # Until prepublication attribution is available (#6183), publish
-            # with ci-full rather than suspend the same candidates forever.
-            # check_local_tests consumes this exact report without replaying it.
+            contract_report = None
+            if publication_policy(args) != "legacy":
+                contract_report = prepublication_contracts(
+                    worktree, base=base_sha, budget=contract_budget(args), guard=guard, expected_head=head,
+                    parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+                contract_run = contract_report.run
+                print("contrats avant publication : %s (%.1f s)%s" % (
+                    "NON CONCLUANT" if contract_run.inconclusive else
+                    ("vert" if contract_run.green else "ROUGE"), contract_run.seconds,
+                    (" — " + contract_run.log_path) if contract_run.log_path else ""), flush=True)
+                if not args.local:
+                    record_contract_result(worktree, args.carrier, contract_report,
+                                           base=base_sha, target=args.target)
             if not args.local:
                 if guard is not None:
                     guard()
@@ -4517,7 +4641,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                             % (branch, state.lower()))
                 check_pause(worktree, getattr(args, "pause_project", "") or "",
                             args.target)
-                verify_contract_scope(worktree, contract_report)
+                if contract_report is not None:
+                    verify_contract_scope(worktree, contract_report)
                 push_branch(worktree, branch, force_lease=lease)
                 print("poussée : %s%s" % (branch, " (recomposition)"
                                           if lease else ""), flush=True)
@@ -4537,7 +4662,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                     worktree, composition, timeout=args.tests_timeout,
                     base_sha=base_sha, guard=tests_guard,
                     parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
-                    deadline=deadline, contract_report=contract_report)
+                    deadline=deadline, contract_report=contract_report,
+                    legacy_contracts=publication_policy(args) == "legacy")
             except CarrierSettled as settled:
                 rc = interrupted_by_carrier(args, worktree, branch, head,
                                             settled.state)
@@ -4560,6 +4686,11 @@ def compose_packet(args: argparse.Namespace) -> int:
                 notify_flaky(args.name, args.carrier, flaky,
                              pilot=getattr(args, "pilot", "mesh-design"),
                              sender=getattr(args, "sender", None))
+            if contract_report is not None and not args.local:
+                # Classification may turn a flaky negative into an explicit
+                # inconclusive result; the projection must reflect that too.
+                record_contract_result(worktree, args.carrier, contract_report,
+                                       base=base_sha, target=args.target)
             if not faulty:
                 break
             if pushed:
@@ -4789,6 +4920,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-failed-hours", type=float, default=24.0,
                         help="N1 : purger un worktree d'échec au-delà de N "
                              "heures (défaut : 24 ; 0 = jamais)")
+    parser.add_argument("--contract-publication", choices=("contracts-first", "legacy"),
+                        default=None, help="#6183 : politique du projet compilée par le composeur")
     parser.add_argument("--publish", default=None, metavar="REF",
                         help="#4237 : publier sans retester la tête testée gardée "
                              "sous REF (%s<nom>) : chaîne et branche vérifiées, "

@@ -92,7 +92,8 @@ class AmeeshRegistryTests(unittest.TestCase):
         universal = {m for r in self.registry.rules if not r.paths for m in r.modules}
         self.assertEqual(universal, legacy)
         self.assertEqual(declared, legacy | {"test_l161f_plan", "test_contract_plan",
-                                                  "test_6182_contracts_before_publish"})
+                                                  "test_6182_contracts_before_publish",
+                                                  "test_6183_contract_proof_resume"})
         for changes in ((), (cs.Change('M', 'src/ameesh/storage/interface.py'),),
                         (cs.Change('A', 'unknown/new.file'),)):
             result = self.select(*changes)
