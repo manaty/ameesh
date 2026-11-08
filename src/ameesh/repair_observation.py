@@ -5,6 +5,9 @@ The shared U5 cursor is a scan position, never a lease or authorization.
 Scans wrap at EOF: late commits and changed existing inputs are eventually
 revisited, including a crash after receipt but before settlement. Replaying
 uses stable source identities and occurrence high-water counts, not deliveries.
+For alerts, a key's occurrence is the number of ``alert.raised`` events already
+committed for that project and key: raising one key N times yields N, while
+replaying the same page recomputes the same count and never adds a delivery.
 Only metadata is selected; source bodies and exception messages stay private.
 """
 from __future__ import annotations
@@ -18,6 +21,29 @@ from .repair_correlation import ENVIRONNEMENT
 
 # U5 currently settles entries individually; cap database round trips per turn.
 BATCH = 20
+
+
+def _alert_occurrences(db, project, keys):
+    """Number of committed raises of each alert key, a source high-water count.
+
+    One aggregate per page, then the identity of a raise is its alert key, so N
+    raises of one key give N occurrences while one signal identity stays unique.
+    The partial ``ameesh_events_alert_project_id_idx`` bounds the aggregate to
+    the project's alerts (never the whole event log); the count is read from the
+    source rows, never incremented by a delivery, so a page replay is neutral.
+    A raise whose lower event id commits late is still counted on a later pass:
+    the count is an upper bound of the raises already visible, not a position.
+    The caller keeps at least the duplicates of the page it already holds, so a
+    concurrent retention prune cannot make an observed raise disappear.
+    """
+    keys = sorted({key for key in keys if isinstance(key, str) and key})
+    if not keys:
+        return {}
+    rows = db.query(
+        "SELECT data->>'key' AS key, count(*) AS occurrences"
+        " FROM ameesh_events WHERE project=%s AND type='alert.raised'"
+        " AND data->>'key' = ANY(%s::text[]) GROUP BY 1", (project, keys))
+    return {row['key']: int(row['occurrences']) for row in rows}
 
 
 def ingest(db, *, project, environment, source, rows, expected_cursor,
@@ -66,6 +92,8 @@ def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None):
     Wraparound deliberately trades extra deduplicated reads for no irreversible
     high-water skip when a source transaction commits out of ID order. A new
     holder resumes the shared scan, not the previous host's local state.
+    Alert occurrences come from the source raises of the key, never from the
+    number of pages that delivered it (see :func:`_alert_occurrences`).
     """
     now = time.time() if now is None else now
     api = storage.of(db).repair_signals
@@ -78,14 +106,25 @@ def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None):
             " extract(epoch FROM created_at) AS observed"
             " FROM ameesh_events WHERE project=%s AND type='alert.raised'"
             " AND id>%s ORDER BY id LIMIT %s", (project, after, BATCH))
+        page_occurrences = {}
+        for row in rows:
+            key = row['key']
+            if isinstance(key, str) and key:
+                page_occurrences[key] = page_occurrences.get(key, 0) + 1
+        occurrences = _alert_occurrences(
+            db, project, [row['key'] for row in rows])
         inputs = []
         for row in rows:
             try:
                 since = float(row['since']) if row.get('since') else row['observed']
             except (ValueError, TypeError):
                 since = row['observed']  # malformed source timestamp: observation time
-            inputs.append({'key': row['id'], 'observed_version': row['version'], 'entry': {
-                'key': row['key'], 'project': project, 'since': since}})
+            key = row['key']
+            inputs.append({'key': row['id'],
+                           'occurrence': max(occurrences.get(key, 0),
+                                             page_occurrences.get(key, 1)),
+                           'observed_version': row['version'], 'entry': {
+                'key': key, 'project': project, 'since': since}})
         next_cursor = str(rows[-1]['id']) if rows else None
     elif source == 'github_watch':
         after = json.loads(cursor) if cursor is not None else ['', '', 0]
