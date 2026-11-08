@@ -1,0 +1,12 @@
+# Render this login consistently with cible.json and sudoers; validate sshd -t.
+Match User vm-operator
+    AuthorizedKeysFile /etc/ssh/authorized_keys/vm-operator
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PermitTTY no
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitUserEnvironment no
+    ForceCommand /opt/ameesh-vm-adapter/venv/bin/python -I /opt/ameesh-vm-adapter/remote/vm-remote.py dispatch
+Match all

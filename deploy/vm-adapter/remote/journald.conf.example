@@ -1,0 +1,5 @@
+# Bureau: render capacity for the target and install a root-owned drop-in.
+# No runtime application is performed by this lot.
+[Journal]
+Storage=persistent
+SystemMaxUse=128M
