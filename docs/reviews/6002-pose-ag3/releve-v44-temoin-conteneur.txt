@@ -1,0 +1,21 @@
+OK   pose u:vm-operator:--x
+OK   mask:: présent après pose (cause du B v4.1)
+OK   vm-operator ne liste pas /home/ameesh
+non-dérive OK : seules u:vm-operator:--x (et mask::) diffèrent de l'état avant
+ACL restaurées : getfacl des 4 parents = reçu avant, à l'octet
+OK   retour rc 0
+OK   getfacl avant = après, à l octet
+OK   aucun mask:: résiduel
+OK   nettoyage poursuivi après le retour ACL
+OK   dérive : STOP (rc 1)
+OK   dérive : rien effacé (ACL inchangées)
+OK   reçu non 0600 refusé
+OK   pose (cas mode)
+OK   dérive de mode : STOP (rc 1)
+OK   dérive de mode : rien restauré ni effacé
+OK   reçu absent + ACL posée : STOP, rien touché
+OK   même reçu remis : restauration OK
+OK   reçu absent, aucune ACL : STOP par défaut
+OK   reçu absent, aucune ACL, --sans-acl : retour sans ACL autorisé
+OK   lecture getfacl en échec + --sans-acl : STOP (rc 1)
+OK   getfacl absent + --sans-acl : STOP (rc 1)
