@@ -37,6 +37,9 @@ TOOL_CREDENTIALS = {
 SECRET_PARTS = re.compile(r"(?:^|_)(?:API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIALS?)(?:_|$)")
 DECLARED_CREDENTIALS: set[str] = set()
 SECRET_SUFFIXES = ("_KEY", "_DSN", "_DATABASE_URL")
+#: #6287: the auditor role's own read-only connection string. It is granted to
+#: that role's harness alone, never through an executable name or a global list.
+AUDITOR_CREDENTIALS = frozenset({"AUDITEUR_DSN"})
 
 
 class GrantedEnvironment(dict):
@@ -155,13 +158,22 @@ def execution_transport(environment: Mapping) -> GrantedEnvironment:
     return grant(environment, TOOL_CREDENTIALS["ameesh"] | TOOL_CREDENTIALS["gh"])
 
 
-def harness(environment: Mapping, family: str, profile=None) -> GrantedEnvironment:
-    """Grant the selected account and the turn's execution transports only."""
+def harness(environment: Mapping, family: str, profile=None, *,
+            auditor: bool = False) -> GrantedEnvironment:
+    """Grant the selected account and the turn's execution transports only.
+
+    ``auditor`` adds the auditor role's own read-only SQL DSN (#6287). The
+    caller reads the role from its canon before selecting the account; no
+    executable name and no global allowlist grant it. The variable exists only
+    on an executor whose unit sets it, i.e. on a candidate host of the role.
+    """
     from .. import accounts
     names = set(TOOL_CREDENTIALS["ameesh"]) | set(TOOL_CREDENTIALS["gh"])
     variable = getattr(profile, "env", "") or accounts.default_key_env_of(family)
     if variable:
         names.add(variable)
+    if auditor:
+        names.update(AUDITOR_CREDENTIALS)
     if family == "claude":
         names.update({"ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
                       "CLAUDE_CODE_OAUTH_REFRESH_TOKEN"})

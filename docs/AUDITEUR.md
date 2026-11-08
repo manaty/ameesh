@@ -1066,7 +1066,8 @@ une permission), une fois en place les rôles du contrat de supervision
 PGOPTIONS='-c search_path=<schéma ameesh>' \
   psql "<DSN d'un rôle qui peut CREATE ROLE>" -v ON_ERROR_STOP=1 \
        -f deploy/sql/role-auditeur.sql
-# mot de passe : jamais dans un fichier versionné ; puis une ligne ~/.pgpass (0600)
+# mot de passe : jamais dans un fichier versionné ; puis une ligne dans le
+# fichier 0600 que le DSN nomme par passfile= (p. ex. ~/.config/ameesh/auditeur.pgpass)
 psql "<DSN d'un rôle qui peut CREATE ROLE>"   # \password auditeur_lecture
 ```
 
@@ -1102,19 +1103,46 @@ fusionner une PR sur le dépôt d'ameesh. Une identité dédiée, aux droits bor
 décider.
 
 **Environnement** de son exécuteur
-(`~/.config/systemd/user/ameesh-runner-agent@auditeur.service.d/auditeur.conf`),
-sans aucun secret. `AUDITEUR_DSN` ne se pose qu'une fois le rôle créé (voir
+(`~/.config/systemd/user/ameesh-runner-agent@auditeur.service.d/`), sans aucun
+secret en clair. `AUDITEUR_DSN` ne se pose qu'une fois le rôle créé (voir
 « Mise en service ») ; sans lui, la consigne interdit `psql` et l'analyse reste
-sur `ameesh … --json` :
+sur `ameesh … --json`. L'exécuteur ne transmet cette variable qu'au harnais de
+l'agent auditeur (#6287), jamais à un autre agent ni à un outil tiers. Le DSN
+a son propre drop-in, les autres réglages restent dans `auditeur.conf` :
 
 ```ini
+# ameesh-runner-agent@auditeur.service.d/auditeur-dsn.conf
+[Service]
+# Rôle auditeur_lecture, lecture seule ; TLS exigé. Le fichier de mots de passe
+# se donne par passfile= DANS le DSN (0600, propriétaire de l'exécuteur).
+Environment="AUDITEUR_DSN=host=<hôte de la base> port=5432 dbname=<base> user=auditeur_lecture sslmode=require passfile=<chemin du fichier de mots de passe>"
+
+# ameesh-runner-agent@auditeur.service.d/auditeur.conf
 [Service]
 Environment=AMEESH_IDLE_NUDGE=3600
-Environment=AUDITEUR_DSN=postgresql://auditeur_lecture@<hôte de la base>/<base>
 Environment="AUDITEUR_CI_REPOS=<propriétaire/dépôt> <propriétaire/dépôt>"
 Environment=AUDITEUR_RESERVE_PREFIX=<préfixe des runners de la réserve>
 Environment=AUDITEUR_RESERVE_DIR=<dossier des scripts de la réserve>
 ```
+
+**Jamais `Environment=PGPASSFILE=…` sur l'unité** : il masquerait le
+`~/.pgpass` de l'exécuteur pour tous ses enfants, y compris sa propre connexion
+à la base du mesh, qui échouerait alors (`fe_sendauth`). Le DSN porte son
+`passfile=` : seul `psql "$AUDITEUR_DSN"` lit ce fichier. Incident du
+2026-11-08 entre 06:07 et 06:15Z : runner auditeur en échec au démarrage, bail
+perdu, préflight du staging `41262fcd` refusé.
+
+Après toute modification de l'environnement d'un exécuteur (drop-in, fichier
+`env`, unité), **vérifier un démarrage sain avant toute séquence de staging** :
+
+```sh
+systemctl --user restart ameesh-runner-agent@auditeur
+systemctl --user is-active ameesh-runner-agent@auditeur   # doit rendre "active"
+ameesh doctor                                             # doit être vert
+```
+
+Un préflight de staging reste refusé tant que l'exécuteur n'a pas redémarré
+sainement (leçon de l'auditeur, #200290).
 
 L'exécuteur ne relance un agent au repos qu'**une fois** : après un tour de
 relance, il attend du courrier. (#408 : s'il détient un lot actionnable, la règle 1
