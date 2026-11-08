@@ -1,0 +1,19 @@
+OK   copie interrompue : arrêt de la source consigné AVANT (intention stop_source src1)
+OK   copie interrompue : le retour relance la source arrêtée
+OK   cible créée sans santé : ID consigné avant l attente (targets)
+OK   cible sans santé : le retour la reconnaît (étiquette 6321) et l arrête
+OK   conteneur rootless sans étiquette : retour refusé (charge inconnue)
+OK   phase C --apply hors fenêtre : refus avant toute mutation
+OK   retour hors fenêtre sans secours : refusé
+OK   retour hors fenêtre avec secours + courrier : accepté et consigné
+OK   packages_sha256 trouve la bonne strophe
+OK   packages_sha256 : autre version → None
+OK   containerd_proof : origine noble-updates et sha256 du .deb = index
+OK   containerd_proof : .deb absent du cache → dit, non comparé
+OK   .deb altéré → refus
+OK   origine autre que noble-updates → refus
+OK   ports 127.0.0.1 seulement + garde refusant les 4 ports → OK
+OK   55441 aussi sur 0.0.0.0 → refus
+OK   55443 sur :: → refus
+OK   jeu chargé sans 55442 (texte conforme) → refus
+OK   garde sans 55442 → refus

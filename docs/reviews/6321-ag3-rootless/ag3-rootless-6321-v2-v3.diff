@@ -1,0 +1,137 @@
+--- ag3-rootless-6321-v2.py	2026-11-08 13:54:51.390601833 +0000
++++ ag3-rootless-6321-v3.py	2026-11-08 14:06:02.662538447 +0000
+@@ -1,4 +1,11 @@
+-"""#6321 v2 (réponses mesh-design #200904) — O1 seules les 4 images de base ; O2 preuve containerd (dpkg
++"""#6321 v3 (avis impl-11 #200929) — B1 intentions et identités persistées AVANT chaque mutation
++(volume, arrêt de source, création de cible ; ID de cible écrit avant l'attente de santé), retour qui
++réconcilie l'état Docker réel avec ces identités et l'étiquette ameesh.operator=6321 ; B2 garde de
++fenêtre en phase C avant toute mutation, retour soumis à la même garde sauf secours explicite
++(autorité secours_hors_fenetre + secours_mail) ; N : SQL par ameesh heavy, garde d'invités prouvée
++par le texte ET par le jeu de règles chargé (nft list ruleset).
++
++#6321 v2 (réponses mesh-design #200904) — O1 seules les 4 images de base ; O2 preuve containerd (dpkg
+ --verify, version et origine, sha256 du .deb comparé à l'index Packages s'il est en cache) ; O5 fenêtre
+ 09/11 13:00-15:30Z exigée pour --apply ; O7 preuve ss -ltn et garde d'invités en phase C ; O4 critère 1
+ de la phase B (aucun processus uid 1001 avec 112, pause Podman compris).
+@@ -318,8 +325,13 @@
+     assert all(h == {'127.0.0.1'} for h in seen.values()), 'port PG lié hors de 127.0.0.1 : %s' % seen
+     text = GUEST_FIREWALL.read_text()
+     denied = set(re.findall(r'\b(\d{4,5})\b', ' '.join(re.findall(r'tcp dport \{([^}]*)\} reject', text))))
+-    assert PG_PORTS <= denied, 'garde d invités : ports PG non refusés'
+-    return {'listen': {k: sorted(v) for k, v in seen.items()}, 'guest_gate_denies': sorted(PG_PORTS)}
++    assert PG_PORTS <= denied, 'garde d invités : ports PG non refusés (texte de firewall.nft)'
++    # N (#200929) : le texte ne prouve pas le chargement ; le jeu de règles ACTIF est lu aussi.
++    active = command(['nft', 'list', 'ruleset']).stdout.decode()
++    loaded = set(re.findall(r'\b(\d{4,5})\b', ' '.join(re.findall(r'tcp dport \{([^}]*)\} reject', active))))
++    assert PG_PORTS <= loaded, 'garde d invités : ports PG absents du jeu de règles chargé'
++    return {'listen': {k: sorted(v) for k, v in seen.items()}, 'guest_gate_denies': sorted(PG_PORTS),
++            'preuve': 'texte de /etc/ameesh-guest/firewall.nft ET nft list ruleset (chargé)'}
+ 
+ 
+ def inspecter():
+@@ -416,10 +428,15 @@
+         progress('PG ' + name + ' : arrêt de la source, copie, démarrage rootless')
+         existing = [json.loads(x) for x in docker(RL, 'volume', 'ls', '--format', '{{json .Name}}').stdout.decode().splitlines() if x]
+         assert p['volume'] not in existing, 'Volume cible existant : réconcilier sans écraser'
++        # B1 (#200929) : chaque intention et son identité sont sur disque AVANT la mutation.
++        record.setdefault('intents', []).append({'kind': 'volume_create', 'name': p['volume']})
++        progress('intention : volume rootless ' + p['volume'])
+         docker(RL, 'volume', 'create', '--label=ameesh.operator=6321', p['volume'])
++        record['intents'].append({'kind': 'stop_source', 'name': name, 'id': p['id']})
++        record.setdefault('sources_stopped', []).append(name)
++        progress('intention : arrêt de la source ' + name)
+         docker(RF, 'stop', '--time=60', name, timeout=90)
+         assert not inspect(RF, name)['State']['Running']
+-        record.setdefault('sources_stopped', []).append(name)
+         stream(['docker', '--host', RF, 'run', '--rm', '--network=none', '--label=ameesh.operator=6321',
+                 '--mount', 'type=volume,src=' + p['volume'] + ',dst=/data,readonly',
+                 '--entrypoint=/bin/tar', p['image'], '--numeric-owner', '-C', '/data', '-cpf', '-', '.'],
+@@ -434,8 +451,11 @@
+         hc = p['healthcheck'] or {}
+         health = (['--health-cmd=' + ' '.join(hc['Test'][1:])] if hc.get('Test', [''])[0] == 'CMD-SHELL'
+                   else ['--health-cmd=pg_isready -U ' + p['role'] + ' -d postgres'])
++        record['intents'].append({'kind': 'create_target', 'name': name, 'label': 'ameesh.operator=6321'})
++        progress('intention : création de la cible ' + name)
+         try:
+             created = docker(RL, 'run', '-d', '--name=' + name, '--restart=unless-stopped', '--label=ameesh.operator=6321',
++                             '--label=ameesh.operator.source=' + name,
+                              '--env-file', envfile, '-p', '127.0.0.1:' + p['port'] + ':5432',
+                              '--mount', 'type=volume,src=' + p['volume'] + ',dst=/var/lib/postgresql/data',
+                              *health, '--health-interval=2s', '--health-timeout=3s', '--health-retries=60',
+@@ -443,6 +463,7 @@
+         finally:
+             user(['/usr/bin/rm', '-f', '--', envfile])
+         targets[name] = created
++        progress('cible créée ' + name + ' ; attente de santé', targets=targets)
+         deadline = time.monotonic() + 150
+         while inspect(RL, name)['State'].get('Health', {}).get('Status') != 'healthy':
+             assert time.monotonic() < deadline, name + ' : santé cible non atteinte ; inspecter avant tout rejeu'
+@@ -555,6 +576,7 @@
+         return
+     assert re.fullmatch(r'[0-9a-f]{40}', sha)
+     authority('phase-C', ['native_AG3_drain_active', 'no_unapproved_personal_session', 'release_tag_and_test_source_sha_verified'])
++    outside_cutoffs()  # B2 (#200929) : fenêtre O5 et coupures, avant toute mutation de la phase C
+     assert not (ROOT / 'phase-C-progress.json').exists()
+     record = {'lot': 6321, 'test_source_sha': sha, 'drain_lifted': False}
+ 
+@@ -591,7 +613,8 @@
+                                   '--setenv=PATH=' + HOME + '/.local/share/ameesh/venv/bin:/usr/local/bin:/usr/bin:/bin', *args]),
+                        timeout=timeout, allow_error=True)
+ 
+-    sql = unit('real-sql', ['/bin/bash', workdir + '/scripts/test-parallele.sh', '-n', '1', '-p', 'psql',
++    # N (#200929) : la suite SQL passe par le régulateur des suites lourdes (ameesh heavy).
++    sql = unit('real-sql', [HOME + '/.local/share/ameesh/venv/bin/ameesh', 'heavy', '--', '/bin/bash', workdir + '/scripts/test-parallele.sh', '-n', '1', '-p', 'psql',
+                             '--liste', workdir + '/.operator-6321-modules.txt'], timeout=1800)
+     write_private(ROOT / 'phase-C-SQL.private.log', sql.stdout + sql.stderr)
+     assert sql.returncode == 0 and b'base(s)' in sql.stdout and b'OK' in sql.stdout, 'Module SQL réel en échec'
+@@ -621,8 +644,15 @@
+         return
+     proof = authority('retour', ['native_AG3_drain_active', 'no_active_turns', 'no_unapproved_personal_session',
+                                  'target_writes_reconciled'])
++    # B2 (#200929) : le retour suit la même garde de fenêtre, SAUF secours explicite et documenté :
++    # autorité « secours_hors_fenetre: true » + « secours_mail » (courrier de mesh-design), consignés.
++    secours = proof.get('secours_hors_fenetre') is True
++    if secours:
++        assert proof.get('secours_mail', 0) > 0, 'Secours sans courrier du pilote'
++    else:
++        outside_cutoffs()
+     assert not (ROOT / 'retour-progress.json').exists(), 'Retour antérieur : réconcilier'
+-    record = {'lot': 6321, 'kind': 'retour avant clé'}
++    record = {'lot': 6321, 'kind': 'retour avant clé', 'secours_hors_fenetre': secours, 'secours_mail': proof.get('secours_mail')}
+ 
+     def save(phase, **f):
+         record.update(f, phase=phase, at=stamp())
+@@ -630,11 +660,15 @@
+ 
+     save('autorité vérifiée', **plan)
+     if Path('/run/user/1001/docker.sock').exists():
+-        names = docker(RL, 'ps', '-a', '--format', '{{.Names}}').stdout.decode().split()
+-        assert set(names) <= set(a.get('targets', {})), 'Charge rootless inconnue : réconcilier'
+-        for name in names:
+-            if inspect(RL, name)['State']['Running']:
+-                docker(RL, 'stop', '--time=60', name, timeout=90)
++        # B1 : réconciliation de l'état réel. Tout conteneur rootless doit porter l'étiquette de ce lot
++        # (cibles, y compris créées sans santé, et conteneurs de copie) ; un autre = charge inconnue.
++        rows = [line.split('|') for line in docker(RL, 'ps', '-a', '--format', '{{.ID}}|{{.Names}}|{{.Label "ameesh.operator"}}').stdout.decode().splitlines() if line]
++        unknown = [r[1] for r in rows if r[2] != '6321']
++        assert not unknown, 'Charge rootless inconnue : réconcilier : %s' % unknown
++        for cid, name, _ in rows:
++            if inspect(RL, cid)['State']['Running']:
++                docker(RL, 'stop', '--time=60', cid, timeout=90)
++        record['rootless_reconciled'] = [r[1] for r in rows]
+     if user(['systemctl', '--user', 'show', 'docker.service', '-p', 'LoadState', '--value']) != 'not-found':
+         user(['systemctl', '--user', 'disable', '--now', 'docker.service'], timeout=120)
+     save('moteur rootless arrêté ; volumes rootless conservés')
+@@ -667,8 +701,11 @@
+         assert command(['systemctl', 'is-active', 'user@1001.service']).stdout.strip() == b'active'
+     save('configuration et groupe restaurés')
+     baselines = json.loads((ROOT / 'database-baseline.private.json').read_text()) if (ROOT / 'database-baseline.private.json').exists() else {}
+-    for name in a.get('sources_stopped', []):
++    stopped = [i['name'] for i in a.get('intents', []) if i.get('kind') == 'stop_source'] or a.get('sources_stopped', [])
++    for name in stopped:
+         src = inspect(RF, name)
++        ident = next((i['id'] for i in a.get('intents', []) if i.get('kind') == 'stop_source' and i['name'] == name), src['Id'])
++        assert src['Id'] == ident, name + ' : source rootful remplacée depuis l intention ; réconcilier'
+         assert src['HostConfig']['RestartPolicy']['Name'] == 'no'
+         if not src['State']['Running']:
+             docker(RF, 'start', name)
