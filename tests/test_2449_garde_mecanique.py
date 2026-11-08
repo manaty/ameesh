@@ -152,6 +152,7 @@ POSITIVE = {
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',
     "production.branch": 'production_branch = "main"\n',
     "contract_selection.publish": 'contract_publication = "legacy"\n',
+    "contract_selection.attestation_max_age_seconds": 'attestation_max_age_seconds = 3600\n',
     "contract_selection.registry":
         'contract_selection_registry = "contracts/registry.json"\n',
 }

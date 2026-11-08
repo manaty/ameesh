@@ -236,7 +236,11 @@ def _project_names(cfg, args) -> list[str]:
 
 def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
     from . import release_cutoff
-    plan = release_cutoff.build_plan(cfg, project, now=now, version=version)
+    # #6243: the preview settles the pending exactly as the tick would, so a
+    # dry-run never announces a cut that `execute` only skips.
+    state = release_cutoff.load_state(cfg) if project.model == "nexlink" else None
+    plan = release_cutoff.build_plan(cfg, project, now=now, version=version,
+                                     state=state)
     report = {
         "schema": release_cutoff.SCHEMA, "mode": "dry-run",
         "project": project.name, "repo": project.repo, "target": project.target,
@@ -255,12 +259,17 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
         "tree_green": plan.tree_green,
         "kept_active": plan.kept_active,
         "result": "skipped" if plan.skipped else "planned",
-        "skipped": plan.skipped,
+        "skipped": plan.skipped, "skipped_empty": plan.skipped_empty,
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
     elif project.model == "nexlink":
-        if plan.skipped:
+        if plan.skipped and plan.skipped_empty:
+            # #6243: the frozen candidate has nothing to publish (no tag ever).
+            print("créneau sauté : coupe vide, aucun contenu nouveau à publier "
+                  "(release-%s non posée) — skipped, aucun tag ni branche"
+                  % plan.skipped)
+        elif plan.skipped:
             # #6152: a manual cutoff already tagged the base; no second cut.
             print("créneau sauté : tête déjà coupée en release-%s (%s) — skipped, "
                   "aucun tag ni branche" % (plan.skipped, plan.base[:12]))

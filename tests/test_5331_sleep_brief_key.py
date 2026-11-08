@@ -61,7 +61,8 @@ class SleepBriefKeyTest(unittest.TestCase):
         self.run_briefs([self.pause_alert(5000)], now=10000)
         self.run_briefs([], now=10600)                       # sommeil levé
         self.run_briefs([self.pause_alert(11000)], now=11200)  # reposé, `since` neuf
-        self.assertEqual(self.recipients(), ["auditeur", "pilot"])
+        # #6256 : le sommeil automatique n'est plus briefé du tout
+        self.assertEqual(self.recipients(), [])
 
     def test_une_vraie_pause_operateur_garde_son_episode(self):
         self.run_briefs([self.pause_alert(5000, sleep=False)], now=10000)

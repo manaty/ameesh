@@ -3283,7 +3283,8 @@ class Notifier:
         # qui le porte hors du poste (aucune duplication : réclamation en base).
         alive = {brief_key_of(a): a for a in current
                  if a.get("type") in alert_briefs.BRIEFED_TYPES
-                 and a.get("type") not in alert_briefs.NOTIFIER_EXCLUDED}
+                 and a.get("type") not in alert_briefs.NOTIFIER_EXCLUDED
+                 and not alert_briefs.sleep_unbriefed(a)}
         open_lots = None
         for key in list(sent):
             if key not in alive:

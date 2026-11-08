@@ -12,6 +12,10 @@ UMask=0077
 EnvironmentFile=/etc/ameesh-vm-adapter/database.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 LoadCredential=scaleway.json:/etc/ameesh-vm-adapter/scaleway.json
+# #6252: the per-VM commands keep their probe nonce and halt marker here
+# (`state_dir` of every cible.json, one file per VM and kind).
+StateDirectory=ameesh-vm-adapter
+StateDirectoryMode=0700
 ExecStart=/opt/ameesh-vm-adapter/venv/bin/python -m ameesh.vm_adapter worker --enrollment /etc/ameesh-vm-adapter/enrollment.json
 TimeoutStartSec=5min
 NoNewPrivileges=yes

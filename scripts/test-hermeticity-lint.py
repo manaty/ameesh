@@ -57,8 +57,10 @@ Règles :
      réels si `tests.support` ne les a pas posés (#6246 : six notes factices
      écrites sur le lot réel #99). La doublure explicite est l'environnement
      passé au banc (`env=child_env(…)`, `env=self.env()`) ou l'`executable=`
-     qui remplace le binaire ; le témoin qui doit hériter s'exempte avec un
-     motif.
+     qui remplace le binaire ; `env=None` et `executable=None` ne sont pas
+     des doublures. Pour `os.spawn*`, le programme suit le mode ; `spawnve`
+     et `spawnvpe` acceptent aussi l'environnement en quatrième position.
+     Le témoin qui doit hériter s'exempte avec un motif.
 
 Exemption motivée : un commentaire `# hermeticity: allow — <raison>` sur
 l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison
@@ -273,16 +275,18 @@ def _argv_ameesh(node: ast.AST) -> bool:
     return _is_ameesh_program(node)
 
 
-def _explicit_program_double(call: ast.Call) -> bool:
+def _explicit_program_double(call: ast.Call, name: str) -> bool:
     """`env=` (environnement du banc) ou `executable=` (binaire substitué).
 
     C'est la doublure explicite de H8 : le test décide de l'environnement de
     l'enfant, ou il exécute autre chose que l'argv[0]. `env=None` n'est pas une
-    doublure : c'est le défaut fautif."""
-    for keyword in call.keywords:
-        if keyword.arg == "executable":
+    doublure : c'est le défaut fautif. `executable=None` garde argv[0]."""
+    if name in {"os.spawnve", "os.spawnvpe"} and len(call.args) > 3:
+        env = call.args[3]
+        if not (isinstance(env, ast.Constant) and env.value is None):
             return True
-        if keyword.arg == "env" and not (
+    for keyword in call.keywords:
+        if keyword.arg in {"env", "executable"} and not (
                 isinstance(keyword.value, ast.Constant) and keyword.value.value is None):
             return True
     return False
@@ -1017,7 +1021,13 @@ def lint_source(path: str, source: str, rules: set[str] | None = None) -> list[F
             name = _called(node, alias, SUBPROCESS_CALLS)
             if not name or not node.args:
                 continue
-            if not _argv_ameesh(node.args[0]) or _explicit_program_double(node):
+            # spawn*(mode, path, argv[, env]); other supported APIs take
+            # the program/command first. `name` is canonical even for aliases.
+            program_index = 1 if name.startswith("os.spawn") else 0
+            if len(node.args) <= program_index:
+                continue
+            if (not _argv_ameesh(node.args[program_index])
+                    or _explicit_program_double(node, name)):
                 continue
             findings.append(Finding(
                 path, node.lineno, node.col_offset + 1, "H8",

@@ -15,11 +15,11 @@
       "project_id": "22222222-2222-4222-8222-222222222222",
       "timezone": "Europe/Paris",
       "release_windows": ["11:00", "23:00"],
-      "quiesce_argv": ["/opt/ameesh-vm-adapter/checks/quiesce-burst-host"],
-      "halt_argv": ["/opt/ameesh-vm-adapter/checks/halt-burst-host"],
-      "halted_argv": ["/opt/ameesh-vm-adapter/checks/halted-burst-host"],
-      "health_argv": ["/opt/ameesh-vm-adapter/checks/health-burst-host"],
-      "reconcile_argv": ["/opt/ameesh-vm-adapter/checks/reconcile-burst-host"],
+      "quiesce_argv": ["/opt/ameesh-vm-adapter/venv/bin/python", "-I", "/opt/ameesh-vm-adapter/commandes/vm-commande.py", "quiesce", "/etc/ameesh-vm-adapter/cibles/burst-host.json"],
+      "halt_argv": ["/opt/ameesh-vm-adapter/venv/bin/python", "-I", "/opt/ameesh-vm-adapter/commandes/vm-commande.py", "halt", "/etc/ameesh-vm-adapter/cibles/burst-host.json"],
+      "halted_argv": ["/opt/ameesh-vm-adapter/venv/bin/python", "-I", "/opt/ameesh-vm-adapter/commandes/vm-commande.py", "halted", "/etc/ameesh-vm-adapter/cibles/burst-host.json"],
+      "health_argv": ["/opt/ameesh-vm-adapter/venv/bin/python", "-I", "/opt/ameesh-vm-adapter/commandes/vm-commande.py", "health", "/etc/ameesh-vm-adapter/cibles/burst-host.json"],
+      "reconcile_argv": ["/opt/ameesh-vm-adapter/venv/bin/python", "-I", "/opt/ameesh-vm-adapter/commandes/vm-commande.py", "reconcile", "/etc/ameesh-vm-adapter/cibles/burst-host.json"],
       "probe_agent": "burst-host-probe"
     }
   }
