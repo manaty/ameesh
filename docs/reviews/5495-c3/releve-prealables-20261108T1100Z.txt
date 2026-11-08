@@ -1,0 +1,27 @@
+sonde C3 #5495 mode=prealables 2026-11-08T11:00:58Z
+OK  AG1 guard sha256 (4bde802e931ab7017934f0ee2f42f07b33b2408905a8aabe3a98063ebeeffdd9)
+OK  AG1 DropInPaths (un seul) (/home/ameesh-staging/.config/systemd/user/ameesh-staging.service.d/10-native-actor.conf)
+OK  AG1 drop-in sha256 (ce3ed09c7a816b1f02358bd6301a1d8bdde0ee3110228a2fe10ea5e0a5a334cc)
+OK  AG1 fichiers du dossier drop-in (10-native-actor.conf )
+OK  AG1 FragmentPath (/home/ameesh-staging/.config/systemd/user/ameesh-staging.service)
+OK  AG1 service sha256 (f8add4eb6e5cecdb4c79471a1558f7a3ad30e689ad013456af6e305bf13d8bec)
+OK  AG1 timer sha256 (f6460989527742e6d9abbe32758f9f3ee417aebfbb722f0c7b85b3d309b0f425)
+OK  AG1 aucune autre unité ameesh-staging* (3)
+OK  AG1 bascule.env 980:0600 (980:600)
+OK  AG1 AMEESH_OPERATEUR (1)
+OK  AG1 venv-courant (venv-5c1e679)
+OK  AG1 config exécuteur = /etc/ameesh/staging-submit.json (1)
+KO  AG1 --absent manaty-mesh-1 dans arguments : lu « False », attendu « True »
+OK  AG1 canon 980 = canon_ref (ab4ae5b1d6f3d91b2c477db7bb7a1acb2de0c5a5)
+KO  AG1 canon_ref = canon des agents : lu « ab4ae5b1d6f3d91b2c477db7bb7a1acb2de0c5a5 », attendu « b8c4ea12ca5fcac799329dd5ac54386384cbe223 »
+OK  AG1 canon 980 propre (0)
+OK  AG1→ameesh-agents-1 ssh root (0)
+OK  AG1→ameesh-agents-2 ssh root (0)
+OK  AG1→ameesh-agents-3 ssh root (0)
+OK  AG1 clé privée illisible par ameesh (refus)
+KO  détenteur mesh-design : lu « ameesh-agents-2 », attendu « ameesh-agents-1 »
+OK  migrations non additives > 0544 (0)
+OK  AG2 timer L2 (disabled)
+OK  BG : aucune séquence staging active (0)
+INFO AG1 timer enabled|timer actif|service actif : disabled inactive inactive
+verdict : KO (3)

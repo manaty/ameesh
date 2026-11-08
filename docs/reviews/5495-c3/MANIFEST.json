@@ -1,0 +1,16 @@
+{
+ "auteur": "bureau (BG)",
+ "files": {
+  "DOSSIER-C3-v1.md": "c88b4306981317948ed0c668b2b50bbc872fbef6178d63b08e08e513025fa7ec",
+  "analyse/attrs.py": "d67851674b9a5f87f8e5d3367507a797e9677611532cf9499ad6b1e4304f4cff",
+  "pose-c3-AG1.sh": "d687eefe2818b22a2defac8b332b30feaa586d2dd72e35a90f3492972e40692e",
+  "preparer-canon-c3.sh": "f5bde6c4fdadb8ed1b7e0886f8f6f5a0298966ec4c4c26c06e57687dada9d079",
+  "releve-prealables-20261108T1100Z.txt": "aca16328e29c4f9c5cb0949c8c44ee93907265105d89a032c37efc978897b03a",
+  "retour-c3-AG1.sh": "db8365adcafdfbfea740d6a254a908c4ee45df34e1a09ff31901128e533e7722",
+  "sonde-c3.sh": "ec6a8dfd7aa713c63771ceccbdd748d9e9e65ab87734c2cf0a2ae68ad1bf2fd0"
+ },
+ "gestes": "aucun",
+ "lot": 5495,
+ "schema": "ameesh-5495-c3-dossier/1",
+ "version": "v1"
+}
