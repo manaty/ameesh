@@ -26,9 +26,20 @@ Trois règles de lecture, testées :
 
 Les compteurs suivent les capacités A1 à A12 de l'étude ; les requêtes sont
 celles de « Requêtes reproductibles » (constantes `_*_SQL` ci-dessous), toutes
-paramétrées et exécutées dans une transaction `READ ONLY`. C'est le lecteur
-que U2 (enveloppe des signaux) et U4 (corrélation à la version active)
-alimenteront : ils ajouteront leurs faits à `build` sans changer le schéma.
+paramétrées et exécutées dans une transaction `READ ONLY`.
+
+#6323 : le rapport **raccorde** U2 (#6315) et U4 (#6317) au lieu de les
+laisser dormir (§5). Chaque `alert.raised` de la fenêtre devient une
+enveloppe `repair-signal/1` par `repair_signals.from_alert` (clé
+`data->>'key'`), résumée par `repair_signals.summary` (A1), puis corrélée à
+la version active par `repair_correlation.correlate` avec les vues
+`active_view`/`journal_view` (A4). L'environnement du mesh est **déclaré une
+fois** (`SIGNAL_ENVIRONMENT` = `staging`, canon §14) : l'enveloppe U2 exige
+un environnement et le rapport ne l'attribue pas signal par signal. Une
+alerte qui ne porte pas de révision observée reste `inconnu` : le rapport le
+dit (`correlations_par_verdict`, `correlations_raisons`) et le compte, jamais
+un zéro inventé. Un `alert.raised` sans clé d'alerte est refusé et compté,
+jamais identifié par son texte.
 
 Sortie : `ameesh-repair-report/1` en `--json`, un tableau lisible sinon.
 """
@@ -38,8 +49,11 @@ import argparse
 import json
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
+
+from . import repair_correlation, repair_signals
 
 SCHEMA = "ameesh-repair-report/1"
 #: la section « Écart mesuré sur une semaine » et ses requêtes reproductibles
@@ -51,6 +65,25 @@ DEFAULT_DAYS = 7
 MAX_DAYS = 3660
 
 DEFAULT_UNKNOWN = "mesure non lue ou non calculable dans cette fenêtre"
+
+#: Environnement déclaré des signaux : celui du mesh ameesh (canon §14, le
+#: staging est l'environnement actif) et celui que U4 sait corréler. U2 exige
+#: un environnement ; le rapport le déclare une fois pour la fenêtre, il ne
+#: l'invente pas alerte par alerte.
+SIGNAL_ENVIRONMENT = repair_correlation.ENVIRONNEMENT
+
+#: Les compteurs A1 du raccord U2 (`repair-signals-summary/1`).
+SIGNAL_COUNTERS = (
+    "signaux_recus", "signaux_occurrences", "signaux_par_source",
+    "signaux_par_environnement", "signaux_par_issue", "signaux_sans_cle_cause",
+    "signaux_sans_version_observee", "signaux_sans_date_observation",
+    "signaux_refuses", "signaux_refuses_raisons",
+)
+#: Les compteurs A4 du raccord U4 (`ameesh-repair-correlation/1`).
+CORRELATION_COUNTERS = (
+    "signaux_correles", "correlations_inconnues", "correlations_par_verdict",
+    "correlations_raisons",
+)
 
 CAPABILITIES = (
     ("A1", "Réception durable des signaux"),
@@ -77,8 +110,42 @@ UNKNOWN = {
         "aucune trace de qualification structurée (nature, sévérité, confiance) "
         "dans la fenêtre : A2 n'est pas mesuré"),
     "signaux_correles": (
-        "aucun lien signal → environnement/hôte/SHA/attestation : la "
+        "les enveloppes A1 ou la vue des attestations n'ont pas été lues : la "
         "corrélation à la version active n'est pas mesurée"),
+    "signaux_recus": (
+        "le résumé A1 (`repair-signals-summary/1`) n'a pas été lu dans la "
+        "fenêtre"),
+    "signaux_occurrences": (
+        "le résumé A1 des occurrences n'a pas été lu dans la fenêtre"),
+    "signaux_par_source": (
+        "le résumé A1 par source n'a pas été lu dans la fenêtre"),
+    "signaux_par_environnement": (
+        "le résumé A1 par environnement n'a pas été lu dans la fenêtre"),
+    "signaux_par_issue": (
+        "le résumé A1 par issue de triage n'a pas été lu dans la fenêtre"),
+    "signaux_sans_cle_cause": (
+        "le résumé A1 des clés de cause absentes n'a pas été lu dans la "
+        "fenêtre"),
+    "signaux_sans_version_observee": (
+        "le résumé A1 des révisions observées absentes n'a pas été lu dans la "
+        "fenêtre"),
+    "signaux_sans_date_observation": (
+        "le résumé A1 des dates d'observation absentes n'a pas été lu dans la "
+        "fenêtre"),
+    "signaux_refuses": (
+        "les `alert.raised` refusés comme enveloppes n'ont pas été lus dans la "
+        "fenêtre"),
+    "signaux_refuses_raisons": (
+        "les motifs de refus des enveloppes n'ont pas été lus dans la fenêtre"),
+    "correlations_inconnues": (
+        "les corrélations inconnues n'ont pas été lues : la vue des "
+        "attestations manque"),
+    "correlations_par_verdict": (
+        "la ventilation des corrélations par verdict n'a pas été lue : la vue "
+        "des attestations manque"),
+    "correlations_raisons": (
+        "les raisons des corrélations inconnues n'ont pas été lues : la vue "
+        "des attestations manque"),
     "politique_presente": (
         "aucune politique A5 écrite au canon (décision séparée) : l'absence "
         "n'est pas une politique observée"),
@@ -124,6 +191,12 @@ LIMITS = {
         "incidents réels",
         "un taux de couverture ne peut pas être calculé sans le dénominateur "
         "des signaux éligibles effectivement reçus",
+        "les enveloppes ne couvrent que les alert.raised de la fenêtre : le "
+        "fil, la boîte et la veille GitHub n'ont pas encore de lecteur commun "
+        "ici ; un signal refusé est compté, jamais identifié par son texte",
+        "les compteurs A1 du raccord sont ceux de repair_signals.summary/1 ; "
+        "l'environnement déclaré (staging) est celui du mesh, pas une preuve "
+        "que chaque alerte vient de lui",
     ),
     "A2": (
         "une alerte n'est pas un défaut : les alertes de décision et de runner "
@@ -145,6 +218,11 @@ LIMITS = {
         "une attestation de staging n'est pas une preuve de résolution",
         "le journal staging est global au mesh (staging.attested ne porte pas "
         "de projet) : il n'est pas filtré par projet",
+        "une alerte qui ne porte pas de révision observée reste inconnue : "
+        "elle est comptée (correlations_par_verdict, correlations_raisons), "
+        "jamais corrélée par défaut",
+        "l'hôte vient de data->>'host' quand l'alerte le porte ; sans lui, "
+        "aucune portée n'est supposée et la corrélation est inconnue",
     ),
     "A5": (
         "politique absente ou inconnue : aucune nouvelle réparation "
@@ -354,6 +432,24 @@ _STAGING_SQL = """
      ORDER BY type
 """
 
+#: #6323 : une ligne par alerte levée, pour l'enveloppe A1 (U2) et la
+#: corrélation A4 (U4). L'identité durable est la clé d'alerte
+#: (`data->>'key'`, sha256 de alert_ack), jamais le texte ; l'hôte et une
+#: éventuelle révision observée sont lus quand l'émetteur les porte.
+_SIGNAL_ALERTS_SQL = """
+    SELECT data->>'key' AS cle,
+           data->>'host' AS hote,
+           data->>'revision' AS revision,
+           data->>'observed_version' AS version_observee,
+           data->>'since' AS depuis,
+           extract(epoch FROM created_at) AS cree
+      FROM ameesh_events
+     WHERE type = 'alert.raised' AND project = %s
+       AND created_at >= to_timestamp(%s)
+       AND created_at <  to_timestamp(%s)
+     ORDER BY created_at, id
+"""
+
 
 def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
          days: int = DEFAULT_DAYS, start: str | None = None,
@@ -376,9 +472,17 @@ def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
             (_DUPLICATE_LINKS_SQL, (project, start_ts, end_ts)),
             (_QA_RETURNS_SQL, (project, end_ts, start_ts)),
             (_STAGING_SQL, (start_ts, end_ts)),
+            (_SIGNAL_ALERTS_SQL, (project, start_ts, end_ts)),
         ])
     cohort_rows, alert_rows, occurrence_rows, open_rows, link_rows, qa_rows, \
-        staging_rows = results
+        staging_rows, signal_rows = results
+    # #6323 : la vue des attestations et le journal se lisent hors de la
+    # transaction en lecture seule. Sans aucun signal, ces lectures ne
+    # servent à rien : les compteurs A4 sont alors des zéros mesurés.
+    active = journal = None
+    if signal_rows:
+        active = repair_correlation.active_view(db)
+        journal = repair_correlation.journal_view(iso_z(start_ts))
     return build(
         project=project, at=at, start=start_ts, end=end_ts,
         cohort=cohort_rows[0] if cohort_rows else None,
@@ -388,6 +492,9 @@ def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
         duplicate_links=link_rows[0] if link_rows else None,
         qa_returns=qa_rows[0] if qa_rows else None,
         staging=staging_rows,
+        signal_alerts=signal_rows,
+        active=active,
+        journal=journal,
     )
 
 
@@ -450,6 +557,99 @@ def _staging(rows: Sequence[Mapping[str, Any]] | None
             "requests": value("staging.request", "evenements")}
 
 
+def _number(value: Any) -> float | None:
+    """Un epoch numérique, ou None : une chaîne illisible ne devient pas 0."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _envelopes(rows: Sequence[Mapping[str, Any]],
+               *, project: str, environment: str, received_at: str
+               ) -> tuple[list, list[list[str]], Counter]:
+    """Construit les enveloppes A1 d'un lot de `alert.raised`.
+
+    Rend `(signaux, portées, refus)` : la portée d'hôte de chaque signal (vide
+    quand l'alerte n'en porte pas) et les refus motivés. Un refus n'arrête pas
+    le rapport et ne recopie aucun texte de l'alerte.
+    """
+    signals: list = []
+    scopes: list[list[str]] = []
+    refused: Counter = Counter()
+    for row in rows:
+        observed = _number(row.get("depuis"))
+        if observed is None:
+            observed = _number(row.get("cree"))
+        alert = {"schema": "ameesh-alert/1", "key": row.get("cle"),
+                 "project": project}
+        if observed is not None:
+            alert["since"] = observed
+        try:
+            signal = repair_signals.from_alert(
+                alert, project=project, environment=environment,
+                received_at=received_at,
+                observed_version=(row.get("revision")
+                                  or row.get("version_observee") or ""))
+        except repair_signals.SignalError as exc:
+            refused[str(exc)] += 1
+            continue
+        signals.append(signal)
+        host = row.get("hote")
+        scopes.append([host] if isinstance(host, str) and host.strip() else [])
+    return signals, scopes, refused
+
+
+def _signal_counters(summary: Mapping[str, Any] | None, refused: Counter | None
+                     ) -> dict[str, Any]:
+    """Les compteurs A1 du raccord U2, ou des inconnues nommées."""
+    if summary is None:
+        return {name: None for name in SIGNAL_COUNTERS}
+    unknown = summary.get("unknown") or {}
+    return {
+        "signaux_recus": summary["signals"],
+        "signaux_occurrences": summary["occurrences"],
+        "signaux_par_source": dict(summary["by_source"]),
+        "signaux_par_environnement": dict(summary["by_environment"]),
+        "signaux_par_issue": dict(summary["by_outcome"]),
+        "signaux_sans_cle_cause": int(unknown.get("cause_key", 0)),
+        "signaux_sans_version_observee": int(unknown.get("observed_version", 0)),
+        "signaux_sans_date_observation": int(unknown.get("observed_at", 0)),
+        "signaux_refuses": sum((refused or Counter()).values()),
+        "signaux_refuses_raisons": dict(sorted((refused or Counter()).items())),
+    }
+
+
+def _correlations(signals: Sequence, scopes: Sequence[Sequence[str]], *,
+                  active: Mapping[str, Any], journal: Sequence[Mapping[str, Any]],
+                  at: float, is_ancestor=None) -> list[dict]:
+    """La corrélation A4 de chaque enveloppe (U4, pure avec `now=at`)."""
+    return [repair_correlation.correlate(
+                signal.record(), active, journal=journal or (),
+                hosts=list(scope) or None, now=at, is_ancestor=is_ancestor)
+            for signal, scope in zip(signals, scopes)]
+
+
+def _correlation_counters(reports: Sequence[Mapping[str, Any]] | None
+                          ) -> dict[str, Any]:
+    """Les compteurs A4 du raccord U4, ou des inconnues nommées."""
+    if reports is None:
+        return {name: None for name in CORRELATION_COUNTERS}
+    verdicts = Counter(report.get("verdict") for report in reports)
+    raisons = Counter(report.get("raison") for report in reports
+                      if report.get("verdict") == repair_correlation.INCONNU
+                      and report.get("raison"))
+    return {
+        "signaux_correles": sum(count for verdict, count in verdicts.items()
+                                if verdict != repair_correlation.INCONNU),
+        "correlations_inconnues": verdicts.get(repair_correlation.INCONNU, 0),
+        "correlations_par_verdict": dict(sorted(verdicts.items())),
+        "correlations_raisons": dict(sorted(raisons.items())),
+    }
+
+
 def _capability(ident: str, title: str, counters: Mapping[str, Any],
                 limits: Sequence[str]) -> dict[str, Any]:
     unknown = {key: UNKNOWN.get(key, DEFAULT_UNKNOWN)
@@ -466,12 +666,24 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
           open_duplicates: Sequence[Mapping[str, Any]] | None,
           duplicate_links: Mapping[str, Any] | None,
           qa_returns: Mapping[str, Any] | None,
-          staging: Sequence[Mapping[str, Any]] | None) -> dict[str, Any]:
+          staging: Sequence[Mapping[str, Any]] | None,
+          signal_alerts: Sequence[Mapping[str, Any]] | None = None,
+          active: Mapping[str, Any] | None = None,
+          journal: Sequence[Mapping[str, Any]] | None = None,
+          environment: str = SIGNAL_ENVIRONMENT,
+          is_ancestor=None) -> dict[str, Any]:
     """Assemble le rapport depuis les lignes lues (aucune base ici).
 
     Chaque mesure vaut `None` quand elle n'a pas pu être lue : le compteur
     sort alors `null` avec sa raison, jamais `0`. Une liste vide, elle, est
     une mesure réelle de zéro.
+
+    `signal_alerts` : les `alert.raised` de la fenêtre (une ligne par alerte,
+    `_SIGNAL_ALERTS_SQL`). `active`/`journal` : la vue des attestations et le
+    journal staging fournis par le lecteur (`active_view`/`journal_view`) ;
+    `active=None` avec des signaux rend la corrélation A4 inconnue, jamais
+    concluante par défaut. `is_ancestor` est le prédicat d'ascendance injecté
+    de U4 : sans lui, deux SHA inégaux restent `version-differente`.
     """
     if end <= start:
         raise RepairReportError("fenêtre vide ou inversée")
@@ -493,6 +705,27 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
     qa_lots = _int(qa_returns, "lots")
     stage = _staging(staging)
 
+    # #6323 — A1 : les enveloppes U2 des alertes lues ; A4 : leur corrélation
+    # U4. Sans signal lu, aucun compteur n'est un zéro ; sans vue des
+    # attestations, la corrélation est inconnue, jamais concluante.
+    signals = scopes = refused = None
+    if signal_alerts is not None:
+        signals, scopes, refused = _envelopes(
+            signal_alerts, project=project, environment=environment,
+            received_at=iso_z(at))
+    summary = (repair_signals.summary(signals) if signals is not None
+               else None)
+    if signals is None:
+        correlations = None
+    elif not signals:
+        correlations = []
+    elif active is None:
+        correlations = None
+    else:
+        correlations = _correlations(signals, scopes, active=active,
+                                     journal=journal or (), at=at,
+                                     is_ancestor=is_ancestor)
+
     decision_alerts = (None if alert_types is None else
                        alert_types.get("decision_pending", 0)
                        + alert_types.get("decision_overdue", 0))
@@ -503,6 +736,7 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
             "empreinte_lots": cohort_counts["empreinte_lots"],
             "empreinte_cles": cohort_counts["empreinte_cles"],
             "defauts_sans_lot": None,
+            **_signal_counters(summary, refused),
         },
         "A2": {
             "alertes_levees": alert_total,
@@ -523,7 +757,7 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
         "A4": {
             "attestations_staging": stage["attested"],
             "demandes_staging": stage["requests"],
-            "signaux_correles": None,
+            **_correlation_counters(correlations),
         },
         "A5": {
             "politique_presente": None,

@@ -41,6 +41,9 @@ def run(**overrides):
         occurrences={"notes": 3, "lots": 1}, open_duplicates=[],
         duplicate_links={"lots": 4}, qa_returns={"reprises": 19, "lots": 14},
         staging=list(STAGING),
+        # #6323 : les raccords U2/U4 sont lus à vide par défaut ; leurs
+        # témoins vivent dans tests/test_6323_repair_report_raccord.py.
+        signal_alerts=[], active={}, journal=[],
     )
     values.update(overrides)
     return repair_report.build(**values)
@@ -109,7 +112,17 @@ class BuildTest(unittest.TestCase):
         report = run()
         self.assertEqual(capability(report, "A1")["counters"],
                          {"cohorte_lots_defaut": 197, "empreinte_lots": 10,
-                          "empreinte_cles": 2, "defauts_sans_lot": None})
+                          "empreinte_cles": 2, "defauts_sans_lot": None,
+                          # #6323 : raccord U2, lu à vide par ce témoin
+                          "signaux_recus": 0, "signaux_occurrences": 0,
+                          "signaux_par_source": {},
+                          "signaux_par_environnement": {},
+                          "signaux_par_issue": {},
+                          "signaux_sans_cle_cause": 0,
+                          "signaux_sans_version_observee": 0,
+                          "signaux_sans_date_observation": 0,
+                          "signaux_refuses": 0,
+                          "signaux_refuses_raisons": {}})
         a3 = capability(report, "A3")["counters"]
         self.assertEqual(a3["occurrences_empreinte_revue"], 3)
         self.assertEqual(a3["lots_avec_occurrence"], 1)
@@ -120,6 +133,13 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(a3["recidives_cle_paquet"], 8)
         self.assertEqual(capability(report, "A4")["counters"]["attestations_staging"], 14)
         self.assertEqual(capability(report, "A4")["counters"]["demandes_staging"], 0)
+        # #6323 : le raccord U4 est mesuré (zéro signal corrélé), pas inconnu
+        a4 = capability(report, "A4")["counters"]
+        self.assertEqual(a4["signaux_correles"], 0)
+        self.assertEqual(a4["correlations_inconnues"], 0)
+        self.assertEqual(a4["correlations_par_verdict"], {})
+        self.assertEqual(a4["correlations_raisons"], {})
+        self.assertNotIn("signaux_correles", capability(report, "A4")["unknown"])
         self.assertEqual(capability(report, "A6")["counters"]["retours_qa_build"], 19)
         self.assertEqual(capability(report, "A9")["counters"]["alertes_decision"], 13)
         self.assertEqual(capability(report, "A11")["counters"]["snapshots_staging"], 1426)
@@ -171,19 +191,22 @@ class BuildTest(unittest.TestCase):
     def test_valeur_inconnue_n_est_pas_zero(self):
         report = run(cohort=None, alerts=None, occurrences=None,
                      open_duplicates=None, duplicate_links=None,
-                     qa_returns=None, staging=None)
+                     qa_returns=None, staging=None, signal_alerts=None,
+                     active=None, journal=None)
         for entry in report["capabilities"]:
             for key, value in entry["counters"].items():
                 if value is None:
                     self.assertIn(key, entry["unknown"], key)
                     self.assertTrue(entry["unknown"][key], key)
         self.assertIsNone(capability(report, "A1")["counters"]["cohorte_lots_defaut"])
+        self.assertIsNone(capability(report, "A1")["counters"]["signaux_recus"])
+        self.assertIsNone(capability(report, "A4")["counters"]["signaux_correles"])
         self.assertIsNone(capability(report, "A3")["counters"]["remplaces_superseded"])
         self.assertIsNone(capability(report, "A11")["counters"]["snapshots_staging"])
         declared = sum(len(entry["unknown"]) for entry in report["capabilities"])
         self.assertEqual(report["unknown_count"], declared)
         # les inconnues structurelles sont nommées, même quand tout est lisible
-        report = run()
+        report = run(signal_alerts=None, active=None, journal=None)
         for key in ("defauts_sans_lot", "signaux_correles", "politique_presente",
                     "plans_reproduction", "preuves_verification",
                     "reprises_par_origine", "syntheses"):
@@ -247,6 +270,8 @@ class _RecordingTx:
             [{"lots": 0}],
             [{"reprises": 0, "lots": 0}],
             [],
+            # #6323 : aucune alerte lue pour les enveloppes U2
+            [],
         ]
 
 
@@ -266,7 +291,7 @@ class ReadOnlyTest(unittest.TestCase):
                                     start=repair_report.iso_z(START),
                                     end=repair_report.iso_z(END))
         self.assertEqual(fake.calls[0], ("execute", "SET TRANSACTION READ ONLY"))
-        self.assertEqual(fake.calls[1], ("query_batch", 7))
+        self.assertEqual(fake.calls[1], ("query_batch", 8))
         self.assertTrue(report["read_only"])
 
 
