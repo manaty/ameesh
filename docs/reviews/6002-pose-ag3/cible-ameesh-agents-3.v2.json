@@ -1,0 +1,75 @@
+{
+  "host": "ameesh-agents-3",
+  "probe_agent": "mty-amh-impl-15",
+  "budget_s": 9,
+  "ameesh_config": "/etc/ameesh-vm-adapter/ameesh.json",
+  "state_dir": "/var/lib/ameesh-vm-adapter",
+  "previous_boot_end": "(?:.*: )?Journal stopped",
+  "ssh": {
+    "executable": "/usr/bin/ssh",
+    "destination": "51.15.137.245",
+    "user": "vm-operator",
+    "port": 22,
+    "identity_file": "/home/agent/.ssh/id_ed25519",
+    "known_hosts": "/etc/ameesh-vm-adapter/ssh/known_hosts_ag3",
+    "connect_timeout_s": 4
+  },
+  "remote": {
+    "quiesce": [
+      [
+        "/opt/ameesh-vm-adapter/remote/quiesce"
+      ]
+    ],
+    "halt": [
+      "/usr/bin/sudo",
+      "-n",
+      "/usr/bin/systemctl",
+      "poweroff",
+      "--no-block"
+    ],
+    "alive": [
+      "/usr/bin/true"
+    ],
+    "probe_start": [
+      "/opt/ameesh-vm-adapter/remote/probe-start",
+      "{host}",
+      "{probe_agent}",
+      "{generation}",
+      "{release_epoch}",
+      "{nonce}"
+    ],
+    "probe_receipt": [
+      "/opt/ameesh-vm-adapter/remote/probe-receipt",
+      "{nonce}"
+    ],
+    "health": [
+      [
+        "/opt/ameesh-vm-adapter/remote/version-mode"
+      ],
+      [
+        "/opt/ameesh-vm-adapter/remote/runners"
+      ],
+      [
+        "/opt/ameesh-vm-adapter/remote/doctor"
+      ],
+      [
+        "/opt/ameesh-vm-adapter/remote/mail"
+      ]
+    ],
+    "previous_boot": [
+      "/usr/bin/journalctl",
+      "-b",
+      "-1",
+      "-n",
+      "1",
+      "-o",
+      "cat",
+      "--no-pager"
+    ],
+    "reconcile": [
+      [
+        "/opt/ameesh-vm-adapter/remote/reconcile"
+      ]
+    ]
+  }
+}
