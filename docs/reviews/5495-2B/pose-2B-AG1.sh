@@ -1,6 +1,7 @@
 #!/bin/bash
 # #5495 phase 2B — clé L2 d'AG1 (compte ameesh-staging, uid 980), lancé depuis bureau-goal (root SSH existant).
 # Modèle : pose AG2 du 04/11 16:40Z (#190288). Décision #184823 a. Aucun timer/service L2, aucun restart.
+# v2 : contrôles stricts (échec SSH = STOP), retour lié au reçu (retour-2B-AG1.sh <TS>).
 # Usage : pose-2B-AG1.sh --apply   (sans --apply : contrôles préalables seuls, aucun effet)
 set -euo pipefail
 AG1=78.232.56.22; CIBLES=("ameesh-agents-1=78.232.56.22" "ameesh-agents-2=78.232.60.1" "ameesh-agents-3=51.15.137.245")
@@ -14,7 +15,8 @@ stop() { echo "STOP: $*" >&2; exit 2; }
 R $AG1 "getent passwd ameesh-staging | grep -q '^ameesh-staging:x:980:980:'" || stop "compte 980 absent sur AG1"
 R $AG1 "test ! -e $K && test ! -e $K.pub" || stop "clé déjà présente sur AG1"
 [ "$(R $AG1 "sha256sum /home/ameesh-staging/.ssh/known_hosts" | cut -c1-64)" = "$KH_SHA" ] || stop "known_hosts AG1 ≠ approuvé"
-R $AG1 "stat -c '%a %U' /home/ameesh-staging /home/ameesh-staging/.ssh" | grep -qv '^700 ameesh-staging$' && stop "droits home/.ssh AG1"
+droits=$(R $AG1 "stat -c '%a %U' /home/ameesh-staging /home/ameesh-staging/.ssh") || stop "lecture droits home/.ssh AG1 impossible"
+[ "$droits" = $'700 ameesh-staging\n700 ameesh-staging' ] || stop "droits home/.ssh AG1 : $droits"
 for c in "${CIBLES[@]}"; do ip=${c#*=}
   [ "$(R $ip "stat -c '%a %U' /root/.ssh/authorized_keys")" = "600 root" ] || stop "authorized_keys $c pas 600 root"
   R $ip "! grep -q 'ameesh-staging-L2-AG1-' /root/.ssh/authorized_keys" || stop "ligne AG1 déjà présente sur $c"
@@ -24,7 +26,7 @@ echo "préalables OK"; [ $APPLY = 1 ] || { echo "(contrôle seul, aucun effet)";
 # 1. Clé générée SUR AG1 par l'uid 980 ; la privée n'est jamais lue ni exportée
 R $AG1 "runuser -u ameesh-staging -- ssh-keygen -q -t ed25519 -N '' -C '$COMMENT' -f $K && chmod 600 $K && stat -c '%a %U %n' $K $K.pub"
 PUB=$(R $AG1 "cat $K.pub"); FP=$(R $AG1 "ssh-keygen -lf $K.pub")
-LINE="restrict,from=\"$FROM\" $PUB"; echo "empreinte : $FP"
+LINE="restrict,from=\"$FROM\" $PUB"; echo "empreinte : $FP ; TS=$TS"
 
 # 2. Partie publique sur chaque cible : sauvegarde, ajout, relecture (mesh-1 reporté, canon §14)
 L64=$(printf '%s' "$LINE" | base64 -w0)
@@ -54,4 +56,4 @@ for c in "${CIBLES[@]}"; do h=${c%%=*}; ip=${c#*=}
 done
 R $AG1 "! runuser -u ameesh -- test -r $K" || stop "ameesh lit la clé privée"
 R $AG1 "! runuser -u nobody -- test -r $K" || stop "nobody lit la clé privée"
-echo "refus de lecture OK ; pose 2B terminée $TS ; reçus $OPS sur chaque cible"
+echo "refus de lecture OK ; pose 2B terminée ; TS=$TS (argument du retour : retour-2B-AG1.sh $TS) ; reçus $OPS"
