@@ -271,6 +271,59 @@ class RulesTest(unittest.TestCase):
             "    self.db.execute(\"INSERT INTO t SELECT g FROM generate_series(1, 500000) g\")\n"),
             [])
 
+    def test_ameesh_subprocess_without_env_is_h8(self):
+        """#6246 : l'enfant hérite du DSN et du ~/.pgpass du processus de la suite."""
+        self.assertEqual(self.rules(
+            "import subprocess\n"
+            "def test_x(self):\n"
+            "    subprocess.run([\"ameesh\", \"work\", \"note\", \"99\", \"x\"])\n"), ["H8"])
+        self.assertEqual(self.rules(
+            "import os\n"
+            "def test_x(self):\n"
+            "    os.system(\"ameesh work note 99 x\")\n"), ["H8"])
+
+    def test_ameesh_path_and_join_are_h8(self):
+        self.assertEqual(self.rules(
+            "import os, subprocess\n"
+            "def test_x(self):\n"
+            "    subprocess.run([os.path.join(REPO, \"bin\", \"ameesh\"), \"--help\"])\n"), ["H8"])
+        self.assertEqual(self.rules(
+            "import subprocess\n"
+            "def test_x(self):\n"
+            "    subprocess.check_output([\"bin/ameesh\", \"version\"])\n"), ["H8"])
+
+    def test_ameesh_subprocess_with_explicit_env_is_a_double(self):
+        """`env=` (même `env=None` explicite ne l'est pas) : la doublure H8."""
+        self.assertEqual(self.rules(
+            "import subprocess\n"
+            "def test_x(self):\n"
+            "    subprocess.run([\"ameesh\", \"version\"], env=child_env())\n"), [])
+        self.assertEqual(self.rules(
+            "import subprocess\n"
+            "def test_x(self):\n"
+            "    subprocess.run([\"ameesh\", \"-c\", CODE], executable=sys.executable,\n"
+            "                   env=env)\n"), [])
+        self.assertEqual(self.rules(
+            "import subprocess\n"
+            "def test_x(self):\n"
+            "    subprocess.run([\"ameesh\", \"version\"], env=None)\n"), ["H8"])
+
+    def test_ameesh_subprocess_exemption(self):
+        """Le témoin qui DOIT hériter s'exempte avec un motif."""
+        self.assertEqual(self.rules(
+            "import subprocess\n"
+            "def test_x(self):\n"
+            "    # hermeticity: allow — témoin : l'enfant doit hériter du banc\n"
+            "    subprocess.run([\"ameesh\", \"work\", \"note\", \"1\", \"x\"])\n"), [])
+
+    def test_other_subprocess_programs_are_not_h8(self):
+        self.assertEqual(self.rules(
+            "import subprocess, sys\n"
+            "def test_x(self):\n"
+            "    subprocess.run([\"git\", \"status\"])\n"
+            "    subprocess.run([sys.executable, \"-m\", \"ameesh.cli\", \"version\"])\n"
+            "    subprocess.run([str(tool), \"version\"])\n"), [])
+
     def test_disk_usage_is_h5(self):
         self.assertEqual(self.rules(
             "import shutil\n"

@@ -166,6 +166,14 @@ TEST_DSN = os.environ.get(
         "postgresql://agent_mesh@127.0.0.1:55432/agent_mesh",
     ),
 )
+#: #6246 : posé AU NIVEAU DU PROCESSUS, pas seulement dans `child_env`. Un test
+#: qui lance un sous-processus sans `env=` explicite — le défaut de
+#: `subprocess.run`, et la forme qu'avait prise test_4217 à travers
+#: `paquet-auto.compose_packet` — héritait sinon du DSN par défaut et du
+#: ~/.pgpass réels : ses notes partaient dans la base du mesh. Ce DSN de test
+#: fait partie de l'état du banc (#5180) et tout enfant l'hérite ; un banc qui
+#: pose le sien continue de l'emporter (`child_env(AMEESH_DSN=…)`).
+os.environ["AMEESH_DSN"] = TEST_DSN
 REQUIRE_DB = os.environ.get(
     "AMEESH_REQUIRE_DB", os.environ.get("AGENT_MESH_REQUIRE_DB", "1")) != "0"
 #: lot #3735 : une seule passe de ménage du banc par processus de suite (un
