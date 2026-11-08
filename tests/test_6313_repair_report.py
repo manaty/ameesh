@@ -122,7 +122,9 @@ class BuildTest(unittest.TestCase):
                           "signaux_sans_version_observee": 0,
                           "signaux_sans_date_observation": 0,
                           "signaux_refuses": 0,
-                          "signaux_refuses_raisons": {}})
+                          "signaux_refuses_raisons": {},
+                          "journal_signaux": None, "journal_occurrences": None,
+                          "journal_groupes": None})
         a3 = capability(report, "A3")["counters"]
         self.assertEqual(a3["occurrences_empreinte_revue"], 3)
         self.assertEqual(a3["lots_avec_occurrence"], 1)
@@ -258,6 +260,10 @@ class _RecordingTx:
 
     def execute(self, sql, params=()):
         self.calls.append(("execute", sql))
+
+    def query(self, sql, params=()):
+        self.calls.append(("query", sql))
+        return []
 
     def query_batch(self, items):
         self.calls.append(("query_batch", len(items)))

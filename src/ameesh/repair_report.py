@@ -41,6 +41,15 @@ dit (`correlations_par_verdict`, `correlations_raisons`) et le compte, jamais
 un zéro inventé. Un `alert.raised` sans clé d'alerte est refusé et compté,
 jamais identifié par son texte.
 
+U6 : A2 appelle `repair_triage.qualify` sur ces enveloppes, sans inférer
+un diagnostic depuis une alerte : faits absents = route unknown. Les champs
+`journal_signaux`, `journal_occurrences` et `journal_groupes` lisent le résumé
+agrégé U5 en lecture seule, par date de première réception dans la fenêtre.
+Ils ne s'ajoutent pas aux alertes lues (les deux mesures peuvent se recouvrir).
+L'observation reprend par pages circulaires de 100 métadonnées déjà persistées
+(alertes et livraisons GitHub), depuis les entrées gardées existantes ; elle
+n'ouvre aucun travail et ne transforme pas une route proposée en autorité.
+
 Sortie : `ameesh-repair-report/1` en `--json`, un tableau lisible sinon.
 """
 from __future__ import annotations
@@ -53,7 +62,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
-from . import repair_correlation, repair_signals
+from . import repair_correlation, repair_signals, repair_triage, storage
 
 SCHEMA = "ameesh-repair-report/1"
 #: la section « Écart mesuré sur une semaine » et ses requêtes reproductibles
@@ -103,7 +112,7 @@ CAPABILITIES = (
 #: Raisons des inconnues structurelles (l'étude les nomme ; aucune n'est un 0).
 UNKNOWN = {
     "defauts_sans_lot": (
-        "aucun journal exhaustif des signaux avec leur issue de triage : le "
+        "le journal observe les entrées internes, pas tous les défauts : le "
         "dénominateur des défauts réels reste inconnu, et une alerte sans lot "
         "n'est pas un défaut"),
     "qualifications": (
@@ -191,14 +200,16 @@ LIMITS = {
         "incidents réels",
         "un taux de couverture ne peut pas être calculé sans le dénominateur "
         "des signaux éligibles effectivement reçus",
-        "les enveloppes ne couvrent que les alert.raised de la fenêtre : le "
-        "fil, la boîte et la veille GitHub n'ont pas encore de lecteur commun "
-        "ici ; un signal refusé est compté, jamais identifié par son texte",
+        "les enveloppes ne couvrent que les alert.raised de la fenêtre ; "
+        "fil et boîte ne sont pas balayés par U6 ; les alertes et livraisons "
+        "GitHub ont un journal distinct ; un refus ne garde aucun texte",
         "les compteurs A1 du raccord sont ceux de repair_signals.summary/1 ; "
         "l'environnement déclaré (staging) est celui du mesh, pas une preuve "
         "que chaque alerte vient de lui",
     ),
     "A2": (
+        "les qualifications U3 portent sur les enveloppes de la fenêtre ; "
+        "faits absents = route unknown ; aucune ouverture de travail",
         "une alerte n'est pas un défaut : les alertes de décision et de runner "
         "n'entrent pas dans la cohorte des défauts",
         "le type d'alerte vient de data->>'alert', la référence de lot de "
@@ -474,6 +485,8 @@ def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
             (_STAGING_SQL, (start_ts, end_ts)),
             (_SIGNAL_ALERTS_SQL, (project, start_ts, end_ts)),
         ])
+        journal_summary = storage.of(tx).repair_signals.summary(
+            project=project, since=start_ts, until=end_ts)
     cohort_rows, alert_rows, occurrence_rows, open_rows, link_rows, qa_rows, \
         staging_rows, signal_rows = results
     # #6323 : la vue des attestations et le journal se lisent hors de la
@@ -493,6 +506,7 @@ def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
         qa_returns=qa_rows[0] if qa_rows else None,
         staging=staging_rows,
         signal_alerts=signal_rows,
+        journal_summary=journal_summary,
         active=active,
         journal=journal,
     )
@@ -671,7 +685,8 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
           active: Mapping[str, Any] | None = None,
           journal: Sequence[Mapping[str, Any]] | None = None,
           environment: str = SIGNAL_ENVIRONMENT,
-          is_ancestor=None) -> dict[str, Any]:
+          is_ancestor=None,
+          journal_summary: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Assemble le rapport depuis les lignes lues (aucune base ici).
 
     Chaque mesure vaut `None` quand elle n'a pas pu être lue : le compteur
@@ -737,12 +752,20 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
             "empreinte_cles": cohort_counts["empreinte_cles"],
             "defauts_sans_lot": None,
             **_signal_counters(summary, refused),
+            "journal_signaux": (journal_summary.get("signals")
+                                if journal_summary is not None else None),
+            "journal_occurrences": (journal_summary.get("occurrences")
+                                    if journal_summary is not None else None),
+            "journal_groupes": (journal_summary.get("groups")
+                               if journal_summary is not None else None),
         },
         "A2": {
             "alertes_levees": alert_total,
             "alertes_par_type": alert_types,
             "alertes_sans_reference_lot": alert_without,
-            "qualifications": None,
+            "qualifications": (repair_triage.summary(
+                repair_triage.qualify(signal) for signal in signals)
+                if signals is not None else None),
         },
         "A3": {
             "occurrences_empreinte_revue": occurrence_notes,
