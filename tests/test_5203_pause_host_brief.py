@@ -51,8 +51,10 @@ class PauseBriefTest(unittest.TestCase):
     def host_alert(self, tenus=13):
         return dict(type="operator_pause_host", agent=None, since=None,
                     value=tenus, threshold=16, host="ameesh-agents-1",
-                    agents=["dev"], sleep=True, orchestrators=["pilot"],
-                    detail="%d/16 agents of host ameesh-agents-1 in automatic sleep" % tenus)
+                    agents=["dev"], sleep=False, orchestrators=["pilot"],
+                    # #6256 : le sommeil automatique n'est plus briefé ; la
+                    # garde vaut pour la pause de maintenance qui oscille.
+                    detail="%d/16 agents of host ameesh-agents-1 under operator pause" % tenus)
 
     def test_une_pause_d_hote_qui_revient_n_est_pas_rebriefee(self):
         self.run_briefs([self.host_alert(13)], now=10000)
