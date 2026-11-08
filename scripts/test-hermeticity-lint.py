@@ -49,6 +49,16 @@ Règles :
      des entiers littéraux, des paramètres `%s`/`%d` liés à des constantes, ou
      des constantes de module ou de classe ; une borne inconnue n'est pas
      comptée (aucun constat sans preuve du volume).
+  H8 sous-processus-ameesh-sans-doublure
+     un test lance le binaire `ameesh` (`subprocess.run(["ameesh", …])`,
+     `os.system("ameesh …")`, un chemin terminé par `bin/ameesh`) sans
+     environnement explicite (`env=…`) ni binaire substitué (`executable=…`) :
+     l'enfant hérite du processus de la suite, donc du DSN et du ~/.pgpass
+     réels si `tests.support` ne les a pas posés (#6246 : six notes factices
+     écrites sur le lot réel #99). La doublure explicite est l'environnement
+     passé au banc (`env=child_env(…)`, `env=self.env()`) ou l'`executable=`
+     qui remplace le binaire ; le témoin qui doit hériter s'exempte avec un
+     motif.
 
 Exemption motivée : un commentaire `# hermeticity: allow — <raison>` sur
 l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison
@@ -122,11 +132,24 @@ RULES = {
     "H5": "etat-disque",
     "H6": "seuil-de-plan-sous-la-seconde",
     "H7": "remplissage-volumineux-hors-fill",
+    "H8": "sous-processus-ameesh-sans-doublure",
 }
 #: #5641 : un remplissage de fixture à partir de ce volume passe par `fill`.
 FILL_ROWS = 10_000
 #: appels qui envoient une instruction à la base ; `fill` n'en fait pas partie.
 EXECUTE_CALLS = {"execute": 0, "execute_without_statement_timeout": 1}
+#: #6246 : appels qui lancent un programme extérieur, par leur nom canonique.
+SUBPROCESS_CALLS = {
+    "subprocess.run", "subprocess.Popen", "subprocess.call",
+    "subprocess.check_call", "subprocess.check_output",
+    "subprocess.getoutput", "subprocess.getstatusoutput",
+    "os.system", "os.popen",
+    "os.execv", "os.execve", "os.execvp", "os.execvpe",
+    "os.spawnv", "os.spawnve", "os.spawnvp", "os.spawnvpe",
+}
+#: le nom du vrai binaire du mesh (H8) : un enfant sans environnement explicite
+#: hérite du DSN et du ~/.pgpass du processus de la suite.
+AMEESH_PROGRAM = "ameesh"
 _SERIES = re.compile(r"generate_series\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*[,)]",
                      re.IGNORECASE)
 
@@ -217,6 +240,51 @@ def _proc_literal(node: ast.AST) -> bool:
             if isinstance(sub, ast.Constant) and isinstance(sub.value, str) \
                     and "/proc" in sub.value:
                 return True
+    return False
+
+
+def _is_ameesh_program(node: ast.AST) -> bool:
+    """le nœud désigne le binaire `ameesh` par un littéral (H8).
+
+    Reconnus : `"ameesh"`, `"bin/ameesh"`, `os.path.join(REPO, "bin", "ameesh")`
+    et la commande chaîne d'`os.system` (`"ameesh work note …"`). Un programme
+    construit dans une variable (`[str(tool)]`, un faux binaire temporaire)
+    n'est pas le binaire du dépôt : c'est déjà une doublure."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        words = node.value.strip().split()
+        return bool(words) and words[0].rsplit("/", 1)[-1] == AMEESH_PROGRAM
+    if isinstance(node, ast.Call):
+        name = _dotted(node.func) or ""
+        short = name.rsplit(".", 1)[-1]
+        if short in ("join", "Path"):
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str) \
+                        and arg.value.rsplit("/", 1)[-1] == AMEESH_PROGRAM:
+                    return True
+        if short == "str" and node.args:
+            return _is_ameesh_program(node.args[0])
+    return False
+
+
+def _argv_ameesh(node: ast.AST) -> bool:
+    """le premier argument d'un appel nomme le binaire `ameesh` (H8)."""
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return bool(node.elts) and _is_ameesh_program(node.elts[0])
+    return _is_ameesh_program(node)
+
+
+def _explicit_program_double(call: ast.Call) -> bool:
+    """`env=` (environnement du banc) ou `executable=` (binaire substitué).
+
+    C'est la doublure explicite de H8 : le test décide de l'environnement de
+    l'enfant, ou il exécute autre chose que l'argv[0]. `env=None` n'est pas une
+    doublure : c'est le défaut fautif."""
+    for keyword in call.keywords:
+        if keyword.arg == "executable":
+            return True
+        if keyword.arg == "env" and not (
+                isinstance(keyword.value, ast.Constant) and keyword.value.value is None):
+            return True
     return False
 
 
@@ -936,6 +1004,26 @@ def lint_source(path: str, source: str, rules: set[str] | None = None) -> list[F
                     "remplissage de %d lignes estimées hors de PgTestCase.fill : "
                     "délai et triggers par ligne du code mesuré (#5641)" % rows,
                     _enclosing(funcs, node)))
+
+    if "H8" in wanted:
+        # H8 : le vrai binaire `ameesh` lancé sans environnement explicite
+        # hérite du DSN et du ~/.pgpass du processus de la suite — la base du
+        # mesh, pas celle du banc (#6246). `env=`/`executable=` sont la
+        # doublure ; un faux binaire construit dans une variable n'est pas
+        # reconnu, donc pas signalé.
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or _exempt(node, comments):
+                continue
+            name = _called(node, alias, SUBPROCESS_CALLS)
+            if not name or not node.args:
+                continue
+            if not _argv_ameesh(node.args[0]) or _explicit_program_double(node):
+                continue
+            findings.append(Finding(
+                path, node.lineno, node.col_offset + 1, "H8",
+                "sous-processus au binaire ameesh sans environnement explicite : "
+                "%s() hérite du processus de la suite (#6246)" % name,
+                _enclosing(funcs, node)))
     return sorted(findings, key=lambda f: (f.lineno, f.col, f.rule))
 
 
@@ -957,7 +1045,8 @@ def diff_files(repo: pathlib.Path, ref: str) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="test-hermeticity-lint.py",
-        description="lint d'herméticité des tests (#707) : horloge, machine, calendrier")
+        description="lint d'herméticité des tests (#707) : horloge, machine, "
+                    "calendrier, sous-processus (#6246)")
     parser.add_argument("files", nargs="*", help="fichiers à analyser")
     parser.add_argument("--diff", metavar="REF",
                         help="n'analyser que les tests changés depuis REF (git diff REF...HEAD)")

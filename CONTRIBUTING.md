@@ -37,7 +37,7 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 - **Tests dépendants de l'environnement** (#5427) : un test qui lit l'horloge,
   le jour, le disque ou le CPU de l'hôte sans fixture est un défaut **du
   test** (canon §3), pas une instabilité à relancer. Le lint
-  `scripts/test-hermeticity-lint.py` le signale (règles H1 à H7) ; le gel
+  `scripts/test-hermeticity-lint.py` le signale (règles H1 à H8) ; le gel
   l'avertit sans le bloquer (`scripts/freeze-checks.py`, règles H4/H5/H6 sans
   diff, toutes règles sur les seuls tests que le lot change), et la passe
   nocturne `.github/workflows/horloge.yml` rejoue les tests du jour sous libfaketime
@@ -46,7 +46,11 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   Injectez l'horloge (`now=…`, `HorlogeSimulee`) ou fixez la valeur. Un
   remplissage de fixture volumineux (`INSERT … generate_series`, 10 000 lignes
   et plus) passe par `PgTestCase.fill` : délai levé pour ce seul remplissage,
-  triggers nommés coupés dans sa transaction (règle H7, #5641).
+  triggers nommés coupés dans sa transaction (règle H7, #5641). Un
+  sous-processus qui lance le vrai binaire `ameesh` reçoit son environnement du
+  banc (`env=child_env(…)`, `env=self.env()`) ou un `executable=`, sinon il
+  hérite du DSN et du `~/.pgpass` du processus de la suite (règle H8, #6246) ;
+  le témoin qui doit hériter s'exempte par `# hermeticity: allow — <raison>`.
 - **PR de documentation seule** (L161a) : si chaque fichier changé est sous
   `docs/` ou `site/`, ou un `*.md` hors de `src/`, `tests/`, `.github/` et
   `examples/`, la CI d'une PR de lot ne passe que les tests qui lisent la
