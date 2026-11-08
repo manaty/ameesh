@@ -75,7 +75,8 @@ class PinTest(unittest.TestCase):
 
     def test_repository_pins_are_exact_and_hashed(self):
         for name, kind, required in (
-                ('runtime-pins.txt', 'runtime', {'psycopg', 'psycopg-binary', 'psutil'}),
+                ('runtime-pins.txt', 'runtime', {'psycopg', 'psycopg-binary', 'psutil',
+                                                  'coverage', 'pyyaml'}),
                 ('runtime-build-pins.txt', 'build', {'setuptools'})):
             path = ROOT / 'deploy/mise-a-jour' / name
             pins = build.read_pins(path, kind=kind)

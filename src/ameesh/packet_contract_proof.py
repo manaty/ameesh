@@ -41,9 +41,26 @@ def projection(report, *, base, target):
             state = "red"
         elif any(child["state"] != "green" for child in children):
             state = "inconclusive"
-        return {"state": state, "modules": list(run.modules), "children": children}
+        node = {"state": state, "modules": list(run.modules), "children": children}
+        if state == "inconclusive" and not children:
+            # #6291: a leaf says why it proves nothing (the composer runs
+            # unittest -q: the skip count is known, not the skip reasons).
+            node["reason"] = reason(run)
+        return node
     return {"schema": SCHEMA, "head": report.head, "tree": report.tree,
             "base": base, "target": target, "result": result(report.run)}
+
+
+def reason(run):
+    """#6291: why a leaf run is inconclusive, in one line."""
+    if run.inconclusive:
+        return run.motive()
+    if not run.finished:
+        return "exécution inachevée"
+    skipped = getattr(run, "skipped", 0)
+    if skipped:
+        return "%d test(s) sauté(s) : un saut ne prouve rien (canon §3)" % skipped
+    return "résultat non concluant"
 
 
 def encode(report, *, base, target):
