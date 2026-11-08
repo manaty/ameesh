@@ -170,8 +170,7 @@ class Native:
             if lock:
                 Hosts._lock_gate(tx, self.cfg['host'])
             rows = tx.query('SELECT host, mode, claims_open, generation, release_epoch, '
-                            'return_probe FROM host_lifecycle WHERE host=%s' +
-                            (' FOR SHARE' if lock else ''),
+                            'return_probe FROM host_lifecycle WHERE host=%s',
                             (self.cfg['host'],))
             if (len(rows) != 1 or rows[0]['mode'] != mode or rows[0]['claims_open']
                     or (mode == 'returning' and rows[0]['return_probe'] != self.cfg['probe_agent'])):
@@ -183,27 +182,21 @@ class Native:
         return Queue(tx).result_since(dict(key, state='busy'), 'probe admitted')
 
     def start(self, key):
-        from ameesh import mail
-        with self.control('returning') as (tx, control):
-            if any(key[k] != control[k] for k in ('generation', 'release_epoch')):
-                raise Refus('stale return')
-            rows = tx.query('SELECT name FROM agent_registry WHERE name=%s AND host=%s '
-                            "AND mode='execute' AND retired_at IS NULL AND NOT handoff_fenced",
-                            (key['probe_agent'], key['host']))
-            if len(rows) != 1:
-                raise Refus('probe identity not enrolled here')
-            if self.admission(tx, key) is None:
-                raise Refus('probe not admitted')
-            nonce = key['nonce']
-            body = ('VM return health probe. Acknowledge this nonce with '
-                    'agent-mail send ' + key['probe_agent'] + ' --ack "VM-PROBE-ACK ' + nonce +
-                    '" then end this turn. No other work is requested.')
-            request_id = mail.send(tx, 'vm-adapter', key['probe_agent'], body,
-                                   host=key['host'], kind='request', thread=False,
-                                   payload={'vm_probe': key}, idempotency_key='vm-probe-' + nonce)
-            created = tx.query('SELECT extract(epoch from created_at) AS ts '
-                               'FROM agent_mailbox WHERE id=%s', (request_id,))[0]['ts']
-            return request_id, float(created)
+        # #6298: no free mailbox INSERT or UPDATE/row-lock privilege on the
+        # VM login. The bounded definer holds the native gate and FOR SHARE,
+        # rechecks the admission and constructs the only permitted message.
+        try:
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL statement_timeout = '4000ms'")
+                tx.execute("SET LOCAL lock_timeout = '1000ms'")
+                rows = tx.query('SELECT request_id, started_ts FROM vm_probe_send(%s,%s,%s,%s,%s)',
+                                tuple(key[k] for k in ('host', 'probe_agent', 'generation',
+                                                      'release_epoch', 'nonce')))
+                if len(rows) != 1:
+                    raise Refus('probe deposit missing')
+                return int(rows[0]['request_id']), float(rows[0]['started_ts'])
+        except Exception:
+            raise Refus('native probe deposit refused') from None
 
     def receipt(self, launch):
         key = {k: launch[k] for k in ('host', 'probe_agent', 'generation', 'release_epoch', 'nonce')}
@@ -366,7 +359,11 @@ def main(argv=None, *, environ=None, connect=None, runner=subprocess.run):
                           stderr=subprocess.DEVNULL, timeout=5, check=False).returncode
         from ameesh import config, db as db_mod
         private_json(cfg['ameesh_config'], root=True)
-        db = (connect or db_mod.connect)(config.load_file(cfg['ameesh_config'], env=ENV))
+        connection_cfg = config.load_file(cfg['ameesh_config'], env=ENV)
+        # The login is not a general application writer: it needs neither
+        # migration inventory rights nor the writer-admission handshake.
+        db = (connect(connection_cfg) if connect is not None
+              else db_mod.connect(connection_cfg, writer=False))
         native = Native(db, cfg)
         if verb == '/usr/bin/sudo':
             if not native.quiet(returning=False):
