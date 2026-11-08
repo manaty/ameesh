@@ -104,8 +104,9 @@ import secrets
 import sys
 import time
 
-from ameesh import (agent_pause, budget, chat, config, db as db_mod,
-                    file_decoupage, mail, registry, storage, work)
+from ameesh import (account_window, agent_pause, budget, chat, config,
+                    db as db_mod, file_decoupage, mail, registry, storage,
+                    work)
 
 #: seconds allowed for delivery, tool answer and a clean turn end (bounded)
 DEFAULT_ATTENTE = 300.0
@@ -279,8 +280,7 @@ def sans_executeur(db, rows: list[dict], souffrance: float, now: float) -> list[
         statut = row.get("status") or "idle"
         if row.get("operator_paused") or statut in ("stopped", "dead"):
             continue
-        if statut == "blocked" and (row.get("status_text") or "").startswith(
-                budget.PAUSE_PREFIX):
+        if statut == "blocked" and attente_budget(row):
             continue
         if driven(row, now):
             continue
@@ -624,10 +624,13 @@ def attente_budget(row: dict) -> str:
     #4089 : the runner holds the turn after the start gap of the account
     (#3779) and writes it under ``budget.PAUSE_PREFIX``; that is a wait, not a
     failed turn (as ``sans_executeur`` already reads it).
+    #6292 : depuis #5783, la fenetre courte du compte s'ecrit aussi sous
+    ``account window:`` ; ``account_window.is_short_window`` la reconnait.
     """
     for texte in (row.get("last_error") or "",
                   row.get("status_text") or ""):
-        if (texte or "").startswith(budget.PAUSE_PREFIX):
+        if (texte or "").startswith(budget.PAUSE_PREFIX) or \
+                account_window.is_short_window(texte):
             return texte
     return ""
 

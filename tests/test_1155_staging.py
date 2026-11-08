@@ -1968,6 +1968,16 @@ class SanteCourrierTest(unittest.TestCase):
                     self.mod.sans_executeur(object(), rows, 0.0, 1000.0), [])
             unread.assert_not_called()
 
+    def test_sans_executeur_ecarte_la_fenetre_courte(self):
+        """#6292 : un agent retenu par « account window: » n'est pas nomme
+        « sans executeur »."""
+        rows = [{'name': 'fenetre', 'status': 'blocked',
+                 'status_text': 'account window: next turn in 17s'}]
+        with mock.patch.object(self.mod.mail, 'unread_active') as unread:
+            self.assertEqual(
+                self.mod.sans_executeur(object(), rows, 0.0, 1000.0), [])
+        unread.assert_not_called()
+
     def test_sans_executeur_nomme_un_bloque_avec_erreur(self):
         """#2899 : un bloque sans bail et hors pause budget garde sa cause et
         son courrier ; il n'est plus invisible."""
@@ -2343,6 +2353,28 @@ class SanteCourrierTest(unittest.TestCase):
         out = self.sonde(lambda db, nom: next(lectures), repond=True, attente=60.0)
         self.assertEqual(out['tour'], 'ok')
         self.assertTrue(out['concluant'])
+
+    def test_probe_waits_through_an_account_window_then_ok(self):
+        """#6292 : la fenetre courte ecrite sous « account window: » (#5783)
+        est une attente, pas un tour en echec (AG3, 08/11 07:07Z)."""
+        raison = ('account window: next turn in 17s (start gap 30s between '
+                  'turns, #3779; last start 07:03; account primaire)')
+        attente = {'last_turn_ts': 101.0, 'status': 'blocked',
+                   'status_text': raison, 'last_error': raison}
+        lectures = iter([attente, {'last_turn_ts': 120.0, 'status': 'idle'}])
+        out = self.sonde(lambda db, nom: next(lectures), repond=True, attente=60.0)
+        self.assertEqual(out['tour'], 'ok')
+        self.assertTrue(out['concluant'])
+
+    def test_attente_budget_reconnait_les_deux_formes(self):
+        """#6292 : « budget : » (#4089) et la fenetre courte (#5783), dans
+        last_error comme dans status_text ; une vraie erreur n'en est pas une."""
+        lit = self.mod.attente_budget
+        self.assertTrue(lit({'last_error': 'account window: next turn in 17s'}))
+        self.assertTrue(lit({'status_text': 'account window: next turn in 17s'}))
+        self.assertTrue(lit({'last_error': 'account primaire: next turn in 17s'}))
+        self.assertTrue(lit({'status_text': 'budget : compte epuise'}))
+        self.assertEqual(lit({'last_error': 'boom', 'status_text': 'harness crashed'}), '')
 
     def test_probe_budget_wait_until_the_bound_is_inconclusive(self):
         out = self.sonde({'last_turn_ts': 101.0, 'status': 'blocked',
