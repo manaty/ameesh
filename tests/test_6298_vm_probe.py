@@ -3,6 +3,7 @@
 from pathlib import Path
 import os
 import dataclasses
+import json
 import secrets
 import urllib.parse
 from ameesh import db as db_mod
@@ -230,6 +231,131 @@ class VmProbeRoleTest(PgTestCase):
             "SELECT * FROM vm_probe_send('burst','burst-probe',1,2,'" + NONCE + "');")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('clean session', result.stderr)
+
+    def receipt(self, request, host='burst', agent='burst-probe', generation=1, epoch=2, nonce=NONCE):
+        # Inputs are fixed fixture literals, never external text.
+        return self.role_sql("SELECT row_to_json(r) FROM vm_probe_receipt('%s','%s',%d,%d,'%s',%d) r;"
+                             % (host, agent, generation, epoch, nonce, request))
+
+    def test_mailbox_is_unreadable_and_old_column_grants_are_revoked_idempotently(self):
+        for target in ('agent_mailbox', '(id,body,meta,payload) ON agent_mailbox'):
+            grant = ('GRANT SELECT ON ' if target == 'agent_mailbox' else 'GRANT SELECT ') + target
+            self.db.execute(grant + ' TO "' + self.role + '"')
+            self.assertNotEqual(self.script('_contrat-vm-probe.sql').returncode, 0)
+            install = self.script('role-vm-probe.sql')
+            self.assertEqual(install.returncode, 0, install.stderr)
+            for col in ('id', 'body', 'meta', 'payload', 'sender', 'delivered_at'):
+                with self.subTest(column=col):
+                    self.assertNotEqual(self.role_sql('SELECT ' + col + ' FROM agent_mailbox').returncode, 0)
+        self.audit()
+
+    def test_other_service_login_may_read_mail_but_vm_probe_cannot_set_role_to_it(self):
+        other = self.role + '_auditor'
+        self.db.execute('CREATE ROLE "' + other + '" LOGIN NOINHERIT')
+        try:
+            self.db.execute('GRANT USAGE ON SCHEMA "' + self.schema + '" TO "' + other + '"')
+            for columns in ('body', 'meta,payload'):
+                self.db.execute('GRANT SELECT(' + columns + ') ON agent_mailbox TO "' + other + '"')
+                self.audit()  # legitimate unrelated service, outside this contract
+            self.db.execute('GRANT "' + other + '" TO "' + self.role + '"')
+            try:
+                result = self.script('_contrat-vm-probe.sql')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('vm_probe can read mailbox directly or via SET ROLE', result.stderr)
+            finally:
+                self.db.execute('REVOKE "' + other + '" FROM "' + self.role + '"')
+            self.audit()
+        finally:
+            self.db.execute('DROP OWNED BY "' + other + '" CASCADE')
+            self.db.execute('DROP ROLE "' + other + '"')
+
+    def test_receipt_matches_only_deposited_probe_and_never_returns_message_content(self):
+        self.admit()
+        sent = self.send()
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        request = int(sent.stdout.strip())
+        proof = self.receipt(request)
+        self.assertEqual(proof.returncode, 0, proof.stderr)
+        self.assertEqual(json.loads(proof.stdout), dict(delivered=False, turn_id=None, acknowledged=False))
+        # A row outside the bounded deposit, even addressed to this probe,
+        # must remain invisible to the connection and the definer.
+        row = self.db.query("INSERT INTO agent_mailbox(sender,recipient,body,host,payload) "
+                            "VALUES ('human:owner','burst-probe','private-content','burst',"
+                            "'{\"private\":\"secret-value\"}') RETURNING id")[0]
+        self.assertEqual(self.receipt(row['id']).stdout.strip(), '')
+        for kwargs in ({'host': 'other'}, {'agent': 'other'}, {'generation': 2},
+                       {'epoch': 3}, {'nonce': 'b' * 32}, {'nonce': 'invalid'}):
+            with self.subTest(kwargs=kwargs):
+                foreign = self.receipt(request, **kwargs)
+                self.assertEqual(foreign.returncode, 0, foreign.stderr)
+                self.assertEqual(foreign.stdout.strip(), '')
+        self.db.execute("UPDATE agent_mailbox SET meta='{\"retire\":true}' WHERE id=%s", (request,))
+        self.assertEqual(self.receipt(request).stdout.strip(), '')
+
+    def test_previous_writer_delivery_and_ack_need_no_new_function_or_columns(self):
+        self.admit()
+        sent = self.send()
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        request = int(sent.stdout.strip())
+        # These are the N-1 writer's ordinary statements. No new schema
+        # column or writer API is needed to satisfy the new receipt reader.
+        self.db.execute("INSERT INTO turn_resources(turn_id,agent,host,status) "
+                        "VALUES ('old-writer-turn','burst-probe','burst','running')")
+        self.db.execute("UPDATE agent_mailbox SET delivered_at=clock_timestamp(),status='delivered',"
+                        "meta='{\"consigne\":{\"turn\":\"old-writer-turn\"}}' WHERE id=%s", (request,))
+        self.db.execute("UPDATE agent_mailbox SET payload=jsonb_build_object('vm_probe',payload->'vm_probe') "
+                        "WHERE id=%s", (request,))
+        before = json.loads(self.receipt(request).stdout)
+        self.assertEqual(before, dict(delivered=True, turn_id='old-writer-turn', acknowledged=False))
+        for sender, recipient, host, body, payload in (
+                ('burst-probe', 'burst-probe', 'other', 'VM-PROBE-ACK ' + NONCE, '{"ack":true}'),
+                ('other', 'burst-probe', 'burst', 'VM-PROBE-ACK ' + NONCE, '{"ack":true}'),
+                ('burst-probe', 'other', 'burst', 'VM-PROBE-ACK ' + NONCE, '{"ack":true}'),
+                ('burst-probe', 'burst-probe', 'burst', 'VM-PROBE-ACK ' + 'b' * 32, '{"ack":true}'),
+                ('burst-probe', 'burst-probe', 'burst', 'VM-PROBE-ACK ' + NONCE, '{}')):
+            self.db.execute("INSERT INTO agent_mailbox(sender,recipient,body,host,payload) VALUES (%s,%s,%s,%s,%s::jsonb)",
+                            (sender, recipient, body, host, payload))
+        self.assertFalse(json.loads(self.receipt(request).stdout)['acknowledged'])
+        self.db.execute("INSERT INTO agent_mailbox(sender,recipient,body,host,payload) VALUES "
+                        "('burst-probe','burst-probe',%s,'burst','{\"ack\":true}')", ('VM-PROBE-ACK ' + NONCE,))
+        self.db.execute("UPDATE turn_resources SET status='done',ended_at=clock_timestamp() "
+                        "WHERE turn_id='old-writer-turn'")
+        self.assertEqual(json.loads(self.receipt(request).stdout),
+                         dict(delivered=True, turn_id='old-writer-turn', acknowledged=True))
+        self.db.execute("UPDATE host_lifecycle SET generation=2 WHERE host='burst'")
+        self.assertEqual(self.receipt(request).stdout.strip(), '')
+
+    def test_receipt_ack_is_bounded_by_delivery_and_turn_end(self):
+        self.admit()
+        sent = self.send()
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        request = int(sent.stdout.strip())
+        self.db.execute("INSERT INTO turn_resources(turn_id,agent,host,status,ended_at) "
+                        "VALUES ('window-turn','burst-probe','burst','done',clock_timestamp()-interval '1 minute')")
+        self.db.execute("UPDATE agent_mailbox SET delivered_at=clock_timestamp()-interval '2 minutes',"
+                        "meta='{\"consigne\":{\"turn\":\"window-turn\"}}' WHERE id=%s", (request,))
+        self.db.execute("INSERT INTO agent_mailbox(sender,recipient,body,host,payload,created_at) VALUES "
+                        "('burst-probe','burst-probe',%s,'burst','{\"ack\":true}',clock_timestamp()-interval '3 minutes'),"
+                        "('burst-probe','burst-probe',%s,'burst','{\"ack\":true}',clock_timestamp())",
+                        ('VM-PROBE-ACK ' + NONCE, 'VM-PROBE-ACK ' + NONCE))
+        self.assertFalse(json.loads(self.receipt(request).stdout)['acknowledged'])
+
+    def test_receipt_definer_public_execution_and_body_drift_refused(self):
+        signature = 'vm_probe_receipt(text,text,bigint,bigint,text,bigint)'
+        definition = self.db.query('SELECT pg_get_functiondef(%s::regprocedure) AS definition', (signature,))[0]['definition']
+        for grant, revoke in (('GRANT EXECUTE ON FUNCTION ' + signature + ' TO PUBLIC',
+                               'REVOKE EXECUTE ON FUNCTION ' + signature + ' FROM PUBLIC'),):
+            self.db.execute(grant)
+            try:
+                self.assertNotEqual(self.script('_contrat-vm-probe.sql').returncode, 0)
+            finally:
+                self.db.execute(revoke)
+        self.db.execute(definition.replace('RETURN QUERY', 'PERFORM 1; RETURN QUERY'))
+        try:
+            self.assertNotEqual(self.script('_contrat-vm-probe.sql').returncode, 0)
+        finally:
+            self.db.execute(definition)
+        self.audit()
 
     def test_real_login_runs_native_receipt_and_reconciliation(self):
         self.admit()
