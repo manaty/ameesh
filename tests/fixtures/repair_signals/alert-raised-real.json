@@ -1,9 +1,9 @@
 {
   "type": "alert.raised",
-  "object": "alert:ci_main_red",
+  "object": "alert:decision_pending",
   "project": "acme",
   "data": {
-    "alert": "ci_main_red",
-    "key": "[\"ci_main_red\", \"acme/widget main\"]"
+    "alert": "decision_pending",
+    "key": "[\"decision_pending\", \"worker-1\", null, 42, 1794144000, null, 123]"
   }
 }
