@@ -109,7 +109,7 @@ class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
         self.denial_reason=None
         if operation!=self.operation or step not in self.steps or self.scopes[step]!=digest:
             return False
-        view=signed.decisions.get(self.db,self.decision_id)
+        view=signed.decisions.get_for_controller(self.db,self.decision_id)
         if view and not self._current(view):
             return False
         if not view or view.get('state')!='answered' or view.get('needs_signature') is not True:

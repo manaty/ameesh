@@ -38,7 +38,7 @@ def replaced(backend, previous, old, new):
                and e.get('phase') == 'start' and e.get('operation') == item.operation
                and e.get('bundle_digest') == bundle['digest']]
     identifier = entries[-1].get('decision') if entries else None
-    view = decisions.get(backend.db, identifier) if type(identifier) is int else None
+    view = decisions.get_for_controller(backend.db, identifier) if type(identifier) is int else None
     answer = (view or {}).get('answer') or {}
     if (view is None or view.get('state') != 'answered' or view.get('needs_signature') is not True
             or view.get('question') != text or view.get('options') != swap.OPTIONS
@@ -94,7 +94,7 @@ def reference(backend, operation, previous, decision):
     # not authority: authenticate the exact historical question and proof too.
     decisions = b.signed.decisions
     def signed_previous(identifier, *, current=False):
-        view = decisions.get(backend.db, identifier)
+        view = decisions.get_for_controller(backend.db, identifier)
         answer = (view or {}).get('answer') or {}
         return (view is not None and (not current or view.get('superseded_by') is None)
                 and view.get('state') == 'answered'
@@ -152,8 +152,8 @@ def authority(bootstrap, backend, decision, operation, bundle, ref):
         def validate(self, operation, digest, step):
             if reference(backend, operation, ref['operation'], ref['decision']) != ref:
                 raise bootstrap.BootstrapError('previous bootstrap changed')
-            old = bootstrap.signed.decisions.get(self.db, ref['decision'])
-            new = bootstrap.signed.decisions.get(self.db, self.decision_id)
+            old = bootstrap.signed.decisions.get_for_controller(self.db, ref['decision'])
+            new = bootstrap.signed.decisions.get_for_controller(self.db, self.decision_id)
             if (not old or not new or old.get('superseded_by') != self.decision_id
                     or new.get('supersedes') != ref['decision']
                     or new.get('supersedes_option') != 'install'
