@@ -126,7 +126,7 @@ _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "re
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
                   "contract_selection")
 _PRODUCTION_KEYS = ("branch",)
-_CONTRACT_SELECTION_KEYS = ("registry", "publish")
+_CONTRACT_SELECTION_KEYS = ("registry", "publish", "attestation_max_age_seconds")
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
 #: ni fin en `/`, `.` ou `.lock` — jamais une ref arbitraire ni un commit
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -188,6 +188,8 @@ class ContractSelection:
 
     registry: str
     publish: str = "contracts-first"
+    # Absent in N-1: attestations may be recorded but must never be reused.
+    attestation_max_age_seconds: int | None = None
 
 
 def _contract_publication(value, where: str) -> str:
@@ -204,7 +206,10 @@ def _contract_selection(value, where: str) -> ContractSelection:
     if not relative_path(path) or any(c in path for c in "*?[]"):
         raise MechanicsError(where + ".registry: repository-relative file required")
     publish = _contract_publication(data.get("publish", "contracts-first"), where + ".publish")
-    return ContractSelection(path, publish)
+    age = data.get("attestation_max_age_seconds")
+    if "attestation_max_age_seconds" in data and (type(age) is not int or age <= 0):
+        raise MechanicsError(where + ".attestation_max_age_seconds: positive integer required")
+    return ContractSelection(path, publish, age)
 
 
 @dataclass(frozen=True)
@@ -775,6 +780,9 @@ class Mechanics:
         if self.contract_selection is not None:
             payload["contract_selection"] = {"registry": self.contract_selection.registry,
                                              "publish": self.contract_selection.publish}
+            if self.contract_selection.attestation_max_age_seconds is not None:
+                payload["contract_selection"]["attestation_max_age_seconds"] = (
+                    self.contract_selection.attestation_max_age_seconds)
         if self.source:
             payload["source"] = self.source
         return payload

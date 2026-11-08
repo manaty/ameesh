@@ -1336,6 +1336,55 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
                         head_after=after, tree=tree)
 
 
+def attest_report(report: dict, *, tree: str, scope: dict, lots: list,
+                  results: dict, timestamp: str, links: list) -> dict:
+    """Add F's envelope to the existing JSON report, retaining N-1 fields.
+
+    Only the execution producer calls this: sealing detects corruption, and
+    does not confer authority or replace a review/CI. No SQL format changes.
+    """
+    from . import test_attestation as evidence
+    result = dict(report)
+    result["attestation"] = evidence.seal({
+        "schema": evidence.SCHEMA, "source_sha": report["sha"],
+        "base_sha": report["base"], "tree": tree,
+        "change_id": str(report["lot"]), "lots": lots, "scope": scope,
+        "results": results, "timestamp": timestamp, "links": links,
+        "patch_id": None,
+    })
+    return result
+
+
+def reuse_report(report: dict | None, *, head: str, tree: str, scope: dict,
+                 now, max_age_seconds=None) -> tuple[dict | None, tuple[str, ...]]:
+    """N-1/malformed reports are misses; compare content, never ancestry.
+
+    Preserve the original envelope/time and both SHAs on reuse: a regel
+    cannot refresh the age of an execution that has not been repeated.
+    """
+    from . import test_attestation as evidence
+    if not isinstance(report, dict) or "attestation" not in report:
+        return None, ("attestation-absent",)
+    if "tree" in report and not isinstance(report["tree"], dict):
+        return None, ("report-tree-invalid",)
+    try:
+        verdict = evidence.reuse(report["attestation"], candidate_sha=head,
+                                 tree=tree, scope=scope, now=now,
+                                 max_age_seconds=max_age_seconds)
+    except (evidence.AttestationError, TypeError, ValueError) as exc:
+        return None, (getattr(exc, "cause", "attestation-invalid"),)
+    if not verdict.reusable:
+        return None, verdict.causes
+    result = dict(report)
+    result["sha"] = head
+    if isinstance(result.get("tree"), dict):
+        # N-1: observed candidate head, while snapshot keeps execution origin.
+        result["tree"] = dict(result["tree"], head=head)
+    result["reuse"] = {"source_sha": verdict.source_sha,
+                       "candidate_sha": verdict.candidate_sha}
+    return result, ()
+
+
 def record(conn, report: dict) -> None:
     """Persiste le rapport APRÈS le run distant (0450), hors de toute transaction.
 

@@ -124,6 +124,16 @@ class CanonAndGitTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(mechanics.MechanicsError):
                 mechanics.compile_document(text.replace("tests/contracts.json", path))
 
+    def test_attestation_age_is_additive_strict_and_absent_in_n_minus_one(self):
+        text = MECHANICS.replace("projects: {}", "projects:\n  ameesh:\n    contract_selection:\n      registry: contracts.json")
+        old = mechanics.compile_document(text).override("ameesh").contract_selection
+        self.assertIsNone(old.attestation_max_age_seconds)
+        current = mechanics.compile_document(text + "\n      attestation_max_age_seconds: 3600\n")
+        self.assertEqual(current.override("ameesh").contract_selection.attestation_max_age_seconds, 3600)
+        for value in ("null", "true", "0", "-1", "1.5", "'3600'", "[]"):
+            with self.subTest(value=value), self.assertRaises(mechanics.MechanicsError):
+                mechanics.compile_document(text + "\n      attestation_max_age_seconds: " + value + "\n")
+
     def test_reads_candidate_blob_not_worktree_and_reports_invalid(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
             def git(*args):
@@ -151,6 +161,14 @@ class CanonAndGitTests(unittest.TestCase):
             result = cs.load_and_select(tmp, git("rev-parse", "HEAD"), policy, [], INVENTORY)
             self.assertTrue(result.full_suite_required)
             self.assertTrue(any(r.startswith("registry-invalid:") for r in result.fallback_reasons))
+            Path(tmp, "processus/mecanique.yaml").write_text(
+                text + "\n      attestation_max_age_seconds: 3600\n")
+            git("add", ".")
+            git("commit", "-m", "additive age policy")
+            loaded = mechanics.load(tmp, git("rev-parse", "HEAD"), "ameesh")
+            self.assertEqual(loaded.to_dict()["contract_selection"], {
+                "registry": "contracts.json", "publish": "contracts-first",
+                "attestation_max_age_seconds": 3600})
             absent = cs.load_and_select(tmp, sha, None, [], INVENTORY)
             self.assertIn("policy-absent", absent.fallback_reasons)
 
