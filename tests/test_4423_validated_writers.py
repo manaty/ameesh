@@ -2,7 +2,7 @@
 """Stored validation is derived from the exact-head review gate (#4423, #5016)."""
 from unittest import mock
 
-from ameesh import planned_waits, progress, storage, work, work_lifecycle
+from ameesh import notify, planned_waits, progress, storage, work, work_lifecycle
 from .support import PgTestCase
 
 HEAD = "a" * 40
@@ -29,6 +29,87 @@ class ValidatedWritersTest(PgTestCase):
 
     def current_state(self):
         return work.get(self.db, self.lot)["state"]
+
+    def test_inconclusive_gate_is_noted_once_and_retried_without_verdict(self):
+        self.read.return_value = None
+        self.mark()
+        before = self.ops.milestones(self.lot, None)
+        results = self.ops.sync_validations()
+        self.assertFalse([r for r in results if r.get("error")], results)
+        notes = self.db.query("SELECT note FROM work_item_events WHERE work_item_id = %s"
+                              " AND note LIKE 'validation pending (#6257):%%'", (self.lot,))
+        self.assertEqual(len(notes), 1)
+        self.assertIn('"gate": null', notes[0]["note"])
+        self.read.return_value = {"ok": True}
+        results = self.ops.sync_validations()
+        self.assertFalse([r for r in results if r.get("error")], results)
+        self.assertEqual(self.current_state(), "validated")
+        self.assertEqual(self.ops.milestones(self.lot, None), before)
+        events = self.db.query("SELECT note FROM work_item_events WHERE work_item_id = %s"
+                               " AND state = 'validated'", (self.lot,))
+        self.assertIn("review quorum (#4423)", events[-1]["note"])
+
+    def test_retry_preserves_concurrent_freeze_guard_and_recovers_next_pass(self):
+        self.mark()
+        def freeze_during_gate(*args, **kwargs):
+            self.read.side_effect = None
+            self.read.return_value = {"ok": False}
+            self.mark("frozen", NEXT)
+            self.mark(sha=NEXT)
+            return {"ok": True}
+        self.read.side_effect = freeze_during_gate
+        results = self.ops.sync_validations()
+        self.assertFalse([r for r in results if r.get("error")], results)
+        self.assertEqual(self.current_state(), "qa")
+        self.read.return_value = {"ok": True}
+        results = self.ops.sync_validations()
+        self.assertFalse([r for r in results if r.get("error")], results)
+        self.assertEqual(self.current_state(), "validated")
+
+    def test_retry_waits_for_outer_transaction_commit(self):
+        with self.db.transaction() as tx:
+            ops = type(self.ops)(tx)
+            ops.add_milestone(self.lot, "verdict", sha=HEAD, actor="reader",
+                              verdict="ok", note="", proof=None)
+            self.assertEqual(ops.sync_validations(), [])
+        self.read.return_value = {"ok": True}
+        results = self.ops.sync_validations()
+        self.assertFalse([r for r in results if r.get("error")], results)
+        self.assertEqual(self.current_state(), "validated")
+
+    def test_notification_pass_retries_but_dry_run_does_not_write(self):
+        self.read.return_value = None
+        self.mark()
+        self.read.return_value = {"ok": True}
+        notifier = notify.Notifier(self.cfg, notify.parse_config({}),
+                                   only=["alerts"], dry_run=True)
+        notifier.run_pass(self.db, current=[])
+        self.assertEqual(self.current_state(), "qa")
+        notifier.dry_run = False
+        notifier.run_pass(self.db, current=[])
+        self.assertEqual(self.current_state(), "validated")
+
+    def test_failed_gate_records_reason_and_error_without_starving_other_lots(self):
+        self.read.return_value = None
+        self.mark()
+        other = work.add(self.db, title="second validation", app="demo")["id"]
+        work.move(self.db, other, "build")
+        work.move(self.db, other, "qa")
+        self.ops.add_milestone(other, "frozen", sha=HEAD, actor="reader",
+                               verdict=None, note="", proof=None)
+        self.ops.add_milestone(other, "verdict", sha=HEAD, actor="reader",
+                               verdict="ok", note="", proof=None)
+        def gate(_db, _cfg, item, marks):
+            if item["id"] == self.lot:
+                raise OSError("clone unavailable")
+            return {"ok": True}
+        self.read.side_effect = gate
+        self.ops.sync_validations()
+        self.assertEqual(self.current_state(), "qa")
+        self.assertEqual(work.get(self.db, other)["state"], "validated")
+        notes = self.db.query("SELECT note FROM work_item_events WHERE work_item_id = %s"
+                              " AND note LIKE 'validation pending (#6257):%%'", (self.lot,))
+        self.assertTrue(any("clone unavailable" in n["note"] for n in notes))
 
     def test_quorum_promotes_and_blocker_revokes_validation(self):
         self.mark("frozen")
