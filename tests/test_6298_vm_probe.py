@@ -93,6 +93,51 @@ class VmProbeRoleTest(PgTestCase):
         result = self.script('_contrat-vm-probe.sql')
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_disappeared_objects_ignored_and_live_grants_refused(self):
+        # DROP after cursor fetch reproduces the concurrent window without
+        # timing or mocking the actual PostgreSQL privilege helpers.
+        cases = [
+            ('TABLE', 'race_object(x int)', 'SELECT(x)', 'race_object',
+             "actual := has_column_privilege(who,item.oid,item.attnum,'SELECT');",
+             "item.relname='race_object'"),
+            ('TABLE', 'race_object(x int)', 'UPDATE(x)', 'race_object',
+             'actual := has_column_privilege(who,item.oid,item.attnum,item.priv);',
+             "item.relname='race_object'"),
+            ('SEQUENCE', 'race_object', 'USAGE', 'race_object',
+             'actual := has_sequence_privilege(who,item.oid,item.priv);',
+             "item.relname='race_object'"),
+            ('FUNCTION', "race_object() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+             'EXECUTE', 'race_object()',
+             "actual := has_function_privilege(who,item.oid,'EXECUTE');",
+             "item.oid=to_regprocedure('race_object()')"),
+            ('SCHEMA', self.schema + '_race', 'USAGE', self.schema + '_race',
+             "IF has_schema_privilege(who,item.oid,'CREATE') OR",
+             "item.nspname='" + self.schema + "_race'"),
+        ]
+        for kind, definition, grant, name, marker, condition in cases:
+            with self.subTest(kind=kind, grant=grant):
+                self.db.execute('CREATE ' + kind + ' ' + definition)
+                try:
+                    self.db.execute('GRANT ' + grant + ' ON ' + kind + ' ' + name
+                                    + ' TO "' + self.role + '"')
+                    result = self.script('_contrat-vm-probe.sql')
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('contract refused', result.stderr)
+                    source = (SQL / '_contrat-vm-probe.sql').read_text()
+                    self.assertEqual(source.count(marker), 1)
+                    source = source.replace(marker,
+                        'IF ' + condition + ' THEN DROP ' + kind + ' IF EXISTS ' + name
+                        + '; END IF;\n          ' + marker)
+                    result = subprocess.run(['psql', '-X', '-w', TEST_DSN, '-q',
+                        '-v', 'role=' + self.role, '-v', 'writer=' + self.writer],
+                        input=source, env=dict(os.environ,
+                            PGOPTIONS='-c search_path=' + self.schema),
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                finally:
+                    self.db.execute('DROP ' + kind + ' IF EXISTS ' + name)
+        self.audit()
+
     def test_idempotent_and_additive_migration_keeps_new_column_closed(self):
         self.assertEqual(self.script('role-vm-probe.sql').returncode, 0)
         self.db.execute('ALTER TABLE agent_registry ADD COLUMN vm_probe_private_test text')

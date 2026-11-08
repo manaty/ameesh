@@ -53,6 +53,9 @@ BEGIN
          WHERE k.relnamespace=n AND k.relname=c.rel AND a.attname=col
            AND a.attnum>0 AND NOT a.attisdropped)
     LOOP errors := errors || format('missing column %s.%s (%s)',item.rel,item.col,item.who); END LOOP;
+    -- Catalog cursors retain their snapshot while privilege helpers can see
+    -- a concurrent DROP. NULL means disappeared, not a privilege mismatch.
+    -- Required objects are still checked by the installation checks.
     FOREACH who IN ARRAY ARRAY[r,w] LOOP
         SELECT oid INTO rid FROM pg_roles WHERE rolname=who;
         IF rid IS NULL THEN RAISE EXCEPTION 'missing role %',who; END IF;
@@ -95,7 +98,7 @@ BEGIN
             (SELECT FROM pg_temp.vm_probe_columns c WHERE c.subject=who
              AND c.rel=item.relname AND item.attname=ANY(c.cols));
           actual := has_column_privilege(who,item.oid,item.attnum,'SELECT');
-          IF actual IS DISTINCT FROM allowed THEN
+          IF actual IS NOT NULL AND actual IS DISTINCT FROM allowed THEN
             errors := errors || format('SELECT outside/missing contract %s %s.%s.%s',who,item.nspname,item.relname,item.attname);
           END IF;
         END LOOP;
@@ -126,7 +129,8 @@ BEGIN
               OR (item.relname='agent_registry' AND item.attname='name')))
             OR (item.priv='INSERT' AND item.relname='agent_mailbox' AND item.attname=ANY
               (ARRAY['sender','recipient','body','host','kind','payload','created_at'])));
-          IF has_column_privilege(who,item.oid,item.attnum,item.priv) IS DISTINCT FROM allowed THEN
+          actual := has_column_privilege(who,item.oid,item.attnum,item.priv);
+          IF actual IS NOT NULL AND actual IS DISTINCT FROM allowed THEN
             errors := errors || format('%s outside/missing contract %s %s.%s',item.priv,who,item.relname,item.attname);
           END IF;
         END LOOP;
@@ -144,7 +148,8 @@ BEGIN
           WHERE k.relkind='S' AND ns.nspname !~ '^pg_'
         LOOP
           allowed := who=w AND item.oid=seq AND item.priv='USAGE';
-          IF has_sequence_privilege(who,item.oid,item.priv) IS DISTINCT FROM allowed THEN
+          actual := has_sequence_privilege(who,item.oid,item.priv);
+          IF actual IS NOT NULL AND actual IS DISTINCT FROM allowed THEN
             errors := errors || format('sequence %s %s (%s)',item.relname,item.priv,who);
           END IF;
         END LOOP;
@@ -154,13 +159,15 @@ BEGIN
             AND ns.nspname !~ '^pg_(toast|temp_|toast_temp_)'
             AND (p.prosecdef OR EXISTS(SELECT FROM aclexplode(p.proacl) x WHERE x.grantee=rid))
         LOOP
-          IF has_function_privilege(who,item.oid,'EXECUTE') IS DISTINCT FROM (item.oid IN (fn,receipt_fn)) THEN
+          actual := has_function_privilege(who,item.oid,'EXECUTE');
+          IF actual IS NOT NULL AND actual IS DISTINCT FROM (item.oid IN (fn,receipt_fn)) THEN
             errors := errors || format('function outside/missing contract %s (%s)',item.name,who);
           END IF;
         END LOOP;
         FOR item IN SELECT * FROM pg_namespace WHERE nspname NOT IN ('pg_catalog','information_schema')
           AND nspname !~ '^pg_(toast|temp_|toast_temp_)'
         LOOP
+          -- These boolean predicates already ignore a disappeared schema.
           IF has_schema_privilege(who,item.oid,'CREATE') OR
              (item.oid=n AND NOT has_schema_privilege(who,item.oid,'USAGE')) OR
              (item.oid<>n AND item.nspname<>'public' AND has_schema_privilege(who,item.oid,'USAGE')) THEN
