@@ -303,6 +303,8 @@ class VmProbeRoleTest(PgTestCase):
                         "VALUES ('old-writer-turn','burst-probe','burst','running')")
         self.db.execute("UPDATE agent_mailbox SET delivered_at=clock_timestamp(),status='delivered',"
                         "meta='{\"consigne\":{\"turn\":\"old-writer-turn\"}}' WHERE id=%s", (request,))
+        self.db.execute("UPDATE agent_mailbox SET payload=jsonb_build_object('vm_probe',payload->'vm_probe') "
+                        "WHERE id=%s", (request,))
         before = json.loads(self.receipt(request).stdout)
         self.assertEqual(before, dict(delivered=True, turn_id='old-writer-turn', acknowledged=False))
         for sender, recipient, host, body, payload in (
