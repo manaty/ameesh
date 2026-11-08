@@ -110,7 +110,7 @@ def _mark_author(author) -> dict:
 
 def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers,
                missing: int, why: str, authors, policy_ref: str, sha: str,
-               sent=(), unknown=()) -> str:
+               sent=(), unknown=(), base: str = "") -> str:
     payload = {
         "state": state,
         "required": int(required),
@@ -134,6 +134,9 @@ def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers
                   "capacity": bool((s or {}).get("capacity"))}
                  for s in sent or ()],
     }
+    if base:
+        # #6365 : le début du delta désigné ; la porte relit la même plage.
+        payload["base"] = base
     return "%s %s" % (mark_prefix(lot, freeze_id),
                       json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
@@ -618,7 +621,8 @@ class PgPort:
                  _mark_note(lot, freeze_id, state=state, required=required,
                             reviewers=reviewers, missing=missing, why=why,
                             authors=authors, policy_ref=policy_ref, sha=sha,
-                            sent=deposited, unknown=unknown_authors),
+                            sent=deposited, unknown=unknown_authors,
+                            base=plan_git.full_commit_id(freeze.get("base"))),
                  self.sender)
         return _designation(lot, freeze_id, state=state, required=required,
                             reviewers=reviewers, missing=missing, why=why,

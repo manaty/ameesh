@@ -567,6 +567,50 @@ def _waiver(db, item) -> tuple:
     return waived, waived_by, row
 
 
+def _designated_base(db, item, milestone, repo, frozen) -> str:
+    """La base du delta que la désignation de ce gel a lue, ou "" (#6365).
+
+    La désignation lit la plage gelée sur la pointe de la cible rafraîchie
+    (`review_target.resolve`) et en garde le début, `merge-base(cible, tête)`,
+    dans sa marque. La porte relit la même plage : elle ne dépend plus de la
+    fraîcheur de la ref `origin/<cible>` du clone qui la lit, ni d'une forge
+    joignable. Seule une marque écrite par le système compte (une note d'agent
+    peut en copier le texte) ; la base doit être un commit présent et un
+    ancêtre strict de la tête. Sinon "" : la lecture d'avant s'applique."""
+    from . import review_designation_pg as pg
+
+    try:
+        lot = int((item or {}).get("id") or 0)
+        freeze_id = int((milestone or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not lot or not freeze_id or not repo or not frozen:
+        return ""
+    try:
+        events = storage.of(db).work.events_noted(
+            pg.mark_prefix(lot, freeze_id), 0.0, ids=[lot]) or []
+    except Exception:  # noqa: BLE001 - journal illisible : lecture d'avant
+        return ""
+    base = ""
+    for event in sorted(events, key=lambda row: int((row or {}).get("id") or 0)):
+        if str((event or {}).get("actor") or "").strip() != pg.SENDER:
+            continue
+        try:
+            payload = pg.designation_of(str((event or {}).get("note") or ""))
+            if int((payload or {}).get("freeze", {}).get("id") or 0) != freeze_id:
+                continue
+        except Exception:  # noqa: BLE001 - marque illisible : ignorée
+            continue
+        noted = plan_git.full_commit_id(payload.get("base"))
+        if noted:
+            base = noted
+    if not base or plan_git.same_commit(base, frozen):
+        return ""
+    if not plan_git._commit(repo, base) or not plan_git._is_ancestor(repo, base, frozen):
+        return ""
+    return base
+
+
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
                            commits=None, strict=False, families_out=None,
                            target="", admitted_heads=(), exclusions_out=None):
@@ -601,6 +645,17 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
         return None
     from . import review_authors, review_designation_activation as act
     milestone = _freeze_milestone(marks, frozen, repo)
+    pinned = _designated_base(db, item, milestone, repo, frozen)
+    known = plan_git._commit(repo, base) if base else None
+    if pinned and (not known or plan_git._is_ancestor(repo, known, pinned)):
+        # #6365 : `base_sha` est la ref `origin/<cible>` du clone qui lit,
+        # fraîche de son seul dernier fetch. Sur une ref périmée et une forge
+        # muette, la plage embarquait les commits entrés dans la cible depuis
+        # (nexlink #6349 : codex3 compté auteur d'une tête d'un seul commit
+        # deepseek, quorum sensible impossible). La porte lit le delta que la
+        # désignation a lu ; une base locale plus récente que lui reste, et
+        # la cible passée par l'appelant garde son filtre (#3116).
+        base = pinned
     # #4791: queue and fire share this bounded, fail-closed attribution.
     # Reuse an outer sweep rather than restarting its budget.
     import contextlib
