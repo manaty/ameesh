@@ -14,7 +14,7 @@ def install_decision_gate(cls):
     sql = ("BEGIN; CREATE ROLE \"%s\" NOLOGIN; "
            "SELECT set_config('ameesh.release_role','%s',true);\n" % (role, role)
            + 'GRANT USAGE ON SCHEMA "%s" TO "%s";\n' % (cls.schema,role)
-           + '\\i ' + str(root / 'deploy/sql/_release-decision.sql') + '\nCOMMIT;\n')
+           + '\\i ' + str(root / 'deploy/sql/_release-decision.sql') + '\n\\i ' + str(root / 'deploy/sql/_revoke-release-mailbox.sql') + '\nCOMMIT;\n')
     result = subprocess.run(['psql', '-X', '-w', TEST_DSN, '-q', '-v', 'ON_ERROR_STOP=1'],
                             input=sql, env=dict(os.environ, PGOPTIONS='-c search_path='+cls.schema),
                             capture_output=True, text=True, timeout=60)
