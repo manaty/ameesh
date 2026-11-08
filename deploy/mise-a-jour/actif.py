@@ -9,7 +9,11 @@ le signal que si l'ACTIVATION est prouvee, hote par hote :
 * `installer`, `redemarrer`, `controler` et `sante` tous « ok » dans la
   fenetre de cette execution (depuis `--depuis`), chaque evenement portant le
   commit vise (un journal d'une autre execution ne prouve rien) ;
-* aucun `retour` (rollback) dans cette fenetre ;
+* aucun `retour` (rollback) non suivi d'un rejeu sain : un retour n'invalide
+  que son hote ; s'il est suivi, dans la fenetre, d'une sequence posterieure
+  du meme commit qui reinstalle cet hote (`installer`, `redemarrer`,
+  `controler`, `sante` ok), l'hote est prouve par ce rejeu et les autres
+  gardent leurs preuves (#6289) ;
 * un hote declare absent (`--absent nom=raison`) est prouve par un evenement
   `absent`/`reporte` portant le commit vise et une raison, et par AUCUNE preuve
   d'activation. Seuls le poste pc-smichea (mise a jour a son retour) et le
@@ -340,9 +344,12 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
             "sequence partielle (%s) : les trois VM d'agents sont requises"
             % ", ".join(sorted(actifs)))
     retours = [e for e in evenements if e.get("etape") == "retour"]
-    if retours:
-        raise PreuveManquante("retour/rollback present dans la fenetre (%d evenement(s))"
-                              % len(retours))
+    inconnus = sorted({str(e.get("hote")) for e in retours
+                       if e.get("hote") not in HOTES_CANON})
+    if inconnus:
+        raise PreuveManquante(
+            "retour/rollback d'un hote hors du canon : %s"
+            % ", ".join(inconnus))
     # un evenement de la fenetre sans le commit vise vient d'une autre
     # execution : le journal ne prouve alors rien pour celle-ci (avis R1 B2).
     etrangers = [e for e in evenements
@@ -368,11 +375,17 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
         if not prefixe_du_commit(sha, actif):
             raise PreuveManquante("%s : commit actif %s different de la cible %s"
                                   % (hote, actif[:12], sha[:12]))
-        # dernier verdict par etape, apres le dernier « ko » de l'hote : un ko
-        # suivi d'un retour est deja disqualifie plus haut.
+        # #6289 : un retour n'invalide que son hote ; seules les preuves
+        # POSTERIEURES (rejeu du meme commit) le rehabilitent. Le dernier
+        # « ko » borne aussi les preuves : une sequence qui echoue ne prouve
+        # rien pour cet hote tant qu'elle n'est pas rejouee.
         siens = [e for e in evenements if e.get("hote") == hote]
-        ko = [i for i, e in enumerate(siens) if e.get("verdict") == "ko"]
-        apres = siens[(ko[-1] + 1) if ko else 0:]
+        bornes = [i for i, e in enumerate(siens)
+                  if e.get("etape") == "retour" or e.get("verdict") == "ko"]
+        apres = siens[(bornes[-1] + 1) if bornes else 0:]
+        if any(e.get("etape") == "retour" for e in siens) and not apres:
+            raise PreuveManquante(
+                "%s : retour/rollback sans rejeu sain posterieur" % hote)
         etapes = {}
         for evenement in apres:
             if evenement.get("etape") in ETAPES_REQUISES:

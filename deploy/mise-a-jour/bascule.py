@@ -74,10 +74,10 @@ INVITE = "ameesh"
 FORMAT_SCELLE = "ameesh-venv-staging/3"
 MAX_MANIFESTE_BYTES = 1024 * 1024
 #: #3619 : les extras que porte tout venv versionné d'hôte — psycopg (pilote
-#: normal) et crypto (canal nexlink, `cryptography>=41`). La préparation les
-#: installe et les contrôle AVANT la bascule : un hôte sans crypto ne sert
-#: jamais le code qui activerait le canal.
-HOST_EXTRAS = "psycopg,crypto"
+#: normal), crypto (canal nexlink) et contrats (coverage/PyYAML, passe du
+#: composeur, #6309). La préparation les installe et les contrôle AVANT la
+#: bascule : une dépendance manquante ne rejoint jamais le venv vivant.
+HOST_EXTRAS = "psycopg,crypto,contrats"
 CURRENT = "venv-courant"         # lien : version vivante
 REPORT = "venv.precedent"        # fichier : version précédente enregistrée
 LAUNCHERS = ".bascule-lanceurs"  # marqueur : <venv> porte les lanceurs
@@ -439,15 +439,17 @@ def _controles(directory, env=None, cryptography=True):
 
     #3619 : le venv historique d'hôte porte l'extra `cryptography` (canal
     nexlink) ; son absence fait échouer la préparation, pas le premier envoi.
+    #6309 : coverage et yaml sont requis pour la passe de contrats du
+    composeur sur les hôtes d’agents, avant toute mise en service.
     #5711 : le paquet opérateur verrouillé est le runtime standard, sans
-    extra (l'exécuteur de staging n'utilise pas le canal nexlink) : ses
+    extra (ni canal nexlink, ni passe de contrats du composeur) : ses
     contrôles portent sur psycopg, psutil et ameesh, et le manifeste scellé
     pinne déjà l'inventaire exact des distributions.
     """
     python = os.path.join(directory, "bin", "python")
     ameesh = os.path.join(directory, "bin", "ameesh")
     _verifier_shebang(ameesh, python)
-    imports = ("import psycopg, cryptography, ameesh; print('imports ok')"
+    imports = ("import psycopg, cryptography, coverage, yaml, ameesh; print('imports ok')"
                if cryptography else
                "import psycopg, psutil, ameesh; print('imports ok')")
     _run([python, "-c", imports], stdout=subprocess.DEVNULL, env=env)

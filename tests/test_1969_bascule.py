@@ -477,6 +477,43 @@ class BasculeTest(unittest.TestCase):
         self.assertEqual(0, activer(self.venv, "v2"))
         self.assertEqual((0, "v2"), lire(self.venv))
 
+    def test_preparation_controle_les_outils_contrats_avant_bascule(self):
+        """#6309 : de vrais imports isolés refusent coverage/yaml manquants."""
+        faux_venv(self.base, "active")
+        os.rename(self.base / "venv-active", self.venv)
+        source = self.base / "src"
+        source.mkdir()
+
+        for absent in ("coverage", "yaml", None):
+            version = absent or "complete"
+            cible = self.base / ("venv-" + version)
+            args = SimpleNamespace(venv=str(self.venv), src=str(source),
+                                   version=version, python=sys.executable)
+
+            def creer(directory, python):
+                vrai_venv(self.base, version, version, "late")
+
+            def installer(directory, src):
+                site = next(Path(directory).glob("lib/python3*/site-packages"))
+                for module in ("psycopg", "cryptography", "coverage", "yaml", "ameesh"):
+                    if module != absent:
+                        (site / (module + ".py")).write_text("")
+
+            with self.subTest(absent=absent), \
+                    mock.patch.dict(os.environ, {"PYTHONPATH": "", "PYTHONNOUSERSITE": "1"}), \
+                    mock.patch.object(bascule, "_creer_venv", side_effect=creer), \
+                    mock.patch.object(bascule, "_pip_install", side_effect=installer), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                code = bascule.preparer(args)
+            self.assertEqual(1 if absent else 0, code)
+            self.assertEqual((0, "active"), lire(self.venv))
+            self.assertFalse((self.base / bascule.CURRENT).exists())
+            if absent:
+                self.assertFalse(cible.exists(), "venv incomplet laissé prêt à activer")
+            else:
+                self.assertTrue((cible / bascule.MARKER).is_file())
+                bascule._supprimer(str(cible))
+
     def test_controles_acceptent_le_shebang_python3_de_pip(self):
         cible = self.base / "venv-v2"
         (cible / "bin").mkdir(parents=True)
