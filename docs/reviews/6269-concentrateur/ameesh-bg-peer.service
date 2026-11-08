@@ -1,0 +1,15 @@
+# #6269 — pair bureau-goal, filtre avant pair ; échec du filtre = pas de pair.
+[Unit]
+Description=ameesh: bureau-goal WireGuard peer limited to central DB (#6269)
+After=wg-quick@wg0.service docker.service
+Requires=wg-quick@wg0.service
+PartOf=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ameesh-bg-peer.sh start
+ExecStop=/usr/local/sbin/ameesh-bg-peer.sh stop
+
+[Install]
+WantedBy=multi-user.target
