@@ -38,10 +38,18 @@ requires_psycopg = unittest.skipUnless(psycopg is not None, 'psycopg absent (par
 @requires_psycopg
 class PrivateInputTest(unittest.TestCase):
     def test_sql_companions_are_packaged_and_root_checked(self):
-        import tomllib
+        import ast
         from types import SimpleNamespace
-        config = tomllib.loads((REPO / 'pyproject.toml').read_text())
-        packaged = config['tool']['setuptools']['data-files']['share/ameesh/sql']
+        # These data-files values are literal string lists; Python 3.9/3.10
+        # can inspect this subset without a TOML dependency.
+        config = (REPO / 'pyproject.toml').read_text().split('[tool.setuptools.data-files]', 1)[1]
+        def files(destination):
+            match = re.search(r'"'+re.escape(destination)+r'"\s*=\s*(\[[^]]*\])', config)
+            self.assertIsNotNone(match)
+            return ast.literal_eval(match.group(1))
+        packaged = files('share/ameesh/sql')
+        self.assertIn('deploy/mise-a-jour/procedures/mailbox-controleur.md',
+                      files('share/ameesh/mise-a-jour/procedures'))
         self.assertTrue(all('deploy/sql/'+name in packaged for name in tool.SQL_COMPANIONS))
         checked = []
         def safe(path):

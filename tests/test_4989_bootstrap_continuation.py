@@ -88,13 +88,15 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
         role = self.controller_role
         self.db.execute('GRANT SELECT ON agent_registry,mesh_keys,mesh_approvals,'
                         'mesh_approvals_status,mesh_consumed_nonces,decision_supersessions TO "'+role+'"')
-        with self.db.transaction() as tx:
-            tx.execute('SET LOCAL ROLE "'+role+'"')
-            self.backend.db = tx
-            self.backend.continuation_question(self.operation, self.old_operation, self.old_decision)
-            self.assertEqual(self.backend.continue_install(self.operation, self.view['id'])['outcome'],
-                             'installed')
-        self.backend.db = self.db
+        try:
+            with self.db.transaction() as tx:
+                tx.execute('SET LOCAL ROLE "'+role+'"')
+                self.backend.db = tx
+                self.backend.continuation_question(self.operation, self.old_operation, self.old_decision)
+                self.assertEqual(self.backend.continue_install(self.operation, self.view['id'])['outcome'],
+                                 'installed')
+        finally:
+            self.backend.db = self.db
 
     def test_unsigned_and_missing_reciprocal_link_cannot_transfer_reservation(self):
         with self.assertRaises(ValueError):
