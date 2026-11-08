@@ -24,14 +24,14 @@ for h in "${CIBLES[@]}"; do
   scp -q -F none -o BatchMode=yes "$KEY" "root@$h:/root/pgdg-6291.asc"
   ssh -F none -o BatchMode=yes "root@$h" bash -s -- "$FPR" <<'EOS'
 set -euo pipefail; FPR=$1; TS=$(date -u +%Y%m%dT%H%MZ); OPS=/root/ameesh-operator-6291-$TS; install -d -m 700 "$OPS"
-dpkg -l | awk '/^ii/{print $2,$3}' > "$OPS/paquets-avant.txt"
+dpkg -l | awk '/^ii/{print $2,$3}' > "$OPS/paquets-avant.txt"; echo "libpq5 avant : $(dpkg-query -W -f='${Version}' libpq5)"
 got=$(gpg --show-keys --with-colons /root/pgdg-6291.asc 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}'); [ "$got" = "$FPR" ] || { echo "empreinte"; exit 1; }
 install -d -m 755 /etc/apt/keyrings; install -m 644 -o root -g root /root/pgdg-6291.asc /etc/apt/keyrings/pgdg.asc; rm -f /root/pgdg-6291.asc
 printf '%s\n' 'Types: deb' 'URIs: https://apt.postgresql.org/pub/repos/apt' 'Suites: noble-pgdg' 'Components: main' 'Signed-By: /etc/apt/keyrings/pgdg.asc' > /etc/apt/sources.list.d/pgdg.sources
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends postgresql-client-17 > "$OPS/install.log" 2>&1
 dpkg -l | awk '/^ii/{print $2,$3}' > "$OPS/paquets-apres.txt"; diff "$OPS/paquets-avant.txt" "$OPS/paquets-apres.txt" | grep '^>' || true
-dpkg -s postgresql-client-16 | grep -q 'Status: install ok installed'; ! dpkg -s postgresql-17 >/dev/null 2>&1
+echo "libpq5 après : $(dpkg-query -W -f='${Version}' libpq5)"; dpkg -s postgresql-client-16 | grep -q 'Status: install ok installed'; ! dpkg -s postgresql-17 >/dev/null 2>&1
 echo "$(hostname) : $(pg_dump --version) ; /usr/lib/postgresql/17/bin/pg_dump $(/usr/lib/postgresql/17/bin/pg_dump --version | awk '{print $3}') ; reçus $OPS"
 EOS
 done

@@ -1,4 +1,4 @@
-# #6291 — postgresql-client-17 (PGDG) sur AG1 et AG2 : dossier (AUCUN geste)
+# #6291 — postgresql-client-17 (PGDG) sur AG1 et AG2 : dossier v2 (AUCUN geste)
 
 Auteur : bureau (BG, claude), 08/11 08:1xZ. Demande mesh-design #200442 (cause auditeur #200436 : pg_dump 16 sur les composeurs, base de test PG17 → tests sautés).
 
@@ -16,3 +16,9 @@ Effet attendu : le wrapper `pg_dump` choisit la version la plus haute → 17 par
 
 ## Suite
 Report dans les fiches d'hôte (lot de fiche après le geste). coverage/pyyaml : hors bureau (épingles du runtime, #6291).
+
+## v2 (avis impl-03 #200490, N1)
+- **libpq5 change aussi** : `postgresql-client-17` exige `libpq5 >= 17.11` ; sur AG1/AG2, libpq5 passe de **16.15-0ubuntu0.24.04.1 à 18.6-1.pgdg24.04+2** (simulation apt d'impl-03 : 0 retrait, client-16 et client-common inchangés, aucun serveur). Seul dépendant installé de libpq5 sur AG1/AG2 : `postgresql-client-16`. **AG3 (modèle) est déjà en libpq5 18.6-1.pgdg24.04+2.**
+- Contrôles ajoutés au geste : version libpq5 avant/après relevée, diff des paquets affiché, `postgresql-client-16` toujours installé, aucun `postgresql-17`.
+- Retour : **libpq5 18.6 accepté** (même état qu'AG3, ABI rétrocompatible, seul client-16 en dépend) ; le retour retire client-17, la source et la clé, et laisse libpq5 en 18.6. Un downgrade (`apt-get install --allow-downgrades libpq5=16.15-0ubuntu0.24.04.1`) reste possible si un écart apparaît, noté dans le script.
+- Après pose : rejouer `test_3752_gabarit` sur un hôte composeur (N2), rapport sur #6291.
