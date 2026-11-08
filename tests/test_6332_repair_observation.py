@@ -58,11 +58,24 @@ class ObservationTest(PgTestCase):
     def page(self, source='inbox'):
         return self.api.page('acme', 'staging', source)
 
-    def event(self, key='a'*64):
+    def event(self, key='a'*64, **metadata):
         return self.db.query(
             "INSERT INTO ameesh_events(type,object,project,data)"
             " VALUES ('alert.raised','alert:test','acme',%s::jsonb) RETURNING id",
-            (json.dumps({'key': key, 'revision': 'a'*40, 'detail': 'PRIVATE'}),))[0]['id']
+            (json.dumps({'key': key, 'revision': 'a'*40, 'detail': 'PRIVATE', **metadata}),))[0]['id']
+
+    def test_alert_scan_advances_only_one_bounded_page(self):
+        for i in range(obs.BATCH + 1):
+            self.event('%064x' % i)
+        self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
+        self.assertEqual(len(self.page('alerts')), obs.BATCH)
+        self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
+        self.assertEqual(len(self.page('alerts')), obs.BATCH + 1)
+
+    def test_iso_since_falls_back_to_observed_timestamp(self):
+        self.event(since='2026-11-08T10:00:00Z')
+        self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
+        self.assertEqual(len(self.page('alerts')), 1)
 
     def test_replay_handover_and_stale_receiver(self):
         self.assertTrue(self.ingest([self.row()]))

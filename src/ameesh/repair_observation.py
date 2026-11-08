@@ -16,7 +16,8 @@ import time
 from . import repair_signals, repair_triage, storage
 from .repair_correlation import ENVIRONNEMENT
 
-BATCH = 100
+# U5 currently settles entries individually; cap database round trips per turn.
+BATCH = 20
 
 
 def ingest(db, *, project, environment, source, rows, expected_cursor,
@@ -82,7 +83,7 @@ def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None):
             try:
                 since = float(row['since']) if row.get('since') else row['observed']
             except (ValueError, TypeError):
-                since = ''  # explicit unknown; no diagnostic text is copied
+                since = row['observed']  # malformed source timestamp: observation time
             inputs.append({'key': row['id'], 'observed_version': row['version'], 'entry': {
                 'key': row['key'], 'project': project, 'since': since}})
         next_cursor = str(rows[-1]['id']) if rows else None
