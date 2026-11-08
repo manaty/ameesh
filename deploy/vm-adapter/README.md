@@ -150,7 +150,28 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    dans les courriers, dans le dépôt ou dans les erreurs. Écrire
    `database.env` (0600) avec le chemin `AMEESH_CONFIG` de la connexion mesh
    de l'opérateur. Le DSN ne contient aucune clé cloud.
-5. Fournir cinq commandes fixes par VM, détenues par l'opérateur et non
+5. Avant d'inscrire **chaque cible burst**, préparer son journal systemd
+   persistant : un drop-in `/etc/systemd/journald.conf.d/persistent.conf`
+   contient par exemple :
+
+   ```ini
+   [Journal]
+   Storage=persistent
+   SystemMaxUse=512M
+   SystemKeepFree=1G
+   ```
+
+   Adapter ces bornes au disque de la cible et au volume de ses journaux :
+   conserver le boot précédent jusqu'au contrôle de retour, sans saturer le
+   disque. Le bureau applique la configuration en redémarrant
+   `systemd-journald`, puis demande le vidage vers le stockage persistant
+   (`journalctl --flush`) avant le premier arrêt réel.
+   Au premier arrêt/réveil autorisé, vérifier que `journalctl --list-boots`
+   liste le boot précédent et que `journalctl -b -1 -n 1 -o cat --no-pager`
+   permet au contrôle `previous_boot` de lire sa fin propre (#6074).
+   `Storage=volatile` ou un journal précédent absent ne satisfait pas ce
+   préalable ; ne pas contourner le contrôle de santé pour inscrire la cible.
+6. Fournir cinq commandes fixes par VM, détenues par l'opérateur et non
    modifiables par les agents. Elles n'héritent d'aucune variable de secret
    cloud ; argv absolu, pas de shell, sorties supprimées, échec = attente.
    `quiesce_argv` vérifie en lecture seule que l'OS peut s'arrêter proprement
@@ -182,14 +203,14 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    La source revue de ces cinq commandes est `commandes/vm-commande.py`
    (#6252, section suivante) : installer ce fichier au SHA fixé, et une
    `cible.json` privée par VM dans `/etc/ameesh-vm-adapter/cibles/`.
-6. Faire relire les mappings, les cinq commandes, les durées
+7. Faire relire les mappings, les cinq commandes, les durées
    (`halt_deadline_s`, `health_deadline_s`), les créneaux,
    les permissions des fichiers et l'unité avec `systemd-analyze verify`.
    Tester le cycle cloud simulé avant tout feu réel (séquence halt → preuve
    → poweroff). Faire valider séparément le premier arrêt/réveil par le
    bureau, avec ses temps mesurés : halt jusqu'à `stopped in place`,
    archivage jusqu'à `stopped`, restauration jusqu'à la santé.
-7. Au feu d'installation seulement : rendre l'inscription active, poser les
+8. Au feu d'installation seulement : rendre l'inscription active, poser les
    unités, recharger systemd et activer le timer sur ce seul hôte. Déclarer
    le hook sans secret dans la configuration des seuls hôtes autorisés.
    Aucune commande de cette étape n'a été exécutée par l'auteur du lot.
