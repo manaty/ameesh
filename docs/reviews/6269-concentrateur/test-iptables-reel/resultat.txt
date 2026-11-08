@@ -1,0 +1,23 @@
+iptables v1.8.11 (nf_tables)
+== start 1
+rc=0
+== start 2 (idempotence)
+rc=0
+-N BG-IN
+-A INPUT -s 10.77.0.6/32 -i wg0 -j BG-IN
+-A FORWARD -s 10.77.0.6/32 -i wg0 -j DROP
+-A BG-IN -d 10.77.0.1/32 -p tcp -m tcp --dport 5432 -j ACCEPT
+-A BG-IN -j DROP
+-A DOCKER-USER -s 10.77.0.6/32 -i wg0 -j DROP
+AAAAPUBKEYTESTAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=	10.77.0.6/32
+== stop
+rc=0
+== après stop
+(aucune règle .6 / BG-IN)
+-N DOCKER-USER
+-A DOCKER-USER -j RETURN
+(fin wg)
+== stop sans DOCKER-USER
+iptables: No chain/target/match by that name.
+rc=0
+(aucune règle .6 / BG-IN)

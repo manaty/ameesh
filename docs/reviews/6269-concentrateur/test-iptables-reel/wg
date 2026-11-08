@@ -1,0 +1,7 @@
+#!/bin/bash
+# faux wg à état : /tmp/wgstate contient les lignes "clé\tallowed"
+f=/tmp/wgstate; touch $f
+case "$1 $3" in
+"show allowed-ips") cat $f;; "show peers") cut -f1 $f;;
+*) if [ "$1" = set ]; then k=$4; if [ "$5" = remove ]; then grep -v "^$k	" $f > $f.n; mv $f.n $f; else printf '%s\t%s\n' "$k" "$6" >> $f; fi; fi;;
+esac
