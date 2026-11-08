@@ -6,7 +6,25 @@
   "fresh_seconds": 60,
   "reconcile_deadline_s": 900,
   "checks": {
-    "version-mode": ["/opt/ameesh-vm-adapter/checks/version-mode"],
-    "doctor": ["/opt/ameesh-vm-adapter/checks/doctor"]
+    "version-mode": [
+      "/usr/bin/python3",
+      "-I",
+      "/opt/ameesh-vm-adapter/checks/health.py",
+      "version-mode"
+    ],
+    "doctor": [
+      "/usr/bin/python3",
+      "-I",
+      "/opt/ameesh-vm-adapter/checks/health.py",
+      "doctor"
+    ]
+  },
+  "health": {
+    "receipt": "/var/lib/ameesh-vm-health/health.json",
+    "producer_uid": 1000,
+    "period_s": 60,
+    "version": "RENDER_INSTALLED_VERSION",
+    "sha": "0000000",
+    "mode": "execute"
   }
 }

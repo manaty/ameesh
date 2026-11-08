@@ -355,10 +355,29 @@ Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
    root non inscriptibles. Ce rôle DB doit lire les faits natifs concernés
    et envoyer le seul courrier de sonde ; le choix et la réduction du rôle
    effectif sont revus avec le bureau avant activation (#6002).
+   Pour #6298 : JSON de connexion root:vm-operator 0640, passfile libpq
+   distinct 0600 appartenant à vm-operator (libpq ignore un passfile 0640),
+   TCP `10.77.0.1:5432`, `sslmode=require`, schéma réel du mesh. Utiliser le
+   rôle réduit `vm_probe`, jamais un DSN d'agent ; sa pose reste distincte.
+   Installer `remote/checks/health.py` dans `checks/health.py`, ainsi que
+   `deploy/mise-a-jour/venv-processus.py` dans `checks/venv-processus.py`,
+   root:root 0644 sous les parents root non inscriptibles de l'étape 2.
+   Rendre `checks/health-producer.example.json` dans
+   `/etc/ameesh-vm-adapter/health-producer.json`, root:root 0644 (aucun secret) :
+   venv stable du compte ameesh, liste **exhaustive** de ses unités runners
+   permanentes, chemin absolu de son EnvironmentFile et du reçu partagé.
+   Ne pas copier cet EnvironmentFile : le producteur le lit sous ameesh.
 3. Créer uniquement `/var/lib/ameesh-vm-remote` sous le compte VM, 0700.
    Le compte y écrit ses reçus et son verrou, jamais dans le dépôt ni dans
    les répertoires des agents. Archiver les anciens reçus hors activation
    lorsque leur vague est révolue ; ne pas enlever celui du retour courant.
+   Créer aussi `/var/lib/ameesh-vm-health`, ameesh:vm-operator **2750**, par
+   root à la pose. Le bit setgid donne aux nouveaux reçus le groupe lecteur,
+   sans ajouter ameesh à ce groupe ; vm-operator n'a aucun droit d'écriture.
+   Installer les modèles `checks/ameesh-vm-health.{service,timer}` comme
+   unités **utilisateur d'ameesh** root non inscriptibles par vm-operator,
+   activer le minuteur sous ce compte et son gestionnaire utilisateur
+   persistant. Aucune unité système root ni règle sudo supplémentaire.
 4. Rendre les modèles `remote/authorized_keys.example` et
    `remote/sshd-match.example` avec la **clé publique** du détenteur opérateur
    existant et le login retenu. Le fichier de clés et ses parents sont root
@@ -378,13 +397,42 @@ Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
    `/usr/bin/systemctl poweroff --no-block`, sans joker ni variante.
    Ajouter le compte au groupe `systemd-journal` pour lire le boot précédent :
    aucune règle sudo pour journalctl, Python, shell ou runuser.
-6. Fournir les deux contrôles locaux **réels**, root non inscriptibles,
-   `checks.version-mode` et `checks.doctor`, argv fixes dans `remote.json`.
-   Le premier vérifie la version et le mode effectivement lancés, le second
-   doctor vert ; le dispatch les borne à 5 s, environnement PATH/LANG seul,
-   sorties supprimées. Les chemins d'exemple ne sont pas des contrôles
-   installés : absents, ils refusent. Ils ne doivent jamais être remplacés
-   par `true`. Leur preuve reste exigée par #6002 avant activation.
+6. Conserver les argv fixes `checks.version-mode` et `checks.doctor` du
+   modèle : `/usr/bin/python3 -I /opt/ameesh-vm-adapter/checks/health.py`
+   suivi du seul nom de contrôle. Rendre le bloc `health` de `remote.json` :
+   UID numérique réel d'ameesh, reçu partagé, période 60 secondes, version,
+   SHA et mode attendus. Remplacer **toutes** les valeurs d'exemple (le SHA
+   d'exemple n'est pas une version installée). La longueur du SHA doit être
+   celle publiée par les métadonnées `direct_url.json`, comme dans la sonde
+   de staging `vm.sh installe_agents` ; ne pas comparer à un checkout local.
+
+   Le producteur énumère les unités runners actives via `systemctl --user`
+   et exige la liste exacte de sa carte. Pour chaque MainPID actif il appelle
+   le même `venv-processus.py` que staging (dont l'attestation privée 0600
+   pour les processus non dumpables), puis lit sa cmdline, jamais son
+   environnement. Le mode `execute` ou `dry-run` vient du `run` vivant et de
+   son option `--dry-run`, pas d'une étiquette déclarative staging/prod.
+   Les métadonnées proviennent du venv ainsi prouvé. Le doctor **complet**
+   tourne via `systemd-run --user` avec l'EnvironmentFile d'ameesh, sans
+   exposer son contenu. Les MainPID et modes sont revérifiés ensuite ;
+   panne, accès refusé ou dépassement de délai ne publient aucun vert.
+
+   Le reçu atomique 0640 contient uniquement schéma, boot_id, horodatage,
+   version, SHA, mode, PIDs et verdicts. Les lecteurs refusent un reçu absent,
+   illisible, mal formé, d'un autre boot, daté du futur, vieux de plus de
+   trois périodes, ou dont UID, permissions, version/SHA/mode divergent.
+   Doctor exige en plus son verdict vert. Le dispatch borne les lecteurs
+   à **5 s**, environnement PATH/LANG seul, sorties supprimées. Un producteur
+   tué laisse au plus le reçu précédent jusqu'à son expiration ; une sonde
+   échouée le remplace par un reçu négatif. Les lecteurs ne consultent ni
+   base, ni bus utilisateur, ni fichiers privés des runners.
+
+   Limite acceptée (#200433, mesh-design, 08/11/2026) : ameesh peut forger
+   son propre reçu. Cette sonde vérifie la santé de l'hôte ; elle ne protège
+   pas contre le compte ameesh compromis. Aucune lecture privilégiée ne
+   remplace une preuve absente. Ne jamais remplacer un contrôle par `true`.
+   Le bureau vérifie les deux codes de sortie sous vm-operator et un reçu
+   frais après activation du minuteur ; cette preuve reste exigée par #6002.
 7. Reporter le login dans `commandes/cible.json` et conserver les argv du
    modèle. Faire relire permissions, argv et preuves de santé avant le feu
    d'activation. Aucune création de compte, pose, commande sudo ou connexion
