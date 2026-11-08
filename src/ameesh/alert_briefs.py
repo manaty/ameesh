@@ -205,14 +205,21 @@ def _escalation_note(dead: dict, from_level: int, to_level: int) -> str:
 
 
 def _split_live(out: dict, by_name: dict, closed: set,
-                covered=()) -> tuple[dict, dict]:
+                covered=(), *, respect_pause=False) -> tuple[dict, dict]:
     """#3036 : sépare les briefs des destinataires vivants de ceux qui ne
     liront pas. Un nom hors registre (les pseudo-destinataires `thread:…`)
     n'est pas filtré : il n'a pas de bail à contrôler. #3100 : un nom de
-    `covered` (déjà remis) non plus : son courrier l'attend."""
+    `covered` (déjà remis) non plus : son courrier l'attend. Pour les SLO,
+    `respect_pause` écarte une pause opérateur même déjà couverte : le
+    courrier ne suffit pas à la lever (#6396)."""
     live: dict = {}
     dead: dict = {}
     for name, text in out.items():
+        # #6396 : un brief SLO déjà déposé ne réveille pas une pause.
+        # Le pilote doit prendre le relais même si le bail reste vivant.
+        if respect_pause and (by_name.get(name) or {}).get("operator_paused"):
+            dead[name] = "operator paused"
+            continue
         if name.startswith("thread:") or name in covered:
             live[name] = text
             continue
@@ -1094,7 +1101,9 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     #3100 : `covered` (les destinataires déjà remis, `to` du registre des
     briefs) compte comme vivant : le courrier est dans leur boîte, lu au
     retour ; un bail qui cligne (redémarrage d'exécuteur, clôture de release)
-    ne fait ni escalader ni nommer absent un palier déjà prévenu."""
+    ne fait ni escalader ni nommer absent un palier déjà prévenu.
+    #6396 : une pause opérateur fait exception, même après remise : ce
+    courrier ne la lève pas ; le palier suivant doit porter le geste."""
     covered = set(covered or ())
     roles = set(alert.get("targets") or ("assignee",))
     text = _slo_breach(alert)
@@ -1103,7 +1112,8 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         for name in _target_names(role, alert, by_name, orchestras, teams,
                                   auditor_names):
             raw.setdefault(name, role)
-    live, dead = _split_live({name: text for name in raw}, by_name, closed, covered)
+    live, dead = _split_live({name: text for name in raw}, by_name, closed, covered,
+                             respect_pause=True)
     if "assignee" in roles and alert.get("agent") == "bureau" \
             and _bureau_externe(by_name):
         dead.setdefault("bureau", "external desk, reads the %s thread"
@@ -1124,7 +1134,8 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
                      + _target_names("auditeur", alert, by_name, orchestras, teams,
                                      auditor_names))
         candidates = {name: next_text for name in dict.fromkeys(names)}
-        live, more = _split_live(candidates, by_name, closed, covered)
+        live, more = _split_live(candidates, by_name, closed, covered,
+                                 respect_pause=True)
         dead.update(more)
         if live:
             note = _escalation_note(dead, current, next_level)
@@ -1137,7 +1148,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     # bureau), en nommant les absents. Sans bureau, rien n'est inventé — le
     # passage suivant réessaiera (l'alerte reste dans `ameesh alerts`).
     fallback = _fallback_bureau(by_name, _slo_breach(alert, level=3))
-    live, more = _split_live(fallback, by_name, closed, covered)
+    live, more = _split_live(fallback, by_name, closed, covered, respect_pause=True)
     dead.update(more)
     if live:
         note = _dead_note(dead)
