@@ -450,6 +450,18 @@ class RepairReportDatabaseTest(PgTestCase):
         self.assertIn("error:", err.getvalue())
 
 
+class HelpTest(unittest.TestCase):
+    """N du 08/11 : `--at` est accepté par la CLI et doit être documenté."""
+
+    def test_at_documente_dans_l_aide_generale_et_celle_de_la_commande(self):
+        from ameesh import main as main_mod
+        usage = [line for line in (main_mod.__doc__ or "").splitlines()
+                 if "repair-report [" in line]
+        self.assertEqual(len(usage), 1)
+        self.assertIn("--at T", usage[0])
+        self.assertIn("--at", repair_report.build_parser().format_help())
+
+
 class PsycopgPlaceholderTest(unittest.TestCase):
     """psycopg refuse un `%` littéral non doublé dans une requête paramétrée.
 
