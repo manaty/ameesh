@@ -25,13 +25,15 @@ DECLARE
     actual boolean;
     seq oid;
     fn oid;
+    receipt_fn oid;
     item record;
     errors text[] := '{}';
 BEGIN
     n := (SELECT oid FROM pg_namespace WHERE nspname=s);
     fn := to_regprocedure(format('%I.vm_probe_send(text,text,bigint,bigint,text)',s));
+    receipt_fn := to_regprocedure(format('%I.vm_probe_receipt(text,text,bigint,bigint,text,bigint)',s));
     seq := pg_get_serial_sequence(format('%I.agent_mailbox',s),'id')::regclass;
-    IF r=w OR n IS NULL OR fn IS NULL THEN RAISE EXCEPTION 'vm_probe installation missing'; END IF;
+    IF r=w OR n IS NULL OR fn IS NULL OR receipt_fn IS NULL THEN RAISE EXCEPTION 'vm_probe installation missing'; END IF;
     CREATE TEMP TABLE vm_probe_columns(subject text,rel text,cols text[]) ON COMMIT DROP;
     INSERT INTO pg_temp.vm_probe_columns VALUES
       (r,'host_lifecycle',ARRAY['host','mode','claims_open','generation','release_epoch','return_probe']),
@@ -40,8 +42,8 @@ BEGIN
       (w,'agent_registry',ARRAY['name','aliases','host','mode','retired_at','handoff_fenced']),
       (r,'vm_adapter_requests',ARRAY['host','generation','release_epoch','state','status','result','updated_at']),
       (w,'vm_adapter_requests',ARRAY['host','generation','release_epoch','state','status','result','updated_at']),
-      (r,'agent_mailbox',ARRAY['id','sender','recipient','body','host','created_at','delivered_at','meta','payload']),
-      (w,'agent_mailbox',ARRAY['id','sender','recipient','body','host','created_at','payload']),
+      (w,'agent_mailbox',ARRAY['id','sender','recipient','body','host','created_at','delivered_at','meta','payload']),
+      (w,'turn_resources',ARRAY['turn_id','ended_at']),
       (r,'turn_resources',ARRAY['turn_id','agent','host','status','started_at','ended_at']),
       (r,'host_lifecycle_agents',ARRAY['host','generation','agent']),
       (r,'host_handoffs',ARRAY['source','target','state']);
@@ -70,7 +72,7 @@ BEGIN
         IF EXISTS (SELECT FROM pg_class WHERE relowner=rid)
            OR EXISTS (SELECT FROM pg_namespace WHERE nspowner=rid)
            OR EXISTS (SELECT FROM pg_database WHERE datdba=rid)
-           OR EXISTS (SELECT FROM pg_proc WHERE proowner=rid AND (who<>w OR oid<>fn))
+           OR EXISTS (SELECT FROM pg_proc WHERE proowner=rid AND (who<>w OR oid NOT IN (fn,receipt_fn)))
            OR EXISTS (SELECT FROM pg_type WHERE typowner=rid)
            OR EXISTS (SELECT FROM pg_largeobject_metadata WHERE lomowner=rid) THEN
             errors := errors || format('unexpected ownership %s',who);
@@ -152,7 +154,7 @@ BEGIN
             AND ns.nspname !~ '^pg_(toast|temp_|toast_temp_)'
             AND (p.prosecdef OR EXISTS(SELECT FROM aclexplode(p.proacl) x WHERE x.grantee=rid))
         LOOP
-          IF has_function_privilege(who,item.oid,'EXECUTE') IS DISTINCT FROM (item.oid=fn) THEN
+          IF has_function_privilege(who,item.oid,'EXECUTE') IS DISTINCT FROM (item.oid IN (fn,receipt_fn)) THEN
             errors := errors || format('function outside/missing contract %s (%s)',item.name,who);
           END IF;
         END LOOP;
@@ -212,6 +214,28 @@ BEGIN
         AND md5(replace(prosrc,quote_ident(s)||'.','<mesh>.'))='39bc2409f257cb43947557696806b393')
        OR EXISTS (SELECT FROM pg_proc p CROSS JOIN LATERAL aclexplode(p.proacl) x WHERE p.oid=fn AND x.grantee=0 AND x.privilege_type='EXECUTE') THEN
         errors := array_append(errors, 'bounded definer changed or PUBLIC executable');
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_proc WHERE oid=receipt_fn
+        AND proowner=(SELECT oid FROM pg_roles WHERE rolname=w)
+        AND prosecdef AND provolatile='v' AND NOT proleakproof
+        AND proconfig=ARRAY['search_path=pg_catalog, pg_temp']
+        AND md5(replace(prosrc,quote_ident(s)||'.','<mesh>.'))='4e5eff523cc99628d2866fea5684c390')
+       OR EXISTS (SELECT FROM pg_proc p CROSS JOIN LATERAL aclexplode(p.proacl) x
+         WHERE p.oid=receipt_fn AND (x.grantee=0 OR x.is_grantable) AND x.privilege_type='EXECUTE') THEN
+        errors := array_append(errors, 'bounded receipt definer changed or PUBLIC executable');
+    END IF;
+    -- #6329: only this enrolled login is constrained. Other mesh service
+    -- roles (auditor, release controller) have their own privacy contracts.
+    -- Include every role the login can SET ROLE to, even with NOINHERIT.
+    IF has_table_privilege(r,format('%I.agent_mailbox',s),'SELECT') OR EXISTS (
+      SELECT FROM pg_roles usable
+      WHERE (usable.rolname=r OR pg_has_role(r,usable.oid,'MEMBER'))
+        AND EXISTS (SELECT FROM pg_attribute a
+          WHERE a.attrelid=format('%I.agent_mailbox',s)::regclass
+            AND a.attnum>0 AND NOT a.attisdropped
+            AND has_column_privilege(usable.oid,a.attrelid,a.attnum,'SELECT'))
+    ) THEN
+        errors := array_append(errors, 'vm_probe can read mailbox directly or via SET ROLE');
     END IF;
     IF cardinality(errors)>0 THEN RAISE EXCEPTION E'vm_probe contract refused:\n%',array_to_string(errors,E'\n'); END IF;
     RAISE NOTICE 'vm_probe contract held';

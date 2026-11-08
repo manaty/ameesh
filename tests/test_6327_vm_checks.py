@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -121,24 +122,29 @@ class DiagnosticsTest(unittest.TestCase):
         loader = SimpleNamespace(exec_module=mock.Mock())
         spec = SimpleNamespace(loader=loader)
         state_calls = 0
+        stages = stage if isinstance(stage, tuple) else (stage,)
 
         def fail():
             raise ValueError(self.secret)
 
         def command(argv, end, **kw):
-            current = 'inventory' if 'list-units' in argv else 'metadata' if '-c' in argv else 'doctor'
-            if stage == current:
+            current = ('inventory' if 'list-units' in argv else 'metadata' if '-c' in argv
+                       else 'readiness' if 'list' in argv else 'doctor')
+            if current in stages:
                 fail()
             if current == 'inventory':
                 return json.dumps([dict(unit=self.unit, active='active')])
+            if current == 'readiness':
+                return json.dumps([dict(lease_owner='runner-probe@vm', status='idle',
+                                        lease_expires_ts=time.time() + 60)])
             return json.dumps(dict(version='1.2.3', source={'url': 'file:///src-' + 'a' * 40}))
 
         def state(*args):
             nonlocal state_calls
             state_calls += 1
-            if stage == ('runners-before' if state_calls == 1 else 'runners-after'):
+            if ('runners-before' if state_calls == 1 else 'runners-after') in stages:
                 fail()
-            return 123, 'execute'
+            return 123, 'execute', 'runner-probe@vm'
 
         if stage == 'verifier':
             loader.exec_module.side_effect = ValueError(self.secret)
@@ -159,7 +165,7 @@ class DiagnosticsTest(unittest.TestCase):
 
     def test_each_failed_probe_step_records_only_stage_and_exception_class(self):
         for stage in ('verifier', 'inventory', 'runners-before', 'venv', 'metadata',
-                      'doctor', 'runners-after'):
+                      'doctor', 'readiness', 'runners-after'):
             with self.subTest(stage=stage):
                 code, output = self.run_producer(stage)
                 receipt = json.loads(self.receipt.read_text())
@@ -167,7 +173,8 @@ class DiagnosticsTest(unittest.TestCase):
                 self.assertEqual(receipt['reason'], stage + ':ValueError')
                 self.assertEqual(output, 'vm-health ' + receipt['reason'] + '\n')
                 self.assertFalse(receipt['doctor'])
-                self.assertFalse(receipt['version_mode'])
+                # #6334: a red doctor or readiness keeps version_mode proven.
+                self.assertEqual(receipt['version_mode'], stage in ('doctor', 'readiness'))
                 for secret in (self.secret, self.card['environment_file']):
                     self.assertNotIn(secret, output + self.receipt.read_text())
 
@@ -202,7 +209,48 @@ class DiagnosticsTest(unittest.TestCase):
                 self.assertEqual(health.main([verb]), 1)
             self.assertEqual(output.getvalue(), 'vm-health read:Exception\n')
 
+    def test_doctor_red_then_runner_change_clears_version_mode(self):
+        code, output = self.run_producer(('doctor', 'runners-after'))
+        receipt = json.loads(self.receipt.read_text())
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['reason'], 'runners-after:ValueError')
+        self.assertFalse(receipt['version_mode'] or receipt['doctor'])
+        self.assertEqual(output, 'vm-health doctor:ValueError\nvm-health runners-after:ValueError\n')
+
     def test_service_keeps_stderr_in_journal(self):
         service = (ROOT / 'checks/ameesh-vm-health.service').read_text()
         self.assertIn('StandardOutput=null\n', service)
         self.assertIn('StandardError=journal\n', service)
+
+
+class ReadinessTest(unittest.TestCase):
+    """#6334: readiness of the launched runner, with its drop-ins, from its lease."""
+    NOW = 1000.0
+
+    def ready(self, rows, ids=('runner-a@vm',)):
+        health.readiness(rows, list(ids), self.NOW)
+
+    def row(self, **kw):
+        return dict(dict(lease_owner='runner-a@vm', status='running', status_text='',
+                         lease_expires_ts=self.NOW + 30), **kw)
+
+    def test_live_lease_and_non_host_block_are_ready(self):
+        self.ready([self.row(), self.row(lease_owner='runner-b@vm', status='blocked',
+                                         status_text='hôte non prêt', lease_expires_ts=0)])
+        self.ready([self.row(status='blocked', status_text='quota exhausted')])
+        self.ready([self.row(), self.row(lease_owner='runner-b@vm')], ('runner-a@vm', 'runner-b@vm'))
+
+    def test_missing_expired_or_host_blocked_runner_is_not_ready(self):
+        for rows in ([], [self.row(lease_owner='runner-a@other')], [None],
+                     [self.row(lease_expires_ts=self.NOW)], [self.row(lease_expires_ts=None)],
+                     [self.row(lease_expires_ts=float('nan'))], [self.row(lease_expires_ts=True)],
+                     [self.row(), self.row(lease_expires_ts=self.NOW - 1)],
+                     [self.row(status='blocked', status_text='hôte non prêt')],
+                     [self.row(status='blocked', status_text='base injoignable')],
+                     [self.row(status='blocked', status_text='dossier absent')]):
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                self.ready(rows)
+        with self.assertRaises(ValueError):
+            self.ready({'agents': []})
+        with self.assertRaises(ValueError):
+            self.ready([self.row()], ('runner-a@vm', 'runner-b@vm'))

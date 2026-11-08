@@ -207,32 +207,30 @@ class Native:
             admitted = self.admission(tx, key)
             if admitted is None or launch['started_ts'] < admitted:
                 return result
-            rows = tx.query('SELECT m.delivered_at, m.meta, m.payload, m.recipient, '
-                            't.agent, t.host, t.status, t.ended_at, '
+            facts = tx.query('SELECT delivered, turn_id, acknowledged FROM '
+                             'vm_probe_receipt(%s,%s,%s,%s,%s,%s)',
+                             tuple(key[k] for k in ('host', 'probe_agent', 'generation',
+                                                   'release_epoch', 'nonce'))
+                             + (launch['request_id'],))
+            if len(facts) != 1:
+                return result
+            proof = facts[0]
+            result['delivered'] = proof['delivered'] is True
+            if not result['delivered']:
+                return result
+            rows = tx.query('SELECT t.agent,t.host,t.status,t.ended_at, '
                             'extract(epoch from t.started_at) AS started_ts, '
-                            'r.status AS agent_status, r.last_error '
-                            'FROM agent_mailbox m '
-                            "LEFT JOIN turn_resources t ON t.turn_id=m.meta->'consigne'->>'turn' "
-                            'LEFT JOIN agent_registry r ON r.name=m.recipient WHERE m.id=%s',
-                            (launch['request_id'],))
+                            'r.status AS agent_status,r.last_error FROM turn_resources t '
+                            'LEFT JOIN agent_registry r ON r.name=%s WHERE t.turn_id=%s',
+                            (key['probe_agent'], proof['turn_id']))
             if len(rows) != 1:
                 return result
             row = rows[0]
-            if (row['recipient'] != key['probe_agent'] or row['payload'].get('vm_probe') != key
-                    or 'retire' in row['meta']):
-                return result
-            result['delivered'] = row['delivered_at'] is not None
-            if (not result['delivered'] or row['agent'] != key['probe_agent']
-                    or row['host'] != key['host'] or row['started_ts'] is None
+            if (row['agent'] != key['probe_agent'] or row['host'] != key['host']
+                    or row['started_ts'] is None
                     or float(row['started_ts']) < launch['started_ts']):
                 return result
-            ack = tx.query('SELECT id FROM agent_mailbox WHERE sender=%s AND recipient=%s '
-                           "AND payload @> '{\"ack\":true}'::jsonb AND body=%s "
-                           'AND created_at >= %s AND created_at <= coalesce(%s, clock_timestamp()) '
-                           'AND host=%s LIMIT 1',
-                           (key['probe_agent'], key['probe_agent'], 'VM-PROBE-ACK ' + key['nonce'],
-                            row['delivered_at'], row['ended_at'], key['host']))
-            result['acknowledged'] = bool(ack)
+            result['acknowledged'] = proof['acknowledged'] is True
             result['turn_ended'] = row['status'] == 'done' and row['ended_at'] is not None
             if result['turn_ended']:
                 result['verdict'] = ('ok' if result['acknowledged'] and row['agent_status'] == 'idle'
