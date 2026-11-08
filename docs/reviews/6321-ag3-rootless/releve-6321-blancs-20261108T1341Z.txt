@@ -1,0 +1,93 @@
+### inspecter (à blanc) 13:41:58Z
+   "volume": "ameesh-pg-dev2-data",
+   "port": "55443",
+   "restart": "no",
+   "health": "healthy",
+   "running": true
+  },
+  {
+   "name": "ameesh-pg-dev4",
+   "volume": "ameesh-pg-dev4-data",
+   "port": "55442",
+   "restart": "no",
+   "health": "healthy",
+   "running": true
+  }
+ ],
+ "free_GiB": 80.2,
+ "containerd_policy": [
+  "containerd:",
+  "  Installed: 2.2.1-0ubuntu1~24.04.4",
+  "  Candidate: 2.2.1-0ubuntu1~24.04.4",
+  "  Version table:",
+  " *** 2.2.1-0ubuntu1~24.04.4 500",
+  "        500 http://fr-par-1.clouds.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages"
+ ]
+}
+### phase-a (à blanc) 13:42:01Z
+{
+ "phase": "A",
+ "\u00e0_blanc": true,
+ "plan": {
+  "pg": [
+   "ameesh-pg\u2192rootless:55432",
+   "ameesh-pg-dev1\u2192rootless:55441",
+   "ameesh-pg-dev2\u2192rootless:55443",
+   "ameesh-pg-dev4\u2192rootless:55442"
+  ],
+  "images": [
+   "node:22-bookworm-slim",
+   "postgres:16",
+   "postgres:17",
+   "ubuntu:24.04"
+  ],
+  "need_GiB": 3.8,
+  "free_GiB": 80.2
+ }
+}
+### phase-b (à blanc) 13:42:03Z
+{
+ "phase": "B",
+ "\u00e0_blanc": true,
+ "uid1001_processes": 12,
+ "outside": 0,
+ "gestes": [
+  "DOCKER_HOST rootless dans ~/.config/ameesh/env et environment.d/90-ameesh-docker-rootless.conf",
+  "gpasswd --delete ameesh docker",
+  "systemctl restart user@1001.service",
+  "unit\u00e9s natives relanc\u00e9es depuis la liste de l autorit\u00e9"
+ ]
+}
+### phase-c (à blanc) 13:42:04Z
+{
+ "phase": "C",
+ "\u00e0_blanc": true,
+ "v\u00e9rifications": [
+  "sudo -l refus\u00e9",
+  "montage prot\u00e9g\u00e9 illisible depuis un conteneur rootless",
+  "test-parallele.sh -n 1 -p psql --liste \u00ab test_work \u00bb dans une unit\u00e9 utilisateur (environment.d effectif)",
+  "ameesh doctor",
+  "ameesh menage --dry-run --json",
+  "porte d h\u00f4te ouverte et 8 runners revenus (lecture)"
+ ]
+}
+### retour (à blanc) 13:42:05Z
+{
+ "retour": "\u00e0 blanc",
+ "phase_A": null,
+ "phase_B": null,
+ "sources_stopped": []
+}
+### phase-b (à blanc, sans podman) 13:42:36Z
+{
+ "phase": "B",
+ "\u00e0_blanc": true,
+ "uid1001_processes": 13,
+ "outside": 0,
+ "gestes": [
+  "DOCKER_HOST rootless dans ~/.config/ameesh/env et environment.d/90-ameesh-docker-rootless.conf",
+  "gpasswd --delete ameesh docker",
+  "systemctl restart user@1001.service",
+  "unit\u00e9s natives relanc\u00e9es depuis la liste de l autorit\u00e9"
+ ]
+}

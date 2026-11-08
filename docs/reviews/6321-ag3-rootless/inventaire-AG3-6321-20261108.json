@@ -1,0 +1,95 @@
+{
+ "lot": 6321,
+ "host": "ameesh-agents-3",
+ "at": "2026-11-08T13:36-13:42Z",
+ "mutations": "aucune (sauf podman pause PID 1704662 créé par l'essai à blanc 13:42:03Z, dans user@1001, dossier §1.4)",
+ "ameesh": "uid=1001 gid=1001 groups=1001,112(docker)",
+ "docker_group_members": [
+  "ameesh"
+ ],
+ "uid1001_processes": 12,
+ "uid1001_with_gid112": 11,
+ "uid1001_outside_user_manager": [],
+ "uid1001_units": [
+  [
+   "init.scope",
+   2
+  ],
+  [
+   "dbus.service",
+   1
+  ],
+  [
+   "ameesh-runner-agent@claude1.service",
+   1
+  ],
+  [
+   "ameesh-runner-agent@claude2.service",
+   1
+  ],
+  [
+   "ameesh-runner-agent@ameesh-cx3.service",
+   1
+  ],
+  [
+   "ameesh-runner-agent@ameesh-dev1.service",
+   1
+  ],
+  [
+   "ameesh-runner-agent@ameesh-dev2.service",
+   1
+  ],
+  [
+   "ameesh-runner-agent@ameesh-dev4.service",
+   1
+  ],
+  [
+   "ameesh-runner-agent@ameesh-dev7.service",
+   1
+  ],
+  [
+   "ameesh-runner-agent@codex2.service",
+   1
+  ],
+  [
+   "ameesh-pgbouncer.service",
+   1
+  ]
+ ],
+ "roles_on_AG3": "aucun (auditeur, mesh-design : AG1/AG2)",
+ "rootful_docker": "29.1.3",
+ "containers": [
+  "/ameesh-pg|sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe|healthy|{\"5432/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"55432\"}]}|no|1|ameesh-pg-data|[\"docker-entrypoint.sh\"]|[\"-c\",\"autovacuum_naptime=15s\",\"-c\",\"autovacuum_vacuum_scale_factor=0.05\",\"-c\",\"autovacuum_analyze_scale_factor=0.05\"]",
+  "/ameesh-pg-dev1|sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe|healthy|{\"5432/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"55441\"}]}|no|1|ameesh-pg-dev1-data|[\"docker-entrypoint.sh\"]|[\"-c\",\"autovacuum_naptime=15s\",\"-c\",\"autovacuum_vacuum_scale_factor=0.05\",\"-c\",\"autovacuum_analyze_scale_factor=0.05\"]",
+  "/ameesh-pg-dev2|sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe|healthy|{\"5432/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"55443\"}]}|no|1|ameesh-pg-dev2-data|[\"docker-entrypoint.sh\"]|[\"-c\",\"autovacuum_naptime=15s\",\"-c\",\"autovacuum_vacuum_scale_factor=0.05\",\"-c\",\"autovacuum_analyze_scale_factor=0.05\"]",
+  "/ameesh-pg-dev4|sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe|healthy|{\"5432/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"55442\"}]}|no|1|ameesh-pg-dev4-data|[\"docker-entrypoint.sh\"]|[\"-c\",\"autovacuum_naptime=15s\",\"-c\",\"autovacuum_vacuum_scale_factor=0.05\",\"-c\",\"autovacuum_analyze_scale_factor=0.05\"]"
+ ],
+ "anonymous_volume": "b8cbe748… 39M 2026-11-02, sans conteneur",
+ "images_loaded_by_plan": [
+  "postgres:17",
+  "postgres:16",
+  "node:22-bookworm-slim",
+  "ubuntu:24.04"
+ ],
+ "images_left_rootful": [
+  "nexlink-web:lot-6193",
+  "ima-private-headroom-pg:1efe6e6",
+  "caddy:2.10.2",
+  "quay.io/keycloak/keycloak:26.4.2"
+ ],
+ "rootless_prereqs": {
+  "rootlesskit": "1.1.1-1ubuntu0.24.04.3 (02/11 22:31Z)",
+  "scripts": "setuptool e68ef655, dockerd-rootless 8eb00d61",
+  "lien": "/usr/local/bin/docker -> /usr/bin/docker (02/11)",
+  "subuid": "ameesh:165536:65536",
+  "apparmor": "rootlesskit chargé, userns restreint=1",
+  "dpkg_verify": "OK 7 paquets",
+  "containerd": "2.2.1-0ubuntu1~24.04.4 (≠ kit 805890af)"
+ },
+ "rootless_existing": "aucun",
+ "free_GiB": 80.2,
+ "sudo": "not allowed",
+ "crontab": "aucune",
+ "linger": "yes",
+ "network": "docker0 172.17/16, wg 10.77.0.5/32"
+}

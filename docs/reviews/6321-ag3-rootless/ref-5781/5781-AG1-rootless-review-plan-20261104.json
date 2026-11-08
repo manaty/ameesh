@@ -1,0 +1,77 @@
+{
+  "lot": 5781,
+  "at": "2026-11-04T19:54:30.377749+00:00",
+  "state": "DRAFT operator plan for independent Claude/DeepSeek review; NO host change yet",
+  "host": "ameesh-agents-1",
+  "authority": {
+    "pilot": 190562,
+    "holder_key_decision": 184823,
+    "AG2_personal_restart_approval_not_applicable_to_AG1": 189578
+  },
+  "source": "ameesh5c1e679b docs/design/etudes/l5502-docker-rootless.md plus actually completedAG2B2 procedure",
+  "window": "After04Nov22:00Z BGsequence AND5748proofs3a\u20133c; onehost only, no cutoff overlap. No pressure to qualify05Nov10Z: BG carries it, C3earliest05Nov22Z.",
+  "inventory_receipts": [
+    "5781-AG1-rootless-readonly-inventory-20261104.json",
+    "5781-AG1-uid1001-process-metadata-20261104.json",
+    "5781-AG1-installed-binaries-vs-signed-packages-20261104.json",
+    "5781-AG1-podman-readonly-inventory-20261104.json"
+  ],
+  "facts": {
+    "ameesh_uid": 1001,
+    "docker_gid": 112,
+    "free_GiB": 33.49,
+    "long_lived_rootful_containers": [
+      "ameesh-pg:healthy,127.0.0.1:55432",
+      "pgss-probe-1624094:running,unpublished,differentanonymousvolume"
+    ],
+    "signed_program_comparisons": "7actualAG1binaryhashes match authenticatedUbuntu package bytes, 4signedInRelease/55packages in existing reviewed kit805890af",
+    "rootless_Docker": "absent",
+    "outside_manager_process": "podman pause PID3039609 in rootsession4598 retainsGID112; must resolve through reviewed native Podman operation, never ignore it",
+    "personal_session_metadata": "No Claude/Codex/tmux/screen outsideagentunits found; allUID1001metadata retained. Recheck at actual window; this is not permission to interrupt a personal session.",
+    "podman": "Fresh ps -a rc0 empty after fixing cwd=/home/ameesh, no migrate/stop/cleanup run",
+    "probe_porteur": "cx1190572: no5263QA depends on it, but stop only after proving exact disposable/isolated provenance and no consumers; no explicit delete. Default for this plan is leave it and its volume untouched."
+  },
+  "steps": [
+    {
+      "n": 0,
+      "action": "Obtain two independent family reviews on this exact plan and authenticated package/script sources; reconcile review corrections. Recheck BG/5748terminal, no staging/keypose in progress, source package bytes unchanged. No key generation in this lot."
+    },
+    {
+      "n": 1,
+      "action": "Native host drain AG1 with bounded window; finish active turns, no leaseSQL edits. Confirm elected roles continue on an admitted live candidate through native election. Inventory allUID1001processes; abort before rights/restart if any unapproved personal/unknown session would be affected. Recheck PGprobe disposition; leave it untouched by default."
+    },
+    {
+      "n": 2,
+      "action": "Same-host root0700 metadata/config backup; capture exact PGimageID, mountvolume, port, restartpolicy, database list and schema_migrations counts. Preserve secrets opaquely on sameVM only; no env/DSN/password/key in argv, stdout, mail or PC. Capacity gate: sameimage bytes+sourcevolume bytes+10GiB below actual free space; no purge as fallback without separate qualified action."
+    },
+    {
+      "n": 3,
+      "action": "Install only missing authenticated rootless prerequisites (rootlesskit1.1.1-1ubuntu0.24.04.3 and any verified dependencies); retain installed Docker29.1.3 and matching public Moby scripts. Verify newuidmap/newgidmap, subuid/subgid65536, loaded AppArmorrootlesskit profile, linger and cgroupdelegation. No arbitrary curl|sh or unpinned apt upgrades."
+    },
+    {
+      "n": 4,
+      "action": "Create rootless Docker underAME1001 with disposable DOCKER_CONFIG and native setuptool install --force --skip-iptables; keep ordinary Docker context unchanged. Explicit RF/RL sockets on every command; data-root home, addresspools outside10.77/16, storageoverlay2/fuse-overlayfs notvfs. Load exact same PGimage fromrootful; no pulling latest for migration."
+    },
+    {
+      "n": 5,
+      "action": "Stop ONLY ameesh-pg after drain and recorded baseline; copy its stopped data in a tar stream preserving numeric owners, between RF andRL, using the qualified AG2 migration method. Verify filebytes/owners, then start rootless sameimage/port/env via private samehostenvfile. Compare every database/schema_migrations count, healthy and restartunless-stopped. Keep rootful source stopped with volume+image>=7days; no deletion and no handling of probevolume."
+    },
+    {
+      "n": 6,
+      "action": "Install DOCKER_HOST=unix:///run/user/1001/docker.sock in AMEenv and environment.d, preserving everyother byte/setting; protectedsamehost backup. Before dropping112, recheck personal/unknown sessions and empty Podmancontainer inventory. If still empty, use reviewed native podman system migrate under freshAMEprocess to release the outside-manager pause; never killall/killpersonal/unownedworkload. If Podman state changed, stop here and reconcile."
+    },
+    {
+      "n": 7,
+      "action": "Remove only AMEsupplementary docker membership; restart user@1001 only after approved quiescence, restore the prior set of native services. No AG2personalapprovalreuse. Require all survivingUID1001processes lack112, rootfulsocketEACCES, rootlessengine+PGhealthy, actual agent/doctor/targetedSQL/mailturn success; preserve prior operatorpaused/hostdrain states until complete."
+    },
+    {
+      "n": 8,
+      "action": "Independent actual postmigrationattestation, native undrain at successful boundary. Only then separately prepare/qualify AG1dedicatedstagingaccount/key under184823a and190553/190562. No L2 activation, rootkey creation or C3 claimed by this lot."
+    }
+  ],
+  "rollback": {
+    "before_any_AG1_staging_key": "Keep drain; stop rootlessPG, restore saved env/context, restore AMEdocker membership, restart approved native manager scope, restart preserved rootfulsamePG. Comparebaseline. Preserve source data; reconcile testwrites before any reversecopy. Reportfailure, no blindreplay.",
+    "after_key_created": "This rollback is NOT valid while an AG1rootdeploymentkey remains accessible through privileges. Disable L2 and revoke AG1public lines on all4targets under reviewed procedure before reintroducing rootful access; no unconditional group restore."
+  },
+  "completion": "NoUID1001process has112; freshAMEcannotreachrootfulDocker and cannotgetroot/stagingUID; rootlessPG/test/doctor/realturn allpass, same testdatabases and schema counts, originalsource retained7d, actual independentattestation linked. Otherwise not done."
+}
