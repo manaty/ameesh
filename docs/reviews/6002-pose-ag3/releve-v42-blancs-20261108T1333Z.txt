@@ -1,0 +1,27 @@
+# blancs #6002 v4.2, aucun --apply, 2026-11-08T13:33:41Z
+préalables OK ; runners actifs : ameesh-runner-agent@ameesh-cx3.service ameesh-runner-agent@ameesh-dev1.service ameesh-runner-agent@ameesh-dev2.service ameesh-runner-agent@ameesh-dev4.service ameesh-runner-agent@ameesh-dev7.service ameesh-runner-agent@claude1.service ameesh-runner-agent@claude2.service ameesh-runner-agent@codex2.service
+accès au venv : ACL u:vm-operator:--x sur 4 parents (décision #200777 O1)
+(contrôle seul, aucun effet)
+rc=0
+préalables base OK
+(contrôle seul, aucun effet)
+rc=0
+état avant retour :
+  reçus absents (retour sans reçus : ACL non restaurée)
+pas de reçu ACL (pose arrêtée avant l'étape 6 bis) : aucune ACL à restaurer
+(à blanc, aucun effet)
+rc=0
+# témoin ACL réel (conteneur)
+OK   pose u:vm-operator:--x
+OK   mask:: présent après pose (cause du B v4.1)
+OK   vm-operator ne liste pas /home/ameesh
+non-dérive OK : seules u:vm-operator:--x (et mask::) diffèrent de l'état avant
+ACL restaurées : getfacl des 4 parents = reçu avant, à l'octet
+OK   retour rc 0
+OK   getfacl avant = après, à l octet
+OK   aucun mask:: résiduel
+OK   nettoyage poursuivi après le retour ACL
+OK   dérive : STOP (rc 1)
+OK   dérive : rien effacé (ACL inchangées)
+OK   reçu non 0600 refusé
+rc=0
