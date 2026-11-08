@@ -61,7 +61,7 @@
                                                  a thread trace; run daily by the runner
   agent-mail list                                agents, host, lease, unread,
                                                  last sign of life (seen/wrote)
-  agent-mail inbox [NAME]                        unread messages of NAME (without marking them read)
+  agent-mail inbox [--unread] [NAME]             unread messages of NAME (without marking them read)
   agent-mail show <id>                           one received message in full (its recipient or a
                                                  copy only), read from the database without
                                                  marking it read (#5215)
@@ -873,6 +873,12 @@ def _send_note(dest: str, urgent: bool, payload: dict, cc: list[str]) -> str:
 
 
 def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
+    # #6343 : inbox est déjà une vue des non-remis ; --unread est un alias,
+    # jamais le nom d'une boîte. La réservation du runner reste intacte.
+    rest = [arg for arg in rest if arg != "--unread"]
+    if len(rest) > 1 or any(arg.startswith("-") for arg in rest):
+        print("usage: agent-mail inbox [--unread] [NAME]", file=sys.stderr)
+        return 2
     if rest:
         name = rest[0]  # lire la boîte d'un autre n'accorde rien et ne consomme rien
     else:
@@ -898,6 +904,8 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
             else:
                 marque = "  [⚠ signature NOT valid: %s]" % verdict.reason
         marque += mail.forwarded_note(msg)
+        if msg.get("reserved_for_delivery"):
+            marque += "  [réservé pour le tour suivant]"
         print("from %s%s: %s" % (msg.get("from"), marque, msg.get("text")))
     return 0
 
