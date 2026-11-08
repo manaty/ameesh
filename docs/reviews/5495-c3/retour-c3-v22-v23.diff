@@ -1,0 +1,53 @@
+--- retour-c3-v22.sh	2026-11-08 12:57:01.335484663 +0000
++++ retour-c3-v23.sh	2026-11-08 13:44:58.086242471 +0000
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bash
+-# #5495 C3 v2.2 — retour à BG (repli #190310 §5), depuis bureau-goal. À BLANC PAR DÉFAUT.
++# #5495 C3 v2.3 — retour (seul delta : état de la minuterie release décidé AVANT son arrêt, N impl-03 #200830) ; v2.2 — à BG (repli #190310 §5), depuis bureau-goal. À BLANC PAR DÉFAUT.
+ #   ./retour-c3-v22.sh [--apply] activation <TS de « pose-c3-v22.sh activer »>
+ #       AG1 et AG2 : minuterie L2 désactivée (unité jamais tuée en séquence : rc 3) ; fenêtre de release
+ #       fermée (minuterie release arrêtée) ; drop-in --no-staging reposé depuis les reçus (sha
+@@ -39,6 +39,26 @@
+     if [ "$v" = "dropin disabled sans-soumission" ]; then echo "OK  $h intact (aucun geste d'activation)"
+     else echo "INCIDENT $h sans reçus mais état « $v » : non touché, à examiner" >&2; INCIDENT=1; fi
+   done
++  declare -A RELANCE
++  for h in $MOD; do
++    A=/root/ameesh-operator-C3-$h-activation-$ACT
++    # v2.3 (N impl-03 #200830) : l'état à restaurer est décidé pour TOUS les hôtes modifiés,
++    # avant le moindre geste de ce retour (minuterie L2 comprise).
++    # État gardé « active » ou « inactive » : il est suivi. État gardé absent, vide ou inconnu : si la
++    # minuterie est « enabled » (état nominal d'un candidat), relance explicite puis ActiveState=active
++    # vérifié ; sinon STOP AVANT tout arrêt, avec diagnostic : rien n'est laissé arrêté par ce retour.
++    garde=$(R $h "sed -n 2p $A/release-timer.etat" 2>/dev/null) || garde=""
++    case "$garde" in
++      active|inactive) RELANCE[$h]=$garde ;;
++      *) ufs=$(R $h "systemctl --user -M ameesh@ show ameesh-release.timer -p UnitFileState --value") || ufs=ERREUR-LECTURE
++         if [ "$ufs" = enabled ]; then
++           echo "ATTENTION $h : état gardé de la minuterie release « $garde » inconnu ; UnitFileState=enabled → relance explicite vérifiée" >&2
++           RELANCE[$h]=active
++         else
++           stop "$h : état gardé « $garde » inconnu et UnitFileState « $ufs » : minuterie release NON arrêtée par ce retour. Diagnostic : cat $A/release-timer.etat ; systemctl --user -M ameesh@ status ameesh-release.timer. Décider, puis relancer ce retour."
++         fi ;;
++    esac
++  done
+   for h in $MOD; do geste $h "minuterie L2 désactivée" "systemctl --user -M ameesh-staging@ disable --now ameesh-staging.timer"; done
+   for h in $MOD; do
+     etat=$(R $h "systemctl --user -M ameesh-staging@ show ameesh-staging.service -p ActiveState --value") || stop "$h état du service illisible"
+@@ -61,14 +81,8 @@
+       "if [ -f $A/10-sans-staging.conf ]; then install -m 644 -o ameesh -g ameesh $A/10-sans-staging.conf $RD/10-sans-staging.conf && mv $A/10-sans-staging.conf $A/10-sans-staging.conf.repose-$TS; fi && systemctl --user -M ameesh@ daemon-reload && x=\$(systemctl --user -M ameesh@ show ameesh-release.service -p ExecStart --value) && case \"\$x\" in *--no-staging*) true;; *) false;; esac"
+     geste $h "soumission retirée (gardée dans $A)" \
+       "if [ -e $SOUMISSION ]; then mv $SOUMISSION $A/staging-executor.json.retire-$TS; fi; test ! -e $SOUMISSION"
+-    # Sans fichier d'état lisible (avis impl-03 B1 #200802) : la minuterie release est redémarrée,
+-    # c'est son état nominal sur les candidats, et le fait est signalé.
+-    if [ $APPLY = 1 ] && ! R $h "test \$(wc -l < $A/release-timer.etat) = 2" 2>/dev/null; then
+-      echo "ATTENTION $h : release-timer.etat absent ou incomplet, minuterie release redémarrée (état nominal)" >&2
+-      R $h "printf 'enabled\nactive\n' > $A/release-timer.etat.defaut && cp $A/release-timer.etat.defaut $A/release-timer.etat" || stop "$h état par défaut non écrit"
+-    fi
+-    geste $h "minuterie release restaurée (démarrée et ActiveState=active exigé si elle était active)" \
+-      "e=\$(sed -n 2p $A/release-timer.etat) && [ -n \"\$e\" ] && if [ \"\$e\" = active ]; then systemctl --user -M ameesh@ start ameesh-release.timer && [ \"\$(systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value)\" = active ]; fi"
++    geste $h "minuterie release restaurée : ${RELANCE[$h]} (si active : start puis ActiveState=active exigé)" \
++      "if [ ${RELANCE[$h]} = active ]; then systemctl --user -M ameesh@ start ameesh-release.timer && [ \"\$(systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value)\" = active ]; fi"
+   done
+   echo "dernier enregistrement mesh-staging (lecture) :"
+   R AG1 "runuser -u ameesh -- env HOME=/home/ameesh $PY -c 'from ameesh import config,db,staging_executor as s;import json;d=s.latest(db.connect(config.load(),writer=False),\"mesh-staging\") or {};print(json.dumps({k:d.get(k) for k in (\"state\",\"host\",\"sha\",\"run\",\"blocked_reason\")}))'" || echo "(lecture impossible)"

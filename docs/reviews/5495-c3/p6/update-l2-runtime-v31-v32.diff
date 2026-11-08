@@ -1,0 +1,47 @@
+--- /tmp/claude-1001/-home-agent/526a0a74-f00e-4639-b4d1-d11066d51f99/scratchpad/p6/update-l2-runtime-v31.py	2026-11-08 12:57:30.500738111 +0000
++++ /tmp/claude-1001/-home-agent/526a0a74-f00e-4639-b4d1-d11066d51f99/scratchpad/p6/update-l2-runtime-v32.py	2026-11-08 13:45:35.950590893 +0000
+@@ -1,4 +1,6 @@
+-"""#5495 P6 — installateur v3.1 (N d'impl-03 #200802 : retour vérifie l'arbre 5c1, tmp O_EXCL,
++"""#5495 P6 — installateur v3.2 (seul delta : un .p6.tmp résiduel d'un échec antérieur est retiré s'il est
++bien le fichier de l'installateur — régulier, nlink 1, propriétaire attendu, nom exact —, sinon refus
++nommé avec la commande ; N impl-03 #200830) ; v3.1 (N d'impl-03 #200802 : retour vérifie l'arbre 5c1, tmp O_EXCL,
+ refus constant pour toute exception) ; v3 : aligne le runtime L2 (compte ameesh-staging, uid 980) d'AG1 ou d'AG2
+ sur le kit scellé de la version de flotte M, SANS première installation. Dérivé de
+ install-passive-runtime.py (phase 1 V2, 465180850fb1d24d) : mêmes gardes (autorité exacte et
+@@ -101,10 +103,28 @@
+     assert r.stdout.strip() == 'disabled', 'L2 timer not disabled'
+ 
+ 
++def clear_stale(tmp, owner_uid):
++    """Retire le SEUL temporaire de l'installateur laissé par un échec antérieur (nom exact
++    <cible>.p6.tmp). Refus nommé, sans rien toucher, s'il n'est pas un fichier régulier non lié de
++    owner_uid ; la commande d'examen est donnée. Retourne True si un résidu a été retiré."""
++    tmp = Path(tmp)
++    assert tmp.name.endswith('.p6.tmp')
++    try:
++        st = tmp.lstat()
++    except FileNotFoundError:
++        return False
++    if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == owner_uid):
++        raise AssertionError('stale %s is not the installer temporary (regular, nlink 1, uid %d): '
++                             'inspect with « stat %s » and remove it by hand if it is ours' % (tmp, owner_uid, tmp))
++    os.unlink(tmp)
++    return True
++
++
+ def write_json_980(path, value):
+     """Écriture atomique 0600 sous 980 (copie privée de l'exécuteur)."""
+     data = json.dumps(value, indent=2) + '\n'
+     tmp = str(path) + '.p6.tmp'
++    clear_stale(tmp, 980)
+     r = subprocess.run(user_args(['/usr/bin/python3.12', '-I', '-c',
+         'import os,sys\nfd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)\n'
+         'os.write(fd,sys.stdin.buffer.read());os.fsync(fd);os.close(fd);os.replace(sys.argv[1],sys.argv[2])',
+@@ -114,6 +134,7 @@
+ 
+ def install_submit(source):
+     tmp = SUBMIT.with_name(SUBMIT.name + '.p6.tmp')
++    clear_stale(tmp, 0)
+     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+     with os.fdopen(fd, 'wb') as f:
+         f.write(Path(source).read_bytes())

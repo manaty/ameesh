@@ -3,14 +3,21 @@
  "conserves": [
   "v1",
   "v2",
-  "v2.1"
+  "v2.1",
+  "v2.2"
  ],
- "demande": "#200777 (2), avis #200778 #200781 #200802",
+ "delta_v22_v23": [
+  "retour-c3-v23.sh (retour-c3-v22-v23.diff)",
+  "p6/update-l2-runtime-v32.py (p6/update-l2-runtime-v31-v32.diff)"
+ ],
+ "demande": "#200888 ; N impl-03 #200830",
  "files": {
+  ".gitattributes": "b5487bd05eee186396baf1d0e878b80abf08686268bdab0d97f8db5e8dac3f9a",
   "DOSSIER-C3-v1.md": "c88b4306981317948ed0c668b2b50bbc872fbef6178d63b08e08e513025fa7ec",
   "DOSSIER-C3-v2.md": "9ff30a590c3041705f1ce2a2a1d305febe07d66ebcf6cd5322c1c2eb47d7a241",
   "DOSSIER-C3-v21.md": "f20ba3cadfc4f56ce449daf0ba095cff042fa16f78e261c13c59913552b02b8a",
   "DOSSIER-C3-v22.md": "56f73c61b3521c3868d95463a4930168ef54b2006948e7ab80c800f365c96687",
+  "DOSSIER-C3-v23.md": "b56381618a7f872463fe17c5b167a59d4b8fcc02c8b656667233bffe6d776f3e",
   "analyse/attrs.py": "d67851674b9a5f87f8e5d3367507a797e9677611532cf9499ad6b1e4304f4cff",
   "evaluer-c3.py": "35e6e673297e3723cbc439a3a42904755751470d6984456f205357184c37c23f",
   "lecteur-c3.py": "782e2299b10077d4c21fae037570bdaec9c37f90b12ff2f302217047a03161f9",
@@ -31,9 +38,12 @@
   "p6/kit-recus/requirements-staging.lock": "185d3bef81efd5c35b385b8705ca2b8885064ad3a3781e6b3c63bf12185cf039",
   "p6/kit-recus/separate-verifier-receipt.json": "f4c753da0e4ca488738078ca9398b512e8b855149a30211ff4a76a906cfac8e3",
   "p6/pins-lock.py": "911e7f370d548ac70e49b7072c85f209f057a1b4382b7c7042ed139ae8177193",
+  "p6/temoin-installateur-v32.py": "9c64faf2920b00b89119bc96307efed089a4e1437f6fbd2eef6a8c59c8f60d75",
   "p6/update-l2-runtime-v3-v31.diff": "21b5eaf4dc89272a022aca3136d58ab2517fbc8e7cbd98d3c043b56e86c815c4",
   "p6/update-l2-runtime-v3.py": "1007f986541e24ecb57983b8d29086d0c703e15dd6dfdf99efcd44a8580af439",
+  "p6/update-l2-runtime-v31-v32.diff": "5be486bfbce31b634f10e48dd598d397363e140c6cb5c43a8df4e9d914055e44",
   "p6/update-l2-runtime-v31.py": "f838ee6b55cbfe025b8ebe157a7e638f01dee75c10a0fb4246619e8287db0bd2",
+  "p6/update-l2-runtime-v32.py": "e6526d402a43ce68117cc24393b6b392bd3bc7d3e1f5d56c791923f51e0b01c6",
   "p6/verify.out.txt": "3e92c5e938fa4be4250eed101657cd5c45b42118ca7da15129b73df9310200c9",
   "pose-c3-AG1.sh": "d687eefe2818b22a2defac8b332b30feaa586d2dd72e35a90f3492972e40692e",
   "pose-c3-v2.sh": "5901e5cf1b278f8ced32b71b6061d2d9279f379dbb8849c2f141627479dbf250",
@@ -50,25 +60,19 @@
   "retour-c3-AG1.sh": "db8365adcafdfbfea740d6a254a908c4ee45df34e1a09ff31901128e533e7722",
   "retour-c3-v2.sh": "523abf0bc566e5a878d7e592b636203ee7957ac78d65ca7d96791377b140d475",
   "retour-c3-v21.sh": "e9cce6c653584cb61ba7855979f49e6ce8dbb913dd3d00f0a408c6585bafb4f9",
+  "retour-c3-v22-v23.diff": "251481fb628b007d2325b8b7d389f50810b4cd706805048e519d0d1e76a3c5d4",
   "retour-c3-v22.sh": "ff80c04be699cc29c108e1a6763f79eaf397afea8d6b6beb3b470d87fc6984b2",
+  "retour-c3-v23.sh": "1c78fc5e8ab32bf33ddc28e3174aef17cc8c0ee50770c0816d16307cc458ca0d",
   "sonde-c3-v2.sh": "ed61763f5f723fff51c03c995ce6f2e3d3e8c647f3ecc6bbd2af6ec60f73f883",
   "sonde-c3-v21.sh": "a55387a0adef8ff86f2bee238429a33f1281a8898156d017af6af56a4675ab69",
   "sonde-c3-v22.sh": "20a780dc699f6f07ad68527fc1a955b4436c0de141096684c870bdf78e73cc9d",
   "sonde-c3.sh": "ec6a8dfd7aa713c63771ceccbdd748d9e9e65ab87734c2cf0a2ae68ad1bf2fd0",
   "temoin-apres.sh": "e47adc3f1a79ee8810f8aadb597af5939ab2e53ec34006bd4f75f4c0e8473e31",
-  "temoin-lectures.sh": "ee6e4bedf68951520f0d1d1d952645159e2d1b67109ef3a96256d8e9f4f58f3b"
+  "temoin-lectures.sh": "ee6e4bedf68951520f0d1d1d952645159e2d1b67109ef3a96256d8e9f4f58f3b",
+  "temoin-v23.sh": "4942cf2330cf3e8432434e9c78736d4841bf3912452a97f07b66b791fc7bd27b"
  },
  "gestes": "aucun sur les VM",
- "installateur": {
-  "v3": "1007f986 (OK impl-11 #200781, OK statique+N impl-03 #200802)",
-  "v3.1": "f838ee6b (delta N impl-03, à confirmer)"
- },
- "kit_p6_archive": {
-  "depot_auditeur_AG1": "/home/ameesh/preparation-5495-AG1-20261105/p6-L2-review-97285a07-20261108/",
-  "requalification": "CONFORME #200778",
-  "sha256": "4143455e87bb07f32398efd5df49df3ca274c3a35e78e51b504f49fcf6784a57"
- },
  "lot": 5495,
- "schema": "ameesh-5495-c3-dossier/4",
- "version": "v2.2"
+ "schema": "ameesh-5495-c3-dossier/5",
+ "version": "v2.3"
 }
