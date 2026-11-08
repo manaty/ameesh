@@ -4199,8 +4199,13 @@ class WorkItems(interface.WorkItems):
 
     def project_plan_rows(self, project, *, assignment_id=None) -> list[dict]:
         """#4174: complete open project snapshot, including every waiting lot."""
+        # #6347: scan historical lots once, then reuse the open set for the
+        # correlated footprint/capacity guards. Keep every app and improvement:
+        # they can occupy a footprint even when absent from the output snapshot.
         return self.db.query(
-            "WITH pending_decisions AS MATERIALIZED ("
+            "WITH plan_open_items AS MATERIALIZED ("
+            " SELECT * FROM work_items WHERE state NOT IN " + _CLOSED + "),"
+            " pending_decisions AS MATERIALIZED ("
             " SELECT DISTINCT btrim(work_item_id) AS lot FROM agent_mailbox"
             " WHERE delivered_at IS NULL AND kind = 'request'"
             " AND payload->'decision' IS NOT NULL) "
@@ -4225,20 +4230,20 @@ class WorkItems(interface.WorkItems):
             "             ORDER BY b.id) AS open_conflicts,"
             "       (pd.lot IS NOT NULL) AS pending_decision,"
             # Match the intake footprint guard used by dispatch (#4173).
-            "       (w.state = 'intake' AND " + footprint_overlap_sql("w") + ")"
+            "       (w.state = 'intake' AND " + footprint_overlap_sql("w", items="plan_open_items") + ")"
             "         AS footprint_overlap,"
             # #4818 : plafond de lots en vol du dépôt, et ce qu'il faut au plan
             # pour choisir un ensemble aux empreintes disjointes deux à deux
             "       (w.state = 'intake' AND w.assignee IS NULL AND "
-            + footprint_cap_sql("w") + ") AS repository_cap,"
+            + footprint_cap_sql("w", items="plan_open_items") + ") AS repository_cap,"
             "       ARRAY(SELECT DISTINCT f.path FROM work_item_footprints f"
             "             WHERE f.work_item_id = w.id ORDER BY f.path) AS footprint_paths,"
-            "       CASE WHEN w.state = 'intake' THEN " + footprint_in_flight_sql("w") +
+            "       CASE WHEN w.state = 'intake' THEN " + footprint_in_flight_sql("w", items="plan_open_items") +
             " END AS repository_in_flight,"
             "       EXISTS (SELECT 1 FROM commitments c WHERE c.work_item_id = w.id"
             "               AND c.kind = 'decision' AND c.status IN ('proposed', 'open'))"
             "         AS decision_milestone"
-            " FROM work_items w LEFT JOIN work_packages k ON k.id = w.package_id"
+            " FROM plan_open_items w LEFT JOIN work_packages k ON k.id = w.package_id"
             " LEFT JOIN work_packages kp ON kp.id = w.package_parent"
             " LEFT JOIN pending_decisions pd ON pd.lot = w.id::text"
             " WHERE coalesce(nullif(btrim(w.app), ''), nullif(btrim(w.team), ''),"

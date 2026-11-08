@@ -37,7 +37,10 @@ def occupying_sql(alias: str) -> str:
     return _OCCUPYING.format(o=alias)
 
 
-def overlap_rows_sql(alias: str) -> str:
+# `items` is a trusted SQL relation name, like `alias`, never user input.
+# A snapshot may supply a CTE containing all non-terminal lots; the canonical
+# predicates below still decide which of those lots occupy an individual app.
+def overlap_rows_sql(alias: str, *, items: str = "work_items") -> str:
     """Les paires (chemin du lot `alias`, chemin d'un lot occupant du même
     dépôt) qui se chevauchent — corps de `overlapping` et de la garde."""
     return ("SELECT o.id, o.state, o.assignee, mine.path, theirs.path AS other_path"
@@ -45,7 +48,7 @@ def overlap_rows_sql(alias: str) -> str:
             "  JOIN work_item_footprints theirs"
             "    ON theirs.work_item_id <> mine.work_item_id"
             "   AND " + _PATHS_OVERLAP.format(a="theirs", b="mine") +
-            "  JOIN work_items o ON o.id = theirs.work_item_id"
+            "  JOIN " + items + " o ON o.id = theirs.work_item_id"
             " WHERE mine.work_item_id = " + alias + ".id"
             "   AND coalesce(btrim(" + alias + ".app), '') <> ''"
             "   AND btrim(o.app) = btrim(" + alias + ".app)"
@@ -54,12 +57,12 @@ def overlap_rows_sql(alias: str) -> str:
             "   AND NOT " + _SHARED.format(app=alias + ".app", p="theirs"))
 
 
-def overlap_exists_sql(alias: str) -> str:
+def overlap_exists_sql(alias: str, *, items: str = "work_items") -> str:
     """Vrai si le lot `alias` chevauche un lot occupant de son dépôt.
 
     `unassigned_lots` (sélection) et `_assign_locked` (sous le verrou du
     graphe) appliquent ce même prédicat : une seule règle."""
-    return "EXISTS (" + overlap_rows_sql(alias) + ")"
+    return "EXISTS (" + overlap_rows_sql(alias, items=items) + ")"
 
 
 #: #4667 : un véhicule de paquet (`integration/**`) n'a pas de delta propre ;
@@ -84,31 +87,31 @@ def exempt_sql(alias: str) -> str:
     return _EXEMPT.format(o=alias)
 
 
-def in_flight_sql(alias: str) -> str:
+def in_flight_sql(alias: str, *, items: str = "work_items") -> str:
     """Le nombre de lots qui OCCUPENT leur empreinte dans le dépôt du lot
     `alias`, lui et les véhicules de paquet exceptés (#4818, plafond de lots
     en vol)."""
-    return ("(SELECT count(*) FROM work_items o"
+    return ("(SELECT count(*) FROM " + items + " o"
             "  WHERE coalesce(btrim(" + alias + ".app), '') <> ''"
             "    AND btrim(o.app) = btrim(" + alias + ".app)"
             "    AND o.id <> " + alias + ".id AND " + occupying_sql("o") +
             "    AND NOT " + exempt_sql("o") + ")")
 
 
-def cap_rows_sql(alias: str) -> str:
+def cap_rows_sql(alias: str, *, items: str = "work_items") -> str:
     """#4818 : `(cap, in_flight)` quand le dépôt du lot `alias` a atteint son
     plafond de lots en vol (`max_in_flight` de sa politique) ; aucune ligne
     sans plafond ou en dessous."""
-    return ("SELECT cp.max_in_flight AS cap, " + in_flight_sql(alias) + " AS in_flight"
+    return ("SELECT cp.max_in_flight AS cap, " + in_flight_sql(alias, items=items) + " AS in_flight"
             "  FROM repository_footprint_policies cp"
             " WHERE cp.app = btrim(" + alias + ".app)"
             "   AND cp.max_in_flight IS NOT NULL"
             "   AND NOT " + exempt_sql(alias) +
-            "   AND " + in_flight_sql(alias) + " >= cp.max_in_flight")
+            "   AND " + in_flight_sql(alias, items=items) + " >= cp.max_in_flight")
 
 
-def cap_reached_sql(alias: str) -> str:
-    return "EXISTS (" + cap_rows_sql(alias) + ")"
+def cap_reached_sql(alias: str, *, items: str = "work_items") -> str:
+    return "EXISTS (" + cap_rows_sql(alias, items=items) + ")"
 
 
 def held_sql(alias: str) -> str:
