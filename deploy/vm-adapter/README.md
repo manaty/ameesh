@@ -283,7 +283,11 @@ son horodatage original, sans second tour.
 `meta.consigne.turn`, une ressource du tour sur le bon hôte et la bonne
 persona, puis l'accusé exact `VM-PROBE-ACK <nonce>` de cette persona envoyé
 entre remise et fin du tour. La demande indique la commande d'accusé à
-exécuter. `done`, `ended_at`, l'état final `idle` sans erreur et les trois
+exécuter : `agent-mail send <probe_agent> --ack "VM-PROBE-ACK <nonce>"`.
+L'accusé est adressé à la persona elle-même, dont l'inscription sur cet hôte
+est vérifiée avant le dépôt ; `--ack` ne réveille aucun nouveau tour.
+L'identité d'émission `vm-adapter` ne reçoit aucun courrier et ne nécessite
+aucune inscription comme destinataire. `done`, `ended_at`, l'état final `idle` sans erreur et les trois
 booléens sont nécessaires à `ok`. Livraison seule, nonce/époque/génération
 étrangers ou réadmission plus récente ne donnent jamais `ok`. Un tour fini
 en échec donne `ko`. Les reçus ne contiennent ni corps de courrier, ni DSN,

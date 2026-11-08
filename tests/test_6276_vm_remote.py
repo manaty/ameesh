@@ -11,7 +11,7 @@ from unittest import mock
 
 from tests.support import PgTestCase
 from tests import test_6252_vm_commandes as cycle
-from ameesh import storage, vm_adapter as vm
+from ameesh import mail, storage, undeliverable, vm_adapter as vm
 
 cmd = cycle.cmd
 
@@ -153,13 +153,27 @@ class NativeTest(PgTestCase):
             self.end()
 
     def ack(self, nonce=NONCE, sender='burst-probe'):
-        self.db.execute("INSERT INTO agent_mailbox(sender,recipient,host,body,payload) "
-                        "VALUES (%s,'vm-adapter','burst',%s,'{\"ack\":true}'::jsonb)",
-                        (sender, 'VM-PROBE-ACK ' + nonce))
+        undeliverable.check_send(self.cfg, self.db, sender=sender, dest='burst-probe')
+        mail.send(self.db, sender, 'burst-probe', 'VM-PROBE-ACK ' + nonce,
+                  host='burst', payload={'ack': True}, thread=False)
 
     def end(self):
         self.db.execute("UPDATE turn_resources SET status='done',ended_at=clock_timestamp() "
                         "WHERE turn_id='probe-turn'")
+
+    def test_requested_ack_destination_passes_native_registry_check(self):
+        self.start()
+        body = self.db.query("SELECT body FROM agent_mailbox WHERE sender='vm-adapter'")[0]['body']
+        command = body.split('with ', 1)[1].split(' then end', 1)[0]
+        argv = shlex.split(command)
+        self.assertEqual(argv, ['agent-mail', 'send', 'burst-probe', '--ack',
+                                'VM-PROBE-ACK ' + NONCE])
+        undeliverable.check_send(self.cfg, self.db, sender='burst-probe', dest=argv[2])
+        self.delivered()
+        mail.send(self.db, 'burst-probe', argv[2], argv[4], host='burst',
+                  payload={'ack': True}, thread=False)
+        self.end()
+        self.assertEqual(self.receipt()['verdict'], 'ok')
 
     def test_start_is_idempotent_and_delivery_alone_is_never_completion(self):
         self.assertEqual(self.start(), (0, None))
@@ -326,11 +340,11 @@ class NativeCycleTest(cycle.CloudCycleTest):
         self.db.execute("UPDATE agent_mailbox SET delivered_at=clock_timestamp(),status='delivered', "
                         "meta=jsonb_build_object('consigne',jsonb_build_object('turn',%s::text)) WHERE id=%s",
                         (turn, launch['request_id']))
-        self.db.execute("DELETE FROM agent_mailbox WHERE sender='burst-probe' AND recipient='vm-adapter'")
+        self.db.execute("DELETE FROM agent_mailbox WHERE sender='burst-probe' AND recipient='burst-probe'")
         if over.get('acknowledged', True):
-            self.db.execute("INSERT INTO agent_mailbox(sender,recipient,host,body,payload) "
-                            "VALUES ('burst-probe','vm-adapter','burst',%s,'{\"ack\":true}'::jsonb)",
-                            ('VM-PROBE-ACK ' + nonce,))
+            undeliverable.check_send(self.cfg, self.db, sender='burst-probe', dest='burst-probe')
+            mail.send(self.db, 'burst-probe', 'burst-probe', 'VM-PROBE-ACK ' + nonce,
+                      host='burst', payload={'ack': True}, thread=False)
         if over.get('turn_ended', True):
             self.db.execute("UPDATE turn_resources SET status='done',ended_at=clock_timestamp() WHERE turn_id=%s", (turn,))
         self.db.execute("UPDATE agent_registry SET status=%s,runner_seen_at=clock_timestamp() "

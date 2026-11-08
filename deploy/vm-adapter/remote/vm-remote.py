@@ -196,7 +196,7 @@ class Native:
                 raise Refus('probe not admitted')
             nonce = key['nonce']
             body = ('VM return health probe. Acknowledge this nonce with '
-                    'agent-mail send vm-adapter --ack "VM-PROBE-ACK ' + nonce +
+                    'agent-mail send ' + key['probe_agent'] + ' --ack "VM-PROBE-ACK ' + nonce +
                     '" then end this turn. No other work is requested.')
             request_id = mail.send(tx, 'vm-adapter', key['probe_agent'], body,
                                    host=key['host'], kind='request', thread=False,
@@ -237,7 +237,7 @@ class Native:
                            "AND payload @> '{\"ack\":true}'::jsonb AND body=%s "
                            'AND created_at >= %s AND created_at <= coalesce(%s, clock_timestamp()) '
                            'AND host=%s LIMIT 1',
-                           (key['probe_agent'], 'vm-adapter', 'VM-PROBE-ACK ' + key['nonce'],
+                           (key['probe_agent'], key['probe_agent'], 'VM-PROBE-ACK ' + key['nonce'],
                             row['delivered_at'], row['ended_at'], key['host']))
             result['acknowledged'] = bool(ack)
             result['turn_ended'] = row['status'] == 'done' and row['ended_at'] is not None
