@@ -5371,7 +5371,7 @@ class LotSessions(Domain):
     @abc.abstractmethod
     def switch(self, name: str, owner: str, epoch: int, *, to_lot: str | None,
                harness: str | None, account: str | None, cwd: str | None,
-               current: str | None = None) -> dict | None:
+               current: str | None = None, max_tokens: float | None = None) -> dict | None:
         """Change le lot de la session active, **fencé par le bail**, en une
         transaction : la session active `current` est mise de côté pour le lot
         de session noté au registre (s'il est un lot encore ouvert et porté
@@ -5385,11 +5385,13 @@ class LotSessions(Domain):
         dossier `cwd` (sinon elle est écartée et la session active est vide :
         une session neuve s'ouvrira). Un siège de relecture retiré ne porte
         plus le lot : sa session n'est pas reprise (relecteur exclu, §2).
+        `max_tokens` : une session au cumul input+output atteignant ce seuil
+        est écartée avant reprise (cache séparé exclu).
         `to_lot=None` : la session active est mise de côté pour son lot et
         AUCUNE ne devient active (`session_work_item` remis à NULL) — le tour
         part dans une session sans lot (#2055).
         Rend `{resumed, parked, discarded, discard_reason}` (identifiants ou
-        None ; raison `origin` ou `lot`), ou None si le bail n'est plus le
+        None ; raison `origin`, `lot` ou `size`), ou None si le bail n'est plus le
         nôtre (rien n'est écrit)."""
 
     @abc.abstractmethod

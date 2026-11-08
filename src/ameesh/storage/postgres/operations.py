@@ -336,7 +336,7 @@ class Operations(interface.Operations):
                 SELECT name, lease_owner, lease_epoch, lease_expires_at, session_id,
                        restart_brief, restart_requested_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
-            )
+            ), applied AS (
             UPDATE agent_registry AS r
                SET session_id = NULL,
                    session_work_item = NULL,
@@ -364,6 +364,14 @@ class Operations(interface.Operations):
             RETURNING r.name, verrou.session_id AS forgotten_session,
                       verrou.restart_brief AS brief,
                       extract(epoch from r.session_reset_at)::float8 AS session_reset_ts
+            ), forgotten AS (
+                -- #6403 : conserver les réveils, oublier toutes les sessions
+                -- mises de côté sous le même bail que la session courante.
+                UPDATE agent_lot_sessions SET session_id = NULL, parked_at = NULL
+                 WHERE agent IN (SELECT name FROM applied)
+                 RETURNING agent
+            )
+            SELECT * FROM applied
             """,
             params,
         )

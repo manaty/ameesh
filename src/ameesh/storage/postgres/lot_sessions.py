@@ -59,14 +59,15 @@ def _holds_sql(agent: str, *, reviewers: bool) -> str:
 
 class LotSessions(interface.LotSessions):
 
-    def switch(self, name, owner, epoch, *, to_lot, harness, account, cwd, current=None):
+    def switch(self, name, owner, epoch, *, to_lot, harness, account, cwd, current=None, max_tokens=None):
         """`to_lot=None` : mise de côté de la session active seulement (#2055).
 
         #6012 : un lot porté par l'agent comme **relecteur désigné** (pas
         seulement comme assigné) garde sa session, qui est reprise au réveil
         sur le même lot. Un siège retiré (relecteur exclu après correction,
         §2) ne la reprend pas : le prédicat se relit à la bascule, et le lot
-        n'est plus porté.
+        n'est plus porté. #6403 : max_tokens applique le seuil existant au
+        cumul input+output de la session AVANT de la rendre active.
         """
         reviewers = has_reviewers(self.db)
         with self.db.transaction() as tx:
@@ -115,6 +116,9 @@ class LotSessions(interface.LotSessions):
             if cible.isdigit():
                 rows = tx.query(
                     "SELECT l.session_id, l.harness, l.account, l.cwd,"
+                    "       (SELECT coalesce(sum(t.input_tokens + t.output_tokens), 0)"
+                    "          FROM turn_costs t WHERE t.agent = l.agent"
+                    "           AND t.session = l.session_id) AS tokens,"
                     "       (w.state NOT IN " + _CLOSED + " AND "
                     + _holds_sql("l.agent", reviewers=reviewers) + ") AS ouvert"
                     "  FROM agent_lot_sessions l JOIN work_items w ON w.id = l.work_item_id"
@@ -124,6 +128,8 @@ class LotSessions(interface.LotSessions):
                 if row and row.get("session_id"):
                     if not row.get("ouvert"):
                         discarded, raison = row["session_id"], "lot"
+                    elif max_tokens is not None and row["tokens"] >= max_tokens:
+                        discarded, raison = row["session_id"], "size"
                     elif row.get("harness") is not None and row.get("cwd") is not None \
                             and (row.get("harness"), row.get("account"), row.get("cwd")) \
                             == (harness, account, cwd):
