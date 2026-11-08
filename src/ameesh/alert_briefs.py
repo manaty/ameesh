@@ -930,6 +930,18 @@ def automatic_sleep(alert: dict) -> bool:
     return bool(alert.get("sleep") or file_decoupage.is_sleep_reason(alert.get("reason")))
 
 
+def sleep_unbriefed(alert: dict) -> bool:
+    """#6256 : le sommeil automatique n'est briefé à aucun agent.
+
+    Quand la feuille de route est épuisée, 12 à 26 agents s'endorment ensemble
+    et franchissent ensemble les seuils : un courrier par agent, par hôte et par
+    destinataire, puis la relance de 6 h (264 courriers en 24 h, 08/11), pour un
+    texte qui dit lui-même qu'aucun geste n'est attendu. L'alerte reste dans
+    `ameesh alerts` ; une vraie pause opérateur garde son brief."""
+    return alert.get("type") in ("operator_pause_long", "operator_pause_host") \
+        and automatic_sleep(alert)
+
+
 def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
     """#5044 : par destinataire, les clés passives de son courrier (`mail.PASSIVE_KEYS`).
 
