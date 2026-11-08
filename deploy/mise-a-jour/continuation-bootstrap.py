@@ -116,13 +116,8 @@ def reference(backend, operation, previous, decision):
     # limit: journal provenance alone cannot enumerate outstanding authority.
     # Superseded duplicates are permanently refused by install(); the named
     # predecessor remains historical authority for its continuation receipts.
-    others = backend.db.query(
-        "SELECT id FROM agent_mailbox WHERE kind = 'request'"
-        " AND payload -> 'decision' ->> 'question' = %s"
-        " AND payload -> 'decision' ->> 'state' = 'answered'"
-        " AND id <> %s",
-        (previous_prepared.question, decision))
-    others = [row['id'] for row in others]
+    others = decisions.ids_for_controller(backend.db, previous_prepared.question)
+    others = [identifier for identifier in others if identifier != decision]
     if any(type(identifier) is int and signed_previous(identifier, current=True) for identifier in others):
         raise b.BootstrapError('multiple previous signed bootstrap decisions require reconciliation')
     result = dict(version=1, operation=previous, decision=decision, digest=old['digest'],

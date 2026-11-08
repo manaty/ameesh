@@ -338,8 +338,25 @@ def grant_reads(conn, value):
     set_default_reads(conn, value, grant=True)
 
 
+SQL_COMPANIONS = ('role-release-controller.sql', '_release-decision.sql',
+                  '_revoke-release-mailbox.sql', '_contrat-release-decision.sql',
+                  '_contrat-mailbox-readers.sql', 'release-decision-additive.sql',
+                  'release-decision-cutover.sql')
+
+
+def check_sql_programs():
+    sql = Path(__file__).resolve().parents[1] / 'sql'
+    for path in (Path(__file__).resolve(), *(sql / name for name in SQL_COMPANIONS)):
+        require(not path.is_symlink() and path.is_file(), 'linked or missing root program')
+        for parent in (path, *path.parents):
+            st = parent.lstat()
+            require(not parent.is_symlink() and st.st_uid == 0 and not st.st_mode & 0o022,
+                    'root-owned immutable program required')
+
+
 def apply_group(value, directory):
     """Use the existing audited NOLOGIN contract verbatim; credentials via pgpass."""
+    check_sql_programs()
     params = connection(value['source_owner_dsn'])
     password = params.pop('password', None)
     env = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/nonexistent',
@@ -477,12 +494,7 @@ def main():
     try:
         require(os.geteuid() == 0 and sys.flags.isolated and sys.flags.dont_write_bytecode
                 and sys.argv[1:] in (['enroll'], ['audit'], ['leave']), 'isolated root enroll|audit|leave required')
-        for path in (Path(__file__).resolve(), Path(__file__).resolve().parents[1] / 'sql/role-release-controller.sql'):
-            require(not Path(__file__).is_symlink(), 'linked root program')
-            for parent in (path, *path.parents):
-                st = parent.lstat()
-                require(not parent.is_symlink() and st.st_uid == 0 and not st.st_mode & 0o022,
-                        'root-owned immutable program required')
+        check_sql_programs()
         os.umask(0o077)
         os.environ.clear()
         protected(ROOT, directory=True)
