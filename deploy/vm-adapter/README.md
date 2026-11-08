@@ -151,24 +151,21 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    `database.env` (0600) avec le chemin `AMEESH_CONFIG` de la connexion mesh
    de l'opérateur. Le DSN ne contient aucune clé cloud.
 5. Avant d'inscrire **chaque cible burst**, préparer son journal systemd
-   persistant : un drop-in `/etc/systemd/journald.conf.d/persistent.conf`
-   contient par exemple :
-
-   ```ini
-   [Journal]
-   Storage=persistent
-   SystemMaxUse=512M
-   SystemKeepFree=1G
-   ```
-
-   Adapter ces bornes au disque de la cible et au volume de ses journaux :
-   conserver le boot précédent jusqu'au contrôle de retour, sans saturer le
-   disque. Le bureau applique la configuration en redémarrant
-   `systemd-journald`, puis demande le vidage vers le stockage persistant
-   (`journalctl --flush`) avant le premier arrêt réel.
-   Au premier arrêt/réveil autorisé, vérifier que `journalctl --list-boots`
-   liste le boot précédent et que `journalctl -b -1 -n 1 -o cat --no-pager`
-   permet au contrôle `previous_boot` de lire sa fin propre (#6074).
+   persistant : poser un drop-in `/etc/systemd/journald.conf.d/persistent.conf`
+   repris du modèle `remote/journald.conf.example` (`Storage=persistent` et un
+   `SystemMaxUse=128M` d'exemple), en dimensionnant les bornes pour le disque
+   de la cible et le volume de ses journaux : conserver le boot précédent
+   jusqu'au contrôle de retour, sans saturer le disque. Le bureau applique la
+   configuration en redémarrant `systemd-journald`, puis demande le vidage
+   vers le stockage persistant (`journalctl --flush`) avant le premier arrêt
+   réel.
+   Au premier arrêt/réveil autorisé, vérifier **sous le compte VM non root
+   réellement utilisé par `previous_boot`** (le `user` de l'accès SSH de la
+   `cible.json`, membre du groupe `systemd-journal`, sans root ni `sudo`) que
+   `journalctl --list-boots` liste le boot précédent et que
+   `journalctl -b -1 -n 1 -o cat --no-pager` rend sa dernière ligne. Une
+   vérification faite sous root ou avec `sudo` ne prouve pas ce droit : le
+   contrôle `previous_boot` tourne sous ce compte SSH.
    `Storage=volatile` ou un journal précédent absent ne satisfait pas ce
    préalable ; ne pas contourner le contrôle de santé pour inscrire la cible.
 6. Fournir cinq commandes fixes par VM, détenues par l'opérateur et non
@@ -333,10 +330,13 @@ activer le journal persistant avant le premier arrêt. Le modèle
 `remote/journald.conf.example` fixe `Storage=persistent` et un
 `SystemMaxUse=128M` d'exemple, à dimensionner par le bureau pour la cible.
 Le bureau pose ce drop-in root non inscriptible par les agents, valide la
-configuration et vérifie après redémarrage que `journalctl --list-boots`
-expose le boot précédent et que sa dernière ligne est lisible par le groupe
-systemd-journal. Sans preuve du boot précédent, la santé refuse : un journal
-volatile ou un simple état SSH silencieux ne remplace pas cette preuve.
+configuration et vérifie après redémarrage, **sous le compte VM non root
+réellement utilisé par `previous_boot`** (le `user` SSH de la `cible.json`,
+membre du groupe `systemd-journal`, sans root ni `sudo`), que
+`journalctl --list-boots` expose le boot précédent et que sa dernière ligne
+est lisible. Une lecture root ou `sudo` ne prouve pas ce droit. Sans preuve
+du boot précédent, la santé refuse : un journal volatile ou un simple état
+SSH silencieux ne remplace pas cette preuve.
 Aucun redémarrage de journald ni changement d'une VM n'a lieu dans ce lot.
 
 Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
