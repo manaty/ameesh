@@ -1,1 +1,1 @@
-restrict,port-forwarding,permitopen="10.77.0.1:5432",permitlisten="none",command="/bin/false" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHVUHZB9JKzFmcJgCvcER+lsDZp+dRufTvOiHCa++5e7 bureau-goal ameesh-vm-adapter tunnel 6002 2026-11-08
+restrict,port-forwarding,permitopen="10.77.0.1:5432" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHVUHZB9JKzFmcJgCvcER+lsDZp+dRufTvOiHCa++5e7 bureau-goal ameesh-vm-adapter tunnel 6002 2026-11-08

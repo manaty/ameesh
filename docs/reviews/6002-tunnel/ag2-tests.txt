@@ -1,0 +1,5 @@
+AG2 08/11 03:36–03:40Z : useradd --system ameesh-vmtunnel (uid 997, nologin, mdp verrouillé) ; authorized_keys = restrict,port-forwarding,permitopen="10.77.0.1:5432" + clé tunnel ; drop-in 50-ameesh-vmtunnel.conf terminé par Match all.
+sshd -t OK ; sshd -T -C user=root et user=ameesh : diff avant/après VIDE ; user=ameesh-vmtunnel : allowtcpforwarding local, permitopen 10.77.0.1:5432, permitlisten none, permittty no, x11 no, agent no, streamlocal no, tunnel no, forcecommand /bin/false.
+systemctl reload ssh (session tenue) : actif ; root@AG2 et runuser ameesh OK après.
+Tests : shell → refusé ("This account is currently not available") ; -R 45999 → "remote port forwarding failed" rc 255 ; -L vers 10.77.0.4:22 → "administratively prohibited" ; -L vers 10.77.0.1:5432 → psql sslmode=require SELECT 1 = 1, ssl=t, client 10.77.0.4.
+Retour arrière : rm drop-in, systemctl reload ssh, userdel -r ameesh-vmtunnel.

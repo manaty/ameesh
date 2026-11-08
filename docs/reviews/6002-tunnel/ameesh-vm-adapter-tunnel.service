@@ -1,12 +1,11 @@
 # #6002 tranche 1 : tunnel vers la base centrale (10.77.0.1:5432) via AG2, pour l'adaptateur VM.
-# Clé dédiée, known_hosts épinglé (AG2 seul) ; côté AG2 : restrict,port-forwarding,permitopen="10.77.0.1:5432",permitlisten="none",command="/bin/false".
+# Clé dédiée, known_hosts épinglé (AG2 seul) ; côté AG2 : restrict,port-forwarding,compte ameesh-vmtunnel (Match User : AllowTcpForwarding local, PermitOpen 10.77.0.1:5432, PermitListen none, ForceCommand /bin/false) + restrict,port-forwarding,permitopen="10.77.0.1:5432".
 # AG2 (relais) ne figure jamais dans les cibles de l'inscription. Échec = attente de l'adaptateur.
 [Unit]
 Description=ameesh VM adapter: SSH tunnel BG -> AG2 -> central DB (#6002)
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=600
-StartLimitBurst=20
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/bin/ssh -N -F none -o BatchMode=yes -o IdentitiesOnly=yes \
@@ -14,7 +13,7 @@ ExecStart=/usr/bin/ssh -N -F none -o BatchMode=yes -o IdentitiesOnly=yes \
   -o UserKnownHostsFile=%h/.config/ameesh-vm-adapter/known_hosts_ag2 -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes \
   -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
   -o ForwardAgent=no -o ForwardX11=no -o PermitLocalCommand=no -o ConnectTimeout=10 \
-  -L 127.0.0.1:15432:10.77.0.1:5432 root@78.232.60.1
+  -L 127.0.0.1:15432:10.77.0.1:5432 ameesh-vmtunnel@78.232.60.1
 Restart=always
 RestartSec=10
 NoNewPrivileges=yes
