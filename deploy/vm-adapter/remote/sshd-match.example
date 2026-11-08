@@ -6,7 +6,10 @@ Match User vm-operator
     KbdInteractiveAuthentication no
     PermitTTY no
     AllowTcpForwarding no
+    AllowAgentForwarding no
+    AllowStreamLocalForwarding no
+    PermitTunnel no
+    PermitListen none
     X11Forwarding no
-    PermitUserEnvironment no
     ForceCommand /opt/ameesh-vm-adapter/venv/bin/python -I /opt/ameesh-vm-adapter/remote/vm-remote.py dispatch
 Match all

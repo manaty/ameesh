@@ -366,6 +366,13 @@ Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
    environnement utilisateur et transferts. Les deux commandes forcées
    sont identiques. Valider avec `sshd -t` avant toute pose. Le parseur
    refuse toute commande, option, argument ou chemin hors liste.
+   `PermitUserEnvironment no` doit rester dans la configuration **globale**
+   de sshd : cette directive est interdite dans un bloc `Match`.
+   Vérifier la configuration effective avec
+   `sshd -T -C user=vm-operator,host=localhost,addr=127.0.0.1` (adapter le
+   login) : `permituserenvironment no`, `allowagentforwarding no`,
+   `allowstreamlocalforwarding no`, `allowtcpforwarding no`, `permittunnel no`
+   et `permitlisten none`. Un écart refuse l'activation.
 5. Rendre `remote/sudoers.example` avec ce seul login et valider
    `visudo -cf <fichier rendu>`. La seule ligne autorisée est
    `/usr/bin/systemctl poweroff --no-block`, sans joker ni variante.
