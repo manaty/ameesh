@@ -10,7 +10,6 @@ import json
 import os
 import subprocess
 import tempfile
-import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -244,25 +243,28 @@ class ValidateTest(unittest.TestCase):
     def test_une_echeance_borne_les_git_locaux_de_validate(self):
         # #2665/B1 cx2 : un git local dormant (contrats, HEAD, chemin du
         # plan, relecture après run) ne dépasse plus l'échéance ; le refus est
-        # une indisponibilité, pas une sélection fausse.
-        seen = {}
+        # une indisponibilité, pas une sélection fausse. #6345 : horloge
+        # injectée, figée hors du git ; sous charge, une échéance réelle de
+        # 30 ms s'épuisait avant le premier git et le test ne prouvait rien.
+        now = [0.0]
+        seen = []
 
         def git_runner(argv, **kwargs):
-            seen["timeout"] = kwargs.get("timeout")
-            subprocess.run(["sleep", "0.15"], timeout=kwargs.get("timeout"))
-            return _Proc(0, A + "\n")
+            seen.append(kwargs.get("timeout"))
+            # git dormant : il consomme tout son délai, puis expire
+            now[0] += kwargs["timeout"]
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
 
-        began = time.monotonic()
         with self.assertRaises(pv.PrevalidationError) as caught:
             pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                         params=params(), repo=self.tmp.name,
                         runner=runner_for(0, flux()),
                         snapshotter=snapshot_for(), git_runner=git_runner,
-                        deadline=pv.Deadline(0.03))
+                        deadline=pv.Deadline(0.03, clock=lambda: now[0]))
         self.assertEqual(caught.exception.cause, "run-incomplete")
-        self.assertLess(time.monotonic() - began, 0.2)
-        self.assertIsNotNone(seen.get("timeout"))
-        self.assertLessEqual(seen["timeout"], 0.03)
+        self.assertIn("pendant git", str(caught.exception))
+        self.assertEqual(seen, [0.03])
+        self.assertEqual(now[0], 0.03)
 
     def test_lanceur_de_part_du_bloc_dans_la_commande(self):
         """Le bloc nomme le lanceur de part : il part tel quel sur la VM."""
