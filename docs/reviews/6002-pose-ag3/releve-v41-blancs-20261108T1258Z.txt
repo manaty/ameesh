@@ -1,0 +1,15 @@
+# blancs #6002 v4.1, aucun --apply, 2026-11-08T12:58:28Z
+préalables OK ; runners actifs : ameesh-runner-agent@ameesh-cx3.service ameesh-runner-agent@ameesh-dev1.service ameesh-runner-agent@ameesh-dev2.service ameesh-runner-agent@ameesh-dev4.service ameesh-runner-agent@ameesh-dev7.service ameesh-runner-agent@claude1.service ameesh-runner-agent@claude2.service ameesh-runner-agent@codex2.service 
+accès au venv : ACL u:vm-operator:--x sur 4 parents (décision #200777 O1)
+(contrôle seul, aucun effet)
+rc=0
+préalables base OK
+(contrôle seul, aucun effet)
+rc=0
+état avant retour :
+  reçus absents (retour sans reçus : ACL non restaurée)
+(à blanc, aucun effet)
+rc=0
+symbolic link root 777 /usr/bin/python3
+regular file root 755 /usr/bin/python3.12
+ameesh:600 /home/ameesh/.config/ameesh/env
