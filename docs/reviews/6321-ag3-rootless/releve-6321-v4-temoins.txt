@@ -1,0 +1,33 @@
+## temoin-6321-v3.py sur v4
+OK   copie interrompue : arrêt de la source consigné AVANT (intention stop_source src1)
+OK   copie interrompue : le retour relance la source arrêtée
+OK   cible créée sans santé : ID consigné avant l attente (targets)
+OK   cible sans santé : le retour la reconnaît (étiquette 6321) et l arrête
+OK   conteneur rootless sans étiquette : retour refusé (charge inconnue)
+OK   phase C --apply hors fenêtre : refus avant toute mutation
+OK   retour hors fenêtre sans secours : refusé
+OK   retour hors fenêtre avec secours + courrier : accepté et consigné
+## temoin-6321-v3-fonctions.py sur v4
+OK   packages_sha256 trouve la bonne strophe
+OK   packages_sha256 : autre version → None
+OK   containerd_proof : origine noble-updates et sha256 du .deb = index
+OK   containerd_proof : .deb absent du cache → dit, non comparé
+OK   .deb altéré → refus
+OK   origine autre que noble-updates → refus
+OK   ports 127.0.0.1 seulement + garde refusant les 4 ports → OK
+OK   55441 aussi sur 0.0.0.0 → refus
+OK   55443 sur :: → refus
+OK   jeu chargé sans 55442 (texte conforme) → refus
+OK   garde sans 55442 → refus
+## temoin-6321-v4.py
+OK   B3 : conteneur démarré, « Permission denied » → preuve acceptée (dossier retiré)
+OK   B3 : dossier de fixture 0711, fixture 0600 au moment du montage
+OK   B3 : erreur de montage (faux positif v3) → KO
+OK   B3 : contenu lu → KO
+OK   B3 : rc 1 sans « Permission denied » → KO
+OK   groupe : intention sauvée, gpasswd fait (ameesh absent) → rétabli
+OK   groupe : intention sauvée, gpasswd jamais fait (ameesh présent) → rien
+OK   groupe : aucune intention → rien
+OK   restauration : .config/docker créé par la pose → retiré
+OK   restauration : environment.d non vide (fichier étranger) → gardé et signalé
+OK   restauration : fichier de la pose retiré, fichier étranger intact

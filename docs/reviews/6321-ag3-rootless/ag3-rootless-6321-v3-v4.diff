@@ -1,0 +1,168 @@
+--- ag3-rootless-6321-v3.py	2026-11-08 14:06:02.662538447 +0000
++++ ag3-rootless-6321-v4.py	2026-11-08 14:14:35.601046564 +0000
+@@ -1,4 +1,12 @@
+-"""#6321 v3 (avis impl-11 #200929) — B1 intentions et identités persistées AVANT chaque mutation
++"""#6321 v4 (avis impl-03 #200943) — B3 témoin de lecture protégée réel : fixture root 0600 dans
++/var/lib/ameesh-operator-6321-fixture (root 0711, traversable par le démon rootless), conteneur qui
++DÉMARRE et stderr « Permission denied », toute erreur de montage = KO ; N : santé en phase B avec
++délai, unités approuvées complètes (docker.service, dbus.service), intention de retrait du groupe
++sauvée AVANT gpasswd et retour sur l'état réel du groupe, valeurs des avis non nulles, sudo -n -l
++sous ameesh, retour qui retire les répertoires créés s'ils étaient absents, ROOT jamais créé par le
++script (l'opérateur le crée avec l'autorité), preuve O7 avant le SQL.
++
++#6321 v3 (avis impl-11 #200929) — B1 intentions et identités persistées AVANT chaque mutation
+ (volume, arrêt de source, création de cible ; ID de cible écrit avant l'attente de santé), retour qui
+ réconcilie l'état Docker réel avec ces identités et l'étiquette ameesh.operator=6321 ; B2 garde de
+ fenêtre en phase C avant toute mutation, retour soumis à la même garde sauf secours explicite
+@@ -222,6 +230,7 @@
+         assert a.get(key) is True, 'Préalable manquant : ' + key
+     assert 0 <= time.time() - a['verified_epoch'] < 600, 'Autorité périmée'
+     assert a.get('pilot_go_mail', 0) > 0 and set(a.get('reviews', {})) == {'codex', 'deepseek'}
++    assert all(isinstance(v, int) and v > 0 for v in a['reviews'].values()), 'avis sans identifiant de courrier'
+     return a
+ 
+ 
+@@ -246,7 +255,9 @@
+     """À blanc, rien n'est créé sur l'hôte (pas même le dossier de reçus)."""
+     assert os.geteuid() == 0 and os.uname().nodename == HOST
+     if apply:
+-        ROOT.mkdir(mode=0o700, exist_ok=True)
++        # v4 (N #200943) : le script ne crée jamais ROOT ; l'opérateur le crée en root 0700 en y écrivant
++        # l'autorité. Un --apply hors fenêtre ne laisse donc aucun dossier.
++        assert ROOT.is_dir(), 'ROOT absent : créer /root/ameesh-operator-6321-AG3 (0700) avec l autorité'
+     if ROOT.exists():
+         st = ROOT.lstat()
+         assert not ROOT.is_symlink() and st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o700
+@@ -312,6 +323,36 @@
+     return proof
+ 
+ 
++FIXTURE_DIR = Path('/var/lib/ameesh-operator-6321-fixture')
++
++
++def protected_read_probe():
++    """B3 (#200943) : fixture root 0600 dans un dossier root 0711 que le démon rootless (uid 1001) peut
++    traverser pour le montage. Le conteneur doit DÉMARRER et cat doit échouer sur « Permission denied »
++    (root du conteneur = uid mappé, sans droit sur le fichier) ; une erreur de montage ou de démarrage
++    n'est pas une preuve : KO. Dossier et fixture retirés ensuite."""
++    assert not FIXTURE_DIR.exists(), 'dossier de fixture déjà présent : réconcilier'
++    FIXTURE_DIR.mkdir(mode=0o711)
++    os.chmod(FIXTURE_DIR, 0o711)
++    fixture = FIXTURE_DIR / 'protected'
++    try:
++        fd = os.open(fixture, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++        with os.fdopen(fd, 'wb') as out:
++            out.write(b'fixture operateur 6321\n')
++        probe = docker(RL, 'run', '--rm', '--network=none', '--label=ameesh.operator=6321',
++                       '--mount', 'type=bind,src=' + str(fixture) + ',dst=/protected,readonly',
++                       '--entrypoint=/bin/cat', IMAGES['postgres:17'], '/protected', allow_error=True)
++        err = probe.stderr.decode(errors='replace')
++        assert not probe.stdout, 'Conteneur rootless a LU un fichier root 0600'
++        assert probe.returncode == 1 and 'Permission denied' in err, 'Pas de refus de lecture prouvé (rc %d)' % probe.returncode
++        assert not any(x in err for x in ('error mounting', 'OCI runtime', 'invalid mount', 'no such file or directory', 'Error response from daemon')), \
++            'Erreur de montage ou de démarrage : ce n est pas un refus de lecture'
++    finally:
++        if fixture.exists():
++            fixture.unlink()
++        FIXTURE_DIR.rmdir()
++
++
+ def ports_and_guest_gate():
+     """O7 (#200904) : les ports PG n'écoutent que sur 127.0.0.1 ; la garde d'invités les refuse (lecture)."""
+     rows = command(['ss', '-ltnH']).stdout.decode().splitlines()
+@@ -394,6 +435,8 @@
+  elif stat.S_ISREG(s.st_mode):row.update(type='file',data=base64.b64encode(p.read_bytes()).decode())
+  else:raise RuntimeError('type inattendu')
+  out[name]=row
++for name in ['.docker','.config/docker','.config/environment.d']:
++ if not (h/name).exists():out[name]={'type':'dir_absent'}
+ print(json.dumps(out))'''
+     write_private(ROOT / 'home-config-before.private.json', user(['/usr/bin/python3', '-I', '-c', snapshot]).encode())
+     for op, a in [('enabled', ['list-unit-files', '--no-pager', '--output=json']),
+@@ -505,6 +548,7 @@
+     for name in a['targets']:
+         assert inspect(RL, name)['State']['Health']['Status'] == 'healthy'
+     approved = set(proof['approved_active_units'])
++    assert {'docker.service', 'dbus.service'} <= approved, 'approved_active_units incomplet (docker.service, dbus.service, scopes actifs)'
+     for row in before:
+         if '/init.scope' in row['cgroup']:
+             continue
+@@ -540,6 +584,7 @@
+ with os.fdopen(fd,'w') as f:f.write('DOCKER_HOST=unix:///run/user/1001/docker.sock\n');f.flush();os.fsync(f.fileno())
+ print(json.dumps({'new_files':['.config/environment.d/90-ameesh-docker-rootless.conf']}))'''
+     save('client mis à jour sous UID1001', **json.loads(user(['/usr/bin/python3', '-I', '-c', configure])))
++    save('intention : retrait du groupe docker', docker_group_removal_intent=True)
+     command(['gpasswd', '--delete', 'ameesh', 'docker'])
+     assert 'ameesh' not in grp.getgrnam('docker').gr_mem
+     save('groupe docker retiré ; redémarrage du gestionnaire', docker_group_removed=True, manager_restart_requested=True)
+@@ -557,7 +602,10 @@
+     assert not forbidden.intersection(groups)
+     assert deny_rootful_as_uid1001()['denied'], 'Socket rootful encore accessible'
+     for name in a['targets']:
+-        assert inspect(RL, name)['State']['Health']['Status'] == 'healthy', name + ' après redémarrage'
++        deadline = time.monotonic() + 180
++        while inspect(RL, name)['State'].get('Health', {}).get('Status') != 'healthy':
++            assert time.monotonic() < deadline, name + ' : santé non revenue après redémarrage du gestionnaire'
++            time.sleep(2)
+     assert user(['docker', 'context', 'show']) == (ROOT / 'docker-context-before.json').read_text()
+     save('phase B terminée ; SQL réel, doctor, tour d agent et attestation à suivre',
+          after_processes=len(after), fresh_groups=groups, rootful_socket_denied=True, rootless_PG_healthy=True)
+@@ -587,14 +635,12 @@
+     sudo = command(['env', 'LC_ALL=C', 'sudo', '-n', '-l', '-U', 'ameesh'], allow_error=True)
+     message = (sudo.stdout + sudo.stderr).decode()
+     assert 'not allowed' in message and 'NOPASSWD:' not in message
+-    fixture = ROOT / 'protected-read-fixture'
+-    fd = os.open(fixture, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+-    with os.fdopen(fd, 'wb') as out:
+-        out.write(b'fixture operateur 6321\n')
+-    probe = docker(RL, 'run', '--rm', '--network=none', '--mount', 'type=bind,src=' + str(fixture) + ',dst=/protected,readonly',
+-                   '--entrypoint=/bin/cat', IMAGES['postgres:17'], '/protected', allow_error=True)
+-    assert probe.returncode != 0 and not probe.stdout, 'Conteneur rootless lit un fichier root 0600'
+-    save('sudo refusé, lecture protégée refusée')
++    # v4 (N #200943) : témoin direct sous ameesh, comme #5781.
++    assert command(user_args(['sudo', '-n', '-l']), allow_error=True).returncode != 0, 'sudo -n -l accepté sous ameesh'
++    protected_read_probe()
++    save('sudo refusé, lecture protégée refusée (conteneur démarré, Permission denied)')
++    ports = ports_and_guest_gate()  # v4 : preuve O7 AVANT le SQL
++    save('ports et garde d invités vérifiés', ports_guest_gate=ports)
+     prepare = "import pathlib,tempfile;d=pathlib.Path.home()/'.local/state/ameesh/operators';d.mkdir(parents=True,exist_ok=True);print(tempfile.mkdtemp(prefix='6321-sql-',dir=d))"
+     workdir = user(['/usr/bin/python3', '-I', '-c', prepare])
+     archive = command(user_args(['git', '--no-replace-objects', '-C', HOME + '/work/ameesh-release', '-c', 'core.hooksPath=/dev/null',
+@@ -626,8 +672,6 @@
+     write_private(ROOT / 'phase-C-menage.private.json', menage.stdout)
+     assert menage.returncode == 0
+     json.loads(menage.stdout)
+-    ports = ports_and_guest_gate()
+-    save('ports et garde d invités vérifiés', ports_guest_gate=ports)
+     save('vérifications locales passées ; levée du drainage, tour réel et attestation à suivre',
+          real_SQL_psql_passed=True, doctor_passed=True, housekeeping_dryrun_passed=True, test_workdir=workdir)
+     print(json.dumps(record))
+@@ -682,8 +726,10 @@
+ extra=h/'.config/environment.d/90-ameesh-docker-rootless.conf'
+ if extra.exists() and '.config/environment.d/90-ameesh-docker-rootless.conf' not in p:
+  assert extra.read_bytes()==b'DOCKER_HOST=unix:///run/user/1001/docker.sock\n';remove(extra)
++dirs=[]
+ for name,row in p.items():
+  path=h/name
++ if row['type']=='dir_absent':dirs.append(path);continue
+  if row['type']=='absent':remove(path);continue
+  if row['type']=='symlink':remove(path);os.symlink(row['target'],path);continue
+  path.parent.mkdir(parents=True,exist_ok=True);fd,tmp=tempfile.mkstemp(prefix='.6321-retour-',dir=path.parent)
+@@ -692,9 +738,15 @@
+   os.chmod(tmp,row['mode']);os.replace(tmp,path)
+  finally:
+   if os.path.exists(tmp):os.unlink(tmp)
+-print(json.dumps({'restored':True}))'''
++left=[]
++for d in sorted(dirs,key=lambda x:len(x.parts),reverse=True):
++ if d.is_dir() and not d.is_symlink():
++  if any(d.iterdir()):left.append(str(d))
++  else:d.rmdir()
++print(json.dumps({'restored':True,'dirs_left_non_empty':left}))'''
+         assert json.loads(user_json(restore, json.loads(snap.read_text())))['restored']
+-    if b.get('docker_group_removed'):
++    # v4 (N #200943) : l'intention est sauvée AVANT gpasswd ; le retour suit l'état réel du groupe.
++    if (b.get('docker_group_removal_intent') or b.get('docker_group_removed')) and 'ameesh' not in grp.getgrnam('docker').gr_mem:
+         command(['gpasswd', '--add', 'ameesh', 'docker'])
+         assert 'ameesh' in grp.getgrnam('docker').gr_mem
+         command(['systemctl', 'restart', 'user@1001.service'], timeout=180)
