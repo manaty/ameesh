@@ -196,6 +196,12 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA_RE = re.compile(r"[0-9a-f]{7,64}", re.IGNORECASE)
 CONTRACT_ALWAYS = "tests/parts/toujours.txt"
 CONTRACT_MODULES = ("tests.test_l161f_plan", "tests.test_cluster")
+#: #6274 : les outils de la convention d'ameesh ; un projet les remplace par
+#: son bloc `prevalidation` (`plan_script`, `parts_script`, `contracts`)
+DEFAULT_PLAN_SCRIPT = "scripts/test-plan.py"
+DEFAULT_PARTS_SCRIPT = "scripts/test-parts.py"
+#: le plan des contrats écrit hors de l'arbre composé pour le lanceur déclaré
+DECLARED_PART_LABEL = "contrats"
 COMPOSE_SCRIPT = "scripts/paquet-compose.py"
 CANDIDATES_SCRIPT = "scripts/paquet-candidats.py"
 INCLUSION_SCRIPT = "scripts/paquet-inclusion.py"
@@ -1679,9 +1685,146 @@ def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Tooling:
+    """#6274 : les outils de contrats du projet composé.
+
+    `declared` : le bloc `prevalidation` du projet nomme un lanceur de part
+    autre que la convention d'ameesh. Le composeur lit alors le plan par le
+    `plan_script` déclaré (contrat d'appel de #6186), garde les identités de
+    module telles que l'adaptateur les rend (opaques : `x.spec.ts`) et joue
+    les contrats par le lanceur déclaré (`run --plan --part --driver
+    --flow`), jamais par `unittest`. Sinon, la convention d'ameesh s'applique
+    à l'identique (liste « toujours », modules `tests.*`, unittest natif).
+    """
+    plan_script: str = DEFAULT_PLAN_SCRIPT
+    parts_script: str = ""
+    contracts: tuple[str, ...] = (CONTRACT_ALWAYS,)
+    project: str = ""
+
+    @property
+    def declared(self) -> bool:
+        return bool(self.parts_script) and self.parts_script != DEFAULT_PARTS_SCRIPT
+
+
+LEGACY_TOOLING = Tooling()
+_TOOLING: Tooling = LEGACY_TOOLING
+
+
+def resolve_tooling(project: str, *, log=print) -> Tooling:
+    """Le bloc `prevalidation` du projet, relu au canon configuré (#6274).
+
+    Sans projet, ou sans bloc lisible, la convention d'ameesh (N-1) : le
+    composeur d'un dépôt ameesh se comporte comme avant. Le nom du projet
+    vient de l'appelant (`--pause-project`), jamais d'un littéral du moteur.
+    """
+    project = (project or "").strip()
+    if not project:
+        return LEGACY_TOOLING
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+        from ameesh import config, prevalidation_calls
+        params = prevalidation_calls.parameters(config.load(), project).params
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — absence = convention
+        log("outils de contrats : convention d'ameesh (bloc de %s illisible : %s)"
+            % (project, _one_line(str(exc))[:200]))
+        return LEGACY_TOOLING
+    contracts = tuple(str(path) for path in (getattr(params, "contracts", ()) or ())
+                      if str(path).strip()) or (CONTRACT_ALWAYS,)
+    return Tooling(plan_script=str(getattr(params, "plan_script", None)
+                                   or DEFAULT_PLAN_SCRIPT),
+                   parts_script=str(getattr(params, "parts_script", None) or ""),
+                   contracts=contracts, project=project)
+
+
+def _contract_names(worktree: Path, rel: str) -> list[str]:
+    path = worktree / rel
+    if not path.is_file():
+        raise PaquetAutoError("%s absent de l'arbre composé" % rel)
+    names = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name = line.split("#", 1)[0].strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def declared_plan(worktree: Path, tooling: Tooling, *, base: str,
+                  timeout: float) -> dict:
+    """Le plan du projet par son adaptateur déclaré (#6186, #6274).
+
+    Même appel que la prévalidation (`plan --out --event --ref --base --mode
+    lot`, `AMEESH_PROJECT`), script lu dans l'arbre composé ; le bloc
+    `contract_plan` est relu par le lecteur de ce script (schéma stable) et
+    doit porter la tête composée. Aucune condition sur la présence de
+    `src/ameesh` dans le dépôt candidat.
+    """
+    script = worktree / tooling.plan_script
+    if not script.is_file():
+        raise PaquetAutoError("%s absent de l'arbre composé" % tooling.plan_script)
+    with tempfile.TemporaryDirectory(prefix="contract-plan-") as temporary:
+        output = Path(temporary) / "plan.json"
+        env = dict(os.environ, AMEESH_PROJECT=tooling.project) if tooling.project \
+            else dict(os.environ)
+        proc = run_command(
+            [project_python(worktree), str(script), "plan", "--out", str(output),
+             "--event", "workflow_dispatch", "--ref", "", "--base", base,
+             "--mode", "lot"], cwd=worktree, timeout=max(0.1, timeout), env=env)
+        if proc.returncode:
+            raise PaquetAutoError("plan déclaré illisible : " + _tail(_output(proc), 3))
+        try:
+            plan = json.loads(output.read_text(encoding="utf-8"))
+            shared = plan["contract_plan"]
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from ameesh import contract_plan
+            contract_plan.consume(shared)
+            if shared["commit"] != _decode(git(worktree, "rev-parse", "HEAD").stdout).strip():
+                raise ValueError("contract plan candidate differs")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise PaquetAutoError("plan déclaré illisible : " + str(exc)) from exc
+    return plan
+
+
+def declared_contract_modules(worktree: Path, tooling: Tooling, *, base: str = "",
+                              timeout: float = GIT_TIMEOUT) -> list[str]:
+    """#6274 : contrats déclarés + plan actif, identités préservées.
+
+    Ni préfixe `tests.`, ni modules propres à ameesh : une identité vaut si
+    l'inventaire du plan la porte, sinon si c'est un fichier de l'arbre.
+    """
+    modules: list[str] = []
+    for rel in tooling.contracts:
+        modules.extend(_contract_names(worktree, rel))
+    inventory: set[str] = set()
+    if base:
+        plan = declared_plan(worktree, tooling, base=base, timeout=timeout)
+        shared = plan["contract_plan"]
+        inventory = set(shared.get("inventory") or ())
+        if shared["active"]:
+            modules.extend(shared["modules"] if (plan.get("map") or {}).get("used")
+                           else shared["contracts"])
+    out: list[str] = []
+    for module in modules:
+        if module in out:
+            continue
+        if module not in inventory and not (worktree / module).is_file():
+            raise PaquetAutoError(
+                "module de test %s absent de l'arbre composé et de l'inventaire du plan"
+                % module)
+        out.append(module)
+    return out
+
+
 def contract_modules(worktree: Path, *, base: str = "",
-                     timeout: float = GIT_TIMEOUT) -> list[str]:
-    """La liste « toujours », `test_l161f_plan` et `test_cluster`."""
+                     timeout: float = GIT_TIMEOUT,
+                     tooling: Tooling | None = None) -> list[str]:
+    """La liste « toujours », `test_l161f_plan` et `test_cluster`.
+
+    #6274 : un projet au lanceur déclaré passe par
+    `declared_contract_modules`."""
+    tooling = tooling or _TOOLING
+    if tooling.declared:
+        return declared_contract_modules(worktree, tooling, base=base, timeout=timeout)
     path = worktree / CONTRACT_ALWAYS
     if not path.is_file():
         raise PaquetAutoError("%s absent de l'arbre composé" % CONTRACT_ALWAYS)
@@ -1699,7 +1842,7 @@ def contract_modules(worktree: Path, *, base: str = "",
         with tempfile.TemporaryDirectory(prefix="contract-plan-") as temporary:
             output = Path(temporary) / "plan.json"
             proc = run_command(
-                [project_python(worktree), str(worktree / "scripts/test-plan.py"),
+                [project_python(worktree), str(worktree / tooling.plan_script),
                  "plan", "--out", str(output), "--base", base, "--mode", "lot",
                  "--local-map"], cwd=worktree, timeout=max(0.1, timeout),
                 env=python_env(worktree))
@@ -2086,11 +2229,129 @@ def contract_order(worktree: Path, modules: list[str]) -> list[str]:
     return sorted(modules, key=order)
 
 
+@dataclass
+class FlowTestRun(TestRun):
+    """#6274 : une part jouée par le lanceur déclaré, lue sur son flux.
+
+    Le flux `ameesh-test-event/1` (lu par `prevalidation.parse_flow`) fait
+    foi, pas une sortie unittest : vert = code 0, une fin `succes`, aucun
+    échec ; rouge = un test en échec hors environnement ; le reste (délai,
+    fin absente, échecs d'environnement seuls) est non concluant.
+    """
+    flow: dict = field(default_factory=dict)
+
+    @property
+    def failed_tests(self) -> list[str]:
+        environment = set(self.flow.get("environment") or ())
+        return [name for name in self.flow.get("failed") or ()
+                if name not in environment]
+
+    @property
+    def finished(self) -> bool:
+        return (not self.timed_out and self.returncode is not None
+                and bool(self.flow.get("fins")))
+
+    @property
+    def green(self) -> bool:
+        return (self.returncode == 0 and self.finished
+                and all(fin == "succes" for fin in self.flow["fins"])
+                and not self.flow.get("failed"))
+
+    @property
+    def real_failure(self) -> bool:
+        return not self.timed_out and self.returncode is not None \
+            and bool(self.failed_tests)
+
+    @property
+    def inconclusive(self) -> bool:
+        return not self.green and not self.real_failure
+
+    @property
+    def tests(self) -> int:
+        return int(self.flow.get("tests") or 0)
+
+    @property
+    def skipped(self) -> int:
+        return 0
+
+    def motive(self) -> str:
+        if self.timed_out:
+            return "délai dépassé"
+        if not self.flow.get("fins"):
+            return "flux sans fin de part (code %s)" % self.returncode
+        if self.flow.get("environment"):
+            return "échecs d'environnement seuls : %s" % ", ".join(
+                self.flow["environment"][:3])
+        return "résultat non concluant (code %s)" % self.returncode
+
+
+def run_declared_contracts(worktree: Path, modules: list[str], *, end: float,
+                           tooling: Tooling) -> FlowTestRun:
+    """#6274 : les contrats en une part du lanceur déclaré, sous `heavy`.
+
+    Même appel que la prévalidation (`prevalidation.remote_script`) : `run
+    --plan --part 1 --driver contrats --flow`. Le plan de la part est écrit
+    hors de l'arbre composé : l'arbre testé reste celui du manifeste.
+    """
+    from ameesh import prevalidation
+    start = time.monotonic()
+    remaining = int(end - time.monotonic())
+    if remaining <= 0:
+        run = budget_spent("contrats", modules)
+        return FlowTestRun(run.label, run.modules, None, run.output, 0.0,
+                           timed_out=True)
+    launcher = worktree / tooling.parts_script
+    if not launcher.is_file():
+        return save_test_log(FlowTestRun(
+            "contrats", list(modules), None,
+            "%s absent de l'arbre composé" % tooling.parts_script, 0.0,
+            timed_out=True))
+    with tempfile.TemporaryDirectory(prefix="contrats-declares-") as temporary:
+        plan = Path(temporary) / "plan.json"
+        flow = Path(temporary) / "flux.jsonl"
+        plan.write_text(json.dumps({
+            "schema": "ameesh-test-plan/1", "mode": "lot",
+            "head": _decode(git(worktree, "rev-parse", "HEAD").stdout).strip(),
+            "parts": {DECLARED_PART_LABEL: [{
+                "part": 1, "of": 1, "label": DECLARED_PART_LABEL,
+                "modules": list(modules), "estimate_s": 0.0}]},
+            "contract": list(modules)}), encoding="utf-8")
+        cmd = [project_python(worktree), str(launcher), "run", "--plan", str(plan),
+               "--part", "1", "--driver", DECLARED_PART_LABEL, "--flow", str(flow)]
+        env = dict(os.environ, AMEESH_PROJECT=tooling.project) if tooling.project \
+            else dict(os.environ)
+        wrapper = shutil.which("ameesh")
+        if wrapper:
+            cmd = [wrapper, "heavy", "--max-duration", "%ds" % remaining, "--", *cmd]
+        proc = run_walled(cmd, cwd=worktree, env=env, wall=remaining)
+        try:
+            events = flow.read_text(encoding="utf-8")
+        except OSError:
+            events = ""
+    parsed = prevalidation.parse_flow(events)
+    if proc is None:
+        return save_test_log(FlowTestRun(
+            "contrats", list(modules), None,
+            "borne des contrats atteinte après %d s (lanceur déclaré)" % remaining,
+            time.monotonic() - start, timed_out=True, flow=parsed))
+    capped = bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT
+    output = _output(proc)
+    if parsed["failed"]:
+        output = "\n".join(["échecs (flux) : " + ", ".join(parsed["failed"]), output])
+    return save_test_log(FlowTestRun(
+        "contrats", list(modules), proc.returncode, output,
+        time.monotonic() - start, timed_out=capped, flow=parsed))
+
+
 def run_contract_modules(worktree: Path, modules: list[str], *,
-                         end: float, parallel: int) -> ContractTestRun:
+                         end: float, parallel: int,
+                         tooling: Tooling | None = None) -> TestRun:
     """One isolated heavy process per module under a shared wall deadline."""
     if not modules:
         return ContractTestRun("contrats", [], None, "aucun contrat sélectionné", 0.0)
+    tooling = tooling or _TOOLING
+    if tooling.declared:
+        return run_declared_contracts(worktree, modules, end=end, tooling=tooling)
     stop = threading.Event()
     def module_job(module):
         def run():
@@ -3165,6 +3426,14 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             log("tests contrats : plan indisponible (non concluant) : %s" % exc)
             return TestRun("contrats", [], None, "plan indisponible : %s" % exc,
                            0.0, timed_out=True)
+        if _TOOLING.declared:
+            # #6274 : identités opaques, jamais `unittest` ; même borne.
+            limit = series_timeout(timeout, deadline)
+            if limit is None:
+                return budget_spent("contrats", modules)
+            return run_declared_contracts(worktree, modules,
+                                          end=time.monotonic() + limit,
+                                          tooling=_TOOLING)
         return bounded("contrats", modules)
 
     jobs = [unit_job("unité #%d" % unit.lot, modules)
@@ -3306,7 +3575,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             "continue" % contract.motive())
     elif not contract.green:
         contract_red = True
-        red.append((contract, unittest_failures(contract.output)))
+        red.append((contract, [{"test": name, "module": ""}
+                               for name in contract.failed_tests]
+                    if isinstance(contract, FlowTestRun)
+                    else unittest_failures(contract.output)))
         log("tests contrats : ROUGE (%d modules)\n%s"
             % (len(modules), _tail(contract.output)))
     else:
@@ -5239,6 +5511,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         _PYTHON_OVERRIDE = str(Path(args.python).resolve())
 
+    global _TOOLING
+    _TOOLING = resolve_tooling(args.pause_project)
+    if _TOOLING.declared:
+        print("outils de contrats déclarés par %s : plan %s, lanceur %s, contrats %s"
+              % (_TOOLING.project, _TOOLING.plan_script, _TOOLING.parts_script,
+                 ", ".join(_TOOLING.contracts)), flush=True)
     try:
         if args.contracts_budget is not None and args.contracts_budget <= 0:
             raise InputError("--contracts-budget doit être strictement positif")
