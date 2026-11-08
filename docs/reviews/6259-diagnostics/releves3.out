@@ -1,0 +1,13 @@
+== timers liés
+aucun
+== cron
+e2scrub_all
+sysstat
+aucune mention dans cron
+== conteneurs
+p393test postgres:17
+== unités memoria-*export*
+memoria-public-export-preflight-20261029.service: path=/opt/memoria-tools/node-v26.8.1-linux-x64/bin/node
+memoria-slack-export-account-pass-timer-restoration.service: path=/usr/bin/python3
+memoria-slack-export-account-pass.service: path=/usr/bin/python3
+== mention pg_stat_statements dans les scripts memoria
