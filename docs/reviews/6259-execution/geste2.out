@@ -1,0 +1,8 @@
+== role-superviseur.sql
+psql:_contrat-superviseur.sql:358: NOTICE:  contrat du rôle ameesh_superviseur tenu dans le schéma public
+== role-superviseur-contenus.sql
+psql:_contrat-superviseur.sql:358: NOTICE:  contrat du rôle ameesh_superviseur_contenus tenu dans le schéma public
+== role-auditeur.sql
+ameesh_superviseur|f|
+ameesh_superviseur_contenus|f|
+auditeur_lecture|t|{default_transaction_read_only=on,jit=off}

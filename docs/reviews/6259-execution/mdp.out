@@ -1,0 +1,4 @@
+600 ameesh 83 /home/ameesh/.config/ameesh/auditeur.pgpass
+1|auditeur_lecture|on|t
+ERROR:  cannot execute CREATE TABLE in a read-only transaction
+rc=0

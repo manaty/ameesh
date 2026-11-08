@@ -1,0 +1,11 @@
+e86833011a10db91
+delta-rc=0
+ERROR:  trailing junk after numeric literal at or near "957510diagnostics957510"
+LINE 1: ...e, (select nspacl from pg_namespace where nspname=957510diag...
+                                                             ^
+extname | extversion | schema | acl | public_vue
+pg_stat_statements | 1.11 | diagnostics | {postgres=UC/postgres} | 
+(1 row)
+appels_ok
+4955
+(1 row)
