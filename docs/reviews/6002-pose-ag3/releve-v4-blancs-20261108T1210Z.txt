@@ -1,0 +1,21 @@
+# blancs #6002 v4, aucun --apply, 2026-11-08T12:10:03Z
+préalables OK ; runners actifs : ameesh-runner-agent@ameesh-cx3.service ameesh-runner-agent@ameesh-dev1.service ameesh-runner-agent@ameesh-dev2.service ameesh-runner-agent@ameesh-dev4.service ameesh-runner-agent@ameesh-dev7.service ameesh-runner-agent@claude1.service ameesh-runner-agent@claude2.service ameesh-runner-agent@codex2.service 
+accès au venv : aucun
+(contrôle seul, aucun effet)
+rc=0
+préalables OK ; runners actifs : ameesh-runner-agent@ameesh-cx3.service ameesh-runner-agent@ameesh-dev1.service ameesh-runner-agent@ameesh-dev2.service ameesh-runner-agent@ameesh-dev4.service ameesh-runner-agent@ameesh-dev7.service ameesh-runner-agent@claude1.service ameesh-runner-agent@claude2.service ameesh-runner-agent@codex2.service 
+accès au venv : acl
+(contrôle seul, aucun effet)
+rc=0
+préalables base OK
+(contrôle seul, aucun effet)
+rc=0
+état avant retour :
+  reçus absents (retour sans reçus : ACL non restaurée)
+(à blanc, aucun effet)
+rc=0
+rôles|
+fonction|0
+sessions|0
+(à blanc, aucun effet)
+rc=0
