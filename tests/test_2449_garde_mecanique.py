@@ -126,6 +126,8 @@ POSITIVE = {
         '# prevalidation\ncontracts = ("tests/parts/toujours.txt",)\n',
     "prevalidation.hosts":
         '# prevalidation\nhosts = ("ameesh-agents-1",)\n',
+    "prevalidation.plan_script":
+        '# prevalidation\nplan_script = "scripts/plan-project.py"\n',
     "prevalidation.parts_script":
         '# prevalidation\nparts_script = "scripts/test-parts.py"\n',
     "prevalidation.timeout_seconds": "# prevalidation\ntimeout_seconds = 7200\n",

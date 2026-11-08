@@ -9,9 +9,12 @@ Operations are Git A/M/D/R/C/T/U statuses. Overlapping path rules are
 ambiguous and trigger the conservative fallback; universal rules are additive.
 
 The caller supplies the complete test-module inventory at the *same* candidate
-commit (including its project-specific discovery conventions). Fallback selects
-that entire inventory and requests full-suite execution; an empty inventory
-refuses rather than returning a misleading empty plan. No tests are executed.
+commit (including its project-specific discovery conventions). A module name
+is an opaque project identity: ``test_cluster`` and
+``suite/example.spec.ts`` are both valid, so the engine carries no
+project layout. Fallback selects that entire inventory and requests full-suite
+execution; an empty inventory refuses rather than returning a misleading empty
+plan. No tests are executed.
 """
 from __future__ import annotations
 
@@ -35,6 +38,25 @@ def relative_path(value: str) -> bool:
     return (isinstance(value, str) and bool(value) and not value.startswith("/")
             and not any(c in value for c in "\\\x00\n\r:")
             and all(p not in ("", ".", "..") for p in value.split("/")))
+
+
+#: Une identité de module est une chaîne opaque et stable pour le sélecteur :
+#: le nom d'un module Python (`test_cluster`), d'un fichier de test ou d'un
+#: groupe d'un autre projet (`suite/example.spec.ts`). Le moteur
+#: ne suppose donc aucune convention de nommage : il refuse seulement ce qui
+#: n'est pas un identifiant relatif, unique et sans caractère de contrôle.
+_MODULE = re.compile(r"[A-Za-z0-9_@][A-Za-z0-9_.+@/-]*")
+
+
+def module_name(value: str) -> bool:
+    """Une identité de module relisible, propre à la convention du projet."""
+    if (not isinstance(value, str) or not value or len(value) > 512
+            or value.strip() != value):
+        return False
+    parts = value.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return False
+    return bool(_MODULE.fullmatch(value))
 
 
 @dataclass(frozen=True)
@@ -117,7 +139,7 @@ def compile_registry(text: str) -> Registry:
             raise RegistryError("invalid paths or operations")
         if not paths and set(operations) != OPERATIONS:
             raise RegistryError("universal rule requires all operations")
-        if any(not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", m) for m in modules):
+        if any(not module_name(m) for m in modules):
             raise RegistryError("invalid module name")
         rules.append(Rule(name, paths, operations, modules))
     canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -140,7 +162,7 @@ def select(registry: Registry | None, changes, inventory, *, commit: str,
         supplied = tuple(inventory)
     except TypeError as exc:
         raise RegistryError("module inventory must be iterable") from exc
-    if not supplied or any(not isinstance(m, str) or not m for m in supplied):
+    if not supplied or any(not module_name(m) for m in supplied):
         raise RegistryError("nonempty candidate module inventory required")
     modules = tuple(sorted(set(supplied)))
     reasons: dict[str, set[str]] = {}

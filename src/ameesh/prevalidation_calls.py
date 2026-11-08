@@ -67,8 +67,9 @@ from . import land, lot_class, mechanics, plan_git, prevalidation, registry, wor
 from . import transverse_contracts
 from .deadline import Deadline
 
-#: le calculateur du plan L161f, lu dans l'arbre du candidat (convention ameesh)
-PLAN_SCRIPT = "scripts/test-plan.py"
+#: le calculateur du plan L161f, lu dans l'arbre du candidat (convention
+#: ameesh ; un projet le remplace par `prevalidation.plan_script`)
+DEFAULT_PLAN_SCRIPT = "scripts/test-plan.py"
 #: nom du plan écrit dans l'arbre du candidat (relatif, embarqué par l'offload)
 PLAN_NAME = "ameesh-prevalidation-plan.json"
 #: borne de la génération du plan (lecture du dépôt, pas une suite de tests)
@@ -399,14 +400,18 @@ def tooling(repo: str, head: str, params: Parameters, *,
             deadline: Deadline | None = None) -> None:
     """#2794 : le plan et le lanceur de part existent au SHA candidat.
 
-    Le bloc ``prevalidation`` global du canon vaut pour tous les projets, mais
-    ``scripts/test-plan.py`` et le lanceur de part sont des outils du dépôt
-    ameesh : un dépôt qui ne les porte pas (nexlink) n'est pas prévalidable.
-    Le refus est nommé ``tooling-missing`` avant tout arbre, carte ou hôte,
-    au lieu d'un ``can't open file`` de Python lu comme ``selection-unsafe``.
-    Une tête qui n'est pas un commit est laissée au refus de ``prepare``.
+    Le bloc ``prevalidation`` du canon du projet déclare ses outils : le script
+    de plan (``plan_script``) et le lanceur de part (``parts_script``). Absents,
+    la convention d'ameesh s'applique (``scripts/test-plan.py``,
+    ``scripts/test-parts.py``) ; un dépôt qui ne les porte pas n'est pas
+    prévalidable. Le refus est nommé ``tooling-missing`` avant tout arbre, carte
+    ou hôte, au lieu d'un ``can't open file`` de Python lu comme
+    ``selection-unsafe``. Une tête qui n'est pas un commit est laissée au refus
+    de ``prepare``.
     """
     full = str(head or "").strip().lower()
+    planner = str(getattr(params.params, "plan_script", None)
+                  or DEFAULT_PLAN_SCRIPT)
     launcher = str(getattr(params.params, "parts_script", None)
                    or prevalidation.DEFAULT_PARTS_SCRIPT)
     git = ["git", "-C", repo, *prevalidation.NO_REPLACE]
@@ -420,7 +425,7 @@ def tooling(repo: str, head: str, params: Parameters, *,
                 [*git, "rev-parse", "--verify", "--quiet", full + "^{commit}"],
                 capture_output=True, text=True, timeout=limit(60)).returncode:
             return
-        for path in (PLAN_SCRIPT, launcher):
+        for path in (planner, launcher):
             if subprocess.run([*git, "cat-file", "-e", "%s:%s" % (full, path)],
                               capture_output=True, text=True,
                               timeout=limit(60)).returncode:
@@ -430,7 +435,7 @@ def tooling(repo: str, head: str, params: Parameters, *,
     if absent:
         raise prevalidation.PrevalidationError(
             "tooling-missing", "%s absent de %s au SHA %s : le projet %s n'outille pas "
-            "la prévalidation (plan L161f et lanceur de part d'ameesh)"
+            "la prévalidation (plan L161f et lanceur de part déclarés)"
             % (", ".join(absent), repo, full[:12], params.project or "?"))
 
 
@@ -466,15 +471,19 @@ def _merge_base(repo: str, base: str, head: str, *, timeout: int = 120) -> str:
 
 
 def prepare(repo: str, head: str, base: str, *, map_path: str = "",
+            plan_script: str = DEFAULT_PLAN_SCRIPT, project: str = "",
             timeout: int = PLAN_TIMEOUT, deadline: Deadline | None = None) -> Prepared:
     """Construit un arbre détaché de ``head`` et y calcule le plan L161f.
 
-    Le script ``scripts/test-plan.py`` lu est celui du commit candidat ; la
-    carte mesurée est passée en lecture seule à ``--map`` quand l'appelant en
-    fournit une. L'arbre reste vivant jusqu'à ``Prepared.close()`` : le plan
-    doit rester dans l'arbre pour être embarqué dans la preuve. Avec
-    ``deadline`` (#2665), aucun appel git ni le plan ne dépasse le temps qui
-    reste au passage.
+    Le script lu est celui du commit candidat — ``plan_script`` déclaré par le
+    bloc ``prevalidation`` du projet, sinon la convention d'ameesh
+    ``scripts/test-plan.py``. ``AMEESH_PROJECT`` porte le projet au script pour
+    qu'il lise le registre de son propre canon ; absent, le script garde sa
+    convention. La carte mesurée est passée en lecture seule à ``--map`` quand
+    l'appelant en fournit une. L'arbre reste vivant jusqu'à
+    ``Prepared.close()`` : le plan doit rester dans l'arbre pour être embarqué
+    dans la preuve. Avec ``deadline`` (#2665), aucun appel git ni le plan ne
+    dépasse le temps qui reste au passage.
     """
     limit = deadline.timeout if deadline is not None else (lambda cap: cap)
 
@@ -565,18 +574,24 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
             raise prevalidation.PrevalidationError(
                 "selection-unsafe", "nom du plan non vérifiable: %s: %s"
                 % (type(exc).__name__, str(exc)[:200])) from None
+        planner = str(plan_script or DEFAULT_PLAN_SCRIPT)
         plan_path = os.path.join(tree, rel)
-        argv = [sys.executable, os.path.join(tree, "scripts", "test-plan.py"), "plan",
+        argv = [sys.executable, os.path.join(tree, planner), "plan",
                 "--out", rel, "--event", "workflow_dispatch", "--ref", "",
                 "--base", comparison, "--mode", "lot"]
         if map_path:
             argv += ["--map", os.path.abspath(map_path)]
+        env = None
+        if project:
+            # The project's adapter reads its own canon/registry; an N-1
+            # adapter ignores the variable and keeps its convention.
+            env = dict(os.environ, AMEESH_PROJECT=project)
         try:
             if deadline is not None and deadline.expired():
                 raise prevalidation.PrevalidationError(
                     "run-incomplete", "budget de prévalidation épuisé avant le plan")
             generated = subprocess.run(argv, cwd=tree, capture_output=True, text=True,
-                                       timeout=limit(timeout))
+                                       timeout=limit(timeout), env=env)
         except (OSError, subprocess.SubprocessError) as exc:
             if deadline is not None and deadline.expired():
                 raise prevalidation.PrevalidationError(
@@ -588,8 +603,8 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
         if generated.returncode:
             tail = ((generated.stderr or "") + (generated.stdout or "")).strip()[-500:]
             raise prevalidation.PrevalidationError(
-                "selection-unsafe", "scripts/test-plan.py a refusé le plan: %s"
-                % (tail or "exit %d" % generated.returncode))
+                "selection-unsafe", "%s a refusé le plan: %s"
+                % (planner, tail or "exit %d" % generated.returncode))
         try:
             with open(plan_path, "r", encoding="utf-8") as fh:
                 plan = json.load(fh)
@@ -792,8 +807,17 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
     changed_tests = [str(name) for name, entry in (plan.get("classes") or {}).items()
                      if isinstance(entry, (list, tuple)) and entry
                      and str(entry[0]) == "P0"]
+    #: #6186 : les modules de la porte et du superviseur sont un filet propre à
+    #: ameesh ; l'inventaire du plan dit si le projet les porte. Sans inventaire
+    #: (plan N-1), le filet historique reste appliqué.
+    historical = FALLBACK_MODULES
+    if isinstance(shared, dict) and shared.get("active"):
+        inventory = set(shared.get("inventory") or ())
+        if inventory:
+            historical = tuple(name for name in FALLBACK_MODULES
+                               if name in inventory)
     modules: list[str] = []
-    for name in (*required, *FALLBACK_MODULES, *sorted(transverse),
+    for name in (*required, *historical, *sorted(transverse),
                  *sorted(changed_tests)):
         if name not in modules:
             modules.append(name)
@@ -938,7 +962,10 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
     try:
         if deadline is not None and deadline.expired():
             raise _timeout_error(deadline, "avant l'arbre du SHA")
-        prepared = prepare(repo, head, base, map_path=carte, deadline=deadline)
+        prepared = prepare(repo, head, base, map_path=carte,
+                           plan_script=getattr(params.params, "plan_script", None)
+                           or DEFAULT_PLAN_SCRIPT,
+                           project=params.project, deadline=deadline)
         fallback = contract_fallback(prepared, params, head=head, base=base,
                                      deadline=deadline)
         if deadline is not None and deadline.expired():
@@ -1008,7 +1035,8 @@ def _run_hosts(prepared: Prepared, params: Parameters, *, lot: int, head: str,
                 lot=lot, plan_path=prepared.path, head=head, host=host,
                 params=attempt.params, base=base, repo=prepared.tree,
                 published_ref=branch, profile=profile, executable=executable,
-                deadline=deadline)
+                project=attempt.project, canon_repo=attempt.repo,
+                canon_commit=attempt.commit, deadline=deadline)
         except prevalidation.PrevalidationError as exc:
             if exc.cause in RETRYABLE and index + 1 < len(hosts):
                 if deadline is not None and deadline.expired():
@@ -1350,6 +1378,9 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
         prepared = None
         try:
             prepared = prepare(repo, head, base, map_path=carte,
+                               plan_script=getattr(params.params, "plan_script", None)
+                               or DEFAULT_PLAN_SCRIPT,
+                               project=params.project,
                                timeout=TRAIN_PLAN_TIMEOUT, deadline=deadline)
             fallback = contract_fallback(prepared, params, head=head, base=base,
                                          deadline=deadline)
