@@ -1,21 +1,29 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#3277: an agent's temporary directory owned by another mesh key, over
 quota, is alerted; under a former key of THIS mesh, its entries of ended lots
-are removed and the others kept.
+are removed and the others kept, and the whole directory goes once idle.
 
 Constat of 24/10 on pc-smichea: `.menage/tmp/codex2` (25 GiB, quota 4 GiB)
 carried the key of the same database reached before pgbouncer (#532): the
 pass skipped it as another mesh's, so nothing measured, evicted or alerted.
+#6258 (08/11): the same move left 3.7 GiB of old directories under the
+former key on ameesh-agents-2, each under the per-agent quota, so the
+over-quota path never looked at them. A former route receives no turn any
+more: after `UNOWNED_IDLE_S` without activity the whole directory is a
+finished session's temporary directory and is removed.
 
 Witnesses: a stopped agent's overrun is alerted (size and biggest entries),
 once per refresh, lifted under quota or once gone; an entry of an ended lot is
-removed (former key only); an unattributed one is kept and named.
+removed (former key only); an unattributed one is kept and named while the
+directory is busy; under a former key, an idle directory under the quota is
+removed whole, while a recent or protected one is kept.
 """
 from __future__ import annotations
 
 import dataclasses
 import os
 import stat
+import subprocess
 import time
 import unittest
 from unittest import mock
@@ -159,6 +167,13 @@ class OverQuotaTest(PgTestCase):
                                if e.get("path") == self.old])
         self.assertEqual(self._alerts(), [])
 
+    def _active_top(self):
+        """Keep the directory itself active while its entries are old: the
+        ended-lot rule is what this pass then exercises, not the whole-directory
+        removal (#6258)."""
+        at = time.time() + LATER
+        os.utime(self.old, (at, at))
+
     def test_former_key_removes_ended_lot_entries_and_keeps_the_others(self):
         lot = self.ended_lot()
         recent = self.ended_lot(age_s=-DAY)          # ended 10 min before the pass
@@ -169,6 +184,7 @@ class OverQuotaTest(PgTestCase):
             _write(os.path.join(self.old, name, "f"), 2 * BIG)
         _write(os.path.join(self.old, "%d-targeted.log" % lot), BIG)
         _age(self.old, 2 * DAY)
+        self._active_top()
         pol = dataclasses.replace(self.pol, former_mesh_keys=(menage.mesh_key(self.former),))
         # dry run: the plan says it, nothing goes, nothing is written
         dry = self._pass(pol, dry_run=True, later=LATER)
@@ -215,6 +231,123 @@ class OverQuotaTest(PgTestCase):
         stale.clear_cache()
         self._pass(pol, later=LATER + 60)
         self.assertFalse(os.path.exists(os.path.join(self.old, "diag%d" % lot)))
+
+    def test_former_key_under_quota_is_removed_once_idle(self):
+        # #6258: the old directory is 2 GiB, under the 4 GiB per-agent quota;
+        # the over-quota path ignored it for ever. A former route receives no
+        # turn any more, so the whole directory is a finished session's temp.
+        _write(os.path.join(self.old, "ameesh-test-scratch", "f"), BIG)
+        _write(os.path.join(self.old, "cargo-ds6-1440.fQhvqq", "f"), BIG)
+        _age(self.old, 2 * DAY)
+        pol = self._former()
+        troot = hk.tmp_root(self.mine, self.pol)
+        dry = self._pass(pol, dry_run=True, later=LATER)
+        planned = [(p["action"], os.path.basename(p["path"])) for p in dry["plan"]
+                   if p["kind"] == "tmp"]
+        self.assertEqual(planned, [("suppression", "codex2")])
+        self.assertTrue(os.path.isdir(self.old))
+        report = self._pass(pol, later=LATER)
+        self.assertFalse(os.path.exists(self.old))
+        deleted = [e for e in report["entries"]
+                   if e["kind"] == "tmp" and e["action"] == "deleted"]
+        self.assertEqual(len(deleted), 1)
+        self.assertEqual(deleted[0]["path"], self.old)
+        self.assertGreater(deleted[0]["bytes"], 0)
+        self.assertFalse(os.path.exists(menage.owner_file(troot, "codex2")))
+
+    def test_former_key_drops_a_generated_plan_from_a_prevalidation_tree(self):
+        # the L161f plan is written at the top of the candidate tree for the
+        # offload and left there when the prevalidation tree was not closed;
+        # it is generated, not user work (#6258). A clean, pushed worktree
+        # must become recoverable once that single untracked file is gone.
+        repo = os.path.join(self.state, "repo")
+        os.makedirs(repo)
+
+        def git(*args, cwd=repo):
+            proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                                  text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc
+
+        git("init", "-q")
+        git("config", "user.email", "test@example.invalid")
+        git("config", "user.name", "test")
+        _write(os.path.join(repo, "README"), 100)
+        git("add", "README")
+        git("commit", "-qm", "base")
+        bare = os.path.join(self.state, "origin.git")
+        os.makedirs(bare)
+        self.assertEqual(subprocess.run(["git", "init", "--bare", "-q", bare]).returncode, 0)
+        git("remote", "add", "origin", bare)
+        git("push", "-q", "origin", "HEAD:main")
+        git("fetch", "-q", "origin")
+        tree = os.path.join(self.old, "ameesh-prevalidation-test", "tree")
+        os.makedirs(os.path.dirname(tree))
+        git("worktree", "add", "-q", tree, "HEAD")
+        _write(os.path.join(tree, "ameesh-prevalidation-plan.json"), 2)
+        _age(self.old, 2 * DAY)
+        report = self._pass(self._former(), later=LATER)
+        self.assertFalse(os.path.exists(tree))
+        self.assertFalse(os.path.exists(os.path.join(self.old, "ameesh-prevalidation-test")))
+        self.assertIn("deleted", [e["action"] for e in report["entries"]
+                                  if e["kind"] == "tmp"])
+
+    def test_former_key_under_quota_ignores_a_future_mtime(self):
+        # #6258: test fixtures left mtimes in 2027 under ameesh-cx1; the max
+        # mtime then kept the 2 GiB directory "active 0 s ago" for ever. A
+        # future mtime is not activity: the ctime is what proves the write.
+        target = os.path.join(self.old, "ameesh-l226a", "auth.json")
+        _write(target, BIG)
+        _age(self.old, 2 * DAY)
+        future = time.time() + 365 * DAY
+        os.utime(target, (future, future))
+        self._pass(self._former(), later=LATER)
+        self.assertFalse(os.path.exists(self.old))
+
+    def test_former_key_under_quota_recent_activity_is_kept(self):
+        _write(os.path.join(self.old, "ameesh-test-scratch", "f"), BIG)
+        pol = self._former()
+        report = self._pass(pol)
+        self.assertTrue(os.path.exists(os.path.join(self.old, "ameesh-test-scratch", "f")))
+        self.assertTrue(any("less than %s" % hk.fmt_idle(hk.UNOWNED_IDLE_S) in s
+                            for s in report["skipped"]), report["skipped"])
+
+    def test_former_key_under_quota_git_copy_is_kept(self):
+        # the whole-directory removal must not bypass the Git guard: a copy
+        # under a former key is kept for inspection.
+        target = os.path.join(self.old, "saved", "work")
+        _write(os.path.join(target, "f"), BIG)
+        os.makedirs(os.path.join(target, ".git"))
+        _write(os.path.join(target, ".git", "HEAD"), 4)
+        _age(self.old, 2 * DAY)
+        report = self._pass(self._former(), later=LATER)
+        self.assertTrue(os.path.exists(os.path.join(target, "f")))
+        self.assertTrue(any("kept: saved" in (p.get("detail") or "")
+                            for p in report["plan"]), report["plan"])
+
+    def test_former_key_reports_a_subtree_it_cannot_remove(self):
+        # root-owned build output (cargo in a rootful container) survives the
+        # whole-directory removal: its bytes are journaled, without a second
+        # alert (the over-quota one already names the directory).
+        _write(os.path.join(self.old, "gone", "f"), BIG)
+        _write(os.path.join(self.old, "root-owned", "f"), BIG)
+        _age(self.old, 2 * DAY)
+
+        def partial(path, root):
+            if os.path.basename(path) != "gone":
+                raise OSError("left in place")
+            os.unlink(os.path.join(path, "f"))
+            os.rmdir(path)
+            return 0
+
+        with mock.patch.object(stale.hk, "_safe_rmtree", side_effect=partial):
+            report = self._pass(self._former(), later=LATER)
+        self.assertTrue(os.path.exists(os.path.join(self.old, "root-owned", "f")))
+        self.assertEqual([e["action"] for e in report["entries"] if e["kind"] == "tmp"],
+                         ["deleted", "unremovable"])
+        unremovable = [e for e in report["entries"] if e["action"] == "unremovable"][0]
+        self.assertGreater(unremovable["bytes"], 0)
+        self.assertFalse(unremovable["data"]["blocked"])
 
     def _former(self):
         return dataclasses.replace(self.pol, former_mesh_keys=(menage.mesh_key(self.former),))

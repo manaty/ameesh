@@ -2155,23 +2155,28 @@ def fmt_idle(seconds: float) -> str:
 
 
 def scan_activity(path: str, limit: int = WALK_LIMIT,
-                  budget: PassBudget | None = None) -> dict:
+                  budget: PassBudget | None = None,
+                  now: float | None = None) -> dict:
     """Parcours d'une entrée pour juger de son abandon : `bytes`, `latest` (la
     plus récente des dates de modification ET de changement d'état de
     l'entrée et de tout ce qu'elle contient — le ctime parce qu'une archive
     extraite garde les mtimes de l'archive), `complete`, `why`.
 
-    Sans suivre les liens ni changer de système de fichiers. Un point de
-    montage dedans, une entrée illisible, plus de `limit` entrées ou le budget
-    du passage (#3802) rendent le parcours incomplet : on ne juge pas ce qu'on
-    n'a pas vu."""
+    Une date de modification DANS LE FUTUR n'est pas une preuve d'activité
+    (fichier de test ou archive dont l'horodatage est faux) : seul le ctime
+    compte alors, sinon un tel fichier garderait le dossier vivant pour
+    toujours (#6258). Sans suivre les liens ni changer de système de fichiers.
+    Un point de montage dedans, une entrée illisible, plus de `limit` entrées
+    ou le budget du passage (#3802) rendent le parcours incomplet : on ne juge
+    pas ce qu'on n'a pas vu."""
+    now = time.time() if now is None else float(now)
     out: dict = {"bytes": 0, "latest": None, "complete": True, "why": ""}
     try:
         top = os.lstat(path)
     except OSError as exc:
         out.update(complete=False, why="unreadable (%s)" % (exc.strerror or exc))
         return out
-    latest = max(top.st_mtime, top.st_ctime)
+    latest = max(top.st_ctime, top.st_mtime if top.st_mtime <= now else 0.0)
     if not stat.S_ISDIR(top.st_mode):
         out.update(bytes=_blocks(top), latest=latest)
         return out
@@ -2188,7 +2193,8 @@ def scan_activity(path: str, limit: int = WALK_LIMIT,
                         out.update(complete=False, why="unreadable entry: %s" % entry.path)
                         continue
                     count += 1
-                    latest = max(latest, st.st_mtime, st.st_ctime)
+                    latest = max(latest, st.st_ctime,
+                                 st.st_mtime if st.st_mtime <= now else 0.0)
                     if stat.S_ISDIR(st.st_mode):
                         if st.st_dev != top.st_dev:
                             out.update(complete=False, latest=latest,

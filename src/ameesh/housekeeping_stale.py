@@ -20,13 +20,18 @@ This pass covers those directories:
   (L219);
 * a key declared in `former_mesh_keys` (Host card, `policy.housekeeping`)
   is a former route of THIS mesh: its directories are ours, no turn writes
-  in them any more (the agent's current one is `<agent>~<key>`). Each
-  first-level entry then follows the ended-lot rule of the #2743 clones:
-  it is removed only when its name cites lots that all exist, are all
-  assigned to this agent and all ended more than `CLONE_IDLE_S` ago, when
-  nothing in it moved for `CLONE_IDLE_S`, no process of the user holds it
-  and it carries no Git copy. Everything else — an unattributed entry
-  first — is kept, and named in the alert with its reason.
+  in them any more (the agent's current one is `<agent>~<key>`). A whole
+  directory left without any activity for `UNOWNED_IDLE_S` (24 h) is
+  removed as a temporary directory whose session is over -- under the same
+  guards as any removal (lock, mount table, processes, Git copies). Before
+  that, and as long as the directory is still busy or protected, each
+  first-level entry may follow the ended-lot rule of the #2743 clones when
+  the directory is over quota: it is removed only when its name cites lots
+  that all exist, are all assigned to this agent and all ended more than
+  `CLONE_IDLE_S` ago, when nothing in it moved for `CLONE_IDLE_S`, no
+  process of the user holds it and it carries no Git copy. Everything else —
+  an unattributed entry first — is kept, and named in the alert with its
+  reason.
 
 Subtrees of another user (root: wine, container leftovers) are neither
 read nor removed: their bytes stay, said in the alert as "as root".
@@ -34,8 +39,10 @@ read nor removed: their bytes stay, said in the alert as "as root".
 from __future__ import annotations
 
 import os
+import re
 import stat
 
+from . import build_artifacts
 from . import housekeeping as hk
 from . import housekeeping_clones as hc
 from . import resources as resources_mod
@@ -46,6 +53,32 @@ TOP = hk.TMP_TOP
 #: path -> (signature, at, measure): a directory unchanged at its first level
 #: is not walked again before `UNOWNED_REFRESH_S` (a pass runs every 10 min)
 _MEASURES: dict = {}
+#: `prevalidation_calls.PLAN_NAME`: the L161f plan is written at the top of
+#: the candidate tree for the offload, then left there by a close that did not
+#: happen. It is generated, never user work (#6258).
+_GENERATED_PLAN = re.compile(r"^ameesh-prevalidation-plan(?:-\d+)?\.json$")
+
+
+def _drop_generated_plan(path: str) -> None:
+    """Remove the untracked L161f plan left at the top of a candidate tree.
+    A tracked file with that name belongs to the project: it stays."""
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return
+    for name in names:
+        if not _GENERATED_PLAN.match(name):
+            continue
+        full = os.path.join(path, name)
+        if os.path.islink(full) or not os.path.isfile(full):
+            continue
+        tracked = hk._git(["ls-files", "--error-unmatch", "--", name], path)
+        if tracked is None or tracked.returncode == 0:
+            continue
+        try:
+            os.unlink(full)
+        except OSError:
+            pass
 
 
 def _signature(path: str):
@@ -66,11 +99,14 @@ def _signature(path: str):
     return tuple(out)
 
 
-def walk(path: str, limit: int = hk.WALK_LIMIT) -> dict:
+def walk(path: str, limit: int = hk.WALK_LIMIT, now: float | None = None) -> dict:
     """`scan_activity`, but a directory of ANOTHER user that this user cannot
     read is not a doubt: it is left out (`foreign`), only its own dates
     count. One of ours that cannot be read, a mount point inside or more than
-    `limit` entries leave the walk incomplete (nothing is judged)."""
+    `limit` entries leave the walk incomplete (nothing is judged). A future
+    mtime is ignored (#6258), exactly as in `scan_activity`."""
+    import time
+    now = time.time() if now is None else float(now)
     out = {"bytes": 0, "latest": None, "complete": True, "why": "", "foreign": []}
     uid = os.getuid()
     try:
@@ -78,7 +114,7 @@ def walk(path: str, limit: int = hk.WALK_LIMIT) -> dict:
     except OSError as exc:
         out.update(complete=False, why="unreadable (%s)" % (exc.strerror or exc))
         return out
-    latest = max(top.st_mtime, top.st_ctime)
+    latest = max(top.st_ctime, top.st_mtime if top.st_mtime <= now else 0.0)
     out["bytes"] = hk._blocks(top)
     if not stat.S_ISDIR(top.st_mode):
         out["latest"] = latest
@@ -103,7 +139,8 @@ def walk(path: str, limit: int = hk.WALK_LIMIT) -> dict:
                     out.update(complete=False, why="unreadable entry: %s" % entry.path)
                     continue
                 count += 1
-                latest = max(latest, st.st_mtime, st.st_ctime)
+                latest = max(latest, st.st_ctime,
+                             st.st_mtime if st.st_mtime <= now else 0.0)
                 out["bytes"] += hk._blocks(st)
                 if stat.S_ISDIR(st.st_mode):
                     if st.st_dev != top.st_dev:
@@ -133,7 +170,7 @@ def measure(path: str, *, now: float) -> dict:
         names = []
     for name in names:
         full = os.path.join(path, name)
-        children.append(dict(walk(full), name=name, path=full))
+        children.append(dict(walk(full, now=now), name=name, path=full))
     try:
         own = hk._blocks(os.lstat(path))
     except OSError:
@@ -193,7 +230,7 @@ def verdict(db, child: dict, agent: str, *, agents, now: float, holder,
                     if hk._in_subtree(m, real) or hk._in_subtree(real, m))
     if inside:
         return "mount point %s: never removed" % inside[0], lots, fresh
-    fresh = dict(walk(child["path"]), name=child["name"], path=child["path"])
+    fresh = dict(walk(child["path"], now=now), name=child["name"], path=child["path"])
     if not fresh["complete"]:
         return "activity not verifiable (%s)" % fresh["why"], lots, fresh
     if fresh["latest"] is None or now - fresh["latest"] < hc.CLONE_IDLE_S:
@@ -246,6 +283,104 @@ def describe(top) -> str:
     return "; ".join(parts)
 
 
+def folder_verdict(path: str, *, now: float, holder, mounts) -> tuple[str, dict]:
+    """('', fresh) when the whole former-key directory `path` may be cleaned,
+    else (why it is kept, fresh).
+
+    A directory under a former key of this mesh receives no turn any more.
+    After `UNOWNED_IDLE_S` without activity it is the temporary directory of
+    a finished session: its safe entries may go, under the same guards as any
+    removal -- a readable mount table, no mount point at or above it, a
+    complete fresh walk, and no process of the user inside. Git copies are
+    judged entry by entry by `clear_entries`, never here."""
+    if mounts is None:
+        return "mount table unreadable", {}
+    real = os.path.realpath(path)
+    inside = sorted(m for m in mounts
+                    if hk._in_subtree(m, real) or hk._in_subtree(real, m))
+    if inside:
+        return "mount point %s: never removed" % inside[0], {}
+    fresh = dict(walk(path, now=now))
+    if not fresh["complete"]:
+        return "activity not verifiable (%s)" % fresh["why"], fresh
+    if fresh["latest"] is None or now - fresh["latest"] < hk.UNOWNED_IDLE_S:
+        return "active %s ago (less than %s)" % (
+            _ago(now - (fresh["latest"] or now)), hk.fmt_idle(hk.UNOWNED_IDLE_S)), fresh
+    held = holder(path)
+    if held:
+        return held, fresh
+    return "", fresh
+
+
+def clear_entries(found: dict, *, troot: str, policy, dry_run: bool = False) -> dict:
+    """Remove the safe first-level entries of an idle former-key directory.
+
+    A Git copy is recovered only when `tmp_git_work` proves its work saved
+    (clean and pushed or integrated, no ignored file outside the build
+    output -- `__pycache__` is the one regenerable extra -- no holder); the
+    generated L161f plan left in a prevalidation tree is not work and is
+    dropped first; the removal itself never uses `--force`. Anything
+    doubtful, or a subtree of another user that survives the deletion, is
+    kept with its reason. Returns `{freed, left, kept, removed}`; `freed` is
+    what would go in a dry run."""
+    rules = tuple(build_artifacts.rules_of(policy.artifacts)) + (
+        build_artifacts.Rule("__pycache__"),)
+    kept: dict = {}
+    freed = 0
+    left_total = 0
+    removed = 0
+    for child in found.get("children") or ():
+        name, path = child["name"], child["path"]
+        if not dry_run and os.path.isdir(path) and not os.path.islink(path):
+            _drop_generated_plan(path)
+        if os.path.isdir(path) and not os.path.islink(path):
+            copies, doubt = hk._git_copies_report(path)
+            if doubt:
+                kept[name] = "git copies not fully inspected (%s)" % doubt
+                continue
+            if copies:
+                if not dry_run:
+                    for copy in copies:
+                        _drop_generated_plan(copy)
+                work = hk.tmp_git_work(path, rules, report=(copies, doubt))
+                if work:
+                    kept[name] = work
+                    continue
+                if not dry_run:
+                    ok, error, repos = hk.recover_tmp_git_copies(
+                        path, report=(copies, doubt))
+                    if not ok:
+                        kept[name] = "git worktree removal refused — %s" % error
+                        continue
+                    for repo in repos:
+                        hk.prune_worktrees(repo)
+        if dry_run:
+            freed += child["bytes"]
+            removed += 1
+            continue
+        if not os.path.islink(path):
+            # #3277 r3 (codex cx1 B1) : un lien n'est jamais ouvert en
+            # écriture, seul le lien part
+            hk._make_owned_dirs_writable(path)
+        try:
+            hk._safe_rmtree(path, troot)
+        except (OSError, hk.RefusedDeletion) as exc:
+            left = hk.size_of(path) if os.path.lexists(path) else 0
+            if left:
+                left_total += left
+            kept[name] = "deletion refused (%s)" % exc
+            continue
+        left = hk.size_of(path) if os.path.lexists(path) else 0
+        if left:
+            left_total += left
+            kept[name] = "%s of another user left" % resources_mod.fmt_value("q", left)
+        if not os.path.lexists(path):
+            removed += 1
+        if left < child["bytes"]:
+            freed += child["bytes"] - left
+    return {"freed": freed, "left": left_total, "kept": kept, "removed": removed}
+
+
 def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
           policy, now: float, dry_run: bool, previous: dict | None, agents,
           holder) -> dict:
@@ -262,56 +397,130 @@ def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
     found = measure(full, now=now)
     kept: dict = {}
     freed = 0
-    if former and found["bytes"] > policy.tmp_quota:
+    whole_dir = False
+    if former:
         lock = None if dry_run else hk.tmp_lock(troot, name, exclusive=True)
         if not dry_run and lock is None:
             skipped.append("tmp %s kept: in turn (lock held)" % full)
             kept = {c["name"]: "in turn (lock held)" for c in found["children"]}
         else:
             try:
-                mounts = hk._mount_points(troot)
-                for child in found["children"]:
-                    why, lots, fresh = verdict(db, child, agent, agents=agents, now=now,
-                                               holder=holder, mounts=mounts)
-                    if why:
-                        kept[child["name"]] = why
-                        continue
-                    child = fresh
-                    detail = ("former key %s of this mesh: lot %s ended, idle %s"
-                              % (owner, lots, _ago(now - child["latest"])))
-                    plan.append({"kind": "tmp", "path": child["path"], "agent": agent,
-                                 "action": "suppression", "bytes": child["bytes"],
-                                 "detail": detail})
-                    if dry_run:
-                        continue
-                    # #3277 r3 (codex cx1 B1) : `os.walk` suit un chemin de
-                    # départ qui est un lien, même `followlinks=False` : un
-                    # lien n'est jamais ouvert en écriture, seul le lien part
-                    if not os.path.islink(child["path"]):
-                        hk._make_owned_dirs_writable(child["path"])
-                    try:
-                        hk._safe_rmtree(child["path"], troot)
-                    except (OSError, hk.RefusedDeletion) as exc:
-                        kept[child["name"]] = "deletion refused (%s)" % exc
-                        continue
-                    left = hk.size_of(child["path"]) if os.path.lexists(child["path"]) else 0
-                    freed += child["bytes"] - left
-                    if left:
-                        kept[child["name"]] = "%s of another user left" % (
-                            resources_mod.fmt_value("q", left))
-                    entries.append({"kind": "tmp", "action": "deleted",
-                                    "path": child["path"], "agent": agent,
-                                    "lot": lots.replace("#", ""),
-                                    "bytes": child["bytes"] - left, "detail": detail})
+                if not dry_run and hk.read_owner(troot, name) != owner:
+                    skipped.append("tmp %s kept: owner changed during the pass" % full)
+                else:
+                    mounts = hk._mount_points(troot)
+                    why, fresh = folder_verdict(full, now=now, holder=holder,
+                                                mounts=mounts)
+                    if not why:
+                        # A former route writes nowhere any more: once the
+                        # whole directory has been idle for a day, every safe
+                        # entry goes. This is what frees the thousands of
+                        # unattributed scratch entries the ended-lot rule
+                        # keeps (#6258).
+                        whole_dir = True
+                        cleared = clear_entries(found, troot=troot, policy=policy,
+                                                dry_run=dry_run)
+                        freed += cleared["freed"]
+                        kept = cleared["kept"]
+                        detail = ("former key %s of this mesh: no turn writes here "
+                                  "any more; idle %s, %d safe entry(ies) removed"
+                                  % (owner, _ago(now - fresh["latest"]),
+                                     cleared["removed"]))
+                        if kept:
+                            detail += "; kept: %s" % ", ".join(
+                                "%s (%s)" % (kept_name, kept_why)
+                                for kept_name, kept_why in sorted(kept.items()))
+                        plan.append({"kind": "tmp", "path": full, "agent": agent,
+                                     "action": "suppression", "bytes": freed,
+                                     "detail": detail})
+                        if not dry_run:
+                            if cleared["removed"] or freed:
+                                entries.append({"kind": "tmp", "action": "deleted",
+                                                "path": full, "agent": agent,
+                                                "bytes": freed, "detail": detail})
+                            if cleared["left"]:
+                                entries.append({
+                                    "kind": "tmp", "action": "unremovable",
+                                    "path": full, "agent": agent,
+                                    "bytes": cleared["left"],
+                                    "detail": "former key %s: %s left in place "
+                                              "(another user, often root: container "
+                                              "or build leftovers); nothing more can "
+                                              "be removed here"
+                                              % (owner, resources_mod.fmt_value(
+                                                  "q", cleared["left"])),
+                                    "data": {"quota": policy.tmp_quota,
+                                             "unremovable_bytes": cleared["left"],
+                                             # the over-quota alert already names
+                                             # this directory; #530: the bytes are
+                                             # reported without a second alert.
+                                             "blocked": False,
+                                             "episode_since": now}})
+                            if not kept and not cleared["left"]:
+                                try:
+                                    os.rmdir(full)
+                                except OSError as exc:
+                                    kept["(directory)"] = "directory not empty (%s)" % (
+                                        exc.strerror or exc)
+                            if not kept:
+                                for leftover in (hk.owner_file(troot, name),
+                                                 hk.lock_file(troot, name)):
+                                    try:
+                                        os.unlink(leftover)
+                                    except OSError:
+                                        pass
+                    elif found["bytes"] > policy.tmp_quota:
+                        # Busy or protected, but over quota: the ended-lot
+                        # cleanup of #3277 still frees what is proven, without
+                        # waiting for the whole directory to become idle.
+                        for child in found["children"]:
+                            why_child, lots, fresh_child = verdict(
+                                db, child, agent, agents=agents, now=now,
+                                holder=holder, mounts=mounts)
+                            if why_child:
+                                kept[child["name"]] = why_child
+                                continue
+                            child = fresh_child
+                            detail = ("former key %s of this mesh: lot %s ended, "
+                                      "idle %s" % (owner, lots,
+                                                   _ago(now - child["latest"])))
+                            plan.append({"kind": "tmp", "path": child["path"],
+                                         "agent": agent, "action": "suppression",
+                                         "bytes": child["bytes"], "detail": detail})
+                            if dry_run:
+                                continue
+                            if not os.path.islink(child["path"]):
+                                hk._make_owned_dirs_writable(child["path"])
+                            try:
+                                hk._safe_rmtree(child["path"], troot)
+                            except (OSError, hk.RefusedDeletion) as exc:
+                                kept[child["name"]] = "deletion refused (%s)" % exc
+                                continue
+                            child_left = (hk.size_of(child["path"])
+                                          if os.path.lexists(child["path"]) else 0)
+                            freed += child["bytes"] - child_left
+                            if child_left:
+                                kept[child["name"]] = "%s of another user left" % (
+                                    resources_mod.fmt_value("q", child_left))
+                            entries.append({"kind": "tmp", "action": "deleted",
+                                            "path": child["path"], "agent": agent,
+                                            "lot": lots.replace("#", ""),
+                                            "bytes": child["bytes"] - child_left,
+                                            "detail": detail})
+                    else:
+                        skipped.append("tmp %s kept: %s" % (full, why))
             finally:
                 if lock is not None:
                     lock.close()
-        if freed:
+        if freed and not dry_run:
             _MEASURES.pop(full, None)
             found = measure(full, now=now)
     size = found["bytes"]
     was_over = (previous or {}).get("action") == "over_quota"
-    if size > policy.tmp_quota:
+    if whole_dir and dry_run:
+        # the plan already says what would go; no separate alert
+        pass
+    elif size > policy.tmp_quota:
         data = ((previous or {}).get("data") or {}) if was_over else {}
         top = _top(found["children"], kept)
         due = (not was_over or freed
@@ -322,7 +531,10 @@ def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
                 "bytes": size,
                 "detail": "quota %s exceeded; owner key %s (%s): %s" % (
                     resources_mod.fmt_value("q", policy.tmp_quota), owner,
-                    "former route of this mesh" if former else
+                    "former route of this mesh: the whole directory is cleaned after "
+                    "%s without activity, the entries of ended lots before that" % (
+                        hk.fmt_idle(hk.UNOWNED_IDLE_S))
+                    if former else
                     "another mesh, or a former route of this one to declare in "
                     "`former_mesh_keys`", describe(top)),
                 "data": {"quota": policy.tmp_quota, "owner": owner, "former": former,
