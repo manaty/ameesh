@@ -264,10 +264,14 @@ class UnitTest(unittest.TestCase):
         from ameesh import role_timers
         unit = (ROOT / "deploy" / "systemd" / "ameesh-paquet-horaire.service").read_text(
             encoding="utf-8")
-        self.assertIn("SuccessExitStatus=%d" % ph.STALE_RC, unit.splitlines())
+        # #6272 : la sortie 5 (paquet rouge par son contenu) est aussi un refus
+        # attendu, à côté de la sortie 3 (code périmé).
+        expected = "SuccessExitStatus=%d %d" % (
+            ph.STALE_RC, ph.COMPOSITION_RED_RC)
+        self.assertIn(expected, unit.splitlines())
         with mock.patch.object(role_timers, "_check_bin", side_effect=lambda b: b):
             rendered = role_timers.render_paquet_service(role="mesh-design")
-        self.assertIn("SuccessExitStatus=%d" % ph.STALE_RC, rendered.splitlines())
+        self.assertIn(expected, rendered.splitlines())
 
 
 class TickAlertTest(HoraireBase):

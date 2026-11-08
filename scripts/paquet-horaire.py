@@ -51,7 +51,8 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    #3801 (`packet_red`) : l'unité désignée par une preuve forte est retirée
    (#3931). Sans attribution sûre (rejeu des préfixes illisible, contrat
    rouge), `paquet-auto.py` ne retire rien, prévient le pilote et garde son
-   échec antérieur. Sur la ci-full rouge de la tête
+   échec antérieur ; ce rouge du contenu sort en `COMPOSITION_RED_RC`, déjà
+   rapporté au pilote, sans lot d'empreinte §16 (#6272). Sur la ci-full rouge de la tête
    gelée : un rouge **déterministe** (chaque échec de test propre au paquet
    attribué par #3801 à une seule unité probable, rejoué rouge en local sur la
    tête) retire ces unités ; le paquet est recomposé sans elles
@@ -160,7 +161,10 @@ sur la tête gelée, CI requise verte. Les marques d'idempotence sont des notes
 `paquet-horaire: …` au journal du porteur.
 
 Codes de retour : 0 tic fait (y compris « rien à faire »), 1 échec
-opérationnel, 2 entrée invalide.
+opérationnel ou panne du composeur (empreinte §16), 2 entrée invalide,
+3 code périmé (refus attendu), 5 paquet rouge par son contenu (contrat, test
+d'une unité, gel, types clients) : le pilote est prévenu, sans lot d'empreinte
+§16 (#6272).
 """
 from __future__ import annotations
 
@@ -247,6 +251,11 @@ ATTEMPT_STALE = COMPOSE_TIMEOUT + 900
 WAIT_POLL = 30
 #: #5696 : sortie du code périmé (refus attendu, sans alerte) ; 1 reste la panne
 STALE_RC = 3
+#: #6272 : sortie d'un tic dont le paquet est rouge par son contenu (contrat,
+#: test d'une unité, gel, types clients) ; le pilote est prévenu, aucun lot
+#: d'empreinte §16 ne s'ouvre. Miroir de `paquet-auto.COMPOSITION_RED_RC`
+#: (vérifié par les tests).
+COMPOSITION_RED_RC = 5
 REPLAY_TIMEOUT = 900
 #: poids #3801 d'une preuve forte (fichier du test, liste, migration) :
 #: `packet_red.attribute_tests` rend `best` = poids de la meilleure preuve
@@ -264,6 +273,12 @@ class InputError(HoraireError):
 class Stale(HoraireError):
     """#5696 : code exécuté qui n'est plus celui de la cible ; refus attendu
     (sortie STALE_RC, sans alerte), pas une panne."""
+
+
+class CompositionRed(HoraireError):
+    """#6272 : la composition est rouge par son contenu (contrat, test d'une
+    unité), pas par une panne du composeur : le pilote est déjà prévenu et le
+    tic sort en COMPOSITION_RED_RC sans ouvrir de lot d'empreinte §16."""
 
 
 class Busy(InputError):
@@ -1614,6 +1629,22 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
         # composition et le tic n'écrit ni marque d'échec ni courrier.
         holder = composition_in_progress(ctx, name) or "verrou tenu"
         return "#%d : composition en cours (%s)" % (carrier, holder)
+    if result.returncode == auto.COMPOSITION_RED_RC:
+        # #6272 : un rouge de composition (contrat, test d'une unité, gel,
+        # types clients) n'est pas une panne du composeur. L'échec est
+        # consigné pour que le tic suivant reprenne, le pilote est prévenu
+        # par courrier, et aucun lot d'empreinte §16 ne s'ouvre.
+        ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
+            MARK_FAILED, step, this.n, this.base or "-", result.returncode))
+        ctx.mail(ctx.pilot, carrier,
+                 "#%d %s : composition rouge par son contenu (rc %d, %s, "
+                 "tentative %d/%d) ; ce n'est pas une panne du composeur, "
+                 "aucun lot d'empreinte n'est ouvert. Retirer l'unité fautive "
+                 "ou renoncer ; le tic suivant reprend.\n\n%s"
+                 % (carrier, name, result.returncode, step, this.n,
+                    MAX_ATTEMPTS, auto._tail(result.text, 30)))
+        raise CompositionRed("paquet-auto rc %d pour %s" % (
+            result.returncode, name))
     if result.returncode != 0:
         ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
             MARK_FAILED, step, this.n, this.base or "-", result.returncode))
@@ -1989,9 +2020,10 @@ def tick_fingerprint(error: BaseException) -> str:
 
 
 def alert_tick(ctx: Context, error: BaseException) -> None:
-    """#5696 : le tic sort en 1 (paquet non composé à l'heure) : pilote et
-    bureau prévenus une fois par empreinte, comme le schéma. Une alerte
-    perdue ne change pas le code de sortie."""
+    """#5696 : le tic sort en 1 (panne du composeur ou échec opérationnel) :
+    pilote et bureau prévenus une fois par empreinte, comme le schéma. #6272 :
+    un rouge de composition sort en COMPOSITION_RED_RC et ne passe pas ici.
+    Une alerte perdue ne change pas le code de sortie."""
     message = ("tic paquet-horaire de %s sur %s en échec (rc 1) : %s\n%s"
                % (ctx.target, ctx.host, error, "\n".join(ctx.log[-10:])))
     if ctx.dry_run:
@@ -2550,6 +2582,11 @@ def main(argv: list[str] | None = None) -> int:
         # #5696 : refus attendu (hôte en retard sur la cible), distinct d'une panne
         print("paquet-horaire : refus attendu : %s" % error, file=sys.stderr)
         return STALE_RC
+    except CompositionRed as error:
+        # #6272 : paquet rouge par son contenu, déjà rapporté au pilote par
+        # after_compose ; pas d'alerte ni de lot d'empreinte §16.
+        print("paquet-horaire : %s" % error, file=sys.stderr)
+        return COMPOSITION_RED_RC
     except (HoraireError, auto.PaquetAutoError) as error:
         print("paquet-horaire : %s" % error, file=sys.stderr)
         if args.command == "tick" and not getattr(error, "alerted", False):

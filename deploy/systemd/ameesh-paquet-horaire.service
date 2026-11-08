@@ -58,7 +58,9 @@ ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run mesh-design -- \
     --repo ${AMEESH_PAQUET_REPO} --target ${AMEESH_PAQUET_TARGET} --pilot ${AMEESH_PAQUET_PILOT}
 # #5696 : sortie 3 = code périmé (hôte en retard sur la cible), refus
 # attendu : ni « failed » ni alerte. 1 reste la panne, qui alerte.
-SuccessExitStatus=3
+# #6272 : sortie 5 = paquet rouge par son contenu (contrat, test d'une unité,
+# gel, types clients), déjà rapporté au pilote : ni « failed » ni empreinte §16.
+SuccessExitStatus=3 5
 # Une composition (tests locaux compris) est bornée à trois heures par le script.
 TimeoutStartSec=4h
 NoNewPrivileges=yes
