@@ -1,0 +1,9 @@
+{
+  "type": "alert.raised",
+  "object": "alert:decision_pending",
+  "project": "acme",
+  "data": {
+    "alert": "decision_pending",
+    "key": "[\"decision_pending\", \"worker-1\", null, 42, 1794144000, null, 123]"
+  }
+}

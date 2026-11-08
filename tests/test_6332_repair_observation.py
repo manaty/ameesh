@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """U6: replay, crash recovery, poison filtering and observation-only wiring."""
 import json
+from pathlib import Path
 import unittest
 from unittest import mock
 
@@ -77,6 +78,30 @@ class ObservationTest(PgTestCase):
         self.event(since='2026-11-08T10:00:00Z')
         self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
         self.assertEqual(len(self.page('alerts')), 1)
+
+    def test_real_anonymized_alert_event_reaches_journal_and_report(self):
+        # notify._event shape, anonymized: the key is JSON text, not a digest.
+        fixture = Path(__file__).parent / 'fixtures/repair_signals/alert-raised-real.json'
+        event = json.loads(fixture.read_text())
+        self.db.execute(
+            'INSERT INTO ameesh_events(type,object,project,data) VALUES (%s,%s,%s,%s::jsonb)',
+            (event['type'], event['object'], event['project'], json.dumps(event['data'])))
+        self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
+        rows = self.page('alerts')
+        self.assertEqual(len(rows), 1)
+        signal = repair_signals.from_alert(event['data'], project='acme',
+                                          environment='staging', received_at=NOW)
+        self.assertEqual(rows[0]['signal']['native_id'], signal.native_id)
+        self.assertEqual(rows[0]['signal']['id'], signal.id)
+        # Historical rows replay after EOF without creating a second signal.
+        self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
+        self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
+        self.assertEqual(len(self.page('alerts')), 1)
+        signals, _, refused = repair_report._envelopes(
+            [{'cle': event['data']['key'], 'cree': NOW}], project='acme',
+            environment='staging', received_at=NOW)
+        self.assertFalse(refused)
+        self.assertEqual([s.id for s in signals], [signal.id])
 
     def test_replay_handover_and_stale_receiver(self):
         self.assertTrue(self.ingest([self.row()]))
