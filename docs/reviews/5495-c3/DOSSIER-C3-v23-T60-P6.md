@@ -31,7 +31,7 @@ Pour chaque hôte, il faut aussi renseigner l'identifiant du feu C3 (`GO`). Le s
 
 ```sh
 set -euo pipefail
-S=/tmp/claude-1001/-home-agent/526a0a74-f00e-4639-b4d1-d11066d51f99/scratchpad/p6
+S=/home/agent/.local/state/ameesh/operators/c3-p6-20261109/p6   # copie stable 0700 (N impl-03 #200960) ; archive 4143455e87bb07f32398efd5df49df3ca274c3a35e78e51b504f49fcf6784a57
 IP=78.232.56.22 HOTE=ameesh-agents-1 GO=<identifiant du courrier de feu C3>
 INST=update-l2-runtime-v32.py; R=/root/ameesh-operator-5495-P6-$HOTE
 [ "$(sha256sum < $S/$INST | cut -c1-64)" = e6526d402a43ce68117cc24393b6b392bd3bc7d3e1f5d56c791923f51e0b01c6 ]
