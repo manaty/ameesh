@@ -51,10 +51,6 @@
         âge, avis dus par relecteur, avis bloquants non traités, holds et
         réveils, agents au repos avec du travail dû, tours et fusions par
         heure, durée de CI par job ; `--check` sort 2 sur une attente > seuil ;
-  ameesh repair-report [--json] [--project P] [--days N] [--start T] [--end T]
-        rapport A1–A12 en lecture seule (étude #6308, unité U1) : compteurs de
-        la fenêtre UTC, inconnues déclarées ; alertes ≠ défauts, événements
-        ≠ runs ;
   ameesh decide <id> <option | "free text"> [--key FILE | --signed]
         | withdraw <id> | show <id>
         the human's answer (never an agent's), sent back to the requester by
@@ -170,6 +166,10 @@
         refusé le tour avant tout appel fournisseur (ameesh-refusal/1), lue
         dans $AMEESH_REFUSAL_FILE ; libère alors la réservation du compte ;
   ameesh release open|check|reason <lot>   release perimeter and validation;
+  ameesh repair-report [--json] [--project P] [--days N] [--start T] [--end T]
+        rapport A1–A12 en lecture seule (étude #6308, unité U1) : compteurs de
+        la fenêtre UTC, inconnues déclarées ; alertes ≠ défauts, événements
+        ≠ runs ;
   ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
         trois {works} {delivered} sur leur base gelée, version installée et version
         évaluée, relecture croisée à l'aveugle ;
