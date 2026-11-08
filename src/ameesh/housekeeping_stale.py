@@ -19,11 +19,15 @@ This pass covers those directories:
   gone. Nothing is deleted there: another mesh's directory is never touched
   (L219);
 * a key declared in `former_mesh_keys` (Host card, `policy.housekeeping`)
-  is a former route of THIS mesh: its directories are ours, no turn writes
-  in them any more (the agent's current one is `<agent>~<key>`). A whole
-  directory left without any activity for `UNOWNED_IDLE_S` (24 h) is
-  removed as a temporary directory whose session is over -- under the same
-  guards as any removal (lock, mount table, processes, Git copies). Before
+  is a former route of THIS mesh FOR THE AGENTS THAT MIGRATED to the current
+  key: their directory is `<agent>`, the current one is
+  `<agent>~<key>`. A declared key can still be the LIVE route of agents that
+  did not migrate (the direct-DSN governance runners): without a newer
+  `<agent>~<other key>` sibling the directory is kept, never treated as
+  dead. For a migrated agent, a whole directory left without any activity
+  for `UNOWNED_IDLE_S` (24 h) is removed as a temporary directory whose
+  session is over -- under the same guards as any removal (lock, mount
+  table, processes, Git copies). Before
   that, and as long as the directory is still busy or protected, each
   first-level entry may follow the ended-lot rule of the #2743 clones when
   the directory is over quota: it is removed only when its name cites lots
@@ -287,7 +291,8 @@ def folder_verdict(path: str, *, now: float, holder, mounts) -> tuple[str, dict]
     """('', fresh) when the whole former-key directory `path` may be cleaned,
     else (why it is kept, fresh).
 
-    A directory under a former key of this mesh receives no turn any more.
+    A directory under a former key of this mesh whose agent MIGRATED (a
+    newer `<agent>~<other key>` sibling exists) receives no turn any more.
     After `UNOWNED_IDLE_S` without activity it is the temporary directory of
     a finished session: its safe entries may go, under the same guards as any
     removal -- a readable mount table, no mount point at or above it, a
@@ -383,6 +388,45 @@ def clear_entries(found: dict, *, troot: str, policy, dry_run: bool = False) -> 
     return {"freed": freed, "left": left_total, "kept": kept, "removed": removed}
 
 
+def _latest(st, now: float) -> float:
+    """Latest activity of a directory, ignoring a future mtime: a test fixture
+    dated 2027 must not make an old directory look newer than its migration
+    sibling (same rule as `walk`)."""
+    return max(st.st_ctime, st.st_mtime if st.st_mtime <= now else 0.0)
+
+
+def migrated(troot: str, name: str, agent: str, owner: str, *, now: float) -> bool:
+    """True when `agent` has a sibling `<agent>~<other key>` newer than the
+    directory `name`: the agent left the route `owner` and writes in the
+    current one, so `name` is a dead route. A key declared in
+    `former_mesh_keys` may still be the LIVE route of an agent that did not
+    migrate (the direct-route governance runners): without that newer
+    sibling, its directory is kept."""
+    base = agent.split(hk.ALT_SEP, 1)[0]
+    path = os.path.join(troot, name)
+    try:
+        mine_latest = _latest(os.lstat(path), now)
+        names = os.listdir(troot)
+    except OSError:
+        return False
+    for sibling in names:
+        if sibling == name or not sibling.startswith(base + hk.ALT_SEP):
+            continue
+        full = os.path.join(troot, sibling)
+        if os.path.islink(full) or not os.path.isdir(full):
+            continue
+        other = hk.read_owner(troot, sibling)
+        if other is None or other == owner:
+            continue
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        if _latest(st, now) > mine_latest:
+            return True
+    return False
+
+
 def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
           policy, now: float, dry_run: bool, previous: dict | None, agents,
           holder) -> dict:
@@ -393,6 +437,10 @@ def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
     # mesh-design 24/10 : une clé n'est ancienne que sur l'hôte dont la fiche
     # la déclare (`effective(canons, host)`), et jamais la clé courante
     former = owner != key and owner in policy.former_mesh_keys
+    # A declared key can still be the live route of an agent that has not
+    # migrated: only a newer `<agent>~<other key>` sibling proves the agent
+    # left this directory for good (#6258, B mesh-design).
+    live = former and not migrated(troot, name, agent, owner, now=now)
     entries: list[dict] = []
     plan: list[dict] = []
     skipped: list[str] = []
@@ -400,7 +448,9 @@ def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
     kept: dict = {}
     freed = 0
     whole_dir = False
-    if former:
+    if live:
+        skipped.append("tmp %s kept: key still live for this agent" % full)
+    elif former:
         lock = None if dry_run else hk.tmp_lock(troot, name, exclusive=True)
         if not dry_run and lock is None:
             skipped.append("tmp %s kept: in turn (lock held)" % full)
@@ -517,6 +567,10 @@ def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
         if freed and not dry_run:
             _MEASURES.pop(full, None)
             found = measure(full, now=now)
+    if live:
+        # This process does not manage the live route: no over-quota alert
+        # here, the housekeeping of that route owns it.
+        return {"entries": entries, "plan": plan, "skipped": skipped}
     size = found["bytes"]
     was_over = (previous or {}).get("action") == "over_quota"
     if whole_dir and dry_run:

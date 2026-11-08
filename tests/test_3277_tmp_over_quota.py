@@ -100,7 +100,11 @@ class OverQuotaTest(PgTestCase):
         registry.upsert(self.db, "codex1", harness="codex", host="pc")
         # the former route created `codex2` first; this one then `codex2~<key>`
         self.old = menage.turn_env(self.former, self.pol, "codex2", {})["TMPDIR"]
-        menage.turn_env(self.mine, self.pol, "codex2", {})
+        self.current = menage.turn_env(self.mine, self.pol, "codex2", {})["TMPDIR"]
+        # the agent migrated: its current directory is newer than the old one
+        # (the pass timestamps below run `LATER` in the future)
+        at = time.time() + LATER - 1
+        os.utime(self.current, (at, at))
         self.assertEqual(os.path.basename(self.old), "codex2")
         self.addCleanup(stale.clear_cache)
 
@@ -171,7 +175,7 @@ class OverQuotaTest(PgTestCase):
         """Keep the directory itself active while its entries are old: the
         ended-lot rule is what this pass then exercises, not the whole-directory
         removal (#6258)."""
-        at = time.time() + LATER
+        at = time.time() + LATER - 60
         os.utime(self.old, (at, at))
 
     def test_former_key_removes_ended_lot_entries_and_keeps_the_others(self):
@@ -308,10 +312,27 @@ class OverQuotaTest(PgTestCase):
         self._pass(self._former(), later=LATER)
         self.assertFalse(os.path.exists(self.old))
 
+    def test_former_key_keeps_an_agent_still_on_that_route(self):
+        # mesh-design B #199823: 14c7cf1a is declared former but is still the
+        # LIVE route of the governance runners on the direct DSN. Their
+        # directory has no newer `<agent>~<other key>` sibling, so it must be
+        # kept even after 24 h of inactivity.
+        live = menage.turn_env(self.former, self.pol, "vivant", {})["TMPDIR"]
+        _write(os.path.join(live, "f"), BIG)
+        _age(live, 2 * DAY)
+        report = self._pass(self._former(), later=LATER)
+        self.assertTrue(os.path.exists(os.path.join(live, "f")))
+        self.assertTrue(any("key still live for this agent" in s
+                            for s in report["skipped"]), report["skipped"])
+        self.assertFalse([e for e in report["entries"]
+                          if e.get("kind") == "tmp" and e.get("path") == live])
+
     def test_former_key_under_quota_recent_activity_is_kept(self):
         _write(os.path.join(self.old, "ameesh-test-scratch", "f"), BIG)
+        at = time.time() + LATER - 60
+        os.utime(self.old, (at, at))          # written one minute before the pass
         pol = self._former()
-        report = self._pass(pol)
+        report = self._pass(pol, later=LATER)
         self.assertTrue(os.path.exists(os.path.join(self.old, "ameesh-test-scratch", "f")))
         self.assertTrue(any("less than %s" % hk.fmt_idle(hk.UNOWNED_IDLE_S) in s
                             for s in report["skipped"]), report["skipped"])
