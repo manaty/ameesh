@@ -706,6 +706,58 @@ class RoutageTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
+    def test_reprise_refuse_le_cumul_au_seuil_et_restaure_les_compteurs(self):
+        for tokens, resume in ((999, True), (1000, False), (1001, False)):
+            with self.subTest(tokens=tokens):
+                name = "cap%d" % tokens
+                worker = self._worker(name)
+                try:
+                    worker.agent["session_max_tokens"] = 1000
+                    a = work.add(self.db, title="A", assignee=name, force=_FORCE)["id"]
+                    b = work.add(self.db, title="B", assignee=name, force=_FORCE)["id"]
+                    self.tour(worker, a, "A", session="old-%d" % tokens)
+                    self.tour(worker, b, "B", session="other-%d" % tokens)
+                    self.db.execute(
+                        "DELETE FROM turn_costs WHERE agent = %s", (name,))
+                    self.db.execute(
+                        "INSERT INTO turn_costs(agent,harness,session,input_tokens,"
+                        "output_tokens,cached_input_tokens) VALUES (%s,'claude',%s,%s,1,999999)",
+                        (name, "old-%d" % tokens, tokens - 1))
+                    with mock.patch.object(worker, "session_max_tokens", return_value=1000):
+                        spec = worker.rotate_for_lot({"lot": str(a), "prompt": "retour"})
+                    self.assertFalse(spec.get("lot_switch_failed"))
+                    self.assertEqual(worker.current_session(), "old-%d" % tokens if resume else None)
+                    self.assertEqual(worker.session_tokens, tokens if resume else 0)
+                    if not resume:
+                        self.assertIn("dedicated to lot #%d" % a, worker.resume_summary)
+                finally:
+                    worker.watchdog_stop.set()
+
+    def test_restart_ne_reprend_aucune_ancienne_session_de_lot(self):
+        from ameesh import exploitation
+        worker = self._worker("fresh6403")
+        try:
+            a = work.add(self.db, title="A", assignee=worker.name, force=_FORCE)["id"]
+            b = work.add(self.db, title="B", assignee=worker.name, force=_FORCE)["id"]
+            self.tour(worker, a, "A", session="old-A")
+            self.tour(worker, b, "B", session="old-B")
+            exploitation.restart(self.cfg, self.db, worker.name, "Brief neuf.")
+            self.assertIsNone(storage.of(self.db).operations.apply_restart(
+                worker.name, "wrong-owner", worker.epoch))
+            self.assertTrue(any(r["session_id"] for r in self.st.listing(worker.name)))
+            self.assertTrue(worker.apply_restart_if_requested())
+            self.assertTrue(all(r["session_id"] is None for r in self.st.listing(worker.name)))
+            with self._env("new-B"):
+                spec = worker.rotate_for_lot(dict(worker.pick(), lot=str(b)))
+                self.assertTrue(worker.run_turn(spec))
+            self.assertNotIn("--resume", self.turns()[-1]["argv"])
+            self.assertEqual(worker.current_session(), "new-B")
+            argv = self.tour(worker, a, "retour A", session="new-A")
+            self.assertNotIn("--resume", argv)
+            self.assertEqual(worker.current_session(), "new-A")
+        finally:
+            worker.watchdog_stop.set()
+
     def test_reveil_sur_le_meme_lot_relu_reprend_la_session(self):
         """#6012 : au réveil sur le MÊME lot relu (nouveau gel), le relecteur
         reprend sa session de relecture — même après un tour sur un autre lot,
