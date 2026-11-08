@@ -24,7 +24,7 @@ OKJSON='{"owner":"human:smichea",
  "records":[{"sha":"'$SHA'","run":"r1","state":"running","host":"ameesh-agents-2","_at":1794200010,"started":1794200010},
             {"sha":"'$SHA'","run":"r1","state":"completed","host":"ameesh-agents-2","_at":1794201000,"started":1794200010,
              "canon_ref":"'$CANON'","fingerprints":'$EMP'}],
- "attestations":[{"sha":"'$SHA'"}],
+ "attestations":[{"sha":"'$SHA'","_at":1794200900}],
  "drains":[{"agent":"a1","paused":true,"actor":"ameesh:staging","principal":"human:smichea","reason":"drain de déploiement #2152 (vm.sh)","at":1794200100},
            {"agent":"a1","paused":false,"actor":"ameesh:staging","principal":"human:smichea","reason":"drain de déploiement #2152 (vm.sh)","at":1794200400}]}'
 attendu 0 "C3 réussi" "$OKJSON"
@@ -42,4 +42,10 @@ attendu 1 "deux runs" "$(muter 'd["records"][0]["run"]="r0"')"
 attendu 1 "démarrage avant l activation" "$(muter 'd["records"][1]["started"]=1794100000')"
 attendu 1 "drain humain dans la fenêtre" "$(muter 'd["drains"].append(dict(d["drains"][0], actor="human:smichea"))')"
 attendu 1 "JSON vide" '{}'
+# 4. Témoin d'impl-11 sur v2.1 (#200781 B1) : run completed démarré après l'activation, mais la seule
+#    attestation du même SHA est ancienne (horodatage 1, run ancien) : doit être KO.
+attendu 1 "ancienne attestation même SHA" "$(muter 'd["attestations"]=[{"sha":d["records"][1]["sha"],"_at":1,"run":"ancien"}]')"
+attendu 1 "attestation après la fenêtre" "$(muter 'd["attestations"][0]["_at"]=1794201000+121')"
+attendu 1 "attestation d un autre run" "$(muter 'd["attestations"][0]["run"]="autre"')"
+attendu 0 "attestation du même run" "$(muter 'd["attestations"][0]["run"]="r1"')"
 exit $ECHEC

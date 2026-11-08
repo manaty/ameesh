@@ -80,7 +80,7 @@ dans `prealables`, `go`, `actif` et `apres`).
 | Pièce | sha256 |
 |---|---|
 | Archive `L2-review-97285a07-20261108.tar.gz` (13,5 Mo, sur BG : `scratchpad/p6/`) | `4143455e87bb07f32398efd5df49df3ca274c3a35e78e51b504f49fcf6784a57` |
-| `SHA256SUMS` du kit (74 lignes) | `68deab6eea3e7c83be4444128d5ed0db703493884829a1ea0a4e6207d2e2dea6` |
+| `SHA256SUMS` du kit (75 lignes ; corrigé, voir v2.2) | `68deab6eea3e7c83be4444128d5ed0db703493884829a1ea0a4e6207d2e2dea6` |
 | `manifest.json` | `1ec6e407733f55e9bf03071779481b7cca1ec3237fdf579700928580ef2f07ed` |
 | `requirements-staging.lock` | `185d3bef81efd5c35b385b8705ca2b8885064ad3a3781e6b3c63bf12185cf039` |
 | Roue `ameesh-1.44.1-py3-none-any.whl` | `d3e5d21a2dd43ce6a97e916099f4630e5c6efafdc99e60b8cfa168e8d933e773` |

@@ -33,8 +33,15 @@ def plain(value):
     return value
 
 
+def stamp(row):
+    """Horodatage d'un événement partagé : colonne `ts` (ameesh_events), sinon `created_at`."""
+    return epoch(row.get("ts") if row.get("ts") is not None else row.get("created_at"))
+
+
 def attested(events, sha):
-    return [plain(r.get("data")) for r in events.recent_type(
+    # created_at/ts CONSERVÉ (avis impl-11 B1 sur v2.1) : le juge exige une attestation postérieure
+    # au démarrage du C3, pas une ancienne attestation du même SHA.
+    return [dict(plain(r.get("data") or {}), _at=stamp(r)) for r in events.recent_type(
         release_cutoff.STAGING_EVENT, 2, 200) if (r.get("data") or {}).get("sha") == sha]
 
 
@@ -57,7 +64,7 @@ def main(argv):
             out["release_attested"] = attested(events, argv[1])
     elif mode == "apres":
         sha, since = argv[1], float(argv[2])
-        recs = [dict(plain(r.get("data") or {}), _at=epoch(r.get("created_at")))
+        recs = [dict(plain(r.get("data") or {}), _at=stamp(r))
                 for r in events.recent_type(staging_executor.EVENT, 2, 500, object="staging-request:" + KEY)]
         out["records"] = [r for r in recs if (r.get("_at") or 0) >= since]
         out["attestations"] = attested(events, sha)

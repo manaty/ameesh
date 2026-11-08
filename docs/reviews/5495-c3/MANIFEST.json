@@ -2,16 +2,18 @@
  "auteur": "bureau (BG)",
  "conserves": [
   "v1",
-  "v2"
+  "v2",
+  "v2.1"
  ],
- "demande": "#200619, #200655, #200708 ; avis #200663 #200665 #200716 #200726",
+ "demande": "#200777 (2), avis #200778 #200781",
  "files": {
   "DOSSIER-C3-v1.md": "c88b4306981317948ed0c668b2b50bbc872fbef6178d63b08e08e513025fa7ec",
   "DOSSIER-C3-v2.md": "9ff30a590c3041705f1ce2a2a1d305febe07d66ebcf6cd5322c1c2eb47d7a241",
-  "DOSSIER-C3-v21.md": "394edec0fe7ca4e794f882db7b78c66bf1bf0f55b4a3f0fda1c1d0366400c9be",
+  "DOSSIER-C3-v21.md": "f20ba3cadfc4f56ce449daf0ba095cff042fa16f78e261c13c59913552b02b8a",
+  "DOSSIER-C3-v22.md": "1ed41f9d0e4aa27e3647fa9fb309419a2d168ad330f9324a8256832dfee082d8",
   "analyse/attrs.py": "d67851674b9a5f87f8e5d3367507a797e9677611532cf9499ad6b1e4304f4cff",
-  "evaluer-c3.py": "096587b71a68f21956a0d5f7625f0f1acb628f990c15705bb3f9cc230bca6185",
-  "lecteur-c3.py": "d811d0209dd5e8e85e2441a3e25bb3f84d6f9a14982aa72c6a0ba798f0bb8b1b",
+  "evaluer-c3.py": "35e6e673297e3723cbc439a3a42904755751470d6984456f205357184c37c23f",
+  "lecteur-c3.py": "782e2299b10077d4c21fae037570bdaec9c37f90b12ff2f302217047a03161f9",
   "p6/build.out.txt": "ca9760b62c03b7441ba2f653e3f2ff710f73afc75edb73be9a44c8e1da5f8b51",
   "p6/enveloppe/build-sealed-package.py": "0ffe24f67320c7fc7f72a947e25d1ad66a7c479715ffd683b03ef71c7dfe18d7",
   "p6/enveloppe/build-sealed-package.py.diff-5c1": "5bfce83590be81ce951b98c861ba04c88d8d6c6807e8ceabecc39fb01ee42388",
@@ -34,26 +36,32 @@
   "pose-c3-AG1.sh": "d687eefe2818b22a2defac8b332b30feaa586d2dd72e35a90f3492972e40692e",
   "pose-c3-v2.sh": "5901e5cf1b278f8ced32b71b6061d2d9279f379dbb8849c2f141627479dbf250",
   "pose-c3-v21.sh": "0c9f06a0266f064d06a9ee0e843e562537278d31e44a1147cf38bc2cfa102ced",
+  "pose-c3-v22.sh": "09c41c0e017a382ea091104a914aa7852e9ed88e814d0f8b7d4eebd59c29608a",
   "preparer-canon-c3.sh": "f5bde6c4fdadb8ed1b7e0886f8f6f5a0298966ec4c4c26c06e57687dada9d079",
   "releve-prealables-20261108T1100Z.txt": "aca16328e29c4f9c5cb0949c8c44ee93907265105d89a032c37efc978897b03a",
   "releve-v2-blancs-20261108T1153Z.txt": "fe7693b40e45c8a626c32ddf061699bcb25f71298127e6baea3d8581f851ef94",
   "releve-v2-sonde-prealables-20261108T1152Z.txt": "6d01e790f8941bd7538ace362be8d6a588dd4c6eca23557a124ab2378566676d",
   "releve-v21-blancs-20261108T1219Z.txt": "9162c6fe751ce9a69818b8494461ea1f52a9c88474ec19f9590ecea6b6a858f7",
   "releve-v21-sonde-go-20261108T1216Z.txt": "cb32ec05df6584a39ad72770f35e3681fe4820ccef67f638bf5618943b1c0852",
+  "releve-v22-20261108T1252Z.txt": "8f42d0ce327b59f36ea6e56e197421612b9e63a27d1a508117eec4671e2fdec5",
   "retour-c3-AG1.sh": "db8365adcafdfbfea740d6a254a908c4ee45df34e1a09ff31901128e533e7722",
   "retour-c3-v2.sh": "523abf0bc566e5a878d7e592b636203ee7957ac78d65ca7d96791377b140d475",
   "retour-c3-v21.sh": "e9cce6c653584cb61ba7855979f49e6ce8dbb913dd3d00f0a408c6585bafb4f9",
+  "retour-c3-v22.sh": "2aa0863e7cd95161ff2219b9b75b3c4a55bc4a55ae0fec737d7392d3509463f3",
   "sonde-c3-v2.sh": "ed61763f5f723fff51c03c995ce6f2e3d3e8c647f3ecc6bbd2af6ec60f73f883",
   "sonde-c3-v21.sh": "a55387a0adef8ff86f2bee238429a33f1281a8898156d017af6af56a4675ab69",
+  "sonde-c3-v22.sh": "ca7f2a017af0922d5bc26a27394781c5b12a9a8f836583e85ca8c1cbbe54bda0",
   "sonde-c3.sh": "ec6a8dfd7aa713c63771ceccbdd748d9e9e65ab87734c2cf0a2ae68ad1bf2fd0",
-  "temoin-apres.sh": "4fa4ed071a2d29c3f26dd8ee53f0c3cebdfeaa16c19929643cf6cdf96acc0639"
+  "temoin-apres.sh": "e47adc3f1a79ee8810f8aadb597af5939ab2e53ec34006bd4f75f4c0e8473e31",
+  "temoin-lectures.sh": "72a41d3c09c92121f06bd36359c5a20b09f4c1383558bdbc28233be845ebee5a"
  },
  "gestes": "aucun sur les VM",
  "kit_p6_archive": {
-  "chemin_BG": "scratchpad/p6/L2-review-97285a07-20261108.tar.gz",
+  "depot_auditeur_AG1": "/home/ameesh/preparation-5495-AG1-20261105/p6-L2-review-97285a07-20261108/",
+  "requalification": "CONFORME #200778",
   "sha256": "4143455e87bb07f32398efd5df49df3ca274c3a35e78e51b504f49fcf6784a57"
  },
  "lot": 5495,
- "schema": "ameesh-5495-c3-dossier/3",
- "version": "v2.1"
+ "schema": "ameesh-5495-c3-dossier/4",
+ "version": "v2.2"
 }

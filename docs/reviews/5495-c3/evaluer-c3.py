@@ -5,7 +5,7 @@ Imprime une ligne OK/KO par critère ; rc 1 au premier KO compté. Testable seul
       --empreintes '<json expected_sha256 du porteur>' [--marge 120]
 Critères : UNE seule exécution (run) de la demande de C3 pour ce SHA depuis l'activation ; son état
 terminal = completed ; porteur ∈ candidats ; canon_ref = canon des agents relevé à l'activation ;
-empreintes = expected_sha256 ; attestation staging.attested du SHA ; dans la fenêtre du run, au
+empreintes = expected_sha256 ; attestation staging.attested du SHA horodatée dans la fenêtre du run ; dans la fenêtre du run, au
 moins un drain paused=true par ameesh:staging au principal = owner, chaque agent drainé levé
 ensuite par ameesh:staging, aucun drain de déploiement humain."""
 import argparse
@@ -37,9 +37,15 @@ def juger(data, sha, depuis, canon, candidats, empreintes, marge=120.0):
     fp = final.get("fingerprints") or {}
     case("empreintes = expected_sha256 du porteur", bool(empreintes) and fp == empreintes,
          "écarts=%s" % sorted(k for k in set(fp) | set(empreintes) if fp.get(k) != empreintes.get(k)))
-    att = [a for a in data.get("attestations", []) if a.get("sha") == sha]
-    case("attestation staging.attested du SHA", bool(att))
     fin = (final.get("_at") or 0) + marge
+    # Attestation DE CE C3 (avis impl-11 B1 sur v2.1) : même SHA, horodatée dans la fenêtre du run
+    # (après son démarrage, au plus tard la marge après son état terminal), et du même run si
+    # l'attestation porte ce champ. Une ancienne attestation du même SHA ne suffit jamais.
+    att = [a for a in data.get("attestations", []) if a.get("sha") == sha
+           and isinstance(debut, (int, float)) and isinstance(a.get("_at"), (int, float))
+           and debut <= a["_at"] <= fin and a.get("run", run) == run]
+    case("attestation staging.attested du SHA dans la fenêtre du run", bool(att),
+         "horodatages=%s" % [a.get("_at") for a in data.get("attestations", []) if a.get("sha") == sha])
     owner = data.get("owner")
     fen = [d for d in data.get("drains", []) if isinstance(debut, (int, float)) and debut - marge <= (d.get("at") or 0) <= fin]
     poses = [d for d in fen if d.get("actor") == "ameesh:staging" and d.get("paused") is True]
