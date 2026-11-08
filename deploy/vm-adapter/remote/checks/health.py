@@ -123,41 +123,62 @@ def atomic_receipt(path, value):
             os.unlink(name)
 
 
+def failure(stage, error):
+    # Fixed vocabulary: even a custom exception class name may carry secrets.
+    classes = (FileNotFoundError, PermissionError, TimeoutError,
+               subprocess.TimeoutExpired, subprocess.CalledProcessError,
+               OSError, ValueError, KeyError, TypeError, RuntimeError,
+               ImportError, Exception)
+    name = next(cls.__name__ for cls in classes if isinstance(error, cls))
+    reason = stage + ':' + name
+    print('vm-health ' + reason, file=sys.stderr)
+    return reason
+
+
 def produce(*, card=CARD, boot=BOOT, reader=document):
-    if os.geteuid() == 0:
-        raise ValueError('producer must run as ameesh')
-    cfg = reader(card, 0, 0o644)
-    if set(cfg) != {'venv', 'verifier', 'units', 'environment_file', 'receipt'}:
-        raise ValueError('invalid producer card')
-    for key in ('venv', 'verifier', 'environment_file', 'receipt'):
-        if not isinstance(cfg[key], str) or not Path(cfg[key]).is_absolute():
-            raise ValueError('absolute path required')
-    if (not isinstance(cfg['units'], list) or not cfg['units']
-            or len(cfg['units']) > 64 or len(set(cfg['units'])) != len(cfg['units'])):
-        raise ValueError('explicit runner inventory required')
-    end = time.monotonic() + 45
-    result = dict(schema=SCHEMA, boot_id=boot.read_text().strip(), timestamp=time.time(),
-                  version='', sha='', mode='', venv='', pids=[], version_mode=False, doctor=False)
+    stage = 'setup'
+    result = None
     try:
+        if os.geteuid() == 0:
+            raise ValueError('producer must run as ameesh')
+        cfg = reader(card, 0, 0o644)
+        if set(cfg) != {'venv', 'verifier', 'units', 'environment_file', 'receipt'}:
+            raise ValueError('invalid producer card')
+        for key in ('venv', 'verifier', 'environment_file', 'receipt'):
+            if not isinstance(cfg[key], str) or not Path(cfg[key]).is_absolute():
+                raise ValueError('absolute path required')
+        if (not isinstance(cfg['units'], list) or not cfg['units']
+                or len(cfg['units']) > 64 or len(set(cfg['units'])) != len(cfg['units'])):
+            raise ValueError('explicit runner inventory required')
+        stage = 'boot'
+        end = time.monotonic() + 45
+        result = dict(schema=SCHEMA, boot_id='', timestamp=time.time(),
+                      version='', sha='', mode='', venv='', pids=[], version_mode=False, doctor=False)
+        result['boot_id'] = boot.read_text().strip()
+        stage = 'verifier'
         spec = importlib.util.spec_from_file_location('venv_processus', cfg['verifier'])
         if spec is None or spec.loader is None:
             raise ValueError('verifier unavailable')
         verifier = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(verifier)
         venv = Path(cfg['venv'])
+        stage = 'inventory'
         inventory = json.loads(command([
             '/usr/bin/systemctl', '--user', 'list-units', '--all', '--type=service',
             '--output=json', '--no-pager', 'ameesh-runner-agent@*.service'], end))
         active = {row['unit'] for row in inventory if row['active'] == 'active'}
         if active != set(cfg['units']):
             raise ValueError('active runner inventory differs from card')
+        stage = 'runners-before'
         before = [runner_state(unit, venv, verifier, end) for unit in cfg['units']]
         if {mode for pid, mode in before} != {'execute'}:
             raise ValueError('runner mode is not execute')
+        stage = 'venv'
         live = verifier.venv_installe(venv)
         python = live / 'bin/python'
         # Same direct_url source identity as vm.sh installe_agents, from the
         # venv proven above, never from an arbitrary checkout or stable launcher.
+        stage = 'metadata'
         metadata = json.loads(command([str(python), '-I', '-c',
             'import importlib.metadata as m,json; '
             'd=m.distribution("ameesh"); '
@@ -170,20 +191,27 @@ def produce(*, card=CARD, boot=BOOT, reader=document):
             raise ValueError('unproven source SHA')
         result.update(version=metadata['version'], sha=sha, mode=before[0][1], venv=str(live),
                       pids=[pid for pid, mode in before])
+        stage = 'doctor'
         command(['/usr/bin/systemd-run', '--user', '--pipe', '--wait', '--quiet',
                  '--property=RuntimeMaxSec=35', '--property=TimeoutStopSec=1',
                  '--property=EnvironmentFile=' + cfg['environment_file'],
                  '--', str(python), '-I', '-m', 'ameesh', 'doctor'], end, capture=False)
+        stage = 'runners-after'
         after = [runner_state(unit, venv, verifier, end) for unit in cfg['units']]
         if before != after or verifier.venv_installe(venv) != live:
             raise ValueError('runner changed during health probe')
         result.update(version_mode=True, doctor=True)
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError,
-            subprocess.SubprocessError, TimeoutError):
-        # A failed producer replaces any earlier green; a killed producer's
-        # earlier receipt expires naturally. No exception text can leak secrets.
-        pass
-    atomic_receipt(Path(cfg['receipt']), result)
+    except Exception as error:
+        reason = failure(stage, error)
+        if result is None:
+            return 1
+        # Red receipts alone gain a reason; green schema remains unchanged.
+        result['reason'] = reason
+    try:
+        atomic_receipt(Path(cfg['receipt']), result)
+    except Exception as error:
+        failure('publish', error)
+        return 1
     return 0 if result['version_mode'] and result['doctor'] else 1
 
 
@@ -194,9 +222,8 @@ def main(argv=None):
             return produce()
         if args in (['doctor'], ['version-mode']):
             return check(args[0])
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError,
-            subprocess.SubprocessError, TimeoutError):
-        pass
+    except Exception as error:
+        failure('produce' if args == ['produce'] else 'read', error)
     return 1
 
 

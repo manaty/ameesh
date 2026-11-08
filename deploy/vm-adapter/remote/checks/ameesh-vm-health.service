@@ -12,4 +12,4 @@ TimeoutStopSec=1
 KillMode=control-group
 NoNewPrivileges=yes
 StandardOutput=null
-StandardError=null
+StandardError=journal
