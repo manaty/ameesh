@@ -180,7 +180,7 @@ class BasculeTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][-1], "/srv/src")
         self.assertEqual(calls[1][-1], "/srv/src[%s]" % bascule.HOST_EXTRAS)
-        self.assertEqual(bascule.HOST_EXTRAS, "psycopg,crypto")
+        self.assertEqual(bascule.HOST_EXTRAS, "psycopg,crypto,contrats")
 
     def test_les_controles_importent_cryptography(self):
         tmp = tempfile.TemporaryDirectory(prefix="bascule-3619-")
@@ -199,6 +199,8 @@ class BasculeTest(unittest.TestCase):
         imports = [cmd for cmd in commands if cmd[1:2] == ["-c"]]
         self.assertEqual(len(imports), 1)
         self.assertIn("cryptography", imports[0][-1])
+        self.assertIn("coverage", imports[0][-1])
+        self.assertIn("yaml", imports[0][-1])
 
     def test_vm_et_poste_verifient_l_import_apres_installation(self):
         for name, expected in (

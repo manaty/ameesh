@@ -35,6 +35,8 @@ dependencies = [
 #: conservée pour les commandes d'installation existantes (`ameesh[psycopg]`)
 psycopg = ["psycopg[binary]>=3.2"]
 crypto = ["cryptography>=41"]
+# #6309 : passe de contrats du composeur sur les hôtes d’agents.
+contrats = ["coverage>=7.10", "pyyaml>=6"]
 
 [project.scripts]
 ameesh = "ameesh.main:main"
