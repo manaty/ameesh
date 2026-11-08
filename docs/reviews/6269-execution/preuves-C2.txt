@@ -1,0 +1,38 @@
+== avant
+[05:32:59] BG-IN: ACCEPT=0 DROP=0  | DOCKER-USER .6: 0 | FORWARD .6: 0
+== 5432 (SELECT 1 via WireGuard)
+1|10.77.0.6|t
+[05:33:01] BG-IN: ACCEPT=15 DROP=0  | DOCKER-USER .6: 0 | FORWARD .6: 0
+== 22 sur 10.77.0.1 (doit échouer)
+refusé/expiré rc=124
+[05:33:08] BG-IN: ACCEPT=15 DROP=6  | DOCKER-USER .6: 0 | FORWARD .6: 0
+== 55432 (a) règles en place (doit échouer, ceinture FORWARD ↑)
+refusé/expiré rc=124
+[05:33:15] BG-IN: ACCEPT=15 DROP=6  | DOCKER-USER .6: 0 | FORWARD .6: 6
+== 55432 (b) ceinture retirée 15 s sous trap (doit échouer, DOCKER-USER ↑)
+refusé/expiré rc=124
+[05:33:42] BG-IN: ACCEPT=15 DROP=6  | DOCKER-USER .6: 6 | FORWARD .6: 
+ceinture-retiree
+ceinture-remise
+[05:33:48] BG-IN: ACCEPT=15 DROP=6  | DOCKER-USER .6: 6 | FORWARD .6: 0
+== transit vers .2 (élargissement temporaire BG sous trap)
+transit .2 refusé/expiré rc=124
+retour: 10.77.0.1/32
+[05:33:57] BG-IN: ACCEPT=15 DROP=6  | DOCKER-USER .6: 6 | FORWARD .6: 6
+10.77.0.1 dev ameesh scope link 
+== tenue du service (restart, stop, start)
+restart unité : état identique (aucun doublon)
+stop : pair ET règles absents
+start : état restauré identique
+active
+enabled
+== C.4 bascule réelle (tunnel ARRÊTÉ, 15432 fermé)
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+AttributeError: 'int' object has no attribute 'fetchone'
+quiesce rc=1 (1 attendu : garde pas en draining)
+Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+TypeError: 'NoneType' object is not callable
+client/ssl [{'client': '10.77.0.6/32', 'ssl': True}]
+host_lifecycle lisible : 3 hôtes
