@@ -94,6 +94,36 @@ def journal_complet():
     return out
 
 
+def journal_retour_puis_rejeu(hote='manaty-mesh-1', rejeu='ok', hote_rejeu=None):
+    """#6289 : sequence interrompue par un retour sur `hote`, puis un rejeu du
+    meme commit (sain ou ko), eventuellement sur un autre hote."""
+    out = []
+    for h in HOTES:
+        out.append(evenement(h, 'installer', detail='installe %s' % SHA[:9]))
+        out.append(evenement(h, 'redemarrer'))
+        out.append(evenement(h, 'controler'))
+        if h == hote:
+            out.append(evenement(h, 'sante', verdict='ko',
+                                 detail=detail_sonde(h, verdict='ko',
+                                                     pourquoi='sante en echec')))
+        else:
+            out.append(evenement(h, 'sante', detail=detail_sonde(h)))
+    out.append(evenement(hote, 'retour',
+                         detail='retour au commit precedent applique'))
+    cible = hote_rejeu or hote
+    out.append(evenement(cible, 'installer', detail='installe %s' % SHA[:9]))
+    out.append(evenement(cible, 'redemarrer'))
+    out.append(evenement(cible, 'controler'))
+    if rejeu == 'ok':
+        out.append(evenement(cible, 'sante', detail=detail_sonde(cible)))
+    else:
+        out.append(evenement(cible, 'sante', verdict='ko',
+                             detail=detail_sonde(cible, verdict='ko',
+                                                 pourquoi='sante en echec')))
+    out.append(evenement(None, 'sequence'))
+    return out
+
+
 def journal_serveur(hote_destinataire='ameesh-agents-1', personas=0,
                     verdict='ok'):
     """Topologie reelle : manaty-mesh-1 (serveur) ne porte aucune persona.
@@ -357,13 +387,49 @@ class ActifTest(unittest.TestCase):
         self.lancer(*self.hotes(), '--rapporteur', 'docs01', '--rapporteur', 'bureau')
         self.assertEqual([e['dest'] for e in self.envois], ['docs01', 'bureau'])
 
-    def test_retour_disqualifie_la_sequence(self):
+    def test_retour_seul_disqualifie_la_sequence(self):
+        """#6289 : un retour sans rejeu posterieur ne prouve rien, meme si
+        les autres hotes ont toutes leurs preuves."""
         evenements = journal_complet()
         evenements.append(evenement('manaty-mesh-1', 'retour'))
         self.ecrire(evenements)
         code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
         self.assertEqual(code, 3, erreur)
         self.assertIn('retour/rollback', erreur)
+        self.assertEqual(self.attestations(), [])
+        self.assertEqual(self.envois, [])
+
+    def test_retour_puis_rejeu_sain_du_meme_hote_atteste(self):
+        """#6289 : le retour n'invalide que son hote ; un rejeu sain du meme
+        commit, posterieur, le rehabilite sans rejouer les autres hotes."""
+        self.ecrire(journal_retour_puis_rejeu('manaty-mesh-1'))
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertEqual(sorted(attestation['hotes']), sorted(HOTES))
+        self.assertEqual(
+            attestation['hotes']['manaty-mesh-1']['etapes'],
+            {e: 'ok' for e in ('installer', 'redemarrer', 'controler', 'sante')})
+        self.assertEqual(len(self.envois), 1)
+
+    def test_retour_puis_rejeu_ko_refuse(self):
+        """#6289 : un rejeu en echec apres le retour ne rehabilite pas
+        l'hote ; rien n'est atteste."""
+        self.ecrire(journal_retour_puis_rejeu('manaty-mesh-1', rejeu='ko'))
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('retour/rollback', erreur)
+        self.assertEqual(self.attestations(), [])
+        self.assertEqual(self.envois, [])
+
+    def test_rejeu_d_un_autre_hote_ne_rehabilite_pas_le_retour(self):
+        """#6289 : chaque hote garde ses propres preuves ; le rejeu sain d'un
+        autre hote ne remplace pas celui qui a ete rollbacke."""
+        self.ecrire(journal_retour_puis_rejeu('manaty-mesh-1',
+                                              hote_rejeu='ameesh-agents-1'))
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('manaty-mesh-1', erreur)
         self.assertEqual(self.attestations(), [])
         self.assertEqual(self.envois, [])
 
