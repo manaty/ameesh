@@ -229,3 +229,53 @@ class RecoveryProofTest(recovery.Chain):
         with mock.patch.object(recovery_auto, 'prepublication_contracts', return_value=evidence):
             with self.assertRaisesRegex(recovery_auto.ChainRefused, 'recomposer pour attribution'):
                 self.publish(args)
+
+
+OTHER = auto.TestRun('contrats', ['tests.test_y'], 0, 'Ran 1 test in 0.1s\n\nOK\n', 0.1)
+
+
+class SingleProjectionTest(Base):
+    """#6238: skipped tests are not green; one projection note per scope."""
+
+    def test_skipped_tests_project_inconclusive_never_green(self):
+        skipped = auto.TestRun('contrats', ['tests.test_x'], 0,
+                               'Ran 3 tests in 0.1s\n\nOK (skipped=2)\n', 0.1)
+        merged = auto.ContractTestRun('contrats', ['tests.test_x', 'tests.test_y'], 0,
+                                      '', 0.2, children=[green('y'), skipped])
+        for run in (skipped, merged):
+            self.assertEqual(proof.projection(report(run), base=BASE, target='main')
+                             ['result']['state'], 'inconclusive')
+        self.assertEqual(proof.projection(report(), base=BASE, target='main')
+                         ['result']['state'], 'green')
+
+    def compose(self, *notes):
+        self.shell.auto_out = ''.join(note + '\n' for note in notes)
+        current = ph.Attempt(ph.COMPOSITION, 1, BASE)
+        with mock.patch.object(ph, 'attempt', return_value='next'):
+            ph.after_compose(self.ctx, 4000, 'h-20261027-04',
+                             ph.Result(0, self.shell.auto_out, ''), current)
+        return [call[4] for call in self.shell.ran('ameesh', 'work', 'note')
+                if call[4].startswith(proof.MARK)]
+
+    def test_recovery_writes_only_a_missing_last_projection(self):
+        first = proof.encode(report(), base=BASE, target='main')
+        later = proof.encode(report(OTHER), base=BASE, target='main')
+        self.shell.items[4000] = carrier(notes=[first])
+        self.assertEqual(self.compose(first, first), [])
+        self.assertEqual(self.compose(first, later), [later])
+        self.shell.items[4000] = carrier(notes=[first, later, first])
+        self.shell.calls.clear()
+        self.assertEqual(self.compose(first), [])
+
+    def test_composer_does_not_rewrite_its_own_identical_note(self):
+        written = []
+        def note(_worktree, lot, text):
+            written.append(text)
+            return 'note du porteur #%d écrite' % lot
+        with mock.patch.object(auto, 'verify_contract_scope'), \
+                mock.patch.object(auto, 'note_carrier', side_effect=note), \
+                mock.patch.dict(auto._RECORDED_CONTRACTS, clear=True):
+            for run in (green('contrats'), green('contrats'), OTHER):
+                auto.record_contract_result(Path('.'), 4000, report(run),
+                                            base=BASE, target='main')
+        self.assertEqual(len(written), 2)
