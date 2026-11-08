@@ -224,20 +224,18 @@ BEGIN
          WHERE p.oid=receipt_fn AND (x.grantee=0 OR x.is_grantable) AND x.privilege_type='EXECUTE') THEN
         errors := array_append(errors, 'bounded receipt definer changed or PUBLIC executable');
     END IF;
-    -- #6329 privacy boundary: ordinary logins other than the application
-    -- must not read private mail, including through inherited/SET ROLE rights.
-    -- Superusers are the enrollment administrators; PostgreSQL grants them
-    -- implicit access to all relations regardless of ACLs.
-    IF EXISTS (
-      SELECT FROM pg_roles login CROSS JOIN pg_roles usable
-      WHERE login.rolcanlogin AND NOT login.rolsuper AND login.rolname<>'ameesh'
-        AND (usable.oid=login.oid OR pg_has_role(login.oid,usable.oid,'MEMBER'))
+    -- #6329: only this enrolled login is constrained. Other mesh service
+    -- roles (auditor, release controller) have their own privacy contracts.
+    -- Include every role the login can SET ROLE to, even with NOINHERIT.
+    IF has_table_privilege(r,format('%I.agent_mailbox',s),'SELECT') OR EXISTS (
+      SELECT FROM pg_roles usable
+      WHERE (usable.rolname=r OR pg_has_role(r,usable.oid,'MEMBER'))
         AND EXISTS (SELECT FROM pg_attribute a
           WHERE a.attrelid=format('%I.agent_mailbox',s)::regclass
-            AND a.attname IN ('body','meta','payload') AND a.attnum>0 AND NOT a.attisdropped
+            AND a.attnum>0 AND NOT a.attisdropped
             AND has_column_privilege(usable.oid,a.attrelid,a.attnum,'SELECT'))
     ) THEN
-        errors := array_append(errors, 'private mailbox readable by an unexpected LOGIN');
+        errors := array_append(errors, 'vm_probe can read mailbox directly or via SET ROLE');
     END IF;
     IF cardinality(errors)>0 THEN RAISE EXCEPTION E'vm_probe contract refused:\n%',array_to_string(errors,E'\n'); END IF;
     RAISE NOTICE 'vm_probe contract held';

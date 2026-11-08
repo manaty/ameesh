@@ -249,25 +249,25 @@ class VmProbeRoleTest(PgTestCase):
                     self.assertNotEqual(self.role_sql('SELECT ' + col + ' FROM agent_mailbox').returncode, 0)
         self.audit()
 
-    def test_other_login_cannot_gain_private_mail_even_through_set_role(self):
-        other = self.role + '_other'
-        group = self.role + '_group'
+    def test_other_service_login_may_read_mail_but_vm_probe_cannot_set_role_to_it(self):
+        other = self.role + '_auditor'
         self.db.execute('CREATE ROLE "' + other + '" LOGIN NOINHERIT')
-        self.db.execute('CREATE ROLE "' + group + '" NOLOGIN')
         try:
-            self.db.execute('GRANT "' + group + '" TO "' + other + '"')
-            for grantee in (other, group):
-                self.db.execute('GRANT SELECT(body) ON agent_mailbox TO "' + grantee + '"')
-                try:
-                    result = self.script('_contrat-vm-probe.sql')
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn('private mailbox readable', result.stderr)
-                finally:
-                    self.db.execute('REVOKE SELECT(body) ON agent_mailbox FROM "' + grantee + '"')
+            self.db.execute('GRANT USAGE ON SCHEMA "' + self.schema + '" TO "' + other + '"')
+            for columns in ('body', 'meta,payload'):
+                self.db.execute('GRANT SELECT(' + columns + ') ON agent_mailbox TO "' + other + '"')
+                self.audit()  # legitimate unrelated service, outside this contract
+            self.db.execute('GRANT "' + other + '" TO "' + self.role + '"')
+            try:
+                result = self.script('_contrat-vm-probe.sql')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('vm_probe can read mailbox directly or via SET ROLE', result.stderr)
+            finally:
+                self.db.execute('REVOKE "' + other + '" FROM "' + self.role + '"')
             self.audit()
         finally:
-            self.db.execute('DROP OWNED BY "' + other + '","' + group + '" CASCADE')
-            self.db.execute('DROP ROLE "' + other + '","' + group + '"')
+            self.db.execute('DROP OWNED BY "' + other + '" CASCADE')
+            self.db.execute('DROP ROLE "' + other + '"')
 
     def test_receipt_matches_only_deposited_probe_and_never_returns_message_content(self):
         self.admit()
