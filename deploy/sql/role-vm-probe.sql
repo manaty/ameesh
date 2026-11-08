@@ -19,7 +19,8 @@
 -- sans lien ; passfile libpq 0600 détenu par vm-operator dans son répertoire
 -- privé 0700 (libpq ignore un passfile accessible au groupe). Aucun secret ici.
 -- Le rôle propriétaire vm_probe_writer est NOLOGIN, sans membres : seul le
--- corps fixe peut faire INSERT ; vm_probe n'a ni INSERT ni séquence.
+-- dépôt fixe peut faire INSERT ; le reçu borné ne rend aucun contenu.
+-- vm_probe n’a aucun SELECT sur le courrier, ni INSERT ni séquence.
 -- Aucun accès au schéma diagnostics. Aucune pose par l'auteur de ce lot.
 \set ON_ERROR_STOP on
 \if :{?role}
@@ -38,6 +39,7 @@ DECLARE
     r text := current_setting('ameesh.vm_probe_role');
     w text := current_setting('ameesh.vm_probe_writer');
     s text := current_schema();
+    mailbox_columns text;
 BEGIN
     IF r = w OR s IS NULL OR s IN ('pg_catalog','information_schema','diagnostics') THEN
         RAISE EXCEPTION 'invalid vm_probe enrollment';
@@ -57,8 +59,15 @@ BEGIN
     EXECUTE format('GRANT SELECT (name,host,mode,retired_at,handoff_fenced,runner_seen_host,runner_seen_owner,runner_seen_at,lease_owner,lease_expires_at,status,last_error) ON %I.agent_registry TO %I',s,r);
     EXECUTE format('GRANT SELECT (name,aliases,host,mode,retired_at,handoff_fenced) ON %I.agent_registry TO %I',s,w);
     EXECUTE format('GRANT SELECT (host,generation,release_epoch,state,status,result,updated_at) ON %I.vm_adapter_requests TO %I, %I',s,r,w);
-    EXECUTE format('GRANT SELECT (id,sender,recipient,body,host,created_at,delivered_at,meta,payload) ON %I.agent_mailbox TO %I',s,r);
-    EXECUTE format('GRANT SELECT (id,sender,recipient,body,host,created_at,payload) ON %I.agent_mailbox TO %I',s,w);
+    -- #6329: explicitly remove the old table AND every column SELECT grant.
+    -- REVOKE at table level alone leaves the N-1 column ACLs effective.
+    SELECT string_agg(quote_ident(attname),',') INTO mailbox_columns
+      FROM pg_attribute WHERE attrelid=format('%I.agent_mailbox',s)::regclass
+        AND attnum>0 AND NOT attisdropped;
+    EXECUTE format('REVOKE SELECT ON %I.agent_mailbox FROM %I',s,r);
+    EXECUTE format('REVOKE SELECT (%s) ON %I.agent_mailbox FROM %I',mailbox_columns,s,r);
+    EXECUTE format('GRANT SELECT (id,sender,recipient,body,host,created_at,delivered_at,meta,payload) ON %I.agent_mailbox TO %I',s,w);
+    EXECUTE format('GRANT SELECT (turn_id,ended_at) ON %I.turn_resources TO %I',s,w);
     EXECUTE format('GRANT SELECT (turn_id,agent,host,status,started_at,ended_at) ON %I.turn_resources TO %I',s,r);
     EXECUTE format('GRANT SELECT (host,generation,agent) ON %I.host_lifecycle_agents TO %I',s,r);
     EXECUTE format('GRANT SELECT (source,target,state) ON %I.host_handoffs TO %I',s,r);
@@ -145,6 +154,53 @@ $ddl$,s);
     EXECUTE format('ALTER FUNCTION %I.vm_probe_send(text,text,bigint,bigint,text) OWNER TO %I',s,w);
     EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM %I',s,w);
     EXECUTE format('GRANT EXECUTE ON FUNCTION %I.vm_probe_send(text,text,bigint,bigint,text) TO %I',s,r);
+    EXECUTE format($ddl$
+CREATE OR REPLACE FUNCTION %1$I.vm_probe_receipt(p_host text,p_agent text,p_generation bigint,p_epoch bigint,p_nonce text,p_request bigint)
+RETURNS TABLE(delivered boolean,turn_id text,acknowledged boolean)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path=pg_catalog,pg_temp
+AS $fn$
+DECLARE
+    key jsonb;
+BEGIN
+    IF p_host IS NULL OR p_agent IS NULL OR p_nonce IS NULL OR p_request IS NULL OR p_request < 1
+       OR p_host !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+       OR p_agent !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+       OR p_nonce !~ '^[0-9a-f]{32}$'
+       OR p_generation IS NULL OR p_generation < 1 OR p_epoch IS NULL OR p_epoch < 0 THEN
+        RETURN;
+    END IF;
+    key := jsonb_build_object('host',p_host,'probe_agent',p_agent,
+      'generation',p_generation,'release_epoch',p_epoch,'nonce',p_nonce);
+    RETURN QUERY
+    SELECT m.delivered_at IS NOT NULL,
+           m.meta->'consigne'->>'turn',
+           EXISTS(SELECT FROM %1$I.agent_mailbox a
+             WHERE m.delivered_at IS NOT NULL AND a.sender=p_agent AND a.recipient=p_agent
+               AND a.host=p_host AND a.body='VM-PROBE-ACK ' || p_nonce
+               AND a.payload @> '{"ack":true}'::jsonb
+               AND a.created_at >= m.delivered_at
+               AND a.created_at <= coalesce(t.ended_at,clock_timestamp()))
+      FROM %1$I.agent_mailbox m
+      JOIN %1$I.host_lifecycle g ON g.host=p_host AND g.mode='returning'
+        AND NOT g.claims_open AND g.generation=p_generation
+        AND g.release_epoch=p_epoch AND g.return_probe=p_agent
+      JOIN %1$I.vm_adapter_requests q ON q.host=p_host AND q.generation=p_generation
+        AND q.release_epoch=p_epoch AND q.state='busy' AND q.status='pending'
+        AND q.result='probe admitted'
+      LEFT JOIN %1$I.turn_resources t ON t.turn_id=m.meta->'consigne'->>'turn'
+      WHERE m.id=p_request AND m.sender='vm-adapter' AND m.recipient=p_agent
+        AND m.host=p_host AND m.payload->'vm_probe'=key
+        AND m.payload->>'idempotency_key'='vm-probe-' || p_nonce
+        AND NOT (m.meta ? 'retire') AND m.created_at >= q.updated_at;
+END
+$fn$;
+$ddl$,s);
+    EXECUTE format('REVOKE ALL ON FUNCTION %I.vm_probe_receipt(text,text,bigint,bigint,text,bigint) FROM PUBLIC',s);
+    EXECUTE format('GRANT CREATE ON SCHEMA %I TO %I',s,w);
+    EXECUTE format('ALTER FUNCTION %I.vm_probe_receipt(text,text,bigint,bigint,text,bigint) OWNER TO %I',s,w);
+    EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM %I',s,w);
+    EXECUTE format('GRANT EXECUTE ON FUNCTION %I.vm_probe_receipt(text,text,bigint,bigint,text,bigint) TO %I',s,r);
 END
 $install$;
 \ir _contrat-vm-probe.sql
