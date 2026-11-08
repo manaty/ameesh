@@ -101,7 +101,7 @@ class PacketTest(unittest.TestCase):
         self.path = self.root / 'state' / 'report.json'
         self.scope = ReportTest('test_new_sha_same_tree_preserves_original_provenance_and_age')
         self.scope.setUp()
-        self.context = (self.scope.scope, self.path, [{'id': '6185', 'sha': self.base}])
+        self.context = (self.scope.scope, self.path, [{'id': '6185', 'sha': self.base}], 3600)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(mock.patch.object(auto, '_state_dir', return_value=str(self.root / 'state')))
@@ -139,8 +139,37 @@ class PacketTest(unittest.TestCase):
         self.assertEqual(second.tree, first.tree)
         self.assertNotEqual(second.head, first.head)
         self.assertEqual(second.evidence['reuse']['source_sha'], first.head)
+        self.assertEqual(second.evidence['tree']['head'], second.head)
+        self.assertEqual(second.evidence['tree']['snapshot'], first.head)
         self.assertEqual(second.run.tests, 2)
         self.assertEqual(self.git('status', '--porcelain'), '')
+
+    def test_n_minus_one_tree_is_an_object_with_string_fields(self):
+        report = self.run_pass().evidence
+        self.assertEqual(report['schema'], prevalidation.REPORT_SCHEMA)
+        self.assertIsInstance(report['tree'], dict)
+        for field in ('head', 'snapshot', 'plan'):
+            self.assertIsInstance(report['tree'][field], str)
+        self.assertEqual(report['tree']['head'], report['sha'])
+        self.assertEqual(report['tree']['git_tree'], self.tree)
+        self.assertEqual(report['attestation']['payload']['tree'], self.tree)
+        incompatible = dict(report, tree=self.tree)
+        self.assertEqual(prevalidation.reuse_report(incompatible, head=report['sha'], tree=self.tree,
+            scope=self.scope.scope, now=datetime(2100, 1, 1, tzinfo=timezone.utc)),
+            (None, ('report-tree-invalid',)))
+
+    def test_no_age_policy_disables_reuse_and_expired_evidence_reexecutes(self):
+        self.context = (*self.context[:3], None)
+        with mock.patch.object(auto, 'contract_attestation_context', return_value=self.context):
+            self.run_pass()
+            self.run_pass()
+        self.assertEqual(self.execute.call_count, 2)
+        previous = auto.read_contract_attestation(self.path)
+        previous['attestation']['payload']['timestamp'] = '2000-01-01T00:00:00+00:00'
+        previous['attestation'] = evidence.seal(previous['attestation']['payload'])
+        auto.save_contract_attestation(self.path, previous)
+        self.run_pass()
+        self.assertEqual(self.execute.call_count, 3)
 
     def test_changed_manifest_replays_and_wrong_tree_is_never_green(self):
         first = self.run_pass()
@@ -189,7 +218,7 @@ class PacketTest(unittest.TestCase):
         self.assertEqual(stored['attestation'], report.evidence['attestation'])
         connection.close.assert_called_once()
 
-    def test_replacement_host_reads_existing_report_without_a_schema_change(self):
+    def test_state_loss_reads_existing_report_without_a_schema_change(self):
         first = self.run_pass()
         self.path.unlink()
         with mock.patch.object(auto, 'run_command', return_value=subprocess.CompletedProcess(
@@ -234,28 +263,144 @@ class ContextTest(unittest.TestCase):
             probe = subprocess.CompletedProcess([], 0, json.dumps(
                 ['Python test', sys.executable, 'test platform', [['psycopg', '3']]]).encode(), b'')
             from ameesh.config import Config
+            from ameesh import mechanics
+            document = SimpleNamespace(override=lambda project: SimpleNamespace(
+                contract_selection=mechanics.ContractSelection('contracts.json',
+                                                               attestation_max_age_seconds=3600)))
             with mock.patch('ameesh.config.load', return_value=Config()), \
                     mock.patch('ameesh.canon.load_configured', return_value=[SimpleNamespace(sources=[source])]), \
-                    mock.patch('ameesh.mechanics.load_global'), \
+                    mock.patch('ameesh.mechanics.load_global', return_value=document), \
                     mock.patch.object(auto.shutil, 'which', return_value=str(launcher)), \
                     mock.patch.object(auto, 'run_command', return_value=probe), \
                     mock.patch.object(auto, 'project_python', return_value=sys.executable), \
                     mock.patch.object(auto, 'test_driver', return_value='psycopg'), \
                     mock.patch.object(auto, '_state_dir', return_value=str(Path(root) / 'state')):
-                scope, path, lots = auto.contract_attestation_context(
-                    repo, base=base, modules=['tests.test_a'], timeout=10)
+                scope, path, lots, age = auto.contract_attestation_context(
+                    repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
                 self.assertEqual(lots, [{'id': '6185', 'sha': base}])
+                self.assertEqual(age, 3600)
                 self.assertEqual(scope['fixtures']['tree'], git('rev-parse', 'HEAD^{tree}'))
                 self.assertNotIn(git('rev-parse', 'HEAD'), json.dumps(scope['plan']))
                 self.assertFalse(path.is_relative_to(repo))
                 launcher.write_text('changed heavy implementation')
-                new_scope, _, _ = auto.contract_attestation_context(
-                    repo, base=base, modules=['tests.test_a'], timeout=10)
+                new_scope, _, _, _ = auto.contract_attestation_context(
+                    repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
                 self.assertNotEqual(scope['runner_digest'], new_scope['runner_digest'])
                 with mock.patch.dict('os.environ', {'AMEESH_DRIVER': 'psql'}):
-                    changed, _, _ = auto.contract_attestation_context(
-                        repo, base=base, modules=['tests.test_a'], timeout=10)
+                    changed, _, _, _ = auto.contract_attestation_context(
+                        repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
                 self.assertNotEqual(scope['drivers'], changed['drivers'])
+                from dataclasses import replace
+                with mock.patch('ameesh.config.load', return_value=replace(Config(), dsn='changed-db')):
+                    other, _, _, _ = auto.contract_attestation_context(
+                        repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
+                self.assertNotEqual(changed['drivers']['config_digest'], other['drivers']['config_digest'])
+                with mock.patch.object(auto.socket, 'gethostname', return_value='another-physical-host'):
+                    other_host, _, _, _ = auto.contract_attestation_context(
+                        repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
+                self.assertNotEqual(scope['drivers']['host'], other_host['drivers']['host'])
                 with mock.patch('ameesh.canon.load_configured', return_value=[]):
                     with self.assertRaisesRegex(ValueError, 'no readable canon'):
-                        auto.contract_attestation_context(repo, base=base, modules=['tests.test_a'], timeout=10)
+                        auto.contract_attestation_context(repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
+
+
+class ProcessReuseTest(unittest.TestCase):
+    def test_real_context_reuses_between_processes_with_new_turn_and_lease(self):
+        """Exercise the producer twice; only external services are doubled."""
+        import os
+        import sys
+        from tests.test_l1616_mechanics import MECHANICS
+        root_code = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(prefix='processes-6185-') as temporary:
+            root = Path(temporary)
+            repo = root / 'repo'
+            repo.mkdir()
+            def git(*args):
+                return subprocess.run(['git', '-C', str(repo), *args], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Test')
+            git('config', 'user.email', 'test@example.invalid')
+            (repo / 'manifest.md').write_text('final manifest')
+            git('add', '.')
+            git('commit', '-qm', 'final manifest')
+            base = git('rev-parse', 'HEAD')
+            policy = root / 'policy.yaml'
+            policy.write_text(MECHANICS.replace('projects: {}',
+                'projects:\n  demo:\n    contract_selection:\n'
+                '      registry: contracts.json\n      attestation_max_age_seconds: 3600'))
+            launcher = root / 'ameesh'
+            launcher.write_text('stable heavy launcher')
+            counter = root / 'executions'
+            child = root / 'produce.py'
+            child.write_text('''import importlib.util, json, os, sys
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+from ameesh import config, mechanics
+spec = importlib.util.spec_from_file_location('process_auto', sys.argv[1])
+auto = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = auto
+spec.loader.exec_module(auto)
+repo, base, state, policy, launcher, counter = sys.argv[2:]
+cfg = replace(config.Config(), state_dir=state, runner_id=os.environ['AMEESH_RUNNER_ID'],
+              host=os.environ['AMEESH_HOST'])
+document = mechanics.compile_document(Path(policy).read_text())
+source = SimpleNamespace(mode='git', repo='pinned-canon', commit='a' * 40, prefix='')
+probe = auto.subprocess.CompletedProcess([], 0,
+    json.dumps([sys.version, sys.executable, 'test-platform', []]).encode(), b'')
+def execute(*args, **kwargs):
+    with Path(counter).open('a') as stream:
+        stream.write('executed\\n')
+    return auto.TestRun('contrats', ['tests.test_a'], 0, 'Ran 2 tests in 0.1s\\nOK\\n', .1)
+with mock.patch('ameesh.config.load', return_value=cfg), \\
+     mock.patch('ameesh.canon.load_configured', return_value=[SimpleNamespace(sources=[source])]), \\
+     mock.patch('ameesh.mechanics.load_global', return_value=document), \\
+     mock.patch.object(auto.shutil, 'which', return_value=launcher), \\
+     mock.patch.object(auto, 'project_python', return_value=sys.executable), \\
+     mock.patch.object(auto, 'run_command', return_value=probe), \\
+     mock.patch.object(auto, 'test_driver', return_value='psycopg'), \\
+     mock.patch.object(auto, '_state_dir', return_value=state), \\
+     mock.patch.object(auto, 'contract_modules', return_value=['tests.test_a']), \\
+     mock.patch.object(auto, 'run_contract_modules', side_effect=execute):
+    result = auto.prepublication_contracts(Path(repo), base=base, budget=20, project='demo')
+print(json.dumps({'reuse': result.evidence.get('reuse'),
+                  'scope': result.evidence['attestation']['payload']['scope']}))
+''')
+            def produce(turn, lease_left):
+                env = dict(os.environ, PYTHONPATH=str(root_code / 'src'),
+                    AMEESH_TURN_ID=turn, AMEESH_LEASE_LEFT=lease_left,
+                    AMEESH_LEASE_EPOCH=turn, AMEESH_RUNNER_ID='runner-' + turn,
+                    AMEESH_ROLE='role-' + turn, AMEESH_LOT=turn,
+                    AMEESH_CONTAINER_LABELS='labels-' + turn,
+                    AMEESH_HOST='label-' + turn, AMEESH_TMPDIR=str(root / turn))
+                run = subprocess.run([sys.executable, str(child),
+                    str(root_code / 'scripts' / 'paquet-auto.py'), str(repo), base,
+                    str(root / 'state'), str(policy), str(launcher), str(counter)],
+                    env=env, cwd=repo, capture_output=True, text=True, check=True)
+                return json.loads(run.stdout.splitlines()[-1])
+            first = produce('first', '120')
+            git('commit', '--allow-empty', '-qm', 'regel')
+            second = produce('second', '93')
+            self.assertIsNone(first['reuse'])
+            self.assertEqual(counter.read_text().splitlines(), ['executed'])
+            self.assertEqual(second['scope'], first['scope'])
+            self.assertEqual(second['reuse']['source_sha'], base)
+            self.assertEqual(second['reuse']['candidate_sha'], git('rev-parse', 'HEAD'))
+            # The age policy is read through the real producer, not injected
+            # into a mocked context. N-1 disables reuse; expiry triggers replay.
+            policy.write_text(policy.read_text().replace(
+                '\n      attestation_max_age_seconds: 3600', ''))
+            absent = produce('third', '90')
+            self.assertIsNone(absent['reuse'])
+            self.assertEqual(len(counter.read_text().splitlines()), 2)
+            saved = next((root / 'state' / 'contract-attestations').glob('*.json'))
+            previous = json.loads(saved.read_text())
+            previous['attestation']['payload']['timestamp'] = '2000-01-01T00:00:00+00:00'
+            previous['attestation'] = evidence.seal(previous['attestation']['payload'])
+            saved.write_text(json.dumps(previous))
+            policy.write_text(policy.read_text() + '\n      attestation_max_age_seconds: 1')
+            expired = produce('fourth', '87')
+            self.assertIsNone(expired['reuse'])
+            self.assertEqual(len(counter.read_text().splitlines()), 3)

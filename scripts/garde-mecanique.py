@@ -114,6 +114,7 @@ SCHEMA_KEYS = (
     "production.branch",
     "contract_selection.registry",
     "contract_selection.publish",
+    "contract_selection.attestation_max_age_seconds",
     "projects",
 )
 
@@ -174,6 +175,7 @@ BINDINGS = {
     "production_branch": "production.branch",
     "contract_selection_registry": "contract_selection.registry",
     "contract_publication": "contract_selection.publish",
+    "attestation_max_age_seconds": "contract_selection.attestation_max_age_seconds",
     # #4448 : le seuil commun et sa table par harnais
     "auto_take_excluded_families": "auto_take.excluded_families",
     "excluded_families": "auto_take.excluded_families",
@@ -576,6 +578,8 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
         return value == "<dict>"
     if key == "contract_selection.publish":
         return value in ("contracts-first", "legacy")
+    if key == "contract_selection.attestation_max_age_seconds":
+        return type(value) is int and value > 0
     if key == "contract_selection.registry":
         return isinstance(value, str) and bool(value.strip())
     if key == "production.branch":

@@ -1365,6 +1365,8 @@ def reuse_report(report: dict | None, *, head: str, tree: str, scope: dict,
     from . import test_attestation as evidence
     if not isinstance(report, dict) or "attestation" not in report:
         return None, ("attestation-absent",)
+    if "tree" in report and not isinstance(report["tree"], dict):
+        return None, ("report-tree-invalid",)
     try:
         verdict = evidence.reuse(report["attestation"], candidate_sha=head,
                                  tree=tree, scope=scope, now=now,
@@ -1375,6 +1377,9 @@ def reuse_report(report: dict | None, *, head: str, tree: str, scope: dict,
         return None, verdict.causes
     result = dict(report)
     result["sha"] = head
+    if isinstance(result.get("tree"), dict):
+        # N-1: observed candidate head, while snapshot keeps execution origin.
+        result["tree"] = dict(result["tree"], head=head)
     result["reuse"] = {"source_sha": verdict.source_sha,
                        "candidate_sha": verdict.candidate_sha}
     return result, ()
