@@ -1,0 +1,50 @@
+--- pose-AG3-vm-operator-v44.sh	2026-11-08 13:53:04.527648317 +0000
++++ pose-AG3-vm-operator-v45.sh	2026-11-08 14:02:23.551607548 +0000
+@@ -1,5 +1,6 @@
+ #!/bin/bash
+-# #6002 v4.4 — acl-retour-v44.sh (lectures getfacl exigées réussies). v4.3 — seul changement : acl-retour-v44.sh déposé dans les reçus (retour v4.3). v4.2 — ACL par acl-pose-v42.sh (reçus root 0600, base du retour borné) ; dossier authorized_keys
++# #6002 v4.5 — étape 2 : pip install « ./src-<sha> » (chemin, pas un nom de paquet ; STOP du 13:59Z) et
++#   chmod go-w borné à src-<sha> juste après l'extraction (archive en 775). v4.4 — acl-retour-v44.sh (lectures getfacl exigées réussies). v4.3 — seul changement : acl-retour-v44.sh déposé dans les reçus (retour v4.3). v4.2 — ACL par acl-pose-v42.sh (reçus root 0600, base du retour borné) ; dossier authorized_keys
+ #   noté s'il est créé par la pose. Sinon identique à v4.1.
+ # #6002 v4.1 — pose AG3 (delta de v4 : O1 ACL décidée #200777, pose INACTIVE seulement, O6/#6321)
+ # #6002 v4 — pose AG3 du compte VM non root de l'adaptateur (README deploy/vm-adapter, prép. 1-6),
+@@ -28,7 +29,7 @@
+ [ "$PUB_TYPE" = ssh-ed25519 ] && [[ $PUB_B64 =~ ^[A-Za-z0-9+/]+=*$ ]] || stop "clé publique opérateur illisible"
+ SRC=/home/agent/development/manaty/ameesh
+ git -C "$SRC" cat-file -e "$M^{commit}" || stop "M absent du clone"
+-[ "$(sha256sum "$ICI/secret-vm-probe-v41.py" | cut -c1-64)" = "$(awk '$2 ~ /secret-vm-probe-v41.py$/ {print $1}' "$ICI/SHA256SUMS-v44")" ] || stop "secret-vm-probe-v41.py ≠ SHA256SUMS-v44"
++[ "$(sha256sum "$ICI/secret-vm-probe-v41.py" | cut -c1-64)" = "$(awk '$2 ~ /secret-vm-probe-v41.py$/ {print $1}' "$ICI/SHA256SUMS-v45")" ] || stop "secret-vm-probe-v41.py ≠ SHA256SUMS-v45"
+ 
+ # 0. Préalables (lecture seule)
+ R "$LOGIN" <<'EOS' || stop "préalables AG3"
+@@ -49,7 +50,19 @@
+ echo "préalables OK ; runners actifs : $(systemctl --user -M ameesh@ list-units 'ameesh-runner-agent@*' --state=active --no-legend | awk '{print $1}' | tr '\n' ' ')"
+ EOS
+ echo "accès au venv : ACL u:$LOGIN:--x sur 4 parents (décision #200777 O1)"
+-[ $APPLY = 1 ] || { echo "(contrôle seul, aucun effet)"; exit 0; }
++if [ $APPLY = 0 ]; then
++  # v4.5 (#200933) : l'essai à blanc exerce l'argv pip de l'étape 2 (--dry-run --no-deps) avec l'interpréteur
++  # cible, dans un venv jetable sous un répertoire temporaire retiré ensuite ; rien sous /opt.
++  TARB=$(mktemp "${TMPDIR:-/tmp}/6002-src-blanc.XXXXXX"); trap 'rm -f "$TARB"' EXIT
++  git -C "$SRC" archive --format=tar --prefix="src-${M:0:12}/" "$M" > "$TARB"
++  BLANC='set -euo pipefail; S12=${1:0:12}; T=$(mktemp -d /tmp/6002-blanc.XXXXXX); trap "rm -rf \"$T\"" EXIT
++tar -C "$T" -xf -; cd "$T"; python3.12 -m venv venv
++venv/bin/pip install -q --dry-run --no-deps --no-compile "./src-$S12"
++echo "étape 2 à blanc : pip accepte ./src-$S12 (python3.12, venv jetable retiré)"'
++  ssh -F none -o BatchMode=yes -o ConnectTimeout=10 "root@$AG3" bash -c "$(printf %q "$BLANC")" _ "$M" < "$TARB" \
++    || stop "étape 2 à blanc refusée (pip --dry-run ./src-${M:0:12})"
++  echo "(contrôle seul, aucun effet hors du répertoire temporaire)"; exit 0
++fi
+ TS=$(date -u +%Y%m%dT%H%M%SZ)-$$; OPS=/root/ameesh-operator-6002-AG3-$TS
+ 
+ # 1. compte non root, mot de passe verrouillé, groupe systemd-journal seul en plus ; relevé sshd avant (v3)
+@@ -70,7 +83,8 @@
+ R "$M" "$OPS" <<'EOS'
+ set -euo pipefail; SHA=$1; OPS=$2; S12=${SHA:0:12}; O=/opt/ameesh-vm-adapter
+ install -d -m 755 -o root -g root "$O"; tar -C "$O" -xf "$OPS/src.tar"
+-cd "$O"; python3.12 -m venv "venv-$S12"; "venv-$S12/bin/pip" install -q --no-compile "src-$S12" >/dev/null; ln -sfn "venv-$S12" venv
++chown -R root:root "$O/src-$S12"; chmod -R go-w "$O/src-$S12"   # v4.5 : l'archive extraite est en 775
++cd "$O"; python3.12 -m venv "venv-$S12"; "venv-$S12/bin/pip" install -q --no-compile "./src-$S12" >/dev/null; ln -sfn "venv-$S12" venv
+ install -d -m 755 -o root -g root remote checks
+ install -m 644 -o root -g root "src-$S12/deploy/vm-adapter/remote/vm-remote.py" remote/vm-remote.py
+ install -m 644 -o root -g root "src-$S12/deploy/vm-adapter/remote/checks/health.py" checks/health.py

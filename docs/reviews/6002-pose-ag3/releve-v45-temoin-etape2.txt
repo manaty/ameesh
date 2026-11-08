@@ -1,0 +1,10 @@
+OK   défaut v4.4 reproduit (rc 1) : No matching distribution found for src-97285a076dee
+a4ffc047239825705db03f72e6801f363e390077d3155dd6574a0cbc81df4171  remote/vm-remote.py
+15919bc1718fcc0926118d755af0d22ebb48aa6defe7b6875db7769519b6291b  checks/health.py
+412b1b76248e637dc876c44680c3457148f485a00e3060eb527ded9717cd953c  checks/venv-processus.py
+755 root:root /opt/ameesh-vm-adapter/src-97285a076dee
+644 root:root /opt/ameesh-vm-adapter/remote/vm-remote.py
+644 root:root /opt/ameesh-vm-adapter/checks/health.py
+venv-97285a076dee
+ameesh importé : True /opt/ameesh-vm-adapter/venv/lib/python3.12/site-packages/ameesh/__init__.py
+OK   étape 2 v4.5 exercée : venv + pip install ./src-…, ameesh importable, src en 755 root:root, contrôles find passés

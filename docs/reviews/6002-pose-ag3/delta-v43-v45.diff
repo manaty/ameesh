@@ -1,0 +1,198 @@
+--- acl-retour-v43.sh	2026-11-08 13:46:58.351345159 +0000
++++ acl-retour-v44.sh	2026-11-08 13:52:43.526460492 +0000
+@@ -1,5 +1,6 @@
+ #!/bin/bash
+-# #6002 v4.3 — N1/N2 d'impl-03 #200878 : reçu absent → STOP (sauf --sans-acl prouvé), dérive de MODE
++# #6002 v4.4 — B impl-11 #200903 : toute lecture getfacl doit réussir (outil absent ou erreur → STOP, même
++#   avec --sans-acl). v4.3 — N1/N2 d'impl-03 #200878 : reçu absent → STOP (sauf --sans-acl prouvé), dérive de MODE
+ #   vérifiée avant toute restauration. v4.2 — retour BORNÉ des ACL de traversée (avis B impl-11 #200824, impl-03 #200830), exécuté SUR
+ # AG3 en root, et tel quel par temoin-acl-v42.sh en conteneur.
+ #   acl-retour-v42.sh verifier  <reçus> <login> [<racine>]   contrôle de non-dérive, AUCUNE écriture
+@@ -14,7 +15,13 @@
+ AV="$OPS/acl-parents.avant"; MV="$OPS/acl-parents.mode.avant"
+ if [ ! -e "$AV" ]; then
+   # v4.3 N2 : sans reçu, on ne restaure rien et on s'arrête, en disant pourquoi.
+-  pose=""; for d in $P; do getfacl -p "$d" 2>/dev/null | grep -q "^user:$L:" && pose="$pose $d"; done
++  command -v getfacl >/dev/null || { echo "STOP : getfacl absent, ACL des parents illisibles ; rien n'est touché"; exit 1; }
++  pose=""
++  for d in $P; do
++    acl=$(getfacl -p "$d" 2>/dev/null) || { echo "STOP : lecture getfacl de $d en échec ; rien n'est touché (même avec --sans-acl)"; exit 1; }
++    case "$acl" in *"# file: $d"*) ;; *) echo "STOP : lecture getfacl de $d inattendue ; rien n'est touché"; exit 1;; esac
++    printf '%s\n' "$acl" | grep -q "^user:$L:" && pose="$pose $d"
++  done
+   if [ -n "$pose" ]; then echo "STOP : reçu $AV absent alors que u:$L est posée sur :$pose ; rien n'est touché"; exit 1; fi
+   if [ "${SANS_ACL:-0}" = 1 ]; then echo "reçu absent et aucune entrée u:$L sur les 4 parents : retour sans ACL (--sans-acl)"; exit 0; fi
+   echo "STOP : reçu $AV absent ; aucune entrée u:$L trouvée. Si la pose s'est arrêtée avant l'étape 6 bis, relancer le retour avec --sans-acl"; exit 1
+--- retour-AG3-vm-operator-v43.sh	2026-11-08 13:48:49.957359292 +0000
++++ retour-AG3-vm-operator-v44.sh	2026-11-08 13:53:04.528648326 +0000
+@@ -1,6 +1,6 @@
+ #!/bin/bash
+-# #6002 v4.3 — reçu ACL absent : STOP sauf --sans-acl prouvé (aucune entrée u:vm-operator) ; mode vérifié
+-#   avant restauration (acl-retour-v43.sh). v4.2 — retour arrière. ACL : contrôle de non-dérive AVANT toute mutation (acl-retour-v42.sh
++# #6002 v4.4 — acl-retour-v44.sh (lectures getfacl exigées réussies). v4.3 — reçu ACL absent : STOP sauf --sans-acl prouvé (aucune entrée u:vm-operator) ; mode vérifié
++#   avant restauration (acl-retour-v44.sh). v4.2 — retour arrière. ACL : contrôle de non-dérive AVANT toute mutation (acl-retour-v42.sh
+ #   verifier ; dérive = STOP, rien effacé), puis restauration bornée setfacl --restore depuis le reçu
+ #   root 0600 (avis B impl-11 #200824, impl-03 #200830 : setfacl -x laissait mask::) ; dossier
+ #   /etc/ssh/authorized_keys retiré s'il a été créé par la pose et qu'il est vide.
+@@ -24,7 +24,7 @@
+ # Contrôle de non-dérive des ACL, AVANT toute mutation (lecture seule ; aussi à blanc).
+ # Contrôle exécuté depuis les octets relus de BG (entrée standard), même si les reçus sont absents.
+ ICI=$(cd "$(dirname "$0")" && pwd)
+-ssh -F none -o BatchMode=yes -o ConnectTimeout=10 "root@$AG3" "SANS_ACL=$SANS_ACL bash -s -- verifier $OPS vm-operator" < "$ICI/acl-retour-v43.sh" \
++ssh -F none -o BatchMode=yes -o ConnectTimeout=10 "root@$AG3" "SANS_ACL=$SANS_ACL bash -s -- verifier $OPS vm-operator" < "$ICI/acl-retour-v44.sh" \
+   || { echo "STOP : ACL en dérive, reçu ACL absent ou illisible : aucun retour lancé, rien effacé" >&2; exit 1; }
+ [ $APPLY = 1 ] || { echo "(à blanc, aucun effet)"; exit 0; }
+ R "$OPS" <<'EOS'
+@@ -38,7 +38,7 @@
+ systemctl --user -M ameesh@ daemon-reload
+ systemctl --user -M ameesh@ reset-failed ameesh-vm-health.service ameesh-vm-health.timer 2>/dev/null || true
+ # 6 bis. ACL : restauration bornée (non-dérive revérifiée, setfacl --restore, getfacl = reçu à l'octet)
+-if [ -f "$OPS/acl-parents.avant" ]; then bash "$OPS/acl-retour-v43.sh" restaurer "$OPS" vm-operator; fi
++if [ -f "$OPS/acl-parents.avant" ]; then bash "$OPS/acl-retour-v44.sh" restaurer "$OPS" vm-operator; fi
+ if [ -f "$OPS/paquet-acl-pose" ]; then DEBIAN_FRONTEND=noninteractive apt-get remove -y -q acl >/dev/null; fi
+ # 6. cartes, passfile (détruit), vérificateur éventuel ; 5. sudoers ; 4. sshd + clé ; 1-3. compte et états
+ [ -f /var/lib/ameesh-vm-remote/vm_probe.pgpass ] && shred -u /var/lib/ameesh-vm-remote/vm_probe.pgpass
+--- pose-AG3-vm-operator-v43.sh	2026-11-08 13:48:30.982187411 +0000
++++ pose-AG3-vm-operator-v45.sh	2026-11-08 14:02:23.551607548 +0000
+@@ -1,5 +1,6 @@
+ #!/bin/bash
+-# #6002 v4.3 — seul changement : acl-retour-v43.sh déposé dans les reçus (retour v4.3). v4.2 — ACL par acl-pose-v42.sh (reçus root 0600, base du retour borné) ; dossier authorized_keys
++# #6002 v4.5 — étape 2 : pip install « ./src-<sha> » (chemin, pas un nom de paquet ; STOP du 13:59Z) et
++#   chmod go-w borné à src-<sha> juste après l'extraction (archive en 775). v4.4 — acl-retour-v44.sh (lectures getfacl exigées réussies). v4.3 — seul changement : acl-retour-v44.sh déposé dans les reçus (retour v4.3). v4.2 — ACL par acl-pose-v42.sh (reçus root 0600, base du retour borné) ; dossier authorized_keys
+ #   noté s'il est créé par la pose. Sinon identique à v4.1.
+ # #6002 v4.1 — pose AG3 (delta de v4 : O1 ACL décidée #200777, pose INACTIVE seulement, O6/#6321)
+ # #6002 v4 — pose AG3 du compte VM non root de l'adaptateur (README deploy/vm-adapter, prép. 1-6),
+@@ -28,7 +29,7 @@
+ [ "$PUB_TYPE" = ssh-ed25519 ] && [[ $PUB_B64 =~ ^[A-Za-z0-9+/]+=*$ ]] || stop "clé publique opérateur illisible"
+ SRC=/home/agent/development/manaty/ameesh
+ git -C "$SRC" cat-file -e "$M^{commit}" || stop "M absent du clone"
+-[ "$(sha256sum "$ICI/secret-vm-probe-v41.py" | cut -c1-64)" = "$(awk '$2 ~ /secret-vm-probe-v41.py$/ {print $1}' "$ICI/SHA256SUMS-v43")" ] || stop "secret-vm-probe-v41.py ≠ SHA256SUMS-v43"
++[ "$(sha256sum "$ICI/secret-vm-probe-v41.py" | cut -c1-64)" = "$(awk '$2 ~ /secret-vm-probe-v41.py$/ {print $1}' "$ICI/SHA256SUMS-v45")" ] || stop "secret-vm-probe-v41.py ≠ SHA256SUMS-v45"
+ 
+ # 0. Préalables (lecture seule)
+ R "$LOGIN" <<'EOS' || stop "préalables AG3"
+@@ -49,7 +50,19 @@
+ echo "préalables OK ; runners actifs : $(systemctl --user -M ameesh@ list-units 'ameesh-runner-agent@*' --state=active --no-legend | awk '{print $1}' | tr '\n' ' ')"
+ EOS
+ echo "accès au venv : ACL u:$LOGIN:--x sur 4 parents (décision #200777 O1)"
+-[ $APPLY = 1 ] || { echo "(contrôle seul, aucun effet)"; exit 0; }
++if [ $APPLY = 0 ]; then
++  # v4.5 (#200933) : l'essai à blanc exerce l'argv pip de l'étape 2 (--dry-run --no-deps) avec l'interpréteur
++  # cible, dans un venv jetable sous un répertoire temporaire retiré ensuite ; rien sous /opt.
++  TARB=$(mktemp "${TMPDIR:-/tmp}/6002-src-blanc.XXXXXX"); trap 'rm -f "$TARB"' EXIT
++  git -C "$SRC" archive --format=tar --prefix="src-${M:0:12}/" "$M" > "$TARB"
++  BLANC='set -euo pipefail; S12=${1:0:12}; T=$(mktemp -d /tmp/6002-blanc.XXXXXX); trap "rm -rf \"$T\"" EXIT
++tar -C "$T" -xf -; cd "$T"; python3.12 -m venv venv
++venv/bin/pip install -q --dry-run --no-deps --no-compile "./src-$S12"
++echo "étape 2 à blanc : pip accepte ./src-$S12 (python3.12, venv jetable retiré)"'
++  ssh -F none -o BatchMode=yes -o ConnectTimeout=10 "root@$AG3" bash -c "$(printf %q "$BLANC")" _ "$M" < "$TARB" \
++    || stop "étape 2 à blanc refusée (pip --dry-run ./src-${M:0:12})"
++  echo "(contrôle seul, aucun effet hors du répertoire temporaire)"; exit 0
++fi
+ TS=$(date -u +%Y%m%dT%H%M%SZ)-$$; OPS=/root/ameesh-operator-6002-AG3-$TS
+ 
+ # 1. compte non root, mot de passe verrouillé, groupe systemd-journal seul en plus ; relevé sshd avant (v3)
+@@ -66,11 +79,12 @@
+ TAR=$(mktemp "${TMPDIR:-/tmp}/6002-src.XXXXXX"); trap 'rm -f "$TAR"' EXIT
+ git -C "$SRC" archive --format=tar --prefix="src-${M:0:12}/" "$M" > "$TAR"
+ scp -q -F none -o BatchMode=yes "$TAR" "root@$AG3:$OPS/src.tar"
+-scp -q -F none -o BatchMode=yes "$ICI/secret-vm-probe-v41.py" "$ICI/acl-pose-v42.sh" "$ICI/acl-retour-v43.sh" "root@$AG3:$OPS/"
++scp -q -F none -o BatchMode=yes "$ICI/secret-vm-probe-v41.py" "$ICI/acl-pose-v42.sh" "$ICI/acl-retour-v44.sh" "root@$AG3:$OPS/"
+ R "$M" "$OPS" <<'EOS'
+ set -euo pipefail; SHA=$1; OPS=$2; S12=${SHA:0:12}; O=/opt/ameesh-vm-adapter
+ install -d -m 755 -o root -g root "$O"; tar -C "$O" -xf "$OPS/src.tar"
+-cd "$O"; python3.12 -m venv "venv-$S12"; "venv-$S12/bin/pip" install -q --no-compile "src-$S12" >/dev/null; ln -sfn "venv-$S12" venv
++chown -R root:root "$O/src-$S12"; chmod -R go-w "$O/src-$S12"   # v4.5 : l'archive extraite est en 775
++cd "$O"; python3.12 -m venv "venv-$S12"; "venv-$S12/bin/pip" install -q --no-compile "./src-$S12" >/dev/null; ln -sfn "venv-$S12" venv
+ install -d -m 755 -o root -g root remote checks
+ install -m 644 -o root -g root "src-$S12/deploy/vm-adapter/remote/vm-remote.py" remote/vm-remote.py
+ install -m 644 -o root -g root "src-$S12/deploy/vm-adapter/remote/checks/health.py" checks/health.py
+--- temoin-acl-v43.sh	2026-11-08 13:47:44.009761001 +0000
++++ temoin-acl-v44.sh	2026-11-08 13:53:04.583648818 +0000
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env bash
+-# #6002 v4.3 — + cas dérive de MODE (N1) et reçu absent (N2). v4.2 — témoin RÉEL en conteneur jetable (ubuntu épinglé, paquet acl réel) des octets
+-# acl-pose-v42.sh / acl-retour-v43.sh : parent 750 sans ACL, pose u:vm-operator:--x, retour,
++# #6002 v4.4 — acl-retour-v44.sh (lectures getfacl exigées réussies). v4.3 — + cas dérive de MODE (N1) et reçu absent (N2). v4.2 — témoin RÉEL en conteneur jetable (ubuntu épinglé, paquet acl réel) des octets
++# acl-pose-v42.sh / acl-retour-v44.sh : parent 750 sans ACL, pose u:vm-operator:--x, retour,
+ # getfacl avant = après à l'octet, puis la suite du nettoyage continue ; cas de dérive : STOP sans effacer.
+ set -u
+ ICI=$(cd "$(dirname "$0")" && pwd)
+@@ -16,7 +16,7 @@
+ bash /t/acl-pose-v42.sh $OPS vm-operator >/dev/null && ok "pose u:vm-operator:--x"
+ getfacl -p $B | grep -q "^mask::" && ok "mask:: présent après pose (cause du B v4.1)"
+ su -s /bin/sh vm-operator -c "ls $B" >/dev/null 2>&1 && ko "vm-operator liste $B" || ok "vm-operator ne liste pas $B"
+-bash /t/acl-retour-v43.sh restaurer $OPS vm-operator; rc=$?
++bash /t/acl-retour-v44.sh restaurer $OPS vm-operator; rc=$?
+ [ $rc = 0 ] && ok "retour rc 0" || ko "retour rc $rc"
+ getfacl -p $P | cmp -s - /root/reference.avant && ok "getfacl avant = après, à l octet" || { ko "getfacl différent"; getfacl -p $B; }
+ getfacl -p $B | grep -q "^mask::" && ko "mask:: résiduel" || ok "aucun mask:: résiduel"
+@@ -25,11 +25,11 @@
+ OPS=/root/ops2; install -d -m 700 $OPS
+ bash /t/acl-pose-v42.sh $OPS vm-operator >/dev/null; setfacl -m u:autre:r-x $B/.local
+ avant=$(getfacl -p $P)
+-bash /t/acl-retour-v43.sh restaurer $OPS vm-operator >/dev/null; rc=$?
++bash /t/acl-retour-v44.sh restaurer $OPS vm-operator >/dev/null; rc=$?
+ [ $rc != 0 ] && ok "dérive : STOP (rc $rc)" || ko "dérive non détectée"
+ [ "$(getfacl -p $P)" = "$avant" ] && ok "dérive : rien effacé (ACL inchangées)" || ko "dérive : ACL modifiées"
+ # --- reçu non protégé → STOP
+-chmod 644 $OPS/acl-parents.avant; bash /t/acl-retour-v43.sh verifier $OPS vm-operator >/dev/null 2>&1 && ko "reçu 0644 accepté" || ok "reçu non 0600 refusé"
++chmod 644 $OPS/acl-parents.avant; bash /t/acl-retour-v44.sh verifier $OPS vm-operator >/dev/null 2>&1 && ko "reçu 0644 accepté" || ok "reçu non 0600 refusé"
+ # Remise à zéro du conteneur entre les cas (ACL du cas « dérive » retirées) ; jamais fait sur AG3.
+ propre() { setfacl -b $P; chmod 750 $B; chmod 775 $B/.local $B/.local/share $B/.local/share/ameesh; }
+ # --- N1 v4.3 : dérive de MODE après la pose → STOP avant restauration, ACL et modes inchangés
+@@ -37,19 +37,27 @@
+ bash /t/acl-pose-v42.sh $OPS vm-operator >/dev/null && ok "pose (cas mode)" || ko "pose (cas mode)"
+ chmod 755 $B
+ avant=$(getfacl -p $P; stat -c "%a %n" $P)
+-bash /t/acl-retour-v43.sh restaurer $OPS vm-operator >/dev/null; rc=$?
++bash /t/acl-retour-v44.sh restaurer $OPS vm-operator >/dev/null; rc=$?
+ [ $rc != 0 ] && ok "dérive de mode : STOP (rc $rc)" || ko "dérive de mode non détectée"
+ [ "$(getfacl -p $P; stat -c "%a %n" $P)" = "$avant" ] && ok "dérive de mode : rien restauré ni effacé" || ko "dérive de mode : état modifié"
+ chmod 750 $B
+ # --- N2 v4.3 : reçu absent alors que l ACL est posée → STOP, rien touché
+ mv $OPS/acl-parents.avant $OPS/acl-parents.avant.cache
+ avant=$(getfacl -p $P)
+-bash /t/acl-retour-v43.sh verifier $OPS vm-operator >/dev/null; rc=$?
++bash /t/acl-retour-v44.sh verifier $OPS vm-operator >/dev/null; rc=$?
+ [ $rc != 0 ] && [ "$(getfacl -p $P)" = "$avant" ] && ok "reçu absent + ACL posée : STOP, rien touché" || ko "reçu absent + ACL posée (rc $rc)"
+ # --- N2 v4.3 : reçu absent et aucune ACL (pose arrêtée avant 6 bis) → STOP, sauf --sans-acl
+-mv $OPS/acl-parents.avant.cache $OPS/acl-parents.avant; bash /t/acl-retour-v43.sh restaurer $OPS vm-operator >/dev/null && ok "même reçu remis : restauration OK" || ko "restauration après remise du reçu"
++mv $OPS/acl-parents.avant.cache $OPS/acl-parents.avant; bash /t/acl-retour-v44.sh restaurer $OPS vm-operator >/dev/null && ok "même reçu remis : restauration OK" || ko "restauration après remise du reçu"
+ propre; OPS=/root/ops4; install -d -m 700 $OPS
+-bash /t/acl-retour-v43.sh verifier $OPS vm-operator >/dev/null; rc=$?
++bash /t/acl-retour-v44.sh verifier $OPS vm-operator >/dev/null; rc=$?
+ [ $rc != 0 ] && ok "reçu absent, aucune ACL : STOP par défaut" || ko "reçu absent sans ACL accepté sans --sans-acl"
+-SANS_ACL=1 bash /t/acl-retour-v43.sh verifier $OPS vm-operator >/dev/null && ok "reçu absent, aucune ACL, --sans-acl : retour sans ACL autorisé" || ko "--sans-acl refusé"
++SANS_ACL=1 bash /t/acl-retour-v44.sh verifier $OPS vm-operator >/dev/null && ok "reçu absent, aucune ACL, --sans-acl : retour sans ACL autorisé" || ko "--sans-acl refusé"
++# --- B impl-11 v4.4 : lecture getfacl en échec + --sans-acl → rc non nul (getfacl simulé en rc 1)
++mkdir -p /root/faux; printf "#!/bin/sh\nexit 1\n" > /root/faux/getfacl; chmod 755 /root/faux/getfacl
++PATH=/root/faux:$PATH SANS_ACL=1 bash /t/acl-retour-v44.sh verifier $OPS vm-operator >/dev/null; rc=$?
++[ $rc != 0 ] && ok "lecture getfacl en échec + --sans-acl : STOP (rc $rc)" || ko "lecture en échec acceptée avec --sans-acl"
++# --- getfacl absent (paquet retiré) + --sans-acl → rc non nul
++DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq acl >/dev/null 2>&1
++SANS_ACL=1 bash /t/acl-retour-v44.sh verifier $OPS vm-operator >/dev/null; rc=$?
++[ $rc != 0 ] && ok "getfacl absent + --sans-acl : STOP (rc $rc)" || ko "outil absent accepté avec --sans-acl"
+ exit $ECHEC'
+--- /dev/null	2026-10-24 06:27:50.783000000 +0000
++++ temoin-etape2-v45.sh	2026-11-08 14:02:00.836407091 +0000
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++# #6002 v4.5 — témoin qui EXERCE l'étape 2 de pose-AG3-vm-operator-v45.sh en conteneur jetable : le bloc
++# distant de l'étape 2 est extrait À L'OCTET du script et lancé en root dans l'image du constructeur
++# (python3.12 = e50d468e, comme AG3), avec l'archive git de M. Reproduit aussi le défaut v4.4 (« src-… »).
++set -u
++ICI=$(cd "$(dirname "$0")" && pwd); W=$(mktemp -d); trap 'docker run --rm -v "$W":/w ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 rm -rf /w/ops >/dev/null 2>&1; rm -rf "$W"' EXIT
++M=97285a076dee285097c412d3bd0f2649438a3257; IMG=ameesh-l2-builder:p6-97285a0
++mkdir -p "$W/ops"; git -C /home/agent/development/manaty/ameesh archive --format=tar --prefix="src-${M:0:12}/" "$M" > "$W/ops/src.tar"
++bloc() { awk -v n="$2" '/^R "\$M" "\$OPS" <<.EOS.$/{k++; if(k==n){on=1; next}} on&&/^EOS$/{on=0} on' "$1"; }
++bloc "$ICI/pose-AG3-vm-operator-v45.sh" 1 > "$W/etape2-v45.sh"; bloc "$ICI/pose-AG3-vm-operator-v44.sh" 1 > "$W/etape2-v44.sh"
++grep -q 'pip" install -q --no-compile "./src-' "$W/etape2-v45.sh" || { echo "ECHEC extraction du bloc v4.5"; exit 1; }
++ECHEC=0
++docker run --rm --user 0 -v "$W":/w:ro "$IMG" bash -c 'mkdir /ops && cp /w/ops/src.tar /ops/ && bash /w/etape2-v44.sh '$M' /ops' > "$W/v44.out" 2>&1; rc=$?
++[ $rc != 0 ] && echo "OK   défaut v4.4 reproduit (rc $rc) : $(grep -o 'No matching distribution[^)]*' "$W/v44.out" | head -1)" || { echo "ECHEC v4.4 n'échoue pas"; ECHEC=1; }
++docker run --rm --user 0 -v "$W":/w:ro "$IMG" bash -c 'mkdir /ops && cp /w/ops/src.tar /ops/ && bash /w/etape2-v45.sh '$M' /ops && O=/opt/ameesh-vm-adapter && stat -c "%a %U:%G %n" $O/src-'${M:0:12}' $O/remote/vm-remote.py $O/checks/health.py && readlink $O/venv && $O/venv/bin/python -I -c "import ameesh,sys; print(\"ameesh importé :\", ameesh.__file__.startswith(\"/opt/ameesh-vm-adapter/venv\"), ameesh.__file__)"' > "$W/v45.out" 2>&1; rc=$?
++cat "$W/v45.out" | grep -v -E "^\s*$" | tail -8
++{ [ $rc = 0 ] && grep -q "ameesh importé : True" "$W/v45.out" && grep -q "^755 root:root /opt/ameesh-vm-adapter/src-" "$W/v45.out"; } \
++  && echo "OK   étape 2 v4.5 exercée : venv + pip install ./src-…, ameesh importable, src en 755 root:root, contrôles find passés" || { echo "ECHEC étape 2 v4.5 (rc $rc)"; ECHEC=1; }
++exit $ECHEC
