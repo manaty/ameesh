@@ -1,0 +1,13 @@
+clé PGDG vérifiée : B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+ameesh-agents-1 : pg_dump (PostgreSQL) 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) ; préalables OK
+ameesh-agents-2 : pg_dump (PostgreSQL) 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) ; préalables OK
+libpq5 avant : 16.15-0ubuntu0.24.04.1
+> libpq5:amd64 18.6-1.pgdg24.04+2
+> postgresql-client-17 17.11-1.pgdg24.04+2
+libpq5 après : 18.6-1.pgdg24.04+2
+ameesh-agents-1 : pg_dump (PostgreSQL) 17.11 (Ubuntu 17.11-1.pgdg24.04+2) ; /usr/lib/postgresql/17/bin/pg_dump 17.11 ; reçus /root/ameesh-operator-6291-20261108T0823Z
+libpq5 avant : 16.15-0ubuntu0.24.04.1
+> libpq5:amd64 18.6-1.pgdg24.04+2
+> postgresql-client-17 17.11-1.pgdg24.04+2
+libpq5 après : 18.6-1.pgdg24.04+2
+ameesh-agents-2 : pg_dump (PostgreSQL) 17.11 (Ubuntu 17.11-1.pgdg24.04+2) ; /usr/lib/postgresql/17/bin/pg_dump 17.11 ; reçus /root/ameesh-operator-6291-20261108T0824Z

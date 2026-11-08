@@ -1,0 +1,13 @@
+test_clones_isoles_et_a_jour (tests.test_3752_gabarit.GabaritTest.test_clones_isoles_et_a_jour) ... ok
+test_gabarit_coupe_par_l_environnement (tests.test_3752_gabarit.GabaritTest.test_gabarit_coupe_par_l_environnement) ... ok
+test_le_clone_vaut_migrate_pour_chaque_pilote (tests.test_3752_gabarit.GabaritTest.test_le_clone_vaut_migrate_pour_chaque_pilote) ... ok
+test_le_schema_de_la_classe_est_a_jour (tests.test_3752_gabarit.GabaritTest.test_le_schema_de_la_classe_est_a_jour) ... ok
+test_sans_gabarit_ni_pg_dump_migrate_comme_avant (tests.test_3752_gabarit.GabaritTest.test_sans_gabarit_ni_pg_dump_migrate_comme_avant) ... ok
+test_un_rejeu_en_echec_retire_le_gabarit_et_migre (tests.test_3752_gabarit.GabaritTest.test_un_rejeu_en_echec_retire_le_gabarit_et_migre) ... ok
+test_une_migration_ajoutee_ou_modifiee_invalide_le_gabarit (tests.test_3752_gabarit.GabaritTest.test_une_migration_ajoutee_ou_modifiee_invalide_le_gabarit) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 33.775s
+
+OK
+pg_dump: pg_dump (PostgreSQL) 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
