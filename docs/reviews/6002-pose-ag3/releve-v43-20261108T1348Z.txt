@@ -1,0 +1,33 @@
+# blancs #6002 v4.3 2026-11-08T13:48:50Z
+(contrôle seul, aucun effet)
+rc=0
+état avant retour :
+  reçus absents (retour sans reçus : ACL non restaurée)
+STOP : reçu /root/ameesh-operator-6002-AG3-20261109T0000Z-1/acl-parents.avant absent ; aucune entrée u:vm-operator trouvée. Si la pose s'est arrêtée avant l'étape 6 bis, relancer le retour avec --sans-acl
+STOP : ACL en dérive, reçu ACL absent ou illisible : aucun retour lancé, rien effacé
+rc(attendu STOP : reçu absent)=1
+état avant retour :
+  reçus absents (retour sans reçus : ACL non restaurée)
+reçu absent et aucune entrée u:vm-operator sur les 4 parents : retour sans ACL (--sans-acl)
+(à blanc, aucun effet)
+rc(--sans-acl, aucune ACL sur AG3, à blanc)=0
+# témoin conteneur
+OK   pose u:vm-operator:--x
+OK   mask:: présent après pose (cause du B v4.1)
+OK   vm-operator ne liste pas /home/ameesh
+non-dérive OK : seules u:vm-operator:--x (et mask::) diffèrent de l'état avant
+ACL restaurées : getfacl des 4 parents = reçu avant, à l'octet
+OK   retour rc 0
+OK   getfacl avant = après, à l octet
+OK   aucun mask:: résiduel
+OK   nettoyage poursuivi après le retour ACL
+OK   dérive : STOP (rc 1)
+OK   dérive : rien effacé (ACL inchangées)
+OK   reçu non 0600 refusé
+OK   pose (cas mode)
+OK   dérive de mode : STOP (rc 1)
+OK   dérive de mode : rien restauré ni effacé
+OK   reçu absent + ACL posée : STOP, rien touché
+OK   même reçu remis : restauration OK
+OK   reçu absent, aucune ACL : STOP par défaut
+OK   reçu absent, aucune ACL, --sans-acl : retour sans ACL autorisé
