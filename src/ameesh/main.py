@@ -166,6 +166,10 @@
         refusé le tour avant tout appel fournisseur (ameesh-refusal/1), lue
         dans $AMEESH_REFUSAL_FILE ; libère alors la réservation du compte ;
   ameesh release open|check|reason <lot>   release perimeter and validation;
+  ameesh repair-report [--json] [--project P] [--days N] [--start T] [--end T]
+        rapport A1–A12 en lecture seule (étude #6308, unité U1) : compteurs de
+        la fenêtre UTC, inconnues déclarées ; alertes ≠ défauts, événements
+        ≠ runs ;
   ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
         trois {works} {delivered} sur leur base gelée, version installée et version
         évaluée, relecture croisée à l'aveugle ;
@@ -414,6 +418,11 @@ def _dispatch(argv: list[str] | None) -> int:
         # mesuré sur les jalons (jamais sur les colonnes d'un lot).
         from . import debit
         return debit.main(rest)
+    if command in ("repair-report", "repair_report"):
+        # #6313 (étude #6308, U1) : rapport A1–A12 en lecture seule, fenêtre
+        # UTC fixe, inconnues déclarées ; n'ouvre aucun lot, n'active rien.
+        from . import repair_report
+        return repair_report.main(rest)
     if command == "process":
         # #2225 : vérifier le bloc `workflow:` d'une carte Process du canon
         from . import process_card
