@@ -191,7 +191,6 @@ BEGIN
       LEFT JOIN %1$I.turn_resources t ON t.turn_id=m.meta->'consigne'->>'turn'
       WHERE m.id=p_request AND m.sender='vm-adapter' AND m.recipient=p_agent
         AND m.host=p_host AND m.payload->'vm_probe'=key
-        AND m.payload->>'idempotency_key'='vm-probe-' || p_nonce
         AND NOT (m.meta ? 'retire') AND m.created_at >= q.updated_at;
 END
 $fn$;

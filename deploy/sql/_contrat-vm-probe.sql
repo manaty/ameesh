@@ -219,7 +219,7 @@ BEGIN
         AND proowner=(SELECT oid FROM pg_roles WHERE rolname=w)
         AND prosecdef AND provolatile='v' AND NOT proleakproof
         AND proconfig=ARRAY['search_path=pg_catalog, pg_temp']
-        AND md5(replace(prosrc,quote_ident(s)||'.','<mesh>.'))='e37ebe43d5c753f470f0a4370a3e9474')
+        AND md5(replace(prosrc,quote_ident(s)||'.','<mesh>.'))='4e5eff523cc99628d2866fea5684c390')
        OR EXISTS (SELECT FROM pg_proc p CROSS JOIN LATERAL aclexplode(p.proacl) x
          WHERE p.oid=receipt_fn AND (x.grantee=0 OR x.is_grantable) AND x.privilege_type='EXECUTE') THEN
         errors := array_append(errors, 'bounded receipt definer changed or PUBLIC executable');
