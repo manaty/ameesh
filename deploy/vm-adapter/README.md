@@ -179,6 +179,9 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    au-delà, retour en `draining` comme un échec. Le wrapper opérateur lance
    la sonde **une seule fois**, en asynchrone, et ne rend jamais `0` sur une
    livraison seule ni sur une preuve ancienne ; tout autre code est un échec.
+   La source revue de ces cinq commandes est `commandes/vm-commande.py`
+   (#6252, section suivante) : installer ce fichier au SHA fixé, et une
+   `cible.json` privée par VM dans `/etc/ameesh-vm-adapter/cibles/`.
 6. Faire relire les mappings, les cinq commandes, les durées
    (`halt_deadline_s`, `health_deadline_s`), les créneaux,
    les permissions des fichiers et l'unité avec `systemd-analyze verify`.
@@ -190,6 +193,72 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    unités, recharger systemd et activer le timer sur ce seul hôte. Déclarer
    le hook sans secret dans la configuration des seuls hôtes autorisés.
    Aucune commande de cette étape n'a été exécutée par l'auteur du lot.
+
+## Commandes par VM (#6252)
+
+`commandes/vm-commande.py <verbe> <cible.json>` porte les cinq commandes ;
+l'inscription les appelle par le python du venv opérateur, en `-I`
+(`enrollment.example.json`). Bibliothèque standard, plus `ameesh` du même
+venv pour lire la base native en lecture seule. Il n'écrit rien sur la
+sortie ; ses enfants reçoivent seulement `PATH` et `LANG`.
+
+La `cible.json` de chaque VM (modèle `commandes/cible.example.json`) est
+privée au compte opérateur (0600, sans lien). Elle fixe :
+- l'hôte ameesh et `probe_agent`, identiques à l'inscription ;
+- l'accès SSH : exécutable, destination, compte, port, clé (0600) et
+  `known_hosts` (non inscriptible par d'autres) ;
+- `connect_timeout_s` et `budget_s` (au plus 9,5 s, sous la borne de 10 s du
+  worker) ;
+- `ameesh_config`, la configuration de lecture de la base, sans clé cloud ;
+- `state_dir`, le `StateDirectory` de l'unité (0700) ;
+- `previous_boot_end` et les argv distants.
+
+SSH tourne en `-F none` et `BatchMode`, avec `StrictHostKeyChecking=yes`,
+`IdentitiesOnly`, sans agent ni transfert. Chaque argv distant est cité
+(`shlex.join`). Une clé à commande forcée côté VM reste recommandée.
+
+- `quiesce` : contrôle fermé en `draining`, aucun `turn_resources` en cours
+  sur l'hôte, puis chaque argv distant `quiesce` à 0.
+- `halt` : mêmes gardes. Le marqueur `halt.<hôte>.json` est écrit d'abord,
+  puis l'argv distant `halt` part (par exemple
+  `systemctl poweroff --no-block`). Une déconnexion (255) ou la borne
+  atteinte sont attendues ; le code ne prouve rien.
+- `halted` : rend 0 seulement si l'argv distant `alive` ne répond pas dans sa
+  borne (délai, connexion perdue). Un refus d'authentification ou de clé
+  d'hôte n'est pas un silence ; `ssh` absent ne l'est pas non plus.
+- `health` : lit le contrôle natif (`returning`, prises fermées,
+  `return_probe` = `probe_agent`, génération, époque) et l'admission de la
+  sonde (`probe admitted`). La première fois pour cette admission, il écrit
+  `probe.<hôte>.json` avec un nonce neuf, **avant** le lancement. Il appelle
+  ensuite `probe_start` une seule fois, sans attendre la fin, et rend 75.
+  Ensuite, `probe_receipt` doit rendre en dernière ligne le reçu JSON de **ce**
+  nonce. Ce reçu porte `host`, `probe_agent`, `generation`, `release_epoch`,
+  `nonce`, `verdict` (`ok`, `ko` ou autre) et les booléens `delivered`,
+  `acknowledged` et `turn_ended`. Un reçu absent, en cours, incomplet
+  (livraison seule) ou d'un autre lancement rend 75 ; `ko` rend 1. Seul un reçu
+  complet `ok` mène aux argv distants `health` (version/mode, runners, doctor,
+  courrier), tous à 0. Après un `halt`, la dernière ligne de `previous_boot`
+  (`journalctl -b -1`) doit correspondre à `previous_boot_end`. Une
+  réadmission (après un refus) relance une seule sonde, avec un nouveau nonce.
+  Base ou transport indisponible : 75, borné par `health_deadline_s`.
+- `reconcile` : contrôle fermé en `returning` sur `probe_agent`, puis chaque
+  argv distant `reconcile` à 0 ; n'ouvre jamais les prises et ne force jamais
+  `lost`.
+
+Les cinq commandes ne tournent que dans le worker, qui les appelle aux étapes
+prévues. Seule `halt` agit sur la VM. Les valeurs de `previous_boot_end` et la
+fin réelle du journal d'un arrêt propre se vérifient au premier cycle mesuré
+par le bureau.
+
+Le côté VM de la sonde (`probe_start` et `probe_receipt`) reste à fournir par
+l'opérateur. Aucun helper natif n'écrit encore ce reçu (#6073) : le contrat
+ci-dessus est celui qu'il doit tenir. `tests/test_6252_vm_commandes.py` joue le
+cycle cloud simulé, sans réseau ni secret, avec le vrai `tick_host` :
+- halt → preuve → poweroff ;
+- sonde en 75 puis 0 sur reçu complet ;
+- reçu ancien refusé ;
+- échec de santé → `draining` ;
+- `systemd-analyze verify` des unités.
 
 ## Contrôle et retour arrière
 
