@@ -1338,6 +1338,9 @@ class Plan:
     #: #6152: the release version already naming the chosen base (a manual
     #: cutoff tagged it); the slot is skipped, no tag or branch is produced.
     skipped: str | None = None
+    #: #6243: the frozen candidate `skipped` is empty — nothing to publish,
+    #: no tag ever existed — not a base a release already names.
+    skipped_empty: bool = False
     #: #2692: the target head's CI is not green (#3633: red, cancelled, absent
     #: or in progress), but its tree is the packet head's green content; the
     #: evidence (head, runs) or None.
@@ -1622,10 +1625,11 @@ def tree_proof_text(head: str, proof: dict) -> str:
 
 
 def build_plan(cfg, project: ProjectRelease, *, now: float,
-               version: str | None = None, db=None) -> Plan:
+               version: str | None = None, db=None, state=None) -> Plan:
     if project.model == "nexlink":
         from . import nexlink_release
-        return nexlink_release.plan(cfg, project, now=now, version=version)
+        return nexlink_release.plan(cfg, project, now=now, version=version,
+                                    state=state)
     rules, source = compiled_rules(cfg, project.name)
     cutoff_at, cutoff_label = cutoff_slot(rules, now)
     fetch(project.repo, project.remote, project.target)

@@ -118,6 +118,41 @@ class TagTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = types.SimpleNamespace(state_dir=self.temp.name)
+        self.project = rc.ProjectRelease("nexlink", "/unused", target="develop",
+                                         model="nexlink")
+        self.main, self.head, self.base = "a" * 40, "b" * 40, "c" * 40
+
+    def save_pending(self, **updates):
+        pending = {"version": "11av", "base": self.base, "previous": "a" * 40,
+                   "sha": "e" * 40, "cutoff_at": 1000, "label": "11:00",
+                   "empty": False}
+        pending.update(updates)
+        rc.save_state(self.cfg, {"schema": rc.SCHEMA,
+                                 "projects": {"nexlink": {"pending_nexlink": pending}}})
+        return pending
+
+    def patched(self, *, cutoff_at=1000, tags=None, choose="11ax"):
+        """The release reads, mocked; returns (ExitStack, choose_version mock)."""
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        for patcher in (
+                mock.patch.object(rc, "compiled_rules",
+                                  return_value=(object(), types.SimpleNamespace(commit="d" * 40))),
+                mock.patch.object(rc, "cutoff_slot", return_value=(cutoff_at, "11:00")),
+                mock.patch.object(nx, "snapshot",
+                                  return_value=(self.head, self.base, self.main, {}, None)),
+                mock.patch.object(nx, "previous_release", return_value=self.main),
+                mock.patch.object(nx, "tagged_at", return_value=set()),
+                mock.patch.object(nx, "release_tags", return_value=tags or {})):
+            stack.enter_context(patcher)
+        choose_mock = stack.enter_context(
+            mock.patch.object(nx, "choose_version", return_value=choose))
+        return stack, choose_mock
+
     def test_plan_marks_a_tagged_base_as_skipped(self):
         cfg = types.SimpleNamespace()
         project = rc.ProjectRelease("nexlink", "/unused", target="develop", model="nexlink")
@@ -135,6 +170,65 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan.version, "11au")
         choose.assert_not_called()
         self.assertIn("Créneau sauté", plan.notes)
+
+    def test_plan_settles_the_pending_the_tick_would_skip(self):
+        """#6243: the 11av pending on an 11au-tagged base is a skip, not a cut."""
+        self.save_pending()
+        stack, choose = self.patched(tags={"11au": self.base})
+        plan = nx.plan(self.cfg, self.project, now=1000,
+                       state=rc.load_state(self.cfg))
+        self.assertEqual(plan.skipped, "11au")
+        self.assertFalse(plan.skipped_empty)
+        self.assertEqual(plan.version, "11au")
+        choose.assert_not_called()
+        self.assertIn("release-11au", plan.notes)
+
+    def test_plan_settles_an_empty_pending_as_an_empty_skip(self):
+        """#6243: nothing to publish, and no release-X tag exists to name."""
+        self.save_pending(empty=True)
+        stack, choose = self.patched(tags={})
+        plan = nx.plan(self.cfg, self.project, now=1000,
+                       state=rc.load_state(self.cfg))
+        self.assertEqual(plan.skipped, "11av")
+        self.assertTrue(plan.skipped_empty)
+        choose.assert_not_called()
+        self.assertIn("vide", plan.notes)
+
+    def test_plan_keeps_the_current_cut_after_an_older_pending(self):
+        """An older pending is settled, then the tick still cuts this slot."""
+        self.save_pending(cutoff_at=1000)
+        stack, choose = self.patched(cutoff_at=2000, tags={"11au": self.base})
+        plan = nx.plan(self.cfg, self.project, now=2000,
+                       state=rc.load_state(self.cfg))
+        self.assertIsNone(plan.skipped)
+        self.assertEqual(plan.version, "11ax")
+        choose.assert_called_once()
+        self.assertIn("soldé", plan.notes)
+
+    def test_dry_run_reports_the_pending_skip_instead_of_planned(self):
+        """#6243: the preview must not announce a cut `execute` only skips."""
+        self.save_pending()
+        stack, choose = self.patched(tags={"11au": self.base})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = release._dry_run(self.cfg, self.project, now=1000,
+                                    version=None, as_json=True)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["result"], "skipped")
+        self.assertEqual(payload["skipped"], "11au")
+        self.assertFalse(payload["skipped_empty"])
+        choose.assert_not_called()
+
+    def test_dry_run_text_names_an_empty_pending_skip(self):
+        self.save_pending(empty=True)
+        stack, choose = self.patched(tags={})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            release._dry_run(self.cfg, self.project, now=1000,
+                             version=None, as_json=False)
+        self.assertIn("coupe vide", out.getvalue())
+        self.assertIn("release-11av non posée", out.getvalue())
 
 
 class ExecuteTests(unittest.TestCase):
@@ -288,7 +382,14 @@ class ExecuteTests(unittest.TestCase):
 
 
 class DryRunTests(unittest.TestCase):
-    def plan(self, skipped):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = types.SimpleNamespace(state_dir=self.temp.name)
+        self.project = rc.ProjectRelease("nexlink", "/unused", target="develop",
+                                         model="nexlink")
+
+    def plan(self, skipped, skipped_empty=False):
         return types.SimpleNamespace(
             canon_commit="d" * 40, cutoff_at=1000, cutoff_label="11:00",
             head="b" * 40, green=True, last_green="b" * 40, base="c" * 40,
@@ -296,33 +397,45 @@ class DryRunTests(unittest.TestCase):
             version=skipped or "11av", floor="patch",
             floor_reason="Nexlink release branch sequence", packets=[], direct=[],
             migrations=[], included=[], excluded=[], notes="", empty=False,
-            tree_green=None, kept_active={}, skipped=skipped)
+            tree_green=None, kept_active={}, skipped=skipped,
+            skipped_empty=skipped_empty)
 
     def test_dry_run_prints_skipped(self):
-        project = rc.ProjectRelease("nexlink", "/unused", target="develop", model="nexlink")
         with mock.patch.object(rc, "build_plan", return_value=self.plan("11au")):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                release._dry_run(None, project, now=1000, version=None, as_json=False)
+                release._dry_run(self.cfg, self.project, now=1000, version=None,
+                                 as_json=False)
         self.assertIn("créneau sauté : tête déjà coupée en release-11au", out.getvalue())
         self.assertIn("skipped", out.getvalue())
 
     def test_dry_run_json_reports_skipped(self):
-        project = rc.ProjectRelease("nexlink", "/unused", target="develop", model="nexlink")
         with mock.patch.object(rc, "build_plan", return_value=self.plan("11au")):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                release._dry_run(None, project, now=1000, version=None, as_json=True)
+                release._dry_run(self.cfg, self.project, now=1000, version=None,
+                                 as_json=True)
         report = json.loads(out.getvalue())
         self.assertEqual(report["result"], "skipped")
         self.assertEqual(report["skipped"], "11au")
 
+    def test_dry_run_text_names_an_empty_pending_skip(self):
+        """#6243: an empty candidate names no release tag; say so."""
+        with mock.patch.object(rc, "build_plan",
+                               return_value=self.plan("11av", skipped_empty=True)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                release._dry_run(self.cfg, self.project, now=1000, version=None,
+                                 as_json=False)
+        self.assertIn("coupe vide", out.getvalue())
+        self.assertIn("release-11av non posée", out.getvalue())
+
     def test_dry_run_keeps_a_fresh_base_as_planned(self):
-        project = rc.ProjectRelease("nexlink", "/unused", target="develop", model="nexlink")
         with mock.patch.object(rc, "build_plan", return_value=self.plan(None)):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                release._dry_run(None, project, now=1000, version=None, as_json=True)
+                release._dry_run(self.cfg, self.project, now=1000, version=None,
+                                 as_json=True)
         report = json.loads(out.getvalue())
         self.assertEqual(report["result"], "planned")
         self.assertIsNone(report["skipped"])

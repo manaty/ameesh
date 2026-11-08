@@ -383,20 +383,47 @@ def snapshot(project):
     return head, base, main, reading, proof
 
 
-def plan(cfg, project, *, now, version=None):
-    """Read-only preview; the final merge must still pass its own CI."""
+def plan(cfg, project, *, now, version=None, state=None):
+    """Read-only preview; the final merge must still pass its own CI.
+
+    #6243: with the durable `state`, the preview settles the same skip
+    `execute` decides before cutting. A frozen candidate the tick would only
+    abandon must not be announced as a fresh cut. A candidate from an earlier
+    slot is settled *and* the tick still cuts the current slot, so the preview
+    keeps that cut and only names the pending.
+    """
     rules, source = rc.compiled_rules(cfg, project.name)
     at, label = rc.cutoff_slot(rules, now)
     head, base, main, reading, proof = snapshot(project)
     previous = previous_release(project, main)
     skipped = already_cut(project, base, previous)
+    skipped_empty = False
+    settling = ""
+    pending = None
+    if state is not None:
+        pending = rc.project_state(state, project.name).get("pending_nexlink")
+    if pending is not None:
+        settle = pending_already_cut(project, pending)
+        if settle and float(pending.get("cutoff_at") or 0) >= at:
+            skipped, skipped_empty = settle
+        elif settle:
+            settling = ("Le candidat figé release-%s (créneau %s) sera soldé "
+                        "skipped avant la coupe." % (
+                            pending.get("version"),
+                            pending.get("label") or label))
     value = skipped or choose_version(project, version)
     notes = "Merge develop %s + main %s; final-tree CI pending." % (base, main)
     if skipped:
-        notes = ("Créneau sauté : la base %s porte déjà release-%s ; aucun tag, "
-                 "aucune branche." % (base, skipped))
+        if skipped_empty:
+            notes = ("Créneau sauté : le candidat figé release-%s est vide, aucun "
+                     "contenu nouveau à publier ; aucun tag, aucune branche." % skipped)
+        else:
+            notes = ("Créneau sauté : la base %s porte déjà release-%s ; aucun tag, "
+                     "aucune branche." % (base, skipped))
     elif proof is not None:
         notes += " " + tree_proof_text(head, proof)
+    if settling:
+        notes = settling + " " + notes
     return rc.Plan(project=project, rules=rules, canon_commit=source.commit,
                    cutoff_at=at, cutoff_label=label, head=head, ci=reading,
                    green=base == head, last_green=base, base=base,
@@ -404,7 +431,7 @@ def plan(cfg, project, *, now, version=None):
                    floor="patch", floor_reason="Nexlink release branch sequence",
                    packets=[], direct=[], migrations=[], included=[], excluded=[],
                    notes=notes, empty=rc.same_tree(project.repo, base, previous),
-                   tree_green=proof, skipped=skipped)
+                   tree_green=proof, skipped=skipped, skipped_empty=skipped_empty)
 
 
 def merge_candidate(project, base, main):
