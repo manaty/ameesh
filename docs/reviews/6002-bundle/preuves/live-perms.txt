@@ -1,0 +1,106 @@
+# preuves live #6002 tranche 1, 2026-11-08T04:06:24Z, bureau-goal, sans contenu de fichier
+## namei
+f: /opt/ameesh-vm-adapter/venv/bin/python
+drwxr-xr-x root root /
+drwxr-xr-x root root opt
+drwxr-xr-x root root ameesh-vm-adapter
+lrwxrwxrwx root root venv -> venv-71ec56e3a8ae
+drwxr-xr-x root root   venv-71ec56e3a8ae
+drwxr-xr-x root root bin
+lrwxrwxrwx root root python -> python3.12
+lrwxrwxrwx root root   python3.12 -> /usr/bin/python3.12
+drwxr-xr-x root root     /
+drwxr-xr-x root root     usr
+drwxr-xr-x root root     bin
+-rwxr-xr-x root root     python3.12
+
+f: /opt/ameesh-vm-adapter/commandes/vm-commande.py
+drwxr-xr-x root root /
+drwxr-xr-x root root opt
+drwxr-xr-x root root ameesh-vm-adapter
+drwxr-xr-x root root commandes
+-rw-r--r-- root root vm-commande.py
+
+f: /etc/ameesh-vm-adapter/cibles/ameesh-agents-3.json
+drwxr-xr-x root  root  /
+drwxr-xr-x root  root  etc
+drwxr-x--- root  agent ameesh-vm-adapter
+drwxr-x--- root  agent cibles
+-rw------- agent agent ameesh-agents-3.json
+
+f: /etc/ameesh-vm-adapter/ssh/known_hosts_ag3
+drwxr-xr-x root  root  /
+drwxr-xr-x root  root  etc
+drwxr-x--- root  agent ameesh-vm-adapter
+drwxr-x--- root  agent ssh
+-rw------- agent agent known_hosts_ag3
+
+f: /var/lib/ameesh-vm-adapter
+drwxr-xr-x root  root  /
+drwxr-xr-x root  root  var
+drwxr-xr-x root  root  lib
+drwx------ agent agent ameesh-vm-adapter
+
+f: /home/agent/.ssh/id_ed25519
+drwxr-xr-x root  root  /
+drwxr-xr-x root  root  home
+drwxr-x--- agent agent agent
+drwx------ agent agent .ssh
+-rw------- agent agent id_ed25519
+
+## stat (mode uid gid nlink type)
+drwxr-xr-x 755 root root 9 directory /opt/ameesh-vm-adapter
+drwxr-xr-x 755 root root 2 directory /opt/ameesh-vm-adapter/commandes
+-rw------- 600 root root 1 regular empty file /opt/ameesh-vm-adapter/create-venv.private.log
+-rw------- 600 root root 1 regular file /opt/ameesh-vm-adapter/decision-tests.private.log
+-rw-r--r-- 644 root root 1 regular file /opt/ameesh-vm-adapter/disabled-preparation.public.json
+-rw------- 600 root root 1 regular file /opt/ameesh-vm-adapter/import-only-as-operator.private.log
+-rw-r--r-- 644 root root 1 regular empty file /opt/ameesh-vm-adapter/install-71ec56e3a8ae.private.log
+-rw------- 600 root root 1 regular file /opt/ameesh-vm-adapter/install-native-runtime.private.log
+-rw-r--r-- 644 root root 1 regular file /opt/ameesh-vm-adapter/preparation.public.json
+-rw-r--r-- 644 root root 1 regular file /opt/ameesh-vm-adapter/qualification-pure.public.json
+drwxr-xr-x 755 root root 2 directory /opt/ameesh-vm-adapter/review
+drwxr-xr-x 755 root root 2 directory /opt/ameesh-vm-adapter/review-71ec56e3a8ae
+drwxr-xr-x 755 root root 16 directory /opt/ameesh-vm-adapter/src
+drwxr-xr-x 755 root root 16 directory /opt/ameesh-vm-adapter/src-71ec56e3a8ae
+-rw------- 600 root root 1 regular empty file /opt/ameesh-vm-adapter/systemd-verify.private.log
+lrwxrwxrwx 777 root root 1 symbolic link /opt/ameesh-vm-adapter/venv
+drwxr-xr-x 755 root root 6 directory /opt/ameesh-vm-adapter/venv-33bfa473
+drwxr-xr-x 755 root root 6 directory /opt/ameesh-vm-adapter/venv-71ec56e3a8ae
+-rw-r--r-- 644 root root 1 regular file /opt/ameesh-vm-adapter/commandes/vm-commande.py
+drwxr-x--- 750 root agent 4 directory /etc/ameesh-vm-adapter
+-rw------- 600 agent agent 1 regular file /etc/ameesh-vm-adapter/ameesh.json
+drwxr-x--- 750 root agent 2 directory /etc/ameesh-vm-adapter/cibles
+-rw------- 600 agent agent 1 regular file /etc/ameesh-vm-adapter/database.env
+-rw------- 600 agent agent 1 regular file /etc/ameesh-vm-adapter/enrollment.json
+-rw------- 600 root root 1 regular file /etc/ameesh-vm-adapter/enrollment.json.avant-v2-20261108T0345Z
+-rw------- 600 agent agent 1 regular file /etc/ameesh-vm-adapter/pgpass
+-rw------- 600 root root 1 regular file /etc/ameesh-vm-adapter/scaleway.json
+drwxr-x--- 750 root agent 2 directory /etc/ameesh-vm-adapter/ssh
+-rw------- 600 agent agent 1 regular file /etc/ameesh-vm-adapter/cibles/ameesh-agents-3.json
+-rw------- 600 agent agent 1 regular file /etc/ameesh-vm-adapter/ssh/known_hosts_ag3
+drwx------ 700 agent agent 2 directory /var/lib/ameesh-vm-adapter
+## liens venv
+venv-71ec56e3a8ae
+python -> python3.12
+python3 -> python3.12
+python3.12 -> /usr/bin/python3.12
+## getfacl
+/bin/bash: line 14: getfacl: command not found
+(vide = aucune ACL étendue)
+## écriture groupe/autres sous /opt (doit être vide)
+## propriétaire non-root sous /opt (doit être vide)
+## ACL POSIX (xattr system.posix_acl_*), getfacl absent sur BG
+entrées avec ACL : 0
+logs-secret-grep-rc=1
+/etc/ameesh-vm-adapter []
+/etc/ameesh-vm-adapter/enrollment.json.avant-v2-20261108T0345Z []
+/etc/ameesh-vm-adapter/pgpass []
+/etc/ameesh-vm-adapter/scaleway.json []
+/etc/ameesh-vm-adapter/enrollment.json []
+/etc/ameesh-vm-adapter/ameesh.json []
+/etc/ameesh-vm-adapter/database.env []
+/etc/ameesh-vm-adapter/ssh []
+/etc/ameesh-vm-adapter/ssh/known_hosts_ag3 []
+/etc/ameesh-vm-adapter/cibles []
+/etc/ameesh-vm-adapter/cibles/ameesh-agents-3.json []

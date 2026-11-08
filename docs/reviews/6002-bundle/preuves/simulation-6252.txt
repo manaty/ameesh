@@ -1,0 +1,25 @@
+# python -m unittest -v tests.test_6252_vm_commandes, venv /opt/ameesh-vm-adapter/venv -> venv-71ec56e3a8ae, 2026-11-08T04:06:53Z
+test_concurrent_invocations_launch_one_probe (tests.test_6252_vm_commandes.CloudCycleTest.test_concurrent_invocations_launch_one_probe) ... ok
+test_halt_then_proof_then_poweroff (tests.test_6252_vm_commandes.CloudCycleTest.test_halt_then_proof_then_poweroff) ... ok
+test_health_failure_goes_back_to_draining_then_one_new_probe (tests.test_6252_vm_commandes.CloudCycleTest.test_health_failure_goes_back_to_draining_then_one_new_probe) ... ok
+test_probe_waits_75_then_ready_on_its_complete_receipt (tests.test_6252_vm_commandes.CloudCycleTest.test_probe_waits_75_then_ready_on_its_complete_receipt) ... ok
+test_quiesce_failure_is_a_wait_without_halt (tests.test_6252_vm_commandes.CloudCycleTest.test_quiesce_failure_is_a_wait_without_halt) ... ok
+test_reconcile_failure_keeps_claims_closed (tests.test_6252_vm_commandes.CloudCycleTest.test_reconcile_failure_keeps_claims_closed) ... ok
+test_transport_cut_after_the_receipt_is_a_wait (tests.test_6252_vm_commandes.CloudCycleTest.test_transport_cut_after_the_receipt_is_a_wait) ... ok
+test_unclean_previous_boot_fails_health (tests.test_6252_vm_commandes.CloudCycleTest.test_unclean_previous_boot_fails_health) ... ok
+test_a_held_vm_lock_is_a_wait_without_effect (tests.test_6252_vm_commandes.TargetTest.test_a_held_vm_lock_is_a_wait_without_effect) ... ok
+test_enrollment_example_points_at_the_five_commands (tests.test_6252_vm_commandes.TargetTest.test_enrollment_example_points_at_the_five_commands) ... ok
+test_example_is_valid_and_names_no_real_host (tests.test_6252_vm_commandes.TargetTest.test_example_is_valid_and_names_no_real_host) ... ok
+test_halt_writes_its_marker_before_the_guest_poweroff (tests.test_6252_vm_commandes.TargetTest.test_halt_writes_its_marker_before_the_guest_poweroff) ... ok
+test_halted_is_a_witness_of_silence_only (tests.test_6252_vm_commandes.TargetTest.test_halted_is_a_witness_of_silence_only) ... ok
+test_private_files_required (tests.test_6252_vm_commandes.TargetTest.test_private_files_required) ... ok
+test_receipt_contract (tests.test_6252_vm_commandes.TargetTest.test_receipt_contract) ... ok
+test_refusals (tests.test_6252_vm_commandes.TargetTest.test_refusals) ... ok
+test_script_runs_isolated_and_silent (tests.test_6252_vm_commandes.TargetTest.test_script_runs_isolated_and_silent) ... ok
+test_ssh_is_fixed_and_children_inherit_no_secret (tests.test_6252_vm_commandes.TargetTest.test_ssh_is_fixed_and_children_inherit_no_secret) ... ok
+test_units_verify (tests.test_6252_vm_commandes.TargetTest.test_units_verify) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 12.889s
+
+OK
