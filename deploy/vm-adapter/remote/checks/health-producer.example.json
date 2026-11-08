@@ -1,0 +1,7 @@
+{
+  "venv": "/home/ameesh/.local/share/ameesh/venv",
+  "verifier": "/opt/ameesh-vm-adapter/checks/venv-processus.py",
+  "units": ["ameesh-runner-agent@burst-host-probe.service"],
+  "environment_file": "/home/ameesh/.config/ameesh/env",
+  "receipt": "/var/lib/ameesh-vm-health/health.json"
+}

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=Publish VM operator health receipt (#6296)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/ameesh-vm-adapter/checks/health.py produce
+EnvironmentFile=%h/.config/ameesh/env
+UMask=0027
+TimeoutStartSec=50
+TimeoutStopSec=1
+KillMode=control-group
+NoNewPrivileges=yes
+StandardOutput=null
+StandardError=null

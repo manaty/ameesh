@@ -1,0 +1,6 @@
+{
+  "receipt": "/var/lib/ameesh-vm-health/health.json",
+  "producer_uid": 1000,
+  "period_s": 60,
+  "venv": "/home/ameesh/.local/share/ameesh/venv"
+}
