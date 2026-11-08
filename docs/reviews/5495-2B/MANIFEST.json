@@ -1,0 +1,25 @@
+{
+  "lot": 5495,
+  "phase": "2B",
+  "host": "ameesh-agents-1",
+  "author": {
+    "actor": "bureau",
+    "host": "bureau-goal",
+    "family": "claude"
+  },
+  "at": "2026-11-08T04:09:34.006021+00:00",
+  "no_pose": true,
+  "targets": [
+    "ameesh-agents-1",
+    "ameesh-agents-2",
+    "ameesh-agents-3"
+  ],
+  "deferred": [
+    "manaty-mesh-1"
+  ],
+  "files": {
+    "DOSSIER-2B.md": "141f04571269daa4b5a5554ad9ce46652308d0cf41c4e3ef466b67453f47f37c",
+    "pose-2B-AG1.sh": "bbc092af804927bfc6b6f329fad4ae4b27b7c6908c27cb9bd9209e15e43196b3",
+    "retour-2B-AG1.sh": "a7dde30a2dfa5132453b83cb145403fdf97dbd1bf26732b4bdc0b139b1ec843e"
+  }
+}
