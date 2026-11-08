@@ -9189,8 +9189,8 @@ class AgentWorker(threading.Thread):
                 self.preempting.clear()
         preempt_thread.start()
         from .platform import audit_guard
-        audit_exempt = (self.runner.is_auditor(self.name, self.agent)
-                        and self.runner.host_pressure().get("blocked"))
+        auditeur = self.runner.is_auditor(self.name, self.agent)
+        audit_exempt = auditeur and self.runner.host_pressure().get("blocked")
         self._audit_guard_error = ""
         audit_seconds = min(audit_guard.WALL_SECONDS,
                             self.turn_max_seconds() or audit_guard.WALL_SECONDS)
@@ -9199,7 +9199,9 @@ class AgentWorker(threading.Thread):
                              args=(preempt_done, time.monotonic() + audit_seconds),
                              daemon=True).start()
         from .platform import child_environment
-        env = child_environment.harness(env, harness, compte)
+        # #6287 : le rôle auditeur reçoit en plus son propre DSN en lecture
+        # seule ; aucun autre agent, aucune liste blanche par nom d'exécutable.
+        env = child_environment.harness(env, harness, compte, auditor=auditeur)
         # #5529 : preuve de refus avant tout appel fournisseur. Le squelette du
         # tour est privé (0600) et son jeton ne part JAMAIS dans l'environnement
         # (`child_environment` filtre les variables en `*_TOKEN`) ; seul le
@@ -16097,9 +16099,19 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         if perdu.is_set():
             return 1
         log_async("[%s] interactive session: %s" % (name, " ".join(argv)))
+        from . import alert_briefs, auditor as auditor_mod, canon as canon_mod
         from .platform import child_environment
+        # #6287 : l'agent auditeur — la persona, ou un rôle auditeur du canon
+        # propriétaire — reçoit son propre DSN en lecture seule ; la variable
+        # n'existe que sur l'unité qui la pose, et le canon n'est chargé que
+        # dans ce cas.
+        auditeur = bool(os.environ.get("AUDITEUR_DSN")) and (
+            name == alert_briefs.AUDITOR_NAME
+            or auditor_mod.is_auditor(
+                db, name, canon_mod.load_configured(cfg), agent))
         proc = subprocess.Popen(argv, cwd=cwd, env=child_environment.harness(
-                                    env, harness_revendique, compte),
+                                    env, harness_revendique, compte,
+                                    auditor=auditeur),
                                 start_new_session=True)
         # Course de publication (même correctif que B5a-P) : le veilleur a pu
         # conclure pendant que ce Popen n'était pas encore publié.

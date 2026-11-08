@@ -18,7 +18,9 @@
 -- la garantie reste les GRANT de colonne des contrats. `jit=off` (#3503) évite
 -- de compiler les plans coûteux sur de petites tables. Le mot de passe n'est
 -- JAMAIS dans ce fichier : le propriétaire pose `\password <role>`, puis une
--- ligne dans le `~/.pgpass` (0600) de l'hôte de l'auditeur.
+-- ligne dans le fichier 0600 que le DSN de l'exécuteur nomme par `passfile=`
+-- (jamais `PGPASSFILE` sur l'unité, qui masquerait le `~/.pgpass` de
+-- l'exécuteur).
 --
 -- TRANSACTIONNEL ET IDEMPOTENT : une appartenance hors des deux contrats ou
 -- des rôles de base absents font échouer le script et annulent tout. Le
