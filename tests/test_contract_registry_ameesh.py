@@ -68,8 +68,14 @@ class AmeeshRegistryTests(unittest.TestCase):
 
     def test_sql_roles_keep_column_and_reader_rights_contracts(self):
         for module in ('test_cluster', 'test_2340_auditeur_role',
-                       'test_6011_contrat_ecrivains_isoles'):
+                       'test_6011_contrat_ecrivains_isoles', 'test_6298_vm_probe'):
             self.assert_contract('deploy/sql/role-module-writers.sql', module, 'sql-roles')
+
+    def test_vm_probe_contract_follows_native_schema_and_endpoint(self):
+        self.assert_contract('src/ameesh/migrations/0999_future.sql',
+                             'test_6298_vm_probe', 'migrations', 'A')
+        self.assert_contract('deploy/vm-adapter/remote/vm-remote.py',
+                             'test_6298_vm_probe', 'vm-local-health')
 
     def test_registry_and_engine_select_all_declared_contracts(self):
         known = {m for r in self.registry.rules for m in r.modules}
@@ -97,7 +103,8 @@ class AmeeshRegistryTests(unittest.TestCase):
                                              "test_6186_project_plan",
                                              "test_6274_composeur_plan_declare",
                                              "test_6296_vm_local_checks",
-                                             "test_6264_packet_mechanics_contracts"})
+                                             "test_6264_packet_mechanics_contracts",
+                                             "test_6298_vm_probe"})
         for changes in ((), (cs.Change('M', 'src/ameesh/storage/interface.py'),),
                         (cs.Change('A', 'unknown/new.file'),)):
             result = self.select(*changes)
