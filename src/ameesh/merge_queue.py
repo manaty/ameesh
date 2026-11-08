@@ -574,9 +574,12 @@ def _designated_base(db, item, milestone, repo, frozen) -> str:
     (`review_target.resolve`) et en garde le début, `merge-base(cible, tête)`,
     dans sa marque. La porte relit la même plage : elle ne dépend plus de la
     fraîcheur de la ref `origin/<cible>` du clone qui la lit, ni d'une forge
-    joignable. Seule une marque écrite par le système compte (une note d'agent
-    peut en copier le texte) ; la base doit être un commit présent et un
-    ancêtre strict de la tête. Sinon "" : la lecture d'avant s'applique."""
+    joignable. L'acteur d'une note est déclaratif (`work note --actor`) : seule
+    compte la preuve structurée que le port écrit dans `evidence` (schéma,
+    lot, gel, tête et base concordants, comme `review_floor`, #3183) ; une
+    copie du texte est ignorée quel que soit l'acteur revendiqué. La base
+    doit être un commit présent et un ancêtre strict de la tête. Sinon "" :
+    la lecture d'avant s'applique."""
     from . import review_designation_pg as pg
 
     try:
@@ -584,7 +587,8 @@ def _designated_base(db, item, milestone, repo, frozen) -> str:
         freeze_id = int((milestone or {}).get("id") or 0)
     except (TypeError, ValueError):
         return ""
-    if not lot or not freeze_id or not repo or not frozen:
+    head = plan_git.full_commit_id(frozen)
+    if not lot or not freeze_id or not repo or not head:
         return ""
     try:
         events = storage.of(db).work.events_noted(
@@ -593,20 +597,24 @@ def _designated_base(db, item, milestone, repo, frozen) -> str:
         return ""
     base = ""
     for event in sorted(events, key=lambda row: int((row or {}).get("id") or 0)):
-        if str((event or {}).get("actor") or "").strip() != pg.SENDER:
-            continue
         try:
             payload = pg.designation_of(str((event or {}).get("note") or ""))
-            if int((payload or {}).get("freeze", {}).get("id") or 0) != freeze_id:
+            evidence = (event or {}).get("evidence")
+            if isinstance(evidence, str):
+                evidence = json.loads(evidence)
+            noted = plan_git.full_commit_id((payload or {}).get("base"))
+            if not noted or evidence != pg.base_evidence(lot, freeze_id, head, noted):
                 continue
-        except Exception:  # noqa: BLE001 - marque illisible : ignorée
+            if int((payload.get("freeze") or {}).get("id") or 0) != freeze_id \
+                    or plan_git.full_commit_id(
+                        (payload.get("freeze") or {}).get("sha")) != head:
+                continue
+        except Exception:  # noqa: BLE001 - marque ou preuve illisible : ignorée
             continue
-        noted = plan_git.full_commit_id(payload.get("base"))
-        if noted:
-            base = noted
-    if not base or plan_git.same_commit(base, frozen):
+        base = noted
+    if not base or base == head:
         return ""
-    if not plan_git._commit(repo, base) or not plan_git._is_ancestor(repo, base, frozen):
+    if not plan_git._commit(repo, base) or not plan_git._is_ancestor(repo, base, head):
         return ""
     return base
 

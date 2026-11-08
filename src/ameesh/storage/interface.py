@@ -2674,10 +2674,13 @@ class WorkItems(Domain):
         state was set without a journal line)."""
 
     @abc.abstractmethod
-    def note(self, item_id: int, state: str, text: str, actor: str, *, once: bool = False) -> None:
+    def note(self, item_id: int, state: str, text: str, actor: str, *, once: bool = False,
+             evidence: dict | None = None) -> None:
         """Journalise une note et rafraîchit `updated_at`.
 
         `once` sérialise sur le lot et n'insère pas un texte déjà présent.
+        `evidence` (#6365) : preuve structurée d'un écrivain système, jamais
+        posée par une écriture à texte libre.
         """
 
     @abc.abstractmethod

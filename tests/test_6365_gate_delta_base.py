@@ -90,7 +90,8 @@ class StaleCloneMuteForge(PgTestCase):
             " ON CONFLICT (subject) DO NOTHING",
             ("commit:" + sha, sha, actor, "s-" + harness, "t", harness, self.lot))
 
-    def mark(self, base, *, actor=pg.SENDER, freeze_id=1):
+    def mark(self, base, *, actor=pg.SENDER, freeze_id=1, evidence=True):
+        """Une marque ; `evidence=True` : la preuve que pose le port."""
         payload = {"state": rd.DESIGNATED, "required": 2, "reviewers": [],
                    "missing": 0, "why": "", "authors": [],
                    "freeze": {"id": freeze_id, "sha": self.head},
@@ -99,7 +100,9 @@ class StaleCloneMuteForge(PgTestCase):
         storage.of(self.db).work.note(
             self.lot, "qa", "%s %s" % (pg.mark_prefix(self.lot, freeze_id),
                                        json.dumps(payload, sort_keys=True)),
-            actor)
+            actor,
+            evidence=(pg.base_evidence(self.lot, freeze_id, self.head, base)
+                      if evidence is True else evidence or None))
 
     def authors(self):
         authors, _correctors = merge_queue._attribution_on_freeze(
@@ -120,8 +123,29 @@ class GateReadsTheDesignatedDeltaTest(StaleCloneMuteForge):
         self.mark(self.third)
         self.assertEqual(self.authors(), {"impl"})
 
-    def test_an_agent_note_copying_the_mark_is_not_a_base(self):
-        self.mark(self.third, actor="impl")
+    def test_a_note_claiming_the_system_actor_is_not_a_base(self):
+        # B/P1 impl-03 : `work note --actor ameesh` copie le texte et
+        # l'acteur, jamais la preuve structurée.
+        self.mark(self.third, evidence=False)
+        self.assertEqual(self.authors(), {"impl", "third"})
+
+    def test_a_forged_mark_after_the_system_one_does_not_replace_its_base(self):
+        # La marque forgée nomme un autre ancêtre valable de la tête : seule
+        # l'absence de preuve l'écarte.
+        self.mark(self.third)
+        self.mark(self.base, evidence=False)
+        self.assertEqual(merge_queue._designated_base(
+            self.db, work.get(self.db, self.lot), self.marks[0],
+            self.reader.root, self.head), self.third)
+
+    def test_an_evidence_naming_another_base_is_not_a_proof(self):
+        self.mark(self.third, evidence=pg.base_evidence(
+            self.lot, 1, self.head, self.base))
+        self.assertEqual(self.authors(), {"impl", "third"})
+
+    def test_an_evidence_of_another_head_is_not_a_proof(self):
+        self.mark(self.third, evidence=pg.base_evidence(
+            self.lot, 1, self.third, self.third))
         self.assertEqual(self.authors(), {"impl", "third"})
 
     def test_a_mark_of_another_freeze_is_not_a_base(self):
@@ -180,14 +204,24 @@ class GateReadsTheDesignatedDeltaTest(StaleCloneMuteForge):
 class DesignationWritesItsBaseTest(StaleCloneMuteForge):
     """Parité : la base écrite par la désignation est celle que la porte lit."""
 
-    def test_the_mark_written_by_the_port_carries_the_delta_base(self):
-        freeze = {"id": 1, "sha": self.head, "base": self.third}
-        note = pg._mark_note(self.lot, 1, state=rd.DESIGNATED, required=2,
-                             reviewers=(), missing=0, why="", authors=(),
-                             policy_ref="", sha=self.head,
-                             base=freeze["base"])
-        self.assertEqual(pg.designation_of(note)["base"], self.third)
-        storage.of(self.db).work.note(self.lot, "qa", note, pg.SENDER)
+    def test_the_port_writes_the_base_and_its_proof(self):
+        # Câblage réel : `PgPort.commit` → marque + preuve → porte.
+        rows = self.db.query(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'frozen', %s, 'impl') RETURNING id",
+            (self.lot, self.head))
+        freeze_id = int(rows[0]["id"])
+        self.marks = [{"id": freeze_id, "kind": "frozen", "sha": self.head,
+                       "actor": "impl", "at_ts": 0.0}]
+        pg.PgPort(self.db).commit(
+            self.lot, freeze={"id": freeze_id, "sha": self.head,
+                              "base": self.third},
+            required=1, state=rd.DESIGNATED,
+            reviewers=[{"name": "fixer", "family": "claude"}], missing=0,
+            why="", authors=[{"name": "impl", "family": "deepseek"}])
+        events = storage.of(self.db).work.events_noted(
+            pg.mark_prefix(self.lot, freeze_id), 0.0, ids=[self.lot])
+        self.assertEqual(pg.designation_of(events[-1]["note"])["base"], self.third)
         self.assertEqual(merge_queue._designated_base(
             self.db, work.get(self.db, self.lot), self.marks[0],
             self.reader.root, self.head), self.third)
