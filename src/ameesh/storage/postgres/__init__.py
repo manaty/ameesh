@@ -35,6 +35,7 @@ from .handoffs import Handoffs
 from .hosts import Hosts, TurnResources, Visibility
 from .github_watch import GithubWatch
 from .fingerprint_watch import FingerprintWatch
+from .repair_signals import RepairSignals
 from .mailbox import Mailbox
 from .notify_liveness import NotifyLiveness
 from .menage import Housekeeping
@@ -84,6 +85,7 @@ class PostgresStorage(interface.Storage):
         self.mailbox = Mailbox(db)
         self.github_watch = GithubWatch(db)
         self.fingerprints = FingerprintWatch(db)
+        self.repair_signals = RepairSignals(db)
         self.notify_liveness = NotifyLiveness(db)
         self.wakeups = Wakeups(db)
         self.keys = Keys(db)

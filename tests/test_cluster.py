@@ -125,6 +125,13 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #6320 (0556): private A1 receipts/cursors/refusals. U1 receives only
+    # aggregates through the native storage API; no supervisor GRANT added.
+    "repair_signal_streams": {"project", "environment", "source", "cursor", "position"},
+    "repair_signals": {"id", "project", "environment", "source", "native_id", "position",
+                       "envelope", "outcome", "outcome_ref", "created_at", "updated_at"},
+    "repair_signal_refusals": {"project", "environment", "source", "rejection_key", "reason", "created_at"},
+
     # #6017 (0552) : sonde admise sur un retour clos, tenue par l'adaptateur VM
     # et lue par le prédicat de prise ; fermée aux deux rôles, aucun GRANT modifié.
     "host_lifecycle": {"return_probe"},
