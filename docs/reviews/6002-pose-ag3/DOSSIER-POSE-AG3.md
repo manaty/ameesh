@@ -29,3 +29,8 @@ sudoers, drop-in sshd et clé retirés (`sshd -t`, reload), `userdel`, `/var/lib
 - B1/B2 : chaque bloc distant est un script entre guillemets envoyé par `bash -s -- <args>` (plus aucune expansion locale) ; contrôles `find` bloquants et cités ; groupes du compte vérifiés exactement.
 - B3 : sudoers préparé dans `$OPS` (0700 root), validé (`visudo -cf`) puis installé depuis ce même fichier ; plus de /tmp.
 - B4 : attendus corrigés (tout refusé avant remote.json) ; tests en deux phases A/B avec assertions ; PTY vérifié par le message de refus.
+
+## v3 (avis B cx3 #200410)
+- B5 : la clé passe en un seul argument (base64 sans espace), `ssh-ed25519 <b64>` reconstruit sur AG3.
+- B6 : `PermitUserEnvironment` retiré du Match (interdit, `sshd -t` rc 255) ; la valeur globale `no` est vérifiée avant pose. Fragment validé AVANT installation (`sshd -t -f` sur config principale + fragment) ; si `sshd -t` échoue après installation, le drop-in est retiré et rien n'est rechargé. Validation réelle sur AG3 (fichier temporaire, rien installé) : fragment v3 rc 0 ; variante v2 refusée « not allowed within a Match block ». Le modèle source `deploy/vm-adapter/remote/sshd-match.example` porte le même défaut : signalé à mesh-design.
+- N : archive par `mktemp` + `trap` ; tests : phase A/B vérifiée ; commentaire root/ameesh corrigé.
