@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shlex
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -278,17 +279,23 @@ class NativeVM(cycle.FakeVM):
     def __init__(self, endpoint):
         super().__init__()
         self.endpoint = endpoint
+        # Once, inside the remote call: after the worker's own local checks.
+        self.halts, self.before = [], {}
 
     def run(self, argv, timeout, *, capture=False):
         args = shlex.split(argv[-1])
         name = args[0].rsplit('/', 1)[-1]
-        if name not in ('probe-start', 'probe-receipt', 'reconcile', 'mail'):
+        if name not in ('probe-start', 'probe-receipt', 'reconcile', 'mail', 'quiesce', 'sudo'):
             return super().run(argv, timeout, capture=capture)
         if name in self.failing:
             return 1, b'', b''
         if name in self.unreachable:
             return self.unreachable[name], b'', b''
         self.calls.append(args)
+        if name in self.before:
+            self.before.pop(name)()
+        if name == 'sudo':
+            return self.poweroff(argv[-1])
         if name == 'probe-start':
             self.launches.append(args[1:])
             if self.on_start:
@@ -299,6 +306,29 @@ class NativeVM(cycle.FakeVM):
             return code, json.dumps(value).encode() if value is not None else b'', b''
         except remote.Refus:
             return 1, b'', b''
+
+    def poweroff(self, command):
+        """The forced-key entry itself: its native guard, then the fixed HALT."""
+        def runner(argv, **kw):
+            # main() swallows exceptions: record, the test asserts.
+            self.halts.append((argv, kw['env']))
+            if self.on_halt:
+                self.on_halt()
+            self.up, self.provider = False, 'stopped in place'
+            return SimpleNamespace(returncode=0)
+        db = self.endpoint.native.db
+        class Connection:  # main() closes its connection; the test owns this one
+            def __getattr__(self, name):
+                return getattr(db, name)
+            def close(self):
+                pass
+        with mock.patch.object(remote, 'private_json', return_value=self.endpoint.cfg), \
+                mock.patch.object(remote.os, 'geteuid', return_value=1001), \
+                mock.patch('ameesh.config.load_file', return_value=None):
+            code = remote.main(['dispatch'], environ={'SSH_ORIGINAL_COMMAND': command},
+                               connect=lambda _: Connection(), runner=runner)
+        # The guest drops the connection while powering off.
+        return (255 if not self.up else code), b'', b''
 
 
 class NativeCycleTest(cycle.CloudCycleTest):
@@ -360,3 +390,43 @@ class NativeCycleTest(cycle.CloudCycleTest):
             self.db.execute("UPDATE agent_mailbox SET payload=jsonb_build_object('vm_probe',%s::jsonb) WHERE id=%s",
                             (json.dumps({k: value[k] for k in ('host','probe_agent','generation','release_epoch','nonce')}),
                              launch['request_id']))
+
+    def drained(self):
+        control = self.q.control('burst')
+        self.q.request('burst', control['generation'], control['release_epoch'], 'idle-drained')
+        self.q.observe('burst', 'running', 90)
+        self.db.execute("UPDATE vm_adapter_observations SET on_since=clock_timestamp()-interval '2 hours'")
+
+    def running_turn(self):
+        self.db.execute("INSERT INTO turn_resources(turn_id,agent,host,status) "
+                        "VALUES ('late-turn','burst-probe','burst','running')")
+
+    def test_native_quiesce_and_guard_pass_then_the_fixed_poweroff_runs(self):
+        self.drained()
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.assertEqual(self.tick(), 'halt prepared')
+        self.assertEqual(self.tick(), 'halt sent')
+        self.assertEqual(self.vm.halts, [(remote.HALT, remote.ENV)])
+        self.assertEqual([c[0] for c in self.vm.calls if c[0].endswith(('quiesce', 'sudo'))],
+                         [remote.PREFIX + 'quiesce'] * 2 + ['/usr/bin/sudo'])
+
+    def test_native_quiesce_waits_for_a_running_turn(self):
+        self.drained()
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.vm.before['quiesce'] = self.running_turn
+        self.assertEqual(self.tick(), 'quiesce pending')
+        self.assertNotIn('halt', self.verbs)
+        self.assertEqual((self.vm.provider, self.vm.halts), ('running', []))
+
+    def test_vm_guard_refuses_poweroff_when_a_turn_starts_after_quiesce(self):
+        self.drained()
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.assertEqual(self.tick(), 'halt prepared')
+        self.vm.before['sudo'] = self.running_turn
+        # The worker never trusts the halt command's code: "halt sent" either
+        # way. Only the guest staying up shows the VM guard refused.
+        self.assertEqual(self.tick(), 'halt sent')
+        self.assertEqual(self.verbs[-2:], ['quiesce', 'halt'])
+        self.assertEqual((self.vm.provider, self.vm.up, self.vm.halts), ('running', True, []))
+        self.assertEqual(self.tick(), 'halt pending')
+        self.assertNotIn('halted', self.verbs)
