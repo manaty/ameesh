@@ -326,6 +326,36 @@ class Endpoint:
         raise Refus('unknown native verb')
 
 
+def root_executable(enrolled):
+    """Check every component and symlink hop before using a root-owned argv.
+
+    Symlink mode bits have no security meaning. Ownership still does, as do
+    the permissions of every directory traversed, including link targets.
+    """
+    pending = list(Path(enrolled).parts[1:])
+    current = Path('/')
+    hops = 0
+    while True:
+        info = current.lstat()
+        link = stat.S_ISLNK(info.st_mode)
+        if info.st_uid != 0 or (not link and info.st_mode & 0o022):
+            raise Refus('health executable writable outside root')
+        if link:
+            hops += 1
+            if hops > 40:
+                raise Refus('health executable symlink loop')
+            target = Path(os.readlink(current))
+            pending = list(target.parts[1:] if target.is_absolute() else target.parts) + pending
+            current = Path('/') if target.is_absolute() else current.parent
+        elif pending:
+            part = pending.pop(0)
+            current = current.parent if part == '..' else current / part
+        else:
+            if not stat.S_ISREG(info.st_mode):
+                raise Refus('health executable is not regular')
+            return
+
+
 def main(argv=None, *, environ=None, connect=None, runner=subprocess.run):
     args = sys.argv[1:] if argv is None else argv
     if args != ['dispatch']:
@@ -349,12 +379,7 @@ def main(argv=None, *, environ=None, connect=None, runner=subprocess.run):
         if verb in ('doctor', 'version-mode'):
             # Fixed root-installed checks, never an argv selected by SSH.
             check = cfg['checks'][verb]
-            enrolled = Path(check[0])
-            executable = enrolled.resolve(strict=True)
-            for path in (enrolled, *enrolled.parents, executable, *executable.parents):
-                info = path.lstat()
-                if info.st_uid != 0 or info.st_mode & 0o022:
-                    raise Refus('health executable writable outside root')
+            root_executable(check[0])
             return runner(check, env=ENV, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL, timeout=5, check=False).returncode
         from ameesh import config, db as db_mod
