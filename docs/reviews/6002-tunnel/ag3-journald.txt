@@ -1,0 +1,20 @@
+== avant
+/dev/vda1       135G   59G   76G  44% /
+/var/log/journal
+ls: cannot access '/etc/systemd/journald.conf.d/': No such file or directory
+[Journal]
+total 32
+drwxr-sr-x+  3 root systemd-journal  4096 Oct 27 07:14 .
+drwxrwxr-x  10 root syslog           4096 Nov  8 00:00 ..
+drwxr-sr-x+  2 root systemd-journal 20480 Nov  8 01:02 3ae8fa040f9f44de88b24a8e70c21fcc
+IDX BOOT ID                          FIRST ENTRY                 LAST ENTRY
+  0 4e90c7f065a840679d87ba338e30f17c Fri 2026-10-30 23:57:03 UTC Sun 2026-11-08 03:15:41 UTC
+2026-10-27 07:14:37
+== après
+897644849f75be77f591ba5b7aa0a7709bdfc969491c0c48c27fa534975dfd47  /etc/systemd/journald.conf.d/ameesh-vm-adapter.conf
+IDX BOOT ID                          FIRST ENTRY                 LAST ENTRY
+  0 4e90c7f065a840679d87ba338e30f17c Fri 2026-11-06 11:30:12 UTC Sun 2026-11-08 03:15:42 UTC
+3ae8fa040f9f44de88b24a8e70c21fcc
+452M	/var/log/journal
+/dev/vda1       135G   56G   79G  42% /
+active
