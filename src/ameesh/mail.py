@@ -633,6 +633,8 @@ def normalize(row: dict) -> dict:
         "signature_expires_ts": row.get("signature_expires_ts"),
         # déjà réservé pour une remise jamais soldée (panne) : « re-livré »
         "deja_consigne": bool(row.get("deja_consigne")),
+        "reserved_for_delivery": bool(row.get("consigne_jeton"))
+        and row.get("delivered_ts") is None,
         # renvoyé d'une boîte morte (`ameesh mail forward`) : le premier destinataire
         "forwarded_from": row.get("forwarded_from"),
     }
