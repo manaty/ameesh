@@ -75,7 +75,7 @@ class AmeeshRegistryTests(unittest.TestCase):
         self.assert_contract('src/ameesh/migrations/0999_future.sql',
                              'test_6298_vm_probe', 'migrations', 'A')
         self.assert_contract('deploy/vm-adapter/remote/vm-remote.py',
-                             'test_6298_vm_probe', 'vm-probe')
+                             'test_6298_vm_probe', 'vm-local-health')
 
     def test_registry_and_engine_select_all_declared_contracts(self):
         known = {m for r in self.registry.rules for m in r.modules}

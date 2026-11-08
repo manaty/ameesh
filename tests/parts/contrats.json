@@ -243,24 +243,7 @@
         "U"
       ],
       "modules": [
-        "test_6296_vm_local_checks"
-      ]
-    },
-    {
-      "id": "vm-probe",
-      "paths": [
-        "deploy/vm-adapter/remote/vm-remote.py"
-      ],
-      "operations": [
-        "A",
-        "C",
-        "D",
-        "M",
-        "R",
-        "T",
-        "U"
-      ],
-      "modules": [
+        "test_6296_vm_local_checks",
         "test_6298_vm_probe"
       ]
     }
