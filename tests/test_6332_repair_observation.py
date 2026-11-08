@@ -155,6 +155,23 @@ class ObservationTest(PgTestCase):
         obs.scan(self.db, 'acme', 'github_watch', now=NOW)
         self.assertEqual(len(self.page('github_watch')), 1)
 
+    def test_existing_lot_reference_stays_within_its_project(self):
+        from ameesh import registry, work
+        registry.upsert(self.db, 'watcher', harness='codex', chantier='app')
+        self.db.execute(
+            "INSERT INTO github_watch_pending(project,repo,kind,object_id,issue_ref,url,agent,delivered_at,events_after)"
+            " VALUES ('acme','org/repo','issue',1,'org/repo#1','https://github.com/org/repo/issues/1','watcher',%s,0)",
+            (NOW,))
+        work.add(self.db, title='other project', app='other', issue_ref='org/repo#1',
+                 actor='watcher')
+        obs.scan(self.db, 'acme', 'github_watch', now=NOW)
+        self.assertEqual(self.page('github_watch')[0]['signal']['outcome'], 'unknown')
+        lot = work.add(self.db, title='same project', app='acme', issue_ref='org/repo#1',
+                       actor='watcher')
+        obs.scan(self.db, 'acme', 'github_watch', now=NOW)  # EOF
+        obs.scan(self.db, 'acme', 'github_watch', now=NOW)
+        self.assertEqual(self.page('github_watch')[0]['outcome_ref'], 'lot:%s' % lot['id'])
+
     def test_real_github_watcher_tick_feeds_journal_without_new_lot(self):
         import dataclasses
         from ameesh import github_watch, registry

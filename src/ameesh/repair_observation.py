@@ -73,7 +73,7 @@ def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None):
         after = int(cursor) if cursor is not None else 0
         rows = db.query(
             "SELECT id, data->>'key' AS key, data->>'since' AS since,"
-            " coalesce(data->>'revision',data->>'observed_version','') AS version,"
+            " coalesce(nullif(data->>'revision',''),data->>'observed_version','') AS version,"
             " extract(epoch FROM created_at) AS observed"
             " FROM ameesh_events WHERE project=%s AND type='alert.raised'"
             " AND id>%s ORDER BY id LIMIT %s", (project, after, BATCH))
@@ -91,7 +91,7 @@ def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None):
         rows = db.query(
             "SELECT p.repo,p.kind,p.object_id,p.issue_ref,p.delivered_at,"
             " (SELECT w.id FROM work_items w"
-            " WHERE lower(w.issue_ref)=lower(p.issue_ref)"
+            " WHERE w.app=p.project AND lower(w.issue_ref)=lower(p.issue_ref)"
             " AND (p.kind='issue' OR w.created_at>=to_timestamp(p.delivered_at))"
             " ORDER BY w.id LIMIT 1) AS lot"
             " FROM github_watch_pending p WHERE p.project=%s"
