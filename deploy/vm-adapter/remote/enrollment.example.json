@@ -4,6 +4,7 @@
   "ameesh_config": "/etc/ameesh-vm-adapter/remote-database.json",
   "state_dir": "/var/lib/ameesh-vm-remote",
   "fresh_seconds": 60,
+  "reconcile_deadline_s": 900,
   "checks": {
     "version-mode": ["/opt/ameesh-vm-adapter/checks/version-mode"],
     "doctor": ["/opt/ameesh-vm-adapter/checks/doctor"]

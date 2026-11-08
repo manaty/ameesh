@@ -10,7 +10,10 @@ import unittest
 from unittest import mock
 
 from tests.support import PgTestCase
-from tests.test_6252_vm_commandes import CloudCycleTest, FakeVM, cmd, vm, storage
+from tests import test_6252_vm_commandes as cycle
+from ameesh import storage, vm_adapter as vm
+
+cmd = cycle.cmd
 
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = ROOT / 'deploy/vm-adapter/remote'
@@ -56,7 +59,9 @@ class DispatchTest(unittest.TestCase):
         cfg = config('/private/state')
         self.assertEqual(remote.enrollment(cfg), cfg)
         for key, value in (('host', 'x;id'), ('fresh_seconds', True),
-                           ('fresh_seconds', 0), ('checks', {}), ('state_dir', '/a/../b')):
+                           ('fresh_seconds', 0), ('reconcile_deadline_s', 0),
+                           ('reconcile_deadline_s', 3601), ('reconcile_deadline_s', True),
+                           ('checks', {}), ('state_dir', '/a/../b')):
             with self.subTest(key=key), self.assertRaises(remote.Refus):
                 remote.enrollment(dict(cfg, **{key: value}))
 
@@ -244,8 +249,18 @@ class NativeTest(PgTestCase):
                 self.endpoint.execute('probe-start', args)
         self.assertEqual(self.db.query('SELECT count(*) AS n FROM agent_mailbox')[0]['n'], 0)
 
+    def test_reconciliation_deadline_fails_closed_and_is_scoped_to_this_wave(self):
+        self.db.execute("UPDATE vm_adapter_requests SET updated_at=clock_timestamp()-interval '901 seconds'")
+        with self.assertRaisesRegex(remote.Refus, 'deadline'):
+            self.endpoint.execute('reconcile', [])
+        self.db.execute("UPDATE vm_adapter_requests SET updated_at=clock_timestamp()")
+        # A new admission gets its own deadline, but still needs evidence.
+        self.assertEqual(self.endpoint.execute('reconcile', [])[0], 75)
+        control = self.db.query("SELECT mode,claims_open FROM host_lifecycle WHERE host='burst'")[0]
+        self.assertEqual(control, {'mode': 'returning', 'claims_open': False})
 
-class NativeVM(FakeVM):
+
+class NativeVM(cycle.FakeVM):
     def __init__(self, endpoint):
         super().__init__()
         self.endpoint = endpoint
@@ -272,7 +287,7 @@ class NativeVM(FakeVM):
             return 1, b'', b''
 
 
-class NativeCycleTest(CloudCycleTest):
+class NativeCycleTest(cycle.CloudCycleTest):
     """Reuse the real worker simulation with the real remote probe endpoints."""
     def setUp(self):
         super().setUp()

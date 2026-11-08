@@ -294,12 +294,25 @@ et périodiques (`report_boot_orphans`, `settle_dead_turns`,
 `reconcile_turn_cgroups`). Il ne rend 0 qu'après une présence du runner sur
 ce retour, fraîche selon `fresh_seconds`, sans ressource `running` ou
 `orphan`, sans identité d'origine déplacée/fencée ni handoff actif.
-Sinon il reste en attente. Il n'appelle pas `ameesh host reconcile` : cette
+Sinon il rend 75, jusqu’à `reconcile_deadline_s` (entier explicite de 1 à
+3600 secondes, depuis `probe admitted` de cette génération/époque) ; à
+l’échéance il refuse (1), sans effet. Il n'appelle pas `ameesh host reconcile` : cette
 commande est destinée à `lost` et peut rouvrir les prises. Aucune ressource
 n'est supprimée ni soldée par l'aide, aucun bail révoqué de force. Le worker
 revérifie génération et relevé sous son verrou avant d'acquitter le retour.
 `quiesce` reste une lecture du contrôle `draining` et des ressources ; il
 ne reprend pas le verrou que le worker tient déjà pendant son appel SSH.
+
+**Préalable sur chaque cible** (#6270, note pilote du 08/11 04:18) :
+activer le journal persistant avant le premier arrêt. Le modèle
+`remote/journald.conf.example` fixe `Storage=persistent` et un
+`SystemMaxUse=128M` d'exemple, à dimensionner par le bureau pour la cible.
+Le bureau pose ce drop-in root non inscriptible par les agents, valide la
+configuration et vérifie après redémarrage que `journalctl --list-boots`
+expose le boot précédent et que sa dernière ligne est lisible par le groupe
+systemd-journal. Sans preuve du boot précédent, la santé refuse : un journal
+volatile ou un simple état SSH silencieux ne remplace pas cette preuve.
+Aucun redémarrage de journald ni changement d'une VM n'a lieu dans ce lot.
 
 Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
 

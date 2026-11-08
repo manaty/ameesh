@@ -59,7 +59,8 @@ def absolute(value):
 
 def enrollment(value):
     if (not isinstance(value, dict) or set(value) != {
-            'host', 'probe_agent', 'ameesh_config', 'state_dir', 'fresh_seconds', 'checks'}):
+            'host', 'probe_agent', 'ameesh_config', 'state_dir', 'fresh_seconds',
+            'reconcile_deadline_s', 'checks'}):
         raise Refus('invalid remote enrollment')
     for key in ('host', 'probe_agent'):
         if not isinstance(value[key], str) or not NAME.fullmatch(value[key]):
@@ -69,6 +70,9 @@ def enrollment(value):
     age = value['fresh_seconds']
     if type(age) is not int or not 1 <= age <= 300:
         raise Refus('invalid freshness bound')
+    deadline = value['reconcile_deadline_s']
+    if type(deadline) is not int or not 1 <= deadline <= 3600:
+        raise Refus('invalid reconciliation deadline')
     if not isinstance(value['checks'], dict) or set(value['checks']) != {'doctor', 'version-mode'}:
         raise Refus('fixed health checks required')
     for argv in value['checks'].values():
@@ -252,6 +256,9 @@ class Native:
                 admitted = self.admission(tx, control)
                 if admitted is None:
                     return False
+                now = float(tx.query('SELECT extract(epoch from clock_timestamp()) AS ts')[0]['ts'])
+                if now - admitted >= self.cfg['reconcile_deadline_s']:
+                    raise Refus('reconciliation deadline passed')
                 rows = tx.query('SELECT name FROM agent_registry WHERE name=%s AND host=%s '
                                 'AND runner_seen_host=%s AND runner_seen_owner IS NOT NULL '
                                 'AND runner_seen_at >= to_timestamp(%s) '
