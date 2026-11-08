@@ -12,7 +12,7 @@ from unittest import mock
 
 from tests.support import PgTestCase
 from tests import test_6252_vm_commandes as cycle
-from ameesh import mail, storage, undeliverable, vm_adapter as vm
+from ameesh import db as db_mod, mail, storage, undeliverable, vm_adapter as vm
 
 cmd = cycle.cmd
 
@@ -115,6 +115,12 @@ class DispatchTest(unittest.TestCase):
 
 
 class NativeTest(PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.test_6298_vm_probe import install_for_native_test
+        install_for_native_test(cls)
+
     def setUp(self):
         super().setUp()
         self.db.execute('DELETE FROM vm_adapter_requests')
@@ -123,7 +129,11 @@ class NativeTest(PgTestCase):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
         self.addCleanup(self.temp.cleanup)
         self.cfg_remote = config(self.temp.name)
-        self.native = remote.Native(self.db, self.cfg_remote)
+        # A real SSH call opens its own clean database session. The migration
+        # fixture session may already have a temporary namespace.
+        probe_db = db_mod.connect(self.cfg, writer=False)
+        self.addCleanup(probe_db.close)
+        self.native = remote.Native(probe_db, self.cfg_remote)
         self.endpoint = remote.Endpoint(self.cfg_remote, self.native, remote.Store(self.temp.name))
         self.db.execute("INSERT INTO agent_registry(name,harness,host,mode,status) "
                         "VALUES ('burst-probe','codex','burst','execute','idle')")
@@ -333,6 +343,13 @@ class NativeVM(cycle.FakeVM):
 
 class NativeCycleTest(cycle.CloudCycleTest):
     """Reuse the real worker simulation with the real remote probe endpoints."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.test_6298_vm_probe import install_for_native_test
+        install_for_native_test(cls)
+
     def setUp(self):
         super().setUp()
         self.db.execute('DELETE FROM turn_resources')
@@ -348,7 +365,9 @@ class NativeCycleTest(cycle.CloudCycleTest):
         self.db.execute("INSERT INTO agent_registry(name,harness,host,mode,status,runner_seen_at, "
                         "runner_seen_host,runner_seen_owner) VALUES "
                         "('burst-probe','codex','burst','execute','idle',clock_timestamp(),'burst','runner-1')")
-        self.endpoint = remote.Endpoint(self.remote_cfg, remote.Native(self.db, self.remote_cfg),
+        probe_db = db_mod.connect(self.cfg, writer=False)
+        self.addCleanup(probe_db.close)
+        self.endpoint = remote.Endpoint(self.remote_cfg, remote.Native(probe_db, self.remote_cfg),
                                         remote.Store(self.remote_temp.name))
         self.vm = NativeVM(self.endpoint)
 
@@ -398,7 +417,9 @@ class NativeCycleTest(cycle.CloudCycleTest):
         self.db.execute("UPDATE vm_adapter_observations SET on_since=clock_timestamp()-interval '2 hours'")
 
     def running_turn(self):
-        self.db.execute("INSERT INTO turn_resources(turn_id,agent,host,status) "
+        # Simulate a separately committed runner event while the worker
+        # holds its own transaction; the SSH connection must see it.
+        self.endpoint.native.db.execute("INSERT INTO turn_resources(turn_id,agent,host,status) "
                         "VALUES ('late-turn','burst-probe','burst','running')")
 
     def test_native_quiesce_and_guard_pass_then_the_fixed_poweroff_runs(self):

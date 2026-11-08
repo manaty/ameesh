@@ -86,6 +86,7 @@
       "modules": [
         "test_3752_gabarit",
         "test_6090_work_add_unique_ref",
+        "test_6298_vm_probe",
         "test_cluster",
         "test_migrations",
         "test_migrations_additives"
@@ -147,6 +148,7 @@
         "test_2340_auditeur_role",
         "test_4256_validation_deadlines",
         "test_6011_contrat_ecrivains_isoles",
+        "test_6298_vm_probe",
         "test_cluster"
       ]
     },
@@ -203,8 +205,9 @@
         "test_6182_contracts_before_publish",
         "test_6183_contract_proof_resume",
         "test_6186_project_plan",
-        "test_6274_composeur_plan_declare",
         "test_6264_packet_mechanics_contracts",
+        "test_6274_composeur_plan_declare",
+        "test_6298_vm_probe",
         "test_987_relance_hosted",
         "test_cluster",
         "test_contract_plan",
@@ -241,6 +244,24 @@
       ],
       "modules": [
         "test_6296_vm_local_checks"
+      ]
+    },
+    {
+      "id": "vm-probe",
+      "paths": [
+        "deploy/vm-adapter/remote/vm-remote.py"
+      ],
+      "operations": [
+        "A",
+        "C",
+        "D",
+        "M",
+        "R",
+        "T",
+        "U"
+      ],
+      "modules": [
+        "test_6298_vm_probe"
       ]
     }
   ]
