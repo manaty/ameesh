@@ -153,6 +153,30 @@ class VmProbeRoleTest(PgTestCase):
             self.db.execute('DROP SCHEMA "' + ns + '"')
         self.audit()
 
+    def test_public_extension_view_is_inert_only_without_schema_usage(self):
+        ns = self.schema + '_closed_extension'
+        self.db.execute('CREATE SCHEMA "' + ns + '"')
+        try:
+            self.db.execute('CREATE VIEW "' + ns + '".extension_stats AS SELECT 1 AS calls')
+            self.db.execute('GRANT SELECT ON "' + ns + '".extension_stats TO PUBLIC')
+            self.audit()
+            self.assertEqual(self.script('role-vm-probe.sql').returncode, 0)
+            self.assertNotEqual(self.role_sql('SELECT * FROM "' + ns + '".extension_stats;').returncode, 0)
+            # A latent direct grant remains a drift, even behind the wall.
+            self.db.execute('GRANT SELECT(calls) ON "' + ns + '".extension_stats TO "' + self.role + '"')
+            self.assertNotEqual(self.script('_contrat-vm-probe.sql').returncode, 0)
+            self.db.execute('REVOKE SELECT(calls) ON "' + ns + '".extension_stats FROM "' + self.role + '"')
+            for grantee in ('PUBLIC', '"' + self.role + '"'):
+                self.db.execute('GRANT USAGE ON SCHEMA "' + ns + '" TO ' + grantee)
+                try:
+                    self.assertNotEqual(self.script('_contrat-vm-probe.sql').returncode, 0)
+                    self.assertNotEqual(self.script('role-vm-probe.sql').returncode, 0)
+                finally:
+                    self.db.execute('REVOKE USAGE ON SCHEMA "' + ns + '" FROM ' + grantee)
+            self.audit()
+        finally:
+            self.db.execute('DROP SCHEMA "' + ns + '" CASCADE')
+
     def test_definer_public_execution_is_refused(self):
         signature = 'vm_probe_send(text,text,bigint,bigint,text)'
         self.db.execute('GRANT EXECUTE ON FUNCTION ' + signature + ' TO PUBLIC')

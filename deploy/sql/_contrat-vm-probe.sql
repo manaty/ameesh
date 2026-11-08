@@ -82,6 +82,12 @@ BEGIN
           WHERE k.relkind IN ('r','v','m','p','f')
             AND nsp.nspname NOT IN ('pg_catalog','information_schema')
             AND nsp.nspname !~ '^pg_(toast|temp_|toast_temp_)'
+            -- Extension views can grant PUBLIC SELECT while their schema
+            -- stays closed. Ignore that inert grant, but retain checks of
+            -- direct grants to the role, even without namespace USAGE.
+            AND (k.relnamespace=n OR has_schema_privilege(who,nsp.oid,'USAGE')
+                 OR EXISTS (SELECT FROM aclexplode(k.relacl) x WHERE x.grantee=rid)
+                 OR EXISTS (SELECT FROM aclexplode(a.attacl) x WHERE x.grantee=rid))
         LOOP
           allowed := item.relnamespace=n AND EXISTS
             (SELECT FROM pg_temp.vm_probe_columns c WHERE c.subject=who
@@ -183,11 +189,14 @@ BEGIN
     IF EXISTS (SELECT FROM pg_class k JOIN pg_namespace ns ON ns.oid=k.relnamespace
         CROSS JOIN LATERAL aclexplode(k.relacl) x
         WHERE ns.nspname NOT IN ('pg_catalog','information_schema') AND ns.nspname !~ '^pg_'
-          AND x.grantee=0)
+          AND x.grantee=0
+          AND (has_schema_privilege(r,ns.oid,'USAGE') OR has_schema_privilege(w,ns.oid,'USAGE')))
        OR EXISTS (SELECT FROM pg_attribute a JOIN pg_class k ON k.oid=a.attrelid
         JOIN pg_namespace ns ON ns.oid=k.relnamespace CROSS JOIN LATERAL aclexplode(a.attacl) x
         WHERE ns.nspname NOT IN ('pg_catalog','information_schema') AND ns.nspname !~ '^pg_'
-          AND x.grantee=0) THEN errors := array_append(errors, 'PUBLIC relation/column ACL'); END IF;
+          AND x.grantee=0
+          AND (has_schema_privilege(r,ns.oid,'USAGE') OR has_schema_privilege(w,ns.oid,'USAGE')))
+       THEN errors := array_append(errors, 'PUBLIC relation/column ACL'); END IF;
     IF EXISTS (SELECT FROM pg_proc p CROSS JOIN LATERAL aclexplode(p.proacl) x
         WHERE x.grantee=(SELECT oid FROM pg_roles WHERE rolname=r) AND x.is_grantable)
        OR EXISTS (SELECT FROM pg_namespace ns CROSS JOIN LATERAL aclexplode(ns.nspacl) x
