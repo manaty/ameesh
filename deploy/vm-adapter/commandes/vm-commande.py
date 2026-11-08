@@ -43,6 +43,7 @@ receipt contract they must honour (see README, "Commandes par VM").
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -280,6 +281,22 @@ class Commande:
             os.fsync(stream.fileno())
         os.replace(tmp, path)
 
+    def exclusive(self):
+        """The operator lock of this VM, held by the caller until it closes
+        the returned descriptor. Two worker invocations may run the same verb
+        at once (health and reconcile run before the worker's own lock): the
+        read, decision, persistence and launch of a probe are one critical
+        section. Never waits: a busy VM answers like a wait."""
+        fd = os.open(self.path('lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                     | os.O_CLOEXEC, 0o600)
+        try:
+            _private(self.path('lock'))
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
     def drop(self, name):
         try:
             os.unlink(self.path(name))
@@ -402,12 +419,19 @@ def main(argv=None, *, natif=None, runner=run):
     if len(args) != 2 or args[0] not in VERBS:
         return 2
     verb = args[0]
-    own = None
+    own = lock = None
     try:
         # A missing or unreadable operator file is a refusal, never a wait.
         cible = target(read_json(args[1]))
         command = Commande(cible, natif=natif, runner=runner)
         command.preflight()
+    except (Refus, OSError):
+        return 1
+    try:
+        lock = command.exclusive()
+    except BlockingIOError:
+        # Another invocation holds this VM: it owns the decision.
+        return WAIT if verb == 'health' else 1
     except (Refus, OSError):
         return 1
     try:
@@ -426,6 +450,7 @@ def main(argv=None, *, natif=None, runner=run):
                 own.close()
             except Exception:
                 pass
+        os.close(lock)
 
 
 if __name__ == '__main__':

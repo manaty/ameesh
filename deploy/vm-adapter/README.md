@@ -213,6 +213,12 @@ privée au compte opérateur (0600, sans lien). Elle fixe :
 - `state_dir`, le `StateDirectory` de l'unité (0700) ;
 - `previous_boot_end` et les argv distants.
 
+Chaque appel prend d'abord le verrou opérateur de sa VM (`flock` non
+bloquant sur `lock.<hôte>.json` dans `state_dir`). Deux invocations
+concurrentes du worker ne décident donc jamais ensemble : la santé tourne
+avant le verrou du worker. Une VM déjà tenue rend 75 pour `health` et 1
+pour les autres commandes, sans aucun effet.
+
 SSH tourne en `-F none` et `BatchMode`, avec `StrictHostKeyChecking=yes`,
 `IdentitiesOnly`, sans agent ni transfert. Chaque argv distant est cité
 (`shlex.join`). Une clé à commande forcée côté VM reste recommandée.

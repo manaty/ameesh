@@ -45,7 +45,7 @@ class FakeVM:
         self.up, self.provider = True, 'running'
         self.calls, self.launches, self.receipt = [], [], None
         self.failing = set()
-        self.on_halt = None
+        self.on_halt = self.on_start = None
 
     def run(self, argv, timeout, *, capture=False):
         assert argv[0] == '/usr/bin/ssh' and argv[-3] == '--' and timeout <= 9.5
@@ -63,6 +63,8 @@ class FakeVM:
             return 255, b'', b''
         if name == 'probe-start':
             self.launches.append(remote[1:])
+            if self.on_start:
+                self.on_start()
             return 0, b'', b''
         if name == 'probe-receipt':
             if self.receipt is None:
@@ -212,6 +214,24 @@ class TargetTest(Files, unittest.TestCase):
             natif.control.return_value, natif.running_turns.return_value = control, turns
             self.assertEqual(cmd.main(['halt', str(self.path)], natif=natif, runner=self.vm.run), 1)
         self.assertEqual(len(self.vm.calls), 1)
+
+    def test_a_held_vm_lock_is_a_wait_without_effect(self):
+        import fcntl
+        lock = self.marker('lock')
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        natif = mock.Mock()
+        natif.control.return_value = dict(mode='draining', claims_open=False)
+        natif.running_turns.return_value = 0
+        self.assertEqual(cmd.main(['health', str(self.path)], natif=natif, runner=self.vm.run),
+                         cmd.WAIT)
+        for verb in ('quiesce', 'halt', 'halted', 'reconcile'):
+            self.assertEqual(cmd.main([verb, str(self.path)], natif=natif, runner=self.vm.run), 1)
+        self.assertEqual(self.vm.calls, [])
+        natif.control.assert_not_called()
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        self.assertEqual(cmd.main(['quiesce', str(self.path)], natif=natif, runner=self.vm.run), 0)
 
     def test_receipt_contract(self):
         launch = dict(host='burst', probe_agent='p', generation=3, release_epoch=2, nonce='a' * 32)
@@ -375,6 +395,30 @@ class CloudCycleTest(Files, PgTestCase):
     def cible_marker(self):
         self.marker('halt').write_text(json.dumps({'host': 'burst', 'at': 1}))
         os.chmod(self.marker('halt'), 0o600)
+
+    def test_concurrent_invocations_launch_one_probe(self):
+        # #6252 B (cx1): health runs before the worker lock, so two worker
+        # invocations may decide at once. The second one, arriving while the
+        # first holds the VM between its decision and its launch, waits.
+        self.returning()
+        seen = []
+        argv = self.policy['targets']['burst']['health_argv']
+        def second():
+            seen.append(cmd.main(argv[-2:], natif=cmd.Natif.of(self.db), runner=self.vm.run))
+            seen.append(cmd.main(['reconcile', str(self.path)], natif=cmd.Natif.of(self.db),
+                                 runner=self.vm.run))
+        self.vm.on_start = second
+        with FRESH:
+            self.assertEqual(self.tick(), 'probe admitted')
+            self.assertEqual(self.tick(), 'health pending')
+        self.assertEqual(seen, [cmd.WAIT, 1])
+        self.assertEqual(len(self.vm.launches), 1)
+        self.vm.on_start = None
+        with FRESH:
+            self.assertEqual(self.tick(), 'health pending')  # same launch, no second one
+            self.complete()
+            self.assertEqual(self.tick(), 'ready')
+        self.assertEqual(len(self.vm.launches), 1)
 
     def test_unclean_previous_boot_fails_health(self):
         self.returning()
