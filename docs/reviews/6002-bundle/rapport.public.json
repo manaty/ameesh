@@ -1,0 +1,35 @@
+{
+  "lot": 6002,
+  "tranche": 1,
+  "author": "bureau (BG, famille claude)",
+  "at": "2026-11-08T03:46:35.741931+00:00",
+  "holder": "bureau-goal",
+  "operator_account": "agent (uid 1001)",
+  "source_sha": "71ec56e3a8ae7aff85d6b9c5fa99d2cd8e4ba017",
+  "installed": {
+    "/opt/ameesh-vm-adapter/venv": "-> venv-71ec56e3a8ae (pip install src-71ec56e3a8ae), ancien venv-33bfa473 gardé",
+    "/opt/ameesh-vm-adapter/commandes/vm-commande.py": "root 0644, blob du SHA",
+    "/etc/ameesh-vm-adapter": "root:agent 0750 ; enrollment/cible/ameesh.json/database.env/pgpass/known_hosts_ag3 agent 0600 ; scaleway.json root 0600 (LoadCredential)",
+    "tunnel": "unité user ameesh-vm-adapter-tunnel.service active, 127.0.0.1:15432 -> AG2(ameesh-vmtunnel) -> 10.77.0.1:5432, SELECT 1 ssl=t"
+  },
+  "enabled": false,
+  "units_installed": false,
+  "timer_started": false,
+  "cloud_action": false,
+  "checks": {
+    "enrollment_valid_if_enabled": true,
+    "native_db_read_via_tunnel": true,
+    "quiesce_rc": "1 (pas de contrôle draining : garde, sans effet)",
+    "halted_rc": "1 (AG3 répond : pas de silence)",
+    "simulation_tests_6252": "19/19 OK (banc PG local jetable)",
+    "systemd_analyze_verify_User_agent": 0
+  },
+  "gaps_blocking_activation": [
+    "probe_start/probe_receipt : /bin/false — aucun helper natif (#6073), à fournir",
+    "reconcile : /bin/false — commande native à désigner",
+    "health remote : doctor + runner impl-15 (unité ameesh-dev4) seulement ; mail/version-mode à compléter",
+    "accès SSH opérateur = root@AG3 existant (pas de sudoers)",
+    "previous_boot_end à vérifier au premier cycle mesuré",
+    "option (a) WireGuard avant activation (mesh-design)"
+  ]
+}
