@@ -2427,7 +2427,8 @@ def _git_copy_work(copy: str, entry: str, rules=()) -> str:
 
 
 def tmp_git_work(path: str, rules=(), *,
-                 report: tuple[list[str], str] | None = None) -> str:
+                 report: tuple[list[str], str] | None = None,
+                 allow=()) -> str:
     """#2493 (N2) : why a Git copy inside a temporary directory must be kept,
     empty when every copy is safe to recover: the saved-work guards of
     `_git_copy_work` (clean, pushed or integrated, no ignored file outside
@@ -2437,13 +2438,15 @@ def tmp_git_work(path: str, rules=(), *,
     A directory is never deleted merely because its agent left the registry;
     this check is the second condition. A bare repository, or a directory
     tree whose copies could not all be inspected (#2525), keeps it.
-    `report` (#2556) reuses the `_git_copies_report` of the pass."""
+    `report` (#2556) reuses the `_git_copies_report` of the pass; `allow`
+    (#6258) is the host's explicit unreadable-process policy, passed to
+    `worktree_holders` — an observed holder still blocks."""
     copies, doubt = _git_copies_report(path) if report is None else report
     for copy in copies:
         work = _git_copy_work(copy, path, rules)
         if work:
             return work
-        in_use, detail = worktree_holders(copy)
+        in_use, detail = worktree_holders(copy, allow=allow)
         if in_use:
             return "%s: %s" % (copy, detail)
     if doubt:

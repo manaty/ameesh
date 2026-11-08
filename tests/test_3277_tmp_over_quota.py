@@ -260,6 +260,10 @@ class OverQuotaTest(PgTestCase):
         # offload and left there when the prevalidation tree was not closed;
         # it is generated, not user work (#6258). A clean, pushed worktree
         # must become recoverable once that single untracked file is gone.
+        # the guest runs under a user systemd whose processes are not
+        # dumpable; the host's unreadable_ok policy is what excuses them.
+        self.pol = dataclasses.replace(
+            self.pol, unreadable_ok=("systemd", "sd-pam", "(sd-pam)"))
         repo = os.path.join(self.state, "repo")
         os.makedirs(repo)
 

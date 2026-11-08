@@ -342,7 +342,9 @@ def clear_entries(found: dict, *, troot: str, policy, dry_run: bool = False) -> 
                 if not dry_run:
                     for copy in copies:
                         _drop_generated_plan(copy)
-                work = hk.tmp_git_work(path, rules, report=(copies, doubt))
+                work = hk.tmp_git_work(
+                    path, rules, report=(copies, doubt),
+                    allow=getattr(policy, "unreadable_ok", ()))
                 if work:
                     kept[name] = work
                     continue
