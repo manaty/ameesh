@@ -773,6 +773,11 @@ class Watcher:
                 self.log("GitHub watch %s: failed; cursor retained: %s" %
                          (sub.repo, plan_github._one_line(exc)))
         if not self.dry_run:
+            from . import repair_observation
+            for project in sorted({sub.project for sub in declared}):
+                repair_observation.observe(db, project=project,
+                                           source="github_watch", now=now,
+                                           log=self.log)
             try:
                 if self.api is None:
                     self.api = plan_github.client(cache_dir=self.cfg.state_dir)

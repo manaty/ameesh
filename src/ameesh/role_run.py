@@ -906,6 +906,11 @@ def run(cfg, args, *, credentials=()) -> int:
                     return 1
             else:
                 code = int(subprocess.run(argv, env=env, check=False).returncode)
+            if pass_name == "alerts":
+                from . import repair_observation
+                repair_observation.observe(
+                    db, source="alerts",
+                    log=lambda text: print(text, file=sys.stderr))
             # The exit code of the command is the wrapper's. A report is printed
             # only on stderr in JSON mode, so a command that speaks JSON keeps
             # its stdout intact.
