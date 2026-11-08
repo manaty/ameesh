@@ -92,6 +92,8 @@ def _write_fake_tree(base: Path) -> Path:
     # #4319: the packet scripts share interpreter resolution in this module.
     shutil.copyfile(ROOT / "src" / "ameesh" / "project_python.py",
                     package / "project_python.py")
+    shutil.copyfile(ROOT / "src" / "ameesh" / "packet_contract_proof.py",
+                    package / "packet_contract_proof.py")
     return tree
 
 
@@ -113,6 +115,7 @@ spec.loader.exec_module(module)
 RUN_TICK = _LOAD + '''
 rc = module.main(["tick", "--repo", sys.argv[2], "--target", "main", "--pilot", "p"])
 print("RC", rc)
+print("CONTRACT_PROOF", sys.modules["ameesh.packet_contract_proof"].__file__)
 '''
 
 RUN_WITH_STALE_IMPORTED = '''\
@@ -203,6 +206,8 @@ class TreeLibraryTest(unittest.TestCase):
         self.assertIn("TREE_PACKET_PAUSE", out)
         self.assertIn("TREE_PACKET_PAUSE_ALERT", out)
         self.assertIn("PYTHONPATH_FIRST=%s" % (self.tree / "src"), out)
+        self.assertIn("CONTRACT_PROOF %s" % (
+            self.tree / "src" / "ameesh" / "packet_contract_proof.py"), out)
         self.assertIn("RC 1", out)  # le faux clone n'a pas d'origin : rien n'est fait
         self.assertIn("fetch main", out)
         # l'alerte du tic est partie, mais vers les doublures seulement

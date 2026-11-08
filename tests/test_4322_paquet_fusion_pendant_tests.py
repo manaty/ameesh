@@ -47,7 +47,8 @@ class FusionPendantLesTestsTest(unittest.TestCase):
         self.assertEqual(len(flux.calls("push")), 1)
         self.assertEqual(len(flux.calls("manifest")), 1)
         self.assertEqual(flux.calls("withdraw"), [])
-        note = flux.calls("note")[0][1][2]
+        note = next(call[1][2] for call in flux.calls("note")
+                    if not call[1][2].startswith("paquet-auto: contrats "))
         self.assertIn("fusionnée au vert pendant les tests", note)
         self.assertIn("rouges pour #2", note)
         mails = flux.calls("mail")
@@ -64,7 +65,9 @@ class FusionPendantLesTestsTest(unittest.TestCase):
         # une seule PR : celle de la poussée ; le corps final n'est pas réécrit
         self.assertEqual(len(flux.calls("pr")), 1)
         self.assertEqual(flux.calls("mail"), [])
-        self.assertIn("tests par unité verts", flux.calls("note")[0][1][2])
+        note = next(call[1][2] for call in flux.calls("note")
+                    if not call[1][2].startswith("paquet-auto: contrats "))
+        self.assertIn("tests par unité verts", note)
         self.assertTrue(out.strip().splitlines()[-1].startswith(paquet_auto.MERGED_LINE))
 
 

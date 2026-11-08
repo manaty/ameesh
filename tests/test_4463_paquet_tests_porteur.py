@@ -98,6 +98,8 @@ class FusionDuPorteurTest(unittest.TestCase):
             rc = flux.run()
         self.assertEqual(rc, 0)
         notes = [call[1][2] for call in flux.calls("note")]
+        # E records the contracts completed before the guarded unit tests.
+        notes = [note for note in notes if not note.startswith("paquet-auto: contrats ")]
         self.assertEqual(len(notes), 1)
         self.assertIn("tests par unité interrompus : porteur fusionné à "
                       "3c16763c9cc5", notes[0])
