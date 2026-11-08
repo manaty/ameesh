@@ -10,13 +10,14 @@
   "retour-c3-v23.sh (retour-c3-v22-v23.diff)",
   "p6/update-l2-runtime-v32.py (p6/update-l2-runtime-v31-v32.diff)"
  ],
- "demande": "#200888 ; N impl-03 #200830",
+ "demande": "#200888 ; N impl-03 #200830, #200930",
  "files": {
   ".gitattributes": "b5487bd05eee186396baf1d0e878b80abf08686268bdab0d97f8db5e8dac3f9a",
   "DOSSIER-C3-v1.md": "c88b4306981317948ed0c668b2b50bbc872fbef6178d63b08e08e513025fa7ec",
   "DOSSIER-C3-v2.md": "9ff30a590c3041705f1ce2a2a1d305febe07d66ebcf6cd5322c1c2eb47d7a241",
   "DOSSIER-C3-v21.md": "f20ba3cadfc4f56ce449daf0ba095cff042fa16f78e261c13c59913552b02b8a",
   "DOSSIER-C3-v22.md": "56f73c61b3521c3868d95463a4930168ef54b2006948e7ab80c800f365c96687",
+  "DOSSIER-C3-v23-T60-P6.md": "9fac6aff2937ec77fca49c2f9dac54cfa20a92206b31c7b5a38fabd2f4c30398",
   "DOSSIER-C3-v23.md": "b56381618a7f872463fe17c5b167a59d4b8fcc02c8b656667233bffe6d776f3e",
   "analyse/attrs.py": "d67851674b9a5f87f8e5d3367507a797e9677611532cf9499ad6b1e4304f4cff",
   "evaluer-c3.py": "35e6e673297e3723cbc439a3a42904755751470d6984456f205357184c37c23f",
@@ -73,6 +74,7 @@
  },
  "gestes": "aucun sur les VM",
  "lot": 5495,
+ "note_T60": "DOSSIER-C3-v23-T60-P6.md (commande d'autorité de l'installateur v3.2, dossier seul)",
  "schema": "ameesh-5495-c3-dossier/5",
  "version": "v2.3"
 }
