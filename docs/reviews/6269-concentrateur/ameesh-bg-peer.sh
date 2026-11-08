@@ -1,5 +1,5 @@
 #!/bin/bash
-# #6269 v8 — pair bureau-goal (10.77.0.6) sur le concentrateur, échec FERMÉ :
+# #6269 v9 — pair bureau-goal (10.77.0.6) sur le concentrateur, échec FERMÉ :
 # start : pair éventuel retiré et absence prouvée -> filtre posé et vérifié -> pair ajouté.
 # stop  : pair retiré et absence prouvée par une lecture réussie -> seulement alors filtres retirés ;
 #         lecture wg en erreur ou pair présent -> filtres CONSERVÉS, rc 1.
@@ -39,17 +39,18 @@ start)
 stop)
   PUB=$(pub)
   retirer_pair "$PUB" || { echo "pair .6 présent (toute clé) ou wg0 illisible : filtres CONSERVÉS" >&2; exit 1; }
-  # chaque saut retiré puis absence vérifiée par une lecture réussie de la chaîne (aucun || true)
+  # chaque saut : chaîne lue avec succès, puis -C (rc 0 présent, rc 1 absent, autre = STOP) et -D
   for spec in "INPUT -i $IF -s $SRC -j BG-IN" "DOCKER-USER -i $IF -s $SRC -j DROP" "FORWARD -i $IF -s $SRC -j DROP"; do
     c=${spec%% *}; r=${spec#* }
-    regles=$($IPT -S "$c") || { echo "STOP : chaîne $c illisible" >&2; exit 1; }
-    while grep -qxF -- "-A $c $r" <<<"$regles"; do
-      $IPT -D "$c" $r
-      regles=$($IPT -S "$c") || { echo "STOP : chaîne $c illisible" >&2; exit 1; }
+    $IPT -S "$c" >/dev/null || { [ "$c" = DOCKER-USER ] && continue; echo "STOP : chaîne $c illisible" >&2; exit 1; }
+    while :; do
+      rc=0; $IPT -C "$c" $r 2>/dev/null || rc=$?
+      case $rc in 0) $IPT -D "$c" $r ;; 1) break ;; *) echo "STOP : -C $c rc=$rc" >&2; exit 1 ;; esac
     done
   done
   if $IPT -S BG-IN >/dev/null 2>&1; then
-    ! $IPT -S | grep -q -- '-j BG-IN' || { echo "STOP : un saut vers BG-IN subsiste" >&2; exit 1; }
+    sauts=$($IPT -S) || { echo "STOP : lecture iptables -S" >&2; exit 1; }
+    ! grep -qE -- '-j BG-IN( |$)' <<<"$sauts" || { echo "STOP : un saut vers BG-IN subsiste" >&2; exit 1; }
     $IPT -F BG-IN; $IPT -X BG-IN
   fi
   ;;
