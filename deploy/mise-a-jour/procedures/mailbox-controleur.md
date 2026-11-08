@@ -1,6 +1,6 @@
 # Réduction de lecture du courrier par le contrôleur
 
-Pose par le bureau uniquement, après intégration du correctif #6372
+Bascule par le bureau uniquement, après intégration du correctif #6372
 (manaty/ameesh#4920) dans un paquet. Aucune migration automatique : le REVOKE
 est non additif. Ne pas poser pendant les coupures de 10:00Z et 22:00Z,
 ni pendant une opération du contrôleur. Le bureau choisit un créneau libre
@@ -12,15 +12,18 @@ Le bureau pose `deploy/sql/release-decision-additive.sql` depuis la tête gelée
 avant l'atterrissage et avant tout lancement du code #6372 (backend installé,
 stage bootstrap et bibliothèque compris). Utiliser le propriétaire du schéma,
 le search_path du mesh et le paramètre psql `role` du contrôleur déjà enrôlé.
-La transaction idempotente crée le propriétaire NOLOGIN, la fonction et son
-EXECUTE borné ; le SELECT existant du contrôleur reste actif. Les REVOKE
-sur EXECUTE ferment seulement l'endpoint ; aucun SELECT existant n'est retiré.
+La transaction idempotente crée le propriétaire NOLOGIN, les deux fonctions et leurs
+EXECUTE bornés ; le SELECT existant du contrôleur reste actif. Les REVOKE
+sur EXECUTE ferment seulement les endpoints ; aucun SELECT existant n'est retiré.
 
 Le reçu cite le SHA gelé et les SHA-256 réellement posés du script et de son
 inclusion `_release-decision.sql`, ainsi que le chemin/SHA réellement lancé.
 Sur une même décision signée, comparer `decisions.get` et
 `decisions.get_for_controller` : mêmes `view_of` et preuves valides.
-Consigner seulement l'id et les résultats, aucun contenu de décision.
+Comparer aussi l'ensemble des identifiants renvoyés par
+`release_controller_decision_ids(question)` à l'ancienne requête filtrée sur
+la même question, les demandes humaines signées et l'état answered.
+Consigner seulement les identifiants et les résultats, aucun contenu de décision.
 Le reçu du bureau est une condition d'unhold, en plus du C3 et de la coupure
 du 09/11 à 10:00Z ; unhold par le pilote. Aucune pose centrale par l'auteur.
 

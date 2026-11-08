@@ -74,6 +74,26 @@ class ReleaseDecisionGateTest(PgTestCase):
             self.assertNotEqual(result.returncode,0)
             self.assertIn('permission denied',result.stderr)
 
+    def test_exact_question_enumeration_under_controller(self):
+        from ameesh import decisions
+        ids = []
+        for question, signed, state, recipient in [
+            ('exact', True, 'answered', 'human:fixture'),
+            ('other', True, 'answered', 'human:fixture'),
+            ('exact', False, 'answered', 'human:fixture'),
+            ('exact', True, 'pending', 'human:fixture'),
+            ('exact', True, 'answered', 'agent:fixture'),
+        ]:
+            import json
+            payload = json.dumps(dict(decision=dict(question=question, needs_signature=signed, state=state)))
+            ids.append(self.db.query("INSERT INTO agent_mailbox(sender,recipient,body,kind,payload)"
+                " VALUES('fixture',%s,'secret','request',%s::jsonb) RETURNING id",
+                (recipient, payload))[0]['id'])
+        with self.db.transaction() as tx:
+            tx.execute('SET LOCAL ROLE "'+self.controller_role+'"')
+            self.assertEqual(decisions.ids_for_controller(tx, 'exact'), [ids[0]])
+            self.assertEqual(decisions.ids_for_controller(tx, "exact' OR true --"), [])
+
     def test_endpoint_contract_rejects_public_and_foreign_execute(self):
         script = ("SELECT set_config('ameesh.release_role','%s',false);\n" % self.controller_role
                   + '\\i '+str(ROOT/'deploy/sql/_contrat-release-decision.sql')+'\n')
@@ -81,12 +101,13 @@ class ReleaseDecisionGateTest(PgTestCase):
         login = 't_endpoint_' + uuid.uuid4().hex[:10]
         self.db.execute('CREATE ROLE "'+login+'" LOGIN')
         try:
-            for grantee in ['PUBLIC','"'+login+'"']:
-                self.db.execute('GRANT EXECUTE ON FUNCTION release_controller_decision(bigint) TO '+grantee)
-                try:
-                    self.assertNotEqual(self.sql(script).returncode,0)
-                finally:
-                    self.db.execute('REVOKE EXECUTE ON FUNCTION release_controller_decision(bigint) FROM '+grantee)
+            for signature in ['release_controller_decision(bigint)', 'release_controller_decision_ids(text)']:
+                for grantee in ['PUBLIC','"'+login+'"']:
+                    self.db.execute('GRANT EXECUTE ON FUNCTION '+signature+' TO '+grantee)
+                    try:
+                        self.assertNotEqual(self.sql(script).returncode,0)
+                    finally:
+                        self.db.execute('REVOKE EXECUTE ON FUNCTION '+signature+' FROM '+grantee)
         finally:
             self.db.execute('DROP OWNED BY "'+login+'" CASCADE')
             self.db.execute('DROP ROLE "'+login+'"')

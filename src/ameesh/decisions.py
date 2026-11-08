@@ -333,6 +333,12 @@ def get_for_controller(db, decision_id: int) -> dict | None:
     return view_of(rows[0]) if rows else None
 
 
+def ids_for_controller(db, question: str) -> list[int]:
+    """Enumerate only answered signature requests for the exact question."""
+    return [row['id'] for row in db.query(
+        'SELECT id FROM release_controller_decision_ids(%s)', (question,))]
+
+
 def supersession_event(db, decision_id: int) -> dict | None:
     """#4995: the append-only replacement event that superseded `decision_id`."""
     return storage.of(db).decisions.supersession(int(decision_id))
