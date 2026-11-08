@@ -2510,6 +2510,82 @@ def prefix_failures(worktree: Path, composition: Composition,
         remove_worktree(worktree, path)
 
 
+def earlier_red(worktree: Path, composition: Composition,
+                removals: list[Removal], *, timeout: int,
+                replay=None, log=print, guard=None,
+                deadline: float | None = None) -> dict[int, int]:
+    """#6232 : les retraits dont le rouge vient d'une unité antérieure retirée.
+
+    Pour chaque retrait hors préfixes (repli, preuve #3801), dans l'ordre de
+    l'empilement, les tests rouges de l'unité sont rejoués sur le préfixe qui
+    s'arrête à la dernière unité antérieure retirée. S'ils y sont **tous**
+    rouges, le rouge précède l'unité : elle est innocente, ni retirée ni
+    marquée `packet-unit-red`. Un rejeu non concluant, un retrait sans nom de
+    test ou un test seulement en partie rouge garde le retrait (geste
+    antérieur). Rend `{lot innocent: lot antérieur retiré}`.
+    """
+    positions = {unit.lot: index for index, unit in enumerate(composition.units)}
+    ordered = sorted((removal for removal in removals
+                      if removal.lot in positions),
+                     key=lambda removal: positions[removal.lot])
+    if len(ordered) < 2:
+        return {}
+    replay = replay or run_tests
+    innocent: dict[int, int] = {}
+    kept: list[Removal] = []
+    path: Path | None = None
+    try:
+        for removal in ordered:
+            earlier = kept[-1] if kept else None
+            names = [name for name in removal.tests if name]
+            if earlier is None or removal.proof == "prefixes" or not names \
+                    or len(names) != len(removal.tests):
+                kept.append(removal)
+                continue
+            limit = series_timeout(timeout, deadline)
+            if limit is None:
+                kept.append(removal)
+                continue
+            if guard is not None:
+                guard()
+            commit = composition.units[positions[earlier.lot]].commit
+            if path is None:
+                parent = temporary_parent()
+                path = Path(tempfile.mkdtemp(prefix="paquet-auto-anterieur-",
+                                             dir=str(parent)))
+                path.rmdir()
+                added = git(worktree, "worktree", "add", "--detach", str(path),
+                            commit, check=False)
+                if added.returncode != 0:
+                    shutil.rmtree(path, ignore_errors=True)
+                    path = None
+                    log("tests ciblés : préfixe antérieur impossible, retraits "
+                        "gardés : %s" % _tail(_decode(added.stderr), 3))
+                    return {}
+            else:
+                moved = git(path, "reset", "--hard", commit, check=False)
+                git(path, "clean", "-fdq", check=False)
+                if moved.returncode != 0:
+                    kept.append(removal)
+                    continue
+            label = "préfixe de #%d (rouge de #%d)" % (earlier.lot, removal.lot)
+            run = replay(path, label, names, timeout=limit,
+                         **({"wall": limit} if deadline is not None else {}))
+            failed = ({entry["test"] for entry in unittest_failures(run.output)}
+                      if not run.inconclusive and not run.green else set())
+            if failed and all(_failure_matches(name, failed) for name in names):
+                innocent[removal.lot] = earlier.lot
+                log("tests unité #%d : rouge déjà présent sur le préfixe de #%d "
+                    "(retirée) — unité innocente, gardée : %s"
+                    % (removal.lot, earlier.lot, ", ".join(names[:5])))
+            else:
+                kept.append(removal)
+    finally:
+        if path is not None:
+            remove_worktree(worktree, path)
+    return innocent
+
+
 def designated_removals(attribution: dict, failures: list[dict], *,
                         known_lots=None) -> tuple[list[Removal], str]:
     """Les unités désignées sans ambiguïté pour **tous** les échecs.
@@ -2685,7 +2761,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
                       select=None, on_base=None, guard=None,
-                      prefix=None,
+                      prefix=None, earlier=None,
                       parallel: int = DEFAULT_PARALLEL,
                       deadline: float | None = None,
                       contract_report: ContractPass | None = None,
@@ -2713,6 +2789,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     est **consigné** dans `runs` et ne retire aucune unité : le canon §3 veut
     qu'il ne retienne ni paquet ni release ; la ci-full tranche.
     `attribute` est injectable pour les témoins (`attribute_composition`).
+
+    #6232 : un retrait dont les tests rouges le sont déjà sur le préfixe d'une
+    unité antérieure retirée est abandonné (`earlier_red`, injectable par
+    `earlier`) : l'unité innocente n'est pas retirée avec la fautive.
 
     #4025 : la série d'une unité joue aussi ses modules voisins
     (`neighbor_modules`, injectable par `select`). Dans le geste antérieur,
@@ -3081,6 +3161,16 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             log("tests contrats : rouge non attribuable (%s) — retrait des "
                 "unités aux tests propres rouges, puis recomposition"
                 % (why or "attribution incertaine"))
+    if len(removals) > 1:
+        if guard is not None:
+            guard()
+        bounds = ({"guard": guard} if guard is not None else {}) | (
+            {"deadline": deadline} if deadline is not None else {})
+        innocent = (earlier or earlier_red)(
+            worktree, composition, removals, timeout=timeout, log=log,
+            **bounds)
+        removals = [removal for removal in removals
+                    if removal.lot not in innocent]
     if removals:
         how = why
         if not how and any(removal.proof == "prefixes" for removal in removals):
