@@ -36,11 +36,20 @@ bash pose-DB-vm_probe-v46.sh --apply '$POSE' > /tmp/v46.out 2>&1; rc=$?
 { [ $rc != 0 ] && grep -q "invalid command-line argument for server process: -c" /tmp/v46.out; } && ok "v4.6 : défaut de quoting reproduit (rc $rc, « invalid command-line argument … -c »)" || { ko "v4.6 non reproduit (rc $rc)"; tail -5 /tmp/v46.out; }
 [ "$(runuser -u postgres -- psql -d ameesh -XAtc "select count(*) from pg_roles where rolname like '"'"'vm_probe%'"'"'")" = 0 ] && ok "v4.6 : base intacte (aucun rôle vm_probe*)" || ko "v4.6 : rôle créé"
 [ -f $OPS/vm_probe.scram ] && ok "v4.6 : vérificateur AG3 conservé après l échec (trap v4.6)" || ko "vérificateur détruit"
+# Échec forcé APRÈS création du dossier de l exécution (colonne manquante → installation refusée) :
+runuser -u postgres -- psql -d ameesh -XAq -c "alter table host_handoffs rename column state to etat"
+avant=$(ls -d /var/tmp/ameesh-6002-vm-probe-* 2>/dev/null | sort)
+bash pose-DB-vm_probe-v47.sh --apply '$POSE' > /tmp/v47e.out 2>&1; rc=$?
+[ $rc != 0 ] && grep -q "installation refusée" /tmp/v47e.out && ok "v4.7 échec forcé à l installation : STOP (rc $rc)" || { ko "échec forcé (rc $rc)"; tail -5 /tmp/v47e.out; }
+grep -q "résidu de la tentative 20261108T171938Z retiré" /tmp/v47e.out && [ ! -e $R ] && ok "v4.7 : résidu exact retiré (chemin exact, root:postgres, 2 .sql)" || ko "résidu"
+[ "$(ls -d /var/tmp/ameesh-6002-vm-probe-* 2>/dev/null | sort)" = "$(printf "%s\n" $avant | grep -v 20261108T171938Z)" ] && ok "v4.7 échec : trap a retiré tout le dossier de l exécution sur « mesh-1 »" || ko "dossier d exécution restant après échec"
+[ -f $OPS/vm_probe.scram ] && ok "v4.7 échec : vérificateur AG3 conservé (relance possible)" || ko "vérificateur AG3 détruit à l échec"
+runuser -u postgres -- psql -d ameesh -XAq -c "alter table host_handoffs rename column etat to state"
 bash pose-DB-vm_probe-v47.sh --apply '$POSE' > /tmp/v47.out 2>&1; rc=$?
 [ $rc = 0 ] && ok "v4.7 : pose-DB rc 0" || { ko "v4.7 rc $rc"; tail -15 /tmp/v47.out; }
-grep -q "résidu de la tentative 20261108T171938Z retiré" /tmp/v47.out && [ ! -e $R ] && ok "v4.7 : résidu exact retiré" || ko "résidu"
+grep -q "pas de résidu" /tmp/v47.out && ok "v4.7 relance : « pas de résidu »" || ko "relance résidu"
 [ "$(grep -c "vm_probe contract held" /tmp/v47.out)" -ge 2 ] && ok "v4.7 : contrat tenu à l installation ET à l audit après mot de passe" || ko "contrat"
 [ "$(runuser -u postgres -- psql -d ameesh -XAtc "select left(rolpassword,14) from pg_authid where rolname='"'"'vm_probe'"'"'")" = "SCRAM-SHA-256\$" ] && ok "v4.7 : vm_probe en SCRAM (vérificateur réutilisé)" || ko "mot de passe"
 [ ! -e $OPS/vm_probe.scram ] && ok "v4.7 : vérificateur AG3 détruit après ALTER ROLE réussi" || ko "vérificateur AG3 restant"
-[ -z "$(ls -d /var/tmp/ameesh-6002-vm-probe-* 2>/dev/null | grep -v 20261108T171938Z | xargs -r -n1 sh -c "ls \$0/v 2>/dev/null")" ] && ok "aucune copie du vérificateur sur « mesh-1 »" || ko "copie résiduelle"
+[ "$(ls -d /var/tmp/ameesh-6002-vm-probe-* 2>/dev/null | sort)" = "$(printf "%s\n" $avant | grep -v 20261108T171938Z)" ] && ok "v4.7 succès : aucun dossier d exécution restant sur « mesh-1 » (seul celui de v4.6 demeure)" || ko "dossier restant après succès"
 exit $E'

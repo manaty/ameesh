@@ -39,10 +39,13 @@ D'autres appels C ne fonctionnaient que par hasard :
      exactement `_contrat-vm-probe.sql` et `role-vm-probe.sql`.
    - Sinon : STOP, sans rien effacer.
    - Absent : « pas de résidu ».
-4. Rien d'autre ne change par rapport à v4.6 : empreintes de M', vérificateur réutilisé, trap qui
+4. **Trap (mesh-design #201452).** À toute sortie, succès comme échec, le trap nettoie **tout** le dossier
+   de l'exécution sur mesh-1 : vérificateur détruit, `.sql` publics retirés, puis le dossier lui-même.
+   La copie d'AG3 n'est détruite qu'après un `ALTER ROLE` réussi, pour qu'une relance reste possible.
+5. Rien d'autre ne change par rapport à v4.6 : empreintes de M', vérificateur réutilisé, trap qui
    garde la copie d'AG3 jusqu'au succès de `ALTER ROLE`, audit relancé une fois (#6364).
 
-## Témoin qui exerce la vraie chaîne (`temoin-quoting-v47.sh`) : 9/9
+## Témoin qui exerce la vraie chaîne (`temoin-quoting-v47.sh`) : 13/13, vert AVANT la pose (#201452)
 
 **Banc :**
 - conteneur `postgres:17` réel, schéma minimal du mesh (`schema-minimal-v47.sql` : les 7 relations
@@ -55,12 +58,18 @@ D'autres appels C ne fonctionnaient que par hasard :
 **Exécution des scripts tels quels :**
 - **`pose-DB-vm_probe-v46.sh --apply`** : défaut reproduit (rc 2, « invalid command-line argument … -c »),
   base intacte, vérificateur d'AG3 conservé.
-- **`pose-DB-vm_probe-v47.sh --apply`** :
-  - rc 0, et résidu exact retiré ;
+- **`pose-DB-vm_probe-v47.sh --apply`, échec forcé après création du dossier** (colonne renommée,
+  donc installation refusée) :
+  - STOP ;
+  - le résidu exact est retiré (chemin exact, root:postgres, les 2 `.sql`) ;
+  - **le trap retire tout le dossier de l'exécution** ;
+  - le vérificateur d'AG3 est conservé.
+- **`pose-DB-vm_probe-v47.sh --apply`, relance** :
+  - rc 0, et « pas de résidu » ;
   - **« vm_probe contract held » à l'installation ET à l'audit après mot de passe**, sur un vrai PostgreSQL 17 ;
   - `vm_probe` en SCRAM avec le vérificateur réutilisé ;
   - vérificateur d'AG3 détruit après `ALTER ROLE` ;
-  - aucune copie restante sur « mesh-1 ».
+  - aucun dossier d'exécution restant sur « mesh-1 » (seul demeure celui de v4.6, rejoué dans le banc).
 
 ## Suite (mêmes feux qu'en v4.6)
 

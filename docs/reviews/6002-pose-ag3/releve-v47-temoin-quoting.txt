@@ -1,9 +1,13 @@
 OK   v4.6 : défaut de quoting reproduit (rc 2, « invalid command-line argument … -c »)
 OK   v4.6 : base intacte (aucun rôle vm_probe*)
 OK   v4.6 : vérificateur AG3 conservé après l échec (trap v4.6)
+OK   v4.7 échec forcé à l installation : STOP (rc 2)
+OK   v4.7 : résidu exact retiré (chemin exact, root:postgres, 2 .sql)
+OK   v4.7 échec : trap a retiré tout le dossier de l exécution sur « mesh-1 »
+OK   v4.7 échec : vérificateur AG3 conservé (relance possible)
 OK   v4.7 : pose-DB rc 0
-OK   v4.7 : résidu exact retiré
+OK   v4.7 relance : « pas de résidu »
 OK   v4.7 : contrat tenu à l installation ET à l audit après mot de passe
 OK   v4.7 : vm_probe en SCRAM (vérificateur réutilisé)
 OK   v4.7 : vérificateur AG3 détruit après ALTER ROLE réussi
-OK   aucune copie du vérificateur sur « mesh-1 »
+OK   v4.7 succès : aucun dossier d exécution restant sur « mesh-1 » (seul celui de v4.6 demeure)

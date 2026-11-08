@@ -51,7 +51,9 @@ TS=$(date -u +%Y%m%dT%H%M%SZ)-$$; D=/var/tmp/ameesh-6002-vm-probe-$TS
 # v4.6 : à toute sortie, la copie de mesh-1 est détruite. Celle d'AG3 (root 0600 dans les reçus de la pose)
 # n'est détruite qu'APRÈS un ALTER ROLE réussi : sinon le passfile vm-operator ne correspondrait plus à aucun
 # vérificateur et la relance exigerait un nouveau secret (retour AG3 puis repose).
-trap 'C "shred -u $D/v 2>/dev/null; true" || true' EXIT
+# v4.7 (#201452) : le trap nettoie TOUT le dossier de cette exécution sur mesh-1 (vérificateur détruit, .sql
+# publics retirés, dossier retiré), succès comme échec.
+trap 'C "if [ -d $D ]; then shred -u $D/v 2>/dev/null; rm -f $D/role-vm-probe.sql $D/_contrat-vm-probe.sql; rmdir $D; fi; true" || true' EXIT
 
 # 1. pièces SQL de M dans un dossier root:postgres 0750 (postgres doit les lire, \ir relatif)
 C "install -d -m 750 -o root -g postgres $D"
