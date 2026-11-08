@@ -1,12 +1,10 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- #6372: included inside role-release-controller.sql's transaction.
--- Non-additive: bureau installation outside release windows, never migration.
+-- #6372: additive endpoint inside caller transaction; preserves controller SELECT.
 DO $install$
 DECLARE
     s text := current_schema();
     r text := current_setting('ameesh.release_role');
     w text := current_setting('ameesh.release_role') || '_decision_reader';
-    cols text;
     acl record;
 BEGIN
     IF octet_length(w)>63 THEN RAISE EXCEPTION 'controller role name too long'; END IF;
@@ -54,15 +52,5 @@ $ddl$,s);
     EXECUTE format('ALTER FUNCTION %I.release_controller_decision(bigint) OWNER TO %I',s,w);
     EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM %I',s,w);
     EXECUTE format('GRANT EXECUTE ON FUNCTION %I.release_controller_decision(bigint) TO %I',s,r);
-    SELECT string_agg(quote_ident(attname),',') INTO cols FROM pg_attribute
-      WHERE attrelid=format('%I.agent_mailbox',s)::regclass AND attnum>0 AND NOT attisdropped;
-    EXECUTE format('REVOKE SELECT ON %I.agent_mailbox FROM %I',s,r);
-    EXECUTE format('REVOKE SELECT (%s) ON %I.agent_mailbox FROM %I',cols,s,r);
-    IF EXISTS (SELECT FROM pg_roles usable WHERE (usable.rolname=r OR pg_has_role(r,usable.oid,'MEMBER'))
-       AND EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid=format('%I.agent_mailbox',s)::regclass
-           AND a.attnum>0 AND NOT a.attisdropped
-           AND has_column_privilege(usable.oid,a.attrelid,a.attnum,'SELECT'))) THEN
-        RAISE EXCEPTION 'controller still reads mailbox directly or via SET ROLE';
-    END IF;
 END
 $install$;
