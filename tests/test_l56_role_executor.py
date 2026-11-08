@@ -108,6 +108,17 @@ class RoleExecutorTest(PgTestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         try:
+            # The enrollment creates isolated function owners, too. Collect
+            # only roles depending on this class's disposable database.
+            readers = cls.db.query("SELECT DISTINCT r.rolname FROM pg_roles r "
+                "JOIN pg_shdepend d ON d.refobjid=r.oid "
+                "WHERE d.refclassid='pg_authid'::regclass "
+                "AND d.dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) "
+                "AND r.rolname LIKE 't_%_decision_reader'")
+            for row in readers:
+                name = db_mod.quote_ident(row['rolname'])
+                cls.db.execute('DROP OWNED BY '+name+' CASCADE')
+                cls.db.execute('DROP ROLE '+name)
             cls.drop_roles()
         finally:
             super().tearDownClass()
@@ -638,7 +649,7 @@ class RoleExecutorTest(PgTestCase):
             # nom de droit inconnu.
             with tempfile.TemporaryDirectory() as directory:
                 older = Path(directory)/'role-release-controller.sql'
-                older.write_text(text.replace("current_setting('server_version_num')::int",
+                older.write_text(text.replace('\\ir ', '\\ir '+str(sql.parent)+'/').replace("current_setting('server_version_num')::int",
                                               '160000'))
                 result = apply(older)
                 self.assertEqual(result.returncode,0,result.stderr)
@@ -975,7 +986,7 @@ class RoleExecutorTest(PgTestCase):
             # #4995: the controller re-reads the signed replacement log at every
             # step; it must reach the same refusal under its own role, not a
             # permission error.
-            decision_payload = json.dumps({"decision": {"state": "answered"}})
+            decision_payload = json.dumps({"decision": {"state": "answered", "needs_signature": True}})
             rows = self.db.query(
                 "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
                 " VALUES ('a', 'human:x', 'old', 'request', %s::jsonb),"
@@ -995,15 +1006,15 @@ class RoleExecutorTest(PgTestCase):
                            ('controller-fixture','synthetic-host','a'*64))
                 tx.execute('INSERT INTO host_release_fences(host,operation,probe) VALUES (%s,%s,%s)',
                            ('synthetic-host','controller-fixture','synthetic-probe'))
-                for relation in ('agent_mailbox','mesh_approvals','mesh_consumed_nonces','turn_resources','spend_pending','decision_supersessions'):
+                for relation in ('mesh_approvals','mesh_consumed_nonces','turn_resources','spend_pending','decision_supersessions'):
                     tx.query('SELECT * FROM '+q(relation)+' LIMIT 0')
                 # #4995: the real authority read, under the controller role: it
                 # sees the logged event and refuses the old authority because
                 # the replacement carries no signed answer (no permission error).
-                view = decisions.get(tx, old_decision)
+                view = decisions.view_of(tx.query('SELECT * FROM release_controller_decision(%s)', (old_decision,))[0])
                 with self.assertRaisesRegex(decisions.DecisionError,
                                             'not a signed replacement'):
-                    decisions.require_current(tx, view)
+                    decisions.require_current(tx, view, reader=decisions.get_for_controller)
                 tx.query('SELECT * FROM mesh_approvals_status LIMIT 0')
                 # SignedDecisionAuthority re-reads the owner key at every step.
                 tx.query('SELECT name, holder, public_key, public_key_fingerprint, key_role,'
@@ -1051,7 +1062,7 @@ class RoleExecutorTest(PgTestCase):
             patched = (head + "SELECT format('GRANT SELECT ON"
                        + tail.replace(":'schema',", "", 1))
             without_read = Path(self.tmp) / 'role-release-controller-no-log.sql'
-            without_read.write_text(patched, encoding='utf-8')
+            without_read.write_text(patched.replace('\\ir ', '\\ir '+str(sql.parent)+'/'), encoding='utf-8')
             result = subprocess.run(command[:-1] + [str(without_read)], env=env,
                                     text=True, capture_output=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)

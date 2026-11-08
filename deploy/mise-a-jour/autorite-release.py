@@ -63,7 +63,7 @@ class SignedDecisionAuthority:
         self.denial_reason = None
         if operation != self.operation or manifest_digest != self.digest or step not in STEPS:
             return False
-        view = decisions.get(self.db, self.decision_id)
+        view = decisions.get_for_controller(self.db, self.decision_id)
         if view and not self._current(view):
             return False
         if not view or view.get('state') != 'answered' or view.get('needs_signature') is not True:
@@ -95,7 +95,7 @@ class SignedDecisionAuthority:
     def _current(self, view):
         self.denial_reason = None
         try:
-            decisions.require_current(self.db, view)
+            decisions.require_current(self.db, view, reader=decisions.get_for_controller)
         except decisions.DecisionError as error:
             self.denial_reason = str(error)
             return False

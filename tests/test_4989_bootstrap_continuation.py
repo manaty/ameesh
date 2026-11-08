@@ -15,6 +15,12 @@ bootstrap = fixture.bootstrap
 
 
 class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.release_decision import install_decision_gate
+        install_decision_gate(cls)
+
     sign = fixture.SignedRefusalTest.sign
 
     def ask(self, question, options, **extra):
@@ -89,7 +95,7 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
         def missing(db, decision, *args):
             value = original(db, decision, *args)
             return dict(value, superseded_by=None) if decision == self.old_decision else value
-        with mock.patch.object(decisions, 'get', side_effect=missing):
+        with mock.patch.object(decisions, 'get_for_controller', side_effect=missing):
             with self.assertRaises(ValueError):
                 self.backend.continue_install(self.operation, self.view['id'])
         self.assertEqual(json.loads(reservation.read_bytes())['operation'], self.old_operation)
