@@ -1,0 +1,55 @@
+== role-superviseur.sql
+psql:_contrat-superviseur.sql:358: ERROR:  contrat du rôle ameesh_superviseur NON TENU dans le schéma public (51 écart(s)) — installation annulée, rien n'a changé :
+  lecture hors contrat : pg_stat_statements.userid
+  lecture hors contrat : pg_stat_statements.dbid
+  lecture hors contrat : pg_stat_statements.toplevel
+  lecture hors contrat : pg_stat_statements.queryid
+  lecture hors contrat : pg_stat_statements.query
+  lecture hors contrat : pg_stat_statements.plans
+  lecture hors contrat : pg_stat_statements.total_plan_time
+  lecture hors contrat : pg_stat_statements.min_plan_time
+  lecture hors contrat : pg_stat_statements.max_plan_time
+  lecture hors contrat : pg_stat_statements.mean_plan_time
+  lecture hors contrat : pg_stat_statements.stddev_plan_time
+  lecture hors contrat : pg_stat_statements.calls
+  lecture hors contrat : pg_stat_statements.total_exec_time
+  lecture hors contrat : pg_stat_statements.min_exec_time
+  lecture hors contrat : pg_stat_statements.max_exec_time
+  lecture hors contrat : pg_stat_statements.mean_exec_time
+  lecture hors contrat : pg_stat_statements.stddev_exec_time
+  lecture hors contrat : pg_stat_statements.rows
+  lecture hors contrat : pg_stat_statements.shared_blks_hit
+  lecture hors contrat : pg_stat_statements.shared_blks_read
+  lecture hors contrat : pg_stat_statements.shared_blks_dirtied
+  lecture hors contrat : pg_stat_statements.shared_blks_written
+  lecture hors contrat : pg_stat_statements.local_blks_hit
+  lecture hors contrat : pg_stat_statements.local_blks_read
+  lecture hors contrat : pg_stat_statements.local_blks_dirtied
+  lecture hors contrat : pg_stat_statements.local_blks_written
+  lecture hors contrat : pg_stat_statements.temp_blks_read
+  lecture hors contrat : pg_stat_statements.temp_blks_written
+  lecture hors contrat : pg_stat_statements.shared_blk_read_time
+  lecture hors contrat : pg_stat_statements.shared_blk_write_time
+  lecture hors contrat : pg_stat_statements.local_blk_read_time
+  lecture hors contrat : pg_stat_statements.local_blk_write_time
+  lecture hors contrat : pg_stat_statements.temp_blk_read_time
+  lecture hors contrat : pg_stat_statements.temp_blk_write_time
+  lecture hors contrat : pg_stat_statements.wal_records
+  lecture hors contrat : pg_stat_statements.wal_fpi
+  lecture hors contrat : pg_stat_statements.wal_bytes
+  lecture hors contrat : pg_stat_statements.jit_functions
+  lecture hors contrat : pg_stat_statements.jit_generation_time
+  lecture hors contrat : pg_stat_statements.jit_inlining_count
+  lecture hors contrat : pg_stat_statements.jit_inlining_time
+  lecture hors contrat : pg_stat_statements.jit_optimization_count
+  lecture hors contrat : pg_stat_statements.jit_optimization_time
+  lecture hors contrat : pg_stat_statements.jit_emission_count
+  lecture hors contrat : pg_stat_statements.jit_emission_time
+  lecture hors contrat : pg_stat_statements.jit_deform_count
+  lecture hors contrat : pg_stat_statements.jit_deform_time
+  lecture hors contrat : pg_stat_statements.stats_since
+  lecture hors contrat : pg_stat_statements.minmax_stats_since
+  lecture hors contrat : pg_stat_statements_info.dealloc
+  lecture hors contrat : pg_stat_statements_info.stats_reset
+Ces droits viennent d'ailleurs (PUBLIC, rôle parent, ACL par défaut) : les retirer à la source, puis relancer.
+CONTEXT:  PL/pgSQL function inline_code_block line 322 at RAISE
