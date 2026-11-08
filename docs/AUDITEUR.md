@@ -1133,12 +1133,26 @@ Environment=AUDITEUR_RESERVE_DIR=<dossier des scripts de la réserve>
 perdu, préflight du staging `41262fcd` refusé.
 
 Après toute modification de l'environnement d'un exécuteur (drop-in, fichier
-`env`, unité), **vérifier un démarrage sain avant toute séquence de staging** :
+`env`, unité), **vérifier un démarrage sain avant toute séquence de staging**.
+`systemctl is-active` et `ameesh doctor` ne suffisent pas : le 08/11 à
+06:11:14Z l'unité était `active` et bouclait dès la seconde suivante sur
+`host not ready: … fe_sendauth` ; `ameesh doctor`, lancé dans le shell de
+l'opérateur sans le `PGPASSFILE` de l'unité, serait resté vert. La preuve vient
+de l'exécuteur lui-même :
 
 ```sh
+systemctl --user daemon-reload        # après édition d'un drop-in
 systemctl --user restart ameesh-runner-agent@auditeur
-systemctl --user is-active ameesh-runner-agent@auditeur   # doit rendre "active"
-ameesh doctor                                             # doit être vert
+
+# Aucune boucle « host not ready » depuis le démarrage de l'unité ; la ligne
+# « Started » le date (ActiveEnterTimestamp = entrée en active de ce démarrage).
+since="$(systemctl --user show -p ActiveEnterTimestamp --value ameesh-runner-agent@auditeur)"
+systemctl --user is-active ameesh-runner-agent@auditeur       # active
+journalctl --user-unit ameesh-runner-agent@auditeur --since "$since" --no-pager \
+  | grep -E 'Started|host not ready'   # Started ; aucune ligne host not ready
+
+# L'agent a repris son bail sur un hôte candidat (pas seulement l'unité up) :
+agent-mail list | grep -E '^auditeur\b'   # … @<hôte candidat> lease:runner-auditeur@<hôte>
 ```
 
 Un préflight de staging reste refusé tant que l'exécuteur n'a pas redémarré
