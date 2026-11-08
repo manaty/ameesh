@@ -2418,6 +2418,25 @@ class WorkItems(interface.WorkItems):
             self.db, getattr(self.db, "cfg", None), item, marks)
         return gate
 
+    def sync_validations(self) -> list[dict]:
+        """#6257: retry committed review gates without requiring a new verdict."""
+        if in_transaction(self.db):
+            return []
+        from ...work import SYSTEM_SENDER
+        candidates = self.db.query(
+            "SELECT work_items.id FROM work_items WHERE work_items.state = 'qa' AND " + _UNPINNED +
+            " AND EXISTS (SELECT 1 FROM work_item_milestones m"
+            " WHERE m.work_item_id = work_items.id AND m.kind = 'verdict') ORDER BY work_items.id")
+        results = []
+        for item in candidates:
+            try:
+                self._sync_validation(item["id"], SYSTEM_SENDER)
+                results.append({"id": item["id"], "state": self.get(item["id"])["state"]})
+            except Exception as exc:
+                # One unreadable lot must not starve the rest of the pass.
+                results.append({"id": item["id"], "error": str(exc)})
+        return results
+
     def _sync_validation(self, item_id, actor):
         """Compute the gate outside locks, then compare the immutable ledger.
 
@@ -2425,9 +2444,11 @@ class WorkItems(interface.WorkItems):
         concurrent note only moves `updated_at`, so the guard compares the
         milestones and the fields the gate actually reads, never the whole
         row — a stale note no longer cancels an acquired quorum for good.
-        The next writer reconciles its own snapshot; no stale quorum can
-        promote a lot.
+        The next writer or notification pass reconciles its own snapshot;
+        no stale quorum can promote a lot.
         """
+        if in_transaction(self.db):
+            return
         item = self.get(item_id)
         if item["state"] != "qa" or item.get("workflow_ref"):
             return
@@ -2446,8 +2467,17 @@ class WorkItems(interface.WorkItems):
                      or plan_git.same_commit(mark.get("sha"), freeze.get("sha")))
                 for mark in marks):
             return
-        gate = self._validation_gate(item_id, marks, item=item)
+        try:
+            gate = self._validation_gate(item_id, marks, item=item)
+        except Exception as exc:
+            gate = {"ok": False, "error": str(exc)}
         if not gate or not gate.get("ok"):
+            detail = {"freeze": freeze.get("sha"), "gate": None if gate is None else "refused",
+                      "why": (gate or {}).get("why") or "review gate inconclusive",
+                      "error": (gate or {}).get("error") or ""}
+            self.note(item_id, "qa", "validation pending (#6257): " +
+                      json.dumps(detail, ensure_ascii=False, sort_keys=True, default=str),
+                      actor, once=True)
             return
         with self.db.transaction() as tx:
             tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",

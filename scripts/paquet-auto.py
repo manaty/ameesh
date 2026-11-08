@@ -2404,6 +2404,10 @@ def publication_policy(args):
     return policy(project)
 
 
+#: #6238 : la dernière projection écrite par ce processus, par porteur.
+_RECORDED_CONTRACTS: dict[int, str] = {}
+
+
 def record_contract_result(worktree, carrier, report, *, base, target):
     from ameesh.packet_contract_proof import encode
     verify_contract_scope(worktree, report)
@@ -2421,7 +2425,15 @@ def record_contract_result(worktree, carrier, report, *, base, target):
                 connection.close()
     note = encode(report, base=base, target=target)
     print(note, flush=True)  # scheduler can recover a failed journal write
-    print(note_carrier(worktree, carrier, note), flush=True)
+    if _RECORDED_CONTRACTS.get(carrier) == note:
+        # #6238 : une seule note par tête/arbre/cible ; le bail exclut un autre
+        # composeur du porteur, la note écrite reste donc la dernière.
+        print("note du porteur #%d déjà à jour" % carrier, flush=True)
+        return
+    outcome = note_carrier(worktree, carrier, note)
+    if outcome == "note du porteur #%d écrite" % carrier:
+        _RECORDED_CONTRACTS[carrier] = note
+    print(outcome, flush=True)
 
 
 def contract_budget(args) -> int | None:

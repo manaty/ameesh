@@ -2486,6 +2486,13 @@ class Notifier:
             except Exception as exc:  # noqa: BLE001 — un battement ne fait pas le passage
                 self.log("[%s] heartbeat not recorded (%s)"
                          % (notify_gap.GAP_TYPE, exc))
+        if db is not None and not self.dry_run:
+            try:
+                for result in storage.of(db).work.sync_validations():
+                    if result.get("error"):
+                        self.log("validation retry #%s: %s" % (result["id"], result["error"]))
+            except Exception as exc:
+                self.log("validation retry unavailable: %s" % exc)
         observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         #: #1901 : familles qu'une passe n'a pas pu lire du tout (porte d'hôte
         #: au registre illisible) ; une alerte absente d'un relevé incomplet

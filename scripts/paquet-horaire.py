@@ -1551,10 +1551,21 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
     step = this.step
     # La sauvegarde Git réussit parfois alors que sa note échoue ; récupérer
     # la marque exacte de la sortie avant de journaliser le refus de garde.
-    from ameesh.packet_contract_proof import MARK as CONTRACT_MARK
+    from ameesh.packet_contract_proof import MARK as CONTRACT_MARK, latest
     for line in result.stdout.splitlines():
-        if auto.TESTED_RE.match(line) or line.startswith(CONTRACT_MARK):
+        if auto.TESTED_RE.match(line):
             ctx.note(carrier, line)
+    # #6238 : seule la dernière projection imprimée peut faire foi (lecture de
+    # E) ; récupérée seulement si le journal du porteur ne la porte pas déjà.
+    projections = [line for line in result.stdout.splitlines()
+                   if line.startswith(CONTRACT_MARK)]
+    if projections:
+        try:
+            journal = latest(show(ctx, carrier))
+        except HoraireError:
+            journal = None
+        if journal != projections[-1]:
+            ctx.note(carrier, projections[-1])
     # N1 de relecture : la fin de la sortie seulement (l'erreur qui arrête
     # paquet-auto), pas une phrase citée plus haut par un test rouge
     if result.returncode != 0 and FENCE_REFUSAL_RE.search(auto._tail(result.text, 10)):
