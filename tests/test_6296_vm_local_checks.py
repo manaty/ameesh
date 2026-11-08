@@ -113,6 +113,18 @@ class ReceiptTest(unittest.TestCase):
         self.receipt['doctor'] = False
         self.assertEqual(self.check('doctor'), 1)
 
+    def test_red_doctor_with_reason_keeps_version_mode_readable(self):
+        # #6334: version_mode no longer depends on doctor.
+        self.receipt.update(doctor=False, reason='readiness:ValueError')
+        self.assertEqual(self.check(), 0)
+        self.assertEqual(self.check('doctor'), 1)
+        for receipt in (dict(doctor=True), dict(doctor=False, reason='leak: secret'),
+                        dict(doctor=False, reason=None)):
+            with self.subTest(receipt=receipt), mock.patch.dict(self.receipt, receipt):
+                self.assertEqual(self.check(), 1)
+        del self.receipt['reason']
+        self.assertEqual(self.check(), 1)
+
     def test_absent_unreadable_malformed_and_timeout_refuse_at_entrypoint(self):
         for error in (FileNotFoundError(), PermissionError(), ValueError(),
                       subprocess.TimeoutExpired('check', 5)):
@@ -153,13 +165,22 @@ class ReceiptTest(unittest.TestCase):
     def test_producer_uses_real_verifier_and_live_mode_not_declared_mode(self):
         proc = self.root / 'proc' / '123'
         proc.mkdir(parents=True)
-        proc.joinpath('cmdline').write_bytes(b'/venv/bin/python\0/venv/bin/ameesh\0run\0--dry-run\0')
+        proc.joinpath('cmdline').write_bytes(b'/venv/bin/python\0/venv/bin/ameesh\0run\0--dry-run\0'
+                                             b'--runner-id\0runner-probe@vm\0')
         verifier = SimpleNamespace(verifier=mock.Mock())
         run = mock.Mock(return_value='MainPID=123\nActiveState=active\nSubState=running\nNeedDaemonReload=no\n')
         self.assertEqual(health.runner_state(
             'ameesh-runner-agent@probe.service', Path('/venv'), verifier,
-            time.monotonic() + 5, proc=self.root / 'proc', run=run), (123, 'dry-run'))
+            time.monotonic() + 5, proc=self.root / 'proc', run=run),
+            (123, 'dry-run', 'runner-probe@vm'))
         verifier.verifier.assert_called_once_with('123', Path('/venv'))
+        for cmdline in (b'/venv/bin/python\0/venv/bin/ameesh\0run\0--agents\0probe\0',
+                        b'/venv/bin/python\0/venv/bin/ameesh\0run\0--runner-id\0a\0--runner-id\0b\0',
+                        b'/venv/bin/python\0/venv/bin/ameesh\0run\0--runner-id\0a b\0'):
+            proc.joinpath('cmdline').write_bytes(cmdline)
+            with self.subTest(cmdline=cmdline), self.assertRaises(ValueError):
+                health.runner_state('ameesh-runner-agent@probe.service', Path('/venv'), verifier,
+                                    time.monotonic() + 5, proc=self.root / 'proc', run=run)
         verifier.verifier.side_effect = PermissionError()
         with self.assertRaises(PermissionError):
             health.runner_state('ameesh-runner-agent@probe.service', Path('/venv'), verifier,
@@ -199,20 +220,26 @@ class ReceiptTest(unittest.TestCase):
                 return json.dumps([dict(unit=unit, active='active')])
             if '-c' in argv:
                 return json.dumps(dict(version='1.2.3', source={'url': 'file:///store/src-' + 'a' * 40}))
+            if 'list' in argv:
+                return json.dumps([dict(lease_owner='runner-probe@vm', status='running',
+                                        lease_expires_ts=time.time() + 60)])
             return ''
 
         with mock.patch.object(health.os, 'geteuid', return_value=1000), \
                 mock.patch.object(health, 'command', side_effect=command), \
-                mock.patch.object(health, 'runner_state', return_value=(123, 'execute')) as state:
+                mock.patch.object(health, 'runner_state',
+                                  return_value=(123, 'execute', 'runner-probe@vm')) as state:
             self.assertEqual(health.produce(boot=self.boot, reader=lambda *args: card), 0)
         result = json.loads(path.read_text())
         self.assertTrue(result['doctor'])
         self.assertTrue(result['version_mode'])
         self.assertEqual((result['sha'], result['pids']), ('a' * 40, [123]))
         self.assertEqual(state.call_count, 2)
-        doctor = calls[-1]
-        self.assertIn('--property=EnvironmentFile=/private/env', doctor)
+        doctor, ready = calls[-2:]
+        for argv in (doctor, ready):
+            self.assertIn('--property=EnvironmentFile=/private/env', argv)
         self.assertEqual(doctor[-5:], ['/live-venv/bin/python', '-I', '-m', 'ameesh', 'doctor'])
+        self.assertEqual(ready[-3:], ['ameesh', 'list', '--json'])
 
     def test_producer_rejects_dry_run_and_venv_switch_during_doctor(self):
         path = self.root / 'health.json'
@@ -244,7 +271,7 @@ class ReceiptTest(unittest.TestCase):
                     mock.patch.object(health.os, 'geteuid', return_value=1000), \
                     mock.patch.object(health.importlib.util, 'module_from_spec', side_effect=module), \
                     mock.patch.object(health, 'command', side_effect=command), \
-                    mock.patch.object(health, 'runner_state', return_value=(123, mode)):
+                    mock.patch.object(health, 'runner_state', return_value=(123, mode, 'r@vm')):
                 self.assertEqual(health.produce(boot=self.boot, reader=lambda *args: card), 1)
                 self.assertFalse(json.loads(path.read_text())['version_mode'])
 
