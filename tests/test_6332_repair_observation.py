@@ -58,11 +58,12 @@ class ObservationTest(PgTestCase):
     def page(self, source='inbox'):
         return self.api.page('acme', 'staging', source)
 
-    def event(self, key='a'*64, **metadata):
+    def event(self, key='a'*64, project='acme', **metadata):
+        data = {'key': key, 'revision': 'a'*40, 'detail': 'PRIVATE', **metadata}
         return self.db.query(
             "INSERT INTO ameesh_events(type,object,project,data)"
-            " VALUES ('alert.raised','alert:test','acme',%s::jsonb) RETURNING id",
-            (json.dumps({'key': key, 'revision': 'a'*40, 'detail': 'PRIVATE', **metadata}),))[0]['id']
+            " VALUES ('alert.raised','alert:test',%s,%s::jsonb) RETURNING id",
+            (project, json.dumps(data)))[0]['id']
 
     def test_alert_scan_advances_only_one_bounded_page(self):
         for i in range(obs.BATCH + 1):
@@ -134,6 +135,52 @@ class ObservationTest(PgTestCase):
         obs.scan(self.db, 'acme', 'alerts', now=NOW)
         self.assertEqual(len(self.page('alerts')), 2)
         self.assertEqual(self.api.summary(project='acme')['occurrences'], 2)
+
+    def test_repeated_raises_of_one_key_are_occurrences_not_deliveries(self):
+        key = 'c'*64
+        for _ in range(3):
+            self.event(key)
+        self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
+        rows = self.page('alerts')
+        # One stable signal identity, but the source raised its key three times.
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['signal']['occurrence'], 3)
+        summary = self.api.summary(project='acme')
+        self.assertEqual((summary['signals'], summary['occurrences']), (1, 3))
+        # Replaying the same committed page is not a delivery counter.
+        obs.scan(self.db, 'acme', 'alerts', now=NOW)  # EOF resets the cursor
+        obs.scan(self.db, 'acme', 'alerts', now=NOW)  # same three raises again
+        summary = self.api.summary(project='acme')
+        self.assertEqual((summary['signals'], summary['occurrences']), (1, 3))
+
+    def test_recurrence_high_water_spans_bounded_pages(self):
+        key = 'd'*64
+        total = obs.BATCH + 1
+        for _ in range(total):
+            self.event(key)
+        self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
+        self.assertEqual(self.page('alerts')[0]['signal']['occurrence'], total)
+        self.assertTrue(obs.scan(self.db, 'acme', 'alerts', now=NOW))
+        rows = self.page('alerts')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['signal']['occurrence'], total)
+        self.assertEqual(self.api.summary(project='acme')['occurrences'], total)
+
+    def test_recurrence_counts_only_the_observed_project(self):
+        key = 'e'*64
+        self.event(key)
+        self.event(key, project='other')
+        obs.scan(self.db, 'acme', 'alerts', now=NOW)
+        self.assertEqual(self.page('alerts')[0]['signal']['occurrence'], 1)
+
+    def test_recurrence_high_water_rises_with_a_new_raise(self):
+        key = 'f'*64
+        self.event(key)
+        obs.scan(self.db, 'acme', 'alerts', now=NOW)
+        self.assertEqual(self.page('alerts')[0]['signal']['occurrence'], 1)
+        self.event(key)
+        obs.scan(self.db, 'acme', 'alerts', now=NOW)
+        self.assertEqual(self.page('alerts')[0]['signal']['occurrence'], 2)
 
     def test_commit_order_cannot_permanently_skip_a_lower_event_id(self):
         from ameesh import db as db_mod

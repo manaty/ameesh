@@ -46,9 +46,12 @@ un diagnostic depuis une alerte : faits absents = route unknown. Les champs
 `journal_signaux`, `journal_occurrences` et `journal_groupes` lisent le résumé
 agrégé U5 en lecture seule, par date de première réception dans la fenêtre.
 Ils ne s'ajoutent pas aux alertes lues (les deux mesures peuvent se recouvrir).
-L'observation reprend par pages circulaires de 100 métadonnées déjà persistées
-(alertes et livraisons GitHub), depuis les entrées gardées existantes ; elle
-n'ouvre aucun travail et ne transforme pas une route proposée en autorité.
+Les occurrences du journal sont les levées déjà commitées de chaque clé
+d'alerte (point haut de la source), jamais un compteur de livraisons.
+L'observation reprend par pages circulaires de `repair_observation.BATCH`
+métadonnées déjà persistées (alertes et livraisons GitHub), depuis les entrées
+gardées existantes ; elle n'ouvre aucun travail et ne transforme pas une route
+proposée en autorité.
 
 Sortie : `ameesh-repair-report/1` en `--json`, un tableau lisible sinon.
 """
@@ -206,6 +209,9 @@ LIMITS = {
         "les compteurs A1 du raccord sont ceux de repair_signals.summary/1 ; "
         "l'environnement déclaré (staging) est celui du mesh, pas une preuve "
         "que chaque alerte vient de lui",
+        "les occurrences du journal U5 sont le nombre de levées déjà commitées "
+        "de chaque clé (point haut de la source), pas un compteur de "
+        "livraisons : un rejeu de page ne les augmente pas",
     ),
     "A2": (
         "les qualifications U3 portent sur les enveloppes de la fenêtre ; "
