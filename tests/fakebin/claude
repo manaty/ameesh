@@ -106,6 +106,8 @@ def main() -> int:
                     "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
                     "AMEESH_HOST", "AMEESH_SCHEMA", "AMEESH_TURN_MAIL_MAX",
                     "AMEESH_TURN_ID", "AMEESH_HARNESS",
+                    # #6287 : le DSN lecture seule n'atteint que l'auditeur
+                    "AUDITEUR_DSN",
                     # #2894 : le document de tour remis au harnais
                     "AMEESH_TURN_CONTEXT",
                     # #834 : l'identité git de la session (auteur et committer)
