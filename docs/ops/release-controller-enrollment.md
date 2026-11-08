@@ -441,3 +441,9 @@ décrit l'étape additive avant lancement du nouveau code et le retrait séparé
 à la bascule arrêtée. La continuation n'énumère que les identifiants des demandes
 humaines signées et répondues correspondant exactement à la question précédente,
 via `release_controller_decision_ids(text)` ; elle revalide ensuite chaque preuve.
+
+Les scripts SQL sont exécutés par le compte PostgreSQL administrateur SUPERUSER
+explicite de l'enrôlement (`source_owner_dsn`), comme l'exige `session()`.
+Le propriétaire LOGIN du schéma seul ne peut pas créer le rôle NOLOGIN et lui
+transférer les fonctions. Le reçu de l'étape additive consigne le `current_user`
+effectif et la vérification SUPERUSER, sans secret ni DSN.

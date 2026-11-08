@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- Bureau: use the enrollment cluster administrator (SUPERUSER); record current_user.
 \set ON_ERROR_STOP on
 \if :{?role}
 \else

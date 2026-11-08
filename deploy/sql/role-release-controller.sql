@@ -1,6 +1,8 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- L232b: independently enrolled controller; NOT a migration/backup/root role.
--- Apply as the schema owner only as part of an approved enrollment.
+-- Apply as the explicit cluster administrator (SUPERUSER) of an approved
+-- enrollment (source_owner_dsn), not merely the schema owner: creates an
+-- isolated NOLOGIN owner and transfers SECURITY DEFINER functions to it.
 -- Protected login credentials belong to the independent service, never runners.
 \set ON_ERROR_STOP on
 \if :{?role}
