@@ -15,6 +15,14 @@ case "$1" in
  systemctl-rc1)  # la commande distante tourne vraiment, avec un faux systemctl en rc 1 (témoin impl-11)
   mkdir -p "$F/bin"; printf '%s\n' '#!/usr/bin/env bash' 'case "\$*" in *ExecStart*|*list-jobs*) exit 1;; esac; echo inactive' > "$F/bin/systemctl"
   chmod 755 "$F/bin/systemctl"; PATH="$F/bin:/usr/bin:/bin" exec bash -c "\$cmd";;
+ canon-absent)  # impl-03 B2 #200802 : premier mv fait, second échoué
+  case "\$cmd" in
+   *UnitFileState*) echo disabled;; *ActiveState*) echo inactive;;
+   *canon-avant*) echo ab4ae5b1d6f3d91b2c477db7bb7a1acb2de0c5a5;;
+   *canon-receipt.json*) echo b8c4ea12ca5fcac799329dd5ac54386384cbe223;;
+   *"test -e /home/ameesh-staging/staging/canon"*) exit 1;;
+   *"retained-before"*"rev-parse HEAD"*) echo ab4ae5b1d6f3d91b2c477db7bb7a1acb2de0c5a5;;
+   *) exit 0;; esac; exit 0;;
  partiel-intact|partiel-modifie)
   case "\$cmd" in
    *"test -d /root/ameesh-operator-C3-AG1-activation-"*) exit 0;;
@@ -42,4 +50,8 @@ faux_ssh partiel-modifie
 out=$(PATH="$F:$PATH" "$ICI/retour-c3-v22.sh" activation 20261109T094500Z-1 2>&1); rc=$?
 { [ $rc = 4 ] && printf '%s\n' "$out" | grep -q 'INCIDENT AG2' && printf '%s\n' "$out" | grep -q 'GESTE \[AG1\] : drop-in' && ! printf '%s\n' "$out" | grep -q 'GESTE \[AG2\]'; } \
   && ok "B3 AG2 sans reçus mais modifié : incident rc 4, AG1 traité, AG2 non touché" || { ko "B3 partiel modifié rc=$rc"; printf '%s\n' "$out" | sed 's/^/     /'; }
+# --- impl-03 B2 (#200802) : canon absent, canon conservé présent au bon HEAD → remis (à blanc)
+faux_ssh canon-absent
+out=$(PATH="$F:$PATH" "$ICI/retour-c3-v22.sh" prealables AG1 20261109T090000Z-1 2>&1); rc=$?
+printf '%s\n' "$out" | grep -q "GESTE \[AG1\] : canon absent : canon conservé ab4ae5b1 remis" && ok "B2 impl-03 : canon absent → canon conservé remis (rc=$rc)" || { ko "B2 impl-03 canon absent rc=$rc"; printf '%s\n' "$out" | sed 's/^/     /'; }
 exit $ECHEC

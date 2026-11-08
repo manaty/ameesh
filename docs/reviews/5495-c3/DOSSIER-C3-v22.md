@@ -22,10 +22,10 @@ tourné ; tous les témoins sont locaux (faux `ssh` et faux `systemctl` dans le 
 
   Un écart de forme est corrigé ici : le `SHA256SUMS` du kit compte **75** lignes, pas 74. Le
   74 de v2.1 venait d'un comptage fait avant l'ajout de `preparation-receipt.json`.
-- **Installateur v3 (c)** : avis **OK** d'impl-11 (#200781, codex). Sa limite de preuve est
+- **Installateur v3 (c)** : avis **OK** d'impl-11 (#200781, codex) et OK statique avec N d'impl-03
+  (#200802, deepseek). Limite de preuve d'impl-11
   explicite : l'essai fourni exerce `bascule preparer/activer/retour`, **pas le contrôleur
-  complet** (autorité, extraction, inventaire, réécriture des configurations sous root). L'avis
-  d'impl-03 (deepseek) est attendu.
+  complet** (autorité, extraction, inventaire, réécriture des configurations sous root).
 
 ## 1. Avis B d'impl-11 sur v2.1 (#200781), corrigés
 
@@ -35,11 +35,35 @@ tourné ; tous les témoins sont locaux (faux `ssh` et faux `systemctl` dans le 
 | **B2** | `if systemctl … \| grep` et `list-jobs …; true` changeaient un échec de lecture en « sans » ou « 0 » | Plus aucune commande distante ne masque son code de retour. `execstart()` et `jobs_release()` capturent la sortie avec `lire` (rc contrôlé), puis l'examinent sur BG ; une erreur de lecture devient un KO. Même principe dans `pose-c3-v22.sh` (`list-jobs` lu séparément ; `UnitFileState` remplace `is-enabled \|\| true`) | `temoin-lectures.sh` : avec un faux `systemctl` en rc 1, **v2.1 rend bien « OK … (sans) »** (défaut reproduit), alors que **v2.2 rend KO** pour ExecStart et ERREUR-LECTURE pour list-jobs |
 | **B3** | Le retour exigeait les reçus des deux hôtes avant de restaurer le premier | (a) `activer` crée les **reçus des deux hôtes** avant toute mutation (boucle 0 : état de la minuterie release et empreinte du drop-in, sans aucun geste d'unité). (b) `retour-c3-v22.sh activation` traite **chaque hôte réellement modifié**, c'est-à-dire celui qui a des reçus. Un hôte sans reçus n'est jamais touché : on vérifie seulement qu'il est intact (drop-in présent, minuterie L2 disabled, pas de soumission). Sinon c'est un **incident, rc 4**, après la restauration complète de l'autre | `temoin-lectures.sh` : activation partielle (reçus sur AG1 seulement) → gestes de retour sur AG1 seul, AG2 « intact », rc 0. AG2 sans reçus mais modifié → INCIDENT, rc 4, AG1 traité, aucun geste sur AG2 |
 
+## 1 bis. Avis B d'impl-03 sur v2.1 (#200802), intégrés dans v2.2
+
+| Avis | Défaut | v2.2 |
+|---|---|---|
+| **B1** fenêtre de release | `…; systemctl stop` masquait un échec de la sauvegarde d'état ; `if start; fi; show` masquait un échec du démarrage ; le retour ne redémarrait pas sans fichier d'état ; `go`/`actif` ne vérifiaient pas la minuterie release | Sauvegarde d'état en `&&`, avec 2 lignes vérifiées dans la boucle 0, **avant** tout arrêt ; arrêt en geste séparé (échec = STOP). Restauration : `start && ActiveState=active` exigé (pose et retour). Retour sans fichier d'état lisible : la minuterie release est redémarrée (état nominal sur les candidats), le fait est signalé et un état par défaut écrit dans les reçus. Case « minuterie release active » ajoutée à `go` et `actif` |
+| **B2** canon absent | Si le premier `mv` avait réussi et le second échoué, le retour refusait au lieu de remettre le canon conservé | `retour prealables` : canon absent **et** `$RET` présent avec HEAD = AVANT → `$RET` remis, puis HEAD vérifié. Sinon : STOP, rien touché. Témoin `temoin-lectures.sh` « canon absent → canon conservé remis » |
+| N | `vexp` prenait `sorted(...)[0]` si plusieurs venv étaient nommés | Exactement un venv est exigé dans `expected_sha256`, sinon KO (`PLUSIEURS-VENV`) |
+| N | Attestation non bornée par `depuis` ; drains non liés à l'hôte du run | La première est couverte par B1 d'impl-11 (fenêtre du run). Les drains portent sur les agents des **cibles** (AG1, AG2, AG3), pas sur l'exécuteur : le lien se fait par la fenêtre du run et l'acteur `ameesh:staging` (limite déclarée) |
+| N | Retour : arrêt de la release avant vérification du service | En v2.2, l'ordre est : minuterie L2 désactivée → service L2 vérifié inactif (sinon rc 3) → seulement ensuite, fenêtre release fermée |
+| N | Dossier « 74 lignes » | Corrigé : 75 |
+
+**Installateur P6, v3.1** (`p6/update-l2-runtime-v31.py`, sha `f838ee6b…`, diff
+`p6/update-l2-runtime-v3-v31.diff`, 50 lignes). Il porte les N d'impl-03 sur v3, dont l'avis est
+**OK (statique) avec N** :
+- `--retour` vérifie l'arbre 5c1 (`0d38f1e7`) après `bascule retour` ;
+- le venv M et le kit restent sur place (documenté) ;
+- le temporaire de `staging-submit.json` est créé en `O_EXCL` ;
+- toute exception donne un refus constant (nom du type seulement), pas seulement `AssertionError`.
+
+Les N « autorité ne contrôle que les clés et identifiants des avis » et « extraction en chmod
+644 » sont gardés tels quels : même comportement que la phase 1 relue. **Les deux avis OK (impl-11
+sur v3, impl-03 sur v3) portent sur `1007f986…`.** v3.1 est un delta de 50 lignes à confirmer par
+les deux relecteurs ; sans confirmation à 08:00Z, c'est v3 (`1007f986…`), relu OK, qui sera posé.
+
 ## 2. Séquence (remplace v2.1 §3, points 1-2)
 
 1. **Avant le 09/11 06:00Z** : re-gel de v2.2, puis avis.
-2. **Avant 08:00Z** : avis d'impl-03 sur l'installateur v3, qui s'ajoute à l'OK d'impl-11 ; la
-   requalification de l'auditeur est déjà CONFORME. **Sans cet avis : pas de C3 ; BG porte 10:00Z.**
+2. **Avant 08:00Z** : l'installateur v3 a déjà les deux avis OK (impl-11 #200781, impl-03 #200802) ;
+   la requalification de l'auditeur est CONFORME. Confirmation du delta v3.1 demandée ; sinon v3 est posé.
 3. **T-60** :
    - P6 (d) sur AG1 puis AG2, **obligatoire** ;
    - `preparer-canon-c3.sh` ;
@@ -55,12 +79,13 @@ tourné ; tous les témoins sont locaux (faux `ssh` et faux `systemctl` dans le 
 | `sonde-c3-v22.sh`, `pose-c3-v22.sh`, `retour-c3-v22.sh` | Corrigés (B2, B3) |
 | `lecteur-c3.py`, `evaluer-c3.py` | Corrigés (B1, horodatage `ts`) ; même nom, l'historique git garde v2.1 |
 | `temoin-apres.sh` | Témoins B1 en plus, 18 au total |
-| `temoin-lectures.sh` | Nouveaux témoins B2 et B3 |
+| `temoin-lectures.sh` | Nouveaux témoins B2, B3 et canon absent (impl-03 B2) |
+| `p6/update-l2-runtime-v31.py`, `p6/update-l2-runtime-v3-v31.diff` | Installateur v3.1 (N d'impl-03) et son diff |
 | `releve-v22-*.txt` | Sonde `go` réelle et essais à blanc. Les cases propres à `go` sont OK : release v1.44.1 attestée, détenteur AG2, tick de release inactif sans job. Restent KO, comme attendu, les préalables non posés |
 | `MANIFEST.json` | sha256 de toutes les pièces |
 
 ## 4. Points ouverts
 
-- **O1.** Avis d'impl-03 (deepseek) sur l'installateur v3 `1007f986…`, à rendre avant 08:00Z le 09/11.
+- **O1.** Confirmation du delta v3.1 de l'installateur (`f838ee6b…`) par impl-11 et impl-03. À défaut, v3 `1007f986…` (deux OK) est posé.
 - **O2.** Re-gel de v2.2 et avis sur B1-B3.
 - **O3.** Si l'attestation gagne un jour un champ `run`, le juge l'exige déjà ; aujourd'hui le rattachement est temporel.

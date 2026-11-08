@@ -1,0 +1,50 @@
+--- /tmp/claude-1001/-home-agent/526a0a74-f00e-4639-b4d1-d11066d51f99/scratchpad/p6/update-l2-runtime-v3.py	2026-11-08 12:29:48.989444063 +0000
++++ /tmp/claude-1001/-home-agent/526a0a74-f00e-4639-b4d1-d11066d51f99/scratchpad/p6/update-l2-runtime-v31.py	2026-11-08 12:57:30.500738111 +0000
+@@ -1,4 +1,5 @@
+-"""#5495 P6 — installateur v3 : aligne le runtime L2 (compte ameesh-staging, uid 980) d'AG1 ou d'AG2
++"""#5495 P6 — installateur v3.1 (N d'impl-03 #200802 : retour vérifie l'arbre 5c1, tmp O_EXCL,
++refus constant pour toute exception) ; v3 : aligne le runtime L2 (compte ameesh-staging, uid 980) d'AG1 ou d'AG2
+ sur le kit scellé de la version de flotte M, SANS première installation. Dérivé de
+ install-passive-runtime.py (phase 1 V2, 465180850fb1d24d) : mêmes gardes (autorité exacte et
+ fraîche, empreintes, extraction sûre, commandes sous 980 en environnement vide), mais :
+@@ -43,6 +44,7 @@
+ LOCK_SHA = '185d3bef81efd5c35b385b8705ca2b8885064ad3a3781e6b3c63bf12185cf039'
+ PACKAGE_SHA = '2dca0d97ba27576a6c6c624c711e8f3588c7f0cc87b2f20386dbf45636e8a633'
+ SOURCE_FILES = 3076
++PREVIOUS_PACKAGE_SHA = '0d38f1e79912c1ad14e0fe6c038e259dbae500fa3c79034d37334696d6cb308f'
+ PYTHON_SHA = 'e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f'
+ QUIESCENCE_SHA = 'f988ee7abd0b73335b58186ffc177b386dddbb8b13ef6d7d0dc35a91c44a3111'
+ QUIESCENCE = str(REPO / 'deploy/mise-a-jour/quiescence-staging.sh')
+@@ -112,7 +114,11 @@
+ 
+ def install_submit(source):
+     tmp = SUBMIT.with_name(SUBMIT.name + '.p6.tmp')
+-    tmp.write_bytes(Path(source).read_bytes())
++    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
++    with os.fdopen(fd, 'wb') as f:
++        f.write(Path(source).read_bytes())
++        f.flush()
++        os.fsync(f.fileno())
+     os.chown(tmp, 0, 0)
+     tmp.chmod(0o644)
+     os.replace(tmp, SUBMIT)
+@@ -233,6 +239,12 @@
+     call(['/usr/bin/python3.12', str(kit / 'bascule.py'), 'retour', '--venv', str(STABLE)],
+          'native-retour-' + str(time.monotonic_ns()), user=True)
+     assert os.readlink(HOME / '.local/share/ameesh/venv-courant') == 'venv-' + PREVIOUS
++    check = ('import json,ameesh; from ameesh.staging_executor import _tree_sha256; '
++             'print(json.dumps({"tree":_tree_sha256(ameesh.__path__[0])}))')
++    assert json.loads(call([str(STABLE / 'bin/python'), '-B', '-c', check], 'native-retour-tree',
++                           user=True))['tree'] == PREVIOUS_PACKAGE_SHA, 'previous runtime tree'
++    # Le venv M et le kit restent sur place (preuve, et réalignement sans reconstruction) ;
++    # le ménage éventuel est un geste séparé.
+     write_json_980(CONF, json.loads((ROOT / 'staging-executor.json.before').read_text()))
+     install_submit(ROOT / 'staging-submit.json.before')
+     assert CONF.read_bytes() == (ROOT / 'staging-executor.json.before').read_bytes()
+@@ -267,3 +279,6 @@
+         # Refus constant, sans trace ni sortie enfant (borne 4 de #195967).
+         sys.stderr.write('P6 alignment refused: %s\n' % (exc.args[0] if exc.args and isinstance(exc.args[0], str) else 'guard'))
+         raise SystemExit(1)
++    except Exception as exc:  # délai, OSError, JSON… : même refus constant, nom du type seulement
++        sys.stderr.write('P6 alignment refused: %s\n' % type(exc).__name__)
++        raise SystemExit(1)

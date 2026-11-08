@@ -56,7 +56,7 @@ config_canon_acces() {
   case_ "$h config exécuteur = staging-submit (2 empreintes égales)" "$(lire $h "a=\$(sha256sum < $C/staging-executor.json); b=\$(sha256sum < $SUBMIT); [ \"\$a\" = \"\$b\" ] && echo egales")" egales
   case_ "$h arguments = ceux de BG" "$(lire $h "python3 -I -c 'import json;print(json.load(open(\"$C/staging-executor.json\"))[\"arguments\"])'")" "$ARGS"
   # venv attendu : celui que nomme expected_sha256 (5c1 ou kit P6), jamais une valeur figée ici.
-  vexp=$(lire $h "python3 -I -c 'import json,re;d=json.load(open(\"$C/staging-executor.json\"))[\"expected_sha256\"];print(sorted({m.group(1) for k in d for m in [re.search(\"/(venv-[0-9a-f]+)/\",k)] if m})[0])'")
+  vexp=$(lire $h "python3 -I -c 'import json,re;d=json.load(open(\"$C/staging-executor.json\"))[\"expected_sha256\"];v=sorted({m.group(1) for k in d for m in [re.search(\"/(venv-[0-9a-f]+)/\",k)] if m}); print(v[0] if len(v)==1 else \"PLUSIEURS-VENV:%s\" % v)'")
   case_ "$h venv-courant = venv des empreintes attendues" "$(lire $h "readlink $H/.local/share/ameesh/venv-courant")" "$vexp"
   case_ "$h empreintes attendues (fichiers ET arbres) = réelles" "$(lire $h "runuser -u ameesh-staging -- $H/.local/share/ameesh/venv/bin/python -I -c '
 import json, os
@@ -92,6 +92,7 @@ etat() {  # $1 hôte, $2 avant|active
     case_ "$h minuterie L2 armée" "$(lire $h "systemctl --user -M ameesh-staging@ show ameesh-staging.timer -p NextElapseUSecMonotonic --value | grep -vcx '0\|infinity\|'")" 1
     case_ "$h drop-in --no-staging absent" "$(lire $h "if [ -e $RD/10-sans-staging.conf ]; then echo present; else echo absent; fi")" absent
     case_ "$h ExecStart sans --no-staging" "$(execstart $h)" sans
+    case_ "$h minuterie release active" "$(lire $h "systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value")" active
     case_ "$h config de soumission = staging-submit" "$(lire $h "a=\$(sha256sum < $SOUMISSION); b=\$(sha256sum < $SUBMIT); [ \"\$a\" = \"\$b\" ] && stat -c '%U:%a' $SOUMISSION")" "ameesh:600"
   fi
 }
@@ -161,6 +162,7 @@ for f in glob.glob(\"/home/ameesh/.local/state/ameesh/release/reports/*.json\"):
     case_ "$h migrations non additives > $max (inconnues du runtime L2)" "$(lire AG2 "runuser -u ameesh -- env HOME=/home/ameesh $PY -c 'import psycopg;c=psycopg.connect(host=\"10.77.0.1\",user=\"ameesh\",dbname=\"ameesh\");print(c.execute(\"select count(*) from schema_non_additive_migrations where version>%s\",(int(\"$max\"),)).fetchone()[0])'")" 0
     case_ "$h tick de release inactif" "$(lire $h "systemctl --user -M ameesh@ show ameesh-release.service -p ActiveState --value")" inactive
     case_ "$h aucun job de release en file" "$(jobs_release $h)" 0
+    case_ "$h minuterie release active" "$(lire $h "systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value")" active
   done ;;
 actif)
   for h in $HOTES; do n7 $h; etat $h active; done ;;

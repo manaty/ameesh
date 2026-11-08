@@ -192,8 +192,8 @@ if [ "$mode" = activer ]; then
   # 3. Minuterie release restaurée dans l'état gardé.
   for h in AG1 AG2; do
     A=/root/ameesh-operator-C3-$h-activation-$TS
-    geste $h "minuterie release restaurée (démarrée si elle était active)" \
-      "if [ \"\$(sed -n 2p $A/release-timer.etat)\" = active ]; then systemctl --user -M ameesh@ start ameesh-release.timer; fi; systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value"
+    geste $h "minuterie release restaurée (démarrée et ActiveState=active exigé si elle était active)" \
+      "e=\$(sed -n 2p $A/release-timer.etat) && [ -n \"\$e\" ] && if [ \"\$e\" = active ]; then systemctl --user -M ameesh@ start ameesh-release.timer && [ \"\$(systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value)\" = active ]; fi"
   done
   if [ $APPLY = 1 ]; then
     printf 'TS=%s\nDEPUIS=%s\nCANON=%s\n' "$TS" "$DEPUIS" "$CANON" > "$ICI/c3-activation-$TS.env"

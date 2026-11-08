@@ -61,8 +61,14 @@ if [ "$mode" = activation ]; then
       "if [ -f $A/10-sans-staging.conf ]; then install -m 644 -o ameesh -g ameesh $A/10-sans-staging.conf $RD/10-sans-staging.conf && mv $A/10-sans-staging.conf $A/10-sans-staging.conf.repose-$TS; fi && systemctl --user -M ameesh@ daemon-reload && x=\$(systemctl --user -M ameesh@ show ameesh-release.service -p ExecStart --value) && case \"\$x\" in *--no-staging*) true;; *) false;; esac"
     geste $h "soumission retirée (gardée dans $A)" \
       "if [ -e $SOUMISSION ]; then mv $SOUMISSION $A/staging-executor.json.retire-$TS; fi; test ! -e $SOUMISSION"
-    geste $h "minuterie release restaurée dans l'état gardé" \
-      "if [ \"\$(sed -n 2p $A/release-timer.etat)\" = active ]; then systemctl --user -M ameesh@ start ameesh-release.timer; fi"
+    # Sans fichier d'état lisible (avis impl-03 B1 #200802) : la minuterie release est redémarrée,
+    # c'est son état nominal sur les candidats, et le fait est signalé.
+    if [ $APPLY = 1 ] && ! R $h "test \$(wc -l < $A/release-timer.etat) = 2" 2>/dev/null; then
+      echo "ATTENTION $h : release-timer.etat absent ou incomplet, minuterie release redémarrée (état nominal)" >&2
+      R $h "printf 'enabled\nactive\n' > $A/release-timer.etat.defaut && cp $A/release-timer.etat.defaut $A/release-timer.etat" || stop "$h état par défaut non écrit"
+    fi
+    geste $h "minuterie release restaurée (démarrée et ActiveState=active exigé si elle était active)" \
+      "e=\$(sed -n 2p $A/release-timer.etat) && [ -n \"\$e\" ] && if [ \"\$e\" = active ]; then systemctl --user -M ameesh@ start ameesh-release.timer && [ \"\$(systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value)\" = active ]; fi"
   done
   echo "dernier enregistrement mesh-staging (lecture) :"
   R AG1 "runuser -u ameesh -- env HOME=/home/ameesh $PY -c 'from ameesh import config,db,staging_executor as s;import json;d=s.latest(db.connect(config.load(),writer=False),\"mesh-staging\") or {};print(json.dumps({k:d.get(k) for k in (\"state\",\"host\",\"sha\",\"run\",\"blocked_reason\")}))'" || echo "(lecture impossible)"
@@ -78,7 +84,14 @@ if [ "$mode" = prealables ]; then
   AVANT=$(R $h "cat $RECUS/canon-avant") || stop "$h canon-avant absent des reçus"
   REF=$(R $h "python3 -I -c 'import json;print(json.load(open(\"$RECUS/canon-receipt.json\"))[\"ref\"])'" 2>/dev/null || echo "")
   RET=$H/staging/canon-${AVANT:0:8}-retained-before-${REF:0:8}
-  COURANT=$(R $h "runuser -u ameesh-staging -- git -C $H/staging/canon rev-parse HEAD") || stop "$h canon courant illisible"
+  # v2.2 (avis impl-03 B2 #200802) : canon ABSENT (premier mv fait, second échoué) et canon conservé
+  # présent au bon HEAD → on remet le conservé, puis on vérifie ; jamais d'autre réparation.
+  if ! R $h "test -e $H/staging/canon"; then
+    if R $h "test -d $RET" && [ "$(R $h "runuser -u ameesh-staging -- git -C $RET rev-parse HEAD")" = "$AVANT" ]; then
+      geste $h "canon absent : canon conservé ${AVANT:0:8} remis" "runuser -u ameesh-staging -- mv -T $RET $H/staging/canon && [ \"\$(runuser -u ameesh-staging -- git -C $H/staging/canon rev-parse HEAD)\" = $AVANT ]"
+    else stop "$h canon absent et canon conservé absent ou d'un autre HEAD : à examiner, rien touché"; fi
+  fi
+  COURANT=$(R $h "runuser -u ameesh-staging -- git -C $H/staging/canon rev-parse HEAD") || { [ $APPLY = 0 ] && COURANT=$AVANT; } || stop "$h canon courant illisible"
   CANON_REMIS=0
   if [ -n "$REF" ] && R $h "test -d $RET" && [ "$(R $h "runuser -u ameesh-staging -- git -C $RET rev-parse HEAD")" = "$AVANT" ] && [ "$COURANT" = "$REF" ]; then
     geste $h "canon ${AVANT:0:8} remis (${REF:0:8} gardé en canon-${REF:0:8}-retired-$TS)" \
