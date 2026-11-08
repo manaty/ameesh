@@ -1,0 +1,127 @@
+--- ag3-rootless-6321.py	2026-11-08 13:42:36.650005930 +0000
++++ ag3-rootless-6321-v2.py	2026-11-08 13:54:51.390601833 +0000
+@@ -1,4 +1,9 @@
+-"""#6321 — Docker rootless pour ameesh (uid 1001) sur ameesh-agents-3, retrait du groupe docker.
++"""#6321 v2 (réponses mesh-design #200904) — O1 seules les 4 images de base ; O2 preuve containerd (dpkg
++--verify, version et origine, sha256 du .deb comparé à l'index Packages s'il est en cache) ; O5 fenêtre
++09/11 13:00-15:30Z exigée pour --apply ; O7 preuve ss -ltn et garde d'invités en phase C ; O4 critère 1
++de la phase B (aucun processus uid 1001 avec 112, pause Podman compris).
++
++#6321 — Docker rootless pour ameesh (uid 1001) sur ameesh-agents-3, retrait du groupe docker.
+ 
+ Contrôleur root unique, exécuté SUR AG3, dérivé des contrôleurs relus et exécutés de #5781 sur AG1
+ (phase-A-engine-and-PG.py d5b50510…, phase-B-client-and-groups.py, phase-C-local-verification.py,
+@@ -54,6 +59,11 @@
+ ADDRESS_POOL = {'default-address-pools': [{'base': '172.30.0.0/16', 'size': 24}]}
+ # Coupures 10:00Z et 22:00Z : aucune phase de 20 min avant à 90 min après (staging et vm.sh sur AG3).
+ FORBIDDEN = [(9 * 60 + 40, 11 * 60 + 30), (21 * 60 + 40, 23 * 60 + 30)]
++# O5 (#200904) : fenêtre fixée par mesh-design, après C3 ; --apply refusé hors de celle-ci.
++WINDOW = (datetime.datetime(2026, 11, 9, 13, 0, tzinfo=datetime.timezone.utc),
++          datetime.datetime(2026, 11, 9, 15, 30, tzinfo=datetime.timezone.utc))
++PG_PORTS = {'55432', '55441', '55442', '55443'}
++GUEST_FIREWALL = Path('/etc/ameesh-guest/firewall.nft')
+ UNIT_RE = re.compile(r'ameesh-[A-Za-z0-9_.@:-]+\.(?:service|timer)')
+ os.umask(0o077)
+ 
+@@ -210,6 +220,7 @@
+ 
+ def outside_cutoffs():
+     now = datetime.datetime.now(datetime.timezone.utc)
++    assert WINDOW[0] <= now < WINDOW[1], 'Hors de la fenêtre 09/11 13:00-15:30Z (O5 #200904)'
+     m = now.hour * 60 + now.minute
+     assert not any(a <= m < b for a, b in FORBIDDEN), 'Fenêtre de coupure (10:00Z/22:00Z, -20 min/+90 min)'
+ 
+@@ -253,13 +264,64 @@
+         assert any(x.startswith('ameesh:') and int(x.split(':')[2]) >= 65536 for x in Path('/etc', name).read_text().splitlines())
+     assert Path('/etc/apparmor.d/rootlesskit').is_file(), 'profil AppArmor rootlesskit (userns restreint sur 24.04)'
+     command(['dpkg', '--verify', 'docker.io', 'containerd', 'runc', 'rootlesskit', 'uidmap', 'slirp4netns', 'fuse-overlayfs'])
+-    facts['containerd_policy'] = command(['apt-cache', 'policy', 'containerd']).stdout.decode().splitlines()[:6]
++    facts['containerd'] = containerd_proof()
+     assert command(['loginctl', 'show-user', 'ameesh', '-p', 'Linger', '--value']).stdout.decode().strip() == 'yes'
+     for image, ident in IMAGES.items():
+         assert json.loads(docker(RF, 'image', 'inspect', image).stdout)[0]['Id'] == ident, image
+     return facts
+ 
+ 
++def packages_sha256(texts, package, version):
++    """SHA256 d'un paquet/version dans des index apt Packages (texte), ou None."""
++    for text in texts:
++        for stanza in text.split('\n\n'):
++            fields = {}
++            for line in stanza.splitlines():
++                if line[:1] not in (' ', '') and ':' in line:
++                    k, v = line.split(':', 1)
++                    fields[k] = v.strip()
++            if fields.get('Package') == package and fields.get('Version') == version and 'SHA256' in fields:
++                return fields['SHA256']
++    return None
++
++
++def containerd_proof():
++    """O2 (#200904) : dpkg --verify (fait par l'appelant), version et origine apt, et, si le .deb est
++    encore en cache, son sha256 égal à celui de l'index Packages de noble-updates."""
++    version = command(['dpkg-query', '-W', '-f', '${Version}', 'containerd']).stdout.decode()
++    policy = command(['apt-cache', 'policy', 'containerd']).stdout.decode()
++    assert re.search(r'\*\*\* ' + re.escape(version) + r' 500\n\s+500 \S+ noble-updates/main', policy), 'origine containerd ≠ noble-updates'
++    proof = {'version': version, 'origin': 'noble-updates/main', 'dpkg_verify': 'OK'}
++    deb = Path('/var/cache/apt/archives/containerd_' + version.replace(':', '%3a') + '_amd64.deb')
++    if deb.is_file():
++        lists = sorted(Path('/var/lib/apt/lists').glob('*_dists_noble-updates_main_binary-amd64_Packages'))
++        expected = packages_sha256([x.read_text(errors='replace') for x in lists], 'containerd', version)
++        actual = hashlib.sha256(deb.read_bytes()).hexdigest()
++        assert expected is not None, 'index Packages non comprimé introuvable pour containerd ' + version
++        assert actual == expected, 'sha256 du .deb containerd ≠ index Packages'
++        proof['deb_sha256'] = actual
++    else:
++        proof['deb_sha256'] = 'non comparé : .deb absent du cache apt'
++    return proof
++
++
++def ports_and_guest_gate():
++    """O7 (#200904) : les ports PG n'écoutent que sur 127.0.0.1 ; la garde d'invités les refuse (lecture)."""
++    rows = command(['ss', '-ltnH']).stdout.decode().splitlines()
++    seen = {}
++    for row in rows:
++        local = row.split()[3]
++        host, _, port = local.rpartition(':')
++        if port in PG_PORTS:
++            seen.setdefault(port, set()).add(host)
++    assert set(seen) == PG_PORTS, 'ports PG manquants : %s' % sorted(PG_PORTS - set(seen))
++    assert all(h == {'127.0.0.1'} for h in seen.values()), 'port PG lié hors de 127.0.0.1 : %s' % seen
++    text = GUEST_FIREWALL.read_text()
++    denied = set(re.findall(r'\b(\d{4,5})\b', ' '.join(re.findall(r'tcp dport \{([^}]*)\} reject', text))))
++    assert PG_PORTS <= denied, 'garde d invités : ports PG non refusés'
++    return {'listen': {k: sorted(v) for k, v in seen.items()}, 'guest_gate_denies': sorted(PG_PORTS)}
++
++
+ def inspecter():
+     common_checks()
+     facts = prerequisites()
+@@ -467,7 +529,8 @@
+         if user(['systemctl', '--user', 'show', unit, '-p', 'ActiveState', '--value']) != 'active':
+             user(['systemctl', '--user', 'start', unit], timeout=120)
+     after = processes()
+-    assert not any(112 in x['groups'] for x in after), 'Processus UID1001 avec le groupe 112'
++    # Critère 1 (O4 #200904) : aucun processus uid 1001 avec 112, pause Podman du 08/11 13:42Z compris.
++    assert not any(112 in x['groups'] for x in after), 'Processus UID1001 avec le groupe 112 (pause Podman compris)'
+     forbidden = {'sudo', 'wheel', 'admin', 'adm', 'docker', 'lxd', 'libvirt', 'systemd-journal'}
+     groups = [grp.getgrgid(g).gr_name for g in os.getgrouplist('ameesh', 1001)]
+     assert not forbidden.intersection(groups)
+@@ -488,7 +551,7 @@
+         print(json.dumps({'phase': 'C', 'à_blanc': True, 'vérifications': [
+             'sudo -l refusé', 'montage protégé illisible depuis un conteneur rootless',
+             'test-parallele.sh -n 1 -p psql --liste « test_work » dans une unité utilisateur (environment.d effectif)',
+-            'ameesh doctor', 'ameesh menage --dry-run --json', 'porte d hôte ouverte et 8 runners revenus (lecture)']}, indent=1))
++            'ameesh doctor', 'ameesh menage --dry-run --json', 'ss -ltn : 55432, 55441-55443 sur 127.0.0.1 seulement', 'garde d invités : ports PG refusés (firewall.nft, lecture)', 'porte d hôte ouverte et 8 runners revenus (lecture)']}, indent=1))
+         return
+     assert re.fullmatch(r'[0-9a-f]{40}', sha)
+     authority('phase-C', ['native_AG3_drain_active', 'no_unapproved_personal_session', 'release_tag_and_test_source_sha_verified'])
+@@ -540,6 +603,8 @@
+     write_private(ROOT / 'phase-C-menage.private.json', menage.stdout)
+     assert menage.returncode == 0
+     json.loads(menage.stdout)
++    ports = ports_and_guest_gate()
++    save('ports et garde d invités vérifiés', ports_guest_gate=ports)
+     save('vérifications locales passées ; levée du drainage, tour réel et attestation à suivre',
+          real_SQL_psql_passed=True, doctor_passed=True, housekeeping_dryrun_passed=True, test_workdir=workdir)
+     print(json.dumps(record))
