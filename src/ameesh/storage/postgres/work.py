@@ -1990,6 +1990,15 @@ class WorkItems(interface.WorkItems):
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
 
+    def record_designation_mark(self, item_id, state, text, actor, evidence) -> None:
+        """#6365 : la marque et sa preuve structurée ; écrivain système hors
+        du contrat L107, appelé par le port de désignation seul."""
+        if not isinstance(evidence, dict) or not evidence:
+            raise DbError("designation mark without its structured evidence")
+        self._event(int(item_id), state, text, actor, evidence=evidence)
+        self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
+                        (int(item_id),))
+
     def note_with_wake(self, item_id, state, text, actor, wake_ts, *, once=False) -> None:
         """#2466 : la note et l'échéance de réveil, sous le même verrou."""
         if not has_wake_at(self.db):
@@ -4864,14 +4873,17 @@ class WorkItems(interface.WorkItems):
             "   AND coalesce(tr.started_at, tc.started_at) IS NOT NULL"
             " ORDER BY start_ts, tc.id", (int(item_id),))
 
-    def _event(self, item_id, state, note, actor) -> None:
+    def _event(self, item_id, state, note, actor, *, evidence=None) -> None:
         # Historical journals and signed receipts retain their stage vocabulary.
         # A note on a delivered core must not erase the merge/promotion phase
         # from the previous-event checks used for merge annulment and SLOs.
+        # #6365 : `evidence` n'est passé que par un écrivain système (la marque
+        # de désignation) ; aucune écriture à texte libre ne le remplit.
         self.db.execute(
-            "INSERT INTO work_item_events (work_item_id, state, note, actor) "
+            "INSERT INTO work_item_events (work_item_id, state, note, actor, evidence) "
             "SELECT id, CASE WHEN %s = 'delivered' THEN "
-            "coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE %s END, %s, %s "
-            "FROM work_items WHERE id = %s",
-            (state, state, note or "", actor or "", item_id),
+            "coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE %s END, %s, %s, "
+            "%s::jsonb FROM work_items WHERE id = %s",
+            (state, state, note or "", actor or "",
+             None if evidence is None else json.dumps(evidence), item_id),
         )

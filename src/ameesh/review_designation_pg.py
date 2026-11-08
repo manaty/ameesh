@@ -62,6 +62,19 @@ def mark_prefix(lot: int, freeze_id: int) -> str:
     return "%s%d:%d:" % (MARK_PREFIX, int(lot), int(freeze_id))
 
 
+#: #6365 : la preuve structurée de la base d'une marque, écrite par le port
+#: dans `work_item_events.evidence` ; aucune écriture à texte libre ne la pose
+#: (`work note --actor ameesh` copie le texte, jamais la preuve).
+BASE_EVIDENCE_SCHEMA = "ameesh-review-designation-base/1"
+
+
+def base_evidence(lot: int, freeze_id: int, sha: str, base: str) -> dict:
+    """La preuve de la base du delta désigné pour ce gel (#6365)."""
+    return {"schema": BASE_EVIDENCE_SCHEMA, "lot": int(lot),
+            "freeze": int(freeze_id), "sha": str(sha or "").strip().lower(),
+            "base": str(base or "").strip().lower(), "actor": SENDER}
+
+
 def designation_of(note: str) -> Optional[dict]:
     """The designation carried by a journal row, or None if it is not a mark.
     An unreadable mark is refused, never interpreted: we do not send a second
@@ -110,7 +123,7 @@ def _mark_author(author) -> dict:
 
 def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers,
                missing: int, why: str, authors, policy_ref: str, sha: str,
-               sent=(), unknown=()) -> str:
+               sent=(), unknown=(), base: str = "") -> str:
     payload = {
         "state": state,
         "required": int(required),
@@ -134,6 +147,9 @@ def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers
                   "capacity": bool((s or {}).get("capacity"))}
                  for s in sent or ()],
     }
+    if base:
+        # #6365 : le début du delta désigné ; la porte relit la même plage.
+        payload["base"] = base
     return "%s %s" % (mark_prefix(lot, freeze_id),
                       json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
@@ -614,12 +630,17 @@ class PgPort:
             # couverture manuelle reste l'issue du gel.
             return {"state": "manual", "required": int(required), "reviewers": [],
                     "missing": 0, "why": why, "freeze": freeze}
-        ops.note(lot, str(rows[0].get("state") or ""),
-                 _mark_note(lot, freeze_id, state=state, required=required,
-                            reviewers=reviewers, missing=missing, why=why,
-                            authors=authors, policy_ref=policy_ref, sha=sha,
-                            sent=deposited, unknown=unknown_authors),
-                 self.sender)
+        base = plan_git.full_commit_id(freeze.get("base"))
+        text = _mark_note(lot, freeze_id, state=state, required=required,
+                          reviewers=reviewers, missing=missing, why=why,
+                          authors=authors, policy_ref=policy_ref, sha=sha,
+                          sent=deposited, unknown=unknown_authors, base=base)
+        if base:
+            # #6365 : la preuve passe par l'écrivain système, hors contrat L107.
+            ops.record_designation_mark(lot, str(rows[0].get("state") or ""), text,
+                                        self.sender, base_evidence(lot, freeze_id, sha, base))
+        else:
+            ops.note(lot, str(rows[0].get("state") or ""), text, self.sender)
         return _designation(lot, freeze_id, state=state, required=required,
                             reviewers=reviewers, missing=missing, why=why,
                             authors=authors, policy_ref=policy_ref, sha=sha,

@@ -1641,12 +1641,25 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                                      correction=correction,
                                      sql_migration=migration),
         })
+    # #6365 : la marque garde le début exact du delta lu (`merge-base` de la
+    # cible rafraîchie et de la tête) ; la porte relit la même plage sans
+    # dépendre de la fraîcheur de son clone. Seul un commit complet l'est.
+    delta_base = str(base or "").strip().lower()
+    written = (dict(freeze, base=delta_base)
+               if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", delta_base) else freeze)
     try:
-        return port.commit(lot, freeze=freeze, required=required, state=state,
-                           reviewers=selection["reviewers"], missing=selection["missing"],
-                           why=selection["why"], authors=authors, policy_ref=policy_ref,
-                           notify=notify, messages=tuple(messages),
-                           unknown_authors=tuple(unknown))
+        out = port.commit(lot, freeze=written, required=required, state=state,
+                          reviewers=selection["reviewers"], missing=selection["missing"],
+                          why=selection["why"], authors=authors, policy_ref=policy_ref,
+                          notify=notify, messages=tuple(messages),
+                          unknown_authors=tuple(unknown))
+        if written is not freeze and isinstance(out, dict) \
+                and isinstance(out.get("freeze"), Mapping):
+            # La base n'appartient qu'à la marque : la forme rendue garde
+            # `{id, sha}` (contrat de `apply`).
+            out = dict(out, freeze={key: value for key, value in out["freeze"].items()
+                                    if key != "base"})
+        return out
     except StaleFreeze as exc:
         # Nothing was written. The provided inputs held for the old freeze:
         # recollect them for the new one before replaying (B1, codex review cx2).

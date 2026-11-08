@@ -5138,7 +5138,8 @@
     "wip_exceptions",
     "without_project",
     "schedule_wake",
-    "note_with_wake"
+    "note_with_wake",
+    "record_designation_mark"
    ],
    "watches": [
     "delete",

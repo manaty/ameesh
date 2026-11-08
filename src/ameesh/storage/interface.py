@@ -2681,6 +2681,17 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def record_designation_mark(self, item_id: int, state: str, text: str, actor: str,
+                                evidence: dict) -> None:
+        """#6365 : journalise la marque de désignation avec sa preuve
+        structurée (`work_item_events.evidence`) et rafraîchit `updated_at`.
+
+        Écrivain système du port de désignation seul : hors du contrat de
+        l'exécuteur médié (L107), aucune voie à texte libre (`note`,
+        `work note --actor`) ne pose cette preuve.
+        """
+
+    @abc.abstractmethod
     def update_generated(self, item_id: int, *, title: str, body: str,
                          priority: int | None, note: str, actor: str) -> dict | None:
         """#4291 : rafraîchit le titre et le corps **générés** d'un lot ouvert
