@@ -89,7 +89,8 @@ chaque recomposition, et aucune tête neuve n'entre sans ci de paquet.
 #4113 : hors banc sans base, la même garde d’époque que `packet record`
 est relue avant la composition, entre unités, avant chaque série de tests et
 avant publication. Une perte de bail arrête avant l’opération suivante ;
-une opération déjà lancée peut finir. Aucun résultat de test n’est réutilisé.
+une opération déjà lancée peut finir. Les contrats seuls peuvent réutiliser une attestation du même arbre et de
+la même portée (#6185).
 
 #4271 : `--tests-parallel N` joue les séries des unités et celle des contrats
 en même temps (au plus N), chacune dans un créneau `ameesh heavy` de l'hôte et
@@ -2101,6 +2102,7 @@ class ContractPass:
     head: str
     tree: str
     run: TestRun
+    evidence: dict | None = None
 
 
 def contract_scope(worktree: Path) -> tuple[str, str]:
@@ -2117,9 +2119,132 @@ def verify_contract_scope(worktree: Path, report: ContractPass) -> None:
         raise PaquetAutoError("arbre des contrats hors portée : tête ou arbre changé ; recomposer")
 
 
+def contract_attestation_context(worktree: Path, *, base: str, modules: list,
+                                 timeout: float) -> tuple[dict, Path, list]:
+    """Exact local execution inputs; unavailable context disables caching.
+
+    The Git tree covers runner code, migrations and repository fixtures. The
+    external interpreter/dependencies, heavy launcher, inherited environment
+    and pinned canon are also fingerprinted. No environment value is stored.
+    """
+    from ameesh import canon, config, mechanics, test_attestation as evidence
+    from ameesh.deadline import Deadline
+    import hashlib
+    deadline = Deadline(timeout, clock=time.monotonic)
+    def remaining():
+        if deadline.expired():
+            raise ValueError("attestation context budget exhausted")
+        return deadline.remaining()
+    cfg = config.load()
+    configured = canon.load_configured(cfg, deadline=deadline)
+    if not configured or not configured[0].sources:
+        raise ValueError("no readable canon")
+    sources = configured[0].sources
+    if sources[0].prefix:
+        raise ValueError("canon mechanics outside root")
+    # Validate the exact pinned policy within the same total budget.
+    mechanics.load_global(sources[0].repo, sources[0].commit, deadline=deadline)
+    canon_ids = [{"commit": source.commit, "repo": source.repo,
+                  "prefix": source.prefix, "mode": source.mode} for source in sources]
+    if any(source.mode != "git" or not source.commit for source in sources):
+        raise ValueError("unpinned canon")
+    heavy = shutil.which("ameesh")
+    if not heavy:
+        raise ValueError("heavy unavailable")
+    probe = run_command([project_python(worktree), "-c",
+        "import importlib.metadata as m,json,platform,sys; "
+        "print(json.dumps([sys.version,sys.executable,platform.platform(),"
+        "sorted((d.metadata['Name'],d.version) for d in m.distributions())]))"],
+        cwd=worktree, timeout=remaining(), env=python_env(worktree))
+    if probe.returncode:
+        raise ValueError("runner unavailable")
+    runtime = json.loads(_decode(probe.stdout))
+    binary = hashlib.sha256(Path(runtime[1]).read_bytes()).hexdigest()
+    launcher = hashlib.sha256(Path(heavy).read_bytes()).hexdigest()
+    common = _decode(git(worktree, "rev-parse", "--git-common-dir", timeout=remaining()).stdout).strip()
+    common = str((worktree / common).resolve())
+    branch_key = evidence.digest({"repository": common, "base": base})
+    path = Path(_state_dir()) / "contract-attestations" / (branch_key + ".json")
+    # Source SHA is provenance. Including it in the plan would prevent safe
+    # reuse when only commit metadata changes and the exact tree is identical.
+    plan = {"selection": "packet-contracts", "modules": modules, "base": base}
+    tree = _decode(git(worktree, "rev-parse", "HEAD^{tree}", timeout=remaining()).stdout).strip()
+    scope = {"plan": plan, "selection_digest": evidence.digest(plan),
+             "tests": modules, "canon_digest": evidence.digest(canon_ids),
+             "registry_digest": evidence.digest({"tree": tree}),
+             "runner_digest": evidence.digest({"runtime": runtime, "binary": binary,
+                                                "launcher": launcher}),
+             "profile": "local-heavy", "drivers": {"driver": test_driver(worktree),
+                 "environment_digest": evidence.digest(dict(os.environ)),
+                 "config_digest": hashlib.sha256(json.dumps(
+                     vars(cfg), sort_keys=True, default=str).encode("utf-8")).hexdigest()},
+             "database_schema": tree, "fixtures": {"tree": tree}, "exclusions": {}}
+    lots = []
+    changed = git(worktree, "diff", "--name-only", base, "HEAD", "--", "reviews/",
+                  timeout=remaining())
+    for rel in sorted(_decode(changed.stdout).splitlines()):
+        manifest = worktree / rel
+        if manifest.name.startswith("integration-paquet-") and manifest.suffix == ".md" and manifest.is_file():
+            for ids, sha in parse_composition_table(manifest.read_text(encoding="utf-8")):
+                for lot in ids:
+                    resolved = _decode(git(worktree, "rev-parse", sha + "^{commit}",
+                                           timeout=remaining()).stdout).strip()
+                    lots.append({"id": str(lot), "sha": resolved})
+    remaining()
+    return scope, path, lots
+
+
+def read_contract_attestation(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def previous_contract_attestation(path: Path, carrier: int, *, worktree: Path,
+                                  timeout: float):
+    """Local artifact first, bounded N-1 storage read on a replacement host."""
+    previous = read_contract_attestation(path)
+    if previous is not None or carrier <= 0:
+        return previous
+    # The subprocess bounds both connection and query, including mediated
+    # backends, within the pass's remaining budget. No DB lock spans a test.
+    script = """import json, sys
+from ameesh import config, db, storage
+connection = db.connect(config.load())
+try:
+    row = storage.of(connection).prevalidation.latest(int(sys.argv[1]))
+    value = row.get('report') if row else None
+    print(json.dumps(json.loads(value) if isinstance(value, str) else value))
+finally:
+    connection.close()
+"""
+    try:
+        if timeout <= 0:
+            return None
+        proc = run_command([project_python(worktree), "-c", script, str(carrier)],
+                           cwd=worktree, env=python_env(worktree), timeout=timeout)
+        return json.loads(_decode(proc.stdout)) if proc.returncode == 0 else None
+    except (OSError, ValueError, PaquetAutoError):
+        return None
+
+
+def save_contract_attestation(path: Path, report: dict):
+    """Private atomic artifact outside the tested tree, also on recomposition."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix=".attestation-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(report, stream, sort_keys=True, allow_nan=False)
+        os.replace(name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name)
+
+
 def prepublication_contracts(worktree: Path, *, base: str,
                              budget: int | None, guard=None, expected_head: str = "",
-                             parallel: int = DEFAULT_PARALLEL) -> ContractPass:
+                             parallel: int = DEFAULT_PARALLEL, carrier: int = 0) -> ContractPass:
     """Plan + slot wait + isolated execution share one canon budget (#6182).
 
     A timeout/absent prerequisite records an inconclusive pass, never a green
@@ -2133,6 +2258,8 @@ def prepublication_contracts(worktree: Path, *, base: str,
     start = time.monotonic()
     end = start + budget if budget else start
     modules = []
+    context = None
+    cached = None
     try:
         if not budget:
             raise PaquetAutoError("budget de contrats absent du canon")
@@ -2140,8 +2267,33 @@ def prepublication_contracts(worktree: Path, *, base: str,
             raise PaquetAutoError("créneau heavy indisponible")
         modules = contract_modules(worktree, base=base,
                                    timeout=max(0.1, end - time.monotonic()))
+        from datetime import datetime, timezone
+        from ameesh import prevalidation
+        try:
+            from ameesh.canon import GitDeadline
+            try:
+                context = contract_attestation_context(
+                    worktree, base=base, modules=modules, timeout=end - time.monotonic())
+            except GitDeadline as exc:
+                raise ValueError("attestation context budget exhausted") from exc
+            scope, path, lots = context
+            cached, causes = prevalidation.reuse_report(
+                previous_contract_attestation(path, carrier, worktree=worktree,
+                                              timeout=end - time.monotonic()),
+                head=head, tree=tree, scope=scope,
+                now=datetime.now(timezone.utc))
+            print("attestation contrats : " + ("réutilisée" if cached else ", ".join(causes)),
+                  flush=True)
+        except (OSError, ValueError, PaquetAutoError) as exc:
+            context = None
+            print("attestation contrats indisponible : " + str(exc), flush=True)
         remaining = int(end - time.monotonic())
-        if remaining <= 0:
+        if cached is not None:
+            run = TestRun("contrats", modules, 0,
+                          "Attestation réutilisée, exécution originale : "
+                          + cached["attestation"]["payload"]["source_sha"]
+                          + "\nRan %d tests in 0.0s\nOK\n" % cached.get("tests", 0), 0.0)
+        elif remaining <= 0:
             run = budget_spent("contrats", modules)
         else:
             run = run_contract_modules(worktree, modules, end=end, parallel=parallel)
@@ -2156,6 +2308,44 @@ def prepublication_contracts(worktree: Path, *, base: str,
     verify_contract_scope(worktree, report)
     if isinstance(run, ContractTestRun):
         save_test_log(run)
+    if context is not None and modules:
+        from ameesh import prevalidation, packet_contract_proof
+        scope, path, lots = context
+        if cached is None:
+            state = packet_contract_proof.projection(report, base=base, target="")["result"]["state"]
+            children = getattr(run, "children", ()) or (run,)
+            results = {module: "inconclusive" for module in modules}
+            for child in children:
+                child_state = "inconclusive"
+                if child.real_failure and not child.inconclusive:
+                    child_state = "failed"
+                elif (child.green and child.finished and not child.inconclusive
+                      and not child.skipped and child.tests > 0 and not child.flaky_tests):
+                    child_state = "passed"
+                for module in child.modules:
+                    if module in results:
+                        results[module] = child_state
+            if state == "green" and any(value != "passed" for value in results.values()):
+                state = "inconclusive"
+            cached = prevalidation.attest_report({
+                "schema": prevalidation.REPORT_SCHEMA, "lot": carrier, "sha": head,
+                "base": base, "card": "", "modules": [
+                    module for module, result in results.items() if result != "inconclusive"],
+                "missing": [module for module, result in results.items() if result == "inconclusive"],
+                "selection": "contract", "profile": "local-heavy", "host": socket.gethostname(),
+                "planned": modules, "ok": state == "green",
+                "outcome": {"green": "green", "red": "run-red",
+                            "inconclusive": "run-incomplete"}[state],
+                "causes": [] if state == "green" else [state],
+                "seconds": run.seconds, "tests": run.tests, "tree": tree,
+            }, tree=tree, scope=scope, lots=lots, results=results,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                links=[run.log_path] if run.log_path else [])
+        report.evidence = cached
+        try:
+            save_contract_attestation(path, cached)
+        except OSError as exc:
+            print("attestation non persistée : " + str(exc), flush=True)
     return report
 
 
@@ -2173,6 +2363,18 @@ def publication_policy(args):
 def record_contract_result(worktree, carrier, report, *, base, target):
     from ameesh.packet_contract_proof import encode
     verify_contract_scope(worktree, report)
+    if report.evidence is not None:
+        from ameesh import config, db, prevalidation
+        connection = None
+        try:
+            connection = db.connect(config.load())
+            stored = dict(report.evidence, lot=int(carrier))
+            prevalidation.record(connection, stored)
+        except Exception as exc:  # storage failure never changes an executed result
+            print("attestation : rapport non persisté — " + str(exc), flush=True)
+        finally:
+            if connection is not None:
+                connection.close()
     note = encode(report, base=base, target=target)
     print(note, flush=True)  # scheduler can recover a failed journal write
     print(note_carrier(worktree, carrier, note), flush=True)
@@ -4321,7 +4523,8 @@ def publish_tested(args: argparse.Namespace) -> int:
         if publication_policy(args) != "legacy":
             report = prepublication_contracts(
                 worktree, base=base_sha, budget=contract_budget(args), guard=guard,
-                expected_head=head, parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+                expected_head=head, parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
+                carrier=args.carrier)
             record_contract_result(worktree, args.carrier, report, base=base_sha, target=args.target)
             from ameesh.packet_contract_proof import projection
             contract_state = projection(report, base=base_sha, target=args.target)["result"]["state"]
@@ -4620,7 +4823,7 @@ def compose_packet(args: argparse.Namespace) -> int:
             if publication_policy(args) != "legacy":
                 contract_report = prepublication_contracts(
                     worktree, base=base_sha, budget=contract_budget(args), guard=guard, expected_head=head,
-                    parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+                    parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL), carrier=args.carrier)
                 contract_run = contract_report.run
                 print("contrats avant publication : %s (%.1f s)%s" % (
                     "NON CONCLUANT" if contract_run.inconclusive else

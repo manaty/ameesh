@@ -29,6 +29,10 @@ def setUpModule():
     patch = mock.patch.object(auto, '_state_dir', return_value=_STATE.name)
     patch.start()
     unittest.addModuleCleanup(patch.stop)
+    context = mock.patch.object(auto, 'contract_attestation_context',
+                                side_effect=ValueError('isolated test: no canon'))
+    context.start()
+    unittest.addModuleCleanup(context.stop)
 
 
 class PublicationTest(unittest.TestCase):
