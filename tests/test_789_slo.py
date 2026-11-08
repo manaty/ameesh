@@ -937,5 +937,158 @@ class ExecuteurExterneTest(unittest.TestCase):
         self.assertEqual(slo.assigned_ts(item, events), T0 + 600)
 
 
+class FauxPositifsTest(unittest.TestCase):
+    """#6255 : quatre alertes SLO à tort et la clé de dédoublonnage.
+
+    Le 07/11, 88 courriers SLO sur 31 lots ont coûté 9,14 $ : un lot à
+    prérequis bloquant (#6140), un lot réservé à un exécutant externe (#6241),
+    un dossier d'acte de prod sur branche `review/**` (#6209) et un porteur de
+    paquet `integration/**` (#6156) ont escaladé sans qu'aucun geste ne soit dû.
+    La clé de dédoublonnage, qui dépendait de l'état, renvoyait le même
+    dépassement au passage qa → validated."""
+
+    def _row(self, rows, key):
+        got = [r for r in rows if r["step"] == key]
+        self.assertEqual(len(got), 1, "%s absent de %s" % (key, rows))
+        return got[0]
+
+    def test_a1_signal_assigned_ne_court_pas_sous_un_prerequis_bloquant(self):
+        # #6140 : le lot a attendu #6132/#6139 pendant 9 h ; l'alerte
+        # « signalé → assigné » a escaladé au niveau 3 alors que personne ne
+        # pouvait le prendre. Une arête bloquante ouverte ne fait courir
+        # aucune horloge ; levée, elle date le départ.
+        item = _item()
+        events = [_ev("intake", T0, "created")]
+        edges = [{"blocker_id": 7, "blocking": True, "satisfied_ts": None}]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 13 * 3600, dependencies=edges)
+        self.assertEqual([r for r in rows if r["step"] == "signal_assigned"], [])
+        self.assertEqual(slo.breaches(rows), [])
+
+        # Bloqueur fusionné à T0+8 h : l'horloge part de la levée, pas de la
+        # demande ; l'attente du prérequis n'est pas imputée au porteur.
+        edges = [{"blocker_id": 7, "blocking": False,
+                  "satisfied_ts": T0 + 8 * 3600}]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 8 * 3600 + 1800, dependencies=edges)
+        row = self._row(rows, "signal_assigned")
+        self.assertEqual(row["started_ts"], T0 + 8 * 3600)
+        self.assertEqual(row["elapsed_s"], 1800)
+        self.assertEqual(row["level"], 0)
+
+        # Déjà attribué : la durée mesurée ne compte que le temps après la
+        # levée (1 h), jamais les 9 h d'attente du prérequis.
+        events = [_ev("intake", T0, "created"),
+                  _ev("intake", T0 + 9 * 3600,
+                      "assigned to executant (before: nobody)")]
+        item = _item(assignee="executant", updated_ts=T0 + 9 * 3600)
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 10 * 3600, dependencies=edges)
+        row = self._row(rows, "signal_assigned")
+        self.assertEqual(row["started_ts"], T0 + 8 * 3600)
+        self.assertEqual(row["elapsed_s"], 3600)
+
+    def test_a2_executeur_externe_mesure_sans_escalade(self):
+        # #6241 : lot P1 réservé au bureau, resté en intake le temps que le
+        # bureau agisse (déclaration, note, déploiement) — niveaux 1→3 en
+        # 30 min. L'étape reste mesurée (taux de respect), sans escalade :
+        # aucun rôle du §9 ne peut faire avancer le geste de l'exécutant.
+        events = [_ev("intake", T0,
+                      "created; estimate: 2 h; reserved to external executor bureau")]
+        item = _item(state="intake", external_executor="bureau", priority=1)
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 2 * 900)
+        row = self._row(rows, "intake_started")
+        self.assertEqual(row["elapsed_s"], 1800)
+        self.assertEqual(row["target_s"], 900)
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(row["targets"], ())
+        self.assertIs(row.get("escalation"), False)
+        self.assertEqual(slo.breaches(rows), [])
+
+        # Déclaration retirée (#6105) : le système n'existe plus, le pilote
+        # doit lever la réservation — l'escalade reprend et le brief le dit.
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 2 * 900, external_retired=True)
+        self.assertEqual(self._row(rows, "intake_started")["level"], 2)
+
+        # Témoin : le même lot sans réservation escalade normalement.
+        item = _item(state="intake", assignee="executant", priority=1)
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 2 * 900)
+        self.assertEqual(self._row(rows, "intake_started")["level"], 2)
+
+        # Réservation levée puis prise par un agent : l'escalade reprend.
+        events = [_ev("intake", T0,
+                      "created; estimate: 2 h; reserved to external executor bureau"),
+                  _ev("intake", T0 + 600, "external executor cleared (was bureau)"),
+                  _ev("intake", T0 + 1200, "assigned to executant (before: nobody)")]
+        item = _item(state="intake", assignee="executant", priority=1)
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 1200 + 2 * 900)
+        row = self._row(rows, "intake_started")
+        self.assertGreaterEqual(row["level"], 1)
+        self.assertNotIn("escalation", row)
+
+    def test_a3_dossier_d_acte_sur_review_sans_horloge_de_fusion(self):
+        # #6209 : dossier d'acte de prod sur `review/**`, relu et validé, qui
+        # ne se fusionne jamais (canon §11 bis : une tête de travail n'entre
+        # pas directement dans la cible). La livraison est l'acte, pas la
+        # fusion : aucune horloge GO → fusion, donc aucune escalade.
+        events = [_ev("intake", T0), _ev("build", T0 + 600),
+                  _ev("qa", T0 + 1200)]
+        item = _item(state="validated", assignee="executant",
+                     branch="review/6209-acte-message-marks",
+                     updated_ts=T0 + 1800)
+        jalons = _jalons(item, events)
+        jalons["verdict"], jalons["verdict_kind"] = T0 + 1800, "ok"
+        jalons["verdict_current"] = True
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 4 * 3600)
+        self.assertEqual([r for r in rows if r["step"] == "verdict_merge"], [])
+        self.assertEqual(slo.breaches(rows), [])
+
+        # Témoin : le même GO sur une branche de travail ordinaire mesure
+        # toujours la fusion (et escalade).
+        item["branch"] = "agent/executant-6209"
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 4 * 3600)
+        self.assertEqual(self._row(rows, "verdict_merge")["level"], 3)
+
+    def test_a4_porteur_de_paquet_la_composition_date_l_attribution(self):
+        # #6156 : le porteur d'un paquet `integration/**` n'a pas d'`assignee`
+        # ; sa note de composition prouve un exécutant. Sans elle,
+        # `signal_assigned` courait après la fusion et alertait.
+        note = slo.PACKET_COMPOSITION_NOTE + "2 unit(s) aaa..bbb (branch integration/paquet-457-nexlink)"
+        events = [_ev("intake", T0, "created"), _ev("intake", T0 + 120, note)]
+        item = _item(branch="integration/paquet-457-nexlink")
+        self.assertEqual(slo.assigned_ts(item, events), T0 + 120)
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 3600)
+        row = self._row(rows, "signal_assigned")
+        self.assertEqual((row["done_ts"], row["level"]), (T0 + 120, 0))
+        self.assertEqual(slo.breaches(rows), [])
+
+        # Le passage en build reste le repli quand aucune composition n'est
+        # enregistrée : un lot pris sans note d'attribution a un exécutant.
+        events = [_ev("intake", T0, "created"),
+                  _ev("build", T0 + 600, "start")]
+        self.assertEqual(slo.assigned_ts(_item(), events), T0 + 600)
+
+    def test_cle_de_deduplication_independante_de_l_etat(self):
+        # #6209 : le même dépassement (lot, étape, agent, niveau) renvoyé au
+        # passage qa → validated, sans changement de niveau. La clé de
+        # dédoublonnage ne dépend plus de l'état ; un niveau qui monte reste
+        # une alerte neuve.
+        from ameesh import exploitation, notify
+
+        base = {"type": "slo_breach", "lot": 6209, "step": "verdict_merge",
+                "agent": "executant", "level": 1, "targets": ["assignee"]}
+        self.assertEqual(exploitation.alert_key(dict(base, lot_state="qa")),
+                         exploitation.alert_key(dict(base, lot_state="validated")))
+        self.assertEqual(notify.brief_key_of(dict(base, lot_state="qa")),
+                         notify.brief_key_of(dict(base, lot_state="validated")))
+        self.assertNotEqual(exploitation.alert_key(dict(base, level=2)),
+                            exploitation.alert_key(dict(base, level=1)))
+
+
 if __name__ == "__main__":
     unittest.main()
