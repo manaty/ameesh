@@ -1,0 +1,13 @@
+3c3,4
+< ROOT=Path('/work');SHA='SHA'
+---
+> import re
+> ROOT=Path('/work');SHA=os.environ['KIT_SHA'];assert re.fullmatch('[0-9a-f]{40}',SHA)
+14c15
+< c.pip(tools,'install','--no-index','--no-deps','--no-compile',str(ROOT/'wheelhouse/setuptools-84.2.1-py3-none-any.whl'),env=env)
+---
+> c.pip(tools,'install','--no-index','--no-deps','--no-compile',str(next((ROOT/'wheelhouse').glob('setuptools-*.whl'))),env=env)
+23c24
+<  v=Path(tmp)/'venv-5c1e679b66cd';c.create_venv(v,python=python,with_pip=True,env=env,prompt=p.INVITE)
+---
+>  v=Path(tmp)/('venv-'+SHA[:12]);c.create_venv(v,python=python,with_pip=True,env=env,prompt=p.INVITE)

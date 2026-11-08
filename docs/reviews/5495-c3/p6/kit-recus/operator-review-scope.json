@@ -1,0 +1,11 @@
+{
+ "at": "2026-11-08T12:28:10.440074+00:00",
+ "source_sha": "97285a076dee285097c412d3bd0f2649438a3257",
+ "scope": "offline sealed format3, public review only; no VM pose (P6 pr\u00e9paration, feu #200708)",
+ "producer_uid": 1000,
+ "network_for_production": "none",
+ "source_file_count": 3076,
+ "lock_rule": "runtime-pins.txt + runtime-build-pins.txt \u00e0 M, une ligne par \u00e9pingle, tri stable par nom ; r\u00e8gle reproduisant le lock 5c1 \u00e0 l'octet (pins-lock.py)",
+ "wheels_downloaded": "pip download --require-hashes --only-binary=:all: depuis PyPI (BG), 5 roues communes = octets du kit 5c1",
+ "envelope_change_vs_5c1": "SHA par KIT_SHA (40 hex v\u00e9rifi\u00e9), roue setuptools et nom du venv d\u00e9riv\u00e9s ; aucun autre \u00e9cart"
+}

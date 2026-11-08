@@ -1,26 +1,59 @@
 {
  "auteur": "bureau (BG)",
- "demande": "mesh-design #200619, r\u00e9ponses #200655",
- "gestes": "aucun",
- "lot": 5495,
- "remplace": "v1 (conserv\u00e9e)",
- "schema": "ameesh-5495-c3-dossier/2",
- "v1": {
+ "conserves": [
+  "v1",
+  "v2"
+ ],
+ "demande": "#200619, #200655, #200708 ; avis #200663 #200665 #200716 #200726",
+ "files": {
   "DOSSIER-C3-v1.md": "c88b4306981317948ed0c668b2b50bbc872fbef6178d63b08e08e513025fa7ec",
-  "pose-c3-AG1.sh": "d687eefe2818b22a2defac8b332b30feaa586d2dd72e35a90f3492972e40692e",
-  "releve-prealables-20261108T1100Z.txt": "aca16328e29c4f9c5cb0949c8c44ee93907265105d89a032c37efc978897b03a",
-  "retour-c3-AG1.sh": "db8365adcafdfbfea740d6a254a908c4ee45df34e1a09ff31901128e533e7722",
-  "sonde-c3.sh": "ec6a8dfd7aa713c63771ceccbdd748d9e9e65ab87734c2cf0a2ae68ad1bf2fd0"
- },
- "v2": {
   "DOSSIER-C3-v2.md": "9ff30a590c3041705f1ce2a2a1d305febe07d66ebcf6cd5322c1c2eb47d7a241",
+  "DOSSIER-C3-v21.md": "394edec0fe7ca4e794f882db7b78c66bf1bf0f55b4a3f0fda1c1d0366400c9be",
   "analyse/attrs.py": "d67851674b9a5f87f8e5d3367507a797e9677611532cf9499ad6b1e4304f4cff",
+  "evaluer-c3.py": "096587b71a68f21956a0d5f7625f0f1acb628f990c15705bb3f9cc230bca6185",
+  "lecteur-c3.py": "d811d0209dd5e8e85e2441a3e25bb3f84d6f9a14982aa72c6a0ba798f0bb8b1b",
+  "p6/build.out.txt": "ca9760b62c03b7441ba2f653e3f2ff710f73afc75edb73be9a44c8e1da5f8b51",
+  "p6/enveloppe/build-sealed-package.py": "0ffe24f67320c7fc7f72a947e25d1ad66a7c479715ffd683b03ef71c7dfe18d7",
+  "p6/enveloppe/build-sealed-package.py.diff-5c1": "5bfce83590be81ce951b98c861ba04c88d8d6c6807e8ceabecc39fb01ee42388",
+  "p6/enveloppe/verify-sealed-package.py": "ff97d020820b197034367bcca2e7de6109fa05a398bb242f045ad8fc1240f300",
+  "p6/enveloppe/verify-sealed-package.py.diff-5c1": "0d335c09e38575851c4922336d1f7aca489ea20cc498119a8562d5399377a861",
+  "p6/essai-bascule.sh": "ebcf0624df60836c0c186b99d5f8231450202f00604c89c3c4c5ab665f7c5a3d",
+  "p6/kit-recus/L2-review-97285a07-20261108.tar.gz.sha256": "a2b53400e019f9823c7386cff2e37d42aa337819828ee0bf430f70594017aa91",
+  "p6/kit-recus/SHA256SUMS": "68deab6eea3e7c83be4444128d5ed0db703493884829a1ea0a4e6207d2e2dea6",
+  "p6/kit-recus/build-receipt.json": "271500a3fc2ae9a369ff1d570ddc5c6567f5bf375c3aecbc654801df0adfa21d",
+  "p6/kit-recus/builder-provenance.json": "e016e84d11d0befdf35cb9be2f67100f9bb3435c4ed130b1d8563cb1a321908c",
+  "p6/kit-recus/dependency-pins.lock": "91376923537634b6f0131d8158159ff03e6d558af8185819fe9cb25786785fd6",
+  "p6/kit-recus/manifest.json": "1ec6e407733f55e9bf03071779481b7cca1ec3237fdf579700928580ef2f07ed",
+  "p6/kit-recus/operator-review-scope.json": "5762deeb6467fba41379310c35e720fa06c716417feb02b5cb1e017b73a19ec3",
+  "p6/kit-recus/preparation-receipt.json": "e5a08ba92791b6995f28973e22522a13edb0a38a449f56b85a0ad0768b255e7c",
+  "p6/kit-recus/requirements-staging.lock": "185d3bef81efd5c35b385b8705ca2b8885064ad3a3781e6b3c63bf12185cf039",
+  "p6/kit-recus/separate-verifier-receipt.json": "f4c753da0e4ca488738078ca9398b512e8b855149a30211ff4a76a906cfac8e3",
+  "p6/pins-lock.py": "911e7f370d548ac70e49b7072c85f209f057a1b4382b7c7042ed139ae8177193",
+  "p6/update-l2-runtime-v3.py": "1007f986541e24ecb57983b8d29086d0c703e15dd6dfdf99efcd44a8580af439",
+  "p6/verify.out.txt": "3e92c5e938fa4be4250eed101657cd5c45b42118ca7da15129b73df9310200c9",
+  "pose-c3-AG1.sh": "d687eefe2818b22a2defac8b332b30feaa586d2dd72e35a90f3492972e40692e",
   "pose-c3-v2.sh": "5901e5cf1b278f8ced32b71b6061d2d9279f379dbb8849c2f141627479dbf250",
+  "pose-c3-v21.sh": "0c9f06a0266f064d06a9ee0e843e562537278d31e44a1147cf38bc2cfa102ced",
   "preparer-canon-c3.sh": "f5bde6c4fdadb8ed1b7e0886f8f6f5a0298966ec4c4c26c06e57687dada9d079",
+  "releve-prealables-20261108T1100Z.txt": "aca16328e29c4f9c5cb0949c8c44ee93907265105d89a032c37efc978897b03a",
   "releve-v2-blancs-20261108T1153Z.txt": "fe7693b40e45c8a626c32ddf061699bcb25f71298127e6baea3d8581f851ef94",
   "releve-v2-sonde-prealables-20261108T1152Z.txt": "6d01e790f8941bd7538ace362be8d6a588dd4c6eca23557a124ab2378566676d",
+  "releve-v21-blancs-20261108T1219Z.txt": "9162c6fe751ce9a69818b8494461ea1f52a9c88474ec19f9590ecea6b6a858f7",
+  "releve-v21-sonde-go-20261108T1216Z.txt": "cb32ec05df6584a39ad72770f35e3681fe4820ccef67f638bf5618943b1c0852",
+  "retour-c3-AG1.sh": "db8365adcafdfbfea740d6a254a908c4ee45df34e1a09ff31901128e533e7722",
   "retour-c3-v2.sh": "523abf0bc566e5a878d7e592b636203ee7957ac78d65ca7d96791377b140d475",
-  "sonde-c3-v2.sh": "ed61763f5f723fff51c03c995ce6f2e3d3e8c647f3ecc6bbd2af6ec60f73f883"
+  "retour-c3-v21.sh": "e9cce6c653584cb61ba7855979f49e6ce8dbb913dd3d00f0a408c6585bafb4f9",
+  "sonde-c3-v2.sh": "ed61763f5f723fff51c03c995ce6f2e3d3e8c647f3ecc6bbd2af6ec60f73f883",
+  "sonde-c3-v21.sh": "a55387a0adef8ff86f2bee238429a33f1281a8898156d017af6af56a4675ab69",
+  "sonde-c3.sh": "ec6a8dfd7aa713c63771ceccbdd748d9e9e65ab87734c2cf0a2ae68ad1bf2fd0",
+  "temoin-apres.sh": "4fa4ed071a2d29c3f26dd8ee53f0c3cebdfeaa16c19929643cf6cdf96acc0639"
  },
- "version": "v2"
+ "gestes": "aucun sur les VM",
+ "kit_p6_archive": {
+  "chemin_BG": "scratchpad/p6/L2-review-97285a07-20261108.tar.gz",
+  "sha256": "4143455e87bb07f32398efd5df49df3ca274c3a35e78e51b504f49fcf6784a57"
+ },
+ "lot": 5495,
+ "schema": "ameesh-5495-c3-dossier/3",
+ "version": "v2.1"
 }

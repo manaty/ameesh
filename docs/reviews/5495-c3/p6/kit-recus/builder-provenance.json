@@ -1,0 +1,9 @@
+{
+ "base_image": "ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852",
+ "builder_image_id": "sha256:900a31fc102ce589b7d11009ac7188724b6a1514230a07a561a605df9d431f03",
+ "builder_host": "bureau-goal (BG), Dockerfile.builder du kit 5c1 inchang\u00e9 (a53443ae)",
+ "python_deb_version": "3.12.3-1ubuntu0.17",
+ "observed_builder_python_sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+ "python_sha256_matches_target_expected_sha256": true,
+ "note": "image reconstruite sur BG : identifiant diff\u00e9rent de 50c8464f (kit 5c1, horodatages de couches), m\u00eames base et paquets \u00e9pingl\u00e9s"
+}

@@ -1,0 +1,57 @@
+{
+  "PYTHONDONTWRITEBYTECODE": "1",
+  "deployment": "not performed; independent review and native pilot go required",
+  "distributions": [
+    {
+      "name": "ameesh",
+      "version": "1.44.1"
+    },
+    {
+      "name": "coverage",
+      "version": "7.17.2"
+    },
+    {
+      "name": "pip",
+      "version": "24.0"
+    },
+    {
+      "name": "psutil",
+      "version": "7.2.2"
+    },
+    {
+      "name": "psycopg",
+      "version": "3.3.6"
+    },
+    {
+      "name": "psycopg-binary",
+      "version": "3.3.6"
+    },
+    {
+      "name": "pyyaml",
+      "version": "6.0.3"
+    },
+    {
+      "name": "setuptools",
+      "version": "84.2.1"
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.16.0"
+    }
+  ],
+  "expected_package_tree_sha256": "2dca0d97ba27576a6c6c624c711e8f3588c7f0cc87b2f20386dbf45636e8a633",
+  "fixed_venv_prompt": "ameesh",
+  "format": "ameesh-venv-staging/3",
+  "lock_sha256": "185d3bef81efd5c35b385b8705ca2b8885064ad3a3781e6b3c63bf12185cf039",
+  "manifest_sha256": "1ec6e407733f55e9bf03071779481b7cca1ec3237fdf579700928580ef2f07ed",
+  "network": "disabled by Docker",
+  "no_compile": true,
+  "pip_install_refused": true,
+  "producer_euid": 1000,
+  "python_sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+  "reproducible_public_producer": true,
+  "separate_sealed_install_verifier": "passed",
+  "source_sha": "97285a076dee285097c412d3bd0f2649438a3257",
+  "wheel": "ameesh-1.44.1-py3-none-any.whl",
+  "wheel_sha256": "d3e5d21a2dd43ce6a97e916099f4630e5c6efafdc99e60b8cfa168e8d933e773"
+}

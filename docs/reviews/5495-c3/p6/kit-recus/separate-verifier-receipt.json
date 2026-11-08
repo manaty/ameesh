@@ -1,0 +1,10 @@
+{
+ "at": "2026-11-08T12:27:26.327020+00:00",
+ "rc": 0,
+ "fresh_container": true,
+ "network": "none",
+ "UID": 1000,
+ "cap_drop": "ALL",
+ "source": "97285a076dee285097c412d3bd0f2649438a3257",
+ "no_VM_pose": true
+}

@@ -1,0 +1,13 @@
+{
+ "source_sha": "97285a076dee285097c412d3bd0f2649438a3257",
+ "tree": "c48d833b3a4e9239a21d1ed331b38633f4b66c36",
+ "PR": 4869,
+ "qualified_PR_head": "d6a518f78245093d3ec9fac9df1ffff72fcca21c",
+ "PR_checks": "59 SUCCESS, 5 SKIPPED (gh pr view 4869, 08/11 12:29Z)",
+ "staging_attestation": "actif-97285a076dee.json, 3 VM, 2 report\u00e9s (staging hors cr\u00e9neau termin\u00e9 11:52:34Z, rc 0)",
+ "builder_image": "voir builder-provenance.json",
+ "python_sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+ "purpose": "P6 pr\u00e9paration (feu #200708) : build seul ; requalification auditeur, installateur v3 relu et feu C3 requis avant toute pose",
+ "VM_deployment": false,
+ "L2_keys": false
+}
