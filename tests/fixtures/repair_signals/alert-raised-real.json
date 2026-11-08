@@ -1,0 +1,9 @@
+{
+  "type": "alert.raised",
+  "object": "alert:ci_main_red",
+  "project": "acme",
+  "data": {
+    "alert": "ci_main_red",
+    "key": "[\"ci_main_red\", \"acme/widget main\"]"
+  }
+}

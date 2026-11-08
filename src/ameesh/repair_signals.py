@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -432,14 +433,28 @@ def from_alert(alert: Any, *, project: str, environment: str,
                observed_version: str = "") -> Signal:
     """Adapte une alerte de ``ameesh alerts`` sans lire son ``detail``.
 
-    La clé d'alerte (sha256 calculée par ``alert_ack``) est l'identité
-    durable ; ``detail``, ``host``, ``value`` et les autres champs de
+    La clé d'alerte est l'identité durable : un SHA-256 existant est conservé,
+    sinon la clé source est sérialisée canoniquement puis hachée (notamment
+    le tableau JSON en texte de ``notify.key_of``). ``detail``, ``host``,
+    ``value`` et les autres champs de
     diagnostic restent dans le relevé d'alertes.  Un ``project`` porté par
     l'alerte et différent du contexte est refusé, jamais réattribué.
     """
     key = _field(alert, "key")
-    if not isinstance(key, str):
+    if not isinstance(key, str) or not key.strip():
         raise SignalError("alerts: an alert key is required")
+    if not _ALERT_KEY_RE.fullmatch(key):
+        try:
+            source_key = json.loads(key)
+        except ValueError:
+            source_key = key
+        try:
+            canonical = json.dumps(source_key, sort_keys=True,
+                                   separators=(',', ':'), ensure_ascii=True,
+                                   allow_nan=False)
+        except ValueError:
+            raise SignalError("alerts: invalid alert key") from None
+        key = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
     carried = _field(alert, "project")
     if carried not in (None, "") and carried != project:
         raise SignalError("alerts: alert belongs to another project")

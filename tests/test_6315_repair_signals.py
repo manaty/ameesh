@@ -296,7 +296,7 @@ class SourceShapeTest(unittest.TestCase):
              "comment id"),
             (rs.from_github_watch, {"kind": "issue", "issue_ref": "pas-un-ref"},
              "reference"),
-            (rs.from_alert, {"key": "pas-une-cle"}, "alert key"),
+            (rs.from_alert, {"key": ""}, "alert key"),
         ]
         for adapter, record, field in cases:
             with self.subTest(field=field):
