@@ -51,6 +51,10 @@
         âge, avis dus par relecteur, avis bloquants non traités, holds et
         réveils, agents au repos avec du travail dû, tours et fusions par
         heure, durée de CI par job ; `--check` sort 2 sur une attente > seuil ;
+  ameesh repair-report [--json] [--project P] [--days N] [--start T] [--end T]
+        rapport A1–A12 en lecture seule (étude #6308, unité U1) : compteurs de
+        la fenêtre UTC, inconnues déclarées ; alertes ≠ défauts, événements
+        ≠ runs ;
   ameesh decide <id> <option | "free text"> [--key FILE | --signed]
         | withdraw <id> | show <id>
         the human's answer (never an agent's), sent back to the requester by
@@ -414,6 +418,11 @@ def _dispatch(argv: list[str] | None) -> int:
         # mesuré sur les jalons (jamais sur les colonnes d'un lot).
         from . import debit
         return debit.main(rest)
+    if command in ("repair-report", "repair_report"):
+        # #6313 (étude #6308, U1) : rapport A1–A12 en lecture seule, fenêtre
+        # UTC fixe, inconnues déclarées ; n'ouvre aucun lot, n'active rien.
+        from . import repair_report
+        return repair_report.main(rest)
     if command == "process":
         # #2225 : vérifier le bloc `workflow:` d'une carte Process du canon
         from . import process_card
