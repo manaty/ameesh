@@ -133,8 +133,8 @@ _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _PACKETS_KEYS = ("cutoffs",)
 #: classes du plan L161f qu'un bloc `prevalidation` peut sélectionner
 PREVALIDATION_CLASSES = ("P0", "P1", "P2", "P3")
-_PREVALIDATION_KEYS = ("classes", "contracts", "hosts", "parts_script",
-                       "timeout_seconds")
+_PREVALIDATION_KEYS = ("classes", "contracts", "hosts", "plan_script",
+                       "parts_script", "timeout_seconds")
 _BUILD_KEYS = ("max_in_build",)
 _CI_KEYS = ("packet", "incident_label", "environment_red", "faulty_lot")
 _REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families",
@@ -237,15 +237,16 @@ class Prevalidation:
     Absent (`None`), le consommateur explicite refuse et l'accroche automatique
     reste inactive : aucune valeur ne se suppose. Présent, il porte exactement
     les paramètres relus — classes du plan L161f retenues, contrats toujours
-    inclus, hôtes d'exécution autorisés, délai du run distant, et le lanceur de
-    part du dépôt quand le bloc le nomme (`parts_script`, `None` sinon : la
-    convention du schéma reste au consommateur, jamais au lecteur).
+    inclus, hôtes d'exécution autorisés, délai du run distant, et les scripts
+    du dépôt quand le bloc les nomme (`plan_script` et `parts_script`, `None`
+    sinon : la convention du schéma reste au consommateur, jamais au lecteur).
     """
 
     classes: tuple[str, ...]
     contracts: tuple[str, ...]
     hosts: tuple[str, ...]
     timeout_seconds: int
+    plan_script: str | None = None
     parts_script: str | None = None
 
     def to_dict(self) -> dict:
@@ -255,6 +256,8 @@ class Prevalidation:
             "hosts": list(self.hosts),
             "timeout_seconds": self.timeout_seconds,
         }
+        if self.plan_script is not None:
+            out["plan_script"] = self.plan_script
         if self.parts_script is not None:
             out["parts_script"] = self.parts_script
         return out
@@ -905,30 +908,31 @@ def _prevalidation(value, where: str) -> Prevalidation:
         if item in out_hosts:
             raise MechanicsError("%s.hosts: duplicate host %s" % (where, item))
         out_hosts.append(item)
-    # le lanceur de part est optionnel : absent, la convention du schéma
-    # s'applique chez le consommateur ; déclaré, il est relu comme un chemin
+    # les scripts du dépôt sont optionnels : absents, la convention du schéma
+    # s'applique chez le consommateur ; déclarés, ils sont relus comme chemins
     return Prevalidation(
         classes=ordered,
         contracts=tuple(out_contracts),
         hosts=tuple(out_hosts),
         timeout_seconds=_positive_int(data.get("timeout_seconds"),
                                       where + ".timeout_seconds"),
-        parts_script=_parts_script(data, where),
+        plan_script=_script(data, "plan_script", where),
+        parts_script=_script(data, "parts_script", where),
     )
 
 
-def _parts_script(data, where: str) -> str | None:
-    """Le lanceur de part déclaré (`None` : la convention du schéma).
+def _script(data, key: str, where: str) -> str | None:
+    """Un script du dépôt déclaré (`None` : la convention du schéma).
 
     Un `null` explicite refuse : la clé déclarée doit porter un chemin, comme
     les contrats. Absente, la clé ne suppose rien — c'est le consommateur qui
-    applique `scripts/test-parts.py`."""
-    if "parts_script" not in data:
+    applique sa convention (`scripts/test-plan.py`, `scripts/test-parts.py`)."""
+    if key not in data:
         return None
-    value = data["parts_script"]
+    value = data[key]
     if not _repository_path(value):
-        raise MechanicsError("%s.parts_script: not a repository path: %r"
-                             % (where, value))
+        raise MechanicsError("%s.%s: not a repository path: %r"
+                             % (where, key, value))
     return value
 
 

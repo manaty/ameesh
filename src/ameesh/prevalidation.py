@@ -1116,7 +1116,9 @@ def contract_modules(paths, repo: str = "", *, head: str = "",
 def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
                 runner=subprocess.run,
                 excluded: Sequence[dict] = (),
-                contract_policy="configured", deadline=None) -> tuple[bool, str]:
+                contract_policy="configured", project: str = "ameesh",
+                canon_repo: str = "", canon_commit: str = "",
+                deadline=None) -> tuple[bool, str]:
     """La sélection du plan tient-elle exactement dans le canon ?
 
     Le canon déclare les classes retenues et les fichiers de contrat ; le plan
@@ -1130,7 +1132,15 @@ def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
 
     `excluded` (#4071) retire de cette exigence les modules que le guest ne
     peut pas exécuter : ils restent dans la suite complète, pas dans la
-    sélection envoyée. Sans classes lisibles, rien ne se prouve : refus."""
+    sélection envoyée. Sans classes lisibles, rien ne se prouve : refus.
+
+    #6186 : la politique de contrat du projet est lue là où le projet l'a
+    déclarée — le canon exact qui a fourni son bloc (`canon_repo`,
+    `canon_commit`), sinon le canon configuré, avec `project`. Aucun nom de
+    projet ni chemin d'un autre projet n'est supposé par le moteur. L'arbre
+    candidat fournit son inventaire dans le plan (`contract_plan.inventory`),
+    pour un projet dont les tests ne sont pas des `tests/test_*.py`.
+    """
     classes = plan.get("classes") if isinstance(plan, dict) else None
     if not isinstance(classes, dict) or not classes:
         return False, "plan sans classes : la sélection ne se prouve pas"
@@ -1144,8 +1154,16 @@ def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
     if problem:
         return False, problem
     from . import contract_plan
-    policy = (contract_plan.configured_policy("ameesh")
-              if contract_policy == "configured" else contract_policy)
+    if contract_policy != "configured":
+        policy = contract_policy
+    elif canon_repo and canon_commit:
+        try:
+            policy = contract_plan.policy_from_canon(
+                canon_repo, canon_commit, project, deadline=deadline)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return False, "contract policy unreadable: " + str(exc)
+    else:
+        policy = contract_plan.configured_policy(project)
     shared = plan.get("contract_plan")
     if policy is not None and (not isinstance(shared, dict) or not shared.get("active")):
         return False, "active contract policy missing from plan"
@@ -1157,15 +1175,26 @@ def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
             if shared.get("active"):
                 if policy is None:
                     return False, "contract plan policy unavailable"
-                inventory = contract_plan.git(
-                    repo, "ls-tree", "-r", "--name-only", head, "--", "tests", deadline=deadline).splitlines()
-                inventory = [p[6:-3] for p in inventory
-                             if re.fullmatch(r"tests/test[^/]*\.py", p)]
+                inventory = shared.get("inventory")
+                if not inventory:
+                    # N-1 block without the candidate universe: ameesh's
+                    # historical layout is the only readable convention.
+                    inventory = contract_plan.git(
+                        repo, "ls-tree", "-r", "--name-only", head, "--", "tests",
+                        deadline=deadline).splitlines()
+                    inventory = [p[6:-3] for p in inventory
+                                 if re.fullmatch(r"tests/test[^/]*\.py", p)]
                 verified = contract_plan.build(
-                    repo, head, shared["base"], inventory, required, (), policy, deadline=deadline)
+                    repo, head, shared["base"], inventory, required, (), policy,
+                    deadline=deadline)
                 if (shared.get("registry_digest") != verified["registry_digest"]
                         or shared["contracts"] != verified["contracts"]):
                     return False, "contract plan registry or contracts differ"
+                if bool(shared.get("full_suite_required")) \
+                        != bool(verified["full_suite_required"]):
+                    # A plan that under-declares the conservative fallback is
+                    # replayed as a full-suite selection, never read as green.
+                    return False, "contract plan fallback differs"
                 required = tuple(verified["contracts"])
         except (ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
             return False, "contract plan unreadable: " + str(exc)
@@ -1242,6 +1271,8 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
              cwd: str | None = None, env: dict | None = None,
              runner=subprocess.run, git_runner=subprocess.run,
              snapshotter=None, executable: str = "ameesh",
+             contract_policy="configured", project: str = "ameesh",
+             canon_repo: str = "", canon_commit: str = "",
              deadline: Deadline | None = None) -> dict:
     """Le geste complet : contrôles du canon, exécution distante, rapport.
 
@@ -1290,7 +1321,9 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
         if applied:
             text = json.dumps(plan, indent=1, ensure_ascii=False) + "\n"
     within, why = meets_canon(plan, params, root, head=head, runner=git_runner,
-                              excluded=excluded, deadline=deadline)
+                              excluded=excluded, contract_policy=contract_policy,
+                              project=project, canon_repo=canon_repo,
+                              canon_commit=canon_commit, deadline=deadline)
     chosen = selection(plan, head=head, base=base, plan_path=plan_path,
                        excluded=applied)
     if not chosen.ok:
@@ -1446,7 +1479,10 @@ def run(cfg, db, args) -> int:
         report = validate(lot=args.lot, plan_path=args.plan, head=args.sha,
                           host=args.host, profile=getattr(args, "profile", ""),
                           params=params, base=args.base, repo=args.repo or "",
-                          published_ref=args.published_ref, remote=args.remote)
+                          published_ref=args.published_ref, remote=args.remote,
+                          project=args.project,
+                          canon_repo=args.canon_repo or args.repo or ".",
+                          canon_commit=args.canon_commit)
     except PrevalidationError as exc:
         if getattr(args, "json", False):
             print(json.dumps({"schema": REPORT_SCHEMA, "lot": args.lot,

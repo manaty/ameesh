@@ -89,6 +89,7 @@ SCHEMA_KEYS = (
     "prevalidation.classes",
     "prevalidation.contracts",
     "prevalidation.hosts",
+    "prevalidation.plan_script",
     "prevalidation.parts_script",
     "prevalidation.timeout_seconds",
     "backlog.lot_min_value",
@@ -155,6 +156,7 @@ BINDINGS = {
     "classes": "prevalidation.classes",
     "contracts": "prevalidation.contracts",
     "hosts": "prevalidation.hosts",
+    "plan_script": "prevalidation.plan_script",
     "parts_script": "prevalidation.parts_script",
     "timeout_seconds": "prevalidation.timeout_seconds",
     "lot_min_value": "backlog.lot_min_value",
@@ -247,6 +249,7 @@ PREVALIDATION_DICT_BINDINGS = {
     "classes": "prevalidation.classes",
     "contracts": "prevalidation.contracts",
     "hosts": "prevalidation.hosts",
+    "plan_script": "prevalidation.plan_script",
     "parts_script": "prevalidation.parts_script",
     "timeout_seconds": "prevalidation.timeout_seconds",
 }
@@ -527,7 +530,7 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key in ("prevalidation.contracts", "prevalidation.hosts"):
         return (prevalidation_context and isinstance(value, tuple) and bool(value)
                 and all(isinstance(item, str) and item for item in value))
-    if key == "prevalidation.parts_script":
+    if key in ("prevalidation.plan_script", "prevalidation.parts_script"):
         return (prevalidation_context and isinstance(value, str)
                 and bool(value) and "/" in value)
     if key == "prevalidation.timeout_seconds":

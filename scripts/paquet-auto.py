@@ -1658,7 +1658,7 @@ def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
 
 
 def contract_modules(worktree: Path, *, base: str = "",
-                     timeout: float = GIT_TIMEOUT) -> list[str]:
+                     timeout: float = GIT_TIMEOUT, project: str = "") -> list[str]:
     """La liste « toujours », `test_l161f_plan` et `test_cluster`."""
     path = worktree / CONTRACT_ALWAYS
     if not path.is_file():
@@ -1676,11 +1676,16 @@ def contract_modules(worktree: Path, *, base: str = "",
         # fallback; neither the neighbor budget nor the map may drop a contract.
         with tempfile.TemporaryDirectory(prefix="contract-plan-") as temporary:
             output = Path(temporary) / "plan.json"
+            env = python_env(worktree)
+            if project:
+                # #6186: the project's adapter reads its own canon/registry;
+                # an N-1 script ignores the variable and keeps its convention.
+                env["AMEESH_PROJECT"] = project
             proc = run_command(
                 [project_python(worktree), str(worktree / "scripts/test-plan.py"),
                  "plan", "--out", str(output), "--base", base, "--mode", "lot",
                  "--local-map"], cwd=worktree, timeout=max(0.1, timeout),
-                env=python_env(worktree))
+                env=env)
             if proc.returncode:
                 raise PaquetAutoError("plan commun de contrats illisible : " + _tail(_output(proc), 3))
             try:
@@ -2304,7 +2309,7 @@ def prepublication_contracts(worktree: Path, *, base: str,
             raise PaquetAutoError("budget de contrats absent du canon")
         if shutil.which("ameesh") is None:
             raise PaquetAutoError("créneau heavy indisponible")
-        modules = contract_modules(worktree, base=base,
+        modules = contract_modules(worktree, base=base, project=project,
                                    timeout=max(0.1, end - time.monotonic()))
         from datetime import datetime, timezone
         from ameesh import prevalidation
@@ -3023,7 +3028,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                       parallel: int = DEFAULT_PARALLEL,
                       deadline: float | None = None,
                       contract_report: ContractPass | None = None,
-                      legacy_contracts: bool = False) -> tuple[list[TestRun], list[int],
+                      legacy_contracts: bool = False,
+                      project: str = "") -> tuple[list[TestRun], list[int],
                                                               list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
@@ -3136,7 +3142,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     def contract_job():
         remaining = max(0.1, deadline - time.monotonic()) if deadline is not None else GIT_TIMEOUT
         try:
-            modules = contract_modules(worktree, base="" if legacy_contracts else base_sha, timeout=remaining)
+            modules = contract_modules(
+                worktree, base="" if legacy_contracts else base_sha,
+                project=project, timeout=remaining)
         except PaquetAutoError as exc:
             # Unavailable planning is not a negative test. CI still runs the
             # full suite; this pass records no qualification of the contracts.
@@ -4923,6 +4931,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                     base_sha=base_sha, guard=tests_guard,
                     parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
                     deadline=deadline, contract_report=contract_report,
+                    project=getattr(args, "pause_project", "") or "",
                     legacy_contracts=publication_policy(args) == "legacy")
             except CarrierSettled as settled:
                 rc = interrupted_by_carrier(args, worktree, branch, head,

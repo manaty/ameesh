@@ -3,6 +3,12 @@
 
 Consumers retain their map freshness and execution policies. This module only
 unions obligations; it never uses a map to subtract a declared contract.
+
+A project declares its registry in its canon
+(``projects.<project>.contract_selection.registry``) and supplies its plan
+adapter inputs (inventory, legacy contracts, impacted modules). The engine
+carries no project name, path or test-layout convention: the project comes from
+the caller or from ``AMEESH_PROJECT``/the configured project.
 """
 from __future__ import annotations
 
@@ -13,15 +19,54 @@ from . import contract_selection as cs, mechanics
 SCHEMA = 'ameesh-contract-plan/1'
 
 
-def configured_policy(project: str):
-    """N-1 or an unavailable canon keeps the historical selection active."""
+def project_name(cfg=None) -> str:
+    """The project of this run, from configuration, never from a literal.
+
+    ``AMEESH_PROJECT`` or the configured project names the canon override and
+    the registry. Empty means unknown: the historical N-1 selection applies.
+    """
+    if cfg is None:
+        from . import config
+        try:
+            cfg = config.load()
+        except (OSError, ValueError):
+            return ''
+    value = getattr(cfg, 'project', '') or ''
+    return value.strip() if isinstance(value, str) else ''
+
+
+def configured_policy(project: str = ''):
+    """The policy declared for ``project`` (default: this run's project).
+
+    N-1, an absent override or an unavailable canon keeps the historical
+    selection active: absence is never read as a policy.
+    """
     from . import config
     try:
-        document = mechanics.configured(config.load())
+        cfg = config.load()
+        project = (project or '').strip() or project_name(cfg)
+        if not project:
+            return None
+        document = mechanics.configured(cfg)
         override = document.override(project)
         return override.contract_selection if override else None
     except (OSError, ValueError, mechanics.MechanicsError):
         return None
+
+
+def policy_from_canon(repo: str, commit: str, project: str, *, deadline=None):
+    """Read ``project``'s policy at an exact canon source, or None.
+
+    A host may carry several canons (decision 0031); the prevalidation path
+    passes the source that declared the project's block, so this never falls
+    back to another project's canon or to a name hard-coded in the engine.
+    """
+    project = (project or '').strip()
+    if not project:
+        return None
+    document = mechanics.load_global(repo, commit, deadline=deadline)
+    override = document.override(project)
+    return override.contract_selection if override else None
 
 
 def git(repo, *args, deadline=None):
@@ -36,7 +81,11 @@ def build(repo, commit, base, inventory, legacy, impacted, policy, *, deadline=N
     Rename detection is deliberately disabled: both its deletion and addition
     are judged, even when Git would classify it as a copy or rename.
     """
+    if isinstance(inventory, str):
+        raise cs.RegistryError('invalid candidate module inventory')
     inventory = sorted(set(inventory))
+    if any(not cs.module_name(m) for m in inventory):
+        raise cs.RegistryError('invalid candidate module inventory')
     legacy, impacted = set(legacy), set(impacted)
     selection = None
     if policy is not None:
@@ -62,6 +111,11 @@ def build(repo, commit, base, inventory, legacy, impacted, policy, *, deadline=N
         entry = evidence.setdefault(module, {'reasons': [], 'paths': []})
         entry['reasons'] = sorted(set(entry['reasons']) | {'map:P0/P1'})
     return {'schema': SCHEMA, 'commit': commit, 'base': base,
+            # The candidate's complete module universe, bound to the same SHA.
+            # A second project's adapter carries its own layout (Jest files,
+            # paths); consumers verify the registry against this list instead
+            # of re-discovering a Python `tests/` tree.
+            'inventory': inventory,
             'registry_digest': selection.registry_digest if selection else None,
             'active': policy is not None, 'contracts': contracts,
             'impacted': sorted(impacted), 'modules': sorted(set(contracts) | impacted),
@@ -79,6 +133,14 @@ def consume(plan):
         if not isinstance(names, list) or any(not isinstance(m, str) for m in names) \
                 or names != sorted(set(names)):
             raise ValueError('invalid contract plan ' + key)
+    inventory = plan.get('inventory')
+    if inventory is not None:
+        # Additive: an N-1 block without inventory stays readable; when present
+        # it is the exact candidate universe used by the selector.
+        if not isinstance(inventory, list) \
+                or any(not cs.module_name(m) for m in inventory) \
+                or inventory != sorted(set(inventory)):
+            raise ValueError('invalid contract plan inventory')
     if set(plan['modules']) != set(plan['contracts']) | set(plan['impacted']):
         raise ValueError('contract plan union differs')
     return tuple(plan['modules'])
