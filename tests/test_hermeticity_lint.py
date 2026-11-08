@@ -308,6 +308,45 @@ class RulesTest(unittest.TestCase):
             "def test_x(self):\n"
             "    subprocess.run([\"ameesh\", \"version\"], env=None)\n"), ["H8"])
 
+    def test_ameesh_executable_none_keeps_the_real_program(self):
+        for call in ("subprocess.run", "subprocess.Popen", "subprocess.check_output"):
+            with self.subTest(call=call):
+                self.assertEqual(self.rules(
+                    "import subprocess\ndef test_x():\n"
+                    f"    {call}(['ameesh', 'version'], executable=None)\n"), ["H8"])
+        self.assertEqual(self.rules(
+            "import subprocess\ndef test_x():\n"
+            "    subprocess.run(['ameesh'], executable='/fake/tool')\n"), [])
+        self.assertEqual(self.rules(
+            "import subprocess\ndef test_x():\n"
+            "    subprocess.run(['ameesh'], executable=None, env=child_env())\n"), [])
+
+    def test_spawn_program_follows_mode_and_resolves_aliases(self):
+        for method in ("spawnv", "spawnve", "spawnvp", "spawnvpe"):
+            for spelling, imports in ((f"os.{method}", "import os"),
+                                      ("launch", f"from os import {method} as launch")):
+                inherited = ", None" if method in ("spawnve", "spawnvpe") else ""
+                with self.subTest(method=method, spelling=spelling):
+                    self.assertEqual(self.rules(
+                        f"{imports}\ndef test_x():\n"
+                        f"    {spelling}(os.P_WAIT, 'ameesh', ['ameesh']{inherited})\n"),
+                        ["H8"])
+                    self.assertEqual(self.rules(
+                        f"{imports}\ndef test_x():\n"
+                        f"    {spelling}(os.P_WAIT, '/fake/tool', ['ameesh'])\n"), [])
+                    self.assertEqual(self.rules(
+                        f"{imports}\ndef test_x():\n"
+                        f"    {spelling}()\n"
+                        f"    {spelling}(os.P_WAIT)\n"), [])
+        for method in ("spawnve", "spawnvpe"):
+            with self.subTest(explicit_env=method):
+                self.assertEqual(self.rules(
+                    "import os\ndef test_x():\n"
+                    f"    os.{method}(os.P_WAIT, 'ameesh', ['ameesh'], child_env())\n"), [])
+                self.assertEqual(self.rules(
+                    "import os\ndef test_x():\n"
+                    f"    os.{method}(os.P_WAIT, 'ameesh', ['ameesh'], None)\n"), ["H8"])
+
     def test_ameesh_subprocess_exemption(self):
         """Le témoin qui DOIT hériter s'exempte avec un motif."""
         self.assertEqual(self.rules(
