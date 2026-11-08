@@ -214,6 +214,27 @@ def begun(events: Iterable[dict], jalons: dict | None = None) -> bool:
     return False
 
 
+#: #6255 A3 : une branche `review/**` porte un dossier d'acte (acte de prod,
+#: preuve) et non un lot de code à fusionner : le canon §11 bis refuse son
+#: entrée directe dans la cible d'intégration hors exception. Sa livraison est
+#: l'acte, jamais une fusion.
+ACT_BRANCH_PREFIX = "review/"
+
+
+def is_act_branch(branch) -> bool:
+    """#6255 : la branche porte-t-elle un dossier d'acte (`review/**`) ?
+
+    Accepte la ref complète (`refs/heads/review/…`) comme la branche courte
+    stockée par `work.set_branch`. Une branche illisible ou vide n'est pas un
+    dossier d'acte : le doute mesure la fusion, il ne la tait pas."""
+    name = str(branch or "").strip()
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    return name.startswith(ACT_BRANCH_PREFIX)
+
+
 #: #4704 : la mention de la note de création d'un lot né réservé à un
 #: exécutant externe (`work add --external-executor`), distincte de la note de
 #: déclaration tardive (`storage.interface.EXTERNAL_EXECUTOR_NOTE`).
@@ -294,7 +315,12 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
     de l'étape. Le journal garde donc le fait que le lot a été attribué, même
     si `assignee` est vide aujourd'hui : un lot créé déjà assigné puis rendu
     ne redevient plus « jamais assigné » et `signal_assigned`, déjà conclu,
-    ne rouvre pas l'alerte de niveau 3 « reassign it now » (#3223)."""
+    ne rouvre pas l'alerte de niveau 3 « reassign it now » (#3223).
+
+    #6255 A4 : sans aucune note d'attribution, un lot qui a commencé
+    (`start_ts` : passage en build, début mesuré, composition d'un porteur de
+    paquet) a un exécutant à cet instant. C'est la première preuve datable ;
+    la création ne la précède pas en tant qu'attribution."""
     from . import backlog, estimates, handoff, work
 
     events = list(events)
@@ -347,6 +373,15 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
         return min(stamps)
     if item.get("assignee") or held:
         return float(item["created_ts"]) if item.get("created_ts") is not None else None
+    # #6255 A4 : un porteur de paquet `integration/**` n'a pas d'`assignee` ;
+    # sa composition enregistrée est son début (`start_ts`), donc la preuve
+    # d'un exécutant. Sans ce repli, `signal_assigned` courait après la fusion
+    # d'un véhicule composé et alertait à tort (#6156). Un lot passé en build
+    # sans note d'attribution a de même un exécutant : le début mesuré date la
+    # première prise, jamais la création (le temps d'avant n'est pas mesuré).
+    started = start_ts(events)
+    if started is not None:
+        return float(started)
     return None
 
 
@@ -809,6 +844,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               vehicle_exit_ts: float | None = None,
               packet_pause: dict | None = None,
               packet_missed: dict | None = None,
+              external_retired: bool = False,
               footprint: dict | None = None) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
@@ -960,12 +996,29 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     retard de son porteur. Une levée qu'aucun jalon ne date laisse les deux
     pas suspendus (`undated`), sans durée inventée. `footprint["named"]`
     nomme les bloqueurs retenus.
+
+    #6255 : quatre faux positifs. A1 : une arête bloquante ouverte retient
+    aussi `signal_assigned` (#6140) ; levée, elle date son départ, comme pour
+    `intake_started` (#2551). A2 : un lot réservé à un exécutant externe
+    (`external_executor`, #3447) garde ses étapes mesurées mais sans escalade
+    — aucun rôle du §9 ne peut faire avancer le geste du bureau ou de l'owner
+    (#6241). `external_retired` lève cette règle quand le système déclaré a été
+    retiré : le pilote doit alors lever la réservation, et l'alerte le dit
+    (#6105). A3 : un dossier d'acte sur branche `review/**` n'a pas d'horloge
+    GO → fusion, sa livraison est l'acte (#6209). A4 : `assigned_ts` retient
+    le début mesuré d'un porteur de paquet (#6156).
     """
     events = list(events)
     fixes = list(fixes or ())
     now = time.time() if now is None else float(now)
     critical = int(item.get("priority") or 0) == 1
     state = item.get("state")
+    # #6255 : la classe du lot, lue une fois. Un dossier d'acte (`review/**`)
+    # ne se fusionne pas ; une réservation externe valide n'a pas d'agent à
+    # escalader. Une déclaration retirée n'est plus un exécutant (#6105).
+    act_branch = is_act_branch(item.get("branch"))
+    external = (bool(str(item.get("external_executor") or "").strip())
+                and not external_retired)
     out = []
 
     # #4561 : l'attente de la garde d'empreinte suspend les deux pas d'avant
@@ -992,13 +1045,26 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     if requested is not None:
         step = step_of("signal_assigned")
         if assigned is not None:
-            start, extra = _fp_start(float(requested), assigned)
+            # #6255 A1 : une dépendance bloquante levée avant l'attribution
+            # décale le départ de sa levée : l'attente d'un autre lot n'est
+            # pas un retard d'attribution (#6140). Déjà attribué, une arête
+            # encore ouverte ne réécrit pas le fait accompli.
+            ready = intake_ready_ts(None, requested, dependencies,
+                                    started=float(assigned))
+            start = float(ready) if ready is not None else float(requested)
+            start, extra = _fp_start(start, assigned)
             out.append(_row(step, start, now=now, critical=critical,
                             done_ts=round(assigned, 3),
                             elapsed_s=int(max(0.0, assigned - start)), **extra))
         elif not blocked:
-            start, extra = _fp_start(float(requested))
-            out.append(_row(step, start, now=now, critical=critical, **extra))
+            # #6255 A1 : aucune horloge tant qu'une arête bloquante est
+            # ouverte — le lot n'est pas attribuable dans l'intervalle, et
+            # `work assign` le refuserait. Levée, le départ est sa levée.
+            ready = intake_ready_ts(None, requested, dependencies)
+            if ready is not None:
+                start, extra = _fp_start(float(ready))
+                out.append(_row(step, start, now=now, critical=critical,
+                                **extra))
 
     # #3162 : le début mesuré conclut l'étape comme le passage en build, même
     # quand le lot est resté en intake.
@@ -1048,7 +1114,11 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             # prêt. Passé intake sans événement `build` (#1982), la phase est
             # franchie mais non mesurable : aucune ligne, donc aucun retard
             # inventé — seules l'origine réelle et les durées mesurées restent.
-            out.append(_row(step, ready, now=now, critical=critical, **fp_extra))
+            # #6255 A2 : un lot tenu par un exécutant externe (bureau, owner,
+            # système) reste mesuré, sans escalade — le §9 ne vise que des
+            # agents, et l'exécutant agit sans changer l'état du lot (#6241).
+            out.append(_row(step, ready, now=now, critical=critical,
+                            escalate=not external, **fp_extra))
 
     # #5214 : un lot validé dont une dépendance bloquante n'est pas levée ne
     # peut pas fusionner : son attente est celle du bloqueur, pas la sienne, et
@@ -1112,7 +1182,11 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     stopped = current_hold_start(events, state)
     running_now = now if stopped is None else min(now, stopped)
 
-    if kind == "ok" and verdict is not None and jalons.get("verdict_current", True):
+    # #6255 A3 : un dossier d'acte sur `review/**` ne se fusionne pas (canon
+    # §11 bis) ; sa livraison est l'acte. Aucune horloge GO → fusion, donc
+    # aucune escalade de fusion (#6209).
+    if (not act_branch and kind == "ok" and verdict is not None
+            and jalons.get("verdict_current", True)):
         step = step_of("verdict_merge")
         # #2919 : le p80 mesuré remplace la cible de la table sur le chemin
         # normal (escalade ×2/×3 relative à lui). Sans mesure, le repli est la

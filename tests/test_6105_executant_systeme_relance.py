@@ -119,7 +119,7 @@ class ExecutantSystemeRelanceTest(_Base):
         self.assertIn("retired non-agent system", slo)
         self.assertIn("pilot: ", slo)
 
-    def test_l_alerte_slo_porte_le_responsable_puis_le_retrait(self):
+    def test_l_alerte_slo_est_tue_puis_nomme_le_retrait(self):
         self.declare()
         lot = self.reserve()
         # Le lot est « prêt, pas démarré » depuis 2 h : l'étape intake court.
@@ -128,19 +128,21 @@ class ExecutantSystemeRelanceTest(_Base):
             " WHERE id = %s", (2 * HEURE, lot["id"]))
         seuils = _seuils()
         now = time.time()
+        # #6255 A2 : une réservation externe valide est mesurée sans escalade —
+        # le système agit hors de l'état du lot —, aucun `slo_breach` ne part.
         alerts = exploitation.alerts(self.cfg, self.db, now=now, **seuils)
-        slo = next(alert for alert in alerts
-                   if alert.get("type") == "slo_breach"
-                   and alert.get("lot") == lot["id"])
-        self.assertEqual(slo.get("external_responsible"), "human:proprio")
-        self.assertFalse(slo.get("external_retired"))
-        # Retiré, le même lot ne nomme plus de responsable : le pilote agit.
+        self.assertEqual([a for a in alerts
+                          if a.get("type") == "slo_breach"
+                          and a.get("lot") == lot["id"]], [])
+        # Déclaration retirée (#6105) : le système n'existe plus, le pilote
+        # doit lever la réservation ; l'alerte revient et nomme le retrait.
         work.retire_external_executor(
             self.db, "system:ima", actor="human:proprio", cfg=self.cfg)
         alerts = exploitation.alerts(self.cfg, self.db, now=now + 60, **seuils)
         slo = next(alert for alert in alerts
                    if alert.get("type") == "slo_breach"
                    and alert.get("lot") == lot["id"])
+        self.assertEqual(slo.get("external_responsible"), "human:proprio")
         self.assertTrue(slo.get("external_retired"))
         self.assertEqual(slo.get("external_retired_by"), "human:proprio")
 
