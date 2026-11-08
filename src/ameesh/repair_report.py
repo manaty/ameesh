@@ -266,16 +266,20 @@ def window(*, now: Any = None, days: int = DEFAULT_DAYS,
 
 
 # -- lectures (requêtes reproductibles de l'étude) ---------------------------
+#
+# psycopg traite `%` dans une requête paramétrée : un `%` littéral (joker
+# LIKE) s'y écrit `%%`. Le pilote psql (`db.bind`) ne réécrit que `%s` et
+# laisse `%%` au serveur, où deux jokers consécutifs valent le même joker.
 
 _COHORT_SQL = """
     SELECT count(*) AS lots,
-           count(*) FILTER (WHERE source LIKE 'empreinte:%') AS empreinte_lots,
-           count(DISTINCT lower(source)) FILTER (WHERE source LIKE 'empreinte:%')
+           count(*) FILTER (WHERE source LIKE 'empreinte:%%') AS empreinte_lots,
+           count(DISTINCT lower(source)) FILTER (WHERE source LIKE 'empreinte:%%')
                AS empreinte_cles,
            count(*) FILTER (WHERE superseded_by IS NOT NULL) AS remplaces,
-           count(*) FILTER (WHERE title LIKE '%récidive de #%') AS recidives,
-           count(*) FILTER (WHERE source LIKE 'empreinte:%:paquet-horaire:tick:%'
-                              AND title LIKE '%récidive de #%') AS recidives_cle_paquet
+           count(*) FILTER (WHERE title LIKE '%%récidive de #%%') AS recidives,
+           count(*) FILTER (WHERE source LIKE 'empreinte:%%:paquet-horaire:tick:%%'
+                              AND title LIKE '%%récidive de #%%') AS recidives_cle_paquet
       FROM work_items
      WHERE app = %s AND type = 'bug'
        AND created_at >= to_timestamp(%s)
@@ -298,7 +302,7 @@ _OCCURRENCES_SQL = """
       FROM work_item_events e
       JOIN work_items w ON w.id = e.work_item_id
      WHERE w.app = %s
-       AND e.note LIKE 'Empreinte revue%'
+       AND e.note LIKE 'Empreinte revue%%'
        AND e.created_at >= to_timestamp(%s)
        AND e.created_at <  to_timestamp(%s)
 """
@@ -306,7 +310,7 @@ _OCCURRENCES_SQL = """
 _OPEN_DUPLICATES_SQL = """
     SELECT lower(source) AS cle, count(*) AS lots
       FROM work_items
-     WHERE app = %s AND source LIKE 'empreinte:%'
+     WHERE app = %s AND source LIKE 'empreinte:%%'
        AND state NOT IN ('merged', 'promoted', 'delivered', 'closed')
      GROUP BY 1
     HAVING count(*) > 1

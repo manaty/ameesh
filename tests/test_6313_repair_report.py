@@ -417,3 +417,25 @@ class RepairReportDatabaseTest(PgTestCase):
         self.assertEqual(code, 2)
         connect.assert_not_called()
         self.assertIn("error:", err.getvalue())
+
+
+class PsycopgPlaceholderTest(unittest.TestCase):
+    """psycopg refuse un `%` littéral non doublé dans une requête paramétrée.
+
+    Le pilote psql (`db.bind`) ne réécrit que `%s` : ce témoin couvre le
+    pilote normal, que la suite exécute quand psycopg est disponible.
+    """
+
+    def test_chaque_requete_passe_le_parseur_psycopg(self):
+        try:
+            import psycopg
+            from psycopg._queries import PostgresQuery
+        except ImportError:
+            self.skipTest("psycopg absent (pilote psql)")
+        queries = {name: getattr(repair_report, name)
+                   for name in dir(repair_report) if name.endswith("_SQL")}
+        self.assertTrue(queries)
+        for name, sql in queries.items():
+            with self.subTest(name=name):
+                PostgresQuery(psycopg.adapt.Transformer()).convert(
+                    sql, (1,) * sql.count("%s"))
