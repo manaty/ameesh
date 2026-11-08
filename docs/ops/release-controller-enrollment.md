@@ -427,3 +427,17 @@ inattendue, sans DROP OWNED ni suppression de données. Le groupe NOLOGIN partag
 reste en place. Les credentials et le reçu privé `retired.json` restent comme
 preuves ; une opération retirée ne se réactive pas implicitement. Une nouvelle
 opération utilise une nouvelle source privée et de nouveaux noms.
+
+### Lecture bornée des décisions (#6372)
+
+Le paquet livre dans `share/ameesh/sql` le script de rôle et tous ses compagnons :
+`_release-decision.sql`, `_revoke-release-mailbox.sql`,
+`_contrat-release-decision.sql`, `_contrat-mailbox-readers.sql`,
+`release-decision-additive.sql` et `release-decision-cutover.sql`.
+L'enrôleur vérifie leur présence, leur propriétaire root et l'absence de droits
+d'écriture groupe/autres, ainsi que tous leurs parents, avant toute pose.
+La procédure livrée dans `share/ameesh/mise-a-jour/procedures/mailbox-controleur.md`
+décrit l'étape additive avant lancement du nouveau code et le retrait séparé
+à la bascule arrêtée. La continuation n'énumère que les identifiants des demandes
+humaines signées et répondues correspondant exactement à la question précédente,
+via `release_controller_decision_ids(text)` ; elle revalide ensuite chaque preuve.
