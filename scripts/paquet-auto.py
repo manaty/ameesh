@@ -59,6 +59,12 @@ l'ordre, sans agent :
 9. le résultat des tests au corps de la PR et au journal du porteur,
    courrier au pilote.
 
+Un rouge **du contenu** — contrat, test d'une unité, contrôle de gel, types
+clients périmés — sort en `COMPOSITION_RED_RC` (#6272) : le composeur a fait
+son travail, le pilote est prévenu, `paquet-horaire.py` le rapporte sans ouvrir
+de lot d'empreinte §16. La panne du composeur (git, base, poussée, outil
+manquant) reste rc 1 et ouvre seule cette empreinte.
+
 Ce qui reste au pilote, hors de ce script : « verdict non requis », le feu et
 toute fusion sur la cible. Le script ne fusionne jamais la cible et ne déclare
 aucun verdict. La ci-full demandée dès la poussée arme pourtant la fusion
@@ -200,6 +206,11 @@ IN_PROGRESS_RC = 3
 #: #5084 : code de retour d'une tentative arrêtée par une pause posée après son
 #: départ (relue avant de pousser) : rien n'est poussé, tentative non décomptée
 PAUSED_RC = 4
+#: #6272 : code de retour d'un paquet rouge par son **contenu** (contrat, test
+#: d'une unité, contrôle de gel ou types clients) : le composeur a fait son
+#: travail et le pilote est déjà prévenu. Ce n'est pas une panne du composeur,
+#: qui reste rc 1 et ouvre seule un lot d'empreinte §16.
+COMPOSITION_RED_RC = 5
 #: #5084 : sortie du lecteur de pause (Python du projet) quand la pause est active
 PAUSE_ACTIVE_EXIT = 10
 #: #3916 : les remises (`ameesh.resolutions.REF_PREFIX`) et leur copie locale
@@ -365,6 +376,16 @@ class PaquetAutoError(RuntimeError):
     """Un geste du script a échoué ; le message porte l'état atteint."""
 
 
+class CompositionRed(PaquetAutoError):
+    """#6272 : la composition est rouge par son contenu, pas par le composeur.
+
+    Un contrat, un test d'unité, un contrôle de gel ou des types clients
+    rouges : le composeur a fait son travail et le pilote est déjà prévenu.
+    ``main`` sort en ``COMPOSITION_RED_RC`` pour que `paquet-horaire.py` ne
+    l'ouvre pas comme une panne du composeur (§16), qui reste rc 1.
+    """
+
+
 class InputError(PaquetAutoError):
     """Un argument ou un état du dépôt ne permet pas de composer."""
 
@@ -408,11 +429,12 @@ class CompositionBusy(PaquetAutoError):
         super().__init__("composition en cours (%s)" % holder_label(host, pid))
 
 
-class AttributionUnreadable(PaquetAutoError):
+class AttributionUnreadable(CompositionRed):
     """Un rouge de voisin ne peut pas être situé sur les préfixes (#4217).
 
     Aucun retrait automatique : le composeur prévient le pilote et s'arrête,
-    pour qu'un agent lise le journal du porteur.
+    pour qu'un agent lise le journal du porteur. C'est un rouge de composition
+    (#6272), pas une panne du composeur.
     """
 
     def __init__(self, why: str, tests=()):
@@ -3438,7 +3460,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                how or "attribution"))
         return runs, [removal.lot for removal in removals], removals
     if contract_red and not own:
-        raise PaquetAutoError(
+        raise CompositionRed(
             "tests de contrat rouges sur la tête composée (aucune unité retirée "
             "automatiquement : %s) :\n%s"
             % (why or "attribution incertaine", _tail(contract.output)))
@@ -4839,7 +4861,11 @@ def compose_packet(args: argparse.Namespace) -> int:
             freeze_rc, freeze_output, freeze_seconds = run_freeze_checks(
                 worktree, timeout=FREEZE_TIMEOUT)
             if freeze_rc != 0:
-                raise PaquetAutoError(
+                # #6272 : rc 1 = au moins un contrôle rouge (le contenu de la
+                # composition) ; rc 2 = hors d'un arbre ameesh, qui reste une
+                # panne du composeur et ouvre seul l'empreinte §16.
+                error = CompositionRed if freeze_rc == 1 else PaquetAutoError
+                raise error(
                     "freeze-checks rouge sur la tête composée :\n%s"
                     % _tail(freeze_output))
             print("freeze-checks : vert (%.1f s)" % freeze_seconds, flush=True)
@@ -4847,7 +4873,9 @@ def compose_packet(args: argparse.Namespace) -> int:
                 worktree, base_sha, repo=repo, units=composition.units)
             print("types clients : %s" % client_note, flush=True)
             if not client_ok:
-                raise PaquetAutoError(
+                # #6272 : types clients périmés = rouge du contenu, pas du
+                # composeur (le contrôle ne bloque que sur une preuve).
+                raise CompositionRed(
                     "types clients rouges sur la tête composée, avant la CI : %s"
                     % client_note)
             table = composition_table(worktree, base_sha)
@@ -4966,7 +4994,10 @@ def compose_packet(args: argparse.Namespace) -> int:
                         "PR de %s %s pendant les tests par unité : rien n'est "
                         "recomposé, un agent lit" % (branch, state.lower()))
             if recomp >= MAX_RECOMPOSITIONS:
-                raise PaquetAutoError(
+                # #6272 : des tests d'unité encore rouges après le retrait
+                # automatique sont un rouge du contenu, pas une panne du
+                # composeur ; le pilote est prévenu par le tic.
+                raise CompositionRed(
                     "tests locaux encore rouges après recomposition : %s ; "
                     "retrait automatique épuisé, un agent lit les modules"
                     % ", ".join("#%d" % lot for lot in faulty))
@@ -5257,6 +5288,11 @@ def main(argv: list[str] | None = None) -> int:
     except PacketPaused as error:
         print("paquet-auto : %s" % error, file=sys.stderr)
         return PAUSED_RC
+    except CompositionRed as error:
+        # #6272 : paquet rouge par son contenu, pas par le composeur ; le tic
+        # le rapporte au pilote sans ouvrir de lot d'empreinte §16.
+        print("paquet-auto : %s" % error, file=sys.stderr)
+        return COMPOSITION_RED_RC
     except PaquetAutoError as error:
         print("paquet-auto : %s" % error, file=sys.stderr)
         return 1

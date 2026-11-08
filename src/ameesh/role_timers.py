@@ -836,7 +836,10 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
         "--repo ${AMEESH_PAQUET_REPO} --target ${AMEESH_PAQUET_TARGET} "
         "--pilot ${AMEESH_PAQUET_PILOT}" % (binary, role, python, PAQUET_SCRIPT),
         # #5696: exit 3 = stale code, an expected refusal, neither "failed" nor alert
-        "SuccessExitStatus=3",
+        # #6272: exit 5 = packet red by its content (contract, unit test, freeze
+        # check, client types), already mailed to the pilot, not a composer
+        # failure and no §16 fingerprint lot.
+        "SuccessExitStatus=3 5",
         # a composition (local tests included) is bounded to three hours by the script
         "TimeoutStartSec=4h",
         "NoNewPrivileges=yes",

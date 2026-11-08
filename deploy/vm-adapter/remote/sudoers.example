@@ -1,0 +1,3 @@
+# Render VM_OPERATOR with the dedicated non-root VM login before visudo -cf.
+# No wildcard, shell, Python, journalctl, runuser or arbitrary systemctl.
+VM_OPERATOR ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff --no-block

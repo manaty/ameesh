@@ -1893,7 +1893,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
               base_ref: str | None = None, head_ref: str | None = None,
               mode: str = "auto", psql_full: bool = False,
               reuse: bool = False, reuse_detail: str = "",
-              contract_policy="configured") -> dict:
+              contract_policy="configured", project: str = "ameesh") -> dict:
     """The plan of one run; `mode` says which CI this is (canon §3).
 
     `auto` (default): inferred from the event, as before — a pull request
@@ -1914,6 +1914,10 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     les deux plans de parts : la tête a déjà passé la suite complète sur le
     même arbre dans le run `tests` de sa PR de paquet. Partout ailleurs, ou
     sans preuve, le plan ordinaire (suite complète) s'applique.
+
+    #6186 : `project` nomme le projet dont le canon déclare le registre de
+    contrats (`projects.<projet>.contract_selection.registry`) ; il vient de
+    `--project` ou d'`AMEESH_PROJECT`, jamais d'un littéral du moteur.
     """
     now = now or datetime.datetime.now(datetime.timezone.utc)
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
@@ -1987,7 +1991,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         plan["unsure"] = list(plan.get("unsure") or ()) + [contract_problem]
         plan["sure"] = plan["lot_safe"] = plan["phase2_safe"] = False
         plan["phase2_why"] = contract_problem
-    policy = (contract_plan.configured_policy("ameesh")
+    policy = (contract_plan.configured_policy(project)
               if contract_policy == "configured" else contract_policy)
     shared = contract_plan.build(
         repo, plan["tested"], _rev(base, repo), modules,
@@ -2444,6 +2448,9 @@ def main(argv: list[str] | None = None) -> int:
                         "tree on a push to main (#5729); no part is planned")
     p.add_argument("--reuse-detail", default="",
                    help="the proof text (packet, head, tree, run) for the summary")
+    p.add_argument("--project", default=os.environ.get("AMEESH_PROJECT") or "ameesh",
+                   help="project whose canon declares the contract registry "
+                        "(default: $AMEESH_PROJECT, else ameesh)")
     p.add_argument("--github-output", help="appends the job outputs to this file")
     p.add_argument("--summary", help="appends the Markdown summary to this file")
     p.add_argument("--annotations", action="store_true",
@@ -2494,7 +2501,8 @@ def main(argv: list[str] | None = None) -> int:
             plan = make_plan(args.event, card, base=args.base, ref=args.ref,
                              base_ref=args.base_ref, head_ref=args.head_ref,
                              mode=args.mode, psql_full=psql_full,
-                             reuse=reuse, reuse_detail=args.reuse_detail)
+                             reuse=reuse, reuse_detail=args.reuse_detail,
+                             project=args.project)
         except Exception as exc:  # planning must never block the suite
             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
             plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",

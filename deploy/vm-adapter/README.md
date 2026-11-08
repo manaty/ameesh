@@ -222,7 +222,8 @@ pour les autres commandes, sans aucun effet.
 
 SSH tourne en `-F none` et `BatchMode`, avec `StrictHostKeyChecking=yes`,
 `IdentitiesOnly`, sans agent ni transfert. Chaque argv distant est cité
-(`shlex.join`). Une clé à commande forcée côté VM reste recommandée.
+(`shlex.join`). La clé à commande forcée et le compte VM non root sont obligatoires
+(voir « Commandes natives dans la VM »).
 
 - `quiesce` : contrôle fermé en `draining`, aucun `turn_resources` en cours
   sur l'hôte, puis chaque argv distant `quiesce` à 0.
@@ -260,15 +261,129 @@ prévues. Seule `halt` agit sur la VM. Les valeurs de `previous_boot_end` et la
 fin réelle du journal d'un arrêt propre se vérifient au premier cycle mesuré
 par le bureau.
 
-Le côté VM de la sonde (`probe_start` et `probe_receipt`) reste à fournir par
-l'opérateur. Aucun helper natif n'écrit encore ce reçu (#6073) : le contrat
-ci-dessus est celui qu'il doit tenir. `tests/test_6252_vm_commandes.py` joue le
-cycle cloud simulé, sans réseau ni secret, avec le vrai `tick_host` :
-- halt → preuve → poweroff ;
-- sonde en 75 puis 0 sur reçu complet ;
-- reçu ancien refusé ;
-- échec de santé → `draining` ;
-- `systemd-analyze verify` des unités.
+## Commandes natives dans la VM (#6276)
+
+`remote/vm-remote.py` fournit les aides natives `probe-start`, `probe-receipt`,
+`reconcile`, `quiesce`, `runners` et `mail`. Aucun fichier exécutable nommé
+`probe-start` n'est nécessaire : le dispatch de la commande forcée reconnaît
+ces chemins exacts, analyse les argv avec `shlex.split` et appelle le code
+Python correspondant. Il n'évalue jamais la chaîne SSH et ne lance aucun
+shell. L'interpréteur est le Python isolé (`-I`) du venv root existant.
+
+`probe-start` vérifie l'hôte, la persona, le contrôle `returning` fermé,
+la génération, l'époque et l'admission `probe admitted`, sous la garde native.
+Il dépose une demande native idempotente à cette seule persona. Le runner
+existant prend le tour en asynchrone : aucun second runner ni harnais n'est
+créé par SSH, aucun utilisateur agent n'est créé. Un verrou local non bloquant
+sérialise les demandes ; le nonce et l'identifiant du message sont durables.
+Une reprise après dépôt et avant écriture locale retrouve le même message et
+son horodatage original, sans second tour.
+
+`probe-receipt` exige la remise effective du message, son lien natif
+`meta.consigne.turn`, une ressource du tour sur le bon hôte et la bonne
+persona, puis l'accusé exact `VM-PROBE-ACK <nonce>` de cette persona envoyé
+entre remise et fin du tour. La demande indique la commande d'accusé à
+exécuter : `agent-mail send <probe_agent> --ack "VM-PROBE-ACK <nonce>"`.
+L'accusé est adressé à la persona elle-même, dont l'inscription sur cet hôte
+est vérifiée avant le dépôt ; `--ack` ne réveille aucun nouveau tour.
+L'identité d'émission `vm-adapter` ne reçoit aucun courrier et ne nécessite
+aucune inscription comme destinataire. `done`, `ended_at`, l'état final `idle` sans erreur et les trois
+booléens sont nécessaires à `ok`. Livraison seule, nonce/époque/génération
+étrangers ou réadmission plus récente ne donnent jamais `ok`. Un tour fini
+en échec donne `ko`. Les reçus ne contiennent ni corps de courrier, ni DSN,
+ni identifiant de session.
+
+`reconcile` laisse le runner effectuer ses traitements natifs de démarrage
+et périodiques (`report_boot_orphans`, `settle_dead_turns`,
+`reconcile_turn_cgroups`). Il ne rend 0 qu'après une présence du runner sur
+ce retour, fraîche selon `fresh_seconds`, sans ressource `running` ou
+`orphan`, sans identité d'origine déplacée/fencée ni handoff actif.
+Sinon il rend 75, jusqu’à `reconcile_deadline_s` (entier explicite de 1 à
+3600 secondes, depuis `probe admitted` de cette génération/époque) ; à
+l’échéance il refuse (1), sans effet. Il n'appelle pas `ameesh host reconcile` : cette
+commande est destinée à `lost` et peut rouvrir les prises. Aucune ressource
+n'est supprimée ni soldée par l'aide, aucun bail révoqué de force. Le worker
+revérifie génération et relevé sous son verrou avant d'acquitter le retour.
+`quiesce` reste une lecture du contrôle `draining` et des ressources ; il
+ne reprend pas le verrou que le worker tient déjà pendant son appel SSH.
+
+**Préalable sur chaque cible** (#6270, note pilote du 08/11 04:18) :
+activer le journal persistant avant le premier arrêt. Le modèle
+`remote/journald.conf.example` fixe `Storage=persistent` et un
+`SystemMaxUse=128M` d'exemple, à dimensionner par le bureau pour la cible.
+Le bureau pose ce drop-in root non inscriptible par les agents, valide la
+configuration et vérifie après redémarrage que `journalctl --list-boots`
+expose le boot précédent et que sa dernière ligne est lisible par le groupe
+systemd-journal. Sans preuve du boot précédent, la santé refuse : un journal
+volatile ou un simple état SSH silencieux ne remplace pas cette preuve.
+Aucun redémarrage de journald ni changement d'une VM n'a lieu dans ce lot.
+
+Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
+
+1. Choisir un compte VM dédié non root (exemple : `vm-operator`), sans mot de
+   passe utilisable et sans groupe d'agent ni groupe sudo général. Son shell
+   doit permettre à sshd de lancer la commande forcée. Ne pas reprendre le
+   compte des runners. Ne pas copier de clé privée ni de secret cloud dans
+   cette VM. Le compte opérateur du contrôleur et le compte opérateur VM
+   sont deux inscriptions différentes.
+2. Installer code et venv sous `/opt/ameesh-vm-adapter`, root:root, non
+   inscriptibles par le compte VM, les agents, groupe ou autres. Installer
+   `remote/enrollment.example.json` rendu en
+   `/etc/ameesh-vm-adapter/remote.json`, root:vm-operator 0640, et le fichier
+   de connexion JSON désigné, root:vm-operator 0640 ; aucun lien, parents
+   root non inscriptibles. Ce rôle DB doit lire les faits natifs concernés
+   et envoyer le seul courrier de sonde ; le choix et la réduction du rôle
+   effectif sont revus avec le bureau avant activation (#6002).
+3. Créer uniquement `/var/lib/ameesh-vm-remote` sous le compte VM, 0700.
+   Le compte y écrit ses reçus et son verrou, jamais dans le dépôt ni dans
+   les répertoires des agents. Archiver les anciens reçus hors activation
+   lorsque leur vague est révolue ; ne pas enlever celui du retour courant.
+4. Rendre les modèles `remote/authorized_keys.example` et
+   `remote/sshd-match.example` avec la **clé publique** du détenteur opérateur
+   existant et le login retenu. Le fichier de clés et ses parents sont root
+   non inscriptibles par ce login ; sshd refuse mot de passe, terminal,
+   environnement utilisateur et transferts. Les deux commandes forcées
+   sont identiques. Valider avec `sshd -t` avant toute pose. Le parseur
+   refuse toute commande, option, argument ou chemin hors liste.
+5. Rendre `remote/sudoers.example` avec ce seul login et valider
+   `visudo -cf <fichier rendu>`. La seule ligne autorisée est
+   `/usr/bin/systemctl poweroff --no-block`, sans joker ni variante.
+   Ajouter le compte au groupe `systemd-journal` pour lire le boot précédent :
+   aucune règle sudo pour journalctl, Python, shell ou runuser.
+6. Fournir les deux contrôles locaux **réels**, root non inscriptibles,
+   `checks.version-mode` et `checks.doctor`, argv fixes dans `remote.json`.
+   Le premier vérifie la version et le mode effectivement lancés, le second
+   doctor vert ; le dispatch les borne à 5 s, environnement PATH/LANG seul,
+   sorties supprimées. Les chemins d'exemple ne sont pas des contrôles
+   installés : absents, ils refusent. Ils ne doivent jamais être remplacés
+   par `true`. Leur preuve reste exigée par #6002 avant activation.
+7. Reporter le login dans `commandes/cible.json` et conserver les argv du
+   modèle. Faire relire permissions, argv et preuves de santé avant le feu
+   d'activation. Aucune création de compte, pose, commande sudo ou connexion
+   VM n'est exécutée par #6276.
+
+Justification de chaque commande admise par la clé forcée :
+
+| Commande | Effet et privilège |
+| --- | --- |
+| `remote/probe-start <host> <probe> <gen> <epoch> <nonce>` | Dépôt natif idempotent de la sonde admise, non root. |
+| `remote/probe-receipt <nonce>` | Lecture du reçu strict de cette demande, non root. |
+| `remote/quiesce` | Contrôle fermé et absence de ressources en cours, lecture seule. |
+| `remote/reconcile` | Vérification de la fin de la réconciliation native, lecture seule. |
+| `remote/runners` | Même contrôle de présence fraîche du runner et de repos sur ce retour. |
+| `remote/mail` | Même reçu strict que la santé ; un courrier quelconque ne suffit pas. |
+| `remote/version-mode` | Contrôle local version/mode inscrit, non root, borné. |
+| `remote/doctor` | Contrôle doctor inscrit, non root, borné. |
+| `/usr/bin/true` | Disponibilité SSH seulement, aucune preuve de santé. |
+| `/usr/bin/journalctl -b -1 -n 1 -o cat --no-pager` | Dernière ligne du boot précédent, groupe systemd-journal, sans sudo. |
+| `/usr/bin/sudo -n /usr/bin/systemctl poweroff --no-block` | Seul effet privilégié : arrêt de cette VM, après contrôle draining/repos ; le worker détient la garde de vague. |
+
+`tests/test_6276_vm_remote.py` étend le cycle simulé de #6252 avec les
+véritables aides et la base native du banc ; aucun SSH, sudo, cloud ni VM
+réelle. Les cas couvrent le reçu incomplet/étranger, la réadmission,
+l'idempotence, les commandes interdites, l'échec de santé et la réconciliation
+qui garde les prises fermées. Le boot précédent reste à qualifier au premier
+cycle mesuré par le bureau.
 
 ## Contrôle et retour arrière
 

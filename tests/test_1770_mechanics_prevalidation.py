@@ -169,6 +169,21 @@ class ReaderTest(unittest.TestCase):
         self.assertIsNone(default.prevalidation.parts_script)
         self.assertNotIn("parts_script", default.to_dict()["prevalidation"])
 
+    def test_plan_script_is_declared_by_the_block_only(self):
+        """#6186 : le plan d'un autre projet est un outil qu'il déclare."""
+        declared = mechanics.compile_document(_document(_block(
+            plan_script="tools/plan.py")))
+        self.assertEqual(declared.prevalidation.plan_script, "tools/plan.py")
+        self.assertEqual(declared.to_dict()["prevalidation"]["plan_script"],
+                         "tools/plan.py")
+        # absent, la convention (`scripts/test-plan.py`) appartient au consommateur
+        default = mechanics.compile_document(_document(_block()))
+        self.assertIsNone(default.prevalidation.plan_script)
+        self.assertNotIn("plan_script", default.to_dict()["prevalidation"])
+        for value in ("null", "1", "'../x'", "'/abs/x'", "'a\\\\b'"):
+            with self.subTest(value=value), self.assertRaises(mechanics.MechanicsError):
+                mechanics.compile_document(_document(_block(plan_script=value)))
+
     def test_block_and_schema_are_consistent(self):
         with self.assertRaises(mechanics.MechanicsError) as caught:
             mechanics.compile_document(_document(_block(), schema="ameesh-mechanics/1"))
