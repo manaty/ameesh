@@ -217,6 +217,12 @@ class PacketTest(unittest.TestCase):
         self.assertEqual(stored['schema'], prevalidation.REPORT_SCHEMA)
         self.assertEqual(stored['attestation'], report.evidence['attestation'])
         connection.close.assert_called_once()
+        # config.load uses SystemExit for a missing explicit config: optional
+        # persistence must still leave the executed result and journal usable.
+        with mock.patch('ameesh.config.load', side_effect=SystemExit('missing config')), \
+                mock.patch.object(auto, 'note_carrier', return_value='noted') as note:
+            auto.record_contract_result(self.repo, 6185, report, base=self.base, target='main')
+        note.assert_called_once()
 
     def test_state_loss_reads_existing_report_without_a_schema_change(self):
         first = self.run_pass()

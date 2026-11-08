@@ -2325,7 +2325,7 @@ def prepublication_contracts(worktree: Path, *, base: str,
                     now=datetime.now(timezone.utc), max_age_seconds=max_age)
             print("attestation contrats : " + ("réutilisée" if cached else ", ".join(causes)),
                   flush=True)
-        except (OSError, ValueError, PaquetAutoError) as exc:
+        except (OSError, ValueError, PaquetAutoError, SystemExit) as exc:
             context = None
             print("attestation contrats indisponible : " + str(exc), flush=True)
         remaining = int(end - time.monotonic())
@@ -2414,7 +2414,7 @@ def record_contract_result(worktree, carrier, report, *, base, target):
             connection = db.connect(config.load())
             stored = dict(report.evidence, lot=int(carrier))
             prevalidation.record(connection, stored)
-        except Exception as exc:  # storage failure never changes an executed result
+        except (Exception, SystemExit) as exc:  # optional storage never changes an executed result
             print("attestation : rapport non persisté — " + str(exc), flush=True)
         finally:
             if connection is not None:
