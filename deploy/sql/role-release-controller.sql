@@ -17,8 +17,8 @@ SELECT format('GRANT USAGE ON SCHEMA %I TO %I', :'schema', :'role') \gexec
 -- (decisions.require_current); the controller needs SELECT on it, never a
 -- write. This script is the (re)enrollment source, and migration 0527 grants
 -- the same SELECT to controllers already enrolled.
-SELECT format('GRANT SELECT ON %I.agent_registry,%I.agent_mailbox,%I.mesh_approvals,%I.mesh_consumed_nonces,%I.turn_resources,%I.spend_pending,%I.host_release_operations,%I.host_release_fences,%I.host_release_fence_receipts,%I.decision_supersessions TO %I',
-              :'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'role') \gexec
+SELECT format('GRANT SELECT ON %I.agent_registry,%I.mesh_approvals,%I.mesh_consumed_nonces,%I.turn_resources,%I.spend_pending,%I.host_release_operations,%I.host_release_fences,%I.host_release_fence_receipts,%I.decision_supersessions TO %I',
+              :'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'role') \gexec
 SELECT format('GRANT SELECT ON %I.mesh_approvals_status TO %I', :'schema', :'role') \gexec
 -- #4976: absent before 0524, which grants this same SELECT when it runs.
 SELECT format('GRANT SELECT ON %I.schema_non_additive_migrations TO %I', :'schema', :'role')
@@ -30,6 +30,7 @@ SELECT format('GRANT SELECT ON %I.mesh_keys TO %I', :'schema', :'role') \gexec
 SELECT format('GRANT UPDATE(updated_at) ON %I.agent_registry TO %I', :'schema', :'role') \gexec
 SELECT format('GRANT INSERT,UPDATE,DELETE ON %I.host_release_operations,%I.host_release_fences,%I.host_release_fence_receipts TO %I',
               :'schema',:'schema',:'schema',:'role') \gexec
+\ir _release-decision.sql
 DO $audit$
 DECLARE
     r record;
@@ -112,4 +113,5 @@ BEGIN
     END LOOP;
 END
 $audit$;
+\ir _contrat-release-decision.sql
 COMMIT;
