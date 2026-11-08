@@ -19,14 +19,18 @@ marque écrite par le système compte ; une base locale plus récente reste.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import unittest
 from unittest import mock
 
 from ameesh import merge_queue, registry, review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
 from ameesh import storage, work
+from ameesh.mediated_executor import contract
+from ameesh.storage import interface as SI
 
 from .support import PgTestCase
 from .test_2447_review_designation_activation import _Repo
@@ -97,12 +101,15 @@ class StaleCloneMuteForge(PgTestCase):
                    "freeze": {"id": freeze_id, "sha": self.head},
                    "unknown_authors": [], "policy_ref": "", "sent": [],
                    "base": base}
-        storage.of(self.db).work.note(
-            self.lot, "qa", "%s %s" % (pg.mark_prefix(self.lot, freeze_id),
-                                       json.dumps(payload, sort_keys=True)),
-            actor,
-            evidence=(pg.base_evidence(self.lot, freeze_id, self.head, base)
-                      if evidence is True else evidence or None))
+        text = "%s %s" % (pg.mark_prefix(self.lot, freeze_id),
+                          json.dumps(payload, sort_keys=True))
+        if evidence is True:
+            evidence = pg.base_evidence(self.lot, freeze_id, self.head, base)
+        if evidence:
+            storage.of(self.db).work.record_designation_mark(
+                self.lot, "qa", text, actor, evidence)
+        else:
+            storage.of(self.db).work.note(self.lot, "qa", text, actor)
 
     def authors(self):
         authors, _correctors = merge_queue._attribution_on_freeze(
@@ -252,3 +259,31 @@ class DesignationWritesItsBaseTest(StaleCloneMuteForge):
                      freeze_sha=self.head, candidates=candidates,
                      base=base, families=FAMILIES, required=1)
             self.assertEqual(seen[-1].get("base"), expected)
+
+
+class ContractPathCannotProveTest(unittest.TestCase):
+    """#6365 (pilote, 08/11) : la voie médiée (contrat L107) ne pose jamais la
+    preuve ; seul l'écrivain système, hors contrat, l'écrit."""
+
+    def setUp(self):
+        self.c = contract.load()
+
+    def test_note_keeps_its_contract_signature(self):
+        params = list(inspect.signature(SI.WorkItems.note).parameters)
+        self.assertNotIn("evidence", params)
+        self.assertEqual([p.name for p in self.c.get("work.note").params], params[1:])
+
+    def test_work_note_refuses_an_evidence(self):
+        with self.assertRaises(ValueError):
+            self.c.bind("work.note", (1, "qa", "x", pg.SENDER),
+                        {"evidence": pg.base_evidence(1, 1, "a" * 40, "b" * 40)})
+
+    def test_the_system_writer_is_refused_remotely(self):
+        self.assertNotIn("work.record_designation_mark", self.c.operations)
+        self.assertIn("record_designation_mark", self.c.refused["work"])
+        with self.assertRaises(contract.NotSupportedRemotely):
+            self.c.validate_request(
+                contract.OpRequest("work.record_designation_mark",
+                                   (1, "qa", "x", pg.SENDER, {})),
+                route="op", idempotency_key="k")
+

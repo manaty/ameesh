@@ -631,13 +631,16 @@ class PgPort:
             return {"state": "manual", "required": int(required), "reviewers": [],
                     "missing": 0, "why": why, "freeze": freeze}
         base = plan_git.full_commit_id(freeze.get("base"))
-        ops.note(lot, str(rows[0].get("state") or ""),
-                 _mark_note(lot, freeze_id, state=state, required=required,
-                            reviewers=reviewers, missing=missing, why=why,
-                            authors=authors, policy_ref=policy_ref, sha=sha,
-                            sent=deposited, unknown=unknown_authors, base=base),
-                 self.sender,
-                 evidence=base_evidence(lot, freeze_id, sha, base) if base else None)
+        text = _mark_note(lot, freeze_id, state=state, required=required,
+                          reviewers=reviewers, missing=missing, why=why,
+                          authors=authors, policy_ref=policy_ref, sha=sha,
+                          sent=deposited, unknown=unknown_authors, base=base)
+        if base:
+            # #6365 : la preuve passe par l'écrivain système, hors contrat L107.
+            ops.record_designation_mark(lot, str(rows[0].get("state") or ""), text,
+                                        self.sender, base_evidence(lot, freeze_id, sha, base))
+        else:
+            ops.note(lot, str(rows[0].get("state") or ""), text, self.sender)
         return _designation(lot, freeze_id, state=state, required=required,
                             reviewers=reviewers, missing=missing, why=why,
                             authors=authors, policy_ref=policy_ref, sha=sha,

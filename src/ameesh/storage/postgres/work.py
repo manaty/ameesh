@@ -1973,7 +1973,7 @@ class WorkItems(interface.WorkItems):
             " ORDER BY d.resolved_at, d.id" % _DELEGATION_COLUMNS,
             (float(since_ts),))
 
-    def note(self, item_id, state, text, actor, *, once=False, evidence=None) -> None:
+    def note(self, item_id, state, text, actor, *, once=False) -> None:
         if once:
             with self.db.transaction() as tx:
                 rows = tx.query("SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
@@ -1986,6 +1986,15 @@ class WorkItems(interface.WorkItems):
                     return
                 WorkItems(tx).note(item_id, rows[0]["state"], text, actor)
             return
+        self._event(int(item_id), state, text, actor)
+        self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
+                        (int(item_id),))
+
+    def record_designation_mark(self, item_id, state, text, actor, evidence) -> None:
+        """#6365 : la marque et sa preuve structurée ; écrivain système hors
+        du contrat L107, appelé par le port de désignation seul."""
+        if not isinstance(evidence, dict) or not evidence:
+            raise DbError("designation mark without its structured evidence")
         self._event(int(item_id), state, text, actor, evidence=evidence)
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))

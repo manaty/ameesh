@@ -2674,13 +2674,21 @@ class WorkItems(Domain):
         state was set without a journal line)."""
 
     @abc.abstractmethod
-    def note(self, item_id: int, state: str, text: str, actor: str, *, once: bool = False,
-             evidence: dict | None = None) -> None:
+    def note(self, item_id: int, state: str, text: str, actor: str, *, once: bool = False) -> None:
         """Journalise une note et rafraîchit `updated_at`.
 
         `once` sérialise sur le lot et n'insère pas un texte déjà présent.
-        `evidence` (#6365) : preuve structurée d'un écrivain système, jamais
-        posée par une écriture à texte libre.
+        """
+
+    @abc.abstractmethod
+    def record_designation_mark(self, item_id: int, state: str, text: str, actor: str,
+                                evidence: dict) -> None:
+        """#6365 : journalise la marque de désignation avec sa preuve
+        structurée (`work_item_events.evidence`) et rafraîchit `updated_at`.
+
+        Écrivain système du port de désignation seul : hors du contrat de
+        l'exécuteur médié (L107), aucune voie à texte libre (`note`,
+        `work note --actor`) ne pose cette preuve.
         """
 
     @abc.abstractmethod
