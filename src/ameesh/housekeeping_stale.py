@@ -23,7 +23,7 @@ This pass covers those directories:
   key: their directory is `<agent>`, the current one is
   `<agent>~<key>`. A declared key can still be the LIVE route of agents that
   did not migrate (the direct-DSN governance runners): without a newer
-  `<agent>~<other key>` sibling the directory is kept, never treated as
+  `<agent>~<current key>` sibling the directory is kept, never treated as
   dead. For a migrated agent, a whole directory left without any activity
   for `UNOWNED_IDLE_S` (24 h) is removed as a temporary directory whose
   session is over -- under the same guards as any removal (lock, mount
@@ -395,13 +395,15 @@ def _latest(st, now: float) -> float:
     return max(st.st_ctime, st.st_mtime if st.st_mtime <= now else 0.0)
 
 
-def migrated(troot: str, name: str, agent: str, owner: str, *, now: float) -> bool:
-    """True when `agent` has a sibling `<agent>~<other key>` newer than the
-    directory `name`: the agent left the route `owner` and writes in the
-    current one, so `name` is a dead route. A key declared in
-    `former_mesh_keys` may still be the LIVE route of an agent that did not
-    migrate (the direct-route governance runners): without that newer
-    sibling, its directory is kept."""
+def migrated(troot: str, name: str, agent: str, owner: str, key: str,
+             *, now: float) -> bool:
+    """True when `agent` has a sibling `<agent>~<key>` (the CURRENT key of
+    this process) newer than the directory `name`: the agent left the route
+    `owner` and writes in the current one, so `name` is a dead route. A key
+    declared in `former_mesh_keys` may still be the LIVE route of an agent
+    that did not migrate (the direct-route governance runners): without that
+    newer sibling, its directory is kept. Requiring the CURRENT key keeps a
+    homonym of another mesh from counting as a migration."""
     base = agent.split(hk.ALT_SEP, 1)[0]
     path = os.path.join(troot, name)
     try:
@@ -416,7 +418,7 @@ def migrated(troot: str, name: str, agent: str, owner: str, *, now: float) -> bo
         if os.path.islink(full) or not os.path.isdir(full):
             continue
         other = hk.read_owner(troot, sibling)
-        if other is None or other == owner:
+        if other != key:
             continue
         try:
             st = os.lstat(full)
@@ -440,7 +442,7 @@ def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
     # A declared key can still be the live route of an agent that has not
     # migrated: only a newer `<agent>~<other key>` sibling proves the agent
     # left this directory for good (#6258, B mesh-design).
-    live = former and not migrated(troot, name, agent, owner, now=now)
+    live = former and not migrated(troot, name, agent, owner, key, now=now)
     entries: list[dict] = []
     plan: list[dict] = []
     skipped: list[str] = []
