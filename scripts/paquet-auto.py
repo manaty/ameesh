@@ -2235,10 +2235,21 @@ class FlowTestRun(TestRun):
 
     Le flux `ameesh-test-event/1` (lu par `prevalidation.parse_flow`) fait
     foi, pas une sortie unittest : vert = code 0, une fin `succes`, aucun
-    échec ; rouge = un test en échec hors environnement ; le reste (délai,
-    fin absente, échecs d'environnement seuls) est non concluant.
+    échec et **chaque module demandé couvert** par au moins un événement
+    `test` ; rouge = un test en échec hors environnement ; le reste (délai,
+    fin absente, module sans test, échecs d'environnement seuls) est non
+    concluant (B/P2 cx2 : une fin `succes` seule ne prouve rien).
     """
     flow: dict = field(default_factory=dict)
+
+    @property
+    def executed(self) -> set[str]:
+        """Les modules demandés qu'un événement `test` du flux a couverts."""
+        return set(self.modules) & set(self.flow.get("modules") or ())
+
+    @property
+    def unexecuted(self) -> list[str]:
+        return [module for module in self.modules if module not in self.executed]
 
     @property
     def failed_tests(self) -> list[str]:
@@ -2255,7 +2266,8 @@ class FlowTestRun(TestRun):
     def green(self) -> bool:
         return (self.returncode == 0 and self.finished
                 and all(fin == "succes" for fin in self.flow["fins"])
-                and not self.flow.get("failed"))
+                and not self.flow.get("failed")
+                and bool(self.modules) and not self.unexecuted)
 
     @property
     def real_failure(self) -> bool:
@@ -2279,6 +2291,9 @@ class FlowTestRun(TestRun):
             return "délai dépassé"
         if not self.flow.get("fins"):
             return "flux sans fin de part (code %s)" % self.returncode
+        if self.unexecuted:
+            return "module(s) demandé(s) sans test au flux : %s" % ", ".join(
+                self.unexecuted[:3])
         if self.flow.get("environment"):
             return "échecs d'environnement seuls : %s" % ", ".join(
                 self.flow["environment"][:3])
@@ -2646,9 +2661,14 @@ def prepublication_contracts(worktree: Path, *, base: str,
                 elif (child.green and child.finished and not child.inconclusive
                       and not child.skipped and child.tests > 0 and not child.flaky_tests):
                     child_state = "passed"
+                # #6274 : un lanceur déclaré n'atteste que les modules que
+                # son flux a réellement joués ; les autres restent non concluants.
+                played = child.executed if isinstance(child, FlowTestRun) \
+                    else set(child.modules)
                 for module in child.modules:
                     if module in results:
-                        results[module] = child_state
+                        results[module] = child_state if module in played \
+                            else "inconclusive"
             if state == "green" and any(value != "passed" for value in results.values()):
                 state = "inconclusive"
             cached = prevalidation.attest_report({

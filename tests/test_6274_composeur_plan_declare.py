@@ -39,6 +39,8 @@ with open(args.flow, "w") as flow:
         flow.write(json.dumps(dict(schema="ameesh-test-event/1", **fields)) + "\\n")
     event(type="debut", modules=part["modules"])
     for module in part["modules"]:
+        if "SKIP" in Path(module).read_text():
+            continue
         bad = "FAIL" in Path(module).read_text()
         failed = failed or bad
         event(type="test", module=module, test=module + " > pays",
@@ -149,6 +151,55 @@ class DeclaredComposerTest(unittest.TestCase):
         self.assertFalse(run.green)
         self.assertFalse(run.real_failure)
         self.assertTrue(run.inconclusive)
+
+    def test_an_end_without_any_test_is_inconclusive_never_green(self):
+        # B/P2 cx2: a launcher that only writes `fin succes` proves nothing.
+        self.repo.write(MODULE, "test('pay', () => {}) // SKIP\n")
+        self.repo.commit("silent launcher")
+        run = self.passed().run
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(run.flow["fins"], ("succes",))
+        self.assertFalse(run.green)
+        self.assertFalse(run.real_failure)
+        self.assertTrue(run.inconclusive)
+        self.assertIn(MODULE, run.motive())
+
+    def test_a_module_without_a_test_event_is_never_attested(self):
+        # B/P2 cx2: A and B requested, only A played: not green, B not passed.
+        other = "backend/test/refunds.e2e-spec.ts"
+        self.repo.write(other, "test('refund', () => {}) // SKIP\n")
+        self.repo.write(CONTRACT, MODULE + "\n" + other + "\n")
+        self.repo.commit("two contracts, one silent")
+        scope = {
+            "plan": {"modules": [MODULE, other]}, "selection_digest": "1" * 64,
+            "tests": [MODULE, other], "canon_digest": "2" * 64,
+            "registry_digest": "3" * 64, "runner_digest": "4" * 64,
+            "profile": "local-heavy", "drivers": {"driver": "contrats"},
+            "database_schema": "v1", "fixtures": {}, "exclusions": {},
+        }
+        path = Path(_STATE.name, "attestation-6274.json")
+        with mock.patch.object(auto, "contract_attestation_context",
+                               return_value=(scope, path, [], None)):
+            report = self.passed()
+        run = report.run
+        self.assertEqual(run.modules, [MODULE, other])
+        self.assertEqual(run.executed, {MODULE})
+        self.assertEqual(run.unexecuted, [other])
+        self.assertFalse(run.green)
+        self.assertTrue(run.inconclusive)
+        self.assertIsNotNone(report.evidence)
+        self.assertFalse(report.evidence["ok"])
+        self.assertIn(other, report.evidence["missing"])
+        self.assertNotIn(other, report.evidence["modules"])
+        # Defence in depth: even a run read as green attests only what ran.
+        with mock.patch.object(auto.FlowTestRun, "green", new=True), \
+                mock.patch.object(auto, "contract_attestation_context",
+                                  return_value=(scope, path, [], None)), \
+                mock.patch.object(auto, "run_declared_contracts",
+                                  return_value=run):
+            forced = self.passed()
+        self.assertIn(other, forced.evidence["missing"])
+        self.assertIn(MODULE, forced.evidence["modules"])
 
 
 if __name__ == "__main__":
