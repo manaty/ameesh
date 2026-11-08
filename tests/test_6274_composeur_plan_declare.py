@@ -39,12 +39,13 @@ with open(args.flow, "w") as flow:
         flow.write(json.dumps(dict(schema="ameesh-test-event/1", **fields)) + "\\n")
     event(type="debut", modules=part["modules"])
     for module in part["modules"]:
-        if "SKIP" in Path(module).read_text():
+        text = Path(module).read_text()
+        if "SKIP" in text:
             continue
-        bad = "FAIL" in Path(module).read_text()
+        bad = "FAIL" in text
         failed = failed or bad
         event(type="test", module=module, test=module + " > pays",
-              statut="echec" if bad else "succes")
+              statut="echec" if bad else ("saute" if "SAUTE" in text else "succes"))
     event(type="fin", statut="echec" if failed else "succes")
 sys.exit(1 if failed else 0)
 """
@@ -163,6 +164,53 @@ class DeclaredComposerTest(unittest.TestCase):
         self.assertFalse(run.real_failure)
         self.assertTrue(run.inconclusive)
         self.assertIn(MODULE, run.motive())
+
+    def test_a_skipped_test_is_inconclusive_and_never_attested(self):
+        # B/P2 dev3/cx3: a real `test`/`saute` event then `fin succes`, rc 0.
+        self.repo.write(MODULE, "test.skip('pay', () => {}) // SAUTE\n")
+        self.repo.commit("skipped spec")
+        scope = {
+            "plan": {"modules": [MODULE]}, "selection_digest": "1" * 64,
+            "tests": [MODULE], "canon_digest": "2" * 64,
+            "registry_digest": "3" * 64, "runner_digest": "4" * 64,
+            "profile": "local-heavy", "drivers": {"driver": "contrats"},
+            "database_schema": "v1", "fixtures": {}, "exclusions": {},
+        }
+        path = Path(_STATE.name, "attestation-6274-saute.json")
+        with mock.patch.object(auto, "contract_attestation_context",
+                               return_value=(scope, path, [], None)):
+            report = self.passed()
+        run = report.run
+        self.assertEqual((run.returncode, run.flow["fins"], run.flow["tests"]),
+                         (0, ("succes",), 1))
+        self.assertEqual(run.skipped, 1)
+        self.assertEqual(run.executed, set())
+        self.assertFalse(run.green)
+        self.assertFalse(run.real_failure)
+        self.assertTrue(run.inconclusive)
+        self.assertIn("sauté", run.motive())
+        from ameesh.packet_contract_proof import projection
+        self.assertEqual(projection(report, base=self.repo.base,
+                                    target="main")["result"]["state"], "inconclusive")
+        self.assertFalse(report.evidence["ok"])
+        self.assertIn(MODULE, report.evidence["missing"])
+
+    def test_the_local_tests_contract_job_uses_the_declared_launcher(self):
+        # The legacy-publication path (`check_local_tests`) never runs unittest.
+        self.repo.write(MODULE, "test.skip('pay', () => {}) // SAUTE\n")
+        head = self.repo.commit("skipped spec")
+        composition = auto.Composition([], [], head)
+        with mock.patch.object(auto, "_TOOLING", self.tooling), \
+                mock.patch.object(auto, "run_tests",
+                                  side_effect=AssertionError("unittest called")):
+            runs, faulty, removals = auto.check_local_tests(
+                self.worktree, composition, timeout=120, base_sha=self.repo.base,
+                log=lambda _line: None)
+        contract = runs[-1]
+        self.assertIsInstance(contract, auto.FlowTestRun)
+        self.assertEqual(contract.modules, [MODULE])
+        self.assertTrue(contract.inconclusive)
+        self.assertEqual((faulty, removals), ([], []))
 
     def test_a_module_without_a_test_event_is_never_attested(self):
         # B/P2 cx2: A and B requested, only A played: not green, B not passed.

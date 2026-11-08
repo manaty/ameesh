@@ -1764,8 +1764,9 @@ def declared_plan(worktree: Path, tooling: Tooling, *, base: str,
         raise PaquetAutoError("%s absent de l'arbre composé" % tooling.plan_script)
     with tempfile.TemporaryDirectory(prefix="contract-plan-") as temporary:
         output = Path(temporary) / "plan.json"
-        env = dict(os.environ, AMEESH_PROJECT=tooling.project) if tooling.project \
-            else dict(os.environ)
+        env = python_env(worktree)
+        if tooling.project:
+            env["AMEESH_PROJECT"] = tooling.project
         proc = run_command(
             [project_python(worktree), str(script), "plan", "--out", str(output),
              "--event", "workflow_dispatch", "--ref", "", "--base", base,
@@ -2236,16 +2237,20 @@ class FlowTestRun(TestRun):
     Le flux `ameesh-test-event/1` (lu par `prevalidation.parse_flow`) fait
     foi, pas une sortie unittest : vert = code 0, une fin `succes`, aucun
     échec et **chaque module demandé couvert** par au moins un événement
-    `test` ; rouge = un test en échec hors environnement ; le reste (délai,
-    fin absente, module sans test, échecs d'environnement seuls) est non
-    concluant (B/P2 cx2 : une fin `succes` seule ne prouve rien).
+    `test` joué ; rouge = un test en échec hors environnement ; le reste
+    (délai, fin absente, module sans test, test sauté, échecs
+    d'environnement seuls) est non concluant (B/P2 cx2 : une fin `succes`
+    seule ne prouve rien ; B/P2 dev3/cx3 : un `saute` n'est pas joué, §3).
     """
     flow: dict = field(default_factory=dict)
 
     @property
     def executed(self) -> set[str]:
-        """Les modules demandés qu'un événement `test` du flux a couverts."""
-        return set(self.modules) & set(self.flow.get("modules") or ())
+        """Les modules demandés qu'un test joué (non sauté) du flux couvre."""
+        played = self.flow.get("played")
+        if played is None:
+            played = self.flow.get("modules") or ()
+        return set(self.modules) & set(played)
 
     @property
     def unexecuted(self) -> list[str]:
@@ -2266,7 +2271,7 @@ class FlowTestRun(TestRun):
     def green(self) -> bool:
         return (self.returncode == 0 and self.finished
                 and all(fin == "succes" for fin in self.flow["fins"])
-                and not self.flow.get("failed")
+                and not self.flow.get("failed") and not self.skipped
                 and bool(self.modules) and not self.unexecuted)
 
     @property
@@ -2284,13 +2289,15 @@ class FlowTestRun(TestRun):
 
     @property
     def skipped(self) -> int:
-        return 0
+        return int(self.flow.get("skipped") or 0)
 
     def motive(self) -> str:
         if self.timed_out:
             return "délai dépassé"
         if not self.flow.get("fins"):
             return "flux sans fin de part (code %s)" % self.returncode
+        if self.skipped:
+            return "%d test(s) sauté(s) au flux : non joué(s)" % self.skipped
         if self.unexecuted:
             return "module(s) demandé(s) sans test au flux : %s" % ", ".join(
                 self.unexecuted[:3])
@@ -2298,6 +2305,31 @@ class FlowTestRun(TestRun):
             return "échecs d'environnement seuls : %s" % ", ".join(
                 self.flow["environment"][:3])
         return "résultat non concluant (code %s)" % self.returncode
+
+
+def _flow_play(text: str, schema: str) -> dict:
+    """Les tests sautés et les modules réellement joués d'un flux (#6274).
+
+    `parse_flow` compte tout événement `test` ; un `saute` (addSkip de
+    `scripts/test-parts.py`, fin `succes` conservée) n'a rien exécuté.
+    """
+    skipped, played = 0, set()
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("schema") != schema \
+                or event.get("type") != "test":
+            continue
+        if str(event.get("statut") or "") == "saute":
+            skipped += 1
+        elif event.get("module"):
+            played.add(str(event["module"]))
+    return {"skipped": skipped, "played": tuple(sorted(played))}
 
 
 def run_declared_contracts(worktree: Path, modules: list[str], *, end: float,
@@ -2333,8 +2365,9 @@ def run_declared_contracts(worktree: Path, modules: list[str], *, end: float,
             "contract": list(modules)}), encoding="utf-8")
         cmd = [project_python(worktree), str(launcher), "run", "--plan", str(plan),
                "--part", "1", "--driver", DECLARED_PART_LABEL, "--flow", str(flow)]
-        env = dict(os.environ, AMEESH_PROJECT=tooling.project) if tooling.project \
-            else dict(os.environ)
+        env = python_env(worktree)
+        if tooling.project:
+            env["AMEESH_PROJECT"] = tooling.project
         wrapper = shutil.which("ameesh")
         if wrapper:
             cmd = [wrapper, "heavy", "--max-duration", "%ds" % remaining, "--", *cmd]
@@ -2344,6 +2377,7 @@ def run_declared_contracts(worktree: Path, modules: list[str], *, end: float,
         except OSError:
             events = ""
     parsed = prevalidation.parse_flow(events)
+    parsed.update(_flow_play(events, prevalidation.FLOW_SCHEMA))
     if proc is None:
         return save_test_log(FlowTestRun(
             "contrats", list(modules), None,
