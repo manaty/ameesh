@@ -166,7 +166,7 @@
         refusé le tour avant tout appel fournisseur (ameesh-refusal/1), lue
         dans $AMEESH_REFUSAL_FILE ; libère alors la réservation du compte ;
   ameesh release open|check|reason <lot>   release perimeter and validation;
-  ameesh repair-report [--json] [--project P] [--days N] [--start T] [--end T]
+  ameesh repair-report [--json] [--project P] [--days N] [--at T] [--start T] [--end T]
         rapport A1–A12 en lecture seule (étude #6308, unité U1) : compteurs de
         la fenêtre UTC, inconnues déclarées ; alertes ≠ défauts, événements
         ≠ runs ;

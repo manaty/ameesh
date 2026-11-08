@@ -59,6 +59,7 @@ import json
 import sys
 import time
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -222,6 +223,8 @@ LIMITS = {
         "sémantiques ; les liens reconnus sont une borne basse",
         "les récidives de la clé générique du tic paquet peuvent réunir des "
         "causes différentes : une récidive n'est pas une régression démontrée",
+        "doublons_techniques_ouverts reflète l'état courant, pas la fenêtre : "
+        "un rejeu d'une fenêtre passée ne le reproduit pas",
     ),
     "A4": (
         "une proximité temporelle n'est pas une preuve que le correctif "
@@ -234,6 +237,13 @@ LIMITS = {
         "jamais corrélée par défaut",
         "l'hôte vient de data->>'host' quand l'alerte le porte ; sans lui, "
         "aucune portée n'est supposée et la corrélation est inconnue",
+        "journal_view ne lit que le journal staging du jour "
+        "(release_cutoff.read_journal, quotidien) alors que la fenêtre fait "
+        "sept jours : les contradictions antérieures au jour du relevé restent "
+        "invisibles",
+        "une alerte d'il y a six jours est corrélée à la version active au "
+        "moment du rapport (now=at), pas à celle qui était active à son "
+        "observation : inhérent à U4",
     ),
     "A5": (
         "politique absente ou inconnue : aucune nouvelle réparation "
@@ -447,6 +457,8 @@ _STAGING_SQL = """
 #: corrélation A4 (U4). L'identité durable est la clé d'alerte
 #: (`data->>'key'`, sha256 de alert_ack), jamais le texte ; l'hôte et une
 #: éventuelle révision observée sont lus quand l'émetteur les porte.
+#: `_envelopes` regroupe les levées de même clé (occurrence = nombre de
+#: lignes) ; l'ordre chronologique garde la dernière levée comme représentante.
 _SIGNAL_ALERTS_SQL = """
     SELECT data->>'key' AS cle,
            data->>'host' AS hote,
@@ -589,9 +601,15 @@ def _envelopes(rows: Sequence[Mapping[str, Any]],
     Rend `(signaux, portées, refus)` : la portée d'hôte de chaque signal (vide
     quand l'alerte n'en porte pas) et les refus motivés. Un refus n'arrête pas
     le rapport et ne recopie aucun texte de l'alerte.
+
+    Une même clé levée N fois reste **une** enveloppe (identité stable de U2)
+    dont l'`occurrence` vaut N : `signaux_recus` compte les signaux distincts
+    et `signaux_occurrences` les levées. La dernière levée représente
+    l'enveloppe (version observée et hôte les plus récents) ; un champ qu'elle
+    ne porte pas reste inconnu, jamais emprunté à une levée antérieure.
     """
-    signals: list = []
-    scopes: list[list[str]] = []
+    last: dict[str, Any] = {}
+    scopes: dict[str, list[str]] = {}
     refused: Counter = Counter()
     for row in rows:
         observed = _number(row.get("depuis"))
@@ -610,10 +628,15 @@ def _envelopes(rows: Sequence[Mapping[str, Any]],
         except repair_signals.SignalError as exc:
             refused[str(exc)] += 1
             continue
-        signals.append(signal)
+        previous = last.get(signal.id)
+        if previous is not None:
+            signal = replace(signal, occurrence=previous.occurrence + 1)
+        last[signal.id] = signal
         host = row.get("hote")
-        scopes.append([host] if isinstance(host, str) and host.strip() else [])
-    return signals, scopes, refused
+        scopes[signal.id] = ([host] if isinstance(host, str) and host.strip()
+                             else [])
+    signals = list(last.values())
+    return signals, [scopes[signal.id] for signal in signals], refused
 
 
 def _signal_counters(summary: Mapping[str, Any] | None, refused: Counter | None
