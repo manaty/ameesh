@@ -2421,7 +2421,9 @@ class LotBranchTest(unittest.TestCase):
     def test_contract_runs_even_when_nothing_is_impacted(self):
         p = self._plan()
         self.assertEqual(self._ran(p), sorted(self.contract))
-        self.assertEqual(plan.outputs(p)["psycopg_parts"], "1")
+        # #6264: the expanded contracts may require several weighted parts.
+        # The invariant is their complete execution in a nonempty matrix.
+        self.assertGreaterEqual(int(plan.outputs(p)["psycopg_parts"]), 1)
 
     def test_psql_keeps_the_pilot_subset(self):
         # le pilote psql d'une PR reste un sous-ensemble de la sélection
