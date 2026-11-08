@@ -5868,6 +5868,59 @@ class GithubWatch(Domain):
         """#5506: stamp ``reminded_at``, ``escalated_at`` or ``checked_at``."""
 
 
+class RepairSignals(Domain):
+    """#6320: private A1 journal, with atomic per-stream receive/cursor CAS.
+
+    Scope is (project, environment, source), never an implicit environment.
+    Readers project repair-signal/1 fields, ignoring additive storage fields.
+    No remote API is enabled by this interface. Summary exposes counts only.
+    """
+
+    @abc.abstractmethod
+    def state(self, project, environment, source):
+        """Return {cursor, position}; absent stream = {None, 0}."""
+
+    @abc.abstractmethod
+    def receive(self, project, environment, source, entries, *,
+                expected_cursor, next_cursor):
+        """Commit <=1000 validated pending receipts and cursor together.
+
+        False on stale cursor, no receipt writes. Duplicate delivery retains
+        the first envelope and settled outcome; occurrence is max(source
+        count). Invalid batch raises ValueError without moving the cursor.
+        A crash rolls back both; after commit replay is harmless. Calls on
+        an open transaction belong to that outer transaction.
+        """
+
+    @abc.abstractmethod
+    def page(self, project, environment, source, *, after=0, limit=100):
+        """Explicit private read, ordered by transaction-safe stream position.
+
+        Rows: {signal: repair-signal/1, position, outcome_ref}. Resume with
+        the last position, not offsets; a duplicate never gets a new slot.
+        """
+
+    @abc.abstractmethod
+    def settle(self, signal_id, outcome, *, reference='', expected='pending'):
+        """CAS a triage outcome, True iff changed. No lot/decision created.
+
+        lot/basket/decision require a matching typed positive numeric ref
+        (e.g. lot:6320); other outcomes have no ref. No free text accepted.
+        """
+
+    @abc.abstractmethod
+    def refuse(self, project, environment, source, rejection_key, reason):
+        """Idempotent bounded refusal, NEVER advances cursor.
+
+        Key: SHA256 of source identity metadata, never of raw text. Reason:
+        invalid_envelope | unsupported_schema | source_error. No payload.
+        """
+
+    @abc.abstractmethod
+    def summary(self, *, project=None, environment=None, since=None, until=None):
+        """Aggregate counts only, UTC epoch [since,until), for the U1 report."""
+
+
 class FingerprintWatch(Domain):
     """#3885: the resume cursor of the failure-fingerprint pass, per source.
 
@@ -6020,6 +6073,7 @@ class Storage(abc.ABC):
     mailbox: Mailbox
     github_watch: GithubWatch
     fingerprints: FingerprintWatch
+    repair_signals: RepairSignals
     notify_liveness: NotifyLiveness
     wakeups: Wakeups
     keys: Keys

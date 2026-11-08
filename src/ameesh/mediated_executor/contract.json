@@ -4610,7 +4610,8 @@
    "fingerprints": "failure fingerprints watch (#3885): mesh server only, read by the elected role",
    "provider_credits": "crédits du compte fournisseur (#4164) : état partagé du compte, tenu par les runners du mesh ; l'exécuteur médié passe par le relais",
    "veille": "relevé propre à la veille (#4291) : serveur seulement, l'appareil ne lit ni n'écrit le relevé",
-   "turn_observation": "observation des tours et des requêtes (#2167) : document du serveur pour /api/v1, jamais servi à l'exécuteur médié"
+   "turn_observation": "observation des tours et des requêtes (#2167) : document du serveur pour /api/v1, jamais servi à l'exécuteur médié",
+   "repair_signals": "A1 journal privé (#6320) : stockage serveur seulement"
   },
   "operations": {
    "account_windows": [
@@ -5246,6 +5247,14 @@
    ],
    "turn_observation": [
     "read"
+   ],
+   "repair_signals": [
+    "state",
+    "receive",
+    "page",
+    "settle",
+    "refuse",
+    "summary"
    ]
   }
  },
