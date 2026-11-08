@@ -8,7 +8,7 @@
   "ssh": {
     "executable": "/usr/bin/ssh",
     "destination": "192.0.2.10",
-    "user": "operator-account",
+    "user": "vm-operator",
     "port": 22,
     "identity_file": "/etc/ameesh-vm-adapter/ssh/burst-host.key",
     "known_hosts": "/etc/ameesh-vm-adapter/ssh/known_hosts",

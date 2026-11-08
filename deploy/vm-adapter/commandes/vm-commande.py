@@ -37,9 +37,10 @@ as nothing at all; failure is a wait, never an effect.
 - reconcile: closed return only (never opens claims, never forces `lost`),
   then the operator's remote reconciliation commands.
 
-No native receipt helper exists yet (#6073): the remote `probe_start` and
-`probe_receipt` commands are the operator's, and this program fixes the
-receipt contract they must honour (see README, "Commandes par VM").
+The native VM endpoint (#6276), remote/vm-remote.py, implements probe_start,
+probe_receipt and closed reconciliation under a forced SSH command. The
+operator enrolls the VM account and its fixed version/mode and doctor checks
+(see README, "Commandes natives dans la VM").
 """
 from __future__ import annotations
 

@@ -1,0 +1,1 @@
+restrict,command="/opt/ameesh-vm-adapter/venv/bin/python -I /opt/ameesh-vm-adapter/remote/vm-remote.py dispatch" ssh-ed25519 REPLACE_WITH_OPERATOR_PUBLIC_KEY vm-adapter
