@@ -18,13 +18,5 @@
       "/opt/ameesh-vm-adapter/checks/health.py",
       "doctor"
     ]
-  },
-  "health": {
-    "receipt": "/var/lib/ameesh-vm-health/health.json",
-    "producer_uid": 1000,
-    "period_s": 60,
-    "version": "RENDER_INSTALLED_VERSION",
-    "sha": "0000000",
-    "mode": "execute"
   }
 }

@@ -399,12 +399,19 @@ Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
    aucune règle sudo pour journalctl, Python, shell ou runuser.
 6. Conserver les argv fixes `checks.version-mode` et `checks.doctor` du
    modèle : `/usr/bin/python3 -I /opt/ameesh-vm-adapter/checks/health.py`
-   suivi du seul nom de contrôle. Rendre le bloc `health` de `remote.json` :
-   UID numérique réel d'ameesh, reçu partagé, période 60 secondes, version,
-   SHA et mode attendus. Remplacer **toutes** les valeurs d'exemple (le SHA
-   d'exemple n'est pas une version installée). La longueur du SHA doit être
-   celle publiée par les métadonnées `direct_url.json`, comme dans la sonde
-   de staging `vm.sh installe_agents` ; ne pas comparer à un checkout local.
+   suivi du seul nom de contrôle. Rendre `checks/health-reader.example.json`
+   dans `/etc/ameesh-vm-adapter/health-reader.json`, root:vm-operator 0640 :
+   UID numérique réel d'ameesh, reçu partagé, période 60 secondes et chemin
+   stable du venv. Aucun bloc supplémentaire dans `remote.json`, aucune
+   version ni aucun SHA figés dans une carte root. Le lecteur résout
+   `venv-courant` (ou le venv stable avant adoption) et exige la même cible
+   que celle prouvée pour les runners par le producteur. Un changement de
+   cible invalide donc immédiatement le reçu précédent. Les métadonnées
+   version/SHA sont celles de ce venv prouvé, jamais d'un checkout local.
+   La cible du lien et ses parents doivent être observables par vm-operator ;
+   si cet accès est refusé, le contrôle refuse et la pose reste à résoudre
+   avec le bureau, sans ajout automatique de droits ni de sudo.
+   Ce contrôle vérifie la cohérence installée, pas une cible de vague.
 
    Le producteur énumère les unités runners actives via `systemctl --user`
    et exige la liste exacte de sa carte. Pour chaque MainPID actif il appelle
@@ -412,15 +419,17 @@ Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
    pour les processus non dumpables), puis lit sa cmdline, jamais son
    environnement. Le mode `execute` ou `dry-run` vient du `run` vivant et de
    son option `--dry-run`, pas d'une étiquette déclarative staging/prod.
+   Seul le mode observé `execute` peut publier un verdict vert.
    Les métadonnées proviennent du venv ainsi prouvé. Le doctor **complet**
    tourne via `systemd-run --user` avec l'EnvironmentFile d'ameesh, sans
    exposer son contenu. Les MainPID et modes sont revérifiés ensuite ;
    panne, accès refusé ou dépassement de délai ne publient aucun vert.
 
    Le reçu atomique 0640 contient uniquement schéma, boot_id, horodatage,
-   version, SHA, mode, PIDs et verdicts. Les lecteurs refusent un reçu absent,
+   version, SHA, mode, venv résolu, PIDs et verdicts. Les lecteurs refusent un reçu absent,
    illisible, mal formé, d'un autre boot, daté du futur, vieux de plus de
-   trois périodes, ou dont UID, permissions, version/SHA/mode divergent.
+   trois périodes, ou dont UID, permissions, mode ou venv divergent.
+   Version et SHA doivent être présents et valides.
    Doctor exige en plus son verdict vert. Le dispatch borne les lecteurs
    à **5 s**, environnement PATH/LANG seul, sorties supprimées. Un producteur
    tué laisse au plus le reçu précédent jusqu'à son expiration ; une sonde

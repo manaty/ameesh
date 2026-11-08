@@ -58,7 +58,7 @@ def absolute(value):
 
 
 def enrollment(value):
-    if (not isinstance(value, dict) or set(value) - {'health'} != {
+    if (not isinstance(value, dict) or set(value) != {
             'host', 'probe_agent', 'ameesh_config', 'state_dir', 'fresh_seconds',
             'reconcile_deadline_s', 'checks'}):
         raise Refus('invalid remote enrollment')

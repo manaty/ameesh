@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 
-REMOTE = Path('/etc/ameesh-vm-adapter/remote.json')
+REMOTE = Path('/etc/ameesh-vm-adapter/health-reader.json')
 CARD = Path('/etc/ameesh-vm-adapter/health-producer.json')
 BOOT = Path('/proc/sys/kernel/random/boot_id')
 SCHEMA = 'ameesh-vm-health/1'
@@ -38,27 +38,29 @@ def document(path, uid, mode):
 
 
 def health_policy(cfg):
-    policy = cfg['health']
-    if set(policy) != {'receipt', 'producer_uid', 'period_s', 'version', 'sha', 'mode'}:
+    policy = cfg
+    if set(policy) != {'receipt', 'producer_uid', 'period_s', 'venv'}:
         raise ValueError('invalid policy')
     if (type(policy['producer_uid']) is not int or policy['producer_uid'] <= 0
             or type(policy['period_s']) is not int or not 1 <= policy['period_s'] <= 60
-            or not isinstance(policy['receipt'], str)
-            or not Path(policy['receipt']).is_absolute()
-            or '..' in Path(policy['receipt']).parts
-            or not isinstance(policy['version'], str) or not policy['version']
-            or not isinstance(policy['sha'], str)
-            or not re.fullmatch('[0-9a-f]{7,40}', policy['sha'])
-            or policy['mode'] not in ('execute', 'dry-run')):
+            or any(not isinstance(policy[key], str)
+                   or not Path(policy[key]).is_absolute()
+                   or '..' in Path(policy[key]).parts for key in ('receipt', 'venv'))):
         raise ValueError('invalid policy')
     return policy
+
+
+def installed(venv):
+    stable = Path(venv)
+    current = stable.parent / 'venv-courant'
+    return str((current if current.is_symlink() else stable).resolve(strict=True))
 
 
 def check(kind, *, remote=REMOTE, boot=BOOT, now=time.time, reader=document):
     policy = health_policy(reader(remote, 0, 0o640))
     receipt = reader(Path(policy['receipt']), policy['producer_uid'], 0o640)
     if set(receipt) != {'schema', 'boot_id', 'timestamp', 'version', 'sha', 'mode',
-                        'pids', 'version_mode', 'doctor'}:
+                        'pids', 'version_mode', 'doctor', 'venv'}:
         return 1
     stamp = receipt['timestamp']
     if (receipt['schema'] != SCHEMA or receipt['boot_id'] != boot.read_text().strip()
@@ -67,7 +69,11 @@ def check(kind, *, remote=REMOTE, boot=BOOT, now=time.time, reader=document):
             or not isinstance(receipt['pids'], list) or not receipt['pids']
             or any(type(pid) is not int or pid <= 0 for pid in receipt['pids'])
             or receipt['version_mode'] is not True
-            or any(receipt[key] != policy[key] for key in ('version', 'sha', 'mode'))):
+            or receipt['mode'] != 'execute'
+            or not isinstance(receipt['version'], str) or not receipt['version']
+            or not isinstance(receipt['sha'], str)
+            or not re.fullmatch('[0-9a-f]{7,40}', receipt['sha'])
+            or receipt['venv'] != installed(policy['venv'])):
         return 1
     return 0 if kind == 'version-mode' or receipt['doctor'] is True else 1
 
@@ -131,7 +137,7 @@ def produce(*, card=CARD, boot=BOOT, reader=document):
         raise ValueError('explicit runner inventory required')
     end = time.monotonic() + 45
     result = dict(schema=SCHEMA, boot_id=boot.read_text().strip(), timestamp=time.time(),
-                  version='', sha='', mode='', pids=[], version_mode=False, doctor=False)
+                  version='', sha='', mode='', venv='', pids=[], version_mode=False, doctor=False)
     try:
         spec = importlib.util.spec_from_file_location('venv_processus', cfg['verifier'])
         if spec is None or spec.loader is None:
@@ -146,9 +152,10 @@ def produce(*, card=CARD, boot=BOOT, reader=document):
         if active != set(cfg['units']):
             raise ValueError('active runner inventory differs from card')
         before = [runner_state(unit, venv, verifier, end) for unit in cfg['units']]
-        if len({mode for pid, mode in before}) != 1:
-            raise ValueError('mixed runner modes')
-        python = verifier.venv_installe(venv) / 'bin/python'
+        if {mode for pid, mode in before} != {'execute'}:
+            raise ValueError('runner mode is not execute')
+        live = verifier.venv_installe(venv)
+        python = live / 'bin/python'
         # Same direct_url source identity as vm.sh installe_agents, from the
         # venv proven above, never from an arbitrary checkout or stable launcher.
         metadata = json.loads(command([str(python), '-I', '-c',
@@ -161,14 +168,14 @@ def produce(*, card=CARD, boot=BOOT, reader=document):
             sha = source.get('url', '').rsplit('/src-', 1)[-1]
         if not re.fullmatch('[0-9a-f]{7,40}', sha):
             raise ValueError('unproven source SHA')
-        result.update(version=metadata['version'], sha=sha, mode=before[0][1],
+        result.update(version=metadata['version'], sha=sha, mode=before[0][1], venv=str(live),
                       pids=[pid for pid, mode in before])
         command(['/usr/bin/systemd-run', '--user', '--pipe', '--wait', '--quiet',
                  '--property=RuntimeMaxSec=35', '--property=TimeoutStopSec=1',
                  '--property=EnvironmentFile=' + cfg['environment_file'],
                  '--', str(python), '-I', '-m', 'ameesh', 'doctor'], end, capture=False)
         after = [runner_state(unit, venv, verifier, end) for unit in cfg['units']]
-        if before != after:
+        if before != after or verifier.venv_installe(venv) != live:
             raise ValueError('runner changed during health probe')
         result.update(version_mode=True, doctor=True)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError,

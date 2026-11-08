@@ -67,15 +67,15 @@ class ReceiptTest(unittest.TestCase):
         self.boot = self.root / 'boot'
         self.boot.write_text('current-boot\n')
         self.policy = dict(receipt=str(self.root / 'health.json'), producer_uid=1000,
-                           period_s=60, version='1.2.3', sha='a' * 40, mode='execute')
+                           period_s=60, venv=str(self.root))
         self.receipt = dict(schema=health.SCHEMA, boot_id='current-boot', timestamp=1000,
                             version='1.2.3', sha='a' * 40, mode='execute',
-                            pids=[123], version_mode=True, doctor=True)
+                            pids=[123], version_mode=True, doctor=True, venv=str(self.root))
 
     def reader(self, path, uid, mode):
         if str(path) == self.policy['receipt']:
             return self.receipt
-        return {'health': self.policy}
+        return self.policy
 
     def check(self, kind='version-mode'):
         return health.check(kind, boot=self.boot, now=lambda: 1001, reader=self.reader)
@@ -84,16 +84,30 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(self.check(), 0)
         self.assertEqual(self.check('doctor'), 0)
 
-    def test_stale_future_wrong_boot_version_sha_mode_and_bad_types_refuse(self):
+    def test_stale_future_wrong_boot_invalid_metadata_mode_and_bad_types_refuse(self):
         for key, value in (('timestamp', 800), ('timestamp', 1002),
                            ('timestamp', float('nan')), ('timestamp', True),
-                           ('boot_id', 'previous-boot'), ('version', 'old'),
-                           ('sha', 'b' * 40), ('mode', 'dry-run'), ('pids', []),
+                           ('boot_id', 'previous-boot'), ('version', ''),
+                           ('sha', 'invalid'), ('mode', 'dry-run'), ('pids', []),
                            ('pids', [True]), ('version_mode', False),
-                           ('schema', 'other')):
+                           ('schema', 'other'), ('venv', '/previous-venv')):
             with self.subTest(key=key, value=value), mock.patch.dict(self.receipt, {key: value}):
                 self.assertEqual(self.check(), 1)
                 self.assertEqual(self.check('doctor'), 1)
+
+    def test_switching_installed_venv_invalidates_previous_receipt(self):
+        old = self.root / 'old'
+        new = self.root / 'new'
+        old.mkdir()
+        new.mkdir()
+        current = self.root / 'venv-courant'
+        current.symlink_to(old)
+        self.policy['venv'] = str(self.root / 'venv')
+        self.receipt['venv'] = str(old)
+        self.assertEqual(self.check(), 0)
+        current.unlink()
+        current.symlink_to(new)
+        self.assertEqual(self.check(), 1)
 
     def test_doctor_negative_is_never_green(self):
         self.receipt['doctor'] = False
@@ -199,6 +213,40 @@ class ReceiptTest(unittest.TestCase):
         doctor = calls[-1]
         self.assertIn('--property=EnvironmentFile=/private/env', doctor)
         self.assertEqual(doctor[-5:], ['/live-venv/bin/python', '-I', '-m', 'ameesh', 'doctor'])
+
+    def test_producer_rejects_dry_run_and_venv_switch_during_doctor(self):
+        path = self.root / 'health.json'
+        verifier = self.root / 'verifier.py'
+        verifier.write_text('from pathlib import Path\ndef venv_installe(venv): return Path("/live-venv")\n')
+        unit = 'ameesh-runner-agent@probe.service'
+        card = dict(venv='/venv', verifier=str(verifier), units=[unit],
+                    environment_file='/private/env', receipt=str(path))
+        for mode in ('dry-run', 'execute'):
+            modules = []
+
+            def command(argv, end, **kwargs):
+                if 'list-units' in argv:
+                    return json.dumps([dict(unit=unit, active='active')])
+                if '-c' in argv:
+                    return json.dumps(dict(version='1.2.3', source={
+                        'url': 'file:///store/src-' + 'a' * 40}))
+                # Simulate a staging switch while doctor is running.
+                modules[-1].venv_installe = lambda venv: Path('/new-venv')
+                return ''
+
+            original = health.importlib.util.module_from_spec
+            def module(spec):
+                value = original(spec)
+                modules.append(value)
+                return value
+
+            with self.subTest(mode=mode), \
+                    mock.patch.object(health.os, 'geteuid', return_value=1000), \
+                    mock.patch.object(health.importlib.util, 'module_from_spec', side_effect=module), \
+                    mock.patch.object(health, 'command', side_effect=command), \
+                    mock.patch.object(health, 'runner_state', return_value=(123, mode)):
+                self.assertEqual(health.produce(boot=self.boot, reader=lambda *args: card), 1)
+                self.assertFalse(json.loads(path.read_text())['version_mode'])
 
     def test_dispatch_timeout_is_refusal_with_five_second_bound(self):
         spec = importlib.util.spec_from_file_location(
