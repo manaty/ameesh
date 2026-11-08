@@ -23,6 +23,35 @@ class ReleaseDecisionGateTest(PgTestCase):
             input=sql,env=dict(os.environ,PGOPTIONS='-c search_path='+self.schema),
             capture_output=True,text=True,timeout=30)
 
+    def test_additive_alone_preserves_old_and_new_decision_paths(self):
+        # Restore the closed gate in finally for the other tests.
+        role = self.controller_role
+        script = ("\\set role " + role + "\n"
+                  + "\\i " + str(ROOT/'deploy/sql/release-decision-additive.sql') + "\n")
+        # The standalone entry commits; run it twice to prove reinstallation.
+        try:
+            granted = self.sql('GRANT SELECT ON agent_mailbox TO "%s";' % role)
+            self.assertEqual(granted.returncode, 0, granted.stderr)
+            for _ in range(2):
+                result = self.sql(script)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            message_id = self.db.query("INSERT INTO agent_mailbox(sender,recipient,body,kind,payload)"
+                " VALUES('fixture','human:fixture','secret','request',"
+                " '{\"decision\":{\"needs_signature\":true,\"question\":\"same decision\"}}') RETURNING id")[0]['id']
+            result = self.sql('SET ROLE "%s"; DO $check$ BEGIN '
+                'IF NOT EXISTS (SELECT FROM agent_mailbox m '
+                'JOIN release_controller_decision(m.id) d USING (id) '
+                'WHERE m.id=%d AND d.sender=m.sender AND d.recipient=m.recipient '
+                "AND d.payload->'decision'=m.payload->'decision' "
+                'AND d.created_ts=extract(epoch FROM m.created_at)::float8) '
+                "THEN RAISE EXCEPTION 'old/new decision mismatch'; END IF; END $check$;"
+                % (role, message_id))
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            result = self.sql("\\set role " + role + "\n"
+                + "\\i " + str(ROOT/'deploy/sql/release-decision-cutover.sql') + "\n")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_only_signature_request_and_minimal_columns(self):
         ids = []
         for kind, payload in [('request','{"decision":{"needs_signature":true},"private":"hidden"}'),

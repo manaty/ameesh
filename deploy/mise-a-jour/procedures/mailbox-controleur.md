@@ -6,6 +6,24 @@ est non additif. Ne pas poser pendant les coupures de 10:00Z et 22:00Z,
 ni pendant une opération du contrôleur. Le bureau choisit un créneau libre
 et garde les exécuteurs du contrôleur arrêtés pendant la bascule.
 
+## Étape 0 : additive avant atterrissage
+
+Le bureau pose `deploy/sql/release-decision-additive.sql` depuis la tête gelée,
+avant l'atterrissage et avant tout lancement du code #6372 (backend installé,
+stage bootstrap et bibliothèque compris). Utiliser le propriétaire du schéma,
+le search_path du mesh et le paramètre psql `role` du contrôleur déjà enrôlé.
+La transaction idempotente crée le propriétaire NOLOGIN, la fonction et son
+EXECUTE borné ; le SELECT existant du contrôleur reste actif. Les REVOKE
+sur EXECUTE ferment seulement l'endpoint ; aucun SELECT existant n'est retiré.
+
+Le reçu cite le SHA gelé et les SHA-256 réellement posés du script et de son
+inclusion `_release-decision.sql`, ainsi que le chemin/SHA réellement lancé.
+Sur une même décision signée, comparer `decisions.get` et
+`decisions.get_for_controller` : mêmes `view_of` et preuves valides.
+Consigner seulement l'id et les résultats, aucun contenu de décision.
+Le reçu du bureau est une condition d'unhold, en plus du C3 et de la coupure
+du 09/11 à 10:00Z ; unhold par le pilote. Aucune pose centrale par l'auteur.
+
 ## Préparation et essai avant
 
 Identifier la version effectivement exécutée, le schéma et le rôle contrôleur,
@@ -21,11 +39,11 @@ pour le retour arrière.
 ## Pose et essai après
 
 1. Arrêter les services contrôleur et vérifier qu'aucune opération n'est active.
-2. Avec le compte propriétaire du schéma, le search_path du schéma mesh et
-   `ON_ERROR_STOP=1`, exécuter `deploy/sql/role-release-controller.sql` depuis
-   le paquet intégré. Garder les fichiers inclus à côté du script. Le script
-   crée la fonction et son propriétaire NOLOGIN isolé, retire les SELECT de
-   table et de toutes les colonnes et vérifie le contrat, en une transaction.
+2. Avec le propriétaire, le même search_path et le paramètre `role`, exécuter
+   `deploy/sql/release-decision-cutover.sql` depuis le paquet intégré, ses
+   inclusions à côté. Cette transaction distincte retire les SELECT de table
+   et de colonnes, puis vérifie les contrats endpoint et lecteurs LOGIN fermés.
+   L'étape 0 doit déjà avoir réussi.
 3. Installer la version intégrée du contrôleur et de sa bibliothèque ameesh.
    Depuis sa connexion réelle, exécuter `decisions.get_for_controller(db,id)`
    sur la même décision, puis `decisions.verify_proof(db,view)`. Comparer les

@@ -31,6 +31,7 @@ SELECT format('GRANT UPDATE(updated_at) ON %I.agent_registry TO %I', :'schema', 
 SELECT format('GRANT INSERT,UPDATE,DELETE ON %I.host_release_operations,%I.host_release_fences,%I.host_release_fence_receipts TO %I',
               :'schema',:'schema',:'schema',:'role') \gexec
 \ir _release-decision.sql
+\ir _revoke-release-mailbox.sql
 DO $audit$
 DECLARE
     r record;
