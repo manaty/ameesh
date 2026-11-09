@@ -1,17 +1,18 @@
 {
- "auteur": "bureau (BG) pour v1-v2.3 ; ameesh-dev3 (deepseek) pour v2.4",
+ "auteur": "bureau (BG) pour v1-v2.3 ; ameesh-dev3 (deepseek) pour v2.4-v2.5",
  "conserves": [
   "v1",
   "v2",
   "v2.1",
   "v2.2",
-  "v2.3"
+  "v2.3",
+  "v2.4"
  ],
  "delta_v22_v23": [
   "retour-c3-v23.sh (retour-c3-v22-v23.diff)",
   "p6/update-l2-runtime-v32.py (p6/update-l2-runtime-v31-v32.diff)"
  ],
- "demande": "#6532 ; défaut #203817 (09/11 09:45Z)",
+ "demande": "#6532 ; décision pilote #205738 ; défaut #203817 (09/11 09:45Z)",
  "files": {
   ".gitattributes": "b5487bd05eee186396baf1d0e878b80abf08686268bdab0d97f8db5e8dac3f9a",
   "DOSSIER-C3-v1.md": "c88b4306981317948ed0c668b2b50bbc872fbef6178d63b08e08e513025fa7ec",
@@ -74,17 +75,21 @@
   "temoin-v23.sh": "4942cf2330cf3e8432434e9c78736d4841bf3912452a97f07b66b791fc7bd27b",
   "DOSSIER-C3-v24.md": "7a3965699778c55d96afbe9a62103e3453762fed94cfafa61438695d6bdaa342",
   "fenetre-release.sh": "5a94b6cea5fefff1d714855b38a9e3b880c060acd3145bd5d4398d857d4862bc",
-  "temoin-fenetre-release.sh": "8dba75b462389209fc2ea4d25960908c8c068f41b8ac99b6c9ab97ce4d775978"
+  "temoin-fenetre-release.sh": "8dba75b462389209fc2ea4d25960908c8c068f41b8ac99b6c9ab97ce4d775978",
+  "DOSSIER-C3-v25.md": "1298f8b4dea678c490a0076239cd1434d5da64f386d1fd7e354709626f5833fb"
  },
  "gestes": "aucun sur les VM",
  "lot": 6532,
  "note_T60": "DOSSIER-C3-v23-T60-P6.md (commande d'autorité de l'installateur v3.2, dossier seul)",
- "schema": "ameesh-5495-c3-dossier/6",
- "version": "v2.4",
+ "schema": "ameesh-5495-c3-dossier/7",
+ "version": "v2.5",
  "delta_v23_v24": [
   "DOSSIER-C3-v24.md (défaut de séquence #203817 + plan de relève L2 AG2->AG1)",
   "fenetre-release.sh (fermeture/restauration de la fenêtre de release, à blanc par défaut)",
   "temoin-fenetre-release.sh (témoins locaux, faux ssh/systemctl)",
   "sonde-c3-v22.sh (delta : option --release-fermee TS ; case minuterie release seulement)"
+ ],
+ "delta_v24_v25": [
+  "DOSSIER-C3-v25.md (règle du SHA actif de la dernière coupure, décision pilote #205738)"
  ]
 }
