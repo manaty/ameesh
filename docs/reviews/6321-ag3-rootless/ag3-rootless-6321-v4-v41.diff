@@ -1,0 +1,13 @@
+--- ag3-rootless-6321-v4.py	2026-11-09 12:18:43.218196100 +0000
++++ ag3-rootless-6321-v41.py	2026-11-09 18:03:01.107411599 +0000
+@@ -75,8 +75,8 @@
+ # Coupures 10:00Z et 22:00Z : aucune phase de 20 min avant à 90 min après (staging et vm.sh sur AG3).
+ FORBIDDEN = [(9 * 60 + 40, 11 * 60 + 30), (21 * 60 + 40, 23 * 60 + 30)]
+ # O5 (#200904) : fenêtre fixée par mesh-design, après C3 ; --apply refusé hors de celle-ci.
+-WINDOW = (datetime.datetime(2026, 11, 9, 13, 0, tzinfo=datetime.timezone.utc),
+-          datetime.datetime(2026, 11, 9, 15, 30, tzinfo=datetime.timezone.utc))
++WINDOW = (datetime.datetime(2026, 11, 9, 18, 0, tzinfo=datetime.timezone.utc),
++          datetime.datetime(2026, 11, 9, 21, 10, tzinfo=datetime.timezone.utc))  # v4.1 : fenêtre mesh-design #204924
+ PG_PORTS = {'55432', '55441', '55442', '55443'}
+ GUEST_FIREWALL = Path('/etc/ameesh-guest/firewall.nft')
+ UNIT_RE = re.compile(r'ameesh-[A-Za-z0-9_.@:-]+\.(?:service|timer)')
