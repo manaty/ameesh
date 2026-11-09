@@ -244,9 +244,33 @@ def repository(cfg, item: dict) -> Optional[str]:
     return project_repo
 
 
+def project_target(cfg, app: str) -> str:
+    """La cible déclarée du projet, ou "" (#6525).
+
+    Une seule résolution, partagée avec la CLI, `work add`/`branch` et
+    `resolutions` : `intake_neighbors.project_target` lit la configuration
+    compilée des coupures du canon (`release.projects.<p>.target`), puis la
+    cible d'atterrissage de l'hôte (`radar.projects.<p>.target`), puis
+    l'unique branche de base déclarée (`github.projects.<p>.base`). Aucune
+    valeur propre à un client n'est écrite ici (§7).
+    """
+    if cfg is None or not app:
+        return ""
+    try:
+        from ... import intake_neighbors
+        return intake_neighbors.project_target(cfg, app)
+    except Exception:  # noqa: BLE001 - configuration absente ou invalide : aucun défaut
+        return ""
+
+
 def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> Optional[str]:
     """La cible du lot : `branch_target`, puis la cible du projet, puis celle
-    du dépôt (`plan_git.default_target`, `origin/HEAD` ou main/master).
+    du dépôt (`plan_git.default_target`, `ameesh.target` ou `origin/HEAD`).
+
+    #6525 : la cible du projet se lit par la résolution partagée
+    (`project_target`) — la configuration compilée du canon d'abord, comme
+    les releases, puis `radar`, puis la base déclarée du dépôt — jamais
+    `origin/HEAD` pour un projet qui en déclare une.
 
     `declared_only` (#2660) : ne retenir que les cibles **déclarées** — lot,
     projet, puis `git config ameesh.target` — et rendre None sans elles,
@@ -257,15 +281,7 @@ def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> 
     explicit = str(item.get("branch_target") or "").strip()
     if explicit:
         return explicit
-    from ... import radar
-    project = None
-    name = str(item.get("app") or "").strip()
-    if cfg is not None and name:
-        try:
-            project = radar.settings_of(cfg).projects.get(name)
-        except Exception:  # noqa: BLE001 - même repli que `repository`
-            project = None
-    target = str(getattr(project, "target", "") or "").strip() if project is not None else ""
+    target = project_target(cfg, str(item.get("app") or "").strip())
     if target:
         return target
     if declared_only:
@@ -277,6 +293,43 @@ def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> 
         return plan_git.default_target(repo)
     except Exception:  # noqa: BLE001 - dépôt illisible : l'appelant doutera
         return None
+
+
+def target_warning(cfg, item: dict, repo: Optional[str]) -> str:
+    """L'alerte d'un lot existant dont la cible explicite est la branche par
+    défaut du dépôt alors que son projet en déclare une autre, ou "" (#6525).
+
+    La cible explicite n'est jamais réécrite en silence : l'alerte la nomme et
+    donne le geste qui la corrige. `repo` peut manquer (affichage hors clone) :
+    seul `main`/`master`, les replis connus de `plan_git`, sont alors reconnus.
+    """
+    explicit = str(item.get("branch_target") or "").strip()
+    if not explicit:
+        return ""
+    project = project_target(cfg, str(item.get("app") or "").strip())
+    if not project:
+        return ""
+    written = plan_git.short_branch(explicit)
+    declared = plan_git.short_branch(project)
+    if not written or written == declared:
+        return ""
+    default = ""
+    if repo:
+        try:
+            default = plan_git.short_branch(plan_git.repository_default_target(repo) or "")
+        except Exception:  # noqa: BLE001 - dépôt illisible : alerte au mieux
+            default = ""
+    if not default:
+        fallback = {plan_git.short_branch(name) for name in plan_git.DEFAULT_TARGETS}
+        default = written if written in fallback else ""
+    if written != default:
+        return ""
+    return ("lot #%s: branch target %s is the repository default, but project %s "
+            "declares %s; fix it explicitly (`ameesh work branch %s %s --target %s`) "
+            "— nothing was rewritten silently"
+            % (item.get("id") or "?", explicit, item.get("app") or "?",
+               project, item.get("id") or "?", item.get("branch") or "<branch>",
+               project))
 
 
 def _landing_ref(repo: str, target: str) -> str:
