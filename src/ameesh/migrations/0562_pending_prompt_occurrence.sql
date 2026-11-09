@@ -23,7 +23,11 @@
 -- rejoue les deux transports que l'ancien code ne fait pas : consigne
 -- consommée → tour courant, tour restauré → consigne en attente. Une
 -- nouvelle mise en attente de l'ancien code reçoit ainsi une occurrence
--- neuve : deux « continue » successifs ne partagent plus la même clé.
+-- neuve : deux « continue » successifs ne partagent plus la même clé. Il
+-- distingue l'enrichissement d'une demande (le texte reprend le tour courant
+-- ou se termine par l'attente existante : l'identité se conserve) du
+-- remplacement direct de l'attente (`set_pending_prompt` sur un texte
+-- indépendant : demande neuve, occurrence neuve).
 alter table agent_registry add column if not exists pending_prompt_id uuid;
 alter table agent_registry add column if not exists current_prompt_id uuid;
 
@@ -32,8 +36,27 @@ update agent_registry set pending_prompt_id = gen_random_uuid()
 
 create or replace function ameesh_agent_prompt_occurrence() returns trigger
 language plpgsql as $$
+declare
+    -- le nouvel écrivain N-1 a-t-il composé le texte à partir de l'ancien ?
+    enriched boolean := false;
 begin
     if tg_op = 'UPDATE' then
+        -- Un écrivain N-1 qui enrichit une demande (restore, R5, brief de
+        -- relève, adoption, reprise) compose le nouveau texte À PARTIR de
+        -- l'ancien : il reprend le tour courant, ou se termine par l'attente
+        -- déjà posée. Un simple remplacement (`set_pending_prompt`) pose un
+        -- texte indépendant, même quand une attente existait.
+        if new.pending_prompt is not null
+           and new.pending_prompt is distinct from old.pending_prompt then
+            if new.current_prompt is null and old.current_prompt is not null
+               and strpos(new.pending_prompt, old.current_prompt) > 0 then
+                enriched := true;
+            elsif old.current_prompt is null and old.pending_prompt is not null
+                  and right(new.pending_prompt, length(old.pending_prompt))
+                      = old.pending_prompt then
+                enriched := true;
+            end if;
+        end if;
         -- N-1 `take_pending_prompt` : la consigne consommée passe du registre
         -- au tour courant sans écrire l'identité ; elle suit le texte.
         if new.pending_prompt is null and old.pending_prompt is not null
@@ -41,15 +64,20 @@ begin
            and new.current_prompt_id is not distinct from old.current_prompt_id then
             new.current_prompt_id := old.pending_prompt_id;
         end if;
-        -- N-1 `restore_prompt` (et R5, redémarrage, adoption, reprise) : un
-        -- tour inachevé repart en attente, éventuellement joint à une consigne
-        -- déjà posée. Le texte change et l'écrivain n'a pas renouvelé
-        -- l'identité : celle du tour courant prime, comme dans le code neuf.
-        if new.current_prompt is null and old.current_prompt is not null
-           and new.pending_prompt is not null
-           and new.pending_prompt is distinct from old.pending_prompt
+        -- Enrichissement : le tour inachevé repart en attente, éventuellement
+        -- joint à une consigne déjà posée, et garde son identité.
+        if enriched and new.current_prompt is null and old.current_prompt is not null
            and new.pending_prompt_id is not distinct from old.pending_prompt_id then
             new.pending_prompt_id := old.current_prompt_id;
+        end if;
+        -- N-1 `set_pending_prompt` : la consigne remplace l'attente sans en
+        -- dériver ; c'est une demande neuve, elle ouvre son occurrence (sans
+        -- quoi deux demandes distinctes partageraient la clé du journal).
+        if not enriched
+           and new.pending_prompt is not null and old.pending_prompt is not null
+           and new.pending_prompt is distinct from old.pending_prompt
+           and new.pending_prompt_id is not distinct from old.pending_prompt_id then
+            new.pending_prompt_id := gen_random_uuid();
         end if;
     end if;
     -- une demande en attente a toujours une occurrence (écrivain N-1)

@@ -560,6 +560,35 @@ class PreviousWriterOccurrenceTest(PgTestCase):
                                           "continue\n\nsuite", occurrence))
 
 
+    def test_an_old_replacement_of_a_pending_request_renews_the_occurrence(self):
+        """Le scénario du B #204799 : le remplacement N-1 d'une attente non
+        nulle est une demande neuve, pas un enrichissement."""
+        self.old_enqueue("continue")
+        self.old_take()
+        self.old_enqueue("suite")
+        restored = self.old_restore()
+        self.assertEqual(restored["pending_prompt"], "continue\n\nsuite")
+        previous = str(restored["pending_prompt_id"])
+        # l'ancien `set_pending_prompt` remplace le texte sans toucher aux ids
+        replaced = self.old_enqueue("nouvelle demande")
+        self.assertEqual(replaced["pending_prompt"], "nouvelle demande")
+        self.assertTrue(replaced["pending_prompt_id"])
+        self.assertNotEqual(str(replaced["pending_prompt_id"]), previous)
+        self.assertNotEqual(
+            repair_retry.runner_retry_key(PROJECT, self.agent,
+                                          "continue\n\nsuite", previous),
+            repair_retry.runner_retry_key(PROJECT, self.agent,
+                                          "nouvelle demande",
+                                          replaced["pending_prompt_id"]))
+
+    def test_an_old_replacement_of_an_unconsumed_request_renews_it(self):
+        first = self.old_enqueue("continue")
+        second = self.old_enqueue("autre consigne")
+        self.assertEqual(second["pending_prompt"], "autre consigne")
+        self.assertNotEqual(str(second["pending_prompt_id"]),
+                            str(first["pending_prompt_id"]))
+
+
 class RunnerRetryJournalStorageTest(PgTestCase):
     """Le journal réel : deux détenteurs, une tentative, issues terminales.
 
