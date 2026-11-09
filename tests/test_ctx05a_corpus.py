@@ -157,6 +157,56 @@ class CorpusLineTest(unittest.TestCase):
         with self.assertRaises(context_corpus.CorpusError):
             context_corpus.validate_line(broken)
 
+    def test_serie_par_etape_recopiee_et_validee(self):
+        series = {
+            "steps": 3,
+            "C_first": measure(30000),
+            "dC_max": measure(40000),
+            "dC_max_rank": 2,
+        }
+        line = build(context_extra={"series": series})
+        self.assertEqual(line["series"], series)
+        self.assertEqual(context_corpus.validate_line(line), line)
+
+    def test_serie_absente_reste_nulle_avec_raison(self):
+        line = build()
+        self.assertIsNone(line["series"]["steps"])
+        self.assertIsNone(line["series"]["C_first"]["value"])
+        self.assertIn("not_published", line["series"]["C_first"]["reasons"])
+        self.assertIsNone(line["series"]["dC_max"]["value"])
+        self.assertIn("not_published", line["series"]["dC_max"]["reasons"])
+        self.assertIsNone(line["series"]["dC_max_rank"])
+        context_corpus.validate_line(line)
+
+    def test_serie_incomplete_ou_hors_liste_blanche_refusee(self):
+        line = build(context_extra={"series": {
+            "steps": 3,
+            "C_first": measure(30000),
+            "dC_max": measure(40000),
+            "dC_max_rank": 2,
+        }})
+        for broken in (
+            # clé hors liste blanche
+            {"series": dict(line["series"], prompt="secret")},
+            # champ manquant : un objet partiel ne se lit pas comme une absence
+            {"series": {key: value for key, value in line["series"].items()
+                        if key != "dC_max_rank"}},
+            # un rang sans croissance n'a pas de sens
+            {"series": dict(line["series"],
+                            dC_max=measure(None, quality="unknown",
+                                           reasons=["no_growth"]))},
+            # un rang de croissance commence au deuxième appel
+            {"series": dict(line["series"], dC_max_rank=1)},
+            # une croissance sans rang, ou un rang après la dernière étape
+            {"series": dict(line["series"], dC_max_rank=None)},
+            {"series": dict(line["series"], dC_max_rank=4)},
+        ):
+            with self.subTest(broken=broken):
+                candidate = json.loads(json.dumps(line))
+                candidate.update(broken)
+                with self.assertRaises(context_corpus.CorpusError):
+                    context_corpus.validate_line(candidate)
+
     def test_aucun_texte_de_la_charge_ne_fuit(self):
         source = payload()
         source["prompt"] = "ne doit jamais entrer dans le corpus"

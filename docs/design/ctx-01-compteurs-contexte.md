@@ -2,9 +2,9 @@
 
 | Champ | Valeur |
 |---|---|
-| **Version** | `ameesh-context/1`, révision 3 |
+| **Version** | `ameesh-context/1`, révision 4 |
 | **Statut** | proposition soumise à relecture ; stable à la fusion après verdict |
-| **Date** | 2026-10-29 ; révision 2 du 2026-11-06 (`compact_tokens`) ; révision 3 du 2026-11-06 (`C_peak`, compactions Codex) |
+| **Date** | 2026-10-29 ; révision 2 du 2026-11-06 (`compact_tokens`) ; révision 3 du 2026-11-06 (`C_peak`, compactions Codex) ; révision 4 du 2026-11-09 (série par étape, #6433) |
 | **Source** | plan `e18` (CTX-01), `conversation:smichea:2026-10-17:roadmap-gestion-contexte` ; découpage #4510 |
 | **Base de code** | `main` `a02b97c9b` (release 1.29.0) ; canon appliqué `5a488730` |
 | **Classe** | légère (documentation/contrat), avis d'une autre famille, pas de CI lourde |
@@ -84,6 +84,24 @@ valeur supposée.
 | `R_session` | entrées cumulées de la session | jetons | session courante | cumul des `R_turn` de la session | même convention que `R_turn` ; l'alerte résidente L81 mesure `R_session_L81` (cache écrit inclus), cas distinct (§5.3) | nouvelle session / rotation | jamais la somme de relevés cumulés | `null` sans session ou sans tour mesuré ; pas de reprise d'une valeur supposée |
 | `W` | fenêtre du modèle effectif | jetons | profil `(modèle, harnais, version, mode, rôle)` | métadonnée runtime du harnais (ex. `modelUsage.contextWindow`, `modelContextWindow`, `usage_update.size`) | sans objet | changement de profil ; redémarrage si la métadonnée n'est pas re-annoncée | une entrée = un modèle ; ne pas sommer plusieurs modèles | `null` + `window_unknown` ; jamais une fenêtre auxiliaire ou précédente |
 | `S_hist` | taille legacy de session (`session_max_tokens`) | jetons | session courante | grand livre `turn_costs` (`sum(input_tokens + output_tokens)`) ; compteur vivant de même somme | **hétérogène** : Claude/DeepSeek entrée non cachée ; Codex entrée cache inclus ; cache écrit exclu | nouvelle session / rotation ; relue du grand livre à la reprise du worker | Codex : côté compteur vivant, dernier relevé cumulé du fil (max), jamais la somme des relevés ; côté grand livre, somme des deltas par tour, qui donne le même total ; autres : somme des tours | `null` sans tour inscrit ; seuil : canon par harnais, sinon valeur commune |
+
+**Série par étape (#6433, optionnelle).** Le document publie en plus un bloc
+`series` pour les harnais qui donnent l'usage de **chaque** appel dans le flux
+(dsh/ACP par `status`/`step_end`, Claude par message dédupliqué). Il ne
+remplace aucune mesure principale : il rend lisible la **forme** de la
+croissance, que `C_peak` et `R_turn` seuls ne peuvent pas distinguer.
+
+| Champ | Contenu |
+|---|---|
+| `steps` | nombre d'appels retenus du fil principal (entier, `0` sans appel observé, `null` + `no_step_stream` quand le harnais ne publie pas l'usage par appel dans son flux, cas de `codex exec`) ; un tour borné en mémoire (`counts.dropped` > 0) ne garde que les appels retenus, donc un minorant |
+| `C_first` | contexte du **premier** appel du fil principal, même convention que `C_last` ; `null` + `no_call` sans appel |
+| `dC_max` | plus forte **croissance positive** de `C_last` entre deux appels successifs ; une baisse (compaction) n'est pas une croissance ; `null` + `no_growth` sans croissance positive, `no_successive_calls` avec moins de deux appels, `context_unknown` si aucune paire n'est lisible ; `partial` quand une paire est illisible, le maximum connu étant alors un minorant |
+| `dC_max_rank` | rang 1-based de l'appel qui termine cette croissance (celui dont le contexte est le plus grand) ; `null` sans croissance |
+
+Le journal Codex n'alimente pas la série : il ne porte pas la chronologie des
+appels, seulement le pic du tour. Une valeur absente reste `null` avec sa
+raison (§2.4), jamais `0`. Le corpus de rejeu recopie le bloc quand il est
+publié ; un corpus antérieur le laisse `null` avec `not_published`.
 
 #### Temps et coût
 
@@ -643,6 +661,8 @@ devient jamais une valeur par défaut silencieuse.
 | `ameesh-context/1` r2 | 2026-11-06 | #6040 : seuil de compaction native Codex par agent (`compact_tokens`, §4.1) ; `policy.compact_tokens` dans `turn.context` et le corpus |
 | `ameesh-context/1` r3 | 2026-11-06 | #6044 : `C_peak` (pic d'entrée du tour) ; compactions Codex lues au journal (`compacted`, `context_compacted`) et au résident (`thread/compacted`, `contextCompaction`) ; `compaction.count` |
 | `ameesh-context-corpus/1` r2 | 2026-11-06 | #6044 : `C_peak` (optionnel en lecture) et `decision.compaction.count` |
+| `ameesh-context/1` r4 | 2026-11-09 | #6433 : `series` par étape (`steps`, `C_first`, `dC_max`, `dC_max_rank`) pour les harnais à usage par étape ; additif, optionnel en lecture |
+| `ameesh-context-corpus/1` r3 | 2026-11-09 | #6433 : `series` optionnel, recopié du `turn.context` ; `not_published` sur un événement antérieur |
 
 ---
 
@@ -672,6 +692,7 @@ raison, jamais `0` (§2.4).
 | `W` | fenêtre du modèle effectif : `value`, `quality`, `reasons`, `granularity`, `source` (provenance runtime) |
 | `auxiliary_models` | modèles auxiliaires observés (jamais utilisés pour `W`) |
 | `C_last`, `C_peak`, `O_last`, `C_next_input`, `C_next`, `R_turn`, `R_session`, `R_session_base`, `O`, `S_hist`, `cache_read_tokens`, `cache_write_tokens` | mesures au même format `{value, quality, reasons, granularity, source}` ; `C_peak` est le pic d'entrée du tour (#6044, absent `null` sur un événement antérieur) ; `R_session_base` est le cumul de relecture **avant** le tour |
+| `series` | série par étape du fil principal (#6433) : `steps` (entier ou `null`), `C_first` et `dC_max` (mesures au même format), `dC_max_rank` (entier ≥ 2 ou `null`) ; **optionnel**, un corpus antérieur le laisse `null` avec `not_published` |
 | `decision` | décision **observée** : `observed` ∈ `none`/`close`/`rotation`/`compaction`, `cause` normalisée, `compacted` (vrai si une compaction est publiée, `null` sinon), et les blocs `close`, `rotation`, `compaction`, `window` ; `compaction.observed`/`requested` séparent la réussite de la demande, `compaction.count` donne le nombre de compactions du tour (#6044) |
 | `policy` | politique en vigueur au tour : `session`, `context_max_tokens`, `session_max_tokens`, budgets opt-in, part d'entretien, seuil de compaction native `compact_tokens` (#6040) |
 | `legacy` | les onze compteurs legacy publiés à côté des mesures |
