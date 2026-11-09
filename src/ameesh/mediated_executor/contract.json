@@ -5255,7 +5255,15 @@
     "page",
     "settle",
     "refuse",
-    "summary"
+    "summary",
+    "retry_request",
+    "retry_begin",
+    "retry_engage",
+    "retry_settle",
+    "retry_avoid",
+    "retry_get",
+    "retry_attempts",
+    "retry_summary"
    ]
   }
  },
