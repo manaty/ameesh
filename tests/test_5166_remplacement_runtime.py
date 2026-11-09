@@ -65,6 +65,12 @@ def thaw(path):
 
 
 class Harness(fixture.Fixture, support.PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.release_decision import install_decision_gate
+        install_decision_gate(cls)
+
     def sign(self, view, text):
         option = decisions.match_option(view, text)
         digest = decisions.answer_digest(view, text, option, 'human:fixture-owner')
