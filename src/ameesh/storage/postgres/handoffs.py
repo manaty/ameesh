@@ -435,10 +435,14 @@ class Handoffs(interface.Handoffs):
                               (op["source"],op["target"],plan["canon"],plan["canon_revision"]))
             if {r["host"] for r in states} != {op["source"],op["target"]}:
                 return None
+            # #6487 : la consigne de bascule est une demande ; elle ouvre une
+            # occurrence si l'attente était vide, sinon garde celle qu'elle
+            # enrichit (même demande reprise par le nouvel hôte).
             tx.execute("UPDATE agent_registry SET host=%s,cwd=%s,lease_owner=NULL,lease_expires_at=NULL,"
                        " lease_epoch=lease_epoch+1,session_id=NULL,session_account=NULL,session_work_item=NULL,"
                        " session_reset_at=clock_timestamp(),placement_ok=NULL,placement_profile=NULL,"
                        " pending_prompt=concat_ws(E'\\n\\n',%s::text,pending_prompt),"
+                       " pending_prompt_id=coalesce(pending_prompt_id,gen_random_uuid()),"
                        " status='queued',status_text='host handoff',updated_at=now() WHERE name=%s",
                        (op["target"], cwd, brief, op["agent"]))
             return Handoffs(tx).transition(operation, "session_ready", "switched",

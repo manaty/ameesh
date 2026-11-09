@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from tests import support  # noqa: F401 — environnement isolé du poste
@@ -85,6 +86,11 @@ elif args[0] == "stop":
     operation("stop")
     if scenario() == "stop-fails":
         sys.exit(1)
+    if scenario() in ("stop-hangs", "sigterm-ignored"):
+        # #6537 : un tour long ; le client `systemctl stop` attendrait
+        # TimeoutStopSec (35 min) ; poste.sh le borne par `timeout`.
+        time.sleep(60)
+        sys.exit(0)
     if scenario() == "still-active":
         sys.exit(0)       # l'unité n'a pas atteint le point sûr
     vivante = etat()
@@ -98,6 +104,20 @@ elif args[0] == "stop":
         final = ["inactive", "0"]
     with open(os.path.join(state, "unit"), "w") as fh:
         fh.write(" ".join(final) + "\n")
+elif args[0] == "kill":
+    # #6537 : arrêt forcé borné. `stop-hangs` : le second SIGTERM arrête le
+    # tour ; `sigterm-ignored` : seul le SIGKILL au groupe en vient à bout
+    # (unité `failed`, cgroup vide).
+    qui = [a for a in args if a.startswith("--kill-who=")][0].split("=", 1)[1]
+    operation("kill-" + qui)
+    final = None
+    if qui == "main" and scenario() == "stop-hangs":
+        final = "inactive 0"
+    elif qui == "all" and scenario() == "sigterm-ignored":
+        final = "failed 0"
+    if final:
+        with open(os.path.join(state, "unit"), "w") as fh:
+            fh.write(final + "\n")
 elif args[0] == "reset-failed":
     operation("reset-failed")
     if scenario() == "reset-fails":
@@ -573,6 +593,75 @@ class RestartLeaseTest(unittest.TestCase):
                 self.assertIn("retour", proc.stderr)
                 self.assertNotIn("dev9 : redémarré", proc.stdout)
 
+    def test_failed_sans_processus_est_un_arret_prouve(self):
+        """#6528/#6537 : un stop qui finit `failed` (SIGKILL, délai d'arrêt) sans
+        processus restant dans le cgroup prouve le point sûr (poste.sh et vm.sh) : l'échec est
+        effacé APRÈS l'arrêt, puis l'unité démarre — pas d'échec d'hôte."""
+        with open(os.path.join(self.state, "stop_mode"), "w", encoding="utf-8") as fh:
+            fh.write("failed-vide\n")
+        proc = self.restart("lease")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        stop = self.op_position("stop")
+        cgroup = self.op_position("show ControlGroup", after=stop)
+        reset = self.op_position("reset-failed")
+        self.assertLess(stop, cgroup)
+        self.assertLess(cgroup, reset)
+        self.assertLess(reset, self.op_position("start"))
+        self.assertIn("aucun processus restant — arrêt prouvé", proc.stdout)
+        self.assertIn("dev9 : redémarré", proc.stdout)
+
+    def forcer(self, mode):
+        with open(os.path.join(self.state, "stop_mode"), "w", encoding="utf-8") as fh:
+            fh.write(mode + "\n")
+        env = dict(self.env, ARRET_BORNE="1", ARRET_FORCE_BORNE="2")
+        with open(os.path.join(self.state, "scenario"), "w", encoding="utf-8") as fh:
+            fh.write("lease")
+        debut = time.monotonic()
+        proc = subprocess.run(["bash", SCRIPT, "redemarrer"], env=env,
+                              capture_output=True, text=True, timeout=300)
+        return proc, time.monotonic() - debut
+
+    def test_tour_long_borne_puis_second_sigterm(self):
+        """#6537 : un tour plus long que ARRET_BORNE ne retient pas le poste
+        TimeoutStopSec (35 min) : le client stop est borné, puis le second
+        SIGTERM au processus principal arrête le tour ; l'arrêt est prouvé et
+        l'unité démarre, sans SIGKILL."""
+        proc, duree = self.forcer("stop-hangs")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertLess(duree, 30, "le stop n'est pas borné")
+        stop = self.op_position("stop")
+        kill = self.op_position("kill-main", after=stop)
+        self.assertIsNotNone(kill, proc.stdout + proc.stderr)
+        self.assertIsNone(self.op_position("kill-all"))
+        self.assertLess(kill, self.op_position("start"))
+        self.assertIn("second SIGTERM", proc.stderr)
+        self.assertIn("dev9 : redémarré", proc.stdout)
+
+    def test_sigterm_ignore_sigkill_puis_failed_a_cgroup_vide(self):
+        """#6537 : un runner qui ne sort pas au second SIGTERM reçoit SIGKILL
+        au groupe ; `failed` à cgroup vide prouve alors l'arrêt (pas d'échec
+        d'hôte), l'échec est effacé avant le démarrage."""
+        proc, duree = self.forcer("sigterm-ignored")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertLess(duree, 30, "l'arrêt forcé n'est pas borné")
+        main = self.op_position("kill-main")
+        tout = self.op_position("kill-all", after=main)
+        self.assertIsNotNone(tout, proc.stdout + proc.stderr)
+        cgroup = self.op_position("show ControlGroup", after=tout)
+        reset = self.op_position("reset-failed", after=tout)
+        self.assertLess(cgroup, reset)
+        self.assertLess(reset, self.op_position("start"))
+        self.assertIn("aucun processus restant — arrêt prouvé", proc.stdout)
+
+    def test_bornes_invalides_refusees(self):
+        """#6537 : une borne non numérique est refusée avant toute opération."""
+        env = dict(self.env, ARRET_BORNE="5m")
+        proc = subprocess.run(["bash", SCRIPT, "redemarrer"], env=env,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("ARRET_BORNE invalide", proc.stderr)
+        self.assertEqual(self.ops(), [])
+
 
 class VmRestartLeaseTest(RestartLeaseTest):
     def setUp(self):
@@ -588,22 +677,13 @@ class VmRestartLeaseTest(RestartLeaseTest):
                                "redemarrer"], env=self.env, capture_output=True, text=True,
                               timeout=300)
 
-    def test_failed_sans_processus_est_un_arret_prouve(self):
-        """#6528 : un stop qui finit `failed` (SIGKILL, délai d'arrêt) sans
-        processus restant dans le cgroup prouve le point sûr (vm.sh seul) : l'échec est
-        effacé APRÈS l'arrêt, puis l'unité démarre — pas d'échec d'hôte."""
-        with open(os.path.join(self.state, "stop_mode"), "w", encoding="utf-8") as fh:
-            fh.write("failed-vide\n")
-        proc = self.restart("lease")
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        stop = self.op_position("stop")
-        cgroup = self.op_position("show ControlGroup", after=stop)
-        reset = self.op_position("reset-failed")
-        self.assertLess(stop, cgroup)
-        self.assertLess(cgroup, reset)
-        self.assertLess(reset, self.op_position("start"))
-        self.assertIn("aucun processus restant — arrêt prouvé", proc.stdout)
-        self.assertIn("dev9 : redémarré", proc.stdout)
+    @unittest.skip("#6537 : faux ssh sans stop long ni kill ; vm.sh couvert par test_503")
+    def test_tour_long_borne_puis_second_sigterm(self):
+        pass
+
+    @unittest.skip("#6537 : faux ssh sans stop long ni kill ; vm.sh couvert par test_503")
+    def test_sigterm_ignore_sigkill_puis_failed_a_cgroup_vide(self):
+        pass
 
 if __name__ == "__main__":
     unittest.main()

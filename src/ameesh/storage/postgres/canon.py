@@ -603,6 +603,9 @@ class Canon(interface.Canon):
                    pending_prompt = CASE
                        WHEN %s OR coalesce(%s::text, '') = '' THEN r.pending_prompt
                        ELSE concat_ws(E'\\n\\n', %s::text, r.pending_prompt) END,
+                   -- #6487 : un déplacement qui pose une consigne ouvre son
+                   -- occurrence ; une attente déjà posée garde la sienne.
+                   pending_prompt_id = coalesce(pending_prompt_id, gen_random_uuid()),
                    status = CASE WHEN %s THEN r.status ELSE 'queued' END,
                    status_text = %s::text,
                    updated_at = now()
@@ -682,6 +685,9 @@ class Canon(interface.Canon):
                    pending_prompt = CASE
                        WHEN %s OR coalesce(%s::text, '') = '' THEN r.pending_prompt
                        ELSE concat_ws(E'\\n\\n', %s::text, r.pending_prompt) END,
+                   -- #6487 : un déplacement qui pose une consigne ouvre son
+                   -- occurrence ; une attente déjà posée garde la sienne.
+                   pending_prompt_id = coalesce(pending_prompt_id, gen_random_uuid()),
                    -- un arrêté reste arrêté (son motif d'arrêt est conservé) ;
                    -- sinon l'agent repart réclamable sur l'hôte d'arrivée
                    status = CASE WHEN %s THEN r.status

@@ -15,6 +15,12 @@ bootstrap = fixture.bootstrap
 
 
 class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.release_decision import install_decision_gate
+        install_decision_gate(cls)
+
     sign = fixture.SignedRefusalTest.sign
 
     def ask(self, question, options, **extra):
@@ -77,6 +83,21 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
         self.assertEqual(self.old_journal.read_bytes(), self.old_bytes)
         self.assertEqual((self.root / 'etc/ameesh-release/runtime-seal.lock').stat().st_ino, self.lock_inode)
 
+    def test_continuation_under_controller_without_mailbox_select(self):
+        self.sign()
+        role = self.controller_role
+        self.db.execute('GRANT SELECT ON agent_registry,mesh_keys,mesh_approvals,'
+                        'mesh_approvals_status,mesh_consumed_nonces,decision_supersessions TO "'+role+'"')
+        try:
+            with self.db.transaction() as tx:
+                tx.execute('SET LOCAL ROLE "'+role+'"')
+                self.backend.db = tx
+                self.backend.continuation_question(self.operation, self.old_operation, self.old_decision)
+                self.assertEqual(self.backend.continue_install(self.operation, self.view['id'])['outcome'],
+                                 'installed')
+        finally:
+            self.backend.db = self.db
+
     def test_unsigned_and_missing_reciprocal_link_cannot_transfer_reservation(self):
         with self.assertRaises(ValueError):
             self.backend.continue_install(self.operation, self.view['id'])
@@ -89,7 +110,7 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
         def missing(db, decision, *args):
             value = original(db, decision, *args)
             return dict(value, superseded_by=None) if decision == self.old_decision else value
-        with mock.patch.object(decisions, 'get', side_effect=missing):
+        with mock.patch.object(decisions, 'get_for_controller', side_effect=missing):
             with self.assertRaises(ValueError):
                 self.backend.continue_install(self.operation, self.view['id'])
         self.assertEqual(json.loads(reservation.read_bytes())['operation'], self.old_operation)
