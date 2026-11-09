@@ -190,8 +190,23 @@ UNKNOWN = {
         "aucun suivi structuré des signaux après livraison : la résolution "
         "observée n'est pas mesurée"),
     "reprises_par_origine": (
-        "l'origine (opérateur, agent, automate) des reprises n'est pas unifiée "
-        "dans le journal : une reprise manuelle n'est pas distinguable"),
+        "le journal A11 des reprises n'a pas été lu dans la fenêtre : "
+        "l'origine (opérateur, agent, automate) n'est pas mesurée"),
+    "reprises_demandees": (
+        "le journal A11 des reprises n'a pas été lu dans la fenêtre : les "
+        "intentions demandées ne sont pas mesurées"),
+    "reprises_engagees": (
+        "le journal A11 des reprises n'a pas été lu dans la fenêtre : les "
+        "effets engagés ne sont pas mesurés"),
+    "reprises_achevees": (
+        "le journal A11 des reprises n'a pas été lu dans la fenêtre : les "
+        "issues achevées ne sont pas mesurées"),
+    "reprises_evitees": (
+        "le journal A11 des reprises n'a pas été lu dans la fenêtre : les "
+        "reprises évitées par idempotence ne sont pas mesurées"),
+    "reprises_rejouees": (
+        "le journal A11 des reprises n'a pas été lu dans la fenêtre : les "
+        "tentatives au-delà de la première ne sont pas mesurées"),
     "syntheses": (
         "aucune passe de balayage A12 mesurée ; le rapport ne clôt, ne "
         "supprime et ne répare rien"),
@@ -291,6 +306,11 @@ LIMITS = {
         "un événement sans run ne compte pas comme un run ; les runs distincts "
         "sont un plancher, pas un total de tentatives",
         "QA → build ne mesure pas les redémarrages manuels de processus",
+        "le journal A11 ne reçoit que les reprises manuelles appliquées "
+        "(resume, adopt) ; les relances automatiques du runner ne sont pas "
+        "encore raccordées et ne sont pas comptées",
+        "une tentative au-delà de la première est une reprise (`retries`) ; le "
+        "journal garde aussi la première tentative comme dénominateur",
     ),
     "A12": (
         "le balayage et la synthèse A12 ne sont pas encore mesurés ; ce "
@@ -505,6 +525,8 @@ def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
         ])
         journal_summary = storage.of(tx).repair_signals.summary(
             project=project, since=start_ts, until=end_ts)
+        retry_summary = storage.of(tx).repair_signals.retry_summary(
+            project=project, since=start_ts, until=end_ts)
     cohort_rows, alert_rows, occurrence_rows, open_rows, link_rows, qa_rows, \
         staging_rows, signal_rows = results
     # #6323 : la vue des attestations et le journal se lisent hors de la
@@ -525,6 +547,7 @@ def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
         staging=staging_rows,
         signal_alerts=signal_rows,
         journal_summary=journal_summary,
+        retry_summary=retry_summary,
         active=active,
         journal=journal,
     )
@@ -715,7 +738,8 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
           journal: Sequence[Mapping[str, Any]] | None = None,
           environment: str = SIGNAL_ENVIRONMENT,
           is_ancestor=None,
-          journal_summary: Mapping[str, Any] | None = None) -> dict[str, Any]:
+          journal_summary: Mapping[str, Any] | None = None,
+          retry_summary: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Assemble le rapport depuis les lignes lues (aucune base ici).
 
     Chaque mesure vaut `None` quand elle n'a pas pu être lue : le compteur
@@ -728,6 +752,8 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
     `active=None` avec des signaux rend la corrélation A4 inconnue, jamais
     concluante par défaut. `is_ancestor` est le prédicat d'ascendance injecté
     de U4 : sans lui, deux SHA inégaux restent `version-differente`.
+    `retry_summary` est le résumé A11 de U14 (#6475) : sans lui, les compteurs
+    de reprise sont inconnus, jamais zéro.
     """
     if end <= start:
         raise RepairReportError("fenêtre vide ou inversée")
@@ -773,6 +799,14 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
     decision_alerts = (None if alert_types is None else
                        alert_types.get("decision_pending", 0)
                        + alert_types.get("decision_overdue", 0))
+    # #6475 — A11 : le journal U14 distingue l'intention (demandée), l'effet
+    # engagé, l'issue achevée et la reprise évitée par idempotence, par origine.
+    retry_totals = (retry_summary.get("totals")
+                    if retry_summary is not None else None)
+
+    def retry_counter(name):
+        return (retry_totals.get(name)
+                if retry_totals is not None else None)
 
     counters = {
         "A1": {
@@ -844,7 +878,13 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
             "lots_repris": qa_lots,
             "snapshots_staging": stage["sequence_events"],
             "runs_staging": stage["sequence_runs"],
-            "reprises_par_origine": None,
+            "reprises_demandees": retry_counter("requested"),
+            "reprises_engagees": retry_counter("engaged"),
+            "reprises_achevees": retry_counter("completed"),
+            "reprises_evitees": retry_counter("avoided"),
+            "reprises_rejouees": retry_counter("retries"),
+            "reprises_par_origine": (retry_summary.get("by_origin")
+                                     if retry_summary is not None else None),
         },
         "A12": {
             "alertes_levees": alert_total,

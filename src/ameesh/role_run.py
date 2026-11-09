@@ -914,6 +914,10 @@ def run(cfg, args, *, credentials=()) -> int:
                     # (the mesh project of the configuration); never a
                     # built-in name, and absent on a bench without one.
                     mesh_project=getattr(cfg, "project", ""),
+                    # #6486 : the configuration names each project's local
+                    # clone; the observation injects its bounded git ancestor
+                    # predicate instead of leaving an old SHA unclassified.
+                    cfg=cfg,
                     log=lambda text: print(text, file=sys.stderr))
             # The exit code of the command is the wrapper's. A report is printed
             # only on stderr in JSON mode, so a command that speaks JSON keeps

@@ -171,3 +171,5 @@ test_5690_n1_bench  # stockage : écriture N-1 rejouée sur le schéma courant, 
 test_5751_native_ci_disk  # #5751 : boîte de refus et acquittements atomiques sous les deux pilotes
 
 test_6473_cause_observation  # stockage : identité A3, deux écrivains et récidive observation (#6473)
+
+test_6486_repair_ancestor  # stockage : prédicat git A4 injecté par ingest, ancien SHA classé version antérieure (#6486)

@@ -777,6 +777,7 @@ class Watcher:
             for project in sorted({sub.project for sub in declared}):
                 repair_observation.observe(db, project=project,
                                            source="github_watch", now=now,
+                                           cfg=self.cfg,
                                            log=self.log)
             try:
                 if self.api is None:
