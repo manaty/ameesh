@@ -662,8 +662,11 @@ class ComposePacketTest(unittest.TestCase):
         with mock.patch.object(paquet_auto, "fresh_base", return_value="a" * 40), \
                 mock.patch.object(paquet_auto, "prune_stale_worktrees",
                                   return_value=[]), \
-                mock.patch.object(paquet_auto, "make_worktree",
-                                  return_value=self.worktree), \
+                mock.patch.multiple(
+                    paquet_auto,
+                    make_worktree=mock.Mock(return_value=self.worktree),
+                    reader_worktree=mock.Mock(
+                        return_value=self.worktree / "reader")), \
                 mock.patch.object(
                     paquet_auto, "compute_candidates",
                     return_value=([paquet_auto.Candidate(1, "a" * 40),
