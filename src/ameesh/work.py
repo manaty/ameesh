@@ -955,6 +955,11 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         external_executor = check_external_executor(db, external_executor, cfg=cfg)
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
+    # #6525 : sans `--target`, une branche créée hérite de la cible déclarée
+    # du projet (configuration compilée, puis radar, puis base du dépôt) et
+    # non de `origin/HEAD` du clone. Une cible explicite prime.
+    if branch and branch_target is None:
+        branch_target = _project_target(cfg, app)
     if _is_vehicle_branch(branch):
         # #4667 : le corps d'un porteur cite souvent le script qui le compose ;
         # une empreinte d'intake inférée de ce texte est fausse (le véhicule
@@ -1040,6 +1045,23 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
 # branche d'un lot (L118)
 # --------------------------------------------------------------------------
 
+def _project_target(cfg, app) -> str | None:
+    """La cible déclarée du projet, validée, ou None (#6525).
+
+    Même résolution que `lot_class.default_base` (`intake_neighbors`). Une
+    configuration illisible ne casse pas la création : le repli du clone
+    (`git config ameesh.target`, puis `origin/HEAD`) reste le comportement
+    d'un projet qui ne déclare rien.
+    """
+    from . import plan_git
+    try:
+        from . import intake_neighbors
+        target = intake_neighbors.project_target(cfg, str(app or "").strip())
+        return plan_git.check_ref(target, "project target") if target else None
+    except Exception:  # noqa: BLE001 - config absente : aucun défaut
+        return None
+
+
 def _branch_args(branch, target) -> tuple:
     """(branche, cible) validées, ou (None, None) ; une cible sans branche
     est refusée."""
@@ -1061,24 +1083,27 @@ def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
     """L118 : la branche (et la cible) d'un lot ouvert ; journalisée. Rend
     le lot. Une branche identique (et la même cible) ne réécrit rien.
     `clear_target` (#2931) efface la cible explicite — le lot retombe sur la
-    cible de son projet ou du dépôt ; `target=None` la conserve."""
+    cible de son projet ou du dépôt ; `target=None` conserve une cible déjà
+    posée, sinon hérite de la cible déclarée du projet (#6525)."""
     branch, target = _branch_args(branch, target)
     if not branch:
         raise WorkError("empty branch")
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    same = (item.get("branch") == branch
-            and ((clear_target and not item.get("branch_target"))
-                 or (not clear_target
-                     and (target is None or item.get("branch_target") == target))))
-    if same:
-        return item
     if clear_target:
         target = None
-    else:
-        target = target if target is not None else (
-            item.get("branch_target") if item.get("branch") == branch else None)
+    elif target is None:
+        # #6525 : une cible posée n'est jamais réécrite en silence ; une
+        # branche nouvelle (ou un lot sans cible) hérite de celle du projet.
+        if item.get("branch") == branch and item.get("branch_target"):
+            target = item["branch_target"]
+        else:
+            target = _project_target(getattr(db, "cfg", None), item.get("app") or "")
+    same = (item.get("branch") == branch
+            and (item.get("branch_target") or None) == (target or None))
+    if same:
+        return item
     note = "branch %s%s%s (before: %s)" % (
         branch,
         " to %s" % target if target else (
