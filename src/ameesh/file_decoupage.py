@@ -41,6 +41,14 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   réellement actionnable, pas seulement un lot assigné. #5151 : le sommeil
   nomme aussi au journal les lots attribués qu'une attente planifiée écarte
   (« sleep set aside: <agent>: #N (planned start …) »).
+  #6575 : un agent qui doit encore un geste sur un travail engagé n'est pas
+  endormi, et le dormeur qui en reçoit un est levé : correction due après un
+  verdict bloquant (`due_fixes`, la lecture de `work fixes-owed`), lot ouvert
+  qui lui est assigné et membre d'un paquet dont le porteur est ouvert (le
+  paquet n'a pas fusionné : son CI peut encore réclamer l'auteur), commande
+  `ameesh heavy` qu'il tient sur l'hôte de la passe (les créneaux sont des
+  verrous locaux, un autre hôte n'est pas lu ; le motif nomme le créneau,
+  jamais la commande, dont l'argv peut porter un secret).
 * **#4623, la dernière note fait foi** : une note `roadmap: rouverte <projet>`
   postérieure à la dernière `roadmap: épuisée <projet>` désarme le sommeil et
   lève les dormeurs du projet dans la même passe (le geste est journalisé sur
@@ -675,6 +683,70 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
     return pending, keep, None
 
 
+def owed_work(db, names, lots, *, cfg=None) -> tuple:
+    """#6575 : le travail engagé que chacun de `names` doit encore.
+
+    Rend `({nom: motif}, erreur)`, un motif par agent (le premier trouvé) :
+
+    * `fix owed on #N` : un verdict bloquant attend sa correction
+      (`review_designation_activation.due_fixes`, la même lecture que
+      `ameesh work fixes-owed`) ;
+    * `member #N of open packet #P` : un lot ouvert assigné à l'agent est
+      membre enregistré (`work_packet_members`) d'un paquet dont le porteur
+      est encore ouvert. Le vert du paquet est à la forge, pas en base : tant
+      que le porteur n'a pas fusionné, son CI peut réclamer l'auteur (constat
+      #6575 : codex3 endormi alors que le paquet 513 attendait son regel) ;
+    * `heavy job running (slot N)` : l'agent tient un créneau `ameesh heavy`
+      sur l'hôte de la passe (`cfg` requis ; un autre hôte n'est pas lisible).
+      Le numéro de créneau suffit et ne recopie jamais la commande : son argv
+      peut porter un secret, et ce motif finit dans une note partagée.
+
+    Une lecture en échec rend l'erreur : l'appelant n'endort personne (le
+    doute épargne, comme #4525). Le créneau heavy illisible n'épargne pas :
+    c'est une lecture locale d'appoint, pas la seule source.
+    """
+    from . import packet_link
+    from . import review_designation_activation as activation
+    wanted = {str(name).strip().lower(): str(name) for name in names or () if name}
+    out: dict = {}
+    if not wanted:
+        return out, None
+    try:
+        for row in activation.due_fixes(db) or ():
+            name = wanted.get(str(row.get("name") or "").strip().lower())
+            if name and name not in out:
+                out[name] = "fix owed on #%s" % row.get("lot")
+        mine = {}
+        for lot in lots or ():
+            name = wanted.get(str((lot or {}).get("assignee") or "").strip().lower())
+            if name and name not in out:
+                mine[int(lot["id"])] = name
+        if mine:
+            from .stagnation import DONE_STATES as done
+            for member in packet_link.memberships(db, item_ids=sorted(mine)) or ():
+                name = mine.get(int(member.get("work_item_id") or 0))
+                if not name or name in out:
+                    continue
+                if (str(member.get("package_state") or "") in done
+                        or member.get("package_merged_sha")):
+                    continue
+                out[name] = "member #%s of open packet #%s" % (
+                    member.get("work_item_id"), member.get("package_id"))
+    except Exception as exc:  # noqa: BLE001 - le doute ne retire personne
+        return out, "%s: %s" % (type(exc).__name__, str(exc)[:160])
+    if cfg is not None and getattr(cfg, "state_dir", None):
+        from . import heavy
+        try:
+            slots = heavy.status(cfg)
+        except Exception:  # noqa: BLE001 - lecture d'appoint : n'épargne pas
+            slots = []
+        for slot in slots:
+            name = wanted.get(str(slot.get("agent") or "").strip().lower())
+            if slot.get("busy") and name and name not in out:
+                out[name] = "heavy job running (slot %s)" % slot.get("slot", "?")
+    return out, None
+
+
 def _journal_exemption(db, split_id, name: str, why: str, *,
                        since_ts: float = 0.0) -> None:
     """Écrit une fois le motif d'exemption sur le lot de découpage (#4525).
@@ -831,6 +903,13 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
         for name in item.idle:
             out.append({"agent": name, "slept": False, "why": why})
         return out
+    owed, owed_error = owed_work(db, item.idle, lots, cfg=cfg)
+    if owed_error:
+        why = "owed work unreadable: %s" % owed_error
+        _journal_exemption(db, split_id, "*", why, since_ts=since_ts)
+        for name in item.idle:
+            out.append({"agent": name, "slept": False, "why": why})
+        return out
     for name in item.idle:
         owner = _owner_of([by_name.get(name) or {}])
         if not owner:
@@ -858,6 +937,11 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
             lot_id = row.get("actionable_lot_id")
             why = ("assigned actionable lot #%s" % lot_id if lot_id
                    else "actionable work due")
+            out.append({"agent": name, "slept": False, "why": why})
+            _journal_exemption(db, split_id, name, why, since_ts=since_ts)
+            continue
+        if owed.get(name):
+            why = owed[name]
             out.append({"agent": name, "slept": False, "why": why})
             _journal_exemption(db, split_id, name, why, since_ts=since_ts)
             continue
@@ -1052,7 +1136,7 @@ def _journal_review_wake(db, project: str, name: str, family: str,
 
 
 def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
-               mail_window_s=None) -> list:
+               mail_window_s=None, lots=()) -> list:
     """#4610 : lève le sommeil dès qu'un lot actionnable est attribué à l'agent
     ou qu'un courrier non lu de son pilote ou d'un orchestrateur arrive.
 
@@ -1065,9 +1149,17 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
     #4619 : la levée applique la même fenêtre de courrier que le sommeil
     (`mail_window_s`) — sinon un dormeur qui ne lit pas son courrier
     oscillerait entre sommeil et levée à chaque passe.
+
+    #6575 : le travail engagé dû (`owed_work` : correction, paquet ouvert,
+    commande heavy) lève aussi le dormeur ; une lecture en échec ne lève
+    personne sur ce motif.
     """
     from . import agent_pause
     woken: dict = {}
+    sleepers = [str(row.get("name") or "").strip() for row in listing
+                if row.get("operator_paused")
+                and is_sleep_reason(str(row.get("operator_pause_reason") or ""))]
+    owed = owed_work(db, sleepers, lots, cfg=cfg)[0] if sleepers else {}
     for row in listing:
         name = str(row.get("name") or "").strip()
         reason = str(row.get("operator_pause_reason") or "")
@@ -1080,6 +1172,8 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
             lot_id = row.get("actionable_lot_id")
             why = ("assigned actionable lot #%s" % lot_id if lot_id
                    else "actionable work due")
+        elif owed.get(name):
+            why = owed[name]
         elif int(row.get("unread") or 0):
             senders, mail_error = mail_lifters(cfg, db, listing, row,
                                                canons=canons)
@@ -1185,7 +1279,7 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     # dormeurs du sommeil automatique.
     if not dry_run:
         out.extend(_wake_work(db, listing, now, cfg=cfg, canons=canons,
-                              mail_window_s=settings.mail_window()))
+                              mail_window_s=settings.mail_window(), lots=lots))
     # #4623 : un projet dont tous les exécutants dorment n'a plus de mesure
     # (`measure` écarte les pauses). Il doit rester dans la passe, sinon la
     # note de réouverture ne serait jamais lue et les dormeurs jamais levés.
