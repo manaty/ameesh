@@ -28,6 +28,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from typing import Sequence
 
 from . import accounts, account_turn, auth_failure, fil, identity, mail, platform, registry, stagnation, storage
@@ -1410,11 +1411,14 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
     if not SESSION_RE.match(session_id or ""):
         raise RepriseError("invalid session id: %r" % (session_id,))
     row = registry.get(db, name)
+    invocation = uuid.uuid4().hex
     if row and row.get("host") and row["host"] != cfg.host:
         raise RepriseError("%s is pinned to host %s (here: %s): sessions are local "
                            "files, run \"ameesh adopt\" on %s"
                            % (name, row["host"], cfg.host, row["host"]))
     if _lease_live(row):
+        _journal_resume(db, cfg, row, name, actor, invocation,
+                        avoided_cause="lease_busy")
         raise RepriseError("%s holds a live lease (%s): a runner or an attached session "
                            "is already driving it; \"agent-runner stop %s\" then wait for the "
                            "lease to end, or use \"ameesh resume\""
@@ -1513,6 +1517,8 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
         name, harness=harness, host=cfg.host, cwd=cwd, session_id=session_id,
         session_account=compte, prompt=prompt, status_text=status_text)
     if result is None:
+        _journal_resume(db, cfg, row, name, actor, invocation,
+                        avoided_cause="other_holder")
         raise RepriseError("%s: a lease was taken in the meantime; try again" % name)
     # #1037 : le harnais déclaré a changé — les réglages du précédent
     # (modèle, effort, tier ; base et état local) ne s'appliquent plus. Le
@@ -1548,6 +1554,9 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
         warn("adopted, but not wakeable yet: %s" % why)
         constats.append("not wakeable yet: %s" % why)
     after = registry.get(db, name) or {}
+    # #6475 (U14): adoption applied the resume instruction; journal the retry
+    # as completed, never as the resumed turn (the runner starts it later).
+    _journal_resume(db, cfg, after, name, actor, invocation, settled="completed")
     fil.record(cfg, db, sender=actor or "ameesh", recipients=[name],
                text="Adoption of %s (L39): session %s %s%s moves under the runner "
                     "(execute mode%s). Resume instruction of %d character(s) queued.%s"
@@ -1699,6 +1708,7 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     row = registry.get(db, name)
     if row is None:
         raise RepriseError("unknown agent: %s" % name)
+    invocation = uuid.uuid4().hex
     if row.get("operator_paused"):
         raise RepriseError("%s is operator paused: use ameesh resume %s --operator --reason <reason>"
                            % (name, name))
@@ -1710,10 +1720,14 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     if not ok:
         raise RepriseError("%s is not wakeable: %s" % (name, why))
     if registry.turn_in_progress(db, name):
+        _journal_resume(db, cfg, row, name, actor, invocation,
+                        avoided_cause="lease_busy")
         raise RepriseError("%s has a turn in progress: nothing to resume (\"ameesh restart\" "
                            "for a new session)" % name)
     live = _lease_live(row)
     if live and row.get("status") == "stopped":
+        _journal_resume(db, cfg, row, name, actor, invocation,
+                        avoided_cause="lease_busy")
         raise RepriseError("%s is stopped but its lease is still live (the runner has not "
                            "returned it yet): try again in a few seconds" % name)
     runner_seen = False
@@ -1765,6 +1779,8 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
         # Un exécuteur tient le bail (agent au repos) : l'oubli passe par lui,
         # comme `ameesh restart` (appliqué hors tour, fencé par son bail).
         if ops.request_restart(name, prompt) is None:
+            _journal_resume(db, cfg, row, name, actor, invocation,
+                            avoided_cause="other_holder")
             raise RepriseError("%s: state changed in the meantime; try again" % name)
         applied = bool(ops.apply_restart(name))
         if not applied:
@@ -1781,10 +1797,17 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
                                                          if forget or decision["deterministic"]
                                                          else "same session"))
         if result is None:
+            _journal_resume(db, cfg, row, name, actor, invocation,
+                            avoided_cause="other_holder")
             raise RepriseError("%s: state changed in the meantime (lease taken, turn started or "
                                "stopped); try again" % name)
     if forget and applied and (row.get("host") or "") == (cfg.host or ""):
         _forget_local(cfg, name)
+    # #6475 (U14): the authorized operation applied the instruction; journal
+    # the retry as completed, or unknown when the runner holding the lease
+    # still has to apply it.  Best effort: never fails or delays the resume.
+    _journal_resume(db, cfg, row, name, actor, invocation,
+                    settled="completed" if applied else "unknown")
     fil.record(cfg, db, sender=actor or "ameesh", recipients=[name],
                text="Resume of %s (L39, ameesh resume) from status %s: %s. Instruction of "
                     "%d character(s) queued%s."
@@ -1830,6 +1853,33 @@ def _actor(cfg: Config, db) -> str:
         return binding.name if binding.ok else ""
     except Exception:
         return ""
+
+
+def _retry_origin(actor: str) -> str:
+    """U14 origin: a human shell has no binding, so ``actor`` is empty."""
+    return "operator" if not actor or actor.startswith("human:") else "agent"
+
+
+def _journal_resume(db, cfg, row, name, actor, invocation, *, settled="completed",
+                    avoided_cause=None):
+    """Best-effort A11 observation of a resume/adopt (U14), never an effect."""
+    try:
+        from . import repair_retry
+        from .repair_correlation import ENVIRONNEMENT
+        if avoided_cause:
+            return repair_retry.observe_manual_resume_avoided(
+                db, project=_project(cfg, row), environment=ENVIRONNEMENT,
+                agent=name, actor=actor or "operator",
+                origin=_retry_origin(actor), invocation=invocation,
+                cause=avoided_cause,
+                log=lambda text: print(text, file=sys.stderr))
+        return repair_retry.observe_manual_resume(
+            db, project=_project(cfg, row), environment=ENVIRONNEMENT,
+            agent=name, actor=actor or "operator", origin=_retry_origin(actor),
+            invocation=invocation, settled=settled,
+            log=lambda text: print(text, file=sys.stderr))
+    except Exception:  # noqa: BLE001 - observation, jamais un effet
+        return None
 
 
 def cmd_adopt(cfg: Config, args) -> int:
