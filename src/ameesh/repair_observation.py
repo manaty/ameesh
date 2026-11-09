@@ -16,7 +16,7 @@ import hashlib
 import json
 import time
 
-from . import repair_signals, repair_triage, storage
+from . import fingerprints, repair_signals, repair_triage, storage
 from .repair_correlation import ENVIRONNEMENT
 
 # U5 currently settles entries individually; cap database round trips per turn.
@@ -62,6 +62,7 @@ def ingest(db, *, project, environment, source, rows, expected_cursor,
             signal = repair_signals.from_source(
                 source, row['entry'], project=project, environment=environment,
                 received_at=now, occurrence=row.get('occurrence', 1),
+                cause_key=row.get('cause_key', ''),
                 observed_version=row.get('observed_version', ''))
         except repair_signals.SignalError:
             key = hashlib.sha256(json.dumps(
@@ -74,15 +75,19 @@ def ingest(db, *, project, environment, source, rows, expected_cursor,
         # observation mode; the route alone is never an outcome proof.
         outcome = row.get('outcome') or ('ignored' if triage.route == 'ignored'
                                         else 'unknown')
-        accepted.append((signal, outcome, row.get('reference', '')))
+        accepted.append((signal, outcome, row.get('reference', ''), triage,
+                         row.get('fingerprint_key')))
     if not api.receive(project, environment, source,
-                       [signal for signal, _, _ in accepted],
+                       [signal for signal, _, _, _, _ in accepted],
                        expected_cursor=expected_cursor, next_cursor=next_cursor):
         return False
-    for signal, outcome, reference in accepted:
+    for signal, outcome, reference, triage, legacy_key in accepted:
         settled = api.settle(signal.id, outcome, reference=reference)
         if not settled and outcome in ('lot', 'basket', 'decision'):
             api.settle(signal.id, outcome, reference=reference, expected='unknown')
+        lot = (int(reference[4:]) if outcome == 'lot'
+               and reference.startswith('lot:') and reference[4:].isdigit() else None)
+        fingerprints.observe_cause(db, signal, triage, lot=lot, legacy_key=legacy_key, now=now)
     return True
 
 
