@@ -949,12 +949,25 @@ def observe_cause(db, signal, triage, *, lot=None, legacy_key=None, active=None,
                   hosts=None, now=None, is_ancestor=None) -> dict:
     """Record a bounded, replay-safe A3 proposal on already received input.
 
+    Two optional raccords come from a producer and are never authority:
+
+    * ``legacy_key`` is a historical fingerprint key. It is mapped to
+      ``empreinte:<project>:<key>`` and only searches existing lots under
+      that alias: without an exact U3 cause the relation stays
+      ``same_symptom_unknown``, never a cause. Without it the alias is the
+      signal's native id; no alias is invented.
+    * ``is_ancestor(observe, active)`` is A4's strict git ancestry proof.
+      When it is absent or does not prove the relation, unequal versions
+      stay ``version-differente`` and a closed exact cause becomes
+      ``same_cause_version_unknown``: a conservative *version* unknown,
+      never an automatically attributed unknown cause.
+
     A producer may associate an existing lot; its current project and state
-    are checked under the same row lock as a concurrent close. Historical
-    keys remain aliases, never authority to assign a cause. Only exact U3
-    cause matches suggest lots. A closed lot gives a recurrence *candidate*;
-    A4 distinguishes currently active, old and mixed versions. This does not
-    prove a regression of a fix, nor open a recurrence lot.
+    are checked under the same row lock as a concurrent close. Only exact U3
+    cause matches suggest lots: an empty cause identity keeps the relation
+    ``unknown`` whatever the alias says. A closed lot gives a recurrence
+    *candidate*; A4 distinguishes currently active, old and mixed versions.
+    This does not prove a regression of a fix, nor open a recurrence lot.
     """
     import hashlib
     from . import repair_correlation as correlation, repair_signals
@@ -969,6 +982,8 @@ def observe_cause(db, signal, triage, *, lot=None, legacy_key=None, active=None,
     if lot is not None and (type(lot) is not int or lot <= 0):
         raise ValueError('a positive existing lot is required')
     alias = signal.native_id
+    # A missing producer alias stays the native id: a symptom key is never
+    # fabricated from the cause identity.
     if legacy_key is not None:
         alias = source_of(signal.project, legacy_key)
         _check_no_secret(alias, 'historical fingerprint alias')
@@ -977,6 +992,8 @@ def observe_cause(db, signal, triage, *, lot=None, legacy_key=None, active=None,
         active = correlation.active_view(db)
         journal = correlation.journal_view()
         hosts = sorted(active)
+    # A4 receives the producer's ancestry proof when one is supplied; without
+    # it an unequal version stays unproven and no cause is attributed.
     version = correlation.correlate(
         signal.record(), active or {}, journal=journal, hosts=hosts, now=now,
         is_ancestor=is_ancestor)
