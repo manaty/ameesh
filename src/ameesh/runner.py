@@ -4071,7 +4071,7 @@ class AgentWorker(threading.Thread):
             out = storage.of(self.db).lot_sessions.switch(
                 self.name, self.runner.runner_id, self.epoch, to_lot=lot,
                 harness=harnais, account=nom, cwd=cwd,
-                current=session)
+                current=session, max_tokens=self.session_max_tokens())
         except db_mod.DbError as exc:
             log_async("[%s] session switch to lot %s failed (%s)" % (self.name, lot, exc))
             return False
@@ -4094,6 +4094,10 @@ class AgentWorker(threading.Thread):
                 pass
         self.agent = registry.get(self.db, self.name) or self.agent
         self._reset_session_counts()
+        if repris:
+            # #6403 : le prochain tour ne doit pas masquer le cumul repris
+            # en faisant passer session_turns de zéro à un.
+            self._restore_session_counters()
         if not repris:
             # L165 (EP3) : le brief de relève en attente n'est pas écrasé par
             # celui du lot ; les deux ouvrent la session neuve.
@@ -4122,6 +4126,8 @@ class AgentWorker(threading.Thread):
                     out["discarded"], lot,
                     "lot finished or no longer assigned to the agent"
                     if out.get("discard_reason") == "lot"
+                    else "session input+output cumulative threshold reached"
+                    if out.get("discard_reason") == "size"
                     else "other harness, account or directory, or unknown origin")
                 if out.get("discarded") else ""),
             meta={"action": "session-lot", "de": courant, "vers": lot,
