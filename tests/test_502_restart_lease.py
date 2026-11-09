@@ -65,6 +65,15 @@ elif args[0] == "show":
     elif prop == "MainPID":
         operation("show MainPID")
         print(etat()[1])
+    elif prop == "ControlGroup":
+        # #6528 : `failed` garde un processus (cgroup réel du banc, non vide) ;
+        # `failed-vide` n'en garde aucun (cgroup supprimé par systemd).
+        operation("show ControlGroup")
+        if scenario() == "failed":
+            print([l for l in open("/proc/self/cgroup").read().splitlines()
+                   if l.startswith("0::")][0][3:])
+        else:
+            print("")
     else:
         operation("show ExecStart")
         path = os.path.join(state, "execstart")
@@ -83,7 +92,7 @@ elif args[0] == "stop":
         fh.write("stop active=%s pid=%s\n" % tuple(vivante))
     if scenario() == "pid-linger":
         final = ["inactive", "1234"]
-    elif scenario() == "failed" or vivante[0] == "failed":
+    elif scenario() in ("failed", "failed-vide") or vivante[0] == "failed":
         final = ["failed", "0"]   # stop non abouti (délai -> SIGKILL, sortie en erreur)
     else:
         final = ["inactive", "0"]
@@ -198,6 +207,11 @@ case $last in
   *"MainPID"*)
     echo "show MainPID $unite" >> "$FAKE_STATE/ops.log"
     set -- $(etat); echo "$2" ;;
+  *"ControlGroup"*)
+    # #6528 : même convention que le faux systemctl des agents.
+    echo "show ControlGroup $unite" >> "$FAKE_STATE/ops.log"
+    if [ "$(stop_mode)" = failed ]; then sed -n 's/^0:://p' /proc/self/cgroup; else echo; fi ;;
+  *cgroup.procs*) eval "$last" ;;
   *"systemctl show"*)
     echo "show ExecStart $unite" >> "$FAKE_STATE/ops.log"
     argv="/x run --agents dev9 --runner-id runner-dev9@host"
@@ -211,7 +225,7 @@ case $last in
     echo "stop active=$1 pid=$2" >> "$FAKE_STATE/drained"
     case $(stop_mode) in
       pid-linger) echo "inactive 1234" > "$FAKE_STATE/unit" ;;
-      failed) echo "failed 0" > "$FAKE_STATE/unit" ;;
+      failed|failed-vide) echo "failed 0" > "$FAKE_STATE/unit" ;;
       *) if [ "$1" = failed ]; then echo "failed 0"; else echo "inactive 0"; fi > "$FAKE_STATE/unit" ;;
     esac ;;
   *"systemctl reset-failed"*)
@@ -574,6 +588,22 @@ class VmRestartLeaseTest(RestartLeaseTest):
                                "redemarrer"], env=self.env, capture_output=True, text=True,
                               timeout=300)
 
+    def test_failed_sans_processus_est_un_arret_prouve(self):
+        """#6528 : un stop qui finit `failed` (SIGKILL, délai d'arrêt) sans
+        processus restant dans le cgroup prouve le point sûr (vm.sh seul) : l'échec est
+        effacé APRÈS l'arrêt, puis l'unité démarre — pas d'échec d'hôte."""
+        with open(os.path.join(self.state, "stop_mode"), "w", encoding="utf-8") as fh:
+            fh.write("failed-vide\n")
+        proc = self.restart("lease")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        stop = self.op_position("stop")
+        cgroup = self.op_position("show ControlGroup", after=stop)
+        reset = self.op_position("reset-failed")
+        self.assertLess(stop, cgroup)
+        self.assertLess(cgroup, reset)
+        self.assertLess(reset, self.op_position("start"))
+        self.assertIn("aucun processus restant — arrêt prouvé", proc.stdout)
+        self.assertIn("dev9 : redémarré", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()
