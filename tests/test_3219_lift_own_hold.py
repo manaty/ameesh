@@ -630,11 +630,22 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         work.move(self.db, item["id"], "qa", note="reprise")
         st = storage.of(self.db)
         row = work.get(self.db, item["id"])
-        retention = plan_git.content_retention(st, row,
-                                               entered_before=lambda since: None)
+        # #6437 : `since` est la date d'entrée en attente lue en base, pas
+        # `time.time()` après les `move` — sous psql chargé, `created_ts` peut
+        # précéder de plus d'une seconde l'instant du test, et le bord
+        # `slack - 1` basculait alors du côté « après ». On capture la valeur
+        # réellement passée à `entered_before`.
+        barrieres: list[float] = []
+
+        def illisible(since):
+            barrieres.append(since)
+            return None
+
+        retention = plan_git.content_retention(st, row, entered_before=illisible)
         self.assertEqual(retention["what"], "unreadable")
+        self.assertTrue(barrieres, "la retenue n'a pas lu sa barrière")
+        since = barrieres[0]
         # la fusion datée par la forge (sync-github) : avant, après, inconnue
-        since = time.time()
         slack = plan_git.CLOCK_SLACK_S
         for merged_ts, what in ((since - 3600, "stale-freeze"),
                                 (since + slack - 1, "stale-freeze"),   # marge prudente
