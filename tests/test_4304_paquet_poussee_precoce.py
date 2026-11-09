@@ -51,7 +51,8 @@ class Flux:
     """Le flux de `compose_packet`, chaque geste extérieur consigné dans l'ordre."""
 
     def __init__(self, test, *, tests, compositions, states=("OPEN",), local=False,
-                 record=False, contract_result=None, **extra):
+                 record=False, contract_result=None, candidate_reads=None,
+                 **extra):
         self.test = test
         self.extra = extra
         self.extra.setdefault("contracts_budget", 10)
@@ -64,6 +65,10 @@ class Flux:
         self.record = record
         self.heads = iter("%x" % n * 40 for n in range(1, 10))
         self.manifests: list = []
+        self.manifest_compositions: list = []
+        #: #6566 : lectures successives de la liste prête (composition, relecture).
+        self.candidate_reads = list(candidate_reads or [])
+        self.candidate_calls = 0
 
     def log(self, name, result=None):
         def side_effect(*args, **kwargs):
@@ -90,6 +95,7 @@ class Flux:
 
         def manifest(**kwargs):
             self.manifests.append(kwargs["tests"])
+            self.manifest_compositions.append(kwargs["composition"])
             return "manifeste"
 
         def write(*_args, **_kwargs):
@@ -107,14 +113,28 @@ class Flux:
             self.events.append(("state", (), {}))
             return self.states.pop(0) if len(self.states) > 1 else self.states[0]
 
+        # #6566 : la lecture initiale puis la relecture du gel avant poussée.
+        # Par défaut, les deux lisent la même liste, celle de la composition :
+        # aucun gel ne change et la poussée part directement.
+        initial = [(unit.lot, unit.source) for unit in first.units]
+
+        def candidates(*_args, **_kwargs):
+            self.candidate_calls += 1
+            if self.candidate_reads:
+                return self.candidate_reads.pop(0)
+            return ([paquet_auto.Candidate(lot, source) for lot, source in initial],
+                    {"ready": [lot for lot, _ in initial], "waiting": []})
+
         patches = [
             mock.patch.object(paquet_auto, "check_epoch"),
             mock.patch.object(paquet_auto, "fresh_base", return_value="a" * 40),
             mock.patch.object(paquet_auto, "prune_stale_worktrees", return_value=[]),
             mock.patch.object(paquet_auto, "make_worktree", return_value=worktree),
-            mock.patch.object(paquet_auto, "compute_candidates", return_value=(
-                [paquet_auto.Candidate(1, "a" * 40), paquet_auto.Candidate(2, "c" * 40)],
-                {"ready": [1, 2], "waiting": []})),
+            # #6566 : la relecture du gel se fait sur un worktree à la base.
+            mock.patch.object(paquet_auto, "reader_worktree",
+                              return_value=worktree / "reader"),
+            mock.patch.object(paquet_auto, "compute_candidates",
+                              side_effect=candidates),
             mock.patch.object(paquet_auto, "compose_candidates", return_value=first),
             mock.patch.object(paquet_auto, "recompose", side_effect=recompose),
             # #4501 : la liaison en base est mockée, mais ses arguments sont

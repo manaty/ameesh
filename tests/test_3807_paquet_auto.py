@@ -323,6 +323,8 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=[]), \
                 mock.patch.object(paquet_auto, "make_worktree",
                                   return_value=worktree), \
+                mock.patch.object(paquet_auto, "reader_worktree",
+                                  return_value=worktree / "reader"), \
                 mock.patch.object(paquet_auto, "compute_candidates",
                                   return_value=([paquet_auto.Candidate(1, "a" * 40)],
                                                 {"ready": [1], "waiting": []})), \
@@ -386,6 +388,8 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=[]), \
                 mock.patch.object(paquet_auto, "make_worktree",
                                   return_value=worktree), \
+                mock.patch.object(paquet_auto, "reader_worktree",
+                                  return_value=worktree / "reader"), \
                 mock.patch.object(paquet_auto, "compute_candidates",
                                   return_value=(
                                       [paquet_auto.Candidate(1, "a" * 40),
@@ -449,6 +453,8 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=[]), \
                 mock.patch.object(paquet_auto, "make_worktree",
                                   return_value=worktree), \
+                mock.patch.object(paquet_auto, "reader_worktree",
+                                  return_value=worktree / "reader"), \
                 mock.patch.object(paquet_auto, "compute_candidates",
                                   return_value=(
                                       [paquet_auto.Candidate(1, "a" * 40)],
@@ -668,6 +674,8 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=[]), \
                 mock.patch.object(paquet_auto, "make_worktree",
                                   return_value=worktree), \
+                mock.patch.object(paquet_auto, "reader_worktree",
+                                  return_value=worktree / "reader"), \
                 mock.patch.object(paquet_auto, "compute_candidates",
                                   return_value=(
                                       [paquet_auto.Candidate(1, first),
@@ -730,6 +738,8 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=[]), \
                 mock.patch.object(paquet_auto, "make_worktree",
                                   return_value=worktree), \
+                mock.patch.object(paquet_auto, "reader_worktree",
+                                  return_value=worktree / "reader"), \
                 mock.patch.object(paquet_auto, "compute_candidates",
                                   return_value=(
                                       [paquet_auto.Candidate(1, "a" * 40),

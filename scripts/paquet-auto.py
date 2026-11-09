@@ -92,6 +92,15 @@ de la liste prête n'est pas admis : il est écrit aux écartés avec le motif
 « coupure suivante : … ». Après un rouge, le paquet ne grossit donc plus à
 chaque recomposition, et aucune tête neuve n'entre sans ci de paquet.
 
+#6566 : une tête composée n'est poussée que si le gel de chacune de ses unités
+est encore celui de la liste calculée. Juste avant la poussée, la liste est
+relue depuis un worktree à la base exacte (le code de la cible, jamais l'arbre
+composé) ; une unité dont le lot n'est plus prêt ou dont la source a changé
+(regel pendant la composition) est écartée « coupure suivante : … » et le
+paquet est recomposé sans elle. Une tête dont une unité a été regelée depuis
+la lecture ne part donc plus : sa CI et sa garde de fusion (« does not carry
+its frozen head ») ne sont plus perdues.
+
 #4113 : hors banc sans base, la même garde d’époque que `packet record`
 est relue avant la composition, entre unités, avant chaque série de tests et
 avant publication. Une perte de bail arrête avant l’opération suivante ;
@@ -1254,6 +1263,25 @@ def make_worktree(repo: Path, base_sha: str, branch: str) -> Path:
     return path
 
 
+def reader_worktree(repo: Path, base_sha: str) -> Path:
+    """Un worktree détaché à `base_sha` : le code de la cible, pas du paquet.
+
+    #6566 : la liste prête est relue juste avant la poussée. `paquet-candidats`
+    refuse un code qui n'est pas la tête de la cible (#3782) : l'arbre composé
+    (base + unités) ne convient pas, il faut un checkout exact de la base.
+    """
+    parent = temporary_parent()
+    path = Path(tempfile.mkdtemp(prefix="paquet-auto-base-", dir=str(parent)))
+    path.rmdir()
+    proc = git(repo, "worktree", "add", "--detach", str(path), base_sha,
+               check=False)
+    if proc.returncode != 0:
+        shutil.rmtree(path, ignore_errors=True)
+        raise PaquetAutoError("worktree de lecture %s : %s"
+                              % (path, _decode(proc.stderr).strip()))
+    return path
+
+
 def _worktrees_on(repo: Path, branch: str) -> list[Path]:
     """Les worktrees du dépôt ouverts sur la branche locale `branch`."""
     listing = out(repo, "worktree", "list", "--porcelain")
@@ -1538,6 +1566,31 @@ def keep_composition(candidates: list[Candidate],
             candidate.lot, KEEP_READY_REASON,
             "hors de la composition conservée ; non admis, coupure suivante"))
     return members, discarded
+
+
+def changed_units(units: list[Unit], current: dict[int, str]) -> list[Discarded]:
+    """#6566 : les unités dont le gel a changé depuis la composition.
+
+    `current` est la source courante de chaque lot prêt, relue sur la base
+    exacte juste avant la poussée. Un lot sorti de la liste prête (build,
+    erreur, conflit) ou regelé (nouvelle source) ne se pousse pas sur la tête
+    composée : il va à la coupure suivante avec le motif de #4581, et le paquet
+    est recomposé sans lui. Une unité de résolution n'a qu'une source composée
+    et suit la même règle.
+    """
+    changes: list[Discarded] = []
+    for unit in units:
+        source = current.get(unit.lot)
+        if source is None:
+            changes.append(Discarded(
+                unit.lot, KEEP_NOT_READY_REASON,
+                "composé %s, plus dans la liste prête" % unit.source[:12]))
+        elif source != unit.source:
+            changes.append(Discarded(
+                unit.lot, KEEP_REFROZEN_REASON,
+                "composé %s, tête actuelle %s : pas de ci de paquet sur la "
+                "nouvelle tête" % (unit.source[:12], source[:12])))
+    return changes
 
 
 def compute_candidates(worktree: Path, target: str, base_sha: str,
@@ -5286,6 +5339,9 @@ def compose_packet(args: argparse.Namespace) -> int:
         for path in stale:
             print("worktree d'échec purgé : %s" % path, flush=True)
         worktree = make_worktree(repo, base_sha, branch)
+        # #6566 : worktree de lecture à la base, créé à la première relecture
+        # du gel avant poussée (le worktree composé porte le code des unités).
+        reader: Path | None = None
         keep_worktree = bool(args.keep_worktree)
         success = False
         empty = False
@@ -5432,6 +5488,40 @@ def compose_packet(args: argparse.Namespace) -> int:
                            inclusion_rc=inclusion_rc,
                            freeze_seconds=freeze_seconds)
 
+        def freeze_changes() -> list[Discarded]:
+            """#6566 : relit le gel des unités sur la base, juste avant la poussée.
+
+            `paquet-candidats` refuse un code qui n'est pas la tête de la cible
+            (#3782) : l'arbre composé ne convient pas, d'où le worktree de
+            lecture à `base_sha`, créé une fois pour tout le lancement.
+            """
+            nonlocal reader
+            if reader is None:
+                reader = reader_worktree(repo, base_sha)
+            refreshed = Path(tmp.name) / "prets-relus.txt"
+            fresh, _ = compute_candidates(reader, args.target, base_sha, refreshed)
+            return changed_units(composition.units,
+                                 {candidate.lot: candidate.source
+                                  for candidate in fresh})
+
+        def empty_after_recomposition(why: str) -> int:
+            """Aucune unité après recomposition : le paquet poussé est retiré."""
+            nonlocal success, empty
+            if pushed:
+                for line in withdraw_packet(
+                        worktree, args.carrier, pr_number,
+                        "Paquet %s : aucune unité après recomposition (%s), PR "
+                        "close par scripts/paquet-auto.py (#4304)."
+                        % (args.name, why)):
+                    print("retrait du paquet poussé : %s" % line,
+                          file=sys.stderr, flush=True)
+            print("aucune unité après recomposition : %s"
+                  % ", ".join("#%d" % item.lot
+                              for item in composition.discarded), flush=True)
+            success = True
+            empty = True
+            return 0
+
         while True:
             if guard is not None:
                 guard()
@@ -5495,6 +5585,37 @@ def compose_packet(args: argparse.Namespace) -> int:
                     record_contract_result(worktree, args.carrier, contract_report,
                                            base=base_sha, target=args.target)
             if not args.local:
+                # #6566 : le gel de chaque unité est relu sur la base exacte
+                # juste avant la poussée ; une unité regelée (ou sortie de la
+                # liste prête) pendant la composition ne part pas sur cette
+                # tête : le paquet est recomposé sans elle.
+                changes = freeze_changes()
+                if changes:
+                    removed = {item.lot for item in changes}
+                    print("recomposition : gel changé pour %s ; la tête composée "
+                          "n'est pas poussée"
+                          % ", ".join("#%d" % lot for lot in sorted(removed)),
+                          flush=True)
+                    for item in changes:
+                        print("écarté #%d : %s — %s"
+                              % (item.lot, item.reason, item.detail), flush=True)
+                    previous = list(composition.discarded)
+                    removed_sources.update(
+                        (candidate.lot, candidate.source)
+                        for candidate in candidates if candidate.lot in removed)
+                    candidates = [candidate for candidate in candidates
+                                  if candidate.lot not in removed]
+                    composition = recompose(
+                        worktree, base_sha, candidates, args.carrier,
+                        compose_script=compose_script,
+                        record_package=not args.no_packet_record,
+                        expect_pushed=lease or "", removed=removed_sources,
+                        guard=guard)
+                    composition.discarded = (previous + composition.discarded
+                                             + changes)
+                    if not composition.units:
+                        return empty_after_recomposition("gel changé")
+                    continue
                 if guard is not None:
                     guard()
                 if pushed:
@@ -5626,30 +5747,18 @@ def compose_packet(args: argparse.Namespace) -> int:
                 if candidate.lot in removed)
             candidates = [candidate for candidate in candidates
                           if candidate.lot not in removed]
+            # les écartés déjà écrits (liste calculée, recomposition
+            # précédente) restent au manifeste : le contrôle d'inclusion les lit
+            previous = list(composition.discarded)
             composition = recompose(
                 worktree, base_sha, candidates, args.carrier,
                 compose_script=compose_script,
                 record_package=not args.no_packet_record,
                 expect_pushed=lease or "", removed=removed_sources,
                 guard=guard)
-            composition.discarded = errors + composition.discarded + reasons
+            composition.discarded = previous + composition.discarded + reasons
             if not composition.units:
-                if pushed:
-                    # la tête poussée n'a plus d'unité : sa CI et sa PR tombent,
-                    # paquet-horaire clôt le porteur sur la ligne ci-dessous.
-                    for line in withdraw_packet(
-                            worktree, args.carrier, pr_number,
-                            "Paquet %s : aucune unité après recomposition "
-                            "(tests par unité rouges), PR close par "
-                            "scripts/paquet-auto.py (#4304)." % args.name):
-                        print("retrait du paquet poussé : %s" % line,
-                              file=sys.stderr, flush=True)
-                print("aucune unité après recomposition : %s"
-                      % ", ".join("#%d" % item.lot
-                                  for item in composition.discarded), flush=True)
-                success = True
-                empty = True
-                return 0
+                return empty_after_recomposition("tests par unité rouges")
         inconclusive = sum(1 for run in runs if run.inconclusive)
         tests_note = ("verts" if not inconclusive
                       else "verts + %d non concluant(s) consigné(s)" % inconclusive)
@@ -5702,6 +5811,8 @@ def compose_packet(args: argparse.Namespace) -> int:
         return 0
     finally:
         try:
+            if reader is not None:
+                remove_worktree(repo, reader)
             if success and not keep_worktree:
                 remove_worktree(repo, worktree)
                 if empty:

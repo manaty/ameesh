@@ -241,6 +241,7 @@ class EpochLostTest(unittest.TestCase):
             validate_target=None, validate_branch=None,
             fresh_base="e" * 40, remote_branch=None, ensure_carrier_branch=None,
             clear_local_branch=None, prune_stale_worktrees=[], make_worktree=worktree,
+            reader_worktree=worktree / "reader",
             compute_candidates=([auto.Candidate(1, "a" * 40)], {"ready": [1]}),
             compose_candidates=composition, run_freeze_checks=(0, "ok", 0.1),
             contract_budget=10,
