@@ -1062,9 +1062,17 @@ The `installer` step follows the same practice.
    any new role.
 6. `poste.sh redemarrer`: each active `ameesh-runner-agent@<p>` is
    restarted **one by one**: the unit is stopped first (SIGTERM closes
-   admission; the turn in progress drains, bounded by `TimeoutStopSec`), the
-   safe point is proven (`ActiveState=inactive` and `MainPID=0`), then it is
-   started. No idle window is awaited: a persona in a long turn no longer
+   admission; the turn in progress drains), the safe point is proven (no
+   process left, `MainPID=0`), then it is started. The wait is bounded
+   (#6537, as `vm.sh`, #6528): `ARRET_BORNE` (300 s) per unit, `ARRET_BUDGET`
+   (900 s) for the whole step, no longer `TimeoutStopSec` (35 min); past it,
+   a second SIGTERM to the main process stops the turn and puts its
+   instruction back, then, `ARRET_FORCE_BORNE` (60 s) later, SIGKILL to the
+   unit's group. `inactive` proves the safe point; so does `failed` (SIGKILL,
+   stop timeout) when the unit's cgroup is empty: that failure is then reset
+   and the unit must be `inactive` again before it starts. A process left in
+   the cgroup, a unit still active after SIGKILL or a non-zero `MainPID`
+   forbids the start. No idle window is awaited: a persona in a long turn no longer
    blocks or starves the update. Then `ameesh-notify`, then the
    runners of the old database (`UNITES_RESTE`), read with its configuration.
    A unit that does not stay active stops the script. So does a runner that
