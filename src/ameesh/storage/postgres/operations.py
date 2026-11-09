@@ -351,7 +351,15 @@ class Operations(interface.Operations):
                        -- d'un remplaçant le remettrait DEVANT le brief (revue L26)
                        pending_prompt = concat_ws(E'\\n\\n', verrou.restart_brief,
                                                   r.current_prompt, r.pending_prompt),
+                       -- #6487 : la consigne inachevée garde son occurrence en
+                       -- repartant en attente ; le brief de reprise est absorbé
+                       -- dans la même demande, et ouvre une occurrence s'il est
+                       -- la seule demande (aucun tour inachevé à reprendre).
+                       pending_prompt_id = coalesce(r.current_prompt_id,
+                                                    r.pending_prompt_id,
+                                                    gen_random_uuid()),
                        current_prompt = NULL,
+                       current_prompt_id = NULL,
                        status = CASE WHEN r.status = 'stopped' THEN r.status ELSE 'queued' END,
                        status_text = 'restart: fresh session from brief',
                        restart_brief = NULL,
@@ -416,7 +424,14 @@ class Operations(interface.Operations):
                    session_reset_at = clock_timestamp(),
                    pending_prompt = concat_ws(E'\\n\\n', %s::text,
                                               r.current_prompt, r.pending_prompt),
+                   -- #6487 : la consigne inachevée garde son occurrence ; le
+                   -- brief d'adoption est absorbé dans la même demande, et
+                   -- ouvre une occurrence s'il est la seule demande.
+                   pending_prompt_id = coalesce(r.current_prompt_id,
+                                                r.pending_prompt_id,
+                                                gen_random_uuid()),
                    current_prompt = NULL,
+                   current_prompt_id = NULL,
                    restart_brief = NULL,
                    restart_requested_at = NULL,
                    status = 'queued',
@@ -463,8 +478,20 @@ class Operations(interface.Operations):
                                                        p.consigne)
                        ELSE concat_ws(E'\\n\\n', p.consigne, r.current_prompt,
                                       r.pending_prompt) END,
+                   -- #6487 : une consigne neuve ouvre une occurrence ; un tour
+                   -- inachevé restauré garde la sienne, et la consigne reçue
+                   -- en même temps est absorbée dans cette demande.
+                   pending_prompt_id = CASE
+                       WHEN verrou.live THEN
+                           CASE WHEN coalesce(p.consigne, '') = ''
+                                THEN r.pending_prompt_id
+                                ELSE gen_random_uuid() END
+                       ELSE coalesce(r.current_prompt_id, r.pending_prompt_id,
+                                     gen_random_uuid()) END,
                    current_prompt = CASE WHEN verrou.live THEN r.current_prompt
                                          ELSE NULL END,
+                   current_prompt_id = CASE WHEN verrou.live
+                                            THEN r.current_prompt_id ELSE NULL END,
                    restart_brief = CASE WHEN verrou.live THEN r.restart_brief ELSE NULL END,
                    restart_requested_at = CASE WHEN verrou.live THEN r.restart_requested_at
                                                ELSE NULL END,

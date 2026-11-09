@@ -6642,8 +6642,38 @@ class AgentWorker(threading.Thread):
                 return {"kind": "suite", "prompt": adapters.SUITE_PROMPT % raison, "ids": [],
                         "lot": lot}
             # #811 (B1) : la suite attend le dossier de son lot, sans perdre sa place.
-        prompt = registry.take_pending_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        # #6487 (U14 suite) : la consigne en attente est la demande d'une
+        # relance automatique, et sa consommation au début du tour en est
+        # l'engagement. Journal best effort : rien ici ne change l'admission,
+        # le bail, la rotation ni l'ordre des tours.
+        retry_key = None
+        pending = (self.agent or {}).get("pending_prompt")
+        pending_id = (self.agent or {}).get("pending_prompt_id")
+        if pending:
+            retry_key = self._retry_requested(pending, pending_id)
+        prompt = registry.take_pending_prompt(
+            self.db, self.name, self.runner.runner_id, self.epoch)
+        prompt_id = None
         if prompt:
+            # La prise a transporté l'occurrence dans `current_prompt_id`,
+            # atomiquement avec le texte : on la relit. Simple lecture
+            # d'identité, sans effet : un échec laisse la clé au texte seul.
+            try:
+                taken_row = registry.get(self.db, self.name) or {}
+                if taken_row.get("current_prompt") == prompt:
+                    prompt_id = taken_row.get("current_prompt_id")
+            except Exception as exc:  # noqa: BLE001 - identité, jamais un effet
+                log_async("[%s] runner occurrence not read (%s)"
+                          % (self.name, type(exc).__name__))
+            if prompt_id is None and prompt == pending:
+                prompt_id = pending_id
+            if not retry_key or prompt != pending or prompt_id != pending_id:
+                # consigne posée entre la lecture du registre et la prise, ou
+                # occurrence/texte changés par une remise en attente : la clé
+                # suit la consigne réellement consommée (#6487).
+                retry_key = self._retry_requested(prompt, prompt_id)
+            if retry_key is not None:
+                self._retry_engaged(retry_key)
             lot = self.turn_lot({"kind": "prompt", "prompt": prompt, "ids": []})
             if self._lot_workdir_blocked(lot):
                 # #811 (B1) : la consigne attend le dossier de SON lot ; elle
@@ -6652,7 +6682,13 @@ class AgentWorker(threading.Thread):
             else:
                 self.nudged = False
                 self._reprise_attach = False
-                return {"kind": "prompt", "prompt": prompt, "ids": [], "lot": lot}
+                return {"kind": "prompt", "prompt": prompt, "ids": [], "lot": lot,
+                        "_retry_key": retry_key}
+        elif pending:
+            # l'état a été observé mais la prise a échoué (autre détenteur,
+            # bail perdu ou garde) : la relance est évitée, aucun essai
+            # consommé, la consigne en attente n'est pas touchée.
+            self._retry_avoided(pending, pending_id)
         # #2466 : un rendez-vous explicite passe avant la fenêtre de
         # regroupement du courrier ordinaire (le hook livrera le reste).
         reveil = self._scheduled_wake_spec()
@@ -6695,6 +6731,122 @@ class AgentWorker(threading.Thread):
             self._post_idle_available()
             return None
         return None
+
+    # -- journal A11 des relances automatiques (U14 suite, #6487) -----------
+    def _retry_scope(self):
+        """(projet, environnement) du journal A11 pour cet agent, ou None.
+
+        Même portée que les reprises manuelles (#6475) : le projet du fil de
+        l'agent et l'environnement staging attesté.  Une construction
+        partielle (doublures, `cfg` absent) n'écrit rien plutôt que d'inventer
+        une portée.
+        """
+        cfg = getattr(self, "cfg", None)
+        if cfg is None:
+            return None
+        try:
+            from . import fil
+            from .repair_correlation import ENVIRONNEMENT
+            return fil.project_for(cfg, fil.agent_project(self.agent)), ENVIRONNEMENT
+        except Exception:  # noqa: BLE001 - observation, jamais un effet
+            return None
+
+    def _retry_requested(self, prompt, occurrence=None):
+        """Journal la demande d'une relance (état posé) et rend sa clé.
+
+        `occurrence` est l'identité durable de la demande (#6487) : deux
+        consignes de texte identique sont deux demandes, une consigne
+        restaurée garde la sienne.  Sans identité (ligne antérieure à 0562),
+        le texte seul fait foi.
+        Best effort : un échec d'écriture est consigné et la clé reste
+        calculable — le tour, l'admission et le bail ne changent jamais.
+        """
+        try:
+            from . import repair_retry
+            scope = self._retry_scope()
+            if scope is None:
+                return None
+            key = repair_retry.runner_retry_key(scope[0], self.name, prompt,
+                                                occurrence)
+        except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
+            log_async("[%s] runner relaunch not journaled (%s)"
+                      % (self.name, type(exc).__name__))
+            return None
+        try:
+            repair_retry.observe_runner_retry_requested(
+                self.db, key=key, project=scope[0], environment=scope[1],
+                agent=self.name, log=log)
+        except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
+            log_async("[%s] runner relaunch not journaled (%s)"
+                      % (self.name, type(exc).__name__))
+        return key
+
+    def _retry_engaged(self, key):
+        """Journal la consommation de la consigne au début du tour."""
+        try:
+            from . import repair_retry
+            repair_retry.observe_runner_retry_engaged(self.db, key=key, log=log)
+        except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
+            log_async("[%s] runner engagement not journaled (%s)"
+                      % (self.name, type(exc).__name__))
+
+    def _retry_avoided(self, prompt, occurrence=None):
+        """Journal une relance évitée : un autre détenteur a consommé l'état.
+
+        La cause est lue, jamais devinée : consigne disparue ou changée =
+        autre détenteur, bail perdu, sinon admission refusée.  Aucun essai
+        n'est consommé et la consigne en attente reste intacte.
+        """
+        try:
+            from . import repair_retry
+            scope = self._retry_scope()
+            if scope is None:
+                return
+            row = registry.get(self.db, self.name) or {}
+            if row.get("pending_prompt") != prompt:
+                cause = "other_holder"
+            elif row.get("lease_owner") != self.runner.runner_id:
+                cause = "lease_lost"
+            elif row.get("status") in ("stopped", "dead"):
+                return
+            else:
+                cause = "admission_refused"
+            key = repair_retry.runner_retry_avoided_key(
+                scope[0], self.name, prompt, occurrence)
+            repair_retry.observe_runner_retry_avoided(
+                self.db, key=key, project=scope[0], environment=scope[1],
+                agent=self.name, cause=cause, log=log)
+        except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
+            log_async("[%s] avoided runner relaunch not journaled (%s)"
+                      % (self.name, type(exc).__name__))
+
+    def _retry_settled(self, key, outcome):
+        """Journal l'issue d'une relance, une seule fois."""
+        try:
+            from . import repair_retry
+            repair_retry.observe_runner_retry_settled(
+                self.db, key=key, outcome=outcome, log=log)
+        except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
+            log_async("[%s] runner relaunch outcome not journaled (%s)"
+                      % (self.name, type(exc).__name__))
+
+    def _settle_runner_retry(self, spec):
+        """Clôt l'entrée A11 du tour : achevée s'il a été lancé, unknown sur
+        perte de bail.  Un tour non lancé laisse l'entrée engagée : la
+        consigne reste en attente et sa reprise la clôt.
+
+        Le journal ne décide jamais : aucun retour, aucune exception.
+        """
+        key = spec.get("_retry_key")
+        if not key:
+            return
+        if self.lease_lost.is_set():
+            outcome = "unknown"
+        elif getattr(self, "_turn_launched", False):
+            outcome = "completed"
+        else:
+            return
+        self._retry_settled(key, outcome)
 
     @staticmethod
     def _owed_due(lines: list[str], none_marker: str) -> bool:
@@ -7639,11 +7791,16 @@ class AgentWorker(threading.Thread):
         processus mort est retiré avant que ce tour puisse écrire le sien."""
         self._purge_turn_context()
         spec = dict(spec, turn_id=uuid.uuid4().hex)
+        # #6487 : ce tour a-t-il réellement lancé son harnais ? Rempli par
+        # `_run_turn`, remis à faux ici pour qu'un report ne lise pas le tour
+        # précédent et ne clôt pas à tort la relance A11.
+        self._turn_launched = False
         try:
             return self._run_turn_or_defer(spec)
         finally:
             if spec.get("scheduled_wake"):
                 self._forget_wake_claim()
+            self._settle_runner_retry(spec)
 
     def _run_turn_or_defer(self, spec: dict) -> bool | None:
         """Exclude attach for the whole turn and life of its resident.

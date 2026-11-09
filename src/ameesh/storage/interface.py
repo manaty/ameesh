@@ -475,7 +475,11 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def set_pending_prompt(self, name: str, prompt: str | None) -> None:
-        """Pose la consigne en attente (statut `queued` si elle n'est pas nulle)."""
+        """Pose la consigne en attente (statut `queued` si elle n'est pas nulle).
+
+        Chaque mise en attente non nulle ouvre une nouvelle **occurrence**
+        (`pending_prompt_id`) : deux demandes successives de texte identique
+        restent deux demandes distinctes pour le journal A11 (#6487)."""
 
     @abc.abstractmethod
     def clear_model(self, name: str) -> None:
@@ -605,7 +609,11 @@ class Leases(Domain):
     @abc.abstractmethod
     def take_pending_prompt(self, name: str, owner: str, epoch: int) -> str | None:
         """Consomme la consigne en attente et passe l'agent en `running` ;
-        refusé (None) sur un agent `stopped` (L35)."""
+        refusé (None) sur un agent `stopped` (L35).
+
+        L'occurrence de la demande consommée est transportée atomiquement de
+        `pending_prompt_id` vers `current_prompt_id`, que le runner relit avec
+        la consigne (#6487) ; la signature du contrat médié reste inchangée."""
 
     @abc.abstractmethod
     def begin_turn(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
@@ -618,7 +626,9 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def restore_prompt(self, name: str, owner: str, epoch: int) -> bool:
-        """Remet en attente la consigne d'un tour qui n'a pas abouti."""
+        """Remet en attente la consigne d'un tour qui n'a pas abouti, avec son
+        occurrence (`current_prompt_id`) ; la même demande garde ainsi la même
+        identité pour le journal A11 (#6487)."""
 
     @abc.abstractmethod
     def end_turn(self, name: str, owner: str, epoch: int, *, status: str,

@@ -38,7 +38,8 @@ AGENT_COLUMNS = """
     name, aliases, chantier, harness, host, cwd, session_id, status, status_text, model,
     -- #4293 : binaire du harnais pour cet agent (canari/bascule d'adoption)
     harness_bin,
-    budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
+    budget_usd, spent_usd, turns, pending_prompt, pending_prompt_id,
+    current_prompt, current_prompt_id, last_error,
     -- L165 (EP3) : brief de reprise d'une relève élue, lu une fois par le
     -- nouveau détenteur (contenu libre, jamais lisible par le superviseur)
     election_brief,
@@ -989,15 +990,21 @@ class Agents(interface.Agents):
         return bool(rows)
 
     def set_pending_prompt(self, name, prompt) -> None:
+        # #6487 : chaque mise en attente non nulle est une occurrence neuve.
+        # Le texte identique peut être redemandé (consigne « continue ») : le
+        # journal A11 doit compter deux demandes, pas rejouer la première.
         self.db.execute(
             """
             UPDATE agent_registry
                SET pending_prompt = %s,
+                   pending_prompt_id = CASE
+                       WHEN %s::text IS NULL THEN NULL
+                       ELSE gen_random_uuid() END,
                    status = CASE WHEN %s::text IS NULL THEN status ELSE 'queued' END,
                    updated_at = now()
              WHERE name = %s
             """,
-            (prompt, prompt, name),
+            (prompt, prompt, prompt, name),
         )
 
     def clear_model(self, name) -> None:
@@ -1129,6 +1136,16 @@ class Leases(interface.Leases):
                                       'then check the mesh state (lots, mail, decisions, '
                                       'alerts) before acting.', __R5__)
                        ELSE __R5__ END,
+                   -- #6487 : la consigne inachevée qui repart en attente garde
+                   -- son occurrence (même demande) : sa relance ne rejoue ni
+                   -- n'ouvre une seconde tentative.
+                   pending_prompt_id = CASE
+                       WHEN r.current_prompt IS NOT NULL
+                            AND (r.lease_owner IS DISTINCT FROM %s
+                                 OR r.lease_expires_at IS NULL
+                                 OR r.lease_expires_at < clock_timestamp())
+                       THEN coalesce(r.current_prompt_id, r.pending_prompt_id)
+                       ELSE r.pending_prompt_id END,
                    current_prompt   = CASE
                        WHEN __TAKEOVER__ THEN NULL
                        WHEN r.lease_owner IS DISTINCT FROM %s
@@ -1223,7 +1240,7 @@ class Leases(interface.Leases):
         # seul l'agent sonde de la fermeture de release rouvre la condition.
         sql = sql.replace("__CANON__", canon_claim_predicate_sql("r", probe=True, host=host))
         rows = self.db.query(sql, (name, election_brief, owner, ttl_seconds,
-                                   owner, owner, owner, owner, owner))
+                                   owner, owner, owner, owner, owner, owner))
         return rows[0] if rows else None
 
     def attach_claim(self, name, owner, ttl_seconds, *, require_responsible) -> dict | None:
@@ -1594,17 +1611,25 @@ class Leases(interface.Leases):
         """Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()`
         dans l'écriture (grille codex3) : une consigne n'est pas consommée
         sous un bail expiré pendant l'attente du verrou, ni par un agent
-        arrêté entre la lecture du registre et cette écriture (L35)."""
+        arrêté entre la lecture du registre et cette écriture (L35).
+
+        #6487 : l'occurrence de la demande accompagne la consigne
+        (`pending_prompt_id` → `current_prompt_id`), relue par le runner avec
+        le texte ; la signature du contrat médié reste inchangée.
+        """
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, handoff_fenced, operator_paused, pending_prompt, lease_owner, lease_epoch,
+                SELECT name, status, handoff_fenced, operator_paused, pending_prompt,
+                       pending_prompt_id, lease_owner, lease_epoch,
                        lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
                SET pending_prompt = NULL,
+                   pending_prompt_id = NULL,
                    current_prompt = verrou.pending_prompt,
+                   current_prompt_id = verrou.pending_prompt_id,
                    status = 'running',
                    status_text = 'turn in progress',
                    updated_at = now()
@@ -1668,6 +1693,10 @@ class Leases(interface.Leases):
             return rows[0]["reason"]
 
     def restore_prompt(self, name, owner, epoch) -> bool:
+        # #6487 : l'occurrence du tour restauré revient avec sa consigne. Si
+        # une autre consigne était déjà en attente, les textes sont joints
+        # (comportement antérieur) et l'identité conservée est celle du tour
+        # restauré : c'est son engagement que le tour suivant achèvera.
         rows = self.db.query(
             """
             UPDATE agent_registry
@@ -1676,7 +1705,13 @@ class Leases(interface.Leases):
                        WHEN pending_prompt IS NULL THEN current_prompt
                        ELSE current_prompt || E'\n\n' || pending_prompt
                    END,
+                   pending_prompt_id = CASE
+                       WHEN current_prompt IS NULL THEN pending_prompt_id
+                       WHEN pending_prompt IS NULL THEN current_prompt_id
+                       ELSE coalesce(current_prompt_id, pending_prompt_id)
+                   END,
                    current_prompt = NULL,
+                   current_prompt_id = NULL,
                    status = CASE WHEN operator_paused AND status = 'running'
                                  THEN 'queued' ELSE status END,
                    updated_at = now()
