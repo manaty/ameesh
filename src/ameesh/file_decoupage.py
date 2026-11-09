@@ -47,7 +47,8 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   qui lui est assigné et membre d'un paquet dont le porteur est ouvert (le
   paquet n'a pas fusionné : son CI peut encore réclamer l'auteur), commande
   `ameesh heavy` qu'il tient sur l'hôte de la passe (les créneaux sont des
-  verrous locaux, un autre hôte n'est pas lu).
+  verrous locaux, un autre hôte n'est pas lu ; le motif nomme le créneau,
+  jamais la commande, dont l'argv peut porter un secret).
 * **#4623, la dernière note fait foi** : une note `roadmap: rouverte <projet>`
   postérieure à la dernière `roadmap: épuisée <projet>` désarme le sommeil et
   lève les dormeurs du projet dans la même passe (le geste est journalisé sur
@@ -695,8 +696,10 @@ def owed_work(db, names, lots, *, cfg=None) -> tuple:
       est encore ouvert. Le vert du paquet est à la forge, pas en base : tant
       que le porteur n'a pas fusionné, son CI peut réclamer l'auteur (constat
       #6575 : codex3 endormi alors que le paquet 513 attendait son regel) ;
-    * `heavy job running (…)` : l'agent tient un créneau `ameesh heavy` sur
-      l'hôte de la passe (`cfg` requis ; un autre hôte n'est pas lisible).
+    * `heavy job running (slot N)` : l'agent tient un créneau `ameesh heavy`
+      sur l'hôte de la passe (`cfg` requis ; un autre hôte n'est pas lisible).
+      Le numéro de créneau suffit et ne recopie jamais la commande : son argv
+      peut porter un secret, et ce motif finit dans une note partagée.
 
     Une lecture en échec rend l'erreur : l'appelant n'endort personne (le
     doute épargne, comme #4525). Le créneau heavy illisible n'épargne pas :
@@ -740,8 +743,7 @@ def owed_work(db, names, lots, *, cfg=None) -> tuple:
         for slot in slots:
             name = wanted.get(str(slot.get("agent") or "").strip().lower())
             if slot.get("busy") and name and name not in out:
-                out[name] = "heavy job running (%s)" % (
-                    str(slot.get("command") or "?")[:60])
+                out[name] = "heavy job running (slot %s)" % slot.get("slot", "?")
     return out, None
 
 

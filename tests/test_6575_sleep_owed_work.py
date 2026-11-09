@@ -130,7 +130,28 @@ class SleepOwedWorkTest(PgTestCase):
             self.addCleanup(heavy.release, held[1])
             owed, error = fd.owed_work(self.db, ["dev0", "dev1"], [], cfg=self.cfg)
         self.assertIsNone(error)
-        self.assertEqual(owed, {"dev1": "heavy job running (scripts/test.sh -p sql)"})
+        self.assertEqual(owed, {"dev1": "heavy job running (slot %d)" % held[0]})
+        self.assertNotIn("scripts/test.sh", str(owed))
+
+    def test_a_heavy_command_never_reaches_the_reason_or_journal(self):
+        # Le motif finit dans `work.note` (partagé) : une commande sentinelle
+        # ne doit sortir ni dans `why`, ni dans la note du lot de découpage.
+        split = self.exhausted_split()
+        sentinel = "FAKE_PRIVATE_COMMAND_6575"
+        with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "dev1",
+                                          "AMEESH_MAX_HEAVY_SUITES": "1"}):
+            held = heavy.acquire(self.cfg, command=sentinel)
+            self.addCleanup(heavy.release, held[1])
+            owed, error = fd.owed_work(self.db, ["dev0", "dev1"], [], cfg=self.cfg)
+            self.assertIsNone(error)
+            self.assertEqual(owed, {"dev1": "heavy job running (slot %d)" % held[0]})
+            self.assertNotIn(sentinel, str(owed))
+            fd._journal_exemption(self.db, split, "dev1", owed["dev1"],
+                                  since_ts=self.t0)
+        notes = "\n".join(self.notes(split))
+        self.assertNotIn(sentinel, notes)
+        self.assertIn("sleep exempted: dev1: heavy job running (slot %d)" % held[0],
+                      notes)
 
     def test_unreadable_owed_work_sleeps_nobody(self):
         split = self.exhausted_split()
