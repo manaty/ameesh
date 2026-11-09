@@ -2208,6 +2208,15 @@ def _last_brief_ts(entry: dict) -> float:
     return max(sent, reminded)
 
 
+def _disk_brief_critical(key: str) -> bool:
+    """#6556 : le palier critique d'une clé `host_disk_soon_full` (#5563) ;
+    une clé illisible compte critique (l'entrée tombe, comme avant)."""
+    try:
+        return bool(json.loads(key)[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return True
+
+
 def brief_key_of(alert: dict) -> str:
     """Identité d'un brief d'agent : une alerte et une fenêtre (#3236).
 
@@ -3324,6 +3333,14 @@ class Notifier:
                     # de chaque hôte disparaît d'une passe puis revient (et
                     # oscille au seuil de 50 %). C'est la même pause, déjà
                     # briefée : pas de courrier par retour avant la relance.
+                    continue
+                if entry.get("type") == "host_disk_soon_full" \
+                        and not _disk_brief_critical(key) \
+                        and now - _last_brief_ts(entry) < alert_briefs.REMIND_AFTER_S:
+                    # #6556 : un disque stable au seuil (85 %) quitte une
+                    # passe puis revient (20,0 puis 20,1 GiB libres) ; c'est
+                    # le même avertissement, déjà briefé. Le passage au
+                    # critique change la clé (#5563) et part tout de suite.
                     continue
                 if entry.get("type") == "slo_breach" and entry.get("lot"):
                     # #2602: a planned wait or a clock crossing below a
