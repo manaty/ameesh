@@ -265,8 +265,15 @@ relation `unknown`), et une récidive d'une cause exacte sans preuve de version
 reste `same_cause_version_unknown`, jamais `old_version` ; le reçu conserve le
 verdict A4 et sa raison. Un `fingerprint_key` invalide est isolé par signal
 depuis `aa300b26` : la page U5 est soldée avant l'observation, et l'échec d'un
-reçu n'interrompt ni les autres signaux ni le curseur. Le producteur d'alias
-est suivi par #6485, l'injection du prédicat par #6486.
+reçu n'interrompt ni les autres signaux ni le curseur. L'injection du
+prédicat est faite par #6486. Depuis #6485, le balayage des alertes lit le
+champ `fingerprint_key` de l'événement `alert.raised` et le porte jusqu'à A3
+par le chemin de production. Une clé absente ou JSON `null` ne crée aucun
+alias. Une clé inutilisable (non textuelle, vide, trop longue, secret ou
+adresse) refuse sa ligne en `invalid_envelope`, comptée, au lieu de faire
+perdre le reçu après réception. Aucun émetteur d'alerte n'écrit encore ce
+champ : l'alias reste dormant en production jusqu'à ce qu'un producteur
+l'écrive, et `github_watch` n'en a pas.
 
 **Coût/risque/classe.** 5 h. Risques : deux causes fusionnées ou une rafale
 de récidives. Outil léger pour `fingerprints.py`, sensible pour son stockage ;

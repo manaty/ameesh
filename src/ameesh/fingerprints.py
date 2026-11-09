@@ -186,6 +186,20 @@ def _check_no_secret(text: str, field: str) -> None:
                                "not export personal data" % field)
 
 
+def historical_alias(app: str, key) -> str:
+    """#6485: the alias ``empreinte:<app>:<key>`` of a producer's historical key.
+
+    The same validation as :func:`source_of`, plus the no-secret guard of the
+    lot journal: the alias ends up in a receipt. A non-string key is refused,
+    never coerced. Raises :class:`FingerprintError`.
+    """
+    if not isinstance(key, str):
+        raise FingerprintError("historical fingerprint key: a string is required")
+    alias = source_of(app, key)
+    _check_no_secret(alias, 'historical fingerprint alias')
+    return alias
+
+
 def _count(value, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise FingerprintError("%s: an integer is required" % field)
@@ -985,8 +999,7 @@ def observe_cause(db, signal, triage, *, lot=None, legacy_key=None, active=None,
     # A missing producer alias stays the native id: a symptom key is never
     # fabricated from the cause identity.
     if legacy_key is not None:
-        alias = source_of(signal.project, legacy_key)
-        _check_no_secret(alias, 'historical fingerprint alias')
+        alias = historical_alias(signal.project, legacy_key)
     scope = (signal.project, signal.environment, signal.source)
     if active is None and signal.observed_version and signal.project == 'ameesh':
         active = correlation.active_view(db)
