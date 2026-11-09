@@ -1109,10 +1109,10 @@ publier_suivi() {  # etat [options de staging_watch…]
   instantane=$(python3 - "$JOURNAL" "$SUIVI_RUN" "$SHA" "$SUIVI_DEBUT" \
     "$SUIVI_DELAI" "$NOTIF_STAGING" "$etat" "$DEPUIS" "$SUIVI_COURANTE" \
     "$SUIVI_PROGRES" "$SUIVI_SILENCE_S" "$SUIVI_PLAFOND_TOUR_S" \
-    "$SUIVI_BASE_HOTE_S" "$SUIVI_RUNNERS_DEFAUT" <<'PY'
+    "$SUIVI_BASE_HOTE_S" "$SUIVI_RUNNERS_DEFAUT" "${HOTE_LOCAL:-}" <<'PY'
 import calendar, json, os, sys, time
 (path, run, sha, start, duration, notify, state, since, current_path,
- runners_path, silence, cap, base, default_runners) = sys.argv[1:]
+ runners_path, silence, cap, base, default_runners, launcher_host) = sys.argv[1:]
 duration = float(duration)
 if not 0 < duration < float('inf'):
     raise SystemExit('STAGING_TIMEOUT_S must be finite and positive')
@@ -1186,7 +1186,7 @@ if host:
                        'deadline': first[host] + budget,
                        'installed': bool(hosts.get(host, {}).get('installed'))}
 print(json.dumps(dict(run=run, sha=sha, started=float(start),
-                     deadline=float(start)+duration, state=state,
+                     deadline=float(start)+duration, state=state, host=launcher_host,
                      hosts=hosts, notify=notify, beat=time.time(), progress=progress,
                      silence_s=silence, stall_s=stall)))
 PY

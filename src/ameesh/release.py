@@ -315,6 +315,9 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
     every tick of its window and leave no trace outside the release host.
     The durable `last_error` is still kept for the missed report's cause, and
     the de-duplication stays per cutoff so a retry loop mails once.
+
+    #6520: before alarming, read the cutoff's tag and the staging holder. A
+    tag whose own staging holds the lock is information, never "aucun tag".
     """
     from . import release_cutoff
     if getattr(exc, "already_reported", False):
@@ -322,6 +325,7 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
         # preflight closes its pending; there is no state to resume).
         return
     transient = isinstance(exc, release_cutoff.TransientReleaseError)
+    busy = isinstance(exc, release_cutoff.ReleaseBusy)
     try:
         state = release_cutoff.load_state(cfg)
         slot = release_cutoff.project_state(state, project.name)
@@ -333,6 +337,93 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
             # A missing calendar can itself be the failure being reported.
             # Keep the previous once-per-error behavior until it is readable.
             cutoff_at, _label = None, ""
+        if project.model != "nexlink":
+            # #6520: before alarming, read the cutoff's tag and who holds the
+            # staging door. A tag published at/after the cutoff is a durable
+            # fact: never say "aucun tag" again, and a lock held by that tag's
+            # own staging is information, not an incident.
+            tag = (release_cutoff.cutoff_tag(project, cutoff_at, now)
+                   if cutoff_at is not None else None)
+            holders = []
+            if busy:
+                try:
+                    holders = release_cutoff.staging_holders(project, db)
+                except Exception:  # noqa: BLE001 - diagnostics never mask the error
+                    holders = []
+            same = [holder for holder in holders
+                    if tag and holder.get("sha") == tag["commit"]]
+            if busy and "another release holds" in text:
+                # The running tick on this host owns the cutoff and reports
+                # it; a lock contention is not a release failure.
+                return
+            if tag and busy and same:
+                if (slot.get("staging_info") == text
+                        and slot.get("staging_info_cutoff") == cutoff_at):
+                    return
+                slot["staging_info_cutoff"] = cutoff_at
+                slot["staging_info"] = text
+                slot["staging_info_at"] = now
+                release_cutoff.save_state(cfg, state)
+                if db is not None:
+                    by = ((" par %s" % same[0]["host"])
+                          if same[0].get("host") else "")
+                    body = ("Coupure %s faite%s : tag %s sur %s. Staging en cours "
+                            "(%s).\n\nRien à corriger : le staging de cette coupure "
+                            "est déjà lancé et aucun second tag ne sera posé. "
+                            "L'attestation suivra."
+                            % (tag["version"], by, tag["tag"], tag["commit"][:12],
+                               release_cutoff.staging_holder_text(same[0])))
+                    report = {"schema": release_cutoff.SCHEMA, "result": "staging-info",
+                              "project": project.name, "cutoff_at": cutoff_at,
+                              "label": _label, "completed_at": now, "message": text,
+                              "tag": tag["tag"], "version": tag["version"],
+                              "release_sha": tag["commit"],
+                              "staging_holders": holders}
+                    if cutoff_at is not None:
+                        report["report_path"] = release_cutoff.write_report(
+                            cfg, project, dict(report, version=tag["version"]))
+                    release_cutoff.send_report(cfg, db, project, body, report,
+                                               urgent=False)
+                return
+            if (slot.get("last_error") == text
+                    and slot.get("last_error_cutoff") == cutoff_at):
+                return
+            slot["last_error_cutoff"] = cutoff_at
+            slot["last_error"] = text
+            slot["last_error_at"] = now
+            release_cutoff.save_state(cfg, state)
+            if db is not None:
+                detail = (" Le staging est tenu par %s."
+                          % release_cutoff.staging_holders_text(holders)
+                          if holders else " Détenteur du verrou non lisible.")
+                if tag:
+                    body = ("Release %s : coupure %s déjà taguée (%s sur %s). %s%s\n\n"
+                            "Aucun second tag ne sera posé ; corriger la cause nommée."
+                            % (tag["version"], _label, tag["tag"],
+                               tag["commit"][:12], text, detail))
+                else:
+                    body = ("Release %s NON faite%s : %s%s\n\n"
+                            "Aucun tag, aucun déploiement. Corrige la cause ; le "
+                            "prochain tick réessaiera tant que la coupure est dans "
+                            "sa fenêtre."
+                            % (project.name,
+                               " (erreur transitoire)" if transient else "",
+                               text, detail))
+                report = {"schema": release_cutoff.SCHEMA, "result": "refused",
+                          "project": project.name, "cutoff_at": cutoff_at,
+                          "label": _label, "completed_at": now, "message": text,
+                          "staging_holders": holders}
+                if tag:
+                    report.update(tag=tag["tag"], version=tag["version"],
+                                  release_sha=tag["commit"])
+                if transient:
+                    report["transient"] = True
+                if cutoff_at is not None:
+                    report["report_path"] = release_cutoff.write_report(
+                        cfg, project, dict(report,
+                                           version=tag["version"] if tag else "refused"))
+                release_cutoff.send_report(cfg, db, project, body, report, urgent=True)
+            return
         if (slot.get("last_error") == text
                 and slot.get("last_error_cutoff") == cutoff_at):
             return
