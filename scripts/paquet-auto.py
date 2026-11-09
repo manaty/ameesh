@@ -313,6 +313,45 @@ PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
 KEEP_READY_REASON = "coupure suivante : recomposition"
 KEEP_REFROZEN_REASON = "coupure suivante : tête regelée"
 KEEP_NOT_READY_REASON = "coupure suivante : membre non prêt"
+#: #6567 : un moteur de conteneurs inutilisable dans l'environnement du test.
+#: Ces signes le prouvent seuls : le message du shim du ménage
+#: (`menage/bin/docker` sans `AMEESH_REAL_DOCKER`), l'exécutable introuvable,
+#: ou le démon injoignable dit par le client lui-même.
+CONTAINER_ENGINE_UNUSABLE = (
+    r"ameesh: container engine not found|"
+    r"No such file or directory: '(?:[^']*/)?(?:docker|podman)'|"
+    r"Cannot connect to the (?:Docker|Podman) daemon|"
+    r"Is the docker daemon running|error during connect|"
+    r"unable to connect to Podman socket")
+DAEMON_UNREACHABLE_RE = re.compile(
+    r"Cannot connect to the (?:Docker|Podman) daemon|"
+    r"Is the docker daemon running|error during connect|"
+    r"unable to connect to Podman socket", re.IGNORECASE)
+#: #6567 : une commande docker/podman en échec. **Seul, son code ne prouve
+#: rien** : un moteur sain rend aussi 127 quand la commande lancée dans le
+#: conteneur est introuvable (`docker run busybox foo`, B/P2 cx1). L'échec ne
+#: compte comme environnement que si la sonde `<exécutable> info`, dans
+#: l'environnement de la série (`container_engine_state`), prouve le moteur
+#: absent (127, exécutable introuvable : n'excuse qu'un 127) ou son démon
+#: injoignable (excuse tout code). C'est le cas h-16, où le shim écrivait son
+#: message sur un stderr capturé par le test. La sonde vise l'exécutable
+#: **tel qu'écrit** (`exe`) : un nom nu par le `PATH` de la série, un chemin
+#: absolu tel quel ; un chemin relatif dépend du cwd du test, inconnu ici, et
+#: ne se prouve jamais (B/P2 cx1, second tour).
+CONTAINER_FAILED_RE = re.compile(
+    r"Command '(?:\[')?(?P<exe>(?:[^'\s]*/)?(?:docker|podman))'?[,\s][^\n]*"
+    r"returned non-zero exit status (?P<code>\d+)")
+ENGINE_ABSENT = "absent"
+ENGINE_UNREACHABLE = "unreachable"
+
+
+def engine_failure_excused(found: re.Match, unusable: frozenset) -> bool:
+    """#6567 : cet échec docker/podman est-il expliqué par la sonde ?"""
+    exe, code = found.group("exe"), int(found.group("code"))
+    return ((exe, ENGINE_UNREACHABLE) in unusable
+            or (code == 127 and (exe, ENGINE_ABSENT) in unusable))
+
+
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 #: #4217 : un `tearDownClass`/`setUpClass` en `QueryCanceled` (statement
 #: timeout, base de test chargée) est une panne d'infrastructure, jamais un
@@ -323,7 +362,8 @@ INCONCLUSIVE_RE = re.compile(
     r"psql: error|No such file or directory: 'psql'|"
     r"could not translate host name|Temporary failure in name resolution|"
     r"QueryCanceled|canceling statement|statement timeout|timeout expired|"
-    r"ModuleNotFoundError: No module named 'psycopg)",
+    r"ModuleNotFoundError: No module named 'psycopg|"
+    + CONTAINER_ENGINE_UNUSABLE + r")",
     re.IGNORECASE,
 )
 #: #4221 : un QueryCanceled ou un lock timeout **reproduit** en rejouant seul,
@@ -347,7 +387,8 @@ ENV_MESSAGE_RE = re.compile(
     r"No such file or directory: 'psql'|"
     r"could not translate host name|Temporary failure in name resolution|"
     r"canceling statement|statement timeout|timeout expired|"
-    r"No module named 'psycopg'",
+    r"No module named 'psycopg'|"
+    + CONTAINER_ENGINE_UNUSABLE,
     re.IGNORECASE,
 )
 #: une ligne de résumé unittest
@@ -752,6 +793,10 @@ class TestRun:
     #: #4887 : rouges de voisins conservés faute de rejeu de base concluant ;
     #: consignés non attribués, la ci-full tranche.
     unattributed: list[str] = field(default_factory=list)
+    #: #6567 : `(exécutable tel qu'écrit, état)` des moteurs prouvés
+    #: inutilisables par la sonde (`container_engine_state`) dans
+    #: l'environnement de la série : `absent` ou `unreachable`.
+    unusable_engines: frozenset = frozenset()
 
     @property
     def green(self) -> bool:
@@ -770,7 +815,8 @@ class TestRun:
                 re.findall(r"(\w+)=(\d+)", found.group(1))}
 
     @staticmethod
-    def _error_is_environment(block: str) -> bool:
+    def _error_is_environment(block: str,
+                              unusable_engines: frozenset = frozenset()) -> bool:
         """La dernière exception effective du bloc est-elle une panne ?
 
         Le **nom du type** ne suffit pas : `AssertionError: expected
@@ -792,6 +838,12 @@ class TestRun:
         if name == "QueryCanceled":
             return True
         if ENV_MESSAGE_RE.search(message):
+            return True
+        # #6567 : un échec de docker/podman n'est une panne que si la sonde de
+        # cet exécutable, dans l'environnement de la série, l'a prouvé absent
+        # (127 seulement) ou son démon injoignable.
+        failed = CONTAINER_FAILED_RE.search(message)
+        if failed and engine_failure_excused(failed, unusable_engines):
             return True
         if name in ("ModuleNotFoundError", "ImportError") and "psycopg" in message:
             return True
@@ -854,7 +906,7 @@ class TestRun:
             rest = self.output[header.end():]
             end = BLOCK_END_RE.search(rest)
             block = rest[:end.start()] if end else rest
-            if self._error_is_environment(block):
+            if self._error_is_environment(block, self.unusable_engines):
                 env_error = True
             else:
                 return True
@@ -865,7 +917,9 @@ class TestRun:
             return True
         if errors and not env_error:
             return True
-        if not headers and not summary and not INCONCLUSIVE_RE.search(self.output):
+        if not headers and not summary and not INCONCLUSIVE_RE.search(self.output) \
+                and not any(engine_failure_excused(found, self.unusable_engines)
+                            for found in CONTAINER_FAILED_RE.finditer(self.output)):
             # rc 1 sans en-tête ni résumé ni motif connu : un rouge, jamais
             # un non-concluant présumé.
             return True
@@ -902,6 +956,10 @@ class TestRun:
         if self.returncode not in (0, 1):
             return "code de retour %s" % self.returncode
         found = INCONCLUSIVE_RE.search(self.output)
+        if not found and self.unusable_engines:
+            return ("moteur de conteneurs inutilisable dans l'environnement des "
+                    "tests (%s)" % ", ".join("%s info : %s" % pair for pair in
+                                              sorted(self.unusable_engines)))
         return _one_line(found.group(0)) if found else "résultat non concluant"
 
     def excerpt(self, lines: int = 3) -> str:
@@ -996,11 +1054,57 @@ def _tail(text: str, lines: int = 40) -> str:
     return "\n".join(kept)
 
 
+#: la marque du script d'étiquetage d'un tour (L73, `containers.SHIM`),
+#: stable d'une version du shim à l'autre
+CONTAINER_SHIM_MARK = "# Posé par ameesh (L73)"
+
+
+def _is_container_shim(path: str) -> bool:
+    """Le script d'étiquetage d'un tour (L73), pas un moteur."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return CONTAINER_SHIM_MARK in handle.read(256)
+    except OSError:
+        return False
+
+
+def real_container_engines(env: dict) -> dict:
+    """#6567 (attendu 2) : les moteurs réels à déclarer au shim du `PATH`.
+
+    Quand le premier `docker`/`podman` du `PATH` est le shim du ménage et que
+    `AMEESH_REAL_<MOTEUR>` manque (ou ne désigne pas un exécutable réel), le
+    shim sort en 127 : un test de l'arbre jetable n'aurait aucun moteur alors
+    que l'hôte en a un (h-16). On déclare le premier vrai moteur du même
+    `PATH`, comme le tour le fait pour ses tests ciblés (`install_shims`).
+    Sans vrai moteur, rien n'est déclaré : l'absence reste vraie et la sonde
+    la prouve.
+    """
+    path = env.get("PATH") or os.defpath
+    declared = {}
+    for name in ("docker", "podman"):
+        variable = "AMEESH_REAL_%s" % name.upper()
+        current = env.get(variable) or ""
+        if current and os.access(current, os.X_OK) and not _is_container_shim(current):
+            continue
+        first = shutil.which(name, path=path)
+        if not first or not _is_container_shim(first):
+            continue
+        for directory in path.split(os.pathsep):
+            found = shutil.which(name, path=directory or os.curdir)
+            if found and not _is_container_shim(found):
+                declared[variable] = found
+                break
+    return declared
+
+
 def python_env(worktree: Path) -> dict:
     """L'environnement des outils exécutés depuis l'arbre jetable."""
     env = dict(os.environ)
     env["PYTHONPATH"] = str(worktree / "src")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # #6567 : le shim du ménage du PATH reçoit son vrai moteur, comme les
+    # tests ciblés d'un tour ; sinon `docker` y sort en 127.
+    env.update(real_container_engines(env))
     return env
 
 
@@ -2263,7 +2367,7 @@ def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
         run = run_tests(path, "base", present, timeout=timeout, **walled)
         if run.inconclusive:
             return None
-        return {failure["test"] for failure in unittest_failures(run.output)}
+        return {failure["test"] for failure in unittest_failures(run.output, _unusable(run))}
     finally:
         remove_worktree(worktree, path)
 
@@ -2399,6 +2503,61 @@ def run_walled(cmd: list[str], *, cwd: Path, env: dict,
     return None
 
 
+_ENGINE_PROBES: dict[tuple, bool] = {}
+
+
+def container_engine_state(executable: str, env: dict) -> str:
+    """#6567 : l'état du moteur `executable` dans l'environnement `env`.
+
+    Sonde `<executable> info`, qui ne lance aucune commande dans un
+    conteneur. `absent` : 127 (shim du ménage sans moteur réel) ou exécutable
+    introuvable ; `unreachable` : démon injoignable, dit par le client ;
+    `ok` : réponse ; `unknown` sinon (délai, autre erreur) — rien n'est prouvé
+    et le rouge reste un rouge. C'est **l'exécutable de la commande en échec**
+    qui est sondé : un nom nu par le `PATH` de la série, un chemin absolu tel
+    quel ; un chemin relatif (cwd du test inconnu) reste `unknown`. Une
+    réponse par exécutable, `PATH` et moteurs réels déclarés, pour tout le
+    lancement.
+    """
+    if "/" in executable and not executable.startswith("/"):
+        return "unknown"
+    key = (executable, env.get("PATH", ""), env.get("AMEESH_REAL_DOCKER", ""),
+           env.get("AMEESH_REAL_PODMAN", ""))
+    if key not in _ENGINE_PROBES:
+        try:
+            proc = subprocess.run([executable, "info"], env=env, capture_output=True,
+                                  stdin=subprocess.DEVNULL, timeout=20)
+        except FileNotFoundError:
+            state = ENGINE_ABSENT
+        except (OSError, subprocess.SubprocessError):
+            state = "unknown"
+        else:
+            said = _decode(proc.stdout) + "\n" + _decode(proc.stderr)
+            if proc.returncode == 0:
+                state = "ok"
+            elif proc.returncode == 127:
+                state = ENGINE_ABSENT
+            elif DAEMON_UNREACHABLE_RE.search(said):
+                state = ENGINE_UNREACHABLE
+            else:
+                state = "unknown"
+        _ENGINE_PROBES[key] = state
+    return _ENGINE_PROBES[key]
+
+
+def probe_engines(result: TestRun, env: dict) -> TestRun:
+    """#6567 : sonde les exécutables cités par un échec de la série, eux seuls."""
+    if result.returncode == 1 and result.output:
+        executables = {found.group("exe")
+                       for found in CONTAINER_FAILED_RE.finditer(result.output)}
+        states = {executable: container_engine_state(executable, env)
+                  for executable in sorted(executables)}
+        result.unusable_engines = frozenset(
+            (executable, state) for executable, state in states.items()
+            if state in (ENGINE_ABSENT, ENGINE_UNREACHABLE))
+    return result
+
+
 def run_tests(worktree: Path, label: str, modules: list[str], *,
               timeout: int, heavy: bool = False,
               wall: int | None = None, failfast: bool = False) -> TestRun:
@@ -2433,16 +2592,17 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
                 output="borne totale des tests par unité atteinte après %d s "
                        "(attente du créneau comprise) : série arrêtée (#4463)" % wall,
                 seconds=time.monotonic() - start, timed_out=True))
-        return save_test_log(TestRun(
+        return save_test_log(probe_engines(TestRun(
             label=label, modules=list(modules), returncode=proc.returncode,
             output=_output(proc), seconds=time.monotonic() - start,
-            timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT))
+            timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT), env))
     try:
         proc = run_command(cmd, cwd=worktree, timeout=timeout + wait, env=env)
-        result = TestRun(label=label, modules=list(modules),
-                       returncode=proc.returncode, output=_output(proc),
-                       seconds=time.monotonic() - start,
-                       timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT)
+        result = probe_engines(TestRun(
+            label=label, modules=list(modules),
+            returncode=proc.returncode, output=_output(proc),
+            seconds=time.monotonic() - start,
+            timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT), env)
     except PaquetAutoError as exc:
         result = TestRun(label=label, modules=list(modules), returncode=None,
                        output=str(exc), seconds=time.monotonic() - start,
@@ -3183,14 +3343,21 @@ def check_client_types(worktree: Path, base_sha: str, *,
                 modules.unlink()
 
 
-def unittest_failures(output: str) -> list[dict]:
+def _unusable(run) -> frozenset:
+    """#6567 : les moteurs prouvés inutilisables d'une série (vide hors `TestRun`)."""
+    return getattr(run, "unusable_engines", frozenset()) or frozenset()
+
+
+def unittest_failures(output: str,
+                      unusable_engines: frozenset = frozenset()) -> list[dict]:
     """Les échecs d'une sortie unittest, au format des échecs de CI (#3801).
 
     `FAIL: test_x (tests.test_module.Class.test_x)` et
     `ERROR: setUpClass (tests.test_module.Class)` donnent le même nom pointé
     que la CI ; un sous-test (`... (i=1)`) ne change pas le nom. Une
     `ERROR:` d'environnement (psql/psycopg absent) n'est pas un rouge du lot :
-    elle est ignorée, comme `TestRun.real_failure` la classe.
+    elle est ignorée, comme `TestRun.real_failure` la classe. #6567 :
+    `unusable_engines` est celui de la série (`TestRun.unusable_engines`).
     """
     seen: set[str] = set()
     out: list[dict] = []
@@ -3202,7 +3369,7 @@ def unittest_failures(output: str) -> list[dict]:
             rest = (output or "")[match.end():]
             end = BLOCK_END_RE.search(rest)
             block = rest[:end.start()] if end else rest
-            if TestRun._error_is_environment(block):
+            if TestRun._error_is_environment(block, unusable_engines):
                 continue
         seen.add(test)
         module = ""
@@ -3349,7 +3516,7 @@ def prefix_failures(worktree: Path, composition: Composition,
                 return {}, ("préfixe %d (#%d) non concluant : %s"
                             % (index, unit.lot, run.motive())), []
             failed = {entry["test"]
-                      for entry in unittest_failures(run.output)}
+                      for entry in unittest_failures(run.output, _unusable(run))}
             if not run.green and not failed:
                 return {}, ("préfixe %d (#%d) rouge sans nom de test"
                             % (index, unit.lot)), []
@@ -3436,7 +3603,7 @@ def earlier_red(worktree: Path, composition: Composition,
             label = "préfixe de #%d (rouge de #%d)" % (earlier.lot, removal.lot)
             run = replay(path, label, names, timeout=limit,
                          **({"wall": limit} if deadline is not None else {}))
-            failed = ({entry["test"] for entry in unittest_failures(run.output)}
+            failed = ({entry["test"] for entry in unittest_failures(run.output, _unusable(run))}
                       if not run.inconclusive and not run.green else set())
             if failed and all(_failure_matches(name, failed) for name in names):
                 innocent[removal.lot] = earlier.lot
@@ -3800,7 +3967,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                 "continue" % (unit.lot, run.motive()))
             continue
         if not run.green:
-            found = unittest_failures(run.output)
+            found = unittest_failures(run.output, _unusable(run))
             proper_names = {module.split(".", 1)[1] for module in proper}
             mine = set(proper_names)
             neighbor = {row["module"].split(".", 1)[1] for row in added}
@@ -3902,7 +4069,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         red.append((contract, [{"test": name, "module": ""}
                                for name in contract.failed_tests]
                     if isinstance(contract, FlowTestRun)
-                    else unittest_failures(contract.output)))
+                    else unittest_failures(contract.output, _unusable(contract))))
         log("tests contrats : ROUGE (%d modules)\n%s"
             % (len(modules), _tail(contract.output)))
     else:

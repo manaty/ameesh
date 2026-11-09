@@ -2660,9 +2660,12 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 pending = None
             lease = (_staging_execution_holder(db, options)
                      if isinstance(pending, dict) else None)
+            sequences = (_staging_sequences(db)
+                         if isinstance(pending, dict)
+                         and not pending.get("execution") else None)
             if (isinstance(pending, dict)
                     and pending.get("sha") == release_sha
-                    and _staging_request_active(pending, lease)):
+                    and _staging_request_active(pending, lease, sequences)):
                 return {"exit": 75, "queued": True, "duration_s": 0.0, "log": "",
                         "summary": [], "attestation": None,
                         "request": pending.get("request"),
@@ -3102,6 +3105,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
         state_slot["last_result"] = "refused-no-green"
         state_slot["last_label"] = label
         state_slot.pop("last_error", None)
+        state_slot.pop("last_error_key", None)
         report = {"schema": SCHEMA, "result": "refused-no-green",
                   "project": project.name, "version": plan.version,
                   "target_head": plan.head, "cutoff_at": at, "label": label,
@@ -3129,6 +3133,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
         state_slot["last_result"] = "nothing-new"
         state_slot["last_label"] = label
         state_slot.pop("last_error", None)
+        state_slot.pop("last_error_key", None)
         report = {"schema": SCHEMA, "result": "nothing-new", "project": project.name,
                   "version": plan.version, "tag": plan.previous["tag"],
                   "release_sha": plan.previous["commit"], "target_head": plan.head,
@@ -3198,6 +3203,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
         state_slot["last_result"] = "refused-push"
         state_slot["last_label"] = label
         state_slot.pop("last_error", None)
+        state_slot.pop("last_error_key", None)
         report = {"schema": SCHEMA, "result": "refused-push", "project": project.name,
                   "version": plan.version, "release_sha": version_sha,
                   "target_head": plan.head, "cutoff_at": at, "label": label,
@@ -3342,7 +3348,8 @@ def _staging_execution_holder(db, options: dict) -> dict | None:
         return None
 
 
-def _staging_request_active(request: dict | None, lease: dict | None) -> bool:
+def _staging_request_active(request: dict | None, lease: dict | None,
+                            sequences: dict | None = None) -> bool:
     """Whether a shared staging request proves live staging (#6520 review).
 
     A terminal or blocked request never does: its commit must not be lent to
@@ -3351,6 +3358,12 @@ def _staging_request_active(request: dict | None, lease: dict | None) -> bool:
     held, the request counts only if the attempt recorded that execution
     (#6520 second review), so a foreign execution is never mistaken for the
     cutoff's staging.
+
+    #6584: an older writer (N-1) does not write the request's `execution`
+    field. A running request without it is not inactive by default: the live
+    shared sequence of its own run, on the same commit and host, is the proof
+    (#4880 log). The lease, when held, must name that same host. No sequence,
+    no proof: an orphan lease stays an orphan and is still alarmed.
     """
     if not isinstance(request, dict):
         return False
@@ -3358,11 +3371,43 @@ def _staging_request_active(request: dict | None, lease: dict | None) -> bool:
         return False
     state = str(request.get("state") or "")
     owner = str((lease or {}).get("owner") or "")
+    execution = str(request.get("execution") or "")
     if state == "pending":
-        return not lease or (bool(owner) and request.get("execution") == owner)
+        return not lease or (bool(owner) and execution == owner)
     if state == "running":
-        return bool(owner) and request.get("execution") == owner
+        if execution:
+            return bool(owner) and execution == owner
+        # N-1 writer: attach the request to the lease by host and run, else
+        # to the in-flight sequence alone. The expiry is not read here.
+        run = str(request.get("run") or "")
+        sequence = (sequences or {}).get(run) if run else None
+        if not sequence:
+            return False
+        if str(sequence.get("sha") or "") != str(request.get("sha") or ""):
+            return False
+        request_host = str(request.get("host") or "")
+        sequence_host = str(sequence.get("host") or "")
+        if request_host and sequence_host and request_host != sequence_host:
+            return False
+        if owner:
+            owner_bits = owner.split(":")
+            lease_host = owner_bits[1] if len(owner_bits) > 2 else ""
+            if not request_host or lease_host != request_host:
+                return False
+        return True
     return False
+
+
+def _staging_sequences(db) -> dict:
+    """The live shared sequences by run (#6584); a diagnostic read only."""
+    if db is None:
+        return {}
+    try:
+        rows = storage.of(db).events.latest_type(
+            staging_watch.EVENT, 60, staging_watch.LIMIT)
+        return staging_watch.in_flight(rows)
+    except Exception:  # noqa: BLE001 - a diagnostic read never blocks a report
+        return {}
 
 
 def staging_holders(project: ProjectRelease, db) -> list[dict]:
@@ -3374,17 +3419,39 @@ def staging_holders(project: ProjectRelease, db) -> list[dict]:
 
     A lease is only that request's staging when the running request records
     the same execution (new attempts) — a terminal or foreign request never
-    lends its commit to an orphan lease (#6520 review).
+    lends its commit to an orphan lease (#6520 review). #6584: an N-1 request
+    without `execution` is attached by its host and live run instead, and a
+    live sequence merges into the entry it proves rather than being dropped.
     """
     if db is None:
         return []
     holders: list[dict] = []
+    sequences = _staging_sequences(db)
 
     def add(holder: dict) -> None:
         if not holder:
             return
-        if any(h.get("execution") == holder.get("execution")
-               and h.get("host") == holder.get("host") for h in holders):
+        for existing in holders:
+            if (existing.get("execution") != holder.get("execution")
+                    or existing.get("host") != holder.get("host")):
+                continue
+            # A blocked request is named aside: a live sequence never proves
+            # that blocked handoff itself (#6520).
+            if existing.get("blocked_reason") or holder.get("blocked_reason"):
+                break
+            # #6584: only the same commit may merge; a sequence of another
+            # release keeps its own entry and never lends its activity.
+            if (holder.get("sha") and existing.get("sha")
+                    and holder["sha"] != existing["sha"]):
+                break
+            if holder.get("active") and not existing.get("active"):
+                existing["active"] = True
+            if (holder.get("state") == "running"
+                    and existing.get("state") in ("", "held", "pending")):
+                existing["state"] = "running"
+            for field in ("sha", "started", "version", "tag", "expires_at"):
+                if not existing.get(field) and holder.get(field):
+                    existing[field] = holder[field]
             return
         holders.append(holder)
 
@@ -3403,7 +3470,7 @@ def staging_holders(project: ProjectRelease, db) -> list[dict]:
                 sha = str(request.get("sha") or "")
                 request_host = str(request.get("host") or "")
                 request_run = str(request.get("run") or "")
-                active = _staging_request_active(request, lease)
+                active = _staging_request_active(request, lease, sequences)
                 if active:
                     add({"kind": "elected", "active": True,
                          "host": request_host or (owner_host if lease else ""),
@@ -3429,16 +3496,11 @@ def staging_holders(project: ProjectRelease, db) -> list[dict]:
                              "blocked_reason": str(request.get("blocked_reason") or "")})
         except Exception:  # noqa: BLE001 - a diagnostic read never blocks a report
             pass
-    try:
-        rows = storage.of(db).events.latest_type(
-            staging_watch.EVENT, 60, staging_watch.LIMIT)
-        for run, data in staging_watch.in_flight(rows).items():
-            add({"kind": "sequence", "active": True,
-                 "host": str(data.get("host") or ""),
-                 "execution": run, "sha": str(data.get("sha") or ""),
-                 "state": "running", "started": data.get("started")})
-    except Exception:  # noqa: BLE001 - a diagnostic read never blocks a report
-        pass
+    for run, data in sequences.items():
+        add({"kind": "sequence", "active": True,
+             "host": str(data.get("host") or ""),
+             "execution": run, "sha": str(data.get("sha") or ""),
+             "state": "running", "started": data.get("started")})
     by_commit = _tags_by_commit(project)
     for holder in holders:
         row = by_commit.get(holder.get("sha"))
@@ -3532,6 +3594,7 @@ def finish(cfg, db, project: ProjectRelease, report: dict, state: dict,
         state_slot["last_label"] = label
         state_slot["last_result"] = result
         state_slot.pop("last_error", None)
+        state_slot.pop("last_error_key", None)
         state_slot["last_release"] = {"version": report.get("version", ""),
                                       "tag": report.get("tag", ""),
                                       "sha": report.get("release_sha", ""),
@@ -3559,6 +3622,7 @@ def finish(cfg, db, project: ProjectRelease, report: dict, state: dict,
     state_slot["last_label"] = label
     state_slot["last_result"] = result
     state_slot.pop("last_error", None)
+    state_slot.pop("last_error_key", None)
     state_slot.pop("staging_queued_request", None)
     state_slot.pop("staging_queued_cutoff", None)
     state_slot["last_release"] = {"version": report.get("version", ""),
