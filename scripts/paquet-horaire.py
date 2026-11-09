@@ -122,7 +122,10 @@ composition précédente moins les exclus, chacun à sa source composée ; un lo
 prêt entre-temps, un membre regelé ou sorti de la liste prête va à la coupure
 suivante, nommé aux écartés. La **preuve parallèle** (#4319, `parallel-proof`),
 qui rejoue la ci-full ordinaire sur le même porteur, passe par le même chemin
-et la même borne.
+et la même borne. Une recomposition qui a publié une tête — ou l'a publiée
+puis retirée — n'est jamais lue comme « rien composé » : l'abandon du porteur
+exige la preuve que la branche porte encore sa tête de départ ; à défaut, il
+reste ouvert et un agent lit (#6561).
 
 #3256 C : quand la médiane d'attente `qa_merge` de la veille dépasse
 `paquet.attente_mediane_s` (bloc du canon compilé, lu avec `ameesh debit
@@ -209,6 +212,17 @@ MARK_STUCK = MARK + "reprise épuisée "
 #: composition (§3, non concluant) : il ne consomme pas de tentative
 MARK_FENCED = MARK + "non concluant "
 MARK_EXCLUDED = MARK + "exclu "
+#: #6561 : une composition a publié une tête (ou l'a publiée puis retirée) ;
+#: l'abandon du porteur exige la preuve qu'aucune tête neuve n'est sur la
+#: branche. À défaut, le porteur reste ouvert et un agent lit.
+MARK_PUBLISHED = MARK + "tête publiée, abandon refusé "
+#: #6561 : les sorties de `paquet-auto` qui n'ont composé aucune unité sans
+#: publier. « aucune unité après recomposition » n'en fait pas partie : une
+#: composition a été enregistrée, puis toutes ses unités retirées.
+EMPTY_COMPOSITION_RE = re.compile(
+    r"^(aucun lot prêt|aucune unité composée)", re.MULTILINE)
+WITHDRAWN_COMPOSITION_RE = re.compile(
+    r"^aucune unité après recomposition", re.MULTILINE)
 COMPOSITION = "composition"
 RECOMPOSITION = "recomposition"
 ATTEMPT_RE = re.compile(
@@ -1438,7 +1452,8 @@ def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
                or last.publish.endswith("@" + sha))
         # un gel posé après « reprise épuisée » est la main d'un agent
         stuck = [float(ev.get("created_ts") or 0) for ev in _events(item)
-                 if str(ev.get("note") or "") == MARK_STUCK + last.key
+                 if str(ev.get("note") or "").startswith(
+                     (MARK_STUCK + last.key, MARK_PUBLISHED + last.key))
                  and float(ev.get("created_ts") or 0) >= last.ts]
         if own and not achieved(item, sha, last.ts) \
                 and not (stuck and frozen_ts(item) > stuck[-1]):
@@ -1488,6 +1503,11 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
         # #4329 : le verrou du paquet prime le pid de la marque, qui peut être
         # celui d'une tentative morte.
         return "#%d : composition en cours (%s)" % (carrier, holder)
+    if any(note.startswith(MARK_PUBLISHED + this.key) for note in marks(item)):
+        # #6561 : la composition a publié une tête puis n'a rien laissé ; le
+        # porteur a été laissé ouvert pour son pilote, le tic n'y recompose pas.
+        return "#%d : %s abandonnée après publication, déjà signalée (#6561)" % (
+            carrier, this.step)
     if running(ctx, this, name):
         return "#%d : %s en cours (%s:%d)" % (carrier, this.step, this.host, this.pid)
     # #4501 : la tête poussée est sous ci-full ; un second composeur ne
@@ -1559,6 +1579,29 @@ def tested_since(item: dict, since: float) -> tuple[str, str, str] | None:
         if match:
             found = match.groups() if match.group(3) != "-" else None
     return found
+
+
+def remote_branch_head(ctx: Context, branch: str) -> str | None:
+    """#6561 : la tête de la branche sur la forge ; None si la lecture échoue.
+
+    Une branche absente rend "" ; une lecture impossible ne prouve rien et
+    rend None (l'appelant ne conclut alors pas). L'abandon d'un porteur exige
+    la preuve qu'aucune tête neuve n'y a été publiée : la branche doit porter
+    encore la tête de départ de la tentative.
+    """
+    if not branch:
+        return ""
+    ref = "refs/heads/" + branch
+    result = ctx.git("ls-remote", "origin", ref, timeout=120)
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        sha, _, found = line.partition("\t")
+        if found.strip() != ref:
+            continue
+        sha = sha.strip()
+        return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+    return ""
 
 
 def after_compose(ctx: Context, carrier: int, name: str, result: Result,
@@ -1665,8 +1708,9 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                  % (carrier, name, result.returncode, step, this.n, MAX_ATTEMPTS,
                     auto._tail(result.text, 30)))
         raise HoraireError("paquet-auto rc %d pour %s" % (result.returncode, name))
-    if re.search(r"^(aucun lot prêt|aucune unité)", result.stdout, re.MULTILINE):
-        reason = "rien composé (%s)" % step
+    empty = EMPTY_COMPOSITION_RE.search(result.stdout)
+    withdrawn = WITHDRAWN_COMPOSITION_RE.search(result.stdout)
+    if empty or withdrawn:
         # #5970 : garder le diagnostic et prévenir avant la clôture ; le
         # courrier lié à un lot clos serait refusé par agent-mail.
         lines = result.text.splitlines()
@@ -1678,6 +1722,27 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
             if line.startswith("écarté #"):
                 kept.add(i)
         diagnostic = "\n".join(lines[i] for i in sorted(kept))
+        head = remote_branch_head(ctx, auto.package_branch(name))
+        # #6561 : une recomposition publiée n'est jamais « rien composé ».
+        # L'abandon (annulation des runs, clôture du porteur) exige la preuve
+        # qu'aucune tête neuve n'est publiée sur la branche : elle doit porter
+        # encore la tête de départ. Une lecture impossible ne prouve rien.
+        if withdrawn is not None or head != this.base:
+            where = ("tête %s sur la branche" % head[:12] if head
+                     else "aucune tête lisible sur la branche")
+            ctx.note(carrier, "%s%s n=%d tête=%s\n\n%s" % (
+                MARK_PUBLISHED, this.key, this.n,
+                (head or "absente")[:12], diagnostic))
+            ctx.mail(ctx.pilot, carrier,
+                     "#%d %s : %s ; %s, abandon refusé (#6561). "
+                     "Porteur laissé ouvert : un agent lit et décide.\n\n%s"
+                     % (carrier, name,
+                        "recomposition sans unité après retrait" if withdrawn
+                        else "composition vide avec une tête déjà publiée",
+                        where, diagnostic))
+            return "#%d %s : abandon refusé, %s (#6561)" % (
+                carrier, name, where)
+        reason = "rien composé (%s)" % step
         ctx.note(carrier, "%s%s\n\n%s" % (MARK, reason, diagnostic))
         ctx.mail(ctx.pilot, carrier, "#%d %s : %s, clôture du porteur vide.\n\n%s"
                  % (carrier, name, reason, diagnostic))
