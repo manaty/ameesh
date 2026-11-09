@@ -12,7 +12,7 @@ import json
 
 from .. import interface
 from .registry import (
-    NAME_LOCK_SQL, PASSIVE_SQL, canon_governed_sql, name_lock_key)
+    NAME_LOCK_SQL, NOT_EXTERNAL_SQL, PASSIVE_SQL, canon_governed_sql, name_lock_key)
 
 #: projet du fil d'un agent (`fil.agent_project`), en SQL : son équipe s'il est
 #: gouverné par le canon, sinon son chantier, désormais `workstream` (un
@@ -45,6 +45,9 @@ MAIL_COLUMNS = """
 #: registre ou arrêté (`stopped`) — personne ne le lira. Une ligne par
 #: (destinataire, expéditeur) ; partagé avec la vue par projet
 #: (`storage.postgres.projects`), qui le lit dans sa requête unique.
+#: #6424 : une boîte `externe` (session humaine hors exécuteur) n'est jamais
+#: morte : son courrier attend sa prochaine session, il n'est ni compté ni
+#: expiré comme une souffrance.
 DEAD_LETTERS_SQL = """
     SELECT m.recipient, m.sender, count(*)::bigint AS n,
            extract(epoch from min(m.created_at))::float8 AS oldest_ts,
@@ -54,6 +57,7 @@ DEAD_LETTERS_SQL = """
       LEFT JOIN agent_registry r ON r.name = m.recipient
      WHERE m.delivered_at IS NULL
        AND (r.name IS NULL OR r.status = 'stopped')
+       AND coalesce(r.mode, 'execute') <> 'externe'
        -- L124 : une demande de décision attend un humain (`human:<id>`),
        -- jamais un agent : elle n'est pas en souffrance
        AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
@@ -509,18 +513,23 @@ class Mailbox(interface.Mailbox):
         )
 
     def pending_recipients(self) -> list[str]:
+        # #6424 : une boîte `externe` n'est soldée par aucun runner ; son
+        # courrier reste en attente, hors des lectures de service.
         return [row["recipient"] for row in self.db.query(
-            "SELECT DISTINCT recipient FROM agent_mailbox WHERE delivered_at IS NULL"
+            "SELECT DISTINCT m.recipient FROM agent_mailbox m"
+            " WHERE m.delivered_at IS NULL AND " + NOT_EXTERNAL_SQL.format(t="m")
         )]
 
     def pending_recipients_sorted(self) -> list[str]:
         return [row["recipient"] for row in self.db.query(
-            "SELECT DISTINCT recipient FROM agent_mailbox "
-            "WHERE delivered_at IS NULL ORDER BY recipient")]
+            "SELECT DISTINCT m.recipient FROM agent_mailbox m"
+            " WHERE m.delivered_at IS NULL AND " + NOT_EXTERNAL_SQL.format(t="m")
+            + " ORDER BY m.recipient")]
 
     def unread_total(self) -> int:
         return self.db.query(
-            "SELECT count(*)::int AS n FROM agent_mailbox WHERE delivered_at IS NULL"
+            "SELECT count(*)::int AS n FROM agent_mailbox m"
+            " WHERE m.delivered_at IS NULL AND " + NOT_EXTERNAL_SQL.format(t="m")
         )[0]["n"]
 
     # -- demandes d'humains sans lot (L130) -----------------------------------

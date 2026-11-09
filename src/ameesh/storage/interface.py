@@ -1751,22 +1751,25 @@ class Mailbox(Domain):
 
     @abc.abstractmethod
     def pending_recipients(self) -> list[str]:
-        """Destinataires qui ont du courrier non remis."""
+        """Destinataires qui ont du courrier non remis, hors boîtes d'agents en
+        mode `externe` (#6424 : aucune session d'exécuteur ne les solde)."""
 
     @abc.abstractmethod
     def pending_recipients_sorted(self) -> list[str]:
         """Destinataires qui ont du courrier non remis, par ordre de nom
-        (`export-v0`)."""
+        (`export-v0`), hors boîtes d'agents en mode `externe` (#6424)."""
 
     @abc.abstractmethod
     def unread_total(self) -> int:
-        """Nombre de messages non remis, tous destinataires confondus (`doctor`)."""
+        """Nombre de messages non remis, hors boîtes d'agents en mode `externe`
+        (#6424 ; `doctor`)."""
 
     @abc.abstractmethod
     def dead_letters(self) -> list[dict]:
         """Courrier en souffrance : non remis, dont le destinataire est absent du
-        registre ou arrêté. Une ligne par (destinataire, expéditeur) :
-        `recipient`, `sender`, `n`, `oldest_ts`, `newest_ts`, `unknown`."""
+        registre ou arrêté, jamais un agent en mode `externe` (#6424). Une ligne
+        par (destinataire, expéditeur) : `recipient`, `sender`, `n`, `oldest_ts`,
+        `newest_ts`, `unknown`."""
 
     @abc.abstractmethod
     def forward(self, old: str, new: str, by: str) -> list[dict]:

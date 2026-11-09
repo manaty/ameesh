@@ -23,6 +23,7 @@ from ameesh import work_lifecycle as lifecycle
 from .. import interface
 from .decisions import PENDING_BOARD_SQL
 from .mailbox import DEAD_LETTERS_SQL
+from .registry import NOT_EXTERNAL_SQL
 
 #: états de lot terminés (même liste que `work_items` ailleurs)
 _CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
@@ -40,10 +41,11 @@ def _lot_ref(expr: str) -> str:
 
 _BOARD_SQL = """
 WITH unread AS (
-    SELECT recipient, count(*)::bigint AS n
-      FROM agent_mailbox
-     WHERE delivered_at IS NULL
-     GROUP BY recipient
+    SELECT m.recipient, count(*)::bigint AS n
+      FROM agent_mailbox m
+     WHERE m.delivered_at IS NULL
+       AND __NOT_EXTERNAL__
+     GROUP BY m.recipient
 ), spend AS (
     SELECT agent, coalesce(sum(usd), 0)::float8 AS usd_24h, count(*)::bigint AS turns_24h
       FROM turn_costs
@@ -173,6 +175,7 @@ SELECT (SELECT coalesce(json_agg(agents ORDER BY agents.name), '[]'::json) FROM 
   .replace("__CITED_SCAN__", str(CITED_SCAN)) \
   .replace("__CLOSED__", _CLOSED) \
   .replace("__DEAD__", DEAD_LETTERS_SQL.strip()) \
+  .replace("__NOT_EXTERNAL__", NOT_EXTERNAL_SQL.format(t="m")) \
   .replace("__DECISIONS__", PENDING_BOARD_SQL)
 
 
