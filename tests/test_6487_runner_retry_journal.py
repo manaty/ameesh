@@ -25,10 +25,13 @@ PROJECT = "ameesh"
 ENVIRONMENT = "staging"
 AGENT = "dev"
 PROMPT = "reprends le lot #12"
+#: identité d'occurrence de la demande (#6487), posée avec la consigne
+OCCURRENCE = "occ-1"
 
 
-def _row(pending=PROMPT, *, lease_owner="r", status="queued"):
+def _row(pending=PROMPT, *, occurrence=OCCURRENCE, lease_owner="r", status="queued"):
     return {"status": status, "pending_prompt": pending,
+            "pending_prompt_id": occurrence if pending else None,
             "lease_owner": lease_owner, "lease_epoch": 1,
             "team": PROJECT, "chantier": "", "canon_governed": True}
 
@@ -84,7 +87,7 @@ class RunnerRetryHooksTest(unittest.TestCase):
 
     def test_a_queued_instruction_is_requested_then_engaged_once(self):
         w = self._worker()
-        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT)
+        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT, OCCURRENCE)
         with mock.patch.object(
                 repair_retry, "observe_runner_retry_requested") as requested, \
                 mock.patch.object(repair_retry, "observe_runner_retry_engaged") as engaged:
@@ -128,7 +131,7 @@ class RunnerRetryHooksTest(unittest.TestCase):
         self.assertEqual(avoided.call_args.kwargs["agent"], "rlx")
         # aucune tentative consommée par l'évitée : clé distincte et dédiée
         self.assertNotEqual(avoided.call_args.kwargs["key"],
-                            repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT))
+                            repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT, OCCURRENCE))
 
     def test_a_refused_admission_is_avoided_with_its_own_cause(self):
         w = self._worker()
@@ -155,11 +158,11 @@ class RunnerRetryHooksTest(unittest.TestCase):
         self.assertEqual(spec["prompt"], PROMPT)
         # la clé reste connue : l'issue pourra être tentative plus tard
         self.assertEqual(spec["_retry_key"],
-                         repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT))
+                         repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT, OCCURRENCE))
 
     def test_a_turn_that_launched_is_settled_completed(self):
         w = self._worker()
-        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT)
+        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT, OCCURRENCE)
 
         def run_turn_spec(spec):
             w._turn_launched = True
@@ -175,7 +178,7 @@ class RunnerRetryHooksTest(unittest.TestCase):
 
     def test_a_lost_lease_settles_unknown(self):
         w = self._worker()
-        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT)
+        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT, OCCURRENCE)
 
         def lost(spec):
             w._turn_launched = True
@@ -191,7 +194,7 @@ class RunnerRetryHooksTest(unittest.TestCase):
 
     def test_a_turn_that_never_launched_leaves_the_entry_engaged(self):
         w = self._worker()
-        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT)
+        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT, OCCURRENCE)
         w._run_turn_or_defer = mock.Mock(return_value=None)  # tour différé
         w._purge_turn_context = mock.Mock()
         with mock.patch.object(repair_retry, "observe_runner_retry_settled") as settled:
@@ -209,7 +212,7 @@ class RunnerRetryHooksTest(unittest.TestCase):
 
     def test_a_settlement_failure_never_changes_the_turn(self):
         w = self._worker()
-        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT)
+        key = repair_retry.runner_retry_key(PROJECT, "rlx", PROMPT, OCCURRENCE)
 
         def run_turn_spec(spec):
             w._turn_launched = True
@@ -268,10 +271,13 @@ class RunnerRetryPickIntegrationTest(PgTestCase):
             return w._pick()
 
     def test_the_real_pick_engages_the_journal_entry(self):
+        occurrence = registry.get(self.db, "dev")["pending_prompt_id"]
+        self.assertTrue(occurrence)  # #6487 : posée avec la consigne
         w = self._worker(self.epoch)
         spec = self._pick(w)
         self.assertEqual(spec["kind"], "prompt")
-        key = repair_retry.runner_retry_key(PROJECT, "dev", "consigne du lot")
+        key = repair_retry.runner_retry_key(PROJECT, "dev", "consigne du lot",
+                                            occurrence)
         self.assertEqual(spec["_retry_key"], key)
         record = repair_retry.from_record(
             storage.of(self.db).repair_signals.retry_get(key))
@@ -282,31 +288,109 @@ class RunnerRetryPickIntegrationTest(PgTestCase):
         row = registry.get(self.db, "dev")
         self.assertIsNone(row["pending_prompt"])
         self.assertEqual(row["status"], "running")
+        current = self.db.query(
+            "SELECT current_prompt_id FROM agent_registry WHERE name='dev'")[0]
+        self.assertEqual(str(current["current_prompt_id"]), str(occurrence))
+
+    def test_two_successive_identical_instructions_are_two_entries(self):
+        """Le scénario du B : le même texte redemandé après un tour achevé."""
+        first = self._pick(self._worker(self.epoch))
+        first_key = first["_retry_key"]
+        self.assertTrue(repair_retry.observe_runner_retry_settled(
+            self.db, key=first_key, outcome="completed"))
+        # la consigne est redemandée, texte identique : demande neuve
+        registry.set_pending_prompt(self.db, "dev", "consigne du lot")
+        second = self._pick(self._worker(self.epoch))
+        self.assertNotEqual(second["_retry_key"], first_key)
+        self.assertEqual(
+            repair_retry.from_record(storage.of(self.db).repair_signals.retry_get(
+                first_key)).state, "completed")
+        self.assertEqual(
+            repair_retry.from_record(storage.of(self.db).repair_signals.retry_get(
+                second["_retry_key"])).state, "engaged")
 
 
 class RunnerRetryKeyTest(unittest.TestCase):
-    """La clé est stable entre détenteurs et propre à la consigne."""
+    """La clé est stable entre détenteurs et propre à l'occurrence."""
 
     def test_one_queued_instruction_has_one_key(self):
         self.assertEqual(
-            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT),
-            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT))
-        self.assertRegex(repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT),
-                         r"^[0-9a-f]{64}$")
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, OCCURRENCE),
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, OCCURRENCE))
+        self.assertRegex(
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, OCCURRENCE),
+            r"^[0-9a-f]{64}$")
         self.assertNotEqual(
-            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT),
-            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT + " bis"))
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, OCCURRENCE),
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT + " bis",
+                                          OCCURRENCE))
         self.assertNotEqual(
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, OCCURRENCE),
+            repair_retry.runner_retry_avoided_key(PROJECT, AGENT, PROMPT,
+                                                  OCCURRENCE))
+
+    def test_the_same_text_under_two_occurrences_is_two_requests(self):
+        """Le B codex1 : deux demandes identiques ne partagent pas la clé."""
+        self.assertNotEqual(
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, "occ-1"),
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, "occ-2"))
+        # une ligne antérieure à 0562, sans occurrence, garde une clé calculable
+        self.assertRegex(
             repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT),
-            repair_retry.runner_retry_avoided_key(PROJECT, AGENT, PROMPT))
+            r"^[0-9a-f]{64}$")
 
     def test_the_prompt_text_never_enters_the_journal(self):
         record = repair_retry.Retry(
             project=PROJECT, environment=ENVIRONMENT, origin="automatic",
             intent="turn.retry", cause="unknown", episode="agent:" + AGENT,
-            idempotency_key=repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT),
+            idempotency_key=repair_retry.runner_retry_key(
+                PROJECT, AGENT, PROMPT, OCCURRENCE),
             requested_at="2026-11-09T12:00:00Z", attempt=1)
         self.assertNotIn(PROMPT, repr(record.record()))
+
+
+class PendingPromptOccurrenceTest(PgTestCase):
+    """#6487 : l'occurrence est posée, transportée et rendue avec la consigne."""
+
+    def setUp(self):
+        super().setUp()
+        suffix = self.id().rsplit(".", 1)[-1].replace("_", "-")[:40]
+        self.agent = "occ-" + suffix
+        registry.upsert(self.db, self.agent, harness="codex", host="source")
+        lease = registry.claim(self.db, self.agent, "runner", ttl_seconds=300)
+        self.epoch = lease["lease_epoch"]
+
+    def prompt_id(self):
+        return registry.get(self.db, self.agent)["pending_prompt_id"]
+
+    def take(self):
+        prompt = registry.take_pending_prompt(
+            self.db, self.agent, "runner", self.epoch)
+        row = registry.get(self.db, self.agent)
+        return {"prompt": prompt, "id": row["current_prompt_id"]}
+
+    def test_a_new_enqueue_renews_the_occurrence(self):
+        registry.set_pending_prompt(self.db, self.agent, "continue")
+        first = self.prompt_id()
+        self.assertTrue(first)
+        taken = self.take()
+        self.assertEqual(taken["prompt"], "continue")
+        self.assertEqual(str(taken["id"]), str(first))
+        # même texte, nouvelle mise en attente : c'est une demande neuve
+        registry.set_pending_prompt(self.db, self.agent, "continue")
+        second = self.prompt_id()
+        self.assertTrue(second)
+        self.assertNotEqual(str(second), str(first))
+
+    def test_a_restored_request_keeps_its_occurrence(self):
+        registry.set_pending_prompt(self.db, self.agent, "continue")
+        first = self.prompt_id()
+        self.assertEqual(str(self.take()["id"]), str(first))
+        self.assertTrue(registry.restore_prompt(
+            self.db, self.agent, "runner", self.epoch))
+        # la même demande, restaurée : même occurrence, pas une seconde
+        self.assertEqual(str(self.prompt_id()), str(first))
+        self.assertEqual(str(self.take()["id"]), str(first))
 
 
 class RunnerRetryJournalStorageTest(PgTestCase):
@@ -323,10 +407,11 @@ class RunnerRetryJournalStorageTest(PgTestCase):
         self.project = "ameesh-" + suffix
         self.agent = "dev-" + suffix[:40]
         self.prompt = PROMPT + ":" + suffix
+        self.occurrence = "occ-" + suffix[:40]
 
     def key(self):
         return repair_retry.runner_retry_key(self.project, self.agent,
-                                             self.prompt)
+                                             self.prompt, self.occurrence)
 
     def requested(self, key, **kw):
         values = dict(project=self.project, environment=ENVIRONMENT,
@@ -350,7 +435,7 @@ class RunnerRetryJournalStorageTest(PgTestCase):
         self.assertTrue(repair_retry.observe_runner_retry_engaged(self.db, key=key))
         self.assertFalse(repair_retry.observe_runner_retry_engaged(self.db, key=key))
         avoid = repair_retry.runner_retry_avoided_key(
-            self.project, self.agent, self.prompt)
+            self.project, self.agent, self.prompt, self.occurrence)
         self.assertTrue(repair_retry.observe_runner_retry_avoided(
             self.db, key=avoid, project=self.project, environment=ENVIRONMENT,
             agent=self.agent, cause="other_holder"))
@@ -389,6 +474,21 @@ class RunnerRetryJournalStorageTest(PgTestCase):
         self.assertEqual(record.origin, "automatic")
         self.assertEqual(record.intent, "turn.retry")
         self.assertEqual(record.episode, "agent:" + self.agent)
+
+    def test_two_identical_requests_are_two_entries(self):
+        """Le B codex1 : même texte, deux occurrences = deux demandes."""
+        first = repair_retry.runner_retry_key(
+            self.project, self.agent, self.prompt, "occ-a")
+        second = repair_retry.runner_retry_key(
+            self.project, self.agent, self.prompt, "occ-b")
+        self.assertNotEqual(first, second)
+        for key in (first, second):
+            self.assertTrue(self.requested(key)["created"])
+            self.assertTrue(repair_retry.observe_runner_retry_engaged(
+                self.db, key=key))
+            self.assertTrue(repair_retry.observe_runner_retry_settled(
+                self.db, key=key, outcome="completed"))
+            self.assertEqual(self.record(key).state, "completed")
 
     def test_the_report_counts_runner_relaunches_next_to_manual_resumes(self):
         key = self.key()

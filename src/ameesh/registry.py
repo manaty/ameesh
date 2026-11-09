@@ -832,7 +832,8 @@ def take_pending_prompt(db: Db, name: str, owner: str, epoch: int) -> str | None
 
     Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()` dans
     l'écriture (grille codex3) : une consigne n'est pas consommée sous un bail
-    expiré pendant l'attente du verrou.
+    expiré pendant l'attente du verrou. L'occurrence de la demande consommée
+    est relue dans `current_prompt_id` (#6487).
     """
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.take_pending_prompt")

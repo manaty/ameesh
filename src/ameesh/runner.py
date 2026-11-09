@@ -6648,15 +6648,30 @@ class AgentWorker(threading.Thread):
         # le bail, la rotation ni l'ordre des tours.
         retry_key = None
         pending = (self.agent or {}).get("pending_prompt")
+        pending_id = (self.agent or {}).get("pending_prompt_id")
         if pending:
-            retry_key = self._retry_requested(pending)
-        prompt = registry.take_pending_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            retry_key = self._retry_requested(pending, pending_id)
+        prompt = registry.take_pending_prompt(
+            self.db, self.name, self.runner.runner_id, self.epoch)
+        prompt_id = None
         if prompt:
-            if not retry_key or prompt != pending:
+            # La prise a transporté l'occurrence dans `current_prompt_id`,
+            # atomiquement avec le texte : on la relit. Simple lecture
+            # d'identité, sans effet : un échec laisse la clé au texte seul.
+            try:
+                taken_row = registry.get(self.db, self.name) or {}
+                if taken_row.get("current_prompt") == prompt:
+                    prompt_id = taken_row.get("current_prompt_id")
+            except Exception as exc:  # noqa: BLE001 - identité, jamais un effet
+                log_async("[%s] runner occurrence not read (%s)"
+                          % (self.name, type(exc).__name__))
+            if prompt_id is None and prompt == pending:
+                prompt_id = pending_id
+            if not retry_key or prompt != pending or prompt_id != pending_id:
                 # consigne posée entre la lecture du registre et la prise, ou
-                # texte changé par une remise en attente : la clé suit la
-                # consigne réellement consommée.
-                retry_key = self._retry_requested(prompt)
+                # occurrence/texte changés par une remise en attente : la clé
+                # suit la consigne réellement consommée (#6487).
+                retry_key = self._retry_requested(prompt, prompt_id)
             if retry_key is not None:
                 self._retry_engaged(retry_key)
             lot = self.turn_lot({"kind": "prompt", "prompt": prompt, "ids": []})
@@ -6673,7 +6688,7 @@ class AgentWorker(threading.Thread):
             # l'état a été observé mais la prise a échoué (autre détenteur,
             # bail perdu ou garde) : la relance est évitée, aucun essai
             # consommé, la consigne en attente n'est pas touchée.
-            self._retry_avoided(pending)
+            self._retry_avoided(pending, pending_id)
         # #2466 : un rendez-vous explicite passe avant la fenêtre de
         # regroupement du courrier ordinaire (le hook livrera le reste).
         reveil = self._scheduled_wake_spec()
@@ -6736,9 +6751,13 @@ class AgentWorker(threading.Thread):
         except Exception:  # noqa: BLE001 - observation, jamais un effet
             return None
 
-    def _retry_requested(self, prompt):
+    def _retry_requested(self, prompt, occurrence=None):
         """Journal la demande d'une relance (état posé) et rend sa clé.
 
+        `occurrence` est l'identité durable de la demande (#6487) : deux
+        consignes de texte identique sont deux demandes, une consigne
+        restaurée garde la sienne.  Sans identité (ligne antérieure à 0562),
+        le texte seul fait foi.
         Best effort : un échec d'écriture est consigné et la clé reste
         calculable — le tour, l'admission et le bail ne changent jamais.
         """
@@ -6747,7 +6766,8 @@ class AgentWorker(threading.Thread):
             scope = self._retry_scope()
             if scope is None:
                 return None
-            key = repair_retry.runner_retry_key(scope[0], self.name, prompt)
+            key = repair_retry.runner_retry_key(scope[0], self.name, prompt,
+                                                occurrence)
         except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
             log_async("[%s] runner relaunch not journaled (%s)"
                       % (self.name, type(exc).__name__))
@@ -6770,7 +6790,7 @@ class AgentWorker(threading.Thread):
             log_async("[%s] runner engagement not journaled (%s)"
                       % (self.name, type(exc).__name__))
 
-    def _retry_avoided(self, prompt):
+    def _retry_avoided(self, prompt, occurrence=None):
         """Journal une relance évitée : un autre détenteur a consommé l'état.
 
         La cause est lue, jamais devinée : consigne disparue ou changée =
@@ -6792,7 +6812,7 @@ class AgentWorker(threading.Thread):
             else:
                 cause = "admission_refused"
             key = repair_retry.runner_retry_avoided_key(
-                scope[0], self.name, prompt)
+                scope[0], self.name, prompt, occurrence)
             repair_retry.observe_runner_retry_avoided(
                 self.db, key=key, project=scope[0], environment=scope[1],
                 agent=self.name, cause=cause, log=log)

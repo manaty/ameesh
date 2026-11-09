@@ -160,8 +160,11 @@ FERMEES = {
     # #5250 (0531) : politique de contexte par agent et état du pilote : rien à
     # superviser au-delà de `turn.context`, aucun droit de plus.
     # #6040 (0553) : seuil de compaction par agent, même classement.
+    # #6487 (0562) : identité d'occurrence d'une consigne en attente, lue par
+    # le runner seul ; aucune lecture superviseur, aucun GRANT ajouté.
     "agent_registry": {"review_hold", "session_max_tokens", "turn_reread_budget",
-                       "session_reread_budget", "context_pilot", "compact_tokens"},
+                       "session_reread_budget", "context_pilot", "compact_tokens",
+                       "pending_prompt_id", "current_prompt_id"},
     "work_review_withdrawals": {"work_item_id", "reviewer", "withdrawn"},
     # #4872 / 0526: budget authority and relay accounting remain closed to
     # supervisor roles; classification grants no additional access.

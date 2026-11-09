@@ -477,21 +477,23 @@ def observe_manual_resume_avoided(db, *, project, environment, agent, actor,
 RUNNER_INTENT = "turn.retry"
 
 
-def runner_retry_key(project, agent, prompt):
-    """La clé d'idempotence d'une consigne en attente, stable entre détenteurs.
+def runner_retry_key(project, agent, prompt, occurrence=None):
+    """La clé d'idempotence d'une demande de relance, stable entre détenteurs.
 
-    La consigne est l'identité de la relance : deux détenteurs qui observent
-    le même état ``pending_prompt`` calculent la même clé, et une consigne
-    remise en attente après une interruption (perte de bail, retrait d'hôte,
-    préemption) ne rejoue pas la tentative.  Le texte de la consigne n'est
-    jamais écrit : seul son condensé entre dans la clé.
+    L'identité est l'**occurrence** de la demande (``pending_prompt_id``,
+    #6487), pas son seul texte : deux consignes successives de texte identique
+    (« continue ») sont deux demandes, tandis qu'une consigne remise en attente
+    après une interruption (perte de bail, retrait d'hôte, préemption) garde
+    son occurrence et ne rejoue pas la tentative.  Sans identité (ligne posée
+    avant 0562), le texte seul fait foi.  Le texte n'est jamais écrit : seul
+    son condensé entre dans la clé.
     """
-    return key_of("runner.turn", project, agent, prompt)
+    return key_of("runner.turn", project, agent, prompt, occurrence or "")
 
 
-def runner_retry_avoided_key(project, agent, prompt):
+def runner_retry_avoided_key(project, agent, prompt, occurrence=None):
     """La clé d'une relance évitée par idempotence (un autre détenteur)."""
-    return key_of("runner.turn.avoid", project, agent, prompt)
+    return key_of("runner.turn.avoid", project, agent, prompt, occurrence or "")
 
 
 def observe_runner_retry_requested(db, *, key, project, environment, agent,
