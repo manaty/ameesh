@@ -34,7 +34,8 @@
                                                 (the actor of work commands: --actor, otherwise
                                                 the session's bound identity, otherwise "inconnu")
   agent-mesh import-v0 [--agents a,b] [--dry-run]     cutover: v0 file mailbox → Postgres
-  agent-mesh export-v0 [--agents a,b] [--keep]        rollback: Postgres → v0 mailbox
+  agent-mesh export-v0 [--agents a,b | --all] [--keep] [--allow-live-executors REASON]
+                                                rollback: Postgres → v0 mailbox
   agent-mesh migrate [--dry-run | --additive-only]   --additive-only: nothing if a migration is not additive (L151)
   agent-mesh doctor [--notify-test | --probe [--all-bases]]
   agent-mesh canon check|show|sync [--json] [--host H]   OKF canon (spec §4)
@@ -3422,16 +3423,46 @@ def cmd_export_v0(cfg: Config, args: argparse.Namespace) -> int:
 
     Par défaut c'est un déplacement : les messages sont marqués remis en base,
     pour que la v0 reprenne la main sans doublon.
+
+    #6534 : ce déplacement n'est jamais silencieux. Il faut nommer les boîtes
+    (`--agents`) ou toutes les prendre (`--all`) ; un mesh vivant exige
+    `--allow-live-executors REASON` (comme `migrate`) ; une demande de décision
+    n'est jamais marquée remise, sa remise la clôturant « sans réponse ni
+    retrait ». Le geste est journalisé (acteur, boîtes, lignes).
     """
-    from . import mail
+    from . import events, mail
     state = os.path.expanduser(args.state or cfg.v0_state)
     db = _open(cfg)
     try:
-        names = ([n.strip() for n in args.agents.split(",") if n.strip()]
-                 if args.agents else storage.of(db).mailbox.pending_recipients_sorted())
+        explicit = args.agents is not None
+        if explicit:
+            names = [n.strip() for n in args.agents.split(",") if n.strip()]
+            if not names:
+                print("export-v0 refused: --agents names no mailbox", file=sys.stderr)
+                return 2
+        else:
+            names = storage.of(db).mailbox.pending_recipients_sorted()
+        live = db.query(
+            "SELECT name FROM agent_registry"
+            " WHERE lease_owner IS NOT NULL AND lease_expires_at > clock_timestamp()"
+            " ORDER BY name")
+        override = (args.allow_live_executors or "").strip()
+        if live and not override:
+            print("export-v0 refused: live executor lease(s): %s"
+                  % ", ".join(row["name"] for row in live), file=sys.stderr)
+            print("stop the executors, or use --allow-live-executors REASON "
+                  "(the reason is journaled)", file=sys.stderr)
+            return 1
         total = 0
+        kept_decisions = 0
         for name in names:
             rows = mail.unread(db, name)
+            decisions = [row for row in rows if mail.is_decision_request(row)]
+            rows = [row for row in rows if not mail.is_decision_request(row)]
+            if decisions:
+                kept_decisions += len(decisions)
+                print("%s: %d decision request(s) kept pending in the database"
+                      % (name, len(decisions)))
             if not rows:
                 continue
             directory = os.path.join(state, "inbox", name)
@@ -3451,6 +3482,23 @@ def cmd_export_v0(cfg: Config, args: argparse.Namespace) -> int:
                 name, len(rows), "" if args.keep else " (marked delivered in the database)"))
             total += len(rows)
         print("%d message(s) exported to %s" % (total, state))
+        if kept_decisions:
+            print("%d decision request(s) kept pending (never marked delivered)"
+                  % kept_decisions)
+        actor = identity.resolve_binding(cfg, db).name or work.UNKNOWN_ACTOR
+        try:
+            events.record(
+                db, "mail.export", "mailbox:export-v0",
+                agent=os.environ.get("AGENT_MAIL_NAME") or None,
+                actor=actor, host=cfg.host, runner=cfg.runner, pid=os.getpid(),
+                all=not explicit, keep=bool(args.keep), boxes=len(names),
+                exported=total, kept_decisions=kept_decisions,
+                live_executors=[row["name"] for row in live] or None,
+                override=override[:200] or None)
+        except Exception as exc:  # noqa: BLE001 — le courrier a bougé, le dire
+            print("export-v0: the mail was moved, but its event was not journaled: %s"
+                  % " ".join(str(exc).split())[:200], file=sys.stderr)
+            return 1
         return 0
     finally:
         db.close()
@@ -4938,9 +4986,16 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     p_imp.set_defaults(func=cmd_import_v0)
     p_exp = sub.add_parser("export-v0", help="write unread messages back into the v0 file mailbox")
     p_exp.add_argument("--state", default=None)
-    p_exp.add_argument("--agents", default=None)
+    names = p_exp.add_mutually_exclusive_group(required=True)
+    names.add_argument("--agents", metavar="A,B", default=None,
+                       help="comma-separated mailboxes to export")
+    names.add_argument("--all", action="store_true",
+                       help="every mailbox with unread mail (explicit, never the default)")
     p_exp.add_argument("--keep", action="store_true",
                        help="do not mark delivered in the database (copy instead of move)")
+    p_exp.add_argument("--allow-live-executors", metavar="REASON", default=None,
+                       help="export despite live executor leases; the nonempty reason "
+                            "is journaled (mesh takeover / rollback)")
     p_exp.set_defaults(func=cmd_export_v0)
 
     p_mig = sub.add_parser("migrate")
