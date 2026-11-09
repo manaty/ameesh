@@ -15,6 +15,7 @@ la nouvelle tête) prouve que l'auteur l'a réécrit. Aucune note n'est lue.
 """
 from __future__ import annotations
 
+import contextlib
 import time
 from types import SimpleNamespace
 from unittest import mock
@@ -26,6 +27,16 @@ from .support import PgTestCase, scaled
 from .test_2447_review_designation_activation import _ActivationFixture
 
 FAMILIES = ("claude", "codex", "deepseek")
+
+
+class _Clock:
+    """Horloge monotone simulée : une échéance se teste sans dormir (#6451)."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
 
 
 class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
@@ -236,6 +247,77 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
                     self.db, work.get(self.db, self.lot),
                     {"id": 999999, "sha": head_b}, self.repo.root,
                     head=head_b, fetch=True)
+
+    @contextlib.contextmanager
+    def _sweep_with_clock(self, budget=60.0):
+        """Le balayage, son échéance remplacée par une horloge simulée."""
+        clock = _Clock()
+        with review_authors.sweep_deadline(budget) as sweep:
+            sweep.deadline = review_authors.Deadline(budget, clock=clock)
+            yield clock
+
+    def test_every_early_return_refuses_a_cut_read(self):
+        # #6451 : la sonde de tête et la frise sont bornées par l'échéance ;
+        # quand une lecture l'atteint (None de `plan_git.local_commit`, ou
+        # exception), le retour « lecture incomplète » concluait « aucun
+        # correcteur réécrit » sans relire l'échéance : la porte comptait alors
+        # le correcteur réécrit. Horloge simulée : aucun sleep, indépendant de
+        # la charge du banc.
+        item = work.get(self.db, self.lot)
+        head = self.frozen
+        args = ({"id": 999999, "sha": head}, self.repo.root)
+
+        def call():
+            return review_authors._rewritten_after_freeze(
+                self.db, item, *args, head=head, fetch=False)
+
+        def reading(clock, outcome):
+            """Une lecture qui consomme l'échéance puis rend `outcome`."""
+            def read(*read_args, **read_kwargs):
+                clock.now = 3600.0
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+            return read
+
+        with self.subTest(read="head", outcome="absent"):
+            with self._sweep_with_clock() as clock:
+                with mock.patch.object(review_authors, "_read_local_commit",
+                                       side_effect=reading(clock, None)):
+                    with self.assertRaises(review_authors.SweepDeadline) as caught:
+                        call()
+            self.assertIn("rewritten correctors", str(caught.exception))
+
+        with self.subTest(read="head", outcome="error"):
+            with self._sweep_with_clock() as clock:
+                failure = OSError("clone illisible")
+                with mock.patch.object(review_authors, "_read_local_commit",
+                                       side_effect=reading(clock, failure)):
+                    with self.assertRaises(review_authors.SweepDeadline):
+                        call()
+
+        with self.subTest(read="frise", outcome="error"):
+            with self._sweep_with_clock() as clock:
+                fake = SimpleNamespace(work=SimpleNamespace(
+                    milestones=reading(clock, RuntimeError("frise illisible"))))
+                with mock.patch.object(review_authors, "_read_local_commit",
+                                       return_value=head), \
+                        mock.patch.object(review_authors.storage, "of",
+                                          return_value=fake):
+                    with self.assertRaises(review_authors.SweepDeadline):
+                        call()
+
+    def test_an_unreadable_head_without_expiry_stays_historical(self):
+        # #6451 : hors échéance atteinte, la tête vraiment illisible garde le
+        # retour historique {} (la désignation attend) : le correctif ne rend
+        # pas toute lecture ratée bloquante.
+        with mock.patch.object(review_authors, "_read_local_commit",
+                               return_value=None):
+            out = review_authors._rewritten_after_freeze(
+                self.db, work.get(self.db, self.lot),
+                {"id": 999999, "sha": self.frozen}, self.repo.root,
+                head=self.frozen, fetch=False)
+        self.assertEqual(out, {})
 
     def _only_absent_receipt(self):
         """Une tête B et un seul reçu, absent : le fetch est le dernier."""

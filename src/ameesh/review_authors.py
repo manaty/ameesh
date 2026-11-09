@@ -4858,7 +4858,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     redemandé à la lecture suivante.
 
     Un dépôt ou une tête illisible rend `{}` (la lecture garde son
-    comportement historique) ; `strict` (la porte, le train) refuse au
+    comportement historique) **sauf si l'échéance est atteinte** : la lecture
+    est alors incomplète et lève (#6451). `strict` (la porte, le train) refuse au
     contraire une lecture des reçus qui échoue, comme le reste de la
     provenance. `recover`/`fetch` rapatrient l'objet du commit retiré quand
     le clone de lecture ne l'a pas (clone scratch de `merge-pr`). Un objet
@@ -4958,12 +4959,22 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     check()
     try:
         if not _read_local_commit(repo, head_sha):
+            # #6451 : la sonde bornée rend None quand l'échéance l'atteint
+            # (`plan_git.local_commit`) ; une lecture nulle sous une échéance
+            # épuisée est un refus, jamais « aucun correcteur réécrit ».
+            check()
             return {}
+    except SweepDeadline:
+        # #6451 : une échéance déjà atteinte avant la sonde (`_read_bound`)
+        # n'est pas un doute ; le `check()` du retour ne doit pas la relancer.
+        raise
     except Exception:  # noqa: BLE001 - tête illisible : comportement historique
+        check()
         return {}
     try:
         rows = storage.of(db).work.milestones(lot, None) or []
     except Exception:  # noqa: BLE001 - frise illisible : comportement historique
+        check()
         return {}
     check()
     freezes = sorted((row for row in rows if row.get("kind") == "frozen"),
