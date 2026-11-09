@@ -39,6 +39,31 @@ def tag(version="1.46.0", commit=SHA):
     return {"version": version, "tag": "v" + version, "commit": commit, "at": 100.0}
 
 
+def holders(request, lease):
+    """Run staging_holders against a fake shared DB (one elected key)."""
+    class Work:
+        def land_holder(self, key):
+            return lease
+
+    class Events:
+        def latest_type(self, *args, **kwargs):
+            return []
+
+    class Storage:
+        work = Work()
+        events = Events()
+
+    project = release_cutoff.ProjectRelease(
+        name="ameesh", repo="/fixture/repo", target="main",
+        staging_executor="/fixture/executor.json")
+    with mock.patch("ameesh.staging_executor.settings",
+                    return_value={"key": "staging", "project": "ameesh"}), \
+            mock.patch("ameesh.staging_executor.latest", return_value=request), \
+            mock.patch.object(release_cutoff.storage, "of", return_value=Storage()), \
+            mock.patch.object(release_cutoff, "tags", return_value=[tag()]):
+        return release_cutoff.staging_holders(project, object())
+
+
 class ReportErrorTest(unittest.TestCase):
     def report(self, *, exception, cutoff_tag=None, holders=(), model="semver"):
         folder = tempfile.TemporaryDirectory()
@@ -60,7 +85,8 @@ class ReportErrorTest(unittest.TestCase):
         return send
 
     def test_tagged_cutoff_whose_staging_is_running_is_information(self):
-        holder = {"kind": "elected", "host": "ameesh-agents-1",
+        holder = {"kind": "elected", "active": True,
+                  "host": "ameesh-agents-1",
                   "execution": "run-1", "sha": SHA, "state": "running",
                   "version": "1.46.0", "tag": "v1.46.0"}
         send = self.report(
@@ -76,7 +102,8 @@ class ReportErrorTest(unittest.TestCase):
         self.assertIs(send.call_args.kwargs.get("urgent"), False)
 
     def test_the_same_information_is_mailed_once_per_cutoff(self):
-        holder = {"kind": "elected", "host": "ameesh-agents-1",
+        holder = {"kind": "elected", "active": True,
+                  "host": "ameesh-agents-1",
                   "execution": "run-1", "sha": SHA, "state": "running",
                   "version": "1.46.0", "tag": "v1.46.0"}
         exception = release_cutoff.ReleaseBusy(
@@ -101,7 +128,8 @@ class ReportErrorTest(unittest.TestCase):
         send.assert_called_once()
 
     def test_tagged_cutoff_with_another_version_lock_alarms_and_names_it(self):
-        holder = {"kind": "elected", "host": "ameesh-agents-2",
+        holder = {"kind": "elected", "active": True,
+                  "host": "ameesh-agents-2",
                   "execution": "run-2", "sha": OTHER, "state": "running",
                   "version": "1.45.0", "tag": "v1.45.0"}
         send = self.report(
@@ -132,6 +160,57 @@ class ReportErrorTest(unittest.TestCase):
         self.assertIn("exécution orphan-execution", body)
         self.assertIs(send.call_args.kwargs.get("urgent"), True)
 
+    def test_terminal_request_at_the_tag_sha_does_not_mask_an_orphan_lease(self):
+        # Review witness #6520: latest() is completed at the tag's commit
+        # while an orphan execution still holds the lease. The tag must not
+        # lend it a commit, and the orphan stays an urgent alarm.
+        found = holders(
+            {"request": "req-old", "state": "completed", "sha": SHA,
+             "run": "old"},
+            {"owner": "staging-execution:ameesh-agents-1:orphan",
+             "expires_at": "2026-11-09T10:40:00Z"})
+        self.assertEqual(len(found), 1)
+        self.assertIs(found[0]["active"], False)
+        self.assertEqual(found[0]["sha"], "")
+        self.assertEqual(found[0]["state"], "held")
+        send = self.report(
+            exception=release_cutoff.ReleaseBusy(
+                "staging execution busy; request not replaced"),
+            cutoff_tag=tag(), holders=found)
+        send.assert_called_once()
+        body = send.call_args.args[3]
+        self.assertIn("coupure 11:00 déjà taguée", body)
+        self.assertIn("hôte ameesh-agents-1", body)
+        self.assertIn("exécution orphan", body)
+        self.assertIn("activité non prouvée", body)
+        self.assertNotIn("Rien à corriger", body)
+        self.assertNotIn("Aucun tag, aucun déploiement", body)
+        self.assertNotIn("staging en cours", body)
+        self.assertIs(send.call_args.kwargs.get("urgent"), True)
+
+    def test_running_request_under_a_foreign_execution_alarms(self):
+        # Review witness #6520: a running request is not this cutoff's
+        # staging when it records another execution than the lease holder.
+        found = holders(
+            {"request": "req-1", "state": "running", "sha": SHA,
+             "host": "ameesh-agents-2", "run": "run-1",
+             "execution": "staging-execution:ameesh-agents-2:exec-2"},
+            {"owner": "staging-execution:ameesh-agents-1:exec-1",
+             "expires_at": "2026-11-09T10:40:00Z"})
+        self.assertEqual(len(found), 1)
+        self.assertIs(found[0]["active"], False)
+        self.assertEqual(found[0]["sha"], "")
+        self.assertEqual(found[0]["execution"], "exec-1")
+        self.assertEqual(found[0]["host"], "ameesh-agents-1")
+        send = self.report(
+            exception=release_cutoff.ReleaseBusy(
+                "staging execution busy; request not replaced"),
+            cutoff_tag=tag(), holders=found)
+        send.assert_called_once()
+        self.assertIn("exécution exec-1", send.call_args.args[3])
+        self.assertNotIn("Rien à corriger", send.call_args.args[3])
+        self.assertIs(send.call_args.kwargs.get("urgent"), True)
+
     def test_local_release_lock_contention_is_not_a_cutoff_alarm(self):
         send = self.report(
             exception=release_cutoff.ReleaseBusy(
@@ -145,7 +224,7 @@ class ElectedHandoffTest(unittest.TestCase):
         self.db = object()
         self.options = {"key": "staging", "project": "ameesh", "role": "pilote"}
 
-    def run_staging(self, *, submit=None, latest=None):
+    def run_staging(self, *, submit=None, latest=None, lease=None):
         project = release_cutoff.ProjectRelease(
             name="ameesh", repo="/fixture/repo", target="main",
             staging_executor="/fixture/executor.json")
@@ -155,6 +234,8 @@ class ElectedHandoffTest(unittest.TestCase):
                         return_value=self.options), \
                 mock.patch("ameesh.staging_executor.submit", **effect), \
                 mock.patch("ameesh.staging_executor.latest", return_value=latest), \
+                mock.patch.object(release_cutoff, "_staging_execution_holder",
+                                  return_value=lease), \
                 mock.patch("ameesh.config.load", return_value=object()):
             return release_cutoff.run_staging(
                 project, SHA, [], state_dir="/tmp/unused", db=self.db)
@@ -167,13 +248,48 @@ class ElectedHandoffTest(unittest.TestCase):
         self.assertEqual(result["request_state"], "pending")
 
     def test_execution_lease_busy_with_the_same_request_is_queued(self):
+        owner = "staging-execution:ameesh-agents-1:exec-1"
         result = self.run_staging(
             submit=RuntimeError("staging execution busy; request not replaced"),
             latest={"request": "req-1", "state": "running", "sha": SHA,
-                    "host": "ameesh-agents-1"})
+                    "host": "ameesh-agents-1", "execution": owner},
+            lease={"owner": owner})
         self.assertTrue(result["queued"])
         self.assertEqual(result["request"], "req-1")
         self.assertEqual(result["request_state"], "running")
+
+    def test_execution_lease_busy_with_a_terminal_request_is_a_named_conflict(self):
+        request = {"request": "req-old", "state": "completed", "sha": SHA,
+                   "run": "old"}
+        lease = {"owner": "staging-execution:ameesh-agents-1:orphan"}
+        with mock.patch.object(release_cutoff, "staging_holders",
+                               return_value=holders(request, lease)):
+            with self.assertRaises(release_cutoff.ReleaseBusy) as caught:
+                self.run_staging(
+                    submit=RuntimeError(
+                        "staging execution busy; request not replaced"),
+                    latest=request, lease=lease)
+        message = str(caught.exception)
+        self.assertIn("hôte ameesh-agents-1", message)
+        self.assertIn("exécution orphan", message)
+        self.assertIn("activité non prouvée", message)
+        self.assertIn("busy", message)
+
+    def test_execution_lease_busy_with_a_foreign_execution_is_a_conflict(self):
+        request = {"request": "req-1", "state": "running", "sha": SHA,
+                   "host": "ameesh-agents-2", "run": "run-1",
+                   "execution": "staging-execution:ameesh-agents-2:exec-2"}
+        lease = {"owner": "staging-execution:ameesh-agents-1:exec-1"}
+        with mock.patch.object(release_cutoff, "staging_holders",
+                               return_value=holders(request, lease)):
+            with self.assertRaises(release_cutoff.ReleaseBusy) as caught:
+                self.run_staging(
+                    submit=RuntimeError(
+                        "staging execution busy; request not replaced"),
+                    latest=request, lease=lease)
+        message = str(caught.exception)
+        self.assertIn("hôte ameesh-agents-1", message)
+        self.assertIn("exécution exec-1", message)
 
     def test_execution_lease_busy_for_another_version_is_a_named_conflict(self):
         holder = {"kind": "elected", "host": "ameesh-agents-2",
@@ -232,17 +348,40 @@ class HolderTest(unittest.TestCase):
                 mock.patch("ameesh.staging_executor.latest",
                            return_value={"request": "req-1", "state": "running",
                                          "sha": SHA, "host": "ameesh-agents-1",
-                                         "run": "seq-0"}), \
+                                         "run": "seq-0",
+                                         "execution": "staging-execution:ameesh-agents-1:exec-1"}), \
                 mock.patch.object(release_cutoff.storage, "of", return_value=Storage()), \
                 mock.patch.object(release_cutoff, "tags", return_value=rows):
             holders = release_cutoff.staging_holders(project, object())
         by_kind = {holder["kind"]: holder for holder in holders}
+        self.assertIs(by_kind["elected"]["active"], True)
         self.assertEqual(by_kind["elected"]["host"], "ameesh-agents-1")
         self.assertEqual(by_kind["elected"]["execution"], "seq-0")
         self.assertEqual(by_kind["elected"]["version"], "1.46.0")
         self.assertEqual(by_kind["sequence"]["host"], "pc-smichea")
         self.assertEqual(by_kind["sequence"]["execution"], "seq-1")
         self.assertEqual(by_kind["sequence"]["version"], "1.45.0")
+
+    def test_a_pending_handoff_without_lease_is_active(self):
+        found = holders({"request": "req-1", "state": "pending", "sha": SHA},
+                        None)
+        self.assertEqual(len(found), 1)
+        self.assertIs(found[0]["active"], True)
+        self.assertEqual(found[0]["sha"], SHA)
+        self.assertEqual(found[0]["state"], "pending")
+        self.assertEqual(found[0]["version"], "1.46.0")
+
+    def test_a_running_request_without_lease_is_named_but_inactive(self):
+        found = holders(
+            {"request": "req-1", "state": "running", "sha": SHA,
+             "host": "ameesh-agents-1", "run": "run-1",
+             "execution": "staging-execution:ameesh-agents-1:exec-1"}, None)
+        self.assertEqual(len(found), 1)
+        self.assertIs(found[0]["active"], False)
+        self.assertEqual(found[0]["sha"], SHA)
+        self.assertEqual(found[0]["state"], "running")
+        self.assertIn("activité non prouvée",
+                      release_cutoff.staging_holder_text(found[0]))
 
     def test_record_keeps_the_launcher_host_and_hides_an_unknown_one(self):
         base = {"run": "run-a", "sha": SHA, "state": "running",

@@ -2658,9 +2658,11 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 pending = staging_executor.latest(db, options["key"])
             except Exception:  # noqa: BLE001 - a diagnostic read never masks it
                 pending = None
+            lease = (_staging_execution_holder(db, options)
+                     if isinstance(pending, dict) else None)
             if (isinstance(pending, dict)
                     and pending.get("sha") == release_sha
-                    and pending.get("state") in ("pending", "running")):
+                    and _staging_request_active(pending, lease)):
                 return {"exit": 75, "queued": True, "duration_s": 0.0, "log": "",
                         "summary": [], "attestation": None,
                         "request": pending.get("request"),
@@ -3325,12 +3327,43 @@ def _tags_by_commit(project: ProjectRelease) -> dict:
     return out
 
 
+def _staging_execution_holder(db, options: dict) -> dict | None:
+    """The live execution lease of an elected staging key, or None."""
+    try:
+        return storage.of(db).work.land_holder("staging-execution:" + options["key"])
+    except Exception:  # noqa: BLE001 - a diagnostic read never masks a refusal
+        return None
+
+
+def _staging_request_active(request: dict | None, lease: dict | None) -> bool:
+    """Whether a shared staging request proves live staging (#6520 review).
+
+    A terminal request never does: its commit must not be lent to a lease an
+    orphan execution still holds. A queued handoff is active before any
+    attempt; a running attempt is active only under the execution lease it
+    recorded, so a foreign execution is not mistaken for this cutoff's.
+    """
+    if not isinstance(request, dict):
+        return False
+    state = str(request.get("state") or "")
+    if state == "pending":
+        return True
+    if state != "running":
+        return False
+    owner = str((lease or {}).get("owner") or "")
+    return bool(owner) and request.get("execution") == owner
+
+
 def staging_holders(project: ProjectRelease, db) -> list[dict]:
     """#6520: the live holders of the staging door, named for the report.
 
     Diagnostics only, never a guard: the elected execution lease
     (`merge_locks`), its shared request, then the shared sequence log. A
     holder a reader cannot see is not invented; the caller says so.
+
+    A lease is only that request's staging when the running request records
+    the same execution (new attempts) — a terminal or foreign request never
+    lends its commit to an orphan lease (#6520 review).
     """
     if db is None:
         return []
@@ -3349,33 +3382,46 @@ def staging_holders(project: ProjectRelease, db) -> list[dict]:
             from . import staging_executor
             options = staging_executor.settings(os.path.expanduser(project.staging_executor))
             if options.get("project") == project.name:
-                request = staging_executor.latest(db, options["key"])
-                lease = None
-                try:
-                    lease = storage.of(db).work.land_holder(
-                        "staging-execution:" + options["key"])
-                except Exception:  # noqa: BLE001 - optional diagnostic
-                    lease = None
+                request = staging_executor.latest(db, options["key"]) or {}
+                lease = _staging_execution_holder(db, options)
                 owner = str((lease or {}).get("owner") or "")
                 owner_bits = owner.split(":")
-                state = str((request or {}).get("state") or "")
-                host = str((request or {}).get("host") or
-                           (owner_bits[1] if len(owner_bits) > 2 else ""))
-                execution = str((request or {}).get("run") or
-                                (owner_bits[2] if len(owner_bits) > 2 else ""))
-                if lease or state in ("pending", "running"):
-                    add({"kind": "elected", "host": host,
-                         "execution": execution,
-                         "sha": str((request or {}).get("sha") or ""),
-                         "state": state or ("held" if lease else ""),
-                         "expires_at": str((lease or {}).get("expires_at") or "")})
+                owner_host = owner_bits[1] if len(owner_bits) > 2 else ""
+                owner_execution = owner_bits[2] if len(owner_bits) > 2 else ""
+                state = str(request.get("state") or "")
+                sha = str(request.get("sha") or "")
+                request_host = str(request.get("host") or "")
+                request_run = str(request.get("run") or "")
+                active = _staging_request_active(request, lease)
+                if lease and active:
+                    add({"kind": "elected", "active": True,
+                         "host": request_host or owner_host,
+                         "execution": request_run or owner_execution,
+                         "sha": sha, "state": state,
+                         "expires_at": str(lease.get("expires_at") or "")})
+                elif lease:
+                    # No active request of this execution owns the lease: an
+                    # orphan (or a foreign operation). Name it, and never
+                    # borrow a terminal request's commit.
+                    add({"kind": "elected", "active": False,
+                         "host": owner_host, "execution": owner_execution,
+                         "sha": "", "state": "held",
+                         "expires_at": str(lease.get("expires_at") or "")})
+                elif state in ("pending", "running") and sha:
+                    # A queued request is a handoff with no lease yet. A
+                    # running one without its lease is not proved to be this
+                    # cutoff's staging: keep its commit visible but inactive.
+                    add({"kind": "elected", "active": active,
+                         "host": request_host, "execution": request_run,
+                         "sha": sha, "state": state})
         except Exception:  # noqa: BLE001 - a diagnostic read never blocks a report
             pass
     try:
         rows = storage.of(db).events.latest_type(
             staging_watch.EVENT, 60, staging_watch.LIMIT)
         for run, data in staging_watch.in_flight(rows).items():
-            add({"kind": "sequence", "host": str(data.get("host") or ""),
+            add({"kind": "sequence", "active": True,
+                 "host": str(data.get("host") or ""),
                  "execution": run, "sha": str(data.get("sha") or ""),
                  "state": "running", "started": data.get("started")})
     except Exception:  # noqa: BLE001 - a diagnostic read never blocks a report
@@ -3402,6 +3448,8 @@ def staging_holder_text(holder: dict) -> str:
         parts.append("commit %s" % str(holder["sha"])[:12])
     if holder.get("state"):
         parts.append("état %s" % holder["state"])
+    if holder.get("active") is False:
+        parts.append("activité non prouvée")
     if holder.get("expires_at"):
         parts.append("bail jusqu'à %s" % holder["expires_at"])
     return ", ".join(parts) or "détenteur inconnu"

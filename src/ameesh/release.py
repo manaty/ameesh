@@ -351,7 +351,8 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
                 except Exception:  # noqa: BLE001 - diagnostics never mask the error
                     holders = []
             same = [holder for holder in holders
-                    if tag and holder.get("sha") == tag["commit"]]
+                    if tag and holder.get("active")
+                    and holder.get("sha") == tag["commit"]]
             if busy and "another release holds" in text:
                 # The running tick on this host owns the cutoff and reports
                 # it; a lock contention is not a release failure.

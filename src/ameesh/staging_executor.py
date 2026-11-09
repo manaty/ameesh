@@ -815,7 +815,11 @@ def tick(db, cfg, options) -> dict:
         queued = request
         attempt = dict(request, state="running", host=host, run=uuid.uuid4().hex,
                        started=time.time(), notify=options["role"],
-                       deadline=time.time() + timeout, ci=ci_evidence)
+                       deadline=time.time() + timeout, ci=ci_evidence,
+                       # #6520: the live lease this attempt runs under, so a
+                       # reader can tell its staging from an orphan lease
+                       # without borrowing a terminal request's commit.
+                       execution=lease.owner)
         attempt.pop("blocked_reason", None)
         attempt.pop("ci_checked", None)
         attempt.pop("previous_host", None)
