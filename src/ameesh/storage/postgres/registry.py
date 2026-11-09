@@ -367,6 +367,18 @@ PASSIVE_SQL = (
     " OR coalesce({t}.payload->>'cc', '') <> ''"
     " OR coalesce(jsonb_typeof({t}.payload->'radar'), '') = 'object'))")
 
+#: #6424 : un message dont le destinataire est un agent en mode `externe`
+#: (session humaine tenue hors exécuteur — bureau, veille) n'entre dans aucun
+#: décompte de non-lus : aucun runner ne solde sa boîte, et ses 7 380 messages
+#: en attente pesaient dans chaque lecture (analyse de nuit du 09/11). Le
+#: prédicat ne touche JAMAIS l'état du courrier (`delivered_at` inchangé) : il
+#: ne vaut que pour les décomptes et les lectures de service.
+#: `{t}` : l'alias de la table `agent_mailbox`.
+NOT_EXTERNAL_SQL = (
+    "NOT EXISTS (SELECT 1 FROM agent_registry ext"
+    " WHERE ext.name = {t}.recipient"
+    " AND coalesce(ext.mode, 'execute') = 'externe')")
+
 
 #: #5101 : `overview()` lit les colonnes absentes de la vue figée
 #: (`review_hold`, `retired_at`, `harness_bin`, les six colonnes de pause) sur
@@ -466,11 +478,13 @@ OVERVIEW_SQL = ("""
                        count(*) FILTER (WHERE __PASSIVE__) AS n_passive_unread
                   FROM agent_mailbox m
                  WHERE m.delivered_at IS NULL
+                   AND __NOT_EXTERNAL__
                  GROUP BY m.recipient) mb ON mb.recipient = o.name
             ORDER BY last_seen_ts DESC NULLS LAST
             """.replace("__GOVERNED__", canon_governed_sql("o"))
                .replace("__CLAIM_OK__", canon_claim_predicate_sql("agent_registry"))
-               .replace("__PASSIVE__", PASSIVE_SQL.format(t="m")))
+               .replace("__PASSIVE__", PASSIVE_SQL.format(t="m"))
+               .replace("__NOT_EXTERNAL__", NOT_EXTERNAL_SQL.format(t="m")))
 
 #: #5982 : lectures étroites des trois appelants périodiques du runner. Ils ne
 #: prenaient d'`OVERVIEW_SQL` que quelques colonnes : le verdict critique
