@@ -5937,6 +5937,48 @@ class RepairSignals(Domain):
     def summary(self, *, project=None, environment=None, since=None, until=None):
         """Aggregate counts only, UTC epoch [since,until), for the U1 report."""
 
+    # -- A11 retry journal (#6475) ------------------------------------------
+    @abc.abstractmethod
+    def retry_request(self, idempotency_key, *, project, environment, origin,
+                      intent, cause, episode, requested_at=None):
+        """Record one retry intent and atomically consume a durable attempt.
+
+        Replaying the same 64-hex key returns the existing attempt without a
+        second increment.  ``requested_at`` is not the effect: only
+        ``retry_engage``/``retry_settle`` record what happened.
+        """
+
+    @abc.abstractmethod
+    def retry_engage(self, idempotency_key, *, engaged_at=None):
+        """Mark the effect as started; False when already engaged/terminal."""
+
+    @abc.abstractmethod
+    def retry_begin(self, idempotency_key, *, project, environment, origin,
+                    intent, cause, episode, engaged_at=None):
+        """Request then engage, replay-safe (a crash leaves ``requested``)."""
+
+    @abc.abstractmethod
+    def retry_settle(self, idempotency_key, outcome, *, settled_at=None):
+        """Record completed/failed/unknown once; completed resets the counter."""
+
+    @abc.abstractmethod
+    def retry_avoid(self, idempotency_key, *, project, environment, origin,
+                    intent, cause, episode, avoided_at=None):
+        """Record an idempotence-avoided retry; consumes no attempt."""
+
+    @abc.abstractmethod
+    def retry_get(self, idempotency_key):
+        """The strict ``repair-retry/1`` record, or None."""
+
+    @abc.abstractmethod
+    def retry_attempts(self, project, environment, episode, cause):
+        """The durable consecutive-attempt counter for one cause/episode."""
+
+    @abc.abstractmethod
+    def retry_summary(self, *, project=None, environment=None, since=None,
+                      until=None):
+        """Aggregated A11 counters only (no key, episode or free text)."""
+
 
 class FingerprintWatch(Domain):
     """#3885: the resume cursor of the failure-fingerprint pass, per source.
