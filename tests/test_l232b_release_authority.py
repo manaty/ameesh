@@ -17,6 +17,12 @@ SPEC.loader.exec_module(release)
 
 
 class ReleaseAuthorityTest(PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.release_decision import install_decision_gate
+        install_decision_gate(cls)
+
     def test_signed_supersession_refuses_old_controller_with_replacement_id(self):
         self.signed_answer()
         new=decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(self.lot['id']),
@@ -52,6 +58,17 @@ class ReleaseAuthorityTest(PgTestCase):
         self.adapter = release.SignedDecisionAuthority(
             self.db, self.view['id'], 'test-release', self.manifest, clock=lambda: self.now)
 
+    def test_real_signature_revalidated_under_controller_without_mailbox_select(self):
+        self.signed_answer()
+        role = self.controller_role
+        self.db.execute('GRANT SELECT ON agent_registry,mesh_keys,mesh_approvals,'
+                        'mesh_approvals_status,mesh_consumed_nonces,decision_supersessions TO "'+role+'"')
+        with self.db.transaction() as tx:
+            tx.execute('SET LOCAL ROLE "'+role+'"')
+            adapter = release.SignedDecisionAuthority(tx, self.view['id'], 'test-release',
+                                                      self.manifest, clock=lambda: self.now)
+            self.assertTrue(adapter.validate('test-release', release.digest(self.manifest), 'prepare'))
+
     def sign_view(self, view, text, ttl=900):
         # Same option `decisions.answer` records and signs: bounded native form
         # only (raw key or the two signer-owner.sh mentions of #3443/#3454).
@@ -81,7 +98,7 @@ class ReleaseAuthorityTest(PgTestCase):
 
     def test_pending_and_unsigned_answers_cannot_authorize(self):
         self.assertFalse(self.validate())
-        with mock.patch.object(decisions, 'get', return_value=dict(self.view, state='answered', answer={
+        with mock.patch.object(decisions, 'get_for_controller', return_value=dict(self.view, state='answered', answer={
                 'option': 'apply', 'text': 'apply', 'channel': 'cli'})):
             self.assertFalse(self.validate())
 
@@ -146,7 +163,7 @@ class ReleaseAuthorityTest(PgTestCase):
         )
         for answer in divergent:
             with self.subTest(answer=answer), mock.patch.object(
-                    decisions, 'get', return_value=dict(original, answer=answer)):
+                    decisions, 'get_for_controller', return_value=dict(original, answer=answer)):
                 self.assertFalse(self.validate())
 
     def test_mentioned_authority_expiry_and_revocation_are_live(self):
@@ -180,10 +197,10 @@ class ReleaseAuthorityTest(PgTestCase):
     def test_signed_scope_expiry_not_mutable_decision_due_date(self):
         self.signed_answer()
         original = decisions.get(self.db, self.view['id'])
-        with mock.patch.object(decisions, 'get', return_value=dict(original, due_ts=self.now - 1000)):
+        with mock.patch.object(decisions, 'get_for_controller', return_value=dict(original, due_ts=self.now - 1000)):
             self.assertTrue(self.validate())
         self.now += 600
-        with mock.patch.object(decisions, 'get', return_value=dict(original, due_ts=self.now + 99999)):
+        with mock.patch.object(decisions, 'get_for_controller', return_value=dict(original, due_ts=self.now + 99999)):
             self.assertFalse(self.validate('rollback'))
 
     def test_a_signature_shorter_than_the_declared_window_never_authorizes(self):
@@ -225,7 +242,7 @@ class ReleaseAuthorityTest(PgTestCase):
         self.signed_answer()
         original = decisions.get(self.db, self.view['id'])
         changed = original['question'].replace('enrolled-test', 'other-host')
-        with mock.patch.object(decisions, 'get', return_value=dict(original, question=changed)):
+        with mock.patch.object(decisions, 'get_for_controller', return_value=dict(original, question=changed)):
             self.assertFalse(self.validate())
 
     def test_tampered_approval_expiry_cannot_extend_signature(self):
@@ -266,7 +283,7 @@ class ReleaseAuthorityTest(PgTestCase):
         self.signed_answer('leave')
         original = decisions.get(self.db, self.view['id'])
         answer = dict(original['answer'], option='apply', text='apply')
-        with mock.patch.object(decisions, 'get', return_value=dict(original, answer=answer)):
+        with mock.patch.object(decisions, 'get_for_controller', return_value=dict(original, answer=answer)):
             self.assertFalse(self.validate())
 
 

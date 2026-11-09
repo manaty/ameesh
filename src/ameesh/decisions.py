@@ -323,6 +323,22 @@ def get(db, decision_id: int, now: float | None = None) -> dict | None:
     return view_of(row, now) if row else None
 
 
+def get_for_controller(db, decision_id: int) -> dict | None:
+    """Read a signature-required request through the enrolled SQL gate (#6372).
+
+    No fallback to direct mailbox access: N-1 controllers retain their old
+    grant until the bureau has installed the function and updated the code.
+    """
+    rows = db.query('SELECT * FROM release_controller_decision(%s)', (int(decision_id),))
+    return view_of(rows[0]) if rows else None
+
+
+def ids_for_controller(db, question: str) -> list[int]:
+    """Enumerate only answered signature requests for the exact question."""
+    return [row['id'] for row in db.query(
+        'SELECT id FROM release_controller_decision_ids(%s)', (question,))]
+
+
 def supersession_event(db, decision_id: int) -> dict | None:
     """#4995: the append-only replacement event that superseded `decision_id`."""
     return storage.of(db).decisions.supersession(int(decision_id))
@@ -344,7 +360,7 @@ def _supersession_timestamp(value) -> float | None:
         return None
 
 
-def require_current(db, view: dict) -> None:
+def require_current(db, view: dict, *, reader=None) -> None:
     """Refuse authority replaced by a signed decision, proven from the log
     (#4991, #4995).
 
@@ -357,6 +373,7 @@ def require_current(db, view: dict) -> None:
     gate fails closed. The table owner and a superuser can still repair the
     database with DDL/DML; this guard does not pretend to stop them.
     """
+    # Controllers must keep replacement reads behind the same bounded gate.
     identifier = int(view["id"])
     try:
         marker = None if view.get("superseded_by") is None else int(view["superseded_by"])
@@ -376,7 +393,7 @@ def require_current(db, view: dict) -> None:
         raise DecisionError(
             "decision #%d has contradictory supersession records (#%d logged, #%s marked): "
             "authority refused" % (identifier, replacement_id, marker))
-    replacement = get(db, replacement_id)
+    replacement = (reader or get)(db, replacement_id)
     if (replacement is None or replacement.get("state") != "answered"
             or replacement.get("needs_signature") is not True
             or replacement.get("supersedes") != identifier
