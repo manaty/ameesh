@@ -537,11 +537,8 @@ class CompositionClaim:
                 data = {}
         if not data:
             proc, self.proc = self.proc, None
-            try:
-                if proc.stdin is not None:
-                    proc.stdin.close()
-            except (OSError, ValueError):
-                pass
+            # `communicate` ferme lui-même le tube (fin de l'entrée standard) ;
+            # le fermer avant rendrait son `flush` sur un fichier déjà clos.
             try:
                 _out, error = proc.communicate(timeout=10)
             except subprocess.TimeoutExpired:
@@ -5104,42 +5101,47 @@ def publish_tested(args: argparse.Namespace) -> int:
     # demande sa ci-full ; elle prend le même bail de composition du porteur
     # qu'une composition, pour qu'un second composeur ne travaille pas dessus.
     claim = CompositionClaim(repo, args.carrier, args.name).start()
+    # un refus avant la publication (garde, tête, chaîne) ne doit pas
+    # laisser le bail du porteur tenu jusqu'à la fin du processus.
+    try:
+        def guard() -> None:
+            claim.require()
+            check_epoch(args.carrier, repo)
 
-    def guard() -> None:
-        claim.require()
-        check_epoch(args.carrier, repo)
-
-    guard()
-    fetched = git(repo, "fetch", "--no-tags", "origin", args.publish, check=False,
-                  timeout=GIT_TIMEOUT)
-    head = rev(repo, "FETCH_HEAD") if fetched.returncode == 0 else rev(repo, args.publish)
-    if not head:
-        raise ChainRefused("tête testée %s introuvable (ni sur origin ni ici)"
-                           % args.publish)
-    # la réf est mobile : seule la tête attestée par la marque est publiée
-    if head != args.publish_sha:
-        raise ChainRefused("%s désigne %s, la marque de tests atteste %s"
-                           % (args.publish, head[:12], args.publish_sha[:12]))
-    base_sha = fresh_base(repo, args.target)
-    print("paquet %s : publication de la tête testée %s sur %s %s"
-          % (args.name, head, args.target, base_sha), flush=True)
-    # #4304 : la tête est poussée, enregistrée et gelée avant ses tests ; seule
-    # la fin reste due, sur la branche du paquet qui la désigne toujours
-    remote_sha = remote_branch(repo, branch)
-    if remote_sha:
-        git(repo, "fetch", "--no-tags", "origin", branch, check=False)
-        remote_sha = rev(repo, "origin/" + branch) or remote_sha
-    if remote_sha != head:
-        raise ChainRefused("%s sur origin désigne %s, pas la tête testée %s"
-                           % (branch, (remote_sha or "rien")[:12], head[:12]))
-    worktree = Path(tempfile.mkdtemp(prefix="paquet-auto-publie-",
-                                     dir=str(temporary_parent())))
-    worktree.rmdir()
-    reader = Path(tempfile.mkdtemp(prefix="paquet-auto-base-",
-                                   dir=str(temporary_parent())))
-    reader.rmdir()
-    tmp = tempfile.TemporaryDirectory(prefix="paquet-auto-", dir=str(temporary_parent()))
-    success = False
+        guard()
+        fetched = git(repo, "fetch", "--no-tags", "origin", args.publish, check=False,
+                      timeout=GIT_TIMEOUT)
+        head = rev(repo, "FETCH_HEAD") if fetched.returncode == 0 else rev(repo, args.publish)
+        if not head:
+            raise ChainRefused("tête testée %s introuvable (ni sur origin ni ici)"
+                               % args.publish)
+        # la réf est mobile : seule la tête attestée par la marque est publiée
+        if head != args.publish_sha:
+            raise ChainRefused("%s désigne %s, la marque de tests atteste %s"
+                               % (args.publish, head[:12], args.publish_sha[:12]))
+        base_sha = fresh_base(repo, args.target)
+        print("paquet %s : publication de la tête testée %s sur %s %s"
+              % (args.name, head, args.target, base_sha), flush=True)
+        # #4304 : la tête est poussée, enregistrée et gelée avant ses tests ; seule
+        # la fin reste due, sur la branche du paquet qui la désigne toujours
+        remote_sha = remote_branch(repo, branch)
+        if remote_sha:
+            git(repo, "fetch", "--no-tags", "origin", branch, check=False)
+            remote_sha = rev(repo, "origin/" + branch) or remote_sha
+        if remote_sha != head:
+            raise ChainRefused("%s sur origin désigne %s, pas la tête testée %s"
+                               % (branch, (remote_sha or "rien")[:12], head[:12]))
+        worktree = Path(tempfile.mkdtemp(prefix="paquet-auto-publie-",
+                                         dir=str(temporary_parent())))
+        worktree.rmdir()
+        reader = Path(tempfile.mkdtemp(prefix="paquet-auto-base-",
+                                       dir=str(temporary_parent())))
+        reader.rmdir()
+        tmp = tempfile.TemporaryDirectory(prefix="paquet-auto-", dir=str(temporary_parent()))
+        success = False
+    except BaseException:
+        claim.stop()
+        raise
     try:
         git(repo, "worktree", "add", "--detach", str(worktree), head)
         git(repo, "worktree", "add", "--detach", str(reader), base_sha)

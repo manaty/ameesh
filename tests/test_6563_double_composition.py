@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import time
 import unittest
 from unittest import mock
 
@@ -240,15 +239,20 @@ class CarrierLeaseTest(PgTestCase):
         carrier_id = self._carrier()
         claim = self._claim(carrier_id)
         lease = packet_composition.Lease(
-            self.db, "ameesh", owner=claim.owner, ttl_s=1.0, carrier=carrier_id)
+            self.db, "ameesh", owner=claim.owner, ttl_s=60, carrier=carrier_id)
         self.assertTrue(lease.acquire())
         claim.epoch = lease.epoch
         claim.proc = self._idle_child()
         try:
             # bail encore à nous, enfant vivant : la preuve passe
             self.assertIsNone(claim.require())
-            # l'enfant vit toujours, mais le bail expire puis est repris
-            time.sleep(1.3)
+            # l'enfant vit toujours, mais le bail expire puis est repris. L'échéance
+            # est posée dans le passé au lieu d'attendre un TTL court : la preuve
+            # lance un processus, dont la durée rendrait ce témoin instable.
+            self.db.execute(
+                "UPDATE merge_locks SET expires_at = clock_timestamp()"
+                " - interval '1 second' WHERE target = %s",
+                (packet_composition.key("ameesh", carrier_id),))
             other = packet_composition.Lease(
                 self.db, "ameesh", owner="autre:composeur", ttl_s=60,
                 carrier=carrier_id)
@@ -272,6 +276,20 @@ class CarrierLeaseTest(PgTestCase):
                     claim.require()
         finally:
             claim.stop()
+
+    def test_start_refuse_un_hold_sans_reponse(self):
+        # #6563 : un détenteur qui meurt sans répondre est un refus propre
+        # (`PaquetAutoError`), jamais un `ValueError` du tube déjà fermé.
+        carrier_id = self._carrier()
+        claim = paquet_auto.CompositionClaim(
+            self.tmp, carrier_id, "h-20261027-04",
+            cli=[sys.executable, "-c", "import sys; sys.exit(1)"],
+            env=self.env())
+        with self.assertRaises(paquet_auto.PaquetAutoError):
+            claim.start()
+        self.assertIsNone(claim.proc)
+        self.assertIsNone(packet_composition.holder(
+            self.db, "ameesh", carrier=carrier_id))
 
     def test_check_cli_prouve_ou_refuse_le_bail(self):
         carrier_id = self._carrier()
