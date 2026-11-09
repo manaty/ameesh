@@ -139,11 +139,11 @@ FERMEES = {
     # stay internal to the native storage API (aggregates only); no supervisor
     # GRANT added.
     "repair_retries": {"idempotency_key", "project", "environment", "origin", "intent",
-                       "cause", "episode", "attempt", "requested_at", "engaged_at",
-                       "completed_at", "failed_at", "unknown_at", "avoided_at",
-                       "updated_at"},
+                       "cause", "episode", "attempt", "generation", "requested_at",
+                       "engaged_at", "completed_at", "failed_at", "unknown_at",
+                       "avoided_at", "updated_at"},
     "repair_retry_attempts": {"project", "environment", "episode", "cause", "attempts",
-                              "updated_at"},
+                              "generation", "updated_at"},
 
     # #6017 (0552) : sonde admise sur un retour clos, tenue par l'adaptateur VM
     # et lue par le prédicat de prise ; fermée aux deux rôles, aucun GRANT modifié.

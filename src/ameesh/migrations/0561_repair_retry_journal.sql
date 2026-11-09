@@ -9,6 +9,9 @@ CREATE TABLE repair_retry_attempts (
     episode text NOT NULL CHECK (char_length(episode) BETWEEN 1 AND 200),
     cause text NOT NULL CHECK (cause ~ '^[a-z][a-z0-9_.-]{0,63}$'),
     attempts bigint NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    -- Series generation: a late completion of an older attempt must never
+    -- reset the counter of a newer series (out-of-order settle, #6475 B2).
+    generation bigint NOT NULL DEFAULT 0 CHECK (generation >= 0),
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (project, environment, episode, cause)
 );
@@ -22,6 +25,7 @@ CREATE TABLE repair_retries (
     cause text NOT NULL CHECK (cause ~ '^[a-z][a-z0-9_.-]{0,63}$'),
     episode text NOT NULL CHECK (char_length(episode) BETWEEN 1 AND 200),
     attempt bigint NOT NULL CHECK (attempt >= 0),
+    generation bigint NOT NULL DEFAULT 0 CHECK (generation >= 0),
     requested_at timestamptz NOT NULL DEFAULT now(),
     engaged_at timestamptz,
     completed_at timestamptz,

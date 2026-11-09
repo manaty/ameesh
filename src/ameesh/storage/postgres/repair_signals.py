@@ -226,20 +226,23 @@ class RepairSignals(interface.RepairSignals):
                         'created': False,
                         'requested_at': _iso(row['requested_at'])}
             # Atomic upsert: two holders share the same durable counter, so a
-            # handover neither restarts nor loses the attempt series.
-            attempt = tx.query(
+            # handover neither restarts nor loses the attempt series.  Each
+            # request opens a new generation so a late completion of an older
+            # attempt cannot reset a newer series (#6475 B2).
+            counter = tx.query(
                 'INSERT INTO repair_retry_attempts'
-                '(project,environment,episode,cause,attempts)'
-                ' VALUES (%s,%s,%s,%s,1)'
+                '(project,environment,episode,cause,attempts,generation)'
+                ' VALUES (%s,%s,%s,%s,1,1)'
                 ' ON CONFLICT (project,environment,episode,cause)'
                 ' DO UPDATE SET attempts=repair_retry_attempts.attempts+1,'
-                ' updated_at=now()'
-                ' RETURNING attempts',
-                (project, environment, episode, cause))[0]['attempts']
+                ' generation=repair_retry_attempts.generation+1, updated_at=now()'
+                ' RETURNING attempts,generation',
+                (project, environment, episode, cause))[0]
             tx.execute(
-                'UPDATE repair_retries SET attempt=%s'
-                ' WHERE idempotency_key=%s', (attempt, key))
-        return {'idempotency_key': key, 'attempt': int(attempt),
+                'UPDATE repair_retries SET attempt=%s,generation=%s'
+                ' WHERE idempotency_key=%s',
+                (int(counter['attempts']), int(counter['generation']), key))
+        return {'idempotency_key': key, 'attempt': int(counter['attempts']),
                 'created': True, 'requested_at': _iso(inserted[0]['requested_at'])}
 
     def retry_engage(self, idempotency_key, *, engaged_at=None):
@@ -270,10 +273,12 @@ class RepairSignals(interface.RepairSignals):
         return result
 
     def retry_settle(self, idempotency_key, outcome, *, settled_at=None):
-        """Record the terminal outcome, once; completed resets the counter.
+        """Record the terminal outcome, once; completed resets its series.
 
-        ``unknown`` is terminal for U14: reconciling an engaged effect is a
-        later, explicit step, never a silent overwrite.
+        The reset is guarded by the row's generation, so a late completion of
+        an older attempt cannot erase a newer series (#6475 B2).  ``unknown``
+        is terminal for U14: reconciling an engaged effect is a later,
+        explicit step, never a silent overwrite.
         """
         key = retries._key(idempotency_key)
         if outcome not in retries.OUTCOMES:
@@ -289,18 +294,20 @@ class RepairSignals(interface.RepairSignals):
                    ' WHERE idempotency_key=%s AND avoided_at IS NULL'
                    ' AND completed_at IS NULL AND failed_at IS NULL'
                    ' AND unknown_at IS NULL AND ' + column + ' IS NULL'
-                   ' RETURNING project,environment,episode,cause')
+                   ' RETURNING project,environment,episode,cause,generation')
             rows = tx.query(sql, (when, when, key))
             if not rows:
                 return False
             row = rows[0]
             if outcome == 'completed':
+                # Only the current series resets: an older attempt settling
+                # late leaves a newer series' counter intact (#6475 B2).
                 tx.execute(
                     'UPDATE repair_retry_attempts SET attempts=0, updated_at=now()'
                     ' WHERE project=%s AND environment=%s AND episode=%s'
-                    ' AND cause=%s',
+                    ' AND cause=%s AND generation=%s',
                     (row['project'], row['environment'], row['episode'],
-                     row['cause']))
+                     row['cause'], int(row['generation'])))
         return True
 
     def retry_avoid(self, idempotency_key, *, project, environment, origin,

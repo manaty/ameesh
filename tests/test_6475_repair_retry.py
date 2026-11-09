@@ -191,6 +191,19 @@ class RepairRetryStorageTest(PgTestCase):
         self.assertEqual(self.api.retry_attempts(
             'ameesh', 'staging', 'role:mesh-design/alerts', 'command'), 1)
 
+    def test_late_completion_does_not_reset_a_newer_series(self):
+        self.assertEqual(self.request(1)['attempt'], 1)
+        self.assertEqual(self.request(2)['attempt'], 2)
+        self.assertTrue(self.api.retry_settle(key(2), 'completed'))
+        self.assertEqual(self.api.retry_attempts(
+            'ameesh', 'staging', 'role:mesh-design/alerts', 'command'), 0)
+        self.assertEqual(self.request(3)['attempt'], 1)
+        # A settles after B: its older generation must not erase C's series.
+        self.assertTrue(self.api.retry_settle(key(1), 'completed'))
+        self.assertEqual(self.api.retry_attempts(
+            'ameesh', 'staging', 'role:mesh-design/alerts', 'command'), 1)
+        self.assertEqual(self.request(4)['attempt'], 2)
+
     def test_replay_between_request_and_engage_does_not_count_twice(self):
         self.request(1)
         replayed = self.api.retry_begin(

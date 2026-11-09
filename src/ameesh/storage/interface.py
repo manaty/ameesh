@@ -5959,7 +5959,11 @@ class RepairSignals(Domain):
 
     @abc.abstractmethod
     def retry_settle(self, idempotency_key, outcome, *, settled_at=None):
-        """Record completed/failed/unknown once; completed resets the counter."""
+        """Record completed/failed/unknown once.
+
+        ``completed`` resets the counter of the current series only: a late
+        completion of an older attempt never erases a newer one.
+        """
 
     @abc.abstractmethod
     def retry_avoid(self, idempotency_key, *, project, environment, origin,
