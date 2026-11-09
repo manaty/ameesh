@@ -113,6 +113,12 @@ def _alert_page(db, project, after, *, without_project=False):
     columns = (
         "SELECT id, data->>'key' AS key, data->>'since' AS since,"
         " coalesce(nullif(data->>'revision',''),data->>'observed_version','') AS version,"
+        # #6485: a JSON null or absent key is no alias; any other non-string
+        # value becomes '' so that ingest refuses the row, never coerces it.
+        " CASE WHEN coalesce(jsonb_typeof(data->'fingerprint_key'),'null')='null'"
+        " THEN NULL WHEN jsonb_typeof(data->'fingerprint_key')='string'"
+        " THEN data->>'fingerprint_key' ELSE '' END"
+        " AS fingerprint_key,"
         " extract(epoch FROM created_at) AS observed"
         " FROM ameesh_events WHERE ")
     if without_project:
@@ -143,11 +149,16 @@ def _alert_inputs(rows, project, occurrences):
         except (ValueError, TypeError):
             since = row['observed']  # malformed source timestamp: observation time
         key = row['key']
-        inputs.append({'key': row['id'],
-                       'occurrence': max(occurrences.get(key, 0),
-                                         page_occurrences.get(key, 1)),
-                       'observed_version': row['version'], 'entry': {
-                'key': key, 'project': project, 'since': since}})
+        item = {'key': row['id'],
+                'occurrence': max(occurrences.get(key, 0),
+                                  page_occurrences.get(key, 1)),
+                'observed_version': row['version'], 'entry': {
+                    'key': key, 'project': project, 'since': since}}
+        # #6485: a producer that knows the historical fingerprint of the
+        # alert writes it as `fingerprint_key`; absent, no alias is invented.
+        if row.get('fingerprint_key') is not None:
+            item['fingerprint_key'] = row['fingerprint_key']
+        inputs.append(item)
     return inputs
 
 
@@ -175,7 +186,12 @@ def ingest(db, *, project, environment, source, rows, expected_cursor,
                 received_at=now, occurrence=row.get('occurrence', 1),
                 cause_key=row.get('cause_key', ''),
                 observed_version=row.get('observed_version', ''))
-        except repair_signals.SignalError:
+            if row.get('fingerprint_key') is not None:
+                # #6485: an unusable historical key refuses the row here,
+                # where it is counted, instead of failing its A3 receipt
+                # after receipt (a warning and a lost observation).
+                fingerprints.historical_alias(project, row['fingerprint_key'])
+        except (repair_signals.SignalError, fingerprints.FingerprintError):
             key = hashlib.sha256(json.dumps(
                 [project, environment, source, row['key']],
                 ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()

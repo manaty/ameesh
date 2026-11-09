@@ -3343,12 +3343,14 @@ class WorkItems(interface.WorkItems):
         return bool(rows)
 
     def land_holder(self, key) -> dict | None:
-        """#3598 : qui tient le bail, et jusqu'à quand, pour le refus de
-        `give`/`withdraw`. Horloge de la base, lecture seule, jamais une garde.
-        L'échéance est rendue en UTC ISO (`…Z`), identique sous les deux
-        pilotes plutôt que datetime (psycopg) ou texte (psql)."""
+        """#3598 : qui tient le bail, son époque, et jusqu'à quand, pour le
+        refus de `give`/`withdraw`. #6563 : l'époque sert aussi de preuve
+        fraîche au détenteur (`ameesh work packet check`). Horloge de la base,
+        lecture seule, jamais une garde. L'échéance est rendue en UTC ISO
+        (`…Z`), identique sous les deux pilotes plutôt que datetime (psycopg)
+        ou texte (psql)."""
         rows = self.db.query(
-            "SELECT owner,"
+            "SELECT owner, epoch,"
             " to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
             "   AS expires_at,"
             " extract(epoch FROM (expires_at - clock_timestamp()))::float8 AS left_s"

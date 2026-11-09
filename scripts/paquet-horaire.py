@@ -95,6 +95,15 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    la création ; `ameesh work add` prend le même verrou pour un porteur de
    paquet, si bien que l'agent désigné par l'alerte « créneau manqué » et la
    minuterie ne peuvent pas créer deux porteurs (h-21/h-22 du 05/11).
+   #6563 : le bail projet de #5941 ne couvre que la création. Sur un porteur
+   **existant**, le tic lit le bail de composition du porteur (clé
+   `packet-compose:carrier:<projet>:<n°>`, tenu par `paquet-auto` pendant toute
+   composition réelle) avant `attempt`, `resume`, `follow` et la recomposition
+   du pilote : un agent désigné qui compose le même porteur dans son clone est
+   vu, et le tic ne relance rien (h-17 du 09/11, #6562). Sans tête gelée ni
+   marque de tentative, une note `packet composition recorded` récente ou une
+   tête de branche poussée sans gel bloque aussi la relance : c'est au pilote
+   de trancher, jamais au tic de réécrire la tête d'un autre composeur.
    #4501 : la vie d'une tentative sur cet hôte se lit au **pid vivant**, jamais
    à la ligne de commande (une recomposition peut tourner sous un autre nom) ;
    et si une tête poussée du porteur (gelée, ou vue en avance) a une ci-full en
@@ -208,6 +217,9 @@ MARK_WAIT = MARK + "verdict au pilote "
 MARK_ATTEMPT = MARK + "tentative "
 MARK_FAILED = MARK + "échec "
 MARK_STUCK = MARK + "reprise épuisée "
+#: #6563 : une unité enregistrée sur le porteur (`work packet record`) avant
+#: tout gel prouve une composition en cours ou poussée par un autre.
+COMPOSITION_RECORD_PREFIX = "packet composition recorded: "
 #: #4245 : un refus de la garde d'époque (EP4) n'est pas un échec de
 #: composition (§3, non concluant) : il ne consomme pas de tentative
 MARK_FENCED = MARK + "non concluant "
@@ -421,6 +433,9 @@ class Context:
     #: bancs sans base, où le verrou n'est pas joué. La fabrique est appelée
     #: après la lecture des candidats, jamais avant (section critique courte).
     composition: object = None
+    #: #6563 : lit le bail de composition d'un porteur existant (clé par
+    #: porteur, tenue par `paquet-auto`) ; None dans les bancs sans base.
+    carrier_claim: object = None
     #: #4562 : le clone de recomposition a déjà été vérifié (jamais le dossier
     #: de travail d'un agent) ; la CLI le vérifie avant `check_fresh`
     clone_checked: bool = False
@@ -1354,6 +1369,29 @@ def composition_in_progress(ctx: Context, name: str) -> str:
     return auto.holder_label(*holder) if holder is not None else ""
 
 
+def carrier_composition(ctx: Context, carrier: int) -> str:
+    """#6563 : le détenteur du bail de composition du porteur, ou "".
+
+    Le bail est partagé entre clones et hôtes (`packet_composition.Lease`,
+    clé par porteur) : il couvre un composeur désigné qui reprend le porteur
+    existant, que le `flock` local du clone ne voit pas. Une lecture
+    impossible n'autorise aucun geste.
+    """
+    if ctx.carrier_claim is None:
+        return ""
+    try:
+        held = ctx.carrier_claim(int(carrier))
+    except Exception as exc:  # noqa: BLE001 - base illisible : aucun geste
+        raise HoraireError(
+            "bail de composition du porteur #%d illisible (%s) : aucun geste"
+            % (carrier, exc)) from exc
+    if not held:
+        return ""
+    if isinstance(held, dict):
+        return str(held.get("owner") or "verrou tenu")
+    return str(held)
+
+
 def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     """Lancer paquet-auto pour une étape, la marque d'intention d'abord."""
     holder = composition_in_progress(ctx, name)
@@ -1361,6 +1399,11 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
         # #4329 : une composition du même paquet vit (tick ou lancement à la
         # main) ; ne pas écrire une tentative que son verrou va refuser.
         return "#%d : composition en cours (%s)" % (carrier, holder)
+    claim = carrier_composition(ctx, carrier)
+    if claim:
+        # #6563 : un autre composeur — l'agent désigné par l'alerte — tient le
+        # bail partagé du porteur ; le tic ne relance rien.
+        return "#%d : composition en cours (%s)" % (carrier, claim)
     mark = "%s%s n=%d base=%s par=%s:%d" % (MARK_ATTEMPT, this.step, this.n,
                                             this.base or "-", ctx.host, ctx.pid)
     if this.step == RECOMPOSITION:
@@ -1503,6 +1546,11 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
         # #4329 : le verrou du paquet prime le pid de la marque, qui peut être
         # celui d'une tentative morte.
         return "#%d : composition en cours (%s)" % (carrier, holder)
+    claim = carrier_composition(ctx, carrier)
+    if claim:
+        # #6563 : un composeur d'un autre clone (agent désigné) tient le bail
+        # partagé du porteur ; la tentative de la marque n'est pas la sienne.
+        return "#%d : composition en cours (%s)" % (carrier, claim)
     if any(note.startswith(MARK_PUBLISHED + this.key) for note in marks(item)):
         # #6561 : la composition a publié une tête puis n'a rien laissé ; le
         # porteur a été laissé ouvert pour son pilote, le tic n'y recompose pas.
@@ -1833,6 +1881,32 @@ def publish(ctx: Context, item: dict) -> str:
     return "#%d : ci-full demandée sur %s" % (carrier, sha[:12])
 
 
+def composition_evidence(item: dict, now: float) -> str:
+    """#6563 : une composition déjà enregistrée ou poussée, sans gel.
+
+    Deux preuves partagées entre clones, lues avant de relancer une composition
+    sur un porteur sans tête gelée :
+
+    * une note `packet composition recorded` récente — `paquet-compose`
+      enregistre chaque unité avant la poussée, donc la trace existe même
+      quand le composeur n'a pas encore publié. Au-delà de `ATTEMPT_STALE`,
+      la composition est réputée morte et le tic peut reprendre ;
+    * une tête de branche vue (`branch_head`), c'est-à-dire une poussée sans
+      gel : elle n'est jamais réécrite par le tic, c'est au pilote de trancher.
+    """
+    recorded = [float(ev.get("created_ts") or 0) for ev in _events(item)
+                if str(ev.get("note") or "").startswith(COMPOSITION_RECORD_PREFIX)]
+    if recorded and now - max(recorded) < ATTEMPT_STALE:
+        minutes = max(0, int((now - max(recorded)) / 60))
+        return ("composition enregistrée par un autre composeur (il y a %d min) : "
+                "rien à faire" % minutes)
+    head = str(item.get("branch_head") or "").strip()
+    if head:
+        return ("tête %s publiée sans gel par un autre composeur : rien à faire, "
+                "le pilote tranche" % head[:12])
+    return ""
+
+
 def follow(ctx: Context, item: dict) -> str:
     """Un porteur horaire ouvert : publier, attendre, ou traiter un rouge."""
     carrier = int(item["id"])
@@ -1843,12 +1917,25 @@ def follow(ctx: Context, item: dict) -> str:
             # #4329 : une composition (tick ou lancement à la main) tient le
             # verrou du paquet ; ne rien publier, retirer ni recomposer avant.
             return "#%d : composition en cours (%s)" % (carrier, holder)
+    claim = carrier_composition(ctx, carrier)
+    if claim:
+        # #6563 : le bail partagé du porteur est tenu par un autre composeur
+        # (agent désigné, autre clone) ; le tic ne relance rien.
+        return "#%d : composition en cours (%s)" % (carrier, claim)
     sha = frozen_sha(item)
     if merged_head(ctx, item, sha):
         # #4506 : un porteur fusionné reste ouvert (qa) le temps de sa clôture
         # (hold du pilote, balayage) ; le tic n'y recompose ni ne republie.
         return "#%d : fusionné, rien à faire (tête %s dans %s)" % (
             carrier, sha[:12] or "aucune", ctx.target)
+    if not sha and not attempts(item):
+        # #6563 : sans tête gelée ni marque de tentative, une composition déjà
+        # enregistrée ou une tête poussée par un autre composeur n'est pas
+        # réécrite. La vérification précède `pending`, qui fabrique sinon une
+        # « tentative 0 morte » pour tout porteur ancien sans marque.
+        evidence = composition_evidence(item, ctx.now)
+        if evidence:
+            return "#%d : %s" % (carrier, evidence)
     left = pending(ctx, item, sha)
     if left is not None:
         return resume(ctx, item, left)
@@ -2385,6 +2472,12 @@ def _pilot_recompose_once(ctx: Context, carrier: int, exclude: list[int],
     if left is not None and running(ctx, left):
         raise Busy("#%d : %s en cours (%s:%d), attendre sa fin"
                    % (carrier, left.step, left.host, left.pid))
+    claim = carrier_composition(ctx, carrier)
+    if claim:
+        # #6563 : un composeur (agent désigné) tient le bail partagé du
+        # porteur ; la recomposition du pilote attend sa fin.
+        raise Busy("#%d : composition en cours (%s), attendre sa fin"
+                   % (carrier, claim))
     # #4501 : une ci-full tourne sur la tête poussée ; la recomposition
     # l'écraserait au lieu d'attendre son verdict.
     run = ci_in_progress(ctx, item, forge=True)
@@ -2497,6 +2590,23 @@ def read_composition(project: str):
         _connect(), project,
         owner=packet_composition.owner("paquet-horaire", socket.gethostname(),
                                        os.getpid()))
+
+
+def read_carrier_claim(project: str, carrier: int) -> dict | None:
+    """#6563 : le bail de composition d'un porteur existant, ou None.
+
+    Lecture seule, sur une connexion courte : le tic ne prend pas le bail
+    (c'est le composeur qui le tient), il refuse seulement de relancer une
+    composition qu'un autre a déjà commencée.
+    """
+    from ameesh import packet_composition
+    db = _connect()
+    try:
+        return packet_composition.holder(db, project, carrier=int(carrier))
+    finally:
+        close = getattr(db, "close", None)
+        if close:
+            close()
 
 
 def _zone() -> tuple[ZoneInfo, object]:
@@ -2652,7 +2762,11 @@ def main(argv: list[str] | None = None) -> int:
                                                pilot=args.pilot, notify=not args.dry_run),
                   # #5941 : le verrou partagé avec `ameesh work add` ; la
                   # fabrique ne se connecte qu'au moment de composer.
-                  composition=lambda: read_composition(args.project))
+                  composition=lambda: read_composition(args.project),
+                  # #6563 : le bail par porteur tenu par `paquet-auto` ; une
+                  # lecture par porteur suivi, jamais une prise.
+                  carrier_claim=lambda carrier: read_carrier_claim(
+                      args.project, carrier))
     try:
         if args.command == "recompose":
             # geste explicite du pilote (#4237) : la pause (#4361) ne vise que le tic

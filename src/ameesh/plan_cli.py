@@ -22,6 +22,10 @@
   ameesh work packet record <porteur> [--repo R] [--base SHA] [--head REF]
                              [--expect-pushed SHA] [--dry-run]
   ameesh work packet show <lot|porteur> [--json]   (#2443 : paquet d'une unité)
+  ameesh work packet hold <porteur> [--project P] [--owner O] [--ttl S] [--json]
+                             (#6563 : tenir le bail de composition du porteur)
+  ameesh work packet check <porteur> [--project P] [--owner O] [--epoch N] [--json]
+                             (#6563 : preuve fraîche bornée de ce bail)
 
 Gardées hors de `mesh_cli` (qui les branche) pour que leurs évolutions n'y
 touchent pas. Voir `plan_github` pour les règles de GitHub (vue, jamais
@@ -31,9 +35,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
+import threading
 
-from . import packet_close, plan_git, plan_github, work
+from . import packet_close, packet_composition, plan_git, plan_github, work
 from .canon import GitError
 from .deprecated import DeprecatedAlias
 
@@ -83,6 +89,34 @@ def add_parsers(work_sub, func) -> None:
     p_pshow.add_argument("id", type=int)
     p_pshow.add_argument("--json", action="store_true")
     p_pshow.set_defaults(func=func)
+    p_phold = packet_sub.add_parser(
+        "hold", help="#6563: hold a carrier's composition lease while composing "
+                     "it, renewing it until stdin closes or SIGTERM")
+    p_phold.add_argument("id", type=int, metavar="CARRIER")
+    p_phold.add_argument("--project", default="",
+                         help="project of the lease (default: the carrier's app)")
+    p_phold.add_argument("--owner", default="",
+                         help="lease owner token (default: a fresh packet-hold token)")
+    p_phold.add_argument("--ttl", type=float,
+                         default=packet_composition.TTL_S,
+                         help="lease TTL in seconds, renewed every third "
+                              "(default: %(default)s)")
+    p_phold.add_argument("--json", action="store_true",
+                         help="print the lease as one JSON object")
+    p_phold.set_defaults(func=func)
+    p_pcheck = packet_sub.add_parser(
+        "check", help="#6563: prove a carrier's composition lease is still "
+                      "held by this owner and epoch (fresh, read-only)")
+    p_pcheck.add_argument("id", type=int, metavar="CARRIER")
+    p_pcheck.add_argument("--project", default="",
+                          help="project of the lease (default: the carrier's app)")
+    p_pcheck.add_argument("--owner", default="",
+                          help="required lease owner token")
+    p_pcheck.add_argument("--epoch", type=int, default=None,
+                          help="required lease epoch")
+    p_pcheck.add_argument("--json", action="store_true",
+                          help="print the proof as one JSON object")
+    p_pcheck.set_defaults(func=func)
 
     p_close = work_sub.add_parser(
         "close", help="close an abandoned, superseded, delivered-outside-target or done work "
@@ -308,6 +342,10 @@ def run(db, args: argparse.Namespace, cfg=None) -> int:
         from . import packet_link
         if args.packet_command == "record":
             return _packet_record(db, args, packet_link)
+        if args.packet_command == "hold":
+            return _packet_hold(db, args)
+        if args.packet_command == "check":
+            return _packet_check(db, args)
         return _packet_show(db, args, packet_link)
     if command == "link":
         if args.none == bool(args.package):
@@ -523,6 +561,140 @@ def _sync_packages(db, args: argparse.Namespace) -> int:
             ", ".join("#%d" % lot for lot in warning["lots"]), warning["message"]),
             file=sys.stderr)
     return 0
+
+
+def _packet_hold(db, args: argparse.Namespace) -> int:
+    """#6563 : tenir le bail de composition d'un porteur existant.
+
+    Le processus de composition (`scripts/paquet-auto.py`) lance cette
+    commande en enfant, garde son entrée standard ouverte, et la referme à la
+    fin : le bail est alors rendu. Un processus tué ferme le tube, le fils
+    rend le bail ; un SIGKILL de toute la lignée laisse le TTL l'expirer.
+    Le renouvellement est fait ici, sur la connexion déjà ouverte, pour que
+    la composition (longue) ne perde pas le bail au bout de `TTL_S`.
+    """
+    item = work.get(db, int(args.id))
+    if item is None:
+        print("error: packet carrier #%d not found" % int(args.id), file=sys.stderr)
+        return 1
+    project = str(args.project or item.get("app") or "")
+    if not project:
+        print("error: packet carrier #%d has no app; pass --project" % int(args.id),
+              file=sys.stderr)
+        return 1
+    ttl = float(args.ttl)
+    if ttl <= 0:
+        print("error: --ttl must be positive", file=sys.stderr)
+        return 2
+    owner = str(args.owner or packet_composition.owner("packet-hold"))
+    lease = packet_composition.Lease(db, project, owner=owner, ttl_s=ttl,
+                                     carrier=int(args.id))
+    try:
+        taken = lease.acquire()
+    except Exception as exc:  # noqa: BLE001 - bail illisible : aucun geste
+        print("error: composition lease unreadable for #%d: %s"
+              % (int(args.id), exc), file=sys.stderr)
+        return 1
+    if not taken:
+        try:
+            held = lease.describe()
+        except Exception as exc:  # noqa: BLE001 - le refus reste un refus
+            held = "unreadable holder (%s)" % exc
+        data = {"held": True, "busy": True, "owner": held, "epoch": None}
+        print(json.dumps(data, ensure_ascii=False) if args.json
+              else "composition en cours (%s)" % held, flush=True)
+        return 3
+    data = {"held": True, "busy": False, "owner": lease.owner,
+            "epoch": lease.epoch, "key": lease.key}
+    print(json.dumps(data, ensure_ascii=False) if args.json
+          else "composition lease held (%s, %s)" % (lease.key, lease.owner),
+          flush=True)
+    stop = threading.Event()
+
+    def watch_stdin() -> None:
+        try:
+            while sys.stdin.read(1):
+                pass
+        except Exception:  # noqa: BLE001 - un tube fermé est le signal attendu
+            pass
+        stop.set()
+
+    def on_signal(_signum, _frame) -> None:
+        stop.set()
+
+    previous: dict[int, object] = {}
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            previous[signum] = signal.signal(signum, on_signal)
+        except (ValueError, OSError):
+            pass
+    threading.Thread(target=watch_stdin, daemon=True).start()
+    interval = max(min(ttl / 3.0, 60.0), 0.05)
+    lost = False
+    try:
+        while not stop.wait(interval):
+            try:
+                ok = lease.renew()
+            except Exception:  # noqa: BLE001 - un renouvellement rompu est perdu
+                ok = False
+            if not ok:
+                lost = True
+                print("error: composition lease lost for #%d (%s)"
+                      % (int(args.id), lease.owner), file=sys.stderr)
+                break
+    finally:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                pass
+        try:
+            lease.release()
+        except Exception:  # noqa: BLE001 - le TTL libère le bail
+            pass
+    return 1 if lost else 0
+
+
+def _packet_check(db, args: argparse.Namespace) -> int:
+    """#6563 : preuve fraîche, en lecture seule, du bail d'un porteur.
+
+    Le détenteur (`packet hold`) reste seul à renouveler ; ce geste relit la
+    base et dit si le bail est encore au propriétaire et à l'époque attendus.
+    Un enfant vivant ne prouve rien (suspendu, renouvellement bloqué) : c'est
+    ce que `CompositionClaim.require` appelle avant chaque mutation.
+    """
+    item = work.get(db, int(args.id))
+    if item is None:
+        print("error: packet carrier #%d not found" % int(args.id), file=sys.stderr)
+        return 1
+    project = str(args.project or item.get("app") or "")
+    if not project:
+        print("error: packet carrier #%d has no app; pass --project" % int(args.id),
+              file=sys.stderr)
+        return 1
+    try:
+        held = packet_composition.holder(db, project, carrier=int(args.id))
+    except Exception as exc:  # noqa: BLE001 - preuve illisible : refus
+        print("error: composition lease unreadable for #%d: %s"
+              % (int(args.id), exc), file=sys.stderr)
+        return 1
+    match = held is not None
+    if match and args.owner:
+        match = str(held.get("owner") or "") == str(args.owner)
+    if match and args.epoch is not None:
+        match = int(held.get("epoch") or 0) == int(args.epoch)
+    data = {"held": held is not None, "match": match,
+            "owner": str((held or {}).get("owner") or ""),
+            "epoch": int((held or {}).get("epoch") or 0)}
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False), flush=True)
+    elif data["held"]:
+        print("composition lease %s (%s, epoch %d)"
+              % ("proven" if match else "NOT ours", data["owner"], data["epoch"]),
+              flush=True)
+    else:
+        print("composition lease not held", flush=True)
+    return 0 if data["held"] and match else 1
 
 
 def _packet_record(db, args: argparse.Namespace, packet_link) -> int:

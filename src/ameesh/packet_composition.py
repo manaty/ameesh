@@ -28,6 +28,24 @@ Le chemin de la minuterie transmet son propriétaire à `work add`
 (`--composition-owner`) : la création d'un second porteur de la même paire
 parallèle est alors permise — c'est le même composeur qui la décide — mais
 tout autre composeur reste refusé.
+
+#6563 — le verrou couvre aussi la **composition d'un porteur existant**. Le
+09/11/2026 (h-17, #6562), l'alerte de créneau a fait reprendre par impl-01 un
+porteur que le tic venait de créer : impl-01 a composé 4 unités dans son clone
+et publié `cd5d5e859b57` à 16:50Z, pendant que le tic, qui ne voyait que son
+`flock` local, relançait une composition de 7 unités sur le même porteur
+(`92f21b21f4db`, poussée refusée). Le bail de création ci-dessus ne couvrait
+que « décider et créer » ; une fois le porteur ouvert, deux clones pouvaient
+le composer.
+
+Un second bail, de clé **par porteur** (`packet-compose:carrier:<projet>:<id>`,
+distincte de la clé projet qui sérialise la création), est donc tenu pendant
+toute la composition réelle (`scripts/paquet-auto.py`). Il est renouvelé par
+le détenteur (TTL cinq minutes) et libéré à la fin ; un processus mort le
+laisse expirer. Le tic le lit avant de reprendre un porteur (`follow`,
+`resume`, `attempt`) et s'arrête si un autre compose. La clé par porteur
+laisse vivre la paire parallèle #3256 C, dont les deux compositions sont
+indépendantes.
 """
 from __future__ import annotations
 
@@ -52,6 +70,11 @@ TTL_S = 300.0
 #: clé du bail dans `merge_locks` ; le projet suffit : deux cibles d'un même
 #: projet ne composent jamais en parallèle (le canon §12 n'en prévoit qu'une).
 KEY = "packet-compose:%s"
+#: #6563 : clé du bail d'un **porteur** pendant sa composition réelle. Elle
+#: est distincte de la clé projet (création) pour que la paire parallèle
+#: #3256 C garde deux compositions indépendantes, et plus fine pour qu'un
+#: composeur qui reprend un porteur existant soit vu du tic.
+CARRIER_KEY = "packet-compose:carrier:%s:%d"
 
 
 class CompositionError(RuntimeError):
@@ -84,9 +107,11 @@ def _row_is_carrier(row: dict) -> bool:
                       title=str(row.get("title") or ""))
 
 
-def key(project: str) -> str:
-    """La clé du bail de composition d'un projet."""
-    return KEY % (project or "")
+def key(project: str, carrier: int | None = None) -> str:
+    """La clé du bail de composition d'un projet, ou d'un porteur (#6563)."""
+    if carrier is None:
+        return KEY % (project or "")
+    return CARRIER_KEY % (project or "", int(carrier))
 
 
 def owner(role: str = "paquet-horaire", host: str = "", pid: int = 0) -> str:
@@ -95,14 +120,14 @@ def owner(role: str = "paquet-horaire", host: str = "", pid: int = 0) -> str:
                            int(pid or os.getpid()), uuid.uuid4().hex[:12])
 
 
-def holder(db, project: str) -> dict | None:
-    """Le bail de composition vivant du projet, ou None (TTL compris).
+def holder(db, project: str, *, carrier: int | None = None) -> dict | None:
+    """Le bail de composition vivant du projet (ou du porteur), ou None.
 
     Lecture de diagnostic, jamais une garde : la garde est la prise du bail.
     """
     if db is None:
         return None
-    return storage.of(db).work.land_holder(key(project))
+    return storage.of(db).work.land_holder(key(project, carrier))
 
 
 def carriers(db, project: str, target: str = "") -> list[int]:
@@ -130,16 +155,21 @@ def carriers(db, project: str, target: str = "") -> list[int]:
 
 
 class Lease:
-    """Le bail de composition d'un projet, dans `merge_locks`.
+    """Le bail de composition d'un projet, ou d'un porteur (#6563), dans
+    `merge_locks`.
 
     `acquire` est non bloquant : un second composeur s'arrête tout de suite.
     `release` ne rend que le bail de ce propriétaire et de cette époque.
+    ``carrier`` choisit la clé par porteur : la composition réelle d'un
+    porteur existant, distincte de la clé projet qui sérialise la création.
     """
 
-    def __init__(self, db, project: str, *, owner: str, ttl_s: float = TTL_S):
+    def __init__(self, db, project: str, *, owner: str, ttl_s: float = TTL_S,
+                 carrier: int | None = None):
         self.db = db
         self.project = project or ""
-        self.key = key(self.project)
+        self.carrier = None if carrier is None else int(carrier)
+        self.key = key(self.project, self.carrier)
         self.owner = str(owner)
         self.ttl_s = float(ttl_s)
         self.epoch: int | None = None
@@ -153,6 +183,26 @@ class Lease:
         epoch = storage.of(self.db).work.land_lock(self.key, self.owner, self.ttl_s)
         self.epoch = int(epoch) if epoch is not None else None
         return self.epoch is not None
+
+    def renew(self) -> bool:
+        """Prolonge le bail tenu, à la même époque ; False s'il est perdu.
+
+        Le détenteur d'une composition réelle peut durer plus que `TTL_S`
+        (tests par unité) : il renouvelle, et un processus tué laisse le bail
+        expirer au plus tard dans `TTL_S`.
+        """
+        epoch = self.epoch
+        if epoch is None:
+            return False
+        try:
+            got = storage.of(self.db).work.land_lock(
+                self.key, self.owner, self.ttl_s, epoch=epoch)
+        except Exception:  # noqa: BLE001 - un renouvellement rompu est un bail perdu
+            got = None
+        if got is None:
+            self.epoch = None
+            return False
+        return True
 
     def verify(self, owner: str | None = None) -> None:
         """Le bail est-il encore tenu par `owner` (ou par ce composeur) ?
