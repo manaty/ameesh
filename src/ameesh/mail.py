@@ -659,6 +659,18 @@ def is_urgent(row: Any) -> bool:
     return bool(message_payload(row).get("urgent"))
 
 
+def is_decision_request(row: Any) -> bool:
+    """#6534 : la ligne d'une demande de décision au propriétaire.
+
+    Elle porte `kind = 'request'` et `payload.decision` ; pour elle,
+    `delivered_at` est la clôture (réponse, retrait, remise). Un export v0 ne
+    la marque donc jamais remise : sinon la question se ferme « sans réponse
+    ni retrait » (constat du 09/11 12:03Z).
+    """
+    return ((row.get("kind") or "") == "request"
+            and message_payload(row).get("decision") is not None)
+
+
 #: #2814: the EXPLICIT request deadline, in the message payload. It is NOT
 #: the signature's `signature_expires_at` (a TTL for the signature, 24 h by
 #: default): a signed owner order must never disappear because its signature

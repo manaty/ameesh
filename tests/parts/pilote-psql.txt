@@ -83,6 +83,7 @@ test_6134_single_turn  # stockage : bail d'un seul tour et annulation du réveil
 test_6161_freeze_branch  # #6161: inferred branch and freeze share a transaction
 test_6332_repair_observation  # stockage : curseur U5 rejoué, refus et comptage des levées d'alerte par clé, sous les deux pilotes (#6332, #6360)
 test_6424_unread_externe  # stockage : décomptes de non-lus hors boîtes d'agents `externe` (overview, board, progress, mailbox, lettres mortes), état du courrier inchangé (#6424)
+test_6534_export_v0_garde  # stockage : export-v0 refuse un mesh vivant sans `--allow-live-executors`, ne remet jamais une décision, journalise l'acteur et les lignes (JSON des deux pilotes) (#6534)
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)
 test_711_migration_reservations  # storage: atomic scoped migration batches, legacy projection, SHA fencing and lifecycle (#711)

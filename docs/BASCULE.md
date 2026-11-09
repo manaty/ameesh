@@ -340,8 +340,9 @@ agent-runner stop deepseek7
 pkill -TERM -f "ameesh.runner.*--agents deepseek7|agent-runner --agents deepseek7"
 ameesh show deepseek7                       # lease: —
 while pgrep -f -- "$SESSION" >/dev/null; do sleep 2; done
-# 2. the mail goes back into the file mailbox
-ameesh export-v0 --agents deepseek7
+# 2. the mail goes back into the file mailbox (a live mesh requires the
+#    named override, journaled: --allow-live-executors REASON, #6534)
+ameesh export-v0 --agents deepseek7 --allow-live-executors "rollback deepseek7"
 # 3. the v0 loop resumes the SAME session
 nexlink-agent start deepseek7 deepseek "<consigne>" "$SESSION"
 ```
@@ -372,8 +373,10 @@ ameesh doctor --notify-test
 **Rollback (per agent), symmetrical:** `agent-runner stop <nom>` (no more
 new turns; `canon sync` never lifts this stop), wait until its lease
 is returned and its group is dead (`ameesh show <nom>`, `pgrep -f` on its
-session), `ameesh export-v0 --agents <nom>`, then `nexlink-agent start` on the
-same session. To cut it over again later: the step 4 procedure.
+session), `ameesh export-v0 --agents <nom> --allow-live-executors "rollback
+<nom>"`, then `nexlink-agent start` on the same session. The override is
+required while any executor is live and is journaled (#6534); without a live
+mesh it is unnecessary. To cut it over again later: the step 4 procedure.
 
 ---
 
@@ -399,7 +402,8 @@ For each orchestrator (declared in the canon like the other agents):
 
 **Rollback, symmetrical:** `agent-runner stop <orchestrateur>`, lease
 returned and group dead; stop the monitoring's event drops;
-`ameesh export-v0 --agents <orchestrateur>`; restart the interactive session
+`ameesh export-v0 --agents <orchestrateur> --allow-live-executors "rollback
+<orchestrateur>"`; restart the interactive session
 on the same session, with monitoring as `Monitor` in the session.
 
 ---
@@ -528,7 +532,8 @@ rollback; `systemctl disable --now ameesh-approve`.
   the v0 scripts after a tested restore.
 
 **Rollback:** reinstall the scripts from the backup, point
-`~/.local/bin/agent-mail` back to v0, `ameesh export-v0` for the mail, then
+`~/.local/bin/agent-mail` back to v0, `ameesh export-v0 --all
+--allow-live-executors "v0 rollback"` for the mail, then
 the v0 loops (step 4, rollback).
 
 ---

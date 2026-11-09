@@ -260,7 +260,14 @@ files are *moved* into `inbox/<nom>/imported/`, never deleted.
 
 `agent-mesh export-v0` does the reverse: it rewrites an agent's unread messages into
 the v0 file mailbox (strict v0 format) and marks them delivered in the database — a
-move, hence no duplicates on the way back. `--keep` copies without marking.
+move, hence no duplicates on the way back. `--keep` copies without marking. The
+perimeter is never implicit: name the boxes (`--agents a,b`) or take every box
+explicitly (`--all`). On a live mesh (a live executor lease) the command is
+refused unless the operator names the gesture with `--allow-live-executors
+REASON`, journaled like `migrate`; a decision request is never exported nor
+marked delivered (its `delivered_at` would close the question without an
+answer or a withdrawal, #6534). Each export writes a `mail.export` event with
+the actor, the boxes and the number of rows.
 
 This pair is what makes every step of `BASCULE.md` reversible.
 
