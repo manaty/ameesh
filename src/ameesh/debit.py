@@ -1244,6 +1244,10 @@ def build(*, items: Iterable[Mapping[str, Any]],
     external_by_lot: dict[int, dict] = {}
     #: #4235 : même règle pour une fenêtre d'observation déclarée.
     window_by_lot: dict[int, dict] = {}
+    #: #6423 : un réveil armé est une attente voulue et datée, comme une
+    #: fenêtre ; la ligne `qa_merge` le suit au lieu de relancer le pilote
+    #: avant l'échéance.
+    wake_by_lot: dict[int, dict] = {}
     wakes_out: list[dict] = []
     device_holds: list[dict] = []
     undeployed_holds: list[dict] = []
@@ -1504,6 +1508,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 "overdue": float(wake["due_ts"]) < now,
             }
             wakes_out.append(entry)
+            wake_by_lot[ident] = entry
 
     # Une cible qui est la branche d'un lot encore ouvert est une dépendance :
     # le lot ne peut pas entrer seul dans un paquet, il suit le lot parent
@@ -1575,6 +1580,18 @@ def build(*, items: Iterable[Mapping[str, Any]],
         else:
             if row.get("depends_on") or row.get("blocking_dependencies"):
                 continue                # l'attente est celle du prérequis
+            # #6423 : un réveil armé ou une fenêtre d'observation, non échus,
+            # sont des attentes voulues et datées : le lot n'est pas encore
+            # « en attente du paquet » et rien n'est actionnable avant
+            # l'échéance (témoin #659, rappelé 30 h à tort). Le réveil échu,
+            # lui, garde son geste propre (`wake_overdue`) et cette ligne.
+            armed = wake_by_lot.get(int(row["lot"]))
+            if armed is not None and float(armed["due_ts"]) > now:
+                continue
+            window = window_by_lot.get(int(row["lot"]))
+            if (window is not None
+                    and now < float(window["observation"]["due_ts"])):
+                continue
             add_wait("qa_merge", row, row["frozen_ts"], "paquet",
                      GESTURES["qa_merge"], level=2, human=_human_wait(state),
                      **dependents_of(row["lot"]))
@@ -2792,6 +2809,10 @@ def annotate_candidate_causes(db, cfg, report: Mapping[str, Any],
         overview = registry.overview(db)
     except Exception:  # noqa: BLE001 - registre illisible : lecture par lot
         overview = []
+    #: #6396/#6423 : un auteur en pause opérateur ne lira pas la relance ; le
+    #: nommer comme débiteur serait l'angle mort déjà corrigé pour les briefs.
+    paused = {_norm(row.get("name")) for row in overview
+              if row.get("operator_paused")}
     for row in rows:
         lot = int(row.get("lot") or 0)
         try:
@@ -2817,6 +2838,17 @@ def annotate_candidate_causes(db, cfg, report: Mapping[str, Any],
         author = item.get("assignee") or "l'auteur"
         detail = " (%s)" % cause["detail"] if cause.get("detail") else ""
         row["cause"] = cause
+        if _norm(author) in paused:
+            # #6396/#6423 : la relance ne part pas chez un auteur endormi.
+            # Le pilote porte le geste (§9) : réassigner le lot ou attendre la
+            # levée ; le geste de l'auteur reste dit pour celui qui le reprend.
+            row["who"] = "pilote"
+            row["gesture"] = (
+                "cause `%s`%s — auteur %s en pause opérateur : pilote, "
+                "réassigner le lot ou attendre la levée (geste dû : %s)" % (
+                    cause["code"], detail, author,
+                    cause.get("gesture") or "aucun"))
+            continue
         row["who"] = author
         row["gesture"] = "cause `%s`%s — %s : %s" % (
             cause["code"], detail, author, cause.get("gesture") or "")
