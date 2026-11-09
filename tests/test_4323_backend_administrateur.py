@@ -226,6 +226,12 @@ class BackendTest(Fixture,unittest.TestCase):
 
 
 class SignedRefusalTest(Fixture,support.PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.release_decision import install_decision_gate
+        install_decision_gate(cls)
+
     """Mandate absent, unsigned, expired or of the other kind: real authority refuses."""
 
     def setUp(self):

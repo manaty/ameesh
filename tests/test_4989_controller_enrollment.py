@@ -465,6 +465,12 @@ class EnrollmentTest(unittest.TestCase):
 
 
 class SignedAuthorityTest(support.PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.release_decision import install_decision_gate
+        install_decision_gate(cls)
+
     def setUp(self):
         super().setUp()
         self.now = time.time()

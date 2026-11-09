@@ -37,6 +37,40 @@ requires_psycopg = unittest.skipUnless(psycopg is not None, 'psycopg absent (par
 
 @requires_psycopg
 class PrivateInputTest(unittest.TestCase):
+    def test_sql_companions_are_packaged_and_root_checked(self):
+        import ast
+        from types import SimpleNamespace
+        # These data-files values are literal string lists; Python 3.9/3.10
+        # can inspect this subset without a TOML dependency.
+        config = (REPO / 'pyproject.toml').read_text().split('[tool.setuptools.data-files]', 1)[1]
+        def files(destination):
+            match = re.search(r'"'+re.escape(destination)+r'"\s*=\s*(\[[^]]*\])', config)
+            self.assertIsNotNone(match)
+            return ast.literal_eval(match.group(1))
+        packaged = files('share/ameesh/sql')
+        self.assertIn('deploy/mise-a-jour/procedures/mailbox-controleur.md',
+                      files('share/ameesh/mise-a-jour/procedures'))
+        self.assertTrue(all('deploy/sql/'+name in packaged for name in tool.SQL_COMPANIONS))
+        checked = []
+        def safe(path):
+            checked.append(path)
+            return SimpleNamespace(st_uid=0, st_mode=0o100644)
+        with mock.patch.object(Path, 'lstat', safe):
+            tool.check_sql_programs()
+        for name in tool.SQL_COMPANIONS:
+            self.assertIn(REPO / 'deploy/sql' / name, checked)
+            def unsafe(path):
+                return SimpleNamespace(st_uid=0, st_mode=0o100664 if path.name == name else 0o100644)
+            with mock.patch.object(Path, 'lstat', unsafe):
+                with self.assertRaisesRegex(tool.IdentityError, 'root-owned'):
+                    tool.check_sql_programs()
+        # A missing inclusion is refused before invoking psql.
+        original = Path.is_file
+        with mock.patch.object(Path, 'lstat', safe), mock.patch.object(
+                Path, 'is_file', lambda path: False if path.name == '_release-decision.sql' else original(path)):
+            with self.assertRaisesRegex(tool.IdentityError, 'missing'):
+                tool.check_sql_programs()
+
     def test_rejects_service_options_nested_uri_and_multiple_endpoints(self):
         for dsn in ("service=ambient", "host=example port=5432 dbname=db user=owner options='-c role=admin'",
                     "host=example port=5432 dbname='postgresql://other@elsewhere/db' user=owner",
@@ -137,8 +171,9 @@ class RealIdentityTest(unittest.TestCase):
                     sock.bind(('127.0.0.1', 0))
                     port = sock.getsockname()[1]
                 result = subprocess.run(['docker', 'run', '-d', '--env-file', str(envfile),
-                                         '--network', 'host', '-v', str(sockets) + ':/socket',
-                                         'postgres:16', '-c', 'listen_addresses=127.0.0.1',
+                                         '-p', '127.0.0.1:' + str(port) + ':' + str(port),
+                                         '-v', str(sockets) + ':/socket',
+                                         'postgres:16', '-c', 'listen_addresses=0.0.0.0',
                                          '-c', 'port=' + str(port), '-c', 'unix_socket_directories=/var/run/postgresql,/socket'],
                                         check=True, capture_output=True, text=True)
                 container = result.stdout.strip()
@@ -196,6 +231,11 @@ class RealIdentityTest(unittest.TestCase):
         patcher = mock.patch.object(tool, 'protected', side_effect=protected_fixture)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Repository sources are agent-owned; the root-installed file boundary
+        # is exercised separately, just like protected() above.
+        sql_patch = mock.patch.object(tool, 'check_sql_programs')
+        sql_patch.start()
+        self.addCleanup(sql_patch.stop)
         self.database = 'live_' + self.suffix
         with psycopg.connect(self.dsns[0], autocommit=True) as conn:
             conn.execute(sql.SQL('CREATE DATABASE {} TEMPLATE template0').format(sql.Identifier(self.database)))
@@ -208,6 +248,11 @@ class RealIdentityTest(unittest.TestCase):
                           'turn_resources', 'spend_pending', 'host_release_operations', 'host_release_fences',
                           'host_release_fence_receipts', 'decision_supersessions', 'schema_non_additive_migrations'):
                 conn.execute(sql.SQL('CREATE TABLE mesh.{} (id integer, updated_at timestamptz)').format(sql.Identifier(table)))
+            # The controller endpoint reads the real mailbox projection.
+            conn.execute("ALTER TABLE mesh.agent_mailbox ADD COLUMN kind text, "
+                         "ADD COLUMN sender text, ADD COLUMN recipient text, "
+                         "ADD COLUMN payload jsonb, ADD COLUMN host text, "
+                         "ADD COLUMN created_at timestamptz, ADD COLUMN delivered_at timestamptz")
             for view in ('mesh_approvals_status', 'mesh_keys'):
                 conn.execute(sql.SQL('CREATE VIEW mesh.{} AS SELECT id FROM mesh.mesh_approvals').format(sql.Identifier(view)))
             conn.execute("CREATE TABLE mesh.schema_migrations(version text, checksum text)")
@@ -225,6 +270,8 @@ class RealIdentityTest(unittest.TestCase):
     def cleanup(self):
         with psycopg.connect(self.dsns[0], autocommit=True) as conn:
             conn.execute(sql.SQL('DROP DATABASE {} WITH (FORCE)').format(sql.Identifier(self.database)))
+            conn.execute(sql.SQL('DROP ROLE IF EXISTS {}').format(
+                sql.Identifier(self.value['group_role'] + '_decision_reader')))
             for key in ('controller_role', 'backup_role', 'group_role'):
                 conn.execute(sql.SQL('DROP ROLE IF EXISTS {}').format(sql.Identifier(self.value[key])))
         with psycopg.connect(self.dsns[1], autocommit=True) as conn:
@@ -261,6 +308,26 @@ class RealIdentityTest(unittest.TestCase):
             logs = result.stdout + result.stderr
             for password in source['passwords'].values():
                 self.assertTrue(password.encode() not in logs, 'plaintext credential in server output')
+
+    def test_controller_endpoint_audit_rejects_tampering_and_other_definers(self):
+        self.enroll()
+        source = self.source_doc()
+        with psycopg.connect(source['database']['dsn'], autocommit=True) as conn:
+            self.assertEqual(conn.execute(
+                'SELECT count(*) FROM mesh.release_controller_decision(1)').fetchone()[0], 0)
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                conn.execute('SELECT * FROM mesh.agent_mailbox')
+        with psycopg.connect(self.source) as conn:
+            for statement in (
+                "CREATE FUNCTION mesh.unrelated() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+                "ALTER FUNCTION mesh.release_controller_decision(bigint) RESET ALL",
+            ):
+                conn.execute('SAVEPOINT endpoint_probe')
+                conn.execute(statement)
+                with self.assertRaises(tool.IdentityError):
+                    tool.audit_data(conn, self.value['controller_role'], 'mesh',
+                                    parent=self.value['group_role'])
+                conn.execute('ROLLBACK TO SAVEPOINT endpoint_probe')
 
     def test_future_relations_stay_readable_and_leave_revokes_defaults(self):
         self.enroll()

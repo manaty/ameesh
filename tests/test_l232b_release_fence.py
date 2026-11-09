@@ -18,6 +18,12 @@ SPEC.loader.exec_module(fence)
 
 
 class ReleaseFenceTest(PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.release_decision import install_decision_gate
+        install_decision_gate(cls)
+
     def setUp(self):
         super().setUp()
         self.db.execute('TRUNCATE host_release_operations CASCADE')
@@ -183,7 +189,7 @@ class ReleaseFenceTest(PgTestCase):
         self.assertEqual(storage.of(self.db).host_lifecycle.get('release-host')['mode'], 'draining')
 
     def test_pending_authority_blocks_all_effects(self):
-        with mock.patch.object(decisions, 'get', return_value=self.view):
+        with mock.patch.object(decisions, 'get_for_controller', return_value=self.view):
             with self.assertRaisesRegex(fence.FenceError, 'denied'):
                 self.perform()
         self.assertEqual(self.db.query('SELECT * FROM host_release_operations'), [])

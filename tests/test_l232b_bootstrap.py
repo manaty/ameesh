@@ -114,6 +114,12 @@ class BootstrapTest(unittest.TestCase):
 
 
 class SignedBootstrapTest(support.PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tests.release_decision import install_decision_gate
+        install_decision_gate(cls)
+
     def test_signed_leave_and_free_text_keep_old_enable_authorized(self):
         self.sign()
         for text in ('leave','non, ne remplace pas'):
@@ -211,13 +217,13 @@ class SignedBootstrapTest(support.PgTestCase):
     def test_unsigned_decline_tampered_bundle_and_later_deadline_have_no_authority(self):
         self.sign(); original=decisions.get(self.db,self.view['id'])
         changed=original['question'].replace('"uid":987','"uid":988')
-        with mock.patch.object(decisions,'get',return_value=dict(original,question=changed)):
+        with mock.patch.object(decisions,'get_for_controller',return_value=dict(original,question=changed)):
             self.assertFalse(self.valid())
         answer=dict(original['answer'],channel='cli')
-        with mock.patch.object(decisions,'get',return_value=dict(original,answer=answer)):
+        with mock.patch.object(decisions,'get_for_controller',return_value=dict(original,answer=answer)):
             self.assertFalse(self.valid())
         self.now+=601
-        with mock.patch.object(decisions,'get',return_value=dict(original,due_ts=self.now+9999)):
+        with mock.patch.object(decisions,'get_for_controller',return_value=dict(original,due_ts=self.now+9999)):
             self.assertFalse(self.valid())
 
     def test_real_bootstrap_signature_drives_account_and_runtime_scope_callbacks(self):
