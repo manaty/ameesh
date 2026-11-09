@@ -1594,6 +1594,17 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                  % (carrier, name, step, ctx.epoch, this.n, MAX_ATTEMPTS,
                     auto._tail(result.text, 10)))
         return "#%d : %s non concluante (refus de garde d'époque)" % (carrier, step)
+    if result.returncode not in (0, auto.PAUSED_RC, auto.IN_PROGRESS_RC):
+        reason = closed_reason(ctx, carrier)
+        if reason:
+            # #6538 : porteur clos par le pilote pendant la tentative (abandon,
+            # remplacement) ; son échec n'est ni une panne du composeur ni un
+            # rouge à reprendre : arrêt propre, sans courrier (refusé sur un
+            # lot clos) ni lot d'empreinte §16.
+            ctx.say("#%d %s : porteur clos (%s) pendant la %s, rc %d ignoré"
+                    % (carrier, name, reason, step, result.returncode))
+            return "#%d : porteur clos (%s) pendant la %s, arrêt propre" % (
+                carrier, reason, step)
     if this.publish and result.returncode == auto.PUBLISH_REFUSED:
         if this.n < MAX_ATTEMPTS:
             # tête testée non publiable (cible bougée, chaîne) : recomposer tout de suite
@@ -1682,6 +1693,21 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
             carrier, name)
     item = show(ctx, carrier)
     return publish(ctx, item)
+
+
+def closed_reason(ctx: Context, carrier: int) -> str:
+    """#6538 : la raison de clôture du porteur s'il est clos, sinon "".
+
+    Une lecture impossible laisse le porteur pour ouvert : l'échec suit
+    alors son chemin ordinaire.
+    """
+    try:
+        item = show(ctx, carrier)
+    except HoraireError:
+        return ""
+    if str(item.get("state") or "") != "closed":
+        return ""
+    return str(item.get("close_reason") or "clos")
 
 
 def contract_result_at(ctx: Context, item: dict, sha: str):
