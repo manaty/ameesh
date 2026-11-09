@@ -421,7 +421,11 @@ if 'stop' in args:
     if scenario.startswith('tour-long'):
         # #6528 : un tour en cours retient l'arrêt au-delà de la borne ; le
         # `timeout` du script coupe ce client, le job d'arrêt reste en vol.
+        # #6544 : un client allé au bout des 30 s le consigne ; la borne se
+        # prouve par ce journal, non par une durée murale (charge du banc).
         time.sleep(30)
+        with (state / 'sequence.log').open('a') as f:
+            f.write('stop-non-borne %s\n' % name)
         sys.exit(0)
     if scenario == 'stop-error' or (scenario == 'drain-puis-stop-error' and name == 'dev9') \
             or (scenario == 'stop-error-candidat' and name == 'mesh-design'):
@@ -923,17 +927,22 @@ class AgentHostTest(unittest.TestCase):
     def _arret_borne(self, scenario):
         """#6528 : bornes courtes ; le faux `sleep` rend la main tout de suite."""
         self.env.update(ARRET_BORNE='1', ARRET_FORCE_BORNE='2', ARRET_SONDE='1')
-        debut = time.monotonic()
-        p = self.run_vm(scenario=scenario)
-        return p, time.monotonic() - debut
+        return self.run_vm(scenario=scenario)
+
+    def assert_stops_bounded(self):
+        """#6544 : chaque `stop` a été coupé par le `timeout` du script avant
+        les 30 s du faux client (aucun « stop-non-borne » au journal)."""
+        seq = (self.state / 'sequence.log').read_text().splitlines()
+        self.assertTrue([l for l in seq if l.startswith('stop ')], seq)
+        self.assertEqual([l for l in seq if l.startswith('stop-non-borne ')], [])
 
     def test_long_turn_is_force_stopped_after_the_bound(self):
         """#6528 : un tour plus long que ARRET_BORNE ne retient plus la coupure
         35 min : second SIGTERM au principal (tour arrêté, consigne remise en
         attente), arrêt prouvé, démarrage — sans SIGKILL."""
-        p, duree = self._arret_borne('tour-long')
+        p = self._arret_borne('tour-long')
+        self.assert_stops_bounded()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertLess(duree, 25)  # le faux `stop` bloquerait 30 s par unité
         log = self.units()
         for name in ('dev8', 'dev9'):
             unite = 'ameesh-runner-agent@%s.service' % name
@@ -947,7 +956,7 @@ class AgentHostTest(unittest.TestCase):
         """#6528 : SIGKILL laisse l'unité failed ; sans processus restant,
         c'est un arrêt prouvé (échec effacé avant le démarrage), pas un échec
         d'hôte."""
-        p, _ = self._arret_borne('tour-long-tenace')
+        p = self._arret_borne('tour-long-tenace')
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         log = self.units().splitlines()
         unite = 'ameesh-runner-agent@dev9.service'
@@ -959,16 +968,16 @@ class AgentHostTest(unittest.TestCase):
 
     def test_sigkill_with_remaining_process_is_not_proven(self):
         """#6528 : un processus resté dans le cgroup n'est jamais un point sûr."""
-        p, _ = self._arret_borne('tour-long-reste')
+        p = self._arret_borne('tour-long-reste')
         self.assertNotEqual(p.returncode, 0, p.stdout)
         self.assertEqual(self.starts(), [])
         self.assertIn('processus restant dans le cgroup', p.stderr)
 
     def test_unit_that_never_stops_fails_within_the_bound(self):
         """#6528 : unité figée même après SIGKILL : échec, durée bornée."""
-        p, duree = self._arret_borne('tour-long-fige')
+        p = self._arret_borne('tour-long-fige')
         self.assertNotEqual(p.returncode, 0, p.stdout)
-        self.assertLess(duree, 25)
+        self.assert_stops_bounded()
         self.assertEqual(self.starts(), [])
         self.assertIn('encore active après SIGKILL', p.stderr)
 
