@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# #6002 — bloc B2 v2 : réinstalle l'adaptateur VM de bureau-goal à 242ced700d6e (= main 14017a2a pour
+# #6002 — bloc B2 v3 : réinstalle l'adaptateur VM de bureau-goal à 242ced700d6e (= main 14017a2a pour
 # les fichiers de l'adaptateur), pose scaleway.json depuis le profil scw existant et les unités.
 # N'ACTIVE RIEN : enrollment.json reste enabled:false, le timer reste désactivé.
-# v2 (avis cx1 #205801) : B1 garde d'états lue avant toute écriture et répétée avant la bascule ;
-# B2 sauvegarde des unités et des liens dans un reçu durable, retour qui restaure ; N : scaleway.json
-# existant vérifié, profil scw explicite (« manaty », seul profil) ; écart de default_project_id consigné.
+# v2 (cx1 #205801) : garde d'états lue avant toute écriture et répétée ; reçu durable et retour qui
+#   restaure ; secret existant et profil explicites.
+# v3 (cx1 #205810) : profil scw et secret validés SANS ÉCRITURE avant tout changement ; création
+#   ensuite seulement si le profil n'a pas changé ; cibles des liens lues avec contrôle.
 # À lancer par l'owner, en root, sur bureau-goal :  sudo bash reinstall-242ced70.sh
 set -euo pipefail
 SHA=242ced700d6ec1a63fc9d72643bc9faad175f72f
@@ -15,92 +16,16 @@ ETC=/etc/ameesh-vm-adapter
 UNITDIR=/etc/systemd/system
 OP=agent
 PROFILE=manaty
+SCW=/home/$OP/.config/scw/config.yaml
 RECU=/root/ameesh-operator-6002-B2-$(date -u +%Y%m%dT%H%M%SZ)
 stop() { echo "STOP : $*" >&2; exit 1; }
 
-# B1 : états lus avec rc contrôlé ; échec de lecture ou état transitoire = STOP.
-garde_etats() {
-  local t s jobs
-  t=$(systemctl show ameesh-vm-adapter.timer -p LoadState -p UnitFileState -p ActiveState) || stop "lecture timer"
-  s=$(systemctl show ameesh-vm-adapter.service -p LoadState -p ActiveState -p SubState) || stop "lecture service"
-  jobs=$(systemctl list-jobs --no-legend) || stop "lecture des jobs"
-  case "$t" in *ActiveState=inactive*) ;; *) stop "timer non inactive : $t" ;; esac
-  case "$t" in *UnitFileState=disabled*|*LoadState=not-found*) ;; *) stop "timer non disabled : $t" ;; esac
-  case "$s" in *ActiveState=inactive*) ;; *) stop "service non inactive : $s" ;; esac
-  if printf '%s\n' "$jobs" | grep -q 'ameesh-vm-adapter'; then stop "job ameesh-vm-adapter en file"; fi
-  pgrep -f 'ameesh\.vm_adapter worker' >/dev/null && stop "worker vm_adapter vivant"
-  echo "garde états OK ($1)"
-}
-
-[ "$(id -u)" = 0 ] || stop "root requis"
-[ "$(hostname)" = bureau-goal ] || stop "bureau-goal seulement"
-garde_etats "avant toute écriture"
-python3 -I -c 'import json,sys; assert json.load(open(sys.argv[1]))["enabled"] is False' $ETC/enrollment.json \
-  || stop "enrollment.json n'est pas enabled:false"
-[ ! -e $OPT/src-$SHORT ] && [ ! -e $OPT/venv-$SHORT ] || stop "src-$SHORT ou venv-$SHORT déjà présents : réconcilier"
-[ ! -e $RECU ] || stop "reçu $RECU déjà présent"
-
-# B2 : reçu durable AVANT le premier changement : liens, commande, unités (ou leur absence).
-install -d -m 0700 -o root -g root $RECU
-printf 'src=%s\nvenv=%s\n' "$(readlink $OPT/src)" "$(readlink $OPT/venv)" > $RECU/liens-avant
-cp -p $OPT/commandes/vm-commande.py $RECU/vm-commande.py.avant
-for u in ameesh-vm-adapter.service ameesh-vm-adapter.timer; do
-  if [ -e $UNITDIR/$u ]; then cp -p $UNITDIR/$u $RECU/$u.avant; else : > $RECU/$u.absente; fi
-done
-[ -e $ETC/scaleway.json ] && : > $RECU/scaleway.json.preexistant || : > $RECU/scaleway.json.absent
-cat > $RECU/retour.sh <<EOF
-# Retour B2 : restaure l'état d'avant, rien d'autre.
-set -eu
-. $RECU/liens-avant
-ln -sfn "\$src" $OPT/src
-ln -sfn "\$venv" $OPT/venv
-install -m 0644 -o root -g root $RECU/vm-commande.py.avant $OPT/commandes/vm-commande.py
-for u in ameesh-vm-adapter.service ameesh-vm-adapter.timer; do
-  if [ -e $RECU/\$u.avant ]; then install -m 0644 -o root -g root $RECU/\$u.avant $UNITDIR/\$u; fi
-  if [ -e $RECU/\$u.absente ]; then rm -f $UNITDIR/\$u; fi
-done
-[ -e $RECU/scaleway.json.absent ] && rm -f $ETC/scaleway.json
-systemctl daemon-reload
-echo "retour B2 fait (src-$SHORT et venv-$SHORT laissés, inertes)"
-EOF
-chmod 0600 $RECU/retour.sh
-echo "reçu et retour : $RECU (retour : sudo bash $RECU/retour.sh)"
-trap 'echo "ÉCHEC : état d avant restaurable par sudo bash '"$RECU"'/retour.sh" >&2' ERR
-
-# 1. Sources : archive git exacte, blobs de l'adaptateur vérifiés contre l'arbre du commit.
-[ "$(runuser -u $OP -- git -C $REPO rev-parse "$SHA^{commit}")" = $SHA ] || stop "commit $SHA absent du clone"
-install -d -m 0755 -o root -g root $OPT/src-$SHORT
-runuser -u $OP -- git -C $REPO archive --format=tar $SHA | tar -x -C $OPT/src-$SHORT --no-same-owner
-chown -R root:root $OPT/src-$SHORT; chmod -R go-w $OPT/src-$SHORT
-for f in deploy/vm-adapter/commandes/vm-commande.py deploy/vm-adapter/ameesh-vm-adapter.service \
-         deploy/vm-adapter/ameesh-vm-adapter.timer src/ameesh/vm_adapter.py; do
-  want=$(runuser -u $OP -- git -C $REPO rev-parse "$SHA:$f")
-  got=$(git hash-object "$OPT/src-$SHORT/$f")
-  [ "$want" = "$got" ] || stop "blob $f : $got ≠ $want"
-done
-[ -z "$(find $OPT/src-$SHORT -perm /022 -print -quit)" ] || stop "fichier g+w/o+w dans les sources"
-
-# 2. venv dédié, source installée, import vérifié sous le compte opérateur.
-python3.12 -m venv $OPT/venv-$SHORT
-$OPT/venv-$SHORT/bin/pip install --quiet --no-cache-dir $OPT/src-$SHORT
-chown -R root:root $OPT/venv-$SHORT; chmod -R go-w $OPT/venv-$SHORT
-runuser -u $OP -- $OPT/venv-$SHORT/bin/python -I -c 'import ameesh.vm_adapter, ameesh.host_release; print("import ok")'
-
-# 3. Garde répétée, puis commande au blob et bascule des liens.
-garde_etats "avant la bascule"
-install -m 0644 -o root -g root $OPT/src-$SHORT/deploy/vm-adapter/commandes/vm-commande.py $OPT/commandes/.vm-commande.py.$SHORT
-[ "$(git hash-object $OPT/commandes/.vm-commande.py.$SHORT)" = "$(runuser -u $OP -- git -C $REPO rev-parse "$SHA:deploy/vm-adapter/commandes/vm-commande.py")" ] || stop "vm-commande.py copié ≠ blob"
-mv -f $OPT/commandes/.vm-commande.py.$SHORT $OPT/commandes/vm-commande.py
-ln -sfn src-$SHORT $OPT/src
-ln -sfn venv-$SHORT $OPT/venv
-echo "liens : src → $(readlink $OPT/src) ; venv → $(readlink $OPT/venv)"
-
-# 4. scaleway.json : profil scw « manaty » explicite et unique, sans affichage ; la clé couvre l'organisation,
-#    le projet est passé explicitement par l'inscription (écart de default_project_id seulement consigné).
-echo "profil scw source : $(stat -c '%y %U:%G %a' /home/$OP/.config/scw/config.yaml) (date de la copie = référence de péremption si la clé tourne)"
-python3 -I - /home/$OP/.config/scw/config.yaml $ETC/scaleway.json $ETC/enrollment.json "$PROFILE" <<'PY'
+# Lecture du profil scw et du scaleway.json existant. Mode « valider » : aucune écriture.
+# Mode « creer » : écrit scaleway.json en O_EXCL, root 0600. La valeur n'est jamais affichée.
+scw() {
+  python3 -I - "$1" "$SCW" "$ETC/scaleway.json" "$ETC/enrollment.json" "$PROFILE" <<'PYEOF'
 import json, os, re, stat, sys
-src, dst, enr, profile = sys.argv[1:5]
+mode, src, dst, enr, profile = sys.argv[1:6]
 UUID = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 projects = {t['project_id'] for t in json.load(open(enr))['targets'].values()}
 if os.path.lexists(dst):
@@ -115,8 +40,7 @@ lines = open(src).read().splitlines()
 assert not any(re.match(r'^secret_key:', l) for l in lines), 'secret_key au niveau racine : profil ambigu'
 names = [m.group(1) for l in lines if (m := re.match(r'^  ([A-Za-z0-9_-]+):\s*$', l))]
 assert names == [profile], 'profils scw %r : exactement un profil %r attendu' % (names, profile)
-block = {}
-inside = False
+block, inside = {}, False
 for l in lines:
     if re.match(r'^  ' + re.escape(profile) + r':\s*$', l):
         inside = True
@@ -128,16 +52,112 @@ for l in lines:
         block[m.group(1)] = m.group(2)
 assert re.fullmatch(UUID, block.get('secret_key', '')), 'secret_key absente ou malformée dans le profil'
 assert re.fullmatch(UUID, block.get('default_organization_id', '')), 'organisation du profil absente'
-same_project = block.get('default_project_id') in projects
+same = block.get('default_project_id') in projects
+if mode == 'valider':
+    print('profil %s validé (valeur non affichée) ; default_project_id = projet inscrit : %s' % (profile, same))
+    sys.exit(0)
+assert mode == 'creer'
 fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, 'w') as f:
     json.dump({'secret_key': block['secret_key']}, f)
     f.write('\n')
 os.chown(dst, 0, 0)
-print('scaleway.json écrit depuis le profil %s (valeur non affichée) ; default_project_id du profil = projet inscrit : %s' % (profile, same_project))
-PY
+print('scaleway.json écrit depuis le profil %s (valeur non affichée)' % profile)
+PYEOF
+}
 
-# 5. Unités : celles du SHA, User=agent substitué, vérifiées, posées. Timer NON activé.
+# Garde d'états : lecture avec rc contrôlé ; échec de lecture ou état transitoire = STOP.
+garde_etats() {
+  local t s jobs
+  t=$(systemctl show ameesh-vm-adapter.timer -p LoadState -p UnitFileState -p ActiveState) || stop "lecture timer"
+  s=$(systemctl show ameesh-vm-adapter.service -p LoadState -p ActiveState -p SubState) || stop "lecture service"
+  jobs=$(systemctl list-jobs --no-legend) || stop "lecture des jobs"
+  case "$t" in *ActiveState=inactive*) ;; *) stop "timer non inactive : $t" ;; esac
+  case "$t" in *UnitFileState=disabled*|*LoadState=not-found*) ;; *) stop "timer non disabled : $t" ;; esac
+  case "$s" in *ActiveState=inactive*) ;; *) stop "service non inactive : $s" ;; esac
+  if printf '%s\n' "$jobs" | grep -q 'ameesh-vm-adapter'; then stop "job ameesh-vm-adapter en file"; fi
+  if pgrep -f 'ameesh\.vm_adapter worker' >/dev/null; then stop "worker vm_adapter vivant"; fi
+  echo "garde états OK ($1)"
+}
+
+# 0. Gardes, toutes en lecture, avant la moindre écriture.
+[ "$(id -u)" = 0 ] || stop "root requis"
+[ "$(hostname)" = bureau-goal ] || stop "bureau-goal seulement"
+garde_etats "avant toute écriture"
+python3 -I -c 'import json,sys; assert json.load(open(sys.argv[1]))["enabled"] is False' $ETC/enrollment.json \
+  || stop "enrollment.json n'est pas enabled:false"
+[ ! -e $OPT/src-$SHORT ] && [ ! -e $OPT/venv-$SHORT ] || stop "src-$SHORT ou venv-$SHORT déjà présents : réconcilier"
+[ ! -e $RECU ] || stop "reçu $RECU déjà présent"
+OLD_SRC=$(readlink $OPT/src) || stop "$OPT/src n'est pas un lien"
+OLD_VENV=$(readlink $OPT/venv) || stop "$OPT/venv n'est pas un lien"
+[ -n "$OLD_SRC" ] && [ -n "$OLD_VENV" ] || stop "cible de lien vide"
+[ -f $OPT/commandes/vm-commande.py ] || stop "commande actuelle absente"
+SCW_SHA=$(sha256sum < $SCW | cut -c1-64) || stop "lecture du profil scw"
+echo "profil scw source : $(stat -c '%y %U:%G %a' $SCW) (date de la copie = référence de péremption si la clé tourne)"
+scw valider || stop "profil scw ou scaleway.json existant refusé"
+
+# 1. Reçu durable AVANT le premier changement : liens, commande, unités (ou leur absence).
+install -d -m 0700 -o root -g root $RECU
+printf 'src=%s\nvenv=%s\n' "$OLD_SRC" "$OLD_VENV" > $RECU/liens-avant
+cp -p $OPT/commandes/vm-commande.py $RECU/vm-commande.py.avant
+for u in ameesh-vm-adapter.service ameesh-vm-adapter.timer; do
+  if [ -e $UNITDIR/$u ]; then cp -p $UNITDIR/$u $RECU/$u.avant; else : > $RECU/$u.absente; fi
+done
+if [ -e $ETC/scaleway.json ]; then : > $RECU/scaleway.json.preexistant; else : > $RECU/scaleway.json.absent; fi
+cat > $RECU/retour.sh <<EOF
+# Retour B2 : restaure l'état d'avant, rien d'autre.
+set -eu
+. $RECU/liens-avant
+ln -sfn "\$src" $OPT/src
+ln -sfn "\$venv" $OPT/venv
+install -m 0644 -o root -g root $RECU/vm-commande.py.avant $OPT/commandes/vm-commande.py
+for u in ameesh-vm-adapter.service ameesh-vm-adapter.timer; do
+  if [ -e $RECU/\$u.avant ]; then install -m 0644 -o root -g root $RECU/\$u.avant $UNITDIR/\$u; fi
+  if [ -e $RECU/\$u.absente ]; then rm -f $UNITDIR/\$u; fi
+done
+if [ -e $RECU/scaleway.json.absent ]; then rm -f $ETC/scaleway.json; fi
+systemctl daemon-reload
+echo "retour B2 fait (src-$SHORT et venv-$SHORT laissés, inertes)"
+EOF
+chmod 0600 $RECU/retour.sh
+echo "reçu et retour : $RECU (retour : sudo bash $RECU/retour.sh)"
+trap 'echo "ÉCHEC : état d avant restaurable par sudo bash '"$RECU"'/retour.sh" >&2' ERR
+
+# 2. Sources : archive git exacte, blobs de l'adaptateur vérifiés contre l'arbre du commit.
+[ "$(runuser -u $OP -- git -C $REPO rev-parse "$SHA^{commit}")" = $SHA ] || stop "commit $SHA absent du clone"
+install -d -m 0755 -o root -g root $OPT/src-$SHORT
+runuser -u $OP -- git -C $REPO archive --format=tar $SHA | tar -x -C $OPT/src-$SHORT --no-same-owner
+chown -R root:root $OPT/src-$SHORT
+chmod -R go-w $OPT/src-$SHORT
+for f in deploy/vm-adapter/commandes/vm-commande.py deploy/vm-adapter/ameesh-vm-adapter.service \
+         deploy/vm-adapter/ameesh-vm-adapter.timer src/ameesh/vm_adapter.py; do
+  want=$(runuser -u $OP -- git -C $REPO rev-parse "$SHA:$f")
+  got=$(git hash-object "$OPT/src-$SHORT/$f")
+  [ "$want" = "$got" ] || stop "blob $f : $got ≠ $want"
+done
+[ -z "$(find $OPT/src-$SHORT -perm /022 -print -quit)" ] || stop "fichier g+w/o+w dans les sources"
+
+# 3. venv dédié, source installée, import vérifié sous le compte opérateur.
+python3.12 -m venv $OPT/venv-$SHORT
+$OPT/venv-$SHORT/bin/pip install --quiet --no-cache-dir $OPT/src-$SHORT
+chown -R root:root $OPT/venv-$SHORT
+chmod -R go-w $OPT/venv-$SHORT
+runuser -u $OP -- $OPT/venv-$SHORT/bin/python -I -c 'import ameesh.vm_adapter, ameesh.host_release; print("import ok")'
+
+# 4. Garde répétée, puis commande au blob et bascule des liens.
+garde_etats "avant la bascule"
+install -m 0644 -o root -g root $OPT/src-$SHORT/deploy/vm-adapter/commandes/vm-commande.py $OPT/commandes/.vm-commande.py.$SHORT
+[ "$(git hash-object $OPT/commandes/.vm-commande.py.$SHORT)" = "$(runuser -u $OP -- git -C $REPO rev-parse "$SHA:deploy/vm-adapter/commandes/vm-commande.py")" ] || stop "vm-commande.py copié ≠ blob"
+mv -f $OPT/commandes/.vm-commande.py.$SHORT $OPT/commandes/vm-commande.py
+ln -sfn src-$SHORT $OPT/src
+ln -sfn venv-$SHORT $OPT/venv
+echo "liens : src → $(readlink $OPT/src) ; venv → $(readlink $OPT/venv)"
+
+# 5. scaleway.json : création depuis la source validée à l'étape 0, si elle n'a pas changé.
+[ "$(sha256sum < $SCW | cut -c1-64)" = "$SCW_SHA" ] || stop "profil scw modifié depuis la validation"
+scw creer
+
+# 6. Unités : celles du SHA, User=agent substitué, vérifiées, posées. Timer NON activé.
 W=$(mktemp -d)
 sed 's/^User=REPLACE_WITH_EXISTING_OPERATOR_ACCOUNT$/User=agent/' $OPT/src-$SHORT/deploy/vm-adapter/ameesh-vm-adapter.service > $W/ameesh-vm-adapter.service
 cp $OPT/src-$SHORT/deploy/vm-adapter/ameesh-vm-adapter.timer $W/
