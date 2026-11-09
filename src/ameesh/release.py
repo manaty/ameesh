@@ -308,6 +308,33 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
     return 0
 
 
+def _holder_identity(holder: dict) -> list:
+    """#6584: what names a staging holder, never its renewed lease expiry."""
+    return [str(holder.get("kind") or ""),
+            bool(holder.get("active")),
+            str(holder.get("host") or ""),
+            str(holder.get("execution") or ""),
+            str(holder.get("sha") or ""),
+            str(holder.get("state") or ""),
+            str(holder.get("blocked_reason") or "")]
+
+
+def _alarm_key(text: str, holders: list[dict], tag: dict | None) -> str:
+    """The identity of a release alarm, not its lease expiry (#6584).
+
+    `staging_holders_text` names the bail's `expires_at`, renewed at every
+    tick: comparing the raw text made the same alarm repeat every minute. The
+    key keeps the cutoff's tag, the holders' identity (execution, SHA, state)
+    and the cause, with the renewed expiry neutralized.
+    """
+    stable = re.sub(r"bail jusqu'à [^,;)]*", "bail jusqu'à …", str(text or ""))
+    return json.dumps({"text": stable,
+                       "tag": str((tag or {}).get("tag") or ""),
+                       "holders": sorted(_holder_identity(holder)
+                                         for holder in holders)},
+                      ensure_ascii=False, sort_keys=True)
+
+
 def _report_error(cfg, db, project, exc, now: float) -> None:
     """Mail an error once per cutoff, transient or definitive (#6014).
 
@@ -318,6 +345,8 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
 
     #6520: before alarming, read the cutoff's tag and the staging holder. A
     tag whose own staging holds the lock is information, never "aucun tag".
+    #6584: the de-duplication key is the cutoff and the holders' identity,
+    never the lease expiry renewed at every tick.
     """
     from . import release_cutoff
     if getattr(exc, "already_reported", False):
@@ -353,15 +382,19 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
             same = [holder for holder in holders
                     if tag and holder.get("active")
                     and holder.get("sha") == tag["commit"]]
+            # #6584: the lease's expires_at is renewed at every tick; it is
+            # not a new cause. Compare the holder identity, never the expiry.
+            alarm_key = _alarm_key(text, holders, tag)
             if busy and "another release holds" in text:
                 # The running tick on this host owns the cutoff and reports
                 # it; a lock contention is not a release failure.
                 return
             if tag and busy and same:
-                if (slot.get("staging_info") == text
+                if (slot.get("staging_info_key") == alarm_key
                         and slot.get("staging_info_cutoff") == cutoff_at):
                     return
                 slot["staging_info_cutoff"] = cutoff_at
+                slot["staging_info_key"] = alarm_key
                 slot["staging_info"] = text
                 slot["staging_info_at"] = now
                 release_cutoff.save_state(cfg, state)
@@ -389,10 +422,11 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
                     release_cutoff.send_report(cfg, db, project, body, report,
                                                urgent=False)
                 return
-            if (slot.get("last_error") == text
+            if (slot.get("last_error_key") == alarm_key
                     and slot.get("last_error_cutoff") == cutoff_at):
                 return
             slot["last_error_cutoff"] = cutoff_at
+            slot["last_error_key"] = alarm_key
             slot["last_error"] = text
             slot["last_error_at"] = now
             release_cutoff.save_state(cfg, state)
