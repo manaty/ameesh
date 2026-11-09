@@ -88,4 +88,13 @@ ameesh = ["migrations/*.sql", "progress_page.html", "harness_descriptors/*.json"
 
 # #5162: preserve the private identity tool and its audited SQL sibling.
 "share/ameesh/postgres" = ["deploy/postgres/enroler-identites.py"]
-"share/ameesh/sql" = ["deploy/sql/role-release-controller.sql"]
+"share/ameesh/sql" = [
+    "deploy/sql/role-release-controller.sql",
+    "deploy/sql/_release-decision.sql",
+    "deploy/sql/_revoke-release-mailbox.sql",
+    "deploy/sql/_contrat-release-decision.sql",
+    "deploy/sql/_contrat-mailbox-readers.sql",
+    "deploy/sql/release-decision-additive.sql",
+    "deploy/sql/release-decision-cutover.sql",
+]
+"share/ameesh/mise-a-jour/procedures" = ["deploy/mise-a-jour/procedures/mailbox-controleur.md"]

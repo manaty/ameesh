@@ -37,6 +37,40 @@ requires_psycopg = unittest.skipUnless(psycopg is not None, 'psycopg absent (par
 
 @requires_psycopg
 class PrivateInputTest(unittest.TestCase):
+    def test_sql_companions_are_packaged_and_root_checked(self):
+        import ast
+        from types import SimpleNamespace
+        # These data-files values are literal string lists; Python 3.9/3.10
+        # can inspect this subset without a TOML dependency.
+        config = (REPO / 'pyproject.toml').read_text().split('[tool.setuptools.data-files]', 1)[1]
+        def files(destination):
+            match = re.search(r'"'+re.escape(destination)+r'"\s*=\s*(\[[^]]*\])', config)
+            self.assertIsNotNone(match)
+            return ast.literal_eval(match.group(1))
+        packaged = files('share/ameesh/sql')
+        self.assertIn('deploy/mise-a-jour/procedures/mailbox-controleur.md',
+                      files('share/ameesh/mise-a-jour/procedures'))
+        self.assertTrue(all('deploy/sql/'+name in packaged for name in tool.SQL_COMPANIONS))
+        checked = []
+        def safe(path):
+            checked.append(path)
+            return SimpleNamespace(st_uid=0, st_mode=0o100644)
+        with mock.patch.object(Path, 'lstat', safe):
+            tool.check_sql_programs()
+        for name in tool.SQL_COMPANIONS:
+            self.assertIn(REPO / 'deploy/sql' / name, checked)
+            def unsafe(path):
+                return SimpleNamespace(st_uid=0, st_mode=0o100664 if path.name == name else 0o100644)
+            with mock.patch.object(Path, 'lstat', unsafe):
+                with self.assertRaisesRegex(tool.IdentityError, 'root-owned'):
+                    tool.check_sql_programs()
+        # A missing inclusion is refused before invoking psql.
+        original = Path.is_file
+        with mock.patch.object(Path, 'lstat', safe), mock.patch.object(
+                Path, 'is_file', lambda path: False if path.name == '_release-decision.sql' else original(path)):
+            with self.assertRaisesRegex(tool.IdentityError, 'missing'):
+                tool.check_sql_programs()
+
     def test_rejects_service_options_nested_uri_and_multiple_endpoints(self):
         for dsn in ("service=ambient", "host=example port=5432 dbname=db user=owner options='-c role=admin'",
                     "host=example port=5432 dbname='postgresql://other@elsewhere/db' user=owner",
@@ -196,6 +230,11 @@ class RealIdentityTest(unittest.TestCase):
         patcher = mock.patch.object(tool, 'protected', side_effect=protected_fixture)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Repository sources are agent-owned; the root-installed file boundary
+        # is exercised separately, just like protected() above.
+        sql_patch = mock.patch.object(tool, 'check_sql_programs')
+        sql_patch.start()
+        self.addCleanup(sql_patch.stop)
         self.database = 'live_' + self.suffix
         with psycopg.connect(self.dsns[0], autocommit=True) as conn:
             conn.execute(sql.SQL('CREATE DATABASE {} TEMPLATE template0').format(sql.Identifier(self.database)))
