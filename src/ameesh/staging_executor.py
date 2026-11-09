@@ -681,13 +681,6 @@ def tick(db, cfg, options) -> dict:
         elected = role_run.live(db, options["role"])
         if not elected["held"] or elected.get("holder") != host:
             return {"state": "standby", "reason": "role changed"}
-        # #6520 second review: tie the request to this execution before the
-        # long preparation below, so a reader can tell a pending handoff this
-        # host is working on from a foreign lease, and a blocked request
-        # (which keeps state pending) never proves live staging.
-        if request.get("execution") != lease.owner:
-            request = dict(request, execution=lease.owner)
-            _record(db, options["key"], request, lease=lease)
         from .platform.child_environment import execution_transport
         timeout = options.get("timeout_s", staging_watch.STAGING_FALLBACK_S)
         env = execution_transport(dict(os.environ, BASCULE_ENV=options["bascule_env"],
@@ -713,6 +706,14 @@ def tick(db, cfg, options) -> dict:
         # #5727: so does the commit of the canon this host reads, compared
         # with the agents' canon by the alerts pass.
         request = dict(request, fingerprints=prints, canon_ref=canon_commit(cfg))
+        # #6520 second review: tie the request to this execution before the
+        # long preparation below (host operations, fetch, worktree), so a
+        # reader can tell a pending handoff this host is working on from a
+        # foreign lease, and a blocked request (which keeps state pending)
+        # never proves live staging.
+        if request.get("execution") != lease.owner:
+            request = dict(request, execution=lease.owner)
+            _record(db, options["key"], request, lease=lease)
         # #5450: a previous stop that could not prove its workstation units
         # stopped left their pid in the request. Settle them before any other
         # host operation; the kept worktree stays until they are proved gone.
