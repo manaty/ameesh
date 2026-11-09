@@ -1757,7 +1757,8 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def pending_recipients_sorted(self) -> list[str]:
         """Destinataires qui ont du courrier non remis, par ordre de nom
-        (`export-v0`), hors boîtes d'agents en mode `externe` (#6424)."""
+        (`export-v0` : retour arrière, toutes les boîtes — ce n'est pas un
+        décompte, #6424)."""
 
     @abc.abstractmethod
     def unread_total(self) -> int:

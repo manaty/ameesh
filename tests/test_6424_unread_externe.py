@@ -34,7 +34,11 @@ class UnreadExternalTest(PgTestCase):
         box = storage.of(self.db).mailbox
         self.assertEqual(box.unread_total(), 2)
         self.assertEqual(set(box.pending_recipients()), {"human:alice", "runner"})
-        self.assertEqual(box.pending_recipients_sorted(), ["human:alice", "runner"])
+        # `pending_recipients_sorted` n'est pas un décompte : c'est la liste
+        # du retour arrière v0 (`export-v0`), qui doit rendre TOUTES les
+        # boîtes, y compris externes, avant de les marquer remises.
+        self.assertEqual(box.pending_recipients_sorted(),
+                         ["bureau", "human:alice", "runner"])
 
     def test_overview_board_and_progress_skip_external_boxes(self):
         self.assertEqual(self._overview_unread("bureau"), 0)

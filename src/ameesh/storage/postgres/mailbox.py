@@ -521,10 +521,14 @@ class Mailbox(interface.Mailbox):
         )]
 
     def pending_recipients_sorted(self) -> list[str]:
+        # #6424 : PAS un décompte. Seul lecteur : `ameesh export-v0` sans
+        # `--agents`, le retour arrière du courrier vers la v0, qui réécrit
+        # chaque boîte puis la marque remise (`mesh_cli.cmd_export_v0`).
+        # Exclure les boîtes `externe` laisserait leur courrier en base au
+        # lieu de le rendre à la v0 : toutes les boîtes sont listées.
         return [row["recipient"] for row in self.db.query(
-            "SELECT DISTINCT m.recipient FROM agent_mailbox m"
-            " WHERE m.delivered_at IS NULL AND " + NOT_EXTERNAL_SQL.format(t="m")
-            + " ORDER BY m.recipient")]
+            "SELECT DISTINCT recipient FROM agent_mailbox "
+            "WHERE delivered_at IS NULL ORDER BY recipient")]
 
     def unread_total(self) -> int:
         return self.db.query(
