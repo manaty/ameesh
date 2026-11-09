@@ -928,3 +928,135 @@ def alerts(db, now: float, *, sources, orchestrators=(),
                           auth_refused=auth_refused(error),
                           orchestrators=list(orchestrators)))
     return out
+
+
+# A3 / #6473. These receipts are proposals only. They never enter open_lot,
+# priority, merge, basket or decision writers.
+def cause_identity(triage) -> str:
+    """Exact U3 discriminators, independent of occurrence and deployed SHA."""
+    import hashlib
+    from . import repair_triage
+    if not isinstance(triage, repair_triage.Triage):
+        raise TypeError('a qualified triage is required')
+    key = repair_triage._cause(triage)
+    if key is None:
+        return ''
+    return hashlib.sha256(json.dumps(key, ensure_ascii=True,
+                                    separators=(',', ':')).encode()).hexdigest()
+
+
+def observe_cause(db, signal, triage, *, lot=None, legacy_key=None, active=None, journal=(),
+                  hosts=None, now=None, is_ancestor=None) -> dict:
+    """Record a bounded, replay-safe A3 proposal on already received input.
+
+    A producer may associate an existing lot; its current project and state
+    are checked under the same row lock as a concurrent close. Historical
+    keys remain aliases, never authority to assign a cause. Only exact U3
+    cause matches suggest lots. A closed lot gives a recurrence *candidate*;
+    A4 distinguishes currently active, old and mixed versions. This does not
+    prove a regression of a fix, nor open a recurrence lot.
+    """
+    import hashlib
+    from . import repair_correlation as correlation, repair_signals
+    if not isinstance(signal, repair_signals.Signal):
+        raise TypeError('a validated signal is required')
+    cause = cause_identity(triage)
+    if (triage.signal_id, triage.project, triage.environment, triage.source,
+            triage.evidence_ref) != (signal.id, signal.project,
+                                    signal.environment, signal.source,
+                                    signal.evidence_ref):
+        raise ValueError('qualification does not belong to the signal')
+    if lot is not None and (type(lot) is not int or lot <= 0):
+        raise ValueError('a positive existing lot is required')
+    alias = signal.native_id
+    if legacy_key is not None:
+        alias = source_of(signal.project, legacy_key)
+        _check_no_secret(alias, 'historical fingerprint alias')
+    scope = (signal.project, signal.environment, signal.source)
+    if active is None and signal.observed_version and signal.project == 'ameesh':
+        active = correlation.active_view(db)
+        journal = correlation.journal_view()
+        hosts = sorted(active)
+    version = correlation.correlate(
+        signal.record(), active or {}, journal=journal, hosts=hosts, now=now,
+        is_ancestor=is_ancestor)
+    # Per-scope serialization also covers different aliases of the same cause.
+    # The unique receipt is the backstop for exact replay from two writers.
+    with db.transaction() as tx:
+        tx.query('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
+                 ('repair-cause:' + json.dumps(scope),))
+        previous = tx.query(
+            'SELECT DISTINCT lot FROM fingerprint_cause_observations'
+            ' WHERE project=%s AND environment=%s AND source=%s'
+            ' AND cause_id=%s AND cause_id<>\'\' AND lot IS NOT NULL'
+            ' ORDER BY lot LIMIT 101', (*scope, cause))
+        historical = (storage.of(tx).work.by_source(alias)
+                      if legacy_key is not None else [])
+        ids = {int(row['lot']) for row in previous}
+        ids.update(int(row['id']) for row in historical)
+        if lot is not None:
+            ids.add(lot)
+        # Read-only row locks stabilize state/project against close/reassign.
+        # No migration-repository locks are needed: we never update work rows.
+        lots = tx.query(
+            'SELECT id,app,state FROM work_items WHERE id=ANY(%s::bigint[])'
+            ' ORDER BY id FOR SHARE', (sorted(ids),)) if ids else []
+        valid = {int(row['id']) for row in lots if row.get('app') == signal.project}
+        invalid_lot = lot is not None and lot not in valid
+        if invalid_lot:
+            lot = None
+        lots = [row for row in lots if int(row['id']) in valid]
+        alias_seen = bool(tx.query(
+            'SELECT 1 FROM fingerprint_cause_observations'
+            ' WHERE project=%s AND environment=%s AND source=%s AND alias=%s'
+            ' LIMIT 1', (*scope, alias)))
+        candidates = [row for row in lots if int(row['id']) in
+                      {int(item['lot']) for item in previous}]
+        relation = 'unknown'
+        if cause and len(previous) <= 100:
+            relation = 'new_cause'
+            if candidates:
+                closed = all(row['state'] in (*work.MERGED_STATES, 'closed')
+                             for row in candidates)
+                if not closed:
+                    relation = 'existing_cause'
+                elif version['verdict'] == correlation.VERSION_ACTIVE:
+                    relation = 'recurrence_candidate_active'
+                elif version['verdict'] == correlation.VERSION_ANTERIEURE:
+                    relation = 'old_version'
+                else:
+                    relation = 'same_cause_version_unknown'
+        alias_candidates = sorted(int(row['id']) for row in lots
+                                  if int(row['id']) in {int(x['id']) for x in historical})
+        if not candidates and alias_candidates:
+            relation = 'same_symptom_unknown'
+        if invalid_lot:
+            relation = 'unknown_lot'
+        record = {
+            'schema': 'repair-cause-observation/1', 'signal_id': signal.id,
+            'evidence_ref': signal.evidence_ref, 'cause_id': cause,
+            'alias': alias, 'alias_seen': alias_seen,
+            'alias_candidates': alias_candidates,
+            'observed_version': signal.observed_version,
+            'occurrence': signal.occurrence, 'relation': relation,
+            'candidates': sorted(int(row['id']) for row in candidates),
+            'lot': lot, 'version': version, 'effects': 'none',
+        }
+        # Alias discovery and candidate/state changes are results, not a new
+        # occurrence. Preserve the first receipt for the same qualified input
+        # and version proof, avoiding an extra receipt on every circular scan.
+        material = [scope, signal.id, signal.observed_version, signal.occurrence,
+                    triage.record(), lot, alias, version]
+        receipt = hashlib.sha256(json.dumps(
+            material, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        rows = tx.query(
+            'INSERT INTO fingerprint_cause_observations'
+            ' (receipt_id,project,environment,source,signal_id,alias,cause_id,lot,record)'
+            ' VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)'
+            ' ON CONFLICT (receipt_id) DO NOTHING RETURNING receipt_id',
+            (receipt, *scope, signal.id, alias, cause, lot,
+             json.dumps(record, sort_keys=True)))
+        if not rows:
+            return tx.query('SELECT record FROM fingerprint_cause_observations'
+                            ' WHERE receipt_id=%s', (receipt,))[0]['record']
+        return record

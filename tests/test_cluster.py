@@ -131,6 +131,10 @@ FERMEES = {
     "repair_signals": {"id", "project", "environment", "source", "native_id", "position",
                        "envelope", "outcome", "outcome_ref", "created_at", "updated_at"},
     "repair_signal_refusals": {"project", "environment", "source", "rejection_key", "reason", "created_at"},
+    # #6477 (0560): scan position of the alerts that carry no project, held and
+    # read by the observation pass, never by a supervisor role; internal state,
+    # closed to both roles, no GRANT added.
+    "repair_observation_scopes": {"scope", "environment", "source", "cursor", "updated_at"},
 
     # #6017 (0552) : sonde admise sur un retour clos, tenue par l'adaptateur VM
     # et lue par le prédicat de prise ; fermée aux deux rôles, aucun GRANT modifié.
@@ -346,6 +350,10 @@ FERMEES = {
     # n'est pas modifiée.
     "fingerprint_source_state": {"project", "environment", "url", "cursor",
                                  "last_read_at", "last_error", "updated_at"},
+    # #6473 (0559): internal cause-observation receipts, no supervisor GRANT.
+    "fingerprint_cause_observations": {
+        "receipt_id", "project", "environment", "source", "signal_id",
+        "alias", "cause_id", "lot", "record", "created_at"},
     # #6091 (0554) : registre des exécutants externes non-agents (nom
     # `system:<nom>` et responsable humain), tenu et lu par les gestes de
     # pilote (`work external-executor`, réservation) ; identité interne fermée
