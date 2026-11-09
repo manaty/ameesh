@@ -309,6 +309,25 @@ class RunnerRetryPickIntegrationTest(PgTestCase):
             repair_retry.from_record(storage.of(self.db).repair_signals.retry_get(
                 second["_retry_key"])).state, "engaged")
 
+    def test_a_joined_instruction_keeps_the_same_entry(self):
+        """B #204724 : la reprise joint une consigne et enrichit le texte de
+        la même demande ; l'entrée engagée reste une seule."""
+        first = self._pick(self._worker(self.epoch))
+        first_key = first["_retry_key"]
+        # une consigne arrive pendant le tour ; la restauration la joint au
+        # tour inachevé en gardant l'occurrence de celui-ci
+        registry.set_pending_prompt(self.db, "dev", "suite du lot")
+        self.assertTrue(registry.restore_prompt(
+            self.db, "dev", "runner", self.epoch))
+        row = registry.get(self.db, "dev")
+        self.assertEqual(row["pending_prompt"],
+                         "consigne du lot\n\nsuite du lot")
+        second = self._pick(self._worker(self.epoch))
+        self.assertEqual(second["_retry_key"], first_key)
+        self.assertEqual(
+            repair_retry.from_record(storage.of(self.db).repair_signals.retry_get(
+                first_key)).state, "engaged")
+
 
 class RunnerRetryKeyTest(unittest.TestCase):
     """La clé est stable entre détenteurs et propre à l'occurrence."""
@@ -320,14 +339,37 @@ class RunnerRetryKeyTest(unittest.TestCase):
         self.assertRegex(
             repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, OCCURRENCE),
             r"^[0-9a-f]{64}$")
-        self.assertNotEqual(
+        # l'occurrence porte seule l'identité : le texte peut être enrichi par
+        # une reprise (brief de relève, consigne jointe) sans nouvelle demande
+        self.assertEqual(
             repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, OCCURRENCE),
-            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT + " bis",
-                                          OCCURRENCE))
+            repair_retry.runner_retry_key(PROJECT, AGENT,
+                                          "brief\n\n" + PROMPT, OCCURRENCE))
+        # sans occurrence (ligne antérieure à 0562), le texte fait foi
+        self.assertNotEqual(
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT),
+            repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT + " bis"))
         self.assertNotEqual(
             repair_retry.runner_retry_key(PROJECT, AGENT, PROMPT, OCCURRENCE),
             repair_retry.runner_retry_avoided_key(PROJECT, AGENT, PROMPT,
                                                   OCCURRENCE))
+
+    def test_the_occurrence_alone_identifies_the_request(self):
+        """B #204724 : texte enrichi, même occurrence = même demande."""
+        self.assertEqual(
+            repair_retry.runner_retry_key(PROJECT, AGENT, "continue", "occ-1"),
+            repair_retry.runner_retry_key(PROJECT, AGENT,
+                                          "continue\n\nsuite", "occ-1"))
+        self.assertEqual(
+            repair_retry.runner_retry_avoided_key(PROJECT, AGENT, "continue",
+                                                  "occ-1"),
+            repair_retry.runner_retry_avoided_key(PROJECT, AGENT,
+                                                  "continue\n\nsuite", "occ-1"))
+        # une clé d'occurrence ne rencontre pas la clé d'un texte, même si le
+        # texte vaut l'identifiant
+        self.assertNotEqual(
+            repair_retry.runner_retry_key(PROJECT, AGENT, "occ-1", "occ-1"),
+            repair_retry.runner_retry_key(PROJECT, AGENT, "occ-1"))
 
     def test_the_same_text_under_two_occurrences_is_two_requests(self):
         """Le B codex1 : deux demandes identiques ne partagent pas la clé."""
@@ -391,6 +433,131 @@ class PendingPromptOccurrenceTest(PgTestCase):
         # la même demande, restaurée : même occurrence, pas une seconde
         self.assertEqual(str(self.prompt_id()), str(first))
         self.assertEqual(str(self.take()["id"]), str(first))
+
+
+#: Écritures de la version N-1 (`d92f3465e`), copiées telles quelles : elles
+#: ne connaissent ni `pending_prompt_id` ni `current_prompt_id` (#204724).
+_OLD_SET_PENDING_PROMPT = """
+    UPDATE agent_registry
+       SET pending_prompt = %s,
+           status = CASE WHEN %s::text IS NULL THEN status ELSE 'queued' END,
+           updated_at = now()
+     WHERE name = %s
+"""
+
+_OLD_TAKE_PENDING_PROMPT = """
+    WITH verrou AS (
+        SELECT name, status, handoff_fenced, operator_paused, pending_prompt,
+               lease_owner, lease_epoch, lease_expires_at
+          FROM agent_registry WHERE name = %s FOR UPDATE
+    )
+    UPDATE agent_registry AS r
+       SET pending_prompt = NULL,
+           current_prompt = verrou.pending_prompt,
+           status = 'running',
+           status_text = 'turn in progress',
+           updated_at = now()
+      FROM verrou
+     WHERE r.name = verrou.name
+       AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+       AND verrou.pending_prompt IS NOT NULL
+       AND NOT verrou.operator_paused
+       AND NOT verrou.handoff_fenced
+       AND ameesh_agent_claims_open(r.host, r.name)
+       AND verrou.status <> 'stopped'
+       AND verrou.lease_expires_at > clock_timestamp()
+    RETURNING verrou.pending_prompt
+"""
+
+_OLD_RESTORE_PROMPT = """
+    UPDATE agent_registry
+       SET pending_prompt = CASE
+               WHEN current_prompt IS NULL THEN pending_prompt
+               WHEN pending_prompt IS NULL THEN current_prompt
+               ELSE current_prompt || E'\\n\\n' || pending_prompt
+           END,
+           current_prompt = NULL,
+           status = CASE WHEN operator_paused AND status = 'running'
+                         THEN 'queued' ELSE status END,
+           updated_at = now()
+     WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
+       AND current_prompt IS NOT NULL
+    RETURNING name
+"""
+
+
+class PreviousWriterOccurrenceTest(PgTestCase):
+    """N-1 (#204724) : l'invariant d'occurrence tient sur les écritures de la
+    version précédente, qui ignorent les deux colonnes."""
+
+    ADDED = ("pending_prompt_id", "current_prompt_id")
+
+    def setUp(self):
+        super().setUp()
+        suffix = self.id().rsplit(".", 1)[-1].replace("_", "-")[:40]
+        self.agent = "n1-" + suffix
+        registry.upsert(self.db, self.agent, harness="codex", host="source")
+        lease = registry.claim(self.db, self.agent, "runner", ttl_seconds=300)
+        self.epoch = lease["lease_epoch"]
+
+    def old_enqueue(self, text):
+        self.previous_write(_OLD_SET_PENDING_PROMPT,
+                            (text, text, self.agent), added=self.ADDED)
+        return registry.get(self.db, self.agent)
+
+    def old_take(self):
+        self.previous_write(_OLD_TAKE_PENDING_PROMPT,
+                            (self.agent, "runner", self.epoch),
+                            added=self.ADDED)
+        return registry.get(self.db, self.agent)
+
+    def old_restore(self):
+        self.previous_write(_OLD_RESTORE_PROMPT,
+                            (self.agent, "runner", self.epoch),
+                            added=self.ADDED)
+        return registry.get(self.db, self.agent)
+
+    def test_two_old_enqueues_are_two_occurrences(self):
+        """Le témoin du B : set N-1, take N-1, set N-1, même texte."""
+        first = self.old_enqueue("continue")
+        self.assertTrue(first["pending_prompt_id"])
+        taken = self.old_take()
+        self.assertEqual(str(taken["current_prompt_id"]),
+                         str(first["pending_prompt_id"]))
+        second = self.old_enqueue("continue")
+        self.assertTrue(second["pending_prompt_id"])
+        self.assertNotEqual(str(second["pending_prompt_id"]),
+                            str(first["pending_prompt_id"]))
+        self.assertNotEqual(
+            repair_retry.runner_retry_key(PROJECT, self.agent, "continue",
+                                          first["pending_prompt_id"]),
+            repair_retry.runner_retry_key(PROJECT, self.agent, "continue",
+                                          second["pending_prompt_id"]))
+
+    def test_an_old_restore_returns_the_occurrence(self):
+        occurrence = self.old_enqueue("continue")["pending_prompt_id"]
+        self.old_take()
+        restored = self.old_restore()
+        self.assertEqual(restored["pending_prompt"], "continue")
+        self.assertEqual(str(restored["pending_prompt_id"]), str(occurrence))
+        # le nouveau lecteur retrouve la même demande au tour suivant
+        self.assertEqual(str(self.old_take()["current_prompt_id"]),
+                         str(occurrence))
+
+    def test_an_old_restore_with_a_joined_instruction_keeps_one_identity(self):
+        """N-1 (#204724) : take, consigne posée, restore joint — le texte
+        change mais la demande inachevée garde son identité."""
+        occurrence = self.old_enqueue("continue")["pending_prompt_id"]
+        self.old_take()
+        self.old_enqueue("suite")
+        restored = self.old_restore()
+        self.assertEqual(restored["pending_prompt"], "continue\n\nsuite")
+        self.assertEqual(str(restored["pending_prompt_id"]), str(occurrence))
+        self.assertEqual(
+            repair_retry.runner_retry_key(PROJECT, self.agent, "continue",
+                                          occurrence),
+            repair_retry.runner_retry_key(PROJECT, self.agent,
+                                          "continue\n\nsuite", occurrence))
 
 
 class RunnerRetryJournalStorageTest(PgTestCase):

@@ -484,16 +484,27 @@ def runner_retry_key(project, agent, prompt, occurrence=None):
     #6487), pas son seul texte : deux consignes successives de texte identique
     (« continue ») sont deux demandes, tandis qu'une consigne remise en attente
     après une interruption (perte de bail, retrait d'hôte, préemption) garde
-    son occurrence et ne rejoue pas la tentative.  Sans identité (ligne posée
+    son occurrence et ne rejoue pas la tentative.  Quand l'occurrence existe,
+    elle porte SEULE l'identité (avec projet et agent) : le texte peut être
+    enrichi par une reprise (brief de relève, consigne jointe à la
+    restauration) sans ouvrir une seconde demande.  Sans identité (ligne posée
     avant 0562), le texte seul fait foi.  Le texte n'est jamais écrit : seul
     son condensé entre dans la clé.
     """
-    return key_of("runner.turn", project, agent, prompt, occurrence or "")
+    if occurrence:
+        # partie dédiée : une clé d'occurrence ne peut pas rencontrer la clé
+        # d'un texte qui vaudrait l'uuid par hasard.
+        return key_of("runner.turn", project, agent, "occurrence",
+                      str(occurrence))
+    return key_of("runner.turn", project, agent, prompt)
 
 
 def runner_retry_avoided_key(project, agent, prompt, occurrence=None):
     """La clé d'une relance évitée par idempotence (un autre détenteur)."""
-    return key_of("runner.turn.avoid", project, agent, prompt, occurrence or "")
+    if occurrence:
+        return key_of("runner.turn.avoid", project, agent, "occurrence",
+                      str(occurrence))
+    return key_of("runner.turn.avoid", project, agent, prompt)
 
 
 def observe_runner_retry_requested(db, *, key, project, environment, agent,
