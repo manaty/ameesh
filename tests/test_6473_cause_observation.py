@@ -2,6 +2,7 @@
 """A3 receipts: exact cause, aliases, real writers and terminal-state races."""
 from dataclasses import replace
 import threading
+from unittest import mock
 
 from ameesh import fingerprints as fp, repair_signals as signals
 from ameesh import repair_triage as triage, repair_observation as obs, work
@@ -12,7 +13,9 @@ from .test_6317_repair_correlation import NOW, OBSERVE, ACTIVE, HOST, HOST2, att
 class CauseObservationTest(PgTestCase):
     def setUp(self):
         super().setUp()
-        self.db.execute('DELETE FROM fingerprint_cause_observations')
+        for table in ('fingerprint_cause_observations', 'repair_signals',
+                      'repair_signal_streams', 'repair_signal_refusals'):
+            self.db.execute('DELETE FROM ' + table)
 
     def signal(self, ident=1, version=OBSERVE, cause='command-failed'):
         return signals.from_inbox({'id': ident}, project='ameesh',
@@ -190,6 +193,27 @@ class CauseObservationTest(PgTestCase):
             self.assertEqual(result['candidates'], [])
         q = self.qualification(s, test='other_contract')
         self.assertEqual(self.observe(s, q)['candidates'], [])
+
+    def test_a3_failure_cannot_interrupt_page_settlement_or_other_receipts(self):
+        original = fp.observe_cause
+        def observe(db, signal, qualification, **kw):
+            page = obs.storage.of(db).repair_signals.page('ameesh', 'staging', 'inbox')
+            self.assertEqual([row['signal']['outcome'] for row in page],
+                             ['unknown', 'unknown'])
+            if signal.native_id == '1':
+                raise RuntimeError('PRIVATE SOURCE CONTENT')
+            return original(db, signal, qualification, **kw)
+        rows = [{'key': ident, 'entry': {'id': ident}} for ident in (1, 2)]
+        with mock.patch.object(fp, 'observe_cause', side_effect=observe) as observer:
+            with self.assertLogs('ameesh.repair_observation', level='WARNING') as logs:
+                self.assertTrue(obs.ingest(
+                    self.db, project='ameesh', environment='staging', source='inbox',
+                    rows=rows, expected_cursor=None, next_cursor='two', now=NOW))
+        self.assertEqual(observer.call_count, 2)
+        self.assertEqual(logs.output, [
+            'WARNING:ameesh.repair_observation:repair-cause-observation: source_error (RuntimeError)'])
+        self.assertEqual(self.db.query(
+            'SELECT count(*) AS n FROM fingerprint_cause_observations')[0]['n'], 1)
 
     def test_u6_writes_unknown_receipt_without_creating_work(self):
         row = {'key': 1, 'entry': {'id': 1}}

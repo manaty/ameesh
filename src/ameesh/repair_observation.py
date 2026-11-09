@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 
 from . import fingerprints, repair_signals, repair_triage, storage
@@ -85,9 +86,17 @@ def ingest(db, *, project, environment, source, rows, expected_cursor,
         settled = api.settle(signal.id, outcome, reference=reference)
         if not settled and outcome in ('lot', 'basket', 'decision'):
             api.settle(signal.id, outcome, reference=reference, expected='unknown')
+    # U7 is advisory: finish settlement of the entire U5 page first.
+    for signal, outcome, reference, triage, legacy_key in accepted:
         lot = (int(reference[4:]) if outcome == 'lot'
                and reference.startswith('lot:') and reference[4:].isdigit() else None)
-        fingerprints.observe_cause(db, signal, triage, lot=lot, legacy_key=legacy_key, now=now)
+        try:
+            fingerprints.observe_cause(db, signal, triage, lot=lot,
+                                       legacy_key=legacy_key, now=now)
+        except Exception as exc:  # one advisory receipt cannot interrupt U5
+            logging.getLogger(__name__).warning(
+                'repair-cause-observation: source_error (%s)',
+                type(exc).__name__[:80])
     return True
 
 
