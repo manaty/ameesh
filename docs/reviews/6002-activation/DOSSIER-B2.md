@@ -1,7 +1,7 @@
-# #6002 — bloc root B2 v3 : réinstallation de l'adaptateur VM de bureau-goal à 242ced70
+# #6002 — bloc root B2 v4 : réinstallation de l'adaptateur VM de bureau-goal à 242ced70
 
 Bureau (BG), 09/11. Demandé par mesh-design #205785 et #205796, corrigé selon cx1 #205801 (v2) et
-#205810 (v3). Lancé par l'owner, en root, sur bureau-goal, **après** le reçu de la simulation #6572
+#205810 (v3), puis impl-03 #205820 (v4 : N1 à N6). Lancé par l'owner, en root, sur bureau-goal, **après** le reçu de la simulation #6572
 et deux avis OK (ameesh-cx1, mty-amh-impl-03). N'active rien : `enrollment.json` reste
 `enabled: false`, le timer reste désactivé. Le script ne garantit pas qu'aucune requête VM n'a eu
 lieu : il garantit seulement qu'il n'en lance aucune, et ses gardes refusent tout worker vivant.
@@ -42,3 +42,27 @@ arrive à l'étape 0, avant la moindre écriture. Après l'étape 1, un `trap ER
 `sudo bash /root/ameesh-operator-6002-B2-<TS>/retour.sh` restaure les liens, `vm-commande.py` et
 les unités d'avant ; il ne retire que les unités et le `scaleway.json` qui étaient absents avant
 B2. `src-242ced700d6e` et `venv-242ced700d6e` restent sur place, inertes.
+
+## v4 (impl-03 #205820)
+- **Lien src** : `/opt/ameesh-vm-adapter/src` est un dossier (installation historique 33bfa473) que le
+  venv n'utilise pas (`ameesh` y est installé depuis `src-71ec56e3a8ae`). Il est laissé intact. Seul
+  le lien `venv` change ; sa cible doit correspondre à `venv-<12 hex>` et exister (N3). Le retour la
+  relit et la valide avant `ln`, sans sourcer de fichier.
+- **N1** : `stop` rappelle `retour.sh` dès que le reçu existe.
+- **N2** : les constats (date du profil, booléen de projet, liens, droits) sont écrits dans
+  `$RECU/constats`, en plus de la sortie.
+- **N4** : préalables du service vérifiés à l'étape 0 : `enrollment.json` et `database.env`
+  réguliers, nlink 1, `agent`, 0600 ; `AMEESH_CONFIG` présent et lisible par `agent`.
+- **N5** : `/opt/ameesh-vm-adapter`, `commandes/`, `/etc/ameesh-vm-adapter` et `/etc/systemd/system`
+  root, sans écriture groupe ni autres, contrôlés à l'étape 0 et de nouveau avant la bascule.
+- **N6** : dépendances épinglées par `PIP_CONSTRAINT` (versions du venv actuel : psutil 7.2.2,
+  psycopg et psycopg-binary 3.3.8, typing_extensions 4.16.0 ; backend setuptools 80.9.0). Pas de
+  hashes : pip reste en root sur PyPI, risque accepté et nommé. Le `freeze` du nouveau venv est gardé au reçu.
+
+## Intégrité au lancement (owner)
+Ne pas lancer depuis l'arbre de `agent`. Copier en root, vérifier l'empreinte, lancer la copie :
+```
+sudo install -m 0700 -o root -g root /home/agent/.local/state/ameesh/operators/6002-activation/reinstall-242ced70.sh /root/reinstall-242ced70.sh
+sudo sha256sum /root/reinstall-242ced70.sh      # doit égaler SHA256SUMS de la tête relue
+sudo bash /root/reinstall-242ced70.sh
+```

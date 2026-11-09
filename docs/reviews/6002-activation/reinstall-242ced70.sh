@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# #6002 — bloc B2 v3 : réinstalle l'adaptateur VM de bureau-goal à 242ced700d6e (= main 14017a2a pour
+# #6002 — bloc B2 v4 : réinstalle l'adaptateur VM de bureau-goal à 242ced700d6e (= main 14017a2a pour
 # les fichiers de l'adaptateur), pose scaleway.json depuis le profil scw existant et les unités.
 # N'ACTIVE RIEN : enrollment.json reste enabled:false, le timer reste désactivé.
-# v2 (cx1 #205801) : garde d'états lue avant toute écriture et répétée ; reçu durable et retour qui
-#   restaure ; secret existant et profil explicites.
-# v3 (cx1 #205810) : profil scw et secret validés SANS ÉCRITURE avant tout changement ; création
-#   ensuite seulement si le profil n'a pas changé ; cibles des liens lues avec contrôle.
-# À lancer par l'owner, en root, sur bureau-goal :  sudo bash reinstall-242ced70.sh
+# v2/v3 (cx1 #205801, #205810) : gardes d'états, reçu durable et retour qui restaure, profil et secret
+#   validés sans écriture avant tout changement, création revalidée.
+# v4 (impl-03 #205820, N1-N6) : stop rappelle le retour ; constats écrits au reçu ; seul le lien venv
+#   change (src est le dossier historique 33bfa473, hors usage du venv, laissé intact) et sa cible est
+#   validée ; préalables du service vérifiés (database.env, enrollment.json, AMEESH_CONFIG) ; parents
+#   root et non inscriptibles ; dépendances épinglées par contraintes.
+# À lancer par l'owner, en root, sur bureau-goal, depuis une copie root vérifiée (voir DOSSIER-B2.md).
 set -euo pipefail
 SHA=242ced700d6ec1a63fc9d72643bc9faad175f72f
 SHORT=${SHA:0:12}
@@ -18,7 +20,12 @@ OP=agent
 PROFILE=manaty
 SCW=/home/$OP/.config/scw/config.yaml
 RECU=/root/ameesh-operator-6002-B2-$(date -u +%Y%m%dT%H%M%SZ)
-stop() { echo "STOP : $*" >&2; exit 1; }
+stop() {
+  echo "STOP : $*" >&2
+  if [ -e "$RECU/retour.sh" ]; then echo "état d'avant restaurable par : sudo bash $RECU/retour.sh" >&2; fi
+  exit 1
+}
+constat() { echo "$*"; if [ -d "$RECU" ]; then echo "$*" >> "$RECU/constats"; fi; }
 
 # Lecture du profil scw et du scaleway.json existant. Mode « valider » : aucune écriture.
 # Mode « creer » : écrit scaleway.json en O_EXCL, root 0600. La valeur n'est jamais affichée.
@@ -80,36 +87,59 @@ garde_etats() {
   echo "garde états OK ($1)"
 }
 
+# Fichier privé de l'opérateur : régulier, sans lien, nlink 1, uid agent, 0600.
+prive_operateur() {
+  local f=$1 info
+  [ -f "$f" ] && [ ! -L "$f" ] || stop "$f : pas un fichier régulier"
+  info=$(stat -c '%h %U %a' "$f") || stop "lecture de $f"
+  [ "$info" = "1 $OP 600" ] || stop "$f : attendu « 1 $OP 600 », lu « $info »"
+}
+
+# Parent root, non inscriptible par le groupe ni par les autres.
+parent_sur() {
+  local d=$1 info
+  [ -d "$d" ] && [ ! -L "$d" ] || stop "$d : pas un dossier"
+  info=$(stat -c '%U %a' "$d") || stop "lecture de $d"
+  [ "${info%% *}" = root ] || stop "$d : propriétaire non root ($info)"
+  [ $(( 0${info##* } & 022 )) = 0 ] || stop "$d : inscriptible par groupe/autres ($info)"
+}
+
 # 0. Gardes, toutes en lecture, avant la moindre écriture.
 [ "$(id -u)" = 0 ] || stop "root requis"
 [ "$(hostname)" = bureau-goal ] || stop "bureau-goal seulement"
 garde_etats "avant toute écriture"
+for d in $OPT $OPT/commandes $ETC $UNITDIR; do parent_sur $d; done
+prive_operateur $ETC/enrollment.json
+prive_operateur $ETC/database.env
 python3 -I -c 'import json,sys; assert json.load(open(sys.argv[1]))["enabled"] is False' $ETC/enrollment.json \
   || stop "enrollment.json n'est pas enabled:false"
+CONF=$(sed -n 's/^AMEESH_CONFIG=//p' $ETC/database.env) || stop "lecture de database.env"
+[ -n "$CONF" ] || stop "AMEESH_CONFIG absent de database.env"
+runuser -u $OP -- test -r "$CONF" || stop "AMEESH_CONFIG illisible par $OP"
 [ ! -e $OPT/src-$SHORT ] && [ ! -e $OPT/venv-$SHORT ] || stop "src-$SHORT ou venv-$SHORT déjà présents : réconcilier"
 [ ! -e $RECU ] || stop "reçu $RECU déjà présent"
-OLD_SRC=$(readlink $OPT/src) || stop "$OPT/src n'est pas un lien"
 OLD_VENV=$(readlink $OPT/venv) || stop "$OPT/venv n'est pas un lien"
-[ -n "$OLD_SRC" ] && [ -n "$OLD_VENV" ] || stop "cible de lien vide"
+[[ $OLD_VENV =~ ^venv-[0-9a-f]{12}$ ]] || stop "cible du lien venv inattendue : $OLD_VENV"
+[ -d "$OPT/$OLD_VENV" ] || stop "cible du lien venv absente"
 [ -f $OPT/commandes/vm-commande.py ] || stop "commande actuelle absente"
 SCW_SHA=$(sha256sum < $SCW | cut -c1-64) || stop "lecture du profil scw"
-echo "profil scw source : $(stat -c '%y %U:%G %a' $SCW) (date de la copie = référence de péremption si la clé tourne)"
-scw valider || stop "profil scw ou scaleway.json existant refusé"
+SCW_INFO=$(stat -c '%y %U:%G %a' $SCW) || stop "lecture du profil scw"
+scw valider > /tmp/.6002-scw-valider.$$ || { rm -f /tmp/.6002-scw-valider.$$; stop "profil scw ou scaleway.json existant refusé"; }
 
-# 1. Reçu durable AVANT le premier changement : liens, commande, unités (ou leur absence).
+# 1. Reçu durable AVANT le premier changement : lien venv, commande, unités (ou leur absence), constats.
 install -d -m 0700 -o root -g root $RECU
-printf 'src=%s\nvenv=%s\n' "$OLD_SRC" "$OLD_VENV" > $RECU/liens-avant
+printf '%s\n' "$OLD_VENV" > $RECU/venv-avant
 cp -p $OPT/commandes/vm-commande.py $RECU/vm-commande.py.avant
 for u in ameesh-vm-adapter.service ameesh-vm-adapter.timer; do
   if [ -e $UNITDIR/$u ]; then cp -p $UNITDIR/$u $RECU/$u.avant; else : > $RECU/$u.absente; fi
 done
 if [ -e $ETC/scaleway.json ]; then : > $RECU/scaleway.json.preexistant; else : > $RECU/scaleway.json.absent; fi
 cat > $RECU/retour.sh <<EOF
-# Retour B2 : restaure l'état d'avant, rien d'autre.
+# Retour B2 : restaure l'état d'avant, rien d'autre. Cible du venv relue et validée.
 set -eu
-. $RECU/liens-avant
-ln -sfn "\$src" $OPT/src
-ln -sfn "\$venv" $OPT/venv
+v=\$(cat $RECU/venv-avant)
+case "\$v" in venv-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "cible venv invalide" >&2; exit 1 ;; esac
+ln -sfn "\$v" $OPT/venv
 install -m 0644 -o root -g root $RECU/vm-commande.py.avant $OPT/commandes/vm-commande.py
 for u in ameesh-vm-adapter.service ameesh-vm-adapter.timer; do
   if [ -e $RECU/\$u.avant ]; then install -m 0644 -o root -g root $RECU/\$u.avant $UNITDIR/\$u; fi
@@ -120,7 +150,11 @@ systemctl daemon-reload
 echo "retour B2 fait (src-$SHORT et venv-$SHORT laissés, inertes)"
 EOF
 chmod 0600 $RECU/retour.sh
-echo "reçu et retour : $RECU (retour : sudo bash $RECU/retour.sh)"
+constat "reçu et retour : $RECU (retour : sudo bash $RECU/retour.sh)"
+constat "profil scw source : $SCW_INFO (date de la copie = référence de péremption si la clé tourne)"
+constat "$(cat /tmp/.6002-scw-valider.$$)"
+rm -f /tmp/.6002-scw-valider.$$
+constat "src historique laissé intact : $OPT/src (dossier, source 33bfa473) ; seul le lien venv change"
 trap 'echo "ÉCHEC : état d avant restaurable par sudo bash '"$RECU"'/retour.sh" >&2' ERR
 
 # 2. Sources : archive git exacte, blobs de l'adaptateur vérifiés contre l'arbre du commit.
@@ -137,25 +171,33 @@ for f in deploy/vm-adapter/commandes/vm-commande.py deploy/vm-adapter/ameesh-vm-
 done
 [ -z "$(find $OPT/src-$SHORT -perm /022 -print -quit)" ] || stop "fichier g+w/o+w dans les sources"
 
-# 3. venv dédié, source installée, import vérifié sous le compte opérateur.
+# 3. venv dédié, dépendances épinglées (versions du venv actuel + backend de build), import vérifié.
+cat > $RECU/contraintes.txt <<'EOF'
+psutil==7.2.2
+psycopg==3.3.8
+psycopg-binary==3.3.8
+typing_extensions==4.16.0
+setuptools==80.9.0
+EOF
 python3.12 -m venv $OPT/venv-$SHORT
-$OPT/venv-$SHORT/bin/pip install --quiet --no-cache-dir $OPT/src-$SHORT
+PIP_CONSTRAINT=$RECU/contraintes.txt $OPT/venv-$SHORT/bin/pip install --quiet --no-cache-dir $OPT/src-$SHORT
 chown -R root:root $OPT/venv-$SHORT
 chmod -R go-w $OPT/venv-$SHORT
+$OPT/venv-$SHORT/bin/pip list --format=freeze > $RECU/venv-$SHORT.freeze
 runuser -u $OP -- $OPT/venv-$SHORT/bin/python -I -c 'import ameesh.vm_adapter, ameesh.host_release; print("import ok")'
 
-# 4. Garde répétée, puis commande au blob et bascule des liens.
+# 4. Gardes répétées, puis commande au blob et bascule du seul lien venv.
 garde_etats "avant la bascule"
+for d in $OPT $OPT/commandes; do parent_sur $d; done
 install -m 0644 -o root -g root $OPT/src-$SHORT/deploy/vm-adapter/commandes/vm-commande.py $OPT/commandes/.vm-commande.py.$SHORT
 [ "$(git hash-object $OPT/commandes/.vm-commande.py.$SHORT)" = "$(runuser -u $OP -- git -C $REPO rev-parse "$SHA:deploy/vm-adapter/commandes/vm-commande.py")" ] || stop "vm-commande.py copié ≠ blob"
 mv -f $OPT/commandes/.vm-commande.py.$SHORT $OPT/commandes/vm-commande.py
-ln -sfn src-$SHORT $OPT/src
 ln -sfn venv-$SHORT $OPT/venv
-echo "liens : src → $(readlink $OPT/src) ; venv → $(readlink $OPT/venv)"
+constat "lien venv : $OLD_VENV → $(readlink $OPT/venv)"
 
 # 5. scaleway.json : création depuis la source validée à l'étape 0, si elle n'a pas changé.
 [ "$(sha256sum < $SCW | cut -c1-64)" = "$SCW_SHA" ] || stop "profil scw modifié depuis la validation"
-scw creer
+constat "$(scw creer)"
 
 # 6. Unités : celles du SHA, User=agent substitué, vérifiées, posées. Timer NON activé.
 W=$(mktemp -d)
@@ -168,5 +210,5 @@ rm -rf "$W"
 systemctl daemon-reload
 garde_etats "après la pose"
 sha256sum $UNITDIR/ameesh-vm-adapter.service $UNITDIR/ameesh-vm-adapter.timer $OPT/commandes/vm-commande.py | tee $RECU/empreintes-apres
-stat -c '%a %U:%G %n' $ETC/scaleway.json $ETC/enrollment.json
-echo "fin B2 : adaptateur à $SHORT, unités posées, timer DÉSACTIVÉ, enrollment enabled:false ; reçu $RECU"
+constat "$(stat -c '%a %U:%G %n' $ETC/scaleway.json $ETC/enrollment.json $ETC/database.env | tr '\n' ' ')"
+constat "fin B2 : adaptateur à $SHORT, unités posées, timer DÉSACTIVÉ, enrollment enabled:false ; reçu $RECU"
