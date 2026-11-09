@@ -552,6 +552,8 @@ cgroup_vide() {  # unité — 0 si aucun processus ne reste dans son cgroup
   local cg f
   cg=$(unite_systemctl "$1" show -p ControlGroup --value) || return 1
   [ -n "$cg" ] || return 0
+  # un chemin de cgroup est absolu, sans `..` ; une autre sortie est illisible
+  [[ $cg == /* && $cg != *..* ]] || return 1
   f=/sys/fs/cgroup$cg/cgroup.procs
   if [ "$MODE" = agents ]; then
     utilisateur_agents sh -c '[ ! -e "$1" ] || [ -z "$(cat "$1")" ]' sh "$f"
