@@ -220,7 +220,11 @@ class SelectedTurnRefusedTest(unittest.TestCase):
             # #2894 : `run_turn` retire d'abord un document de tour périmé ;
             # la doublure n'a pas de document, le rappel est inerte.
             _release_turn_memory=lambda *a, **k: None,
-            _purge_turn_context=lambda: None)
+            _purge_turn_context=lambda: None,
+            # #6487 : l'enveloppe clôt l'entrée de relance A11 dans son
+            # `finally` ; ce tour-ci n'en porte pas (`_retry_key` absent), le
+            # journal de relance est couvert par test_6487_runner_retry_journal.
+            _settle_runner_retry=lambda *a, **k: None)
         # #290 a séparé l'enveloppe (`run_turn`) du tour (`_run_guarded_turn`) :
         # la doublure porte la vraie logique de tour et une enveloppe inerte.
         worker._run_guarded_turn = types.MethodType(
