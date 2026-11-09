@@ -37,6 +37,19 @@ requires_psycopg = unittest.skipUnless(psycopg is not None, 'psycopg absent (par
 
 @requires_psycopg
 class PrivateInputTest(unittest.TestCase):
+    def test_unavailable_container_engine_is_inconclusive_before_cluster_creation(self):
+        # A runner's docker shim can exist while its backing engine is absent
+        # (exit 127). No SQL assertion has run in that case (#6372, h-16).
+        with mock.patch.object(Path, 'exists', return_value=False), \
+                mock.patch.object(shutil, 'which', return_value='/fixture/docker'), \
+                mock.patch.object(subprocess, 'run', return_value=
+                                  subprocess.CompletedProcess(['docker'], 127, '', '')) as run, \
+                mock.patch.object(tempfile, 'TemporaryDirectory') as temporary:
+            with self.assertRaisesRegex(unittest.SkipTest, 'container engine unavailable'):
+                RealIdentityTest.setUpClass()
+        self.assertEqual(run.call_args.args[0], ['docker', 'info'])
+        temporary.assert_not_called()
+
     def test_sql_companions_are_packaged_and_root_checked(self):
         import ast
         from types import SimpleNamespace
@@ -147,6 +160,18 @@ class RealIdentityTest(unittest.TestCase):
         local = (binaries / 'initdb').exists() and os.geteuid() != 0
         if not local and not shutil.which('docker'):
             raise unittest.SkipTest('isolated PostgreSQL cluster tools required')
+        if not local:
+            # Finding the executable is insufficient: the runner's shim may
+            # lack its engine, or the daemon may be unavailable. Classify that
+            # before creating clusters; failures after this probe still fail.
+            try:
+                engine = subprocess.run(['docker', 'info'], capture_output=True,
+                                        timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                raise unittest.SkipTest('isolated container engine unavailable') from None
+            if engine.returncode:
+                raise unittest.SkipTest('isolated container engine unavailable (exit %d)'
+                                        % engine.returncode)
         cls.temporary = tempfile.TemporaryDirectory(prefix='i5162-', dir=os.environ.get('TMPDIR'))
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
