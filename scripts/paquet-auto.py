@@ -313,6 +313,17 @@ PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
 KEEP_READY_REASON = "coupure suivante : recomposition"
 KEEP_REFROZEN_REASON = "coupure suivante : tête regelée"
 KEEP_NOT_READY_REASON = "coupure suivante : membre non prêt"
+#: #6567 : un moteur de conteneurs absent de l'environnement du test. Le shim
+#: du ménage (`menage/bin/docker`) sort en 127 sans `AMEESH_REAL_DOCKER` ; un
+#: `docker run` en `check=True` lève alors `CalledProcessError … exit status
+#: 127` (h-16, #6372 retiré à tort). Un exécutable introuvable dit la même
+#: chose. Seuls `docker`/`podman` en tête de commande sont visés : un 127 d'un
+#: autre programme reste lu comme avant.
+CONTAINER_ENGINE_ABSENT = (
+    r"ameesh: container engine not found|"
+    r"Command '(?:\[')?(?:[^'\s]*/)?(?:docker|podman)'?[,\s][^\n]*"
+    r"returned non-zero exit status 127|"
+    r"No such file or directory: '(?:[^']*/)?(?:docker|podman)'")
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 #: #4217 : un `tearDownClass`/`setUpClass` en `QueryCanceled` (statement
 #: timeout, base de test chargée) est une panne d'infrastructure, jamais un
@@ -323,7 +334,8 @@ INCONCLUSIVE_RE = re.compile(
     r"psql: error|No such file or directory: 'psql'|"
     r"could not translate host name|Temporary failure in name resolution|"
     r"QueryCanceled|canceling statement|statement timeout|timeout expired|"
-    r"ModuleNotFoundError: No module named 'psycopg)",
+    r"ModuleNotFoundError: No module named 'psycopg|"
+    + CONTAINER_ENGINE_ABSENT + r")",
     re.IGNORECASE,
 )
 #: #4221 : un QueryCanceled ou un lock timeout **reproduit** en rejouant seul,
@@ -347,7 +359,8 @@ ENV_MESSAGE_RE = re.compile(
     r"No such file or directory: 'psql'|"
     r"could not translate host name|Temporary failure in name resolution|"
     r"canceling statement|statement timeout|timeout expired|"
-    r"No module named 'psycopg'",
+    r"No module named 'psycopg'|"
+    + CONTAINER_ENGINE_ABSENT,
     re.IGNORECASE,
 )
 #: une ligne de résumé unittest
