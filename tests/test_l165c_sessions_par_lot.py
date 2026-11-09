@@ -733,6 +733,60 @@ class RoutageTest(_Base):
                 finally:
                     worker.watchdog_stop.set()
 
+    def test_seuil_de_reprise_suit_le_harnais_de_la_session_reprise(self):
+        """#6404 : le seuil passé à la bascule est celui du harnais de la
+        session reprise (celui du prochain tour), pas celui du dernier tour
+        lancé.
+
+        Canon surchargé : Codex 2 M, commune 150 k. Une session de 500 k est
+        donc reprise si elle relève de Codex, écartée si elle relève de
+        Claude — dans les deux cas le dernier tour est noté sous l'autre
+        harnais, seul cas où les deux seuils divergent.
+        """
+        from ameesh import mechanics
+        from .test_4448_rotation_par_harnais import BLOC, document
+
+        for harnais_a, harnais_b, repris in (("codex", "claude", True),
+                                             ("claude", "codex", False)):
+            with self.subTest(harnais=harnais_a, dernier=harnais_b):
+                name = "tgt-%s-%s" % (harnais_a, harnais_b)
+                worker = self._worker(name)
+                try:
+                    a = work.add(self.db, title="A", assignee=name, force=_FORCE)["id"]
+                    b = work.add(self.db, title="B", assignee=name, force=_FORCE)["id"]
+                    cwd = worker._resolve_workdir(lot=a)
+                    self.assertTrue(cwd)
+                    registry.set_session(self.db, name, "sess-A", None,
+                                         harness=harnais_a, cwd=cwd)
+                    storage.of(self.db).operations.set_session_work_item(
+                        name, worker.runner.runner_id, worker.epoch, str(a))
+                    # la session de A est mise de côté sous son harnais
+                    out = self.st.switch(
+                        name, worker.runner.runner_id, worker.epoch,
+                        to_lot=str(b), harness=harnais_b, account=None,
+                        cwd=cwd, current="sess-A")
+                    self.assertEqual(out["parked"], "sess-A")
+                    self.db.execute(
+                        "DELETE FROM turn_costs WHERE agent = %s", (name,))
+                    self.db.execute(
+                        "INSERT INTO turn_costs(agent,harness,session,input_tokens,"
+                        "output_tokens,cached_input_tokens)"
+                        " VALUES (%s,%s,%s,499999,1,999999)",
+                        (name, harnais_a, "sess-A"))
+                    # le prochain tour reprend A ; le dernier tour était sous
+                    # l'autre harnais, au seuil différent
+                    worker._harness_override = harnais_a
+                    self.assertTrue(worker._state_note("turn_harness", harnais_b))
+                    self.assertEqual(worker._ledger_harness(), harnais_b)
+                    with mock.patch.object(mechanics, "configured",
+                                           return_value=document(BLOC)):
+                        self.assertTrue(worker._switch_lot("", str(a)))
+                    self.assertEqual(worker.current_session(),
+                                     "sess-A" if repris else None)
+                    self.assertEqual(worker.session_tokens, 500_000 if repris else 0)
+                finally:
+                    worker.watchdog_stop.set()
+
     def test_restart_ne_reprend_aucune_ancienne_session_de_lot(self):
         from ameesh import exploitation
         worker = self._worker("fresh6403")
