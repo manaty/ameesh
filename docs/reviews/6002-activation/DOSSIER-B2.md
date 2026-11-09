@@ -37,3 +37,20 @@ rm /etc/systemd/system/ameesh-vm-adapter.{service,timer} && systemctl daemon-rel
 rm /etc/ameesh-vm-adapter/scaleway.json   # seulement si B2 l'a créé
 ```
 Le timer n'ayant jamais été activé, aucune requête VM n'est partie.
+
+## v2 (avis cx1 #205801)
+- **B1** : `garde_etats` lit avec rc contrôlé les états du timer (LoadState, UnitFileState, ActiveState)
+  et du service, les jobs en file et la présence d'un worker `ameesh.vm_adapter worker`. Lecture en
+  échec ou état transitoire = STOP. Jouée avant toute écriture, répétée juste avant la bascule
+  (étape 3) et après la pose (étape 5). Le reçu ne déduit plus « aucune requête VM » du seul timer.
+- **B2** : reçu durable `/root/ameesh-operator-6002-B2-<TS>/` (0700) écrit AVANT le premier
+  changement : cibles des liens, ancien `vm-commande.py`, chaque unité sauvegardée ou marquée
+  absente, état initial de `scaleway.json`. `retour.sh` dans ce reçu restaure les liens, la commande
+  et les unités d'avant ; il ne retire que les unités et le `scaleway.json` initialement absents. Un
+  `trap ERR` rappelle ce retour à tout échec, y compris après une mutation partielle de l'étape 3.
+- **N** : un `scaleway.json` déjà présent est vérifié (fichier régulier sans lien, nlink 1, root
+  0600, JSON `{"secret_key": <uuid>}`), sans afficher la valeur. Le profil scw est explicite :
+  exactement un profil, `manaty`, aucune `secret_key` au niveau racine. Sinon STOP. Constat relu
+  sans valeur : le `default_project_id` du profil diffère du projet inscrit. La clé couvre
+  l'organisation et le projet est passé explicitement par l'inscription, donc ce n'est pas un
+  refus ; le booléen est consigné au reçu.
