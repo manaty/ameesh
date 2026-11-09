@@ -269,6 +269,10 @@ def record(db, snapshot: dict, *, exclusive: bool = False,
             "hosts": {str(host)[:128]: _public_step(step)
                       for host, step in snapshot.get("hosts", {}).items()},
             "notify": str(snapshot.get("notify") or "")[:128]}
+    # #6520: the launcher names its host, so a busy door can name its holder
+    # from any host. Older launchers omit it; the reader says "inconnu".
+    if isinstance(snapshot.get("host"), str) and snapshot["host"].strip():
+        data["host"] = snapshot["host"].strip()[:128]
     for key in _LIVENESS:
         if key in snapshot:
             data[key] = _finite(snapshot[key], key)
