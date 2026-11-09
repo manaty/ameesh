@@ -610,6 +610,12 @@ def submit(db, cfg, options, sha, *, included=()):
         previous = latest(db, options["key"])
         if previous and previous["state"] in ("pending", "running"):
             if previous["sha"] == sha:
+                blocked = str(previous.get("blocked_reason") or "")
+                if blocked:
+                    # #6520: a blocked request is not a queued handoff. The
+                    # release must name the blocker, never report "rien à
+                    # corriger" from a normal submit return.
+                    raise RuntimeError("staging request blocked: " + blocked)
                 return previous
             if not previous.get("blocked_reason"):
                 raise RuntimeError("an unfinished staging request already exists")
@@ -700,6 +706,14 @@ def tick(db, cfg, options) -> dict:
         # #5727: so does the commit of the canon this host reads, compared
         # with the agents' canon by the alerts pass.
         request = dict(request, fingerprints=prints, canon_ref=canon_commit(cfg))
+        # #6520 second review: tie the request to this execution before the
+        # long preparation below (host operations, fetch, worktree), so a
+        # reader can tell a pending handoff this host is working on from a
+        # foreign lease, and a blocked request (which keeps state pending)
+        # never proves live staging.
+        if request.get("execution") != lease.owner:
+            request = dict(request, execution=lease.owner)
+            _record(db, options["key"], request, lease=lease)
         # #5450: a previous stop that could not prove its workstation units
         # stopped left their pid in the request. Settle them before any other
         # host operation; the kept worktree stays until they are proved gone.
@@ -815,7 +829,11 @@ def tick(db, cfg, options) -> dict:
         queued = request
         attempt = dict(request, state="running", host=host, run=uuid.uuid4().hex,
                        started=time.time(), notify=options["role"],
-                       deadline=time.time() + timeout, ci=ci_evidence)
+                       deadline=time.time() + timeout, ci=ci_evidence,
+                       # #6520: the live lease this attempt runs under, so a
+                       # reader can tell its staging from an orphan lease
+                       # without borrowing a terminal request's commit.
+                       execution=lease.owner)
         attempt.pop("blocked_reason", None)
         attempt.pop("ci_checked", None)
         attempt.pop("previous_host", None)

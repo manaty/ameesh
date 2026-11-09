@@ -2649,9 +2649,38 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
             request = staging_executor.submit(db, config.load(), options, release_sha,
                                              included=included)
         except RuntimeError as exc:
-            raise ReleaseBusy(str(exc)) from exc
-        return {"exit": 75, "duration_s": 0.0, "log": "", "summary": [],
-                "attestation": None, "request": request["request"]}
+            # #6520: an execution lease held by the executor that is already
+            # running *this* release's request is a normal handoff, not a
+            # conflict: say so instead of alarming "aucun tag" on a tagged
+            # cutoff. Any other unfinished request stays a named refusal.
+            pending = None
+            try:
+                pending = staging_executor.latest(db, options["key"])
+            except Exception:  # noqa: BLE001 - a diagnostic read never masks it
+                pending = None
+            lease = (_staging_execution_holder(db, options)
+                     if isinstance(pending, dict) else None)
+            if (isinstance(pending, dict)
+                    and pending.get("sha") == release_sha
+                    and _staging_request_active(pending, lease)):
+                return {"exit": 75, "queued": True, "duration_s": 0.0, "log": "",
+                        "summary": [], "attestation": None,
+                        "request": pending.get("request"),
+                        "request_state": pending.get("state"),
+                        "request_host": pending.get("host", "")}
+            raise ReleaseBusy(_staging_busy_text(project, db, str(exc))) from exc
+        blocked = str((request or {}).get("blocked_reason") or "")
+        if blocked:
+            # #6520: submit returns the previous request unchanged for the
+            # same commit, lease free or not. A blocked one is not a queued
+            # handoff: name the blocker instead of a "rien à corriger".
+            raise ReleaseBusy(_staging_busy_text(
+                project, db, "staging request blocked: " + blocked))
+        return {"exit": 75, "queued": True, "duration_s": 0.0, "log": "",
+                "summary": [], "attestation": None,
+                "request": request.get("request"),
+                "request_state": request.get("state"),
+                "request_host": request.get("host", "")}
     relative = project.staging
     if os.path.isabs(relative):
         relative = os.path.relpath(relative, project.repo)
@@ -2833,7 +2862,14 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
         last = (" ; dernier vert %s" % plan.last_green[:12]
                 if not reading_is_green(plan.ci) and plan.last_green else "")
         lines.append("CI tête: %s%s%s." % (state, caveat, last))
-    if staging:
+    if staging and staging.get("queued"):
+        lines.append("Staging: en cours — demande %s (%s%s) remise à l'exécutant ; "
+                     "l'attestation suivra."
+                     % (staging.get("request") or "?",
+                        staging.get("request_state") or "pending",
+                        ", hôte %s" % staging["request_host"]
+                        if staging.get("request_host") else ""))
+    elif staging:
         lines.append("Staging: sortie %s en %ss (journal %s)."
                      % (staging.get("exit"), staging.get("duration_s"), staging.get("log")))
         for row in staging.get("summary") or []:
@@ -3242,11 +3278,18 @@ def _staging_step(project: ProjectRelease, release_sha: str, included: list[int]
     except TransientReleaseError as exc:
         return {"exit": None, "duration_s": 0.0, "log": "", "summary": [],
                 "attestation": None, "error": str(exc)}
+    if result.get("queued"):
+        # #6520: the elected executor owns the sequence and its request is a
+        # normal handoff, not a lock conflict. The tag is durable; the next
+        # tick reconciles it and waits for the attestation.
+        result["exit"] = None
+        return result
     if result.get("exit") == 75:
         # staging.sh's single-operator lock, or its exclusive shared start
         # (#4885): another sequence is running, on any path or host. Not a
         # release failure; the next tick reconciles the tag and retries.
-        raise ReleaseBusy("staging is running (code 75, single-operator lock)")
+        raise ReleaseBusy(_staging_busy_text(
+            project, db, "staging is running (code 75, single-operator lock)"))
     return result
 
 
@@ -3270,6 +3313,179 @@ def staging_local_host() -> str:
     return os.uname().nodename.split(".")[0].lower()
 
 
+def cutoff_tag(project: ProjectRelease, cutoff_at: float, now: float) -> dict | None:
+    """#6520: the tag a cutoff already published, read before any alarm."""
+    try:
+        return recent_tag(project.repo, "%s/%s" % (project.remote, project.target),
+                          cutoff_at, now)
+    except Exception:  # noqa: BLE001 - a diagnostic read never masks the error
+        return None
+
+
+def _tags_by_commit(project: ProjectRelease) -> dict:
+    """The known tags by commit, for naming a staging holder's version."""
+    try:
+        rows = tags(project.repo, "%s/%s" % (project.remote, project.target))
+    except Exception:  # noqa: BLE001 - a diagnostic read never masks the error
+        return {}
+    out = {}
+    for row in rows:
+        out.setdefault(row["commit"], row)
+    return out
+
+
+def _staging_execution_holder(db, options: dict) -> dict | None:
+    """The live execution lease of an elected staging key, or None."""
+    try:
+        return storage.of(db).work.land_holder("staging-execution:" + options["key"])
+    except Exception:  # noqa: BLE001 - a diagnostic read never masks a refusal
+        return None
+
+
+def _staging_request_active(request: dict | None, lease: dict | None) -> bool:
+    """Whether a shared staging request proves live staging (#6520 review).
+
+    A terminal or blocked request never does: its commit must not be lent to
+    a lease an orphan execution still holds, and a blocked staging must stay
+    an alarm. A queued handoff is active before any attempt; once a lease is
+    held, the request counts only if the attempt recorded that execution
+    (#6520 second review), so a foreign execution is never mistaken for the
+    cutoff's staging.
+    """
+    if not isinstance(request, dict):
+        return False
+    if str(request.get("blocked_reason") or ""):
+        return False
+    state = str(request.get("state") or "")
+    owner = str((lease or {}).get("owner") or "")
+    if state == "pending":
+        return not lease or (bool(owner) and request.get("execution") == owner)
+    if state == "running":
+        return bool(owner) and request.get("execution") == owner
+    return False
+
+
+def staging_holders(project: ProjectRelease, db) -> list[dict]:
+    """#6520: the live holders of the staging door, named for the report.
+
+    Diagnostics only, never a guard: the elected execution lease
+    (`merge_locks`), its shared request, then the shared sequence log. A
+    holder a reader cannot see is not invented; the caller says so.
+
+    A lease is only that request's staging when the running request records
+    the same execution (new attempts) — a terminal or foreign request never
+    lends its commit to an orphan lease (#6520 review).
+    """
+    if db is None:
+        return []
+    holders: list[dict] = []
+
+    def add(holder: dict) -> None:
+        if not holder:
+            return
+        if any(h.get("execution") == holder.get("execution")
+               and h.get("host") == holder.get("host") for h in holders):
+            return
+        holders.append(holder)
+
+    if project.staging_executor:
+        try:
+            from . import staging_executor
+            options = staging_executor.settings(os.path.expanduser(project.staging_executor))
+            if options.get("project") == project.name:
+                request = staging_executor.latest(db, options["key"]) or {}
+                lease = _staging_execution_holder(db, options)
+                owner = str((lease or {}).get("owner") or "")
+                owner_bits = owner.split(":")
+                owner_host = owner_bits[1] if len(owner_bits) > 2 else ""
+                owner_execution = owner_bits[2] if len(owner_bits) > 2 else ""
+                state = str(request.get("state") or "")
+                sha = str(request.get("sha") or "")
+                request_host = str(request.get("host") or "")
+                request_run = str(request.get("run") or "")
+                active = _staging_request_active(request, lease)
+                if active:
+                    add({"kind": "elected", "active": True,
+                         "host": request_host or (owner_host if lease else ""),
+                         "execution": request_run or (owner_execution if lease else ""),
+                         "sha": sha, "state": state,
+                         "expires_at": str((lease or {}).get("expires_at") or "")})
+                else:
+                    # A lease that no active request of its execution owns is
+                    # an orphan (or a foreign operation): name it, and never
+                    # borrow a terminal or blocked request's commit.
+                    if lease:
+                        add({"kind": "elected", "active": False,
+                             "host": owner_host, "execution": owner_execution,
+                             "sha": "", "state": "held",
+                             "expires_at": str(lease.get("expires_at") or "")})
+                    if state in ("pending", "running") and sha:
+                        # The request is named aside, with the reason that
+                        # keeps it inactive, so a blocked handoff is not
+                        # silently covered by a foreign lease.
+                        add({"kind": "elected", "active": False,
+                             "host": request_host, "execution": request_run,
+                             "sha": sha, "state": state,
+                             "blocked_reason": str(request.get("blocked_reason") or "")})
+        except Exception:  # noqa: BLE001 - a diagnostic read never blocks a report
+            pass
+    try:
+        rows = storage.of(db).events.latest_type(
+            staging_watch.EVENT, 60, staging_watch.LIMIT)
+        for run, data in staging_watch.in_flight(rows).items():
+            add({"kind": "sequence", "active": True,
+                 "host": str(data.get("host") or ""),
+                 "execution": run, "sha": str(data.get("sha") or ""),
+                 "state": "running", "started": data.get("started")})
+    except Exception:  # noqa: BLE001 - a diagnostic read never blocks a report
+        pass
+    by_commit = _tags_by_commit(project)
+    for holder in holders:
+        row = by_commit.get(holder.get("sha"))
+        if row:
+            holder["version"] = row["version"]
+            holder["tag"] = row["tag"]
+    return holders
+
+
+def staging_holder_text(holder: dict) -> str:
+    """One holder, with the facts the operator needs to name it."""
+    parts = []
+    if holder.get("host"):
+        parts.append("hôte %s" % holder["host"])
+    if holder.get("execution"):
+        parts.append("exécution %s" % holder["execution"])
+    if holder.get("tag"):
+        parts.append("version %s (%s)" % (holder.get("version"), holder["tag"]))
+    elif holder.get("sha"):
+        parts.append("commit %s" % str(holder["sha"])[:12])
+    if holder.get("state"):
+        parts.append("état %s" % holder["state"])
+    if holder.get("blocked_reason"):
+        parts.append("bloqué : %s" % holder["blocked_reason"])
+    if holder.get("active") is False:
+        parts.append("activité non prouvée")
+    if holder.get("expires_at"):
+        parts.append("bail jusqu'à %s" % holder["expires_at"])
+    return ", ".join(parts) or "détenteur inconnu"
+
+
+def staging_holders_text(holders: list[dict]) -> str:
+    return " ; ".join(staging_holder_text(holder) for holder in holders) \
+        or "détenteur inconnu"
+
+
+def _staging_busy_text(project: ProjectRelease, db, text: str) -> str:
+    """Name the staging door's holder in a busy refusal (#6520)."""
+    try:
+        holders = staging_holders(project, db)
+    except Exception:  # noqa: BLE001 - a diagnostic read never masks the refusal
+        holders = []
+    if holders:
+        return "%s (détenteur : %s)" % (text, staging_holders_text(holders))
+    return text
+
+
 def maybe_staging(project: ProjectRelease, release_sha: str, included: list[int],
                   state_dir: str, db=None) -> dict:
     attestation = read_attestation(release_sha, db)
@@ -3291,10 +3507,12 @@ def finish(cfg, db, project: ProjectRelease, report: dict, state: dict,
            plan: Plan | None, staging: dict | None, no_staging: bool) -> dict:
     """Write the durable report, mail the owner, record the cutoff."""
     result = report.get("result")
+    queued = bool(staging and staging.get("queued"))
     # #4219 : a skipped staging is not a successful one. A release is tagged
     # AND deployed to staging (canon §11 bis), and not deployed is not done
     # (§5): `--no-staging` is written down and the report goes out urgent.
     report["staging_ok"] = bool(staging and staging.get("exit") == 0)
+    report["staging_pending"] = queued
     if no_staging:
         report["staging_skipped"] = "--no-staging"
     report["completed_at"] = time.time()
@@ -3302,10 +3520,47 @@ def finish(cfg, db, project: ProjectRelease, report: dict, state: dict,
         report["duration_s"] = round(report["completed_at"] - report["started_at"], 1)
     path = write_report(cfg, project, report)
     report["report_path"] = path
+    if queued:
+        # #6520: the tag is durable, the elected executor owns the sequence.
+        # The cutoff is not recorded as finished until the attestation lands,
+        # so the next tick reconciles it; the info is mailed once per request.
+        request = str(staging.get("request") or "")
+        informed = (state_slot.get("staging_queued_request") == request
+                    and state_slot.get("staging_queued_cutoff") == at)
+        state_slot["staging_queued_request"] = request
+        state_slot["staging_queued_cutoff"] = at
+        state_slot["last_label"] = label
+        state_slot["last_result"] = result
+        state_slot.pop("last_error", None)
+        state_slot["last_release"] = {"version": report.get("version", ""),
+                                      "tag": report.get("tag", ""),
+                                      "sha": report.get("release_sha", ""),
+                                      "at": time.time()}
+        state_slot["last_staging"] = {key: staging.get(key) for key in
+                                      ("exit", "duration_s", "log", "skipped")}
+        state_slot["last_staging"].update(queued=True, request=request)
+        save_state(cfg, state)
+        if db is not None and not informed:
+            body = _report_body(project, plan, result=result,
+                                version=report.get("version", "?"),
+                                tag=report.get("tag", "?"),
+                                release_sha=report.get("release_sha", "?"),
+                                staging=staging, deviations=report.get("deviations") or [],
+                                previous=previous, cutoff_at=at, cutoff_label=label,
+                                rules=rules, landing_sha=report.get("landing_sha", ""))
+            body += ("\n\nCoupure %s faite : tag %s sur %s ; staging en cours, "
+                     "rien à corriger et aucun second tag ne sera posé."
+                     % (report.get("version", "?"), report.get("tag", "?"),
+                        str(report.get("release_sha") or "?")[:12]))
+            body += "\n\nRapport JSON: %s" % path
+            send_report(cfg, db, project, body, report, urgent=False)
+        return report
     state_slot["last_cutoff"] = at
     state_slot["last_label"] = label
     state_slot["last_result"] = result
     state_slot.pop("last_error", None)
+    state_slot.pop("staging_queued_request", None)
+    state_slot.pop("staging_queued_cutoff", None)
     state_slot["last_release"] = {"version": report.get("version", ""),
                                   "tag": report.get("tag", ""),
                                   "sha": report.get("release_sha", ""),

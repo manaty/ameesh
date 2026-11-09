@@ -2679,9 +2679,27 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     if item.get("branch_head_ts"):
                         vu += " le %s" % _fmt_moment(item["branch_head_ts"])
                     avance = " (%s — vérifier à la forge)" % vu
-                print("branch   : %s → %s%s" % (
-                    item["branch"], item.get("branch_target") or "repository default target",
-                    avance))
+                # #6525 : sans cible explicite, la cible effective est celle
+                # du projet (la même résolution que le gel), pas `origin/HEAD`.
+                try:
+                    from . import intake_neighbors, lot_class
+                    project_target = lot_class.project_target(
+                        cfg, item.get("app") or "")
+                    checkout = (getattr(args, "git_dir", None)
+                                or intake_neighbors.resolve_clone(
+                                    cfg, item.get("app") or ""))
+                    warning = lot_class.target_warning(cfg, item, checkout)
+                except Exception:  # noqa: BLE001 - l'affichage ne casse pas le lot
+                    project_target, warning = "", ""
+                shown = item.get("branch_target") or (
+                    "%s (project target)" % project_target if project_target
+                    else "repository default target")
+                print("branch   : %s → %s%s" % (item["branch"], shown, avance))
+                # Une cible explicite qui n'est que le défaut du dépôt alors
+                # que le projet en déclare une autre est nommée ici ; le lot
+                # n'est jamais réécrit en silence.
+                if warning:
+                    print("warning  : %s" % warning)
             migration = work.migration_line(item, cfg)
             if migration:
                 print("migration: %s" % migration)
@@ -4267,8 +4285,10 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_add.add_argument("--branch", default=None,
                         help=("%s branch: its merge into the target closes the %s (L118)") % (v.noun, v.noun))
     pw_add.add_argument("--target", default=None,
-                        help="target branch (default: the repository's git config ameesh.target, "
-                             "otherwise origin/HEAD)")
+                        help=("target branch (default: the project's declared target — "
+                              "compiled release configuration, then radar, then the "
+                              "repository's single declared base — otherwise its git config "
+                              "ameesh.target, otherwise origin/HEAD)"))
     pw_add.add_argument("--priority", type=int, choices=list(work.PRIORITIES), default=None,
                         help=("1 high, 2 normal, 3 low (L130: every request from a "
                              "human becomes a %s, with its priority)") % v.noun)
@@ -4580,9 +4600,11 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                            help=("the branch to set; with --detach, the branch to detach "
                                 "(default: the %s's)") % v.noun)
     pw_branch.add_argument("--target", default=None,
-                           help=("target branch (see work add); an empty value clears "
-                                "the explicit target and the %s falls back to its "
-                                "project's or the repository's default") % v.noun)
+                           help=("target branch (see work add); without it a new branch "
+                                "inherits the project's declared target, and an existing "
+                                "explicit target is kept; an empty value clears the "
+                                "explicit target and the %s falls back to its project's "
+                                "or the repository's default") % v.noun)
     pw_branch.add_argument("--detach", action="store_true",
                            help=("remove the branch from the %s; the merge sweep no longer "
                                 "associates it implicitly (lot/<id>-…); Git is not touched") % v.noun)

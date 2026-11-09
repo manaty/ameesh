@@ -392,7 +392,7 @@ elif sys.argv[1:3] == ['role', 'status']:
 else: sys.exit(2)
 '''
 SYSTEMCTL = r'''#!/usr/bin/env python3
-import os, sys
+import os, sys, time
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
@@ -418,11 +418,25 @@ def stopped():
 if 'stop' in args:
     with (state / 'sequence.log').open('a') as f:
         f.write('stop %s\n' % name)
+    if scenario.startswith('tour-long'):
+        # #6528 : un tour en cours retient l'arrêt au-delà de la borne ; le
+        # `timeout` du script coupe ce client, le job d'arrêt reste en vol.
+        time.sleep(30)
+        sys.exit(0)
     if scenario == 'stop-error' or (scenario == 'drain-puis-stop-error' and name == 'dev9') \
             or (scenario == 'stop-error-candidat' and name == 'mesh-design'):
         sys.exit(1)
     if scenario != 'stop-unproven': (state / ('stopped-' + name)).touch()
     if scenario == 'stop-failed': (state / ('failed-' + name)).touch()
+elif 'kill' in args:
+    # #6528 : arrêt forcé. Second SIGTERM au principal : le runner sort,
+    # sauf s'il est tenace ; SIGKILL au groupe : unité failed, cgroup vide
+    # ou non (processus restant).
+    if '--signal=SIGTERM' in args and scenario == 'tour-long':
+        (state / ('stopped-' + name)).touch()
+    if '--signal=SIGKILL' in args and scenario in ('tour-long-tenace', 'tour-long-reste'):
+        (state / ('stopped-' + name)).touch()
+        (state / ('failed-' + name)).touch()
 elif 'reset-failed' in args:
     if scenario == 'reset-error': sys.exit(1)
     if scenario != 'reset-no-effect':
@@ -443,6 +457,15 @@ elif 'show' in args:
             print('masked')
         else:
             print('disabled' if (state / ('disabled-' + name)).exists() else 'enabled')
+    elif 'ControlGroup' in args:
+        # #6528 : un processus restant est simulé par le cgroup réel du banc
+        # (non vide : ce processus y vit) ; sinon le cgroup a disparu.
+        if scenario in ('stop-failed', 'tour-long-reste'):
+            lignes = [l for l in Path('/proc/self/cgroup').read_text().splitlines()
+                      if l.startswith('0::')]
+            print(lignes[0][3:] if lignes else '/absent-6528')
+        else:
+            print('')
     elif 'ActiveState' in args:
         if (state / ('failed-' + name)).exists(): print('failed')
         else: print('inactive' if stopped() else 'active')
@@ -896,6 +919,67 @@ class AgentHostTest(unittest.TestCase):
             self.assertLess(proof, start)
             self.assertLess(pid, start)
             self.assertIn(name + ' : redémarré', p.stdout)
+
+    def _arret_borne(self, scenario):
+        """#6528 : bornes courtes ; le faux `sleep` rend la main tout de suite."""
+        self.env.update(ARRET_BORNE='1', ARRET_FORCE_BORNE='2', ARRET_SONDE='1')
+        debut = time.monotonic()
+        p = self.run_vm(scenario=scenario)
+        return p, time.monotonic() - debut
+
+    def test_long_turn_is_force_stopped_after_the_bound(self):
+        """#6528 : un tour plus long que ARRET_BORNE ne retient plus la coupure
+        35 min : second SIGTERM au principal (tour arrêté, consigne remise en
+        attente), arrêt prouvé, démarrage — sans SIGKILL."""
+        p, duree = self._arret_borne('tour-long')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertLess(duree, 25)  # le faux `stop` bloquerait 30 s par unité
+        log = self.units()
+        for name in ('dev8', 'dev9'):
+            unite = 'ameesh-runner-agent@%s.service' % name
+            self.assertIn('--user kill --kill-who=main --signal=SIGTERM ' + unite, log)
+            self.assertNotIn('--user kill --kill-who=all --signal=SIGKILL ' + unite, log)
+            self.assertIn('--user start ' + unite, log)
+            self.assertIn(name + ' : redémarré', p.stdout)
+        self.assertIn('tour encore en cours après 1 s — arrêt forcé', p.stderr)
+
+    def test_sigkill_with_empty_cgroup_is_a_proven_stop(self):
+        """#6528 : SIGKILL laisse l'unité failed ; sans processus restant,
+        c'est un arrêt prouvé (échec effacé avant le démarrage), pas un échec
+        d'hôte."""
+        p, _ = self._arret_borne('tour-long-tenace')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        log = self.units().splitlines()
+        unite = 'ameesh-runner-agent@dev9.service'
+        kill = log.index('--user kill --kill-who=all --signal=SIGKILL ' + unite)
+        reset = log.index('--user reset-failed ' + unite, kill)
+        self.assertLess(reset, log.index('--user start ' + unite))
+        self.assertIn('aucun processus restant — arrêt prouvé', p.stdout)
+        self.assertNotIn('arrêt non prouvé', p.stderr)
+
+    def test_sigkill_with_remaining_process_is_not_proven(self):
+        """#6528 : un processus resté dans le cgroup n'est jamais un point sûr."""
+        p, _ = self._arret_borne('tour-long-reste')
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertEqual(self.starts(), [])
+        self.assertIn('processus restant dans le cgroup', p.stderr)
+
+    def test_unit_that_never_stops_fails_within_the_bound(self):
+        """#6528 : unité figée même après SIGKILL : échec, durée bornée."""
+        p, duree = self._arret_borne('tour-long-fige')
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertLess(duree, 25)
+        self.assertEqual(self.starts(), [])
+        self.assertIn('encore active après SIGKILL', p.stderr)
+
+    def test_stop_bounds_are_validated(self):
+        for nom in ('ARRET_BORNE', 'ARRET_BUDGET', 'ARRET_FORCE_BORNE', 'ARRET_SONDE'):
+            with self.subTest(nom=nom):
+                env = dict(self.env, **{nom: 'x'})
+                p = subprocess.run(['bash', str(SCRIPT), 'agents', 'redemarrer'], env=env,
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(p.returncode, 2)
+                self.assertIn(nom + ' invalide', p.stderr)
 
     def test_preexisting_failure_does_not_bypass_stop_proof(self):
         unit = 'ameesh-runner-agent@dev8.service'

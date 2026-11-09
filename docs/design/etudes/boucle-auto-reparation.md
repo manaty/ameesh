@@ -251,6 +251,23 @@ Les lots distincts restent liés explicitement. Distinguer récidive d'un même
 symptôme, nouvelle cause et observation d'une ancienne version encore active.
 Pas de réécriture massive des sources historiques ni de suppression d'index.
 
+**Couverture réelle des raccords A3 au commit examiné (`aa300b26`, 09/11/2026).**
+`fingerprints.observe_cause` accepte deux entrées optionnelles dont dépendent
+les branches « alias ancien » et « ancien SHA » : `legacy_key` (une clé
+d'empreinte historique, convertie en alias `empreinte:<projet>:<clé>`) et
+`is_ancestor` (le prédicat d'ascendance stricte d'A4). Au balayage U6 de ce
+commit, `repair_observation.scan` ne produit aucun `fingerprint_key` pour
+`alerts` ni `github_watch`, et `ingest` ne fournit pas de prédicat : les deux
+branches ne sont donc exercées que par injection directe dans les tests.
+Leur absence reste conservatrice et n'attribue jamais une cause inconnue :
+`cause_id` ne vient que des discriminateurs exacts d'U3 (identité vide →
+relation `unknown`), et une récidive d'une cause exacte sans preuve de version
+reste `same_cause_version_unknown`, jamais `old_version` ; le reçu conserve le
+verdict A4 et sa raison. Un `fingerprint_key` invalide est isolé par signal
+depuis `aa300b26` : la page U5 est soldée avant l'observation, et l'échec d'un
+reçu n'interrompt ni les autres signaux ni le curseur. Le producteur d'alias
+est suivi par #6485, l'injection du prédicat par #6486.
+
 **Coût/risque/classe.** 5 h. Risques : deux causes fusionnées ou une rafale
 de récidives. Outil léger pour `fingerprints.py`, sensible pour son stockage ;
 classe finale **sensible** (§1 verrous/unicité), même si le diff Python seul

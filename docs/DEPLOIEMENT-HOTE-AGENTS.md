@@ -65,15 +65,23 @@ deploy/mise-a-jour/vm.sh agents controler
 ```
 
 Le redémarrage ferme l’admission de chaque unité par `stop` (SIGTERM) avant
-de la démarrer : le tour en cours draine, borné par `TimeoutStopSec` (35 min),
-et le démarrage n’a lieu qu’après preuve du point sûr (`ActiveState=inactive`
-et `MainPID=0`). Aucune fenêtre « idle » n’est attendue : une persona en tour
-ne bloque plus la mise à jour.
+de la démarrer : le tour en cours draine, et le démarrage n’a lieu qu’après
+preuve du point sûr (aucun processus, `MainPID=0`). Aucune fenêtre « idle »
+n’est attendue : une persona en tour ne bloque plus la mise à jour.
+
+L’attente d’un tour est bornée (#6528) : `ARRET_BORNE` (300 s) par unité,
+`ARRET_BUDGET` (900 s) pour toute l’étape, et non plus `TimeoutStopSec`
+(35 min). Passé la borne, l’arrêt est forcé : second SIGTERM au processus
+principal (le runner arrête son tour et remet sa consigne en attente), puis,
+`ARRET_FORCE_BORNE` (60 s) plus tard, SIGKILL au groupe de l’unité. L’état est
+relu toutes les `ARRET_SONDE` (2 s).
 
 Si l’unité est déjà en échec avant l’arrêt, `reset-failed` efface cet échec
-antérieur avant `stop`. Un échec de cette remise à zéro ou du drainage, un
-état final différent de `inactive` ou un `MainPID` non nul interdit toujours
-le démarrage. Un nouvel échec pendant l’arrêt n’est jamais effacé.
+antérieur avant `stop`. Après l’arrêt, `inactive` prouve le point sûr ; `failed`
+(SIGKILL, délai d’arrêt) aussi quand le cgroup de l’unité est vide : l’échec
+est alors effacé, et le démarrage n’a lieu que si l’unité redevient `inactive`.
+Un échec de la remise à zéro, un processus restant dans le cgroup, une unité
+encore active après SIGKILL ou un `MainPID` non nul interdit le démarrage.
 
 Quand `DRAIN_ATTENTE` est supérieur à 0 (0 par défaut : désactivé), c’est un
 interrupteur, pas un délai : seul l’agent courant, en tour ou au repos
@@ -81,8 +89,8 @@ interrupteur, pas un délai : seul l’agent courant, en tour ou au repos
 juste avant son arrêt prouvé. La pause est levée après son démarrage contrôlé.
 Aucun agent suivant n’est mis en pause par anticipation (K = 0, #4000) : au
 plus un drain du script existe à la fois, y compris pour les rôles élus.
-Le SIGTERM laisse finir le tour courant, borné par `TimeoutStopSec` ; chaque
-arrêt journalise sa durée. Si une pause reste suivie, le balayage s’arrête
+Le SIGTERM laisse finir le tour courant, dans la borne d’arrêt ci-dessus ;
+chaque arrêt journalise sa durée. Si une pause reste suivie, le balayage s’arrête
 avant de toucher l’agent suivant. La sortie réessaie la levée conditionnelle,
 même après un échec d’arrêt, de démarrage ou de SSH, et rapporte les
 `DRAINS_NON_LEVES` si le lien reste indisponible.
