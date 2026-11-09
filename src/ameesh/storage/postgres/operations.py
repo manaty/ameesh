@@ -330,44 +330,51 @@ class Operations(interface.Operations):
             fence = ("verrou.lease_owner = %s AND verrou.lease_epoch = %s"
                      " AND verrou.lease_expires_at > clock_timestamp()")
             params = (name, owner, int(epoch if epoch is not None else -1))
-        rows = self.db.query(
-            """
-            WITH verrou AS (
-                SELECT name, lease_owner, lease_epoch, lease_expires_at, session_id,
-                       restart_brief, restart_requested_at
-                  FROM agent_registry WHERE name = %s FOR UPDATE
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                WITH verrou AS (
+                    SELECT name, lease_owner, lease_epoch, lease_expires_at, session_id,
+                           restart_brief, restart_requested_at
+                      FROM agent_registry WHERE name = %s FOR UPDATE
+                )
+                UPDATE agent_registry AS r
+                   SET session_id = NULL,
+                       session_work_item = NULL,
+                       -- L165 (EP3) : le brief de relève décrivait l'ancienne
+                       -- session ; il part avec elle.
+                       election_brief = NULL,
+                       session_reset_at = clock_timestamp(),
+                       -- le brief EN TÊTE, puis la consigne courante d'un tour qui
+                       -- n'a pas abouti (bail expiré ou rendu), puis l'attente :
+                       -- current_prompt est récupéré ici et effacé, sinon le claim
+                       -- d'un remplaçant le remettrait DEVANT le brief (revue L26)
+                       pending_prompt = concat_ws(E'\\n\\n', verrou.restart_brief,
+                                                  r.current_prompt, r.pending_prompt),
+                       current_prompt = NULL,
+                       status = CASE WHEN r.status = 'stopped' THEN r.status ELSE 'queued' END,
+                       status_text = 'restart: fresh session from brief',
+                       restart_brief = NULL,
+                       restart_requested_at = NULL,
+                       updated_at = now()
+                  FROM verrou
+                 WHERE r.name = verrou.name
+                   AND verrou.restart_requested_at IS NOT NULL
+                   AND verrou.restart_brief IS NOT NULL
+                   AND """ + fence + """
+                RETURNING r.name, verrou.session_id AS forgotten_session,
+                          verrou.restart_brief AS brief,
+                          extract(epoch from r.session_reset_at)::float8 AS session_reset_ts
+                """,
+                params,
             )
-            UPDATE agent_registry AS r
-               SET session_id = NULL,
-                   session_work_item = NULL,
-                   -- L165 (EP3) : le brief de relève décrivait l'ancienne
-                   -- session ; il part avec elle.
-                   election_brief = NULL,
-                   session_reset_at = clock_timestamp(),
-                   -- le brief EN TÊTE, puis la consigne courante d'un tour qui
-                   -- n'a pas abouti (bail expiré ou rendu), puis l'attente :
-                   -- current_prompt est récupéré ici et effacé, sinon le claim
-                   -- d'un remplaçant le remettrait DEVANT le brief (revue L26)
-                   pending_prompt = concat_ws(E'\\n\\n', verrou.restart_brief,
-                                              r.current_prompt, r.pending_prompt),
-                   current_prompt = NULL,
-                   status = CASE WHEN r.status = 'stopped' THEN r.status ELSE 'queued' END,
-                   status_text = 'restart: fresh session from brief',
-                   restart_brief = NULL,
-                   restart_requested_at = NULL,
-                   updated_at = now()
-              FROM verrou
-             WHERE r.name = verrou.name
-               AND verrou.restart_requested_at IS NOT NULL
-               AND verrou.restart_brief IS NOT NULL
-               AND """ + fence + """
-            RETURNING r.name, verrou.session_id AS forgotten_session,
-                      verrou.restart_brief AS brief,
-                      extract(epoch from r.session_reset_at)::float8 AS session_reset_ts
-            """,
-            params,
-        )
-        return rows[0] if rows else None
+            if rows:
+                # #6403 : même transaction et verrou du registre ; execute évite
+                # les CTE modificatrices nichées par le pilote psql.
+                tx.execute(
+                    "UPDATE agent_lot_sessions SET session_id = NULL, parked_at = NULL"
+                    " WHERE agent = %s", (name,))
+            return rows[0] if rows else None
 
     # -- adoption et reprise (L39, 0030) --------------------------------------
     @track_change("adopt")
