@@ -486,6 +486,52 @@ _OLD_RESTORE_PROMPT = """
 """
 
 
+#: `Handoffs.switch` de la version N-1 (`d92f3465e`), copiée telle quelle.
+_OLD_HANDOFF_SWITCH = """
+    UPDATE agent_registry SET host=%s,cwd=%s,lease_owner=NULL,lease_expires_at=NULL,
+     lease_epoch=lease_epoch+1,session_id=NULL,session_account=NULL,session_work_item=NULL,
+     session_reset_at=clock_timestamp(),placement_ok=NULL,placement_profile=NULL,
+     pending_prompt=concat_ws(E'\\n\\n',%s::text,pending_prompt),
+     status='queued',status_text='host handoff',updated_at=now() WHERE name=%s
+"""
+
+#: `Operations.resume` de la version N-1 (`d92f3465e`), copiée telle quelle.
+_OLD_RESUME = """
+    WITH verrou AS (
+        SELECT name, status, session_id,
+               (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
+                AND lease_expires_at > clock_timestamp()) AS live
+          FROM agent_registry WHERE name = %s FOR UPDATE
+    ), p AS (SELECT %s::boolean AS oubli, %s::text AS consigne)
+    UPDATE agent_registry AS r
+       SET session_id = CASE WHEN p.oubli THEN NULL ELSE r.session_id END,
+           session_work_item = CASE WHEN p.oubli THEN NULL
+                                    ELSE r.session_work_item END,
+           election_brief = CASE WHEN p.oubli THEN NULL
+                                 ELSE r.election_brief END,
+           session_reset_at = CASE WHEN p.oubli THEN clock_timestamp()
+                                   ELSE r.session_reset_at END,
+           pending_prompt = CASE
+               WHEN verrou.live THEN concat_ws(E'\\n\\n', r.pending_prompt,
+                                               p.consigne)
+               ELSE concat_ws(E'\\n\\n', p.consigne, r.current_prompt,
+                              r.pending_prompt) END,
+           current_prompt = CASE WHEN verrou.live THEN r.current_prompt
+                                 ELSE NULL END,
+           restart_brief = CASE WHEN verrou.live THEN r.restart_brief ELSE NULL END,
+           restart_requested_at = CASE WHEN verrou.live THEN r.restart_requested_at
+                                       ELSE NULL END,
+           status = 'queued',
+           status_text = %s::text,
+           last_seen = now(),
+           updated_at = now()
+      FROM verrou, p
+     WHERE r.name = verrou.name
+       AND (NOT verrou.live
+            OR (NOT p.oubli AND verrou.status NOT IN ('running', 'stopped')))
+"""
+
+
 class PreviousWriterOccurrenceTest(PgTestCase):
     """N-1 (#204724) : l'invariant d'occurrence tient sur les écritures de la
     version précédente, qui ignorent les deux colonnes."""
@@ -514,6 +560,19 @@ class PreviousWriterOccurrenceTest(PgTestCase):
     def old_restore(self):
         self.previous_write(_OLD_RESTORE_PROMPT,
                             (self.agent, "runner", self.epoch),
+                            added=self.ADDED)
+        return registry.get(self.db, self.agent)
+
+    def old_handoff(self, brief):
+        self.previous_write(_OLD_HANDOFF_SWITCH,
+                            ("target", "work", brief, self.agent),
+                            added=self.ADDED)
+        return registry.get(self.db, self.agent)
+
+    def old_resume(self, prompt):
+        self.previous_write(_OLD_RESUME,
+                            (self.agent, False, prompt,
+                             "resumed by operator"),
                             added=self.ADDED)
         return registry.get(self.db, self.agent)
 
@@ -587,6 +646,66 @@ class PreviousWriterOccurrenceTest(PgTestCase):
         self.assertEqual(second["pending_prompt"], "autre consigne")
         self.assertNotEqual(str(second["pending_prompt_id"]),
                             str(first["pending_prompt_id"]))
+
+    def test_two_old_enqueues_of_the_same_text_are_two_occurrences(self):
+        """B codex1 #204850 (1) : deux `set_pending_prompt` N-1 successifs du
+        même texte, sans consommation, sont deux demandes — le déclencheur ne
+        peut pas se fier à un texte inchangé."""
+        first = self.old_enqueue("continue")
+        second = self.old_enqueue("continue")
+        self.assertEqual(second["pending_prompt"], "continue")
+        self.assertTrue(second["pending_prompt_id"])
+        self.assertNotEqual(str(second["pending_prompt_id"]),
+                            str(first["pending_prompt_id"]))
+        self.assertNotEqual(
+            repair_retry.runner_retry_key(PROJECT, self.agent, "continue",
+                                          first["pending_prompt_id"]),
+            repair_retry.runner_retry_key(PROJECT, self.agent, "continue",
+                                          second["pending_prompt_id"]))
+
+    def test_an_old_replacement_that_ends_like_the_pending_is_new(self):
+        """B codex1 #204850 (2) : « ne pas continue » se termine par l'attente
+        existante ; ce suffixe ne prouve rien, c'est une demande indépendante."""
+        first = self.old_enqueue("continue")
+        replaced = self.old_enqueue("ne pas continue")
+        self.assertEqual(replaced["pending_prompt"], "ne pas continue")
+        self.assertTrue(replaced["pending_prompt_id"])
+        self.assertNotEqual(str(replaced["pending_prompt_id"]),
+                            str(first["pending_prompt_id"]))
+        self.assertNotEqual(
+            repair_retry.runner_retry_key(PROJECT, self.agent, "continue",
+                                          first["pending_prompt_id"]),
+            repair_retry.runner_retry_key(PROJECT, self.agent,
+                                          "ne pas continue",
+                                          replaced["pending_prompt_id"]))
+
+    def test_an_old_handoff_brief_keeps_the_occurrence(self):
+        """N-1 (#204850) : le brief de relève s'ajoute à l'attente ; l'hôte,
+        le bail et la session déplacés disent la reprise, pas une demande
+        neuve — l'identité se garde sans lire le texte."""
+        first = self.old_enqueue("continue")["pending_prompt_id"]
+        moved = self.old_handoff("now on target")
+        self.assertEqual(moved["pending_prompt"], "now on target\n\ncontinue")
+        self.assertEqual(str(moved["pending_prompt_id"]), str(first))
+
+    def test_an_old_resume_under_a_live_lease_opens_a_new_demand(self):
+        """N-1 (#204850) : `resume` sous bail vivant ajoute une consigne à la
+        file — c'est une demande neuve, comme le nouveau code."""
+        first = self.old_enqueue("continue")["pending_prompt_id"]
+        resumed = self.old_resume("suite")
+        self.assertEqual(resumed["pending_prompt"], "continue\n\nsuite")
+        self.assertNotEqual(str(resumed["pending_prompt_id"]), str(first))
+
+    def test_an_old_resume_outside_a_lease_keeps_the_reprise(self):
+        """N-1 (#204850) : hors bail, la consigne reçue rejoint la demande
+        reprise ; celle-ci garde son occurrence."""
+        first = self.old_enqueue("continue")["pending_prompt_id"]
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = "
+                        "clock_timestamp() - interval '1 minute' WHERE name = %s",
+                        (self.agent,))
+        resumed = self.old_resume("suite")
+        self.assertEqual(resumed["pending_prompt"], "suite\n\ncontinue")
+        self.assertEqual(str(resumed["pending_prompt_id"]), str(first))
 
 
 class RunnerRetryJournalStorageTest(PgTestCase):

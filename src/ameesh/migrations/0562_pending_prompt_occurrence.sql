@@ -16,18 +16,17 @@
 -- n'est modifiée, hormis l'attribution d'une occurrence aux consignes déjà en
 -- attente (une occurrence, jamais un rejeu).
 --
--- N-1 (#204724) : les exécuteurs restés sur la version précédente écrivent
--- `pending_prompt` / `current_prompt` sans connaître les deux colonnes. Le
--- déclencheur ci-dessous maintient l'invariant pendant la vague — une
--- consigne en attente ou un tour courant a toujours son occurrence — et
+-- N-1 (#204724, #204850) : les exécuteurs restés sur la version précédente
+-- écrivent `pending_prompt` / `current_prompt` sans connaître les deux
+-- colonnes. Le déclencheur ci-dessous maintient l'invariant pendant la vague
+-- — une consigne en attente ou un tour courant a toujours son occurrence — et
 -- rejoue les deux transports que l'ancien code ne fait pas : consigne
--- consommée → tour courant, tour restauré → consigne en attente. Une
--- nouvelle mise en attente de l'ancien code reçoit ainsi une occurrence
--- neuve : deux « continue » successifs ne partagent plus la même clé. Il
--- distingue l'enrichissement d'une demande (le texte reprend le tour courant
--- ou se termine par l'attente existante : l'identité se conserve) du
--- remplacement direct de l'attente (`set_pending_prompt` sur un texte
--- indépendant : demande neuve, occurrence neuve).
+-- consommée → tour courant, tour remis en attente → consigne en attente.
+-- Toute autre écriture de la file est un remplacement : une occurrence neuve,
+-- même quand le texte ne change pas (deux « continue ») ou se termine par
+-- l'ancien (« ne pas continue »). La nature remplacement / enrichissement ne
+-- se déduit jamais du texte : elle se lit dans les autres colonnes que
+-- l'écrivain déplace, ou dans les deux transports ci-dessus.
 alter table agent_registry add column if not exists pending_prompt_id uuid;
 alter table agent_registry add column if not exists current_prompt_id uuid;
 
@@ -37,47 +36,62 @@ update agent_registry set pending_prompt_id = gen_random_uuid()
 create or replace function ameesh_agent_prompt_occurrence() returns trigger
 language plpgsql as $$
 declare
-    -- le nouvel écrivain N-1 a-t-il composé le texte à partir de l'ancien ?
-    enriched boolean := false;
+    -- Un écrivain N-1 qui compose une consigne à partir de l'existante
+    -- (déplacement, relève, redémarrage, adoption) déplace aussi une autre
+    -- pièce durable de la ligne : hôte, bail, session, brief. `resume` est le
+    -- seul à ne changer que le texte de statut, et `set_pending_prompt` seul
+    -- n'écrit que la file (`pending_prompt`, `status`, `updated_at`).
+    autre_etat boolean := false;
 begin
     if tg_op = 'UPDATE' then
-        -- Un écrivain N-1 qui enrichit une demande (restore, R5, brief de
-        -- relève, adoption, reprise) compose le nouveau texte À PARTIR de
-        -- l'ancien : il reprend le tour courant, ou se termine par l'attente
-        -- déjà posée. Un simple remplacement (`set_pending_prompt`) pose un
-        -- texte indépendant, même quand une attente existait.
-        if new.pending_prompt is not null
-           and new.pending_prompt is distinct from old.pending_prompt then
-            if new.current_prompt is null and old.current_prompt is not null
-               and strpos(new.pending_prompt, old.current_prompt) > 0 then
-                enriched := true;
-            elsif old.current_prompt is null and old.pending_prompt is not null
-                  and right(new.pending_prompt, length(old.pending_prompt))
-                      = old.pending_prompt then
-                enriched := true;
-            end if;
-        end if;
         -- N-1 `take_pending_prompt` : la consigne consommée passe du registre
         -- au tour courant sans écrire l'identité ; elle suit le texte.
-        if new.pending_prompt is null and old.pending_prompt is not null
+        if old.pending_prompt is not null and new.pending_prompt is null
            and new.current_prompt is not null
            and new.current_prompt_id is not distinct from old.current_prompt_id then
             new.current_prompt_id := old.pending_prompt_id;
         end if;
-        -- Enrichissement : le tour inachevé repart en attente, éventuellement
-        -- joint à une consigne déjà posée, et garde son identité.
-        if enriched and new.current_prompt is null and old.current_prompt is not null
-           and new.pending_prompt_id is not distinct from old.pending_prompt_id then
-            new.pending_prompt_id := old.current_prompt_id;
-        end if;
-        -- N-1 `set_pending_prompt` : la consigne remplace l'attente sans en
-        -- dériver ; c'est une demande neuve, elle ouvre son occurrence (sans
-        -- quoi deux demandes distinctes partageraient la clé du journal).
-        if not enriched
-           and new.pending_prompt is not null and old.pending_prompt is not null
+        -- N-1 remise en attente du tour inachevé (restore, R5, redémarrage,
+        -- adoption, reprise hors bail) : `current_prompt` est effacé et son
+        -- texte revient en attente, joint ou non à une consigne déjà posée.
+        -- L'identité du tour revient avec lui.
+        if old.current_prompt is not null and new.current_prompt is null
+           and new.pending_prompt is not null
            and new.pending_prompt is distinct from old.pending_prompt
            and new.pending_prompt_id is not distinct from old.pending_prompt_id then
-            new.pending_prompt_id := gen_random_uuid();
+            new.pending_prompt_id := coalesce(old.current_prompt_id,
+                                              old.pending_prompt_id);
+        end if;
+        -- N-1 écriture de la file : le déclencheur ne se déclenche que si
+        -- l'instruction nomme `pending_prompt` ou `current_prompt` (colonne
+        -- `update of`). Un remplacement sans changement visible est donc un
+        -- vrai remplacement, pas un autre écrivain qui aurait laissé la file
+        -- telle quelle.
+        if new.pending_prompt is not null
+           and new.current_prompt is not distinct from old.current_prompt
+           and new.pending_prompt_id is not distinct from old.pending_prompt_id then
+            autre_etat := new.host is distinct from old.host
+                or new.lease_epoch is distinct from old.lease_epoch
+                or new.session_reset_at is distinct from old.session_reset_at
+                or new.restart_brief is distinct from old.restart_brief;
+            if autre_etat then
+                -- Déplacement, relève, redémarrage ou adoption : la consigne
+                -- reprise reste la même demande.
+                null;
+            elsif new.status_text is distinct from old.status_text then
+                -- `resume` : une consigne reçue sous bail vivant est une
+                -- demande neuve (même contrat que le nouveau code) ; hors
+                -- bail, elle rejoint la demande reprise.
+                if new.pending_prompt is distinct from old.pending_prompt
+                   and old.lease_owner is not null
+                   and old.lease_expires_at > clock_timestamp() then
+                    new.pending_prompt_id := gen_random_uuid();
+                end if;
+            else
+                -- `set_pending_prompt` : remplacement de l'attente, demande
+                -- neuve, même à texte identique.
+                new.pending_prompt_id := gen_random_uuid();
+            end if;
         end if;
     end if;
     -- une demande en attente a toujours une occurrence (écrivain N-1)
@@ -106,5 +120,5 @@ $$;
 -- ameesh: trigger compatible with previous code
 drop trigger if exists agent_registry_prompt_occurrence on agent_registry;
 create trigger agent_registry_prompt_occurrence
-    before insert or update on agent_registry
+    before insert or update of pending_prompt, current_prompt on agent_registry
     for each row execute function ameesh_agent_prompt_occurrence();
