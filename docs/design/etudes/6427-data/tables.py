@@ -11,7 +11,8 @@ growth per step g = (C_peak - C0) / steps.  A cap closes the turn when the
 context reaches it; the k = (C_peak - cap) / g remaining steps then run in a
 fresh session started at C0, each rereading (cap - C0) tokens less:
 saved = k * (cap - C0).  The resume summary is not counted.
-A fresh first turn is session_seq == 1 and R_session_base == 0.
+A fresh first turn is session_seq == 1 and R_session_base == 0; a missing
+R_session_base is unknown, not 0: such a turn is not counted as fresh.
 """
 import json
 import statistics as st
@@ -30,7 +31,7 @@ def quality(row, key):
 
 
 def fresh(row):
-    return row["session_seq"] == 1 and (value(row, "R_session_base") or 0) == 0
+    return row["session_seq"] == 1 and value(row, "R_session_base") == 0
 
 
 def steps(row):
@@ -45,7 +46,10 @@ def main(path):
     rows = [json.loads(line) for line in open(path) if line.strip()]
     turns = [r for r in rows if value(r, "C_peak") and value(r, "R_turn")]
     first = [r for r in turns if fresh(r)]
-    print("turns %d, fresh first turns %d" % (len(turns), len(first)))
+    unknown = sum(r["session_seq"] == 1 and value(r, "R_session_base") is None
+                  for r in turns)
+    print("turns %d, fresh first turns %d, seq 1 without R_session_base %d" % (
+        len(turns), len(first), unknown))
 
     print("\n1. fresh first turns, C_peak >= 300k")
     for r in sorted((r for r in first if value(r, "C_peak") >= 300000),
@@ -77,7 +81,7 @@ def main(path):
     big = [r for r in turns if value(r, "C_peak") >= 300000]
     print(">=300k: %d turns, %d fresh first, %d seq 1 started before the window, %d later" % (
         len(big), sum(fresh(r) for r in big),
-        sum(r["session_seq"] == 1 and not fresh(r) for r in big),
+        sum(r["session_seq"] == 1 and (value(r, "R_session_base") or 0) > 0 for r in big),
         sum(r["session_seq"] > 1 for r in big)))
     total = sum(value(r, "R_turn") for r in turns)
     print("reread total %.0fM" % (total / 1e6))

@@ -5,6 +5,8 @@ description: "manaty/ameesh#4955 (lot #6427): 24 h of the deepseek context corpu
 status: draft
 tags: [deepseek, contexte, rotation, plafond, mesure]
 generated: { by: "mty-amh-impl-18/claude-opus-5-5", at: "2026-11-09T01:19:20Z" }
+# first draft; the Decisions section (#202540) was added at 01:36:13Z (c68b32177)
+updated: { by: "mty-amh-impl-12/claude-opus-5-5", at: "2026-11-09T07:22:00Z" }
 sources:
   - { resource: "../../../src/ameesh/runner.py", title: "turn_close_due, _turn_closed (L105, CTX-04a)" }
   - { resource: "../../../src/ameesh/adapters.py", title: "context_tokens vs reread_tokens (#2336)" }
@@ -20,7 +22,9 @@ out of 319 at ≥300 k tokens of context, some on the first turn of a fresh
 session (event 593263, deepseek2, 386 k; event 581750, mty-amh-impl-04,
 357 k, lot #6186). #6403 (resume refused above the threshold) does not cover
 this case. Working hypothesis: untruncated tool outputs. This study measures
-before any fix.
+before any fix. Its window (24 h up to 2026-11-09T01:17Z) is not the one of
+the night analysis (48 of 319 turns at ≥300 k), so section 4 counts 61 of
+326; the two named events are in both.
 
 # Method
 
@@ -122,7 +126,8 @@ started at `C0` and each reread `cap − C0` tokens less, so
    `turn_close_due` closes a deepseek turn at 250 k and leaves a Claude turn
    alone; the forced rotation follows. Estimate 2 h.
 2. **Immediate gesture, without code (pilot)** — `ameesh set <agent>
-   context_max_tokens=250k` on the deepseek agents, effective from the next
+   context_max_tokens=250k` on the ameesh deepseek agents (mty-amh-*,
+   bounded by decision 2 below), effective from the next
    turn, to measure the closures (`turn.context` kind `context_cap`) over
    24 h before choosing the default of lot 1. Reversible
    (`context_max_tokens=` to clear).
