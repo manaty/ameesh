@@ -30,6 +30,11 @@ class ValidatedWritersTest(PgTestCase):
     def current_state(self):
         return work.get(self.db, self.lot)["state"]
 
+    def pending_notes(self):
+        return self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s"
+            " AND note LIKE 'validation pending (#6257):%%'", (self.lot,))
+
     def test_inconclusive_gate_is_noted_once_and_retried_without_verdict(self):
         self.read.return_value = None
         self.mark()
@@ -226,6 +231,39 @@ class ValidatedWritersTest(PgTestCase):
         self.read.side_effect = note_during_gate
         self.mark()
         self.assertEqual(self.current_state(), "validated")
+
+    def test_refusal_note_is_not_written_after_a_concurrent_validation(self):
+        # #6466 : la porte refuse sur un instantané qa ; le lot est validé par
+        # un autre écrivain avant l'écriture de la note. Aucune trace de refus
+        # périmée ne doit rester sur un lot déjà validé.
+        def validate_during_gate(*args, **kwargs):
+            self.read.side_effect = None
+            self.read.return_value = {"ok": True}
+            work.move(self.db, self.lot, "validated")
+            self.read.return_value = {"ok": False}
+            return {"ok": False}
+        self.read.side_effect = validate_during_gate
+        self.mark()
+        self.assertEqual(self.current_state(), "validated")
+        self.assertEqual(self.pending_notes(), [])
+
+    def test_refusal_note_is_written_when_the_qa_snapshot_is_current(self):
+        # #6466 : lot resté en qa, jalons inchangés : le refus reste dû.
+        self.read.return_value = {"ok": False}
+        self.mark()
+        self.assertEqual(self.current_state(), "qa")
+        self.assertEqual(len(self.pending_notes()), 1)
+
+    def test_refusal_note_is_not_written_after_a_concurrent_freeze(self):
+        # #6466 : les jalons lus par la porte ont changé (nouveau gel) avant
+        # l'écriture ; le refus de l'ancien instantané n'est plus une preuve.
+        def freeze_during_gate(*args, **kwargs):
+            self.mark("frozen", NEXT)
+            return {"ok": False}
+        self.read.side_effect = freeze_during_gate
+        self.mark()
+        self.assertEqual(self.current_state(), "qa")
+        self.assertEqual(self.pending_notes(), [])
 
     def test_manual_validation_survives_a_concurrent_note(self):
         def note_during_gate(*args, **kwargs):
