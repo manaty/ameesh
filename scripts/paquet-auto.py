@@ -148,6 +148,18 @@ précédente et de le supprimer ; le tick la compte comme en cours. Le noyau ren
 le verrou à la mort du processus, donc le worktree d'une tentative morte reste
 nettoyable comme avant, sans expiration à deviner.
 
+#6563 : ce `flock` ne voit ni un autre clone ni un autre hôte. Une composition
+réelle (et la publication d'une tête testée, #4237) prend donc aussi le **bail
+de composition du porteur** (`merge_locks`, clé
+`packet-compose:carrier:<projet>:<n° de porteur>`), distinct du bail projet de
+#5941 pour que la paire parallèle #3256 C reste permise. Le parent n'accède pas
+à la base : un enfant `ameesh work packet hold` prend le bail, le renouvelle
+(TTL/3) et le rend quand son entrée standard se ferme, c'est-à-dire à la fin,
+à la mort ou au kill de la composition. Avant chaque geste, `require()` vérifie
+que cet enfant vit encore ; un second composeur — le tic horaire ou l'agent
+désigné par l'alerte de créneau, sur le même porteur — est refusé (code 3)
+au lieu de réécrire la tête de l'autre.
+
 Modes :
 
 * normal : composition réelle, poussée, PR, gel, ci-full, tests et courrier ;
@@ -176,6 +188,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -184,6 +197,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -217,6 +231,12 @@ PAUSED_RC = 4
 #: travail et le pilote est déjà prévenu. Ce n'est pas une panne du composeur,
 #: qui reste rc 1 et ouvre seule un lot d'empreinte §16.
 COMPOSITION_RED_RC = 5
+#: #6563 : bail de composition d'un porteur, tenu par un enfant `ameesh work
+#: packet hold` pendant toute la composition réelle. Renouvelé par l'enfant
+#: (TTL/3) ; un processus mort le laisse expirer en cinq minutes.
+CLAIM_TTL_S = 300.0
+#: #6563 : attente de la première réponse du détenteur (acquisition en base)
+CLAIM_START_TIMEOUT = 60.0
 #: #5084 : sortie du lecteur de pause (Python du projet) quand la pause est active
 PAUSE_ACTIVE_EXIT = 10
 #: #3916 : les remises (`ameesh.resolutions.REF_PREFIX`) et leur copie locale
@@ -433,6 +453,136 @@ class CompositionBusy(PaquetAutoError):
         self.host = host
         self.pid = pid
         super().__init__("composition en cours (%s)" % holder_label(host, pid))
+
+
+class CompositionClaim:
+    """#6563 : le bail de composition du porteur, tenu pendant la composition.
+
+    Le parent `paquet-auto` reste sans dépendance base : un enfant
+    `ameesh work packet hold` prend le bail (`packet_composition.Lease`, clé
+    par porteur), le renouvelle et le rend quand son entrée standard se ferme
+    — c'est-à-dire quand cette composition se termine, meurt ou est tuée avec
+    son tube. La première ligne JSON dit si le bail est pris ou tenu par un
+    autre ; `require` avant chaque geste vérifie que l'enfant vit encore, donc
+    qu'aucun second composeur n'a pris le porteur. Le TTL de cinq minutes
+    couvre la mort brutale de toute la lignée.
+    """
+
+    def __init__(self, repo: Path, carrier: int, name: str = ""):
+        self.repo = Path(repo)
+        self.carrier = int(carrier)
+        self.name = str(name or "")
+        self.owner = "paquet-auto:%s:%d:%s" % (
+            socket.gethostname(), os.getpid(), uuid.uuid4().hex[:12])
+        self.proc: subprocess.Popen | None = None
+        self.epoch = 0
+
+    def _command(self) -> list[str]:
+        return ["ameesh", "work", "packet", "hold", str(self.carrier),
+                "--owner", self.owner, "--ttl", str(CLAIM_TTL_S), "--json"]
+
+    def start(self) -> "CompositionClaim":
+        try:
+            self.proc = subprocess.Popen(
+                self._command(), cwd=str(self.repo), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError as exc:
+            raise PaquetAutoError(
+                "bail de composition du porteur #%d : `ameesh` introuvable (%s) ; "
+                "aucune composition" % (self.carrier, exc)) from exc
+        try:
+            ready, _, _ = select.select([self.proc.stdout], [], [],
+                                        CLAIM_START_TIMEOUT)
+        except (OSError, ValueError) as exc:
+            self.stop(force=True)
+            raise PaquetAutoError(
+                "bail de composition du porteur #%d illisible : %s"
+                % (self.carrier, exc)) from exc
+        if not ready:
+            self.stop(force=True)
+            raise PaquetAutoError(
+                "bail de composition du porteur #%d : aucune réponse en %d s ; "
+                "aucune composition" % (self.carrier, int(CLAIM_START_TIMEOUT)))
+        line = (self.proc.stdout.readline() or "").strip()
+        data = {}
+        if line:
+            try:
+                data = json.loads(line)
+            except ValueError:
+                data = {}
+        if not data:
+            proc, self.proc = self.proc, None
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+            try:
+                _out, error = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _out, error = proc.communicate()
+            error = (error or "").strip()
+            if proc.returncode == IN_PROGRESS_RC and "composition en cours" in error:
+                raise CompositionBusy(
+                    self.name, error.split("(", 1)[-1].rstrip(")"), 0)
+            raise PaquetAutoError(
+                "bail de composition du porteur #%d non pris (rc %s) : %s"
+                % (self.carrier, proc.returncode,
+                   _tail(error, 5) or "réponse illisible"))
+        if data.get("busy") or not data.get("epoch"):
+            owner = str(data.get("owner") or "verrou tenu")
+            self.stop(force=True)
+            raise CompositionBusy(self.name, owner, 0)
+        self.epoch = int(data.get("epoch") or 0)
+        return self
+
+    def alive(self) -> bool:
+        """L'enfant tient-il encore le bail (tube ouvert, processus vivant) ?"""
+        return self.proc is not None and self.proc.poll() is None
+
+    def require(self) -> None:
+        """Refuse un geste quand le bail n'est plus tenu par cette composition."""
+        if self.proc is None:
+            return
+        if not self.alive():
+            error = ""
+            try:
+                if self.proc.stderr is not None:
+                    error = (self.proc.stderr.read() or "").strip()
+            except (OSError, ValueError):
+                error = ""
+            raise EpochLost(
+                "bail de composition du porteur #%d perdu%s : aucun geste"
+                % (self.carrier, (" (%s)" % _tail(error, 3)) if error else ""))
+
+    def stop(self, *, force: bool = False) -> None:
+        """Ferme le tube du détenteur ; le bail est rendu par l'enfant."""
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            proc.wait(timeout=2 if force else 10)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
 
 
 class AttributionUnreadable(CompositionRed):
@@ -4880,7 +5030,15 @@ def publish_tested(args: argparse.Namespace) -> int:
     branch = package_branch(args.name)
     validate_branch(repo, branch, "--name")
     rel = manifest_rel(args.name)
-    guard = lambda: check_epoch(args.carrier, repo)  # noqa: E731
+    # #6563 : la publication d'une tête testée écrit la branche du porteur et
+    # demande sa ci-full ; elle prend le même bail de composition du porteur
+    # qu'une composition, pour qu'un second composeur ne travaille pas dessus.
+    claim = CompositionClaim(repo, args.carrier, args.name).start()
+
+    def guard() -> None:
+        claim.require()
+        check_epoch(args.carrier, repo)
+
     guard()
     fetched = git(repo, "fetch", "--no-tags", "origin", args.publish, check=False,
                   timeout=GIT_TIMEOUT)
@@ -4993,6 +5151,7 @@ def publish_tested(args: argparse.Namespace) -> int:
             remove_worktree(repo, worktree)
         elif not success:
             print("worktree conservé pour diagnostic : %s" % worktree, file=sys.stderr)
+        claim.stop()
 
 
 def compose_packet(args: argparse.Namespace) -> int:
@@ -5006,9 +5165,21 @@ def compose_packet(args: argparse.Namespace) -> int:
     branch = package_branch(args.name)
     validate_branch(repo, branch, "--name")
     rel = manifest_rel(args.name)
-    guard = (lambda: check_epoch(args.carrier, repo)) if not args.no_packet_record else None
-    if guard is not None:
-        guard()
+    # #6563 : le bail partagé du porteur vérifie, avant chaque geste, que
+    # cette composition est toujours la seule sur #carrier ; l'époque du bail
+    # du rôle (#4113) reste vérifiée par `check_epoch` pour les gestes base.
+    claim: CompositionClaim | None = None
+    base_guard = (lambda: check_epoch(args.carrier, repo)) \
+        if not args.no_packet_record else None
+
+    def guard() -> None:
+        if claim is not None:
+            claim.require()
+        if base_guard is not None:
+            base_guard()
+
+    if base_guard is not None:
+        base_guard()
     # #4329 : le verrou par nom de paquet est pris avant toute lecture d'état
     # et toute suppression de worktree. Une composition vivante du même paquet
     # le tient : on refuse au lieu de prendre son worktree pour celui d'une
@@ -5016,6 +5187,12 @@ def compose_packet(args: argparse.Namespace) -> int:
     lock = PackageLock(repo, args.name)
     lock.acquire()
     try:
+        # #6563 : le bail partagé du porteur est pris avant toute lecture ou
+        # écriture de la branche. Il couvre la composition réelle (pas les
+        # modes de contrôle) et il est renouvelé par l'enfant détenteur ; un
+        # second composeur — le tic, un agent désigné — est refusé ici (rc 3).
+        if not args.no_packet_record and not args.local:
+            claim = CompositionClaim(repo, args.carrier, args.name).start()
         base_sha = fresh_base(repo, args.target)
         print("paquet %s : base %s %s"
               % (args.name, args.target, base_sha), flush=True)
@@ -5043,6 +5220,8 @@ def compose_packet(args: argparse.Namespace) -> int:
         tmp = tempfile.TemporaryDirectory(prefix="paquet-auto-",
                                           dir=str(temporary_parent()))
     except BaseException:
+        if claim is not None:
+            claim.stop()
         lock.release()
         raise
     try:
@@ -5459,6 +5638,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                 print("worktree conservé pour diagnostic : %s" % worktree,
                       file=sys.stderr)
         finally:
+            if claim is not None:
+                claim.stop()
             lock.release()
 
 

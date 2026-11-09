@@ -584,7 +584,7 @@ concluant** (délai, base absente, psql/psycopg indisponible) est consigné à l
 PR, au porteur et au courrier, sans retirer d'unité ni arrêter le paquet :
 seul un test négatif bloque (canon §3), la ci-full tranche.
 
-Une composition tient deux verrous distincts :
+Une composition tient trois verrous distincts :
 
 * un `flock` **par nom de paquet**, sous le `.git` commun du clone (#4329) :
   une seconde composition du même paquet — le tic et un lancement manuel, par
@@ -601,7 +601,18 @@ Une composition tient deux verrous distincts :
   (`composition in progress (…)` ou `packet carrier #N already reserves …`),
   sans rien pousser. Le tic transmet son propriétaire au `work add` pour créer
   les deux porteurs d'une paire parallèle (#3256 C) ; tout autre composeur
-  reste refusé. Le bail expire seul (5 min) si son processus meurt.
+  reste refusé. Le bail expire seul (5 min) si son processus meurt ;
+* un **bail de composition par porteur** (`merge_locks`, clé
+  `packet-compose:carrier:<projet>:<n°>`, #6563), pris par `paquet-auto.py`
+  (composition réelle et publication d'une tête testée) et lu par le tic avant
+  toute reprise. Il couvre ce que le bail projet ne couvre pas : un agent
+  désigné par l'alerte de créneau qui reprend un porteur existant dans un autre
+  clone, pendant que la minuterie croit le porteur abandonné (h-17 du 09/11,
+  #6562). Le composeur refuse « composition en cours (…) » (code 3) ; le tic ne
+  relance rien, et sans tête gelée il ne réécrit pas non plus une composition
+  seulement enregistrée (`packet composition recorded`) ou une tête poussée
+  sans gel : le pilote tranche. Le bail est tenu par un enfant
+  `ameesh work packet hold` et expire seul (5 min) avec lui.
 
 Un porteur se crée donc par la même commande que le tic :
 
