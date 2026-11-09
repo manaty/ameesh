@@ -14,19 +14,24 @@ Témoins : un bail par porteur, distinct de la clé projet, est pris par
 reprise ; une composition seulement enregistrée (notes `packet composition
 recorded`) ou une tête poussée sans gel n'est jamais réécrite par le tic ;
 après publication, le tic demande la ci-full de la même tête et ne lance aucun
-second composeur.
+second composeur. Le détenteur ne se contente pas de la vie de son enfant
+(vivant après SIGSTOP, ou renouvellement bloqué) : une preuve fraîche bornée,
+propriétaire et époque relus en base, est exigée avant chaque mutation ; un
+bail expiré puis repris est refusé.
 """
 from __future__ import annotations
 
 import json
 import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 
 from ameesh import packet_composition, work
 
 from .support import PgTestCase
+from .test_3807_paquet_auto import paquet_auto
 from .test_3845_paquet_horaire import HEAD, HEAD2, NOW, Base, carrier, ph
 
 BRANCH = "integration/paquet-h-20261027-04"
@@ -197,6 +202,98 @@ class CarrierLeaseTest(PgTestCase):
             self.assertEqual(first.wait(timeout=10), 0)
         self.assertIsNone(packet_composition.holder(
             self.db, "ameesh", carrier=carrier_id))
+
+    def _carrier(self) -> int:
+        item = work.add(
+            self.db, title="Paquet horaire h-20261027-04 — composition",
+            branch=BRANCH, branch_target="main", app="ameesh",
+            source="paquet-horaire (#3845), minuterie", cfg=self.cfg)
+        return int(item["id"])
+
+    def _claim(self, carrier_id: int) -> "paquet_auto.CompositionClaim":
+        return paquet_auto.CompositionClaim(
+            self.tmp, carrier_id, "h-20261027-04",
+            cli=[sys.executable, "-m", "ameesh.main"], env=self.env())
+
+    @staticmethod
+    def _idle_child() -> subprocess.Popen:
+        """Un enfant vivant qui ne tient aucun bail (le SIGSTOP simulé)."""
+        return subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+
+    def test_claim_start_prend_et_rend_le_bail(self):
+        carrier_id = self._carrier()
+        claim = self._claim(carrier_id).start()
+        try:
+            self.assertGreater(claim.epoch, 0)
+            self.assertEqual(packet_composition.holder(
+                self.db, "ameesh", carrier=carrier_id)["owner"], claim.owner)
+            claim.require()
+        finally:
+            claim.stop()
+        self.assertIsNone(packet_composition.holder(
+            self.db, "ameesh", carrier=carrier_id))
+
+    def test_preuve_fraiche_refuse_bail_repris_malgre_enfant_vivant(self):
+        carrier_id = self._carrier()
+        claim = self._claim(carrier_id)
+        lease = packet_composition.Lease(
+            self.db, "ameesh", owner=claim.owner, ttl_s=1.0, carrier=carrier_id)
+        self.assertTrue(lease.acquire())
+        claim.epoch = lease.epoch
+        claim.proc = self._idle_child()
+        try:
+            # bail encore à nous, enfant vivant : la preuve passe
+            self.assertIsNone(claim.require())
+            # l'enfant vit toujours, mais le bail expire puis est repris
+            time.sleep(1.3)
+            other = packet_composition.Lease(
+                self.db, "ameesh", owner="autre:composeur", ttl_s=60,
+                carrier=carrier_id)
+            self.assertTrue(other.acquire())
+            with self.assertRaises(paquet_auto.EpochLost):
+                claim.require()
+            self.assertTrue(other.release())
+        finally:
+            claim.stop()
+
+    def test_preuve_bornee_refuse_timeout_malgre_enfant_vivant(self):
+        carrier_id = self._carrier()
+        claim = self._claim(carrier_id)
+        claim.epoch = 1
+        claim.proc = self._idle_child()
+        try:
+            with mock.patch.object(
+                    paquet_auto.subprocess, "run",
+                    side_effect=subprocess.TimeoutExpired("check", 30)):
+                with self.assertRaises(paquet_auto.EpochLost):
+                    claim.require()
+        finally:
+            claim.stop()
+
+    def test_check_cli_prouve_ou_refuse_le_bail(self):
+        carrier_id = self._carrier()
+        lease = packet_composition.Lease(
+            self.db, "ameesh", owner="preuve:1", ttl_s=60, carrier=carrier_id)
+        self.assertTrue(lease.acquire())
+        try:
+            ok = self.mesh("work", "packet", "check", str(carrier_id),
+                           "--json", "--owner", "preuve:1",
+                           "--epoch", str(lease.epoch))
+            self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+            data = json.loads(ok.stdout)
+            self.assertTrue(data["match"])
+            self.assertEqual(data["owner"], "preuve:1")
+            self.assertEqual(data["epoch"], lease.epoch)
+            bad = self.mesh("work", "packet", "check", str(carrier_id),
+                            "--json", "--owner", "autre:1",
+                            "--epoch", str(lease.epoch))
+            self.assertEqual(bad.returncode, 1)
+            self.assertFalse(json.loads(bad.stdout)["match"])
+        finally:
+            self.assertTrue(lease.release())
 
 
 if __name__ == "__main__":

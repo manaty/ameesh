@@ -2396,7 +2396,8 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def land_holder(self, key: str) -> dict | None:
         """#3598: the live holder of the merge lease of `key`, for a refusal
-        message: `{owner, expires_at, left_s}`, or None. A diagnostic read,
+        message: `{owner, epoch, expires_at, left_s}`, or None (#6563: the
+        epoch also proves a holder is still current). A diagnostic read,
         never a guard; server-only, like `land_lock`/`land_unlock`."""
 
     @abc.abstractmethod

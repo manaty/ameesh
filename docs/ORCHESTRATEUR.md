@@ -612,7 +612,10 @@ Une composition tient trois verrous distincts :
   relance rien, et sans tête gelée il ne réécrit pas non plus une composition
   seulement enregistrée (`packet composition recorded`) ou une tête poussée
   sans gel : le pilote tranche. Le bail est tenu par un enfant
-  `ameesh work packet hold` et expire seul (5 min) avec lui.
+  `ameesh work packet hold` et expire seul (5 min) avec lui ; avant chaque
+  geste, une preuve fraîche bornée (`ameesh work packet check`, propriétaire
+  et époque) relit la base — un enfant suspendu ou bloqué dans son
+  renouvellement ne vaut pas bail, et un bail expiré ou repris est refusé.
 
 Un porteur se crée donc par la même commande que le tic :
 

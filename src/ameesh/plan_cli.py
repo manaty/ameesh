@@ -22,6 +22,10 @@
   ameesh work packet record <porteur> [--repo R] [--base SHA] [--head REF]
                              [--expect-pushed SHA] [--dry-run]
   ameesh work packet show <lot|porteur> [--json]   (#2443 : paquet d'une unité)
+  ameesh work packet hold <porteur> [--project P] [--owner O] [--ttl S] [--json]
+                             (#6563 : tenir le bail de composition du porteur)
+  ameesh work packet check <porteur> [--project P] [--owner O] [--epoch N] [--json]
+                             (#6563 : preuve fraîche bornée de ce bail)
 
 Gardées hors de `mesh_cli` (qui les branche) pour que leurs évolutions n'y
 touchent pas. Voir `plan_github` pour les règles de GitHub (vue, jamais
@@ -100,6 +104,19 @@ def add_parsers(work_sub, func) -> None:
     p_phold.add_argument("--json", action="store_true",
                          help="print the lease as one JSON object")
     p_phold.set_defaults(func=func)
+    p_pcheck = packet_sub.add_parser(
+        "check", help="#6563: prove a carrier's composition lease is still "
+                      "held by this owner and epoch (fresh, read-only)")
+    p_pcheck.add_argument("id", type=int, metavar="CARRIER")
+    p_pcheck.add_argument("--project", default="",
+                          help="project of the lease (default: the carrier's app)")
+    p_pcheck.add_argument("--owner", default="",
+                          help="required lease owner token")
+    p_pcheck.add_argument("--epoch", type=int, default=None,
+                          help="required lease epoch")
+    p_pcheck.add_argument("--json", action="store_true",
+                          help="print the proof as one JSON object")
+    p_pcheck.set_defaults(func=func)
 
     p_close = work_sub.add_parser(
         "close", help="close an abandoned, superseded, delivered-outside-target or done work "
@@ -327,6 +344,8 @@ def run(db, args: argparse.Namespace, cfg=None) -> int:
             return _packet_record(db, args, packet_link)
         if args.packet_command == "hold":
             return _packet_hold(db, args)
+        if args.packet_command == "check":
+            return _packet_check(db, args)
         return _packet_show(db, args, packet_link)
     if command == "link":
         if args.none == bool(args.package):
@@ -634,6 +653,48 @@ def _packet_hold(db, args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001 - le TTL libère le bail
             pass
     return 1 if lost else 0
+
+
+def _packet_check(db, args: argparse.Namespace) -> int:
+    """#6563 : preuve fraîche, en lecture seule, du bail d'un porteur.
+
+    Le détenteur (`packet hold`) reste seul à renouveler ; ce geste relit la
+    base et dit si le bail est encore au propriétaire et à l'époque attendus.
+    Un enfant vivant ne prouve rien (suspendu, renouvellement bloqué) : c'est
+    ce que `CompositionClaim.require` appelle avant chaque mutation.
+    """
+    item = work.get(db, int(args.id))
+    if item is None:
+        print("error: packet carrier #%d not found" % int(args.id), file=sys.stderr)
+        return 1
+    project = str(args.project or item.get("app") or "")
+    if not project:
+        print("error: packet carrier #%d has no app; pass --project" % int(args.id),
+              file=sys.stderr)
+        return 1
+    try:
+        held = packet_composition.holder(db, project, carrier=int(args.id))
+    except Exception as exc:  # noqa: BLE001 - preuve illisible : refus
+        print("error: composition lease unreadable for #%d: %s"
+              % (int(args.id), exc), file=sys.stderr)
+        return 1
+    match = held is not None
+    if match and args.owner:
+        match = str(held.get("owner") or "") == str(args.owner)
+    if match and args.epoch is not None:
+        match = int(held.get("epoch") or 0) == int(args.epoch)
+    data = {"held": held is not None, "match": match,
+            "owner": str((held or {}).get("owner") or ""),
+            "epoch": int((held or {}).get("epoch") or 0)}
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False), flush=True)
+    elif data["held"]:
+        print("composition lease %s (%s, epoch %d)"
+              % ("proven" if match else "NOT ours", data["owner"], data["epoch"]),
+              flush=True)
+    else:
+        print("composition lease not held", flush=True)
+    return 0 if data["held"] and match else 1
 
 
 def _packet_record(db, args: argparse.Namespace, packet_link) -> int:

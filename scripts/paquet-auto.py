@@ -155,10 +155,13 @@ de composition du porteur** (`merge_locks`, clé
 #5941 pour que la paire parallèle #3256 C reste permise. Le parent n'accède pas
 à la base : un enfant `ameesh work packet hold` prend le bail, le renouvelle
 (TTL/3) et le rend quand son entrée standard se ferme, c'est-à-dire à la fin,
-à la mort ou au kill de la composition. Avant chaque geste, `require()` vérifie
-que cet enfant vit encore ; un second composeur — le tic horaire ou l'agent
-désigné par l'alerte de créneau, sur le même porteur — est refusé (code 3)
-au lieu de réécrire la tête de l'autre.
+à la mort ou au kill de la composition. Avant chaque geste, `require()` ne se
+contente pas de vérifier que cet enfant vit : il demande à la base une preuve
+fraîche et bornée (`ameesh work packet check`, propriétaire et époque), car un
+enfant suspendu ou bloqué dans son renouvellement reste vivant pendant que le
+TTL expire. Un second composeur — le tic horaire ou l'agent désigné par
+l'alerte de créneau, sur le même porteur — est refusé (code 3) au lieu de
+réécrire la tête de l'autre ; un bail expiré ou repris est refusé de même.
 
 Modes :
 
@@ -237,6 +240,10 @@ COMPOSITION_RED_RC = 5
 CLAIM_TTL_S = 300.0
 #: #6563 : attente de la première réponse du détenteur (acquisition en base)
 CLAIM_START_TIMEOUT = 60.0
+#: #6563 : borne de la preuve fraîche du bail (lecture base) avant chaque
+#: geste. Au-delà, le geste est refusé même si l'enfant détenteur vit encore :
+#: un enfant suspendu ou bloqué dans son renouvellement ne prouve pas le bail.
+CLAIM_CHECK_TIMEOUT = 30.0
 #: #5084 : sortie du lecteur de pause (Python du projet) quand la pause est active
 PAUSE_ACTIVE_EXIT = 10
 #: #3916 : les remises (`ameesh.resolutions.REF_PREFIX`) et leur copie locale
@@ -463,29 +470,47 @@ class CompositionClaim:
     par porteur), le renouvelle et le rend quand son entrée standard se ferme
     — c'est-à-dire quand cette composition se termine, meurt ou est tuée avec
     son tube. La première ligne JSON dit si le bail est pris ou tenu par un
-    autre ; `require` avant chaque geste vérifie que l'enfant vit encore, donc
-    qu'aucun second composeur n'a pris le porteur. Le TTL de cinq minutes
-    couvre la mort brutale de toute la lignée.
+    autre.
+
+    `require` avant chaque geste ne se contente pas de vérifier que l'enfant
+    vit : un enfant suspendu (SIGSTOP) ou bloqué dans un renouvellement reste
+    vivant pendant que le TTL expire et qu'un autre composeur reprend la clé
+    du porteur. Il demande donc une preuve fraîche et bornée à la base
+    (`ameesh work packet check`, propriétaire et époque attendus) ; bail
+    expiré, repris, preuve en dépassement de borne ou illisible = refus.
     """
 
-    def __init__(self, repo: Path, carrier: int, name: str = ""):
+    def __init__(self, repo: Path, carrier: int, name: str = "",
+                 cli: list[str] | None = None, env: dict | None = None):
         self.repo = Path(repo)
         self.carrier = int(carrier)
         self.name = str(name or "")
         self.owner = "paquet-auto:%s:%d:%s" % (
             socket.gethostname(), os.getpid(), uuid.uuid4().hex[:12])
+        #: #6563 : binaire `ameesh` ; les bancs peuvent passer
+        #: `[sys.executable, "-m", "ameesh.main"]`.
+        self.cli = list(cli) if cli else ["ameesh"]
+        #: #6563 : environnement des enfants (`None` : celui du parent).
+        self.env = dict(env) if env else None
         self.proc: subprocess.Popen | None = None
         self.epoch = 0
 
     def _command(self) -> list[str]:
-        return ["ameesh", "work", "packet", "hold", str(self.carrier),
-                "--owner", self.owner, "--ttl", str(CLAIM_TTL_S), "--json"]
+        return self.cli + ["work", "packet", "hold", str(self.carrier),
+                           "--owner", self.owner, "--ttl", str(CLAIM_TTL_S),
+                           "--json"]
+
+    def _check_command(self) -> list[str]:
+        return self.cli + ["work", "packet", "check", str(self.carrier),
+                           "--owner", self.owner, "--epoch", str(self.epoch),
+                           "--json"]
 
     def start(self) -> "CompositionClaim":
         try:
             self.proc = subprocess.Popen(
                 self._command(), cwd=str(self.repo), stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=self.env)
         except FileNotFoundError as exc:
             raise PaquetAutoError(
                 "bail de composition du porteur #%d : `ameesh` introuvable (%s) ; "
@@ -538,13 +563,49 @@ class CompositionClaim:
         return self
 
     def alive(self) -> bool:
-        """L'enfant tient-il encore le bail (tube ouvert, processus vivant) ?"""
+        """L'enfant détenteur vit-il encore (tube ouvert, processus vivant) ?"""
         return self.proc is not None and self.proc.poll() is None
 
+    def verify(self) -> bool:
+        """#6563 : preuve fraîche, bornée, que le bail est encore à nous.
+
+        Lecture seule dans un processus court : la base rend le propriétaire
+        et l'époque vivants. Un dépassement de `CLAIM_CHECK_TIMEOUT`, une
+        sortie non nulle ou illisible, ou une valeur différente vaut refus.
+        """
+        if not self.owner or not self.epoch:
+            return False
+        try:
+            proc = subprocess.run(
+                self._check_command(), cwd=str(self.repo),
+                capture_output=True, text=True, timeout=CLAIM_CHECK_TIMEOUT,
+                env=self.env)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if proc.returncode != 0:
+            return False
+        lines = (proc.stdout or "").strip().splitlines()
+        if not lines:
+            return False
+        try:
+            data = json.loads(lines[-1])
+        except ValueError:
+            return False
+        return (data.get("match") is True
+                and str(data.get("owner") or "") == self.owner
+                and int(data.get("epoch") or 0) == int(self.epoch))
+
     def require(self) -> None:
-        """Refuse un geste quand le bail n'est plus tenu par cette composition."""
+        """Refuse un geste quand le bail n'est plus tenu par cette composition.
+
+        Un enfant vivant ne suffit pas : il a pu être suspendu, ou son
+        renouvellement bloqué au-delà du TTL, pendant qu'un autre composeur
+        reprenait la clé du porteur. La preuve base fraîche tranche.
+        """
         if self.proc is None:
-            return
+            raise EpochLost(
+                "bail de composition du porteur #%d non pris : aucun geste"
+                % self.carrier)
         if not self.alive():
             error = ""
             try:
@@ -555,6 +616,15 @@ class CompositionClaim:
             raise EpochLost(
                 "bail de composition du porteur #%d perdu%s : aucun geste"
                 % (self.carrier, (" (%s)" % _tail(error, 3)) if error else ""))
+        if not self.verify():
+            raise EpochLost(
+                "bail de composition du porteur #%d non prouvé (propriétaire "
+                "%s, époque %s) : aucun geste"
+                % (self.carrier, self.owner, self.epoch))
+        if not self.alive():
+            raise EpochLost(
+                "bail de composition du porteur #%d perdu pendant la preuve : "
+                "aucun geste" % self.carrier)
 
     def stop(self, *, force: bool = False) -> None:
         """Ferme le tube du détenteur ; le bail est rendu par l'enfant."""
