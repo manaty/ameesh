@@ -325,9 +325,12 @@ CONTAINER_ENGINE_ABSENT = (
 #: compte comme environnement que si la sonde `<moteur> info`, dans
 #: l'environnement de la série, sort elle-même en 127 ou ne trouve pas
 #: l'exécutable (`container_engine_absent`) : c'est le cas h-16, où le shim
-#: écrivait son message sur un stderr capturé par le test.
+#: écrivait son message sur un stderr capturé par le test. La sonde vise
+#: l'exécutable **tel qu'écrit** (`exe`) : un nom nu par le `PATH` de la
+#: série, un chemin absolu tel quel ; un chemin relatif dépend du cwd du test,
+#: inconnu ici, et ne se prouve jamais (B/P2 cx1, second tour).
 CONTAINER_EXIT_127_RE = re.compile(
-    r"Command '(?:\[')?(?:[^'\s]*/)?(?P<engine>docker|podman)'?[,\s][^\n]*"
+    r"Command '(?:\[')?(?P<exe>(?:[^'\s]*/)?(?:docker|podman))'?[,\s][^\n]*"
     r"returned non-zero exit status 127")
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 #: #4217 : un `tearDownClass`/`setUpClass` en `QueryCanceled` (statement
@@ -770,8 +773,9 @@ class TestRun:
     #: #4887 : rouges de voisins conservés faute de rejeu de base concluant ;
     #: consignés non attribués, la ci-full tranche.
     unattributed: list[str] = field(default_factory=list)
-    #: #6567 : moteurs de conteneurs prouvés absents par la sonde
-    #: (`container_engine_absent`) dans l'environnement de la série.
+    #: #6567 : exécutables de moteur (tels qu'écrits dans la commande) prouvés
+    #: absents par la sonde (`container_engine_absent`) dans l'environnement
+    #: de la série.
     absent_engines: frozenset = frozenset()
 
     @property
@@ -818,7 +822,7 @@ class TestRun:
         # #6567 : un 127 de docker/podman n'est une panne que si la sonde du
         # moteur, dans l'environnement de la série, l'a prouvé absent.
         exit_127 = CONTAINER_EXIT_127_RE.search(message)
-        if exit_127 and exit_127.group("engine") in absent_engines:
+        if exit_127 and exit_127.group("exe") in absent_engines:
             return True
         if name in ("ModuleNotFoundError", "ImportError") and "psycopg" in message:
             return True
@@ -2432,20 +2436,25 @@ def run_walled(cmd: list[str], *, cwd: Path, env: dict,
 _ENGINE_PROBES: dict[tuple, bool] = {}
 
 
-def container_engine_absent(engine: str, env: dict) -> bool:
-    """#6567 : `engine` est-il absent de l'environnement `env` des tests ?
+def container_engine_absent(executable: str, env: dict) -> bool:
+    """#6567 : l'exécutable `executable` est-il un moteur absent dans `env` ?
 
-    Sonde `<engine> info`, qui ne lance aucune commande dans un conteneur :
-    son 127 ne vient que du shim du ménage sans moteur réel ou d'un
-    exécutable introuvable. Un délai, une autre erreur ou un démon arrêté ne
-    prouvent pas l'absence (le rouge reste un rouge). Une réponse par
-    moteur, `PATH` et moteur réel déclaré, pour tout le lancement.
+    Sonde `<executable> info`, qui ne lance aucune commande dans un
+    conteneur : son 127 ne vient que du shim du ménage sans moteur réel ou
+    d'un exécutable introuvable. C'est **l'exécutable de la commande en
+    échec** qui est sondé : un nom nu par le `PATH` de la série, un chemin
+    absolu tel quel. Un chemin relatif (cwd du test inconnu) ne prouve rien.
+    Un délai, une autre erreur ou un démon arrêté ne prouvent pas l'absence
+    (le rouge reste un rouge). Une réponse par exécutable, `PATH` et moteurs
+    réels déclarés, pour tout le lancement.
     """
-    real = "AMEESH_REAL_DOCKER" if engine == "docker" else "AMEESH_REAL_PODMAN"
-    key = (engine, env.get("PATH", ""), env.get(real, ""))
+    if "/" in executable and not executable.startswith("/"):
+        return False
+    key = (executable, env.get("PATH", ""), env.get("AMEESH_REAL_DOCKER", ""),
+           env.get("AMEESH_REAL_PODMAN", ""))
     if key not in _ENGINE_PROBES:
         try:
-            proc = subprocess.run([engine, "info"], env=env, capture_output=True,
+            proc = subprocess.run([executable, "info"], env=env, capture_output=True,
                                   stdin=subprocess.DEVNULL, timeout=20)
             _ENGINE_PROBES[key] = proc.returncode == 127
         except FileNotFoundError:
@@ -2456,13 +2465,13 @@ def container_engine_absent(engine: str, env: dict) -> bool:
 
 
 def probe_engines(result: TestRun, env: dict) -> TestRun:
-    """#6567 : sonde les moteurs cités par un 127 de la série, et seulement eux."""
+    """#6567 : sonde les exécutables cités par un 127 de la série, eux seuls."""
     if result.returncode == 1 and result.output:
-        engines = {found.group("engine")
-                   for found in CONTAINER_EXIT_127_RE.finditer(result.output)}
+        executables = {found.group("exe")
+                       for found in CONTAINER_EXIT_127_RE.finditer(result.output)}
         result.absent_engines = frozenset(
-            engine for engine in sorted(engines)
-            if container_engine_absent(engine, env))
+            executable for executable in sorted(executables)
+            if container_engine_absent(executable, env))
     return result
 
 

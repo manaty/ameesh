@@ -22,6 +22,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 AUTO = ROOT / "scripts" / "paquet-auto.py"
@@ -100,9 +101,19 @@ class ContainerEngineAbsentTest(unittest.TestCase):
         # podman absent ne blanchit pas un 127 de docker
         self.assert_red(_run(H16, absent=frozenset({"podman"})))
 
+    def test_l_absence_vaut_pour_l_executable_ecrit(self) -> None:
+        # B/P2 cx1 (second tour) : `docker` (PATH) absent ne blanchit pas un
+        # 127 de `/usr/bin/docker`, ni l'inverse.
+        absolute = _error("setUpClass (tests.test_t.T)",
+                          "subprocess.CalledProcessError: Command '['/usr/bin/docker', "
+                          "'run', 'busybox', 'foo']' returned non-zero exit status 127.")
+        self.assert_red(_run(absolute, absent=frozenset({"docker"})))
+        self.assert_red(_run(H16, absent=frozenset({"/usr/bin/docker"})))
+
     def test_commande_en_chaine_et_chemin_absolu(self) -> None:
         for command, engine in (("Command 'docker run -d postgres:16'", "docker"),
-                                ("Command '['/usr/bin/docker', 'run', 'x']'", "docker"),
+                                ("Command '['/usr/bin/docker', 'run', 'x']'",
+                                 "/usr/bin/docker"),
                                 ("Command '['podman', 'run', 'x']'", "podman")):
             with self.subTest(command=command):
                 self.assert_inconclusive(_run(_error(
@@ -197,6 +208,46 @@ class EngineProbeTest(unittest.TestCase):
         green = paquet_auto.probe_engines(paquet_auto.TestRun(
             label="u", modules=[], returncode=0, output="OK\n", seconds=0.1), env)
         self.assertEqual(green.absent_engines, frozenset())
+
+    def test_moteur_explicite_sain_et_shim_du_path_absent(self) -> None:
+        # B/P2 cx1 (second tour) : le PATH porte le shim sans moteur réel, mais
+        # le test appelle un moteur sain par son chemin absolu, et la commande
+        # du conteneur est introuvable : le 127 reste un rouge.
+        env = self.engine("docker", 'echo "ameesh: container engine not found (docker)" >&2\nexit 127')
+        real = pathlib.Path(self.dir.name) / "real"
+        real.mkdir()
+        healthy = real / "docker"
+        healthy.write_text("#!/bin/sh\nexit 0\n")
+        healthy.chmod(0o755)
+        output = _error("setUpClass (tests.test_t.T)",
+                        "subprocess.CalledProcessError: Command '['%s', 'run', "
+                        "'busybox', 'foo']' returned non-zero exit status 127."
+                        % healthy)
+        run = paquet_auto.probe_engines(_run(output), env)
+        self.assertEqual(run.absent_engines, frozenset())
+        self.assertTrue(run.real_failure)
+        self.assertFalse(run.inconclusive)
+        # le même moteur par son nom nu, via le shim du PATH : absent prouvé
+        shim = paquet_auto.probe_engines(_run(H16), env)
+        self.assertEqual(shim.absent_engines, frozenset({"docker"}))
+        self.assert_inconclusive_run(shim)
+
+    def test_chemin_absolu_du_shim_est_sonde_tel_quel(self) -> None:
+        self.engine("docker", "exit 127")
+        shim = str(self.bin / "docker")
+        self.assertTrue(paquet_auto.container_engine_absent(shim, {"PATH": "/nonexistent"}))
+
+    def test_chemin_relatif_ne_se_prouve_jamais(self) -> None:
+        # le cwd du test est inconnu : `./docker` n'est jamais sondé
+        env = self.engine("docker", "exit 127")
+        with mock.patch.object(paquet_auto.subprocess, "run") as run:
+            self.assertFalse(paquet_auto.container_engine_absent("./docker", env))
+            self.assertFalse(paquet_auto.container_engine_absent("bin/podman", env))
+        run.assert_not_called()
+        output = _error("setUpClass (tests.test_t.T)",
+                        "subprocess.CalledProcessError: Command '['./docker', 'run', "
+                        "'x']' returned non-zero exit status 127.")
+        self.assertTrue(paquet_auto.probe_engines(_run(output), env).real_failure)
 
     def assert_inconclusive_run(self, run) -> None:
         self.assertFalse(run.real_failure)
