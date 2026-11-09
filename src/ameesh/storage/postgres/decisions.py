@@ -35,6 +35,26 @@ _MAIL_COLUMNS = """
     extract(epoch from m.created_at)::float8 AS created_ts
 """
 
+#: `prose_candidates` : la sonde `NOT EXISTS` compare l'id du message à
+#: `payload->'decision'->>'source_mail'` ; l'index d'expression 0558 fait
+#: cette sonde par index au lieu d'un Seq Scan par candidat (1,5 s sur
+#: 201 k lignes, #6422). Le reste de la forme est inchangé.
+PROSE_CANDIDATES_SQL = """
+    SELECT __COLUMNS__ FROM agent_mailbox m
+     WHERE m.created_at >= to_timestamp(%s)
+       AND (m.recipient = ANY(ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)))
+            OR m.recipient LIKE 'human:%%')
+       AND coalesce(m.kind, 'notify') NOT IN ('request', 'reply', 'event', 'receipt')
+       AND m.sender <> 'ameesh' AND m.sender NOT LIKE 'human:%%'
+       AND m.sender NOT LIKE 'chat-%%'
+       AND NOT EXISTS (
+           SELECT 1 FROM agent_mailbox r
+            WHERE r.kind = 'request' AND (r.payload -> 'decision') IS NOT NULL
+              AND r.payload -> 'decision' ->> 'source_mail' = m.id::text)
+     ORDER BY m.id DESC
+     LIMIT %s
+""".replace("__COLUMNS__", _MAIL_COLUMNS)
+
 #: les demandes en attente pour la vue par projet (`projects.board`, L124) :
 #: un sous-SELECT, inséré dans la requête unique de la vue
 PENDING_BOARD_SQL = """
@@ -270,21 +290,7 @@ class Decisions(interface.Decisions):
         # only the shape — mail written by an agent to bureau or a human, not
         # a request, reply, alert or receipt, not yet converted into a request.
         return self.db.query(
-            """
-            SELECT __COLUMNS__ FROM agent_mailbox m
-             WHERE m.created_at >= to_timestamp(%s)
-               AND (m.recipient = ANY(ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)))
-                    OR m.recipient LIKE 'human:%%')
-               AND coalesce(m.kind, 'notify') NOT IN ('request', 'reply', 'event', 'receipt')
-               AND m.sender <> 'ameesh' AND m.sender NOT LIKE 'human:%%'
-               AND m.sender NOT LIKE 'chat-%%'
-               AND NOT EXISTS (
-                   SELECT 1 FROM agent_mailbox r
-                    WHERE r.kind = 'request' AND (r.payload -> 'decision') IS NOT NULL
-                      AND r.payload -> 'decision' ->> 'source_mail' = m.id::text)
-             ORDER BY m.id DESC
-             LIMIT %s
-            """.replace("__COLUMNS__", _MAIL_COLUMNS),
+            PROSE_CANDIDATES_SQL,
             (float(since_ts), json.dumps(list(recipients)), int(limit)))[::-1]
 
     def validation_register(self, decision_id, *, routing):

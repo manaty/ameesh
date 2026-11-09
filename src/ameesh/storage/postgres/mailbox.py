@@ -72,6 +72,60 @@ _RESERVED_SQL = """
 #: `registry` depuis #5586 (le compte groupé d'`overview()` le lit sans import
 #: circulaire) ; il reste exporté ici pour ses lecteurs.
 
+#: `human_messages` : les messages d'humains depuis `since_ts`, lus par les
+#: index partiels de 0558 au lieu d'un parcours de `agent_mailbox_recent_idx`
+#: (732 ms sur 201 k lignes, #6422). La CTE ne rend que des ids : chaque
+#: branche a son index — humain ou payload `human`, chat externe (le registre
+#: donne `mode`), noms humains déclarés (anciens messages sans marqueur, sur
+#: `agent_mailbox_sender_idx`) — et la jointure finale part de la clé primaire.
+HUMAN_MESSAGES_SQL = """
+    WITH candidates AS (
+        SELECT id FROM agent_mailbox
+         WHERE created_at >= to_timestamp(%s)
+           AND (starts_with(sender, 'human:')
+                OR payload @> '{"human": true}'::jsonb)
+      UNION
+        SELECT m.id FROM agent_mailbox m
+         WHERE m.created_at >= to_timestamp(%s)
+           AND starts_with(m.sender, 'chat-')
+           AND EXISTS (SELECT 1 FROM agent_registry r
+                        WHERE r.name = m.sender
+                          AND coalesce(r.mode, 'execute') = 'externe')
+        __DECLARED__
+    )
+    SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.payload,
+           m.work_item_id, w.id AS lot_id,
+           extract(epoch from m.created_at)::float8 AS created_ts
+      FROM agent_mailbox m
+      JOIN candidates c ON c.id = m.id
+      LEFT JOIN work_items w
+        ON w.id = CASE WHEN btrim(coalesce(m.work_item_id, '')) ~ '^[0-9]{1,18}$'
+                       THEN btrim(m.work_item_id)::bigint END
+     WHERE NOT m.payload @> '{"ack": true}'::jsonb
+       AND coalesce(m.payload ->> 'cc', '') = ''
+       AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
+     ORDER BY m.id DESC
+     LIMIT %s
+"""
+
+
+def human_messages_query(*, since_ts, humans, limit) -> tuple[str, list]:
+    """(SQL, paramètres) de `human_messages` : la CTE de 0558, construite pour
+    les noms humains déclarés (branche absente s'il n'y en a aucun)."""
+    names = sorted({str(n) for n in humans or () if str(n).strip()})
+    declared = (
+        "  UNION\n"
+        "    SELECT id FROM agent_mailbox\n"
+        "     WHERE created_at >= to_timestamp(%s)\n"
+        "       AND sender IN (__NAMES__)"
+    ).replace("__NAMES__", ", ".join(["%s"] * len(names))) if names else ""
+    params = [float(since_ts), float(since_ts)]
+    if names:
+        params.append(float(since_ts))
+        params.extend(names)
+    params.append(int(limit))
+    return HUMAN_MESSAGES_SQL.replace("__DECLARED__", declared), params
+
 
 class Mailbox(interface.Mailbox):
 
@@ -525,31 +579,15 @@ class Mailbox(interface.Mailbox):
 
     # -- demandes d'humains sans lot (L130) -----------------------------------
     def human_messages(self, *, since_ts, humans, limit) -> list[dict]:
-        names = sorted({str(n) for n in humans or () if str(n).strip()})
-        declared = (" OR m.sender IN (%s)" % ", ".join(["%s"] * len(names))) if names else ""
+        """Les messages d'humains depuis `since_ts` (L130).
+
+        #6422 : le filtre `created_at` sans destinataire lisait tout
+        `agent_mailbox_recent_idx` (732 ms). Les candidats viennent des index
+        partiels de 0558 (humains, chat externe) et de `sender_idx` pour les
+        noms déclarés ; la jointure finale part de la clé primaire.
+        """
         rows = self.db.query(
-            """
-            SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.payload,
-                   m.work_item_id, w.id AS lot_id,
-                   extract(epoch from m.created_at)::float8 AS created_ts
-              FROM agent_mailbox m
-              LEFT JOIN work_items w
-                ON w.id = CASE WHEN btrim(coalesce(m.work_item_id, '')) ~ '^[0-9]{1,18}$'
-                               THEN btrim(m.work_item_id)::bigint END
-              LEFT JOIN agent_registry r ON r.name = m.sender
-             WHERE m.created_at >= to_timestamp(%s)
-               AND (starts_with(m.sender, 'human:')
-                    OR m.payload @> '{"human": true}'::jsonb
-                    OR (starts_with(m.sender, 'chat-')
-                        AND coalesce(r.mode, 'execute') = 'externe')__DECLARED__)
-               AND NOT m.payload @> '{"ack": true}'::jsonb
-               AND coalesce(m.payload ->> 'cc', '') = ''
-               AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
-             ORDER BY m.id DESC
-             LIMIT %s
-            """.replace("__DECLARED__", declared),
-            (float(since_ts), *names, int(limit)),
-        )
+            *human_messages_query(since_ts=since_ts, humans=humans, limit=limit))
         return list(reversed(rows))
 
     # -- courrier en souffrance ----------------------------------------------
