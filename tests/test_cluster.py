@@ -131,6 +131,10 @@ FERMEES = {
     "repair_signals": {"id", "project", "environment", "source", "native_id", "position",
                        "envelope", "outcome", "outcome_ref", "created_at", "updated_at"},
     "repair_signal_refusals": {"project", "environment", "source", "rejection_key", "reason", "created_at"},
+    # #6477 (0560): scan position of the alerts that carry no project, held and
+    # read by the observation pass, never by a supervisor role; internal state,
+    # closed to both roles, no GRANT added.
+    "repair_observation_scopes": {"scope", "environment", "source", "cursor", "updated_at"},
 
     # #6017 (0552) : sonde admise sur un retour clos, tenue par l'adaptateur VM
     # et lue par le prédicat de prise ; fermée aux deux rôles, aucun GRANT modifié.
