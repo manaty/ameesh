@@ -313,17 +313,22 @@ PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
 KEEP_READY_REASON = "coupure suivante : recomposition"
 KEEP_REFROZEN_REASON = "coupure suivante : tête regelée"
 KEEP_NOT_READY_REASON = "coupure suivante : membre non prêt"
-#: #6567 : un moteur de conteneurs absent de l'environnement du test. Le shim
-#: du ménage (`menage/bin/docker`) sort en 127 sans `AMEESH_REAL_DOCKER` ; un
-#: `docker run` en `check=True` lève alors `CalledProcessError … exit status
-#: 127` (h-16, #6372 retiré à tort). Un exécutable introuvable dit la même
-#: chose. Seuls `docker`/`podman` en tête de commande sont visés : un 127 d'un
-#: autre programme reste lu comme avant.
+#: #6567 : un moteur de conteneurs absent de l'environnement du test. Ces
+#: deux signes le prouvent seuls : le message du shim du ménage
+#: (`menage/bin/docker` sans `AMEESH_REAL_DOCKER`), ou l'exécutable introuvable.
 CONTAINER_ENGINE_ABSENT = (
     r"ameesh: container engine not found|"
-    r"Command '(?:\[')?(?:[^'\s]*/)?(?:docker|podman)'?[,\s][^\n]*"
-    r"returned non-zero exit status 127|"
     r"No such file or directory: '(?:[^']*/)?(?:docker|podman)'")
+#: #6567 : une commande docker/podman sortie en 127. **Seule, ce n'est pas une
+#: preuve** : un moteur sain rend aussi 127 quand la commande lancée dans le
+#: conteneur est introuvable (`docker run busybox foo`, B/P2 cx1). Elle ne
+#: compte comme environnement que si la sonde `<moteur> info`, dans
+#: l'environnement de la série, sort elle-même en 127 ou ne trouve pas
+#: l'exécutable (`container_engine_absent`) : c'est le cas h-16, où le shim
+#: écrivait son message sur un stderr capturé par le test.
+CONTAINER_EXIT_127_RE = re.compile(
+    r"Command '(?:\[')?(?:[^'\s]*/)?(?P<engine>docker|podman)'?[,\s][^\n]*"
+    r"returned non-zero exit status 127")
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 #: #4217 : un `tearDownClass`/`setUpClass` en `QueryCanceled` (statement
 #: timeout, base de test chargée) est une panne d'infrastructure, jamais un
@@ -765,6 +770,9 @@ class TestRun:
     #: #4887 : rouges de voisins conservés faute de rejeu de base concluant ;
     #: consignés non attribués, la ci-full tranche.
     unattributed: list[str] = field(default_factory=list)
+    #: #6567 : moteurs de conteneurs prouvés absents par la sonde
+    #: (`container_engine_absent`) dans l'environnement de la série.
+    absent_engines: frozenset = frozenset()
 
     @property
     def green(self) -> bool:
@@ -783,7 +791,8 @@ class TestRun:
                 re.findall(r"(\w+)=(\d+)", found.group(1))}
 
     @staticmethod
-    def _error_is_environment(block: str) -> bool:
+    def _error_is_environment(block: str,
+                              absent_engines: frozenset = frozenset()) -> bool:
         """La dernière exception effective du bloc est-elle une panne ?
 
         Le **nom du type** ne suffit pas : `AssertionError: expected
@@ -805,6 +814,11 @@ class TestRun:
         if name == "QueryCanceled":
             return True
         if ENV_MESSAGE_RE.search(message):
+            return True
+        # #6567 : un 127 de docker/podman n'est une panne que si la sonde du
+        # moteur, dans l'environnement de la série, l'a prouvé absent.
+        exit_127 = CONTAINER_EXIT_127_RE.search(message)
+        if exit_127 and exit_127.group("engine") in absent_engines:
             return True
         if name in ("ModuleNotFoundError", "ImportError") and "psycopg" in message:
             return True
@@ -867,7 +881,7 @@ class TestRun:
             rest = self.output[header.end():]
             end = BLOCK_END_RE.search(rest)
             block = rest[:end.start()] if end else rest
-            if self._error_is_environment(block):
+            if self._error_is_environment(block, self.absent_engines):
                 env_error = True
             else:
                 return True
@@ -915,6 +929,9 @@ class TestRun:
         if self.returncode not in (0, 1):
             return "code de retour %s" % self.returncode
         found = INCONCLUSIVE_RE.search(self.output)
+        if not found and self.absent_engines:
+            return ("moteur de conteneurs indisponible dans l'environnement des "
+                    "tests (%s info : 127)" % ", ".join(sorted(self.absent_engines)))
         return _one_line(found.group(0)) if found else "résultat non concluant"
 
     def excerpt(self, lines: int = 3) -> str:
@@ -2276,7 +2293,7 @@ def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
         run = run_tests(path, "base", present, timeout=timeout, **walled)
         if run.inconclusive:
             return None
-        return {failure["test"] for failure in unittest_failures(run.output)}
+        return {failure["test"] for failure in unittest_failures(run.output, _absent(run))}
     finally:
         remove_worktree(worktree, path)
 
@@ -2412,6 +2429,43 @@ def run_walled(cmd: list[str], *, cwd: Path, env: dict,
     return None
 
 
+_ENGINE_PROBES: dict[tuple, bool] = {}
+
+
+def container_engine_absent(engine: str, env: dict) -> bool:
+    """#6567 : `engine` est-il absent de l'environnement `env` des tests ?
+
+    Sonde `<engine> info`, qui ne lance aucune commande dans un conteneur :
+    son 127 ne vient que du shim du ménage sans moteur réel ou d'un
+    exécutable introuvable. Un délai, une autre erreur ou un démon arrêté ne
+    prouvent pas l'absence (le rouge reste un rouge). Une réponse par
+    moteur, `PATH` et moteur réel déclaré, pour tout le lancement.
+    """
+    real = "AMEESH_REAL_DOCKER" if engine == "docker" else "AMEESH_REAL_PODMAN"
+    key = (engine, env.get("PATH", ""), env.get(real, ""))
+    if key not in _ENGINE_PROBES:
+        try:
+            proc = subprocess.run([engine, "info"], env=env, capture_output=True,
+                                  stdin=subprocess.DEVNULL, timeout=20)
+            _ENGINE_PROBES[key] = proc.returncode == 127
+        except FileNotFoundError:
+            _ENGINE_PROBES[key] = True
+        except (OSError, subprocess.SubprocessError):
+            _ENGINE_PROBES[key] = False
+    return _ENGINE_PROBES[key]
+
+
+def probe_engines(result: TestRun, env: dict) -> TestRun:
+    """#6567 : sonde les moteurs cités par un 127 de la série, et seulement eux."""
+    if result.returncode == 1 and result.output:
+        engines = {found.group("engine")
+                   for found in CONTAINER_EXIT_127_RE.finditer(result.output)}
+        result.absent_engines = frozenset(
+            engine for engine in sorted(engines)
+            if container_engine_absent(engine, env))
+    return result
+
+
 def run_tests(worktree: Path, label: str, modules: list[str], *,
               timeout: int, heavy: bool = False,
               wall: int | None = None, failfast: bool = False) -> TestRun:
@@ -2446,16 +2500,17 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
                 output="borne totale des tests par unité atteinte après %d s "
                        "(attente du créneau comprise) : série arrêtée (#4463)" % wall,
                 seconds=time.monotonic() - start, timed_out=True))
-        return save_test_log(TestRun(
+        return save_test_log(probe_engines(TestRun(
             label=label, modules=list(modules), returncode=proc.returncode,
             output=_output(proc), seconds=time.monotonic() - start,
-            timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT))
+            timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT), env))
     try:
         proc = run_command(cmd, cwd=worktree, timeout=timeout + wait, env=env)
-        result = TestRun(label=label, modules=list(modules),
-                       returncode=proc.returncode, output=_output(proc),
-                       seconds=time.monotonic() - start,
-                       timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT)
+        result = probe_engines(TestRun(
+            label=label, modules=list(modules),
+            returncode=proc.returncode, output=_output(proc),
+            seconds=time.monotonic() - start,
+            timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT), env)
     except PaquetAutoError as exc:
         result = TestRun(label=label, modules=list(modules), returncode=None,
                        output=str(exc), seconds=time.monotonic() - start,
@@ -3196,14 +3251,21 @@ def check_client_types(worktree: Path, base_sha: str, *,
                 modules.unlink()
 
 
-def unittest_failures(output: str) -> list[dict]:
+def _absent(run) -> frozenset:
+    """#6567 : les moteurs prouvés absents d'une série (vide hors `TestRun`)."""
+    return getattr(run, "absent_engines", frozenset()) or frozenset()
+
+
+def unittest_failures(output: str,
+                      absent_engines: frozenset = frozenset()) -> list[dict]:
     """Les échecs d'une sortie unittest, au format des échecs de CI (#3801).
 
     `FAIL: test_x (tests.test_module.Class.test_x)` et
     `ERROR: setUpClass (tests.test_module.Class)` donnent le même nom pointé
     que la CI ; un sous-test (`... (i=1)`) ne change pas le nom. Une
     `ERROR:` d'environnement (psql/psycopg absent) n'est pas un rouge du lot :
-    elle est ignorée, comme `TestRun.real_failure` la classe.
+    elle est ignorée, comme `TestRun.real_failure` la classe. #6567 :
+    `absent_engines` est celui de la série (`TestRun.absent_engines`).
     """
     seen: set[str] = set()
     out: list[dict] = []
@@ -3215,7 +3277,7 @@ def unittest_failures(output: str) -> list[dict]:
             rest = (output or "")[match.end():]
             end = BLOCK_END_RE.search(rest)
             block = rest[:end.start()] if end else rest
-            if TestRun._error_is_environment(block):
+            if TestRun._error_is_environment(block, absent_engines):
                 continue
         seen.add(test)
         module = ""
@@ -3362,7 +3424,7 @@ def prefix_failures(worktree: Path, composition: Composition,
                 return {}, ("préfixe %d (#%d) non concluant : %s"
                             % (index, unit.lot, run.motive())), []
             failed = {entry["test"]
-                      for entry in unittest_failures(run.output)}
+                      for entry in unittest_failures(run.output, _absent(run))}
             if not run.green and not failed:
                 return {}, ("préfixe %d (#%d) rouge sans nom de test"
                             % (index, unit.lot)), []
@@ -3449,7 +3511,7 @@ def earlier_red(worktree: Path, composition: Composition,
             label = "préfixe de #%d (rouge de #%d)" % (earlier.lot, removal.lot)
             run = replay(path, label, names, timeout=limit,
                          **({"wall": limit} if deadline is not None else {}))
-            failed = ({entry["test"] for entry in unittest_failures(run.output)}
+            failed = ({entry["test"] for entry in unittest_failures(run.output, _absent(run))}
                       if not run.inconclusive and not run.green else set())
             if failed and all(_failure_matches(name, failed) for name in names):
                 innocent[removal.lot] = earlier.lot
@@ -3813,7 +3875,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                 "continue" % (unit.lot, run.motive()))
             continue
         if not run.green:
-            found = unittest_failures(run.output)
+            found = unittest_failures(run.output, _absent(run))
             proper_names = {module.split(".", 1)[1] for module in proper}
             mine = set(proper_names)
             neighbor = {row["module"].split(".", 1)[1] for row in added}
@@ -3915,7 +3977,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         red.append((contract, [{"test": name, "module": ""}
                                for name in contract.failed_tests]
                     if isinstance(contract, FlowTestRun)
-                    else unittest_failures(contract.output)))
+                    else unittest_failures(contract.output, _absent(contract))))
         log("tests contrats : ROUGE (%d modules)\n%s"
             % (len(modules), _tail(contract.output)))
     else:

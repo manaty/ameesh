@@ -8,6 +8,11 @@ un rouge réel, et #6372 a été retiré du paquet. Un environnement sans moteur
 ne prouve aucun défaut du lot (canon §3) ; un vrai échec de `docker` (autre
 code), un 127 d'un autre programme ou une assertion restent rouges.
 
+Un 127 de docker/podman ne suffit pas seul (B/P2 cx1) : un moteur sain rend
+aussi 127 quand la commande lancée dans le conteneur est introuvable. Il ne
+compte que si la sonde `<moteur> info`, dans l'environnement de la série, a
+prouvé le moteur absent (`absent_engines`).
+
 Aucune base, aucune forge, aucun réseau, aucun moteur de conteneurs.
 """
 from __future__ import annotations
@@ -15,6 +20,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -43,7 +49,8 @@ def _error(header: str, exception: str, *, frames: str = "") -> str:
             + exception + "\n\n")
 
 
-def _run(output: str, *, failures: int = 0, errors: int = 1) -> object:
+def _run(output: str, *, failures: int = 0, errors: int = 1,
+         absent: frozenset = frozenset()) -> object:
     parts = []
     if failures:
         parts.append("failures=%d" % failures)
@@ -51,7 +58,8 @@ def _run(output: str, *, failures: int = 0, errors: int = 1) -> object:
         parts.append("errors=%d" % errors)
     output += DASH + "Ran 3 tests in 0.2s\n\nFAILED (%s)\n" % ", ".join(parts)
     return paquet_auto.TestRun(label="unité #6372", modules=["tests.test_t"],
-                               returncode=1, output=output, seconds=0.2)
+                               returncode=1, output=output, seconds=0.2,
+                               absent_engines=absent)
 
 
 #: la sortie du cas h-16, à la forme exacte de `subprocess.CalledProcessError`
@@ -71,20 +79,36 @@ class ContainerEngineAbsentTest(unittest.TestCase):
         self.assertTrue(run.real_failure)
         self.assertFalse(run.inconclusive)
 
-    def test_h16_docker_run_127_en_setupclass_est_non_concluant(self) -> None:
-        run = _run(H16)
+    def test_h16_docker_run_127_moteur_prouve_absent_est_non_concluant(self) -> None:
+        run = _run(H16, absent=frozenset({"docker"}))
         self.assert_inconclusive(run)
-        self.assertIn("exit status 127", run.motive())
+        self.assertIn("docker info : 127", run.motive())
+        self.assertEqual(paquet_auto.unittest_failures(run.output, run.absent_engines), [])
+
+    def test_127_avec_moteur_sain_reste_rouge(self) -> None:
+        # B/P2 cx1 : `docker run busybox foo`, commande du conteneur absente
+        run = _run(_error(
+            "test_value (tests.test_t.T.test_value)",
+            "subprocess.CalledProcessError: Command '['docker', 'run', 'busybox', "
+            "'foo']' returned non-zero exit status 127."))
+        self.assert_red(run)
+        self.assertEqual([entry["test"] for entry in
+                          paquet_auto.unittest_failures(run.output)],
+                         ["tests.test_t.T.test_value"])
+
+    def test_le_moteur_absent_ne_couvre_que_lui(self) -> None:
+        # podman absent ne blanchit pas un 127 de docker
+        self.assert_red(_run(H16, absent=frozenset({"podman"})))
 
     def test_commande_en_chaine_et_chemin_absolu(self) -> None:
-        for command in ("Command 'docker run -d postgres:16'",
-                        "Command '['/usr/bin/docker', 'run', 'x']'",
-                        "Command '['podman', 'run', 'x']'"):
+        for command, engine in (("Command 'docker run -d postgres:16'", "docker"),
+                                ("Command '['/usr/bin/docker', 'run', 'x']'", "docker"),
+                                ("Command '['podman', 'run', 'x']'", "podman")):
             with self.subTest(command=command):
                 self.assert_inconclusive(_run(_error(
                     "setUpClass (tests.test_t.T)",
                     "subprocess.CalledProcessError: %s returned non-zero "
-                    "exit status 127." % command)))
+                    "exit status 127." % command), absent=frozenset({engine})))
 
     def test_executable_introuvable(self) -> None:
         for exception in (
@@ -115,19 +139,68 @@ class ContainerEngineAbsentTest(unittest.TestCase):
                 self.assert_red(_run(_error(
                     "test_value (tests.test_t.T.test_value)",
                     "subprocess.CalledProcessError: Command '%s' returned "
-                    "non-zero exit status 127." % command)))
+                    "non-zero exit status 127." % command),
+                    absent=frozenset({"docker", "podman"})))
 
     def test_une_assertion_qui_cite_le_127_reste_rouge(self) -> None:
         self.assert_red(_run(_error(
             "test_value (tests.test_t.T.test_value)",
             "AssertionError: Command '['docker', 'run']' returned non-zero "
-            "exit status 127.")))
+            "exit status 127."), absent=frozenset({"docker"})))
 
     def test_un_fail_a_cote_du_moteur_absent_reste_rouge(self) -> None:
         output = H16 + SEP + "FAIL: test_value (tests.test_t.T.test_value)\n" \
             + DASH + "Traceback (most recent call last):\n" \
             + "AssertionError: 1 != 2\n\n"
-        self.assert_red(_run(output, failures=1, errors=1))
+        self.assert_red(_run(output, failures=1, errors=1,
+                             absent=frozenset({"docker"})))
+
+
+class EngineProbeTest(unittest.TestCase):
+    """La sonde `<moteur> info`, avec de faux moteurs sur un PATH privé."""
+
+    def setUp(self) -> None:
+        paquet_auto._ENGINE_PROBES.clear()
+        self.addCleanup(paquet_auto._ENGINE_PROBES.clear)
+        self.dir = tempfile.TemporaryDirectory(prefix="t6567-")
+        self.addCleanup(self.dir.cleanup)
+        self.bin = pathlib.Path(self.dir.name)
+
+    def engine(self, name: str, body: str) -> dict:
+        path = self.bin / name
+        path.write_text("#!/bin/sh\n" + body + "\n")
+        path.chmod(0o755)
+        return {"PATH": str(self.bin)}
+
+    def test_shim_sans_moteur_reel_est_absent(self) -> None:
+        env = self.engine("docker", 'echo "ameesh: container engine not found (docker)" >&2\nexit 127')
+        self.assertTrue(paquet_auto.container_engine_absent("docker", env))
+
+    def test_moteur_sain_n_est_pas_absent(self) -> None:
+        env = self.engine("docker", "exit 0")
+        self.assertFalse(paquet_auto.container_engine_absent("docker", env))
+
+    def test_demon_arrete_ne_prouve_pas_l_absence(self) -> None:
+        env = self.engine("docker", "echo 'Cannot connect to the Docker daemon' >&2\nexit 1")
+        self.assertFalse(paquet_auto.container_engine_absent("docker", env))
+
+    def test_executable_introuvable_est_absent(self) -> None:
+        self.assertTrue(paquet_auto.container_engine_absent(
+            "podman", {"PATH": str(self.bin)}))
+
+    def test_la_sonde_ne_vise_que_les_moteurs_cites_par_un_127(self) -> None:
+        env = self.engine("docker", "exit 127")
+        self.engine("podman", "exit 127")
+        run = paquet_auto.probe_engines(_run(H16), env)
+        self.assertEqual(run.absent_engines, frozenset({"docker"}))
+        self.assert_inconclusive_run(run)
+        green = paquet_auto.probe_engines(paquet_auto.TestRun(
+            label="u", modules=[], returncode=0, output="OK\n", seconds=0.1), env)
+        self.assertEqual(green.absent_engines, frozenset())
+
+    def assert_inconclusive_run(self, run) -> None:
+        self.assertFalse(run.real_failure)
+        self.assertTrue(run.inconclusive)
 
 
 if __name__ == "__main__":
