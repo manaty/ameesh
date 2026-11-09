@@ -230,8 +230,13 @@ class Progress(interface.Progress):
                    extract(epoch from p.created_at)::float8   AS turn_started_ts,
                    p.turn  AS turn_label,
                    p.model AS turn_model,
+                   -- #6424 : une boîte `externe` (session humaine hors
+                   -- exécuteur) n'a pas de non-lus à décompter ; le prédicat
+                   -- porte sur `r` déjà joint, la sous-requête ne parcourt
+                   -- donc pas ses 7 380 messages à chaque lecture.
                    (SELECT count(*) FROM agent_mailbox m
-                     WHERE m.recipient = r.name AND m.delivered_at IS NULL)::bigint AS unread,
+                     WHERE m.recipient = r.name AND m.delivered_at IS NULL
+                       AND coalesce(r.mode, 'execute') <> 'externe')::bigint AS unread,
                    -- §4 (owner 14/10/2026) : l'en-cours de l'agent, tous
                    -- projets confondus (le plafond est global)
                    (SELECT count(*) FROM work_items w
