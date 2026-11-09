@@ -1,7 +1,7 @@
-# #6002 — bloc root B2 v5 : réinstallation de l'adaptateur VM de bureau-goal à 242ced70
+# #6002 — bloc root B2 v6 : réinstallation de l'adaptateur VM de bureau-goal à 242ced70
 
 Bureau (BG), 09/11. Demandé par mesh-design #205785 et #205796, corrigé selon cx1 #205801 (v2) et
-#205810 (v3), puis impl-03 #205820 (v4 : N1 à N6), puis cx1 #205830 (v5). Lancé par l'owner, en root, sur bureau-goal, **après** le reçu de la simulation #6572
+#205810 (v3), puis impl-03 #205820 (v4 : N1 à N6), puis cx1 #205830 (v5), puis impl-03 #205832 N7/N8 (v6). Lancé par l'owner, en root, sur bureau-goal, **après** le reçu de la simulation #6572
 et deux avis OK (ameesh-cx1, mty-amh-impl-03). N'active rien : `enrollment.json` reste
 `enabled: false`, le timer reste désactivé. Le script ne garantit pas qu'aucune requête VM n'a eu
 lieu : il garantit seulement qu'il n'en lance aucune, et ses gardes refusent tout worker vivant.
@@ -35,8 +35,8 @@ Les fichiers de l'adaptateur sont identiques entre 242ced70 et main 14017a2a (bl
    `daemon-reload`, `garde_etats` après la pose. Empreintes au reçu.
 
 ## Arrêts
-`set -euo pipefail` et gardes nommées « STOP : … ». Tout refus portant sur le profil ou le secret
-arrive à l'étape 0, avant la moindre écriture. Après l'étape 1, un `trap ERR` rappelle le retour.
+`set -euo pipefail` et gardes nommées « STOP : … ». La validation du profil et du secret arrive à l'étape 0,
+avant la moindre écriture ; la création de scaleway.json (étape 4) précède la bascule du lien venv. Après l'étape 1, un `trap ERR` rappelle le retour.
 
 ## Retour
 `sudo bash /root/ameesh-operator-6002-B2-<TS>/retour.sh` restaure les liens, `vm-commande.py` et
@@ -65,6 +65,14 @@ B2. `src-242ced700d6e` et `venv-242ced700d6e` restent sur place, inertes.
 - La création (`SCW_RESULT=$(scw creer) || stop`), la relecture du nouveau lien venv et la lecture des
   droits finaux ont chacune leur rc contrôlé avant d'être consignées. Un échec arrête avant la pose
   des unités, sans annoncer « fin B2 ».
+
+## v6 (impl-03, N7/N8)
+- **N7** : `scaleway.json` est créé au début de l'étape 4, APRÈS les gardes répétées et AVANT la
+  bascule du lien venv. Un échec d'écriture ou un profil modifié arrête donc avant la bascule.
+- **N8** : si `scaleway.json` existe déjà (vérifié à l'étape 0), le profil n'est plus utilisé ni
+  contrôlé ensuite. L'empreinte du profil n'est exigée que s'il faut créer le fichier ; elle est relue
+  juste après `scw valider`, ce qui lie la validation à ces octets, puis juste avant la création.
+- Les étapes sont renumérotées : 5 = unités.
 
 ## Intégrité au lancement (owner)
 Ne pas lancer depuis l'arbre de `agent`. Copier en root, vérifier l'empreinte, lancer la copie :

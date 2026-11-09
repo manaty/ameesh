@@ -10,6 +10,8 @@
 #   root et non inscriptibles ; dépendances épinglées par contraintes.
 # v5 (cx1 #205830) : aucun fichier temporaire (validation gardée en mémoire) ; rc contrôlé de toute
 #   commande dont la sortie est consignée (scw creer, lien, droits).
+# v6 (impl-03 N7/N8) : scaleway.json créé avant la bascule ; empreinte du profil liée à la
+#   validation et exigée seulement si scaleway.json est absent.
 # À lancer par l'owner, en root, sur bureau-goal, depuis une copie root vérifiée (voir DOSSIER-B2.md).
 set -euo pipefail
 SHA=242ced700d6ec1a63fc9d72643bc9faad175f72f
@@ -127,6 +129,12 @@ OLD_VENV=$(readlink $OPT/venv) || stop "$OPT/venv n'est pas un lien"
 SCW_SHA=$(sha256sum < $SCW | cut -c1-64) || stop "lecture du profil scw"
 SCW_INFO=$(stat -c '%y %U:%G %a' $SCW) || stop "lecture du profil scw"
 SCW_VALIDATION=$(scw valider) || stop "profil scw ou scaleway.json existant refusé"
+if [ -e $ETC/scaleway.json ]; then
+  SCW_NEEDED=0
+else
+  SCW_NEEDED=1
+  [ "$(sha256sum < $SCW | cut -c1-64)" = "$SCW_SHA" ] || stop "profil scw modifié pendant la validation"
+fi
 
 # 1. Reçu durable AVANT le premier changement : lien venv, commande, unités (ou leur absence), constats.
 install -d -m 0700 -o root -g root $RECU
@@ -187,9 +195,17 @@ chmod -R go-w $OPT/venv-$SHORT
 $OPT/venv-$SHORT/bin/pip list --format=freeze > $RECU/venv-$SHORT.freeze
 runuser -u $OP -- $OPT/venv-$SHORT/bin/python -I -c 'import ameesh.vm_adapter, ameesh.host_release; print("import ok")'
 
-# 4. Gardes répétées, puis commande au blob et bascule du seul lien venv.
+# 4. Gardes répétées ; scaleway.json créé AVANT la bascule (si absent et profil inchangé) ;
+#    puis commande au blob et bascule du seul lien venv.
 garde_etats "avant la bascule"
 for d in $OPT $OPT/commandes; do parent_sur $d; done
+if [ "$SCW_NEEDED" = 1 ]; then
+  [ "$(sha256sum < $SCW | cut -c1-64)" = "$SCW_SHA" ] || stop "profil scw modifié depuis la validation"
+  SCW_RESULT=$(scw creer) || stop "création ou validation de scaleway.json refusée"
+  constat "$SCW_RESULT"
+else
+  constat "scaleway.json préexistant gardé (vérifié à l'étape 0) ; profil scw non utilisé"
+fi
 install -m 0644 -o root -g root $OPT/src-$SHORT/deploy/vm-adapter/commandes/vm-commande.py $OPT/commandes/.vm-commande.py.$SHORT
 [ "$(git hash-object $OPT/commandes/.vm-commande.py.$SHORT)" = "$(runuser -u $OP -- git -C $REPO rev-parse "$SHA:deploy/vm-adapter/commandes/vm-commande.py")" ] || stop "vm-commande.py copié ≠ blob"
 mv -f $OPT/commandes/.vm-commande.py.$SHORT $OPT/commandes/vm-commande.py
@@ -198,12 +214,7 @@ NEW_VENV=$(readlink $OPT/venv) || stop "lecture du nouveau lien venv"
 [ "$NEW_VENV" = venv-$SHORT ] || stop "lien venv inattendu après bascule : $NEW_VENV"
 constat "lien venv : $OLD_VENV → $NEW_VENV"
 
-# 5. scaleway.json : création depuis la source validée à l'étape 0, si elle n'a pas changé.
-[ "$(sha256sum < $SCW | cut -c1-64)" = "$SCW_SHA" ] || stop "profil scw modifié depuis la validation"
-SCW_RESULT=$(scw creer) || stop "création ou validation de scaleway.json refusée"
-constat "$SCW_RESULT"
-
-# 6. Unités : celles du SHA, User=agent substitué, vérifiées, posées. Timer NON activé.
+# 5. Unités : celles du SHA, User=agent substitué, vérifiées, posées. Timer NON activé.
 W=$(mktemp -d)
 sed 's/^User=REPLACE_WITH_EXISTING_OPERATOR_ACCOUNT$/User=agent/' $OPT/src-$SHORT/deploy/vm-adapter/ameesh-vm-adapter.service > $W/ameesh-vm-adapter.service
 cp $OPT/src-$SHORT/deploy/vm-adapter/ameesh-vm-adapter.timer $W/
