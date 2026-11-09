@@ -2091,6 +2091,24 @@ def declared_target(repo: str, *, deadline: Deadline | None = None) -> str | Non
     return _out(repo, "config", "--get", TARGET_GIT_KEY, **_bounded(deadline)) or None
 
 
+def repository_default_target(repo: str, *, deadline: Deadline | None = None) -> str | None:
+    """La branche par défaut du dépôt, sans lire `git config ameesh.target` :
+    `origin/HEAD` quand elle se résout, sinon main/master (#6525).
+
+    C'est la cible que le clone nomme par défaut, celle dont l'écart avec la
+    cible déclarée du projet signale un lot mal ciblé, et le repli de
+    `default_target` quand aucune cible n'est configurée."""
+    bound = _bounded(deadline)
+    head = _out(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD",
+                **bound)
+    if head and _commit(repo, head, **bound):
+        return head
+    for candidate in DEFAULT_TARGETS:
+        if _commit(repo, candidate, **bound):
+            return candidate
+    return None
+
+
 def default_target(repo: str, *, deadline: Deadline | None = None) -> str | None:
     """La cible par défaut du dépôt : `git config ameesh.target`, sinon la
     branche par défaut du dépôt distant (`origin/HEAD`), sinon main/master.
@@ -2108,14 +2126,7 @@ def default_target(repo: str, *, deadline: Deadline | None = None) -> str | None
         raise MergeProbeError("%s = %s not found in %s (no fetch is done: "
                               "fix the value or fetch the branch)"
                               % (TARGET_GIT_KEY, configured, repo))
-    head = _out(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD",
-                **bound)
-    if head and _commit(repo, head, **bound):
-        return head
-    for candidate in DEFAULT_TARGETS:
-        if _commit(repo, candidate, **bound):
-            return candidate
-    return None
+    return repository_default_target(repo, deadline=deadline)
 
 
 def integration_branch(name: str) -> bool:
