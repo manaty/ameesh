@@ -88,6 +88,9 @@ class FakeShell:
                 self.added.append(args)
                 return ph.Result(0, "lot #4000 created in intake: x\n")
             if args[:2] == ["work", "show"]:
+                if int(args[2]) not in self.items:
+                    # #6538 : un lot inconnu du banc échoue comme `work show`
+                    return ph.Result(1, "", "lot #%s not found\n" % args[2])
                 return ph.Result(0, json.dumps(self.items[int(args[2])]))
             if args[:2] == ["ci", "status"]:
                 return ph.Result(0, json.dumps(self.ci.get(int(args[2]), {"runs": []})))
