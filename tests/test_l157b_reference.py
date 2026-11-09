@@ -119,7 +119,9 @@ class BriefTest(unittest.TestCase):
                 types.SimpleNamespace(), object(), listing, None, declared=["orch"])
         self.assertEqual(len(alerts), 1)
         out = alert_briefs.briefs(alerts[0], listing, auditor_names=["auditeur"])
-        self.assertEqual(set(out), {"dev1", "orch", "pilot", "auditeur"})
+        # #6426 : l'estimateur seul est briefé ; ni l'ancien assigneur, ni le
+        # pilote, ni l'auditeur (qui lit le biais à sa passe).
+        self.assertEqual(set(out), {"dev1"})
 
     def test_estimateur_et_orchestrateurs(self):
         alert = {"type": "estimate_bias", "agent": "dev1", "value": 0.1,
@@ -128,9 +130,10 @@ class BriefTest(unittest.TestCase):
         listing = [{"name": "dev1", "team": "app"}, {"name": "orch", "team": "app"},
                    {"name": "auditeur", "team": "app"}]
         out = alert_briefs.briefs(alert, listing, {}, ["auditeur"])
-        self.assertEqual(set(out), {"dev1", "orch", "auditeur"})
+        # #6426 : l'estimateur corrige ; le pilote n'a pas de geste et
+        # l'auditeur lit les biais à sa passe (`ameesh alerts --json`).
+        self.assertEqual(set(out), {"dev1"})
         self.assertIn("overestimates", out["dev1"])
-        self.assertIn("phases", out["orch"])
         self.assertIn("estimate_bias", exploitation.ALERT_TYPES)
 
     def test_estimateur_sans_equipe_ne_reveille_pas_tous_les_orchestrateurs(self):
@@ -138,7 +141,7 @@ class BriefTest(unittest.TestCase):
         # `human:smichea` dans la table du 25/10) n'a pas d'équipe ; le repli
         # « sans équipe, tous les orchestrateurs » réveillait les pilotes des
         # autres projets (l'orchestrateur Nexlink recevait les estimateurs
-        # ameesh). L'auditeur reste destinataire — c'est son geste.
+        # ameesh). Le repli est l'auditeur, puis le bureau (#6426).
         listing = [{"name": "mesh-design", "team": "ameesh"},
                    {"name": "orchestrateur", "team": "nexlink"},
                    {"name": "auditeur", "team": "ameesh"}]
@@ -147,12 +150,12 @@ class BriefTest(unittest.TestCase):
                  "orchestrators": ["mesh-design", "orchestrateur"]}
         out = alert_briefs.briefs(alert, listing, {}, ["auditeur"])
         self.assertEqual(set(out), {"auditeur"})
-        # un estimateur au registre mais sans projet reçoit SON brief, pas
-        # celui de tous les orchestrateurs.
+        # un estimateur au registre mais sans projet reçoit SON brief, et lui
+        # seul : l'auditeur n'a plus de copie (#6426).
         alert["agent"] = "bureau"
         listing.append({"name": "bureau"})
         out = alert_briefs.briefs(alert, listing, {}, ["auditeur"])
-        self.assertEqual(set(out), {"bureau", "auditeur"})
+        self.assertEqual(set(out), {"bureau"})
 
 
 class BiasEpisodeTest(unittest.TestCase):

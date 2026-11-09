@@ -117,6 +117,20 @@ class GitContentCacheTest(unittest.TestCase):
         self.assertEqual(canon.git_read(self.repo.root, self.first, "a.txt"),
                          b"un\n")
 
+    def test_git_diff_is_bounded_to_the_path_and_needs_full_shas(self):
+        # #6425 : le diff poussé est un diff d'objets git, borné à la fiche.
+        self.repo.write("b.txt", "autre\n")
+        second = self.repo.commit("deux fichiers")
+        self.repo.write("a.txt", "trois\n")
+        third = self.repo.commit("a change")
+        diff = canon.git_diff(self.repo.root, second, third, "a.txt")
+        self.assertIn(b"+trois", diff)
+        self.assertNotIn(b"b.txt", diff)
+        # ni une ref mouvante ni un SHA court ne décrivent le changement lu
+        self.assertIsNone(canon.git_diff(self.repo.root, "HEAD", third, "a.txt"))
+        self.assertIsNone(canon.git_diff(self.repo.root, second[:12], third,
+                                         "a.txt"))
+
     def test_a_symbolic_ref_is_never_cached(self):
         with mock.patch.object(canon.subprocess, "run",
                                wraps=subprocess.run) as run:

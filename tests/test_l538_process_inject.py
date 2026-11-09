@@ -676,6 +676,50 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.sync()
         self.assertEqual(len(self._sujets("orchestre")), 1)
 
+    def test_le_message_porte_un_diff_borne_et_un_lien_pas_le_corps(self):
+        # #6425 : la diffusion d'une fiche Process porte un diff borné et le
+        # lien vers la fiche ; le corps entier (98 k o pour « Processus de lot »)
+        # n'est plus recopié à chaque agent.
+        self.sync()
+        queue = "TAIL-QUEUE-98K"
+        long_body = ("# Processus de lot\n\n- la règle nouvelle\n"
+                     + "".join("- règle ancienne %03d\n" % i for i in range(600))
+                     + "- %s\n" % queue)
+        self._change(long_body)
+        revision = canon.load(self.clone)
+        ref = revision.processes[0].fiche.ref
+        self.sync()
+        recus = self._sujets("orchestre")
+        self.assertEqual(len(recus), 1, recus)
+        corps = recus[0]["body"]
+        self.assertIn("la règle nouvelle", corps)
+        self.assertIn("@@", corps)                 # un vrai diff unifié
+        self.assertIn(ref, corps)                  # le lien (référence canon)
+        self.assertIn("git -C", corps)             # la commande de lecture
+        self.assertIn(canon_sync.PROCESS_PUSH_CUT % canon_sync.PROCESS_PUSH_DIFF_MAX,
+                      corps)                      # la coupe est dite
+        self.assertNotIn(queue, corps)             # le corps entier n'est pas là
+        self.assertLessEqual(mail.octets(corps),
+                             canon_sync.PROCESS_PUSH_DIFF_MAX + 1500)
+
+    def test_un_diff_de_fiche_illisible_pousse_quand_meme_le_lien(self):
+        # #6425 : un diff de fiche illisible ne retient pas la poussée — le
+        # lien suffit, et le repère avance (la règle est dans le brief suivant).
+        self.sync()
+        self._change("# Processus de lot\n\n- la règle suivante\n")
+        revision = canon.load(self.clone)
+        head = revision.sources[0].commit
+        ref = revision.processes[0].fiche.ref
+        with mock.patch.object(canon, "git_diff", return_value=None):
+            report = self.sync()
+        self.assertEqual(report.processes.sent, 2)
+        corps = self._sujets("orchestre")[0]["body"]
+        self.assertIn("diff illisible", corps)
+        self.assertIn(ref, corps)
+        self.assertIn("git -C", corps)
+        self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
+                         head)
+
     def test_retired_recipient_still_declared_does_not_abort_sync(self):
         # #5080 : fiche encore présente, retrait DB déjà committé.
         self.sync()

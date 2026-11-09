@@ -273,13 +273,18 @@ class ContextTest(unittest.TestCase):
             document = SimpleNamespace(override=lambda project: SimpleNamespace(
                 contract_selection=mechanics.ContractSelection('contracts.json',
                                                                attestation_max_age_seconds=3600)))
-            with mock.patch('ameesh.config.load', return_value=Config()), \
+            # #6428 : le pilote initial est posé explicitement ; il ne dépend
+            # pas de l'environnement du job. Les parts psql exportent
+            # AMEESH_DRIVER=psql : sans cette base, le changement de pilote
+            # vérifié plus bas ne changeait rien et le témoin rougissait au
+            # nocturne psql alors que le contexte était correct.
+            with mock.patch.dict('os.environ', {'AMEESH_DRIVER': 'psycopg'}), \
+                    mock.patch('ameesh.config.load', return_value=Config()), \
                     mock.patch('ameesh.canon.load_configured', return_value=[SimpleNamespace(sources=[source])]), \
                     mock.patch('ameesh.mechanics.load_global', return_value=document), \
                     mock.patch.object(auto.shutil, 'which', return_value=str(launcher)), \
                     mock.patch.object(auto, 'run_command', return_value=probe), \
                     mock.patch.object(auto, 'project_python', return_value=sys.executable), \
-                    mock.patch.object(auto, 'test_driver', return_value='psycopg'), \
                     mock.patch.object(auto, '_state_dir', return_value=str(Path(root) / 'state')):
                 scope, path, lots, age = auto.contract_attestation_context(
                     repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
