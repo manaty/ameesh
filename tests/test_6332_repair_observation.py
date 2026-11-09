@@ -33,9 +33,11 @@ class ReportTest(unittest.TestCase):
         logs = []
         db = mock.Mock()
         db.query.return_value = [{'project': 'broken'}, {'project': 'working'}]
-        with mock.patch.object(obs, 'scan', side_effect=[RuntimeError('SECRET'), True]) as scan:
-            obs.observe(db, log=logs.append)
-        self.assertEqual(scan.call_count, 2)
+        with mock.patch.object(
+                obs, 'scan', side_effect=[RuntimeError('SECRET'), True, True]) as scan:
+            obs.observe(db, mesh_project='banc', log=logs.append)
+        # Two project streams and the declared scope of the alerts without one.
+        self.assertEqual(scan.call_count, 3)
         self.assertEqual(logs, ['repair-observation: source_error (RuntimeError)'])
 
 
@@ -44,7 +46,7 @@ class ObservationTest(PgTestCase):
         super().setUp()
         self.api = storage.of(self.db).repair_signals
         for table in ('repair_signals', 'repair_signal_streams', 'repair_signal_refusals',
-                      'github_watch_pending'):
+                      'repair_observation_scopes', 'github_watch_pending'):
             self.db.execute('DELETE FROM ' + table)
         self.db.execute('TRUNCATE ameesh_events, ameesh_events_pruned')
 
@@ -277,6 +279,7 @@ class ObservationTest(PgTestCase):
         from types import SimpleNamespace
         from ameesh import role_run
         self.event()
+        self.event('b'*64, project=None)
         report = dict(role='watcher', host='banc', held=True, stopped=False,
                       releve='', epoch=1, owner='test', left_s=200)
         proxy = mock.Mock(wraps=self.db)
@@ -293,10 +296,15 @@ class ObservationTest(PgTestCase):
              contextlib.redirect_stderr(io.StringIO()):
             lease.return_value.remaining.return_value = 100
             execution.return_value.lost.is_set.return_value = False
-            cfg = SimpleNamespace(host='banc', notify={})
+            cfg = SimpleNamespace(host='banc', notify={}, project='banc')
             self.assertEqual(role_run.run(cfg, args), 7)
         self.assertEqual(len(self.page('alerts')), 1)
         self.assertEqual(self.page('alerts')[0]['signal']['observed_version'], 'a'*40)
+        # #6477 : the role pass hands its configured project as the declared
+        # scope, so the alert without a project reaches the same journal.
+        without = self.api.page('banc', 'staging', 'alerts')
+        self.assertEqual(len(without), 1)
+        self.assertEqual(without[0]['signal']['native_id'], 'b'*64)
 
     def test_report_reads_durable_summary_in_read_only_transaction(self):
         self.ingest([self.row()])
@@ -304,3 +312,160 @@ class ObservationTest(PgTestCase):
         report = repair_report.read(self.db, project='acme', now=end)
         self.assertEqual(capability(report, 'A1')['counters']['journal_signaux'], 1)
         self.assertTrue(report['read_only'])
+
+
+class WithoutProjectTest(PgTestCase):
+    """#6477: alerts without a project are observed under the declared scope.
+
+    They belong to the mesh project read from the configuration, but their
+    scan position is their own: the project stream's cursor must neither
+    advance for them nor skip them.
+    """
+
+    SCOPE = 'banc'
+    ENV = 'staging'
+
+    def setUp(self):
+        super().setUp()
+        self.api = storage.of(self.db).repair_signals
+        for table in ('repair_signals', 'repair_signal_streams',
+                      'repair_signal_refusals', 'repair_observation_scopes'):
+            self.db.execute('DELETE FROM ' + table)
+        self.db.execute('TRUNCATE ameesh_events, ameesh_events_pruned')
+
+    def event(self, key='a'*64, project=None, **metadata):
+        data = {'key': key, 'revision': 'a'*40, 'detail': 'PRIVATE', **metadata}
+        return self.db.query(
+            "INSERT INTO ameesh_events(type,object,project,data)"
+            " VALUES ('alert.raised','alert:test',%s,%s::jsonb) RETURNING id",
+            (project, json.dumps(data)))[0]['id']
+
+    def page(self, project=None):
+        return self.api.page(project or self.SCOPE, self.ENV, 'alerts')
+
+    def scope_cursor(self, scope=None):
+        rows = self.db.query(
+            "SELECT cursor FROM repair_observation_scopes"
+            " WHERE scope=%s AND environment=%s AND source='alerts'",
+            (scope or self.SCOPE, self.ENV))
+        return rows[0]['cursor'] if rows else None
+
+    def observe(self, **kw):
+        return obs.observe(self.db, mesh_project=self.SCOPE, **kw)
+
+    def test_alert_without_project_is_received_once_under_the_declared_scope(self):
+        ident = self.event()
+        self.observe()
+        rows = self.page()
+        self.assertEqual(len(rows), 1)
+        signal = rows[0]['signal']
+        self.assertEqual(signal['project'], self.SCOPE)
+        self.assertEqual(signal['source'], 'alerts')
+        self.assertEqual(signal['outcome'], 'unknown')
+        self.assertEqual(self.scope_cursor(), str(ident))
+        self.assertNotIn('PRIVATE', json.dumps(rows))
+        # EOF resets the position; replaying the same committed page is neutral.
+        self.observe()
+        self.observe()
+        self.assertEqual(len(self.page()), 1)
+        self.assertEqual(self.api.summary(project=self.SCOPE)['occurrences'], 1)
+
+    def test_cursor_is_distinct_from_the_project_stream(self):
+        project_id = self.event('p'*64, project='acme')
+        without_id = self.event('w'*64)
+        self.observe()
+        self.assertEqual(len(self.api.page('acme', self.ENV, 'alerts')), 1)
+        self.assertEqual(self.api.state('acme', self.ENV, 'alerts')['cursor'],
+                         str(project_id))
+        # The scope's journal stream is the receipt stream, not its position.
+        self.assertIsNone(self.api.state(self.SCOPE, self.ENV, 'alerts')['cursor'])
+        self.assertEqual(self.scope_cursor(), str(without_id))
+
+    def test_without_project_pages_are_bounded(self):
+        for i in range(obs.BATCH + 1):
+            self.event('%064x' % i)
+        self.observe()
+        self.assertEqual(len(self.page()), obs.BATCH)
+        self.observe()
+        self.assertEqual(len(self.page()), obs.BATCH + 1)
+
+    def test_occurrences_count_only_alerts_without_project(self):
+        key = 'e'*64
+        self.event(key)
+        self.event(key, project='acme')
+        self.observe()
+        self.assertEqual(self.page()[0]['signal']['occurrence'], 1)
+        self.assertEqual(
+            self.api.page('acme', self.ENV, 'alerts')[0]['signal']['occurrence'], 1)
+
+    def test_repeated_raises_are_occurrences_not_deliveries(self):
+        key = 'f'*64
+        for _ in range(3):
+            self.event(key)
+        self.observe()
+        rows = self.page()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['signal']['occurrence'], 3)
+        self.observe()
+        self.observe()
+        self.assertEqual(self.page()[0]['signal']['occurrence'], 3)
+
+    def test_observation_opens_no_work(self):
+        before = self.db.query('SELECT count(*) AS n FROM work_items')[0]['n']
+        self.event()
+        self.observe()
+        self.assertEqual(self.db.query('SELECT count(*) AS n FROM work_items')[0]['n'],
+                         before)
+        self.assertEqual(self.page()[0]['signal']['outcome'], 'unknown')
+
+    def test_poison_is_refused_once_and_does_not_block_the_page(self):
+        self.db.execute(
+            "INSERT INTO ameesh_events(type,object,project,data)"
+            " VALUES ('alert.raised','alert:bad',NULL,'{}'::jsonb)")
+        self.event()
+        self.observe()
+        self.assertEqual(len(self.page()), 1)
+        self.assertEqual(
+            self.db.query('SELECT count(*) AS n FROM repair_signal_refusals')[0]['n'], 1)
+        self.assertNotIn('PRIVATE', json.dumps(self.page()))
+
+    def test_missing_declared_scope_is_not_invented(self):
+        self.event()
+        logs = []
+        obs.observe(self.db, mesh_project='', log=logs.append)
+        self.assertEqual(self.page(), [])
+        self.assertEqual(logs, ['repair-observation: scope_unset'])
+
+    def test_scope_failure_does_not_stop_the_project_scan(self):
+        self.event('p'*64, project='acme')
+        logs = []
+        with mock.patch.object(obs, '_scan_without_project',
+                               side_effect=RuntimeError('SECRET')):
+            self.observe(log=logs.append)
+        self.assertEqual(len(self.api.page('acme', self.ENV, 'alerts')), 1)
+        self.assertEqual(logs, ['repair-observation: source_error (RuntimeError)'])
+
+    def test_project_failure_does_not_stop_the_scope_scan(self):
+        self.event('p'*64, project='acme')
+        self.event()
+        logs = []
+        real = obs.scan
+
+        def scan(db, project, source, **kw):
+            if project == 'acme':
+                raise RuntimeError('SECRET')
+            return real(db, project, source, **kw)
+
+        with mock.patch.object(obs, 'scan', side_effect=scan):
+            self.observe(log=logs.append)
+        self.assertEqual(len(self.page()), 1)
+        self.assertEqual(logs, ['repair-observation: source_error (RuntimeError)'])
+
+    def test_a_failed_receipt_does_not_advance_the_scope_cursor(self):
+        self.event()
+        with mock.patch.object(obs, 'ingest', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                obs.scan(self.db, self.SCOPE, 'alerts',
+                         alerts=obs.WITHOUT_PROJECT)
+        self.assertIsNone(self.scope_cursor())
+        self.assertEqual(self.page(), [])
