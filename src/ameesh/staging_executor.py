@@ -675,6 +675,13 @@ def tick(db, cfg, options) -> dict:
         elected = role_run.live(db, options["role"])
         if not elected["held"] or elected.get("holder") != host:
             return {"state": "standby", "reason": "role changed"}
+        # #6520 second review: tie the request to this execution before the
+        # long preparation below, so a reader can tell a pending handoff this
+        # host is working on from a foreign lease, and a blocked request
+        # (which keeps state pending) never proves live staging.
+        if request.get("execution") != lease.owner:
+            request = dict(request, execution=lease.owner)
+            _record(db, options["key"], request, lease=lease)
         from .platform.child_environment import execution_transport
         timeout = options.get("timeout_s", staging_watch.STAGING_FALLBACK_S)
         env = execution_transport(dict(os.environ, BASCULE_ENV=options["bascule_env"],

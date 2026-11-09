@@ -197,17 +197,85 @@ class ReportErrorTest(unittest.TestCase):
              "execution": "staging-execution:ameesh-agents-2:exec-2"},
             {"owner": "staging-execution:ameesh-agents-1:exec-1",
              "expires_at": "2026-11-09T10:40:00Z"})
-        self.assertEqual(len(found), 1)
-        self.assertIs(found[0]["active"], False)
-        self.assertEqual(found[0]["sha"], "")
-        self.assertEqual(found[0]["execution"], "exec-1")
-        self.assertEqual(found[0]["host"], "ameesh-agents-1")
+        self.assertEqual(len(found), 2)
+        self.assertTrue(all(holder["active"] is False for holder in found))
+        by_sha = {holder["sha"]: holder for holder in found}
+        self.assertEqual(by_sha[""]["execution"], "exec-1")
+        self.assertEqual(by_sha[""]["host"], "ameesh-agents-1")
+        self.assertEqual(by_sha[SHA]["state"], "running")
+        self.assertEqual(by_sha[SHA]["execution"], "run-1")
         send = self.report(
             exception=release_cutoff.ReleaseBusy(
                 "staging execution busy; request not replaced"),
             cutoff_tag=tag(), holders=found)
         send.assert_called_once()
         self.assertIn("exécution exec-1", send.call_args.args[3])
+        self.assertNotIn("Rien à corriger", send.call_args.args[3])
+        self.assertIs(send.call_args.kwargs.get("urgent"), True)
+
+    def test_pending_handoff_under_its_claimed_execution_is_information(self):
+        owner = "staging-execution:ameesh-agents-1:exec-1"
+        found = holders(
+            {"request": "req-1", "state": "pending", "sha": SHA,
+             "execution": owner},
+            {"owner": owner, "expires_at": "2026-11-09T10:40:00Z"})
+        self.assertEqual(len(found), 1)
+        self.assertIs(found[0]["active"], True)
+        self.assertEqual(found[0]["state"], "pending")
+        send = self.report(
+            exception=release_cutoff.ReleaseBusy(
+                "staging execution busy; request not replaced"),
+            cutoff_tag=tag(), holders=found)
+        send.assert_called_once()
+        body = send.call_args.args[3]
+        self.assertIn("Staging en attente", body)
+        self.assertIn("Rien à corriger", body)
+        self.assertIs(send.call_args.kwargs.get("urgent"), False)
+
+    def test_blocked_pending_request_does_not_mask_a_foreign_lease(self):
+        # Second review witness #6520: tick keeps state pending when another
+        # staging sequence blocks it. That blocked handoff must not turn the
+        # foreign lease into "rien à corriger".
+        request = {"request": "req-old", "state": "pending", "sha": SHA,
+                   "blocked_reason": "another staging sequence running: old"}
+        lease = {"owner": "staging-execution:ameesh-agents-1:foreign",
+                 "expires_at": "2026-11-09T10:40:00Z"}
+        found = holders(request, lease)
+        self.assertEqual(len(found), 2)
+        self.assertTrue(all(holder["active"] is False for holder in found))
+        by_sha = {holder["sha"]: holder for holder in found}
+        self.assertEqual(by_sha[""]["execution"], "foreign")
+        self.assertEqual(by_sha[SHA]["state"], "pending")
+        self.assertIn("another staging sequence running: old",
+                      release_cutoff.staging_holders_text(found))
+        send = self.report(
+            exception=release_cutoff.ReleaseBusy(
+                "staging execution busy; request not replaced"),
+            cutoff_tag=tag(), holders=found)
+        send.assert_called_once()
+        body = send.call_args.args[3]
+        self.assertIn("coupure 11:00 déjà taguée", body)
+        self.assertIn("exécution foreign", body)
+        self.assertIn("bloqué : another staging sequence running: old", body)
+        self.assertNotIn("Rien à corriger", body)
+        self.assertIs(send.call_args.kwargs.get("urgent"), True)
+
+    def test_pending_request_under_a_foreign_lease_is_not_active(self):
+        request = {"request": "req-1", "state": "pending", "sha": SHA,
+                   "execution": "staging-execution:ameesh-agents-2:exec-2"}
+        lease = {"owner": "staging-execution:ameesh-agents-1:exec-1",
+                 "expires_at": "2026-11-09T10:40:00Z"}
+        found = holders(request, lease)
+        self.assertEqual(len(found), 2)
+        self.assertTrue(all(holder["active"] is False for holder in found))
+        by_sha = {holder["sha"]: holder for holder in found}
+        self.assertEqual(by_sha[""]["execution"], "exec-1")
+        self.assertEqual(by_sha[SHA]["execution"], "")
+        send = self.report(
+            exception=release_cutoff.ReleaseBusy(
+                "staging execution busy; request not replaced"),
+            cutoff_tag=tag(), holders=found)
+        send.assert_called_once()
         self.assertNotIn("Rien à corriger", send.call_args.args[3])
         self.assertIs(send.call_args.kwargs.get("urgent"), True)
 
@@ -257,6 +325,31 @@ class ElectedHandoffTest(unittest.TestCase):
         self.assertTrue(result["queued"])
         self.assertEqual(result["request"], "req-1")
         self.assertEqual(result["request_state"], "running")
+
+    def test_execution_lease_busy_with_a_claimed_pending_request_is_queued(self):
+        owner = "staging-execution:ameesh-agents-1:exec-1"
+        result = self.run_staging(
+            submit=RuntimeError("staging execution busy; request not replaced"),
+            latest={"request": "req-1", "state": "pending", "sha": SHA,
+                    "execution": owner},
+            lease={"owner": owner})
+        self.assertTrue(result["queued"])
+        self.assertEqual(result["request_state"], "pending")
+
+    def test_execution_lease_busy_with_a_blocked_pending_request_is_a_conflict(self):
+        request = {"request": "req-old", "state": "pending", "sha": SHA,
+                   "blocked_reason": "another staging sequence running: old"}
+        lease = {"owner": "staging-execution:ameesh-agents-1:foreign"}
+        with mock.patch.object(release_cutoff, "staging_holders",
+                               return_value=holders(request, lease)):
+            with self.assertRaises(release_cutoff.ReleaseBusy) as caught:
+                self.run_staging(
+                    submit=RuntimeError(
+                        "staging execution busy; request not replaced"),
+                    latest=request, lease=lease)
+        message = str(caught.exception)
+        self.assertIn("exécution foreign", message)
+        self.assertIn("bloqué : another staging sequence running: old", message)
 
     def test_execution_lease_busy_with_a_terminal_request_is_a_named_conflict(self):
         request = {"request": "req-old", "state": "completed", "sha": SHA,
@@ -370,6 +463,16 @@ class HolderTest(unittest.TestCase):
         self.assertEqual(found[0]["sha"], SHA)
         self.assertEqual(found[0]["state"], "pending")
         self.assertEqual(found[0]["version"], "1.46.0")
+
+    def test_a_blocked_pending_request_is_inactive_and_names_its_reason(self):
+        found = holders(
+            {"request": "req-1", "state": "pending", "sha": SHA,
+             "blocked_reason": "another staging sequence running: old"}, None)
+        self.assertEqual(len(found), 1)
+        self.assertIs(found[0]["active"], False)
+        self.assertEqual(found[0]["sha"], SHA)
+        self.assertIn("bloqué : another staging sequence running: old",
+                      release_cutoff.staging_holder_text(found[0]))
 
     def test_a_running_request_without_lease_is_named_but_inactive(self):
         found = holders(

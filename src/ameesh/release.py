@@ -368,12 +368,15 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
                 if db is not None:
                     by = ((" par %s" % same[0]["host"])
                           if same[0].get("host") else "")
-                    body = ("Coupure %s faite%s : tag %s sur %s. Staging en cours "
+                    pending = str(same[0].get("state") or "") == "pending"
+                    body = ("Coupure %s faite%s : tag %s sur %s. Staging %s "
                             "(%s).\n\nRien à corriger : le staging de cette coupure "
-                            "est déjà lancé et aucun second tag ne sera posé. "
+                            "est %s et aucun second tag ne sera posé. "
                             "L'attestation suivra."
                             % (tag["version"], by, tag["tag"], tag["commit"][:12],
-                               release_cutoff.staging_holder_text(same[0])))
+                               "en attente" if pending else "en cours",
+                               release_cutoff.staging_holder_text(same[0]),
+                               "en file" if pending else "déjà lancé"))
                     report = {"schema": release_cutoff.SCHEMA, "result": "staging-info",
                               "project": project.name, "cutoff_at": cutoff_at,
                               "label": _label, "completed_at": now, "message": text,

@@ -485,6 +485,10 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertIn("manual", self.request["blocked_reason"])
         self.assertEqual(self.request["state"], "pending")
+        # #6520: the request is tied to this execution before the wait, so a
+        # reader never takes the held lease for a foreign staging.
+        self.assertEqual(self.request["execution"],
+                         executor.ExecutionLease.return_value.owner)
         release_cutoff._worktree.assert_not_called()
         # The same wait is not journaled again on every timer pass.
         with mock.patch.object(executor, "_record") as record:

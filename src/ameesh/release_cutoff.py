@@ -3338,20 +3338,24 @@ def _staging_execution_holder(db, options: dict) -> dict | None:
 def _staging_request_active(request: dict | None, lease: dict | None) -> bool:
     """Whether a shared staging request proves live staging (#6520 review).
 
-    A terminal request never does: its commit must not be lent to a lease an
-    orphan execution still holds. A queued handoff is active before any
-    attempt; a running attempt is active only under the execution lease it
-    recorded, so a foreign execution is not mistaken for this cutoff's.
+    A terminal or blocked request never does: its commit must not be lent to
+    a lease an orphan execution still holds, and a blocked staging must stay
+    an alarm. A queued handoff is active before any attempt; once a lease is
+    held, the request counts only if the attempt recorded that execution
+    (#6520 second review), so a foreign execution is never mistaken for the
+    cutoff's staging.
     """
     if not isinstance(request, dict):
         return False
-    state = str(request.get("state") or "")
-    if state == "pending":
-        return True
-    if state != "running":
+    if str(request.get("blocked_reason") or ""):
         return False
+    state = str(request.get("state") or "")
     owner = str((lease or {}).get("owner") or "")
-    return bool(owner) and request.get("execution") == owner
+    if state == "pending":
+        return not lease or (bool(owner) and request.get("execution") == owner)
+    if state == "running":
+        return bool(owner) and request.get("execution") == owner
+    return False
 
 
 def staging_holders(project: ProjectRelease, db) -> list[dict]:
@@ -3393,27 +3397,29 @@ def staging_holders(project: ProjectRelease, db) -> list[dict]:
                 request_host = str(request.get("host") or "")
                 request_run = str(request.get("run") or "")
                 active = _staging_request_active(request, lease)
-                if lease and active:
+                if active:
                     add({"kind": "elected", "active": True,
-                         "host": request_host or owner_host,
-                         "execution": request_run or owner_execution,
+                         "host": request_host or (owner_host if lease else ""),
+                         "execution": request_run or (owner_execution if lease else ""),
                          "sha": sha, "state": state,
-                         "expires_at": str(lease.get("expires_at") or "")})
-                elif lease:
-                    # No active request of this execution owns the lease: an
-                    # orphan (or a foreign operation). Name it, and never
-                    # borrow a terminal request's commit.
-                    add({"kind": "elected", "active": False,
-                         "host": owner_host, "execution": owner_execution,
-                         "sha": "", "state": "held",
-                         "expires_at": str(lease.get("expires_at") or "")})
-                elif state in ("pending", "running") and sha:
-                    # A queued request is a handoff with no lease yet. A
-                    # running one without its lease is not proved to be this
-                    # cutoff's staging: keep its commit visible but inactive.
-                    add({"kind": "elected", "active": active,
-                         "host": request_host, "execution": request_run,
-                         "sha": sha, "state": state})
+                         "expires_at": str((lease or {}).get("expires_at") or "")})
+                else:
+                    # A lease that no active request of its execution owns is
+                    # an orphan (or a foreign operation): name it, and never
+                    # borrow a terminal or blocked request's commit.
+                    if lease:
+                        add({"kind": "elected", "active": False,
+                             "host": owner_host, "execution": owner_execution,
+                             "sha": "", "state": "held",
+                             "expires_at": str(lease.get("expires_at") or "")})
+                    if state in ("pending", "running") and sha:
+                        # The request is named aside, with the reason that
+                        # keeps it inactive, so a blocked handoff is not
+                        # silently covered by a foreign lease.
+                        add({"kind": "elected", "active": False,
+                             "host": request_host, "execution": request_run,
+                             "sha": sha, "state": state,
+                             "blocked_reason": str(request.get("blocked_reason") or "")})
         except Exception:  # noqa: BLE001 - a diagnostic read never blocks a report
             pass
     try:
@@ -3448,6 +3454,8 @@ def staging_holder_text(holder: dict) -> str:
         parts.append("commit %s" % str(holder["sha"])[:12])
     if holder.get("state"):
         parts.append("état %s" % holder["state"])
+    if holder.get("blocked_reason"):
+        parts.append("bloqué : %s" % holder["blocked_reason"])
     if holder.get("active") is False:
         parts.append("activité non prouvée")
     if holder.get("expires_at"):
