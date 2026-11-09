@@ -7,6 +7,9 @@
 #   ./sonde-c3-v22.sh prealables --sans-detenteur     identique (prealables ne lit pas le détenteur ;
 #        option acceptée pour l'appel à T-60 par pose-c3-v22.sh, sans effet sur les cases)
 #   ./sonde-c3-v22.sh go          T-15 : prealables des deux hôtes + détenteur candidat + base
+#        --release-fermee TS     v2.4 : la séquence a fermé la fenêtre release (fenetre-release.sh) ;
+#                                exige la minuterie release inactive et l'état gardé (2 lignes),
+#                                au lieu de la case « minuterie release active ».
 #        (migrations non additives inconnues du runtime L2, in_flight vide, aucune demande en cours)
 #        + dernière release ameesh taguée attestée + tick de release inactif sans job
 #   ./sonde-c3-v22.sh actif       après activation : N7 + minuteries L2 actives et armées, tick sans
@@ -118,7 +121,7 @@ bg_sans_sequence() {
 
 [ "${SONDE_BIBLIO:-}" = 1 ] && return 0 2>/dev/null
 mode=${1:-prealables}; shift || true
-TIMER_ATTENDU=$TIMER_144 HOTES="AG1 AG2" SHA= DEPUIS= CANON=
+TIMER_ATTENDU=$TIMER_144 HOTES="AG1 AG2" SHA= DEPUIS= CANON= RELEASE_FERMEE=
 while [ $# -gt 0 ]; do case $1 in
   --timer-attendu) TIMER_ATTENDU=$2; shift 2 ;;
   --hotes) HOTES=$2; shift 2 ;;
@@ -126,6 +129,7 @@ while [ $# -gt 0 ]; do case $1 in
   --sha) SHA=$2; shift 2 ;;
   --depuis) DEPUIS=$2; shift 2 ;;
   --canon) CANON=$2; shift 2 ;;
+  --release-fermee) RELEASE_FERMEE=$2; shift 2 ;;
   *) echo "argument inconnu : $1"; exit 2 ;; esac; done
 echo "sonde C3 v2.2 #5495 mode=$mode hôtes=$HOTES $(date -u +%FT%TZ)"
 
@@ -162,7 +166,14 @@ for f in glob.glob(\"/home/ameesh/.local/state/ameesh/release/reports/*.json\"):
     case_ "$h migrations non additives > $max (inconnues du runtime L2)" "$(lire AG2 "runuser -u ameesh -- env HOME=/home/ameesh $PY -c 'import psycopg;c=psycopg.connect(host=\"10.77.0.1\",user=\"ameesh\",dbname=\"ameesh\");print(c.execute(\"select count(*) from schema_non_additive_migrations where version>%s\",(int(\"$max\"),)).fetchone()[0])'")" 0
     case_ "$h tick de release inactif" "$(lire $h "systemctl --user -M ameesh@ show ameesh-release.service -p ActiveState --value")" inactive
     case_ "$h aucun job de release en file" "$(jobs_release $h)" 0
-    case_ "$h minuterie release active" "$(lire $h "systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value")" active
+    if [ -n "$RELEASE_FERMEE" ]; then
+      # v2.4 : la fenêtre a été fermée D'ABORD par fenetre-release.sh ; l'état gardé prouve
+      # l'état d'avant, et la minuterie doit être inactive (pas « active » comme en v2.2).
+      case_ "$h état gardé fenêtre release (2 lignes)" "$(lire $h "wc -l < /root/ameesh-operator-C3-fenetre-$h-$RELEASE_FERMEE/release-timer.etat")" 2
+      case_ "$h minuterie release arrêtée par la séquence" "$(lire $h "systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value")" inactive
+    else
+      case_ "$h minuterie release active" "$(lire $h "systemctl --user -M ameesh@ show ameesh-release.timer -p ActiveState --value")" active
+    fi
   done ;;
 actif)
   for h in $HOTES; do n7 $h; etat $h active; done ;;
