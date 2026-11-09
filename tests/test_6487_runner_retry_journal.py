@@ -707,6 +707,22 @@ class PreviousWriterOccurrenceTest(PgTestCase):
         self.assertEqual(resumed["pending_prompt"], "suite\n\ncontinue")
         self.assertEqual(str(resumed["pending_prompt_id"]), str(first))
 
+    def test_two_old_resumes_with_the_same_status_keep_the_reprise(self):
+        """B/P2 impl-11 et cx1 (#204850) : deux `resume` N-1 hors bail avec le
+        même `status_text` sont deux reprises de la même demande ; le second
+        ne retombe pas dans la branche `set_pending_prompt`. `last_seen` est
+        rafraîchi à chaque appel, `status_text` ne l'est pas."""
+        first = self.old_enqueue("continue")["pending_prompt_id"]
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = "
+                        "clock_timestamp() - interval '1 minute' WHERE name = %s",
+                        (self.agent,))
+        one = self.old_resume("suite")
+        two = self.old_resume("encore")
+        self.assertEqual(one["pending_prompt"], "suite\n\ncontinue")
+        self.assertEqual(two["pending_prompt"], "encore\n\nsuite\n\ncontinue")
+        self.assertEqual(str(one["pending_prompt_id"]), str(first))
+        self.assertEqual(str(two["pending_prompt_id"]), str(first))
+
 
 class RunnerRetryJournalStorageTest(PgTestCase):
     """Le journal réel : deux détenteurs, une tentative, issues terminales.

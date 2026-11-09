@@ -39,8 +39,10 @@ declare
     -- Un écrivain N-1 qui compose une consigne à partir de l'existante
     -- (déplacement, relève, redémarrage, adoption) déplace aussi une autre
     -- pièce durable de la ligne : hôte, bail, session, brief. `resume` est le
-    -- seul à ne changer que le texte de statut, et `set_pending_prompt` seul
-    -- n'écrit que la file (`pending_prompt`, `status`, `updated_at`).
+    -- seul à ne changer que la file et `last_seen` (qu'il rafraîchit à chaque
+    -- appel, même quand son texte de statut est déjà celui qu'il repose) ;
+    -- `set_pending_prompt` seul n'écrit que la file (`pending_prompt`,
+    -- `status`, `updated_at`).
     autre_etat boolean := false;
 begin
     if tg_op = 'UPDATE' then
@@ -78,10 +80,13 @@ begin
                 -- Déplacement, relève, redémarrage ou adoption : la consigne
                 -- reprise reste la même demande.
                 null;
-            elsif new.status_text is distinct from old.status_text then
+            elsif new.last_seen is distinct from old.last_seen then
                 -- `resume` : une consigne reçue sous bail vivant est une
                 -- demande neuve (même contrat que le nouveau code) ; hors
-                -- bail, elle rejoint la demande reprise.
+                -- bail, elle rejoint la demande reprise. `last_seen` est
+                -- rafraîchi à CHAQUE appel de l'ancien `resume`, même quand
+                -- `status_text` portait déjà le même texte : deux reprises
+                -- successives restent deux reprises.
                 if new.pending_prompt is distinct from old.pending_prompt
                    and old.lease_owner is not null
                    and old.lease_expires_at > clock_timestamp() then
