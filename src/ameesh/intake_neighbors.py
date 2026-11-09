@@ -336,24 +336,120 @@ def default_target(repo: Optional[str]) -> str:
         return ""
 
 
+def _release_target(cfg, app: str, slug: str = "") -> str:
+    """La `target` du projet dans `release.projects`, ou "".
+
+    C'est la configuration compilée des coupures du canon : sa cible est la
+    même que celle des releases (`develop` pour Nexlink). On lit la valeur
+    déclarée sans instancier un `ProjectRelease` (le handoff y résout le
+    registre) : la résolution de cible est appelée à chaque gel et à chaque
+    affichage, elle reste bornée et sans effet de bord.
+    """
+    block = getattr(cfg, "release", None)
+    if not isinstance(block, dict):
+        return ""
+    projects = block.get("projects")
+    if not isinstance(projects, dict):
+        return ""
+    entry = None
+    for name, value in projects.items():
+        if app and str(name).casefold() == app.casefold():
+            entry = value
+            break
+    if entry is None and slug:
+        try:
+            from . import migrations
+            wanted = migrations.repo_key(slug)
+        except Exception:  # noqa: BLE001 - URL inhabituelle
+            wanted = ""
+        if wanted:
+            for value in projects.values():
+                github = value.get("github") if isinstance(value, dict) else ""
+                try:
+                    if github and migrations.repo_key(str(github)) == wanted:
+                        entry = value
+                        break
+                except Exception:  # noqa: BLE001 - URL inhabituelle
+                    continue
+    if not isinstance(entry, dict):
+        return ""
+    target = entry.get("target")
+    if not isinstance(target, str) or not target.strip():
+        return ""
+    from . import plan_git
+    target = target.strip()
+    try:
+        plan_git.check_ref(target, "project target")
+    except ValueError:
+        return ""
+    return target
+
+
+def _github_base_target(cfg, app: str, slug: str = "") -> str:
+    """L'unique branche de base déclarée du projet (`github.projects.<p>.base`),
+    ou "".
+
+    `base` nomme la ou les branches sur lesquelles une PR atterrit (#1483 :
+    Nexlink a `develop` pour base) : une seule valeur est la cible
+    d'intégration du projet. Une liste en déclare plusieurs (main et develop) :
+    aucune ne s'impose, on ne devine pas.
+    """
+    try:
+        from . import plan_github
+        settings = plan_github.settings_of(cfg)
+    except Exception:  # noqa: BLE001 - configuration absente ou invalide
+        return ""
+    repo = settings.repo_for(app) if app else None
+    if not repo and slug:
+        repo = next((value for value in settings.projects.values()
+                     if value.casefold() == slug.casefold()), "")
+    if not repo:
+        return ""
+    bases = settings.bases_for(repo) or ()
+    if len(bases) != 1:
+        return ""
+    from . import plan_git
+    target = str(bases[0]).strip()
+    try:
+        plan_git.check_ref(target, "project target")
+    except ValueError:
+        return ""
+    return target
+
+
 def project_target(cfg, app: str, slug: str = "") -> str:
-    """La cible d'intégration déclarée du projet (`radar.projects.<p>.target`),
-    ou "" (#4733).
+    """La cible d'intégration déclarée du projet, ou "" (#4733, #6525).
 
     Un lot sans `branch_target` se lit sur la cible que le projet déclare
     (`develop` pour Nexlink), jamais sur la branche par défaut de la forge
     (`origin/HEAD`, souvent `main`/prod) : le diff `main...branche` porterait
     tout l'écart d'intégration, pas les fichiers du lot.
 
+    Sources, dans l'ordre, toutes déclaratives — aucune valeur propre à un
+    client n'est écrite ici (§7) :
+
+    1. `release.projects.<p>.target`, la configuration compilée des coupures
+       du canon, la même cible que celle des releases ;
+    2. `radar.projects.<p>.target`, la cible d'atterrissage de l'hôte ;
+    3. `github.projects.<p>.base`, quand une seule branche de base est
+       déclarée (la cible des PR du projet).
+
     Le projet se reconnaît à son nom, puis au dépôt déclaré pour ce nom
-    (`github.projects`) : un projet radar peut porter un autre nom que l'app.
+    (`github.projects`) : un projet peut porter un autre nom que l'app.
     """
+    if cfg is None or not (app or slug):
+        return ""
     if not slug and app:
         slug = _project_slug(cfg, app)
-    project = _radar_project(cfg, app or "", slug)
-    if project is None:
-        return ""
-    return str(getattr(project, "target", "") or "").strip()
+    target = _release_target(cfg, app, slug)
+    if target:
+        return target
+    project = _radar_project(cfg, app, slug)
+    if project is not None:
+        target = str(getattr(project, "target", "") or "").strip()
+        if target:
+            return target
+    return _github_base_target(cfg, app, slug)
 
 
 # --------------------------------------------------------------------------

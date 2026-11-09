@@ -805,17 +805,35 @@ def pair(db, lot: int, other: int, repo: str, *, fetch: bool = True) -> dict:
             raise ResolveError("lot #%d has no branch (ameesh work assign %d <agent> "
                                "--branch …)" % (n, n))
         rows[n] = row
+    # #6525 : la même résolution de cible que `work add`/`lot_class` — cible
+    # du lot, sinon du projet (configuration compilée), sinon du dépôt — et
+    # jamais `origin/HEAD` pour un projet qui déclare sa cible. Sans cela,
+    # deux lots nexlink sans `branch_target` se lisaient `main` sur un clone
+    # dont `origin/HEAD` est main, et `work resolve` refusait la paire.
+    from . import lot_class
+    cfg = getattr(db, "cfg", None)
     default = None
     targets = {}
     for n, row in rows.items():
-        if not row.get("branch_target") and default is None:
-            default = plan_git.default_target(repo)
-        targets[n] = row.get("branch_target") or default
+        explicit = str(row.get("branch_target") or "").strip()
+        targets[n] = explicit or lot_class.default_base(cfg, row, repo)
+        if not explicit and default is None:
+            # la forme résolue du défaut (`origin/main`) est celle que le
+            # clone connaît : elle prime sur un `main` explicite équivalent,
+            # quel que soit l'ordre des lots (#1802).
+            default = targets[n]
     # #1802 : `main` et `origin/main` (le défaut du dépôt) désignent la même
     # branche : comparer les formes courtes, pas les libellés enregistrés.
     if plan_git.short_branch(targets[lot]) != plan_git.short_branch(targets[other]):
+        # #6525 : nommer le lot dont la cible explicite n'est que le défaut du
+        # dépôt alors que son projet en déclare une autre, avec le geste qui
+        # la corrige — c'est ce refus qui a fait corriger dix lots à la main.
+        hints = [hint for hint in (lot_class.target_warning(cfg, rows[n], repo)
+                                   for n in (lot, other)) if hint]
         raise ResolveError("lots #%d and #%d do not share a target (%s, %s): their branches "
-                           "never merge together" % (lot, other, targets[lot], targets[other]))
+                           "never merge together%s"
+                           % (lot, other, targets[lot], targets[other],
+                              " — " + " ; ".join(hints) if hints else ""))
     target = default or targets[lot]
     # #2189 : the landing merge and the radar's trial merge read the target's
     # `.gitattributes`; preparation and replay must use the same tree, else a
