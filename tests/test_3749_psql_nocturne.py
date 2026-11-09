@@ -111,6 +111,31 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(self._ran(p, "psql"), self.mods)
         self.assertEqual(p["parts"]["psycopg"], [])
 
+    def test_le_nocturne_pese_la_table_des_mesures_pleines(self):
+        """#6437 : le nocturne suit `psql_full`, pas la carte sous couverture.
+
+        Le run 42460885729 a mesuré 5 406 à 13 500 s par part quand le plan en
+        annonçait 3 637 : cinq parts coupées au plafond de 60 min. Avec une
+        table `psql_full` où un module pèse 3 600 s, ce module doit partir seul
+        dans sa part (découpage LPT), pas être dilué dans la moyenne.
+        """
+        lent = self.mods[0]
+        table = {
+            "_generated": "2026-11-08T00:00:00Z",
+            "psql": {m: 1.0 for m in self.mods},
+            "psql_full": {m: 1.0 for m in self.mods}}
+        table["psql_full"][lent] = 3600.0
+        with tempfile.TemporaryDirectory() as tmp:
+            chemin = pathlib.Path(tmp) / "durees.json"
+            chemin.write_text(json.dumps(table), encoding="utf-8")
+            with mock.patch.object(plan.parts, "TABLE", chemin):
+                p = self._plan("schedule", psql_full=True)
+        self.assertEqual(self._ran(p, "psql"), self.mods)
+        porteuse = next(ps for ps in p["parts"]["psql"] if lent in ps["modules"])
+        self.assertGreaterEqual(porteuse["estimate_s"], 3600.0)
+        self.assertTrue(all(ps["estimate_s"] < 100.0
+                            for ps in p["parts"]["psql"] if ps is not porteuse))
+
     def test_le_lot_garde_sa_selection_psql(self):
         p = self._plan("pull_request", base_ref="main", head_ref="lot/x")
         self.assertEqual(p["selection"]["mode"], "impacted")

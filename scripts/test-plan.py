@@ -1604,11 +1604,42 @@ def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, flo
     return weighed
 
 
+def psql_full_weights(modules: list[str], card: dict | None) -> dict[str, float]:
+    """#6437 : poids du nocturne psql, mesurés sur la suite complète.
+
+    Hors nocturne, le découpage psql s'appuie sur la carte (mesurée sous
+    couverture) et sur la table `psql` (d'avant #5629) : ces deux sources
+    annonçaient 16 parts égales quand le run 42460885729 en a mesuré de
+    5 406 à 13 500 s, d'où cinq parts coupées au plafond de 60 min. Le même
+    run a mesuré la suite entière sous psql et sous la charge de la CI ;
+    `tests/parts/durees.json` garde ces secondes par module dans `psql_full`.
+    Ce sont elles qui équilibrent les parts du nocturne. `psql` comble les
+    modules que ce run n'a pas atteints (coupés, ou postérieurs) ; sans table
+    `psql_full` (arbre ancien, autre projet), le découpage habituel reste.
+    """
+    mesurees = (json.loads(parts.TABLE.read_text(encoding="utf-8"))
+                if parts.TABLE.exists() else {})
+    pleine = mesurees.get("psql_full") if isinstance(mesurees, dict) else None
+    if not isinstance(pleine, dict) or not pleine:
+        return weights(modules, "psql", card)
+    # La table `psql` d'abord : ses modules non atteints par le run gardent
+    # leur mesure ; `psql_full` écrase les autres, y compris la valeur
+    # prudente d'un module d'une part coupée.
+    reference = {m: float(v) for m, v in (mesurees.get("psql") or {}).items()
+                 if isinstance(v, (int, float))}
+    reference.update({m: float(v) for m, v in pleine.items()
+                      if isinstance(v, (int, float))})
+    weighed, _ = parts.weight(modules, "psql", {"psql": reference})
+    return weighed
+
+
 def split(modules: list[str], driver: str, n: int, card: dict | None,
-          classes: dict[str, tuple[str, str]]) -> list[dict]:
+          classes: dict[str, tuple[str, str]],
+          weighed: dict[str, float] | None = None) -> list[dict]:
     if not modules:
         return []
-    weighed = weights(modules, driver, card)
+    if weighed is None:
+        weighed = weights(modules, driver, card)
     result = []
     for i, part in enumerate(parts.split(weighed, n), 1):
         if part:
@@ -2060,6 +2091,9 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     chosen_set = None if selection is None else set(selection)
     contract = [m for m in plan.get("contract", []) if m in modules]
     plan["parts"] = {}
+    # #6437 : le nocturne pèse la suite entière avec les durées mesurées du
+    # run nocturne (`psql_full`), pas la carte sous couverture.
+    pleine = psql_full_weights(modules, card) if psql_full else None
     for driver, (n_pr, n_other) in PARTS.items():
         selected = modules
         if driver == "psql" and lot:
@@ -2084,7 +2118,9 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         n = n_pr if lot and chosen_set is not None else n_other
         if chosen_set is not None:
             n = min(n, lot_part_count(driver, selected, card))
-        plan["parts"][driver] = [] if skip else split(selected, driver, n, card, classes)
+        plan["parts"][driver] = [] if skip else split(
+            selected, driver, n, card, classes,
+            weighed=pleine if driver == "psql" else None)
     every = [m for m in modules]
     weighed = weights(every, "psycopg", card)
     chosen = [m for m in every if classes[m][0] in ("P0", "P1")]
@@ -2142,7 +2178,17 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
             "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     psql_split = None
-    if not psql_full:
+    if psql_full:
+        # #6437 : le repli du nocturne garde le découpage mesuré de `psql_full`
+        # (mêmes parts que le plan nominal), jamais la liste pilote.
+        try:
+            weighed = psql_full_weights(modules, None)
+            psql_split = [(part, sum(weighed[m] for m in part), False)
+                          for part in parts.split(weighed, PARTS["psql"][1])]
+        except (Exception, SystemExit) as exc:  # the fallback must not fail
+            plan["unsure"].append(f"psql_full table unreadable ({exc}); "
+                                  "whole suite under psql")
+    else:
         try:
             pilot = read_list(PILOT_FILE, modules, required=True)
             contract = read_list(ALWAYS_FILE, modules, required=True)
@@ -2150,7 +2196,7 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
                 raise ValueError("empty pilot or contract list")
             chosen = psql_pr_modules(pilot, contract)
             weighed, _ = parts.weight(chosen, "psql")
-            psql_split = [(part, sum(weighed[m] for m in part))
+            psql_split = [(part, sum(weighed[m] for m in part), True)
                           for part in parts.split(weighed, PARTS["psql"][1])]
         except (Exception, SystemExit) as exc:  # the fallback must not fail
             plan["unsure"].append(f"psql lists unreadable ({exc}); whole suite under psql")
@@ -2165,8 +2211,8 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
         if driver == "psql" and psql_split is not None:
             plan["parts"][driver] = [
                 {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": part,
-                 "pilot_list": True, "estimate_s": round(estimate, 1)}
-                for i, (part, estimate) in enumerate(psql_split, 1)]
+                 "pilot_list": pilot, "estimate_s": round(estimate, 1)}
+                for i, (part, estimate, pilot) in enumerate(psql_split, 1)]
             continue
         # no module list: scripts/test-parts.py splits the suite itself (L116)
         plan["parts"][driver] = [

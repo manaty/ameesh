@@ -16,7 +16,7 @@ from ameesh import adapters, db as db_mod, mail, registry
 from ameesh import platform as os_layer
 from ameesh.runner import AgentWorker, Runner, _AsyncLog
 
-from .support import FAKEBIN, PgTestCase, SRC
+from .support import FAKEBIN, PgTestCase, SRC, scaled
 
 HARNESSES = {
     "claude": {"session": "claude-sess-1", "reprise": ["--resume", "claude-sess-1"]},
@@ -349,7 +349,7 @@ class RunnerTest(PgTestCase):
             # La préparation précède le Popen : le battement doit déjà avoir
             # renouvelé le bail, sinon l'échéance tomberait pendant ce bloc.
             self.assertTrue(
-                renouvele.wait(10.0),
+                renouvele.wait(scaled(10.0)),
                 "aucun renouvellement pendant la préparation du tour : le "
                 "battement ne la couvre pas")
             return ouverture(self_)
@@ -360,7 +360,7 @@ class RunnerTest(PgTestCase):
             # Après-harnais : le battement doit encore renouveler ici (#2597).
             renouvele.clear()
             self.assertTrue(
-                renouvele.wait(10.0),
+                renouvele.wait(scaled(10.0)),
                 "le battement s'est arrêté à la sortie du harnais, avant la "
                 "compta d'après tour")
             return fin_de_tour(*args, **kwargs)
@@ -610,7 +610,7 @@ class RunnerTest(PgTestCase):
             # (le message arrivait avant l'inscription du worker : tour pris
             # au démarrage, sans réveil). #5637 : on attend la ligne qui
             # prouve l'inscription (`worker serving`), jamais un délai fixe.
-            echeance = time.monotonic() + 30
+            echeance = time.monotonic() + scaled(30.0)
             while not (any(l.startswith("LISTEN") or " LISTEN " in l for l in lignes)
                        and any("lease acquired: dort" in l for l in lignes)
                        and any("worker serving: dort" in l for l in lignes)):
@@ -622,16 +622,17 @@ class RunnerTest(PgTestCase):
                              env=self.env(AGENT_MAIL_NAME="orchestrateur"))
             self.assertEqual(envoi.returncode, 0)
             try:
-                proc.wait(timeout=30)
+                proc.wait(timeout=scaled(30.0))
             except subprocess.TimeoutExpired:
                 # #5637 : la sortie ne dépend plus du NOTIFY de bail (perdu
                 # sous charge) ; si elle traîne encore, le journal du runner
                 # dit où — sans quoi le rouge de CI reste muet.
-                self.fail("runner did not exit within 30 s:\n" + "".join(lignes))
+                self.fail("runner did not exit within %.0f s:\n%s"
+                          % (scaled(30.0), "".join(lignes)))
         finally:
             if proc.poll() is None:
                 proc.terminate()
-                proc.wait(timeout=10)
+                proc.wait(timeout=scaled(10.0))
             lecteur.join(10)
             # #3881 : le fil lecteur atteint l'EOF mais ne ferme pas le fichier
             # du tube ; sans cette fermeture, `unclosed file` sort en
@@ -701,7 +702,7 @@ class RunnerTest(PgTestCase):
             target=lambda: lignes.extend(iter(proc.stdout.readline, "")), daemon=True)
         lecteur.start()
         try:
-            echeance = time.monotonic() + 30
+            echeance = time.monotonic() + scaled(30.0)
             while not (any(l.startswith("LISTEN") or " LISTEN " in l for l in lignes)
                        and any("lease acquired: dort" in l for l in lignes)
                        and any("worker serving: dort" in l for l in lignes)):
@@ -712,13 +713,14 @@ class RunnerTest(PgTestCase):
                              env=self.env(AGENT_MAIL_NAME="orchestrateur"))
             self.assertEqual(envoi.returncode, 0)
             try:
-                proc.wait(timeout=30)
+                proc.wait(timeout=scaled(30.0))
             except subprocess.TimeoutExpired:
-                self.fail("runner did not exit within 30 s:\n" + "".join(lignes))
+                self.fail("runner did not exit within %.0f s:\n%s"
+                          % (scaled(30.0), "".join(lignes)))
         finally:
             if proc.poll() is None:
                 proc.terminate()
-                proc.wait(timeout=10)
+                proc.wait(timeout=scaled(10.0))
             lecteur.join(10)
             if proc.stdout is not None:
                 proc.stdout.close()
