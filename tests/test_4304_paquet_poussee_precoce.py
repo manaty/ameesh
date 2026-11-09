@@ -152,6 +152,9 @@ class Flux:
             # #4329 : le verrou de composition exige un dépôt git réel ; ce
             # banc monte un dépôt factice et mocke déjà tous les gestes git.
             mock.patch.object(paquet_auto, "PackageLock"),
+            # #6563 : le bail de composition du porteur, comme les autres
+            # gestes, est mocké : le banc ne touche pas la base réelle.
+            mock.patch.object(paquet_auto, "CompositionClaim"),
         ]
         with contextlib.ExitStack() as stack:
             for patch in patches:

@@ -250,7 +250,8 @@ class EpochLostTest(unittest.TestCase):
             record_packet="", run_inclusion=(0, "ok"), pull_request_state=None,
             ensure_pull_request=(7, "http://pr"), freeze_carrier="",
             request_full_ci="", note_carrier="", send_mail=None,
-            remove_worktree=None, PackageLock=mock.DEFAULT)
+            remove_worktree=None, PackageLock=mock.DEFAULT,
+            CompositionClaim=mock.DEFAULT)
         with mock.patch.multiple(auto, **{k: mock.DEFAULT for k in patches}) as mocks, \
                 mock.patch.object(auto, "check_epoch", side_effect=guard), \
                 mock.patch.object(auto, "check_local_tests", side_effect=tests), \
@@ -261,6 +262,7 @@ class EpochLostTest(unittest.TestCase):
             # #4329 : le verrou de composition exige un dépôt git réel ; ce
             # témoin monte un dépôt factice et mocke déjà tous les gestes git.
             mocks["PackageLock"].return_value = mock.MagicMock()
+            mocks["CompositionClaim"].return_value = mock.MagicMock()
             with self.assertRaises(auto.EpochLost):
                 auto.compose_packet(args)
         return tmp, keep, push, mocks
@@ -301,7 +303,8 @@ class PublishTest(Chain):
             pull_request_state=mock.DEFAULT, ensure_pull_request=mock.DEFAULT,
             note_carrier=mock.DEFAULT, request_full_ci=mock.DEFAULT,
             send_mail=mock.DEFAULT, record_packet=mock.DEFAULT,
-            push_branch=mock.DEFAULT, freeze_carrier=mock.DEFAULT)
+            push_branch=mock.DEFAULT, freeze_carrier=mock.DEFAULT,
+            CompositionClaim=mock.DEFAULT)
 
     def push(self, args, branch_head=None):
         git(self.repo, "push", "-q", "origin", "%s:%s" % (self.head, args.publish))
@@ -356,6 +359,19 @@ class PublishTest(Chain):
         # la réf réservée est mobile : elle désigne une autre tête que la marque
         with self.assertRaisesRegex(auto.ChainRefused, "la marque de tests atteste"):
             self.publish(self.args(publish_sha="f" * 40))
+
+    def test_ref_deplacee_rend_le_bail_du_porteur(self):
+        # #6563 : un refus avant la publication ne garde pas le bail du porteur
+        # tenu jusqu'à la fin du processus.
+        args = self.args(publish_sha="f" * 40)
+        self.push(args)
+        with self.finishing() as mocks:
+            mocks["compute_candidates"].return_value = (self.candidates(), {})
+            with self.assertRaisesRegex(auto.ChainRefused,
+                                        "la marque de tests atteste"):
+                auto.publish_tested(args)
+        claim = mocks["CompositionClaim"].return_value.start.return_value
+        claim.stop.assert_called_once()
 
     def test_branche_du_paquet_deplacee_refusee(self):
         # la branche poussée ne désigne plus la tête testée : rien n'est fini
