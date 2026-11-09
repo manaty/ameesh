@@ -26,7 +26,7 @@ ROOT = Path('/etc/ameesh-release-identities')
 RESTORE_SOCKET = '/run/ameesh-release-restore'
 PUBLIC_READ_EXTENSIONS = ('pg_stat_statements',)
 NAME = re.compile(r'[a-z][a-z0-9_]{0,62}\Z')
-CONTROLLER_READS = frozenset(('agent_registry', 'agent_mailbox', 'mesh_approvals',
+CONTROLLER_READS = frozenset(('agent_registry', 'mesh_approvals',
     'mesh_consumed_nonces', 'turn_resources', 'spend_pending', 'host_release_operations',
     'host_release_fences', 'host_release_fence_receipts', 'decision_supersessions',
     'mesh_approvals_status', 'schema_non_additive_migrations', 'mesh_keys'))
@@ -236,9 +236,33 @@ def audit_data(conn, name, schema, parent=None):
             'source identity has database creation privileges (including PUBLIC)')
     require(not conn.execute("SELECT 1 FROM pg_namespace WHERE has_schema_privilege(%s,oid,'CREATE')",
                              (oid,)).fetchone(), 'source identity has schema creation privilege')
+    # The controller may execute only the two bounded decision endpoints.
+    # Validate their complete SQL/owner/ACL contract before exempting their
+    # OIDs from the otherwise strict SECURITY DEFINER denial.
+    endpoints = []
+    if parent:
+        check_sql_programs()
+        try:
+            with conn.transaction():
+                previous = conn.execute("SELECT current_setting('search_path'), "
+                                        "current_setting('ameesh.release_role',true)").fetchone()
+                conn.execute("SELECT set_config('search_path',quote_ident(%s),true), "
+                             "set_config('ameesh.release_role',%s,true)", (schema, parent))
+                conn.execute((Path(__file__).resolve().parents[1] /
+                              'sql/_contrat-release-decision.sql').read_text())
+                endpoints = [row[0] for row in conn.execute(
+                    "SELECT to_regprocedure(format('%%I.%%s',%s::text,signature))::oid "
+                    "FROM (VALUES ('release_controller_decision(bigint)'), "
+                    "('release_controller_decision_ids(text)')) f(signature)", (schema,))]
+                conn.execute("SELECT set_config('search_path',%s,true), "
+                             "set_config('ameesh.release_role',%s,true)",
+                             (previous[0], previous[1] or ''))
+        except psycopg.Error:
+            raise IdentityError('controller decision endpoint contract refused') from None
     require(not conn.execute("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
                              "WHERE p.prosecdef AND n.nspname !~ '^pg_' "
-                             "AND has_function_privilege(%s,p.oid,'EXECUTE')", (oid,)).fetchone(),
+                             "AND has_function_privilege(%s,p.oid,'EXECUTE') "
+                             "AND NOT (p.oid=ANY(%s::oid[]))", (oid, endpoints)).fetchone(),
             'identity can execute a SECURITY DEFINER function')
     principals = [0, oid]
     if parent:
