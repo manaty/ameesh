@@ -110,6 +110,21 @@ SAUVEGARDES_VM=${SAUVEGARDES_VM%/}
 #: zéros de tête sont normalisés) ; la progression et les octets déjà écrits
 #: sont journalisés par le récepteur en cas d'échec
 RECUPERATION_TIMEOUT=${RECUPERATION_TIMEOUT:-3600}
+# #6537 (suite de #6528) : l'arrêt prouvé n'attend plus TimeoutStopSec
+# (35 min) en plein tour. Fin de tour attendue au plus ARRET_BORNE s par runner
+# et ARRET_BUDGET s sur toute l'étape ; puis arrêt forcé (second SIGTERM, puis
+# SIGKILL), chacun attendu au plus ARRET_FORCE_BORNE s. État relu toutes les
+# ARRET_SONDE s.
+ARRET_BORNE=${ARRET_BORNE:-300}
+ARRET_BUDGET=${ARRET_BUDGET:-900}
+ARRET_FORCE_BORNE=${ARRET_FORCE_BORNE:-60}
+ARRET_SONDE=${ARRET_SONDE:-2}
+for _v in ARRET_BORNE ARRET_BUDGET ARRET_FORCE_BORNE; do
+  [[ ${!_v} =~ ^[0-9]+$ ]] \
+    || { echo "$_v invalide : « ${!_v} » (secondes attendues)" >&2; exit 2; }
+done
+[[ $ARRET_SONDE =~ ^[0-9]+$ ]] && [ "$ARRET_SONDE" -gt 0 ] \
+  || { echo "ARRET_SONDE invalide : « $ARRET_SONDE » (secondes > 0 attendues)" >&2; exit 2; }
 case "${1:-}" in
   publier|rattraper) ;;
   *) mkdir -p "$TRAVAIL" "$SAUVEGARDES"; chmod 700 "$TRAVAIL" ;;
@@ -662,35 +677,107 @@ proprietaire_de() {  # unit → the lease owner its runner takes: --runner-id, e
   else echo ":$(systemctl --user show -p MainPID --value "$1")"; fi
 }
 # #1152 : arrêt PROUVÉ avant tout démarrage. Le SIGTERM de `stop` ferme
-# l'admission : le tour en cours se termine (drainage borné par
-# `drain_seconds`, sous `TimeoutStopSec`), plus aucun nouveau tour ne part. On
-# ne décide pas d'arrêter sur une lecture de statut — un tour peut partir juste
-# après elle — et on ne relance jamais au-dessus d'un processus vivant.
-# Only inactive with MainPID=0 proves the safe point. Clear a preexisting
-# failure BEFORE stop (#1907), so a new failure during drainage stays visible.
-redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
-  local u=$1 etat pid
+# l'admission : le tour en cours se termine (drainage), plus aucun nouveau
+# tour ne part. On ne décide pas d'arrêter sur une lecture de statut — un tour
+# peut partir juste après elle — et on ne relance jamais au-dessus d'un
+# processus vivant. Clear a preexisting failure BEFORE stop (#1907), so a new
+# failure during drainage stays visible.
+# #6537 (même correctif que vm.sh, #6528) : l'attente est bornée (ARRET_BORNE,
+# ARRET_BUDGET). Un tour encore en cours est arrêté par un second SIGTERM au
+# processus principal : le runner arrête le tour et remet sa consigne en
+# attente (`request_stop`) ; s'il ne sort pas, SIGKILL au groupe de l'unité.
+# Le point sûr est l'absence de processus : inactive, ou failed (SIGKILL,
+# délai d'arrêt) avec un cgroup vide, et MainPID=0. Un processus restant n'est
+# jamais prouvé.
+attendre_arret() {  # unité borne — 0 hors service, 1 encore actif, 2 illisible
+  local u=$1 n=$(( $2 / ARRET_SONDE )) i etat
+  for ((i = 0; ; i++)); do
+    etat=$(systemctl --user show -p ActiveState --value "$u") || return 2
+    case $etat in inactive|failed) return 0 ;; esac
+    ((i < n)) || return 1
+    sleep "$ARRET_SONDE"
+  done
+}
+cgroup_vide() {  # unité — 0 si aucun processus ne reste dans son cgroup
+  local cg f
+  cg=$(systemctl --user show -p ControlGroup --value "$1") || return 1
+  [ -n "$cg" ] || return 0
+  # un chemin de cgroup est absolu, sans `..` ; une autre sortie est illisible
+  [[ $cg == /* && $cg != *..* ]] || return 1
+  f=/sys/fs/cgroup$cg/cgroup.procs
+  [ ! -e "$f" ] || [ -z "$(cat "$f")" ]
+}
+arreter_hors_tour() {  # unité — 0 quand l'arrêt est prouvé (aucun processus, MainPID=0)
+  local u=$1 etat pid debut borne rc
   etat=$(systemctl --user show -p ActiveState --value "$u") \
     || { echo "$u : lecture d'ActiveState impossible — aucun démarrage" >&2; return 1; }
   if [ "$etat" = failed ]; then
     systemctl --user reset-failed "$u" \
       || { echo "$u : reset-failed échoue — aucun démarrage" >&2; return 1; }
   fi
-  systemctl --user stop "$u" \
-    || { echo "$u : l'arrêt échoue — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2; return 1; }
+  borne=$ARRET_BORNE
+  ((borne <= ARRET_BUDGET)) || borne=$ARRET_BUDGET
+  ((borne > 0)) || borne=1  # `timeout 0` ne borne rien
+  debut=$SECONDS
+  etape "$u : attente de fin de tour (au plus $borne s) — arrêt prouvé en cours"
+  # Le client `systemctl stop` est borné par `timeout` (code 124) : le job
+  # d'arrêt, lui, continue dans systemd, et le drainage avec lui.
+  rc=0; timeout "$borne" systemctl --user stop "$u" || rc=$?
+  case $rc in
+    0) ;;
+    124) rc=1 ;;  # tour encore en cours : arrêt forcé ci-dessous
+    *) echo "$u : l'arrêt échoue après $(( SECONDS - debut )) s (code $rc) — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
+       return 1 ;;
+  esac
+  ARRET_BUDGET=$(( ARRET_BUDGET - (SECONDS - debut) ))
+  ((ARRET_BUDGET > 0)) || ARRET_BUDGET=0
+  if [ "$rc" = 1 ]; then
+    echo "$u : tour encore en cours après $borne s — arrêt forcé : second SIGTERM, le tour s'arrête et sa consigne est remise en attente" >&2
+    systemctl --user kill --kill-who=main --signal=SIGTERM "$u" || true
+    rc=0; attendre_arret "$u" "$ARRET_FORCE_BORNE" || rc=$?
+  fi
+  if [ "$rc" = 1 ]; then
+    echo "$u : encore actif $ARRET_FORCE_BORNE s après le second SIGTERM — SIGKILL au groupe de l'unité" >&2
+    systemctl --user kill --kill-who=all --signal=SIGKILL "$u" || true
+    rc=0; attendre_arret "$u" "$ARRET_FORCE_BORNE" || rc=$?
+  fi
+  if [ "$rc" != 0 ]; then
+    echo "$u : arrêt non prouvé (unité encore active après SIGKILL, ou état illisible) — aucun démarrage ; journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
+    return 1
+  fi
   etat=$(systemctl --user show -p ActiveState --value "$u") || return 1
   pid=$(systemctl --user show -p MainPID --value "$u") || return 1
-  if [ "$etat" != inactive ] || [ "$pid" != 0 ]; then
+  if [ "$pid" != 0 ]; then
     echo "$u : arrêt non prouvé (ActiveState=$etat, MainPID=$pid) — aucun démarrage ; journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
     return 1
   fi
+  case $etat in
+    inactive) ;;
+    failed)
+      cgroup_vide "$u" \
+        || { echo "$u : arrêt non prouvé (ActiveState=failed, processus restant dans le cgroup ou cgroup illisible) — aucun démarrage ; journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2; return 1; }
+      systemctl --user reset-failed "$u" \
+        || { echo "$u : reset-failed échoue — aucun démarrage" >&2; return 1; }
+      etat=$(systemctl --user show -p ActiveState --value "$u") || return 1
+      [ "$etat" = inactive ] \
+        || { echo "$u : reset-failed sans effet (ActiveState=$etat) — aucun démarrage" >&2; return 1; }
+      echo "$u : failed après l'arrêt (SIGKILL ou délai d'arrêt), aucun processus restant — arrêt prouvé, échec effacé" ;;
+    *)
+      echo "$u : arrêt non prouvé (ActiveState=$etat, MainPID=$pid) — aucun démarrage ; journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
+      return 1 ;;
+  esac
+  etape "$u : arrêt prouvé — attente $(( SECONDS - debut )) s"
+}
+redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
+  local u=$1
+  arreter_hors_tour "$u" || return 1
   systemctl --user start "$u" \
     || { echo "$u : ne redémarre pas — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2; return 1; }
 }
 
 # Redémarre les unités $2… (base $1 : mesh | ancienne) une par une. L'admission
 # de chaque persona est fermée par `stop` (SIGTERM) AVANT tout démarrage : le
-# tour en cours draine, borné par TimeoutStopSec, et aucun nouveau tour ne
+# tour en cours draine, borné par ARRET_BORNE (#6537), et aucun nouveau tour ne
 # part. On n'attend plus un créneau « idle » : un statut `running` à chaque
 # lecture faisait expirer la mise à jour sans même arrêter l'unité (starvation
 # de l'incident impl07, #1152/R1). Le statut sert encore à la garde `stopped`
