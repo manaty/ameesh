@@ -97,6 +97,36 @@ class RemainingRoomTest(unittest.TestCase):
         self.assertIn("corrector(s) excluded: lecteur-ds registered;"
                       " hypothetical corrector: lecteur-codex", out["why"])
 
+    def test_the_hypothetical_is_never_eligible_under_another_family(self):
+        # B/P2 auditeur + ameesh-cx1 (#6458) : avant le correctif, le relecteur
+        # simulé n'était plus exclu par son nom ; une ligne candidate d'une
+        # autre famille (harnais changé) le rendait éligible et la projection
+        # disait « il reste de la place » à tort.
+        result = self.measure(
+            required=2,
+            reviewer={"name": "lecteur-codex", "family": "codex"},
+            candidates=[reviewer_row("lecteur-codex", "gemini"),
+                        reviewer_row("lecteur-ds", "deepseek")],
+            families=FAMILIES + ["gemini"])
+        self.assertEqual(result["state"], rc.STATE_TOO_TIGHT, result)
+        self.assertEqual(result["families"], ["deepseek"])
+        self.assertEqual(result["remaining"], 1)
+
+    def test_a_hypothetical_without_family_is_excluded_by_name(self):
+        # Même contrat pour une famille vide (exclusion personnelle, #3518) :
+        # `hypothetical` exclut par le nom comme `fixers`, jamais la famille
+        # seule.
+        out = review_designation.select(
+            required=1,
+            authors=[{"name": "redacteur", "family": "claude"}],
+            candidates=[reviewer_row("lecteur-codex", "deepseek"),
+                        reviewer_row("lecteur-ds", "deepseek")],
+            families=FAMILIES,
+            hypothetical=[{"name": "lecteur-codex", "family": ""}])
+        self.assertEqual(out["state"], review_designation.DESIGNATED, out)
+        self.assertEqual([row["name"] for row in out["reviewers"]],
+                         ["lecteur-ds"])
+
     def test_a_single_required_opinion_still_has_deepseek(self):
         result = self.measure(required=1)
         self.assertEqual(result["state"], rc.STATE_ENOUGH)

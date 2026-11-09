@@ -920,7 +920,8 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         return out
     seat_names = {row["name"] for row in seats} | {row["name"] for row in kept}
     eligible = [c for c in candidates or ()
-                if c.eligible(forbidden_names=names | seat_names | fixer_names,
+                if c.eligible(forbidden_names=(names | seat_names | fixer_names
+                                               | hypothetical_names),
                               forbidden_families=forbidden | seat_families,
                               families=families)]
     # #2668: a family's advance over its plan pace (points), lower is further
