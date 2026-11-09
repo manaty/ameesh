@@ -95,6 +95,26 @@ class CauseObservationTest(PgTestCase):
         self.assertEqual(result['relation'], 'same_symptom_unknown')
         self.assertEqual(work.get(self.db, opened['lot'])['source'], opened['source'])
 
+    def test_ingest_raccord_carries_a_producer_alias_without_a_cause(self):
+        """The U6 seam, not a direct call: a producer alias stays a symptom."""
+        opened = fp.open_lot(self.db, app='ameesh', key='old-command-rc1',
+                             title='Old symptom', environment='staging', actor='test')
+        rows = [{'key': 1, 'entry': {'id': 1},
+                 'fingerprint_key': 'old-command-rc1'}]
+        self.assertTrue(obs.ingest(
+            self.db, project='ameesh', environment='staging', source='inbox',
+            rows=rows, expected_cursor=None, next_cursor='one', now=NOW))
+        record = self.db.query(
+            'SELECT record FROM fingerprint_cause_observations')[0]['record']
+        self.assertEqual(record['alias'], opened['source'])
+        self.assertEqual(record['alias_candidates'], [opened['lot']])
+        self.assertEqual(record['candidates'], [])
+        self.assertEqual(record['cause_id'], '')
+        self.assertEqual(record['relation'], 'same_symptom_unknown')
+        self.assertEqual(record['effects'], 'none')
+        self.assertEqual(self.db.query(
+            'SELECT count(*) AS n FROM work_items')[0]['n'], 1)
+
     def test_closed_cause_active_old_and_mixed_versions(self):
         lot = self.lot()
         self.observe(lot=lot)
@@ -224,4 +244,7 @@ class CauseObservationTest(PgTestCase):
         records = self.db.query('SELECT record FROM fingerprint_cause_observations')
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]['record']['relation'], 'unknown')
+        self.assertEqual(records[0]['record']['alias'], '1')
+        self.assertEqual(records[0]['record']['alias_candidates'], [])
+        self.assertEqual(records[0]['record']['cause_id'], '')
         self.assertEqual(self.db.query('SELECT count(*) AS n FROM work_items')[0]['n'], 0)
