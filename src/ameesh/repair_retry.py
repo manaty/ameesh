@@ -82,7 +82,10 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 __all__ = ["SCHEMA", "SUMMARY_SCHEMA", "ORIGINS", "INTENTS", "CAUSES",
            "OUTCOMES", "FIELDS", "Retry", "RetryError", "key_of",
            "from_record", "summary", "summary_from_groups",
-           "observe_manual_resume", "observe_manual_resume_avoided"]
+           "observe_manual_resume", "observe_manual_resume_avoided",
+           "RUNNER_INTENT", "runner_retry_key", "runner_retry_avoided_key",
+           "observe_runner_retry_requested", "observe_runner_retry_engaged",
+           "observe_runner_retry_settled", "observe_runner_retry_avoided"]
 
 
 class RetryError(ValueError):
@@ -462,5 +465,96 @@ def observe_manual_resume_avoided(db, *, project, environment, agent, actor,
             intent=intent, cause=cause, episode="agent:%s" % agent))
     except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
         _log(log, "repair-retry: avoided resume not journaled (%s)"
+             % type(exc).__name__)
+        return None
+
+
+# --------------------------------------------------------------------------
+# relances automatiques du runner (U14 suite, #6487)
+# --------------------------------------------------------------------------
+
+#: intention d'une relance automatique : le tour d'une consigne en attente
+RUNNER_INTENT = "turn.retry"
+
+
+def runner_retry_key(project, agent, prompt):
+    """La clé d'idempotence d'une consigne en attente, stable entre détenteurs.
+
+    La consigne est l'identité de la relance : deux détenteurs qui observent
+    le même état ``pending_prompt`` calculent la même clé, et une consigne
+    remise en attente après une interruption (perte de bail, retrait d'hôte,
+    préemption) ne rejoue pas la tentative.  Le texte de la consigne n'est
+    jamais écrit : seul son condensé entre dans la clé.
+    """
+    return key_of("runner.turn", project, agent, prompt)
+
+
+def runner_retry_avoided_key(project, agent, prompt):
+    """La clé d'une relance évitée par idempotence (un autre détenteur)."""
+    return key_of("runner.turn.avoid", project, agent, prompt)
+
+
+def observe_runner_retry_requested(db, *, key, project, environment, agent,
+                                   cause="unknown", log=None):
+    """Journal the demand of an automatic relaunch: the queued instruction.
+
+    The runner reads ``pending_prompt`` (the state is set) before consuming
+    it; this is the *requested* intent, with no effect claimed.  The cause is
+    ``unknown`` by default: the runner does not know why the instruction was
+    queued and the contract forbids guessing it.  Best effort like the manual
+    observation: a journal failure never delays or changes admission.
+    """
+    try:
+        project, environment = _scope_of(project, environment)
+        return _store(db).retry_request(
+            key, project=project, environment=environment, origin="automatic",
+            intent=RUNNER_INTENT, cause=cause, episode="agent:%s" % agent)
+    except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
+        _log(log, "repair-retry: runner relaunch not journaled (%s)"
+             % type(exc).__name__)
+        return None
+
+
+def observe_runner_retry_engaged(db, *, key, log=None):
+    """Journal that the runner consumed the queued instruction (turn start).
+
+    ``False`` when another holder already engaged the same key (idempotent
+    replay); the journal is observation only and never refuses the turn.
+    """
+    try:
+        return bool(_store(db).retry_engage(key))
+    except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
+        _log(log, "repair-retry: runner engagement not journaled (%s)"
+             % type(exc).__name__)
+        return None
+
+
+def observe_runner_retry_settled(db, *, key, outcome, log=None):
+    """Journal the issue of a runner relaunch: completed or unknown, once."""
+    try:
+        if outcome not in OUTCOMES:
+            raise RetryError("outcome: expected one of %s" % ", ".join(OUTCOMES))
+        return bool(_store(db).retry_settle(key, outcome))
+    except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
+        _log(log, "repair-retry: runner outcome not journaled (%s)"
+             % type(exc).__name__)
+        return None
+
+
+def observe_runner_retry_avoided(db, *, key, project, environment, agent,
+                                 cause="other_holder", log=None):
+    """Journal a relaunch that idempotence made unnecessary.
+
+    Another holder consumed the same queued instruction first (or the state
+    changed before the write): no attempt is consumed, the queued demand is
+    left untouched, and the *avoided* entry is separate from the engaged one.
+    """
+    try:
+        project, environment = _scope_of(project, environment)
+        return bool(_store(db).retry_avoid(
+            key, project=project, environment=environment, origin="automatic",
+            intent=RUNNER_INTENT, cause=cause, episode="agent:%s" % agent))
+    except Exception as exc:  # noqa: BLE001 - observation, jamais un effet
+        _log(log, "repair-retry: avoided runner relaunch not journaled (%s)"
              % type(exc).__name__)
         return None

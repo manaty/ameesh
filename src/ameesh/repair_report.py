@@ -306,9 +306,11 @@ LIMITS = {
         "un événement sans run ne compte pas comme un run ; les runs distincts "
         "sont un plancher, pas un total de tentatives",
         "QA → build ne mesure pas les redémarrages manuels de processus",
-        "le journal A11 ne reçoit que les reprises manuelles appliquées "
-        "(resume, adopt) ; les relances automatiques du runner ne sont pas "
-        "encore raccordées et ne sont pas comptées",
+        "le journal A11 reçoit les reprises manuelles appliquées (resume, "
+        "adopt) et les relances automatiques d'une consigne en attente "
+        "consommée par le runner (origine automatique) ; les autres relances "
+        "du runner (reprise d'attache morte, relance cadencée après échec, "
+        "réveil programmé) ne sont pas encore raccordées",
         "une tentative au-delà de la première est une reprise (`retries`) ; le "
         "journal garde aussi la première tentative comme dénominateur",
     ),
