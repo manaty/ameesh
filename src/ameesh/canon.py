@@ -2923,6 +2923,31 @@ def git_read(repo: str, commit: str, path: str, *,
         return None
 
 
+def git_diff(repo: str, base: str, tip: str, path: str = "", *,
+             timeout: float = GIT_TIMEOUT,
+             deadline: Deadline | None = None) -> bytes | None:
+    """Le diff unifié `base..tip` (borné à `path` s'il est donné), ou None.
+
+    Les deux révisions doivent être des SHA complets, comme `git_read` : un
+    diff entre refs mouvantes ne décrirait pas le changement déjà lu. La
+    sortie est sans couleur, sans diff externe ni textconv (une lecture
+    d'objets git, jamais un programme configuré) et sans détection de
+    renommage : l'appelant borne le diff par un chemin, celui de la fiche au
+    commit `tip`. Un chemin vide donne le diff entier des deux commits.
+    """
+    if not (_SHA_RE.fullmatch(base or "") and _SHA_RE.fullmatch(tip or "")):
+        return None
+    args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv",
+            "--no-renames", "--unified=3", base, tip]
+    if path:
+        args += ["--", path]
+    try:
+        proc = _git(repo, *args, timeout=timeout, deadline=deadline)
+    except GitError:
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
 def git_remotes(repo: str, *, deadline: Deadline | None = None) -> list[str]:
     """Les dépôts distants ; avec ``deadline`` (#3572), une échéance épuisée
     lève `GitDeadline` au lieu de se lire « aucun dépôt distant »."""

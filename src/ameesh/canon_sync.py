@@ -142,6 +142,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -2404,8 +2405,8 @@ def sync_mechanics(canon: Canon) -> MechanicsSync:
 @dataclass
 class ProcessSync:
     """#538 : fiches Process modifiées depuis le dernier commit appliqué,
-    poussées en message `event` aux agents de l'hôte — leur prochain tour les
-    lit, sans réveiller personne."""
+    poussées en message `event` aux agents de l'hôte (réveil regroupé C9) :
+    leur prochain tour les lit."""
 
     #: titres des fiches poussées
     changed: list[str] = field(default_factory=list)
@@ -2424,6 +2425,67 @@ class ProcessSync:
         return out
 
 
+#: #6425 : plafond du diff poussé dans un message de règles (octets UTF-8).
+#: Le corps entier d'une fiche n'est plus diffusé : « Processus de lot » pèse
+#: ~98 k o, et 41 agents en recevaient 4 M caractères par diffusion (09/11).
+PROCESS_PUSH_DIFF_MAX = 4000
+#: #6425 : marque de coupe d'un diff trop long ; le lien de la fiche suit.
+PROCESS_PUSH_CUT = "… [diff cut at %d bytes — read the whole card at the link below]"
+
+
+def _clip_octets(text: str, limit: int, mark: str) -> str:
+    """`text` borné à `limit` octets UTF-8, marque comprise (jamais un
+    demi-caractère) : la coupe est dite par `mark`, pas silencieuse."""
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    marge = len(mark.encode("utf-8"))
+    if limit <= marge:
+        return data[:max(0, limit)].decode("utf-8", "ignore")
+    return data[:limit - marge].decode("utf-8", "ignore").rstrip() + mark
+
+
+def _fiche_ref(source, process) -> str:
+    """La référence de la fiche au commit poussé (`home:processus/lots.md@<sha>`)."""
+    return (getattr(process.fiche, "ref", "")
+            or "%s:%s@%s" % (process.fiche.member, process.fiche.path,
+                             source.commit))
+
+
+def _read_command(source, process) -> str:
+    """La commande qui rend la fiche entière depuis le clone du canon."""
+    return "git -C %s show %s" % (
+        shlex.quote(source.repo or "."),
+        shlex.quote("%s:%s" % (source.commit, process.fiche.path)))
+
+
+def _process_push_text(process, old: str, source) -> str:
+    """#6425 : le message poussé pour une fiche Process modifiée.
+
+    Il porte le diff `old..tip` borné (`PROCESS_PUSH_DIFF_MAX`) et le lien vers
+    la fiche au commit lu — jamais le corps entier, dont la diffusion coûtait
+    4 M caractères pour « Processus de lot ». Un diff illisible ne retient pas
+    la poussée : le lien suffit, et le brief de la prochaine session portera
+    les règles ; une coupe est dite, jamais silencieuse."""
+    ref = _fiche_ref(source, process)
+    lignes = ["Règles de travail du canon : %s" % process.title,
+              "Fiche : %s (diff %s..%s)"
+              % (ref, old[:12], source.commit[:12])]
+    diff = canon_mod.git_diff(source.repo, old, source.commit, process.fiche.path)
+    if diff is None:
+        lignes += ["", "(diff illisible — lire la fiche entière par le lien ci-dessous)"]
+    else:
+        texte = diff.decode("utf-8", "replace").strip()
+        if not texte:
+            lignes += ["", "(aucun diff textuel pour cette fiche)"]
+        else:
+            lignes += ["", _clip_octets(
+                texte, PROCESS_PUSH_DIFF_MAX,
+                "\n" + PROCESS_PUSH_CUT % PROCESS_PUSH_DIFF_MAX)]
+    lignes += ["", "Pour lire la fiche entière : `%s`" % _read_command(source, process)]
+    return "\n".join(lignes).strip()
+
+
 def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> ProcessSync:
     """#538 : pousse aux agents de `host` les fiches Process modifiées depuis
     le dernier commit poussé (`canon_state.process_commit` ; au premier envoi,
@@ -2433,6 +2495,10 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
     illisible ne pousse rien non plus (`error`) : mieux vaut manquer un
     rappel que pousser un texte qu'on n'a pas su relire — la règle, elle, est
     déjà dans le brief de la prochaine session.
+
+    #6425 : le message porte un diff borné et le lien vers la fiche, jamais le
+    corps entier (98 k o × 41 agents = 4 M caractères par diffusion). Un diff
+    de fiche illisible ne retient pas la poussée : le lien est toujours envoyé.
 
     #793 : les synchronisations concurrentes d'un hôte lisent le même ancien
     commit ; seule celle qui l'avance (`claim_commit`, dans la transaction
@@ -2492,8 +2558,8 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
                                                  state_key(db, canon, host)):
             return done
         for process in changed:
-            texte = ("Règles de travail du canon : %s\n\n%s"
-                     % (process.title, (process.body or "").strip())).strip()
+            # #6425 : diff borné + lien, jamais le corps entier de la fiche.
+            texte = _process_push_text(process, old, source)
             for name in sorted(set(agents)):
                 if name in done.skipped_retired:
                     continue
@@ -2501,7 +2567,8 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
                     mail_mod.send(tx, work_mod.SYSTEM_SENDER, name, texte, host=host,
                                   kind="event",
                                   payload={"event": "canon-process",
-                                           "path": process.fiche.path},
+                                           "path": process.fiche.path,
+                                           "ref": _fiche_ref(source, process)},
                                   thread=False)
                 except storage.RecipientRetired:
                     # #5080 : le retrait peut précéder celui de la fiche canon.
