@@ -1211,17 +1211,19 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     n'a pas d'assigné
     (#1026 : sans équipe, le brief partait à tous et deux orchestrateurs
     traitaient le même lot) ; `plan_underused`, ceux des équipes des agents au
-    repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
-    l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
+    repos ; `estimate_bias` (L157b), l'estimateur seul s'il est un agent du
+    registre (#6426 : ni le pilote ni l'auditeur n'ont de geste, l'auditeur lit
+    le biais à sa passe), sinon l'auditeur en repli. `module_deviation` :
     rôle explicite et projet, sans repli ; un constat de portée hôte
     (`project` absent, `dev` workspaces) n'a pas de fil de projet et part au
     responsable humain de son hôte ou agent (`notify.Router`), jamais en
     diffusion aux agents. `stale_lot` d'un lot en qa : le relecteur DÉSIGNÉ
     reçoit en outre le verdict qui lui est dû (#705).
-    Auditeurs : pour tous les types sauf `stale_lot` (L713) et
-    `plan_underused` (#3274) — lus à la passe de l'auditeur, sans réveil ;
-    sans aucun orchestrateur vivant, `plan_underused` se replie sur l'auditeur
-    (#3036). Un agent à la fois orchestrateur et auditeur reçoit un seul texte.
+    Auditeurs : pour tous les types sauf `stale_lot` (L713), `plan_underused`
+    (#3274) et `estimate_bias` avec un estimateur au registre (#6426) — lus à
+    la passe de l'auditeur, sans réveil ; sans aucun orchestrateur vivant,
+    `plan_underused` se replie sur l'auditeur (#3036). Un agent à la fois
+    orchestrateur et auditeur reçoit un seul texte.
 
     #3036 : `closed_hosts` (les hôtes de `claims_closed_hosts`) et le champ
     `lease_live` des lignes du registre écartent les destinataires qui ne
@@ -1325,16 +1327,15 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                     extra[name] = _verdict_due(alert)
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
-            teams = _projects(by_name, alert.get("agent"))
-            if not teams:
-                # #3502 : un estimateur sans équipe connue (hors registre, ou
-                # fiche sans projet) ne doit pas réveiller TOUS les
-                # orchestrateurs — l'orchestrateur Nexlink recevait ainsi les
-                # estimateurs ameesh `claude3`, `bureau`, `inconnu` et
-                # `human:smichea`. Le brief va à l'estimateur s'il est au
-                # registre, sinon à l'auditeur (repli bureau) : c'est lui qui
-                # publie la table et peut corriger le biais à la source.
-                orchestras = []
+            # #6426 : l'estimateur est le seul acteur du biais (il part de la
+            # table de référence et justifie ses écarts) ; le pilote et
+            # l'auditeur recevaient le même courrier sans geste — le pilote l'a
+            # écrit (mesh-design, 09/11 01:03 : « no action on these automated
+            # estimate-bias alerts »), et l'auditeur lit les biais à sa passe
+            # (`ameesh alerts --json`, docs/AUDITEUR.md §11). Un estimateur
+            # hors registre garde le repli auditeur/bureau ci-dessous (#3502).
+            orchestras = []
+            teams = set()
         elif kind == "waiting_without_question":
             text = _waiting_without_question(alert)
             teams = _projects(by_name, alert.get("agent"))
@@ -1414,6 +1415,12 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     # vivant, l'auditeur prend le relais plus bas (#3036).
     if kind not in ("stale_lot", "plan_underused"):
         for name in auditor_names or ():
+            if kind == "estimate_bias" and alert.get("agent") in by_name:
+                # #6426 : l'estimateur est briefé ; l'auditeur lit le biais à
+                # sa passe (`ameesh alerts --json`, docs/AUDITEUR.md §11), sans
+                # second courrier ni réveil. Un estimateur hors registre garde
+                # le repli auditeur plus bas (#3502).
+                continue
             out.setdefault(name, audit_text)
     if kind in ("critical_budget_pause", "budget_pause_long", "rate_limited_chronic",
                 "account_config_invalid", "operator_pause_long"):
