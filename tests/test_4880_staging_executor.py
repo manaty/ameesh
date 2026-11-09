@@ -468,6 +468,13 @@ class ExecutorTest(unittest.TestCase):
             executor.submit(self.db, self.cfg, self.options, "b" * 40)
         self.assertEqual(self.calls, [])
 
+    def test_submit_refuses_a_blocked_request_for_the_same_commit(self):
+        # Third review witness #6520: the free lease and the same commit used
+        # to return the blocked request as a normal queued handoff.
+        self.request["blocked_reason"] = "another staging sequence running: old"
+        with self.assertRaisesRegex(RuntimeError, "staging request blocked"):
+            executor.submit(self.db, self.cfg, self.options, "a" * 40)
+
     def test_automatic_release_queues_without_running_in_its_launcher(self):
         project = release_cutoff.ProjectRelease(
             name="test", repo=str(self.root), staging_executor="private.json")

@@ -610,6 +610,12 @@ def submit(db, cfg, options, sha, *, included=()):
         previous = latest(db, options["key"])
         if previous and previous["state"] in ("pending", "running"):
             if previous["sha"] == sha:
+                blocked = str(previous.get("blocked_reason") or "")
+                if blocked:
+                    # #6520: a blocked request is not a queued handoff. The
+                    # release must name the blocker, never report "rien à
+                    # corriger" from a normal submit return.
+                    raise RuntimeError("staging request blocked: " + blocked)
                 return previous
             if not previous.get("blocked_reason"):
                 raise RuntimeError("an unfinished staging request already exists")

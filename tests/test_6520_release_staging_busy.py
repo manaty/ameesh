@@ -336,6 +336,21 @@ class ElectedHandoffTest(unittest.TestCase):
         self.assertTrue(result["queued"])
         self.assertEqual(result["request_state"], "pending")
 
+    def test_a_blocked_request_returned_by_submit_is_a_named_conflict(self):
+        # Third review witness #6520: submit normally returns the previous
+        # request for the same commit even with a free lease. A blocked one
+        # must not become a queued handoff and "rien à corriger".
+        request = {"request": "req-1", "state": "pending", "sha": SHA,
+                   "blocked_reason": "another staging sequence running: old"}
+        with mock.patch.object(release_cutoff, "staging_holders",
+                               return_value=holders(request, None)):
+            with self.assertRaises(release_cutoff.ReleaseBusy) as caught:
+                self.run_staging(submit=request)
+        message = str(caught.exception)
+        self.assertIn("staging request blocked: another staging sequence running: old",
+                      message)
+        self.assertIn("bloqué : another staging sequence running: old", message)
+
     def test_execution_lease_busy_with_a_blocked_pending_request_is_a_conflict(self):
         request = {"request": "req-old", "state": "pending", "sha": SHA,
                    "blocked_reason": "another staging sequence running: old"}

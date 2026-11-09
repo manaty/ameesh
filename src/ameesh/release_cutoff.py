@@ -2669,6 +2669,13 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                         "request_state": pending.get("state"),
                         "request_host": pending.get("host", "")}
             raise ReleaseBusy(_staging_busy_text(project, db, str(exc))) from exc
+        blocked = str((request or {}).get("blocked_reason") or "")
+        if blocked:
+            # #6520: submit returns the previous request unchanged for the
+            # same commit, lease free or not. A blocked one is not a queued
+            # handoff: name the blocker instead of a "rien à corriger".
+            raise ReleaseBusy(_staging_busy_text(
+                project, db, "staging request blocked: " + blocked))
         return {"exit": 75, "queued": True, "duration_s": 0.0, "log": "",
                 "summary": [], "attestation": None,
                 "request": request.get("request"),
