@@ -1,7 +1,7 @@
-# #6002 — bloc root B2 v4 : réinstallation de l'adaptateur VM de bureau-goal à 242ced70
+# #6002 — bloc root B2 v5 : réinstallation de l'adaptateur VM de bureau-goal à 242ced70
 
 Bureau (BG), 09/11. Demandé par mesh-design #205785 et #205796, corrigé selon cx1 #205801 (v2) et
-#205810 (v3), puis impl-03 #205820 (v4 : N1 à N6). Lancé par l'owner, en root, sur bureau-goal, **après** le reçu de la simulation #6572
+#205810 (v3), puis impl-03 #205820 (v4 : N1 à N6), puis cx1 #205830 (v5). Lancé par l'owner, en root, sur bureau-goal, **après** le reçu de la simulation #6572
 et deux avis OK (ameesh-cx1, mty-amh-impl-03). N'active rien : `enrollment.json` reste
 `enabled: false`, le timer reste désactivé. Le script ne garantit pas qu'aucune requête VM n'a eu
 lieu : il garantit seulement qu'il n'en lance aucune, et ses gardes refusent tout worker vivant.
@@ -58,6 +58,13 @@ B2. `src-242ced700d6e` et `venv-242ced700d6e` restent sur place, inertes.
 - **N6** : dépendances épinglées par `PIP_CONSTRAINT` (versions du venv actuel : psutil 7.2.2,
   psycopg et psycopg-binary 3.3.8, typing_extensions 4.16.0 ; backend setuptools 80.9.0). Pas de
   hashes : pip reste en root sur PyPI, risque accepté et nommé. Le `freeze` du nouveau venv est gardé au reçu.
+
+## v5 (cx1 #205830)
+- La validation du profil et du secret existant est gardée en mémoire (`SCW_VALIDATION=$(scw valider) || stop`) :
+  aucun fichier temporaire, en particulier aucun nom prévisible sous `/tmp` ouvert en root.
+- La création (`SCW_RESULT=$(scw creer) || stop`), la relecture du nouveau lien venv et la lecture des
+  droits finaux ont chacune leur rc contrôlé avant d'être consignées. Un échec arrête avant la pose
+  des unités, sans annoncer « fin B2 ».
 
 ## Intégrité au lancement (owner)
 Ne pas lancer depuis l'arbre de `agent`. Copier en root, vérifier l'empreinte, lancer la copie :

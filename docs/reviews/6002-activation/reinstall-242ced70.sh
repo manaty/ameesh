@@ -8,6 +8,8 @@
 #   change (src est le dossier historique 33bfa473, hors usage du venv, laissé intact) et sa cible est
 #   validée ; préalables du service vérifiés (database.env, enrollment.json, AMEESH_CONFIG) ; parents
 #   root et non inscriptibles ; dépendances épinglées par contraintes.
+# v5 (cx1 #205830) : aucun fichier temporaire (validation gardée en mémoire) ; rc contrôlé de toute
+#   commande dont la sortie est consignée (scw creer, lien, droits).
 # À lancer par l'owner, en root, sur bureau-goal, depuis une copie root vérifiée (voir DOSSIER-B2.md).
 set -euo pipefail
 SHA=242ced700d6ec1a63fc9d72643bc9faad175f72f
@@ -124,7 +126,7 @@ OLD_VENV=$(readlink $OPT/venv) || stop "$OPT/venv n'est pas un lien"
 [ -f $OPT/commandes/vm-commande.py ] || stop "commande actuelle absente"
 SCW_SHA=$(sha256sum < $SCW | cut -c1-64) || stop "lecture du profil scw"
 SCW_INFO=$(stat -c '%y %U:%G %a' $SCW) || stop "lecture du profil scw"
-scw valider > /tmp/.6002-scw-valider.$$ || { rm -f /tmp/.6002-scw-valider.$$; stop "profil scw ou scaleway.json existant refusé"; }
+SCW_VALIDATION=$(scw valider) || stop "profil scw ou scaleway.json existant refusé"
 
 # 1. Reçu durable AVANT le premier changement : lien venv, commande, unités (ou leur absence), constats.
 install -d -m 0700 -o root -g root $RECU
@@ -152,8 +154,7 @@ EOF
 chmod 0600 $RECU/retour.sh
 constat "reçu et retour : $RECU (retour : sudo bash $RECU/retour.sh)"
 constat "profil scw source : $SCW_INFO (date de la copie = référence de péremption si la clé tourne)"
-constat "$(cat /tmp/.6002-scw-valider.$$)"
-rm -f /tmp/.6002-scw-valider.$$
+constat "$SCW_VALIDATION"
 constat "src historique laissé intact : $OPT/src (dossier, source 33bfa473) ; seul le lien venv change"
 trap 'echo "ÉCHEC : état d avant restaurable par sudo bash '"$RECU"'/retour.sh" >&2' ERR
 
@@ -193,11 +194,14 @@ install -m 0644 -o root -g root $OPT/src-$SHORT/deploy/vm-adapter/commandes/vm-c
 [ "$(git hash-object $OPT/commandes/.vm-commande.py.$SHORT)" = "$(runuser -u $OP -- git -C $REPO rev-parse "$SHA:deploy/vm-adapter/commandes/vm-commande.py")" ] || stop "vm-commande.py copié ≠ blob"
 mv -f $OPT/commandes/.vm-commande.py.$SHORT $OPT/commandes/vm-commande.py
 ln -sfn venv-$SHORT $OPT/venv
-constat "lien venv : $OLD_VENV → $(readlink $OPT/venv)"
+NEW_VENV=$(readlink $OPT/venv) || stop "lecture du nouveau lien venv"
+[ "$NEW_VENV" = venv-$SHORT ] || stop "lien venv inattendu après bascule : $NEW_VENV"
+constat "lien venv : $OLD_VENV → $NEW_VENV"
 
 # 5. scaleway.json : création depuis la source validée à l'étape 0, si elle n'a pas changé.
 [ "$(sha256sum < $SCW | cut -c1-64)" = "$SCW_SHA" ] || stop "profil scw modifié depuis la validation"
-constat "$(scw creer)"
+SCW_RESULT=$(scw creer) || stop "création ou validation de scaleway.json refusée"
+constat "$SCW_RESULT"
 
 # 6. Unités : celles du SHA, User=agent substitué, vérifiées, posées. Timer NON activé.
 W=$(mktemp -d)
@@ -210,5 +214,6 @@ rm -rf "$W"
 systemctl daemon-reload
 garde_etats "après la pose"
 sha256sum $UNITDIR/ameesh-vm-adapter.service $UNITDIR/ameesh-vm-adapter.timer $OPT/commandes/vm-commande.py | tee $RECU/empreintes-apres
-constat "$(stat -c '%a %U:%G %n' $ETC/scaleway.json $ETC/enrollment.json $ETC/database.env | tr '\n' ' ')"
+DROITS=$(stat -c '%a %U:%G %n' $ETC/scaleway.json $ETC/enrollment.json $ETC/database.env) || stop "lecture des droits finaux"
+constat "$(printf '%s\n' "$DROITS" | tr '\n' ' ')"
 constat "fin B2 : adaptateur à $SHORT, unités posées, timer DÉSACTIVÉ, enrollment enabled:false ; reçu $RECU"
