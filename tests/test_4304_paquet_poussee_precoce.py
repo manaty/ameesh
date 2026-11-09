@@ -263,7 +263,8 @@ class PousseePrecoceTest(unittest.TestCase):
         withdraw = flux.calls("withdraw")
         self.assertEqual(len(withdraw), 1)
         self.assertEqual(withdraw[0][1][1:3], (4304, 3281))
-        # paquet-horaire clôt le porteur sur cette ligne (after_compose)
+        # #6561 : paquet-horaire ne lit plus cette ligne comme « rien composé »
+        # (le porteur reste ouvert à son pilote) ; paquet-auto dit le retrait.
         self.assertTrue(any(line.startswith("aucune unité après recomposition")
                             for line in out), out)
         self.assertEqual(flux.calls("mail"), [])
