@@ -102,6 +102,10 @@ class BuilderTest(unittest.TestCase):
         # le document normalisé reste le seul porteur des mesures étiquetées
         self.assertEqual(payload["context"]["measures"]["C_last"]["value"], 22500)
         self.assertEqual(payload["context"]["measures"]["R_turn"]["value"], 43500)
+        # #6433 : la série par étape est publiée avec le document, sans être
+        # recopiée dans un compteur legacy
+        self.assertEqual(payload["context"]["series"]["steps"], 2)
+        self.assertEqual(payload["context"]["series"]["dC_max"]["value"], 1500)
 
     def test_le_document_n_est_pas_modifie(self):
         document = observe_all(CLAUDE, "claude_stream.jsonl",

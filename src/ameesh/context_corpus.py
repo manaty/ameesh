@@ -10,7 +10,10 @@ décision n'est prise ici.
 Ce que le corpus ne contient jamais : prompt, résultat d'outil, texte de
 courrier, secret, chemin privé. Le constructeur ne recopie que les champs
 d'une liste blanche ; les mesures absentes restent ``None`` avec leur raison,
-jamais ``0`` (contrat ``ameesh-context/1`` §2.4).
+jamais ``0`` (contrat ``ameesh-context/1`` §2.4). #6433 : la série par étape
+du ``turn.context`` (``series``) est recopiée quand elle est publiée ;
+optionnelle en lecture, un corpus antérieur la laisse ``null`` avec
+``not_published``.
 
 Le corpus réel n'est pas versionné dans le dépôt : :func:`write_corpus` refuse
 un chemin situé dans un arbre Git et écrit le fichier en ``0600``. Les cinq
@@ -80,7 +83,7 @@ LINE_KEYS = frozenset({
     "session_seq", "W", "auxiliary_models",
     "C_last", "C_peak", "O_last", "C_next_input", "C_next", "R_turn", "R_session",
     "R_session_base", "O", "S_hist", "cache_read_tokens", "cache_write_tokens",
-    "decision", "policy", "legacy", "quality", "reasons", "source",
+    "series", "decision", "policy", "legacy", "quality", "reasons", "source",
 })
 REQUIRED_LINE_KEYS = frozenset({
     "schema", "turn_id", "agent", "harness", "model", "model_quality",
@@ -91,6 +94,9 @@ REQUIRED_LINE_KEYS = frozenset({
     "quality", "reasons", "source",
 })
 MEASURE_KEYS = frozenset({"value", "quality", "reasons", "granularity", "source"})
+#: #6433 : série par étape publiée avec le document ; optionnelle en lecture
+#: (un corpus produit avant son ajout reste lisible, comme ``C_peak``).
+SERIES_KEYS = frozenset({"steps", "C_first", "dC_max", "dC_max_rank"})
 CORE_MEASURES = ("C_last", "O_last", "R_turn", "R_session", "R_session_base",
                  "O", "S_hist", "cache_read_tokens", "cache_write_tokens")
 #: #6044 : `C_peak` est publiable sans être requis, pour qu'un corpus produit
@@ -245,6 +251,47 @@ def _copy_measure(raw, default_reason: str, *, granularity: str = "call") -> dic
     return measure(value, quality=quality, reasons=reasons,
                    granularity=raw.get("granularity") or granularity,
                    source=raw.get("source"))
+
+
+def _count(value) -> int | None:
+    """Un compteur d'étapes : entier positif ou nul, jamais inventé."""
+    number = _number(value)
+    return number if isinstance(number, int) and number >= 0 else None
+
+
+def _rank(value) -> int | None:
+    """Le rang d'une croissance : deux appels au moins, un entier."""
+    number = _number(value)
+    return number if isinstance(number, int) and number >= 2 else None
+
+
+def _series(raw) -> dict:
+    """Recopie la série par étape (#6433) ou dit qu'elle n'est pas publiée.
+
+    Le corpus garde la forme complète (quatre champs) pour qu'un consommateur
+    n'ait pas à distinguer une clé absente d'une valeur inconnue : un
+    événement antérieur au champ rend ``steps`` null et les deux mesures
+    ``null`` avec ``not_published``, jamais ``0``.
+    """
+    if not isinstance(raw, Mapping):
+        return {
+            "steps": None,
+            "C_first": measure(None, quality=UNKNOWN,
+                               reasons=(REASON_NOT_PUBLISHED,),
+                               granularity="unknown", source=None),
+            "dC_max": measure(None, quality=UNKNOWN,
+                              reasons=(REASON_NOT_PUBLISHED,),
+                              granularity="unknown", source=None),
+            "dC_max_rank": None,
+        }
+    return {
+        "steps": _count(raw.get("steps")),
+        "C_first": _copy_measure(
+            raw.get("C_first"), context_metrics.REASON_CONTEXT_UNKNOWN),
+        "dC_max": _copy_measure(
+            raw.get("dC_max"), context_metrics.REASON_NO_GROWTH),
+        "dC_max_rank": _rank(raw.get("dC_max_rank")),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -775,6 +822,10 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
             cache_raw.get("write_tokens")
             if isinstance(cache_raw, Mapping) else None,
             context_metrics.REASON_CACHE_WRITE_UNKNOWN),
+        # #6433 : série par étape du fil principal (steps, premier appel,
+        # plus forte croissance et son rang) ; optionnelle dans un événement
+        # antérieur, alors dite `not_published`.
+        "series": _series(context.get("series")),
     }
     started, ended = result["started_ts"], result["ended_ts"]
     if isinstance(started, (int, float)) and isinstance(ended, (int, float)) \
@@ -862,6 +913,39 @@ def _validate_measure(raw, name: str) -> None:
     source = mapping.get("source")
     if source is not None and not isinstance(source, str):
         raise CorpusError("%s.source must be a string or null" % name)
+
+
+def _validate_series(raw) -> None:
+    """La série par étape : quatre champs, mesures et rang cohérents.
+
+    Optionnelle dans un corpus antérieur à #6433 ; dès qu'elle est présente,
+    elle doit être complète : un objet partiel ne se lirait pas de la même
+    façon qu'une absence nommée.
+    """
+    mapping = _mapping(raw, "series")
+    _extra(mapping, SERIES_KEYS, "series")
+    missing = SERIES_KEYS - set(mapping)
+    if missing:
+        raise CorpusError("series: missing field(s): %s"
+                          % ", ".join(sorted(missing)))
+    steps = mapping.get("steps")
+    if steps is not None and (isinstance(steps, bool)
+                              or not isinstance(steps, int) or steps < 0):
+        raise CorpusError("series.steps must be a non-negative integer or null")
+    _validate_measure(mapping.get("C_first"), "series.C_first")
+    _validate_measure(mapping.get("dC_max"), "series.dC_max")
+    rank = mapping.get("dC_max_rank")
+    if rank is not None and (isinstance(rank, bool)
+                             or not isinstance(rank, int) or rank < 2):
+        raise CorpusError("series.dC_max_rank must be an integer >= 2 or null")
+    if rank is not None and mapping["dC_max"].get("value") is None:
+        raise CorpusError("series.dC_max_rank needs a dC_max value")
+    if mapping["dC_max"].get("value") is not None and rank is None:
+        raise CorpusError("series.dC_max with a value needs a dC_max_rank")
+    if rank is not None and steps is not None and rank > steps:
+        raise CorpusError("series.dC_max_rank must not exceed series.steps")
+    if rank is not None and steps is None:
+        raise CorpusError("series.dC_max_rank needs series.steps")
 
 
 def _validate_close(raw, name: str) -> None:
@@ -1095,6 +1179,9 @@ def validate_line(line) -> dict:
         if name in OPTIONAL_MEASURES and name not in mapping:
             continue
         _validate_measure(mapping.get(name), name)
+    # #6433 : série par étape, optionnelle en lecture (corpus antérieur).
+    if "series" in mapping:
+        _validate_series(mapping["series"])
     auxiliary = mapping.get("auxiliary_models")
     if not isinstance(auxiliary, list) or any(not _text(item) for item in auxiliary):
         raise CorpusError("line.auxiliary_models must be a list of strings")
@@ -1438,7 +1525,7 @@ __all__ = [
     "ALL_MEASURES", "CORE_MEASURES", "CorpusError", "DECISION_KEYS",
     "DEFAULT_BATCH", "ExportResult", "LINE_KEYS", "LedgerSession",
     "MEASURE_KEYS", "MODEL_QUALITIES", "REQUIRED_LINE_KEYS", "SCHEMA",
-    "SOURCE_SCHEMA", "build_parser", "corpus_line", "export_corpus",
+    "SERIES_KEYS", "SOURCE_SCHEMA", "build_parser", "corpus_line", "export_corpus",
     "iter_corpus", "iter_turns", "main", "measure", "opaque_session",
     "read_corpus", "validate_line", "write_corpus",
 ]

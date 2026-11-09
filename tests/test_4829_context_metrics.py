@@ -544,6 +544,108 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(normalizer.session_reread, 1100)
 
 
+class SeriesTest(unittest.TestCase):
+    """#6433 : série par étape du fil principal (``turn.context.series``)."""
+
+    #: trois étapes dsh ; la deuxième relit 40 k de plus que la première
+    #: (sortie d'outil entre les deux appels), la troisième 1,5 k de plus.
+    DSH_40K = (
+        '{"type":"session","sessionId":"ctx-dsh-steps",'
+        '"model":"deepseek-flash"}',
+        '{"type":"status","phase":"step_end","usage":'
+        '{"inputTokens":1000,"cacheReadTokens":29000,"outputTokens":100}}',
+        '{"type":"status","phase":"step_end","usage":'
+        '{"inputTokens":1000,"cacheReadTokens":69000,"outputTokens":200}}',
+        '{"type":"status","phase":"step_end","usage":'
+        '{"inputTokens":1000,"cacheReadTokens":70500,"outputTokens":100}}',
+    )
+
+    @staticmethod
+    def observe(lines, *, interrupted=False, **kwargs):
+        normalizer = context_metrics.TurnNormalizer(
+            "deepseek", session="ctx-dsh-steps", session_reread=0, **kwargs)
+        for line in lines:
+            parsed = DEEPSEEK.parse(line)
+            if parsed:
+                normalizer.observe(parsed)
+        return normalizer.finish(interrupted=interrupted)
+
+    def test_trois_etapes_une_sortie_de_40k(self):
+        document = self.observe(self.DSH_40K)
+        series = document["series"]
+        self.assertEqual(series["steps"], 3)
+        self.assertEqual(series["C_first"]["value"], 30000)
+        self.assertEqual(series["dC_max"]["value"], 40000)
+        self.assertEqual(series["dC_max"]["quality"], "measured")
+        self.assertEqual(series["dC_max_rank"], 2)
+        # le pic du tour reste C_peak, la série ne le remplace pas
+        self.assertEqual(document["measures"]["C_peak"]["value"], 71500)
+
+    def test_un_seul_appel_n_a_pas_de_croissance(self):
+        document = self.observe(self.DSH_40K[:2])
+        series = document["series"]
+        self.assertEqual(series["steps"], 1)
+        self.assertEqual(series["C_first"]["value"], 30000)
+        self.assertIsNone(series["dC_max"]["value"])
+        self.assertIn("no_successive_calls",
+                      series["dC_max"]["reasons"])
+        self.assertIsNone(series["dC_max_rank"])
+
+    def test_sans_appel_d_un_flux_par_etape_steps_vaut_zero(self):
+        # Un harnais à usage par étape qui n'a fait aucun appel : 0 est mesuré.
+        document = context_metrics.TurnNormalizer("deepseek", session="s").finish()
+        self.assertEqual(document["series"]["steps"], 0)
+        self.assertIn("no_call", document["series"]["C_first"]["reasons"])
+        self.assertIn("no_successive_calls",
+                      document["series"]["dC_max"]["reasons"])
+
+    def test_codex_exec_ne_suppose_pas_zero_etape(self):
+        # Codex exec ne publie pas la chronologie des appels dans son flux ;
+        # le journal en prouve, donc `steps` reste inconnu, jamais 0.
+        document = context_metrics.TurnNormalizer("codex", session="s").finish()
+        self.assertIsNone(document["series"]["steps"])
+        self.assertIn("no_step_stream",
+                      document["series"]["C_first"]["reasons"])
+        self.assertIn("no_step_stream",
+                      document["series"]["dC_max"]["reasons"])
+
+    def test_une_compaction_n_est_pas_une_croissance(self):
+        lines = (
+            '{"type":"status","phase":"step_end","usage":'
+            '{"inputTokens":1000,"cacheReadTokens":29000}}',
+            '{"type":"status","phase":"step_end","usage":'
+            '{"inputTokens":1000,"cacheReadTokens":4000}}',
+        )
+        series = self.observe(lines)["series"]
+        self.assertEqual(series["steps"], 2)
+        self.assertIsNone(series["dC_max"]["value"])
+        self.assertIn("no_growth", series["dC_max"]["reasons"])
+        self.assertIsNone(series["dC_max_rank"])
+
+    def test_croissance_partielle_si_un_appel_est_illisible(self):
+        lines = (
+            '{"type":"status","phase":"step_end","usage":'
+            '{"inputTokens":1000,"cacheReadTokens":9000}}',
+            '{"type":"status","phase":"step_end","usage":'
+            '{"inputTokens":1000,"cacheReadTokens":49000}}',
+            '{"type":"status","phase":"step_end","usage":{"outputTokens":1}}',
+        )
+        series = self.observe(lines)["series"]
+        self.assertEqual(series["steps"], 3)
+        self.assertEqual(series["dC_max"]["value"], 40000)
+        self.assertEqual(series["dC_max"]["quality"], "partial")
+        self.assertIn(context_metrics.REASON_CONTEXT_UNKNOWN,
+                      series["dC_max"]["reasons"])
+        self.assertEqual(series["dC_max_rank"], 2)
+
+    def test_tour_interrompu_rend_la_croissance_minorante(self):
+        document = self.observe(self.DSH_40K[:3], interrupted=True)
+        self.assertEqual(document["series"]["dC_max"]["value"], 40000)
+        self.assertEqual(document["series"]["dC_max"]["quality"], "partial")
+        self.assertIn("turn_interrupted",
+                      document["series"]["dC_max"]["reasons"])
+
+
 class SchemaTest(unittest.TestCase):
     def test_document_serialisable_et_complet(self):
         result = observe_all(CLAUDE, "claude_stream.jsonl",
@@ -563,6 +665,14 @@ class SchemaTest(unittest.TestCase):
         self.assertIn("subagents", result)
         self.assertIn("cache", result["subagents"])
         self.assertIn("counts", result)
+        # #6433 : série par étape, additive et toujours présente
+        self.assertEqual(
+            set(result["series"]),
+            {"steps", "C_first", "dC_max", "dC_max_rank"})
+        self.assertIn(result["series"]["C_first"]["quality"],
+                      context_metrics.QUALITIES)
+        self.assertIn(result["series"]["dC_max"]["quality"],
+                      context_metrics.QUALITIES)
         # aucune donnée de prompt, de résultat d'outil ou de secret
         self.assertNotIn("prompt", encoded)
         self.assertNotIn("tool_result", encoded)
