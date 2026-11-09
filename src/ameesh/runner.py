@@ -2455,8 +2455,8 @@ class AgentWorker(threading.Thread):
         return ((self.agent or {}).get("session_policy") or "").strip() \
             or self.cfg.session_policy
 
-    def session_max_tokens(self) -> float:
-        """Seuil de rotation sur la taille (L11) du harnais de la session.
+    def session_max_tokens(self, harness: str | None = None) -> float:
+        """Seuil de rotation sur la taille (L11) d'une session, par harnais.
 
         #4448 : le canon compilé (`session.max_tokens` et
         `session.max_tokens_by_harness`) fait foi, surcharge du harnais puis
@@ -2464,13 +2464,22 @@ class AgentWorker(threading.Thread):
         le seuil commun de l'exécuteur (`AMEESH_SESSION_MAX_TOKENS`), jamais
         une valeur propre à un harnais écrite en dur. #5250 : le réglage de
         l'agent passe devant, pour le pilote d'un seul rôle.
+
+        `harness` : harnais de la session visée. Sans argument, celui du
+        dernier tour lancé (`_ledger_harness`), c'est-à-dire la session
+        active que `rotation_due` mesure. `_switch_lot` passe le harnais de
+        la session qu'il reprend (#6404) : cette session peut relever d'un
+        autre harnais que le dernier tour, et les surcharges
+        `session.max_tokens_by_harness` peuvent diverger d'un harnais à
+        l'autre.
         """
         from . import mechanics
         propre = (self.agent or {}).get("session_max_tokens")
         if propre:
             return float(propre)
+        harnais = self._ledger_harness() if harness is None else harness
         return mechanics.session_max_tokens(
-            self.cfg, self._ledger_harness() or "", self.runner.session_max_tokens)
+            self.cfg, harnais or "", self.runner.session_max_tokens)
 
     def _restore_session_counters(self) -> None:
         """#4448 : reprendre les compteurs de la session depuis le grand livre.
@@ -4067,11 +4076,14 @@ class AgentWorker(threading.Thread):
             else:
                 self._workdir_missing(force_status=True)
             return False
+        # #6404 : le seuil de reprise est celui du harnais de la session
+        # reprise (`harnais`, celui du prochain tour), pas celui du dernier
+        # tour lancé : les surcharges par harnais peuvent diverger.
         try:
             out = storage.of(self.db).lot_sessions.switch(
                 self.name, self.runner.runner_id, self.epoch, to_lot=lot,
                 harness=harnais, account=nom, cwd=cwd,
-                current=session, max_tokens=self.session_max_tokens())
+                current=session, max_tokens=self.session_max_tokens(harnais))
         except db_mod.DbError as exc:
             log_async("[%s] session switch to lot %s failed (%s)" % (self.name, lot, exc))
             return False
