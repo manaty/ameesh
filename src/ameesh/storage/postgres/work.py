@@ -2455,6 +2455,13 @@ class WorkItems(interface.WorkItems):
         row — a stale note no longer cancels an acquired quorum for good.
         The next writer or notification pass reconciles its own snapshot;
         no stale quorum can promote a lot.
+
+        #6466: the refusal note obeys the same guard. The gate can read a qa
+        snapshot for minutes; when a validation or a milestone lands before
+        the note, writing it would leave a « validation pending » trace on a
+        lot that is no longer waiting for anything. State and observation are
+        therefore re-read under the lot lock, and nothing is written if the
+        snapshot moved.
         """
         if in_transaction(self.db):
             return
@@ -2484,15 +2491,29 @@ class WorkItems(interface.WorkItems):
             detail = {"freeze": freeze.get("sha"), "gate": None if gate is None else "refused",
                       "why": (gate or {}).get("why") or "review gate inconclusive",
                       "error": (gate or {}).get("error") or ""}
-            self.note(item_id, "qa", "validation pending (#6257): " +
-                      json.dumps(detail, ensure_ascii=False, sort_keys=True, default=str),
-                      actor, once=True)
+            text = ("validation pending (#6257): " +
+                    json.dumps(detail, ensure_ascii=False, sort_keys=True, default=str))
+            # #6466 : la porte a été calculée hors verrou ; un lot validé, ou
+            # des jalons changés, entre-temps ne reçoit pas de trace de refus
+            # périmée (même garde que le chemin de succès, #5016).
+            with self.db.transaction() as tx:
+                rows = tx.query(
+                    "SELECT state FROM work_items WHERE id = %s AND " + _UNPINNED +
+                    " FOR NO KEY UPDATE", (int(item_id),))
+                if not rows or rows[0]["state"] != "qa":
+                    return
+                if not self._validation_snapshot_matches(tx, item_id, item, marks):
+                    return
+                if tx.query("SELECT id FROM work_item_events"
+                            " WHERE work_item_id = %s AND note = %s LIMIT 1",
+                            (int(item_id), text)):
+                    return
+                WorkItems(tx).note(item_id, rows[0]["state"], text, actor)
             return
         with self.db.transaction() as tx:
             tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                      (int(item_id),))
-            if (WorkItems(tx).milestones(item_id, None) != marks
-                    or _gate_item(WorkItems(tx).get(item_id)) != _gate_item(item)):
+            if not self._validation_snapshot_matches(tx, item_id, item, marks):
                 return
             rows = tx.query("UPDATE work_items SET state = 'validated', updated_at = now()"
                             " WHERE id = %s AND state = 'qa' AND " + _UNPINNED + " RETURNING id",
@@ -2508,6 +2529,14 @@ class WorkItems(interface.WorkItems):
                 validated_hold_notice.notify(self.db, int(item_id))
             except Exception:  # noqa: BLE001 - l'avis ne défait pas le quorum
                 pass
+
+    def _validation_snapshot_matches(self, tx, item_id, item, marks) -> bool:
+        """#5016/#6466 : l'observation qui a produit la porte tient-elle
+        toujours, sous le verrou du lot ? Les jalons et les champs lus par la
+        porte se comparent ; une note concurrente ne change que `updated_at`.
+        L'état (`qa`) est vérifié par l'appelant, avec le même verrou."""
+        return (WorkItems(tx).milestones(item_id, None) == marks
+                and _gate_item(WorkItems(tx).get(item_id)) == _gate_item(item))
 
     def _lapse_waiver(self, item_id, milestone, actor) -> None:
         """#1979 : un gel d'une AUTRE tête lève la dispense de re-verdict
