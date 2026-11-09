@@ -49,13 +49,17 @@ U16 (A10), qui prend ce SHA en entrée et peut réutiliser la même relation
 d'ascendance.
 
 Le lecteur est borné : `MAX_HOTES` hôtes et des références tronquées. Il ne
-lit aucun secret, aucun contenu brut de signal, et ne journalise rien.
+lit aucun secret, aucun contenu brut de signal, et ne journalise rien. Le
+prédicat d'ascendance réel est fourni séparément par `git_is_ancestor`
+(#6486) : `correlate()` reste pur, et U16 peut réutiliser ce prédicat borné.
 """
 from __future__ import annotations
 
 import datetime as _dt
 import math
+import os
 import re
+import subprocess
 import time
 from collections.abc import Mapping, Sequence
 
@@ -92,6 +96,13 @@ MAX_HOTES = 64
 #: longueur maximale d'une référence (chemin d'attestation, ligne de journal)
 _REFERENCE_MAX = 240
 _SHA = re.compile(r"^[0-9a-f]{7,40}$")
+#: borne d'une commande git d'ascendance (#6486) : un processus court, sans
+#: réseau ; au-delà, la relation n'est pas prouvée et le verdict reste
+#: `version-differente`, jamais une direction inventée.
+GIT_ANCESTOR_TIMEOUT_S = 2.0
+#: paires mémorisées par prédicat : une page de signaux répète souvent la même
+#: paire sur plusieurs hôtes, et la borne évite une mémoire non bornée.
+_GIT_CACHE_MAX = 1024
 
 
 def _texte(value) -> str:
@@ -401,6 +412,75 @@ def correlate(signal, active, *, journal=(), hosts=None, now=None,
             "connus": sorted(r["hote"] for r in connus),
             "inconnus": sorted(r["hote"] for r in inconnus),
             "raison": raison}
+
+
+def git_is_ancestor(repo, *, timeout: float = GIT_ANCESTOR_TIMEOUT_S):
+    """Un prédicat d'ascendance borné, adossé à un clone local (#6486).
+
+    Rend ``is_ancestor(observe, actif)`` : ``True`` si ``observe`` est un
+    ancêtre de ``actif`` — git compte un commit comme son propre ancêtre,
+    :func:`correlate` vérifie l'égalité avant —, ``False`` s'il ne l'est
+    pas, ``None`` quand git ne peut pas conclure (dépôt absent, objet
+    manquant, argument non hexadécimal, délai dépassé, sortie d'erreur).
+    Une seule commande ``git merge-base --is-ancestor`` par paire, sans
+    réseau ni écriture ; ``None`` laisse :func:`correlate` rendre
+    ``version-differente``, jamais une direction inventée.
+
+    ``None`` est aussi rendu quand ``repo`` n'est pas un dossier : l'appelant
+    n'a pas de clone à interroger et n'injecte alors aucun prédicat.
+    """
+    text = str(repo or "").strip()
+    if not text:
+        return None
+    root = os.path.abspath(os.path.expanduser(text))
+    if not os.path.isdir(root):
+        return None
+    try:
+        limit = float(timeout)
+    except (TypeError, ValueError):
+        limit = GIT_ANCESTOR_TIMEOUT_S
+    if not math.isfinite(limit) or limit <= 0:
+        limit = GIT_ANCESTOR_TIMEOUT_S
+    cache: dict[tuple[str, str], bool | None] = {}
+    env = dict(os.environ)
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
+                "LC_ALL": "C", "LANG": "C"})
+    # Un GIT_DIR/GIT_WORK_TREE hérité désignerait un autre dépôt que `repo`.
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_COMMON_DIR", "GIT_NAMESPACE"):
+        env.pop(key, None)
+
+    def predicate(observe, actif) -> bool | None:
+        left, right = _sha(observe), _sha(actif)
+        if not left or not right:
+            return None
+        key = (left, right)
+        if key in cache:
+            return cache[key]
+        if len(cache) >= _GIT_CACHE_MAX:
+            cache.clear()
+        try:
+            done = subprocess.run(
+                ["git", "-C", root, "-c", "gc.auto=0",
+                 "-c", "maintenance.auto=false", "merge-base",
+                 "--is-ancestor", left, right],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=limit, env=env, check=False)
+        except (OSError, subprocess.SubprocessError):
+            answer = None
+        else:
+            # Git sort 1 pour « pas ancêtre » ; un objet manquant ou une
+            # histoire illisible sortent un autre code et parlent sur stderr.
+            if done.returncode == 0 and not done.stderr:
+                answer = True
+            elif done.returncode == 1 and not done.stderr:
+                answer = False
+            else:
+                answer = None
+        cache[key] = answer
+        return answer
+    return predicate
 
 
 def active_view(db=None) -> dict:

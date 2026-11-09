@@ -19,10 +19,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 
 from . import fingerprints, repair_signals, repair_triage, storage
-from .repair_correlation import ENVIRONNEMENT
+from .repair_correlation import ENVIRONNEMENT, git_is_ancestor
 
 # U5 currently settles entries individually; cap database round trips per turn.
 BATCH = 20
@@ -31,6 +32,44 @@ BATCH = 20
 #: page of alerts that carry no project, observed under a declared scope.
 PROJECT = "project"
 WITHOUT_PROJECT = "without_project"
+
+
+def project_checkout(cfg, project):
+    """Un clone local du dépôt de `project` pour A4, ou ``''``.
+
+    Le clone de release (`release.projects.<p>.repo`) est celui depuis lequel
+    le staging est attesté ; la déclaration radar de l'hôte vient ensuite.
+    Lecture seule : rien n'est récupéré, et un clone en retard laisse la
+    relation non prouvée (`git_is_ancestor` rend ``None``) au lieu d'inventer
+    une direction. Sans configuration ou sans clone, l'appelant garde le
+    verdict `version-differente` d'avant #6486.
+    """
+    if cfg is None or not project:
+        return ''
+    candidates = []
+    release = getattr(cfg, 'release', None)
+    if isinstance(release, dict):
+        entry = (release.get('projects') or {}).get(project)
+        if isinstance(entry, dict):
+            candidates.append(entry.get('repo'))
+    try:
+        from . import radar
+        entry = radar.settings_of(cfg).projects.get(project)
+        if entry is not None:
+            candidates.append(getattr(entry, 'repo', ''))
+    except Exception:  # noqa: BLE001 — une déclaration illisible ne prouve rien
+        pass
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        try:
+            path = os.path.abspath(os.path.expanduser(candidate.strip()))
+        except (OSError, ValueError):
+            continue
+        # Un worktree lié a un fichier `.git`, un clone un dossier.
+        if os.path.isdir(path) and os.path.exists(os.path.join(path, '.git')):
+            return path
+    return ''
 
 
 def _alert_occurrences(db, project, keys, *, without_project=False):
@@ -113,15 +152,21 @@ def _alert_inputs(rows, project, occurrences):
 
 
 def ingest(db, *, project, environment, source, rows, expected_cursor,
-           next_cursor, now):
+           next_cursor, now, repo=''):
     """Filter poison entries, record refusals, then atomically receive valid ones.
 
     Rows contain a stable metadata ``key``, a source ``entry`` and optionally
     structured ``facts`` and an existing typed ``outcome``/``reference``.
     Qualification is advisory: even a confirmed route never opens anything.
     An outcome is recorded only with proof supplied by the existing producer.
+
+    ``repo`` is a local clone of the project's repository; when it is given,
+    A4's bounded git predicate is injected into :func:`fingerprints.observe_cause`
+    so a recurrence on an earlier commit is classified as ``old_version``
+    (#6486). Without it, unequal SHAs stay ``version-differente`` as before.
     """
     api = storage.of(db).repair_signals
+    is_ancestor = git_is_ancestor(repo) if repo else None
     accepted = []
     for row in rows:
         try:
@@ -157,7 +202,8 @@ def ingest(db, *, project, environment, source, rows, expected_cursor,
                and reference.startswith('lot:') and reference[4:].isdigit() else None)
         try:
             fingerprints.observe_cause(db, signal, triage, lot=lot,
-                                       legacy_key=legacy_key, now=now)
+                                       legacy_key=legacy_key, now=now,
+                                       is_ancestor=is_ancestor)
         except Exception as exc:  # one advisory receipt cannot interrupt U5
             logging.getLogger(__name__).warning(
                 'repair-cause-observation: source_error (%s)',
@@ -165,7 +211,7 @@ def ingest(db, *, project, environment, source, rows, expected_cursor,
     return True
 
 
-def _scan_without_project(db, scope, *, environment, now):
+def _scan_without_project(db, scope, *, environment, now, repo=''):
     """One bounded page of alerts carrying no project, under a declared scope.
 
     The scope is the mesh project the caller read from the configuration: those
@@ -202,7 +248,8 @@ def _scan_without_project(db, scope, *, environment, now):
             stream = api.state(scope, environment, 'alerts')['cursor']
             if not ingest(tx, project=scope, environment=environment,
                           source='alerts', rows=inputs,
-                          expected_cursor=stream, next_cursor=stream, now=now):
+                          expected_cursor=stream, next_cursor=stream, now=now,
+                          repo=repo):
                 return False
         tx.execute(
             "UPDATE repair_observation_scopes SET cursor=%s, updated_at=now()"
@@ -212,7 +259,7 @@ def _scan_without_project(db, scope, *, environment, now):
 
 
 def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None,
-         alerts=PROJECT):
+         alerts=PROJECT, repo=''):
     """One bounded circular page of committed alerts or GitHub deliveries.
 
     Wraparound deliberately trades extra deduplicated reads for no irreversible
@@ -223,7 +270,8 @@ def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None,
     ``alerts`` selects the alert subset: ``PROJECT`` (events carrying
     ``project``, the historical scan) or ``WITHOUT_PROJECT`` (events carrying
     none, observed under ``project`` as the declared mesh scope, with a
-    position of their own).
+    position of their own). ``repo`` is the project's local clone for A4
+    ancestry, or ``''`` (no predicate).
     """
     now = time.time() if now is None else now
     api = storage.of(db).repair_signals
@@ -231,7 +279,7 @@ def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None,
     if source == 'alerts':
         if alerts == WITHOUT_PROJECT:
             return _scan_without_project(db, project, environment=environment,
-                                         now=now)
+                                         now=now, repo=repo)
         if alerts != PROJECT:
             raise ValueError('unsupported alert subset')
         after = int(cursor) if cursor is not None else 0
@@ -266,11 +314,12 @@ def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None,
     else:
         raise ValueError('unsupported observation source')
     return ingest(db, project=project, environment=environment, source=source,
-                  rows=inputs, expected_cursor=cursor, next_cursor=next_cursor, now=now)
+                  rows=inputs, expected_cursor=cursor, next_cursor=next_cursor,
+                  now=now, repo=repo)
 
 
 def observe(db, *, project=None, source='alerts', now=None, log=None,
-            mesh_project=None):
+            mesh_project=None, cfg=None):
     """Best effort at the existing entry points; one source cannot stop another.
 
     No source failure is recursively converted into a signal or a new lot.
@@ -281,6 +330,9 @@ def observe(db, *, project=None, source='alerts', now=None, log=None,
     read by the caller from the configuration (the mesh project); it is never
     defaulted to a built-in name here. Without it, those alerts are not
     observed at all rather than attributed to an invented project.
+    ``cfg`` lets the observation resolve each project's local clone
+    (:func:`project_checkout`) for A4 ancestry; without it, no predicate is
+    injected and unequal SHAs keep the historical ``version-differente``.
     """
     log = log or (lambda text: None)
     try:
@@ -294,7 +346,8 @@ def observe(db, *, project=None, source='alerts', now=None, log=None,
         return
     for name in projects:
         try:
-            scan(db, name, source, now=now)
+            scan(db, name, source, now=now,
+                 repo=project_checkout(cfg, name))
         except Exception as exc:
             log('repair-observation: source_error (%s)' % type(exc).__name__)
     if project is not None or source != 'alerts':
@@ -304,6 +357,7 @@ def observe(db, *, project=None, source='alerts', now=None, log=None,
         log('repair-observation: scope_unset')
         return
     try:
-        scan(db, scope, source, now=now, alerts=WITHOUT_PROJECT)
+        scan(db, scope, source, now=now, alerts=WITHOUT_PROJECT,
+             repo=project_checkout(cfg, scope))
     except Exception as exc:
         log('repair-observation: source_error (%s)' % type(exc).__name__)
