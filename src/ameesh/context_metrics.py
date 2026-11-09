@@ -17,6 +17,9 @@ et les accumule pour un tour :
   exclu (c'est une écriture, pas une relecture) ;
 * ``R_session`` : cumul des ``R_turn`` de la session, à partir d'un point de
   départ fourni par l'appelant (le grand livre) ;
+* ``series`` (#6433) : série par étape du fil principal (``steps``,
+  ``C_first``, ``dC_max`` et son rang) pour les harnais qui publient l'usage de
+  chaque appel ; additive, elle ne remplace aucune mesure principale ;
 * le cache lu et écrit, les sous-agents mesurés à part, la déduplication des
   blocs d'un même appel et des mises à jour cumulatives.
 
@@ -100,6 +103,14 @@ REASON_NO_SESSION = "no_session"
 REASON_SESSION_MISMATCH = "session_mismatch"
 REASON_CALL_ID_UNKNOWN = "call_id_unknown"
 REASON_CALL_BOUND_REACHED = "call_bound_reached"
+#: #6433 : la série par étape n'a pas de croissance positive mesurable, ou
+#: pas deux appels successifs pour en calculer une. Une croissance absente
+#: n'est pas `0` : la valeur reste `null` avec sa raison.
+REASON_NO_GROWTH = "no_growth"
+REASON_NO_SUCCESSIVE_CALLS = "no_successive_calls"
+#: #6433 : le harnais ne publie pas l'usage de chaque appel dans son flux
+#: (Codex exec) ; le nombre d'étapes n'est alors pas mesuré, jamais supposé `0`.
+REASON_NO_STEP_STREAM = "no_step_stream"
 #: #4870 : une collecte de tour perdue (worker mort, réparation par un autre)
 #: laisse un trou dans `R_session` ; la base reste inconnue, jamais un total
 #: supposé reconstruit.
@@ -791,6 +802,7 @@ class TurnNormalizer:
                 self.session_reread_reasons, r_turn.reasons)
             self.session_reread += int(r_turn.value)
 
+        series = self._series_measures()
         all_measures = list(principal.values())
         if self._subcalls:
             all_measures += [value for key, value in subagents.items()
@@ -816,6 +828,10 @@ class TurnNormalizer:
             "source": self.source,
             "partial": partial,
             "measures": {key: principal[key].to_dict() for key in core},
+            # #6433 : série par étape du fil principal (additive). Elle se lit
+            # sur le flux seulement ; le journal Codex ne porte pas la
+            # chronologie complète des appels.
+            "series": series,
             "cache": {
                 "read_tokens": principal["cache_read_tokens"].to_dict(),
                 "write_tokens": principal["cache_write_tokens"].to_dict(),
@@ -920,6 +936,101 @@ class TurnNormalizer:
         return Measure(max(known), quality, reasons,
                        _aggregate_granularity(measures),
                        _aggregate_source(measures))
+
+    def _series_measures(self) -> dict:
+        """#6433 : série de contexte par étape du **fil principal**.
+
+        ``steps`` compte les appels retenus du fil principal (un ``step_end``
+        DeepSeek/ACP, un message Claude dédupliqué), ``C_first`` est le
+        contexte du premier appel et ``dC_max`` la plus forte croissance
+        positive entre deux appels successifs, avec ``dC_max_rank`` = rang
+        1-based de l'appel qui la termine. Une baisse (compaction) n'est pas
+        une croissance : elle ne concourt pas, et sans croissance positive la
+        valeur reste ``null`` avec ``no_growth``. Une mesure d'appel inconnue
+        rend la croissance ``partial`` (minorant nommé), jamais devinée.
+
+        Le journal Codex n'entre pas : il ne porte pas la chronologie des
+        appels, seulement le pic du tour. Un tour Codex sans appel de flux
+        (``codex exec``) laisse ``steps`` inconnu avec ``no_step_stream``, pas
+        ``0`` : le journal prouve des appels que le flux n'a pas comptés. Un
+        tour interrompu, borné en mémoire ou d'une autre session laisse
+        ``dC_max`` minorant, comme ``C_peak``.
+        """
+        calls = self._calls
+        if not calls and self.harness == "codex":
+            unknown = Measure(None, UNKNOWN, (REASON_NO_STEP_STREAM,),
+                              "call", "none")
+            growth = unknown
+            if self._interrupted:
+                growth = growth.degraded(REASON_TURN_INTERRUPTED)
+            if self._session_mismatch:
+                growth = growth.degraded(REASON_SESSION_MISMATCH)
+            return {
+                "steps": None,
+                "C_first": unknown.to_dict(),
+                "dC_max": growth.to_dict(),
+                "dC_max_rank": None,
+            }
+        c_first = calls[0].c_last if calls else Measure(
+            None, UNKNOWN, (REASON_NO_CALL,), "call", "none")
+        growth, rank = self._max_growth(calls)
+        if self._dropped:
+            growth = growth.degraded(REASON_CALL_BOUND_REACHED)
+        if self._interrupted:
+            growth = growth.degraded(REASON_TURN_INTERRUPTED)
+        if self._session_mismatch:
+            growth = growth.degraded(REASON_SESSION_MISMATCH)
+        return {
+            "steps": len(calls),
+            "C_first": c_first.to_dict(),
+            "dC_max": growth.to_dict(),
+            "dC_max_rank": rank,
+        }
+
+    def _max_growth(self, calls: list[CallMeasure]) -> tuple[Measure, int | None]:
+        """La plus forte croissance positive de ``C_last`` entre appels.
+
+        Le rang rendu est celui de l'appel qui termine la croissance, à partir
+        de 1. Une paire dont un contexte est inconnu est sautée et ses raisons
+        sont jointes : le maximum connu est alors un minorant (``partial``).
+        """
+        if len(calls) < 2:
+            return (Measure(None, UNKNOWN, (REASON_NO_SUCCESSIVE_CALLS,),
+                            "call", "none"), None)
+        best = 0
+        rank: int | None = None
+        winner: tuple[Measure, Measure] | None = None
+        missing: list[Measure] = []
+        known_pairs = 0
+        for index in range(1, len(calls)):
+            previous = calls[index - 1].c_last
+            current = calls[index].c_last
+            if previous.value is None or current.value is None:
+                missing.extend(measure for measure in (previous, current)
+                               if measure.value is None)
+                continue
+            known_pairs += 1
+            delta = int(current.value) - int(previous.value)
+            if delta > best:
+                best, rank = delta, index + 1
+                winner = (previous, current)
+        reasons = _reasons(*(measure.reasons for measure in missing))
+        if rank is None:
+            if not known_pairs:
+                return (Measure(None, UNKNOWN,
+                                _reasons((REASON_CONTEXT_UNKNOWN,), reasons),
+                                "call",
+                                _aggregate_source([call.c_last for call in calls])),
+                        None)
+            # Contexte stable ou en baisse (compaction) : aucune croissance.
+            return (Measure(None, UNKNOWN,
+                            _reasons((REASON_NO_GROWTH,), reasons),
+                            "call",
+                            _aggregate_source([call.c_last for call in calls])),
+                    None)
+        return (Measure(best, PARTIAL if missing else MEASURED, reasons,
+                        "call", _aggregate_source(list(winner))),
+                rank)
 
     def _last_call_measure(self, field: str, unknown_reason: str) -> Measure:
         """C_last/O_last : appel du flux, sinon appel du journal, sinon motif.
