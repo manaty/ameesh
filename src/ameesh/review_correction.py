@@ -23,6 +23,11 @@ La lecture est prudente : une famille inconnue ne vaut jamais « il reste de la
 place », et une lecture impossible se tait au lieu de retarder ou de refuser un
 verdict. La désignation du gel suivant reste l'autorité ; ce module n'écrit
 rien.
+
+#6458 : la place est une **projection**. Le message la formule au conditionnel
+(« si X poussait lui-même le correctif ») et nomme séparément les correcteurs
+réellement enregistrés sur la tête (aucun, ou la liste) et le correcteur
+hypothétique simulé, pour qu'aucune attribution ne soit lue comme un fait.
 """
 from __future__ import annotations
 
@@ -67,20 +72,24 @@ def _family_of(db, inputs, name: str) -> str:
 def outlook(*, required: int, reviewer: Mapping, authors: Iterable = (),
             candidates: Iterable = (), families, seats: Iterable = (),
             earlier: Iterable = ()) -> dict:
-    """Les familles qui resteraient éligibles après le correctif de `reviewer`.
+    """Les familles qui resteraient éligibles si `reviewer` corrigeait.
 
     `authors` sont les auteurs de la tête gelée, `seats` les relecteurs manuels
-    qui couvrent déjà un avis, `earlier` les correcteurs antérieurs (déjà
-    auteurs de la tête, #2739). La correction examinée ajoute `reviewer` à ces
-    derniers : la sélection de désignation est rejouée avec la même politique,
-    les mêmes candidats et les mêmes exclusions, ce qui donne la place réelle
-    — disponibilité des agents comprise, pas une famille théorique.
+    qui couvrent déjà un avis, `earlier` les correcteurs **réellement
+    enregistrés** sur la tête (déjà auteurs, #2739). La correction examinée est
+    une projection : `reviewer` est passé à la sélection comme correcteur
+    **hypothétique**, séparé des correcteurs enregistrés dans le message
+    (#6458), puis la sélection de désignation est rejouée avec la même
+    politique, les mêmes candidats et les mêmes exclusions, ce qui donne la
+    place réelle — disponibilité des agents comprise, pas une famille théorique.
 
     Rend `{state, required, reviewer, family, families, seats, remaining,
     missing, why}`. `short` porte `missing` (le nombre d'avis que la porte ne
-    pourrait plus obtenir) et la phrase `§2 : retour à l'auteur` en tête de
-    `why` ; `unknown` quand la famille du relecteur ou d'un auteur n'est pas
-    prouvée — le doute ne dit jamais `ok`.
+    pourrait plus obtenir) et, en tête de `why`, la phrase `§2 : retour à
+    l'auteur` suivie d'une formulation **au conditionnel** (« si X poussait
+    lui-même le correctif ») et de l'état des correcteurs réellement
+    enregistrés (aucun, ou la liste) ; `unknown` quand la famille du relecteur
+    ou d'un auteur n'est pas prouvée — le doute ne dit jamais `ok`.
     """
     name = str((reviewer or {}).get("name") or "").strip()
     family = str((reviewer or {}).get("family") or "").strip().lower()
@@ -96,13 +105,13 @@ def outlook(*, required: int, reviewer: Mapping, authors: Iterable = (),
                     "why": "famille du relecteur %s inconnue : la place restante "
                            "ne peut pas être calculée" % (name or "?")})
         return out
-    fixers = [dict(row or {}) for row in earlier or ()]
-    fixers.append({"name": name, "family": family})
+    registered = [dict(row or {}) for row in earlier or ()]
     try:
         outcome = rd.select(required=need, authors=list(authors or ()),
                             candidates=list(candidates or ()),
                             families=families, already=list(seats or ()),
-                            fixers=fixers)
+                            fixers=registered,
+                            hypothetical=[{"name": name, "family": family}])
     except Exception as exc:  # noqa: BLE001 - entrées incohérentes : doute
         out.update({"state": STATE_UNSURE,
                     "why": "sélection illisible : %s" % (exc,)})
@@ -121,7 +130,7 @@ def outlook(*, required: int, reviewer: Mapping, authors: Iterable = (),
     out.update({
         "state": STATE_TOO_TIGHT,
         "missing": int(outcome.get("missing") or 0),
-        "why": "%s — après un correctif de %s (%s), %s"
+        "why": "%s — si %s (%s) poussait lui-même le correctif : %s"
                % (BACK_TO_AUTHOR, name or "?", family,
                   outcome.get("why") or "les avis requis ne sont plus couverts"),
     })

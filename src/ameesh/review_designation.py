@@ -780,6 +780,7 @@ def _advance_of(candidate, pace: Mapping) -> float:
 
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
            families, already: Iterable = (), fixers: Iterable = (),
+           hypothetical: Iterable = (),
            advances: Optional[Mapping] = None, automatic: Iterable = ()) -> dict:
     """Chooses `required` (1 or 2) independent reviewers, by plan pace then load.
 
@@ -822,6 +823,11 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
       as a safety net: they would review their own fix. A fixer row with an
       empty family is a **personal** exclusion only (`test_only`, #3518, or a
       rewritten correction, #4457): its family remains eligible.
+    - `hypothetical` names the reviewers a preview simulates as pushing the
+      correction (#3416 `review_correction.outlook`): they are excluded
+      exactly like `fixers` (name and family), but reported apart from the
+      registered correctors so a projection never reads as a fact. The
+      returned `fixers` keeps the registered ones alone.
 
     Returns `{state, required, reviewers, missing, manual, why, forbidden,
     families, fixers}`: `waiting` when independent families are missing or an author
@@ -837,30 +843,38 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
+    registered_fixers = list(fixers or ())
+    simulated_fixers = list(hypothetical or ())
+    all_fixers = registered_fixers + simulated_fixers
     names, forbidden = families_of(authors)
-    fixer_names = names_of(fixers)
+    fixer_names = names_of(registered_fixers)
+    hypothetical_names = names_of(simulated_fixers) - fixer_names
     #: #4679 : un correcteur dont le commit local (avant rebase/amend) est
     #: introuvable reste exclu par son nom ; le gel dit le doute et le SHA,
     #: au lieu de le redésigner en silence.
     fixer_doubts: dict[str, str] = {}
-    for row in fixers or ():
+    for row in all_fixers:
         if isinstance(row, Mapping) and row.get("unresolved"):
             name = str(row.get("name") or "").strip()
             if name:
                 fixer_doubts[name] = str(row.get("unresolved") or "").strip()
 
     def excluded_fixers_text() -> str:
-        text = ", ".join(sorted(fixer_names))
+        text = "%s registered" % (", ".join(sorted(fixer_names)) or "none")
         if fixer_doubts:
             text += (" (unresolved correction: %s — commit not recoverable,"
                      " excluded by doubt)" % ", ".join(
                          "%s %s" % (name, sha[:12])
                          for name, sha in sorted(fixer_doubts.items())))
+        if hypothetical_names:
+            text += ("; hypothetical corrector: %s"
+                     % ", ".join(sorted(hypothetical_names)))
         return text
 
-    forbidden = forbidden | families_of(fixers)[1]
-    seats = manual_seats(already, authors=authors, fixers=fixers, families=families)
-    kept = automatic_seats(automatic, authors=authors, fixers=fixers,
+    forbidden = forbidden | families_of(all_fixers)[1]
+    seats = manual_seats(already, authors=authors, fixers=all_fixers,
+                         families=families)
+    kept = automatic_seats(automatic, authors=authors, fixers=all_fixers,
                            families=families)
     if kept:
         # #3596: an automatic seat already provided on this freeze is never
@@ -906,7 +920,8 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         return out
     seat_names = {row["name"] for row in seats} | {row["name"] for row in kept}
     eligible = [c for c in candidates or ()
-                if c.eligible(forbidden_names=names | seat_names | fixer_names,
+                if c.eligible(forbidden_names=(names | seat_names | fixer_names
+                                               | hypothetical_names),
                               forbidden_families=forbidden | seat_families,
                               families=families)]
     # #2668: a family's advance over its plan pace (points), lower is further
@@ -958,7 +973,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         if kept:
             missing_why += (" (already designated: %s)"
                             % ", ".join(row["name"] for row in kept))
-        if fixer_names:
+        if fixer_names or hypothetical_names:
             missing_why += " (corrector(s) excluded: %s)" % excluded_fixers_text()
         out.update({
             "state": WAITING,
@@ -970,7 +985,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     why = "designated %d reviewer(s)" % len(chosen)
     if kept:
         why += " (kept %d already designated for this freeze)" % len(kept)
-    if fixer_names:
+    if fixer_names or hypothetical_names:
         why += " (corrector(s) excluded: %s)" % excluded_fixers_text()
     if pace:
         reading = ["%s %+.0f pt" % (c.family.strip().lower(), _advance_of(c, pace) * 100)
