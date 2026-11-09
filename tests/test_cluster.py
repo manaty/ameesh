@@ -346,6 +346,10 @@ FERMEES = {
     # n'est pas modifiée.
     "fingerprint_source_state": {"project", "environment", "url", "cursor",
                                  "last_read_at", "last_error", "updated_at"},
+    # #6473 (0559): internal cause-observation receipts, no supervisor GRANT.
+    "fingerprint_cause_observations": {
+        "receipt_id", "project", "environment", "source", "signal_id",
+        "alias", "cause_id", "lot", "record", "created_at"},
     # #6091 (0554) : registre des exécutants externes non-agents (nom
     # `system:<nom>` et responsable humain), tenu et lu par les gestes de
     # pilote (`work external-executor`, réservation) ; identité interne fermée
