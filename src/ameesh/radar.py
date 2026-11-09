@@ -2044,6 +2044,78 @@ def actions_run_id(slug: str, entry) -> int | None:
     return int(match.group(1)) if match else None
 
 
+#: #6568 : conclusions d'un job qui ne démontrent aucun défaut. Un run
+#: `pull_request` dont **tous** les jobs sont là et verts ou sautés peut
+#: pourtant s'être terminé en `failure` : GitHub n'a pas créé les jobs
+#: restants (annotation « Internal server error », panne Actions/Checks du
+#: 09/11 18:12Z, incident githubstatus tp8cghg7tlc4).
+_CLEAN_JOB_CONCLUSIONS = frozenset(("success", "skipped"))
+
+
+def failed_run_without_negative(slug: str, head: str, *, gh) -> dict | None:
+    """#6568 : le run `pull_request` de la tête `head` conclu en `failure`
+    alors qu'**aucun de ses jobs n'est négatif** — signature d'une panne
+    d'infrastructure GitHub : le run s'arrête sans créer les jobs restants,
+    dont l'agrégat requis, qui reste donc absent de la tête.
+
+    Rend `{id, name, workflow, url}` pour ce run **unique**, sinon `None` :
+    aucun run de cette forme (rien à relancer), plusieurs (ambigu : on ne
+    relance pas au hasard), ou une lecture impossible (un doute ne relance
+    rien et ne verdit rien). Un run vert, un run d'une autre tête, un run
+    `push`/`pull_request_target` ou un échec avec un job négatif ne sont
+    jamais des candidats.
+
+    Témoin : run 42667953303 (#5021, 09/11 18:19Z), 33 jobs `success`/`skipped`,
+    jobs `tests` et `bilan des impactés` jamais créés, run conclu `failure`."""
+    def read(argv):
+        code, text, _err = _gh_call(gh, argv)
+        if code:
+            raise ValueError("gh exited %d" % code)
+        return json.loads(text) if (text or "").strip() else None
+
+    try:
+        rows = read(["run", "list", "--repo", slug, "--commit", head,
+                     "--limit", "100", "--json",
+                     "databaseId,name,workflowName,event,status,conclusion,headSha,url"])
+        if not isinstance(rows, list) or len(rows) >= 100:
+            return None
+        candidates = []
+        for run in rows:
+            if not isinstance(run, dict) or run.get("headSha") != head:
+                return None
+            if run.get("event") != "pull_request" \
+                    or run.get("status") != "completed" \
+                    or str(run.get("conclusion") or "").lower() != "failure":
+                continue
+            run_id = run.get("databaseId")
+            if type(run_id) is not int or run_id <= 0:
+                return None
+            data = read(["run", "view", str(run_id), "--repo", slug, "--json", "jobs"])
+            jobs = data.get("jobs") if isinstance(data, dict) else None
+            if not isinstance(jobs, list) or len(jobs) >= 100:
+                return None
+            if not jobs:
+                continue  # une suite qui n'a créé aucun job ne prouve rien
+            clean = True
+            for job in jobs:
+                if not isinstance(job, dict):
+                    return None
+                if str(job.get("status") or "").lower() != "completed" \
+                        or str(job.get("conclusion") or "").lower() \
+                        not in _CLEAN_JOB_CONCLUSIONS:
+                    clean = False
+                    break
+            if not clean:
+                continue
+            candidates.append({"id": run_id,
+                               "name": run.get("name") or run.get("workflowName") or "",
+                               "workflow": run.get("workflowName") or "",
+                               "url": run.get("url") or ""})
+    except Exception:  # noqa: BLE001 - une lecture d'infra ne relance rien
+        return None
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _gh_call(gh, argv: list) -> tuple:
     """`(code, out, err)` d'un `gh` des deux formes en usage : `plan_github.Gh`
     (`run(argv)` → tuple) ou l'appelable de `land`/`fire` (→ CompletedProcess)."""

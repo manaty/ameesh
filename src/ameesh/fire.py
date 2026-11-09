@@ -1209,7 +1209,8 @@ def _entry_suite(entry):
 
 
 def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
-                   unconcluded: list | None = None, slug: str | None = None,
+                   unconcluded: list | None = None, absent: list | None = None,
+                   slug: str | None = None,
                    gh=None, head: str = "", target: str = "") -> tuple:
     """Les checks requis que `rollup` et `provenance` ne prouvent pas.
 
@@ -1245,6 +1246,12 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
     manque), pour les lecteurs qui n'ont pas reçu la règle du 23/10 (file de
     fusion, `merge-pr`).
 
+    #6568 : les noms d'un check requis **absent de la tête** (aucune entrée)
+    sont ajoutés à `absent`, si fourni, pour que l'appelant distingue « jamais
+    demandé » d'un run conclu sans son agrégat (panne d'infra, relance unique
+    de `radar.failed_run_without_negative`). Un rouge prouvé les retire, comme
+    `unconcluded` : relancer ne lèverait pas la porte.
+
     #4549 : une suite plus récente conclue verte remplace un run échoué au
     plan d'une suite plus ancienne **sans aucun test exécuté**
     (`_supersede_testless_runs`) ; un rouge de test, une suite concurrente ou
@@ -1257,6 +1264,7 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
     rollup = radar.latest_rollup(rollup)
     gaps, consigned = [], []
     mark = len(unconcluded) if unconcluded is not None else 0
+    absent_mark = len(absent) if absent is not None else 0
     proven_red = []
 
     def classify(name: str, entries: list) -> None:
@@ -1295,6 +1303,8 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
             entries = [entry for entry in rollup or () if _rollup_name(entry) == name]
             if not entries:
                 gaps.append("%s (absent)" % name)
+                if absent is not None:
+                    absent.append(name)
                 continue
             # #4549 (B2 de cx2) : le remplacement d'une suite échouée au plan
             # par une suite verte sans test se prouve ici, sur la provenance
@@ -1329,10 +1339,14 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
                 gaps.append("%s (source absent)" % name)
             else:
                 gaps.append("%s (absent)" % name)
+                if absent is not None:
+                    absent.append(name)
             continue
         classify(name, runs)
     if proven_red and unconcluded is not None:
         del unconcluded[mark:]
+    if proven_red and absent is not None:
+        del absent[absent_mark:]
     return gaps, consigned
 
 
@@ -1345,10 +1359,18 @@ def relaunch_unconcluded(db, lot: int, slug: str, head: str, report: dict | None
     jusqu'à une conclusion. `guard()` (bail du passage et garde du pilote
     élu) est relu juste avant chaque relance : un détenteur périmé ne relance
     rien. Chaque issue utile est notée au journal du lot, une seule fois.
+    #6568 : une entrée `missing_aggregate` (agrégat absent d'un run conclu
+    sans job négatif) est notée comme non concluante d'infrastructure.
     Rend les issues."""
     from . import radar
-    pairs = [(name, radar.actions_run_id(slug, entry))
-             for name, entry in (report or {}).get("unconcluded") or ()]
+    #6568 : l'agrégat requis absent d'un run conclu sans job négatif est une
+    # preuve absente d'infra (canon §3) ; sa relance se trace comme telle, à
+    # part des checks qui n'ont jamais conclu eux-mêmes (#3186).
+    entries = (report or {}).get("unconcluded") or ()
+    missing = [(name, radar.actions_run_id(slug, entry))
+               for name, entry in entries
+               if isinstance(entry, dict) and entry.get("missing_aggregate")]
+    pairs = [(name, radar.actions_run_id(slug, entry)) for name, entry in entries]
     if not pairs:
         return []
     reruns = radar.rerun_unconcluded(slug, head, pairs, gh=gh, dry_run=dry_run,
@@ -1357,12 +1379,21 @@ def relaunch_unconcluded(db, lot: int, slug: str, head: str, report: dict | None
         for row in reruns:
             if row["result"] in ("running", "busy"):
                 continue
+            names = sorted({name for name, run in missing if run == row["run"]})
             try:
-                work.note(db, int(lot),
-                          "required check %s never concluded on %s — no test proof, "
-                          "blocking (owner decision #128512): %s"
-                          % (row["check"], head[:12], row["detail"]),
-                          actor=actor, once=True)
+                if names:
+                    work.note(db, int(lot),
+                              "required check(s) %s absent from the run concluded on %s "
+                              "without any negative job — infrastructure non-conclusive "
+                              "(canon §3, #6568), no test proof, blocking: %s"
+                              % (", ".join(names), head[:12], row["detail"]),
+                              actor=actor, once=True)
+                else:
+                    work.note(db, int(lot),
+                              "required check %s never concluded on %s — no test proof, "
+                              "blocking (owner decision #128512): %s"
+                              % (row["check"], head[:12], row["detail"]),
+                              actor=actor, once=True)
             except Exception:  # noqa: BLE001 - la trace au mieux, la porte reste fermée
                 pass
     return reruns
@@ -2108,7 +2139,15 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
     #3186 (décision owner #128512) : un check requis qui n'a pas conclu
     lui-même (annulé, expiré, démarrage raté) bloque — preuve absente — et
     `report["unconcluded"]` reçoit ses entrées `(nom, entrée)`, pour que
-    l'appelant relance le run une fois (`relaunch_unconcluded`)."""
+    l'appelant relance le run une fois (`relaunch_unconcluded`).
+
+    #6568 : un check requis **absent** de la tête alors qu'un run
+    `pull_request` de cette tête s'est conclu en échec sans aucun job négatif
+    (panne GitHub Actions/Checks : les jobs restants, dont l'agrégat, n'ont
+    jamais été créés) suit le même canal : `report["unconcluded"]` reçoit une
+    entrée portant l'identifiant du run, et `relaunch_unconcluded` le relance
+    une fois avec une trace d'infra. La porte reste fermée ; jamais un
+    `tests` vert sans les parts."""
     if status.get("draft"):
         return False, "PR #%s is a draft" % status.get("number")
     if target and status.get("base") and status["base"] != target:
@@ -2145,9 +2184,10 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
                                "cannot be proven: %s"
                                % (target or "the target", frozen[:12], exc))
         unconcluded: list = []
+        absent: list = []
         gaps, consigned = _required_gate(pairs, rollup, provenance, strict=False,
-                                         unconcluded=unconcluded, slug=slug,
-                                         gh=gh, head=head or frozen_head,
+                                         unconcluded=unconcluded, absent=absent,
+                                         slug=slug, gh=gh, head=head or frozen_head,
                                          target=target)
         # #2876/#3066 : la preuve du portier `paquet` n'est jamais un check
         # facultatif — un rouge ou une preuve indisponible bloque ; un non
@@ -2161,6 +2201,21 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
         gaps += detail_gaps
         consigned += detail_consigned
         from . import radar
+        # #6568 : un agrégat requis absent de la tête alors qu'un run de la
+        # tête s'est conclu en échec sans aucun job négatif (panne
+        # GitHub Actions/Checks) est une preuve absente d'infrastructure
+        # (canon §3) : son run est relancé une fois, la porte reste fermée,
+        # jamais un `tests` vert supposé. Le run n'est cherché qu'à la
+        # demande d'un appelant qui relancera (`report`).
+        if report is not None and absent and slug and gh:
+            run = radar.failed_run_without_negative(slug, head or frozen_head, gh=gh)
+            if run is not None:
+                for name in absent:
+                    unconcluded.append((name, {
+                        "__typename": "CheckRun", "name": name,
+                        "status": "COMPLETED", "conclusion": "STARTUP_FAILURE",
+                        "databaseId": run["id"], "url": run.get("url") or "",
+                        "missing_aggregate": True}))
         if any(radar.check_result(entry) == radar.CI_NEGATIVE_RESULT
                for entry in radar.packet_proof_entries(rollup, replaced)):
             # #3186 : un portier rouge retient la porte quoi qu'il arrive ;
