@@ -101,6 +101,29 @@ class DefaultBaseTest(CompanionFixture):
                                                 "base": ["main"]}
         self.assertEqual(lot_class.default_base(cfg, self.item(), self.companion), "main")
 
+    def test_parent_without_target_does_not_guess_the_companion_default(self):
+        # B mty-amh-impl-11 : sans cible parent, ni origin/HEAD=main du compagnon
+        cfg = types.SimpleNamespace(github={"projects": {"nexlink": {
+            "repo": "manaty/nexlink"}}})
+        self.assertIsNone(lot_class.default_base(cfg, self.item(), self.companion))
+        self.assertIsNone(lot_class.default_base(cfg, self.item(), self.companion,
+                                                 declared_only=True))
+        self.assertIn("project's target is not inherited",
+                      lot_class.companion_refusal(cfg, self.item(), self.companion))
+
+    def test_parent_without_target_reads_the_companion_declared_target(self):
+        # la cible réelle (#209852) n'est ni main ni develop, ni origin/HEAD
+        cfg = types.SimpleNamespace(github={"projects": {
+            "nexlink": {"repo": "manaty/nexlink"},
+            "manaty-its": {"repo": "manaty/manaty-its",
+                           "base": ["codex/home-server-console"]}}})
+        _git(self.companion, "update-ref",
+             "refs/remotes/origin/codex/home-server-console", "HEAD")
+        for declared_only in (False, True):
+            self.assertEqual(lot_class.default_base(cfg, self.item(), self.companion,
+                                                    declared_only=declared_only),
+                             "codex/home-server-console")
+
     def test_explicit_lot_target_is_preserved(self):
         self.assertEqual(lot_class.default_base(self.cfg(), self.item(branch_target="main"),
                                                 self.companion), "main")

@@ -327,12 +327,15 @@ def companion_refusal(cfg, item: dict, repo: str) -> str:
     if companion_target(cfg, companion, repo):
         return ""
     app = str((item or {}).get("app") or "").strip()
-    return ("lot #%s: %s is a companion repository of project %s; the project "
-            "target %s is not inherited and no target is declared for %s — "
+    parent = project_target(cfg, app)
+    inherited = ("the project target %s is not inherited" % parent if parent
+                 else "the project's target is not inherited")
+    return ("lot #%s: %s is a companion repository of project %s; %s and no "
+            "target is declared for %s (its default branch is not guessed) — "
             "declare it (`git -C %s config %s <branch>`) or pass the lot's "
             "explicit target; nothing guessed"
-            % (item.get("id") or "?", companion, app, project_target(cfg, app),
-               companion, repo, plan_git.TARGET_GIT_KEY))
+            % (item.get("id") or "?", companion, app, inherited, companion,
+               repo, plan_git.TARGET_GIT_KEY))
 
 
 def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> Optional[str]:
@@ -353,14 +356,15 @@ def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> 
     explicit = str(item.get("branch_target") or "").strip()
     if explicit:
         return explicit
+    # #6769 : un dépôt compagnon n'hérite ni de la cible du projet ni du repli
+    # du dépôt ; il n'a que la sienne, déclarée, jamais `origin/HEAD` deviné
+    # (la cible réelle de manaty/manaty-its#5 n'est ni main ni develop).
+    companion = companion_repository(cfg, item, repo)
+    if companion:
+        return companion_target(cfg, companion, repo) or None
     target = project_target(cfg, str(item.get("app") or "").strip())
     if target:
-        companion = companion_repository(cfg, item, repo)
-        if not companion:
-            return target
-        # #6769 : un dépôt compagnon n'hérite pas de la cible du projet ; il
-        # n'a que la sienne, déclarée, et jamais sa branche par défaut devinée.
-        return companion_target(cfg, companion, repo) or None
+        return target
     if declared_only:
         try:
             return plan_git.declared_target(repo)
