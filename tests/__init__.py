@@ -8,8 +8,12 @@ import tempfile
 # venv installé et non celui de l'arbre testé (faux rouges des tests ciblés,
 # paquet-horaire refusant une bibliothèque « déjà chargée ailleurs »). L'arbre
 # `src` passe en tête une fois, ici, avant tout import d'ameesh ; une
-# bibliothèque chargée hors de cet arbre arrête la suite net.
-_SRC = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "src"))
+# bibliothèque chargée hors de cet arbre arrête la suite net. « .. » se réduit
+# lexicalement avant de résoudre : un banc qui relie `tests/` par lien
+# symbolique à côté d'une copie de `src` (test_3687) charge la copie voisine
+# du lien, pas le `src` du dépôt réel.
+_SRC = os.path.realpath(os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "src")))
 sys.path[:] = [_SRC] + [p for p in sys.path
                         if not p or os.path.realpath(p) != _SRC]
 import ameesh as _ameesh  # noqa: E402

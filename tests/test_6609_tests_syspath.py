@@ -6,6 +6,7 @@ installé : faux rouges des tests ciblés d'agent (paquet-horaire refusait une
 bibliothèque « déjà chargée ailleurs »).
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,19 @@ class TestsSysPathTest(unittest.TestCase):
         done = run("import ameesh; import tests", pythonpath=self.elsewhere)
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("hors de l'arbre", done.stderr)
+
+    def test_tests_en_lien_symbolique_charge_le_src_voisin_du_lien(self):
+        root = Path(self.tmp.name) / "copie"
+        shutil.copytree(SRC, root / "src",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        os.symlink(REPO / "tests", root / "tests")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        done = subprocess.run(
+            [sys.executable, "-c", "import tests, ameesh; print(ameesh.__file__)"],
+            cwd=root, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(Path(done.stdout.strip()).resolve().is_relative_to(
+            (root / "src").resolve()), done.stdout)
 
 
 if __name__ == "__main__":
