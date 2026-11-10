@@ -738,11 +738,26 @@ def request_findings(rows: list[dict], *, now: float, attested=(),
         data = row["data"]
         later = sum(1 for other in group
                     if int(other.get("id") or 0) > int(row.get("id") or 0))
-        detail = ("Staging request %s (%s) blocked: %s; reprise refusée avant "
-                  "preuve d'arrêt et accès de déploiement sur le candidat élu."
-                  % (data.get("request"), str(data.get("sha") or "")[:12],
-                     data.get("blocked_reason") or data.get("reason")
-                     or ("deadline exceeded" if late else "failed")))
+        request = data.get("request")
+        sha = str(data.get("sha") or "")[:12]
+        # #6761: the alert names the real cause the sequence consigned on the
+        # request (last named error, already bounded and redacted there). The
+        # generic "reprise refusée avant preuve d'arrêt…" misled the auditor
+        # on #6532: a configuration refusal or a failed step is not a recovery.
+        if data.get("blocked_reason"):
+            detail = "Staging request %s (%s) blocked: %s" % (
+                request, sha, " ".join(str(data["blocked_reason"]).split())[:300])
+        elif late:
+            detail = ("Staging request %s (%s) deadline exceeded"
+                      % (request, sha))
+        else:
+            reason = " ".join(str(data.get("reason") or "").split())[:300]
+            code = data.get("exit")
+            detail = ("Staging request %s (%s) failed%s%s"
+                      % (request, sha,
+                         "" if code is None else " (exit %s)" % code,
+                         (": " + reason) if reason
+                         else " (aucune erreur nommée)"))
         if later:
             detail += (" %d demande(s) ultérieure(s), partielle(s) ou en cours, "
                        "ne soldent pas cet échec : seul un déploiement completed, "
