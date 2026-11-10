@@ -198,27 +198,44 @@ class Mailbox(interface.Mailbox):
             candidates = self.db.query(
                 "SELECT id, payload FROM agent_mailbox WHERE recipient = %s"
                 " AND work_item_id = %s AND kind = 'request' AND delivered_at IS NULL"
-                " AND payload ? 'review_designation' AND sender = %s"
+                " AND ((payload ? 'review_designation' AND sender = %s)"
+                " OR payload ? 'review_request')"
                 " AND signature IS NULL AND meta->'consigne' IS NULL"
                 " AND NOT coalesce((meta->>'deja_consigne')::boolean, false)"
-                " ORDER BY id DESC FOR UPDATE", (recipient, str(lot), sender))
+                " ORDER BY id ASC FOR UPDATE", (recipient, str(lot), sender))
             if candidates and not args['signature']:
                 prior = candidates[0]
                 # Recheck in the UPDATE as well: a read/reservation wins if it
                 # acquired the row first. Keep the original queue age so rapid
                 # freezes cannot postpone delivery indefinitely.
                 rows = self.db.query(
-                    "UPDATE agent_mailbox SET body = %s, payload = %s::jsonb"
+                    "UPDATE agent_mailbox SET body = %s, payload = %s::jsonb, sender = %s"
                     " WHERE id = %s AND delivered_at IS NULL AND meta->'consigne' IS NULL"
                     " AND NOT coalesce((meta->>'deja_consigne')::boolean, false)"
                     " RETURNING id, extract(epoch from created_at)::float8 AS created_ts",
-                    (body, json.dumps(args['payload'], ensure_ascii=False), prior['id']))
+                    (body, json.dumps(args['payload'], ensure_ascii=False), sender, prior['id']))
                 if rows:
                     from .work import WorkItems
                     WorkItems(self.db).note(lot, item[0]['state'],
                         'review-designation-replaced: ' + json.dumps({
                             'message': int(prior['id']), 'reviewer': recipient,
                             'old_sha': _request_sha(prior), 'new_sha': sha}, sort_keys=True), sender)
+                    # Retire legacy duplicates only while never exposed. All
+                    # candidates are locked, serializing with reservations.
+                    for stale in candidates[1:]:
+                        retired = self.db.query(
+                            "UPDATE agent_mailbox SET delivered_at = clock_timestamp(),"
+                            " status = 'delivered' WHERE id = %s AND delivered_at IS NULL"
+                            " AND meta->'consigne' IS NULL"
+                            " AND NOT coalesce((meta->>'deja_consigne')::boolean, false)"
+                            " RETURNING id", (stale['id'],))
+                        if retired:
+                            WorkItems(self.db).note(lot, item[0]['state'],
+                                'review-designation-replaced: ' + json.dumps({
+                                    'message': int(stale['id']), 'reviewer': recipient,
+                                    'old_sha': _request_sha(stale), 'new_sha': sha,
+                                    'retired': True, 'replacement': int(prior['id'])},
+                                    sort_keys=True), sender)
                     return rows[0]
         return self._insert(sender, recipient, body, **args)
 
