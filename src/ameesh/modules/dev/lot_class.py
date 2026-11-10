@@ -299,6 +299,15 @@ def companion_repository(cfg, item: dict, repo: str) -> str:
         return ""
     if own.rpartition("/")[2] == str(declared).lower().rpartition("/")[2]:
         return ""
+    # B mty-amh-impl-01 : un clone du canon (lot `canon/…`, #3331) garde la
+    # cible de son projet ; ce n'est pas un dépôt compagnon.
+    try:
+        top = os.path.realpath(canon_mod.git_toplevel(repo) or repo)
+        for path, slug in canon_clones(cfg):
+            if os.path.realpath(path) == top or (slug and slug.lower() == own):
+                return ""
+    except Exception:  # noqa: BLE001 - canons illisibles : le doute garde le projet
+        return ""
     return own
 
 

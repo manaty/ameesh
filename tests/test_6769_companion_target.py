@@ -124,6 +124,20 @@ class DefaultBaseTest(CompanionFixture):
                                                     declared_only=declared_only),
                              "codex/home-server-console")
 
+    def test_canon_clone_keeps_the_project_target(self):
+        # B mty-amh-impl-01 : lot `canon/…` d'ameesh, clone du canon (manaty/home)
+        canon = _clone(self.tmp, "canon", "manaty/home", ["main"])
+        cfg = types.SimpleNamespace(
+            canon=canon, github={"projects": {"ameesh": "manaty/ameesh"}},
+            release={"projects": {"ameesh": {"target": "main"}}})
+        item = self.item(id=6637, app="ameesh", branch="canon/6637-x",
+                         issue_ref="manaty/ameesh#1")
+        self.assertEqual(lot_class.companion_repository(cfg, item, canon), "")
+        self.assertEqual(lot_class.default_base(cfg, item, canon), "main")
+        # un autre dépôt reste un compagnon sur la même configuration
+        self.assertEqual(lot_class.companion_repository(cfg, item, self.companion),
+                         "manaty/manaty-its")
+
     def test_explicit_lot_target_is_preserved(self):
         self.assertEqual(lot_class.default_base(self.cfg(), self.item(branch_target="main"),
                                                 self.companion), "main")
