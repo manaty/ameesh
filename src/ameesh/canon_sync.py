@@ -2414,23 +2414,33 @@ class ProcessSync:
     sent: int = 0
     #: destinataires retirés au dépôt, ignorés sans annuler la synchronisation
     skipped_retired: list[str] = field(default_factory=list)
+    #: #6640 : envois en information (`info`, sans réveil) parmi `sent`
+    informed: int = 0
     #: diff git illisible : aucune poussée, les règles restent lues par le brief
     error: str = ""
 
     def to_dict(self) -> dict:
         out = {"changed": self.changed, "sent": self.sent,
+               "informed": self.informed,
                "skipped_retired": self.skipped_retired}
         if self.error:
             out["error"] = self.error
         return out
 
 
-#: #6425 : plafond du diff poussé dans un message de règles (octets UTF-8).
-#: Le corps entier d'une fiche n'est plus diffusé : « Processus de lot » pèse
-#: ~98 k o, et 41 agents en recevaient 4 M caractères par diffusion (09/11).
-PROCESS_PUSH_DIFF_MAX = 4000
-#: #6425 : marque de coupe d'un diff trop long ; le lien de la fiche suit.
-PROCESS_PUSH_CUT = "… [diff cut at %d bytes — read the whole card at the link below]"
+#: #6425, #6640 : plafond des sections poussées dans un message de règles
+#: (octets UTF-8). Le corps entier d'une fiche n'est plus diffusé : « Processus
+#: de lot » pèse ~98 k o, et 41 agents en recevaient 4 M caractères par
+#: diffusion (09/11) ; seules les sections changées partent, bornées ici.
+PROCESS_PUSH_SECTIONS_MAX = 8000
+#: #6425 : marque de coupe d'un extrait trop long ; le lien de la fiche suit.
+PROCESS_PUSH_CUT = "… [cut at %d bytes — read the whole card at the link below]"
+#: #6640 : nom de la « section » du frontmatter (hors `updated:`, qui bouge à
+#: chaque édition sans rien changer aux règles).
+PROCESS_FRONTMATTER = "(frontmatter)"
+
+_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 
 def _clip_octets(text: str, limit: int, mark: str) -> str:
@@ -2459,31 +2469,127 @@ def _read_command(source, process) -> str:
         shlex.quote("%s:%s" % (source.commit, process.fiche.path)))
 
 
-def _process_push_text(process, old: str, source) -> str:
-    """#6425 : le message poussé pour une fiche Process modifiée.
+def _process_sections(text: str) -> list[tuple[str, str]]:
+    """#6640 : une fiche découpée en sections `(clé, texte)`, dans l'ordre.
 
-    Il porte le diff `old..tip` borné (`PROCESS_PUSH_DIFF_MAX`) et le lien vers
-    la fiche au commit lu — jamais le corps entier, dont la diffusion coûtait
-    4 M caractères pour « Processus de lot ». Un diff illisible ne retient pas
-    la poussée : le lien suffit, et le brief de la prochaine session portera
-    les règles ; une coupe est dite, jamais silencieuse."""
+    Une section s'ouvre sur un titre Markdown (`#` à `######`, hors bloc de
+    code) et court jusqu'au suivant ; le texte avant le premier titre est la
+    section `""`. Le frontmatter est la section `PROCESS_FRONTMATTER`, sans la
+    ligne `updated:`. Un titre répété reçoit son rang (`titre #2`) : deux
+    sections homonymes ne se confondent jamais."""
+    sections: list[tuple[str, str]] = []
+    try:
+        front = canon_mod.split_frontmatter(text)
+    except canon_mod.YamlError:
+        front = None
+    if front is not None:
+        kept = [line for line in front.split("\n")
+                if not line.startswith("updated:")]
+        sections.append((PROCESS_FRONTMATTER, "\n".join(kept).strip()))
+    key, lines, fenced, seen = "", [], False, {}
+    for line in canon_mod.body_of(text).split("\n"):
+        if _FENCE_RE.match(line):
+            fenced = not fenced
+        elif not fenced and _HEADING_RE.match(line):
+            if key or "".join(lines).strip():
+                sections.append((key, "\n".join(lines).strip()))
+            key = line.strip().lstrip("#").strip()
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] > 1:
+                key = "%s #%d" % (key, seen[key])
+            lines = []
+        lines.append(line.rstrip())
+    if key or "".join(lines).strip():
+        sections.append((key, "\n".join(lines).strip()))
+    return sections
+
+
+@dataclass
+class ProcessPush:
+    """#6640 : ce qu'une fiche modifiée pousse — le texte du message, les
+    sections changées (vide : fiche entière, base absente ou illisible) et le
+    texte où chercher les destinataires touchés."""
+
+    text: str
+    sections: list[str]
+    full: bool
+    touched_text: str
+
+
+def _process_push(process, old: str, source) -> ProcessPush | None:
+    """#6425, #6640 : le message poussé pour une fiche Process modifiée.
+
+    Il porte les seules sections changées entre `old` (la base déjà poussée à
+    l'hôte) et le commit lu — ajoutées, modifiées (texte nouveau) ou retirées
+    (titre seul) —, bornées (`PROCESS_PUSH_SECTIONS_MAX`), et la référence
+    `chemin@sha` de la fiche entière avec sa commande de lecture. Aucune
+    section changée (seul `updated:` a bougé) : None, aucun courrier.
+
+    Base absente ou illisible (fiche nouvelle, objet manquant) : la fiche
+    entière part, jamais un delta orphelin (contre-examen #207148)."""
     ref = _fiche_ref(source, process)
-    lignes = ["Règles de travail du canon : %s" % process.title,
-              "Fiche : %s (diff %s..%s)"
-              % (ref, old[:12], source.commit[:12])]
-    diff = canon_mod.git_diff(source.repo, old, source.commit, process.fiche.path)
-    if diff is None:
-        lignes += ["", "(diff illisible — lire la fiche entière par le lien ci-dessous)"]
-    else:
-        texte = diff.decode("utf-8", "replace").strip()
-        if not texte:
-            lignes += ["", "(aucun diff textuel pour cette fiche)"]
-        else:
-            lignes += ["", _clip_octets(
-                texte, PROCESS_PUSH_DIFF_MAX,
-                "\n" + PROCESS_PUSH_CUT % PROCESS_PUSH_DIFF_MAX)]
-    lignes += ["", "Pour lire la fiche entière : `%s`" % _read_command(source, process)]
-    return "\n".join(lignes).strip()
+    lien = "Pour lire la fiche entière : `%s`" % _read_command(source, process)
+    raw_tip = canon_mod.git_read(source.repo, source.commit, process.fiche.path)
+    tip = (raw_tip.decode("utf-8", "replace") if raw_tip is not None
+           else process.body)
+    raw_old = canon_mod.git_read(source.repo, old, process.fiche.path)
+    if raw_old is None:
+        corps = canon_mod.body_of(tip).strip()
+        texte = "\n".join([
+            "Règles de travail du canon : %s" % process.title,
+            "Fiche : %s — base %s absente ou illisible : fiche entière"
+            % (ref, old[:12]), "", corps, "", lien])
+        return ProcessPush(texte.strip(), [], True, corps)
+    before = dict(_process_sections(raw_old.decode("utf-8", "replace")))
+    after = _process_sections(tip)
+    keys_after = {key for key, _ in after}
+    blocs, noms, touche = [], [], []
+    for key, texte in after:
+        if before.get(key) == texte:
+            continue
+        noms.append(key)
+        touche += [texte, before.get(key, "")]
+        etat = "modifiée" if key in before else "ajoutée"
+        blocs.append("— section « %s » (%s) :\n%s"
+                     % (key or "(avant le premier titre)", etat, texte))
+    for key, texte in before.items():
+        if key not in keys_after:
+            noms.append(key)
+            touche.append(texte)
+            blocs.append("— section « %s » (retirée)" % (key or "(avant le premier titre)"))
+    if not noms:
+        return None
+    extrait = _clip_octets("\n\n".join(blocs), PROCESS_PUSH_SECTIONS_MAX,
+                           "\n" + PROCESS_PUSH_CUT % PROCESS_PUSH_SECTIONS_MAX)
+    texte = "\n".join([
+        "Règles de travail du canon : %s" % process.title,
+        "Fiche : %s — %d section(s) changée(s) depuis %s"
+        % (ref, len(noms), old[:12]), "", extrait, "", lien])
+    return ProcessPush(texte.strip(), noms, False, "\n".join(touche))
+
+
+def _fold(text: str) -> str:
+    """Minuscules sans accents : « Relecture » et « relecturé » se lisent pareil."""
+    import unicodedata
+    return "".join(ch for ch in unicodedata.normalize("NFKD", text or "")
+                   if not unicodedata.combining(ch)).lower()
+
+
+def _recipient_tokens(canon: Canon, name: str) -> list[str]:
+    """#6640 : ce qui désigne un destinataire dans le texte d'une règle — son
+    nom, le titre et les alias de sa fiche, ses rôles déclarés (`roles:`)."""
+    tokens = [name]
+    agent = canon.agent(name)
+    if agent is not None:
+        tokens += [agent.title] + list(agent.aliases or []) + list(agent.roles or [])
+    return sorted({_fold(t).strip() for t in tokens if t and len(t.strip()) >= 3})
+
+
+def _touches(text: str, tokens: list[str]) -> bool:
+    """Vrai si l'un des `tokens` figure en mot entier dans `text` (plié)."""
+    plie = _fold(text)
+    return any(re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(token), plie)
+               for token in tokens)
 
 
 def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> ProcessSync:
@@ -2558,18 +2664,26 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
                                                  state_key(db, canon, host)):
             return done
         for process in changed:
-            # #6425 : diff borné + lien, jamais le corps entier de la fiche.
-            texte = _process_push_text(process, old, source)
+            # #6425, #6640 : sections changées + lien, jamais le corps entier
+            # (sauf base illisible : la fiche entière, jamais un delta orphelin).
+            push = _process_push(process, old, source)
+            if push is None:
+                continue
             for name in sorted(set(agents)):
                 if name in done.skipped_retired:
                     continue
+                payload = {"event": "canon-process",
+                           "path": process.fiche.path,
+                           "ref": _fiche_ref(source, process),
+                           "base": old, "sections": push.sections,
+                           "full": push.full}
+                # #6640 : en information, sauf si une section changée nomme
+                # le destinataire (nom, titre, alias, rôle) : lui est réveillé.
+                if not _touches(push.touched_text, _recipient_tokens(canon, name)):
+                    payload["info"] = True
                 try:
-                    mail_mod.send(tx, work_mod.SYSTEM_SENDER, name, texte, host=host,
-                                  kind="event",
-                                  payload={"event": "canon-process",
-                                           "path": process.fiche.path,
-                                           "ref": _fiche_ref(source, process)},
-                                  thread=False)
+                    mail_mod.send(tx, work_mod.SYSTEM_SENDER, name, push.text, host=host,
+                                  kind="event", payload=payload, thread=False)
                 except storage.RecipientRetired:
                     # #5080 : le retrait peut précéder celui de la fiche canon.
                     # Le dépôt refuse sans erreur SQL ; la transaction reste
@@ -2577,6 +2691,8 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
                     done.skipped_retired.append(name)
                     continue
                 done.sent += 1
+                if payload.get("info"):
+                    done.informed += 1
             done.changed.append(process.title)
     return done
 

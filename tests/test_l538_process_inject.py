@@ -676,14 +676,14 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.sync()
         self.assertEqual(len(self._sujets("orchestre")), 1)
 
-    def test_le_message_porte_un_diff_borne_et_un_lien_pas_le_corps(self):
-        # #6425 : la diffusion d'une fiche Process porte un diff borné et le
-        # lien vers la fiche ; le corps entier (98 k o pour « Processus de lot »)
-        # n'est plus recopié à chaque agent.
+    def test_le_message_porte_les_sections_bornees_et_un_lien_pas_le_corps(self):
+        # #6425, #6640 : la diffusion d'une fiche Process porte les sections
+        # changées, bornées, et le lien vers la fiche ; le corps entier (98 k o
+        # pour « Processus de lot ») n'est plus recopié à chaque agent.
         self.sync()
         queue = "TAIL-QUEUE-98K"
         long_body = ("# Processus de lot\n\n- la règle nouvelle\n"
-                     + "".join("- règle ancienne %03d\n" % i for i in range(600))
+                     + "".join("- règle ancienne %03d\n" % i for i in range(1200))
                      + "- %s\n" % queue)
         self._change(long_body)
         revision = canon.load(self.clone)
@@ -693,30 +693,35 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.assertEqual(len(recus), 1, recus)
         corps = recus[0]["body"]
         self.assertIn("la règle nouvelle", corps)
-        self.assertIn("@@", corps)                 # un vrai diff unifié
         self.assertIn(ref, corps)                  # le lien (référence canon)
         self.assertIn("git -C", corps)             # la commande de lecture
-        self.assertIn(canon_sync.PROCESS_PUSH_CUT % canon_sync.PROCESS_PUSH_DIFF_MAX,
+        self.assertIn(canon_sync.PROCESS_PUSH_CUT
+                      % canon_sync.PROCESS_PUSH_SECTIONS_MAX,
                       corps)                      # la coupe est dite
         self.assertNotIn(queue, corps)             # le corps entier n'est pas là
         self.assertLessEqual(mail.octets(corps),
-                             canon_sync.PROCESS_PUSH_DIFF_MAX + 1500)
+                             canon_sync.PROCESS_PUSH_SECTIONS_MAX + 1500)
 
-    def test_un_diff_de_fiche_illisible_pousse_quand_meme_le_lien(self):
-        # #6425 : un diff de fiche illisible ne retient pas la poussée — le
-        # lien suffit, et le repère avance (la règle est dans le brief suivant).
+    def test_une_base_illisible_pousse_la_fiche_entiere(self):
+        # #6640 (contre-examen #207148) : base absente ou illisible — la fiche
+        # entière part, jamais un delta orphelin ; le repère avance.
         self.sync()
-        self._change("# Processus de lot\n\n- la règle suivante\n")
+        self._change("# Processus de lot\n\n- la règle suivante\n- %s\n" % REGLE)
         revision = canon.load(self.clone)
         head = revision.sources[0].commit
         ref = revision.processes[0].fiche.ref
-        with mock.patch.object(canon, "git_diff", return_value=None):
+        lire = canon.git_read
+
+        def sans_base(repo, commit, path, **kw):
+            return None if commit != head else lire(repo, commit, path, **kw)
+        with mock.patch.object(canon, "git_read", side_effect=sans_base):
             report = self.sync()
         self.assertEqual(report.processes.sent, 2)
-        corps = self._sujets("orchestre")[0]["body"]
-        self.assertIn("diff illisible", corps)
-        self.assertIn(ref, corps)
-        self.assertIn("git -C", corps)
+        recu = self._sujets("orchestre")[0]
+        self.assertIn("fiche entière", recu["body"])
+        self.assertIn(REGLE, recu["body"])         # inchangée, mais portée
+        self.assertIn(ref, recu["body"])
+        self.assertTrue(mail.message_payload(recu)["full"])
         self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
                          head)
 
