@@ -2648,6 +2648,11 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     for problem in venv_guard.installation_problems():
         print("install    : KO — %s (reinstall the deployed src-<sha>)" % problem)
         verdict = 1
+    # #6684 : un dossier de shims dont la cible n'est pas le venv de CE
+    # magasin fait exécuter l'ameesh d'un autre magasin à chaque tour.
+    for problem in venv_guard.shim_problems(cfg):
+        print("shims      : KO — %s" % problem)
+        verdict = 1
     from . import db_capacity
     try:
         capacity = db_capacity.read(db)

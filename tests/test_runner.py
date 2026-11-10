@@ -843,10 +843,15 @@ class RunnerTest(PgTestCase):
         productif = os.path.join(self.tmp, "venv-prod")
         subprocess.run([sys.executable, "-m", "venv", "--without-pip", productif],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # l'écriture des shims échoue : un fichier occupe leur chemin
-        menage = os.path.join(self.state, ".menage")
-        os.makedirs(menage, exist_ok=True)
-        with open(os.path.join(menage, "bin-ameesh"), "w", encoding="utf-8") as fh:
+        # l'écriture des shims échoue : un fichier occupe leur chemin (#6684 :
+        # le dossier dépend du magasin, ici le venv jetable du tour)
+        import types
+        from ameesh import venv_guard
+        with mock.patch.multiple(sys, prefix=productif, base_prefix="/usr"):
+            shims = venv_guard.shim_dir(
+                types.SimpleNamespace(state_dir=self.state))
+        os.makedirs(os.path.dirname(shims), exist_ok=True)
+        with open(shims, "w", encoding="utf-8") as fh:
             fh.write("obstacle\n")
         # le venv jetable voit les dépendances de la suite par PYTHONPATH
         import site
