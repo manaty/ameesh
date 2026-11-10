@@ -268,6 +268,22 @@ class StrataTest(unittest.TestCase):
         self.assertEqual(sum(row["units"] for row in strata["staging"]),
                          run()["cohorts"]["staging"]["units"])
 
+    def test_chaque_strate_porte_le_cout_de_sa_cohorte(self):
+        # le coût d'intégration s'arrête à la fusion, celui du staging à
+        # l'attestation : une strate de staging ne publie jamais l'autre phase
+        one = unit(1, family="claude", type_="bug", size="s", usd=10.0)
+        one["active_usd"] = 2.0
+        strata = run(units=[one])["sensitivity"]["strata"]
+        integration = cell(strata["integration"], type="bug", size="s")
+        staging = cell(strata["staging"], type="bug", size="s")
+        self.assertEqual(integration["families"][0]["mean_usd"], 10.0)
+        self.assertEqual(staging["families"][0]["mean_usd"], 2.0)
+
+    def test_strates_non_lues_restent_inconnues(self):
+        strata = run(units=None)["sensitivity"]["strata"]
+        self.assertIsNone(strata["integration"])
+        self.assertIsNone(strata["staging"])
+
 
 class OtherCohortsTest(unittest.TestCase):
     """Abandonnées et ouvertes : cohortes distinctes."""

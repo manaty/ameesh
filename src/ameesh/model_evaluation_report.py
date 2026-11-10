@@ -1732,11 +1732,15 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
         "activity": activity,
     }
 
-    # M5 : tableaux descriptifs et de sensibilité, à côté des tableaux M1
+    # M5 : tableaux descriptifs et de sensibilité, à côté des tableaux M1.
+    # Chaque strate porte le coût de sa cohorte : l'intégration s'arrête à la
+    # fusion, le staging à l'attestation ; les deux phases ne se comparent pas.
     sensitivity = {
         "b_cross": _b_cross(verdicts),
-        "strata": {"integration": _strata(integration),
-                   "staging": _strata(staging)},
+        "strata": {"integration": (_strata(integration_cost)
+                                   if units is not None else None),
+                   "staging": (_strata(staging_cost)
+                               if units is not None else None)},
         "other_cohorts": _other_cohorts(others),
         "reds": _reds(reds),
         "ci": _ci(ci),
