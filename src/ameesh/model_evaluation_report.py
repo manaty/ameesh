@@ -85,8 +85,9 @@ from . import estimates
 SCHEMA = "ameesh-model-evaluation-report/1"
 SOURCE = "docs/design/etudes/evaluation-modeles.md#M1"
 #: la version de calcul, conservée à côté des tableaux (l'étude le demande) ;
-#: 2 = tableaux M5 ajoutés, ceux de M1 inchangés
-CALCULATION_VERSION = 2
+#: 2 = tableaux M5 ajoutés, M1 inchangé ; 3 = résolutions M3 des constats
+#: (table de relecture M1 modifiée) et tableaux M5
+CALCULATION_VERSION = 3
 #: seuil d'affichage d'une petite cellule, le même pour toutes les familles :
 #: la cellule reste publiée, marquée ; ce n'est pas un seuil de décision
 SMALL_CELL = 10
@@ -97,6 +98,8 @@ DEFAULT_PROJECT = "ameesh"
 DEFAULT_DAYS = 14
 #: borne de sécurité d'une fenêtre glissante (dix ans)
 MAX_DAYS = 3660
+#: #6669 (M3) : le journal additif des résolutions de constats
+RESOLUTIONS_TABLE = "review_finding_resolutions"
 
 #: l'ordre des tableaux de l'étude
 FAMILY_ORDER = ("claude", "codex", "deepseek", "mixed", "unknown")
@@ -166,7 +169,8 @@ LIMITS = (
     "dépense marginale comparable entre forfait et paiement au jeton ; aucune "
     "économie n'en est déduite",
     "un B déclaré n'est pas un défaut prouvé ; un lot fusionné ne tranche pas "
-    "la justesse d'un B, et le nombre de B justes reste inconnu",
+    "la justesse d'un B : seuls les constats adjudiqués indépendamment (M3) "
+    "sont comptés, les autres restent non tranchés",
     "l'attribution des lots, des relecteurs et des familles n'est pas "
     "aléatoire : les différences décrivent des populations, pas un effet "
     "causal du modèle",
@@ -237,6 +241,11 @@ COVERAGE_RULES = (
     ("review", "les sièges notifiés et les verdicts rendus ne forment pas le "
                "même entonnoir ; une notification sans famille reste hors "
                "des trois lignes et n'est pas affectée au registre courant"),
+    ("resolution", "un constat est un verdict bloqué identifiable par son "
+                   "jalon ; son état effectif est la dernière résolution du "
+                   "journal 0564, une absence valant non tranché ; un OK "
+                   "postérieur ne tranche rien et un confirmé/infirmé non "
+                   "indépendant n'est jamais compté comme tranché"),
     ("causality", "les tableaux sont descriptifs : aucune inférence causale "
                   "n'est tirée d'une différence entre familles, et aucune "
                   "recommandation n'est produite par ce lecteur"),
@@ -550,6 +559,32 @@ SELECT m.kind, coalesce(m.verdict, '') AS verdict,
  ORDER BY 1, 2, 3
 """
 
+#: #6669 (M3) : les constats (verdicts bloqués) de la fenêtre et l'état
+#: effectif de leur résolution (dernière ligne du journal 0564 **antérieure à
+#: la fin de fenêtre**, pour qu'une fenêtre passée se rejoue). Une absence de
+#: ligne reste un constat non tranché ; un OK postérieur ne tranche rien.
+_RESOLUTIONS_SQL = """
+SELECT m.id AS milestone_id, m.work_item_id AS lot,
+       lower(btrim(m.sha)) AS sha,
+       coalesce(p.harness, 'unknown') AS family,
+       r.state, r.basis, r.adjudicator, r.independent
+  FROM work_item_milestones m
+  JOIN work_items w ON w.id = m.work_item_id
+  LEFT JOIN provenance_receipts p ON p.subject = 'milestone:' || m.id
+  LEFT JOIN LATERAL (
+      SELECT state, basis, adjudicator, independent
+        FROM review_finding_resolutions r
+       WHERE r.milestone_id = m.id
+         AND r.created_at < to_timestamp(%s)
+       ORDER BY r.id DESC LIMIT 1
+  ) r ON true
+ WHERE w.app = %s
+   AND m.kind = 'verdict' AND m.verdict = 'blocked'
+   AND m.at >= to_timestamp(%s)
+   AND m.at < to_timestamp(%s)
+ ORDER BY m.id
+"""
+
 #: Les sièges notifiés, lus seulement dans la charge de désignation de la
 #: boîte, jamais dans le corps. `reviewer` y est la famille du siège.
 _DESIGNATED_SQL = """
@@ -790,7 +825,14 @@ def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
     start_ts, end_ts = window(now=at, days=days, start=start, end=end)
     with db.transaction() as tx:
         tx.execute("SET TRANSACTION READ ONLY")
-        results = tx.query_batch([
+        # #6669 (M3) : la table du journal peut manquer sur un schéma N-1 ;
+        # le rapport lit alors les constats sans résolution, jamais un zéro
+        # inventé. `to_regclass` ne résout rien d'autre que la présence.
+        present = tx.query(
+            "SELECT to_regclass(%s) IS NOT NULL AS present",
+            (RESOLUTIONS_TABLE,))
+        held = bool((present[0] or {}).get("present")) if present else False
+        queries = [
             (_UNITS_SQL, (start_ts, end_ts, project, project)),
             (_STAGED_SQL, (project, start_ts, end_ts)),
             (_PERIOD_SQL, (start_ts, end_ts, project, project)),
@@ -802,16 +844,21 @@ def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
             (_REDS_SQL, (project, start_ts, end_ts)),
             (_CI_SQL, (start_ts, end_ts, project)),
             (_REVIEW_COST_SQL, (project, start_ts, end_ts)),
-        ])
+        ]
+        if held:
+            queries.append(
+                (_RESOLUTIONS_SQL, (end_ts, project, start_ts, end_ts)))
+        results = tx.query_batch(queries)
     (units, staged, project_period, mesh_period, reviews, designated,
-     verdicts, others, reds, ci, review_cost) = results
+     verdicts, others, reds, ci, review_cost) = results[:11]
+    resolutions = results[11] if held and len(results) > 11 else None
     return build(
         project=project, at=at, start=start_ts, end=end_ts,
         units=units, staged=staged,
         period_project=project_period, period_mesh=mesh_period,
         reviews=reviews, designated=designated,
         verdicts=verdicts, others=others, reds=reds, ci=ci,
-        review_cost=review_cost,
+        review_cost=review_cost, resolutions=resolutions,
     )
 
 
@@ -1118,14 +1165,53 @@ def _activity(rows: Sequence[Mapping[str, Any]] | None
     return out
 
 
+#: les trois états effectifs d'un constat (#6669)
+RESOLUTION_STATES = ("confirmed", "refuted", "undecided")
+
+
+def _resolution_states(rows: Sequence[Mapping[str, Any]] | None):
+    """Compte les états effectifs par famille, ou `(None, None)` sans lecture.
+
+    Une ligne sans `state` est un constat sans résolution : non tranché. Un
+    confirmé/infirmé que la base n'a pas marqué indépendant n'est jamais
+    compté comme tranché (la contrainte 0564 l'interdit déjà ; le lecteur ne
+    s'y fie pas). Une lecture vide est un zéro mesuré, une lecture absente
+    reste `None`.
+    """
+    if rows is None:
+        return None, None
+    by_family: dict[str, dict[str, int]] = {}
+    totals = {"total": 0, "confirmed": 0, "refuted": 0, "undecided": 0,
+              "resolved": 0, "adjudicated": 0}
+    for row in rows or ():
+        family = str(row.get("family") or "unknown")
+        state = str(row.get("state") or "undecided")
+        if state in ("confirmed", "refuted") and row.get("independent") is False:
+            state = "undecided"
+        if state not in RESOLUTION_STATES:
+            state = "undecided"
+        entry = by_family.setdefault(
+            family, {key: 0 for key in RESOLUTION_STATES})
+        entry[state] += 1
+        totals["total"] += 1
+        totals[state] += 1
+        if state != "undecided":
+            totals["resolved"] += 1
+            totals["adjudicated"] += 1
+    return by_family, totals
+
+
 def _review(rows: Sequence[Mapping[str, Any]] | None,
             designated: Sequence[Mapping[str, Any]] | None,
+            resolutions: Sequence[Mapping[str, Any]] | None = None,
             ) -> dict[str, Any]:
-    """Les reçus de verdict, leur famille, et les sièges notifiés à part."""
+    """Les reçus de verdict, les sièges notifiés et les résolutions M3."""
+    by_resolution, totals = _resolution_states(resolutions)
     if rows is None:
         return {"by_family": None,
                 "notified_unattributed": None,
                 "unknown_receipt_family": None,
+                "b_resolutions": totals,
                 "b_justes": None,
                 "b_justes_reason": UNKNOWN["b_justes"],
                 "unknown": UNKNOWN["review_family"]}
@@ -1155,11 +1241,12 @@ def _review(rows: Sequence[Mapping[str, Any]] | None,
             continue
         notified[family] = {"mails": mails, "seats": seats}
     families = []
-    for family in sorted(set(verdicts) | set(notified)):
+    for family in sorted(set(verdicts) | set(notified)
+                         | set(by_resolution or ())):
         entry = verdicts.get(family) or {"frozen": 0, "ok": 0,
                                          "blocked": 0, "lots": 0}
         lines = entry["ok"] + entry["blocked"]
-        families.append({
+        out = {
             "family": family,
             "frozen": entry["frozen"],
             "ok": entry["ok"],
@@ -1170,9 +1257,42 @@ def _review(rows: Sequence[Mapping[str, Any]] | None,
             "lots": entry["lots"],
             "notified_mails": (notified.get(family) or {}).get("mails", 0),
             "notified_seats": (notified.get(family) or {}).get("seats", 0),
-            "b_justes": None,
-            "b_justes_unknown": entry["blocked"],
-        })
+        }
+        if by_resolution is None:
+            out.update({
+                "b_confirmed": None, "b_refuted": None,
+                "b_undecided": None, "b_resolved": None,
+                "b_justes": None, "b_justes_known": None,
+                "b_justes_unknown": entry["blocked"],
+            })
+        else:
+            counts = {key: int((by_resolution.get(family) or {}).get(key) or 0)
+                      for key in RESOLUTION_STATES}
+            # un verdict bloqué sans ligne de résolution n'est pas perdu
+            missing = entry["blocked"] - sum(counts.values())
+            if missing > 0:
+                counts["undecided"] += missing
+            out.update({
+                "b_confirmed": counts["confirmed"],
+                "b_refuted": counts["refuted"],
+                "b_undecided": counts["undecided"],
+                "b_resolved": counts["confirmed"] + counts["refuted"],
+                "b_justes": counts["confirmed"],
+                "b_justes_known": counts["confirmed"] + counts["refuted"],
+                "b_justes_unknown": counts["undecided"],
+            })
+        families.append(out)
+    if by_resolution is not None:
+        # les lignes ajustées font foi : le total reste la somme des familles
+        totals = {
+            "total": sum(row["b_confirmed"] + row["b_refuted"]
+                         + row["b_undecided"] for row in families),
+            "confirmed": sum(row["b_confirmed"] for row in families),
+            "refuted": sum(row["b_refuted"] for row in families),
+            "undecided": sum(row["b_undecided"] for row in families),
+            "resolved": sum(row["b_resolved"] for row in families),
+            "adjudicated": sum(row["b_resolved"] for row in families),
+        }
     return {
         "by_family": families,
         "notified_unattributed": {"mails": unattributed_mails,
@@ -1182,8 +1302,9 @@ def _review(rows: Sequence[Mapping[str, Any]] | None,
             + verdicts.get("unknown", {}).get("blocked", 0),
             "name": UNKNOWN["review_family"],
         },
-        "b_justes": None,
-        "b_justes_reason": UNKNOWN["b_justes"],
+        "b_resolutions": totals,
+        "b_justes": (totals["confirmed"] if totals is not None else None),
+        "b_justes_reason": (None if totals is not None else UNKNOWN["b_justes"]),
     }
 
 
@@ -1594,6 +1715,7 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
           reds: Sequence[Mapping[str, Any]] | None = None,
           ci: Sequence[Mapping[str, Any]] | None = None,
           review_cost: Sequence[Mapping[str, Any]] | None = None,
+          resolutions: Sequence[Mapping[str, Any]] | None = None,
           ) -> dict[str, Any]:
     """Assemble le rapport depuis les lignes lues (aucune base ici).
 
@@ -1668,6 +1790,14 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
         staging_cost, lambda unit: (unit["family"], unit["type"] or "unknown",
                                     unit["size"] or "unknown"))
 
+    review = _review(reviews, designated, resolutions)
+    held_resolutions = review.get("b_resolutions") is not None
+    unknown = dict(UNKNOWN)
+    if held_resolutions:
+        # M3 fournit la source structurée : le nombre de B justes n'est plus
+        # une inconnue globale, il est mesuré sur les constats adjudiqués.
+        unknown.pop("b_justes", None)
+
     cohort = {
         "candidates": len(units) if units is not None else None,
         "integration": _cohort(integration_cost),
@@ -1693,11 +1823,13 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
             "staging_usd_known": cohort["staging"]["lots_with_usd"],
             "staging_class_unknown": cohort["staging"]["units"],
             "staging_effort_unknown": cohort["staging"]["units"],
-            "b_justes_known": 0,
+            "b_justes_known": (
+                (review.get("b_resolutions") or {}).get("resolved", 0)
+                if held_resolutions else 0),
         },
         "staging_attestations": _staging_coverage(
             staged, computed_units if units is not None else None, staging),
-        "unknown": dict(UNKNOWN),
+        "unknown": unknown,
         "families_absent": [
             family for family in FAMILY_ORDER
             if family not in {row["name"] for row in families_staging}
@@ -1715,8 +1847,6 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
             "estimation de consommation du livre comptable ; ni facture ni "
             "dépense marginale comparable entre forfait et paiement au jeton"),
     }
-    review = _review(reviews, designated)
-
     tables = {
         "families": {"integration": families_integration,
                      "staging": families_staging,
@@ -1916,14 +2046,24 @@ def format_text(report: Mapping[str, Any]) -> str:
     lines += ["", "Porteurs, séparés des unités"]
     lines += _family_table((report.get("families") or {}).get("carriers") or ())
     review = report.get("review") or {}
-    lines += ["", "Relecture : reçus et sièges notifiés"]
-    lines.append("  %-9s %8s %6s %9s %10s %10s"
-                 % ("FAMILLE", "SIÈGES", "B", "OK", "B/LIGNES", "B JUSTES"))
+    lines += ["", "Relecture : reçus, sièges notifiés et résolutions des constats"]
+    lines.append("  %-9s %8s %6s %6s %10s %10s %13s"
+                 % ("FAMILLE", "SIÈGES", "B", "OK", "CONFIRMÉS",
+                    "INFIRMÉS", "NON TRANCHÉS"))
     for row in review.get("by_family") or ():
-        lines.append("  %-9s %8s %6s %9s %10s %10s"
+        lines.append("  %-9s %8s %6s %6s %10s %10s %13s"
                      % (row.get("family"), _fmt(row.get("notified_seats")),
                         _fmt(row.get("blocked")), _fmt(row.get("ok")),
-                        _fmt(row.get("blocked_rate")), "inconnu"))
+                        _fmt(row.get("b_confirmed")), _fmt(row.get("b_refuted")),
+                        _fmt(row.get("b_undecided"))))
+    resolved = review.get("b_resolutions") or {}
+    if resolved:
+        lines.append("  B résolus : %s confirmé(s), %s infirmé(s), "
+                     "%s non tranché(s), %s adjudiqué(s) indépendamment"
+                     % (_fmt(resolved.get("confirmed")),
+                        _fmt(resolved.get("refuted")),
+                        _fmt(resolved.get("undecided")),
+                        _fmt(resolved.get("adjudicated"))))
     unattributed = review.get("notified_unattributed") or {}
     if unattributed.get("seats"):
         lines.append("  notification(s) sans famille : %s siège(s), hors des "
@@ -1946,10 +2086,18 @@ def format_text(report: Mapping[str, Any]) -> str:
                  % ("attestations staging", _fmt(staging.get("events")),
                     _fmt(staging.get("lots")), _fmt(staging.get("matched"))))
     lines += _sensitivity_text(report.get("sensitivity") or {})
+    b_justes = review.get("b_justes")
+    if b_justes is None:
+        b_line = ("B justes : inconnu (lecture M3 absente) ; classe et effort "
+                  "exécuté : inconnus ; USD ≠ facture ; données absentes ≠ zéro.")
+    else:
+        b_line = ("B justes : %s confirmé(s) sur %s constat(s) par adjudication "
+                  "indépendante ; classe et effort exécuté : inconnus ; "
+                  "USD ≠ facture ; données absentes ≠ zéro."
+                  % (_fmt(b_justes), _fmt(resolved.get("total"))))
     lines += [
         "",
-        "B justes : inconnu ; classe et effort exécuté : inconnus ; "
-        "USD ≠ facture ; données absentes ≠ zéro.",
+        b_line,
         "Ce rapport ne conclut aucune causalité et ne produit aucun conseil "
         "de routage.",
     ]

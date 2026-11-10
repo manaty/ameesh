@@ -2088,6 +2088,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "links":     # #4167 : liens typés entre lots
             from . import work_dependencies
             return work_dependencies.run_links(db, args)
+        if args.work_command == "findings":  # #6669 : constats de revue (B) et résolutions
+            from . import review_finding
+            return review_finding.run(cfg, db, args)
         if args.work_command == "footprint":   # #4173 : empreinte de lot (#3185)
             from . import work_footprints
             return work_footprints.run(cfg, db, args)
@@ -4429,6 +4432,8 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     work_dependencies.add_parser(work_sub, cmd_work)
     work_dependencies.add_landing_parser(work_sub, cmd_work)
     work_dependencies.add_links_parser(work_sub, cmd_work)
+    from . import review_finding
+    review_finding.add_parsers(work_sub, cmd_work)  # constats de revue (M3, #6669)
     from . import work_footprints
     work_footprints.add_parser(work_sub, cmd_work)
     work_footprints.add_policy_parser(work_sub, cmd_work)
