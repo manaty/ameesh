@@ -141,6 +141,12 @@ def carrier(head_ref) -> bool:
 def gh_of(runner):
     """Un `gh` appelable (`gh(args, timeout=…)` → CompletedProcess, celui de
     `land` et `fire`) à partir d'un `plan_github.Gh` (`run(argv)` → tuple)."""
+    from .modules.dev.plan_github import Gh
+    if isinstance(runner, Gh):
+        # Armement et contrôle de fusion utilisent la réserve ; conserver
+        # l'environnement du client général sans lui donner cette priorité.
+        runner = Gh(gh=runner.path, env=dict(runner.env, AMEESH_GITHUB_PRIORITY="gate"),
+                    timeout=runner.timeout)
     def call(args, timeout: float = 60.0):
         code, out, err = runner.run(list(args))
         return subprocess.CompletedProcess(["gh", *args], code, out or "", err or "")

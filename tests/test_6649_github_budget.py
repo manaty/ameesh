@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ameesh import github_budget as budget, github_identity, packet_watch, plan_github
+from ameesh import github_budget as budget, github_identity, packet_watch, plan_github, packet_automerge
 from .test_l848_github_quota import Clock, FakeGitHub, BASE, quota_headers
 
 
@@ -101,6 +101,23 @@ class BudgetTest(unittest.TestCase):
         self.clock.now = 1061
         self.reads.note({}, status=403, body="Resource not accessible by integration")
         self.assertIsNone(self.reads.blocked())
+
+    def test_packet_merge_adapter_uses_reserve_without_promoting_poll_client(self):
+        self.reads.note(quota_headers(remaining="100", reset=4_000_000_000), status=200)
+        runner = plan_github.Gh(gh=sys.executable, env={"AMEESH_GITHUB_STATE": self.state})
+        gate = packet_automerge.gh_of(runner)
+        args = ["pr", "view", "2"]
+        with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                [], 0, "ok", "")) as run:
+            self.assertEqual(runner.run(args)[0], 75)
+            run.assert_not_called()
+            self.assertEqual(gate(args).returncode, 0)
+            self.assertEqual(run.call_args.kwargs["env"]["AMEESH_GITHUB_PRIORITY"], "gate")
+            self.assertNotIn("AMEESH_GITHUB_PRIORITY", runner.env)
+            self.reads.note(quota_headers(remaining="0", reset=4_000_000_000), status=403)
+            run.reset_mock()
+            self.assertEqual(gate(args).returncode, 75)
+            run.assert_not_called()
 
     def test_generated_shim_refuses_poll_without_starting_gh(self):
         self.sample()
