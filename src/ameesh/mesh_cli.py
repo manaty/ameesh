@@ -1211,13 +1211,19 @@ def _print_host_menage(menage: dict) -> None:
         autres = conteneurs.get("others") or []
         total = conteneurs.get("others_total")
         total = len(autres) if total is None else total
-        print("  containers %d started by an ameesh turn%s; %d other(s) reported%s" % (
+        bases = conteneurs.get("bases") or []
+        # #6630 : les noms, jamais une commande de suppression ; la base du
+        # mesh est nommée à part
+        print("  containers %d started by an ameesh turn%s; %d other(s) reported%s%s" % (
             len(ours),
             " (%s)" % "; ".join("%s: %s" % (c["path"], c.get("detail") or c["action"])
                                  for c in ours[:3]) if ours else "",
             total,
-            " (never removed: %s)" % "; ".join(c["command"] for c in autres[:5])
-            if autres else ""))
+            " (never removed: %s)" % "; ".join(
+                "%s (%s)" % (c.get("name") or c.get("id"), c.get("status") or "?")
+                for c in autres[:5]) if autres else "",
+            "; mesh database: %s (kept, do not remove)" % ", ".join(
+                c.get("name") or c.get("id") for c in bases) if bases else ""))
     faits = menage.get("last_24h") or []
     if faits:
         print("  24 h       %s" % "; ".join(

@@ -707,6 +707,32 @@ class ConteneursTest(_Tmp):
         self.assertEqual(moteur.remove("abc"), (True, ""))
         self.assertEqual(appels[-1], ["docker", "rm", "-f", "-v", "abc"])
 
+    def test_base_du_mesh_reconnue_par_nom_ou_volume(self):
+        """#6630 : le banc partagé (`scripts/pg-up.sh` : conteneur `<nom>`,
+        volume `<nom>-data` en `-pg-data`) est une base du mesh, reconnue par
+        son nom ou par le volume de base monté ; une base de lot ne l'est pas.
+        `ps` rend les montages (chaîne docker, liste podman)."""
+        base = containers.is_base_container
+        self.assertTrue(base({"name": "ameesh-pg"}))
+        self.assertTrue(base({"name": "/agent-mesh-pg"}))
+        self.assertTrue(base({"name": "banc", "mounts": ["ameesh-pg-data"]}))
+        self.assertFalse(base({"name": "ameesh-pg-1333", "mounts": ["ameesh-pg-1333-data"]}))
+        self.assertFalse(base({"name": "nexlink-sqltest-1", "mounts": []}))
+        self.assertFalse(base({"name": "redis"}))
+
+        def run(argv, **_kw):
+            sortie = "\n".join(json.dumps(r) for r in (
+                {"ID": "abc", "Names": "ameesh-pg", "Image": "postgres:16",
+                 "Mounts": "ameesh-pg-data", "Labels": ""},
+                {"ID": "def", "Names": ["banc"], "Image": "postgres:16",
+                 "Mounts": ["/var/lib/postgresql/data"], "Labels": ""},
+                {"ID": "ghi", "Names": "autre", "Image": "redis", "Labels": ""}))
+            return subprocess.CompletedProcess(argv, 0, sortie, "")
+
+        rows = containers.Runtime(binary="docker", run=run).list_all()
+        self.assertEqual([r["mounts"] for r in rows],
+                         [["ameesh-pg-data"], ["/var/lib/postgresql/data"], []])
+
     def test_ps_a_est_le_seul_releve_des_arretes(self):
         """#1547 (N2a) : `stopped=True` ajoute `-a` à l'argv réel de `ps` —
         un conteneur arrêté n'est vu que par ce relevé ; sans lui, la lecture
@@ -2205,7 +2231,7 @@ class MenageDbTest(PgTestCase):
         self.assertEqual(sorted(moteur.removed), ["1", "3"])
         dernier = storage.of(self.db).housekeeping.last_measure("pc")[0]["data"]
         self.assertEqual([o["command"] for o in dernier["containers"]["others"]],
-                         ["docker rm -f c-7"])
+                         ["docker inspect c-7"])
         attente = {o["path"]: o["action"] for o in dernier["containers"]["ameesh"]}
         self.assertEqual(attente, {"c-2": "attend", "c-4": "attend", "c-5": "signalé",
                                    "c-6": "signalé"})
@@ -2214,7 +2240,8 @@ class MenageDbTest(PgTestCase):
                          ["c-1", "c-3"])
         proc = self.mesh("hosts")
         self.assertIn("containers 4 started by an ameesh turn", proc.stdout)
-        self.assertIn("docker rm -f c-7", proc.stdout)
+        self.assertIn("never removed: c-7 (Up)", proc.stdout)
+        self.assertNotIn("rm -f", proc.stdout)
         # au tour suivant, seul le conteneur de CE tour est regardé
         seul = menage.reap_containers(moteur, self.db, "pc", only_turn="encours")
         self.assertEqual(seul["entries"], [])
@@ -2263,12 +2290,43 @@ class MenageDbTest(PgTestCase):
         self.assertEqual("lot #%s intake" % ouvert,
                          [o["detail"] for o in essai["ameesh"]
                           if o["path"] == "c-9"][0])
-        # le conteneur arrêté hors tour est vu et signalé, avec sa commande
-        self.assertEqual([o["command"] for o in essai["others"]], ["docker rm -f c-10"])
+        # le conteneur arrêté hors tour est vu et signalé, avec une commande
+        # d'inspection (#6630 : jamais de suppression imprimée)
+        self.assertEqual([o["command"] for o in essai["others"]], ["docker inspect c-10"])
         self.assertEqual(essai["others"][0]["status"], "Exited (0) 3 h ago")
         # réalisation : le tour fini sans lot et la base du lot fermé partent
         menage.reap_containers(moteur, self.db, "pc")
         self.assertEqual(sorted(moteur.removed), ["12", "8"])
+
+    def test_base_du_mesh_hors_des_autres_et_aucune_suppression_imprimee(self):
+        """#6630 (#205722, mesh-design #206985) : le banc rootless `ameesh-pg`
+        d'un hôte n'est pas un conteneur « autre » : relevé à part (`bases`),
+        hors du compte `others_total`, nommé « mesh database » par
+        `ameesh hosts` ; aucun `rm -f` n'est imprimé pour les autres."""
+        moteur = _FauxMoteur([
+            {"id": "a1", "name": "ameesh-pg", "image": "postgres:16",
+             "status": "Up 3 days", "labels": {}, "mounts": ["ameesh-pg-data"]},
+            {"id": "b2", "name": "ameesh-pg-1333", "image": "postgres:16",
+             "status": "Exited (0) 2 h ago", "labels": {}},
+        ])
+        essai = menage.reap_containers(moteur, self.db, "pc", dry_run=True)
+        self.assertEqual([b["name"] for b in essai["bases"]], ["ameesh-pg"])
+        self.assertEqual([o["name"] for o in essai["others"]], ["ameesh-pg-1333"])
+        self.assertEqual(essai["others_total"], 1)
+        self.assertEqual(essai["others"][0]["command"], "docker inspect ameesh-pg-1333")
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                        runtime=moteur)
+        self.assertEqual(moteur.removed, [])
+        dernier = storage.of(self.db).housekeeping.last_measure("pc")[0]["data"]
+        self.assertEqual([b["name"] for b in dernier["containers"]["bases"]], ["ameesh-pg"])
+        proc = self.mesh("hosts")
+        self.assertIn("1 other(s) reported (never removed: ameesh-pg-1333 "
+                      "(Exited (0) 2 h ago)); mesh database: ameesh-pg (kept, do not remove)",
+                      proc.stdout)
+        self.assertNotIn("rm -f", proc.stdout)
+        # un tour précis ne relève ni autres ni bases
+        seul = menage.reap_containers(moteur, self.db, "pc", only_turn="t")
+        self.assertIsNone(seul["bases"])
 
     def test_le_releve_des_conteneurs_hors_tour_est_borne(self):
         """#1547 (N3) : le journal ne garde qu'`OTHERS_TOP` conteneurs hors
