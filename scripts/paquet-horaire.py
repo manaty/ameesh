@@ -213,6 +213,8 @@ EARLY_PUSH_RE = re.compile(
 MARK = "paquet-horaire: "
 MARK_CI = MARK + "ci demandée "
 MARK_RED = MARK + "rouge consigné "
+#: #6665 : les états d'un run de ci-full encore vivant (ou pas encore relevé)
+RUN_IN_FLIGHT = ("running", "queued", "pending", None)
 MARK_WAIT = MARK + "verdict au pilote "
 MARK_ATTEMPT = MARK + "tentative "
 MARK_FAILED = MARK + "échec "
@@ -1845,6 +1847,21 @@ def publish(ctx: Context, item: dict) -> str:
         # le retour de paquet-auto ; ni verdict ni ci-full sur un porteur clos
         return "#%d déjà %s : rien à publier" % (
             carrier, "fusionné" if landed else "clos")
+    # #6665 (récidive de #6565) : une ci-full déjà terminée non verte sur
+    # cette tête n'est jamais redemandée — `ci run` la refuse (« already ran…
+    # none green »), le tic sortait en rc 1 et ouvrait un lot d'empreinte à
+    # chaque passage. Le rouge suit son chemin ordinaire. Une lecture
+    # impossible laisse la demande ordinaire décider, comme avant.
+    try:
+        run = run_for(ci_status(ctx, carrier), sha)
+    except HoraireError:
+        run = None
+    if (run is not None and run.get("status") not in RUN_IN_FLIGHT
+            and run.get("status") != "success"):
+        noted = marks(item)
+        if MARK_CI + sha not in noted:
+            ctx.note(carrier, MARK_CI + sha)
+        return finished_red(ctx, item, sha, run, noted)
     if publication_mode(ctx) != "legacy":
         proof = contract_result_at(ctx, item, sha)
         if proof is None or proof["result"]["state"] == "red":
@@ -1968,10 +1985,23 @@ def follow(ctx: Context, item: dict) -> str:
         ctx.say("#%d : résultat contrats %s sur %s ; résultat ci-full lu séparément"
                 % (carrier, state, sha[:12]))
     run = run_for(ci_status(ctx, carrier), sha)
-    if run is None or run.get("status") in ("running", "queued", "pending", None):
+    if run is None or run.get("status") in RUN_IN_FLIGHT:
         return "#%d : ci-full en cours sur %s" % (carrier, sha[:12])
     if run.get("status") == "success":
         return "#%d : ci-full verte sur %s, fusion automatique" % (carrier, sha[:12])
+    return finished_red(ctx, item, sha, run, noted)
+
+
+def finished_red(ctx: Context, item: dict, sha: str, run: dict,
+                 noted: list[str]) -> str:
+    """La ci-full terminée non verte de la tête gelée : retrait déterministe
+    et recomposition (une fois), sinon rouge consigné au pilote.
+
+    #6665 : partagé par `follow` et par `publish`, qui y arrive quand la tête
+    gelée porte déjà une ci-full rouge sans la marque `ci demandée` (arrêt
+    entre la demande et la marque, ou reprise d'une tentative qui republie la
+    même tête)."""
+    carrier = int(item["id"])
     run_id = str(run.get("run_id") or "?")
     if any(note.startswith(MARK_RED + run_id) for note in noted):
         return "#%d : rouge %s déjà consigné" % (carrier, run_id)
