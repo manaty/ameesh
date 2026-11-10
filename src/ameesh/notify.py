@@ -3554,6 +3554,10 @@ class Notifier:
                                # (`_brief_orchestrators`), pour ses lecteurs
                                agents=list(alert.get("agents") or ()),
                                lots=list(alert.get("lots") or ()))
+            if kind == "slo_breach":
+                # #6642 : la mesure de l'auditeur (#207200) lit le lot
+                # (`payload.lot`), l'étape et le palier dans le payload.
+                payload.update(step=alert.get("step"), level=alert.get("level"))
             # pas de `work_item_id` : un message lié au lot compterait comme
             # son activité (stagnation) et effacerait l'alerte qu'il signale
             delivered = []

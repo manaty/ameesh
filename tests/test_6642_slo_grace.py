@@ -107,6 +107,11 @@ class NotifierGraceTest(unittest.TestCase):
         self.assertEqual(self.recipients(), ["dev1"])
         self.run_pass(_slo(overdue=420), now=10_240)
         self.assertEqual(self.recipients(), ["dev1"])
+        meta = self.send.call_args.kwargs["payload"]
+        self.assertEqual((meta["lot"], meta["step"], meta["level"]),
+                         (42, "build_quiet", 1))
+        # pas de `work_item_id` : le courrier compterait comme activité du lot
+        self.assertNotIn("work_item_id", self.send.call_args.kwargs)
 
     def test_p1_part_tout_de_suite(self):
         self.run_pass(_slo(overdue=30, critical=True, urgent=True,
