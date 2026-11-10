@@ -5040,6 +5040,7 @@
     "backlog",
     "backlog_add",
     "backlog_basket_add",
+    "branch_heads",
     "by_issue_ref",
     "by_package",
     "by_source",

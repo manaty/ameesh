@@ -296,6 +296,11 @@ FERMEES = {
     # par déclencheurs et lue par l'élection (`role_standings_pg.coverage`) ;
     # état de mesure interne, fermé aux deux rôles, aucun GRANT modifié.
     "host_presence": {"host", "bucket_start", "readings", "first_at", "last_at"},
+    # #6626 (0563) : têtes de branche observées par le relevé des fusions,
+    # lues par `paquet-candidats` et le débit (empilement non déclaré). État
+    # interne de l'exécuteur ; fermé aux deux rôles superviseur, aucun GRANT
+    # modifié.
+    "work_item_branch_heads": {"work_item_id", "branch", "sha", "observed_at"},
     # #2845 (0470) : curseur, reçus et progression de la veille des tickets
     # GitHub. État interne de l'agent de veille, pas un état de supervision ;
     # fermé aux deux rôles superviseur, aucun GRANT modifié.

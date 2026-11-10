@@ -77,8 +77,9 @@ dépôt (aucun fetch) ; `ready=True` seulement quand le gel est la tête publié
 et que la fusion avec la cible est propre.
 
 #6607 : une tête qui porte des commits d'un autre lot **ouvert** du projet
-absents de la cible (son `branch_head`, sa tête publiée ou l'un de ses gels,
-même dépassé, est dans `cible..tête` : critère directionnel, jamais un
+absents de la cible (son `branch_head`, sa tête publiée, l'une des têtes
+relevées de sa branche (#6626) ou l'un de ses gels, même dépassé, est dans
+`cible..tête` : critère directionnel, jamais un
 simple recoupement), sans dépendance déclarée, est refusée `stacked-undeclared`
 (`depends_on` nomme le parent) : composée seule, elle emporterait les commits
 non relus du parent. Geste de l'auteur ou du pilote : `ameesh work
@@ -397,9 +398,11 @@ def open_lot_heads(db, app: str, *, tips: dict | None = None) -> tuple[list[dict
     Pour chaque lot ouvert (ni fusionné, ni livré, ni fermé) qui a une
     branche, hors véhicule de paquet : son `branch_head` observé, **tous** ses
     gels et têtes relues (un enfant a pu partir d'un gel que le parent a
-    dépassé depuis, B cx1) et, si `tips` la porte, sa tête publiée fraîche.
-    Rend `(têtes, tronqué)` : `tronqué` dit que la borne de lecture est
-    dépassée."""
+    dépassé depuis, B cx1), l'historique des têtes de sa branche courante
+    relevées par le balayage des fusions (#6626 : un enfant a pu partir d'une
+    tête jamais gelée ni relue) et, si `tips` la porte, sa tête publiée
+    fraîche. Rend `(têtes, tronqué)` : `tronqué` dit que la borne de lecture
+    est dépassée."""
     rows = storage.of(db).work.open_for_sweep(plan_git.MAX_BRANCH_LOTS + 1)
     truncated = len(rows) > plan_git.MAX_BRANCH_LOTS
     rows = [row for row in rows
@@ -407,12 +410,19 @@ def open_lot_heads(db, app: str, *, tips: dict | None = None) -> tuple[list[dict
             and str(row.get("branch") or "").strip()
             and not packet_guard.is_packet_branch(str(row.get("branch")).strip())]
     marks = _marks(db, [int(row["id"]) for row in rows]) if rows else {}
+    seen: dict[int, list[tuple]] = {}
+    if rows:
+        for head in storage.of(db).work.branch_heads([int(row["id"]) for row in rows]):
+            seen.setdefault(int(head["work_item_id"]), []).append(
+                (str(head.get("branch") or ""), head.get("sha")))
     out: list[dict] = []
     for row in rows:
         branch = str(row.get("branch") or "").strip()
         values = [row.get("branch_head"), (tips or {}).get(branch)]
         values += [mark.get("sha") for mark in marks.get(int(row["id"]), [])
                    if mark.get("kind") in ("frozen", "verdict")]
+        # #6626 : une tête relevée sur une autre branche du lot n'est pas la sienne
+        values += [sha for name, sha in seen.get(int(row["id"]), []) if name == branch]
         # un préfixe court nommerait plusieurs commits : 7 au moins
         shas = sorted({sha for sha in (plan_git.commit_id(value) for value in values)
                        if len(sha) >= 7})
@@ -430,12 +440,13 @@ def stacked_on(repo: str, head: str, base: str, others, *, lot: int,
     Une branche empilée sur un lot non fusionné ferait entrer dans le paquet
     les commits non relus de ce lot. `others` vient d'`open_lot_heads`. Le
     critère est **directionnel** : un lot est parent quand l'une de ses
-    têtes propres (observée, publiée, ou l'un de ses gels et têtes relues,
-    même dépassés) est un commit de `base..head`. Un simple recoupement de
+    têtes propres (observée, publiée, relevée à l'historique de sa branche,
+    ou l'un de ses gels et têtes relues, même dépassés) est un commit de
+    `base..head`. Un simple recoupement de
     commits ne suffit pas : il est symétrique et nommerait un enfant ou une
     sœur comme parent (B cx1, B ds1). Un parent dont l'enfant est parti d'un
-    commit jamais gelé ni observé n'est pas vu (faux négatif assumé, jamais
-    un faux parent). Sont exclus : le lot lui-même, un lot de même branche,
+    commit qu'aucun relevé n'a vu (poussé et dépassé entre deux balayages)
+    n'est pas vu (faux négatif assumé, jamais un faux parent). Sont exclus : le lot lui-même, un lot de même branche,
     celui dont la branche est la cible du lot (#3437, il entre avec son
     parent) et les prérequis déclarés (`declared`, #6214). Une seule lecture
     Git (`rev-list`) ; une lecture impossible lève `CandidateError`."""
