@@ -14,7 +14,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import time
-import types
 import unittest
 import uuid
 from unittest import mock
@@ -218,14 +217,6 @@ class ReadinessTest(_RoleCase):
         state = self.candidate()
         self.assertTrue(state["ready"], state["diagnostic"])
         self.assertEqual(state["diagnostic"], "")
-
-    def test_la_preparation_de_staging_ne_ferme_pas_la_readiness_locale(self):
-        # #6761 (P1 impl-18) : la preuve de staging arbitre le classement des
-        # candidats, jamais la readiness du role : le pilote ne se perd pas sur
-        # un echec commun ou sur l'ordre de deploiement (venv stable / runners).
-        ready, diagnostic = self.local()
-        self.assertTrue(ready, diagnostic)
-        self.assertNotIn("staging", diagnostic)
 
     def test_porte_de_l_hote_fermee(self):
         self.db.execute(
@@ -687,201 +678,52 @@ class RunnerWiringTest(_RoleCase):
         self.standing("pilote", "banc", 90.0)
 
 
-class StagingArbitrationTest(_RoleCase):
-    """#6761 : la preuve de staging arbitre le rang, jamais le role lui-meme."""
+class StagingProofObservationTest(_RoleCase):
+    """#6761 : la preuve de staging ne touche jamais l'election (pilote, 21:02Z).
+
+    Le refus est a la prise, dans l'executeur (`sequence_problem` en direct) ;
+    la preuve publiee n'est qu'une observation. Aucune absence, peremption ou
+    echec, meme commun aux deux candidats, ne retire le role : c'est le temoin
+    de l'ordre de deploiement (venv stable / runners) et du §11.
+    """
 
     def setUp(self) -> None:
         super().setUp()
-        # Le journal est append-only et partage : un nom de role par temoin
-        # isole les preuves des autres tests (aucun effacement possible).
-        self.name = "arbitrage-%s" % uuid.uuid4().hex[:8]
+        # Journal append-only et partage : un nom par temoin isole les preuves.
+        self.name = "observation-%s" % uuid.uuid4().hex[:8]
         self.role(self.name)
         self.ready_pair(self.name)
         self.standing(self.name, "banc", 90.0)
         self.standing(self.name, "atelier", 80.0)
 
-    def proof(self, host: str, *, ready: bool = True, diagnostic: str = "",
-              age: float = 0.0) -> None:
+    def proof(self, host: str, *, ready: bool, age: float = 0.0) -> None:
         object_name = "staging-executor:%s:%s" % (self.name, host)
         data = {"role": self.name, "host": host, "ready": ready}
-        if diagnostic:
-            data["diagnostic"] = diagnostic
+        if not ready:
+            data["diagnostic"] = "ssh manaty-mesh-1"
         self.db.execute(
             "INSERT INTO ameesh_events (type, object, project, data, created_at)"
             " VALUES ('staging.executor', %s, '', %s::jsonb,"
             "         now() - make_interval(secs => %s))",
             (object_name, json.dumps(data), float(age)))
 
-    def candidates(self) -> dict:
-        return {item["host"]: item
+    def ready_hosts(self) -> dict:
+        return {item["host"]: item["ready"]
                 for item in election.candidacy(self.db, self.name)}
 
-    def test_sans_preuve_le_role_reste_electible(self):
-        # Ordre de deploiement : l'executeur tourne encore l'ancien code et ne
-        # publie rien ; le pilote ne doit pas disparaitre (P1 impl-18).
-        candidates = self.candidates()
-        self.assertTrue(candidates["banc"]["ready"],
-                        candidates["banc"]["diagnostic"])
-        self.assertTrue(candidates["atelier"]["ready"],
-                        candidates["atelier"]["diagnostic"])
-
-    def test_une_preuve_fraiche_ecarte_les_candidats_sans_preuve(self):
-        self.proof("atelier")
-        candidates = self.candidates()
-        self.assertFalse(candidates["banc"]["ready"])
-        self.assertIn("staging preparation proof missing",
-                      candidates["banc"]["diagnostic"])
-        self.assertTrue(candidates["atelier"]["ready"],
-                        candidates["atelier"]["diagnostic"])
-        self.assertEqual(candidates["atelier"]["rank"], 0)
-        self.assertIsNone(candidates["banc"]["rank"])
-
-    def test_un_echec_commun_ne_retire_pas_le_role(self):
-        # Deux candidats partagent la topologie SSH : manaty-mesh-1
-        # injoignable les fait echouer tous les deux (reportable, §14).
-        self.proof("banc", ready=False, diagnostic="ssh manaty-mesh-1")
-        self.proof("atelier", ready=False, diagnostic="ssh manaty-mesh-1")
-        candidates = self.candidates()
-        self.assertTrue(candidates["banc"]["ready"],
-                        candidates["banc"]["diagnostic"])
-        self.assertTrue(candidates["atelier"]["ready"],
-                        candidates["atelier"]["diagnostic"])
-
-    def test_un_echec_isole_n_ecarte_que_son_hote(self):
-        self.proof("banc", ready=False, diagnostic="ssh manaty-mesh-1")
-        self.proof("atelier")
-        candidates = self.candidates()
-        self.assertFalse(candidates["banc"]["ready"])
-        self.assertIn("staging preparation failed: ssh manaty-mesh-1",
-                      candidates["banc"]["diagnostic"])
-        self.assertTrue(candidates["atelier"]["ready"],
-                        candidates["atelier"]["diagnostic"])
-
-    def test_une_preuve_perimee_est_ecartee_si_une_preuve_fraiche_existe(self):
-        # Minuterie morte apres un echec : la preuve positive d'il y a plus de
-        # 900 s ne classe plus son hote quand un autre prouve le contraire.
-        self.proof("banc", age=1000.0)
-        self.proof("atelier")
-        candidates = self.candidates()
-        self.assertFalse(candidates["banc"]["ready"])
-        self.assertIn("staging preparation proof expired",
-                      candidates["banc"]["diagnostic"])
-        self.assertTrue(candidates["atelier"]["ready"],
-                        candidates["atelier"]["diagnostic"])
-
-
-class StagingPreparationTest(unittest.TestCase):
-    """#6761 : lecture et jugement de la preuve de preparation du staging."""
-
-    ROLE = {"name": "mesh-design"}
-
-    def proof(self, *, host="banc", ready=True, ts=900.0, diagnostic="",
-              role="mesh-design"):
-        data = {"ready": ready}
-        if diagnostic:
-            data["diagnostic"] = diagnostic
-        return dict(id=1, ts=ts, object="staging-executor:%s:%s" % (role, host),
-                    data=data)
-
-    def proofs(self, rows, *, hosts=("banc",), now=1000.0, role=None):
-        events = mock.Mock()
-        events.latest_type.return_value = rows
-        store = mock.Mock(events=events)
-        with mock.patch.object(election.storage, "of", return_value=store), \
-             mock.patch.object(election.pg, "now_ts", return_value=now):
-            return (election.staging_proofs(object(), role or self.ROLE,
-                                            hosts, now=now), events)
-
-    def test_the_journal_is_read_once_for_the_whole_role(self):
-        proofs, events = self.proofs([self.proof(host="banc")],
-                                     hosts=("banc", "atelier"))
-        events.latest_type.assert_called_once_with(
-            "staging.executor", 30, 200)
-        self.assertEqual(proofs["banc"]["state"], "ready")
-        self.assertEqual(proofs["atelier"]["state"], "missing")
-
-    def test_a_fresh_positive_proof_is_ready(self):
-        proofs, _ = self.proofs([self.proof(ready=True, ts=900.0)])
-        self.assertEqual(proofs["banc"], {"state": "ready", "reason": ""})
-
-    def test_an_expired_positive_proof_is_expired(self):
-        proofs, _ = self.proofs([self.proof(ready=True, ts=99.0)])
-        self.assertEqual(proofs["banc"]["state"], "expired")
-        self.assertIn("staging preparation proof expired",
-                      proofs["banc"]["reason"])
-
-    def test_a_failure_names_the_diagnostic(self):
-        proofs, _ = self.proofs([self.proof(
-            ready=False, ts=900.0, diagnostic="unreachable (dial tcp)")])
-        self.assertEqual(proofs["banc"]["state"], "failed")
-        self.assertEqual(
-            proofs["banc"]["reason"],
-            "staging preparation failed: unreachable (dial tcp)")
-
-    def test_an_incomplete_proof_is_incomplete(self):
-        row = self.proof()
-        row["data"].pop("ready")
-        proofs, _ = self.proofs([row])
-        self.assertEqual(proofs["banc"]["state"], "incomplete")
-
-    def test_an_unreadable_timestamp_is_unreadable(self):
-        row = self.proof()
-        row["ts"] = "hier"
-        proofs, _ = self.proofs([row])
-        self.assertEqual(proofs["banc"]["state"], "unreadable")
-
-    def test_an_unreadable_journal_is_reported_without_condemning_anyone(self):
-        events = mock.Mock()
-        events.latest_type.side_effect = election.db_mod.DbError("boom")
-        with mock.patch.object(election.storage, "of",
-                               return_value=mock.Mock(events=events)):
-            proofs = election.staging_proofs(
-                object(), self.ROLE, ("banc", "atelier"), now=1000.0)
-        self.assertEqual({item["state"] for item in proofs.values()},
-                         {"unreadable"})
-        self.assertIn("staging preparation unreadable",
-                      proofs["banc"]["reason"])
-
-    def test_the_proof_of_another_host_does_not_answer_for_this_one(self):
-        proofs, _ = self.proofs([self.proof(host="atelier")],
-                                hosts=("banc", "atelier"))
-        self.assertEqual(proofs["banc"]["state"], "missing")
-        self.assertEqual(proofs["atelier"]["state"], "ready")
-
-    def test_an_ordinary_role_without_any_proof_is_untouched(self):
-        self.assertEqual(
-            election._staging_arbitration(
-                {"banc": True},
-                {"banc": {"state": "missing",
-                          "reason": "staging preparation proof missing"}}),
-            {})
-
-    def test_a_proven_candidate_keeps_the_others_out(self):
-        excluded = election._staging_arbitration(
-            {"banc": True, "atelier": True},
-            {"banc": {"state": "ready", "reason": ""},
-             "atelier": {"state": "missing",
-                         "reason": "staging preparation proof missing"}})
-        self.assertEqual(excluded,
-                         {"atelier": "staging preparation proof missing"})
+    def test_an_absent_proof_never_removes_the_role(self):
+        # L'executeur tourne encore l'ancien venv et ne publie rien.
+        self.assertEqual(self.ready_hosts(), {"banc": True, "atelier": True})
 
     def test_a_common_failure_never_removes_the_role(self):
-        failed = {"state": "failed",
-                  "reason": "staging preparation failed: ssh"}
-        self.assertEqual(
-            election._staging_arbitration(
-                {"banc": True, "atelier": True},
-                {"banc": failed, "atelier": dict(failed)}),
-            {})
+        self.proof("banc", ready=False)
+        self.proof("atelier", ready=False)
+        self.assertEqual(self.ready_hosts(), {"banc": True, "atelier": True})
 
-    def test_a_proven_candidate_that_is_not_ready_does_not_exclude(self):
-        self.assertEqual(
-            election._staging_arbitration(
-                {"banc": True, "atelier": False},
-                {"banc": {"state": "expired",
-                          "reason": "staging preparation proof expired"},
-                 "atelier": {"state": "ready", "reason": ""}}),
-            {})
+    def test_an_expired_or_isolated_failure_never_removes_the_role(self):
+        self.proof("banc", ready=False)
+        self.proof("atelier", ready=True, age=1000.0)
+        self.assertEqual(self.ready_hosts(), {"banc": True, "atelier": True})
 
 
 if __name__ == "__main__":

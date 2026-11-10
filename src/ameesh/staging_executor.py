@@ -59,12 +59,12 @@ SEQUENCE_REFUSAL = "sequence config: "
 #: #6761: the variables `config.load` reads as the DSN, in its priority order.
 DSN_SOURCES = ("AMEESH_DSN", "AGENT_MESH_DSN",
                "AMEESH_DATABASE_URL", "AGENT_MESH_DATABASE_URL")
-#: #6761: the preparation publishes its probe in the shared log, so the role's
-#: ranking prefers a candidate that proved it can deploy; the take-time probe
-#: remains the guard (one minute timer).
+#: #6761: the preparation publishes its probe in the shared log for
+#: observation only (no election reads it); the take-time probe is the guard
+#: (one minute timer).
 SEQUENCE_EVENT = "staging.executor"
 #: #6761: the probe's result is republished at most this often; a change is
-#: published at once, so the election sees a failure before the next minute.
+#: published at once, so the observation follows the failure.
 SEQUENCE_REPORT_S = 300.0
 #: The probe's default python, as in quiescence-staging.sh.
 PROBE_PYTHON = ".local/share/ameesh/venv/bin/python"
@@ -453,7 +453,7 @@ def quiescence_access_problem(env, options) -> str | None:
     """#6761: the quiescence probe will reach every staging target, or refuse.
 
     A candidate that cannot deploy, or cannot prove a previous execution
-    stopped, is never ranked 0 (#6532: AG1 was ranked ready while
+    stopped, refuses the take by name (#6532: AG1 took the request while
     `quiescence-staging.sh` could not reach `manaty-mesh-1`). The preparation
     checks the same SSH targets here, before any request is taken; hosts the
     sequence never touches (`QUIESCENCE_ABSENTS`) and the workstation without
@@ -540,13 +540,12 @@ def sequence_problem(cfg, env, options=None) -> str | None:
 
 
 def publish_sequence_readiness(db, cfg, options, problem, descriptor) -> None:
-    """#6761: publish the preparation's verdict for the staging arbitration.
+    """#6761: publish the preparation's verdict for observation only.
 
-    Every candidate runs the timer, holder or not. `election.candidacy` reads
-    the newest event: a proven candidate is preferred, but a missing or common
-    failure never removes the role (the live `sequence_problem` refuses an
-    unprepared host's take). The event is rate-limited; a changed verdict is
-    published at once, and a recovery removes the reason on the next pass.
+    Every candidate runs the timer, holder or not. No election reads the
+    newest event: the guard is the live `sequence_problem` before the take.
+    The event is rate-limited; a changed verdict is published at once, and a
+    recovery removes the reason on the next pass.
     """
     object_name = "staging-executor:%s:%s" % (options.get("role") or "", cfg.host)
     ready = problem is None
@@ -944,9 +943,8 @@ def tick(db, cfg, options) -> dict:
     if host not in options["candidates"]:
         return {"state": "standby", "reason": "not a candidate"}
     # #6761: the sequence's configuration is proved on EVERY candidate, holder
-    # or not: the preparation publishes its verdict, which arbitrates the
-    # ranking between otherwise ready candidates (never the role's readiness),
-    # and the probe below refuses this take if it fails. It runs the same
+    # or not: the preparation publishes its verdict for observation, and the
+    # probe below refuses this take if it fails. It runs the same
     # `config.load`/`db.connect` as `staging_watch`, with the environment the
     # sequence will receive.
     from .platform.child_environment import execution_transport

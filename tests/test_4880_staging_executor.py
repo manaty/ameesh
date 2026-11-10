@@ -745,7 +745,7 @@ class SequenceConfigTest(unittest.TestCase):
                 self.cfg(), {}, {"bascule_env": "/b"})
         self.assertEqual(problem, "quiescence access: x")
 
-    def test_a_failed_preparation_is_published_for_the_election(self):
+    def test_a_failed_preparation_is_published_for_observation(self):
         events = mock.Mock()
         events.recent_type.return_value = []
         store = types.SimpleNamespace(events=events)
