@@ -142,7 +142,7 @@ def gh_of(runner):
     """Un `gh` appelable (`gh(args, timeout=…)` → CompletedProcess, celui de
     `land` et `fire`) à partir d'un `plan_github.Gh` (`run(argv)` → tuple)."""
     from .modules.dev.plan_github import Gh
-    if isinstance(runner, Gh):
+    if isinstance(Gh, type) and isinstance(runner, Gh):
         # Armement et contrôle de fusion utilisent la réserve ; conserver
         # l'environnement du client général sans lui donner cette priorité.
         runner = Gh(gh=runner.path, env=dict(runner.env, AMEESH_GITHUB_PRIORITY="gate"),
