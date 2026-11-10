@@ -77,9 +77,9 @@ dépôt (aucun fetch) ; `ready=True` seulement quand le gel est la tête publié
 et que la fusion avec la cible est propre.
 
 #6607 : une tête qui porte des commits d'un autre lot **ouvert** du projet
-absents de la cible (ses commits hors cible, lus de son `branch_head`, de son
-gel ou de sa tête publiée, recoupent ceux de la tête), sans dépendance
-déclarée, est refusée `stacked-undeclared`
+absents de la cible (son `branch_head`, sa tête publiée ou l'un de ses gels,
+même dépassé, est dans `cible..tête` : critère directionnel, jamais un
+simple recoupement), sans dépendance déclarée, est refusée `stacked-undeclared`
 (`depends_on` nomme le parent) : composée seule, elle emporterait les commits
 non relus du parent. Geste de l'auteur ou du pilote : `ameesh work
 dependencies <lot> --add <parent>` (#6214 range alors le lot derrière son
@@ -395,11 +395,13 @@ def open_lot_heads(db, app: str, *, tips: dict | None = None) -> tuple[list[dict
     """#6607 : les têtes connues des lots ouverts du projet `app`.
 
     Pour chaque lot ouvert (ni fusionné, ni livré, ni fermé) qui a une
-    branche, hors véhicule de paquet : son `branch_head` observé, son dernier
-    gel et, si `tips` la porte, sa tête publiée fraîche. Rend `(têtes,
-    tronqué)` : `tronqué` dit que la borne de lecture est atteinte."""
-    rows = storage.of(db).work.open_for_sweep(plan_git.MAX_BRANCH_LOTS)
-    truncated = len(rows) >= plan_git.MAX_BRANCH_LOTS
+    branche, hors véhicule de paquet : son `branch_head` observé, **tous** ses
+    gels et têtes relues (un enfant a pu partir d'un gel que le parent a
+    dépassé depuis, B cx1) et, si `tips` la porte, sa tête publiée fraîche.
+    Rend `(têtes, tronqué)` : `tronqué` dit que la borne de lecture est
+    dépassée."""
+    rows = storage.of(db).work.open_for_sweep(plan_git.MAX_BRANCH_LOTS + 1)
+    truncated = len(rows) > plan_git.MAX_BRANCH_LOTS
     rows = [row for row in rows
             if (row.get("app") or "") == (app or "")
             and str(row.get("branch") or "").strip()
@@ -408,109 +410,60 @@ def open_lot_heads(db, app: str, *, tips: dict | None = None) -> tuple[list[dict
     out: list[dict] = []
     for row in rows:
         branch = str(row.get("branch") or "").strip()
-        freeze = plan_git.latest_freeze(marks.get(int(row["id"]), []))
-        shas = {str(value or "").strip().lower()
-                for value in (row.get("branch_head"), (freeze or {}).get("sha"),
-                              (tips or {}).get(branch))}
+        values = [row.get("branch_head"), (tips or {}).get(branch)]
+        values += [mark.get("sha") for mark in marks.get(int(row["id"]), [])
+                   if mark.get("kind") in ("frozen", "verdict")]
         # un préfixe court nommerait plusieurs commits : 7 au moins
-        shas = sorted(sha for sha in shas if len(plan_git.commit_id(sha)) >= 7)
+        shas = sorted({sha for sha in (plan_git.commit_id(value) for value in values)
+                       if len(sha) >= 7})
         if shas:
             out.append({"lot": int(row["id"]), "branch": branch, "shas": shas})
     return out, truncated
 
 
-def _pending(repo: str, heads, base: str) -> set[str]:
-    """#6607 : les commits de `heads` absents de `base` (une lecture
-    `rev-list`). Une tête dont l'objet n'est pas dans le dépôt est ignorée :
-    absente, elle ne peut pas être dans l'historique d'une tête locale."""
-    resolved = []
-    for sha in heads or ():
-        proc = _git_out(repo, "rev-parse", "--verify", "--quiet",
-                        "%s^{commit}" % sha)
-        if proc.returncode == 0 and _text(proc):
-            resolved.append(_text(proc))
-    if not resolved:
-        return set()
-    proc = _git_out(repo, "rev-list", *resolved, "^" + base, "--")
-    if proc.returncode:
-        raise CandidateError("git rev-list %s ^%s rc=%d: %s" % (
-            " ".join(sha[:12] for sha in resolved), base[:12], proc.returncode,
-            proc.stderr.decode("utf-8", "replace").strip()[:300]))
-    return set(_text(proc).split())
-
-
 def stacked_on(repo: str, head: str, base: str, others, *, lot: int,
                branch: str = "", branch_target: str = "",
-               declared=(), cache: dict | None = None) -> list[dict]:
+               declared=()) -> list[dict]:
     """#6607 : les lots ouverts dont la tête `head` porte des commits absents
     de `base`, sans dépendance déclarée.
 
     Une branche empilée sur un lot non fusionné ferait entrer dans le paquet
-    les commits non relus de ce lot. `others` vient d'`open_lot_heads`. Un
-    lot est retenu quand ses commits hors cible (depuis ses têtes observée,
-    gelée, publiée) et ceux de `head` se recoupent : la tête exacte du parent
-    ne suffit pas, il a pu avancer et être regelé depuis (B1 cx1). Le
-    recoupement n'est pas un empilement quand le parent contient `head`
-    lui-même (c'est lui qui est empilé sur ce lot). Sont exclus : le lot
-    lui-même, un lot de même branche, celui dont la branche est la cible du
-    lot (#3437, il entre avec son parent) et les prérequis déclarés
-    (`declared`, #6214) ; les commits que ces parents portent sont couverts
-    et ne rendent aucun autre lot parent (deux frères d'un parent déclaré ne
-    s'empilent pas l'un sur l'autre). `cache` garde les commits hors cible de chaque
-    autre lot d'un appel à l'autre (même `base`). Une lecture impossible
-    lève `CandidateError`."""
-    mine = _pending(repo, [head], base)
-    if not mine:
+    les commits non relus de ce lot. `others` vient d'`open_lot_heads`. Le
+    critère est **directionnel** : un lot est parent quand l'une de ses
+    têtes propres (observée, publiée, ou l'un de ses gels et têtes relues,
+    même dépassés) est un commit de `base..head`. Un simple recoupement de
+    commits ne suffit pas : il est symétrique et nommerait un enfant ou une
+    sœur comme parent (B cx1, B ds1). Un parent dont l'enfant est parti d'un
+    commit jamais gelé ni observé n'est pas vu (faux négatif assumé, jamais
+    un faux parent). Sont exclus : le lot lui-même, un lot de même branche,
+    celui dont la branche est la cible du lot (#3437, il entre avec son
+    parent) et les prérequis déclarés (`declared`, #6214). Une seule lecture
+    Git (`rev-list`) ; une lecture impossible lève `CandidateError`."""
+    proc = _git_out(repo, "rev-list", head, "^" + base, "--")
+    if proc.returncode:
+        raise CandidateError("git rev-list %s ^%s rc=%d: %s" % (
+            head[:12], base[:12], proc.returncode,
+            proc.stderr.decode("utf-8", "replace").strip()[:300]))
+    pending = set(_text(proc).split())
+    if not pending:
         return []
-    tip = _text(_git_out(repo, "rev-parse", "--verify", "--quiet",
-                         "%s^{commit}" % head))
     declared = {int(value) for value in declared or ()}
     parent_branch = merge_queue._remote_branch(str(branch_target or "").strip())
-    cache = {} if cache is None else cache
-
-    def pending_of(other) -> set[str]:
-        key = (int(other["lot"]), tuple(other.get("shas") or ()), base)
-        if key not in cache:
-            cache[key] = _pending(repo, other.get("shas") or (), base)
-        return cache[key]
-
-    def excluded(other) -> bool:
-        other_branch = str(other.get("branch") or "")
-        return (int(other["lot"]) in declared
-                or bool(parent_branch and other_branch == parent_branch))
-
-    # B2 cx1 : les commits d'un parent déclaré (#6214) ou de la branche cible
-    # du lot (#3437) sont couverts : deux frères qui partagent ce parent ne
-    # s'emportent rien l'un à l'autre, seul le contenu propre compte.
-    covered: set[str] = set()
-    for other in others or ():
-        if int(other["lot"]) != int(lot) and excluded(other):
-            covered |= pending_of(other)
-    mine -= covered
-    if not mine:
-        return []
     found: list[dict] = []
     for other in others or ():
         other_lot = int(other["lot"])
         other_branch = str(other.get("branch") or "")
-        if other_lot == int(lot) or other_branch == branch or excluded(other):
+        if (other_lot == int(lot) or other_lot in declared
+                or other_branch == branch
+                or (parent_branch and other_branch == parent_branch)):
             continue
-        theirs = pending_of(other)
-        if not theirs or (tip and tip in theirs):
-            continue
-        theirs = theirs - covered
-        shared = mine & theirs
-        if shared:
-            # le commit partagé le plus récent de `head` qui vient du parent
-            listed = _text(_git_out(repo, "rev-list", "--max-count=1",
-                                    *sorted(shared), "^" + base, "--"))
-            found.append({"lot": other_lot, "branch": other_branch,
-                          "sha": listed or sorted(shared)[0],
-                          "shared": len(shared), "contained": theirs <= mine})
-    # Le parent entièrement contenu d'abord (deux frères empilés sur un même
-    # lot se recoupent aussi), puis le plus grand recoupement.
-    return sorted(found, key=lambda entry: (not entry["contained"],
-                                            -entry["shared"], entry["lot"]))
+        for sha in other.get("shas") or ():
+            hit = sha if sha in pending else next(
+                (commit for commit in pending if commit.startswith(sha)), "")
+            if hit:
+                found.append({"lot": other_lot, "branch": other_branch, "sha": hit})
+                break
+    return sorted(found, key=lambda entry: entry["lot"])
 
 
 def _stacked_cause(lot: int, stacked: list[dict], target: str, *,
@@ -1047,7 +1000,6 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     slug = migrations.origin_repo(repo)
     layout = migrations.layout_for(slug, cfg) if slug else None
     open_heads = None
-    pending_cache: dict = {}
     for entry in candidates:
         entry["conflicts_with"] = sorted({
             int(link["lot"]) for link in links.get(entry["work_item"], ())
@@ -1077,14 +1029,14 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
                     raise CandidateError("cannot read the open lots: %s" % exc) from exc
                 if truncated:
                     raise CandidateError(
-                        "open lots read up to the bound (%d): a stacked branch "
-                        "could be missed" % plan_git.MAX_BRANCH_LOTS)
+                        "more than %d open lots: a stacked branch could be "
+                        "missed" % plan_git.MAX_BRANCH_LOTS)
             try:
                 stacked = stacked_on(
                     where, head, package_base, open_heads,
                     lot=entry["work_item"], branch=entry["branch"],
                     branch_target=entry["branch_target"],
-                    declared=entry["dependencies"], cache=pending_cache)
+                    declared=entry["dependencies"])
             except CandidateError as exc:
                 entry["error"] = "cannot read the stacked lots: %s" % exc
                 entry["ready"] = False

@@ -67,18 +67,28 @@ class StackedOnTest(unittest.TestCase):
 
     def test_le_parent_ouvert_est_nomme(self):
         self.assertEqual(self.stacked(),
-                         [{"lot": 1, "branch": "review/a", "sha": self.a_tip,
-                           "shared": 1, "contained": True}])
+                         [{"lot": 1, "branch": "review/a", "sha": self.a_tip}])
 
-    def test_le_parent_avance_et_regele_reste_un_parent(self):
-        # B1 cx1 : A1 est dans B ; A avance à A2 et ses têtes (observée,
-        # gelée, publiée) sont toutes A2, hors de base..B. A1 reste partagé.
+    def advance_parent(self):
+        """B cx1 : B part du gel A1 ; A avance et regèle à A2 (ses têtes
+        courantes sont A2, son ancien gel A1 reste à l'historique)."""
         git(self.repo, "checkout", "-q", "review/a")
         a2 = write_commit(self.repo, "a", "a2\n", "lot A, suite")
         git(self.repo, "checkout", "-q", "main")
-        self.others[0]["shas"] = [a2]
+        self.others[0]["shas"] = sorted([self.a_tip, a2])
+        return a2
+
+    def test_le_parent_avance_et_regele_reste_un_parent(self):
+        self.advance_parent()
         found = self.stacked()
         self.assertEqual([(s["lot"], s["sha"]) for s in found], [(1, self.a_tip)])
+
+    def test_le_parent_avance_n_est_jamais_empile_sur_son_enfant(self):
+        # B ds1 : du point de vue de A à A2, B (tête B1) n'est pas dans
+        # base..A2 ; le recoupement A1 ne fait pas de l'enfant un parent.
+        a2 = self.advance_parent()
+        self.assertEqual(packet_candidates.stacked_on(
+            self.repo, a2, self.base, self.others, lot=1, branch="review/a"), [])
 
     def test_un_partage_limite_a_la_cible_n_empile_pas(self):
         # A et B partent tous deux de `main` : seul l'historique de la cible
@@ -95,15 +105,17 @@ class StackedOnTest(unittest.TestCase):
             self.repo, self.a_tip, self.base, self.others, lot=1,
             branch="review/a"), [])
 
-    def test_le_vrai_parent_passe_avant_un_frere(self):
-        # D est aussi branché sur A : B et D se recoupent par A1, mais A est
-        # le parent entièrement contenu dans B.
-        git(self.repo, "checkout", "-q", "-b", "lot/d", "review/a")
-        d_tip = write_commit(self.repo, "d", "d\n", "lot D")
-        git(self.repo, "checkout", "-q", "main")
-        self.others.append({"lot": 0, "branch": "lot/d", "shas": [d_tip]})
-        found = self.stacked()
-        self.assertEqual([s["lot"] for s in found], [1, 0])
+    def test_une_soeur_n_est_jamais_nommee_parent(self):
+        # D est aussi branché sur A, rien n'est déclaré : B et D partagent
+        # A1, mais seul A est le parent, A immobile ou avancé.
+        for advance in (False, True):
+            with self.subTest(advance=advance):
+                self.setUp()
+                d_tip = self.siblings(advance=advance)
+                self.assertEqual([s["lot"] for s in self.stacked()], [1])
+                self.assertEqual([s["lot"] for s in packet_candidates.stacked_on(
+                    self.repo, d_tip, self.base, self.others, lot=4,
+                    branch="lot/d")], [1])
 
     def siblings(self, *, advance=False):
         """B2 cx1 : cible → A1 → B1 et A1 → D1 ; A éventuellement avancé."""
@@ -111,7 +123,8 @@ class StackedOnTest(unittest.TestCase):
         d_tip = write_commit(self.repo, "d", "d\n", "lot D")
         if advance:
             git(self.repo, "checkout", "-q", "review/a")
-            self.others[0]["shas"] = [write_commit(self.repo, "a", "a2\n", "A2")]
+            self.others[0]["shas"] = sorted(
+                [self.a_tip, write_commit(self.repo, "a", "a2\n", "A2")])
         git(self.repo, "checkout", "-q", "main")
         self.others.append({"lot": 4, "branch": "lot/d", "shas": [d_tip]})
         return d_tip
@@ -240,6 +253,27 @@ class DebitStackedTest(PgTestCase):
         self.assertEqual([r["kind"] for r in parent], ["qa_merge"])
         self.assertEqual(parent[0]["dependents"], [self.b["id"]])
         self.assertIn("stacked-undeclared", debit.format_text(report))
+
+    def test_parent_avance_et_regele_garde_son_qa_merge(self):
+        # B cx1 / B ds1 dans le débit : A regèle à A2 après le départ de B ;
+        # B reste empilé sur A, A reste l'attente du paquet.
+        root = os.path.join(self.tmp, "repo")
+        git(root, "checkout", "-q", "review/a")
+        a2 = write_commit(root, "a", "a2\n", "lot A, suite")
+        git(root, "checkout", "-q", "main")
+        git(root, "update-ref", "refs/remotes/origin/review/a", a2)
+        for kind, extra in (("frozen", ""), ("verdict", "ok")):
+            self.db.execute(
+                "INSERT INTO work_item_milestones (work_item_id, kind, at, actor,"
+                " verdict, sha) VALUES (%s, %s, to_timestamp(%s), %s, %s, %s)",
+                (self.a["id"], kind, self.GO + (1 if kind == "frozen" else 2),
+                 "dev1" if kind == "frozen" else "rel", extra or None, a2))
+        report = self.report()
+        self.assertEqual([(r["kind"], r.get("depends_on"))
+                          for r in self.rows(report, self.b["id"])],
+                         [("stacked_undeclared", self.a["id"])])
+        self.assertEqual([r["kind"] for r in self.rows(report, self.a["id"])],
+                         ["qa_merge"])
 
     def test_la_dependance_declaree_range_le_lot_derriere_son_parent(self):
         work_dependencies.add(self.db, self.b["id"], self.a["id"], actor="dev1")
