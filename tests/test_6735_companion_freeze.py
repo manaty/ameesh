@@ -17,6 +17,7 @@ dépôt, le refus fermé reste.
 from __future__ import annotations
 
 import os
+from unittest import mock
 
 from ameesh import review_authors, work
 
@@ -144,6 +145,20 @@ class LegacyCompanionTest(_CompanionFixture):
         self.assertEqual(unknown, [])
         self.assertEqual([row["ref"] for row in exclusions
                           if row["commit"] == self.part], ["manaty/manaty-its"])
+
+    def test_the_discovery_probe_stays_local_and_bounded(self):
+        # B mty-amh-impl-03 : `plan_git._commit` (rev-parse non borné) attend
+        # GIT_TIMEOUT sur un clone partiel ; la découverte n'utilise que
+        # `local_commit`.
+        from ameesh import plan_git
+        from ameesh import review_designation_activation as act
+
+        with mock.patch.object(plan_git, "_commit",
+                               side_effect=AssertionError("unbounded probe")):
+            self.assertEqual(
+                act.companion_repository(self.db, self.cfg, self.lot_item(),
+                                         self.part, "manaty/ameesh"),
+                "manaty/manaty-its")
 
     def test_a_clone_of_the_same_origin_proves_nothing(self):
         self.strip_mark()

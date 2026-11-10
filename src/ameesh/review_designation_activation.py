@@ -157,6 +157,9 @@ RETRY_CURSOR = "review-designation-retry.cursor"
 FETCH_TRIES = 2
 #: and each fetch is bounded (network is not allowed to hold the freeze)
 FETCH_TIMEOUT = 10.0
+#: #6735 : clones d'une autre origine sondés au plus pour un gel compagnon
+#: sans marque (chaque sonde est locale et bornée à PROBE_TIMEOUT_S).
+COMPANION_PROBES = 8
 
 _RETRY_NOTE = re.compile(r"^review-designation-unavailable:(\d+):(\d+):")
 _SHA_TEXT = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
@@ -608,14 +611,31 @@ def companion_repository(db, cfg, item: Mapping, sha: str, own: str) -> str:
                (str((item or {}).get("id") or ""),
                 str((item or {}).get("assignee") or "").strip())
                if needle and needle != "0"]
+    # #6735 (B mty-amh-impl-03) : la sonde reste locale et bornée
+    # (`local_commit`, PROBE_TIMEOUT_S) — jamais `_repo_holding`, dont
+    # `rev-parse` attend jusqu'à GIT_TIMEOUT sur un clone partiel — et ne vise
+    # que les clones d'une autre origine, au plus COMPANION_PROBES.
     seen: set[str] = set()
+    probes = 0
     for path in candidates + _neighbour_paths(_search_roots(candidates), needles):
-        repo = _repo_holding(path, sha, seen)
-        if not repo:
+        path = os.path.expanduser(str(path or "").strip())
+        if not path or not os.path.isdir(path):
             continue
+        repo = canon_mod.git_toplevel(path)
+        if not repo or repo in seen:
+            continue
+        seen.add(repo)
         slug = _configured_origin(repo)
-        if slug and slug != own:
-            return slug
+        if not slug or slug == own:
+            continue
+        probes += 1
+        try:
+            if plan_git.local_commit(repo, sha):
+                return slug
+        except Exception:  # noqa: BLE001 - clone illisible : clone suivant
+            pass
+        if probes >= COMPANION_PROBES:
+            break
     return ""
 
 
