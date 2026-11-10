@@ -262,7 +262,7 @@ class ReadOnlyReadTest(unittest.TestCase):
                     now=END, start="2026-10-27T00:00:00Z",
                     end="2026-11-10T00:00:00Z")
         self.assertIn(("SET TRANSACTION READ ONLY", ()), tx.statements)
-        self.assertEqual(len(tx.queries), 6)
+        self.assertEqual(len(tx.queries), 11)
         for sql, _params in tx.queries:
             self.assertNotIn("LIMIT 1000", sql)
 
@@ -567,7 +567,7 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(value["schema"], "ameesh-model-evaluation-report/1")
         self.assertEqual(value["source"],
                          "docs/design/etudes/evaluation-modeles.md#M1")
-        self.assertEqual(value["calculation_version"], 1)
+        self.assertEqual(value["calculation_version"], 2)
         self.assertIs(value["read_only"], True)
         self.assertEqual(value["window"]["timezone"], "UTC")
         self.assertIs(value["window"]["end_exclusive"], True)

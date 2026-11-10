@@ -63,6 +63,7 @@ from __future__ import annotations
 
 from ameesh import work_lifecycle as lifecycle
 
+import copy
 import json
 import os
 import re
@@ -141,6 +142,12 @@ def carrier(head_ref) -> bool:
 def gh_of(runner):
     """Un `gh` appelable (`gh(args, timeout=…)` → CompletedProcess, celui de
     `land` et `fire`) à partir d'un `plan_github.Gh` (`run(argv)` → tuple)."""
+    if (all(hasattr(runner, name) for name in ("path", "env", "timeout"))
+            and callable(getattr(runner, "run", None))):
+        # Armement et contrôle de fusion utilisent la réserve ; conserver
+        # l'environnement du client général sans lui donner cette priorité.
+        runner = copy.copy(runner)
+        runner.env = dict(runner.env, AMEESH_GITHUB_PRIORITY="gate")
     def call(args, timeout: float = 60.0):
         code, out, err = runner.run(list(args))
         return subprocess.CompletedProcess(["gh", *args], code, out or "", err or "")
