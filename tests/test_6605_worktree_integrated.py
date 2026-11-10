@@ -90,16 +90,57 @@ class TargetTest(_Repo):
 
 
 class LargeArchiveTest(_ArchiveRepo):
-    def test_default_accepts_large_delta_footprint(self):
+    def test_default_bounds_untracked_copy_before_writing(self):
         wt = self.add_worktree('lot-7')
-        # Exercise a >512 MiB delta footprint without filling the host disk.
         _write(os.path.join(wt, 'note.txt'), text='retain me\n')
         head = _git('rev-parse', 'HEAD', cwd=wt).strip()
         with mock.patch.object(ha, '_size', return_value=513 * 1024 ** 2):
+            with self.assertRaisesRegex(ha.ArchiveRefused, 'untracked bytes'):
+                ha.archive(wt, self.archives, head=head, lot=7, now=2_000_000_000,
+                           retention_s=RETENTION)
+        self.assertFalse(os.path.exists(self.archives))
+        self.assertTrue(os.path.exists(wt))
+
+    def test_default_ceiling_exempts_patches_and_bundle(self):
+        wt = self.add_worktree('lot-7')
+        _write(os.path.join(wt, 'f.txt'), text='large tracked delta\n')
+        _write(os.path.join(wt, 'private.txt'), text='unpublished\n')
+        _git('add', 'private.txt', cwd=wt)
+        _git('commit', '-qm', 'unpublished', cwd=wt)
+        head = _git('rev-parse', 'HEAD', cwd=wt).strip()
+        # A small ceiling exercises the real Git bundle/patches, cheaply.
+        with mock.patch.object(ha, 'MAX_BYTES', 4):
             result = ha.archive(wt, self.archives, head=head, lot=7, now=2_000_000_000,
                                 retention_s=RETENTION)
         with open(os.path.join(result['archive'], 'manifest.json')) as fh:
             manifest = json.load(fh)
-        self.assertEqual(manifest['untracked'], ['note.txt'])
-        self.assertEqual(manifest['untracked_bytes'], 513 * 1024 ** 2)
-        self.assertLess(result['bytes'], 1024 ** 2)
+        self.assertGreater(manifest['patch_bytes'], 4)
+        self.assertGreater(manifest['bundle_bytes'], 4)
+        self.assertEqual(manifest['untracked'], [])
+        restored = os.path.join(self.base, 'restored')
+        _git('fetch', os.path.join(result['archive'], 'HEAD.bundle'),
+             'HEAD:refs/heads/archive-restored', cwd=self.main)
+        _git('worktree', 'add', '--detach', restored, 'archive-restored', cwd=self.main)
+        _git('apply', '--binary', os.path.join(result['archive'], 'unstaged.patch'), cwd=restored)
+        with open(os.path.join(restored, 'f.txt')) as fh:
+            self.assertEqual(fh.read(), 'large tracked delta\n')
+
+    def test_bundle_verification_failure_keeps_source_and_no_archive(self):
+        wt = self.add_worktree('lot-7')
+        _write(os.path.join(wt, 'private.txt'), text='unpublished\n')
+        _git('add', 'private.txt', cwd=wt)
+        _git('commit', '-qm', 'unpublished', cwd=wt)
+        head = _git('rev-parse', 'HEAD', cwd=wt).strip()
+        real_git = ha._git
+
+        def fail_verification(path, *args, **kwargs):
+            if args[:2] == ('bundle', 'verify'):
+                raise ha.ArchiveRefused('bundle verification failed')
+            return real_git(path, *args, **kwargs)
+
+        with mock.patch.object(ha, '_git', side_effect=fail_verification):
+            with self.assertRaisesRegex(ha.ArchiveRefused, 'verification failed'):
+                ha.archive(wt, self.archives, head=head, lot=7, now=2_000_000_000,
+                           retention_s=RETENTION)
+        self.assertEqual(os.listdir(self.archives), [])
+        self.assertTrue(os.path.isfile(os.path.join(wt, 'private.txt')))

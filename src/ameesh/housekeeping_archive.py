@@ -60,10 +60,10 @@ UNMERGED = frozenset(("DD", "AU", "UD", "UA", "DU", "AA", "UU"))
 EXCLUDED_NAMES = frozenset((
     ".cache", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".gradle", ".turbo", ".next", ".parcel-cache", ".venv", ".tox", ".nox"))
-# #6605: no fixed ceiling for bundle + patches + untracked data. The pass
-# deadline and write failures refuse incomplete archives; callers may still
-# explicitly impose a byte limit. Tracked files are never copied wholesale.
-MAX_BYTES = None
+# #6605: the default ceiling bounds copied untracked/ignored files only.
+# Bundle and patches preserve large tracked trees without copying them whole.
+# An explicit max_bytes still bounds the entire archive payload.
+MAX_BYTES = 512 * 1024 ** 2
 MAX_FILES = 20_000
 #: a `.partial-` directory older than this is a crashed pass: deleted
 PARTIAL_GRACE_S = 24 * 3600.0
@@ -266,6 +266,7 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
     `retain_until_ts`. `ArchiveRefused` when it cannot be whole: nothing is
     left behind (the partial directory is deleted)."""
     now = time.time() if now is None else now
+    total_limit = max_bytes
     max_bytes = MAX_BYTES if max_bytes is None else max_bytes
     max_files = MAX_FILES if max_files is None else max_files
 
@@ -308,10 +309,12 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
         raise ArchiveRefused("%d untracked file(s) to archive (limit %d)" % (
             len(files), max_files))
     size = _size(path, files, check=_check)
-    # dev3 N1: the patches count too
-    if max_bytes is not None and size + len(staged) + len(unstaged) > max_bytes:
+    if size > max_bytes:
+        raise ArchiveRefused("%d untracked bytes to archive (limit %d)" % (size, max_bytes))
+    # Explicit caller limits retain their whole-payload semantics.
+    if total_limit is not None and size + len(staged) + len(unstaged) > total_limit:
         raise ArchiveRefused("%d bytes to archive (limit %d)" % (
-            size + len(staged) + len(unstaged), max_bytes))
+            size + len(staged) + len(unstaged), total_limit))
     # #4442 : les commits qu'aucune branche distante ne porte partent dans
     # `HEAD.bundle`, sinon retirer le worktree perdrait ce travail. Le compte
     # est lu avant de créer le dossier partiel (un bundle vide est refusé par
@@ -358,11 +361,10 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
             except OSError as exc:
                 raise ArchiveRefused("HEAD.bundle not written (%s)" % exc) from exc
             _check()
-            # #4442 : le bundle compte dans la borne, comme les patchs (N1 de
-            # #3728) ; un bundle trop gros refuse l'archive entière.
-            if max_bytes is not None and size + len(staged) + len(unstaged) + bundle_bytes > max_bytes:
+            _git(path, "bundle", "verify", bundle_path, timeout=_timeout())
+            if total_limit is not None and size + len(staged) + len(unstaged) + bundle_bytes > total_limit:
                 raise ArchiveRefused("%d bytes to archive (limit %d)" % (
-                    size + len(staged) + len(unstaged) + bundle_bytes, max_bytes))
+                    size + len(staged) + len(unstaged) + bundle_bytes, total_limit))
         ref = _restore_ref(name)
         restore = (["git -C %s fetch %s/HEAD.bundle HEAD:refs/heads/%s"
                     % (repo or "<repo>", final, ref)]
