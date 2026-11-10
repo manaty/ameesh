@@ -183,6 +183,20 @@ case "$*" in
     fi
     echo "0123456789abcdef0123456789abcdef01234567"
     exit 0 ;;
+  *"rev-parse HEAD"*)
+    # #6778 : sha_installe sur une VM d'agents ; un scenario peut declarer
+    # l'hote deja au commit vise (l'installation est alors ignoree). La cle est
+    # l'adresse de la cible, seule information d'hote dans la commande ssh.
+    cible=$(printf '%s\n' "$*" | sed -n 's/.*root@\([0-9.]*\).*/\1/p' | head -1)
+    deja=$(sed -n "s/^deja-${cible}=//p" "$FAKE_STATE/scenario" 2>/dev/null | head -1)
+    if [ -n "$deja" ]; then printf '%s\n' "$deja"; exit 0; fi
+    exit 255 ;;
+  *"previous-sha"*)
+    # #6778 : precedent_retour lit la cible de retour de l'installation d'avant.
+    cible=$(printf '%s\n' "$*" | sed -n 's/.*root@\([0-9.]*\).*/\1/p' | head -1)
+    precedent=$(sed -n "s/^previous-${cible}=//p" "$FAKE_STATE/scenario" 2>/dev/null | head -1)
+    if [ -n "$precedent" ]; then printf '%s\n' "$precedent"; exit 0; fi
+    exit 255 ;;
   *"cat > "*)
     # #3981 : journal copie sur HOTE_OUTILS avant actif.py ; la source arrive
     # sur l'entree standard de ssh.
@@ -784,6 +798,68 @@ class StagingTest(unittest.TestCase):
                             and t['verdict'] == 'ok' for t in traces))
         self.assertTrue(any(t['hote'] == 'manaty-mesh-1' and t['etape'] == 'controle-retour'
                             and t['verdict'] == 'ok' for t in traces))
+
+    def test_same_sha_host_does_not_roll_back_below_the_target(self):
+        """#6778 : un hote deja au commit vise avant la sequence n'a rien a
+        annuler. Rejouer previous-sha le ferait redescendre sous le SHA atteste
+        (AG2 7e1c5fe -> 8bdc815, run fcc24db8)."""
+        precedent = '8bdc815cd08f252fe24b2895f63d1421e4a59072'
+        (self.state / 'scenario').write_text(
+            'deja-10.77.0.4=%s\nprevious-10.77.0.4=%s\n'
+            'ko=sante:ameesh-agents-2\n' % (self.sha, precedent))
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        actions = self.actions()
+        self.assertNotIn(('ameesh-agents-2', 'installer'), actions)
+        self.assertNotIn(('ameesh-agents-2', 'retour'), actions)
+        self.assertNotIn(('ameesh-agents-3', 'installer'), actions)
+        self.assertIn('sequence arretee sur ameesh-agents-2 (aucun retour', p.stderr)
+        traces = self.traces()
+        trace = next(t for t in traces if t['hote'] == 'ameesh-agents-2'
+                     and t['etape'] == 'retour')
+        self.assertEqual(trace['verdict'], 'sans-objet', trace)
+        self.assertIn('deja au commit', trace['detail'])
+        self.assertIn(precedent, trace['detail'])
+        notifications = [l for l in self.calls() if l.startswith('venv-python - ')]
+        self.assertEqual(len(notifications), 1)
+        self.assertIn('aucun retour', notifications[0])
+        self.assertIn(precedent, notifications[0])
+        self.assert_no_escape()
+
+    def test_term_on_same_sha_host_leaves_no_return_to_the_supervisor(self):
+        """#6778 : l'arret surveille d'un hote deja au commit vise ne laisse
+        aucun retour au superviseur : previous-sha redescendrait sous le SHA."""
+        import signal
+        import time
+        (self.state / 'scenario').write_text(
+            'deja-10.77.0.4=%s\nlent=ameesh-agents-2:redemarrer\n' % self.sha)
+        env = dict(self.env, DUREE_LENT='400')
+        proc = subprocess.Popen(
+            ['bash', str(self.script_dir / 'staging.sh')], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if 'slow host=ameesh-agents-2 action=redemarrer' in self.calls():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('the restart step never started')
+        os.killpg(proc.pid, signal.SIGTERM)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, (out, err))
+        self.assertFalse(any('action=retour' in line for line in self.calls()))
+        self.assertFalse((self.repo / '.retour-apres-arret').exists())
+        self.assertIn('aucun retour', err)
+        self.assertIn('etait deja au commit vise', err)
+        traces = self.traces()
+        self.assertTrue(any(t['hote'] == 'ameesh-agents-2'
+                            and t['etape'] == 'redemarrer'
+                            and t['verdict'] == 'ko'
+                            and 'aucun retour' in (t['detail'] or '')
+                            for t in traces), traces)
+        self.assert_no_escape()
 
     def test_failed_rollback_is_reported_and_stops(self):
         (self.state / 'scenario').write_text('ko=sante:ameesh-agents-1\nko=ameesh-agents-1:retour\n')

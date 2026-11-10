@@ -134,7 +134,11 @@
 # dans l'ordre ci-dessus : installer, [poste] role, redemarrer, controler,
 # sante (unites, baux et doctor par `controler`, puis courrier reellement remis
 # par une sonde). Un echec = retour automatique de l'HOTE (previous-sha),
-# controle du retour, arret de la sequence et courrier urgent au pilote. Rien
+# controle du retour, arret de la sequence et courrier urgent au pilote. Un
+# hote deja au commit vise avant la sequence n'a rien a annuler : aucun retour
+# n'est lance, car previous-sha (celui de l'installation d'avant) redescendrait
+# sous le SHA vise, donc sous le SHA atteste (#6778) ; la trace porte
+# `retour`/`sans-objet`, la sequence s'arrete et le pilote est notifie. Rien
 # n'est repris apres un echec ; relancer la commande est sur : un hote deja au
 # commit vise ne le reinstallle pas (le previous-sha reste le bon).
 # Un seul operateur a la fois : un second passage sort en 75 (verrou
@@ -343,6 +347,9 @@ var_sonde_de() { printf 'SONDE_%s\n' "$(printf '%s' "$1" | tr 'a-z.-' 'A-Z__')";
 declare -A CIBLE=()
 declare -A FICHIER_HOTE=()
 declare -A CHOISI=()   #: selection normalisee de --hotes (un nom = une entree)
+#: #6778 : 1 = hote deja au commit vise avant la sequence (installation
+#: ignoree) ; un retour previous-sha le ferait redescendre sous le SHA atteste.
+declare -A DEJA_A_CIBLE=()
 POSTE_ABSENT=0
 POSTE_RAISON=""
 HOTES=()
@@ -992,6 +999,11 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   if [ "$SANS_RETOUR" = 1 ]; then
     retour_desactive "$nom" "$ou" "$detail" "$complement"
   fi
+  # #6778 : rien n'a ete installe sur un hote deja au commit vise ; rejouer
+  # previous-sha le ferait redescendre sous le SHA vise (atteste).
+  if [ "${DEJA_A_CIBLE[$nom]:-0}" = 1 ]; then
+    retour_inutile "$nom" "$ou" "$detail" "$complement"
+  fi
   etape "$nom : retour automatique (previous-sha)"
   if ! exec_hote "$nom" retour; then
     trace "$nom" retour ko "le retour lui-meme a echoue"
@@ -1011,6 +1023,22 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   notifier "staging #1155 : $nom en echec, retour effectue" \
     "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail). Retour automatique effectue et controle (unites, baux, doctor). Sequence arretee avant les hotes suivants : rien d'autre n'a ete modifie.$complement Trace : $JOURNAL"
   echo "sequence arretee sur $nom (retour effectue et controle)" >&2
+  exit 1
+}
+
+# #6778 : un hote deja au commit vise avant la sequence n'a rien a annuler.
+# « retour » rejouerait le previous-sha conserve (celui de l'installation
+# d'avant), donc un commit anterieur au SHA vise : il redescendrait sous le SHA
+# atteste (AG2 7e1c5fe -> 8bdc815, run fcc24db8). Aucun geste de code : trace,
+# arret de la sequence et courrier au pilote.
+retour_inutile() {  # nom etape detail complement
+  local nom=$1 ou=$2 detail=$3 complement=$4 precedent
+  precedent=$(precedent_retour "$nom" || true)
+  trace "$nom" retour sans-objet \
+    "hote deja au commit $SHA_TRAVE avant la sequence : aucun retour (previous-sha ${precedent:-illisible} redescendrait sous le SHA vise)"
+  notifier "staging #6778 : $nom en echec, aucun retour (deja au commit vise)" \
+    "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail). $nom etait deja au commit vise avant cette sequence : aucun retour automatique n'a ete lance, car previous-sha (${precedent:-illisible}) le ferait redescendre sous le SHA atteste. $nom reste sur $SHA_TRAVE. Sequence arretee avant les hotes suivants ; rien d'autre n'a ete modifie.$complement Trace : $JOURNAL"
+  echo "sequence arretee sur $nom (aucun retour : hote deja au commit vise)" >&2
   exit 1
 }
 
@@ -1270,6 +1298,15 @@ arret_surveillance() {
       retour_desactive "$hote" "${etape_ouverte:-surveillance}" \
         "arret demande par la surveillance de progression" ""
     fi
+    # #6778 : un hote deja au commit vise avant la sequence n'a rien a annuler ;
+    # aucun etat de retour n'est laisse au superviseur (pas de `retour` a jouer,
+    # previous-sha redescendrait sous le SHA vise).
+    if [ "${DEJA_A_CIBLE[$hote]:-0}" = 1 ]; then
+      trace "$hote" "${etape_ouverte:-surveillance}" ko \
+        "arret demande par la surveillance de progression ; aucun retour : hote deja au commit $SHA_TRAVE avant la sequence"
+      echo "staging arrete par la surveillance (aucun retour : $hote etait deja au commit vise)" >&2
+      exit 1
+    fi
     # L'etat reste dans le worktree, que le superviseur conserve jusqu'a la
     # fin du retour ; aucun secret n'y est ecrit.
     ( umask 077; printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -1483,11 +1520,13 @@ fi
 # --- sequence par hote ----------------------------------------------------
 for nom in "${HOTES[@]}"; do
   installe=$(sha_installe "$nom" || true)
+  DEJA_A_CIBLE[$nom]=0
   # le poste publie un nom court (src-<7>) ; les VM un SHA complet : comparer
   # le prefixe installe au prefixe correspondant de la cible.
   if [ -n "$installe" ] && [ "$installe" = "${SHA:0:${#installe}}" ]; then
     # rien n'est reinstallé : « retour » rejouerait le previous-sha conserve,
     # pas la version courante (avis R1 N2).
+    DEJA_A_CIBLE[$nom]=1
     PRECEDENT=$(precedent_retour "$nom" || true)
     etape "$nom : deja au commit $SHA_TRAVE — installation ignoree (previous-sha preserve)"
     trace "$nom" installer ok "deja installe (${installe:0:9})"
