@@ -33,10 +33,9 @@ class WorkDependencies(abc.ABC):
     def add_link(self, item_id: int, other_id: int, kind: str, *, actor: str) -> dict:
         """#4167: atomically validate, add and journal a typed link.
 
-        `kind` is `duplicates`, `supersedes`, `part_of`, `regressed_by`
-        (directed: `item_id` duplicates/supersedes/is part of/is regressed by
-        `other_id`) or `conflicts_with` (symmetric, stored with the smaller id
-        first). Same graph lock as the
+        `kind` is `duplicates`, `supersedes`, `part_of` (directed: `item_id`
+        duplicates/supersedes/is part of `other_id`) or `conflicts_with`
+        (symmetric, stored with the smaller id first). Same graph lock as the
         dependencies. Self links (`self_link`), unknown endpoints
         (`unknown_lot`), a conflict with a finished lot (`finished_lot`) and a
         cycle in the directed graph of the same kind (`link_cycle`) are

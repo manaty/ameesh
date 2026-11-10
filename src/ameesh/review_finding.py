@@ -10,8 +10,9 @@ base refuse un témoin qui n'est pas ce SHA exact.
 Trois états, et trois seulement :
 
 * `confirmed` : le constat était fondé — avec un correctif (`correction_sha`),
-  une régression liée (`regression_lot`, aussi un lien typé `regressed_by`) ou
-  une autre preuve (`evidence`, note obligatoire) ;
+  une régression liée (`regression_lot`, le lot fautif ; le journal suffit et
+  aucun lien `work_item_links` n'est écrit tant qu'un lecteur N-1 le lirait en
+  erreur) ou une autre preuve (`evidence`, note obligatoire) ;
 * `refuted` : le constat ne tient pas — retrait de la remarque par son auteur
   (`withdrawal`, `withdrawn_by`) ou autre preuve ;
 * `undecided` : aucune preuve ne tranche (`insufficient`). C'est aussi l'état
@@ -50,7 +51,7 @@ import sys
 import time
 from typing import Any, Mapping, Sequence
 
-from . import registry, review_correction, storage, work, work_dependencies
+from . import registry, review_correction, storage, work
 from . import review_designation_pg as designation_pg
 
 #: le schéma rendu par `ameesh work findings --json`
@@ -73,8 +74,6 @@ BASIS_INSUFFICIENT = "insufficient"
 BASES = (BASIS_CORRECTION, BASIS_REGRESSION, BASIS_WITHDRAWAL,
          BASIS_EVIDENCE, BASIS_INSUFFICIENT)
 
-#: le lien typé vers le lot de régression (#6669, 0564)
-LINK_REGRESSED_BY = "regressed_by"
 #: un SHA de commit, complet ou abrégé de façon usuelle ; le gel écrit complet
 _SHA = re.compile(r"^[0-9a-f]{7,64}$")
 #: borne de la note écrite sur le lot (le journal n'est pas un rapport)
@@ -192,9 +191,11 @@ def judged_families(db, lot: int, milestone: Mapping, *,
 
     La preuve est la marque de désignation du gel lu : ses `authors` portent
     les familles prouvées, `unknown_authors` les attributions manquantes. Sans
-    marque, on retombe sur l'auteur au gel (`review_lot`, la même référence que
-    la porte) ; un auteur sans famille prouvée reste un trou, jamais une
-    famille devinée. Le relecteur vient du reçu exact du jalon.
+    marque, on retombe sur l'auteur au gel du constat (le `freeze_id` borné au
+    SHA du verdict, la même référence historique que la porte) ; un gel absent
+    ou un auteur sans famille prouvée reste un trou, jamais une famille devinée
+    (le gel le plus récent d'une autre famille ne réécrit pas l'auteur de la
+    tête relue, #6669 B2). Le relecteur vient du reçu exact du jalon.
     """
     judged: set[str] = set()
     unknown: list[str] = []
@@ -222,16 +223,23 @@ def judged_families(db, lot: int, milestone: Mapping, *,
         if not authors_seen:
             unknown.append("auteur ?")
     else:
-        try:
-            from . import review_lot
-            author = review_lot._author_at_freeze(db, int(lot), _item(db, lot))
-        except Exception:  # noqa: BLE001 - lecture historique impossible
-            author = {}
-        harness = str((author or {}).get("harness") or "").strip().lower()
-        if harness:
-            judged.add(harness)
+        freeze_id = _freeze_id_for(db, int(lot),
+                                   str(milestone.get("sha") or ""))
+        if freeze_id is None:
+            # le verdict ne nomme aucun gel du lot : l'auteur n'est pas prouvé
+            unknown.append("auteur ?")
         else:
-            unknown.append("auteur %s" % ((author or {}).get("name") or "?"))
+            try:
+                from . import review_lot
+                author = review_lot._author_at_freeze(
+                    db, int(lot), _item(db, lot), freeze_id=int(freeze_id))
+            except Exception:  # noqa: BLE001 - lecture historique impossible
+                author = {}
+            harness = str((author or {}).get("harness") or "").strip().lower()
+            if harness:
+                judged.add(harness)
+            else:
+                unknown.append("auteur %s" % ((author or {}).get("name") or "?"))
 
     name = str(corrector or "").strip()
     if name and name != actor:
@@ -387,7 +395,7 @@ def resolve(db, lot: int, milestone_id: int, *, state: str, witness: str = "",
     Le geste est **additif** : une nouvelle ligne du journal, jamais une
     réécriture. Le témoin (`witness`) doit être le SHA lu par le verdict ; il
     est écrit tel quel, en minuscules. Un correctif (`correction_sha`) ou un
-    lot de régression (`regression_lot`, lien `regressed_by`) nomme la preuve.
+    lot de régression (`regression_lot`, le lot fautif) nomme la preuve.
     L'adjudicateur est refusé s'il n'est pas indépendant des familles jugées.
     Aucun quorum, aucune famille et aucune porte ne sont modifiés.
     """
@@ -425,6 +433,10 @@ def resolve(db, lot: int, milestone_id: int, *, state: str, witness: str = "",
     correction_sha = _sha_arg(correction_sha, "--correction") if correction_sha else ""
     if regression_lot is not None:
         regression_lot = int(regression_lot)
+        if regression_lot == int(lot):
+            raise ReviewFindingError(
+                "regression lot #%s is the finding's own lot" % regression_lot)
+        _item(db, regression_lot)
     corrector = str(corrector or "").strip()
     withdrawn_by = str(withdrawn_by or "").strip()
     note = str(note or "").strip()
@@ -456,14 +468,12 @@ def resolve(db, lot: int, milestone_id: int, *, state: str, witness: str = "",
                        " FOR NO KEY UPDATE", (int(lot),))
         if not row:
             raise ReviewFindingError("lot #%s not found" % int(lot))
-        if regression_lot is not None:
-            try:
-                work_dependencies.add_link(
-                    tx, int(lot), regression_lot, LINK_REGRESSED_BY,
-                    actor=adjudicator)
-            except work.WorkError as exc:
-                raise ReviewFindingError(
-                    "regression link refused: %s" % exc) from exc
+        # #6669 B1 (ameesh-cx2, auditeur) : aucun lien `work_item_links` n'est
+        # écrit ici. `add_link` prend le verrou de graphe puis les lignes, à
+        # l'inverse du verrou de lot tenu ci-dessus : un interblocage possible.
+        # Le genre `regressed_by` casserait aussi un lecteur N-1
+        # (`_INVERSE[kind]`), donc aucune valeur n'est ajoutée à la contrainte
+        # de 0501 ; `regression_lot` du journal porte la preuve.
         inserted = tx.query(
             "INSERT INTO " + TABLE + " ("
             " milestone_id, work_item_id, witness_sha, state, basis,"
@@ -677,8 +687,8 @@ def add_parsers(sub, func) -> None:
     parser.add_argument("--correction", default="",
                         help="the correction commit (basis correction)")
     parser.add_argument("--regression", type=int, default=None, metavar="LOT",
-                        help="the regression lot (basis regression; also a "
-                             "typed 'regressed_by' link)")
+                        help="the regression lot (basis regression; the "
+                             "journal carries it, no typed link is written)")
     parser.add_argument("--corrector", default="",
                         help="who pushed the correction (a reviewer's own "
                              "correction is recorded, never blocked)")

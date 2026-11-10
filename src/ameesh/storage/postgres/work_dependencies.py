@@ -254,8 +254,7 @@ class WorkDependencies(Contract):
             " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
 
     # ------------------------------------------------------------------
-    # #4167 : liens typés (duplicates, supersedes, part_of, conflicts_with,
-    # #6669 : regressed_by)
+    # #4167 : liens typés (duplicates, supersedes, part_of, conflicts_with)
     # ------------------------------------------------------------------
 
     @staticmethod

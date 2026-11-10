@@ -52,16 +52,13 @@ def grouped(db, item_ids):
 # #4167 (manaty/ameesh#3185, volet 1) : liens typés entre lots
 # --------------------------------------------------------------------------
 
-#: `duplicates`, `supersedes`, `part_of`, `regressed_by` sont orientés (le lot
-#: édité est le doublon, le remplaçant, la part, ou le lot régressé) ;
-#: `conflicts_with` est symétrique.
-LINK_KINDS = ("duplicates", "supersedes", "part_of", "conflicts_with",
-              "regressed_by")
+#: `duplicates`, `supersedes`, `part_of` sont orientés (le lot édité est le
+#: doublon, le remplaçant, la part) ; `conflicts_with` est symétrique.
+LINK_KINDS = ("duplicates", "supersedes", "part_of", "conflicts_with")
 
 #: lecture inverse d'un lien orienté, vu depuis sa cible
 _INVERSE = {"duplicates": "duplicated by", "supersedes": "superseded by",
-            "part_of": "has part", "conflicts_with": "conflicts with",
-            "regressed_by": "regresses"}
+            "part_of": "has part", "conflicts_with": "conflicts with"}
 
 _LINK_ERRORS = {"self_link": "a lot cannot be linked to itself",
                 "unknown_lot": "link endpoints must be existing lots",
@@ -128,8 +125,7 @@ def links(db, item_ids):
         a, b, kind = int(row["work_item_id"]), int(row["other_id"]), row["kind"]
         for lot, peer, label, state, forward in (
                 (a, b, kind.replace("_", " "), row["other_state"], True),
-                (b, a, _INVERSE.get(kind, kind.replace("_", " ")),
-                 row["item_state"], False)):
+                (b, a, _INVERSE[kind], row["item_state"], False)):
             if lot not in wanted:
                 continue
             out.setdefault(lot, []).append({
@@ -166,7 +162,7 @@ def alerts(db):
 def add_links_parser(sub, func):
     parser = sub.add_parser(
         "links", help="#4167: inspect or edit typed links between lots (duplicates, "
-                      "supersedes, part_of, conflicts_with, regressed_by)")
+                      "supersedes, part_of, conflicts_with)")
     parser.add_argument("id", type=int, nargs="?", help="lot")
     parser.add_argument("--project", default=None,
                         help="#6043: read the typed links of every open lot of the project")

@@ -5,13 +5,17 @@ Témoins demandés par le lot : un B suivi d'un OK sans correction reste non
 tranché ; plusieurs constats sur le même gel ; retrait d'une remarque ; témoin
 sur le SHA lu ; correction par le relecteur ; adjudicateur indépendant ;
 aucune modification de quorum ni de famille. M1 montre les trois états.
+Témoins de relecture : l'auteur est borné au gel du constat (B2) et la
+résolution ne prend aucun verrou de graphe ni n'écrit de lien typé (B1).
 """
 from __future__ import annotations
 
 import json
+import threading
 import unittest
 from unittest import mock
 
+from ameesh import db as D
 from ameesh import model_evaluation_report as report
 from ameesh import registry, review_finding, storage, work, work_dependencies
 from ameesh import review_designation_pg as designation_pg
@@ -250,6 +254,42 @@ class FindingTest(PgTestCase):
                      adjudicator="human:owner")
         self.assertEqual(self.finding(milestone=finding)["state"], "confirmed")
 
+    def test_l_auteur_est_borne_au_gel_du_constat_apres_un_nouveau_gel(self):
+        # #6669 B2 (ameesh-cx2) : sans marque de désignation, l'auteur est lu
+        # au gel que le B a lu, jamais au gel le plus récent d'une autre famille.
+        # B sur la tête A (auteur claude), puis nouveau gel B (auteur deepseek) :
+        # un adjudicateur claude reste refusé pour le constat A.
+        self.db.execute("UPDATE work_items SET assignee = 'claude-author'"
+                        " WHERE id = %s", (self.lot,))
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " VALUES (%s, 'intake', 'assigned to claude-author (before: nobody)',"
+            " 'orchestrateur')", (self.lot,))
+        self.freeze(sha=SHA_A, actor="claude-author")
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+            " VALUES ('claude-author', 'claude', 's-claude',"
+            " now() + interval '1 second')")
+        finding = self.blocked(sha=SHA_A, actor="reviewer")
+        # la branche avance : nouveau gel, autre famille, autre assigné
+        self.db.execute("UPDATE work_items SET assignee = 'author'"
+                        " WHERE id = %s", (self.lot,))
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " VALUES (%s, 'qa', 'assigned to author (before: claude-author)',"
+            " 'orchestrateur')", (self.lot,))
+        self.freeze(sha=SHA_B, actor="author")
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+            " VALUES ('author', 'deepseek', 's-deepseek',"
+            " now() + interval '1 second')")
+        with self.assertRaises(review_finding.ReviewFindingError) as ctx:
+            self.resolve(finding, state="confirmed", correction_sha=SHA_C,
+                         adjudicator="judge")
+        self.assertIn("judged family", str(ctx.exception))
+        # l'humain reste indépendant par autorité
+        self.resolve(finding, state="undecided", adjudicator="human:owner")
+
     def test_aucune_modification_de_quorum_de_famille_ni_de_porte(self):
         self.mark()
         finding = self.blocked()
@@ -330,7 +370,7 @@ class FindingTest(PgTestCase):
 
     # -- régression -------------------------------------------------------
 
-    def test_le_lien_de_regression_est_un_lien_type_et_journalise(self):
+    def test_le_lot_de_regression_est_dans_le_journal_sans_lien_type(self):
         self.mark()
         finding = self.blocked()
         regression = self.new_lot(title="la régression")
@@ -338,15 +378,64 @@ class FindingTest(PgTestCase):
                      regression_lot=regression, adjudicator="judge")
         row = self.finding(milestone=finding)
         self.assertEqual(row["regression_lot"], regression)
-        links = work_dependencies.links(self.db, [self.lot]).get(self.lot, [])
+        self.assertEqual(row["basis"], "regression")
+        # #6669 B1 : aucun genre `regressed_by` n'est écrit — un lecteur N-1 de
+        # `links()` lèverait KeyError et `packet_candidates` refuserait le paquet.
         self.assertEqual(
-            [(link["kind"], link["lot"], link["label"]) for link in links],
-            [("regressed_by", regression, "regressed by")])
-        with self.assertRaises(work.WorkError):
-            review_finding.resolve(
-                self.db, self.lot, finding, state="confirmed",
-                basis="regression", regression_lot=self.lot,
-                adjudicator="judge")
+            work_dependencies.links(self.db, [self.lot]).get(self.lot, []), [])
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM work_item_links")[0]["n"], 0)
+
+    def test_un_lot_de_regression_propre_ou_inconnu_est_refuse(self):
+        self.mark()
+        finding = self.blocked()
+        for lot in (self.lot, 999999):
+            with self.subTest(lot=lot):
+                with self.assertRaises(review_finding.ReviewFindingError):
+                    self.resolve(finding, state="confirmed", basis="regression",
+                                 regression_lot=lot, adjudicator="judge")
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM review_finding_resolutions")[0]["n"], 0)
+
+    def test_deux_resolutions_concurrentes_ne_sont_pas_un_interblocage(self):
+        # #6669 B1 : `resolve` ne prend que le verrou de lot, plus de verrou de
+        # graphe (aucun lien typé) ; deux résolutions simultanées aboutissent et
+        # la dernière ligne fait foi.
+        self.mark()
+        finding = self.blocked()
+        start = threading.Barrier(2)
+        errors = []
+
+        def run(**kwargs):
+            db = D.connect(self.cfg)
+            try:
+                start.wait(timeout=5)
+                review_finding.resolve(db, self.lot, finding,
+                                       adjudicator="human:owner", **kwargs)
+            except Exception as exc:  # noqa: BLE001 - le témoin juge l'échec
+                errors.append(exc)
+            finally:
+                db.close()
+
+        threads = [
+            threading.Thread(target=run, daemon=True, kwargs=dict(
+                state=review_finding.STATE_CONFIRMED, correction_sha=SHA_C)),
+            threading.Thread(target=run, daemon=True, kwargs=dict(
+                state=review_finding.STATE_REFUTED, basis="evidence",
+                note="le relecteur s'est trompé de tête")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        rows = self.db.query(
+            "SELECT state FROM review_finding_resolutions"
+            " WHERE milestone_id = %s ORDER BY id", (finding,))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(self.finding(milestone=finding)["state"],
+                         rows[-1]["state"])
 
     # -- M1 ---------------------------------------------------------------
 

@@ -24,12 +24,15 @@
 -- nouvelle porte de fusion.
 --
 -- 0564 est réservé au lot #6669 (`ameesh work migration`). Additif : une
--- table neuve et une valeur de plus dans une contrainte de genre existante
--- (L151), aucune ligne réécrite. L'écrivain N-1 n'écrit pas cette table ; le
--- lecteur du rapport affiche alors les constats « non tranchés ». En revanche
--- un lecteur N-1 de `ameesh work links` ne connaît pas `regressed_by` : le
--- code se déploie avec la migration (lecture seule, aucune corruption), et un
--- retour arrière laisse la valeur inerte jusqu'au retour du nouveau code.
+-- table neuve seulement, aucune ligne ni contrainte existante réécrite (L151).
+-- L'écrivain N-1 n'écrit pas cette table ; le lecteur du rapport affiche alors
+-- les constats « non tranchés ». Le lien de régression vit dans
+-- `regression_lot` : le genre `work_item_links.regressed_by` n'est pas ouvert
+-- ici, parce qu'un lecteur N-1 de `work_dependencies.links()` lève
+-- `KeyError` (`_INVERSE[kind]`) et que `packet_candidates` en fait un refus de
+-- composition (B1 auditeur #209049, hôtes N-1 et retour arrière). Le genre
+-- sera ouvert quand plus aucun lecteur N-1 ne tourne, ou derrière un plancher
+-- de version.
 
 SET LOCAL lock_timeout = '5s';
 
@@ -49,7 +52,9 @@ CREATE TABLE IF NOT EXISTS review_finding_resolutions (
     correction_sha    text
                       CHECK (correction_sha IS NULL
                              OR correction_sha ~ '^[0-9a-f]{7,64}$'),
-    regression_lot    bigint REFERENCES work_items(id) ON DELETE SET NULL,
+    -- #6669 N1 : pas de SET NULL — la preuve de régression ne se perd pas
+    -- en silence, et l'append-only refuserait l'UPDATE du SET NULL
+    regression_lot    bigint REFERENCES work_items(id),
     corrector         text NOT NULL DEFAULT '',
     withdrawn_by      text NOT NULL DEFAULT '',
     adjudicator       text NOT NULL CHECK (btrim(adjudicator) <> ''),
@@ -126,17 +131,6 @@ CREATE TRIGGER review_finding_resolutions_guard
     BEFORE INSERT OR UPDATE ON review_finding_resolutions
     FOR EACH ROW EXECUTE FUNCTION review_finding_resolution_guard();
 
--- #6669 : le lien de régression est un lien typé entre lots, réutilisé par
--- `ameesh work links`. `regressed_by` est orienté : le lot édité est régressé
--- par le lot cité. Extension de la contrainte de genre de 0501 : seules des
--- valeurs de plus, aucune ligne réécrite (L151).
-ALTER TABLE work_item_links
-    DROP CONSTRAINT IF EXISTS work_item_links_kind_check;
-ALTER TABLE work_item_links
-    ADD CONSTRAINT work_item_links_kind_check
-    CHECK (kind IN ('duplicates', 'supersedes', 'part_of', 'conflicts_with',
-                    'regressed_by'));
-
 COMMENT ON TABLE review_finding_resolutions IS
     '#6669 (M3) : journal additif des résolutions explicites d''un constat de revue (jalon verdict blocked). État effectif = dernière ligne ; absence = non tranché. Aucune porte de fusion ne le lit.';
 COMMENT ON COLUMN review_finding_resolutions.witness_sha IS
@@ -145,5 +139,3 @@ COMMENT ON COLUMN review_finding_resolutions.review_room IS
     '#6669 : projection review_correction.check quand le relecteur corrige lui-même ; observation, jamais un refus ni un compte d''avis.';
 COMMENT ON COLUMN review_finding_resolutions.judged_families IS
     '#6669 : familles prises en compte pour l''indépendance de l''adjudicateur (auteurs prouvés au gel, relecteur, correcteur).';
-COMMENT ON COLUMN work_item_links.kind IS
-    '#4167/#6669 : duplicates, supersedes, part_of (orientés), conflicts_with (symétrique) ou regressed_by (le lot édité est régressé par l''autre).';
