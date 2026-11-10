@@ -888,7 +888,7 @@ def _record_ahead(member, carrier, now: float) -> bool:
     return observed < recorded and now - recorded <= RECORD_AHEAD_GRACE_S
 
 
-def recorded_packet_attachments(st, open_items, rows, *, now=None):
+def recorded_packet_attachments(st, open_items, rows, *, now=None, moved=None):
     """#4082: read current packet membership without a local Git clone.
 
     Membership is replaced by record_packet on recomposition. Bind it to the
@@ -896,6 +896,13 @@ def recorded_packet_attachments(st, open_items, rows, *, now=None):
     excluded from the current packet or added since its composition. #5206:
     a composition recorded after the observed head, for a bounded time, is the
     newer evidence (a recomposition the branch sweep has not seen yet).
+
+    #6608 : une unité composée depuis son **dernier gel** reste membre quand
+    sa tête a bougé après : le paquet porte le contenu gelé, la fusion est la
+    sienne (nexlink #6511, faux `freeze-not-head`). Le commit d'après n'est
+    pas dans le paquet ; `moved`, s'il est donné, reçoit
+    `{lot: {"vehicle", "frozen", "head"}}` pour l'avis à l'auteur. Un regel
+    après la composition détache toujours l'unité.
     """
     from . import plan_git
 
@@ -934,10 +941,16 @@ def recorded_packet_attachments(st, open_items, rows, *, now=None):
         frozen = latest_freeze(marks.get(uid, ())) or {}
         current = unit.get("branch_head") or frozen.get("sha")
         source = member.get("source_sha") or member.get("frozen_sha")
-        if not current or not source or not plan_git.same_commit(current, source):
+        if not current or not source:
             continue
         if frozen and not plan_git.same_commit(frozen["sha"], source):
             continue
+        if not plan_git.same_commit(current, source):
+            if not frozen:
+                continue
+            if moved is not None:
+                moved[uid] = {"vehicle": cid, "frozen": str(frozen["sha"]),
+                              "head": str(current)}
         out.setdefault(cid, set()).add(uid)
     return out
 
@@ -1320,11 +1333,18 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
                                    db=db)
                 if want_packets and not _dry_pass(db) else {})
     attached = {cid: set(members) for cid, members in attached.items()}
+    moved: dict[int, dict] = {}
     if want_packets and not _dry_pass(db):
         for cid, members in recorded_packet_attachments(st, open_items, rows,
-                                                        now=now).items():
+                                                        now=now, moved=moved).items():
             attached.setdefault(cid, set()).update(members)
     packet = packet_waits(rows, open_items, attachments=attached) if want_packets else {}
+    for ident, shift in moved.items():
+        # #6608 : la tête a bougé après la composition depuis le gel ; seul le
+        # véhicule qui l'a enregistrée le dit (un autre porteur n'en sait rien).
+        if (packet.get(ident) or {}).get("vehicle") == shift["vehicle"]:
+            packet[ident] = dict(packet[ident], head_moved_after_composition={
+                "frozen": shift["frozen"], "head": shift["head"]})
     landings = _with_heads(st, _admitted(
         st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))
     if decisions is None:
