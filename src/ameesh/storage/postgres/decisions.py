@@ -191,6 +191,15 @@ class Decisions(interface.Decisions):
             " AND btrim(work_item_id) = %%s ORDER BY id" % (_COLUMNS, _IS_DECISION),
             (str(lot).strip(),))
 
+    def for_work_item(self, lot) -> list[dict]:
+        # #6638: bounded by agent_mailbox_work_item_idx (0413); pending and
+        # closed requests share one read so a replay after an answer cannot
+        # file a second request for the same repair plan.
+        return self.db.query(
+            "SELECT %s FROM agent_mailbox WHERE %s AND work_item_id = %%s"
+            " ORDER BY id DESC" % (_COLUMNS, _IS_DECISION),
+            (str(lot).strip(),))
+
     def supersession(self, decision_id):
         # #4995: append-only evidence, read by the authority gate; the
         # mutable payload marker is only a cache.

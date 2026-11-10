@@ -95,7 +95,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    lot_milestones lot_actions actions agents costs packages
                    package_items lot_messages
    projects        board
-   decisions       create get pending history pending_for_lot close register_chat
+   decisions       create get pending history pending_for_lot for_work_item close register_chat
    roadmap         plan_item item_plans plan_package items commitments
                    add_commitment record_proposal set_commitment
    operations      set_settings set_session_work_item listing request_restart
@@ -4251,6 +4251,14 @@ class Decisions(Domain):
     @abc.abstractmethod
     def pending_for_lot(self, lot: str) -> list[dict]:
         """Les demandes en attente rattachées au lot `lot` (`work_item_id`)."""
+
+    def for_work_item(self, lot: str) -> list[dict]:
+        """Toutes les demandes rattachées au lot `lot`, en attente ou closes,
+        les plus récentes d'abord (#6638 : une demande par plan de réparation).
+
+        Lecture serveur seule, hors du contrat médié ; un pilote qui ne
+        l'implémente pas lève NotImplementedError."""
+        raise NotImplementedError
 
     @abc.abstractmethod
     def close(self, decision_id: int, *, status: str, record: dict) -> dict | None:

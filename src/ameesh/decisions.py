@@ -315,6 +315,7 @@ def view_of(row: dict, now: float | None = None) -> dict:
         "answer": d.get("answer"),
         "withdrawn": d.get("withdrawn"),
         "validation": d.get("validation"),
+        "repair_plan": d.get("repair_plan"),
     }
 
 
@@ -598,6 +599,11 @@ def request_text(decision: dict, *, requester: str, owner: str | None,
     if decision.get("recommend"):
         lines.append("Recommendation: %s%s" % (
             decision["recommend"], " — %s" % decision["why"] if decision.get("why") else ""))
+    plan = decision.get("repair_plan")
+    if isinstance(plan, dict) and plan.get("key"):
+        lines.append("Repair plan %s (%s/%s), content sha256:%s." % (
+            plan["key"], plan.get("project") or "?", plan.get("environment") or "?",
+            str(plan.get("digest") or "")[:12]))
     validation = decision.get("validation") or {}
     due_label = validation.get("due_local") or (_local(decision["due_ts"]) if decision.get("due_ts") else None)
     tail = ["Deadline: %s (%s)." % (due_label, validation.get("timezone", "local"))] if due_label else []
@@ -643,14 +649,20 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         urgent: bool = False, due_ts: float | None = None, needs_signature: bool = False,
         source_mail: int | None = None, parent_lot: str | None = None,
         now: float | None = None, domain: str = "decision", issue_links=(),
-        supersedes: int | None = None, supersedes_option: str | None = None) -> dict:
+        supersedes: int | None = None, supersedes_option: str | None = None,
+        repair_plan: dict | None = None) -> dict:
     """Dépose une demande de décision de `requester` (un agent) ; rend la
     demande (`ameesh-decision/1`) avec `lot_state`. DecisionError si refusée
     (rien n'est déposé).
 
     `source_mail` (L233): the mail in which `requester` wrote this decision in
     prose; it must be theirs. Its lot is the default `lot`, and once the
-    request names it, the mail is no longer shown as a prose decision."""
+    request names it, the mail is no longer shown as a prose decision.
+
+    `repair_plan` (U13/A9, #6638): bounded structured metadata of a repair
+    plan (key, SHA-256 content digest, project/environment, U5 receipt ids).
+    It is stored and rendered with the request; it grants no authority and
+    never turns an answer into an approval by itself."""
     now = time.time() if now is None else float(now)
     if supersedes is not None:
         if type(supersedes) is not int or supersedes <= 0:
@@ -704,6 +716,26 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                             "request is attached to a work item")
     if due_ts is not None and float(due_ts) <= now:
         raise DecisionError("deadline already passed (%s)" % _local(due_ts))
+    if repair_plan is not None:
+        # U13/A9: a bounded structured receipt, never a raw log or a free text
+        # that could be mistaken for the owner's authority.
+        if not isinstance(repair_plan, dict):
+            raise DecisionError("repair_plan: an object is required")
+        key = repair_plan.get("key")
+        digest = repair_plan.get("digest")
+        if (not isinstance(key, str) or not key or len(key) > 160
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in key)):
+            raise DecisionError("repair_plan.key: a bounded token is required")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise DecisionError("repair_plan.digest: a SHA-256 hex digest is required")
+        try:
+            encoded = json.dumps(repair_plan, ensure_ascii=False, sort_keys=True)
+            clean_plan = json.loads(encoded)
+        except (TypeError, ValueError) as exc:
+            raise DecisionError("repair_plan: JSON-serializable data is required") from exc
+        if len(encoded) > 8192:
+            raise DecisionError("repair_plan: at most 8192 bytes")
+        repair_plan = clean_plan
 
     def body(db):
         requester_row = registry.get(db, requester)
@@ -787,6 +819,8 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         if supersedes is not None:
             decision["supersedes"] = supersedes
             decision["supersedes_option"] = supersedes_option
+        if repair_plan is not None:
+            decision["repair_plan"] = repair_plan
 
         def write(tx):
             row = storage.of(tx).decisions.create(
@@ -946,7 +980,8 @@ def _option_label(view: dict, key: str | None) -> str | None:
 
 def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
     """L'empreinte que signe une réponse (sha256 hex) : la demande (numéro,
-    demandeur, lot, question, options, heure), la réponse exacte, son auteur."""
+    demandeur, lot, question, options, heure), le plan de réparation (clé et
+    empreinte de contenu) quand il y en a un, la réponse exacte, son auteur."""
     from . import authority
     document = {
         "v": 1, "kind": "ameesh-decision-answer", "decision": int(view["id"]),
@@ -960,6 +995,13 @@ def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
     if view.get("supersedes") is not None:
         document["request"]["supersedes"] = view["supersedes"]
         document["request"]["supersedes_option"] = view.get("supersedes_option")
+    # #6638 : a repair plan's identity and content digest are part of what the
+    # owner signs, so replacing the plan metadata breaks the signature. Absent
+    # for historical requests: their signed document is unchanged.
+    plan = view.get("repair_plan")
+    if isinstance(plan, dict) and plan.get("key") and plan.get("digest"):
+        document["request"]["repair_plan"] = {"key": plan["key"],
+                                              "digest": plan["digest"]}
     return authority.hash_artifact(json.dumps(document, sort_keys=True, separators=(",", ":"),
                                               ensure_ascii=False))
 
@@ -1528,6 +1570,11 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
             if view["state"] == "pending" else " (not effective)"))
     if view.get("superseded_by") is not None:
         lines.append("      superseded by decision #%d; authority refused" % view["superseded_by"])
+    plan = view.get("repair_plan")
+    if isinstance(plan, dict) and plan.get("key"):
+        lines.append("      repair plan %s (%s/%s), content sha256:%s" % (
+            plan["key"], plan.get("project") or "?", plan.get("environment") or "?",
+            str(plan.get("digest") or "")[:12]))
     for line in (view.get("question") or "").splitlines() or [""]:
         lines.append("      %s" % line)
     for option in view.get("options") or ():
