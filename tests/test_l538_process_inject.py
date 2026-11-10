@@ -703,8 +703,8 @@ class PushProcessTest(_TmpMixin, PgTestCase):
                              canon_sync.PROCESS_PUSH_SECTIONS_MAX + 1500)
 
     def test_une_base_illisible_pousse_la_fiche_entiere(self):
-        # #6640 (contre-examen #207148) : base absente ou illisible — la fiche
-        # entière part, jamais un delta orphelin ; le repère avance.
+        # #6640 (contre-examen #207148) : la fiche à la base est illisible —
+        # la fiche entière part, jamais un delta orphelin ; le repère avance.
         self.sync()
         self._change("# Processus de lot\n\n- la règle suivante\n- %s\n" % REGLE)
         revision = canon.load(self.clone)
@@ -724,6 +724,32 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.assertTrue(mail.message_payload(recu)["full"])
         self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
                          head)
+
+    def test_un_repere_inconnu_du_clone_pousse_la_fiche_entiere(self):
+        # #6640 (B1 relecture) : de bout en bout, `process_commit` est un SHA
+        # que le clone n'a pas — ni `error` muet ni delta : chaque fiche part
+        # entière, le repère est ré-ancré, et le sync suivant redevient muet.
+        self.sync()
+        inconnu = "f" * 40
+        self.db.execute("UPDATE canon_state SET process_commit = %s "
+                        "WHERE host = %s", (inconnu, "atelier"))
+        self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
+                         inconnu)
+        self._change("# Processus de lot\n\n- la règle suivante\n- %s\n" % REGLE)
+        head = canon.load(self.clone).sources[0].commit
+        report = self.sync()
+        self.assertEqual(report.processes.error, "")
+        self.assertEqual(report.processes.sent, 2)
+        recu = self._sujets("orchestre")
+        self.assertEqual(len(recu), 1, recu)
+        self.assertIn("fiche entière", recu[0]["body"])
+        self.assertIn(inconnu[:12], recu[0]["body"])
+        self.assertIn(REGLE, recu[0]["body"])
+        self.assertTrue(mail.message_payload(recu[0])["full"])
+        self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
+                         head)
+        self.sync()
+        self.assertEqual(len(self._sujets("orchestre")), 1)
 
     def test_retired_recipient_still_declared_does_not_abort_sync(self):
         # #5080 : fiche encore présente, retrait DB déjà committé.

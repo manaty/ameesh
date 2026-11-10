@@ -2439,6 +2439,7 @@ PROCESS_PUSH_CUT = "… [cut at %d bytes — read the whole card at the link bel
 #: chaque édition sans rien changer aux règles).
 PROCESS_FRONTMATTER = "(frontmatter)"
 
+_SHA_FULL_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _HEADING_RE = re.compile(r"^#{1,6}\s+\S")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
@@ -2626,7 +2627,15 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
     if not old or old == source.commit:
         return done
     try:
-        if not canon_mod.git_contains(source.repo, old, source.commit):
+        if not _SHA_FULL_RE.fullmatch(old) \
+                or canon_mod.git_commit(source.repo, old) is None:
+            # #6640 (B1 relecture) : base absente de ce clone (objet perdu,
+            # repère d'un autre clone) — aucune section ne se compare : chaque
+            # fiche part ENTIÈRE, jamais un delta orphelin ni un silence, et
+            # `claim_commit` ré-ancre le repère. Une base présente mais hors
+            # des deux histoires reste le constat #1464 ci-dessous.
+            touched = None
+        elif not canon_mod.git_contains(source.repo, old, source.commit):
             if canon_mod.git_contains(source.repo, source.commit, old):
                 # sync ancien : un sync plus récent a déjà poussé au-delà de ce
                 # commit — rien à pousser, rien à signaler, repère conservé
@@ -2643,18 +2652,20 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
                 "changed Process rules are no longer pushed on this host until "
                 "the push marker is re-anchored" % (old[:12], source.commit[:12]))
             return done
-        # #538 : la comparaison porte sur la RÉFÉRENCE APPROUVÉE (`source.commit`),
-        # pas sur HEAD ni l'arbre de travail : si la référence avance sans que le
-        # checkout suive, le changement est quand même poussé (sinon le point de
-        # reprise avancerait en silence, et la règle serait perdue).
-        touched = set(canon_mod.git_changed_paths_between(source.repo, old,
-                                                          source.commit))
+        else:
+            # #538 : la comparaison porte sur la RÉFÉRENCE APPROUVÉE
+            # (`source.commit`), pas sur HEAD ni l'arbre de travail : si la
+            # référence avance sans que le checkout suive, le changement est
+            # quand même poussé (sinon le point de reprise avancerait en
+            # silence, et la règle serait perdue).
+            touched = set(canon_mod.git_changed_paths_between(source.repo, old,
+                                                              source.commit))
     except canon_mod.GitError as exc:
         done.error = str(exc)
         return done
     changed = [process for process in canon.processes
                if process.valid and process.fiche.member == source.member
-               and process.fiche.path in touched]
+               and (touched is None or process.fiche.path in touched)]
     if not changed:
         return done
     from . import mail as mail_mod
