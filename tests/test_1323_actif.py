@@ -1599,7 +1599,12 @@ while index < len(args):
         cwd = args[index + 1]
         index += 2
     elif arg.startswith('--setenv='):
-        name, value = arg[len('--setenv='):].split('=', 1)
+        # #6761 : nom seul = valeur copiee de l'environnement de l'appelant.
+        item = arg[len('--setenv='):]
+        if '=' in item:
+            name, value = item.split('=', 1)
+        else:
+            name, value = item, os.environ.get(item, '')
         env[name] = value
         index += 1
     else:

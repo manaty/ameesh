@@ -2607,6 +2607,8 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
     une échéance épuisée lève `GitDeadline` : la découverte bornée s'arrête,
     elle ne se lit pas comme un canon illisible.
     """
+    if repo is None or not str(repo).strip():
+        raise GitError("no repository: run from the lot's checkout or pass --repo")
     global _CONTENT_CACHE_MISSES
     if deadline is not None:
         if deadline.expired():
@@ -2633,7 +2635,7 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         # Deux cas distincts portent le même FileNotFoundError : l'exécutable
         # `git` absent, et le dossier de travail (`cwd=repo`) absent. Le
         # second ne doit jamais se lire « git not found » (#2349).
-        if exc.filename and exc.filename != cmd[0]:
+        if exc.filename != cmd[0]:
             raise GitError("git %s: repository directory %r does not exist"
                            % (args[0] if args else "?", repo)) from exc
         raise GitError("git not found") from exc

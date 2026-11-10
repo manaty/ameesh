@@ -6,7 +6,8 @@ Constat (pilote, 07/11) : GitHub démarre le cron 03:30Z de carte.yml avec six
 que la ci-full du paquet h-20261107-13 attendait). Témoins : la décision du
 garde (scripts/carte-fenetre.py), son câblage dans carte.yml (job `fenetre`
 hébergé, `plan-mesure` qui en dépend, `carte` qui ne rougit pas sur une mesure
-sautée, plafond de runners) et la minuterie d'hôte qui dispatche à 03:30Z.
+sautée, plafond de runners) et la minuterie de rôle `ameesh-carte` qui
+dispatche à 01:00Z (#6777).
 """
 from __future__ import annotations
 
@@ -69,6 +70,45 @@ class DecisionTest(unittest.TestCase):
         mesurer, _ = self.decider(evenement="workflow_dispatch", planifie=True,
                                   maintenant=a("14:00"))
         self.assertFalse(mesurer)
+
+    def test_une_carte_perimee_mesure_hors_fenetre(self):
+        # #6777 : le cron de 03:30Z démarre vers 11Z ; une carte de plus de
+        # 48 h (le seuil de `map_stale`) l'emporte sur la fenêtre.
+        mesurer, raison = self.decider(
+            maintenant=a("11:24"),
+            derniere_carte=a("11:24") - dt.timedelta(hours=49))
+        self.assertTrue(mesurer)
+        self.assertIn("périmée", raison)
+        self.assertIn("rattrapage", raison)
+
+    def test_une_carte_perimee_attend_le_creneau_sans_paquet(self):
+        mesurer, raison = self.decider(
+            maintenant=a("11:24"), paquet_actif=True,
+            derniere_carte=a("11:24") - dt.timedelta(hours=49))
+        self.assertFalse(mesurer)
+        self.assertIn("paquet", raison)
+
+    def test_une_carte_perimee_ne_double_pas_une_mesure(self):
+        mesurer, raison = self.decider(
+            maintenant=a("11:24"), autre_carte=True,
+            derniere_carte=a("11:24") - dt.timedelta(hours=49))
+        self.assertFalse(mesurer)
+        self.assertIn("autre mesure", raison)
+
+    def test_le_seuil_de_peremption_est_48_h(self):
+        self.assertFalse(self.decider(
+            maintenant=a("11:24"),
+            derniere_carte=a("11:24") - dt.timedelta(hours=47))[0])
+        self.assertTrue(self.decider(
+            maintenant=a("11:24"),
+            derniere_carte=a("11:24") - dt.timedelta(hours=49))[0])
+
+    def test_lecture_impossible_hors_fenetre_ne_mesure_pas(self):
+        # une lecture en panne ne prouve pas la péremption : la fenêtre borne
+        mesurer, raison = self.decider(maintenant=a("11:24"), derniere_carte=None,
+                                       paquet_actif=None, autre_carte=None)
+        self.assertFalse(mesurer)
+        self.assertIn("hors fenêtre", raison)
 
     def test_un_paquet_en_file_saute_la_mesure(self):
         mesurer, raison = self.decider(paquet_actif=True)
@@ -155,13 +195,13 @@ class CablageTest(unittest.TestCase):
         self.assertIn('- cron: "30 3 * * *"', WORKFLOW)
         self.assertIn("      - scripts/carte-fenetre.py", WORKFLOW)
 
-    def test_minuterie_d_hote(self):
+    def test_minuterie_de_role(self):
         timer = (REPO / "deploy/systemd/ameesh-carte.timer").read_text(encoding="utf-8")
         service = (REPO / "deploy/systemd/ameesh-carte.service").read_text(encoding="utf-8")
-        self.assertIn("OnCalendar=*-*-* 03:30:00 UTC", timer)
+        self.assertIn("OnCalendar=*-*-* 01:00:00 UTC", timer)
         self.assertIn("Persistent=true", timer)
-        self.assertIn("gh workflow run carte.yml", service)
-        self.assertIn("-f planifie=true", service)
+        self.assertIn("role run mesh-design", service)
+        self.assertIn("carte dispatch", service)
         self.assertNotIn("manaty", service, "rien de propre à un client en dur")
 
 

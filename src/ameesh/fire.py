@@ -240,7 +240,10 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
     # Le dépôt de l'assigné (registre) sert à résoudre les abréviations et à
     # enregistrer le SHA complet, comme le passage le fait déjà ; sans lui, la
     # comparaison par préfixe commun reste possible (#2349).
-    repo = repo or _repo_of(db, item)
+    repo = review_checkout(cfg, db, item, repo=repo)
+    from . import packet_reviews
+    if repo is None and packet_reviews.is_vehicle(item):
+        raise FireError("no repository: run from the lot's checkout or pass --repo")
     if not same_commit(wanted, frozen, repo):
         raise FireError("the fire names %s, not the current freeze %s of lot #%d: the fire is "
                         "given on the exact head (freeze it again, then give the fire)"
@@ -401,6 +404,41 @@ def _project_checkout(project) -> str | None:
     """Le clone que l'hôte déclare pour ce projet
     (`radar.projects.<p>.repo`), s'il est un checkout (#2473)."""
     return _checkout(getattr(project, "repo", "") or "") if project is not None else None
+
+
+def review_checkout(cfg, db, row: dict, *, repo: str | None = None,
+                    slug: str | None = None, caller: bool = False) -> str | None:
+    """Resolve a local lot checkout; an explicit invalid path never falls back.
+
+    Registry paths can belong to another host. Try the declared project clone,
+    then the caller's checkout only when it belongs to the lot's repository.
+    """
+    if repo is not None:
+        return _checkout(repo)
+    candidate = _repo_of(db, row)
+    slug = slug or _slug(cfg, row, candidate)
+    if candidate and slug and not _same_repository(candidate, slug):
+        candidate = None
+    project = _project(cfg, candidate, slug)
+    if candidate:
+        return candidate
+    candidate = _project_checkout(project)
+    if candidate and slug and _same_repository(candidate, slug):
+        return candidate
+    if not caller:
+        return None
+    # No directory scan or guessed child: only a checkout whose origin proves
+    # that it is the lot's own repository is a caller fallback.
+    try:
+        candidate = _checkout(os.getcwd())
+    except OSError:
+        candidate = None
+    if candidate and slug:
+        from . import migrations
+        origin = migrations.origin_repo(candidate)
+        if origin and migrations.repo_key(origin) == migrations.repo_key(slug):
+            return candidate
+    return None
 
 
 def _slug(cfg, item: dict, repo: str | None) -> str | None:
@@ -810,6 +848,10 @@ def _ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""
     lot = int(row["id"])
+    from . import packet_reviews
+    if not repo and packet_reviews.is_vehicle(row):
+        return False, "no repository: run from the lot's checkout or pass --repo", {
+            "class": "sensitive", "doubt": True}
     freeze = freeze_of(marks)
     frozen = _norm((freeze or {}).get("sha"))
     head = merge_queue.pinned(repo, frozen) if repo else None
@@ -2753,7 +2795,7 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
         work_repo = None
     project = _project(cfg, work_repo, slug)
     if work_repo is None:
-        work_repo = _project_checkout(project)
+        work_repo = review_checkout(cfg, db, row, repo=repo, slug=slug)
     status = _pr_status(slug, branch, gh=gh)
     out.update(slug=slug, repo=work_repo,
                project=project.name if project is not None else "",
@@ -3273,8 +3315,9 @@ def add_parser(work_sub, func) -> None:
                         help="withdraw the fire: the automatic merge is disarmed; waits for an "
                              "in-flight pass's lease (up to ~2 min) before refusing (#3598)")
     parser.add_argument("--repo", default=None,
-                        help="the lot's repository: a checkout path, or the current "
-                             "checkout's owner/name (default: the current git repository)")
+                        help="the lot's repository: a checkout path (default: the assignee's "
+                             "local checkout, the declared project clone, then the current "
+                             "checkout with a matching origin)")
     parser.add_argument("--exception", choices=packet_guard.EXCEPTIONS, default="",
                         help="#2333/canon §11 bis: incident|unblock, for a lot branch merged "
                              "outside the packet (the declaration is journaled in the lot's "
@@ -3320,6 +3363,10 @@ def run(cfg, db, args) -> int:
                 print("the fire is the pilot's gesture (a human, an orchestrator or a design "
                       "agent with a declared role): %s" % exc, file=sys.stderr)
                 return 1
+        if args.sha and repo is None:
+            item = work.get(db, args.id)
+            if item is not None:
+                repo = review_checkout(cfg, db, item, caller=True)
         if args.sha:
             row = give(db, args.id, sha=args.sha, actor=actor, note=args.note, repo=repo,
                        exception=args.exception or "", reason=args.reason or "", cfg=cfg)

@@ -15,6 +15,7 @@ import dataclasses
 import json
 import time
 import unittest
+import uuid
 from unittest import mock
 
 from ameesh import election, registry, role_standings_pg as pg, runner, storage
@@ -675,6 +676,54 @@ class RunnerWiringTest(_RoleCase):
     def standings_for_handover(self):
         self.standing("pilote", "atelier", 99.0)
         self.standing("pilote", "banc", 90.0)
+
+
+class StagingProofObservationTest(_RoleCase):
+    """#6761 : la preuve de staging ne touche jamais l'election (pilote, 21:02Z).
+
+    Le refus est a la prise, dans l'executeur (`sequence_problem` en direct) ;
+    la preuve publiee n'est qu'une observation. Aucune absence, peremption ou
+    echec, meme commun aux deux candidats, ne retire le role : c'est le temoin
+    de l'ordre de deploiement (venv stable / runners) et du §11.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Journal append-only et partage : un nom par temoin isole les preuves.
+        self.name = "observation-%s" % uuid.uuid4().hex[:8]
+        self.role(self.name)
+        self.ready_pair(self.name)
+        self.standing(self.name, "banc", 90.0)
+        self.standing(self.name, "atelier", 80.0)
+
+    def proof(self, host: str, *, ready: bool, age: float = 0.0) -> None:
+        object_name = "staging-executor:%s:%s" % (self.name, host)
+        data = {"role": self.name, "host": host, "ready": ready}
+        if not ready:
+            data["diagnostic"] = "ssh manaty-mesh-1"
+        self.db.execute(
+            "INSERT INTO ameesh_events (type, object, project, data, created_at)"
+            " VALUES ('staging.executor', %s, '', %s::jsonb,"
+            "         now() - make_interval(secs => %s))",
+            (object_name, json.dumps(data), float(age)))
+
+    def ready_hosts(self) -> dict:
+        return {item["host"]: item["ready"]
+                for item in election.candidacy(self.db, self.name)}
+
+    def test_an_absent_proof_never_removes_the_role(self):
+        # L'executeur tourne encore l'ancien venv et ne publie rien.
+        self.assertEqual(self.ready_hosts(), {"banc": True, "atelier": True})
+
+    def test_a_common_failure_never_removes_the_role(self):
+        self.proof("banc", ready=False)
+        self.proof("atelier", ready=False)
+        self.assertEqual(self.ready_hosts(), {"banc": True, "atelier": True})
+
+    def test_an_expired_or_isolated_failure_never_removes_the_role(self):
+        self.proof("banc", ready=False)
+        self.proof("atelier", ready=True, age=1000.0)
+        self.assertEqual(self.ready_hosts(), {"banc": True, "atelier": True})
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ Ces témoins rejouent les deux premiers sur la base ; le troisième est dans
 from __future__ import annotations
 
 import os
+import subprocess
 import types
 import unittest
 from unittest import mock
@@ -32,6 +33,11 @@ class FireQueueTakeOutScopeTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        # #6765: the vehicle fire needs an explicit checkout, independent of cwd.
+        self.fire_repo = os.path.join(self.tmp, "fire-repo")
+        subprocess.run(["git", "init", "-q", "-b", "develop", self.fire_repo], check=True)
+        subprocess.run(["git", "-C", self.fire_repo, "config",
+                        "ameesh.target", "develop"], check=True)
         patches = [
             mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "", "AMEESH_ROLE": ""}),
             mock.patch.object(merge_queue, "readiness", side_effect=self._ready),
@@ -74,7 +80,7 @@ class FireQueueTakeOutScopeTest(PgTestCase):
         ops = storage.of(self.db).work
         ops.queue_add(self.lot, target="main", frozen_sha=SHA_A, note="queued",
                       actor="pilote", frozen_id=self.freeze_a["id"])
-        fire.give(self.db, self.lot, sha=SHA_A, actor="pilote")
+        fire.give(self.db, self.lot, sha=SHA_A, actor="pilote", repo=self.fire_repo)
         self.assertTrue(merge_queue.leave(self.db, self.lot, actor="pilote"))
 
         out = self._fallback()
@@ -92,7 +98,7 @@ class FireQueueTakeOutScopeTest(PgTestCase):
         self.ready_sha, self.ready_id = SHA_B, self.freeze_b["id"]
         packet_guard.declare(self.db, self.lot, "incident", "test: #3550 B", SHA_B,
                              actor="pilote")
-        fire.give(self.db, self.lot, sha=SHA_B, actor="pilote")
+        fire.give(self.db, self.lot, sha=SHA_B, actor="pilote", repo=self.fire_repo)
         # la ligne encore en file est celle du gel A : sa sortie nomme A
         self.assertTrue(merge_queue.leave(self.db, self.lot, actor="pilote"))
 
@@ -109,7 +115,7 @@ class FireQueueTakeOutScopeTest(PgTestCase):
         ops = storage.of(self.db).work
         ops.queue_add(self.lot, target="develop", frozen_sha=SHA_A, note="queued",
                       actor="pilote", frozen_id=self.freeze_a["id"])
-        fire.give(self.db, self.lot, sha=SHA_A, actor="pilote")
+        fire.give(self.db, self.lot, sha=SHA_A, actor="pilote", repo=self.fire_repo)
         self.assertTrue(merge_queue.leave(self.db, self.lot, actor="pilote"))
         self.db.execute("UPDATE integration_train_queue_receipts SET target = NULL"
                         " WHERE work_item_id = %s AND kind = 'removed'", (self.lot,))
@@ -123,7 +129,7 @@ class FireQueueTakeOutScopeTest(PgTestCase):
         """#3550 (2) : la relecture du reçu dans le chemin QueueWithdrawn ne
         laisse pas remonter une lecture DB en échec."""
         ops = storage.of(self.db).work
-        fire.give(self.db, self.lot, sha=SHA_A, actor="pilote")
+        fire.give(self.db, self.lot, sha=SHA_A, actor="pilote", repo=self.fire_repo)
         calls = []
 
         def read(*_a, **_kw):

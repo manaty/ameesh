@@ -263,6 +263,90 @@ def project_target(cfg, app: str) -> str:
         return ""
 
 
+def _origin_slug(repo: str) -> str:
+    """Le dépôt GitHub `owner/repo` configuré pour `remote.origin` de `repo`, ou ""."""
+    if not repo:
+        return ""
+    try:
+        from ... import migrations
+        url = canon_mod._git_out(repo, "config", "--get", "remote.origin.url")
+        return migrations.github_repo(str(url or "").strip()) or ""
+    except Exception:  # noqa: BLE001 - origine illisible : aucune identité
+        return ""
+
+
+def companion_repository(cfg, item: dict, repo: str) -> str:
+    """Le dépôt `owner/repo` de `repo` quand c'est un **compagnon** du projet
+    du lot, ou "" (#6769).
+
+    Un lot multi-dépôt (#6735) gèle aussi dans un autre dépôt que celui de son
+    projet : le lot nexlink #6746 porte une PR de manaty/manaty-its. Le dépôt
+    du projet est celui que la configuration lui déclare (`github.projects`),
+    jamais celui de l'issue ni de la PR. Le doute ne fait pas de compagnon :
+    projet sans dépôt déclaré, origine illisible ou hors GitHub, ou fork (même
+    nom de dépôt) gardent la cible du projet."""
+    app = str((item or {}).get("app") or "").strip()
+    if cfg is None or not app or not repo:
+        return ""
+    try:
+        from ... import intake_neighbors, migrations
+        declared = intake_neighbors._project_slug(cfg, app)
+        declared = migrations.repo_key(declared) if declared else ""
+    except Exception:  # noqa: BLE001 - configuration illisible : aucun compagnon
+        return ""
+    own = _origin_slug(repo).lower()
+    if not declared or not own:
+        return ""
+    if own.rpartition("/")[2] == str(declared).lower().rpartition("/")[2]:
+        return ""
+    # B mty-amh-impl-01 : un clone du canon (lot `canon/…`, #3331) garde la
+    # cible de son projet ; ce n'est pas un dépôt compagnon.
+    try:
+        top = os.path.realpath(canon_mod.git_toplevel(repo) or repo)
+        for path, slug in canon_clones(cfg):
+            if os.path.realpath(path) == top or (slug and slug.lower() == own):
+                return ""
+    except Exception:  # noqa: BLE001 - canons illisibles : le doute garde le projet
+        return ""
+    return own
+
+
+def companion_target(cfg, companion: str, repo: str) -> str:
+    """La cible **déclarée** d'un dépôt compagnon, ou "" (#6769) : celle du
+    projet qui déclare ce dépôt (même résolution que `project_target`), puis
+    `git config ameesh.target` du clone. Jamais `origin/HEAD`."""
+    try:
+        from ... import intake_neighbors
+        target = intake_neighbors.project_target(cfg, "", slug=companion)
+    except Exception:  # noqa: BLE001 - configuration illisible : la suivante
+        target = ""
+    if target:
+        return target
+    try:
+        return plan_git.declared_target(repo) or ""
+    except Exception:  # noqa: BLE001 - dépôt illisible : aucune cible
+        return ""
+
+
+def companion_refusal(cfg, item: dict, repo: str) -> str:
+    """Le refus nommé d'un compagnon sans cible déclarée, ou "" (#6769)."""
+    companion = companion_repository(cfg, item, repo)
+    if not companion or str((item or {}).get("branch_target") or "").strip():
+        return ""
+    if companion_target(cfg, companion, repo):
+        return ""
+    app = str((item or {}).get("app") or "").strip()
+    parent = project_target(cfg, app)
+    inherited = ("the project target %s is not inherited" % parent if parent
+                 else "the project's target is not inherited")
+    return ("lot #%s: %s is a companion repository of project %s; %s and no "
+            "target is declared for %s (its default branch is not guessed) — "
+            "declare it (`git -C %s config %s <branch>`) or pass the lot's "
+            "explicit target; nothing guessed"
+            % (item.get("id") or "?", companion, app, inherited, companion,
+               repo, plan_git.TARGET_GIT_KEY))
+
+
 def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> Optional[str]:
     """La cible du lot : `branch_target`, puis la cible du projet, puis celle
     du dépôt (`plan_git.default_target`, `ameesh.target` ou `origin/HEAD`).
@@ -281,6 +365,12 @@ def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> 
     explicit = str(item.get("branch_target") or "").strip()
     if explicit:
         return explicit
+    # #6769 : un dépôt compagnon n'hérite ni de la cible du projet ni du repli
+    # du dépôt ; il n'a que la sienne, déclarée, jamais `origin/HEAD` deviné
+    # (la cible réelle de manaty/manaty-its#5 n'est ni main ni develop).
+    companion = companion_repository(cfg, item, repo)
+    if companion:
+        return companion_target(cfg, companion, repo) or None
     target = project_target(cfg, str(item.get("app") or "").strip())
     if target:
         return target

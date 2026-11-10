@@ -606,6 +606,12 @@ class ReadyTest(unittest.TestCase):
         klass = {"class": "sensitive", "doubt": False, "files": [
             {"path": "docs/x.md", "class": "sensitive", "rule": ["docs/**"]}]}
         with mock.patch.object(fire.lot_class, "of_lot", return_value=klass), \
+                mock.patch.object(merge_queue, "pinned", return_value=A), \
+                mock.patch.object(merge_queue, "_class_base", return_value="main"), \
+                mock.patch.object(review_authors, "refreshed_target", return_value=A), \
+                mock.patch.object(merge_queue, "review_gate",
+                                  return_value={"ok": False,
+                                                "why": "independent review missing"}) as gate, \
                 mock.patch.object(merge_queue, "actor_family", side_effect=_family), \
                 mock.patch("ameesh.packet_reviews.is_vehicle", return_value=True), \
                 mock.patch("ameesh.review_lot.compiled_families",
@@ -615,9 +621,10 @@ class ReadyTest(unittest.TestCase):
                                       "the packet range must not be pre-read")):
             ok, why, _ = fire.ready_verdicts(None, None, self.ROW,
                                             _marks(_mark("frozen", A)),
-                                            repo=None, project=None, target="main")
+                                            repo="/checkout", project=None, target="main")
         self.assertFalse(ok)
         self.assertIn("independent review", why)
+        self.assertEqual(gate.call_args.kwargs["repo"], "/checkout")
 
     def test_a_corrector_author_does_not_review_his_own_work(self):
         # #1515 N1 : les auteurs du delta sont lus avant la porte ; le
@@ -1071,8 +1078,10 @@ class FireDbTest(PgTestCase):
 
     def test_packet_head_passes_without_an_exception(self):
         """#2333 : la tête d'un paquet (`integration/**`) a le droit de fusionner."""
-        lot = self._bare_frozen_lot(branch="integration/paquet-2333")
-        row = fire.give(self.db, lot, sha=A, actor="pilote")
+        with tempfile.TemporaryDirectory() as repo:
+            head = _git_repo(repo)
+            lot = self._bare_frozen_lot(sha=head, branch="integration/paquet-2333")
+            row = fire.give(self.db, lot, sha=head, actor="pilote", repo=repo)
         self.assertEqual(row["kind"], "fire")
 
     def _landing(self, lot, *, branch="lot/1-un-lot", target="main", sha=A):

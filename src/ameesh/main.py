@@ -33,6 +33,10 @@
         | unset [--per-hour] [--per-day] [--agent A]
         mesh budget caps, stored in the database, reloaded live (L70);
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
+  ameesh carte dispatch [--repo R] [--project P] [--branch B] [--manuel]
+        [--dry-run] [--json]
+        dispatch carte.yml (planifie=true) to measure the impact map in its
+        window; the workflow guard still decides (#6777);
   ameesh chat [--harness claude|codex] [--instruction] [--dry-run]
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
@@ -514,6 +518,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "carte":
+        # #6777 : dispatch de la mesure de la carte dans sa fenêtre
+        from . import carte
+        return carte.main(rest)
     if command == "service":
         # L65 : services utilisateur (launchd sur macOS)
         from . import service

@@ -1738,7 +1738,9 @@ def prepare_target(cfg, db, item: Mapping, head: str, *,
                            " frozen diff" % head[:12])
     base = lot_class.default_base(cfg, item, repo)
     if not base:
-        return Unavailable("no target branch known for lot #%d" % int(item["id"]))
+        # #6769 : un dépôt compagnon sans cible déclarée est refusé nommément.
+        return Unavailable(lot_class.companion_refusal(cfg, item, repo)
+                           or "no target branch known for lot #%d" % int(item["id"]))
     try:
         sha = review_target.resolve(repo, base, fetch=fetch)
     except (review_target.TargetError, canon_mod.GitError) as exc:

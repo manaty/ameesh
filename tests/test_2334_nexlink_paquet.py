@@ -167,8 +167,10 @@ class NexlinkFireLandTest(PgTestCase):
             "packet-exception incident sha=%s reason=develop rouge 18/10" % A])
 
     def test_an_integration_packet_fires_on_develop(self):
+        # #6765: a packet fire names a fixture checkout, never the caller cwd.
+        _git(self.tmp, "init", "-q", "-b", "develop")
         lot = self._lot(branch=PAQUET)
-        row = fire.give(self.db, lot, sha=A, actor="pilote")
+        row = fire.give(self.db, lot, sha=A, actor="pilote", repo=self.tmp)
         self.assertEqual(row["kind"], "fire")
 
     def _landing(self, lot, *, branch=BRANCHE, target="develop", sha=A):

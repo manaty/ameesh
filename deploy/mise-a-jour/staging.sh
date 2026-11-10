@@ -134,7 +134,11 @@
 # dans l'ordre ci-dessus : installer, [poste] role, redemarrer, controler,
 # sante (unites, baux et doctor par `controler`, puis courrier reellement remis
 # par une sonde). Un echec = retour automatique de l'HOTE (previous-sha),
-# controle du retour, arret de la sequence et courrier urgent au pilote. Rien
+# controle du retour, arret de la sequence et courrier urgent au pilote. Un
+# hote deja au commit vise avant la sequence n'a rien a annuler : aucun retour
+# n'est lance, car previous-sha (celui de l'installation d'avant) redescendrait
+# sous le SHA vise, donc sous le SHA atteste (#6778) ; la trace porte
+# `retour`/`sans-objet`, la sequence s'arrete et le pilote est notifie. Rien
 # n'est repris apres un echec ; relancer la commande est sur : un hote deja au
 # commit vise ne le reinstallle pas (le previous-sha reste le bon).
 # Un seul operateur a la fois : un second passage sort en 75 (verrou
@@ -155,8 +159,19 @@
 set -euo pipefail
 shopt -s inherit_errexit
 
+# #6761 : l'executeur eLu transmet la source de sa config (nom de variable,
+# jamais sa valeur) : la sequence garde CE DSN et retire les autres alias.
+# Sans source nommee, rien n'est herite, comme avant (poste.sh/vm.sh).
+preparer_env_sequence() {
+  local source=${AMEESH_SEQUENCE_DSN:-} var
+  for var in AMEESH_DSN AGENT_MESH_DSN AMEESH_DATABASE_URL AGENT_MESH_DATABASE_URL; do
+    if [ -z "$source" ] || [ "$var" != "$source" ]; then
+      unset "$var"
+    fi
+  done
+}
 # Jamais la base d'un environnement herite (meme piege que poste.sh/vm.sh).
-unset AMEESH_DSN AGENT_MESH_DSN
+preparer_env_sequence
 
 BASCULE_ENV=${BASCULE_ENV:-$HOME/.config/ameesh/bascule.env}
 [ -r "$BASCULE_ENV" ] || { echo "parametres absents : $BASCULE_ENV" >&2; exit 2; }
@@ -343,6 +358,9 @@ var_sonde_de() { printf 'SONDE_%s\n' "$(printf '%s' "$1" | tr 'a-z.-' 'A-Z__')";
 declare -A CIBLE=()
 declare -A FICHIER_HOTE=()
 declare -A CHOISI=()   #: selection normalisee de --hotes (un nom = une entree)
+#: #6778 : 1 = hote deja au commit vise avant la sequence (installation
+#: ignoree) ; un retour previous-sha le ferait redescendre sous le SHA atteste.
+declare -A DEJA_A_CIBLE=()
 POSTE_ABSENT=0
 POSTE_RAISON=""
 HOTES=()
@@ -664,6 +682,10 @@ poste_transitoire() {  # redemarrer|retour
   local unite="poste-maj-staging-$$-$1" env_args=()
   env_args+=(--setenv=BASCULE_ENV="$BASCULE_ENV")
   [ -n "${AMEESH_CONFIG:-}" ] && env_args+=(--setenv=AMEESH_CONFIG="$AMEESH_CONFIG")
+  # #6761 : la source du DSN est transmise par son NOM ; systemd-run en copie
+  # la valeur depuis l'environnement du lanceur, jamais sur la ligne de
+  # commande ni dans un journal.
+  [ -n "${AMEESH_SEQUENCE_DSN:-}" ] && env_args+=(--setenv="$AMEESH_SEQUENCE_DSN")
   systemd-run --user --collect --wait --pipe --unit "$unite" \
     --working-directory "$PWD" "${env_args[@]}" "$POSTE_SH" "$@"
 }
@@ -992,6 +1014,11 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   if [ "$SANS_RETOUR" = 1 ]; then
     retour_desactive "$nom" "$ou" "$detail" "$complement"
   fi
+  # #6778 : rien n'a ete installe sur un hote deja au commit vise ; rejouer
+  # previous-sha le ferait redescendre sous le SHA vise (atteste).
+  if [ "${DEJA_A_CIBLE[$nom]:-0}" = 1 ]; then
+    retour_inutile "$nom" "$ou" "$detail" "$complement"
+  fi
   etape "$nom : retour automatique (previous-sha)"
   if ! exec_hote "$nom" retour; then
     trace "$nom" retour ko "le retour lui-meme a echoue"
@@ -1011,6 +1038,22 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   notifier "staging #1155 : $nom en echec, retour effectue" \
     "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail). Retour automatique effectue et controle (unites, baux, doctor). Sequence arretee avant les hotes suivants : rien d'autre n'a ete modifie.$complement Trace : $JOURNAL"
   echo "sequence arretee sur $nom (retour effectue et controle)" >&2
+  exit 1
+}
+
+# #6778 : un hote deja au commit vise avant la sequence n'a rien a annuler.
+# « retour » rejouerait le previous-sha conserve (celui de l'installation
+# d'avant), donc un commit anterieur au SHA vise : il redescendrait sous le SHA
+# atteste (AG2 7e1c5fe -> 8bdc815, run fcc24db8). Aucun geste de code : trace,
+# arret de la sequence et courrier au pilote.
+retour_inutile() {  # nom etape detail complement
+  local nom=$1 ou=$2 detail=$3 complement=$4 precedent
+  precedent=$(precedent_retour "$nom" || true)
+  trace "$nom" retour sans-objet \
+    "hote deja au commit $SHA_TRAVE avant la sequence : aucun retour (previous-sha ${precedent:-illisible} redescendrait sous le SHA vise)"
+  notifier "staging #6778 : $nom en echec, aucun retour (deja au commit vise)" \
+    "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail). $nom etait deja au commit vise avant cette sequence : aucun retour automatique n'a ete lance, car previous-sha (${precedent:-illisible}) le ferait redescendre sous le SHA atteste. $nom reste sur $SHA_TRAVE. Sequence arretee avant les hotes suivants ; rien d'autre n'a ete modifie.$complement Trace : $JOURNAL"
+  echo "sequence arretee sur $nom (aucun retour : hote deja au commit vise)" >&2
   exit 1
 }
 
@@ -1110,9 +1153,23 @@ publier_suivi() {  # etat [options de staging_watch…]
     "$SUIVI_DELAI" "$NOTIF_STAGING" "$etat" "$DEPUIS" "$SUIVI_COURANTE" \
     "$SUIVI_PROGRES" "$SUIVI_SILENCE_S" "$SUIVI_PLAFOND_TOUR_S" \
     "$SUIVI_BASE_HOTE_S" "$SUIVI_RUNNERS_DEFAUT" "${HOTE_LOCAL:-}" <<'PY'
-import calendar, json, os, sys, time
+import calendar, json, os, re, sys, time
 (path, run, sha, start, duration, notify, state, since, current_path,
  runners_path, silence, cap, base, default_runners, launcher_host) = sys.argv[1:]
+
+# #6761 : la sequence NOMME sa derniere erreur, bornee et expurgee, pour que la
+# demande en echec et son alerte disent la cause reelle. Jamais un DSN ni un
+# secret : le texte est nettoye ici, avant d'entrer dans le journal partage.
+def public_reason(value, limit=300):
+    text = ' '.join(str(value or '').split())
+    if not text:
+        return ''
+    text = re.sub(r'\bpostgres(?:ql)?://\S+', '<dsn>', text, flags=re.I)
+    text = re.sub(r'\b(?:bearer|basic)\s+\S+', '<credentials>', text, flags=re.I)
+    text = re.sub(r'(?i)\b(password|passwd|pwd|secret|token|dsn|'
+                  r'database_url|ameesh_dsn|agent_mesh_dsn)\s*[:=]\s*\S+',
+                  r'\1=<secret>', text)
+    return text[:limit]
 duration = float(duration)
 if not 0 < duration < float('inf'):
     raise SystemExit('STAGING_TIMEOUT_S must be finite and positive')
@@ -1122,6 +1179,7 @@ if not (0 < silence < float('inf') and 0 < cap < float('inf') and 0 <= base < fl
 def epoch(stamp):
     return float(calendar.timegm(time.strptime(stamp, '%Y-%m-%dT%H:%M:%SZ')))
 hosts, first, last_line = {}, {}, {}
+last_error = ''
 progress = float(start)
 with open(path, encoding='utf-8') as stream:
     for number, line in enumerate(stream):
@@ -1136,6 +1194,8 @@ with open(path, encoding='utf-8') as stream:
                 started = at
             first.setdefault(row['hote'], started)
             last_line[row['hote']] = number
+            if row.get('verdict') == 'ko' and row.get('detail'):
+                last_error = str(row['detail'])
             progress = max(progress, at)
             # #5691 : la trace `installer ok` est la seule preuve que la cible
             # a ete installee sur cet hote. Le marqueur se garde sur les etapes
@@ -1185,10 +1245,15 @@ if host:
         hosts[host] = {'stage': stage, 'verdict': 'en-cours', 'since': began,
                        'deadline': first[host] + budget,
                        'installed': bool(hosts.get(host, {}).get('installed'))}
-print(json.dumps(dict(run=run, sha=sha, started=float(start),
-                     deadline=float(start)+duration, state=state, host=launcher_host,
-                     hosts=hosts, notify=notify, beat=time.time(), progress=progress,
-                     silence_s=silence, stall_s=stall)))
+snapshot = dict(run=run, sha=sha, started=float(start),
+                deadline=float(start)+duration, state=state, host=launcher_host,
+                hosts=hosts, notify=notify, beat=time.time(), progress=progress,
+                silence_s=silence, stall_s=stall)
+if state == 'failed':
+    reason = public_reason(last_error)
+    if reason:
+        snapshot['reason'] = reason
+print(json.dumps(snapshot))
 PY
   ) || return
   py_sequence "$SUIVI_PY" "$instantane" "$@"
@@ -1269,6 +1334,15 @@ arret_surveillance() {
     if [ "$SANS_RETOUR" = 1 ]; then
       retour_desactive "$hote" "${etape_ouverte:-surveillance}" \
         "arret demande par la surveillance de progression" ""
+    fi
+    # #6778 : un hote deja au commit vise avant la sequence n'a rien a annuler ;
+    # aucun etat de retour n'est laisse au superviseur (pas de `retour` a jouer,
+    # previous-sha redescendrait sous le SHA vise).
+    if [ "${DEJA_A_CIBLE[$hote]:-0}" = 1 ]; then
+      trace "$hote" "${etape_ouverte:-surveillance}" ko \
+        "arret demande par la surveillance de progression ; aucun retour : hote deja au commit $SHA_TRAVE avant la sequence"
+      echo "staging arrete par la surveillance (aucun retour : $hote etait deja au commit vise)" >&2
+      exit 1
     fi
     # L'etat reste dans le worktree, que le superviseur conserve jusqu'a la
     # fin du retour ; aucun secret n'y est ecrit.
@@ -1483,11 +1557,13 @@ fi
 # --- sequence par hote ----------------------------------------------------
 for nom in "${HOTES[@]}"; do
   installe=$(sha_installe "$nom" || true)
+  DEJA_A_CIBLE[$nom]=0
   # le poste publie un nom court (src-<7>) ; les VM un SHA complet : comparer
   # le prefixe installe au prefixe correspondant de la cible.
   if [ -n "$installe" ] && [ "$installe" = "${SHA:0:${#installe}}" ]; then
     # rien n'est reinstallé : « retour » rejouerait le previous-sha conserve,
     # pas la version courante (avis R1 N2).
+    DEJA_A_CIBLE[$nom]=1
     PRECEDENT=$(precedent_retour "$nom" || true)
     etape "$nom : deja au commit $SHA_TRAVE — installation ignoree (previous-sha preserve)"
     trace "$nom" installer ok "deja installe (${installe:0:9})"
