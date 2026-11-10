@@ -155,8 +155,19 @@
 set -euo pipefail
 shopt -s inherit_errexit
 
+# #6761 : l'executeur eLu transmet la source de sa config (nom de variable,
+# jamais sa valeur) : la sequence garde CE DSN et retire les autres alias.
+# Sans source nommee, rien n'est herite, comme avant (poste.sh/vm.sh).
+preparer_env_sequence() {
+  local source=${AMEESH_SEQUENCE_DSN:-} var
+  for var in AMEESH_DSN AGENT_MESH_DSN AMEESH_DATABASE_URL AGENT_MESH_DATABASE_URL; do
+    if [ -z "$source" ] || [ "$var" != "$source" ]; then
+      unset "$var"
+    fi
+  done
+}
 # Jamais la base d'un environnement herite (meme piege que poste.sh/vm.sh).
-unset AMEESH_DSN AGENT_MESH_DSN
+preparer_env_sequence
 
 BASCULE_ENV=${BASCULE_ENV:-$HOME/.config/ameesh/bascule.env}
 [ -r "$BASCULE_ENV" ] || { echo "parametres absents : $BASCULE_ENV" >&2; exit 2; }
@@ -664,6 +675,10 @@ poste_transitoire() {  # redemarrer|retour
   local unite="poste-maj-staging-$$-$1" env_args=()
   env_args+=(--setenv=BASCULE_ENV="$BASCULE_ENV")
   [ -n "${AMEESH_CONFIG:-}" ] && env_args+=(--setenv=AMEESH_CONFIG="$AMEESH_CONFIG")
+  # #6761 : la source du DSN est transmise par son NOM ; systemd-run en copie
+  # la valeur depuis l'environnement du lanceur, jamais sur la ligne de
+  # commande ni dans un journal.
+  [ -n "${AMEESH_SEQUENCE_DSN:-}" ] && env_args+=(--setenv="$AMEESH_SEQUENCE_DSN")
   systemd-run --user --collect --wait --pipe --unit "$unite" \
     --working-directory "$PWD" "${env_args[@]}" "$POSTE_SH" "$@"
 }
@@ -1110,9 +1125,23 @@ publier_suivi() {  # etat [options de staging_watch…]
     "$SUIVI_DELAI" "$NOTIF_STAGING" "$etat" "$DEPUIS" "$SUIVI_COURANTE" \
     "$SUIVI_PROGRES" "$SUIVI_SILENCE_S" "$SUIVI_PLAFOND_TOUR_S" \
     "$SUIVI_BASE_HOTE_S" "$SUIVI_RUNNERS_DEFAUT" "${HOTE_LOCAL:-}" <<'PY'
-import calendar, json, os, sys, time
+import calendar, json, os, re, sys, time
 (path, run, sha, start, duration, notify, state, since, current_path,
  runners_path, silence, cap, base, default_runners, launcher_host) = sys.argv[1:]
+
+# #6761 : la sequence NOMME sa derniere erreur, bornee et expurgee, pour que la
+# demande en echec et son alerte disent la cause reelle. Jamais un DSN ni un
+# secret : le texte est nettoye ici, avant d'entrer dans le journal partage.
+def public_reason(value, limit=300):
+    text = ' '.join(str(value or '').split())
+    if not text:
+        return ''
+    text = re.sub(r'\bpostgres(?:ql)?://\S+', '<dsn>', text, flags=re.I)
+    text = re.sub(r'\b(?:bearer|basic)\s+\S+', '<credentials>', text, flags=re.I)
+    text = re.sub(r'(?i)\b(password|passwd|pwd|secret|token|dsn|'
+                  r'database_url|ameesh_dsn|agent_mesh_dsn)\s*[:=]\s*\S+',
+                  r'\1=<secret>', text)
+    return text[:limit]
 duration = float(duration)
 if not 0 < duration < float('inf'):
     raise SystemExit('STAGING_TIMEOUT_S must be finite and positive')
@@ -1122,6 +1151,7 @@ if not (0 < silence < float('inf') and 0 < cap < float('inf') and 0 <= base < fl
 def epoch(stamp):
     return float(calendar.timegm(time.strptime(stamp, '%Y-%m-%dT%H:%M:%SZ')))
 hosts, first, last_line = {}, {}, {}
+last_error = ''
 progress = float(start)
 with open(path, encoding='utf-8') as stream:
     for number, line in enumerate(stream):
@@ -1136,6 +1166,8 @@ with open(path, encoding='utf-8') as stream:
                 started = at
             first.setdefault(row['hote'], started)
             last_line[row['hote']] = number
+            if row.get('verdict') == 'ko' and row.get('detail'):
+                last_error = str(row['detail'])
             progress = max(progress, at)
             # #5691 : la trace `installer ok` est la seule preuve que la cible
             # a ete installee sur cet hote. Le marqueur se garde sur les etapes
@@ -1185,10 +1217,15 @@ if host:
         hosts[host] = {'stage': stage, 'verdict': 'en-cours', 'since': began,
                        'deadline': first[host] + budget,
                        'installed': bool(hosts.get(host, {}).get('installed'))}
-print(json.dumps(dict(run=run, sha=sha, started=float(start),
-                     deadline=float(start)+duration, state=state, host=launcher_host,
-                     hosts=hosts, notify=notify, beat=time.time(), progress=progress,
-                     silence_s=silence, stall_s=stall)))
+snapshot = dict(run=run, sha=sha, started=float(start),
+                deadline=float(start)+duration, state=state, host=launcher_host,
+                hosts=hosts, notify=notify, beat=time.time(), progress=progress,
+                silence_s=silence, stall_s=stall)
+if state == 'failed':
+    reason = public_reason(last_error)
+    if reason:
+        snapshot['reason'] = reason
+print(json.dumps(snapshot))
 PY
   ) || return
   py_sequence "$SUIVI_PY" "$instantane" "$@"

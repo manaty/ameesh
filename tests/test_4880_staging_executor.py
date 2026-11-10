@@ -34,7 +34,8 @@ class ExecutorTest(unittest.TestCase):
                             repo=str(self.root), bascule_env=str(self.bascule),
                             github="o/r", config_path=str(self.root / "staging.json"),
                             quiescence_probe=["prove-old-and-remote-operations-stopped"])
-        self.cfg = types.SimpleNamespace(host="host-a")
+        self.cfg = types.SimpleNamespace(host="host-a", config_path="",
+                                         dsn="", schema="")
         self.request = dict(request="request-1", sha="a" * 40, state="pending")
         self.proofs = []
         self.attested = []
@@ -75,6 +76,9 @@ class ExecutorTest(unittest.TestCase):
             mock.patch.object(executor, "fingerprints", return_value=({}, None)),
             mock.patch.object(executor, "tree_problem", return_value=None),
             mock.patch.object(executor, "forge_ci", return_value=(None, "CI green")),
+            # #6761: the preparation's own tests are SequenceConfigTest.
+            mock.patch.object(executor, "sequence_problem", return_value=None),
+            mock.patch.object(executor, "publish_sequence_readiness"),
         ]
         for patch in patches:
             self.addCleanup(patch.stop)
@@ -544,6 +548,230 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(env["STAGING_RUN_ID"], result["run"])
         self.assertNotIn("STAGING_PREVIOUS_RUN", env)
         self.assertNotIn("STAGING_PREVIOUS_HOST", env)
+
+    def test_a_sequence_config_refusal_blocks_before_any_take(self):
+        executor.sequence_problem.return_value = "different base (db; executor other)"
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertTrue(result["reason"].startswith(executor.SEQUENCE_REFUSAL))
+        # the request stays pending for another candidate: no run, no host act
+        self.assertEqual(self.request["state"], "pending")
+        self.assertEqual(self.request["blocked_reason"], result["reason"])
+        self.assertIn("sequence_config", self.request)
+        executor.role_run._run_under_lease.assert_not_called()
+
+    def test_a_previous_reason_does_not_survive_a_new_failure(self):
+        self.request.update(reason="old failure", exit=2)
+        executor.role_run._run_under_lease.side_effect = lambda *a, **k: (1, False)
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "failed")
+        self.assertNotIn("reason", result)
+
+    def test_a_failed_sequence_reason_is_copied_redacted_on_the_request(self):
+        def failing(argv, env, *_args, **_kwargs):
+            self.calls.append((argv, env))
+            self.proofs = [dict(data=dict(
+                state="failed",
+                reason="installer ko postgres://user:secret@db/ameesh token=abc"))]
+            return 1, False
+        executor.role_run._run_under_lease.side_effect = failing
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["exit"], 1)
+        self.assertIn("<dsn>", result["reason"])
+        self.assertNotIn("secret", result["reason"])
+        self.assertNotIn("user:", result["reason"])
+        self.assertEqual(self.request["reason"], result["reason"])
+
+
+class SequenceConfigTest(unittest.TestCase):
+    """#6761: the sequence resolves the executor's base, or refuses by name."""
+
+    DSN = "postgresql://user:secret@db:5432/ameesh"
+
+    def cfg(self, path=""):
+        return types.SimpleNamespace(host="host-a", config_path=path,
+                                     dsn=self.DSN, schema="public")
+
+    def test_the_loaded_file_and_dsn_source_are_transmitted_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "config.json")
+            Path(path).write_text("{}", encoding="utf-8")
+            env = {"AMEESH_CONFIG": "/other.json",
+                   "AGENT_MESH_CONFIG": "/legacy.json",
+                   "AMEESH_DSN": self.DSN,
+                   "AMEESH_DATABASE_URL": "postgresql://user:secret@other/db"}
+            descriptor = executor.sequence_config(self.cfg(path), env)
+        self.assertEqual(env["AMEESH_CONFIG"], path)
+        # the source is named, never quoted: no secret in the child's argv
+        self.assertEqual(env["AMEESH_SEQUENCE_DSN"], "AMEESH_DSN")
+        self.assertEqual(env["AMEESH_DSN"], self.DSN)
+        self.assertNotIn("AMEESH_DATABASE_URL", env)
+        self.assertNotIn("AGENT_MESH_CONFIG", env)
+        self.assertEqual(descriptor["path"], path)
+        self.assertEqual(descriptor["source"], "file:env:AMEESH_DSN")
+        self.assertEqual(descriptor["schema"], "public")
+        self.assertNotIn("secret", descriptor["dsn"])
+
+    def test_without_a_read_file_the_sequence_gets_no_inherited_config(self):
+        env = {"AMEESH_CONFIG": "/elsewhere.json", "AGENT_MESH_CONFIG": "/x",
+               "AMEESH_DSN": self.DSN}
+        descriptor = executor.sequence_config(self.cfg(""), env)
+        self.assertNotIn("AMEESH_CONFIG", env)
+        self.assertNotIn("AGENT_MESH_CONFIG", env)
+        self.assertEqual(descriptor["path"], "")
+        self.assertEqual(descriptor["source"], "default:env:AMEESH_DSN")
+
+    def test_a_unit_without_the_current_name_still_gets_the_file_read(self):
+        # #6761 witness: the unit exports no AMEESH_CONFIG (AG1), the executor
+        # resolved its configuration another way; the sequence gets the file
+        # the executor actually read, not the ambient alias.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "profile.json")
+            Path(path).write_text("{}", encoding="utf-8")
+            env = {"AGENT_MESH_CONFIG": "/stale.json", "AMEESH_DSN": self.DSN}
+            descriptor = executor.sequence_config(self.cfg(path), env)
+        self.assertEqual(env["AMEESH_CONFIG"], path)
+        self.assertNotIn("AGENT_MESH_CONFIG", env)
+        self.assertEqual(descriptor["path"], path)
+
+    def test_public_reason_bounds_and_redacts_a_sequence_error(self):
+        reason = executor.public_reason(
+            "postgres://user:secret@db/x password=hunter2 token=abc " + "x" * 500)
+        self.assertNotIn("secret", reason)
+        self.assertNotIn("hunter2", reason)
+        self.assertNotIn("postgres://", reason)
+        self.assertIn("<dsn>", reason)
+        self.assertLessEqual(len(reason), 300)
+        self.assertEqual(executor.public_reason(""), "")
+
+    def test_an_unresolvable_config_is_a_named_refusal(self):
+        with mock.patch("ameesh.config.load",
+                        side_effect=SystemExit("config file not found: /x")):
+            problem = executor.sequence_problem(self.cfg(), {})
+        self.assertTrue(problem.startswith("unresolvable ("))
+        self.assertIn("config file not found", problem)
+
+    def test_an_empty_dsn_is_refused_never_the_local_socket(self):
+        resolved = types.SimpleNamespace(dsn="", schema="")
+        cfg = types.SimpleNamespace(host="host-a", config_path="",
+                                    dsn="", schema="")
+        with mock.patch("ameesh.config.load", return_value=resolved), \
+             mock.patch("ameesh.db.connect") as connect:
+            problem = executor.sequence_problem(cfg, {})
+        self.assertIn("empty dsn", problem)
+        self.assertIn("local socket", problem)
+        connect.assert_not_called()
+
+    def test_another_base_is_refused_before_any_connection(self):
+        resolved = types.SimpleNamespace(dsn="postgresql://user:secret@other/db",
+                                         schema="public")
+        with mock.patch("ameesh.config.load", return_value=resolved), \
+             mock.patch("ameesh.db.connect") as connect:
+            problem = executor.sequence_problem(self.cfg(), {})
+        self.assertTrue(problem.startswith("different base"))
+        connect.assert_not_called()
+
+    def test_an_unreachable_base_is_a_named_refusal(self):
+        resolved = types.SimpleNamespace(dsn=self.DSN, schema="public")
+        with mock.patch("ameesh.config.load", return_value=resolved), \
+             mock.patch("ameesh.db.connect",
+                        side_effect=RuntimeError("dial tcp: refused")), \
+             mock.patch("ameesh.db.explain",
+                        return_value="dial tcp: refused"):
+            problem = executor.sequence_problem(self.cfg(), {})
+        self.assertTrue(problem.startswith("unreachable"))
+        self.assertIn("refused", problem)
+
+    def test_the_probe_connects_and_selects_on_the_same_base(self):
+        resolved = types.SimpleNamespace(dsn=self.DSN, schema="public")
+        connection = mock.Mock()
+        with mock.patch("ameesh.config.load", return_value=resolved), \
+             mock.patch("ameesh.db.connect", return_value=connection):
+            self.assertIsNone(executor.sequence_problem(self.cfg(), {}))
+        connection.query.assert_called_once_with("select 1 as sequence_probe")
+        connection.close.assert_called_once()
+
+    def test_the_quiescence_targets_are_all_reachable_or_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bascule.env"
+            path.write_text('HOTES_STAGING="ameesh-agents-1=root@a1 '
+                            'ameesh-agents-2=root@a2 pc-smichea=poste"\n'
+                            'QUIESCENCE_ABSENTS="ameesh-agents-2"\n',
+                            encoding="utf-8")
+            path.chmod(0o600)
+            done = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            with mock.patch.object(executor, "_program",
+                                   return_value="ssh"), \
+                 mock.patch.object(executor, "path_problem",
+                                   return_value=None), \
+                 mock.patch.object(executor.subprocess, "run",
+                                   return_value=done) as run:
+                problem = executor.quiescence_access_problem(
+                    {}, {"bascule_env": str(path)})
+        self.assertIsNone(problem)
+        self.assertEqual(run.call_args.args[0],
+                         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                          "root@a1", "true"])
+
+    def test_an_unreachable_target_is_a_named_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bascule.env"
+            path.write_text('HOTES_STAGING="ameesh-agents-1=root@a1"\n',
+                            encoding="utf-8")
+            path.chmod(0o600)
+            done = types.SimpleNamespace(
+                returncode=255, stdout="",
+                stderr="ssh: connect to host a1: refused")
+            with mock.patch.object(executor, "_program",
+                                   return_value="ssh"), \
+                 mock.patch.object(executor, "path_problem",
+                                   return_value=None), \
+                 mock.patch.object(executor.subprocess, "run",
+                                   return_value=done):
+                problem = executor.quiescence_access_problem(
+                    {}, {"bascule_env": str(path)})
+        self.assertTrue(problem.startswith(
+            "quiescence access: ameesh-agents-1 unreachable"))
+        self.assertIn("refused", problem)
+
+    def test_a_sequence_problem_includes_the_quiescence_access(self):
+        resolved = types.SimpleNamespace(dsn=self.DSN, schema="public")
+        with mock.patch("ameesh.config.load", return_value=resolved), \
+             mock.patch("ameesh.db.connect"), \
+             mock.patch.object(executor, "quiescence_access_problem",
+                               return_value="quiescence access: x"):
+            problem = executor.sequence_problem(
+                self.cfg(), {}, {"bascule_env": "/b"})
+        self.assertEqual(problem, "quiescence access: x")
+
+    def test_a_failed_preparation_is_published_for_the_election(self):
+        events = mock.Mock()
+        events.recent_type.return_value = []
+        store = types.SimpleNamespace(events=events)
+        cfg = types.SimpleNamespace(host="host-a")
+        with mock.patch.object(executor.storage, "of", return_value=store):
+            executor.publish_sequence_readiness(
+                object(), cfg, {"role": "mesh-design", "key": "mesh"},
+                "unreachable (dial tcp)", {"path": "/c", "source": "file"})
+        events.record.assert_called_once()
+        kind, obj, _project, data = events.record.call_args.args
+        self.assertEqual(kind, executor.SEQUENCE_EVENT)
+        self.assertEqual(obj, "staging-executor:mesh-design:host-a")
+        self.assertFalse(data["ready"])
+        self.assertEqual(data["diagnostic"], "unreachable (dial tcp)")
+
+    def test_a_recovery_is_published_at_once(self):
+        events = mock.Mock()
+        events.recent_type.return_value = [
+            dict(data={"ready": False}, ts=time.time())]
+        store = types.SimpleNamespace(events=events)
+        with mock.patch.object(executor.storage, "of", return_value=store):
+            executor.publish_sequence_readiness(
+                object(), types.SimpleNamespace(host="host-a"),
+                {"role": "mesh-design", "key": "mesh"}, None, {})
+        events.record.assert_called_once()
+        self.assertTrue(events.record.call_args.args[3]["ready"])
 
 
 class GuardedStopTest(unittest.TestCase):

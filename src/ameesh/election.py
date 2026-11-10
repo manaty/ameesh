@@ -288,6 +288,54 @@ def _harness_reason(role: Mapping) -> str:
     return ""
 
 
+#: #6761: a staging preparation proof older than this says nothing about the
+#: candidate any more; the executor republishes its verdict at most every five
+#: minutes, so this only covers missed passes.
+STAGING_PREP_S = 900.0
+
+#: #6761: the executor's preparation publishes one event per role and host.
+STAGING_PREP_EVENT = "staging.executor"
+
+
+def _staging_reason(db, role: Mapping, host: str) -> str:
+    """#6761: a candidate that cannot deploy is not ready for the role.
+
+    The elected staging executor proves, before taking any request, that a
+    sequence on this host resolves the same base (same `config.load` and
+    `db.connect` as `staging_watch`) and publishes the verdict here. A fresh
+    failure makes the candidate non-eligible for the role rank, so the
+    election never keeps a host that would only refuse at take time (#6532,
+    auditor #209624). Absence of a proof is not a failure: a role without a
+    staging executor publishes none, and a stale one is ignored.
+    """
+    name = role.get("name") or ""
+    if not name:
+        return ""
+    object_name = "staging-executor:%s:%s" % (name, host)
+    try:
+        rows = storage.of(db).events.recent_type(
+            STAGING_PREP_EVENT, None, 1, object=object_name)
+    except db_mod.Unavailable:
+        raise
+    except db_mod.DbError as exc:
+        return "staging preparation unreadable (%s)" % db_mod.explain(exc)
+    if not rows:
+        return ""
+    row = rows[0]
+    data = row.get("data") or {}
+    if data.get("ready") is not False:
+        return ""
+    try:
+        age = pg.now_ts(db) - float(row.get("ts") or 0)
+    except (TypeError, ValueError):
+        return "staging preparation unreadable (timestamp)"
+    if not 0 <= age <= STAGING_PREP_S:
+        return ""
+    diagnostic = " ".join(str(data.get("diagnostic") or "").split())[:300]
+    return "staging preparation failed%s" % (
+        (": " + diagnostic) if diagnostic else "")
+
+
 def local_readiness(cfg, db, role: Mapping, host: str) -> tuple[bool, str]:
     """What only the candidate host can know: could a turn start there?
 
@@ -303,6 +351,9 @@ def local_readiness(cfg, db, role: Mapping, host: str) -> tuple[bool, str]:
     auth = _auth_reason(cfg, db, role, host)
     if auth:
         reasons.append(auth)
+    staging = _staging_reason(db, role, host)
+    if staging:
+        reasons.append(staging)
     if not reasons:
         from . import account_turn
         try:

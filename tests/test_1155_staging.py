@@ -262,7 +262,14 @@ for arg in args:
     elif arg == '--working-directory':
         cwd = next(args)
     elif arg.startswith('--setenv='):
-        name, value = arg.removeprefix('--setenv=').split('=', 1)
+        # #6761 : sans « =valeur », systemd-run copie la variable de
+        # l'environnement de l'appelant (le nom seul, jamais le secret en
+        # ligne de commande).
+        item = arg.removeprefix('--setenv=')
+        if '=' in item:
+            name, value = item.split('=', 1)
+        else:
+            name, value = item, os.environ.get(item, '')
         env[name] = value
     else:
         command = [arg, *args]
@@ -583,6 +590,62 @@ class StagingTest(unittest.TestCase):
         for cle in env:
             if cle.startswith(ENV_PREFIXES):
                 self.assertIn(cle, ENV_BAC, 'variable heritee : %s' % cle)
+
+    def test_la_seule_source_nommee_du_dsn_survit_au_filtre(self):
+        """#6761 : l'executeur nomme la source ; la sequence garde ce DSN seul.
+
+        Un nom sans valeur : `AMEESH_SEQUENCE_DSN` ne contient jamais le
+        secret, et les autres alias sont retires pour que `config.load` ne
+        puisse pas choisir une autre base.
+        """
+        texte = (self.script_dir / 'staging.sh').read_text(encoding='utf-8')
+        debut = texte.index('preparer_env_sequence() {')
+        fin = texte.index('\n}', debut) + 2
+        script = (texte[debut:fin]
+                  + '\npreparer_env_sequence\n'
+                  + 'printf "%s|%s|%s|%s|%s\\n"'
+                  ' "${AMEESH_DSN:-}" "${AGENT_MESH_DSN:-}"'
+                  ' "${AMEESH_DATABASE_URL:-}" "${AGENT_MESH_DATABASE_URL:-}"'
+                  ' "${AMEESH_SEQUENCE_DSN:-}"\n')
+        env = {'AMEESH_SEQUENCE_DSN': 'AMEESH_DATABASE_URL',
+               'AMEESH_DSN': 'other', 'AGENT_MESH_DSN': 'other',
+               'AMEESH_DATABASE_URL': 'kept',
+               'AGENT_MESH_DATABASE_URL': 'other'}
+        p = subprocess.run(['bash', '-c', script], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(),
+                         '||kept||AMEESH_DATABASE_URL')
+
+    def test_la_raison_terminale_est_bornee_et_expurgee(self):
+        """#6761 : l'instantane `failed` porte la derniere erreur nommee.
+
+        Le texte vient du journal (detail `ko`), est borne et nettoye avant
+        publication : aucun DSN, aucun secret dans l'alerte ni dans la demande.
+        """
+        texte = (self.script_dir / 'staging.sh').read_text(encoding='utf-8')
+        bloc = texte.split('instantane=$(python3 - ', 1)[1]
+        bloc = bloc.split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+        travail = self.root / 'raison'
+        travail.mkdir()
+        journal = travail / 'journal.jsonl'
+        journal.write_text(json.dumps({
+            'ts': '2026-11-10T19:15:01Z', 'hote': 'ameesh-agents-1',
+            'etape': 'installer', 'verdict': 'ko', 'sha': self.sha,
+            'detail': 'installer ko postgres://u:secret@db/x refused',
+            'started': 0}) + '\n', encoding='utf-8')
+        args = [str(journal), 'run-1', self.sha, '0', '1800', 'pilot',
+                'failed', '1970-01-01T00:00:00Z', str(travail / 'courante'),
+                str(travail / 'progres'), '900', '1800', '900', '20',
+                'ameesh-agents-1']
+        p = subprocess.run([sys.executable, '-c', bloc, *args],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(p.stdout)
+        self.assertEqual(data['state'], 'failed')
+        self.assertEqual(data['reason'], 'installer ko <dsn> refused')
+        self.assertNotIn('secret', data['reason'])
+        self.assertLessEqual(len(data['reason']), 300)
 
     def test_le_filtre_ecarte_les_replis_du_runner(self):
         """Temoin de non-recidive (#1195) : un banc qui herite du runner garde

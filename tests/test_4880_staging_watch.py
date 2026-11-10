@@ -848,6 +848,29 @@ class HostRepairTest(unittest.TestCase):
             staging_watch.alerts(None, now=250, cfg="cfg")
         found.assert_called_once_with("cfg")
 
+    def test_a_failed_request_names_the_consigned_reason_and_the_exit(self):
+        request = request_row(3, "r1", exit=1,
+                              reason="installer ko postgres://user:secret@db/x")
+        finding, = staging_watch.request_findings(
+            [request], now=250, sequences=[], descends=lambda a, b: False)
+        self.assertIn("failed (exit 1): installer ko", finding["detail"])
+        self.assertNotIn("reprise refusée", finding["detail"])
+
+    def test_a_failed_request_without_a_reason_says_so(self):
+        request = request_row(3, "r1", exit=2)
+        finding, = staging_watch.request_findings(
+            [request], now=250, sequences=[], descends=lambda a, b: False)
+        self.assertIn("failed (exit 2) (aucune erreur nommée)", finding["detail"])
+
+    def test_a_blocked_request_names_the_blocked_reason(self):
+        request = request_row(3, "r1", state="pending",
+                              blocked_reason="sequence config: different base")
+        finding, = staging_watch.request_findings(
+            [request], now=250, sequences=[], descends=lambda a, b: False)
+        self.assertIn("blocked: sequence config: different base",
+                      finding["detail"])
+        self.assertNotIn("reprise refusée", finding["detail"])
+
 
 class AlertGroupTest(unittest.TestCase):
     """#5693: one alert per descending line of failures, hosts still to repair."""

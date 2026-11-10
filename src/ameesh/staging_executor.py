@@ -54,6 +54,17 @@ _SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 #: Every fingerprint refusal starts with this prefix (#5665).
 FINGERPRINT_REFUSAL = "fingerprint: "
+#: #6761: every refusal of the sequence's own configuration starts here.
+SEQUENCE_REFUSAL = "sequence config: "
+#: #6761: the variables `config.load` reads as the DSN, in its priority order.
+DSN_SOURCES = ("AMEESH_DSN", "AGENT_MESH_DSN",
+               "AMEESH_DATABASE_URL", "AGENT_MESH_DATABASE_URL")
+#: #6761: the preparation publishes its probe in the shared log, so the role's
+#: election never ranks a candidate that cannot deploy (one minute timer).
+SEQUENCE_EVENT = "staging.executor"
+#: #6761: the probe's result is republished at most this often; a change is
+#: published at once, so the election sees a failure before the next minute.
+SEQUENCE_REPORT_S = 300.0
 #: The probe's default python, as in quiescence-staging.sh.
 PROBE_PYTHON = ".local/share/ameesh/venv/bin/python"
 #: #5743: a stable venv that only carries launchers (bascule.py) holds this
@@ -271,6 +282,290 @@ def activation_problem(options: dict, env: dict) -> str | None:
         if problem:
             return "program: " + problem
     return None
+
+
+# -- #6761: the sequence's configuration, transmitted and proved --------------
+
+#: A DSN quoted in an error message is never published, password or not: the
+#: alert only has to name the base's host and database through `mask_dsn`.
+_DSN_TEXT = re.compile(r"\bpostgres(?:ql)?://\S+", re.I)
+
+
+def public_reason(value, limit: int = 300) -> str:
+    """A bounded, redacted one-line reason for the shared request (#6761).
+
+    The sequence names its own error; the executor only bounds and redacts it:
+    no DSN, no password, no credential assignment reaches the request or the
+    alert mail. An empty value stays empty, so the snapshot keeps no field.
+    """
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    text = _DSN_TEXT.sub("<dsn>", text)
+    from .activity import redact
+    return redact(text)[:limit]
+
+
+def sequence_config(cfg, env) -> dict:
+    """Pin the executor's own configuration in the sequence's environment.
+
+    #6761: the sequence and its children resolve the base the executor loaded,
+    whatever the unit's ambient environment:
+    * the path of the file actually read (`cfg.config_path`) is passed as
+      `AMEESH_CONFIG`, so a profile or a non-default file keeps working even
+      when the unit does not export anything;
+    * the DSN's *source* is passed by name (`AMEESH_SEQUENCE_DSN`), never its
+      value: `staging.sh` keeps only that variable instead of discarding the
+      inherited DSN, and hands it to its transient units by name.
+
+    Returns the public provenance recorded with the request: file path and
+    source name only, plus the masked DSN that identifies the base.
+    """
+    from . import config as config_mod
+    path = getattr(cfg, "config_path", "") or ""
+    if path and os.path.isfile(path):
+        env["AMEESH_CONFIG"] = os.path.abspath(path)
+        source = "file"
+    else:
+        # No file was read: do not let a stale alias of the unit's
+        # environment pick another one for the sequence.
+        env.pop("AMEESH_CONFIG", None)
+        source = "default"
+    env.pop("AGENT_MESH_CONFIG", None)
+    dsn_source = next((name for name in DSN_SOURCES if env.get(name)), "")
+    # `staging.sh` has always dropped the DSN of an inherited environment.
+    # Only the variable the executor names is a deliberate transmission; every
+    # other alias is removed so `config.load` cannot silently pick another.
+    for name in DSN_SOURCES:
+        if name != dsn_source:
+            env.pop(name, None)
+    if dsn_source:
+        env["AMEESH_SEQUENCE_DSN"] = dsn_source
+        source += ":env:" + dsn_source
+    else:
+        env.pop("AMEESH_SEQUENCE_DSN", None)
+    return {"path": env.get("AMEESH_CONFIG", ""), "source": source,
+            "dsn": config_mod.mask_dsn(cfg.dsn), "schema": cfg.schema or ""}
+
+
+#: #6761: the shell files that hold the staging topology (same rule as
+#: `staging.sh` and `quiescence-staging.sh`).
+_TOPOLOGY_ENVS = ("bascule-a1.env", "bascule-a2.env", "bascule-agents-3.env")
+_VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SSH_TARGET = re.compile(r"[A-Za-z0-9_.@:-]+")
+#: #6761: an unreachable staging target costs at most this long before the
+#: preparation closes on doubt.
+QUIESCENCE_SSH_TIMEOUT_S = 10.0
+
+
+def _bascule_values(path: str) -> dict:
+    """Simple `NAME=value` assignments of a private shell environment file.
+
+    #6761: the topology is read, never sourced: a writable file must not turn
+    the preparation probe into running another account's shell. A value that
+    needs the shell (command substitution, concatenation) stays literal and
+    the topology check refuses it as unreadable, closed on doubt.
+    """
+    values = {}
+    with open(path, encoding="utf-8") as stream:
+        for raw in stream:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            name, sep, value = line.partition("=")
+            name = name.strip()
+            if not sep or not _VARIABLE.fullmatch(name):
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            values[name] = value
+    return values
+
+
+def _topology_targets(env, options):
+    """The staging topology's SSH targets, its declared absents and `ssh`.
+
+    Mirrors `quiescence-staging.sh`: `HOTES_STAGING` from BASCULE_ENV, or the
+    three per-VM files plus `SERVEUR_SSH`/`VM`. `QUIESCENCE_*` overrides are
+    read from the unit's environment and from the file, like the probe does.
+    Returns `(targets, absent, ssh, problem)`; a `problem` is a named refusal.
+    """
+    path = options.get("bascule_env") or env.get("BASCULE_ENV") or ""
+    if not path:
+        return [], set(), "ssh", "BASCULE_ENV absent"
+    problem = path_problem(path)
+    if problem:
+        return [], set(), "ssh", "BASCULE_ENV: " + problem
+    try:
+        values = _bascule_values(path)
+    except OSError as exc:
+        return [], set(), "ssh", "BASCULE_ENV unreadable (%s)" % type(exc).__name__
+    merged = dict(env)
+    merged.update(values)
+    topology = (merged.get("HOTES_STAGING") or "").strip()
+    parsed = []
+    if topology:
+        for entry in topology.split():
+            host, sep, target = entry.partition("=")
+            if not sep or not host or not target:
+                return [], set(), "ssh", "HOTES_STAGING: entree invalide %r" % entry
+            parsed.append((host, target))
+    else:
+        directory = os.path.dirname(os.path.abspath(path))
+        entries = []
+        for name in _TOPOLOGY_ENVS:
+            sub_path = os.path.join(directory, name)
+            problem = path_problem(sub_path, missing_ok=True)
+            if problem:
+                return [], set(), "ssh", "%s: %s" % (name, problem)
+            try:
+                sub = _bascule_values(sub_path)
+            except OSError:
+                continue
+            host, target = sub.get("HOTE_AGENTS", ""), sub.get("AGENTS_SSH", "")
+            if host and target:
+                entries.append((host, target))
+        server = merged.get("SERVEUR_SSH") or (
+            "root@" + merged["VM"] if merged.get("VM") else "")
+        if len(entries) < 3 or not server:
+            return ([], set(), "ssh", "topologie illisible (ni HOTES_STAGING ni "
+                    "bascule-*.env et SERVEUR_SSH complets)")
+        entries.append(("manaty-mesh-1", server))
+        parsed = entries
+    effective = []
+    for host, target in parsed:
+        override = "QUIESCENCE_SSH_" + re.sub(r"[^A-Za-z0-9]", "_", host).upper()
+        target = merged.get(override) or target
+        if target not in ("poste", "local"):
+            if not _SSH_TARGET.fullmatch(target) or target.startswith("-"):
+                return [], set(), "ssh", "cible ssh invalide pour %s" % host
+        effective.append((host, target))
+    absent = set((merged.get("QUIESCENCE_ABSENTS") or "").split())
+    ssh = merged.get("QUIESCENCE_SSH") or "ssh"
+    return effective, absent, ssh, None
+
+
+def quiescence_access_problem(env, options) -> str | None:
+    """#6761: the quiescence probe will reach every staging target, or refuse.
+
+    A candidate that cannot deploy, or cannot prove a previous execution
+    stopped, is never ranked 0 (#6532: AG1 was ranked ready while
+    `quiescence-staging.sh` could not reach `manaty-mesh-1`). The preparation
+    checks the same SSH targets here, before any request is taken; hosts the
+    sequence never touches (`QUIESCENCE_ABSENTS`) and the workstation without
+    a target are not blocking, exactly as in the proof itself.
+    """
+    targets, absent, ssh, problem = _topology_targets(env, options)
+    if problem:
+        return "quiescence access: " + problem
+    to_check = [(host, target) for host, target in targets
+                if host not in absent and host != "pc-smichea"
+                and target not in ("poste", "local")]
+    if not to_check:
+        return None
+    # #5500: the preparation runs only a program no other account can rewrite.
+    program = _program(ssh, env)
+    if not program:
+        return "quiescence access: ssh not found (%s)" % ssh
+    problem = path_problem(program)
+    if problem:
+        return "quiescence access: ssh: " + problem
+    for host, target in to_check:
+        try:
+            done = subprocess.run(
+                [program, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                 target, "true"], env=dict(env), capture_output=True,
+                text=True, timeout=QUIESCENCE_SSH_TIMEOUT_S)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return ("quiescence access: %s unreachable (%s)"
+                    % (host, public_reason(exc, 120)))
+        if done.returncode != 0:
+            detail = public_reason(
+                (done.stderr or done.stdout or "").strip().splitlines()[-1]
+                if (done.stderr or done.stdout or "").strip() else "", 120)
+            return ("quiescence access: %s unreachable (exit %s%s)"
+                    % (host, done.returncode,
+                       (": " + detail) if detail else ""))
+    return None
+
+
+def sequence_problem(cfg, env, options=None) -> str | None:
+    """#6761: the sequence resolves the executor's base, or a named refusal.
+
+    The very `config.load` and `db.connect` of `staging_watch` run here, in the
+    executor's own process, with the environment the sequence will receive
+    (uid included: the service's account). A configuration that does not load,
+    a base that cannot be reached, or another base than the executor's own is
+    closed on doubt: nothing is taken, no run is opened, and the request stays
+    pending for another candidate. With `options`, the quiescence probe's
+    staging accesses are checked too.
+    """
+    from . import config as config_mod
+    from . import db as db_mod
+    try:
+        resolved = config_mod.load(env=dict(env), register_credentials=False)
+    except SystemExit as exc:
+        return "unresolvable (%s)" % public_reason(exc, 200)
+    except Exception as exc:  # noqa: BLE001 - unreadable config is a refusal
+        return "unresolvable (%s: %s)" % (type(exc).__name__,
+                                          public_reason(exc, 180))
+    # #6761: an empty dsn is a named refusal, never the local socket. AG1's
+    # config.json carries an empty `dsn`; the executor lived on the unit's
+    # AMEESH_DSN while its sequence fell back to /var/run/postgresql.
+    if not str(cfg.dsn or "").strip():
+        return ("empty dsn in the executor's configuration "
+                "(the local socket is never a base)")
+    if not str(resolved.dsn or "").strip():
+        return ("unresolvable (empty dsn; the local socket is never a base)")
+    expected = (config_mod.mask_dsn(cfg.dsn), cfg.schema or "")
+    actual = (config_mod.mask_dsn(resolved.dsn), resolved.schema or "")
+    if actual != expected:
+        return ("different base (%s, schema %s; executor %s, schema %s)"
+                % (actual[0], actual[1], expected[0], expected[1]))
+    try:
+        connection = db_mod.connect(resolved, writer=False)
+        try:
+            connection.query("select 1 as sequence_probe")
+        finally:
+            connection.close()
+    except Exception as exc:  # noqa: BLE001 - unreachable is a refusal
+        return "unreachable (%s)" % public_reason(db_mod.explain(exc), 200)
+    if options is not None:
+        return quiescence_access_problem(env, options)
+    return None
+
+
+def publish_sequence_readiness(db, cfg, options, problem, descriptor) -> None:
+    """#6761: publish the preparation's verdict for the role's election.
+
+    Every candidate runs the timer, holder or not. A failure makes the host
+    not ready for the role (`election.local_readiness` reads the newest
+    event), so a candidate that cannot deploy is never ranked 0. The event is
+    rate-limited; a changed verdict is published at once, and a recovery
+    removes the reason on the next pass.
+    """
+    object_name = "staging-executor:%s:%s" % (options.get("role") or "", cfg.host)
+    ready = problem is None
+    try:
+        rows = storage.of(db).events.recent_type(
+            SEQUENCE_EVENT, 1, 1, object=object_name)
+        previous = (rows[0].get("data") or {}) if rows else {}
+        fresh = bool(rows) and time.time() - float(rows[0].get("ts") or 0) \
+            < SEQUENCE_REPORT_S
+        if previous.get("ready") == ready and fresh:
+            return
+        storage.of(db).events.record(
+            SEQUENCE_EVENT, object_name, None,
+            {"key": options.get("key") or "", "role": options.get("role") or "",
+             "host": cfg.host, "ready": ready,
+             "diagnostic": "" if ready else public_reason(problem),
+             "config": descriptor})
+    except Exception as exc:  # noqa: BLE001 - the refusal itself remains
+        print("ameesh: staging preparation not published: %s"
+              % type(exc).__name__, file=sys.stderr)
 
 
 # -- #5665: fingerprints of the probe and its notifier ------------------------
@@ -646,6 +941,18 @@ def tick(db, cfg, options) -> dict:
     host = cfg.host
     if host not in options["candidates"]:
         return {"state": "standby", "reason": "not a candidate"}
+    # #6761: the sequence's configuration is proved on EVERY candidate, holder
+    # or not: the preparation publishes its verdict for the role's election,
+    # so a candidate that cannot deploy is never ranked 0. The probe runs the
+    # same `config.load`/`db.connect` as `staging_watch`, with the environment
+    # the sequence will receive.
+    from .platform.child_environment import execution_transport
+    timeout = options.get("timeout_s", staging_watch.STAGING_FALLBACK_S)
+    env = execution_transport(dict(os.environ, BASCULE_ENV=options["bascule_env"],
+                                   STAGING_TIMEOUT_S=str(timeout)))
+    sequence_settings = sequence_config(cfg, env)
+    sequence_failure = sequence_problem(cfg, env, options)
+    publish_sequence_readiness(db, cfg, options, sequence_failure, sequence_settings)
     elected = role_run.live(db, options["role"])
     if not elected["held"] or elected.get("holder") != host:
         return {"state": "standby", "reason": "another role holder"}
@@ -673,18 +980,24 @@ def tick(db, cfg, options) -> dict:
             return {"state": "idle"}
         def blocked(reason):
             if not execution.lost.is_set():
-                _record(db, options["key"], dict(request, blocked_reason=reason,
-                                                notify=options["role"]), lease=lease)
+                _record(db, options["key"], dict(
+                    request, blocked_reason=reason, notify=options["role"],
+                    sequence_config=sequence_settings), lease=lease)
             return {"state": "blocked", "reason": reason}
         # Read again under the shared lease: a role change at acquisition
         # cannot authorize a new attempt under a stale election result.
         elected = role_run.live(db, options["role"])
         if not elected["held"] or elected.get("holder") != host:
             return {"state": "standby", "reason": "role changed"}
-        from .platform.child_environment import execution_transport
-        timeout = options.get("timeout_s", staging_watch.STAGING_FALLBACK_S)
-        env = execution_transport(dict(os.environ, BASCULE_ENV=options["bascule_env"],
-                   STAGING_TIMEOUT_S=str(timeout)))
+        # #6761: a sequence that cannot resolve the executor's own base never
+        # takes the request: a named refusal, no run, and the request stays
+        # pending for another candidate. The refusal is also what the alerts
+        # pass names, instead of a generic "reprise refusée".
+        if sequence_failure:
+            reason = SEQUENCE_REFUSAL + sequence_failure
+            if request.get("blocked_reason") == reason:
+                return {"state": "blocked", "reason": reason}
+            return blocked(reason)
         # #5500: nothing below may read or run what another account can
         # write. A refusal alerts the pilot (staging_interrupted) and makes
         # no host operation, not even the recovery of a previous attempt.
@@ -830,6 +1143,9 @@ def tick(db, cfg, options) -> dict:
         attempt = dict(request, state="running", host=host, run=uuid.uuid4().hex,
                        started=time.time(), notify=options["role"],
                        deadline=time.time() + timeout, ci=ci_evidence,
+                       # #6761: the configuration this attempt's sequence
+                       # resolves (path and source name only, never a secret).
+                       sequence_config=sequence_settings,
                        # #6520: the live lease this attempt runs under, so a
                        # reader can tell its staging from an orphan lease
                        # without borrowing a terminal request's commit.
@@ -948,6 +1264,11 @@ def tick(db, cfg, options) -> dict:
             proofs = storage.of(db).events.recent_type(
                 staging_watch.EVENT, 60, 1, object="staging-run:" + attempt["run"])
             terminal = proofs[0]["data"]["state"] if proofs else None
+            # #6761: the sequence's own last named error, bounded and
+            # redacted, so the failed request and its alert name the cause
+            # instead of a generic "reprise refusée".
+            named = public_reason(
+                (proofs[0]["data"] or {}).get("reason")) if proofs else ""
             if code == staging_watch.BUSY and terminal is None:
                 # Refused before any host operation (shared start or local
                 # flock): the request is queued again, not failed.
@@ -967,6 +1288,11 @@ def tick(db, cfg, options) -> dict:
                     terminal = "completed"
             result = dict(attempt, state=terminal if code == 0 and terminal in ("completed", "partial") else "failed",
                           exit=code)
+            # #6761: a stale reason from an earlier attempt must not speak for
+            # this one; only the sequence's own last error names the failure.
+            result.pop("reason", None)
+            if code != 0 and named:
+                result["reason"] = named
             _record(db, options["key"], result, lease=lease)
             return result
         finally:

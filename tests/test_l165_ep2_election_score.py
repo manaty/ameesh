@@ -217,6 +217,14 @@ class ReadinessTest(_RoleCase):
         self.assertTrue(state["ready"], state["diagnostic"])
         self.assertEqual(state["diagnostic"], "")
 
+    def test_une_preparation_staging_en_echec_rend_le_candidat_non_pret(self):
+        # #6761 : un candidat qui ne peut pas deployer n'est jamais classe.
+        with mock.patch.object(election, "_staging_reason",
+                               return_value="staging preparation failed: x"):
+            ready, diagnostic = self.local()
+        self.assertFalse(ready)
+        self.assertIn("staging preparation failed", diagnostic)
+
     def test_porte_de_l_hote_fermee(self):
         self.db.execute(
             "INSERT INTO host_lifecycle (host, mode, actor) VALUES ('banc', 'draining', 'test')")
@@ -675,6 +683,52 @@ class RunnerWiringTest(_RoleCase):
     def standings_for_handover(self):
         self.standing("pilote", "atelier", 99.0)
         self.standing("pilote", "banc", 90.0)
+
+
+class StagingPreparationTest(unittest.TestCase):
+    """#6761 : la preuve de preparation du staging, lue par l'election."""
+
+    ROLE = {"name": "mesh-design"}
+
+    def reason(self, rows, *, now=1000.0):
+        events = mock.Mock()
+        events.recent_type.return_value = rows
+        store = mock.Mock(events=events)
+        with mock.patch.object(election.storage, "of", return_value=store), \
+             mock.patch.object(election.pg, "now_ts", return_value=now):
+            return election._staging_reason(object(), self.ROLE, "banc")
+
+    def test_a_fresh_failure_names_the_reason(self):
+        rows = [dict(ts=900.0, data={"ready": False,
+                                     "diagnostic": "unreachable (dial tcp)"})]
+        self.assertEqual(self.reason(rows),
+                         "staging preparation failed: unreachable (dial tcp)")
+
+    def test_a_success_or_a_stale_failure_says_nothing(self):
+        self.assertEqual(self.reason(
+            [dict(ts=900.0, data={"ready": True})]), "")
+        self.assertEqual(self.reason(
+            [dict(ts=99.0, data={"ready": False, "diagnostic": "x"})]), "")
+        self.assertEqual(self.reason([]), "")
+
+    def test_an_unreadable_journal_closes_on_doubt(self):
+        events = mock.Mock()
+        events.recent_type.side_effect = election.db_mod.DbError("boom")
+        with mock.patch.object(election.storage, "of",
+                               return_value=mock.Mock(events=events)):
+            reason = election._staging_reason(object(), self.ROLE, "banc")
+        self.assertIn("staging preparation unreadable", reason)
+
+    def test_the_event_is_read_for_this_role_and_host_only(self):
+        events = mock.Mock()
+        events.recent_type.return_value = []
+        with mock.patch.object(election.storage, "of",
+                               return_value=mock.Mock(events=events)):
+            self.assertEqual(
+                election._staging_reason(object(), self.ROLE, "banc"), "")
+        events.recent_type.assert_called_once_with(
+            "staging.executor", None, 1,
+            object="staging-executor:mesh-design:banc")
 
 
 if __name__ == "__main__":
