@@ -1,0 +1,176 @@
+{
+  "lot": 6583,
+  "at": "2026-11-10T00:31:31.779483+00:00",
+  "status": "published_build_inputs_verified_target_runtime_not_built_or_sealed",
+  "source": {
+    "tag": "v1.47.0",
+    "sha": "8bdc815cd08f252fe24b2895f63d1421e4a59072",
+    "pins_match_exact_git_tag": true,
+    "assets": [
+      {
+        "name": "ameesh-1.47.0-py3-none-any.whl",
+        "sha256": "211f066eaeb7870c24589fa6430397a59d480c5c416d767204e9a4cc47361db6",
+        "bytes": 5707495,
+        "published_digest_matches": true,
+        "url": "https://github.com/manaty/ameesh/releases/download/v1.47.0/ameesh-1.47.0-py3-none-any.whl"
+      },
+      {
+        "name": "runtime-build-pins.txt",
+        "sha256": "55466394f781769736ed2ea15c3cb04c4434482e05b03299ac129fb07fac33f4",
+        "bytes": 390,
+        "published_digest_matches": true,
+        "url": "https://github.com/manaty/ameesh/releases/download/v1.47.0/runtime-build-pins.txt"
+      },
+      {
+        "name": "runtime-pins.txt",
+        "sha256": "ca5864c9fdc1ff65dfcfc18b1cfe2d81287d2d4230fa153f9eff3c8de23f1ac1",
+        "bytes": 1458,
+        "published_digest_matches": true,
+        "url": "https://github.com/manaty/ameesh/releases/download/v1.47.0/runtime-pins.txt"
+      },
+      {
+        "name": "SHA256SUMS",
+        "sha256": "03d67a07309d7dc784c2dd708fe68d068dd1aa3482502202e77f13ed51f46e29",
+        "bytes": 269,
+        "published_digest_matches": true,
+        "url": "https://github.com/manaty/ameesh/releases/download/v1.47.0/SHA256SUMS"
+      }
+    ],
+    "integrated_controller_callers": [
+      {
+        "path": "deploy/mise-a-jour/autorite-release.py",
+        "sha256": "e3c3c9a6c3604771ec7b786b844fed375e6348eb6a03bece0279a917514141ab",
+        "controller_reader_lines": [
+          {
+            "line": 66,
+            "text": "view = decisions.get_for_controller(self.db, self.decision_id)"
+          },
+          {
+            "line": 98,
+            "text": "decisions.require_current(self.db, view, reader=decisions.get_for_controller)"
+          }
+        ]
+      },
+      {
+        "path": "deploy/mise-a-jour/bootstrap-release.py",
+        "sha256": "bf780e87fc5d772c3905dcf8b658c44c0786af400ef4392b5032043468b763b3",
+        "controller_reader_lines": [
+          {
+            "line": 112,
+            "text": "view=signed.decisions.get_for_controller(self.db,self.decision_id)"
+          }
+        ]
+      },
+      {
+        "path": "deploy/mise-a-jour/continuation-bootstrap.py",
+        "sha256": "7318bd69336c3da56842cd2581e2828630b1ae76c63fa254dd19ee1b15ed6b3e",
+        "controller_reader_lines": [
+          {
+            "line": 41,
+            "text": "view = decisions.get_for_controller(backend.db, identifier) if type(identifier) is int else None"
+          },
+          {
+            "line": 97,
+            "text": "view = decisions.get_for_controller(backend.db, identifier)"
+          },
+          {
+            "line": 150,
+            "text": "old = bootstrap.signed.decisions.get_for_controller(self.db, ref['decision'])"
+          },
+          {
+            "line": 151,
+            "text": "new = bootstrap.signed.decisions.get_for_controller(self.db, self.decision_id)"
+          }
+        ]
+      }
+    ]
+  },
+  "target_read_only": {
+    "at": "2026-11-10T00:26:01.467232+00:00",
+    "host": "AG3",
+    "read_only": true,
+    "rc": 0,
+    "metadata": {
+      "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+      "python_executable": "/usr/bin/python3.12",
+      "python_sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+      "controller_unit": [
+        "User=root",
+        "ActiveState=inactive",
+        "FragmentPath=/etc/systemd/system/ameesh-release-controller.service"
+      ],
+      "runtime_pyvenv": "home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.12.3\n",
+      "controller_callers": {
+        "autorite-release.py": {
+          "sha256": "12a64d781ac6c2ab9c7ef5ed9157d0b88a30377dd4edebb490d3099944c1f415",
+          "decision_get_lines": [
+            {
+              "line": 66,
+              "text": "view = decisions.get(self.db, self.decision_id)"
+            }
+          ]
+        },
+        "bootstrap-release.py": {
+          "sha256": "abb93a6d11fe9dedc966b37f5c973713dc48945bd67afa912ac32c3b1788ca6d",
+          "decision_get_lines": [
+            {
+              "line": 112,
+              "text": "view=signed.decisions.get(self.db,self.decision_id)"
+            }
+          ]
+        },
+        "continuation-bootstrap.py": {
+          "sha256": "be9de77a7806f9533d9daa41dc600dd5b5250b618c0741d8cd7b9c1deba4e55b",
+          "decision_get_lines": [
+            {
+              "line": 41,
+              "text": "view = decisions.get(backend.db, identifier) if type(identifier) is int else None"
+            },
+            {
+              "line": 97,
+              "text": "view = decisions.get(backend.db, identifier)"
+            },
+            {
+              "line": 155,
+              "text": "old = bootstrap.signed.decisions.get(self.db, ref['decision'])"
+            },
+            {
+              "line": 156,
+              "text": "new = bootstrap.signed.decisions.get(self.db, self.decision_id)"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "operator_build": {
+    "actor": "BG sole VM/runtime mutator, unprivileged build first",
+    "command_template": "/usr/bin/python3 -I -B CLONE/deploy/mise-a-jour/construction-runtime.py --clone CLONE --sha 8bdc815cd08f252fe24b2895f63d1421e4a59072 --output NEW_OUTPUT",
+    "requirements": [
+      "Clean clone exactly at source SHA, tracked and untracked bytes clean.",
+      "Use AG3 system Python3.12.3, binarySHA256 e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f.",
+      "Return construction receipt, measured runtime/lib/source inventories, built wheel digest and exact replacement question from canonical #5166 tools.",
+      "Independent rebuild/verification with the same target Python and exact question before signing."
+    ]
+  },
+  "root_pose_hold": [
+    "Exact byte dossier still missing: target runtime construction/seal and two independent family opinions, then pilot fire.",
+    "Use canonical replacement-prepare/replacement-plan/replace with protected stage, unchanged permanent runtime-seal.lock inode, retained old runtime/lib/seal.",
+    "BG chooses a gap outside21:40–23:30Z and09:40–11:30Z and any packet CI; controller/socket/instances stopped for pose.",
+    "Before/after actual enrolled private connection: same real signed decision ID, old decisions.get then new get_for_controller, identical view_of/proof booleans; output IDs/SHA/booleans only.",
+    "Establish historical AG1 controller usage separately; current absence alone does not prove never ran.",
+    "No #6372REVOKE or realAG3shutdown before valid #6583receipt or explicitMDdisposition."
+  ],
+  "canonical_sources": [
+    "https://github.com/manaty/ameesh/blob/8bdc815cd08f252fe24b2895f63d1421e4a59072/docs/ops/runtime-root-seal.md",
+    "https://github.com/manaty/ameesh/blob/8bdc815cd08f252fe24b2895f63d1421e4a59072/deploy/mise-a-jour/procedures/mailbox-controleur.md"
+  ],
+  "not_claimed": [
+    "target runtime built or byte-qualified",
+    "owner/pilot approval",
+    "root pose",
+    "decision proof comparison",
+    "AG1 never ran",
+    "REVOKE or VM sizing change"
+  ]
+}
