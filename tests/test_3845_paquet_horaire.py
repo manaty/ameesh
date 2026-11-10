@@ -62,6 +62,9 @@ class FakeShell:
         self.clock = NOW
         #: #4506 : la tête gelée est-elle un ancêtre de origin/<cible> ?
         self.ancestor = False
+        #: #6665 : une recomposition réussie regèle le porteur sur une tête
+        #: neuve ; `None` garde la tête gelée (composition sans effet).
+        self.recomposed_head: str | None = None
 
     def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
         self.calls.append(list(cmd))
@@ -102,6 +105,10 @@ class FakeShell:
                         {"note": args[3], "created_ts": self.clock})
             return ph.Result(0, "ok\n")
         if str(cmd[1]).endswith("paquet-auto.py"):
+            if self.recomposed_head and "--keep-composition" in cmd and self.auto_rc == 0:
+                for item in self.items.values():
+                    if item.get("freeze"):
+                        item["freeze"] = {"declared": {"sha": self.recomposed_head}}
             return ph.Result(self.auto_rc, self.auto_out)
         raise AssertionError("commande inattendue : %r" % cmd)
 
@@ -606,6 +613,7 @@ class FollowTest(Base):
         self.open_carrier()
         self.shell.items[3801] = {"id": 3801, "assignee": "mty-amh-impl-02"}
         self.shell.ci[4000] = {"runs": [red_run()]}
+        self.shell.recomposed_head = HEAD2
         ph.tick(self.ctx)
         auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
         self.assertIn("--force", auto)
@@ -622,7 +630,8 @@ class FollowTest(Base):
         self.assertTrue(any(n.startswith(ph.MARK_ATTEMPT + "recomposition n=1 base=%s"
                                          % HEAD) for n in notes))
         # la recomposition est republiée : ci-full sur la nouvelle tête
-        self.assertTrue(self.shell.ran("ci", "run", "4000", "--full"))
+        run = self.shell.ran("ci", "run", "4000", "--full")
+        self.assertEqual([c[c.index("--sha") + 1] for c in run], [HEAD2])
 
     def test_lot_retire_repasse_en_build_avec_sa_trace(self):
         # #4028 : le lot retiré porte sa trace (paquet, porteur, run, tests) et
@@ -684,6 +693,77 @@ class FollowTest(Base):
         self.shell.ci[4000] = {"runs": [red_run()]}
         self.assertIn("vert en local", ph.tick(self.ctx))
         self.assertFalse([c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)])
+
+
+class RedHeadPublishTest(Base):
+    """#6665 (récidive de #6565) : `publish` ne redemande jamais une ci-full
+    déjà terminée non verte sur la tête gelée ; le rouge suit son chemin."""
+
+    def frozen_without_mark(self, *notes):
+        item = carrier(notes=notes)
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        return item
+
+    def test_tete_rouge_sans_marque_ne_redemande_pas_la_ci(self):
+        # h-06 (#6658) : la marque « ci demandée » manque (arrêt entre la
+        # demande et la marque) ; le tic sortait en rc 1 sur le refus de `ci run`.
+        item = self.frozen_without_mark()
+        self.shell.ci[4000] = {"runs": [red_run(best=(3801, 3807))]}
+        out = ph.tick(self.ctx)
+        self.assertIn("rouge consigné", out)
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+        self.assertIn(ph.MARK_CI + HEAD, ph.marks(item))
+        self.assertTrue(any(n.startswith(ph.MARK_RED + "77") for n in ph.marks(item)))
+        # le tic suivant ne redit rien au pilote et ne redemande rien
+        mails = len(self.shell.mails)
+        ph.tick(self.ctx)
+        self.assertEqual(len(self.shell.mails), mails)
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+
+    def test_tete_rouge_deterministe_sans_marque_recompose(self):
+        self.frozen_without_mark()
+        self.shell.items[3801] = {"id": 3801, "assignee": "mty-amh-impl-02"}
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        self.shell.recomposed_head = HEAD2
+        ph.tick(self.ctx)
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)]
+        self.assertEqual(len(auto), 1)
+        self.assertEqual(auto[0][auto[0].index("--exclude") + 1], "3801")
+        run = self.shell.ran("ci", "run", "4000", "--full")
+        self.assertEqual([c[c.index("--sha") + 1] for c in run], [HEAD2])
+
+    def test_recomposition_sans_tete_neuve_bornee(self):
+        # la reprise republie la même tête rouge : une recomposition au plus,
+        # puis rouge consigné — jamais de `ci run` refusé, jamais de boucle.
+        item = self.frozen_without_mark()
+        self.shell.items[3801] = {"id": 3801, "assignee": "mty-amh-impl-02"}
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        out = ph.tick(self.ctx)
+        self.assertIn("épuisé", out)
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)]
+        self.assertEqual(len(auto), 1)
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+        self.assertTrue(any(n.startswith(ph.MARK_RED + "77") for n in ph.marks(item)))
+
+    def test_ci_en_cours_ou_absente_demande_ordinaire(self):
+        self.frozen_without_mark()
+        self.shell.ci[4000] = {"runs": [dict(red_run(), status="running")]}
+        ph.tick(self.ctx)
+        self.assertEqual(len(self.shell.ran("ci", "run", "4000", "--full")), 1)
+
+    def test_lecture_ci_impossible_garde_la_demande_ordinaire(self):
+        self.frozen_without_mark()
+        run = self.shell.run
+
+        def unreadable(cmd, **kw):
+            if cmd[:3] == ["ameesh", "ci", "status"]:
+                self.shell.calls.append(list(cmd))
+                return ph.Result(1, "", "base indisponible")
+            return run(cmd, **kw)
+        self.shell.run = unreadable
+        ph.tick(self.ctx)
+        self.assertEqual(len(self.shell.ran("ci", "run", "4000", "--full")), 1)
 
 
 class EstimateGuardTest(Base):
@@ -922,6 +1002,7 @@ class ResumeTest(Base):
         self.shell.items[4000] = item
         self.shell.lists["qa"] = [item]
         self.shell.ci[4000] = {"runs": [red_run()]}
+        self.shell.recomposed_head = HEAD2
         ph.tick(self.ctx)
         auto = self.autos()[0]
         self.assertIn("--force", auto)
