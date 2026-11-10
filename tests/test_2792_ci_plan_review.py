@@ -121,7 +121,7 @@ class GateForwardTest(unittest.TestCase):
             out = merge_queue.review_gate_for_item(None, cfg, item, marks)
         self.assertEqual(out, {"ok": True})
         self.assertIs(gate.call_args.kwargs["cfg"], cfg)
-        self.assertEqual(gate.call_args.kwargs["target"], "main")
+        self.assertEqual(gate.call_args.kwargs["target"], sha)
 
 
 class CandidateForwardTest(unittest.TestCase):
