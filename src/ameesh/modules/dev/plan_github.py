@@ -71,6 +71,8 @@ import json
 import os
 import re
 import subprocess
+import socket
+import sys
 import tempfile
 import threading
 import time
@@ -146,6 +148,10 @@ class Gh:
         self.timeout = float(timeout)
 
     def run(self, argv: list[str], stdin: str | None = None) -> tuple[int, str, str]:
+        from ...github_budget import reserve_reason
+        reason = reserve_reason(argv, env=self.env)
+        if reason:
+            return 75, "", reason
         try:
             proc = subprocess.run([self.path, *argv], input=stdin, capture_output=True,
                                   text=True, timeout=self.timeout, env=self.env)
@@ -535,7 +541,8 @@ class SharedReads:
     et une empreinte non réversible du jeton."""
 
     def __init__(self, state_dir, *, clock=time.time, ttl: float = READS_TTL,
-                 max_entries: int = READS_MAX, scope: str = ""):
+                 max_entries: int = READS_MAX, scope: str = "",
+                 caller: str = "", priority: str = "poll", env=None):
         state_dir = str(state_dir or "").strip()
         if not state_dir:
             raise ValueError("state_dir is required for the shared reads cache")
@@ -545,6 +552,13 @@ class SharedReads:
         self.ttl = float(ttl)
         self.max_entries = int(max_entries)
         self.scope = str(scope or "")
+        env = os.environ if env is None else env
+        self.priority = priority
+        self.consumer = {"caller": str(caller or os.path.basename(sys.argv[0]))[:120],
+                         "process": os.getpid(),
+                         "role": str(env.get("AMEESH_ROLE") or env.get("AMEESH_GH_ROLE") or "")[:120],
+                         "agent": str(env.get("AGENT_MAIL_NAME") or "")[:120],
+                         "host": str(env.get("AMEESH_HOST") or socket.gethostname())[:120]}
         self._reads_dir = os.path.join(self.root, "reads")
         self._quota_path = os.path.join(self.root, "quota.json")
         self._lock_path = os.path.join(self.root, ".lock")
@@ -739,6 +753,7 @@ class SharedReads:
         resource = str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() \
             or str(resource or "").strip().lower() or DEFAULT_RESOURCE
         secondary = status in (403, 429) and SECONDARY_LIMIT_MARK in str(body or "").lower()
+        primary = status in (403, 429) and "api rate limit exceeded" in str(body or "").lower()
         self._ensure_dirs()
         taken = _take_pending(self._pending, self._pending_lock)
         written = False
@@ -754,6 +769,27 @@ class SharedReads:
                     quota = quotas[resource] = {}
                 counters = data.setdefault("counters", {})
                 counters["requests"] = int(counters.get("requests") or 0) + 1
+                # #6649: real HTTP responses, attributed without an extra API
+                # call. Keep 24 hourly windows, including 304 separately.
+                windows = data.setdefault("consumers", {})
+                hour = str(int(now // 3600))
+                for old in list(windows):
+                    if not old.isdigit() or int(old) < int(hour) - 23:
+                        del windows[old]
+                bucket = windows.setdefault(hour, {})
+                identity = json.dumps(dict(self.consumer, resource=resource), sort_keys=True)
+                key = hashlib.sha256(identity.encode()).hexdigest()[:24]
+                if key not in bucket and len(bucket) >= 1024:
+                    key = "overflow"
+                record = bucket.setdefault(key, dict(
+                    self.consumer if key != "overflow" else {"caller": "overflow"},
+                    requests=0, not_modified=0))
+                record["requests"] += 1
+                record["not_modified"] += int(status == 304)
+                record["last_status"] = status
+                record["resource"] = resource
+                record["remaining"] = values.get("remaining")
+                record["reset"] = values.get("reset")
                 if status == 304:
                     counters["not_modified"] = int(counters.get("not_modified") or 0) + 1
                 for key, value in values.items():
@@ -761,7 +797,7 @@ class SharedReads:
                         quota[key] = value
                 blocked = float(quota.get("blocked_until") or 0.0)
                 remaining, reset = values.get("remaining"), values.get("reset")
-                exhausted = status in (403, 429) and (remaining == 0 or retry is not None)
+                exhausted = status in (403, 429) and (remaining == 0 or retry is not None or primary)
                 if remaining == 0 and (reset or 0) > now:
                     exhausted = True
                 if retry:
@@ -787,8 +823,20 @@ class SharedReads:
     def blocked(self, now=None, resource: str = DEFAULT_RESOURCE) -> float | None:
         """L'instant (epoch) jusqu'auquel cette ressource est épuisée, sinon None."""
         now = float(self.clock() if now is None else now)
-        until = float(self.quota(resource).get("blocked_until") or 0.0)
-        return until if until > now else None
+        quota = self.quota(resource)
+        until = float(quota.get("blocked_until") or 0.0)
+        if until > now:
+            return until
+        # #6649: preserve the last 20% for explicit gate/merge reads. Never
+        # infer a new window from an old sample after its reset.
+        from ...github_budget import RESERVE_FRACTION
+        if self.priority != "gate" and resource == DEFAULT_RESOURCE:
+            limit, remaining, reset = (quota.get(k) for k in ("limit", "remaining", "reset"))
+            if (isinstance(limit, int) and limit > 0 and isinstance(remaining, int)
+                    and remaining < limit * RESERVE_FRACTION and isinstance(reset, (int, float))
+                    and reset > now):
+                return float(reset)
+        return None
 
 
 def _resource_header(headers) -> str | None:
@@ -889,13 +937,15 @@ class Api:
         except (urllib.error.URLError, OSError) as exc:
             raise GithubError("GitHub %s: %s"
                               % (path, " ".join(str(exc).split())[:200])) from exc
+        # Count a received HTTP response even if its JSON body is broken.
+        if self.reads is not None:
+            self.reads.note(headers, status=200, now=now, resource=resource)
         try:
             value = json.loads(body) if body.strip() else None
         except ValueError as exc:
             raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
         if self.reads is not None:
             etag = header_of(headers, "ETag")
-            self.reads.note(headers, status=200, now=now, resource=resource)
             self.reads.store(path, value, etag=etag, read_ts=now,
                              resource=_resource_header(headers))
         self.last_read = ReadMeta(now, False, "network")
@@ -970,7 +1020,7 @@ class GhApi:
 
 def client(*, env=None, gh: str | None = None, timeout: float = 60.0,
            allow_gh: bool = True, cache_dir=None, ttl: float = READS_TTL,
-           clock=time.time):
+           clock=time.time, caller: str = "", priority: str = "poll"):
     """Le client de lecture GitHub : le jeton s'il est là, sinon `gh`.
 
     `allow_gh=False` (le serveur) : sans jeton, rend None — `gh` n'est pas
@@ -979,13 +1029,15 @@ def client(*, env=None, gh: str | None = None, timeout: float = 60.0,
     env = os.environ if env is None else env
     token = token_of(env)
     reads = SharedReads(cache_dir, clock=clock, ttl=ttl,
-                        scope=reads_scope(env.get("GITHUB_API_URL"), token)) \
+                        scope=reads_scope(env.get("GITHUB_API_URL"), token),
+                        caller=caller, priority=priority, env=env) \
         if cache_dir else None
     if token:
         return Api(env=env, timeout=timeout, reads=reads, ttl=ttl, clock=clock)
     if not allow_gh:
         return None
-    return GhApi(Gh(gh, env=env, timeout=timeout), reads=reads, ttl=ttl, clock=clock)
+    transport_env = dict(env, AMEESH_GITHUB_PRIORITY=priority)
+    return GhApi(Gh(gh, env=transport_env, timeout=timeout), reads=reads, ttl=ttl, clock=clock)
 
 
 def client_name(env=None) -> str:
@@ -1003,7 +1055,11 @@ def quota_stats(state_dir) -> dict:
     if not str(state_dir or "").strip():
         return {"quota": {}, "counters": {}}
     reads = SharedReads(state_dir)
-    return {"quota": reads.quotas(), "counters": reads.counters()}
+    report = {"quota": reads.quotas(), "counters": reads.counters()}
+    consumers = reads._load().get("consumers")
+    if consumers:
+        report["consumers"] = consumers
+    return report
 
 
 # --------------------------------------------------------------------------

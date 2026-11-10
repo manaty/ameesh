@@ -399,7 +399,8 @@ GH_TIMEOUT = 124
 def _gh(args: list[str], *, timeout: float = 60.0) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(["gh", *args], capture_output=True, text=True,
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False,
+                              env=dict(os.environ, AMEESH_GITHUB_PRIORITY="gate"))
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(["gh", *args], GH_TIMEOUT, "", str(exc))
     except OSError as exc:
