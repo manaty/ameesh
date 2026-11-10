@@ -391,6 +391,16 @@ FERMEES = {
     "harness_adoptions": {"lot_id", "project", "harness", "object",
                           "from_version", "to_version", "stage", "report",
                           "report_digest", "state", "created_at", "updated_at"},
+    # #6669 (0564): le journal additif des résolutions de constat (M3) est une
+    # observation interne lue par le rapport M1, pas par le rôle superviseur ;
+    # fermé aux deux rôles, aucun GRANT ajouté.
+    "review_finding_resolutions": {"id", "milestone_id", "work_item_id",
+                                   "witness_sha", "state", "basis",
+                                   "correction_sha", "regression_lot",
+                                   "corrector", "withdrawn_by", "adjudicator",
+                                   "adjudicator_family", "judged_families",
+                                   "independent", "review_room", "note",
+                                   "created_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

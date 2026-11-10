@@ -98,7 +98,12 @@ KEPT = (
     "executor_tokens.agent", "executors.enrolled_by", "executors.revoked_by",
     "key_events.holder", "key_events.name", "key_holders.name", "mesh_approvals.approver",
     "mesh_approvals.consumed_by", "mesh_consumed_nonces.approver",
-    "mesh_consumed_nonces.consumed_by", "provenance_receipts.actor", "schema_migrations.name",
+    "mesh_consumed_nonces.consumed_by", "provenance_receipts.actor",
+    # #6669 (0564) : le journal additif des résolutions de constat est une
+    # preuve historique (retrait, correction) que l'append-only interdit de
+    # réécrire ; un renommage ne le déplace pas (corrector/adjudicator ne
+    # relèvent pas du motif d'identité, ils restent des preuves aussi).
+    "review_finding_resolutions.withdrawn_by", "schema_migrations.name",
     "schema_non_additive_migrations.name",
     "spend_marker_events.actor",  # Human resolution / runner audit evidence.
     "sandbox_turns.owner",  # Runner lease owner, never an agent identity.

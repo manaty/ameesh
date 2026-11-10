@@ -36,7 +36,9 @@
 
 SET LOCAL lock_timeout = '5s';
 
-CREATE TABLE IF NOT EXISTS review_finding_resolutions (
+-- #6669 : `CREATE TABLE` nu (sans IF NOT EXISTS) pour que le classement L151
+-- prouve la table neuve et accepte le déclencheur qui suit, comme 0529.
+CREATE TABLE review_finding_resolutions (
     id                bigserial PRIMARY KEY,
     -- le constat : un jalon verdict blocked, identifié par son id
     milestone_id      bigint NOT NULL REFERENCES work_item_milestones(id) ON DELETE CASCADE,
