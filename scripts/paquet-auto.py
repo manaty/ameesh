@@ -1680,12 +1680,21 @@ def keep_composition(candidates: list[Candidate],
     return members, discarded
 
 
-def unique_discarded(items: list[Discarded]) -> list[Discarded]:
-    """#6579 : conserver chaque motif une fois, dans son ordre d'apparition."""
+def unique_discarded(items: list[Discarded],
+                     units: list[Unit] = ()) -> list[Discarded]:
+    """#6579 : conserver chaque motif une fois, dans son ordre d'apparition.
+
+    #6727 : un écart d'un passage précédent (conflit avec une unité retirée
+    depuis) tombe si la recomposition a composé son lot (`units`) : un lot
+    composé n'est jamais aux écartés du même manifeste.
+    """
+    composed = {unit.lot for unit in units}
     seen: set[tuple[int, str]] = set()
     result: list[Discarded] = []
     for item in items:
         key = (item.lot, item.reason)
+        if item.lot in composed:
+            continue
         if key not in seen:
             seen.add(key)
             result.append(item)
@@ -4405,6 +4414,15 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     except InputError:
         admissions = [([unit.lot], unit.source) for unit in composition.units]
     lots = len({lot for members, _source in admissions for lot in members})
+    # #6727 : Composition ∩ Écartés = ∅ ; `packet_close` tiendrait le lot
+    # composé pour retiré et ne le clôturerait pas à la fusion.
+    composed = {unit.lot for unit in composition.units} | {
+        lot for members, _source in admissions for lot in members}
+    both = sorted(composed & {item.lot for item in composition.discarded})
+    if both:
+        raise PaquetAutoError(
+            "manifeste refusé : %s à la fois composé(s) et écarté(s)"
+            % ", ".join("#%d" % lot for lot in both))
     lines = [
         "# Paquet %s — composition (§12), sur %s `%s`"
         % (package_branch(name), target, base_sha[:12]),
@@ -5922,7 +5940,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                         expect_pushed=lease or "", removed=removed_sources,
                         guard=guard)
                     composition.discarded = unique_discarded(
-                        previous + composition.discarded + changes)
+                        previous + composition.discarded + changes,
+                        composition.units)
                     if not composition.units:
                         return empty_after_recomposition("gel changé")
                     continue
@@ -6067,7 +6086,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                 expect_pushed=lease or "", removed=removed_sources,
                 guard=guard)
             composition.discarded = unique_discarded(
-                previous + composition.discarded + reasons)
+                previous + composition.discarded + reasons,
+                composition.units)
             if not composition.units:
                 return empty_after_recomposition("tests par unité rouges")
         inconclusive = sum(1 for run in runs if run.inconclusive)
