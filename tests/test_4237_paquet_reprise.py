@@ -344,6 +344,21 @@ class PublishTest(Chain):
             ["git", "-C", str(self.origin), "rev-parse", "--verify", "--quiet",
              auto.TESTED_REF_PREFIX + NAME], capture_output=True).returncode, 1)
 
+    def test_regel_entre_verification_et_publication_refuse(self):
+        """#6579 : la première lecture passe, la seconde voit le nouveau gel."""
+        self.push(self.args())
+        initial = self.candidates()
+        refrozen = [auto.Candidate(c.lot, "f" * 40) if c.lot == 1 else c
+                    for c in initial]
+        with self.finishing() as mocks:
+            mocks["compute_candidates"].side_effect = [(initial, {}), (refrozen, {})]
+            with self.assertRaisesRegex(auto.ChainRefused, "gel changé.*#1"):
+                auto.publish_tested(self.args())
+        for gesture in ("ensure_pull_request", "request_full_ci", "send_mail"):
+            mocks[gesture].assert_not_called()
+        reads = mocks["compute_candidates"].call_args_list
+        self.assertEqual(reads[0].args[:3], reads[1].args[:3])
+
     def test_cible_bougee_sort_en_3(self):
         self.commit("autre.txt", "x\n", "cible bougée")
         git(self.repo, "push", "-q", "origin", "HEAD:main")

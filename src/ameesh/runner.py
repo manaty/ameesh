@@ -15412,6 +15412,10 @@ class Runner:
             for engine in engines:
                 part = self._running_containers(engine)
                 if part is None:
+                    # #6610 : podman sans espace de noms sous no_new_privs ne
+                    # porte aucun conteneur de tour ; ce n'est pas un doute
+                    if containers_mod.rootless_unusable(engine, engines):
+                        continue
                     silent.append(engine.binary + (" (%s)" % engine.context
                                                    if engine.context else ""))
                     continue

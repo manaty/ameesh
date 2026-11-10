@@ -252,6 +252,18 @@ anciens `venv-<sha7>` en gardant la cible de `venv-courant`, le nom de
 `venv.precedent` et tout venv qu’un processus vivant nomme par un chemin
 absolu. Le lien `venv-courant` lui-même n’est jamais candidat (#3792).
 
+Le même ménage retient aussi les instantanés `src-<sha7>` du layout (#6606) :
+le courant est la source écrite dans le `direct_url.json` du venv vivant (et
+la cible de `src-current` sur le poste), le précédent vient de
+`venv.precedent` (repli `previous-sha` sur une VM d’agents), l’instantané
+nommé par le journal `installation-en-cours` reste la cible de `retour`, et
+tout instantané qu’un processus vivant nomme est gardé. Les autres sont
+retirés en fin de bascule réussie, puis `git worktree prune` efface leurs
+métadonnées dans le clone `src`. Le clone, le lien `src-current` et les noms
+qui ne sont pas exactement `src-` suivi de sept caractères hexadécimaux ne
+sont jamais candidats ; rien n’est retiré quand l’état ne permet pas de
+conclure (courant introuvable, journal ou processus illisibles).
+
 Après une installation réussie, et seulement en mode agents, `installer` retire
 l’agent GnuPG inutile de la VM : si `~/.gnupg/private-keys-v1.d` est absent ou
 vide, il masque les sockets utilisateur `gpg-agent.socket`,

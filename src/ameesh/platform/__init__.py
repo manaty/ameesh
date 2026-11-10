@@ -95,7 +95,7 @@ def machine() -> str:
 
 from .process import (PROC, HoldersUnreadable, alive, ancestry,  # noqa: E402
                       become_subreaper, become_undumpable, boot_time, children, publish_venv_attestation,
-                      command_argv, command_line, environ, env_values, fd_path, holders,
+                      command_argv, command_line, environ, env_values, fd_path, holders, no_new_privs,
                       open_fd_count, parent_pid, process_table, process_group_exists,
                       reap, exited_child, exited_child_status, self_cgroup_paths, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
 from .terminal import human_tty  # noqa: E402

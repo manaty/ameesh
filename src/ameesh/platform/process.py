@@ -37,6 +37,17 @@ def _proc_ok() -> bool:
     return is_linux() and os.path.isdir(os.path.join(PROC, "self"))
 
 
+def no_new_privs() -> bool:
+    """#6610 : ce processus est-il sous no_new_privs (`NoNewPrivs: 1`) ?
+
+    Hérité par chaque descendant et jamais levé : un setuid (`newuidmap`) n'y
+    élève plus rien. Faux hors Linux ou si l'état est illisible."""
+    for line in _read_text(os.path.join(PROC, "self", "status")).splitlines():
+        if line.split() == ["NoNewPrivs:", "1"]:
+            return True
+    return False
+
+
 def self_cgroup_paths() -> tuple[str, ...]:
     """Kernel cgroup memberships of this process (Linux only).
 

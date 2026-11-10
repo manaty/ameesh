@@ -46,8 +46,9 @@
 #                redémarre
 #
 #   En mode agents, installer et retour travaillent dans le layout du compte
-#   ameesh (~/.local/share/ameesh : clone src, instantanés src-<sha7> jamais
-#   écrasés, previous-sha, venv), avec les mêmes gardes de migrations ; le
+#   ameesh (~/.local/share/ameesh : clone src, instantanés src-<sha7>
+#   jamais écrasés mais élagués en fin de bascule réussie (#6606),
+#   previous-sha, venv), avec les mêmes gardes de migrations ; le
 #   redémarrage reste hors tour sous bail. L'installation ne redémarre
 #   personne, le retour bascule en arrière vers le venv précédent conservé
 #   puis redémarre et contrôle.
@@ -1594,8 +1595,9 @@ redemarrer_agents() {
 
 # --- mode agents : installer / retour (layout du compte ameesh) -------------
 # Clone ~/.local/share/ameesh/src, venv ~/.local/share/ameesh/venv, code
-# installé depuis des instantanés src-<sha7> jamais écrasés, sha du code
-# d'avant dans previous-sha. Un instantané est un worktree détaché du commit
+# installé depuis des instantanés src-<sha7> jamais écrasés mais élagués
+# en fin de bascule réussie (#6606), sha du code d'avant dans previous-sha.
+# Un instantané est un worktree détaché du commit
 # (arbre exact, jamais copié d'un clone sale) ; un instantané préexistant n'est
 # réutilisé que si son HEAD et son contenu correspondent au commit. L'identité
 # effective du compte runner et le journal de récupération sont vérifiés avant
