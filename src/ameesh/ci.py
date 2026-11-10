@@ -128,6 +128,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import secrets
 import sys
@@ -4703,7 +4704,9 @@ def cmd_ci_run(cfg, args) -> int:
                 print("ameesh ci run: %s" % exc)
             return 1
     db = open_db(cfg)
-    gh = plan_github.Gh()
+    # La demande de CI est une porte : ses lectures de plan doivent accéder
+    # à la réserve aussi, avant même l'armement de la fusion du paquet.
+    gh = plan_github.Gh(env=dict(os.environ, AMEESH_GITHUB_PRIORITY="gate"))
 
     def api(path: str):
         return plan_github._json(gh, ["api", path])

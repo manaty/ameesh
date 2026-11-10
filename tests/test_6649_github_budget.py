@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Real quota samples, local admission, and persistence across processes."""
 import os
+import argparse
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -8,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ameesh import github_budget as budget, github_identity, packet_watch, plan_github, packet_automerge
+from ameesh import ci, github_budget as budget, github_identity, packet_watch, plan_github, packet_automerge
 from .test_l848_github_quota import Clock, FakeGitHub, BASE, quota_headers
 
 
@@ -118,6 +121,38 @@ class BudgetTest(unittest.TestCase):
             run.reset_mock()
             self.assertEqual(gate(args).returncode, 75)
             run.assert_not_called()
+
+    def test_ci_run_plan_uses_reserve_but_refuses_exhaustion(self):
+        args = argparse.Namespace(id=0, repo="o/r", sha="", avis=1,
+                                  exception="", reason="", full=True,
+                                  force=False, dry_run=False, json=True)
+
+        def plan(*a, api, **kw):
+            # Exercise the real plan transport, before packet arming.
+            self.assertEqual(api("repos/o/r"), {"ok": True})
+            return {"action": "green"}
+
+        env = dict(os.environ, AMEESH_GITHUB_STATE=self.state)
+        env.pop("AMEESH_GITHUB_PRIORITY", None)
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("ameesh.db.open_db", return_value=None), \
+                mock.patch.object(plan_github, "resolve_gh", return_value=sys.executable), \
+                mock.patch.object(ci, "gel_plan", side_effect=plan), \
+                mock.patch.object(ci, "_arm_packet") as arm, \
+                mock.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                    [], 0, '{"ok": true}', "")) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.reads.note(quota_headers(remaining="100", reset=4_000_000_000), status=200)
+            self.assertEqual(ci.cmd_ci_run(None, args), 0)
+            arm.assert_called_once()
+            self.assertEqual(run.call_args.kwargs["env"]["AMEESH_GITHUB_PRIORITY"], "gate")
+            self.assertNotIn("AMEESH_GITHUB_PRIORITY", os.environ)
+            self.reads.note(quota_headers(remaining="0", reset=4_000_000_000), status=403)
+            run.reset_mock()
+            arm.reset_mock()
+            self.assertEqual(ci.cmd_ci_run(None, args), 1)
+            run.assert_not_called()
+            arm.assert_not_called()
 
     def test_generated_shim_refuses_poll_without_starting_gh(self):
         self.sample()
