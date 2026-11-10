@@ -159,6 +159,11 @@ UNKNOWN = {
     "reds": "notes de rouges non lues : absence de lecture, pas zéro rouge",
     "ci": "runs CI non lus : absence de lecture, pas zéro run",
     "review_cost": "coût de revue non lu",
+    "designated": (
+        "désignations de relecture non lues : sièges notifiés inconnus, "
+        "pas zéro"),
+    "units": (
+        "unités non lues : cohortes et dénominateurs inconnus, pas zéro"),
 }
 
 #: Ce que le lecteur ne peut pas conclure ; l'étude les nomme déjà.
@@ -544,10 +549,13 @@ SELECT c.harness,
 """
 
 #: Verdicts et gels de la fenêtre, famille du reçu exact (`milestone:<id>`).
+#: #6674 : la ligne `family_total` (ensemble de regroupement par famille seule)
+#: porte l'union des lots de la famille ; deux lots disjoints OK et B en font 2.
 _REVIEW_SQL = """
 SELECT m.kind, coalesce(m.verdict, '') AS verdict,
        coalesce(p.harness, 'unknown') AS family,
-       count(*) AS n, count(DISTINCT m.work_item_id) AS lots
+       count(*) AS n, count(DISTINCT m.work_item_id) AS lots,
+       GROUPING(m.kind) = 1 AS family_total
   FROM work_item_milestones m
   JOIN work_items w ON w.id = m.work_item_id
   LEFT JOIN provenance_receipts p ON p.subject = 'milestone:' || m.id
@@ -555,8 +563,10 @@ SELECT m.kind, coalesce(m.verdict, '') AS verdict,
    AND m.kind IN ('frozen', 'verdict')
    AND m.at >= to_timestamp(%s)
    AND m.at < to_timestamp(%s)
- GROUP BY 1, 2, 3
- ORDER BY 1, 2, 3
+ GROUP BY GROUPING SETS (
+       (m.kind, coalesce(m.verdict, ''), coalesce(p.harness, 'unknown')),
+       (coalesce(p.harness, 'unknown')))
+ ORDER BY 3, 1, 2
 """
 
 #: #6669 (M3) : les constats (verdicts bloqués) de la fenêtre et l'état
@@ -1210,16 +1220,23 @@ def _review(rows: Sequence[Mapping[str, Any]] | None,
     if rows is None:
         return {"by_family": None,
                 "notified_unattributed": None,
+                "notified_unknown": (UNKNOWN["designated"]
+                                     if designated is None else None),
                 "unknown_receipt_family": None,
                 "b_resolutions": totals,
                 "b_justes": None,
                 "b_justes_reason": UNKNOWN["b_justes"],
                 "unknown": UNKNOWN["review_family"]}
     verdicts: dict[str, dict[str, int]] = {}
+    union_lots: dict[str, int] = {}
     for row in rows or ():
         family = str(row.get("family") or "unknown")
         entry = verdicts.setdefault(family, {"frozen": 0, "ok": 0,
                                             "blocked": 0, "lots": 0})
+        if row.get("family_total"):
+            # #6674 : l'union SQL des lots de la famille fait foi
+            union_lots[family] = int(_int(row.get("lots")) or 0)
+            continue
         count = int(_int(row.get("n")) or 0)
         if str(row.get("kind")) == "frozen":
             entry["frozen"] += count
@@ -1227,8 +1244,12 @@ def _review(rows: Sequence[Mapping[str, Any]] | None,
             entry["blocked"] += count
         elif str(row.get("verdict")) == "ok":
             entry["ok"] += count
+        # sans ligne d'union (lecteur N-1) : borne basse, jamais une somme
         entry["lots"] = max(entry["lots"], int(_int(row.get("lots")) or 0))
-    notified: dict[str, dict[str, int]] = {}
+    for family, lots in union_lots.items():
+        verdicts[family]["lots"] = lots
+    notified: dict[str, dict[str, int]] | None = (
+        None if designated is None else {})
     unattributed_mails = 0
     unattributed_seats = 0
     for row in designated or ():
@@ -1241,7 +1262,7 @@ def _review(rows: Sequence[Mapping[str, Any]] | None,
             continue
         notified[family] = {"mails": mails, "seats": seats}
     families = []
-    for family in sorted(set(verdicts) | set(notified)
+    for family in sorted(set(verdicts) | set(notified or ())
                          | set(by_resolution or ())):
         entry = verdicts.get(family) or {"frozen": 0, "ok": 0,
                                          "blocked": 0, "lots": 0}
@@ -1255,8 +1276,11 @@ def _review(rows: Sequence[Mapping[str, Any]] | None,
             "blocked_rate": (round(entry["blocked"] / lines, 4)
                              if lines else None),
             "lots": entry["lots"],
-            "notified_mails": (notified.get(family) or {}).get("mails", 0),
-            "notified_seats": (notified.get(family) or {}).get("seats", 0),
+            # #6674 : désignations non lues → inconnu, pas zéro
+            "notified_mails": (None if notified is None else
+                               (notified.get(family) or {}).get("mails", 0)),
+            "notified_seats": (None if notified is None else
+                               (notified.get(family) or {}).get("seats", 0)),
         }
         if by_resolution is None:
             out.update({
@@ -1295,8 +1319,11 @@ def _review(rows: Sequence[Mapping[str, Any]] | None,
         }
     return {
         "by_family": families,
-        "notified_unattributed": {"mails": unattributed_mails,
-                                  "seats": unattributed_seats},
+        "notified_unattributed": (None if notified is None else
+                                  {"mails": unattributed_mails,
+                                   "seats": unattributed_seats}),
+        "notified_unknown": (UNKNOWN["designated"] if notified is None
+                             else None),
         "unknown_receipt_family": {
             "verdicts": verdicts.get("unknown", {}).get("ok", 0)
             + verdicts.get("unknown", {}).get("blocked", 0),
@@ -1798,13 +1825,18 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
         # une inconnue globale, il est mesuré sur les constats adjudiqués.
         unknown.pop("b_justes", None)
 
+    # #6674 : unités non lues → cohortes inconnues, jamais des cohortes vides
+    read_units = units is not None
     cohort = {
-        "candidates": len(units) if units is not None else None,
-        "integration": _cohort(integration_cost),
-        "staging": _cohort(staging_cost),
-        "carriers": _cohort(carrier_cost),
+        "candidates": len(units) if read_units else None,
+        "integration": _cohort(integration_cost) if read_units else None,
+        "staging": _cohort(staging_cost) if read_units else None,
+        "carriers": _cohort(carrier_cost) if read_units else None,
         "separated": len(separated) if separated is not None else None,
+        "unknown": None if read_units else UNKNOWN["units"],
     }
+    known = {name: cohort[name] or {}
+             for name in ("integration", "staging", "carriers")}
     coverage = {
         "window": {
             "start": iso_z(start), "end": iso_z(end),
@@ -1815,14 +1847,15 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
         },
         "denominators": {
             "candidates": cohort["candidates"],
-            "integration": cohort["integration"]["units"],
-            "staging": cohort["staging"]["units"],
-            "carriers": cohort["carriers"]["units"],
-            "staging_ratios_known": cohort["staging"]["ratios_known"],
-            "integration_ratios_known": cohort["integration"]["ratios_known"],
-            "staging_usd_known": cohort["staging"]["lots_with_usd"],
-            "staging_class_unknown": cohort["staging"]["units"],
-            "staging_effort_unknown": cohort["staging"]["units"],
+            "integration": known["integration"].get("units"),
+            "staging": known["staging"].get("units"),
+            "carriers": known["carriers"].get("units"),
+            "staging_ratios_known": known["staging"].get("ratios_known"),
+            "integration_ratios_known": known["integration"].get(
+                "ratios_known"),
+            "staging_usd_known": known["staging"].get("lots_with_usd"),
+            "staging_class_unknown": known["staging"].get("units"),
+            "staging_effort_unknown": known["staging"].get("units"),
             "b_justes_known": (
                 (review.get("b_resolutions") or {}).get("resolved", 0)
                 if held_resolutions else 0),
@@ -1830,10 +1863,10 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
         "staging_attestations": _staging_coverage(
             staged, computed_units if units is not None else None, staging),
         "unknown": unknown,
-        "families_absent": [
+        "families_absent": (None if not read_units else [
             family for family in FAMILY_ORDER
             if family not in {row["name"] for row in families_staging}
-        ],
+        ]),
         "rules": [{"id": ident, "rule": text}
                   for ident, text in COVERAGE_RULES],
         "limits": list(LIMITS),
@@ -1900,6 +1933,7 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
             "staging": cohort["staging"],
             "carriers": cohort["carriers"],
             "separated": cohort["separated"],
+            "unknown": cohort["unknown"],
         },
         "activity": activity,
         "families": {"integration": families_integration,
@@ -2039,6 +2073,8 @@ def format_text(report: Mapping[str, Any]) -> str:
         "",
         "Unités attestées (phase début → première attestation compatible)",
     ]
+    if cohorts.get("unknown"):
+        lines.insert(3, "  inconnu : %s" % cohorts.get("unknown"))
     lines += _family_table((report.get("families") or {}).get("staging") or ())
     lines += ["", "Unités intégrées (phase début → première fusion)",
               ]
@@ -2064,6 +2100,8 @@ def format_text(report: Mapping[str, Any]) -> str:
                         _fmt(resolved.get("refuted")),
                         _fmt(resolved.get("undecided")),
                         _fmt(resolved.get("adjudicated"))))
+    if review.get("notified_unknown"):
+        lines.append("  sièges : inconnu (%s)" % review.get("notified_unknown"))
     unattributed = review.get("notified_unattributed") or {}
     if unattributed.get("seats"):
         lines.append("  notification(s) sans famille : %s siège(s), hors des "
