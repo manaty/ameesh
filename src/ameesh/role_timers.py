@@ -154,6 +154,11 @@ AUDITOR_INTERVAL_S = 3600
 AUDITOR_CALENDAR = "*-*-* *:15:00"
 AUDITOR_DESCRIPTION = "ameesh — auditor short pass, hourly, under the elected role lease (#5863)"
 AUDITOR_MAIL = "Passage court (chaque heure). Consigne : ameesh/docs/AUDITEUR.md, à jour."
+#: #6643: the unit runs `ameesh auditor tick`, not the blind mail. `vm.sh`
+#: probes this attribute with the CLI it is about to control: a rollback to a
+#: CLI that predates it re-poses the unit with that CLI before checking it,
+#: instead of judging N's unit stale under N-1 (and turning the rollback red).
+AUDITOR_TICK = True
 
 
 class TimerError(RuntimeError):

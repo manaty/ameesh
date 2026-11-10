@@ -2088,7 +2088,7 @@ controler_agents() {
   # (python_agents, comme ameesh_agents) : jamais une lecture root dans les
   # dossiers d'agent, jamais un chemin supposé. L'étape est nommée, jamais
   # sautée en silence ; une réponse illisible reste un échec.
-  local passe_auditeur
+  local passe_auditeur tick_auditeur
   rc=0
   passe_auditeur=$(python_agents -c 'from ameesh import role_timers as r
 print(getattr(r, "AUDITOR_PASS", "") or "-")') || rc=$?
@@ -2098,6 +2098,20 @@ print(getattr(r, "AUDITOR_PASS", "") or "-")') || rc=$?
   elif [ "$passe_auditeur" = - ]; then
     etape "minuterie de l'auditeur (#5863) : le code installé ne la connaît pas, contrôle après l'installation"
   else
+    # #6643 : l'unité de N lance `ameesh auditor tick`, que le CLI d'un retour
+    # arrière (N-1) ne connaît pas et juge donc périmée. Le retour repose la
+    # minuterie avec le CLI INSTALLÉ avant de la contrôler : l'unité de N
+    # laisse alors place à celle de N-1, et le contrôle est vert.
+    rc=0
+    tick_auditeur=$(python_agents -c 'from ameesh import role_timers as r
+print(getattr(r, "AUDITOR_TICK", "") or "-")') || rc=$?
+    if [ "$rc" != 0 ] || [ -z "$tick_auditeur" ]; then
+      echo "minuterie de l'auditeur : passe déterministe du venv installé illisible (rc $rc)" >&2
+      echec=1
+    elif [ "$tick_auditeur" = - ]; then
+      etape "minuterie de l'auditeur : repose avec le CLI installé (retour avant #6643)"
+      ameesh_agents role timers --role auditeur --install || echec=1
+    fi
     ameesh_agents role timers --role auditeur --check || echec=1
   fi
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
