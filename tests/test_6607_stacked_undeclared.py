@@ -105,6 +105,46 @@ class StackedOnTest(unittest.TestCase):
         found = self.stacked()
         self.assertEqual([s["lot"] for s in found], [1, 0])
 
+    def siblings(self, *, advance=False):
+        """B2 cx1 : cible → A1 → B1 et A1 → D1 ; A éventuellement avancé."""
+        git(self.repo, "checkout", "-q", "-b", "lot/d", "review/a")
+        d_tip = write_commit(self.repo, "d", "d\n", "lot D")
+        if advance:
+            git(self.repo, "checkout", "-q", "review/a")
+            self.others[0]["shas"] = [write_commit(self.repo, "a", "a2\n", "A2")]
+        git(self.repo, "checkout", "-q", "main")
+        self.others.append({"lot": 4, "branch": "lot/d", "shas": [d_tip]})
+        return d_tip
+
+    def test_freres_d_un_parent_declare_ne_s_empilent_pas(self):
+        for advance in (False, True):
+            with self.subTest(advance=advance):
+                self.setUp()
+                d_tip = self.siblings(advance=advance)
+                self.assertEqual(self.stacked(declared=[1]), [])
+                self.assertEqual(packet_candidates.stacked_on(
+                    self.repo, d_tip, self.base, self.others, lot=4,
+                    branch="lot/d", declared=[1]), [])
+
+    def test_freres_d_une_cible_de_lot_ne_s_empilent_pas(self):
+        d_tip = self.siblings()
+        self.assertEqual(self.stacked(branch_target="review/a"), [])
+        self.assertEqual(packet_candidates.stacked_on(
+            self.repo, d_tip, self.base, self.others, lot=4, branch="lot/d",
+            branch_target="review/a"), [])
+
+    def test_le_contenu_propre_d_un_frere_reste_vu(self):
+        # B déclare A mais porte aussi D1 (fusion de lot/d) : D est un parent.
+        self.siblings()
+        git(self.repo, "checkout", "-q", "lot/b")
+        git(self.repo, "merge", "-q", "--no-edit", "lot/d")
+        tip = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "checkout", "-q", "main")
+        found = packet_candidates.stacked_on(
+            self.repo, tip, self.base, self.others, lot=2, branch="lot/b",
+            declared=[1])
+        self.assertEqual([s["lot"] for s in found], [4])
+
     def test_un_prefixe_de_gel_suffit(self):
         self.others[0]["shas"] = [self.a_tip[:12]]
         self.assertEqual([s["lot"] for s in self.stacked()], [1])

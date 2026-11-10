@@ -454,7 +454,9 @@ def stacked_on(repo: str, head: str, base: str, others, *, lot: int,
     lui-même (c'est lui qui est empilé sur ce lot). Sont exclus : le lot
     lui-même, un lot de même branche, celui dont la branche est la cible du
     lot (#3437, il entre avec son parent) et les prérequis déclarés
-    (`declared`, #6214). `cache` garde les commits hors cible de chaque
+    (`declared`, #6214) ; les commits que ces parents portent sont couverts
+    et ne rendent aucun autre lot parent (deux frères d'un parent déclaré ne
+    s'empilent pas l'un sur l'autre). `cache` garde les commits hors cible de chaque
     autre lot d'un appel à l'autre (même `base`). Une lecture impossible
     lève `CandidateError`."""
     mine = _pending(repo, [head], base)
@@ -465,20 +467,38 @@ def stacked_on(repo: str, head: str, base: str, others, *, lot: int,
     declared = {int(value) for value in declared or ()}
     parent_branch = merge_queue._remote_branch(str(branch_target or "").strip())
     cache = {} if cache is None else cache
+
+    def pending_of(other) -> set[str]:
+        key = (int(other["lot"]), tuple(other.get("shas") or ()), base)
+        if key not in cache:
+            cache[key] = _pending(repo, other.get("shas") or (), base)
+        return cache[key]
+
+    def excluded(other) -> bool:
+        other_branch = str(other.get("branch") or "")
+        return (int(other["lot"]) in declared
+                or bool(parent_branch and other_branch == parent_branch))
+
+    # B2 cx1 : les commits d'un parent déclaré (#6214) ou de la branche cible
+    # du lot (#3437) sont couverts : deux frères qui partagent ce parent ne
+    # s'emportent rien l'un à l'autre, seul le contenu propre compte.
+    covered: set[str] = set()
+    for other in others or ():
+        if int(other["lot"]) != int(lot) and excluded(other):
+            covered |= pending_of(other)
+    mine -= covered
+    if not mine:
+        return []
     found: list[dict] = []
     for other in others or ():
         other_lot = int(other["lot"])
         other_branch = str(other.get("branch") or "")
-        if (other_lot == int(lot) or other_lot in declared
-                or other_branch == branch
-                or (parent_branch and other_branch == parent_branch)):
+        if other_lot == int(lot) or other_branch == branch or excluded(other):
             continue
-        key = (other_lot, tuple(other.get("shas") or ()), base)
-        if key not in cache:
-            cache[key] = _pending(repo, other.get("shas") or (), base)
-        theirs = cache[key]
+        theirs = pending_of(other)
         if not theirs or (tip and tip in theirs):
             continue
+        theirs = theirs - covered
         shared = mine & theirs
         if shared:
             # le commit partagé le plus récent de `head` qui vient du parent
