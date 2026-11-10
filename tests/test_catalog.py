@@ -6,11 +6,8 @@ choses qui séparent « un modèle a disparu » de « la source a mal répondu �
 """
 from __future__ import annotations
 
-import os
-import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from ameesh.catalog import ActiveModel, reconcile  # noqa: E402
 from ameesh.discovery.base import ModelSeen, SourceResult  # noqa: E402

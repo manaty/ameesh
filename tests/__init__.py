@@ -1,7 +1,22 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Tests du paquet agent-mesh (banc local, conteneur agent-mesh-pg)."""
 import os
+import sys
 import tempfile
+
+# #6609 : sans PYTHONPATH, `python -m unittest tests.…` prenait l'ameesh du
+# venv installé et non celui de l'arbre testé (faux rouges des tests ciblés,
+# paquet-horaire refusant une bibliothèque « déjà chargée ailleurs »). L'arbre
+# `src` passe en tête une fois, ici, avant tout import d'ameesh ; une
+# bibliothèque chargée hors de cet arbre arrête la suite net.
+_SRC = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path[:] = [_SRC] + [p for p in sys.path
+                        if not p or os.path.realpath(p) != _SRC]
+import ameesh as _ameesh  # noqa: E402
+_loaded = os.path.realpath(getattr(_ameesh, "__file__", None) or "")
+if os.path.commonpath([_SRC, _loaded or "/"]) != _SRC:
+    raise ImportError("tests : ameesh chargé depuis %s, hors de l'arbre "
+                      "testé %s" % (_loaded or "?", _SRC))
 
 # #3042 : sous macOS `/tmp` et `/var` sont des liens vers `/private/...`.
 # Les gardes de sécurité des scripts de déploiement refusent, à raison, tout

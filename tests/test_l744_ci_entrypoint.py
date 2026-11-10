@@ -23,12 +23,9 @@ from .entrypoint import run as isolated_entrypoint
 import argparse
 import contextlib
 import io
-import os
-import sys
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from ameesh import db as db_mod  # noqa: E402
 from ameesh import main as main_mod  # noqa: E402

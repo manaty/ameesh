@@ -8,11 +8,8 @@ et cela se relit dans un test.
 """
 from __future__ import annotations
 
-import os
-import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from ameesh.catalog import ActiveModel, events_for, reconcile, record  # noqa: E402
 from ameesh.discovery.base import ModelSeen, SourceResult  # noqa: E402

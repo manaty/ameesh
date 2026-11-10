@@ -28,7 +28,6 @@ import io
 import itertools
 import json
 import subprocess
-import sys
 import tempfile
 import time
 import types
@@ -36,7 +35,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from ameesh import (ci, fire, packet_automerge, plan_github, work,  # noqa: E402
                     work_dependencies)
