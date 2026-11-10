@@ -1,18 +1,19 @@
 {
- "auteur": "bureau (BG) pour v1-v2.3 ; ameesh-dev3 (deepseek) pour v2.4-v2.5",
+ "auteur": "bureau (BG) pour v1-v2.3 ; ameesh-dev3 (deepseek) pour v2.4-v2.5 ; mty-amh-impl-04 (deepseek) pour v2.6",
  "conserves": [
   "v1",
   "v2",
   "v2.1",
   "v2.2",
   "v2.3",
-  "v2.4"
+  "v2.4",
+  "v2.5"
  ],
  "delta_v22_v23": [
   "retour-c3-v23.sh (retour-c3-v22-v23.diff)",
   "p6/update-l2-runtime-v32.py (p6/update-l2-runtime-v31-v32.diff)"
  ],
- "demande": "#6532 ; décision pilote #205738 ; défaut #203817 (09/11 09:45Z)",
+ "demande": "#6532 ; décision pilote #205738 ; défaut #203817 (09/11 09:45Z) ; #6763 (auditeur #209624 point 4, rapport bureau #6532 19:17Z)",
  "files": {
   ".gitattributes": "b5487bd05eee186396baf1d0e878b80abf08686268bdab0d97f8db5e8dac3f9a",
   "DOSSIER-C3-v1.md": "c88b4306981317948ed0c668b2b50bbc872fbef6178d63b08e08e513025fa7ec",
@@ -22,7 +23,7 @@
   "DOSSIER-C3-v23-T60-P6.md": "40b73b39feec812b63d3184231eddc1eff7acb0036248b1b97d18853dea7c9a7",
   "DOSSIER-C3-v23.md": "b56381618a7f872463fe17c5b167a59d4b8fcc02c8b656667233bffe6d776f3e",
   "analyse/attrs.py": "d67851674b9a5f87f8e5d3367507a797e9677611532cf9499ad6b1e4304f4cff",
-  "evaluer-c3.py": "35e6e673297e3723cbc439a3a42904755751470d6984456f205357184c37c23f",
+  "evaluer-c3.py": "758e95843fa9a4dd062b8db6efdaf9209c144b99e7d39eaba9364a85e030638c",
   "lecteur-c3.py": "782e2299b10077d4c21fae037570bdaec9c37f90b12ff2f302217047a03161f9",
   "p6/build.out.txt": "ca9760b62c03b7441ba2f653e3f2ff710f73afc75edb73be9a44c8e1da5f8b51",
   "p6/enveloppe/build-sealed-package.py": "0ffe24f67320c7fc7f72a947e25d1ad66a7c479715ffd683b03ef71c7dfe18d7",
@@ -70,19 +71,20 @@
   "sonde-c3-v21.sh": "a55387a0adef8ff86f2bee238429a33f1281a8898156d017af6af56a4675ab69",
   "sonde-c3-v22.sh": "887f4f3c64fe59fe058b4351871c2da9e6718b44851ccb1ffaa3dd77488048d8",
   "sonde-c3.sh": "ec6a8dfd7aa713c63771ceccbdd748d9e9e65ab87734c2cf0a2ae68ad1bf2fd0",
-  "temoin-apres.sh": "e47adc3f1a79ee8810f8aadb597af5939ab2e53ec34006bd4f75f4c0e8473e31",
+  "temoin-apres.sh": "0285b98f61d816d9861c6930a33127a14b3b93034664d375ed04da67ea6285f9",
   "temoin-lectures.sh": "ee6e4bedf68951520f0d1d1d952645159e2d1b67109ef3a96256d8e9f4f58f3b",
   "temoin-v23.sh": "4942cf2330cf3e8432434e9c78736d4841bf3912452a97f07b66b791fc7bd27b",
   "DOSSIER-C3-v24.md": "7a3965699778c55d96afbe9a62103e3453762fed94cfafa61438695d6bdaa342",
   "fenetre-release.sh": "5a94b6cea5fefff1d714855b38a9e3b880c060acd3145bd5d4398d857d4862bc",
   "temoin-fenetre-release.sh": "8dba75b462389209fc2ea4d25960908c8c068f41b8ac99b6c9ab97ce4d775978",
-  "DOSSIER-C3-v25.md": "2a2080f380dc11f299469aaee6b65e957c8912f92ce7bd80210e3a74b6a0d120"
+  "DOSSIER-C3-v25.md": "2a2080f380dc11f299469aaee6b65e957c8912f92ce7bd80210e3a74b6a0d120",
+  "DOSSIER-C3-v26.md": "4388c57a0e6c7998c1b4b5f56578d0951349e7f886f260dd73f4c447bc6fcddd"
  },
  "gestes": "aucun sur les VM",
  "lot": 6532,
  "note_T60": "DOSSIER-C3-v23-T60-P6.md (commande d'autorité de l'installateur v3.2, dossier seul)",
- "schema": "ameesh-5495-c3-dossier/7",
- "version": "v2.5.1",
+ "schema": "ameesh-5495-c3-dossier/8",
+ "version": "v2.6",
  "delta_v23_v24": [
   "DOSSIER-C3-v24.md (défaut de séquence #203817 + plan de relève L2 AG2->AG1)",
   "fenetre-release.sh (fermeture/restauration de la fenêtre de release, à blanc par défaut)",
@@ -91,5 +93,10 @@
  ],
  "delta_v24_v25": [
   "DOSSIER-C3-v25.md v2.5.1 (B1 auditeur #205759 : dernier staging.attested, pas le dernier rapport de release)"
+ ],
+ "delta_v25_v26": [
+  "DOSSIER-C3-v26.md (prise L2 = 1,5 x la période réelle du tick de 60 s, mesurée sur le lien d'exécution #6520 avant la préparation ; running borné par start_timeout_s)",
+  "evaluer-c3.py (critère de prise, N/M si le runtime précède #6520, constante TICK_PERIOD_S = 60 et borne 90, option --borne-prise)",
+  "temoin-apres.sh (témoins de prise 60 s OK / 124 s KO / non mesurée ; garde de dérive minuterie <-> constante)"
  ]
 }
