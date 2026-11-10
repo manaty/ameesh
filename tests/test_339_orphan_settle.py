@@ -183,6 +183,18 @@ class SettleDeadTurnsTest(PgTestCase):
         self.assertEqual(self.turns.get(turn)["status"], "orphan")
         self.assertEqual(self._review(engines=([vide, self._engine([], "podman")], [])), [turn])
 
+    def test_rootless_podman_without_namespace_does_not_hold_rows(self):
+        """#6610 : podman muet faute d'espace de noms sous no_new_privs."""
+        turn = self._row("ns", pgid=self.mort, status="orphan")
+        vide, muet = self._engine([]), self._engine(None, "/usr/bin/podman")
+        with mock.patch.object(containers, "rootless_unusable", return_value=False) as probe:
+            self.assertEqual(self._review(engines=([vide, muet], [])), [])
+        probe.assert_called_once_with(muet, [vide, muet])
+        self.assertEqual(self.turns.get(turn)["status"], "orphan")
+        with mock.patch.object(containers, "rootless_unusable", return_value=True):
+            self.assertEqual(self._review(engines=([vide, muet], [])), [turn])
+        self.assertEqual(self.turns.get(turn)["status"], "done")
+
     def test_unknown_boot_time_settles_nothing(self):
         turn = self._row("bn", pgid=self.mort, status="orphan")
         self.assertEqual(self._review(uptime=None), [])
@@ -255,6 +267,46 @@ class AllRuntimesTest(unittest.TestCase):
             engines, silent = containers.all_runtimes(self.cfg, run=run)
         self.assertEqual([e.context for e in engines], ["", "default"])
         self.assertEqual(silent, [podman])
+
+    # #6610 : podman sans racine, espace de noms refusé sous no_new_privs
+    USERNS = ('level=error msg="running `/usr/bin/newuidmap 1 0 1001 1 1 165536 65536`: '
+              'newuidmap: write to uid_map failed: Operation not permitted"\n'
+              'level=error msg="invalid internal status, try resetting the pause process: '
+              'cannot set up namespace using \\"/usr/bin/newuidmap\\": exit status 1"\n')
+
+    def _unusable(self, binary="/usr/bin/podman", context="", *, stderr=USERNS, rc=125,
+                  nnp=True, env=None, engines=None):
+        runtime = containers.Runtime(
+            binary=binary, timeout=5.0, context=context,
+            run=lambda argv, **_: mock.Mock(returncode=rc, stdout="", stderr=stderr))
+        with mock.patch.object(platform, "no_new_privs", return_value=nnp), \
+                mock.patch.dict(os.environ, env or {}, clear=True):
+            return containers.rootless_unusable(runtime, engines or [runtime])
+
+    def test_rootless_podman_refused_under_no_new_privs(self):
+        self.assertTrue(self._unusable())
+
+    def test_doubt_keeps_the_engine_silent(self):
+        named = containers.Runtime(binary="/usr/bin/podman", timeout=5.0, context="machine")
+        for case, kwargs in (
+                ("privileges available", {"nnp": False}),
+                ("docker", {"binary": "/usr/bin/docker"}),
+                ("named connection", {"context": "machine"}),
+                ("connection listed", {"engines": [named]}),
+                ("CONTAINER_HOST", {"env": {"CONTAINER_HOST": "ssh://h"}}),
+                ("CONTAINER_CONNECTION", {"env": {"CONTAINER_CONNECTION": "m"}}),
+                ("another failure", {"stderr": "Error: cannot connect to Podman\n"}),
+                ("info answers", {"rc": 0})):
+            with self.subTest(case=case):
+                self.assertFalse(self._unusable(**kwargs))
+
+    def test_no_new_privs_read_from_proc(self):
+        for text, expected in (("Name:\tx\nNoNewPrivs:\t1\n", True),
+                               ("NoNewPrivs:\t0\n", False), ("Name:\tx\n", False)):
+            with mock.patch("builtins.open", mock.mock_open(read_data=text.encode())):
+                self.assertIs(platform.no_new_privs(), expected)
+        with mock.patch("builtins.open", side_effect=OSError):
+            self.assertFalse(platform.no_new_privs())
 
     def test_shims_skipped_disabled_engine_none(self):
         shims = os.path.join(self.dir, "shims")
