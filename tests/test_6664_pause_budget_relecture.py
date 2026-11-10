@@ -305,9 +305,15 @@ class DebitPauseRelayTest(unittest.TestCase):
                         "missing": 0, "why": "test",
                         "freeze": {"id": freeze_id, "sha": "a" * 40}}))
 
-    def report(self, *, status="blocked", text=BUDGET):
+    def report(self, *, status="blocked", text=BUDGET, reviewers=None):
+        """Un rapport du débit ; `reviewers` permet une attente mixte (#6667).
+
+        Chaque relecteur est `(nom, statut, texte de statut)` et la
+        désignation les nomme tous ; sans liste, l'unique relecteur claude1
+        est en pause."""
         freeze_at = T - 4 * HEURE
         item = self._item()
+        seats = reviewers or [("claude1", status, text)]
         return debit.build(
             items=[item],
             milestones=[{"work_item_id": item["id"], "id": 100, "kind": "frozen",
@@ -315,10 +321,13 @@ class DebitPauseRelayTest(unittest.TestCase):
                          "actor": "auteur"}],
             events=[{"work_item_id": item["id"], "id": 100, "state": "qa",
                      "at_ts": freeze_at, "actor": "pilote",
-                     "note": self._mark(item["id"], 100, ["claude1"])}],
-            agents=[{"name": "claude1", "harness": "claude", "status": status,
-                     "status_text": text, "mode": "execute", "team": "nexlink",
-                     "operator_paused": False}],
+                     "note": self._mark(
+                         item["id"], 100,
+                         [name for name, _status, _text in seats])}],
+            agents=[{"name": name, "harness": "claude", "status": state,
+                     "status_text": note, "mode": "execute", "team": "nexlink",
+                     "operator_paused": False}
+                    for name, state, note in seats],
             turns=[], merges=[], ci_runs=[], jobs=[], now=T,
             installed="1.45.0",
             devices={"names": [], "phrases": [], "sources": [], "unreadable": []},
@@ -347,6 +356,19 @@ class DebitPauseRelayTest(unittest.TestCase):
         row = self._wait(self.report(status="blocked", text=SHORT))
         self.assertEqual(row["who"], "claude1")
         self.assertNotIn("pause", row["gesture"])
+
+    def test_une_attente_mixte_nomme_un_geste_par_relecteur(self):
+        # #6667 : le relecteur actif est relancé, celui en pause passe au
+        # pilote ; la relance ne part jamais chez ce dernier.
+        row = self._wait(self.report(reviewers=[
+            ("claude1", "blocked", BUDGET),
+            ("claude2", "idle", "last turn: mail")]))
+        self.assertEqual(row["who"], "claude1, claude2")
+        self.assertIn("relecteur claude1 en pause (budget paused) : pilote",
+                      row["gesture"])
+        self.assertNotIn("relancer le relecteur claude1", row["gesture"])
+        self.assertIn("relancer le relecteur claude2", row["gesture"])
+        self.assertFalse(row.get("paused"))
 
 
 if __name__ == "__main__":
