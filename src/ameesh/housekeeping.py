@@ -4348,8 +4348,18 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # précisément le travail non poussé — et les copies étrangères
         # suivent la même fin au lieu d'être écartées avant ce bloc.
         held_by_archive = None
+        # Git's clean status excludes ignored files. Integration (including
+        # packet evidence) never authorises discarding these local files.
+        leftovers = []
+        if st["clean"] and st["integrated"] and not st["submodules"]:
+            leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts),
+                                          budget=window)
+            if leftovers is None:
+                plan.append(dict(base, action="garde", detail=
+                                 "ignored files unreadable (git status --ignored)"))
+                continue
         unpushed = bool(st.get("head")) and not st["pushed"] and not st["integrated"]
-        unsaved = not st["clean"] or unpushed
+        unsaved = not st["clean"] or unpushed or bool(leftovers)
         if archive and ended and unsaved and st["head"] and not st["locked"] \
                 and not st["submodules"] \
                 and _archive_due(db, idents, archive, now=now, youngest=youngest):
@@ -4357,7 +4367,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 path, row.get("repo") or "", base, why=why, st=st, state=state,
                 archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
                 allow=allow, lock_path=lock_path, journal_path=journal_path,
-                skip_roots=skip_roots, held=_unsaved_work(st),
+                skip_roots=skip_roots, held="ignored files only" if leftovers else _unsaved_work(st),
                 budget=budget, reserve_s=reserve_s)
             entries += done["entries"]
             if done["plan"]["action"] != "garde":
@@ -4369,7 +4379,10 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             # dev3 N3: the refusal is the kept reason, in the status and
             # the `kept` line (written when it changes), not only in a plan
             detail = held_by_archive["detail"]
-        if not st["clean"] or not st["integrated"] or st["submodules"]:
+        if not st["clean"] or not st["integrated"] or st["submodules"] or leftovers:
+            if leftovers and held_by_archive is None:
+                detail = "%s; %d ignored file(s) outside build artifacts (%s)" % (
+                    detail, len(leftovers), leftovers[0])
             plan.append(held_by_archive or dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)

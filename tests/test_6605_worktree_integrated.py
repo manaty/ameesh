@@ -2,6 +2,7 @@
 """#6605: lot target, packet evidence and delta archives (isolated Git)."""
 import json
 import os
+import tarfile
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,6 +12,46 @@ from .test_3728_menage_archive import _ArchiveRepo, _touch, RETENTION
 
 
 class TargetTest(_Repo):
+    def test_packet_ignored_file_at_two_hours_is_preserved(self):
+        for mode in ('archive', 'not-due', 'disabled', 'unreadable'):
+            with self.subTest(mode=mode):
+                wt = self.add_worktree('lot-' + mode)
+                _write(os.path.join(wt, '.env'), text='PRIVATE=keep\n')
+                head = _git('rev-parse', 'HEAD', cwd=wt).strip()
+                self.assertTrue(hk.worktree_state(wt)['clean'])
+                now = 2_000_000_000.0
+                _touch(wt, now - 2 * 3600)
+                row = dict(id=1, path=wt, repo=hk.common_dir(self.main), agent='dev2',
+                           lot='7', status='kept', created_ts=now - DAY,
+                           checked_ts=now - 2 * 3600, detail='previously kept')
+                store = _Store([row], {7: 'merged'})
+                store.work.get = lambda ident: dict(state='merged', branch='lot-' + mode,
+                    branch_target='develop', frozen_sha=head, closed_ts=now - 2 * 3600)
+                store.work.milestones = lambda ident, limit: [dict(kind='merged', sha='packet')]
+                archive = dict(after=DAY if mode == 'not-due' else 3600,
+                    retention=RETENTION, root=os.path.join(self.base, 'archives-' + mode))
+                ignored_check = (mock.patch.object(hk, 'ignored_leftovers', return_value=None)
+                    if mode == 'unreadable' else mock.patch.object(
+                        hk, 'ignored_leftovers', wraps=hk.ignored_leftovers))
+                with mock.patch.object(hk.storage, 'of', return_value=store), \
+                        mock.patch.object(hk, 'worktree_holders', return_value=(False, '')), \
+                        ignored_check:
+                    entries, plan = hk._worktree_pass(None, 'pc', protected=set(), now=now,
+                        dry_run=False, archive=None if mode == 'disabled' else archive,
+                        lock_path=os.path.join(self.base, 'state', 'lock'),
+                        journal_path=self.journal_path)
+                if mode == 'archive':
+                    self.assertEqual(plan[0]['action'], 'retrait', plan)
+                    self.assertFalse(os.path.exists(wt))
+                    archived, = [entry for entry in entries if entry['action'] == 'archived']
+                    with tarfile.open(os.path.join(archived['data']['archive'],
+                                                  'untracked.tar.gz')) as saved:
+                        self.assertEqual(saved.extractfile('.env').read(), b'PRIVATE=keep\n')
+                else:
+                    self.assertEqual(plan[0]['action'], 'garde', plan)
+                    with open(os.path.join(wt, '.env')) as source:
+                        self.assertEqual(source.read(), 'PRIVATE=keep\n')
+
     def test_develop_instead_of_default_main(self):
         wt = self.add_worktree('lot-7')
         _git('push', '-q', 'origin', 'HEAD:develop', cwd=wt)
