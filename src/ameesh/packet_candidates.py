@@ -1687,7 +1687,13 @@ def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
                     row, frozen=frozen, raw_freeze=raw, published=published,
                     published_source=source, repo=repo, target=target_name,
                     base=base, remises=evaluated)
-    if (repo and frozen and base and result.get("code") not in _BEFORE_STACKED):
+    vehicle = packet_guard.is_packet_branch(str(row.get("branch") or ""))
+    # #6703 : un porteur de paquet (`integration/**`) est le véhicule de ses
+    # membres, jamais un lot empilé sur eux. Même garde que `_candidate`
+    # (`packet-vehicle`) sur ce chemin : sans elle, l'alerte SLO du porteur
+    # #6700 demandait de déclarer une dépendance sur des lots qu'il porte.
+    if (repo and frozen and base and not vehicle
+            and result.get("code") not in _BEFORE_STACKED):
         stacked = _stacked_for(db, row, repo=repo, frozen=frozen, base=base,
                                open_heads=open_heads)
         if stacked:

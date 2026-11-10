@@ -787,7 +787,21 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         branch = str(waiting.get("branch") or "")
         where = " (%s)" % branch if branch else ""
         ci = _packet_ci_text(waiting.get("ci") or {})
-        if level >= 3:
+        if waiting.get("self"):
+            # #6703 : le lot est lui-même le véhicule du paquet ; sa vraie
+            # attente est sa propre CI complète, puis sa fusion. Aucun
+            # composeur ne le portera et aucune dépendance n'est à déclarer.
+            if level >= 3:
+                move = ("bureau or auditor: the %s is itself the packet vehicle %s%s "
+                        "and waits for its full CI%s — push the pilot to merge it once "
+                        "green; no composer carries it and no dependency is to be "
+                        "declared" % (v.noun, packet, where, ci))
+            else:
+                move = ("pilot: the %s is itself the packet vehicle %s%s and waits for "
+                        "its full CI%s — do not look for a composer or declare a "
+                        "dependency: merge it once its CI is green"
+                        % (v.noun, packet, where, ci))
+        elif level >= 3:
             move = ("bureau or auditor: the %s is carried by packet %s%s and waits for "
                     "the packet's full CI%s — do not reassign or nudge its holder; push "
                     "the pilot/composer to see the packet through (the %s merges with "
