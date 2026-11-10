@@ -120,8 +120,9 @@ def cmd_read(cfg, args) -> int:
         return 2
     except plan_github.GithubRateLimited as exc:
         when = time.strftime("%H:%M:%SZ", time.gmtime(exc.reset)) if exc.reset else "unknown"
-        print("github: quota exhausted (reset at %s) and %s is not in the shared "
-              "cache yet" % (when, args.path), file=sys.stderr)
+        print("github: quota %s (reset at %s) and %s is not in the shared "
+              "cache yet" % ("reserve reached" if getattr(exc, "reserve", False) else "exhausted",
+                             when, args.path), file=sys.stderr)
         return EXIT_RATE_LIMITED
     except plan_github.GithubError as exc:
         print("github: %s" % exc, file=sys.stderr)

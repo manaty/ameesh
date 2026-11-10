@@ -194,6 +194,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "decision_pending", "decision_overdue",
                  # L161c : la CI de main est rouge (elle bloque les déploiements)
                  "ci_main_red",
+                 # #6649 : quota GitHub sous la réserve — sondages différés
+                 "github_quota_low",
                  # #845 : la garde de la CI — runner busy sans job (panne) et
                  # file au-delà du SLO de 15 min (capacité)
                  "ci_runner_stuck", "ci_queue_saturated", "ci_disk_low", "ci_disk_unreadable",
@@ -297,6 +299,8 @@ TYPE_LABELS = {
     "mesh_backup_unseen": "mesh database backup not seen",
     "migration_pending_non_additive": "non-additive migration waiting",
     "staging_canon_stale": "staging executor canon behind the agents' canon",
+    # #6649: routine GitHub polls deferred to keep the gate/merge reserve
+    "github_quota_low": "GitHub API quota reserve reached",
     "host_migration_pending_non_additive": (
         "non-additive migration waiting on a host base"),
     "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
