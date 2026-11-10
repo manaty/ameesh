@@ -72,6 +72,10 @@ PROBE_PYTHON = ".local/share/ameesh/venv/bin/python"
 #: marker; its live version is the target of the sibling link `venv-courant`.
 BASCULE_LAUNCHERS = ".bascule-lanceurs"
 BASCULE_CURRENT = "venv-courant"
+#: #6776: terminal states of a request never taken: its start deadline
+#: passed, or the pilot or the office cancelled it.
+EXPIRED = "expired"
+CANCELLED = "cancelled"
 
 
 class ExecutionLease(role_run._AlertsLease):
@@ -895,6 +899,65 @@ def latest(db, key):
     return rows[0]["data"] if rows else None
 
 
+def start_expired(request: dict, now: float | None = None) -> bool:
+    """#6776: a pending request past its start deadline is never taken.
+
+    The deadline only judges a request no attempt started: a running one
+    carries the deployment's own deadline, judged by staging_watch."""
+    deadline = request.get("deadline")
+    return (request.get("state") == "pending"
+            and isinstance(deadline, (int, float)) and not isinstance(deadline, bool)
+            and (time.time() if now is None else now) >= deadline)
+
+
+def _terminal(request: dict, state: str, **fields) -> dict:
+    """A terminal snapshot; the last refusal stays apart from the outcome."""
+    data = dict(request, state=state, **fields)
+    blocked = data.pop("blocked_reason", None)
+    if blocked:
+        data["last_blocked_reason"] = blocked
+    return data
+
+
+def _expire(db, key, request, *, lease) -> dict:
+    data = _terminal(request, EXPIRED, expired_at=time.time(),
+                     reason="start deadline exceeded")
+    _record(db, key, data, lease=lease)
+    return data
+
+
+def cancel(db, cfg, options, request_id, *, reason, actor):
+    """#6776: cancel a pending request, journaled with its actor and reason.
+
+    Same guard as submit (the executor configuration and the shared
+    execution lease). A running request is refused: a sequence is never
+    killed from here, only stopped by its own monitor."""
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("cancel requires a reason")
+    if not str(actor or "").strip():
+        raise ValueError("cancel requires an actor")
+    lease = ExecutionLease(db, options["role"], cfg.host, options["key"])
+    if lease.acquire() is None:
+        raise RuntimeError("staging execution busy; request not cancelled")
+    try:
+        current = latest(db, options["key"])
+        if not current or current.get("request") != request_id:
+            raise RuntimeError("not the current staging request: " + request_id)
+        state = current.get("state")
+        if state == "running":
+            raise RuntimeError("staging request running: a sequence is never "
+                               "killed; not cancelled")
+        if state != "pending":
+            raise RuntimeError("staging request already terminal: " + str(state))
+        data = _terminal(current, CANCELLED, cancelled_at=time.time(),
+                         cancelled_by=actor, reason=reason)
+        _record(db, options["key"], data, lease=lease)
+        return data
+    finally:
+        lease.release()
+
+
 def submit(db, cfg, options, sha, *, included=()):
     """Queue a commit without executing any host operation in this process."""
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
@@ -929,8 +992,9 @@ def submit(db, cfg, options, sha, *, included=()):
             for field in ("unit_pid", "return_pid", "return_recovery"):
                 if previous.get(field):
                     data[field] = previous[field]
-            if previous.get("return_recovery") and previous.get("blocked_reason"):
-                data["blocked_reason"] = previous["blocked_reason"]
+            blocked = previous.get("blocked_reason") or previous.get("last_blocked_reason")
+            if previous.get("return_recovery") and blocked:
+                data["blocked_reason"] = blocked
         _record(db, options["key"], data, lease=lease)
         return data
     finally:
@@ -990,6 +1054,10 @@ def tick(db, cfg, options) -> dict:
         elected = role_run.live(db, options["role"])
         if not elected["held"] or elected.get("holder") != host:
             return {"state": "standby", "reason": "role changed"}
+        # #6776: past its start deadline, a pending request is terminal,
+        # blocked or not: no candidate takes it, even after a takeover.
+        if start_expired(request):
+            return _expire(db, options["key"], request, lease=lease)
         # #6761: a sequence that cannot resolve the executor's own base never
         # takes the request: a named refusal, no run, and the request stays
         # pending for another candidate. The refusal is also what the alerts
@@ -1140,6 +1208,9 @@ def tick(db, cfg, options) -> dict:
         project = release_cutoff.ProjectRelease(name=options["project"], repo=repo)
         if staging_pending.regressions(project, sha, db=db):
             return blocked("candidate would roll back active content")
+        # #6776: the preparation above may outlast the deadline.
+        if start_expired(request):
+            return _expire(db, options["key"], request, lease=lease)
         queued = request
         attempt = dict(request, state="running", host=host, run=uuid.uuid4().hex,
                        started=time.time(), notify=options["role"],
@@ -1315,6 +1386,13 @@ def tick(db, cfg, options) -> dict:
         lease.release()
 
 
+def _actor() -> str:
+    """Who cancels: the agent named by the environment, else the local account."""
+    import getpass
+    name = os.environ.get("AGENT_MAIL_NAME")
+    return "agent:%s" % name if name else "cli:%s" % getpass.getuser()
+
+
 def main(argv=None):
     from .platform.child_environment import install
     install()
@@ -1324,6 +1402,9 @@ def main(argv=None):
     commands.add_parser("tick")
     submit_p = commands.add_parser("submit")
     submit_p.add_argument("sha")
+    cancel_p = commands.add_parser("cancel")
+    cancel_p.add_argument("request")
+    cancel_p.add_argument("--reason", required=True)
     args = parser.parse_args(argv)
     # #5500: whatever this process creates (the attempt's worktree) must
     # pass the guard: never group or other writable.
@@ -1344,8 +1425,13 @@ def main(argv=None):
     options = settings(args.config)
     conn = db_mod.connect(cfg)
     try:
-        result = (submit(conn, cfg, options, args.sha) if args.command == "submit"
-                  else tick(conn, cfg, options))
+        if args.command == "submit":
+            result = submit(conn, cfg, options, args.sha)
+        elif args.command == "cancel":
+            result = cancel(conn, cfg, options, args.request,
+                            reason=args.reason, actor=_actor())
+        else:
+            result = tick(conn, cfg, options)
         print(json.dumps(result, ensure_ascii=False))
         return 1 if result.get("state") in ("failed", "blocked") else 0
     finally:

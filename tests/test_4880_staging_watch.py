@@ -88,6 +88,17 @@ class LivenessTest(unittest.TestCase):
                 staging_watch.record(object(), dict(beating(150)["data"],
                                                     beat=float("nan")))
 
+    def test_expired_request_alerts_and_cancelled_does_not(self):
+        # #6776: the requester learns of the expiry; a cancel is a gesture.
+        expired = request_row(5, "r1", state="expired", deadline=200,
+                              last_blocked_reason="forge CI: pending")
+        found = staging_watch.request_findings([expired], now=1000)
+        self.assertEqual(len(found), 1)
+        self.assertIn("expirée", found[0]["detail"])
+        self.assertIn("forge CI: pending", found[0]["detail"])
+        cancelled = request_row(5, "r1", state="cancelled", deadline=200)
+        self.assertEqual(staging_watch.request_findings([cancelled], now=1000), [])
+
     def test_running_request_past_its_deadline_follows_its_sequence(self):
         request = request_row(5, "r1", state="running", run="run-a", deadline=200)
         healthy = beating(1000)

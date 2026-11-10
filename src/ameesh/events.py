@@ -49,6 +49,8 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        before staging mutations and at each step (#4880)
   staging.request      queued commit and elected execution attempt; survives
                        the launching turn, reused by candidate takeover (#4880)
+                       pending past its start deadline: expired; pending
+                       cancelled by `cancel --reason`, actor kept (#6776)
   git.lock_removed     an orphan git lock removed from a radar clone: path, age,
                        size (no table: written by `resolutions`, #5179)
   mail.export          a v0 mailbox export: actor, boxes, rows, decision requests
