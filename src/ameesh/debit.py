@@ -59,7 +59,12 @@ qu'avec ce lot, dont le hold couvre déjà l'attente. Le rapport le marque
 #6214 : un prérequis explicite (`ameesh work dependencies`) encore bloquant
 suit la même règle — le lot n'est pas une attente de paquet, le rapport nomme
 le prérequis (`depends_on`, `blocking_dependencies`) et `--check` ne sort 2
-que si le prérequis lui-même dépasse son seuil.
+que si le prérequis lui-même dépasse son seuil. #6607 : un lot relu dont la
+tête gelée porte des commits d'un autre lot ouvert absents de la cible, sans
+dépendance déclarée (`stacked-undeclared`, même lecture que
+`paquet-candidats`), n'est pas non plus une attente de paquet : la ligne
+devient `stacked_undeclared`, nomme le parent (`depends_on`) et le geste de
+l'auteur ou du pilote (déclarer la dépendance, ou rebaser).
 
 #3256 B : la section `capacity` (spec `docs/design/3256-debit-file.md` §3) —
 agents réveillables au repos, heures-agent au repos, lots démarrables, lot de
@@ -2813,6 +2818,9 @@ def annotate_candidate_causes(db, cfg, report: Mapping[str, Any],
     #: nommer comme débiteur serait l'angle mort déjà corrigé pour les briefs.
     paused = {_norm(row.get("name")) for row in overview
               if row.get("operator_paused")}
+    #: #6607 : les têtes des lots ouverts, lues une fois par projet
+    open_heads: dict[str, list] = {}
+    by_lot = {int(row.get("lot") or 0): row for row in rows}
     for row in rows:
         lot = int(row.get("lot") or 0)
         try:
@@ -2824,9 +2832,22 @@ def annotate_candidate_causes(db, cfg, report: Mapping[str, Any],
             # Un lot sans branche n'est pas un candidat au paquet : la cause
             # `missing-branch` relève de la prise du lot, pas de la fusion.
             continue
+        app = str(item.get("app") or "")
+        if app not in open_heads:
+            try:
+                heads, truncated = packet_candidates.open_lot_heads(db, app)
+                open_heads[app] = [] if truncated else heads
+                if truncated:
+                    unreadable.append("project %s: open lots truncated, stacked "
+                                      "branches not read (#6607)" % (app or "?"))
+            except Exception as exc:  # noqa: BLE001 - lecture nommée, pas devinée
+                open_heads[app] = []
+                unreadable.append("project %s: open lots unreadable for stacked "
+                                  "branches: %s" % (app or "?", exc))
         try:
             cause = packet_candidates.candidate_refusal(
-                db, cfg, item, marks_by_lot.get(lot, ()), overview=overview)
+                db, cfg, item, marks_by_lot.get(lot, ()), overview=overview,
+                open_heads=open_heads[app])
         except Exception as exc:  # noqa: BLE001 - une lecture ne fait pas tomber le débit
             unreadable.append("lot %d: candidate cause unreadable: %s" % (lot, exc))
             continue
@@ -2838,6 +2859,25 @@ def annotate_candidate_causes(db, cfg, report: Mapping[str, Any],
         author = item.get("assignee") or "l'auteur"
         detail = " (%s)" % cause["detail"] if cause.get("detail") else ""
         row["cause"] = cause
+        if cause["code"] == "stacked-undeclared":
+            # #6607 : une branche empilée sur un lot ouvert non fusionné n'est
+            # pas une attente du paquet (le composeur la refuse) : c'est une
+            # dépendance non déclarée. Le geste est à l'auteur ou au pilote ;
+            # la déclaration faite, #6214 range le lot derrière son parent.
+            parent = int(cause.get("depends_on") or 0)
+            row["kind"] = "stacked_undeclared"
+            row["level"] = 1
+            row["depends_on"] = parent
+            row["who"] = "pilote" if _norm(author) in paused else author
+            row["gesture"] = (
+                "cause `stacked-undeclared`%s — %s ou pilote : `ameesh work "
+                "dependencies %d --add %d`, ou rebaser sur la cible"
+                % (detail, author, lot, parent))
+            carrier = by_lot.get(parent)
+            if carrier is not None and carrier.get("kind") == "qa_merge":
+                carrier["dependents"] = sorted(
+                    set(carrier.get("dependents") or ()) | {lot})
+            continue
         if _norm(author) in paused:
             # #6396/#6423 : la relance ne part pas chez un auteur endormi.
             # Le pilote porte le geste (§9) : réassigner le lot ou attendre la

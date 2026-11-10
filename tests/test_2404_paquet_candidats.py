@@ -76,6 +76,11 @@ class FakeWork:
     def get(self, lot: int):
         return next((row for row in self.rows if row["id"] == lot), None)
 
+    def open_for_sweep(self, limit):
+        """#6607 : les lots ouverts, pour reconnaître une branche empilée."""
+        return [dict(row) for row in self.rows
+                if row["state"] not in ("delivered", "closed")][:limit]
+
 
 class FakeProgress:
     def __init__(self, marks: dict[int, list[dict]], holds: dict[int, list[dict]] | None = None):
@@ -560,6 +565,72 @@ class InventoryTest(unittest.TestCase):
         self.assertIn(1, payload["ready"])
         self.assertTrue(all(row["assignee"] == "author"
                             for row in self.rows if row["app"] == "ameesh"))
+
+    def stacked(self, lot: int = 14, parent_branch: str = "lot/1-ready") -> None:
+        """#6607 : un lot gelé et relu, branché sur la branche non fusionnée
+        d'un autre lot, sans dépendance déclarée."""
+        name = "lot/%d-stacked" % lot
+        _git(self.repo, "switch", "-q", "-c", name, parent_branch)
+        _write(self.repo, "stacked.py", "x\n")
+        tip = _commit(self.repo, "#%d" % lot)
+        _git(self.repo, "switch", "-q", "main")
+        _git(self.repo, "push", "-q", "origin", name)
+        self.marks[lot] = [
+            {"id": 1400, "work_item_id": lot, "kind": "frozen", "sha": tip,
+             "actor": "author", "verdict": None, "at_ts": 1400.0},
+            {"id": 1401, "work_item_id": lot, "kind": "verdict", "sha": tip,
+             "actor": "reviewer", "verdict": "ok", "at_ts": 1401.0}]
+        self.rows.append({"id": lot, "state": "qa", "app": "ameesh",
+                          "branch": name, "branch_target": None,
+                          "title": "lot %d" % lot, "assignee": "author",
+                          "priority": 2, "created_ts": float(lot)})
+        self.classes[lot] = "normal"
+
+    def test_stacked_branch_without_dependency_is_refused(self):
+        # #6607 : composé seul, le lot 14 emporterait les commits non relus
+        # du lot 1 ; le parent, lui, reste prêt.
+        self.stacked()
+        payload = self.inventory()
+        entry = self.by_id(payload)[14]
+        self.assertFalse(entry["ready"])
+        self.assertNotIn(14, payload["ready"])
+        self.assertIn(1, payload["ready"])
+        cause = next(c for c in entry["causes"] if c["code"] == "stacked-undeclared")
+        self.assertEqual(cause["depends_on"], 1)
+        self.assertEqual(cause["stacked_on"][0]["lot"], 1)
+        self.assertIn("ameesh work dependencies 14 --add 1", cause["detail"])
+
+    def test_stacked_on_a_lot_outside_qa_is_refused(self):
+        # Le parent en `build` n'est pas candidat : sa tête vient du gel.
+        self.stacked()
+        next(row for row in self.rows if row["id"] == 1)["state"] = "build"
+        entry = self.by_id(self.inventory())[14]
+        self.assertEqual(
+            [c["depends_on"] for c in entry["causes"]
+             if c["code"] == "stacked-undeclared"], [1])
+
+    def test_declared_dependency_replaces_the_stacked_refusal(self):
+        self.stacked()
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 14, "blocker_id": 1, "blocker_state": "qa",
+             "blocking": True}]
+        codes = [c["code"] for c in self.by_id(self.inventory())[14]["causes"]]
+        self.assertIn("dependency-blocking", codes)
+        self.assertNotIn("stacked-undeclared", codes)
+
+    def test_parent_already_in_target_is_not_a_stack(self):
+        self.stacked()
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "livre #1", "lot/1-ready")
+        _git(self.repo, "push", "-q", "origin", "main")
+        payload = self.inventory()
+        self.assertIn(14, payload["ready"], self.by_id(payload)[14]["causes"])
+
+    def test_unreadable_open_lots_refuse_the_inventory(self):
+        self.stacked()
+        with mock.patch.object(FakeWork, "open_for_sweep",
+                               side_effect=RuntimeError("base")):
+            with self.assertRaises(packet_candidates.CandidateError):
+                self.inventory()
 
     def test_freeze_not_at_published_head_is_named(self):
         entry = self.by_id(self.inventory())[2]

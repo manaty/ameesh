@@ -2991,10 +2991,11 @@ def _default_remote_ref(path: str, budget: PassBudget | None = None) -> str:
     return ""
 
 
-def worktree_state(path: str, budget: PassBudget | None = None) -> dict:
+def worktree_state(path: str, budget: PassBudget | None = None, *,
+                   target: str | None = "", integrated_head: str = "") -> dict:
     """État d'un worktree pour son retrait : `exists`, `clean`, `pushed` (HEAD
     sur une branche distante), `integrated` (HEAD contenu dans la branche
-    principale distante, ou intégré par rebase), `locked` (`git worktree
+    cible distante, ou intégré par rebase/paquet), `locked` (`git worktree
     lock`), `head`, `reason` (pourquoi il ne peut pas être retiré, vide
     sinon).
 
@@ -3029,8 +3030,15 @@ def worktree_state(path: str, budget: PassBudget | None = None) -> dict:
     remote = _git(["for-each-ref", "--contains", "HEAD", "--count=1", "refs/remotes"],
                   path, budget=budget)
     out["pushed"] = bool(remote is not None and remote.returncode == 0 and remote.stdout.strip())
-    ref = _default_remote_ref(path, budget=budget) if out["head"] else ""
-    if ref:
+    # #6605: an explicit lot target must never fall back to main if absent.
+    if target is None or not out["head"]:
+        ref = ""  # unreadable or conflicting lot targets grant no Git proof
+    else:
+        target = target.removeprefix("refs/heads/").removeprefix("refs/remotes/")
+        ref = ((target if target.startswith("origin/") else "origin/" + target)
+               if target else _default_remote_ref(path, budget=budget))
+    out["integrated"] = bool(integrated_head and out["head"] == integrated_head)
+    if ref and not out["integrated"]:
         ancestor = _git(["merge-base", "--is-ancestor", "HEAD", ref], path,
                         budget=budget)
         if ancestor is not None and ancestor.returncode == 0:
@@ -3790,6 +3798,46 @@ def _lot_state(db, lot) -> str | None:
     return row.get("state") if row else None
 
 
+def _worktree_lot_evidence(db, idents, branch: str, path: str,
+                           budget: PassBudget | None = None) -> tuple[str | None, str]:
+    """#6605: target and frozen source HEAD of an actually landed lot.
+
+    A milestone on a rewritten packet commit proves the frozen source, not
+    arbitrary later commits on its branch. Existing all-lots-ended,
+    inactivity and process guards still apply.
+    """
+    targets, heads = set(), set()
+    for ident in idents:
+        try:
+            work = storage.of(db).work
+            item = work.get(int(str(ident).lstrip("#"))) or {}
+        except Exception:
+            return None, ""
+        try:
+            if item.get("branch_target"):
+                targets.add(item["branch_target"])
+            frozen = item.get("frozen_sha")
+            if not frozen or item.get("branch") != branch or item.get("state") not in LOT_MERGED \
+                    or (item.get("build_at") or 0) > (item.get("frozen_at") or 0):
+                continue
+            marks = work.milestones(int(str(ident).lstrip("#")), None)
+            if any(m.get("kind") in ("merged", "delivered") and not m.get("annulled")
+                   and (m.get("at_ts") or 0) >= (item.get("frozen_at") or 0)
+                   for m in marks):
+                heads.add(frozen)
+        except Exception:  # unreadable registry cannot authorise removal
+            continue
+    if len(targets) == 1:
+        target = next(iter(targets))
+    elif targets:
+        target = None  # conflicting targets: do not guess main
+    else:
+        configured = _git(["config", "--get", "ameesh.target"], path, budget=budget)
+        target = (configured.stdout.strip() if configured is not None
+                  and configured.returncode == 0 else "")
+    return target, next(iter(heads)) if len(heads) == 1 else ""
+
+
 def _mtime(path: str) -> float | None:
     try:
         return os.stat(path).st_mtime
@@ -4179,7 +4227,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             plan.append(dict(base, action="garde",
                              detail="linked worktree no longer matches its tracked repository"))
             continue
-        st = worktree_state(path, budget=window)
+        target_ref, landed_head = _worktree_lot_evidence(db, idents, branch, path, window)
+        st = worktree_state(path, budget=window, target=target_ref,
+                            integrated_head=landed_head)
         if not st["exists"]:
             plan.append(dict(base, action="disparu", detail=why))
             if not dry_run:
@@ -4298,8 +4348,18 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # précisément le travail non poussé — et les copies étrangères
         # suivent la même fin au lieu d'être écartées avant ce bloc.
         held_by_archive = None
+        # Git's clean status excludes ignored files. Integration (including
+        # packet evidence) never authorises discarding these local files.
+        leftovers = []
+        if st["clean"] and st["integrated"] and not st["submodules"]:
+            leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts),
+                                          budget=window)
+            if leftovers is None:
+                plan.append(dict(base, action="garde", detail=
+                                 "ignored files unreadable (git status --ignored)"))
+                continue
         unpushed = bool(st.get("head")) and not st["pushed"] and not st["integrated"]
-        unsaved = not st["clean"] or unpushed
+        unsaved = not st["clean"] or unpushed or bool(leftovers)
         if archive and ended and unsaved and st["head"] and not st["locked"] \
                 and not st["submodules"] \
                 and _archive_due(db, idents, archive, now=now, youngest=youngest):
@@ -4307,7 +4367,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 path, row.get("repo") or "", base, why=why, st=st, state=state,
                 archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
                 allow=allow, lock_path=lock_path, journal_path=journal_path,
-                skip_roots=skip_roots, held=_unsaved_work(st),
+                skip_roots=skip_roots, held="ignored files only" if leftovers else _unsaved_work(st),
                 budget=budget, reserve_s=reserve_s)
             entries += done["entries"]
             if done["plan"]["action"] != "garde":
@@ -4319,7 +4379,10 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             # dev3 N3: the refusal is the kept reason, in the status and
             # the `kept` line (written when it changes), not only in a plan
             detail = held_by_archive["detail"]
-        if not st["clean"] or not st["integrated"] or st["submodules"]:
+        if not st["clean"] or not st["integrated"] or st["submodules"] or leftovers:
+            if leftovers and held_by_archive is None:
+                detail = "%s; %d ignored file(s) outside build artifacts (%s)" % (
+                    detail, len(leftovers), leftovers[0])
             plan.append(held_by_archive or dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
