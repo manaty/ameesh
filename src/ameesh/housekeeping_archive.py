@@ -60,10 +60,10 @@ UNMERGED = frozenset(("DD", "AU", "UD", "UA", "DU", "AA", "UU"))
 EXCLUDED_NAMES = frozenset((
     ".cache", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".gradle", ".turbo", ".next", ".parcel-cache", ".venv", ".tox", ".nox"))
-#: what one archive may hold (files outside the exclusions); beyond it the
-#: worktree is kept and said — an archive is a safety net, not a copy of a
-#: build directory nobody declared
-MAX_BYTES = 512 * 1024 ** 2
+# #6605: no fixed ceiling for bundle + patches + untracked data. The pass
+# deadline and write failures refuse incomplete archives; callers may still
+# explicitly impose a byte limit. Tracked files are never copied wholesale.
+MAX_BYTES = None
 MAX_FILES = 20_000
 #: a `.partial-` directory older than this is a crashed pass: deleted
 PARTIAL_GRACE_S = 24 * 3600.0
@@ -309,7 +309,7 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
             len(files), max_files))
     size = _size(path, files, check=_check)
     # dev3 N1: the patches count too
-    if size + len(staged) + len(unstaged) > max_bytes:
+    if max_bytes is not None and size + len(staged) + len(unstaged) > max_bytes:
         raise ArchiveRefused("%d bytes to archive (limit %d)" % (
             size + len(staged) + len(unstaged), max_bytes))
     # #4442 : les commits qu'aucune branche distante ne porte partent dans
@@ -360,7 +360,7 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
             _check()
             # #4442 : le bundle compte dans la borne, comme les patchs (N1 de
             # #3728) ; un bundle trop gros refuse l'archive entière.
-            if size + len(staged) + len(unstaged) + bundle_bytes > max_bytes:
+            if max_bytes is not None and size + len(staged) + len(unstaged) + bundle_bytes > max_bytes:
                 raise ArchiveRefused("%d bytes to archive (limit %d)" % (
                     size + len(staged) + len(unstaged) + bundle_bytes, max_bytes))
         ref = _restore_ref(name)
