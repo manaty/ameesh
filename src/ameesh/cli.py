@@ -811,6 +811,12 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                                 "an acknowledgement" if "ack" in passif
                                 else "an information"), file=sys.stderr)
 
+    if lot is None and new_lot is None and bk.kind == "pg" \
+            and not getattr(bk, "mediated", False):
+        # #6642 : sans --lot, un « #NNNN » en tête du corps rattache le
+        # courrier à ce lot (fil, `work_item_id`), sans attribution.
+        lot = mail.head_lot(bk.db, text)
+
     skipped: list[str] = []
     from . import storage
     try:
