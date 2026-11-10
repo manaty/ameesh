@@ -363,6 +363,24 @@ def is_short_window_pause(text: str) -> bool:
     return account_window.is_short_window(rest)
 
 
+def is_budget_pause(row: Mapping) -> bool:
+    """#6664: a budget pause that really holds the agent, short window apart.
+
+    The runner writes a gauge/account pause under `budget : ` and the agent
+    takes no turn until the gauge goes down or the account is switched
+    (event #207575: claude1, "account secondaire, five_hour 77 %" until
+    08:30Z). The account's short window (#3876) is written the same way but
+    lasts minutes and leaves the agent a candidate, so it is not read as a
+    hold here. The text is read alone, like `is_available`: a status not yet
+    refreshed must not send a reminder or a review request to an agent that
+    will not read it.
+    """
+    from . import budget
+    text = str((row or {}).get("status_text") or "").strip()
+    prefix = budget.PAUSE_PREFIX.strip().lower()
+    return text.lower().startswith(prefix) and not is_short_window_pause(text)
+
+
 def is_blocked_pause(row: Mapping) -> bool:
     """#4491: a `blocked` pause with a **named long cause**, not a short pause.
 

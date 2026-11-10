@@ -214,20 +214,30 @@ def _split_live(out: dict, by_name: dict, closed: set,
     n'est pas filtré : il n'a pas de bail à contrôler. #3100 : un nom de
     `covered` (déjà remis) non plus : son courrier l'attend. Pour les SLO,
     `respect_pause` écarte une pause opérateur même déjà couverte : le
-    courrier ne suffit pas à la lever (#6396)."""
+    courrier ne suffit pas à la lever (#6396). #6664 : il écarte de même une
+    pause budget de jauge (la fenêtre courte du compte reste un destinataire,
+    #3876) : le relecteur ne lira pas la relance, le palier suivant porte le
+    geste."""
+    from . import review_designation as rd
+
     live: dict = {}
     dead: dict = {}
     for name, text in out.items():
+        row = by_name.get(name) or {}
         # #6396 : un brief SLO déjà déposé ne réveille pas une pause.
         # Le pilote doit prendre le relais même si le bail reste vivant.
-        if respect_pause and (by_name.get(name) or {}).get("operator_paused"):
+        if respect_pause and row.get("operator_paused"):
             dead[name] = "operator paused"
+            continue
+        # #6664 : une pause budget de jauge ne prendra pas de tour ; la
+        # relance doit passer au pilote, pas attendre dans sa boîte.
+        if respect_pause and row and rd.is_budget_pause(row):
+            dead[name] = "budget paused"
             continue
         if name.startswith("thread:") or name in covered:
             live[name] = text
             continue
-        row = by_name.get(name)
-        if row is None:
+        if not row:
             live[name] = text
             continue
         why = _unavailable(row, closed)

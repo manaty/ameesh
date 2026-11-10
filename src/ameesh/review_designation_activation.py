@@ -1538,7 +1538,9 @@ def _waiver(item: Mapping) -> bool:
 
 def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
                   authors: Sequence[Mapping], families, *,
-                  correctors: Sequence[Mapping] = ()) -> list:
+                  correctors: Sequence[Mapping] = (),
+                  closed_hosts: Sequence[str] = (),
+                  answered: Sequence[str] = ()) -> list:
     """The manual reviewers that cover a required seat (#2627).
 
     A manual reviewer is always kept in the column; this only says which ones
@@ -1554,12 +1556,24 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
     selection from naming a real reviewer and the gate would stay held. The
     seat stays in the column (a pilot gesture); only its counting stops. The
     list is ordered like the column.
+
+    #6664: an unavailable manual reviewer (budget pause, stopped/dead,
+    closed host) covers nothing either — the freeze must fall back on
+    another seat of the same family or of an eligible family instead of
+    re-sending the request to a reviewer that will not read it. An operator
+    pause keeps its seat: #2627/#5129's automatic sleep is lifted by the
+    designation path, and a human pause is a temporary hold. A seat whose
+    reviewer already rendered a verdict on the frozen head (`answered`) still
+    covers: the opinion exists, the pause only follows it.
     """
     forbidden_names, forbidden_families = rd.families_of(authors)
     _names, corrector_families = rd.families_of(correctors)
     forbidden_families = forbidden_families | corrector_families
     forbidden_names = forbidden_names | rd.names_of(correctors)
     rows = {str((row or {}).get("name") or ""): row for row in listing or ()}
+    answered_names = {str(name or "").strip().casefold()
+                      for name in answered or () if str(name or "").strip()}
+    closed = {str(host).strip() for host in closed_hosts or () if str(host).strip()}
     covered = set(forbidden_families)
     seats = []
     for name in manual or ():
@@ -1570,6 +1584,16 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
         # posé avant la garde (le siège reste dans la colonne).
         eligible, _reason = rd.reviewer_eligibility(row)
         if not eligible:
+            continue
+        # #6664 : un relecteur que le registre dit indisponible ne couvre pas
+        # le siège. Un avis déjà rendu sur la tête gelée reste une preuve.
+        # La pause opérateur est lue comme avant (#2627/#5129) : le sommeil
+        # automatique de la feuille de route reste couvert par la levée de
+        # `_wake_sleeping_reviewers`, et une pause humaine garde son siège
+        # manuel. Une pause budget de jauge, elle, ne se lève pas seule.
+        probe = dict(row, operator_paused=False)
+        if not rd.is_available(probe, closed_hosts=closed) \
+                and name.casefold() not in answered_names:
             continue
         family = rd.live_family(row, families=families)
         if (not name or name in forbidden_names or not family
@@ -1872,7 +1896,9 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   candidates=candidates, notify=notify,
                   manual=manual, waiver=waiver, answered=answered,
                   manual_seats=_manual_seats(manual, listing, authors, families,
-                                             correctors=correctors),
+                                             correctors=correctors,
+                                             closed_hosts=closed_hosts,
+                                             answered=answered),
                   advances=_advances(db), author_commits=author_commits,
                   unreadable=tuple(unreadable),
                   basis=_prepared_basis(item, target, latest), doubts=doubts)
@@ -3428,7 +3454,9 @@ def _fresh_prepared(cfg, tx, item: Mapping, freeze: Mapping,
     # verrou, il est relu pour ne pas relancer un siège qui a déjà son avis.
     answered = _verdicts_on(tx, int(item.get("id") or 0),
                             str(freeze.get("sha") or ""))
-    if list(manual) == list(inputs.manual) and bool(waiver) == bool(inputs.waiver):
+    if (list(manual) == list(inputs.manual)
+            and bool(waiver) == bool(inputs.waiver)
+            and tuple(answered) == tuple(inputs.answered)):
         return dataclasses.replace(inputs, item=dict(item), freeze=dict(freeze),
                                    answered=answered)
     listing = registry.overview(tx)
@@ -3437,7 +3465,9 @@ def _fresh_prepared(cfg, tx, item: Mapping, freeze: Mapping,
         waiver=bool(waiver), answered=answered,
         manual_seats=_manual_seats(manual, listing, inputs.authors,
                                    inputs.policy.families,
-                                   correctors=inputs.correctors))
+                                   correctors=inputs.correctors,
+                                   closed_hosts=alert_briefs.claims_closed_hosts(tx),
+                                   answered=answered))
 
 
 def _unavailable_in_transaction(cfg, tx, item: Mapping, freeze: Mapping,
