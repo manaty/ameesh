@@ -738,7 +738,7 @@ class Watcher:
                     self.next[key] = since + sub.interval
                     continue
                 if self.api is None:
-                    self.api = plan_github.client(cache_dir=self.cfg.state_dir)
+                    self.api = plan_github.client(cache_dir=self.cfg.state_dir, caller="github-watch")
                 if self.api is None:
                     raise plan_github.GithubError("GitHub watch: no token or gh")
                 # The committed cursor is the settled bound U: the next window
@@ -781,7 +781,7 @@ class Watcher:
                                            log=self.log)
             try:
                 if self.api is None:
-                    self.api = plan_github.client(cache_dir=self.cfg.state_dir)
+                    self.api = plan_github.client(cache_dir=self.cfg.state_dir, caller="github-watch")
                 follow_up(db, self.cfg, declared, now, api=self.api, log=self.log)
             except Exception as exc:
                 self.log("GitHub watch follow-up: failed (%s)" % plan_github._one_line(exc))

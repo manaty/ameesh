@@ -563,6 +563,16 @@ try:
     argv = _annotated(sys.argv[1:])
 except Exception:  # le marqueur ne bloque jamais la commande
     argv = sys.argv[1:]
+# #6649: no API request to check the reserve; the shared response headers
+# are already on disk. A missing optional module preserves the old shim.
+try:
+    from ameesh.github_budget import reserve_reason
+    reason = reserve_reason(argv)
+except (ImportError, OSError, ValueError):
+    reason = None
+if reason:
+    sys.stderr.write(reason + "\n")
+    sys.exit(75)
 if refuse_auto(real, argv):
     sys.exit(1)
 os.execv(real, [real] + argv)
@@ -712,6 +722,7 @@ def apply(env: dict, agent: str, config_dir: str, state_dir: str,
     laisse l'environnement hérité."""
     info, jeton = _resolve(config_dir, agent)
     nouveau = dict(env)
+    nouveau["AMEESH_GITHUB_STATE"] = state_dir
     if lot:
         nouveau["AMEESH_LOT"] = str(lot)
     nouveau.pop(ENV_ROLE, None)
@@ -828,11 +839,21 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--agent", default="")
     g.add_argument("--match", default="", help="sous-chaîne de la commande, ex. 'run cancel'")
     g.add_argument("--json", action="store_true")
+    q = sub.add_parser("quota", help="quota observé et réponses HTTP par appelant, sans API")
+    q.add_argument("--json", action="store_true")
     i = sub.add_parser("identity", help="identité GitHub résolue d'un agent (jamais le jeton)")
     i.add_argument("agent")
     i.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
     cfg = load_config_mesh()
+    if args.cmd == "quota":
+        from . import plan_github
+        report = plan_github.quota_stats(cfg.state_dir)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
+        else:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     if args.cmd == "identity":
         info = resolve(cfg.config_dir, args.agent)
         if args.json:

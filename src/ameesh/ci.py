@@ -888,7 +888,7 @@ def gh_api(gh=None, *, cache_dir=None, ttl=None, clock=None):
     from . import plan_github
 
     client = plan_github.client(
-        gh=gh, cache_dir=cache_dir, clock=clock or time.time,
+        gh=gh, cache_dir=cache_dir, clock=clock or time.time, caller="ci",
         ttl=plan_github.DEFAULT_CI_TTL if ttl is None else ttl)
     if client is None:
         raise plan_github.GithubError("no GitHub token (%s) and no local gh"

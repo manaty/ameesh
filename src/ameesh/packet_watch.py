@@ -516,8 +516,15 @@ def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
         except Exception as exc:  # noqa: BLE001 - un projet ne fait pas tomber l'autre
             results.append({"project": name, "result": "error",
                             "error": "%s: %s" % (type(exc).__name__, exc)})
-        results += _auto_merge(cfg, db, name, watch.app or name, gh=gh, dry_run=dry_run,
-                               checkout=watch.repo)
+        # #6649: the timer can tick every minute; do not repay every held
+        # carrier's forge reads at that cadence. Explicit check/arm stays immediate.
+        from .github_budget import POLL_INTERVAL
+        checked = state.setdefault("auto_merge_checked_at", {})
+        if name not in checked or now - float(checked[name]) >= POLL_INTERVAL:
+            if not dry_run:
+                checked[name] = now
+            results += _auto_merge(cfg, db, name, watch.app or name, gh=gh, dry_run=dry_run,
+                                   checkout=watch.repo)
     if not dry_run:
         save_state(cfg, state)
     return results
