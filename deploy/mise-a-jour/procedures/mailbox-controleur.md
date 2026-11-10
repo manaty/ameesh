@@ -19,6 +19,14 @@ La transaction idempotente crée le propriétaire NOLOGIN, les deux fonctions et
 EXECUTE bornés ; le SELECT existant du contrôleur reste actif. Les REVOKE
 sur EXECUTE ferment seulement les endpoints ; aucun SELECT existant n'est retiré.
 
+Depuis #6377, le propriétaire NOLOGIN n'est plus nommé `<rôle>_decision_reader` :
+ce préfixe était celui des contrôleurs de la migration 0527. Une installation
+dont l'étape 0 a été posée par une tête antérieure rejoue cette étape depuis la
+tête courante ; `ALTER ROLE ... RENAME` migre le propriétaire en place, sans
+recréer les fonctions ni toucher à leurs ACL, et retire le SELECT accidentel que
+0527 avait accordé sur `decision_supersessions`. Le contrat de l'étape 2 refuse
+un propriétaire hérité tant que cette reprise n'a pas eu lieu.
+
 Le reçu cite le SHA gelé et les SHA-256 réellement posés du script et de son
 inclusion `_release-decision.sql`, ainsi que le chemin/SHA réellement lancé.
 Il consigne aussi le compte PostgreSQL réellement utilisé (`current_user`) et
@@ -52,7 +60,8 @@ pour le retour arrière.
    `deploy/sql/release-decision-cutover.sql` depuis le paquet intégré, ses
    inclusions à côté. Cette transaction distincte retire les SELECT de table
    et de colonnes, puis vérifie les contrats endpoint et lecteurs LOGIN fermés.
-   L'étape 0 doit déjà avoir réussi.
+   L'étape 0 doit déjà avoir réussi depuis la même tête : elle a renommé le
+   propriétaire de décision hérité hors du préfixe des contrôleurs.
 3. Installer la version intégrée du contrôleur et de sa bibliothèque ameesh.
    Depuis sa connexion réelle, exécuter `decisions.get_for_controller(db,id)`
    sur la même décision, puis `decisions.verify_proof(db,view)`. Comparer les
@@ -61,8 +70,13 @@ pour le retour arrière.
    agent_mailbox LIMIT 0` échoue avec permission refusée. Vérifier aussi qu'un
    id de courrier ordinaire connu ne renvoie aucune ligne par la fonction.
 5. Avec ce compte administrateur, exécuter `_contrat-mailbox-readers.sql` :
-   seuls ameesh, ameesh_host_agents1 et auditeur_lecture sont admis comme
-   lecteurs LOGIN non superuser, y compris via SET ROLE.
+   seuls le propriétaire de la relation, les LOGIN membres de `ameesh_executor`,
+   le LOGIN de sauvegarde enrôlé (marqueur de rôle
+   `ameesh-release-identities:<opération>:backup`) et les lecteurs explicites de
+   `mailbox_readers` (par défaut `ameesh` et `auditeur_lecture`) sont admis comme
+   lecteurs LOGIN non superuser, y compris via SET ROLE. Aucun nom d'hôte n'est
+   codé en dur ; un lecteur contractuel supplémentaire se passe par
+   `-v mailbox_readers='[...]'`.
 6. Redémarrer le contrôleur, relever la version réellement lancée et son état.
    Aucune recette owner ni publication de contenu de décision n'est requise.
 

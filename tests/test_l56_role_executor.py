@@ -114,7 +114,7 @@ class RoleExecutorTest(PgTestCase):
                 "JOIN pg_shdepend d ON d.refobjid=r.oid "
                 "WHERE d.refclassid='pg_authid'::regclass "
                 "AND d.dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) "
-                "AND r.rolname LIKE 't_%_decision_reader'")
+                "AND r.rolname LIKE 'ameesh_decision_owner_%'")
             for row in readers:
                 name = db_mod.quote_ident(row['rolname'])
                 cls.db.execute('DROP OWNED BY '+name+' CASCADE')

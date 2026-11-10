@@ -442,6 +442,25 @@ décrit l'étape additive avant lancement du nouveau code et le retrait séparé
 humaines signées et répondues correspondant exactement à la question précédente,
 via `release_controller_decision_ids(text)` ; elle revalide ensuite chaque preuve.
 
+Depuis #6377, le propriétaire NOLOGIN des deux fonctions n'est plus dérivé en
+`<rôle>_decision_reader` : ce suffixe tombait sous le préfixe des contrôleurs de
+la migration 0527, qui l'aurait traité comme un contrôleur. Il est nommé
+`ameesh_decision_owner_<empreinte>` et porte le commentaire de rôle
+`ameesh-decision-owner:<rôle contrôleur>`. Rejouer l'étape additive depuis une
+tête antérieure renomme en place le propriétaire hérité (l'ownership des
+fonctions suit l'OID) et retire le SELECT accidentel sur `decision_supersessions`.
+Le contrat `_contrat-release-decision.sql` refuse un propriétaire hérité ou un
+marqueur étranger.
+
+Le contrat `_contrat-mailbox-readers.sql` admet comme lecteurs LOGIN le
+propriétaire de la relation, les membres du groupe `ameesh_executor` (le script
+de rôle leur accorde déjà SELECT sur toutes les tables du mesh ; le groupe est
+réglable par la variable psql `mailbox_executor`), le LOGIN de
+sauvegarde enrôlé par cette commande — reconnu par son commentaire de rôle
+`ameesh-release-identities:<opération>:backup` — et les lecteurs explicites de
+`mailbox_readers` (par défaut le LOGIN canonique de la base et
+`auditeur_lecture`). Aucun nom d'hôte n'est codé en dur.
+
 Les scripts SQL sont exécutés par le compte PostgreSQL administrateur SUPERUSER
 explicite de l'enrôlement (`source_owner_dsn`), comme l'exige `session()`.
 Le propriétaire LOGIN du schéma seul ne peut pas créer le rôle NOLOGIN et lui
