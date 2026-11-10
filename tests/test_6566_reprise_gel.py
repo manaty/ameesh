@@ -63,6 +63,13 @@ ONLY_REFROZEN = read((1, E))
 class ChangedUnitsTest(unittest.TestCase):
     """La comparaison gel composé / gel courant, sans git ni base."""
 
+    def test_motifs_recomposes_sans_doublon(self) -> None:
+        first = paquet_auto.Discarded(1, "regel", "première preuve")
+        repeated = paquet_auto.Discarded(1, "regel", "seconde preuve")
+        other = paquet_auto.Discarded(2, "regel")
+        self.assertEqual(paquet_auto.unique_discarded([first, other, repeated]),
+                         [first, other])
+
     def test_gel_inchange_rien(self) -> None:
         units = [paquet_auto.Unit(1, A, B), paquet_auto.Unit(2, C, D)]
         self.assertEqual(paquet_auto.changed_units(units, {1: A, 2: C}), [])

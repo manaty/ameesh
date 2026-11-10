@@ -1672,6 +1672,18 @@ def keep_composition(candidates: list[Candidate],
     return members, discarded
 
 
+def unique_discarded(items: list[Discarded]) -> list[Discarded]:
+    """#6579 : conserver chaque motif une fois, dans son ordre d'apparition."""
+    seen: set[tuple[int, str]] = set()
+    result: list[Discarded] = []
+    for item in items:
+        key = (item.lot, item.reason)
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
 def changed_units(units: list[Unit], current: dict[int, str]) -> list[Discarded]:
     """#6566 : les unités dont le gel a changé depuis la composition.
 
@@ -5392,6 +5404,19 @@ def publish_tested(args: argparse.Namespace) -> int:
                   "leur qualification reste celle du journal d'origine du porteur #%d "
                   "et n'est pas déduite de cette reprise." % (head[:12], args.carrier)) + " " + contract_note
         guard()
+        # #6579 : les contrats de reprise peuvent durer ; relire les gels
+        # sur la base exacte avant tout geste de publication de la tête testée.
+        fresh, _ = compute_candidates(
+            reader, args.target, base_sha, Path(tmp.name) / "prets-relus.txt")
+        changes = changed_units(
+            [Unit(lot, rev(worktree, source) or source, "")
+             for lots, source in specs for lot in lots],
+            {candidate.lot: candidate.source for candidate in fresh})
+        if changes:
+            raise ChainRefused(
+                "gel changé avant publication : %s ; recomposer"
+                % "; ".join("#%d : %s" % (item.lot, item.reason)
+                            for item in changes))
         state = pull_request_state(worktree, branch)
         pr_number: int | None = None
         pr_url = ""
@@ -5778,8 +5803,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                         record_package=not args.no_packet_record,
                         expect_pushed=lease or "", removed=removed_sources,
                         guard=guard)
-                    composition.discarded = (previous + composition.discarded
-                                             + changes)
+                    composition.discarded = unique_discarded(
+                        previous + composition.discarded + changes)
                     if not composition.units:
                         return empty_after_recomposition("gel changé")
                     continue
@@ -5923,7 +5948,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                 record_package=not args.no_packet_record,
                 expect_pushed=lease or "", removed=removed_sources,
                 guard=guard)
-            composition.discarded = previous + composition.discarded + reasons
+            composition.discarded = unique_discarded(
+                previous + composition.discarded + reasons)
             if not composition.units:
                 return empty_after_recomposition("tests par unité rouges")
         inconclusive = sum(1 for run in runs if run.inconclusive)
