@@ -4,6 +4,8 @@ import os
 import argparse
 import contextlib
 import io
+import json
+from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
@@ -46,6 +48,20 @@ class BudgetTest(unittest.TestCase):
         self.sample(999)
         self.assertIsNone(self.reads.blocked(resource="graphql"))
         self.assertEqual(budget.low_quotas(self.state, now=1000)[0]["remaining"], 999)
+
+    def test_quota_command_is_routed_from_main_and_reports_consumers(self):
+        from ameesh import main
+        self.sample(4999)
+        output = io.StringIO()
+        with mock.patch("ameesh.config.load", return_value=SimpleNamespace(state_dir=self.state)), \
+                mock.patch("ameesh.platform.child_environment.managed_entry", return_value=True), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(main.main(["github", "quota", "--json"]), 0)
+        report = json.loads(output.getvalue())
+        record, = report["consumers"]["0"].values()
+        self.assertEqual(record["requests"], 1)
+        self.assertEqual(record["caller"], "watch")
+        self.assertEqual(record["host"], "host-a")
 
     def test_http_consumers_are_distinct_from_cached_reads_and_expire(self):
         self.sample(4999)

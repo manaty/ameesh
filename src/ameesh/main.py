@@ -414,7 +414,7 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "activity":
         from . import activity
         return activity.main(rest)
-    if command == "github" and rest[:1] in (["gestes"], ["identity"]):
+    if command == "github" and rest[:1] in (["gestes"], ["identity"], ["quota"]):
         # #1645 : journal des gestes gh des agents, identité GitHub par rôle ;
         # `ameesh github read` (#860) et l'aide restent à github_cli
         from . import github_identity
