@@ -1347,6 +1347,18 @@ class ReviewPolicyTest(_TmpMixin, unittest.TestCase):
 class GitReadTest(_TmpMixin, unittest.TestCase):
     """#2349 : un dossier de dépôt absent n'est pas « git not found »."""
 
+    def test_empty_repository_is_not_a_missing_git_executable(self):
+        for repo in ("", None):
+            with self.subTest(repo=repo):
+                with self.assertRaisesRegex(canon.GitError, "no repository"):
+                    canon._git(repo, "rev-parse", "HEAD")
+
+    def test_missing_git_executable_is_still_named(self):
+        with mock.patch.object(canon.subprocess, "run",
+                               side_effect=FileNotFoundError(2, "missing", "git")):
+            with self.assertRaisesRegex(canon.GitError, "git not found"):
+                canon._git(self.make_tmp(), "rev-parse", "HEAD")
+
     def test_dossier_de_depot_absent(self):
         missing = os.path.join(self.make_tmp(), "absent")
         with self.assertRaises(canon.GitError) as caught:

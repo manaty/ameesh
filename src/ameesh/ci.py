@@ -3875,6 +3875,41 @@ def reservation_holder(events: list[dict], sha: str, base: str, mode: str, token
     return held[-1] if held else None
 
 
+def _vehicle_review_need(db, cfg, item, sha, slug, *, checkout="", reading=None):
+    """Read the same constituent/own-delta proof as the merge gate.
+
+    A locked revalidation reuses the pinned repository/base, never a cached
+    waiver or a network fetch. Member verdicts are read again by need().
+    """
+    from . import fire, lot_class, packet_automerge, packet_reviews, plan_git, review_target, work
+    if reading is None:
+        repo = packet_automerge._gate_repo(cfg, db, item, slug, checkout)
+        if not repo:
+            repo = fire.review_checkout(cfg, db, item, slug=slug, caller=True)
+        if not repo:
+            raise GelError("no repository: run from the lot's checkout or pass "
+                           "--prevalidation-repo <checkout> (--repo names owner/repo)")
+        if not plan_git.local_commit(repo, sha):
+            error = packet_automerge._fetch_into(repo, (item.get("branch") or "",))
+            if error or not plan_git.local_commit(repo, sha):
+                raise GelError("vehicle review unreadable: frozen head %s is not available "
+                               "in %s%s" % (sha[:12], repo, ": " + error if error else ""))
+        try:
+            base = review_target.resolve(repo, lot_class.default_base(cfg, item, repo))
+        except Exception as exc:  # noqa: BLE001 - unreadable target never waives reviews
+            raise GelError("vehicle review unreadable: %s" % exc) from exc
+        reading = {"repo": repo, "base": base}
+    try:
+        needed = packet_reviews.need(db, int(item["id"]), item,
+                                     work.milestones(db, int(item["id"])),
+                                     reading["repo"], reading["base"], sha, cfg=cfg)
+    except Exception as exc:  # noqa: BLE001 - no proof, no waiver
+        raise GelError("vehicle review unreadable: %s" % exc) from exc
+    if needed and needed.get("ok") is False:
+        raise GelError(needed.get("why") or "vehicle review unreadable")
+    return needed, reading
+
+
 def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
              exception: str = "", reason: str = "", full: bool = False,
              force: bool = False, repo: str = "", checkout: str = "") -> dict:
@@ -3948,6 +3983,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
     verdicts = latest_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")
     reviews = [m for m in verdicts if (m.get("verdict") or "") == "ok"]
     blocked = [m for m in verdicts if (m.get("verdict") or "") == "blocked"]
+    vehicle_reading = None
     if not exception:
         # #2214 : `--full` ne dispense pas des avis. La suite complète est un
         # mode d'exécution, pas une relecture ; seules les exceptions motivées
@@ -3959,7 +3995,13 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                            "fix the head, refreeze and re-review; nothing requested"
                            % (item_id, blocked[0].get("actor") or "a reviewer",
                               frozen_sha[:12]))
-        if len(reviews) < avis:
+        from . import packet_reviews
+        if avis > 0 and full and packet_reviews.is_vehicle(item):
+            needed, reading = _vehicle_review_need(
+                db, cfg, item, frozen_sha, name, checkout=checkout)
+            if needed and needed.get("ok") is True and needed.get("required") == 0:
+                vehicle_reading = reading
+        if len(reviews) < avis and vehicle_reading is None:
             raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required "
                            "(ameesh work milestone %s verdict ok --sha %s --actor <relecteur>); "
                            "an incident or a CI unblock uses --exception incident|unblock "
@@ -4029,7 +4071,9 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                 "path": "workflow-dispatch" if dispatch is not None else "pr-label",
                 **({"dispatch": dispatch} if dispatch is not None else {}),
                 "pr": pr["number"],
-                "exception": exception, "reason": reason.strip(), "avis": avis,
+                "exception": exception, "reason": reason.strip(),
+                "avis": 0 if vehicle_reading is not None else avis,
+                **({"vehicle_review": vehicle_reading} if vehicle_reading is not None else {}),
                 "verdicts": sorted((m.get("actor") or "") for m in reviews),
                 "frozen": bool(freeze), "runs": len(runs),
                 **({"cutoff_bases": cutoff} if cutoff else {}),
@@ -4289,7 +4333,7 @@ def _pose_request(gh, repo: str, pr: dict, label: str, mode: str) -> dict:
     return {"ok": True, "dropped": dropped, "failed": failed, "error": ""}
 
 
-def _revalidate(db, item_id: int, decision: dict) -> None:
+def _revalidate(db, item_id: int, decision: dict, *, cfg=None) -> None:
     """Relit le gel et les verdicts sous le verrou, avant la pose (avis delta R1).
 
     `gel_plan` décide hors transaction : un relecteur peut retirer son `ok`
@@ -4326,6 +4370,12 @@ def _revalidate(db, item_id: int, decision: dict) -> None:
         raise GelError("lot #%s: %s blocked %s (last verdict of that reviewer, read under "
                        "the lock): fix the head, refreeze and re-review; nothing posed"
                        % (item_id, blocked[0].get("actor") or "a reviewer", sha[:12]))
+    if decision.get("vehicle_review"):
+        needed, _ = _vehicle_review_need(
+            db, cfg, item, sha, decision["repo"], reading=decision["vehicle_review"])
+        if not (needed and needed.get("ok") is True and needed.get("required") == 0):
+            raise GelError("vehicle review proof changed while the request was prepared: "
+                           "read the vehicle again; nothing posed")
     reviews = [m for m in verdicts if (m.get("verdict") or "") == "ok"]
     avis = int(decision.get("avis") or 0)
     if len(reviews) < avis:
@@ -4468,7 +4518,7 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool,
                            "CI again (explicit resumption)"
                            % (number, carried[0]["id"], carried[0]["mode"])}
         try:
-            _revalidate(tx, int(item_id), decision)
+            _revalidate(tx, int(item_id), decision, cfg=cfg)
         except GelError as exc:
             note("released", str(exc))
             return {"requested": False, "action": "refuse", "why": str(exc)}
@@ -4671,7 +4721,8 @@ def _arm_packet(cfg, db, decision: dict, gh, args) -> dict | None:
             cfg, db, args.id, slug=decision["repo"], number=decision["pr"], sha=decision["sha"],
             target=decision.get("base_ref") or "", gh=packet_automerge.gh_of(gh),
             actor=getattr(args, "actor", "") or work.SYSTEM_SENDER,
-            checkout=getattr(args, "prevalidation_repo", "") or "")
+            checkout=(getattr(args, "prevalidation_repo", "")
+                      or (decision.get("vehicle_review") or {}).get("repo") or ""))
     except Exception as exc:  # noqa: BLE001 - l'étiquette est posée : jamais fatal
         out = {"state": "error", "why": "%s: %s" % (type(exc).__name__, exc)}
     decision["auto_merge"] = out

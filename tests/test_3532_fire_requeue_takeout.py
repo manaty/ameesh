@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
 import types
 import unittest
 from contextlib import redirect_stderr
@@ -33,6 +34,11 @@ class FireRequeueAfterTakeOutTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        # #6765: the vehicle fire needs an explicit checkout, independent of cwd.
+        self.fire_repo = os.path.join(self.tmp, "fire-repo")
+        subprocess.run(["git", "init", "-q", "-b", "develop", self.fire_repo], check=True)
+        subprocess.run(["git", "-C", self.fire_repo, "config",
+                        "ameesh.target", "develop"], check=True)
         patches = [
             mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "", "AMEESH_ROLE": ""}),
             mock.patch.object(merge_queue, "readiness", side_effect=self._ready),
@@ -51,7 +57,7 @@ class FireRequeueAfterTakeOutTest(PgTestCase):
         self.frozen = work.milestone(self.db, self.lot, "frozen", sha=SHA, actor="impl-02")
         packet_guard.declare(self.db, self.lot, "incident", "test: fire fixture", SHA,
                              actor="pilote")
-        fire.give(self.db, self.lot, sha=SHA, actor="orchestrateur")
+        fire.give(self.db, self.lot, sha=SHA, actor="orchestrateur", repo=self.fire_repo)
 
     def tearDown(self):
         ops = storage.of(self.db).work
@@ -121,7 +127,7 @@ class FireRequeueAfterTakeOutTest(PgTestCase):
         self.assertIsNotNone(self._row())
         merge_queue.leave(self.db, self.lot, actor="mty-nxl-impl-02")
         fire.withdraw(self.db, self.lot, actor="orchestrateur")
-        fire.give(self.db, self.lot, sha=SHA, actor="orchestrateur")
+        fire.give(self.db, self.lot, sha=SHA, actor="orchestrateur", repo=self.fire_repo)
         self.assertEqual(self._fallback()["result"], "queued")
 
     def test_queue_remove_warns_when_it_condemns_a_live_train(self):
