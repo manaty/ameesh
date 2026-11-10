@@ -4181,12 +4181,20 @@ def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list
         return []
     current = str(head or "").strip().lower()
     fetched: list[str] = []
+    own: Optional[str] = None
     for row in rows:
         if row.get("kind") != "frozen":
             continue
         sha = str(row.get("sha") or "").strip().lower()
         if not sha or sha == current or not plan_git.full_commit_id(sha):
             continue
+        # #6735 : la forge de ce clone ne sert pas la tête d'un dépôt compagnon.
+        named = freeze_repository(row)
+        if named:
+            if own is None:
+                own = _repository_slug(repo)
+            if own and _repository_name(named) != _repository_name(own):
+                continue
         try:
             if plan_git.local_commit(repo, sha):
                 continue
@@ -4198,6 +4206,79 @@ def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list
         except Exception:  # noqa: BLE001 - forge injoignable : absence
             continue
     return fetched
+
+
+#: #6735 : la ligne machine d'un gel qui nomme le dépôt GitHub de sa tête
+#: (écrite par `work milestone frozen`, jamais recopiée d'une note d'appelant :
+#: le filtre générique #2971 retire toute ligne `ameesh-freeze-*:` fournie).
+FREEZE_REPO_MARK = "ameesh-freeze-repo:"
+
+
+def freeze_repository(row: Optional[Mapping]) -> str:
+    """Le dépôt `owner/repo` que la marque machine d'un gel nomme, ou "" (#6735)."""
+    for line in str((row or {}).get("note") or "").splitlines():
+        line = line.strip()
+        if line.startswith(FREEZE_REPO_MARK):
+            return line[len(FREEZE_REPO_MARK):].strip().lower()
+    return ""
+
+
+def _repository_slug(repo: str) -> str:
+    """Le dépôt GitHub `owner/repo` configuré pour le clone `repo`, ou ""."""
+    from . import review_designation_activation as activation
+
+    try:
+        return activation._configured_origin(repo) or ""
+    except Exception:  # noqa: BLE001 - origine illisible : aucune identité
+        return ""
+
+
+def _shared_history(repo: str, one: str, other: str) -> Optional[bool]:
+    """`one` et `other` ont-ils un ancêtre commun dans `repo` ? (#6735)
+
+    `None` : lecture impossible (le doute garde la lecture normale)."""
+    try:
+        proc = plan_git._git(repo, "merge-base", one, other,
+                             env_extra=plan_git.NO_LAZY_FETCH,
+                             **plan_git._bounded(_read_bound(plan_git.PROBE_TIMEOUT_S)))
+    except (canon.GitError, canon.GitDeadline, plan_git.MergeProbeError):
+        return None
+    if proc.returncode == 0 and proc.stdout.strip():
+        return True
+    if proc.returncode == 1 and not proc.stdout.strip() and not proc.stderr.strip():
+        return False
+    return None
+
+
+def _repository_name(slug: str) -> str:
+    return str(slug or "").rpartition("/")[2]
+
+
+def _companion_of(db, item: Mapping, row: Mapping, own: str) -> str:
+    """Le dépôt compagnon d'un gel antérieur du lot, ou "" (#6735).
+
+    Un lot multi-dépôt gèle tour à tour sa partie de chaque dépôt ; la tête de
+    l'autre dépôt n'est pas dans le clone lu. La marque du gel fait foi ; un
+    gel antérieur à la marque se reconnaît à un clone local du lot dont
+    l'origine est un autre dépôt GitHub et qui porte le commit. `own` vide
+    (origine du clone lu illisible) ne prouve rien, ni un fork du même dépôt."""
+    if not own:
+        return ""
+    named = freeze_repository(row)
+    if not named:
+        from . import review_designation_activation as activation
+
+        try:
+            named = activation.companion_repository(
+                db, getattr(db, "cfg", None), item,
+                str(row.get("sha") or "").strip(), own) or ""
+        except Exception:  # noqa: BLE001 - clones illisibles : aucun compagnon
+            return ""
+    # Un fork (même nom de dépôt, autre propriétaire) porte la même histoire :
+    # sa tête réécrite garde ses auteurs (#2924), jamais une exclusion.
+    if not named or _repository_name(named) == _repository_name(own):
+        return ""
+    return named
 
 
 def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
@@ -4270,7 +4351,15 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     de 180 s y laissait la session `idle in transaction` et retenait ses
     verrous. Les objets manquants sont alors une absence prouvée localement,
     et l'appelant les rapatrie avant la transaction s'il les veut
-    (`prefetch_prior_freezes`)."""
+    (`prefetch_prior_freezes`).
+
+    #6735 : le gel antérieur d'un **dépôt compagnon** (marque
+    `ameesh-freeze-repo`, ou clone local d'une autre origine qui le porte)
+    n'est pas lu dans ce clone : son contenu ne peut pas être dans cette tête
+    et il est relu sur sa propre tête. Il n'ajoute ni auteur ni inconnu ; il
+    est tracé dans `exclusions_out`. Un commit qui partage l'histoire de la
+    tête lue (fork, réécriture) garde la lecture normale, quelle que soit la
+    marque."""
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
         return [], [], []
@@ -4529,6 +4618,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         except Exception:  # noqa: BLE001 - récupération en échec : absence
             return False
 
+    own_origin: Optional[str] = None
     for row in sorted(prior, key=lambda value: (value.get("at_ts") or 0,
                                                 int(value.get("id") or 0)),
                       reverse=True):
@@ -4577,6 +4667,22 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         # un gel déjà attribué par la plage courante n'a pas besoin d'objets
         if plan_git.full_commit_id(sha) in current_set:
             continue
+        # #6735 : la partie d'un dépôt compagnon est relue sur sa propre tête ;
+        # un objet rapatrié dans ce clone (fetch de diagnostic) sans histoire
+        # commune avec la tête ne la fait pas lire ici. Une histoire commune
+        # (fork, réécriture) garde la lecture normale.
+        if not (present(sha) and _shared_history(repo, sha, head_sha)
+                is not False):
+            if own_origin is None:
+                own_origin = _repository_slug(repo)
+            companion = _companion_of(db, item, row, own_origin)
+            if companion:
+                if exclusions_out is not None:
+                    exclusions_out.append({
+                        "commit": sha, "head": sha, "ref": companion,
+                        "reason": "freeze of a companion repository",
+                        "freeze_id": row_id})
+                continue
         if not present(sha) and not recover_one(sha):
             # #2924 B7 : sans les objets, impossible de prouver qu'aucun
             # correcteur n'est en cause ; B5 refuse plutôt que de deviner.

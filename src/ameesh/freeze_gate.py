@@ -429,6 +429,21 @@ def _freeze_absent_marker(db: Db, item: dict, full: str, repo: str | None,
     return "ameesh-freeze-absent: " + " ".join(absent[:8])
 
 
+def _freeze_repo_marker(db: Db, item: dict, full: str, repo: str | None) -> str:
+    """La ligne machine du dépôt GitHub qui porte `full` (#6735), ou "".
+
+    Le premier dépôt connu qui porte le commit (même ordre que la marque
+    d'absence) ; une origine qui n'est pas un dépôt GitHub n'écrit rien."""
+    from . import freeze_checks
+    from . import review_authors
+    from . import review_designation_activation as activation
+    for candidate in ([repo] if repo else []) + _head_repos(db, item):
+        if candidate and freeze_checks.commit_in(candidate, full):
+            slug = activation._configured_origin(candidate)
+            return "%s %s" % (review_authors.FREEZE_REPO_MARK, slug) if slug else ""
+    return ""
+
+
 def _freeze_unpublished(db: Db, item: dict, full: str, repo: str | None,
                         refreshed: dict | None = None, *, where: str = "") -> str:
     """La ligne d'avertissement d'un gel absent de `origin/<branche>` (#2962).
@@ -1075,6 +1090,11 @@ def milestone(
         marker = _freeze_absent_marker(db, item, sha, repo, refreshed)
         if marker:
             note = (note + "\n" if note else "") + marker
+        # #6735 : le dépôt GitHub de la tête, pour qu'un gel ultérieur d'un
+        # autre dépôt du même lot ne lise pas celui-ci dans son propre clone.
+        origin = _freeze_repo_marker(db, item, sha, repo)
+        if origin:
+            note = (note + "\n" if note else "") + origin
     # #1465 : un gel ou un verdict déclaré dans un tour managé emporte la
     # preuve exacte de son origine (acteur, session, tour, harnais, sha
     # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
