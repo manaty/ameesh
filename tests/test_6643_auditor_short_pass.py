@@ -181,6 +181,15 @@ class FinalDecisionTest(unittest.TestCase):
         self.assertFalse(decision.skip)
         self.assertEqual(decision.reason, auditor_pass.READ_ERROR)
 
+    def test_a_partially_unreadable_debit_is_played(self):
+        # debit.read signals a partial read without raising (B #37313)
+        report = dict(QUIET, unreadable=["canon unavailable"])
+        decision = auditor_pass.final_decision(
+            report, [], NOW, since=NOW - 3600)
+        self.assertFalse(decision.skip)
+        self.assertEqual(decision.reason, auditor_pass.READ_ERROR)
+        self.assertEqual(decision.detail["where"], "debit")
+
     def test_a_deadline_is_played_before_the_debit_check(self):
         report = dict(QUIET, totals={"slow_waits": 5, "capacity_alerts": 0},
                       wakes=[{"lot": 1, "due_ts": NOW + 60}])

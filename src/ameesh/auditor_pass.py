@@ -267,7 +267,9 @@ def final_decision(report, decisions, now: float, *,
     """Decide once the debit has been read: deadline, debit check, or skip."""
     if read_error:
         return _played(READ_ERROR, where=read_error)
-    if not isinstance(report, dict):
+    # `debit.read` reports a partial read through `unreadable` without raising
+    # (a canon or a GitHub call it could not read): that is not a quiet debit.
+    if not isinstance(report, dict) or report.get("unreadable"):
         return _played(READ_ERROR, where="debit")
     hit = deadline_within(report, decisions, now, since=since)
     if hit is not None:
