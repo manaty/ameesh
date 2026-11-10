@@ -1114,7 +1114,9 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         "To do:",
     ]
     remaining = _correction_room(required, eligible_families, correction)
-    read = ["- read the diff **of this exact head** and check the edge cases;"]
+    read = ["- read the diff **of this exact head** and check the edge cases;",
+            "- do not announce an ok verdict by mail: record it through the milestone; "
+            "send mail only for a blocked verdict, with its reason;"]
     if sql_migration:
         read.append(N1_QUESTION)
     if remaining is not None and remaining < required:

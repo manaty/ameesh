@@ -1,13 +1,26 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- #6372: controller endpoint must stay private and unavailable via SET ROLE.
+-- #6377: the definer owner is derived outside the controller prefix of
+-- migration 0527. A legacy `<controller>_decision_reader` is refused here:
+-- release-decision-additive.sql renames it in place, and this audit never
+-- adopts a role by name alone (the enrollment marker names its controller).
 DO $audit$
 DECLARE
     s text := current_schema();
     r text := current_setting('ameesh.release_role');
-    w text := r || '_decision_reader';
+    w text := 'ameesh_decision_owner_' || substr(md5(r),1,12);
+    legacy text := r || '_decision_reader';
+    mark text := 'ameesh-decision-owner:' || r;
     fn regprocedure;
     spec record;
 BEGIN
+    IF legacy <> w AND EXISTS (SELECT FROM pg_roles WHERE rolname=legacy) THEN
+        RAISE EXCEPTION 'legacy decision owner % present: re-run release-decision-additive.sql from the current head',legacy;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname=w
+                   AND shobj_description(oid,'pg_authid')=mark) THEN
+        RAISE EXCEPTION 'decision owner marker missing or foreign';
+    END IF;
     IF EXISTS (SELECT FROM pg_roles login JOIN pg_roles reachable
           ON reachable.oid=login.oid OR pg_has_role(login.oid,reachable.oid,'MEMBER')
         WHERE NOT login.rolsuper AND (login.rolname=r OR pg_has_role(login.oid,(SELECT oid FROM pg_roles WHERE rolname=r),'MEMBER'))

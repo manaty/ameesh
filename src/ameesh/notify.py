@@ -3300,7 +3300,9 @@ class Notifier:
         alive = {brief_key_of(a): a for a in current
                  if a.get("type") in alert_briefs.BRIEFED_TYPES
                  and a.get("type") not in alert_briefs.NOTIFIER_EXCLUDED
-                 and not alert_briefs.sleep_unbriefed(a)}
+                 and not alert_briefs.sleep_unbriefed(a)
+                 # #6642 : grâce de 5 min d'un SLO de niveau 1 ordinaire
+                 and not alert_briefs.slo_grace_unbriefed(a)}
         open_lots = None
         for key in list(sent):
             if key not in alive:
@@ -3552,8 +3554,14 @@ class Notifier:
                                # (`_brief_orchestrators`), pour ses lecteurs
                                agents=list(alert.get("agents") or ()),
                                lots=list(alert.get("lots") or ()))
+            if kind == "slo_breach":
+                # #6642 : la mesure de l'auditeur (#207200) lit le lot
+                # (`payload.lot`), l'étape et le palier dans le payload.
+                payload.update(step=alert.get("step"), level=alert.get("level"))
             # pas de `work_item_id` : un message lié au lot compterait comme
-            # son activité (stagnation) et effacerait l'alerte qu'il signale
+            # son activité (stagnation) et effacerait l'alerte qu'il signale.
+            # #6642 (accepté par mesh-design, #207423) : ne pas l'ajouter pour
+            # mesurer — `lot`, `step` et `level` sont dans le payload.
             delivered = []
             quiet = alert_briefs.quiet_payloads(alert, briefs, by_name)
             for name, text in sorted(briefs.items()):

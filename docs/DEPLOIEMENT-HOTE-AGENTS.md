@@ -74,13 +74,16 @@ L’attente d’un tour est bornée (#6528) : `ARRET_BORNE` (300 s) par unité,
 (35 min). Passé la borne, l’arrêt est forcé : second SIGTERM au processus
 principal (le runner arrête son tour et remet sa consigne en attente), puis,
 `ARRET_FORCE_BORNE` (60 s) plus tard, SIGKILL au groupe de l’unité. L’état est
-relu toutes les `ARRET_SONDE` (2 s).
+relu toutes les `ARRET_SONDE` (2 s). Le temps des phases forcées est décompté
+du budget (#6536) ; budget épuisé, une unité coûte encore au plus
+1 + 2 × `ARRET_FORCE_BORNE` s.
 
 Si l’unité est déjà en échec avant l’arrêt, `reset-failed` efface cet échec
 antérieur avant `stop`. Après l’arrêt, `inactive` prouve le point sûr ; `failed`
 (SIGKILL, délai d’arrêt) aussi quand le cgroup de l’unité est vide : l’échec
 est alors effacé, et le démarrage n’a lieu que si l’unité redevient `inactive`.
-Un échec de la remise à zéro, un processus restant dans le cgroup, une unité
+Un échec de la remise à zéro, un processus restant dans le cgroup, un
+`cgroup.procs` présent mais illisible (#6536), une unité
 encore active après SIGKILL ou un `MainPID` non nul interdit le démarrage.
 
 Quand `DRAIN_ATTENTE` est supérieur à 0 (0 par défaut : désactivé), c’est un

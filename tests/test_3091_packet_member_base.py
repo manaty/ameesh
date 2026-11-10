@@ -174,6 +174,48 @@ class PacketMemberBaseTest(PgTestCase):
         return own
 
     # -- témoins ----------------------------------------------------------
+    # #6646: validation must use the resolved remote target, as classification does.
+    def validation_with_historical_trailer(self, *, missing_freeze=False):
+        self.repo.git("checkout", "-q", "-b", "develop", self.old)
+        self.repo.write("history.txt", "already on develop\n")
+        historical = work.add(self.db, title="historical lot without a freeze",
+                              app="ameesh", branch="lot/historical",
+                              branch_target="develop")
+        self.historical_lot = int(historical["id"])
+        self.base = self.repo.commit(
+            "historical lot\n\nameesh-work: %d" % self.historical_lot)
+        self.member()
+        self.repo.git("update-ref", "refs/remotes/origin/develop", self.base)
+        # The local develop branch predates the historical lot; only origin
+        # has the actual packet base. The historical lot has no freeze.
+        self.repo.git("update-ref", "refs/heads/develop", self.old)
+        self.db.execute("UPDATE work_items SET branch_target = 'develop' WHERE id = %s",
+                        (self.vehicle,))
+        if missing_freeze:
+            self.db.execute("DELETE FROM work_item_milestones"
+                            " WHERE work_item_id = %s AND kind = 'frozen'", (self.lot,))
+        row = work.get(self.db, self.vehicle)
+        marks = [{"id": 1, "kind": "frozen", "sha": self.packet}]
+        with mock.patch.object(lot_class, "repo_for_freeze",
+                               return_value=(self.repo.root, self.packet)), \
+                mock.patch.object(work, "configured_canons", return_value=[_canon()]):
+            return merge_queue.review_gate_for_item(
+                self.db, self.cfg, row, marks,
+                klass={"class": "light", "files": [], "frozen_sha": self.packet})
+
+    def test_validation_ignores_historical_lots_before_the_remote_packet_base(self):
+        out = self.validation_with_historical_trailer()
+        self.assertIsNotNone(out)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual([m["lot"] for m in out["vehicle"]["members"]], [self.lot])
+
+    def test_validation_still_refuses_a_real_constituent_without_a_freeze(self):
+        out = self.validation_with_historical_trailer(missing_freeze=True)
+        self.assertIsNotNone(out)
+        self.assertFalse(out["ok"], out)
+        self.assertIn("constituent #%d has no frozen head" % self.lot, out["why"])
+        self.assertNotIn("constituent #%d " % self.historical_lot, out["why"])
+
     def test_a_member_of_the_composition_base_stays_light(self):
         # La cible réelle porte un workflow sensible ; le membre, lui, n'ajoute
         # qu'un fichier léger. La classe ne compte que son propre delta.

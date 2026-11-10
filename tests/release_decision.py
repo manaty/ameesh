@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Install the controller read gate in disposable fixture schemas only."""
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -7,9 +8,14 @@ import uuid
 from tests.support import TEST_DSN
 
 
+def decision_owner(role):
+    """The isolated NOLOGIN definer owner derived by _release-decision.sql (#6377)."""
+    return 'ameesh_decision_owner_' + hashlib.md5(role.encode()).hexdigest()[:12]
+
+
 def install_decision_gate(cls):
     role = 't_decision_' + uuid.uuid4().hex[:10]
-    writer = role + '_decision_reader'
+    writer = decision_owner(role)
     root = Path(__file__).resolve().parents[1]
     sql = ("BEGIN; CREATE ROLE \"%s\" NOLOGIN; "
            "SELECT set_config('ameesh.release_role','%s',true);\n" % (role, role)

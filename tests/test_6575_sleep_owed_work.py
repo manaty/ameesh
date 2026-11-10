@@ -16,6 +16,7 @@ Témoins du lot :
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from unittest import mock
@@ -74,8 +75,12 @@ class SleepOwedWorkTest(PgTestCase):
         unit = int(work.add(self.db, title="unité", app="ameesh", actor="pilote")["id"])
         work.assign(self.db, unit, member_assignee, actor="pilote")
         self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (unit,))
-        # gelé, sans verdict : le lot n'est pas actionnable (cas de codex3)
-        work.milestone(self.db, unit, "frozen", sha="c" * 40, actor=member_assignee)
+        # gelé, sans verdict : le lot n'est pas actionnable (cas de codex3).
+        # #6576 : le SHA factice se gèle hors du clone ; depuis un clone
+        # partiel, sa résolution réveillait le fetch paresseux (minutes).
+        with contextlib.chdir(self.tmp):
+            work.milestone(self.db, unit, "frozen", sha="c" * 40,
+                           actor=member_assignee)
         rows = [{"package_id": carrier, "work_item_id": unit,
                  "package_state": carrier_state, "package_merged_sha": merged_sha}]
         patch = mock.patch("ameesh.packet_link.memberships",

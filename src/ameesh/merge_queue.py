@@ -1772,7 +1772,11 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
     try:
         gate = review_gate(db, marks or [], frozen,
                            repo=klass.get("repo") or repo or None,
-                           klass=klass, item=item, cfg=cfg, target=target)
+                           # #6646: keep the same resolved target as the class.
+                           # A bare develop/main can name an older local branch
+                           # and make the vehicle scan historical target trailers.
+                           klass=klass, item=item, cfg=cfg,
+                           target=base_sha or target)
     except Exception:  # noqa: BLE001 - une porte illisible ne conclut pas
         return None
     if sweep is not None and sweep.trips != trips:

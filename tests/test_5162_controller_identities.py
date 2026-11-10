@@ -25,6 +25,8 @@ try:  # #5628 : l'outil parle psycopg ; la part psql de la CI n'en a pas
 except ImportError:  # pragma: no cover - dépend de la part de CI
     psycopg = None
 
+from .release_decision import decision_owner
+
 REPO = Path(__file__).resolve().parents[1]
 tool = None
 if psycopg is not None:
@@ -296,7 +298,7 @@ class RealIdentityTest(unittest.TestCase):
         with psycopg.connect(self.dsns[0], autocommit=True) as conn:
             conn.execute(sql.SQL('DROP DATABASE {} WITH (FORCE)').format(sql.Identifier(self.database)))
             conn.execute(sql.SQL('DROP ROLE IF EXISTS {}').format(
-                sql.Identifier(self.value['group_role'] + '_decision_reader')))
+                sql.Identifier(decision_owner(self.value['group_role']))))
             for key in ('controller_role', 'backup_role', 'group_role'):
                 conn.execute(sql.SQL('DROP ROLE IF EXISTS {}').format(sql.Identifier(self.value[key])))
         with psycopg.connect(self.dsns[1], autocommit=True) as conn:

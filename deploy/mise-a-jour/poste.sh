@@ -114,7 +114,8 @@ RECUPERATION_TIMEOUT=${RECUPERATION_TIMEOUT:-3600}
 # (35 min) en plein tour. Fin de tour attendue au plus ARRET_BORNE s par runner
 # et ARRET_BUDGET s sur toute l'étape ; puis arrêt forcé (second SIGTERM, puis
 # SIGKILL), chacun attendu au plus ARRET_FORCE_BORNE s. État relu toutes les
-# ARRET_SONDE s.
+# ARRET_SONDE s. #6536/N2 : le temps des phases forcées est décompté du
+# budget ; budget épuisé, un runner coûte encore au plus 1 + 2 × ARRET_FORCE_BORNE s.
 ARRET_BORNE=${ARRET_BORNE:-300}
 ARRET_BUDGET=${ARRET_BUDGET:-900}
 ARRET_FORCE_BORNE=${ARRET_FORCE_BORNE:-60}
@@ -705,7 +706,11 @@ cgroup_vide() {  # unité — 0 si aucun processus ne reste dans son cgroup
   # un chemin de cgroup est absolu, sans `..` ; une autre sortie est illisible
   [[ $cg == /* && $cg != *..* ]] || return 1
   f=/sys/fs/cgroup$cg/cgroup.procs
-  [ ! -e "$f" ] || [ -z "$(cat "$f")" ]
+  # #6536/N1 : une lecture en échec n'est pas un cgroup vide ; seul un fichier
+  # disparu (cgroup supprimé par systemd, même pendant la lecture) l'est.
+  local p
+  p=$(cat "$f") || { [ ! -e "$f" ]; return; }
+  [ -z "$p" ]
 }
 arreter_hors_tour() {  # unité — 0 quand l'arrêt est prouvé (aucun processus, MainPID=0)
   local u=$1 etat pid debut borne rc
@@ -729,8 +734,6 @@ arreter_hors_tour() {  # unité — 0 quand l'arrêt est prouvé (aucun processu
     *) echo "$u : l'arrêt échoue après $(( SECONDS - debut )) s (code $rc) — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
        return 1 ;;
   esac
-  ARRET_BUDGET=$(( ARRET_BUDGET - (SECONDS - debut) ))
-  ((ARRET_BUDGET > 0)) || ARRET_BUDGET=0
   if [ "$rc" = 1 ]; then
     echo "$u : tour encore en cours après $borne s — arrêt forcé : second SIGTERM, le tour s'arrête et sa consigne est remise en attente" >&2
     systemctl --user kill --kill-who=main --signal=SIGTERM "$u" || true
@@ -741,6 +744,9 @@ arreter_hors_tour() {  # unité — 0 quand l'arrêt est prouvé (aucun processu
     systemctl --user kill --kill-who=all --signal=SIGKILL "$u" || true
     rc=0; attendre_arret "$u" "$ARRET_FORCE_BORNE" || rc=$?
   fi
+  # #6536/N2 : les phases forcées comptent aussi dans le budget de l'étape.
+  ARRET_BUDGET=$(( ARRET_BUDGET - (SECONDS - debut) ))
+  ((ARRET_BUDGET > 0)) || ARRET_BUDGET=0
   if [ "$rc" != 0 ]; then
     echo "$u : arrêt non prouvé (unité encore active après SIGKILL, ou état illisible) — aucun démarrage ; journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
     return 1
@@ -766,7 +772,7 @@ arreter_hors_tour() {  # unité — 0 quand l'arrêt est prouvé (aucun processu
       echo "$u : arrêt non prouvé (ActiveState=$etat, MainPID=$pid) — aucun démarrage ; journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
       return 1 ;;
   esac
-  etape "$u : arrêt prouvé — attente $(( SECONDS - debut )) s"
+  etape "$u : arrêt prouvé — attente $(( SECONDS - debut )) s, budget d'arrêt restant $ARRET_BUDGET s"
 }
 redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
   local u=$1
