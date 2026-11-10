@@ -14,19 +14,25 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
+import tempfile
+import time
 import unittest
 from unittest import mock
 
-from ameesh import adapters, cost, db as db_mod, exploitation, registry, storage
+from ameesh import (adapters, config as config_mod, cost, db as db_mod,
+                    exploitation, registry, storage)
 from ameesh.mesh_cli import parse_token_count
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
 
-#: un tour dont UN appel relit 16 M jetons de contexte, au-dessus du plafond 15 M
+#: un tour dont UN appel relit 15,9 M de jetons de contexte, au-dessus du
+#: plafond du harnais deepseek (250 k, #6677)
 GROS_TOUR = "100000,15900000,500"
-#: un tour léger : 2 M relus en deux étapes de 1 M (contexte 1 M)
-PETIT_TOUR = "50000,950000,100;50000,950000,100"
+#: un tour calme : deux étapes de 200 k de contexte (sous le plafond 250 k),
+#: 400 k relus au total
+PETIT_TOUR = "50000,150000,100;50000,150000,100"
 
 
 class LectureDuFluxTest(unittest.TestCase):
@@ -80,12 +86,12 @@ class _Base(PgTestCase):
         super().setUp()
         self.db.execute("TRUNCATE turn_costs, spend_pending CASCADE")
 
-    def _worker(self, name: str, **cfg_extra):
+    def _worker(self, name: str, harness: str = "deepseek", **cfg_extra):
         cfg = dataclasses.replace(self.cfg, **cfg_extra) if cfg_extra else self.cfg
         runner = Runner(cfg, self.db, once=True)
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        self.register(name, "deepseek", cwd=cwd)
+        self.register(name, harness, cwd=cwd)
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         self.assertIsNotNone(lease)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
@@ -102,6 +108,11 @@ class _Base(PgTestCase):
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
                "AMEESH_TEST_DSH_USAGE": usage, "AMEESH_PRICES": bareme}
         return mock.patch.dict(os.environ, env, clear=False)
+
+    def _env_claude(self, appels: list):
+        return mock.patch.dict(os.environ, {
+            "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+            "AMEESH_TEST_CLAUDE_CALLS": json.dumps(appels)}, clear=False)
 
     def _tour(self, worker, texte: str = "travail") -> bool:
         return worker.run_turn({"kind": "prompt", "prompt": texte, "ids": []})
@@ -122,12 +133,12 @@ class GrandLivreDeepSeekTest(_Base):
         # le défaut du descripteur est passé explicitement : modèle connu
         self.assertEqual(ligne["model"], "deepseek-flash")
         self.assertEqual((int(ligne["input_tokens"]), int(ligne["cached_input_tokens"])),
-                         (100_000, 1_900_000))
+                         (100_000, 300_000))
         argv = self.turns()[-1]["argv"]
         self.assertIn("--patch", argv)
         with open(argv[argv.index("--patch") + 1], encoding="utf-8") as fh:
             self.assertIn("model: deepseek-flash", fh.read())
-        self.assertEqual(worker.last_turn_reread, 2_000_000)
+        self.assertEqual(worker.last_turn_reread, 400_000)
         self.assertEqual(worker.last_turn_reread_session, "dsh-session-1")
 
     def test_tarif_du_modele_configure_pas_le_maximum(self):
@@ -138,9 +149,9 @@ class GrandLivreDeepSeekTest(_Base):
         with self._env(PETIT_TOUR):
             self.assertTrue(self._tour(worker))
         ligne = self._lignes("ds-tarif")[-1]
-        flash = (100_000 * 1.0 + 1_900_000 * 0.01 + 200 * 2.0) / 1e6
+        flash = (100_000 * 1.0 + 300_000 * 0.01 + 200 * 2.0) / 1e6
         self.assertAlmostEqual(float(ligne["usd"]), flash, places=6)
-        self.assertLess(float(ligne["usd"]), (100_000 * 10.0 + 1_900_000 * 0.1) / 1e6)
+        self.assertLess(float(ligne["usd"]), (100_000 * 10.0 + 300_000 * 0.1) / 1e6)
 
     def test_marqueur_rejoue_n_ecrit_pas_de_doublon(self):
         """Constat du 2026-10-10 (deepseek3/4, 06:04 et 06:05) : l'exécuteur
@@ -210,11 +221,15 @@ class GrandLivreDeepSeekTest(_Base):
 class PlafondDeContexteTest(_Base):
     def test_au_dela_du_plafond_la_session_tourne_avec_resume(self):
         runner, worker = self._worker("ds-cap")
-        self.assertEqual(worker.context_max_tokens(), 15_000_000)
+        # #6677 : le harnais deepseek a son propre plafond (250 k), lu avant
+        # le défaut global de 15 M.
+        self.assertEqual(worker.context_max_tokens(), 250_000)
         with self._env(GROS_TOUR):
             self.assertTrue(self._tour(worker, "premier tour"))
             self.assertEqual(registry.get(self.db, "ds-cap")["session_id"], "dsh-session-1")
             self.assertTrue(worker.context_rotation_due())
+            self.assertTrue(worker.rotation_forcee,
+                            "la clôture au plafond force la rotation qui suit")
             # un seul tour suffit : pas de minimum de tours pour le plafond
             self.assertLess(worker.session_turns, self.cfg.session_min_turns)
             with mock.patch.object(worker, "_fil_note") as note:
@@ -240,45 +255,95 @@ class PlafondDeContexteTest(_Base):
 
     def test_sous_le_plafond_rien_ne_tourne(self):
         runner, worker = self._worker("ds-sous")
+        # 200 k de contexte, sous les 250 k du harnais deepseek
+        self.assertEqual(worker.context_max_tokens(), 250_000)
         with self._env(PETIT_TOUR):
             self.assertTrue(self._tour(worker))
             self.assertFalse(worker.context_rotation_due())
             self.assertFalse(worker.maybe_rotate())
         self.assertEqual(registry.get(self.db, "ds-sous")["session_id"], "dsh-session-1")
 
+    def test_tour_deepseek_clos_a_250k_et_tour_claude_laisse(self):
+        """#6677 : pendant un tour, le plafond lu est celui du harnais
+        effectivement lancé — deepseek ferme à 250 k, claude reste au défaut
+        global (15 M) pour le même contexte."""
+        _runner, deepseek = self._worker("ds-250")
+        with self._env("100000,200000,500"):   # contexte 300 k
+            self.assertTrue(self._tour(deepseek))
+        self.assertTrue((deepseek.last_turn_closed or "").startswith("context cap"))
+        self.assertTrue(deepseek.rotation_forcee)
+        _runner, claude = self._worker("cl-250", harness="claude")
+        with self._env_claude([{"reread": 300000, "tool": True}]):
+            self.assertTrue(self._tour(claude))
+        self.assertIsNone(claude.last_turn_closed)
+        self.assertFalse(claude.rotation_forcee)
+
     def test_la_somme_des_appels_ne_tourne_pas(self):
-        """#2336 : 2 M relus en deux étapes de 1 M dans une session de 1 M ne
-        dépassent pas le plafond de 15 M — la somme du tour n'est pas une
-        taille de contexte."""
+        """#2336 : 400 k relus en deux étapes de 200 k dans une session de
+        200 k ne dépassent pas le plafond du harnais (250 k) — la somme du
+        tour n'est pas une taille de contexte."""
         runner, worker = self._worker("ds-somme")
         with self._env(PETIT_TOUR):
             self.assertTrue(self._tour(worker))
-        self.assertEqual(worker.last_turn_reread, 2_000_000)
+        self.assertEqual(worker.last_turn_reread, 400_000)
         self.assertEqual(worker.last_turn_context_reread(),
-                         (1_000_000, "dsh-session-1"))
+                         (200_000, "dsh-session-1"))
         self.assertFalse(worker.context_rotation_due())
 
     def test_reglage_par_agent(self):
         runner, worker = self._worker("ds-reg")
         with self._env(PETIT_TOUR):
             self.assertTrue(self._tour(worker))
+        # 200 k de contexte : sous le plafond du harnais (250 k)
         self.assertFalse(worker.context_rotation_due())
-        # plafond abaissé sous le contexte du dernier appel (1 M)
-        proc = self.mesh("set", "ds-reg", "context_max_tokens=900k")
+        # plafond propre à l'agent, sous le contexte du dernier appel
+        proc = self.mesh("set", "ds-reg", "context_max_tokens=150k")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("context=900000", proc.stdout)
+        self.assertIn("context=150000", proc.stdout)
         worker.agent = registry.get(self.db, "ds-reg")
-        self.assertEqual(worker.context_max_tokens(), 900_000)
+        self.assertEqual(worker.context_max_tokens(), 150_000)
         self.assertTrue(worker.context_rotation_due())
         # 0 = désactivé
         self.assertEqual(self.mesh("set", "ds-reg", "context_max_tokens=0").returncode, 0)
         worker.agent = registry.get(self.db, "ds-reg")
         self.assertFalse(worker.context_rotation_due())
-        # vide = défaut de l'exécuteur ; valeur illisible refusée
+        # vide = défaut du harnais (250 k), pas le défaut global ; valeur
+        # illisible refusée
         self.assertEqual(self.mesh("set", "ds-reg", "context_max_tokens=").returncode, 0)
         self.assertIsNone(registry.get(self.db, "ds-reg")["context_max_tokens"])
+        worker.agent = registry.get(self.db, "ds-reg")
+        self.assertEqual(worker.context_max_tokens(), 250_000)
+        self.assertFalse(worker.context_rotation_due())
         self.assertEqual(self.mesh("set", "ds-reg", "context_max_tokens=beaucoup").returncode, 2)
         self.assertEqual(self.mesh("set", "ds-reg", "context_max_tokens=-3").returncode, 2)
+
+    def test_plafond_du_harnais_laisse_l_autre_harnais_et_cede_a_l_agent(self):
+        """#6677 : le plafond suit le harnais du tour ; un réglage par agent
+        garde la priorité ; un exécuteur N-1 sans valeur par harnais garde le
+        défaut global."""
+        _runner, deepseek = self._worker("ds-harnais")
+        _runner, claude = self._worker("cl-harnais", harness="claude")
+        now = time.time()
+        # deepseek : 250 k, le tour claude reste au défaut global (15 M)
+        self.assertEqual(deepseek.context_max_tokens(), 250_000)
+        self.assertEqual(claude.context_max_tokens(), 15_000_000)
+        self.assertIsNone(deepseek.turn_close_due(now, 249_999, now=now))
+        self.assertIn("context cap", deepseek.turn_close_due(now, 250_000, now=now))
+        self.assertIsNone(claude.turn_close_due(now, 250_000, now=now))
+        self.assertIn("context cap", claude.turn_close_due(now, 15_000_000, now=now))
+        # un réglage par agent l'emporte sur le défaut du harnais
+        storage.of(self.db).operations.set_settings(
+            "ds-harnais", {"context_max_tokens": "400000"})
+        deepseek.agent = registry.get(self.db, "ds-harnais")
+        self.assertEqual(deepseek.context_max_tokens(), 400_000)
+        self.assertIsNone(deepseek.turn_close_due(now, 300_000, now=now))
+        self.assertIn("context cap", deepseek.turn_close_due(now, 400_000, now=now))
+        # un exécuteur N-1, sans table par harnais, garde le défaut global
+        _runner, ancien = self._worker("ds-n1", context_max_tokens_by_harness={})
+        self.assertEqual(ancien.context_max_tokens(), 15_000_000)
+        # un harnais absent de la table garde aussi le défaut global
+        _runner, inconnu = self._worker("cx-harnais", harness="codex")
+        self.assertEqual(inconnu.context_max_tokens(), 15_000_000)
 
     def test_list_json_rend_le_plafond(self):
         runner, worker = self._worker("ds-list")
@@ -313,6 +378,47 @@ class PlafondDeContexteTest(_Base):
         with mock.patch.object(worker, "run_turn", return_value=False):
             self.assertFalse(worker.maybe_rotate())
         self.assertEqual(registry.get(self.db, "ds-echec")["session_id"], "dsh-session-1")
+
+
+class PlafondParHarnaisConfigTest(unittest.TestCase):
+    """#6677 : le défaut par harnais est une valeur d'exécuteur compilée,
+    lue au chargement et prioritaire sur le défaut global."""
+
+    def _load(self, payload: dict):
+        tmp = tempfile.mkdtemp(prefix="ameesh-6677-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        return config_mod.load(env={"AMEESH_CONFIG": path},
+                               register_credentials=False)
+
+    def test_defaut_compile_du_harnais(self):
+        cfg = config_mod.load(register_credentials=False)
+        self.assertEqual(cfg.context_max_tokens_by_harness,
+                         {"deepseek": 250_000.0})
+        self.assertEqual(exploitation.effective_context_max(
+            cfg, {"harness": "deepseek"}), 250_000)
+        self.assertEqual(exploitation.effective_context_max(
+            cfg, {"harness": "claude"}), 15_000_000)
+        self.assertEqual(exploitation.effective_context_max(
+            cfg, {"harness": "codex"}), 15_000_000)
+
+    def test_le_fichier_change_ou_retire_la_valeur(self):
+        cfg = self._load({"context_max_tokens_by_harness": {"deepseek": 300000}})
+        self.assertEqual(exploitation.effective_context_max(
+            cfg, {"harness": "deepseek"}), 300_000)
+        # une table vide rend le défaut global au harnais (exécuteur N-1)
+        cfg = self._load({"context_max_tokens_by_harness": {}})
+        self.assertEqual(exploitation.effective_context_max(
+            cfg, {"harness": "deepseek"}), 15_000_000)
+
+    def test_valeur_illisible_refusee(self):
+        for bad in ({"deepseek": -1}, {"deepseek": "beaucoup"},
+                    {"deepseek": True}, ["deepseek"]):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit) as caught:
+                self._load({"context_max_tokens_by_harness": bad})
+            self.assertIn("context_max_tokens_by_harness", str(caught.exception))
 
 
 if __name__ == "__main__":

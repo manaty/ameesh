@@ -23,7 +23,8 @@ import os
 import unittest
 from unittest import mock
 
-from ameesh import adapters, context_metrics, context_profile, cost, events, mechanics
+from ameesh import (adapters, context_metrics, context_profile, cost, events,
+                    exploitation, mechanics)
 from ameesh.runner import AgentWorker
 
 from .support import PgTestCase
@@ -549,7 +550,9 @@ class TurnContextEventTest(PgTestCase):
         self.assertEqual(data["legacy"]["session_tokens"], 1800)
         self.assertEqual(data["legacy"]["session_turns"], 1)
         self.assertEqual(data["legacy"]["context_max_tokens"],
-                         self.cfg.context_max_tokens)
+                         exploitation.effective_context_max(
+                             self.cfg, {"harness": "deepseek"}))
+        self.assertEqual(data["legacy"]["context_max_tokens"], 250_000)
         self.assertEqual(
             data["legacy"]["session_max_tokens"],
             mechanics.session_max_tokens(self.cfg, "deepseek",
@@ -669,11 +672,10 @@ class TurnContextEventTest(PgTestCase):
         self.assertEqual(data["context"]["measures"]["R_turn"]["value"], 21000)
 
     def test_aucune_decision_legacy_change(self):
-        # Le plafond de contexte reste le seuil legacy, et la publication ne
-        # l'abaisse pas : le tour long n'est pas clos par la mesure normalisée.
+        # Le plafond publié est celui du harnais (250 k pour deepseek, #6677) ;
+        # la publication ne le change pas : le tour court n'est pas clos.
         data = self._run("ctx-seuil", "1000,20000,100")
-        self.assertEqual(data["legacy"]["context_max_tokens"],
-                         self.cfg.context_max_tokens)
+        self.assertEqual(data["legacy"]["context_max_tokens"], 250_000)
         self.assertIsNone(data["decision"]["close"])
         row = self.db.query(
             "select context_max_tokens from agent_registry where name = %s",
