@@ -75,8 +75,7 @@ class PinTest(unittest.TestCase):
 
     def test_repository_pins_are_exact_and_hashed(self):
         for name, kind, required in (
-                ('runtime-pins.txt', 'runtime', {'psycopg', 'psycopg-binary', 'psutil',
-                                                  'coverage', 'pyyaml'}),
+                ('runtime-pins.txt', 'runtime', {'psycopg', 'psycopg-binary', 'psutil'}),
                 ('runtime-build-pins.txt', 'build', {'setuptools'})):
             path = ROOT / 'deploy/mise-a-jour' / name
             pins = build.read_pins(path, kind=kind)
@@ -86,6 +85,31 @@ class PinTest(unittest.TestCase):
                 self.assertTrue(record['hashes'])
                 self.assertTrue(all(len(value) == 64 for value in record['hashes']))
                 self.assertTrue(record['version'])
+
+    def test_runtime_pins_carry_no_test_tool(self):
+        """#6601 : coverage pose un `.pth`, refusé par la garde de l'arbre ;
+        le runtime root (contrôleur, bootstrap) n'épingle aucun outil de test."""
+        pins = build.read_pins(ROOT / 'deploy/mise-a-jour/runtime-pins.txt', kind='runtime')
+        self.assertEqual(build.TEST_TOOLS & set(pins['records']), set())
+        base = ''.join('%s==1.0 --hash=sha256:%s\n' % (name, 'a' * 64)
+                       for name in ('psycopg', 'psycopg-binary', 'psutil'))
+        for tool in ('coverage', 'pyyaml', 'PyYAML'):
+            with self.subTest(tool=tool):
+                path = self.write(base + '%s==1.0 --hash=sha256:%s\n' % (tool, 'b' * 64))
+                with self.assertRaisesRegex(build.BuildError, 'test tools'):
+                    build.read_pins(path, kind='runtime')
+
+    def test_host_runtime_still_receives_the_contract_tools(self):
+        """#6601 : l'hôte d'agents garde coverage et PyYAML (passe contrats
+        de #6291) par l'extra `contrats` que `bascule.py` installe."""
+        import tomllib
+        with open(ROOT / 'pyproject.toml', 'rb') as handle:
+            extras = tomllib.load(handle)['project']['optional-dependencies']
+        names = {requirement.split('>')[0].split('=')[0].split('<')[0].strip().lower()
+                 for requirement in extras['contrats']}
+        self.assertTrue({'coverage', 'pyyaml'} <= names)
+        source = (ROOT / 'deploy/mise-a-jour/bascule.py').read_text()
+        self.assertIn('HOST_EXTRAS = "psycopg,crypto,contrats"', source)
 
     def test_unpinned_url_option_marker_duplicate_and_binary_are_refused(self):
         cases = {

@@ -12,9 +12,11 @@ root, in a new directory, without publishing anything:
 * a fresh venv from `/usr/bin/python3`, with no pip in the final tree;
 * the `ameesh` wheel built from the exact commit, never from checkout bytes;
 * the wheel's complete dependency closure (`psycopg[binary]`, `psutil` and
-  their transitive dependencies) plus the contract-module tools `coverage`
-  and `pyyaml` (#6291), pinned by version and SHA-256 in
+  their transitive dependencies), pinned by version and SHA-256 in
   `runtime-pins.txt`, installed with `--require-hashes --only-binary=:all:`;
+  no test tool (#6601: `coverage` installs a `.pth`, refused below; the
+  composer's contract tools reach the agent hosts through the `contrats`
+  extra of `bascule.py`, never through this root runtime);
 * the wheel build backend pinned in `runtime-build-pins.txt` and installed in
   a disposable tools venv, never in the runtime;
 * a provenance receipt carrying the SHA, both pin-file digests, the Python
@@ -73,6 +75,11 @@ SCRIPT_PREAMBLE = (
     b"' '''\n"
 )
 PINS_NAME = 'deploy/mise-a-jour/runtime-pins.txt'
+#: #6601 : outils de test refusés dans le runtime root (contrôleur, bootstrap).
+#: `coverage` pose un `.pth` (code au démarrage), que la garde de l'arbre
+#: refuse ; la passe contrats du composeur (#6291) les reçoit sur les hôtes
+#: d'agents par l'extra `contrats` de `bascule.py` (#6309).
+TEST_TOOLS = frozenset({'coverage', 'pyyaml', 'pytest'})
 BUILD_PINS_NAME = 'deploy/mise-a-jour/runtime-build-pins.txt'
 RECEIPT = 'receipt.json'
 SUMS = 'SHA256SUMS'
@@ -175,11 +182,14 @@ def read_pins(path, *, kind):
     if not records:
         raise BuildError('empty pin file refused')
     if kind == 'runtime':
-        # #6291 : coverage et pyyaml, outils des modules de contrats du composeur
-        missing = {'psycopg', 'psycopg-binary', 'psutil', 'coverage', 'pyyaml'} - set(records)
+        missing = {'psycopg', 'psycopg-binary', 'psutil'} - set(records)
         if missing:
-            raise BuildError('runtime pins must cover psycopg[binary], psycopg-binary, psutil, '
-                             'coverage and pyyaml')
+            raise BuildError('runtime pins must cover psycopg[binary], psycopg-binary and psutil')
+        tools = TEST_TOOLS & set(records)
+        if tools:
+            raise BuildError('runtime pins refuse test tools (%s): the contract tools '
+                             'reach the agent hosts through the contrats extra'
+                             % ', '.join(sorted(tools)))
     elif 'setuptools' not in records:
         raise BuildError('build pins must pin setuptools')
     return dict(records=records, digest=hashlib.sha256(data).hexdigest(), bytes=len(data))
@@ -413,9 +423,8 @@ def check_runtime(tools, runtime_dir, pins, wheel, *, env):
         raise BuildError('installed wheel version differs from the build')
     pip(tools, '--python', str(runtime_dir / 'bin' / 'python'), 'check', env=env)
     _target(runtime_dir,
-            'import ameesh, coverage, psycopg, psutil, yaml\n'
-            'print(ameesh.__version__, psycopg.__version__, psutil.__version__,\n'
-            '      coverage.__version__, yaml.__version__)\n',
+            'import ameesh, psycopg, psutil\n'
+            'print(ameesh.__version__, psycopg.__version__, psutil.__version__)\n',
             env=env)
 
 
