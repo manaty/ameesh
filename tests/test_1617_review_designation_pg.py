@@ -425,7 +425,8 @@ class Test1617ReviewDesignationPg(PgTestCase):
                               policy=light_rule, paths=("src/x.sql",))
         self.assertEqual(out2["freeze"]["sha"], SHA_B)
         self.assertNotEqual(int(first["id"]), int(second["id"]))
-        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r1"])
+        # #6641: the unread mail is replaced, both designation marks remain.
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1"])
         self.assertIn(SHA_B, self.mailbox()[-1]["body"])
         # la désignation du premier gel reste attachée à son gel (portée des verdicts)
         old = pg.PgPort(self.db).recorded(self.lot, int(first["id"]))

@@ -2015,11 +2015,17 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str, *,
     if not name or name.startswith(HUMAN_PREFIX) or name == REVIEWER_NONE:
         return {}
     try:
-        latest = plan_git.latest_freeze(milestones(db, int(item["id"]), limit=None))
+        timeline = milestones(db, int(item["id"]), limit=None)
+        latest = plan_git.latest_freeze(timeline)
     except Exception:  # noqa: BLE001 - unreadable milestones: no head named
         latest = None
     freeze = ({"id": int(latest["id"]), "sha": str(latest.get("sha") or "")}
               if latest is not None else None)
+    if freeze and any(row.get("kind") == "verdict" and row.get("actor") == name
+                      and str(row.get("sha") or "").lower() == freeze["sha"].lower()
+                      for row in timeline):
+        return {"reviewer_request_warning":
+                "review request refused: verdict already recorded on this head"}
     # #2495/#2504 : one request per (lot, reviewer, head). A re-designation, or
     # a designation after the freeze already woke this reviewer, sends nothing.
     # The requests are selected per lot in storage: an old one cannot fall out
@@ -2053,6 +2059,8 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str, *,
         message_id = mail.send(
             db, who or SYSTEM_SENDER, name, body, kind=REQUEST_KIND,
             work_item_id=str(int(item["id"])), payload=payload)
+    except ValueError as exc:
+        return {"reviewer_request_warning": str(exc)}
     except Exception as exc:  # noqa: BLE001 - la désignation est écrite ; le dire
         return {"reviewer_request_warning":
                 "review request not delivered to %s (%s): notify them" % (name, exc)}
