@@ -307,10 +307,13 @@ class GithubRateLimited(GithubError):
     appelant qui a une valeur en cache la sert : la panne ne perd pas de
     preuve, elle attend le reset."""
 
-    def __init__(self, path: str, reset: float | None = None):
+    def __init__(self, path: str, reset: float | None = None, *, reserve: bool = False):
         when = time.strftime("%H:%M:%SZ", time.gmtime(reset)) if reset else "unknown"
-        super().__init__("GitHub %s: rate limit exhausted (reset at %s)" % (path, when))
+        # #6649 : sous la réserve, le quota reste pour les portes, il n'est pas épuisé.
+        super().__init__("GitHub %s: rate limit %s (reset at %s)"
+                         % (path, "reserve reached" if reserve else "exhausted", when))
         self.reset = reset
+        self.reserve = reserve
 
 
 @dataclass
@@ -829,14 +832,20 @@ class SharedReads:
             return until
         # #6649: preserve the last 20% for explicit gate/merge reads. Never
         # infer a new window from an old sample after its reset.
-        from ...github_budget import RESERVE_FRACTION
-        if self.priority != "gate" and resource == DEFAULT_RESOURCE:
+        from ...github_budget import RESERVE_FRACTION, RESERVE_RESOURCES
+        if self.priority != "gate" and resource in RESERVE_RESOURCES:
             limit, remaining, reset = (quota.get(k) for k in ("limit", "remaining", "reset"))
             if (isinstance(limit, int) and limit > 0 and isinstance(remaining, int)
                     and remaining < limit * RESERVE_FRACTION and isinstance(reset, (int, float))
                     and reset > now):
                 return float(reset)
         return None
+
+    def reserve_only(self, now=None, resource: str = DEFAULT_RESOURCE) -> bool:
+        """#6649 : bloquée par la seule réserve (quota restant, pas épuisé) ?"""
+        now = float(self.clock() if now is None else now)
+        return (self.blocked(now, resource) is not None
+                and float(self.quota(resource).get("blocked_until") or 0.0) <= now)
 
 
 def _resource_header(headers) -> str | None:
@@ -907,7 +916,8 @@ class Api:
                     self.last_read = ReadMeta(entry.read_ts, True, "cache")
                     return entry.value
                 self.reads.count("refused")
-                raise GithubRateLimited(path, until)
+                raise GithubRateLimited(path, until,
+                                        reserve=self.reads.reserve_only(now, resource))
         url = "%s/%s" % (self.base, str(path).lstrip("/"))
         request = urllib.request.Request(url, method="GET",
                                          headers=self._request_headers(path, entry))
@@ -989,7 +999,7 @@ class GhApi:
                 self.last_read = ReadMeta(entry.read_ts, True, "cache")
                 return entry.value
             self.reads.count("refused")
-            raise GithubRateLimited(path, until)
+            raise GithubRateLimited(path, until, reserve=self.reads.reserve_only(now, resource))
         status, headers, body = gh_api_response(
             self.gh, path, etag=entry.etag if entry is not None else None)
         if status == 304 and entry is not None:

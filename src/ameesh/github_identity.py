@@ -524,7 +524,7 @@ def refuse_auto(real, argv):
 #: tourne sous l'interpréteur de l'exécuteur, sans importer ameesh.
 SHIM = r'''#!{python}
 # ameesh #1645 : journal des gestes gh ; #2848 : marqueur des commentaires ;
-# #2853 : garde `pr merge --auto`.
+# #2853 : garde `pr merge --auto` ; #6649 : réserve de quota des sondages.
 # Fichier généré par l'exécuteur, ne pas éditer ; il est réécrit à chaque tour.
 import json, os, re, sys, time
 {sanitize}
@@ -564,7 +564,8 @@ try:
 except Exception:  # le marqueur ne bloque jamais la commande
     argv = sys.argv[1:]
 # #6649: no API request to check the reserve; the shared response headers
-# are already on disk. A missing optional module preserves the old shim.
+# are already on disk. Without ameesh importable, or an unreadable cache,
+# the command runs unguarded.
 try:
     from ameesh.github_budget import reserve_reason
     reason = reserve_reason(argv)

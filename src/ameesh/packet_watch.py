@@ -519,8 +519,14 @@ def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
         # #6649: the timer can tick every minute; do not repay every held
         # carrier's forge reads at that cadence. Explicit check/arm stays immediate.
         from .github_budget import POLL_INTERVAL
-        checked = state.setdefault("auto_merge_checked_at", {})
-        if name not in checked or now - float(checked[name]) >= POLL_INTERVAL:
+        checked = state.get("auto_merge_checked_at")
+        if not isinstance(checked, dict):
+            checked = state["auto_merge_checked_at"] = {}
+        try:
+            last = float(checked.get(name))
+        except (TypeError, ValueError):  # absent or unreadable: check now
+            last = None
+        if last is None or now - last >= POLL_INTERVAL:
             if not dry_run:
                 checked[name] = now
             results += _auto_merge(cfg, db, name, watch.app or name, gh=gh, dry_run=dry_run,

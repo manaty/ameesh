@@ -104,6 +104,39 @@ class BudgetTest(unittest.TestCase):
         self.assertFalse(budget.is_poll(["api", "repos/o/r/merges", "-X", "POST"]))
         self.assertFalse(budget.is_poll(["api", "graphql", "-f", "query=x"]))
 
+    def test_graphql_commands_consult_the_graphql_bucket(self):
+        env = {"AMEESH_GITHUB_STATE": self.state}
+        self.assertEqual(budget.poll_resource(["pr", "view", "2"]), "graphql")
+        self.assertEqual(budget.poll_resource(["release", "view", "v1"]), "core")
+        self.assertEqual(budget.poll_resource(["api", "graphql", "-X", "GET"]), "graphql")
+        self.assertIsNone(budget.poll_resource(["pr", "merge", "2"]))
+        self.sample()  # core low: GraphQL reads still pass
+        self.assertIsNone(budget.reserve_reason(["pr", "view", "2"], env=env, now=1000))
+        self.reads.note(quota_headers(remaining="10", reset=2000, resource="graphql"), status=200)
+        reason = budget.reserve_reason(["pr", "view", "2"], env=env, now=1000)
+        self.assertIn("GitHub graphql rate limit reserve", reason)
+
+    def test_reserve_refusal_does_not_claim_exhaustion(self):
+        self.sample()
+        api = plan_github.Api("token", base=BASE, reads=self.reads, clock=self.clock,
+                              opener=FakeGitHub(self.clock))
+        with self.assertRaises(plan_github.GithubRateLimited) as caught:
+            api.get("repos/o/r")
+        self.assertTrue(caught.exception.reserve)
+        self.assertIn("reserve reached", str(caught.exception))
+        self.sample(0, 403)
+        with self.assertRaises(plan_github.GithubRateLimited) as caught:
+            api.get("repos/o/r")
+        self.assertFalse(caught.exception.reserve)
+        self.assertIn("exhausted", str(caught.exception))
+        self.assertIn("exhausted", budget.reserve_reason(
+            ["run", "list"], env={"AMEESH_GITHUB_STATE": self.state}, now=1000))
+
+    def test_quota_alert_is_labelled_and_pushed_by_default(self):
+        from ameesh import notify
+        self.assertIn("github_quota_low", notify.TYPE_LABELS)
+        self.assertIn("github_quota_low", notify.DEFAULT_TYPES)
+
     def test_gate_priority_reaches_the_gh_fallback_transport(self):
         self.sample()
         env = {"AMEESH_GITHUB_STATE": self.state}
@@ -122,7 +155,9 @@ class BudgetTest(unittest.TestCase):
         self.assertIsNone(self.reads.blocked())
 
     def test_packet_merge_adapter_uses_reserve_without_promoting_poll_client(self):
-        self.reads.note(quota_headers(remaining="100", reset=4_000_000_000), status=200)
+        # `pr view` queries GraphQL: its own bucket holds the reserve.
+        self.reads.note(quota_headers(remaining="100", reset=4_000_000_000,
+                                      resource="graphql"), status=200)
         runner = plan_github.Gh(gh=sys.executable, env={"AMEESH_GITHUB_STATE": self.state})
         gate = packet_automerge.gh_of(runner)
         args = ["pr", "view", "2"]
@@ -133,7 +168,8 @@ class BudgetTest(unittest.TestCase):
             self.assertEqual(gate(args).returncode, 0)
             self.assertEqual(run.call_args.kwargs["env"]["AMEESH_GITHUB_PRIORITY"], "gate")
             self.assertNotIn("AMEESH_GITHUB_PRIORITY", runner.env)
-            self.reads.note(quota_headers(remaining="0", reset=4_000_000_000), status=403)
+            self.reads.note(quota_headers(remaining="0", reset=4_000_000_000,
+                                          resource="graphql"), status=403)
             run.reset_mock()
             self.assertEqual(gate(args).returncode, 75)
             run.assert_not_called()
@@ -203,3 +239,17 @@ class BudgetTest(unittest.TestCase):
                 packet_watch.tick(cfg, None, now=now, rules_of=lambda name: {})
         self.assertEqual(auto.call_count, 2)
         self.assertEqual(state["auto_merge_checked_at"]["app"], 1300)
+
+    def test_packet_timer_tolerates_an_unreadable_last_check(self):
+        watch = mock.Mock(app="app", repo="/checkout")
+        state = {"auto_merge_checked_at": {"app": "garbled"}}
+        with mock.patch.object(packet_watch, "projects", return_value={"app": watch}), \
+                mock.patch.object(packet_watch, "load_state", return_value=state), \
+                mock.patch.object(packet_watch, "save_state"), \
+                mock.patch.object(packet_watch, "check", return_value={}), \
+                mock.patch.object(packet_watch, "_auto_merge", return_value=[]) as auto:
+            packet_watch.tick(mock.Mock(), None, now=1000, rules_of=lambda name: {})
+            state["auto_merge_checked_at"] = None
+            packet_watch.tick(mock.Mock(), None, now=1010, rules_of=lambda name: {})
+        self.assertEqual(auto.call_count, 2)
+        self.assertEqual(state["auto_merge_checked_at"]["app"], 1010)
