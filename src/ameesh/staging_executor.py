@@ -60,7 +60,8 @@ SEQUENCE_REFUSAL = "sequence config: "
 DSN_SOURCES = ("AMEESH_DSN", "AGENT_MESH_DSN",
                "AMEESH_DATABASE_URL", "AGENT_MESH_DATABASE_URL")
 #: #6761: the preparation publishes its probe in the shared log, so the role's
-#: election never ranks a candidate that cannot deploy (one minute timer).
+#: ranking prefers a candidate that proved it can deploy; the take-time probe
+#: remains the guard (one minute timer).
 SEQUENCE_EVENT = "staging.executor"
 #: #6761: the probe's result is republished at most this often; a change is
 #: published at once, so the election sees a failure before the next minute.
@@ -539,13 +540,13 @@ def sequence_problem(cfg, env, options=None) -> str | None:
 
 
 def publish_sequence_readiness(db, cfg, options, problem, descriptor) -> None:
-    """#6761: publish the preparation's verdict for the role's election.
+    """#6761: publish the preparation's verdict for the staging arbitration.
 
-    Every candidate runs the timer, holder or not. A failure makes the host
-    not ready for the role (`election.local_readiness` reads the newest
-    event), so a candidate that cannot deploy is never ranked 0. The event is
-    rate-limited; a changed verdict is published at once, and a recovery
-    removes the reason on the next pass.
+    Every candidate runs the timer, holder or not. `election.candidacy` reads
+    the newest event: a proven candidate is preferred, but a missing or common
+    failure never removes the role (the live `sequence_problem` refuses an
+    unprepared host's take). The event is rate-limited; a changed verdict is
+    published at once, and a recovery removes the reason on the next pass.
     """
     object_name = "staging-executor:%s:%s" % (options.get("role") or "", cfg.host)
     ready = problem is None
@@ -943,10 +944,11 @@ def tick(db, cfg, options) -> dict:
     if host not in options["candidates"]:
         return {"state": "standby", "reason": "not a candidate"}
     # #6761: the sequence's configuration is proved on EVERY candidate, holder
-    # or not: the preparation publishes its verdict for the role's election,
-    # so a candidate that cannot deploy is never ranked 0. The probe runs the
-    # same `config.load`/`db.connect` as `staging_watch`, with the environment
-    # the sequence will receive.
+    # or not: the preparation publishes its verdict, which arbitrates the
+    # ranking between otherwise ready candidates (never the role's readiness),
+    # and the probe below refuses this take if it fails. It runs the same
+    # `config.load`/`db.connect` as `staging_watch`, with the environment the
+    # sequence will receive.
     from .platform.child_environment import execution_transport
     timeout = options.get("timeout_s", staging_watch.STAGING_FALLBACK_S)
     env = execution_transport(dict(os.environ, BASCULE_ENV=options["bascule_env"],

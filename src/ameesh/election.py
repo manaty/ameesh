@@ -72,6 +72,14 @@ delivery, else the last handover, else the holder's tenure), one per bounded
 window: the pass leaves a delegate that stopped beating, a delegate whose
 timer never starts cannot keep it for good, and a recovered host gets its
 turn back.
+
+#6761: the staging executor publishes a preparation proof (same
+`config.load`/`db.connect` as `staging_watch`, quiescence accesses). It
+arbitrates the ranking, never the role's own readiness: when at least one
+otherwise ready candidate proves a fresh positive preparation, the others are
+not ranked; when none does, nobody is excluded and the live pre-take probe
+remains the guard, so a common staging failure or the deployment order never
+removes the pilot (P1 of mty-amh-impl-18).
 """
 from __future__ import annotations
 
@@ -301,57 +309,83 @@ STAGING_PREP_DAYS = 30
 STAGING_PREP_EVENTS = 200
 
 
-def _staging_reason(cfg, db, role: Mapping, host: str) -> str:
-    """#6761: a staging candidate needs a fresh, positive preparation proof.
+def staging_proofs(db, role: Mapping, hosts: Sequence[str], *,
+                   now: float | None = None) -> dict[str, dict]:
+    """#6761: the newest staging preparation proof of each candidate host.
 
-    The elected staging executor proves, before taking any request, that a
-    sequence on this host resolves the same base (same `config.load` and
-    `db.connect` as `staging_watch`) and reaches the quiescence targets, then
-    publishes the verdict. A role is subject to that proof when the shared
-    configuration names it as the release role (`release.role`) or when it has
-    published preparation events recently; ordinary roles are untouched.
+    One journal read for the whole role. A proof is `ready` only when it is
+    fresh (0..`STAGING_PREP_S`), readable and exactly positive; the other
+    states name the doubt: `missing`, `expired`, `failed`, `incomplete`,
+    `unreadable`.
 
-    For a subject role, the proof is closed on doubt: no event, an event that
-    is not exactly `ready: true`, an unreadable one or one older than
-    `STAGING_PREP_S` all make the candidate non-eligible for the role rank. A
-    dead timer therefore never leaves a host ranked 0 on its old word (#6532,
-    auditor #209624 and the P1 verdict on e8ac15005).
+    An unreadable journal is not a failure of the candidates: the live probe
+    still refuses the take, and demoting every host would stop the role. It is
+    reported as `unreadable` and arbitrates nothing.
     """
-    name = role.get("name") or ""
-    if not name:
-        return ""
-    object_name = "staging-executor:%s:%s" % (name, host)
-    prefix = "staging-executor:%s:" % name
+    now = pg.now_ts(db) if now is None else float(now)
     try:
         rows = storage.of(db).events.latest_type(
             STAGING_PREP_EVENT, STAGING_PREP_DAYS, STAGING_PREP_EVENTS)
     except db_mod.Unavailable:
         raise
     except db_mod.DbError as exc:
-        return "staging preparation unreadable (%s)" % db_mod.explain(exc)
-    mine = [row for row in rows
-            if str(row.get("object") or "").startswith(prefix)]
-    configured = str((getattr(cfg, "release", None) or {}).get("role") or "")
-    if configured != name and not mine:
-        return ""
-    row = next((row for row in mine
-                if row.get("object") == object_name), None)
+        reason = "staging preparation unreadable (%s)" % db_mod.explain(exc)
+        return {host: {"state": "unreadable", "reason": reason}
+                for host in hosts}
+    prefix = "staging-executor:%s:" % (role.get("name") or "")
+    newest = {str(row.get("object") or ""): row for row in rows
+              if str(row.get("object") or "").startswith(prefix)}
+    return {host: _staging_proof(newest.get(prefix + host), now)
+            for host in hosts}
+
+
+def _staging_proof(row: Mapping | None, now: float) -> dict:
+    """#6761: judge one newest preparation event, closed on doubt."""
     if row is None:
-        return "staging preparation proof missing"
+        return {"state": "missing",
+                "reason": "staging preparation proof missing"}
     data = row.get("data") or {}
     try:
-        age = pg.now_ts(db) - float(row.get("ts") or 0)
+        age = float(now) - float(row.get("ts") or 0)
     except (TypeError, ValueError):
-        return "staging preparation unreadable (timestamp)"
+        return {"state": "unreadable",
+                "reason": "staging preparation unreadable (timestamp)"}
     if not 0 <= age <= STAGING_PREP_S:
-        return "staging preparation proof expired"
+        return {"state": "expired",
+                "reason": "staging preparation proof expired"}
     if data.get("ready") is True:
-        return ""
+        return {"state": "ready", "reason": ""}
     if data.get("ready") is False:
         diagnostic = " ".join(str(data.get("diagnostic") or "").split())[:300]
-        return "staging preparation failed%s" % (
-            (": " + diagnostic) if diagnostic else "")
-    return "staging preparation incomplete"
+        return {"state": "failed",
+                "reason": "staging preparation failed%s" % (
+                    (": " + diagnostic) if diagnostic else "")}
+    return {"state": "incomplete",
+            "reason": "staging preparation incomplete"}
+
+
+def _staging_arbitration(ready: Mapping[str, bool],
+                         proofs: Mapping[str, Mapping]) -> dict[str, str]:
+    """#6761: which otherwise-ready candidates the staging proof excludes.
+
+    A candidate is *proven* when it is otherwise ready and its newest proof is
+    fresh and positive. When at least one candidate is proven, the others are
+    not ranked for the role: a host that cannot deploy (or has not proved it)
+    must not take the staging pass while a proven one can. When none is proven,
+    the proof excludes nobody: the role must never be lost to a common staging
+    failure, a missing journal or the deployment order where the executor
+    still runs the previous code — the live probe
+    (`staging_executor.sequence_problem`) refuses an unprepared host's take
+    anyway (P1 of mty-amh-impl-18). Ordinary roles have no proof and are
+    untouched.
+    """
+    proven = {host for host in ready
+              if ready[host] and proofs.get(host, {}).get("state") == "ready"}
+    if not proven:
+        return {}
+    return {host: str(proofs.get(host, {}).get("reason")
+                      or "staging preparation proof missing")
+            for host in ready if ready[host] and host not in proven}
 
 
 def local_readiness(cfg, db, role: Mapping, host: str) -> tuple[bool, str]:
@@ -369,9 +403,6 @@ def local_readiness(cfg, db, role: Mapping, host: str) -> tuple[bool, str]:
     auth = _auth_reason(cfg, db, role, host)
     if auth:
         reasons.append(auth)
-    staging = _staging_reason(cfg, db, role, host)
-    if staging:
-        reasons.append(staging)
     if not reasons:
         from . import account_turn
         try:
@@ -690,8 +721,14 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
     declared = list(role.get("candidats") or [])
     latest = pg.latest(db, name)
     placed = {row["host"]: row for row in pg.candidate_rows(db, name)}
+    hosts = sorted(set(declared) | set(latest))
+    # #6761: the staging proof arbitrates between otherwise ready candidates
+    # only (see `_staging_arbitration`); one journal read covers the role.
+    proofs = (staging_proofs(db, role, hosts, now=now)
+              if len(hosts) > 1 else {})
     out = []
-    for host in sorted(set(declared) | set(latest)):
+    base_ready: dict[str, bool] = {}
+    for host in hosts:
         row = latest.get(host) or {}
         candidate = placed.get(host) or {}
         state = candidate_state(db, role, host, now=now, standing=row)
@@ -699,6 +736,7 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
         declared_here = host in declared
         stopped = role.get("status") == "stopped"
         ready = bool(state["ready"] and admitted and declared_here and not stopped)
+        base_ready[host] = ready
         diagnostic = state["diagnostic"]
         if stopped:
             diagnostic = "; ".join(part for part in (diagnostic, "role stopped")
@@ -719,6 +757,16 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
             "evaluated_ts": row.get("evaluated_ts"),
             "age_s": (now - float(row["evaluated_ts"])) if row.get("evaluated_ts") else None,
         })
+    # #6761: when a candidate proves a fresh positive staging preparation, an
+    # otherwise ready candidate that cannot show one is not ranked; when none
+    # proves it, the role is never removed (P1 of mty-amh-impl-18).
+    demoted = _staging_arbitration(base_ready, proofs)
+    for item in out:
+        if item["host"] in demoted and item["ready"]:
+            item["ready"] = False
+            item["diagnostic"] = "; ".join(
+                part for part in (item["diagnostic"], demoted[item["host"]])
+                if part)
     eligible = sorted(
         (item for item in out if item["ready"]),
         key=lambda item: (-item["score"], -item["capacity"], item["host"]))
