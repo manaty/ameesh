@@ -292,7 +292,7 @@ document :
 
 | Clé | Précédence |
 |---|---|
-| `context_max_tokens` | réglage explicite de l'agent, sinon `AMEESH_CONTEXT_MAX_TOKENS`, sinon défaut du paquet |
+| `context_max_tokens` | réglage explicite de l'agent, sinon défaut du harnais (`context_max_tokens_by_harness`, #6677 : deepseek 250 k), sinon `AMEESH_CONTEXT_MAX_TOKENS`, sinon défaut du paquet (15 M) |
 | `session.max_tokens`, `session.max_tokens_by_harness` | canon compilé au commit appliqué, sinon `AMEESH_SESSION_MAX_TOKENS` ; pas de réglage d'agent |
 | `session_policy`, `turn_max_seconds`, `turn_mail_max` | réglage explicite de l'agent, sinon défaut de l'exécuteur |
 | `resident`, `resident_sleep`, `resident_reread_max` | état local de l'hôte de l'agent, sinon défaut du paquet |
@@ -506,7 +506,7 @@ fixe la lecture exacte des noms existants.
 
 | Nom legacy | Défaut / portée | Mesure réelle (main `a02b97c9b`) | Cache | Décision | Nom cible (documentation) |
 |---|---|---|---|---|---|
-| `context_max_tokens` | 15 000 000 ; par agent ; `0` = off ; vide = défaut | `C_last` : contexte du dernier appel du fil principal ; repli sur les relectures du dernier tour inscrit au grand livre (`last_turn_reread`), **hors Codex** ; Codex sans relevé d'appel : pas de rotation sur la somme | Claude : entrée + cache lu + cache écrit ; Codex : entrée ; DeepSeek/ACP : entrée + cache lu | clôture au point sûr, puis rotation ; jamais un budget cumulé | `window.max_tokens` (plafond absolu de `C_last`) |
+| `context_max_tokens` | 15 000 000 ; défaut du harnais avant lui (`context_max_tokens_by_harness` : deepseek 250 000, #6677) ; par agent ; `0` = off ; vide = défaut du harnais puis défaut global | `C_last` : contexte du dernier appel du fil principal ; repli sur les relectures du dernier tour inscrit au grand livre (`last_turn_reread`), **hors Codex** ; Codex sans relevé d'appel : pas de rotation sur la somme | Claude : entrée + cache lu + cache écrit ; Codex : entrée ; DeepSeek/ACP : entrée + cache lu | clôture au point sûr, puis rotation ; jamais un budget cumulé | `window.max_tokens` (plafond absolu de `C_last`) |
 | `session_max_tokens` | 150 000 ; canon `session.max_tokens` / `max_tokens_by_harness` ; sinon commun ; #4448 | `S_hist` = `sum(input_tokens + output_tokens)` des tours de la session ; Codex : dernier relevé cumulé du fil côté compteur vivant, somme des deltas côté grand livre ; reprise du grand livre au redémarrage | **hétérogène** : Claude/DeepSeek entrée non cachée ; Codex entrée cache inclus ; cache écrit exclu | rotation sur la taille (L11), au minimum de tours, jamais pendant un tour | `legacy.session_size_max` (garde de taille, pas fenêtre, pas coût) |
 | `session_too_big` | même mesure et même seuil que `session_max_tokens` (#4448) ; `--session-tokens`/`AMEESH_ALERT_SESSION_TOKENS` = surcharge globale | `S_hist` de la session courante, minimum de tours, aucun tour en cours ; silencieuse après rotation | idem `S_hist` | alerte seulement ; la rotation est décidée par la même mesure dans `rotation_due` | `legacy.session_size_alert` |
 | `resident_reread_max` | 50 000 000 ; réglage local ; `0` = jamais | `R_session_L81` = somme des `turn_reread` résidents ; **inclut le cache écrit** ; distinct de `R_session` | Claude : entrée + cache lu + cache écrit ; autres : idem selon clés | alerte douce → rotation au moment calme (L81), pas une fenêtre | `reread.session_alert` |
@@ -514,7 +514,10 @@ fixe la lecture exacte des noms existants.
 
 **Sémantique de `0` et du vide** :
 
-* `context_max_tokens=0` : plafond désactivé (documenté) ; vide = défaut 15 M.
+* `context_max_tokens=0` : plafond désactivé (documenté) ; vide = défaut du
+  harnais (deepseek 250 k, #6677), sinon défaut global 15 M. Un `turn.context`
+  publié par une version N-1, sans valeur par harnais, garde le défaut global
+  qu'il a publié : le rejeu ne lui applique pas la valeur arrivée après lui.
 * `session_max_tokens` : `0` n'est **pas** une extinction documentée ; le canon
   refuse `0` ; ne pas l'utiliser comme « off ». Vide = défaut/canon.
 * `resident_reread_max=0` : jamais de rotation sur le cumul résident.

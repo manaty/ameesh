@@ -63,7 +63,10 @@ ligne au journal du lot. Un **blocage se reporte** comme un avis
 favorable : un réalignement ne lave jamais un blocage. Un relecteur qui a déjà
 un verdict sur la tête gelée n'en reçoit pas ; le dernier verdict d'un
 relecteur rendu sur une autre tête (non réalignée) n'est pas remplacé par un
-plus ancien.
+plus ancien. Un refus sur une tête que le **gel précédent** avait déjà
+remplacée (#6720 : verdict antérieur à ce gel, sur une autre tête) est
+journalisé mais ne rend pas le report partiel : la porte du gel précédent ne
+le lisait déjà plus, il ne demande aucun siège.
 
 Le report se fait au gel (`ameesh work milestone <lot> frozen`, `carry`) et à
 chaque relevé des branches de l'exécuteur (`run_pass`). Les calculs git
@@ -114,6 +117,8 @@ NOT_CARRIED = "verdict not carried:"
 CARRIED_MARK_PREFIX = "review-designation-carried:"
 #: #5042 : une adaptation peut répondre au blocage, son auteur juge la nouvelle tête
 NOT_OK_ADAPTATION = "a blocking verdict is not carried across an adaptation"
+#: #6720 : un refus sur une tête que le gel précédent avait déjà remplacée
+SUPERSEDED = "superseded by the previous freeze"
 #: résultats qu'un passage de l'exécuteur dit dans son journal
 LOUD = ("carried", "not-carried", "error", "validated")
 #: lots examinés par passage
@@ -925,7 +930,7 @@ def would_carry(cfg, db, lot: int, frozen_sha: str, *, repo: str | None = None,
     """
     lot = int(lot)
     out: dict = {"lot": lot, "result": "idle", "frozen": "", "target": "", "tip": "",
-                 "carried": [], "refused": [], "detail": ""}
+                 "carried": [], "refused": [], "superseded": [], "detail": ""}
     try:
         out, plan, refused, _where = _plan_for(
             cfg, db, lot, out, _norm(frozen_sha), repo=repo, clone=clone,
@@ -935,7 +940,8 @@ def would_carry(cfg, db, lot: int, frozen_sha: str, *, repo: str | None = None,
         return out
     if out["result"] in ("no-repository", "error"):
         return out
-    out["result"] = "would-carry" if plan else "not-carried" if refused else "idle"
+    out["result"] = ("would-carry" if plan else
+                     "not-carried" if refused or out.get("superseded") else "idle")
     return out
 
 
@@ -957,7 +963,7 @@ def carry(cfg, db, lot: int, *, repo: str | None = None, clone=None,
     Ne lève jamais."""
     lot = int(lot)
     out: dict = {"lot": lot, "result": "idle", "frozen": "", "target": "", "tip": "",
-                 "carried": [], "refused": [], "detail": ""}
+                 "carried": [], "refused": [], "superseded": [], "detail": ""}
     try:
         return _carry(cfg, db, lot, out, repo=repo, clone=clone, dry_run=dry_run, lock=lock,
                       notes=notes, fetched={} if fetched is None else fetched)
@@ -983,7 +989,7 @@ def _carry(cfg, db, lot: int, out: dict, *, repo, clone, dry_run: bool, lock: bo
         fetched=fetched)
     if out["result"] in ("no-repository", "error"):
         return out
-    if not plan and not refused:
+    if not plan and not refused and not out.get("superseded"):
         out["result"] = "idle"
         return out
     if dry_run:
@@ -1062,6 +1068,9 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
     verdicts: dict = {}          # tête relue complète -> (oui, raison)
     plan: list = []              # (relecteur, verdict reporté)
     refused: list = []           # (tête relue, raison)
+    superseded: list = []        # (tête relue, raison), hors du gel précédent
+    previous = plan_git.latest_freeze(
+        [m for m in marks if m.get("kind") == "frozen" and not _same(m.get("sha"), declared)])
     for key, mark in sorted(candidates.items()):
         if _decided(notes, mark.get("sha"), frozen):
             continue
@@ -1079,15 +1088,36 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
             plan.append((mark, reviewed))
             if adaptation:
                 out.setdefault("adaptations", {})[reviewed] = why
+        elif _stale(mark, previous):
+            if (reviewed, why) not in superseded:
+                superseded.append((reviewed, why))
         elif (reviewed, why) not in refused:
             refused.append((reviewed, why))
-    if not plan and not refused:
+    if not plan and not refused and not superseded:
         if not out["detail"]:
             out["detail"] = "nothing decidable"
         return out, [], [], where
     out["carried"] = [_entry(m, r) for m, r in plan]
     out["refused"] = [{"reviewed": r, "why": w} for r, w in refused]
+    out["superseded"] = [{"reviewed": r, "why": w} for r, w in superseded]
     return out, plan, refused, where
+
+
+def _stale(mark: Mapping, previous: Optional[Mapping]) -> bool:
+    """#6720 : le verdict précède le gel précédent et porte sur une autre tête.
+
+    Constat nexlink #6699 (10/11) : rev-02 bloque 812d130, l'auteur corrige,
+    le gel ab80b4 reçoit deux avis favorables d'autres relecteurs, puis un
+    rebasage regèle 77c74bc. Le dernier verdict de rev-02 porte encore sur
+    812d130 : son report est refusé, mais ce blocage ne comptait déjà plus à
+    la porte du gel précédent (elle ne lit que la tête gelée). Ce refus ne
+    rend donc pas le report partiel : il ne demande aucun siège et ne relance
+    aucune désignation. Les sièges du gel précédent sans verdict restent
+    désignés par la marque du report (`_previous_designees`)."""
+    if not previous:
+        return False
+    return (int(mark.get("id") or 0) < int(previous.get("id") or 0)
+            and not _same(mark.get("sha"), previous.get("sha")))
 
 
 def _entry(mark: dict, reviewed: str) -> dict:
@@ -1192,8 +1222,14 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
         st.note(lot, state, "%s %s on %s@%s: %s — verdicts are due on the frozen head (#2442)"
                 % (NOT_CARRIED, _arrow(reviewed, frozen), target, tip[:12], why),
                 work.SYSTEM_SENDER, once=True)
+    superseded = [(e["reviewed"], e["why"]) for e in out.get("superseded") or ()]
+    for reviewed, why in superseded:
+        st.note(lot, state, "%s %s on %s@%s: %s — %s: no seat is due for it (#6720)"
+                % (NOT_CARRIED, _arrow(reviewed, frozen), target, tip[:12], why,
+                   SUPERSEDED), work.SYSTEM_SENDER, once=True)
     out.update(carried=carried, refused=[{"reviewed": r, "why": w} for r, w in refused],
-               result="carried" if carried else "not-carried" if refused else "idle")
+               result="carried" if carried else
+               "not-carried" if refused or superseded else "idle")
     if carried:
         how = ("a test or mechanical adaptation of the reviewed head (canon §2)"
                if any(e["from"] in adaptations for e in carried) else
@@ -1512,7 +1548,9 @@ def describe(result: dict) -> str:
                       for e in result.get("carried") or ()))
     if kind == "not-carried":
         return "verdicts not carried: %s" % "; ".join(
-            "%s: %s" % (e["reviewed"][:12], e["why"]) for e in result.get("refused") or ())
+            ["%s: %s" % (e["reviewed"][:12], e["why"]) for e in result.get("refused") or ()]
+            + ["%s: %s (%s)" % (e["reviewed"][:12], e["why"], SUPERSEDED)
+               for e in result.get("superseded") or ()])
     if kind in ("validated", "would-validate"):
         return "carried review quorum validated on the frozen head (#4423)"
     return "verdicts not carried (%s): %s" % (kind, result.get("detail") or "")
