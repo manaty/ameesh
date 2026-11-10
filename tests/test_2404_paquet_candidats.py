@@ -81,6 +81,10 @@ class FakeWork:
         return [dict(row) for row in self.rows
                 if row["state"] not in ("delivered", "closed")][:limit]
 
+    def branch_heads(self, item_ids):
+        """#6626 : aucun historique de têtes relevées dans ce banc."""
+        return []
+
 
 class FakeProgress:
     def __init__(self, marks: dict[int, list[dict]], holds: dict[int, list[dict]] | None = None):

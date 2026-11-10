@@ -24,6 +24,10 @@
         RP ID/origin agreement between ameesh-approve and this verifier;
   ameesh attach <agent> [--wait] [--ttl S] [--max 2h]
         bounded native access: sleep the resident, then return its lease (L82);
+  ameesh auditor tick [--dry-run] [--json]
+        the hourly short-pass gate: mails the auditor only when something moved
+        (mail, debit --check 2, deadline in the hour, head/gate change), journals
+        the skip without a mail (#6643);
   ameesh authenticator list   registered authenticators (spec §8);
   ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]
         | unset [--per-hour] [--per-day] [--agent A]
@@ -117,6 +121,11 @@
         re-delivers the pending mail of a stopped agent to a live agent;
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh migrate              apply schema migrations;
+  ameesh model-report [--json] [--project P] [--days N] [--at T] [--start T] [--end T]
+        rapport d'évaluation des modèles en lecture seule (étude #6650, unité
+        M1) : fenêtre UTC, cohortes d'intégration et de staging séparées,
+        familles historiques, coût du livre (estimation, pas facture),
+        verdicts B, inconnues déclarées ; n'ouvre aucun {work} ;
   ameesh models list|show|discover      model catalog and discovery;
   ameesh module <name> …              project module commands (Pipeline: adopt/advance/hold/release), --list
                                       for installation evidence;
@@ -413,6 +422,11 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "progress":
         from . import progress
         return progress.main(rest)
+    if command == "auditor" and rest[:1] == ["tick"]:
+        # #6643 : la minuterie horaire de l'auditeur décide s'il y a une passe
+        # à jouer ; le saut est journalisé, sans courrier.
+        from . import auditor_pass
+        return auditor_pass.main(rest[1:])
     if command == "debit":
         # canon 24/10/2026 : l'auditeur commence chaque passage par le débit,
         # mesuré sur les jalons (jamais sur les colonnes d'un lot).
@@ -423,6 +437,12 @@ def _dispatch(argv: list[str] | None) -> int:
         # UTC fixe, inconnues déclarées ; n'ouvre aucun lot, n'active rien.
         from . import repair_report
         return repair_report.main(rest)
+    if command in ("model-report", "model_report"):
+        # #6660 (étude #6650, M1) : rapport d'évaluation des modèles en lecture
+        # seule ; fenêtre UTC fixe, cohortes séparées, inconnues déclarées ;
+        # n'ouvre aucun lot, n'active aucun routage.
+        from . import model_evaluation_report
+        return model_evaluation_report.main(rest)
     if command == "process":
         # #2225 : vérifier le bloc `workflow:` d'une carte Process du canon
         from . import process_card

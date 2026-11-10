@@ -1021,7 +1021,8 @@
               "staging.request",
               "git.lock_removed",
               "mail.export",
-              "packet.pause"
+              "packet.pause",
+              "auditor.pass"
             ]
           }
         },

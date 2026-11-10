@@ -1178,6 +1178,21 @@ def build(*, items: Iterable[Mapping[str, Any]],
             if blocker != lot:
                 blocked_by.setdefault(lot, set()).add(blocker)
     agents = [dict(row) for row in agents or ()]
+    #: #6664 : un relecteur que le registre dit en pause (budget de jauge ou
+    #: pause opérateur) ne lira pas la relance : le geste va au pilote, comme
+    #: pour un auteur endormi (#6396/#6423). La fenêtre courte du compte
+    #: (#3876) reste actionnable dans la minute et n'est pas une pause ici.
+    from . import review_designation as review_designation_mod
+
+    paused_reviewers: dict[str, str] = {}
+    for agent in agents:
+        name = str(agent.get("name") or "").strip()
+        if not name:
+            continue
+        if agent.get("operator_paused"):
+            paused_reviewers[_norm(name)] = "operator paused"
+        elif review_designation_mod.is_budget_pause(agent):
+            paused_reviewers[_norm(name)] = "budget paused"
     # #5430 : la famille d'un verdict est prouvée par le registre (harness)
     # et les familles du canon, jamais supposée du nom. Un harnais inconnu ne
     # donne pas de famille (`review_lot.family_of`), et le verdict compte
@@ -1346,6 +1361,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
                               for text in designation["unreadable"])
             pending = [p for p in designation["pending"]
                        if _norm(p["name"]) != _norm(item.get("assignee"))]
+            #: #6664 : les avis dus dont le relecteur est en pause. Le geste
+            #: de relance ne part pas chez lui ; l'attente reste due et le
+            #: pilote la porte (désigner un autre relecteur ou attendre).
+            pending_paused = {
+                _norm(review["name"]): paused_reviewers[_norm(review["name"])]
+                for review in pending
+                if _norm(review["name"]) in paused_reviewers}
             if fixes_authoritative:
                 fix = fixes_by_lot.get(ident)
                 blocked = None if fix is None else {
@@ -1371,6 +1393,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 "frozen": _iso(freeze.get("at_ts")),
                 "sha": str(freeze.get("sha") or "")[:12] or None,
                 "age_s": age, "pending_reviewers": [p["name"] for p in pending],
+                "pending_paused": pending_paused,
                 "blocked_verdict": bool(blocked),
                 "missing_reviewer": bool(designation["missing"]),
                 # #5430 : le manque et sa cause sont dits, pas seulement le
@@ -1403,15 +1426,21 @@ def build(*, items: Iterable[Mapping[str, Any]],
             for review in designation["pending"]:
                 if _norm(review["name"]) == _norm(item.get("assignee")):
                     continue
+                paused = pending_paused.get(_norm(review["name"]), "")
+                gesture = (("relecteur %s en pause (%s) : pilote, désigner un "
+                            "autre relecteur ou attendre la levée"
+                            % (review["name"], paused))
+                           if paused else
+                           GESTURES["review"].format(who=review["name"], lot=ident))
                 reviews_due.append({
                     "lot": ident, "reviewer": review["name"],
                     "sha": str(freeze.get("sha") or "")[:12] or None,
                     "designated_ts": review["designated_ts"],
                     "age_s": _age(now, review["designated_ts"]),
                     "title": item.get("title") or "",
+                    "paused": paused or None,
                     "task": "review",
-                    "gesture": GESTURES["review"].format(
-                        who=review["name"], lot=ident)})
+                    "gesture": gesture})
         # holds (les lots mergés peuvent encore attendre un déploiement)
         lot_holds: list[dict] = []
         rejected_window: list[str] = []
@@ -1565,10 +1594,27 @@ def build(*, items: Iterable[Mapping[str, Any]],
                      "vérifier le compte de repli ou demander une décision de plafond",
                      pauses=pauses)
         elif reviewers:
-            add_wait("qa", row, row["frozen_ts"], ", ".join(reviewers),
-                     ", ".join(GESTURES["review"].format(who=name, lot=row["lot"])
-                               for name in reviewers),
-                     human=_human_wait(state))
+            paused = row.get("pending_paused") or {}
+            if paused and len(paused) == len(reviewers):
+                # #6664 : tous les avis dus sont chez un relecteur en pause.
+                # Le débit ne prescrit pas de le relancer : le pilote porte le
+                # geste (autre relecteur, ou attendre la levée).
+                add_wait("qa", row, row["frozen_ts"], "pilote",
+                         "relecteur(s) en pause : %s — pilote, désigner un autre "
+                         "relecteur ou attendre la levée"
+                         % ", ".join("%s (%s)" % (name, paused[_norm(name)])
+                                     for name in reviewers),
+                         human=_human_wait(state), paused=True)
+            else:
+                gesture = ", ".join(
+                    GESTURES["review"].format(who=name, lot=row["lot"])
+                    for name in reviewers)
+                if paused:
+                    gesture += " ; en pause : %s" % ", ".join(
+                        "%s (%s)" % (name, paused[_norm(name)])
+                        for name in reviewers if _norm(name) in paused)
+                add_wait("qa", row, row["frozen_ts"], ", ".join(reviewers),
+                         gesture, human=_human_wait(state))
         elif row.get("blocked_verdict"):
             continue                    # l'avis bloquant a son attente dédiée
         elif row.get("missing_reviewer"):
@@ -1749,11 +1795,14 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if not name:
             continue
         entry = per_reviewer.setdefault(name, {"reviewer": name, "count": 0,
-                                               "oldest_age_s": 0.0, "lots": []})
+                                               "oldest_age_s": 0.0, "lots": [],
+                                               "paused": None})
         entry["count"] += 1
         entry["oldest_age_s"] = max(float(entry["oldest_age_s"]),
                                     float(review.get("age_s") or 0.0))
         entry["lots"].append(review["lot"])
+        if review.get("paused") and not entry.get("paused"):
+            entry["paused"] = review["paused"]
     reviews_by_reviewer = sorted(per_reviewer.values(),
                                  key=lambda r: (-float(r["oldest_age_s"]), r["reviewer"]))
 
@@ -3197,8 +3246,10 @@ def format_text(report: Mapping[str, Any]) -> str:
     reviews = report.get("reviews_by_reviewer") or []
     lines.append("")
     lines.append("Avis dus par relecteur : %s" % (
-        " · ".join("%s %d (max %s)" % (row["reviewer"], row["count"],
-                                       _duration(row.get("oldest_age_s")))
+        " · ".join("%s %d (max %s%s)" % (row["reviewer"], row["count"],
+                                       _duration(row.get("oldest_age_s")),
+                                       ", en pause : %s" % row["paused"]
+                                       if row.get("paused") else "")
                    for row in reviews[:12]) or "aucun"))
     lines.append("Holds : %d · réveils : %d · fenêtres : %d · sur appareil "
                  "indisponible : %d · sur correctif non déployé : %d · relances "

@@ -287,6 +287,10 @@ class PreflightCliPrecedentTest(VmAgentsHarness):
         self.assert_mesh_design_controle(pose)
         self.installer_cli(self.n1 / 'src')
         self.assert_vert(self.run_vm('controler'))
+        # #6643 : le retour a bien reposé la minuterie avec le CLI N-1 avant
+        # de la contrôler (l'unité de N lance `ameesh auditor tick`).
+        self.assertIn('role timers --role auditeur --install',
+                      (self.state / 'cli-n1.log').read_text())
 
 
 # #5946 : l'incident lui-même. Le dernier tag connaît déjà la passe courte de
@@ -369,6 +373,10 @@ CONTROLES_CLI = {
     'python_agents -c': dict(etapes=TOUTES),
     'ameesh_agents role timers --role auditeur --check': dict(
         etapes=('controler',), garde='elif [ "$passe_auditeur" = - ]; then'),
+    # #6643 : repose l'unité avec le CLI installé quand celui-ci précède la
+    # passe déterministe (retour arrière) ; inoffensif sous N (garde fausse)
+    # et sous N-1 (écrit l'unité que ce CLI attend).
+    'ameesh_agents role timers --role auditeur --install': dict(etapes=TOUTES),
 }
 
 

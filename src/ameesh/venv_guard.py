@@ -30,14 +30,26 @@ par le venv partagé.
 `installation_problems` sert à `ameesh doctor` : une installation éditable
 (`__editable__*.pth`, `direct_url.json` éditable) ou un paquet `ameesh`
 chargé hors du `site-packages` du venv sont signalés.
+
+#6684 : le dossier de shims est propre au **magasin** d'ameesh, pas seulement
+à l'état de l'hôte. Deux magasins sur le même `state_dir` (le magasin par
+défaut et un magasin séparé, sur le poste) écrivaient les mêmes `ameesh` et
+`agent-mail` : le dernier runner qui démarrait un tour gagnait, et un tour
+pouvait appeler l'ameesh de l'autre magasin. Le magasin par défaut garde son
+chemin historique ; chaque autre magasin reçoit un dossier dérivé de sa
+racine d'installation, stable d'une version à l'autre (`#3311`).
+`shim_problems` sert à `ameesh doctor` : un shim dont la cible n'est pas le
+venv du magasin courant est signalé.
 """
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
 import os
 import re
+import shlex
 import sys
 import tempfile
 
@@ -53,6 +65,14 @@ SHIM = """#!/bin/sh
 # production (ni pip, ni python3) dans le PATH du tour.
 exec %s "$@"
 """
+
+#: #6684 : racines d'installation du magasin par défaut de l'hôte, celles de
+#: `deploy/mise-a-jour/{poste,staging,vm}.sh` (poste `~/.local/share/ameesh`,
+#: VM `/opt/ameesh`). Leur dossier de shims reste le chemin historique
+#: `<state_dir>/.menage/bin-ameesh`, sans migration des hôtes du mesh ; tout
+#: autre magasin reçoit le sien. `~` est résolu à chaque lecture : un profil
+#: ou un banc peut changer `HOME` sans recharger ce module.
+DEFAULT_STORE_ROOTS = ("~/.local/share/ameesh", "/opt/ameesh")
 
 _VENV_NAME = re.compile(r"venv(?:-[0-9a-z.]+)?")
 #: instantané de déploiement écrit par `poste.sh`/`vm.sh` (git archive)
@@ -111,22 +131,134 @@ def hidden_venvs(env) -> set:
     return out
 
 
+def store_root(prefix: str | None = None) -> str:
+    """Racine d'installation du magasin d'où tourne ameesh (#6684).
+
+    Le venv versionné d'un magasin déployé (`<racine>/venv-<sha7>`) change à
+    chaque déploiement ; sa racine, elle, ne change pas, et un shim qui la
+    vise garde le PATH d'un tour stable d'une version à l'autre (#3311).
+    Hors disposition déployée (venv d'outils `uv`, pipx, worktree), le venv
+    lui-même est sa propre racine : il ne change pas d'une version à l'autre.
+    """
+    venv = _real(prefix if prefix is not None else running_venv())
+    if not venv:
+        return ""
+    if _VENV_NAME.fullmatch(os.path.basename(venv)):
+        return os.path.dirname(venv)
+    return venv
+
+
+def _default_store_roots() -> set:
+    return {_real(os.path.expanduser(racine)) for racine in DEFAULT_STORE_ROOTS}
+
+
+def is_default_store(prefix: str | None = None) -> bool:
+    """Le magasin courant est-il le magasin par défaut de l'hôte ?"""
+    racine = store_root(prefix)
+    return not racine or racine in _default_store_roots()
+
+
+def _store_slug(root: str) -> str:
+    """Identifiant de dossier stable et lisible d'un magasin secondaire.
+
+    Le nom lisible aide à reconnaître le magasin ; le court condensé de sa
+    racine réelle distingue deux magasins de même nom (le magasin par défaut
+    `.../ameesh` et un magasin placé ailleurs sous le même nom)."""
+    nom = re.sub(r"[^a-z0-9]+", "-", os.path.basename(root).lower()).strip("-")
+    nom = nom[:24] or "store"
+    digest = hashlib.sha256(root.encode("utf-8")).hexdigest()[:8]
+    return "%s-%s" % (nom, digest)
+
+
+def shim_target(nom: str, prefix: str | None = None) -> str:
+    """Le binaire du magasin courant que le shim `nom` exécute, ou vide.
+
+    #3311 : le lanceur stable voisin, qui résout `venv-courant` à chaque
+    appel ; à défaut (venv d'outils, lanceur absent de la version), le venv
+    vivant. Même choix que `install_shims`, pour que `doctor` juge la cible
+    réellement attendue.
+    """
+    courant = _real(prefix if prefix is not None else running_venv())
+    if not courant:
+        return ""
+    stable = stable_launcher(courant)
+    reel = os.path.join(stable or courant, "bin", nom)
+    if stable and not os.access(reel, os.X_OK):
+        reel = os.path.join(courant, "bin", nom)
+    if not os.access(reel, os.X_OK):
+        return ""
+    return reel
+
+
+def _shim_target(text: str) -> str:
+    """La cible d'un shim (`exec <chemin> "$@"`), ou vide si illisible."""
+    for ligne in text.splitlines():
+        if not ligne.startswith("exec "):
+            continue
+        try:
+            mots = shlex.split(ligne)
+        except ValueError:
+            return ""
+        if len(mots) >= 2 and mots[0] == "exec":
+            return mots[1]
+    return ""
+
+
+def _in_store_venv(path: str, root: str) -> bool:
+    """`path` est-il le binaire d'un venv du magasin de racine `root` ?
+
+    Disposition déployée : `<racine>/venv[-<sha7>]/bin/<nom>`. Venv d'outils
+    (`uv`, `pipx`, worktree) : le venv est la racine, `<racine>/bin/<nom>`.
+    """
+    rel = os.path.relpath(_real(path), root)
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return False
+    parts = rel.split(os.sep)
+    if len(parts) == 2 and parts[0] == "bin":
+        return True
+    return (len(parts) == 3 and parts[1] == "bin"
+            and _VENV_NAME.fullmatch(parts[0]) is not None)
+
+
+def shim_problems(cfg) -> list:
+    """Écarts du dossier de shims du magasin (#6684), pour `ameesh doctor`.
+
+    Un shim dont la cible n'est pas un venv de CE magasin est signalé : c'est
+    le symptôme d'un dossier partagé par deux magasins, où le dernier runner
+    qui écrit décide de l'ameesh de tous les tours. Un shim absent n'est pas
+    un écart (un tour le réécrit) ; l'échec d'écriture reste celui de #2772.
+    """
+    root = store_root()
+    if not root:
+        return []
+    directory = shim_dir(cfg)
+    problemes = []
+    for nom in SHIMMED:
+        chemin = os.path.join(directory, nom)
+        try:
+            with open(chemin, encoding="utf-8") as fh:
+                texte = fh.read()
+        except OSError:
+            continue
+        cible = _shim_target(texte)
+        if not cible:
+            problemes.append("%s: no target" % chemin)
+        elif not _in_store_venv(cible, root):
+            problemes.append("%s: target %s is not this store's venv (%s)"
+                             % (chemin, cible, root))
+    return problemes
+
+
 def install_shims(directory: str) -> str:
     """Écrit les shims `ameesh` et `agent-mail` dans `directory` ; rend le
     dossier, ou vide si ameesh ne tourne pas depuis un venv."""
     courant = running_venv()
     if not courant:
         return ""
-    stable = stable_launcher(courant)
-    import shlex
     os.makedirs(directory, mode=0o700, exist_ok=True)
     for nom in SHIMMED:
-        # #3311 : le lanceur stable ne dépend pas du runner qui écrit le shim ;
-        # à défaut (venv d'outils, lanceur absent de la version), le venv vivant.
-        reel = os.path.join(stable or courant, "bin", nom)
-        if stable and not os.access(reel, os.X_OK):
-            reel = os.path.join(courant, "bin", nom)
-        if not os.access(reel, os.X_OK):
+        reel = shim_target(nom, courant)
+        if not reel:
             continue
         texte = SHIM % shlex.quote(reel)
         cible = os.path.join(directory, nom)
@@ -184,8 +316,22 @@ def scrub(env: dict, shim_dir: str | None = None) -> dict:
 
 
 def shim_dir(cfg) -> str:
-    """Dossier des shims d'un tour, sous l'état géré de l'hôte."""
-    return os.path.join(cfg.state_dir, ".menage", SHIM_DIR)
+    """Dossier des shims d'un tour, sous l'état géré de l'hôte.
+
+    #6684 : le dossier dépend du **magasin**, pas seulement du `state_dir`
+    partagé. Deux magasins sur le même `state_dir` (le magasin par défaut et
+    un magasin séparé) écrivaient les mêmes `ameesh`/`agent-mail`, et le
+    dernier runner qui démarrait un tour décidait de l'ameesh de tous les
+    tours. Le magasin par défaut garde le chemin historique (aucune migration
+    des hôtes du mesh) ; chaque autre magasin reçoit un dossier dérivé de sa
+    racine d'installation, stable d'une version à l'autre.
+    """
+    historique = os.path.join(cfg.state_dir, ".menage", SHIM_DIR)
+    root = store_root()
+    if not root or root in _default_store_roots():
+        return historique
+    return os.path.join(cfg.state_dir, ".menage",
+                        SHIM_DIR + "-" + _store_slug(root))
 
 
 def _from_deployed_snapshot(charge: str, prefix: str) -> bool:

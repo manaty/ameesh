@@ -41,6 +41,13 @@ earlier automatic request only while unread and never reserved for display.
 The message keeps its queue age; a lot event records both heads. Read requests
 remain untouched. Manual requests share this lock and refuse pending requests
 or a verdict already recorded by that reviewer on the requested head.
+
+#6661 (M2 of study #6650): the mark may carry a `risk_trace`, the class the
+policy reader computed at this freeze, where the required count came from
+(policy, canon lowering, pilot floor), the exact policy commit and source, and
+the exact freeze and base. It is an observation for the model evaluation: no
+gate reads it, it changes neither the count nor the families. A mark without
+it (N-1 writer) or a carried mark reads as an unknown class, never a guess.
 """
 from __future__ import annotations
 
@@ -79,6 +86,75 @@ def base_evidence(lot: int, freeze_id: int, sha: str, base: str) -> dict:
     return {"schema": BASE_EVIDENCE_SCHEMA, "lot": int(lot),
             "freeze": int(freeze_id), "sha": str(sha or "").strip().lower(),
             "base": str(base or "").strip().lower(), "actor": SENDER}
+
+
+#: #6661 : le schéma de la trace du risque au gel (`risk_trace` de la marque)
+RISK_TRACE_SCHEMA = "ameesh-review-designation-risk/1"
+#: la valeur d'une classe, d'un compte ou d'une source qu'aucune trace ne prouve
+UNKNOWN = "unknown"
+
+
+def _count(value) -> Optional[int]:
+    """Un compte d'avis lu tel quel (0, 1, 2…), ou None s'il n'est pas prouvé."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _risk_trace(trace: Optional[Mapping], *, freeze_id: int, sha: str,
+                base: str) -> Optional[dict]:
+    """La trace normalisée écrite dans la marque (#6661), ou None sans trace.
+
+    Le gel et la base viennent du port, pas de l'appelant : la trace nomme la
+    tête et la base que la marque désigne réellement, complètes ou vides. Un
+    compte absent reste absent (`None`), jamais 0."""
+    if not isinstance(trace, Mapping):
+        return None
+    policy = trace.get("policy") if isinstance(trace.get("policy"), Mapping) else {}
+    sources = (trace.get("required_from")
+               if isinstance(trace.get("required_from"), Mapping) else {})
+    return {
+        "schema": RISK_TRACE_SCHEMA,
+        "risk": str(trace.get("risk") or "").strip().lower(),
+        "required_from": {key: _count(sources.get(key))
+                          for key in ("policy", "canon_lowering", "floor")},
+        "policy": {key: str(policy.get(key) or "").strip()
+                   for key in ("ref", "commit", "source")},
+        "freeze": {"id": int(freeze_id), "sha": plan_git.full_commit_id(sha)},
+        "base": plan_git.full_commit_id(base),
+    }
+
+
+def risk_trace_of(mark: Optional[Mapping]) -> Optional[dict]:
+    """La trace du risque d'une marque de gel lue, pour le rapport (#6661).
+
+    Rend None sans marque. Sinon `quality` dit d'où vient la classe :
+    `recorded` (trace écrite au gel), `absent` (marque d'un écrivain N-1) ou
+    `carried` (verdicts reportés : aucune politique relue à ce gel). Les deux
+    derniers donnent `risk: unknown` ; un quorum n'est jamais retraduit en
+    classe (un plancher explicite donne 2 avis à un lot léger)."""
+    if not isinstance(mark, Mapping):
+        return None
+    freeze = mark.get("freeze") if isinstance(mark.get("freeze"), Mapping) else {}
+    try:
+        freeze_id = int(freeze.get("id") or 0)
+    except (TypeError, ValueError):
+        freeze_id = 0
+    trace = mark.get("risk_trace")
+    if mark.get("state") == "carried" or not isinstance(trace, Mapping) \
+            or trace.get("schema") != RISK_TRACE_SCHEMA:
+        return {"quality": "carried" if mark.get("state") == "carried" else "absent",
+                "risk": UNKNOWN, "required": _count(mark.get("required")),
+                "required_from": {}, "policy": {"ref": str(mark.get("policy_ref") or "")},
+                "freeze": {"id": freeze_id,
+                           "sha": plan_git.full_commit_id(freeze.get("sha"))},
+                "base": plan_git.full_commit_id(mark.get("base"))}
+    found = trace.get("freeze") if isinstance(trace.get("freeze"), Mapping) else {}
+    out = _risk_trace(trace, freeze_id=freeze_id, sha=found.get("sha"),
+                      base=trace.get("base"))
+    out.pop("schema")
+    out["risk"] = out["risk"] or UNKNOWN
+    return dict(out, quality="recorded", required=_count(mark.get("required")))
 
 
 def designation_of(note: str) -> Optional[dict]:
@@ -129,7 +205,8 @@ def _mark_author(author) -> dict:
 
 def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers,
                missing: int, why: str, authors, policy_ref: str, sha: str,
-               sent=(), unknown=(), base: str = "") -> str:
+               sent=(), unknown=(), base: str = "",
+               risk_trace: Optional[Mapping] = None) -> str:
     payload = {
         "state": state,
         "required": int(required),
@@ -156,6 +233,10 @@ def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers
     if base:
         # #6365 : le début du delta désigné ; la porte relit la même plage.
         payload["base"] = base
+    trace = _risk_trace(risk_trace, freeze_id=freeze_id, sha=sha, base=base)
+    if trace is not None:
+        # #6661 : observation seule ; aucune porte ne la lit.
+        payload["risk_trace"] = trace
     return "%s %s" % (mark_prefix(lot, freeze_id),
                       json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
@@ -426,7 +507,8 @@ class PgPort:
                reviewers: Sequence[Mapping], missing: int, why: str,
                authors: Sequence[Mapping] = (), policy_ref: str = "",
                notify: str = "", messages: Sequence[Mapping] = (),
-               unknown_authors: Sequence[str] = (), force: bool = False) -> dict:
+               unknown_authors: Sequence[str] = (), force: bool = False,
+               risk_trace: Optional[Mapping] = None) -> dict:
         """Writes the freeze's designation in one transaction and returns its shape.
 
         Under the lock of the lot row: rechecks that `freeze` is still the
@@ -441,7 +523,11 @@ class PgPort:
         replay does not send a request or a waiting notice already deposited
         for the same freeze (#2541): the port filters them on the freeze's
         marks and the mailbox, with primary names, so a purge or an alias does
-        not make a mail leave twice (#2557)."""
+        not make a mail leave twice (#2557).
+
+        `risk_trace` (#6661) is written into the mark as is (normalized, with
+        the port's own freeze and base); it never changes what is written
+        otherwise nor the returned shape."""
         lot = int(lot)
         if self.after_commit is not None:
             return self._write(self.db, lot, freeze=freeze, required=required,
@@ -449,7 +535,8 @@ class PgPort:
                                why=why, authors=authors, policy_ref=policy_ref,
                                notify=notify, messages=messages,
                                unknown_authors=unknown_authors,
-                               hook=self.at_freeze, force=force)
+                               hook=self.at_freeze, force=force,
+                               risk_trace=risk_trace)
         threads: list = []
         inner = PgPort(self.db, sender=self.sender, after_commit=threads,
                        retired=self.retired)
@@ -468,7 +555,7 @@ class PgPort:
                                reviewers=reviewers, missing=missing, why=why,
                                authors=authors, policy_ref=policy_ref, notify=notify,
                                messages=messages, unknown_authors=unknown_authors,
-                               hook=False, force=force)
+                               hook=False, force=force, risk_trace=risk_trace)
         # the external thread only after the commit: a cancelled send leaves nothing
         for record in threads:
             record(self.db.cfg, self.db)
@@ -477,7 +564,8 @@ class PgPort:
     def _write(self, db, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str, authors,
                policy_ref: str, notify: str, messages, hook: bool,
-               unknown_authors: Sequence[str] = (), force: bool = False) -> dict:
+               unknown_authors: Sequence[str] = (), force: bool = False,
+               risk_trace: Optional[Mapping] = None) -> dict:
         freeze = dict(freeze or {})
         sha = str(freeze.get("sha") or "").strip().lower()
         try:
@@ -640,7 +728,8 @@ class PgPort:
         text = _mark_note(lot, freeze_id, state=state, required=required,
                           reviewers=reviewers, missing=missing, why=why,
                           authors=authors, policy_ref=policy_ref, sha=sha,
-                          sent=deposited, unknown=unknown_authors, base=base)
+                          sent=deposited, unknown=unknown_authors, base=base,
+                          risk_trace=risk_trace)
         if base:
             # #6365 : la preuve passe par l'écrivain système, hors contrat L107.
             ops.record_designation_mark(lot, str(rows[0].get("state") or ""), text,
