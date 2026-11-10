@@ -49,14 +49,15 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("00/3", timer)
         self.assertIn("Persistent=true", timer)
 
-    def test_the_service_mails_the_auditor_under_its_lease(self):
+    def test_the_service_runs_the_tick_under_its_lease(self):
         spec = role_timers.TimerSpec("auditeur-court", "auditeur-court", 3600, "d")
         service = role_timers.render_service(spec, role="auditeur")
         self.assertIn(
             "ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run auditeur -- "
-            "%h/.local/share/ameesh/venv/bin/agent-mail send auditeur "
-            "\"Passage court (chaque heure). Consigne : ameesh/docs/AUDITEUR.md, "
-            "à jour.\" --from ameesh\n", service)
+            "%h/.local/share/ameesh/venv/bin/ameesh auditor tick\n", service)
+        # #6643: the body now lives in the tick, not in the unit
+        self.assertNotIn("agent-mail send", service)
+        self.assertNotIn(role_timers.AUDITOR_MAIL, service)
 
 
 class InstallTest(unittest.TestCase):

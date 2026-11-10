@@ -57,6 +57,10 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   packet.pause         a pause with a deadline (alert or automatic end) of the hourly packet tick, or its end
                        (no table: written by `paquet-horaire.py pause|resume`,
                        read by its tick and `role timers --check`, #4361)
+  auditor.pass         one tick of the auditor's short pass: played (with its
+                       reason) or skipped (no mail, debit --check 0, no gate
+                       change, no deadline), with the gate state it compared
+                       (no table: written by `auditor_pass`, #6643)
 
 `data` holds identifiers and states, never free text: the client rereads the
 object through the API. One bounded exception: `packet.pause` carries the
@@ -111,7 +115,7 @@ TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
          "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request", "git.lock_removed",
-         "mail.export", "packet.pause")
+         "mail.export", "packet.pause", "auditor.pass")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365
 #: the table refuses to delete an event younger than this (migration 0396)

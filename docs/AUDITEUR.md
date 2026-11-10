@@ -17,8 +17,12 @@ qu'il ne fait jamais, et comment il en rend compte.
 
 ## Ce qui le réveille
 
-* le courrier « Passage court (chaque heure) » d'`ameesh`, chaque heure à :15 :
-  passage court ;
+* le courrier « Passage court (chaque heure) » d'`ameesh`, à :15 : passage
+  court. Depuis #6643, la minuterie ne l'envoie que si quelque chose a bougé
+  depuis la passe précédente — un courrier, un `ameesh debit --check` qui sort
+  2, une échéance dans l'heure, ou une tête/porte changée (gel, fusion, CI,
+  staging) ; sinon la passe est sautée et le saut est journalisé
+  (`auditor.pass`), sans courrier et sans tour ;
 * le courrier « Alerte urgente : … » d'`ameesh` : passage court, centré sur
   l'alerte ;
 * le courrier « Analyse profonde » d'`ameesh`, chaque nuit, ou une demande du
@@ -1173,11 +1177,23 @@ le staging (`vm.sh`, `poste.sh`), l'écrit sur chaque hôte candidat du rôle
 `auditeur`, chaque heure à :15, sous `role run auditeur` : seul le détenteur
 du bail envoie le courrier, et la relève emporte la minuterie avec le bail.
 `--check` signale une copie qui diverge (par exemple l'ancienne cadence de
-3 h, `00/3:15`, posée à la main le 24/10). Le service envoie :
+3 h, `00/3:15`, posée à la main le 24/10). Le service lance le tick qui décide
+de la passe (#6643) :
 
 ```ini
-ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run auditeur -- %h/.local/share/ameesh/venv/bin/agent-mail send auditeur "Passage court (chaque heure). Consigne : ameesh/docs/AUDITEUR.md, à jour." --from ameesh
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run auditeur -- %h/.local/share/ameesh/venv/bin/ameesh auditor tick
 ```
+
+Le tick ne prend aucune décision d'auditeur : il compare seulement l'état du
+mesh à la passe précédente. Il joue la passe (un courrier « Passage court »,
+comme avant) si un courrier est arrivé depuis, si `ameesh debit --check` sort
+2, si une échéance tombe entre la passe précédente et l'heure suivante, ou si
+une tête ou une porte a changé (gel, fusion, conclusion de CI, événement de
+staging). Sinon il saute la passe et écrit l'événement `auditor.pass`
+(`decision: skipped`, avec l'état comparé) sans courrier : aucun tour n'est
+ouvert. Toute lecture en erreur fait jouer la passe — un débit illisible n'est
+jamais un débit vide. Les événements `auditor.pass` des deux issues portent le
+motif, pour la mesure avant/après (#207135 a).
 
 L'analyse de la nuit (`ameesh-auditeur-nuit.service` et `.timer`), sur le même
 modèle :
