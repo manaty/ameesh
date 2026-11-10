@@ -121,6 +121,11 @@
         re-delivers the pending mail of a stopped agent to a live agent;
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh migrate              apply schema migrations;
+  ameesh model-report [--json] [--project P] [--days N] [--at T] [--start T] [--end T]
+        rapport d'évaluation des modèles en lecture seule (étude #6650, unité
+        M1) : fenêtre UTC, cohortes d'intégration et de staging séparées,
+        familles historiques, coût du livre (estimation, pas facture),
+        verdicts B, inconnues déclarées ; n'ouvre aucun {work} ;
   ameesh models list|show|discover      model catalog and discovery;
   ameesh module <name> …              project module commands (Pipeline: adopt/advance/hold/release), --list
                                       for installation evidence;
@@ -432,6 +437,12 @@ def _dispatch(argv: list[str] | None) -> int:
         # UTC fixe, inconnues déclarées ; n'ouvre aucun lot, n'active rien.
         from . import repair_report
         return repair_report.main(rest)
+    if command in ("model-report", "model_report"):
+        # #6660 (étude #6650, M1) : rapport d'évaluation des modèles en lecture
+        # seule ; fenêtre UTC fixe, cohortes séparées, inconnues déclarées ;
+        # n'ouvre aucun lot, n'active aucun routage.
+        from . import model_evaluation_report
+        return model_evaluation_report.main(rest)
     if command == "process":
         # #2225 : vérifier le bloc `workflow:` d'une carte Process du canon
         from . import process_card
