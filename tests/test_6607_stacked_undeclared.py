@@ -67,7 +67,43 @@ class StackedOnTest(unittest.TestCase):
 
     def test_le_parent_ouvert_est_nomme(self):
         self.assertEqual(self.stacked(),
-                         [{"lot": 1, "branch": "review/a", "sha": self.a_tip}])
+                         [{"lot": 1, "branch": "review/a", "sha": self.a_tip,
+                           "shared": 1, "contained": True}])
+
+    def test_le_parent_avance_et_regele_reste_un_parent(self):
+        # B1 cx1 : A1 est dans B ; A avance à A2 et ses têtes (observée,
+        # gelée, publiée) sont toutes A2, hors de base..B. A1 reste partagé.
+        git(self.repo, "checkout", "-q", "review/a")
+        a2 = write_commit(self.repo, "a", "a2\n", "lot A, suite")
+        git(self.repo, "checkout", "-q", "main")
+        self.others[0]["shas"] = [a2]
+        found = self.stacked()
+        self.assertEqual([(s["lot"], s["sha"]) for s in found], [(1, self.a_tip)])
+
+    def test_un_partage_limite_a_la_cible_n_empile_pas(self):
+        # A et B partent tous deux de `main` : seul l'historique de la cible
+        # est commun, aucun commit hors cible.
+        git(self.repo, "checkout", "-q", "-b", "lot/c", "main")
+        c_tip = write_commit(self.repo, "c", "c\n", "lot C")
+        git(self.repo, "checkout", "-q", "main")
+        self.assertEqual(packet_candidates.stacked_on(
+            self.repo, c_tip, self.base, self.others, lot=3, branch="lot/c"), [])
+
+    def test_le_lot_empile_sur_moi_n_est_pas_mon_parent(self):
+        # du point de vue de A : B contient A, c'est B qui est empilé
+        self.assertEqual(packet_candidates.stacked_on(
+            self.repo, self.a_tip, self.base, self.others, lot=1,
+            branch="review/a"), [])
+
+    def test_le_vrai_parent_passe_avant_un_frere(self):
+        # D est aussi branché sur A : B et D se recoupent par A1, mais A est
+        # le parent entièrement contenu dans B.
+        git(self.repo, "checkout", "-q", "-b", "lot/d", "review/a")
+        d_tip = write_commit(self.repo, "d", "d\n", "lot D")
+        git(self.repo, "checkout", "-q", "main")
+        self.others.append({"lot": 0, "branch": "lot/d", "shas": [d_tip]})
+        found = self.stacked()
+        self.assertEqual([s["lot"] for s in found], [1, 0])
 
     def test_un_prefixe_de_gel_suffit(self):
         self.others[0]["shas"] = [self.a_tip[:12]]
