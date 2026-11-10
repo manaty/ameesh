@@ -85,10 +85,10 @@ MAX_MANIFESTE_BYTES = 1024 * 1024
 #: bascule : une dépendance manquante ne rejoint jamais le venv vivant.
 #: Sur ce chemin historique, pip résout les bornes basses du pyproject
 #: (coverage>=7.10, pyyaml>=6) depuis l'index, comme psycopg>=3.2 et
-#: cryptography>=41 : les versions peuvent s'écarter des épingles exactes de
-#: `runtime-pins.txt` (coverage 7.17.2, pyyaml 6.0.3). Écart accepté (#6311) :
-#: la source commune est le chemin verrouillé (#5711), seul à installer les
-#: épingles, et la pose L2 décide du basculement.
+#: cryptography>=41, sans épingles : `runtime-pins.txt` ne porte que le
+#: runtime contrôleur (#6601), et le chemin verrouillé (#5711) reste seul à
+#: installer des versions exactes. Écart accepté (#6311) : la pose L2 décide
+#: du basculement.
 HOST_EXTRAS = "psycopg,crypto,contrats"
 #: #6311 : extras qu'une source ancienne peut ne pas déclarer (`contrats`
 #: avant #6309). Un bascule.py copié du poste ne les exige que si le
