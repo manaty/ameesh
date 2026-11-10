@@ -613,6 +613,17 @@ vérifier (doctor, courrier). Une séquence saine menée ainsi passe
 `--sans-retour` à `actif.py` : l’attestation, sa copie partagée et le courrier
 portent « retour automatique désactivé ». Sans l’option, rien ne change.
 
+**Hôte déjà au commit visé (#6778).** Quand `installer` est sauté parce que
+l’hôte porte déjà le commit visé avant la séquence, un échec des étapes
+suivantes (`redemarrer`, `timers`, `controler`, `sante`) n’appelle pas
+`retour` : `previous-sha` désigne alors la version d’avant cette installation,
+donc un commit **antérieur** au SHA visé — le rejouer ferait redescendre
+l’hôte sous le SHA attesté (incident AG2 `7e1c5fe` → `8bdc815`, run
+`fcc24db8`). L’échec est tracé (`retour`, verdict `sans-objet`), l’hôte reste
+sur le commit visé, la séquence s’arrête et le pilote est notifié ; un arrêt
+par la surveillance ne laisse aucun état de retour au superviseur. Un hôte
+réellement installé par la séquence garde le retour `previous-sha` habituel.
+
 Le courrier nomme les hôtes prouvés, le commit **relu actif** sur chacun après
 la séquence, les preuves `installer`/`redemarrer`/`controler`/`sante`, les lots
 concernés et, s’il y a lieu, le poste reporté avec sa raison. Un échec, un
