@@ -1,7 +1,7 @@
 {
   "lot": 6583,
-  "at": "2026-11-10T00:31:31.779483+00:00",
-  "status": "published_build_inputs_verified_target_runtime_not_built_or_sealed",
+  "at": "2026-11-10T01:07:56.970337+00:00",
+  "status": "waiting_6601_in_staging_before_target_runtime_construction",
   "source": {
     "tag": "v1.47.0",
     "sha": "8bdc815cd08f252fe24b2895f63d1421e4a59072",
@@ -145,9 +145,9 @@
   },
   "operator_build": {
     "actor": "BG sole VM/runtime mutator, unprivileged build first",
-    "command_template": "/usr/bin/python3 -I -B CLONE/deploy/mise-a-jour/construction-runtime.py --clone CLONE --sha 8bdc815cd08f252fe24b2895f63d1421e4a59072 --output NEW_OUTPUT",
+    "command_template": "After6601is in staging: /usr/bin/python3 -I -B CLONE/deploy/mise-a-jour/construction-runtime.py --clone CLONE --sha SHA_ACTIF --output /home/ameesh/runtime-build-6583/out",
     "requirements": [
-      "Clean clone exactly at source SHA, tracked and untracked bytes clean.",
+      "Clean clone exactly at SHA_ACTIF from staging.attested, including6601. The8bdc/v1.47assets above are historical verified inputs, not the revised final runtime.",
       "Use AG3 system Python3.12.3, binarySHA256 e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f.",
       "Return construction receipt, measured runtime/lib/source inventories, built wheel digest and exact replacement question from canonical #5166 tools.",
       "Independent rebuild/verification with the same target Python and exact question before signing."
@@ -172,5 +172,24 @@
     "decision proof comparison",
     "AG1 never ran",
     "REVOKE or VM sizing change"
-  ]
+  ],
+  "author": {
+    "actor": "bureau",
+    "harness": "codex",
+    "host": "pc-smichea",
+    "session": "01a186ba-ae8b-7893-b721-46140003838d"
+  },
+  "superseding_instructions": {
+    "native_messages": [
+      206517,
+      206541,
+      206546,
+      206560
+    ],
+    "blocked_by": 6601,
+    "reason": "Coverage/PyYAML controller pin closure introduces a .pth rejected by the guard. Keep the guard unchanged. Build only after corrected pins are delivered in staging, on that active source SHA.",
+    "nonroot_parent": "/home/ameesh/runtime-build-6583 (0700), if every ancestor is root-or-euid owned without group/world write. The earlier refusal under .local/state did not require a root-owned parent.",
+    "held_actions": "No root pose,6372REVOKE,orAG3shutdown before exact byte dossier/two independent family opinions/pilot fire and valid6583receipt or explicitMDdisposition."
+  },
+  "historical_git_metadata": "The first preparation commit11e2e033 inherited Git identity bureau(Claude); its actual producer was this PC Codex session. Native work note and this author record state the actual harness. Future commits use explicit local identity; no shared Git configuration is changed."
 }
