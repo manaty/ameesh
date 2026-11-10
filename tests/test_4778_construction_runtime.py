@@ -7,12 +7,14 @@ copy is the test interpreter itself.
 """
 from tests import support  # noqa: F401 — environnement isolé du poste
 
+import configparser
 import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -102,9 +104,17 @@ class PinTest(unittest.TestCase):
     def test_host_runtime_still_receives_the_contract_tools(self):
         """#6601 : l'hôte d'agents garde coverage et PyYAML (passe contrats
         de #6291) par l'extra `contrats` que `bascule.py` installe."""
-        import tomllib
-        with open(ROOT / 'pyproject.toml', 'rb') as handle:
-            extras = tomllib.load(handle)['project']['optional-dependencies']
+        # Le sous-ensemble TOML de pyproject.toml (listes de scalaires entre
+        # guillemets) se lit sans tomllib, absent de Python 3.9/3.10 (#6602),
+        # comme les bancs l104 et #5737.
+        package = configparser.ConfigParser()
+        contenu = (ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+        section = re.search(
+            r'(?ms)^\[project\.optional-dependencies\]\s*\n(.*?)(?=^\[|\Z)', contenu)
+        self.assertIsNotNone(section, 'section project.optional-dependencies absente')
+        package.read_string('[project.optional-dependencies]\n' + section.group(1))
+        extras = {nom: json.loads(valeur)
+                  for nom, valeur in package['project.optional-dependencies'].items()}
         names = {requirement.split('>')[0].split('=')[0].split('<')[0].strip().lower()
                  for requirement in extras['contrats']}
         self.assertTrue({'coverage', 'pyyaml'} <= names)
