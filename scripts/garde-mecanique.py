@@ -69,6 +69,10 @@ EXCLUDED_PREFIXES = ("tests/", "reviews/")
 #: compare cette liste aux constantes du lecteur `src/ameesh/mechanics.py` ;
 #: une clé ajoutée ou retirée là-bas sans la garde fait rougir le témoin.
 SCHEMA_KEYS = (
+    "repair_policy",
+    "repair_policy.schema",
+    "repair_policy.paused",
+    "repair_policy.rules",
     "schema",
     "timezone",
     "cutoffs",
@@ -175,6 +179,10 @@ BINDINGS = {
     "repos_s": "file.repos_s",
     "wake_mail_s": "file.wake_mail_s",
     "production_branch": "production.branch",
+    "repair_policy": "repair_policy",
+    "repair_policy_schema": "repair_policy.schema",
+    "repair_policy_paused": "repair_policy.paused",
+    "repair_policy_rules": "repair_policy.rules",
     "contract_selection_registry": "contract_selection.registry",
     "contract_publication": "contract_selection.publish",
     "attestation_max_age_seconds": "contract_selection.attestation_max_age_seconds",
@@ -208,6 +216,7 @@ UPPER_BINDINGS = {
 #: `schema` y sont bornés par leur valeur (`full|impacted|none`, préfixe
 #: `ameesh-mechanics/`) pour ne pas confondre un mapping étranger.
 DICT_BINDINGS = {
+    "repair_policy": "repair_policy",
     "max_in_build": "build.max_in_build",
     "packet": "ci.packet",
     "incident_label": "ci.incident_label",
@@ -579,6 +588,14 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "session.by_role":
         # #6046 : la table des réglages par classe de rôle, recopiée en mapping
         return value == "<dict>"
+    if key == "repair_policy":
+        return value == "<dict>"
+    if key == "repair_policy.schema":
+        return isinstance(value, str) and value.startswith("repair-policy/")
+    if key == "repair_policy.paused":
+        return type(value) is bool
+    if key == "repair_policy.rules":
+        return isinstance(value, tuple)
     if key == "contract_selection.publish":
         return value in ("contracts-first", "legacy")
     if key == "contract_selection.attestation_max_age_seconds":
