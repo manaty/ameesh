@@ -28,7 +28,7 @@ import sys
 import tempfile
 import unittest
 
-from ameesh import canon, mechanics
+from ameesh import canon, mechanics, repair_policy
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
@@ -43,7 +43,7 @@ EXAMPLE = "src/ameesh/example.py"
 
 def reader_keys() -> set[str]:
     """Les clés du schéma, dérivées des constantes du lecteur strict."""
-    keys = {"schema", "timezone", "cutoffs", "projects"}
+    keys = {"schema", "timezone", "cutoffs", "projects", "repair_policy"}
     for block, names in (
             ("packets", mechanics._PACKETS_KEYS),
             ("build", mechanics._BUILD_KEYS),
@@ -62,7 +62,8 @@ def reader_keys() -> set[str]:
             # #3022 : `production.branch` est un bloc **par projet**, pas un
             # bloc du document global ; la garde doit le voir comme les autres.
             ("production", mechanics._PRODUCTION_KEYS),
-            ("contract_selection", mechanics._CONTRACT_SELECTION_KEYS)):
+            ("contract_selection", mechanics._CONTRACT_SELECTION_KEYS),
+            ("repair_policy", repair_policy.POLICY_KEYS)):
         keys |= {"%s.%s" % (block, name) for name in names}
     return keys
 
@@ -85,7 +86,7 @@ class SchemaCoverageTest(unittest.TestCase):
         # leurs clés ci-dessus, sans entrer dans le schéma du document global.
         self.assertLessEqual(set(mechanics._OVERRIDE_KEYS),
                              set(mechanics._DOCUMENT_KEYS) |
-                             {"production", "contract_selection"})
+                             {"production", "contract_selection", "repair_policy"})
 
     def test_every_key_has_a_working_detector(self):
         self.assertEqual(set(POSITIVE), set(garde.SCHEMA_KEYS))
@@ -99,6 +100,10 @@ class SchemaCoverageTest(unittest.TestCase):
 #: qu'elle produit bien un constat pour cette clé : aucune clé ne peut être
 #: déclarée couverte sans que sa règle existe.
 POSITIVE = {
+    "repair_policy": 'REPAIR_POLICY = {"schema": "repair-policy/1", "paused": False, "rules": []}\n',
+    "repair_policy.schema": 'repair_policy_schema = "repair-policy/1"\n',
+    "repair_policy.paused": 'repair_policy_paused = False\n',
+    "repair_policy.rules": 'repair_policy_rules = [{"name": "unsafe"}]\n',
     "auto_take.excluded_families": 'AUTO_TAKE_EXCLUDED_FAMILIES = ["deepseek"]\n',
     "auto_take.expire": 'AUTO_TAKE_EXPIRE = "2026-11-01"\n',
     "schema": 'MECHANICS_SCHEMA = "ameesh-mechanics/2"\n',

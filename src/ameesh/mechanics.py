@@ -52,6 +52,9 @@ mécanique, ce que l'outillage exécute sans agent :
   `packet_tests.contracts_timeout_seconds` (#6182, clé optionnelle) : budget
   de la passe de contrats avant publication, plan et attente compris ;
   absente : le consommateur conserve le budget unitaire déclaré N-1.
+- `projects.<projet>.repair_policy` (#6636, A5) : schéma `repair-policy/1`,
+  interrupteur durable `paused` et règles explicites ; absent, inconnu ou
+  invalide : observation seule. Aucune politique globale ni héritage.
 - `projects.<projet>.production.branch` (#3022, canon §5, décision owner
   #122895) : la branche de prod d'un projet, où un lot de porte de production
   (`prod_gate`) doit être présent pour se fermer. Absente : un tel lot n'est
@@ -90,11 +93,11 @@ from __future__ import annotations
 import functools
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import canon, review
+from . import canon, review, repair_policy
 from .deadline import Deadline
 
 #: version du contrat `processus/mecanique.yaml`
@@ -124,7 +127,7 @@ _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "re
                   "merge", "prevalidation", "backlog", "staging", "accounts",
                   "paquet", "packet_tests", "file", "session", "auto_take", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
-                  "contract_selection")
+                  "contract_selection", "repair_policy")
 _PRODUCTION_KEYS = ("branch",)
 _CONTRACT_SELECTION_KEYS = ("registry", "publish", "attestation_max_age_seconds")
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
@@ -228,6 +231,7 @@ class ProjectOverride:
     #: #3022 : la branche de prod du projet (`production.branch`)
     production_branch: str | None = None
     contract_selection: ContractSelection | None = None
+    repair_policy: repair_policy.Policy | None = None
 
 
 @dataclass(frozen=True)
@@ -608,6 +612,7 @@ class Mechanics:
     session: Session | None = None
 
     contract_selection: ContractSelection | None = None
+    repair_policy: repair_policy.Policy | None = None
 
     # -- coupures -----------------------------------------------------------
 
@@ -786,6 +791,8 @@ class Mechanics:
             if self.contract_selection.attestation_max_age_seconds is not None:
                 payload["contract_selection"]["attestation_max_age_seconds"] = (
                     self.contract_selection.attestation_max_age_seconds)
+        if self.repair_policy is not None:
+            payload["repair_policy"] = self.repair_policy.to_dict()
         if self.source:
             payload["source"] = self.source
         return payload
@@ -1052,6 +1059,9 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
                                    ci_environment_red=environment,
                                    ci_faulty_lot=faulty,
                                    production_branch=production,
+                                   repair_policy=(repair_policy.compile_policy(
+                                       data["repair_policy"], project=name)
+                                       if "repair_policy" in data else None),
                                    contract_selection=(_contract_selection(
                                        data["contract_selection"], scope + ".contract_selection")
                                        if "contract_selection" in data else None)))
@@ -1646,4 +1656,6 @@ def load(repo: str, commit: str, project: str, *,
         paquet=document.paquet,
         session=document.session,
         contract_selection=override.contract_selection if override else None,
+        repair_policy=(replace(override.repair_policy, commit=commit)
+                       if override and override.repair_policy is not None else None),
     )
