@@ -78,6 +78,36 @@ def _as_float(value, default: float) -> float:
         return default
 
 
+def _as_harness_tokens(value) -> dict:
+    """#6677 : `{harnais: jetons}` du plafond de contexte par harnais.
+
+    Un entier ou un réel ≥ 0 par harnais ; une valeur illisible est refusée au
+    chargement (jamais un défaut silencieux). Un harnais absent de la table
+    garde le défaut global."""
+    if not isinstance(value, dict):
+        raise SystemExit("unreadable config: `context_max_tokens_by_harness` "
+                         "expects {harness: tokens}")
+    out = {}
+    for name, tokens in value.items():
+        if not isinstance(name, str) or not name.strip():
+            raise SystemExit("unreadable config: `context_max_tokens_by_harness` "
+                             "expects non-empty harness names")
+        if isinstance(tokens, bool):
+            raise SystemExit("unreadable config: `context_max_tokens_by_harness`"
+                             ".%s expects a token count" % name.strip())
+        try:
+            number = float(tokens)
+        except (TypeError, ValueError):
+            raise SystemExit("unreadable config: `context_max_tokens_by_harness`"
+                             ".%s expects a token count" % name.strip())
+        if not math.isfinite(number) or number < 0:
+            raise SystemExit("unreadable config: `context_max_tokens_by_harness`"
+                             ".%s expects a non-negative token count"
+                             % name.strip())
+        out[name.strip()] = number
+    return out
+
+
 def _as_reserve(value, default: float) -> float:
     """Réserve de fenêtre en jetons (CTX-04b) ; non finie : non déclarée."""
     reserve = _as_float(value, default)
@@ -377,6 +407,16 @@ class Config:
     #: (`ameesh set context_max_tokens=…`). La somme des relectures d'un tour
     #: n'est pas la mesure (#2336). 0 = plafond désactivé.
     context_max_tokens: float = 15_000_000.0
+    #: #6427/#6677 : plafond de contexte propre à un harnais, lu **avant** le
+    #: défaut global quand l'agent n'a pas de réglage propre (`ameesh set
+    #: context_max_tokens=…`, qui garde la priorité). `deepseek` vaut 250 k
+    #: depuis la mesure de 24 h du 10/11 (étude #6427 : la valeur ferme tous
+    #: les premiers tours au-dessus de 300 k en laissant la majorité des tours
+    #: intacts) ; Claude et Codex gardent le défaut global jusqu'à leur propre
+    #: mesure. Un harnais absent de la table garde le défaut global ; 0 =
+    #: plafond désactivé pour ce harnais.
+    context_max_tokens_by_harness: dict = field(
+        default_factory=lambda: {"deepseek": 250_000.0})
     #: CTX-04a (#4970) : budgets de relecture opt-in, en jetons, sur `R_turn`
     #: (relu du tour) et `R_session` (relu cumulé de la session). Dépassé : le
     #: tour se clôt au prochain point sûr et le travail reprend dans la MÊME
@@ -1405,6 +1445,8 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
             isinstance(k, str) and isinstance(v, str) and v.strip()
             for k, v in cfg.harness_bins.items()):
         raise SystemExit("unreadable config: `harness_bins` expects {harness: path}")
+    cfg = replace(cfg, context_max_tokens_by_harness=_as_harness_tokens(
+        cfg.context_max_tokens_by_harness))
     if cfg.driver not in ("auto", "psycopg", "psql"):
         raise SystemExit("invalid AGENT_MESH_DRIVER: %r" % cfg.driver)
     if cfg.backend not in ("auto", "pg", "file", "mediated"):

@@ -2534,12 +2534,19 @@ class AgentWorker(threading.Thread):
         return (self.session_tokens >= self.session_max_tokens()
                 or self.last_turn_seconds >= latency_threshold)
 
-    def context_max_tokens(self) -> int:
+    def context_max_tokens(self, harness: str | None = None) -> int:
         """Plafond de contexte effectif (L60) : réglage de l'agent
-        (`ameesh set context_max_tokens=…`), sinon défaut de l'exécuteur
-        (`AMEESH_CONTEXT_MAX_TOKENS`). 0 = désactivé."""
+        (`ameesh set context_max_tokens=…`), sinon défaut du harnais (#6677),
+        sinon défaut de l'exécuteur (`AMEESH_CONTEXT_MAX_TOKENS`). 0 =
+        désactivé.
+
+        `harness` : harnais de la session mesurée. Sans argument, celui du
+        dernier tour lancé (`_ledger_harness`) — pendant un tour, le harnais
+        effectivement utilisé (repli ou bascule de compte), pas celui de la
+        fiche de l'agent."""
         from .exploitation import effective_context_max
-        return effective_context_max(self.cfg, self.agent)
+        harnais = self._ledger_harness() if harness is None else harness
+        return effective_context_max(self.cfg, self.agent, harness=harnais or None)
 
     def canon_session(self):
         """#6046 : le bloc `session` du canon appliqué, lu au premier besoin

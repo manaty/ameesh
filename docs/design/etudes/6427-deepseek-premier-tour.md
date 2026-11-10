@@ -6,13 +6,14 @@ status: draft
 tags: [deepseek, contexte, rotation, plafond, mesure]
 generated: { by: "mty-amh-impl-18/claude-opus-5-5", at: "2026-11-09T01:19:20Z" }
 # first draft; the Decisions section (#202540) was added at 01:36:13Z (c68b32177)
-updated: { by: "mty-amh-impl-12/claude-opus-5-5", at: "2026-11-09T07:22:00Z" }
+updated: { by: "mty-amh-impl-05/deepseek-flash", at: "2026-11-10T12:53:33Z" }
 sources:
   - { resource: "../../../src/ameesh/runner.py", title: "turn_close_due, _turn_closed (L105, CTX-04a)" }
   - { resource: "../../../src/ameesh/adapters.py", title: "context_tokens vs reread_tokens (#2336)" }
   - { resource: "../../../src/ameesh/config.py", title: "context_max_tokens default (15 M), turn_max_seconds (1800 s)" }
   - { resource: "../../../src/ameesh/migrations/0041_plafond_de_contexte.sql", title: "L60: the cap defined on the cumulative reread" }
   - { resource: "6427-data/tables.py", title: "Script that recomputes every table from the corpus" }
+  - { resource: "#6677", title: "24 h measurement of the 250 k setting and per-harness fix lot" }
 ---
 
 # Need
@@ -148,3 +149,56 @@ three mid-work.
    to the prior values at the end unless the fix lot is merged.
 3. Per-step context series in `turn.context`: lot #6433.
 4. The fix lot (per-harness cap) waits for the 24 h measurement.
+
+# 24 h measurement (2026-11-09T01:30Z → 2026-11-10T01:30Z)
+
+The gesture of decision 2 set `context_max_tokens=250k` at 01:30Z on the ten
+ameesh DeepSeek agents (`mty-amh-*`; receipt: no prior setting, default 15 M).
+Corpus: `ameesh context corpus export --harness deepseek --since
+2026-11-09T01:30:00Z --until 2026-11-10T01:30:00Z` — 545 turns, 225 sessions,
+0 skipped; the 24 h before (2026-11-08T01:30Z → 2026-11-09T01:30Z) is the
+baseline — 329 turns, 136 sessions.
+
+**Closures `context_cap` and the forced rotations that follow** (scoped
+`mty-amh-*` agents; `decision.close.kind = context_cap`):
+
+| agent | closures | lots |
+|---|---|---|
+| mty-amh-impl-01 | 2 | #6525, #6534 |
+| mty-amh-impl-03 | 2 | #6473, #6002 |
+| mty-amh-impl-04 | 2 | #6422, #6520 |
+| mty-amh-impl-06 | 2 | #6475, #6487 |
+| mty-amh-impl-07 | 1 | #6437 |
+| mty-amh-impl-08 | 2 | #6563, #6566 |
+| **total** | **11** | eleven distinct lots |
+
+Every closure (11/11) is followed by exactly one `context_cap` rotation,
+published on the next turn: no closure without its rotation, no rotation
+without a closure. Context at closure: 250,176–256,045 tokens (the first call
+at or above the cap). The per-agent stop of decision 2 (“two forced rotations
+in a row on the same lot without progress”) never triggered: the eleven
+closures sit on eleven distinct lots. Outside the gesture, the Claude agents'
+own 400 k cap also closed 9 turns (auditeur 4, mesh-design 4, orchestrateur
+1); that setting is unchanged.
+
+**Fresh first turns above 300 k** (`session_seq = 1`, `R_session_base = 0`):
+
+| fresh first turns | before | after |
+|---|---|---|
+| all deepseek | 7 / 127 (5.5 %) | 13 / 214 (6.1 %) |
+| scoped `mty-amh-*` | 2 / 59 (3.4 %) | 0 / 70 (0.0 %) |
+| non-scoped deepseek | 5 / 68 (7.4 %) | 13 / 144 (9.0 %) |
+
+The scoped share falls to zero; the two before cases are impl-04 (356,668,
+event 581750) and impl-03 (326,345, event 587218). The global share does not
+fall because the gesture does not cover the other DeepSeek agents (nexlink,
+`deepseek6/7`, `ameesh-dev3`): they produce the 13 after cases. The first
+event at 250 k is at 01:42Z (impl-03/05), the last at 15 M at 01:52Z
+(impl-04); an agent idle at the gesture only shows a 250 k turn when it next
+runs (docs-01, impl-02, impl-08: 07:19–07:21Z), so no closure can precede it.
+
+**Settings returned?** No. At 2026-11-10T12:44Z the ten scoped agents still
+carry `context_max_tokens=250000` (prior value: none, default 15 M), instead
+of the return of decision 2. It is reported on lot #6677 and was not modified
+here; the per-harness default of the fix lot carries the same 250 k once
+merged. **No tort found**: the start value stays 250 k.

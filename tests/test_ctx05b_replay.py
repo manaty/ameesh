@@ -117,6 +117,23 @@ class ReproductionsTest(unittest.TestCase):
                          {"claude", "codex"})
         self.assertEqual(len(synth), 2)
 
+    def test_evenement_n_1_sans_valeur_par_harnais_garde_le_defaut_global(self):
+        """#6677 : un ``turn.context`` publié par la version N-1 ne porte pas de
+        plafond propre au harnais. Le rejeu garde le défaut global qu'il a
+        publié (15 M), jamais la valeur deepseek de 250 k arrivée après lui."""
+        ancien = turn(fixture("r5_session_guard")[0], "n1", C_last=300_000)
+        ancien["harness"] = "deepseek"
+        ancien["policy"]["context_max_tokens"] = 15_000_000
+        cf = context_replay.replay_turns([ancien], candidates())[0]["counterfactual"]
+        self.assertIsNone(cf["guard"])
+        self.assertEqual(cf["decision"], "none")
+        # un événement N, qui publie la valeur du harnais, la garde bien
+        courant = copy.deepcopy(ancien)
+        courant["policy"]["context_max_tokens"] = 250_000
+        cf = context_replay.replay_turns([courant], candidates())[0]["counterfactual"]
+        self.assertEqual(cf["guard"]["kind"], "context_cap")
+        self.assertEqual((cf["decision"], cf["cause"]), ("rotation", "context_cap"))
+
 
 class MultiToursTest(unittest.TestCase):
     def test_session_longue_claude_compaction_puis_divergence(self):
