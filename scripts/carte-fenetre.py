@@ -9,9 +9,9 @@ GitHub avec six à huit heures de retard, chaque jour (05/11 11:25Z, 06/11
 L'heure de 03:30Z, choisie « loin des coupures et des paquets » (#3343),
 n'était donc jamais l'heure réelle.
 
-La mesure planifiée part désormais d'une minuterie d'hôte
-(deploy/systemd/ameesh-carte.timer, `workflow_dispatch` avec
-`planifie=true` à 03:30Z, fiable) ; le cron GitHub reste un filet de secours.
+La mesure planifiée part désormais d'une minuterie de rôle du mesh
+(`ameesh-carte.timer`, `ameesh role timers`, `workflow_dispatch` avec
+`planifie=true` à 01:00Z, fiable) ; le cron GitHub reste un filet de secours.
 Les deux passent par ce garde, exécuté par le job `fenetre` sur un runner
 hébergé (il ne prend jamais un runner du pool) :
 
@@ -19,18 +19,24 @@ hébergé (il ne prend jamais un runner du pool) :
     mesure plus ancienne de la carte est en file ou en cours (le cron en
     retard derrière une mesure de la minuterie ; de deux gardes simultanés,
     l'aîné mesure) ;
+  - paquet en cours : une exécution d'une branche `integration/*` est en file
+    ou en cours ; la mesure lui prendrait ses runners ;
+  - carte périmée (#6777) : une carte de main de plus de 48 h (le seuil de
+    l'alerte `map_stale`, #3344) fait mesurer même hors de la fenêtre, au
+    premier créneau sans paquet en cours : la fraîcheur l'emporte sur
+    l'heure, sinon un cron toujours démarré en retard ne mesurerait plus
+    jamais ;
   - hors fenêtre : l'heure UTC n'est pas dans [00:00, 07:00) — loin des
     coupures 10:00Z/22:00Z (11:00/23:00 Europe/Paris) et des heures de
-    paquets de jour ;
-  - paquet en cours : une exécution d'une branche `integration/*` est en file
-    ou en cours ; la mesure lui prendrait ses runners.
+    paquets de jour.
 
 Une mesure sautée n'est pas un échec (le job est vert, la raison est en
-annotation) : la carte reste sous 48 h par la mesure du lendemain, et le plan
-signale une carte périmée. Un dispatch manuel (sans `planifie`) et une PR qui
-touche la mesure mesurent toujours. Une lecture d'API impossible est non
-concluante (canon §3) : elle n'empêche pas la mesure, la fenêtre horaire
-suffit à la borner.
+annotation) : la carte reste sous 48 h par la mesure du lendemain ou, si elle
+est déjà périmée, par la mesure de rattrapage hors fenêtre. Un dispatch manuel
+(sans `planifie`) et une PR qui touche la mesure mesurent toujours. Une lecture
+d'API impossible est non concluante (canon §3) : elle n'empêche pas la mesure,
+la fenêtre horaire suffit à la borner (une carte d'âge inconnu ne prouve pas
+qu'elle est périmée).
 
 Sortie : `mesurer=true|false` dans `$GITHUB_OUTPUT`, raison en annotation.
 """
@@ -48,6 +54,9 @@ import urllib.request
 FENETRE_UTC = (0, 7)
 #: une carte de main plus jeune que ceci rend la mesure planifiée « pas due »
 FRAICHEUR_H = 12
+#: au-delà, la carte est périmée (même seuil que `map_stale`, #3344) : la
+#: mesure de rattrapage l'emporte sur la fenêtre horaire (#6777)
+FRAICHEUR_MAX_H = 48
 #: préfixe des branches de paquet (paquet.yml : `integration/**`)
 PREFIXE_PAQUET = "integration/"
 
@@ -61,6 +70,7 @@ def decider(*, evenement: str, planifie: bool, maintenant: dt.datetime,
         return True, "%s : mesure de contrôle" % evenement
     if evenement == "workflow_dispatch" and not planifie:
         return True, "dispatch manuel : mesure sans garde"
+    age_h = None
     if derniere_carte is not None:
         age_h = (maintenant - derniere_carte).total_seconds() / 3600
         if age_h < FRAICHEUR_H:
@@ -68,14 +78,21 @@ def decider(*, evenement: str, planifie: bool, maintenant: dt.datetime,
                            "(< %d h)" % (age_h, FRAICHEUR_H))
     if autre_carte:
         return False, "pas due : une autre mesure de la carte est en file ou en cours"
-    debut, fin = FENETRE_UTC
-    if not debut <= maintenant.hour < fin:
-        return False, ("hors fenêtre : %s, mesure planifiée due entre "
-                       "%02d:00Z et %02d:00Z (retard du planificateur)"
-                       % (maintenant.strftime("%H:%MZ"), debut, fin))
     if paquet_actif:
         return False, "paquet en cours : la mesure lui laisse les runners"
-    return True, "mesure planifiée dans sa fenêtre"
+    debut, fin = FENETRE_UTC
+    if debut <= maintenant.hour < fin:
+        return True, "mesure planifiée dans sa fenêtre"
+    # #6777 : la fraîcheur l'emporte sur la fenêtre. Un cron que GitHub démarre
+    # toujours avec six à huit heures de retard ne mesurerait plus jamais : une
+    # carte de plus de 48 h (le seuil de `map_stale`) est mesurée au premier
+    # créneau sans paquet, même hors de [00:00, 07:00)Z.
+    if age_h is not None and age_h > FRAICHEUR_MAX_H:
+        return True, ("carte de main périmée (%.1f h > %d h) : mesure de "
+                      "rattrapage hors fenêtre" % (age_h, FRAICHEUR_MAX_H))
+    return False, ("hors fenêtre : %s, mesure planifiée due entre "
+                   "%02d:00Z et %02d:00Z (retard du planificateur)"
+                   % (maintenant.strftime("%H:%MZ"), debut, fin))
 
 
 def _date(texte: str) -> dt.datetime:
