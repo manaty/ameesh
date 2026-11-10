@@ -1022,7 +1022,8 @@
               "git.lock_removed",
               "mail.export",
               "packet.pause",
-              "auditor.pass"
+              "auditor.pass",
+              "packet.client_types"
             ]
           }
         },

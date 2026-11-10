@@ -364,7 +364,7 @@ class TypesClientsTest(unittest.TestCase):
         (worktree / "ui").mkdir(parents=True)
         source = self.repo / "ui" / "node_modules" / "openapi-typescript"
         source.mkdir(parents=True)
-        link, linked = paquet_auto._client_node_modules(worktree, self.repo)
+        link, linked, _why = paquet_auto._client_node_modules(worktree, self.repo)
         self.assertTrue(linked)
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.resolve(), source.parent.resolve())
