@@ -540,15 +540,6 @@ USERNS_REFUSED_RE = re.compile(
     r"newuidmap|newgidmap|cannot set up namespace", re.IGNORECASE)
 
 
-def _no_new_privs() -> bool:
-    """Ce processus (et donc chaque tour qu'il a lancé) est-il sous no_new_privs ?"""
-    try:
-        with open("/proc/self/status", encoding="utf-8") as fh:
-            return any(line.split() == ["NoNewPrivs:", "1"] for line in fh)
-    except OSError:
-        return False
-
-
 def rootless_unusable(runtime: Runtime, engines: list[Runtime]) -> bool:
     """#6610 : ce podman local muet ne peut porter aucun conteneur de tour.
 
@@ -567,7 +558,8 @@ def rootless_unusable(runtime: Runtime, engines: list[Runtime]) -> bool:
         return False
     if any(other.binary == runtime.binary and other.context for other in engines):
         return False
-    if not _no_new_privs():
+    from . import platform as os_layer
+    if not os_layer.no_new_privs():
         return False
     try:
         proc = runtime.run([runtime.binary, "info", "--format", "{{.Host.Arch}}"],

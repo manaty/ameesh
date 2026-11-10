@@ -279,7 +279,7 @@ class AllRuntimesTest(unittest.TestCase):
         runtime = containers.Runtime(
             binary=binary, timeout=5.0, context=context,
             run=lambda argv, **_: mock.Mock(returncode=rc, stdout="", stderr=stderr))
-        with mock.patch.object(containers, "_no_new_privs", return_value=nnp), \
+        with mock.patch.object(platform, "no_new_privs", return_value=nnp), \
                 mock.patch.dict(os.environ, env or {}, clear=True):
             return containers.rootless_unusable(runtime, engines or [runtime])
 
@@ -303,10 +303,10 @@ class AllRuntimesTest(unittest.TestCase):
     def test_no_new_privs_read_from_proc(self):
         for text, expected in (("Name:\tx\nNoNewPrivs:\t1\n", True),
                                ("NoNewPrivs:\t0\n", False), ("Name:\tx\n", False)):
-            with mock.patch("builtins.open", mock.mock_open(read_data=text)):
-                self.assertIs(containers._no_new_privs(), expected)
+            with mock.patch("builtins.open", mock.mock_open(read_data=text.encode())):
+                self.assertIs(platform.no_new_privs(), expected)
         with mock.patch("builtins.open", side_effect=OSError):
-            self.assertFalse(containers._no_new_privs())
+            self.assertFalse(platform.no_new_privs())
 
     def test_shims_skipped_disabled_engine_none(self):
         shims = os.path.join(self.dir, "shims")
