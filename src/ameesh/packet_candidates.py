@@ -75,6 +75,15 @@ lecteurs qui ne composent pas — escalade SLO « review GO → merge » et
 `ameesh debit`. Mêmes codes que `_candidate`, lecture locale des refs du
 dépôt (aucun fetch) ; `ready=True` seulement quand le gel est la tête publiée
 et que la fusion avec la cible est propre.
+
+#6607 : une tête qui porte des commits d'un autre lot **ouvert** du projet
+absents de la cible (son `branch_head`, son gel ou sa tête publiée est dans
+`cible..tête`), sans dépendance déclarée, est refusée `stacked-undeclared`
+(`depends_on` nomme le parent) : composée seule, elle emporterait les commits
+non relus du parent. Geste de l'auteur ou du pilote : `ameesh work
+dependencies <lot> --add <parent>` (#6214 range alors le lot derrière son
+parent), ou rebaser sur la cible. Une lecture des lots ouverts impossible ou
+tronquée rend l'inventaire illisible, jamais un lot réputé non empilé.
 """
 from __future__ import annotations
 
@@ -379,6 +388,90 @@ def _ancestor(repo: str, tip: str, base: str) -> bool:
                              % (proc.returncode,
                                 proc.stderr.decode("utf-8", "replace").strip()[:300]))
     return proc.returncode == 0
+
+
+def open_lot_heads(db, app: str, *, tips: dict | None = None) -> tuple[list[dict], bool]:
+    """#6607 : les têtes connues des lots ouverts du projet `app`.
+
+    Pour chaque lot ouvert (ni fusionné, ni livré, ni fermé) qui a une
+    branche, hors véhicule de paquet : son `branch_head` observé, son dernier
+    gel et, si `tips` la porte, sa tête publiée fraîche. Rend `(têtes,
+    tronqué)` : `tronqué` dit que la borne de lecture est atteinte."""
+    rows = storage.of(db).work.open_for_sweep(plan_git.MAX_BRANCH_LOTS)
+    truncated = len(rows) >= plan_git.MAX_BRANCH_LOTS
+    rows = [row for row in rows
+            if (row.get("app") or "") == (app or "")
+            and str(row.get("branch") or "").strip()
+            and not packet_guard.is_packet_branch(str(row.get("branch")).strip())]
+    marks = _marks(db, [int(row["id"]) for row in rows]) if rows else {}
+    out: list[dict] = []
+    for row in rows:
+        branch = str(row.get("branch") or "").strip()
+        freeze = plan_git.latest_freeze(marks.get(int(row["id"]), []))
+        shas = {str(value or "").strip().lower()
+                for value in (row.get("branch_head"), (freeze or {}).get("sha"),
+                              (tips or {}).get(branch))}
+        # un préfixe court nommerait plusieurs commits : 7 au moins
+        shas = sorted(sha for sha in shas if len(plan_git.commit_id(sha)) >= 7)
+        if shas:
+            out.append({"lot": int(row["id"]), "branch": branch, "shas": shas})
+    return out, truncated
+
+
+def stacked_on(repo: str, head: str, base: str, others, *, lot: int,
+               branch: str = "", branch_target: str = "",
+               declared=()) -> list[dict]:
+    """#6607 : les lots ouverts dont la tête `head` porte des commits absents
+    de `base`, sans dépendance déclarée.
+
+    Une branche empilée sur un lot non fusionné ferait entrer dans le paquet
+    les commits non relus de ce lot. `others` vient d'`open_lot_heads` ; un
+    lot est retenu quand l'une de ses têtes (observée, gelée, publiée) est un
+    commit de `base..head`. Sont exclus : le lot lui-même, un lot de même
+    branche, celui dont la branche est la cible du lot (#3437, il entre avec
+    son parent) et les prérequis déclarés (`declared`, #6214). Une seule
+    lecture Git (`rev-list`) ; une lecture impossible lève `CandidateError`."""
+    proc = _git_out(repo, "rev-list", head, "^" + base, "--")
+    if proc.returncode:
+        raise CandidateError("git rev-list %s ^%s rc=%d: %s" % (
+            head[:12], base[:12], proc.returncode,
+            proc.stderr.decode("utf-8", "replace").strip()[:300]))
+    pending = set(_text(proc).split())
+    if not pending:
+        return []
+    declared = {int(value) for value in declared or ()}
+    parent_branch = merge_queue._remote_branch(str(branch_target or "").strip())
+    found: list[dict] = []
+    for other in others or ():
+        other_lot = int(other["lot"])
+        other_branch = str(other.get("branch") or "")
+        if (other_lot == int(lot) or other_lot in declared
+                or other_branch == branch
+                or (parent_branch and other_branch == parent_branch)):
+            continue
+        for sha in other.get("shas") or ():
+            hit = sha if sha in pending else next(
+                (commit for commit in pending if commit.startswith(sha)), "")
+            if hit:
+                found.append({"lot": other_lot, "branch": other_branch, "sha": hit})
+                break
+    return sorted(found, key=lambda entry: entry["lot"])
+
+
+def _stacked_cause(lot: int, stacked: list[dict], target: str, *,
+                   author: bool = False) -> dict:
+    """#6607 : le refus `stacked-undeclared`, nommant le premier parent."""
+    parent = stacked[0]["lot"]
+    detail = ("frozen head carries commits of open lot(s) %s absent from %s, "
+              "without a declared dependency: `ameesh work dependencies %d "
+              "--add %d`, or rebase on %s"
+              % (", ".join("#%d (%s @ %s)" % (s["lot"], s["branch"], s["sha"][:12])
+                           for s in stacked),
+                 target or "the target", int(lot), parent, target or "the target"))
+    extra = {"depends_on": parent, "stacked_on": [dict(s) for s in stacked]}
+    if author:
+        return _author_refusal("stacked-undeclared", detail, **extra)
+    return _cause("stacked-undeclared", detail, **extra)
 
 
 def _git_out(repo: str, *args: str) -> subprocess.CompletedProcess:
@@ -898,6 +991,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     from . import migrations
     slug = migrations.origin_repo(repo)
     layout = migrations.layout_for(slug, cfg) if slug else None
+    open_heads = None
     for entry in candidates:
         entry["conflicts_with"] = sorted({
             int(link["lot"]) for link in links.get(entry["work_item"], ())
@@ -915,6 +1009,33 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
                         edge["blocker_id"], edge["blocker_state"]),
                     blocker_id=edge["blocker_id"],
                     blocker_state=edge["blocker_state"]))
+                entry["ready"] = False
+        # #6607 : une tête empilée sur un lot ouvert non fusionné, sans
+        # dépendance déclarée, emporterait ses commits non relus.
+        head = entry["source"] or entry["published_head"]
+        if head and not entry["error"]:
+            if open_heads is None:
+                try:
+                    open_heads, truncated = open_lot_heads(db, app, tips=tips)
+                except Exception as exc:  # noqa: BLE001 - inventaire incomplet
+                    raise CandidateError("cannot read the open lots: %s" % exc) from exc
+                if truncated:
+                    raise CandidateError(
+                        "open lots read up to the bound (%d): a stacked branch "
+                        "could be missed" % plan_git.MAX_BRANCH_LOTS)
+            try:
+                stacked = stacked_on(
+                    where, head, package_base, open_heads,
+                    lot=entry["work_item"], branch=entry["branch"],
+                    branch_target=entry["branch_target"],
+                    declared=entry["dependencies"])
+            except CandidateError as exc:
+                entry["error"] = "cannot read the stacked lots: %s" % exc
+                entry["ready"] = False
+                stacked = []
+            if stacked:
+                entry["causes"].append(_stacked_cause(
+                    entry["work_item"], stacked, target_branch))
                 entry["ready"] = False
         if entry["ready"] and not entry["source"]:
             entry["source"] = entry["published_head"]
@@ -1235,6 +1356,12 @@ AUTHOR_CAUSES = {
     "conflict":
         "resolve the conflict with the target, then freeze and have it reviewed; "
         "if a remise on the target is refused, fix it and have the remise reviewed",
+    # #6607 : l'auteur ou le pilote déclare le prérequis ; le lot entre alors
+    # avec son parent (#6214), ou l'auteur rebase sur la cible.
+    "stacked-undeclared":
+        "author or pilot: declare the dependency on the open lot it is stacked "
+        "on (`ameesh work dependencies <lot> --add <parent>`), or rebase the "
+        "branch on the target, then freeze and have it reviewed",
 }
 
 
@@ -1447,7 +1574,8 @@ def evaluate_known_remises(db, cfg, row: dict, marks, *, repo: str, target: str,
 
 
 def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
-                      repo: str | None = None, events=None) -> dict:
+                      repo: str | None = None, events=None,
+                      open_heads=None) -> dict:
     """#4572 : `refusal_of` avec la résolution des refs locales du lot.
 
     `marks` : les jalons du lot (relus de la base s'ils manquent). `repo` peut
@@ -1457,7 +1585,13 @@ def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
     `published` est la ref `origin/<branche>` du dépôt, jamais `branch_head` ;
     à défaut de dépôt, `branch_head` ne sert qu'à **nommer** la tête dans le
     détail (`published_source="observed"`), la conclusion restant `unknown`
-    sans essai de fusion. Lecture seule, aucun fetch, aucune écriture."""
+    sans essai de fusion. Lecture seule, aucun fetch, aucune écriture.
+
+    #6607 : un gel qui porte des commits d'un autre lot ouvert absents de la
+    cible, sans dépendance déclarée, rend `stacked-undeclared` (`depends_on`
+    nomme le parent) — sauf si le gel n'est pas la tête (le regel passe
+    avant). `open_heads` (`open_lot_heads`) évite la relecture par lot ; une
+    lecture impossible ou tronquée laisse le résultat sans cette cause."""
     row = row or {}
     if marks is None:
         marks = storage.of(db).work.milestones(int(row["id"]), None)
@@ -1534,4 +1668,41 @@ def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
                     row, frozen=frozen, raw_freeze=raw, published=published,
                     published_source=source, repo=repo, target=target_name,
                     base=base, remises=evaluated)
+    if (repo and frozen and base and result.get("code") not in _BEFORE_STACKED):
+        stacked = _stacked_for(db, row, repo=repo, frozen=frozen, base=base,
+                               open_heads=open_heads)
+        if stacked:
+            result = dict(_stacked_cause(int(row["id"]), stacked, target_name,
+                                         author=True),
+                          published=result.get("published", ""),
+                          published_source=result.get("published_source", ""))
     return result
+
+
+#: #6607 : refus qui passent avant l'empilement (le gel lu n'est pas la tête).
+_BEFORE_STACKED = ("missing-branch", "freeze-required", "freeze-unresolved",
+                   "freeze-not-head")
+
+
+def _stacked_for(db, row: dict, *, repo: str, frozen: str, base: str,
+                 open_heads=None) -> list[dict]:
+    """#6607 : `stacked_on` pour un seul lot ; une lecture impossible rend []."""
+    try:
+        if open_heads is None:
+            if db is None:
+                return []
+            open_heads, truncated = open_lot_heads(db, row.get("app") or "")
+            if truncated:
+                return []
+        declared = []
+        if db is not None:
+            declared = [edge.get("blocker_id") for edge in
+                        work_dependencies.grouped(db, [int(row["id"])]).get(
+                            int(row["id"]), [])
+                        if edge.get("blocker_id") is not None]
+        return stacked_on(repo, frozen, base, open_heads, lot=int(row["id"]),
+                          branch=str(row.get("branch") or "").strip(),
+                          branch_target=str(row.get("branch_target") or ""),
+                          declared=declared)
+    except Exception:  # noqa: BLE001 - lecture impossible : pas de conclusion
+        return []
