@@ -96,6 +96,9 @@ REMIND_AFTER_S = 6 * 3600.0
 #: quelques secondes) n'est pas encore une perte : le brief attend, sans
 #: escalade ni copie au fil ; trois passes du notificateur (30 s)
 LEASE_GRACE_S = 90.0
+#: #6642 : un SLO de niveau 1 ordinaire n'est briefé qu'après ce retard ;
+#: 62 des 78 L1 du 09/11 étaient en retard de 0 à 4 min (auditeur #206650)
+SLO_L1_GRACE_S = 300
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
 AUDITOR_ROLES = ("auditeur", "auditor")
 #: nom de la persona de l'auditeur (docs/AUDITEUR.md, « Mise en service »)
@@ -949,6 +952,28 @@ def sleep_unbriefed(alert: dict) -> bool:
         and automatic_sleep(alert)
 
 
+def slo_ordinary_l1(alert: dict) -> bool:
+    """#6642 : un `slo_breach` de niveau 1 ni urgent ni P1 (critique)."""
+    return alert.get("type") == "slo_breach" \
+        and int(alert.get("level") or 0) == 1 \
+        and not alert.get("urgent") and not alert.get("critical")
+
+
+def slo_grace_unbriefed(alert: dict) -> bool:
+    """#6642 (décision owner #207135 a) : un SLO de niveau 1 ordinaire en
+    retard de moins de `SLO_L1_GRACE_S` n'est briefé à personne.
+
+    L'alerte existe dès le retard, datée à l'heure exacte (`since`, `value`),
+    et reste dans `ameesh alerts` : seul le courrier est différé. Urgent et P1
+    gardent leur envoi immédiat (contre-examen #207148) ; le niveau 2 aussi."""
+    if not slo_ordinary_l1(alert):
+        return False
+    try:
+        return float(alert.get("value") or 0) < SLO_L1_GRACE_S
+    except (TypeError, ValueError):
+        return False
+
+
 def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
     """#5044 : par destinataire, les clés passives de son courrier (`mail.PASSIVE_KEYS`).
 
@@ -1118,6 +1143,19 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
             and _bureau_externe(by_name):
         dead.setdefault("bureau", "external desk, reads the %s thread"
                        % vocab.active().noun)
+    if live and len(live) > 1 and slo_ordinary_l1(alert):
+        # #6642 : au niveau 1 ordinaire, le courrier va au seul débiteur —
+        # le porteur s'il lit, sinon un pilote stable d'une passe à l'autre ;
+        # les copies partent dès le niveau 2.
+        holder = alert.get("agent")
+        names = sorted(live)
+        if holder in live:
+            keep = holder
+        else:
+            picked = _one_orchestrator(names, by_name, alert.get("lot"))
+            keep = picked[0] if len(picked) == 1 \
+                else names[int(alert.get("lot") or 0) % len(names)]
+        live = {keep: live[keep]}
     if live:
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}

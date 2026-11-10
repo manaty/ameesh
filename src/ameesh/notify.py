@@ -3300,7 +3300,9 @@ class Notifier:
         alive = {brief_key_of(a): a for a in current
                  if a.get("type") in alert_briefs.BRIEFED_TYPES
                  and a.get("type") not in alert_briefs.NOTIFIER_EXCLUDED
-                 and not alert_briefs.sleep_unbriefed(a)}
+                 and not alert_briefs.sleep_unbriefed(a)
+                 # #6642 : grâce de 5 min d'un SLO de niveau 1 ordinaire
+                 and not alert_briefs.slo_grace_unbriefed(a)}
         open_lots = None
         for key in list(sent):
             if key not in alive:

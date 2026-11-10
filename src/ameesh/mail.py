@@ -829,6 +829,27 @@ def _nature(row: Any) -> str:
     return " (urgent)" if is_urgent(row) else ""
 
 
+#: #6642 : un « #NNNN » en tête du corps, seul rattachement deviné
+_HEAD_LOT_RE = re.compile(r"\s*#(\d+)(?![\w-])")
+
+
+def head_lot(db: Db, text: str) -> str | None:
+    """#6642 : le lot qu'un « #NNNN » en tête du corps nomme, s'il existe.
+
+    62 % des courriers partaient sans lot rattaché (auditeur #206650) alors
+    que leur corps commençait par le numéro. Un numéro ailleurs dans le texte
+    ne rattache rien (une citation n'est pas le sujet), ni un lot inconnu ;
+    une lecture en échec non plus : le courrier part comme avant."""
+    match = _HEAD_LOT_RE.match(text or "")
+    if not match:
+        return None
+    try:
+        item = storage.of(db).work.get(int(match.group(1)))
+    except Exception:  # noqa: BLE001 - lecture en échec : pas de rattachement
+        return None
+    return str(int(item["id"])) if item else None
+
+
 def looks_like_ack(text: str) -> bool:
     """L125 : ce texte n'est-il QU'un accusé de réception ?
 
