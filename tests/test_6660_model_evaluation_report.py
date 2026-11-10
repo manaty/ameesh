@@ -538,6 +538,55 @@ class ReviewTest(unittest.TestCase):
                               value["review"]["by_family"]])
 
 
+class ReviewDenominatorTest(unittest.TestCase):
+    """#6674 : union des lots par famille, désignations et unités non lues."""
+
+    def test_union_des_lots_fait_foi(self):
+        rows = [
+            {"kind": "verdict", "verdict": "ok", "family": "claude",
+             "n": 1, "lots": 1},
+            {"kind": "verdict", "verdict": "blocked", "family": "claude",
+             "n": 1, "lots": 1},
+            {"kind": None, "verdict": "", "family": "claude",
+             "n": 2, "lots": 2, "family_total": True},
+        ]
+        value = report._review(rows, [])
+        claude = value["by_family"][0]
+        self.assertEqual(claude["lots"], 2)
+        self.assertEqual(claude["ok"], 1)
+        self.assertEqual(claude["blocked"], 1)
+
+    def test_designations_non_lues_restent_inconnues(self):
+        value = run(designated=None)
+        review = value["review"]
+        self.assertIsNone(review["notified_unattributed"])
+        self.assertIn("non lues", review["notified_unknown"])
+        for row in review["by_family"]:
+            self.assertIsNone(row["notified_mails"])
+            self.assertIsNone(row["notified_seats"])
+        self.assertIn("sièges : inconnu", report.format_text(value))
+        # une lecture vide reste un zéro mesuré
+        read = run(designated=[])["review"]
+        self.assertIsNone(read["notified_unknown"])
+        self.assertEqual(read["notified_unattributed"]["seats"], 0)
+        self.assertEqual(read["by_family"][0]["notified_seats"], 0)
+
+    def test_unites_non_lues_donnent_des_cohortes_inconnues(self):
+        value = run(units=None)
+        cohorts = value["cohorts"]
+        for name in ("candidates", "integration", "staging", "carriers",
+                     "separated"):
+            self.assertIsNone(cohorts[name])
+        self.assertIn("non lues", cohorts["unknown"])
+        denominators = value["coverage"]["denominators"]
+        for name in ("candidates", "integration", "staging", "carriers",
+                     "staging_ratios_known", "staging_usd_known"):
+            self.assertIsNone(denominators[name])
+        self.assertIsNone(value["coverage"]["families_absent"])
+        self.assertIn("Cohortes : inconnu", report.format_text(value))
+        self.assertIsNone(run()["cohorts"]["unknown"])
+
+
 class CoverageTest(unittest.TestCase):
     """Dénominateurs exacts, inconnues nommées, pas de zéro inventé."""
 
@@ -657,3 +706,24 @@ class DatabaseReadTest(PgTestCase):
         self.assertEqual(claude["blocked_rows"], 1)
         self.assertEqual(value["coverage"]["staging_attestations"]["lots"], 1)
         self.assertEqual(value["coverage"]["staging_attestations"]["matched"], 1)
+
+    def test_lots_de_revue_comptent_l_union(self):
+        # #6674 : deux lots disjoints, l'un OK, l'autre B, même famille
+        for lot, verdict in ((666011, "ok"), (666012, "blocked")):
+            self.db.execute(
+                "INSERT INTO work_items (id, type, source, title, app, state, "
+                "branch) VALUES (%s, 'bug', 'test', 'M1', 'ameesh', 'qa', "
+                "%s)", (lot, "lot/%d" % lot))
+            self.db.execute(
+                "INSERT INTO work_item_milestones (work_item_id, kind, at, "
+                "sha, actor, verdict) VALUES (%s, 'verdict', "
+                "to_timestamp(%s), %s, 'relecteur', %s)",
+                (lot, START + 6000, "b" * 40, verdict))
+        value = report.read(self.db, project="ameesh",
+                            start=report.iso_z(START),
+                            end=report.iso_z(END))
+        unknown = next(row for row in value["review"]["by_family"]
+                       if row["family"] == "unknown")
+        self.assertEqual(unknown["lots"], 2)
+        self.assertEqual(unknown["ok"], 1)
+        self.assertEqual(unknown["blocked"], 1)
