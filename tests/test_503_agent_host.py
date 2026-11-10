@@ -438,7 +438,13 @@ elif 'kill' in args:
     # ou non (processus restant).
     if '--signal=SIGTERM' in args and scenario == 'tour-long':
         (state / ('stopped-' + name)).touch()
-    if '--signal=SIGKILL' in args and scenario in ('tour-long-tenace', 'tour-long-reste'):
+    if '--signal=SIGTERM' in args and scenario == 'tour-long-lent':
+        # #6536/N2 : le tour met 100 s (horloge du banc) à s'arrêter.
+        horloge = Path(os.environ['HORLOGE_FICHIER'])
+        horloge.write_text(str(int(horloge.read_text()) + 100))
+        (state / ('stopped-' + name)).touch()
+    if '--signal=SIGKILL' in args and scenario in ('tour-long-tenace', 'tour-long-reste',
+                                                   'tour-long-illisible'):
         (state / ('stopped-' + name)).touch()
         (state / ('failed-' + name)).touch()
 elif 'reset-failed' in args:
@@ -464,7 +470,8 @@ elif 'show' in args:
     elif 'ControlGroup' in args:
         # #6528 : un processus restant est simulé par le cgroup réel du banc
         # (non vide : ce processus y vit) ; sinon le cgroup a disparu.
-        if scenario in ('stop-failed', 'tour-long-reste'):
+        # #6536/N1 : `tour-long-illisible`, cgroup présent mais illisible (faux cat).
+        if scenario in ('stop-failed', 'tour-long-reste', 'tour-long-illisible'):
             lignes = [l for l in Path('/proc/self/cgroup').read_text().splitlines()
                       if l.startswith('0::')]
             print(lignes[0][3:] if lignes else '/absent-6528')
@@ -551,6 +558,15 @@ SLEEP = ('#!/bin/sh\n'
          'fi\n'
          'exit 0\n') % (shutil.which('sleep') or '/bin/sleep')
 
+#: #6536/N1 : `cgroup.procs` illisible dans le scénario `tour-long-illisible`.
+CAT = ('#!/bin/sh\n'
+       'case "$1" in */cgroup.procs)\n'
+       '  if [ "$(%(cat)s "$FAKE_STATE/scenario")" = tour-long-illisible ]; then\n'
+       '    echo "cat: $1: Permission denied" >&2; exit 1\n'
+       '  fi ;;\n'
+       'esac\n'
+       'exec %(cat)s "$@"\n') % {'cat': shutil.which('cat') or '/bin/cat'}
+
 #: #2184/R3 : l'échéance absolue remise à la base suit l'horloge injectée,
 #: comme le faux CLI qui la compare. Sans fichier d'horloge, date réelle.
 DATE = ('#!/bin/sh\n'
@@ -597,7 +613,7 @@ class AgentHostTest(unittest.TestCase):
         self.config.write_text('AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=host-agents\nPERSONAS_VM=obsolete\n')
         for name, source in [('ssh', SSH), ('runuser', RUNUSER), ('ameesh', AMEESH),
                              ('systemctl', SYSTEMCTL), ('systemd-run', SYSTEMD_RUN), ('db-python', DB_PYTHON), ('sleep', SLEEP),
-                             ('date', DATE), ('id', '#!/bin/sh\necho 1001\n'),
+                             ('date', DATE), ('cat', CAT), ('id', '#!/bin/sh\necho 1001\n'),
                              ('journalctl', '#!/bin/sh\n'
                               '[ -f "$FAKE_STATE/journal" ] && cat "$FAKE_STATE/journal"\n'
                               'exit 0\n')]:
@@ -972,6 +988,23 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0, p.stdout)
         self.assertEqual(self.starts(), [])
         self.assertIn('processus restant dans le cgroup', p.stderr)
+
+    def test_unreadable_cgroup_is_not_proven(self):
+        """#6536/N1 : un cgroup.procs illisible ne prouve pas l'arrêt."""
+        p = self._arret_borne('tour-long-illisible')
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertEqual(self.starts(), [])
+        self.assertIn('processus restant dans le cgroup ou cgroup illisible', p.stderr)
+        self.assertNotIn('aucun processus restant — arrêt prouvé', p.stdout)
+
+    def test_forced_phases_count_against_the_budget(self):
+        """#6536/N2 : le second SIGTERM (100 s à l'horloge du banc) est
+        décompté du budget de l'étape, pas seulement l'attente du stop."""
+        self.env.update(ARRET_BUDGET='50')
+        p = self._arret_borne('tour-long-lent')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("budget d'arrêt restant 0 s", p.stdout)
+        self.assertNotIn("budget d'arrêt restant 50 s", p.stdout)
 
     def test_unit_that_never_stops_fails_within_the_bound(self):
         """#6528 : unité figée même après SIGKILL : échec, durée bornée."""

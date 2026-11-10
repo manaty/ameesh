@@ -1073,10 +1073,11 @@ The `installer` step follows the same practice.
    (900 s) for the whole step, no longer `TimeoutStopSec` (35 min); past it,
    a second SIGTERM to the main process stops the turn and puts its
    instruction back, then, `ARRET_FORCE_BORNE` (60 s) later, SIGKILL to the
-   unit's group. `inactive` proves the safe point; so does `failed` (SIGKILL,
+   unit's group; the forced phases count against the budget too (#6536).
+   `inactive` proves the safe point; so does `failed` (SIGKILL,
    stop timeout) when the unit's cgroup is empty: that failure is then reset
    and the unit must be `inactive` again before it starts. A process left in
-   the cgroup, a unit still active after SIGKILL or a non-zero `MainPID`
+   the cgroup, an unreadable `cgroup.procs` (#6536), a unit still active after SIGKILL or a non-zero `MainPID`
    forbids the start. No idle window is awaited: a persona in a long turn no longer
    blocks or starves the update. Then `ameesh-notify`, then the
    runners of the old database (`UNITES_RESTE`), read with its configuration.
