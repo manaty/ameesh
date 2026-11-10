@@ -15,7 +15,12 @@ des décisions legacy :
   publié dans ``turn.context.compaction`` ;
 * :func:`publish` : la section ``profile`` de ``turn.context`` (CTX-03b), qui
   ajoute au profil du tour le harnais et sa version, le mode et la classe de
-  rôle du canon — pour un tour résident comme non résident.
+  rôle du canon — pour un tour résident comme non résident ;
+* :func:`adapter_snapshot` : la section ``adapter`` de ``turn.context`` (M4,
+  #6662), le réglage **réellement remis à l'adaptateur** (modèle, effort,
+  version du binaire, compte de facturation par identifiant non secret) et sa
+  qualité ``requested``/``effective``/``unknown`` ; :func:`adapter_view` la
+  relit sans combler un trou (un événement N-1 n'a pas ce bloc).
 
 **Observation seule.** Rien ici ne décide d'une rotation ni d'un compactage,
 et aucune valeur legacy n'est requalifiée : ``resident`` garde son chemin de
@@ -36,9 +41,28 @@ import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 
-from .context_metrics import DERIVED, FALLBACK, MEASURED, PARTIAL, UNKNOWN
+from .context_metrics import (DERIVED, FALLBACK, MEASURED, PARTIAL, REQUESTED,
+                              UNKNOWN)
 
 SCHEMA = "ameesh-context/1"
+
+#: M4 (#6662) : le réglage réellement remis à l'adaptateur pour le tour —
+#: effort, modèle, version du binaire et compte de facturation par identifiant
+#: non secret. Bloc **additif** de ``turn.context``, à côté de ``profile`` : un
+#: événement antérieur n'en porte pas, et ses trous se lisent ``unknown``.
+ADAPTER_SCHEMA = "ameesh-adapter/1"
+
+#: qualités d'un réglage d'adaptateur, au sens de l'étude #6650 :
+#: ``requested`` (seul ce qu'ameesh a passé est connu), ``effective`` (le
+#: harnais l'a confirmé au runtime), ``unknown`` (aucune des deux preuves).
+#: Le vocabulaire est distinct de ``model_quality`` du profil, qui garde
+#: ``measured``/``requested``/``unknown`` pour ne pas requalifier le contrat
+#: ``ameesh-context/1`` existant.
+EFFECTIVE = "effective"
+ADAPTER_QUALITIES = (REQUESTED, EFFECTIVE, UNKNOWN)
+
+#: modes de compte du contrat §3.1, dérivés du type de profil déclaré.
+CREDENTIAL_MODES = ("subscription", "api-key")
 
 #: sources runtime de la fenêtre (§3.1, §3.5)
 SOURCE_MODEL_USAGE = "runtime:modelUsage.contextWindow"
@@ -408,6 +432,141 @@ def _reason_list(value) -> list[str]:
     if not isinstance(value, (list, tuple, set, frozenset)):
         return []
     return [str(item).strip() for item in value if str(item or "").strip()]
+
+
+def _setting_quality(requested, effective) -> str:
+    """``effective`` quand le harnais a confirmé, ``requested`` sinon si une
+    valeur a été passée, ``unknown`` sans aucune des deux preuves."""
+    if _name(effective) is not None:
+        return EFFECTIVE
+    if _name(requested) is not None:
+        return REQUESTED
+    return UNKNOWN
+
+
+def account_identity(account) -> dict:
+    """L'identité **non secrète** d'un compte de facturation, ou des nuls.
+
+    Seuls le nom déclaré du profil, l'identifiant de facturation et le mode de
+    compte (``subscription``/``api-key``) sortent d'ici. Un chemin, une
+    variable d'environnement, un fichier de clé ou une clé n'entrent jamais
+    dans une publication : ``turn.context`` est partagé (M4, #6662).
+
+    ``account`` est un profil de compte (``accounts.Profile``) ou ``None`` ;
+    un objet sans les champs attendus rend des nuls, jamais une exception.
+    """
+    if account is None:
+        return {"account_name": None, "billing_account": None,
+                "credential_mode": None}
+    kind = str(getattr(account, "kind", "") or "").strip().lower()
+    mode = {"api_key_env": "api-key", "config_dir": "subscription"}.get(kind)
+    return {
+        "account_name": _name(getattr(account, "name", None)),
+        "billing_account": _name(getattr(account, "billing_account", None)),
+        "credential_mode": mode if mode in CREDENTIAL_MODES else None,
+    }
+
+
+def adapter_snapshot(*, harness: str | None = None,
+                     own_harness: str | None = None,
+                     borrowed: bool | None = None,
+                     model_requested: str | None = None,
+                     model_effective: str | None = None,
+                     effort_requested: str | None = None,
+                     effort_effective: str | None = None,
+                     harness_version: str | None = None,
+                     account_name: str | None = None,
+                     billing_account: str | None = None,
+                     credential_mode: str | None = None) -> dict:
+    """La section ``adapter`` de ``turn.context`` (M4, #6662).
+
+    Elle décrit le réglage **réellement remis à l'adaptateur** pour le tour,
+    pas le réglage courant du registre : ``model_requested`` et
+    ``effort_requested`` sont les valeurs passées à ``adapter.command()`` (ou
+    écrites par son gabarit) ; ``model_effective`` n'est rempli que sur une
+    preuve runtime (modèle annoncé par le flux ou lu dans le journal du
+    harnais), jamais avec le seul nom demandé. Chaque réglage porte sa qualité
+    ``requested``/``effective``/``unknown``.
+
+    ``borrowed`` dit que le harnais (et donc son compte) est un repli de la
+    politique L242b : le compte publié est celui du repli, pas celui de la
+    fiche. ``own_harness`` garde le harnais déclaré, pour que l'écart reste
+    lisible. ``harness_version`` vient de ``harness_versions.probe`` ; une
+    version absente reste ``None`` avec ``version_quality=unknown``.
+
+    Aucun secret, aucun prompt : ``account_name``/``billing_account`` sont des
+    identifiants non secrets, ``credential_mode`` un mode, jamais une clé.
+    """
+    requested_model = _name(model_requested)
+    effective_model = _name(model_effective)
+    requested_effort = _name(effort_requested)
+    effective_effort = _name(effort_effective)
+    version = _name(harness_version)
+    name = _name(account_name)
+    billing = _name(billing_account)
+    mode = credential_mode if credential_mode in CREDENTIAL_MODES else None
+    return {
+        "schema": ADAPTER_SCHEMA,
+        "harness": _name(harness),
+        "own_harness": _name(own_harness),
+        "borrowed": None if borrowed is None else bool(borrowed),
+        "version": version,
+        "version_quality": EFFECTIVE if version is not None else UNKNOWN,
+        "model": {
+            "requested": requested_model,
+            "effective": effective_model,
+            "quality": _setting_quality(requested_model, effective_model),
+        },
+        "effort": {
+            "requested": requested_effort,
+            "effective": effective_effort,
+            "quality": _setting_quality(requested_effort, effective_effort),
+        },
+        "account": {
+            "name": name,
+            "billing_account": billing,
+            "credential_mode": mode,
+            "quality": REQUESTED if (name or billing) else UNKNOWN,
+        },
+    }
+
+
+def adapter_view(document: Mapping | None) -> dict:
+    """Relit ``document["adapter"]`` sans inventer un trou (M4, #6662).
+
+    Un événement antérieur à M4 n'a pas de bloc ``adapter`` : tous ses
+    réglages restent ``None`` avec la qualité ``unknown``, jamais reconstruits
+    depuis le registre ou le catalogue courant (aucun backfill). Un champ
+    malformé est traité de même, champ par champ. Un consommateur (M1) lit
+    donc les trous au lieu de les confondre avec une valeur mesurée.
+
+    ``document`` est le document ``ameesh-context/1`` (``payload["context"]``
+    d'un événement ``turn.context``), pas l'événement entier.
+    """
+    raw = document.get("adapter") if isinstance(document, Mapping) else None
+    if not isinstance(raw, Mapping):
+        raw = {}
+
+    def _obj(name: str) -> Mapping:
+        value = raw.get(name)
+        return value if isinstance(value, Mapping) else {}
+
+    model = _obj("model")
+    effort = _obj("effort")
+    account = _obj("account")
+    borrowed = raw.get("borrowed")
+    return adapter_snapshot(
+        harness=raw.get("harness"),
+        own_harness=raw.get("own_harness"),
+        borrowed=borrowed if isinstance(borrowed, bool) else None,
+        model_requested=model.get("requested"),
+        model_effective=model.get("effective"),
+        effort_requested=effort.get("requested"),
+        effort_effective=effort.get("effective"),
+        harness_version=raw.get("version"),
+        account_name=account.get("name"),
+        billing_account=account.get("billing_account"),
+        credential_mode=account.get("credential_mode"))
 
 
 def publish(observed: Window | Mapping | None = None, *,

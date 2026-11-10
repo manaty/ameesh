@@ -966,6 +966,11 @@ class AgentWorker(threading.Thread):
         self._turn_close_observation: dict | None = None
         #: #6040 : seuil de compaction réellement passé au harnais de ce tour
         self._turn_compact_tokens: int | None = None
+        #: M4 (#6662) : le réglage capturé **avant** le lancement pour la
+        #: section `adapter` de `turn.context` (harnais, repli, modèle et
+        #: effort remis, compte non secret) ; les valeurs effectives et la
+        #: version sont ajoutées à la publication. None : rien à publier.
+        self._turn_adapter_request: dict | None = None
         self._last_rotation_observation: dict | None = None
         #: CTX-04b (#4971) : `C_last`/`O_last` du dernier tour mesuré, pour la
         #: projection de fenêtre ; None après une compaction (la prochaine
@@ -5477,17 +5482,46 @@ class AgentWorker(threading.Thread):
             # sa raison, sans retenir le tour.
             requested = _modele_publie(document.get("model"), usage.model)
             harness = usage.harness or document.get("harness")
+            version = self.runner.harness_version(harness)
             profile = context_profile.publish(
                 self._context_profile_observed,
                 requested_model=requested,
                 harness=harness,
-                harness_version=self.runner.harness_version(harness),
+                harness_version=version,
                 mode=self._context_profile_mode or document.get("mode"),
                 roles=(self.agent or {}).get("roles"))
             document["profile"] = profile
             document["model"] = profile["model_effective"] or document.get("model")
             document["mode"] = profile["mode"]
             document["role"] = profile["role"]
+            # M4 (#6662) : le réglage réellement remis à l'adaptateur, à côté
+            # du profil. `requested` est capturé avant le lancement ; le
+            # modèle n'est `effective` que sur une preuve runtime — annonce du
+            # flux (profil `measured`/`derived`…) ou modèle du grand livre
+            # (journal Codex) différent du modèle demandé. Aucun harnais
+            # n'annonce l'effort aujourd'hui : il reste `requested` avec
+            # `effective=null`, jamais supposé. Un tour réparé sans capture
+            # (worker recréé) ne publie pas d'observation du tout.
+            request = getattr(self, "_turn_adapter_request", None)
+            request = dict(request) if isinstance(request, dict) else {}
+            effective_model = None
+            if profile.get("model_quality") not in (context_metrics.REQUESTED,
+                                                    context_metrics.UNKNOWN):
+                effective_model = profile.get("model_effective")
+            else:
+                declared = _modele_publie(None, usage.model)
+                if declared and (not request.get("model_requested")
+                                 or declared != request.get("model_requested")):
+                    effective_model = declared
+            effort_effective = document.get("effort") \
+                if isinstance(document.get("effort"), str) else None
+            adapter = dict(request)
+            adapter["harness"] = harness
+            document["adapter"] = context_profile.adapter_snapshot(
+                **adapter,
+                model_effective=effective_model,
+                effort_effective=effort_effective,
+                harness_version=version)
             legacy = {
                 "input_tokens": usage.input_tokens,
                 "cached_input_tokens": usage.cached_input_tokens,
@@ -5566,6 +5600,7 @@ class AgentWorker(threading.Thread):
             self._turn_close_observation = None
             self._last_rotation_observation = None
             self._turn_compact_tokens = None
+            self._turn_adapter_request = None
 
     def _compta_repare(self) -> None:
         """Avant un tour : rejoue le travail en attente ; `{}` suspend."""
@@ -8975,6 +9010,38 @@ class AgentWorker(threading.Thread):
         # compte emprunté garde les défauts de son harnais, comme l'effort.
         compact = None if emprunte else self.compact_tokens()
         self._turn_compact_tokens = compact if compact and adapter.supports_compact() else None
+        # M4 (#6662) : le réglage **réellement remis** à l'adaptateur, capturé
+        # avant le lancement ; le modèle effectif et la version du binaire ne
+        # seront connus qu'à la publication. Un effort livré par gabarit
+        # (DeepSeek : le modèle et l'effort partagent le patch YAML) prend le
+        # défaut du descripteur quand le patch est écrit — le premier gabarit
+        # de fichier dans l'ordre de `_options` (model, effort, tier) ; un
+        # harnais emprunté garde les défauts du sien, jamais ceux de la fiche
+        # de l'agent. Aucun secret : seuls des identifiants non secrets.
+        effort_passe = effort
+        if not effort_passe and patch:
+            for gabarit in (adapter.spec.model_file, adapter.spec.effort_file,
+                            adapter.spec.tier_file):
+                gabarit_texte = (gabarit.get("template")
+                                 if isinstance(gabarit, dict) else None)
+                if isinstance(gabarit_texte, str):
+                    if "{effort}" in gabarit_texte:
+                        effort_passe = adapter.spec.defaults.get("effort", "")
+                    break
+        compte_publie = (None if compte is None or compte is account_turn.INVALID
+                         else compte)
+        override = getattr(self, "_harness_override", None)
+        self._turn_adapter_request = {
+            "harness": harness,
+            "own_harness": (self.agent or {}).get("harness") or None,
+            # un repli L242b laisse le harnais différer de la fiche ; une
+            # rotation de résumé impose l'ancien harnais sans être un emprunt.
+            "borrowed": bool(emprunte and not (
+                isinstance(override, str) and override == harness)),
+            "model_requested": model or None,
+            "effort_requested": effort_passe or None,
+            **context_profile.account_identity(compte_publie),
+        }
         argv = adapter.command(resume + spec["prompt"], session,
                                model=model or None, effort=effort or None, patch=patch,
                                tier=tier or None, compact=compact)
