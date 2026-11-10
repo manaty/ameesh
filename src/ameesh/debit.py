@@ -195,6 +195,16 @@ def _window_gesture(declared: Mapping[str, Any], due: str | None) -> str:
     return GESTURES["hold_window"].format(due=due or "?", motif=motif)
 
 
+def _paused_review_gesture(name: str, reason: str) -> str:
+    """Le geste d'un avis dû chez un relecteur en pause (#6664/#6667).
+
+    Le débit ne prescrit pas de le relancer — même dans une attente mixte
+    où d'autres relecteurs sont actifs : le pilote porte le geste, désigne
+    un autre relecteur ou attend la levée."""
+    return ("relecteur %s en pause (%s) : pilote, désigner un autre "
+            "relecteur ou attendre la levée" % (name, reason))
+
+
 class DebitError(ValueError):
     """Une lecture ou une option refusée."""
 
@@ -1427,9 +1437,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 if _norm(review["name"]) == _norm(item.get("assignee")):
                     continue
                 paused = pending_paused.get(_norm(review["name"]), "")
-                gesture = (("relecteur %s en pause (%s) : pilote, désigner un "
-                            "autre relecteur ou attendre la levée"
-                            % (review["name"], paused))
+                gesture = (_paused_review_gesture(review["name"], paused)
                            if paused else
                            GESTURES["review"].format(who=review["name"], lot=ident))
                 reviews_due.append({
@@ -1606,13 +1614,14 @@ def build(*, items: Iterable[Mapping[str, Any]],
                                      for name in reviewers),
                          human=_human_wait(state), paused=True)
             else:
+                # #6667 : un geste par relecteur — relance pour un actif,
+                # pilote pour un relecteur en pause. Une attente mixte ne
+                # prescrit jamais de relancer celui qui est en pause.
                 gesture = ", ".join(
+                    _paused_review_gesture(name, paused[_norm(name)])
+                    if _norm(name) in paused else
                     GESTURES["review"].format(who=name, lot=row["lot"])
                     for name in reviewers)
-                if paused:
-                    gesture += " ; en pause : %s" % ", ".join(
-                        "%s (%s)" % (name, paused[_norm(name)])
-                        for name in reviewers if _norm(name) in paused)
                 add_wait("qa", row, row["frozen_ts"], ", ".join(reviewers),
                          gesture, human=_human_wait(state))
         elif row.get("blocked_verdict"):
