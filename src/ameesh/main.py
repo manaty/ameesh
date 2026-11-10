@@ -117,6 +117,11 @@
         re-delivers the pending mail of a stopped agent to a live agent;
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh migrate              apply schema migrations;
+  ameesh model-report [--json] [--project P] [--days N] [--at T] [--start T] [--end T]
+        rapport d'évaluation des modèles en lecture seule (étude #6650, unité
+        M1) : fenêtre UTC, cohortes d'intégration et de staging séparées,
+        familles historiques, coût du livre (estimation, pas facture),
+        verdicts B, inconnues déclarées ; n'ouvre aucun {work} ;
   ameesh models list|show|discover      model catalog and discovery;
   ameesh module <name> …              project module commands (Pipeline: adopt/advance/hold/release), --list
                                       for installation evidence;
@@ -170,11 +175,6 @@
         rapport A1–A12 en lecture seule (étude #6308, unité U1) : compteurs de
         la fenêtre UTC, inconnues déclarées ; alertes ≠ défauts, événements
         ≠ runs ;
-  ameesh model-report [--json] [--project P] [--days N] [--at T] [--start T] [--end T]
-        rapport d'évaluation des modèles en lecture seule (étude #6650, unité
-        M1) : fenêtre UTC, cohortes d'intégration et de staging séparées,
-        familles historiques, coût du livre (estimation, pas facture),
-        verdicts B, inconnues déclarées ; n'ouvre aucun {work} ;
   ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
         trois {works} {delivered} sur leur base gelée, version installée et version
         évaluée, relecture croisée à l'aveugle ;
