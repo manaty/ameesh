@@ -200,6 +200,12 @@ class Policy:
     #: viennent du document compilé, lues par `_policy`. Vide (lecture qui n'a
     #: pas de politique, `required == 0`) : le gel n'a rien à en faire.
     review_independence: tuple = ()
+    #: #6661 : le compte lu de la seule politique (barème, plancher léger,
+    #: porte critique), avant la baisse de canon et le plancher du pilote ;
+    #: None quand aucune politique n'a été lue
+    policy_required: Optional[int] = None
+    #: #6661 : le plancher posé par le pilote (`review_floor`) lu à ce gel
+    floor: int = 0
 
 
 @dataclass
@@ -365,7 +371,7 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                 errors.append("%s@%s: %s" % (source.repo, commit[:12], exc))
                 continue
             return Policy(rules=rules, families=tuple(loaded.families),
-                          risk=risk, required=required,
+                          risk=risk, required=required, policy_required=required,
                           ref=str(getattr(loaded, "source", "") or
                                   "%s@%s" % (source.repo, commit)),
                           commit=commit, source=source.repo,
@@ -1813,6 +1819,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     floor = review_floor.apply({}, db, int(lot), cfg=cfg)
     if floor.get("reviews_floor_unreadable"):
         return Unavailable("review floor unreadable: %s" % floor["reviews_floor_unreadable"])
+    policy = dataclasses.replace(policy, floor=int(floor.get("reviews_floor") or 0))
     if int(floor.get("reviews_floor") or 0) > policy.required:
         policy = dataclasses.replace(policy, required=int(floor["reviews_floor"]))
     listing = registry.overview(db)
@@ -3097,6 +3104,43 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
     return dataclasses.replace(inputs, candidates=list(fresh_by_name.values()))
 
 
+def risk_trace(inputs: Inputs) -> dict:
+    """La trace du risque de ce gel pour la marque (#6661, M2 de #6650).
+
+    Observation seule : la classe lue par la politique et d'où vient le compte
+    requis (politique, baisse de canon, plancher du pilote), avec le commit et
+    la source exacts. Rien ici ne change le compte ni les familles ; le port
+    y ajoute le gel et la base qu'il écrit."""
+    policy = inputs.policy
+    lowering = getattr(policy, "canon_lowering", None) or {}
+    return {"risk": str(policy.risk or ""),
+            "required_from": {"policy": policy.policy_required,
+                              "canon_lowering": int(lowering.get("floor") or 0),
+                              "floor": int(policy.floor or 0)},
+            "policy": {"ref": policy.ref, "commit": policy.commit,
+                       "source": policy.source}}
+
+
+class _TracedPort:
+    """Vue du port qui joint la trace du risque à chaque marque écrite (#6661).
+
+    Les ports enveloppés (`_ForcedPort`, `_FloorPort`, `_ReseatPort`) passent
+    les arguments au port réel : la trace l'atteint sans changer `rd.apply`."""
+
+    def __init__(self, port, trace: Mapping) -> None:
+        self.port = port
+        self.trace = dict(trace)
+
+    def latest_freeze(self, lot: int):
+        return self.port.latest_freeze(lot)
+
+    def recorded(self, lot: int, freeze_id: int):
+        return self.port.recorded(lot, freeze_id)
+
+    def commit(self, lot: int, **kwargs) -> dict:
+        return self.port.commit(lot, risk_trace=self.trace, **kwargs)
+
+
 def _selection(inputs: Inputs, port, *, force: bool = False,
                kept: Sequence[Mapping] = (), reported: Sequence[str] = ()) -> dict:
     """The `apply` call, shared by the hook and the recovery path.
@@ -3111,6 +3155,7 @@ def _selection(inputs: Inputs, port, *, force: bool = False,
     tête. `inputs.answered` écarte de même les avis déjà rendus sur elle."""
     if force:
         port = _ForcedPort(port)
+    port = _TracedPort(port, risk_trace(inputs))
     held = _held_manual(inputs, reported)
     return rd.apply(
         inputs.item, policy=inputs.policy.rules, paths=list(inputs.paths),
@@ -5206,7 +5251,8 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
                     why=GATE_COVERED_WHY if gate_open else COVERED_WHY,
                     authors=inputs.authors,
                     policy_ref=inputs.policy.ref, notify=inputs.notify, messages=(),
-                    unknown_authors=inputs.unknown_authors)
+                    unknown_authors=inputs.unknown_authors,
+                    risk_trace=risk_trace(inputs))
             if out.get("state") == rd.DESIGNATED:
                 _sync_reviewers(tx, item, freeze,
                                 [r.get("name") for r in out.get("reviewers") or ()])
