@@ -235,6 +235,10 @@ class ReadOnlyReadTest(unittest.TestCase):
         def execute(self, sql, params=()):
             self.statements.append((sql, params))
 
+        def query(self, sql, params=()):
+            self.statements.append((sql, params))
+            return [{"present": False}]
+
         def query_batch(self, queries):
             self.queries = list(queries)
             return [[] for _ in queries]
@@ -265,6 +269,18 @@ class ReadOnlyReadTest(unittest.TestCase):
         self.assertEqual(len(tx.queries), 11)
         for sql, _params in tx.queries:
             self.assertNotIn("LIMIT 1000", sql)
+        self.assertFalse(any("review_finding_resolutions" in sql
+                             for sql, _params in tx.queries))
+
+    def test_le_journal_des_resolutions_est_lu_s_il_existe(self):
+        tx = self.FakeTx()
+        tx.query = lambda sql, params=(): [{"present": True}]
+        report.read(self.FakeDb(tx), project="ameesh",
+                    now=END, start="2026-10-27T00:00:00Z",
+                    end="2026-11-10T00:00:00Z")
+        self.assertEqual(len(tx.queries), 12)
+        self.assertTrue(any("review_finding_resolutions" in sql
+                            for sql, _params in tx.queries))
 
 
 class FamilyTest(unittest.TestCase):
@@ -567,7 +583,7 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(value["schema"], "ameesh-model-evaluation-report/1")
         self.assertEqual(value["source"],
                          "docs/design/etudes/evaluation-modeles.md#M1")
-        self.assertEqual(value["calculation_version"], 2)
+        self.assertEqual(value["calculation_version"], 3)
         self.assertIs(value["read_only"], True)
         self.assertEqual(value["window"]["timezone"], "UTC")
         self.assertIs(value["window"]["end_exclusive"], True)
