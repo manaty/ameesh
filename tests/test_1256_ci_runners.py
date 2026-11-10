@@ -1006,7 +1006,10 @@ class CiRunnersTest(unittest.TestCase):
         # les outils (hors arbre) et l'unité systemd.
         res = self.run_script("--prepare", "--host", "ci-3", "--count", "2")
         self.assertEqual(res.returncode, 0, res.stderr)
-        guest_root = "/srv/ameesh-guest/"
+        # l'arbre invité *du banc* : sur un guest d'offload, le TMPDIR du test
+        # vit lui-même sous /srv/ameesh-guest/ (#6733), le motif nu y prendrait
+        # toute ligne
+        guest_root = self.host + "/srv/ameesh-guest/"
         touched = [line for line in res.stdout.splitlines()
                    if line.startswith("DRY ") and guest_root in line
                    and not line.startswith("DRY state ")]     # état = /etc/ameesh
@@ -1116,9 +1119,11 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn(TOOLS + "/ci-runner-gate", out)
         self.assertIn("rmdir --ignore-fail-on-non-empty", out)
         self.assertIn(TOOLS, out)
-        # root ne suit jamais un chemin sous l'arbre invité pour un rm
+        # root ne suit jamais un chemin sous l'arbre invité pour un rm (celui
+        # du banc : le TMPDIR d'un guest est lui-même sous /srv/ameesh-guest/)
+        guest_root = self.host + "/srv/ameesh-guest/"
         for line in out.splitlines():
-            if line.startswith("DRY rm ") and "/srv/ameesh-guest/" in line:
+            if line.startswith("DRY rm ") and guest_root in line:
                 self.fail("rm root sous l'arbre invité : %s" % line)
 
     def test_the_recorded_disk_floor_is_adopted_by_the_later_commands(self):
@@ -1282,6 +1287,29 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn('snapshot "$(at "$tarball_in")" "$stage"', text)
         return match.group(1)
 
+    def snap_dir(self, name):
+        """Un dossier de travail pour `snapshot`, dont chaque ancêtre est
+        lisible : le bloc ouvre chaque composant en O_RDONLY, ce que root
+        fait partout, mais pas l'utilisateur d'un guest d'offload sous la
+        racine 2710 de /srv/ameesh-guest (#6733). Sans chaîne lisible, le
+        témoin serait rouge (ou vert par erreur) pour une raison étrangère."""
+        def readable(path):
+            parts = path.split("/")
+            return all(os.access("/".join(parts[:i]) or "/", os.R_OK)
+                       for i in range(1, len(parts) + 1))
+        for base in (self.host, "/tmp", "/dev/shm", "/var/tmp"):
+            if not (os.path.isdir(base) and readable(os.path.realpath(base))):
+                continue
+            if base != self.host:
+                tmp = tempfile.TemporaryDirectory(dir=base)
+                self.addCleanup(tmp.cleanup)
+                base = os.path.realpath(tmp.name)
+            work = os.path.join(base, name)
+            os.makedirs(work)
+            return work
+        self.skipTest("aucun dossier temporaire à chaîne lisible "
+                      "(guest sans root : la copie ouvre chaque ancêtre)")
+
     def snap(self, block, src, dst, limit=1 << 20):
         return subprocess.run([sys.executable, "-", src, dst, str(limit)],
                               input=block, capture_output=True, text=True, timeout=20)
@@ -1293,8 +1321,7 @@ class CiRunnersTest(unittest.TestCase):
         # ouvre la source en O_NOFOLLOW, n'accepte qu'un fichier régulier et
         # borne ce qu'elle lit.
         block = self.snapshot_block()
-        work = os.path.join(self.host, "snap")
-        os.makedirs(work)
+        work = self.snap_dir("snap")
         real = os.path.join(work, "real.bin")
         with open(real, "wb") as fh:
             fh.write(b"archive-bytes")
@@ -1322,7 +1349,7 @@ class CiRunnersTest(unittest.TestCase):
 
     def test_archive_snapshot_refuses_a_symlinked_parent(self):
         # O_NOFOLLOW on the leaf alone still follows a replaced cache directory.
-        work = os.path.join(self.host, "snap-parent")
+        work = self.snap_dir("snap-parent")
         os.makedirs(os.path.join(work, "private"))
         real = os.path.join(work, "private", "runner.tar.gz")
         with open(real, "wb") as fh:
