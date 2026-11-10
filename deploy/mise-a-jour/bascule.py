@@ -45,17 +45,22 @@ basculement, ce fichier ne l'impose pas.
 idempotent. Aucun octet d'un venv versionné n'est modifié après préparation.
 
 `menage` retire les anciens `venv-<version>` d'une installation qui accumule
-un venv complet par mise à jour (#3792) : il garde la CIBLE du lien
-`venv-courant`, le nom écrit dans `venv.precedent`, et tout venv qu'un
-processus vivant nomme par un chemin absolu (`/proc/*/cmdline`, ou `ps` sans
-`/proc`). Le lien `venv-courant` lui-même n'est jamais candidat — on
-n'énumère que des répertoires réels — et rien n'est retiré quand l'état ne
-permet pas de conclure. `activer` l'applique en fin de bascule réussie ; le
-mode à blanc (`--apply` absent) montre ce qui serait retiré.
+un venv complet par mise à jour (#3792) et les anciens instantanés
+`src-<sha7>` du layout d'hôte (#6606) : il garde la CIBLE du lien
+`venv-courant`, le nom écrit dans `venv.precedent`, l'instantané que le venv
+vivant déclare servir (`direct_url.json`, et la cible de `src-current` sur le
+poste), celui du journal de récupération `installation-en-cours`, et tout
+venv ou instantané qu'un processus vivant nomme par un chemin absolu
+(`/proc/*/cmdline`, ou `ps` sans `/proc`). Le lien `venv-courant` et le clone
+`src` ne sont jamais candidats — on n'énumère que des répertoires réels au nom
+exact — et rien n'est retiré quand l'état ne permet pas de conclure.
+`activer` l'applique en fin de bascule réussie ; le mode à blanc (`--apply`
+absent) montre ce qui serait retiré.
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -66,6 +71,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import unquote, urlparse
 
 MARKER = ".pret"                 # venv-<version> complet et contrôlé
 #: #5711/N2 : invite fixe du venv verrouillé, identique à la production #5666.
@@ -93,6 +99,11 @@ REPORT = "venv.precedent"        # fichier : version précédente enregistrée
 LAUNCHERS = ".bascule-lanceurs"  # marqueur : <venv> porte les lanceurs
 SHEBANG_MAX_LINE = 8192          # borne en octets, même pour un script malformé
 PROC = "/proc"                   # racine des processus vivants (ménage #3792)
+#: #6606 : instantanés `src-<sha7>` du layout d'hôte (worktrees du clone `src`).
+SNAPSHOT_RE = re.compile(r"^src-[0-9a-f]{7}$")
+SRC_CURRENT = "src-current"      # lien du poste : instantané vivant
+PREVIOUS = "previous-sha"        # fichier des VM d'agents : code d'avant
+JOURNAL = "installation-en-cours"  # journal de récupération des VM d'agents
 
 _LAUNCHER = """#!/bin/sh
 # #1969 : lanceur stable du venv d'ameesh. Il résout le venv versionné vivant
@@ -408,7 +419,7 @@ def _sceller(directory):
 
 
 def _supprimer(directory):
-    """Retire un venv versionné, scellé ou non (`_sceller`)."""
+    """Retire un répertoire versionné (venv, scellé ou non, ou instantané)."""
     for dossier, _sous, _fichiers in os.walk(directory):
         if not os.path.islink(dossier):
             os.chmod(dossier, os.stat(dossier).st_mode | 0o700)
@@ -945,6 +956,269 @@ def _sous(chemin, dossier):
     return chemin == dossier or chemin.startswith(dossier + os.sep)
 
 
+def _candidats_instantanes(base):
+    """Répertoires `src-<sha7>` du partage : les worktrees du clone `src`.
+
+    Seuls des répertoires RÉELS dont le nom est exactement `src-` + 7 hex sont
+    candidats : le clone `src`, le lien `src-current`, un fichier ou un nom
+    approchant ne peuvent donc jamais être retirés. Rend None si la base est
+    illisible."""
+    try:
+        noms = sorted(os.listdir(base))
+    except OSError:
+        return None
+    candidats = []
+    for nom in noms:
+        if not SNAPSHOT_RE.match(nom):
+            continue
+        chemin = os.path.join(base, nom)
+        if os.path.islink(chemin) or not os.path.isdir(chemin):
+            continue
+        candidats.append((nom, chemin))
+    return candidats
+
+
+def _instantane_direct_url(vivante):
+    """Chemin `src-<sha7>` nommé par le `direct_url.json` du venv vivant.
+
+    C'est la source exacte du code installé (#1969) : elle est écrite par pip
+    dans le venv versionné, pas déduite d'un motif de nom."""
+    motif = os.path.join(vivante, "lib", "python*", "site-packages",
+                         "ameesh-*.dist-info", "direct_url.json")
+    for chemin in sorted(glob.glob(motif)):
+        try:
+            with open(chemin, "r", encoding="utf-8") as handle:
+                url = json.load(handle).get("url")
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(url, str):
+            continue
+        partie = urlparse(url)
+        if partie.scheme != "file" or partie.netloc not in ("", "localhost"):
+            continue
+        source = os.path.normpath(unquote(partie.path))
+        if os.path.isabs(source) and SNAPSHOT_RE.match(os.path.basename(source)):
+            return source
+    return None
+
+
+def _instantanes_courants(base, vivante):
+    """Instantanés vivants : source du venv et cible du lien `src-current`.
+
+    Sur une VM d'agents, le venv versionné porte la source dans son
+    `direct_url.json` ; sur le poste, `src-current` nomme aussi l'instantané
+    servi. Les deux sont gardés s'ils existent : le ménage ne retire jamais le
+    code que le venv vivant déclare servir."""
+    trouves = []
+    for chemin in (_instantane_direct_url(vivante), _lien_src_current(base)):
+        if not chemin:
+            continue
+        chemin = os.path.normpath(chemin)
+        if os.path.dirname(chemin) != base \
+                or not SNAPSHOT_RE.match(os.path.basename(chemin)) \
+                or os.path.islink(chemin) or not os.path.isdir(chemin):
+            continue
+        if chemin not in trouves:
+            trouves.append(chemin)
+    return trouves
+
+
+def _lien_src_current(base):
+    """Cible absolue du lien `src-current` (layout du poste), ou None."""
+    lien = os.path.join(base, SRC_CURRENT)
+    try:
+        cible = os.readlink(lien)
+    except OSError:
+        return None
+    if not os.path.isabs(cible):
+        cible = os.path.join(base, cible)
+    return os.path.normpath(cible)
+
+
+def _instantanes_precedents(base, venv):
+    """Instantanés du code d'avant : `venv.precedent`, sinon `previous-sha`.
+
+    `venv.precedent` est la version quittée au moment de la bascule ; sur une
+    VM d'agents, `previous-sha` porte le même commit après une installation
+    réussie et sert de repli si le rapport manque. Le repli n'est lu que si le
+    rapport ne désigne aucun instantané présent : au moment de la bascule, le
+    `previous-sha` publié est encore celui de l'installation d'avant et n'est
+    pas la cible de retour de celle-ci."""
+    base = os.path.normpath(base)
+    trouves = []
+    rapport = _report_path(venv)
+    precedent = None
+    if os.path.lexists(rapport):
+        try:
+            with open(rapport, "r", encoding="utf-8") as handle:
+                precedent = handle.read().strip() or None
+        except (OSError, UnicodeError) as exc:
+            return trouves, "rapport %s illisible (%s)" % (REPORT, exc)
+    if precedent:
+        chemin = os.path.normpath(os.path.join(base, "src-%s" % precedent))
+        if os.path.dirname(chemin) == base and os.path.isdir(chemin):
+            trouves.append(chemin)
+    if trouves:
+        return trouves, None
+    chemin = os.path.join(base, PREVIOUS)
+    if not os.path.exists(chemin):
+        return trouves, None
+    try:
+        with open(chemin, "r", encoding="utf-8") as handle:
+            texte = handle.read().strip()
+    except (OSError, UnicodeError) as exc:
+        return trouves, "%s illisible (%s)" % (PREVIOUS, exc)
+    if not re.match(r"^[0-9a-fA-F]{7,40}$", texte):
+        return trouves, "%s invalide (%s)" % (PREVIOUS, texte or "vide")
+    chemin = os.path.normpath(os.path.join(base, "src-%s" % texte[:7].lower()))
+    if os.path.dirname(chemin) == base and os.path.isdir(chemin):
+        trouves.append(chemin)
+    return trouves, None
+
+
+def _instantanes_journal(base):
+    """Instantanés nommés par le journal de récupération (`installation-en-cours`).
+
+    Tant que ce journal existe, `installer` refuse et `retour` s'appuie sur le
+    code qu'il désigne : ses instantanés ne sont jamais candidats."""
+    base = os.path.normpath(base)
+    chemin = os.path.join(base, JOURNAL)
+    if not os.path.lexists(chemin):
+        return [], None
+    try:
+        with open(chemin, "r", encoding="utf-8") as handle:
+            lignes = handle.read().splitlines()
+    except (OSError, UnicodeError) as exc:
+        return [], "journal de récupération illisible (%s)" % exc
+    trouves = []
+    for ligne in lignes:
+        cle, _, valeur = ligne.partition("=")
+        valeur = valeur.strip()
+        if cle == "sha" and re.match(r"^[0-9a-fA-F]{7,40}$", valeur):
+            nom = "src-%s" % valeur[:7].lower()
+        elif cle == "cible" and re.match(r"^[0-9a-fA-F]{7,40}$", valeur):
+            nom = "src-%s" % valeur[:7].lower()
+        elif cle == "instantane" and SNAPSHOT_RE.match(valeur):
+            nom = valeur
+        else:
+            continue
+        chemin_snapshot = os.path.normpath(os.path.join(base, nom))
+        if os.path.dirname(chemin_snapshot) == base \
+                and os.path.isdir(chemin_snapshot) \
+                and chemin_snapshot not in trouves:
+            trouves.append(chemin_snapshot)
+    if not trouves:
+        return [], "journal de récupération sans instantané lisible"
+    return trouves, None
+
+
+def _prune_worktrees(base, erreurs):
+    """Retire du clone les métadonnées des worktrees dont le répertoire est parti.
+
+    Un instantané d'hôte est un worktree détaché : après le retrait de son
+    répertoire, `git worktree prune` évite qu'une création suivante au même
+    chemin refuse un worktree « déjà enregistré ». Best-effort : le disque est
+    déjà libéré, et une erreur ne fait jamais échouer une bascule."""
+    src = os.path.join(base, "src")
+    if not os.path.exists(os.path.join(src, ".git")):
+        return
+    try:
+        resultat = subprocess.run(["git", "-C", src, "worktree", "prune"],
+                                  capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        erreurs.append(("worktree prune", str(exc)))
+        return
+    if resultat.returncode != 0:
+        detail = (resultat.stderr or "").strip() or "code %d" % resultat.returncode
+        erreurs.append(("worktree prune", detail))
+
+
+def _menager_instantanes(venv, appliquer=False, racine=PROC, vivants=None):
+    """Retire les instantanés `src-<sha7>` au-delà du courant, du précédent,
+    du journal de récupération et de l'usage.
+
+    Le courant est la source écrite dans le `direct_url.json` du venv vivant
+    (et la cible de `src-current` sur le poste), jamais un motif ; le précédent
+    est `venv.precedent` (repli `previous-sha`) ; le journal
+    `installation-en-cours` protège la cible de `retour` ; tout instantané
+    qu'un processus vivant nomme par un chemin absolu est conservé. Rien n'est
+    retiré si l'état ne permet pas de conclure. Rend un compte rendu ; ne lève
+    pas."""
+    rapport = {"courant": None, "precedent": None, "gardes": [],
+               "retirables": [], "retires": [], "erreurs": [], "probleme": None}
+    base = os.path.normpath(_base(venv))
+    candidats = _candidats_instantanes(base)
+    if candidats is None:
+        rapport["probleme"] = "contenu de %s illisible" % base
+        return rapport
+    if not candidats:
+        return rapport
+    vivante = _repertoire_lie(venv)
+    if vivante is None:
+        rapport["probleme"] = "lien %s absent ou illisible" % CURRENT
+        return rapport
+    if not os.path.isdir(vivante):
+        rapport["probleme"] = "cible du lien %s introuvable (%s)" % (CURRENT, vivante)
+        return rapport
+    courants = _instantanes_courants(base, vivante)
+    if not courants:
+        rapport["probleme"] = ("instantané courant introuvable (%s ou "
+                               "direct_url.json du venv vivant)" % SRC_CURRENT)
+        return rapport
+    rapport["courant"] = courants[0]
+    precedents, probleme = _instantanes_precedents(base, venv)
+    if probleme:
+        rapport["probleme"] = probleme
+        return rapport
+    if precedents:
+        rapport["precedent"] = precedents[0]
+    journal, probleme = _instantanes_journal(base)
+    if probleme:
+        rapport["probleme"] = probleme
+        return rapport
+    if vivants is None:
+        vivants = _chemins_des_processus(racine)
+        if vivants is None:
+            rapport["probleme"] = "processus vivants illisibles (%s)" % racine
+            return rapport
+    gardes = {}
+    for chemin in courants:
+        gardes[chemin] = "courant"
+    for chemin in precedents:
+        gardes.setdefault(chemin, "précédent")
+    for chemin in journal:
+        gardes.setdefault(chemin, "récupération (journal)")
+    retirables = []
+    for nom, chemin in candidats:
+        chemin = os.path.normpath(chemin)
+        raison = gardes.get(chemin)
+        if raison:
+            rapport["gardes"].append((nom, raison))
+            continue
+        if any(_sous(utilise, chemin) for utilise in vivants):
+            rapport["gardes"].append((nom, "utilisé par un processus vivant"))
+            continue
+        retirables.append((nom, chemin))
+    rapport["retirables"] = [nom for nom, _ in retirables]
+    if not appliquer:
+        return rapport
+    for nom, chemin in retirables:
+        if _repertoire_lie(venv) != vivante \
+                or sorted(_instantanes_courants(base, vivante)) != sorted(courants):
+            rapport["probleme"] = ("l'instantané courant a changé pendant le "
+                                   "ménage ; retrait interrompu")
+            break
+        try:
+            _supprimer(chemin)
+        except OSError as exc:
+            rapport["erreurs"].append((nom, str(exc)))
+        else:
+            rapport["retires"].append(nom)
+    if rapport["retires"]:
+        _prune_worktrees(base, rapport["erreurs"])
+    return rapport
+
+
 def _menager(venv, appliquer=False, racine=PROC):
     """Retire les venvs versionnés au-delà du courant, du précédent et de l'usage.
 
@@ -1009,6 +1283,11 @@ def _menager(venv, appliquer=False, racine=PROC):
             continue
         retirables.append((nom, chemin))
     rapport["retirables"] = [nom for nom, _ in retirables]
+    # #6606 : le même ménage taille les instantanés `src-<sha7>` du layout
+    # d'hôte. Leur courant se lit dans le venv vivant ; le précédent et le
+    # journal de récupération sont gardés par leur nom, jamais par un motif.
+    rapport["instantanes"] = _menager_instantanes(
+        venv, appliquer=appliquer, racine=racine, vivants=vivants)
     if not appliquer:
         return rapport
     for nom, chemin in retirables:
@@ -1030,7 +1309,7 @@ def _menager_apres_bascule(venv):
     try:
         rapport = _menager(venv, appliquer=True)
     except Exception as exc:  # le déploiement reste réussi même si le ménage casse
-        print("bascule: ménage des venvs impossible (%s) ; rien retiré" % exc,
+        print("bascule: ménage impossible (%s) ; rien retiré" % exc,
               file=sys.stderr)
         return
     if rapport["retires"]:
@@ -1041,6 +1320,16 @@ def _menager_apres_bascule(venv):
     if rapport["probleme"]:
         print("bascule: ménage des venvs non conclu (%s)"
               % rapport["probleme"], file=sys.stderr)
+    instantanes = rapport.get("instantanes") or {}
+    if instantanes.get("retires"):
+        print("bascule: ménage : %d ancien(s) instantané(s) retiré(s) (%s)"
+              % (len(instantanes["retires"]), ", ".join(instantanes["retires"])))
+    for nom, erreur in instantanes.get("erreurs", []):
+        print("bascule: ménage : instantané %s conservé (%s)" % (nom, erreur),
+              file=sys.stderr)
+    if instantanes.get("probleme"):
+        print("bascule: ménage des instantanés non conclu (%s)"
+              % instantanes["probleme"], file=sys.stderr)
 
 
 def menager(args):
@@ -1060,6 +1349,23 @@ def menager(args):
             print("bascule: à retirer %s (à blanc ; --apply pour retirer)" % nom)
     for nom, erreur in rapport["erreurs"]:
         print("bascule: non retiré %s : %s" % (nom, erreur), file=sys.stderr)
+    instantanes = rapport.get("instantanes") or {}
+    if instantanes.get("courant"):
+        print("bascule: instantané courant %s%s" % (
+            os.path.basename(instantanes["courant"]),
+            ", précédent %s" % os.path.basename(instantanes["precedent"])
+            if instantanes.get("precedent") else ""))
+    for nom, raison in instantanes.get("gardes", []):
+        print("bascule: instantané gardé %s (%s)" % (nom, raison))
+    for nom in instantanes.get("retires", []):
+        print("bascule: instantané retiré %s" % nom)
+    if not args.apply:
+        for nom in instantanes.get("retirables", []):
+            print("bascule: instantané à retirer %s (à blanc ; --apply pour "
+                  "retirer)" % nom)
+    for nom, erreur in instantanes.get("erreurs", []):
+        print("bascule: instantané non retiré %s : %s" % (nom, erreur),
+              file=sys.stderr)
     if rapport["probleme"]:
         if rapport["retires"]:
             print("bascule: ménage interrompu : %s" % rapport["probleme"],
@@ -1068,7 +1374,13 @@ def menager(args):
             print("bascule: ménage non conclu : %s ; rien retiré"
                   % rapport["probleme"], file=sys.stderr)
         return 1
-    return 1 if rapport["erreurs"] else 0
+    if instantanes.get("probleme"):
+        print("bascule: ménage des instantanés non conclu : %s"
+              % instantanes["probleme"], file=sys.stderr)
+        return 1
+    if rapport["erreurs"] or instantanes.get("erreurs"):
+        return 1
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -1219,8 +1531,9 @@ def main(argv=None):
     p.add_argument("--venv", required=True)
     p.set_defaults(func=retour)
     p = sub.add_parser("menage",
-                       help="retirer les anciens venv-<version> (courant, précédent "
-                            "et venvs utilisés gardés ; à blanc par défaut)")
+                       help="retirer les anciens venv-<version> et instantanés "
+                            "src-<sha7> (courant, précédent, journal et usage "
+                            "gardés ; à blanc par défaut)")
     p.add_argument("--venv", required=True)
     p.add_argument("--apply", action="store_true",
                    help="retirer réellement (défaut : mode à blanc)")

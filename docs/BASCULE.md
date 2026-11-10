@@ -1463,6 +1463,18 @@ cannot be told apart from an old one: the cleanup may remove it, and
 `preparer` rebuilds it. `retour` does not clean up: the version it switches
 away from stays on disk for inspection and a retry.
 
+The same cleanup trims the host layout's `src-<sha7>` snapshots (#6606):
+each update leaves an exact worktree of the commit (about 40 MB), and nothing
+removed them. It keeps the snapshot the live venv declares as its source
+(`direct_url.json`, plus the target of `src-current` where that link exists),
+the previous one (`venv.precedent`, falling back to `previous-sha` on agent
+VMs), the one named by the `installation-en-cours` recovery journal, and every
+snapshot a live process names. The rest are removed after a successful switch,
+then `git worktree prune` drops their metadata from the `src` clone. The
+clone, the `src-current` link and any name that is not exactly `src-` plus
+seven hex characters are never candidates, and nothing is removed when the
+current snapshot, the journal or the live processes cannot be read.
+
 A systemd unit must therefore never name a versioned venv (#4754): a watch or
 wake unit armed from a process whose `PATH` held `venv-<sha7>/bin` failed with
 203/EXEC once that venv was removed. `ameesh watch` writes the stable path
