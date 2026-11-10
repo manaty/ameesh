@@ -562,6 +562,7 @@ def publish_sequence_readiness(db, cfg, options, problem, descriptor) -> None:
             {"key": options.get("key") or "", "role": options.get("role") or "",
              "host": cfg.host, "ready": ready,
              "diagnostic": "" if ready else public_reason(problem),
+             "candidates": list(options.get("candidates") or []),
              "config": descriptor})
     except Exception as exc:  # noqa: BLE001 - the refusal itself remains
         print("ameesh: staging preparation not published: %s"

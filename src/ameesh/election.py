@@ -295,45 +295,63 @@ STAGING_PREP_S = 900.0
 
 #: #6761: the executor's preparation publishes one event per role and host.
 STAGING_PREP_EVENT = "staging.executor"
+#: The durable window in which a role's preparation events identify it as a
+#: staging-executor role, even when this host's config does not name it.
+STAGING_PREP_DAYS = 30
+STAGING_PREP_EVENTS = 200
 
 
-def _staging_reason(db, role: Mapping, host: str) -> str:
-    """#6761: a candidate that cannot deploy is not ready for the role.
+def _staging_reason(cfg, db, role: Mapping, host: str) -> str:
+    """#6761: a staging candidate needs a fresh, positive preparation proof.
 
     The elected staging executor proves, before taking any request, that a
     sequence on this host resolves the same base (same `config.load` and
-    `db.connect` as `staging_watch`) and publishes the verdict here. A fresh
-    failure makes the candidate non-eligible for the role rank, so the
-    election never keeps a host that would only refuse at take time (#6532,
-    auditor #209624). Absence of a proof is not a failure: a role without a
-    staging executor publishes none, and a stale one is ignored.
+    `db.connect` as `staging_watch`) and reaches the quiescence targets, then
+    publishes the verdict. A role is subject to that proof when the shared
+    configuration names it as the release role (`release.role`) or when it has
+    published preparation events recently; ordinary roles are untouched.
+
+    For a subject role, the proof is closed on doubt: no event, an event that
+    is not exactly `ready: true`, an unreadable one or one older than
+    `STAGING_PREP_S` all make the candidate non-eligible for the role rank. A
+    dead timer therefore never leaves a host ranked 0 on its old word (#6532,
+    auditor #209624 and the P1 verdict on e8ac15005).
     """
     name = role.get("name") or ""
     if not name:
         return ""
     object_name = "staging-executor:%s:%s" % (name, host)
+    prefix = "staging-executor:%s:" % name
     try:
-        rows = storage.of(db).events.recent_type(
-            STAGING_PREP_EVENT, None, 1, object=object_name)
+        rows = storage.of(db).events.latest_type(
+            STAGING_PREP_EVENT, STAGING_PREP_DAYS, STAGING_PREP_EVENTS)
     except db_mod.Unavailable:
         raise
     except db_mod.DbError as exc:
         return "staging preparation unreadable (%s)" % db_mod.explain(exc)
-    if not rows:
+    mine = [row for row in rows
+            if str(row.get("object") or "").startswith(prefix)]
+    configured = str((getattr(cfg, "release", None) or {}).get("role") or "")
+    if configured != name and not mine:
         return ""
-    row = rows[0]
+    row = next((row for row in mine
+                if row.get("object") == object_name), None)
+    if row is None:
+        return "staging preparation proof missing"
     data = row.get("data") or {}
-    if data.get("ready") is not False:
-        return ""
     try:
         age = pg.now_ts(db) - float(row.get("ts") or 0)
     except (TypeError, ValueError):
         return "staging preparation unreadable (timestamp)"
     if not 0 <= age <= STAGING_PREP_S:
+        return "staging preparation proof expired"
+    if data.get("ready") is True:
         return ""
-    diagnostic = " ".join(str(data.get("diagnostic") or "").split())[:300]
-    return "staging preparation failed%s" % (
-        (": " + diagnostic) if diagnostic else "")
+    if data.get("ready") is False:
+        diagnostic = " ".join(str(data.get("diagnostic") or "").split())[:300]
+        return "staging preparation failed%s" % (
+            (": " + diagnostic) if diagnostic else "")
+    return "staging preparation incomplete"
 
 
 def local_readiness(cfg, db, role: Mapping, host: str) -> tuple[bool, str]:
@@ -351,7 +369,7 @@ def local_readiness(cfg, db, role: Mapping, host: str) -> tuple[bool, str]:
     auth = _auth_reason(cfg, db, role, host)
     if auth:
         reasons.append(auth)
-    staging = _staging_reason(db, role, host)
+    staging = _staging_reason(cfg, db, role, host)
     if staging:
         reasons.append(staging)
     if not reasons:

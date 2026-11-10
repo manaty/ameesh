@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -690,45 +691,82 @@ class StagingPreparationTest(unittest.TestCase):
 
     ROLE = {"name": "mesh-design"}
 
-    def reason(self, rows, *, now=1000.0):
+    def cfg(self, role="mesh-design"):
+        return types.SimpleNamespace(release={"role": role})
+
+    def proof(self, *, host="banc", ready=True, ts=900.0, diagnostic="",
+              role="mesh-design"):
+        data = {"ready": ready}
+        if diagnostic:
+            data["diagnostic"] = diagnostic
+        return dict(id=1, ts=ts, object="staging-executor:%s:%s" % (role, host),
+                    data=data)
+
+    def reason(self, rows, *, now=1000.0, cfg=None, role=None):
         events = mock.Mock()
-        events.recent_type.return_value = rows
+        events.latest_type.return_value = rows
         store = mock.Mock(events=events)
         with mock.patch.object(election.storage, "of", return_value=store), \
              mock.patch.object(election.pg, "now_ts", return_value=now):
-            return election._staging_reason(object(), self.ROLE, "banc")
+            return election._staging_reason(
+                cfg if cfg is not None else self.cfg(), object(),
+                role or self.ROLE, "banc")
 
-    def test_a_fresh_failure_names_the_reason(self):
-        rows = [dict(ts=900.0, data={"ready": False,
-                                     "diagnostic": "unreachable (dial tcp)"})]
-        self.assertEqual(self.reason(rows),
-                         "staging preparation failed: unreachable (dial tcp)")
+    def test_an_ordinary_role_without_events_is_untouched(self):
+        self.assertEqual(self.reason([], cfg=self.cfg("pilote")), "")
 
-    def test_a_success_or_a_stale_failure_says_nothing(self):
-        self.assertEqual(self.reason(
-            [dict(ts=900.0, data={"ready": True})]), "")
-        self.assertEqual(self.reason(
-            [dict(ts=99.0, data={"ready": False, "diagnostic": "x"})]), "")
-        self.assertEqual(self.reason([]), "")
+    def test_a_subject_role_without_any_proof_is_refused(self):
+        # closed on doubt: no journal is not "ready by default"
+        self.assertEqual(self.reason([]),
+                         "staging preparation proof missing")
+
+    def test_a_fresh_positive_proof_is_ready(self):
+        self.assertEqual(self.reason([self.proof(ready=True, ts=900.0)]), "")
+
+    def test_an_expired_proof_is_refused_even_when_positive(self):
+        self.assertEqual(self.reason([self.proof(ready=True, ts=99.0)]),
+                         "staging preparation proof expired")
+
+    def test_a_failure_names_the_diagnostic(self):
+        self.assertEqual(
+            self.reason([self.proof(ready=False, ts=900.0,
+                                    diagnostic="unreachable (dial tcp)")]),
+            "staging preparation failed: unreachable (dial tcp)")
+
+    def test_an_incomplete_proof_is_refused(self):
+        row = self.proof()
+        row["data"].pop("ready")
+        self.assertEqual(self.reason([row]),
+                         "staging preparation incomplete")
+
+    def test_a_role_that_published_events_is_subject_even_without_config(self):
+        # a candidate whose own timer never ran has no proof: refused
+        self.assertEqual(
+            self.reason([self.proof(host="atelier")], cfg=self.cfg("pilote")),
+            "staging preparation proof missing")
+
+    def test_the_proof_of_another_host_does_not_answer_for_this_one(self):
+        self.assertEqual(self.reason([self.proof(host="atelier")]),
+                         "staging preparation proof missing")
 
     def test_an_unreadable_journal_closes_on_doubt(self):
         events = mock.Mock()
-        events.recent_type.side_effect = election.db_mod.DbError("boom")
+        events.latest_type.side_effect = election.db_mod.DbError("boom")
         with mock.patch.object(election.storage, "of",
                                return_value=mock.Mock(events=events)):
-            reason = election._staging_reason(object(), self.ROLE, "banc")
+            reason = election._staging_reason(
+                self.cfg(), object(), self.ROLE, "banc")
         self.assertIn("staging preparation unreadable", reason)
 
-    def test_the_event_is_read_for_this_role_and_host_only(self):
+    def test_the_journal_is_read_once_for_the_whole_role(self):
         events = mock.Mock()
-        events.recent_type.return_value = []
+        events.latest_type.return_value = []
         with mock.patch.object(election.storage, "of",
-                               return_value=mock.Mock(events=events)):
-            self.assertEqual(
-                election._staging_reason(object(), self.ROLE, "banc"), "")
-        events.recent_type.assert_called_once_with(
-            "staging.executor", None, 1,
-            object="staging-executor:mesh-design:banc")
+                               return_value=mock.Mock(events=events)), \
+             mock.patch.object(election.pg, "now_ts", return_value=1000.0):
+            election._staging_reason(self.cfg(), object(), self.ROLE, "banc")
+        events.latest_type.assert_called_once_with(
+            "staging.executor", 30, 200)
 
 
 if __name__ == "__main__":
