@@ -160,14 +160,24 @@ def _lire(db, cle: str) -> tuple[str, str] | None:
     return row["source"], row["ddl"]
 
 
-def _ranger(db, cle: str, schema: str) -> bool:
+def verrou(cle: str) -> str:
+    """Nom du verrou consultatif du gabarit `cle` : un par empreinte, pour
+    qu'un autre job (autre branche, autres migrations) qui construit le sien
+    sur le même serveur ne fasse pas sauter celui-ci (#6785)."""
+    return "%s:%s" % (_LOCK, cle)
+
+
+def _ranger(db, cle: str, schema: str, attendre: bool = False) -> bool:
     """Tire le gabarit du schéma `schema` (tout juste migré) et le range ;
-    sans attente : si un autre processus le construit, on passe."""
+    sans attente : si un autre processus le construit, on passe. `attendre`
+    (témoins) : attend sa fin, puis range si le gabarit manque encore."""
     if cle in _echecs or pg_dump_pour(_serveur(db)) is None:
         return False
     with db.transaction() as tx:
-        if not tx.query("SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS ok",
-                        (_LOCK,))[0].get("ok"):
+        if attendre:
+            tx.query("SELECT pg_advisory_xact_lock(hashtext(%s)) IS NULL AS ok", (verrou(cle),))
+        elif not tx.query("SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS ok",
+                          (verrou(cle),))[0].get("ok"):
             return False
         tx.execute("CREATE SCHEMA IF NOT EXISTS " + SCHEMA)
         tx.execute("CREATE TABLE IF NOT EXISTS " + TABLE + " ("
