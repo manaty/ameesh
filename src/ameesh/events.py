@@ -115,7 +115,7 @@ TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
          "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request", "git.lock_removed",
-         "mail.export", "packet.pause", "auditor.pass")
+         "mail.export", "packet.pause", "auditor.pass", "packet.client_types")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365
 #: the table refuses to delete an event younger than this (migration 0396)

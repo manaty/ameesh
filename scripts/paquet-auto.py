@@ -447,6 +447,14 @@ IMPACT_BUDGET_S = 180
 CLIENT_SPEC = "docs/api/openapi-v1.json"
 CLIENT_SCHEMA = "ui/src/api/schema.d.ts"
 CLIENT_GEN = "ui/scripts/gen-api.mjs"
+#: #6676 : le cache partagé par lockfile (`ameesh deps link`, #248) prête au
+#: worktree jetable les `ui/node_modules` de l'arbre composé ; `--no-fill` :
+#: jamais de `npm ci` réseau dans le tic, une entrée absente reste absente
+DEPS_LINK_TIMEOUT = 60
+#: #6676 : un « non concluant » faute de modules est compté (`ameesh events`)
+CLIENT_TYPES_EVENT = "packet.client_types"
+#: les causes de non-concluant qui sont une panne de l'hôte, pas du contenu
+CLIENT_MISSING_CAUSES = ("node-absent", "modules-absent")
 #: un en-tête d'échec unittest (`FAIL: test (tests.test_x.T.t)`) ; une ligne
 #: `FAIL:` produite par le test lui-même n'a pas ce nom pointé et est ignorée
 FAIL_LINE_RE = re.compile(
@@ -3255,23 +3263,70 @@ def _changed_paths(worktree: Path, base_sha: str) -> list[str] | None:
             if line.strip()]
 
 
-def _client_node_modules(worktree: Path, repo: Path | None) -> tuple[Path | None, bool]:
-    """#4887 : les `node_modules` de `ui/`, dans l'arbre ou prêtés par le clone.
+def _cached_client_modules(worktree: Path) -> tuple[Path | None, str]:
+    """#6676 : lie `ui/node_modules` du worktree jetable au cache partagé.
 
-    Rend `(chemin, posé)`, `posé` disant qu'un lien a été créé dans le worktree
-    jetable et doit être retiré après le contrôle.
+    La clé de l'entrée est celle du `ui/package-lock.json` **composé**
+    (`ameesh deps link --no-fill`) : aucun `npm ci`, aucune écriture hors du
+    clone et du cache. Rend `(lien, "")` si posé, sinon `(None, motif)`.
+    """
+    ui = worktree / "ui"
+    link = ui / "node_modules"
+    if not (ui / "package-lock.json").is_file():
+        return None, "pas de ui/package-lock.json"
+    try:
+        proc = run_command(["ameesh", "deps", "link", "--no-fill", "--json",
+                            str(ui)], cwd=worktree, timeout=DEPS_LINK_TIMEOUT)
+    except PaquetAutoError as exc:
+        return None, "ameesh deps link : %s" % _one_line(str(exc))[:160]
+    if proc.returncode != 0:
+        return None, ("ameesh deps link rc %d : %s"
+                      % (proc.returncode, _one_line(_output(proc))[:160]))
+    try:
+        items = json.loads(_decode(proc.stdout)).get("items") or []
+    except (ValueError, AttributeError):
+        return None, "ameesh deps link : sortie illisible"
+    status = ""
+    for item in items:
+        if (isinstance(item, dict) and item.get("package")
+                and Path(str(item["package"])).resolve() == ui.resolve()):
+            status = str(item.get("status") or "")
+    if status == "linked":
+        if (link / "openapi-typescript").is_dir():
+            return link, ""
+        if link.is_symlink():
+            with contextlib.suppress(OSError):
+                link.unlink()
+        return None, "cache partagé lié sans openapi-typescript"
+    return None, "cache partagé : %s" % (status or "ui/ absent de la réponse")
+
+
+def _client_node_modules(worktree: Path, repo: Path | None
+                         ) -> tuple[Path | None, bool, str]:
+    """#4887 : les `node_modules` de `ui/`, dans l'arbre ou prêtés.
+
+    Rend `(chemin, posé, motif)`, `posé` disant qu'un lien a été créé dans le
+    worktree jetable et doit être retiré après le contrôle ; `motif` dit
+    pourquoi aucun n'a été trouvé. #6676 : le cache partagé par lockfile
+    passe avant le clone dédié, qui n'a souvent aucun `ui/node_modules`.
     """
     direct = worktree / "ui" / "node_modules"
     if (direct / "openapi-typescript").is_dir():
-        return direct, False
+        return direct, False, ""
+    why = "ui/node_modules absent"
+    if not os.path.lexists(direct):
+        cached, why = _cached_client_modules(worktree)
+        if cached is not None:
+            return cached, True, ""
     if repo is not None:
         source = repo / "ui" / "node_modules"
         if (source / "openapi-typescript").is_dir():
             link = worktree / "ui" / "node_modules"
             if not os.path.lexists(link):
                 link.symlink_to(source.resolve(), target_is_directory=True)
-                return link, True
-    return None, False
+                return link, True, ""
+        why += " ; clone sans ui/node_modules"
+    return None, False, why
 
 
 def _client_culprits(worktree: Path, units) -> list[int]:
@@ -3291,7 +3346,8 @@ def _client_culprits(worktree: Path, units) -> list[int]:
 
 def check_client_types(worktree: Path, base_sha: str, *,
                        repo: Path | None = None, units=(),
-                       timeout: int = GIT_TIMEOUT) -> tuple[bool, str]:
+                       timeout: int = GIT_TIMEOUT,
+                       outcome: dict | None = None) -> tuple[bool, str]:
     """#4887 : le contrôle rapide du job plan (`types clients à jour`) avant la CI.
 
     h-10 a perdu sa CI sur `ui/src/api/schema.d.ts` périmé (#4831) : le job
@@ -3305,7 +3361,12 @@ def check_client_types(worktree: Path, base_sha: str, *,
       « OpenAPI changé sans schéma » et l'unité qui le porte, mais il ne bloque
       pas (§3) — un reformatage JSON ou un `info.version` peut laisser les
       types identiques (cx1, #4887) ; la CI tranche.
+
+    #6676 : `outcome` reçoit la cause d'un non-concluant (`cause`, `detail`) ;
+    `node-absent` et `modules-absent` sont une panne de l'hôte, consignée au
+    manifeste et comptée par l'appelant.
     """
+    outcome = {} if outcome is None else outcome
     script = worktree / CLIENT_GEN
     if not script.is_file():
         return True, "types clients : pas de générateur dans l'arbre, contrôle sauté"
@@ -3318,41 +3379,86 @@ def check_client_types(worktree: Path, base_sha: str, *,
     if "ui/package.json" in changed or "ui/package-lock.json" in changed:
         # les dépendances du générateur ont bougé : le node_modules prêté par
         # le clone n'est plus celui de l'arbre composé.
+        outcome.update(cause="deps-changed")
         return True, ("types clients : non concluant (dépendances ui modifiées, "
                       "node_modules du clone peut être périmé) ; la CI tranche")
     node = shutil.which("node")
-    modules, linked = _client_node_modules(worktree, repo)
+    modules, linked, why = (_client_node_modules(worktree, repo) if node
+                            else (None, False, "node absent"))
     try:
         if node and modules is not None:
             try:
                 proc = run_command([node, CLIENT_GEN, "--check"], cwd=worktree,
                                    timeout=timeout)
             except PaquetAutoError as exc:
+                outcome.update(cause="check-failed", detail=_one_line(str(exc))[:160])
                 return True, ("types clients : contrôle non concluant (%s) ; "
                               "la CI tranche" % _one_line(str(exc))[:160])
             text = _output(proc)
             if proc.returncode == 0:
                 return True, "types clients : à jour (`gen-api --check`)"
             if re.search(r"ERR_MODULE_NOT_FOUND|Cannot find module", text):
-                pass        # dépendances incomplètes : garde déterministe
+                # dépendances incomplètes : garde déterministe
+                why = "modules incomplets : %s" % _one_line(text)[:120]
             else:
                 return False, ("types clients périmés (`gen-api --check`, rc %d) : %s"
                                % (proc.returncode, _one_line(text)[:240]))
+        outcome.update(cause="node-absent" if not node else "modules-absent",
+                       detail=why)
         if CLIENT_SPEC in changed and CLIENT_SCHEMA not in changed:
             culprits = _client_culprits(worktree, units)
             hint = ((" ; indice : unité(s) #"
                      + ", #".join(str(lot) for lot in culprits))
                     if culprits else "")
             return True, (
-                "types clients : non concluant (node/node_modules absent) ; "
+                "types clients : non concluant (node/node_modules absent : %s) ; "
                 "`%s` change sans `%s`%s ; la CI tranche (#4831)"
-                % (CLIENT_SPEC, CLIENT_SCHEMA, hint))
-        return True, ("types clients : non concluant (node/node_modules absent) ; "
-                      "la CI tranche")
+                % (why, CLIENT_SPEC, CLIENT_SCHEMA, hint))
+        return True, ("types clients : non concluant (node/node_modules absent : "
+                      "%s) ; la CI tranche" % why)
     finally:
         if linked and modules is not None:
             with contextlib.suppress(OSError):
                 modules.unlink()
+
+
+def record_client_types_event(worktree: Path, *, name: str, project: str,
+                              outcome: dict) -> str:
+    """#6676 : compte un non-concluant faute de modules (`packet.client_types`).
+
+    Sans lui, la panne de l'hôte se répétait en silence et coûtait une CI de
+    paquet rouge. Au mieux : un échec d'écriture est dit, jamais bloquant.
+    Rend la ligne à afficher.
+    """
+    code = """
+import json, sys
+from ameesh import config, db, events
+conn = None
+try:
+    conn = db.connect(config.load())
+    if conn is None:
+        raise RuntimeError("base absente")
+    data = json.loads(sys.argv[3])
+    print(events.record(conn, sys.argv[1], sys.argv[2],
+                        project=sys.argv[4] or None, **data))
+finally:
+    if conn is not None:
+        conn.close()
+"""
+    data = {"cause": str(outcome.get("cause") or ""),
+            "detail": str(outcome.get("detail") or "")[:300],
+            "host": socket.gethostname()}
+    try:
+        proc = run_command(
+            [project_python(worktree), "-c", code, CLIENT_TYPES_EVENT,
+             package_branch(name), json.dumps(data, ensure_ascii=False), project],
+            cwd=worktree, env=python_env(worktree), timeout=EPOCH_CHECK_TIMEOUT)
+    except PaquetAutoError as exc:
+        return "événement %s non écrit : %s" % (CLIENT_TYPES_EVENT, exc)
+    if proc.returncode:
+        return "événement %s non écrit : %s" % (CLIENT_TYPES_EVENT,
+                                                 _tail(_output(proc), 3))
+    return "événement %s #%s" % (CLIENT_TYPES_EVENT, _decode(proc.stdout).strip())
 
 
 def _unusable(run) -> frozenset:
@@ -4282,7 +4388,7 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
                    composition: Composition, table: str,
                    tests: list[TestRun] | None, freeze_seconds: float,
                    ready_count: int = 0, waiting: int = 0,
-                   errors: int = 0) -> str:
+                   errors: int = 0, client_types: str = "") -> str:
     """Le manifeste §12, lisible par `paquet-inclusion.py` (#1644/#2409).
 
     #4304 : `tests=None` — le manifeste est écrit et poussé avant les tests par
@@ -4341,6 +4447,11 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
         "",
         "- `scripts/freeze-checks.py` : vert en %.1f s." % freeze_seconds,
     ]
+    if client_types:
+        # #6676 : un non-concluant faute de modules se voit au manifeste ; les
+        # ids d'indice (« unité(s) #N ») ne sont pas relus par l'inclusion
+        lines.append("- Types clients : %s."
+                     % re.sub(r"#(\d+)", r"lot \1", _cell(client_types)))
     if tests is None:
         lines.append(TESTS_PARALLEL_LINE)
         lines.append("- Contrats du plan commun : passe bornée sur cet arbre après "
@@ -5728,9 +5839,16 @@ def compose_packet(args: argparse.Namespace) -> int:
                     "freeze-checks rouge sur la tête composée :\n%s"
                     % _tail(freeze_output))
             print("freeze-checks : vert (%.1f s)" % freeze_seconds, flush=True)
+            client_outcome: dict = {}
             client_ok, client_note = check_client_types(
-                worktree, base_sha, repo=repo, units=composition.units)
+                worktree, base_sha, repo=repo, units=composition.units,
+                outcome=client_outcome)
             print("types clients : %s" % client_note, flush=True)
+            if client_outcome.get("cause") in CLIENT_MISSING_CAUSES:
+                print("types clients : %s" % record_client_types_event(
+                    worktree, name=args.name,
+                    project=getattr(args, "pause_project", "") or "",
+                    outcome=client_outcome), flush=True)
             if not client_ok:
                 # #6272 : types clients périmés = rouge du contenu, pas du
                 # composeur (le contrôle ne bloque que sur une preuve).
@@ -5744,7 +5862,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                 tests=None, freeze_seconds=freeze_seconds,
                 ready_count=ready_count,
                 waiting=len(payload.get("waiting") or []),
-                errors=len(errors))
+                errors=len(errors), client_types=client_note)
             head = write_manifest(worktree, rel, manifest_text, name=args.name,
                                   units=len(composition.units),
                                   discarded=len(composition.discarded))
