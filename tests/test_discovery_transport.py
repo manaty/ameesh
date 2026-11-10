@@ -9,14 +9,11 @@ parce qu'un faux transport ne prouverait rien de ce genre de bug.
 from __future__ import annotations
 
 import http.server
-import os
-import sys
 import threading
 import unittest
 import urllib.parse
 import socket
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from ameesh.discovery import http as discovery_http  # noqa: E402
 

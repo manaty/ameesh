@@ -19,12 +19,10 @@ import os
 import pathlib
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
 
 from ameesh import github_identity as gi  # noqa: E402
 

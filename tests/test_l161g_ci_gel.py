@@ -49,14 +49,12 @@ import io
 import itertools
 import json
 import re
-import sys
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 from urllib.parse import unquote
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from ameesh import ci, mesh_cli, plan_github, prevalidation, work  # noqa: E402
 from ameesh import prevalidation_calls  # noqa: E402

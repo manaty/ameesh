@@ -79,12 +79,42 @@ def is_base_volume(name: str) -> bool:
     return str(name or "").endswith(BASE_VOLUME_SUFFIX)
 
 
+#: #6630 : suffixe du conteneur d'une base nommée. `scripts/pg-up.sh` monte le
+#: volume `<nom>-data` dans le conteneur `<nom>` : le banc partagé `ameesh-pg`
+#: (ou `agent-mesh-pg`, `<agent>-pg`) porte ainsi `*-pg-data`
+#: ([`BASE_VOLUME_SUFFIX`]). Il est lancé sans étiquette de tour (#1411).
+BASE_CONTAINER_SUFFIX = "-pg"
+
+
+def is_base_container(row: dict) -> bool:
+    """#6630 : ce conteneur est-il une base du mesh (banc Postgres partagé) ?
+
+    Reconnu par le contrat de nommage de `scripts/pg-up.sh` (nom en `-pg`,
+    son volume en `-pg-data`) ou, quand le moteur les donne, par un volume de
+    base monté. Une base de lot (`ameesh-pg-1333`) n'en est pas une : elle
+    reste parmi les conteneurs hors tour."""
+    names = [n.strip().lstrip("/") for n in str(row.get("name") or "").split(",")]
+    if any(n.endswith(BASE_CONTAINER_SUFFIX) for n in names if n):
+        return True
+    return any(is_base_volume(m) for m in row.get("mounts") or ())
+
+
 #: marque que Docker pose sur un volume créé implicitement pour un conteneur
 ANONYMOUS_LABEL = "com.docker.volume.anonymous"
 
 #: volumes inspectés par commande (`volume inspect` accepte une liste ; l'argv
 #: reste borné sur un hôte qui en porte des centaines)
 INSPECT_BATCH = 200
+
+
+def _mounts(raw) -> list[str]:
+    """#6630 : les montages d'une ligne de `ps` — une chaîne `a,b` (docker)
+    ou une liste (podman) ; jamais d'erreur sur une forme inattendue."""
+    if isinstance(raw, str):
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    if isinstance(raw, list):
+        return [str(m) for m in raw if m]
+    return []
 
 
 def turn_labels(turn_id: str, agent: str, lot: str | None = None) -> str:
@@ -195,7 +225,8 @@ class Runtime:
 
     def list_all(self, stopped: bool = False) -> list[dict] | None:
         """Les conteneurs de l'hôte (L73, lecture seule) : `id`, `name`,
-        `image`, `created`, `status`, `labels` ; None si le moteur ne répond
+        `image`, `created`, `status`, `labels`, `mounts` (#6630 : noms des
+        volumes montés que donne `ps`) ; None si le moteur ne répond
         pas. Sans `stopped`, seuls ceux qui tournent (`ps`).
 
         `stopped=True` (#1411) : aussi ceux qui ne tournent plus (`ps -a`) —
@@ -238,6 +269,7 @@ class Runtime:
                 "created": str(row.get("CreatedAt") or row.get("Created") or ""),
                 "status": str(row.get("Status") or row.get("State") or ""),
                 "labels": parse_labels(row.get("Labels")),
+                "mounts": _mounts(row.get("Mounts")),
             })
         return out
 

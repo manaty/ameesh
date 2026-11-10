@@ -4689,18 +4689,21 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
 
     Un conteneur étiqueté par un tour INCONNU de cette base, ou d'un autre
     hôte, n'est pas supprimé (signalé). Rend `{entries, plan, ameesh,
-    others, others_total}` ; `ameesh`/`others` à None si le moteur ne répond
-    pas ; `others` est borné à `OTHERS_TOP` entrées (#1547 N3), le compte
-    total restant dans `others_total`."""
+    others, others_total, bases}` ; `ameesh`/`others` à None si le moteur ne
+    répond pas ; `others` est borné à `OTHERS_TOP` entrées (#1547 N3), le
+    compte total restant dans `others_total`. #6630 : les bases du mesh (banc
+    partagé, `containers.is_base_container`) vont dans `bases`, hors des
+    `others`, et un « autre » porte une commande d'inspection, jamais `rm`."""
+    from . import containers as containers_mod
     out: dict = {"entries": [], "plan": [], "ameesh": None, "others": None,
-                 "others_total": None}
+                 "others_total": None, "bases": None}
     if runtime is None:
         return out
     rows = runtime.list_all(stopped=True)
     if rows is None:
         return out
     binary = os.path.basename(getattr(runtime, "binary", "docker") or "docker")
-    ours, others, others_total = [], [], 0
+    ours, others, others_total, bases = [], [], 0, []
     turns = storage.of(db).turn_resources
     for c in rows:
         if budget is not None and budget.expired():
@@ -4710,12 +4713,18 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
         turn = labels.get("ameesh.turn")
         ref = c.get("name") or c.get("id", "")[:12]
         if not turn:
-            if only_turn is None:
+            if only_turn is None and containers_mod.is_base_container(c):
+                # #6630 : la base du mesh (banc partagé) n'est pas un « autre »
+                bases.append({"id": c.get("id", "")[:12], "name": c.get("name"),
+                              "image": c.get("image"), "status": c.get("status")})
+            elif only_turn is None:
                 others_total += 1
                 if len(others) < OTHERS_TOP:
+                    # #6630 : une commande d'inspection, jamais de suppression
+                    # imprimée telle quelle
                     others.append({"id": c.get("id", "")[:12], "name": c.get("name"),
                                    "image": c.get("image"), "status": c.get("status"),
-                                   "command": "%s rm -f %s" % (binary, shlex.quote(ref))})
+                                   "command": "%s inspect %s" % (binary, shlex.quote(ref))})
             continue
         if only_turn is not None and turn != only_turn:
             continue
@@ -4755,6 +4764,7 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     out["ameesh"] = ours
     out["others"] = others if only_turn is None else None
     out["others_total"] = others_total if only_turn is None else None
+    out["bases"] = bases if only_turn is None else None
     return out
 
 
@@ -6142,7 +6152,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         top["command"] = "rm -rf -- %s" % shlex.quote(top["path"])
     report_measure["containers"] = {
         "ameesh": conteneurs["ameesh"], "others": conteneurs["others"],
-        "others_total": conteneurs["others_total"]}
+        "others_total": conteneurs["others_total"], "bases": conteneurs.get("bases")}
     report_measure["volumes"] = {
         "ameesh": volumes["ours"], "others": volumes["others"],
         "others_total": volumes["others_total"]}
@@ -6326,6 +6336,9 @@ def print_report(report: dict) -> None:
     if images.get("others_total"):
         print("    … %d untagged image(s) without the lifetime label "
               "(never deleted by ameesh)" % images["others_total"])
+    for c in conteneurs.get("bases") or ():
+        print("  container mesh database  %s  %s  (%s) — kept, do not remove" % (
+            c.get("name") or c.get("id"), c.get("image"), c.get("status") or "?"))
     autres = conteneurs.get("others") or []
     if autres:
         print("  containers not started by an ameesh turn (never deleted by ameesh):")
