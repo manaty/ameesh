@@ -41,6 +41,30 @@ Règles testées (témoins du lot) :
   une lecture vide (liste vide) est un zéro mesuré ; les lignes `void_reason`
   sont écartées des sommes et comptées à part.
 
+Unité **M5** (même étude, ligne M5) : tableaux descriptifs et de sensibilité,
+lus dans les mêmes sources, sans nouvelle persistance ni moteur de catalogue :
+
+* **B croisés** famille du relecteur (reçu du verdict) × famille des auteurs
+  (désignation du **même** gel, texte SHA exact), puis par risque au gel
+  (trace M2, `unknown` pour une marque N-1 ou reportée) ; marges et total
+  rapprochés, lignes, lots et B distincts `(lot, gel, relecteur)` séparés ;
+* **strates comparables** `(type, taille)` : seules les unités à ratio connu,
+  famille par famille ; une strate n'est « comparable » qu'avec au moins deux
+  familles nommées à ratio connu ;
+* **cohortes distinctes** des unités abandonnées (fermées sans intégration
+  effective dans la fenêtre) et ouvertes (démarrées dans la fenêtre, non
+  intégrées ni fermées à sa fin) : jamais mêlées aux cohortes M1 ;
+* **rouges** : notes `packet-unit-red` lues par `packet_unit_red.read_note`,
+  dédupliquées par note, mémoire `(lot, source, cible, base)`, source et
+  `(source, test)` ; chaque source reliée au reçu de son commit et aux runs CI
+  de sa tête ; les runs de la fenêtre séparés en succès, échec et
+  non-concluants (annulé, remplacé, en cours) ;
+* **coût de revue** (tours des agents ayant rendu un verdict sur le lot) et
+  **coût sans lot** (livre du mesh), à part des coûts d'unités.
+
+Toute cellule sous `SMALL_CELL` lignes est gardée et marquée `small_cell`, pour
+toutes les familles ; un inconnu reste une ligne `unknown`, jamais réparti.
+
 Ce module ne lit ni corps de courrier, ni prompt, ni secret : les requêtes ne
 prennent que des métadonnées et des identifiants. Toutes les lectures sont
 exécutées dans une transaction `READ ONLY`.
@@ -60,8 +84,14 @@ from . import estimates
 
 SCHEMA = "ameesh-model-evaluation-report/1"
 SOURCE = "docs/design/etudes/evaluation-modeles.md#M1"
-#: la version de calcul, conservée à côté des tableaux (l'étude le demande)
-CALCULATION_VERSION = 1
+#: la version de calcul, conservée à côté des tableaux (l'étude le demande) ;
+#: 2 = tableaux M5 ajoutés, ceux de M1 inchangés
+CALCULATION_VERSION = 2
+#: seuil d'affichage d'une petite cellule, le même pour toutes les familles :
+#: la cellule reste publiée, marquée ; ce n'est pas un seuil de décision
+SMALL_CELL = 10
+#: statuts `ci_runs` qui ne concluent rien (§3 : seul un test négatif bloque)
+CI_INCONCLUSIVE = ("cancelled", "superseded", "running")
 DEFAULT_PROJECT = "ameesh"
 #: la fenêtre de l'étude : quatorze jours complets, `[start, end[` en UTC
 DEFAULT_DAYS = 14
@@ -110,6 +140,22 @@ UNKNOWN = {
     "review_family": (
         "famille du reçu de verdict absente : la notification n'est pas "
         "affectée au registre courant"),
+    "author_family": (
+        "famille des auteurs inconnue pour ce verdict : aucune désignation "
+        "`designated` sur le texte SHA exact du gel jugé, ou attribution "
+        "incomplète"),
+    "risk": (
+        "risque au gel inconnu : marque sans trace M2 (écrivain N-1), "
+        "verdicts reportés ou aucune marque sur ce gel"),
+    "red_family": (
+        "famille de la source rouge inconnue : aucun reçu `commit:<sha>` ; "
+        "un reçu atteste le créateur du commit, pas la cause du rouge"),
+    "other_cohorts": (
+        "cohortes abandonnée/ouverte non lues : aucune conclusion de "
+        "survie n'est possible sans elles"),
+    "reds": "notes de rouges non lues : absence de lecture, pas zéro rouge",
+    "ci": "runs CI non lus : absence de lecture, pas zéro run",
+    "review_cost": "coût de revue non lu",
 }
 
 #: Ce que le lecteur ne peut pas conclure ; l'étude les nomme déjà.
@@ -128,8 +174,17 @@ LIMITS = (
     "taille sont déclaratifs et la taille manque pour une partie des lots",
     "les cohortes d'intégration et de staging sont publiées séparément et "
     "leurs coûts portent sur des phases différentes : ils ne se comparent pas",
-    "les unités abandonnées ou ouvertes ne sont pas dans ces cohortes ; leur "
-    "ajout est une unité distincte (M5)",
+    "les unités abandonnées ou ouvertes forment des cohortes distinctes, "
+    "jamais mêlées aux cohortes d'intégration ou de staging ; leur état est "
+    "celui de l'extraction, pas une reconstruction historique",
+    "un B croisé décrit qui a relu qui, pas une qualité : les missions de "
+    "relecture ne sont pas aléatoires et un relecteur ne juge pas sa famille",
+    "une note de rouge est une borne basse sans adjudication (code, banc, "
+    "interaction, non-concluant) ; aucun taux de rouges par famille n'est "
+    "calculé ; zéro note n'est pas zéro rouge",
+    "le coût de revue compte les tours des agents ayant rendu un verdict sur "
+    "le lot : un relecteur correcteur y est aussi compté, un relecteur sans "
+    "verdict ne l'est pas",
     "aucune p-value ni intervalle de confiance n'est inventé ; une cellule de "
     "petit effectif ne soutient aucune recommandation",
     "le rapport ne lit ni corps de courrier, ni prompt, ni secret, et "
@@ -185,6 +240,23 @@ COVERAGE_RULES = (
     ("causality", "les tableaux sont descriptifs : aucune inférence causale "
                   "n'est tirée d'une différence entre familles, et aucune "
                   "recommandation n'est produite par ce lecteur"),
+    ("b_cross", "B croisés : famille du relecteur = reçu `milestone:<id>` du "
+                "verdict ; famille des auteurs = désignation du même texte SHA "
+                "de gel, jamais un gel voisin ; marges et total sont la somme "
+                "exacte des cellules ; porteurs comptés à part"),
+    ("strata", "strate = (type, taille) déclarés ; seules les unités à ratio "
+               "connu y entrent ; comparable = au moins deux familles nommées "
+               "à ratio connu dans la strate"),
+    ("small_cell", "une cellule de moins de %d lignes (ou lots) est gardée et "
+                   "marquée `small_cell`, pour toutes les familles" % SMALL_CELL),
+    ("other_cohorts", "abandonnée = fermée sans livraison ni intégration "
+                      "effective, fermeture dans la fenêtre ; ouverte = "
+                      "démarrée dans la fenêtre, ni intégrée ni fermée avant "
+                      "sa fin ; coûts du début à la fermeture ou à la fin"),
+    ("reds", "rouges dédupliqués par note, mémoire (lot, source, cible, base), "
+             "source et (source, test) ; runs CI comptés par (dépôt, run) ; "
+             "annulé, remplacé et en cours sont non concluants, jamais "
+             "des rouges"),
 )
 
 
@@ -448,7 +520,11 @@ SELECT c.harness,
                          AND (c.billing_account IS NULL
                               OR c.billing_account = ''))
          AS billing_account_unknown,
-       count(DISTINCT c.turn_id) AS turn_ids
+       count(DISTINCT c.turn_id) AS turn_ids,
+       count(*) FILTER (WHERE c.work_item_id IS NULL
+                         AND c.void_reason IS NULL) AS without_lot_rows,
+       sum(c.usd) FILTER (WHERE c.work_item_id IS NULL
+                           AND c.void_reason IS NULL) AS without_lot_usd
   FROM turn_costs c
   LEFT JOIN work_items w ON w.id = c.work_item_id
  WHERE c.recorded_at >= to_timestamp(%s)
@@ -489,6 +565,187 @@ SELECT payload->'review_designation'->>'reviewer' AS family,
    AND work_item_id IN (SELECT id::text FROM work_items WHERE app = %s)
  GROUP BY 1
  ORDER BY 1
+"""
+
+#: M5 — un verdict par ligne : famille du reçu exact du relecteur, et les
+#: marques de désignation du lot jusqu'au verdict (le gel est choisi en Python
+#: par texte SHA exact, la marque n'est jamais lue dans un gel voisin).
+_VERDICTS_SQL = """
+SELECT m.id, m.work_item_id AS lot, coalesce(w.branch, '') AS branch,
+       m.sha, m.actor, m.verdict,
+       coalesce(p.harness, '') AS reviewer_family,
+       extract(epoch FROM m.at) AS at,
+       d.notes
+  FROM work_item_milestones m
+  JOIN work_items w ON w.id = m.work_item_id
+  LEFT JOIN provenance_receipts p ON p.subject = 'milestone:' || m.id
+  LEFT JOIN LATERAL (
+    SELECT array_agg(e.note ORDER BY e.created_at DESC, e.id DESC) AS notes
+      FROM work_item_events e
+     WHERE e.work_item_id = m.work_item_id
+       AND e.note LIKE 'review-designation:%%'
+       AND e.created_at <= m.at
+  ) d ON true
+ WHERE w.app = %s
+   AND m.kind = 'verdict'
+   AND m.at >= to_timestamp(%s)
+   AND m.at < to_timestamp(%s)
+ ORDER BY m.at, m.id
+"""
+
+#: M5 — cohortes abandonnée et ouverte, sans intégration effective avant la
+#: fin. Mêmes colonnes de coût, de B et de têtes que `_UNITS_SQL`, bornées au
+#: début mesuré et à la fermeture (ou à la fin de la fenêtre).
+_OTHERS_SQL = """
+WITH bounds AS (
+  SELECT to_timestamp(%s) AS lo, to_timestamp(%s) AS hi
+), candidates AS (
+  SELECT w.id, w.type, w.change_size, w.branch, w.state, w.close_reason,
+         CASE WHEN w.state = 'closed' AND w.closed_at < b.hi
+              THEN 'abandoned' ELSE 'open' END AS cohort,
+         extract(epoch FROM w.started_at) AS started_at,
+         extract(epoch FROM w.closed_at) AS closed_at,
+         w.started_at AS started_ts,
+         CASE WHEN w.state = 'closed' AND w.closed_at < b.hi
+              THEN w.closed_at ELSE b.hi END AS upto_ts
+    FROM work_items w
+    CROSS JOIN bounds b
+   WHERE w.app = %s
+     AND NOT EXISTS (
+       SELECT 1 FROM work_item_milestones m
+        WHERE m.work_item_id = w.id
+          AND m.kind IN ('merged', 'delivered')
+          AND m.at < b.hi
+          AND (m.kind <> 'merged'
+               OR NOT agent_mesh_merged_annulled(w.id, m.at)))
+     AND ((w.state = 'closed'
+           AND coalesce(w.close_reason, '') <> 'delivered'
+           AND w.closed_at >= b.lo AND w.closed_at < b.hi)
+          OR (w.started_at >= b.lo AND w.started_at < b.hi
+              AND (w.state <> 'closed' OR w.closed_at >= b.hi)))
+)
+SELECT c.id, c.type, c.change_size, c.branch, c.state, c.close_reason,
+       c.cohort, c.started_at, c.closed_at,
+       d.notes,
+       ts.turns, ts.usd, ts.cost_rows, ts.void_rows, ts.prompt,
+       ts.output_tokens,
+       mm.blocked AS blocked, mm.heads AS distinct_heads
+  FROM candidates c
+  LEFT JOIN LATERAL (
+    SELECT array_agg(e.note ORDER BY e.created_at DESC, e.id DESC) AS notes
+      FROM work_item_events e
+     WHERE e.work_item_id = c.id
+       AND e.note LIKE 'review-designation:%%'
+       AND e.created_at <= c.upto_ts
+  ) d ON true
+  LEFT JOIN LATERAL (
+    SELECT
+      CASE WHEN c.started_ts IS NULL THEN NULL ELSE count(*) END AS turns,
+      count(*) FILTER (WHERE void_reason IS NULL) AS cost_rows,
+      count(*) FILTER (WHERE void_reason IS NOT NULL) AS void_rows,
+      sum(usd) FILTER (WHERE void_reason IS NULL) AS usd,
+      sum(output_tokens) FILTER (WHERE void_reason IS NULL) AS output_tokens,
+      sum(input_tokens + CASE WHEN harness = 'codex' THEN 0
+                               ELSE cached_input_tokens END)
+        FILTER (WHERE void_reason IS NULL) AS prompt
+      FROM turn_costs tc
+     WHERE tc.work_item_id = c.id
+       AND c.started_ts IS NOT NULL
+       AND tc.recorded_at >= c.started_ts
+       AND tc.recorded_at <= c.upto_ts
+  ) ts ON true
+  LEFT JOIN LATERAL (
+    SELECT count(*) FILTER (WHERE kind = 'verdict'
+                              AND verdict = 'blocked') AS blocked,
+           array_agg(DISTINCT sha) FILTER (WHERE kind = 'frozen'
+                                             AND sha IS NOT NULL
+                                             AND sha <> '') AS heads
+      FROM work_item_milestones m
+     WHERE m.work_item_id = c.id
+       AND m.at <= c.upto_ts
+       AND (c.started_ts IS NULL OR m.at >= c.started_ts)
+  ) mm ON true
+ ORDER BY c.id
+"""
+
+#: M5 — les notes de rouges de la fenêtre, la source extraite par motif (une
+#: note illisible garde des liens nuls, sans faire échouer la lecture), le
+#: reçu du commit et les runs CI de cette tête, toutes dates confondues.
+_REDS_SQL = """
+WITH notes AS (
+  SELECT e.id, e.work_item_id AS lot, e.note,
+         extract(epoch FROM e.created_at) AS at,
+         coalesce(w.branch, '') AS branch,
+         substring(e.note FROM '"source": "([0-9a-f]{40})"') AS source
+    FROM work_item_events e
+    JOIN work_items w ON w.id = e.work_item_id
+   WHERE w.app = %s
+     AND e.note LIKE 'packet-unit-red: %%'
+     AND e.created_at >= to_timestamp(%s)
+     AND e.created_at < to_timestamp(%s)
+)
+SELECT n.id, n.lot, n.note, n.at, n.branch, n.source,
+       coalesce(p.harness, '') AS source_family,
+       ci.runs, ci.failure, ci.success, ci.inconclusive
+  FROM notes n
+  LEFT JOIN provenance_receipts p ON p.subject = 'commit:' || n.source
+  LEFT JOIN LATERAL (
+    SELECT count(DISTINCT (r.repo, r.run_id)) AS runs,
+           count(DISTINCT (r.repo, r.run_id))
+             FILTER (WHERE r.status = 'failure') AS failure,
+           count(DISTINCT (r.repo, r.run_id))
+             FILTER (WHERE r.status = 'success') AS success,
+           count(DISTINCT (r.repo, r.run_id))
+             FILTER (WHERE r.status IN ('cancelled', 'superseded', 'running'))
+             AS inconclusive
+      FROM ci_runs r
+     WHERE n.source IS NOT NULL AND r.head_sha = n.source
+  ) ci ON true
+ ORDER BY n.id
+"""
+
+#: M5 — runs CI de la fenêtre rattachés à un lot du projet, par statut ; les
+#: runs sans lot ne sont pas attribuables à un projet et sortent à part.
+_CI_SQL = """
+SELECT r.status,
+       (r.work_item_id IS NULL) AS without_lot,
+       count(DISTINCT (r.repo, r.run_id)) AS runs,
+       count(DISTINCT r.head_sha) AS heads,
+       count(DISTINCT r.work_item_id) AS lots,
+       coalesce(sum(f.tests), 0) AS failed_tests,
+       coalesce(sum(f.inherited), 0) AS inherited_tests
+  FROM ci_runs r
+  LEFT JOIN work_items w ON w.id = r.work_item_id
+  LEFT JOIN LATERAL (
+    SELECT count(*) AS tests, count(*) FILTER (WHERE t.inherited) AS inherited
+      FROM ci_test_failures t
+     WHERE t.repo = r.repo AND t.run_id = r.run_id
+  ) f ON true
+ WHERE r.first_seen_at >= to_timestamp(%s)
+   AND r.first_seen_at < to_timestamp(%s)
+   AND (w.app = %s OR r.work_item_id IS NULL)
+ GROUP BY 1, 2
+ ORDER BY 2, 1
+"""
+
+#: M5 — coût de revue : tours des agents ayant rendu un verdict sur ce lot.
+_REVIEW_COST_SQL = """
+SELECT c.harness,
+       count(*) FILTER (WHERE c.void_reason IS NULL) AS cost_rows,
+       count(*) FILTER (WHERE c.void_reason IS NOT NULL) AS void_rows,
+       sum(c.usd) FILTER (WHERE c.void_reason IS NULL) AS usd,
+       count(DISTINCT c.work_item_id) AS lots,
+       count(DISTINCT c.agent) AS agents
+  FROM turn_costs c
+  JOIN work_items w ON w.id = c.work_item_id
+ WHERE w.app = %s
+   AND c.recorded_at >= to_timestamp(%s)
+   AND c.recorded_at < to_timestamp(%s)
+   AND EXISTS (SELECT 1 FROM work_item_milestones m
+                WHERE m.work_item_id = c.work_item_id
+                  AND m.kind = 'verdict' AND m.actor = c.agent)
+ GROUP BY c.harness
+ ORDER BY c.harness
 """
 
 
@@ -540,13 +797,21 @@ def read(db, *, project: str = DEFAULT_PROJECT, now: Any = None,
             (_PERIOD_SQL, (start_ts, end_ts, "", "")),
             (_REVIEW_SQL, (project, start_ts, end_ts)),
             (_DESIGNATED_SQL, (start_ts, end_ts, project)),
+            (_VERDICTS_SQL, (project, start_ts, end_ts)),
+            (_OTHERS_SQL, (start_ts, end_ts, project)),
+            (_REDS_SQL, (project, start_ts, end_ts)),
+            (_CI_SQL, (start_ts, end_ts, project)),
+            (_REVIEW_COST_SQL, (project, start_ts, end_ts)),
         ])
-    units, staged, project_period, mesh_period, reviews, designated = results
+    (units, staged, project_period, mesh_period, reviews, designated,
+     verdicts, others, reds, ci, review_cost) = results
     return build(
         project=project, at=at, start=start_ts, end=end_ts,
         units=units, staged=staged,
         period_project=project_period, period_mesh=mesh_period,
         reviews=reviews, designated=designated,
+        verdicts=verdicts, others=others, reds=reds, ci=ci,
+        review_cost=review_cost,
     )
 
 
@@ -844,6 +1109,11 @@ def _activity(rows: Sequence[Mapping[str, Any]] | None
             "billing_account_unknown": int(
                 _int(row.get("billing_account_unknown")) or 0),
             "turn_ids": int(_int(row.get("turn_ids")) or 0),
+            # sans lot : jamais attribué à une unité ; nul sur un projet,
+            # qui ne lit que ses lignes attribuées
+            "without_lot_rows": int(_int(row.get("without_lot_rows")) or 0),
+            "without_lot_usd": (_number(row.get("without_lot_usd"))
+                                if _int(row.get("without_lot_rows")) else None),
         })
     return out
 
@@ -953,6 +1223,364 @@ def _staging_coverage(staged: Sequence[Mapping[str, Any]] | None,
     }
 
 
+# -- M5 : tableaux descriptifs et sensibilité --------------------------------
+
+def _is_carrier(branch: Any) -> bool:
+    return str(branch or "").startswith(("integration/", "packet/"))
+
+
+def _family_order(name: str) -> tuple[int, str]:
+    return (FAMILY_ORDER.index(name) if name in FAMILY_ORDER
+            else len(FAMILY_ORDER), name)
+
+
+def _freeze_notes(notes: Sequence[Any] | None, sha: str) -> list[str]:
+    """Les notes de désignation du gel `sha`, de la plus récente à la plus
+    ancienne ; comparaison par texte exact, aucun préfixe ni gel voisin."""
+    wanted = str(sha or "").strip()
+    if not wanted:
+        return []
+    out = []
+    for note in notes or ():
+        freeze = (_payload(note) or {}).get("freeze")
+        if isinstance(freeze, Mapping) and str(freeze.get("sha") or "") == wanted:
+            out.append(note)
+    return out
+
+
+def _author_families(payload: Mapping[str, Any] | None) -> set[str]:
+    """Les familles prouvées des auteurs d'une marque (vide si incomplète)."""
+    if not isinstance(payload, Mapping):
+        return set()
+    families: set[str] = set()
+    for author in payload.get("authors") or ():
+        if not isinstance(author, Mapping):
+            return set()
+        proved = author.get("families")
+        values = ([str(value).strip() for value in proved
+                   if str(value or "").strip()]
+                  if isinstance(proved, list) else [])
+        single = str(author.get("family") or "").strip()
+        if not values and not single:
+            return set()
+        families.update(values or [single])
+    return families
+
+
+def _risk_of(payloads: Sequence[Mapping[str, Any]]) -> str:
+    """Le risque au gel (trace M2) de la dernière marque du gel, ou unknown.
+
+    Lecteur M2 : `review_designation_pg.risk_trace_of`, importé à l'appel pour
+    ne pas charger la porte avec le rapport."""
+    if not payloads:
+        return "unknown"
+    from .review_designation_pg import risk_trace_of
+    for payload in payloads:
+        if str(payload.get("state") or "") not in ("designated", "carried"):
+            continue
+        trace = risk_trace_of(payload) or {}
+        risk = str(trace.get("risk") or "").strip().lower()
+        return risk if risk in ("light", "sensitive") else "unknown"
+    return "unknown"
+
+
+def _verdict(row: Mapping[str, Any]) -> dict[str, Any]:
+    sha = str(row.get("sha") or "").strip()
+    notes = _freeze_notes(row.get("notes"), sha)
+    payloads = [_payload(note) for note in notes]
+    author, _reason = family_of(notes)
+    designated = next((payload for payload in payloads
+                       if str(payload.get("state") or "") == "designated"),
+                      None)
+    reviewer = str(row.get("reviewer_family") or "").strip() or "unknown"
+    return {
+        "id": _int(row.get("id")),
+        "lot": _int(row.get("lot")),
+        "sha": sha,
+        "actor": str(row.get("actor") or ""),
+        "verdict": str(row.get("verdict") or ""),
+        "carrier": _is_carrier(row.get("branch")),
+        "reviewer_family": reviewer,
+        "author_family": author,
+        "same_family": (reviewer != "unknown"
+                        and reviewer in _author_families(designated)),
+        "risk": _risk_of(payloads),
+    }
+
+
+def _cross_cell(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Une cellule de B croisés : lignes, lots et B distincts séparés."""
+    blocked = [row for row in rows if row["verdict"] == "blocked"]
+    lines = len(rows)
+    return {
+        "verdict_lines": lines,
+        "ok": sum(1 for row in rows if row["verdict"] == "ok"),
+        "blocked": len(blocked),
+        "blocked_distinct": len({(row["lot"], row["sha"], row["actor"])
+                                 for row in blocked}),
+        "blocked_rate": round(len(blocked) / lines, 4) if lines else None,
+        "lots": len({row["lot"] for row in rows}),
+        "lots_blocked": len({row["lot"] for row in blocked}),
+        "same_family_lines": sum(1 for row in rows if row["same_family"]),
+        "small_cell": lines < SMALL_CELL,
+    }
+
+
+def _b_cross(verdicts: Sequence[Mapping[str, Any]] | None) -> dict[str, Any]:
+    """B croisés famille du relecteur × famille des auteurs, puis × risque."""
+    if verdicts is None:
+        return {"cells": None, "by_risk": None, "reviewer_margin": None,
+                "author_margin": None, "total": None, "carriers": None,
+                "unknown": UNKNOWN["author_family"]}
+    rows = [_verdict(row) for row in verdicts]
+    units = [row for row in rows if not row["carrier"]]
+    carriers = [row for row in rows if row["carrier"]]
+
+    def table(key, names):
+        groups: dict[tuple[str, ...], list[Mapping[str, Any]]] = {}
+        for row in units:
+            groups.setdefault(key(row), []).append(row)
+        out = []
+        for parts in sorted(groups, key=lambda parts: tuple(
+                _family_order(part) for part in parts)):
+            cell = dict(zip(names, parts))
+            cell.update(_cross_cell(groups[parts]))
+            out.append(cell)
+        return out
+
+    return {
+        "cells": table(lambda row: (row["reviewer_family"],
+                                    row["author_family"]),
+                       ("reviewer_family", "author_family")),
+        "by_risk": table(lambda row: (row["reviewer_family"],
+                                      row["author_family"], row["risk"]),
+                         ("reviewer_family", "author_family", "risk")),
+        "reviewer_margin": table(lambda row: (row["reviewer_family"],),
+                                 ("reviewer_family",)),
+        "author_margin": table(lambda row: (row["author_family"],),
+                               ("author_family",)),
+        "total": _cross_cell(units),
+        "carriers": _cross_cell(carriers),
+        "author_unknown_lines": sum(1 for row in units
+                                    if row["author_family"] == "unknown"),
+        "reviewer_unknown_lines": sum(1 for row in units
+                                      if row["reviewer_family"] == "unknown"),
+        "risk_unknown_lines": sum(1 for row in units
+                                  if row["risk"] == "unknown"),
+        "unknown": None,
+    }
+
+
+def _strata(units: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Strates (type, taille) des unités à ratio connu, famille par famille."""
+    groups: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for unit in units:
+        groups.setdefault((unit["type"] or "unknown", unit["size"] or "unknown"),
+                          []).append(unit)
+    out = []
+    for (kind, size), members in sorted(groups.items(), key=lambda item: (
+            TYPE_ORDER.index(item[0][0]) if item[0][0] in TYPE_ORDER
+            else len(TYPE_ORDER),
+            SIZE_ORDER.index(item[0][1]) if item[0][1] in SIZE_ORDER
+            else len(SIZE_ORDER), item[0])):
+        known = [unit for unit in members if unit["ratio"] is not None]
+        families: dict[str, list[Mapping[str, Any]]] = {}
+        for unit in known:
+            families.setdefault(unit["family"], []).append(unit)
+        rows = []
+        for name in sorted(families, key=_family_order):
+            ratios = [unit["ratio"] for unit in families[name]]
+            rows.append({
+                "family": name,
+                "lots": len(ratios),
+                "median_ratio": _percentile(ratios, 0.5),
+                "p80_ratio": _percentile(ratios, 0.8),
+                "mean_usd": _mean(unit["usd"] for unit in families[name])[0],
+                "lots_with_usd": _mean(unit["usd"]
+                                       for unit in families[name])[1],
+                "lots_blocked": sum(1 for unit in families[name]
+                                    if int(unit["blocked"]) > 0),
+                "small_cell": len(ratios) < SMALL_CELL,
+            })
+        named = [row for row in rows if row["family"] not in ("mixed", "unknown")]
+        out.append({
+            "type": kind, "size": size,
+            "units": len(members),
+            "ratios_known": len(known),
+            "ratio_unknown": len(members) - len(known),
+            "families": rows,
+            "named_families": len(named),
+            "comparable": len(named) >= 2,
+        })
+    return out
+
+
+_RATIO_KEYS = ("ratios_known", "median_ratio", "p80_ratio")
+
+
+def _other_rows(units: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    rows = _family_rows(units)
+    for row in rows:
+        for key in _RATIO_KEYS:
+            row.pop(key, None)
+        row["unknown"].pop("ratio", None)
+        row["small_cell"] = row["lots"] < SMALL_CELL
+    return rows
+
+
+def _other_cohorts(others: Sequence[Mapping[str, Any]] | None
+                   ) -> dict[str, Any]:
+    """Cohortes abandonnée et ouverte, publiées à part des cohortes M1 ;
+    le ratio n'y a pas de sens (pas d'intégration) et n'est pas publié."""
+    if others is None:
+        return {"abandoned": None, "open": None, "carriers": None,
+                "unknown": UNKNOWN["other_cohorts"]}
+    out: dict[str, Any] = {"unknown": None}
+    computed = []
+    for row in others:
+        unit = _unit(row)
+        unit["cohort"] = str(row.get("cohort") or "")
+        unit["close_reason"] = str(row.get("close_reason") or "")
+        computed.append(unit)
+    out["carriers"] = sum(1 for unit in computed if _is_carrier(unit["branch"]))
+    for name in ("abandoned", "open"):
+        members = [unit for unit in computed if unit["cohort"] == name
+                   and not _is_carrier(unit["branch"])]
+        summary = _cohort(members)
+        for key in _RATIO_KEYS:
+            summary.pop(key, None)
+        out[name] = {
+            "summary": summary,
+            "families": _other_rows(members),
+            "close_reasons": dict(sorted(Counter(
+                unit["close_reason"] or "none" for unit in members).items())),
+            "family_unknown": sum(1 for unit in members
+                                  if unit["family"] == "unknown"),
+        }
+    return out
+
+
+def _reds(reds: Sequence[Mapping[str, Any]] | None) -> dict[str, Any]:
+    """Les rouges de paquet reliés à leurs sources et aux runs de leur tête.
+
+    Lecteur : `packet_unit_red.read_note`. Une note illisible est comptée à
+    part ; les déduplications restent publiées côte à côte."""
+    if reds is None:
+        return {"notes": None, "unknown": UNKNOWN["reds"]}
+    from .packet_unit_red import read_note
+    unreadable = 0
+    memories: set[tuple[Any, ...]] = set()
+    pairs: set[tuple[str, str]] = set()
+    sources: dict[str, dict[str, Any]] = {}
+    for row in reds:
+        value = read_note(row.get("note"))
+        if value is None:
+            unreadable += 1
+            continue
+        source = value["source"]
+        memories.add((_int(row.get("lot")), source, value["target"],
+                      value.get("base")))
+        pairs.update((source, test) for test in value["tests"])
+        linked = str(row.get("source") or "") == source
+        entry = sources.setdefault(source, {
+            "source": source,
+            "family": "unknown",
+            "lots": set(), "tests": set(), "notes": 0,
+            "carrier": False,
+            "ci": None,
+        })
+        entry["notes"] += 1
+        entry["lots"].add(_int(row.get("lot")))
+        entry["tests"].update(value["tests"])
+        entry["carrier"] = entry["carrier"] or _is_carrier(row.get("branch"))
+        if linked:
+            family = str(row.get("source_family") or "").strip()
+            if family:
+                entry["family"] = family
+            if row.get("runs") is not None:
+                entry["ci"] = {
+                    "runs": int(_int(row.get("runs")) or 0),
+                    "failure": int(_int(row.get("failure")) or 0),
+                    "success": int(_int(row.get("success")) or 0),
+                    "inconclusive": int(_int(row.get("inconclusive")) or 0),
+                }
+    listed = []
+    for source in sorted(sources):
+        entry = sources[source]
+        listed.append(dict(entry, lots=sorted(lot for lot in entry["lots"]
+                                              if lot is not None),
+                           tests=len(entry["tests"])))
+    by_family: dict[str, dict[str, int]] = {}
+    for entry in listed:
+        cell = by_family.setdefault(entry["family"],
+                                    {"sources": 0, "tests": 0, "notes": 0})
+        cell["sources"] += 1
+        cell["tests"] += entry["tests"]
+        cell["notes"] += entry["notes"]
+    return {
+        "notes": len(reds),
+        "unreadable": unreadable,
+        "memories": len(memories),
+        "sources": len(sources),
+        "source_tests": len(pairs),
+        "by_source": listed,
+        "by_source_family": [dict(family=name, **by_family[name])
+                             for name in sorted(by_family, key=_family_order)],
+        "source_family_unknown": sum(1 for entry in listed
+                                     if entry["family"] == "unknown"),
+        "lower_bound": True,
+        "rate_by_family": None,
+        "unknown": None,
+    }
+
+
+def _ci(rows: Sequence[Mapping[str, Any]] | None) -> dict[str, Any]:
+    """Runs CI par statut : échecs, succès et non-concluants séparés."""
+    if rows is None:
+        return {"project": None, "without_lot": None, "unknown": UNKNOWN["ci"]}
+    out: dict[str, Any] = {"unknown": None}
+    for scope, flag in (("project", False), ("without_lot", True)):
+        by_status = {}
+        for row in rows:
+            if bool(row.get("without_lot")) != flag:
+                continue
+            by_status[str(row.get("status") or "")] = {
+                "runs": int(_int(row.get("runs")) or 0),
+                "heads": int(_int(row.get("heads")) or 0),
+                "lots": int(_int(row.get("lots")) or 0),
+                "failed_tests": int(_int(row.get("failed_tests")) or 0),
+                "inherited_tests": int(_int(row.get("inherited_tests")) or 0),
+            }
+        runs = {status: value["runs"] for status, value in by_status.items()}
+        out[scope] = {
+            "by_status": dict(sorted(by_status.items())),
+            "runs": sum(runs.values()),
+            "success": runs.get("success", 0),
+            "failure": runs.get("failure", 0),
+            "inconclusive": sum(runs.get(status, 0)
+                                for status in CI_INCONCLUSIVE),
+        }
+    return out
+
+
+def _review_cost(rows: Sequence[Mapping[str, Any]] | None
+                 ) -> list[dict[str, Any]] | None:
+    if rows is None:
+        return None
+    out = []
+    for row in rows:
+        cost_rows = int(_int(row.get("cost_rows")) or 0)
+        out.append({
+            "harness": str(row.get("harness") or ""),
+            "cost_rows": cost_rows,
+            "void_rows": int(_int(row.get("void_rows")) or 0),
+            "usd": _number(row.get("usd")) if cost_rows else None,
+            "lots": int(_int(row.get("lots")) or 0),
+            "agents": int(_int(row.get("agents")) or 0),
+        })
+    return out
+
+
 def build(*, project: str = DEFAULT_PROJECT, at: float,
           start: float, end: float,
           units: Sequence[Mapping[str, Any]] | None,
@@ -960,7 +1588,13 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
           period_project: Sequence[Mapping[str, Any]] | None,
           period_mesh: Sequence[Mapping[str, Any]] | None,
           reviews: Sequence[Mapping[str, Any]] | None,
-          designated: Sequence[Mapping[str, Any]] | None) -> dict[str, Any]:
+          designated: Sequence[Mapping[str, Any]] | None,
+          verdicts: Sequence[Mapping[str, Any]] | None = None,
+          others: Sequence[Mapping[str, Any]] | None = None,
+          reds: Sequence[Mapping[str, Any]] | None = None,
+          ci: Sequence[Mapping[str, Any]] | None = None,
+          review_cost: Sequence[Mapping[str, Any]] | None = None,
+          ) -> dict[str, Any]:
     """Assemble le rapport depuis les lignes lues (aucune base ici).
 
     Chaque source `None` signifie « non lue » : les mesures qui en dépendent
@@ -1098,6 +1732,30 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
         "activity": activity,
     }
 
+    # M5 : tableaux descriptifs et de sensibilité, à côté des tableaux M1.
+    # Chaque strate porte le coût de sa cohorte : l'intégration s'arrête à la
+    # fusion, le staging à l'attestation ; les deux phases ne se comparent pas.
+    sensitivity = {
+        "b_cross": _b_cross(verdicts),
+        "strata": {"integration": (_strata(integration_cost)
+                                   if units is not None else None),
+                   "staging": (_strata(staging_cost)
+                               if units is not None else None)},
+        "other_cohorts": _other_cohorts(others),
+        "reds": _reds(reds),
+        "ci": _ci(ci),
+        "review_cost": _review_cost(review_cost),
+        "review_cost_unknown": (UNKNOWN["review_cost"]
+                                if review_cost is None else None),
+        "without_lot": (None if period_mesh is None else [
+            {"harness": row["harness"], "rows": row["without_lot_rows"],
+             "usd": row["without_lot_usd"]}
+            for row in _activity(period_mesh) or ()]),
+        "small_cell": SMALL_CELL,
+        "causal": False,
+        "recommendation": None,
+    }
+
     report = {
         "schema": SCHEMA,
         "source": SOURCE,
@@ -1129,6 +1787,7 @@ def build(*, project: str = DEFAULT_PROJECT, at: float,
         "review": review,
         "coverage": coverage,
         "tables": tables,
+        "sensitivity": sensitivity,
     }
     report["unknown_count"] = sum(
         len(row.get("unknown") or {}) for row in families_staging
@@ -1168,6 +1827,67 @@ def _family_table(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     if not rows:
         out.append("  (aucune unité dans cette cohorte)")
     return out
+
+
+def _small(row: Mapping[str, Any]) -> str:
+    return " *" if row.get("small_cell") else ""
+
+
+def _sensitivity_text(sensitivity: Mapping[str, Any]) -> list[str]:
+    """Les tableaux M5 : B croisés, cohortes à part, rouges et CI."""
+    lines = ["", "B croisés : famille du relecteur × famille des auteurs "
+                 "(même gel ; * = moins de %s lignes)"
+             % _fmt(sensitivity.get("small_cell"))]
+    cross = sensitivity.get("b_cross") or {}
+    if cross.get("cells") is None:
+        lines.append("  inconnu : %s" % cross.get("unknown"))
+    else:
+        lines.append("  %-9s %-9s %7s %5s %9s %8s %7s"
+                     % ("RELECT.", "AUTEURS", "LIGNES", "B", "B DIST.",
+                        "B/LIGNES", "LOTS B"))
+        for row in cross.get("cells") or ():
+            lines.append("  %-9s %-9s %7d %5d %9d %8s %7d%s"
+                         % (row["reviewer_family"], row["author_family"],
+                            row["verdict_lines"], row["blocked"],
+                            row["blocked_distinct"],
+                            _fmt(row["blocked_rate"]), row["lots_blocked"],
+                            _small(row)))
+        total = cross.get("total") or {}
+        lines.append("  total : %s ligne(s), %s B ; auteurs inconnus %s, "
+                     "relecteurs inconnus %s, risque inconnu %s ; porteurs "
+                     "à part : %s ligne(s)"
+                     % (_fmt(total.get("verdict_lines")),
+                        _fmt(total.get("blocked")),
+                        _fmt(cross.get("author_unknown_lines")),
+                        _fmt(cross.get("reviewer_unknown_lines")),
+                        _fmt(cross.get("risk_unknown_lines")),
+                        _fmt((cross.get("carriers") or {}).get(
+                            "verdict_lines"))))
+    others = sensitivity.get("other_cohorts") or {}
+    lines += ["", "Cohortes distinctes (sans intégration effective)"]
+    for name, label in (("abandoned", "abandonnées"), ("open", "ouvertes")):
+        cohort = others.get(name)
+        if cohort is None:
+            lines.append("  %s : inconnu" % label)
+            continue
+        summary = cohort.get("summary") or {}
+        lines.append("  %-12s %s unité(s), %s avec USD, %s avec B, "
+                     "famille inconnue %s"
+                     % (label, _fmt(summary.get("units")),
+                        _fmt(summary.get("lots_with_usd")),
+                        _fmt(summary.get("lots_blocked")),
+                        _fmt(cohort.get("family_unknown"))))
+    reds = sensitivity.get("reds") or {}
+    ci = (sensitivity.get("ci") or {}).get("project") or {}
+    lines += ["", "Rouges de paquet (borne basse, sans adjudication)"]
+    lines.append("  %s note(s), %s mémoire(s), %s source(s), %s couple(s) "
+                 "source × test ; runs CI du projet : %s échec(s), %s "
+                 "non concluant(s), %s succès"
+                 % (_fmt(reds.get("notes")), _fmt(reds.get("memories")),
+                    _fmt(reds.get("sources")), _fmt(reds.get("source_tests")),
+                    _fmt(ci.get("failure")), _fmt(ci.get("inconclusive")),
+                    _fmt(ci.get("success"))))
+    return lines
 
 
 def format_text(report: Mapping[str, Any]) -> str:
@@ -1225,6 +1945,7 @@ def format_text(report: Mapping[str, Any]) -> str:
     lines.append("  %-28s %s événement(s), %s référence(s), %s rapprochée(s)"
                  % ("attestations staging", _fmt(staging.get("events")),
                     _fmt(staging.get("lots")), _fmt(staging.get("matched"))))
+    lines += _sensitivity_text(report.get("sensitivity") or {})
     lines += [
         "",
         "B justes : inconnu ; classe et effort exécuté : inconnus ; "
@@ -1241,7 +1962,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ameesh model-report",
         description="Rapport en lecture seule d'évaluation des modèles "
-                    "(étude #6650, unité M1) : fenêtre UTC fixe, cohortes "
+                    "(étude #6650, unités M1 et M5) : fenêtre UTC fixe, cohortes "
                     "séparées, familles historiques, inconnues déclarées.",
     )
     parser.add_argument("--json", action="store_true",
