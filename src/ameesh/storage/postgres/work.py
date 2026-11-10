@@ -3598,13 +3598,29 @@ class WorkItems(interface.WorkItems):
         lot), et quand (L118d, 0372, horloge de la base). Une pointe inchangée
         est relevée de nouveau si son instant précède la dernière fusion
         partielle vue (#346 r2) : elle est encore là après cette fusion.
-        Conditionné à la branche lue : rien si elle a changé."""
+        Conditionné à la branche lue : rien si elle a changé. #6626 : la
+        tête entre aussi, une fois, à l'historique des têtes du lot (un
+        enfant parti d'une tête intermédiaire reste vu empilé)."""
         rows = self.db.query(
             "UPDATE work_items SET branch_head = %s, branch_head_at = clock_timestamp()"
             " WHERE id = %s AND branch = %s AND (branch_head IS DISTINCT FROM %s"
             "       OR branch_head_at IS NULL OR branch_head_at <= partial_seen_at)"
             " RETURNING id", (head, int(item_id), branch, head))
+        if head:
+            self.db.execute(
+                "INSERT INTO work_item_branch_heads (work_item_id, branch, sha)"
+                " SELECT id, branch, %s FROM work_items WHERE id = %s AND branch = %s"
+                " ON CONFLICT DO NOTHING", (head, int(item_id), branch))
         return bool(rows)
+
+    def branch_heads(self, item_ids) -> list[dict]:
+        ids = sorted({int(value) for value in item_ids or ()})
+        if not ids:
+            return []
+        return self.db.query(
+            "SELECT work_item_id, branch, sha FROM work_item_branch_heads"
+            " WHERE work_item_id = ANY(%s) ORDER BY work_item_id, observed_at",
+            (ids,))
 
     def set_partial_seen(self, item_id, sha) -> bool:
         """#346 r2 : retient la dernière fusion partielle du lot et l'instant

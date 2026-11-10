@@ -2485,7 +2485,13 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
         """L118 : retient le dernier commit de la branche vu en avance sur sa
-        cible, si la branche du lot est toujours `branch` (et quand, L118d)."""
+        cible, si la branche du lot est toujours `branch` (et quand, L118d) ;
+        #6626 : l'inscrit aussi à l'historique des têtes du lot."""
+
+    @abc.abstractmethod
+    def branch_heads(self, item_ids) -> list[dict]:
+        """#6626 : l'historique des têtes relevées (`work_item_id`, `branch`,
+        `sha`) des lots `item_ids`, toutes branches confondues."""
 
     @abc.abstractmethod
     def set_partial_seen(self, item_id: int, sha: str) -> bool:
