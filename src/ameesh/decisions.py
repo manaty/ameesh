@@ -980,7 +980,8 @@ def _option_label(view: dict, key: str | None) -> str | None:
 
 def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
     """L'empreinte que signe une réponse (sha256 hex) : la demande (numéro,
-    demandeur, lot, question, options, heure), la réponse exacte, son auteur."""
+    demandeur, lot, question, options, heure), le plan de réparation (clé et
+    empreinte de contenu) quand il y en a un, la réponse exacte, son auteur."""
     from . import authority
     document = {
         "v": 1, "kind": "ameesh-decision-answer", "decision": int(view["id"]),
@@ -994,6 +995,13 @@ def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
     if view.get("supersedes") is not None:
         document["request"]["supersedes"] = view["supersedes"]
         document["request"]["supersedes_option"] = view.get("supersedes_option")
+    # #6638 : a repair plan's identity and content digest are part of what the
+    # owner signs, so replacing the plan metadata breaks the signature. Absent
+    # for historical requests: their signed document is unchanged.
+    plan = view.get("repair_plan")
+    if isinstance(plan, dict) and plan.get("key") and plan.get("digest"):
+        document["request"]["repair_plan"] = {"key": plan["key"],
+                                              "digest": plan["digest"]}
     return authority.hash_artifact(json.dumps(document, sort_keys=True, separators=(",", ":"),
                                               ensure_ascii=False))
 

@@ -10,6 +10,7 @@ leave the plan unapproved. Deadline and reminder are the queue's existing
 from __future__ import annotations
 
 import dataclasses
+import json
 import threading
 import time
 import unittest
@@ -232,6 +233,32 @@ class RepairDecisionTest(PgTestCase):
         outcome = plan_decision(self.db, plan, now=self.now + 2)
         self.assertEqual((outcome["state"], outcome["approved"]), ("pending", False))
         self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
+
+    def test_replacing_the_signed_plan_metadata_breaks_the_signature(self):
+        # B1 (#6638): the signed document binds the plan key and digest too, so
+        # swapping the stored plan for another content cannot keep the proof.
+        from .test_l124_decisions import SignatureTest
+        key = SignatureTest.owner_key(self)
+        plan = self.plan(needs_signature=True, question="Autoriser le plan signé ?")
+        view = self.file(plan)["decision"]
+        decisions.answer(self.cfg, self.db, view["id"], "approve",
+                         human=ALICE, channel="cli", key_path=key, now=self.now + 1)
+        approved = plan_decision(self.db, plan, now=self.now + 2)
+        self.assertEqual((approved["state"], approved["approved"], approved["reason"]),
+                         ("approved", True, "signed_owner_option"))
+        changed = self.plan(needs_signature=True, question="Autoriser le plan signé ?",
+                            why="autre périmètre")
+        row = storage.of(self.db).decisions.get(view["id"])
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        payload = dict(payload)
+        payload["decision"]["repair_plan"] = changed.payload()
+        self.db.execute("UPDATE agent_mailbox SET payload = %s::jsonb WHERE id = %s",
+                        (json.dumps(payload, ensure_ascii=False), view["id"]))
+        outcome = plan_decision(self.db, changed, now=self.now + 3)
+        self.assertEqual((outcome["state"], outcome["approved"], outcome["reason"]),
+                         ("not_approved", False, "invalid_signature"))
 
     def test_a_superseded_authority_does_not_approve(self):
         from .test_l124_decisions import SignatureTest
