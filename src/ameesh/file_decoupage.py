@@ -49,6 +49,9 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   `ameesh heavy` qu'il tient sur l'hôte de la passe (les créneaux sont des
   verrous locaux, un autre hôte n'est pas lu ; le motif nomme le créneau,
   jamais la commande, dont l'argv peut porter un secret).
+  #6734 : un réveil programmé dû (ou dû dans `WAKE_LEAD_S`) sur un lot
+  ouvert de l'agent est aussi un travail engagé : il n'endort pas l'agent et
+  lève le dormeur, l'exécuteur délivrant alors le rendez-vous à l'heure.
 * **#4623, la dernière note fait foi** : une note `roadmap: rouverte <projet>`
   postérieure à la dernière `roadmap: épuisée <projet>` désarme le sommeil et
   lève les dormeurs du projet dans la même passe (le geste est journalisé sur
@@ -117,6 +120,12 @@ MAIL_HISTORY_LIMIT = 200
 #: au contrat médié (contrairement à `mail.unread`), donc le repli garde la
 #: même lecture sur un exécuteur médié.
 MAIL_UNREAD_LIMIT = 200
+#: #6734 : avance de la levée sur un réveil programmé (`ameesh work wake`,
+#: `--wake-at`) : le dormeur est levé un peu avant l'échéance, pour que
+#: l'exécuteur la délivre à l'heure (sa relecture des réveils est de 10 s,
+#: la passe du notifieur de l'ordre de la minute). La même avance vaut pour
+#: le sommeil, sinon l'agent levé serait rendormi avant son rendez-vous.
+WAKE_LEAD_S = 120.0
 #: état du notifieur : `{projet: début de la condition}`
 STATE_KEY = "queue_fill"
 
@@ -683,7 +692,7 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
     return pending, keep, None
 
 
-def owed_work(db, names, lots, *, cfg=None) -> tuple:
+def owed_work(db, names, lots, *, cfg=None, now: float | None = None) -> tuple:
     """#6575 : le travail engagé que chacun de `names` doit encore.
 
     Rend `({nom: motif}, erreur)`, un motif par agent (le premier trouvé) :
@@ -696,6 +705,12 @@ def owed_work(db, names, lots, *, cfg=None) -> tuple:
       est encore ouvert. Le vert du paquet est à la forge, pas en base : tant
       que le porteur n'a pas fusionné, son CI peut réclamer l'auteur (constat
       #6575 : codex3 endormi alors que le paquet 513 attendait son regel) ;
+    * `scheduled wake due on #N (HH:MM UTC)` (#6734) : un lot ouvert assigné
+      à l'agent porte un réveil programmé échu ou dû dans `WAKE_LEAD_S`
+      (`wake_ts` du relevé). Le sommeil est une pause d'opérateur : sans ce
+      motif, l'exécuteur ne délivrait le réveil qu'à la levée suivante,
+      étrangère au rendez-vous (dev3 le 10/11 : 12:45 livré 13:59, 14:45
+      livré 17:06) ;
     * `heavy job running (slot N)` : l'agent tient un créneau `ameesh heavy`
       sur l'hôte de la passe (`cfg` requis ; un autre hôte n'est pas lisible).
       Le numéro de créneau suffit et ne recopie jamais la commande : son argv
@@ -716,6 +731,16 @@ def owed_work(db, names, lots, *, cfg=None) -> tuple:
             name = wanted.get(str(row.get("name") or "").strip().lower())
             if name and name not in out:
                 out[name] = "fix owed on #%s" % row.get("lot")
+        horizon = (time.time() if now is None else float(now)) + WAKE_LEAD_S
+        due = sorted((float(lot["wake_ts"]), int(lot["id"]), lot.get("assignee"))
+                     for lot in lots or ()
+                     if (lot or {}).get("wake_ts") is not None
+                     and float(lot["wake_ts"]) <= horizon)
+        for wake_ts, lot_id, assignee in due:
+            name = wanted.get(str(assignee or "").strip().lower())
+            if name and name not in out:
+                out[name] = "scheduled wake due on #%d (%s UTC)" % (
+                    lot_id, time.strftime("%H:%M", time.gmtime(wake_ts)))
         mine = {}
         for lot in lots or ():
             name = wanted.get(str((lot or {}).get("assignee") or "").strip().lower())
@@ -903,7 +928,7 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
         for name in item.idle:
             out.append({"agent": name, "slept": False, "why": why})
         return out
-    owed, owed_error = owed_work(db, item.idle, lots, cfg=cfg)
+    owed, owed_error = owed_work(db, item.idle, lots, cfg=cfg, now=now)
     if owed_error:
         why = "owed work unreadable: %s" % owed_error
         _journal_exemption(db, split_id, "*", why, since_ts=since_ts)
@@ -1151,15 +1176,15 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
     oscillerait entre sommeil et levée à chaque passe.
 
     #6575 : le travail engagé dû (`owed_work` : correction, paquet ouvert,
-    commande heavy) lève aussi le dormeur ; une lecture en échec ne lève
-    personne sur ce motif.
+    commande heavy ; #6734 : réveil programmé dû) lève aussi le dormeur ; une
+    lecture en échec ne lève personne sur ce motif.
     """
     from . import agent_pause
     woken: dict = {}
     sleepers = [str(row.get("name") or "").strip() for row in listing
                 if row.get("operator_paused")
                 and is_sleep_reason(str(row.get("operator_pause_reason") or ""))]
-    owed = owed_work(db, sleepers, lots, cfg=cfg)[0] if sleepers else {}
+    owed = owed_work(db, sleepers, lots, cfg=cfg, now=now)[0] if sleepers else {}
     for row in listing:
         name = str(row.get("name") or "").strip()
         reason = str(row.get("operator_pause_reason") or "")
