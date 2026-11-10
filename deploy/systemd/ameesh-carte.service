@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# ameesh : déclenche la mesure quotidienne de la carte d'impact (#6157).
-# Service UTILISATEUR, sur UN hôte du mesh muni d'un `gh` authentifié (droit
-# `actions: write` sur le dépôt) : un `workflow_dispatch` de carte.yml sur
-# main avec `planifie=true`. Le workflow garde la décision (job `fenetre`,
-# scripts/carte-fenetre.py) : hors fenêtre, carte fraîche, autre mesure ou
-# paquet en cours → mesure sautée ; un second hôte qui le lancerait aussi ne
-# doublerait donc pas la mesure. Le dépôt vient de la configuration de l'hôte
-# (`AMEESH_CARTE_REPO`), sans valeur en dur.
+# ameesh : déclenche la mesure quotidienne de la carte d'impact (#6157, #6777).
+# Service UTILISATEUR de la minuterie de rôle `ameesh-carte` : posé sur chaque
+# hôte candidat du rôle élu (`mesh-design`), il n'agit que sur l'hôte qui
+# détient le bail vivant (`ameesh role run`). Le dispatch part à 01:00Z, dans
+# la fenêtre de mesure [00:00, 07:00)Z ; le cron GitHub de carte.yml, démarré
+# avec six à huit heures de retard, ne reste qu'un filet de secours.
 #
-# Install:
-#   install -m 0644 deploy/systemd/ameesh-carte.service \
-#                      deploy/systemd/ameesh-carte.timer ~/.config/systemd/user/
-#   echo 'AMEESH_CARTE_REPO=<propriétaire>/<dépôt>' >> ~/.config/ameesh/env
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now ameesh-carte.timer
-#   journalctl --user -u ameesh-carte -f
+# `ameesh carte dispatch` envoie `workflow_dispatch` (`planifie=true`) aux
+# dépôts de `github.projects` qui portent `carte.yml`. Le workflow garde la
+# décision (job `fenetre`, scripts/carte-fenetre.py) : carte fraîche, paquet en
+# cours ou autre mesure le font sauter ; une carte de plus de 48 h l'emporte
+# sur la fenêtre.
+#
+# Install (voie normale, remplace une copie manuelle sans la doubler) :
+#   ameesh role timers --install
+# Contrôle : ameesh role timers --check
 [Unit]
-Description=ameesh daily impact map measurement dispatch (#6157)
+Description=ameesh — impact-map measurement dispatch in its window (#6777)
 After=network-online.target
 Wants=network-online.target
 
@@ -25,6 +25,9 @@ Wants=network-online.target
 Type=oneshot
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=%h/.config/ameesh/env
-ExecStart=/bin/sh -c 'exec gh workflow run carte.yml --repo "$AMEESH_CARTE_REPO" --ref main -f planifie=true'
-TimeoutStartSec=2min
+# `GH_TOKEN` vit dans notify.env sur les hôtes sans session `gh` ; une minuterie
+# n'est pas un shell de connexion.
+EnvironmentFile=-%h/.config/ameesh/notify.env
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run mesh-design -- %h/.local/share/ameesh/venv/bin/ameesh carte dispatch
+TimeoutStartSec=5min
 NoNewPrivileges=yes

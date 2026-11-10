@@ -82,12 +82,16 @@ name: carte
 # #6157 (07/11/2026) — GitHub démarre ce cron avec six à huit heures de retard,
 # chaque jour (05/11 11:25Z, 06/11 11:24Z, 07/11 10:37Z, run 42364733479 : 11
 # des 12 runners pendant que la ci-full du paquet h-20261107-13 attendait).
-# La mesure planifiée part donc d'une minuterie d'hôte
-# (deploy/systemd/ameesh-carte.timer : dispatch `planifie=true` à 03:30Z) ; le
+# La mesure planifiée part donc d'une minuterie de rôle du mesh
+# (`ameesh-carte.timer`, posée par `ameesh role timers` : `ameesh carte
+# dispatch`, `planifie=true`, à 01:00Z depuis l'hôte qui détient le bail) ; le
 # cron reste un filet de secours. Les deux passent par le job `fenetre`
 # (scripts/carte-fenetre.py) : hors de [00:00, 07:00)Z, carte de main de moins
 # de 12 h, autre mesure en cours ou paquet en file → mesure sautée, job vert,
-# raison en annotation (une mesure sautée n'est pas un échec).
+# raison en annotation (une mesure sautée n'est pas un échec). #6777 : une
+# carte de plus de 48 h (le seuil de `map_stale`) fait mesurer même hors
+# fenêtre, au premier créneau sans paquet en cours : la fraîcheur l'emporte sur
+# l'heure, sinon un cron toujours démarré en retard ne mesurerait plus jamais.
 on:
   schedule:
     - cron: "30 3 * * *"
@@ -102,7 +106,7 @@ on:
   workflow_dispatch:
     inputs:
       planifie:
-        description: "mesure planifiée (minuterie d'hôte) : garde de fenêtre #6157"
+        description: "mesure planifiée (minuterie de rôle `ameesh-carte`) : garde de fenêtre #6157/#6777"
         type: boolean
         default: false
 
@@ -154,10 +158,11 @@ env:
 # repository is public: its code would run on a shared, persistent machine);
 # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
 jobs:
-  # #6157 — la mesure planifiée (cron en retard, minuterie d'hôte) n'est due
-  # que dans sa fenêtre et sans paquet en file ; un dispatch manuel et une PR
-  # mesurent toujours. Runner hébergé : le garde ne prend jamais un runner du
-  # pool. Un garde en panne laisse mesurer (non concluant, canon §3).
+  # #6157/#6777 — la mesure planifiée (cron en retard, minuterie de rôle) n'est
+  # due que dans sa fenêtre et sans paquet en file, sauf carte périmée (> 48 h :
+  # la mesure de rattrapage l'emporte) ; un dispatch manuel et une PR mesurent
+  # toujours. Runner hébergé : le garde ne prend jamais un runner du pool. Un
+  # garde en panne laisse mesurer (non concluant, canon §3).
   fenetre:
     name: fenêtre de mesure
     if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-')
