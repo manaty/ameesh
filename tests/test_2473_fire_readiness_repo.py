@@ -20,6 +20,9 @@ branche par un `ls-remote` + `fetch` frais, sans aucun geste manuel.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import dataclasses
 import os
 import shutil
@@ -105,6 +108,65 @@ class RepoChoiceTest(_RepoCase):
         with mock.patch("ameesh.migrations.origin_repo",
                         return_value="manaty/ameesh"):
             self.assertFalse(fire._same_repository(self.repo, "manaty/nexlink"))
+
+    def test_shared_review_checkout_uses_project_when_registry_path_is_remote(self):
+        row = {"id": 42, "app": "nexlink", "assignee": "orchestrateur",
+               "issue_ref": "manaty/nexlink#1"}
+        with mock.patch("ameesh.registry.get", return_value={"cwd": self.tmp + "/gone"}), \
+                mock.patch("ameesh.migrations.origin_repo", return_value="manaty/nexlink"):
+            self.assertEqual(fire.review_checkout(self.config(), None, row), self.repo)
+
+    def test_verified_caller_checkout_when_declared_path_is_absent_on_this_host(self):
+        row = {"id": 42, "app": "nexlink", "assignee": "orchestrateur",
+               "issue_ref": "manaty/nexlink#1"}
+        cfg = self.config(repo=self.tmp + "/remote-host-only")
+        with mock.patch("ameesh.registry.get", return_value={"cwd": self.tmp}), \
+                mock.patch.object(os, "getcwd", return_value=self.repo), \
+                mock.patch("ameesh.migrations.origin_repo", return_value="manaty/nexlink"):
+            self.assertEqual(fire.review_checkout(cfg, None, row, caller=True), self.repo)
+            self.assertIsNone(fire.review_checkout(cfg, None, row, repo=self.tmp))
+            with mock.patch("ameesh.migrations.origin_repo", return_value="other/repo"):
+                self.assertIsNone(fire.review_checkout(cfg, None, row, caller=True))
+
+    def test_review_gate_without_checkout_refuses_before_classifying(self):
+        with mock.patch.object(fire.lot_class, "of_lot") as classify:
+            ok, why, _ = fire.ready_verdicts(
+                self.config(), None, {"id": 42, "branch": BRANCH}, [], repo=None,
+                project=None, target=TARGET)
+        self.assertFalse(ok)
+        self.assertIn("no repository", why)
+        classify.assert_not_called()
+
+    def test_cli_passes_the_verified_caller_checkout_to_both_fire_steps(self):
+        row = {"id": 42, "app": "nexlink", "assignee": "orchestrateur",
+               "issue_ref": "manaty/nexlink#1", "branch": BRANCH}
+        args = argparse.Namespace(id=42, sha=self.head, withdraw=False, repo=None,
+                                  exception="", reason="", note="", actor="", json=False)
+        with mock.patch("ameesh.registry.get", return_value={"cwd": self.tmp}), \
+                mock.patch.object(os, "getcwd", return_value=self.repo), \
+                mock.patch("ameesh.migrations.origin_repo", return_value="manaty/nexlink"), \
+                mock.patch.object(work, "get", return_value=row), \
+                mock.patch.object(work, "corrector", return_value="pilot"), \
+                mock.patch.object(fire, "give", return_value={"sha": self.head}) as give, \
+                mock.patch.object(fire, "run_pass", return_value=[]) as run_pass, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = fire.run(self.config(repo=self.tmp + "/missing"), None, args)
+        self.assertEqual(code, 0)
+        self.assertEqual(give.call_args.kwargs["repo"], self.repo)
+        self.assertEqual(run_pass.call_args.kwargs["repo"], self.repo)
+
+    def test_no_checkout_refuses_vehicle_fire_before_a_milestone(self):
+        row = {"id": 42, "app": "nexlink", "assignee": "orchestrateur",
+               "state": "qa", "issue_ref": "manaty/nexlink#1", "branch": BRANCH}
+        marks = [{"id": 1, "kind": "frozen", "sha": self.head}]
+        with mock.patch.object(work, "get", return_value=row), \
+                mock.patch.object(work, "milestones", return_value=marks), \
+                mock.patch("ameesh.registry.get", return_value={"cwd": self.tmp}), \
+                mock.patch.object(work, "milestone") as milestone:
+            with self.assertRaisesRegex(fire.FireError, "no repository"):
+                fire._give_locked(None, 42, sha=self.head, actor="pilot",
+                                  cfg=self.config(repo=self.tmp + "/missing"))
+        milestone.assert_not_called()
 
 
 class ReadinessWitnessTest(_RepoCase):
