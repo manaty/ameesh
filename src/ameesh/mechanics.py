@@ -230,8 +230,8 @@ class ProjectOverride:
     ci_faulty_lot: str | None = None
     #: #3022 : la branche de prod du projet (`production.branch`)
     production_branch: str | None = None
-    repair_policy: repair_policy.Policy | None = None
     contract_selection: ContractSelection | None = None
+    repair_policy: repair_policy.Policy | None = None
 
 
 @dataclass(frozen=True)
@@ -611,8 +611,8 @@ class Mechanics:
     #: #4448 : seuil de rotation de session par harnais ; None = bloc absent
     session: Session | None = None
 
-    repair_policy: repair_policy.Policy | None = None
     contract_selection: ContractSelection | None = None
+    repair_policy: repair_policy.Policy | None = None
 
     # -- coupures -----------------------------------------------------------
 
