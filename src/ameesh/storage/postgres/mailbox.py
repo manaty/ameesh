@@ -145,6 +145,86 @@ class Mailbox(interface.Mailbox):
     def send(self, sender, recipient, body, *, host, kind, payload, work_item_id,
              signature, signature_key, signed_payload, nonce, created_us,
              expires_us) -> dict:
+        # #6641: all structured review writers share the lot lock, including
+        # manual requests and automatic paths outside PgPort. No network work
+        # runs under this lock. Reservations lock the mailbox row too: once a
+        # request may have been shown, it must never be rewritten.
+        review = (payload or {}).get('review_designation')
+        manual = (payload or {}).get('review_request')
+        args = dict(host=host, kind=kind, payload=payload, work_item_id=work_item_id,
+                    signature=signature, signature_key=signature_key,
+                    signed_payload=signed_payload, nonce=nonce,
+                    created_us=created_us, expires_us=expires_us)
+        if kind == 'request' and work_item_id and (isinstance(review, dict)
+                                                  or isinstance(manual, dict)):
+            with self.db.transaction() as tx:
+                box = Mailbox(tx)
+                return box._send_review(sender, recipient, body, args,
+                                        automatic=isinstance(review, dict))
+        return self._insert(sender, recipient, body, **args)
+
+    def _send_review(self, sender, recipient, body, args, *, automatic):
+        from ...review_designation import _request_sha
+        lot = int(args['work_item_id'])
+        item = self.db.query(
+            'SELECT id, state FROM work_items WHERE id = %s FOR NO KEY UPDATE', (lot,))
+        if not item:
+            raise ValueError('review request refused: lot not found')
+        registered = self.db.query(
+            'SELECT retired_at FROM agent_registry WHERE name = %s FOR SHARE', (recipient,))
+        if registered and registered[0].get('retired_at') is not None:
+            raise interface.RecipientRetired('%s is retired: nothing deposited' % recipient)
+        sha = _request_sha({'payload': args['payload']}) or ''
+        if not automatic:
+            if not sha:
+                freeze = self.db.query(
+                    "SELECT sha FROM work_item_milestones WHERE work_item_id = %s"
+                    " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1", (lot,))
+                sha = str(freeze[0].get('sha') or '').lower() if freeze else ''
+            verdict = self.db.query(
+                "SELECT id FROM work_item_milestones WHERE work_item_id = %s"
+                " AND kind = 'verdict' AND actor = %s AND lower(sha) = %s LIMIT 1",
+                (lot, recipient, sha)) if sha else []
+            pending = self.db.query(
+                "SELECT id FROM agent_mailbox WHERE recipient = %s AND work_item_id = %s"
+                " AND kind = 'request' AND delivered_at IS NULL"
+                " AND (payload ? 'review_designation' OR payload ? 'review_request') LIMIT 1",
+                (recipient, str(lot)))
+            if verdict or pending:
+                raise ValueError('review request refused: ' + (
+                    'verdict already recorded on this head' if verdict else
+                    'review designation or request pending'))
+        else:
+            candidates = self.db.query(
+                "SELECT id, payload FROM agent_mailbox WHERE recipient = %s"
+                " AND work_item_id = %s AND kind = 'request' AND delivered_at IS NULL"
+                " AND payload ? 'review_designation' AND sender = %s"
+                " AND signature IS NULL AND meta->'consigne' IS NULL"
+                " AND NOT coalesce((meta->>'deja_consigne')::boolean, false)"
+                " ORDER BY id DESC FOR UPDATE", (recipient, str(lot), sender))
+            if candidates and not args['signature']:
+                prior = candidates[0]
+                # Recheck in the UPDATE as well: a read/reservation wins if it
+                # acquired the row first. Keep the original queue age so rapid
+                # freezes cannot postpone delivery indefinitely.
+                rows = self.db.query(
+                    "UPDATE agent_mailbox SET body = %s, payload = %s::jsonb"
+                    " WHERE id = %s AND delivered_at IS NULL AND meta->'consigne' IS NULL"
+                    " AND NOT coalesce((meta->>'deja_consigne')::boolean, false)"
+                    " RETURNING id, extract(epoch from created_at)::float8 AS created_ts",
+                    (body, json.dumps(args['payload'], ensure_ascii=False), prior['id']))
+                if rows:
+                    from .work import WorkItems
+                    WorkItems(self.db).note(lot, item[0]['state'],
+                        'review-designation-replaced: ' + json.dumps({
+                            'message': int(prior['id']), 'reviewer': recipient,
+                            'old_sha': _request_sha(prior), 'new_sha': sha}, sort_keys=True), sender)
+                    return rows[0]
+        return self._insert(sender, recipient, body, **args)
+
+    def _insert(self, sender, recipient, body, *, host, kind, payload, work_item_id,
+                signature, signature_key, signed_payload, nonce, created_us,
+                expires_us) -> dict:
         # #3460 : un retiré n'est jamais destinataire. Le retrait est relu
         # dans l'instruction qui dépose, sous un verrou partagé de sa ligne
         # (`retire` la prend en exclusif) : un retrait committé après un

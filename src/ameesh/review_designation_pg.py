@@ -35,6 +35,12 @@ sent again (#2541). That evidence is durable: the mark records the mails it
 deposited, the journal is not purged with the mailbox, and recipients are
 compared as primary names, so an alias matches the resolved name the mailbox
 holds (#2557).
+
+#6641: when a new head needs a request, the mailbox atomically replaces its
+earlier automatic request only while unread and never reserved for display.
+The message keeps its queue age; a lot event records both heads. Read requests
+remain untouched. Manual requests share this lock and refuse pending requests
+or a verdict already recorded by that reviewer on the requested head.
 """
 from __future__ import annotations
 
