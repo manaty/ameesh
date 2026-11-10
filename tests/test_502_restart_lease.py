@@ -69,8 +69,9 @@ elif args[0] == "show":
     elif prop == "ControlGroup":
         # #6528 : `failed` garde un processus (cgroup réel du banc, non vide) ;
         # `failed-vide` n'en garde aucun (cgroup supprimé par systemd).
+        # #6536/N1 : `failed-illisible`, cgroup présent mais illisible (faux cat).
         operation("show ControlGroup")
-        if scenario() == "failed":
+        if scenario() in ("failed", "failed-illisible"):
             print([l for l in open("/proc/self/cgroup").read().splitlines()
                    if l.startswith("0::")][0][3:])
         else:
@@ -86,7 +87,7 @@ elif args[0] == "stop":
     operation("stop")
     if scenario() == "stop-fails":
         sys.exit(1)
-    if scenario() in ("stop-hangs", "sigterm-ignored"):
+    if scenario() in ("stop-hangs", "sigterm-ignored", "stop-hangs-lent"):
         # #6537 : un tour long ; le client `systemctl stop` attendrait
         # TimeoutStopSec (35 min) ; poste.sh le borne par `timeout`.
         time.sleep(60)
@@ -98,7 +99,8 @@ elif args[0] == "stop":
         fh.write("stop active=%s pid=%s\n" % tuple(vivante))
     if scenario() == "pid-linger":
         final = ["inactive", "1234"]
-    elif scenario() in ("failed", "failed-vide") or vivante[0] == "failed":
+    elif scenario() in ("failed", "failed-vide", "failed-illisible") \
+            or vivante[0] == "failed":
         final = ["failed", "0"]   # stop non abouti (délai -> SIGKILL, sortie en erreur)
     else:
         final = ["inactive", "0"]
@@ -111,6 +113,10 @@ elif args[0] == "kill":
     qui = [a for a in args if a.startswith("--kill-who=")][0].split("=", 1)[1]
     operation("kill-" + qui)
     final = None
+    if qui == "main" and scenario() == "stop-hangs-lent":
+        # #6536/N2 : le tour met 2 s à s'arrêter, temps compté au budget.
+        time.sleep(2)
+        final = "inactive 0"
     if qui == "main" and scenario() == "stop-hangs":
         final = "inactive 0"
     elif qui == "all" and scenario() == "sigterm-ignored":
@@ -230,7 +236,10 @@ case $last in
   *"ControlGroup"*)
     # #6528 : même convention que le faux systemctl des agents.
     echo "show ControlGroup $unite" >> "$FAKE_STATE/ops.log"
-    if [ "$(stop_mode)" = failed ]; then sed -n 's/^0:://p' /proc/self/cgroup; else echo; fi ;;
+    case $(stop_mode) in
+      failed|failed-illisible) sed -n 's/^0:://p' /proc/self/cgroup ;;
+      *) echo ;;
+    esac ;;
   *cgroup.procs*) eval "$last" ;;
   *"systemctl show"*)
     echo "show ExecStart $unite" >> "$FAKE_STATE/ops.log"
@@ -245,7 +254,7 @@ case $last in
     echo "stop active=$1 pid=$2" >> "$FAKE_STATE/drained"
     case $(stop_mode) in
       pid-linger) echo "inactive 1234" > "$FAKE_STATE/unit" ;;
-      failed|failed-vide) echo "failed 0" > "$FAKE_STATE/unit" ;;
+      failed|failed-vide|failed-illisible) echo "failed 0" > "$FAKE_STATE/unit" ;;
       *) if [ "$1" = failed ]; then echo "failed 0"; else echo "inactive 0"; fi > "$FAKE_STATE/unit" ;;
     esac ;;
   *"systemctl reset-failed"*)
@@ -277,6 +286,19 @@ esac
 FAKE_LOGGED_CLOCK = '#!/bin/sh\necho "$0 $*" >> "$FAKE_STATE/argv.log"\necho 1000\n'
 
 
+FAKE_CAT = r'''#!/bin/sh
+case "$1" in
+  /proc/*/cgroup) echo "0::/user.slice/session.scope" ;;
+  */cgroup.procs)
+    if [ "$(%(cat)s "$FAKE_STATE/stop_mode" 2>/dev/null)" = failed-illisible ]; then
+      echo "cat: $1: Permission denied" >&2; exit 1
+    fi
+    exec %(cat)s "$@" ;;
+  *) exec %(cat)s "$@" ;;
+esac
+''' % {"cat": REAL_CAT}
+
+
 class RestartLeaseTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-502-")
@@ -295,7 +317,8 @@ class RestartLeaseTest(unittest.TestCase):
             fh.write('{"dsn": "postgresql://ameesh:%s@mesh.invalid/ameesh"}\n' % PASSWORD)
         for path, text in ((os.path.join(bin_dir, "systemctl"), FAKE_SYSTEMCTL),
                            # Les faux services sont dans un terminal indépendant.
-                           (os.path.join(bin_dir, "cat"), '#!/bin/sh\ncase "$1" in /proc/*/cgroup) echo "0::/user.slice/session.scope" ;; *) exec ' + REAL_CAT + ' "$@" ;; esac\n'),
+                           # #6536/N1 : `failed-illisible`, cgroup.procs illisible.
+                           (os.path.join(bin_dir, "cat"), FAKE_CAT),
                            (os.path.join(bin_dir, "sleep"), "#!/bin/sh\nexit 0\n"),
                            (os.path.join(bin_dir, "ssh"), FAKE_SSH),
                            (os.path.join(bin_dir, "psql"), FAKE_LOGGED_CLOCK),
@@ -376,7 +399,10 @@ class RestartLeaseTest(unittest.TestCase):
         """#1152 : point sûr non prouvé (unité encore active, MainPID restant,
         état `failed` — drainage non abouti, ou stop en échec) : l'unité n'est
         PAS démarrée, le déploiement échoue en la nommant."""
-        for mode in ("still-active", "pid-linger", "failed", "stop-fails"):
+        # #6536/N1 : `failed-illisible`, une lecture en échec du cgroup ne
+        # prouve pas qu'il est vide.
+        for mode in ("still-active", "pid-linger", "failed", "failed-illisible",
+                     "stop-fails"):
             with self.subTest(mode=mode):
                 self.clear_ops()
                 with open(os.path.join(self.state, "stop_mode"), "w",
@@ -610,10 +636,10 @@ class RestartLeaseTest(unittest.TestCase):
         self.assertIn("aucun processus restant — arrêt prouvé", proc.stdout)
         self.assertIn("dev9 : redémarré", proc.stdout)
 
-    def forcer(self, mode):
+    def forcer(self, mode, **bornes):
         with open(os.path.join(self.state, "stop_mode"), "w", encoding="utf-8") as fh:
             fh.write(mode + "\n")
-        env = dict(self.env, ARRET_BORNE="1", ARRET_FORCE_BORNE="2")
+        env = dict(self.env, **dict(dict(ARRET_BORNE="1", ARRET_FORCE_BORNE="2"), **bornes))
         with open(os.path.join(self.state, "scenario"), "w", encoding="utf-8") as fh:
             fh.write("lease")
         debut = time.monotonic()
@@ -653,6 +679,15 @@ class RestartLeaseTest(unittest.TestCase):
         self.assertLess(reset, self.op_position("start"))
         self.assertIn("aucun processus restant — arrêt prouvé", proc.stdout)
 
+    def test_phases_forcees_comptees_au_budget(self):
+        """#6536/N2 : le temps du second SIGTERM (2 s ici) est décompté du
+        budget de l'étape, pas seulement l'attente bornée du stop (1 s) :
+        budget 3 s épuisé, et non 2 s restantes."""
+        proc, _ = self.forcer("stop-hangs-lent", ARRET_BUDGET="3", ARRET_FORCE_BORNE="5")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(self.op_position("kill-main"), proc.stdout + proc.stderr)
+        self.assertIn("budget d'arrêt restant 0 s", proc.stdout)
+
     def test_bornes_invalides_refusees(self):
         """#6537 : une borne non numérique est refusée avant toute opération."""
         env = dict(self.env, ARRET_BORNE="5m")
@@ -683,6 +718,10 @@ class VmRestartLeaseTest(RestartLeaseTest):
 
     @unittest.skip("#6537 : faux ssh sans stop long ni kill ; vm.sh couvert par test_503")
     def test_sigterm_ignore_sigkill_puis_failed_a_cgroup_vide(self):
+        pass
+
+    @unittest.skip("#6536 : faux ssh sans stop long ni kill ; vm.sh couvert par test_503")
+    def test_phases_forcees_comptees_au_budget(self):
         pass
 
 if __name__ == "__main__":

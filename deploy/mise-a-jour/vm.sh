@@ -149,6 +149,8 @@ LECTURE_ECART=${LECTURE_ECART:-3}
 # Fin de tour attendue au plus ARRET_BORNE s par runner et ARRET_BUDGET s sur
 # toute l'étape ; puis arrêt forcé (second SIGTERM, puis SIGKILL), chacun
 # attendu au plus ARRET_FORCE_BORNE s. État relu toutes les ARRET_SONDE s.
+# #6536/N2 : le temps des phases forcées est décompté du budget ; budget épuisé,
+# un runner coûte encore au plus 1 + 2 × ARRET_FORCE_BORNE s.
 ARRET_BORNE=${ARRET_BORNE:-300}
 ARRET_BUDGET=${ARRET_BUDGET:-900}
 ARRET_FORCE_BORNE=${ARRET_FORCE_BORNE:-60}
@@ -556,11 +558,13 @@ cgroup_vide() {  # unité — 0 si aucun processus ne reste dans son cgroup
   # un chemin de cgroup est absolu, sans `..` ; une autre sortie est illisible
   [[ $cg == /* && $cg != *..* ]] || return 1
   f=/sys/fs/cgroup$cg/cgroup.procs
+  # #6536/N1 : une lecture en échec n'est pas un cgroup vide ; seul un fichier
+  # disparu (cgroup supprimé par systemd, même pendant la lecture) l'est.
   if [ "$MODE" = agents ]; then
-    utilisateur_agents sh -c '[ ! -e "$1" ] || [ -z "$(cat "$1")" ]' sh "$f"
+    utilisateur_agents sh -c 'p=$(cat "$1") || { [ ! -e "$1" ]; exit; }; [ -z "$p" ]' sh "$f"
   else
     printf -v f '%q' "$f"
-    ssh_vm "[ ! -e $f ] || [ -z \"\$(cat $f)\" ]"
+    ssh_vm "p=\$(cat $f) || { [ ! -e $f ]; exit; }; [ -z \"\$p\" ]"
   fi
 }
 # Le client `systemctl stop` est borné par `timeout` (code 124) : le job
@@ -590,8 +594,6 @@ arreter_hors_tour() {  # unité — 0 quand l'arrêt est prouvé (aucun processu
     *) echo "$u : l'arrêt échoue après $(( $(horloge) - debut )) s (code $rc) — aucun démarrage" >&2
        return 1 ;;
   esac
-  ARRET_BUDGET=$(( ARRET_BUDGET - ($(horloge) - debut) ))
-  ((ARRET_BUDGET > 0)) || ARRET_BUDGET=0
   if [ "$rc" = 1 ]; then
     echo "$u : tour encore en cours après $borne s — arrêt forcé : second SIGTERM, le tour s'arrête et sa consigne est remise en attente" >&2
     unite_systemctl "$u" kill --kill-who=main --signal=SIGTERM || true
@@ -602,6 +604,9 @@ arreter_hors_tour() {  # unité — 0 quand l'arrêt est prouvé (aucun processu
     unite_systemctl "$u" kill --kill-who=all --signal=SIGKILL || true
     rc=0; attendre_arret "$u" "$ARRET_FORCE_BORNE" || rc=$?
   fi
+  # #6536/N2 : les phases forcées comptent aussi dans le budget de l'étape.
+  ARRET_BUDGET=$(( ARRET_BUDGET - ($(horloge) - debut) ))
+  ((ARRET_BUDGET > 0)) || ARRET_BUDGET=0
   if [ "$rc" != 0 ]; then
     echo "$u : arrêt non prouvé (unité encore active après SIGKILL, ou état illisible) — aucun démarrage" >&2
     return 1
@@ -627,7 +632,7 @@ arreter_hors_tour() {  # unité — 0 quand l'arrêt est prouvé (aucun processu
       echo "$u : arrêt non prouvé (ActiveState=$etat, MainPID=$pid) — aucun démarrage" >&2
       return 1 ;;
   esac
-  etape "$u : arrêt prouvé — attente $(( $(horloge) - debut )) s"
+  etape "$u : arrêt prouvé — attente $(( $(horloge) - debut )) s, budget d'arrêt restant $ARRET_BUDGET s"
 }
 redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
   local u=$1
