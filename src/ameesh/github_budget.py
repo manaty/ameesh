@@ -14,40 +14,60 @@ RESERVE_FRACTION = .2
 POLL_INTERVAL = 300.0
 
 
-def is_poll(argv):
+#: buckets that keep a reserve for explicit gate/merge reads
+RESERVE_RESOURCES = ("core", "graphql")
+
+#: routine gh reads and the API bucket each one spends: the pr/issue/repo
+#: commands and `release list` query GraphQL, the others REST core.
+POLL_RESOURCES = {
+    ("run", "list"): "core", ("run", "view"): "core",
+    ("workflow", "list"): "core", ("workflow", "view"): "core",
+    ("release", "view"): "core", ("release", "list"): "graphql",
+    ("pr", "list"): "graphql", ("pr", "view"): "graphql", ("pr", "checks"): "graphql",
+    ("issue", "list"): "graphql", ("issue", "view"): "graphql",
+    ("repo", "view"): "graphql", ("repo", "list"): "graphql"}
+
+
+def poll_resource(argv):
+    """The bucket a routine gh read spends (`core`, `graphql`), else None."""
     if not argv:
-        return False
+        return None
     if argv[0] == "api":
         # gh defaults to POST with form fields or input. Do not misclassify
-        # writes (or GraphQL, a separate bucket) as REST polling.
+        # writes as polling; a GraphQL query (even a read) spends `graphql`.
         if any(a.split("=", 1)[0] in ("-f", "-F", "--field", "--raw-field", "--input")
                or a.startswith(("-f", "-F")) for a in argv[1:]):
-            return False
+            return None
         for i, arg in enumerate(argv[1:], 1):
             if arg in ("-X", "--method") and (i + 1 >= len(argv) or argv[i + 1].upper() != "GET"):
-                return False
+                return None
             if arg.startswith(("--method=", "-X")) and arg not in ("-X", "--method"):
                 if arg.removeprefix("--method=").removeprefix("-X").upper() != "GET":
-                    return False
-        return not any(a.rstrip("/").split("?")[0] in ("graphql", "/graphql",
-                       "https://api.github.com/graphql") for a in argv[1:])
-    return len(argv) > 1 and (argv[0], argv[1]) in {
-        ("run", "list"), ("run", "view"), ("pr", "list"), ("pr", "view"),
-        ("pr", "checks"), ("issue", "list"), ("issue", "view"),
-        ("repo", "view"), ("repo", "list"), ("workflow", "list"),
-        ("workflow", "view"), ("release", "list"), ("release", "view")}
+                    return None
+        if any(a.rstrip("/").split("?")[0] in ("graphql", "/graphql",
+               "https://api.github.com/graphql") for a in argv[1:]):
+            return "graphql"
+        return "core"
+    return POLL_RESOURCES.get(tuple(argv[:2])) if len(argv) > 1 else None
+
+
+def is_poll(argv):
+    return poll_resource(argv) is not None
 
 
 def reserve_reason(argv, *, env=None, now=None):
     env = os.environ if env is None else env
     state_dir = env.get("AMEESH_GITHUB_STATE")
-    if not state_dir or not is_poll(argv):
+    resource = poll_resource(argv) if state_dir else None
+    if not resource:
         return None
     from . import plan_github
     reads = plan_github.SharedReads(state_dir, priority=env.get("AMEESH_GITHUB_PRIORITY", "poll"))
-    until = reads.blocked(time.time() if now is None else now)
+    now = time.time() if now is None else now
+    until = reads.blocked(now, resource)
     if until:
-        return "GitHub REST rate limit reserve: polling deferred until %s (non-conclusive)" % (
+        return "GitHub %s rate limit %s: polling deferred until %s (non-conclusive)" % (
+            resource, "reserve" if reads.reserve_only(now, resource) else "exhausted",
             time.strftime("%H:%M:%SZ", time.gmtime(until)))
     return None
 

@@ -536,7 +536,8 @@ def _turns_harness(db, agent: str, at_ts: float, *, contains: bool = True) -> st
     return _harness_of(after) if within_window else ""
 
 
-def _author_at_freeze(db, lot: int, item: dict) -> dict:
+def _author_at_freeze(db, lot: int, item: dict, *,
+                      freeze_id: int | None = None) -> dict:
     """L'auteur du lot produit, et le harnais sous lequel il tournait au gel.
 
     #1053 : le gel est le geste de livraison — son acteur est l'auteur du lot
@@ -545,6 +546,11 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
     réassigne le lot après le gel. Sans gel, sans acteur ou sans tour tracé, la
     famille reste inconnue : le registre courant n'est jamais consulté pour la
     deviner, il ne prouve rien d'historique (L242b, rotation, `adopt`).
+
+    #6669 (M3) : `freeze_id` borne la lecture au gel nommé (le gel du constat
+    relu). Sans borne, le gel le plus récent d'une autre famille réécrirait
+    l'auteur d'une tête plus ancienne ; une borne absente de l'historique rend
+    une preuve vide, jamais l'assigné courant.
 
     #1777 N2 / #1859 : un gel reposé par un tiers qui n'a jamais tenu le lot
     (pilote, bureau, `--actor`) ne fait pas de lui l'auteur : les gels sont
@@ -558,6 +564,15 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
         freezes = _freezes(db, lot)
         if not freezes:
             return out
+        if freeze_id is not None:
+            bounded = []
+            for row in freezes:
+                bounded.append(row)
+                if int(row.get("id") or 0) == int(freeze_id):
+                    break
+            else:
+                return {"name": "", "harness": ""}
+            freezes = bounded
         holders = _holders(db, lot, item)
         third, freeze = "", None
         for row in reversed(freezes):
