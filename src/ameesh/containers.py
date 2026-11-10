@@ -534,6 +534,50 @@ def _contexts(runtime: Runtime) -> list[str] | None:
     return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
 
 
+#: #6610 : le refus de podman quand son espace de noms utilisateur ne peut
+#: pas s'ouvrir (`newuidmap` refusé sous `NoNewPrivileges`)
+USERNS_REFUSED_RE = re.compile(
+    r"newuidmap|newgidmap|cannot set up namespace", re.IGNORECASE)
+
+
+def _no_new_privs() -> bool:
+    """Ce processus (et donc chaque tour qu'il a lancé) est-il sous no_new_privs ?"""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            return any(line.split() == ["NoNewPrivs:", "1"] for line in fh)
+    except OSError:
+        return False
+
+
+def rootless_unusable(runtime: Runtime, engines: list[Runtime]) -> bool:
+    """#6610 : ce podman local muet ne peut porter aucun conteneur de tour.
+
+    Sous no_new_privs (`NoNewPrivileges` de l'unité de l'exécuteur), le
+    `newuidmap` setuid ne mappe rien : podman sans racine ne crée pas son
+    espace de noms utilisateur. L'exécuteur et chacun de ses tours en
+    héritent (on ne quitte pas no_new_privs) : aucun n'a pu lancer un
+    conteneur podman local. Seulement le point d'accès local : ni contexte
+    nommé, ni connexion distante (`CONTAINER_HOST`, `CONTAINER_CONNECTION`,
+    connexion listée du même moteur) ; dans le doute, le moteur reste muet.
+    """
+    import os
+    if _engine(runtime.binary) != "podman" or runtime.context:
+        return False
+    if os.environ.get("CONTAINER_HOST") or os.environ.get("CONTAINER_CONNECTION"):
+        return False
+    if any(other.binary == runtime.binary and other.context for other in engines):
+        return False
+    if not _no_new_privs():
+        return False
+    try:
+        proc = runtime.run([runtime.binary, "info", "--format", "{{.Host.Arch}}"],
+                           capture_output=True, text=True, timeout=runtime.timeout)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (getattr(proc, "returncode", 0) != 0
+            and bool(USERNS_REFUSED_RE.search(str(getattr(proc, "stderr", "") or ""))))
+
+
 def all_runtimes(cfg, run=None) -> tuple[list[Runtime], list[str]]:
     """#339 : tous les moteurs où un tour a pu lancer un conteneur étiqueté —
     chaque moteur de CANDIDATES présent (les scripts d'étiquetage d'un tour
