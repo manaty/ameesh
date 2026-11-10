@@ -3559,7 +3559,9 @@ class Notifier:
                 # (`payload.lot`), l'étape et le palier dans le payload.
                 payload.update(step=alert.get("step"), level=alert.get("level"))
             # pas de `work_item_id` : un message lié au lot compterait comme
-            # son activité (stagnation) et effacerait l'alerte qu'il signale
+            # son activité (stagnation) et effacerait l'alerte qu'il signale.
+            # #6642 (accepté par mesh-design, #207423) : ne pas l'ajouter pour
+            # mesurer — `lot`, `step` et `level` sont dans le payload.
             delivered = []
             quiet = alert_briefs.quiet_payloads(alert, briefs, by_name)
             for name, text in sorted(briefs.items()):

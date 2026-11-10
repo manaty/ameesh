@@ -38,9 +38,10 @@ LISTING = [_row("dev1"), _row("orch1"), _row("orch2"), _row("bureau"),
            _row("auditeur")]
 
 
-def _briefs(alert, listing=LISTING):
+def _briefs(alert, listing=LISTING, covered=()):
     return alert_briefs.briefs(alert, listing, auditor_names=["auditeur"],
-                               orchestrator_names=("orch1", "orch2"))
+                               orchestrator_names=("orch1", "orch2"),
+                               covered=covered)
 
 
 class GraceTest(unittest.TestCase):
@@ -65,6 +66,18 @@ class GraceTest(unittest.TestCase):
         self.assertIn(next(iter(out)), ("orch1", "orch2"))
         self.assertEqual(out, _briefs(_slo(targets=("pilot",))))  # stable
         self.assertEqual(list(_briefs(_slo(targets=("assignee", "pilot")))), ["dev1"])
+
+    def test_l1_deja_remis_reste_le_seul(self):
+        # Relecture mty-amh-docs-01 (b491b7034, réécrit) : le pilote déjà servi
+        # garde le courrier, même quand un autre serait choisi à cette passe.
+        listing = [_row("dev1"), _row("orch1"),
+                   dict(_row("orch2"), lease_live=False), _row("bureau"),
+                   _row("auditeur")]
+        out = _briefs(_slo(targets=("pilot",)), listing, covered={"orch2"})
+        self.assertEqual(list(out), ["orch2"])
+        for served in ("orch1", "orch2"):
+            self.assertEqual(list(_briefs(_slo(targets=("pilot",)),
+                                          covered={served})), [served])
 
     def test_l2_avec_copies_et_p1_inchange(self):
         out = _briefs(_slo(level=2, targets=("pilot",)))
@@ -112,6 +125,21 @@ class NotifierGraceTest(unittest.TestCase):
                          (42, "build_quiet", 1))
         # pas de `work_item_id` : le courrier compterait comme activité du lot
         self.assertNotIn("work_item_id", self.send.call_args.kwargs)
+
+    def test_l1_pas_de_second_courrier_quand_le_bail_cligne(self):
+        # Relecture mty-amh-docs-01 (b491b7034, réécrit) : le pilote servi
+        # perd son bail un instant ; l'autre, éveillé, ne reçoit rien.
+        alive = [dict(row, lease_owner="runner") for row in LISTING]
+        listing = alive
+        self.store.operations.listing.side_effect = lambda: listing
+        alert = _slo(targets=("pilot",), lot=43, overdue=360)
+        self.run_pass(alert, now=10_000)
+        first = self.recipients()
+        self.assertEqual(len(first), 1)
+        listing = [dict(row, lease_live=False, lease_owner=None)
+                   if row["name"] == first[0] else row for row in alive]
+        self.run_pass(dict(alert, value=420), now=10_060)
+        self.assertEqual(self.recipients(), first)
 
     def test_p1_part_tout_de_suite(self):
         self.run_pass(_slo(overdue=30, critical=True, urgent=True,

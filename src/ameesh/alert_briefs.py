@@ -1147,9 +1147,14 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         # #6642 : au niveau 1 ordinaire, le courrier va au seul débiteur —
         # le porteur s'il lit, sinon un pilote stable d'une passe à l'autre ;
         # les copies partent dès le niveau 2.
+        # Un destinataire déjà remis (`covered`, #3100) le reste : un bail qui
+        # cligne ne fait pas repartir le courrier vers un autre pilote.
         holder = alert.get("agent")
         names = sorted(live)
-        if holder in live:
+        served = [name for name in names if name in covered]
+        if served:
+            keep = served[0]
+        elif holder in live:
             keep = holder
         else:
             picked = _one_orchestrator(names, by_name, alert.get("lot"))
