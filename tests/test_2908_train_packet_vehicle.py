@@ -23,7 +23,8 @@ class InventoryPacketVehicleTest(unittest.TestCase):
         self.ops.milestones.return_value = [dict(id=1, kind="frozen", sha=HEAD)]
         self.reader = mock.Mock(side_effect=lambda marks, waived: dict(
             sha=HEAD, origin="frozen", declared=marks[0], verdict=None, notes=[], causes=[]))
-        patch = mock.patch.object(storage, "of", return_value=types.SimpleNamespace(work=self.ops))
+        patch = mock.patch.object(storage, "of", return_value=types.SimpleNamespace(
+            work=self.ops, progress=types.SimpleNamespace(lot_hold_events=lambda ids, patterns: [])))
         patch.start()
         self.addCleanup(patch.stop)
         source = mock.patch.object(train_candidates.merge_queue, "source_of",
