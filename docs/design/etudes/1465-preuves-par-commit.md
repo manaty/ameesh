@@ -323,6 +323,15 @@ d'écriture (`record_commit`, `record_signed_commit`) refusent de ressusciter un
 reçu révoqué. `provenance show` garde la ligne pour l'audit et affiche la
 révocation.
 
+Droits et renommage : `provenance_revocations.actor` est une **preuve** (comme
+`provenance_receipts.actor`), classée `KEPT` dans `agent_rename` — un renommage
+ne réécrit pas l'acteur daté d'une révocation, l'alias le résout. Les cinq
+colonnes de 0566 restent **fermées aux deux rôles superviseurs**, sans nouveau
+GRANT, comme les reçus 0445 dont elles dépendent : la révocation est une
+autorité de porte, et sa raison peut citer un diagnostic interne. Les contrats
+`test_4299_agent_rename`, `test_cluster` et `test_4037_reviewed_requalification`
+couvrent ce classement et le faux de stockage du dernier.
+
 Témoins : `tests/test_4485_signed_provenance.py` (preuve par clé ou approbation
 pré-signée, lecture de la famille au gel, commit non-HEAD, commit d'auteur Git
 humain, refus d'un agent execute ou sous bail, harnais divergent ou hors canon,

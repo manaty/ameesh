@@ -215,6 +215,11 @@ FERMEES = {
     # their existing closed rights; this does not qualify their producers.
     "provenance_receipts": {"subject", "sha", "actor", "session", "turn", "harness",
                             "work_item_id", "at"},
+    # #6873 (0566): a revocation is gate authority tied to a receipt that is
+    # itself closed to both supervisor roles (0445). Its reason can quote an
+    # internal diagnostic, and supervision does not need the withdrawn proof:
+    # closed to both roles, no GRANT added.
+    "provenance_revocations": {"subject", "sha", "actor", "reason", "at"},
     # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
     # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
     "agent_mesh_overview": {"roles", "aliases"},  # #423 : 0418 avant 0428 sur un schéma neuf

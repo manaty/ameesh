@@ -99,6 +99,9 @@ KEPT = (
     "key_events.holder", "key_events.name", "key_holders.name", "mesh_approvals.approver",
     "mesh_approvals.consumed_by", "mesh_consumed_nonces.approver",
     "mesh_consumed_nonces.consumed_by", "provenance_receipts.actor",
+    # #6873 (0566) : la révocation est une preuve datée (acteur, raison), au
+    # même titre que le reçu qu'elle retire ; un renommage ne la réécrit pas.
+    "provenance_revocations.actor",
     # #6669 (0564) : le journal additif des résolutions de constat est une
     # preuve historique (retrait, correction) que l'append-only interdit de
     # réécrire ; un renommage ne le déplace pas (corrector/adjudicator ne
