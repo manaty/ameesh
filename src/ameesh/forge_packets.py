@@ -147,7 +147,7 @@ def _frozen_head(milestones) -> str:
     return str(last["sha"])
 
 
-def vehicle(cfg, row: dict, milestones, *, gh=None, now: float | None = None,
+def vehicle(cfg, row: dict, milestones, *, db=None, gh=None, now: float | None = None,
             cache: dict | None = None) -> dict:
     """La PR de paquet ouverte qui porte ce lot.
 
@@ -172,15 +172,33 @@ def vehicle(cfg, row: dict, milestones, *, gh=None, now: float | None = None,
         return {"unreadable": reason}
     if not prs:
         return {}
-    from . import lot_class
-    repo = lot_class.repository(cfg, row)
+    from . import fire, lot_class
+    # #6825 : le chemin radar peut appartenir à l'ancien hôte du pilote.
+    # Garder la résolution du canon, puis utiliser les mêmes sources locales
+    # que la porte de revue (#6765), en vérifiant l'identité du dépôt.
+    repo = fire._checkout(lot_class.repository(cfg, row))
+    if repo and not fire._same_repository(repo, slug):
+        repo = None
+    if not repo:
+        repo = fire.review_checkout(cfg, db, row, slug=slug, caller=True)
     unreadable = ""
     for pr in prs:
-        if not repo or not pr["head"]:
+        if not repo:
             unreadable = "PR #%d: no local clone of %s" % (pr["number"], slug)
             continue
+        if not pr["head"]:
+            unreadable = "PR #%d: head absent from forge response" % pr["number"]
+            continue
+        # Un clone du bon origin peut être resté avant la composition.
+        # Le registre local peut déjà disposer de la tête de cette PR.
+        read_repo = repo
+        if plan_git._git(read_repo, "cat-file", "-e", pr["head"] + "^{commit}").returncode:
+            alternate = fire.review_checkout(cfg, db, row, slug=slug, caller=True)
+            if alternate and not plan_git._git(
+                    alternate, "cat-file", "-e", pr["head"] + "^{commit}").returncode:
+                read_repo = alternate
         members = planned_waits.packet_trailers(
-            repo, {"branch": pr["branch"], "branch_head": pr["head"]},
+            read_repo, {"branch": pr["branch"], "branch_head": pr["head"]},
             pr["base"] or None, head=pr["head"])
         if members is None:
             unreadable = "PR #%d: head %s not readable locally" % (
@@ -188,8 +206,12 @@ def vehicle(cfg, row: dict, milestones, *, gh=None, now: float | None = None,
             continue
         if rid not in members:
             continue
-        if plan_git._git(repo, "merge-base", "--is-ancestor",
-                         frozen, pr["head"]).returncode != 0:
+        ancestry = plan_git._git(read_repo, "merge-base", "--is-ancestor", frozen, pr["head"])
+        if ancestry.returncode not in (0, 1):
+            unreadable = "PR #%d: ancestry of frozen head %s not readable locally" % (
+                pr["number"], frozen[:12])
+            continue
+        if ancestry.returncode != 0:
             continue  # cité, mais la tête du paquet ne contient pas ce gel
         return {"pr": pr["number"], "branch": pr["branch"], "head": pr["head"],
                 "created_ts": pr.get("created_ts"), "ci": pr.get("ci") or "none"}
