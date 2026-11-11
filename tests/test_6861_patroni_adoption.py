@@ -491,6 +491,9 @@ class ScriptsTest(unittest.TestCase):
         self.assertOk(res)
         self.assertIn("déjà leader", res.stdout)
         self.assertEqual(self.gestes_systemctl(), [])
+        # B2 de revue : le rejeu repose les mots de passe
+        stdin = "".join(a["stdin"] for a in self.appels("psql"))
+        self.assertIn("ALTER ROLE replicator PASSWORD '%s'" % REPLICATION_PASSWORD, stdin)
 
     def _standby(self, **etat):
         base = {"recuperation": {"local": True, "10.78.0.11": False},
@@ -567,11 +570,18 @@ class ScriptsTest(unittest.TestCase):
         self.assertRefus(self.lancer("retour-arriere.sh", "--geste-reel", "arreter"),
                          "s'arrête en dernier")
         self.assertRefus(self.lancer("retour-arriere.sh", "--geste-reel", "primaire"),
-                         "tourne encore sous Patroni")
+                         "sert encore une base")
         self.assertEqual(self.gestes_systemctl(), [])
+
+    def _autres_arretes(self, **etat):
+        courant = self.lire_etat()
+        courant["en_service"].update({"10.78.0.12": False, "10.78.0.10": False})
+        courant.update(etat)
+        self.etat.write_text(json.dumps(courant), encoding="utf-8")
 
     def test_retour_primaire_restaure_sans_synchrone(self):
         self._adopter_primaire()
+        self._autres_arretes()
         self.ecrire_cluster(cluster(("ameesh-agents-1", "leader", "running", None)))
         res = self.lancer("retour-arriere.sh", "--geste-reel", "primaire")
         self.assertOk(res)
@@ -599,9 +609,35 @@ class ScriptsTest(unittest.TestCase):
                           "ameesh-agents-1", nom="ameesh-agents-2")
         self.assertOk(res)
         self.assertTrue((self.data / "standby.signal").exists())
+        # B1 de revue : la ligne Patroni ne passe plus avant celles d'EP8.3
+        pgpass = self.pgpass.read_text()
+        self.assertNotIn(REPLICATION_PASSWORD, pgpass)
+        self.assertIn(EP83_REPLICATOR, pgpass)
         self.assertEqual([a["argv"] for a in self.appels("suivre-primaire.sh")],
                          [["--source", "ameesh-agents-1", "ameesh-agents-2"]])
         self.assertEqual(self.gestes_systemctl(), [["enable", "postgresql@17-main"]])
+
+    def test_retour_primaire_patroni_arrete_refuse_un_second_primaire(self):
+        # B3 de revue : Patroni local arrêté, une bascule a fait d'un autre
+        # nœud le leader, ou un autre nœud sert encore : aucun geste.
+        self._adopter_primaire()
+        self._autres_arretes(actives=[], dcs={"leader": "ameesh-agents-2"})
+        self.assertRefus(self.lancer("retour-arriere.sh", "--geste-reel", "primaire"),
+                         "le DCS désigne ameesh-agents-2")
+        self._autres_arretes(actives=[], dcs={})
+        etat = self.lire_etat()
+        etat["en_service"]["10.78.0.12"] = True
+        self.etat.write_text(json.dumps(etat), encoding="utf-8")
+        self.assertRefus(self.lancer("retour-arriere.sh", "--geste-reel", "primaire"),
+                         "ameesh-agents-2 (10.78.0.12) sert encore une base")
+        self.assertEqual(self.gestes_systemctl(), [])
+
+    def test_retour_api_illisible_n_est_pas_un_non_leader(self):
+        self.ecrire_etat({"actives": ["patroni.service"]})
+        self.cluster.write_text("{illisible", encoding="utf-8")
+        self.assertRefus(self.lancer("retour-arriere.sh", "--geste-reel", "arreter",
+                                     nom="ameesh-agents-2"), "API Patroni illisible")
+        self.assertEqual(self.gestes_systemctl(), [])
 
     def test_retour_sans_sauvegarde_refuse_et_etcd_en_dernier(self):
         self.assertRefus(self.lancer("retour-arriere.sh", "--geste-reel", "standby",
@@ -634,6 +670,14 @@ def _port_libre():
         return s.getsockname()[1]
 
 
+def _env_client():
+    """Environnement des clients du témoin : sans PG* hérité (PGPASSWORD de la
+    CI, PGSSLMODE ou PGTARGETSESSIONATTRS d'un guest changeraient libpq)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+    env["PYTHONPATH"] = str(ROOT / "src")
+    return env
+
+
 def _python_psycopg():
     for candidat in (sys.executable, str(VENV_PY)):
         if candidat and os.path.exists(candidat) and subprocess.run(
@@ -642,7 +686,24 @@ def _python_psycopg():
     return None
 
 
-@unittest.skipUnless((PG_BIN / "initdb").exists(), "binaires PostgreSQL 17 absents")
+class VerifierClientsGardeTest(unittest.TestCase):
+    """Sans paire locale : hors des hôtes locaux, --geste-reel est exigé."""
+
+    def test_hors_hotes_locaux_exige_le_geste_reel(self):
+        python = _python_psycopg()
+        if not python:
+            self.skipTest("psycopg absent")
+        res = subprocess.run(
+            [python, str(PATRONI / "verifier-clients.py"), "--dsn",
+             "host=10.78.0.11,10.78.0.12 dbname=ameesh", "--tuer", "true"],
+            capture_output=True, text=True, timeout=30,
+            env=_env_client())
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("--geste-reel", res.stderr)
+
+
+@unittest.skipUnless(all((PG_BIN / b).exists() for b in ("initdb", "pg_ctl", "pg_basebackup")),
+                     "binaires serveur PostgreSQL 17 absents")
 @unittest.skipIf(os.geteuid() == 0, "initdb refuse root")
 class VerifierClientsTest(unittest.TestCase):
     """Primaire tué, standby synchrone promu : le client tient l'acceptation."""
@@ -655,11 +716,22 @@ class VerifierClientsTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.a, self.b = self.tmp / "a", self.tmp / "b"
         self.pa, self.pb = _port_libre(), _port_libre()
-        self.socket = self.tmp / "sock"
-        self.socket.mkdir()
+        # Le chemin d'une socket Unix est borné à 107 octets : un TMPDIR
+        # profond (guest, CI) le dépasserait. Répertoire vide, quelques octets.
+        self.socket = pathlib.Path(tempfile.mkdtemp(prefix="t6861s-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.socket, True)
+        try:
+            self._monter_paire()
+        except subprocess.CalledProcessError as exc:
+            # Environnement (ports, droits, binaires partiels) : non concluant,
+            # pas un échec du client (canon §3).
+            self.skipTest("paire PostgreSQL locale impossible : %s %s" % (
+                exc.cmd[0], (exc.stderr or b"").decode(errors="replace")[-300:]))
+
+    def _monter_paire(self):
         subprocess.run([str(PG_BIN / "initdb"), "-D", str(self.a), "-U", "postgres",
                         "--auth=trust", "-E", "UTF8", "--locale=C"],
-                       check=True, capture_output=True)
+                       check=True, capture_output=True, env=_env_client())
         with open(self.a / "postgresql.conf", "a", encoding="utf-8") as fh:
             fh.write("listen_addresses = '127.0.0.1'\nunix_socket_directories = '%s'\n"
                      "wal_level = replica\nmax_wal_senders = 5\n"
@@ -672,7 +744,7 @@ class VerifierClientsTest(unittest.TestCase):
         subprocess.run([str(PG_BIN / "pg_basebackup"), "-D", str(self.b), "-h", "127.0.0.1",
                         "-p", str(self.pa), "-U", "postgres", "-X", "stream", "-R",
                         "-d", "host=127.0.0.1 port=%d user=postgres application_name=b" % self.pa],
-                       check=True, capture_output=True)
+                       check=True, capture_output=True, env=_env_client())
         # Promu, B n'attend aucun synchrone : c'est ce que Patroni pose
         # (synchronous_mode non strict sans candidat).
         with open(self.b / "postgresql.auto.conf", "a", encoding="utf-8") as fh:
@@ -685,7 +757,7 @@ class VerifierClientsTest(unittest.TestCase):
         options = "-p %d -k %s" % (port, self.socket)
         return subprocess.run([str(PG_BIN / "pg_ctl"), "-D", str(data), "-o", options,
                                "-l", str(data) + ".log", "-w", action, *extra],
-                              check=check, capture_output=True)
+                              check=check, capture_output=True, env=_env_client())
 
     def _attendre_sync(self):
         for _ in range(100):
@@ -693,7 +765,7 @@ class VerifierClientsTest(unittest.TestCase):
                 [str(PG_BIN / "psql"), "-h", "127.0.0.1", "-p", str(self.pa), "-U", "postgres",
                  "-d", "postgres", "-tAc",
                  "SELECT sync_state FROM pg_stat_replication WHERE application_name = 'b'"],
-                capture_output=True, text=True)
+                capture_output=True, text=True, env=_env_client())
             if res.stdout.strip() == "sync":
                 return
             time.sleep(0.1)
@@ -717,7 +789,7 @@ class VerifierClientsTest(unittest.TestCase):
              "--tuer", str(tuer), "--avant", "1.5", "--apres", "2", "--connect-timeout", "2", "--exigence", "60",
              "--rapport", str(rapport)],
             capture_output=True, text=True, timeout=120,
-            env=dict(os.environ, PYTHONPATH=str(ROOT / "src")))
+            env=_env_client())
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         doc = json.loads(rapport.read_text(encoding="utf-8"))
         self.assertTrue(doc["ok"], doc["ecarts"])
@@ -726,15 +798,6 @@ class VerifierClientsTest(unittest.TestCase):
         self.assertLess(mesures["delai_nouveau_primaire_s"], 60)
         self.assertEqual(len(set(mesures["serveurs_ecrivain"])), 2)
         self.assertIn("reprise_ecouteur_s", mesures)
-
-    def test_hors_hotes_locaux_exige_le_geste_reel(self):
-        res = subprocess.run(
-            [self.python, str(PATRONI / "verifier-clients.py"), "--dsn",
-             "host=10.78.0.11,10.78.0.12 dbname=ameesh", "--tuer", "true"],
-            capture_output=True, text=True, timeout=30,
-            env=dict(os.environ, PYTHONPATH=str(ROOT / "src")))
-        self.assertEqual(res.returncode, 2)
-        self.assertIn("--geste-reel", res.stderr)
 
 
 if __name__ == "__main__":

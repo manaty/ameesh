@@ -188,7 +188,11 @@ phase_primaire() {
   if patroni_actif; then
     aide grappe --env "$PATRONI_ENV" --membre "$NOM_LOCAL" --etat leader >/dev/null \
       || die "Patroni tourne sur $NOM_LOCAL mais il n'est pas leader : la phase primaire ne se rejoue pas ici"
-    log "$NOM_LOCAL déjà leader sous Patroni : rien à faire"
+    # B2 de revue #6861 : un premier passage a pu s'arrêter entre l'élection
+    # et l'ALTER ROLE (attente dépassée, psql en échec). Les mots de passe sont
+    # reposés à chaque rejeu : le geste est idempotent.
+    log "$NOM_LOCAL déjà leader sous Patroni : mots de passe reposés, rien d'autre"
+    geste poser_mots_de_passe_patroni
     return 0
   fi
   [[ $ROLE == primaire ]] || die "$NOM_LOCAL est $ROLE : la phase primaire se joue sur le primaire EP8.3"
