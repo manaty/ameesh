@@ -10,8 +10,8 @@ saut attendu d'un hôte sans compte `ameesh-staging`. Enfin, il vérifie que
 installé et traite le code 3 comme un saut.
 
 Aucun hôte réel, aucun compte, aucun service : les chemins sont temporaires,
-l'uid attendu est celui du banc, et `runuser`/`systemctl` sont des exécuteurs
-factices.
+l'uid attendu est celui du banc, le nodename est simulé (candidat AG1/AG2 ou
+témoin hors candidats) et `runuser`/`systemctl` sont des exécuteurs factices.
 """
 from __future__ import annotations
 
@@ -53,14 +53,38 @@ garde = charger('garde_service_6806', GARDE)
 PUBLIC_ENV = garde.PUBLIC_ENV
 UID, GID = os.getuid(), os.getgid()
 
+# Relevé avant toute simulation : le banc ne dépend jamais du nodename de la
+# machine qui l'exécute (le runner de CI n'est ni AG1 ni AG2).
+UNAME_REEL = os.uname()
+HOTE_CANDIDAT = 'ameesh-agents-1'
+HOTE_HORS_CANDIDATS = 'runner-ci-6806'
+
 
 class Banc(unittest.TestCase):
+    """Banc dont l'hôte simulé est un candidat, sauf témoin contraire.
+
+    L'installateur ne fait tourner la garde que sur un nodename admis par la
+    garde versionnée ; hors AG1/AG2 il se contente de poser. Le nodename est
+    donc fixé explicitement ici, et le témoin hors candidats le remplace.
+    """
+
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(prefix='6806-'))
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
         self.home = self.base / 'home'
         self.home.mkdir(mode=0o700)
         self.executeur = Executeur()
+        self.simuler_hote(HOTE_CANDIDAT)
+
+    def simuler_hote(self, nodename: str) -> None:
+        """Fixe le nodename vu par l'installateur (`os.uname`)."""
+        simule = SimpleNamespace(
+            sysname=UNAME_REEL.sysname, nodename=nodename,
+            release=UNAME_REEL.release, version=UNAME_REEL.version,
+            machine=UNAME_REEL.machine)
+        patcher = mock.patch.object(os, 'uname', return_value=simule)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def bascule(self, contenu: bytes = PUBLIC_ENV) -> Path:
         (self.home / '.config').mkdir(mode=0o700, exist_ok=True)
@@ -194,10 +218,26 @@ class TestInstallateur(Banc):
         self.assertEqual(cible.stat().st_uid, UID)
         self.assertEqual(dropin.stat().st_uid, UID)
         self.assertFalse(rapport['change'])
+        self.assertTrue(rapport['candidat'])
         self.assertTrue(rapport['verifie'])
         self.assertEqual(len(self.executeur.appels), 2)  # daemon-reload, garde
         self.assertIn('daemon-reload', self.executeur.appels[0])
         self.assertEqual(self.executeur.appels[1][-1], str(cible))
+
+    def test_un_hote_hors_candidats_ne_verifie_pas_la_garde(self):
+        """Témoin : hors AG1/AG2, la pose réussit sans exécuter la garde."""
+        self.bascule()
+        self.simuler_hote(HOTE_HORS_CANDIDATS)
+        rapport = self.installer()
+        self.assertFalse(rapport['change'])
+        self.assertFalse(rapport['candidat'])
+        self.assertFalse(rapport['verifie'])
+        self.assertTrue((self.home / garde_staging.GARDE_REL).exists())
+        self.assertTrue((self.home / garde_staging.DROPIN_REL).exists())
+        self.assertEqual(len(self.executeur.appels), 1)  # daemon-reload seul
+        self.assertIn('daemon-reload', self.executeur.appels[0])
+        self.assertFalse(any('staging-startup-guard.py' in ' '.join(appel)
+                             for appel in self.executeur.appels))
 
     def test_est_idempotent(self):
         self.bascule()
