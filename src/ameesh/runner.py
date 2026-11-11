@@ -12832,6 +12832,28 @@ class Runner:
             for worker in self.workers.values():
                 worker.wake.set()
 
+    def sweep_after_reconnect(self) -> None:
+        """#6869 : relit courrier, baux et budget dès que l'écoute est (r)établie.
+
+        Un NOTIFY n'est pas mis en file pour un auditeur déconnecté : celui
+        émis pendant une bascule est perdu, et le sondage au repos peut être
+        long. Chaque worker relit donc son courrier et son bail tout de suite,
+        la passe complète repart, et les plafonds de budget en base sont
+        relus sans attendre leur TTL. C'est le balayage qu'EP8.4 prouve sur
+        une bascule réelle ; il ne dépend pas de `poll`."""
+        cache = getattr(self, "budget_cache", None)
+        if cache is not None:
+            cache.invalidate()
+        self._wake_workers()
+        service = getattr(self, "train_service", None)
+        if service is not None:
+            # même geste que #4515 pour la file du train : les indices perdus
+            # pendant la coupure sont relus, une fois, à la reconnexion
+            service.wake()
+        wake_all = getattr(self, "wake_all", None)
+        if wake_all is not None:
+            wake_all.set()
+
     #: #4602 : au plus une ligne par agent et par fenêtre pour une attente
     #: d'admission base longue (le seuil du verrou est `admission_lock.WARN_S`).
     DB_WAIT_NOTICE_S = 30.0
@@ -12968,27 +12990,41 @@ class Runner:
                 channels.append(train_events.CHANNEL)
             listener = storage.of(self.db).wakeups.subscribe(channels)
             if listener is None:
+                # La base répond-elle ? Sinon l'échec est une coupure, pas un
+                # pilote sans écoute : on réessaie dans les deux cas.
+                attente = reprise.echec()
                 try:
                     self.db.ping()
                 except db_mod.DbError as exc:
-                    # psycopg : la connexion d'écoute n'a pas pu s'ouvrir
-                    attente = reprise.echec()
                     log_async("cannot listen (%s): retrying in %ds"
                               % (db_mod.explain(exc), int(attente)))
+                    self.stop.wait(attente)
+                    continue
+                # #6869 : un pilote qui déclare savoir écouter ne renonce plus
+                # au premier refus (base saturée, veille chaude, droit retiré,
+                # coupure entre la connexion et le LISTEN) : il réessaie avec
+                # la même attente bornée que la reconnexion (L72), le sondage
+                # des workers prenant le relais entre deux essais. Un pilote
+                # inconnu (attribut absent : transaction, enveloppe de test)
+                # garde l'ancien comportement, le sondage.
+                if getattr(self.db, "supports_listen", False):
+                    log_async("cannot listen (LISTEN refused while the database "
+                              "answers): retrying in %ds" % int(attente))
                     self.stop.wait(attente)
                     continue
                 log_async("LISTEN/NOTIFY unavailable with this driver: polling every %ss"
                           % self.poll)
                 return
             self.listener = listener
-            # #4515 : un NOTIFY émis pendant la coupure est perdu, et le
-            # sondage au repos s'est allongé (`idle_poll`) : chaque worker
-            # relit une fois dès que l'écoute est (r)établie.
-            self._wake_workers()
-            if service is not None:
-                # LISTEN is established first: recover hints lost before startup
-                # or during disconnection once, never on a listener timeout.
-                service.wake()
+            # #4515/#6869 : un NOTIFY émis pendant la coupure est perdu, et
+            # le sondage au repos s'est allongé (`idle_poll`) : chaque worker
+            # relit une fois dès que l'écoute est (r)établie, et le budget en
+            # base est relu sans attendre son TTL.
+            self.sweep_after_reconnect()
+            if reprise.en_panne:
+                log_async("listening re-established after %ds (%d failure(s)): "
+                          "mail, leases and budget swept"
+                          % (int(reprise.duree()), reprise.echecs))
             if not annonce:
                 log_async("LISTEN %s" % ", ".join(channels))
                 annonce = True

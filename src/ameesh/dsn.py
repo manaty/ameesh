@@ -42,6 +42,10 @@ from collections.abc import Mapping
 _BLANKS = " \t\n\r\f\v"
 _URI_PREFIXES = ("postgresql://", "postgres://")
 _HEX = "0123456789abcdefABCDEF"
+#: libpq's parameter that makes a multi-host connection skip a standby or a
+#: demoted primary (#6869); it is added only when the DSN lists several hosts
+TARGET_SESSION_ATTRS = "target_session_attrs"
+READ_WRITE = "read-write"
 
 
 class DsnError(ValueError):
@@ -83,6 +87,56 @@ def without_parameter(dsn: str, key: str) -> str:
     if "=" in dsn:
         return _without_keyword(dsn, key)
     return dsn
+
+
+def hosts(dsn: str) -> list[str]:
+    """The host names libpq would try, in order (no port, no brackets).
+
+    A URI's authority (`postgresql://u@h1:5432,h2:5433/db`) or its `host=`
+    query parameter, a key/value pair's `host`/`hostaddr` list, and the empty
+    list for a bare database name or a service-only DSN (the service file is
+    not read here). Percent-encoded URI tokens are decoded. A string libpq's
+    parser would refuse raises `DsnError`; `primary` treats that as "leave it
+    alone", so the later libpq error keeps its message (#6869)."""
+    if dsn.startswith(_URI_PREFIXES):
+        return _uri_hosts(dsn)
+    if "=" in dsn:
+        return _keyword_hosts(dsn)
+    return []
+
+
+def multi_host(dsn: str) -> bool:
+    """Does the DSN list more than one host (the multi-host failover case)?"""
+    try:
+        return len(hosts(dsn)) > 1
+    except DsnError:
+        return False
+
+
+def primary(dsn: str, environ: Mapping[str, str] | None = None) -> str:
+    """The DSN as libpq should read it to find the current primary (#6869).
+
+    A DSN that lists several hosts gets `target_session_attrs=read-write` when
+    it does not already choose that attribute, so a standby or a demoted
+    primary is skipped and a reconnection reaches the new primary. A
+    single-host DSN is returned byte for byte: the existing deployment keeps
+    exactly its connection string. An explicit `target_session_attrs` (in the
+    DSN), `PGTARGETSESSIONATTRS`, or a service (`service=`, `PGSERVICE`) is
+    respected: each of them already decides the host policy. `environ` is the
+    client's environment (os.environ by default)."""
+    env = os.environ if environ is None else environ
+    try:
+        if not multi_host(dsn):
+            return dsn
+        if _has_parameter(dsn, TARGET_SESSION_ATTRS):
+            return dsn
+        if env.get("PGTARGETSESSIONATTRS"):
+            return dsn
+        if _service(dsn) or env.get("PGSERVICE"):
+            return dsn
+        return _with_parameter(dsn, TARGET_SESSION_ATTRS, READ_WRITE)
+    except DsnError:
+        return dsn   # libpq refuses it later, with its own message
 
 
 # -- URI ---------------------------------------------------------------------
@@ -185,6 +239,82 @@ def _without_uri_parameter(dsn: str, key: str) -> str:
     return prefix + body[:start] + path + ("?" + "&".join(kept) if kept else "")
 
 
+def _uri_start(body: str) -> int:
+    """Where the authority starts: after the userinfo's `@`, or at the body."""
+    start = 0
+    while start < len(body) and body[start] not in "@/":
+        start += 1
+    return start + 1 if start < len(body) and body[start] == "@" else 0
+
+
+def _uri_params(dsn: str) -> list[tuple[str, str]]:
+    """[(decoded key, decoded value)] of a URI's query, as libpq reads it."""
+    prefix = next(p for p in _URI_PREFIXES if dsn.startswith(p))
+    body = dsn[len(prefix):]
+    _path, question, query = body[_uri_start(body):].partition("?")
+    if not question:
+        return []
+    params = query.split("&")
+    if params and not params[-1]:   # libpq accepts one trailing "&"
+        params.pop()
+    out = []
+    for param in params:
+        if param.count("=") != 1:
+            raise DsnError("malformed query parameter in the URI")
+        key, value = param.split("=", 1)
+        out.append((_uri_decode(key), _uri_decode(value)))
+    return out
+
+
+def _uri_authority(dsn: str) -> str:
+    prefix = next(p for p in _URI_PREFIXES if dsn.startswith(p))
+    body = dsn[len(prefix):]
+    start = _uri_start(body)
+    end = start
+    while end < len(body) and body[end] not in "/?":
+        end += 1
+    return body[start:end]
+
+
+def _uri_host(entry: str) -> str:
+    """The host of one URI authority entry (`h:5432`, `[::1]:5432`)."""
+    entry = entry.strip()
+    if entry.startswith("["):
+        close = entry.find("]")
+        return entry[1:close] if close >= 0 else entry
+    if entry.startswith(("/", "@")):   # a Unix or abstract socket path
+        return entry
+    return entry.rsplit(":", 1)[0] if ":" in entry else entry
+
+
+def _host_list(value: str) -> list[str]:
+    # libpq splits a host list on every comma and keeps empty entries: an
+    # empty host means "the default host" (socket or localhost), and it still
+    # counts as a destination (`host=,h2` is a two-host list, not one).
+    return [part.strip() for part in value.split(",")]
+
+
+def _uri_hosts(dsn: str) -> list[str]:
+    """The hosts of a URI: its `host=` query parameter wins over the authority,
+    as it does for libpq (the query is applied after the authority); like
+    libpq, the last `host=` (or `hostaddr=`) parameter wins."""
+    params = _uri_params(dsn)
+    host = hostaddr = None
+    for key, value in params:
+        if key == "host":
+            host = value
+        elif key == "hostaddr":
+            hostaddr = value
+    if host is not None:
+        return _host_list(host)
+    if hostaddr is not None:
+        return _host_list(hostaddr)
+    authority = _uri_authority(dsn)
+    if not authority:   # postgresql:///db: no authority at all
+        return []
+    return [_uri_host(_uri_decode(part)) for part in authority.split(",")]
+
+
 # -- key/value pairs ----------------------------------------------------------
 
 def _tokens(dsn: str) -> list[tuple[str, str]]:
@@ -270,6 +400,51 @@ def _without_keyword(dsn: str, key: str) -> str:
             continue
         kept.append("%s=%s" % (token_key, _quote(value)))
     return " ".join(kept) if removed else dsn
+
+
+def _keyword_hosts(dsn: str) -> list[str]:
+    """The `host` list of a key/value DSN, or its `hostaddr` list."""
+    host = hostaddr = None
+    for key, value in _tokens(dsn):
+        if key == "host":
+            host = value         # the last one wins, as libpq reads it
+        elif key == "hostaddr":
+            hostaddr = value
+    value = host if host is not None else hostaddr
+    return [] if value is None else _host_list(value)
+
+
+def _has_parameter(dsn: str, key: str) -> bool:
+    if dsn.startswith(_URI_PREFIXES):
+        return any(k == key for k, _ in _uri_params(dsn))
+    if "=" in dsn:
+        return any(k == key for k, _ in _tokens(dsn))
+    return False
+
+
+def _service(dsn: str) -> bool:
+    """Does the DSN name a service (whose parameters are not read here)?"""
+    if dsn.startswith(_URI_PREFIXES):
+        return any(k == "service" for k, _ in _uri_params(dsn))
+    if "=" in dsn:
+        return any(k == "service" for k, _ in _tokens(dsn))
+    return False
+
+
+def _with_parameter(dsn: str, key: str, value: str) -> str:
+    """The DSN plus one parameter; `key`/`value` must be URI-safe."""
+    if dsn.startswith(_URI_PREFIXES):
+        prefix = next(p for p in _URI_PREFIXES if dsn.startswith(p))
+        body = dsn[len(prefix):]
+        _path, question, query = body[_uri_start(body):].partition("?")
+        if not question:
+            return dsn + "?%s=%s" % (key, value)
+        if not query or query.endswith("&"):   # libpq accepts one trailing "&"
+            return dsn + "%s=%s" % (key, value)
+        return dsn + "&%s=%s" % (key, value)
+    if "=" in dsn:
+        return dsn + " %s=%s" % (key, _quote(value))
+    return dsn
 
 
 # -- command line (deploy/mise-a-jour/poste.sh) --------------------------------

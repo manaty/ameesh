@@ -1146,8 +1146,10 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
     exec_token_file = pick("AMEESH_EXEC_TOKEN_FILE", default=cfg.exec_token_file)
     cfg = replace(
         cfg,
-        dsn=pick("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
-                 "AGENT_MESH_DATABASE_URL", default=cfg.dsn),
+        # #6869 : un DSN multi-hôtes vise le primaire (target_session_attrs=
+        # read-write) ; un DSN mono-hôte reste inchangé, octet pour octet.
+        dsn=dsn_mod.primary(pick("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
+                                  "AGENT_MESH_DATABASE_URL", default=cfg.dsn), env),
         schema=pick("AMEESH_SCHEMA", "AGENT_MESH_SCHEMA", default=cfg.schema),
         driver=pick("AMEESH_DRIVER", "AGENT_MESH_DRIVER", default=cfg.driver),
         backend=pick("AMEESH_BACKEND", "AGENT_MESH_BACKEND", default=cfg.backend),
