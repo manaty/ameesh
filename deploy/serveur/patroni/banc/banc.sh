@@ -12,6 +12,7 @@
 #   banc.sh journal NOEUD [LIGNES]
 #   banc.sh versions
 #   banc.sh demonter [--garder]
+#   banc.sh verifier-marqueur   (interne : 0 si le dossier est un état du banc)
 #
 # Trois conteneurs portent chacun etcd + Patroni + PostgreSQL 17, comme les
 # trois hôtes de l'étude ; un quatrième conteneur joue le poste client. Tout
@@ -44,6 +45,7 @@ usage: banc.sh COMMANDE [options]
   journal NOEUD [LIGNES]
   versions
   demonter [--garder]
+  verifier-marqueur   (interne)
 
 Variables : BANC_ETAT (défaut $TMPDIR/ameesh-banc-grappe), BANC_IMAGE,
 BANC_TOPOLOGIE, BANC_DELAI_SAIN, BANC_DELAI_SYNC.
@@ -249,6 +251,13 @@ cmd_monter() {
         esac
     done
     [[ ! -e $ETAT/etat.json ]] || die "banc déjà monté dans $ETAT (demonter d'abord)"
+    # Ne jamais écrire dans un dossier étranger : un --etat non vide sans
+    # marqueur du banc est refusé (l'opérateur le vide ou choisit un autre
+    # dossier ; le banc ne supprime pas de données qu'il n'a pas créées).
+    if [[ -e $ETAT ]] && ! marqueur_valide; then
+        [[ -d $ETAT && -z $(ls -A -- "$ETAT") ]] || die \
+            "refus : $ETAT n'est pas vide et ne porte pas le marqueur du banc ; choisir un dossier vide ou le vider à la main"
+    fi
     exiger_docker
     TOPOLOGIE=${BANC_TOPOLOGIE:-$ICI/topologie-banc.json}
     lire_topologie
@@ -315,23 +324,49 @@ PY
     printf '%s\n' "$primaire" > "$ETAT/primaire-initial"
 }
 
+# Marqueur du banc : seul un dossier d'état portant ce fichier (schéma du lot
+# et projet dérivé du chemin) peut voir ses fichiers supprimés. Un dossier
+# quelconque passé par --etat n'est jamais effacé, même par demonter.
+marqueur_valide() {
+    [[ -r $ETAT/etat.json ]] || return 1
+    local projet
+    projet=$(nom_projet)
+    python3 - "$ETAT/etat.json" "$projet" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as flux:
+        etat = json.load(flux)
+except (OSError, ValueError):
+    raise SystemExit(1)
+if etat.get("banc") != "ameesh-banc-grappe/1" or etat.get("projet") != sys.argv[2]:
+    raise SystemExit(1)
+PY
+}
+
 # Les données PostgreSQL appartiennent à postgres (uid 999) dans le conteneur :
 # un rm direct échouerait. On les supprime depuis l'image, en root, avec le
-# dossier d'état monté ; --rm ne laisse aucun conteneur derrière.
+# dossier d'état monté ; --rm ne laisse aucun conteneur derrière. Le marqueur
+# est vérifié avant, et seuls donnees/ et etcd/ sont touchés.
 supprimer_donnees() {
     [[ -d $ETAT/donnees || -d $ETAT/etcd ]] || return 0
+    marqueur_valide || die "refus : $ETAT n'est pas l'état de ce banc (marqueur absent) ; données conservées"
     docker run --rm \
         -v "$ETAT:/etat-banc" \
         --entrypoint /bin/bash \
         "$IMAGE" -c 'rm -rf /etat-banc/donnees /etat-banc/etcd' >/dev/null
 }
 
+# Supprime les fichiers que le banc a lui-même créés, jamais un fichier étranger
+# (le dossier peut contenir autre chose : rmdir échoue alors sans le détruire).
 supprimer_etat() {
-    docker run --rm \
-        -v "$ETAT:/etat-banc" \
-        --entrypoint /bin/bash \
-        "$IMAGE" -c 'find /etat-banc -mindepth 1 -delete' >/dev/null
-    rmdir -- "$ETAT" 2>/dev/null || rm -rf -- "$ETAT"
+    marqueur_valide || die "refus : $ETAT n'est pas l'état de ce banc (marqueur absent) ; rien supprimé"
+    supprimer_donnees
+    rm -rf -- "$ETAT/client" "$ETAT/logs" "$ETAT/config" "$ETAT/tls" \
+        "$ETAT/etat.json" "$ETAT/topologie.json" "$ETAT/constats.json" \
+        "$ETAT/primaire-initial" "$ETAT/client.env"
+    rmdir -- "$ETAT" 2>/dev/null || true
 }
 
 cmd_reinitialiser() {
@@ -457,14 +492,19 @@ cmd_demonter() {
     mapfile -t reseaux < <(docker network ls -q --filter "label=ameesh.banc.etat=$ETAT")
     ((${#reseaux[@]} == 0)) || docker network rm "${reseaux[@]}" >/dev/null 2>&1 || true
     # Les données sont sous $ETAT et appartiennent en partie à postgres dans
-    # le conteneur : le nettoyage passe par l'image, en root.
-    IMAGE=$(image_du_banc)
-    if (( garder == 0 )); then
-        [[ ! -d $ETAT ]] || supprimer_etat
-        log "banc démonté, état supprimé"
+    # le conteneur : le nettoyage passe par l'image, en root, et seulement si
+    # le marqueur du banc autorise à toucher ce dossier.
+    if marqueur_valide; then
+        IMAGE=$(image_du_banc)
+        if (( garder == 0 )); then
+            supprimer_etat
+            log "banc démonté, état supprimé"
+        else
+            supprimer_donnees
+            log "banc démonté, état conservé dans $ETAT"
+        fi
     else
-        [[ ! -d $ETAT ]] || supprimer_donnees
-        log "banc démonté, état conservé dans $ETAT"
+        log "marqueur du banc absent : fichiers de $ETAT conservés (conteneurs et réseau étiquetés retirés)"
     fi
 }
 
@@ -480,6 +520,7 @@ image_du_banc() {
 
 charger_etat() {
     [[ -r $ETAT/etat.json ]] || die "aucun banc dans $ETAT (monter d'abord)"
+    marqueur_valide || die "refus : $ETAT/etat.json n'est pas l'état d'un banc #6902"
     PROJET=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["projet"])' "$ETAT/etat.json")
     NOM_RESEAU=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["reseau"])' "$ETAT/etat.json")
     IMAGE=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("image") or "")' "$ETAT/etat.json")
@@ -513,6 +554,7 @@ main() {
         journal) cmd_journal "$@" ;;
         versions) cmd_versions "$@" ;;
         demonter) cmd_demonter "$@" ;;
+        verifier-marqueur) marqueur_valide ;;
         -h | --help | help) utiliser ;;
         *) die "commande inconnue : $commande" ;;
     esac

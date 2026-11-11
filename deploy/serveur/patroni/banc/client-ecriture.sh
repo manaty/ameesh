@@ -18,7 +18,10 @@ NOEUDS=${BANC_NOEUDS:-banc-1,banc-2,banc-3}
 : "${PGPASSWORD:?PGPASSWORD manquant}"
 
 mkdir -p -- "$(dirname -- "$SORTIE")"
-: > "$SORTIE"
+# Ne jamais tronquer : le journal des identifiants confirmés survit au
+# redémarrage du poste et sert de preuve RPO (lot #6902). Seul
+# `banc.sh reinitialiser` recrée $BANC_ETAT/client entre deux scénarios.
+touch -- "$SORTIE"
 
 conn() {
     local hote=$1

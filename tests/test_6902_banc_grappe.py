@@ -280,7 +280,32 @@ class RapportTest(unittest.TestCase):
         resume = module.resume_ecritures(fichier)
         self.assertEqual(resume["nombre"], 2)
         self.assertEqual(resume["max_id"], 7)
+        self.assertEqual(resume["ids"], [1, 7])
         self.assertEqual(resume["noeuds"], ["banc-1", "banc-2"])
+
+    def test_ecritures_absentes_compare_lensemble_des_ids(self):
+        module = _charger_exercer()
+
+        class FauxCible:
+            nom = "faux"
+            noeuds = []
+            noeuds_noms = []
+            ecrivain_disponible = True
+            table_jalon = "t"
+
+            def versions(self):
+                return ""
+
+            def accessibilite(self):
+                return ""
+
+            def sql(self, nom, requete, timeout=5):
+                return "1\n3"
+
+        pilote = module.Pilote(FauxCible(), module.Options())
+        # 2 manque même si le maximum (3) est présent : max(id) ne suffit pas.
+        self.assertEqual(pilote.ecritures_absentes("banc-1", [1, 2, 3]), [2])
+        self.assertEqual(pilote.ecritures_absentes("banc-1", []), [])
 
 
 class ScriptsTest(unittest.TestCase):
@@ -315,6 +340,56 @@ class ScriptsTest(unittest.TestCase):
         self.assertNotIn("docker volume rm", texte)
         self.assertIn('donnees="$ETAT/donnees/$nom"', texte)
         self.assertIn('etcd="$ETAT/etcd/$nom"', texte)
+
+    def test_marqueur_du_banc_avant_tout_nettoyage(self):
+        # B/P1 de la revue : un dossier --etat quelconque ne doit jamais être
+        # effacé. Le marqueur (schéma du lot + projet dérivé du chemin) est la
+        # seule autorisation de suppression des fichiers.
+        def projet_attendu(etat):
+            base = re.sub(r"[^a-z0-9-]", "-", etat.name.lower()).strip("-")[:24]
+            return "ameesh-banc-" + (base or "banc")
+
+        without = pathlib.Path(tempfile.mkdtemp(prefix="test6902-marqueur-"))
+        self.addCleanup(shutil.rmtree, without, True)
+        resultat = _run(
+            ["bash", DIR / "banc.sh", "verifier-marqueur"],
+            env={"BANC_ETAT": str(without)},
+        )
+        self.assertEqual(resultat.returncode, 1, resultat.stderr)
+        (without / "etat.json").write_text(
+            json.dumps({"banc": "autre-schema/1", "projet": projet_attendu(without)}),
+            encoding="utf-8",
+        )
+        resultat = _run(
+            ["bash", DIR / "banc.sh", "verifier-marqueur"],
+            env={"BANC_ETAT": str(without)},
+        )
+        self.assertEqual(resultat.returncode, 1, resultat.stderr)
+        (without / "etat.json").write_text(
+            json.dumps(
+                {
+                    "banc": "ameesh-banc-grappe/1",
+                    "lot": 6902,
+                    "projet": projet_attendu(without),
+                }
+            ),
+            encoding="utf-8",
+        )
+        resultat = _run(
+            ["bash", DIR / "banc.sh", "verifier-marqueur"],
+            env={"BANC_ETAT": str(without)},
+        )
+        self.assertEqual(resultat.returncode, 0, resultat.stderr)
+        # Le dossier reste intact : verifier-marqueur est en lecture seule.
+        self.assertTrue((without / "etat.json").is_file())
+
+    def test_client_ne_tronque_pas_le_journal(self):
+        # B/P2 de la revue : le journal des confirmations doit survivre au
+        # redémarrage du poste (le scénario pc-eteint le relit).
+        texte = (DIR / "client-ecriture.sh").read_text(encoding="utf-8")
+        self.assertNotIn(': > "$SORTIE"', texte)
+        self.assertIn('touch -- "$SORTIE"', texte)
+        self.assertIn('>> "$SORTIE"', texte)
 
     def test_pas_de_secret_dans_le_depot(self):
         # ``banc.sh`` lit la variable depuis ``secrets.env`` : une référence

@@ -37,6 +37,9 @@ TOPOLOGIE_BANC = ICI / "topologie-banc.json"
 SCHEMA = "ameesh-banc-grappe/1"
 LOT = 6902
 TABLE_BANC = "banc_jalons"
+# Écritures confirmées à accumuler avant un geste : la preuve RPO compare un
+# ensemble non trivial, pas les deux premières lignes du journal.
+ECRITURES_MINIMUM = 20
 
 TITRES = {
     "perte-primaire": "Perte du primaire (SIGKILL du conteneur)",
@@ -202,6 +205,7 @@ class BancCible(Cible):
         self.conteneurs: dict[str, str] = {}
         self.projet = ""
         self.pc = ""
+        self.monte = False
 
     def _banc(self, *arguments, timeout=60):
         return run(
@@ -219,18 +223,32 @@ class BancCible(Cible):
         self.noeuds_noms = [n["nom"] for n in self.noeuds]
 
     def demarrer(self) -> None:
-        if (self.etat / "etat.json").exists():
+        etat_json = self.etat / "etat.json"
+        if etat_json.exists():
+            marqueur = lire_json(etat_json)
+            if (
+                marqueur.get("banc") != SCHEMA
+                or int(marqueur.get("lot") or 0) != LOT
+            ):
+                raise Erreur(
+                    "%s n'est pas un état de banc #%d ; refus de le réutiliser"
+                    % (etat_json, LOT)
+                )
             self._charger()
+            self.monte = True
             return
         arguments = ["monter", "--etat", str(self.etat)]
         if not self.construire:
             arguments.append("--sans-construire")
         self._banc(*arguments, timeout=600)
         self._charger()
+        self.monte = True
 
     def arreter(self) -> None:
-        # Même sans etat.json (montage interrompu), le nettoyage par étiquette
-        # de banc.sh retrouve les conteneurs, volumes et réseaux de cet état.
+        # Rien n'a été monté par cet exercice : ne pas toucher à un dossier
+        # --etat préexistant. banc.sh vérifie de toute façon son marqueur.
+        if not self.monte:
+            return
         self._banc("demonter", timeout=120)
 
     def _supprimer_repertoire(self) -> None:
@@ -629,6 +647,9 @@ def resume_ecritures(chemin: Path | None) -> dict:
     return {
         "nombre": len(lignes),
         "max_id": max(ids) if ids else 0,
+        # Tous les identifiants confirmés par le poste, pas seulement le plus
+        # grand : une séquence peut avancer après bascule et laisser un trou.
+        "ids": sorted(set(ids)),
         "noeuds": sorted({str(l.get("noeud")) for l in lignes if l.get("noeud")}),
     }
 
@@ -822,15 +843,13 @@ class Pilote:
         if not self.ecritures_fichier:
             return 0
         debut = time.time()
-        dernier = -1
         while time.time() - debut < timeout:
             nombre = resume_ecritures(self.ecritures_fichier)["nombre"]
-            if nombre >= 2 and nombre > dernier:
+            if nombre >= ECRITURES_MINIMUM:
                 return nombre
-            dernier = nombre
             time.sleep(0.5)
         raise Echec(
-            "le poste client n'écrit pas (fichier %s) après %.0f s"
+            "le poste client n'écrit pas assez (fichier %s) après %.0f s"
             % (self.ecritures_fichier, timeout)
         )
 
@@ -875,6 +894,27 @@ class Pilote:
             )
         except (Erreur, ValueError):
             return None
+
+    def ecritures_absentes(self, nom: str, ids: list[int]) -> list[int]:
+        """Identifiants confirmés par le poste qui manquent sur ``nom``.
+
+        On compare l'ensemble exact des identifiants lus dans le journal du
+        poste à ceux présents sur le nœud : ``max(id)`` ne suffirait pas, une
+        séquence peut avancer après bascule et laisser un trou.
+        """
+        if not ids:
+            return []
+        try:
+            reponse = self.cible.sql(
+                nom,
+                "SELECT id FROM banc_ecritures WHERE id IN (%s)"
+                % ",".join(str(i) for i in ids),
+                timeout=15,
+            )
+        except Erreur:
+            return list(ids)
+        presents = {int(v) for v in reponse.splitlines() if v.strip().isdigit()}
+        return [i for i in ids if i not in presents]
 
     def etat_cluster(self) -> dict:
         roles = self.roles()
@@ -934,6 +974,7 @@ class Pilote:
             log("nouveau primaire %s après %.1f s" % (nouveau, delai))
             rpo_jalon = self.jalon_present(nouveau, jalon)
             max_apres = self.max_ecriture(nouveau)
+            manquantes = self.ecritures_absentes(nouveau, avant["ids"])
             retour_debut = time.time()
             self.cible.demarrer_noeud(primaire)
             retour_tente = True
@@ -956,9 +997,7 @@ class Pilote:
             and re.search(r"pg_rewind exit code=0", journal)
         )
         rpo_ecritures = (
-            max_apres is not None and max_apres >= avant["max_id"]
-            if self.cible.ecrivain_disponible
-            else None
+            not manquantes if self.cible.ecrivain_disponible else None
         )
         critere = (
             delai is not None
@@ -967,6 +1006,7 @@ class Pilote:
             and jalon_final
             and split == 0
             and retour is not None
+            and rpo_ecritures is not False
         )
         if not critere:
             verdict = "blocked"
@@ -980,7 +1020,10 @@ class Pilote:
                "tenue" if delai is not None and delai <= 300 else "manquée")
         )
         if rpo_ecritures is False:
-            note += " Les écritures confirmées du poste ne sont pas toutes présentes."
+            note += (
+                " Les écritures confirmées du poste ne sont pas toutes présentes "
+                "(%d manquante(s) sur %d)." % (len(manquantes), len(avant["ids"]))
+            )
         return self._resultat(
             "perte-primaire",
             time.time() - (delai or 0) - 1,
@@ -991,6 +1034,8 @@ class Pilote:
                 "retour_ancien_primaire_s": None if delai_retour is None else round(delai_retour, 1),
                 "rpo_jalon": rpo_jalon,
                 "rpo_ecritures": rpo_ecritures,
+                "ecritures_confirmees": len(avant["ids"]),
+                "ecritures_absentes": len(manquantes),
                 "max_ecriture_avant": avant["max_id"],
                 "max_ecriture_apres": max_apres,
                 "split_brain_s": round(split, 1),
@@ -1005,6 +1050,7 @@ class Pilote:
                 "pg_rewind": rewind,
                 "journal_pg_rewind": _extrait(journal, ("pg_rewind", "rewind")),
                 "periodes_deux_primaires": len(periodes),
+                "ecritures_absentes_ids": manquantes[:20],
             },
             [note],
             verdict,
@@ -1036,6 +1082,7 @@ class Pilote:
             )
             rpo_jalon = self.jalon_present(nouveau, jalon)
             max_apres = self.max_ecriture(nouveau)
+            manquantes = self.ecritures_absentes(nouveau, avant["ids"])
             self.cible.retablir(primaire)
             retabli = True
             retour, delai_retour = surveillance.attendre_role(
@@ -1053,9 +1100,7 @@ class Pilote:
                     pass
             surveillance.arreter()
         rpo_ecritures = (
-            max_apres is not None and max_apres >= avant["max_id"]
-            if self.cible.ecrivain_disponible
-            else None
+            not manquantes if self.cible.ecrivain_disponible else None
         )
         rewind = bool(
             re.search(r"running pg_rewind", journal)
@@ -1068,6 +1113,7 @@ class Pilote:
             and jalon_final
             and split == 0
             and retour is not None
+            and rpo_ecritures is not False
         )
         if not critere:
             verdict = "blocked"
@@ -1087,6 +1133,11 @@ class Pilote:
             )
         if delai is not None and delai > 60:
             notes.append("La cible < 60 s est manquée ; l'exigence < 300 s reste tenue.")
+        if rpo_ecritures is False:
+            notes.append(
+                "Les écritures confirmées du poste ne sont pas toutes présentes "
+                "(%d manquante(s) sur %d)." % (len(manquantes), len(avant["ids"]))
+            )
         return self._resultat(
             "coupure-reseau",
             time.time() - (delai or 0) - 1,
@@ -1100,6 +1151,8 @@ class Pilote:
                 "retour_ancien_primaire_s": None if delai_retour is None else round(delai_retour, 1),
                 "rpo_jalon": rpo_jalon,
                 "rpo_ecritures": rpo_ecritures,
+                "ecritures_confirmees": len(avant["ids"]),
+                "ecritures_absentes": len(manquantes),
                 "max_ecriture_avant": avant["max_id"],
                 "max_ecriture_apres": max_apres,
                 "split_brain_s": round(split, 1),
@@ -1115,6 +1168,7 @@ class Pilote:
                 "journal_pg_rewind": _extrait(journal, ("pg_rewind", "rewind")),
                 "periodes_deux_primaires": len(periodes),
                 "demotion_observee": demotion is not None,
+                "ecritures_absentes_ids": manquantes[:20],
             },
             notes,
             verdict,
@@ -1124,7 +1178,8 @@ class Pilote:
         primaire = self.preparer()
         jalon = self.inserer_jalon(primaire, "pc-eteint")
         avant = self.etat_cluster()
-        avant_ecritures = self.ecritures()["nombre"]
+        avant_ecritures = self.ecritures()
+        perdues: list[int] = []
         anomalies = []
         sante_min = 3
         pc_arrete = False
@@ -1155,6 +1210,16 @@ class Pilote:
             pc_redemarre = True
             if self.cible.ecrivain_disponible:
                 self.attendre_reprise_ecriture(apres_ecritures)
+                # B/P2 de la revue : le journal est en ajout ; tous les
+                # identifiants confirmés avant l'extinction doivent survivre
+                # au rallumage (une troncature les effacerait).
+                apres_ids = set(self.ecritures()["ids"])
+                perdues = sorted(set(avant_ecritures["ids"]) - apres_ids)
+                if perdues:
+                    anomalies.append(
+                        "journal du poste tronqué : %d identifiant(s) confirmé(s) "
+                        "perdu(s) au rallumage" % len(perdues)
+                    )
             fin = self.attendre_sain(timeout=self.options.timeout_sain)
             jalon_final = self.jalon_present(fin, jalon)
         finally:
@@ -1176,13 +1241,16 @@ class Pilote:
                 "primaire_avant": avant["primaire"],
                 "primaire_apres": fin,
                 "etcd_sains_minimum": sante_min,
-                "ecritures_avant": avant_ecritures,
+                "ecritures_avant": avant_ecritures["nombre"],
                 "ecritures_pendant": apres_ecritures,
+                "ecritures_confirmees_avant": len(avant_ecritures["ids"]),
+                "ecritures_perdues_au_rallumage": len(perdues),
                 "reprise_ecriture": True,
             },
             {
                 "jalon_id": jalon,
                 "jalon_sur_grappe_finale": jalon_final,
+                "journal_integral_apres_rallumage": not perdues,
             },
             anomalies or ["Aucun effet sur le primaire, le quorum etcd ni la réplication."],
             verdict,

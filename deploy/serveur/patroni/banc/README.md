@@ -22,6 +22,11 @@ reste EP8.6 (#6863), sur décision du pilote ou du bureau.
 - Aucun secret n'entre dans le dépôt. `generer-tls.sh` (#6870) écrit le
   matériel TLS et `secrets.env` sous `$BANC_ETAT`, avec les permissions
   d'origine ; les conteneurs les copient dans leur système de fichiers.
+- `banc.sh demonter` ne supprime des fichiers que si `$BANC_ETAT/etat.json`
+  porte le marqueur du banc (schéma `ameesh-banc-grappe/1` et projet dérivé
+  du chemin). Un dossier `--etat` quelconque, ou un montage interrompu avant
+  l'écriture du marqueur, n'est jamais effacé : seuls les conteneurs et le
+  réseau étiquetés sont retirés, et le message le dit.
 
 ## Prérequis
 
@@ -83,7 +88,7 @@ grappe réelle (un seul synchrone, hub `nosync`, `pg_rewind`, `use_slots`,
 | configurations rendues | `$BANC_ETAT/config/<nœud>/` |
 | matériel TLS et `secrets.env` | `$BANC_ETAT/tls/` |
 | constats d'exécution | `$BANC_ETAT/constats.json` |
-| journal des écritures du poste | `$BANC_ETAT/client/ecritures.jsonl` |
+| journal des écritures du poste | `$BANC_ETAT/client/ecritures.jsonl` (ajouté, jamais tronqué ; `reinitialiser` recrée le dossier) |
 | `etat.json` du banc | `$BANC_ETAT/etat.json` |
 | données PostgreSQL et etcd | `$BANC_ETAT/donnees/<nœud>/` et `$BANC_ETAT/etcd/<nœud>/`, supprimées par `banc.sh demonter` (propriété `postgres` dans le conteneur, nettoyage en root depuis l'image) |
 
@@ -96,13 +101,16 @@ banc avant chacun (sauf `--sans-reinitialiser`) :
 |---|---|---|
 | `perte-primaire` | `docker kill` du primaire | nouveau primaire < 60 s (cible) et < 300 s (exigence), RPO 0 sur le jalon et les écritures confirmées, aucun moment à deux primaires, retour de l'ancien primaire en standby par `pg_rewind` |
 | `coupure-reseau` | `iptables` DROP entrant/sortant hors `lo` sur le primaire | nouveau primaire et démotion de l'ancien, RPO 0, aucun moment à deux primaires, rétablissement et rejonction |
-| `pc-eteint` | arrêt du conteneur `pc` | primaire et quorum etcd inchangés, aucune écriture du poste éteint, reprise des écritures au rallumage |
+| `pc-eteint` | arrêt du conteneur `pc` | primaire et quorum etcd inchangés, aucune écriture du poste éteint, journal des confirmations conservé au redémarrage, reprise des écritures |
 | `deux-noeuds` | perte du primaire et du standby synchrone, le hub `nofailover` survit | le survivant ne se promeut pas (1 votant etcd sur 3), aucune écriture sans quorum, aucun split brain, jalon présent après le retour des deux nœuds — **limite attendue de l'étude**, pas une survie |
 
 Mesures produites : délai jusqu'au nouveau primaire, RPO (jalon SQL et
-dernière écriture confirmée du poste), durée des périodes à deux primaires,
-délai de démotion de l'ancien primaire, délai de retour, présence de
-`pg_rewind`, état etcd, rôles finaux.
+**ensemble exact** des identifiants confirmés par le poste, pas seulement le
+maximum : une perte rend le verdict `blocked`), durée des périodes à deux
+primaires, délai de démotion de l'ancien primaire, délai de retour, présence
+de `pg_rewind`, état etcd, rôles finaux. Chaque geste est précédé d'au moins
+20 écritures confirmées, pour que la comparaison RPO ne porte pas sur deux
+lignes.
 
 ### Format du rapport
 
