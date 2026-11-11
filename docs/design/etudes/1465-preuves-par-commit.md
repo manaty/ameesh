@@ -242,6 +242,13 @@ harnais, hôte, lot — et son sha256 est l'empreinte de l'approbation
 (`action = provenance`, `artifact_kind = commit`) ; le texte est conservé dans
 le `meta` de l'approbation pour l'audit.
 
+**Depuis #164261 a (29/10, approval #170), la délégation du §10 ne couvre pas
+la provenance : seule une signature faite par l'owner lui-même vaut preuve.**
+Le bureau n'utilise pas sa copie de la clé owner pour ses propres commits
+(#6873, incident du 11/11 : trois reçus `signed:` auto-attestés sur #6866). Le
+11/11, le bureau les a retirés lui-même (#211783) ; la réimplémentation
+indépendante est #6872.
+
 `ameesh provenance record --signed` :
 
 - résout le commit dans un dépôt (`--repo`), **pas nécessairement HEAD** : il a
@@ -271,6 +278,51 @@ couvre le SHA exact. Le correctif d'environnement de #4485 (un nom annoncé est
 couvert par une liaison valide, au lieu de la masquer) reste utile pour l'option
 « ameesh installé » et pour toute session liée dont le shell a gardé un nom.
 
+### Bornes ajoutées par #6873
+
+`record_signed_commit` refuse désormais, **avant de consommer l'approbation** :
+
+- un détenteur (`approver`, l'option `--as`) qui est un agent : une clé owner
+  posée sur une fiche d'agent est une délégation (#326 r2), pas l'owner ;
+- un détenteur qui est l'acteur attesté : un commit ne signe pas sa propre
+  provenance ;
+- une clé de signature qui est la clé enregistrée de l'acteur, ou qui est
+  détenue par un agent — même sous un autre nom. Tant qu'une copie de la clé
+  owner est enregistrée sur un agent, toute signature par cette clé est
+  ambiguë et refusée ; la séparation réelle demande une **clé distincte** pour
+  le délégataire (retrait de la copie, retrait de la délégation et révocation
+  de la clé sont trois gestes de l'owner, §10).
+
+La limite est réelle et le code ne prétend pas plus : la même clé privée ne
+distingue pas l'owner de son délégataire. Un bureau qui signe avec la copie
+**sous le nom de l'owner** produit une déclaration de bonne foi
+indiscernable ; le contrôle porte sur ce que l'approbation déclare, et le texte
+signé reste en version 1. La décision #164261 a ferme l'usage, pas la
+cryptographie.
+
+### Révocation d'un reçu (#6873)
+
+La table 0445 est en ajout seul : elle ne dit pas qu'une preuve a été reconnue
+fausse. `ameesh provenance revoke --commit <sha> --reason …` écrit une ligne
+`provenance_revocations` (migration 0566 : sujet, SHA, acteur, raison, date),
+sans réécrire la preuve. La première révocation fait foi — une seconde ne
+remplace ni l'acteur ni la raison. L'identité est **liée** (bail ou session,
+L244), le motif est obligatoire, et l'**autorité** est vérifiée avant toute
+écriture : un correcteur (orchestrateur, agent de conception ou auditeur —
+rôle déclaré au canon, jamais le seul historique) ou l'owner à son terminal
+(`--actor human:<id>`, L46). Un agent lié sans ce rôle est refusé : le geste
+est définitif et ferme la porte, il n'est ouvert ni à « n'importe quel agent
+lié » ni au délégataire mis en cause.
+
+`receipt_for_commit` rend alors `None` : la lecture de la porte (`review_authors`,
+donc la désignation, le train et `verdict_carry` qui relit la porte) traite le
+commit comme un auteur inconnu et refuse (`author provenance unknown for frozen
+commit(s)`) ; le repli sur l'identité Git du commit est court-circuité, pour
+qu'un commit d'agent révoqué ne se réattribue pas tout seul. Les deux chemins
+d'écriture (`record_commit`, `record_signed_commit`) refusent de ressusciter un
+reçu révoqué. `provenance show` garde la ligne pour l'audit et affiche la
+révocation.
+
 Témoins : `tests/test_4485_signed_provenance.py` (preuve par clé ou approbation
 pré-signée, lecture de la famille au gel, commit non-HEAD, commit d'auteur Git
 humain, refus d'un agent execute ou sous bail, harnais divergent ou hors canon,
@@ -278,6 +330,8 @@ clé de rôle agent, clé révoquée, approbation d'un autre texte ou déjà
 consommée ; #5756 : harnais d'une liaison passée accepté après changement de
 harnais au registre, harnais jamais vu refusé, session liée sous un autre
 harnais ou à un autre agent refusée, `registry_harness` dans le meta et affiché
-par `provenance show`) et les trois témoins #4485 de
-`tests/test_3985_bound_session_provenance.py` (nom annoncé couvert par une
-liaison, jamais une autre).
+par `provenance show` ; #6873 : refus d'un détenteur agent, d'une copie
+enregistrée sous un autre agent, owner en personne accepté, révocation finale
+et inconnue à la lecture, CLI liée et refus d'une identité non liée) et les
+trois témoins #4485 de `tests/test_3985_bound_session_provenance.py` (nom
+annoncé couvert par une liaison, jamais une autre).
