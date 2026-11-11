@@ -42,7 +42,8 @@ class VerdictReceiptTest(PgTestCase):
 
     def verdict(self, sha=None, **kwargs):
         return work.milestone(self.db, self.lot, "verdict", sha=sha or self.head,
-                              actor=self.actor, verdict="ok", **kwargs)
+                              actor=self.actor, verdict="ok",
+                              note=kwargs.pop("note", "tête relue"), **kwargs)
 
     def receipt(self, mark):
         receipt = review_provenance.receipt_for_milestone(self.db, mark["id"])
@@ -72,7 +73,8 @@ class VerdictReceiptTest(PgTestCase):
                 mock.patch("ameesh.config.load", return_value=self.cfg), \
                 redirect_stdout(out), redirect_stderr(err):
             code = mesh_cli.main(["work", "milestone", str(self.lot), "verdict",
-                                  "ok", "--sha", self.head, *extra])
+                                  "ok", "--sha", self.head, "--note", "tête relue",
+                                  *extra])
         return code, out.getvalue(), err.getvalue()
 
     def test_cli_returns_failure_and_names_the_repository_option(self):
