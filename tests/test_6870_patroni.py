@@ -170,9 +170,12 @@ class ConfigurationTest(unittest.TestCase):
                              "%s:%d" % (noeud["adresse"], ports["patroni_rest"]))
             self.assertIn("certfile", patroni["restapi"])
             self.assertIn("keyfile", patroni["restapi"])
+            self.assertEqual(patroni["etcd3"]["protocol"], "https")
             hotes = patroni["etcd3"]["hosts"].split(",")
             self.assertEqual(len(hotes), 3)
-            self.assertEqual(hotes[0], "https://%s:%d" % (noeud["adresse"], ports["etcd_client"]))
+            # Patroni 4.x attend hôte:port ; le schéma vient de protocol (#6925).
+            self.assertEqual(hotes[0], "%s:%d" % (noeud["adresse"], ports["etcd_client"]))
+            self.assertNotIn("://", patroni["etcd3"]["hosts"])
             self.assertNotIn("password", patroni["restapi"])
             self.assertNotIn("password", patroni["postgresql"]["authentication"]["replication"])
             self.assertEqual(patroni["postgresql"]["authentication"]["replication"]["username"],
@@ -408,6 +411,25 @@ class TlsTest(unittest.TestCase):
         verif = _run(["sh", "-c", "cd \"$1\" && sha256sum -c empreintes.sha256",
                       "sh", str(self.sortie)])
         self.assertEqual(verif.returncode, 0, verif.stderr)
+
+    def test_permissions_avec_parent_setgid(self):
+        """Un parent setgid ne doit pas laisser 2700 : GNU chmod 0700 préserve
+        le setgid hérité, le dossier des secrets doit rester exactement 0700
+        (constat #6925 sur le guest de prévalidation)."""
+        parent = self.tmp / "parent-setgid"
+        parent.mkdir()
+        try:
+            parent.chmod(0o2775)
+        except OSError:
+            self.skipTest("setgid non supporté")
+        if stat.S_IMODE(parent.stat().st_mode) != 0o2775:
+            self.skipTest("setgid non supporté")
+        sortie = parent / "tls"
+        resultat = _run(["bash", str(TLS), "--topologie", str(self.topologie_fichier),
+                         "--sortie", str(sortie)])
+        self.assertEqual(resultat.returncode, 0, resultat.stderr)
+        self.assertEqual(stat.S_IMODE(sortie.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((sortie / "ca.key").stat().st_mode), 0o600)
 
     def test_certificats_signes_et_usages(self):
         self.assertEqual(self.generer().returncode, 0)

@@ -100,7 +100,13 @@ def build(repo, commit, base, inventory, legacy, impacted, policy, *, deadline=N
                 cs.RegistryError):
             selection = cs.select(None, (), inventory, commit=commit,
                                   registry_error='candidate-input-unreadable')
-    declared = set(selection.modules) if selection else set()
+    # The selector expands to the entire inventory on uncertainty so CI can
+    # run the full suite. That expansion is not a contract obligation: local
+    # packet/prevalidation passes retain legacy and explicitly matched or
+    # universal rules, while full_suite_required carries the CI obligation.
+    declared = {module for module, reasons, _ in selection.evidence
+                if any(reason.startswith(('rule:', 'universal:'))
+                       for reason in reasons)} if selection else set()
     contracts = sorted(legacy | declared)
     evidence = selection.to_dict()['evidence'] if selection else {}
     for module in contracts:

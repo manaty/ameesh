@@ -48,8 +48,9 @@ Règles encodées :
    `pg_ctlcluster`) sur les trois nœuds. `psql`/`pg_basebackup` 16 ne pilotent
    pas un serveur 17 (étude, « What already works in the client »).
 2. **Réseau privé (#6859)** : les nœuds doivent se joindre sur le port 5432
-   par leur nom d'inventaire, sans passer par le hub, et `listen_addresses`
-   doit contenir ce nom. Le script le signale s'il ne le voit pas ; il ne
+   par l'adresse privée de l'inventaire (`10.78.0.0/24`, RESEAU-PRIVE.md),
+   sans passer par le hub, et `listen_addresses` doit contenir cette adresse
+   (`reseau-prive.sh postgres` la pose). Le script le signale s'il ne le voit pas ; il ne
    touche pas au réseau.
 3. **TLS** (`ssl = on`, posé par `installer-serveur.sh`) : les lignes
    `hostssl` de `pg_hba` ne servent à rien sans lui. `sslmode=require` chiffre
@@ -67,7 +68,7 @@ Règles encodées :
    install -d -m 0750 /etc/ameesh
    umask 077
    {
-     printf 'REPLICATION_SUBNET=%s\n' '10.77.0.0/24'   # à remplacer par le réseau #6859
+     printf 'REPLICATION_SUBNET=%s\n' '10.78.0.0/24'   # réseau privé #6859
      printf 'REPLICATOR_PASSWORD=%s\n' "$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
      printf 'REWIND_PASSWORD=%s\n' "$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
    } > /etc/ameesh/replication.env
@@ -185,17 +186,40 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
    sa liste synchrone est vide. La rejouer (`configurer-noeud.sh
    ameesh-agents-1`) une fois `ameesh-agents-2` en flux.
 
-5. **Contrôle final** sur `ameesh-agents-1` : `etat.sh` doit montrer
-   `ameesh-agents-2` en `quorum`, le hub en `async`, deux slots actifs, et
-   `wal_log_hints = on`. Un seul primaire répond ; les clients se reconnectent
-   par le DSN multi-hôte (EP8.4/EP8.5).
+   **Aller-retour d'EP8.3 (décision pilote, #6860)** : tant que Patroni et
+   le DSN multi-hôte (EP8.4/EP8.5) ne sont pas là, les clients restent sur
+   le hub. Après l'aller ci-dessus, une seconde fenêtre ramène le primaire
+   sur le hub, avec les mêmes gardes ; `--retour-nofailover` lève le seul
+   `nofailover` et exige la borne :
+
+   ```bash
+   # sur ameesh-agents-1, écritures client arrêtées : relever la borne, puis arrêt
+   psql -Atc 'SELECT pg_current_wal_flush_lsn()'
+   pg_ctlcluster 17 main stop
+   # sur manaty-mesh-1 : promotion de retour
+   deploy/serveur/replication/promouvoir.sh --retour-nofailover --borne <LSN> manaty-mesh-1
+   # sur ameesh-agents-1, puis ameesh-agents-2
+   deploy/serveur/replication/reintegrer.sh --source manaty-mesh-1 ameesh-agents-1
+   deploy/serveur/replication/suivre-primaire.sh --source manaty-mesh-1 ameesh-agents-2
+   # sur manaty-mesh-1, les deux agents en flux : ANY 1
+   deploy/serveur/replication/configurer-noeud.sh manaty-mesh-1
+   ```
+
+5. **Contrôle final** sur le primaire : `etat.sh` doit montrer deux standbys
+   en flux, deux slots actifs, `wal_log_hints = on`, et le hub jamais dans la
+   liste synchrone. Après l'aller-retour (primaire `manaty-mesh-1`), les deux
+   agents sont en `quorum` ; à EP8.6 (primaire `ameesh-agents-1`),
+   `ameesh-agents-2` est en `quorum` et le hub en `async`. Un seul primaire
+   répond ; les clients se reconnectent par le DSN multi-hôte (EP8.4/EP8.5).
 
 ## Promotion manuelle
 
 `promouvoir.sh` est un geste **d'exploitant**, pas une décision d'agent
 (étude §4 : Patroni fera le code en EP8.4). Gardes :
 
-- un nœud `nofailover` (le hub) est refusé sans `--force` ;
+- un nœud `nofailover` (le hub) est refusé sans `--force`, sauf le retour
+  planifié d'un aller-retour (`--retour-nofailover`, borne exigée, autres
+  gardes intactes) ;
 - le serveur local doit tourner et être en récupération ;
 - **aucun autre nœud joignable ne doit répondre comme primaire** ; un nœud
   joignable dont le rôle est illisible arrête aussi (on ne parie pas) ;
@@ -341,8 +365,8 @@ PYTHONPATH=src python -m unittest tests.test_6868_replication -v
 - Pas de Patroni/etcd : la promotion est manuelle et le split brain est gardé
   par un contrôle de rôle, pas par un quorum (EP8.4).
 - Le réseau privé (#6859) et l'archivage/PITR (#6858) sont des prérequis
-  d'autres lots ; `REPLICATION_SUBNET` et les hôtes de `noeuds.conf` seront
-  ajustés à leur livraison.
+  d'autres lots ; les hôtes de `noeuds.conf` sont les adresses privées de
+  #6859 (EP8.3, #6860).
 - Aucune alerte ni sonde de supervision : `etat.sh` est un outil
   d'exploitation, pas un service (EP8.4/EP8.5).
 - La bascule réelle, la fenêtre et la recette sur les trois nœuds restent le

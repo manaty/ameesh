@@ -5,10 +5,12 @@
 # réel d'EP8.3 #6860, jamais joué ici). Le code ne décide pas : c'est un
 # geste d'exploitant, dans la fenêtre de bascule, en attendant Patroni (EP8.4).
 #
-#   promouvoir.sh [--borne <LSN>] [--force] [nom-du-noeud]
+#   promouvoir.sh [--borne <LSN>] [--retour-nofailover] [--force] [nom-du-noeud]
 #
 # Gardes contre le split brain, dans cet ordre :
-#   - un nœud nofailover (le hub) n'est jamais promu sans --force ;
+#   - un nœud nofailover (le hub) n'est jamais promu sans --force, sauf le
+#     retour planifié d'un aller-retour (--retour-nofailover, borne exigée,
+#     les autres gardes intactes ; décision pilote #6860) ;
 #   - le serveur local doit tourner et être en récupération ;
 #   - aucun autre nœud joignable ne doit répondre comme primaire ; un nœud
 #     joignable dont le rôle est illisible arrête aussi (on ne parie pas) ;
@@ -29,7 +31,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: promouvoir.sh [--borne <LSN>] [--force] [nom-du-noeud]
+usage: promouvoir.sh [--borne <LSN>] [--retour-nofailover] [--force] [nom-du-noeud]
 
   --borne <LSN>  borne WAL de l'ancien primaire, relevée sur lui AVANT son
                  arrêt par SELECT pg_current_wal_flush_lsn() (ex. 0/1A2B3C4).
@@ -37,6 +39,10 @@ usage: promouvoir.sh [--borne <LSN>] [--force] [nom-du-noeud]
                  refusée : ANY 1 ne garantit pas que tous les candidats ont
                  tout reçu, et un candidat en retard perdrait des COMMIT
                  confirmés (le pg_rewind de l'ancien primaire les effacerait).
+  --retour-nofailover
+                 accepte un nœud nofailover (le hub) pour le retour planifié
+                 d'une bascule aller-retour ; exige --borne et garde le
+                 contrôle d'absence d'autre primaire et le rejeu de la borne.
   --force        passe outre la borne, le nofailover et le contrôle d'absence
                  d'autre primaire ; réservé à une décision humaine en situation
                  de désastre (double panne), avec perte possible, jamais à une
@@ -49,11 +55,13 @@ EOF
 }
 
 force=0
+retour_nofailover=0
 borne=""
 nom=""
 while (( $# )); do
   case $1 in
     --force) force=1 ;;
+    --retour-nofailover) retour_nofailover=1 ;;
     --borne)
       shift
       (( $# )) || die "--borne attend un LSN PostgreSQL (ex. 0/1A2B3C4)"
@@ -70,6 +78,8 @@ while (( $# )); do
 done
 [[ -z $borne || $borne =~ ^[0-9A-Fa-f]{1,8}/[0-9A-Fa-f]{1,8}$ ]] \
   || die "--borne : LSN PostgreSQL attendu (ex. 0/1A2B3C4), pas « $borne »"
+(( !retour_nofailover )) || [[ -n $borne ]] \
+  || die "--retour-nofailover exige --borne : c'est une bascule planifiée"
 
 charger_env
 lire_noeuds
@@ -77,7 +87,9 @@ trouver_primaire
 charger_noeud_local "$nom"
 
 log "nœud $NOM_LOCAL ($HOTE_LOCAL) — inventaire : $ROLE_INVENTAIRE, synchrone=$SYNC_LOCAL, nofailover=$NOFAIL_LOCAL"
-if [[ $NOFAIL_LOCAL == oui ]] && (( !force )); then
+if [[ $NOFAIL_LOCAL == oui ]] && (( retour_nofailover )) && (( !force )); then
+  info "nœud nofailover promu pour le retour planifié d'un aller-retour (--retour-nofailover, borne $borne)"
+elif [[ $NOFAIL_LOCAL == oui ]] && (( !force )); then
   die "$NOM_LOCAL est nofailover : jamais promu (4 vCPU sans swap) ; --force seulement pour une décision humaine de désastre"
 fi
 pg_isready -q 2>/dev/null || die "le serveur local ne tourne pas : rien à promouvoir"
