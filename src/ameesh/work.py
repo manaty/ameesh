@@ -3077,6 +3077,64 @@ def release_external(db: Db, item_id: int, session, *, actor: str = "", host: st
     return {"item": item, "session": text, "forced": bool(force)}
 
 
+def check_external_claim(db: Db, item_id: int, session, *,
+                         proof: str | None = None) -> dict:
+    """#6877 : vérifier, AVANT un geste hôte, que ce processus tient la prise.
+
+    Le geste hôte (ssh root, apply-services, lancement de services, geste de
+    déploiement) est un geste d'exécutant externe comme un achat : il se prend
+    sur son lot avec `claim_external` avant le premier effet, et la seconde
+    session est refusée. Cette vérification est la porte que les scripts et
+    les runbooks appellent avant leur premier geste : elle ne prend rien, ne
+    libère rien, et n'écrit rien. Elle n'accepte que la liaison de session
+    VÉRIFIÉE de l'appelant (`caller_session_proof`), jamais un libellé.
+
+    Rend `{item, session, at}` ; lève `WorkError` avec un refus nommé."""
+    proved = normalize_external_session(proof)
+    if not proved:
+        raise WorkError("lot %s: a host gesture requires a verified session binding "
+                        "(`ameesh mail bind <agent> --session <id> --pid <pid>`); "
+                        "a free label is not a proof — nothing done" % item_id)
+    text = normalize_external_session(session) if session else proved
+    if not text:
+        text = proved
+    if text != proved:
+        raise WorkError("lot %s: this caller's verified session is %s, not %s: "
+                        "host gesture refused, nothing done"
+                        % (item_id, proved, text))
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    if item["state"] in MERGED_STATES or item["state"] == lifecycle.CLOSED:
+        raise WorkError("lot %s is %s: no host gesture to allow"
+                        % (item_id, item["state"]))
+    if not (item.get("external_executor") or "").strip():
+        raise WorkError("lot %s has no external executor: a host gesture claim is for "
+                        "a gesture reserved to one (`ameesh work external-executor %s "
+                        "<agent>`)" % (item_id, item_id))
+    holder = (item.get("external_claim_session") or "").strip()
+    if not holder:
+        raise WorkError("lot %s has no external claim: no host gesture is allowed — "
+                        "take it first (`ameesh work claim %s --session %s`)"
+                        % (item_id, item_id, text))
+    claimed_at = item.get("external_claimed_ts")
+    if holder != text:
+        raise WorkError("lot %s is claimed by session %s at %s, not by this session "
+                        "(%s): host gesture refused, nothing done"
+                        % (item_id, holder, _claim_moment(claimed_at), text))
+    claimed_proof = (item.get("external_claim_proof") or "").strip()
+    if not claimed_proof:
+        raise WorkError("lot %s: the claim of session %s carries no verified session "
+                        "proof: release it and claim again from a bound session "
+                        "(`ameesh work claim %s --release --session %s`)"
+                        % (item_id, holder, item_id, holder))
+    if claimed_proof != proved:
+        raise WorkError("lot %s: session %s was claimed with verified session %s, "
+                        "which this caller does not prove: host gesture refused"
+                        % (item_id, holder, claimed_proof))
+    return {"item": item, "session": text, "at": claimed_at}
+
+
 def takes_rule(check: dict) -> bool:
     """#540 : l'assigné normalisé par `check_assignee` est soumis à la règle
     « au plus un lot non démarré » (ni humain ni agent externe)."""

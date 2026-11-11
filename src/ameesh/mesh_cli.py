@@ -2455,6 +2455,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "claim":
             # #6839 : la prise exclusive d'un geste d'exécutant externe, écrite
             # avant l'effet ; la seconde session reçoit la porteuse et l'heure.
+            # #6877 : `--check` est la porte, en lecture seule, que les scripts
+            # et runbooks appellent avant leur premier geste hôte.
             actor, warning = work.resolve_actor(cfg, db, args.actor)
             if warning:
                 print("warning: %s" % warning, file=sys.stderr)
@@ -2464,7 +2466,29 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     "this session is bound to %s, not %s: a claim or a normal "
                     "release speaks for its own agent (a pilot uses --force)"
                     % (proof_agent, actor))
+            if args.check:
+                if args.release or args.force:
+                    raise work.WorkError("--check goes alone: it takes and releases nothing")
+                out = work.check_external_claim(
+                    db, args.id, args.session, proof=proof)
+                if args.json:
+                    print(json.dumps({"schema": "ameesh.work.claim-check/1",
+                                      "lot": out["item"]["id"],
+                                      "session": out["session"],
+                                      "held": True,
+                                      "at": out.get("at"),
+                                      "proved": bool(proof),
+                                      "proof_source": proof_source},
+                                     ensure_ascii=False, indent=2, default=str))
+                    return 0
+                print(('%s #%d: external claim held by %s at %s — host gesture '
+                       'allowed') % (v.noun, out["item"]["id"], out["session"],
+                                     _fmt_moment(out.get("at"))))
+                return 0
             if args.release:
+                if not args.session:
+                    raise work.WorkError(
+                        "--session: name the session whose claim is released")
                 out = work.release_external(
                     db, args.id, args.session, actor=actor, host=cfg.host,
                     proof=proof, note=args.note, cfg=cfg, force=args.force)
@@ -4717,17 +4741,23 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
         "claim",
         help=("#6839: take EXCLUSIVELY the external gesture of a %s reserved to an "
              "external executor, before any purchase or resource creation; the second "
-             "session is refused, naming the holder and its time") % v.noun)
+             "session is refused, naming the holder and its time; #6877: --check "
+             "verifies the claim before a host gesture") % v.noun)
     pw_claim.add_argument("id", type=int)
-    pw_claim.add_argument("--session", required=True, metavar="SESSION",
+    pw_claim.add_argument("--session", default=None, metavar="SESSION",
                           help=("#6839: the claiming session (the one the fire names, or "
-                               "this session's own label)"))
+                               "this session's own label); with --check, defaults to this "
+                               "caller's verified session"))
     pw_claim.add_argument("--release", action="store_true",
                           help=("#6839: release the claim (the holder alone, or a pilot "
                                "with --force)"))
     pw_claim.add_argument("--force", action="store_true",
                           help=("#6839: pilot gesture: release a claim whose session is "
                                "gone (authority checked)"))
+    pw_claim.add_argument("--check", action="store_true",
+                          help=("#6877: read-only gate before a host gesture: exit 0 only "
+                               "if this caller's verified session holds the claim; takes "
+                               "and releases nothing"))
     pw_claim.add_argument("--note", default="", metavar="TEXT",
                           help="#6839: note kept in the %s journal" % v.noun)
     pw_claim.add_argument("--json", action="store_true")
