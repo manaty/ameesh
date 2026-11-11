@@ -246,6 +246,20 @@ class DsnPrimaryTest(unittest.TestCase):
                 self.assertNotIn("&&", got)
                 self.assertEqual(got.count("?"), 1)
 
+    def test_uri_host_parameter_follows_libpq(self):
+        # libpq keeps the last `host=` of the query, and an empty host entry
+        # is a real destination (the default host), not a hole to remove.
+        last = "postgresql:///db?host=localhost&host=h1,h2"
+        self.assertEqual(dsn_mod.hosts(last), ["h1", "h2"])
+        self.assertIn("target_session_attrs=read-write", dsn_mod.primary(last, {}))
+        empty = "postgresql:///db?host=,h2"
+        self.assertEqual(dsn_mod.hosts(empty), ["", "h2"])
+        self.assertIn("target_session_attrs=read-write", dsn_mod.primary(empty, {}))
+        keyword = "host=,h2 dbname=db"
+        self.assertEqual(dsn_mod.hosts(keyword), ["", "h2"])
+        self.assertIn("target_session_attrs=read-write", dsn_mod.primary(keyword, {}))
+        self.assertEqual(dsn_mod.hosts("postgresql:///db"), [])
+
     def test_existing_target_session_attrs_is_respected(self):
         for dsn in (
             "postgresql://u@h1,h2/db?target_session_attrs=any",

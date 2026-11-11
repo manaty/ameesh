@@ -288,17 +288,31 @@ def _uri_host(entry: str) -> str:
 
 
 def _host_list(value: str) -> list[str]:
-    return [part.strip() for part in value.split(",") if part.strip()]
+    # libpq splits a host list on every comma and keeps empty entries: an
+    # empty host means "the default host" (socket or localhost), and it still
+    # counts as a destination (`host=,h2` is a two-host list, not one).
+    return [part.strip() for part in value.split(",")]
 
 
 def _uri_hosts(dsn: str) -> list[str]:
     """The hosts of a URI: its `host=` query parameter wins over the authority,
-    as it does for libpq (the query is applied after the authority)."""
-    for key, value in _uri_params(dsn):
+    as it does for libpq (the query is applied after the authority); like
+    libpq, the last `host=` (or `hostaddr=`) parameter wins."""
+    params = _uri_params(dsn)
+    host = hostaddr = None
+    for key, value in params:
         if key == "host":
-            return _host_list(value)
-    return [_uri_host(_uri_decode(part))
-            for part in _uri_authority(dsn).split(",") if part.strip()]
+            host = value
+        elif key == "hostaddr":
+            hostaddr = value
+    if host is not None:
+        return _host_list(host)
+    if hostaddr is not None:
+        return _host_list(hostaddr)
+    authority = _uri_authority(dsn)
+    if not authority:   # postgresql:///db: no authority at all
+        return []
+    return [_uri_host(_uri_decode(part)) for part in authority.split(",")]
 
 
 # -- key/value pairs ----------------------------------------------------------
