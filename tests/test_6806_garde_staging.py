@@ -27,6 +27,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / 'deploy/mise-a-jour'
@@ -326,6 +327,18 @@ class TestInstallateur(Banc):
             os.close(dir_fd)
         self.assertEqual((self.base / 'ouvert' / 'preuve').read_bytes(), b'ok\n')
         self.assertFalse((dehors / 'preuve').exists())
+
+    def test_verifier_ne_suit_pas_une_garde_symbolique(self):
+        self.bascule()
+        (self.home / '.local').mkdir(mode=0o755)
+        (self.home / '.local' / 'libexec').mkdir(mode=0o755)
+        cible = self.home / garde_staging.GARDE_REL
+        cible.symlink_to(self.base / 'ailleurs-garde')
+        compte = SimpleNamespace(pw_dir=str(self.home), pw_uid=UID, pw_gid=GID)
+        with mock.patch.object(garde_staging.pwd, 'getpwnam',
+                               return_value=compte):
+            code = garde_staging.principal(['--compte', 'banc', 'verifier'])
+        self.assertEqual(code, 2)
 
     def test_un_hote_sans_compte_sort_en_3(self):
         resultat = subprocess.run(

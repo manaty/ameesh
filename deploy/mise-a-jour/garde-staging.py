@@ -462,7 +462,17 @@ def principal(argv: list[str] | None = None) -> int:
     try:
         if args.action == 'verifier':
             garde = home / GARDE_REL
-            if not garde.is_file():
+            home_fd = _ouvrir_home(home, uid)
+            try:
+                garde_dir = _ouvrir_dossier(home_fd, ('.local', 'libexec'),
+                                            uid, gid, False)
+            finally:
+                os.close(home_fd)
+            try:
+                contenu = _lire_ancien(garde_dir, GARDE_REL.name)
+            finally:
+                os.close(garde_dir)
+            if contenu is None:
                 raise Refus('garde absente : %s' % garde)
             resultat = _verifier(args.compte, garde, subprocess.run)
             if resultat.returncode != 0:
@@ -471,7 +481,7 @@ def principal(argv: list[str] | None = None) -> int:
                       file=sys.stderr)
                 return 1
             print('garde acceptee par %s (%s)'
-                  % (args.compte, empreinte(garde.read_bytes())[:16]))
+                  % (args.compte, empreinte(contenu)[:16]))
             return 0
         dropin = args.dropin if args.action == 'installer' else None
         rapport = installer(home, uid, gid, args.compte, args.source, dropin,
