@@ -81,6 +81,7 @@ class MediatedOwnershipTest(unittest.TestCase):
                                      source == "old-server" else set(),
                                      container_runtime=lambda: None)
             tracker = background.Tracker(runner, log=notes.append)
+            support.adopt_orphans(self, tracker)
             tracker.TERM_GRACE_S = .05
             tracker.entries = [background.Entry(agent="test", turn_id="own", pgid=7000,
                                ended=0, deadline=1, grace_s=1, handles={child.pid: handle})]

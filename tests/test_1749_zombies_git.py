@@ -32,7 +32,9 @@ class AdoptedZombieTest(unittest.TestCase):
         runner = SimpleNamespace(db=None, host="h", harness_pids=set(),
                                  launch_lock=threading.Lock(),
                                  container_runtime=lambda: None)
-        return background.Tracker(runner, log=lambda _: None)
+        tracker = background.Tracker(runner, log=lambda _: None)
+        support.adopt_orphans(self, tracker)
+        return tracker
 
     def mes_zombies(self) -> set:
         return {p["pid"] for p in platform.process_table()
