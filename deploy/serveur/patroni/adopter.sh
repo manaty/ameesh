@@ -98,6 +98,12 @@ verifier_fichiers() {
   local mode
   mode=$(stat -c '%a' -- "$PATRONI_ENV")
   [[ $mode == 640 || $mode == 600 ]] || die "$PATRONI_ENV en $mode : 0640 root:postgres attendu (secrets)"
+  # Le service et l'enveloppe patronictl le lisent en root : un fichier
+  # appartenant à un autre compte (postgres) lui donnerait la main sur root.
+  if (( EUID == 0 )); then
+    [[ $(stat -c '%u' -- "$PATRONI_ENV") == 0 ]] \
+      || die "$PATRONI_ENV doit appartenir à root (chown root:postgres)"
+  fi
   grep -q "^name: $NOM_LOCAL\$" "$PATRONI_CONF" \
     || die "$PATRONI_CONF n'est pas celui de $NOM_LOCAL (name:)"
   local cle
@@ -116,10 +122,14 @@ verifier_hba() {
   local clients sortie
   clients=$(mktemp "${TMPDIR:-/tmp}/adopter-clients.XXXXXX")
   psql_local -tAc "SELECT DISTINCT host(client_addr) FROM pg_stat_activity WHERE client_addr IS NOT NULL" > "$clients" 2>/dev/null || :
-  if sortie=$(aide hba --patroni-yml "$PATRONI_CONF" --hba "$HBA" --clients "$clients"); then
+  local code=0
+  sortie=$(aide hba --patroni-yml "$PATRONI_CONF" --hba "$HBA" --clients "$clients") || code=$?
+  if (( code == 0 )); then
     info "$sortie"
   else
     rm -f -- "$clients"
+    # Code 2 : lecture impossible ; --accepter-hba ne couvre qu'un écart lu.
+    (( code == 1 )) || die "pg_hba illisible (adoption.py hba, code $code) : $sortie"
     printf '%s\n' "$sortie" | sed 's/^/   /'
     (( ACCEPTER_HBA )) || die "pg_hba : Patroni réécrira le fichier sans ces règles (--accepter-hba pour poursuivre, décision d'exploitant)"
     info "ATTENTION : --accepter-hba accordé"

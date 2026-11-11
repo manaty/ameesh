@@ -195,6 +195,13 @@ phase_standby() {
   [[ -n $source_nom ]] || die "phase standby : --source <primaire> exigé"
   ! patroni_actif || die "Patroni tourne encore sur $NOM_LOCAL : phase arreter d'abord"
   verifier_sauvegarde
+  # Un nœud arrêté en primaire (leader tombé, un autre promu) a divergé : le
+  # flux ne reprend pas sans pg_rewind (replication/reintegrer.sh).
+  local etat_arret
+  etat_arret=$(LC_ALL=C comme_postgres "$PG_BIN/pg_controldata" -D "$DATA" \
+    | sed -n 's/^Database cluster state:[[:space:]]*//p')
+  [[ $etat_arret == "shut down in recovery" ]] \
+    || die "$NOM_LOCAL arrêté dans l'état « ${etat_arret:-illisible} », pas en récupération : il a pu diverger ; replication/reintegrer.sh --source $source_nom (pg_rewind)"
   geste restaurer_configuration
   geste poser_standby_signal
   geste ecrire_start_conf auto

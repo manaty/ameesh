@@ -179,6 +179,8 @@ def evaluer(ecrivain, ecouteur, presents, t_tuer, cible, exigence):
     ecarts, mesures = [], {}
     if ecrivain.premiere_erreur is None or ecrivain.reprise is None:
         ecarts.append("l'écrivain n'a vu ni coupure ni reprise : la bascule n'a pas eu lieu")
+    elif ecrivain.premiere_erreur < t_tuer or ecrivain.reprise <= t_tuer:
+        ecarts.append("coupure de l'écrivain antérieure à --tuer : la mesure ne porte pas sur cette bascule")
     else:
         delai = ecrivain.reprise - t_tuer
         mesures["delai_nouveau_primaire_s"] = round(delai, 3)

@@ -96,6 +96,7 @@ if nom == "psql":
 if nom == "pg_controldata":
     print("pg_control version number:            1700")
     print("Database system identifier:           %s" % etat["sysid"])
+    print("Database cluster state:               %s" % etat.get("arret", "shut down in recovery"))
     sys.exit(0)
 if nom == "systemctl":
     if argv[:2] == ["is-active", "--quiet"]:
@@ -446,7 +447,8 @@ class ScriptsTest(unittest.TestCase):
             self.assertTrue((dernier / f).exists(), f)
         self.assertTrue((dernier / "conf.d" / "60-ameesh-replication.conf").exists())
         self.assertEqual((dernier / "role").read_text().strip(), "primaire")
-        self.assertEqual(stat.S_IMODE(os.stat(dernier.resolve()).st_mode), 0o700)
+        # bits de droits seuls : un parent setgid (guest) ajoute S_ISGID
+        self.assertEqual(stat.S_IMODE(os.stat(dernier.resolve()).st_mode) & 0o777, 0o700)
         self.assertTrue((self.pgconf / "start.conf").read_text().endswith("manual\n"))
         stdin = "".join(a["stdin"] for a in self.appels("psql"))
         self.assertIn("ALTER ROLE replicator PASSWORD '%s'" % REPLICATION_PASSWORD, stdin)
@@ -638,6 +640,13 @@ class ScriptsTest(unittest.TestCase):
         self.assertRefus(self.lancer("retour-arriere.sh", "--geste-reel", "arreter",
                                      nom="ameesh-agents-2"), "API Patroni illisible")
         self.assertEqual(self.gestes_systemctl(), [])
+
+    def test_retour_standby_refuse_un_ancien_primaire_divergent(self):
+        self._adopter_primaire()
+        self.ecrire_etat({"actives": [], "arret": "shut down"})
+        self.assertRefus(self.lancer("retour-arriere.sh", "--geste-reel", "standby", "--source",
+                                     "ameesh-agents-2", nom="ameesh-agents-1"), "reintegrer.sh")
+        self.assertEqual(self.appels("suivre-primaire.sh"), [])
 
     def test_retour_sans_sauvegarde_refuse_et_etcd_en_dernier(self):
         self.assertRefus(self.lancer("retour-arriere.sh", "--geste-reel", "standby",

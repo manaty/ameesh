@@ -306,9 +306,10 @@ Effets attendus : un redémarrage bref de la base pendant la phase `primaire`
 (les clients se reconnectent par le DSN multi-hôtes). Entre les phases
 `primaire` et `standby` d'`ameesh-agents-2`, la grappe est asynchrone : Patroni
 ne prend pour synchrone qu'un membre, et les standbys d'EP8.3 n'en sont pas
-encore. Ils continuent le flux sur leur connexion ouverte. Une reconnexion
-échouerait avec l'ancien mot de passe de `replicator` : on enchaîne donc les
-standbys sans attendre.
+encore. Le redémarrage du primaire coupe leurs connexions, et leur
+reconnexion échoue avec l'ancien mot de passe de `replicator` : ils ne
+suivent plus jusqu'à leur propre phase `standby`. Les slots retiennent le WAL,
+rien n'est perdu ; on enchaîne donc les standbys sans attendre.
 
 ### Retour arrière scripté
 
@@ -323,8 +324,10 @@ standbys sans attendre.
 La phase `primaire` refuse tant qu'un autre membre tourne sous Patroni. Elle
 restaure la configuration sauvegardée, sans liste synchrone (aucun standby
 n'est encore là), puis repose les rôles et le `pgpass` d'EP8.3 depuis
-`replication.env`. La phase `standby` confie la reprise du flux à
-`replication/suivre-primaire.sh`.
+`replication.env`. La phase `standby` restaure aussi le `pgpass` d'avant
+Patroni, puis confie la reprise du flux à `replication/suivre-primaire.sh` ;
+un nœud arrêté en primaire (il a divergé) est refusé et renvoyé à
+`replication/reintegrer.sh` (`pg_rewind`).
 
 ### Preuve côté client
 
