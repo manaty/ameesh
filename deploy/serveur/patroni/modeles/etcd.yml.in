@@ -1,0 +1,36 @@
+# Modèle etcd 3.5 pour un votant de la grappe ameesh (EP8.4b, lot #6870).
+# Rendu par generer-configuration.py : ne pas éditer la copie installée.
+# Aucun secret ici : les clés sont des chemins, le matériel vient de
+# generer-tls.sh (0600/0640, hors du dépôt).
+name: $nom
+data-dir: $etcd_data
+
+# Aucun écouteur public : uniquement l'adresse privée du nœud (EP8.2).
+listen-client-urls: https://$adresse:$port_client
+advertise-client-urls: https://$adresse:$port_client
+listen-peer-urls: https://$adresse:$port_peer
+initial-advertise-peer-urls: https://$adresse:$port_peer
+initial-cluster: $initial_cluster
+initial-cluster-state: new
+initial-cluster-token: $jeton
+
+# Quorum : un membre = une voix ; deux membres sains suffisent.
+client-transport-security:
+  cert-file: $tls_serveur_cert
+  key-file: $tls_serveur_key
+  client-cert-auth: true
+  trusted-ca-file: $tls_ca
+  auto-tls: false
+peer-transport-security:
+  cert-file: $tls_serveur_cert
+  key-file: $tls_serveur_key
+  client-cert-auth: true
+  trusted-ca-file: $tls_ca
+  auto-tls: false
+
+heartbeat-interval: 100
+election-timeout: 1000
+snapshot-count: 10000
+quota-backend-bytes: 2147483648
+logger: zap
+log-level: info

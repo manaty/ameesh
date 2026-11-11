@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# etcd 3.5 — un votant de la grappe ameesh (EP8.4b, lot #6870).
+# Installer : /etc/systemd/system/etcd.service, puis
+#   systemctl daemon-reload && systemctl enable --now etcd.service
+# Le binaire vient de la version 3.5.x épinglée dans le runbook
+# (/usr/local/bin/etcd), pas du paquet de la distribution (3.4.x).
+[Unit]
+Description=etcd — quorum de la grappe PostgreSQL ameesh (EP8.4)
+Documentation=file:///opt/ameesh/src/deploy/serveur/patroni/README.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/etcd/etcd.conf.yml
+ConditionPathExists=/etc/ameesh/tls/ca.crt
+
+[Service]
+Type=notify
+User=etcd
+Group=etcd
+StateDirectory=etcd
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/etcd --config-file /etc/etcd/etcd.conf.yml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/etcd
+
+[Install]
+WantedBy=multi-user.target

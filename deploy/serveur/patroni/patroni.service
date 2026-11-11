@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Patroni 4.x — un nœud de la grappe ameesh (EP8.4b, lot #6870).
+# Installer : /etc/systemd/system/patroni.service, puis
+#   systemctl daemon-reload && systemctl enable --now patroni.service
+# Ne pas Requires=etcd : une perte du DCS met les écritures en pause
+# (failsafe_mode: false), elle n'arrête pas Patroni.
+[Unit]
+Description=Patroni — haute disponibilité PostgreSQL de la grappe ameesh (EP8.4)
+Documentation=file:///opt/ameesh/src/deploy/serveur/patroni/README.md
+After=network-online.target etcd.service
+Wants=network-online.target
+ConditionPathExists=/etc/patroni/patroni.yml
+ConditionPathExists=/etc/ameesh/patroni.env
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+EnvironmentFile=/etc/ameesh/patroni.env
+ExecStart=/opt/patroni/venv/bin/patroni /etc/patroni/patroni.yml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+KillMode=mixed
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+# Patroni écrit postgresql.conf et pg_hba.conf dans config_dir
+# (/etc/postgresql/17/main) et dans le data-dir ; /etc reste sinon en lecture.
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/etc/postgresql /var/lib/postgresql /var/log/postgresql /var/run/postgresql
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+# Dépendances du nœud Patroni (EP8.4b, lot #6870).
+# Patroni 4.x exige un pilote psycopg ; le venv est créé dans /opt/patroni/venv
+# par le runbook. Les versions sont encadrées par majeure pour recevoir les
+# correctifs ; la version validée est notée dans le README.
+patroni[etcd]>=4.0,<5
+psycopg[binary]>=3.2

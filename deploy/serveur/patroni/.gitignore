@@ -1,0 +1,8 @@
+# Matériel généré par generer-tls.sh / generer-configuration.py : jamais
+# versionné. Les clés et secrets restent hors du dépôt (voir README).
+*.key
+*.crt
+*.pem
+secrets.env
+patroni.env
+empreintes.sha256

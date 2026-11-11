@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Enveloppe patronictl de la grappe ameesh (EP8.4b, lot #6870).
+#
+#   patronictl list
+#   patronictl switchover --leader ameesh-agents-1 --candidate ameesh-agents-2
+#   patronictl reinit ameesh manaty-mesh-1
+#
+# Le fichier de configuration contient les certificats et l'API REST ; les
+# mots de passe REST viennent de /etc/ameesh/patroni.env (0640 root:postgres)
+# et sont exportés pour que le chargeur de Patroni les applique, exactement
+# comme le fait le service. Aucun secret n'est affiché.
+#
+# Variables : PATRONI_CONFIG_FILE, PATRONI_ENV_FILE, PATRONI_CTL_BIN.
+set -euo pipefail
+umask 077
+
+CONF=${PATRONI_CONFIG_FILE:-/etc/patroni/patroni.yml}
+ENV_FILE=${PATRONI_ENV_FILE:-/etc/ameesh/patroni.env}
+BIN=${PATRONI_CTL_BIN:-/opt/patroni/venv/bin/patronictl}
+
+die() { printf 'patronictl : %s\n' "$*" >&2; exit 1; }
+
+[[ -r $CONF ]] || die "configuration illisible : $CONF"
+[[ -r $ENV_FILE ]] || die "environnement illisible : $ENV_FILE"
+[[ -x $BIN ]] || die "patronictl introuvable : $BIN"
+
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+exec "$BIN" --config-file "$CONF" "$@"
