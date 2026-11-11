@@ -165,9 +165,12 @@ class ConfigurationTest(unittest.TestCase):
                              "%s:%d" % (noeud["adresse"], ports["patroni_rest"]))
             self.assertIn("certfile", patroni["restapi"])
             self.assertIn("keyfile", patroni["restapi"])
+            self.assertEqual(patroni["etcd3"]["protocol"], "https")
             hotes = patroni["etcd3"]["hosts"].split(",")
             self.assertEqual(len(hotes), 3)
-            self.assertEqual(hotes[0], "https://%s:%d" % (noeud["adresse"], ports["etcd_client"]))
+            # Patroni 4.x attend hôte:port ; le schéma vient de protocol (#6925).
+            self.assertEqual(hotes[0], "%s:%d" % (noeud["adresse"], ports["etcd_client"]))
+            self.assertNotIn("://", patroni["etcd3"]["hosts"])
             self.assertNotIn("password", patroni["restapi"])
             self.assertNotIn("password", patroni["postgresql"]["authentication"]["replication"])
             self.assertEqual(patroni["postgresql"]["authentication"]["replication"]["username"],
