@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=ameesh — sauvegarde pgBackRest (%i) de la base du mesh (EP8.1)
+After=postgresql.service
+# Aucune sauvegarde avant l'activation de l'archivage (pgbackrest-ameesh activer).
+ConditionPathExists=/etc/postgresql/17/main/conf.d/ameesh-archivage.conf
+ConditionPathExists=/etc/pgbackrest/pgbackrest.conf
+
+[Service]
+Type=oneshot
+User=postgres
+UMask=0077
+ExecStart=/usr/local/sbin/ameesh-pgbackrest sauvegarder %i
+TimeoutStartSec=4h
+TimeoutStopSec=60
+KillMode=control-group

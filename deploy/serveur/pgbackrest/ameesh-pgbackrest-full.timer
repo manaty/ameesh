@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=ameesh — sauvegarde pgBackRest complète hebdomadaire
+
+[Timer]
+Unit=ameesh-pgbackrest@full.service
+OnCalendar=Sun *-*-* 02:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
