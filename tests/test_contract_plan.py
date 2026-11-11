@@ -155,6 +155,51 @@ class SharedPlanTest(unittest.TestCase):
         self.assertEqual(plan['selection']['mode'], 'full')
         self.assertIn('unknown-path:unknown.file', plan['contract_plan']['fallback_reasons'])
 
+    def test_unknown_paths_keep_contracts_bounded_at_local_entries(self):
+        for path in ('docs/new.md', 'src/other.py'):
+            self.write(path, 'outside registry')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'unknown paths and matched rule')
+        self.head = self.git('rev-parse', 'HEAD')
+        for used in (False, True):
+            with self.subTest(map_used=used):
+                plan = self.plan(used=used)
+                shared = plan['contract_plan']
+                self.assertEqual(set(shared['contracts']),
+                                 {'test_cluster', 'test_declared', 'test_universal'})
+                self.assertTrue(shared['full_suite_required'])
+                self.assertEqual(plan['selection']['mode'], 'full')
+                ci_modules = {m for parts in plan['parts'].values()
+                              for part in parts for m in part['modules']}
+                self.assertEqual(ci_modules, set(self.inventory))
+                self.assertIn('test_declared', self.packet_modules(plan))
+                self.assertIn('test_universal', self.packet_modules(plan))
+                self.assertNotIn('test_unused', self.packet_modules(plan))
+                prepared = SimpleNamespace(plan=plan, path=str(self.repo / 'plan.json'),
+                                           tree=str(self.repo))
+                with patch.object(calls, '_tree_modules', return_value=set(self.inventory)), \
+                        patch.object(calls, '_changed_paths',
+                                     return_value=['watched.py', 'docs/new.md', 'src/other.py']), \
+                        patch.object(calls.transverse_contracts, 'problem', return_value=''):
+                    result = calls.contract_fallback(prepared, self.params,
+                                                     head=self.head, base=self.base)
+                self.assertIsNotNone(result)
+                fallback = json.loads((self.repo / 'plan.json').read_text())
+                self.assertNotIn('test_unused', pv.planned_modules(fallback))
+                self.assertIn('test_declared', pv.planned_modules(fallback))
+                self.assertIn('test_universal', pv.planned_modules(fallback))
+                self.assertEqual(pv.meets_canon(
+                    fallback, self.params, str(self.repo), head=self.head,
+                    contract_policy=self.policy), (True, ''))
+
+    def test_unreadable_registry_keeps_legacy_without_inventory_expansion(self):
+        self.write('tests/parts/registry.json', 'broken')
+        self.git('commit', '-qam', 'invalid registry')
+        self.head = self.git('rev-parse', 'HEAD')
+        shared = self.plan()['contract_plan']
+        self.assertEqual(shared['contracts'], ['test_cluster'])
+        self.assertTrue(shared['full_suite_required'])
+
     def test_prevalidation_rejects_forged_digest_or_removed_contract(self):
         for field, value in (('registry_digest', '0' * 64),
                              ('contracts', ['test_cluster'])):
