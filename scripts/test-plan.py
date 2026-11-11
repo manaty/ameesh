@@ -232,7 +232,21 @@ RECENT_FAILURE_DAYS = 7
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 8), "psql": (3, 16)}
+#:
+#: #6880 (11/11) : la flotte est à 8 vCPU par hôte (24 vCPU pour les 24
+#: runners) alors que le découpage 16 psql + 8 psycopg avait été calibré sur
+#: 16 vCPU par hôte (48 vCPU). Mesure du paquet h-11 (run 43004377795, 29,3 min,
+#: 24 parts, 2 à 4 processus par part) : travail mesuré ~36 700 s, plancher
+#: ~25,5 min à 24 vCPU ; les parts psycopg pèsent 2 024-2 710 s de charge
+#: contre 359-2 557 s pour psql, et une part psycopg de plus sur un hôte le
+#: ralentit de 1,2 à 1,9x (h-09 : ci-2 225 min de jobs contre ci-1 121 min).
+#: À 12 parts psycopg (~1 423 s) contre 16 psql (~1 227 s), les parts ont des
+#: poids comparables : la répartition par hôte (8 jobs chacun) redevient
+#: équilibrée même si le planificateur place les parts psycopg en premier, et
+#: la simulation sur les charges de h-11 ramène le mur médian de 28,6 à
+#: 26,5 min (p80 31,3 → 27,2, max 38,5 → 29,0). psql reste à 16 : sa part
+#: nocturne complète garde son découpage (#6437, #1692).
+PARTS = {"psycopg": (4, 12), "psql": (3, 16)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 45 min de psycopg
 #: comme dans celui de 60 min de psql (#1251).

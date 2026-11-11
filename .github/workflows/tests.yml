@@ -8,11 +8,12 @@
 # propre Postgres :
 #   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
 #               en une à quatre parts selon l'estimation ; la suite complète,
-#               en 8 parts (#1476 : 6 → 8, d'après les durées mesurées du run
-#               de paquet 39085758208), sur push vers main ou release/**, sur
-#               une PR de release (source ou cible release/** ou
-#               integration/**) et sur l'appel du portier de paquet
-#               (workflow_call, §12) ;
+#               en 12 parts (#6880 : 8 → 12, d'après les charges du paquet
+#               h-11 ; 8 parts pesaient ~1,7x une part psql et une part
+#               lourde de plus sur un hôte dominait le mur), sur push vers
+#               main ou release/**, sur une PR de release (source ou cible
+#               release/** ou integration/**) et sur l'appel du portier de
+#               paquet (workflow_call, §12) ;
 #   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
 #               et le contrat, plus la liste « always » déclenchée (#749), en
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
@@ -34,10 +35,13 @@
 # n'est jamais le check requis d'une PR.
 # #1476 : 16 psql + 8 psycopg = 24 jobs, la taille du pool de #1468 ; le
 # découpage suit les durées mesurées (scripts/test-plan.py, PARTS), jamais ce
-# fichier (rééquilibrage : #3754).
+# fichier (rééquilibrage : #3754). #6880 : psycopg passe à 12 parts (28 jobs) ;
+# les quatre parts au-delà du pool attendent qu'un runner se libère, ce qui
+# lisse la fin de paquet au lieu de laisser un hôte avec quatre parts lourdes.
 # #3754 — chaque part psql/psycopg tourne en deux processus de test
 # (`--parallel 2`), chacun son schéma : les runners auto-hébergés offrent
-# 16 vCPU pour 8 jobs, une part série n'occupait qu'un cœur. La charge mesurée
+# 8 vCPU pour 8 jobs (#6880 : la flotte est à 8 vCPU par hôte, pas 16), une
+# part série n'occupait qu'un cœur. La charge mesurée
 # de la part peut relever ce nombre jusqu'à 4 (cible ~450 s de tests par
 # processus) : les parts lourdes prennent plus de cœurs, pas plus de temps.
 # #3945 — sans dépasser la part de l'hôte, vCPU // AMEESH_CI_JOBS_PER_HOST :

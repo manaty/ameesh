@@ -2133,7 +2133,7 @@ class PlanTest(unittest.TestCase):
             plan.read_list(plan.ALWAYS_FILE, mods))
         self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]),
                          sorted(pilot))
-        # #1476 : la suite complète passe à 16 psql et 8 psycopg
+        # #1476 : la suite complète passe à 16 psql et 8 psycopg, puis 12 (#6880)
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
                          _full_suite_parts("psycopg"))
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
@@ -2168,8 +2168,12 @@ class PlanTest(unittest.TestCase):
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
         # #1476 : seize parts psql et huit psycopg (24 jobs = 24 runners),
         # d'après les durées mesurées du run de paquet 39085758208.
+        # #6880 : psycopg passe à douze parts (28 jobs) pour que chaque part
+        # pèse ~1 423 s contre ~1 227 s en psql ; à huit parts, une part
+        # psycopg pèse ~1,7x une part psql et la répartition par hôte
+        # (quatre parts lourdes sur un hôte contre zéro) domine le mur.
         self.assertEqual(plan.PARTS["psql"][1], 16)
-        self.assertEqual(plan.PARTS["psycopg"][1], 8)
+        self.assertEqual(plan.PARTS["psycopg"][1], 12)
 
     def test_full_suite_psycopg_is_split_for_the_cap(self):
         # #2292 : à quatre parts, 14,3-30,5 min sous saturation sur les cinq
@@ -2344,7 +2348,7 @@ def _full_suite_parts(driver: str) -> list[int]:
     """`of` de chaque part de la suite complète, lu de `plan.PARTS`.
 
     Le découpage appartient au plan (#1692 : 9 parts psql ; #1476 : 16 psql et
-    8 psycopg), épinglé par
+    8 psycopg ; #6880 : 12 psycopg), épinglé par
     `PlanTest.test_pull_request_psql_part_is_split_for_the_cap`. Un témoin de
     cette voie le lit au lieu de recopier le nombre : sinon chaque changement
     de découpage casse l'union des lots (#1343 × #1476, 5 FAIL sur l'arbre
@@ -3659,7 +3663,7 @@ class LotFreezePlanTest(unittest.TestCase):
         p = plan.fallback_plan("pull_request", "boom", mode="lot",
                                base_ref="main", head_ref="lot/x")
         # #3343 : le repli reste la suite complète, même au gel d'un lot ; il
-        # prend les parts de main (16 psql, 8 psycopg), jamais les 3 d'un lot.
+        # prend les parts de main (16 psql, 12 psycopg), jamais les 3 d'un lot.
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
                          _full_suite_parts("psycopg"))
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],

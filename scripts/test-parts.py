@@ -186,6 +186,11 @@ PARALLEL_MAX = 4
 #: prend donc au plus sa part des vCPU de l'hôte, `vCPU // runners de
 #: l'hôte` (2 sur 16 vCPU et 8 runners), même au-dessus du `--parallel`
 #: demandé ; sans la variable (poste, fourche), pas de plafond.
+#: #6880 (11/11) : la flotte est à 8 vCPU par hôte (8 runners, 24 vCPU pour
+#: les 24 runners) ; les paquets h-09 à h-11 ont mesuré 2 à 4 processus par
+#: part et une charge système de 20 à 36 par hôte. Le découpage 12 psycopg +
+#: 16 psql vise des parts de poids comparable, pour que la répartition par
+#: hôte reste équilibrée malgré ce plancher de deux processus.
 JOBS_PER_HOST_ENV = "AMEESH_CI_JOBS_PER_HOST"
 #: #3754 — un processus de la part parallèle : il exécute un sous-ensemble de
 #: tests (plan dérivé) et ne refait pas de fan-out. La variable évite la
