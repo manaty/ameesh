@@ -34,7 +34,14 @@
 #   PGBR_CIPHER_PASS (chiffrement du dépôt : une copie DOIT vivre hors de
 #   l'hôte, chez le bureau, sinon une perte de l'hôte rend le dépôt illisible)
 #   facultatifs : PGBR_S3_ENDPOINT (défaut s3.<région>.scw.cloud),
-#   PGBR_REPO_PATH (défaut /pgbackrest/<hôte>), PGBR_STANZA (défaut ameesh)
+#   PGBR_REPO_PATH (défaut /pgbackrest/<hôte>)
+# La stanza est toujours `ameesh` : les minuteries (sous postgres) et les
+# autres commandes ne lisent pas ce fichier, une stanza propre à l'hôte n'y
+# serait vue que par `configurer` ; PGBR_STANZA est donc refusé.
+#
+# Les exercices se lancent en root (ou sous postgres) : initdb, pg_ctl,
+# pgbackrest restore, psql et pg_restore passent sous le compte de Postgres,
+# qui refuse root ; le dossier lui appartient, le dump lui est lu sur l'entrée.
 #
 # La rétention (14 jours de restauration à un instant) est tenue par
 # pgBackRest (repo1-retention-full-type=time) : une règle de cycle de vie du
@@ -49,6 +56,7 @@ PG_CONF=${AMEESH_PGBR_PG_CONF:-/etc/postgresql/$PG_VERSION/main}
 PG_DATA=${AMEESH_PGBR_PG_DATA:-/var/lib/postgresql/$PG_VERSION/main}
 PG_UNIT=${AMEESH_PGBR_PG_UNIT:-postgresql@$PG_VERSION-main}
 PG_USER=${AMEESH_PGBR_PG_USER:-postgres}
+PG_GROUP=$(id -gn "$PG_USER" 2>/dev/null || echo "$PG_USER")
 ENV_FILE=${AMEESH_PGBR_ENV:-/etc/ameesh/pgbackrest.env}
 ETC=${AMEESH_PGBR_ETC:-/etc/pgbackrest}
 SPOOL=${AMEESH_PGBR_SPOOL:-/var/spool/pgbackrest}
@@ -64,7 +72,10 @@ as_pg() {
   if [[ $(id -un) == "$PG_USER" ]]; then "$@"; else runuser -u "$PG_USER" -- "$@"; fi
 }
 
-stanza() { echo "${PGBR_STANZA:-ameesh}"; }
+stanza() { echo ameesh; }
+
+# Fichier ou dossier rendu à Postgres ; hors root (tests), rien à céder.
+ceder() { if [[ $EUID == 0 ]]; then chown "$PG_USER:$PG_GROUP" "$@"; fi; }
 
 charger_env() {
   [[ -r $ENV_FILE ]] || die "$ENV_FILE absent : le bureau confirme le bucket et ses accès d'abord"
@@ -74,14 +85,14 @@ charger_env() {
   for v in PGBR_S3_BUCKET PGBR_S3_REGION PGBR_S3_KEY PGBR_S3_KEY_SECRET PGBR_CIPHER_PASS; do
     [[ -n ${!v:-} ]] || die "$v manquant dans $ENV_FILE"
   done
+  [[ -z ${PGBR_STANZA:-} ]] || die "PGBR_STANZA refusé : la stanza est toujours ameesh"
   for v in PGBR_S3_BUCKET PGBR_S3_REGION PGBR_S3_ENDPOINT PGBR_S3_KEY PGBR_S3_KEY_SECRET \
-           PGBR_CIPHER_PASS PGBR_REPO_PATH PGBR_STANZA; do
+           PGBR_CIPHER_PASS PGBR_REPO_PATH; do
     # une valeur du fichier ini va jusqu'à la fin de la ligne
     [[ ${!v:-} != *$'\n'* && ${!v:-} != *$'\r'* ]] || die "$v : retour à la ligne refusé"
   done
   [[ $PGBR_S3_BUCKET =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "PGBR_S3_BUCKET invalide"
   [[ $PGBR_S3_REGION =~ ^[a-z]{2}-[a-z]{3}$ ]] || die "PGBR_S3_REGION invalide (ex. nl-ams)"
-  [[ $(stanza) =~ ^[a-z0-9_-]+$ ]] || die "PGBR_STANZA invalide"
   if [[ $PGBR_S3_REGION == fr-par ]]; then
     log "bucket en fr-par, la région des VM : pas de copie hors région (décision 6)"
   fi
@@ -91,7 +102,10 @@ configurer() {
   charger_env
   local endpoint=${PGBR_S3_ENDPOINT:-s3.$PGBR_S3_REGION.scw.cloud}
   local path=${PGBR_REPO_PATH:-/pgbackrest/$(hostname)}
+  # pgBackRest lit sa configuration sous postgres : son groupe doit traverser
+  # le dossier (relecture ameesh-dev3, 292eb8991d42)
   install -d -m 0750 "$ETC"
+  chgrp "$PG_GROUP" "$ETC" 2>/dev/null || true
   install -d -m 0750 -o "$PG_USER" -g "$PG_USER" "$SPOOL" "$LOGS" 2>/dev/null \
     || install -d -m 0750 "$SPOOL" "$LOGS"
   local tmp
@@ -128,7 +142,7 @@ pg1-port=5432
 pg1-socket-path=/var/run/postgresql
 CONF
   chmod 0640 "$tmp"
-  chgrp "$PG_USER" "$tmp" 2>/dev/null || true
+  chgrp "$PG_GROUP" "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$ETC/pgbackrest.conf"
   log "$ETC/pgbackrest.conf écrit (dépôt s3://$PGBR_S3_BUCKET$path, $endpoint)"
 }
@@ -226,6 +240,7 @@ lire_options() {
     die "--dossier $DOSSIER n'est pas vide"
   fi
   install -d -m 0700 "$DOSSIER"
+  ceder "$DOSSIER"
 }
 
 # Instance jetable : socket dans le dossier, aucune écoute réseau, aucun
@@ -243,14 +258,15 @@ hot_standby = off
 CONF
   printf 'local all all trust\n' > "$DOSSIER/pg_hba.conf"
   : > "$DOSSIER/pg_ident.conf"
+  ceder "$DOSSIER/postgresql.conf" "$DOSSIER/pg_hba.conf" "$DOSSIER/pg_ident.conf"
 }
 
 demarrer_instance() {
-  "$PG_BIN/pg_ctl" -D "$DOSSIER" -l "$DOSSIER/exercice.log" -w -t 3600 start
+  as_pg "$PG_BIN/pg_ctl" -D "$DOSSIER" -l "$DOSSIER/exercice.log" -w -t 3600 start
 }
 
 arreter_instance() {
-  "$PG_BIN/pg_ctl" -D "$DOSSIER" -m fast -w stop >/dev/null 2>&1 || true
+  as_pg "$PG_BIN/pg_ctl" -D "$DOSSIER" -m fast -w stop >/dev/null 2>&1 || true
   if [[ $GARDER == 0 ]]; then rm -rf "$DOSSIER"; fi
 }
 
@@ -258,7 +274,7 @@ sonder_instance() {
   local cfg="$DOSSIER/ameesh-exercice.json"
   printf '{"dsn": "postgresql://ameesh@/ameesh?host=%s&port=%s", "host": "exercice-restauration", "canons": []}\n' \
     "$DOSSIER" "$PORT" > "$cfg"
-  "$PG_BIN/psql" -h "$DOSSIER" -p "$PORT" -U ameesh -d ameesh -XAtc \
+  as_pg "$PG_BIN/psql" -h "$DOSSIER" -p "$PORT" -U ameesh -d ameesh -XAtc \
     "SELECT 'instant atteint : ' || coalesce(max(created_at)::text, '?') FROM agent_mailbox" >&2 || true
   AMEESH_CONFIG=$cfg ameesh doctor --probe
 }
@@ -269,7 +285,7 @@ restaurer() {
   local t0 t1
   t0=$(date +%s)
   trap arreter_instance EXIT
-  pgbackrest --stanza="$(stanza)" --pg1-path="$DOSSIER" --type=time --target="$CIBLE" \
+  as_pg pgbackrest --stanza="$(stanza)" --pg1-path="$DOSSIER" --type=time --target="$CIBLE" \
     --target-action=promote --archive-mode=off --delta=n restore
   configurer_instance
   demarrer_instance
@@ -284,12 +300,14 @@ exercice_dump() {
   local t0 t1
   t0=$(date +%s)
   trap arreter_instance EXIT
-  "$PG_BIN/initdb" -D "$DOSSIER" -U postgres -A trust >/dev/null
+  as_pg "$PG_BIN/initdb" -D "$DOSSIER" -U postgres -A trust >/dev/null
   configurer_instance
   demarrer_instance
-  "$PG_BIN/psql" -h "$DOSSIER" -p "$PORT" -U postgres -d postgres -Xqc "CREATE ROLE ameesh LOGIN" \
+  as_pg "$PG_BIN/psql" -h "$DOSSIER" -p "$PORT" -U postgres -d postgres -Xqc "CREATE ROLE ameesh LOGIN" \
     -c "CREATE DATABASE ameesh OWNER ameesh"
-  "$PG_BIN/pg_restore" -h "$DOSSIER" -p "$PORT" -U postgres -d ameesh --no-acl --exit-on-error "$FICHIER"
+  # le dump (root, 0600) est ouvert ici et lu par pg_restore sur son entrée
+  as_pg "$PG_BIN/pg_restore" -h "$DOSSIER" -p "$PORT" -U postgres -d ameesh --no-acl \
+    --exit-on-error < "$FICHIER"
   sonder_instance
   t1=$(date +%s)
   log "exercice réussi : dump $(basename "$FICHIER") restauré, doctor vert, RTO mesuré $((t1 - t0)) s"
@@ -305,5 +323,5 @@ case $cmd in
   etat) as_pg pgbackrest --stanza="$(stanza)" info ;;
   restaurer) restaurer "$@" ;;
   exercice-dump) exercice_dump "$@" ;;
-  *) sed -n '4,40p' "$0" >&2; exit 2 ;;
+  *) sed -n '4,44p' "$0" >&2; exit 2 ;;
 esac

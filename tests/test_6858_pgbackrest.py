@@ -20,11 +20,21 @@ ROOT = Path(__file__).resolve().parents[1]
 DIR = ROOT / "deploy/serveur/pgbackrest"
 SCRIPT = DIR / "pgbackrest-ameesh.sh"
 
+# Les outils de Postgres refusent un autre compte que celui de Postgres, comme
+# initdb et pg_ctl refusent root ; `runuser` faux passe le compte par RUNAS.
 FAKE = """#!/bin/sh
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$JOURNAL"
 case "$(basename "$0")" in
   ameesh) printf 'ameesh-config %s\\n' "$AMEESH_CONFIG" >> "$JOURNAL"
           cat "$AMEESH_CONFIG" >> "$JOURNAL" ;;
+  runuser) u=$2; shift 3; RUNAS=$u exec "$@" ;;
+  pgbackrest|pg_ctl|psql|initdb|pg_restore|pg_isready)
+    if [ "${RUNAS:-$(id -un)}" != "$PG_ATTENDU" ]; then
+      echo "$(basename "$0") refusé sous ${RUNAS:-$(id -un)}" >&2; exit 1
+    fi ;;
+esac
+case "$(basename "$0")" in
+  pg_restore) printf 'entrée %s\\n' "$(cat)" >> "$JOURNAL" ;;
 esac
 exit 0
 """
@@ -63,6 +73,7 @@ class PgBackRestAmeesh(unittest.TestCase):
             "AMEESH_PGBR_PG_CONF": str(self.pgconf),
             "AMEESH_PGBR_PG_DATA": str(self.pgdata),
             "AMEESH_PGBR_PG_USER": getpass.getuser(),
+            "PG_ATTENDU": getpass.getuser(),
             "AMEESH_PGBR_ENV": str(self.envfile),
             "AMEESH_PGBR_ETC": str(self.etc),
             "AMEESH_PGBR_SPOOL": str(self.tmp / "spool"),
@@ -112,6 +123,15 @@ class PgBackRestAmeesh(unittest.TestCase):
         r = self.run_script("configurer")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("retour à la ligne refusé", r.stderr)
+        self.assertFalse((self.etc / "pgbackrest.conf").exists())
+
+    def test_stanza_personnalisee_refusee(self):
+        # seule `configurer` lit le fichier : une autre stanza y divergerait
+        # des minuteries et des autres commandes (relecture ameesh-cx2, B2)
+        self.envfile.write_text(ENV_OK + "PGBR_STANZA=autre\n")
+        r = self.run_script("configurer")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("PGBR_STANZA refusé", r.stderr)
         self.assertFalse((self.etc / "pgbackrest.conf").exists())
 
     def test_configurer_refuse_bucket_invalide(self):
@@ -212,11 +232,37 @@ class PgBackRestAmeesh(unittest.TestCase):
                             "--garder")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(f"pg_restore -h {d} -p 55432 -U postgres -d ameesh --no-acl "
-                      f"--exit-on-error {dump}", self.calls())
+                      "--exit-on-error", self.calls())
+        self.assertIn("entrée PGDMP", self.calls())
         self.assertIn("ameesh doctor --probe", self.calls())
         conf = (d / "postgresql.conf").read_text()
         self.assertIn("listen_addresses = ''", conf)
         self.assertIn("archive_mode = off", conf)
+
+    def test_exercices_sous_le_compte_de_postgres(self):
+        # lancés par un autre compte (root en vrai), les outils de Postgres
+        # passent par runuser ; appelés directement, les faux refusent
+        # (relecture ameesh-cx2, B1)
+        self.env["AMEESH_PGBR_PG_USER"] = self.env["PG_ATTENDU"] = "pgfaux"
+        dump = self.tmp / "ameesh.dump"
+        dump.write_bytes(b"PGDMP")
+        r = self.run_script("exercice-dump", "--fichier", str(dump),
+                            "--dossier", str(self.tmp / "e1"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.run_script("restaurer", "--cible", "2026-11-11 08:00:00+00",
+                            "--dossier", str(self.tmp / "e2"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls()
+        for i, c in enumerate(calls):
+            if c.split(" ")[0] in ("pgbackrest", "pg_ctl", "psql", "initdb", "pg_restore"):
+                self.assertTrue(calls[i - 1].startswith("runuser -u pgfaux -- "), c)
+        self.assertGreaterEqual(sum(c.startswith("runuser -u pgfaux -- ") for c in calls), 10)
+
+    def test_faux_outils_refusent_un_autre_compte(self):
+        self.env["PG_ATTENDU"] = "pgfaux"
+        r = subprocess.run([str(self.bin / "initdb"), "-D", "x"], env=self.env,
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
 
     # --- unités et installateur ------------------------------------------------
     def test_unites(self):

@@ -36,11 +36,15 @@ les WAL plus récents.
    hors de `fr-par`. Il fournit une clé dédiée et une phrase de chiffrement,
    dont une copie reste chez lui. Il écrit `/etc/ameesh/pgbackrest.env`
    (root, 0600) : `PGBR_S3_BUCKET`, `PGBR_S3_REGION`, `PGBR_S3_KEY`,
-   `PGBR_S3_KEY_SECRET`, `PGBR_CIPHER_PASS`. Aucun secret dans le dépôt.
+   `PGBR_S3_KEY_SECRET`, `PGBR_CIPHER_PASS`. Aucun secret dans le dépôt. La
+   stanza est toujours `ameesh` (`PGBR_STANZA` est refusé : les minuteries ne
+   lisent pas ce fichier).
 2. **Avant tout changement** : relever `df -h /var/lib/postgresql`, puis
    restaurer le dump S3 actuel sur un autre hôte :
    `ameesh-pgbackrest exercice-dump --fichier <dump> --dossier <vide>`.
-   Cet exercice doit finir sur `doctor` vert.
+   Cet exercice doit finir sur `doctor` vert. En root, les outils de Postgres
+   (qui refusent root) passent sous `postgres`, propriétaire du dossier ; le
+   dump est lu par root et donné à `pg_restore` sur son entrée.
 3. `ameesh-pgbackrest configurer`, puis `ameesh-pgbackrest activer`, sans
    redémarrage : la stanza est créée et le réglage posé, mais rien n'est
    encore appliqué. Retour arrière : `ameesh-pgbackrest desactiver`.
@@ -50,7 +54,7 @@ les WAL plus récents.
    première sauvegarde complète, puis met les minuteries en marche. Retour
    arrière : `ameesh-pgbackrest desactiver --redemarrer`.
 5. **Exercice de restauration** : sur un hôte qui n'est pas celui de la base,
-   sous `postgres`, avec le même `pgbackrest.conf` :
+   en root ou sous `postgres`, avec le même `pgbackrest.conf` :
    `ameesh-pgbackrest restaurer --cible '2026-11-12 08:00:00+00' --dossier <vide>`.
    Il restaure à l'instant choisi dans une instance jetable : socket local,
    aucune écoute réseau, `archive-mode=off`, donc rien ne repart vers le
