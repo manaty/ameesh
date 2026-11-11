@@ -73,3 +73,7 @@ class Ledger:
         if result is None:
             raise TrainError("target lease, train revision or fire changed; abandon refused")
         return result
+
+    def request_abandon(self, plan_id, request):
+        """#6978: ask the live holder to abandon this exact plan; None if refused."""
+        return self.ops.train_abandon_request(self.key, plan_id, request)

@@ -14,7 +14,7 @@ import re
 from urllib.parse import quote
 
 from . import land, resolutions
-from .train import TrainError, digest
+from .train import PublicationRefused, TrainError, digest
 
 
 def _slurp_unsupported(proc) -> bool:
@@ -518,7 +518,8 @@ def verify_local(path, plan, workflows):
         fields = resolutions._text(proc).strip().split()
         if proc.returncode or len(fields) != 4 or fields[0] not in ("100644", "100755") \
                 or fields[1:] != ["blob", blob, source]:
-            raise TrainError("full-suite source differs from audited CI contract: %s" % source)
+            raise PublicationRefused("full-suite source differs from audited CI contract: %s"
+                                     % source)
     due_for = getattr(workflows, "due_for", None)
     if callable(due_for):
         # The suite's own workflow is the reviewed project code, not a frozen
@@ -529,8 +530,8 @@ def verify_local(path, plan, workflows):
             fields = resolutions._text(proc).strip().split()
             if proc.returncode or len(fields) != 4 or fields[0] not in ("100644", "100755") \
                     or fields[1] != "blob" or fields[3] != workflow.path:
-                raise TrainError("due suite workflow missing at the train head: %s"
-                                 % workflow.path)
+                raise PublicationRefused("due suite workflow missing at the train head: %s"
+                                         % workflow.path)
 
 
 class GitHub:

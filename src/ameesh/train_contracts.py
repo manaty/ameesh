@@ -30,7 +30,7 @@ import re
 import types
 
 from . import ci_parts, radar, resolutions, train_ci
-from .train import TrainError, digest
+from .train import PublicationRefused, TrainError, digest
 from .train_ci import Workflow
 
 
@@ -202,8 +202,9 @@ class Nexlink:
         if proc.returncode or len(fields) != 4 or fields[0] not in ("100644", "100755") \
                 or fields[1] != "blob" or fields[2] != _NEXLINK_LOT_SELECTOR[1] \
                 or fields[3] != _NEXLINK_LOT_SELECTOR[0]:
-            raise TrainError("the target selector differs from the audited Nexlink contract: %s"
-                             % _NEXLINK_LOT_SELECTOR[0])
+            raise PublicationRefused(
+                "the target selector differs from the audited Nexlink contract: %s"
+                % _NEXLINK_LOT_SELECTOR[0])
 
     def _proof(self, plan, *, repo, cache, declarations_sha=None):
         """One due-parts proof: the audited selector over base or head tree."""
@@ -234,12 +235,13 @@ class Nexlink:
         due = tuple(base_proof["due"]) + tuple(
             context for context in head_proof["due"] if context not in base_proof["due"])
         if not due:
-            raise TrainError("no due part: a packet CI cannot be proven (doc-only packet?)")
+            raise PublicationRefused(
+                "no due part: a packet CI cannot be proven (doc-only packet?)")
         workflows = []
         for context in due:
             match = re.fullmatch(r"lot/([A-Za-z0-9_-]+)", context)
             if match is None:
-                raise TrainError("malformed due part: %r" % context)
+                raise PublicationRefused("malformed due part: %r" % context)
             path = ".github/workflows/%s.yml" % match.group(1)
             # The context and the workflow file are two declarations at the
             # dispatched head; the selector names the context, the dispatch
@@ -250,8 +252,8 @@ class Nexlink:
             declared = re.search(r"(?m)^\s*context:\s*(lot/[A-Za-z0-9_-]+)\s*$",
                                  resolutions._text(proc) if not proc.returncode else "")
             if proc.returncode or declared is None or declared.group(1) != context:
-                raise TrainError("due part %s is not declared by %s at the train head"
-                                 % (context, path))
+                raise PublicationRefused("due part %s is not declared by %s at the train head"
+                                         % (context, path))
             workflows.append(train_ci.DueWorkflow(path=path, context=context))
         self._resolved_key = key
         self._resolved = tuple(workflows)

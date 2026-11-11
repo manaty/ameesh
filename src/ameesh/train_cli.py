@@ -19,7 +19,10 @@ A persisted plan that was never fired has no receipt to withdraw: ``abandon``
 is its terminal gesture. It refuses an active/uncertain fire (withdraw or
 reconcile first), writes the terminal phase with the pilot actor, and releases
 the target lease it had to take (or adopts when that lease has expired). The
-next cutoff may then compose a new plan. #6853: a ``paused`` train (red
+next cutoff may then compose a new plan. #6978: while a live train service
+holds that lease, ``abandon`` persists the same request instead (no lease,
+same guards in storage); the holder applies it at its next step and ``show``
+names it until then. #6853: a ``paused`` train (red
 prevalidation) is terminal for the engine, which never composes behind it;
 ``abandon`` is the pilot's way out of it, with the same guards (exact plan,
 no active/uncertain fire, target lease).
@@ -71,13 +74,23 @@ def _abandon(ledger, plan, *, actor, reason, now):
     # expired one, only for the terminal write, then give it back.
     epoch = ledger.acquire(None)
     if epoch is None:
-        raise TrainError("target reservation is held by another live train; "
-                         "abandon once its lease expires")
+        # #6978 : le service vivant tient le bail ; il applique la demande à
+        # son prochain pas, sous ce bail, avec les mêmes gardes.
+        request = dict(actor=actor, at_ts=now, reason=reason, plan=current["id"],
+                       fire=(fire or {}).get("id"))
+        requested = ledger.request_abandon(current["id"], request)
+        if requested is None:
+            raise TrainError("target reservation is held by another live train and the "
+                             "abandon request was refused: plan, phase or fire changed")
+        return dict(phase=requested["phase"], revision=requested["revision"],
+                    plan=requested["plan"], abandon_request=requested["abandon_request"],
+                    fire=ledger.ops.train_fire_read(ledger.key, current["id"]))
     try:
         state["phase"] = "invalidated"
         state["abandoned"] = dict(actor=actor, at_ts=now, reason=reason,
                                   previous_phase=phase, plan=current["id"],
                                   fire=(fire or {}).get("id"))
+        state["abandon_request"] = None
         saved = ledger.abandon(state, int(state["revision"]), epoch)
     finally:
         ledger.release(epoch)
@@ -109,6 +122,8 @@ def execute(cfg, db, project, action, *, manifest=None, receipt=None, reason=Non
                       enrollment_checked_ts=state.get("enrollment_checked_ts"))
         if state.get("abandoned"):
             result["abandoned"] = state["abandoned"]
+        if state.get("abandon_request"):
+            result["abandon_request"] = state["abandon_request"]
         return result
     if action not in ("give", "withdraw", "abandon"):
         raise TrainError("train command: show | give | withdraw | abandon expected")

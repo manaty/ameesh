@@ -111,6 +111,9 @@ class Runtime:
     def save(self, state, expected, epoch):
         return self.ledger.save(state, expected, epoch)
 
+    def abandon(self, state, expected, epoch):
+        return self.ledger.abandon(state, expected, epoch)
+
     def target(self):
         return self.repository.target(self.target_branch)
 

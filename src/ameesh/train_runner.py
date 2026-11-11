@@ -172,7 +172,7 @@ class HostLease:
 #: (`ledger.acquire`) precedes every effect; publication is fenced at its
 #: push and composition at its migration reservations, so a long
 #: prevalidation or replay never holds the service lease's lock.
-_FENCED = (("save", "release", "enroll", "quarantine", "start_ci", "reconcile", "promote"),
+_FENCED = (("save", "abandon", "release", "enroll", "quarantine", "start_ci", "reconcile", "promote"),
            ("acquire", "before_publish"),
            ("publish",),
            ("reserve", "landed"))

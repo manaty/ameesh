@@ -73,6 +73,22 @@ incertaine est republiée à l'identique (idempotente), une promotion incertaine
 passe par la réconciliation. Une réservation ordinaire (fusion d'un lot seul)
 n'est jamais adoptée, ni un ticket dont l'epoch ne correspond plus à la ligne.
 
+Un refus local et déterministe avant tout effet distant (#6978) n'est pas une
+publication incertaine : contrat CI audité différent ou absent à la tête du
+plan (`full-suite source differs…`, suite due absente, sélecteur Nexlink
+modifié), le plan passe `invalidated` avec `diagnosis.stage = publication` et
+la réservation est rendue ; le créneau suivant recompose. Une prévalidation
+indisponible (outillage absent au SHA) reste non bloquante. Seul un plan dont
+une passe antérieure a été incertaine (`publication_uncertain`) garde
+`publishing` et sa réservation, car il a pu être poussé.
+
+`train_cli abandon` sur un plan non donné dont le service vivant tient le bail
+(#6978) pose une demande (`abandon_request`, visible par `show`) au lieu d'être
+refusé : sans bail, avec les mêmes gardes (plan exact, ni phase terminale sauf
+`paused`, ni `promoting`, aucun feu actif). Le détenteur l'applique à son pas
+suivant, sous son bail, et rend la réservation ; un feu donné entre-temps la
+marque `refused` et le train continue.
+
 ## Modes
 
 ### `shadow` — le plan calculé, sans effet

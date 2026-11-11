@@ -276,14 +276,17 @@ class TrainCommandTest(PgTestCase):
         epoch = self.ledger.acquire(None)
         self.assertIsNotNone(epoch)
         try:
+            # #6978 : le détenteur vivant reçoit une demande au lieu d'un refus.
             with mock.patch.object(work, "corrector", return_value="pilot"):
-                with self.assertRaisesRegex(train.TrainError, "live train"):
-                    self.execute("abandon", manifest=item)
+                requested = self.execute("abandon", manifest=item)
+            self.assertEqual((requested["phase"], requested["abandon_request"]["actor"]),
+                             ("publishing", "pilot"))
             self.db.execute("UPDATE merge_locks SET expires_at = clock_timestamp()"
                             " - interval '1 second' WHERE target = %s", (self.ledger.key,))
             with mock.patch.object(work, "corrector", return_value="pilot"):
                 result = self.execute("abandon", manifest=item)
             self.assertEqual(result["phase"], "invalidated")
+            self.assertIsNone(self.ledger.load()["abandon_request"])
             self.assertEqual(self.db.query(
                 "SELECT owner FROM merge_locks WHERE target = %s", (self.ledger.key,)),
                 [{"owner": None}])

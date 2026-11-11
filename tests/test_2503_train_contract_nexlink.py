@@ -669,14 +669,14 @@ class VerifyLocalTest(unittest.TestCase):
     def test_changed_shared_source_refuses_publication(self):
         contract = FakeContract((self.due,), dict(self.sources,
             **{"scripts/ci/lot-plan.mjs": "e" * 40}))
-        with self.assertRaisesRegex(train.TrainError, "source differs"):
+        with self.assertRaisesRegex(train.PublicationRefused, "source differs"):
             train_ci.verify_local(self.repo, self.plan, contract)
 
     def test_missing_due_workflow_refuses_publication(self):
         contract = FakeContract((self.due,), self.sources)
         os.remove(os.path.join(self.repo, ".github/workflows/backend-suite.yml"))
         self.commit()
-        with self.assertRaisesRegex(train.TrainError, "due suite workflow missing"):
+        with self.assertRaisesRegex(train.PublicationRefused, "due suite workflow missing"):
             train_ci.verify_local(self.repo, self.plan, contract)
 
     def test_an_undue_workflow_is_not_part_of_this_packet_proof(self):

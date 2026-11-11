@@ -38,6 +38,16 @@ class PrevalidationRed(TrainError):
     est rendue par le `finally` de `step`."""
 
 
+class PublicationRefused(TrainError):
+    """#6978 : un refus local et déterministe avant tout effet distant (contrat
+    CI audité absent ou différent à la tête du plan) : la même composition
+    immuable serait refusée à l'identique à chaque passe.
+
+    Ce n'est pas une réponse perdue : l'Engine invalide le plan (terminal,
+    réservation rendue) au lieu de garder `publishing` jusqu'à la date limite.
+    Une indisponibilité de prévalidation n'en est pas une (non bloquante)."""
+
+
 class MemberDeferred(TrainError):
     """A named composition exclusion, never an accusation or queue ejection."""
     def __init__(self, row, reason):
@@ -285,6 +295,11 @@ class Engine:
         try:
             if state is not None and (state["source"], state["target"]) != (self.source, self.target):
                 raise TrainError("persisted train belongs to another repository or target")
+            if state is not None and state.get("abandon_request"):
+                abandoned = self._requested_abandon(state, now)
+                if abandoned is not None:
+                    state = abandoned.pop("state")
+                    return abandoned
             if state is not None and state["phase"] == "paused":
                 return {"result": "paused"}
             if state is not None and state["phase"] == "draining":
@@ -333,7 +348,9 @@ class Engine:
                              attempts=[], failures=0, pending=[], excluded=[], good=[], deferred=[],
                              enrollment_deferred=copy.deepcopy(
                                  (state or {}).get("enrollment_deferred") or []),
-                             enrollment_checked_ts=(state or {}).get("enrollment_checked_ts"))
+                             enrollment_checked_ts=(state or {}).get("enrollment_checked_ts"),
+                             # #6978 : une demande nommait un plan précédent.
+                             abandon_request=None)
                 state = self._save(state)
             if self.policy.build_beta and (state.get("plan") or {}).get("diagnostic"):
                 raise TrainError("diagnostic CI is disabled during build/beta")
@@ -372,9 +389,21 @@ class Engine:
                     # réponse perdue : on arrête le paquet (terminal, donc
                     # réservation rendue) au lieu de rejouer la composition.
                     return self._prevalidation_red(state, exc)
+                except PublicationRefused as exc:
+                    # #6978 : refusé avant le bail distant, donc rien n'a été
+                    # poussé dans cette passe. Une passe antérieure incertaine
+                    # a pu pousser sous un autre contrat : elle garde son
+                    # chemin de réconciliation.
+                    if not state.get("publication_uncertain"):
+                        return self._publication_refused(state, exc)
+                    self.ports.notify(str(exc), state)
+                    return {"result": "publication-uncertain", "error": str(exc)}
                 except TrainError as exc:
                     # A push may have succeeded despite a lost response.
                     # Keep the immutable publication intent for reconciliation.
+                    if not state.get("publication_uncertain"):
+                        state["publication_uncertain"] = True
+                        state = self._save(state)
                     self.ports.notify(str(exc), state)
                     return {"result": "publication-uncertain", "error": str(exc)}
                 state["phase"] = "ci-intent"
@@ -479,6 +508,57 @@ class Engine:
         state = self._save(state)
         self.ports.notify("prevalidation red before publication: %s" % exc, state)
         return {"result": "paused", "error": str(exc)}
+
+    def _requested_abandon(self, state, now):
+        """#6978 : applique, sous le bail de ce détenteur, l'abandon qu'un
+        pilote a demandé sans pouvoir prendre ce bail (`train_cli abandon`).
+
+        Mêmes gardes que l'abandon direct, revérifiées par le stockage dans la
+        même transaction : plan exact, ni phase terminale (sauf `paused`) ni
+        `promoting`, aucun feu actif. Une demande périmée (autre plan, phase
+        devenue terminale ou promotion) ne fait rien ; une demande refusée
+        (feu donné depuis) est marquée `refused` et signalée, le train continue.
+        Retourne None quand le pas suit son cours."""
+        request, phase = state["abandon_request"], state.get("phase")
+        plan = state.get("plan") or {}
+        abandon = getattr(self.ports, "abandon", None)
+        if not isinstance(request, dict) or request.get("refused") \
+                or request.get("plan") != plan.get("id") \
+                or phase == "promoting" or (phase in TERMINAL and phase != "paused") \
+                or not callable(abandon):
+            return None
+        self._held()
+        terminal = copy.deepcopy(state)
+        terminal["phase"] = "invalidated"
+        terminal["abandoned"] = dict(actor=request.get("actor"), at_ts=request.get("at_ts"),
+                                     reason=request.get("reason", ""), previous_phase=phase,
+                                     plan=plan["id"], fire=request.get("fire"),
+                                     applied_ts=now)
+        terminal["abandon_request"] = None
+        try:
+            saved = abandon(terminal, int(state.get("revision", 0)), self.epoch)
+        except TrainError as exc:
+            # Un objet, pas None : `train_save` garderait sinon la demande.
+            state["abandon_request"] = dict(request, refused=str(exc))
+            state = self._save(state)
+            self.ports.notify("abandon request refused under the lease: %s" % exc, state)
+            return {"result": "abandon-refused", "error": str(exc), "state": state}
+        self.ports.notify("plan abandoned at the pilot's request", saved)
+        return {"result": "abandoned", "plan": saved["plan"], "abandoned": saved["abandoned"],
+                "state": saved}
+
+    def _publication_refused(self, state, exc):
+        """#6978 : termine un plan dont la publication est refusée à l'identique.
+
+        `invalidated` est terminal : le `finally` de `step` rend l'époque et
+        la réservation ; le créneau suivant recompose sur la tête courante.
+        Le diagnostic nomme le refus (contrat CI, suite due absente)."""
+        state["diagnosis"] = {"stage": "publication", "why": str(exc)}
+        state["error"] = str(exc)
+        state["phase"] = "invalidated"
+        state = self._save(state)
+        self.ports.notify("publication refused before any remote effect: %s" % exc, state)
+        return {"result": "invalidated", "error": str(exc), "plan": state["plan"]}
 
     def _red(self, state, now):
         state["failures"] += 1
