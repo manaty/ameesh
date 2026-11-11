@@ -314,8 +314,9 @@ def _revoked_receipt(provider, db, sha: str) -> bool:
         return bool(getter(db, sha))
     except review_provenance.ProvenanceError:
         raise
-    except Exception:  # noqa: BLE001 - une lecture ratée ne crée pas une révocation
-        return False
+    except Exception:  # noqa: BLE001 - le doute refuse : une lecture ratée
+        # ne rouvre jamais le repli sur l'identité Git (#6873, N de relecture).
+        return True
 
 
 def _milestone_receipt(provider, db, milestone_id: int, *, strict: bool) -> Optional[dict]:

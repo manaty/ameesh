@@ -77,10 +77,13 @@ puis B1 cx2/Codex, 15/10 12:12).
   utilisée sous le nom de l'owner ne se distingue pas d'une signature de
   l'owner, c'est une déclaration de bonne foi. La séparation cryptographique
   demande une clé distincte pour le bureau, geste de l'owner ;
-* **une révocation définitive** : `ameesh provenance revoke --commit <sha>
-  --reason ...` écrit un fait daté, motivé et attribué (migration 0566), sans
-  réécrire la preuve. `receipt_for_commit` rend alors `None`, la porte lit
-  « auteur inconnu » et refuse ; `record_commit` / `record_signed_commit`
+* **une révocation définitive**, réservée à un correcteur ou à l'owner :
+  `ameesh provenance revoke --commit <sha> --reason ...` vérifie l'autorité
+  (`work.corrector` : orchestrateur, agent de conception ou auditeur déclaré ;
+  un humain dit `--actor human:<id>` à son terminal) avant d'écrire un fait
+  daté, motivé et attribué (migration 0566), sans réécrire la preuve. Un agent
+  lié sans ce rôle est refusé. `receipt_for_commit` rend alors `None`, la porte
+  lit « auteur inconnu » et refuse ; `record_commit` / `record_signed_commit`
   refusent de ressusciter le reçu. La lecture brute de `provenance show` garde
   la ligne et affiche sa révocation pour l'audit.
 """
@@ -818,7 +821,47 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     return receipt
 
 
-def revoke_receipt(db, sha, *, actor: str, reason: str) -> dict:
+def _revocation_identity(db, actor) -> str:
+    """Qui révoque, avec la liaison et l'autorité exigées (#6873).
+
+    Un agent agit sous une identité LIÉE (bail ou session, L244) et en son
+    nom ; un humain à son terminal dit qui il est (`human:<id>`, L46), puis
+    `work.corrector` vérifie le rôle (orchestrateur, conception, auditeur) ou
+    l'autorité humaine. Un simple `AGENT_MAIL_NAME`, ou un nom d'agent fourni
+    à la main, ne suffit pas : la révocation est définitive et ferme la porte.
+
+    Appelé avant `work.corrector` : celui-ci accepte une identité explicite
+    (source `explicit`) pour les corrections ordinaires, pas pour ce retrait
+    irréversible."""
+    from . import identity as identity_mod
+    requested = str(actor or "").strip()
+    binding = identity_mod.resolve_binding(getattr(db, "cfg", None), db)
+    if binding.name:
+        if not binding.ok or binding.source not in identity_mod.BOUND_SOURCES:
+            reason = binding.reason or "identity %s is %s, not bound" % (
+                binding.name, binding.source)
+            raise ProvenanceError(
+                "provenance revoke requires a bound session identity (%s)" % reason)
+        if requested and requested != binding.name:
+            raise ProvenanceError(
+                "provenance revoke refused: this session belongs to %s, it does "
+                "not act on behalf of %s" % (binding.name, requested))
+        return binding.name
+    if requested.startswith("human:"):
+        return requested
+    if os.environ.get("AGENT_MAIL_NAME"):
+        raise ProvenanceError(
+            "provenance revoke requires a bound session identity "
+            "(AGENT_MAIL_NAME is not bound to a live lease or session)")
+    if not requested:
+        raise ProvenanceError(
+            "provenance revoke: say who does it (--actor human:<id>)")
+    raise ProvenanceError(
+        "provenance revoke refused: %s is not bound on this host (a bound "
+        "session acts as itself; a human says --actor human:<id>)" % requested)
+
+
+def revoke_receipt(db, sha, *, actor: str | None = None, reason: str) -> dict:
     """Révoque définitivement le reçu de commit `sha` (#6873), ou refuse.
 
     Le geste est séparé de la preuve : la ligne `provenance_receipts` n'est ni
@@ -827,20 +870,32 @@ def revoke_receipt(db, sha, *, actor: str, reason: str) -> dict:
     pour un auteur inconnu), et les deux chemins d'écriture refusent de
     ressusciter le reçu.
 
-    `actor` vient d'une identité liée (L244) : ce n'est pas une déclaration
-    libre. `reason` est obligatoire et borné : une révocation sans motif n'est
-    pas une trace."""
+    L'autorité est vérifiée avant toute écriture (B des relectures #6873) :
+    la révocation est définitive et ferme la porte, elle n'est donc pas
+    ouverte à « n'importe quel agent lié ». `work.corrector` — rôle déclaré,
+    `history=False` — autorise un orchestrateur, un agent de conception ou
+    l'auditeur ; sans session d'agent, un humain à son terminal dit qui il est
+    (`--actor human:<id>`, L46), et l'owner en fait partie. `actor` seul ne
+    suffit pas : la liaison (L244) et le rôle sont exigés. `reason` est
+    obligatoire et borné : une révocation sans motif n'est pas une trace."""
+    from . import work as work_mod
     full = full_sha(sha)
     subject = subject_of_commit(full)
-    who = str(actor or "").strip()
     why = " ".join(str(reason or "").split())
-    if not who:
-        raise ProvenanceError("a revocation requires a bound actor")
     if not why:
         raise ProvenanceError("a revocation requires a reason")
     if len(why) > 2000:
         raise ProvenanceError(
             "revocation reason is too long (%d characters, 2000 max)" % len(why))
+    who = _revocation_identity(db, actor)
+    try:
+        who = work_mod.corrector(
+            getattr(db, "cfg", None), db, who,
+            what="provenance revoke", auditor=True, history=False)
+    except work_mod.WorkError as exc:
+        raise ProvenanceError(str(exc)) from exc
+    if not who:
+        raise ProvenanceError("a revocation requires a bound actor")
     ops = storage.of(db).provenance
     receipt = ops.get(subject)
     if receipt is None:
@@ -1506,6 +1561,8 @@ def build_parser():
         "revoke", help="revoke a commit provenance receipt (#6873)")
     rev.add_argument("--commit", required=True, help="full commit id")
     rev.add_argument("--reason", required=True, help="why the receipt is withdrawn")
+    rev.add_argument("--actor", default="",
+                     help="human:<id> at a terminal; a bound session acts as itself")
     rev.add_argument("--json", action="store_true")
     return parser
 
@@ -1602,15 +1659,10 @@ def main(argv: list[str] | None = None) -> int:
                       % (row["subject"], row["actor"], row["turn"][:8]))
             return 0
         if args.command == "revoke":
-            # #6873 : geste de droits — une identité liée (bail ou session),
-            # jamais un nom auto-déclaré (L244).
-            from . import identity as identity_mod
-            try:
-                binding = identity_mod.require_bound(
-                    db.cfg, db, what="provenance revoke")
-            except ValueError as exc:
-                raise ProvenanceError(str(exc)) from exc
-            row = revoke_receipt(db, args.commit, actor=binding.name,
+            # #6873 : geste de droits — l'autorité (correcteur ou owner) et la
+            # liaison (L244) sont vérifiées dans `revoke_receipt`, avant toute
+            # écriture ; `--actor human:<id>` est le terminal de l'owner.
+            row = revoke_receipt(db, args.commit, actor=args.actor or None,
                                  reason=args.reason)
             if args.json:
                 print(json.dumps(row, default=str))

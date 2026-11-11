@@ -139,6 +139,14 @@ class PgProvenanceTest(PgTestCase):
         return self.ops.add(subject, sha, actor, session, turn, harness,
                             work_item_id=work_item_id)
 
+    def _revoke(self, sha, *, actor="human:test", reason="preuve auto-attestée"):
+        """Le geste sous l'autorité d'un humain à son terminal (L46), hors
+        session d'agent du banc : la révocation exige un correcteur ou l'owner."""
+        nobody = types.SimpleNamespace(name="", ok=False, source="none", reason="")
+        with mock.patch("ameesh.identity.resolve_binding", return_value=nobody), \
+                mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": ""}):
+            return prov.revoke_receipt(self.db, sha, actor=actor, reason=reason)
+
     def test_commit_receipt_is_exact_or_unknown(self):
         self.assertIsNone(prov.receipt_for_commit(self.db, SHA1))
         self._receipt("commit:" + SHA1, SHA1, work_item_id=int(self.lot["id"]))
@@ -257,10 +265,9 @@ class PgProvenanceTest(PgTestCase):
         self.assertEqual([row["sha"] for row in
                           self.ops.commits("mty-amh-impl-07")], [SHA1])
         self.assertIsNone(self.ops.revocation("commit:" + SHA1))
-        revoked = prov.revoke_receipt(
-            self.db, SHA1, actor="auditeur", reason="preuve auto-attestée")
+        revoked = self._revoke(SHA1)
         self.assertTrue(revoked["recorded"])
-        self.assertEqual(revoked["actor"], "auditeur")
+        self.assertEqual(revoked["actor"], "human:test")
         self.assertEqual(revoked["reason"], "preuve auto-attestée")
         self.assertIsNone(prov.receipt_for_commit(self.db, SHA1))
         self.assertEqual(self.ops.commits("mty-amh-impl-07"), [])
@@ -269,11 +276,10 @@ class PgProvenanceTest(PgTestCase):
         self.assertEqual(self.ops.get("commit:" + SHA1)["actor"],
                          "mty-amh-impl-07")
         # Une seconde révocation ne remplace ni l'acteur ni la raison.
-        again = prov.revoke_receipt(self.db, SHA1, actor="quelqu-un",
-                                    reason="autre motif")
+        again = self._revoke(SHA1, actor="human:quelqu-un", reason="autre motif")
         self.assertFalse(again["recorded"])
         self.assertEqual((again["actor"], again["reason"]),
-                         ("auditeur", "preuve auto-attestée"))
+                         ("human:test", "preuve auto-attestée"))
 
     def test_milestone_declared_in_a_turn_carries_its_proof(self):
         """Le jalon et sa preuve naissent dans la même transaction (0445)."""
@@ -550,8 +556,7 @@ class PgProvenanceTest(PgTestCase):
         head = self._commit_attested(repo, env, "révoqué")
         row = prov.record_commit(self.db, head, identity=ident, cwd=repo)
         self.assertTrue(row["recorded"])
-        prov.revoke_receipt(self.db, head, actor="auditeur",
-                            reason="preuve auto-attestée")
+        self._revoke(head)
         with self.assertRaises(prov.ProvenanceError) as raised:
             prov.record_commit(self.db, head, identity=ident, cwd=repo)
         self.assertIn("revoked", str(raised.exception))
