@@ -27,7 +27,7 @@ from unittest import mock
 
 from ameesh import lot_class, plan_git, registry, review_lot, verdict_carry, work
 
-from .support import PgTestCase, patch_families
+from .support import PgTestCase
 
 ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
            GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
@@ -183,14 +183,12 @@ class BranchSweepResolvesCanonTest(unittest.TestCase):
 class CarryCanonTest(PgTestCase):
     """Le report de verdict d'un lot du canon, sans `--repo` (témoin #3331)."""
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        for name, harness in (("author", "deepseek"), ("rev1", "claude")):
-            registry.upsert(cls.db, name, harness=harness, host="pc")
-
     def setUp(self) -> None:
-        patch_families(self)
+        # Chaque cas possède son lot : `super().setUp()` vide la base (sinon
+        # le lot ouvert du cas précédent garde la branche, #6849).
+        super().setUp()
+        for name, harness in (("author", "deepseek"), ("rev1", "claude")):
+            registry.upsert(self.db, name, harness=harness, host="pc")
         self.tmp = tempfile.mkdtemp(prefix="ameesh-3331-carry-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.canon = _repo(os.path.join(self.tmp, "canon"))
