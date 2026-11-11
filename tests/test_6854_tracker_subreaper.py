@@ -13,11 +13,13 @@ lui-même sous-moissonneur.
 from __future__ import annotations
 
 import os
+import pathlib
 import subprocess
 import sys
 import unittest
 
 from . import support  # noqa: F401
+import ameesh
 from ameesh import platform
 
 SCENARIO = r"""
@@ -40,9 +42,15 @@ print(tracker.subreaper, flag.value, len(zombies))
 @unittest.skipUnless(platform.is_linux(), "PR_SET_CHILD_SUBREAPER : Linux")
 class TrackerSubreaperTest(unittest.TestCase):
     def test_tracker_sans_fil_fond_ne_garde_pas_de_zombie(self):
+        # le `sys.path` du lanceur (test-parts.py, invité) ne passe pas à
+        # l'enfant : le paquet testé lui est donné par PYTHONPATH
+        src = str(pathlib.Path(ameesh.__file__).resolve().parents[1])
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (src, env.get("PYTHONPATH")) if p)
         out = subprocess.run([sys.executable, "-c", SCENARIO], check=True,
                              capture_output=True, text=True, timeout=30,
-                             env=dict(os.environ)).stdout.split()
+                             env=env).stdout.split()
         self.assertEqual(out, ["False", "0", "0"],
                          "sous-moissonneur sans moisson : zombies adoptés")
 
