@@ -238,6 +238,10 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "merge_lock_stuck",
                  # #194 r6: a PR merged into a wrong base, or not checked
                  "land_uncertain", "db_connections_high",
+                 # #6871 (EP8.5a) : la grappe PostgreSQL du mesh — le PC peut
+                 # être éteint, ces alertes partent d'un hôte du mesh.
+                 "db_no_standby", "db_replication_lag",
+                 "db_sync_lost", "db_two_primaries",
                  # #4609 : la sauvegarde quotidienne de la base du mesh n'a pas
                  # lu la base dans sa fenêtre — le propriétaire doit le savoir
                  "mesh_backup_unseen",
@@ -296,6 +300,10 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
+    "db_no_standby": "database standby missing",
+    "db_replication_lag": "database replication lag above threshold",
+    "db_sync_lost": "database has no synchronous standby",
+    "db_two_primaries": "database has two primaries",
     "mesh_backup_unseen": "mesh database backup not seen",
     "migration_pending_non_additive": "non-additive migration waiting",
     "staging_canon_stale": "staging executor canon behind the agents' canon",
@@ -462,6 +470,9 @@ URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "orphan_lot", "dead_runne
                 "owner_key_registered",
                 "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting",
                 "pgbouncer_pool_at_ceiling",
+                # #6871 : un secours perdu, la synchronisation perdue ou deux
+                # primaires ne peuvent pas attendre le prochain tour ordinaire.
+                "db_no_standby", "db_sync_lost", "db_two_primaries",
                 "host_network_overlap")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui

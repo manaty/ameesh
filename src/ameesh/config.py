@@ -295,6 +295,14 @@ class Config:
     mesh_backup_window: tuple[int, int] = (12600, 16200)
     mesh_backup_min_share: float = 0.9
     mesh_backup_min_group_share: float = 0.05
+    #: #6871 (EP8.5a) : la grappe PostgreSQL du mesh. `patroni_url` (base de
+    #: l'API REST, ex. `http://127.0.0.1:8008`) active la lecture Patroni et
+    #: vaut un secours attendu ; `db_min_standbys` explicite ce nombre (0 =
+    #: mono-nœud, sauf si Patroni ou `synchronous_standby_names` est posé) et
+    #: `db_lag_threshold_s` est le seuil du retard de rejeu qui alerte.
+    patroni_url: str = ""
+    db_min_standbys: int = 0
+    db_lag_threshold_s: float = 30.0
     #: L304 : session en lecture seule (`default_transaction_read_only`) ;
     #: jamais lu de l'environnement, posé par `ameesh progress --serve`
     read_only: bool = False
@@ -1162,6 +1170,12 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
         statement_timeout_ms=_as_float(
             pick("AMEESH_STATEMENT_TIMEOUT_MS", "AGENT_MESH_STATEMENT_TIMEOUT_MS"),
             cfg.statement_timeout_ms),
+        patroni_url=str(pick("AMEESH_PATRONI_URL",
+                             default=cfg.patroni_url) or "").strip(),
+        db_min_standbys=_as_count(pick("AMEESH_DB_MIN_STANDBYS"),
+                                  cfg.db_min_standbys),
+        db_lag_threshold_s=_as_seconds(pick("AMEESH_DB_LAG_THRESHOLD_S"),
+                                       cfg.db_lag_threshold_s),
         mesh_backup_window=_as_window(
             pick("AMEESH_MESH_BACKUP_WINDOW", default=cfg.mesh_backup_window),
             cfg.mesh_backup_window),

@@ -54,6 +54,9 @@
         and counterfactual decisions kept apart, nothing activated (#5135);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
+  ameesh db status [--json]   the mesh database: primary, standbys, replay lag,
+        Patroni state if `patroni_url` is configured; exit 1 when a `db_*`
+        cluster alert is active (EP8.5a, #6871);
   ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
         débit mesuré sur les jalons (canon 24/10/2026) : les {works} en qa/blocked par
         âge, avis dus par relecteur, avis bloquants non traités, holds et
@@ -431,6 +434,11 @@ def _dispatch(argv: list[str] | None) -> int:
         # à jouer ; le saut est journalisé, sans courrier.
         from . import auditor_pass
         return auditor_pass.main(rest[1:])
+    if command == "db":
+        # #6871 (EP8.5a) : primaire, secours, retard, Patroni — la lecture que
+        # le doctor et les alertes db_* partagent.
+        from . import db_status
+        return db_status.main(rest)
     if command == "debit":
         # canon 24/10/2026 : l'auditeur commence chaque passage par le débit,
         # mesuré sur les jalons (jamais sur les colonnes d'un lot).
