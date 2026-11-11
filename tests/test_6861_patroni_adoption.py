@@ -403,6 +403,13 @@ class ScriptsTest(unittest.TestCase):
             "work_mem = '8MB'\nsynchronous_standby_names = 'x'\n")
         self.assertRefus(self.lancer("adopter.sh", "verifier"), "synchronous_standby_names")
 
+    def test_verifier_refuse_une_autre_liste_synchrone(self):
+        (self.pgconf / "conf.d" / "70-local.conf").write_text(
+            "synchronous_standby_names = 'ameesh-agents-2'\n")
+        self.assertRefus(self.lancer("adopter.sh", "verifier"), "70-local.conf")
+        (self.pgconf / "conf.d" / "70-local.conf").write_text("synchronous_standby_names = ''\n")
+        self.assertOk(self.lancer("adopter.sh", "verifier"))
+
     def test_verifier_refuse_client_non_couvert_sauf_accord(self):
         self.ecrire_etat({"clients": ["10.78.0.12", "10.77.0.5"]})
         self.assertRefus(self.lancer("adopter.sh", "verifier"), "10.77.0.5")
@@ -450,6 +457,12 @@ class ScriptsTest(unittest.TestCase):
         # bits de droits seuls : un parent setgid (guest) ajoute S_ISGID
         self.assertEqual(stat.S_IMODE(os.stat(dernier.resolve()).st_mode) & 0o777, 0o700)
         self.assertTrue((self.pgconf / "start.conf").read_text().endswith("manual\n"))
+        # B4 de revue : la liste ANY 1 du fragment EP8.3 ne revient pas quand
+        # Patroni retire la sienne ; l'original reste dans la sauvegarde.
+        fragment = (self.pgconf / "conf.d" / "60-ameesh-replication.conf").read_text()
+        self.assertIn("synchronous_standby_names = ''", fragment)
+        self.assertNotIn("ANY 1", fragment)
+        self.assertIn("ANY 1", (dernier / "conf.d" / "60-ameesh-replication.conf").read_text())
         stdin = "".join(a["stdin"] for a in self.appels("psql"))
         self.assertIn("ALTER ROLE replicator PASSWORD '%s'" % REPLICATION_PASSWORD, stdin)
         self.assertIn("ALTER ROLE postgres PASSWORD '%s'" % SUPERUSER_PASSWORD, stdin)
@@ -519,6 +532,7 @@ class ScriptsTest(unittest.TestCase):
         self.assertOk(res)
         auto = (self.data / "postgresql.auto.conf").read_text()
         self.assertEqual(auto, "work_mem = '8MB'\n")
+        self.assertNotIn("ANY 1", (self.pgconf / "conf.d" / "60-ameesh-replication.conf").read_text())
         self.assertIn("primary_slot_name", (self.sauvegardes / "dernier" / "postgresql.auto.conf").read_text())
         self.assertEqual(self.gestes_systemctl(), [
             ["disable", "--now", "postgresql@17-main"],

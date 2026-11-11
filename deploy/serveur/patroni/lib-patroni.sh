@@ -115,6 +115,37 @@ parametres_geres_auto_conf() {
   ' "$fichier"
 }
 
+# B4 de revue #6861 (ameesh-dev3) : Patroni écrit postgresql.conf avec
+# « include 'postgresql.base.conf' » en tête, et la base inclut conf.d. Quand
+# Patroni retire synchronous_standby_names (aucun synchrone disponible), la
+# valeur des fichiers inclus redevient effective : la liste ANY 1 du fragment
+# EP8.3 ferait attendre chaque COMMIT, contre synchronous_mode_strict=false.
+# Fichiers de configuration (hors fragment EP8.3, qui est neutralisé) qui
+# posent une liste synchrone non vide.
+listes_synchrones_hors_fragment() {
+  local f
+  for f in "$PGCONF/postgresql.conf" "$PGCONF"/conf.d/*.conf; do
+    [[ -f $f && $f != "$CONF_FRAGMENT" ]] || continue
+    if grep -Eq "^[[:space:]]*synchronous_standby_names[[:space:]]*=[[:space:]]*'[^']+'" "$f"; then
+      printf '%s ' "$f"
+    fi
+  done
+}
+
+# Vide la liste synchrone du fragment EP8.3 : sous Patroni, la valeur de
+# repli est « aucun synchrone ». Le reste du fragment est conservé ; la
+# sauvegarde conf.d d'adopter.sh porte l'original pour le retour arrière.
+neutraliser_synchrone_fragment() {
+  local tmp
+  [[ -f $CONF_FRAGMENT ]] || return 0
+  tmp=$(mktemp "$(dirname -- "$CONF_FRAGMENT")/.fragment.XXXXXX") || die "temporaire impossible pour $CONF_FRAGMENT"
+  sed -E "s/^([[:space:]]*synchronous_standby_names[[:space:]]*=).*/\1 '' # vidé par adopter.sh (#6861) : Patroni gère la liste/" \
+    "$CONF_FRAGMENT" > "$tmp"
+  chmod --reference="$CONF_FRAGMENT" -- "$tmp"
+  if (( EUID == 0 )); then chown --reference="$CONF_FRAGMENT" -- "$tmp"; fi
+  mv -f -- "$tmp" "$CONF_FRAGMENT"
+}
+
 # Retire le bloc de reprise d'EP8.3 et les lignes primary_conninfo /
 # primary_slot_name : sous Patroni, elles fixeraient la source du flux sur
 # l'ancien primaire après une bascule. Le reste de auto.conf est conservé.

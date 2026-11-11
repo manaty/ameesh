@@ -116,12 +116,16 @@ verifier_auto_conf() {
   local geres
   geres=$(parametres_geres_auto_conf) || true
   [[ -z $geres ]] || die "postgresql.auto.conf porte des paramètres gérés par Patroni, prioritaires sur les siens : $geres (ALTER SYSTEM RESET d'abord)"
+  local listes
+  listes=$(listes_synchrones_hors_fragment)
+  [[ -z $listes ]] || die "liste synchrone non vide dans $listes : elle reviendrait quand Patroni retire la sienne (COMMIT bloqués) ; la vider d'abord"
 }
 
 verifier_hba() {
   local clients sortie
   clients=$(mktemp "${TMPDIR:-/tmp}/adopter-clients.XXXXXX")
-  psql_local -tAc "SELECT DISTINCT host(client_addr) FROM pg_stat_activity WHERE client_addr IS NOT NULL" > "$clients" 2>/dev/null || :
+  psql_local -tAc "SELECT DISTINCT host(client_addr) FROM pg_stat_activity WHERE client_addr IS NOT NULL" > "$clients" 2>/dev/null \
+    || { rm -f -- "$clients"; die "clients connectés illisibles (pg_stat_activity) : la couverture du pg_hba ne serait pas contrôlée"; }
   local code=0
   sortie=$(aide hba --patroni-yml "$PATRONI_CONF" --hba "$HBA" --clients "$clients") || code=$?
   if (( code == 0 )); then
@@ -179,6 +183,7 @@ verifier_local() {
 passer_sous_patroni() {
   sauvegarder_configuration
   geste retirer_reprise_auto_conf
+  geste neutraliser_synchrone_fragment
   geste ecrire_start_conf manual
   geste systemctl disable --now "$UNITE_PG"
   geste systemctl enable --now patroni.service

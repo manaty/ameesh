@@ -284,6 +284,12 @@ Ce que les phases contrôlent, et refusent :
   `installer-serveur.sh`), ou une adresse cliente connectée que le nouveau
   `pg_hba` ne couvre pas, arrête la phase. `--accepter-hba` passe outre :
   c'est une décision d'exploitant ;
+- liste synchrone : `postgresql.conf` de Patroni inclut d'abord la
+  configuration de base, donc `conf.d`. Quand Patroni retire
+  `synchronous_standby_names` (aucun synchrone disponible), la valeur incluse
+  revient. La ligne du fragment EP8.3 est donc vidée avant le démarrage de
+  Patroni (l'original reste dans la sauvegarde), et toute autre liste non vide
+  dans `postgresql.conf` ou `conf.d` arrête la phase ;
 - slots : Patroni supprime un slot physique qu'il ne connaît pas. Ceux
   d'EP8.3 portent déjà le nom des membres (`ameesh_agents_2`, `manaty_mesh_1`) ;
 - `primaire` : jamais sur le hub `nofailover` (Patroni ne le garderait pas
@@ -328,6 +334,12 @@ n'est encore là), puis repose les rôles et le `pgpass` d'EP8.3 depuis
 Patroni, puis confie la reprise du flux à `replication/suivre-primaire.sh` ;
 un nœud arrêté en primaire (il a divergé) est refusé et renvoyé à
 `replication/reintegrer.sh` (`pg_rewind`).
+
+La phase `primaire` lit le leader dans etcd. Si etcd est perdu, elle
+s'arrête : la sûreté contre un second primaire passe avant le retour. Dans ce
+cas, la décision est humaine. Vérifier à la main qu'aucun autre nœud ne sert
+(`pg_isready -h` sur chacun, `patronictl list` s'il répond), puis reprendre
+les gestes de la section manuelle ci-dessous.
 
 ### Preuve côté client
 
