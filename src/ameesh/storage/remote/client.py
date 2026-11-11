@@ -117,6 +117,8 @@ class RemoteDb:
     driver = DRIVER
     #: le schéma est celui du serveur : rien à vérifier ici (`require_schema`)
     _schema_ok = True
+    #: #6869 : pas de LISTEN/NOTIFY local par ce transport ; le runner sonde
+    supports_listen = False
 
     def __init__(self, cfg: Any, transport: ExecTransport, *, mode: str = EXECUTOR,
                  contract: Optional[C.Contract] = None, url: str = ""):
