@@ -1338,7 +1338,7 @@ ameesh provenance install [--repo R] [--json]
 ameesh provenance intent [--json]
 ameesh provenance created [--json]
 ameesh provenance show [--commit SHA | --milestone ID] [--json]
-ameesh provenance revoke --commit SHA --reason TEXT [--json]
+ameesh provenance revoke --commit SHA --reason TEXT [--actor human:ID] [--json]
 ```
 
 `#1465`: the exact origin of a commit and of a milestone — actor, session,
@@ -1357,7 +1357,10 @@ the owner in person — a holder that is an agent, the attested actor itself, or
 a copy of the key registered under an agent is refused. `revoke` retires a
 commit receipt for good (dated, attributed, reasoned; the receipt line stays
 for audit): the merge gate then reads the commit as an unknown author. It
-requires a bound identity (lease or session).
+requires a bound identity (lease or session) **and** the corrector authority —
+a declared orchestrator, design agent or auditor — or the owner at a terminal
+(`--actor human:ID`). A bound agent without that role is refused before any
+write.
 
 ## Bench authority model (Ed25519)
 

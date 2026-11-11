@@ -307,7 +307,12 @@ fausse. `ameesh provenance revoke --commit <sha> --reason …` écrit une ligne
 `provenance_revocations` (migration 0566 : sujet, SHA, acteur, raison, date),
 sans réécrire la preuve. La première révocation fait foi — une seconde ne
 remplace ni l'acteur ni la raison. L'identité est **liée** (bail ou session,
-L244), le motif est obligatoire.
+L244), le motif est obligatoire, et l'**autorité** est vérifiée avant toute
+écriture : un correcteur (orchestrateur, agent de conception ou auditeur —
+rôle déclaré au canon, jamais le seul historique) ou l'owner à son terminal
+(`--actor human:<id>`, L46). Un agent lié sans ce rôle est refusé : le geste
+est définitif et ferme la porte, il n'est ouvert ni à « n'importe quel agent
+lié » ni au délégataire mis en cause.
 
 `receipt_for_commit` rend alors `None` : la lecture de la porte (`review_authors`,
 donc la désignation, le train et `verdict_carry` qui relit la porte) traite le
