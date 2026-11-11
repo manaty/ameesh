@@ -58,6 +58,8 @@ class FakeShell:
         self.agents: list[dict] = []
         self.auto_out = "manifeste reviews/x.md : tête %s\n" % HEAD
         self.auto_rc = 0
+        #: #6891 : codes successifs de `paquet-auto` (le dernier se répète).
+        self.auto_rcs: list[int] = []
         self.added: list[list[str]] = []
         self.clock = NOW
         #: #4506 : la tête gelée est-elle un ancêtre de origin/<cible> ?
@@ -105,11 +107,12 @@ class FakeShell:
                         {"note": args[3], "created_ts": self.clock})
             return ph.Result(0, "ok\n")
         if str(cmd[1]).endswith("paquet-auto.py"):
-            if self.recomposed_head and "--keep-composition" in cmd and self.auto_rc == 0:
+            rc = self.auto_rcs.pop(0) if self.auto_rcs else self.auto_rc
+            if self.recomposed_head and "--keep-composition" in cmd and rc == 0:
                 for item in self.items.values():
                     if item.get("freeze"):
                         item["freeze"] = {"declared": {"sha": self.recomposed_head}}
-            return ph.Result(self.auto_rc, self.auto_out)
+            return ph.Result(rc, self.auto_out)
         raise AssertionError("commande inattendue : %r" % cmd)
 
     def ran(self, *prefix) -> list[list[str]]:
