@@ -427,16 +427,12 @@ class ExecutorPassTest(unittest.TestCase):
 class CarryTest(PgTestCase):
     """Le report de bout en bout, sur Postgres et un vrai dépôt sans origin."""
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        for name, harness in (("author", "deepseek"), ("rev1", "claude"), ("rev2", "codex")):
-            registry.upsert(cls.db, name, harness=harness, host="pc")
-
     def setUp(self) -> None:
-        # #2664 : le banc n'a pas de canon Git, les familles compilées sont
-        # épinglées ; le registre seedé en setUpClass reste en place.
-        patch_families(self)
+        # This setup is also borrowed by #5042 without inheritance.
+        # Reset independent cases without retaining their open lots (#6834).
+        PgTestCase.setUp(self)
+        for name, harness in (("author", "deepseek"), ("rev1", "claude"), ("rev2", "codex")):
+            registry.upsert(self.db, name, harness=harness, host="pc")
         self.repo = Repo()
         self.addCleanup(self.repo.cleanup)
         self.lot = work.add(self.db, title="un lot", branch="lot/9-x",

@@ -53,7 +53,7 @@ class RevueSourceTest(PgTestCase):
             self.db.execute(
                 "INSERT INTO turn_costs (agent, harness, recorded_at)"
                 " VALUES (%s, %s, now() - interval '1 minute')", (actor, harness))
-        work.milestone(self.db, lot["id"], "frozen", sha="a" * 40, actor=actor)
+        work.milestone(self.db, lot["id"], "frozen", sha="%040x" % lot["id"], actor=actor)
         return lot["id"]
 
     def revue(self, lot, *, issue_ref=None):

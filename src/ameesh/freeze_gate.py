@@ -410,7 +410,8 @@ def _refuse_freeze_already_in_target(repo: str, item: dict, full: str,
             raise WorkError(
                 "freeze refused (already-in-target): %s is already an ancestor of %s "
                 "in %s — the freeze names no own commit; push the lot's commit and "
-                "freeze its head (#2784)" % (full[:12], target, repo))
+                "freeze its head (#2784); for notes only, close the lot as done "
+                "instead of freezing" % (full[:12], target, repo))
     except WorkError:
         raise
     except Exception:  # noqa: BLE001 - cible illisible : le balayage tranchera
@@ -963,6 +964,10 @@ def milestone(
         freeze_info: dict = {}
         sha = freeze_head(db, item, sha, repo=repo, refreshed=refreshed,
                           outcome=freeze_info)
+        from . import freeze_branch
+        freeze_branch.guard_ownership(db, item, sha,
+                                      branch=str(item.get("branch") or "").strip(),
+                                      repo=repo or str(freeze_info.get("repo") or ""))
         # #6161 : ne pas laisser un gel validé invisible au composeur.
         if not str(item.get("branch") or "").strip():
             from . import freeze_branch
@@ -975,9 +980,19 @@ def milestone(
                                   + " (published branch explicitly detached)")
                 inferred_branch = None
             if inferred_branch:
+                freeze_branch.guard_ownership(db, item, sha, branch=inferred_branch,
+                                              repo=repo or str(freeze_info.get("repo") or ""))
                 item = dict(item, branch=inferred_branch)
             elif branch_warning:
                 note = (note + "\n" if note else "") + branch_warning
+        if (not str(item.get("branch") or "").strip()
+                and (repo or freeze_info.get("repo"))):
+            from . import freeze_checks
+            if freeze_checks.changed_paths(
+                    db.cfg, item, repo or str(freeze_info.get("repo") or ""), sha) == []:
+                raise WorkError(
+                    "freeze refused (notes-only): no own branch and no delta; "
+                    "close lot #%s as done with its notes instead of freezing" % item_id)
         # #3589 : un lot empilé sur un parent ouvert ne gèle pas des copies
         # de la tête gelée de ce parent (même patch-id, tête absente) : le
         # refus donne le `git rebase --onto` exact. Lecture seule, avant
@@ -1230,6 +1245,18 @@ def milestone(
     if inferred_branch:
         from . import freeze_branch
         on_frozen = freeze_branch.attach_hook(item_id, inferred_branch, sha, actor, on_frozen)
+    if kind == "frozen":
+        # Relire la propriété après les lectures réseau, dans la transaction
+        # du jalon : un lot associé entre-temps ne doit pas être emprunté.
+        following = on_frozen
+        def ownership_hook(tx, milestone, after_commit):
+            from . import freeze_branch
+            freeze_branch.guard_ownership(
+                tx, item, sha, branch=str(item.get("branch") or "").strip(),
+                exclude_freeze_id=int(milestone["id"]))
+            if following is not None:
+                following(tx, milestone, after_commit)
+        on_frozen = ownership_hook
     row = storage.of(db).work.add_milestone(
         item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
         on_frozen=on_frozen, after_commit=after_commit, proof=proof)
