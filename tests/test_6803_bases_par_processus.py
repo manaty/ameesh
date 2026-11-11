@@ -10,9 +10,17 @@ refusaient le verrou (test_6074 « worker busy », run 42932684029). Le témoin
 joue deux processus sur le serveur du banc : la clé constante tenue dans la
 base de l'un reste libre dans celle de l'autre, alors qu'elle est refusée dans
 la même base.
+
+#6808 : le DSN du banc peut prendre d'autres formes URL que `//hôte/base` —
+`postgresql:///base?host=/var/run/postgresql` (hôte vide) ou un `dbname=` de
+la requête. La base jetable doit rester valide et la sonde vérifier la base
+réellement atteinte (`current_database()`), sinon les processus restent
+cloisonnés nulle part, ou sur une autre base, sans le dire.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -41,14 +49,19 @@ def _charger():
 
 parts = _charger()
 
-#: doublure `psql` : enregistre chaque appel ; refuse celui qui contient
-#: `PSQL_REFUSE`
+#: doublure `psql` : enregistre chaque appel, refuse celui qui contient
+#: `PSQL_REFUSE` ; à la sonde de base, rend la base du DSN (ou `PSQL_CURRENT_DB`)
 PSQL_STUB = """#!{python}
-import json, os, sys
+import json, os, sys, urllib.parse
 with open(os.environ["PSQL_CALLS"], "a") as out:
     out.write(json.dumps(sys.argv[1:]) + "\\n")
 refus = os.environ.get("PSQL_REFUSE")
-sys.exit(1 if refus and refus in " ".join(sys.argv[1:]) else 0)
+if refus and refus in " ".join(sys.argv[1:]):
+    sys.exit(1)
+if "current_database" in " ".join(sys.argv[1:]):
+    dsn = sys.argv[sys.argv.index("--dbname") + 1]
+    print(os.environ.get("PSQL_CURRENT_DB")
+          or urllib.parse.urlsplit(dsn).path.lstrip("/"))
 """
 
 CLE = "hashtextextended('vm-adapter:burst', 0)"
@@ -84,7 +97,8 @@ class BasesDoubleesTest(unittest.TestCase):
             self.assertTrue(all(d.startswith("postgresql://ameesh@127.0.0.1:5432/")
                                 for d in dsns), dsns)
             self.assertEqual(self._sql(), [s for b in bases
-                                           for s in (f'CREATE DATABASE "{b}"', "SELECT 1")])
+                                           for s in (f'CREATE DATABASE "{b}"',
+                                                     "SELECT current_database()")])
             parts.supprimer_bases(admin, dsns)
         self.assertEqual(self._sql()[4:],
                          [f'DROP DATABASE IF EXISTS "{b}" WITH (FORCE)' for b in bases])
@@ -103,15 +117,57 @@ class BasesDoubleesTest(unittest.TestCase):
         """B de mty-amh-impl-11 : CREATE DATABASE réussit par le DSN
         d'administration, mais le profil (.pgpass limité à cette base,
         #2170) refuse la base fille ; aucun processus n'y est envoyé."""
-        with mock.patch.dict(os.environ, dict(self.env, PSQL_REFUSE="SELECT 1")):
+        with mock.patch.dict(os.environ, dict(self.env, PSQL_REFUSE="current_database")):
             _admin, dsns = parts.bases_par_processus(1, 2)
         self.assertEqual(dsns, [])
         sql = self._sql()
         premiere = sql[0].split('"')[1]
-        self.assertEqual(sql, [f'CREATE DATABASE "{premiere}"', "SELECT 1",
+        self.assertEqual(sql, [f'CREATE DATABASE "{premiere}"', "SELECT current_database()",
                                f'DROP DATABASE IF EXISTS "{premiere}" WITH (FORCE)'])
         appels = [json.loads(l) for l in self.appels.read_text().splitlines()]
         self.assertIn(f"/{premiere}", appels[1][appels[1].index("--dbname") + 1])
+
+    def test_une_url_sans_hote_garde_ses_trois_barres(self):
+        """#6808 : `postgresql:///base?host=/var/run/postgresql` ne doit pas
+        devenir `postgresql:/base?…`, que libpq refuse."""
+        self.assertEqual(
+            parts._base_dsn("postgresql:///ameesh?host=/var/run/postgresql", "jetable"),
+            "postgresql:///jetable?host=/var/run/postgresql")
+
+    def test_un_dbname_de_la_requete_cede_la_place(self):
+        """#6808 : `dbname=` l'emporte sur le chemin chez libpq ; le garder
+        enverrait tous les processus sur cette autre base."""
+        self.assertEqual(
+            parts._base_dsn(
+                "postgresql://ameesh@127.0.0.1:5432/ameesh?dbname=autre&sslmode=disable",
+                "jetable"),
+            "postgresql://ameesh@127.0.0.1:5432/jetable?sslmode=disable")
+
+    def test_une_url_sans_hote_cree_et_sonde_sa_base(self):
+        env = dict(self.env,
+                   AMEESH_TEST_DSN="postgresql:///ameesh?host=/var/run/postgresql")
+        with mock.patch.dict(os.environ, env):
+            admin, dsns = parts.bases_par_processus(2, 1)
+        self.assertEqual(admin, env["AMEESH_TEST_DSN"])
+        self.assertEqual(len(dsns), 1, dsns)
+        self.assertTrue(dsns[0].startswith("postgresql:///ameesh_p2_1_"), dsns)
+        self.assertTrue(dsns[0].endswith("?host=/var/run/postgresql"), dsns)
+        self.assertEqual(self._sql()[-1], "SELECT current_database()")
+
+    def test_une_base_qui_atteint_une_autre_base_replie(self):
+        """#6808 : la sonde vérifie la base atteinte ; un DSN qui atterrit
+        ailleurs (profil, `dbname=`) rend la base partagée, en le disant."""
+        erreurs = io.StringIO()
+        with mock.patch.dict(os.environ, dict(self.env, PSQL_CURRENT_DB="autre")):
+            with contextlib.redirect_stderr(erreurs):
+                _admin, dsns = parts.bases_par_processus(1, 1)
+        self.assertEqual(dsns, [])
+        self.assertIn("atteint la base 'autre'", erreurs.getvalue())
+        self.assertIn("base partagée", erreurs.getvalue())
+        sql = self._sql()
+        premiere = sql[0].split('"')[1]
+        self.assertEqual(sql, [f'CREATE DATABASE "{premiere}"', "SELECT current_database()",
+                               f'DROP DATABASE IF EXISTS "{premiere}" WITH (FORCE)'])
 
     def test_sans_dsn_explicite_rien_n_est_cree(self):
         env = dict(self.env)
@@ -123,13 +179,35 @@ class BasesDoubleesTest(unittest.TestCase):
         self.assertEqual(self._sql(), [])
 
 
+def _sans_hote(dsn: str) -> str | None:
+    """#6808 : la même cible en URL sans hôte, `dbname=` dans la requête.
+
+    `postgresql:///` garde un hôte vide ; les paramètres de la forme à hôte
+    passent en clé/valeur, ce que libpq accepte dans la requête."""
+    morceaux = urllib.parse.urlsplit(dsn)
+    if morceaux.scheme not in ("postgres", "postgresql") or not morceaux.hostname:
+        return None
+    params = {"host": morceaux.hostname,
+              "dbname": morceaux.path.lstrip("/") or "postgres"}
+    if morceaux.port:
+        params["port"] = str(morceaux.port)
+    if morceaux.username:
+        params["user"] = morceaux.username
+    if morceaux.password:
+        params["password"] = morceaux.password
+    return "postgresql:///?" + urllib.parse.urlencode(params)
+
+
 class DeuxProcessusTest(unittest.TestCase):
     """Le témoin réel : deux bases d'une part sur le serveur du banc."""
+
+    def _admin_dsn(self) -> str:
+        return support.TEST_DSN
 
     def setUp(self):
         if shutil.which("psql") is None:
             self.skipTest("psql absent")
-        with mock.patch.dict(os.environ, {"AMEESH_TEST_DSN": support.TEST_DSN}):
+        with mock.patch.dict(os.environ, {"AMEESH_TEST_DSN": self._admin_dsn()}):
             self.admin, self.dsns = parts.bases_par_processus(99, 2)
         if not self.dsns:
             self.skipTest("bases jetables refusées ou injoignables sur le banc")
@@ -159,6 +237,20 @@ class DeuxProcessusTest(unittest.TestCase):
         self.assertEqual(self._try(self.dsns[0]), "f")
         # chaque processus a sa base : la clé y reste libre
         self.assertEqual(self._try(self.dsns[1]), "t")
+
+
+class DeuxProcessusSansHoteTest(DeuxProcessusTest):
+    """#6808 : le même cloisonnement par une URL sans hôte et `dbname=`."""
+
+    def _admin_dsn(self) -> str:
+        dsn = _sans_hote(support.TEST_DSN)
+        if dsn is None:
+            self.skipTest("DSN du banc hors forme URL avec hôte")
+        return dsn
+
+    def test_les_bases_rendues_sont_valides_et_sans_dbname(self):
+        self.assertTrue(all(d.startswith("postgresql:///") for d in self.dsns), self.dsns)
+        self.assertTrue(all("dbname=" not in d for d in self.dsns), self.dsns)
 
 
 if __name__ == "__main__":
