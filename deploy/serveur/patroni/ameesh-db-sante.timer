@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Minuterie du contrôle de santé (EP8.4b, lot #6870) : toutes les minutes,
+# après le démarrage. Une alerte est visible dans le journal du service et
+# dans /run/ameesh-db/alertes.json ; le branchement vers ameesh notify est
+# fait par EP8.5 (#6862), pas ici.
+[Unit]
+Description=Minuterie du contrôle de santé de la grappe PostgreSQL ameesh
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+RandomizedDelaySec=5s
+Unit=ameesh-db-sante.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,88 @@
+# Modèle Patroni 4.x pour un nœud de la grappe ameesh (EP8.4b, lot #6870).
+# Rendu par generer-configuration.py : ne pas éditer la copie installée.
+# Aucun secret ici : l'authentification REST et la réplication viennent des
+# variables PATRONI_* de /etc/ameesh/patroni.env (0640 root:postgres).
+scope: $grappe
+namespace: $namespace
+name: $nom
+
+log:
+  level: INFO
+
+restapi:
+  listen: $adresse:$port_rest
+  connect_address: $adresse:$port_rest
+  certfile: $tls_rest_cert
+  keyfile: $tls_rest_key
+
+ctl:
+  insecure: false
+  cacert: $tls_ca
+
+etcd3:
+  hosts: $hotes_etcd
+  protocol: https
+  cacert: $tls_ca
+  cert: $tls_etcd_client_cert
+  key: $tls_etcd_client_key
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    synchronous_mode: true
+    synchronous_node_count: 1
+    synchronous_mode_strict: false
+    failsafe_mode: false
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        wal_level: replica
+        hot_standby: 'on'
+        wal_log_hints: 'on'
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: '2GB'
+        max_connections: 300
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+    - locale: C.UTF-8
+  pg_hba:
+$pg_hba
+
+postgresql:
+  listen: 127.0.0.1:$port_pg,$adresse:$port_pg
+  connect_address: $adresse:$port_pg
+  config_dir: $pg_conf
+  data_dir: $pg_data
+  bin_dir: $pg_bin
+  pgpass: $pgpass
+  pg_hba:
+$pg_hba
+  authentication:
+    replication:
+      username: replicator
+    superuser:
+      username: postgres
+    rewind:
+      username: postgres
+  parameters:
+    unix_socket_directories: '/var/run/postgresql'
+    password_encryption: 'scram-sha-256'
+    ssl: 'on'
+    ssl_cert_file: '/etc/ssl/certs/ssl-cert-snakeoil.pem'
+    ssl_key_file: '/etc/ssl/private/ssl-cert-snakeoil.key'
+
+# Priorité de bascule : le hub est nofailover (priorité effective 0) et
+# nosync ; ameesh-agents-1 passe devant ameesh-agents-2 (étude §4).
+tags:
+$tags
+
+# Le chien de garde matériel n'est pas activé : il sera testé avant emploi
+# (étude §4). « off » est entre guillemets pour rester une chaîne YAML.
+watchdog:
+  mode: 'off'
