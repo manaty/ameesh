@@ -20,7 +20,8 @@
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work wake <id> --at ISO | --in DURATION | --cancel   scheduled wake, even under hold (#2466)
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
-  agent-mesh work external-executor <id> <agent> | --clear   reserve a {work} to an external executor (#3447)
+  agent-mesh work external-executor <id> <agent> [--session S] | --clear   reserve a {work} to an external executor (#3447, #6839)
+  agent-mesh work claim <id> --session S [--release] [--force]   take the external gesture exclusively, before acting (#6839)
   agent-mesh work external-executor --declare system:<nom> --responsible human:H | --list | --retire system:<nom>   declare a non-agent executor (#6091)
   agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the {work}'s migration numbers (L122, #2481)
@@ -2223,6 +2224,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
                 external_executor=args.external_executor,
+                external_session=args.external_session,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
                 note=note,
@@ -2371,7 +2373,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # ne sont ni réveillés ni assignables.
             if args.list:
                 if args.id is not None or args.agent or args.clear or args.declare \
-                        or args.retire or args.responsible or args.note:
+                        or args.retire or args.responsible or args.note or args.session:
                     raise work.WorkError("--list goes alone")
                 rows = work.external_executors(
                     db, include_retired=args.include_retired)
@@ -2390,7 +2392,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if args.declare or args.retire:
                 if args.declare and args.retire:
                     raise work.WorkError("--declare and --retire are two different gestures")
-                if args.id is not None or args.agent or args.clear \
+                if args.id is not None or args.agent or args.clear or args.session \
                         or args.include_retired:
                     raise work.WorkError("--declare/--retire go without a lot and without "
                                          "an executor name")
@@ -2433,20 +2435,64 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                      "--include-retired with --list")
             if args.id is None:
                 raise work.WorkError("name the lot, or use --declare/--retire/--list")
-            if args.clear and args.agent:
-                raise work.WorkError("--clear goes without an executor name")
+            if args.clear and (args.agent or args.session):
+                raise work.WorkError("--clear goes without an executor name and session")
             if not args.clear and not args.agent:
                 raise work.WorkError("name the external executor, or pass --clear")
             out = work.set_external_executor(db, args.id, args.agent,
                                              actor=args.actor, cfg=cfg,
-                                             clear=args.clear)
+                                             clear=args.clear, session=args.session)
             if args.json:
                 print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
                 return 0
             if args.clear:
                 print(('%s #%d: external executor cleared (was %s); the %s is back in the ordinary queue') % (v.noun, out["item"]["id"], out["previous"] or "nobody", v.noun))
             else:
-                print(('%s #%d: reserved to %s (external executor; not assigned — L165 does not take it)') % (v.noun, out["item"]["id"], out["executor"]))
+                print(('%s #%d: reserved to %s (external executor; not assigned — L165 does not take it)%s') % (
+                    v.noun, out["item"]["id"], out["executor"],
+                    "; session %s" % out["session"] if out.get("session") else ""))
+            return 0
+        if args.work_command == "claim":
+            # #6839 : la prise exclusive d'un geste d'exécutant externe, écrite
+            # avant l'effet ; la seconde session reçoit la porteuse et l'heure.
+            actor, warning = work.resolve_actor(cfg, db, args.actor)
+            if warning:
+                print("warning: %s" % warning, file=sys.stderr)
+            proof, proof_source, proof_agent = work.caller_session_proof(cfg, db)
+            if proof and not args.force and proof_agent and actor != proof_agent:
+                raise work.WorkError(
+                    "this session is bound to %s, not %s: a claim or a normal "
+                    "release speaks for its own agent (a pilot uses --force)"
+                    % (proof_agent, actor))
+            if args.release:
+                out = work.release_external(
+                    db, args.id, args.session, actor=actor, host=cfg.host,
+                    proof=proof, note=args.note, cfg=cfg, force=args.force)
+            else:
+                if args.force:
+                    raise work.WorkError("--force goes with --release: a claim is not forced")
+                out = work.claim_external(
+                    db, args.id, args.session, actor=actor, host=cfg.host,
+                    proof=proof, note=args.note, cfg=cfg)
+            if args.json:
+                print(json.dumps({"schema": "ameesh.work.claim/1",
+                                  "lot": out["item"]["id"],
+                                  "session": out["session"],
+                                  "released": bool(args.release),
+                                  "forced": bool(out.get("forced", False)),
+                                  "proved": bool(proof),
+                                  "proof_source": proof_source},
+                                 ensure_ascii=False, indent=2, default=str))
+                return 0
+            if args.release:
+                print(('%s #%d: external claim released by %s%s') % (
+                    v.noun, out["item"]["id"], out["session"],
+                    " (pilot forced)" if out.get("forced") else ""))
+            else:
+                print(('%s #%d: external claim taken by %s at %s — this session alone '
+                       'executes the external gesture') % (
+                    v.noun, out["item"]["id"], out["session"],
+                    _fmt_moment(out.get("at"))))
             return 0
         if args.work_command == "branch":
             # #2102 : détachement explicite, ou (ré)association explicite
@@ -2606,6 +2652,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                 declared.get("responsible") or "?")
                 print("executor : %s (external, reserved; not assignable%s)" % (
                     external, detail))
+                if item.get("external_session"):
+                    print("session  : %s (named by the fire, #6839)"
+                          % item["external_session"])
+                if item.get("external_claim_session"):
+                    by = " by %s on %s" % (
+                        item.get("external_claim_actor") or "?",
+                        item.get("external_claim_host") or "?")
+                    print("claim    : %s at %s%s (exclusive external gesture, #6839)"
+                          % (item["external_claim_session"],
+                             _fmt_moment(item.get("external_claimed_ts")), by))
             print("app      : %-10s source: %-12s workstream: %s" % (
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
@@ -4339,6 +4395,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                         help=("#3447: declare the %s reserved to an external executor "
                              "(an `externe` agent with a human owner, or human:<id>) "
                              "without assigning it; L165 does not take it") % v.noun)
+    pw_add.add_argument("--external-session", default=None, metavar="SESSION",
+                        help=("#6839: name the session the fire designates for the "
+                             "external gesture; only it can take the claim"))
     pw_add.add_argument("--branch", default=None,
                         help=("%s branch: its merge into the target closes the %s (L118)") % (v.noun, v.noun))
     pw_add.add_argument("--target", default=None,
@@ -4631,6 +4690,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                                   "--clear")
     pw_executor.add_argument("--clear", action="store_true",
                              help=("clear the reservation (the %s returns to the ordinary queue)") % v.noun)
+    pw_executor.add_argument("--session", default=None, metavar="SESSION",
+                             help=("#6839: name the session the fire designates for this "
+                                  "external gesture; only it can take the claim"))
     pw_executor.add_argument("--declare", default=None, metavar="SYSTEM",
                              help=("#6091: declare the non-agent external executor "
                                   "system:<name> with --responsible; never an agent, never "
@@ -4651,6 +4713,26 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_executor.add_argument("--json", action="store_true")
     pw_executor.add_argument("--actor", default="")
     pw_executor.set_defaults(func=cmd_work)
+    pw_claim = work_sub.add_parser(
+        "claim",
+        help=("#6839: take EXCLUSIVELY the external gesture of a %s reserved to an "
+             "external executor, before any purchase or resource creation; the second "
+             "session is refused, naming the holder and its time") % v.noun)
+    pw_claim.add_argument("id", type=int)
+    pw_claim.add_argument("--session", required=True, metavar="SESSION",
+                          help=("#6839: the claiming session (the one the fire names, or "
+                               "this session's own label)"))
+    pw_claim.add_argument("--release", action="store_true",
+                          help=("#6839: release the claim (the holder alone, or a pilot "
+                               "with --force)"))
+    pw_claim.add_argument("--force", action="store_true",
+                          help=("#6839: pilot gesture: release a claim whose session is "
+                               "gone (authority checked)"))
+    pw_claim.add_argument("--note", default="", metavar="TEXT",
+                          help="#6839: note kept in the %s journal" % v.noun)
+    pw_claim.add_argument("--json", action="store_true")
+    pw_claim.add_argument("--actor", default="")
+    pw_claim.set_defaults(func=cmd_work)
     pw_branch = work_sub.add_parser(
         "branch", help=("set a %s's branch explicitly (L118), or detach an obsolete one "
                        "(#2102: closed or superseded PR); journaled, state and assignee kept") % v.noun)

@@ -157,6 +157,9 @@ def has_migration_slots(db) -> bool:
 #: #5404 : les colonnes optionnelles lues par `item_columns` et `work.get`.
 _OPTIONAL_ITEM_COLUMNS = ("reviewer", "reviewers", "external_executor", "unique_ref",
                           "wake_at", "legacy_state",
+                          "external_session", "external_claim_session",
+                          "external_claimed_at", "external_claim_actor",
+                          "external_claim_host", "external_claim_proof",
                           "workflow_ref", "workflow_stage", "workflow_version")
 
 
@@ -219,14 +222,32 @@ def item_columns(db, ref: str | None = None, migrations: str | None = None) -> s
         reviewer = "''::text AS reviewer"
     if ref or has_current_item_columns(db):
         reviewers = "to_jsonb(%sreviewers) AS reviewers" % col
-        external = "%sexternal_executor AS external_executor" % col
+        external = ("%sexternal_executor AS external_executor, "
+                    "%sexternal_session AS external_session, "
+                    "%sexternal_claim_session AS external_claim_session, "
+                    "%sexternal_claim_actor AS external_claim_actor, "
+                    "%sexternal_claim_host AS external_claim_host, "
+                    "%sexternal_claim_proof AS external_claim_proof, "
+                    "extract(epoch from %sexternal_claimed_at)::float8"
+                    " AS external_claimed_ts" % (col, col, col, col, col, col, col))
         unique_ref = "%sunique_ref AS unique_ref" % col
         wake = "extract(epoch from %swake_at)::float8 as wake_ts" % col
         lifecycle_columns = ("%slegacy_state AS legacy_state, "
                              "%sworkflow_stage AS workflow_stage" % (col, col))
     else:
         reviewers = "to_jsonb(work_items)->'reviewers' AS reviewers"
-        external = "to_jsonb(work_items)->>'external_executor' AS external_executor"
+        external = ("to_jsonb(work_items)->>'external_executor' AS external_executor, "
+                    "to_jsonb(work_items)->>'external_session' AS external_session, "
+                    "to_jsonb(work_items)->>'external_claim_session'"
+                    " AS external_claim_session, "
+                    "to_jsonb(work_items)->>'external_claim_actor'"
+                    " AS external_claim_actor, "
+                    "to_jsonb(work_items)->>'external_claim_host'"
+                    " AS external_claim_host, "
+                    "to_jsonb(work_items)->>'external_claim_proof'"
+                    " AS external_claim_proof, "
+                    "extract(epoch from (to_jsonb(work_items)->>'external_claimed_at')"
+                    "::timestamptz)::float8 AS external_claimed_ts")
         unique_ref = "to_jsonb(work_items)->>'unique_ref' AS unique_ref"
         wake = ("extract(epoch from (to_jsonb(work_items)->>'wake_at')::timestamptz)::float8"
                 " as wake_ts")
@@ -702,7 +723,7 @@ class WorkItems(interface.WorkItems):
             estimate_source=None, change_size=None, queued_note=None,
             forced_note=None, mark_item_id=None, mark_note="",
             parent_lot=None, unique_execution=False, unique_ref=None,
-            external_executor=None,
+            external_executor=None, external_session=None,
             footprint=None, footprint_unknown=False) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
@@ -840,9 +861,9 @@ class WorkItems(interface.WorkItems):
                     (type, source, app, title, body, issue_ref, workstream, assignee,
                      budget_usd, state, package_id, package_parent, branch, branch_target,
                      priority, estimate_minutes, estimate_source, estimate_by, estimate_at,
-                     change_size, external_executor, unique_ref)
+                     change_size, external_executor, external_session, unique_ref)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s, %s,
-                        %s, %s, %s, CASE WHEN %s THEN now() END, %s, %s, %s)
+                        %s, %s, %s, CASE WHEN %s THEN now() END, %s, %s, %s, %s)
                 RETURNING __COLUMNS__
                 """.replace("__COLUMNS__", item_columns(self.db)),
                 (type, source, app, title, body, issue_ref, workstream, assignee,
@@ -850,7 +871,8 @@ class WorkItems(interface.WorkItems):
                  None if priority is None else int(priority),
                  estimate_minutes, estimate_source if estimate_minutes else None,
                  (actor or "") if estimate_minutes else None, bool(estimate_minutes),
-                 change_size or None, external_executor or None, unique_ref or None),
+                 change_size or None, external_executor or None,
+                 external_session or None, unique_ref or None),
             )
             item = rows[0]
             if estimate_minutes:
@@ -1656,27 +1678,161 @@ class WorkItems(interface.WorkItems):
                 return None
             return work._unassign_locked(item_id, agent, note, actor)
 
-    def set_external_executor(self, item_id, executor, *, note, actor) -> dict | None:
+    def set_external_executor(self, item_id, executor, *, session=None, note,
+                              actor) -> dict | None:
         """#3447 : pose (ou efface, `executor=None`) l'exécutant externe d'un lot
         ouvert, avec sa ligne de journal, en une transaction.
 
         Un lot assigné ne reçoit pas d'exécutant externe (deux porteurs) ; une
         levée reste possible pour nettoyer un lot déjà assigné. None si le lot
         est fermé ou si la pose perd la course contre une attribution : sous le
-        verrou de la ligne, la condition est relue, pas devinée."""
+        verrou de la ligne, la condition est relue, pas devinée.
+
+        #6839 : `session` nomme la session exécutante du feu (facultative). Une
+        pose concurrente d'une prise exclusive est refusée (`external_claim_session`
+        relu sous le même verrou) ; une levée efface la prise, sa session et son
+        instant dans la même écriture."""
+        closed = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
         with self.db.transaction() as tx:
             if executor:
                 require_external_executor_active(tx, executor)
-            rows = tx.query(
-                ("UPDATE work_items SET external_executor = %s, updated_at = now()"
-                 f" WHERE id = %s AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
-                 "   AND (%s::text IS NULL OR assignee IS NULL)"
-                 " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
-                (executor or None, int(item_id), executor or None))
+                rows = tx.query(
+                    ("UPDATE work_items SET external_executor = %s,"
+                     " external_session = %s, updated_at = now()"
+                     f" WHERE id = %s AND state NOT IN {closed}"
+                     "   AND assignee IS NULL AND external_claim_session IS NULL"
+                     " RETURNING __COLUMNS__").replace(
+                         "__COLUMNS__", item_columns(self.db)),
+                    (executor, session or None, int(item_id)))
+            else:
+                rows = tx.query(
+                    ("UPDATE work_items SET external_executor = NULL,"
+                     " external_session = NULL, external_claim_session = NULL,"
+                     " external_claimed_at = NULL, external_claim_actor = NULL,"
+                     " external_claim_host = NULL, external_claim_proof = NULL,"
+                     " updated_at = now()"
+                     f" WHERE id = %s AND state NOT IN {closed}"
+                     " RETURNING __COLUMNS__").replace(
+                         "__COLUMNS__", item_columns(self.db)),
+                    (int(item_id),))
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
             return rows[0]
+
+    #: #6839 : les états d'un lot qui ne prennent plus de geste externe
+    _EXTERNAL_CLOSED = lifecycle.COMPLETED
+
+    @_retry_deadlock
+    def claim_external(self, item_id, session, *, note, actor, host=None,
+                       proof=None) -> dict:
+        """#6839 : la prise exclusive d'un geste d'exécutant externe.
+
+        La ligne du lot est verrouillée avant la lecture de la prise : deux
+        sessions concurrentes se sérialisent, la seconde voit la première et
+        n'écrit rien. Le résultat est un objet, pas une exception — le métier
+        nomme le refus :
+
+        * `{"error": "unknown_lot"}` ;
+        * `{"error": "closed", "state": …}` ;
+        * `{"error": "not_external"}` : lot sans exécutant externe déclaré ;
+        * `{"error": "taken", "session": …, "at": …}` : déjà pris, avec la
+          porteuse et l'instant de sa prise ;
+        * `{"error": "reserved_session", "session": …}` : le feu nomme une
+          autre session ;
+        * `{"error": "no_proof", "session": …}` : aucune liaison de session
+          vérifiée ;
+        * `{"error": "not_proved", "session": …}` : le libellé ne correspond
+          pas à la session vérifiée de l'appelant ;
+        * `{"item": …}` : la prise est écrite, la session, l'instant, l'acteur,
+          l'hôte et la preuve avec.
+        """
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT id, state, external_executor, external_session,"
+                " external_claim_session,"
+                " extract(epoch from external_claimed_at)::float8 AS claimed_ts"
+                " FROM work_items WHERE id = %s FOR UPDATE", (int(item_id),))
+            if not rows:
+                return {"error": "unknown_lot"}
+            item = rows[0]
+            if item["state"] in self._EXTERNAL_CLOSED:
+                return {"error": "closed", "state": item["state"]}
+            if not (item.get("external_executor") or "").strip():
+                return {"error": "not_external"}
+            if (item.get("external_claim_session") or "").strip():
+                return {"error": "taken",
+                        "session": item["external_claim_session"],
+                        "at": item.get("claimed_ts")}
+            if not proof:
+                return {"error": "no_proof", "session": session}
+            if proof != session:
+                return {"error": "not_proved", "session": session}
+            named = (item.get("external_session") or "").strip()
+            if named and named != session:
+                return {"error": "reserved_session", "session": named}
+            rows = tx.query(
+                ("UPDATE work_items SET external_claim_session = %s,"
+                 " external_claimed_at = clock_timestamp(), external_claim_actor = %s,"
+                 " external_claim_host = %s, external_claim_proof = %s,"
+                 " updated_at = now()"
+                 " WHERE id = %s RETURNING __COLUMNS__").replace(
+                     "__COLUMNS__", item_columns(self.db)),
+                (session, actor or "", host, proof, int(item_id)))
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return {"item": rows[0]}
+
+    @_retry_deadlock
+    def release_external(self, item_id, session, *, note, actor, host=None,
+                         proof=None, force=False) -> dict:
+        """#6839 : lever la prise exclusive d'un geste externe.
+
+        Seule la session porteuse la lève, depuis l'acteur, l'hôte et la
+        liaison L41 vérifiée de la prise ; une autre session qui passerait le
+        libellé public est refusée, sauf `force` (geste de pilote, vérifié par
+        le métier). Le feu nommé (`external_session`) reste : une autre
+        session ne peut reprendre que si le feu n'en nommait aucune. Résultats :
+        `unknown_lot`, `no_claim`, `not_holder` (avec la porteuse),
+        `not_holder_identity`, `not_holder_host`, `not_proved`, ou
+        `{"item": …}`."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT id, external_claim_session, external_claim_actor,"
+                " external_claim_host, external_claim_proof,"
+                " extract(epoch from external_claimed_at)::float8 AS claimed_ts"
+                " FROM work_items WHERE id = %s FOR UPDATE", (int(item_id),))
+            if not rows:
+                return {"error": "unknown_lot"}
+            item = rows[0]
+            holder = (item.get("external_claim_session") or "").strip()
+            if not holder:
+                return {"error": "no_claim"}
+            if holder != session and not force:
+                return {"error": "not_holder", "session": holder}
+            if not force:
+                claimed_by = (item.get("external_claim_actor") or "").strip()
+                claimed_on = (item.get("external_claim_host") or "").strip()
+                proved = (item.get("external_claim_proof") or "").strip()
+                if claimed_by and claimed_by != (actor or ""):
+                    return {"error": "not_holder_identity", "session": holder,
+                            "actor": claimed_by, "host": claimed_on,
+                            "at": item.get("claimed_ts")}
+                if claimed_on and claimed_on != (host or ""):
+                    return {"error": "not_holder_host", "session": holder,
+                            "host": claimed_on, "at": item.get("claimed_ts")}
+                if proved and proved != (proof or ""):
+                    return {"error": "not_proved", "session": holder,
+                            "proof": proved}
+            rows = tx.query(
+                ("UPDATE work_items SET external_claim_session = NULL,"
+                 " external_claimed_at = NULL, external_claim_actor = NULL,"
+                 " external_claim_host = NULL, external_claim_proof = NULL,"
+                 " updated_at = now()"
+                 " WHERE id = %s RETURNING __COLUMNS__").replace(
+                     "__COLUMNS__", item_columns(self.db)),
+                (int(item_id),))
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return {"item": rows[0]}
 
     def _wip_exception_locked(self, item_id, marker, prefixes) -> bool:
         """§4 : la dernière note d'attribution du lot porte-t-elle `marker` ?
