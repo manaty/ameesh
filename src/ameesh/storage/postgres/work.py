@@ -1740,10 +1740,10 @@ class WorkItems(interface.WorkItems):
           porteuse et l'instant de sa prise ;
         * `{"error": "reserved_session", "session": …}` : le feu nomme une
           autre session ;
-        * `{"error": "named_requires_proof", "session": …}` : le feu nomme
-          une session et l'appelant n'a aucune preuve de session ;
+        * `{"error": "no_proof", "session": …}` : aucune liaison de session
+          vérifiée ;
         * `{"error": "not_proved", "session": …}` : le libellé ne correspond
-          pas à la session prouvée de l'appelant ;
+          pas à la session vérifiée de l'appelant ;
         * `{"item": …}` : la prise est écrite, la session, l'instant, l'acteur,
           l'hôte et la preuve avec.
         """
@@ -1764,14 +1764,13 @@ class WorkItems(interface.WorkItems):
                 return {"error": "taken",
                         "session": item["external_claim_session"],
                         "at": item.get("claimed_ts")}
-            if proof and proof != session:
+            if not proof:
+                return {"error": "no_proof", "session": session}
+            if proof != session:
                 return {"error": "not_proved", "session": session}
             named = (item.get("external_session") or "").strip()
-            if named:
-                if not proof:
-                    return {"error": "named_requires_proof", "session": named}
-                if named != session:
-                    return {"error": "reserved_session", "session": named}
+            if named and named != session:
+                return {"error": "reserved_session", "session": named}
             rows = tx.query(
                 ("UPDATE work_items SET external_claim_session = %s,"
                  " external_claimed_at = clock_timestamp(), external_claim_actor = %s,"
@@ -1789,7 +1788,7 @@ class WorkItems(interface.WorkItems):
         """#6839 : lever la prise exclusive d'un geste externe.
 
         Seule la session porteuse la lève, depuis l'acteur, l'hôte et la
-        preuve de session de la prise ; une autre session qui passerait le
+        liaison L41 vérifiée de la prise ; une autre session qui passerait le
         libellé public est refusée, sauf `force` (geste de pilote, vérifié par
         le métier). Le feu nommé (`external_session`) reste : une autre
         session ne peut reprendre que si le feu n'en nommait aucune. Résultats :

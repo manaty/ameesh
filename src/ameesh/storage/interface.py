@@ -2810,12 +2810,11 @@ class WorkItems(Domain):
         Rend `{"item": …}` si la prise est écrite, ou un refus nommé :
         `unknown_lot`, `closed` (avec l'état), `not_external` (lot ordinaire),
         `taken` (avec la session porteuse et l'instant de sa prise),
-        `reserved_session` (le feu nomme une autre session),
-        `named_requires_proof` (le feu nomme une session, l'appelant n'en
-        prouve aucune) ou `not_proved` (le libellé n'est pas la session
-        prouvée). Deux prises concurrentes se sérialisent : une seule écrit,
-        l'autre voit la porteuse. `host` et `proof` sont écrits avec la prise
-        et contrôlés à la levée."""
+        `reserved_session` (le feu nomme une autre session), `no_proof`
+        (aucune liaison de session vérifiée) ou `not_proved` (le libellé
+        n'est pas la session vérifiée). Deux prises concurrentes se
+        sérialisent : une seule écrit, l'autre voit la porteuse. `host` et
+        `proof` sont écrits avec la prise et contrôlés à la levée."""
 
     @abc.abstractmethod
     def release_external(self, item_id: int, session: str, *, note: str,
@@ -2823,7 +2822,7 @@ class WorkItems(Domain):
                          proof: str | None = None, force: bool = False) -> dict:
         """#6839 : lever la prise exclusive d'un geste externe. Seule la
         session porteuse la lève, depuis le même acteur, le même hôte et la
-        même preuve de session, sauf `force` (geste de pilote vérifié par le
+        même liaison L41 vérifiée, sauf `force` (geste de pilote vérifié par le
         métier). Rend `{"item": …}`, `unknown_lot`, `no_claim`, `not_holder`,
         `not_holder_identity`, `not_holder_host` ou `not_proved`."""
 

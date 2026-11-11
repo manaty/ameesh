@@ -14,9 +14,10 @@
 --   external_claimed_at     : l'instant de la prise, avec la session.
 --   external_claim_actor    : l'acteur lié qui a pris (journal, levée).
 --   external_claim_host     : l'hôte de la prise (levée depuis le même hôte).
---   external_claim_proof    : l'identifiant de session PROUVÉ du preneur
---                             (liaison L41 ou session du harnais), NULL si
---                             aucune preuve n'était disponible.
+--   external_claim_proof    : l'identifiant de la liaison de session L41
+--                             VÉRIFIÉE du preneur (le nouveau code l'écrit
+--                             toujours ; NULL seulement pour une ligne d'un
+--                             autre écrivain).
 --
 -- La prise n'est ni une attribution ni un droit de dépense : le lot reste
 -- sans `assignee`, la règle du go owner et les autres gardes ne changent pas.
@@ -53,7 +54,7 @@ alter table work_items
         check (external_claim_proof is null or external_claim_session is not null);
 
 comment on column work_items.external_session is
-    '#6839: session named by the fire for an external executor gesture; NULL = any proved session of the executor may take it. Not an assignment.';
+    '#6839: L41 session id named by the fire for an external executor gesture; NULL = any verified session of the executor may take it. Not an assignment.';
 comment on column work_items.external_claim_session is
     '#6839: session that atomically took the external gesture (NULL = free); written before the external effect.';
 comment on column work_items.external_claimed_at is
@@ -63,4 +64,4 @@ comment on column work_items.external_claim_actor is
 comment on column work_items.external_claim_host is
     '#6839: host of the claim; a normal release is checked against it.';
 comment on column work_items.external_claim_proof is
-    '#6839: proved session id of the claimer (L41 binding or harness session); NULL = unproved, actor+host only.';
+    '#6839: verified L41 session id of the claimer; the new code always writes it with the claim.';

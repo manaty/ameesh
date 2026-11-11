@@ -2927,43 +2927,28 @@ def set_external_executor(db: Db, item_id: int, executor: str | None, *,
             "session": None if clear else named}
 
 
-#: #6839 : variables qui portent l'identifiant de session d'un harnais ;
-#: lues dans cet ordre, la première valeur valide fait preuve.
-_SESSION_PROOF_ENV = ("AMEESH_SESSION_ID", "DSH_SESSION_ID", "AGENT_MAIL_SESSION",
-                      "CLAUDE_SESSION_ID", "CODEX_SESSION_ID")
+def caller_session_proof(cfg, db) -> tuple[str | None, str, str | None]:
+    """#6839 : `(identifiant de session VÉRIFIÉ, source, agent lié)` de ce
+    processus, ou `(None, "", None)`.
 
-
-def caller_session_proof(cfg, db) -> tuple[str | None, str]:
-    """#6839 : l'identifiant de session PROUVÉ de ce processus, ou `(None, "")`.
-
-    Deux sources, dans cet ordre : la liaison de session L41 (le PID de ce
-    processus est un descendant de celui lié), puis la variable de session du
-    harnais (`DSH_SESSION_ID`, …), posée par l'exécuteur pour CETTE session.
-    Un libellé libre n'est pas une preuve : sans l'une des deux, la prise
-    reste possible (acteur + hôte), mais un feu qui nomme une session exige
-    la preuve."""
-    binding = None
+    Une seule source : la liaison L41 (`ameesh mail bind`) dont le PID est un
+    ancêtre de ce processus — vérifiée par le noyau, jamais par un libellé ni
+    par une variable d'environnement qu'une autre session recopierait. Sans
+    liaison, la prise est refusée : pas de mode dégradé permissif."""
     try:
         from . import identity
         binding = identity.resolve_session_binding(cfg, db)
-    except Exception:  # noqa: BLE001 - liaison illisible : le harnais peut prouver
-        binding = None
+    except Exception:  # noqa: BLE001 - liaison illisible : aucune preuve
+        return None, "", None
     if binding is not None and binding.ok and binding.source == "session":
         value = ((binding.session or {}).get("session_id") or "").strip()
         if value:
             try:
-                return normalize_external_session(value), "binding"
+                return (normalize_external_session(value), "binding",
+                        binding.name or None)
             except WorkError:
                 pass
-    for name in _SESSION_PROOF_ENV:
-        value = (os.environ.get(name) or "").strip()
-        if not value:
-            continue
-        try:
-            return normalize_external_session(value), name
-        except WorkError:
-            continue
-    return None, ""
+    return None, "", None
 
 
 def claim_external(db: Db, item_id: int, session, *, actor: str = "", host: str = "",
@@ -2974,15 +2959,14 @@ def claim_external(db: Db, item_id: int, session, *, actor: str = "", host: str 
     La prise est écrite AVANT l'effet externe, sous le verrou de la ligne du
     lot : deux sessions qui prennent le même feu se sérialisent, une seule
     aboutit. La seconde reçoit un refus nommé qui donne la porteuse et l'heure
-    de sa prise — jamais une réécriture silencieuse. Si le feu nomme une
-    session, seule une session PROUVÉE peut prendre, et c'est elle. Rend
-    `{item, session, at}`.
+    de sa prise — jamais une réécriture silencieuse. Seule une session VÉRIFIÉE
+    (liaison L41) peut prendre, et si le feu en nomme une, c'est celle-là.
+    Rend `{item, session, at}`.
 
-    `proof` est l'identifiant de session prouvé de l'appelant (`caller_session
-    _proof`) : il doit être celui de `--session`, sinon une autre session
-    prendrait le libellé public d'une porteuse. Sans preuve, la prise n'est
-    possible que si le feu ne nomme personne, et la levée exigera l'acteur et
-    l'hôte de la prise.
+    `proof` est l'identifiant de la liaison de session vérifiée de l'appelant
+    (`caller_session_proof`) : il doit être celui de `--session`, sinon une
+    autre session prendrait le libellé public d'une porteuse. Sans preuve, la
+    prise est refusée.
 
     La prise ne change ni l'assigné, ni l'état, ni les règles de dépense : le
     go owner reste requis pour tout achat, c'est une exclusivité d'exécution."""
@@ -2990,8 +2974,12 @@ def claim_external(db: Db, item_id: int, session, *, actor: str = "", host: str 
     if not text:
         raise WorkError("--session: name the session taking the external gesture")
     proved = normalize_external_session(proof)
-    if proved and proved != text:
-        raise WorkError("lot %s: this caller's proved session is %s, not %s: claim "
+    if not proved:
+        raise WorkError("lot %s: a claim requires a verified session binding "
+                        "(`ameesh mail bind <agent> --session <id> --pid <pid>`); "
+                        "a free label is not a proof — nothing changed" % item_id)
+    if proved != text:
+        raise WorkError("lot %s: this caller's verified session is %s, not %s: claim "
                         "refused, nothing changed" % (item_id, proved, text))
     host = (host or "").strip() or (getattr(cfg, "host", "") if cfg is not None else "")
     note = " ".join(str(note or "").split()) or ("external claim: %s" % text)
@@ -3015,11 +3003,10 @@ def claim_external(db: Db, item_id: int, session, *, actor: str = "", host: str 
     if error == "reserved_session":
         raise WorkError("lot %s is reserved to session %s: claim by %s refused, "
                         "nothing changed" % (item_id, result.get("session") or "?", text))
-    if error == "named_requires_proof":
-        raise WorkError("lot %s: the fire names session %s, and this caller has no "
-                        "proved session: bind this session (`ameesh mail bind`) or run "
-                        "the claim from the named session — nothing changed"
-                        % (item_id, result.get("session") or "?"))
+    if error == "no_proof":
+        raise WorkError("lot %s: a claim requires a verified session binding "
+                        "(`ameesh mail bind <agent> --session <id> --pid <pid>`) — "
+                        "nothing changed" % item_id)
     item = result["item"]
     return {"item": item, "session": text,
             "at": item.get("external_claimed_ts")}
@@ -3031,18 +3018,24 @@ def release_external(db: Db, item_id: int, session, *, actor: str = "", host: st
     """#6839 : lever la prise exclusive d'un geste externe.
 
     Seule la session porteuse la lève, depuis son acteur et son hôte, et avec
-    la preuve de session qui a pris : une autre session ne peut pas passer le
+    la liaison VÉRIFIÉE qui a pris : une autre session ne peut pas passer le
     libellé public de la porteuse, libérer sa prise puis reprendre le geste.
     `force` est le geste de secours du pilote (session porteuse disparue) :
-    il exige l'autorité de `corrector` et laisse une ligne de journal nommant
-    le forçage. Rend `{item, session, forced}`."""
+    il exige l'autorité de `corrector`, ne demande pas la preuve de la
+    porteuse, et laisse une ligne de journal nommant le forçage. Rend
+    `{item, session, forced}`."""
     text = normalize_external_session(session)
     if not text:
         raise WorkError("--session: name the session whose claim is released")
     proved = normalize_external_session(proof)
-    if proved and proved != text:
-        raise WorkError("lot %s: this caller's proved session is %s, not %s: release "
-                        "refused, nothing changed" % (item_id, proved, text))
+    if not force:
+        if not proved:
+            raise WorkError("lot %s: a release requires a verified session binding "
+                            "(`ameesh mail bind <agent> --session <id> --pid <pid>`); "
+                            "a pilot may use --force — nothing changed" % item_id)
+        if proved != text:
+            raise WorkError("lot %s: this caller's verified session is %s, not %s: "
+                            "release refused, nothing changed" % (item_id, proved, text))
     host = (host or "").strip() or (getattr(cfg, "host", "") if cfg is not None else "")
     who = actor or UNKNOWN_ACTOR
     if force:
@@ -3076,7 +3069,7 @@ def release_external(db: Db, item_id: int, session, *, actor: str = "", host: st
                         "refused (the holder releases it, or a pilot uses --force)"
                         % (item_id, text, result.get("host") or "?", host or "?"))
     if error == "not_proved":
-        raise WorkError("lot %s: session %s was taken with proved session %s; this "
+        raise WorkError("lot %s: session %s was taken with verified session %s; this "
                         "caller does not prove it: release refused (the holder "
                         "releases it, or a pilot uses --force)"
                         % (item_id, text, result.get("proof") or "?"))

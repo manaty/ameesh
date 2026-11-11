@@ -2458,7 +2458,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             actor, warning = work.resolve_actor(cfg, db, args.actor)
             if warning:
                 print("warning: %s" % warning, file=sys.stderr)
-            proof, proof_source = work.caller_session_proof(cfg, db)
+            proof, proof_source, proof_agent = work.caller_session_proof(cfg, db)
+            if proof and not args.force and proof_agent and actor != proof_agent:
+                raise work.WorkError(
+                    "this session is bound to %s, not %s: a claim or a normal "
+                    "release speaks for its own agent (a pilot uses --force)"
+                    % (proof_agent, actor))
             if args.release:
                 out = work.release_external(
                     db, args.id, args.session, actor=actor, host=cfg.host,
