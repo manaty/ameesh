@@ -9,12 +9,21 @@ from __future__ import annotations
 from . import accounts, budget, review_designation as rd, work_lifecycle as lifecycle
 
 
-def _account(row):
+def _nature(row):
     reason = str(row.get("status_text") or "")[len(budget.PAUSE_PREFIX):].strip()
     if reason.lower().startswith(budget.CRITICAL_MARK.lower()):
         reason = reason[len(budget.CRITICAL_MARK):].strip()
-    nature = accounts.pause_nature(reason).split("|")
+    return accounts.pause_nature(reason).split("|")
+
+
+def _account(row):
+    nature = _nature(row)
     return nature[1] if nature[0] == "pause" else row.get("session_account")
+
+
+def _window(row):
+    nature = _nature(row)
+    return nature[2] if nature[0] == "pause" else ""
 
 
 def blocked(designation, listing, *, project, families, now, pilot="", closed_hosts=()):
@@ -134,8 +143,11 @@ def alerts(items, milestones, events, listing, *, families, now, pilots=None,
     for alert in grouped.values():
         # The episode belongs to the family, not to today's held projects.
         # Removing a project's last lot must not create another notification.
+        # #6809 : the deadline stays out of the key — a pace pause recomputes
+        # it at every pass (01:30, 01:33, 01:36), which re-briefed the same
+        # pause every 30 s. The account and its window name the episode.
         alert["episode"] = sorted({
-            (_account(row) or "", accounts.pause_deadline(row.get("status_text") or ""))
+            (_account(row) or "", _window(row))
             for row in listing if rd.live_family(row, families=families) == alert["family"]
             and str(row.get("status_text") or "").lower().startswith(budget.PAUSE_PREFIX)
             and not rd.is_short_window_pause(row["status_text"])}, key=repr)

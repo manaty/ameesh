@@ -55,6 +55,22 @@ class FamilyPausedTest(unittest.TestCase):
         changed = dict(alert, lots=[], detail="changed")
         self.assertEqual(exploitation.alert_key(alert), exploitation.alert_key(changed))
 
+    def test_sliding_pace_deadline_keeps_the_episode_key(self):
+        # #6809 : 01:30, 01:33, 01:36 — one pause, one brief
+        def paused(deadline, window="seven_day"):
+            rows = registry()
+            for row in rows:
+                if row["harness"] == "codex":
+                    row["status_text"] = (
+                        "budget : pause (account primary, %s 80%%) until reset@%d; cap"
+                        % (window, deadline))
+            return self.alerts(rows)[0]
+        first, slid = paused(T+H), paused(T+H+180)
+        self.assertEqual(slid["resume_ts"], T+H+180)
+        self.assertEqual(exploitation.alert_key(first), exploitation.alert_key(slid))
+        self.assertNotEqual(exploitation.alert_key(first),
+                            exploitation.alert_key(paused(T+H, window="five_hour")))
+
     def test_removing_a_projects_last_lot_keeps_the_family_episode(self):
         rows = registry()
         for row in registry():
