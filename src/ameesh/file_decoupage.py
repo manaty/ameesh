@@ -52,6 +52,11 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   #6734 : un réveil programmé dû (ou dû dans `WAKE_LEAD_S`) sur un lot
   ouvert de l'agent est aussi un travail engagé : il n'endort pas l'agent et
   lève le dormeur, l'exécuteur délivrant alors le rendez-vous à l'heure.
+  #6833 : une relecture demandée sur un artefact hors git (lot sans gel,
+  exécutant externe) est enregistrée par une note de lot
+  `artifact-review-requested: <agent> sha256:<empreinte>` ; tant qu'aucune
+  note `artifact-review-done: <agent> sha256:<empreinte>` ne la suit et que
+  le lot reste ouvert, c'est un travail engagé de l'agent cité.
 * **#4623, la dernière note fait foi** : une note `roadmap: rouverte <projet>`
   postérieure à la dernière `roadmap: épuisée <projet>` désarme le sommeil et
   lève les dormeurs du projet dans la même passe (le geste est journalisé sur
@@ -126,6 +131,14 @@ MAIL_UNREAD_LIMIT = 200
 #: la passe du notifieur de l'ordre de la minute). La même avance vaut pour
 #: le sommeil, sinon l'agent levé serait rendormi avant son rendez-vous.
 WAKE_LEAD_S = 120.0
+#: #6833 : relecture d'un artefact hors git (dossier d'exécutant externe, lot
+#: sans gel), demandée et close par des notes du lot, jamais par courrier.
+#: L'empreinte est un sha256 (abrégé à 8 caractères au moins) ; `done` vaut
+#: pour la même empreinte (préfixe commun) et la même relecture.
+ARTIFACT_REVIEW_PREFIX = "artifact-review-requested:"
+ARTIFACT_DONE_PREFIX = "artifact-review-done:"
+_ARTIFACT_NOTE_RE = re.compile(
+    r"^\S+\s+([A-Za-z0-9_.:@-]+)\s+sha256:([0-9a-fA-F]{8,64})\b")
 #: état du notifieur : `{projet: début de la condition}`
 STATE_KEY = "queue_fill"
 
@@ -692,6 +705,58 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
     return pending, keep, None
 
 
+def artifact_reviews(db, lots) -> list:
+    """#6833 : les relectures d'artefact hors git encore ouvertes.
+
+    Un lot à exécutant externe n'a pas de gel : `ameesh work reviewer` n'y
+    crée pas de siège, et le courrier de demande cesse de compter dès qu'il
+    est lu. La demande est donc une note du lot
+    (`ARTIFACT_REVIEW_PREFIX <agent> sha256:<empreinte>`), close par une note
+    `ARTIFACT_DONE_PREFIX` postérieure qui cite le même agent et la même
+    empreinte (le verdict, noté par le relecteur ou le pilote). Seuls les lots
+    ouverts (`lots`) sont lus : un lot clos ferme ses demandes. Une demande
+    écrite par l'agent qu'elle cite ne compte pas : nul ne s'exempte seul.
+
+    Rend `[(lot, agent, empreinte)]` dans l'ordre des notes ; une lecture en
+    échec lève, l'appelant n'endort alors personne.
+    """
+    ids = sorted({int(lot["id"]) for lot in lots or () if (lot or {}).get("id")})
+    if not ids:
+        return []
+    st = storage.of(db).work
+    asked = st.events_noted(ARTIFACT_REVIEW_PREFIX, 0.0, ids=ids) or ()
+    if not asked:
+        return []
+    done = st.events_noted(ARTIFACT_DONE_PREFIX, 0.0, ids=ids) or ()
+
+    def parsed(row):
+        match = _ARTIFACT_NOTE_RE.match(str(row.get("note") or ""))
+        if match is None:
+            return None
+        return match.group(1).lower(), match.group(2).lower()
+
+    closed = []
+    for row in done:
+        key = parsed(row)
+        if key is not None:
+            closed.append((int(row["work_item_id"]), int(row["id"]), key))
+    out = []
+    for row in asked:
+        key = parsed(row)
+        if key is None:
+            continue
+        name, digest = key
+        if str(row.get("actor") or "").strip().lower() == name:
+            continue
+        lot = int(row["work_item_id"])
+        if any(c_lot == lot and c_id > int(row["id"]) and c_name == name
+               and (c_digest.startswith(digest) or digest.startswith(c_digest))
+               for c_lot, c_id, (c_name, c_digest) in closed):
+            continue
+        out.append((lot, name, digest))
+    return out
+
+
 def owed_work(db, names, lots, *, cfg=None, now: float | None = None) -> tuple:
     """#6575 : le travail engagé que chacun de `names` doit encore.
 
@@ -711,6 +776,10 @@ def owed_work(db, names, lots, *, cfg=None, now: float | None = None) -> tuple:
       motif, l'exécuteur ne délivrait le réveil qu'à la levée suivante,
       étrangère au rendez-vous (dev3 le 10/11 : 12:45 livré 13:59, 14:45
       livré 17:06) ;
+    * `artifact review requested on #N (sha256:abcdef12…)` (#6833) : une
+      relecture d'artefact hors git demandée à l'agent par note de lot
+      (`artifact_reviews`) attend encore son verdict (impl-12 endormi le
+      11/11 en relisant le dossier v3 de #6002) ;
     * `heavy job running (slot N)` : l'agent tient un créneau `ameesh heavy`
       sur l'hôte de la passe (`cfg` requis ; un autre hôte n'est pas lisible).
       Le numéro de créneau suffit et ne recopie jamais la commande : son argv
@@ -741,6 +810,11 @@ def owed_work(db, names, lots, *, cfg=None, now: float | None = None) -> tuple:
             if name and name not in out:
                 out[name] = "scheduled wake due on #%d (%s UTC)" % (
                     lot_id, time.strftime("%H:%M", time.gmtime(wake_ts)))
+        for lot_id, reviewer, digest in artifact_reviews(db, lots):
+            name = wanted.get(reviewer)
+            if name and name not in out:
+                out[name] = "artifact review requested on #%d (sha256:%s…)" % (
+                    lot_id, digest[:8])
         mine = {}
         for lot in lots or ():
             name = wanted.get(str((lot or {}).get("assignee") or "").strip().lower())
