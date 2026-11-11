@@ -1331,10 +1331,14 @@ ameesh export-v0 [--state DIR] [--agents a,b] [--keep]   # --keep: copy instead 
 
 ```
 ameesh provenance record --commit SHA [--lot ID] [--quiet] [--json]
+ameesh provenance record --signed --commit SHA --actor A --session S --harness H --host HOST \
+    (--key FILE --as OWNER | --approval ID) [--lot ID] [--expires TTL] [--json]
+ameesh provenance statement --commit SHA --actor A --session S --harness H --host HOST [--lot ID] [--json]
 ameesh provenance install [--repo R] [--json]
 ameesh provenance intent [--json]
 ameesh provenance created [--json]
 ameesh provenance show [--commit SHA | --milestone ID] [--json]
+ameesh provenance revoke --commit SHA --reason TEXT [--actor human:ID] [--json]
 ```
 
 `#1465`: the exact origin of a commit and of a milestone — actor, session,
@@ -1345,6 +1349,18 @@ existing commit (`--lot` attaches it to a work item), and `show` reads the
 receipt, or nothing when it is unknown. A provenance receipt proves where a
 change came from; it is never human authority (see the bench authority model
 below).
+
+`#4485`: `record --signed` attests a commit created outside a managed turn
+(no local PID) with an owner-key approval over a canonical statement;
+`statement` prints that statement and its digest. `#6873`: the signer must be
+the owner in person — a holder that is an agent, the attested actor itself, or
+a copy of the key registered under an agent is refused. `revoke` retires a
+commit receipt for good (dated, attributed, reasoned; the receipt line stays
+for audit): the merge gate then reads the commit as an unknown author. It
+requires a bound identity (lease or session) **and** the corrector authority —
+a declared orchestrator, design agent or auditor — or the owner at a terminal
+(`--actor human:ID`). A bound agent without that role is refused before any
+write.
 
 ## Bench authority model (Ed25519)
 

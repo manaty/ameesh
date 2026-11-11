@@ -151,6 +151,11 @@ def _qualify_range(cfg, db, spec, pin, gate, changed, references, *,
                         and _clean_merge_tree(spec.canon, parents[0], parents[1]) == tree):
                     continue
             receipt = review_provenance.receipt_for_commit(db, commit)
+            if receipt is None and review_provenance.revocation_for_commit(db, commit):
+                # #6873 : une preuve retirée n'est pas une origine inconnue
+                # ordinaire ; le repli d'auteur Git ne la remplace pas.
+                raise TrainError(
+                    "commit %s: provenance receipt revoked" % commit[:12])
             family = review_lot.family_of((receipt or {}).get("harness"), families)
             if receipt and family:
                 authors.append({"name": receipt["actor"], "family": family})

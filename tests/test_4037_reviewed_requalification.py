@@ -58,7 +58,10 @@ class ReviewedMoveTest(unittest.TestCase):
         self.items = {4037: {'id': 4037}, 4011: {'id': 4011}}
         store = types.SimpleNamespace(work=types.SimpleNamespace(
             verdicts_for_commit=lambda commit: self.marks), provenance=types.SimpleNamespace(
-            get=lambda reference: dict(work_item_id=4011), origins=self.origins))
+            get=lambda reference: dict(work_item_id=4011), origins=self.origins,
+            # #6873 : le contrat du fournisseur porte la révocation (0566) ;
+            # le faux n'en a aucune, comme une base sans reçu révoqué.
+            revocation=lambda subject: None))
         self.stack.enter_context(mock.patch.object(review.storage, 'of', return_value=store))
         self.stack.enter_context(mock.patch.object(review.work, 'milestones',
                                                    side_effect=lambda *a, **k: self.marks))
