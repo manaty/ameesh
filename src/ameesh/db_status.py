@@ -22,13 +22,16 @@ passe d'un hôte du mesh, PC éteint.
   interprété, et le chemin de lecture autorisé est dans
   `docs/EXPLOITATION.md`.
 
-Depuis PostgreSQL 10, `pg_stat_get_wal_senders` ne laisse que `pid` aux rôles
-qui n'ont pas les privilèges de `pg_read_all_stats` (superutilisateur ou
-membre de `pg_monitor` compris) : tous les autres champs de la ligne sont
-NULL. Une telle ligne n'est jamais comptée comme un secours ni interprétée ;
-le statut dit la visibilité insuffisante et l'alerte `db_stats_masked` la
-porte. Zéro ligne, elle, reste une absence certaine : le filtrage des lignes
-n'est pas masqué, seules leurs colonnes le sont.
+Depuis PostgreSQL 10, `pg_stat_replication` joint `pg_stat_get_activity` et
+`pg_stat_get_wal_senders` (system_views.sql, REL_17_STABLE) : hors
+superutilisateur et hors `pg_read_all_stats` (ou `pg_monitor`, qui l'inclut),
+`application_name`, `client_addr` et l'identité restent visibles, mais
+`state`, `sync_state`, les LSN et les retards viennent du second et sont
+NULL. Une ligne dont `state` est NULL n'est jamais comptée comme un secours
+ni interprétée ; le statut dit la visibilité insuffisante et l'alerte
+`db_stats_masked` la porte. Zéro ligne, elle, reste une absence certaine : le
+filtrage des lignes n'est pas masqué, seules les colonnes du walsender le
+sont.
 
 Le mono-nœud actuel est le défaut : ni `patroni_url`, ni réplication
 configurée, `db_min_standbys = 0` — le statut est lisible et aucune alerte de
@@ -221,14 +224,16 @@ def _replication_rows(db) -> list[dict]:
 
 
 def _masked_row(row) -> bool:
-    """Vrai pour une ligne de `pg_stat_replication` aux colonnes masquées.
+    """Vrai pour une ligne de `pg_stat_replication` aux détails masqués.
 
-    PostgreSQL ne laisse que `pid` aux rôles sans les privilèges de
-    `pg_read_all_stats` : `application_name`, `state`, `sync_state` et les
-    retards sont NULL. Une telle ligne ne dit ni l'état ni le retard ; elle
-    ne doit jamais être comptée comme un secours.
+    La vue joint `pg_stat_get_activity` (pid, `application_name`,
+    `client_addr`, identité) à `pg_stat_get_wal_senders()` : hors
+    `pg_read_all_stats`, seul le second jeu est NULL. Un `application_name`
+    visible ne prouve donc pas que `state`, `sync_state` ou les retards le
+    sont ; `state`, lui, n'est jamais NULL sur une ligne lisible (état
+    startup/catchup/streaming/backup/stopping).
     """
-    return row.get("state") is None and row.get("application_name") is None
+    return row.get("state") is None
 
 
 def _standbys(rows):

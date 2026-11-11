@@ -47,13 +47,15 @@ def standby(name, *, sync="async", lag=0.0, state="streaming"):
             "sent_lsn": "0/10", "replay_lsn": "0/10"}
 
 
-def masked_standby(pid=1234):
+def masked_standby(name="n2", pid=1234):
     """Une ligne telle que PostgreSQL 17 la rend sans pg_read_all_stats.
 
-    Seul `pid` est visible ; tout le reste est NULL (walsender.c,
-    `pg_stat_get_wal_senders`, REL_17_STABLE).
+    `application_name` et `client_addr` viennent de `pg_stat_get_activity`
+    et restent visibles ; `state`, `sync_state` et les retards viennent de
+    `pg_stat_get_wal_senders` et sont NULL (system_views.sql,
+    REL_17_STABLE).
     """
-    return {"pid": pid, "application_name": None, "client_addr": None,
+    return {"pid": pid, "application_name": name, "client_addr": "10.77.0.3",
             "state": None, "sync_state": None, "sync_priority": None,
             "write_lag_s": None, "flush_lag_s": None, "replay_lag_s": None,
             "sent_lsn": None, "replay_lsn": None}
@@ -204,9 +206,12 @@ class MaskedStatsTest(unittest.TestCase):
 
     def test_ligne_masquee_n_est_pas_un_secours(self):
         local = self.unprivileged(synchronous_standby_names="n2")
+        row = masked_standby()
+        # Le nom reste visible (pg_stat_get_activity) : c'est `state` NULL,
+        # et lui seul, qui prouve le masque.
+        self.assertEqual(row["application_name"], "n2")
         status = db_status.read(
-            cfg(db_min_standbys=1), FakeDb(local=local,
-                                           standbys=[masked_standby()]))
+            cfg(db_min_standbys=1), FakeDb(local=local, standbys=[row]))
         self.assertFalse(status["visibility"]["privileged"])
         self.assertEqual(status["visibility"]["masked_rows"], 1)
         self.assertEqual(status["replication"]["masked"], 1)
