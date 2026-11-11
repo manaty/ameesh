@@ -1558,6 +1558,10 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     récent peut être actif sans aucun check visible dans le rollup. Sans
     preuve API fraîche, aucun remplacement et aucun vert d'intégration.
     `ci_green` reste un prédicat pur ; les lecteurs lui passent ce rollup.
+
+    #6960 : un run annulé dont tous les checks du portier ont conclu sans
+    échec est admis même sans check CANCELLED — l'annulation demandée par
+    `ameesh ci run` (#2876) peut être traitée après la fin des jobs.
     """
     from datetime import datetime
     from urllib.parse import urlencode
@@ -1675,9 +1679,20 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     # Le run annulé le plus récent doit être visible : un CANCELLED d'un
     # ancien run ne permet jamais de retirer les FAILURE d'un nouveau run.
     ids = [run_id(c) for c in all_packet]
+    own = [c for c in packet if run_id(c) == latest["id"]]
     if (not packet or None in ids or any(i not in {r["id"] for r in runs} for i in ids)
-            or not any(run_id(c) == latest["id"] and c.get("conclusion") == "CANCELLED"
-                       for c in packet)):
+            or not own):
+        return blocked()
+    # #6960 : `ameesh ci run` annule le portier de la tête (#2876) ; quand
+    # l'annulation est traitée après la fin de ses jobs, le run conclut
+    # « cancelled » sans qu'aucun check ne soit CANCELLED (couverture
+    # SUCCESS, suite SKIPPED). Un run ainsi terminé, dont tous les checks du
+    # portier ont conclu sans échec, est le même remplacement : la preuve de
+    # validation reste le run PR vert de la même tête, fini après.
+    if not any(c.get("conclusion") == "CANCELLED" for c in own) and any(
+            str(c.get("status") or "").upper() != "COMPLETED"
+            or str(c.get("conclusion") or "").upper() == "FAILURE"
+            for c in packet):
         return blocked()
     ends = [finished(c) for c in all_packet]
     if any(t is None for t in ends) or end <= max(ends):
