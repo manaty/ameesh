@@ -378,6 +378,18 @@ class ReplicationTest(unittest.TestCase):
         self.stub("pg_ctlcluster", FAKE_PG_CTLCLUSTER)
         self.stub("runuser", FAKE_RUNUSER)
         self.stub("hostname", FAKE_HOSTNAME)
+        # Les doublures adressent les nœuds par leur nom : copie de
+        # l'inventaire réel où l'hôte est le nom (les adresses privées #6859
+        # sont témoignées par test_inventaire_reseau_prive).
+        self.noeuds = self.tmp / "noeuds.conf"
+        lignes = []
+        for ligne in (REPLICATION / "noeuds.conf").read_text(encoding="utf-8").splitlines():
+            champs = ligne.split("#", 1)[0].split()
+            if champs:
+                champs[1] = champs[0]
+                ligne = "  ".join(champs)
+            lignes.append(ligne)
+        self.noeuds.write_text("\n".join(lignes) + "\n", encoding="utf-8")
         self.stub("pg_basebackup", FAKE_PG_BASEBACKUP)
         self.stub("pg_rewind", FAKE_PG_REWIND)
         (self.pgconf / "pg_hba.conf").write_text(
@@ -423,7 +435,7 @@ class ReplicationTest(unittest.TestCase):
             "TZ": "UTC",
             "AMEESH_REPLICATION_ETC": str(self.etc),
             "AMEESH_REPLICATION_ENV": str(self.env_file),
-            "AMEESH_REPLICATION_NOEUDS": str(REPLICATION / "noeuds.conf"),
+            "AMEESH_REPLICATION_NOEUDS": str(self.noeuds),
             "AMEESH_REPLICATION_PGCONF": str(self.pgconf),
             "AMEESH_REPLICATION_DATA": str(self.data),
             "AMEESH_REPLICATION_PGBIN": str(self.pgbin),
@@ -518,6 +530,19 @@ class ReplicationTest(unittest.TestCase):
         self.assertEqual(lignes[0][2:], ["primaire", "oui", "non", "100"])
         self.assertEqual(lignes[1][2:], ["standby", "oui", "non", "90"])
         self.assertEqual(lignes[2][2:], ["standby", "non", "oui", "0"])
+
+    def test_inventaire_reseau_prive(self):
+        # EP8.3 (#6860) : les nœuds se joignent sur les adresses privées
+        # d'EP8.2 (#6859, RESEAU-PRIVE.md), jamais par un nom public.
+        hotes = {}
+        for ligne in (REPLICATION / "noeuds.conf").read_text(encoding="utf-8").splitlines():
+            ligne = ligne.split("#", 1)[0].strip()
+            if ligne:
+                champs = ligne.split()
+                hotes[champs[0]] = champs[1]
+        self.assertEqual(hotes, {"ameesh-agents-1": "10.78.0.11",
+                                 "ameesh-agents-2": "10.78.0.12",
+                                 "manaty-mesh-1": "10.78.0.10"})
 
     def test_inventaire_refuse_deux_primaires_et_hub_synchrone(self):
         inventaire = self.tmp / "inventaire.cas"

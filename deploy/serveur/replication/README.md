@@ -48,8 +48,9 @@ Règles encodées :
    `pg_ctlcluster`) sur les trois nœuds. `psql`/`pg_basebackup` 16 ne pilotent
    pas un serveur 17 (étude, « What already works in the client »).
 2. **Réseau privé (#6859)** : les nœuds doivent se joindre sur le port 5432
-   par leur nom d'inventaire, sans passer par le hub, et `listen_addresses`
-   doit contenir ce nom. Le script le signale s'il ne le voit pas ; il ne
+   par l'adresse privée de l'inventaire (`10.78.0.0/24`, RESEAU-PRIVE.md),
+   sans passer par le hub, et `listen_addresses` doit contenir cette adresse
+   (`reseau-prive.sh postgres` la pose). Le script le signale s'il ne le voit pas ; il ne
    touche pas au réseau.
 3. **TLS** (`ssl = on`, posé par `installer-serveur.sh`) : les lignes
    `hostssl` de `pg_hba` ne servent à rien sans lui. `sslmode=require` chiffre
@@ -67,7 +68,7 @@ Règles encodées :
    install -d -m 0750 /etc/ameesh
    umask 077
    {
-     printf 'REPLICATION_SUBNET=%s\n' '10.77.0.0/24'   # à remplacer par le réseau #6859
+     printf 'REPLICATION_SUBNET=%s\n' '10.78.0.0/24'   # réseau privé #6859
      printf 'REPLICATOR_PASSWORD=%s\n' "$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
      printf 'REWIND_PASSWORD=%s\n' "$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
    } > /etc/ameesh/replication.env
@@ -341,8 +342,8 @@ PYTHONPATH=src python -m unittest tests.test_6868_replication -v
 - Pas de Patroni/etcd : la promotion est manuelle et le split brain est gardé
   par un contrôle de rôle, pas par un quorum (EP8.4).
 - Le réseau privé (#6859) et l'archivage/PITR (#6858) sont des prérequis
-  d'autres lots ; `REPLICATION_SUBNET` et les hôtes de `noeuds.conf` seront
-  ajustés à leur livraison.
+  d'autres lots ; les hôtes de `noeuds.conf` sont les adresses privées de
+  #6859 (EP8.3, #6860).
 - Aucune alerte ni sonde de supervision : `etat.sh` est un outil
   d'exploitation, pas un service (EP8.4/EP8.5).
 - La bascule réelle, la fenêtre et la recette sur les trois nœuds restent le
