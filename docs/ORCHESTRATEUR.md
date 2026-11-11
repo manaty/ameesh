@@ -73,14 +73,16 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   par `parent_lot` ni par la fiche).
 * Un geste unique d'exécutant externe (#6839, constat du 11/11 : deux sessions
   du bureau ont exécuté le même feu d'achat) se **prend exclusivement sur son
-  lot, avant l'effet** : `ameesh work claim <lot> --session BG`. La prise est
-  écrite sous le verrou de la ligne ; la seconde session reçoit `already taken
-  by <session> at <heure>` et rien ne change. **Un geste = un lot** : deux
-  gestes distincts ne partagent pas la même prise. Nommer la session dans le
-  feu (`work add … --external-session BG`, ou `work external-executor <lot>
-  bureau --session BG`) réserve la prise à celle-là ; la porteuse la lève
-  (`--release`), un pilote la force si elle a disparu. Le go owner et les
-  règles de dépense ne changent pas.
+  lot, avant l'effet** : `ameesh work claim <lot> --session <id de session
+  prouvé>`. La prise est écrite sous le verrou de la ligne ; la seconde
+  session reçoit `already taken by <session> at <heure>` et rien ne change.
+  **Un geste = un lot** : deux gestes distincts ne partagent pas la même
+  prise. Nommer la session dans le feu (`work add … --external-session <id>`,
+  ou `work external-executor <lot> bureau --session <id>`) réserve la prise à
+  cette session prouvée (liaison `ameesh mail bind`, ou identifiant de session
+  du harnais) ; une autre reçoit `reserved to session`. La porteuse la lève
+  (`--release`) avec la même preuve ; un pilote la force si elle a disparu. Le
+  go owner et les règles de dépense ne changent pas.
 * Un lot de relecture après fusion (`review-after-merge:#<lot>`, sur son
   `issue_ref` ou sa `source`, #2377/#2552) n'est pris que par un agent de la
   **famille opposée** à celle de l'auteur au gel ; famille de l'auteur

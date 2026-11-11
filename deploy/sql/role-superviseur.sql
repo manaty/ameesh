@@ -743,9 +743,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- ligne par `to_jsonb` échouerait pour le rôle à droits de colonne
         'wake_at', 'wake_claim_at',
         -- #6839 (0565) : session nommée par le feu et prise exclusive d'un
-        -- geste d'exécutant externe (des libellés et un instant, de l'ÉTAT) —
-        -- le superviseur lit qui exécute, jamais une dépense
-        'external_session', 'external_claim_session', 'external_claimed_at'
+        -- geste d'exécutant externe (des libellés, l'acteur, l'hôte et un
+        -- instant, de l'ÉTAT) — le superviseur lit qui exécute, jamais une
+        -- dépense
+        'external_session', 'external_claim_session', 'external_claimed_at',
+        'external_claim_actor', 'external_claim_host', 'external_claim_proof'
     ]),
     -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
     ('work_item_estimates', ARRAY[

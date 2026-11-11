@@ -2458,21 +2458,25 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             actor, warning = work.resolve_actor(cfg, db, args.actor)
             if warning:
                 print("warning: %s" % warning, file=sys.stderr)
+            proof, proof_source = work.caller_session_proof(cfg, db)
             if args.release:
                 out = work.release_external(
-                    db, args.id, args.session, actor=actor, note=args.note,
-                    cfg=cfg, force=args.force)
+                    db, args.id, args.session, actor=actor, host=cfg.host,
+                    proof=proof, note=args.note, cfg=cfg, force=args.force)
             else:
                 if args.force:
                     raise work.WorkError("--force goes with --release: a claim is not forced")
                 out = work.claim_external(
-                    db, args.id, args.session, actor=actor, note=args.note, cfg=cfg)
+                    db, args.id, args.session, actor=actor, host=cfg.host,
+                    proof=proof, note=args.note, cfg=cfg)
             if args.json:
                 print(json.dumps({"schema": "ameesh.work.claim/1",
                                   "lot": out["item"]["id"],
                                   "session": out["session"],
                                   "released": bool(args.release),
-                                  "forced": bool(out.get("forced", False))},
+                                  "forced": bool(out.get("forced", False)),
+                                  "proved": bool(proof),
+                                  "proof_source": proof_source},
                                  ensure_ascii=False, indent=2, default=str))
                 return 0
             if args.release:
@@ -2647,9 +2651,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print("session  : %s (named by the fire, #6839)"
                           % item["external_session"])
                 if item.get("external_claim_session"):
-                    print("claim    : %s at %s (exclusive external gesture, #6839)"
+                    by = " by %s on %s" % (
+                        item.get("external_claim_actor") or "?",
+                        item.get("external_claim_host") or "?")
+                    print("claim    : %s at %s%s (exclusive external gesture, #6839)"
                           % (item["external_claim_session"],
-                             _fmt_moment(item.get("external_claimed_ts"))))
+                             _fmt_moment(item.get("external_claimed_ts")), by))
             print("app      : %-10s source: %-12s workstream: %s" % (
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
