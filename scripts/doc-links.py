@@ -36,6 +36,7 @@ import pathlib
 import re
 import sys
 import unicodedata
+from html.parser import HTMLParser
 from urllib.parse import unquote
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -58,8 +59,6 @@ FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
 # Indented code block (CommonMark: 4 spaces or a tab).
 INDENTED_CODE = re.compile(r"^(?: {4,}|\t)")
 INLINE_CODE = re.compile(r"`+[^`]*`+")
-# An explicit HTML anchor GitHub exposes as an id (`<a id="x">`, `<a name="x">`).
-HTML_ANCHOR = re.compile(r"<a\s+[^>]*?(?:id|name)\s*=\s*[\"']([^\"']+)[\"']", re.I)
 # A line that cannot be the text of a setext heading.
 LIST_ITEM = re.compile(r"^\s*(?:[-+*]|\d+[.)])\s+")
 # Anything with a scheme (http:, mailto:, data:…) or starting with // is external.
@@ -157,15 +156,28 @@ def _add_anchor(anchors: set[str], seen: dict[str, int], text: str) -> None:
     anchors.add(base if rank == 0 else f"{base}-{rank}")
 
 
+class _HTMLAnchors(HTMLParser):
+    """Collect actual anchor attributes, ignoring comments and attribute text."""
+
+    def __init__(self):
+        super().__init__()
+        self.anchors: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.anchors.update(value for key, value in attrs
+                                if key in ("id", "name") and value)
+
+
 def headings(path: pathlib.Path) -> set[str]:
     """Every anchor GitHub produces for the headings and HTML anchors of `path`."""
     anchors: set[str] = set()
     seen: dict[str, int] = {}
     previous = ""
+    html = _HTMLAnchors()
     text = path.read_text(encoding="utf-8", errors="replace").splitlines()
     for _, line in _prose_lines(text):
-        for match in HTML_ANCHOR.finditer(line):
-            anchors.add(match.group(1))
+        html.feed(INLINE_CODE.sub("", line) + "\n")
         match = HEADING.match(line)
         if match:
             _add_anchor(anchors, seen, match.group(2))
@@ -176,7 +188,7 @@ def headings(path: pathlib.Path) -> set[str]:
             previous = ""
             continue
         previous = line.strip() if _setext_text(line) else ""
-    return anchors
+    return anchors | html.anchors
 
 
 def links_of(path: pathlib.Path):
