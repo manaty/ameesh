@@ -563,7 +563,13 @@ projet. `ameesh release packet-watch --dry-run` montre ce qui
 partirait.
 
 La composition est **scriptée** (`scripts/paquet-auto.py`, #3807) : le
-composeur n'enchaîne plus les outils à la main. Le script part d'un worktree
+composeur n'enchaîne plus les outils à la main. Quand le script est lancé dans
+le tour d'un agent, il se replace d'abord dans un scope systemd transitoire
+(`systemd-run --user --scope`, #6814) : la mise à jour staging qui redémarre
+les exécuteurs arrête le tour, jamais la composition sous son bail (h-03,
+#6810). Le tic garde son unité dédiée ; le scope hérite du nom de l'agent et du
+DSN, mais pas du bail du tour, et ses worktrees vivent dans le dossier stable
+du composeur. Le script part d'un worktree
 jetable à la tête exacte d'`origin/<cible>`, y exécute `paquet-candidats.py`
 (le code de la cible), compose les candidats dans l'ordre rendu, écarte un
 conflit sans le résoudre, passe `freeze-checks`, écrit le manifeste,
