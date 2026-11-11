@@ -191,13 +191,14 @@ def vehicle(cfg, row: dict, milestones, *, db=None, gh=None, now: float | None =
             continue
         # Un clone du bon origin peut être resté avant la composition.
         # Le registre local peut déjà disposer de la tête de cette PR.
-        if plan_git._git(repo, "cat-file", "-e", pr["head"] + "^{commit}").returncode:
+        read_repo = repo
+        if plan_git._git(read_repo, "cat-file", "-e", pr["head"] + "^{commit}").returncode:
             alternate = fire.review_checkout(cfg, db, row, slug=slug, caller=True)
             if alternate and not plan_git._git(
                     alternate, "cat-file", "-e", pr["head"] + "^{commit}").returncode:
-                repo = alternate
+                read_repo = alternate
         members = planned_waits.packet_trailers(
-            repo, {"branch": pr["branch"], "branch_head": pr["head"]},
+            read_repo, {"branch": pr["branch"], "branch_head": pr["head"]},
             pr["base"] or None, head=pr["head"])
         if members is None:
             unreadable = "PR #%d: head %s not readable locally" % (
@@ -205,7 +206,7 @@ def vehicle(cfg, row: dict, milestones, *, db=None, gh=None, now: float | None =
             continue
         if rid not in members:
             continue
-        ancestry = plan_git._git(repo, "merge-base", "--is-ancestor", frozen, pr["head"])
+        ancestry = plan_git._git(read_repo, "merge-base", "--is-ancestor", frozen, pr["head"])
         if ancestry.returncode not in (0, 1):
             unreadable = "PR #%d: ancestry of frozen head %s not readable locally" % (
                 pr["number"], frozen[:12])

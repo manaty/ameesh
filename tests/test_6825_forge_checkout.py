@@ -77,3 +77,23 @@ class LocalVehicleTest(unittest.TestCase):
                 self.frozen_ms(self.frozen), db=object(),
                 gh=self.gh([self.pr()]), cache={})
             self.assertEqual(result, {})
+
+    def test_each_pr_selects_its_own_readable_clone(self):
+        git(self.repo, "remote", "add", "origin", "https://github.com/o/x.git")
+        project = os.path.join(self.repo, "project")
+        git(self.repo, "clone", "--single-branch", "--branch", "develop",
+            "--no-local", self.repo, project)
+        git(project, "fetch", "origin", "agent/43")
+        git(project, "checkout", "-q", "-b", "integration/paquet-10-x", "develop")
+        git(project, "merge", "-q", "--no-ff", "FETCH_HEAD",
+            "-m", "composition : #43\n\nameesh-work: 43")
+        second_head = git(project, "rev-parse", "HEAD")
+        git(project, "remote", "set-url", "origin", "https://github.com/o/x.git")
+        with mock.patch("ameesh.lot_class.repository", return_value=project), \
+                mock.patch("ameesh.registry.get", return_value={"cwd": self.repo}):
+            result = forge_packets.vehicle(
+                None, {"id": 43, "app": "product", "assignee": "author"},
+                self.frozen_ms(self.other), db=object(),
+                gh=self.gh([self.pr(), dict(self.pr(head=second_head,
+                    branch="integration/paquet-10-x"), number=10)]), cache={})
+        self.assertEqual(result["pr"], 10)
