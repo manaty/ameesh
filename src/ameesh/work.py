@@ -132,6 +132,14 @@ SIZES = ("s", "m", "l")
 #: #6090 : longueur maximale d'une clé d'idempotence durable
 #: (`work add --unique-ref`). La clé est opaque et fournie par l'appelant.
 UNIQUE_REF_MAX = 256
+#: #6839 : longueur maximale de la session qui porte un geste d'exécutant
+#: externe (l'identifiant que le feu nomme, ou que la session déclare).
+EXTERNAL_SESSION_MAX = 200
+#: #6839 : forme d'une session — imprimable, sans espace, comme
+#: `session_bindings.SESSION_RE` ; un libellé court (« BG », « pc-smichea »)
+#: et l'identifiant du harnais sont tous deux admis.
+_EXTERNAL_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,%d}$"
+                                  % (EXTERNAL_SESSION_MAX - 1))
 #: #2954 : les types de lot que porte la base (mêmes valeurs que la projection
 #: GitHub, `plan_github.LOT_TYPES`). Un lot `improvement` est un panier, avec
 #: ses champs de valeur ; `bug` et `evolution` suivent le chemin de correction.
@@ -615,6 +623,40 @@ def existing_by_unique_ref(db: Db, key) -> dict | None:
     return dict(row, existing=True) if row is not None else None
 
 
+def normalize_external_session(session) -> str | None:
+    """#6839 : la session qui porte (ou que le feu nomme pour) un geste
+    d'exécutant externe, ou None.
+
+    Un libellé opaque, sans espace : « BG », « pc-smichea », ou l'identifiant
+    de session d'un harnais. Les bords sont retirés, la casse est
+    significative ; un booléen ou un NUL est refusé. Une session vide n'est
+    pas une session (None)."""
+    if session is None:
+        return None
+    if isinstance(session, bool):
+        raise WorkError("external session: a session is a string, not a boolean")
+    text = str(session).strip()
+    if not text:
+        return None
+    if len(text) > EXTERNAL_SESSION_MAX:
+        raise WorkError("external session: at most %d characters (got %d)"
+                        % (EXTERNAL_SESSION_MAX, len(text)))
+    if "\x00" in text:
+        raise WorkError("external session: NUL is not allowed")
+    if not _EXTERNAL_SESSION_RE.match(text):
+        raise WorkError("invalid external session: %r (printable, no space, "
+                        "1 to %d characters)" % (session, EXTERNAL_SESSION_MAX))
+    return text
+
+
+def _claim_moment(ts) -> str:
+    """#6839 : l'instant d'une prise, en UTC, pour le refus qui la nomme."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(float(ts)))
+    except (TypeError, ValueError):
+        return "an unknown time"
+
+
 def add(
     db: Db,
     *,
@@ -645,6 +687,7 @@ def add(
     unique_execution: bool = False,
     unique_ref: str | None = None,
     external_executor: str | None = None,
+    external_session: str | None = None,
     footprint=None,
     impact: dict | None = None,
     composition_owner: str | None = None,
@@ -699,6 +742,12 @@ def add(
     débit le nomment. Le geste est celui d'un pilote (`corrector`,
     `history=False`) ; un lot ne porte pas deux exécutants (`assignee` et
     `external_executor` s'excluent).
+
+    #6839 : `external_session` nomme la session que le feu désigne pour ce
+    geste unique ; une autre session ne pourra pas le prendre. Sans elle,
+    la première session de l'exécutant qui prend le lot l'emporte. La prise
+    elle-même est `ameesh work claim <lot> --session <session>`, atomique et
+    écrite avant toute dépense ou création de ressource.
 
     Canon §2 (15/10/2026): the returned item carries `route_hint` when the
     title or the source looks like a non-blocking follow-up (N, P2, P3) — the
@@ -758,8 +807,8 @@ def add(
         note=note, force=force, parent_lot=parent_lot,
         mark_item_id=mark_item_id, mark_note=mark_note,
         unique_execution=unique_execution, unique_ref=unique_ref, team_queue=True,
-        external_executor=external_executor, footprint=footprint,
-        impact=impact)
+        external_executor=external_executor, external_session=external_session,
+        footprint=footprint, impact=impact)
     from . import packet_composition
     if not packet_composition.is_carrier(branch=branch, title=title):
         return _create(db, **fields)
@@ -896,7 +945,8 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             size=None, note="", force=None, parent_lot=None, mark_item_id=None,
             mark_note="", unique_execution: bool = False,
             unique_ref: str | None = None, team_queue: bool,
-            external_executor=None, footprint=None, impact=None) -> dict:
+            external_executor=None, external_session=None,
+            footprint=None, impact=None) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
@@ -945,6 +995,10 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
     elif externe:
         raise WorkError("--externe without assignee: nothing to force")
     external_executor = (external_executor or "").strip() or None
+    external_session = normalize_external_session(external_session)
+    if external_session and not external_executor:
+        raise WorkError("--external-session goes with --external-executor: a session "
+                        "names who takes an external gesture")
     if external_executor:
         if assignee:
             raise WorkError("a lot carries one executor: %s is assigned, drop the "
@@ -968,7 +1022,9 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         impact = None
     created = ("created" + (" (plan: %s)" % package if package else "")
                + ("; estimate: %s" % span(minutes * 60) if minutes else "")
-               + ("; reserved to external executor %s" % external_executor
+               + ("; reserved to external executor %s%s" % (
+                   external_executor,
+                   " (session %s)" % external_session if external_session else "")
                   if external_executor else "")
                + ("; %s" % note if note else ""))
 
@@ -988,7 +1044,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             forced_note=queued and _forced_note(queued, created, force, actor),
             mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot,
             unique_execution=unique_execution, unique_ref=unique_ref,
-            external_executor=external_executor,
+            external_executor=external_executor, external_session=external_session,
             # #4173 : l'empreinte d'intake est écrite par la création même ;
             # attribuée, celle-ci est refusée si elle chevauche un lot en cours
             # (`FootprintOverlap`, rien n'est écrit). #4818 : une analyse
@@ -2805,14 +2861,20 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
 
 
 def set_external_executor(db: Db, item_id: int, executor: str | None, *,
-                          actor: str = "", cfg=None, clear: bool = False) -> dict:
+                          actor: str = "", cfg=None, clear: bool = False,
+                          session: str | None = None) -> dict:
     """#3447 : déclare (ou efface, `clear=True`) l'exécutant externe d'un lot.
 
     Geste de pilote (`corrector`, `history=False`), comme la déclaration à la
     création. Le lot reste sans assigné : l'exécutant externe ne se réveille
     pas (0030), il porte l'attente nommée par les alertes et le débit. Un lot
     déjà assigné est refusé (deux exécutants) ; le lot doit être ouvert. Rend
-    `{item, previous, executor}`."""
+    `{item, previous, executor, session}`.
+
+    #6839 : `session` nomme la session que le feu désigne pour ce geste ; sur
+    une réservation déjà posée, la même session peut être (re)nommée sans
+    changer d'exécutant. Un lot déjà pris (`external_claim_session`) refuse
+    toute pose sauf `clear=True`, qui efface la prise avec la réservation."""
     who = corrector(cfg, db, actor, what="external executor", history=False)
     item = get(db, item_id)
     if item is None:
@@ -2821,20 +2883,34 @@ def set_external_executor(db: Db, item_id: int, executor: str | None, *,
         raise WorkError("lot %s is %s: no external executor to declare"
                         % (item_id, item["state"]))
     previous = (item.get("external_executor") or "").strip() or None
+    previous_session = (item.get("external_session") or "").strip() or None
+    named = normalize_external_session(session)
     if clear:
         name = None
         note = ("%s (was %s)" % (interface.EXTERNAL_EXECUTOR_CLEARED_NOTE, previous)
                 if previous else interface.EXTERNAL_EXECUTOR_CLEARED_NOTE)
+        if previous_session:
+            note += " (session %s)" % previous_session
     else:
         name = check_external_executor(db, executor or "", cfg=cfg)
         if item.get("assignee"):
             raise WorkError("lot %s is assigned to %s: clear the assignment first "
                             "(one executor per lot)" % (item_id, item["assignee"]))
-        if name == previous:
+        claim = (item.get("external_claim_session") or "").strip() or None
+        if claim:
+            raise WorkError("lot %s is claimed by session %s at %s: release it first "
+                            "(ameesh work claim %s --release --session %s)"
+                            % (item_id, claim,
+                               _claim_moment(item.get("external_claimed_ts")),
+                               item_id, claim))
+        if name == previous and (named or None) == previous_session:
             raise WorkError("lot %s is already reserved to %s" % (item_id, name))
         note = "%s %s" % (interface.EXTERNAL_EXECUTOR_NOTE, name)
+        if named:
+            note += " (session %s)" % named
     try:
-        row = storage.of(db).work.set_external_executor(item_id, name, note=note, actor=who)
+        row = storage.of(db).work.set_external_executor(
+            item_id, name, session=None if clear else named, note=note, actor=who)
     except interface.ExternalExecutorUnavailable as exc:
         raise WorkError("lot %s: external executor %s was retired before the reservation "
                         "was written; nothing changed — declare a current system instead"
@@ -2845,8 +2921,160 @@ def set_external_executor(db: Db, item_id: int, executor: str | None, *,
         if holder:
             raise WorkError("lot %s was assigned to %s in the meantime: one executor "
                             "per lot, nothing changed" % (item_id, holder))
-        raise WorkError("lot %s changed or closed in the meantime: retry" % item_id)
-    return {"item": row, "previous": previous, "executor": name}
+        raise WorkError("lot %s changed, closed or was claimed in the meantime: retry"
+                        % item_id)
+    return {"item": row, "previous": previous, "executor": name,
+            "session": None if clear else named}
+
+
+def caller_session_proof(cfg, db) -> tuple[str | None, str, str | None]:
+    """#6839 : `(identifiant de session VÉRIFIÉ, source, agent lié)` de ce
+    processus, ou `(None, "", None)`.
+
+    Une seule source : la liaison L41 (`ameesh mail bind`) dont le PID est un
+    ancêtre de ce processus — vérifiée par le noyau, jamais par un libellé ni
+    par une variable d'environnement qu'une autre session recopierait. Sans
+    liaison, la prise est refusée : pas de mode dégradé permissif."""
+    try:
+        from . import identity
+        binding = identity.resolve_session_binding(cfg, db)
+    except Exception:  # noqa: BLE001 - liaison illisible : aucune preuve
+        return None, "", None
+    if binding is not None and binding.ok and binding.source == "session":
+        value = ((binding.session or {}).get("session_id") or "").strip()
+        if value:
+            try:
+                return (normalize_external_session(value), "binding",
+                        binding.name or None)
+            except WorkError:
+                pass
+    return None, "", None
+
+
+def claim_external(db: Db, item_id: int, session, *, actor: str = "", host: str = "",
+                   proof: str | None = None, note: str = "", cfg=None) -> dict:
+    """#6839 : prendre de façon exclusive le geste d'un lot réservé à un
+    exécutant externe.
+
+    La prise est écrite AVANT l'effet externe, sous le verrou de la ligne du
+    lot : deux sessions qui prennent le même feu se sérialisent, une seule
+    aboutit. La seconde reçoit un refus nommé qui donne la porteuse et l'heure
+    de sa prise — jamais une réécriture silencieuse. Seule une session VÉRIFIÉE
+    (liaison L41) peut prendre, et si le feu en nomme une, c'est celle-là.
+    Rend `{item, session, at}`.
+
+    `proof` est l'identifiant de la liaison de session vérifiée de l'appelant
+    (`caller_session_proof`) : il doit être celui de `--session`, sinon une
+    autre session prendrait le libellé public d'une porteuse. Sans preuve, la
+    prise est refusée.
+
+    La prise ne change ni l'assigné, ni l'état, ni les règles de dépense : le
+    go owner reste requis pour tout achat, c'est une exclusivité d'exécution."""
+    text = normalize_external_session(session)
+    if not text:
+        raise WorkError("--session: name the session taking the external gesture")
+    proved = normalize_external_session(proof)
+    if not proved:
+        raise WorkError("lot %s: a claim requires a verified session binding "
+                        "(`ameesh mail bind <agent> --session <id> --pid <pid>`); "
+                        "a free label is not a proof — nothing changed" % item_id)
+    if proved != text:
+        raise WorkError("lot %s: this caller's verified session is %s, not %s: claim "
+                        "refused, nothing changed" % (item_id, proved, text))
+    host = (host or "").strip() or (getattr(cfg, "host", "") if cfg is not None else "")
+    note = " ".join(str(note or "").split()) or ("external claim: %s" % text)
+    result = storage.of(db).work.claim_external(
+        item_id, text, actor=actor or UNKNOWN_ACTOR, host=(host or None),
+        proof=proved, note=note)
+    error = result.get("error")
+    if error == "unknown_lot":
+        raise WorkError("lot %s not found" % item_id)
+    if error == "closed":
+        raise WorkError("lot %s is %s: no external gesture to take"
+                        % (item_id, result.get("state") or "closed"))
+    if error == "not_external":
+        raise WorkError("lot %s has no external executor: a claim is for a gesture "
+                        "reserved to one (`ameesh work external-executor %s <agent>`)"
+                        % (item_id, item_id))
+    if error == "taken":
+        raise WorkError("lot %s already taken by %s at %s: claim refused, nothing changed"
+                        % (item_id, result.get("session") or "?",
+                           _claim_moment(result.get("at"))))
+    if error == "reserved_session":
+        raise WorkError("lot %s is reserved to session %s: claim by %s refused, "
+                        "nothing changed" % (item_id, result.get("session") or "?", text))
+    if error == "no_proof":
+        raise WorkError("lot %s: a claim requires a verified session binding "
+                        "(`ameesh mail bind <agent> --session <id> --pid <pid>`) — "
+                        "nothing changed" % item_id)
+    item = result["item"]
+    return {"item": item, "session": text,
+            "at": item.get("external_claimed_ts")}
+
+
+def release_external(db: Db, item_id: int, session, *, actor: str = "", host: str = "",
+                     proof: str | None = None, note: str = "", cfg=None,
+                     force: bool = False) -> dict:
+    """#6839 : lever la prise exclusive d'un geste externe.
+
+    Seule la session porteuse la lève, depuis son acteur et son hôte, et avec
+    la liaison VÉRIFIÉE qui a pris : une autre session ne peut pas passer le
+    libellé public de la porteuse, libérer sa prise puis reprendre le geste.
+    `force` est le geste de secours du pilote (session porteuse disparue) :
+    il exige l'autorité de `corrector`, ne demande pas la preuve de la
+    porteuse, et laisse une ligne de journal nommant le forçage. Rend
+    `{item, session, forced}`."""
+    text = normalize_external_session(session)
+    if not text:
+        raise WorkError("--session: name the session whose claim is released")
+    proved = normalize_external_session(proof)
+    if not force:
+        if not proved:
+            raise WorkError("lot %s: a release requires a verified session binding "
+                            "(`ameesh mail bind <agent> --session <id> --pid <pid>`); "
+                            "a pilot may use --force — nothing changed" % item_id)
+        if proved != text:
+            raise WorkError("lot %s: this caller's verified session is %s, not %s: "
+                            "release refused, nothing changed" % (item_id, proved, text))
+    host = (host or "").strip() or (getattr(cfg, "host", "") if cfg is not None else "")
+    who = actor or UNKNOWN_ACTOR
+    if force:
+        who = corrector(cfg, db, actor, what="external claim release")
+        note = " ".join(str(note or "").split())
+        note = ("%s (forced release of session %s)" % (note, text) if note
+                else "forced release of session %s" % text)
+    else:
+        note = " ".join(str(note or "").split()) or ("external claim released: %s" % text)
+    result = storage.of(db).work.release_external(
+        item_id, text, actor=who, host=(host or None), proof=proved,
+        note=note, force=bool(force))
+    error = result.get("error")
+    if error == "unknown_lot":
+        raise WorkError("lot %s not found" % item_id)
+    if error == "no_claim":
+        raise WorkError("lot %s has no external claim to release" % item_id)
+    if error == "not_holder":
+        raise WorkError("lot %s is claimed by session %s, not %s: release refused "
+                        "(the holder releases it, or a pilot uses --force)"
+                        % (item_id, result.get("session") or "?", text))
+    if error == "not_holder_identity":
+        raise WorkError("lot %s: session %s was taken by actor %s on %s at %s, not "
+                        "by %s from %s: release refused (the holder releases it, or "
+                        "a pilot uses --force)"
+                        % (item_id, text, result.get("actor") or "?",
+                           result.get("host") or "?", _claim_moment(result.get("at")),
+                           actor or UNKNOWN_ACTOR, host or "?"))
+    if error == "not_holder_host":
+        raise WorkError("lot %s: session %s was taken on host %s, not %s: release "
+                        "refused (the holder releases it, or a pilot uses --force)"
+                        % (item_id, text, result.get("host") or "?", host or "?"))
+    if error == "not_proved":
+        raise WorkError("lot %s: session %s was taken with verified session %s; this "
+                        "caller does not prove it: release refused (the holder "
+                        "releases it, or a pilot uses --force)"
+                        % (item_id, text, result.get("proof") or "?"))
+    item = result["item"]
+    return {"item": item, "session": text, "forced": bool(force)}
 
 
 def takes_rule(check: dict) -> bool:

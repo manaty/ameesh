@@ -780,6 +780,12 @@ def owed_work(db, names, lots, *, cfg=None, now: float | None = None) -> tuple:
       relecture d'artefact hors git demandée à l'agent par note de lot
       (`artifact_reviews`) attend encore son verdict (impl-12 endormi le
       11/11 en relisant le dossier v3 de #6002) ;
+    * `packet refusal on #N: <code> (author)` (#6828) : un lot à valider
+      assigné à l'agent est refusé au paquet pour une cause côté auteur
+      (`freeze-not-head`, `conflict`…), lue par
+      `packet_candidates.candidate_refusal` comme l'escalade SLO et le débit
+      (#4572). Le composeur ne peut pas le porter : sans ce motif, l'auteur
+      était endormi avec son regel dû (impl-03 le 11/11, #6806) ;
     * `heavy job running (slot N)` : l'agent tient un créneau `ameesh heavy`
       sur l'hôte de la passe (`cfg` requis ; un autre hôte n'est pas lisible).
       Le numéro de créneau suffit et ne recopie jamais la commande : son argv
@@ -831,6 +837,7 @@ def owed_work(db, names, lots, *, cfg=None, now: float | None = None) -> tuple:
                     continue
                 out[name] = "member #%s of open packet #%s" % (
                     member.get("work_item_id"), member.get("package_id"))
+        _author_refusals(db, cfg, lots, wanted, out)
     except Exception as exc:  # noqa: BLE001 - le doute ne retire personne
         return out, "%s: %s" % (type(exc).__name__, str(exc)[:160])
     if cfg is not None and getattr(cfg, "state_dir", None):
@@ -844,6 +851,42 @@ def owed_work(db, names, lots, *, cfg=None, now: float | None = None) -> tuple:
             if slot.get("busy") and name and name not in out:
                 out[name] = "heavy job running (slot %s)" % slot.get("slot", "?")
     return out, None
+
+
+def _author_refusals(db, cfg, lots, wanted: dict, out: dict) -> None:
+    """#6828 : ajoute à `out` le refus de paquet côté auteur de chaque agent.
+
+    Seuls les lots à valider (`qa`, `validated`) avec une branche sont lus :
+    un lot en cours est déjà du travail actionnable. La lecture est celle de
+    `paquet-candidats` (locale, sans fetch) ; une lecture incomplète
+    (`unknown`) ou en échec pour un lot ne nomme pas l'auteur débiteur, comme
+    le brief SLO, et ne fait pas tomber les autres motifs."""
+    from . import packet_candidates, registry
+    from . import work_lifecycle as lifecycle
+    rows = []
+    for lot in lots or ():
+        lot = lot or {}
+        name = wanted.get(str(lot.get("assignee") or "").strip().lower())
+        if (name and name not in out
+                and str(lot.get("state") or "") in lifecycle.TO_VALIDATE
+                and str(lot.get("branch") or "").strip()):
+            rows.append((int(lot["id"]), name, lot))
+    if not rows:
+        return
+    try:
+        overview = registry.overview(db)
+    except Exception:  # noqa: BLE001 - registre illisible : lecture par lot
+        overview = None
+    for lot_id, name, lot in sorted(rows, key=lambda row: row[0]):
+        if name in out:
+            continue
+        try:
+            cause = packet_candidates.candidate_refusal(
+                db, cfg, dict(lot), overview=overview)
+        except Exception:  # noqa: BLE001 - cause illisible : personne nommé
+            continue
+        if cause.get("code") and cause.get("owner") == "author":
+            out[name] = "packet refusal on #%d: %s (author)" % (lot_id, cause["code"])
 
 
 def _journal_exemption(db, split_id, name: str, why: str, *,
