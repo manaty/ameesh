@@ -30,6 +30,7 @@ class DetachedStatusTest(unittest.TestCase):
                                  launch_lock=threading.Lock(),
                                  container_runtime=lambda: None)
         tracker = background.Tracker(runner, log=lambda _: None)
+        support.adopt_orphans(self, tracker)
         self.assertTrue(tracker.subreaper)
         saut_lu, saut_ecrit = os.pipe()     # test -> enfant : quitte le groupe
         sortie_lu, sortie_ecrit = os.pipe()  # enfant -> test : setsid fait

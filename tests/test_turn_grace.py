@@ -27,6 +27,7 @@ from ameesh import background, config as config_mod, mail, platform, registry, s
 from ameesh.platform import turn_cgroup
 from ameesh.runner import AgentWorker, Runner
 
+from . import support
 from .support import EMPTY_CONFIG, FAKEBIN, PgTestCase
 
 
@@ -65,7 +66,10 @@ class NoteTest(unittest.TestCase):
     def _tracker(self) -> background.Tracker:
         runner = mock.Mock()
         runner.container_runtime.return_value = None
-        return background.Tracker(runner, log=lambda *_a: None)
+        tracker = background.Tracker(runner, log=lambda *_a: None)
+        support.adopt_orphans(self, tracker)
+        support.adopt_orphans(self, tracker)
+        return tracker
 
     @staticmethod
     def _entry(turn, state, ended, job=None, **kw) -> background.Entry:
@@ -149,6 +153,7 @@ class ZombieTest(unittest.TestCase):
         runner = mock.Mock()
         runner.container_runtime.return_value = None
         tracker = background.Tracker(runner, log=lambda *_a: None)
+        support.adopt_orphans(self, tracker)
         now = time.time()
         entry = background.Entry(agent="a", turn_id="t" * 32, pgid=pid, ended=now,
                                  deadline=now + 1200, grace_s=1200, lineage={pid})
@@ -180,6 +185,7 @@ class PgidRecycleTest(unittest.TestCase):
         runner = mock.Mock()
         runner.container_runtime.return_value = None
         tracker = background.Tracker(runner, log=lambda *a: None)
+        support.adopt_orphans(self, tracker)
         entry = background.Entry(agent="a", turn_id="t" * 32, pgid=self.PGID,
                                  ended=now - 30.0, deadline=now + 1200.0,
                                  grace_s=1200, lineage={self.PGID, self.JOB})
@@ -220,6 +226,7 @@ class KillVerdictTest(unittest.TestCase):
         runner.harness_pids = set()
         runner.container_runtime.return_value = None
         tracker = background.Tracker(runner, log=lambda *a: None)
+        support.adopt_orphans(self, tracker)
         tracker.TERM_GRACE_S = 0
         entry = background.Entry(agent="a", turn_id="t" * 32, pgid=4242, ended=0.0,
                                  deadline=1.0, grace_s=1, lineage={4242})
