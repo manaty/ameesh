@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0566_work_item_external_claim_identity — #6877 : la prise d'un geste hôte
+-- 0568_work_item_external_claim_identity — #6877 : la prise d'un geste hôte
 -- nomme l'identité COMPLÈTE de la liaison de session.
 --
 -- #6839 ne persistait que le libellé (`external_claim_session`) et
@@ -17,7 +17,7 @@
 --                             libérer en --force).
 --
 -- Les deux colonnes vont ensemble (NULL,NULL pour une prise écrite par le
--- code d'avant 0566 ou par un autre écrivain) ; la porte refuse alors la
+-- code d'avant 0568 ou par un autre écrivain) ; la porte refuse alors la
 -- prise et demande de la libérer puis de la reprendre depuis une session liée.
 -- Additif seulement : colonnes nullables, aucune ligne existante ne change de
 -- sens, et le code d'avant ne les nomme jamais.

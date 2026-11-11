@@ -748,7 +748,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- dépense
         'external_session', 'external_claim_session', 'external_claimed_at',
         'external_claim_actor', 'external_claim_host', 'external_claim_proof',
-        -- #6877 (0566) : identité complète de la liaison qui a pris (harnais
+        -- #6877 (0568) : identité complète de la liaison qui a pris (harnais
         -- et ligne de liaison) — de l'ÉTAT, lue pour dire qui tient le geste
         'external_claim_harness', 'external_claim_binding'
     ]),

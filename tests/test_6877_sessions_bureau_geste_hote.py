@@ -270,13 +270,13 @@ class GesteHoteGateTest(_Base):
         self.assertIn("release it and claim again", str(raised.exception))
 
     def test_une_prise_ecrite_par_le_code_n_moins_1_se_libere_et_se_reprend(self):
-        """L'écrivain N-1 (#6839) ne nomme pas les colonnes de 0566 : sa prise
+        """L'écrivain N-1 (#6839) ne nomme pas les colonnes de 0568 : sa prise
         se lit, la porte la refuse, mais la porteuse peut la libérer puis la
         reprendre avec l'identité complète."""
         lot = self.reserve()
         bg = self.bind_session("BG")
         # l'UPDATE de prise du stockage N-1, copié : il ne nomme aucune des
-        # deux colonnes ajoutées par 0566.
+        # deux colonnes ajoutées par 0568.
         self.previous_write(
             "UPDATE work_items SET external_claim_session = %s,"
             " external_claimed_at = clock_timestamp(), external_claim_actor = %s,"
