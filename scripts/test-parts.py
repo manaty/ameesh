@@ -852,17 +852,33 @@ def host_cap() -> int | None:
 
 
 def _base_dsn(dsn: str, base: str) -> str | None:
-    """Le DSN URL `dsn` pointé sur la base `base` (`None` hors forme URL)."""
+    """Le DSN URL `dsn` pointé sur la base `base` (`None` hors forme URL).
+
+    #6808 : `urlunsplit` perd une barre oblique quand l'hôte est vide
+    (`postgresql:///db?host=/var/run/postgresql` devenait `postgresql:/…`,
+    illisible pour libpq), et un `dbname=` de la requête l'emporte sur le
+    chemin : les processus restaient alors sur une autre base sans le dire.
+    La forme est reconstruite à la main pour garder `//` même sans hôte, et
+    `dbname` est retiré de la requête ; `bases_par_processus` sonde ensuite
+    la base réellement atteinte (`current_database()`)."""
     morceaux = urllib.parse.urlsplit(dsn)
     if morceaux.scheme not in ("postgres", "postgresql"):
         return None
-    return urllib.parse.urlunsplit(morceaux._replace(path="/" + base))
+    requete = [param for param in morceaux.query.split("&")
+               if param and urllib.parse.unquote_plus(param.split("=", 1)[0]) != "dbname"]
+    url = f"{morceaux.scheme}://{morceaux.netloc}/{base}"
+    if requete:
+        url += "?" + "&".join(requete)
+    if morceaux.fragment:
+        url += "#" + morceaux.fragment
+    return url
 
 
-def _psql_admin(dsn: str, sql: str) -> bool:
+def _psql_admin(dsn: str, sql: str, attendu: str | None = None) -> bool:
+    """Exécute `sql` par `psql` ; avec `attendu`, la sortie doit valoir ce texte."""
     try:
         proc = subprocess.run(
-            ["psql", "-w", "--dbname", dsn, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
+            ["psql", "-w", "--dbname", dsn, "-At", "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
             capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"#6803 : psql indisponible ({exc})", file=sys.stderr, flush=True)
@@ -870,7 +886,14 @@ def _psql_admin(dsn: str, sql: str) -> bool:
     if proc.returncode != 0:
         print(f"#6803 : {sql} refusé : {proc.stderr.strip()[-500:]}",
               file=sys.stderr, flush=True)
-    return proc.returncode == 0
+        return False
+    if attendu is not None and proc.stdout.strip() != attendu:
+        # #6808/B de ameesh-cx1 : jamais le DSN ici, il peut porter un mot de
+        # passe (userinfo ou `password=`) ; les deux noms de base suffisent.
+        print(f"#6808 : la base atteinte {(proc.stdout.strip() or '?')!r} n'est pas "
+              f"{attendu!r}", file=sys.stderr, flush=True)
+        return False
+    return True
 
 
 def bases_par_processus(part: int, n: int) -> tuple[str, list[str]]:
@@ -893,8 +916,9 @@ def bases_par_processus(part: int, n: int) -> tuple[str, list[str]]:
         if cree:
             dsns.append(dsn)
         # une base créée mais injoignable (profil de connexion limité à la
-        # base d'administration, #2170) ferait échouer chaque test du processus
-        if not cree or not _psql_admin(dsn, "SELECT 1"):
+        # base d'administration, #2170) ferait échouer chaque test du processus ;
+        # #6808 : la sonde vérifie la base atteinte, pas seulement la connexion
+        if not cree or not _psql_admin(dsn, "SELECT current_database()", base):
             print("#6803 : base partagée par les processus de la part "
                   "(verrous consultatifs communs)", file=sys.stderr, flush=True)
             supprimer_bases(admin, dsns)
