@@ -16,6 +16,7 @@ import re
 import stat
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -25,7 +26,10 @@ PORT = 5432
 ADMIN = 'release_restore_admin'
 ADMIN_MAP = 'release_admin'
 SOCKET = '/run/' + NAME
-INSTALL = Path('/opt/ameesh-release/restore')
+INSTALL = Path('/usr/local/libexec/ameesh-release-restore')
+# #6799: earlier installers put their copy inside the sealed release tree. A
+# present legacy copy is moved out and is never written to again.
+LEGACY_INSTALL = Path('/opt/ameesh-release/restore')
 UNIT_ROOT = Path('/etc/systemd/system')
 ENROLLMENT = Path('/etc/ameesh-release/restore-probe.json')
 INTENT = Path('/etc/ameesh-release/restore-install.json')
@@ -267,7 +271,8 @@ def capacity_output(backup, config, config_path=ENROLLMENT):
         documents.update(canonical(value) for value in remote.values()
                          if isinstance(value, str) and value.startswith('/'))
     data, conf = layout(config['version'])
-    trees = (ENROLLMENT.parent, INTENT.parent, conf, data, INSTALL, UNIT_ROOT)
+    trees = (ENROLLMENT.parent, INTENT.parent, conf, data, INSTALL,
+             LEGACY_INSTALL, UNIT_ROOT)
     if output in documents or any(output == tree or tree in output.parents for tree in trees):
         raise RestoreError('capacity output must not target enrollment or configuration')
     return output
@@ -311,7 +316,8 @@ After={NAME}.service
 Type=oneshot
 User=root
 UMask=0077
-ExecStart={python} -I {INSTALL}/restauration-release.py probe
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart={python} -I -B {INSTALL}/restauration-release.py probe
 TimeoutStartSec=120
 NoNewPrivileges=yes
 ProtectHome=yes
@@ -358,6 +364,58 @@ def authentication(restore_role):
             f'{ADMIN_MAP} root {ADMIN}\n')
 
 
+def migrate_install():
+    """Move a pre-#6799 copy out of the sealed release tree, never copy it.
+
+    The installed script is overwritten right after the move; only the
+    directory changes place, so no restore file stays under the runtime tree.
+    """
+    if not LEGACY_INSTALL.is_symlink() and not LEGACY_INSTALL.exists():
+        return
+    if LEGACY_INSTALL.is_symlink():
+        raise RestoreError('legacy restore installation is linked')
+    info = LEGACY_INSTALL.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RestoreError('legacy restore installation differs')
+    if INSTALL.exists() or INSTALL.is_symlink():
+        raise RestoreError('both restore installation paths exist')
+    protected(LEGACY_INSTALL)
+    INSTALL.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    protected(INSTALL)
+    os.replace(LEGACY_INSTALL, INSTALL)
+
+
+def clear_install_copy(root):
+    """Remove the installer-owned script and bytecode cache from one path."""
+    (root / 'restauration-release.py').unlink(missing_ok=True)
+    cache = root / '__pycache__'
+    if cache.is_dir() and not cache.is_symlink():
+        shutil.rmtree(cache)
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+
+
+def activate_capacity(backup):
+    """Enable the root producer only with its protected identity document.
+
+    #6799: installing while the restore-backup identity is absent (P1 of
+    #3392) must not reactivate a probe that can only fail. The refusal is
+    named and reported, while the rest of the installation stays complete.
+    """
+    if not backup.exists():
+        return ('restore cluster operation refused; step=capacity-timer: '
+                'restore backup identity missing; timer left disabled')
+    try:
+        read_document(backup)
+    except Exception:
+        return ('restore cluster operation refused; step=capacity-timer: '
+                'restore backup identity unreadable; timer left disabled')
+    command(['/usr/bin/systemctl', 'enable', '--now', NAME + '-capacity.timer'])
+    return None
+
+
 def install(version, backup_path, python, restore_role):
     data, conf = layout(version)
     rendered = units(version, python)
@@ -379,6 +437,7 @@ def install(version, backup_path, python, restore_role):
             raise RestoreError('unowned restore cluster exists')
         intent = dict(request=request, system_identifier=None)
         save_document(INTENT, intent)
+    migrate_install()
     try:
         user = pwd.getpwnam(ACCOUNT)
         if user.pw_shell != '/usr/sbin/nologin' or user.pw_dir != '/nonexistent':
@@ -436,7 +495,9 @@ def install(version, backup_path, python, restore_role):
     if ENROLLMENT.exists() and read_document(ENROLLMENT) != current:
         raise RestoreError('restore enrollment changed')
     save_document(ENROLLMENT, current)
-    command(['/usr/bin/systemctl', 'enable', '--now', NAME + '-capacity.timer'])
+    refused = activate_capacity(backup_path)
+    if refused is not None:
+        print(refused, file=sys.stderr)
 
 
 def remove():
@@ -476,7 +537,8 @@ def remove():
     for name in units(version, request['python']):
         (UNIT_ROOT / name).unlink(missing_ok=True)
     ENROLLMENT.unlink(missing_ok=True)
-    (INSTALL / 'restauration-release.py').unlink(missing_ok=True)
+    for root in (INSTALL, LEGACY_INSTALL):
+        clear_install_copy(root)
     command(['/usr/bin/systemctl', 'daemon-reload'])
     INTENT.unlink()
     # Keep the locked OS identity: deleting/reusing its uid is unsafe. No data,
