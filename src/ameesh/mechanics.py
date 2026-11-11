@@ -127,7 +127,7 @@ _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "re
                   "merge", "prevalidation", "backlog", "staging", "accounts",
                   "paquet", "packet_tests", "file", "session", "auto_take", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
-                  "contract_selection", "repair_policy")
+                  "contract_selection", "repair_policy", "prevalidation")
 _PRODUCTION_KEYS = ("branch",)
 _CONTRACT_SELECTION_KEYS = ("registry", "publish", "attestation_max_age_seconds")
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
@@ -232,6 +232,9 @@ class ProjectOverride:
     production_branch: str | None = None
     contract_selection: ContractSelection | None = None
     repair_policy: repair_policy.Policy | None = None
+    #: #6915 : le bloc `prevalidation` du projet, qui remplace le bloc global
+    #: en entier (jamais une fusion clé par clé)
+    prevalidation: "Prevalidation | None" = None
 
 
 @dataclass(frozen=True)
@@ -1064,7 +1067,10 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
                                        if "repair_policy" in data else None),
                                    contract_selection=(_contract_selection(
                                        data["contract_selection"], scope + ".contract_selection")
-                                       if "contract_selection" in data else None)))
+                                       if "contract_selection" in data else None),
+                                   prevalidation=(_prevalidation(
+                                       data["prevalidation"], scope + ".prevalidation")
+                                       if "prevalidation" in data else None)))
     return tuple(out)
 
 
@@ -1258,6 +1264,11 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
     if schema == SCHEMA_PREVALIDATION and not has_block:
         raise MechanicsError("%s: schema %s requires the prevalidation block"
                              % (source, SCHEMA_PREVALIDATION))
+    overrides = _overrides(parsed.get("projects"), source + ".projects")
+    if schema == SCHEMA and any(o.prevalidation is not None for o in overrides):
+        # #6915 : même contrat que le bloc global, jamais sous le schéma /1
+        raise MechanicsError("%s: projects.*.prevalidation requires schema %s"
+                             % (source, SCHEMA_PREVALIDATION))
     build = _mapping(parsed.get("build"), source + ".build", _BUILD_KEYS)
     reviews = _mapping(parsed.get("reviews"), source + ".reviews", _REVIEWS_KEYS)
     # `light_reviews` absent : 0, la transition explicitement bornée à la PR
@@ -1296,7 +1307,7 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         merge_on_green_packet=on_green,
         merge_post_merge_red=post_merge,
         packet_cutoffs=packets,
-        overrides=_overrides(parsed.get("projects"), source + ".projects"),
+        overrides=overrides,
         prevalidation=(_prevalidation(parsed["prevalidation"],
                                       source + ".prevalidation") if has_block else None),
         backlog_lot_min_value=lot_min_value,
@@ -1649,7 +1660,10 @@ def load(repo: str, commit: str, project: str, *,
         merge_post_merge_red=document.merge_post_merge_red,
         review_policy=policy,
         rules=rules,
-        prevalidation=document.prevalidation,
+        # #6915 : le bloc du projet remplace le bloc global en entier
+        prevalidation=(override.prevalidation
+                       if override and override.prevalidation is not None
+                       else document.prevalidation),
         source="%s@%s:%s" % (repo, commit, PATH),
         backlog_lot_min_value=document.backlog_lot_min_value,
         staging=document.staging,
