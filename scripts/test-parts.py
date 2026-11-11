@@ -888,8 +888,10 @@ def _psql_admin(dsn: str, sql: str, attendu: str | None = None) -> bool:
               file=sys.stderr, flush=True)
         return False
     if attendu is not None and proc.stdout.strip() != attendu:
-        print(f"#6808 : {dsn} atteint la base {(proc.stdout.strip() or '?')!r} "
-              f"au lieu de {attendu!r}", file=sys.stderr, flush=True)
+        # #6808/B de ameesh-cx1 : jamais le DSN ici, il peut porter un mot de
+        # passe (userinfo ou `password=`) ; les deux noms de base suffisent.
+        print(f"#6808 : la base atteinte {(proc.stdout.strip() or '?')!r} n'est pas "
+              f"{attendu!r}", file=sys.stderr, flush=True)
         return False
     return True
 

@@ -162,12 +162,29 @@ class BasesDoubleesTest(unittest.TestCase):
             with contextlib.redirect_stderr(erreurs):
                 _admin, dsns = parts.bases_par_processus(1, 1)
         self.assertEqual(dsns, [])
-        self.assertIn("atteint la base 'autre'", erreurs.getvalue())
+        self.assertIn("la base atteinte 'autre' n'est pas", erreurs.getvalue())
         self.assertIn("base partagée", erreurs.getvalue())
         sql = self._sql()
         premiere = sql[0].split('"')[1]
         self.assertEqual(sql, [f'CREATE DATABASE "{premiere}"', "SELECT current_database()",
                                f'DROP DATABASE IF EXISTS "{premiere}" WITH (FORCE)'])
+
+    def test_le_diagnostic_ne_divulgue_pas_le_mot_de_passe(self):
+        """B de ameesh-cx1 : le repli est le chemin d'une base inattendue ;
+        son diagnostic ne doit pas recopier le DSN (userinfo ou `password=`)."""
+        secret = "s3cr3t-6808"
+        for dsn in (
+                f"postgresql://ameesh:{secret}@127.0.0.1:5432/ameesh",
+                f"postgresql:///ameesh?user=ameesh&password={secret}&host=127.0.0.1"):
+            with self.subTest(dsn=dsn):
+                erreurs = io.StringIO()
+                env = dict(self.env, AMEESH_TEST_DSN=dsn, PSQL_CURRENT_DB="autre")
+                with mock.patch.dict(os.environ, env):
+                    with contextlib.redirect_stderr(erreurs):
+                        _admin, dsns = parts.bases_par_processus(1, 1)
+                self.assertEqual(dsns, [])
+                self.assertIn("la base atteinte 'autre' n'est pas", erreurs.getvalue())
+                self.assertNotIn(secret, erreurs.getvalue())
 
     def test_sans_dsn_explicite_rien_n_est_cree(self):
         env = dict(self.env)
