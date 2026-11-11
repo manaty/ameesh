@@ -45,7 +45,8 @@ The gesture, and its guards (all checked BEFORE any write):
    gate), while every required check is proven by the same gate as the fire;
    the target's **required checks** (#2273) are read like the fire
    does (`fire.required_checks`: branch protection completed by
-   `radar.projects.<p>.required_checks`) and must be present and `SUCCESS` on
+   `radar.projects.<p>.required_checks` and, #6832, by the canon's versioned
+   declaration) and must be present and `SUCCESS` on
    the frozen head — an absent `tests` check is not proven by a green
    `couverture`, and a `SKIPPED` check proves nothing; when the protection
    imposes an application, the check runs of the exact head are read for
@@ -358,14 +359,14 @@ def _project_of(cfg, repo: str):
 
 
 def _required_refusal(slug: str, target: str, project, rollup, *, head: str = "",
-                      gh=None, pairs_out: list | None = None) -> str:
+                      gh=None, pairs_out: list | None = None, cfg=None) -> str:
     """Le refus opposé par les checks requis de la cible sur cette tête
     (#2273), ou "" quand ils sont tous présents et `SUCCESS`.
 
     La lecture est celle du feu (`fire.required_checks` : protection de la
     branche lue à la forge, complétée — jamais affaiblie — par
     `radar.projects.<p>.required_checks` et par la déclaration versionnée du
-    paquet, `forge_checks` #6832, la seule qui suive une relève) et la
+    canon, `forge_checks` #6832, la seule qui suive une relève) et la
     comparaison celle de
     `fire._required_gap` : un check absent, non conclu ou `SKIPPED` ne prouve
     rien. Quand la protection impose une application (`checks[].app_id`), la
@@ -394,8 +395,7 @@ def _required_refusal(slug: str, target: str, project, rollup, *, head: str = ""
     if not target:
         return "the required checks of the target cannot be proven: no target branch"
     try:
-        declared = fire.versioned_declaration(slug)
-        required = fire.required_checks(slug, target, project, gh=gh, declared=declared)
+        required = fire.required_checks(slug, target, project, gh=gh, cfg=cfg)
         pairs = fire._required_pairs(required)
     except land.LandError as exc:
         return "the required checks of %s cannot be proven: %s" % (target, exc)
@@ -438,7 +438,7 @@ def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
     # une vue sans base ne doit pas vider la lecture des checks requis)
     pairs: list = []
     refusal = _required_refusal(slug, (target or "").strip() or base, project, rollup,
-                                head=head, gh=gh, pairs_out=pairs)
+                                head=head, gh=gh, pairs_out=pairs, cfg=cfg)
     if refusal:
         raise MergePrError("PR #%s on the freeze %s: %s"
                            % (view.get("number"), head[:12] or "?", refusal))

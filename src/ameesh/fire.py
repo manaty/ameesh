@@ -1980,19 +1980,13 @@ def _ruleset_required(slug: str | None, target: str, *, gh) -> tuple:
     return tuple(dict.fromkeys(pairs))
 
 
-#: #6832 : `declared=` non fourni → la déclaration du projet radar seul. Un
-#: tuple (même vide) est une déclaration versionnée qui s'ajoute à celle du
-#: projet ; `None` dit « aucune déclaration versionnée » et ne change rien.
-_PROJECT_DECLARATION = object()
-
-
 def required_checks(slug: str | None, target: str, project, *, gh,
-                    declared=_PROJECT_DECLARATION) -> tuple:
+                    cfg=None) -> tuple:
     """Les checks requis de la branche cible, sous la forme `(contexte,
     app_id)` : la protection classique et les rulesets lus à la forge,
     complétés par la déclaration `radar.projects.<p>.required_checks` (des
-    noms, sans application imposée) et, quand l'appelant la fournit, par la
-    déclaration **versionnée** du paquet (`declared=`, #6832).
+    noms, sans application imposée) et, quand `cfg` est fourni, par la
+    déclaration **versionnée dans le canon** (`forge_checks`, #6832).
 
     Quand la forge **refuse** une lecture (403 prouvé : jeton sans droits), la
     déclaration du projet la remplace **sans retirer l'autre lecture** ; sans
@@ -2010,17 +2004,19 @@ def required_checks(slug: str | None, target: str, project, *, gh,
     Un 403 de droits, une protection lisible ou tout autre échec gardent le
     refus : une déclaration vide n'affaiblit jamais une source qui existe.
 
-    #6832 : `declared` est la déclaration versionnée lue par le paquet
+    #6832 : `cfg` fait lire la déclaration versionnée du canon appliqué
     (`forge_checks`), la seule qui suive une relève d'hôte. Elle s'ajoute à
     celle du projet ; une valeur vide reste une déclaration (couvre le 403 de
-    plan), `None` signifie qu'il n'y en a pas."""
+    plan), son absence ne change rien. Sans `cfg`, la garde reste forge-seule
+    (lectures d'armement et de publication de paquet, qui ne fusionnent pas)."""
     names = tuple(str(name) for name in
                   (getattr(project, "required_checks", ()) or ())
                   if str(name).strip())
     present = bool(getattr(project, "required_checks_declared", False))
-    if declared is not _PROJECT_DECLARATION:
-        names += tuple(str(name) for name in (declared or ()) if str(name).strip())
-        present = present or declared is not None
+    versioned = versioned_declaration(slug, cfg)
+    if versioned is not None:
+        names += tuple(str(name) for name in versioned if str(name).strip())
+        present = True
     declared_pairs = tuple((name, None) for name in dict.fromkeys(names))
     # #3428 : `[]` déclaré est une déclaration, pas une absence ; elle ne vaut
     # que pour le 403 de plan, prouvé source par source ci-dessous.
@@ -2055,16 +2051,18 @@ def required_checks(slug: str | None, target: str, project, *, gh,
     return tuple(dict.fromkeys(tuple(forged) + declared_pairs))
 
 
-def versioned_declaration(slug: str | None):
-    """#6832 : la déclaration des checks versionnée avec le paquet pour ce
-    dépôt, ou None quand il n'y en a pas.
+def versioned_declaration(slug: str | None, cfg=None):
+    """#6832 : la déclaration des checks versionnée dans le canon appliqué
+    pour ce dépôt, ou None quand il n'y en a pas.
 
     C'est la source qui survit à une relève : `radar.projects` reste dans le
-    fichier d'un hôte. Un inventaire illisible lève `land.LandError` — une
-    déclaration qu'on ne peut pas lire ne s'ignore pas."""
+    fichier d'un hôte. Sans `cfg`, aucune lecture n'est faite : la garde
+    forge-seule reste inchangée. Un bloc de canon illisible lève
+    `land.LandError` — une déclaration qu'on ne peut pas lire ne s'ignore
+    pas."""
     from . import forge_checks
     try:
-        return forge_checks.declared(slug)
+        return forge_checks.declared(slug, cfg)
     except forge_checks.InventoryError as exc:
         raise land.LandError("the versioned required-checks declaration of %s is "
                              "unreadable: %s" % (slug or "?", exc)) from exc
@@ -2114,12 +2112,13 @@ def _head_statuses(slug: str | None, sha: str, *, gh) -> list:
     return out
 
 
-def required_on_head(project, target: str, sha: str, *, gh) -> list:
+def required_on_head(project, target: str, sha: str, *, gh, cfg=None) -> list:
     """#2286 : les checks requis de la cible que la tête **exacte** `sha` ne
     prouve pas, pour la voie file de fusion (`land`).
 
     La source est la déclaration `radar.projects.<p>.required_checks` du
-    projet, complétée par la protection de la forge quand elle se lit (mêmes
+    projet et, avec `cfg`, la déclaration versionnée du canon (#6832),
+    complétées par la protection de la forge quand elle se lit (mêmes
     règles que `required_checks`) : un projet qui ne déclare aucun check n'a
     rien à prouver ici, et la protection seule reste portée par la forge au
     moment de la fusion d'une PR. Sans déclaration, cette garde ne retire
@@ -2136,11 +2135,14 @@ def required_on_head(project, target: str, sha: str, *, gh) -> list:
     if project is None:
         return []
     slug = radar.github_slug(project)
-    versioned = versioned_declaration(slug)
-    declared = tuple(getattr(project, "required_checks", ()) or ())
-    if not declared and not versioned:
+    if not (getattr(project, "required_checks", ()) or ()) \
+            and not getattr(project, "required_checks_declared", False) \
+            and versioned_declaration(slug, cfg) is None:
+        # sans déclaration (projet ou canon), cette garde ne s'active pas : la
+        # protection seule reste portée par la forge au moment de la fusion
+        # d'une PR (comportement d'avant #2286, aucun appel inutile).
         return []
-    required = required_checks(slug, target, project, gh=gh, declared=versioned)
+    required = required_checks(slug, target, project, gh=gh, cfg=cfg)
     if not required:
         return []
     runs = _head_check_runs(slug, sha, gh=gh)
@@ -2186,11 +2188,12 @@ def _required_status_gate(entries, required) -> tuple:
 
 
 def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
-             slug: str | None = None, gh=None, report: dict | None = None) -> tuple:
+             slug: str | None = None, gh=None, report: dict | None = None,
+             cfg=None) -> tuple:
     """Les portes qui dépendent de la PR : brouillon, cible, CI verte sur la
     tête gelée, **checks requis de la branche cible** présents et `SUCCESS`
     sur cette tête (protection de la forge, déclaration du projet ou
-    déclaration versionnée du paquet, #6832), CI du
+    déclaration versionnée du canon, #6832), CI du
     commit gelé quand le projet l'exige (L160g).
 
     La protection peut imposer une application GitHub pour un contexte
@@ -2238,8 +2241,7 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
                        % (status.get("number"), head[:12], frozen_head[:12]))
     if required is None:
         try:
-            declared = versioned_declaration(slug)
-            required = required_checks(slug, target, project, gh=gh, declared=declared)
+            required = required_checks(slug, target, project, gh=gh, cfg=cfg)
         except land.LandError as exc:
             return False, ("the required checks of %s on the freeze %s cannot be proven: %s"
                            % (target or "the target", frozen[:12], exc))
@@ -2364,7 +2366,7 @@ def ready(cfg, db, row: dict, marks: list, status: dict, *, repo: str | None,
         return ok, why, klass
     frozen = _norm((freeze_of(marks) or {}).get("sha"))
     ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
-                       slug=_slug(cfg, row, repo), gh=gh or land._gh)
+                       slug=_slug(cfg, row, repo), gh=gh or land._gh, cfg=cfg)
     return ok, why, klass
 
 
@@ -3028,7 +3030,7 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     frozen = _norm((freeze_of(marks) or {}).get("sha"))
     report: dict = {}
     ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
-                       slug=slug, gh=gh, report=report)
+                       slug=slug, gh=gh, report=report, cfg=cfg)
     if not ok:
         # #3186 : un requis jamais conclu bloque ; son run est relancé une fois,
         # sous le bail du feu et la garde du pilote élu, comme la fusion.
@@ -3267,15 +3269,16 @@ def _taken_out(out: dict, lot: int, removed: float, granted: float) -> dict:
 # --------------------------------------------------------------------------
 
 def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None,
-               project=None, target: str = "", gh=None) -> tuple:
+               project=None, target: str = "", gh=None, cfg=None) -> tuple:
     """Le dernier contrôle avant le geste d'atterrissage (#1374, P1-2) : un lot
     qui a porté un feu ne s'atterrit que sous un feu actif couvrant la tête
     gelée de sa file, et jamais sous un blocage non levé.
 
     #2286 : pour un atterrissage **local** (`project.land == "local"`, la voie
     file de Nexlink), les checks requis **déclarés** du projet
-    (`radar.projects.<p>.required_checks`) sont aussi exigés sur le gel : la
-    poussée directe ne passe par aucune protection de branche, et cette
+    (`radar.projects.<p>.required_checks`, et depuis #6832 la déclaration
+    versionnée du canon quand `cfg` est fourni) sont aussi exigés sur le gel :
+    la poussée directe ne passe par aucune protection de branche, et cette
     déclaration est la seule source de la cible (Nexlink n'en a pas). La garde
     vaut pour tout atterrissage, `ci_required` ou non ; un projet qui ne
     déclare aucun check garde le comportement d'avant, et la voie `pr` reste
@@ -3323,7 +3326,7 @@ def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None,
             return False, ("no target branch known: the required checks cannot be proven: "
                            "landing refused")
         try:
-            gaps = required_on_head(project, target, sha, gh=gh)
+            gaps = required_on_head(project, target, sha, gh=gh, cfg=cfg)
         except land.TransientLandError:
             # #2306 : lecture passagère — l'appelant garde la ligne en file et
             # réessaie au passage suivant ; le refus (fail-closed) tient.

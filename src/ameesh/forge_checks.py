@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#6832 — la déclaration des checks requis, versionnée avec le code.
+"""#6832 — la déclaration des checks requis, versionnée dans le canon.
 
-`radar.projects.<p>.required_checks` vit dans `~/.config/ameesh/config.json` :
-une déclaration posée sur un hôte ne suit pas la relève (§11, bascule en moins
-de cinq minutes). Le 11/11, le pilote a échoué d'AG2 vers AG1 et `merge-pr` a
+`radar.projects.<p>.required_checks` vit dans la configuration d'un hôte : une
+déclaration posée sur un hôte ne suit pas la relève (§11, bascule en moins de
+cinq minutes). Le 11/11, le pilote a échoué d'AG2 vers AG1 et `merge-pr` a
 refusé Nexlink : AG1 n'avait pas la déclaration (#211196, #5152).
 
-Ce module porte la même déclaration dans le paquet, donc versionnée avec le
-code et installée sur chaque hôte par le chemin de staging (données de paquet,
-`pip install`) : la garde de fusion la lit quel que soit l'hôte qui a pris le
-bail, sans geste d'hôte ni dérive de profil. Le fichier
-`forge_checks.json` est petit et strict : schéma inconnu, dépôt en double,
-clé inconnue ou nom de check vide refusent la lecture — une déclaration
-illisible ne s'ignore pas.
+La déclaration vit désormais dans le **canon du mesh**
+(`federation.yaml`, `extensions.ameesh.forge_checks`), pas dans le paquet :
+ameesh reste générique, ses valeurs par défaut et son schéma ne nomment aucun
+client (§7). Le bloc se lit au commit exact du canon appliqué
+(`canon.load_configured` + `canon.git_read`), comme les paramètres mécaniques
+(#2451), et il suit le déploiement staging qui synchronise le canon sur
+chaque hôte — aucun geste d'hôte. Le lecteur est strict : schéma inconnu,
+dépôt en double, clé inconnue ou nom de check vide refusent la lecture — une
+déclaration illisible ne s'ignore pas.
 
 Une déclaration **vide** garde le sens de #3428 : elle ne couvre que le 403 de
 **plan** GitHub (protection et rulesets indisponibles sur un dépôt privé hors
@@ -20,14 +22,15 @@ Pro), jamais un 403 de droits.
 """
 from __future__ import annotations
 
-import json
-import os
 import re
+import time
 from dataclasses import dataclass
 
+from . import canon
+
 SCHEMA = "ameesh-forge-checks/1"
-#: le fichier livré avec le paquet ; `path` reste injectable pour les tests
-PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "forge_checks.json")
+#: le manifeste du canon qui porte le bloc `extensions.ameesh.forge_checks`
+MANIFEST = "federation.yaml"
 
 _TOP_KEYS = frozenset(("schema", "projects"))
 _DECL_KEYS = frozenset(("github", "required_checks", "why"))
@@ -36,8 +39,13 @@ _DECL_KEYS = frozenset(("github", "required_checks", "why"))
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _ORIGIN_PREFIX = re.compile(r"^(?:https?://|git@)?(?:www\.)?github\.com[/:]")
 
-#: cache par chemin : `(mtime_ns, taille)` → déclarations validées
+#: déclarations déjà compilées, par `(dépôt git, commit exact)` : un commit
+#: ne change pas, une passe ne relit donc pas le manifeste par appel
 _CACHE: dict = {}
+#: canons déjà chargés par `(path, ref, untrusted)` et leur date de lecture :
+#: une rafale de gardes (file, feu) ne recharge pas tout le canon à chaque lot
+_LOADED: dict = {}
+_LOADED_TTL_S = 30.0
 
 
 class InventoryError(ValueError):
@@ -57,6 +65,18 @@ class Declaration:
     why: str = ""
 
 
+@dataclass(frozen=True)
+class Evidence:
+    """Ce que le canon appliqué déclare, ou pourquoi il ne déclare rien.
+
+    `declarations is None` : aucune source (canon absent ou bloc absent) ;
+    `declarations == ()` : le bloc existe et ne déclare aucun projet."""
+
+    declarations: tuple | None
+    label: str = ""
+    reason: str = ""
+
+
 def _repo_key(value) -> str:
     """`owner/repo` normalisé (minuscules, sans URL ni suffixe `.git`)."""
     text = str(value or "").strip().lower()
@@ -67,115 +87,229 @@ def _repo_key(value) -> str:
     return text
 
 
-def _pairs(pairs):
-    """`object_pairs_hook` : un doublon JSON est une erreur, pas un écrasement."""
-    out = {}
-    for key, value in pairs:
-        if key in out:
-            raise InventoryError("duplicate key %r" % (key,))
-        out[key] = value
-    return out
-
-
 def _text(value, where: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise InventoryError("%s: non-empty text expected" % where)
     return value
 
 
-def _parse(raw, path: str) -> tuple:
+def _parse(raw, where: str) -> tuple:
     if not isinstance(raw, dict):
-        raise InventoryError("%s: JSON object expected" % path)
+        raise InventoryError("%s: mapping expected" % where)
     unknown = sorted(set(map(str, raw)) - _TOP_KEYS)
     if unknown:
         raise InventoryError("%s: unknown top-level key(s) %s (allowed: %s)"
-                             % (path, ", ".join(unknown), ", ".join(sorted(_TOP_KEYS))))
+                             % (where, ", ".join(unknown), ", ".join(sorted(_TOP_KEYS))))
     if raw.get("schema") != SCHEMA:
         raise InventoryError("%s: schema must be %r, not %r"
-                             % (path, SCHEMA, raw.get("schema")))
+                             % (where, SCHEMA, raw.get("schema")))
     projects = raw.get("projects")
     if not isinstance(projects, dict):
-        raise InventoryError("%s.projects: object expected" % path)
+        raise InventoryError("%s.projects: mapping expected" % where)
     out = []
     seen: dict = {}
     for name, value in projects.items():
         name = str(name).strip()
-        where = "%s.projects.%s" % (path, name)
+        scope = "%s.projects.%s" % (where, name)
         if not name:
-            raise InventoryError("%s.projects: empty project name" % path)
+            raise InventoryError("%s.projects: empty project name" % where)
         if not isinstance(value, dict):
-            raise InventoryError("%s: object expected" % where)
+            raise InventoryError("%s: mapping expected" % scope)
         extra = sorted(set(map(str, value)) - _DECL_KEYS)
         if extra:
             raise InventoryError("%s: unknown key(s) %s (allowed: %s)"
-                                 % (where, ", ".join(extra), ", ".join(sorted(_DECL_KEYS))))
-        github = _repo_key(_text(value.get("github"), where + ".github"))
+                                 % (scope, ", ".join(extra), ", ".join(sorted(_DECL_KEYS))))
+        github = _repo_key(_text(value.get("github"), scope + ".github"))
         if not _REPO_RE.match(github):
             raise InventoryError("%s.github: owner/repo expected, not %r"
-                                 % (where, value.get("github")))
+                                 % (scope, value.get("github")))
         if github in seen:
             raise InventoryError("%s.github: %s is already declared by %s"
-                                 % (where, github, seen[github]))
+                                 % (scope, github, seen[github]))
         seen[github] = name
         checks = value.get("required_checks")
         if not isinstance(checks, list):
-            raise InventoryError("%s.required_checks: list of check names expected" % where)
+            raise InventoryError("%s.required_checks: list of check names expected" % scope)
         for check in checks:
             if not isinstance(check, str) or not check.strip():
                 raise InventoryError("%s.required_checks: non-empty check name expected"
-                                     % where)
+                                     % scope)
         if len(set(checks)) != len(checks):
-            raise InventoryError("%s.required_checks: duplicate check name" % where)
+            raise InventoryError("%s.required_checks: duplicate check name" % scope)
         why = value.get("why", "")
         if why is not None:
-            why = _text(why, where + ".why")
+            why = _text(why, scope + ".why")
         out.append(Declaration(name, github, tuple(checks), why or ""))
     return tuple(out)
 
 
-def inventory(path: str | None = None) -> tuple | None:
-    """Les déclarations versionnées, ou None si le fichier n'est pas installé.
+def _block(manifest, where: str):
+    """Le bloc `extensions.ameesh.forge_checks` du manifeste, ou None.
 
-    Un fichier absent n'est pas une erreur : l'hôte peut tourner une version
-    antérieure à #6832 (le doctor le dit, la garde refuse alors un 403 de plan
-    sans déclaration). Un fichier présent mais invalide lève `InventoryError`."""
-    path = os.path.abspath(path or PATH)
-    try:
-        stat = os.stat(path)
-    except FileNotFoundError:
+    Un bloc absent n'est pas une erreur : un canon qui ne déclare rien garde
+    le comportement d'avant #6832 (un 403 de plan sans déclaration refuse).
+    Un bloc présent mais mal formé refuse : il ne s'ignore pas."""
+    if not isinstance(manifest, dict):
+        raise InventoryError("%s: mapping expected" % where)
+    extensions = manifest.get("extensions")
+    if extensions is None:
         return None
-    except OSError as exc:
-        raise InventoryError("%s: unreadable (%s)" % (path, exc)) from exc
-    key = (stat.st_mtime_ns, stat.st_size)
-    cached = _CACHE.get(path)
-    if cached is not None and cached[0] == key:
-        return cached[1]
+    if not isinstance(extensions, dict):
+        raise InventoryError("%s.extensions: mapping expected" % where)
+    ameesh = extensions.get("ameesh")
+    if ameesh is None:
+        return None
+    if not isinstance(ameesh, dict):
+        raise InventoryError("%s.extensions.ameesh: mapping expected" % where)
+    block = ameesh.get("forge_checks")
+    if block is None:
+        return None
+    return block
+
+
+def _configured_canons(cfg) -> list:
+    """Les canons configurés, relus au plus une fois par fenêtre courte.
+
+    Le chargement du canon (git, fiches) est coûteux ; la garde de fusion le
+    demande à chaque geste. Un commit ne change pas, la compilation des
+    déclarations est de toute façon mémoïsée par `(dépôt, commit)`."""
+    if cfg is None:
+        return []
     try:
-        with open(path, encoding="utf-8") as stream:
-            raw = json.load(stream, object_pairs_hook=_pairs)
-    except InventoryError:
-        raise
-    except (OSError, ValueError) as exc:
-        raise InventoryError("%s: unreadable (%s)" % (path, exc)) from exc
-    parsed = _parse(raw, path)
-    _CACHE[path] = (key, parsed)
-    return parsed
+        entries = canon.configured(cfg)
+    except Exception:  # noqa: BLE001 - une configuration illisible se dira plus bas
+        entries = ()
+    key = tuple((getattr(entry, "path", ""), getattr(entry, "ref", ""),
+                 bool(getattr(entry, "untrusted", False))) for entry in entries)
+    now = time.monotonic()
+    hit = _LOADED.get(key)
+    if hit is not None and now - hit[0] < _LOADED_TTL_S:
+        return hit[1]
+    try:
+        loaded = canon.load_configured(cfg)
+    except Exception:  # noqa: BLE001 - l'appelant dira « canon illisible »
+        loaded = []
+    _LOADED[key] = (now, loaded)
+    return loaded
 
 
-def declarations(path: str | None = None) -> dict:
-    """Les déclarations indexées par `owner/repo` (minuscules)."""
-    return {item.github: item for item in (inventory(path) or ())}
+def _manifest_at(canon_obj) -> tuple:
+    """`(texte, provenance)` du manifeste au commit exact, ou `(None, raison)`."""
+    sources = getattr(canon_obj, "sources", None) or []
+    if not sources:
+        return None, "no member source"
+    source = sources[0]
+    if getattr(source, "mode", "") != "git" or not getattr(source, "repo", "") \
+            or not getattr(source, "commit", ""):
+        return None, "no exact git commit"
+    if getattr(source, "prefix", ""):
+        return None, "canon under a sub-directory (%s)" % source.prefix
+    raw = canon.git_read(source.repo, source.commit, MANIFEST)
+    if raw is None:
+        return None, "%s unreadable at %s" % (MANIFEST, source.commit[:12])
+    try:
+        return raw.decode("utf-8"), "%s@%s" % (source.repo, source.commit[:12])
+    except UnicodeDecodeError:
+        return None, "%s is not UTF-8 at %s" % (MANIFEST, source.commit[:12])
 
 
-def declared(repo, path: str | None = None):
+def _exact_source(canon_obj):
+    """La première source Git au commit exact de ce canon, ou None.
+
+    Un canon en fichiers de travail (`untrusted`) ou sous un sous-dossier n'a
+    pas de commit appliqué : il ne peut pas porter une déclaration versionnée,
+    ce n'est pas une lecture en erreur (la garde reste forge-seule)."""
+    sources = getattr(canon_obj, "sources", None) or []
+    if not sources:
+        return None
+    source = sources[0]
+    if getattr(source, "mode", "") != "git" or not getattr(source, "repo", "") \
+            or not getattr(source, "commit", "") or getattr(source, "prefix", ""):
+        return None
+    return source
+
+
+def _canon_block(canon_obj) -> tuple:
+    """`(déclarations, provenance)` du bloc de ce canon, ou None.
+
+    Mémoïsé par `(dépôt, commit)` : le contenu d'un commit est immuable."""
+    source = _exact_source(canon_obj)
+    if source is None:
+        return None
+    key = (source.repo, source.commit)
+    if key in _CACHE:
+        return _CACHE[key]
+    text, label = _manifest_at(canon_obj)
+    if text is None:
+        raise InventoryError("the canon manifest cannot be read: %s" % label)
+    try:
+        manifest = canon.load_yaml(text)
+    except ValueError as exc:
+        raise InventoryError("%s: unreadable YAML (%s)" % (label, " ".join(str(exc).split())))
+    block = _block(manifest, label)
+    if block is None:
+        result = None
+    else:
+        result = (_parse(block, "%s:extensions.ameesh.forge_checks" % label), label)
+    _CACHE[key] = result
+    return result
+
+
+def configured(cfg=None) -> Evidence:
+    """La déclaration versionnée du canon appliqué, ou la raison de son absence.
+
+    Lit les canons lisibles au commit exact de leur première source Git.
+    Aucun canon configuré, un canon illisible ou un manifeste absent ne sont
+    pas des erreurs de lecture : la garde refuse alors un 403 de plan comme
+    avant #6832. Un bloc **présent** mais invalide lève `InventoryError`."""
+    canons = _configured_canons(cfg)
+    if not canons:
+        return Evidence(None, "", "no readable canon configured")
+    declarations: list = []
+    labels: list = []
+    unreadable: list = []
+    unavailable: list = []
+    seen: dict = {}
+    for canon_obj in canons:
+        if not getattr(canon_obj, "readable", False):
+            unreadable.append(getattr(canon_obj, "id", "") or "?")
+            continue
+        if _exact_source(canon_obj) is None:
+            unavailable.append(getattr(canon_obj, "id", "") or "?")
+            continue
+        found = _canon_block(canon_obj)
+        if found is None:
+            continue
+        found_declarations, label = found
+        for item in found_declarations:
+            if item.github in seen:
+                raise InventoryError("%s: %s is already declared by %s"
+                                     % (label, item.github, seen[item.github]))
+            seen[item.github] = label
+        declarations.extend(found_declarations)
+        labels.append(label)
+    if not labels:
+        if unreadable:
+            return Evidence(None, "", "no readable canon (unreadable: %s)"
+                            % ", ".join(sorted(unreadable)))
+        if unavailable:
+            return Evidence(None, "", "no exact canon commit (unavailable: %s)"
+                            % ", ".join(sorted(unavailable)))
+        return Evidence(None, "", "no extensions.ameesh.forge_checks in the canon")
+    return Evidence(tuple(declarations), ", ".join(labels))
+
+
+def declared(repo, cfg=None):
     """La déclaration versionnée de `repo` : un tuple (vide possible), ou None
-    quand aucune déclaration n'est installée. Un fichier invalide lève
-    `InventoryError` : un appelant qui garde une fusion doit refuser."""
+    quand le canon n'en porte pas. Un bloc invalide lève `InventoryError` :
+    un appelant qui garde une fusion doit refuser."""
     key = _repo_key(repo)
     if not key:
         return None
-    found = declarations(path).get(key)
-    return None if found is None else found.required_checks
+    for item in configured(cfg).declarations or ():
+        if item.github == key:
+            return item.required_checks
+    return None
 
 
 def _one_line(exc) -> str:
@@ -254,13 +388,13 @@ def _plan_refusal(slug: str, target: str, gh) -> tuple:
     return plan, others
 
 
-def doctor_lines(cfg, db, *, gh=None, path: str | None = None) -> tuple:
+def doctor_lines(cfg, db, *, gh=None) -> tuple:
     """#6832 : le doctor de l'hôte, face aux déclarations des projets qu'il
     fusionne. Rend `(ko, lignes)`.
 
     Un hôte **candidat d'un rôle élu** (§11) doit pouvoir prouver la garde de
     chaque projet qu'il fusionne : quand la forge répond 403 de **plan** sur
-    une cible et qu'aucune déclaration (versionnée ou `radar.projects` de cet
+    une cible et qu'aucune déclaration (canon ou `radar.projects` de cet
     hôte) ne la couvre, c'est un KO qui nomme le projet et la cible — c'est
     exactement le refus de `merge-pr` après une relève (#211196). Un 403 de
     droits, une lecture passagère ou un `gh` sans jeton restent des
@@ -280,13 +414,17 @@ def doctor_lines(cfg, db, *, gh=None, path: str | None = None) -> tuple:
         return False, ["candidate host (%s) but no GitHub project declared; nothing to check"
                        % ", ".join(sorted(str(role.get("name")) for role in roles))]
     try:
-        installed = inventory(path)
+        evidence = configured(cfg)
     except InventoryError as exc:
-        return True, ["KO — the versioned declaration inventory is unreadable: %s"
-                      % _one_line(exc)]
-    known = {item.github: item for item in (installed or ())}
-    if installed is None:
-        lines.append("no versioned declaration inventory installed (%s)" % (path or PATH))
+        return True, ["KO — the versioned declaration is unreadable: %s" % _one_line(exc)]
+    if evidence.declarations is None:
+        if "no readable canon" in evidence.reason or "no exact canon commit" in evidence.reason:
+            return True, ["KO — the canon declarations cannot be proven: %s"
+                          % _one_line(evidence.reason)]
+        lines.append(evidence.reason)
+    known = {item.github: item for item in (evidence.declarations or ())}
+    if not known:
+        lines.append("the canon declares no project (%s)" % (evidence.label or "no block"))
     if gh is None:
         try:
             from . import packet_automerge
@@ -299,22 +437,23 @@ def doctor_lines(cfg, db, *, gh=None, path: str | None = None) -> tuple:
     for (repo, target), name in sorted(projects.items()):
         versioned = known.get(repo)
         if versioned is not None:
-            lines.append("%s (%s, %s): versioned declaration installed (%d check(s))"
-                         % (name, repo, target, len(versioned.required_checks)))
+            lines.append("%s (%s, %s): versioned declaration installed (%d check(s), %s)"
+                         % (name, repo, target, len(versioned.required_checks),
+                            evidence.label))
             continue
         host_declared, host_names = _host_declared(cfg, repo)
         if host_declared:
             lines.append("%s (%s, %s): WARNING host-only radar declaration (%d check(s)); "
-                         "it does not follow the failover — move it to "
-                         "src/ameesh/forge_checks.json"
+                         "it does not follow the failover — move it to the canon "
+                         "(extensions.ameesh.forge_checks)"
                          % (name, repo, target, len(host_names)))
             continue
         plan, others = _plan_refusal(repo, target, gh)
         if plan:
             ko = True
             lines.append("KO — %s (%s, %s): the forge proves a plan 403 and no declaration "
-                         "covers it; merge-pr would refuse after a failover (add it to "
-                         "src/ameesh/forge_checks.json)" % (name, repo, target))
+                         "covers it; merge-pr would refuse after a failover (add it to the "
+                         "canon, extensions.ameesh.forge_checks)" % (name, repo, target))
         elif others:
             lines.append("%s (%s, %s): not conclusive (%s); no declaration needed"
                          % (name, repo, target, ", ".join(others)))
@@ -322,3 +461,9 @@ def doctor_lines(cfg, db, *, gh=None, path: str | None = None) -> tuple:
             lines.append("%s (%s, %s): protection readable; no declaration needed"
                          % (name, repo, target))
     return ko, lines
+
+
+def clear_cache() -> None:
+    """Vide les mémoïsations (tests, ou changement de canon dans un processus)."""
+    _CACHE.clear()
+    _LOADED.clear()
