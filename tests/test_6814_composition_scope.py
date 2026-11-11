@@ -4,7 +4,9 @@
 Le banc n'appelle pas systemd : il vérifie la décision (cgroup d'un runner ou
 non), l'environnement et le journal du scope (le bail du tour tombe, le nom de
 l'agent reste, le lot suit le porteur, les sorties ne passent plus par le tube
-du tour) et la ligne `systemd-run --scope`, sans jamais créer d'unité réelle.
+du tour), la ligne `systemd-run --scope` et la session neuve du scope (B/P1
+impl-11 : `killpg` du groupe du tour ne doit pas l'atteindre), sans jamais
+créer d'unité réelle.
 
 Contexte : la mise à jour staging du 11/11/2026 à 01:42:52Z a arrêté
 l'exécuteur d'AG1 et tué son cgroup ; la composition de h-03 (#6810), lancée
@@ -256,6 +258,9 @@ class MaybeScope(unittest.TestCase):
         self.assertRegex(command[6], r"^ameesh-paquet-auto-h-x-\d+-[0-9a-f]{8}$")
         self.assertEqual(command[12:], argv)
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        # B/P1 impl-11 : le scope doit avoir sa session, sinon `killpg` du
+        # groupe du tour (runner.py, `_signal_group`) l'atteint encore.
+        self.assertIs(kwargs["start_new_session"], True)
         env = kwargs["env"]
         self.assertEqual(env[paquet_auto.SCOPED_ENV], "1")
         for variable in ("AMEESH_RUNNER_ID", "AMEESH_LEASE_EPOCH"):

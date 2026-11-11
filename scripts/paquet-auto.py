@@ -6164,7 +6164,10 @@ def compose_packet(args: argparse.Namespace) -> int:
 #: Un redémarrage de l'exécuteur (mise à jour staging) arrête l'unité et tue
 #: son cgroup : une composition lancée dans un tour mourait avec lui, sous son
 #: bail (h-03, #6810). Le scope transitoire vit sous le gestionnaire de
-#: l'utilisateur, hors de l'unité : l'arrêt du tour ne l'atteint plus.
+#: l'utilisateur, hors de l'unité : l'arrêt du tour ne l'atteint plus. Il lui
+#: faut aussi une session neuve : l'exécuteur arrête son harnais par
+#: `killpg(groupe du tour)` (runner.py, `_signal_group`), et un changement de
+#: cgroup ne change pas de groupe de processus (B/P1 impl-11).
 RUNNER_CGROUP_RE = re.compile(
     r"/ameesh-runner(?:-agent)?@[^/]*\.service(?:/|$)")
 #: Posé dans le scope : une seconde exécution ne se ré-enveloppe pas.
@@ -6306,9 +6309,12 @@ def _follow_scope(proc, log: Path) -> int:
 def maybe_scope(argv: list[str], *, name: str, carrier: int = 0) -> int | None:
     """#6814 : relance la composition hors du cgroup de l'exécuteur.
 
-    Rend None quand le processus n'est pas dans un tour, quand le scope est
-    déjà posé, ou quand `systemd-run` manque (repli direct, dit à l'appelant) ;
-    sinon rend le code de sortie du scope après avoir recopié son journal.
+    Le scope a son propre cgroup (gestionnaire utilisateur) et sa propre
+    session (PGID distinct), donc l'arrêt du tour ne l'atteint ni par le
+    cgroup ni par `killpg`. Rend None quand le processus n'est pas dans un
+    tour, quand le scope est déjà posé, ou quand `systemd-run` manque (repli
+    direct, dit à l'appelant) ; sinon rend le code de sortie du scope après
+    avoir recopié son journal.
     """
     if os.environ.get(SCOPED_ENV) or not in_runner_cgroup():
         return None
@@ -6333,7 +6339,13 @@ def maybe_scope(argv: list[str], *, name: str, carrier: int = 0) -> int | None:
     print("paquet-auto : composition hors du cgroup de l'exécuteur (%s), "
           "journal %s" % (unit, log), file=sys.stderr, flush=True)
     try:
-        proc = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL)
+        # #6814 (B/P1 impl-11) : changer de cgroup ne détache pas le groupe de
+        # processus. L'exécuteur lance son harnais avec `start_new_session` et
+        # son arrêt fait `killpg(groupe du tour)` (`runner.py`, `_signal_group`) :
+        # sans session neuve, le scope héritait de ce groupe et mourait quand
+        # même. Le scope a donc sa propre session (PGID = pid de systemd-run).
+        proc = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
     except OSError as error:
         print("paquet-auto : scope indisponible (%s) ; composition dans le cgroup "
               "de l'exécuteur (un redémarrage staging la tuerait)" % error,
