@@ -103,7 +103,8 @@ class ReseauPriveTest(unittest.TestCase):
         self.assertNotIn("curl", self.calls())
 
     def test_interface_refuses_public_or_wireguard_address(self):
-        for cidr in ("51.15.137.245/32", "10.77.0.9/24", "10.78.0.300/24", "10.78.0.10"):
+        for cidr in ("51.15.137.245/32", "10.77.0.9/24", "10.78.0.300/24", "10.78.0.10",
+                     "10.78.0.10/0", "10.78.0.10/8", "10.77.1.10/16", "10.78.0.10/30"):
             out = self.run_script("interface", cidr)
             self.assertEqual(out.returncode, 2, cidr)
         self.assertFalse((self.racine / "etc/systemd").exists())
