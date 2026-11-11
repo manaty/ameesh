@@ -231,6 +231,35 @@ liste_sync() {
   printf 'ANY 1 (%s)' "${joint%, }"
 }
 
+# Candidats synchrones de l'inventaire réellement en flux, vus du primaire
+# local. Vide si le serveur ne répond pas, n'est pas primaire, ou n'a aucun
+# candidat en streaming : c'est l'état d'amorçage. La liste synchrone ne doit
+# être posée que si ce résultat est non vide (B1 de revue #6868) : avec
+# PostgreSQL seul, une liste non vide sans standby connecté fait attendre
+# chaque COMMIT indéfiniment (synchronous_mode_strict=false est une propriété
+# de Patroni, pas du serveur).
+sync_candidats_en_flux() {
+  local rec valeurs="" nom i liste
+  pg_isready -q 2>/dev/null || return 0
+  rec=$(psql_local -tAc 'SELECT pg_is_in_recovery()' 2>/dev/null) || return 0
+  [[ $rec == f ]] || return 0
+  for ((i = 0; i < ${#NOEUDS_NOMS[@]}; i++)); do
+    [[ ${NOEUDS_SYNC[$i]} == oui ]] || continue
+    nom=${NOEUDS_NOMS[$i]}
+    valeurs+="${valeurs:+,}$(litteral_sql "$nom")"
+  done
+  [[ -n $valeurs ]] || return 0
+  liste=$(psql_local -tAc "SELECT application_name FROM pg_stat_replication WHERE state = 'streaming' AND application_name IN ($valeurs) ORDER BY application_name" 2>/dev/null) || return 0
+  printf '%s' "$liste"
+}
+
+# Vrai si la liste synchrone doit être posée : un candidat est en flux et
+# l'exploitant n'a pas demandé la dégradation (--sans-synchrone).
+sync_actif() {
+  (( ${FORCER_SANS_SYNCHRONE:-0} )) && return 1
+  [[ -n $(sync_candidats_en_flux) ]]
+}
+
 # Nom de slot physique d'un nœud : stable, sans tiret (les tirets sont
 # autorisés dans un nom de slot, mais un identifiant SQL simple évite tout
 # échappement dans les requêtes générées).
@@ -259,10 +288,13 @@ psql_local() {
 
 # Connexion normale (pas de réplication) au nom de rewind, pour pg_rewind et
 # le contrôle d'absence de second primaire ; le mot de passe vient du pgpass.
+# sslmode=require : le pg_hba hostssl impose déjà TLS, on interdit tout
+# repli en clair ; la vérification du certificat (verify-full) attend l'AC du
+# mesh (#6859, étude §8) et reste une limite connue, non bloquante.
 psql_rewind() {
   local hote=$1
   shift
-  comme_postgres psql -X -w -v ON_ERROR_STOP=1 -q -h "$hote" -p 5432 -U rewind -d postgres "$@"
+  PGSSLMODE=require comme_postgres psql -X -w -v ON_ERROR_STOP=1 -q -h "$hote" -p 5432 -U rewind -d postgres "$@"
 }
 
 # Rôle effectif du serveur local, ou rôle de l'inventaire s'il ne répond pas
@@ -297,8 +329,13 @@ ecrire_fichier() {
 }
 
 fragment_conf() {
-  local sync
-  sync=$(liste_sync)
+  local sync=""
+  # B1 de revue #6868 : la liste n'est posée que si un candidat est déjà en
+  # flux. À l'amorçage (aucun standby), elle reste vide pour que les COMMIT
+  # (dont les CREATE/ALTER ROLE et les slots) ne s'attendent pas.
+  if sync_actif; then
+    sync=$(liste_sync)
+  fi
   cat <<CONF
 # BEGIN ameesh-replication (lot #6868) — géré par deploy/serveur/replication/configurer-noeud.sh
 # Réplication en flux PostgreSQL 17 (EP8.3) ; ne pas éditer à la main.
@@ -391,7 +428,7 @@ ecrire_reprise() {
   cat >> "$tmp" <<CONF
 $REPRISE_DEBUT
 # Paramètres de reprise gérés par deploy/serveur/replication (lot #6868).
-primary_conninfo = 'host=$hote port=5432 user=replicator application_name=$nom connect_timeout=10 passfile=$passfile keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3'
+primary_conninfo = 'host=$hote port=5432 user=replicator application_name=$nom connect_timeout=10 passfile=$passfile sslmode=require keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3'
 primary_slot_name = '$slot'
 $HBA_FIN
 CONF

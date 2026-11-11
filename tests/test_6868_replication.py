@@ -10,13 +10,17 @@ sur les points sensibles du lot (SQL, droits) :
   limité aux deux VM d'agents) et ses refus ;
 - la configuration idempotente (`conf.d`, bloc marqué de `pg_hba`, rechargement,
   redémarrage seulement sur demande) ;
+- l'amorçage sans standby : liste synchrone vide (les COMMIT n'attendent pas),
+  puis activation avec un candidat en flux, et `--sans-synchrone` ;
 - les rôles `replicator` (LOGIN REPLICATION) et `rewind` (quatre fonctions,
   pas superuser), les slots, et le pgpass 0600 ;
 - la promotion manuelle (split brain, nofailover, slots du nouveau primaire) ;
 - `pg_basebackup -X stream -S <slot> -R` et le re-seed qui déplace les données ;
 - `pg_rewind`, la re-pose de la configuration copiée par le rewind et l'échec
   qui n'est pas masqué ;
-- le retour arrière sans perte de données ;
+- le retour arrière sans perte de données, grants pg_rewind révoqués avant
+  `DROP ROLE` ;
+- `etat.sh` : colonnes réelles de `pg_stat_wal_receiver` (pas de `*_lag`) ;
 - aucun mot de passe en argument de processus.
 """
 from __future__ import annotations
@@ -121,9 +125,18 @@ if sql is None:
     for nom in ("replicator", "rewind"):
         if "CREATE ROLE " + nom in texte or "ALTER ROLE " + nom in texte:
             (base / ("role_" + nom)).touch()
+    grants = base / "grants"
     if "GRANT EXECUTE" in texte:
         ecrire("grants", texte)
+    if "REVOKE EXECUTE" in texte and grants.exists():
+        # Elles ne dépendent plus du rôle : DROP ROLE peut passer.
+        grants.unlink()
     if "DROP ROLE IF EXISTS rewind" in texte:
+        if (base / "role_rewind").exists() and grants.exists():
+            sys.stderr.write(
+                'psql: error: role "rewind" cannot be dropped because some '
+                "objects depend on it\n")
+            sys.exit(1)
         (base / "role_rewind").unlink(missing_ok=True)
     if "DROP ROLE IF EXISTS replicator" in texte:
         (base / "role_replicator").unlink(missing_ok=True)
@@ -161,10 +174,27 @@ elif "SELECT 1 FROM pg_replication_slots" in q:
 elif "SELECT slot_name, active, wal_status FROM pg_replication_slots" in q:
     for ligne in slots():
         print("|".join(ligne))
+elif "SELECT application_name FROM pg_stat_replication" in q:
+    # B1 : seuls les candidats nommés et réellement en streaming comptent.
+    noms = set(re.findall(r"'([^']+)'", q.split(" IN (", 1)[1]))
+    chemin = base / "replication"
+    if chemin.exists():
+        for ligne in chemin.read_text(encoding="utf-8").splitlines():
+            champs = ligne.split("|")
+            if len(champs) >= 2 and champs[0] in noms and champs[1] == "streaming":
+                print(champs[0])
 elif "FROM pg_stat_replication" in q:
     chemin = base / "replication"
     if chemin.exists():
         print(chemin.read_text(encoding="utf-8").rstrip("\n"))
+elif "pg_stat_wal_receiver" in q and re.search(
+        r"\b(write_lag|flush_lag|replay_lag)\b", q):
+    # B2 : ces colonnes n'existent pas dans pg_stat_wal_receiver en PG17 ;
+    # la doublure refuse comme PostgreSQL, pour que le témoin ne les couvre
+    # plus par accident.
+    sys.stderr.write(
+        'psql: error: column "write_lag" does not exist\n')
+    sys.exit(1)
 elif "coalesce(sender_host" in q:
     chemin = base / "receiver"
     if chemin.exists():
@@ -509,12 +539,10 @@ class ReplicationTest(unittest.TestCase):
         self.assertIn("max_replication_slots = 10", fragment)
         self.assertIn("max_slot_wal_keep_size = '4GB'", fragment)
         self.assertIn("password_encryption = 'scram-sha-256'", fragment)
-        self.assertIn(
-            "synchronous_standby_names = 'ANY 1 (\"ameesh-agents-1\", \"ameesh-agents-2\")'",
-            fragment)
-        ligne_sync = [ligne for ligne in fragment.splitlines()
-                      if ligne.startswith("synchronous_standby_names")][0]
-        self.assertNotIn("manaty-mesh-1", ligne_sync)
+        # B1 de revue #6868 : aucun standby en flux à l'amorçage, donc liste
+        # vide — les COMMIT (CREATE/ALTER ROLE, slots) n'attendent personne.
+        self.assertIn("synchronous_standby_names = ''", fragment)
+        self.assertIn("aucun candidat synchrone en flux", premier.stdout)
 
         hba = self.hba()
         self.assertEqual(hba.count("# BEGIN ameesh-replication (lot #6868)"), 1)
@@ -546,6 +574,57 @@ class ReplicationTest(unittest.TestCase):
         self.run_script("configurer-noeud.sh", "manaty-mesh-1")
         self.assertEqual(self.hba().count("# BEGIN ameesh-replication (lot #6868)"), 1)
         self.assertEqual(len((self.state / "slots").read_text(encoding="utf-8").split()), 2)
+
+        # Après la base backup, un candidat est en flux : un nouveau passage
+        # pose ANY 1 (quorum en PG17), toujours sans le hub ni le nœud local.
+        (self.state / "replication").write_text(
+            "ameesh-agents-2|streaming|quorum|0/5000000|0/5000000\n",
+            encoding="utf-8")
+        active = self.run_script("configurer-noeud.sh", "manaty-mesh-1")
+        fragment = self.fragment().read_text(encoding="utf-8")
+        self.assertIn(
+            "synchronous_standby_names = 'ANY 1 (\"ameesh-agents-1\", \"ameesh-agents-2\")'",
+            fragment)
+        ligne_sync = [ligne for ligne in fragment.splitlines()
+                      if ligne.startswith("synchronous_standby_names")][0]
+        self.assertNotIn("manaty-mesh-1", ligne_sync)
+        self.assertIn("candidat(s) synchrone(s) en flux", active.stdout)
+
+        # Geste d'urgence : --sans-synchrone dégrade tout de suite, même avec
+        # un candidat en flux ; un passage normal le rétablit ensuite.
+        degrade = self.run_script("configurer-noeud.sh", "--sans-synchrone",
+                                  "manaty-mesh-1")
+        self.assertIn("synchronous_standby_names = ''",
+                      self.fragment().read_text(encoding="utf-8"))
+        self.assertIn("synchrone désactivé", degrade.stdout)
+        self.run_script("configurer-noeud.sh", "manaty-mesh-1")
+        self.assertIn("ANY 1 (",
+                      self.fragment().read_text(encoding="utf-8"))
+
+    def test_configurer_primaire_sans_standby_amorce_sans_synchrone(self):
+        """B1 : sans standby en flux, la préparation termine et n'attend pas.
+
+        Le premier passage du hub (primaire actuel) doit poser rôles et slots
+        alors qu'aucun standby n'existe encore : synchronous_standby_names
+        reste vide. La liste vide est la condition qui empêche un COMMIT de
+        partir en attente synchrone (PostgreSQL seul, sans Patroni).
+        """
+        self.serveur(demarre=True, en_recuperation=False)
+        self.assertFalse((self.state / "replication").exists())
+        resultat = self.run_script("configurer-noeud.sh", "manaty-mesh-1")
+        self.assertIn("synchronous_standby_names = ''",
+                      self.fragment().read_text(encoding="utf-8"))
+        self.assertIn("rôles et slots assurés", resultat.stdout)
+        self.assertTrue((self.state / "role_replicator").exists())
+        self.assertTrue((self.state / "role_rewind").exists())
+        slots = sorted(ligne.split("|")[0] for ligne in
+                       (self.state / "slots").read_text(encoding="utf-8").split())
+        self.assertEqual(slots, ["ameesh_agents_1", "ameesh_agents_2"])
+        # L'ordre du script : la configuration vide est rechargée avant le SQL
+        # des rôles/slots, qui ne peut donc pas attendre un synchrone absent.
+        journal = self.journal_texte()
+        self.assertLess(journal.index("pg_ctlcluster 17 main reload"),
+                        journal.index("pg_create_physical_replication_slot"))
 
     def test_configurer_redemarrage_sur_demande(self):
         self.serveur(demarre=True, en_recuperation=False)
@@ -636,7 +715,19 @@ class ReplicationTest(unittest.TestCase):
         slots = sorted(ligne.split("|")[0] for ligne in
                        (self.state / "slots").read_text(encoding="utf-8").split())
         self.assertEqual(slots, ["ameesh_agents_1", "manaty_mesh_1"])
-        self.assertIn("synchronous_standby_names", self.fragment().read_text(encoding="utf-8"))
+        # Aucun standby en flux juste après la promotion : liste vide, sinon
+        # les premiers COMMIT du nouveau primaire attendraient indéfiniment.
+        self.assertIn("synchronous_standby_names = ''",
+                      self.fragment().read_text(encoding="utf-8"))
+        self.assertIn("synchrones actifs après rechargement : aucun", resultat.stdout)
+
+        # ameesh-agents-2 suit le nouveau primaire : un passage active ANY 1.
+        (self.state / "replication").write_text(
+            "ameesh-agents-2|streaming|quorum|0/5000000|0/5000000\n",
+            encoding="utf-8")
+        self.run_script("configurer-noeud.sh", "ameesh-agents-2")
+        self.assertIn("ANY 1 (",
+                      self.fragment().read_text(encoding="utf-8"))
 
     # --- base backup ---------------------------------------------------------
     def test_initialiser_standby_basebackup_et_reprise(self):
@@ -845,6 +936,24 @@ class ReplicationTest(unittest.TestCase):
         self.assertFalse((self.state / "role_replicator").exists())
         self.assertFalse((self.state / "role_rewind").exists())
 
+        # B3 de revue #6868 : les quatre grants pg_rewind sont révoqués avant
+        # DROP ROLE rewind ; la doublure refuse le DROP tant qu'ils existent,
+        # comme PostgreSQL (« objects depend on it »).
+        stdin = self.stdin_texte()
+        self.assertLess(
+            stdin.index("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_ls_dir(text, boolean, boolean) FROM rewind"),
+            stdin.index("DROP ROLE IF EXISTS rewind"))
+        self.assertLess(
+            stdin.index("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text, boolean) FROM rewind"),
+            stdin.index("DROP ROLE IF EXISTS rewind"))
+        self.assertLess(
+            stdin.index("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) FROM rewind"),
+            stdin.index("DROP ROLE IF EXISTS rewind"))
+        self.assertLess(
+            stdin.index("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text, bigint, bigint, boolean) FROM rewind"),
+            stdin.index("DROP ROLE IF EXISTS rewind"))
+        self.assertFalse((self.state / "grants").exists())
+
         # Rejouable : rien à retirer, aucun échec.
         self.run_script("retour-arriere.sh", "--tout", "--force", "manaty-mesh-1")
 
@@ -859,9 +968,11 @@ class ReplicationTest(unittest.TestCase):
 
     # --- état ----------------------------------------------------------------
     def test_etat_primaire_et_standby(self):
+        # etat.sh ne lit aucun secret : le fichier 0600 peut être absent.
+        self.env_file.unlink()
         self.serveur(demarre=True, en_recuperation=False)
         (self.state / "replication").write_text(
-            "ameesh-agents-2|streaming|sync|0/5000000|0/5000000\n"
+            "ameesh-agents-2|streaming|quorum|0/5000000|0/5000000\n"
             "manaty-mesh-1|streaming|async|0/5000000|0/4FFFF00\n",
             encoding="utf-8")
         self.slots([["ameesh_agents_2", "t", "reserved"],
@@ -870,8 +981,20 @@ class ReplicationTest(unittest.TestCase):
         self.assertIn("primaire", resultat.stdout)
         self.assertIn("ameesh-agents-2", resultat.stdout)
         self.assertIn("manaty-mesh-1", resultat.stdout)
-        self.assertIn("sync", resultat.stdout)
+        # ANY 1 rend sync_state=quorum en PG17 : ce n'est pas un défaut.
+        self.assertIn("quorum", resultat.stdout)
+        self.assertNotIn("aucun standby sync/quorum", resultat.stdout)
         self.assertIn("slot manaty_mesh_1 inactif", resultat.stdout)
+
+        # B1 : une liste active sans candidat en flux = COMMIT bloqués.
+        (self.state / "replication").unlink()
+        resultat = self.run_script("etat.sh", "ameesh-agents-1")
+        self.assertIn("les COMMIT peuvent attendre", resultat.stdout)
+
+        # Liste vide : synchrone inactif, averti (amorçage ou dégradation).
+        self.parametre("synchronous_standby_names", "")
+        resultat = self.run_script("etat.sh", "ameesh-agents-1")
+        self.assertIn("synchronous_standby_names vide", resultat.stdout)
 
         # Le hub (nofailover) ne doit jamais apparaître dans les synchrones.
         self.parametre("synchronous_standby_names",
@@ -884,14 +1007,18 @@ class ReplicationTest(unittest.TestCase):
         resultat = self.run_script("etat.sh", "ameesh-agents-1")
         self.assertIn("pg_rewind de ce nœud impossible", resultat.stdout)
 
-        # Standby : flux entrant.
+        # Standby : flux entrant, colonnes réelles de PG17 (written/flushed/
+        # latest_end_lsn, last_msg_receipt_time), pas de write_lag fantôme.
         self.serveur(demarre=True, en_recuperation=True)
         (self.state / "receiver").write_text(
-            "streaming|ameesh-agents-1|ameesh_agents_2|00:00:00.001|00:00:00.001|00:00:00.001\n",
+            "streaming|ameesh-agents-1|ameesh_agents_2|0/5000000|0/4FF0000|0/4FF0000|2026-11-11 10:00:00\n",
             encoding="utf-8")
         resultat = self.run_script("etat.sh", "ameesh-agents-2")
         self.assertIn("flux entrant", resultat.stdout)
         self.assertIn("statut=streaming", resultat.stdout)
+        self.assertIn("written_lsn=0/5000000", resultat.stdout)
+        self.assertIn("recu=2026-11-11 10:00:00", resultat.stdout)
+        self.assertNotIn("write_lag", resultat.stdout)
 
     def test_etat_injoignable(self):
         self.serveur(demarre=False)
@@ -916,7 +1043,8 @@ class ReplicationTest(unittest.TestCase):
         self.assertNotIn("SUPERUSER;", roles)
         readme = (REPLICATION / "README.md").read_text(encoding="utf-8")
         for attendu in ("EP8.3", "pg_rewind", "retour arrière", "noeuds.conf",
-                        "replication.env", "synchronous_standby_names"):
+                        "replication.env", "synchronous_standby_names",
+                        "sans-synchrone", "quorum"):
             self.assertIn(attendu, readme)
         self.assertTrue((REPLICATION / "noeuds.conf").exists())
 

@@ -127,8 +127,10 @@ elif (( EUID == 0 )); then
 fi
 
 # 5. Base backup physique, WAL en flux, slot déjà réservé par le primaire.
+#    sslmode=require : TLS imposé par le pg_hba hostssl, sans repli en clair
+#    (la vérification du certificat attend l'AC du mesh, #6859).
 log "base backup de $SOURCE_NOM ($SOURCE_HOTE) vers $DATA (slot $slot)"
-if ! comme_postgres "$PG_BIN/pg_basebackup" -w -h "$SOURCE_HOTE" -p 5432 -U replicator \
+if ! PGSSLMODE=require comme_postgres "$PG_BIN/pg_basebackup" -w -h "$SOURCE_HOTE" -p 5432 -U replicator \
     -D "$DATA" -X stream -S "$slot" -R -c fast -P; then
   die "pg_basebackup a échoué ; $DATA peut être partiel — le déplacer avant de rejouer avec --reinitialiser (ancien répertoire : ${sauvegarde:-aucun})"
 fi

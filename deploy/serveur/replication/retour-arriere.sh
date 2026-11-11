@@ -118,14 +118,26 @@ if (( supprimer_slots )); then
 fi
 
 # 3. Rôles : après les slots, pour ne pas laisser un slot rattaché à un rôle
-#    qui n'existe plus.
+#    qui n'existe plus. B3 de revue #6868 : DROP ROLE rewind échoue tant que
+#    les quatre GRANT EXECUTE de sql/roles.sql dépendent de lui ; on les
+#    révoque d'abord, précisément (aucun DROP OWNED général ni destructif).
 if (( supprimer_roles )); then
   if pg_isready -q 2>/dev/null; then
     psql_local <<'SQL'
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rewind') THEN
+    REVOKE EXECUTE ON FUNCTION pg_catalog.pg_ls_dir(text, boolean, boolean) FROM rewind;
+    REVOKE EXECUTE ON FUNCTION pg_catalog.pg_stat_file(text, boolean) FROM rewind;
+    REVOKE EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) FROM rewind;
+    REVOKE EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text, bigint, bigint, boolean) FROM rewind;
+  END IF;
+END
+$$;
 DROP ROLE IF EXISTS rewind;
 DROP ROLE IF EXISTS replicator;
 SQL
-    log "rôles rewind et replicator supprimés (s'ils existaient)"
+    log "rôles rewind et replicator supprimés (s'ils existaient ; grants pg_rewind révoqués)"
   else
     info "serveur arrêté : rôles non supprimés (rejouer avec le serveur en service)"
   fi

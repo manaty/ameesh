@@ -87,7 +87,7 @@ hints=$(psql_rewind "$SOURCE_HOTE" -tAc 'SHOW wal_log_hints' || true)
 log "pg_rewind de $DATA vers $SOURCE_NOM ($SOURCE_HOTE), rôle rewind"
 if ! comme_postgres "$PG_BIN/pg_rewind" \
     --target-pgdata="$DATA" \
-    --source-server="host=$SOURCE_HOTE port=5432 user=rewind dbname=postgres connect_timeout=10 passfile=$PGPASS" \
+    --source-server="host=$SOURCE_HOTE port=5432 user=rewind dbname=postgres connect_timeout=10 passfile=$PGPASS sslmode=require" \
     --progress; then
   die "pg_rewind a échoué : le répertoire $DATA n'est pas garanti réutilisable ; NE PAS le redémarrer en primaire. Re-seed explicite : deploy/serveur/replication/initialiser-standby.sh --reinitialiser --source $SOURCE_NOM $NOM_LOCAL"
 fi

@@ -35,7 +35,6 @@ case ${1:-} in
 esac
 (( $# <= 1 )) || die "au plus un nom de nœud"
 
-charger_env
 lire_noeuds
 trouver_primaire
 charger_noeud_local "$nom"
@@ -93,19 +92,28 @@ if [[ $role == primaire ]]; then
   echo
   echo 'standbys connectés (application_name|state|sync_state|sent_lsn|replay_lsn) :'
   lignes=$(psql_local -tAc 'SELECT application_name, state, sync_state, sent_lsn, replay_lsn FROM pg_stat_replication ORDER BY application_name')
+  sync_en_flux=0
+  quorum=0
   if [[ -z $lignes ]]; then
     echo '  (aucun)'
     avertir "aucun standby connecté : RPO non garanti"
   else
-    synchrone=0
     while IFS='|' read -r app etat sync_state sent replay; do
       [[ -n $app ]] || continue
       printf '  %-20s %-10s %-8s sent=%s replay=%s\n' "$app" "$etat" "$sync_state" "${sent:-?}" "${replay:-?}"
-      [[ $sync_state == sync ]] && synchrone=1
+      # ANY 1 rend sync_state=quorum en PostgreSQL 17 ; « sync » reste accepté.
+      [[ $etat == streaming && $sync_names == *"\"$app\""* ]] && sync_en_flux=1
+      [[ $sync_state == sync || $sync_state == quorum ]] && quorum=1
     done <<< "$lignes"
-    if [[ -n $sync_names && $synchrone -eq 0 ]]; then
-      avertir "aucun standby sync : synchronous_standby_names=$sync_names sans « sync » (RPO dégradé, synchronous_mode_strict=false)"
-    fi
+  fi
+  # B1 de revue #6868 : une liste posée sans candidat en flux fait attendre
+  # chaque COMMIT indéfiniment (PostgreSQL seul, sans Patroni).
+  if [[ -z $sync_names ]]; then
+    avertir "synchronous_standby_names vide : synchrone inactif (amorçage ou dégradation), RPO non garanti ; rejouer configurer-noeud.sh après le flux pour activer"
+  elif (( sync_en_flux == 0 )); then
+    avertir "synchronous_standby_names=$sync_names mais aucun candidat en flux : les COMMIT peuvent attendre indéfiniment ; dégager par configurer-noeud.sh --sans-synchrone, puis rétablir"
+  elif (( quorum == 0 )); then
+    avertir "aucun standby sync/quorum malgré synchronous_standby_names=$sync_names : RPO dégradé (candidat en rattrapage ?)"
   fi
 
   echo
@@ -126,16 +134,19 @@ if [[ $role == primaire ]]; then
   fi
 else
   echo
-  echo 'flux entrant (status|sender_host|slot_name|write_lag|flush_lag|replay_lag) :'
-  lignes=$(psql_local -tAc "SELECT status, coalesce(sender_host, ''), coalesce(slot_name, ''), coalesce(write_lag::text, ''), coalesce(flush_lag::text, ''), coalesce(replay_lag::text, '') FROM pg_stat_wal_receiver")
+  # pg_stat_wal_receiver n'a ni write_lag ni flush_lag ni replay_lag (elles
+  # sont dans pg_stat_replication, côté primaire) : LSN et horodatage réels
+  # de PostgreSQL 17 (B2 de revue #6868).
+  echo 'flux entrant (status|sender_host|slot_name|written_lsn|flushed_lsn|latest_end_lsn|last_msg_receipt_time) :'
+  lignes=$(psql_local -tAc "SELECT status, coalesce(sender_host, ''), coalesce(slot_name, ''), coalesce(written_lsn::text, ''), coalesce(flushed_lsn::text, ''), coalesce(latest_end_lsn::text, ''), coalesce(to_char(last_msg_receipt_time, 'YYYY-MM-DD HH24:MI:SS'), '') FROM pg_stat_wal_receiver")
   if [[ -z $lignes ]]; then
     echo '  (aucun)'
     avertir "aucun flux entrant : pg_stat_wal_receiver est vide"
   else
-    while IFS='|' read -r statut source slot write_lag flush_lag replay_lag; do
+    while IFS='|' read -r statut source slot written flushed latest recu; do
       [[ -n $statut ]] || continue
-      printf '  statut=%s source=%s slot=%s write_lag=%s flush_lag=%s replay_lag=%s\n' \
-        "$statut" "${source:-?}" "${slot:-?}" "${write_lag:-?}" "${flush_lag:-?}" "${replay_lag:-?}"
+      printf '  statut=%s source=%s slot=%s written_lsn=%s flushed_lsn=%s latest_end_lsn=%s recu=%s\n' \
+        "$statut" "${source:-?}" "${slot:-?}" "${written:-?}" "${flushed:-?}" "${latest:-?}" "${recu:-?}"
       [[ $statut == streaming ]] || avertir "flux $statut (attendu streaming)"
     done <<< "$lignes"
   fi

@@ -27,9 +27,13 @@ l'inventaire, pour poser les rôles et les slots sur celui qui sert.
 
 Règles encodées :
 
-- `synchronous_commit = on` et `synchronous_standby_names = 'ANY 1 (...)'`
-  avec **les deux VM d'agents seulement** : un seul synchrone, `ANY 1` choisit
-  celui des deux qui est connecté ; le hub n'est jamais candidat (`nosync`) ;
+- `synchronous_commit = on` et, **seulement quand un candidat est déjà en
+  flux**, `synchronous_standby_names = 'ANY 1 (...)'` avec les deux VM
+  d'agents : un seul synchrone, `ANY 1` choisit celui des deux qui est
+  connecté ; le hub n'est jamais candidat (`nosync`). À l'amorçage (aucun
+  standby), la liste reste **vide** : sans Patroni, une liste non vide sans
+  standby connecté ferait attendre chaque `COMMIT` indéfiniment (B1 de revue
+  #6868) ;
 - `wal_log_hints = on` (pg_rewind) et `full_page_writes = on` ;
 - `wal_level = replica`, `max_wal_senders = 10`, `max_replication_slots = 10`,
   `hot_standby = on` ;
@@ -112,7 +116,10 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
 
 1. **Sur le primaire actuel (`manaty-mesh-1`)** : rôles, slots des deux agents,
    configuration et `pg_hba` ; le premier passage exige un redémarrage court
-   (`wal_log_hints`), fenêtre d'EP8.1/EP8.3 :
+   (`wal_log_hints`), fenêtre d'EP8.1/EP8.3. Aucun standby n'existe encore :
+   `synchronous_standby_names` reste **vide**, donc les `CREATE ROLE`,
+   `ALTER ROLE` et la création des slots ne s'attendent pas (B1 de revue
+   #6868) :
 
    ```bash
    deploy/serveur/replication/configurer-noeud.sh --redemarrer manaty-mesh-1
@@ -129,9 +136,22 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
        --source manaty-mesh-1 ameesh-agents-2
    ```
 
-3. **Contrôle** sur le hub (encore primaire) : `etat.sh manaty-mesh-1` doit
-   montrer deux standbys connectés, dont `ameesh-agents-2` en `sync` (le hub
-   n'est jamais dans les synchrones).
+3. **Activer le synchrone sur le hub**, une fois `ameesh-agents-2` en flux :
+   rejouer la configuration (sans redémarrage). Le script ne pose `ANY 1` que
+   s'il voit un candidat en `streaming` ; `etat.sh` doit alors afficher
+   `sync_state = quorum` (valeur de `ANY 1` en PG17), le hub restant `async` :
+
+   ```bash
+   deploy/serveur/replication/configurer-noeud.sh manaty-mesh-1
+   deploy/serveur/replication/etat.sh manaty-mesh-1
+   ```
+
+   **Avant EP8.4 (Patroni)**, si le standby synchrone est perdu alors que la
+   liste est active, les `COMMIT` attendent indéfiniment (`synchronous_mode_strict`
+   est une propriété de Patroni, pas de PostgreSQL). Geste d'urgence, sans
+   redémarrage : `configurer-noeud.sh --sans-synchrone manaty-mesh-1`
+   (liste vide + rechargement) ; rétablir par un passage normal dès le flux
+   revenu. `etat.sh` signale les deux cas.
 
 4. **Bascule planifiée** (fenêtre d'EP8.3, aucun client ne doit écrire
    pendant la promotion) :
@@ -147,8 +167,12 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
    deploy/serveur/replication/suivre-primaire.sh --source ameesh-agents-1 ameesh-agents-2
    ```
 
+   Après la promotion, le nouveau primaire n'a encore aucun standby en flux :
+   sa liste synchrone est vide. La rejouer (`configurer-noeud.sh
+   ameesh-agents-1`) une fois `ameesh-agents-2` en flux.
+
 5. **Contrôle final** sur `ameesh-agents-1` : `etat.sh` doit montrer
-   `ameesh-agents-2` en `sync`, le hub en `async`, deux slots actifs, et
+   `ameesh-agents-2` en `quorum`, le hub en `async`, deux slots actifs, et
    `wal_log_hints = on`. Un seul primaire répond ; les clients se reconnectent
    par le DSN multi-hôte (EP8.4/EP8.5).
 
@@ -168,10 +192,13 @@ Une bascule planifiée arrête d'abord l'ancien primaire
 (`pg_ctlcluster 17 main stop`), puis promeut. Le script ne fait pas le premier
 geste : un primaire qui tourne encore est un split brain en puissance.
 
-Après promotion, `promouvoir.sh` réécrit les synchrones (les deux agents,
-`ANY 1`), recharge et crée un slot physique pour chaque autre nœud (les slots
-ne se répliquent pas). L'ancien primaire revient par `reintegrer.sh`, les
-autres standbys par `suivre-primaire.sh`.
+Après promotion, `promouvoir.sh` réécrit la configuration : à cet instant aucun
+standby n'est encore en flux, donc `synchronous_standby_names` est vide (les
+premiers `COMMIT` du nouveau primaire ne s'attendent pas) ; un passage de
+`configurer-noeud.sh` après le flux rétablit `ANY 1`. Le script recharge et crée
+un slot physique pour chaque autre nœud (les slots ne se répliquent pas).
+L'ancien primaire revient par `reintegrer.sh`, les autres standbys par
+`suivre-primaire.sh`.
 
 ## pg_rewind et re-seed
 
@@ -216,8 +243,11 @@ Deux niveaux, à ne pas confondre :
 1. **La préparation de ce lot** (configuration seule) :
    `retour-arriere.sh [--tout] [nœud]` retire le fragment `conf.d` et le bloc
    marqué de `pg_hba`, puis, sur demande, les slots (`--slots`) et les rôles
-   (`--roles`, après les slots). Aucune donnée n'est touchée, le serveur n'est
-   pas arrêté, `standby.signal` reste en place. Un slot actif arrête sans
+   (`--roles`, après les slots). Avant `DROP ROLE rewind`, les quatre
+   `GRANT EXECUTE` de `pg_rewind` sont révoqués nommément (B3 de revue #6868 :
+   PostgreSQL refuse sinon le `DROP ROLE`, « objects depend on it ») ; aucun
+   `DROP OWNED` général n'est utilisé. Aucune donnée n'est touchée, le serveur
+   n'est pas arrêté, `standby.signal` reste en place. Un slot actif arrête sans
    `--force`. Les paramètres de redémarrage (`wal_log_hints`, `wal_level`)
    reprennent leur défaut au redémarrage suivant, que le script n'impose pas.
 2. **La bascule d'EP8.3** (données) : elle se décide, elle ne se scripte pas
@@ -235,14 +265,17 @@ Deux niveaux, à ne pas confondre :
 
 ## Surveillance
 
-`etat.sh` lit le nœud local, sans connexion distante ni secret. Sur le
-primaire il affiche les standbys (`state`, `sync_state`, LSN), les slots
-(`active`, `wal_status`) ; sur un standby, le flux
-(`pg_stat_wal_receiver`, source, slot, retards). Il avertit si
-`wal_log_hints` est off, si un nœud `nofailover` apparaît dans
-`synchronous_standby_names`, si aucun standby n'est `sync`, si un slot est
-inactif ou perdu. Il sort 0 si le serveur répond, 1 sinon : il n'est pas une
-sonde de supervision.
+`etat.sh` lit le nœud local, sans connexion distante ni secret (il ne lit pas
+`replication.env`). Sur le primaire il affiche les standbys (`state`,
+`sync_state`, LSN), les slots (`active`, `wal_status`) ; sur un standby, le
+flux (`pg_stat_wal_receiver`, source, slot, `written_lsn`/`flushed_lsn`/
+`latest_end_lsn`, date du dernier message — les colonnes `*_lag` n'existent
+que dans `pg_stat_replication`, côté primaire). Il avertit si `wal_log_hints`
+est off, si un nœud `nofailover` apparaît dans `synchronous_standby_names`, si
+la liste synchrone est active sans candidat en flux (risque de `COMMIT`
+bloqués, B1) ou vide (RPO dégradé), si aucun standby n'est `sync`/`quorum`, si
+un slot est inactif ou perdu. Il sort 0 si le serveur répond, 1 sinon : il
+n'est pas une sonde de supervision.
 
 Les alertes `db_replication_lag`, `db_slot_lost`, `db_no_primary` et
 `db_archive_stale` sont du lot EP8.4/EP8.5 (étude §7) : ce lot ne fixe pas de
@@ -258,6 +291,10 @@ perdu impose un re-seed, pas une augmentation silencieuse de la borne.
 - `pg_hba` : `hostssl` seulement, `scram-sha-256`, restreint au CIDR
   `REPLICATION_SUBNET` ; l'accès client `ameesh` reste le bloc `ameesh-mesh`
   d'`installer-serveur.sh`.
+- `primary_conninfo`, `pg_basebackup` et `pg_rewind` sont en
+  `sslmode=require` : TLS obligatoire, aucun repli en clair. La vérification
+  du certificat (`verify-full`) attend l'AC du mesh (#6859, étude §8) ; c'est
+  une limite connue, non bloquante pour ce lot.
 - Secrets : `replication.env` 0600 root ; pgpass 0600 postgres ; aucun mot de
   passe dans le dépôt, en argument, dans `primary_conninfo` ni dans un journal
   de script. Une rotation se fait en modifiant `replication.env` puis en

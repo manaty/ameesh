@@ -93,11 +93,19 @@ attendre_valeur "promotion (pg_is_in_recovery)" 'SELECT pg_is_in_recovery()' f
 log "promotion confirmée : $NOM_LOCAL est primaire"
 
 # La configuration de synchrones est commune aux deux agents ; on la réécrit
-# et on recharge pour que le nouveau primaire attende un synchrone.
+# et on recharge. B1 de revue #6868 : après la promotion aucun standby n'est
+# encore en flux, donc la liste reste vide (les COMMIT ne s'attendent pas) ;
+# elle sera activée par un passage de configurer-noeud.sh une fois le flux
+# d'ameesh-agents-2 établi.
+sync_flux=$(sync_candidats_en_flux || true)
 ecrire_fichier "$CONF_FRAGMENT" 0644 "$(fragment_conf)"
 remplacer_bloc_hba "$(bloc_hba)"
 pg_ctlcluster "$PG_VERSION" main reload
-log "synchrones rechargés : $(liste_sync)"
+if [[ -n $sync_flux ]]; then
+  log "synchrones actifs après rechargement : $(printf '%s' "$sync_flux" | paste -sd, -)"
+else
+  log "synchrones actifs après rechargement : aucun (amorçage ; rejouer configurer-noeud.sh après le flux)"
+fi
 
 poser_slots
 log "terminé — ancien primaire à réintégrer avec reintegrer.sh --source $NOM_LOCAL ; autres standbys avec suivre-primaire.sh --source $NOM_LOCAL"

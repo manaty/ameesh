@@ -4,17 +4,22 @@
 # Prépare un nœud PostgreSQL 17 pour la réplication en flux du mesh
 # (lot #6868, EP8.3a, étude docs/design/etudes/replique-base-mesh.md §2/§3).
 #
-#   configurer-noeud.sh [--redemarrer] [nom-du-noeud]
+#   configurer-noeud.sh [--redemarrer] [--sans-synchrone] [nom-du-noeud]
 #
 # Idempotent, sans geste réseau ni redémarrage implicite :
 #   - écrit deploy/serveur/replication/60-ameesh-replication.conf dans conf.d
-#     (wal_level, wal_log_hints, hot_standby, slots, synchrone ANY 1) ;
+#     (wal_level, wal_log_hints, hot_standby, slots) ; synchronous_standby_names
+#     n'est posé que si un candidat synchrone est déjà en flux (B1 de revue
+#     #6868 : à l'amorçage, une liste non vide ferait attendre chaque COMMIT) ;
 #   - remplace le bloc marqué de pg_hba.conf (replicator et rewind, hostssl) ;
 #   - recharge le serveur s'il tourne (pg_hba et paramètres rechargeables) ;
 #   - signale les paramètres qui exigent un redémarrage (wal_log_hints, …) ;
 #     --redemarrer le fait, sinon la commande est imprimée ;
 #   - sur le primaire effectif (pg_is_in_recovery = f), pose les rôles
 #     replicator et rewind et un slot physique par autre nœud.
+#
+# --sans-synchrone dégrade volontairement : liste vide et rechargement, geste
+# d'urgence quand le standby synchrone est perdu et que les COMMIT attendent.
 #
 # Le hub est encore primaire au moment de la préparation : le rôle effectif
 # est lu au serveur, pas seulement dans l'inventaire.
@@ -26,24 +31,32 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: configurer-noeud.sh [--redemarrer] [nom-du-noeud]
+usage: configurer-noeud.sh [--redemarrer] [--sans-synchrone] [nom-du-noeud]
 
-  --redemarrer   redémarre PostgreSQL si des paramètres (wal_log_hints,
-                 wal_level, max_wal_senders, max_replication_slots) ne
-                 s'appliquent qu'au redémarrage ; sans l'option, la commande
-                 est seulement imprimée.
-  nom-du-noeud   nœud de noeuds.conf ; par défaut le nom court de l'hôte.
+  --redemarrer     redémarre PostgreSQL si des paramètres (wal_log_hints,
+                   wal_level, max_wal_senders, max_replication_slots) ne
+                   s'appliquent qu'au redémarrage ; sans l'option, la commande
+                   est seulement imprimée.
+  --sans-synchrone dégrade le synchrone : synchronous_standby_names vide et
+                   rechargement (geste d'urgence si le standby synchrone est
+                   perdu et que les COMMIT attendent). La liste est reposée au
+                   passage suivant, si un candidat est en flux.
+  nom-du-noeud     nœud de noeuds.conf ; par défaut le nom court de l'hôte.
 
 Le script est idempotent. Il n'ouvre aucun port, ne touche ni au réseau
 (#6859) ni à l'archivage (#6858), et ne démarre pas un serveur arrêté.
+synchronous_standby_names n'est posé que si un candidat synchrone est déjà en
+flux : à l'amorçage, une liste non vide ferait attendre chaque COMMIT.
 EOF
 }
 
 redemarrer=0
+FORCER_SANS_SYNCHRONE=0
 nom=""
 while (( $# )); do
   case $1 in
     --redemarrer) redemarrer=1 ;;
+    --sans-synchrone) FORCER_SANS_SYNCHRONE=1 ;;
     -h | --help) usage; exit 0 ;;
     --) shift; break ;;
     -*) die "option inconnue : $1 (voir --help)" ;;
@@ -67,6 +80,21 @@ charger_noeud_local "$nom"
 
 log "nœud $NOM_LOCAL ($HOTE_LOCAL) — inventaire : $ROLE_INVENTAIRE, synchrone=$SYNC_LOCAL, nofailover=$NOFAIL_LOCAL"
 log "synchrones de l'inventaire : $(liste_sync)"
+
+# B1 de revue #6868 : dire noir sur blanc ce que la liste vaudra. À l'amorçage
+# (aucun standby en flux), elle reste vide et les COMMIT ne s'attendent pas ;
+# après l'étape base backup, un nouveau passage active ANY 1.
+sync_flux=""
+if (( ! FORCER_SANS_SYNCHRONE )); then
+  sync_flux=$(sync_candidats_en_flux || true)
+fi
+if (( FORCER_SANS_SYNCHRONE )); then
+  log "synchrone désactivé (--sans-synchrone) : synchronous_standby_names vide et rechargement"
+elif [[ -n $sync_flux ]]; then
+  log "candidat(s) synchrone(s) en flux : $(printf '%s' "$sync_flux" | paste -sd, -) — liste ANY 1 posée"
+else
+  info "aucun candidat synchrone en flux : synchronous_standby_names vide (amorçage ; les COMMIT n'attendent pas ; rejouer ce script après le flux pour activer)"
+fi
 
 # 1. Configuration commune : fragment conf.d, bloc pg_hba, contrôle de lecture.
 ecrire_fichier "$CONF_FRAGMENT" 0644 "$(fragment_conf)"
