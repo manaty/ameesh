@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#6825 : le véhicule se lit dans un clone local après relève de pilote."""
+import os
 from types import SimpleNamespace
 from unittest import mock
 import unittest
@@ -61,3 +62,18 @@ class LocalVehicleTest(unittest.TestCase):
     def test_missing_packet_commit_is_distinct_from_missing_clone(self):
         result = self.lookup(pr=dict(self.pr(), headRefOid="f" * 40))
         self.assertIn("head ffffffffffff not readable locally", result["unreadable"])
+
+    def test_project_clone_without_packet_head_uses_registry_clone(self):
+        git(self.repo, "remote", "add", "origin", "https://github.com/o/x.git")
+        stale = os.path.join(self.repo, "stale")
+        git(self.repo, "clone", "--single-branch", "--branch", "develop",
+            "--no-local", self.repo, stale)
+        git(stale, "remote", "set-url", "origin", "https://github.com/o/x.git")
+        with mock.patch("ameesh.lot_class.repository", return_value=stale), \
+                mock.patch("ameesh.registry.get", return_value={"cwd": self.repo}):
+            self.assertEqual(self.lookup(db=object())["pr"], 9)
+            result = forge_packets.vehicle(
+                None, {"id": 99, "app": "product", "assignee": "author"},
+                self.frozen_ms(self.frozen), db=object(),
+                gh=self.gh([self.pr()]), cache={})
+            self.assertEqual(result, {})
