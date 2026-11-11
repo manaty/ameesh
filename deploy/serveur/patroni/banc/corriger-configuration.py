@@ -3,13 +3,13 @@
 """Corrige la forme de ``etcd3.hosts`` dans les configurations du banc.
 
 Constat d'exécution du 11/11/2026 (lot #6902) : ``generer-configuration.py``
-(#6870) rend ``etcd3.hosts`` avec le schéma (« https://hôte:2379 »), alors que
-Patroni 4.x attend « hôte:port » et applique ``protocol: https``. Avec le
+(#6870) rendait ``etcd3.hosts`` avec le schéma (« https://hôte:2379 »), alors
+que Patroni 4.x attend « hôte:port » et applique ``protocol: https``. Avec le
 schéma, Patroni refuse de démarrer (``ValueError: Invalid IPv6 URL``).
 
-Le banc corrige **sa copie** des configurations et consigne le constat dans
-``$BANC_ETAT/constats.json`` ; le rapport le cite. La correction de #6870 doit
-partir dans un lot correctif avant EP8.6 : le banc ne masque pas l'écart.
+#6925 a corrigé le générateur ; sur une sortie actuelle, ce correcteur ne
+trouve rien. Il reste pour les configurations héritées (antérieures à #6925)
+et consigne alors le constat dans ``$BANC_ETAT/constats.json``.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import sys
 
 MOTIF = re.compile(r"^  hosts: (\S.*)$", re.M)
 CAUSE = "etcd3.hosts rendu avec schéma par #6870 ; Patroni 4.x attend hôte:port"
-CORRECTION = "lot correctif #6870 avant EP8.6"
+CORRECTION = "lot #6925 (fusionné) ; correcteur conservé pour les entrées héritées"
 
 
 def corriger(dossier: pathlib.Path) -> list[dict]:

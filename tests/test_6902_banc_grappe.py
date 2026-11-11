@@ -163,21 +163,45 @@ class GenerationConfigurationTest(unittest.TestCase):
         # Le gabarit de #6870 cite une adresse du mesh en commentaire : seules
         # les valeurs effectives doivent rester sur le réseau du banc.
         self.assertNotIn("10.78.0.", _sans_commentaires(patroni))
-        self.assertIn("https://172.30.77.11:2379", patroni)  # constat #6870
+        # #6925 : le générateur rend hôte:port et protocol: https, plus de
+        # schéma dans etcd3.hosts.
+        self.assertIn("hosts: 172.30.77.11:2379", patroni)
+        self.assertIn("protocol: https", patroni)
+        self.assertNotIn("https://172.30.77.11:2379", patroni)
         self.assertIn("nofailover: true", (config / "banc-3" / "patroni.yml").read_text())
         self.assertNotIn(
             "nofailover: true", (config / "banc-1" / "patroni.yml").read_text()
         )
 
+        # Sortie du générateur corrigé (#6925) : le correcteur ne trouve rien.
         resultat = _run([sys.executable, CORRECTEUR, "--dossier", self._tmp])
         self.assertEqual(resultat.returncode, 0, resultat.stderr)
-        corrige = (config / "banc-1" / "patroni.yml").read_text(encoding="utf-8")
-        self.assertIn("hosts: 172.30.77.11:2379", corrige)
-        self.assertNotIn("https://172.30.77.11:2379", corrige)
+        constats = json.loads((self._tmp / "constats.json").read_text(encoding="utf-8"))
+        self.assertEqual(constats, [])
+
+        # Entrée héritée (#6870) : le correcteur doit encore corriger les
+        # configurations antérieures à #6925, avec ses trois constats.
+        motif = re.compile(r"^  hosts: (.+)$", re.MULTILINE)
+        for nom in ("banc-1", "banc-2", "banc-3"):
+            fichier = config / nom / "patroni.yml"
+            texte = fichier.read_text(encoding="utf-8")
+            trouve = motif.search(texte)
+            self.assertIsNotNone(trouve, nom)
+            herite = ",".join("https://" + h for h in trouve.group(1).split(","))
+            fichier.write_text(
+                texte.replace(trouve.group(0), "  hosts: " + herite, 1),
+                encoding="utf-8",
+            )
+
+        resultat = _run([sys.executable, CORRECTEUR, "--dossier", self._tmp])
+        self.assertEqual(resultat.returncode, 0, resultat.stderr)
         constats = json.loads((self._tmp / "constats.json").read_text(encoding="utf-8"))
         self.assertEqual(len(constats), 3)
         self.assertIn("avant", constats[0])
         self.assertIn("apres", constats[0])
+        for nom in ("banc-1", "banc-2", "banc-3"):
+            corrige = (config / nom / "patroni.yml").read_text(encoding="utf-8")
+            self.assertNotIn("hosts: https://", corrige)
 
 
 class CorrectionTest(unittest.TestCase):

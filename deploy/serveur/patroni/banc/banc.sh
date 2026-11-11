@@ -198,13 +198,12 @@ initialiser_schema() {
         ' >/dev/null
 }
 
-# Écart constaté à l'exécution (11/11/2026) : generer-configuration.py (#6870)
-# écrit etcd3.hosts avec le schéma (« https://hôte:2379 »), alors que Patroni 4.x
-# attend « hôte:port » et applique protocol: https. Avec le schéma, Patroni
-# refuse de démarrer (ValueError: Invalid IPv6 URL). Le banc corrige sa copie
-# avec corriger-configuration.py, consigne le constat dans constats.json et le
-# rapport le cite : la correction doit partir dans un lot correctif de #6870
-# avant EP8.6, pas être masquée par le banc.
+# Écart constaté à l'exécution (11/11/2026), corrigé par #6925 : le générateur
+# de #6870 rendait etcd3.hosts avec le schéma (« https://hôte:2379 »), que
+# Patroni 4.x refuse (ValueError: Invalid IPv6 URL). #6925 rend désormais
+# « hôte:port » avec protocol: https. Le banc garde corriger-configuration.py
+# pour les configurations héritées : sur une sortie actuelle il ne trouve rien
+# et constats.json reste vide.
 demarrer_pc() {
     # Le poste client reçoit le mot de passe par un fichier d'environnement
     # 0600 : il n'apparaît ni dans la ligne de commande ni dans les journaux.

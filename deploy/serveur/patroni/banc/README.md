@@ -189,22 +189,23 @@ La table `table_jalon` est nécessaire pour mesurer le RPO ; `creer_table_jalon`
 doit rester `false` sur une grappe déjà en service, sauf geste validé. EP8.6
 reste responsable du contenu des commandes, de la fenêtre et du retour arrière.
 
-## Constat d'exécution : `etcd3.hosts` de #6870
+## Constat d'exécution : `etcd3.hosts` de #6870 (corrigé par #6925)
 
 La première exécution du banc a révélé un défaut réel dans
-`generer-configuration.py` (#6870) : `valeurs_communes()` rend
+`generer-configuration.py` (#6870) : `valeurs_communes()` rendait
 `etcd3.hosts` sous la forme `https://hôte:2379,...`, alors que Patroni 4.x
-attend `hôte:port` et applique `protocol: https`. Patroni refuse alors de
+attend `hôte:port` et applique `protocol: https`. Patroni refusait alors de
 démarrer :
 
 ```
 ValueError: Invalid IPv6 URL
 ```
 
-`corriger-configuration.py` corrige **la copie du banc** et écrit
-`$BANC_ETAT/constats.json` ; le rapport cite l'écart. Ce n'est pas une
-correction de #6870 : un **lot correctif de #6870 doit partir avant EP8.6**,
-sinon la vraie grappe ne démarrera pas avec ces configurations.
+Le lot correctif #6925, fusionné, rend désormais `hôte:port` avec
+`protocol: https` ; sur une sortie actuelle `corriger-configuration.py` ne
+trouve rien et `$BANC_ETAT/constats.json` reste vide. Le correcteur reste
+nécessaire pour les configurations héritées (antérieures à #6925) : le test
+`test_generation_puis_correction` couvre les deux cas.
 
 ## Fichiers
 
@@ -216,7 +217,7 @@ sinon la vraie grappe ne démarrera pas avec ces configurations.
 | `topologie-banc.json` | topologie du banc, sans adresse du mesh |
 | `banc.sh` | monter / état / couper / tuer / réinitialiser / démonter |
 | `exercer.py` | scénarios, mesures, rapport Markdown et JSON |
-| `corriger-configuration.py` | correction locale d'`etcd3.hosts` et constat #6870 |
+| `corriger-configuration.py` | correction d'`etcd3.hosts` pour les configurations héritées (constat #6870, corrigé par #6925) |
 | `tests/test_6902_banc_grappe.py` | contrats hors Docker (topologie, génération, correction, refus du geste réel, rapport) |
 
 ## Dépannage
