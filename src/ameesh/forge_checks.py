@@ -427,8 +427,10 @@ def doctor_lines(cfg, db, *, gh=None) -> tuple:
         lines.append("the canon declares no project (%s)" % (evidence.label or "no block"))
     if gh is None:
         try:
-            from . import packet_automerge
-            from .modules.dev import plan_github
+            # `plan_github` est la façade de compatibilité du cœur (#4384),
+            # comme dans `fire`/`merge_pr` ; le cœur n'importe jamais
+            # l'implémentation d'un module (L97, test_generic_core).
+            from . import packet_automerge, plan_github
             gh = packet_automerge.gh_of(plan_github.Gh())
         except Exception as exc:  # noqa: BLE001 - sans gh, rien n'est prouvé
             lines.append("not checked (no GitHub reader: %s)" % _one_line(exc))
