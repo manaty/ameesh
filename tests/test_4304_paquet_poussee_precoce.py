@@ -52,7 +52,7 @@ class Flux:
 
     def __init__(self, test, *, tests, compositions, states=("OPEN",), local=False,
                  record=False, contract_result=None, candidate_reads=None,
-                 **extra):
+                 fresh_bases=None, **extra):
         self.test = test
         self.extra = extra
         self.extra.setdefault("contracts_budget", 10)
@@ -69,6 +69,9 @@ class Flux:
         #: #6566 : lectures successives de la liste prête (composition, relecture).
         self.candidate_reads = list(candidate_reads or [])
         self.candidate_calls = 0
+        #: #6891 : têtes successives lues de la cible (base, puis relecture
+        #: avant les tests). La dernière valeur se répète.
+        self.fresh_bases = list(fresh_bases or ["a" * 40])
 
     def log(self, name, result=None):
         def side_effect(*args, **kwargs):
@@ -127,7 +130,12 @@ class Flux:
 
         patches = [
             mock.patch.object(paquet_auto, "check_epoch"),
-            mock.patch.object(paquet_auto, "fresh_base", return_value="a" * 40),
+            # #6891 : base de composition, puis relecture avant les tests.
+            mock.patch.object(paquet_auto, "fresh_base",
+                              side_effect=lambda *_a, **_k: (
+                                  self.fresh_bases.pop(0)
+                                  if len(self.fresh_bases) > 1
+                                  else self.fresh_bases[0])),
             mock.patch.object(paquet_auto, "prune_stale_worktrees", return_value=[]),
             mock.patch.object(paquet_auto, "make_worktree", return_value=worktree),
             # #6566 : la relecture du gel se fait sur un worktree à la base.
