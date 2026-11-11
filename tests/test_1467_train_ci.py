@@ -191,10 +191,10 @@ class TrainCiTest(unittest.TestCase):
         every = self.caller_jobs(contract)
         ci = self.caller(contract, every)
         self.assertEqual(ci.read(self.plan)["status"], "green")
-        # #2446 : the packet suite is the compiled 8 psycopg + 16 psql matrix;
+        # #2446 : the packet suite is the compiled 12 psycopg + 16 psql matrix;
         # a missing caller gate, aggregate, part or platform job can never be
         # replaced by the workflow's green conclusion.
-        for missing in ("tests", "psycopg 4/8", "psql 6/16",
+        for missing in ("tests", "psycopg 4/12", "psql 6/16",
                         "plateforme macOS", "plan"):
             with self.subTest(missing=missing):
                 actual = next(j["name"] for j in every if j["name"].endswith(missing))
@@ -264,7 +264,7 @@ class TrainCiTest(unittest.TestCase):
         # refuse instead of choosing one.
         prefixed = self.caller_jobs(contract)
         duplicated = prefixed + [dict(self.job, id=999,
-                                      name="suite complète du paquet / psycopg 4/8")]
+                                      name="suite complète du paquet / psycopg 4/12")]
         ci = self.caller(contract, duplicated)
         with self.assertRaisesRegex(train.TrainError, "missing, skipped or interrupted"):
             ci.read(self.plan)

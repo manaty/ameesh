@@ -40,8 +40,9 @@ class ContractTest(unittest.TestCase):
         self.assertIn("tests", jobs)
         self.assertIn("plan", jobs)
         self.assertIn("plateforme macOS", jobs)
+        # #6880 : la flotte est à 8 vCPU par hôte, psycopg passe à 12 parts.
         self.assertEqual({job for job in jobs if job.startswith("psycopg ")},
-                         {"psycopg %d/8" % n for n in range(1, 9)})
+                         {"psycopg %d/12" % n for n in range(1, 13)})
         self.assertEqual({job for job in jobs if job.startswith("psql ")},
                          {"psql %d/16" % n for n in range(1, 17)})
 
