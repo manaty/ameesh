@@ -747,7 +747,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- instant, de l'ÉTAT) — le superviseur lit qui exécute, jamais une
         -- dépense
         'external_session', 'external_claim_session', 'external_claimed_at',
-        'external_claim_actor', 'external_claim_host', 'external_claim_proof'
+        'external_claim_actor', 'external_claim_host', 'external_claim_proof',
+        -- #6877 (0568) : identité complète de la liaison qui a pris (harnais
+        -- et ligne de liaison) — de l'ÉTAT, lue pour dire qui tient le geste
+        'external_claim_harness', 'external_claim_binding'
     ]),
     -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
     ('work_item_estimates', ARRAY[
