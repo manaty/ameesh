@@ -1252,7 +1252,8 @@ def milestone(
         def ownership_hook(tx, milestone, after_commit):
             from . import freeze_branch
             freeze_branch.guard_ownership(
-                tx, item, sha, branch=str(item.get("branch") or "").strip())
+                tx, item, sha, branch=str(item.get("branch") or "").strip(),
+                exclude_freeze_id=int(milestone["id"]))
             if following is not None:
                 following(tx, milestone, after_commit)
         on_frozen = ownership_hook

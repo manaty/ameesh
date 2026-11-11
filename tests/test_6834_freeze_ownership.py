@@ -32,11 +32,11 @@ class FreezeOwnershipTest(fixtures.FreezeBranchTest):
         git(self.repo, "update-ref", "-d", "refs/remotes/origin/shared")
         owner = self.other()
         work.set_branch(self.db, owner, "shared", actor="human:test")
-        resolve = plan_git._commit
+        resolve = plan_git.local_commit
         def without_owner_ref(repo, ref, **kwargs):
             # Le clone peut lire le commit sans disposer de la ref du détenteur.
             return None if ref.endswith("/shared") else resolve(repo, ref, **kwargs)
-        with mock.patch.object(plan_git, "_commit", side_effect=without_owner_ref):
+        with mock.patch.object(plan_git, "local_commit", side_effect=without_owner_ref):
             with self.assertRaisesRegex(work.WorkError, "owned-by-open-lot.*branch.*#%s" % owner):
                 self.freeze()
         self.assert_no_freeze()
@@ -69,3 +69,12 @@ class FreezeOwnershipTest(fixtures.FreezeBranchTest):
             self.freeze()
         self.assertFalse(any(m["kind"] == "frozen"
                              for m in work.milestones(self.db, self.lot)))
+
+    def test_own_refreeze_survives_child_branch_pointing_at_head(self):
+        self.publish()
+        self.freeze()
+        owner = self.other()
+        git(self.repo, "branch", "child", self.sha)
+        work.set_branch(self.db, owner, "child", actor="human:test")
+        self.freeze()
+        self.assertEqual(work.get(self.db, self.lot)["branch"], "agent/basket")
