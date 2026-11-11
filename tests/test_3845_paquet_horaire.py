@@ -67,6 +67,9 @@ class FakeShell:
         #: #6665 : une recomposition réussie regèle le porteur sur une tête
         #: neuve ; `None` garde la tête gelée (composition sans effet).
         self.recomposed_head: str | None = None
+        #: #6933 : `work reviewer --no-verdict` refusé à l'acteur
+        self.refuse_waiver = False
+        self.waiver_rc: tuple[int, str] | None = None
 
     def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
         self.calls.append(list(cmd))
@@ -97,6 +100,13 @@ class FakeShell:
                     # #6538 : un lot inconnu du banc échoue comme `work show`
                     return ph.Result(1, "", "lot #%s not found\n" % args[2])
                 return ph.Result(0, json.dumps(self.items[int(args[2])]))
+            if args[:2] == ["work", "reviewer"] and "--no-verdict" in args:
+                if self.refuse_waiver:
+                    return ph.Result(1, "", "error: designation refused: %s is neither a "
+                                     "human, an orchestrator nor a design agent\n"
+                                     % args[args.index("--actor") + 1])
+                if self.waiver_rc:
+                    return ph.Result(self.waiver_rc[0], "", self.waiver_rc[1])
             if args[:2] == ["ci", "status"]:
                 return ph.Result(0, json.dumps(self.ci.get(int(args[2]), {"runs": []})))
             if args[:2] == ["work", "note"]:
@@ -357,6 +367,35 @@ class ComposeTest(Base):
         self.assertEqual(ci[ci.index("--sha") + 1], HEAD)
         self.assertIn(ph.MARK_CI + HEAD, ph.marks(self.shell.items[4000]))
         self.assertEqual(self.shell.mails[-1][0], "mesh-design")
+
+    def test_verdict_deja_pose_n_est_pas_redemande(self):
+        # #6933 : la pose automatique du véhicule (#4109) a déjà mis « verdict
+        # non requis » ; le tic ne le redemande pas et demande la ci-full.
+        self.shell.items[4000] = dict(carrier(), reviewer="-none", reviewers=["-none"])
+        self.assertIn("ci-full demandée", ph.tick(self.ctx))
+        self.assertEqual(self.shell.ran("work", "reviewer"), [])
+        self.assertTrue(self.shell.ran("ci", "run", "4000", "--full"))
+
+    def test_composeur_delegue_sans_le_geste_ne_fait_pas_echouer_le_tic(self):
+        # #6933 : un composeur délégué (§12) n'a pas `--no-verdict` ; le refus
+        # est consigné, laissé au pilote, et la ci-full part quand même.
+        self.shell.items[4000] = carrier()
+        self.shell.refuse_waiver = True
+        self.ctx.actor = "mty-amh-impl-01"
+        self.assertIn("ci-full demandée", ph.tick(self.ctx))
+        self.assertTrue(self.shell.ran("ci", "run", "4000", "--full"))
+        left = [n for n in ph.marks(self.shell.items[4000])
+                if n.startswith(ph.MARK_WAIVE_LEFT + HEAD)]
+        self.assertEqual(len(left), 1, left)
+        self.assertIn("laissé au pilote", self.shell.mails[-1][1])
+
+    def test_autre_echec_du_verdict_reste_un_echec(self):
+        self.shell.items[4000] = carrier()
+        self.shell.waiver_rc = (1, "error: verdict not required refused: lot 4000 "
+                                   "carries a current blocked verdict\n")
+        with self.assertRaises(ph.HoraireError):
+            ph.tick(self.ctx)
+        self.assertEqual(self.shell.ran("ci", "run"), [])
 
     def test_courriers_nomment_l_expediteur(self):
         # revue mty-amh-impl-04 : `role run` retire AGENT_MAIL_NAME ; sans
