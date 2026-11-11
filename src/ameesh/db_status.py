@@ -33,6 +33,11 @@ ni interprétée ; le statut dit la visibilité insuffisante et l'alerte
 filtrage des lignes n'est pas masqué, seules les colonnes du walsender le
 sont.
 
+`pg_stat_replication` liste aussi les walsenders logiques des abonnés : un
+slot logique actif sur le pid les distingue (`pg_replication_slots`,
+`slot_type = 'logical'`), et ils ne comptent ni comme secours physique ni
+dans le minimum attendu. Une connexion physique sans slot reste un secours.
+
 Le mono-nœud actuel est le défaut : ni `patroni_url`, ni réplication
 configurée, `db_min_standbys = 0` — le statut est lisible et aucune alerte de
 grappe ne part. Aucune grappe n'est contactée pour tester ce module : les
@@ -42,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.parse
@@ -74,14 +80,17 @@ SELECT pg_is_in_recovery() AS in_recovery,
 """
 
 _REPLICATION_SQL = """
-SELECT pid, application_name, client_addr::text AS client_addr,
-       state, sync_state, sync_priority,
-       EXTRACT(EPOCH FROM write_lag) AS write_lag_s,
-       EXTRACT(EPOCH FROM flush_lag) AS flush_lag_s,
-       EXTRACT(EPOCH FROM replay_lag) AS replay_lag_s,
-       sent_lsn::text AS sent_lsn, replay_lsn::text AS replay_lsn
-  FROM pg_stat_replication
- ORDER BY application_name
+SELECT r.pid, r.application_name, r.client_addr::text AS client_addr,
+       r.state, r.sync_state, r.sync_priority,
+       EXTRACT(EPOCH FROM r.write_lag) AS write_lag_s,
+       EXTRACT(EPOCH FROM r.flush_lag) AS flush_lag_s,
+       EXTRACT(EPOCH FROM r.replay_lag) AS replay_lag_s,
+       r.sent_lsn::text AS sent_lsn, r.replay_lsn::text AS replay_lsn,
+       EXISTS (SELECT 1 FROM pg_replication_slots s
+                WHERE s.active_pid = r.pid
+                  AND s.slot_type = 'logical') AS logical
+  FROM pg_stat_replication r
+ ORDER BY r.application_name
 """
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -99,17 +108,47 @@ def _short(value, limit: int = 160) -> str:
     return " ".join(str(value).split())[:limit]
 
 
+_URL_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
+
+
 def mask_url(url: str) -> str:
-    """L'URL Patroni sans identifiants ni requête : un statut se cite sans secret."""
+    """L'URL Patroni sans identifiants ni requête : un statut se cite sans secret.
+
+    Une URL illisible (`port` non numérique, IPv6 mal formée) n'est jamais
+    rendue brute : elle pourrait porter un mot de passe ou un jeton de
+    requête. Elle devient un texte neutre.
+    """
     try:
         parts = urllib.parse.urlsplit(url)
-        netloc = parts.netloc
-        if parts.username is not None or parts.password is not None:
-            host = parts.hostname or ""
-            netloc = host + (":%d" % parts.port if parts.port else "")
+        host = parts.hostname or ""
+        if ":" in host:  # IPv6 : urlunsplit veut les crochets
+            host = "[%s]" % host
+        port = parts.port  # lève ValueError sur un port illisible
+        netloc = host + (":%d" % port if port else "")
         return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
     except ValueError:
-        return url
+        return "(invalid URL)"
+
+
+def _error_text(exc, url: str = "") -> str:
+    """Le message d'une sonde, sans URL ni identifiants recopiés.
+
+    Une exception réseau (`http.client.InvalidURL`, `HTTPError`, un `OSError`
+    fabriqué) peut citer l'URL complète. On remplace l'URL configurée puis
+    tout jeton d'URL restant par sa forme masquée, et les requêtes éventuelles
+    par un blanc : `patroni.url` et `error` ne sont jamais un canal de fuite.
+    """
+    try:
+        text = str(exc)
+    except Exception:  # noqa: BLE001 - un __str__ cassé ne casse pas le statut
+        text = type(exc).__name__
+    text = _short(text, 160)
+    if url:
+        text = text.replace(url, mask_url(url))
+    text = _URL_TOKEN.sub(lambda match: mask_url(match.group(0)), text)
+    # Un message peut ne citer que la partie `user:motdepasse@` de l'URL.
+    text = re.sub(r"\b[^\s:/@]+:[^\s/@]+@", "[redacted]@", text)
+    return re.sub(r"[?&][^\s'\"<>]*", "?…", text)
 
 
 def _as_bool(value) -> bool:
@@ -156,7 +195,7 @@ def patroni(cfg, *, reader=_json) -> dict | None:
         local = reader(url, "/patroni")
     except Exception as exc:  # une sonde réseau ne casse pas le statut
         local = None
-        out["errors"]["local"] = _short(exc)
+        out["errors"]["local"] = _error_text(exc, url)
     if isinstance(local, dict):
         meta = local.get("patroni")
         meta = meta if isinstance(meta, dict) else {}
@@ -177,7 +216,7 @@ def patroni(cfg, *, reader=_json) -> dict | None:
         cluster = reader(url, "/cluster")
     except Exception as exc:
         cluster = None
-        out["errors"]["cluster"] = _short(exc)
+        out["errors"]["cluster"] = _error_text(exc, url)
     if isinstance(cluster, dict):
         members = cluster.get("members")
         if isinstance(members, list):
@@ -237,10 +276,20 @@ def _masked_row(row) -> bool:
 
 
 def _standbys(rows):
-    """Les secours interprétables, et le nombre de lignes masquées écartées."""
+    """Les secours physiques interprétables, les masqués et les logiques.
+
+    `pg_stat_replication` contient aussi les walsenders logiques des abonnés
+    (slot logique actif sur le pid) : ils ne sont pas des secours physiques
+    et ne comptent ni dans le minimum attendu ni dans le retard de la
+    grappe. Une connexion physique sans slot reste un secours.
+    """
     out = []
     masked = 0
+    logical = 0
     for row in rows:
+        if _as_bool(row.get("logical")):
+            logical += 1
+            continue
         if _masked_row(row):
             masked += 1
             continue
@@ -256,7 +305,7 @@ def _standbys(rows):
             "sent_lsn": row.get("sent_lsn"),
             "replay_lsn": row.get("replay_lsn"),
         })
-    return out, masked
+    return out, masked, logical
 
 
 def _lag(standbys: list[dict]):
@@ -277,7 +326,7 @@ def read(cfg, db, *, patroni_reading: dict | None = None) -> dict:
     row = _node_row(db)
     in_recovery = _as_bool(row.get("in_recovery"))
     replication_rows = _replication_rows(db)
-    standbys, masked_rows = _standbys(replication_rows)
+    standbys, masked_rows, logical_rows = _standbys(replication_rows)
     privileged = _as_bool(row.get("read_all_stats")) or _as_bool(
         row.get("superuser"))
     if patroni_reading is None and not db_mod.is_dry_pass(db):
@@ -327,6 +376,7 @@ def read(cfg, db, *, patroni_reading: dict | None = None) -> dict:
         "replication": {
             "count": len(standbys),
             "masked": masked_rows,
+            "logical": logical_rows,
             "sync_count": sum(1 for s in standbys
                               if s.get("sync_state") in SYNC_STATES),
             "max_lag_s": _lag(standbys),
@@ -525,6 +575,7 @@ def line(status: dict) -> str:
     visibility = status.get("visibility") or {}
     standbys = status.get("standbys") or []
     masked = int(replication.get("masked") or 0)
+    logical = int(replication.get("logical") or 0)
     bits = ["%s (%s, PostgreSQL %s)" % (node.get("name") or "?",
                                         node.get("role") or "?", _version(status))]
     if _as_bool(node.get("in_recovery")):
@@ -545,6 +596,9 @@ def line(status: dict) -> str:
             visibility.get("role") or "the reading role"))
     elif not visibility.get("privileged", True):
         bits.append("statistics restricted (role lacks pg_read_all_stats)")
+    if logical:
+        bits.append("%d logical walsender%s excluded" % (
+            logical, "" if logical == 1 else "s"))
     if replication.get("max_lag_s") is not None:
         bits.append("lag %.1f s / %.1f s" % (
             replication["max_lag_s"], replication.get("threshold_s") or 0.0))
@@ -577,6 +631,7 @@ def format_lines(status: dict) -> list[str]:
     visibility = status.get("visibility") or {}
     standbys = status.get("standbys") or []
     masked = int(replication.get("masked") or 0)
+    logical = int(replication.get("logical") or 0)
     patroni_reading = status.get("patroni")
     out = ["node       : %s (%s, PostgreSQL %s, up since %s)" % (
         node.get("name") or "?", node.get("role") or "?",
@@ -610,6 +665,9 @@ def format_lines(status: dict) -> list[str]:
         out.append("standbys   : none (%d expected)" % replication["expected"])
     else:
         out.append("standbys   : none (mono-node)")
+    if logical:
+        out.append("logical    : %d walsender(s) excluded "
+                   "(logical subscriber, not a physical standby)" % logical)
     lag = replication.get("max_lag_s")
     out.append("replication: lag %s / threshold %.1f s; "
                "synchronous_standby_names = %r" % (

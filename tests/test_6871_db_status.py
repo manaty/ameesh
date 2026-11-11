@@ -39,15 +39,16 @@ def cfg(**changes):
     return dataclasses.replace(config.Config(), **changes)
 
 
-def standby(name, *, sync="async", lag=0.0, state="streaming"):
+def standby(name, *, sync="async", lag=0.0, state="streaming", logical=False):
     return {"application_name": name, "client_addr": "10.77.0.3",
             "state": state, "sync_state": sync,
             "sync_priority": 0 if sync != "sync" else 1,
             "write_lag_s": lag, "flush_lag_s": lag, "replay_lag_s": lag,
-            "sent_lsn": "0/10", "replay_lsn": "0/10"}
+            "sent_lsn": "0/10", "replay_lsn": "0/10",
+            "logical": logical}
 
 
-def masked_standby(name="n2", pid=1234):
+def masked_standby(name="n2", pid=1234, logical=False):
     """Une ligne telle que PostgreSQL 17 la rend sans pg_read_all_stats.
 
     `application_name` et `client_addr` viennent de `pg_stat_get_activity`
@@ -58,7 +59,7 @@ def masked_standby(name="n2", pid=1234):
     return {"pid": pid, "application_name": name, "client_addr": "10.77.0.3",
             "state": None, "sync_state": None, "sync_priority": None,
             "write_lag_s": None, "flush_lag_s": None, "replay_lag_s": None,
-            "sent_lsn": None, "replay_lsn": None}
+            "sent_lsn": None, "replay_lsn": None, "logical": logical}
 
 
 class FakeDb:
@@ -188,6 +189,32 @@ class ClusterStatusTest(unittest.TestCase):
         self.assertIn("db_no_standby", kinds)
         self.assertIn("db_replication_lag", kinds)
 
+    def test_un_abonne_logique_n_est_pas_un_secours(self):
+        # Un seul abonné logique : aucun secours physique, l'alerte reste.
+        expected_cfg = cfg(db_min_standbys=1)
+        status = db_status.read(
+            expected_cfg, FakeDb(standbys=[standby("sub1", logical=True)]))
+        self.assertEqual(status["replication"]["count"], 0)
+        self.assertEqual(status["replication"]["logical"], 1)
+        self.assertEqual([a["type"] for a in
+                          db_status.alerts_from_status(expected_cfg, status)],
+                         ["db_no_standby"])
+        self.assertIn("1 logical walsender excluded", db_status.line(status))
+
+    def test_logique_et_physique_meles(self):
+        expected_cfg = cfg(db_min_standbys=1)
+        status = db_status.read(
+            expected_cfg, FakeDb(
+                local=dict(LOCAL_PRIMARY,
+                           synchronous_standby_names="FIRST 1 (n2)"),
+                standbys=[standby("sub1", logical=True),
+                          standby("n2", sync="sync")]))
+        self.assertEqual(status["replication"]["count"], 1)
+        self.assertEqual(status["replication"]["sync_count"], 1)
+        self.assertEqual(status["replication"]["logical"], 1)
+        self.assertEqual([s["name"] for s in status["standbys"]], ["n2"])
+        self.assertEqual(db_status.alerts_from_status(expected_cfg, status), [])
+
 
 class MaskedStatsTest(unittest.TestCase):
     """PostgreSQL masque `pg_stat_replication` hors `pg_read_all_stats`.
@@ -257,6 +284,20 @@ class MaskedStatsTest(unittest.TestCase):
         self.assertEqual(kinds, ["db_stats_masked"])
         self.assertNotIn("db_no_standby", kinds)
         self.assertNotIn("db_sync_lost", kinds)
+
+    def test_un_abonne_logique_masque_ne_crie_pas_au_masque(self):
+        # Le classement logique vient des slots, pas des colonnes masquées :
+        # un abonné logique n'est pas un secours et n'en cache aucun.
+        expected_cfg = cfg(db_min_standbys=1)
+        status = db_status.read(
+            expected_cfg, FakeDb(
+                local=self.unprivileged(),
+                standbys=[masked_standby("sub1", logical=True)]))
+        self.assertEqual(status["replication"]["masked"], 0)
+        self.assertEqual(status["replication"]["logical"], 1)
+        self.assertEqual([a["type"] for a in
+                          db_status.alerts_from_status(expected_cfg, status)],
+                         ["db_no_standby"])
 
 
 class AlertTest(unittest.TestCase):
@@ -418,6 +459,52 @@ class PatroniTest(unittest.TestCase):
         self.assertEqual(
             db_status.mask_url("http://127.0.0.1:8008?token=secret"),
             "http://127.0.0.1:8008")
+
+    def test_port_invalide_ne_livre_pas_l_url_brute(self):
+        for raw in ("http://user:secret@localhost:bad",
+                    "http://user:secret@127.0.0.1:70000"):
+            with self.subTest(raw=raw):
+                masked = db_status.mask_url(raw)
+                self.assertEqual(masked, "(invalid URL)")
+                self.assertNotIn("secret", masked)
+                self.assertNotIn("user", masked)
+
+    def test_ipv6_mal_formee_ne_livre_pas_l_url_brute(self):
+        masked = db_status.mask_url("http://user:secret@[::1")
+        self.assertEqual(masked, "(invalid URL)")
+        self.assertNotIn("secret", masked)
+
+    def test_ipv6_valide_garde_les_crochets(self):
+        self.assertEqual(
+            db_status.mask_url("http://user:secret@[::1]:8008/"),
+            "http://[::1]:8008/")
+
+    def test_une_erreur_reseau_ne_recopie_pas_l_url(self):
+        raw = "http://user:secret@127.0.0.1:8008"
+
+        def reader(url, path):
+            raise OSError("connection to %s refused" % url)
+
+        view = db_status.patroni(cfg(patroni_url=raw), reader=reader)
+        self.assertNotIn("secret", json.dumps(view))
+        self.assertIn("http://127.0.0.1:8008", view["errors"]["local"])
+
+    def test_une_erreur_sans_schema_ne_recopie_pas_le_mot_de_passe(self):
+        def reader(url, path):
+            raise OSError("auth user:secret@host refused")
+
+        view = db_status.patroni(
+            cfg(patroni_url="http://127.0.0.1:8008"), reader=reader)
+        self.assertNotIn("secret", json.dumps(view))
+        self.assertIn("[redacted]@host", view["errors"]["local"])
+
+    def test_une_url_illisible_dans_le_json_ne_livre_rien(self):
+        raw = "http://user:secret@localhost:bad"
+        view = db_status.patroni(
+            cfg(patroni_url=raw),
+            reader=patroni_reader(local=OSError("refused")))
+        self.assertEqual(view["url"], "(invalid URL)")
+        self.assertNotIn("secret", json.dumps(view))
 
 
 class RegistrationTest(unittest.TestCase):
