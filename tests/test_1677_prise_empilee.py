@@ -31,6 +31,7 @@ class _Prise(_Base):
         # #2864 : les auteurs lus par la désignation du dernier gel, tels que
         # la marque `review-designation` les garde (par lot).
         self.marques: dict = {}
+        self._head_counter = 0
 
     def lot(self, title, *, app="nexlink", age_s=HEURE, **kw):
         item = work.add(self.db, title=title, app=app, **kw)
@@ -59,8 +60,15 @@ class _Prise(_Base):
         kw.setdefault("orchestras", ["orchestrateur"])
         return super().take(**kw)
 
-    def amont(self, verdict=None, *, sha=SHA, branch="lot/amont"):
+    def tete_propre(self):
+        """Chaque lot indépendant possède sa tête ; aucun paquet n'est simulé."""
+        sha = f"{int(SHA, 16) + self._head_counter:040x}"
+        self._head_counter += 1
+        return sha
+
+    def amont(self, verdict=None, *, sha=None, branch="lot/amont"):
         """Le bloqueur du 15/10 : un lot en `qa` (gelé, éventuellement jugé)."""
+        sha = sha if sha is not None else self.tete_propre()
         item = self.lot("amont", assignee="human:proprio")
         self.db.execute("UPDATE work_items SET state = 'qa', branch = %s"
                         " WHERE id = %s", (branch, item["id"]))
@@ -197,8 +205,9 @@ class PropositionTest(_Prise):
     def auteur(self, name="auteur", harness="claude", team="nexlink"):
         self.agent(name, harness=harness, team=team)
 
-    def qa(self, title, *, verdict=None, author="auteur", branch="lot/qa", sha=SHA,
+    def qa(self, title, *, verdict=None, author="auteur", branch="lot/qa", sha=None,
            app="nexlink", author_family="claude"):
+        sha = sha if sha is not None else self.tete_propre()
         item = self.lot(title, assignee=author, app=app)
         self.db.execute("UPDATE work_items SET state = 'qa', branch = %s"
                         " WHERE id = %s", (branch, item["id"]))

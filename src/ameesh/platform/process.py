@@ -661,17 +661,19 @@ def command_argv(pid: int) -> list[str]:
         return []
 
 
-def become_subreaper() -> bool:
+def become_subreaper(on: bool = True) -> bool:
     """Ce processus adopte ses descendants orphelins (Linux,
     `PR_SET_CHILD_SUBREAPER`) au lieu de les laisser à systemd ou à init :
-    il peut alors lire leur code de sortie. Faux si l'OS ne le permet pas."""
+    il peut alors lire leur code de sortie. Faux si l'OS ne le permet pas.
+    `on=False` rend les prochains orphelins à init (#6854 : un processus qui
+    ne les moissonne pas ne doit pas rester sous-moissonneur)."""
     from . import is_linux
     if not is_linux():
         return False
     try:
         import ctypes
         libc = ctypes.CDLL(None, use_errno=True)
-        return int(libc.prctl(36, 1, 0, 0, 0)) == 0  # 36 = PR_SET_CHILD_SUBREAPER
+        return int(libc.prctl(36, int(bool(on)), 0, 0, 0)) == 0  # 36 = PR_SET_CHILD_SUBREAPER
     except (OSError, AttributeError, ValueError):
         return False
 

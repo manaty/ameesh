@@ -38,6 +38,7 @@ class BackgroundSignalTest(unittest.TestCase):
         self.runner = SimpleNamespace(db=None, host="test", runner_id="test",
                                       container_runtime=lambda: None)
         self.tracker = background.Tracker(self.runner, log=self.notes.append)
+        support.adopt_orphans(self, self.tracker)
         self.entry = background.Entry(agent="test", turn_id="expiry-test", pgid=7000,
                                       ended=0, deadline=1, grace_s=1, lineage={7001},
                                       containers=[{"id": "remaining-container"}])
@@ -358,7 +359,7 @@ class BackgroundSignalTest(unittest.TestCase):
     @unittest.skipUnless(platform.is_linux() and hasattr(os, "pidfd_open")
                          and hasattr(signal, "pidfd_send_signal"), "Linux pidfds")
     def test_detached_double_fork_with_new_session_preserves_uncertainty(self):
-        self.assertTrue(platform.become_subreaper())
+        self.assertTrue(self.tracker.subreaper)
         self._detached_fork_on_term(double=True)
 
     def _wait_pid(self, pidfile: str, timeout: float = 10.0):

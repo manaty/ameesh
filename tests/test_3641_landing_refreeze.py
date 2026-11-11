@@ -70,6 +70,8 @@ class LandingRefreezeTest(PgTestCase):
         self.vehicle = work.add(self.db, title="vehicule", app="ameesh",
                                 actor="human:op")
         self.unit = work.add(self.db, title="unite", app="ameesh", actor="human:op")
+        # #6834 : le partage de tête est prouvé avant le premier gel.
+        self.record_member(self.old, self.old)
         work.milestone(self.db, int(self.vehicle["id"]), "frozen", sha=self.old,
                        repo=str(self.repo), actor="mty-amh-impl-07")
         work.milestone(self.db, int(self.unit["id"]), "frozen", sha=self.old,

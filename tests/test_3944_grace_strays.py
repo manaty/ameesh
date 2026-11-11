@@ -21,6 +21,7 @@ class GraceStraysTest(unittest.TestCase):
         runner = SimpleNamespace(db=None, host="h", harness_pids=set(),
                                  launch_lock=threading.Lock(), container_runtime=lambda: None)
         tracker = background.Tracker(runner, log=lambda _: None)
+        support.adopt_orphans(self, tracker)
         self.assertTrue(tracker.subreaper)
         lire, ecrire = os.pipe()
         # Le parent intermédiaire meurt : son enfant est réellement adopté

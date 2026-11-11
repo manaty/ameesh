@@ -1322,3 +1322,28 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
                 " WHERE name = (SELECT ameesh_resolve_agent_name(%s, %s))",
                 (name, "tests.support.register"))
         return proc
+
+
+def adopt_orphans(test: unittest.TestCase, tracker) -> None:
+    """#6854 : `tracker` adopte les orphelins comme sous le fil `fond`
+    (`start_monitor`) ; au nettoyage du test, le processus de tests cesse
+    d'être sous-moissonneur et moissonne les zombies adoptés qu'aucun `Popen`
+    vivant n'attend. Sans ce retour, `scripts/test-parts.py` accumulait les
+    zombies des modules suivants (471 sous runner-ameesh-cx3 le 11/11)."""
+    from ameesh import platform
+    tracker.subreaper = platform.become_subreaper()
+    test.addCleanup(release_orphans)
+
+
+def release_orphans() -> None:
+    from ameesh import background, platform
+    platform.become_subreaper(False)
+    try:
+        rows = platform.children()
+    except platform.NotAvailable:
+        return
+    with background._own_lock:
+        owned = background._owned_children()
+        for row in rows:
+            if row["zombie"] and row["pid"] not in owned:
+                platform.reap(row["pid"])

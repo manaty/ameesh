@@ -22,7 +22,6 @@ from ameesh.storage.postgres import work_dependencies as pg_deps
 
 from .support import PgTestCase
 
-SHA = "c" * 40
 NEW_SHA = "d" * 40
 
 
@@ -55,14 +54,19 @@ class FixOwedTest(PgTestCase):
         work.assign(self.db, lot, "dev1", actor="pilote")
         work.move(self.db, lot, "build")
         work.move(self.db, lot, "qa")
-        work.milestone(self.db, lot, "frozen", sha=SHA, actor="dev1")
+        work.milestone(self.db, lot, "frozen", sha=self.sha(lot), actor="dev1")
         self.db.execute("UPDATE work_items SET reviewers ="
                         " coalesce(string_to_array(nullif(%s, ''), ','), '{}')"
                         " WHERE id = %s", (",".join(reviewers), lot))
         return lot
 
-    def verdict(self, lot, actor, kind, sha=SHA):
-        work.milestone(self.db, lot, "verdict", verdict=kind, sha=sha, actor=actor)
+    def sha(self, lot):
+        # Independent lots must not impersonate the same frozen content.
+        return "%012x" % int(lot) + "c" * 28
+
+    def verdict(self, lot, actor, kind, sha=None):
+        work.milestone(self.db, lot, "verdict", verdict=kind,
+                       sha=self.sha(lot) if sha is None else sha, actor=actor)
 
     def listing_row(self):
         return next(r for r in storage.of(self.db).operations.listing()
@@ -137,7 +141,7 @@ class FixOwedTest(PgTestCase):
         cases.append(lot)
         # B en sha abrégé → dû
         lot = self.qa_lot(["rev-a"])
-        self.verdict(lot, "rev-a", "blocked", sha=SHA[:12])
+        self.verdict(lot, "rev-a", "blocked", sha=self.sha(lot)[:12])
         cases.append(lot)
         sql, ref = self.sql_owed(), self.ref_owed()
         for lot in cases:

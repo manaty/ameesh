@@ -291,7 +291,10 @@ class Tracker:
         self.lock = threading.Lock()
         self.entries: list[Entry] = []
         #: l'exécuteur adopte-t-il les orphelins de ses tours (codes de sortie) ?
-        self.subreaper = platform.become_subreaper()
+        #: #6854 : seulement avec le fil `fond` (`start_monitor`), qui les
+        #: moissonne ; construit sans lui (mode `once`, tests), le processus
+        #: deviendrait sous-moissonneur sans jamais moissonner : zombies.
+        self.subreaper = False
         #: #1749 : de quoi reconnaître nos `Popen` d'un orphelin adopté
         _watch_own_children()
         self._strays_at = 0.0
