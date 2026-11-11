@@ -41,13 +41,14 @@ def _charger():
 
 parts = _charger()
 
-#: doublure `psql` : enregistre chaque appel ; refuse la création demandée
+#: doublure `psql` : enregistre chaque appel ; refuse celui qui contient
+#: `PSQL_REFUSE`
 PSQL_STUB = """#!{python}
 import json, os, sys
 with open(os.environ["PSQL_CALLS"], "a") as out:
     out.write(json.dumps(sys.argv[1:]) + "\\n")
 refus = os.environ.get("PSQL_REFUSE")
-sys.exit(1 if refus and refus in sys.argv[-1] else 0)
+sys.exit(1 if refus and refus in " ".join(sys.argv[1:]) else 0)
 """
 
 CLE = "hashtextextended('vm-adapter:burst', 0)"
@@ -82,9 +83,10 @@ class BasesDoubleesTest(unittest.TestCase):
             self.assertTrue(all(b.startswith("ameesh_p3_") for b in bases), bases)
             self.assertTrue(all(d.startswith("postgresql://ameesh@127.0.0.1:5432/")
                                 for d in dsns), dsns)
-            self.assertEqual(self._sql(), [f'CREATE DATABASE "{b}"' for b in bases])
+            self.assertEqual(self._sql(), [s for b in bases
+                                           for s in (f'CREATE DATABASE "{b}"', "SELECT 1")])
             parts.supprimer_bases(admin, dsns)
-        self.assertEqual(self._sql()[2:],
+        self.assertEqual(self._sql()[4:],
                          [f'DROP DATABASE IF EXISTS "{b}" WITH (FORCE)' for b in bases])
 
     def test_une_creation_refusee_garde_la_base_partagee(self):
@@ -92,10 +94,24 @@ class BasesDoubleesTest(unittest.TestCase):
             _admin, dsns = parts.bases_par_processus(1, 2)
         self.assertEqual(dsns, [])
         sql = self._sql()
-        self.assertEqual(len(sql), 3, sql)
+        self.assertEqual(len(sql), 4, sql)
         self.assertTrue(sql[0].startswith("CREATE DATABASE"), sql)
         premiere = sql[0].split('"')[1]
-        self.assertEqual(sql[2], f'DROP DATABASE IF EXISTS "{premiere}" WITH (FORCE)')
+        self.assertEqual(sql[3], f'DROP DATABASE IF EXISTS "{premiere}" WITH (FORCE)')
+
+    def test_une_base_injoignable_garde_la_base_partagee(self):
+        """B de mty-amh-impl-11 : CREATE DATABASE réussit par le DSN
+        d'administration, mais le profil (.pgpass limité à cette base,
+        #2170) refuse la base fille ; aucun processus n'y est envoyé."""
+        with mock.patch.dict(os.environ, dict(self.env, PSQL_REFUSE="SELECT 1")):
+            _admin, dsns = parts.bases_par_processus(1, 2)
+        self.assertEqual(dsns, [])
+        sql = self._sql()
+        premiere = sql[0].split('"')[1]
+        self.assertEqual(sql, [f'CREATE DATABASE "{premiere}"', "SELECT 1",
+                               f'DROP DATABASE IF EXISTS "{premiere}" WITH (FORCE)'])
+        appels = [json.loads(l) for l in self.appels.read_text().splitlines()]
+        self.assertIn(f"/{premiere}", appels[1][appels[1].index("--dbname") + 1])
 
     def test_sans_dsn_explicite_rien_n_est_cree(self):
         env = dict(self.env)
@@ -116,10 +132,8 @@ class DeuxProcessusTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AMEESH_TEST_DSN": support.TEST_DSN}):
             self.admin, self.dsns = parts.bases_par_processus(99, 2)
         if not self.dsns:
-            self.skipTest("CREATE DATABASE refusé sur le banc")
+            self.skipTest("bases jetables refusées ou injoignables sur le banc")
         self.addCleanup(parts.supprimer_bases, self.admin, self.dsns)
-        if not self._try(self.dsns[1]).startswith(("t", "f")):
-            self.skipTest("base jetable injoignable (profil de connexion)")
 
     def _try(self, dsn: str) -> str:
         proc = subprocess.run(

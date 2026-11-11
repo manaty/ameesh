@@ -44,7 +44,9 @@ se refusaient le verrou (« worker busy » de test_6074, run 42932684029). Le
 parent crée donc une base jetable par processus sur le serveur du DSN
 explicite (`AMEESH_TEST_DSN`, comme scripts/test.sh pour le banc local,
 #1992) et la supprime à la sortie ; une création refusée (droit, `psql`
-absent) garde la base partagée, signalée sur la sortie d'erreur.
+absent) ou une base créée mais injoignable (profil de connexion limité à la
+base d'administration, #2170) garde la base partagée, signalée sur la sortie
+d'erreur.
 
 `--list` restreint la suite aux modules d'un fichier (un nom par ligne, `#`
 pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR de lot (le
@@ -876,8 +878,8 @@ def bases_par_processus(part: int, n: int) -> tuple[str, list[str]]:
 
     Rend le DSN d'administration et les DSN des bases créées ; une liste
     vide quand il n'y a pas de DSN explicite ou qu'une création échoue (les
-    bases déjà créées sont alors supprimées) : les processus restent sur la
-    base partagée, comme avant."""
+    bases déjà créées sont alors supprimées), ou qu'une base créée refuse la
+    connexion : les processus restent sur la base partagée, comme avant."""
     admin = os.environ.get("AMEESH_TEST_DSN") or os.environ.get("AGENT_MESH_TEST_DSN") or ""
     if not admin:
         return admin, []
@@ -887,12 +889,16 @@ def bases_par_processus(part: int, n: int) -> tuple[str, list[str]]:
     for i in range(1, n + 1):
         base = f"{nom}_p{part}_{i}_{os.getpid()}"
         dsn = _base_dsn(admin, base)
-        if dsn is None or not _psql_admin(admin, f'CREATE DATABASE "{base}"'):
+        cree = dsn is not None and _psql_admin(admin, f'CREATE DATABASE "{base}"')
+        if cree:
+            dsns.append(dsn)
+        # une base créée mais injoignable (profil de connexion limité à la
+        # base d'administration, #2170) ferait échouer chaque test du processus
+        if not cree or not _psql_admin(dsn, "SELECT 1"):
             print("#6803 : base partagée par les processus de la part "
                   "(verrous consultatifs communs)", file=sys.stderr, flush=True)
             supprimer_bases(admin, dsns)
             return admin, []
-        dsns.append(dsn)
     return admin, dsns
 
 
