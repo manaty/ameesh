@@ -78,6 +78,10 @@ TRAVAIL=$(mktemp -d -- "$PARENT/.patroni-tls.XXXXXX")
 MATERIEL="$TRAVAIL/materiel"
 LISTE="$TRAVAIL/noeuds"
 mkdir -m 0700 -- "$MATERIEL"
+# GNU chmod 0700 ne retire pas un setgid hérité du parent ; sans ce mode exact,
+# le dossier des secrets reste 2700 sur un parent setgid (guest de
+# prévalidation sous /srv, constat #6925).
+chmod =700 -- "$MATERIEL"
 nettoyer() { rm -rf -- "$TRAVAIL"; }
 trap nettoyer EXIT
 
@@ -176,7 +180,7 @@ if [[ -d $SORTIE ]]; then
   fi
 fi
 mv -- "$MATERIEL" "$SORTIE"
-chmod 0700 "$SORTIE"
+chmod =700 "$SORTIE"
 
 log "matériel TLS écrit dans $SORTIE (clés 0600, secrets 0600)"
 while IFS=$'\t' read -r nom adresse; do

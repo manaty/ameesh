@@ -407,6 +407,25 @@ class TlsTest(unittest.TestCase):
                       "sh", str(self.sortie)])
         self.assertEqual(verif.returncode, 0, verif.stderr)
 
+    def test_permissions_avec_parent_setgid(self):
+        """Un parent setgid ne doit pas laisser 2700 : GNU chmod 0700 préserve
+        le setgid hérité, le dossier des secrets doit rester exactement 0700
+        (constat #6925 sur le guest de prévalidation)."""
+        parent = self.tmp / "parent-setgid"
+        parent.mkdir()
+        try:
+            parent.chmod(0o2775)
+        except OSError:
+            self.skipTest("setgid non supporté")
+        if stat.S_IMODE(parent.stat().st_mode) != 0o2775:
+            self.skipTest("setgid non supporté")
+        sortie = parent / "tls"
+        resultat = _run(["bash", str(TLS), "--topologie", str(self.topologie_fichier),
+                         "--sortie", str(sortie)])
+        self.assertEqual(resultat.returncode, 0, resultat.stderr)
+        self.assertEqual(stat.S_IMODE(sortie.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((sortie / "ca.key").stat().st_mode), 0o600)
+
     def test_certificats_signes_et_usages(self):
         self.assertEqual(self.generer().returncode, 0)
         for noeud in self._topologie["noeuds"]:
