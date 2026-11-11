@@ -46,7 +46,7 @@ import time
 from collections import deque
 from decimal import Decimal
 from typing import Any, Iterable, Sequence, Union
-from urllib.parse import unquote, urlsplit
+
 
 from . import admission_lock
 from . import dsn as dsn_mod
@@ -397,22 +397,27 @@ def dsn_has_options(dsn: str) -> bool:
     return bool(re.search(r"(?:^|\s)options\s*=", dsn))
 
 
-def is_remote(cfg: Config) -> bool:
-    """La base est-elle hors de cette machine (ni socket Unix, ni boucle locale) ?"""
-    dsn = cfg.dsn or ""
-    host = ""
-    if "://" in dsn:
-        parts = urlsplit(dsn)
-        host = parts.hostname or ""
-        query = dict(kv.split("=", 1) for kv in parts.query.split("&") if "=" in kv)
-        host = unquote(query.get("host", "")) or host
-    else:
-        match = re.search(r"(?:^|\s)host\s*=\s*(\S+)", dsn)
-        host = match.group(1).strip("'\"") if match else ""
-    host = host or os.environ.get("PGHOST", "")
+def _remote_host(host: str) -> bool:
+    host = (host or "").strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
     if not host or host.startswith("/") or host.startswith("@"):
         return False
     return host not in ("localhost", "127.0.0.1", "::1") and not host.startswith("127.")
+
+
+def is_remote(cfg: Config) -> bool:
+    """La base est-elle hors de cette machine (ni socket Unix, ni boucle locale) ?
+
+    #6869 : un DSN multi-hôtes est distant dès qu'UN de ses hôtes l'est ; le
+    premier hôte ne décide plus pour les autres."""
+    try:
+        hosts = dsn_mod.hosts(cfg.dsn or "")
+    except dsn_mod.DsnError:
+        hosts = []
+    if not hosts:
+        hosts = os.environ.get("PGHOST", "").split(",")
+    return any(_remote_host(host) for host in hosts)
 
 
 # --------------------------------------------------------------------------
@@ -627,6 +632,8 @@ class PsqlDriver:
     """Pilote par sous-processus `psql` (aucune dépendance Python)."""
 
     name = "psql"
+    #: ce pilote sait écouter ; un échec d'abonnement est donc passager
+    supports_listen = True
 
     def __init__(self, cfg: Config):
         binary = shutil.which("psql")
@@ -634,6 +641,9 @@ class PsqlDriver:
             raise Unavailable("psql not found in PATH")
         self.binary = binary
         self.cfg = cfg
+        #: #6869 : le DSN réellement remis à libpq ; un DSN multi-hôtes vise
+        #: le primaire. Direct `Config(...)` constructions get it too.
+        self.dsn = dsn_mod.primary(cfg.dsn)
         #: délai client : si le serveur ne répond plus (réseau coupé, requête
         #: qui pend), on ne bloque pas le battement de bail indéfiniment.
         self._client_timeout: float | None = (
@@ -641,7 +651,7 @@ class PsqlDriver:
             if cfg.statement_timeout_ms and cfg.statement_timeout_ms > 0 else None
         )
         try:
-            self.password, base = split_password(cfg.dsn)
+            self.password, base = split_password(self.dsn)
         except dsn_mod.DsnError as exc:   # #518: libpq would refuse it too
             raise Unavailable("psql: invalid DSN: %s" % exc) from None
         # #5652 : un DSN partagé peut porter une option que ce libpq-ci ne
@@ -853,6 +863,8 @@ class _PsqlTransaction:
     """
 
     name = "psql"
+    #: une transaction n'ouvre pas d'écouteur : le runner sonde alors
+    supports_listen = False
 
     def __init__(self, driver: PsqlDriver):
         self.driver = driver
@@ -1178,6 +1190,8 @@ class PsycopgDriver:
     """
 
     name = "psycopg"
+    #: ce pilote sait écouter ; un échec d'abonnement est donc passager
+    supports_listen = True
 
     def __init__(self, cfg: Config):
         try:
@@ -1188,6 +1202,9 @@ class PsycopgDriver:
         self._psycopg = psycopg
         self._dict_row = dict_row
         self.cfg = cfg
+        #: #6869 : le DSN réellement remis à libpq ; un DSN multi-hôtes vise
+        #: le primaire. Direct `Config(...)` constructions get it too.
+        self.dsn = dsn_mod.primary(cfg.dsn)
         #: #5986 : nom de session figé à la construction, dans le bloc
         #: `application` de l'appelant ; une reconnexion (L72) le reprend
         self._application_name = application_name()
@@ -1216,7 +1233,7 @@ class PsycopgDriver:
                             connect_timeout=max(1, int(self.cfg.connect_timeout)),
                             row_factory=self._dict_row)
         try:
-            existing = self._psycopg.conninfo.conninfo_to_dict(self.cfg.dsn).get("options")
+            existing = self._psycopg.conninfo.conninfo_to_dict(self.dsn).get("options")
         except Exception:
             existing = None
         if existing is None:
@@ -1229,7 +1246,7 @@ class PsycopgDriver:
         kwargs["fallback_application_name"] = self._application_name
         TRACE.connect()
         try:
-            return self._psycopg.connect(self.cfg.dsn, **kwargs)
+            return self._psycopg.connect(self.dsn, **kwargs)
         except Exception as exc:  # psycopg.OperationalError et cie
             raise Unavailable("psycopg: %s" % _one_line(exc)) from exc
 

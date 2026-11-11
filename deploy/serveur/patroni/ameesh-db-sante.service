@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Contrôle de santé local de la grappe etcd + Patroni (EP8.4b, lot #6870).
+# Le service écrit un JSON dans le journal et, s'il y a des alertes,
+# /run/ameesh-db/alertes.json pour le chemin de notification (EP8.5).
+# Une observation ratée n'échoue pas le service : elle produit une alerte
+# db_no_primary / db_etcd_no_quorum, pas un statut systemd en échec.
+[Unit]
+Description=Contrôle de santé de la grappe PostgreSQL ameesh (patroni/etcd)
+Documentation=file:///opt/ameesh/src/deploy/serveur/patroni/README.md
+After=patroni.service
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+EnvironmentFile=/etc/ameesh/patroni.env
+StateDirectory=ameesh-db
+StateDirectoryMode=0700
+RuntimeDirectory=ameesh-db
+RuntimeDirectoryMode=0750
+# Type=oneshot : sans cette option systemd supprime /run/ameesh-db à la fin
+# de la sonde, et alertes.json ne survit pas jusqu'à la notification EP8.5.
+# Vérifié sur le cycle réel d'une unité utilisateur (systemd 255).
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/sbin/ameesh-db-sante --json --alerte-fichier /run/ameesh-db/alertes.json
+TimeoutStartSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true

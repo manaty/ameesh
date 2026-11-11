@@ -25,6 +25,7 @@ Postgres n'est jamais exposé sur Internet.
 | `ameesh-runner@.service` | un exécuteur par persona, service système sous `ameesh` |
 | `ameesh-sauvegarde.{service,timer}`, `sauvegarder-base.sh` | `pg_dump` quotidien (répertoire 0700, dumps 0600), rétention locale par catalogue privé et protection rollback, copie hors de la VM si configurée ; les sauvegardes non inscrites sont conservées. `ameesh alerts` vérifie que la base a bien été lue dans la fenêtre (`mesh_backup_unseen`, PostgreSQL 16 et suivants) : accorder `mesh_backup_window` à `OnCalendar` si le minuteur change |
 | `ajouter-appareil.sh` | déclare un appareil dans WireGuard et affiche sa configuration |
+| `terraform/reseau-prive/`, `reseau-prive.sh`, `RESEAU-PRIVE.md` | EP8.2 : réseau privé Scaleway des nœuds de base (cartes, adresses fixes, Postgres et `pg_hba` sur le sous-réseau, essai hub arrêté, chemin du poste) |
 
 ## Mise en place (actes de l'opérateur)
 

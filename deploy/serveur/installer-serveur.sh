@@ -181,6 +181,24 @@ install -m 0644 "$SRC/deploy/serveur/ameesh-sauvegarde.service" "$SRC/deploy/ser
 systemctl daemon-reload
 systemctl enable --now ameesh-sauvegarde.timer
 
+# --- archivage WAL et restauration à un instant (EP8.1, #6858) -----------------
+# Outils et unités seulement : l'activation (archive_mode, redémarrage court)
+# est un geste du pilote ou du bureau, `ameesh-pgbackrest activer --redemarrer`
+# dans la fenêtre planifiée ; voir deploy/serveur/pgbackrest/README.md.
+log "pgBackRest (archivage WAL hors hôte, activé à part)"
+dpkg -s pgbackrest >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pgbackrest >/dev/null
+install -m 0755 "$SRC/deploy/serveur/pgbackrest/pgbackrest-ameesh.sh" /usr/local/sbin/ameesh-pgbackrest
+install -m 0644 "$SRC/deploy/serveur/pgbackrest/ameesh-pgbackrest@.service" \
+  "$SRC/deploy/serveur/pgbackrest/ameesh-pgbackrest-full.timer" \
+  "$SRC/deploy/serveur/pgbackrest/ameesh-pgbackrest-diff.timer" /etc/systemd/system/
+systemctl daemon-reload
+# rejouable : la configuration suit le fichier d'environnement ; les
+# minuteries restent en marche seulement si l'archivage est déjà activé.
+[[ -r /etc/ameesh/pgbackrest.env ]] && /usr/local/sbin/ameesh-pgbackrest configurer
+if [[ -f $PG_CONF/conf.d/ameesh-archivage.conf ]]; then
+  systemctl enable --now ameesh-pgbackrest-full.timer ameesh-pgbackrest-diff.timer
+fi
+
 # --- relevé de l'hôte (#5559) ----------------------------------------------------
 log "relevé de l'hôte toutes les 5 minutes (disque de la base)"
 install -m 0644 "$SRC/deploy/serveur/ameesh-releve-hote.service" "$SRC/deploy/serveur/ameesh-releve-hote.timer" \

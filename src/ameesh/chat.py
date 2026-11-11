@@ -784,8 +784,15 @@ class TerminalClient:
         from . import db as db_mod
         self._start_input()
         listener = self._open_listener()
+        listening_supported = getattr(self.db, "supports_listen", False)
+        ever_listened = listener is not None
+        listen_failures = 0
+        listen_retry_at = 0.0
         if listener is None:
-            self.view.line("  (no LISTEN on this driver: polling every %gs)" % self.poll)
+            if listening_supported:
+                self.view.line("  … live connection unavailable; polling and retrying")
+            else:
+                self.view.line("  (no LISTEN on this driver: polling every %gs)" % self.poll)
         while True:
             for line in self._drain():
                 if not self.handle(line):
@@ -799,14 +806,35 @@ class TerminalClient:
                     return 0
             wakeup = None
             if listener is None:
-                self.sleep(self.poll)
+                # #6869 : une coupure ne condamne plus le client au sondage
+                # pour de bon. Il réessaie l'abonnement avec une attente
+                # bornée (2, 4, … 60 s), et `read_new` rattrape de toute
+                # façon l'historique entre deux essais.
+                now = time.monotonic()
+                if listening_supported and now >= listen_retry_at:
+                    listener = self._open_listener()
+                    if listener is not None:
+                        listen_failures = 0
+                        listen_retry_at = 0.0
+                        if ever_listened:
+                            self.view.line("  … live connection restored")
+                        ever_listened = True
+                    else:
+                        listen_failures += 1
+                        listen_retry_at = now + min(
+                            60.0, 2.0 ** min(listen_failures, 6))
+                if listener is None:
+                    self.sleep(self.poll)
             else:
                 item = listener.wait(timeout=self.poll)
                 if item is not None and item.get("event") == "down":
-                    self.view.line("  … live connection lost (%s); falling back to polling"
+                    self.view.line("  … live connection lost (%s); polling while reconnecting"
                                    % (item.get("error") or "?"))
                     listener.close()
                     listener = None
+                    listen_failures += 1
+                    listen_retry_at = time.monotonic() + min(
+                        60.0, 2.0 ** min(listen_failures, 6))
                 elif item is not None:
                     wakeup = item
             try:

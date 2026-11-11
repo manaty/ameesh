@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=ameesh — sauvegarde pgBackRest différentielle quotidienne
+
+[Timer]
+Unit=ameesh-pgbackrest@diff.service
+OnCalendar=Mon..Sat *-*-* 02:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
