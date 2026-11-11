@@ -134,6 +134,7 @@ class PassTest(_SloBase):
         alerts, seen = self.alert_with({"pr": 9, "branch": "integration/paquet-9-x",
                                         "head": "c" * 40})
         self.assertTrue(seen.called)
+        self.assertIs(seen.call_args.kwargs["db"], self.db)
         self.assertEqual(alerts, [])
 
     def test_unreadable_forge_keeps_alert_and_names_it(self):
