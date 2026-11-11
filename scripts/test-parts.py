@@ -36,6 +36,16 @@ elles existent. Les tests d'une classe partagent déjà un schéma unique par
 classe dans `PgTestCase` : deux processus de la même base ne se voient pas.
 La mesure (`--measure`) reste série : ses couvertures ne se fusionnent pas.
 
+#6803 — **une base par processus** : un schéma ne cloisonne ni les verrous
+consultatifs (`pg_try_advisory_xact_lock(hashtextextended('vm-adapter:burst',
+0))`, verrou de migration, verrou gabarit : leur clé vaut pour toute la base)
+ni les NOTIFY. Deux processus d'une part qui prenaient la même clé constante
+se refusaient le verrou (« worker busy » de test_6074, run 42932684029). Le
+parent crée donc une base jetable par processus sur le serveur du DSN
+explicite (`AMEESH_TEST_DSN`, comme scripts/test.sh pour le banc local,
+#1992) et la supprime à la sortie ; une création refusée (droit, `psql`
+absent) garde la base partagée, signalée sur la sortie d'erreur.
+
 `--list` restreint la suite aux modules d'un fichier (un nom par ligne, `#`
 pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR de lot (le
 plan de repli le demande par `pilot_list` ; une PR de release garde la suite
@@ -120,6 +130,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 TESTS = REPO / "tests"
@@ -838,6 +849,59 @@ def host_cap() -> int | None:
     return max(1, host_cpus() // jobs)
 
 
+def _base_dsn(dsn: str, base: str) -> str | None:
+    """Le DSN URL `dsn` pointé sur la base `base` (`None` hors forme URL)."""
+    morceaux = urllib.parse.urlsplit(dsn)
+    if morceaux.scheme not in ("postgres", "postgresql"):
+        return None
+    return urllib.parse.urlunsplit(morceaux._replace(path="/" + base))
+
+
+def _psql_admin(dsn: str, sql: str) -> bool:
+    try:
+        proc = subprocess.run(
+            ["psql", "-w", "--dbname", dsn, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
+            capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"#6803 : psql indisponible ({exc})", file=sys.stderr, flush=True)
+        return False
+    if proc.returncode != 0:
+        print(f"#6803 : {sql} refusé : {proc.stderr.strip()[-500:]}",
+              file=sys.stderr, flush=True)
+    return proc.returncode == 0
+
+
+def bases_par_processus(part: int, n: int) -> tuple[str, list[str]]:
+    """#6803 — `n` bases jetables, une par processus de la part.
+
+    Rend le DSN d'administration et les DSN des bases créées ; une liste
+    vide quand il n'y a pas de DSN explicite ou qu'une création échoue (les
+    bases déjà créées sont alors supprimées) : les processus restent sur la
+    base partagée, comme avant."""
+    admin = os.environ.get("AMEESH_TEST_DSN") or os.environ.get("AGENT_MESH_TEST_DSN") or ""
+    if not admin:
+        return admin, []
+    nom = urllib.parse.urlsplit(admin).path.lstrip("/") or "ameesh"
+    nom = re.sub(r"[^a-z0-9_]", "_", nom.lower())[:24]
+    dsns: list[str] = []
+    for i in range(1, n + 1):
+        base = f"{nom}_p{part}_{i}_{os.getpid()}"
+        dsn = _base_dsn(admin, base)
+        if dsn is None or not _psql_admin(admin, f'CREATE DATABASE "{base}"'):
+            print("#6803 : base partagée par les processus de la part "
+                  "(verrous consultatifs communs)", file=sys.stderr, flush=True)
+            supprimer_bases(admin, dsns)
+            return admin, []
+        dsns.append(dsn)
+    return admin, dsns
+
+
+def supprimer_bases(admin: str, dsns: list[str]) -> None:
+    for dsn in dsns:
+        base = urllib.parse.urlsplit(dsn).path.lstrip("/")
+        _psql_admin(admin, f'DROP DATABASE IF EXISTS "{base}" WITH (FORCE)')
+
+
 def _charge_systeme() -> str:
     """#3945 : la charge moyenne sur 1 min de l'hôte, pour mesurer sa saturation."""
     try:
@@ -980,6 +1044,7 @@ def run_parallel(args) -> int | None:
     fini = threading.Event()
     procs: list[subprocess.Popen] = []
     fils: list[threading.Thread] = []
+    admin, bases = bases_par_processus(args.part, len(shards))
     debut = time.monotonic()
     charge_systeme_debut = _charge_systeme()
 
@@ -1022,6 +1087,8 @@ def run_parallel(args) -> int | None:
             env = dict(os.environ)
             env[PARALLEL_ENV] = "1"
             env["AMEESH_SCHEMA"] = "t_par_%d_%d_%d" % (args.part, i, os.getpid())
+            if bases:
+                env["AMEESH_TEST_DSN"] = env["AGENT_MESH_TEST_DSN"] = bases[i - 1]
             procs.append(subprocess.Popen(commande, cwd=REPO, env=env))
             if flow:
                 fil = threading.Thread(target=_suivre_flux,
@@ -1072,6 +1139,12 @@ def run_parallel(args) -> int | None:
                 proc.terminate()
         for fil in fils:
             fil.join(timeout=5)
+        for proc in procs:
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        supprimer_bases(admin, bases)
         for sig, ancien in anciens.items():
             signal.signal(sig, ancien)
         shutil.rmtree(tmp, ignore_errors=True)
