@@ -2692,6 +2692,12 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         print("connections: unavailable")
         verdict = 1
+    # #6871 (EP8.5a) : le doctor lit la même vue que `ameesh db status`
+    # (primaire, secours, retard, Patroni). Une lecture impossible est dite,
+    # sans changer le verdict : les alertes db_* sont la porte d'alerte.
+    from . import db_status
+    for line in db_status.doctor_lines(cfg, db):
+        print(line)
     if notify_test:
         channel = "ameesh_doctor"
         listener = storage.of(db).wakeups.subscribe([channel])
