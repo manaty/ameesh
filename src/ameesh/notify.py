@@ -3313,12 +3313,17 @@ class Notifier:
                 entry = sent[key]
                 if entry.get("type") == "staging_interrupted" and "staging.sequence" in unreadable:
                     continue
-                if entry.get("type") == "review_family_paused" and (
+                if entry.get("type") in ("review_family_paused",
+                                         "critical_budget_pause") and (
                         now < entry["resume_ts"] if entry.get("resume_ts") is not None
                         # #5424 N4 : sans échéance, l'épisode n'a pas de fin
                         # lisible ; l'entrée tombe 6 h après le brief, sinon
                         # une pause ultérieure (même clé) resterait muette.
                         else now - _last_brief_ts(entry) < alert_briefs.REMIND_AFTER_S):
+                    # #6824 : le statut d'un agent critique clignote
+                    # `blocked`/`idle` ; la passe peut donc ne pas voir la
+                    # pause. L'épisode (compte, fenêtre) est le même : garder
+                    # l'entrée jusqu'à l'échéance évite un brief par retour.
                     continue  # same budget episode, even if no lot waits for a pass
                 if entry.get("type") == "idle_capacity" and now - _last_brief_ts(entry) \
                         < alert_briefs.REMIND_AFTER_S:
@@ -3638,7 +3643,11 @@ class Notifier:
                              # `mail_undeliverable` reste un envoi unique à la
                              # levée (comportement L118) : une relance de 6 h
                              # n'ajouterait rien au courrier déjà en souffrance.
-                             "reminded": kind in ("mail_undeliverable", "review_family_paused"),
+                             # #6824 : une pause critique est un épisode continu
+                             # (compte, fenêtre) ; sa durée est couverte par
+                             # `budget_pause_long`, pas par un second brief.
+                             "reminded": kind in ("mail_undeliverable", "review_family_paused",
+                                                  "critical_budget_pause"),
                              "resume_ts": alert.get("resume_ts"),
                              "to": sorted(set(delivered)),
                              # #3036 : les écartés, pour réévaluer la passe

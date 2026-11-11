@@ -419,6 +419,42 @@ class AlerteCritiqueTest(PgTestCase):
         self.assertEqual(sorted(briefs), ["auditeur", "orch"])
         self.assertIn("Critical agent paused on budget", briefs["auditeur"])
 
+    def test_la_meme_pause_critique_garde_une_seule_identite(self):
+        # #6824 : le statut clignote blocked/idle (tour réussi puis garde
+        # budget), chaque bascule réécrit status_reason_since ; l'épisode
+        # (compte, fenêtre) doit rester le même, et changer avec la fenêtre.
+        raison = ("pause (account secondaire, five_hour 76 %) "
+                  "until 04:30@1794371400; no claude account to place")
+        registre = "%s%s%s" % (budget.PAUSE_PREFIX, budget.CRITICAL_MARK, raison)
+        registry.set_status(self.db, "mesh-design", "blocked", status_text=registre)
+        self.db.execute(
+            "UPDATE agent_registry SET status_reason_since ="
+            " now() - make_interval(secs => 30) WHERE name = %s", ("mesh-design",))
+        [first] = [a for a in exploitation.alerts(self.cfg, self.db,
+                                                  orchestrators_declared=("orch",))
+                   if a["type"] == "critical_budget_pause"]
+        self.assertEqual(first["episode"], ("secondaire", "five_hour"))
+        self.assertEqual(first["resume_ts"], 1794371400.0)
+        registry.set_status(self.db, "mesh-design", "idle")
+        registry.set_status(self.db, "mesh-design", "blocked",
+                            status_text=registre.replace("76 %", "77 %"))
+        self.db.execute(
+            "UPDATE agent_registry SET status_reason_since ="
+            " now() - make_interval(secs => 10) WHERE name = %s", ("mesh-design",))
+        [second] = [a for a in exploitation.alerts(self.cfg, self.db,
+                                                   orchestrators_declared=("orch",))
+                    if a["type"] == "critical_budget_pause"]
+        self.assertNotEqual(first["since"], second["since"])
+        self.assertEqual(exploitation.alert_key(first),
+                         exploitation.alert_key(second))
+        registry.set_status(self.db, "mesh-design", "blocked",
+                            status_text=registre.replace("five_hour", "seven_day"))
+        [third] = [a for a in exploitation.alerts(self.cfg, self.db,
+                                                  orchestrators_declared=("orch",))
+                   if a["type"] == "critical_budget_pause"]
+        self.assertNotEqual(exploitation.alert_key(first),
+                            exploitation.alert_key(third))
+
     def test_la_pause_budget_ne_reprend_pas_la_date_d_un_autre_blocage(self):
         # #1521 : `blocked` sur auth depuis 3 h puis `blocked` sur budget
         # depuis 1 min : la pause budget est datée de 1 min, pas de 3 h ;

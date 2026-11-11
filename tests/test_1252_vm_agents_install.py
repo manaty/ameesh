@@ -27,8 +27,9 @@ from ameesh import platform
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / 'deploy/mise-a-jour/vm.sh'
-BAIL = ROOT / 'deploy/mise-a-jour/bail.sh'
+DEPLOY = ROOT / 'deploy/mise-a-jour'
+SCRIPT = DEPLOY / 'vm.sh'
+BAIL = DEPLOY / 'bail.sh'
 
 SSH = r'''#!/usr/bin/env python3
 import os, re, subprocess, sys
@@ -39,6 +40,14 @@ vmtmp = Path(os.environ['FAKE_VM_TMP'])
 live = '/home/ameesh'
 sentinel = '@@VMHOME@@'
 command = sys.argv[-1]
+# #6806 : la garde de staging est envoyee depuis le poste vers /root (hors du
+# home simule) puis posee en root. Le banc ne pose aucune garde d'hote : il
+# journalise le transport et simule un hote sans compte dedie (rc 3).
+if '/root/.cache/ameesh/garde-' in command:
+    with (state / 'ssh.log').open('a') as f:
+        f.write('garde-staging %s\n'
+                % ('installer' if ' installer ' in command else 'transport'))
+    sys.exit(3 if ' installer ' in command else 0)
 # Un chemin déjà traduit (rendu par un `mktemp` distant, relu par le script)
 # ne doit pas l'être deux fois : on le met de côté avant le reste.
 command = command.replace(str(vmtmp), '@@VMTMP@@')
@@ -473,6 +482,12 @@ class VmAgentsHarness(unittest.TestCase):
         # #3311 : vm.sh lit ce helper sur stdin pour prouver le venv du MainPID.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/venv-processus.py',
                      self.origin / 'deploy/mise-a-jour/venv-processus.py')
+        # #6806 : pieces envoyees depuis le poste par `vm.sh agents installer`.
+        for nom in ('garde-staging.py', 'staging-startup-guard.py',
+                    'systemd/ameesh-staging-10-native-actor.conf'):
+            cible = self.origin / 'deploy/mise-a-jour' / nom
+            cible.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(DEPLOY / nom, cible)
         shutil.copy2(ROOT / '.gitignore', self.origin / '.gitignore')
         (self.origin / 'src/ameesh/migrations').mkdir(parents=True)
         (self.origin / 'src/ameesh/__init__.py').write_text('# origine\n')
