@@ -234,7 +234,8 @@ def _fire_guard(landing, *, gh=None) -> dict | None:
         ok, why = fire.land_guard(landing.db, landing.lot,
                                   landing.row.get("frozen_sha") or "",
                                   repo=landing.project.repo, project=landing.project,
-                                  target=landing.row.get("target") or "", gh=gh)
+                                  target=landing.row.get("target") or "", gh=gh,
+                                  cfg=getattr(landing, "cfg", None))
     except TransientLandError as exc:
         return landing.retry(
             "the required checks of %s on the freeze %s cannot be read now (%s)"
