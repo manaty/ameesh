@@ -1359,6 +1359,12 @@ class GitReadTest(_TmpMixin, unittest.TestCase):
             with self.assertRaisesRegex(canon.GitError, "git not found"):
                 canon._git(self.make_tmp(), "rev-parse", "HEAD")
 
+    def test_missing_git_without_filename_is_not_a_missing_repository(self):
+        with mock.patch.object(canon.subprocess, "run",
+                               side_effect=FileNotFoundError(2, "missing")):
+            with self.assertRaisesRegex(canon.GitError, "git not found"):
+                canon._git(self.make_tmp(), "rev-parse", "HEAD")
+
     def test_dossier_de_depot_absent(self):
         missing = os.path.join(self.make_tmp(), "absent")
         with self.assertRaises(canon.GitError) as caught:

@@ -899,7 +899,7 @@ install packages or fetch dependencies.
 For example, with PostgreSQL 16 and the controller's protected backup document:
 
 ```sh
-sudo /opt/ameesh-release/runtime/bin/python3 -I \
+sudo /opt/ameesh-release/runtime/bin/python3 -I -B \
   deploy/mise-a-jour/restauration-release.py install \
   --pg-version 16 --backup /etc/ameesh-release/backup.json \
   --python /opt/ameesh-release/runtime/bin/python3 --restore-role release_restore
@@ -908,7 +908,16 @@ sudo /opt/ameesh-release/runtime/bin/python3 -I \
 The restore role must match the login chosen for #5162; it is an explicit
 installation parameter, restricted to a plain lowercase SQL identifier.
 
-The installed script is `/opt/ameesh-release/restore/restauration-release.py`.
+The installed script is
+`/usr/local/libexec/ameesh-release-restore/restauration-release.py`, outside the
+sealed `/opt/ameesh-release` tree. An installation still at the former
+`/opt/ameesh-release/restore` path is moved there by `install` before its copy
+is refreshed; two copies at once are refused. The capacity producer runs the
+installed script with `-I -B` and `PYTHONDONTWRITEBYTECODE=1`, so a root probe
+never writes bytecode into the sealed runtime. The capacity timer is only
+enabled when the private restore backup identity document exists and is
+readable; otherwise `install` prints a named refusal and leaves the timer
+disabled, without failing the rest of the installation.
 Its cluster has these fixed boundaries:
 
 - OS account `ameesh-restore`, without a login shell, owns only the disposable
@@ -997,13 +1006,14 @@ commands and real producer/consumer documents; it does not provision a host.
 Removal is explicit and deletes only the enrolled disposable cluster:
 
 ```sh
-sudo /opt/ameesh-release/runtime/bin/python3 -I \
-  /opt/ameesh-release/restore/restauration-release.py remove
+sudo /opt/ameesh-release/runtime/bin/python3 -I -B \
+  /usr/local/libexec/ameesh-release-restore/restauration-release.py remove
 ```
 
 It checks the offline cluster identifier before deletion, stops the capacity
 producer before PostgreSQL, removes its attestation, data, configuration,
-installed script and units, and reloads systemd. A repeated removal is a no-op.
+installed script (including a copy left at the former sealed path) and units,
+and reloads systemd. A repeated removal is a no-op.
 The locked OS identity, empty parent directories and the separately managed
 backup enrollment remain; its uid is never recycled. A partially initialized
 or foreign cluster is refused for administrator reconciliation instead of

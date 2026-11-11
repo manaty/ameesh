@@ -266,6 +266,25 @@ def _head_refusal(db: Db, item: dict, why: str, *,
     return WorkError("%s; %s" % (why, hint))
 
 
+def _require_verdict_note(db: Db, item: dict) -> None:
+    """#6802 : refuse un OK sans note sur un lot que la classe de revue ne dit
+    pas léger. Une classe illisible vaut `sensitive` (jamais rassurante)."""
+    from .work import WorkError
+    from . import lot_class
+    try:
+        klass = lot_class.of_lot(db, int(item["id"]), cfg=getattr(db, "cfg", None),
+                                 item=item).get("class") or lot_class.DOUBT
+    except Exception:  # noqa: BLE001 - classe illisible : doute
+        klass = lot_class.DOUBT
+    if lot_class.RANK.get(klass, lot_class.RANK[lot_class.DOUBT]) \
+            < lot_class.RANK[lot_class.SENSITIVE]:
+        return
+    raise WorkError(
+        "verdict refused (note-missing): an ok on %s lot #%d needs --note naming "
+        "the head read, the files or functions checked and the findings (#6802)"
+        % (klass, int(item["id"])))
+
+
 def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> str:
     """Le `sha` d'un verdict, vérifié et **résolu en tête complète** (#3329).
 
@@ -1108,6 +1127,12 @@ def milestone(
             required=kind == "verdict" and bool(os.environ.get("AMEESH_TURN_ID", "").strip()))
     except review_provenance.ProvenanceError as exc:
         raise WorkError("verdict refused (provenance-missing): %s" % exc) from exc
+    # #6802 : dans un tour managé, un OK sans note sur un lot sensible
+    # (release, ou classe douteuse) est refusé : la note porte la lecture
+    # (tête lue, fichiers, constats), seule trace qui survit à la session.
+    if (kind == "verdict" and verdict == "ok" and not note
+            and os.environ.get("AMEESH_TURN_ID", "").strip()):
+        _require_verdict_note(db, item)
     if proof and not actor:
         actor = proof["actor"]
     if kind == "frozen":
