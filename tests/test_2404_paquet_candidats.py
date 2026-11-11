@@ -355,6 +355,57 @@ class InventoryTest(unittest.TestCase):
             self.assertIn(1, self.inventory()['ready'])
 
     # ------------------------------------------------------------------
+    # #6893 : une exception de paquet déclarée écarte le lot des candidats
+    # ------------------------------------------------------------------
+
+    def test_declared_packet_exception_excludes_the_lot_from_the_candidates(self):
+        """Le lot qui fusionne hors paquet n'est jamais une unité.
+
+        h-13 (11/11 12:12Z) a composé #6880 alors qu'il portait
+        `packet-exception unblock` sur sa tête gelée : le paquet ne pouvait
+        pas fusionner (plancher installé), sa CI a été perdue et le pilote a
+        dû arrêter la composition à la main. Le motif `packet-exception` doit
+        apparaître dans la liste calculée, avec la nature et la raison.
+        """
+        from ameesh import packet_guard
+        note = packet_guard.marker("unblock", self.tips[1],
+                                   "lot de source CI partagée")
+        self.hold(1, note, actor="mesh-design")
+        payload = self.inventory()
+        entry = self.by_id(payload)[1]
+        self.assertFalse(entry["ready"])
+        self.assertEqual([cause["code"] for cause in entry["causes"]],
+                         ["packet-exception"])
+        self.assertIn("unblock", entry["causes"][0]["detail"])
+        self.assertIn("lot de source CI partagée", entry["causes"][0]["detail"])
+        self.assertEqual(entry["packet_exception"]["exception"], "unblock")
+        self.assertEqual(entry["packet_exception"]["sha"], self.tips[1])
+        self.assertNotIn(1, payload["ready"])
+        self.assertIn(1, payload["waiting"])
+        rendered = candidates_script.render(payload)
+        self.assertIn("packet-exception", rendered)
+        self.assertIn("lot de source CI partagée", rendered)
+
+    def test_packet_exception_covers_only_the_head_it_names(self):
+        """Une déclaration d'une autre tête ne couvre pas une nouvelle tête."""
+        from ameesh import packet_guard
+        self.hold(1, packet_guard.marker("incident", "a" * 40, "cible rouge"),
+                  actor="pilote")
+        entry = self.by_id(self.inventory())[1]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertIsNone(entry["packet_exception"])
+
+    def test_unreadable_packet_exceptions_refuse_the_inventory(self):
+        """Une exception invisible ne doit pas faire entrer le lot au paquet."""
+        # le premier appel est la lecture des holds de pilote, le second celle
+        # des exceptions de paquet (#6893).
+        self.store.progress.lot_hold_events = mock.Mock(
+            side_effect=[[], RuntimeError("journal offline")])
+        with self.assertRaisesRegex(packet_candidates.CandidateError,
+                                    "cannot read the packet exceptions: journal offline"):
+            self.inventory()
+
+    # ------------------------------------------------------------------
     # #3375 : un hold de pilote actif exclut le lot de la liste calculée
     # ------------------------------------------------------------------
 
