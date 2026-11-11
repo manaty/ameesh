@@ -54,9 +54,10 @@ die() { printf 'ERREUR : %s\n' "$*" >&2; exit 1; }
 
 # --- secrets et inventaire ----------------------------------------------------
 
-# Refuse un fichier de secrets lisible ou modifiable par un autre compte que
-# son propriétaire (0600 ou 0400), et un lien symbolique.
-verifier_secret() {
+# Refuse un fichier privé lisible ou modifiable par un autre compte que son
+# propriétaire (0600 ou 0400), et un lien symbolique. Ne juge pas le
+# propriétaire : le pgpass appartient à postgres, les secrets à root.
+verifier_fichier_prive() {
   local fichier=$1 mode
   [[ -f $fichier ]] || die "$fichier est absent (voir le README du répertoire)"
   [[ -L $fichier ]] && die "$fichier ne doit pas être un lien symbolique"
@@ -64,6 +65,19 @@ verifier_secret() {
   if (( (8#$mode & 8#077) != 0 )); then
     die "$fichier doit être en 0600 (il est en 0$mode) : chmod 0600 $fichier"
   fi
+}
+
+# Fichier de secrets sourcé par le script : il doit appartenir à l'utilisateur
+# effectif (root en production), AVANT toute lecture. Un fichier 0600 d'un
+# autre compte serait modifiable par lui et deviendrait du shell exécuté en
+# root (B2 de revue #6868) ; le pgpass, lui, appartient à postgres et n'est pas
+# sourcé, d'où verifier_fichier_prive.
+verifier_secret() {
+  local fichier=$1 proprietaire
+  verifier_fichier_prive "$fichier"
+  proprietaire=$(stat -c '%u' -- "$fichier") || die "propriétaire de $fichier illisible"
+  [[ $proprietaire == "$EUID" ]] \
+    || die "$fichier doit appartenir à l'utilisateur effectif (uid $EUID), pas à l'uid $proprietaire : chown root:root $fichier en production"
 }
 
 # Les mots de passe sont générés en base64 sans « / » ni « + » par le README ;
@@ -471,7 +485,7 @@ installer_pgpass() {
 }
 
 verifier_pgpass() {
-  verifier_secret "$PGPASS"
+  verifier_fichier_prive "$PGPASS"
   grep -q ':replication:replicator:' "$PGPASS" || die "$PGPASS ne porte pas l'entrée replication:replicator"
   grep -q ':postgres:rewind:' "$PGPASS" || die "$PGPASS ne porte pas l'entrée postgres:rewind"
   if (( EUID == 0 )); then

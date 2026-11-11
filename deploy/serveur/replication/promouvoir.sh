@@ -5,28 +5,42 @@
 # réel d'EP8.3 #6860, jamais joué ici). Le code ne décide pas : c'est un
 # geste d'exploitant, dans la fenêtre de bascule, en attendant Patroni (EP8.4).
 #
-#   promouvoir.sh [--force] [nom-du-noeud]
+#   promouvoir.sh [--borne <LSN>] [--force] [nom-du-noeud]
 #
 # Gardes contre le split brain, dans cet ordre :
 #   - un nœud nofailover (le hub) n'est jamais promu sans --force ;
 #   - le serveur local doit tourner et être en récupération ;
 #   - aucun autre nœud joignable ne doit répondre comme primaire ; un nœud
 #     joignable dont le rôle est illisible arrête aussi (on ne parie pas) ;
-#   - --force ne sert qu'à une décision humaine de désastre, et le dit.
+#   - la borne WAL de l'ancien primaire (--borne, relevée par
+#     pg_current_wal_flush_lsn() AVANT son arrêt) doit être rejouée par le
+#     candidat : ANY 1 ne garantit pas que tous les candidats ont tout reçu,
+#     et promouvoir un candidat en retard perdrait des COMMIT confirmés que
+#     le pg_rewind de l'ancien primaire effacerait ensuite ;
+#   - --force ne sert qu'à une décision humaine de désastre, et le dit : sans
+#     borne, ou avec un candidat en retard, il accepte une perte possible.
 #
-# Après promotion : synchrones réécrits (ANY 1 sur la paire d'agents), rechargement,
-# slot physique créé pour chaque autre nœud. Le retour de l'ancien primaire se
-# fait par reintegrer.sh ; les autres standbys par suivre-primaire.sh.
+# Après promotion : synchrones réécrits (ANY 1 seulement si un candidat est en
+# flux), rechargement, slot physique créé pour chaque autre nœud. Le retour de
+# l'ancien primaire se fait par reintegrer.sh ; les autres standbys par
+# suivre-primaire.sh.
 set -euo pipefail
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 usage() {
   cat <<'EOF'
-usage: promouvoir.sh [--force] [nom-du-noeud]
+usage: promouvoir.sh [--borne <LSN>] [--force] [nom-du-noeud]
 
-  --force   passe outre le nofailover et le contrôle d'absence d'autre
-            primaire ; réservé à une décision humaine en situation de
-            désastre (double panne), jamais à une bascule planifiée.
+  --borne <LSN>  borne WAL de l'ancien primaire, relevée sur lui AVANT son
+                 arrêt par SELECT pg_current_wal_flush_lsn() (ex. 0/1A2B3C4).
+                 Le candidat doit l'avoir rejouée, sinon la promotion est
+                 refusée : ANY 1 ne garantit pas que tous les candidats ont
+                 tout reçu, et un candidat en retard perdrait des COMMIT
+                 confirmés (le pg_rewind de l'ancien primaire les effacerait).
+  --force        passe outre la borne, le nofailover et le contrôle d'absence
+                 d'autre primaire ; réservé à une décision humaine en situation
+                 de désastre (double panne), avec perte possible, jamais à une
+                 bascule planifiée.
   nom-du-noeud   nœud de noeuds.conf ; par défaut le nom court de l'hôte.
 
 La bascule planifiée arrête d'abord l'ancien primaire, puis promeut un
@@ -35,10 +49,16 @@ EOF
 }
 
 force=0
+borne=""
 nom=""
 while (( $# )); do
   case $1 in
     --force) force=1 ;;
+    --borne)
+      shift
+      (( $# )) || die "--borne attend un LSN PostgreSQL (ex. 0/1A2B3C4)"
+      borne=$1
+      ;;
     -h | --help) usage; exit 0 ;;
     -*) die "option inconnue : $1 (voir --help)" ;;
     *)
@@ -48,6 +68,8 @@ while (( $# )); do
   esac
   shift
 done
+[[ -z $borne || $borne =~ ^[0-9A-Fa-f]{1,8}/[0-9A-Fa-f]{1,8}$ ]] \
+  || die "--borne : LSN PostgreSQL attendu (ex. 0/1A2B3C4), pas « $borne »"
 
 charger_env
 lire_noeuds
@@ -86,6 +108,37 @@ for ((i = 0; i < ${#NOEUDS_NOMS[@]}; i++)); do
     fi
   fi
 done
+
+# B1 de revue #6868 (seconde passe) : la borne WAL relevée sur l'ancien
+# primaire doit être rejouée par le candidat avant la promotion. ANY 1 ne
+# garantit pas que tous les candidats ont tout reçu : promouvoir un candidat
+# en retard perdrait des COMMIT confirmés, que le pg_rewind de l'ancien
+# primaire effacerait ensuite.
+if [[ -n $borne ]]; then
+  log "borne WAL de l'ancien primaire : $borne — attente du rejeu sur $NOM_LOCAL"
+  essais=$(( ATTENTE / 2 ))
+  (( essais > 0 )) || essais=1
+  atteint=0
+  for ((i = 0; i < essais; i++)); do
+    if [[ $(psql_local -tAc "SELECT pg_last_wal_replay_lsn() >= '$borne'::pg_lsn" 2>/dev/null) == t ]]; then
+      atteint=1
+      break
+    fi
+    (( i + 1 < essais )) && sleep 2
+  done
+  rejoue=$(psql_local -tAc 'SELECT pg_last_wal_replay_lsn()' || true)
+  if (( atteint )); then
+    log "candidat à jour : rejeu ${rejoue:-?} >= borne $borne"
+  elif (( force )); then
+    info "ATTENTION : candidat en retard (rejeu ${rejoue:-?} < borne $borne) ; --force accordé, des COMMIT confirmés peuvent être perdus"
+  else
+    die "candidat en retard : rejeu ${rejoue:-?} < borne $borne — promotion refusée (attendre le rejeu ; --force seulement pour une décision humaine de désastre, avec perte possible)"
+  fi
+elif (( force )); then
+  info "ATTENTION : aucune borne WAL (--borne) et --force : promotion de désastre, des COMMIT confirmés peuvent être perdus"
+else
+  die "borne WAL de l'ancien primaire absente : relever SELECT pg_current_wal_flush_lsn() AVANT son arrêt, puis passer --borne <LSN> ; --force seulement pour une décision humaine de désastre (perte possible)"
+fi
 
 log "promotion de $NOM_LOCAL (aucun autre primaire joignable)"
 pg_ctlcluster "$PG_VERSION" main promote

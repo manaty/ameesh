@@ -59,7 +59,9 @@ Règles encodées :
    retenu par les slots. `ameesh-agents-2` avait 13 Go libres, à nettoyer
    avant EP8.3 (étude §2).
 5. **Secrets** dans `/etc/ameesh/replication.env` (root:root, **0600**), sur
-   chaque nœud ; le fichier est refusé s'il est lisible par un autre compte :
+   chaque nœud ; le fichier est refusé s'il est lisible par un autre compte
+   **ou s'il n'appartient pas à l'utilisateur effectif** (root en production) :
+   un 0600 d'un autre compte serait modifiable par lui, puis sourcé en root.
 
    ```bash
    install -d -m 0750 /etc/ameesh
@@ -98,7 +100,7 @@ Règles encodées :
 | `sql/roles.sql` | rôles `replicator` (LOGIN REPLICATION) et `rewind` (LOGIN + quatre fonctions pg_rewind), sans superuser |
 | `configurer-noeud.sh` | idempotent : fragment `conf.d`, bloc `pg_hba`, rechargement, redémarrage optionnel, rôles et slots sur le primaire effectif |
 | `initialiser-standby.sh` | `pg_basebackup -X stream -S <slot> -R -c fast`, reprise et `standby.signal`, contrôle du flux |
-| `promouvoir.sh` | promotion manuelle avec gardes anti-split-brain ; crée les slots des autres nœuds |
+| `promouvoir.sh` | promotion manuelle avec gardes anti-split-brain et borne WAL rejouée ; crée les slots des autres nœuds |
 | `reintegrer.sh` | `pg_rewind` de l'ancien primaire, re-pose de la configuration copiée par le rewind, démarrage en standby |
 | `suivre-primaire.sh` | fait suivre un autre standby au nouveau primaire (`primary_conninfo`/slot), recharge et contrôle |
 | `retour-arriere.sh` | retire la configuration du lot, et sur demande les slots et les rôles ; aucune donnée supprimée |
@@ -157,15 +159,27 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
    pendant la promotion) :
 
    ```bash
-   # sur manaty-mesh-1 : arrêt propre de l'ancien primaire
+   # sur manaty-mesh-1, écritures client arrêtées : relever la borne WAL
+   psql -Atc 'SELECT pg_current_wal_flush_lsn()'   # ex. 0/1A2B3C4, à noter
+   # puis arrêt propre de l'ancien primaire
    pg_ctlcluster 17 main stop
-   # sur ameesh-agents-1 : promotion (refusée si un primaire répond encore)
-   deploy/serveur/replication/promouvoir.sh ameesh-agents-1
+   # sur ameesh-agents-1 : promotion avec la borne relevée
+   deploy/serveur/replication/promouvoir.sh --borne 0/1A2B3C4 ameesh-agents-1
    # sur manaty-mesh-1 : réintégration par pg_rewind
    deploy/serveur/replication/reintegrer.sh --source ameesh-agents-1 manaty-mesh-1
    # sur ameesh-agents-2 : suivre le nouveau primaire
    deploy/serveur/replication/suivre-primaire.sh --source ameesh-agents-1 ameesh-agents-2
    ```
+
+   La borne est **obligatoire** pour une bascule planifiée : `ANY 1` ne
+   garantit pas que tous les candidats ont reçu tous les `COMMIT`, et un
+   candidat en retard perdrait des transactions confirmées que le `pg_rewind`
+   de l'ancien primaire effacerait ensuite. `promouvoir.sh` attend le rejeu de
+   la borne (borné) et refuse si elle n'est pas atteinte. Sans borne, il
+   refuse aussi ; `--force` seul autorise une promotion de désastre, en
+   annonçant la perte possible — jamais pour une bascule planifiée. Si la
+   borne n'a pas été relevée avant l'arrêt, redémarrer l'ancien primaire,
+   arrêter les écritures et recommencer.
 
    Après la promotion, le nouveau primaire n'a encore aucun standby en flux :
    sa liste synchrone est vide. La rejouer (`configurer-noeud.sh
@@ -185,12 +199,20 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
 - le serveur local doit tourner et être en récupération ;
 - **aucun autre nœud joignable ne doit répondre comme primaire** ; un nœud
   joignable dont le rôle est illisible arrête aussi (on ne parie pas) ;
+- `--borne <LSN>` est **obligatoire** pour une bascule planifiée : la borne
+  WAL relevée sur l'ancien primaire avant son arrêt doit être rejouée par le
+  candidat, sinon `promouvoir.sh` refuse (attente bornée puis erreur
+  explicite) ;
 - `--force` ne sert qu'à une décision **humaine** de désastre (double panne) :
-  il est journalisé par le message, jamais par une écriture silencieuse.
+  il autorise l'absence de borne ou un candidat en retard, en annonçant la
+  perte possible ; il est journalisé par le message, jamais par une écriture
+  silencieuse.
 
-Une bascule planifiée arrête d'abord l'ancien primaire
-(`pg_ctlcluster 17 main stop`), puis promeut. Le script ne fait pas le premier
-geste : un primaire qui tourne encore est un split brain en puissance.
+Une bascule planifiée relève la borne
+(`SELECT pg_current_wal_flush_lsn()`) sur l'ancien primaire **avant** de
+l'arrêter (`pg_ctlcluster 17 main stop`), puis promeut avec `--borne`. Le
+script ne fait pas le premier geste : un primaire qui tourne encore est un
+split brain en puissance.
 
 Après promotion, `promouvoir.sh` réécrit la configuration : à cet instant aucun
 standby n'est encore en flux, donc `synchronous_standby_names` est vide (les

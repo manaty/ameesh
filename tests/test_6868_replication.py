@@ -14,7 +14,9 @@ sur les points sensibles du lot (SQL, droits) :
   puis activation avec un candidat en flux, et `--sans-synchrone` ;
 - les rôles `replicator` (LOGIN REPLICATION) et `rewind` (quatre fonctions,
   pas superuser), les slots, et le pgpass 0600 ;
-- la promotion manuelle (split brain, nofailover, slots du nouveau primaire) ;
+- la promotion manuelle (split brain, nofailover, borne WAL rejouée ; un
+  candidat en retard est refusé, `--force` dit la perte possible) ;
+- le fichier de secrets doit appartenir à l'utilisateur effectif avant source ;
 - `pg_basebackup -X stream -S <slot> -R` et le re-seed qui déplace les données ;
 - `pg_rewind`, la re-pose de la configuration copiée par le rewind et l'échec
   qui n'est pas masqué ;
@@ -118,6 +120,11 @@ def ecrire_slots(lignes):
     ecrire("slots", "".join("|".join(ligne) + "\n" for ligne in lignes))
 
 
+def lsn(texte):
+    haut, bas = texte.strip().split("/", 1)
+    return (int(haut, 16) << 32) + int(bas, 16)
+
+
 if sql is None:
     texte = sys.stdin.read()
     with stdin_log.open("a", encoding="utf-8") as out:
@@ -187,6 +194,15 @@ elif "FROM pg_stat_replication" in q:
     chemin = base / "replication"
     if chemin.exists():
         print(chemin.read_text(encoding="utf-8").rstrip("\n"))
+elif "pg_last_wal_replay_lsn() >=" in q:
+    borne = re.search(r"'([0-9A-Fa-f]+/[0-9A-Fa-f]+)'::pg_lsn", q).group(1)
+    print("t" if lsn(lire("replay_lsn", "0/0")) >= lsn(borne) else "f")
+elif "pg_last_wal_replay_lsn()" in q:
+    print(lire("replay_lsn", "0/0"))
+elif "pg_last_wal_receive_lsn()" in q:
+    print(lire("receive_lsn", lire("replay_lsn", "0/0")))
+elif "pg_current_wal_flush_lsn()" in q:
+    print(lire("flush_lsn", "0/0"))
 elif "pg_stat_wal_receiver" in q and re.search(
         r"\b(write_lag|flush_lag|replay_lag)\b", q):
     # B2 : ces colonnes n'existent pas dans pg_stat_wal_receiver en PG17 ;
@@ -677,6 +693,27 @@ class ReplicationTest(unittest.TestCase):
         self.assertIn("CIDR valide", resultat.stderr)
         self.assertFalse(self.fragment().exists())
 
+    def test_secret_mauvais_proprietaire_refuse_avant_source(self):
+        # B2 de revue #6868 (2e passe) : un 0600 appartenant à un autre compte
+        # serait modifiable par lui, puis sourcé en root. La doublure de stat
+        # annonce un autre uid pour replication.env ; le script doit refuser
+        # AVANT de le sourcer.
+        vrai_stat = shutil.which("stat")
+        self.assertIsNotNone(vrai_stat)
+        self.stub("stat", f'''
+import os
+import sys
+args = sys.argv[1:]
+if "-c" in args and "%u" in args and args[-1].endswith("replication.env"):
+    print("4242")
+    sys.exit(0)
+os.execv({vrai_stat!r}, ["stat"] + args)
+''')
+        self.serveur(demarre=False)
+        resultat = self.run_script("configurer-noeud.sh", "ameesh-agents-2", attendu=1)
+        self.assertIn("doit appartenir à l'utilisateur effectif", resultat.stderr)
+        self.assertIn("uid 4242", resultat.stderr)
+
     # --- promotion -----------------------------------------------------------
     def test_promotion_refuse_hub_et_split_brain(self):
         self.serveur(demarre=True, en_recuperation=True)
@@ -707,8 +744,11 @@ class ReplicationTest(unittest.TestCase):
 
     def test_promotion_ok_cree_les_slots_et_recharge(self):
         self.serveur(demarre=True, en_recuperation=True)
-        resultat = self.run_script("promouvoir.sh", "ameesh-agents-2")
+        (self.state / "replay_lsn").write_text("0/5000000", encoding="utf-8")
+        resultat = self.run_script("promouvoir.sh", "--borne", "0/5000000",
+                                   "ameesh-agents-2")
         self.assertIn("promotion confirmée", resultat.stdout)
+        self.assertIn("candidat à jour", resultat.stdout)
         self.assertIn("pg_ctlcluster 17 main promote", self.journal_texte())
         self.assertIn("pg_ctlcluster 17 main reload", self.journal_texte())
         self.assertEqual((self.state / "in_recovery").read_text(encoding="utf-8"), "f")
@@ -728,6 +768,42 @@ class ReplicationTest(unittest.TestCase):
         self.run_script("configurer-noeud.sh", "ameesh-agents-2")
         self.assertIn("ANY 1 (",
                       self.fragment().read_text(encoding="utf-8"))
+
+    def test_promotion_refuse_sans_borne_ou_candidat_en_retard(self):
+        self.serveur(demarre=True, en_recuperation=True)
+        (self.state / "replay_lsn").write_text("0/4000000", encoding="utf-8")
+
+        # LSN invalide : refus avant tout geste.
+        resultat = self.run_script("promouvoir.sh", "--borne", "pas-un-lsn",
+                                   "ameesh-agents-2", attendu=1)
+        self.assertIn("LSN PostgreSQL attendu", resultat.stderr)
+        self.assertNotIn("pg_ctlcluster 17 main promote", self.journal_texte())
+
+        # Sans borne (bascule planifiée) : refus ; un candidat en retard ne
+        # prouve pas qu'il a tous les COMMIT confirmés (B1, 2e passe).
+        resultat = self.run_script("promouvoir.sh", "ameesh-agents-2", attendu=1)
+        self.assertIn("borne WAL de l'ancien primaire absente", resultat.stderr)
+        self.assertNotIn("pg_ctlcluster 17 main promote", self.journal_texte())
+
+        resultat = self.run_script("promouvoir.sh", "--borne", "0/5000000",
+                                   "ameesh-agents-2", attendu=1)
+        self.assertIn("candidat en retard", resultat.stderr)
+        self.assertIn("0/4000000", resultat.stderr)
+        self.assertNotIn("pg_ctlcluster 17 main promote", self.journal_texte())
+
+        # --force est la dérogation de désastre : elle dit la perte possible.
+        resultat = self.run_script("promouvoir.sh", "--borne", "0/5000000",
+                                   "--force", "ameesh-agents-2")
+        self.assertIn("--force accordé", resultat.stdout)
+        self.assertIn("COMMIT confirmés peuvent être perdus", resultat.stdout)
+        self.assertIn("pg_ctlcluster 17 main promote", self.journal_texte())
+
+    def test_promotion_sans_borne_force_dit_la_perte(self):
+        self.serveur(demarre=True, en_recuperation=True)
+        resultat = self.run_script("promouvoir.sh", "--force", "ameesh-agents-2")
+        self.assertIn("aucune borne WAL", resultat.stdout)
+        self.assertIn("COMMIT confirmés peuvent être perdus", resultat.stdout)
+        self.assertIn("pg_ctlcluster 17 main promote", self.journal_texte())
 
     # --- base backup ---------------------------------------------------------
     def test_initialiser_standby_basebackup_et_reprise(self):
