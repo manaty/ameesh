@@ -3996,7 +3996,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                            % (item_id, blocked[0].get("actor") or "a reviewer",
                               frozen_sha[:12]))
         from . import packet_reviews
-        if avis > 0 and full and packet_reviews.is_vehicle(item):
+        if len(reviews) < avis and full and packet_reviews.is_vehicle(item):
             needed, reading = _vehicle_review_need(
                 db, cfg, item, frozen_sha, name, checkout=checkout)
             if needed and needed.get("ok") is True and needed.get("required") == 0:

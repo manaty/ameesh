@@ -61,6 +61,21 @@ class VehicleCiTest(fixtures.GelTestCase):
                 self.plan()
         self.proof.assert_not_called()
 
+    def test_reviewed_vehicle_needs_no_checkout_and_rechecks_verdicts(self):
+        self.jalons.append(fixtures.jalon(
+            "verdict", sha=fixtures.GEL, actor="relecteur", verdict="ok"))
+        with mock.patch.object(packet_automerge, "_gate_repo", return_value=""), \
+                mock.patch("ameesh.fire.review_checkout", return_value=None):
+            decision = self.plan()
+            self.assertEqual(decision["action"], "request")
+            self.assertFalse(decision.get("vehicle_review"))
+            ci._revalidate(self.db, self.item["id"], decision)
+            self.jalons.append(fixtures.jalon(
+                "verdict", sha=fixtures.GEL, actor="relecteur", verdict="blocked"))
+            with self.assertRaisesRegex(ci.GelError, "blocked"):
+                ci._revalidate(self.db, self.item["id"], decision)
+        self.proof.assert_not_called()
+
     def test_changed_own_delta_proof_under_lock_refuses(self):
         decision = self.plan()
         self.proof.return_value = {"ok": None, "required": 1}
