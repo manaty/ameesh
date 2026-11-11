@@ -217,6 +217,12 @@ returns or a direct peer is configured. That is acceptable for a workstation
 that is off half the time, and it is a deliberate choice: the study does not
 make the PC a quorum member.
 
+EP8.2 (2026-11-11): the bureau measured the four VMs (`ameesh-agents-1/2/3`,
+`manaty-mesh-1`) in one project and the `fr-par-1` zone, so the Private
+Network applies and the fallback is not needed. The procedure, the address
+plan (`10.78.0.0/24`), the hub-down test and the PC path are in
+[`deploy/serveur/RESEAU-PRIVE.md`](../../../deploy/serveur/RESEAU-PRIVE.md).
+
 ### 2. Three nodes, two of them the primary candidates
 
 | Node | Role | Why |
