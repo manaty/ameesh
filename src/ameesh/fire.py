@@ -917,7 +917,7 @@ def _ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     gate_target = resolved if class_sha else (fresh_target or resolved or base)
     gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
                                    item=row, cfg=cfg, target=gate_target,
-                                   **gate_authors)
+                                   record=True, **gate_authors)
     if not gate["ok"]:
         return False, gate["why"], klass
     return True, "", klass

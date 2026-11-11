@@ -769,11 +769,65 @@ def _admitted_stacked_parents(db, cfg, item, repo, frozen) -> tuple[str, ...]:
     return tuple(admitted)
 
 
+def _paused_family_fallback(db, item, marks, klass, families, cfg, frozen, now):
+    """#6990 : la preuve de repli d'une famille en pause, ou `None`.
+
+    N'est tentée que pour un barème à deux avis : `klass` porte alors le seuil
+    `paused_family_min_hours` et l'accord `paused_family_reviews: 1` de
+    `lot_class` (toutes les règles à deux avis du diff l'ont donné). La lecture
+    est celle de la désignation au gel (`debit.designations`) et des pauses
+    budget (`review_family_paused.blocked`, #5424) : le pilote et les hôtes
+    fermés sortent du pool, comme pour les alertes. Une preuve illisible ne
+    l'ouvre jamais.
+    """
+    from . import debit, review_designation as rd, review_family_paused, storage
+    min_hours = int((klass or {}).get("paused_family_min_hours") or 0)
+    if min_hours <= 0 or int((klass or {}).get("paused_family_reviews") or 0) != 1:
+        return None
+    if families is None:
+        from . import review_lot
+        try:
+            families = review_lot.compiled_families(db)
+        except review_lot.FamiliesError:
+            return None
+    listing = storage.of(db).operations.listing()
+    agent_families = {str(row["name"]).casefold(): rd.live_family(row, families=families)
+                      for row in listing}
+    designation = debit.designations(
+        list(marks or ()), work.events(db, int(item["id"]), limit=200),
+        agent_families=agent_families)
+    freeze = designation.get("freeze") or {}
+    if not freeze or not _same_sha(freeze.get("sha"), frozen, repo=None):
+        return None
+    project = str((item or {}).get("app") or "")
+    pilots, closed_hosts = review_family_paused.exclusions(
+        cfg, db, [project], listing)
+    return review_family_paused.fallback(
+        designation, listing, project=project, families=families, now=now,
+        min_hours=min_hours, pilot=(pilots or {}).get(project) or "",
+        closed_hosts=closed_hosts)
+
+
+def _record_paused_family_fallback(db, item, frozen, evidence) -> None:
+    """Écrit la preuve du repli au journal du lot, une seule fois (#6990).
+
+    La relecture après fusion lit cette marque pour désigner la famille en
+    pause sur la fusion ; sans elle, le repli ne se prouve pas. Une écriture
+    impossible est rendue par l'exception : la porte refuse alors de
+    s'ouvrir sur un repli non tracé.
+    """
+    from . import review_family_paused
+    work.note(db, int(item["id"]),
+              review_family_paused.fallback_note(evidence, frozen),
+              actor=work.SYSTEM_SENDER, once=True)
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
                 authors=None, authors_complete=False, cfg=None, project=None,
                 target=None, vehicle=None, exclude_author_family=None,
-                distinct_families=None, admitted_heads=(), production_cache=None) -> dict:
+                distinct_families=None, admitted_heads=(), production_cache=None,
+                record: bool = False, now: float | None = None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     `admitted_heads` ne vient que de la porte du véhicule : les gels de ses
@@ -1125,6 +1179,28 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # historique garde son message d'échec fermé.
     latest_ok = [mark for mark in latest.values()
                  if (mark.get("verdict") or "") == "ok"]
+    # #6990 : quand le barème demande deux avis, qu'un seul est rendu et que
+    # la famille manquante est en pause budget au-delà du seuil du canon, la
+    # porte admet sur cet avis plus la CI complète du paquet (décision owner
+    # #213032 a). `klass` ne porte les deux clés que si toutes les règles à
+    # deux avis du diff l'accordent : la CI, SQL, les secrets, l'identité, le
+    # paiement et la prod réelle n'y ont jamais droit. Le repli ne relève pas
+    # l'exigence d'indépendance : l'avis doit rester d'une autre famille que
+    # tous les auteurs (`strict` ci-dessous).
+    fallback = None
+    if (required == 2 and len(latest_ok) == 1 and db is not None
+            and item is not None):
+        try:
+            fallback = _paused_family_fallback(
+                db, item, marks, klass, families, cfg, frozen,
+                time.time() if now is None else float(now))
+        except Exception:  # noqa: BLE001 - preuve illisible : jamais un repli
+            fallback = None
+    if fallback is not None:
+        out["fallback"] = fallback
+        out["fallback_required"] = 2
+        required = 1
+        out["required"] = 1
     if len(latest_ok) < required and callable(getattr(db, "query", None)):
         # #3400 (auditeur sur #3397) : ces `ok` ne sont pas des avis
         # **acceptés**. Le filtre d'indépendance (auteurs, correcteurs,
@@ -1546,6 +1622,18 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         accepted = chosen
     out["accepted"] = accepted
     if len(accepted) >= required:
+        if fallback is not None and record:
+            # La marque est la preuve que la relecture après fusion relira :
+            # sans elle, pas de désignation de la famille au retour. Une
+            # écriture impossible ferme la porte, jamais un repli muet.
+            try:
+                _record_paused_family_fallback(db, item, frozen, fallback)
+            except Exception as exc:  # noqa: BLE001 - repli non tracé : refus
+                out["error"] = str(exc)
+                out["why"] = ("no review verdict ok on the freeze %s (class: %s): "
+                              "the paused-family fallback could not be recorded (%s)"
+                              % (frozen[:12], cls, exc))
+                return out
         out["ok"] = True
         return out
     got = ", ".join("%s (%s)" % (e["actor"] or "?", e["family"] or "famille inconnue")
@@ -1592,7 +1680,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
 #: Le cache ne nourrit que la passe d'alertes (`exploitation._slo_breaches`) :
 #: aucun chemin de fusion ne le lit. Une fusion refait toujours la porte
 #: complète ; un verdict mémorisé ne peut donc jamais autoriser un merge.
-GATE_CACHE_VERSION = "3761.2"
+GATE_CACHE_VERSION = "6990.1"
 #: Une famille d'acteur ou un reçu de provenance peut changer sans nouveau
 #: jalon : la porte se relit au plus tard après ce délai.
 GATE_CACHE_TTL_S = 3600.0
@@ -2904,7 +2992,8 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
             gate_authors = {"authors": authors, "families": families,
                             "authors_complete": True}
     gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row,
-                       cfg=cfg, target=fresh_target, **gate_authors)
+                       cfg=cfg, target=fresh_target, record=True,
+                       **gate_authors)
     if not gate["ok"]:
         raise QueueError("lot #%d: %s" % (lot, gate["why"]))
     # L756 (#566): un lot de classe release ne se contente pas du check de sa
