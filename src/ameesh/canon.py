@@ -2635,7 +2635,7 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         # Deux cas distincts portent le même FileNotFoundError : l'exécutable
         # `git` absent, et le dossier de travail (`cwd=repo`) absent. Le
         # second ne doit jamais se lire « git not found » (#2349).
-        if exc.filename != cmd[0]:
+        if exc.filename is not None and exc.filename != cmd[0]:
             raise GitError("git %s: repository directory %r does not exist"
                            % (args[0] if args else "?", repo)) from exc
         raise GitError("git not found") from exc
