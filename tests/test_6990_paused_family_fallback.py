@@ -18,7 +18,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import (debit, lot_class, mechanics, merge_queue,
+from ameesh import (debit, lot_class, mechanics, merge_queue, packet_reviews,
                     review_designation, review_family_paused, review_lot,
                     storage, work)
 
@@ -408,10 +408,67 @@ class GateFallbackTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("could not be recorded", out["why"])
 
-    def test_a_read_only_admission_does_not_write(self):
-        out, recorded = self.gate()
+    def test_a_read_only_admission_does_not_write_but_stays_ok(self):
+        # B/P1 auditeur (11/11 21:42) : la sélection de candidat lit la porte
+        # sans écrire ; elle doit rester `ok` pour que le lot entre au paquet,
+        # et la preuve est écrite plus tard par la porte du véhicule (record).
+        out, recorded = self.gate(record=False)
         self.assertTrue(out["ok"], out["why"])
+        self.assertEqual(out["required"], 1)
         recorded.assert_not_called()
+
+
+class PacketGateRecordTest(unittest.TestCase):
+    """#6990 (B/P1 auditeur) : la porte du véhicule écrit la preuve des membres."""
+
+    def test_the_vehicle_gate_passes_record_to_need(self):
+        with mock.patch.object(packet_reviews, "is_vehicle", return_value=True), \
+                mock.patch.object(packet_reviews, "need",
+                                  return_value={"ok": False, "why": "x"}) as need:
+            out = merge_queue.review_gate(
+                types.SimpleNamespace(), [], HEAD, cfg=object(), target="main",
+                item={"id": 1, "app": "ameesh"}, record=True)
+        self.assertFalse(out["ok"])
+        self.assertTrue(need.call_args.kwargs["record"])
+
+    def test_a_read_only_vehicle_gate_does_not_write(self):
+        with mock.patch.object(packet_reviews, "is_vehicle", return_value=True), \
+                mock.patch.object(packet_reviews, "need",
+                                  return_value={"ok": False, "why": "x"}) as need:
+            merge_queue.review_gate(
+                types.SimpleNamespace(), [], HEAD, cfg=object(), target="main",
+                item={"id": 1, "app": "ameesh"})
+        self.assertFalse(need.call_args.kwargs["record"])
+
+    def test_need_passes_record_to_each_member_gate(self):
+        member = {"id": 7, "app": "ameesh", "assignee": "author"}
+        marks = [{"kind": "frozen", "sha": HEAD, "actor": "author", "at_ts": T}]
+        with mock.patch.object(packet_reviews, "is_vehicle", return_value=True), \
+                mock.patch.object(packet_reviews, "_packet_base",
+                                  return_value=("main", None)), \
+                mock.patch.object(packet_reviews, "members",
+                                  return_value=[{"lot": 7}]), \
+                mock.patch.object(packet_reviews, "_member_freeze",
+                                  return_value=(member, marks, {"sha": HEAD})), \
+                mock.patch.object(packet_reviews, "_stack_order",
+                                  side_effect=lambda repo, prepared: prepared), \
+                mock.patch.object(packet_reviews, "own_changes",
+                                  return_value={"paths": [], "commits": []}), \
+                mock.patch.object(packet_reviews.plan_git, "_commit",
+                                  side_effect=lambda repo, sha: sha), \
+                mock.patch.object(packet_reviews, "_ancestor",
+                                  return_value=True), \
+                mock.patch.object(packet_reviews.plan_git, "_out",
+                                  return_value="a" * 40), \
+                mock.patch.object(lot_class, "of_lot", return_value={}), \
+                mock.patch.object(merge_queue, "review_gate",
+                                  return_value={"ok": True,
+                                                "attribution_read": False}) as gate:
+            out = packet_reviews.need(types.SimpleNamespace(), 999, {},
+                                      [], "/repo", "a" * 40, HEAD,
+                                      record=True)
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(gate.call_args.kwargs["record"])
 
 
 class PausedFamilyFallbackWiringTest(unittest.TestCase):

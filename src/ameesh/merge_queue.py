@@ -951,6 +951,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # `accepted_unfiltered` ; `accepted` reste la liste des seuls avis dont
     # l'indépendance est prouvée, vide quand la porte se ferme sans la lire.
 
+    #6990 : quand le barème exige deux avis, qu'un seul est rendu et que la
+    # famille manquante est entièrement en pause budget au-delà du seuil du
+    # canon, la porte admet sur cet avis (`fallback` porte la preuve). Seul
+    # un appelant qui admet pour fusionner passe `record=True` (file, feu,
+    # porte du véhicule qui descend `record` à ses membres) : la preuve est
+    # alors écrite au journal et la relecture après fusion la relit. Une
+    # lecture sans écriture (candidat de paquet, alerte) reste `ok` sans note ;
+    # la preuve est écrite par la porte d'admission avant la fusion.
+
     Rend `{ok, why, class, required, accepted, accepted_unfiltered, blocked,
     waived, author, author_family, author_families, authors, corrections,
     on_freeze, unproven, completed_ts, vehicle, attribution_read}` ; ne lève
@@ -1000,7 +1009,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             try:
                 vehicle = packet_reviews.need(db, int(item.get("id") or 0), item,
                                               marks, repo or "", target, frozen,
-                                              cfg=cfg)
+                                              cfg=cfg, record=record)
             except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
                 vehicle = {"ok": False, "required": None, "klass": None,
                            "why": "vehicle review unreadable: %s" % exc,
