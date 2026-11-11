@@ -269,6 +269,37 @@ class GesteHoteGateTest(_Base):
         self.assertIn("carries no full verified identity", str(raised.exception))
         self.assertIn("release it and claim again", str(raised.exception))
 
+    def test_une_prise_ecrite_par_le_code_n_moins_1_se_libere_et_se_reprend(self):
+        """L'écrivain N-1 (#6839) ne nomme pas les colonnes de 0566 : sa prise
+        se lit, la porte la refuse, mais la porteuse peut la libérer puis la
+        reprendre avec l'identité complète."""
+        lot = self.reserve()
+        bg = self.bind_session("BG")
+        # l'UPDATE de prise du stockage N-1, copié : il ne nomme aucune des
+        # deux colonnes ajoutées par 0566.
+        self.previous_write(
+            "UPDATE work_items SET external_claim_session = %s,"
+            " external_claimed_at = clock_timestamp(), external_claim_actor = %s,"
+            " external_claim_host = %s, external_claim_proof = %s,"
+            " updated_at = now() WHERE id = %s",
+            ("BG", "bureau", self.cfg.host, "BG", lot["id"]),
+            added=("external_claim_harness", "external_claim_binding"))
+        stored = work.get(self.db, lot["id"])
+        self.assertEqual(stored["external_claim_session"], "BG")
+        self.assertIsNone(stored["external_claim_harness"])
+        self.assertIsNone(stored["external_claim_binding"])
+        with self.assertRaises(work.WorkError) as raised:
+            self.check(lot["id"], proof=self.proof_of(bg))
+        self.assertIn("carries no full verified identity", str(raised.exception))
+        # la porteuse libère l'ancienne prise (sans identité complète)…
+        self.assertEqual(self.release(lot["id"], "BG", proof=self.proof_of(bg))
+                         ["session"], "BG")
+        # …puis reprend avec l'identité complète : la porte passe
+        self.claim(lot["id"], "BG", proof=self.proof_of(bg))
+        out = self.check(lot["id"], proof=self.proof_of(bg))
+        self.assertEqual(out["binding"], int(bg["id"]))
+        self.assertEqual(out["session"], "BG")
+
     def test_cli_check_est_la_porte_avant_le_premier_geste(self):
         lot = self.reserve()
         bg = self.bind_session("s-bg")
