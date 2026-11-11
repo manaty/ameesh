@@ -389,6 +389,32 @@ class ComposeTest(Base):
         self.assertEqual(len(left), 1, left)
         self.assertIn("laissé au pilote", self.shell.mails[-1][1])
 
+    def test_dispense_laissee_au_pilote_une_seule_note_par_tete(self):
+        # revue ameesh-dev3 : une reprise sur la même tête (ci run en échec,
+        # MARK_CI non posé) ne réécrit pas la note.
+        self.shell.items[4000] = carrier()
+        self.shell.refuse_waiver = True
+        self.ctx.actor = "mty-amh-impl-01"
+        for _ in range(2):
+            ph.publish(self.ctx, self.shell.items[4000])
+        left = [n for n in ph.marks(self.shell.items[4000])
+                if n.startswith(ph.MARK_WAIVE_LEFT + HEAD)]
+        self.assertEqual(len(left), 1, left)
+
+    def test_dispense_posee_entre_lecture_et_refus(self):
+        # #6926 : la pose automatique arrive après la lecture du porteur ; la
+        # relecture après le refus la voit, aucune note de renvoi au pilote.
+        self.shell.items[4000] = carrier()
+        stale = dict(self.shell.items[4000])
+        self.shell.items[4000].update(reviewer="-none", reviewers=["-none"])
+        self.shell.refuse_waiver = True
+        self.ctx.actor = "mty-amh-impl-01"
+        self.assertIn("ci-full demandée", ph.publish(self.ctx, stale))
+        self.assertTrue(self.shell.ran("work", "reviewer", "4000", "--no-verdict"))
+        self.assertFalse([n for n in ph.marks(self.shell.items[4000])
+                          if n.startswith(ph.MARK_WAIVE_LEFT)])
+        self.assertIn("déjà posé", self.shell.mails[-1][1])
+
     def test_autre_echec_du_verdict_reste_un_echec(self):
         self.shell.items[4000] = carrier()
         self.shell.waiver_rc = (1, "error: verdict not required refused: lot 4000 "

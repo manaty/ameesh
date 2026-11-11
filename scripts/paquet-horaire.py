@@ -1899,7 +1899,7 @@ def waive(ctx: Context, item: dict, sha: str) -> str:
                            % (carrier, result.returncode, auto._tail(result.text, 20)))
     if waived(show(ctx, carrier)):
         return "Fusions propres seulement : « verdict non requis » déjà posé (§2)."
-    if MARK_WAIVE_LEFT + sha not in marks(item):
+    if not any(note.startswith(MARK_WAIVE_LEFT + sha) for note in marks(item)):
         ctx.note(carrier, MARK_WAIVE_LEFT + sha + " (%s sans ce geste)" % ctx.actor)
     return ("« verdict non requis » refusé à %s : laissé au pilote (#1979) ; "
             "la fusion automatique attend ce geste." % ctx.actor)
