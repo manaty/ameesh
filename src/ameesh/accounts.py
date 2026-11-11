@@ -1120,6 +1120,10 @@ class Evaluation:
     held: tuple | None = None
     #: L226b: {gauge key: (cap, label)}, the cap each window is held to
     limits: dict = field(default_factory=dict)
+    #: #6958 : `limits` a été calculé avec la réserve des non-critiques
+    #: (`evaluate(reserve=True)`) — le rythme et la fenêtre courte la portent
+    #: déjà ; `_informative_partial` ne la retranche pas une seconde fois.
+    reserve: bool = False
     #: #1176 : {clé de jauge: Ceiling}, le plafond de rythme effectif du compte
     #: (de base ou relevé en fin de fenêtre), avec sa raison
     ceilings: dict = field(default_factory=dict)
@@ -1659,7 +1663,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     déclenche aucune E/S réseau. `_gauges` est la relecture interne qui
     n'ouvre pas une seconde sonde.
     """
-    result = Evaluation(profile)
+    result = Evaluation(profile, reserve=reserve)
     result.problems = check(profile, environ)
     if result.problems:
         result.reason = "unusable profile: %s" % "; ".join(result.problems)
@@ -2178,7 +2182,11 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
     * **chaque** fenêtre encore ouverte (non datée comprise : elle ne prouve
       pas sa remise à zéro) reste sous son plafond effectif moins `RESERVE`
       (`Evaluation.limits` : rythme, fenêtre courte, plafond fixe ou d'overage
-      — jamais `held_cap` seul, qui ignore les plafonds fixes).
+      — jamais `held_cap` seul, qui ignore les plafonds fixes). La réserve
+      n'est retranchée qu'**une fois** : quand `limits` a été calculé avec
+      elle (`Evaluation.reserve`, #6958), le rythme et la fenêtre courte la
+      portent déjà ; les plafonds fixes ne la portent jamais — elle s'y
+      applique ici.
 
     Sans preuve (âge inconnu, aucune fenêtre datée ouverte, plafond absent), le
     relevé reste périmé : fraîcheur 2. L'incident #1672 (relevé de quatre
@@ -2204,7 +2212,14 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
         found = result.limits.get(gauge.key)
         if found is None:
             return False
-        if gauge.used_at(now) >= max(0.0, found[0] - RESERVE):
+        cap, label = found
+        # #6958 : `limits(reserve=True)` a déjà baissé le rythme et la fenêtre
+        # courte de la réserve ; la retrancher encore jugeait un relevé partiel
+        # sous 0 % (primaire : 3 % pour un plafond déjà réservé de 10 %). Les
+        # plafonds fixes, eux, ne la portent jamais.
+        cut = (0.0 if result.reserve
+               and label in ("pace cap", "short window cap") else RESERVE)
+        if gauge.used_at(now) >= max(0.0, cap - cut):
             return False
     return True
 
@@ -3345,6 +3360,16 @@ def format_rows(rows: list[dict]) -> str:
             for g in row["gauges"]) or "—"
         lines.append("%-9s %-14s %-7s %-8s %s" % (
             row["harness"], row["account"], actif, etat, gauges))
+        if row["active"] and not row["forced"] and not row["ok"] and any(
+                r.get("next") and r.get("harness") == row["harness"] for r in rows):
+            # #6958 : « active » est le dernier choix PARTAGÉ (L242b) ; un agent
+            # critique choisit le sien sans l'écrire, et l'actif au-dessus de sa
+            # pause ne cède qu'à la prochaine session non critique. Sans cette
+            # mention, un hôte sans consommateur non critique se lit « bloqué ».
+            lines.append("%-9s %-14s %-7s %-8s ↳ active = last shared choice, "
+                         "above its pause threshold: the next non-critical "
+                         "session switches; a critical agent chooses its own"
+                         % ("", "", "", ""))
         if row.get("stale"):
             # #1561 : le relevé n'est plus un instantané courant (une fenêtre
             # remise à zéro, une autre encore ouverte) — la valeur lue n'est
