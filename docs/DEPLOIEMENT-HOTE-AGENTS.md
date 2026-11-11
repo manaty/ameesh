@@ -1023,6 +1023,56 @@ l'exécutant reste sur sa version : la qualification lit la version
 réellement lancée (`venv-courant` et `MainPID`), jamais celle qu'on croit
 installée.
 
+**Garde de démarrage du staging (#6806).** Le service de l'exécutant élu
+n'est admis que si son contexte et son environnement public sont ceux de
+l'élection : uid 980, nodename `ameesh-agents-1` ou `ameesh-agents-2`, acteur
+`ameesh:staging`, home `0700`, parents de configuration non inscriptibles par
+le groupe ni les autres, et `~/.config/ameesh/bascule.env` régulier `0600` à
+lien unique dont le contenu complet est épinglé par `ENV_SHA`. La garde et son
+drop-in sont désormais du code du dépôt, plus du code d'hôte hors dépôt :
+
+* `deploy/mise-a-jour/staging-startup-guard.py` (sha256 `4bde802e…`) ;
+* `deploy/mise-a-jour/systemd/ameesh-staging-10-native-actor.conf` (sha256
+  `ce3ed09c…`), qui pose `AMEESH_OPERATEUR=ameesh:staging` et l'`ExecStartPre`
+  de la garde dans `~ameesh-staging/.config/systemd/user/ameesh-staging.service.d/` ;
+* `deploy/mise-a-jour/garde-staging.py`, l'installateur.
+
+`vm.sh agents installer` envoie ces pièces **depuis le poste** (la version
+de la garde est celle du checkout de `vm.sh`, comme `bascule.py`) vers
+`/root/.cache/ameesh/garde-<pid>` (0700), puis exécute l'installateur en root
+à sa dernière étape : le code posé ne vient jamais de
+l'arbre du compte `ameesh`, qu'un tour d'agent peut écrire. L'installateur
+fait ensuite tourner la garde sous le compte dédié : la pose n'est déclarée
+réussie que si elle rend 0. Un hôte sans compte `ameesh-staging` (AG3) rend 3
+et l'étape est un saut attendu ; le dossier d'envoi est retiré dans tous les
+cas. Aucun service n'est démarré ni arrêté par la pose ; le drop-in ne
+s'applique qu'au prochain démarrage de l'unité.
+
+Une édition manuelle de `bascule.env` fait refuser l'installation, par un
+refus nommé qui affiche l'empreinte attendue et lue. Le **chemin de mise à
+jour du hash** est la revue puis l'autorisation explicite :
+
+```sh
+GARDE_ACCEPTER_BASCULE=1 deploy/mise-a-jour/vm.sh agents installer <ref>
+```
+
+L'installateur réécrit alors `PUBLIC_ENV` (donc `ENV_SHA`) dans la copie
+installée ; le drop-in, inchangé, n'est pas reposé. La même autorisation se
+donne directement à l'installateur par `--accepter-bascule`, et son
+sous-commande `pin --accepter-bascule` ne réécrit que `PUBLIC_ENV`. Sans
+autorisation, un fichier qui diffère du versionnement est refusé et rien
+n'est posé. L'installateur expose aussi `verifier` (faire tourner la garde
+installée) et `--a-blanc` (montrer sans modifier) pour un opérateur qui
+l'exécute sur l'hôte. Le refus du service reste « Elected staging startup
+refused: actor or protected configuration ».
+
+La copie versée est celle du dossier #5495 (celle d'AG2) ; son identité avec
+la garde **en service** sur AG1 n'est pas prouvée par ce lot. À la première
+pose, le bureau compare le sha256 de la garde installée à l'attendu
+`4bde802e…` et le consigne, avant de considérer l'identité acquise. Un retour
+de code ne retire pas la garde : elle est l'infrastructure d'hôte, et son
+retrait éventuel est un geste manuel distinct, hors de ce lot.
+
 Les candidats sont des noms d'hôtes de configuration, jamais des constantes
 du code. Ils doivent avoir le même `key`, le même rôle élu, accès à la base,
 un clone dédié contenant le commit demandé et les accès de déploiement

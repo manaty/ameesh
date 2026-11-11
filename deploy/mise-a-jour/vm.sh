@@ -69,6 +69,10 @@
 # attente : c'est un interrupteur. > 0 pose la pause opérateur #2152
 # juste avant l'arrêt du seul agent courant (K = 0), puis la lève après son
 # démarrage ; 0 l'arrêt prouvé #1152 sans pause.
+# GARDE_ACCEPTER_BASCULE (0, défaut) : après revue du contenu public de
+# ~ameesh-staging/.config/ameesh/bascule.env, 1 autorise l'installateur de la
+# garde de staging (#6806) à mettre à jour l'empreinte ENV_SHA ; 0 refuse un
+# fichier qui diffère du versionnement.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -210,6 +214,11 @@ envoyer_bascule_vm() {
   ssh_vm "umask 077; mkdir -p ${BASCULE_VM%/*} && cat > $BASCULE_VM" < "$ICI/bascule.py"
 }
 BASCULE_AGENTS=/home/ameesh/.local/state/ameesh/mise-a-jour/bascule-$$.py
+# #6806 : pieces de la garde de staging envoyees depuis le poste (comme
+# bascule.py) vers un dossier prive de root sur la cible, puis executees en
+# root : jamais depuis l'arbre du compte ameesh, qu'un tour d'agent peut
+# ecrire.
+GARDE_AGENTS_DIR=/root/.cache/ameesh/garde-$$
 envoyer_bascule_agents() {
   local b64
   [ -r "$ICI/bascule.py" ] || { echo "bascule.py introuvable : $ICI/bascule.py" >&2; return 1; }
@@ -1871,6 +1880,56 @@ reinstaller_agents() {
     python3 $BASCULE_AGENTS activer --venv \"\$V\" --version $court ${precedent:+--precedent $precedent}
     \"\$V/bin/python\" -c 'import psycopg, cryptography, ameesh; print(\"psycopg\", psycopg.__version__, \"crypto\", cryptography.__version__)'"
 }
+
+# --- garde de demarrage du staging (#6806) ---------------------------------
+# La garde (empreinte sha256 de bascule.env, ENV_SHA) etait du code d'hote
+# hors depot : elle est desormais versee dans deploy/mise-a-jour/. `vm.sh`
+# l'envoie depuis le poste, comme bascule.py, dans un dossier prive de root
+# (0700) puis execute l'installateur en root : le code pose ne vient jamais de
+# l'arbre du compte ameesh, qu'un tour d'agent peut ecrire. L'installateur
+# rend 3 quand le compte dedie ameesh-staging n'existe pas (AG3) : saut
+# attendu. Aucun service n'est demarre ni arrete ; la pose verifie ensuite la
+# garde sous le compte dedie.
+envoyer_garde_agents() {
+  local piece b64 pieces=(garde-staging.py staging-startup-guard.py
+    systemd/ameesh-staging-10-native-actor.conf)
+  ssh_agents "umask 077; rm -rf $GARDE_AGENTS_DIR; mkdir -p $GARDE_AGENTS_DIR/systemd" \
+    || return 1
+  for piece in "${pieces[@]}"; do
+    if [ ! -r "$ICI/$piece" ]; then
+      echo "piece de la garde introuvable : $ICI/$piece" >&2
+      return 1
+    fi
+    b64=$(base64 -w0 "$ICI/$piece") || return 1
+    ssh_agents "printf %s '$b64' | base64 -d > $GARDE_AGENTS_DIR/$piece" \
+      || return 1
+  done
+}
+installer_garde_staging() {  # $1 : sha40 installe (pour la trace)
+  local rc=0 accepter=
+  etape "garde de demarrage du staging (#6806) sur $HOTE_AGENTS (code ${1:0:9})"
+  case "${GARDE_ACCEPTER_BASCULE:-0}" in
+    0) ;;
+    1) accepter='--accepter-bascule'
+       echo "bascule.env : changement revu, ENV_SHA sera mis a jour (GARDE_ACCEPTER_BASCULE=1)" ;;
+    *) echo "GARDE_ACCEPTER_BASCULE invalide : « ${GARDE_ACCEPTER_BASCULE} » (0 ou 1 attendu)" >&2
+       return 1 ;;
+  esac
+  if ! envoyer_garde_agents; then
+    ssh_agents "rm -rf $GARDE_AGENTS_DIR" || true
+    echo "pieces de la garde non envoyees : garde de staging non posee" >&2
+    return 1
+  fi
+  ssh_agents "python3 $GARDE_AGENTS_DIR/garde-staging.py --source $GARDE_AGENTS_DIR/staging-startup-guard.py installer $accepter --dropin $GARDE_AGENTS_DIR/systemd/ameesh-staging-10-native-actor.conf" \
+    || rc=$?
+  ssh_agents "rm -rf $GARDE_AGENTS_DIR" || true
+  case "$rc" in
+    0) echo "garde installee sous le compte ameesh-staging (verifiee si l'hote est candidat)" ;;
+    3) echo "hote sans compte ameesh-staging : aucune garde de staging a poser (saut attendu)" ;;
+    *) echo "garde de staging non installee (rc $rc)" >&2; return 1 ;;
+  esac
+}
+
 # --- agent GnuPG des VM d'agents (#3320) -----------------------------------
 # Un hôte d'agents ne tient aucune clé privée : l'agent GnuPG n'y sert à rien
 # et, non dumpable, il retient le ménage des sorties de build (#3195). Après
@@ -2230,6 +2289,14 @@ installer_agents() {
   # Idempotent : relancer « installer » rejoue l'étape, sockets déjà masqués.
   if ! masquer_agent_gpg_agents; then
     echo "étape GnuPG en échec : code ${sha:0:9} installé ; la relancer par « $0 agents installer ${sha:0:9} » (idempotente)" >&2
+    return 1
+  fi
+  # #6806 : la garde de demarrage du staging est du code d'hote ; elle est
+  # envoyee depuis le poste (comme bascule.py), jamais executee depuis l'arbre
+  # du compte ameesh. Un echec ne defait pas le code (previous-sha est deja
+  # ecrit) : relancer « installer » est idempotent.
+  if ! installer_garde_staging "$sha"; then
+    echo "code ${sha:0:9} installe mais garde de staging non posee ; relancer « $0 agents installer ${sha:0:9} » (idempotente)" >&2
     return 1
   fi
   echo "installé depuis src-$court (avant $complet). Les exécuteurs tournent encore l'ancien code : « $0 agents redemarrer », puis « $0 agents controler »."
