@@ -23,7 +23,11 @@ contenu public exact de `~ameesh-staging/.config/ameesh/bascule.env`
   * un hote sans compte `ameesh-staging` (AG3) sort en 3 : rien a poser.
 
 Aucun service n'est demarre ni arrete. `--a-blanc` ne modifie rien. Un echec
-de verification restaure les octets precedents.
+de verification restaure les octets precedents. Les acces au home du compte
+passent par des descripteurs de repertoire ancres (chaque composant ouvert
+sans suivre de lien, ecritures et remplacements relatifs au parent ouvert) :
+la substitution d'un parent apres controle ne detourne ni une lecture ni une
+ecriture.
 """
 from __future__ import annotations
 
@@ -138,75 +142,99 @@ def rendre(source: bytes, home: Path, env: bytes) -> bytes:
     return neuf
 
 
-def _dossier_sur(chemin: Path, uid: int, gid: int) -> None:
-    """Cree le dossier et ses parents manquants, sans suivre de lien.
+def _ouvrir_home(home: Path, uid: int) -> int:
+    """Descripteur du home du compte, sans suivre de lien, controle 0700."""
+    try:
+        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise Refus('home du compte illisible : %s' % exc) from None
+    meta = os.fstat(fd)
+    if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid
+            or stat.S_IMODE(meta.st_mode) != 0o700):
+        os.close(fd)
+        raise Refus('home dedie attendu en 0700 et proprietaire du compte')
+    return fd
 
-    Chaque niveau existant doit etre un dossier du compte, non inscriptible
-    par le groupe ni par les autres ; chaque niveau cree est pose 0755 et
-    appartient au compte, comme le reste de son home.
+
+def _ouvrir_dossier(parent_fd: int, composants, uid: int, gid: int,
+                    creer: bool) -> int:
+    """Ouvre les composants sous parent_fd, sans suivre aucun lien.
+
+    Chaque composant est resolu relativement au descripteur precedent : une
+    substitution du parent apres controle ne detourne pas l'ecriture. Les
+    niveaux crees sont poses 0755 et appartiennent au compte.
     """
-    manquants = []
-    courant = chemin
-    while True:
-        try:
-            meta = courant.lstat()
-        except FileNotFoundError:
-            manquants.append(courant)
-            if courant.parent == courant:
-                raise Refus('dossier introuvable : %s' % chemin) from None
-            courant = courant.parent
-            continue
-        if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid
-                or stat.S_IMODE(meta.st_mode) & 0o022):
-            raise Refus('dossier non sur : %s' % courant)
-        break
-    for dossier in reversed(manquants):
-        try:
-            os.mkdir(dossier, 0o755)
-        except FileExistsError:
-            pass
-        fd = os.open(dossier, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fchown(fd, uid, gid)
-            os.fchmod(fd, 0o755)
-            meta = os.fstat(fd)
-        finally:
+    fd = os.dup(parent_fd)
+    try:
+        for nom in composants:
+            cree = False
+            for _ in range(3):
+                try:
+                    suivant = os.open(nom, os.O_RDONLY | os.O_DIRECTORY
+                                      | os.O_NOFOLLOW, dir_fd=fd)
+                    break
+                except FileNotFoundError:
+                    if not creer:
+                        raise Refus('dossier de configuration introuvable : %s'
+                                    % nom) from None
+                    try:
+                        os.mkdir(nom, 0o755, dir_fd=fd)
+                        cree = True
+                    except FileExistsError:
+                        pass
+                    except OSError as exc:
+                        raise Refus('dossier non creable (%s) : %s'
+                                    % (nom, exc)) from None
+                except OSError as exc:
+                    raise Refus('dossier non sur (%s) : %s' % (nom, exc)) from None
+            else:
+                raise Refus('dossier instable : %s' % nom)
+            try:
+                if cree:
+                    os.fchown(suivant, uid, gid)
+                    os.fchmod(suivant, 0o755)
+                meta = os.fstat(suivant)
+            except BaseException:
+                os.close(suivant)
+                raise
+            if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid
+                    or stat.S_IMODE(meta.st_mode) & 0o022
+                    or (cree and stat.S_IMODE(meta.st_mode) != 0o755)):
+                os.close(suivant)
+                raise Refus('dossier non sur : %s' % nom)
             os.close(fd)
-        if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid
-                or stat.S_IMODE(meta.st_mode) != 0o755):
-            raise Refus('dossier cree non conforme : %s' % dossier)
+            fd = suivant
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def lire_bascule(home: Path, uid: int) -> bytes:
-    """Memes controles de metadonnees que la garde, puis le contenu public."""
+    """Memes controles que la garde, sur des descripteurs ancres au home."""
+    home_fd = _ouvrir_home(home, uid)
     try:
-        meta = home.lstat()
-    except OSError as exc:
-        raise Refus('home du compte illisible : %s' % exc) from None
-    if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid
-            or stat.S_IMODE(meta.st_mode) != 0o700):
-        raise Refus('home dedie attendu en 0700 et proprietaire du compte')
-    for parent in (home / '.config', home / '.config/ameesh'):
+        config_fd = _ouvrir_dossier(home_fd, ('.config', 'ameesh'),
+                                    uid, 0, False)
+    finally:
+        os.close(home_fd)
+    try:
         try:
-            meta = parent.lstat()
+            fd = os.open('bascule.env',
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=config_fd)
         except OSError as exc:
-            raise Refus('parent de configuration illisible : %s' % exc) from None
-        if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid
-                or stat.S_IMODE(meta.st_mode) & 0o022):
-            raise Refus('parent de configuration non sur : %s' % parent)
-    chemin = home / BASCULE_REL
-    try:
-        fd = os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError as exc:
-        raise Refus('bascule.env illisible : %s' % exc) from None
-    with os.fdopen(fd, 'rb') as flux:
-        meta = os.fstat(flux.fileno())
-        if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != uid
-                or stat.S_IMODE(meta.st_mode) != 0o600 or meta.st_nlink != 1):
-            raise Refus('bascule.env : fichier regulier 0600, un seul lien attendu')
-        if meta.st_size > TAILLE_MAX:
-            raise Refus('bascule.env : taille maximale depassee')
-        data = flux.read(TAILLE_MAX + 1)
+            raise Refus('bascule.env illisible : %s' % exc) from None
+        with os.fdopen(fd, 'rb') as flux:
+            meta = os.fstat(flux.fileno())
+            if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != uid
+                    or stat.S_IMODE(meta.st_mode) != 0o600 or meta.st_nlink != 1):
+                raise Refus('bascule.env : fichier regulier 0600, un seul lien attendu')
+            if meta.st_size > TAILLE_MAX:
+                raise Refus('bascule.env : taille maximale depassee')
+            data = flux.read(TAILLE_MAX + 1)
+    finally:
+        os.close(config_fd)
     if len(data) != meta.st_size or len(data) > TAILLE_MAX:
         raise Refus('bascule.env : lecture incomplete')
     return data
@@ -219,29 +247,35 @@ def verifier_acteur(env: bytes) -> None:
         raise Refus("bascule.env : une seule ligne AMEESH_OPERATEUR=ameesh:staging attendue")
 
 
-def _lire_ancien(chemin: Path) -> bytes | None:
-    """Octets de la cible, ou None si absente ; refuse tout non-regulier."""
+def _lire_ancien(dir_fd: int, nom: str) -> bytes | None:
+    """Octets de la cible sous dir_fd, ou None si absente ; jamais un lien."""
     try:
-        meta = chemin.lstat()
+        meta = os.stat(nom, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(meta.st_mode):
-        raise Refus('cible non reguliere : %s' % chemin)
+        raise Refus('cible non reguliere : %s' % nom)
     if meta.st_size > TAILLE_MAX:
-        raise Refus('cible surdimensionnee : %s' % chemin)
-    fd = os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW)
+        raise Refus('cible surdimensionnee : %s' % nom)
+    try:
+        fd = os.open(nom, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError as exc:
+        raise Refus('cible illisible (%s) : %s' % (nom, exc)) from None
     with os.fdopen(fd, 'rb') as flux:
         return flux.read(TAILLE_MAX + 1)
 
 
-def _ecrire_atomique(chemin: Path, data: bytes, mode: int, uid: int, gid: int) -> None:
-    _dossier_sur(chemin.parent, uid, gid)
-    temporaire = chemin.parent / ('.%s.tmp-%d' % (chemin.name, os.getpid()))
+def _ecrire_atomique(dir_fd: int, nom: str, data: bytes, mode: int,
+                     uid: int, gid: int) -> None:
+    """Ecrit et remplace `nom` relativement au parent ouvert."""
+    temporaire = '.%s.tmp-%d' % (nom, os.getpid())
     try:
-        fd = os.open(temporaire, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        fd = os.open(temporaire, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode,
+                     dir_fd=dir_fd)
     except FileExistsError:
-        os.unlink(temporaire)
-        fd = os.open(temporaire, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        os.unlink(temporaire, dir_fd=dir_fd)
+        fd = os.open(temporaire, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode,
+                     dir_fd=dir_fd)
     try:
         with os.fdopen(fd, 'wb') as flux:
             os.fchmod(flux.fileno(), mode)
@@ -249,10 +283,10 @@ def _ecrire_atomique(chemin: Path, data: bytes, mode: int, uid: int, gid: int) -
             flux.write(data)
             flux.flush()
             os.fsync(flux.fileno())
-        os.replace(temporaire, chemin)
+        os.replace(temporaire, nom, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except BaseException:
         try:
-            os.unlink(temporaire)
+            os.unlink(temporaire, dir_fd=dir_fd)
         except FileNotFoundError:
             pass
         raise
@@ -278,14 +312,15 @@ def _verifier(compte: str, garde: Path, executer) -> subprocess.CompletedProcess
                       '-I', '-B', str(garde)], executer)
 
 
-def _restaurer(chemin: Path, ancien: bytes | None, mode: int, uid: int, gid: int) -> None:
+def _restaurer(dir_fd: int, nom: str, ancien: bytes | None, mode: int,
+               uid: int, gid: int) -> None:
     if ancien is None:
         try:
-            chemin.unlink()
+            os.unlink(nom, dir_fd=dir_fd)
         except FileNotFoundError:
             pass
     else:
-        _ecrire_atomique(chemin, ancien, mode, uid, gid)
+        _ecrire_atomique(dir_fd, nom, ancien, mode, uid, gid)
 
 
 def installer(home: Path, uid: int, gid: int, compte: str, source: Path,
@@ -339,33 +374,55 @@ def installer(home: Path, uid: int, gid: int, compte: str, source: Path,
     }
     if not appliquer:
         return compte_rendu
-    ancienne_garde = _lire_ancien(garde_cible)
-    ancien_dropin = _lire_ancien(dropin_cible) if contenu_dropin is not None else None
-    garde_change = ancienne_garde != garde
-    dropin_change = contenu_dropin is not None and ancien_dropin != contenu_dropin
+    home_fd = _ouvrir_home(home, uid)
+    garde_dir = None
+    dropin_dir = None
     try:
-        if garde_change:
-            _ecrire_atomique(garde_cible, garde, 0o755, uid, gid)
-        if dropin_change:
-            _ecrire_atomique(dropin_cible, contenu_dropin, 0o644, uid, gid)
-        if dropin_change:
-            _recharger(compte, home, uid, executer)
-        if compte_rendu['candidat']:
-            resultat = _verifier(compte, garde_cible, executer)
-            if resultat.returncode != 0:
-                raise Refus('la garde refuse apres installation (rc %d) : %s'
-                            % (resultat.returncode, (resultat.stderr or '').strip()))
-            compte_rendu['verifie'] = True
-    except BaseException:
-        if garde_change:
-            _restaurer(garde_cible, ancienne_garde, 0o755, uid, gid)
-        if dropin_change:
-            _restaurer(dropin_cible, ancien_dropin, 0o644, uid, gid)
-            try:
+        garde_dir = _ouvrir_dossier(home_fd, ('.local', 'libexec'),
+                                    uid, gid, True)
+        if contenu_dropin is not None:
+            dropin_dir = _ouvrir_dossier(
+                home_fd, ('.config', 'systemd', 'user',
+                          'ameesh-staging.service.d'), uid, gid, True)
+        ancienne_garde = _lire_ancien(garde_dir, garde_cible.name)
+        ancien_dropin = (_lire_ancien(dropin_dir, dropin_cible.name)
+                         if dropin_dir is not None else None)
+        garde_change = ancienne_garde != garde
+        dropin_change = contenu_dropin is not None and ancien_dropin != contenu_dropin
+        try:
+            if garde_change:
+                _ecrire_atomique(garde_dir, garde_cible.name, garde,
+                                 0o755, uid, gid)
+            if dropin_change:
+                _ecrire_atomique(dropin_dir, dropin_cible.name, contenu_dropin,
+                                 0o644, uid, gid)
+            if dropin_change:
                 _recharger(compte, home, uid, executer)
-            except Refus:
-                pass
-        raise
+            if compte_rendu['candidat']:
+                resultat = _verifier(compte, garde_cible, executer)
+                if resultat.returncode != 0:
+                    raise Refus('la garde refuse apres installation (rc %d) : %s'
+                                % (resultat.returncode,
+                                   (resultat.stderr or '').strip()))
+                compte_rendu['verifie'] = True
+        except BaseException:
+            if garde_change:
+                _restaurer(garde_dir, garde_cible.name, ancienne_garde,
+                           0o755, uid, gid)
+            if dropin_change:
+                _restaurer(dropin_dir, dropin_cible.name, ancien_dropin,
+                           0o644, uid, gid)
+                try:
+                    _recharger(compte, home, uid, executer)
+                except Refus:
+                    pass
+            raise
+    finally:
+        if dropin_dir is not None:
+            os.close(dropin_dir)
+        if garde_dir is not None:
+            os.close(garde_dir)
+        os.close(home_fd)
     return compte_rendu
 
 

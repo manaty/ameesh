@@ -284,17 +284,48 @@ class TestInstallateur(Banc):
     def test_refuse_un_parent_de_configuration_inscriptible(self):
         self.bascule()
         (self.home / '.config').chmod(0o777)
-        with self.assertRaisesRegex(garde_staging.Refus,
-                                    'parent de configuration non sur'):
+        with self.assertRaisesRegex(garde_staging.Refus, 'dossier non sur'):
             self.installer()
 
     def test_refuse_une_cible_symbolique(self):
         self.bascule()
         cible = self.home / garde_staging.GARDE_REL
-        cible.parent.mkdir(parents=True)
+        (self.home / '.local').mkdir(mode=0o755)
+        (self.home / '.local' / 'libexec').mkdir(mode=0o755)
         cible.symlink_to(self.base / 'ailleurs-garde')
         with self.assertRaisesRegex(garde_staging.Refus, 'cible non reguliere'):
             self.installer()
+
+    def test_refuse_un_parent_de_bascule_symbolique(self):
+        self.bascule()
+        (self.home / '.config' / 'ameesh').rename(self.base / 'ailleurs-config')
+        (self.home / '.config' / 'ameesh').symlink_to(self.base / 'ailleurs-config')
+        with self.assertRaisesRegex(garde_staging.Refus, 'dossier non sur'):
+            self.installer()
+
+    def test_ecriture_relative_au_dossier_ouvert_malgre_substitution(self):
+        # La course nommee par la revue : le parent est remplace par un lien
+        # apres l'ouverture ; l'ecriture doit rester dans le dossier ouvert.
+        self.bascule()
+        (self.home / '.local').mkdir(mode=0o755)
+        (self.home / '.local' / 'libexec').mkdir(mode=0o755)
+        home_fd = garde_staging._ouvrir_home(self.home, UID)
+        try:
+            dir_fd = garde_staging._ouvrir_dossier(
+                home_fd, ('.local', 'libexec'), UID, GID, False)
+        finally:
+            os.close(home_fd)
+        dehors = self.base / 'dehors'
+        dehors.mkdir()
+        (self.home / '.local' / 'libexec').rename(self.base / 'ouvert')
+        (self.home / '.local' / 'libexec').symlink_to(dehors)
+        try:
+            garde_staging._ecrire_atomique(dir_fd, 'preuve', b'ok\n',
+                                           0o755, UID, GID)
+        finally:
+            os.close(dir_fd)
+        self.assertEqual((self.base / 'ouvert' / 'preuve').read_bytes(), b'ok\n')
+        self.assertFalse((dehors / 'preuve').exists())
 
     def test_un_hote_sans_compte_sort_en_3(self):
         resultat = subprocess.run(
