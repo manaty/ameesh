@@ -58,6 +58,19 @@ def _codex_rollout(home: str, used_percent: float, resets_at: float) -> None:
                 "secondary": None}}}) + "\n")
 
 
+def _stamp_rollout(home: str, stamp: float) -> None:
+    """#6961 : pose l'instant du relevé du journal (mtime de la jauge Codex)."""
+    chemin = os.path.join(home, "sessions", "2026", "10", "05", "rollout-test.jsonl")
+    os.utime(chemin, (stamp, stamp))
+
+
+def _age_rollout(home: str, seconds: float) -> None:
+    """#6961 : vieillit le relevé du journal (le `read_at` d'une jauge Codex
+    est le mtime du fichier). Sert à figurer l'agent dont la lecture locale
+    est ANTÉRIEURE à l'observation partagée d'un autre hôte."""
+    _stamp_rollout(home, time.time() - seconds)
+
+
 class ProfilsTest(unittest.TestCase):
     """Configuration, validation, environnement, continuité (sans base)."""
 
@@ -326,7 +339,10 @@ class _Base(PgTestCase):
                       "spend_pending", "quota_gauge_readings", "provider_balances",
                       # #1883 : les empreintes de dossier publiées par les tests
                       # précédents ne doivent pas créer de faux conflits
-                      "account_identities"):
+                      "account_identities",
+                      # #6961 : la pause partagée d'un compte ne doit pas
+                      # retenir le compte d'un test suivant
+                      "account_pauses"):
             self.db.execute("DELETE FROM %s" % table)
 
     def _claude_comptes(self, partage: bool = True) -> list:
@@ -548,6 +564,143 @@ class ChoixTest(_Base):
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertIsNone(choix.profile)
         self.assertIn("not private", choix.reason)
+
+    # -- #6961 : pause partagée du compte (plafond dur) -------------------
+
+    def _items_plafonnes(self, cap: float = 0.8) -> list:
+        comptes = self._codex_comptes()
+        for compte in comptes:
+            compte["cap"] = cap
+        return accounts.parse({"codex": comptes})["codex"]
+
+    def test_plafond_dur_publie_une_pause_pour_les_autres_hotes(self):
+        """#6961, témoin : deux agents du même compte. Le premier voit le
+        plafond dur et publie la pause ; le second, dont le relevé local est
+        PLUS ANCIEN et sous le plafond, ne démarre pas tant qu'elle court."""
+        items = self._items_plafonnes()
+        now = time.time()
+        _codex_rollout(items[0].path, 95, now + 3600)
+        _codex_rollout(items[1].path, 96, now + 3600)
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+        self.assertIsNone(accounts.choose(
+            self.db, self.cfg.host, "codex", items, book, now=now).profile)
+        store = storage.of(self.db).accounts
+        pauses = store.account_pauses("codex")
+        self.assertEqual(set(pauses), {"primaire", "secondaire"})
+        self.assertEqual(pauses["primaire"]["source"],
+                         "%s@%s" % ("?", self.cfg.host))
+        self.assertGreater(float(pauses["primaire"]["until_ts"]), now)
+        # second agent : sa lecture locale (30 %, il y a 5 min) est ANTÉRIEURE
+        # à l'observation partagée ; l'historique est effacé pour ne prouver
+        # que la pause, pas la lecture des autres hôtes.
+        _codex_rollout(items[0].path, 30, now + 3600)
+        _age_rollout(items[0].path, 300)
+        self.db.execute("DELETE FROM quota_gauge_readings")
+        choix = accounts.choose(self.db, self.cfg.host, "codex", items[:1],
+                                book, now=now)
+        self.assertIsNone(choix.profile)
+        self.assertIn("paused at the account hard cap", choix.reason)
+        self.assertIn("primaire", store.account_pauses("codex"))
+        # l'échéance passée, le relevé sous le plafond reprend la main
+        choix = accounts.choose(self.db, self.cfg.host, "codex", items[:1],
+                                book, now=now + 3601)
+        self.assertEqual(choix.profile.name, "primaire")
+        self.assertNotIn("primaire", store.account_pauses("codex"))
+
+    def test_un_releve_plus_recent_sous_le_plafond_leve_la_pause(self):
+        """#6961 : la fenêtre se remet à zéro (ou un autre hôte la voit
+        repasser dessous) — un relevé plus RÉCENT et sous le plafond lève la
+        pause, sans attendre son échéance."""
+        items = self._items_plafonnes()
+        now = time.time()
+        _codex_rollout(items[0].path, 95, now + 3600)
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+        self.assertIsNone(accounts.choose(
+            self.db, self.cfg.host, "codex", items[:1], book, now=now).profile)
+        store = storage.of(self.db).accounts
+        self.assertIn("primaire", store.account_pauses("codex"))
+        _codex_rollout(items[0].path, 10, now + 3600)
+        _stamp_rollout(items[0].path, now + 1)
+        choix = accounts.choose(self.db, self.cfg.host, "codex", items[:1],
+                                book, now=now + 60)
+        self.assertIsNotNone(choix.profile, choix.reason)
+        self.assertEqual(choix.profile.name, "primaire")
+        self.assertEqual(store.account_pauses("codex"), {})
+
+    def test_publication_la_plus_recente_gagne(self):
+        """#6961 : deux hôtes publient — une lecture plus ancienne arrivée
+        après ne raccourcit ni ne déplace la pause."""
+        store = storage.of(self.db).accounts
+        store.publish_account_pause("codex", "primaire", 1000.0, 200.0,
+                                    "codex plan: in overage")
+        store.publish_account_pause("codex", "primaire", 2000.0, 100.0,
+                                    "codex plan: in overage")
+        ligne = store.account_pauses("codex")["primaire"]
+        self.assertEqual((ligne["until_ts"], ligne["observed_at"]), (1000.0, 200.0))
+        store.release_account_pause("codex", "primaire")
+        self.assertEqual(store.account_pauses("codex"), {})
+
+
+class PlafondTourTest(_Base):
+    """#6961 : la clôture d'un tour qui franchit le plafond dur en vol."""
+
+    def test_un_tour_en_vol_close_et_publie_la_pause(self):
+        comptes = self._codex_comptes()
+        for compte in comptes:
+            compte["cap"] = 0.8
+        items = accounts.parse({"codex": comptes})["codex"]
+        now = time.time()
+        _codex_rollout(items[0].path, 85, now + 3600)
+        _runner, worker = self._worker("plafond-en-vol", "codex", {"codex": comptes})
+        worker._account = items[0]
+        raison = worker.account_ceiling_due(now=now)
+        self.assertIn("account hard cap", raison)
+        self.assertIn("primaire", raison)
+        pause = storage.of(self.db).accounts.account_pauses("codex")["primaire"]
+        self.assertGreater(float(pause["until_ts"]), now)
+        self.assertEqual(pause["source"], "plafond-en-vol@%s" % self.cfg.host)
+        # au plus une relecture par minute : le point sûr suivant ne relit pas
+        self.assertIsNone(worker.account_ceiling_due(now=now + 1))
+        self.assertIn("account hard cap", worker.account_ceiling_due(now=now + 61))
+
+    def test_sous_le_plafond_aucune_cloture(self):
+        comptes = self._codex_comptes()
+        for compte in comptes:
+            compte["cap"] = 0.8
+        items = accounts.parse({"codex": comptes})["codex"]
+        now = time.time()
+        _codex_rollout(items[0].path, 40, now + 3600)
+        _runner, worker = self._worker("sous-plafond", "codex", {"codex": comptes})
+        worker._account = items[0]
+        self.assertIsNone(worker.account_ceiling_due(now=now))
+        self.assertEqual(storage.of(self.db).accounts.account_pauses("codex"), {})
+
+    def test_le_point_sur_clot_le_tour_au_plafond_du_compte(self):
+        """#6961 : la vérification est branchée sur les points sûrs du tour —
+        le premier point sûr après le franchissement clôt le harnais, l'appel
+        suivant n'a pas lieu."""
+        comptes = self._claude_comptes(partage=True)
+        _runner, worker = self._worker("plafond-point", "claude", {"claude": comptes})
+        try:
+            appels = [{"reread": 10, "tool": True},
+                      {"reread": 10, "tool": True, "sleep": 2}]
+            with mock.patch.object(
+                    worker, "account_ceiling_due",
+                    return_value="account hard cap: primaire (test)") as relu:
+                self.assertIsNotNone(self._tour(
+                    worker, AMEESH_TEST_CLAUDE_CALLS=json.dumps(appels),
+                    AMEESH_TEST_RATE_LIMIT=json.dumps({"five_hour": {
+                        "utilization": 0.3,
+                        "resetsAt": time.time() + 3600}})))
+            self.assertTrue(relu.called)
+            with open(worker._path("events.jsonl"), encoding="utf-8") as fh:
+                flux = fh.read()
+            self.assertIn('"tool_use_id": "outil-0"', flux)
+            self.assertNotIn('"tool_use_id": "outil-1"', flux)
+            self.assertTrue((worker.last_turn_closed or "").startswith(
+                "account hard cap"))
+        finally:
+            worker.watchdog_stop.set()
 
 
 class ExecuteurTest(_Base):

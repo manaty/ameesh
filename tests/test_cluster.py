@@ -229,6 +229,11 @@ FERMEES = {
     # (arbitrage pilote du 16/10) : la table reste fermée, aucun GRANT modifié.
     "account_identities": {"host", "harness", "account", "identity",
                            "first_seen", "last_seen"},
+    # #6961 (0569) : la pause partagée d'un compte (plafond dur observé sur
+    # un hôte, lue par tous les agents) est un état interne de l'exécuteur ;
+    # aucun rôle superviseur ne la lit, aucun GRANT modifié.
+    "account_pauses": {"harness", "account", "until_ts", "observed_at", "reason",
+                       "source", "created_at", "updated_at"},
     # #1922 (0452) : registre Process des workflows (révision/étape, reçus d'étape) —
     # fermé tant que le contrat des rôles superviseur ne le classe pas (paquet du 16/10)
     "work_items": {"workflow_ref", "workflow_stage", "workflow_version"},

@@ -978,6 +978,9 @@ class AgentWorker(threading.Thread):
         self._turn_close_observation: dict | None = None
         #: #7008 : raison de la clôture dure du tour en cours (borne hors flux)
         self._turn_hard_closed: str | None = None
+        #: #6961 : prochaine relecture du plafond dur du compte pendant le
+        #: tour en vol (epoch) ; remise à zéro au départ de chaque tour.
+        self._account_ceiling_next: float = 0.0
         #: #6040 : seuil de compaction réellement passé au harnais de ce tour
         self._turn_compact_tokens: int | None = None
         #: M4 (#6662) : le réglage capturé **avant** le lancement pour la
@@ -2415,6 +2418,11 @@ class AgentWorker(threading.Thread):
     #: fond garde le délai de grâce, borné par l'échéance du retrait)
     HOST_SAFE_POINT = "safe point"
 
+    #: #6961 : intervalle minimal entre deux relectures du plafond dur du
+    #: compte pendant un tour. La lecture est locale (journaux du harnais) et
+    #: complétée par l'historique partagé : aucune requête au fournisseur.
+    ACCOUNT_CEILING_INTERVAL_S = 60.0
+
     def yield_to_host(self, reason: str) -> None:
         """L159f : l'échéance du retrait est atteinte, ou l'hôte s'arrête —
         le tour en cours s'arrête, groupe compris (grâce brève) ; sa consigne
@@ -2704,6 +2712,76 @@ class AgentWorker(threading.Thread):
         if duree_max > 0 and ecoule >= duree_max:
             return "maximum turn duration: %ds (cap %ds)" % (int(ecoule), duree_max)
         return None
+
+    def account_ceiling_due(self, now: float | None = None) -> str | None:
+        """#6961 : le compte du tour en vol a-t-il atteint son plafond dur ?
+
+        Appelé aux points sûrs du tour (pas à chaque événement) et au plus
+        toutes les `ACCOUNT_CEILING_INTERVAL_S` : relit la jauge du compte
+        choisi — locale, complétée par l'historique partagé des autres hôtes
+        (`_codex_with_history`) — et rend la raison de clôture si un plafond
+        FIXE est franchi (overage, `overage_cap`, plafond du compte). C'est
+        ce qui manquait le 11/11 : un tour parti à 0.79 a franchi 0.80 en vol
+        et n'a été vu qu'à sa fin (81 %).
+
+        Aucune requête au fournisseur (`probe=False`) : une lecture récente
+        suffit. Un plafond non daté ne clôt pas (aucune échéance à annoncer) ;
+        l'échec d'observation est consigné et ne casse pas le tour — le
+        prochain démarrage refait la garde complète (`budget_ok`).
+
+        Publie aussi la pause PARTAGÉE du compte pour que les autres agents,
+        même sur un autre hôte et avec une lecture plus ancienne, ne démarrent
+        pas de tour (voir `accounts.choose`). L'échec de cette écriture ne
+        retient pas la clôture locale."""
+        compte = getattr(self, "_account", None)
+        if not isinstance(compte, accounts_mod.Profile):
+            return None
+        now = time.time() if now is None else now
+        if now < getattr(self, "_account_ceiling_next", 0.0):
+            return None
+        self._account_ceiling_next = now + self.ACCOUNT_CEILING_INTERVAL_S
+        cfg = getattr(self, "cfg", None)
+        if cfg is None or not hasattr(self.runner, "budget_limits"):
+            return None
+        harness = compte.harness
+        try:
+            items = accounts_mod.profiles(cfg, harness)
+        except (accounts_mod.AccountError, OSError) as exc:
+            log_async("[%s] account ceiling check skipped (%s)"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+            return None
+        profile = accounts_mod.by_name(items, compte.name)
+        if profile is None:
+            return None
+        try:
+            limites = self.runner.budget_limits(self.db)
+            book = cost_mod.CostBook(
+                state_dir=cfg.state_dir, db=self.db,
+                tools={self.name: harness}, **limites.book_kwargs())
+            critique = account_turn.is_critical(self)
+            ev = accounts_mod.evaluate(
+                book, profile, items, now, record=False, critical=critique,
+                reserve=not critique,
+                model=account_turn.session_model(self, book), probe=False)
+        except Exception as exc:  # noqa: BLE001 — observation seule
+            log_async("[%s] account ceiling check skipped (%s)"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+            return None
+        if not ev.hard or ev.until is None or float(ev.until) <= now:
+            return None
+        raison = "account hard cap: %s (%s)" % (profile.name, ev.reason)
+        try:
+            storage.of(self.db).accounts.publish_account_pause(
+                harness, profile.name, float(ev.until),
+                accounts_mod._read_at_of(ev.gauges) or now,
+                ev.reason or "account at hard cap",
+                source="%s@%s" % (self.name, getattr(cfg, "host", "") or ""))
+        except Exception as exc:  # noqa: BLE001 — la clôture locale reste due
+            log_async("[%s] shared account pause not published (%s)"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+        log_async("[%s] %s: turn closed at the next safe point"
+                  % (self.name, raison))
+        return raison
 
     def reread_budget_due(self, live: dict) -> dict | None:
         """CTX-04a : un budget de relecture opt-in est-il dépassé ? (§5.1, 4)
@@ -9572,6 +9650,9 @@ class AgentWorker(threading.Thread):
         self._context_profile_observed = None
         self._context_profile_mode = None
         self._turn_close_observation = None
+        #: #6961 : la relecture du plafond du compte part au premier point sûr
+        #: de ce tour, puis au plus toutes les `ACCOUNT_CEILING_INTERVAL_S`.
+        self._account_ceiling_next = 0.0
         self._context_baseline = self._context_session_baseline(session)
         self._turn_hard_closed = None
         borne_dure = self.turn_hard_limit_seconds() if plafonne else 0.0
@@ -9820,6 +9901,21 @@ class AgentWorker(threading.Thread):
                         self.host_yield = self.HOST_SAFE_POINT
                         self._close_turn_now(
                             rp, "the host is withdrawing: turn stopped at a safe point")
+                    # #6961 : plafond dur du compte en vol. Un tour parti sous
+                    # le seuil peut le franchir (le 11/11 : 27 min, 10,6 M
+                    # jetons, 0.79 → 0.81). Au point sûr, on relit la jauge du
+                    # compte (locale + historique partagé, sans requête
+                    # fournisseur) et on clôt sans attendre la fin du tour.
+                    if plafonne and not clos and cloture is None \
+                            and parsed.get("safe_point"):
+                        plafond_compte = self.account_ceiling_due()
+                        if plafond_compte:
+                            cloture = plafond_compte
+                            self._turn_close_observation = {
+                                "kind": "account_cap",
+                                "reason": plafond_compte,
+                                "elapsed_s": round(time.time() - started, 3),
+                            }
                     if plafonne:
                         # L217b : le flux se lit jusqu'au bout, même après la
                         # clôture — un appel déjà en tampon compte encore.

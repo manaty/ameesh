@@ -1393,6 +1393,35 @@ class Accounts(Domain):
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
         """Les dernières bascules de l'hôte (toutes ou d'un harnais), récentes d'abord."""
 
+    # -- #6961 : pause partagée par compte --------------------------------
+    # Méthodes NON abstraites : le contrat de l'exécuteur médié (L107) ne
+    # change pas, et un stockage qui ne les porte pas (doublure de test,
+    # domaine refusé) garde la garde locale — la pause partagée est une
+    # défense en plus, jamais la seule décision.
+
+    def account_pauses(self, harness: str) -> dict[str, dict]:
+        """#6961 : pauses de compte encore publiées pour ce harnais.
+
+        {account: {until_ts, observed_at, reason, source}} ; une pause échue
+        (`until_ts <= now`) est ignorée par l'appelant, pas effacée ici. Le
+        compte est l'identité logique, le même sur tous les hôtes.
+        Défaut : aucune (stockage sans la table, doublure)."""
+        return {}
+
+    def publish_account_pause(self, harness: str, account: str, until_ts: float,
+                              observed_at: float, reason: str,
+                              source: str = "") -> None:
+        """#6961 : publie (ou rafraîchit) la pause du compte.
+
+        `observed_at` date le relevé qui la fonde : une publication plus
+        ancienne n'écrase pas une plus récente. Sans effet par défaut."""
+        return None
+
+    def release_account_pause(self, harness: str, account: str) -> None:
+        """#6961 : lève la pause du compte (relevé plus récent sous le
+        plafond, ou échéance passée). Sans effet par défaut."""
+        return None
+
 
 # --------------------------------------------------------------------------
 # crédits du compte fournisseur, par compte logique (#4164)
