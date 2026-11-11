@@ -30,6 +30,8 @@ LOCAL_PRIMARY = {
     "server_port": 5432,
     "database": "ameesh",
     "role_name": "ameesh",
+    "read_all_stats": True,
+    "superuser": True,
 }
 
 
@@ -43,6 +45,18 @@ def standby(name, *, sync="async", lag=0.0, state="streaming"):
             "sync_priority": 0 if sync != "sync" else 1,
             "write_lag_s": lag, "flush_lag_s": lag, "replay_lag_s": lag,
             "sent_lsn": "0/10", "replay_lsn": "0/10"}
+
+
+def masked_standby(pid=1234):
+    """Une ligne telle que PostgreSQL 17 la rend sans pg_read_all_stats.
+
+    Seul `pid` est visible ; tout le reste est NULL (walsender.c,
+    `pg_stat_get_wal_senders`, REL_17_STABLE).
+    """
+    return {"pid": pid, "application_name": None, "client_addr": None,
+            "state": None, "sync_state": None, "sync_priority": None,
+            "write_lag_s": None, "flush_lag_s": None, "replay_lag_s": None,
+            "sent_lsn": None, "replay_lsn": None}
 
 
 class FakeDb:
@@ -173,6 +187,73 @@ class ClusterStatusTest(unittest.TestCase):
         self.assertIn("db_replication_lag", kinds)
 
 
+class MaskedStatsTest(unittest.TestCase):
+    """PostgreSQL masque `pg_stat_replication` hors `pg_read_all_stats`.
+
+    Une ligne masquée ne doit être ni un secours, ni un retard, ni une
+    absence : elle se dit, et rien ne s'interprète à partir d'elle.
+    """
+
+    def unprivileged(self, **changes):
+        return dict(LOCAL_PRIMARY, read_all_stats=False, superuser=False,
+                    role_name="app", **changes)
+
+    def test_la_lecture_sonde_le_droit_de_voir_les_details(self):
+        self.assertIn("pg_read_all_stats", db_status._LOCAL_SQL)
+        self.assertIn("is_superuser", db_status._LOCAL_SQL)
+
+    def test_ligne_masquee_n_est_pas_un_secours(self):
+        local = self.unprivileged(synchronous_standby_names="n2")
+        status = db_status.read(
+            cfg(db_min_standbys=1), FakeDb(local=local,
+                                           standbys=[masked_standby()]))
+        self.assertFalse(status["visibility"]["privileged"])
+        self.assertEqual(status["visibility"]["masked_rows"], 1)
+        self.assertEqual(status["replication"]["masked"], 1)
+        self.assertEqual(status["standbys"], [])
+        self.assertEqual(status["replication"]["count"], 0)
+        self.assertIsNone(status["replication"]["max_lag_s"])
+        alerts = db_status.alerts_from_status(cfg(), status)
+        self.assertEqual([a["type"] for a in alerts], ["db_stats_masked"])
+        self.assertEqual(alerts[0]["masked"], 1)
+        self.assertIn("pg_read_all_stats", alerts[0]["detail"])
+        self.assertIn("masked", db_status.line(status))
+        text = "\n".join(db_status.format_lines(dict(status, alerts=[])))
+        self.assertIn("1 walsender(s) with masked statistics", text)
+        self.assertIn("pg_read_all_stats no", text)
+
+    def test_absence_reste_certaine_sans_privilege(self):
+        # Zéro ligne : le filtrage des lignes n'est pas masqué ; le secours
+        # attendu par synchronous_standby_names manque vraiment.
+        status = db_status.read(
+            cfg(), FakeDb(local=self.unprivileged(
+                synchronous_standby_names="n2")))
+        self.assertEqual(status["visibility"]["masked_rows"], 0)
+        self.assertEqual([a["type"] for a in
+                          db_status.alerts_from_status(cfg(), status)],
+                         ["db_no_standby"])
+
+    def test_retard_inconnu_visible_n_est_pas_du_masque(self):
+        status = db_status.read(
+            cfg(), FakeDb(standbys=[standby("n2", lag=None)]))
+        self.assertEqual(status["visibility"]["masked_rows"], 0)
+        self.assertEqual(status["replication"]["count"], 1)
+        self.assertIsNone(status["replication"]["max_lag_s"])
+        self.assertEqual(db_status.alerts_from_status(cfg(), status), [])
+
+    def test_sauvegarde_masquee_dit_la_visibilite_pas_l_absence(self):
+        # Une sauvegarde masquée ne se distingue pas d'un secours : on ne
+        # compte ni l'une ni l'autre, et on dit le masque.
+        local = self.unprivileged(synchronous_standby_names="n2")
+        status = db_status.read(
+            cfg(), FakeDb(local=local, standbys=[masked_standby()]))
+        kinds = [a["type"] for a in
+                 db_status.alerts_from_status(cfg(), status)]
+        self.assertEqual(kinds, ["db_stats_masked"])
+        self.assertNotIn("db_no_standby", kinds)
+        self.assertNotIn("db_sync_lost", kinds)
+
+
 class AlertTest(unittest.TestCase):
     def status(self, *, local=None, standbys=(), **changes):
         return db_status.read(cfg(**changes), FakeDb(
@@ -268,6 +349,45 @@ class AlertTest(unittest.TestCase):
         self.assertTrue(status["patroni"]["error"])
         self.assertEqual(self.kinds(status), [])
 
+    def test_cluster_a_deux_leaders_malgre_patroni_en_erreur(self):
+        # /patroni échoue mais /cluster répond : la preuve disponible suffit.
+        status = self.status()
+        status["patroni"] = db_status.patroni(
+            cfg(patroni_url="http://127.0.0.1:8008"),
+            reader=patroni_reader(
+                local=OSError("refused"),
+                cluster={"scope": "ameesh", "members": [
+                    {"name": "n1", "role": "leader"},
+                    {"name": "n2", "role": "leader"}]}))
+        self.assertEqual(status["patroni"]["errors"]["local"], "refused")
+        self.assertIsNone(status["patroni"]["errors"]["cluster"])
+        self.assertEqual([a["type"] for a in
+                          db_status.alerts_from_status(cfg(), status)],
+                         ["db_two_primaries"])
+        text = "\n".join(db_status.format_lines(dict(status, alerts=[])))
+        self.assertIn("leader n1, 2 members", text)
+        self.assertIn("local unreadable", text)
+
+    def test_cluster_illisible_ne_compare_pas_le_role_local(self):
+        # Le rôle local ne dit rien sans la vue DCS : aucune inférence.
+        status = self.status()
+        status["patroni"] = db_status.patroni(
+            cfg(patroni_url="http://127.0.0.1:8008"),
+            reader=patroni_reader(
+                local={"role": "primary", "patroni": {"name": "n1"}},
+                cluster=OSError("refused")))
+        self.assertEqual(status["patroni"]["errors"]["cluster"], "refused")
+        self.assertEqual(self.kinds(status), [])
+
+    def test_un_seul_leader_et_patroni_en_erreur_n_invente_rien(self):
+        status = self.status()
+        status["patroni"] = db_status.patroni(
+            cfg(patroni_url="http://127.0.0.1:8008"),
+            reader=patroni_reader(
+                local=OSError("refused"),
+                cluster={"members": [{"name": "n2", "role": "leader"}]}))
+        self.assertEqual(self.kinds(status), [])
+
 
 class PatroniTest(unittest.TestCase):
     def test_lecture_de_l_api_et_du_leader(self):
@@ -298,7 +418,7 @@ class PatroniTest(unittest.TestCase):
 class RegistrationTest(unittest.TestCase):
     def test_les_types_sont_declares_et_urgents(self):
         kinds = ("db_no_standby", "db_replication_lag",
-                 "db_sync_lost", "db_two_primaries")
+                 "db_sync_lost", "db_two_primaries", "db_stats_masked")
         for kind in kinds:
             with self.subTest(kind=kind):
                 self.assertIn(kind, exploitation.ALERT_TYPES)
@@ -306,6 +426,9 @@ class RegistrationTest(unittest.TestCase):
                 self.assertIn(kind, notify.TYPE_LABELS)
         for kind in ("db_no_standby", "db_sync_lost", "db_two_primaries"):
             self.assertIn(kind, notify.URGENT_TYPES)
+        # Une visibilité masquée est un diagnostic de surveillance, pas une
+        # panne de service : elle ne réveille pas.
+        self.assertNotIn("db_stats_masked", notify.URGENT_TYPES)
 
 
 class ConfigurationTest(unittest.TestCase):

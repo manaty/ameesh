@@ -241,7 +241,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #6871 (EP8.5a) : la grappe PostgreSQL du mesh — le PC peut
                  # être éteint, ces alertes partent d'un hôte du mesh.
                  "db_no_standby", "db_replication_lag",
-                 "db_sync_lost", "db_two_primaries",
+                 "db_sync_lost", "db_two_primaries", "db_stats_masked",
                  # #4609 : la sauvegarde quotidienne de la base du mesh n'a pas
                  # lu la base dans sa fenêtre — le propriétaire doit le savoir
                  "mesh_backup_unseen",
@@ -304,6 +304,7 @@ TYPE_LABELS = {
     "db_replication_lag": "database replication lag above threshold",
     "db_sync_lost": "database has no synchronous standby",
     "db_two_primaries": "database has two primaries",
+    "db_stats_masked": "database replication statistics masked",
     "mesh_backup_unseen": "mesh database backup not seen",
     "migration_pending_non_additive": "non-additive migration waiting",
     "staging_canon_stale": "staging executor canon behind the agents' canon",

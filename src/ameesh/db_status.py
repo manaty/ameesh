@@ -16,7 +16,19 @@ passe d'un hôte du mesh, PC éteint.
 - `db_sync_lost` : `synchronous_standby_names` est posé et aucun secours
   connecté n'est `sync`/`quorum` ;
 - `db_two_primaries` : Patroni voit deux leaders, ou ce nœud écrit alors que
-  le leader DCS est un autre membre.
+  le leader DCS est un autre membre ;
+- `db_stats_masked` : des walsenders sont visibles mais PostgreSQL en masque
+  l'état et les retards (rôle sans `pg_read_all_stats`) : rien n'est
+  interprété, et le chemin de lecture autorisé est dans
+  `docs/EXPLOITATION.md`.
+
+Depuis PostgreSQL 10, `pg_stat_get_wal_senders` ne laisse que `pid` aux rôles
+qui n'ont pas les privilèges de `pg_read_all_stats` (superutilisateur ou
+membre de `pg_monitor` compris) : tous les autres champs de la ligne sont
+NULL. Une telle ligne n'est jamais comptée comme un secours ni interprétée ;
+le statut dit la visibilité insuffisante et l'alerte `db_stats_masked` la
+porte. Zéro ligne, elle, reste une absence certaine : le filtrage des lignes
+n'est pas masqué, seules leurs colonnes le sont.
 
 Le mono-nœud actuel est le défaut : ni `patroni_url`, ni réplication
 configurée, `db_min_standbys = 0` — le statut est lisible et aucune alerte de
@@ -53,11 +65,13 @@ SELECT pg_is_in_recovery() AS in_recovery,
        host(inet_server_addr()) AS server_addr,
        inet_server_port() AS server_port,
        current_database() AS database,
-       current_user AS role_name
+       current_user AS role_name,
+       pg_has_role(current_user, 'pg_read_all_stats', 'USAGE') AS read_all_stats,
+       current_setting('is_superuser') AS superuser
 """
 
 _REPLICATION_SQL = """
-SELECT application_name, client_addr::text AS client_addr,
+SELECT pid, application_name, client_addr::text AS client_addr,
        state, sync_state, sync_priority,
        EXTRACT(EPOCH FROM write_lag) AS write_lag_s,
        EXTRACT(EPOCH FROM flush_lag) AS flush_lag_s,
@@ -124,20 +138,22 @@ def _json(base_url: str, path: str, *, timeout: float = PATRONI_TIMEOUT_S):
 def patroni(cfg, *, reader=_json) -> dict | None:
     """La vue Patroni, ou None si `patroni_url` n'est pas configurée.
 
-    Une API illisible ne casse jamais le statut : elle est dite dans `error`
-    et la détection « deux primaires » attend une lecture qui a conclu.
+    Une API illisible ne casse jamais le statut : chaque appel a son erreur
+    dans `errors` (`local`, `cluster`) et la détection « deux primaires »
+    n'exploite que les réponses qui ont conclu, indépendamment l'une de
+    l'autre.
     """
     url = str(getattr(cfg, "patroni_url", "") or "").strip()
     if not url:
         return None
     out = {"url": mask_url(url), "local": None, "members": [], "error": None,
+           "errors": {"local": None, "cluster": None},
            "name": None, "scope": None, "version": None, "paused": None}
-    errors = []
     try:
         local = reader(url, "/patroni")
     except Exception as exc:  # une sonde réseau ne casse pas le statut
         local = None
-        errors.append("local: %s" % _short(exc))
+        out["errors"]["local"] = _short(exc)
     if isinstance(local, dict):
         meta = local.get("patroni")
         meta = meta if isinstance(meta, dict) else {}
@@ -158,7 +174,7 @@ def patroni(cfg, *, reader=_json) -> dict | None:
         cluster = reader(url, "/cluster")
     except Exception as exc:
         cluster = None
-        errors.append("cluster: %s" % _short(exc))
+        out["errors"]["cluster"] = _short(exc)
     if isinstance(cluster, dict):
         members = cluster.get("members")
         if isinstance(members, list):
@@ -166,7 +182,9 @@ def patroni(cfg, *, reader=_json) -> dict | None:
         out["scope"] = out["scope"] or cluster.get("scope")
         if "pause" in cluster:
             out["paused"] = bool(cluster.get("pause"))
-    out["error"] = "; ".join(errors) or None
+    out["error"] = "; ".join(
+        "%s: %s" % (source, message)
+        for source, message in out["errors"].items() if message) or None
     return out
 
 
@@ -202,9 +220,25 @@ def _replication_rows(db) -> list[dict]:
     return list(db.query(_REPLICATION_SQL) or [])
 
 
-def _standbys(rows) -> list[dict]:
+def _masked_row(row) -> bool:
+    """Vrai pour une ligne de `pg_stat_replication` aux colonnes masquées.
+
+    PostgreSQL ne laisse que `pid` aux rôles sans les privilèges de
+    `pg_read_all_stats` : `application_name`, `state`, `sync_state` et les
+    retards sont NULL. Une telle ligne ne dit ni l'état ni le retard ; elle
+    ne doit jamais être comptée comme un secours.
+    """
+    return row.get("state") is None and row.get("application_name") is None
+
+
+def _standbys(rows):
+    """Les secours interprétables, et le nombre de lignes masquées écartées."""
     out = []
+    masked = 0
     for row in rows:
+        if _masked_row(row):
+            masked += 1
+            continue
         out.append({
             "name": row.get("application_name") or "",
             "client_addr": row.get("client_addr"),
@@ -217,7 +251,7 @@ def _standbys(rows) -> list[dict]:
             "sent_lsn": row.get("sent_lsn"),
             "replay_lsn": row.get("replay_lsn"),
         })
-    return out
+    return out, masked
 
 
 def _lag(standbys: list[dict]):
@@ -238,7 +272,9 @@ def read(cfg, db, *, patroni_reading: dict | None = None) -> dict:
     row = _node_row(db)
     in_recovery = _as_bool(row.get("in_recovery"))
     replication_rows = _replication_rows(db)
-    standbys = _standbys(replication_rows)
+    standbys, masked_rows = _standbys(replication_rows)
+    privileged = _as_bool(row.get("read_all_stats")) or _as_bool(
+        row.get("superuser"))
     if patroni_reading is None and not db_mod.is_dry_pass(db):
         patroni_reading = patroni(cfg)
     node_name = str(getattr(cfg, "host", "") or "")
@@ -276,8 +312,16 @@ def read(cfg, db, *, patroni_reading: dict | None = None) -> dict:
         },
         "primary": primary,
         "standbys": standbys,
+        "visibility": {
+            "role": row.get("role_name"),
+            "superuser": _as_bool(row.get("superuser")),
+            "read_all_stats": _as_bool(row.get("read_all_stats")),
+            "privileged": privileged,
+            "masked_rows": masked_rows,
+        },
         "replication": {
             "count": len(standbys),
+            "masked": masked_rows,
             "sync_count": sum(1 for s in standbys
                               if s.get("sync_state") in SYNC_STATES),
             "max_lag_s": _lag(standbys),
@@ -296,18 +340,35 @@ def _leaders(patroni_reading: dict) -> list[dict]:
             if str(m.get("role") or "").strip().lower() in LEADER_ROLES]
 
 
+def _patroni_errors(patroni_reading: dict) -> dict:
+    """Les erreurs par source Patroni (`local`, `cluster`).
+
+    Une vue sans le détail par source (ancien format, faux minimal) est
+    traitée comme deux lectures en erreur : on n'en infère rien.
+    """
+    errors = patroni_reading.get("errors")
+    if isinstance(errors, dict):
+        return {"local": errors.get("local"),
+                "cluster": errors.get("cluster")}
+    error = patroni_reading.get("error")
+    return {"local": error, "cluster": error}
+
+
 def _two_primaries(patroni_reading: dict) -> list[str]:
     """Les noms en conflit si deux nœuds peuvent écrire, sinon [].
 
-    Deux leaders dans la vue Patroni, ou ce nœud en `primary` alors que le
-    leader DCS est un autre membre : dans les deux cas, deux primaires sont
-    possibles et c'est l'alerte qui le dit.
+    Deux leaders dans `/cluster` sont concluants même si `/patroni` est en
+    erreur ; la comparaison du rôle local au leader DCS ne vaut que si les
+    deux réponses ont conclu. Chaque preuve disponible est exploitée seule,
+    sans inférer les données absentes.
     """
+    errors = _patroni_errors(patroni_reading)
     leaders = _leaders(patroni_reading)
-    if len(leaders) > 1:
+    if not errors.get("cluster") and len(leaders) > 1:
         return [str(m.get("name") or "?") for m in leaders]
     local = patroni_reading.get("local") or {}
-    if str(local.get("role") or "").strip().lower() in LEADER_ROLES:
+    if (not errors.get("local") and not errors.get("cluster")
+            and str(local.get("role") or "").strip().lower() in LEADER_ROLES):
         name = local.get("name")
         if leaders and leaders[0].get("name") != name:
             return [str(name or "?"), str(leaders[0].get("name") or "?")]
@@ -338,8 +399,21 @@ def alerts_from_status(cfg, status: dict | None) -> list[dict]:
     standbys = [s for s in standbys
                 if str(s.get("state") or "").strip().lower() != "backup"]
     in_recovery = _as_bool(node.get("in_recovery"))
+    visibility = status.get("visibility") or {}
+    masked = int(replication.get("masked") or 0)
     out = []
-    if not in_recovery:
+    if masked:
+        # Des lignes existent mais PostgreSQL en masque l'état et les retards :
+        # ni secours, ni retard, ni synchrone ne peuvent être interprétés.
+        # On le dit explicitement au lieu d'inventer les trois alertes.
+        role = visibility.get("role") or "the status role"
+        out.append(_alert(
+            "db_stats_masked", masked, 0,
+            "%d replication connection(s) visible but their state and lag are "
+            "masked: %s lacks pg_read_all_stats (grant it, or read with the "
+            "documented monitoring role)" % (masked, role),
+            masked=masked, role=role))
+    if not in_recovery and not masked:
         # Un secours ne voit pas les secours du primaire : ces trois alertes
         # se lisent depuis le primaire, jamais depuis un nœud qui rejoue.
         # Le deux-primaires, lui, se lit de partout (vue Patroni de grappe).
@@ -373,7 +447,7 @@ def alerts_from_status(cfg, status: dict | None) -> list[dict]:
                 "sync/quorum" % _short(names, 80),
                 standbys=len(standbys)))
     patroni_reading = status.get("patroni") or {}
-    if patroni_reading and not patroni_reading.get("error"):
+    if patroni_reading:
         names = _two_primaries(patroni_reading)
         if names:
             out.append(_alert(
@@ -415,11 +489,37 @@ def _one_standby(standby: dict) -> str:
     return " ".join(bits)
 
 
+def _patroni_text(patroni_reading: dict) -> str:
+    """La vue Patroni en une phrase, chaque source d'erreur dite à part."""
+    errors = _patroni_errors(patroni_reading)
+    local = patroni_reading.get("local") or {}
+    members = patroni_reading.get("members") or []
+    leaders = _leaders(patroni_reading)
+    if errors.get("local") and errors.get("cluster"):
+        return "unreadable (local: %s; cluster: %s)" % (
+            _short(errors["local"], 60), _short(errors["cluster"], 60))
+    if errors.get("cluster"):
+        return "local %s, cluster unreadable (%s)" % (
+            local.get("role") or "?", _short(errors["cluster"], 60))
+    if errors.get("local"):
+        return "leader %s, %d member%s (local unreadable: %s)" % (
+            leaders[0].get("name") if leaders else "none",
+            len(members), "" if len(members) == 1 else "s",
+            _short(errors["local"], 60))
+    return "leader %s, %d member%s, scope %s%s" % (
+        leaders[0].get("name") if leaders else "none",
+        len(members), "" if len(members) == 1 else "s",
+        patroni_reading.get("scope") or "?",
+        ", paused" if patroni_reading.get("paused") else "")
+
+
 def line(status: dict) -> str:
     """La ligne `db` du doctor, un seul paragraphe."""
     node = status.get("node") or {}
     replication = status.get("replication") or {}
+    visibility = status.get("visibility") or {}
     standbys = status.get("standbys") or []
+    masked = int(replication.get("masked") or 0)
     bits = ["%s (%s, PostgreSQL %s)" % (node.get("name") or "?",
                                         node.get("role") or "?", _version(status))]
     if _as_bool(node.get("in_recovery")):
@@ -428,27 +528,26 @@ def line(status: dict) -> str:
         bits.append("%d standby%s: %s" % (
             len(standbys), "" if len(standbys) == 1 else "s",
             "; ".join(_one_standby(s) for s in standbys)))
+    elif masked:
+        bits.append("%d walsender%s with masked statistics" % (
+            masked, "" if masked == 1 else "s"))
     elif replication.get("expected"):
         bits.append("no standby (%d expected)" % replication["expected"])
     else:
         bits.append("mono-node, no standby")
+    if masked:
+        bits.append("grant pg_read_all_stats to %s" % (
+            visibility.get("role") or "the reading role"))
+    elif not visibility.get("privileged", True):
+        bits.append("statistics restricted (role lacks pg_read_all_stats)")
     if replication.get("max_lag_s") is not None:
         bits.append("lag %.1f s / %.1f s" % (
             replication["max_lag_s"], replication.get("threshold_s") or 0.0))
     patroni_reading = status.get("patroni")
     if patroni_reading is None:
         bits.append("Patroni not configured")
-    elif patroni_reading.get("error"):
-        bits.append("Patroni unreadable (%s)" % _short(
-            patroni_reading["error"], 90))
     else:
-        leaders = _leaders(patroni_reading)
-        bits.append("Patroni leader %s, %d member%s" % (
-            leaders[0].get("name") if leaders else "none",
-            len(patroni_reading.get("members") or []),
-            "" if len(patroni_reading.get("members") or []) == 1 else "s"))
-        if patroni_reading.get("paused"):
-            bits.append("paused")
+        bits.append("Patroni " + _patroni_text(patroni_reading))
     return ", ".join(bits)
 
 
@@ -470,7 +569,9 @@ def format_lines(status: dict) -> list[str]:
     node = status.get("node") or {}
     client = status.get("client") or {}
     replication = status.get("replication") or {}
+    visibility = status.get("visibility") or {}
     standbys = status.get("standbys") or []
+    masked = int(replication.get("masked") or 0)
     patroni_reading = status.get("patroni")
     out = ["node       : %s (%s, PostgreSQL %s, up since %s)" % (
         node.get("name") or "?", node.get("role") or "?",
@@ -478,6 +579,11 @@ def format_lines(status: dict) -> list[str]:
     out.append("client     : %s, database %s, user %s" % (
         client.get("host") or "?", node.get("database") or "?",
         node.get("role_name") or "?"))
+    if masked or not visibility.get("privileged", True):
+        out.append("visibility : role %s, pg_read_all_stats %s%s" % (
+            node.get("role_name") or "?",
+            "yes" if visibility.get("privileged") else "no",
+            ", %d masked row(s)" % masked if masked else ""))
     primary = status.get("primary")
     if primary:
         out.append("primary    : %s (%s)" % (primary.get("name") or "?",
@@ -491,6 +597,10 @@ def format_lines(status: dict) -> list[str]:
         out.append("standbys   : %d connected, %d synchronous — %s" % (
             len(standbys), replication.get("sync_count") or 0,
             "; ".join(_one_standby(s) for s in standbys)))
+    elif masked:
+        out.append("standbys   : %d walsender(s) with masked statistics "
+                   "(grant pg_read_all_stats to %s)" % (
+                       masked, node.get("role_name") or "the reading role"))
     elif replication.get("expected"):
         out.append("standbys   : none (%d expected)" % replication["expected"])
     else:
@@ -503,16 +613,8 @@ def format_lines(status: dict) -> list[str]:
                    node.get("synchronous_standby_names") or ""))
     if patroni_reading is None:
         out.append("patroni    : not configured")
-    elif patroni_reading.get("error"):
-        out.append("patroni    : unreadable (%s)" % _short(
-            patroni_reading["error"]))
     else:
-        leaders = _leaders(patroni_reading)
-        out.append("patroni    : leader %s, %d member(s), scope %s%s" % (
-            leaders[0].get("name") if leaders else "none",
-            len(patroni_reading.get("members") or []),
-            patroni_reading.get("scope") or "?",
-            ", paused" if patroni_reading.get("paused") else ""))
+        out.append("patroni    : " + _patroni_text(patroni_reading))
     active = status.get("alerts") or []
     out.append("alerts     : %s" % (
         ", ".join(a["type"] for a in active) if active else "none"))
