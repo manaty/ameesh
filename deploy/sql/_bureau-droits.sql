@@ -71,6 +71,10 @@ INSERT INTO pg_temp.bureau_spec(rel, priv, cols) VALUES
   -- reçus de provenance (hooks)
   ('provenance_receipts','SELECT',NULL),
   ('provenance_receipts','INSERT',ARRAY['subject','sha','actor','session','turn','harness','work_item_id']),
+  -- #6873 : le hook lit la révocation avant d'écrire (une preuve retirée ne
+  -- redevient pas une preuve) ; lecture seule, le geste de révocation reste
+  -- réservé au correcteur ou à l'owner.
+  ('provenance_revocations','SELECT',NULL),
   -- séquences des INSERT ci-dessus (USAGE seulement)
   ('session_bindings_id_seq','USAGE',NULL),
   ('agent_mailbox_id_seq','USAGE',NULL),
