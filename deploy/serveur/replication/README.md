@@ -186,17 +186,40 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
    sa liste synchrone est vide. La rejouer (`configurer-noeud.sh
    ameesh-agents-1`) une fois `ameesh-agents-2` en flux.
 
-5. **Contrôle final** sur `ameesh-agents-1` : `etat.sh` doit montrer
-   `ameesh-agents-2` en `quorum`, le hub en `async`, deux slots actifs, et
-   `wal_log_hints = on`. Un seul primaire répond ; les clients se reconnectent
-   par le DSN multi-hôte (EP8.4/EP8.5).
+   **Aller-retour d'EP8.3 (décision pilote, #6860)** : tant que Patroni et
+   le DSN multi-hôte (EP8.4/EP8.5) ne sont pas là, les clients restent sur
+   le hub. Après l'aller ci-dessus, une seconde fenêtre ramène le primaire
+   sur le hub, avec les mêmes gardes ; `--retour-nofailover` lève le seul
+   `nofailover` et exige la borne :
+
+   ```bash
+   # sur ameesh-agents-1, écritures client arrêtées : relever la borne, puis arrêt
+   psql -Atc 'SELECT pg_current_wal_flush_lsn()'
+   pg_ctlcluster 17 main stop
+   # sur manaty-mesh-1 : promotion de retour
+   deploy/serveur/replication/promouvoir.sh --retour-nofailover --borne <LSN> manaty-mesh-1
+   # sur ameesh-agents-1, puis ameesh-agents-2
+   deploy/serveur/replication/reintegrer.sh --source manaty-mesh-1 ameesh-agents-1
+   deploy/serveur/replication/suivre-primaire.sh --source manaty-mesh-1 ameesh-agents-2
+   # sur manaty-mesh-1, les deux agents en flux : ANY 1
+   deploy/serveur/replication/configurer-noeud.sh manaty-mesh-1
+   ```
+
+5. **Contrôle final** sur le primaire : `etat.sh` doit montrer deux standbys
+   en flux, deux slots actifs, `wal_log_hints = on`, et le hub jamais dans la
+   liste synchrone. Après l'aller-retour (primaire `manaty-mesh-1`), les deux
+   agents sont en `quorum` ; à EP8.6 (primaire `ameesh-agents-1`),
+   `ameesh-agents-2` est en `quorum` et le hub en `async`. Un seul primaire
+   répond ; les clients se reconnectent par le DSN multi-hôte (EP8.4/EP8.5).
 
 ## Promotion manuelle
 
 `promouvoir.sh` est un geste **d'exploitant**, pas une décision d'agent
 (étude §4 : Patroni fera le code en EP8.4). Gardes :
 
-- un nœud `nofailover` (le hub) est refusé sans `--force` ;
+- un nœud `nofailover` (le hub) est refusé sans `--force`, sauf le retour
+  planifié d'un aller-retour (`--retour-nofailover`, borne exigée, autres
+  gardes intactes) ;
 - le serveur local doit tourner et être en récupération ;
 - **aucun autre nœud joignable ne doit répondre comme primaire** ; un nœud
   joignable dont le rôle est illisible arrête aussi (on ne parie pas) ;

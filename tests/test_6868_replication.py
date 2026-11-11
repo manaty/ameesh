@@ -823,6 +823,33 @@ os.execv({vrai_stat!r}, ["stat"] + args)
         self.assertIn("COMMIT confirmés peuvent être perdus", resultat.stdout)
         self.assertIn("pg_ctlcluster 17 main promote", self.journal_texte())
 
+    def test_retour_nofailover_garde_borne_et_split_brain(self):
+        # Aller-retour d'EP8.3 (#6860, décision pilote b) : le retour vers le
+        # hub lève le seul nofailover ; borne et split brain restent gardés.
+        self.serveur(demarre=True, en_recuperation=True)
+        (self.state / "replay_lsn").write_text("0/4000000", encoding="utf-8")
+        resultat = self.run_script("promouvoir.sh", "--retour-nofailover",
+                                   "manaty-mesh-1", attendu=1)
+        self.assertIn("exige --borne", resultat.stderr)
+
+        self.hote_distant("ameesh-agents-1", demarre=True, en_recuperation=False)
+        resultat = self.run_script("promouvoir.sh", "--retour-nofailover", "--borne",
+                                   "0/4000000", "manaty-mesh-1", attendu=1)
+        self.assertIn("split brain", resultat.stderr)
+        self.hote_distant("ameesh-agents-1", demarre=False)
+
+        resultat = self.run_script("promouvoir.sh", "--retour-nofailover", "--borne",
+                                   "0/5000000", "manaty-mesh-1", attendu=1)
+        self.assertIn("candidat en retard", resultat.stderr)
+        self.assertNotIn("pg_ctlcluster 17 main promote", self.journal_texte())
+
+        (self.state / "replay_lsn").write_text("0/5000000", encoding="utf-8")
+        resultat = self.run_script("promouvoir.sh", "--retour-nofailover", "--borne",
+                                   "0/5000000", "manaty-mesh-1")
+        self.assertIn("retour planifié", resultat.stdout)
+        self.assertNotIn("--force accordé", resultat.stdout)
+        self.assertIn("pg_ctlcluster 17 main promote", self.journal_texte())
+
     def test_promotion_sans_borne_force_dit_la_perte(self):
         self.serveur(demarre=True, en_recuperation=True)
         resultat = self.run_script("promouvoir.sh", "--force", "ameesh-agents-2")
