@@ -295,7 +295,8 @@ def external_hold(text) -> dict | None:
 
 #: #4235 : une **fenêtre d'observation** est une attente voulue et **datée**,
 #: déclarée dans le hold du pilote : `hold: fenêtre : <motif>` (ou `hold:
-#: fenêtre d'observation : …`, `hold: observation : …`), avec le préambule du
+#: fenêtre d'observation : …`, `hold: observation : …`, et depuis #6888
+#: `hold: window : …` ou `hold: observation window : …`), avec le préambule du
 #: journal (`hold: (pilote …) Fenêtre d'observation voulue : …`). Son échéance
 #: est celle que `--wake-at` écrit (`[réveil programmé: …]`), ou une date
 #: déclarée `(due …)`/`(échéance …)`. Sans échéance écrite, ce n'est pas une
@@ -303,7 +304,10 @@ def external_hold(text) -> dict | None:
 #: une attente ordinaire.
 _OBSERVATION_HOLD = re.compile(
     r"^hold:\s*(?:\([^)\n]*\)\s*)?"
-    r"(?P<head>fen[êe]tre(?:\s+d['’]observation)?|observation)\b"
+    # #6888 : la CLI parle anglais depuis L156c ; « window » et
+    # « observation window » déclarent la même fenêtre que « fenêtre ».
+    r"(?P<head>fen[êe]tre(?:\s+d['’]observation)?|observation\s+window"
+    r"|observation|window)\b"
     r"(?P<tail>.*)$", re.I | re.S)
 
 
