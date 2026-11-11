@@ -75,3 +75,48 @@ def attach_hook(item_id: int, branch: str, sha: str, actor: str, following):
         if following is not None:
             following(tx, milestone, after_commit)
     return hook
+
+
+def guard_ownership(db, item: dict, sha: str, *, branch: str = "", repo: str = "") -> None:
+    """#6834 : une tête exacte ou une branche ne se prête pas entre lots ouverts."""
+    from . import plan_git, storage, work, work_lifecycle
+
+    st = storage.of(db)
+    others = [row for row in st.work.items(state=None, assignee=None, limit=None)
+              if int(row["id"]) != int(item["id"])
+              and row.get("state") not in work_lifecycle.COMPLETED]
+    if not others:
+        return
+    marks = {}
+    for mark in st.progress.lot_milestones([int(row["id"]) for row in others]):
+        marks.setdefault(int(mark["work_item_id"]), []).append(mark)
+
+    def repository(row):
+        try:
+            return work.lot_repository(row, db.cfg)
+        except Exception:  # dépôt non résolu : ne comparer que l'app connue
+            return "app:" + str(row.get("app") or "")
+
+    for other in others:
+        frozen = plan_git.latest_freeze(marks.get(int(other["id"]), [])) or {}
+        reason = ""
+        heads = {str(frozen.get("sha") or "").lower(),
+                 str(other.get("branch_head") or "").lower()}
+        other_branch = str(other.get("branch") or "").strip()
+        if repo and other_branch and repository(item) == repository(other):
+            for ref in ("refs/heads/" + other_branch, "refs/remotes/origin/" + other_branch):
+                head = plan_git._commit(repo, ref)
+                if head:
+                    heads.add(head.lower())
+        if sha.lower() in heads:
+            reason = "head %s" % sha[:12]
+        elif (branch and branch == str(other.get("branch") or "").strip()
+              and repository(item) == repository(other)):
+            reason = "branch %s" % branch
+        if reason:
+            raise work.WorkError(
+                "freeze refused (owned-by-open-lot): %s belongs to open lot #%s; "
+                "create and associate this lot's own branch with ameesh work branch %s "
+                "BRANCH_NAME, commit its delta and freeze that head; "
+                "for notes only, close this lot as done instead of freezing"
+                % (reason, other["id"], item["id"]))
