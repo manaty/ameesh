@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Dedicated restore target: producer/consumer protocol, without root effects."""
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -122,6 +124,7 @@ class CapacityTest(unittest.TestCase):
                        '/etc/ameesh-release/other.json', str(conf / 'postgresql.conf'),
                        str(producer.layout('16')[0] / 'capacity.json'),
                        str(producer.INSTALL / 'capacity.json'),
+                       str(producer.LEGACY_INSTALL / 'capacity.json'),
                        str(producer.UNIT_ROOT / 'capacity.json'),
                        '/srv/keys/upload.json', remote['restore_credentials'],
                        '//etc/ameesh-release/restore-probe.json', '/etc//ameesh-release/x.json',
@@ -173,9 +176,18 @@ class CapacityTest(unittest.TestCase):
         self.assertIn('RuntimeDirectoryMode=0700', cluster)
         self.assertIn('config_file=/etc/ameesh-release-restore/postgresql.conf', cluster)
         self.assertIn('User=root', probe)
-        self.assertIn(' -I ', probe)
+        self.assertIn('Environment=PYTHONDONTWRITEBYTECODE=1', probe)
+        self.assertIn('ExecStart=/opt/release/bin/python3 -I -B '
+                      + str(producer.INSTALL) + '/restauration-release.py probe', probe)
         self.assertIn('OnUnitActiveSec=60s', timer)
         self.assertIn('TimeoutStartSec=120', probe)
+
+    def test_installer_path_is_outside_the_sealed_release_tree(self):
+        sealed = Path('/opt/ameesh-release')
+        self.assertEqual(producer.INSTALL,
+                         Path('/usr/local/libexec/ameesh-release-restore'))
+        self.assertEqual(producer.LEGACY_INSTALL, sealed / 'restore')
+        self.assertNotIn(sealed, producer.INSTALL.parents)
 
     def test_atomic_output_private_and_replaces_exactly(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -209,6 +221,9 @@ class InstallationTest(unittest.TestCase):
             output = root / 'capacity.json'
             backup = root / 'etc/backup.json'
             backup.write_text(json.dumps(dict(restore_capacity=str(output))))
+            legacy = root / 'sealed/restore'
+            legacy.mkdir(parents=True)
+            (legacy / 'restauration-release.py').write_text('sealed copy')
             calls = []
             def effect(args):
                 calls.append(args)
@@ -224,6 +239,7 @@ class InstallationTest(unittest.TestCase):
                                       pw_dir='/nonexistent', pw_shell='/usr/sbin/nologin')
             with mock.patch.multiple(producer, ENROLLMENT=root / 'etc/probe.json',
                         INTENT=root / 'etc/intent.json', INSTALL=root / 'installed',
+                        LEGACY_INSTALL=legacy,
                         UNIT_ROOT=root / 'units'), \
                     mock.patch.object(producer, 'layout', return_value=(data, conf)), \
                     mock.patch.object(producer, 'protected', side_effect=Path), \
@@ -235,6 +251,8 @@ class InstallationTest(unittest.TestCase):
                     mock.patch.object(producer, 'command', side_effect=effect), \
                     mock.patch.object(producer.pwd, 'getpwnam', return_value=account), \
                     mock.patch.object(producer.os, 'chown'), \
+                    mock.patch.object(Path, 'lstat', return_value=SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o755, st_uid=0)), \
                     mock.patch.object(Path, 'is_file', available):
                 producer.install('16', backup, '/opt/release/bin/python3', 'restore')
                 producer.install('16', backup, '/opt/release/bin/python3', 'restore')
@@ -248,6 +266,12 @@ class InstallationTest(unittest.TestCase):
                 initializations = [args for args in calls if any(
                     str(item).endswith('/bin/initdb') for item in args)]
                 self.assertEqual(len(initializations), 1)
+                self.assertFalse(legacy.exists())
+                self.assertEqual((producer.INSTALL / 'restauration-release.py').read_bytes(),
+                                 Path(producer.__file__).read_bytes())
+                timer_enables = [args for args in calls if args[1:3] == [
+                    'enable', '--now'] and args[3] == producer.NAME + '-capacity.timer']
+                self.assertEqual(len(timer_enables), 2)
                 output.write_text('fresh attestation')
                 producer.remove()
                 producer.remove()
@@ -256,6 +280,7 @@ class InstallationTest(unittest.TestCase):
                 self.assertFalse(conf.exists())
                 self.assertFalse(producer.INTENT.exists())
                 self.assertFalse(producer.ENROLLMENT.exists())
+                self.assertFalse(producer.INSTALL.exists())
                 self.assertEqual(list(producer.UNIT_ROOT.iterdir()), [])
                 self.assertTrue(backup.exists())
                 stop = next(i for i, args in enumerate(calls)
@@ -263,6 +288,114 @@ class InstallationTest(unittest.TestCase):
                 cluster_stop = next(i for i, args in enumerate(calls)
                             if args[1:] == ['disable', '--now', producer.NAME + '.service'])
                 self.assertLess(stop, cluster_stop)
+
+    def test_legacy_sealed_copy_is_moved_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / 'sealed/restore'
+            legacy.mkdir(parents=True)
+            (legacy / 'restauration-release.py').write_text('sealed copy')
+            install_path = root / 'libexec/ameesh-release-restore'
+            with mock.patch.multiple(producer, INSTALL=install_path,
+                                     LEGACY_INSTALL=legacy), \
+                    mock.patch.object(producer, 'protected', side_effect=Path), \
+                    mock.patch.object(Path, 'lstat', return_value=SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o755, st_uid=0)):
+                producer.migrate_install()
+                producer.migrate_install()
+            self.assertFalse(legacy.exists())
+            self.assertEqual((install_path / 'restauration-release.py').read_text(),
+                             'sealed copy')
+
+    def test_both_install_paths_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy, install_path = root / 'sealed/restore', root / 'libexec/restore'
+            legacy.mkdir(parents=True)
+            install_path.mkdir(parents=True)
+            with mock.patch.multiple(producer, INSTALL=install_path,
+                                     LEGACY_INSTALL=legacy), \
+                    mock.patch.object(producer, 'protected', side_effect=Path), \
+                    mock.patch.object(Path, 'lstat', return_value=SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o755, st_uid=0)):
+                with self.assertRaisesRegex(producer.RestoreError, 'both'):
+                    producer.migrate_install()
+            self.assertTrue(legacy.exists())
+            self.assertTrue(install_path.exists())
+
+    def test_capacity_timer_requires_the_restore_backup_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / 'missing.json'
+            with mock.patch.object(producer, 'command') as command:
+                refused = producer.activate_capacity(missing)
+            self.assertIn('restore backup identity missing', refused)
+            self.assertIn('timer left disabled', refused)
+            command.assert_not_called()
+
+            unusable = root / 'unusable.json'
+            unusable.write_text('{}')
+            with mock.patch.object(producer, 'read_document',
+                                   side_effect=producer.RestoreError(
+                                       'private root document required')), \
+                    mock.patch.object(producer, 'command') as command:
+                refused = producer.activate_capacity(unusable)
+            self.assertIn('restore backup identity unreadable', refused)
+            self.assertIn('timer left disabled', refused)
+            command.assert_not_called()
+
+            identity = root / 'identity.json'
+            identity.write_text('{}')
+            with mock.patch.object(producer, 'read_document', return_value={}), \
+                    mock.patch.object(producer, 'command') as command:
+                self.assertIsNone(producer.activate_capacity(identity))
+            command.assert_called_once_with(['/usr/bin/systemctl', 'enable', '--now',
+                                             producer.NAME + '-capacity.timer'])
+
+    def test_install_without_identity_leaves_capacity_timer_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data, conf = root / 'data-parent/data', root / 'etc/cluster'
+            (root / 'units').mkdir()
+            (root / 'etc').mkdir()
+            backup = root / 'etc/identity.json'  # Deliberately never written.
+            calls = []
+            def effect(args):
+                calls.append(args)
+                if any(str(item).endswith('/bin/initdb') for item in args):
+                    (data / 'PG_VERSION').write_text('16')
+                return ''
+            real_is_file = Path.is_file
+            def available(path):
+                if str(path) == '/usr/lib/postgresql/16/bin/initdb':
+                    return True
+                return real_is_file(path)
+            account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid(),
+                                      pw_dir='/nonexistent', pw_shell='/usr/sbin/nologin')
+            stderr = io.StringIO()
+            with mock.patch.multiple(producer, ENROLLMENT=root / 'etc/probe.json',
+                        INTENT=root / 'etc/intent.json', INSTALL=root / 'installed',
+                        LEGACY_INSTALL=root / 'sealed/restore',
+                        UNIT_ROOT=root / 'units'), \
+                    mock.patch.object(producer, 'layout', return_value=(data, conf)), \
+                    mock.patch.object(producer, 'protected', side_effect=Path), \
+                    mock.patch.object(producer, 'read_document',
+                        side_effect=lambda path: json.loads(Path(path).read_text())), \
+                    mock.patch.object(producer, 'system_identifier',
+                        return_value='1234567890123456789'), \
+                    mock.patch.object(producer, 'inspect_cluster',
+                        return_value=dict(system_identifier='1234567890123456789')), \
+                    mock.patch.object(producer, 'command', side_effect=effect), \
+                    mock.patch.object(producer.pwd, 'getpwnam', return_value=account), \
+                    mock.patch.object(producer.os, 'chown'), \
+                    mock.patch.object(Path, 'is_file', available), \
+                    contextlib.redirect_stderr(stderr):
+                producer.install('16', backup, '/opt/release/bin/python3', 'restore')
+            self.assertFalse(any(args[1:3] == ['enable', '--now']
+                                 and args[3] == producer.NAME + '-capacity.timer'
+                                 for args in calls))
+            self.assertIn('restore backup identity missing', stderr.getvalue())
+            self.assertIn('timer left disabled', stderr.getvalue())
 
     def test_hba_role_cannot_add_rules_or_assume_admin(self):
         for role in ('all', 'replication', 'pg_monitor', producer.ADMIN,
