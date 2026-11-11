@@ -2552,6 +2552,18 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     for line in module_lines:
         print(line)
     print(host_measures_line(cfg))
+    # #6832 : un hôte candidat d'un rôle élu doit pouvoir prouver les checks
+    # requis de chaque projet qu'il fusionne sans dépendre de la config d'un
+    # autre hôte : une déclaration versionnée couvre un 403 de plan, son
+    # absence est un KO (le refus de merge-pr après une relève, #211196).
+    from . import forge_checks
+    try:
+        forge_ko, forge_lines = forge_checks.doctor_lines(cfg, db)
+    except Exception as exc:  # a reading never breaks the doctor
+        forge_ko = False
+        forge_lines = ["not checked (%s)" % (" ".join(str(exc).split())[:120],)]
+    for line in forge_lines:
+        print("forge      : %s" % line)
     from . import host_idle, resources, canon as canon_mod
     try:
         controls = {r["host"]: r for r in storage.of(db).host_lifecycle.listing()}
@@ -2640,6 +2652,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     # #3345 : un profil de l'hôte qui diverge sur train, github ou release
     # n'est pas un état vert — le runner d'à côté ne fait pas la même chose.
     if profile_ko:
+        verdict = 1
+    # #6832 : une déclaration versionnée absente sur un projet dont la forge
+    # prouve le 403 de plan rouvrirait le refus de merge-pr après une relève.
+    if forge_ko:
         verdict = 1
     if accounts_ko:
         verdict = 1
