@@ -568,7 +568,9 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         # is an empty commit on top of the base, not the base itself.
         lot_head = self.frozen
         branch = self.repo.git("rev-parse", "--abbrev-ref", "HEAD")
-        self.repo.git("checkout", "-q", self.base)
+        # #6834: an empty-diff freeze must have its own associated branch.
+        self.repo.git("checkout", "-q", "-b", "lot/light-empty", self.base)
+        work.set_branch(self.db, self.lot, "lot/light-empty", self.base, actor="author")
         self.repo.git("commit", "-q", "--allow-empty", "-m", "gel vide")
         self.frozen = self.repo.git("rev-parse", "HEAD")
         # #2924 : le gel suivant relit la provenance des gels antérieurs ; ce
@@ -578,6 +580,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         first, light = self.freeze()
         self.assertEqual(light["state"], rd.NONE, light)
         self.repo.git("checkout", "-q", branch)
+        work.set_branch(self.db, self.lot, branch, self.base, actor="author")
         self.frozen = lot_head
         self.repo.write("src/ameesh/work.py", "new head\n")
         self.frozen = self.repo.commit("new head")
