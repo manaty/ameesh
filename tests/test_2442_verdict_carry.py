@@ -428,9 +428,9 @@ class CarryTest(PgTestCase):
     """Le report de bout en bout, sur Postgres et un vrai dépôt sans origin."""
 
     def setUp(self) -> None:
-        # Each independent case owns its branch; do not retain open lots
-        # from previous cases with the same branch (#6834).
-        super().setUp()
+        # This setup is also borrowed by #5042 without inheritance.
+        # Reset independent cases without retaining their open lots (#6834).
+        PgTestCase.setUp(self)
         for name, harness in (("author", "deepseek"), ("rev1", "claude"), ("rev2", "codex")):
             registry.upsert(self.db, name, harness=harness, host="pc")
         self.repo = Repo()
