@@ -38,6 +38,12 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    (`paquet-candidats.py` depuis un worktree à la tête exacte de la cible) ;
    sans lot prêt, rien n'est créé. Sinon le lot porteur « Paquet horaire
    h-AAAAMMJJ-NN » est créé et `paquet-auto.py` compose, pousse et gèle.
+   #6891 : si la cible avance pendant la composition (le commit d'atterrissage
+   d'une coupure, par exemple), `paquet-auto.py` relit la référence #3782
+   **avant** les contrats — les tests locaux les plus longs — et sort en
+   `auto.TARGET_MOVED_RC` : le refus est journalisé et la composition repart
+   aussitôt sur la nouvelle tête, sans attendre le tick suivant. La relecture
+   du gel juste avant la poussée reste en place (#6566).
 3. **Publication.** Sur la tête gelée sans demande `ci-full` : « verdict non
    requis » **seulement** si aucune unité n'est une résolution (fusions
    propres, §2 : aucun avis) — avec une résolution le geste reste au pilote
@@ -226,6 +232,9 @@ COMPOSITION_RECORD_PREFIX = "packet composition recorded: "
 #: composition (§3, non concluant) : il ne consomme pas de tentative
 MARK_FENCED = MARK + "non concluant "
 MARK_EXCLUDED = MARK + "exclu "
+#: #6891 : la référence #3782 a été relue avant les tests locaux ; la cible a
+#: avancé, rien n'est poussé et la composition repart sur la nouvelle tête.
+MARK_TARGET = MARK + "cible avancée avant tests "
 #: #6561 : une composition a publié une tête (ou l'a publiée puis retirée) ;
 #: l'abandon du porteur exige la preuve qu'aucune tête neuve n'est sur la
 #: branche. À défaut, le porteur reste ouvert et un agent lit.
@@ -1733,6 +1742,33 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
         # composition et le tic n'écrit ni marque d'échec ni courrier.
         holder = composition_in_progress(ctx, name) or "verrou tenu"
         return "#%d : composition en cours (%s)" % (carrier, holder)
+    if result.returncode == auto.TARGET_MOVED_RC:
+        # #6891 : la cible a atterri pendant la composition. `paquet-auto` a
+        # relu la référence #3782 AVANT les contrats, rien n'est poussé et son
+        # clone est déjà à jour ; on relance tout de suite sur la nouvelle
+        # tête. La perte se limite à la composition, jamais aux ~12 min de
+        # tests locaux ni au tick suivant. La relecture du gel juste avant la
+        # poussée reste en place (#6566) pour une cible qui bouge pendant les
+        # tests. Bornée par MAX_ATTEMPTS, comme une tentative morte.
+        detail = " ".join(auto._tail(result.text, 3).split())
+        ctx.note(carrier, "%s%s n=%d base=%s : %s" % (
+            MARK_TARGET, step, this.n, this.base or "-", detail))
+        ctx.say("#%d : cible avancée avant les tests, recomposition immédiate"
+                % carrier)
+        if this.n >= MAX_ATTEMPTS:
+            if MARK_STUCK + this.key in marks(show(ctx, carrier)):
+                return "#%d : cible avancée, relance immédiate déjà épuisée" % carrier
+            ctx.mail(ctx.pilot, carrier,
+                     "#%d %s : la cible a encore avancé avant les tests (%d "
+                     "relance(s) immédiate(s), §3 non concluant) ; plus de "
+                     "relance automatique, le tic suivant reprend.\n\n%s"
+                     % (carrier, name, this.n, auto._tail(result.text, 10)))
+            ctx.note(carrier, MARK_STUCK + this.key)
+            return "#%d : cible avancée, relance immédiate épuisée" % carrier
+        return attempt(ctx, carrier, name, Attempt(
+            this.step, this.n + 1, this.base, run_id=this.run_id,
+            exclude=list(this.exclude), only=list(this.only),
+            reasons=list(this.reasons)))
     if result.returncode == auto.COMPOSITION_RED_RC:
         # #6272 : un rouge de composition (contrat, test d'une unité, gel,
         # types clients) n'est pas une panne du composeur. L'échec est
