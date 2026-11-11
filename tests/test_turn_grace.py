@@ -68,7 +68,6 @@ class NoteTest(unittest.TestCase):
         runner.container_runtime.return_value = None
         tracker = background.Tracker(runner, log=lambda *_a: None)
         support.adopt_orphans(self, tracker)
-        support.adopt_orphans(self, tracker)
         return tracker
 
     @staticmethod
