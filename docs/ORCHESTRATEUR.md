@@ -90,11 +90,16 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   session BG) suit la même prise : la session liée prend le lot avant le
   premier effet, et la porte `ameesh work claim <lot> --check` (code 0 = elle
   tient la prise, code 1 = refus nommé, rien n'est écrit) est appelée en tête
-  du runbook ou du script. Une seconde session est refusée, et le fil nomme
-  la session qui écrit (`session`, `harness` dans les métadonnées de l'entrée,
-  `ameesh fil show`). Les clés SSH séparées par session sont une décision
-  owner, pas encore appliquée : la prise est une garde de coordination, pas
-  une frontière d'accès.
+  du runbook ou du script. La porte compare l'identité complète de la liaison
+  vérifiée (session, agent, hôte, harnais, ligne de liaison) à celle de la
+  prise : un même identifiant sur un autre hôte ou sous un autre agent est
+  refusé, et une liaison révoquée puis refaite ne reprend pas la prise. Une
+  seconde session est refusée, et le fil nomme la session qui écrit
+  (`session`, `harness` dans les métadonnées de l'entrée, `ameesh fil show`).
+  La décision owner #211859 (option a) règle l'accès : CLI ameesh + base
+  limitée sur bureau-goal, une clé SSH par session restreinte par `from=`
+  (lots #6881/#6882/#6883, rattachés à #6877) ; d'ici là la prise reste une
+  garde de coordination, pas une frontière d'accès.
 * Un lot de relecture après fusion (`review-after-merge:#<lot>`, sur son
   `issue_ref` ou sa `source`, #2377/#2552) n'est pris que par un agent de la
   **famille opposée** à celle de l'auteur au gel ; famille de l'auteur

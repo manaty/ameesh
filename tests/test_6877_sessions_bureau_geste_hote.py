@@ -5,16 +5,17 @@ SSH de BG ; « exécutant unique » sans garde mécanique.
 Le constat du 11/11 sur manaty-its-node : apply-services et un lancement de
 services ont été faits depuis l'IP de BG avec sa clé générale, sans qu'aucune
 session ne les revendique ; sshd ne distingue pas les deux sessions. Le lot
-ajoute deux pièces mécaniques, sans toucher aux clés (décision owner) :
+ajoute deux pièces mécaniques, sans toucher aux clés (décision owner #211859) :
 
 * le fil nomme la session VÉRIFIÉE qui écrit (L41, PID ancêtre), au lieu de
   la seule identité « bureau » ;
 * `ameesh work claim <lot> --check` est la porte, en lecture seule, qu'un
-  runbook appelle avant son premier geste hôte : elle n'accepte que la
-  session liée qui tient la prise, et refuse une seconde session.
+  runbook appelle avant son premier geste hôte : elle compare l'identité
+  COMPLÈTE de la liaison (session, agent, hôte, harnais, ligne de liaison) à
+  celle écrite dans la prise, pas un libellé réutilisable.
 
-Les clés SSH séparées par session restent une proposition owner (aucune
-modification de clé dans ce lot)."""
+Les clés SSH séparées par session sont la décision owner #211859 option a
+(lots #6881/#6882/#6883) : ce lot ne les applique pas."""
 from __future__ import annotations
 
 import json
@@ -129,7 +130,11 @@ class GesteHoteGateTest(_Base):
                        external_executor="bureau")
         return work.get(self.db, lot["id"])
 
-    def bind_session(self, session_id, *, agent="bureau"):
+    def bind_session(self, session_id, *, agent="bureau", host=None,
+                     harness="claude"):
+        """Une liaison L41 active, PID ancêtre du processus de test ; rend sa
+        ligne (l'identité complète de la preuve)."""
+        host = host or self.cfg.host
         # une session externe ne se lie pas à un agent mené par un bail (L41)
         self.db.execute("UPDATE agent_registry SET lease_owner = NULL,"
                         " lease_expires_at = NULL, status = 'idle'"
@@ -137,79 +142,143 @@ class GesteHoteGateTest(_Base):
         self.db.execute(
             "INSERT INTO session_bindings"
             " (session_id, harness, host, agent, pid, created_by)"
-            " VALUES (%s, %s, %s, %s, %s, %s)",
-            (session_id, "claude", self.cfg.host, agent, os.getpid(), "test"))
+            " VALUES (%s, %s, %s, %s, %s, 'test')",
+            (session_id, harness, host, agent, os.getpid()))
+        [row] = self.db.query(
+            "SELECT id, session_id, harness, host, agent FROM session_bindings"
+            " WHERE session_id = %s AND harness = %s AND host = %s"
+            "   AND revoked_at IS NULL", (session_id, harness, host))
+        return row
 
-    def claim(self, lot_id, session, *, proof=None):
-        return work.claim_external(self.db, lot_id, session, actor="bureau",
-                                   proof=proof if proof is not None else session,
-                                   cfg=self.cfg)
+    def proof_of(self, row):
+        """La preuve complète d'une liaison, telle que `caller_session_proof`
+        la rend (la ligne de liaison comprise)."""
+        return {"session": row["session_id"], "agent": row["agent"],
+                "host": row["host"], "harness": row["harness"],
+                "binding": int(row["id"])}
 
-    def check(self, lot_id, session, *, proof=None):
+    def claim(self, lot_id, session, *, proof=None, actor="bureau", host=None):
+        return work.claim_external(self.db, lot_id, session, actor=actor,
+                                   host=host, proof=proof, cfg=self.cfg)
+
+    def release(self, lot_id, session, *, proof=None, actor="bureau", host=None):
+        return work.release_external(self.db, lot_id, session, actor=actor,
+                                     host=host, proof=proof, cfg=self.cfg)
+
+    def check(self, lot_id, session=None, *, proof=None):
         return work.check_external_claim(self.db, lot_id, session, proof=proof)
 
-    def test_la_porte_refuse_sans_prise_sans_preuve_et_pour_une_autre_session(self):
+    def test_la_porte_exige_l_identite_complete_et_refuse_la_seconde_session(self):
         lot = self.reserve()
-        with self.assertRaises(work.WorkError) as raised:
-            self.check(lot["id"], "BG", proof=None)
-        self.assertIn("verified session binding", str(raised.exception))
-        self.assertIn("nothing done", str(raised.exception))
-        with self.assertRaises(work.WorkError) as raised:
-            self.check(lot["id"], "BG", proof="BG")
-        self.assertIn("has no external claim", str(raised.exception))
-        self.assertIn("no host gesture is allowed", str(raised.exception))
+        for proof in (None, "BG", {"session": "BG", "agent": "bureau"}):
+            with self.assertRaises(work.WorkError) as raised:
+                self.check(lot["id"], "BG", proof=proof)
+            self.assertIn("full identity", str(raised.exception))
+            self.assertIn("nothing done", str(raised.exception))
 
-        self.claim(lot["id"], "BG")
-        out = self.check(lot["id"], "BG", proof="BG")
-        self.assertEqual(out["session"], "BG")
+        bg = self.bind_session("s-bg")
+        with self.assertRaises(work.WorkError) as raised:
+            self.check(lot["id"], proof=self.proof_of(bg))
+        self.assertIn("has no external claim", str(raised.exception))
+        self.claim(lot["id"], "s-bg", proof=self.proof_of(bg))
+        out = self.check(lot["id"], proof=self.proof_of(bg))
+        self.assertEqual(out["session"], "s-bg")
+        self.assertEqual(out["agent"], "bureau")
+        self.assertEqual(out["host"], self.cfg.host)
+        self.assertEqual(out["harness"], "claude")
+        self.assertEqual(out["binding"], int(bg["id"]))
         self.assertIsNotNone(out["at"])
 
-        # la seconde session est refusée, nommée, et n'obtient aucune écriture
+        # la seconde session, pourtant liée sur le même hôte, est refusée
+        pc = self.bind_session("s-pc")
         before = work.get(self.db, lot["id"])["external_claimed_ts"]
         with self.assertRaises(work.WorkError) as raised:
-            self.check(lot["id"], "PC", proof="PC")
-        self.assertIn("claimed by session BG at", str(raised.exception))
+            self.check(lot["id"], proof=self.proof_of(pc))
+        self.assertIn("claimed by session s-bg at", str(raised.exception))
         self.assertIn("host gesture refused", str(raised.exception))
         self.assertEqual(work.get(self.db, lot["id"])["external_claimed_ts"], before)
-        # le libellé de la porteuse ne suffit pas sans sa liaison
+        # le libellé de la porteuse, sans sa liaison, ne passe pas non plus
         with self.assertRaises(work.WorkError) as raised:
-            self.check(lot["id"], "BG", proof="PC")
-        self.assertIn("verified session is PC, not BG", str(raised.exception))
+            self.check(lot["id"], "s-bg", proof="s-bg")
+        self.assertIn("full identity", str(raised.exception))
 
-    def test_la_porte_refuse_un_lot_ordinaire_ou_ferme(self):
-        self.external_agent()
-        ordinaire = work.add(self.db, title="lot ordinaire", app="nexlink",
-                             actor="human:proprio", cfg=self.cfg)
-        with self.assertRaises(work.WorkError) as raised:
-            self.check(ordinaire["id"], "BG", proof="BG")
-        self.assertIn("has no external executor", str(raised.exception))
+    def test_le_meme_libelle_sur_un_autre_hote_ne_prend_pas_la_prise(self):
+        """Le scénario B1 : même agent, même harnais, même identifiant de
+        session, mais une liaison réelle sur un AUTRE hôte."""
         lot = self.reserve()
-        self.claim(lot["id"], "BG")
-        work.close(self.db, lot["id"], abandoned=True, note="test",
-                   actor="human:proprio")
+        bg = self.bind_session("s-bureau")
+        self.claim(lot["id"], "s-bureau", proof=self.proof_of(bg))
+        # la liaison PC est valide sur son hôte (l'unicité est locale à l'hôte)
+        pc = self.bind_session("s-bureau", host="pc-smichea")
         with self.assertRaises(work.WorkError) as raised:
-            self.check(lot["id"], "BG", proof="BG")
-        self.assertIn("no host gesture to allow", str(raised.exception))
+            self.check(lot["id"], proof=self.proof_of(pc))
+        message = str(raised.exception)
+        self.assertIn("claimed on host %s, not pc-smichea" % self.cfg.host, message)
+        self.assertIn("nothing done", message)
+        # la porteuse inchangée passe toujours
+        self.assertEqual(self.check(lot["id"], proof=self.proof_of(bg))["session"],
+                         "s-bureau")
 
-    def test_la_porte_refuse_une_prise_sans_preuve_de_session(self):
-        """Une prise écrite par un autre écrivain (preuve NULL) ne fait pas
-        autorité : la porte refuse, elle ne suppose pas la session."""
+    def test_le_meme_libelle_sous_un_autre_agent_ou_harnais_est_refuse(self):
         lot = self.reserve()
-        self.claim(lot["id"], "BG")
-        self.db.execute(
-            "UPDATE work_items SET external_claim_proof = NULL WHERE id = %s",
-            (lot["id"],))
+        bg = self.bind_session("s-bg")
+        self.claim(lot["id"], "s-bg", proof=self.proof_of(bg))
+        # même hôte et même identifiant, autre harnais : liaison distincte
+        codex = self.bind_session("s-bg", harness="codex")
         with self.assertRaises(work.WorkError) as raised:
-            self.check(lot["id"], "BG", proof="BG")
-        self.assertIn("carries no verified session proof", str(raised.exception))
+            self.check(lot["id"], proof=self.proof_of(codex))
+        self.assertIn("claimed with harness claude, not codex",
+                      str(raised.exception))
+        # une preuve qui se déclare sous un autre agent est refusée
+        forged = dict(self.proof_of(bg))
+        forged["agent"] = "autre"
+        with self.assertRaises(work.WorkError) as raised:
+            self.check(lot["id"], proof=forged)
+        self.assertIn("claimed by agent bureau, not autre", str(raised.exception))
+
+    def test_une_liaison_refaite_est_une_autre_ligne_et_ne_prend_pas_la_prise(self):
+        """Révoquer puis relier la même session refait une ligne : la prise
+        reste à l'ancienne, la nouvelle doit la libérer puis reprendre."""
+        lot = self.reserve()
+        bg = self.bind_session("s-bg")
+        self.claim(lot["id"], "s-bg", proof=self.proof_of(bg))
+        self.db.execute("UPDATE session_bindings SET revoked_at = now()"
+                        " WHERE id = %s", (bg["id"],))
+        again = self.bind_session("s-bg")
+        self.assertNotEqual(again["id"], bg["id"])
+        with self.assertRaises(work.WorkError) as raised:
+            self.check(lot["id"], proof=self.proof_of(again))
+        message = str(raised.exception)
+        self.assertIn("binding line %s, not by this caller's line %s"
+                      % (bg["id"], again["id"]), message)
+        self.assertIn("pilot uses --force", message)
+        # la levée par la nouvelle liaison est refusée pour la même raison
+        with self.assertRaises(work.WorkError) as raised:
+            self.release(lot["id"], "s-bg", proof=self.proof_of(again))
+        self.assertIn("another binding (line %s)" % bg["id"], str(raised.exception))
+
+    def test_une_prise_sans_identite_complete_est_refusee(self):
+        """Une prise écrite avec le seul libellé (compatibilité N-1) ou par un
+        autre écrivain ne fait pas autorité : la porte refuse et dit comment
+        la refaire."""
+        lot = self.reserve()
+        self.claim(lot["id"], "BG", proof="BG")      # ancien libellé seul
+        bg = self.bind_session("BG")
+        with self.assertRaises(work.WorkError) as raised:
+            self.check(lot["id"], proof=self.proof_of(bg))
+        self.assertIn("carries no full verified identity", str(raised.exception))
+        self.assertIn("release it and claim again", str(raised.exception))
 
     def test_cli_check_est_la_porte_avant_le_premier_geste(self):
         lot = self.reserve()
-        self.bind_session("s-bg")
+        bg = self.bind_session("s-bg")
         proc = self.mesh("work", "claim", str(lot["id"]), "--session", "s-bg",
                          "--actor", "bureau")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        claimed = work.get(self.db, lot["id"])["external_claimed_ts"]
+        stored = work.get(self.db, lot["id"])
+        claimed = stored["external_claimed_ts"]
+        self.assertEqual(int(stored["external_claim_binding"]), int(bg["id"]))
+        self.assertEqual(stored["external_claim_harness"], "claude")
 
         # sans --session, la porte lit la session VÉRIFIÉE de l'appelant
         proc = self.mesh("work", "claim", str(lot["id"]), "--check", "--json")
@@ -218,6 +287,10 @@ class GesteHoteGateTest(_Base):
         self.assertEqual(out["schema"], "ameesh.work.claim-check/1")
         self.assertTrue(out["held"])
         self.assertEqual(out["session"], "s-bg")
+        self.assertEqual(out["agent"], "bureau")
+        self.assertEqual(out["host"], self.cfg.host)
+        self.assertEqual(out["harness"], "claude")
+        self.assertEqual(int(out["binding"]), int(bg["id"]))
         self.assertTrue(out["proved"])
         self.assertEqual(work.get(self.db, lot["id"])["external_claimed_ts"], claimed)
 

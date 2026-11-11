@@ -2475,15 +2475,22 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print(json.dumps({"schema": "ameesh.work.claim-check/1",
                                       "lot": out["item"]["id"],
                                       "session": out["session"],
+                                      "agent": out.get("agent"),
+                                      "host": out.get("host"),
+                                      "harness": out.get("harness"),
+                                      "binding": out.get("binding"),
                                       "held": True,
                                       "at": out.get("at"),
                                       "proved": bool(proof),
                                       "proof_source": proof_source},
                                      ensure_ascii=False, indent=2, default=str))
                     return 0
-                print(('%s #%d: external claim held by %s at %s — host gesture '
-                       'allowed') % (v.noun, out["item"]["id"], out["session"],
-                                     _fmt_moment(out.get("at"))))
+                print(('%s #%d: external claim held by %s (%s on %s, binding %s) at '
+                       '%s — host gesture allowed')
+                      % (v.noun, out["item"]["id"], out["session"],
+                         out.get("agent") or "?", out.get("host") or "?",
+                         out.get("binding") or "?",
+                         _fmt_moment(out.get("at"))))
                 return 0
             if args.release:
                 if not args.session:

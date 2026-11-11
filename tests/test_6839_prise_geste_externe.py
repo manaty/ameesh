@@ -281,7 +281,11 @@ class PriseGesteExterneTest(_Base):
         self.assertFalse(out["released"])
         self.assertTrue(out["proved"])
         # la seconde session est refusée, nommée, code 1
-        self.bind_session("PC")
+        self.db.execute(
+            "INSERT INTO session_bindings"
+            " (session_id, harness, host, agent, pid, created_by)"
+            " VALUES ('PC', 'claude', %s, 'bureau', %s, 'test')",
+            (self.cfg.host, os.getpid()))
         proc = self.mesh("work", "claim", str(lot["id"]), "--session", "PC",
                          "--actor", "bureau")
         self.assertEqual(proc.returncode, 1)
@@ -291,8 +295,9 @@ class PriseGesteExterneTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("claim    : BG at", proc.stdout)
         self.assertIn("by bureau on", proc.stdout)
-        # la levée par la porteuse
-        self.bind_session("BG")
+        # la levée par la porteuse : sa liaison n'a pas changé (#6877 : une
+        # révocation puis nouvelle liaison serait une autre ligne)
+        self.db.execute("DELETE FROM session_bindings WHERE session_id = 'PC'")
         proc = self.mesh("work", "claim", str(lot["id"]), "--session", "BG",
                          "--release", "--actor", "bureau", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
