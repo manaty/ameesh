@@ -259,7 +259,7 @@ class CanonHeadProofTest(PgTestCase):
         with mock.patch.dict(os.environ, self.turn_env):
             mark = work.milestone(self.db, self.lot, "verdict", sha=self.head,
                                   actor=self.reviewer, verdict="ok",
-                                  repo=self.repo)
+                                  repo=self.repo, note="tête canon relue")
         receipt = storage.of(self.db).provenance.milestone(
             "milestone:%d" % int(mark["id"]))
         self.assertIsNotNone(receipt, "la tête canon doit porter son reçu")
@@ -271,7 +271,8 @@ class CanonHeadProofTest(PgTestCase):
         with mock.patch.dict(os.environ, self.turn_env):
             mark = work.milestone(self.db, self.lot, "verdict",
                                   sha=self.head[:12], actor=self.reviewer,
-                                  verdict="ok", repo=self.repo)
+                                  verdict="ok", repo=self.repo,
+                                  note="tête canon relue")
         receipt = storage.of(self.db).provenance.milestone(
             "milestone:%d" % int(mark["id"]))
         self.assertIsNotNone(receipt, "l'abréviation doit se résoudre dans --repo")
