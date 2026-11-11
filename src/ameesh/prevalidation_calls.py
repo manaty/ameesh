@@ -304,15 +304,17 @@ def repository(cfg, db, item, head: str, *, explicit: str = "") -> str:
             row = {}
         candidates.append(str(row.get("cwd") or ""))
     try:
-        candidates.append(lot_class.repository(cfg, dict(item or {})) or "")
+        # #6984 : le dépôt du projet et les clones déclarés par l'hôte
+        # (`packet_watch`, `release`) ; un miroir bare est lu par SHA.
+        candidates.extend(lot_class.declared_repo_paths(cfg, dict(item or {})))
     except Exception:  # noqa: BLE001 - pas de radar : indice suivant
-        candidates.append("")
+        pass
     seen: set[str] = set()
     for path in candidates:
         path = os.path.expanduser(str(path or "").strip())
         if not path or not os.path.isdir(path):
             continue
-        top = canon_mod.git_toplevel(path)
+        top = canon_mod.git_repository(path)
         if not top or top in seen:
             continue
         seen.add(top)

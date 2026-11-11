@@ -2805,6 +2805,40 @@ def git_toplevel(directory: str, *, timeout: float = GIT_TIMEOUT,
     return os.path.realpath(out) if out else None
 
 
+def git_repository(directory: str, *, timeout: float = GIT_TIMEOUT,
+                   deadline: Deadline | None = None) -> str | None:
+    """Le chemin où les commandes git lisent le dépôt de `directory`, ou None.
+
+    Un arbre de travail rend sa racine ([`git_toplevel`]). Un dépôt **nu** n'a
+    pas d'arbre de travail : `rev-parse --show-toplevel` y échoue (« this
+    operation must be run in a work tree »), alors que toutes les lectures par
+    SHA (`rev-parse`, `merge-base`, `diff`, `fetch`) y fonctionnent. On rend
+    donc son répertoire Git (`--absolute-git-dir`).
+
+    #6984 : sans ce cas, un miroir bare local ne pouvait jamais fournir une
+    tête gelée — la désignation répondait « no repository holds the frozen
+    head » même après un fetch dans le miroir, et la lecture d'auteurs de la
+    porte rendait un doute (indépendance non prouvée). Un cas isolé de
+    `--show-toplevel` n'est pas un dépôt : None, jamais un chemin supposé.
+    """
+    top = git_toplevel(directory, timeout=timeout, deadline=deadline)
+    if top:
+        return top
+    try:
+        bare = _git_out(directory, "rev-parse", "--is-bare-repository",
+                        timeout=timeout, deadline=deadline)
+    except GitError:
+        return None
+    if (bare or "").strip() != "true":
+        return None
+    try:
+        out = _git_out(directory, "rev-parse", "--absolute-git-dir",
+                       timeout=timeout, deadline=deadline)
+    except GitError:
+        return None
+    return os.path.realpath(out) if out else None
+
+
 def git_commit(repo: str, rev: str, *, timeout: float = GIT_TIMEOUT,
                deadline: Deadline | None = None) -> str | None:
     if not rev or rev.startswith("-"):

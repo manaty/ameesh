@@ -1097,14 +1097,47 @@ def _git(cwd: str, args) -> tuple[str | None, str]:
     return proc.stdout, ""
 
 
-def _lot_diff(item: dict, cwd: str) -> list[str]:
+def _lot_worktrees(db, cfg, item: dict) -> list[str]:
+    """Les worktrees que le ménage attribue à ce lot sur cet hôte (#6984).
+
+    Le brief est écrit depuis le dossier de session de l'agent, qui n'est pas
+    toujours le worktree du lot : quand la branche n'y est pas, la section
+    « diff » répondait « git failed » sans dire où lire. Cette lecture est la
+    même source machine que la désignation (`managed_worktrees`) ; une table
+    illisible ne rend aucune piste, jamais une erreur. """
+    if db is None:
+        return []
+    try:
+        lot = int((item or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        return []
+    host = str(getattr(cfg, "host", "") or "").strip()
+    if not lot or not host:
+        return []
+    try:
+        rows = db.query(
+            "SELECT path FROM managed_worktrees"
+            " WHERE host = %s AND lot = %s AND status = 'active'"
+            " ORDER BY id DESC", (host, str(lot)))
+    except Exception:  # noqa: BLE001 - table absente/illisible : pas de piste
+        return []
+    return [str(row.get("path") or "").strip() for row in rows or ()
+            if str(row.get("path") or "").strip()]
+
+
+def _lot_diff(item: dict, cwd: str, *, db=None, cfg=None) -> list[str]:
     """Le diff de la branche du lot (stat et derniers commits), borné.
 
     Jamais fatal : sans branche, sans dépôt, sans git ou sans merge-base, la
     section le dit et la session neuve sait où reprendre. N2 (revue Claude du
     2026-10-14) : `branch` et `branch_target` viennent de `work.set_branch` et
     ne sont jamais passés à git comme des options — un nom qui commence par
-    `-` est refusé, et `--end-of-options` précède toute référence."""
+    `-` est refusé, et `--end-of-options` précède toute référence.
+
+    #6984 : le dossier de session n'est pas le worktree du lot ; la branche se
+    cherche aussi dans les worktrees suivis du lot sur cet hôte. Sans piste qui
+    la tienne, le refus nomme l'erreur git réelle au lieu de « git failed »
+    (`--quiet` l'effaçait)."""
     section = ["## Diff of the lot's branch"]
     branche = (item.get("branch") or "").strip()
     if not branche:
@@ -1115,32 +1148,47 @@ def _lot_diff(item: dict, cwd: str) -> list[str]:
     if not cwd or not os.path.isdir(cwd):
         return section + ["- branch %s (diff unreadable: no working directory)"
                           % branche]
-    tete, err = _git(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options",
-                           branche + "^{commit}"])
+    places: list[str] = []
+    for path in [cwd] + _lot_worktrees(db, cfg, item):
+        real = os.path.realpath(path) if path and os.path.isdir(path) else ""
+        if real and real not in places:
+            places.append(real)
+    tete = err = ""
+    where = cwd
+    for place in places:
+        tete, err = _git(place, ["rev-parse", "--verify", "--end-of-options",
+                                 branche + "^{commit}"])
+        if tete:
+            where = place
+            break
     if not tete:
-        return section + ["- branch %s (diff unreadable: %s)" % (branche, err or "unknown ref")]
+        return section + ["- branch %s (diff unreadable: %s; not in %s)"
+                          % (branche, err or "unknown ref",
+                             ", ".join(places) or "any local checkout")]
     tete = tete.strip()
     cible = (item.get("branch_target") or "").strip()
     if cible.startswith("-"):
         cible = ""
     racine = base_nom = None
     for candidat in ([cible] if cible else list(LOT_DIFF_BASES)):
-        sortie, _ = _git(cwd, ["merge-base", "--end-of-options", candidat, branche])
+        sortie, _ = _git(where, ["merge-base", "--end-of-options", candidat, branche])
         if sortie and sortie.strip():
             racine, base_nom = sortie.strip(), candidat
             break
     if racine is None:
         return section + ["- branch %s, head %s (no merge-base with %s: diff unreadable)"
                           % (branche, tete[:12], cible or "/".join(LOT_DIFF_BASES))]
-    out = ["- %s: base %s (%s) → head %s" % (branche, base_nom, racine[:12], tete[:12])]
-    stat, _ = _git(cwd, ["diff", "--stat", "--no-color", "--end-of-options",
-                         racine, branche])
+    out = ["- %s: base %s (%s) → head %s%s"
+           % (branche, base_nom, racine[:12], tete[:12],
+              "" if where == cwd else " (read in %s)" % where)]
+    stat, _ = _git(where, ["diff", "--stat", "--no-color", "--end-of-options",
+                           racine, branche])
     if stat:
         stat_lignes = [l for l in stat.splitlines() if l.strip()][:LOT_DIFF_MAX_LINES]
         out += ["  - " + fil.excerpt(l, 300) for l in stat_lignes]
         out = _clip_lines(out, LOT_DIFF_MAX_BYTES)
-    journal, _ = _git(cwd, ["log", "--oneline", "--no-decorate", "-5",
-                            "--end-of-options", "%s..%s" % (racine, branche)])
+    journal, _ = _git(where, ["log", "--oneline", "--no-decorate", "-5",
+                              "--end-of-options", "%s..%s" % (racine, branche)])
     if journal:
         out.append("  - last commits:")
         out += ["    - " + fil.excerpt(l, 200) for l in journal.splitlines()[:5]]
@@ -1341,7 +1389,7 @@ def lot_brief(cfg: Config, db, row: dict | None, lot, *, consigne: str = "",
         fiche = ["## Lot #%s" % lot, "- lot unreadable or unknown to ameesh"]
     else:
         fiche = _lot_sheet(db, item) + _not_yours(item, name, cfg=cfg, db=db)
-    diff = _lot_diff(item or {}, row.get("cwd") or "")
+    diff = _lot_diff(item or {}, row.get("cwd") or "", db=db, cfg=cfg)
     fin = ["## Instructions", (consigne or "").strip() or DEFAULT_RESUME]
     text = "\n".join(head + ident + [""] + fiche + [""] + diff + [""]
                      + _lot_thread(db, name, str(lot)) + fin)
