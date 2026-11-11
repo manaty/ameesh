@@ -35,11 +35,16 @@ primaire() {
 }
 
 ecrire() {
-    local hote=$1 id
+    local hote=$1 id jeton
+    # Jeton unique par tentative : l'identité d'une confirmation est le couple
+    # (id, jeton), pas le seul id — une branche divergente peut réattribuer un
+    # id, et la preuve RPO doit alors voir une substitution, pas une présence.
+    jeton=$(cat /proc/sys/kernel/random/uuid) || return 1
     id=$(psql "$(conn "$hote")" -X -q -tA -v ON_ERROR_STOP=1 -c \
-        "INSERT INTO banc_ecritures(noeud) VALUES ('${hote}') RETURNING id" 2>/dev/null) || return 1
+        "INSERT INTO banc_ecritures(noeud,jeton) VALUES ('${hote}','${jeton}') RETURNING id" 2>/dev/null) || return 1
     [[ $id =~ ^[0-9]+$ ]] || return 1
-    printf '{"ts":%s,"noeud":"%s","id":%s}\n' "$(date +%s%N)" "$hote" "$id" >> "$SORTIE"
+    printf '{"ts":%s,"noeud":"%s","id":%s,"jeton":"%s"}\n' \
+        "$(date +%s%N)" "$hote" "$id" "$jeton" >> "$SORTIE"
 }
 
 while true; do

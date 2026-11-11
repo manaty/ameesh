@@ -88,7 +88,7 @@ grappe réelle (un seul synchrone, hub `nosync`, `pg_rewind`, `use_slots`,
 | configurations rendues | `$BANC_ETAT/config/<nœud>/` |
 | matériel TLS et `secrets.env` | `$BANC_ETAT/tls/` |
 | constats d'exécution | `$BANC_ETAT/constats.json` |
-| journal des écritures du poste | `$BANC_ETAT/client/ecritures.jsonl` (ajouté, jamais tronqué ; `reinitialiser` recrée le dossier) |
+| journal des écritures du poste | `$BANC_ETAT/client/ecritures.jsonl` (ajouté, jamais tronqué ; une ligne = `id`, `jeton` unique, nœud, date ; `reinitialiser` recrée le dossier) |
 | `etat.json` du banc | `$BANC_ETAT/etat.json` |
 | données PostgreSQL et etcd | `$BANC_ETAT/donnees/<nœud>/` et `$BANC_ETAT/etcd/<nœud>/`, supprimées par `banc.sh demonter` (propriété `postgres` dans le conteneur, nettoyage en root depuis l'image) |
 
@@ -104,13 +104,20 @@ banc avant chacun (sauf `--sans-reinitialiser`) :
 | `pc-eteint` | arrêt du conteneur `pc` | primaire et quorum etcd inchangés, aucune écriture du poste éteint, journal des confirmations conservé au redémarrage, reprise des écritures |
 | `deux-noeuds` | perte du primaire et du standby synchrone, le hub `nofailover` survit | le survivant ne se promeut pas (1 votant etcd sur 3), aucune écriture sans quorum, aucun split brain, jalon présent après le retour des deux nœuds — **limite attendue de l'étude**, pas une survie |
 
-Mesures produites : délai jusqu'au nouveau primaire, RPO (jalon SQL et
-**ensemble exact** des identifiants confirmés par le poste, pas seulement le
-maximum : une perte rend le verdict `blocked`), durée des périodes à deux
-primaires, délai de démotion de l'ancien primaire, délai de retour, présence
-de `pg_rewind`, état etcd, rôles finaux. Chaque geste est précédé d'au moins
-20 écritures confirmées, pour que la comparaison RPO ne porte pas sur deux
-lignes.
+Mesures produites : délai jusqu'au nouveau primaire, RPO, durée des périodes
+à deux primaires, délai de démotion de l'ancien primaire, délai de retour,
+présence de `pg_rewind`, état etcd, rôles finaux. Chaque geste est précédé
+d'au moins 20 écritures confirmées, pour que la comparaison RPO ne porte pas
+sur deux lignes.
+
+Pour le RPO, la fenêtre de panne est **close par l'arrêt du poste** dès le
+nouveau primaire connu : le journal est figé, et chaque confirmation qu'il
+contient — y compris celles obtenues pendant la bascule, donc après la
+photographie prise avant le geste — est comparée à la branche finale après
+retour et `pg_rewind`. L'identité comparée est le couple `(id, jeton)` :
+un id absent est une perte, un id présent avec un autre jeton est une
+substitution sur branche divergente ; une confirmation sans jeton est
+invérifiable. L'un ou l'autre rend le verdict `blocked`.
 
 ### Format du rapport
 

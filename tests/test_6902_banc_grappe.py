@@ -272,18 +272,46 @@ class RapportTest(unittest.TestCase):
         module = _charger_exercer()
         fichier = self._tmp / "ecritures.jsonl"
         fichier.write_text(
-            '{"id": 1, "noeud": "banc-1"}\n'
+            '{"id": 1, "noeud": "banc-1", "jeton": "a"}\n'
             "pas du json\n"
-            '{"id": 7, "noeud": "banc-2"}\n',
+            '{"id": 7, "noeud": "banc-2", "jeton": "g"}\n'
+            '{"id": 8, "noeud": "banc-2"}\n',
             encoding="utf-8",
         )
         resume = module.resume_ecritures(fichier)
-        self.assertEqual(resume["nombre"], 2)
-        self.assertEqual(resume["max_id"], 7)
-        self.assertEqual(resume["ids"], [1, 7])
+        self.assertEqual(resume["nombre"], 3)
+        self.assertEqual(resume["max_id"], 8)
+        self.assertEqual(resume["ids"], [1, 7, 8])
+        self.assertEqual(resume["paires"], [(1, "a"), (7, "g")])
+        # Une ligne confirmée sans jeton ne prouve pas son identité.
+        self.assertEqual(resume["sans_jeton"], 1)
         self.assertEqual(resume["noeuds"], ["banc-1", "banc-2"])
 
-    def test_ecritures_absentes_compare_lensemble_des_ids(self):
+    def test_comparer_confirmations_exige_id_et_jeton(self):
+        # Témoins négatifs de la revue #39050 : perte après la photographie
+        # (id absent) et substitution du même id (jeton différent).
+        module = _charger_exercer()
+        confirmations = [(1, "a"), (2, "b"), (3, "c")]
+        self.assertEqual(
+            module.comparer_confirmations(
+                confirmations, {1: "a", 2: "b", 3: "c"}
+            ),
+            ([], []),
+        )
+        self.assertEqual(
+            module.comparer_confirmations(confirmations, {1: "a", 3: "c"}),
+            ([2], []),
+        )
+        self.assertEqual(
+            module.comparer_confirmations(confirmations, {1: "a", 2: "X", 3: "c"}),
+            ([], [2]),
+        )
+        self.assertEqual(
+            module.comparer_confirmations(confirmations, {}),
+            ([1, 2, 3], []),
+        )
+
+    def test_ecritures_non_prouvees_lit_id_et_jeton(self):
         module = _charger_exercer()
 
         class FauxCible:
@@ -300,12 +328,18 @@ class RapportTest(unittest.TestCase):
                 return ""
 
             def sql(self, nom, requete, timeout=5):
-                return "1\n3"
+                self.requete = requete
+                return "1|a\n3|c"
 
-        pilote = module.Pilote(FauxCible(), module.Options())
-        # 2 manque même si le maximum (3) est présent : max(id) ne suffit pas.
-        self.assertEqual(pilote.ecritures_absentes("banc-1", [1, 2, 3]), [2])
-        self.assertEqual(pilote.ecritures_absentes("banc-1", []), [])
+        cible = FauxCible()
+        pilote = module.Pilote(cible, module.Options())
+        manquantes, substituees = pilote.ecritures_non_prouvees(
+            "banc-1", [(1, "a"), (2, "b"), (3, "c")]
+        )
+        self.assertEqual(manquantes, [2])
+        self.assertEqual(substituees, [])
+        self.assertIn("SELECT id, jeton", cible.requete)
+        self.assertEqual(pilote.ecritures_non_prouvees("banc-1", []), ([], []))
 
 
 class ScriptsTest(unittest.TestCase):

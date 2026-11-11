@@ -189,8 +189,12 @@ initialiser_schema() {
             CREATE TABLE IF NOT EXISTS banc_ecritures (
                 id bigserial PRIMARY KEY,
                 noeud text NOT NULL,
+                jeton text,
                 cree_le timestamptz NOT NULL DEFAULT clock_timestamp()
             );
+            ALTER TABLE banc_ecritures ADD COLUMN IF NOT EXISTS jeton text;
+            CREATE UNIQUE INDEX IF NOT EXISTS banc_ecritures_jeton
+                ON banc_ecritures (jeton);
         ' >/dev/null
 }
 

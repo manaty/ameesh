@@ -644,14 +644,46 @@ def lire_ecritures(chemin: Path | None) -> list[dict]:
 def resume_ecritures(chemin: Path | None) -> dict:
     lignes = lire_ecritures(chemin)
     ids = [int(l["id"]) for l in lignes if isinstance(l.get("id"), int)]
+    paires = []
+    sans_jeton = 0
+    for ligne in lignes:
+        if not isinstance(ligne.get("id"), int):
+            continue
+        jeton = ligne.get("jeton")
+        if isinstance(jeton, str) and jeton:
+            paires.append((int(ligne["id"]), jeton))
+        else:
+            sans_jeton += 1
     return {
         "nombre": len(lignes),
         "max_id": max(ids) if ids else 0,
         # Tous les identifiants confirmés par le poste, pas seulement le plus
         # grand : une séquence peut avancer après bascule et laisser un trou.
         "ids": sorted(set(ids)),
+        # L'identité d'une confirmation est le couple (id, jeton) : le seul id
+        # ne distingue pas une ligne conservée d'une ligne réattribuée sur une
+        # branche divergente.
+        "paires": paires,
+        "sans_jeton": sans_jeton,
         "noeuds": sorted({str(l.get("noeud")) for l in lignes if l.get("noeud")}),
     }
+
+
+def comparer_confirmations(confirmations, presentes):
+    """Confirme que chaque couple (id, jeton) est présent à l'identique.
+
+    ``presentes`` associe un id à son jeton sur la branche finale. Retourne
+    (manquantes, substituées) : un id absent est une perte, un id présent avec
+    un autre jeton est une substitution (branche divergente).
+    """
+    manquantes = []
+    substituees = []
+    for identifiant, jeton in confirmations:
+        if identifiant not in presentes:
+            manquantes.append(identifiant)
+        elif presentes[identifiant] != jeton:
+            substituees.append(identifiant)
+    return manquantes, substituees
 
 
 # ---------------------------------------------------------------------------
@@ -895,26 +927,32 @@ class Pilote:
         except (Erreur, ValueError):
             return None
 
-    def ecritures_absentes(self, nom: str, ids: list[int]) -> list[int]:
-        """Identifiants confirmés par le poste qui manquent sur ``nom``.
+    def ecritures_non_prouvees(self, nom: str, confirmations) -> tuple[list[int], list[int]]:
+        """Confirmations du poste absentes ou substituées sur ``nom``.
 
-        On compare l'ensemble exact des identifiants lus dans le journal du
-        poste à ceux présents sur le nœud : ``max(id)`` ne suffirait pas, une
-        séquence peut avancer après bascule et laisser un trou.
+        On compare le couple (id, jeton) de chaque confirmation à la branche
+        finale : ``max(id)`` ne prouve ni l'absence de trou ni l'identité du
+        contenu, et un id réattribué après divergence serait accepté à tort.
         """
-        if not ids:
-            return []
+        if not confirmations:
+            return [], []
+        ids = sorted({i for i, _ in confirmations})
         try:
             reponse = self.cible.sql(
                 nom,
-                "SELECT id FROM banc_ecritures WHERE id IN (%s)"
+                "SELECT id, jeton FROM banc_ecritures WHERE id IN (%s)"
                 % ",".join(str(i) for i in ids),
                 timeout=15,
             )
         except Erreur:
-            return list(ids)
-        presents = {int(v) for v in reponse.splitlines() if v.strip().isdigit()}
-        return [i for i in ids if i not in presents]
+            return ids, []
+        presentes = {}
+        for ligne in reponse.splitlines():
+            morceaux = ligne.split("|")
+            if len(morceaux) != 2 or not morceaux[0].strip().isdigit():
+                continue
+            presentes[int(morceaux[0])] = morceaux[1]
+        return comparer_confirmations(confirmations, presentes)
 
     def etat_cluster(self) -> dict:
         roles = self.roles()
@@ -955,6 +993,11 @@ class Pilote:
         surveillance = Surveillance(self.cible)
         perdu = False
         retour_tente = False
+        pc_arrete = False
+        pc_redemarre = False
+        fenetre = {"paires": [], "sans_jeton": 0, "nombre": 0}
+        manquantes: list[int] = []
+        substituees: list[int] = []
         surveillance.start()
         try:
             t0 = time.time()
@@ -972,9 +1015,16 @@ class Pilote:
                     )
                 )
             log("nouveau primaire %s après %.1f s" % (nouveau, delai))
+            # Fenêtre de panne close : le poste est arrêté et le journal figé.
+            # Toute confirmation qu'il contient (y compris celles obtenues
+            # pendant la bascule) doit se retrouver à l'identique sur la
+            # branche finale, jeton compris.
+            self.cible.arreter_pc()
+            pc_arrete = True
+            time.sleep(0.3)
+            fenetre = self.ecritures()
             rpo_jalon = self.jalon_present(nouveau, jalon)
             max_apres = self.max_ecriture(nouveau)
-            manquantes = self.ecritures_absentes(nouveau, avant["ids"])
             retour_debut = time.time()
             self.cible.demarrer_noeud(primaire)
             retour_tente = True
@@ -982,6 +1032,11 @@ class Pilote:
                 primaire, "t", self.options.timeout_retour
             )
             fin = self.attendre_sain(timeout=self.options.timeout_sain)
+            manquantes, substituees = self.ecritures_non_prouvees(
+                fin, fenetre["paires"]
+            )
+            self.cible.demarrer_pc()
+            pc_redemarre = True
             jalon_final = self.jalon_present(fin, jalon)
             journal = self.cible.journal(primaire, 400)
             split, periodes = surveillance.primaires_simultanes()
@@ -991,13 +1046,20 @@ class Pilote:
                     self.cible.demarrer_noeud(primaire)
                 except Erreur as exc:
                     log("retour de %s non tenté : %s" % (primaire, exc))
+            if pc_arrete and not pc_redemarre:
+                try:
+                    self.cible.demarrer_pc()
+                except Erreur as exc:
+                    log("poste client non rallumé : %s" % exc)
             surveillance.arreter()
         rewind = bool(
             re.search(r"running pg_rewind", journal)
             and re.search(r"pg_rewind exit code=0", journal)
         )
         rpo_ecritures = (
-            not manquantes if self.cible.ecrivain_disponible else None
+            not manquantes and not substituees and fenetre["sans_jeton"] == 0
+            if self.cible.ecrivain_disponible
+            else None
         )
         critere = (
             delai is not None
@@ -1021,8 +1083,14 @@ class Pilote:
         )
         if rpo_ecritures is False:
             note += (
-                " Les écritures confirmées du poste ne sont pas toutes présentes "
-                "(%d manquante(s) sur %d)." % (len(manquantes), len(avant["ids"]))
+                " Confirmations non prouvées sur la branche finale : %d "
+                "manquante(s), %d substituée(s), %d sans jeton, sur %d."
+                % (
+                    len(manquantes),
+                    len(substituees),
+                    fenetre["sans_jeton"],
+                    len(fenetre["paires"]),
+                )
             )
         return self._resultat(
             "perte-primaire",
@@ -1034,8 +1102,11 @@ class Pilote:
                 "retour_ancien_primaire_s": None if delai_retour is None else round(delai_retour, 1),
                 "rpo_jalon": rpo_jalon,
                 "rpo_ecritures": rpo_ecritures,
-                "ecritures_confirmees": len(avant["ids"]),
+                "ecritures_confirmees": len(fenetre["paires"]),
+                "ecritures_avant_geste": len(avant["paires"]),
                 "ecritures_absentes": len(manquantes),
+                "ecritures_substituees": len(substituees),
+                "ecritures_sans_jeton": fenetre["sans_jeton"],
                 "max_ecriture_avant": avant["max_id"],
                 "max_ecriture_apres": max_apres,
                 "split_brain_s": round(split, 1),
@@ -1051,6 +1122,8 @@ class Pilote:
                 "journal_pg_rewind": _extrait(journal, ("pg_rewind", "rewind")),
                 "periodes_deux_primaires": len(periodes),
                 "ecritures_absentes_ids": manquantes[:20],
+                "ecritures_substituees_ids": substituees[:20],
+                "fenetre_close_par_arret_du_poste": True,
             },
             [note],
             verdict,
@@ -1063,6 +1136,11 @@ class Pilote:
         surveillance = Surveillance(self.cible)
         surveillance.start()
         retabli = False
+        pc_arrete = False
+        pc_redemarre = False
+        fenetre = {"paires": [], "sans_jeton": 0, "nombre": 0}
+        manquantes: list[int] = []
+        substituees: list[int] = []
         try:
             t0 = time.time()
             self.cible.couper(primaire)
@@ -1080,15 +1158,26 @@ class Pilote:
             demotion, delai_demotion = surveillance.attendre_role(
                 primaire, "t", self.options.timeout_promotion
             )
+            # Fenêtre de panne close : le poste est arrêté et le journal figé
+            # après la bascule ; les confirmations de la fenêtre seront
+            # comparées à l'identique sur la branche finale (id + jeton).
+            self.cible.arreter_pc()
+            pc_arrete = True
+            time.sleep(0.3)
+            fenetre = self.ecritures()
             rpo_jalon = self.jalon_present(nouveau, jalon)
             max_apres = self.max_ecriture(nouveau)
-            manquantes = self.ecritures_absentes(nouveau, avant["ids"])
             self.cible.retablir(primaire)
             retabli = True
             retour, delai_retour = surveillance.attendre_role(
                 primaire, "t", self.options.timeout_retour
             )
             fin = self.attendre_sain(timeout=self.options.timeout_sain)
+            manquantes, substituees = self.ecritures_non_prouvees(
+                fin, fenetre["paires"]
+            )
+            self.cible.demarrer_pc()
+            pc_redemarre = True
             jalon_final = self.jalon_present(fin, jalon)
             journal = self.cible.journal(primaire, 400)
             split, periodes = surveillance.primaires_simultanes()
@@ -1098,9 +1187,16 @@ class Pilote:
                     self.cible.retablir(primaire)
                 except Erreur:
                     pass
+            if pc_arrete and not pc_redemarre:
+                try:
+                    self.cible.demarrer_pc()
+                except Erreur as exc:
+                    log("poste client non rallumé : %s" % exc)
             surveillance.arreter()
         rpo_ecritures = (
-            not manquantes if self.cible.ecrivain_disponible else None
+            not manquantes and not substituees and fenetre["sans_jeton"] == 0
+            if self.cible.ecrivain_disponible
+            else None
         )
         rewind = bool(
             re.search(r"running pg_rewind", journal)
@@ -1135,8 +1231,14 @@ class Pilote:
             notes.append("La cible < 60 s est manquée ; l'exigence < 300 s reste tenue.")
         if rpo_ecritures is False:
             notes.append(
-                "Les écritures confirmées du poste ne sont pas toutes présentes "
-                "(%d manquante(s) sur %d)." % (len(manquantes), len(avant["ids"]))
+                "Confirmations non prouvées sur la branche finale : %d "
+                "manquante(s), %d substituée(s), %d sans jeton, sur %d."
+                % (
+                    len(manquantes),
+                    len(substituees),
+                    fenetre["sans_jeton"],
+                    len(fenetre["paires"]),
+                )
             )
         return self._resultat(
             "coupure-reseau",
@@ -1151,8 +1253,11 @@ class Pilote:
                 "retour_ancien_primaire_s": None if delai_retour is None else round(delai_retour, 1),
                 "rpo_jalon": rpo_jalon,
                 "rpo_ecritures": rpo_ecritures,
-                "ecritures_confirmees": len(avant["ids"]),
+                "ecritures_confirmees": len(fenetre["paires"]),
+                "ecritures_avant_geste": len(avant["paires"]),
                 "ecritures_absentes": len(manquantes),
+                "ecritures_substituees": len(substituees),
+                "ecritures_sans_jeton": fenetre["sans_jeton"],
                 "max_ecriture_avant": avant["max_id"],
                 "max_ecriture_apres": max_apres,
                 "split_brain_s": round(split, 1),
@@ -1169,6 +1274,8 @@ class Pilote:
                 "periodes_deux_primaires": len(periodes),
                 "demotion_observee": demotion is not None,
                 "ecritures_absentes_ids": manquantes[:20],
+                "ecritures_substituees_ids": substituees[:20],
+                "fenetre_close_par_arret_du_poste": True,
             },
             notes,
             verdict,
