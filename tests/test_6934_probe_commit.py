@@ -18,7 +18,7 @@ from unittest import mock
 from ameesh import (plan_git, review_authors, review_designation as rd,
                     review_designation_activation as act, work)
 
-from .test_4679_rebased_corrector import RebasedCorrectorDoubtTest
+from . import test_4679_rebased_corrector as rebased
 
 _REAL_FETCH = review_authors._forge_fetch
 
@@ -34,7 +34,7 @@ def _refusing(*shas):
     return fetch
 
 
-class ProbeCommitTest(RebasedCorrectorDoubtTest):
+class ProbeCommitTest(rebased.RebasedCorrectorDoubtTest):
     """Les témoins #4679 restent verts ; s'y ajoutent la sonde et sa garde."""
 
     def prefetched_freeze(self):
