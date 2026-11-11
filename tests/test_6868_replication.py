@@ -378,6 +378,18 @@ class ReplicationTest(unittest.TestCase):
         self.stub("pg_ctlcluster", FAKE_PG_CTLCLUSTER)
         self.stub("runuser", FAKE_RUNUSER)
         self.stub("hostname", FAKE_HOSTNAME)
+        # Les doublures adressent les nœuds par leur nom : copie de
+        # l'inventaire réel où l'hôte est le nom (les adresses privées #6859
+        # sont témoignées par test_inventaire_reseau_prive).
+        self.noeuds = self.tmp / "noeuds.conf"
+        lignes = []
+        for ligne in (REPLICATION / "noeuds.conf").read_text(encoding="utf-8").splitlines():
+            champs = ligne.split("#", 1)[0].split()
+            if champs:
+                champs[1] = champs[0]
+                ligne = "  ".join(champs)
+            lignes.append(ligne)
+        self.noeuds.write_text("\n".join(lignes) + "\n", encoding="utf-8")
         self.stub("pg_basebackup", FAKE_PG_BASEBACKUP)
         self.stub("pg_rewind", FAKE_PG_REWIND)
         (self.pgconf / "pg_hba.conf").write_text(
@@ -423,7 +435,7 @@ class ReplicationTest(unittest.TestCase):
             "TZ": "UTC",
             "AMEESH_REPLICATION_ETC": str(self.etc),
             "AMEESH_REPLICATION_ENV": str(self.env_file),
-            "AMEESH_REPLICATION_NOEUDS": str(REPLICATION / "noeuds.conf"),
+            "AMEESH_REPLICATION_NOEUDS": str(self.noeuds),
             "AMEESH_REPLICATION_PGCONF": str(self.pgconf),
             "AMEESH_REPLICATION_DATA": str(self.data),
             "AMEESH_REPLICATION_PGBIN": str(self.pgbin),
@@ -518,6 +530,19 @@ class ReplicationTest(unittest.TestCase):
         self.assertEqual(lignes[0][2:], ["primaire", "oui", "non", "100"])
         self.assertEqual(lignes[1][2:], ["standby", "oui", "non", "90"])
         self.assertEqual(lignes[2][2:], ["standby", "non", "oui", "0"])
+
+    def test_inventaire_reseau_prive(self):
+        # EP8.3 (#6860) : les nœuds se joignent sur les adresses privées
+        # d'EP8.2 (#6859, RESEAU-PRIVE.md), jamais par un nom public.
+        hotes = {}
+        for ligne in (REPLICATION / "noeuds.conf").read_text(encoding="utf-8").splitlines():
+            ligne = ligne.split("#", 1)[0].strip()
+            if ligne:
+                champs = ligne.split()
+                hotes[champs[0]] = champs[1]
+        self.assertEqual(hotes, {"ameesh-agents-1": "10.78.0.11",
+                                 "ameesh-agents-2": "10.78.0.12",
+                                 "manaty-mesh-1": "10.78.0.10"})
 
     def test_inventaire_refuse_deux_primaires_et_hub_synchrone(self):
         inventaire = self.tmp / "inventaire.cas"
@@ -796,6 +821,33 @@ os.execv({vrai_stat!r}, ["stat"] + args)
                                    "--force", "ameesh-agents-2")
         self.assertIn("--force accordé", resultat.stdout)
         self.assertIn("COMMIT confirmés peuvent être perdus", resultat.stdout)
+        self.assertIn("pg_ctlcluster 17 main promote", self.journal_texte())
+
+    def test_retour_nofailover_garde_borne_et_split_brain(self):
+        # Aller-retour d'EP8.3 (#6860, décision pilote b) : le retour vers le
+        # hub lève le seul nofailover ; borne et split brain restent gardés.
+        self.serveur(demarre=True, en_recuperation=True)
+        (self.state / "replay_lsn").write_text("0/4000000", encoding="utf-8")
+        resultat = self.run_script("promouvoir.sh", "--retour-nofailover",
+                                   "manaty-mesh-1", attendu=1)
+        self.assertIn("exige --borne", resultat.stderr)
+
+        self.hote_distant("ameesh-agents-1", demarre=True, en_recuperation=False)
+        resultat = self.run_script("promouvoir.sh", "--retour-nofailover", "--borne",
+                                   "0/4000000", "manaty-mesh-1", attendu=1)
+        self.assertIn("split brain", resultat.stderr)
+        self.hote_distant("ameesh-agents-1", demarre=False)
+
+        resultat = self.run_script("promouvoir.sh", "--retour-nofailover", "--borne",
+                                   "0/5000000", "manaty-mesh-1", attendu=1)
+        self.assertIn("candidat en retard", resultat.stderr)
+        self.assertNotIn("pg_ctlcluster 17 main promote", self.journal_texte())
+
+        (self.state / "replay_lsn").write_text("0/5000000", encoding="utf-8")
+        resultat = self.run_script("promouvoir.sh", "--retour-nofailover", "--borne",
+                                   "0/5000000", "manaty-mesh-1")
+        self.assertIn("retour planifié", resultat.stdout)
+        self.assertNotIn("--force accordé", resultat.stdout)
         self.assertIn("pg_ctlcluster 17 main promote", self.journal_texte())
 
     def test_promotion_sans_borne_force_dit_la_perte(self):
