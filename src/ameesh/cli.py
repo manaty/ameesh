@@ -140,6 +140,14 @@ def _doc(vocabulary=None) -> str:
 
 
 MAX_STOP_BLOCKS = 3
+#: #6964 : une session hors bail (liée par `ameesh mail bind`, ou
+#: AGENT_MAIL_NAME sans exécuteur) n'a ni tour ni borne L105 : sans cette
+#: borne, chaque hook (Stop compris) remettait 200 messages d'un arriéré.
+#: Au plus `turn_mail_max` (sinon ce défaut) par remise ; une session liée
+#: (`source == "session"`) n'a qu'un Stop bloqué par invite (AGENT_MAIL_NAME
+#: garde les 3 relances de la v0) : le reste attend, intact, les hooks suivants.
+EXTERNAL_HOOK_MAIL_MAX = 20
+EXTERNAL_MAX_STOP_BLOCKS = 1
 #: L61 : un hook ne réinscrit pas l'agent (aller-retour vers la base) plus
 #: d'une fois par cette durée, tant que harnais, dossier, session et bail
 #: n'ont pas changé — `last_seen` avance alors par pas d'au plus une minute.
@@ -1315,6 +1323,14 @@ def avis_borne(attente: int, borne: int) -> str:
             "the rest on the next turn." % (attente, borne))
 
 
+def avis_borne_externe(attente: int, borne: int, plafonne: bool = False) -> str:
+    """#6964 : borne d'une remise à une session hors bail (sans tour)."""
+    return ("[ameesh] %s%d more pending message(s) remain in your mailbox: at most "
+            "%d message(s) are delivered per hook. They stay unread and will be "
+            "delivered by the next hooks; `ameesh mail inbox` lists them."
+            % ("at least " if plafonne else "", attente, borne))
+
+
 def avis_borne_travail(attente: int, borne: int, travail: list[str]) -> str:
     """Borne atteinte, mais un travail lancé pendant le tour tourne encore :
     le tour n'est pas coupé pour le courrier (le conclure maintenant
@@ -1690,6 +1706,9 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             # nulle n'a rien reserve) ; la structure L514 de la chaine est
             # gardee (limite, garder/prendre selon le filtre mi-tour).
             limite = borne - etat["remis"] if etat is not None and borne else None
+            externe = not binding.bound_to_lease
+            if externe:
+                limite = cfg.turn_mail_max or EXTERNAL_HOOK_MAIL_MAX
             if event == "PostToolUse" and mid_turn_filtered(tool, binding):
                 # L514/#885: in a dsh or codex turn, only what must not wait
                 msgs = remise.prendre_mi_tour(limite)
@@ -1709,6 +1728,12 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                     else:
                         avis = "\n\n" + avis_borne(attente, borne)
                         etat["signale"] = True
+            elif externe and remise.reste:
+                attente = _attente(bk, name, msgs)
+                if attente:
+                    # la lecture des non-lus est plafonnée : « au moins »
+                    plafonne = attente + len(msgs) >= mail.UNREAD_LIMIT
+                    avis = "\n\n" + avis_borne_externe(attente, limite, plafonne)
             if event == "Stop":
                 # L125 : un courrier passif (accusé, copie, diffusion) ne relance
                 # pas un tour qui se termine : rendu à la boîte, il attend le
@@ -1718,7 +1743,9 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                     return 0
                 # stop_hook_active n'est pas fiable selon les harnais : on compte
                 # nous-mêmes les tours forcés d'affilée (comme la v0).
-                if bk.stop_counter(name) >= MAX_STOP_BLOCKS:
+                if bk.stop_counter(name) >= (EXTERNAL_MAX_STOP_BLOCKS
+                                             if binding.source == "session"
+                                             else MAX_STOP_BLOCKS):
                     return 0
                 # Écrire d'abord : si le harnais a fermé son entrée, on ne
                 # consomme pas les messages pour autant.
