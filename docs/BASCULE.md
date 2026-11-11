@@ -1535,6 +1535,235 @@ enrolled).
 
 ---
 
+## PostgreSQL cluster — planned switchover, minor upgrades and restore (EP8)
+
+The mesh database is a three-node PostgreSQL 17 cluster under etcd 3.5 and
+Patroni 4.x (study
+[`design/etudes/replique-base-mesh.md`](design/etudes/replique-base-mesh.md)
+§2–§7; owner decision #207987 a). The nodes and their private addresses are:
+
+| Node | Private address | Role | Patroni tags |
+|---|---|---|---|
+| `ameesh-agents-1` | `10.78.0.11` | preferred primary | `failover_priority: 100` |
+| `ameesh-agents-2` | `10.78.0.12` | primary candidate | `failover_priority: 90` |
+| `manaty-mesh-1` | `10.78.0.10` | etcd voter, asynchronous standby | `nofailover: true`, `nosync: true` |
+
+This section holds the **planned** operations. The incident runbooks (node
+replacement, etcd member replacement, `pg_rewind` failure, replica re-seed,
+full disk, suspected split brain, restore) are in
+[`EXPLOITATION.md`](EXPLOITATION.md), “Grappe PostgreSQL — runbooks
+d'incident”. The preparation material is in
+`deploy/serveur/replication/` (EP8.3a, #6868),
+[`deploy/serveur/patroni/`](../deploy/serveur/patroni/README.md)
+(EP8.4b, #6870) and
+[`deploy/serveur/pgbackrest/`](../deploy/serveur/pgbackrest/README.md)
+(EP8.1, #6858). No command below is invented: “Sources” at the end of the
+section names the script or CLI each one comes from.
+
+**Before any gesture**, run the cluster commands as root on the node named
+and `ameesh db status`/`ameesh alerts` under the agent account, record the
+outputs in the lot, and announce the window (staging, canon §14):
+
+```bash
+patronictl list
+patronictl topology
+ameesh db status
+ameesh alerts
+df -h /var/lib/postgresql
+```
+
+`patronictl` is the wrapper installed by EP8.4 (`/usr/local/bin/patronictl`);
+it reads `/etc/patroni/patroni.yml` and exports the secrets from
+`/etc/ameesh/patroni.env`. `ameesh db status` reads the local node, the
+standbys and, when `patroni_url` is configured, the Patroni API; it exits 1
+when a `db_*` alert is active. No agent decides a promotion: `patronictl`
+asks, Patroni and etcd execute.
+
+### Planned switchover
+
+Use it to move the primary off a node that needs maintenance, or back to
+`ameesh-agents-1`. Do **not** use it to replace a lost primary: Patroni
+already elects (see EXPLOITATION.md, “Perte du primaire”).
+
+Preconditions:
+
+- `patronictl list` shows the candidate `streaming` and `sync` (or at least
+  `streaming`: `synchronous_mode_strict: false` keeps writes available when
+  the synchronous standby is missing, at a degraded RPO), the hub `async`
+  when present (a stopped hub does not block the two-agent quorum), and no
+  member with `pending_restart`;
+- `ameesh db status` says `OK` (no `db_sync_lost`, `db_no_standby`,
+  `db_replication_lag`, `db_two_primaries`);
+- no migration is in flight: `ameesh migrate` is transactional and a
+  switchover aborts it (it is retried on the new primary), but the window is
+  cleaner without one;
+- clients use the three-host DSN
+  (`host=10.78.0.11,10.78.0.12,10.78.0.10 target_session_attrs=read-write`,
+  study §5); a client pinned to one host will not follow and must be
+  restarted or reconfigured first.
+
+```bash
+patronictl list
+patronictl switchover --leader ameesh-agents-1 \
+  --candidate ameesh-agents-2 --force
+patronictl list
+patronictl topology
+patronictl history
+ameesh db status
+ameesh doctor
+```
+
+Expected: `ameesh-agents-2` is `Leader`, `ameesh-agents-1` rejoins as a
+streaming replica through `pg_rewind` (or is re-seeded by Patroni), the hub
+stays `async`, and the other agent is `sync`. `patronictl history` carries
+the timestamps; the study's target is under one minute. Check that the
+clients reconnected (their own logs) and that `ameesh alerts` has no `db_*`
+alert.
+
+**Rollback** — a second switchover, once the old leader is streaming again:
+
+```bash
+patronictl list
+patronictl switchover --leader ameesh-agents-2 \
+  --candidate ameesh-agents-1 --force
+patronictl list
+```
+
+Do not start `postgresql@17-main` on the old leader and do not promote it by
+hand: that would be a second primary. If it does not rejoin, follow “Échec de
+pg_rewind” in EXPLOITATION.md. If only a client failed to follow, fix that
+client's DSN or restart the client; do not switch the database back for a
+client-side error.
+
+### Minor upgrade — PostgreSQL 17, etcd 3.5, Patroni 4.x
+
+Rules: one component, one node at a time; never two nodes of the same
+component in the same step; the cluster must be green before each step
+(`patronictl list`, `etcdctl … endpoint health --cluster`,
+`ameesh db status`); keep the previous package or binary until the cluster is
+green again. A PostgreSQL **major** upgrade is a separate lot (`pg_upgrade` on
+the primary, then re-seed the standbys), not this procedure.
+
+#### PostgreSQL 17 minor (patches)
+
+The Debian package comes from apt.postgresql.org and is installed by
+`installer-serveur.sh` when absent; the same `apt-get install` with the
+package names upgrades it in place. Patroni owns the data directory: keep
+`postgresql@17-main` disabled, and check that the package post-install did
+not start a second cluster; if it did, stop that unit immediately and let
+Patroni restart PostgreSQL. Upgrade the two standbys first, then switch over
+and upgrade the former primary.
+
+On a standby (hub first, then `ameesh-agents-2`):
+
+```bash
+patronictl list
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+  postgresql-17 postgresql-contrib-17
+patronictl restart ameesh manaty-mesh-1
+patronictl list
+```
+
+When both standbys run the new minor version, do the planned switchover
+above, upgrade the former primary (now a standby) the same way, then
+optionally switch back. After each `patronictl restart`, wait for `running`
+and `streaming` before touching the next node.
+
+```bash
+patronictl list
+patronictl history
+ameesh db status
+ameesh-pgbackrest etat
+etcdctl --endpoints https://10.78.0.11:2379 \
+  --cacert /etc/ameesh/tls/ca.crt \
+  --cert /etc/patroni/tls/etcd-client.crt \
+  --key /etc/patroni/tls/etcd-client.key endpoint health --cluster
+```
+
+#### etcd 3.5 minor
+
+The validated version and its checksum are in
+`deploy/serveur/patroni/README.md` (3.5.17). Replace `/usr/local/bin/etcd` on
+one node, restart only that member, and wait for the three endpoints to be
+healthy before the next one. The quorum is two of three: never restart a
+second member while the first is not healthy.
+
+```bash
+etcdctl --endpoints https://10.78.0.11:2379 \
+  --cacert /etc/ameesh/tls/ca.crt \
+  --cert /etc/patroni/tls/etcd-client.crt \
+  --key /etc/patroni/tls/etcd-client.key member list
+systemctl restart etcd
+journalctl -u etcd -n 50 --no-pager
+etcdctl --endpoints https://10.78.0.11:2379 \
+  --cacert /etc/ameesh/tls/ca.crt \
+  --cert /etc/patroni/tls/etcd-client.crt \
+  --key /etc/patroni/tls/etcd-client.key endpoint health --cluster
+```
+
+Rollback: keep the previous binary and restart only that member with it, one
+node at a time; an etcd downgrade across minor versions is not supported, so
+a failed minor upgrade is fixed forward rather than downgraded. Do not restore
+an etcd data directory from an older snapshot under a running member.
+
+#### Patroni 4.x minor
+
+On one node, with the repository checkout used by the installation (for
+example `/opt/ameesh/src`):
+
+```bash
+cd /opt/ameesh/src
+/opt/patroni/venv/bin/pip install -r deploy/serveur/patroni/requirements.txt
+systemctl restart patroni
+journalctl -u patroni -n 80 --no-pager
+patronictl list
+```
+
+Wait for the node to be `running` and streaming before the next. The REST
+API listens on the private address only; `patronictl list` uses it. Rollback:
+reinstall the previous version in the venv and restart Patroni, one node at a
+time.
+
+### Restore before a cutover or upgrade
+
+A backup that has not been restored is not a backup. Before a planned
+operation that touches storage or PostgreSQL, prove the restore on a host
+that is not the primary, into an **empty** directory. The script refuses the
+live data directory, starts a disposable instance with no network listener
+and `archive_mode=off`, then runs `ameesh doctor --probe` and prints the
+measured RTO:
+
+```bash
+ameesh-pgbackrest etat
+ameesh-pgbackrest exercice-dump --fichier <dump> --dossier <empty-dir>
+ameesh-pgbackrest restaurer --cible '2026-11-12 08:00:00+00' \
+  --dossier <empty-dir>
+```
+
+The daily `pg_dump` (`ameesh-sauvegarde.timer`, 03:30) is the second,
+independent path. The full restore procedure after a loss or a bad migration
+is in EXPLOITATION.md, “Restauration”; it reuses the same `pgBackRest`
+command but is a pilot/bureau gesture, not an exercise.
+
+**Sources.** `patronictl list|topology|history|switchover`:
+`deploy/serveur/patroni/patronictl` and its README; `patronictl restart` is
+the Patroni CLI (`patronictl restart --help`); package install:
+`deploy/serveur/installer-serveur.sh`; etcd health/member and the validated
+version: `deploy/serveur/patroni/README.md`; `ameesh db status` and the
+`db_*` alerts: EP8.5a (#6871), `docs/EXPLOITATION.md` “Grappe PostgreSQL”;
+`ameesh-pgbackrest etat|exercice-dump|restaurer`:
+`deploy/serveur/pgbackrest/pgbackrest-ameesh.sh` and its README. `systemctl`,
+`journalctl`, `df` and `apt-get` are the host's standard CLIs.
+
+**Known gaps.** No preparation lot scripts the package or binary replacement
+itself: the `apt-get` and binary steps above are the distribution's, with the
+versions validated in the Patroni README; the pilot confirms the package
+source before the gesture. No preparation lot pins a PostgreSQL minor version
+or a rollback to the previous package: keep the previous `.deb` or binary on
+the node until the cluster is green.
+
+---
+
 ## Risks and mitigations
 
 | Risk | Mitigation |
