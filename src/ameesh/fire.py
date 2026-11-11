@@ -1980,11 +1980,19 @@ def _ruleset_required(slug: str | None, target: str, *, gh) -> tuple:
     return tuple(dict.fromkeys(pairs))
 
 
-def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
+#: #6832 : `declared=` non fourni → la déclaration du projet radar seul. Un
+#: tuple (même vide) est une déclaration versionnée qui s'ajoute à celle du
+#: projet ; `None` dit « aucune déclaration versionnée » et ne change rien.
+_PROJECT_DECLARATION = object()
+
+
+def required_checks(slug: str | None, target: str, project, *, gh,
+                    declared=_PROJECT_DECLARATION) -> tuple:
     """Les checks requis de la branche cible, sous la forme `(contexte,
     app_id)` : la protection classique et les rulesets lus à la forge,
     complétés par la déclaration `radar.projects.<p>.required_checks` (des
-    noms, sans application imposée).
+    noms, sans application imposée) et, quand l'appelant la fournit, par la
+    déclaration **versionnée** du paquet (`declared=`, #6832).
 
     Quand la forge **refuse** une lecture (403 prouvé : jeton sans droits), la
     déclaration du projet la remplace **sans retirer l'autre lecture** ; sans
@@ -2000,17 +2008,26 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     le 403 de **plan** GitHub, qui prouve que la protection est indisponible
     sur ce dépôt (privé hors Pro) — il n'y a alors aucune protection à lire.
     Un 403 de droits, une protection lisible ou tout autre échec gardent le
-    refus : une déclaration vide n'affaiblit jamais une source qui existe."""
-    declared = tuple((str(name), None) for name in
-                     (getattr(project, "required_checks", ()) or ())
-                     if str(name).strip())
+    refus : une déclaration vide n'affaiblit jamais une source qui existe.
+
+    #6832 : `declared` est la déclaration versionnée lue par le paquet
+    (`forge_checks`), la seule qui suive une relève d'hôte. Elle s'ajoute à
+    celle du projet ; une valeur vide reste une déclaration (couvre le 403 de
+    plan), `None` signifie qu'il n'y en a pas."""
+    names = tuple(str(name) for name in
+                  (getattr(project, "required_checks", ()) or ())
+                  if str(name).strip())
+    present = bool(getattr(project, "required_checks_declared", False))
+    if declared is not _PROJECT_DECLARATION:
+        names += tuple(str(name) for name in (declared or ()) if str(name).strip())
+        present = present or declared is not None
+    declared_pairs = tuple((name, None) for name in dict.fromkeys(names))
     # #3428 : `[]` déclaré est une déclaration, pas une absence ; elle ne vaut
     # que pour le 403 de plan, prouvé source par source ci-dessous.
-    empty_declared = (not declared
-                      and bool(getattr(project, "required_checks_declared", False)))
+    empty_declared = (not declared_pairs and present)
     if not target:
-        if declared:
-            return declared
+        if declared_pairs:
+            return declared_pairs
         raise land.LandError("no target branch known: its required checks cannot be read")
     forged = []
     for read in (lambda: _protection_required(slug, target, gh=gh),
@@ -2022,7 +2039,8 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
             # de cette source ; sans déclaration, la lecture refuse.
             # #3428 : une déclaration vide couvre le seul 403 de plan, qui
             # prouve l'absence de protection ; un 403 de droits refuse.
-            if not declared and not (empty_declared and _plan_unprotected(str(exc))):
+            if not declared_pairs and not (empty_declared
+                                           and _plan_unprotected(str(exc))):
                 raise
         except land.TransientLandError:
             # #2306 : un échec passager n'est pas une source absente ; la
@@ -2034,7 +2052,22 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
             # forge n'a pas prouvé de refus, la déclaration ne remplace rien ;
             # la lecture partielle est écartée (fail-closed).
             raise
-    return tuple(dict.fromkeys(tuple(forged) + declared))
+    return tuple(dict.fromkeys(tuple(forged) + declared_pairs))
+
+
+def versioned_declaration(slug: str | None):
+    """#6832 : la déclaration des checks versionnée avec le paquet pour ce
+    dépôt, ou None quand il n'y en a pas.
+
+    C'est la source qui survit à une relève : `radar.projects` reste dans le
+    fichier d'un hôte. Un inventaire illisible lève `land.LandError` — une
+    déclaration qu'on ne peut pas lire ne s'ignore pas."""
+    from . import forge_checks
+    try:
+        return forge_checks.declared(slug)
+    except forge_checks.InventoryError as exc:
+        raise land.LandError("the versioned required-checks declaration of %s is "
+                             "unreadable: %s" % (slug or "?", exc)) from exc
 
 
 def _head_statuses(slug: str | None, sha: str, *, gh) -> list:
@@ -2100,11 +2133,14 @@ def required_on_head(project, target: str, sha: str, *, gh) -> list:
     `land.TransientLandError` (la file réessaiera) ; une réponse malformée ou
     un manque prouvé restent des `LandError`."""
     from . import radar
-    declared = tuple(getattr(project, "required_checks", ()) or ())
-    if not declared:
+    if project is None:
         return []
     slug = radar.github_slug(project)
-    required = required_checks(slug, target, project, gh=gh)
+    versioned = versioned_declaration(slug)
+    declared = tuple(getattr(project, "required_checks", ()) or ())
+    if not declared and not versioned:
+        return []
+    required = required_checks(slug, target, project, gh=gh, declared=versioned)
     if not required:
         return []
     runs = _head_check_runs(slug, sha, gh=gh)
@@ -2153,7 +2189,8 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
              slug: str | None = None, gh=None, report: dict | None = None) -> tuple:
     """Les portes qui dépendent de la PR : brouillon, cible, CI verte sur la
     tête gelée, **checks requis de la branche cible** présents et `SUCCESS`
-    sur cette tête (protection de la forge ou déclaration du projet), CI du
+    sur cette tête (protection de la forge, déclaration du projet ou
+    déclaration versionnée du paquet, #6832), CI du
     commit gelé quand le projet l'exige (L160g).
 
     La protection peut imposer une application GitHub pour un contexte
@@ -2201,7 +2238,8 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
                        % (status.get("number"), head[:12], frozen_head[:12]))
     if required is None:
         try:
-            required = required_checks(slug, target, project, gh=gh)
+            declared = versioned_declaration(slug)
+            required = required_checks(slug, target, project, gh=gh, declared=declared)
         except land.LandError as exc:
             return False, ("the required checks of %s on the freeze %s cannot be proven: %s"
                            % (target or "the target", frozen[:12], exc))

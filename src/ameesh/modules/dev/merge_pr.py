@@ -364,7 +364,9 @@ def _required_refusal(slug: str, target: str, project, rollup, *, head: str = ""
 
     La lecture est celle du feu (`fire.required_checks` : protection de la
     branche lue à la forge, complétée — jamais affaiblie — par
-    `radar.projects.<p>.required_checks`) et la comparaison celle de
+    `radar.projects.<p>.required_checks` et par la déclaration versionnée du
+    paquet, `forge_checks` #6832, la seule qui suive une relève) et la
+    comparaison celle de
     `fire._required_gap` : un check absent, non conclu ou `SKIPPED` ne prouve
     rien. Quand la protection impose une application (`checks[].app_id`), la
     provenance se lit sur la tête exacte (`fire._head_check_runs`) : le rollup
@@ -392,7 +394,8 @@ def _required_refusal(slug: str, target: str, project, rollup, *, head: str = ""
     if not target:
         return "the required checks of the target cannot be proven: no target branch"
     try:
-        required = fire.required_checks(slug, target, project, gh=gh)
+        declared = fire.versioned_declaration(slug)
+        required = fire.required_checks(slug, target, project, gh=gh, declared=declared)
         pairs = fire._required_pairs(required)
     except land.LandError as exc:
         return "the required checks of %s cannot be proven: %s" % (target, exc)
