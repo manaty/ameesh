@@ -174,12 +174,40 @@ class GabaritTest(PgTestCase):
         self.exiger_pg_dump()
         premier, a = self.nouveau("un")
         self.assertIn(gabarit.preparer(a, premier), ("clone", "migrate+gabarit", "migrate"))
+        if gabarit.dernier == "migrate":
+            # #6785 : un autre processus du même serveur construisait le même
+            # gabarit (try-lock perdu) : on attend sa fin, sans course
+            gabarit._ranger(a, gabarit.empreinte(a), premier, attendre=True)
         second, b = self.nouveau("deux")
         self.assertEqual(gabarit.preparer(b, second), "clone")
         self.assertEqual(migrations.pending(b), [])
         a.execute("INSERT INTO agent_registry (name, harness) VALUES ('fuite', 'claude')")
         self.assertEqual(b.query("SELECT count(*) AS n FROM agent_registry")[0]["n"], 0)
         self.assertEqual(a.query("SELECT count(*) AS n FROM agent_registry")[0]["n"], 1)
+
+    def test_le_verrou_d_une_autre_empreinte_ne_bloque_pas(self):
+        """#6785 : témoin de la course vue en CI — un autre job du même
+        serveur range le gabarit d'une autre empreinte pendant que celui-ci
+        construit le sien ; seul le verrou de la même empreinte fait passer."""
+        self.exiger_pg_dump()
+        cle = "temoin-6785-%s" % uuid.uuid4().hex
+        self.addCleanup(gabarit._retirer, self.db, cle)
+        self.addCleanup(gabarit._cache.pop, cle, None)
+        with mock.patch.object(gabarit, "empreinte", return_value=cle):
+            with self.db.transaction() as autre:
+                autre.query("SELECT pg_advisory_xact_lock(hashtext(%s)) IS NULL AS ok",
+                            (gabarit.verrou("autre-" + cle),))
+                premier, a = self.nouveau("course")
+                self.assertEqual(gabarit.preparer(a, premier), "migrate+gabarit")
+                second, b = self.nouveau("course")
+                self.assertEqual(gabarit.preparer(b, second), "clone")
+            gabarit._retirer(self.db, cle)
+            with self.db.transaction() as meme:
+                meme.query("SELECT pg_advisory_xact_lock(hashtext(%s)) IS NULL AS ok",
+                           (gabarit.verrou(cle),))
+                troisieme, c = self.nouveau("course")
+                self.assertEqual(gabarit.preparer(c, troisieme), "migrate")
+        self.assertEqual(migrations.pending(c), [])
 
     def test_une_migration_ajoutee_ou_modifiee_invalide_le_gabarit(self):
         copie = tempfile.mkdtemp(prefix="ameesh-gabarit-")

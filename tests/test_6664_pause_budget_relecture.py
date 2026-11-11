@@ -370,6 +370,29 @@ class DebitPauseRelayTest(unittest.TestCase):
         self.assertIn("relancer le relecteur claude2", row["gesture"])
         self.assertFalse(row.get("paused"))
 
+    def test_attente_mixte_partage_le_geste_avec_reviews_due(self):
+        """#6671 : le geste `qa` d'une attente mixte est celui de `reviews_due`.
+
+        Le relecteur actif est relancé, le relecteur en pause renvoie au
+        pilote ; le texte de l'attente ne réintroduit pas une relance chez ce
+        dernier."""
+        report = self.report(reviewers=[
+            ("claude1", "blocked", BUDGET),
+            ("auditeur", "idle", "last turn: mail")])
+        row = self._wait(report)
+        due = {review["reviewer"]: review for review in report["reviews_due"]}
+        self.assertIn("relancer le relecteur auditeur", row["gesture"])
+        self.assertNotIn("relancer le relecteur claude1", row["gesture"])
+        self.assertNotIn("agent-mail send claude1", row["gesture"])
+        self.assertIn("relecteur claude1 en pause (budget paused) : pilote",
+                      row["gesture"])
+        self.assertEqual(due["claude1"]["gesture"],
+                         "relecteur claude1 en pause (budget paused) : pilote, "
+                         "désigner un autre relecteur ou attendre la levée")
+        self.assertIn(due["claude1"]["gesture"], row["gesture"])
+        self.assertNotIn("pause", due["auditeur"]["gesture"])
+        self.assertIn("relancer le relecteur auditeur", due["auditeur"]["gesture"])
+
 
 if __name__ == "__main__":
     unittest.main()

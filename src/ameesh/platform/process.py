@@ -897,6 +897,31 @@ def service_managers(uid: int | None = None) -> frozenset:
     return frozenset(out)
 
 
+def _user_bus_env(uid: int | None = None) -> dict | None:
+    """#6786: the environment `systemctl --user` needs to reach the user's
+    manager, None when the current one already names it. A session opened
+    without the user bus (ssh, `sudo -u`, a shell of the bureau) has no
+    `XDG_RUNTIME_DIR`: every executor then stayed a doubt and the
+    housekeeping kept every worktree. The runtime directory is that of
+    logind (`/run/user/<uid>`), taken only when it belongs to the user, is
+    closed to others and holds the bus socket; otherwise nothing is added."""
+    env = os.environ
+    if env.get("XDG_RUNTIME_DIR") or env.get("DBUS_SESSION_BUS_ADDRESS"):
+        return None
+    uid = os.getuid() if uid is None else uid
+    runtime = "/run/user/%d" % uid
+    try:
+        info = os.lstat(runtime)
+        bus = os.lstat(os.path.join(runtime, "bus"))
+    except OSError:
+        return None
+    import stat
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077
+            or not stat.S_ISSOCK(bus.st_mode) or bus.st_uid != uid):
+        return None
+    return dict(env, XDG_RUNTIME_DIR=runtime)
+
+
 def executor_processes() -> dict:
     """#5038: service MainPIDs with their kernel start ticks and cgroup.
 
@@ -914,7 +939,8 @@ def executor_processes() -> dict:
             done = subprocess.run(
                 [*manager, "show", "--no-pager",
                  "--property=Id,MainPID,ControlGroup,Transient,FragmentPath", "ameesh-*.service"],
-                capture_output=True, text=True, timeout=5, check=False)
+                capture_output=True, text=True, timeout=5, check=False,
+                env=_user_bus_env() if manager[-1] == "--user" else None)
         except (OSError, subprocess.SubprocessError):
             continue
         if done.returncode == 0:
