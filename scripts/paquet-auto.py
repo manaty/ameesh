@@ -6157,6 +6157,203 @@ def compose_packet(args: argparse.Namespace) -> int:
             lock.release()
 
 
+# ---------------------------------------------------------------------------
+# #6814 : la composition d'un agent ne vit pas dans le cgroup de son exécuteur
+# ---------------------------------------------------------------------------
+
+#: Un redémarrage de l'exécuteur (mise à jour staging) arrête l'unité et tue
+#: son cgroup : une composition lancée dans un tour mourait avec lui, sous son
+#: bail (h-03, #6810). Le scope transitoire vit sous le gestionnaire de
+#: l'utilisateur, hors de l'unité : l'arrêt du tour ne l'atteint plus. Il lui
+#: faut aussi une session neuve : l'exécuteur arrête son harnais par
+#: `killpg(groupe du tour)` (runner.py, `_signal_group`), et un changement de
+#: cgroup ne change pas de groupe de processus (B/P1 impl-11).
+RUNNER_CGROUP_RE = re.compile(
+    r"/ameesh-runner(?:-agent)?@[^/]*\.service(?:/|$)")
+#: Posé dans le scope : une seconde exécution ne se ré-enveloppe pas.
+SCOPED_ENV = "AMEESH_PAQUET_AUTO_SCOPED"
+#: Variables du tour et de son bail, retirées du scope. Le nom de l'agent
+#: reste (`AGENT_MAIL_NAME`, identité explicite) : après le redémarrage,
+#: l'exécuteur reprend un bail neuf et une identité liée à l'ancienne époque
+#: serait refusée (« unbound sender ») au milieu de la composition.
+TURN_VARIABLES = (
+    "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
+    "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
+    "AMEESH_LOT",
+)
+#: Dossier stable des worktrees, celui du tic (`CacheDirectory`) : le TMPDIR
+#: d'un tour peut être vidé à une rotation de session pendant la composition.
+SCOPE_TMPDIR = ".cache/ameesh/paquet-auto"
+#: Le scope écrit dans un journal, jamais dans le tube du tour : quand
+#: l'exécuteur est arrêté, le tube se ferme et le premier `print` lèverait
+#: `BrokenPipeError` au milieu de la composition. Le parent recopie le journal
+#: tant que le tour vit ; une fois tué, le scope continue d'y écrire.
+SCOPE_LOG_ENV = "AMEESH_PAQUET_AUTO_LOG"
+SCOPE_LOG_DIR = "logs"
+
+
+def in_runner_cgroup(path: str = "/proc/self/cgroup") -> bool:
+    """#6814 : ce processus vit-il dans le cgroup d'un exécuteur d'agent ?
+
+    `path` est un fichier au format `/proc/self/cgroup` (les témoins).
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    return bool(RUNNER_CGROUP_RE.search(text))
+
+
+def scope_unit(name: str) -> str:
+    """Un nom d'unité systemd sûr, préfixé `ameesh-paquet-auto-`."""
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "-", str(name or "composition"))
+    cleaned = cleaned.strip(".-")[:80] or "composition"
+    return "ameesh-paquet-auto-%s-%d-%s" % (
+        cleaned, os.getpid(), uuid.uuid4().hex[:8])
+
+
+def scope_log(unit: str) -> Path:
+    """#6814 : le journal du scope, sous le dossier stable du composeur."""
+    directory = Path.home() / SCOPE_TMPDIR / SCOPE_LOG_DIR
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return directory / (unit + ".log")
+
+
+def scope_environment(carrier: int = 0, *, log: Path | None = None) -> dict:
+    """#6814 : l'environnement de la composition dans son scope.
+
+    Le scope hérite du tour (DSN, `AGENT_MAIL_NAME`, `AMEESH_CONFIG`, caches),
+    mais pas de son bail : l'agent reste nommé, en identité explicite, et le
+    courrier de fin part encore après le redémarrage. `AMEESH_LOT` suit le
+    porteur (#6810), jamais le lot que l'agent avait au moment du lancement.
+    """
+    env = dict(os.environ)
+    env[SCOPED_ENV] = "1"
+    for variable in TURN_VARIABLES:
+        env.pop(variable, None)
+    if carrier:
+        env["AMEESH_LOT"] = str(carrier)
+        labels = [
+            part for part in str(env.get("AMEESH_CONTAINER_LABELS") or "").split(",")
+            if part and not part.startswith("ameesh.lot=")]
+        labels.append("ameesh.lot=%d" % carrier)
+        env["AMEESH_CONTAINER_LABELS"] = ",".join(labels)
+    if log is not None:
+        env[SCOPE_LOG_ENV] = str(log)
+    parent = Path.home() / SCOPE_TMPDIR
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        pass
+    else:
+        for variable in ("TMPDIR", "TMP", "TEMP", "AMEESH_TMPDIR"):
+            env[variable] = str(parent)
+    return env
+
+
+def scope_command(argv: list[str], *, unit: str, binary: str) -> list[str]:
+    """#6814 : la ligne `systemd-run --scope` qui relance ce script.
+
+    Le shell du scope redirige les deux sorties vers le journal : les tubes du
+    tour peuvent disparaître sans toucher la composition. Le parent, lui,
+    recopie le journal tant qu'il vit (#6814, `_follow_scope`).
+    """
+    return [binary, "--user", "--scope", "--quiet", "--collect",
+            "--unit", unit, "/bin/sh", "-c",
+            'exec "$0" "$@" >>"$%s" 2>&1' % SCOPE_LOG_ENV,
+            sys.executable, str(Path(__file__).resolve())] + list(argv)
+
+
+def _copy_log(path: Path, offset: int) -> int:
+    """Recopie ce qui a été écrit dans le journal depuis `offset` ; rend le
+    nouvel offset. Une sortie de tour fermée n'arrête pas la copie."""
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(offset)
+            data = stream.read()
+            offset = stream.tell()
+    except OSError:
+        return offset
+    if not data:
+        return offset
+    try:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    except AttributeError:
+        try:
+            sys.stdout.write(data.decode("utf-8", "replace"))
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+    except (OSError, ValueError):
+        pass
+    return offset
+
+
+def _follow_scope(proc, log: Path) -> int:
+    """Suit le scope jusqu'à sa fin et rend son code de sortie.
+
+    La boucle ne dépend pas du tube du tour : si le parent est tué, le scope
+    continue, ses écritures restent dans le journal.
+    """
+    offset = 0
+    while True:
+        offset = _copy_log(log, offset)
+        code = proc.poll()
+        if code is not None:
+            _copy_log(log, offset)
+            return int(code)
+        time.sleep(0.2)
+
+
+def maybe_scope(argv: list[str], *, name: str, carrier: int = 0) -> int | None:
+    """#6814 : relance la composition hors du cgroup de l'exécuteur.
+
+    Le scope a son propre cgroup (gestionnaire utilisateur) et sa propre
+    session (PGID distinct), donc l'arrêt du tour ne l'atteint ni par le
+    cgroup ni par `killpg`. Rend None quand le processus n'est pas dans un
+    tour, quand le scope est déjà posé, ou quand `systemd-run` manque (repli
+    direct, dit à l'appelant) ; sinon rend le code de sortie du scope après
+    avoir recopié son journal.
+    """
+    if os.environ.get(SCOPED_ENV) or not in_runner_cgroup():
+        return None
+    binary = shutil.which("systemd-run")
+    if not binary:
+        print("paquet-auto : systemd-run absent ; composition dans le cgroup de "
+              "l'exécuteur (un redémarrage staging la tuerait)", file=sys.stderr,
+              flush=True)
+        return None
+    unit = scope_unit(name)
+    try:
+        log = scope_log(unit)
+        descriptor = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(descriptor)
+    except OSError as error:
+        print("paquet-auto : journal du scope indisponible (%s) ; composition dans "
+              "le cgroup de l'exécuteur (un redémarrage staging la tuerait)"
+              % error, file=sys.stderr, flush=True)
+        return None
+    env = scope_environment(carrier, log=log)
+    command = scope_command(argv, unit=unit, binary=binary)
+    print("paquet-auto : composition hors du cgroup de l'exécuteur (%s), "
+          "journal %s" % (unit, log), file=sys.stderr, flush=True)
+    try:
+        # #6814 (B/P1 impl-11) : changer de cgroup ne détache pas le groupe de
+        # processus. L'exécuteur lance son harnais avec `start_new_session` et
+        # son arrêt fait `killpg(groupe du tour)` (`runner.py`, `_signal_group`) :
+        # sans session neuve, le scope héritait de ce groupe et mourait quand
+        # même. Le scope a donc sa propre session (PGID = pid de systemd-run).
+        proc = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
+    except OSError as error:
+        print("paquet-auto : scope indisponible (%s) ; composition dans le cgroup "
+              "de l'exécuteur (un redémarrage staging la tuerait)" % error,
+              file=sys.stderr, flush=True)
+        return None
+    return _follow_scope(proc, log)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Compose le paquet horaire sans agent (#3807).")
@@ -6251,7 +6448,15 @@ def main(argv: list[str] | None = None) -> int:
                              % PAUSED_RC)
     parser.add_argument("--no-packet-record", action="store_true",
                         help="banc : ne pas lire/écrire la base (porteur, packet record)")
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    if __name__ == "__main__":
+        # #6814 : seul le point d'entrée du script se ré-enveloppe ; un module
+        # importé (tests, `paquet-horaire`) ne remplace pas le processus de
+        # son appelant.
+        scoped = maybe_scope(raw_argv, name=args.name, carrier=args.carrier)
+        if scoped is not None:
+            return scoped
     global _PYTHON_OVERRIDE
     if args.python:
         if not Path(args.python).is_file():
