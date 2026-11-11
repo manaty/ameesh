@@ -58,6 +58,11 @@ def _env(**extra):
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     }
+    # #6918 (comme #1938) : le Python de setup-python a besoin de sa propre
+    # libpython ; sans LD_LIBRARY_PATH, sys.executable charge celle du système
+    # avec une autre stdlib et meurt en SIGSEGV sur un JSON invalide.
+    if os.environ.get("LD_LIBRARY_PATH"):
+        base["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
     base.update(extra)
     return base
 
