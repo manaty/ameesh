@@ -26,7 +26,11 @@ class Provenance(abc.ABC):
 
     @abc.abstractmethod
     def get(self, subject: str) -> Optional[dict]:
-        """La preuve brute de `subject`, ou None si l'origine est inconnue."""
+        """La preuve brute de `subject`, ou None si l'origine est inconnue.
+
+        #6873 : la lecture est brute, révocations comprises — l'audit doit
+        pouvoir relire la ligne retirée. C'est `revocation` qui dit si elle
+        ne vaut plus rien, et les lecteurs de la porte l'appliquent."""
 
     @abc.abstractmethod
     def milestone(self, subject: str) -> Optional[dict]:
@@ -48,6 +52,9 @@ class Provenance(abc.ABC):
         `actor` vaut pour toute orthographe de sa fiche du registre (nom ou
         alias, #4299 : un renommage réécrit le jalon, pas la preuve).
 
+        #6873 : une preuve révoquée n'est plus une preuve — elle ne figure
+        jamais dans cette lecture, comme si le commit n'avait pas de reçu.
+
         Un reçu de commit ne porte pas toujours le lot (`work_item_id` est
         NULL quand le hook post-commit ne le connaît pas). Cette lecture rend
         les SHA que l'acteur a réellement créés, pour que la désignation
@@ -57,6 +64,25 @@ class Provenance(abc.ABC):
         exhaustivement : une troncature silencieuse ferait disparaître le
         correctif sous des reçus plus récents (B/P2 cx3). Une ligne par
         `subject`, sans `recorded`."""
+
+    @abc.abstractmethod
+    def revocation(self, subject: str) -> Optional[dict]:
+        """La révocation de `subject` (#6873), ou None s'il n'y en a pas.
+
+        Rend `{subject, sha, actor, reason, at_ts}`. Une révocation est un
+        fait séparé : la ligne de `provenance_receipts` reste intacte, mais
+        tous les lecteurs de la porte doivent la tenir pour une origine
+        inconnue."""
+
+    @abc.abstractmethod
+    def revoke(self, subject: str, sha: str, actor: str, reason: str) -> dict:
+        """Révoque la preuve de `subject`, sans jamais la réécrire (#6873).
+
+        Écrit une ligne `provenance_revocations` si la preuve existe et n'est
+        pas déjà révoquée ; rend la ligne qui fait foi, avec `recorded` :
+        False quand une révocation antérieure existe (la première fait foi,
+        comme pour la preuve elle-même). Une seconde révocation ne remplace ni
+        l'acteur ni la raison de la première."""
 
     @abc.abstractmethod
     def origins(self, commits: Sequence[str]) -> list[int]:

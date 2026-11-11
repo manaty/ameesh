@@ -249,6 +249,32 @@ class PgProvenanceTest(PgTestCase):
         with self.assertRaises(prov.ProvenanceError):
             prov.receipt_for_commit(self.db, SHA1)
 
+    def test_a_revoked_receipt_is_unknown_and_out_of_every_read(self):
+        """#6873 : la révocation est un fait séparé, définitif, jamais une
+        réécriture de la preuve. Le commit redevient inconnu pour la porte et
+        disparaît des lectures de correctifs ; la ligne reste pour l'audit."""
+        self._receipt("commit:" + SHA1, SHA1, work_item_id=int(self.lot["id"]))
+        self.assertEqual([row["sha"] for row in
+                          self.ops.commits("mty-amh-impl-07")], [SHA1])
+        self.assertIsNone(self.ops.revocation("commit:" + SHA1))
+        revoked = prov.revoke_receipt(
+            self.db, SHA1, actor="auditeur", reason="preuve auto-attestée")
+        self.assertTrue(revoked["recorded"])
+        self.assertEqual(revoked["actor"], "auditeur")
+        self.assertEqual(revoked["reason"], "preuve auto-attestée")
+        self.assertIsNone(prov.receipt_for_commit(self.db, SHA1))
+        self.assertEqual(self.ops.commits("mty-amh-impl-07"), [])
+        # La ligne d'origine est intacte : c'est la lecture de preuve qui
+        # refuse, pas une suppression.
+        self.assertEqual(self.ops.get("commit:" + SHA1)["actor"],
+                         "mty-amh-impl-07")
+        # Une seconde révocation ne remplace ni l'acteur ni la raison.
+        again = prov.revoke_receipt(self.db, SHA1, actor="quelqu-un",
+                                    reason="autre motif")
+        self.assertFalse(again["recorded"])
+        self.assertEqual((again["actor"], again["reason"]),
+                         ("auditeur", "preuve auto-attestée"))
+
     def test_milestone_declared_in_a_turn_carries_its_proof(self):
         """Le jalon et sa preuve naissent dans la même transaction (0445)."""
         storage.of(self.db).agents.upsert_unleased(
@@ -514,6 +540,22 @@ class PgProvenanceTest(PgTestCase):
         with self.assertRaises(prov.ProvenanceError):
             prov.record_commit(self.db, other_head, identity=ident, cwd=other)
         self.assertIsNone(prov.receipt_for_commit(self.db, other_head))
+
+    def test_record_commit_does_not_resurrect_a_revoked_receipt(self):
+        """#6873 : même le tour qui a créé le commit ne rouvre pas un reçu
+        révoqué ; la révocation est définitive."""
+        ident = {"actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
+                 "harness": "deepseek"}
+        repo, env = self._repo()
+        head = self._commit_attested(repo, env, "révoqué")
+        row = prov.record_commit(self.db, head, identity=ident, cwd=repo)
+        self.assertTrue(row["recorded"])
+        prov.revoke_receipt(self.db, head, actor="auditeur",
+                            reason="preuve auto-attestée")
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            prov.record_commit(self.db, head, identity=ident, cwd=repo)
+        self.assertIn("revoked", str(raised.exception))
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
 
 
 class HookInstallTest(unittest.TestCase):
