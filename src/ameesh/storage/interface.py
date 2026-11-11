@@ -2791,11 +2791,35 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def set_external_executor(self, item_id: int, executor: str | None, *,
-                              note: str, actor: str) -> dict | None:
+                              session: str | None = None, note: str,
+                              actor: str) -> dict | None:
         """#3447 : pose (ou efface, `executor=None`) l'exécutant externe d'un
         lot ouvert, avec sa ligne de journal, en UNE transaction ; None si le
         lot est fermé, ou si la pose perd la course contre une attribution.
-        Un lot assigné ne reçoit pas d'exécutant externe (deux porteurs)."""
+        Un lot assigné ne reçoit pas d'exécutant externe (deux porteurs).
+        #6839 : `session` nomme la session exécutante du feu ; une levée efface
+        aussi la prise exclusive et son instant."""
+
+    @abc.abstractmethod
+    def claim_external(self, item_id: int, session: str, *, note: str,
+                       actor: str) -> dict:
+        """#6839 : prendre de façon EXCLUSIVE le geste d'un lot réservé à un
+        exécutant externe, sous le verrou de la ligne, avant l'effet externe.
+
+        Rend `{"item": …}` si la prise est écrite, ou un refus nommé :
+        `unknown_lot`, `closed` (avec l'état), `not_external` (lot ordinaire),
+        `taken` (avec la session porteuse et l'instant de sa prise) ou
+        `reserved_session` (le feu nomme une autre session). Deux prises
+        concurrentes se sérialisent : une seule écrit, l'autre voit la
+        porteuse."""
+
+    @abc.abstractmethod
+    def release_external(self, item_id: int, session: str, *, note: str,
+                         actor: str, force: bool = False) -> dict:
+        """#6839 : lever la prise exclusive d'un geste externe. Seule la
+        session porteuse la lève, sauf `force` (geste de pilote vérifié par le
+        métier). Rend `{"item": …}`, `unknown_lot`, `no_claim` ou `not_holder`
+        (avec la session porteuse)."""
 
     @abc.abstractmethod
     def count_builds(self, assignee: str) -> int:
