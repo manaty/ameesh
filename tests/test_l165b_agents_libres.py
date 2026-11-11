@@ -32,7 +32,7 @@ class _Libres(_Lots):
 
     def geler(self, item):
         # A QA lot waiting for someone else has already been frozen by its author.
-        work.milestone(self.db, item["id"], "frozen", sha="a" * 40, actor="test")
+        work.milestone(self.db, item["id"], "frozen", sha="%040x" % item["id"], actor="test")
 
     def listing(self):
         return storage.of(self.db).operations.listing()
