@@ -3566,7 +3566,9 @@ class WorkItems(interface.WorkItems):
             if isinstance(current, str):
                 current = json.loads(current)
             phase = current.get("phase")
-            if phase in ("landed", "empty", "paused", "invalidated") or phase == "promoting" \
+            # #6853 : un train `paused` s'abandonne (sa seule sortie) ; les
+            # autres phases terminales restent refusées.
+            if phase in ("landed", "empty", "invalidated") or phase == "promoting" \
                     or (current.get("plan") or {}).get("id") != plan_id:
                 return None
             fire = WorkItems(tx).train_fire_read(key, plan_id)

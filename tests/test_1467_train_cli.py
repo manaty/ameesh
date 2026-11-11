@@ -189,6 +189,76 @@ class TrainCommandTest(PgTestCase):
             with self.assertRaisesRegex(train.TrainError, "already terminal"):
                 self.execute("abandon", manifest=item)
 
+    def paused(self, item=None, fire_plan=False):
+        """#6853 : un train arrêté (`paused`) sur un plan, bail rendu."""
+        plan = self.plan if fire_plan else (item or dict(
+            self.plan, id="e" * 64, nonce="b" * 64, head="e" * 40, tree="e" * 40))
+        document = self.ledger.save(dict(self.document, phase="paused", plan=plan),
+                                    self.document["revision"], self.epoch)
+        self.ledger.release(self.epoch)
+        return plan, document
+
+    def test_abandon_ends_a_paused_train_without_fire(self):
+        # #6853 : `paused` n'avait aucune sortie (step() ne compose pas derrière
+        # lui, abandon le refusait) ; l'abandon du pilote l'invalide.
+        item, document = self.paused()
+        with mock.patch.object(work, "corrector", return_value="pilot"):
+            result = self.execute("abandon", manifest=item, reason="prevalidation red")
+        self.assertEqual(result["phase"], "invalidated")
+        self.assertEqual(result["abandoned"]["previous_phase"], "paused")
+        self.assertIsNone(result["abandoned"]["fire"])
+        state = self.ledger.load()
+        self.assertEqual((state["phase"], state["revision"]),
+                         ("invalidated", document["revision"] + 1))
+        # la réservation est libre : le créneau suivant peut composer
+        epoch = self.ledger.acquire(None)
+        self.assertIsNotNone(epoch)
+        self.ledger.release(epoch)
+        with mock.patch.object(work, "corrector", return_value="pilot"):
+            with self.assertRaisesRegex(train.TrainError, "already terminal"):
+                self.execute("abandon", manifest=item)
+
+    def test_abandon_of_a_paused_train_still_refuses_an_active_fire(self):
+        plan, _ = self.paused(fire_plan=True)
+        before = self.ledger.load()
+        with mock.patch.object(work, "corrector", return_value="pilot"):
+            with self.assertRaisesRegex(train.TrainError, "fire receipt"):
+                self.execute("abandon", manifest=plan)
+        self.assertEqual(self.ledger.load(), before)
+
+    def test_abandon_of_a_paused_train_names_the_exact_plan(self):
+        item, _ = self.paused()
+        with mock.patch.object(work, "corrector", return_value="pilot"):
+            with self.assertRaisesRegex(train.TrainError, "exact persisted plan"):
+                self.execute("abandon", manifest=dict(item, nonce="0" * 64))
+        self.assertEqual(self.ledger.load()["phase"], "paused")
+
+    def test_abandon_still_refuses_landed_and_empty(self):
+        item, _ = self.unfired()
+        for phase in ("landed", "empty"):
+            state = self.ledger.load()
+            epoch = self.ledger.acquire(None)
+            self.ledger.save(dict(state, phase=phase), state["revision"], epoch)
+            self.ledger.release(epoch)
+            with mock.patch.object(work, "corrector", return_value="pilot"):
+                with self.assertRaisesRegex(train.TrainError, "already terminal"):
+                    self.execute("abandon", manifest=item)
+            self.assertEqual(self.ledger.load()["phase"], phase)
+
+    def test_storage_refuses_abandon_of_other_terminal_phases(self):
+        # La garde SQL suit la même règle que la commande (#6853).
+        item, document = self.paused()
+        epoch = self.ledger.acquire(None)
+        try:
+            for phase in ("landed", "empty", "invalidated"):
+                saved = self.ledger.save(dict(self.ledger.load(), phase=phase),
+                                         self.ledger.load()["revision"], epoch)
+                self.assertIsNone(self.ledger.ops.train_abandon(
+                    self.ledger.key, item["id"], dict(saved, phase="invalidated"),
+                    revision=saved["revision"], owner=self.ledger.owner, epoch=epoch))
+        finally:
+            self.ledger.release(epoch)
+
     def test_abandon_accepts_a_revoked_fire(self):
         # A withdrawn fire authorizes nothing; the plan is no longer "fired".
         with mock.patch.object(work, "corrector", return_value="pilot"):
