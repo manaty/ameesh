@@ -19,7 +19,10 @@ A persisted plan that was never fired has no receipt to withdraw: ``abandon``
 is its terminal gesture. It refuses an active/uncertain fire (withdraw or
 reconcile first), writes the terminal phase with the pilot actor, and releases
 the target lease it had to take (or adopts when that lease has expired). The
-next cutoff may then compose a new plan.
+next cutoff may then compose a new plan. #6853: a ``paused`` train (red
+prevalidation) is terminal for the engine, which never composes behind it;
+``abandon`` is the pilot's way out of it, with the same guards (exact plan,
+no active/uncertain fire, target lease).
 """
 from __future__ import annotations
 
@@ -49,7 +52,10 @@ def _abandon(ledger, plan, *, actor, reason, now):
     if state is None:
         raise TrainError("no persisted train for this project target")
     phase = state.get("phase")
-    if phase in TERMINAL:
+    # #6853 : `paused` (prévalidation rouge, arrêt voulu) n'a pas d'autre
+    # sortie : `step()` ne compose jamais derrière lui. L'abandon est le geste
+    # du pilote qui le termine, avec les mêmes gardes (plan exact, feu, bail).
+    if phase in TERMINAL and phase != "paused":
         raise TrainError("train is already terminal (%s): nothing to abandon" % phase)
     if phase == "promoting":
         # The push/merge may have happened: only reconciliation can tell.
