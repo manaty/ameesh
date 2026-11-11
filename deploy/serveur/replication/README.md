@@ -17,7 +17,7 @@ Trois nœuds PostgreSQL 17, sans VM nouvelle (étude §2) :
 |---|---|---|---|
 | `ameesh-agents-1` | `primaire`, synchrone, priorité 100 | primaire | sert les clients |
 | `ameesh-agents-2` | `standby`, synchrone, priorité 90 | standby synchrone | `sync` (un seul) |
-| `manaty-mesh-1` | `standby`, **nosync**, **nofailover**, priorité 0 | standby asynchrone, hub WireGuard | `async`, jamais promu |
+| `manaty-mesh-1` | `standby`, **nosync**, **nofailover**, priorité 0 | standby asynchrone, hub WireGuard | `async` ; promu seulement au retour planifié (`--retour-nofailover`) |
 
 L'inventaire [`noeuds.conf`](noeuds.conf) porte ces valeurs ; les scripts n'ont
 aucun nom de nœud en dur. La cible d'EP8.3 est le primaire `ameesh-agents-1`,
