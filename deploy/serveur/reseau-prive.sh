@@ -49,17 +49,21 @@ prive() {
 
 # Réseau canonique (/16 à /29) entièrement RFC 1918 et sans recouvrement de
 # WireGuard : tester la seule adresse de base laissait passer 10.77.1.0/16.
+# --hote : adresse/préfixe d'une interface, jugée sur le réseau qu'elle porte.
 sous_reseau_valide() {
   python3 -I -c '
 import ipaddress, sys
 try:
-    n = ipaddress.IPv4Network(sys.argv[1])
+    if sys.argv[1] == "--hote":
+        n = ipaddress.IPv4Interface(sys.argv[2]).network
+    else:
+        n = ipaddress.IPv4Network(sys.argv[1])
 except ValueError:
     sys.exit(1)
 rfc1918 = [ipaddress.IPv4Network(c) for c in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
 ok = (16 <= n.prefixlen <= 29 and any(n.subnet_of(r) for r in rfc1918)
       and not n.overlaps(ipaddress.IPv4Network("10.77.0.0/24")))
-sys.exit(0 if ok else 1)' "$1"
+sys.exit(0 if ok else 1)' "$@"
 }
 
 # MAC de l'unique carte privée annoncée par les métadonnées Scaleway.
@@ -82,7 +86,8 @@ cmd_interface() {
   while (($#)); do
     case $1 in --mac) mac=${2:?--mac sans valeur}; shift 2 ;; *) meurt "argument inconnu : $1" ;; esac
   done
-  [[ $cidr =~ ^[0-9.]+/[0-9]{1,2}$ ]] && prive "$cidr" || meurt "adresse/préfixe privé attendu : '$cidr'"
+  [[ $cidr =~ ^[0-9.]+/[0-9]{1,2}$ ]] && prive "$cidr" && sous_reseau_valide --hote "$cidr" \
+    || meurt "adresse/préfixe privé attendu (/16 à /29) : '$cidr'"
   [[ -n $mac ]] || mac=$(mac_privee) || meurt "MAC de la carte privée introuvable"
   mac=${mac,,}
   [[ $mac =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || meurt "MAC invalide : $mac"

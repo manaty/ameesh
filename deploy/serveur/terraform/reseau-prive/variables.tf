@@ -24,9 +24,24 @@ variable "sous_reseau" {
   description = "Sous-réseau IPv4 privé, distinct de WireGuard (10.77.0.0/24) et de Docker (172.17.0.0/16)."
   type        = string
   default     = "10.78.0.0/24"
+  # Règle de reseau-prive.sh (sous_reseau_valide) : forme canonique, /16 à /29,
+  # entier dans une plage RFC 1918, sans recouvrir WireGuard (ni Docker ici).
+  # Deux réseaux se recouvrent si leurs bases coïncident au plus court préfixe.
   validation {
-    condition     = can(cidrhost(var.sous_reseau, 0)) && !contains(["10.77.0.0/24", "172.17.0.0/16"], var.sous_reseau)
-    error_message = "Sous-réseau invalide ou déjà pris par WireGuard ou Docker."
+    condition = try(
+      cidrhost(var.sous_reseau, 0) == split("/", var.sous_reseau)[0]
+      && tonumber(split("/", var.sous_reseau)[1]) >= 16
+      && tonumber(split("/", var.sous_reseau)[1]) <= 29
+      && anytrue([for r in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] :
+        cidrhost("${split("/", var.sous_reseau)[0]}/${split("/", r)[1]}", 0) == split("/", r)[0]
+      ])
+      && alltrue([for r in ["10.77.0.0/24", "172.17.0.0/16"] :
+        cidrhost("${split("/", var.sous_reseau)[0]}/${min(split("/", var.sous_reseau)[1], split("/", r)[1])}", 0)
+        != cidrhost("${split("/", r)[0]}/${min(split("/", var.sous_reseau)[1], split("/", r)[1])}", 0)
+      ]),
+      false
+    )
+    error_message = "Sous-réseau invalide (forme canonique RFC 1918, /16 à /29) ou recouvrant WireGuard (10.77.0.0/24) ou Docker (172.17.0.0/16)."
   }
 }
 
