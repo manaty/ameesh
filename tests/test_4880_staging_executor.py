@@ -479,6 +479,87 @@ class ExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "staging request blocked"):
             executor.submit(self.db, self.cfg, self.options, "a" * 40)
 
+    # -- #6776: the start deadline expires a request; cancel is traced --------
+
+    def test_pending_past_its_start_deadline_expires_without_attempt(self):
+        self.request.update(deadline=time.time() - 1,
+                            blocked_reason="forge CI: pending")
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], executor.EXPIRED)
+        self.assertEqual(self.request["state"], executor.EXPIRED)
+        # The refusal stays apart from the expiry.
+        self.assertNotIn("blocked_reason", self.request)
+        self.assertEqual(self.request["last_blocked_reason"], "forge CI: pending")
+        self.assertEqual(self.calls, [])
+        executor.subprocess.run.assert_not_called()
+
+    def test_pending_before_its_deadline_is_taken(self):
+        self.request["deadline"] = time.time() + 300
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"],
+                         "completed")
+
+    def test_deadline_reached_during_preparation_expires_before_attempt(self):
+        self.request["deadline"] = time.time() + 300
+        # Checked on reading, then again after the preparation.
+        with mock.patch.object(executor, "start_expired", side_effect=[False, True]):
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], executor.EXPIRED)
+        self.assertEqual(self.request["state"], executor.EXPIRED)
+        self.assertFalse([argv for argv, _ in self.calls if argv[0] == "bash"])
+
+    def test_expired_request_is_never_taken_after_a_takeover(self):
+        self.request.update(state=executor.EXPIRED, deadline=time.time() - 1)
+        self.cfg.host = "host-b"
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options),
+                         {"state": "idle"})
+        self.assertEqual(self.calls, [])
+
+    def test_running_request_never_expires_on_its_start_deadline(self):
+        self.assertFalse(executor.start_expired(
+            dict(state="running", deadline=1), now=10))
+        self.assertFalse(executor.start_expired(dict(state="pending"), now=10))
+
+    def test_cancel_of_a_pending_request_is_traced(self):
+        self.request["blocked_reason"] = "another staging sequence running: old"
+        data = executor.cancel(self.db, self.cfg, self.options, "request-1",
+                               reason="drain AG1", actor="agent:pilot")
+        self.assertEqual(self.request, data)
+        self.assertEqual(data["state"], executor.CANCELLED)
+        self.assertEqual(data["cancelled_by"], "agent:pilot")
+        self.assertEqual(data["reason"], "drain AG1")
+        self.assertIn("cancelled_at", data)
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options),
+                         {"state": "idle"})
+        # A new submit may follow.
+        self.assertEqual(executor.submit(self.db, self.cfg, self.options,
+                                         "b" * 40)["state"], "pending")
+
+    def test_cancel_refuses_a_running_request(self):
+        self.request.update(state="running", host="host-a", run="attempt-a")
+        with self.assertRaisesRegex(RuntimeError, "never killed"):
+            executor.cancel(self.db, self.cfg, self.options, "request-1",
+                            reason="drain", actor="agent:pilot")
+        self.assertEqual(self.request["state"], "running")
+
+    def test_cancel_refuses_another_request_terminal_or_no_reason(self):
+        with self.assertRaisesRegex(RuntimeError, "not the current"):
+            executor.cancel(self.db, self.cfg, self.options, "other",
+                            reason="x", actor="agent:pilot")
+        with self.assertRaisesRegex(ValueError, "reason"):
+            executor.cancel(self.db, self.cfg, self.options, "request-1",
+                            reason=" ", actor="agent:pilot")
+        self.request["state"] = "completed"
+        with self.assertRaisesRegex(RuntimeError, "terminal"):
+            executor.cancel(self.db, self.cfg, self.options, "request-1",
+                            reason="x", actor="agent:pilot")
+
+    def test_cancel_waits_for_a_free_execution_lease(self):
+        executor.ExecutionLease.return_value.acquire.return_value = None
+        with self.assertRaisesRegex(RuntimeError, "busy"):
+            executor.cancel(self.db, self.cfg, self.options, "request-1",
+                            reason="x", actor="agent:pilot")
+        self.assertEqual(self.request["state"], "pending")
+
     def test_automatic_release_queues_without_running_in_its_launcher(self):
         project = release_cutoff.ProjectRelease(
             name="test", repo=str(self.root), staging_executor="private.json")

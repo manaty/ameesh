@@ -728,9 +728,11 @@ def request_findings(rows: list[dict], *, now: float, attested=(),
             if state == "failed" and _repaired(
                     data.get("run"), latest, ids, descends or _git_descends):
                 continue
-            if state in ("completed", "partial"):
+            # #6776: a cancellation is a traced gesture, not a failure;
+            # an expiry is one: the requester's fallback must not assume it.
+            if state in ("completed", "partial", "cancelled"):
                 continue
-            if state == "failed" or data.get("blocked_reason") or late:
+            if state in ("failed", "expired") or data.get("blocked_reason") or late:
                 unsettled.append((row, late))
         if not unsettled:
             continue
@@ -744,7 +746,14 @@ def request_findings(rows: list[dict], *, now: float, attested=(),
         # request (last named error, already bounded and redacted there). The
         # generic "reprise refusée avant preuve d'arrêt…" misled the auditor
         # on #6532: a configuration refusal or a failed step is not a recovery.
-        if data.get("blocked_reason"):
+        if data.get("state") == "expired":
+            # #6776: the requester's fallback must not assume a live request.
+            last = " ".join(str(data.get("last_blocked_reason") or "").split())[:300]
+            detail = ("Staging request %s (%s) expirée : échéance de prise "
+                      "dépassée sans prise%s ; aucun candidat ne la reprendra. "
+                      "Soumettre de nouveau ou replier."
+                      % (request, sha, " (dernier refus : %s)" % last if last else ""))
+        elif data.get("blocked_reason"):
             detail = "Staging request %s (%s) blocked: %s" % (
                 request, sha, " ".join(str(data["blocked_reason"]).split())[:300])
         elif late:
