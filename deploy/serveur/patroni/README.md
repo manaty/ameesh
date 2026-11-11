@@ -35,6 +35,12 @@ adresses privées sont celles d'EP8.2 (lot #6859,
   lieu de risquer un fork.
 - **`use_pg_rewind: true`** et `use_slots: true` : l'ancien primaire revient
   par `pg_rewind`, sinon Patroni le réinitialise (`reinit`).
+- **Authentification** : `use_unix_socket: true` pour les connexions locales
+  de Patroni (socket Unix, `local all postgres peer`), donc aucun mot de
+  passe TCP local pour le superutilisateur. Réplication et `pg_rewind` en
+  TCP/TLS `scram-sha-256` : `replicator` avec
+  `PATRONI_REPLICATION_PASSWORD`, `pg_rewind` avec le superutilisateur
+  `postgres` et `PATRONI_SUPERUSER_PASSWORD` (pas de section `rewind`).
 - **Chien de garde** : `watchdog.mode: 'off'`. Il n'est pas activé tant qu'il
   n'a pas été testé sur les VM (étude §4).
 
@@ -64,7 +70,7 @@ pour `verify-full` est une suite.
 | `patroni.service` | unité Patroni (`/opt/patroni/venv`, environnement des secrets) |
 | `patronictl` | enveloppe `patronictl` (configuration + secrets) |
 | `sante-base.py` | collecteur de santé et alertes `db_*` |
-| `ameesh-db-sante.service` / `.timer` | contrôle toutes les minutes, journal et `/run/ameesh-db/alertes.json` |
+| `ameesh-db-sante.service` / `.timer` | contrôle toutes les minutes, journal et `/run/ameesh-db/alertes.json` (répertoire préservé entre les sondes : `RuntimeDirectoryPreserve=yes`) |
 | `requirements.txt` | dépendances du venv Patroni (4.x + psycopg) |
 
 `generer-tls.sh` n'écrit jamais dans le dépôt : il exige `--sortie`. Un
@@ -75,10 +81,11 @@ créés par erreur dans le répertoire.
 
 1. **Réseau privé** EP8.2 : chaque nœud a son adresse `10.78.0.x`, les trois
    se joignent, aucun port base public.
-2. **PostgreSQL 17** EP8.3 : rôles `ameesh`, `replicator` et `rewind` ou
-   `postgres` local, `pg_hba` `hostssl`, `wal_log_hints=on`, `archive_mode=on`
-   et l'archivage EP8.1 (pgBackRest). Le présent lot ne crée ni rôle ni
-   migration.
+2. **PostgreSQL 17** EP8.3 : rôles applicatifs (`ameesh`), `replicator` et
+   superutilisateur `postgres` ; `pg_hba` `hostssl`, `wal_log_hints=on`,
+   `archive_mode=on` et l'archivage EP8.1 (pgBackRest). Au bootstrap, Patroni
+   crée ou met à jour `replicator` et le mot de passe de `postgres` depuis
+   `patroni.env` ; le présent lot ne crée ni rôle applicatif ni migration.
 3. **etcd 3.5.x** : binaire officiel `/usr/local/bin/etcd` et `etcdctl`.
    Version validée pour ce lot : **3.5.17**, empreinte du tar.gz
    `eff6ac621d41711085d0f38fab17d8fa3705f6326c3ff11301a1f5a71fc94edd`.
@@ -389,12 +396,21 @@ puis `reinit` l'autre. Ne pas restaurer à l'aveugle.
   sur l'adresse privée seule. Aucun port public.
 - Patroni REST : TLS signé par la CA de la grappe, authentification
   utilisateur/mot de passe ; `ctl.cacert` vérifie le serveur.
-- PostgreSQL : `pg_hba` réécrit par Patroni avec `hostssl` + `scram-sha-256`
-  sur le réseau privé et l'adresse du PC, `local … peer` pour Postgres, aucun
-  `trust`.
-- Aucun secret dans le dépôt : les mots de passe sont générés par
-  `generer-tls.sh`, recopiés dans `patroni.env` et lus par Patroni via
-  `PATRONI_*`. La clé de la CA ne doit jamais être copiée sur un nœud.
+- PostgreSQL : `pg_hba` réécrit par Patroni. Connexions locales en socket
+  Unix + `peer` (`use_unix_socket: true`, `local all postgres peer`) ;
+  réplication, superutilisateur et clients en `hostssl` + `scram-sha-256`
+  sur le réseau privé, l'adresse du PC et localhost TCP (la sonde de timeline
+  de Patroni passe par `127.0.0.1`). Aucun `trust`.
+- `pg_rewind` : pas de rôle dédié ; Patroni réutilise `postgres` avec
+  `PATRONI_SUPERUSER_PASSWORD`, présenté en `scram-sha-256` au primaire
+  distant. Le mot de passe doit être le même sur les trois nœuds. Sur un
+  cluster déjà initialisé hors Patroni (état EP8.3), EP8.4 doit le poser
+  explicitement (`ALTER ROLE postgres PASSWORD …`) : Patroni ne le fait qu'au
+  bootstrap.
+- Aucun secret dans le dépôt : les mots de passe (REST, réplication,
+  superutilisateur) sont générés par `generer-tls.sh`, recopiés dans
+  `patroni.env` et lus par Patroni via `PATRONI_*`. La clé de la CA ne doit
+  jamais être copiée sur un nœud.
 - Le matériel TLS est daté : CA 10 ans, certificats 825 jours par défaut
   (`--jours`, `--jours-ca`). La rotation est un geste à planifier avec EP8.6.
 - `journalctl -u patroni` peut contenir des noms d'hôtes, pas de mots de
@@ -432,6 +448,16 @@ puis `reinit` l'autre. Ne pas restaurer à l'aveugle.
   `/usr/lib/postgresql/17/bin` (binaires présents), les droits de
   `/etc/postgresql/17/main` pour `postgres`, et que `postgresql@17-main`
   n'est pas déjà actif.
+- **Patroni ne joint pas sa base locale** : `journalctl -u patroni` ; vérifier
+  `use_unix_socket: true` et la ligne `local all postgres peer` du `pg_hba` ;
+  Patroni tourne sous `postgres` et passe par `/var/run/postgresql`.
+- **`pg_rewind` échoue en `scram-sha-256`** : `PATRONI_SUPERUSER_PASSWORD`
+  doit être identique sur les trois nœuds et le primaire doit accepter
+  `hostssl all all 10.78.0.0/24 scram-sha-256` ; `pg_rewind` réutilise
+  `postgres`, il n'y a pas de rôle `rewind` dédié.
+- **`alertes.json` disparaît entre deux sondes** : vérifier
+  `RuntimeDirectoryPreserve=yes` ; sans lui, la fin de la sonde `oneshot`
+  supprime `/run/ameesh-db`.
 - **Pas de synchrone** : `patronictl list` ; l'autre agent doit être
   `streaming` et non `nosync`. Le hub ne doit jamais apparaître en `sync`.
 - **Alerte `db_archive_stale` alors qu'EP8.1 n'est pas actif** : le collecteur

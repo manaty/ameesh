@@ -55,12 +55,20 @@ bootstrap:
 $pg_hba
 
 postgresql:
-  listen: 127.0.0.1:$port_pg,$adresse:$port_pg
+  # listen_addresses est une liste d'hôtes, le port vient une seule fois à la
+  # fin : Patroni 4.x applique split_host_port une fois puis transmet la liste
+  # à PostgreSQL. « 127.0.0.1:5432,10.78.0.11:5432 » laisserait le port dans
+  # le premier hôte et serait refusé par PostgreSQL.
+  listen: 127.0.0.1,$adresse:$port_pg
   connect_address: $adresse:$port_pg
   config_dir: $pg_conf
   data_dir: $pg_data
   bin_dir: $pg_bin
   pgpass: $pgpass
+  # Connexions locales de Patroni (superutilisateur et vérifications) par la
+  # socket Unix : « local all postgres peer » suffit, aucun mot de passe TCP
+  # local. La réplication reste en TCP/TLS vers l'adresse privée du primaire.
+  use_unix_socket: true
   pg_hba:
 $pg_hba
   authentication:
@@ -68,8 +76,9 @@ $pg_hba
       username: replicator
     superuser:
       username: postgres
-    rewind:
-      username: postgres
+    # Pas de section rewind : Patroni réutilise le superutilisateur pour
+    # pg_rewind, avec le mot de passe PATRONI_SUPERUSER_PASSWORD de
+    # patroni.env (scram-sha-256 vers le primaire distant).
   parameters:
     unix_socket_directories: '/var/run/postgresql'
     password_encryption: 'scram-sha-256'

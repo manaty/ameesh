@@ -19,6 +19,10 @@ StateDirectory=ameesh-db
 StateDirectoryMode=0700
 RuntimeDirectory=ameesh-db
 RuntimeDirectoryMode=0750
+# Type=oneshot : sans cette option systemd supprime /run/ameesh-db à la fin
+# de la sonde, et alertes.json ne survit pas jusqu'à la notification EP8.5.
+# Vérifié sur le cycle réel d'une unité utilisateur (systemd 255).
+RuntimeDirectoryPreserve=yes
 ExecStart=/usr/local/sbin/ameesh-db-sante --json --alerte-fichier /run/ameesh-db/alertes.json
 TimeoutStartSec=45
 NoNewPrivileges=true

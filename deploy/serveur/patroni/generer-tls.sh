@@ -8,7 +8,8 @@
 #
 # Produit, hors du dépôt et avec des permissions strictes :
 #   ca.crt, ca.key                     autorité de la grappe (clé CA 0600)
-#   secrets.env                        mots de passe REST et réplication (0600)
+#   secrets.env                        mots de passe REST, réplication et
+#                                      superutilisateur (0600)
 #   <nœud>/etcd-server.{crt,key}       pair etcd : serveur + client (0600 clé)
 #   <nœud>/etcd-client.{crt,key}       client etcd pour Patroni/etcdctl
 #   <nœud>/patroni-rest.{crt,key}      API REST Patroni (serveur)
@@ -91,15 +92,18 @@ mot_de_passe() {
 
 REST=$(mot_de_passe)
 REPL=$(mot_de_passe)
-[[ ${#REST} -eq 32 && ${#REPL} -eq 32 && $REST != "$REPL" ]] \
+SUPER=$(mot_de_passe)
+[[ ${#REST} -eq 32 && ${#REPL} -eq 32 && ${#SUPER} -eq 32 \
+   && $REST != "$REPL" && $REST != "$SUPER" && $REPL != "$SUPER" ]] \
   || die "génération de mot de passe incomplète"
 cat > "$MATERIEL/secrets.env" <<EOF
 PATRONI_RESTAPI_USERNAME=patroni
 PATRONI_RESTAPI_PASSWORD=$REST
 PATRONI_REPLICATION_USERNAME=replicator
 PATRONI_REPLICATION_PASSWORD=$REPL
+PATRONI_SUPERUSER_PASSWORD=$SUPER
 EOF
-unset REST REPL
+unset REST REPL SUPER
 chmod 0600 "$MATERIEL/secrets.env"
 
 openssl ecparam -name prime256v1 -genkey -noout -out "$MATERIEL/ca.key" >/dev/null 2>&1

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 try:
@@ -39,12 +40,14 @@ TOPOLOGIE = DIR / "topologie.json"
 
 REST = "RestPassword0123456789abcdef"
 REPL = "ReplPassword0123456789abcdef"
+SUPER = "SuperPassword0123456789abcdef"
 SECRETS = """\
 PATRONI_RESTAPI_USERNAME=patroni
 PATRONI_RESTAPI_PASSWORD=%s
 PATRONI_REPLICATION_USERNAME=replicator
 PATRONI_REPLICATION_PASSWORD=%s
-""" % (REST, REPL)
+PATRONI_SUPERUSER_PASSWORD=%s
+""" % (REST, REPL, SUPER)
 
 
 def _env(**extra):
@@ -169,11 +172,22 @@ class ConfigurationTest(unittest.TestCase):
             self.assertNotIn("password", patroni["postgresql"]["authentication"]["replication"])
             self.assertEqual(patroni["postgresql"]["authentication"]["replication"]["username"],
                              "replicator")
+            self.assertNotIn("rewind", patroni["postgresql"]["authentication"])
+            self.assertNotIn("password", patroni["postgresql"]["authentication"]["superuser"])
             self.assertEqual(patroni["postgresql"]["connect_address"],
                              "%s:%d" % (noeud["adresse"], ports["postgres"]))
-            self.assertIn("127.0.0.1:%d" % ports["postgres"], patroni["postgresql"]["listen"])
-            self.assertIn("%s:%d" % (noeud["adresse"], ports["postgres"]),
-                          patroni["postgresql"]["listen"])
+            # Patroni 4.x applique split_host_port une seule fois : le port ne
+            # doit apparaître qu'à la fin, sinon PostgreSQL reçoit un hôte
+            # « 127.0.0.1:5432 » invalide.
+            self.assertEqual(patroni["postgresql"]["listen"],
+                             "127.0.0.1,%s:%d" % (noeud["adresse"], ports["postgres"]))
+            hotes_pg, port_pg = patroni["postgresql"]["listen"].rsplit(":", 1)
+            self.assertNotIn(":", hotes_pg)
+            self.assertEqual(int(port_pg), ports["postgres"])
+            # Connexions locales de Patroni par socket Unix (peer) : sans
+            # cela, le superutilisateur devrait avoir un mot de passe TCP local
+            # et le pg_hba localhost suffirait à peine.
+            self.assertTrue(patroni["postgresql"]["use_unix_socket"])
             dcs = patroni["bootstrap"]["dcs"]
             self.assertEqual(dcs["ttl"], 30)
             self.assertEqual(dcs["loop_wait"], 10)
@@ -188,6 +202,13 @@ class ConfigurationTest(unittest.TestCase):
             regles = patroni["postgresql"]["pg_hba"]
             self.assertTrue(any(regle.startswith("hostssl replication replicator 10.78.0.0/24")
                                 for regle in regles))
+            # Patroni lit la timeline par une connexion de réplication locale
+            # en TCP localhost ; sans règle dédiée, get_replica_timeline échoue.
+            self.assertIn("hostssl replication replicator 127.0.0.1/32 scram-sha-256", regles)
+            self.assertIn("hostssl replication replicator ::1/128 scram-sha-256", regles)
+            # pg_rewind se connecte au primaire distant en superutilisateur.
+            self.assertIn("hostssl all all 127.0.0.1/32 scram-sha-256", regles)
+            self.assertIn("local all postgres peer", regles)
             self.assertFalse(any("trust" in regle for regle in regles))
             self.assertEqual(patroni["watchdog"]["mode"], "off")
             if noeud["nofailover"]:
@@ -210,6 +231,22 @@ class ConfigurationTest(unittest.TestCase):
         self.assertEqual(priorites["ameesh-agents-2"], 90)
         self.assertEqual(priorites["manaty-mesh-1"], 0)
 
+    def test_patroni_lit_le_listen_et_le_port(self):
+        """Paramètres effectifs : split_host_port (Patroni 4.1.5) doit rendre
+        deux hôtes et un port, jamais « 127.0.0.1:5432 » comme premier hôte."""
+        try:
+            from patroni.utils import split_host_port
+        except ImportError:
+            self.skipTest("Patroni absent : validation effective impossible")
+        self.assertEqual(self.generer("--tous").returncode, 0)
+        ports = self.topologie["ports"]
+        for noeud in self.topologie["noeuds"]:
+            patroni = _yaml(self.sortie / noeud["nom"] / "patroni.yml")
+            adresses, port = split_host_port(patroni["postgresql"]["listen"],
+                                             ports["postgres"])
+            self.assertEqual(adresses, "127.0.0.1,%s" % noeud["adresse"])
+            self.assertEqual(port, ports["postgres"])
+
     def test_aucun_secret_dans_les_yaml_et_secrets_dans_env(self):
         self.assertEqual(self.generer("--tous").returncode, 0)
         for noeud in self.topologie["noeuds"]:
@@ -217,9 +254,11 @@ class ConfigurationTest(unittest.TestCase):
             env = (self.sortie / noeud["nom"] / "patroni.env").read_text(encoding="utf-8")
             self.assertNotIn(REST, patroni)
             self.assertNotIn(REPL, patroni)
+            self.assertNotIn(SUPER, patroni)
             self.assertNotRegex(patroni, r"(?m)^\s*password\s*:")
             self.assertIn("PATRONI_RESTAPI_PASSWORD=%s" % REST, env)
             self.assertIn("PATRONI_REPLICATION_PASSWORD=%s" % REPL, env)
+            self.assertIn("PATRONI_SUPERUSER_PASSWORD=%s" % SUPER, env)
             self.assertIn("AMEESH_DB_REST_URL=https://%s:%d" % (
                 noeud["adresse"], self.topologie["ports"]["patroni_rest"]), env)
             self.assertIn("AMEESH_DB_ETCD_ENDPOINTS=", env)
@@ -401,10 +440,12 @@ class TlsTest(unittest.TestCase):
                 valeurs[cle] = valeur
         self.assertEqual(valeurs["PATRONI_RESTAPI_USERNAME"], "patroni")
         self.assertEqual(valeurs["PATRONI_REPLICATION_USERNAME"], "replicator")
-        for cle in ("PATRONI_RESTAPI_PASSWORD", "PATRONI_REPLICATION_PASSWORD"):
+        for cle in ("PATRONI_RESTAPI_PASSWORD", "PATRONI_REPLICATION_PASSWORD",
+                    "PATRONI_SUPERUSER_PASSWORD"):
             self.assertRegex(valeurs[cle], r"^[A-Za-z0-9]{32}$")
-        self.assertNotEqual(valeurs["PATRONI_RESTAPI_PASSWORD"],
-                            valeurs["PATRONI_REPLICATION_PASSWORD"])
+        self.assertEqual(len({valeurs["PATRONI_RESTAPI_PASSWORD"],
+                              valeurs["PATRONI_REPLICATION_PASSWORD"],
+                              valeurs["PATRONI_SUPERUSER_PASSWORD"]}), 3)
 
     def test_refus_sans_force_puis_force(self):
         self.assertEqual(self.generer().returncode, 0)
@@ -505,9 +546,49 @@ class UnitsTest(unittest.TestCase):
         self.assertIn("ExecStart=/usr/local/sbin/ameesh-db-sante --json", sante)
         self.assertIn("StateDirectory=ameesh-db", sante)
         self.assertIn("RuntimeDirectory=ameesh-db", sante)
+        self.assertIn("RuntimeDirectoryPreserve=yes", sante)
         timer = self.unites["ameesh-db-sante.timer"]
         self.assertIn("OnUnitActiveSec=1min", timer)
         self.assertIn("Unit=ameesh-db-sante.service", timer)
+
+    @unittest.skipUnless(
+        shutil.which("systemd-run") and os.environ.get("XDG_RUNTIME_DIR")
+        and os.environ.get("DBUS_SESSION_BUS_ADDRESS"),
+        "gestionnaire systemd utilisateur absent")
+    def test_repertoire_alertes_survit_au_cycle_de_l_unite(self):
+        """Cycle réel (systemd 255) : preserve=yes garde alertes.json après la
+        sonde oneshot ; le témoin sans preserve est bien supprimé."""
+        sante = self.unites["ameesh-db-sante.service"]
+        self.assertIn("RuntimeDirectoryPreserve=yes", sante)
+        base = pathlib.Path(os.environ["XDG_RUNTIME_DIR"])
+        nom = "ameesh-6870-cycle-%d-%d" % (os.getpid(), int(time.time()))
+        env = {"XDG_RUNTIME_DIR": str(base),
+               "DBUS_SESSION_BUS_ADDRESS": os.environ["DBUS_SESSION_BUS_ADDRESS"]}
+        commande = ["systemd-run", "--user", "--wait", "--collect",
+                    "--property=Type=oneshot"]
+        temoin = nom + "-sans-preserve"
+        shutil.rmtree(base / nom, ignore_errors=True)
+        shutil.rmtree(base / temoin, ignore_errors=True)
+        try:
+            resultat = _run(commande + [
+                "--unit", nom, "--property=RuntimeDirectory=" + nom,
+                "--property=RuntimeDirectoryPreserve=yes",
+                "/bin/sh", "-c",
+                'printf ok > "$XDG_RUNTIME_DIR/%s/alertes.json"' % nom,
+            ], env=env, timeout=30)
+            self.assertEqual(resultat.returncode, 0, resultat.stderr)
+            self.assertEqual(
+                (base / nom / "alertes.json").read_text(encoding="utf-8"), "ok")
+            resultat = _run(commande + [
+                "--unit", temoin, "--property=RuntimeDirectory=" + temoin,
+                "/bin/sh", "-c",
+                'printf ok > "$XDG_RUNTIME_DIR/%s/alertes.json"' % temoin,
+            ], env=env, timeout=30)
+            self.assertEqual(resultat.returncode, 0, resultat.stderr)
+            self.assertFalse((base / temoin).exists())
+        finally:
+            shutil.rmtree(base / nom, ignore_errors=True)
+            shutil.rmtree(base / temoin, ignore_errors=True)
 
     def test_aucun_secret_dans_les_unites(self):
         for nom, texte in self.unites.items():

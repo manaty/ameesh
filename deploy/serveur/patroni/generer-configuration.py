@@ -44,6 +44,7 @@ SECRETS_REQUIS = (
     "PATRONI_RESTAPI_PASSWORD",
     "PATRONI_REPLICATION_USERNAME",
     "PATRONI_REPLICATION_PASSWORD",
+    "PATRONI_SUPERUSER_PASSWORD",
 )
 CLE_SECRET = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 VALEUR_SECRET = re.compile(r"[A-Za-z0-9._~+-]{1,128}\Z")
@@ -247,7 +248,8 @@ def charger_secrets(chemin) -> dict:
     for cle in ("PATRONI_RESTAPI_USERNAME", "PATRONI_REPLICATION_USERNAME"):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}", secrets[cle]):
             raise Erreur("secrets : %s invalide" % cle)
-    for cle in ("PATRONI_RESTAPI_PASSWORD", "PATRONI_REPLICATION_PASSWORD"):
+    for cle in ("PATRONI_RESTAPI_PASSWORD", "PATRONI_REPLICATION_PASSWORD",
+                "PATRONI_SUPERUSER_PASSWORD"):
         if len(secrets[cle]) < 16:
             raise Erreur("secrets : %s trop court (16 caractères minimum)" % cle)
     return secrets
@@ -271,9 +273,19 @@ def bloc_pg_hba(topologie: dict) -> str:
     lignes = [
         "local all postgres peer",
         "local all all peer",
+        # Réplication : depuis le réseau privé et depuis localhost (Patroni
+        # ouvre une connexion de réplication locale pour lire la timeline).
         "hostssl replication replicator %s scram-sha-256" % topologie["reseau"],
+        "hostssl replication replicator 127.0.0.1/32 scram-sha-256",
+        "hostssl replication replicator ::1/128 scram-sha-256",
+        # Superutilisateur et clients : réseau privé, PC, localhost TCP.
+        # pg_rewind se connecte au primaire distant en postgres + mot de passe
+        # (PATRONI_SUPERUSER_PASSWORD) ; en local, Patroni passe par la socket
+        # Unix (« local all postgres peer », use_unix_socket).
         "hostssl all all %s scram-sha-256" % topologie["reseau"],
         "hostssl all all %s scram-sha-256" % pc,
+        "hostssl all all 127.0.0.1/32 scram-sha-256",
+        "hostssl all all ::1/128 scram-sha-256",
     ]
     return "\n".join("    - " + ligne for ligne in lignes)
 
@@ -362,6 +374,7 @@ def contenu_patroni_env(topologie: dict, noeud: dict, secrets: dict, hotes: str)
         "PATRONI_RESTAPI_PASSWORD=%s" % secrets["PATRONI_RESTAPI_PASSWORD"],
         "PATRONI_REPLICATION_USERNAME=%s" % secrets["PATRONI_REPLICATION_USERNAME"],
         "PATRONI_REPLICATION_PASSWORD=%s" % secrets["PATRONI_REPLICATION_PASSWORD"],
+        "PATRONI_SUPERUSER_PASSWORD=%s" % secrets["PATRONI_SUPERUSER_PASSWORD"],
         "",
         "AMEESH_DB_REST_URL=https://%s:%d" % (noeud["adresse"], ports["patroni_rest"]),
         "AMEESH_DB_ETCD_ENDPOINTS=%s" % hotes,
@@ -409,6 +422,7 @@ def verifier_structure(topologie: dict, secrets: dict, fichiers: dict,
         for marqueur in ("synchronous_mode: true", "synchronous_node_count: 1",
                          "synchronous_mode_strict: false", "failsafe_mode: false",
                          "use_pg_rewind: true", "use_slots: true",
+                         "use_unix_socket: true",
                          "maximum_lag_on_failover: 1048576", "ttl: 30",
                          "loop_wait: 10", "retry_timeout: 10"):
             if marqueur not in patroni:
@@ -417,12 +431,19 @@ def verifier_structure(topologie: dict, secrets: dict, fichiers: dict,
             raise Erreur("%s/patroni.yml : name incorrect" % nom)
         if "listen: %s:%d\n" % (noeud["adresse"], ports["patroni_rest"]) not in patroni:
             raise Erreur("%s/patroni.yml : REST hors adresse privée" % nom)
+        # Le port PostgreSQL ne doit apparaître qu'une fois, à la fin de la
+        # liste : Patroni 4.x passe listen_addresses tel quel à PostgreSQL.
+        if "listen: 127.0.0.1,%s:%d\n" % (noeud["adresse"], ports["postgres"]) not in patroni:
+            raise Erreur("%s/patroni.yml : listen PostgreSQL mal formé" % nom)
         if "connect_address: %s:%d\n" % (noeud["adresse"], ports["postgres"]) not in patroni:
             raise Erreur("%s/patroni.yml : connexion PostgreSQL hors adresse privée" % nom)
         if "0.0.0.0" in patroni or re.search(r"^\s*password\s*:", patroni, re.M):
             raise Erreur("%s/patroni.yml : secret ou écoute publique" % nom)
+        if re.search(r"^\s+rewind:\s*$", patroni, re.M):
+            raise Erreur("%s/patroni.yml : section rewind inutile (superuser)" % nom)
         for secret in (secrets["PATRONI_RESTAPI_PASSWORD"],
-                       secrets["PATRONI_REPLICATION_PASSWORD"]):
+                       secrets["PATRONI_REPLICATION_PASSWORD"],
+                       secrets["PATRONI_SUPERUSER_PASSWORD"]):
             if secret in patroni:
                 raise Erreur("%s/patroni.yml : mot de passe présent dans le YAML" % nom)
         if noeud["nofailover"]:
@@ -449,6 +470,7 @@ def verifier_structure(topologie: dict, secrets: dict, fichiers: dict,
         if not env.startswith("# Généré"):
             raise Erreur("%s/patroni.env : en-tête absent" % nom)
         for cle in ("PATRONI_RESTAPI_PASSWORD=", "PATRONI_REPLICATION_PASSWORD=",
+                    "PATRONI_SUPERUSER_PASSWORD=",
                     "AMEESH_DB_REST_URL=https://%s:%d" % (noeud["adresse"], ports["patroni_rest"])):
             if cle not in env:
                 raise Erreur("%s/patroni.env : %s manquant" % (nom, cle))
