@@ -43,6 +43,8 @@ declare
     l       record;
     lot     record;
     bound   boolean;
+    claim   jsonb;
+    binding bigint;
 begin
     if marker is null or not exists (
             select from pg_auth_members
@@ -72,10 +74,23 @@ begin
                 using errcode = 'insufficient_privilege';
         end if;
     elsif tg_table_name = 'agent_mailbox' then
-        if new.sender is distinct from l.agent
+        if tg_op = 'UPDATE' and old.recipient = l.agent and old.sender is distinct from l.agent then
+            -- courrier reçu (hook `agent-mail`) : réserver (`meta.consigne`)
+            -- puis remettre, jamais rendre non lu un message remis ni toucher
+            -- au reste de `meta`
+            if (new.meta - 'consigne' - 'deja_consigne') is distinct from (old.meta - 'consigne' - 'deja_consigne')
+               or (old.delivered_at is not null
+                    and new.delivered_at is distinct from old.delivered_at)
+               or (new.status is distinct from old.status
+                    and (new.status is distinct from 'delivered' or new.delivered_at is null)) then
+                raise exception 'limited login %: mail to % is reserved or delivered only', session_user, l.agent
+                    using errcode = 'insufficient_privilege';
+            end if;
+        elsif new.sender is distinct from l.agent
            or (new.host is not null and new.host is distinct from l.host)
            or (tg_op = 'UPDATE' and (old.sender is distinct from l.agent
-                                     or new.delivered_at is distinct from old.delivered_at)) then
+                                     or new.delivered_at is distinct from old.delivered_at
+                                     or new.status is distinct from old.status)) then
             raise exception 'limited login %: mail from % only', session_user, l.agent
                 using errcode = 'insufficient_privilege';
         end if;
@@ -100,6 +115,29 @@ begin
                or not bound then
                 raise exception 'limited login %: claim of lot % refused (bound session of % on % only)',
                     session_user, old.id, l.agent, l.host using errcode = 'insufficient_privilege';
+            end if;
+            -- #6877 (0566), lu par to_jsonb tant que la colonne peut manquer :
+            -- le harnais et la ligne de liaison nommés vont ensemble et
+            -- désignent la liaison active de cette session, de cet agent, sur
+            -- cet hôte
+            claim := to_jsonb(new);
+            if claim ? 'external_claim_binding' then
+                binding := nullif(claim->>'external_claim_binding', '')::bigint;
+                if (binding is null) is distinct from (nullif(claim->>'external_claim_harness', '') is null) then
+                    raise exception 'limited login %: claim of lot % names harness and binding together',
+                        session_user, old.id using errcode = 'insufficient_privilege';
+                end if;
+                if binding is not null then
+                    execute format('select exists (select from %I.session_bindings'
+                                   ' where id = $1 and session_id = $2 and harness = $3'
+                                   ' and agent = $4 and host = $5 and revoked_at is null)', s)
+                       into bound using binding, new.external_claim_proof,
+                                        claim->>'external_claim_harness', l.agent, l.host;
+                    if not bound then
+                        raise exception 'limited login %: claim of lot % names binding % that is not its active one',
+                            session_user, old.id, binding using errcode = 'insufficient_privilege';
+                    end if;
+                end if;
             end if;
         elsif old.external_claim_session is not null
               and old.external_claim_host is distinct from l.host then

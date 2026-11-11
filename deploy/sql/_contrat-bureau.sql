@@ -118,7 +118,7 @@ BEGIN
         END;
         allowed := EXISTS (SELECT FROM pg_temp.bureau_spec x
                            WHERE x.rel = item.relname AND x.priv = item.priv
-                             AND (x.cols IS NULL OR item.attname = ANY (x.cols)));
+                             AND (x.cols IS NULL OR item.attname = ANY (x.cols || coalesce(x.opt_cols, '{}'))));
         IF actual IS DISTINCT FROM allowed AND actual IS NOT NULL THEN
             errors := errors || format('%s %s on %s.%s', CASE WHEN actual THEN 'unexpected' ELSE 'missing' END,
                                        item.priv, item.relname, item.attname);

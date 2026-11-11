@@ -2,14 +2,15 @@
 -- #6881 : la liste EXACTE des droits d'une connexion limitée du bureau, lue
 -- par role-bureau.sql (pose) et _contrat-bureau.sql (audit). Une ligne par
 -- relation et privilège ; `cols` NULL = toute la table (SELECT seulement),
--- sinon les seules colonnes nommées.
+-- sinon les seules colonnes nommées ; `opt_cols` : colonnes accordées en plus
+-- si elles existent (ajoutées par un lot pas encore dans la base visée).
 -- Ce que chaque droit sert (chemins tracés, #6881) :
 --   lecture des lots exécutés (`work show`), liaison L41 (`mail bind`), prise
 --   #6839 (`work claim`), reçus de provenance (hooks), `agent-mail send|inbox`.
 -- Aucune table de secrets, de clés privées, d'approbation ou de comptes.
-CREATE TEMP TABLE IF NOT EXISTS bureau_spec(rel text, priv text, cols text[]);
+CREATE TEMP TABLE IF NOT EXISTS bureau_spec(rel text, priv text, cols text[], opt_cols text[]);
 DELETE FROM pg_temp.bureau_spec;
-INSERT INTO pg_temp.bureau_spec VALUES
+INSERT INTO pg_temp.bureau_spec(rel, priv, cols) VALUES
   -- admission d'écriture et sonde de schéma (db.connect)
   ('schema_migrations','SELECT',NULL),
   ('schema_non_additive_migrations','SELECT',NULL),
@@ -30,7 +31,9 @@ INSERT INTO pg_temp.bureau_spec VALUES
   -- courrier
   ('agent_mailbox','SELECT',NULL),
   ('agent_mailbox','INSERT',ARRAY['sender','recipient','body','host','kind','payload','work_item_id','signature','signature_key','signed_payload','nonce','created_at','signature_expires_at']),
-  ('agent_mailbox','UPDATE',ARRAY['meta']),
+  -- `meta` : clé d'idempotence d'un envoi ; réservation (`meta.consigne`) et
+  -- remise (`delivered_at`, `status`) du courrier reçu par le hook
+  ('agent_mailbox','UPDATE',ARRAY['meta','delivered_at','status']),
   ('thread_index','SELECT',NULL),
   ('thread_index','INSERT',ARRAY['project','lot','transport','host','location','last_entry_id','last_mailbox_id','last_author','last_excerpt','last_at','entries']),
   ('thread_index','UPDATE',ARRAY['location','entries','last_entry_id','last_mailbox_id','last_author','last_excerpt','last_at','counted_until','updated_at']),
@@ -74,3 +77,8 @@ INSERT INTO pg_temp.bureau_spec VALUES
   ('work_item_events_id_seq','USAGE',NULL),
   ('ameesh_events_id_seq','USAGE',NULL),
   ('agent_name_resolutions_id_seq','USAGE',NULL);
+-- #6877 (0566) : le harnais et la ligne de liaison L41 de la prise, écrits
+-- par claim/release dès que la migration est passée ; la garde 0567 les
+-- contrôle
+INSERT INTO pg_temp.bureau_spec VALUES
+  ('work_items','UPDATE',ARRAY[]::text[],ARRAY['external_claim_harness','external_claim_binding']);

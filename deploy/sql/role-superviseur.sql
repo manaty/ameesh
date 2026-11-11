@@ -626,6 +626,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L63 (0048) : heure de démarrage du PID lié, secondes epoch
         'pid_started_at'
     ]),
+    -- #6881 (0567) : connexions limitées à un agent et un hôte (des noms de
+    -- rôle, d'agent et d'hôte, de l'ÉTAT) — le superviseur lit qui est limité
+    ('limited_logins', ARRAY['rolname', 'agent', 'host', 'created_at']),
     -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
     -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
     -- est un CONTENU). `run_attempt` (#901, 0429) : quel essai de l'exécution

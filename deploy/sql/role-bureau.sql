@@ -59,6 +59,7 @@ DECLARE
     m text := 'ameesh_login_limite';
     s text := current_schema();
     item record;
+    cols text[];
 BEGIN
     IF current_setting('server_version_num')::int < 160000 THEN
         RAISE EXCEPTION 'PostgreSQL 16+ required (membership without SET ROLE)';
@@ -110,9 +111,16 @@ BEGIN
         ELSIF item.cols IS NULL THEN
             EXECUTE format('GRANT %s ON %I.%I TO %I', item.priv, s, item.rel, r);
         ELSE
-            EXECUTE format('GRANT %s (%s) ON %I.%I TO %I', item.priv,
-                (SELECT string_agg(quote_ident(c), ',') FROM unnest(item.cols) c),
-                s, item.rel, r);
+            cols := item.cols || ARRAY(
+                SELECT c FROM unnest(item.opt_cols) c
+                 WHERE EXISTS (SELECT FROM pg_attribute a3
+                                WHERE a3.attrelid = to_regclass(format('%I.%I', s, item.rel))
+                                  AND a3.attname = c AND a3.attnum > 0 AND NOT a3.attisdropped));
+            IF cardinality(cols) > 0 THEN
+                EXECUTE format('GRANT %s (%s) ON %I.%I TO %I', item.priv,
+                    (SELECT string_agg(quote_ident(c), ',') FROM unnest(cols) c),
+                    s, item.rel, r);
+            END IF;
         END IF;
     END LOOP;
 END

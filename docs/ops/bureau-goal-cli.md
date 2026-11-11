@@ -15,9 +15,9 @@ jamais avec le rôle `ameesh` ni un DSN d'agent.
 |---|---|---|
 | lire les lots qu'il exécute | `ameesh work show <lot>` | SELECT des tables de lots, du registre, du courrier ; `actions` limité aux colonnes du résumé (ni `args`, ni empreinte, ni nonce, ni reçu) |
 | se lier, PID vérifié localement | `ameesh mail bind|unbind` | INSERT/UPDATE de colonnes de `session_bindings` |
-| prendre / lever un geste externe | `ameesh work claim <lot> --session <id> [--release]` | UPDATE des seules colonnes `external_claim_*` de `work_items` |
+| prendre / lever un geste externe | `ameesh work claim <lot> --session <id> [--release]` | UPDATE des seules colonnes `external_claim_*` de `work_items` (dont `external_claim_harness` et `external_claim_binding` dès la migration 0566 de #6877) |
 | reçus de provenance | hooks `provenance intent|created|record` | INSERT de `provenance_receipts` |
-| courrier | `agent-mail send`, `agent-mail inbox` | INSERT de `agent_mailbox`, UPDATE de `meta` |
+| courrier | `agent-mail send`, `agent-mail inbox` | INSERT de `agent_mailbox` ; UPDATE de `meta`, `delivered_at`, `status` (réservation et remise du courrier reçu) |
 
 La liste exacte est `deploy/sql/_bureau-droits.sql` ; `_contrat-bureau.sql`
 compare les droits **effectifs** (PUBLIC et appartenances compris) à cette
@@ -31,10 +31,13 @@ leur agent et leur hôte. Pour ces connexions, la base refuse :
 - tout courrier, liaison, reçu ou note qui n'est pas à leur nom, ou qui vient
   d'un autre hôte ;
 - la prise d'un lot qui n'est pas réservé à leur agent (`external_executor`) ;
-- une prise sans liaison L41 active de cet agent sur cet hôte ;
+- une prise sans liaison L41 active de cet agent sur cet hôte, ou qui nomme
+  (#6877) un harnais ou une ligne de liaison qui n'est pas celle-là ;
 - l'écrasement de la prise d'une autre session ;
 - toute écriture du registre (le droit UPDATE n'y sert qu'au verrou de ligne
-  que prend le dépôt de courrier) ;
+  que prennent le dépôt et la remise du courrier) ;
+- sur le courrier reçu, tout changement autre que la réservation
+  (`meta.consigne`) et la remise ; un message remis ne redevient pas non lu ;
 - tout événement écrit hors trigger ;
 - toute suppression ;
 - la réouverture d'une liaison révoquée.
@@ -47,9 +50,15 @@ Limites, dites franchement :
 
 - la lecture du courrier n'est pas bornée au destinataire, parce que le CLI
   lit le dernier message de chaque agent ;
+- un renommage de l'agent `bureau` ne déplace pas `limited_logins.agent` :
+  la garde refuse jusqu'à la réinstallation du rôle sous le nouveau nom ;
 - deux sessions du même agent sur bureau-goal partagent la connexion : la
   base les distingue par leur liaison L41, et le CLI vérifie le PID
   localement ;
+- le hook `agent-mail hook` n'est pas installé sur bureau-goal : son
+  inscription écrit le registre, fermé à cette connexion. Sous la connexion
+  limitée, il ne fait pas échouer la session et laisse le courrier non lu ;
+  le bureau lit par `agent-mail inbox` ;
 - la base ne peut pas empêcher une session de lever la prise d'une autre
   session du même agent sur le même hôte. Le CLI la refuse (« verified
   session is … »).

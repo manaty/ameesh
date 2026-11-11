@@ -87,6 +87,10 @@ CASCADED = (
 # Evidence, authority and unrelated names: never rewritten. Executor
 # allowlists (jsonb) are granted authority, read through the alias.
 KEPT = (
+    # #6881 (0567): the agent a limited login may act for, granted by the
+    # administrator (role-bureau.sql) — a rename does not move it; the guard
+    # refuses until the role is reinstalled under the new name (fails closed).
+    "limited_logins.agent",
     "action_attempts.approver", "action_attempts.launched_by", "action_attempts.settled_by",
     "action_events.actor", "actions.auth_by", "actions.proposed_by", "actions.replaced_by",
     "agent_name_resolutions.primary_name", "agent_name_resolutions.supplied_name",

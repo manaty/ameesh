@@ -14,6 +14,7 @@ et l'audit qui refuse un droit en trop.
 """
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import subprocess
@@ -195,6 +196,68 @@ class BureauRoleLimiteTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("reçu", proc.stdout)
 
+    def test_prise_identite_complete_check_puis_levee(self):
+        """#6877 (0566) sur l'arbre intégré : la prise écrit le harnais et la
+        ligne de liaison sous la connexion limitée, `--check` la voit, la
+        levée l'efface ; la base refuse une ligne de liaison qui n'est pas la
+        liaison active de la session. Sur un arbre sans 0566, la prise
+        ancienne seule est témoignée."""
+        lot = self.reserve()
+        self.bind("BG")
+        proc = self.as_bureau("work", "claim", str(lot), "--session", "BG")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = work.get(self.db, lot)
+        self.assertEqual(item["external_claim_session"], "BG")
+        integrated = "external_claim_binding" in item
+        if integrated:
+            own = self.db.query("SELECT id FROM session_bindings WHERE session_id = 'BG'"
+                                " AND revoked_at IS NULL")[0]["id"]
+            self.assertEqual(item["external_claim_harness"], "claude")
+            self.assertEqual(int(item["external_claim_binding"]), int(own))
+            proc = self.as_bureau("work", "claim", str(lot), "--check")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("held by BG", proc.stdout)
+            self.bind("PC")
+            other = self.db.query("SELECT id FROM session_bindings WHERE session_id = 'PC'")[0]["id"]
+            self.refused("UPDATE work_items SET external_claim_binding = %d"
+                         " WHERE id = %d" % (other, lot), "not its active one")
+            self.refused("UPDATE work_items SET external_claim_harness = NULL"
+                         " WHERE id = %d" % lot, "harness and binding together")
+            proc = self.as_bureau("mail", "unbind", "--session", "PC", "--harness", "claude")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.as_bureau("work", "claim", str(lot), "--session", "BG", "--release")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = work.get(self.db, lot)
+        self.assertIsNone(item["external_claim_session"])
+        if integrated:
+            self.assertIsNone(item["external_claim_binding"])
+            self.assertIsNone(item["external_claim_harness"])
+
+    def test_le_hook_agent_mail_ne_touche_a_rien(self):
+        """Hors périmètre (#6881) : l'inscription du hook écrit le registre,
+        fermé à la connexion limitée. Le hook ne fait pas échouer la session
+        et laisse le courrier non lu ; le bureau lit par `mail inbox`."""
+        self.bind("BG")
+        self.db.execute("INSERT INTO agent_mailbox (sender, recipient, body)"
+                        " VALUES ('orchestrateur', 'bureau', 'geste à prendre')")
+        before = self.db.query("SELECT cwd, session_id, last_seen FROM agent_registry"
+                               " WHERE name = 'bureau'")
+        proc = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.argv = ['agent-mail', 'hook', 'claude'];"
+             " import ameesh.entry as e; sys.exit(e.main())"],
+            input=json.dumps({"hook_event_name": "Stop", "cwd": self.tmp,
+                              "session_id": "BG"}),
+            capture_output=True, text=True, timeout=60, cwd=self.tmp,
+            env=self.limited_env(AGENT_MAIL_NAME="bureau"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.db.query("SELECT cwd, session_id, last_seen FROM agent_registry"
+                                       " WHERE name = 'bureau'"), before)
+        row = self.db.query("SELECT status, delivered_at FROM agent_mailbox"
+                            " WHERE recipient = 'bureau'")[0]
+        self.assertIsNone(row["delivered_at"])
+        self.refused("UPDATE agent_registry SET last_seen = now() WHERE name = 'bureau'",
+                     "permission denied")
+
     def test_commit_par_les_hooks_installes_avec_recu(self):
         from ameesh import review_provenance as prov
         self.bind("BG")
@@ -302,10 +365,20 @@ class BureauRoleLimiteTest(PgTestCase):
                      "binds bureau")
         self.refused("INSERT INTO session_bindings (session_id, harness, host, agent)"
                      " VALUES ('S', 'claude', 'ailleurs', 'bureau')", "binds bureau")
-        self.db.execute("INSERT INTO agent_mailbox (sender, recipient, body)"
-                        " VALUES ('orchestrateur', 'bureau', 'vrai')")
-        self.refused("UPDATE agent_mailbox SET meta = '{}' WHERE sender = 'orchestrateur'",
-                     "mail from bureau only")
+        # courrier reçu : seules la réservation et la remise changent (hook)
+        self.db.execute("INSERT INTO agent_mailbox (sender, recipient, body, meta)"
+                        " VALUES ('orchestrateur', 'bureau', 'vrai', '{\"k\": 1}'),"
+                        " ('orchestrateur', 'mesh-design', 'autre', '{}')")
+        self.refused("UPDATE agent_mailbox SET meta = '{}' WHERE recipient = 'bureau'",
+                     "reserved or delivered only")
+        self.refused("UPDATE agent_mailbox SET status = 'failed' WHERE recipient = 'bureau'",
+                     "reserved or delivered only")
+        self.refused("UPDATE agent_mailbox SET delivered_at = now(), status = 'delivered'"
+                     " WHERE recipient = 'mesh-design'", "mail from bureau only")
+        self.assertEqual(self.sql("UPDATE agent_mailbox SET delivered_at = now(),"
+                                  " status = 'delivered' WHERE recipient = 'bureau'").returncode, 0)
+        self.refused("UPDATE agent_mailbox SET delivered_at = NULL WHERE recipient = 'bureau'",
+                     "reserved or delivered only")
 
     def test_les_autres_connexions_ne_voient_pas_la_garde(self):
         """Le banc (superutilisateur, hors marqueur) écrit comme avant."""
