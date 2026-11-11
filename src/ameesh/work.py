@@ -3804,6 +3804,11 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
     d'un lot léger ne s'ouvrait jamais. Le même dépôt rejoue une relecture
     manquante sur un lot déjà fusionné (dans les bornes du rattrapage).
 
+    #6826 : sur un lot déjà livré, le clone explicite fait autorité pour
+    l'intervalle de relecture, même si son origin diffère du dépôt du ticket.
+    La classe doit toujours prouver un delta Git ; une première livraison
+    reste soumise à la preuve du dépôt du lot ou de la PR déclarée.
+
     #3413 : ce rejeu est **explicite** — le clone fourni relance la
     classification sans attendre le délai ni le plafond de tentatives du
     balayage, sinon l'avertissement « aucun dépôt lisible » conseillerait un
@@ -3844,9 +3849,12 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
             text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
             proof_repo = _merge_proof_repo(item, repo, cfg)
     else:
-        # #3201 : un lot déjà fusionné peut rejouer sa relecture manquante ; le
-        # dépôt donné (ou celui de la PR) reste l'indice de classe.
-        proof_repo = _merge_proof_repo(item, repo, cfg, pr_ref=pr_text or None)
+        # #6826 : le ticket peut vivre dans un autre dépôt que le code.
+        # La fusion est déjà acquise : --repo est autoritaire pour relire
+        # son intervalle, pas une nouvelle preuve de livraison. Ne pas le
+        # filtrer sur le slug du ticket, ni se replier s'il est illisible.
+        proof_repo = ((repo or "").strip()
+                      or _merge_proof_repo(item, None, cfg, pr_ref=pr_text or None))
     landed = None
     if migration_landed is not None:
         number = _landed_number(migration_landed)
