@@ -328,7 +328,16 @@ def valeurs_communes(topologie: dict, noeud: dict) -> dict:
     # Le client etcd du nœud parle d'abord à son membre local, puis aux autres :
     # une panne du réseau privé ne doit pas ajouter un aller-retour inutile.
     ordre = [noeud] + [n for n in topologie["noeuds"] if n["nom"] != noeud["nom"]]
+    # Patroni 4.x attend « hôte:port » dans etcd3.hosts : le schéma est porté
+    # une seule fois par etcd3.protocol. Un « https://hôte:port » y est pris
+    # pour une adresse IPv6 et Patroni refuse de démarrer (Invalid IPv6 URL,
+    # constat du banc #6902). etcdctl, lui, attend des URL complètes : les deux
+    # formes sont donc produites séparément.
     hotes = ",".join(
+        "%s:%d" % (n["adresse"], ports["etcd_client"])
+        for n in ordre
+    )
+    endpoints = ",".join(
         "https://%s:%d" % (n["adresse"], ports["etcd_client"])
         for n in ordre
     )
@@ -349,6 +358,7 @@ def valeurs_communes(topologie: dict, noeud: dict) -> dict:
         "initial_cluster": initial,
         "jeton": topologie["grappe"] + "-etcd",
         "hotes_etcd": hotes,
+        "endpoints_etcd": endpoints,
         "tls_ca": chemins["ca"],
         "tls_serveur_cert": sous(chemins["etcd_tls"], "etcd-server.crt"),
         "tls_serveur_key": sous(chemins["etcd_tls"], "etcd-server.key"),
@@ -365,7 +375,7 @@ def valeurs_communes(topologie: dict, noeud: dict) -> dict:
     }
 
 
-def contenu_patroni_env(topologie: dict, noeud: dict, secrets: dict, hotes: str) -> str:
+def contenu_patroni_env(topologie: dict, noeud: dict, secrets: dict, endpoints: str) -> str:
     chemins, ports, sante = topologie["chemins"], topologie["ports"], topologie["sante"]
     valeurs = [
         "# Généré par generer-configuration.py pour %s ; ne pas éditer." % noeud["nom"],
@@ -377,7 +387,7 @@ def contenu_patroni_env(topologie: dict, noeud: dict, secrets: dict, hotes: str)
         "PATRONI_SUPERUSER_PASSWORD=%s" % secrets["PATRONI_SUPERUSER_PASSWORD"],
         "",
         "AMEESH_DB_REST_URL=https://%s:%d" % (noeud["adresse"], ports["patroni_rest"]),
-        "AMEESH_DB_ETCD_ENDPOINTS=%s" % hotes,
+        "AMEESH_DB_ETCD_ENDPOINTS=%s" % endpoints,
         "AMEESH_DB_CA=%s" % chemins["ca"],
         "AMEESH_DB_ETCD_CERT=%s" % sous(chemins["patroni_tls"], "etcd-client.crt"),
         "AMEESH_DB_ETCD_KEY=%s" % sous(chemins["patroni_tls"], "etcd-client.key"),
@@ -395,7 +405,7 @@ def generer_noeud(topologie: dict, noeud: dict, secrets: dict, sortie: Path) -> 
     valeurs = valeurs_communes(topologie, noeud)
     patroni = rendre(MODELE_PATRONI, valeurs)
     etcd = rendre(MODELE_ETCD, valeurs)
-    env = contenu_patroni_env(topologie, noeud, secrets, valeurs["hotes_etcd"])
+    env = contenu_patroni_env(topologie, noeud, secrets, valeurs["endpoints_etcd"])
     fichiers = {
         "patroni": sortie / "patroni.yml",
         "etcd": sortie / "etcd.yml",
@@ -451,6 +461,17 @@ def verifier_structure(topologie: dict, secrets: dict, fichiers: dict,
                 raise Erreur("%s/patroni.yml : tags nofailover/nosync manquants" % nom)
         elif "  failover_priority: %d\n" % noeud["priorite"] not in patroni:
             raise Erreur("%s/patroni.yml : failover_priority manquante" % nom)
+
+        # Patroni 4.x attend « hôte:port » dans etcd3.hosts : le schéma est
+        # porté une seule fois par etcd3.protocol. Un « https:// » dans hosts
+        # est pris pour une adresse IPv6 et fait refuser le démarrage
+        # (Invalid IPv6 URL, constat du banc #6902).
+        ordre = [noeud] + [n for n in topologie["noeuds"] if n["nom"] != noeud["nom"]]
+        hotes = ",".join("%s:%d" % (n["adresse"], ports["etcd_client"]) for n in ordre)
+        if "  hosts: %s\n" % hotes not in patroni:
+            raise Erreur("%s/patroni.yml : etcd3.hosts doit être une liste hôte:port" % nom)
+        if "  protocol: https\n" not in patroni:
+            raise Erreur("%s/patroni.yml : etcd3.protocol https manquant" % nom)
 
         if "name: %s\n" % nom not in etcd:
             raise Erreur("%s/etcd.yml : name incorrect" % nom)
