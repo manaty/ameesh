@@ -49,6 +49,27 @@ class DeclarationTest(unittest.TestCase):
                 self.assertEqual(declared["due"], "2026-10-28 17:35 UTC")
                 self.assertIn("témoin", declared["motif"])
 
+    def test_formes_anglaises_6888(self):
+        # #6888 : mesh-design écrit en anglais (CLI L156c) ; « window » et
+        # « observation window » déclarent la même fenêtre.
+        for text, motif in (
+                ("hold: window: waiting for manaty-mesh-1 on 1.48.0 "
+                 "[réveil programmé: 2026-11-11 13:05 UTC]",
+                 "waiting for manaty-mesh-1 on 1.48.0"),
+                ("hold: observation window : relire le témoin "
+                 "(due 2026-10-28 17:35 UTC)", "relire le témoin"),
+                ("hold: Window — 7-day observation [réveil programmé: "
+                 "2026-11-16 23:00 UTC]", "7-day observation")):
+            declared = planned_waits.observation_hold(text)
+            self.assertIsNotNone(declared, text)
+            self.assertEqual(declared["motif"], motif)
+        # mêmes exigences : sans échéance, rien n'est déclaré ; un mot qui
+        # commence par « window » n'est pas la déclaration
+        self.assertIsNone(planned_waits.observation_hold(
+            "hold: window: waiting for the bureau"))
+        self.assertIsNone(planned_waits.observation_hold(
+            "hold: windows host down (due 2026-10-28 17:35 UTC)"))
+
     def test_sans_echeance_ou_sans_motif_rien_n_est_declare(self):
         for text in ("hold: fenêtre opérateur",
                      "hold: fenêtre : relire le témoin",

@@ -172,6 +172,15 @@ TTL expire. Un second composeur — le tic horaire ou l'agent désigné par
 l'alerte de créneau, sur le même porteur — est refusé (code 3) au lieu de
 réécrire la tête de l'autre ; un bail expiré ou repris est refusé de même.
 
+#6891 : la référence #3782 est relue **avant** les tests locaux
+(`ensure_reference`), juste avant les contrats. Quand la cible avance pendant
+la composition — le commit d'atterrissage d'une coupure, par exemple — la
+composition ne part pas sur une base périmée et ne perd pas les ~12 min de
+contrats : elle sort en 6, le clone est déjà à jour (`fetch`), et
+`paquet-horaire.py` relance aussitôt la composition sur la nouvelle tête. La
+relecture du gel juste avant la poussée reste en place (#6566) : la cible peut
+encore bouger pendant les tests.
+
 Modes :
 
 * normal : composition réelle, poussée, PR, gel, ci-full, tests et courrier ;
@@ -190,13 +199,17 @@ Modes :
 Codes de retour : 0 composition réussie (ou aucun lot prêt), 1 échec
 opérationnel (git, test, contrôle, poussée, PR, gel, courrier), 2 entrée
 invalide, 3 une composition du même paquet est en cours (verrou vivant), ou
-une tête testée n'est pas publiable (`--publish`, #4237).
+une tête testée n'est pas publiable (`--publish`, #4237), 4 tentative arrêtée
+par une pause (#5084), 5 composition rouge par son contenu (#6272), 6 la
+cible a avancé avant les tests locaux (#6891 : rien n'est poussé, le clone est
+à jour, `paquet-horaire.py` recompose aussitôt sur la nouvelle tête).
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import fcntl
+import importlib.util
 import json
 import os
 import re
@@ -243,6 +256,11 @@ PAUSED_RC = 4
 #: travail et le pilote est déjà prévenu. Ce n'est pas une panne du composeur,
 #: qui reste rc 1 et ouvre seule un lot d'empreinte §16.
 COMPOSITION_RED_RC = 5
+#: #6891 : la cible a avancé entre la composition et ses tests locaux. Rien
+#: n'est poussé ; le clone est déjà à jour (le `fetch` de `fresh_base`) et
+#: `paquet-horaire.py` relance aussitôt la composition sur la nouvelle tête,
+#: sans attendre le tic suivant.
+TARGET_MOVED_RC = 6
 #: #6563 : bail de composition d'un porteur, tenu par un enfant `ameesh work
 #: packet hold` pendant toute la composition réelle. Renouvelé par l'enfant
 #: (TTL/3) ; un processus mort le laisse expirer en cinq minutes.
@@ -518,6 +536,22 @@ class CompositionBusy(PaquetAutoError):
         self.host = host
         self.pid = pid
         super().__init__("composition en cours (%s)" % holder_label(host, pid))
+
+
+class TargetMoved(PaquetAutoError):
+    """#6891 : la cible a avancé entre la composition et ses tests locaux.
+
+    Le code de la composition (base `base`) n'est plus la référence de #3782
+    (tête `head`) : les contrats et les tests par unité ne partent pas sur une
+    base périmée. `main` sort en `TARGET_MOVED_RC` ; `paquet-horaire.py`
+    journalise le refus avant tests et relance aussitôt la composition sur la
+    nouvelle tête, sans attendre le tic suivant.
+    """
+
+    def __init__(self, message: str, *, base: str = "", head: str = "") -> None:
+        self.base = base
+        self.head = head
+        super().__init__(message)
 
 
 class CompositionClaim:
@@ -1803,6 +1837,68 @@ def compute_candidates(worktree: Path, target: str, base_sha: str,
             lot=lot, source=source, branch=str(entry.get("branch") or ""),
             title=str(entry.get("title") or ""), remise_ref=remise_ref))
     return candidates, payload
+
+
+#: #6891 : `scripts/paquet-candidats.py` chargé en module, pour appliquer ses
+#: gardes #3782 (`code_reference`, `code_provenance`, `code_refusal`) sans en
+#: recopier la lecture. Le module vient du même arbre que ce script : c'est le
+#: code exécuté par le composeur.
+_CANDIDATES_GUARD = None
+
+
+def candidates_guard():
+    """Les gardes #3782 de `paquet-candidats.py`, chargées une fois."""
+    global _CANDIDATES_GUARD
+    if _CANDIDATES_GUARD is None:
+        path = Path(__file__).resolve().parent / Path(CANDIDATES_SCRIPT).name
+        spec = importlib.util.spec_from_file_location(
+            "paquet_candidats_guard", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("paquet_candidats_guard", module)
+        spec.loader.exec_module(module)
+        _CANDIDATES_GUARD = module
+    return _CANDIDATES_GUARD
+
+
+def ensure_reference(repo: Path, target: str, base_sha: str) -> None:
+    """#6891 : la base de composition est-elle encore la référence du code ?
+
+    `freeze_changes` applique déjà la garde #3782 juste avant la poussée, mais
+    après les contrats — 12 min au constat h-11, quand le commit d'atterrissage
+    de la coupure arrive pendant la composition. Ici la tête de la cible est
+    relue (`fetch` du clone du composeur, donc le clone est à jour) et le code
+    de `base_sha` est confronté à cette référence avec les fonctions de
+    `paquet-candidats.py` (#3782) : un décalage lève `TargetMoved`, rien n'est
+    poussé, et l'appelant recompose aussitôt sur la nouvelle tête
+    (`TARGET_MOVED_RC`) sans attendre le tic suivant. La relecture du gel juste
+    avant la poussée reste en place : la cible peut encore bouger pendant les
+    tests.
+
+    `code_refusal` fait foi : un code qui *contient* la référence (`ahead`)
+    passe, comme pour `paquet-candidats` ; seuls les cas qu'il refuse
+    (`behind`, `absent`, `diverged`, `dirty`, `unknown`) arrêtent les tests.
+    """
+    fresh = fresh_base(repo, target)
+    if fresh == base_sha:
+        return
+    # Un worktree de lecture à la base exacte : c'est ce code-là que les tests
+    # locaux exécuteraient, et `code_provenance` y lit l'arbre, pas le clone.
+    reader = reader_worktree(repo, base_sha)
+    try:
+        guard = candidates_guard()
+        ref, ref_source = guard.code_reference(reader, reader, fresh)
+        provenance = guard.code_provenance(reader, ref)
+        refusal = guard.code_refusal(provenance, ref, ref_source)
+    finally:
+        remove_worktree(repo, reader)
+    if not refusal:
+        return
+    raise TargetMoved(
+        "la cible %s a avancé pendant la composition (%s → %s) : %s ; "
+        "tests locaux non lancés, clone mis à jour, recomposition immédiate"
+        % (target, base_sha[:12], fresh[:12], refusal),
+        base=base_sha, head=fresh)
+
 
 def validate_remise_ref(repo: Path, ref: str, lot: int) -> None:
     """#3916 : une remise du lot, sous `refs/ameesh/resolutions/<lot>/`."""
@@ -5898,6 +5994,14 @@ def compose_packet(args: argparse.Namespace) -> int:
                     "contrôle d'inclusion rouge sur la tête %s : voir le rapport "
                     "ci-dessus" % head[:12])
             print("inclusion : vert", flush=True)
+            if not pushed:
+                # #6891 : la cible peut avoir atterri pendant la composition
+                # (composition, freeze-checks, inclusion). La référence #3782
+                # est relue AVANT les contrats, les tests locaux les plus longs
+                # (≈12 min au constat h-11) : un décalage lève `TargetMoved`
+                # avant de les lancer. Après une poussée, le refus de
+                # `freeze_changes` juste avant la poussée reste en place.
+                ensure_reference(repo, args.target, base_sha)
             contract_report = None
             if publication_policy(args) != "legacy":
                 contract_report = prepublication_contracts(
@@ -6525,6 +6629,11 @@ def main(argv: list[str] | None = None) -> int:
         # le rapporte au pilote sans ouvrir de lot d'empreinte §16.
         print("paquet-auto : %s" % error, file=sys.stderr)
         return COMPOSITION_RED_RC
+    except TargetMoved as error:
+        # #6891 : la cible a avancé avant les tests locaux ; rien n'est poussé.
+        # `paquet-horaire.py` relance aussitôt sur la nouvelle tête.
+        print("paquet-auto : %s" % error, file=sys.stderr)
+        return TARGET_MOVED_RC
     except PaquetAutoError as error:
         print("paquet-auto : %s" % error, file=sys.stderr)
         return 1

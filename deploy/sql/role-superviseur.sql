@@ -626,6 +626,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L63 (0048) : heure de démarrage du PID lié, secondes epoch
         'pid_started_at'
     ]),
+    -- #6881 (0567) : connexions limitées à un agent et un hôte (des noms de
+    -- rôle, d'agent et d'hôte, de l'ÉTAT) — le superviseur lit qui est limité
+    ('limited_logins', ARRAY['rolname', 'agent', 'host', 'created_at']),
     -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
     -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
     -- est un CONTENU). `run_attempt` (#901, 0429) : quel essai de l'exécution
@@ -747,7 +750,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- instant, de l'ÉTAT) — le superviseur lit qui exécute, jamais une
         -- dépense
         'external_session', 'external_claim_session', 'external_claimed_at',
-        'external_claim_actor', 'external_claim_host', 'external_claim_proof'
+        'external_claim_actor', 'external_claim_host', 'external_claim_proof',
+        -- #6877 (0568) : identité complète de la liaison qui a pris (harnais
+        -- et ligne de liaison) — de l'ÉTAT, lue pour dire qui tient le geste
+        'external_claim_harness', 'external_claim_binding'
     ]),
     -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
     ('work_item_estimates', ARRAY[
