@@ -47,10 +47,19 @@ prive() {
   [[ $a =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]]
 }
 
+# Réseau canonique (/16 à /29) entièrement RFC 1918 et sans recouvrement de
+# WireGuard : tester la seule adresse de base laissait passer 10.77.1.0/16.
 sous_reseau_valide() {
-  [[ $1 =~ ^([0-9.]+)/([0-9]{1,2})$ ]] || return 1
-  local p=${BASH_REMATCH[2]}
-  prive "${BASH_REMATCH[1]}" && ((10#$p >= 16 && 10#$p <= 29))
+  python3 -I -c '
+import ipaddress, sys
+try:
+    n = ipaddress.IPv4Network(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+rfc1918 = [ipaddress.IPv4Network(c) for c in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+ok = (16 <= n.prefixlen <= 29 and any(n.subnet_of(r) for r in rfc1918)
+      and not n.overlaps(ipaddress.IPv4Network("10.77.0.0/24")))
+sys.exit(0 if ok else 1)' "$1"
 }
 
 # MAC de l'unique carte privée annoncée par les métadonnées Scaleway.

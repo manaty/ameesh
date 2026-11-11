@@ -168,7 +168,8 @@ class ReseauPriveTest(unittest.TestCase):
         self.assertNotIn("systemctl restart", self.calls())
 
     def test_postgres_refuses_wide_or_public_subnets(self):
-        for sr in ("0.0.0.0/0", "10.0.0.0/8", "10.77.0.0/24", "51.15.0.0/16", "10.78.0.0"):
+        for sr in ("0.0.0.0/0", "10.0.0.0/8", "10.77.0.0/24", "51.15.0.0/16", "10.78.0.0",
+                   "10.77.1.0/16", "10.77.0.0/16", "10.78.0.5/24", "172.31.0.0/11"):
             out = self.run_script("postgres", "10.78.0.10", sr)
             self.assertEqual(out.returncode, 2, sr)
         self.assertNotIn("10.78", self.hba.read_text())
