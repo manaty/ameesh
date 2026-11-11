@@ -817,6 +817,19 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         # courrier à ce lot (fil, `work_item_id`), sans attribution.
         lot = mail.head_lot(bk.db, text)
 
+    # #6877 : deux sessions du bureau partagent l'identité `bureau` ; le fil
+    # doit dire LAQUELLE a écrit. Seule une liaison de session VÉRIFIÉE (L41,
+    # PID ancêtre de ce processus) est annoncée : un libellé recopié ou une
+    # variable d'environnement ne fait pas une session distinguable. La lecture
+    # est celle de #4485 (`resolve_session_binding`) : un `AGENT_MAIL_NAME`
+    # encore posé dans le shell d'une session liée ne masque pas sa liaison.
+    session_binding = identity.resolve_session_binding(
+        cfg, bk.db if bk.kind == "pg" else None)
+    if session_binding.ok and session_binding.session:
+        thread_meta = dict(thread_meta or {})
+        thread_meta["session"] = session_binding.session.get("session_id")
+        thread_meta["harness"] = session_binding.session.get("harness")
+
     skipped: list[str] = []
     from . import storage
     try:

@@ -160,6 +160,7 @@ _OPTIONAL_ITEM_COLUMNS = ("reviewer", "reviewers", "external_executor", "unique_
                           "external_session", "external_claim_session",
                           "external_claimed_at", "external_claim_actor",
                           "external_claim_host", "external_claim_proof",
+                          "external_claim_harness", "external_claim_binding",
                           "workflow_ref", "workflow_stage", "workflow_version")
 
 
@@ -228,8 +229,10 @@ def item_columns(db, ref: str | None = None, migrations: str | None = None) -> s
                     "%sexternal_claim_actor AS external_claim_actor, "
                     "%sexternal_claim_host AS external_claim_host, "
                     "%sexternal_claim_proof AS external_claim_proof, "
+                    "%sexternal_claim_harness AS external_claim_harness, "
+                    "%sexternal_claim_binding AS external_claim_binding, "
                     "extract(epoch from %sexternal_claimed_at)::float8"
-                    " AS external_claimed_ts" % (col, col, col, col, col, col, col))
+                    " AS external_claimed_ts" % ((col,) * 9))
         unique_ref = "%sunique_ref AS unique_ref" % col
         wake = "extract(epoch from %swake_at)::float8 as wake_ts" % col
         lifecycle_columns = ("%slegacy_state AS legacy_state, "
@@ -246,6 +249,10 @@ def item_columns(db, ref: str | None = None, migrations: str | None = None) -> s
                     " AS external_claim_host, "
                     "to_jsonb(work_items)->>'external_claim_proof'"
                     " AS external_claim_proof, "
+                    "to_jsonb(work_items)->>'external_claim_harness'"
+                    " AS external_claim_harness, "
+                    "nullif(to_jsonb(work_items)->>'external_claim_binding', '')"
+                    "::bigint AS external_claim_binding, "
                     "extract(epoch from (to_jsonb(work_items)->>'external_claimed_at')"
                     "::timestamptz)::float8 AS external_claimed_ts")
         unique_ref = "to_jsonb(work_items)->>'unique_ref' AS unique_ref"
@@ -1710,6 +1717,7 @@ class WorkItems(interface.WorkItems):
                      " external_session = NULL, external_claim_session = NULL,"
                      " external_claimed_at = NULL, external_claim_actor = NULL,"
                      " external_claim_host = NULL, external_claim_proof = NULL,"
+                     " external_claim_harness = NULL, external_claim_binding = NULL,"
                      " updated_at = now()"
                      f" WHERE id = %s AND state NOT IN {closed}"
                      " RETURNING __COLUMNS__").replace(
@@ -1725,7 +1733,7 @@ class WorkItems(interface.WorkItems):
 
     @_retry_deadlock
     def claim_external(self, item_id, session, *, note, actor, host=None,
-                       proof=None) -> dict:
+                       proof=None, harness=None, binding=None) -> dict:
         """#6839 : la prise exclusive d'un geste d'exécutant externe.
 
         La ligne du lot est verrouillée avant la lecture de la prise : deux
@@ -1745,8 +1753,13 @@ class WorkItems(interface.WorkItems):
         * `{"error": "not_proved", "session": …}` : le libellé ne correspond
           pas à la session vérifiée de l'appelant ;
         * `{"item": …}` : la prise est écrite, la session, l'instant, l'acteur,
-          l'hôte et la preuve avec.
+          l'hôte et la preuve avec ; #6877 : le harnais et la ligne de liaison
+          aussi quand l'appelant les a donnés (`harness`, `binding`).
         """
+        harness = (harness or "").strip() or None
+        binding = int(binding) if binding is not None else None
+        if (harness is None) != (binding is None):
+            return {"error": "not_proved", "session": session}
         with self.db.transaction() as tx:
             rows = tx.query(
                 "SELECT id, state, external_executor, external_session,"
@@ -1775,30 +1788,36 @@ class WorkItems(interface.WorkItems):
                 ("UPDATE work_items SET external_claim_session = %s,"
                  " external_claimed_at = clock_timestamp(), external_claim_actor = %s,"
                  " external_claim_host = %s, external_claim_proof = %s,"
+                 " external_claim_harness = %s, external_claim_binding = %s,"
                  " updated_at = now()"
                  " WHERE id = %s RETURNING __COLUMNS__").replace(
                      "__COLUMNS__", item_columns(self.db)),
-                (session, actor or "", host, proof, int(item_id)))
+                (session, actor or "", host, proof, harness, binding, int(item_id)))
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
             return {"item": rows[0]}
 
     @_retry_deadlock
     def release_external(self, item_id, session, *, note, actor, host=None,
-                         proof=None, force=False) -> dict:
+                         proof=None, harness=None, binding=None,
+                         force=False) -> dict:
         """#6839 : lever la prise exclusive d'un geste externe.
 
         Seule la session porteuse la lève, depuis l'acteur, l'hôte et la
         liaison L41 vérifiée de la prise ; une autre session qui passerait le
         libellé public est refusée, sauf `force` (geste de pilote, vérifié par
-        le métier). Le feu nommé (`external_session`) reste : une autre
-        session ne peut reprendre que si le feu n'en nommait aucune. Résultats :
+        le métier). #6877 : le harnais et la LIGNE de liaison de la prise sont
+        aussi exigés quand elle les porte (une révocation puis nouvelle liaison
+        est une autre ligne : le pilote libère en `--force` si la porteuse a
+        disparu). Le feu nommé (`external_session`) reste : une autre session
+        ne peut reprendre que si le feu n'en nommait aucune. Résultats :
         `unknown_lot`, `no_claim`, `not_holder` (avec la porteuse),
-        `not_holder_identity`, `not_holder_host`, `not_proved`, ou
-        `{"item": …}`."""
+        `not_holder_identity`, `not_holder_host`, `not_holder_harness`,
+        `not_holder_binding`, `not_proved`, ou `{"item": …}`."""
         with self.db.transaction() as tx:
             rows = tx.query(
                 "SELECT id, external_claim_session, external_claim_actor,"
                 " external_claim_host, external_claim_proof,"
+                " external_claim_harness, external_claim_binding,"
                 " extract(epoch from external_claimed_at)::float8 AS claimed_ts"
                 " FROM work_items WHERE id = %s FOR UPDATE", (int(item_id),))
             if not rows:
@@ -1813,6 +1832,8 @@ class WorkItems(interface.WorkItems):
                 claimed_by = (item.get("external_claim_actor") or "").strip()
                 claimed_on = (item.get("external_claim_host") or "").strip()
                 proved = (item.get("external_claim_proof") or "").strip()
+                claimed_harness = (item.get("external_claim_harness") or "").strip()
+                claimed_binding = item.get("external_claim_binding")
                 if claimed_by and claimed_by != (actor or ""):
                     return {"error": "not_holder_identity", "session": holder,
                             "actor": claimed_by, "host": claimed_on,
@@ -1823,10 +1844,20 @@ class WorkItems(interface.WorkItems):
                 if proved and proved != (proof or ""):
                     return {"error": "not_proved", "session": holder,
                             "proof": proved}
+                if claimed_harness and claimed_harness != (harness or "").strip():
+                    return {"error": "not_holder_harness", "session": holder,
+                            "harness": claimed_harness,
+                            "at": item.get("claimed_ts")}
+                if claimed_binding is not None \
+                        and int(claimed_binding) != int(binding or 0):
+                    return {"error": "not_holder_binding", "session": holder,
+                            "binding": int(claimed_binding),
+                            "at": item.get("claimed_ts")}
             rows = tx.query(
                 ("UPDATE work_items SET external_claim_session = NULL,"
                  " external_claimed_at = NULL, external_claim_actor = NULL,"
                  " external_claim_host = NULL, external_claim_proof = NULL,"
+                 " external_claim_harness = NULL, external_claim_binding = NULL,"
                  " updated_at = now()"
                  " WHERE id = %s RETURNING __COLUMNS__").replace(
                      "__COLUMNS__", item_columns(self.db)),
