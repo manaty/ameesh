@@ -742,6 +742,16 @@ harnais.
   l'exposer, avec TLS, quota, journaux sans contenu, ou le réserver au réseau
   du mesh. Le service ne stocke ni credential ni session ; il route des
   trames.
+- **Décision Q3 (#213938, option a, signée par human:smichea le 12/11/2026,
+  approbation #345)** : peut s'attacher le `responsible` de l'agent, ou un
+  humain de la liste explicite du canon (`avatar.attach_authorized` sur la
+  carte de l'agent) ; un deputy agit sous sa propre identité et n'est
+  autorisé que s'il figure dans cette liste. La preuve est un reçu
+  `ameesh-approve`/WebAuthn : grant de 5 min, à usage unique, lié à la clé
+  d'appareil du poste (un authentificateur `device-es256` du même humain,
+  déclaré au canon). Le relais est réservé au réseau du mesh (postes
+  enrôlés) ; une exposition publique demanderait une décision séparée. D1
+  (#7119) porte le grant, D2 (#7120) le relais.
 
 ### 5.3 Transport et confidentialité
 
@@ -879,6 +889,10 @@ droits. Recommandation entre parenthèses.
    Quel mécanisme d'identité : `ameesh-approve`/WebAuthn (recommandé, déjà
    là) ou OIDC ? Et expose-t-on le relais hors du mesh (nouvelle surface,
    décision owner) ?
+   **Tranché (#213938, option a, signée le 12/11/2026, approbation #345)** :
+   `responsible` + liste explicite du canon, deputy sous sa propre identité ;
+   `ameesh-approve`/WebAuthn, grant de 5 min à usage unique lié à
+   l'appareil ; relais réservé au réseau du mesh (voir §5.2).
 4. **Q4 — Pouvoirs de l'avatar.** L'avatar parle, propose et exécute ses
    tâches, mais ne signe pas et n'engage pas son humain (recommandé, 0012 et
    0029 §4) ; ou l'owner veut qu'il réponde en son nom sur certains sujets,
