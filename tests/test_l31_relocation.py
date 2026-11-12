@@ -435,7 +435,16 @@ class OperatorMoveTest(_MoveCase):
         self._prepare()
         self.db.execute("UPDATE agent_registry SET releve = 'election', "
                         "candidats = ARRAY['banc'] WHERE name = 'ouvrier'")
-        with self.assertRaisesRegex(relocation.MoveError, "elected role"):
+        with self.assertRaisesRegex(relocation.MoveError, "cross-host role"):
+            self._move()
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_refuse_un_agent_preference(self):
+        # #7048 : `agent move` d'un agent `preference` est le sous-lot B4
+        self._prepare()
+        self.db.execute("UPDATE agent_registry SET releve = 'preference', "
+                        "candidats = ARRAY['atelier', 'banc'] WHERE name = 'ouvrier'")
+        with self.assertRaisesRegex(relocation.MoveError, "releve: preference"):
             self._move()
         self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
 
