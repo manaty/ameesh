@@ -71,7 +71,7 @@ def _release_elected(tx, host):
         "lease_epoch = lease_epoch + 1, "
         "status = CASE WHEN status = 'running' THEN 'idle' ELSE status END, "
         "updated_at = now() "
-        "WHERE host = %s AND mode = 'execute' AND releve = 'election' "
+        "WHERE host = %s AND mode = 'execute' AND releve IN ('election', 'preference') "
         "AND lease_owner IS NOT NULL "
         "RETURNING name", (host,))
 
@@ -136,7 +136,7 @@ class HostLifecycle(interface.HostLifecycle):
                 # bail expiré est repris par un autre candidat, sans preuve de
                 # source. Il n'entre donc pas dans le journal de l'hôte perdu.
                 agents = tx.query("SELECT name FROM agent_registry WHERE host=%s "
-                                  "AND mode='execute' AND releve <> 'election' "
+                                  "AND mode='execute' AND releve NOT IN ('election', 'preference') "
                                   "ORDER BY name FOR UPDATE", (host,))
                 old = HostLifecycle(tx).get(host)
                 if not agents or (old and old["mode"] == "lost"):
@@ -273,7 +273,7 @@ class HostLifecycle(interface.HostLifecycle):
                 (host, actor, duration, duration, not close_claims, automatic))
             row = rows[0]
             for agent in agents:
-                if agent["releve"] == "election":
+                if agent["releve"] in ("election", "preference"):
                     continue
                 tx.execute("INSERT INTO host_lifecycle_agents(host,generation,agent,critical) "
                            "VALUES (%s,%s,%s,%s)",

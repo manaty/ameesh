@@ -507,6 +507,25 @@ the role back from a VM.
 `ameesh role status [ROLE] [--json]` prints the holder, the epoch and the
 ranked candidates with the diagnostic of each refusal.
 
+## Relief by declared preference (#7048, avatar B1)
+
+`releve: preference` (docs/design/5322-avatar-humain.md §3.2) reuses the
+cross-host lease of EP1: the claim CAS, the epoch, `agent_candidates` and the
+briefing. Its candidates are the hosts of its single Placement card **in the
+declared order** (named hosts, then tag hosts in canon order):
+`placement.admitted_hosts` no longer sorts them, and `canon sync` writes that
+order to `agent_registry.candidats` and each host's index to
+`agent_candidates.preference_rank` (migration 0570). A `candidats` field on
+the card is refused (`agent-preference-candidats`); a single admitted host is
+a warning (`agent-preference-no-fallback`). Only the ranking changes: the
+present candidates (fresh standing and reading, i.e. a live runner; gate open;
+canon `ok`; placement admitted) are ranked by `preference_rank`, never by
+availability, and wait the usual rank delay. A present workstation (rank 0)
+claims at once and the cloud waits 20 s; with the workstation absent, the
+cloud is rank 0 and claims the free lease at once. The availability
+hysteresis and the planned handover stay `election`-only: the return to the
+preferred host while the cloud holds the lease is sub-lot B2.
+
 ## Standby executors and the election briefing (L165/EP3)
 
 Every candidate host runs the role's runner, and none of them takes a turn

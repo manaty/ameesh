@@ -127,7 +127,8 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
     # est repris par un autre hôte candidat, sans preuve de source : le travail
     # qui compte est en base, dans le canon et sur GitHub, pas dans un
     # worktree local.
-    if agent.get("releve") == "election":
+    # #7048 : de même pour `releve: preference` (déplacement : B4).
+    if agent.get("releve") in ("election", "preference"):
         return None
     api = storage.of(db)
     forced = demand is not None

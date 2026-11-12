@@ -3648,7 +3648,8 @@ class Canon(Domain):
     def write_candidate(self, name: str, host: str, *, canon: str, cwd: str | None,
                         ok: bool | None, diagnostic: str, ref: str | None,
                         harness: str | None, provider: str | None,
-                        model: str | None, credential_mode: str | None) -> None:
+                        model: str | None, credential_mode: str | None,
+                        preference_rank: int | None = None) -> None:
         """L165 (EP1) : inscrit le verdict de placement de `name` sur l'hôte
         candidat `host` (profil évalué calculé dans la même instruction), pour
         que la réclamation depuis cet hôte soit jugée sur SA politique."""

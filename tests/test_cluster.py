@@ -281,10 +281,11 @@ FERMEES = {
     "spend_pending": {"resident_usage", "attribution", "attribution_at"},
     # L165 (EP1, 0473) : verdicts de placement par hôte candidat, lus par la
     # condition de réclamation et non par le rôle superviseur ; table interne
-    # fermée aux deux rôles, aucun GRANT ajouté.
+    # fermée aux deux rôles, aucun GRANT ajouté. #7048 (0570) : le rang de
+    # préférence, même table interne, même fermeture.
     "agent_candidates": {"name", "host", "canon", "cwd", "placement_ok",
                          "placement_diagnostic", "placement_ref",
-                         "placement_profile", "updated_at"},
+                         "placement_profile", "preference_rank", "updated_at"},
     # #2443 (0465) : appartenance d'une unité à un paquet, écrite à la
     # composition (porteur, commit de composition, gel effectif). État interne
     # lu par `work show` et `sync-merges` ; fermé aux deux rôles superviseur,

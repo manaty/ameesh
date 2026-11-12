@@ -466,7 +466,12 @@ def evaluate(cfg, db, role: Mapping, host: str, *, now: float | None = None) -> 
     reading = pg.latest_reading(db, host)
     cap = capacity(reading)
     ready, diagnostic = local_readiness(cfg, db, role, host)
-    notify_ok, notify_diagnostic = _notify_reach(cfg, role)
+    if role.get("releve") == "election":
+        notify_ok, notify_diagnostic = _notify_reach(cfg, role)
+    else:
+        # #7048 : la passe d'alertes est celle des rôles élus ; un agent
+        # `preference` ne la porte jamais
+        notify_ok, notify_diagnostic = False, "not an elected role"
     if role.get("operator_paused"):
         ready = False
         pause = "operator pause"
@@ -612,6 +617,14 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
     capacity tie-break, then the host name (stable). `rank` and `delay_s` are
     only set for eligible candidates, so a dead better candidate does not make
     the second wait.
+
+    #7048 (`releve: preference`, docs/design/5322-avatar-humain.md §3.2): the
+    same readiness is the host's **presence** (fresh reading and standing,
+    i.e. a live runner; gate open; canon ok; placement admitted), but the
+    ranking is the declared order of the Placement card (`preference_rank`),
+    never availability. A present workstation (rank 0) claims at once; the
+    cloud waits one rank delay, and claims at once when the workstation is
+    absent.
     """
     now = pg.now_ts(db) if now is None else float(now)
     from . import registry
@@ -649,10 +662,17 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
             "notify_diagnostic": str(state.get("notify_diagnostic") or ""),
             "evaluated_ts": row.get("evaluated_ts"),
             "age_s": (now - float(row["evaluated_ts"])) if row.get("evaluated_ts") else None,
+            "preference_rank": candidate.get("preference_rank"),
         })
-    eligible = sorted(
-        (item for item in out if item["ready"]),
-        key=lambda item: (-item["score"], -item["capacity"], item["host"]))
+    if role.get("releve") == "preference":
+        # un verdict sans rang (écrit avant 0570) passe après les rangés
+        def order(item):
+            rank = item["preference_rank"]
+            return (rank is None, rank if rank is not None else 0, item["host"])
+    else:
+        def order(item):
+            return (-item["score"], -item["capacity"], item["host"])
+    eligible = sorted((item for item in out if item["ready"]), key=order)
     rest = sorted((item for item in out if not item["ready"]),
                   key=lambda item: item["host"])
     ordered = eligible + rest
