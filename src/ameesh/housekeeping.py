@@ -4953,7 +4953,7 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
                     data={"created": stamp}))
             continue
         if stamp is None:
-            why = "%s: creation identity unreadable: flagged only" % kind
+            why = "declared disposable: creation identity unreadable: flagged only"
             ours.append(dict(base, action="signalé", detail=why))
             out["plan"].append(dict(base, action="signalé", detail=why))
             continue
@@ -5091,7 +5091,7 @@ def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False
                            % ident[:19], data={"created": stamp}))
             continue
         if stamp is None:
-            why = "declared disposable: creation identity unreadable: flagged only"
+            why = "%s: creation identity unreadable: flagged only" % kind
             ours.append(dict(base, action="signalé", detail=why))
             out["plan"].append(dict(base, action="signalé", detail=why))
             continue
