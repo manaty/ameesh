@@ -43,6 +43,10 @@ class Fixture:
         self.bundle=base.bundle; self.operation=base.operation
         self.stage=self.root/('var/lib/ameesh-release-bootstrap/'+self.operation)
         self.root.joinpath('var/lib/ameesh-release-bootstrap').chmod(0o700)
+        # These synthetic bundles carry no seal: a sealed agent host or guest
+        # must not lead `bootstrap.run` to its real root-only lock (#7013).
+        patcher=mock.patch.object(bootstrap.delegation,'SEAL_DOCUMENT',str(self.root/'absent-seal.json'))
+        patcher.start(); self.addCleanup(patcher.stop)
         # #7013: a prepared window ends within one fresh signature.
         self.expires=int(time.time())+600
         self.question=bootstrap.question(self.operation,self.bundle,expires_at=self.expires)
