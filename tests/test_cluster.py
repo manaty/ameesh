@@ -220,6 +220,12 @@ FERMEES = {
     # internal diagnostic, and supervision does not need the withdrawn proof:
     # closed to both roles, no GRANT added.
     "provenance_revocations": {"subject", "sha", "actor", "reason", "at"},
+    # #7119 (0574): the attach grant journal names humans, devices and refusal
+    # reasons; it is read by `ameesh attach-grant audit`, not by supervision:
+    # closed to both roles, no GRANT added.
+    "attach_grant_events": {"id", "at", "outcome", "code", "reason", "human", "agent",
+                            "host", "tenant", "device_key", "attach_id", "nonce", "exp",
+                            "checked_by"},
     # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
     # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
     "agent_mesh_overview": {"roles", "aliases"},  # #423 : 0418 avant 0428 sur un schéma neuf

@@ -106,6 +106,9 @@ KEPT = (
     # #6873 (0566) : la révocation est une preuve datée (acteur, raison), au
     # même titre que le reçu qu'elle retire ; un renommage ne la réécrit pas.
     "provenance_revocations.actor",
+    # #7119 (0574) : le journal des grants d'attach est une preuve datée (grant
+    # accepté ou refusé pour CET agent) ; un renommage ne le réécrit pas.
+    "attach_grant_events.agent", "attach_grant_events.checked_by",
     # #6669 (0564) : le journal additif des résolutions de constat est une
     # preuve historique (retrait, correction) que l'append-only interdit de
     # réécrire ; un renommage ne le déplace pas (corrector/adjudicator ne

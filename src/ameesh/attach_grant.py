@@ -227,6 +227,11 @@ def redeem(db: Db, receipt, *, canon, agent: str, host: str, tenant: str, device
             else:
                 event_id = _record(db, grant, nonce=nonce, checked_by=checked_by)
         except DbError as exc:
+            deadline = receipts._deadline_error(exc) if grant.ok else None
+            if deadline is not None:
+                # échéance franchie pendant l'attente du verrou : rien d'écrit
+                return finish(dataclasses.replace(
+                    grant, ok=False, code=deadline.code, reason=str(deadline)))
             # grant déjà consommé : sans trace, il ne vaut rien (fail closed)
             return dataclasses.replace(
                 grant, ok=False, code=AUDIT,

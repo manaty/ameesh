@@ -32,7 +32,10 @@ class AttachGrants(abc.ABC):
         l'authentificateur WebAuthn dans `ameesh_receipt_consume`), son état
         relu sous ce verrou, puis la ligne `granted` écrite. Rend
         `("ok", id)`, `("device_revoked", None)` (rien d'écrit) ou
-        `("used", None)` (un grant existe déjà pour cet attach_id)."""
+        `("used", None)` (un grant existe déjà pour cet attach_id). L'échéance
+        `exp` est recontrôlée à l'heure de la base après le verrou et après
+        l'écriture (`ameesh_receipt_deadlines`) : dépassée, l'erreur SQL
+        annule la transaction (receipts._deadline_error la lit)."""
 
     @abc.abstractmethod
     def recent(self, *, agent: Optional[str] = None, limit: int = 50) -> list[dict]:

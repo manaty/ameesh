@@ -43,6 +43,12 @@ class AttachGrants(Contract):
                 (int(device_authenticator_id),))
             if not live:
                 return "device_revoked", None
+            # ⏱ à l'heure réelle de la base, après le dernier verrou et après
+            # l'écriture (l'INSERT peut attendre un grant concurrent) : un
+            # dépassement lève et annule toute la transaction (0011)
+            what = "grant d'attach %s" % attach_id
+            tx.query("SELECT ameesh_receipt_deadlines(%s, %s, NULL, NULL, NULL) AS ok",
+                     (what, int(exp)))
             rows = tx.query(
                 "INSERT INTO attach_grant_events"
                 "       (outcome, code, reason, human, agent, host, tenant, device_key,"
@@ -54,6 +60,8 @@ class AttachGrants(Contract):
                  checked_by))
             if not rows:
                 return "used", None
+            tx.query("SELECT ameesh_receipt_deadlines(%s, %s, NULL, NULL, NULL) AS ok",
+                     (what, int(exp)))
             return "ok", int(rows[0]["id"])
 
     def recent(self, *, agent=None, limit=50):

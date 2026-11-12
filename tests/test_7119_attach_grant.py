@@ -12,6 +12,7 @@ import contextlib
 import io
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -276,6 +277,44 @@ class RedeemTest(PgTestCase):
             grant = self.redeem(receipt)
         self.assertRefused(grant, attach_grant.DEVICE)
         self.assertIn("revoked during verification", grant.reason)
+        self.assertEqual([e["outcome"] for e in self.events()], ["refused"])
+
+    def test_echeance_franchie_pendant_le_verrou(self):
+        """B cx1 : la clé d'appareil tenue par une autre transaction jusqu'après
+        `exp` ; le grant est recontrôlé à l'heure de la base après le verrou :
+        aucun `granted`, refus `expired` journalisé."""
+        receipt = self.grant(ttl=3)
+        device_id = self.db.query(
+            "SELECT id FROM authenticators WHERE credential_id = %s",
+            (self.alice_station.credential_id,))[0]["id"]
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            other = self.connect()
+            try:
+                with other.transaction() as tx:
+                    tx.query("SELECT id FROM authenticators WHERE id = %s FOR UPDATE",
+                             (device_id,))
+                    held.set()
+                    release.wait(30)
+            finally:
+                other.close()
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(held.wait(30))
+        timer = threading.Timer(max(0.0, receipt["request"]["exp"] - time.time() + 1.5),
+                                release.set)
+        timer.start()
+        try:
+            grant = self.redeem(receipt)
+        finally:
+            release.set()
+            timer.cancel()
+            holder.join(30)
+        self.assertRefused(grant, receipts.EXPIRED)
+        # refus de la base (après le verrou), pas du contrôle Python d'avant
+        self.assertIn("heure de la base", grant.reason)
         self.assertEqual([e["outcome"] for e in self.events()], ["refused"])
 
     def test_un_seul_grant_par_attach_id(self):
