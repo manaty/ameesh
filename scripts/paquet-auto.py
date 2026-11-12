@@ -2290,6 +2290,22 @@ def declared_plan(worktree: Path, tooling: Tooling, *, base: str,
     return plan
 
 
+def _contract_choice(plan: dict, shared: dict) -> list[str]:
+    """Contrats + impactés d'une sélection sûre, sinon les seuls contrats.
+
+    #7091 : une carte périmée vaut une carte absente (celle du 27/10, 386 h,
+    mettait 1324 modules dans la passe). #7092 : une carte fraîche ne suffit
+    pas ; sur une fondation (`tests/support.py`), un retrait ou une
+    sélection incertaine, les impactés sont toute la suite (1011 modules),
+    déjà due à la CI complète du paquet (canon §12). Un plan sans `lot_safe`
+    (adaptateur déclaré d'un autre projet) est jugé sur `full_suite_required`.
+    """
+    card = plan.get("map") or {}
+    safe = (card.get("used") and not card.get("stale")
+            and plan.get("lot_safe", True) and not shared.get("full_suite_required"))
+    return shared["modules"] if safe else shared["contracts"]
+
+
 def declared_contract_modules(worktree: Path, tooling: Tooling, *, base: str = "",
                               timeout: float = GIT_TIMEOUT) -> list[str]:
     """#6274 : contrats déclarés + plan actif, identités préservées.
@@ -2306,8 +2322,7 @@ def declared_contract_modules(worktree: Path, tooling: Tooling, *, base: str = "
         shared = plan["contract_plan"]
         inventory = set(shared.get("inventory") or ())
         if shared["active"]:
-            modules.extend(shared["modules"] if (plan.get("map") or {}).get("used")
-                           else shared["contracts"])
+            modules.extend(_contract_choice(plan, shared))
     out: list[str] = []
     for module in modules:
         if module in out:
@@ -2366,13 +2381,7 @@ def contract_modules(worktree: Path, *, base: str = "",
             except (OSError, ValueError, KeyError) as exc:
                 raise PaquetAutoError("plan commun de contrats illisible : " + str(exc)) from exc
             if shared["active"]:
-                # #7091 : une carte périmée vaut une carte absente. Celle du
-                # 27/10 (386 h), lue sur une fondation (housekeeping.py),
-                # mettait 1324 modules dans la passe des contrats.
-                card = plan.get("map") or {}
-                chosen = (shared["modules"] if card.get("used") and not card.get("stale")
-                          else shared["contracts"])
-                modules.extend("tests." + name for name in chosen)
+                modules.extend("tests." + name for name in _contract_choice(plan, shared))
     return _dedupe_modules(worktree, modules)
 
 
