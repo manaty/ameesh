@@ -457,7 +457,9 @@ class TrainGitTest(_Land):
         plan = self.plan()
         self.assertEqual(self.repository.compose("main", plan["base"], plan["members"]),
                          {k: plan[k] for k in ("head", "tree")})
+        self.assertEqual(self.repository.published(plan), "")   # #6978 : absente
         self.repository.publish(plan, key="p:main", epoch=1, owner="one", workflows=self.workflows)
+        self.assertEqual(self.repository.published(plan), plan["head"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), plan["base"])
         self.assertEqual(_git(self.origin, "rev-parse", plan["branch"]), plan["head"])
         self.repository.promote(plan, key="p:main", epoch=1, owner="one")

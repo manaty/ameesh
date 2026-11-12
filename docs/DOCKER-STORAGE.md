@@ -51,7 +51,10 @@ after the same `docker_volume_idle` of continuous absence. A tagged image is
 never deleted, even labelled: a tag is a reference. The removal first puts a
 temporary tag of ours on the image (`docker tag`) and removes only that tag
 with `--no-prune`: a tag added concurrently survives, and untagged parent
-images are never pruned. Images without the label are only counted.
+images are never pruned. An untagged image without the label is only counted,
+except in the mesh's rootless Docker (#7081): there it follows the same idle
+delay and removal path; a container descending from it — even a stopped one —
+keeps it.
 
 Nothing else is ever deleted automatically: an anonymous volume
 (`com.docker.volume.anonymous`) carries no mesh provenance and is never reaped
@@ -59,7 +62,9 @@ by housekeeping — it leaves with the container that owns it (`rm -v`, forced b
 the shim and already used by the mesh's own container reaper); a named volume
 without the label, or with a non-disposable label, is listed in the bounded
 `others` section with its exact `docker volume rm` command so a human decides;
-an untagged image without the label is only counted. A disposable volume or
+an untagged image without the label is only counted, except in the mesh's
+rootless Docker (#7081) where it is reaped after the same idle delay; a tagged
+image is never deleted, even labelled. A disposable volume or
 image whose creation identity is unreadable is flagged without a command, since
 the episode's identity cannot be established. This preserves the #411 rule
 (existing named volumes are kept). `docker volume rm` and `docker image rm`
@@ -80,7 +85,7 @@ The default thresholds and retention in the Host card's
 docker_orphan_volumes_alert: 100
 docker_build_cache_alert: 20GiB
 docker_volumes: true          # reap declared-disposable dangling volumes
-docker_images: true           # reap declared-disposable untagged images
+docker_images: true           # declared-disposable untagged + rootless dangling
 docker_volume_idle: 24h       # continuous absence before either is reaped
 ```
 

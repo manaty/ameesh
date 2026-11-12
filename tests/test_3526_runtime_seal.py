@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -198,7 +199,7 @@ class SealTest(unittest.TestCase):
         doc = dict(self.document, machine_id=plan['machine_id'])
         rendered = bootstrap.delegation.render(plan, account_ids={'uid':987,'gid':987},
             enrollment={bootstrap.delegation.SEAL_DOCUMENT:seal.canonical(doc).decode()})
-        text = bootstrap.question('seal-test', rendered, expires_at=2000000000)
+        text = bootstrap.question('seal-test', rendered, expires_at=int(time.time())+600)
         question = json.loads(text[len(bootstrap.PREFIX):])
         self.assertIn(bootstrap.delegation.SEAL_DOCUMENT, question['file_sha256'])
         self.assertIn(bootstrap.delegation.SEAL_ENTRY, question['file_sha256'])

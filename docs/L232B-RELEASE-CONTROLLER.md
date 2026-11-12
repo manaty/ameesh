@@ -92,7 +92,11 @@ reviewable question containing the exact manifest, its digest, host, operation,
 allowed release/recovery steps and execution deadline. Use that exact question
 and the module's `OPTIONS` with `decide ask --needs-signature` only when the
 host operation is fully prepared. This development checkpoint sends no request.
-The expiry must cover the rollback window. A prepared question is not authority.
+The expiry must cover the rollback window and end within one fresh
+`decide --key` signature (`SIGN_TTL_S` less 300 s): every question builder
+refuses a longer window with the largest accepted value (#7013), and
+`signable(expires_at)` returns the owner's deadline. A prepared question is not
+authority.
 
 `SignedDecisionAuthority(db, decision_id, operation, manifest)` implements the
 controller's validation interface. Only the signed `apply` option counts, as
@@ -516,10 +520,10 @@ program, root, destination, journal or credential is selectable.
 | Command | Effect |
 | --- | --- |
 | `inventory OPERATION` | none: host inventory of the reviewed destinations of the staged plan, machine-id, host-key digest |
-| `prepare OPERATION` | no host installation effect: measures the staged trees, observes the inventory itself, writes `question.txt` then `bundle.json` (0600) beside the stage; an existing different bundle refuses |
+| `prepare OPERATION` | no host installation effect: measures the staged trees, observes the inventory itself, writes `question.txt` then `bundle.json` (0600) beside the stage; an existing different bundle refuses; prints `deadline` |
 | `plan OPERATION --decision N` | none (dry run, no `adapter.perform` nor `bootstrap.run`): ordered steps, scope digests, per-step authority, observed state, revoke preview and whether N authorizes the revoke; exit 3 when N authorizes neither |
 | `install OPERATION --decision N` | the signed bootstrap, resumable from its journal |
-| `revoke-question OPERATION --expires T` | none: prints the separate rollback question (options `revoke`/`leave`) |
+| `revoke-question OPERATION --expires T` | none: prints the separate rollback question (options `revoke`/`leave`) and its `deadline` |
 | `revoke OPERATION --decision N` | rollback under its **own** signed decision (`SignedBootstrapRevokeAuthority`), under the bootstrap host lock: key first, approved snapshots restored, exact new files removed; runtime, account and journals kept |
 
 An `install` answer never authorizes `revoke`, and a `revoke` answer never
@@ -528,8 +532,14 @@ that installed.
 
 The administrator stages `runtime/`, `sources/` and `plan.json` (exactly
 `plan`, `account_ids`, `expires_at`, optional `probe_turn`, `runtime_seal`,
-root 0600) under `/var/lib/ameesh-release-bootstrap/OPERATION/`. The question
-is then asked with `ameesh decide ask --needs-signature`; the owner signs
+root 0600) under `/var/lib/ameesh-release-bootstrap/OPERATION/`; `expires_at`
+(and `--expires T`) ends within one fresh signature, at most now + 3600 s −
+300 s, or the question is refused (#7013). The question is then asked with
+`ameesh decide ask --needs-signature --recommend install --why "DEADLINE"`
+(`--recommend revoke` for the revoke question; `decide` only takes `--why`
+with `--recommend`), `DEADLINE` being the `deadline` field printed by `prepare`
+(or `revoke-question`), so that the owner reads when the gesture must run; the
+owner signs
 `install`, raw or with the fixed `signer-owner.sh` mention, and the backend
 recognizes the option through `decisions.match_option`, never a free prefix.
 Private state lives under `/var/lib/ameesh-release-bootstrap/.admin`

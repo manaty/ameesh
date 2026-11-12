@@ -72,17 +72,25 @@ def _text(prefix,value):
     return text
 
 
-def question(operation,bundle, *, expires_at):
+def signable(expires_at):
+    """Refuse a window no fresh owner signature covers (#7013); its deadline."""
+    return bootstrap.deadline(expires_at,ReplacementError)
+
+
+def question(operation,bundle, *, expires_at, fresh=True):
+    """`fresh=False` only re-renders a stored question to check its bytes."""
     if type(expires_at) is not int or expires_at<=0:
         raise ReplacementError('signed replacement deadline required')
+    if fresh: signable(expires_at)
     value={key:item for key,item in bundle.items() if key!='seal'}
     return _text(PREFIX,dict(value,scopes={step:scope for step,scope in scopes(operation,bundle).items()
                                            if step in STEPS},expires_at=expires_at))
 
 
-def rollback_question(operation,bundle, *, expires_at):
+def rollback_question(operation,bundle, *, expires_at, fresh=True):
     if type(expires_at) is not int or expires_at<=0:
         raise ReplacementError('signed rollback deadline required')
+    if fresh: signable(expires_at)
     return _text(ROLLBACK_PREFIX,dict(version=1,operation=operation,host=bundle['host'],
         machine_id=bundle['machine_id'],bundle_digest=bundle['digest'],previous=bundle['previous'],
         next=bundle['next'],retained=bundle['retained'],scope=scopes(operation,bundle)['rollback'],
@@ -101,14 +109,14 @@ class SignedReplacementAuthority(bootstrap.SignedBootstrapAuthority):
         self.scopes=scopes(operation,self.bundle)
 
     def render(self,operation,expires_at):
-        return question(operation,self.bundle,expires_at=expires_at)
+        return question(operation,self.bundle,expires_at=expires_at,fresh=False)
 
 
 class SignedRollbackAuthority(SignedReplacementAuthority):
     steps,option,options,prefix=('rollback',),'rollback',ROLLBACK_OPTIONS,ROLLBACK_PREFIX
 
     def render(self,operation,expires_at):
-        return rollback_question(operation,self.bundle,expires_at=expires_at)
+        return rollback_question(operation,self.bundle,expires_at=expires_at,fresh=False)
 
 
 class Replacement:
@@ -190,6 +198,7 @@ class Replacement:
                     or value['held_operation']==self.operation))):
             raise ReplacementError('exact staged replacement required')
         self.check_held(value['held_operation'])
+        deadline=signable(value['expires_at'])
         host_key=backend.host_key()
         if not isinstance(host_key,str) or re.fullmatch('[0-9a-f]{64}',host_key) is None:
             raise ReplacementError('pinned host key required')
@@ -226,14 +235,16 @@ class Replacement:
         backend.gestes.append(command='replacement-prepare',operation=self.operation,phase='prepared',
                               bundle_digest=bundle['digest'],
                               question_sha256=hashlib.sha256(rendered.encode()).hexdigest())
-        return dict(operation=self.operation,bundle_digest=bundle['digest'],question=rendered,options=OPTIONS)
+        return dict(operation=self.operation,bundle_digest=bundle['digest'],question=rendered,options=OPTIONS,
+                    deadline=deadline)
 
     def prepared(self,*,same_code=True):
         try:
             bundle=json.loads(self.backend.private(self.bundle_path,1<<24))
             text=self.backend.private(self.question_path,bootstrap.signed.decisions.MAX_QUESTION).decode()
             expires=json.loads(text[len(PREFIX):])['expires_at']
-            exact=text==question(self.operation,bundle,expires_at=expires)
+            # Integrity only: a stored window stays readable (rollback, #7013).
+            exact=text==question(self.operation,bundle,expires_at=expires,fresh=False)
         except (OSError,KeyError,TypeError,ValueError):
             raise ReplacementError('prepared replacement unavailable') from None
         if not exact or bundle['host']!=self.backend.enrollment['host'] or bundle['machine_id']!=self.backend.machine():
@@ -246,9 +257,10 @@ class Replacement:
         return bundle,text
 
     def rollback_text(self,expires_at):
+        deadline=signable(expires_at)
         bundle,_=self.prepared()
         return dict(operation=self.operation,question=rollback_question(self.operation,bundle,expires_at=expires_at),
-                    options=ROLLBACK_OPTIONS)
+                    options=ROLLBACK_OPTIONS,deadline=deadline)
 
     # ---- observation
     def digest(self,path):

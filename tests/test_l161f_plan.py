@@ -17,6 +17,7 @@ import functools
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -27,7 +28,11 @@ import textwrap
 import unittest
 from unittest import mock
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
+# #7109 : la configuration de l'hôte n'est jamais lue (AMEESH_CONFIG vide) ;
+# son canon déclare un registre de contrats absent des dépôts jetables.
+from tests import support  # noqa: F401  (L142 : environnement isolé)
+
+REPO =pathlib.Path(__file__).resolve().parent.parent
 
 
 def _load(name: str, filename: str):
@@ -1613,6 +1618,13 @@ class DocsLaneTest(unittest.TestCase):
                 mock.patch.object(plan, "read_list", self._read_list):
             return plan.make_plan("pull_request", self.card, NOW, base=base, head="HEAD",
                                   repo=self.repo.path, base_ref="main", head_ref="lot/x")
+
+    def test_plans_never_read_the_host_contract_policy(self):
+        # #7109 : témoin, vert en CI comme sur un hôte d'agents. Le canon de
+        # l'hôte y donnait une politique de contrats ; le plan exigeait alors
+        # tests/parts/contrats.json du dépôt jetable et prenait la suite complète.
+        self.assertEqual(os.environ.get("AMEESH_CONFIG"), support.EMPTY_CONFIG)
+        self.assertIsNone(plan.contract_plan.configured_policy("ameesh"))
 
     def test_docs_pr_ignores_ci_changes_already_in_its_base(self):
         base = self._base_with_unmeasured_ci_change()

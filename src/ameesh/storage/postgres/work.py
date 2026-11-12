@@ -3571,10 +3571,44 @@ class WorkItems(interface.WorkItems):
                 " SELECT %s, 1, %s::jsonb WHERE %s = 0"
                 " ON CONFLICT (target_key) DO NOTHING RETURNING revision",
                 (key, json.dumps(document), int(revision))) if revision == 0 else tx.query(
-                "UPDATE integration_trains SET revision = revision + 1, document = %s::jsonb,"
+                # #6978 : une demande d'abandon posée sans bail survit à la
+                # réécriture, pour le même plan, d'un détenteur qui l'a
+                # chargée avant elle (son document n'y porte pas d'objet).
+                "UPDATE integration_trains SET revision = revision + 1, document = %s::jsonb"
+                " || CASE WHEN jsonb_typeof(document->'abandon_request') = 'object'"
+                " AND jsonb_typeof((%s::jsonb)->'abandon_request') IS DISTINCT FROM 'object'"
+                " AND document->'abandon_request'->>'plan' = (%s::jsonb)->'plan'->>'id'"
+                " THEN jsonb_build_object('abandon_request', document->'abandon_request')"
+                " ELSE '{}'::jsonb END,"
                 " updated_at = clock_timestamp() WHERE target_key = %s AND revision = %s"
-                " RETURNING revision", (json.dumps(document), key, int(revision)))
+                " RETURNING revision", (json.dumps(document), json.dumps(document),
+                                        json.dumps(document), key, int(revision)))
             return dict(document, revision=int(rows[0]["revision"])) if rows else None
+
+    def train_abandon_request(self, key, plan_id, request) -> dict | None:
+        with self.db.transaction() as tx:
+            # Même verrou que train_save et train_fire_give : la demande est
+            # vue par la prochaine écriture du détenteur, ou la précède.
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s FOR UPDATE", (key,)):
+                return None
+            rows = tx.query("SELECT revision, document FROM integration_trains"
+                            " WHERE target_key = %s FOR UPDATE", (key,))
+            if not rows:
+                return None
+            current = rows[0]["document"]
+            if isinstance(current, str):
+                current = json.loads(current)
+            if current.get("phase") in ("landed", "empty", "invalidated", "promoting") \
+                    or (current.get("plan") or {}).get("id") != plan_id \
+                    or not isinstance(request, dict) or request.get("plan") != plan_id:
+                return None
+            fire = WorkItems(tx).train_fire_read(key, plan_id)
+            if fire and fire.get("state") in ("active", "promoting", "landed"):
+                return None
+            tx.execute("UPDATE integration_trains SET document = jsonb_set(document,"
+                       " '{abandon_request}', %s::jsonb) WHERE target_key = %s",
+                       (json.dumps(request), key))
+            return dict(current, abandon_request=request, revision=int(rows[0]["revision"]))
 
     def train_abandon(self, key, plan_id, document, *, revision, owner, epoch) -> dict | None:
         with self.db.transaction() as tx:

@@ -65,6 +65,9 @@ def thaw(path):
 
 
 class Harness(fixture.Fixture, support.PgTestCase):
+    #: Real seal documents are enrolled and locked through `seal` here.
+    isolate_seal = False
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -271,6 +274,25 @@ class ReplacementTest(Harness):
         (self.swap_stage/'replacement.json').write_text(json.dumps(value))
         with self.assertRaisesRegex(ValueError, 'sealed commit'):
             self.item.prepare()
+
+    def test_7013_window_beyond_a_fresh_signature_refuses_before_any_question(self):
+        # #6583: prepared up to the artifact expiry, no `decide --key` approval
+        # (SIGN_TTL_S) could cover it; it is now refused here, not at replace.
+        value = json.loads((self.swap_stage/'replacement.json').read_bytes())
+        (self.swap_stage/'replacement.json').write_text(json.dumps(dict(value, expires_at=int(self.now)+2*86400)))
+        with self.assertRaisesRegex(swap.ReplacementError, 'at most'):
+            self.item.prepare()
+        self.assertFalse(self.item.question_path.exists())
+        self.assertFalse(self.item.bundle_path.exists())
+        (self.swap_stage/'replacement.json').write_text(json.dumps(value))
+        self.assertIn('runs before', self.item.prepare()['deadline'])
+        with self.assertRaisesRegex(swap.ReplacementError, 'at most'):
+            self.item.rollback_text(int(self.now)+2*86400)
+        self.assertIn('runs before', self.item.rollback_text(int(self.now)+600)['deadline'])
+        bundle, _ = self.item.prepared()
+        for render in (swap.question, swap.rollback_question):
+            with self.subTest(render=render.__name__), self.assertRaisesRegex(swap.ReplacementError, 'at most'):
+                render('swap-1', bundle, expires_at=int(self.now)+2*86400)
 
     def test_bundle_binds_the_code_that_runs_it_and_only_the_staged_code_may_run(self):
         self.assertEqual(self.item.prepare()['bundle_digest'], json.loads(self.item.bundle_path.read_bytes())['digest'])

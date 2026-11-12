@@ -2428,6 +2428,23 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def train_abandon_request(self, key: str, plan_id: str,
+                              request: dict) -> dict | None:
+        """#6978: a pilot's abandon request for a plan whose target lease a
+        live train service holds; that holder applies it at its next step.
+
+        No lease is taken. Under the same target-row lock as `train_save` and
+        `train_fire_give`, in one transaction: the persisted plan id is still
+        `plan_id`, its phase is neither terminal (except `paused`) nor
+        `promoting`, and no active/promoting/landed fire exists for it. The
+        request is set on the document without changing its revision, so the
+        holder's compare-and-swap is not refused; `train_save` keeps a stored
+        request for the same plan when the incoming document carries no
+        request object (a holder clears it by writing one, e.g. `refused`).
+        Returns the document, None on any mismatch.
+        """
+
+    @abc.abstractmethod
     def train_adopt(self, key: str, owner: str, *, revision: int,
                     previous: tuple | None, service: tuple, ttl_s: float) -> dict | None:
         """#3142: the train service's current holder takes over the target

@@ -7,10 +7,12 @@ An agent's mail, unsigned answer or policy name cannot supply authority.
 
 The signature must cover the whole declared window (`expires_at`): a release
 fence is never committed under an authority that would die before the window
-it approved, recovery included. The one-hour `decide <id> <answer> --key` path
-therefore fits windows up to one hour; a longer window is signed deliberately
-with `ameesh approve --expires …` plus `decide <id> <answer> --signed`. After
-the window, resuming the same manifest needs a fresh signed decision.
+it approved, recovery included. The one-hour `decide <id> <answer> --key`
+signature (SIGN_TTL_S) therefore only covers a window ending within the hour:
+every question builder refuses any other window through `signable()` (#7013),
+before an owner signature is spent on it. Revalidating a stored question
+re-renders it without that bound (`fresh=False`): its approval decides. After the window, resuming the same
+manifest needs a fresh signed decision.
 """
 import hashlib
 import json
@@ -30,10 +32,40 @@ def digest(manifest):
     return hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-def question(operation, manifest, *, expires_at):
-    """Prepared question for decide ask --needs-signature; no request is sent."""
+#: Clock skew tolerated between the preparing host and the signer (#7013).
+SIGN_MARGIN_S = 300
+
+
+def signable(expires_at, *, now=None):
+    """Owner deadline of a question prepared now, or ValueError (#7013).
+
+    A fresh `decide --key` approval lives SIGN_TTL_S from its signature and
+    `_proof_live` wants it to outlive `expires_at`: a later window can never
+    be covered, so it is refused here with the largest accepted value, never
+    silently capped (the window is a signed parameter).
+    """
+    now = time.time() if now is None else now
+    latest = int(now + decisions.SIGN_TTL_S - SIGN_MARGIN_S)
+    if type(expires_at) is not int or expires_at > latest:
+        raise ValueError('expires_at %r cannot be covered by a fresh signature (lives %ds):'
+                         ' at most %d (%s)' % (expires_at, decisions.SIGN_TTL_S, latest, _utc(latest)))
+    return 'sign, then the gesture runs before %s' % _utc(expires_at)
+
+
+def _utc(epoch):
+    return time.strftime('%H:%MZ on %Y-%m-%d', time.gmtime(epoch))
+
+
+def question(operation, manifest, *, expires_at, fresh=True):
+    """Prepared question for decide ask --needs-signature; no request is sent.
+
+    `fresh=False` only re-renders a stored question to check its bytes: the
+    signed approval then decides (`_proof_live`), not this preparation bound.
+    """
     if type(expires_at) is not int or expires_at <= manifest['rollback_until']:
         raise ValueError('authority expiry must cover the rollback window')
+    if fresh:
+        signable(expires_at)
     scope = {'v': 1, 'operation': operation, 'host': manifest['host'],
              'manifest_digest': digest(manifest), 'manifest': manifest,
              'steps': list(STEPS), 'expires_at': expires_at}
@@ -83,7 +115,7 @@ class SignedDecisionAuthority:
         try:
             scope = json.loads(text[len(PREFIX):])
             expires = scope['expires_at']
-            if type(expires) is not int or text != question(operation, self.manifest, expires_at=expires):
+            if type(expires) is not int or text != question(operation, self.manifest, expires_at=expires, fresh=False):
                 return False
         except (KeyError, TypeError, ValueError):
             return False

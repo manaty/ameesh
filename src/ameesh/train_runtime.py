@@ -111,6 +111,9 @@ class Runtime:
     def save(self, state, expected, epoch):
         return self.ledger.save(state, expected, epoch)
 
+    def abandon(self, state, expected, epoch):
+        return self.ledger.abandon(state, expected, epoch)
+
     def target(self):
         return self.repository.target(self.target_branch)
 
@@ -203,6 +206,10 @@ class Runtime:
             self.ledger.before_publish(plan, epoch)
         self.repository.publish(plan, key=self.ledger.key, epoch=epoch,
                                 owner=self.ledger.owner, workflows=self.ci_adapter.workflows)
+
+    def published(self, plan):
+        """#6978 : la tête que nomme la référence distante du plan ("" : absente)."""
+        return self.repository.published(plan)
 
     def start_ci(self, plan):
         self.ci_adapter.start(plan)
