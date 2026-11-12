@@ -1450,7 +1450,10 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     `doubts` (#4679 B/P2) names unresolved correction receipts **without any
     lot attachment**: they prove nothing about this head, so they exclude
     nobody; the designation's `why` says them, so the freeze still reports
-    what could not be resolved.
+    what could not be resolved. #6934: a row with `reason: never-pushed` is a
+    receipt of this lot whose commit the forge refuses and whose actor pushed
+    nothing onto the lot's branch after the freeze (a local probe): said
+    apart, excluding nobody either.
 
     `advances` maps a family to its advance over the plan pace, in points
     (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
@@ -1566,20 +1569,26 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     # silence. Un acteur déjà correcteur de la tête n'est pas répété.
     excluded = {str((row or {}).get("name") or "").strip().casefold()
                 for row in fixers or () if isinstance(row, Mapping)}
-    reported = []
+    reported: dict[str, list] = {"": [], "never-pushed": []}
     for row in doubts or ():
         if not isinstance(row, Mapping):
             continue
         name = str(row.get("name") or "").strip()
         sha = str(row.get("sha") or "").strip()
+        reason = str(row.get("reason") or "").strip()
         if name and sha and name.casefold() not in excluded:
-            reported.append((name, sha))
-    if reported:
-        unique = sorted(set(reported))
+            reported.setdefault(reason, []).append((name, sha))
+    #: #6934 : un commit local jamais poussé (refusé par la forge, aucune
+    #: poussée de l'acteur sur la branche du lot) est une sonde, dite à part.
+    for reason, label in (("", "without a lot attachment"),
+                          ("never-pushed", "never pushed (local probe)")):
+        unique = sorted(set(reported.get(reason) or ()))
+        if not unique:
+            continue
         selection = dict(selection)
-        note = ("%d unresolved correction receipt(s) without a lot attachment"
-                " ignored, no exclusion: %s%s"
-                % (len(unique),
+        note = ("%d unresolved correction receipt(s) %s ignored, no exclusion:"
+                " %s%s"
+                % (len(unique), label,
                    ", ".join("%s %s" % (name, sha[:12]) for name, sha in unique[:4]),
                    ", …" if len(unique) > 4 else ""))
         selection["why"] = ("%s; %s" % (selection["why"], note)

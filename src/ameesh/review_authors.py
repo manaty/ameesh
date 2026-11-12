@@ -4150,6 +4150,62 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
         return None
 
 
+def _forge_serves(repo: str, sha: str, *, timeout: Optional[float] = None):
+    """La forge du clone sert-elle le commit exact `sha` ? (#6934, B/P2 cx2)
+
+    `_forge_fetch` conclut sur l'objet **local** : un commit de sonde resté
+    dans le clone de lecture y paraît servi. Ici la question va à la forge
+    seule, depuis un dépôt vide temporaire (`--filter=blob:none --depth=1`,
+    jamais sur le clone partagé) qui reprend la configuration d'accès du
+    clone (`credential.*`, `http.*`, `url.*`). Rend `True` (servi), `False`
+    (refus **explicite** de l'objet : jamais publié, ou plus servi) ou `None`
+    (pas de forge, échéance, panne : un doute qui garde l'exclusion)."""
+    text = plan_git.full_commit_id(sha)
+    if not text:
+        return None
+    bound = plan_git.FETCH_TIMEOUT if timeout is None else min(
+        float(timeout), plan_git.FETCH_TIMEOUT)
+    sweep = active_sweep()
+    if sweep is not None:
+        sweep.check("forge serves")
+        bound = min(bound, sweep.deadline.remaining())
+    if bound <= 0:
+        return None
+    try:
+        forge = plan_git.forge_remote(repo)
+        if forge is None:
+            return None
+        url = (plan_git._out(repo, "remote", "get-url", forge)
+               if forge == "origin" else forge)
+        url = str(url or "").strip()
+        if not url:
+            return None
+        if ("://" not in url and not os.path.isabs(url)
+                and not re.match(r"^[^/]+:", url)):
+            # un chemin local relatif se lit depuis le clone, pas le scratch
+            url = os.path.normpath(os.path.join(repo, url))
+        access = plan_git._out(repo, "config", "--local", "--get-regexp",
+                               r"^(credential|http|url)\.") or ""
+        options: list[str] = []
+        for line in str(access).splitlines():
+            name, _sep, value = line.partition(" ")
+            if name:
+                options.extend(("-c", "%s=%s" % (name, value)))
+        with tempfile.TemporaryDirectory(prefix="ameesh-forge-serves-") as scratch:
+            init = plan_git._git(scratch, "init", "--quiet", timeout=bound)
+            if init.returncode != 0:
+                return None
+            proc = plan_git._git(
+                scratch, *options, "fetch", "--quiet", "--no-tags",
+                "--no-write-fetch-head", "--filter=blob:none", "--depth=1",
+                "--", url, text, timeout=bound)
+    except Exception:  # noqa: BLE001 - forge injoignable ou coupée : doute
+        return None
+    if proc.returncode == 0:
+        return True
+    return False if _fetch_refused(proc.stderr) else None
+
+
 #: stderr d'un `git fetch` qui refuse **explicitement** l'objet demandé (#4457)
 _FETCH_REFUSAL_MARKERS = (
     "not our ref",
@@ -4231,6 +4287,13 @@ def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list
                 fetched.append(sha)
         except Exception:  # noqa: BLE001 - forge injoignable : absence
             continue
+    # #6934 : la lecture du gel (`fetch=False`) ne sait dire « jamais poussé »
+    # que par le refus mémorisé (`fetch_cache`) et les têtes locales : le même
+    # balayage des correctifs retirés, ici avec la forge, les prépare.
+    try:
+        _rewritten_after_freeze(db, item, None, repo, head=current, fetch=True)
+    except Exception:  # noqa: BLE001 - au mieux : la lecture du gel doute
+        pass
     return fetched
 
 
@@ -5003,6 +5066,16 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     pas son acteur, et `unattached` reçoit sa trace pour que le gel le dise
     (#4679 B/P2 auditeur : sept exclusions sans fondement en 48 h).
 
+    #6934 : un reçu rattaché au lot dont la forge **refuse net** l'objet et
+    dont l'acteur n'a rien poussé sur la branche du lot après ce gel
+    (`pushed_by` : têtes relevées, gels postérieurs) est une sonde locale
+    jamais poussée (cas réel nexlink #6912) : il n'exclut pas son acteur et
+    `unattached` le dit avec `reason: never-pushed`. Une forge muette ou une
+    poussée lisible garde le doute de #4679. B/P2 cx2 : la même règle vaut
+    pour une sonde restée **lisible** dans le clone (`published` : poussée
+    tracée, ou forge interrogée seule par `_forge_serves`) ; un correctif
+    publié puis réécrit reste exclu (#4457).
+
     #5197 : la note de relecture d'une branche `review/<relecteur>-<lot>` ne
     corrige pas cette tête : un commit de cette branche du relecteur
     (`_on_own_review_branch`) qui ne touche que des fichiers absents de la
@@ -5155,6 +5228,111 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     #: comme un correctif, mais un correctif de ce lot garde la trace la plus forte.
     stacked: dict[str, dict] = {}
 
+    pushes: dict[tuple[str, int], bool] = {}
+
+    def pushed_by(key: str, freeze_id: int, freeze_sha: str) -> bool:
+        """L'acteur a-t-il poussé un commit sur la branche du lot après ce gel ?
+
+        #6934 : un reçu dont la forge refuse l'objet nomme soit le commit local
+        d'un correctif rebasé avant son push (#4679, le commit poussé n'a pas
+        de reçu), soit une sonde jamais poussée. La différence est une poussée
+        : une tête vue de la branche du lot (relevé, `branch_heads`) ou un gel
+        postérieur qui descend de ce gel et dont la plage porte un commit de
+        committer `key`. B/P2 mty-amh-impl-06 : une tête **relevée** n'a pas à
+        descendre du gel (une correction poussée puis rebasée sur une base
+        neuve) ; son journal hors du gel (`tip --not gel`) est lu, et un commit
+        de `key` daté du gel ou après suffit. Les gels postérieurs gardent la
+        descendance. Une tête illisible ou une lecture impossible dit
+        « poussé » : le doute garde l'exclusion."""
+        slot = (key, int(freeze_id))
+        if slot in pushes:
+            return pushes[slot]
+        observed: list[str] = []
+        try:
+            work_store = storage.of(db).work
+            observed.append(str(item.get("branch_head") or ""))
+            observed.extend(str(row.get("sha") or "")
+                            for row in work_store.branch_heads([lot]) or ())
+        except Exception:  # noqa: BLE001 - relevé illisible : doute
+            pushes[slot] = True
+            return True
+        since = 0.0
+        later: list[str] = []
+        for row in freezes:
+            if int(row.get("id") or 0) == int(freeze_id):
+                since = float(row.get("at_ts") or 0.0)
+            elif int(row.get("id") or 0) > int(freeze_id):
+                later.append(str(row.get("sha") or ""))
+        tips = [(value, True) for value in observed] + [
+            (value, False) for value in later]
+        found = False
+        seen: set[str] = set()
+        for raw_tip, is_observed in tips:
+            tip = raw_tip.strip().lower()
+            if not tip or tip in seen or plan_git.same_commit(tip, freeze_sha):
+                continue
+            seen.add(tip)
+            check()
+            try:
+                readable = (_forge_fetch(repo, tip, timeout=remaining())
+                            if fetch else bool(_read_local_commit(repo, tip)))
+            except Exception:  # noqa: BLE001 - tête illisible : doute
+                readable = False
+            if readable is not True:
+                found = True            # tête poussée illisible : doute
+                break
+            if is_observed:
+                text = _read_out(repo, "log", "--format=%ce%x1f%ct", tip,
+                                 "--not", freeze_sha)
+            elif _is_ancestor(repo, freeze_sha, tip) is not True:
+                continue
+            else:
+                text = _read_out(repo, "log", "--format=%ce%x1f%ct",
+                                 "%s..%s" % (freeze_sha, tip))
+            if text is None:
+                found = True
+                break
+            for line in text.splitlines():
+                email, _sep, raw = line.partition("\x1f")
+                try:
+                    stamp = float(raw.strip())
+                except ValueError:
+                    stamp = 0.0
+                if is_observed and stamp and since and stamp < since:
+                    continue            # commit d'avant ce gel : pas une poussée
+                name = _agent_of_email(db, email.strip().lower(), stamp)
+                if name and name.casefold() == key:
+                    found = True
+                    break
+            if found:
+                break
+        pushes[slot] = found
+        return found
+
+    def published(key: str, freeze_id: int, freeze_sha: str, full: str) -> bool:
+        """Le commit lisible `full` a-t-il été publié ? (#6934, B/P2 cx2)
+
+        Une poussée de l'acteur sur la branche du lot (`pushed_by`) ou une
+        forge qui sert l'objet le disent publié. Seul un refus **net** de la
+        forge, sans poussée tracée, dit « jamais publié » ; le refus se
+        mémorise (`fetch_cache`, même sens : la forge ne sert pas ce commit)
+        pour la lecture du gel (`fetch=False`), qui ne lit que lui. Un doute
+        dit « publié » : l'exclusion demeure."""
+        if pushed_by(key, freeze_id, freeze_sha):
+            return True
+        if not fetch:
+            return not fetch_cache.refused(repo, full, state_dir=state_dir)
+        # Avec la forge, le cache (6 h) n'est pas une preuve : elle répond.
+        check()
+        served = _forge_serves(repo, full, timeout=remaining())
+        check()
+        if served is False:
+            fetch_cache.note(repo, full, state_dir=state_dir)
+            return False
+        if served is True:
+            fetch_cache.forget(repo, full, state_dir=state_dir)
+        return True
+
     def finish(result: dict) -> dict:
         """Ajoute la trace des reçus sans lot au retour (#4679 B/P2)."""
         if unattached is not None:
@@ -5203,8 +5381,12 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                         full = None
                 else:
                     full = present.get(sha)
-                if not full and not fetch_cache.refused(
-                        repo, sha, state_dir=state_dir):
+                #: #6934 : la forge a refusé net l'objet (maintenant ou dans le
+                #: cache) : il n'a jamais été poussé, ou plus servi.
+                never_pushed = False
+                if not full and fetch_cache.refused(repo, sha, state_dir=state_dir):
+                    never_pushed = True
+                elif not full:
                     refused = False
                     if recover is not None:
                         check()
@@ -5234,6 +5416,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     check()
                     if refused and not full:
                         fetch_cache.note(repo, sha, state_dir=state_dir)
+                        never_pushed = True
                 if not full:
                     # #4679 : le reçu peut nommer le commit **local** d'avant
                     # un rebase/amend, jamais poussé : aucun clone ne le
@@ -5244,6 +5427,17 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     # rattachement ne prouve rien (B/P2 auditeur) — il est dit
                     # au gel, jamais exclu.
                     related = receipt_lot(receipt)
+                    if (related == lot and never_pushed
+                            and not pushed_by(key, freeze_id, freeze_sha)):
+                        # #6934 : un commit que la forge refuse et dont aucune
+                        # tête vue de la branche du lot ne porte de commit de
+                        # l'acteur après ce gel est une sonde locale, pas une
+                        # correction : il est dit au gel, sans exclure.
+                        if unattached is not None:
+                            ignored.setdefault((key, sha), {
+                                "name": actor, "sha": sha, "freeze": freeze_id,
+                                "reason": "never-pushed"})
+                        continue
                     if related == lot:
                         doubt.setdefault(key, {
                             "name": actor, "family": "", "families": [],
@@ -5264,6 +5458,16 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     # #5197 : une note de relecture — sur la branche review/*
                     # du relecteur et hors du contenu du lot —, pas un
                     # correctif réécrit
+                    continue
+                check()
+                if not published(key, freeze_id, freeze_sha, full):
+                    # #6934 (B/P2 cx2) : une sonde restée lisible dans le
+                    # clone, que la forge ne sert pas et sans poussée de
+                    # l'acteur sur la branche du lot : pas une correction.
+                    if unattached is not None:
+                        ignored.setdefault((key, full), {
+                            "name": actor, "sha": full, "freeze": freeze_id,
+                            "reason": "never-pushed"})
                     continue
                 check()
                 other_lot = stacked_lot(receipt, full)
