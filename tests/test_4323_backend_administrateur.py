@@ -331,15 +331,23 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
         self.assertTrue(self.backend.plan(self.operation,view['id'],authority=self.signed(view=view))['authorized'])
 
     def test_7013_execution_still_refuses_an_uncovered_window(self):
-        # No change to `_proof_live`: a window prepared around the guard is
-        # still refused when the fresh signature dies before it ends.
-        text=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+2*3600)
+        # A legacy question rendered past the bound no longer revalidates.
+        with mock.patch.object(bootstrap.signed,'signable',return_value=''):
+            text=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+2*3600)
         self.stage_bundle(self.bundle,text)
         view=self.ask(text,bootstrap.OPTIONS)
         self.sign(view,ttl=decisions.SIGN_TTL_S)
         self.assertFalse(self.backend.plan(self.operation,view['id'],authority=self.signed(view=view))['authorized'])
-        self.assertFalse(self.signed(view=view).validate(self.operation,
-            bootstrap.scopes(self.operation,self.bundle)['preflight'],'preflight'))
+        # Its stored bytes still check out: its rollback stays preparable.
+        self.assertEqual(self.backend.prepared(self.operation).question,text)
+        self.assertIn('runs before',self.backend.revoke_question(self.operation,int(self.now)+600)['deadline'])
+        # No change to `_proof_live`: an approval dying before a coverable
+        # window ends is still refused at execution.
+        text=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+50*60)
+        self.stage_bundle(self.bundle,text)
+        view=self.ask(text,bootstrap.OPTIONS)
+        self.sign(view,ttl=30*60)
+        self.assertFalse(self.backend.plan(self.operation,view['id'],authority=self.signed(view=view))['authorized'])
 
     def test_bureau_mention_installs_then_revokes_through_the_backend(self):
         # #4788: the canonical signer keeps its fixed mention; the backend must

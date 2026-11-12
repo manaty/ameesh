@@ -39,6 +39,14 @@ class BootstrapError(ValueError):
     pass
 
 
+def deadline(expires_at,error=BootstrapError):
+    """Refuse a window no fresh owner signature covers (#7013); its deadline."""
+    try:
+        return signed.signable(expires_at)
+    except ValueError as exc:
+        raise error(str(exc)) from None
+
+
 def scopes(operation,bundle):
     if not isinstance(operation,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}',operation):
         raise BootstrapError('bootstrap operation required')
@@ -55,9 +63,11 @@ def scopes(operation,bundle):
     return result
 
 
-def question(operation,bundle, *, expires_at):
+def question(operation,bundle, *, expires_at, fresh=True):
+    """`fresh=False` only re-renders a stored question to check its bytes."""
     if type(expires_at) is not int or expires_at<=0:
         raise BootstrapError('signed bootstrap deadline required')
+    if fresh: deadline(expires_at)
     # decide caps questions at 4000 characters. The complete immutable review
     # inventory is bound by its digest, not expanded into this signed question.
     # The administrator must publish that exact inventory beside the request.
@@ -80,9 +90,10 @@ def question(operation,bundle, *, expires_at):
     return PREFIX+json.dumps(value,sort_keys=True,separators=(',',':'))
 
 
-def revoke_question(operation,bundle, *, expires_at):
+def revoke_question(operation,bundle, *, expires_at, fresh=True):
     if type(expires_at) is not int or expires_at<=0:
         raise BootstrapError('signed revoke deadline required')
+    if fresh: deadline(expires_at)
     value=dict(version=1,operation=operation,host=bundle['host'],machine_id=bundle['machine_id'],
         bundle_digest=bundle['digest'],revoke_digest=protocol.identity(bundle['revoke']),
         file_sha256={path:info['sha256'] for path,info in bundle['files'].items()},

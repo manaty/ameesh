@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import time
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -110,7 +111,7 @@ class OperatorEntryTest(unittest.TestCase):
     def prepare(self,**changes):
         arguments=dict(operation=self.operation,plan=self.plan,account_ids=self.accounts,
                        trees=self.trees,observed=self.observed,probe_turn=self.turn,
-                       expires_at=2000000000,db=self.registry)
+                       expires_at=int(time.time())+600,db=self.registry)
         arguments.update(changes)
         return entry.prepare(**arguments)
 

@@ -74,23 +74,23 @@ def _text(prefix,value):
 
 def signable(expires_at):
     """Refuse a window no fresh owner signature covers (#7013); its deadline."""
-    try:
-        return bootstrap.signed.signable(expires_at)
-    except ValueError as error:
-        raise ReplacementError(str(error)) from None
+    return bootstrap.deadline(expires_at,ReplacementError)
 
 
-def question(operation,bundle, *, expires_at):
+def question(operation,bundle, *, expires_at, fresh=True):
+    """`fresh=False` only re-renders a stored question to check its bytes."""
     if type(expires_at) is not int or expires_at<=0:
         raise ReplacementError('signed replacement deadline required')
+    if fresh: signable(expires_at)
     value={key:item for key,item in bundle.items() if key!='seal'}
     return _text(PREFIX,dict(value,scopes={step:scope for step,scope in scopes(operation,bundle).items()
                                            if step in STEPS},expires_at=expires_at))
 
 
-def rollback_question(operation,bundle, *, expires_at):
+def rollback_question(operation,bundle, *, expires_at, fresh=True):
     if type(expires_at) is not int or expires_at<=0:
         raise ReplacementError('signed rollback deadline required')
+    if fresh: signable(expires_at)
     return _text(ROLLBACK_PREFIX,dict(version=1,operation=operation,host=bundle['host'],
         machine_id=bundle['machine_id'],bundle_digest=bundle['digest'],previous=bundle['previous'],
         next=bundle['next'],retained=bundle['retained'],scope=scopes(operation,bundle)['rollback'],
@@ -243,7 +243,8 @@ class Replacement:
             bundle=json.loads(self.backend.private(self.bundle_path,1<<24))
             text=self.backend.private(self.question_path,bootstrap.signed.decisions.MAX_QUESTION).decode()
             expires=json.loads(text[len(PREFIX):])['expires_at']
-            exact=text==question(self.operation,bundle,expires_at=expires)
+            # Integrity only: a stored window stays readable (rollback, #7013).
+            exact=text==question(self.operation,bundle,expires_at=expires,fresh=False)
         except (OSError,KeyError,TypeError,ValueError):
             raise ReplacementError('prepared replacement unavailable') from None
         if not exact or bundle['host']!=self.backend.enrollment['host'] or bundle['machine_id']!=self.backend.machine():

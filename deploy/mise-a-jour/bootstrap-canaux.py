@@ -56,9 +56,10 @@ def scopes(operation,bundle):
     return result
 
 
-def question(operation,bundle, *, expires_at):
+def question(operation,bundle, *, expires_at, fresh=True):
     if type(expires_at) is not int or expires_at<=0:
         raise BootstrapError('signed bootstrap deadline required')
+    if fresh: release.deadline(expires_at)
     # The complete immutable review inventory is bound by its digest; the
     # administrator publishes it beside the request (4000-character cap).
     # Account numeric ids stay readable; their fixed fields are digest-bound.
@@ -81,9 +82,10 @@ def question(operation,bundle, *, expires_at):
     return PREFIX+json.dumps(value,sort_keys=True,separators=(',',':'))
 
 
-def revoke_question(operation,bundle, *, expires_at):
+def revoke_question(operation,bundle, *, expires_at, fresh=True):
     if type(expires_at) is not int or expires_at<=0:
         raise BootstrapError('signed revoke deadline required')
+    if fresh: release.deadline(expires_at)
     value=dict(version=1,kind=delegation.KIND,operation=operation,host=bundle['host'],
         machine_id=bundle['machine_id'],bundle_digest=bundle['digest'],
         revoke_digest=protocol.identity(bundle['revoke']),

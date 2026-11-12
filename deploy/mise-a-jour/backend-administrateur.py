@@ -97,10 +97,7 @@ files_mod=installer.file_mod
 
 def signable(expires_at):
     """Refuse a window no fresh owner signature covers (#7013); its deadline."""
-    try:
-        return bootstrap.signed.signable(expires_at)
-    except ValueError as error:
-        raise BackendError(str(error)) from None
+    return bootstrap.deadline(expires_at,BackendError)
 
 
 STAGE='/var/lib/ameesh-release-bootstrap'
@@ -401,7 +398,7 @@ class Backend:
         try:
             expires=json.loads(question[len(kind.prefix):])['expires_at']
             exact=(question.startswith(kind.prefix)
-                   and question==kind.question(operation,bundle,expires_at=expires))
+                   and question==kind.question(operation,bundle,expires_at=expires,fresh=False))
         except (KeyError,TypeError,ValueError,*kind.errors):
             exact=False
         if not exact:

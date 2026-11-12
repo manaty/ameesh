@@ -286,6 +286,10 @@ class ReplacementTest(Harness):
         with self.assertRaisesRegex(swap.ReplacementError, 'at most'):
             self.item.rollback_text(int(self.now)+2*86400)
         self.assertIn('runs before', self.item.rollback_text(int(self.now)+600)['deadline'])
+        bundle, _ = self.item.prepared()
+        for render in (swap.question, swap.rollback_question):
+            with self.subTest(render=render.__name__), self.assertRaisesRegex(swap.ReplacementError, 'at most'):
+                render('swap-1', bundle, expires_at=int(self.now)+2*86400)
 
     def test_bundle_binds_the_code_that_runs_it_and_only_the_staged_code_may_run(self):
         self.assertEqual(self.item.prepare()['bundle_digest'], json.loads(self.item.bundle_path.read_bytes())['digest'])

@@ -9,8 +9,9 @@ The signature must cover the whole declared window (`expires_at`): a release
 fence is never committed under an authority that would die before the window
 it approved, recovery included. The one-hour `decide <id> <answer> --key`
 signature (SIGN_TTL_S) therefore only covers a window ending within the hour:
-`signable()` refuses any other window when the question is prepared (#7013),
-before an owner signature is spent on it. After the window, resuming the same
+every question builder refuses any other window through `signable()` (#7013),
+before an owner signature is spent on it; a legacy question rendered past
+that bound no longer revalidates. After the window, resuming the same
 manifest needs a fresh signed decision.
 """
 import hashlib
@@ -59,6 +60,7 @@ def question(operation, manifest, *, expires_at):
     """Prepared question for decide ask --needs-signature; no request is sent."""
     if type(expires_at) is not int or expires_at <= manifest['rollback_until']:
         raise ValueError('authority expiry must cover the rollback window')
+    signable(expires_at)
     scope = {'v': 1, 'operation': operation, 'host': manifest['host'],
              'manifest_digest': digest(manifest), 'manifest': manifest,
              'steps': list(STEPS), 'expires_at': expires_at}

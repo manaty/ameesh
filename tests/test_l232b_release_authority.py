@@ -29,6 +29,13 @@ class SignableWindowTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'at most %d ' % latest):
                 release.signable(value, now=now)
 
+    def test_every_builder_refuses_a_window_no_fresh_signature_covers(self):
+        manifest = {'host': 'fixture-host', 'rollback_until': int(time.time())}
+        far, near = int(time.time()) + 2*86400, int(time.time()) + 50*60
+        with self.assertRaisesRegex(ValueError, 'at most'):
+            release.question('op', manifest, expires_at=far)
+        self.assertIn('"expires_at":%d' % near, release.question('op', manifest, expires_at=near))
+
 
 class ReleaseAuthorityTest(PgTestCase):
     @classmethod

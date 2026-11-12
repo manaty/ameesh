@@ -100,7 +100,11 @@ class BootstrapTest(unittest.TestCase):
         with self.assertRaisesRegex(bootstrap.BootstrapError,'another unresolved'): self.run_bootstrap(review=changed)
 
     def test_question_and_scopes_bind_numeric_ids_and_exact_destinations(self):
-        text=bootstrap.question('bootstrap-fixture',self.bundle,expires_at=2000000000)
+        text=bootstrap.question('bootstrap-fixture',self.bundle,expires_at=int(time.time())+600)
+        # #7013: a window no fresh owner signature covers is never rendered.
+        for render in (bootstrap.question,bootstrap.revoke_question):
+            with self.subTest(render=render.__name__),self.assertRaisesRegex(bootstrap.BootstrapError,'at most'):
+                render('bootstrap-fixture',self.bundle,expires_at=int(time.time())+2*86400)
         self.assertLessEqual(len(text),decisions.MAX_QUESTION)
         scopes=bootstrap.scopes('bootstrap-fixture',self.bundle)
         self.assertIn('"uid":987',text)

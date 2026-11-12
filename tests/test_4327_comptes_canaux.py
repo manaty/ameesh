@@ -135,11 +135,15 @@ class RendererTest(unittest.TestCase):
                 delegation.question(altered)
         prior={path:dict(sha256='e'*64,mode=0o644) for path in bundle['files']}
         full=delegation.render(plan(),account_ids=IDS,previous_files=prior)
-        text=channels.question('c'*80,full,expires_at=2000000000)
+        text=channels.question('c'*80,full,expires_at=int(time.time())+600)
         self.assertLessEqual(len(text.encode()),channels.MAX_QUESTION)
         self.assertIn('"handoff":"ameesh-handoff 981:981"',text)
-        self.assertLessEqual(len(channels.revoke_question('x',full,expires_at=2000000000).encode()),
+        self.assertLessEqual(len(channels.revoke_question('x',full,expires_at=int(time.time())+600).encode()),
                              channels.MAX_QUESTION)
+        # #7013: a window no fresh owner signature covers is never rendered.
+        for render in (channels.question,channels.revoke_question):
+            with self.subTest(render=render.__name__),self.assertRaisesRegex(channels.BootstrapError,'at most'):
+                render('x',full,expires_at=int(time.time())+2*86400)
 
     def test_scopes_are_distinct_from_the_release_bootstrap(self):
         bundle=delegation.render(plan(),account_ids=IDS)
@@ -292,7 +296,7 @@ class BackendChannelTest(Fixture,unittest.TestCase):
             with self.subTest(extra=extra),self.assertRaisesRegex(backend_mod.BackendError,'exact staged plan'):
                 self.backend.inventory(self.operation)
         self.stage_plan(); (self.stage/'plan.json').write_text(json.dumps(dict(
-            delegation='autre',plan=self.plan,account_ids=IDS,expires_at=2000000000)))
+            delegation='autre',plan=self.plan,account_ids=IDS,expires_at=int(time.time())+600)))
         with self.assertRaisesRegex(backend_mod.BackendError,'exact staged plan'):
             self.backend.inventory(self.operation)
 

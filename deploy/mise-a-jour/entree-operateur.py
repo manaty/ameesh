@@ -197,6 +197,8 @@ def prepare(*, operation, plan, account_ids, trees, observed, probe_turn=None, e
         raise OperatorError('bootstrap operation required')
     if type(expires_at) is not int or expires_at<=0:
         raise OperatorError('signed bootstrap deadline required')
+    # #7013: refused before any measure, with the largest accepted value.
+    bootstrap.deadline(expires_at,OperatorError)
     if not isinstance(trees,dict) or set(trees)!=set(TREES):
         raise OperatorError('exact staged trees required')
     turn=None; enrollment=None
