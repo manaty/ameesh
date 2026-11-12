@@ -47,6 +47,7 @@ from .prevalidation import PrevalidationReports
 from .progress import Progress
 from .projects import Projects
 from .provenance import Provenance
+from .attach_grants import AttachGrants
 from .roadmap import Roadmap
 from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
@@ -96,6 +97,7 @@ class PostgresStorage(interface.Storage):
         self.work_dependencies = WorkDependencies(db)
         self.work_footprints = WorkFootprints(db)
         self.provenance = Provenance(db)
+        self.attach_grants = AttachGrants(db)
         self.migration_reservations = MigrationReservations(db)
         self.lot_sessions = LotSessions(db)
         self.packages = WorkPackages(db)

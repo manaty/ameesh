@@ -94,6 +94,17 @@ The API remains authenticated by the token and refuses any browser
 Changing `approve_url` does **not** change trust: only the RP ID and origins
 determine it (§5).
 
+The **attach grant** (`POST /attach-requests`, page `/attach/<token>`, receipt
+by `GET /receipts/<id>`; #7119) uses the team service token: the human signs a
+5-minute grant bound to an agent, its host, the tenant and the device key of
+their station (an active `device-es256` authenticator of the same human,
+declared in the canon). A request for a device that is not theirs is refused
+at creation (`409 device_not_enrolled`). The grant is consumed only by the
+agent's host (`attach_grant.redeem`), which also requires the station to sign
+with that device key; whoever holds the service token cannot use a grant
+without the device. `ameesh attach-grant who|request|audit` reads who may
+attach, asks for a grant, and reads the journal of grants and refusals.
+
 The **login API** (`POST /login-requests`, `GET /login-receipts/<id>`, L232d)
 is a separate switch: **closed by default** (`403 login_api_closed`) and, once
 opened in the JSON, served only to the holder of the DEDICATED token

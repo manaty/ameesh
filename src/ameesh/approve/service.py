@@ -26,6 +26,13 @@
   authentificateurs de CE canon — une passkey enregistrée par un autre canon
   ne vaut jamais pour elle. Un défi de connexion, lui, n'a pas de canon
   d'action : il utilise le canon par défaut.
+* `create_attach_request` / `attach_view` / `attach_submit` (#7119, avatar
+  D1) : GRANT D'ATTACH distant. La demande (attach_grant.build_request) lie
+  l'agent, son hôte, le tenant et la clé d'appareil du poste — un
+  authentificateur `device-es256` actif de l'approbateur, vérifié dès la
+  création ; elle vit 5 min. Le reçu se récupère par `GET /receipts/<id>` ;
+  il n'est consommé que par l'hôte de l'agent (attach_grant.redeem), avec la
+  preuve de l'appareil. Une demande d'attach n'est jamais servie par `/a/`.
 * `create_enroll_link` / `enroll_view` / `enroll_submit` : cérémonie de
   création de passkey → fichier de PROPOSITION de canon ; jamais d'écriture
   dans `authenticators`.
@@ -43,7 +50,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from .. import jcs, receipts, server_faults
+from .. import attach_grant, jcs, receipts, server_faults
 from ..db import DbError
 from . import duplicate, enroll, render
 from . import config as config_mod
@@ -64,6 +71,11 @@ REQUEST_OPTIONAL = ("assume_duplicate",)
 _ASSERTION_FIELDS = frozenset({"decision", "credential_id", "authenticatorData",
                                "clientDataJSON", "signature"})
 _ASSERTION_OPTIONAL = frozenset({"userHandle"})
+#: #7119 (D1) : demande de grant d'attach ; `canon` ('' = canon par défaut) est
+#: celui de l'agent, qui déclare les authentificateurs admis
+ATTACH_REQUEST_FIELDS = ("agent", "host", "tenant", "device_key", "approver",
+                         "requested_by")
+ATTACH_REQUEST_OPTIONAL = ("canon",)
 _ENROLL_FIELDS = frozenset({"credential_id", "clientDataJSON", "attestationObject"})
 _ENROLL_OPTIONAL = frozenset({"transports"})
 
@@ -179,10 +191,11 @@ class ApproveService:
     def subject_of(self, kind: str, token: str | None) -> str | None:
         """L'humain d'un lien (pour compter les humains touchés par une
         panne) ; `server_faults.HUMAN` s'il ne se lit pas ; None hors liens."""
-        if kind not in ("approve", "login", "enroll"):
+        if kind not in ("approve", "attach", "login", "enroll"):
             return None
         try:
             record = {"approve": self.store.request_by_token,
+                      "attach": self.store.request_by_token,
                       "login": self.store.login_by_token,
                       "enroll": self.store.enroll_by_token}[kind](token)
             approver = (record.get("approver") or (record.get("request") or {}).get("approver")
@@ -379,9 +392,11 @@ class ApproveService:
     # ------------------------------------------------------------------
     # GET /a/<jeton>
     # ------------------------------------------------------------------
-    def _live_record(self, token: str) -> dict:
+    def _live_record(self, token: str, kind: str = "action") -> dict:
         record = self.store.request_by_token(token)
-        if record is None:
+        # #7119 : un lien ne sert que sa nature (une demande d'attach n'est
+        # jamais une approbation d'action, et réciproquement)
+        if record is None or record.get("kind", "action") != kind:
             raise ApproveError(404, "unknown_link", "unknown link")
         if self.store.has_receipt(record["request_id"]):
             raise ApproveError(410, "used", "this link has already been used")
@@ -486,6 +501,138 @@ class ApproveService:
         log.info("request %s: receipt %s%s signed by %s", record["request_id"], decision,
                  " (duplicate assumed)" if record.get("assume_duplicate") is True
                  and decision == "approve" else "", verdict.approver)
+        return {"request_id": record["request_id"], "decision": decision}
+
+    # ------------------------------------------------------------------
+    # grants d'attach (#7119, avatar D1)
+    # ------------------------------------------------------------------
+    def create_attach_request(self, body) -> dict:
+        if not isinstance(body, dict):
+            raise ApproveError(400, "format", "JSON object expected")
+        missing = [name for name in ATTACH_REQUEST_FIELDS if name not in body]
+        if missing:
+            raise ApproveError(400, "format", "missing fields: %s" % ", ".join(missing))
+        ignored = sorted(set(body) - set(ATTACH_REQUEST_FIELDS) - set(ATTACH_REQUEST_OPTIONAL))
+        if ignored:
+            log.info("attach request: ignored fields %s", ", ".join(
+                re.sub(r"[^A-Za-z0-9_-]", "?", name)[:32] for name in ignored[:10]))
+        approver, device_key = body["approver"], body["device_key"]
+        if not isinstance(approver, str) or not _HUMAN_RE.fullmatch(approver):
+            raise ApproveError(400, "format", "approver: \"human:<id>\" expected")
+        if not isinstance(body["requested_by"], str) or not _MEMBER_RE.fullmatch(
+                body["requested_by"]):
+            raise ApproveError(400, "format", "requested_by: \"agent:<id>\" or \"human:<id>\"")
+        canon = body.get("canon", "")
+        if not isinstance(canon, str) or canon != canon.strip() or len(canon) > 200:
+            raise ApproveError(400, "format", "canon: canon identifier expected ('' = default)")
+        try:
+            request, summary = attach_grant.build_request(
+                approver=approver, agent=body["agent"], host=body["host"],
+                tenant=body["tenant"], device_key=device_key,
+                requested_by=body["requested_by"], now=self.clock())
+        except (receipts.ReceiptError, TypeError) as exc:
+            raise ApproveError(400, "format", str(exc)) from exc
+        if not self._credentials(approver, canon):
+            raise ApproveError(409, "no_authenticator",
+                               "%s has no active WebAuthn authenticator at level %s in the %s"
+                               % (approver, self.cfg.level, receipts.canon_label(canon)))
+        with self.db_lock:
+            try:
+                row, _code, reason = receipts.active_authenticator(
+                    self.db, approver, "device-es256", device_key, canon)
+            except DbError as exc:
+                raise ApproveError(503, "registry", "trust registry unreachable") from exc
+        if row is None:
+            raise ApproveError(409, attach_grant.DEVICE, "device %s: %s"
+                               % (device_key[:16], reason))
+        request_id = new_request_id()
+        token = new_token()
+        record = {
+            "request_id": request_id,
+            "kind": "attach",
+            "canon": canon,
+            "request": request,
+            "summary": summary,
+            "link_exp": request["exp"],     # le lien vit exactement le grant
+            "exp": request["exp"],
+            "created": int(self.clock()),
+        }
+        self.store.save_request(record, token)
+        self.store.prune(record["created"])
+        log.info("attach request %s: %s on %s, approver %s, device %s, requested by %s",
+                 request_id, request["agent"], request["host"], approver, device_key[:16],
+                 request["requested_by"])
+        return {
+            "request_id": request_id,
+            "link": self._link("attach", token),
+            "link_exp": record["link_exp"],
+            "exp": request["exp"],
+            "attach_id": request["attach_id"],
+            "agent": request["agent"],
+            "host": request["host"],
+            "tenant": request["tenant"],
+            "device_key": device_key,
+            "approver": approver,
+            "summary_digest": request["summary_digest"],
+        }
+
+    def attach_view(self, token: str) -> dict:
+        record = self._live_record(token, "attach")
+        request = record["request"]
+        credentials = self._credentials(request["approver"], record.get("canon") or "")
+        if not credentials:
+            raise ApproveError(409, "no_authenticator", "no active authenticator")
+        return {
+            "request_id": record["request_id"],
+            "request": request,
+            "summary": record["summary"],
+            "link_exp": record["link_exp"],
+            "rp_id": self.cfg.rp_id,
+            "level": self.cfg.level,
+            "credentials": credentials,
+            "challenge_approve": _b64u(receipts.challenge(dict(request, decision="approve"))),
+            "challenge_deny": _b64u(receipts.challenge(dict(request, decision="deny"))),
+        }
+
+    def attach_submit(self, token: str, body) -> dict:
+        decision = self._assertion(body, receipts.DECISIONS)
+        try:
+            return self._attach_submit(token, body, decision)
+        except ApproveError as exc:
+            # §16 (#3889) : même règle que `submit` (le même corps rend le reçu gardé)
+            if (exc.status, exc.code) != (410, "used"):
+                raise
+            record = self.store.request_by_token(token)
+            kept = (record and record.get("kind") == "attach"
+                    and self.store.receipt_bytes(record["request_id"]))
+            if kept and _same_receipt(
+                    kept, _receipt_of(dict(record["request"], decision=decision), body)):
+                return {"request_id": record["request_id"], "decision": decision,
+                        "replayed": True}
+            raise
+
+    def _attach_submit(self, token: str, body, decision: str) -> dict:
+        record = self._live_record(token, "attach")
+        request = dict(record["request"], decision=decision)
+        policy = dataclasses.replace(self.policy, canon=record.get("canon") or "",
+                                     max_ttl=attach_grant.GRANT_TTL)
+        receipt = _receipt_of(request, body)
+        expected = {name: request[name] for name in receipts.ATTACH_BINDING_FIELDS}
+        with self.db_lock:
+            try:
+                verdict = receipts.verify_receipt(
+                    self.db, receipt, policy, kind="attach", expected_attach=expected,
+                    expect_decision=decision, consume_by=None, now=self.clock())
+            except DbError as exc:
+                raise ApproveError(503, "registry", "trust registry unreachable") from exc
+        if not verdict.ok:
+            log.info("attach request %s: assertion refused [%s]", record["request_id"],
+                     verdict.code)
+            raise ApproveError(403, verdict.code, verdict.reason)
+        if not self.store.save_receipt_once(record["request_id"], receipt):
+            raise ApproveError(410, "used", "this link has already been used")
+        log.info("attach request %s: receipt %s signed by %s", record["request_id"],
+                 decision, verdict.approver)
         return {"request_id": record["request_id"], "decision": decision}
 
     # ------------------------------------------------------------------

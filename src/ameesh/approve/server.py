@@ -105,6 +105,9 @@ _TOKEN_PATH = r"([A-Za-z0-9_-]{43})"
 _ROUTES = (
     ("api", "POST", re.compile(r"^/requests$")),
     ("api", "GET", re.compile(r"^/receipts/(req_[0-9a-z]{26})$")),
+    # #7119 (D1) : demande de grant d'attach (jeton de service) ; le reçu se
+    # lit par /receipts/<id>
+    ("attach-api", "POST", re.compile(r"^/attach-requests$")),
     ("login-api", "POST", re.compile(r"^/login-requests$")),
     ("login-api", "POST", re.compile(r"^/login-close/(lgn_[0-9a-z]{26})$")),
     ("login-api", "GET", re.compile(r"^/login-receipts/(lgn_[0-9a-z]{26})$")),
@@ -113,14 +116,18 @@ _ROUTES = (
     ("fingerprints", "GET", re.compile(r"^/fingerprints$")),
     ("approve", "GET POST", re.compile(r"^/a/%s$" % _TOKEN_PATH)),
     ("login", "GET POST", re.compile(r"^/login/%s$" % _TOKEN_PATH)),
+    ("attach", "GET POST", re.compile(r"^/attach/%s$" % _TOKEN_PATH)),
     ("enroll", "GET POST", re.compile(r"^/enroll/%s$" % _TOKEN_PATH)),
     ("static", "GET", re.compile(r"^/static/([a-z]+\.(?:js|css))$")),
 )
 #: gabarit de route d'une empreinte de panne (jamais le chemin : il porte le jeton)
 _ROUTE_TEMPLATES = {"api": "/requests|/receipts/<id>", "login-api": "/login-*",
+                    "attach-api": "/attach-requests", "attach": "/attach/<token>",
                     "health": "/health", "approve": "/a/<token>", "login": "/login/<token>",
                     "enroll": "/enroll/<token>", "static": "/static/<file>",
                     "fingerprints": "/fingerprints"}
+#: routes de lien humain (pages HTML en GET)
+_LINK_KINDS = ("approve", "attach", "enroll", "login")
 _SINCE_RE = re.compile(r"^since=([0-9]{1,18})$")
 #: délai suggéré au client avant de renvoyer après une panne (secondes)
 RETRY_AFTER = 15
@@ -246,11 +253,11 @@ class ApproveHandler(BaseHTTPRequestHandler):
             # recharge seule ; la réponse JSON dit au client de renvoyer le
             # MÊME corps (`retry`), jamais de re-signer.
             extra = extra + (("Retry-After", str(RETRY_AFTER)),)
-            if kind in ("approve", "enroll", "login") and self.command == "GET":
+            if kind in _LINK_KINDS and self.command == "GET":
                 return self._html(exc.status, render.unavailable_page(RETRY_AFTER))
             return self._json(exc.status, {"error": exc.code, "message": exc.message,
                                            "retry": True}, extra)
-        if kind in ("approve", "enroll", "login") and self.command == "GET":
+        if kind in _LINK_KINDS and self.command == "GET":
             titles = {404: "Unknown link", 410: "Unusable link", 409: "Obsolete request",
                       429: "Too many requests"}
             if exc.code == "used" and kind == "enroll":   # gardée : pas un échec
@@ -320,7 +327,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
         if kind == "fingerprints":
             # lue par la passe de veille d'un autre hôte, en HTTPS (#3885)
             return host in self.server.local_hosts | self.server.public_hosts
-        if kind in ("api", "login-api", "health"):
+        if kind in ("api", "attach-api", "login-api", "health"):
             allowed = self.server.local_hosts
             if self.server.service.cfg.api_via_public:
                 allowed = allowed | self.server.public_hosts
@@ -409,7 +416,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
             # corps lu (borné) AVANT les contrôles d'autorisation : la réponse
             # d'erreur part sur une connexion propre
             body = self._read_body() if self.command == "POST" else b""
-            if kind in ("api", "login-api"):
+            if kind in ("api", "attach-api", "login-api"):
                 return self._api(kind, value, body)
             return self._human(kind, value, body)
         except ApproveError as exc:
@@ -460,6 +467,8 @@ class ApproveHandler(BaseHTTPRequestHandler):
                         reference, body.get("close_token")))
                 return self._json(201, service.create_login_request(load_json_body(raw)))
             status, payload = service.login_receipt(reference)
+        elif kind == "attach-api":
+            return self._json(201, service.create_attach_request(load_json_body(raw)))
         else:
             if self.command == "POST":
                 return self._json(201, service.create_request(load_json_body(raw)))
@@ -485,12 +494,16 @@ class ApproveHandler(BaseHTTPRequestHandler):
                 return self._json(200, service.submit(token, body))
             if kind == "login":
                 return self._json(200, service.login_submit(token, body))
+            if kind == "attach":
+                return self._json(200, service.attach_submit(token, body))
             return self._json(200, service.enroll_submit(
                 token, body, origin=self.headers.get("Origin")))
         if kind == "approve":
             return self._html(200, render.approval_page(service.link_view(token)))
         if kind == "login":
             return self._html(200, render.login_page(service.login_view(token)))
+        if kind == "attach":
+            return self._html(200, render.attach_page(service.attach_view(token)))
         return self._html(200, render.enroll_page(service.enroll_view(token)))
 
 
