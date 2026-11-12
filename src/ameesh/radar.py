@@ -59,6 +59,10 @@ Configuration de l'hôte (clé `radar`) :
 `migrations_width` (facultatif) : chiffres des numéros de migration
 (`014_x.sql` : 3) ; sinon celui d'un dépôt connu, sinon 4.
 
+`migrations_companions` (facultatif, #7000) : chemins qui portent le numéro
+d'une migration (`["supabase/rollback"]`) ; une renumérotation imposée par la
+réservation peut les renommer ou les retoucher du seul numéro.
+
 `github` (facultatif, sinon déduit de l'URL `origin`) : le dépôt où lire l'état
 de la CI des PR, pour savoir si un conflit bloque.
 """
@@ -79,7 +83,8 @@ from .canon import GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
-PROJECT_KEYS = ("repo", "migrations", "migrations_width", "target", "github", "land", "gates", "merge_method",
+PROJECT_KEYS = ("repo", "migrations", "migrations_width", "migrations_companions", "target",
+                "github", "land", "gates", "merge_method",
                 "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
                 "required_statuses", "required_checks", "production_branch")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
@@ -165,6 +170,11 @@ class Project:
     #: #4750 : chiffres des numéros de migration (`014_x.sql` : 3) ; 0 : celui
     #: d'un dépôt connu (`migrations.LAYOUTS`), sinon 4
     migrations_width: int = 0
+    #: #7000 : chemins (répertoires ou fichiers) qui suivent le numéro d'une
+    #: migration — rollback, registre : une renumérotation imposée par la
+    #: réservation peut les renommer ou les retoucher du seul numéro
+    #: (`verdict_carry`, adaptation sans second avis)
+    migrations_companions: tuple = ()
     target: str = ""
     github: str = ""
     #: L160e2: `off` (default), `local` or `pr`; the commands run on the merged
@@ -359,6 +369,18 @@ def parse_settings(raw) -> Settings:
         if isinstance(width, bool) or not isinstance(width, int) or not 0 <= width <= 9:
             raise SettingsError("%s.migrations_width: digits of a migration number (1-9) "
                                 "expected" % where)
+        companions = value.get("migrations_companions") or ()
+        if isinstance(companions, str):
+            companions = (companions,)
+        if not isinstance(companions, (list, tuple)) or not all(
+                isinstance(c, str) and c.strip().strip("/") for c in companions):
+            raise SettingsError("%s.migrations_companions: a list of relative paths expected"
+                                % where)
+        companions = tuple(c.strip().strip("/") for c in companions)
+        if any(c.startswith("~") or any(part in (".", "..") for part in c.split("/"))
+               for c in companions):
+            raise SettingsError("%s.migrations_companions: path must be relative to the "
+                                "repository" % where)
         if texts["target"]:
             plan_git.check_ref(texts["target"], "cible")
         if texts["production_branch"]:
@@ -518,6 +540,7 @@ def parse_settings(raw) -> Settings:
             raise SettingsError("%s.lease_ref: %s" % (where, exc)) from exc
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], migrations_width=width,
+                                 migrations_companions=companions,
                                  target=texts["target"],
                                  github=texts["github"], land=land,
                                  production_branch=texts["production_branch"],
@@ -1558,6 +1581,10 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     récent peut être actif sans aucun check visible dans le rollup. Sans
     preuve API fraîche, aucun remplacement et aucun vert d'intégration.
     `ci_green` reste un prédicat pur ; les lecteurs lui passent ce rollup.
+
+    #6960 : un run annulé dont tous les checks du portier ont conclu sans
+    échec est admis même sans check CANCELLED — l'annulation demandée par
+    `ameesh ci run` (#2876) peut être traitée après la fin des jobs.
     """
     from datetime import datetime
     from urllib.parse import urlencode
@@ -1675,9 +1702,20 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     # Le run annulé le plus récent doit être visible : un CANCELLED d'un
     # ancien run ne permet jamais de retirer les FAILURE d'un nouveau run.
     ids = [run_id(c) for c in all_packet]
+    own = [c for c in packet if run_id(c) == latest["id"]]
     if (not packet or None in ids or any(i not in {r["id"] for r in runs} for i in ids)
-            or not any(run_id(c) == latest["id"] and c.get("conclusion") == "CANCELLED"
-                       for c in packet)):
+            or not own):
+        return blocked()
+    # #6960 : `ameesh ci run` annule le portier de la tête (#2876) ; quand
+    # l'annulation est traitée après la fin de ses jobs, le run conclut
+    # « cancelled » sans qu'aucun check ne soit CANCELLED (couverture
+    # SUCCESS, suite SKIPPED). Un run ainsi terminé, dont tous les checks du
+    # portier ont conclu sans échec, est le même remplacement : la preuve de
+    # validation reste le run PR vert de la même tête, fini après.
+    if not any(c.get("conclusion") == "CANCELLED" for c in own) and any(
+            str(c.get("status") or "").upper() != "COMPLETED"
+            or str(c.get("conclusion") or "").upper() == "FAILURE"
+            for c in packet):
         return blocked()
     ends = [finished(c) for c in all_packet]
     if any(t is None for t in ends) or end <= max(ends):

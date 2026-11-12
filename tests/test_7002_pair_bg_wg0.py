@@ -44,8 +44,11 @@ STUBS = {
     "wg": """
         case "$*" in
           "show wg0 allowed-ips") [[ -z $WG_ILLISIBLE ]] || exit 1; printf '%b' "$WG_PAIRS" ;;
-          genkey) echo cle-privee ;;
-          pubkey) echo NOUVELLE= ;;
+          genkey) printf '%s\\n' "${WG_GENKEY:-cle-privee}" ;;
+          # #7094 : le vrai `wg pubkey` lit son entrée. Un faux qui sort sans la
+          # lire fait prendre SIGPIPE à `echo | wg pubkey` (141, stderr vide)
+          # sous pipefail dès que la clé dépasse le tampon du pipe.
+          pubkey) cat >/dev/null; echo NOUVELLE= ;;
           *) exit 0 ;;
         esac""",
     "wg-quick": "exit 0",
@@ -165,6 +168,18 @@ class PairBgWg0Test(unittest.TestCase):
         self.assertIn("# appareil nouveau 10.77.0.7", self.wg_conf.read_text())
         self.assertIn("wg set wg0 peer NOUVELLE= allowed-ips 10.77.0.7/32", self.calls())
         self.assertNotIn("syncconf", self.calls())
+
+    def test_new_device_when_pubkey_ignores_stdin_does_not_die_of_sigpipe(self):
+        # #7094 : une clé plus grosse que le tampon du pipe (64 Kio) force
+        # l'ordonnancement — le faux `wg pubkey` sort avant d'avoir lu, `echo`
+        # prend SIGPIPE et le script sort en 141 sans un mot. Le faux doit
+        # drainer stdin, comme le vrai `wg pubkey`.
+        out = self.run_script("ajouter-appareil.sh", "nouveau",
+                              WG_GENKEY="a" * 100_000,
+                              WG_PAIRS=r"PC=\t10.77.0.2/32\nX=\t10.77.0.4/32\nY=\t10.77.0.5/32\n")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Address = 10.77.0.7/32", out.stdout)
+        self.assertIn("# appareil nouveau 10.77.0.7", self.wg_conf.read_text())
 
     def test_new_device_stops_when_wg0_unreadable(self):
         out = self.run_script("ajouter-appareil.sh", "nouveau", WG_ILLISIBLE="1")

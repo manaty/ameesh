@@ -180,6 +180,11 @@ contrats : elle sort en 6, le clone est déjà à jour (`fetch`), et
 `paquet-horaire.py` relance aussitôt la composition sur la nouvelle tête. La
 relecture du gel juste avant la poussée reste en place (#6566) : la cible peut
 encore bouger pendant les tests.
+#6867 : cette référence est relue une seconde fois **après** les contrats,
+juste avant le gel et la poussée, quand rien n'est encore poussé : une cible
+qui atterrit pendant les ~12 min de contrats sort en 6 au lieu du refus
+`paquet-candidats` (rc 2) traduit en rc 1 et lot d'empreinte §16 par
+`paquet-horaire.py`.
 
 Modes :
 
@@ -6028,6 +6033,15 @@ def compose_packet(args: argparse.Namespace) -> int:
                     record_contract_result(worktree, args.carrier, contract_report,
                                            base=base_sha, target=args.target)
             if not args.local:
+                if not pushed:
+                    # #6867 : la cible peut atterrir pendant les contrats (≈12
+                    # min au constat h-11) ; la relecture #3782 tombait alors
+                    # dans `freeze_changes` (`paquet-candidats` rc 2), traduite
+                    # en rc 1 et lot d'empreinte §16 au lieu de la
+                    # recomposition immédiate de #6891. Relue ici, avant le gel
+                    # et la poussée, elle garde le même geste : rien n'est
+                    # poussé, `TARGET_MOVED_RC` et relance aussitôt.
+                    ensure_reference(repo, args.target, base_sha)
                 # #6566 : le gel de chaque unité est relu sur la base exacte
                 # juste avant la poussée ; une unité regelée (ou sortie de la
                 # liste prête) pendant la composition ne part pas sur cette

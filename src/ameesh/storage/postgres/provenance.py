@@ -11,6 +11,11 @@ _COLUMNS = """
     extract(epoch FROM at)::float8 AS at_ts
 """
 
+#: #6873 : la révocation, fait séparé de la preuve (la ligne 0445 ne bouge pas).
+_REVOCATION_COLUMNS = """
+    subject, sha, actor, reason, extract(epoch FROM at)::float8 AS at_ts
+"""
+
 #: une liste de textes passée en paramètre : `NULL` si vide, sinon un JSON
 #: que l'instruction convertit en `text[]` (même idiome que `hosts.py`)
 _ARRAY_SQL = "ARRAY(SELECT jsonb_array_elements_text(%s::jsonb))"
@@ -48,6 +53,34 @@ class Provenance(Contract):
                              " FROM provenance_receipts WHERE subject = %s", (subject,))
         return rows[0] if rows else None
 
+    def revocation(self, subject):
+        rows = self.db.query(
+            "SELECT " + _REVOCATION_COLUMNS +
+            "  FROM provenance_revocations WHERE subject = %s", (subject,))
+        return rows[0] if rows else None
+
+    def revoke(self, subject, sha, actor, reason):
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "INSERT INTO provenance_revocations (subject, sha, actor, reason)"
+                " SELECT subject, sha, %s, %s"
+                "   FROM provenance_receipts"
+                "  WHERE subject = %s AND sha = %s"
+                " ON CONFLICT (subject) DO NOTHING"
+                " RETURNING " + _REVOCATION_COLUMNS,
+                (actor, reason, subject, sha))
+            if rows:
+                return dict(rows[0], recorded=True)
+            # Une révocation existe déjà (la première fait foi), ou la preuve
+            # n'existe pas / ne porte pas ce SHA : l'appelant distingue les
+            # deux en relisant la ligne de preuve.
+            rows = tx.query(
+                "SELECT " + _REVOCATION_COLUMNS +
+                "  FROM provenance_revocations WHERE subject = %s", (subject,))
+            if rows:
+                return dict(rows[0], recorded=False)
+            return None
+
     def milestone(self, subject):
         rows = self.db.query(
             "SELECT p.subject, p.sha, p.actor, p.session, p.turn, p.harness,"
@@ -67,13 +100,16 @@ class Provenance(Contract):
 
     def commits(self, actor, *, since_ts=None, until_ts=None, limit=None):
         sql = ("SELECT " + _COLUMNS +
-               "  FROM provenance_receipts"
+               "  FROM provenance_receipts p"
                # #4299: the receipt keeps the spelling of its day; read every
                # spelling of the registry identity.
                " WHERE actor IN (SELECT %s::text UNION SELECT unnest(ARRAY[r.name] || r.aliases)"
                "                   FROM agent_registry r"
                "                  WHERE r.name = %s::text OR %s::text = ANY(r.aliases))"
-               "   AND subject LIKE 'commit:%%'")
+               "   AND subject LIKE 'commit:%%'"
+               # #6873: a revoked receipt is no longer a proof.
+               "   AND NOT EXISTS (SELECT 1 FROM provenance_revocations v"
+               "                    WHERE v.subject = p.subject)")
         params = [str(actor)] * 3
         if since_ts is not None:
             sql += " AND extract(epoch FROM at) >= %s"

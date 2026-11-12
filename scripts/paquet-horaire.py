@@ -222,6 +222,12 @@ MARK_RED = MARK + "rouge consigné "
 #: #6665 : les états d'un run de ci-full encore vivant (ou pas encore relevé)
 RUN_IN_FLIGHT = ("running", "queued", "pending", None)
 MARK_WAIT = MARK + "verdict au pilote "
+#: #6933 : l'acteur du tic n'a pas le geste « verdict non requis » (`work
+#: reviewer --no-verdict` : humains, orchestrateurs, agents de conception)
+MARK_WAIVE_LEFT = MARK + "dispense laissée au pilote "
+#: la marque de `work reviewer --no-verdict` (storage/postgres/work.py)
+REVIEWER_NONE = "-none"
+WAIVE_REFUSED_RE = re.compile(r"designation refused: .* is neither a human")
 MARK_ATTEMPT = MARK + "tentative "
 MARK_FAILED = MARK + "échec "
 MARK_STUCK = MARK + "reprise épuisée "
@@ -1875,6 +1881,34 @@ def contract_result_at(ctx: Context, item: dict, sha: str):
     return read(item, head=sha, tree=tree, target=ctx.target) if tree else None
 
 
+def waived(item: dict) -> bool:
+    """#6933 : « verdict non requis » déjà posé (pose automatique d'un
+    véhicule sans delta propre, #4109, ou tic précédent)."""
+    names = item.get("reviewers")
+    if names is None:
+        names = [item.get("reviewer")]
+    return REVIEWER_NONE in [str(name or "").strip() for name in names]
+
+
+def waive(ctx: Context, item: dict, sha: str) -> str:
+    """#6933 : pose « verdict non requis » ; un acteur qui n'a pas ce geste
+    (composeur délégué, §12) le laisse au pilote, consigné, sans faire
+    échouer le tic : la ci-full est demandée quand même."""
+    carrier = int(item["id"])
+    result = ctx.ameesh("work", "reviewer", str(carrier), "--no-verdict", "--actor", ctx.actor)
+    if result.returncode == 0:
+        return "Fusions propres seulement : « verdict non requis » posé (§2)."
+    if not WAIVE_REFUSED_RE.search(result.text):
+        raise HoraireError("verdict non requis #%d : rc %d : %s"
+                           % (carrier, result.returncode, auto._tail(result.text, 20)))
+    if waived(show(ctx, carrier)):
+        return "Fusions propres seulement : « verdict non requis » déjà posé (§2)."
+    if not any(note.startswith(MARK_WAIVE_LEFT + sha) for note in marks(item)):
+        ctx.note(carrier, MARK_WAIVE_LEFT + sha + " (%s sans ce geste)" % ctx.actor)
+    return ("« verdict non requis » refusé à %s : laissé au pilote (#1979) ; "
+            "la fusion automatique attend ce geste." % ctx.actor)
+
+
 def publish(ctx: Context, item: dict) -> str:
     """Tête gelée : « verdict non requis » si aucune résolution, puis ci-full."""
     carrier = int(item["id"])
@@ -1924,10 +1958,10 @@ def publish(ctx: Context, item: dict) -> str:
                      "pilote (#1979) ; la fusion automatique attend ce geste.")
         if MARK_WAIT + sha not in marks(item):
             ctx.note(carrier, MARK_WAIT + sha)
+    elif waived(item):
+        lines.append("Fusions propres seulement : « verdict non requis » déjà posé (§2).")
     elif not ctx.dry_run:
-        ctx.must("work", "reviewer", str(carrier), "--no-verdict", "--actor", ctx.actor,
-                 what="verdict non requis #%d" % carrier)
-        lines.append("Fusions propres seulement : « verdict non requis » posé (§2).")
+        lines.append(waive(ctx, item, sha))
     if not ctx.dry_run:
         ctx.must("ci", "run", str(carrier), "--full", "--sha", sha, "--avis", "0",
                  "--reason", "paquet horaire automatique (#3845)",

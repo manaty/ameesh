@@ -7,8 +7,9 @@ import dataclasses
 import json
 import os
 import unittest
+import unittest.mock
 
-from ameesh import conversation as C, conversation_segment as S, turn_context
+from ameesh import conversation as C, conversation_segment as S, fil, storage, turn_context
 from tests.support import PgTestCase
 
 SECRET = "sk-test-0123456789abcdef-SECRET"
@@ -30,6 +31,21 @@ def turn(seq, question, answer, *, tools=0, agent="avatar", human="human:alice",
 
 def size(document):
     return len(S.canonical(document).encode("utf-8"))
+
+
+def thread_entry(seq, author, text, *, agent="avatar"):
+    return fil.Entry(author=author, recipient="agent:" + agent, text=text, ts=1000.0,
+                     meta={"conversation": {"agent": agent, "seq": seq, "turn": "t"}})
+
+
+class FakeStore:
+    """Minimal `Conversations` page reader, for `_turn_head` without a database."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def read(self, agent, *, after=0, limit=100):
+        return {"entries": [r for r in self.rows if int(r["seq"]) > after][:limit]}
 
 
 class SelectTest(unittest.TestCase):
@@ -76,6 +92,9 @@ class SelectTest(unittest.TestCase):
         self.assertLessEqual(size(doc), S.BUDGET_BYTES)
         self.assertTrue(all(e.get("truncated") for e in doc["entries"]))
         self.assertTrue(doc["cut"])
+        sealed = S.seal(doc)
+        self.assertEqual(size(sealed), size(doc) + S.DIGEST_BYTES)
+        self.assertLessEqual(size(sealed), S.BUDGET_BYTES)
 
     def test_tools_keep_name_and_status_only_input_and_state_dropped(self):
         rows = turn(1, "q", "r", tools=1)
@@ -105,14 +124,16 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(S.canonical(doc).count("doublon du détail"), 0)
         self.assertEqual(doc["from_seq"], 1)
 
-    def test_partial_head_turn_is_kept_reduced_and_thread_ignored(self):
+    def test_partial_head_turn_is_completed_from_the_thread_open_tail(self):
+        # the window starts on seq 3 (the previous turn's final answer): the
+        # question of the turn that ends at seq 3 is only in the thread.
         rows = turn(1, "q1", "r1")[2:] + turn(5, "q2", "r2")
-        doc = S.select(rows, [{"seq": 0, "kind": "human_message", "author": "human:a",
-                               "ts": 0.0, "text": "fil", "meta": {}}],
-                       agent="avatar", head_complete=False)
-        self.assertEqual([e["seq"] for e in doc["entries"]], [3, 5, 6, 7])
+        thread = [{"seq": 0, "kind": "human_message", "author": "human:a",
+                   "ts": 0.0, "text": "fil", "meta": {}}]
+        doc = S.select(rows, thread, agent="avatar", head_complete=False)
+        self.assertEqual([e["seq"] for e in doc["entries"]], [0, 3, 5, 6, 7])
+        self.assertEqual(doc["entries"][0]["source"], "thread")
         self.assertEqual(doc["cut"]["reduced_seq"], 3)
-        self.assertNotIn("fil", [e.get("text") for e in doc["entries"]])
 
     def test_newest_turn_longer_than_the_read_window_is_kept(self):
         # review B (mty-amh-qa-01): 1 human + 498 text + 1 turn_end
@@ -130,6 +151,32 @@ class SelectTest(unittest.TestCase):
                                           "reduced_seq": 500})
 
 
+class ThreadRowsTest(unittest.TestCase):
+    def test_thread_rows_dedupe_replayed_delivery(self):
+        rows = S.thread_rows([
+            thread_entry(4, "agent:avatar", "réponse"),
+            thread_entry(4, "agent:avatar", "réponse"),
+            thread_entry(1, "human:alice", "question"),
+        ], "avatar")
+        self.assertEqual([r["seq"] for r in rows], [4, 1])
+        self.assertEqual(rows[0]["kind"], "turn_end")
+
+
+class TurnHeadTest(unittest.TestCase):
+    def test_first_entry_is_a_whole_turn(self):
+        store = FakeStore([{"seq": 1, "kind": "human_message"}])
+        self.assertEqual(S._turn_head(store, "avatar", 1), ([], True))
+
+    def test_reads_past_ten_thousand_entries(self):
+        rows = [{"seq": 1, "kind": "human_message", "text": "question",
+                 "author": "human:a", "ts": 1.0, "meta": {}}]
+        rows += [{"seq": n, "kind": "text", "text": "t", "author": "agent:a",
+                  "ts": 1.0, "meta": {}} for n in range(2, 10_051)]
+        messages, whole = S._turn_head(FakeStore(rows), "a", 10_050)
+        self.assertEqual([m["seq"] for m in messages], [1])
+        self.assertFalse(whole)
+
+
 class SecretAndDigestTest(unittest.TestCase):
     def test_known_secret_never_leaves_in_document_or_rendering(self):
         rows = turn(1, "mon jeton est %s, garde-le" % SECRET, "noté : %s" % SECRET)
@@ -143,6 +190,19 @@ class SecretAndDigestTest(unittest.TestCase):
         secrets = turn_context.environment_secrets(env)
         doc = S.select(turn(1, SECRET, "ok"), agent="avatar", secrets=secrets)
         self.assertNotIn(SECRET, S.canonical(doc))
+
+    def test_select_filters_environment_secrets_by_default(self):
+        with unittest.mock.patch.dict(os.environ, {"OPENAI_API_KEY": SECRET}, clear=True):
+            doc = S.select(turn(1, SECRET, "ok"), agent="avatar")
+        self.assertNotIn(SECRET, S.canonical(doc))
+        self.assertIn(S.REDACTED, S.canonical(doc))
+
+    def test_seal_filters_environment_secrets_by_default(self):
+        doc = S.select(turn(1, "q", "r"), agent="avatar", secrets=[])
+        doc["entries"][0]["text"] = "x %s y" % SECRET
+        with unittest.mock.patch.dict(os.environ, {"OPENAI_API_KEY": SECRET}, clear=True):
+            with self.assertRaises(S.SegmentError):
+                S.seal(doc)
 
     def test_seal_refuses_a_secret_that_got_through(self):
         doc = S.select(turn(1, "q", "r"), agent="avatar")
@@ -168,6 +228,10 @@ class SecretAndDigestTest(unittest.TestCase):
             S.verify(tampered)
         with self.assertRaises(S.SegmentError):
             S.verify({"schema": "other/1"})
+        for missing in ({"schema": S.SCHEMA}, dict(doc, digest=None),
+                        dict(doc, digest="0" * 63), dict(doc, digest="Z" * 64)):
+            with self.assertRaises(S.SegmentError):
+                S.verify(missing)
 
 
 class RenderTest(unittest.TestCase):
@@ -186,15 +250,25 @@ class RenderTest(unittest.TestCase):
 class BuildTest(PgTestCase):
     def setUp(self):
         self.db.execute("DELETE FROM conversation_log; DELETE FROM conversation_heads")
-        self.cfg = dataclasses.replace(self.cfg, threads_dir=os.path.join(self.tmp, self._testMethodName))
-        self.log = C.Log(self.db, self.cfg, agent="avatar", project="acme", lot="7049")
+        self.cfg = dataclasses.replace(
+            self.cfg, threads_dir=os.path.join(self.tmp, self._testMethodName),
+            project="acme")
+        storage.of(self.db).agents.upsert(
+            "avatar", chantier="acme-team", harness="deepseek", host="test",
+            cwd=self.tmp, session_id=None, status="idle", status_text="",
+            model=None, budget_usd=None)
+        # the real recorder writes assistant turns to the agent's project
+        # thread (lot=None) and human messages to their lot's thread.
+        self.log = C.Log(self.db, self.cfg, agent="avatar", project="acme-team")
+        self.humans = C.Log(self.db, self.cfg, agent="avatar", project="acme", lot="7049")
 
     def exchange(self, question, answer, turn_id):
-        self.log.append("human_message", question, author="human:alice", turn=turn_id)
+        self.humans.append("human_message", question, author="human:alice", turn=turn_id)
         self.log.append("tool", "Bash", meta={"tool": "Bash", "status": "completed"}, turn=turn_id)
         self.log.append("text", answer, turn=turn_id)
         self.log.append("turn_end", answer, turn=turn_id, meta={"status": "completed"},
                         thread_text=answer, event_id="final:" + turn_id)
+        self.humans.drain_threads()
         self.log.drain_threads()
 
     def test_builds_from_journal_without_writing_back(self):
@@ -211,16 +285,43 @@ class BuildTest(PgTestCase):
 
     def test_turn_longer_than_the_read_window_keeps_question_and_answer(self):
         self.exchange("ancienne question", "ancienne réponse", "t0")
-        self.log.append("human_message", "longue question", author="human:alice", turn="t1")
+        self.humans.append("human_message", "longue question", author="human:alice", turn="t1")
         for n in range(S.READ_LIMIT + 100):
             self.log.append("tool", "Bash", meta={"tool": "Bash", "status": "completed"},
                             turn="t1")
         self.log.append("turn_end", "longue réponse", turn="t1", meta={"status": "completed"},
                         thread_text="longue réponse", event_id="final:t1")
+        self.humans.drain_threads()
+        self.log.drain_threads()
         last = self.db.query("SELECT max(seq) AS m FROM conversation_log")[0]["m"]
         doc = S.build(self.db, self.cfg, "avatar", secrets=[])
         self.assertEqual([(e["kind"], e["text"]) for e in doc["entries"]],
                          [("human_message", "longue question"), ("turn_end", "longue réponse")])
+        self.assertEqual(doc["cut"], {"truncated_before_seq": 5, "reason": "bytes",
+                                      "reduced_seq": last})
+        S.verify(doc, doc["digest"])
+
+    def test_prune_in_the_middle_of_a_full_window_keeps_the_question(self):
+        self.exchange("ancienne question", "ancienne réponse", "t0")
+        self.humans.append("human_message", "longue question", author="human:alice",
+                           turn="t1")
+        for n in range(700):
+            self.log.append("tool", "Bash", meta={"tool": "Bash", "status": "completed"},
+                            turn="t1")
+        self.log.append("turn_end", "longue réponse", turn="t1", meta={"status": "completed"},
+                        thread_text="longue réponse", event_id="final:t1")
+        self.humans.drain_threads()
+        self.log.drain_threads()
+        self.db.execute("UPDATE conversation_log SET created_at = now() - interval '91 days'"
+                        " WHERE seq <= 200")
+        self.log.prune()
+        self.assertEqual(C.history(self.db, "avatar")["entries"][0]["seq"], 201)
+        last = self.db.query("SELECT max(seq) AS m FROM conversation_log")[0]["m"]
+        doc = S.build(self.db, self.cfg, "avatar", secrets=[])
+        self.assertEqual([(e["kind"], e["text"]) for e in doc["entries"]],
+                         [("human_message", "longue question"),
+                          ("turn_end", "longue réponse")])
+        self.assertEqual(doc["entries"][0]["source"], "thread")
         self.assertEqual(doc["cut"], {"truncated_before_seq": 5, "reason": "bytes",
                                       "reduced_seq": last})
         S.verify(doc, doc["digest"])
@@ -246,6 +347,25 @@ class BuildTest(PgTestCase):
         self.assertEqual(sources[:2], [("human_message", "thread"), ("turn_end", "thread")])
         self.assertIn("réponse d'il y a longtemps", S.render(doc))
         self.assertEqual(doc["entries"][0]["seq"], 1)
+
+    def test_falls_back_on_the_thread_after_full_detail_retention(self):
+        # review N: human messages live in the lot thread, assistant turns in
+        # the project thread; after a full prune only the thread names them.
+        self.exchange("question d'il y a longtemps", "réponse d'il y a longtemps", "t1")
+        self.exchange("question récente", "réponse récente", "t2")
+        self.db.execute("UPDATE conversation_log SET created_at = now() - interval '91 days'")
+        self.log.prune()
+        self.assertEqual(C.history(self.db, "avatar")["entries"], [])
+        doc = S.build(self.db, self.cfg, "avatar", secrets=[])
+        self.assertEqual(
+            [(e["kind"], e.get("source"), e["text"]) for e in doc["entries"]],
+            [("human_message", "thread", "question d'il y a longtemps"),
+             ("turn_end", "thread", "réponse d'il y a longtemps"),
+             ("human_message", "thread", "question récente"),
+             ("turn_end", "thread", "réponse récente")])
+        self.assertEqual((doc["from_seq"], doc["to_seq"]), (1, 8))
+        self.assertIsNone(doc["cut"])
+        S.verify(doc, doc["digest"])
 
 
 if __name__ == "__main__":

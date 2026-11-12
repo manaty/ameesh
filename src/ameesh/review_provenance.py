@@ -63,6 +63,29 @@ exige les deux, liés par le même aléa, et les consomme. Un objet seulement
 restauré par `reset` ou `checkout`, même committé par le même agent, ne produit
 pas de fait de création : son origine reste inconnue (écarts cx3, 15/10 04:37,
 puis B1 cx2/Codex, 15/10 12:12).
+
+#6873 — deux bornes de plus sur la voie signée, après l'incident du 11/11 :
+
+* **pas d'auto-attestation** : le détenteur de la clé qui signe
+  (`approver`, l'option `--as`) doit être un humain, jamais un agent ; il ne
+  peut pas être l'acteur attesté ni détenir une copie enregistrée de sa clé.
+  Un agent qui détient une copie de la clé owner — même sous un autre nom —
+  rend la signature ambiguë : elle est refusée tant que la copie n'est pas
+  retirée ou remplacée par une clé distincte (décision owner #164261 a : seule
+  une signature faite par l'owner lui-même vaut provenance). Le texte signé ne
+  change pas (version 1) ; la limite est réelle et dite : une copie privée
+  utilisée sous le nom de l'owner ne se distingue pas d'une signature de
+  l'owner, c'est une déclaration de bonne foi. La séparation cryptographique
+  demande une clé distincte pour le bureau, geste de l'owner ;
+* **une révocation définitive**, réservée à un correcteur ou à l'owner :
+  `ameesh provenance revoke --commit <sha> --reason ...` vérifie l'autorité
+  (`work.corrector` : orchestrateur, agent de conception ou auditeur déclaré ;
+  un humain dit `--actor human:<id>` à son terminal) avant d'écrire un fait
+  daté, motivé et attribué (migration 0566), sans réécrire la preuve. Un agent
+  lié sans ce rôle est refusé. `receipt_for_commit` rend alors `None`, la porte
+  lit « auteur inconnu » et refuse ; `record_commit` / `record_signed_commit`
+  refusent de ressusciter le reçu. La lecture brute de `provenance show` garde
+  la ligne et affiche sa révocation pour l'audit.
 """
 from __future__ import annotations
 
@@ -122,6 +145,25 @@ def subject_of_milestone(milestone_id) -> str:
     return "milestone:%d" % number
 
 
+def _at_text(stamp) -> str:
+    """Un instant epoch en UTC lisible, pour une trace de révocation."""
+    import datetime
+    try:
+        value = float(stamp)
+    except (TypeError, ValueError):
+        return "?"
+    return datetime.datetime.fromtimestamp(
+        value, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _revoked_error(subject: str, revoked) -> ProvenanceError:
+    """Le refus nommé d'une preuve révoquée (#6873)."""
+    return ProvenanceError(
+        "%s: receipt revoked by %s on %s: %s"
+        % (subject, revoked.get("actor") or "?",
+           _at_text(revoked.get("at_ts")), revoked.get("reason") or "?"))
+
+
 def _receipt(row, *, commit: str, milestone) -> dict:
     """Le reçu aux champs de `train_review.Receipt`."""
     return {
@@ -142,9 +184,17 @@ def receipt_for_commit(db, sha) -> dict | None:
 
     `sha` doit être complet : le train qualifie des commits complets, et une
     abréviation ne désigne un commit qu'en présence du dépôt — le fournisseur
-    ne l'a pas."""
+    ne l'a pas.
+
+    #6873 : une preuve révoquée n'est plus une preuve. La ligne reste en base
+    (audit, `provenance show`), mais le fournisseur rend `None` : la porte lit
+    un auteur inconnu et refuse. `revocation_for_commit` donne le fait de
+    révocation quand l'appelant doit le nommer."""
     subject = subject_of_commit(sha)
-    row = storage.of(db).provenance.get(subject)
+    ops = storage.of(db).provenance
+    if ops.revocation(subject) is not None:
+        return None
+    row = ops.get(subject)
     if row is None:
         return None
     if row["sha"] != subject[len("commit:"):]:
@@ -153,6 +203,15 @@ def receipt_for_commit(db, sha) -> dict | None:
         raise ProvenanceError(
             "%s: proof records commit %s, not the subject" % (subject, row["sha"]))
     return _receipt(row, commit=row["sha"], milestone=None)
+
+
+def revocation_for_commit(db, sha) -> dict | None:
+    """La révocation du reçu de `sha` (#6873), ou None.
+
+    Lecture séparée de `receipt_for_commit` : la porte n'en a pas besoin (un
+    reçu révoqué est déjà une origine inconnue) ; l'audit et `provenance show`
+    y lisent l'acteur, la date et la raison du retrait."""
+    return storage.of(db).provenance.revocation(subject_of_commit(sha))
 
 
 def receipt_for_milestone(db, milestone_id) -> dict | None:
@@ -527,6 +586,82 @@ def _signed_meta(db, turn: str) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+def _same_agent_identity(db, one: str, other: str) -> bool:
+    """`one` et `other` désignent-ils la même fiche du registre (alias compris) ?"""
+    from . import agent_names
+    try:
+        left = agent_names.resolve(str(one or "").strip(), db=db,
+                                   operation="review_provenance.attestation")
+        right = agent_names.resolve(str(other or "").strip(), db=db,
+                                    operation="review_provenance.attestation")
+        return bool(left) and left.casefold() == right.casefold()
+    except Exception:  # noqa: BLE001 - repli lexical seulement, jamais une preuve
+        return (bool(str(one or "").strip())
+                and str(one).strip().casefold() == str(other or "").strip().casefold())
+
+
+def _refuse_delegated_attestation(db, row, ident: dict) -> None:
+    """#6873 : une preuve signée ne s'auto-atteste pas, ni par une copie.
+
+    La clé owner ne distingue pas son propriétaire de son délégataire : le même
+    secret signe les deux. Le contrôle porte donc sur ce que l'approbation
+    **déclare** — c'est une déclaration de bonne foi, pas une preuve
+    cryptographique :
+
+    * le détenteur (`approver`, l'option `--as`) doit être une clé humaine,
+      jamais un agent : une clé owner posée sur une fiche d'agent est une
+      délégation (#326 r2), et son porteur ne peut pas attester ;
+    * le détenteur ne peut pas être l'acteur attesté : un auteur ne signe pas
+      sa propre provenance ;
+    * la clé de signature ne peut pas être la clé enregistrée de l'acteur
+      attesté, ni une clé que détient un agent — même sous un autre nom — tant
+      que cette copie existe : la signature serait ambiguë.
+
+    Une copie privée utilisée sous le nom de l'owner reste indiscernable d'une
+    signature de l'owner : la séparation réelle demande une clé distincte pour
+    le délégataire, geste de l'owner (décision #164261 a, §10)."""
+    from . import authority
+    approval = row.get("id") or "?"
+    approver = str(row.get("approver") or "").strip()
+    if not approver:
+        raise ProvenanceError("approval #%s names no key holder" % approval)
+    info = authority.key_info(db, approver) or {}
+    holder = str(info.get("holder") or "").strip()
+    if holder != "human":
+        raise ProvenanceError(
+            "approval #%s is signed by %s, %s: signed provenance requires the "
+            "owner's key in person, not a delegated copy"
+            % (approval, approver,
+               "an agent key holder" if holder == "agent"
+               else "a key holder of unknown nature"))
+    actor = str(ident.get("actor") or "").strip()
+    if actor and _same_agent_identity(db, approver, actor):
+        raise ProvenanceError(
+            "approval #%s is signed by the attested actor %s: a commit's author "
+            "cannot attest their own provenance" % (approval, actor))
+    fingerprint = str(row.get("signature_key") or "").strip()
+    if not fingerprint:
+        return
+    actor_key = (authority.key_info(db, actor) or {}) if actor else {}
+    if str(actor_key.get("public_key_fingerprint") or "").strip() == fingerprint:
+        raise ProvenanceError(
+            "approval #%s is signed with the key of the attested actor %s: a "
+            "delegated copy cannot attest its holder's own commit"
+            % (approval, actor))
+    for key in storage.of(db).keys.registered() or ():
+        if str(key.get("holder") or "") != "agent":
+            continue
+        if key.get("key_revoked_ts"):
+            continue
+        if str(key.get("public_key_fingerprint") or "").strip() != fingerprint:
+            continue
+        raise ProvenanceError(
+            "approval #%s is signed with a key also held by agent %s: signed "
+            "provenance requires the owner's key in person; withdraw the "
+            "delegated copy or use a distinct key"
+            % (approval, key.get("name") or "?"))
+
+
 def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
                          host: str, families, lot=None,
                          approval_id: int | None = None,
@@ -544,7 +679,12 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     (`cwd`), pas seulement HEAD : il a été créé sur un autre hôte.
 
     Ne jamais appeler sans `families` issues de `compiled_families` (ou du canon
-    épinglé du banc) : une famille supposée n'est pas une preuve."""
+    épinglé du banc) : une famille supposée n'est pas une preuve.
+
+    #6873 : une approbation dont le détenteur est l'acteur attesté, un agent,
+    ou qui signe avec une clé détenue par un agent est refusée
+    (`_refuse_delegated_attestation`). Un reçu révoqué est définitif : ni
+    celui-ci ni `record_commit` ne le ressuscitent."""
     from . import authority, signing
     from . import work as work_mod
     full = resolve_commit(sha, cwd=cwd)
@@ -560,7 +700,11 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
         harness=ident["harness"], host=ident["host"], lot=lot)
     digest = hashlib.sha256(statement.encode("utf-8")).hexdigest()
     subject = subject_of_commit(full)
-    existing = storage.of(db).provenance.get(subject)
+    ops = storage.of(db).provenance
+    revoked = ops.revocation(subject)
+    if revoked is not None:
+        raise _revoked_error(subject, revoked)
+    existing = ops.get(subject)
     if existing is not None:
         if (existing["actor"] == ident["actor"]
                 and existing["session"] == ident["session"]
@@ -591,6 +735,13 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
             raise ProvenanceError("cannot read the signing key: %s" % exc) from exc
         meta = {"statement": statement, "host": ident["host"],
                 "lot": work_item_id or 0, "source": "provenance --signed"}
+        # #6873 : la déclaration du détenteur et de l'hôte de signature reste
+        # lisible pour l'audit ; elle ne remplace pas la clé distincte que la
+        # décision #164261 demande pour séparer l'owner de son délégataire.
+        meta["holder"] = approver
+        signing_host = str(getattr(getattr(db, "cfg", None), "host", "") or "").strip()
+        if signing_host:
+            meta["signing_host"] = signing_host
         # #5756 : le texte signé ne bouge pas (version 1) ; le harnais courant
         # du registre, quand il diverge, reste lisible dans l'approbation.
         if ident.get("registry_harness"):
@@ -623,6 +774,10 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     if not verdict.ok:
         raise ProvenanceError(
             "approval #%s is not valid: %s" % (approval_id, verdict.reason))
+    # #6873 : avant toute consommation. Le contrôle est une déclaration de
+    # bonne foi (la même clé privée ne distingue pas l'owner de son
+    # délégataire) ; il ferme l'auto-attestation et les copies enregistrées.
+    _refuse_delegated_attestation(db, row, ident)
     if not authority.consume_approval(db, int(approval_id),
                                       "provenance:%s" % full):
         raise ProvenanceError(
@@ -634,13 +789,26 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     # recalculer à la lecture. Une seconde tentative échoue avant cette
     # écriture : elle ne peut pas réécrire le diagnostic d'une approbation
     # déjà consommée. Le texte version 1 et l'empreinte signée ne changent pas.
+    # #6873 : l'hôte qui a enregistré l'approbation pré-signée est consigné de
+    # même, sans toucher au texte signé.
+    meta_update = {}
     if pre_signed and ident.get("registry_harness"):
-        storage.of(db).approvals.merge_meta(
-            int(approval_id), {"registry_harness": ident["registry_harness"]})
+        meta_update["registry_harness"] = ident["registry_harness"]
+    if pre_signed:
+        signing_host = str(getattr(getattr(db, "cfg", None), "host", "") or "").strip()
+        if signing_host:
+            meta_update["signing_host"] = signing_host
+    if meta_update:
+        storage.of(db).approvals.merge_meta(int(approval_id), meta_update)
     receipt = storage.of(db).provenance.add(
         subject, full, ident["actor"], ident["session"],
         SIGNED_TURN_PREFIX + str(approval_id), ident["harness"],
         work_item_id=work_item_id)
+    revoked = ops.revocation(subject)
+    if revoked is not None:
+        # Une révocation concurrente entre la lecture et l'écriture : le reçu
+        # a été retiré avant d'être relu, il ne redevient pas une preuve.
+        raise _revoked_error(subject, revoked)
     if not receipt.get("recorded"):
         if (receipt["actor"] == ident["actor"]
                 and receipt["session"] == ident["session"]
@@ -651,6 +819,96 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
             % (subject, receipt["actor"], receipt["session"],
                ident["actor"], ident["session"]))
     return receipt
+
+
+def _revocation_identity(db, actor) -> str:
+    """Qui révoque, avec la liaison et l'autorité exigées (#6873).
+
+    Un agent agit sous une identité LIÉE (bail ou session, L244) et en son
+    nom ; un humain à son terminal dit qui il est (`human:<id>`, L46), puis
+    `work.corrector` vérifie le rôle (orchestrateur, conception, auditeur) ou
+    l'autorité humaine. Un simple `AGENT_MAIL_NAME`, ou un nom d'agent fourni
+    à la main, ne suffit pas : la révocation est définitive et ferme la porte.
+
+    Appelé avant `work.corrector` : celui-ci accepte une identité explicite
+    (source `explicit`) pour les corrections ordinaires, pas pour ce retrait
+    irréversible."""
+    from . import identity as identity_mod
+    requested = str(actor or "").strip()
+    binding = identity_mod.resolve_binding(getattr(db, "cfg", None), db)
+    if binding.name:
+        if not binding.ok or binding.source not in identity_mod.BOUND_SOURCES:
+            reason = binding.reason or "identity %s is %s, not bound" % (
+                binding.name, binding.source)
+            raise ProvenanceError(
+                "provenance revoke requires a bound session identity (%s)" % reason)
+        if requested and requested != binding.name:
+            raise ProvenanceError(
+                "provenance revoke refused: this session belongs to %s, it does "
+                "not act on behalf of %s" % (binding.name, requested))
+        return binding.name
+    if requested.startswith("human:"):
+        return requested
+    if os.environ.get("AGENT_MAIL_NAME"):
+        raise ProvenanceError(
+            "provenance revoke requires a bound session identity "
+            "(AGENT_MAIL_NAME is not bound to a live lease or session)")
+    if not requested:
+        raise ProvenanceError(
+            "provenance revoke: say who does it (--actor human:<id>)")
+    raise ProvenanceError(
+        "provenance revoke refused: %s is not bound on this host (a bound "
+        "session acts as itself; a human says --actor human:<id>)" % requested)
+
+
+def revoke_receipt(db, sha, *, actor: str | None = None, reason: str) -> dict:
+    """Révoque définitivement le reçu de commit `sha` (#6873), ou refuse.
+
+    Le geste est séparé de la preuve : la ligne `provenance_receipts` n'est ni
+    réécrite ni supprimée, et la révocation garde son acteur, sa date et sa
+    raison. `receipt_for_commit` rend ensuite `None` (la porte refuse comme
+    pour un auteur inconnu), et les deux chemins d'écriture refusent de
+    ressusciter le reçu.
+
+    L'autorité est vérifiée avant toute écriture (B des relectures #6873) :
+    la révocation est définitive et ferme la porte, elle n'est donc pas
+    ouverte à « n'importe quel agent lié ». `work.corrector` — rôle déclaré,
+    `history=False` — autorise un orchestrateur, un agent de conception ou
+    l'auditeur ; sans session d'agent, un humain à son terminal dit qui il est
+    (`--actor human:<id>`, L46), et l'owner en fait partie. `actor` seul ne
+    suffit pas : la liaison (L244) et le rôle sont exigés. `reason` est
+    obligatoire et borné : une révocation sans motif n'est pas une trace."""
+    from . import work as work_mod
+    full = full_sha(sha)
+    subject = subject_of_commit(full)
+    why = " ".join(str(reason or "").split())
+    if not why:
+        raise ProvenanceError("a revocation requires a reason")
+    if len(why) > 2000:
+        raise ProvenanceError(
+            "revocation reason is too long (%d characters, 2000 max)" % len(why))
+    who = _revocation_identity(db, actor)
+    try:
+        who = work_mod.corrector(
+            getattr(db, "cfg", None), db, who,
+            what="provenance revoke", auditor=True, history=False)
+    except work_mod.WorkError as exc:
+        raise ProvenanceError(str(exc)) from exc
+    if not who:
+        raise ProvenanceError("a revocation requires a bound actor")
+    ops = storage.of(db).provenance
+    receipt = ops.get(subject)
+    if receipt is None:
+        raise ProvenanceError("%s: no provenance receipt" % subject)
+    if str(receipt.get("sha") or "").strip().lower() != full:
+        raise ProvenanceError(
+            "%s: proof records commit %s, not the subject"
+            % (subject, receipt.get("sha")))
+    row = ops.revoke(subject, full, who, why)
+    if row is None:
+        raise ProvenanceError(
+            "%s: revocation failed (the receipt disappeared meanwhile)" % subject)
+    return row
 
 
 def live_session(db, actor: str, *, harness: str = "") -> str:
@@ -1057,6 +1315,11 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
             % (full[:12], identity["actor"], email or "?"))
     subject = subject_of_commit(full)
     ops = storage.of(db).provenance
+    revoked = ops.revocation(subject)
+    if revoked is not None:
+        # #6873 : une révocation est définitive ; un nouveau tour sur le même
+        # objet ne rouvre pas la preuve.
+        raise _revoked_error(subject, revoked)
     existing = ops.get(subject)
     if existing is not None:
         # La preuve est déjà écrite : rejouer la même identité ne réécrit rien
@@ -1293,6 +1556,14 @@ def build_parser():
     show.add_argument("--commit", default="")
     show.add_argument("--milestone", type=int, default=None)
     show.add_argument("--json", action="store_true")
+    # #6873 : retirer une preuve reconnue fausse, sans la réécrire.
+    rev = sub.add_parser(
+        "revoke", help="revoke a commit provenance receipt (#6873)")
+    rev.add_argument("--commit", required=True, help="full commit id")
+    rev.add_argument("--reason", required=True, help="why the receipt is withdrawn")
+    rev.add_argument("--actor", default="",
+                     help="human:<id> at a terminal; a bound session acts as itself")
+    rev.add_argument("--json", action="store_true")
     return parser
 
 
@@ -1387,13 +1658,43 @@ def main(argv: list[str] | None = None) -> int:
                 print("provenance recorded: %s by %s (turn %s)"
                       % (row["subject"], row["actor"], row["turn"][:8]))
             return 0
+        if args.command == "revoke":
+            # #6873 : geste de droits — l'autorité (correcteur ou owner) et la
+            # liaison (L244) sont vérifiées dans `revoke_receipt`, avant toute
+            # écriture ; `--actor human:<id>` est le terminal de l'owner.
+            row = revoke_receipt(db, args.commit, actor=args.actor or None,
+                                 reason=args.reason)
+            if args.json:
+                print(json.dumps(row, default=str))
+            else:
+                print("provenance revoked: %s by %s: %s"
+                      % (row["subject"], row["actor"], row["reason"]))
+            return 0
+        revoked = None
         if args.commit:
-            recu = receipt_for_commit(db, args.commit)
+            revoked = revocation_for_commit(db, args.commit)
+            if revoked is not None:
+                # #6873 : la ligne de preuve reste lisible pour l'audit ; elle
+                # n'est simplement plus une preuve.
+                raw = storage.of(db).provenance.get(subject_of_commit(args.commit))
+                recu = (_receipt(raw, commit=raw["sha"], milestone=None)
+                        if raw is not None else None)
+            else:
+                recu = receipt_for_commit(db, args.commit)
         elif args.milestone is not None:
             recu = receipt_for_milestone(db, args.milestone)
         else:
             print("error: --commit or --milestone is required", file=sys.stderr)
             return 2
+        if revoked is not None:
+            if args.json:
+                print(json.dumps({"revoked": True, "revocation": revoked,
+                                  "receipt": recu}, default=str))
+            else:
+                print("%s: REVOKED by %s on %s: %s"
+                      % (revoked["subject"], revoked["actor"],
+                         _at_text(revoked["at_ts"]), revoked["reason"]))
+            return 0
         registry_harness = ""
         if recu is not None:
             registry_harness = str(
