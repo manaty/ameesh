@@ -2361,7 +2361,11 @@ def contract_modules(worktree: Path, *, base: str = "",
             except (OSError, ValueError, KeyError) as exc:
                 raise PaquetAutoError("plan commun de contrats illisible : " + str(exc)) from exc
             if shared["active"]:
-                chosen = (shared["modules"] if (plan.get("map") or {}).get("used")
+                # #7091 : une carte périmée vaut une carte absente. Celle du
+                # 27/10 (386 h), lue sur une fondation (housekeeping.py),
+                # mettait 1324 modules dans la passe des contrats.
+                card = plan.get("map") or {}
+                chosen = (shared["modules"] if card.get("used") and not card.get("stale")
                           else shared["contracts"])
                 modules.extend("tests." + name for name in chosen)
     return _dedupe_modules(worktree, modules)
@@ -4896,9 +4900,16 @@ def request_full_ci(worktree: Path, carrier: int, head: str) -> str:
 
 
 def note_carrier(worktree: Path, carrier: int, note: str) -> str:
-    """Une note au journal du porteur ; une erreur est dite, jamais fatale."""
-    proc = run_command(["ameesh", "work", "note", str(carrier), note],
-                       cwd=worktree, timeout=GIT_TIMEOUT)
+    """Une note au journal du porteur ; une erreur est dite, jamais fatale.
+
+    #7091 : le texte passe par l'entrée standard (`work note <lot> -`) ; une
+    projection de contrats de plus de 128 Kio (MAX_ARG_STRLEN) faisait mourir
+    l'appel en E2BIG, une OSError qui arrêtait toute la composition."""
+    try:
+        proc = run_command(["ameesh", "work", "note", str(carrier), "-"],
+                           cwd=worktree, input_text=note, timeout=GIT_TIMEOUT)
+    except (OSError, PaquetAutoError) as exc:
+        return "note du porteur #%d non écrite : %s" % (carrier, exc)
     if proc.returncode != 0:
         return "note du porteur #%d non écrite : %s" % (carrier, _tail(_output(proc)))
     return "note du porteur #%d écrite" % carrier

@@ -133,6 +133,17 @@ class SharedPlanTest(unittest.TestCase):
         self.assertEqual(pv.meets_canon(fallback, self.params, str(self.repo), head=self.head,
                                        contract_policy=self.policy), (True, ''))
 
+    def test_stale_map_packet_takes_contracts_only(self):
+        # #7091 : une carte périmée vaut une carte absente pour la passe des
+        # contrats du paquet ; la sélection d'impact (test_changed, test_map)
+        # n'y entre pas.
+        expected = self.packet_modules(self.plan(used=False))
+        stale = self.packet_modules(self.plan(stale=True))
+        self.assertEqual(stale, expected)
+        self.assertNotIn('test_map', stale)
+        self.assertNotIn('test_changed', stale)
+        self.assertIn('test_map', self.packet_modules(self.plan()))
+
     def test_stale_map_rules_unchanged(self):
         plan = self.plan(stale=True)
         self.assertEqual(plan['selection']['mode'], 'impacted')

@@ -48,9 +48,21 @@ RESOLVED = MANIFEST.replace("| 1 | #3801 | `035249f490d2` | `035249f49` | compos
                             "| 1 | #3779, #3755 | `404177ae7c83` | `51762f6fa8b1` | résolution |")
 
 
+def _logical(cmd, input_text):
+    """#7091 : un texte passé par l'entrée standard (« - ») est relu à sa
+    place, pour que les tests lisent la commande telle qu'elle porte."""
+    if input_text is None or "-" not in cmd[1:]:
+        return list(cmd)
+    cmd = list(cmd)
+    cmd[cmd.index("-", 1)] = input_text
+    return cmd
+
+
 class FakeShell:
     def __init__(self):
         self.calls: list[list[str]] = []
+        #: #7091 : argv réellement passés (sans substitution de stdin).
+        self.argvs: list[list[str]] = []
         self.mails: list[tuple[str, str]] = []
         self.lists: dict[str, list] = {}
         self.items: dict[int, dict] = {}
@@ -69,10 +81,13 @@ class FakeShell:
         self.recomposed_head: str | None = None
 
     def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
-        self.calls.append(list(cmd))
+        self.argvs.append(list(cmd))
         if cmd[0] == "agent-mail":
+            self.calls.append(list(cmd))
             self.mails.append((cmd[2], input_text))
             return ph.Result(0)
+        cmd = _logical(cmd, input_text)
+        self.calls.append(cmd)
         if cmd[0] == "gh":
             # #5696 : forge illisible par défaut, le relevé d'ameesh fait foi
             return ph.Result(1, "", "gh absent du banc")
@@ -1125,10 +1140,11 @@ class SchemaTest(unittest.TestCase):
 
         class Sh:
             def run(self, cmd, input_text=None, **kw):
-                calls.append(cmd)
                 if cmd[0] == "agent-mail":
+                    calls.append(cmd)
                     mails.append((cmd[2], cmd, input_text))
                     return ph.Result(0)
+                calls.append(_logical(cmd, input_text))
                 if cmd[0] == "ameesh":
                     return ph.Result(0, json.dumps({"created": created, "lot": 4100}))
                 if cmd[-1] == "--dry-run":
@@ -1345,6 +1361,62 @@ class ExcludeOptionTest(unittest.TestCase):
         finally:
             ph.auto.compose_packet = original
         self.assertEqual(parsed, ["mesh-design", "x"])
+
+
+
+class LongTextStdinTest(Base):
+    """#7091 : la projection des contrats de h-20261112-06 dépassait 128 Kio
+    (MAX_ARG_STRLEN) ; passée en argv, `ameesh work note` mourait en E2BIG
+    et chaque tentative du paquet échouait après la passe des contrats."""
+
+    BIG = "paquet-auto: contrats\n" + "x" * (200 * 1024)
+    LIMIT = 128 * 1024
+
+    def assert_argv_bounded(self):
+        for argv in self.shell.argvs:
+            for arg in argv:
+                self.assertLess(len(arg.encode()), self.LIMIT, argv[:4])
+
+    def test_note_de_plus_de_200_kio_par_stdin(self):
+        self.shell.items[4000] = carrier()
+        self.ctx.note(4000, self.BIG)
+        [argv] = self.shell.argvs
+        self.assertEqual(argv, ["ameesh", "work", "note", "4000", "-",
+                                "--actor", "mesh-design"])
+        self.assertEqual(self.shell.items[4000]["events"][-1]["note"], self.BIG)
+        self.assert_argv_bounded()
+
+    def test_retrait_du_paquet_et_alerte_par_stdin(self):
+        run = self.shell.run
+
+        def opened(cmd, **kw):
+            if cmd[1:4] == ["work", "fingerprint", "open"]:
+                self.shell.argvs.append(list(cmd))
+                return ph.Result(0, json.dumps({"created": True, "lot": 4100}))
+            return run(cmd, **kw)
+
+        self.shell.run = opened
+        ph.alert_once(self.ctx, "k", "titre", "tick", self.BIG)
+        tests = ["tests.test_x.T.test_%d" % i for i in range(20000)]
+        ph.exclude(self.ctx, 3801, 4000, "h-20261112-06", "77", tests)
+        [move] = self.shell.ran("work", "move", "3801", "build")
+        self.assertIn(tests[-1], move[move.index("--note") + 1])
+        [note] = self.shell.ran("work", "note")
+        self.assertEqual(note[4], self.BIG)
+        self.assert_argv_bounded()
+
+    def test_paquet_auto_note_du_porteur_par_stdin(self):
+        auto = ph.auto
+        with mock.patch.object(auto, "run_command",
+                               return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run:
+            said = auto.note_carrier(ROOT, 4000, self.BIG)
+        self.assertEqual(said, "note du porteur #4000 écrite")
+        self.assertEqual(run.call_args.args[0], ["ameesh", "work", "note", "4000", "-"])
+        self.assertEqual(run.call_args.kwargs["input_text"], self.BIG)
+        with mock.patch.object(auto, "run_command",
+                               side_effect=OSError(7, "Argument list too long")):
+            said = auto.note_carrier(ROOT, 4000, "x")
+        self.assertIn("non écrite", said)
 
 
 if __name__ == "__main__":
