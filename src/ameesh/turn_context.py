@@ -300,20 +300,27 @@ def _request_validate(row: Any, index: int) -> None:
     _object(row.get("payload"), "requests[%d].payload" % index)
 
 
-def _refuse_secrets(serialized: str, secrets: Iterable[str] | None) -> None:
+def contains_secret(serialized: str, secrets: Iterable[str] | None) -> bool:
+    """Whether `serialized` holds an exact known secret value, raw or in its
+    JSON-escaped form (also used by the conversation segment, #7049)."""
     for value in secrets or ():
         if not value:
             continue
         if value in serialized:
-            # Never echo the value: the error is written to the runner log.
-            raise ContextError("the turn context would contain a secret value; "
-                               "refusing to write it")
+            return True
         # JSON escapes quotes, backslashes and control characters: compare the
         # escaped form too, so a credential containing one is still caught.
         escaped = json.dumps(value, ensure_ascii=False)[1:-1]
         if escaped != value and escaped in serialized:
-            raise ContextError("the turn context would contain a secret value; "
-                               "refusing to write it")
+            return True
+    return False
+
+
+def _refuse_secrets(serialized: str, secrets: Iterable[str] | None) -> None:
+    if contains_secret(serialized, secrets):
+        # Never echo the value: the error is written to the runner log.
+        raise ContextError("the turn context would contain a secret value; "
+                           "refusing to write it")
 
 
 def write(state_dir: str, document: dict, *, secrets: Iterable[str] | None = None) -> str:
