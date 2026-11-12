@@ -49,6 +49,9 @@ REWRITTEN = (
     "agent_registry.retired_by", "agent_watches.agent", "agent_watches.enabled_by",
     "alert_acknowledgements.actor", "budget_events.actor", "budget_limits.set_by",
     "commitments.created_by", "commitments.owner", "conversation_heads.agent",
+    # #7050 (0572): the move attempt follows the agent; its requester is an
+    # ordinary actor (not an approval), renamed like `work_items.planned_by`
+    "conversation_moves.agent", "conversation_moves.requested_by",
     "estimate_references.published_by", "external_executors.declared_by",
     "external_executors.retired_by", "github_watch_pending.agent", "host_lifecycle.actor",
     "host_lifecycle.return_requested_by", "host_lifecycle_transitions.actor",

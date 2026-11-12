@@ -72,5 +72,12 @@ create index if not exists conversation_moves_target
     on conversation_moves (target_host)
     where state in ('planned', 'prepared', 'switched', 'recovered', 'rehydrating');
 
+-- Same spelling contract as agent_rename.REWRITTEN: resolve aliases on new
+-- writes, under the registry lock used by the rename transaction (0516).
+drop trigger if exists ameesh_agent_spelling on conversation_moves;
+create trigger ameesh_agent_spelling before insert or update of agent,requested_by
+    on conversation_moves
+    for each row execute function ameesh_agent_spelling('agent requested_by');
+
 comment on table conversation_moves is
     '#7050 (design 5322 §2.3): one row per conversation move attempt; ids, hosts, bounds and digest only — never the segment text nor a credential or transcript path.';
