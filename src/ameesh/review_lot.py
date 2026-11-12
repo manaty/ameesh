@@ -963,6 +963,36 @@ def _heads_on_merge(db, lot: int, merged: str, repo: Optional[str] = None) -> li
     return heads
 
 
+def _fallback_claims(ops, lot: int) -> list:
+    """#7012 : les marques de repli lisibles du journal du lot, sans conclure.
+
+    Une marque dit que la porte a admis le lot par repli d'une famille en
+    pause (#6990), sur le gel qu'elle nomme. Elle ne prouve pas que ce gel est
+    entré dans la fusion : `_fallback_on_merge` l'exige par Git. Cette lecture
+    séparée permet au rattrapage de distinguer « aucun repli dû » (une classe
+    non légère ordinaire, terminale) d'un « repli réclamé mais non prouvé »
+    (une mission due, à réessayer quand le clone la prouve). Un journal
+    illisible ne rend aucune marque : rien n'est supposé."""
+    from . import review_family_paused
+    return review_family_paused.recorded(
+        _noted(ops, lot, review_family_paused.FALLBACK_PREFIX))
+
+
+def _fallback_claimed(db, ops, lot: int) -> bool:
+    """#7012 : une marque de repli nomme-t-elle le **dernier** gel du lot ?
+
+    Une marque d'un gel antérieur ne réclame rien pour une tête re-gelée
+    depuis (#2585) : seule la marque du gel courant dit que la porte a admis
+    ce lot-ci par repli. Sans cette distinction, un ancien repli ferait
+    réessayer sans fin une classe non légère ordinaire."""
+    freezes = _freezes(db, lot)
+    frozen = str(freezes[-1].get("sha") or "").strip() if freezes else ""
+    if not frozen:
+        return False
+    return any(plan_git.same_commit(str(payload.get("freeze") or ""), frozen)
+               for payload in _fallback_claims(ops, lot))
+
+
 def _fallback_on_merge(db, ops, lot: int, item: dict, merged: str,
                        repo: Optional[str] = None) -> Optional[dict]:
     """#6990 : la marque de repli qui couvre cette fusion, ou `None`.
@@ -971,10 +1001,9 @@ def _fallback_on_merge(db, ops, lot: int, item: dict, merged: str,
     que si ce gel est une des têtes que la fusion a fait entrer (`_heads_on_merge`,
     qui exige Git quand il faut prouver le gel). Une marque d'un autre gel, ou
     un journal illisible, n'ouvre pas de relecture : le repli ne se suppose
-    jamais."""
-    from . import review_family_paused
-    notes = review_family_paused.recorded(
-        _noted(ops, lot, review_family_paused.FALLBACK_PREFIX))
+    jamais. #7012 : un repli marqué mais non prouvé n'est pas perdu — le
+    rattrapage le réessaie (`open_after_merge` rend `fallback_unproven`)."""
+    notes = _fallback_claims(ops, lot)
     if not notes:
         return None
     heads = _heads_on_merge(db, lot, merged, repo=repo)
@@ -1140,7 +1169,8 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     out = {"lot": lot, "id": None, "created": False, "class": review_class,
            "merged_class": merged_class, "critical": critical,
            "reviews": reviews, "already_reviewed": False, "reviewed_by": [],
-           "why": ""}
+           "fallback_unproven": False, "why": ""}
+    ops = storage.of(db).work
     # #6990 : un lot admis par le repli d'une famille en pause (décision owner
     # #213032 a) garde une relecture due **après** fusion, celle de la famille
     # en pause. La marque du journal, écrite par la porte sur le gel exact,
@@ -1153,11 +1183,21 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
         if item is None:
             out["why"] = "lot #%d introuvable" % lot
             return out
-        fallback = _fallback_on_merge(db, storage.of(db).work, lot, item,
-                                      merged_sha, repo)
+        fallback = _fallback_on_merge(db, ops, lot, item, merged_sha, repo)
         if fallback is None:
-            out["why"] = ("class %s: pas de lot de relecture après fusion (§2)"
-                          % (merged_class or "?"))
+            # #7012 : une marque de repli lisible mais non prouvée par Git
+            # n'est pas une classe non légère ordinaire. La mission de la
+            # famille en pause reste due ; le rattrapage doit la réessayer au
+            # lieu de la clore. Sans marque, rien n'est dû (canon §2).
+            out["fallback_unproven"] = _fallback_claimed(db, ops, lot)
+            if out["fallback_unproven"]:
+                out["why"] = (
+                    "class %s: repli #6990 marqué mais non prouvé sur la fusion "
+                    "(gel non prouvé entré par Git) — mission due, réessayée"
+                    % (merged_class or "?"))
+            else:
+                out["why"] = ("class %s: pas de lot de relecture après fusion (§2)"
+                              % (merged_class or "?"))
             return out
         reviews = 1
         out["reviews"] = reviews
@@ -1183,7 +1223,6 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
         out["why"] = vehicle
         return out
     ref = ref_of(lot)
-    ops = storage.of(db).work
     existing = _open(ops, ref)
     if existing is not None:
         out.update({"id": int(existing["id"]),
@@ -1663,7 +1702,7 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
     out = {"lot": lot, "id": None, "created": False, "class": "",
            "merged_class": "", "critical": False, "reviews": 0,
            "already_reviewed": False, "reviewed_by": [], "fallback": None,
-           "why": ""}
+           "fallback_unproven": False, "why": ""}
     try:
         item = work.get(db, lot)
         if item is None:
@@ -1706,6 +1745,7 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
                     "already_reviewed": bool(opened.get("already_reviewed")),
                     "reviewed_by": list(opened.get("reviewed_by") or []),
                     "fallback": opened.get("fallback"),
+                    "fallback_unproven": bool(opened.get("fallback_unproven")),
                     "why": opened.get("why") or ""})
         return out
     except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
@@ -1851,6 +1891,11 @@ def catch_up(db, *, repo: str = "", target: str = "",
     #6990 : un candidat non léger admis par le repli d'une famille en pause fait
     exception — la mission de cette famille reste due après fusion et se
     réessaie comme celle d'un léger tant que sa création échoue.
+    #7012 : la même mission reste due quand la marque de repli est lisible
+    mais que Git ne prouve pas encore le gel (clone partiel, commit absent) :
+    `open_after_merge` rend `fallback_unproven`, le candidat reçoit une
+    **tentative comptée** au lieu de la marque terminale d'une classe non
+    légère ordinaire — une preuve qui arrive ensuite ouvre la mission.
 
     #2585 : un candidat dont la tête est déjà relue par une autre famille
     n'ouvre rien ; il reçoit la marque terminale (`reviewed`) au lieu d'être
@@ -2042,7 +2087,8 @@ def catch_up(db, *, repo: str = "", target: str = "",
             merged_class = str(done.get("merged_class") or done.get("class") or "")
             if (not done.get("doubt") and merged_class
                     and merged_class != lot_class.LIGHT
-                    and not done.get("fallback")):
+                    and not done.get("fallback")
+                    and not done.get("fallback_unproven")):
                 # classe confirmée non-light : le canon §2 ne demande une
                 # relecture après fusion que pour un lot léger — terminal.
                 # On lit la classe du diff fusionné, pas celle du lot de
@@ -2053,6 +2099,10 @@ def catch_up(db, *, repo: str = "", target: str = "",
                 # a) même si sa création a échoué. `open_for_merge` rend le
                 # repli trouvé, donc ce candidat se réessaie comme un léger au
                 # lieu d'être clos à tort.
+                # #7012 : un repli **marqué** mais dont Git ne prouve pas le
+                # gel n'est pas une classe non légère ordinaire — la mission
+                # reste due et se réessaie (tentative comptée), au lieu d'un
+                # terminal qui la perdrait à la première preuve absente.
                 out["terminal"] += 1
                 close_terminal(lot, state, "classe %s confirmée non-light"
                                % merged_class)
