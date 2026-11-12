@@ -371,6 +371,32 @@ class WorkerTest(Base):
         w._finish_move_turn(True)
         self.assertFalse(w._conversation_move_open())
 
+    def test_queued_prompt_taken_then_refused_does_not_block_the_switch(self):
+        # relecture dev3 (B2) : la vraie séquence du runner — consigne prise
+        # (`running`), admission refusée, consigne remise ; le statut ne
+        # reste pas `running` et la bascule part
+        from types import SimpleNamespace
+        from ameesh.runner import AgentWorker
+        move = self.plan()
+        registry.set_pending_prompt(self.db, "avatar", "une question de l'humain")
+        self.assertIsNotNone(registry.take_pending_prompt(
+            self.db, "avatar", "runner-src", self.epoch))
+        self.assertEqual(self.row()["status"], "running")
+        reason = self.begin()
+        self.assertEqual(reason, M.BEGIN_REFUSAL)
+        w = self.worker({"lease_epoch": self.epoch})
+        w.runner = SimpleNamespace(host="source", runner_id="runner-src", dry_run=False,
+                                   db_retry_max=1)
+        w.wake = threading.Event()
+        w.wait_timeout = lambda delay: 0
+        w._release_running_for_move = AgentWorker._release_running_for_move.__get__(w)
+        AgentWorker._begin_turn_refused(w, reason)
+        row = self.row()
+        self.assertEqual((row["status"], row["pending_prompt"]),
+                         ("queued", "une question de l'humain"))
+        self.assertEqual(self.advance(), [(move["move_id"], "prepared"),
+                                          (move["move_id"], "switched")])
+
     def test_mediated_executor_has_no_move_hooks(self):
         # B3 (relecture 2/2) : RemoteDb n'a pas `conversation_moves` — no-op
         # explicite, jamais AttributeError, jamais « ouvert pour toujours »

@@ -2460,6 +2460,8 @@ class AgentWorker(threading.Thread):
         """#5856: a refused admission must not become an immediate retry."""
         log("[%s] turn admission refused: %s" % (self.name, reason))
         registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        if reason == conversation_move.BEGIN_REFUSAL:
+            self._release_running_for_move()
         if reason in ("lease_lost", "lease_expired", "missing", "handoff_fenced", "stopped"):
             self.lease_lost.set()
         elif reason == "host_closed":
@@ -2472,6 +2474,21 @@ class AgentWorker(threading.Thread):
             delay = retry.echec()
             self.wake.wait(timeout=self.wait_timeout(delay))
             self.wake.clear()
+
+    def _release_running_for_move(self) -> None:
+        """#7050 (relecture dev3, B2) : `take_pending_prompt` a posé `running`,
+        puis `begin_turn` a refusé (`conversation_move`) sans ouvrir de tour —
+        la consigne remise, le statut ne peut pas rester `running` : `switch`
+        attendrait la fin d'un tour qui n'existe pas, jusqu'à l'expiration."""
+        try:
+            row = registry.get(self.db, self.name) or {}
+            if row.get("status") == "running":
+                registry.set_status(self.db, self.name,
+                                    "queued" if row.get("pending_prompt") else "idle",
+                                    status_text="conversation move in progress")
+        except db_mod.DbError as exc:
+            log_async("[%s] status after the move refusal not written (%s)"
+                      % (self.name, db_mod.explain(exc)))
 
     def _leave_for_host(self) -> None:
         """L159f : porte d'hôte fermée — plus aucun tour ici. Session écrite,
