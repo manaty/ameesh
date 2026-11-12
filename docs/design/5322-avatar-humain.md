@@ -256,6 +256,38 @@ Règles de construction :
 - digest SHA-256 du JSON canonique ; la cible vérifie le digest avant de
   l'envoyer ; un digest qui ne correspond pas refuse le déplacement.
 
+**Implémenté par A1 (#7049)** dans `src/ameesh/conversation_segment.py`
+(`build`, `select`, `render`, `seal`, `verify`), sans appelant de production
+avant A2. Précisions du contrat :
+
+- un tour est tout ce qui suit le `turn_end` précédent jusqu'à son propre
+  `turn_end` ; le tour ouvert (sans `turn_end`) est exclu, son entrée reste à
+  la file ; le budget porte sur le JSON canonique du document ;
+- `cut` vaut `null` quand tout le journal disponible tient ; sinon
+  `{truncated_before_seq, reason: "bytes"}`, où `truncated_before_seq` est la
+  première entrée gardée, plus `reduced_seq` (le `turn_end` d'un tour gardé
+  sans ses entrées intermédiaires) ; le tour le plus récent est toujours
+  gardé, ses textes tronqués (`truncated: true`) si même sa forme réduite
+  dépasse ;
+- la lecture est une fenêtre des 500 dernières entrées ; si elle commence au
+  milieu d'un tour (tour de plus de 500 entrées), ses messages humains sont
+  relus à rebours jusqu'au `turn_end` précédent et ce tour n'est gardé que
+  réduit ; le fil n'est alors pas consulté ;
+- les entrées `input` et `state` ne sont jamais incluses (le courrier est
+  relu par le tour lui-même) ; un `tool` ne garde que `meta.{tool, status}`,
+  nom filtré par `safe_tool_name` ;
+- repli sur le fil : quand le détail retenu ne commence pas à la séquence 1,
+  les copies R12 (`meta.conversation.{agent, seq}`) antérieures à la première
+  entrée retenue fournissent les messages humains et les réponses finales
+  (`source: "thread"`) ;
+- filtre de secrets : chaque valeur exacte de secret connu
+  (`turn_context.environment_secrets`) est remplacée par `[secret retiré]`,
+  puis `seal` refuse le document si une valeur subsiste, brute ou échappée
+  JSON, dans le JSON ou dans son rendu (`turn_context.contains_secret`, la
+  garde du writer du contexte de tour) ;
+- rendu : chaque message est cité (`> `), si bien qu'aucun texte ne peut
+  reproduire seul sur sa ligne le marqueur de fin.
+
 ### 2.3 Le protocole de déplacement
 
 Le déplacement est un **handoff de conversation** à la frontière de tour,
