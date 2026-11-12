@@ -5543,9 +5543,11 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     for role, seat in sorted(seats.items()):
         if seat is None:
             agent = canon.agent(role)
+            # #7048 : les candidats d'un agent `preference` viennent du Placement
             add("agent-election-max-agents", ERROR,
                 "elected agent %s: no candidate (%s) has a free place under max_agents"
-                % (role, ", ".join(agent.candidats)), agent.fiche, agent=role)
+                % (role, ", ".join(lease_candidates(canon, agent) or [])),
+                agent.fiche, agent=role)
 
     # -- politique de revue par classe (décision 0018 point 1, R19) ------------
     # La déclaration vit dans `federation.yaml`, sous `review_policies.classes`,

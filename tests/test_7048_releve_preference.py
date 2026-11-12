@@ -94,6 +94,27 @@ class PreferenceCanonTest(test_canon._TmpMixin, unittest.TestCase):
         _pinned, seats = canon.admission_load(loaded, covered)
         self.assertEqual(seats.get("relecteur"), "banc")
 
+    def test_aucune_place_erreur_sans_exception(self):
+        """B qa-01 (#39780) : candidats pleins → erreur de fiche, pas TypeError."""
+        from .test_placement import host_card
+        write(self.root, "agents/relecteur.md", avatar())
+        write(self.root, "placements/relecteur-atelier.md", admission())
+        # orchestre est épinglé sur atelier, ouvrier sur banc : plus de place
+        write(self.root, "hotes/atelier.md", host_card(
+            "atelier", harnesses=["claude", "codex", "deepseek"],
+            providers=["anthropic", "openai", "deepseek"],
+            credential_modes=["api-key", "subscription"],
+            work_roots="{acme-web: ~/acme/acme-web}", max_agents="1"))
+        write(self.root, "hotes/banc.md", host_card(
+            "banc", "human:alice", harnesses=["deepseek", "codex"],
+            providers=["deepseek", "openai"], credential_modes=["api-key"],
+            work_roots="{acme-web: /srv/acme/acme-web}", max_agents="1"))
+        found = [f for f in canon.validate(self.load())
+                 if f.code == "agent-election-max-agents"]
+        self.assertEqual(len(found), 1, found)
+        self.assertEqual(found[0].severity, canon.ERROR)
+        self.assertIn("(banc, atelier)", found[0].message)
+
 
 class PreferenceSyncTest(test_canon._CanonDbCase):
     def setUp(self) -> None:
