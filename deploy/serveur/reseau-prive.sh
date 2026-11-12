@@ -17,6 +17,9 @@
 #       pairs joignables sur le réseau privé (Postgres s'il écoute), aucune
 #       base sur une adresse publique ; --hub-arrete exige en plus que le hub
 #       WireGuard (10.77.0.1) soit injoignable : l'essai de l'acceptation.
+#       Sur le hub (wg0.conf présent), chaque pair attendu de wg0 doit être
+#       posé (#7002) : ceux de wg0.conf et ceux des unités qui déclarent
+#       X-Ameesh-Pair-WireGuard (ameesh-bg-peer.service).
 #
 # RACINE préfixe les chemins de /etc (tests) ; rien d'autre ne change.
 set -euo pipefail
@@ -27,6 +30,8 @@ PG_VERSION=${PG_VERSION:-17}
 PG_CONF=$RACINE/etc/postgresql/$PG_VERSION/main
 MARQUE='# ameesh-reseau-prive (EP8.2)'
 HUB=${HUB:-10.77.0.1}
+WG_CONF=$RACINE/etc/wireguard/wg0.conf
+UNITES=$RACINE/etc/systemd/system
 
 log() { printf '[reseau-prive] %s\n' "$*" >&2; }
 meurt() { log "$*"; exit 2; }
@@ -195,6 +200,42 @@ dans() {
   (( (x ^ y) >> (32 - p) == 0 ))
 }
 
+# Pairs attendus de wg0, une ligne « <nom> <adresse> » : chaque AllowedIPs d'un
+# [Peer] de wg0.conf (nom pris au commentaire « # appareil <nom> » d'ajouter-
+# appareil.sh) et chaque pair posé hors de wg0.conf par une unité qui le
+# déclare. Aucune clé : l'adresse suffit à reconnaître le pair.
+pairs_attendus() {
+  awk '/^# appareil /{nom=$3; next}
+       /^\[/{pair=($0 ~ /^\[Peer\]/); if (!pair) nom=""; next}
+       pair && /^AllowedIPs *=/{sub(/^AllowedIPs *= */, ""); n=split($0, a, / *, */)
+         for (i = 1; i <= n; i++) print (nom == "" ? "(sans-nom)" : nom), a[i]
+         nom=""}' "$WG_CONF"
+  local f
+  for f in "$UNITES"/*.service; do
+    [[ -f $f ]] || continue
+    sed -n 's/^X-Ameesh-Pair-WireGuard= *//p' "$f"
+  done
+}
+
+# Sur le hub : chaque pair attendu figure dans `wg show wg0` ; rend le nombre
+# d'échecs. Un pair posé par une unité tombe sans bruit quand wg0 redémarre
+# sans elle (#7002 : 1 h 46 sans base pour bureau-goal).
+verifier_pairs() {
+  local actifs nom adr manquants=0
+  [[ -r $WG_CONF ]] || { log "ÉCHEC $WG_CONF illisible (root ?)"; return 1; }
+  actifs=$(wg show wg0 allowed-ips) || { log "ÉCHEC wg0 illisible (wg show wg0)"; return 1; }
+  while read -r nom adr; do
+    [[ -n $adr ]] || continue
+    [[ $adr == */* ]] || adr+=/32
+    if awk -v a="$adr" '{for (i = 2; i <= NF; i++) if ($i == a) f=1} END {exit !f}' <<<"$actifs"; then
+      log "ok pair wg0 $nom ($adr)"
+    else
+      log "ÉCHEC pair wg0 $nom ($adr) absent"; manquants=$((manquants + 1))
+    fi
+  done < <(pairs_attendus)
+  return "$manquants"
+}
+
 cmd_verifier() {
   local sous_reseau=${1:-} hub_arrete='' pairs=()
   shift || true
@@ -222,6 +263,10 @@ cmd_verifier() {
   else
     log "hub WireGuard $HUB injoignable"
   fi
+  if [[ -e $WG_CONF ]]; then
+    if [[ -n $hub_arrete ]]; then log "wg0 arrêté : pairs non vérifiés"
+    else verifier_pairs || echecs=$((echecs + $?)); fi
+  fi
   for pair in "${pairs[@]}"; do
     { ipv4_valide "$pair" && dans "$pair" "$sous_reseau"; } || meurt "pair hors du sous-réseau : $pair"
     if ! ping -c 2 -W 2 -q "$pair" >/dev/null 2>&1; then
@@ -242,5 +287,5 @@ case ${1:-} in
   interface) shift; cmd_interface "$@" ;;
   postgres) shift; cmd_postgres "$@" ;;
   verifier) shift; cmd_verifier "$@" ;;
-  *) sed -n '4,21p' "$0" >&2; exit 2 ;;
+  *) sed -n '4,24p' "$0" >&2; exit 2 ;;
 esac

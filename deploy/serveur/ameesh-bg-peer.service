@@ -1,0 +1,21 @@
+# #6269 — pair bureau-goal, filtre avant pair ; échec du filtre = pas de pair.
+# #7002 — versionnée ; WantedBy=wg-quick@wg0 : un stop/start de wg0 relance
+# aussi le pair (PartOf seul ne propageait que l'arrêt). Le pair reste hors de
+# wg0.conf : wg-quick le poserait avant le filtre (échec ouvert).
+# Pose : deploy/serveur/RESEAU-PRIVE.md, « Pairs hors de wg0.conf ».
+[Unit]
+Description=ameesh: bureau-goal WireGuard peer limited to central DB (#6269)
+After=wg-quick@wg0.service docker.service
+Requires=wg-quick@wg0.service
+PartOf=wg-quick@wg0.service
+# Inventaire lu par `reseau-prive.sh verifier` sur le hub : <nom> <adresse>
+X-Ameesh-Pair-WireGuard=bureau-goal 10.77.0.6/32
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ameesh-bg-peer.sh start
+ExecStop=/usr/local/sbin/ameesh-bg-peer.sh stop
+
+[Install]
+WantedBy=multi-user.target wg-quick@wg0.service
