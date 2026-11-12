@@ -797,20 +797,30 @@ def canon_drift_findings(records, *, head: str, first_ahead, now: float) -> list
     `canon_ref` per key. `head`: the commit of the agents' canon.
     `first_ahead(canon_ref, head)`: commit time of the oldest first-parent
     commit of `head` that `canon_ref` lacks, None when nothing lacks or when
-    the agents' clone cannot judge (unknown commit: it may simply lag)."""
+    the agents' clone cannot judge (unknown commit: it may simply lag).
+    #7053: a refused automatic refresh (`canon_refresh`) alerts at once,
+    with its reason, whatever the age of the drift."""
     out = []
     for key, data in records:
         ref = str(data.get("canon_ref") or "")
         if not ref or not head or ref == head:
             continue
         since = first_ahead(ref, head)
-        if since is None or now - since < CANON_DRIFT_S:
+        refresh = data.get("canon_refresh")
+        refused = (str(refresh.get("reason") or "refused")
+                   if isinstance(refresh, dict) and refresh.get("state") == "refused"
+                   else "")
+        if since is None or (now - since < CANON_DRIFT_S and not refused):
             continue
         detail = ("Staging executor %s reads canon %s; the agents' canon is at %s, "
                   "ahead for %.1f d (threshold 1 d). Host fiches and rules read "
-                  "by staging may be stale: install a new qualified canon copy "
-                  "at the next quiescent handover."
+                  "by staging may be stale. "
                   % (key, ref[:12], head[:12], (now - since) / 86400.0))
+        detail += ("The automatic refresh of its last completed pass was refused "
+                   "(%s): copy kept; fix the cause, or see the operator gesture "
+                   "in DEPLOIEMENT-HOTE-AGENTS.md." % refused[:200] if refused else
+                   "Its next completed pass refreshes the copy (#7053); without one, "
+                   "see the operator gesture in DEPLOIEMENT-HOTE-AGENTS.md.")
         out.append(dict(schema="ameesh-alert/1", type="staging_canon_stale",
                         agent=None, since=since, value=now - since,
                         threshold=CANON_DRIFT_S, reason=key, canon_ref=ref,

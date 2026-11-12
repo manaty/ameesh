@@ -749,6 +749,66 @@ def canon_commit(cfg) -> str:
     return ""
 
 
+#: #7053: the remote head is fetched here first; the read ref only moves to
+#: it once the check is green, so a refused head is never read.
+CANON_CANDIDATE_REF = "refs/ameesh/staging-canon-candidate"
+
+
+def refresh_canon(cfg) -> dict:
+    """#7053: bring this host's canon copy to its remote head, check first.
+
+    Only a remote-tracking revision (`origin/main` by default) moves; a
+    pinned `canon_ref` stays. The head is fetched into a candidate ref,
+    loaded and validated at that commit (`canon check` errors), then the
+    read ref is swapped in one compare-and-swap `update-ref`, fast-forward
+    only. Any refusal leaves the copy unchanged and is returned, never
+    raised: the record carries it to the alert."""
+    from ameesh import canon
+    path = getattr(cfg, "canon", "")
+    rev = getattr(cfg, "canon_ref", "") or "origin/main"
+    try:
+        repo = canon.git_toplevel(path) if path else None
+        if not repo:
+            return {"state": "absent"}
+        remote, _, branch = rev.partition("/")
+        remotes = (canon._git_out(repo, "remote") or "").split()
+        if remote not in remotes or not branch or branch.startswith("-"):
+            return {"state": "pinned", "ref": rev}
+        tracking = "refs/remotes/%s/%s" % (remote, branch)
+        old = canon.git_commit(repo, tracking) or ""
+        # `--refmap=`: the remote's configured refspec must not move the
+        # read ref along with the candidate (opportunistic update).
+        proc = canon._git(repo, "fetch", "--quiet", "--no-tags", "--refmap=",
+                          "--no-write-fetch-head", "--", remote,
+                          "+refs/heads/%s:%s" % (branch, CANON_CANDIDATE_REF),
+                          timeout=canon.FETCH_TIMEOUT)
+        if proc.returncode != 0:
+            error = proc.stderr.decode("utf-8", "replace").strip()
+            return {"state": "refused", "from": old, "reason": "fetch: " + (
+                error.splitlines()[0][:200] if error else "code %d" % proc.returncode)}
+        new = canon.git_commit(repo, CANON_CANDIDATE_REF) or ""
+        if not new:
+            return {"state": "refused", "from": old, "reason": "fetched head unreadable"}
+        if new == old:
+            return {"state": "current", "from": old}
+        if old and not canon.git_contains(repo, old, new):
+            return {"state": "refused", "from": old, "to": new,
+                    "reason": "not a fast-forward"}
+        errors = canon.errors(canon.validate(canon.load(path, ref=new)))
+        if errors:
+            return {"state": "refused", "from": old, "to": new,
+                    "reason": "canon check: %d error(s), first %s"
+                    % (len(errors), errors[0].code)}
+        proc = canon._git(repo, "update-ref", "-m",
+                          "ameesh staging canon refresh (#7053)", tracking, new, old)
+        if proc.returncode != 0:
+            return {"state": "refused", "from": old, "to": new,
+                    "reason": "update-ref: read ref moved during the check"}
+        return {"state": "installed", "from": old, "to": new}
+    except canon.GitError as exc:
+        return {"state": "refused", "reason": "git: %s" % str(exc)[:200]}
+
+
 def forge_runs(slug: str, sha: str) -> list:
     """The workflow runs of one exact commit, read anonymously at the forge."""
     url = "%s/repos/%s/actions/runs?head_sha=%s&per_page=100" % (FORGE_API, slug, sha)
@@ -1365,6 +1425,12 @@ def tick(db, cfg, options) -> dict:
             result.pop("reason", None)
             if code != 0 and named:
                 result["reason"] = named
+            # #7053: a completed pass is quiescent: the canon copy moves to
+            # its checked remote head now, and the record names the commit
+            # it reads afterwards (the alert compares that one).
+            if result["state"] == "completed":
+                result["canon_refresh"] = refresh_canon(cfg)
+                result["canon_ref"] = canon_commit(cfg)
             _record(db, options["key"], result, lease=lease)
             return result
         finally:

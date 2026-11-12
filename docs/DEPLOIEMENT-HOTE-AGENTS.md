@@ -1164,6 +1164,52 @@ séquence ne touche jamais, comme ses `--absent`). Le clone dédié se place à
 trois niveaux au plus sous le dossier personnel (par exemple
 `~/staging/ameesh`) : la sonde y cherche les arbres conservés.
 
+**Copie du canon de l'exécutant (#7053).** L'exécutant lit les fiches d'hôtes
+et les règles dans **sa** copie du canon : la racine `canon` (ou la première
+entrée de `canons`) de la configuration ameesh du compte d'exécution
+(`~/.config/ameesh/config.json` ou `AMEESH_CANON` dans `~/.config/ameesh/env`,
+par exemple `~ameesh-staging/canon`, un clone de `manaty/home`), à la
+révision `canon_ref` (défaut `origin/main`), jamais celle du compte des
+runners. Chaque enregistrement de la passe porte le commit lu (`canon_ref`) ;
+`staging_canon_stale` part quand la tête du canon des agents a plus d'un jour
+d'avance (#5727).
+
+Aucun runner ne tourne sous ce compte : c'est l'exécutant qui tient sa copie à
+jour. À la fin de chaque passe `completed` (séquence quiescente, bail encore
+tenu), il récupère la tête distante dans `refs/ameesh/staging-canon-candidate`
+(`fetch --refmap=`, sans toucher la référence lue), la charge et la valide à
+ce commit (les erreurs de `ameesh canon check`), puis avance la référence lue
+(`refs/remotes/origin/main`) d'un seul `update-ref` à comparaison, en avance
+rapide seulement. Le résultat va dans l'enregistrement (`canon_refresh` :
+`installed`, `current`, `pinned` pour un `canon_ref` fixe, `absent`, ou
+`refused` avec sa raison) et `canon_ref` y est relu après coup. Un refus
+(check rouge, fetch en échec, historique réécrit, référence déplacée pendant
+le check) laisse la copie intacte et fait partir `staging_canon_stale` aussitôt,
+raison comprise, sans attendre le seuil d'un jour. L'arbre de travail et `HEAD`
+du clone ne sont pas lus (seul l'objet de la révision l'est) et ne bougent pas.
+Une passe `partial`, `failed` ou bloquée ne touche pas la copie.
+
+Geste manuel de l'opérateur (aucune passe `completed` à venir, ou refus à
+lever après correction), dans la session du compte d'exécution, sur le
+candidat élu, hors de toute séquence en cours :
+
+```sh
+CANON=~/canon            # la racine canon lue par ce compte
+git -C "$CANON" fetch --no-tags --refmap= origin \
+  +refs/heads/main:refs/ameesh/staging-canon-candidate
+~/.local/share/ameesh/venv/bin/ameesh canon check \
+  --canon "$CANON" --ref refs/ameesh/staging-canon-candidate
+git -C "$CANON" merge-base --is-ancestor origin/main \
+  refs/ameesh/staging-canon-candidate \
+  && git -C "$CANON" update-ref refs/remotes/origin/main \
+       "$(git -C "$CANON" rev-parse refs/ameesh/staging-canon-candidate)" \
+       "$(git -C "$CANON" rev-parse origin/main)"
+```
+
+Le `update-ref` ne se lance que si le check est vert (ses erreurs, pas ses
+avertissements d'hôte) ; l'alerte se tait à la prochaine passe qui traite
+une demande (son enregistrement porte le nouveau commit).
+
 Une fois la configuration et les accès approuvés, l'opérateur active les
 services sur les candidats et soumet un SHA complet :
 
