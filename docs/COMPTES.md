@@ -481,6 +481,7 @@ last resort. Each account takes these optional settings in the host's
 | `cap` [0.50 for the default account, none otherwise] | fixed cap on **every** window: above it, the account is ineligible |
 | `overage` [`auto`] | may the account be billed beyond its plan? `auto` reads it from the harness (Claude `overageStatus`, Codex `credits.has_credits`), `allowed` or `none` declare it |
 | `overage_cap` [0.80] | fixed cap on every window of an account that may be billed beyond its plan |
+| `scope` [`personal`] | `organization` explicitly marks a shared plan: no personal-use reserve, no implicit default-account 50 % cap, and a hard 95 % cap on every window even if the provider reports that paid overage is possible (#7023). The pace cap still applies (`pace_ceiling`, 90 % by default). Never inferred from the account's name. API keys cannot use this scope; use `cap` to tighten its 95 % limit. Keep `personal` for the owner's own plan. |
 | `short_window_cap` [none] | fixed cap replacing the pace cap on the short window (5 h) |
 | `pace_multiplier` [1.0] | multiplies the **elapsed share** of the pace cap: `min(90 %, elapsed × m + 10 points)`. Set per account, no implicit value (#1075: `2.0` on the Codex primary to spend its plan reserve without a reset). The reserve, the fixed caps, the overage rules, the gauges and the reset dates are unchanged |
 | `pace_ceiling` [0.90] | the account's own pace ceiling, replacing the 90 % of the guard (0019): the pace cap is `min(pace_ceiling, elapsed × pace_multiplier + 10 points)` (#1176) |

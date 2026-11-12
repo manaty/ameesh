@@ -176,6 +176,10 @@ CAP_LABEL_PRIMARY = "primary cap"
 #: the critical agents keep the margin up to it
 RESERVE = 0.10
 OVERAGE_CAP = 0.80          #: an account that may be billed beyond its plan stops early
+#: #7023 (owner 12/11) : an explicit `scope: organization` plan is meant for the
+#: mesh — no personal-use reserve, and this hard cap on every window, overage
+#: or not: never billed beyond the plan
+ORGANIZATION_CAP = 0.95
 PRIMARY_PRIORITY = 100      #: the default account comes last
 OTHER_PRIORITY = 50
 #: #1883 : durée d'une retenue d'overage publiée pour l'hôte. Quand un runner
@@ -198,6 +202,7 @@ DEFAULT_FORCE_S = 3600.0
 FORCE_EXPIRED_REASON = "forcing expired (--for): back to the automatic choice"
 #: `overage` setting: read from the harness's journals, or declared
 OVERAGE_MODES = ("auto", "allowed", "none")
+ACCOUNT_SCOPES = ("personal", "organization")
 #: windows up to this length are "short" (`short_window_cap`): 5 h for both plans
 SHORT_WINDOW_S = 6 * 3600.0
 #: #1176 : relèvement de fin de fenêtre. Dans les `pace_ceiling_end_hours`
@@ -305,6 +310,7 @@ class Profile:
     cap: float | None = None
     overage: str = "auto"
     overage_cap: float = OVERAGE_CAP
+    scope: str = "personal"  #: explicit owner classification, never inferred from the name
     short_window_cap: float | None = None
     #: #1075: multiplies the elapsed share of the pace cap (1.0 = nominal
     #: pace). #3647: compiled from the canon (`accounts.pace_multipliers` of
@@ -587,6 +593,14 @@ def parse(raw) -> dict[str, list[Profile]]:
             if overage not in OVERAGE_MODES:
                 raise AccountError("account %s/%s: overage must be one of %s"
                                    % (harness, name, ", ".join(OVERAGE_MODES)))
+            scope = str(item.get("scope") or "personal")
+            if scope not in ACCOUNT_SCOPES or (scope == "organization" and kind != "config_dir"):
+                raise AccountError("account %s/%s: scope must be personal or organization "
+                                   "(organization requires config_dir)" % (harness, name))
+            if scope == "organization" and "overage_cap" in item:
+                raise AccountError("account %s/%s: use cap to tighten the organization "
+                                   "limit; overage_cap only applies to personal accounts"
+                                   % (harness, name))
             path = str(item.get("path") or "")
             key_env = str(item.get("key_env") or "")
             key_file = str(item.get("key_file") or "")
@@ -622,7 +636,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                 key_env=key_env, key_file=_expand(key_file) if key_file else "",
                 hourly_usd=hourly, min_balance=min_balance, adopts_unnamed=adopts,
                 check_credentials=bool(item.get("check_credentials", True)),
-                priority=priority, overage=overage, **caps,
+                priority=priority, overage=overage, scope=scope, **caps,
                 pace_multiplier=pace_multiplier, pace_local=pace_local, declared=True,
                 billing_account=billing, reserve_usd=reserve,
                 max_concurrent=max_concurrent, min_start_gap_s=min_start_gap_s,
@@ -1304,7 +1318,7 @@ def account_cap(profile: Profile) -> float | None:
     ~/.codex: the owner's own), none otherwise."""
     if profile.cap is not None:
         return profile.cap
-    return PRIMARY_CAP if profile.default else None
+    return PRIMARY_CAP if profile.default and profile.scope == "personal" else None
 
 
 def priority(profile: Profile) -> int:
@@ -1529,7 +1543,11 @@ def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tupl
         cap = None
     if cap is not None:
         fixed.append((cap, CAP_LABEL_PRIMARY if profile.cap is None else "account cap"))
-    if overage_capable(profile, getattr(gauges, "overage", None)):
+    if profile.scope == "organization":
+        # This cap applies even when the provider does not report overage:
+        # a shared plan must never enter paid usage through a missing flag.
+        fixed.append((ORGANIZATION_CAP, "organization cap"))
+    elif overage_capable(profile, getattr(gauges, "overage", None)):
         fixed.append((profile.overage_cap, "overage cap"))
     return fixed
 
@@ -1568,6 +1586,7 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
     non-critiques et les plafonds fixes s'appliquent par-dessus.
     """
     fixed = fixed_caps(profile, gauges, critical=critical)
+    reserve = reserve and profile.scope == "personal"
     cut = RESERVE if reserve else 0.0
     if ceilings is None:
         ceilings = pace_ceilings(profile, gauges, now)
@@ -1674,6 +1693,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     déclenche aucune E/S réseau. `_gauges` est la relecture interne qui
     n'ouvre pas une seconde sonde.
     """
+    reserve = reserve and profile.scope == "personal"
     result = Evaluation(profile, reserve=reserve)
     result.problems = check(profile, environ)
     if result.problems:
@@ -2237,8 +2257,9 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
         # courte de la réserve ; la retrancher encore jugeait un relevé partiel
         # sous 0 % (primaire : 3 % pour un plafond déjà réservé de 10 %). Les
         # plafonds fixes, eux, ne la portent jamais.
-        cut = (0.0 if result.reserve
-               and label in ("pace cap", "short window cap") else RESERVE)
+        # #7023 : un forfait d'organisation ne garde aucune réserve.
+        cut = (0.0 if result.profile.scope == "organization" or (
+            result.reserve and label in ("pace cap", "short window cap")) else RESERVE)
         if gauge.used_at(now) >= max(0.0, cap - cut):
             return False
     return True
@@ -3389,6 +3410,7 @@ def report(cfg, db, book, *, now: float | None = None,
             rows.append({
                 "harness": harness,
                 "account": profile.name,
+                "scope": profile.scope,
                 "type": profile.kind,
                 "where": profile.describe(),
                 "active": profile.name == active_name,
