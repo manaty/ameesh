@@ -179,11 +179,11 @@ Ordre sur l'hôte :
    ameesh decide ask --lot L --needs-signature --question "$question" \
      --option replace="Replace this exact sealed runtime" \
      --option leave="Leave this host unchanged" \
-     --why "DEADLINE"
+     --recommend replace --why "DEADLINE"
    ```
    `DEADLINE` est le champ `deadline` rendu par `replacement-prepare`
    (« sign, then the gesture runs before HH:MMZ on AAAA-MM-JJ ») : il dit à
-   l'owner l'échéance exacte de son geste.
+   l'owner l'échéance exacte de son geste (`--why` exige `--recommend`).
    La question affiche `next.sha`,
    `next.runtime`, `next.lib` et `code_sha256`.
    Avant de signer, recalculer ces valeurs sans passer par le stage, hors root,
@@ -216,7 +216,8 @@ Ordre sur l'hôte :
    stage `OP` jusqu'à la fin de la continuation : elle y relit bundle et question.
 
 Retour arrière : `replacement-rollback-question OP --expires T` (même borne
-d'une heure, même champ `deadline`), décision signée propre, socket arrêté, puis `replacement-rollback OP --decision N` depuis le même
+d'une heure, même champ `deadline`, posé par `--recommend rollback --why
+"DEADLINE"`), décision signée propre, socket arrêté, puis `replacement-rollback OP --decision N` depuis le même
 stage. Les arbres neufs restent sous `replaced-runtime` et `replaced-lib` ; un
 remplacement annulé ne reprend pas : préparer une nouvelle opération.
 

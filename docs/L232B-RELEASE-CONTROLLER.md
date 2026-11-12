@@ -535,9 +535,11 @@ The administrator stages `runtime/`, `sources/` and `plan.json` (exactly
 root 0600) under `/var/lib/ameesh-release-bootstrap/OPERATION/`; `expires_at`
 (and `--expires T`) ends within one fresh signature, at most now + 3600 s −
 300 s, or the question is refused (#7013). The question is then asked with
-`ameesh decide ask --needs-signature --why "DEADLINE"`, `DEADLINE` being the
-`deadline` field printed by `prepare` (or `revoke-question`), so that the owner
-reads when the gesture must run; the owner signs
+`ameesh decide ask --needs-signature --recommend install --why "DEADLINE"`
+(`--recommend revoke` for the revoke question; `decide` only takes `--why`
+with `--recommend`), `DEADLINE` being the `deadline` field printed by `prepare`
+(or `revoke-question`), so that the owner reads when the gesture must run; the
+owner signs
 `install`, raw or with the fixed `signer-owner.sh` mention, and the backend
 recognizes the option through `decisions.match_option`, never a free prefix.
 Private state lives under `/var/lib/ameesh-release-bootstrap/.admin`
