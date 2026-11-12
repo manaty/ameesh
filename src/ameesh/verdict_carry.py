@@ -797,7 +797,9 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
 
     Rend `{mapping, paths, why}` : `mapping` {ancien n° : nouveau n°} (vide si aucune),
     `paths` les chemins couverts, `why` un refus ; `before`/`after` lisent un
-    chemin dans la base et dans l'arbre. Conditions, toutes requises :
+    chemin dans la base et dans l'arbre (`_regular` : `(mode, contenu)` d'un
+    fichier ordinaire, None sinon — un lien symbolique ne se renumérote pas,
+    et le mode ne change pas, B cx2 #213476). Conditions, toutes requises :
     au moins un fichier du répertoire de migrations renommé du seul préfixe
     numérique ; chaque nouveau numéro réservé par le lot ; un seul nouveau numéro
     par ancien ; le contenu de chaque migration ou compagnon renommé (ou compagnon
@@ -824,9 +826,10 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
     taken: dict = {}
     for _old, new, number, renamed, zone in pairs:
         if zone == "migration" and mapping.get(number) == renamed:
-            if taken.setdefault(renamed, number) != number:
+            # B dev01 #213475 : `0783` et `783` sont le même numéro
+            if taken.setdefault(int(renamed), number) != number:
                 out["why"] = ("renumbering %s and %s to the same number %s"
-                              % (taken[renamed], number, renamed))
+                              % (taken[int(renamed)], number, renamed))
                 return out
     if not mapping:
         return out
@@ -836,7 +839,8 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
             continue                  # couple hors de la renumérotation : jugé ailleurs
         if zone != "test":
             old_blob, new_blob = before(old), after(new)
-            if old_blob is None or new_blob is None or _substitute(old_blob, mapping) != new_blob:
+            if (old_blob is None or new_blob is None or old_blob[0] != new_blob[0]
+                    or _substitute(old_blob[1], mapping) != new_blob[1]):
                 out["why"] = ("%s is not %s with only %s→%s changed"
                               % (new, old, number, renamed))
                 return out
@@ -845,12 +849,36 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
         if (status == "M" and path not in paths and path in renumber.owned
                 and renumber.zone(path) == "companion"):
             old_blob, new_blob = before(path), after(path)
-            if old_blob is None or new_blob is None or _substitute(old_blob, mapping) != new_blob:
+            if (old_blob is None or new_blob is None or old_blob[0] != new_blob[0]
+                    or _substitute(old_blob[1], mapping) != new_blob[1]):
                 out["why"] = "%s is changed beyond the renumbering" % path
                 return out
             paths.add(path)
     out.update(mapping=mapping, paths=paths)
     return out
+
+
+#: les modes d'un fichier ordinaire dans un arbre git
+_REGULAR_MODES = ("100644", "100755")
+
+
+def _regular(run, rev: str, path: str) -> tuple | None:
+    """`(mode, contenu)` de `path` dans `rev` si c'est un fichier ordinaire, None
+    sinon (absent, lien symbolique, sous-module, illisible). `run(*args)` lance
+    git et rend le processus."""
+    listed = run("ls-tree", "-z", rev, "--", path)
+    if listed.returncode != 0:
+        return None
+    entry = listed.stdout.split(b"\0", 1)[0]
+    meta, _tab, name = entry.partition(b"\t")
+    fields = meta.split()
+    if len(fields) != 3 or name.decode("utf-8", "surrogateescape") != path:
+        return None
+    mode, kind, sha = (field.decode() for field in fields)
+    if kind != "blob" or mode not in _REGULAR_MODES:
+        return None
+    proc = run("cat-file", "blob", sha)
+    return (mode, proc.stdout) if proc.returncode == 0 else None
 
 
 def _mapping_text(mapping: Mapping) -> str:
@@ -907,8 +935,12 @@ def _merge_adaptation(repo: str, left: str, right: str, *, head: str | None = No
         unresolved = sorted(path for path in conflicts if path not in changes)
         if unresolved:
             return dict(refused, why="conflict left as is in %s" % unresolved[0])
-        renamed = _renumbered(changes, renumber, lambda path: blob(base, path),
-                              lambda path: blob(tree, path))
+        def regular(root: str, path: str):
+            return _regular(lambda *args: radar._scratch_git(repo, objects, scratch, *args),
+                            root, path)
+
+        renamed = _renumbered(changes, renumber, lambda path: regular(base, path),
+                              lambda path: regular(tree, path))
         if renamed["why"]:
             return dict(refused, why=renamed["why"])
         tests = hunks = 0
@@ -997,14 +1029,13 @@ def _renumber_commit(repo: str, parent: str, commit: str, fields: Mapping,
     compagnon, et son contenu ne diffère du précédent **que par ces numéros**
     (remplacés des deux côtés, l'égalité stricte reste celle du bout en bout) :
     renommer puis retoucher les renvois en deux commits reste une adaptation."""
-    def read(rev: str, path: str) -> bytes | None:
-        proc = plan_git._git(repo, "cat-file", "blob", "%s:%s" % (rev, path))
-        return proc.stdout if proc.returncode == 0 else None
+    def run(*args):
+        return plan_git._git(repo, *args)
 
     def same(old: str, new: str) -> bool:
-        before, after = read(parent, old), read(commit, new)
-        return (before is not None and after is not None
-                and _substitute(before, mapping) == _substitute(after, mapping))
+        before, after = _regular(run, parent, old), _regular(run, commit, new)
+        return (before is not None and after is not None and before[0] == after[0]
+                and _substitute(before[1], mapping) == _substitute(after[1], mapping))
 
     # B1 dev3 #213435 : seuls un chemin de la tête relue et le nouveau chemin
     # attendu d'un tel chemin se retouchent ; un fichier de la cible qui porte

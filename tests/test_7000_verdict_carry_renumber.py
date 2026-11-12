@@ -194,6 +194,51 @@ class RenumberingTest(unittest.TestCase):
         frozen = self.references()
         self.refused(frozen, "to the same number 783")
 
+    def test_a_padded_number_is_the_same_number(self):
+        # B dev01 #213475 : `0783_…` et `783_…` sont deux migrations 783.
+        _put(self.root, "supabase/migrations/785_second.sql", "SELECT 785;\n")
+        self.reviewed = _commit(self.root, "second migration")
+        self.rename()
+        _git(self.root, "mv", "supabase/migrations/785_second.sql",
+             "supabase/migrations/0783_second.sql")
+        frozen = self.references()
+        renumber = verdict_carry.Renumbering(
+            "supabase/migrations", frozenset({783}), ("supabase/rollback",))
+        self.refused(frozen, "to the same number", renumber)
+
+    def symlink(self, path, target):
+        full = os.path.join(self.root, path)
+        os.remove(full)
+        os.symlink(target, full)
+        _git(self.root, "add", path)
+
+    def test_a_symlink_is_not_a_renumbering(self):
+        # B cx2 #213476 : le lien ouvrirait un autre fichier.
+        self.rename()
+        self.references()
+        # le blob du lien est exactement le contenu attendu (cas de cx2)
+        with open(os.path.join(self.root, self.MIG % "783"), encoding="utf-8") as fh:
+            self.symlink(self.MIG % "783", fh.read())
+        self.refused(_commit(self.root, "link"), "is not supabase/migrations/784_hub_service.sql")
+
+    def test_a_mode_change_is_not_a_renumbering(self):
+        self.rename()
+        os.chmod(os.path.join(self.root, self.MIG % "783"), 0o755)
+        frozen = self.references()
+        self.assertIn("100755", _git(self.root, "ls-tree", frozen, self.MIG % "783"))
+        self.refused(frozen, "is not supabase/migrations/784_hub_service.sql")
+
+    def test_a_type_changed_then_restored_in_the_history_is_refused(self):
+        self.rename()
+        self.references()
+        with open(os.path.join(self.root, self.MIG % "783"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.symlink(self.MIG % "783", text)
+        _commit(self.root, "link")
+        os.remove(os.path.join(self.root, self.MIG % "783"))
+        _put(self.root, self.MIG % "783", text)
+        self.refused(_commit(self.root, "back"), "neither a test adaptation")
+
     def test_a_product_change_hidden_in_the_history_is_refused(self):
         _put(self.root, "secret.txt", "s\n")
         _commit(self.root, "secret")
