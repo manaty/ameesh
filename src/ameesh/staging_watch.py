@@ -797,22 +797,36 @@ def canon_drift_findings(records, *, head: str, first_ahead, now: float) -> list
     `canon_ref` per key. `head`: the commit of the agents' canon.
     `first_ahead(canon_ref, head)`: commit time of the oldest first-parent
     commit of `head` that `canon_ref` lacks, None when nothing lacks or when
-    the agents' clone cannot judge (unknown commit: it may simply lag)."""
+    the agents' clone cannot judge (unknown commit: it may simply lag).
+    #7053: a refused automatic refresh (`canon_refresh`) alerts at once,
+    with its reason, whatever the age of the drift."""
     out = []
     for key, data in records:
         ref = str(data.get("canon_ref") or "")
         if not ref or not head or ref == head:
             continue
         since = first_ahead(ref, head)
-        if since is None or now - since < CANON_DRIFT_S:
+        refresh = data.get("canon_refresh")
+        refused = (str(refresh.get("reason") or "refused")
+                   if isinstance(refresh, dict) and refresh.get("state") == "refused"
+                   else "")
+        # A refusal alerts even when the agents' clone cannot date the drift
+        # (the executor's commit unknown to it, e.g. after rewritten history).
+        if not refused and (since is None or now - since < CANON_DRIFT_S):
             continue
         detail = ("Staging executor %s reads canon %s; the agents' canon is at %s, "
-                  "ahead for %.1f d (threshold 1 d). Host fiches and rules read "
-                  "by staging may be stale: install a new qualified canon copy "
-                  "at the next quiescent handover."
-                  % (key, ref[:12], head[:12], (now - since) / 86400.0))
+                  % (key, ref[:12], head[:12]))
+        detail += ("ahead for %.1f d (threshold 1 d). " % ((now - since) / 86400.0)
+                   if since is not None else "drift not datable from the agents' clone. ")
+        detail += "Host fiches and rules read by staging may be stale. "
+        detail += ("The automatic refresh of its last completed pass was refused "
+                   "(%s): copy kept; fix the cause, or see the operator gesture "
+                   "in DEPLOIEMENT-HOTE-AGENTS.md." % refused[:200] if refused else
+                   "Its next completed pass refreshes the copy (#7053); without one, "
+                   "see the operator gesture in DEPLOIEMENT-HOTE-AGENTS.md.")
         out.append(dict(schema="ameesh-alert/1", type="staging_canon_stale",
-                        agent=None, since=since, value=now - since,
+                        agent=None, since=since,
+                        value=now - since if since is not None else None,
                         threshold=CANON_DRIFT_S, reason=key, canon_ref=ref,
                         head=head, urgent=False,
                         orchestrators=([data["notify"]]
@@ -829,12 +843,25 @@ def executor_canons(db) -> list[tuple[str, dict]]:
         key = row.get("object")
         if not key:
             continue
+        found = None
         for item in events.recent_type("staging.request", 60, CANON_HISTORY,
                                        object=key):
             data = item.get("data")
-            if isinstance(data, dict) and data.get("canon_ref"):
-                out.append((key.split(":", 1)[-1], data))
+            if not (isinstance(data, dict) and data.get("canon_ref")):
+                continue
+            if found is None:
+                found = data
+                if "canon_refresh" in data:
+                    break
+            elif "canon_refresh" in data:
+                # #7053: a later failed or blocked pass carries no refresh;
+                # the refusal of the last completed one on the same copy
+                # still speaks for it.
+                if data["canon_ref"] == found["canon_ref"]:
+                    found = dict(found, canon_refresh=data["canon_refresh"])
                 break
+        if found is not None:
+            out.append((key.split(":", 1)[-1], found))
     return out
 
 
