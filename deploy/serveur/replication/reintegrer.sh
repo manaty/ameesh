@@ -108,4 +108,25 @@ pg_ctlcluster "$PG_VERSION" main start
 attendre_commande "démarrage de PostgreSQL" pg_isready -q
 attendre_valeur "standby en récupération" 'SELECT pg_is_in_recovery()' t
 attendre_valeur "flux entrant (pg_stat_wal_receiver)" 'SELECT status FROM pg_stat_wal_receiver' streaming
+
+# #7028 : pg_rewind laisse dans pg_replslot les slots physiques de l'ancien
+# rôle primaire. Sur un standby ils sont inactifs, ne servent aucun flux et
+# retiennent du WAL jusqu'à max_slot_wal_keep_size (disque) ; un futur primaire
+# les réutiliserait avec un restart_lsn périmé. Les slots vivants sont sur le
+# nouveau primaire : on supprime ici les slots physiques inactifs nommés par
+# l'inventaire, sans toucher à un slot inconnu (cascade) ni à un slot actif.
+supprimes=0
+for ((i = 0; i < ${#NOEUDS_NOMS[@]}; i++)); do
+  ancien_slot=$(slot_de "${NOEUDS_NOMS[$i]}")
+  etat_slot=$(psql_local -tAc "SELECT active FROM pg_replication_slots WHERE slot_name = '$ancien_slot' AND slot_type = 'physical'")
+  [[ $etat_slot == f ]] || continue
+  if psql_local -tAc "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '$ancien_slot' AND NOT active" >/dev/null; then
+    info "slot physique $ancien_slot supprimé (ancien rôle primaire, inactif sur ce standby)"
+    supprimes=$((supprimes + 1))
+  else
+    info "ATTENTION : slot $ancien_slot non supprimé ; à supprimer à la main : SELECT pg_drop_replication_slot('$ancien_slot');"
+  fi
+done
+(( supprimes == 0 )) || log "$supprimes slot(s) physique(s) de l'ancien rôle primaire supprimé(s)"
+
 log "ancien primaire $NOM_LOCAL réintégré en standby de $SOURCE_NOM — vérifier avec etat.sh (aucun second primaire)"
