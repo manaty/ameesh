@@ -451,7 +451,7 @@ class Canon(interface.Canon):
                     "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END")
         self.db.execute(
             "DELETE FROM agent_candidates WHERE name = %s AND canon = %s"
-            " AND (%s <> 'election' OR NOT (host = ANY(" + empty + ")))",
+            " AND (%s NOT IN ('election', 'preference') OR NOT (host = ANY(" + empty + ")))",
             (name, canon, releve, candidates, candidates))
         self.db.execute(
             """
@@ -463,19 +463,21 @@ class Canon(interface.Canon):
             (releve, candidates, candidates, name, canon, releve, candidates, candidates))
 
     def write_candidate(self, name, host, *, canon, cwd, ok, diagnostic, ref,
-                        harness, provider, model, credential_mode) -> None:
+                        harness, provider, model, credential_mode,
+                        preference_rank=None) -> None:
         """L165 (EP1) : verdict de placement de `name` sur l'hôte candidat.
 
         Le profil évalué est calculé ici, pour CET hôte : la réclamation depuis
         un autre candidat compare le sien, donc un profil divergé ferme la
-        réclamation comme pour un agent épinglé."""
+        réclamation comme pour un agent épinglé. `preference_rank` (#7048) :
+        index de l'hôte dans l'ordre du Placement d'un agent `preference`."""
         self.db.execute(
             """
             INSERT INTO agent_candidates
                 (name, host, canon, cwd, placement_ok, placement_diagnostic,
-                 placement_ref, placement_profile, updated_at)
+                 placement_ref, placement_profile, preference_rank, updated_at)
             SELECT %s, %s, %s, %s, %s, %s, %s,
-                   ameesh_placement_profile(%s, %s, %s, %s, %s), now()
+                   ameesh_placement_profile(%s, %s, %s, %s, %s), %s, now()
             ON CONFLICT (name, host) DO UPDATE SET
                 canon = excluded.canon,
                 cwd = excluded.cwd,
@@ -483,10 +485,11 @@ class Canon(interface.Canon):
                 placement_diagnostic = excluded.placement_diagnostic,
                 placement_ref = excluded.placement_ref,
                 placement_profile = excluded.placement_profile,
+                preference_rank = excluded.preference_rank,
                 updated_at = now()
             """,
             (name, host, canon, cwd, ok, diagnostic or "", ref,
-             host, harness, provider, model, credential_mode))
+             host, harness, provider, model, credential_mode, preference_rank))
 
     def candidate_names(self, host, canon="") -> list[str]:
         rows = self.db.query(
@@ -708,7 +711,7 @@ class Canon(interface.Canon):
               FROM verrou
              WHERE r.name = verrou.name
                AND verrou.host = %s
-               AND coalesce(verrou.releve, 'hote') <> 'election'
+               AND coalesce(verrou.releve, 'hote') NOT IN ('election', 'preference')
                AND verrou.status <> 'running'
                AND NOT ameesh_handoff_fenced(r.name)
                AND NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name

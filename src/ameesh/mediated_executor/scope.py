@@ -79,7 +79,7 @@ def admitted_sql(host: str) -> str:
     """
     host = check_name(host)
     return ("SELECT r.name, r.credential_mode FROM agent_registry r"
-            " WHERE (r.host = %%s OR (r.releve = 'election' AND %%s = ANY(r.candidats)))"
+            " WHERE (r.host = %%s OR (r.releve IN ('election', 'preference') AND %%s = ANY(r.candidats)))"
             " AND %s AND %s ORDER BY r.name"
             % (canon_governed_sql("r"), placement_admitted_sql("r", host=host)))
 

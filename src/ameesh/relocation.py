@@ -165,10 +165,11 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
         raise MoveError("%s has no execution host yet: run canon sync first" % name)
     if target == source:
         raise MoveError("%s is already on %s" % (name, target))
-    if (row.get("releve") or "hote") == "election":
+    if (row.get("releve") or "hote") in ("election", "preference"):
+        # #7048 : `agent move` d'un agent `preference` est le sous-lot B4
         raise MoveError(
-            "%s is an elected role (releve: election): its candidates take the "
-            "lease; a manual move would bypass the election" % name)
+            "%s is a cross-host role (releve: %s): its candidates take the "
+            "lease; a manual move would bypass the relief" % (name, row.get("releve")))
     admitted = list(row.get("admitted_hosts") or ())
     if target not in admitted:
         raise MoveError(

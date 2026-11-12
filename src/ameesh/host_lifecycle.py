@@ -301,7 +301,7 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
             continue
         # L165 (EP1) : un rôle élu se reprend par élection (bail expiré), sans
         # preuve de source L232e ; il n'a rien à faire dans un handoff.
-        if agent.get("releve") == "election":
+        if agent.get("releve") in ("election", "preference"):    # #7048
             continue
         demand = api.host_lifecycle.demand(agent["name"], agent["host"])
         op = api.handoffs.active(agent["name"])

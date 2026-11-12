@@ -1663,21 +1663,66 @@ class Canon:
 # Charge d'admissions d'un hôte (`max_agents`) — #3101 (suite d'EP1, L165)
 # ==========================================================================
 
+#: #7048 : relèves dont le bail passe d'un hôte candidat à l'autre (EP1) ;
+#: `election` classe par disponibilité, `preference` par l'ordre du Placement
+CROSS_HOST_RELEVES = ("election", "preference")
+RELEVES = ("hote",) + CROSS_HOST_RELEVES
+
+
+def cross_host(releve: str | None) -> bool:
+    """Le bail de cette relève se reprend depuis un autre hôte candidat."""
+    return (releve or "hote") in CROSS_HOST_RELEVES
+
+
+def ordered_admitted_hosts(canon: Canon, admission: Any) -> list[str]:
+    """Hôtes admis par une admission, dans l'ordre déclaré (#7048).
+
+    Hôtes NOMMÉS dans l'ordre de la fiche (l'ancien `host` d'abord), puis
+    hôtes d'étiquettes dans l'ordre du canon, sans doublon : l'ordre est la
+    préférence (`specification.md`, « ordre = préférence »).
+    """
+    if admission is None:
+        return []
+    out = list(admission.host_names())
+    tags = set(admission.tags())
+    if tags:
+        for host in canon.hosts:
+            if tags & set(host.tags or []) and host.title not in out:
+                out.append(host.title)
+    return out
+
+
+def lease_candidates(canon: Canon, agent: Any) -> list[str] | None:
+    """Hôtes candidats au bail d'un agent à relève croisée, ou None (épinglé).
+
+    `election` : ses `candidats` déclarés. `preference` (#7048) : les hôtes de
+    son admission unique, dans l'ordre de préférence ; aucune ou plusieurs
+    admissions : [] (déjà en erreur, réclamable nulle part).
+    """
+    if agent is None or agent.releve == "hote":
+        return None
+    if agent.releve == "preference":
+        found = canon.placements_of(agent.title)
+        return ordered_admitted_hosts(canon, found[0]) if len(found) == 1 else []
+    return agent.candidats
+
+
 def elected_candidates(canon: Canon, placement: Any, covered: Iterable[str]) -> list[str] | None:
     """Hôtes où l'admission d'un rôle élu peut tenir le bail, ou None (épinglé).
 
-    Un agent `releve: election` avec `candidats` ne tourne que là où il tient
-    le bail : son admission ne prend qu'UNE place dans tout le maillage, sur
-    l'un de ses candidats couverts par l'admission et dont la politique
-    l'admet (un candidat refusé ne peut pas tenir le bail). Tout autre agent
-    (et un rôle élu sans candidat, déjà en erreur) occupe une place sur chaque
-    hôte couvert.
+    Un agent `releve: election` avec `candidats` (ou `releve: preference`,
+    #7048) ne tourne que là où il tient le bail : son admission ne prend
+    qu'UNE place dans tout le maillage, sur l'un de ses candidats couverts
+    par l'admission et dont la politique l'admet (un candidat refusé ne peut
+    pas tenir le bail). Tout autre agent (et un rôle élu sans candidat, déjà
+    en erreur) occupe une place sur chaque hôte couvert.
     """
     agent = canon.agent(placement.agent) if placement.agent else None
-    if agent is None or agent.releve != "election" or not agent.candidats:
+    candidates = lease_candidates(canon, agent)
+    if not candidates:
         return None
     covered = set(covered)
-    return [name for name in agent.candidats if name in covered
+    return [name for name in candidates if name in covered
             and canon.host(name) is not None
             and not placement_violations(agent, canon.host(name), placement)]
 
@@ -4014,14 +4059,16 @@ class _Loader:
         # L165 (EP1) : `releve: hote` (défaut) ou `election` ; les candidats
         # sont les hôtes qui peuvent prendre le bail, tous admis par la fiche
         # Placement (contrôlé par `validate`, qui connaît les hôtes).
+        # #7048 : `preference`, les candidats sont les hôtes du Placement,
+        # dans leur ordre (`lease_candidates`).
         releve = (_text(fiche.data.get("releve")) or "hote").strip().lower()
-        if releve not in ("hote", "election"):
+        if releve not in RELEVES:
             # Valeur illisible : repli sur `election` (fail closed). Un repli
             # sur `hote` rouvrirait la ligne sur l'hôte courant, alors que la
             # fiche est fautive ; `election` exige un verdict candidat, que la
             # fiche en erreur ferme partout.
             self.add("agent-releve-invalid", ERROR,
-                     "`releve`: `hote` or `election` expected, not %r "
+                     "`releve`: `hote`, `election` or `preference` expected, not %r "
                      "(treated as `election`, not claimable)"
                      % fiche.data.get("releve"), **where, **subject)
             releve = "election"
@@ -5403,7 +5450,7 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                     # refuse l'agent ne ferme QUE ce candidat ; les autres
                     # hôtes candidats gardent leur propre verdict. Un agent
                     # épinglé, lui, reste bloqué partout par son erreur.
-                    if agent.releve == "election":
+                    if cross_host(agent.releve):
                         # Un candidat refusé ne ferme que CE candidat : ni
                         # l'hôte (les agents épinglés y restent réclamables),
                         # ni les autres hôtes candidats.
@@ -5428,6 +5475,22 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     # tenu nulle part ; un candidat non admis serait refusé au verdict de
     # placement, donc la fiche est fautive dès `canon check`.
     for agent in canon.agents:
+        if agent.releve == "preference":
+            # #7048 : la préférence vient de l'ordre du Placement ; `candidats`
+            # reste réservé à l'élection (deux listes qui divergeraient ne se
+            # trancheraient pas). Un seul hôte : réclamable, mais sans repli.
+            if agent.candidats:
+                add("agent-preference-candidats", ERROR,
+                    "agent %s is `releve: preference`: its candidates are the hosts of "
+                    "its Placement card, in order; `candidats` is reserved to "
+                    "`releve: election`" % agent.title, agent.fiche, agent=agent.title)
+            hosts = lease_candidates(canon, agent)
+            if len(by_agent.get(agent.title, [])) == 1 and len(hosts) < 2:
+                add("agent-preference-no-fallback", WARNING,
+                    "agent %s is `releve: preference` with %d admitted host(s): no "
+                    "fallback host" % (agent.title, len(hosts)),
+                    agent.fiche, agent=agent.title)
+            continue
         if agent.releve != "election":
             if agent.candidats:
                 add("agent-candidats-ignored", WARNING,

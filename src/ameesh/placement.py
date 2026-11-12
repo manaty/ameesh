@@ -59,17 +59,10 @@ def admitted_hosts(canon: Canon, admission) -> list[str]:
     """Hôtes du canon admis par une admission (L31, 0029).
 
     Ce sont les hôtes NOMMÉS (`hosts`, et l'ancien `host`) plus ceux dont une
-    étiquette figure dans `host_tags` ; sans doublon, triés par nom.
+    étiquette figure dans `host_tags` ; sans doublon, dans l'ordre déclaré
+    (#7048 : l'ordre est la préférence ; trier n'est que pour l'affichage).
     """
-    if admission is None:
-        return []
-    titles = set(admission.host_names())
-    tags = set(admission.tags())
-    if tags:
-        for host in canon.hosts:
-            if tags & set(host.tags or []):
-                titles.add(host.title)
-    return sorted(titles)
+    return canon_mod.ordered_admitted_hosts(canon, admission)
 
 
 def admission_of(canon: Canon, agent: str):
@@ -111,7 +104,7 @@ def capacity_baseline(canon: Canon, agent: str) -> tuple[dict[str, list], set[st
     """
     covered = covered_by_host(canon, without=agent)
     fiche = canon.agent(agent)
-    elected = fiche is not None and fiche.releve == "election" and bool(fiche.candidats)
+    elected = bool(canon_mod.lease_candidates(canon, fiche))
     seats = (host_load(canon) if elected else canon_mod.admission_load(canon, covered))[1]
     title = fiche.title if fiche is not None else agent
     return covered, {role for role, seat in seats.items() if seat is not None and role != title}
@@ -222,10 +215,10 @@ def evaluate(canon: Canon, agent: str, host: str) -> Verdict:
     admis = admitted_hosts(canon, admission)
     if host not in admis:
         verdict.diagnostic = "host %s not admitted for %s (admitted: %s)" % (
-            host, agent, ", ".join(admis) or "none")
+            host, agent, ", ".join(sorted(admis)) or "none")
         return verdict
     reasons = canon_mod.placement_violations(fiche, hosts[0], admission)
-    if not reasons and fiche.releve == "election" and fiche.candidats:
+    if not reasons and canon_mod.lease_candidates(canon, fiche):
         # #3101 : un rôle élu ne prend qu'une place, sur un candidat qui en a
         # une ; un candidat sans place ne réclame pas le bail.
         full = capacity_reason(canon, agent, host)

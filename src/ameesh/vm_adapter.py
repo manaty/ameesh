@@ -221,7 +221,7 @@ def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, tar
         return True
     available = host_release._open_hosts(controls, known, holds)
     eligible = {a['name'] for a in listing
-                if host in a.get('admitted_hosts', ()) and a.get('releve') != 'election'
+                if host in a.get('admitted_hosts', ()) and a.get('releve') not in ('election', 'preference')
                 and a.get('mode') in (None, 'execute') and a.get('status') != 'stopped'
                 and not (set(a.get('admitted_hosts', ())) - {host}) & available}
     if any(lot.get('assignee') in eligible and lot.get('state') not in host_idle.DONE

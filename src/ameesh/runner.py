@@ -1412,8 +1412,8 @@ class AgentWorker(threading.Thread):
         lost = getattr(self, "lease_lost", None)
         if (runner_obj is None or lost is None or lost.is_set()
                 or getattr(self, "_restart_reserved", False)
-                or str((getattr(self, "agent", None) or {}).get("releve") or "")
-                != "election"):
+                or not canon_mod.cross_host(
+                    (getattr(self, "agent", None) or {}).get("releve"))):
             return
         stopping = getattr(runner_obj, "restart_pending", None)
         if stopping is None or not stopping():
@@ -2031,7 +2031,7 @@ class AgentWorker(threading.Thread):
         if row.get("retired_ts"):
             return "retired from the registry"
         if (row.get("canon_governed") and not row.get("placement_admitted")
-                and row.get("releve") != "election"):
+                and not canon_mod.cross_host(row.get("releve"))):
             return "Agent card or Placement withdrawn from the canon (%s)" % (
                 row.get("placement_diagnostic") or "placement not admitted")
         return ""
@@ -5857,8 +5857,9 @@ class AgentWorker(threading.Thread):
             # Device relocation is controlled by the mesh server (L109).
             return False
         # L165 (EP1) : un rôle élu ne se déplace pas par handoff ; un autre
-        # hôte candidat reprend le bail expiré, sans preuve de source.
-        if self.agent.get("releve") == "election":
+        # hôte candidat reprend le bail expiré, sans preuve de source
+        # (#7048 : de même pour `releve: preference`).
+        if canon_mod.cross_host(self.agent.get("releve")):
             return False
         from . import handoffs, host_lifecycle, storage, work
         try:
@@ -11683,7 +11684,7 @@ class Runner:
         pas — jamais de tour sans briefing. Construit APRÈS la porte de rang
         d'EP2, juste avant le CAS : le brief décrit l'état au plus près.
         """
-        if agent.get("releve") != "election":
+        if not canon_mod.cross_host(agent.get("releve")):
             return None
         previous = agent.get("previous_host")
         if not previous or previous == self.host:
@@ -12480,7 +12481,8 @@ class Runner:
             # L165 (EP2) : un rôle élu attend son rang avant de tenter le CAS ;
             # le bail (EP1) reste le seul arbitre, ce délai n'est que la
             # politesse qui laisse le meilleur candidat passer d'abord.
-            if agent.get("releve") == "election":
+            # #7048 : `preference` aussi, rangé par l'ordre du Placement.
+            if canon_mod.cross_host(agent.get("releve")):
                 allowed, reason, _standing = self.election_claim_allowed(agent)
                 if not allowed:
                     if reason.startswith("not ready"):
@@ -12539,7 +12541,7 @@ class Runner:
                         self._note_unleased(agent, reason)
                     continue  # un autre exécuteur a gagné la course
                 self._election_free_since.pop(agent["name"], None)
-                if agent.get("releve") == "election":
+                if canon_mod.cross_host(agent.get("releve")):
                     self._clear_restart_reservation(agent["name"])
                 # L165 (EP1) : un rôle élu peut être réclamé depuis cet hôte
                 # alors que sa ligne était chez un autre candidat ; le worker
@@ -12635,7 +12637,7 @@ class Runner:
         # repart de zéro au prochain bail libre : le délai par rang se compte
         # depuis la première observation de CETTE liberté.
         free = {agent["name"] for agent in candidates
-                if agent.get("releve") == "election"
+                if canon_mod.cross_host(agent.get("releve"))
                 and agent["name"] in self._election_free_since}
         for name in list(self._election_free_since):
             if name not in free:
@@ -14818,8 +14820,8 @@ class Runner:
         if len(others) >= cap:
             return False
         pinned = getattr(self, "_host_pinned_admissions", None)
-        if (agent or {}).get("releve") == "election" and pinned is not None:
-            elected = sum(1 for other in others if other.get("releve") == "election")
+        if canon_mod.cross_host((agent or {}).get("releve")) and pinned is not None:
+            elected = sum(1 for other in others if canon_mod.cross_host(other.get("releve")))
             if elected >= cap - pinned:
                 return False
         if not getattr(self, "_host_slot_reservations", None):

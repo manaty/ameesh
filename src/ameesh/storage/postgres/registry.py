@@ -193,7 +193,7 @@ def _election_placement_sql(alias: str, host: str | None = None) -> str:
     """
     a = _alias(alias)
     h = _host_expr(a, host)
-    return """(%(a)s.releve = 'election'
+    return """(%(a)s.releve IN ('election', 'preference')
        AND %(h)s = ANY(%(a)s.candidats)
        AND %(h)s = ANY(%(a)s.admitted_hosts)
        AND EXISTS (SELECT 1 FROM agent_candidates c
@@ -262,13 +262,13 @@ def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = Fa
                 else "ameesh_host_claims_open(%s)" % h)
     sql = """(%(open)s
        AND %(a)s.retired_at IS NULL
-       AND (%(a)s.releve = 'election' OR NOT ameesh_handoff_fenced(%(a)s.name))
+       AND (%(a)s.releve IN ('election', 'preference') OR NOT ameesh_handoff_fenced(%(a)s.name))
        AND (NOT %(governed)s
             OR (EXISTS (SELECT 1 FROM canon_state s
                          WHERE s.host = %(h)s
                            AND s.canon = coalesce(%(a)s.canon, '')
                            AND s.status = 'ok')
-                AND CASE WHEN %(a)s.releve = 'election' THEN %(election)s
+                AND CASE WHEN %(a)s.releve IN ('election', 'preference') THEN %(election)s
                          ELSE %(pinned)s END)))"""
     return sql % {"governed": canon_governed_sql(a), "a": a,
                   "h": _host_expr(a, host), "open": open_sql,
@@ -287,7 +287,7 @@ def placement_admitted_sql(alias: str = "agent_registry",
     (None : l'hôte de la ligne)."""
     a = _alias(alias)
     return """(NOT %(governed)s
-       OR (CASE WHEN %(a)s.releve = 'election' THEN %(election)s
+       OR (CASE WHEN %(a)s.releve IN ('election', 'preference') THEN %(election)s
                 ELSE %(pinned)s END))""" % {
         "governed": canon_governed_sql(a), "a": a,
         "election": _election_placement_sql(a, host),
@@ -804,14 +804,14 @@ class Agents(interface.Agents):
         # l'hôte rendus sont ceux du candidat qui va réclamer.
         sql = """
             SELECT %s,
-                   CASE WHEN releve = 'election' THEN
+                   CASE WHEN releve IN ('election', 'preference') THEN
                      (SELECT c.cwd FROM agent_candidates c
                        WHERE c.name = agent_registry.name AND c.host = %%s
                          AND c.canon = coalesce(agent_registry.canon, ''))
                    ELSE cwd END AS claim_cwd
             FROM agent_registry
-            WHERE ((releve <> 'election' AND host = %%s)
-                   OR (releve = 'election' AND %%s = ANY(candidats)))
+            WHERE ((releve NOT IN ('election', 'preference') AND host = %%s)
+                   OR (releve IN ('election', 'preference') AND %%s = ANY(candidats)))
               AND status <> 'stopped'
               -- L46 : un agent `externe` (session humaine) n'est jamais mené
               -- par l'exécuteur, même avec une session et du courrier.
@@ -820,7 +820,7 @@ class Agents(interface.Agents):
               AND (NOT ephemeral OR ephemeral_expires_at > clock_timestamp())
               -- #254 : un hôte en pause ne prend aucun bail
               AND NOT EXISTS (SELECT 1 FROM host_holds hh
-                               WHERE hh.host = CASE WHEN releve = 'election' THEN %%s
+                               WHERE hh.host = CASE WHEN releve IN ('election', 'preference') THEN %%s
                                                     ELSE agent_registry.host END
                                  AND hh.until > clock_timestamp())
               AND %s
@@ -861,7 +861,7 @@ class Agents(interface.Agents):
               FROM verrou
              WHERE r.name = verrou.name
                AND (verrou.host = %s
-                    OR (verrou.releve = 'election' AND %s = ANY(verrou.candidats)))
+                    OR (verrou.releve IN ('election', 'preference') AND %s = ANY(verrou.candidats)))
                AND verrou.mode = 'execute'
                AND verrou.status IN ('idle', 'queued', 'dead')
                AND (verrou.lease_owner IS NULL OR verrou.lease_expires_at IS NULL
@@ -1068,7 +1068,7 @@ class Leases(interface.Leases):
         # L165 (EP3) : une relève n'est croisée que si la ligne était encore
         # chez un AUTRE hôte. Le brief ne peut alors pas être un reste d'un
         # tour local : la session de l'ancien hôte n'est jamais reprise ici.
-        takeover = """(p.brief IS NOT NULL AND r.releve = 'election'
+        takeover = """(p.brief IS NOT NULL AND r.releve IN ('election', 'preference')
                        AND verrou.host IS DISTINCT FROM __H__)"""
         r5 = """CASE
                            WHEN r.current_prompt IS NOT NULL
@@ -1092,34 +1092,34 @@ class Leases(interface.Leases):
                    -- L165 (EP1) : le détenteur élu est l'hôte qui réclame ;
                    -- son dossier et son verdict de placement sont ceux de ce
                    -- candidat, pour que le profil reste celui de l'hôte.
-                   host             = CASE WHEN r.releve = 'election' THEN __H__
+                   host             = CASE WHEN r.releve IN ('election', 'preference') THEN __H__
                                             ELSE r.host END,
-                   cwd              = CASE WHEN r.releve = 'election' THEN
+                   cwd              = CASE WHEN r.releve IN ('election', 'preference') THEN
                          (SELECT c.cwd FROM agent_candidates c
                            WHERE c.name = r.name AND c.host = __H__
                              AND c.canon = coalesce(r.canon, ''))
                        ELSE r.cwd END,
-                   placement_ok     = CASE WHEN r.releve = 'election' THEN
+                   placement_ok     = CASE WHEN r.releve IN ('election', 'preference') THEN
                          (SELECT c.placement_ok FROM agent_candidates c
                            WHERE c.name = r.name AND c.host = __H__
                              AND c.canon = coalesce(r.canon, ''))
                        ELSE r.placement_ok END,
-                   placement_diagnostic = CASE WHEN r.releve = 'election' THEN
+                   placement_diagnostic = CASE WHEN r.releve IN ('election', 'preference') THEN
                          (SELECT c.placement_diagnostic FROM agent_candidates c
                            WHERE c.name = r.name AND c.host = __H__
                              AND c.canon = coalesce(r.canon, ''))
                        ELSE r.placement_diagnostic END,
-                   placement_ref    = CASE WHEN r.releve = 'election' THEN
+                   placement_ref    = CASE WHEN r.releve IN ('election', 'preference') THEN
                          (SELECT c.placement_ref FROM agent_candidates c
                            WHERE c.name = r.name AND c.host = __H__
                              AND c.canon = coalesce(r.canon, ''))
                        ELSE r.placement_ref END,
-                   placement_profile = CASE WHEN r.releve = 'election' THEN
+                   placement_profile = CASE WHEN r.releve IN ('election', 'preference') THEN
                          (SELECT c.placement_profile FROM agent_candidates c
                            WHERE c.name = r.name AND c.host = __H__
                              AND c.canon = coalesce(r.canon, ''))
                        ELSE r.placement_profile END,
-                   handoff_fenced   = CASE WHEN r.releve = 'election' THEN false
+                   handoff_fenced   = CASE WHEN r.releve IN ('election', 'preference') THEN false
                                            ELSE r.handoff_fenced END,
                    -- R5 : si le bail n'était plus vivant (autre main, ou même
                    -- exécuteur relancé avec le même identifiant), la consigne
@@ -1191,12 +1191,12 @@ class Leases(interface.Leases):
              WHERE r.name = verrou.name
                -- L46 : même règle que `claimable` — jamais un agent `externe`.
                AND r.mode = 'execute'
-               AND (r.releve = 'election' OR r.host = __H__)
+               AND (r.releve IN ('election', 'preference') OR r.host = __H__)
                -- L165 (EP3) : une relève CROISÉE d'un rôle élu ne se fait
                -- jamais sans brief. Sans lui, la ligne changerait d'hôte en
                -- gardant la session et le compte de l'ancien (le contrat médié
                -- force le brief à null) : le CAS refuse, sans rien écrire.
-               AND (r.releve <> 'election' OR verrou.host = __H__
+               AND (r.releve NOT IN ('election', 'preference') OR verrou.host = __H__
                     OR p.brief IS NOT NULL)
                -- #6134 : le même identifiant d'exécuteur ne reprend pas un
                -- tour EN COURS tant que son bail est vivant. L'ancien
@@ -1214,11 +1214,11 @@ class Leases(interface.Leases):
                -- encore vivant, se renouvelle)
                AND ((r.lease_owner = %s AND r.lease_expires_at >= clock_timestamp())
                     OR NOT EXISTS (SELECT 1 FROM host_holds hh
-                                    WHERE hh.host = CASE WHEN r.releve = 'election'
+                                    WHERE hh.host = CASE WHEN r.releve IN ('election', 'preference')
                                                          THEN __H__ ELSE r.host END
                                       AND hh.until > clock_timestamp()))
                __RESPONSABLE__
-               AND (r.releve = 'election' OR NOT r.handoff_fenced)
+               AND (r.releve IN ('election', 'preference') OR NOT r.handoff_fenced)
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch, r.host, r.cwd,
                       r.election_brief,
@@ -1284,7 +1284,7 @@ class Leases(interface.Leases):
                                     WHERE hh.host = r.host
                                       AND hh.until > clock_timestamp()))
                __RESPONSABLE__
-               AND (r.releve = 'election' OR NOT r.handoff_fenced)
+               AND (r.releve IN ('election', 'preference') OR NOT r.handoff_fenced)
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch,
                       extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts,

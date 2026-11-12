@@ -1435,8 +1435,13 @@ def _write_candidate(db: Db, canon: Canon, agent, admission, host: str, *,
     verdict = placement_mod.evaluate(canon, agent.title, host)
     visibility_mod.annotate(canon, agent, host, verdict, db=db, forge=forge)
     cwd, _ = canon_mod.work_dir_for(canon.host(host), agent, admission)
+    # #7048 : rang de préférence (index dans l'ordre du Placement) ; None pour
+    # un rôle élu, classé par disponibilité
+    candidates = canon_mod.lease_candidates(canon, agent) or []
+    rank = (candidates.index(host) if agent.releve == "preference" and host in candidates
+            else None)
     storage.of(db).canon.write_candidate(
-        agent.title, host, canon=canon_key,
+        agent.title, host, canon=canon_key, preference_rank=rank,
         cwd=os.path.expanduser(cwd) if cwd else None,
         ok=verdict.ok, diagnostic=verdict.diagnostic, ref=verdict.ref,
         harness=agent.harness or "other", provider=agent.provider,
@@ -1870,8 +1875,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     # des hôtes qui ne sont plus candidats.
     canon_key = "" if canon.is_default else ident
     for declared in canon.agents:
+        # #7048 : pour `preference`, les candidats sont les hôtes du Placement,
+        # dans l'ordre (la colonne `candidats` garde cet ordre)
         storage.of(db).canon.set_election(
-            declared.title, declared.releve, declared.candidats, canon=canon_key)
+            declared.title, declared.releve,
+            canon_mod.lease_candidates(canon, declared), canon=canon_key)
     # L165 (EP1) : un agent élu peut avoir sa ligne chez un AUTRE candidat.
     # Le sync de cet hôte doit quand même voir les fiches retirées (pour
     # fermer leur candidature) et les candidats qui ne sont plus admis ici.
@@ -1937,7 +1945,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         # L165 (EP1) : sur un hôte candidat, le verdict de placement de CET
         # hôte est écrit même si la ligne est encore chez un autre candidat :
         # c'est lui qui autorisera la réclamation depuis ici.
-        candidate = agent.releve == "election" and host in (agent.candidats or [])
+        # #7048 : pour `preference`, les candidats sont les hôtes du Placement
+        lease = canon_mod.lease_candidates(canon, agent)
+        candidate = host in (lease or [])
         card_errors = list(block.by_agent.get(name, ()))
         # Hôte courant admis et différent de celui qu'on synchronise : on ne
         # touche à rien, l'exécution reste où elle est (0029). Une fiche en
@@ -1945,7 +1955,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         # périmé est vidé même si la ligne est chez un autre détenteur.
         if row is not None and row.get("host") not in (None, host) \
                 and row.get("host") in other_admitted.get(name, []):
-            election_card = agent.releve == "election" and bool(card_errors)
+            election_card = canon_mod.cross_host(agent.releve) and bool(card_errors)
             if candidate or election_card:
                 if block.global_errors:
                     # Lecture locale incomplète : le sync du détenteur jugera.
@@ -2046,8 +2056,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # L165 (EP1) : relève et hôtes candidats, déclaratifs comme le
             # placement ; un agent `hote` n'a pas de liste (NULL).
             "releve": agent.releve,
-            "candidats": (list(agent.candidats) if agent.candidats is not None
-                          else None),
+            "candidats": (list(lease) if lease is not None else None),
             # #3185 : les projets dont l'agent relit les lots, hors son équipe
             "relit": list(agent.relit) if agent.relit is not None else None,
             # L42 (0031) : canon déclarant (NULL pour le canon par défaut)
