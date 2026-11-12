@@ -168,6 +168,32 @@ class RenumberingTest(unittest.TestCase):
              "supabase/migrations/783_other_lot.sql")
         self.refused(_commit(self.root, "steal"), "_other_lot.sql differs outside")
 
+    def test_a_target_file_touched_then_restored_is_refused(self):
+        # B1 dev3 #213435 : il porte le nouveau numéro, mais n'est pas au lot.
+        _git(self.root, "switch", "-q", "main")
+        _put(self.root, "supabase/migrations/783_target.sql", "-- 783\n")
+        self.tip = _commit(self.root, "a target file numbered 783")
+        _git(self.root, "switch", "-q", "lot/6953")
+        _git(self.root, "merge", "-q", "--no-edit", "main")
+        self.rename()
+        self.references()
+        _put(self.root, "supabase/migrations/783_target.sql", "-- 784\n")
+        _commit(self.root, "touched")
+        _put(self.root, "supabase/migrations/783_target.sql", "-- 783\n")
+        self.refused(_commit(self.root, "restored"), "neither a test adaptation")
+
+    def test_two_migrations_to_one_number_are_refused(self):
+        # B2 dev3 #213435 : deux 783 à l'arrivée.
+        _git(self.root, "switch", "-q", "lot/6953")
+        _put(self.root, "supabase/migrations/785_second.sql", "SELECT 785;\n")
+        self.reviewed = _commit(self.root, "second migration")
+        self.rename()
+        _git(self.root, "mv", "supabase/migrations/785_second.sql",
+             "supabase/migrations/783_second.sql")
+        _put(self.root, "supabase/migrations/783_second.sql", "SELECT 783;\n")
+        frozen = self.references()
+        self.refused(frozen, "to the same number 783")
+
     def test_a_product_change_hidden_in_the_history_is_refused(self):
         _put(self.root, "secret.txt", "s\n")
         _commit(self.root, "secret")

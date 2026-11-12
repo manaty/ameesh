@@ -819,6 +819,15 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
         if mapping.setdefault(number, renamed) != renamed:
             out["why"] = "renumbering %s to two numbers" % number
             return out
+    # B2 dev3 #213435 : deux anciens numéros vers un même nouveau laisseraient
+    # deux migrations de ce numéro à l'arrivée
+    taken: dict = {}
+    for _old, new, number, renamed, zone in pairs:
+        if zone == "migration" and mapping.get(number) == renamed:
+            if taken.setdefault(renamed, number) != number:
+                out["why"] = ("renumbering %s and %s to the same number %s"
+                              % (taken[renamed], number, renamed))
+                return out
     if not mapping:
         return out
     paths: set = set()
@@ -997,10 +1006,19 @@ def _renumber_commit(repo: str, parent: str, commit: str, fields: Mapping,
         return (before is not None and after is not None
                 and _substitute(before, mapping) == _substitute(after, mapping))
 
-    renamed_to = set(mapping.values())
+    # B1 dev3 #213435 : seuls un chemin de la tête relue et le nouveau chemin
+    # attendu d'un tel chemin se retouchent ; un fichier de la cible qui porte
+    # le nouveau numéro n'est pas au lot, même retouché puis rétabli
+    owned = renumber.owned or frozenset()
+    expected = set(owned)
+    for path in owned:
+        match = _NUMBERED.match(os.path.basename(path))
+        if match and match.group(1) in mapping:
+            expected.add(os.path.join(os.path.dirname(path),
+                                      mapping[match.group(1)] + match.group(2)))
     pairs = {}
     for old, new, number, renamed, zone in _renamed_pairs(fields, renumber):
-        if mapping.get(number) == renamed and old in (renumber.owned or ()):
+        if mapping.get(number) == renamed and old in owned:
             pairs[old] = pairs[new] = (old, new, zone)
     for path, status in fields.items():
         zone = renumber.zone(path)
@@ -1011,9 +1029,7 @@ def _renumber_commit(repo: str, parent: str, commit: str, fields: Mapping,
             continue
         if status in ("M", "A") and zone == "test":
             continue
-        match = _NUMBERED.match(os.path.basename(path))
-        if status == "M" and zone in ("migration", "companion") and (
-                path in (renumber.owned or ()) or (match and match.group(1) in renamed_to)):
+        if status == "M" and zone in ("migration", "companion") and path in expected:
             if not same(path, path):
                 return False
             continue
