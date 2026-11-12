@@ -2361,7 +2361,11 @@ def contract_modules(worktree: Path, *, base: str = "",
             except (OSError, ValueError, KeyError) as exc:
                 raise PaquetAutoError("plan commun de contrats illisible : " + str(exc)) from exc
             if shared["active"]:
-                chosen = (shared["modules"] if (plan.get("map") or {}).get("used")
+                # #7091 : une carte périmée vaut une carte absente. Celle du
+                # 27/10 (386 h), lue sur une fondation (housekeeping.py),
+                # mettait 1324 modules dans la passe des contrats.
+                card = plan.get("map") or {}
+                chosen = (shared["modules"] if card.get("used") and not card.get("stale")
                           else shared["contracts"])
                 modules.extend("tests." + name for name in chosen)
     return _dedupe_modules(worktree, modules)
