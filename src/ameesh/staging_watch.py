@@ -839,12 +839,25 @@ def executor_canons(db) -> list[tuple[str, dict]]:
         key = row.get("object")
         if not key:
             continue
+        found = None
         for item in events.recent_type("staging.request", 60, CANON_HISTORY,
                                        object=key):
             data = item.get("data")
-            if isinstance(data, dict) and data.get("canon_ref"):
-                out.append((key.split(":", 1)[-1], data))
+            if not (isinstance(data, dict) and data.get("canon_ref")):
+                continue
+            if found is None:
+                found = data
+                if "canon_refresh" in data:
+                    break
+            elif "canon_refresh" in data:
+                # #7053: a later failed or blocked pass carries no refresh;
+                # the refusal of the last completed one on the same copy
+                # still speaks for it.
+                if data["canon_ref"] == found["canon_ref"]:
+                    found = dict(found, canon_refresh=data["canon_refresh"])
                 break
+        if found is not None:
+            out.append((key.split(":", 1)[-1], found))
     return out
 
 

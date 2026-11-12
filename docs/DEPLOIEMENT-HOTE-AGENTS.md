@@ -1194,21 +1194,26 @@ lever après correction), dans la session du compte d'exécution, sur le
 candidat élu, hors de toute séquence en cours :
 
 ```sh
-CANON=~/canon            # la racine canon lue par ce compte
-git -C "$CANON" fetch --no-tags --refmap= origin \
-  +refs/heads/main:refs/ameesh/staging-canon-candidate
-~/.local/share/ameesh/venv/bin/ameesh canon check \
-  --canon "$CANON" --ref refs/ameesh/staging-canon-candidate
-git -C "$CANON" merge-base --is-ancestor origin/main \
-  refs/ameesh/staging-canon-candidate \
-  && git -C "$CANON" update-ref refs/remotes/origin/main \
-       "$(git -C "$CANON" rev-parse refs/ameesh/staging-canon-candidate)" \
-       "$(git -C "$CANON" rev-parse origin/main)"
+(
+  set -eu
+  CANON=~/canon          # la racine canon lue par ce compte
+  git -C "$CANON" fetch --no-tags --refmap= origin \
+    +refs/heads/main:refs/ameesh/staging-canon-candidate
+  ANCIEN=$(git -C "$CANON" rev-parse refs/remotes/origin/main)
+  NOUVEAU=$(git -C "$CANON" rev-parse refs/ameesh/staging-canon-candidate)
+  git -C "$CANON" merge-base --is-ancestor "$ANCIEN" "$NOUVEAU"
+  ~/.local/share/ameesh/venv/bin/ameesh canon check \
+    --canon "$CANON" --ref "$NOUVEAU"
+  git -C "$CANON" update-ref refs/remotes/origin/main "$NOUVEAU" "$ANCIEN"
+)
 ```
 
-Le `update-ref` ne se lance que si le check est vert (ses erreurs, pas ses
-avertissements d'hôte) ; l'alerte se tait à la prochaine passe qui traite
-une demande (son enregistrement porte le nouveau commit).
+Le sous-shell s'arrête à la première commande en échec (`set -e`) : le
+`update-ref` ne se lance qu'après un fetch réussi, une avance rapide et un
+`canon check` qui rend 0 (il est plus strict que le chemin automatique : les
+erreurs du registre de l'hôte le font aussi échouer), et seulement si
+`origin/main` n'a pas bougé entre-temps. L'alerte se tait à la prochaine
+passe qui traite une demande (son enregistrement porte le nouveau commit).
 
 Une fois la configuration et les accès approuvés, l'opérateur active les
 services sur les candidats et soumet un SHA complet :

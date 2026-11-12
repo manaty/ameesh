@@ -165,5 +165,33 @@ class CompletedPassTest(Copies):
         self.assertEqual(self.read(), self.old)
 
 
+class LaterPassTest(unittest.TestCase):
+    """Un refus reste lu malgré une passe `failed` plus récente."""
+
+    def canons(self, rows):
+        events = types.SimpleNamespace(
+            latest_type=lambda *a: [dict(object="staging-request:mesh")],
+            recent_type=lambda kind, days, limit, object=None: rows)
+        store = types.SimpleNamespace(events=events)
+        with mock.patch.object(staging_watch.storage, "of", return_value=store):
+            return staging_watch.executor_canons(object())
+
+    def test_failed_pass_keeps_the_last_refusal(self):
+        refused = dict(state="refused", reason="canon check")
+        (key, data), = self.canons([
+            dict(data=dict(state="failed", canon_ref="c" * 40)),
+            dict(data=dict(state="completed", canon_ref="c" * 40,
+                           canon_refresh=refused))])
+        self.assertEqual((key, data["state"], data["canon_refresh"]),
+                         ("mesh", "failed", refused))
+
+    def test_refusal_on_another_copy_is_not_carried(self):
+        (_, data), = self.canons([
+            dict(data=dict(state="failed", canon_ref="d" * 40)),
+            dict(data=dict(state="completed", canon_ref="c" * 40,
+                           canon_refresh=dict(state="refused")))])
+        self.assertNotIn("canon_refresh", data)
+
+
 if __name__ == "__main__":
     unittest.main()
