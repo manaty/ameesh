@@ -213,9 +213,18 @@ def rules_of(declaration) -> tuple[Rule, ...]:
         raise DesignationError("explicit train review rules required; no implicit default")
     out = []
     for entry in declaration["rules"]:
-        if not isinstance(entry, dict) or set(entry) != {"paths", "reviews"} \
-                or not isinstance(entry["paths"], list):
+        if (not isinstance(entry, dict)
+                or not {"paths", "reviews"} <= set(entry)
+                or set(entry) - {"paths", "reviews", "paused_family_reviews"}
+                or not isinstance(entry["paths"], list)):
             raise DesignationError("a review rule is {paths: [...], reviews: 1|2}")
+        # #6990 : clé de repli de la porte ; ce lecteur de désignation la
+        # valide sans l'appliquer (le gel garde ses deux familles).
+        paused = entry.get("paused_family_reviews", 0)
+        if type(paused) is not int or paused not in (0, 1) \
+                or (type(entry.get("reviews")) is int and paused > entry["reviews"]):
+            raise DesignationError("paused_family_reviews: 0 or 1 expected, "
+                                   "at most reviews")
         out.append(Rule(paths=tuple(entry["paths"]), reviews=entry["reviews"]))
     return tuple(out)
 

@@ -915,8 +915,14 @@ def _ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     # branche locale) ; un clone partagé non rafraîchi ne fait alors plus
     # passer des commits déjà dans la cible pour des tiers.
     gate_target = resolved if class_sha else (fresh_target or resolved or base)
+    # #6990 (B1 cx1, 12/11) : même contexte que la file. Un feu sur une tête
+    # `integration/**` admet le paquet et sa suite complète ; un feu direct
+    # sur un lot ordinaire, même sous exception incident/unblock, garde les
+    # deux avis : le repli de famille en pause ne s'y applique pas (#213032 a).
     gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
                                    item=row, cfg=cfg, target=gate_target,
+                                   record=True,
+                                   packet=packet_reviews.is_vehicle(row),
                                    **gate_authors)
     if not gate["ok"]:
         return False, gate["why"], klass

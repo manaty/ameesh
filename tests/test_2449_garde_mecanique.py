@@ -122,6 +122,7 @@ POSITIVE = {
     "reviews.distinct_families":
         "def f(*, distinct_families=True):\n    pass\n",
     "reviews.light_reviews": "LIGHT_REVIEWS = 1\n",
+    "reviews.paused_family_min_hours": "paused_family_min_hours = 12\n",
     "merge.named_fire": "def f(*, named_fire=False):\n    pass\n",
     "merge.repeat_freeze": "def f(*, repeat_freeze=False):\n    pass\n",
     "merge.on_green_packet": "def f(*, on_green_packet=True):\n    pass\n",

@@ -563,6 +563,37 @@ def _light_reviews(canons) -> tuple[int, str]:
     return value, ""
 
 
+def _paused_min_hours(canons) -> int:
+    """#6990 : le seuil de repli d'une famille en pause, au même commit.
+
+    `reviews.paused_family_min_hours` est une **permission**, pas un plancher :
+    elle n'est ouverte que si tous les canons lisibles la déclarent positive ;
+    le plus long délai l'emporte, et un canon sans la clé rend 0 (aucun repli).
+    Une lecture impossible laisse 0 sans rendre la classe douteuse : le
+    plancher léger porte déjà le diagnostic d'un document illisible ; ici,
+    l'absence de preuve ne s'accorde jamais.
+    """
+    from ... import mechanics
+    paused = None
+    enabled = None
+    for canon in canons or ():
+        for source in getattr(canon, "sources", ()) or ():
+            if (getattr(source, "mode", "") != "git" or not source.repo
+                    or not source.commit or getattr(source, "prefix", "")):
+                continue
+            try:
+                declared = int(mechanics.paused_family_min_hours_at(
+                    source.repo, source.commit))
+            except (mechanics.MechanicsAbsent, mechanics.MechanicsError):
+                declared = 0
+            if declared <= 0:
+                enabled = False
+            elif enabled is None:
+                enabled = True
+            paused = declared if paused is None else max(paused, declared)
+    return int(paused or 0) if enabled else 0
+
+
 def _review_flags(canons) -> tuple[bool, bool, str]:
     """Les drapeaux d'avis du canon compilé, au même commit que la classe (#2726).
 
@@ -595,7 +626,8 @@ def _review_flags(canons) -> tuple[bool, bool, str]:
     return exclude, True if distinct is None else distinct, ""
 
 
-def _train_reviews(federation, project: Optional[str], paths) -> tuple[int, dict, int, str]:
+def _train_reviews(federation, project: Optional[str], paths
+                   ) -> tuple[int, dict, int, dict, str]:
     """Le nombre d'avis déclaré par chemin (`train_reviews`, PR85).
 
     Lu dans le **même document** que la politique de classe, donc au même
@@ -611,59 +643,117 @@ def _train_reviews(federation, project: Optional[str], paths) -> tuple[int, dict
     `**` couvre tous les chemins sans en nommer aucun, il ne peut donc pas
     abaisser le plancher critique.
 
+    #6990 : `repli` porte, pour chaque chemin changé, `{count, keyed}` — le
+    plus grand nombre de règles qui le couvrent, et si **toutes** les règles de
+    ce nombre déclarent `paused_family_reviews: 1`. Un chemin dont une règle
+    au compte maximal ne l'accorde pas n'ouvre jamais le repli, et une règle
+    mal formée rend un problème, jamais un accord muet.
+
     Un bloc absent (canon antérieur) ou un projet absent du bloc ne disent
     rien : 0, sans doute. Un bloc ou une règle illisible rend un problème que
     `class_of_paths` traduit en doute, jamais en zéro rassurant.
     """
     if not isinstance(federation, dict):
-        return 0, {}, 0, ""
+        return 0, {}, 0, {}, ""
     policies = federation.get("review_policies")
     if not isinstance(policies, dict):
-        return 0, {}, 0, ""
+        return 0, {}, 0, {}, ""
     block = policies.get("train_reviews")
     if block is None:
-        return 0, {}, 0, ""
+        return 0, {}, 0, {}, ""
     if not isinstance(block, dict) \
             or block.get("schema") != "ameesh-train-reviews-policy/1":
-        return 0, {}, 0, "review_policies.train_reviews: unknown schema"
+        return 0, {}, 0, {}, "review_policies.train_reviews: unknown schema"
     projects = block.get("projects")
     if not isinstance(projects, dict):
-        return 0, {}, 0, "review_policies.train_reviews.projects: not a mapping"
+        return 0, {}, 0, {}, "review_policies.train_reviews.projects: not a mapping"
     declaration = projects.get(project)
     if declaration is None:
-        return 0, {}, 0, ""     # ce canon ne déclare pas les avis de ce projet
+        return 0, {}, 0, {}, ""     # ce canon ne déclare pas les avis de ce projet
     rules = declaration.get("rules") if isinstance(declaration, dict) else None
     if not isinstance(rules, list):
-        return 0, {}, 0, ("review_policies.train_reviews.projects.%s.rules: not a list"
-                          % project)
+        return 0, {}, 0, {}, ("review_policies.train_reviews.projects.%s.rules: not a list"
+                              % project)
     wanted = [str(path) for path in paths or () if str(path or "")]
     value = 0
     pairs = []
+    matched: dict[str, list[tuple[int, bool]]] = {path: [] for path in wanted}
     for index, rule in enumerate(rules):
         where = ("review_policies.train_reviews.projects.%s.rules[%d]"
                  % (project, index))
-        if not isinstance(rule, dict) or set(rule) != {"paths", "reviews"}:
-            return 0, {}, 0, "%s: expected {paths, reviews}" % where
+        if (not isinstance(rule, dict)
+                or not {"paths", "reviews"} <= set(rule)
+                or set(rule) - {"paths", "reviews", "paused_family_reviews"}):
+            return 0, {}, 0, {}, "%s: expected {paths, reviews}" % where
         count = rule["reviews"]
         if type(count) is not int or count not in (1, 2):
-            return 0, {}, 0, "%s.reviews: expected 1 or 2" % where
+            return 0, {}, 0, {}, "%s.reviews: expected 1 or 2" % where
+        paused = rule.get("paused_family_reviews", 0)
+        if type(paused) is not int or paused not in (0, 1) or paused > count:
+            return 0, {}, 0, {}, ("%s.paused_family_reviews: expected 0 or 1, "
+                                  "at most reviews" % where)
         patterns = rule["paths"]
         if (not isinstance(patterns, list) or not patterns
                 or any(not isinstance(p, str) or not p.strip() for p in patterns)):
-            return 0, {}, 0, "%s.paths: nonempty strings required" % where
+            return 0, {}, 0, {}, "%s.paths: nonempty strings required" % where
         try:
             compiled = tuple(review_mod.compile_glob(pattern) for pattern in patterns)
         except re.error as exc:
-            return 0, {}, 0, "%s.paths: invalid pattern (%s)" % (where, exc)
-        if any(rx.fullmatch(path) for path in wanted for rx in compiled):
+            return 0, {}, 0, {}, "%s.paths: invalid pattern (%s)" % (where, exc)
+        hits = [path for path in wanted if any(rx.fullmatch(path) for rx in compiled)]
+        if hits:
             value = max(value, count)
+        for path in hits:
+            matched[path].append((count, paused >= 1))
         pairs.append((patterns, count))
     try:
         named, wide = review_mod.declared_reviews(pairs, wanted)
     except re.error as exc:     # déjà validé ci-dessus : jamais un repli muet
-        return 0, {}, 0, ("review_policies.train_reviews.projects.%s.rules:"
-                          " invalid pattern (%s)" % (project, exc))
-    return value, named, wide, ""
+        return 0, {}, 0, {}, ("review_policies.train_reviews.projects.%s.rules:"
+                              " invalid pattern (%s)" % (project, exc))
+    repli = {}
+    for path, entries in matched.items():
+        top = max((entry[0] for entry in entries), default=0)
+        repli[path] = {"count": top,
+                       "keyed": bool(entries) and all(
+                           keyed for count, keyed in entries if count == top)}
+    return value, named, wide, repli, ""
+
+
+def _paused_eligible(files, named, repli, wide, light, project) -> bool:
+    """#6990 : le repli de pause couvre-t-il **tous** les chemins changés ?
+
+    Même lecture que la porte de fusion (`merge_queue._named_verdicts`) : une
+    règle qui nomme le chemin fait foi du compte ; un `**` ne l'abaisse jamais ;
+    un chemin critique explicite (`critical: true` du canon) ou un chemin
+    critique non nommé garde deux avis. Le repli n'est ouvert que si chaque
+    chemin à deux avis tombe sous une règle nommante à deux avis qui l'accorde
+    (`paused_family_reviews: 1`). Un `**` accordant peut relever le compte sans
+    l'abaisser ; un `**` non accordant interdit le repli sur tous les chemins.
+    """
+    from ... import merge_queue
+    if not files:
+        return False
+    for entry in files:
+        path = str(entry.get("path") or "")
+        if not path:
+            return False
+        declared = repli.get(path) or {}
+        count = int(declared.get("count") or 0)
+        keyed = bool(declared.get("keyed"))
+        floor = (int(light or 0) if str(entry.get("class") or "") == LIGHT
+                 else merge_queue.SENSITIVE_REVIEWS)
+        effective = max(floor, count, int(wide or 0))
+        if entry.get("critical") is True:
+            return False
+        if named.get(path) is None and project in ("", "ameesh") \
+                and merge_queue._entry_critical(entry):
+            return False
+        if effective <= 1:
+            continue
+        if named.get(path) is None or count != 2 or not keyed:
+            return False
+    return True
 
 
 def class_of_paths(canons, project: Optional[str], paths) -> dict:
@@ -693,10 +783,12 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
     """
     canons = tuple(canons or ())
     light_reviews, light_problem = _light_reviews(canons)
+    paused_min_hours = _paused_min_hours(canons)
     exclude_author_family, distinct_families, flags_problem = _review_flags(canons)
     train_reviews = 0
     train_named: dict = {}
     train_wide = 0
+    paused_ok = paused_min_hours > 0
     if light_problem:
         return {"class": SENSITIVE, "files": _doubtful_files(paths),
                 "policy_ref": "", "doubt": True, "project": project or "",
@@ -749,8 +841,9 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
                     "exclude_author_family": exclude_author_family,
                     "distinct_families": distinct_families,
                     "why": "cannot classify the change: %s" % exc}
-        declared, declared_named, declared_wide, declared_problem = _train_reviews(
-            federation, project, [entry["path"] for entry in result["files"]])
+        declared, declared_named, declared_wide, declared_repli, declared_problem = \
+            _train_reviews(federation, project,
+                           [entry["path"] for entry in result["files"]])
         if declared_problem:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
                     "policy_ref": _ref(canon), "doubt": True,
@@ -767,6 +860,10 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         train_wide = max(train_wide, declared_wide)
         for path, count in declared_named.items():
             train_named[path] = max(train_named.get(path, 0), count)
+        if paused_ok:
+            paused_ok = _paused_eligible(
+                result["files"], declared_named, declared_repli,
+                max(train_wide, declared_wide), light_reviews, project)
         if not ref:
             ref = _ref(canon)
         critical_paths.update(entry["path"] for entry in result["files"]
@@ -802,7 +899,12 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             "train_reviews_paths": train_named,
             "train_reviews_wide": train_wide,
             "exclude_author_family": exclude_author_family,
-            "distinct_families": distinct_families}
+            "distinct_families": distinct_families,
+            # #6990 : le repli d'une famille en pause ne s'ouvre que si le
+            # canon le déclare (seuil) et si toutes les règles à deux avis du
+            # diff l'accordent ; la porte l'exige, jamais ne le suppose.
+            "paused_family_min_hours": paused_min_hours if paused_ok else 0,
+            "paused_family_reviews": 1 if paused_ok else 0}
 
 
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
@@ -840,7 +942,10 @@ def _of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     projet qui décide du repli de la porte, #2696) et les drapeaux compilés
     `exclude_author_family` / `distinct_families` (#2726) pour la trace, et,
     sur un lot du canon qui touche sa politique, `canon_lowering` (#3554) avec
-    `reviews_floor=2` sur une baisse d'exigence.
+    `reviews_floor=2` sur une baisse d'exigence. `paused_family_min_hours`
+    (seuil compilé) et `paused_family_reviews` (1 quand toutes les règles à
+    deux avis du diff accordent le repli, #6990) sont absents sur un doute :
+    la porte les lit par `.get` et n'ouvre alors aucun repli.
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",

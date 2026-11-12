@@ -71,11 +71,21 @@ class Versioned:
         rules = []
         patterns = []
         for rule in declaration["rules"]:
-            if not isinstance(rule, dict) or set(rule) != {"paths", "reviews"} \
-                    or type(rule["reviews"]) is not int or rule["reviews"] not in (1, 2) \
-                    or not isinstance(rule["paths"], list) or not rule["paths"] \
-                    or any(not isinstance(p, str) or not p.strip() for p in rule["paths"]):
+            if (not isinstance(rule, dict)
+                    or not {"paths", "reviews"} <= set(rule)
+                    or set(rule) - {"paths", "reviews", "paused_family_reviews"}
+                    or type(rule["reviews"]) is not int or rule["reviews"] not in (1, 2)
+                    or not isinstance(rule["paths"], list) or not rule["paths"]
+                    or any(not isinstance(p, str) or not p.strip() for p in rule["paths"])):
                 raise TrainError("review rules require paths and an explicit count of 1 or 2")
+            # #6990 : clé de repli de la porte, lue par `lot_class` et
+            # `mechanics` ; ce lecteur de compte la valide sans l'appliquer
+            # (la désignation garde ses deux familles au gel).
+            paused = rule.get("paused_family_reviews", 0)
+            if type(paused) is not int or paused not in (0, 1) \
+                    or paused > rule["reviews"]:
+                raise TrainError("paused_family_reviews: 0 or 1 expected, "
+                                 "at most reviews")
             try:
                 rules.append((tuple(review.compile_glob(p) for p in rule["paths"]), rule["reviews"]))
             except re.error as exc:
