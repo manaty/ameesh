@@ -191,6 +191,38 @@ class CapsAndOrderTest(_CapsBase):
         self.assertFalse(evs["tertiaire"].ok)
         self.assertIn("in overage", evs["tertiaire"].reason)
 
+    def test_organization_plan_uses_reserved_quota_without_paid_overage(self):
+        now = 1_800_000_000.0
+        capable = cost.Overage(capable=True)
+        items = self._items(secondaire={"scope": "organization"})
+        shared = items[1]
+        self.assertEqual(shared.scope, "organization")
+        gauges = {"secondaire": self._gauges(0.14, 0.80, now, capable)}
+        ordinary = accounts.evaluate(_Book(gauges), shared, items, now, reserve=True)
+        self.assertTrue(ordinary.ok, ordinary.reason)
+        self.assertFalse(ordinary.reserve)
+        self.assertEqual(ordinary.limits["seven_day"][0], 0.90)
+        with_short = self._items(secondaire={"scope": "organization",
+                                            "short_window_cap": 0.85})
+        short_reading = accounts.evaluate(_Book(gauges), with_short[1], with_short,
+                                          now, reserve=True)
+        self.assertTrue(short_reading.ok, short_reading.reason)
+        self.assertEqual(short_reading.limits["five_hour"], (0.85, "short window cap"))
+        personal = self._items()[1]
+        personal_reading = accounts.evaluate(_Book(gauges), personal, self._items(),
+                                             now, reserve=True)
+        self.assertFalse(personal_reading.ok)
+        self.assertIn("overage cap 80%", personal_reading.reason)
+        spent = {"secondaire": self._gauges(0.14, 0.90, now, capable)}
+        held = accounts.evaluate(_Book(spent), shared, items, now, reserve=True)
+        self.assertFalse(held.ok)
+        self.assertTrue(held.hard)
+        self.assertIn("organization cap 90%", held.reason)
+        with self.assertRaises(accounts.AccountError):
+            self._items(secondaire={"scope": "unknown"})
+        with self.assertRaises(accounts.AccountError):
+            self._items(secondaire={"scope": "organization", "overage_cap": 0.95})
+
     def test_short_window_cap_replaces_the_pace_cap(self):
         # bureau's sprint patch of 2026-10-11 (sprint.json short_window_cap 0.80)
         now = 1_800_000_000.0
