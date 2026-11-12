@@ -18,6 +18,7 @@ jamais avec le rôle `ameesh` ni un DSN d'agent.
 | prendre / lever un geste externe | `ameesh work claim <lot> --session <id> [--release]` | UPDATE des seules colonnes `external_claim_*` de `work_items` (dont `external_claim_harness` et `external_claim_binding` dès la migration 0566 de #6877) |
 | reçus de provenance | hooks `provenance intent|created|record` | INSERT de `provenance_receipts` |
 | courrier | `agent-mail send`, `agent-mail inbox` | INSERT de `agent_mailbox` ; UPDATE de `meta`, `delivered_at`, `status` (réservation et remise du courrier reçu) |
+| présence et non-lus des agents (#7058) | `agent-mail list` | SELECT de la vue `agent_mesh_overview` (registre et courrier, déjà lisibles) ; pour le prédicat de réclamation, SELECT des seules colonnes lues de `host_lifecycle`, `host_release_fences` et `host_handoffs` |
 
 La liste exacte est `deploy/sql/_bureau-droits.sql` ; `_contrat-bureau.sql`
 compare les droits **effectifs** (PUBLIC et appartenances compris) à cette
