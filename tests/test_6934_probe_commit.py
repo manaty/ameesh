@@ -107,6 +107,32 @@ class ProbeCommitTest(rebased.RebasedCorrectorDoubtTest):
         self.assertIn("excluded by doubt", out["why"])
         self.assertIn(local[:12], out["why"])
 
+    def test_a_correction_pushed_on_a_new_base_stays_excluded(self):
+        # B/P2 mty-amh-impl-06 : le correctif poussé (C) est rebasé sur une
+        # base neuve, il ne descend pas de F1 ; le relevé l'a vu, puis l'auteur
+        # réécrit. Le reçu local L est refusé par la forge : cx3 reste exclu.
+        _head_a, local, _pushed, head_b = self._prepare_doubt()
+        branch = self.repo.git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        self.repo.git("checkout", "-q", "-B", "nouvelle-base", self.base)
+        self.repo.write("docs/avance.md", "la cible avance\n")
+        self.repo.commit("cible : avance", agent="author")
+        self.repo.write("src/ameesh/mail.py", "lot\ncx3 petit correctif\n")
+        rebased_fix = self.repo.commit("cx3: correctif rebasé", agent="cx3")
+        self.repo.git("checkout", "-q", branch)
+        self.repo.git("reset", "--hard", head_b)
+        self.assertIs(False, review_authors._is_ancestor(
+            self.repo.root, _head_a, rebased_fix))
+        self.db.execute(
+            "INSERT INTO work_item_branch_heads (work_item_id, branch, sha)"
+            " VALUES (%s, 'lot-branch', %s)", (self.lot, rebased_fix))
+        with mock.patch.object(review_authors, "_forge_fetch",
+                               side_effect=_refusing(local)):
+            _mark, out = self.prefetched_freeze()   # F2
+        names = [row["name"] for row in out["reviewers"]]
+        self.assertNotIn("cx3", names)
+        self.assertIn("excluded by doubt", out["why"])
+        self.assertNotIn("never pushed", out["why"])
+
     def test_a_refused_rebased_correction_without_push_trace_is_a_probe(self):
         _head_a, local, _pushed, _head_b = self._prepare_doubt()
         with mock.patch.object(review_authors, "_forge_fetch",

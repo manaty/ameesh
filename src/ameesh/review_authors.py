@@ -5212,26 +5212,40 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         de reçu), soit une sonde jamais poussée. La différence est une poussée
         : une tête vue de la branche du lot (relevé, `branch_heads`) ou un gel
         postérieur qui descend de ce gel et dont la plage porte un commit de
-        committer `key`. Une tête illisible ou une lecture impossible dit
+        committer `key`. B/P2 mty-amh-impl-06 : une tête **relevée** n'a pas à
+        descendre du gel (une correction poussée puis rebasée sur une base
+        neuve) ; son journal hors du gel (`tip --not gel`) est lu, et un commit
+        de `key` daté du gel ou après suffit. Les gels postérieurs gardent la
+        descendance. Une tête illisible ou une lecture impossible dit
         « poussé » : le doute garde l'exclusion."""
         slot = (key, int(freeze_id))
         if slot in pushes:
             return pushes[slot]
-        tips: list[str] = []
+        observed: list[str] = []
         try:
             work_store = storage.of(db).work
-            tips.append(str(item.get("branch_head") or ""))
-            tips.extend(str(row.get("sha") or "")
-                        for row in work_store.branch_heads([lot]) or ())
+            observed.append(str(item.get("branch_head") or ""))
+            observed.extend(str(row.get("sha") or "")
+                            for row in work_store.branch_heads([lot]) or ())
         except Exception:  # noqa: BLE001 - relevé illisible : doute
             pushes[slot] = True
             return True
-        tips.extend(str(row.get("sha") or "") for row in freezes
-                    if int(row.get("id") or 0) > int(freeze_id))
+        since = 0.0
+        later: list[str] = []
+        for row in freezes:
+            if int(row.get("id") or 0) == int(freeze_id):
+                since = float(row.get("at_ts") or 0.0)
+            elif int(row.get("id") or 0) > int(freeze_id):
+                later.append(str(row.get("sha") or ""))
+        tips = [(value, True) for value in observed] + [
+            (value, False) for value in later]
         found = False
-        for tip in dict.fromkeys(value.strip().lower() for value in tips):
-            if not tip or plan_git.same_commit(tip, freeze_sha):
+        seen: set[str] = set()
+        for raw_tip, is_observed in tips:
+            tip = raw_tip.strip().lower()
+            if not tip or tip in seen or plan_git.same_commit(tip, freeze_sha):
                 continue
+            seen.add(tip)
             check()
             try:
                 readable = (_forge_fetch(repo, tip, timeout=remaining())
@@ -5241,10 +5255,14 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             if readable is not True:
                 found = True            # tête poussée illisible : doute
                 break
-            if _is_ancestor(repo, freeze_sha, tip) is not True:
+            if is_observed:
+                text = _read_out(repo, "log", "--format=%ce%x1f%ct", tip,
+                                 "--not", freeze_sha)
+            elif _is_ancestor(repo, freeze_sha, tip) is not True:
                 continue
-            text = _read_out(repo, "log", "--format=%ce%x1f%ct",
-                             "%s..%s" % (freeze_sha, tip))
+            else:
+                text = _read_out(repo, "log", "--format=%ce%x1f%ct",
+                                 "%s..%s" % (freeze_sha, tip))
             if text is None:
                 found = True
                 break
@@ -5254,6 +5272,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     stamp = float(raw.strip())
                 except ValueError:
                     stamp = 0.0
+                if is_observed and stamp and since and stamp < since:
+                    continue            # commit d'avant ce gel : pas une poussée
                 name = _agent_of_email(db, email.strip().lower(), stamp)
                 if name and name.casefold() == key:
                     found = True
@@ -5274,16 +5294,17 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         dit « publié » : l'exclusion demeure."""
         if pushed_by(key, freeze_id, freeze_sha):
             return True
-        if fetch_cache.refused(repo, full, state_dir=state_dir):
-            return False
         if not fetch:
-            return True
+            return not fetch_cache.refused(repo, full, state_dir=state_dir)
+        # Avec la forge, le cache (6 h) n'est pas une preuve : elle répond.
         check()
         served = _forge_serves(repo, full, timeout=remaining())
         check()
         if served is False:
             fetch_cache.note(repo, full, state_dir=state_dir)
             return False
+        if served is True:
+            fetch_cache.forget(repo, full, state_dir=state_dir)
         return True
 
     def finish(result: dict) -> dict:
