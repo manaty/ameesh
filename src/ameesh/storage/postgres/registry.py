@@ -28,6 +28,7 @@ from typing import Any, Sequence
 
 from ...persona_sessions import track_change
 from ...config import NAME_RE
+from .. import conversation_moves
 from .. import interface
 
 _ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -1666,10 +1667,20 @@ class Leases(interface.Leases):
                     WHEN operator_paused THEN 'operator_paused'
                     WHEN status = 'stopped' THEN 'stopped'
                     WHEN NOT ameesh_agent_claims_open(host, name) THEN 'host_closed'
+                    -- #7050 (5322 §2.3) : un déplacement de conversation
+                    -- planifié ou préparé — la source finit son tour en
+                    -- cours, mais n'en ouvre plus ; même verrou que `switch`.
+                    WHEN EXISTS (SELECT 1 FROM conversation_moves m
+                                  WHERE m.agent = verrou.name
+                                    AND m.source_host = verrou.host
+                                    AND m.state IN ('planned', 'prepared')
+                                    AND m.updated_at > clock_timestamp()
+                                        - make_interval(secs => %s))
+                    THEN 'conversation_move'
                     ELSE 'started' END AS reason
                 FROM (SELECT * FROM agent_registry WHERE name = %s FOR UPDATE) AS verrou
                 """,
-                (owner, epoch, name),
+                (owner, epoch, conversation_moves.PLAN_TTL_S, name),
             )
             reason = rows[0]["reason"] if rows else "missing"
             if reason != "started":

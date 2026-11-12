@@ -65,6 +65,7 @@ from . import account_budget, account_turn, adapters, admission_lock, auth_failu
 from . import cost as cost_mod
 from . import cost_attribution
 from . import context_metrics, context_profile
+from . import conversation_move
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, refusal, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import account_window
@@ -668,6 +669,9 @@ def _wake_arming_event(events) -> dict | None:
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
+    #: #7050 : premier tour d'un déplacement de conversation (session neuve,
+    #: segment, session provisoire) ; None hors déplacement
+    _move_turn = None
     """Un agent = un bail + une boucle de tours sur cette machine.
 
     C'est un thread : en mode service plusieurs agents tournent en parallèle,
@@ -1135,6 +1139,10 @@ class AgentWorker(threading.Thread):
         `session_reset_at` de la base) ; `SESSION_RESET_SKEW_S` couvre leur
         dérive, et dans la fenêtre on tranche pour l'oubli (voir la constante).
         """
+        if self._move_turn is not None:
+            # #7050 (5322 §2.3) : la session native de la cible est neuve ; le
+            # registre garde celle de la source jusqu'à `verified`
+            return self._move_turn.session
         session = (self.agent or {}).get("session_id")
         if session:
             return session
@@ -1182,6 +1190,20 @@ class AgentWorker(threading.Thread):
         # son ouverture)
         ouverte = session_new != session
         origine = (harnais_lance if ouverte else None, cwd if ouverte else None)
+        if self._move_turn is not None:
+            # #7050 : session provisoire — notée sur la tentative seulement ;
+            # le registre ne la prend qu'à `verified` (`_finish_move_turn`)
+            self._move_turn.session = session_new
+            self._move_turn.account = compte.name if compte is not None else None
+            self._move_turn.harness, self._move_turn.cwd = harnais_lance, cwd
+            try:
+                self._move_turn.launched(session_new)
+            except db_mod.DbError as exc:
+                log_async("[%s] conversation move session not noted (%s)"
+                          % (self.name, db_mod.explain(exc)))
+            if ouverte:
+                self._installe_hook_preuve(cwd)
+            return
         try:
             registry.set_session(
                 self.db, self.name, session_new,
@@ -8966,12 +8988,73 @@ class AgentWorker(threading.Thread):
         # #6046 : le bloc `session` du canon se relit à chaque tour
         self._canon_session = _SESSION_UNREAD
         with self._lease_heartbeat():
+            ok = False
             try:
                 with self._preparing("turn setup"):
-                    return self._run_turn_sous_battement(spec)
+                    ok = self._run_turn_sous_battement(spec)
+                    return ok
             finally:
+                self._finish_move_turn(ok)
                 # Le document ne survit à aucun retour du tour (#2894).
                 self._purge_turn_context()
+
+    def _open_move_turn(self) -> bool:
+        """#7050 (5322 §2.3-§2.4) : la cible réclame le déplacement avant son
+        premier tour — session native neuve, segment construit depuis le
+        journal, écrit dans un fichier 0600 de l'état de l'agent, désigné par
+        le document de tour. Faux si le déplacement vient d'échouer (bail
+        rendu, ligne revenue à la source) : pas de tour ici."""
+        if self._move_turn is not None or self.runner.dry_run:
+            return True
+        try:
+            first = conversation_move.open_first_turn(
+                self.db, self.cfg, self.state_dir, agent=self.name,
+                host=self.runner.host, owner=self.runner.runner_id, epoch=self.epoch)
+        except conversation_move.MoveError as exc:
+            log_async("[%s] conversation move failed: %s — back to the source host"
+                      % (self.name, exc))
+            self.lease_lost.set()
+            return False
+        if first is not None:
+            self._move_turn = first
+            log_async("[%s] conversation move %s: new session, segment %s..%s from %s"
+                      % (self.name, first.move_id, first.context.get("from_seq"),
+                         first.context.get("to_seq"), first.move["source_host"]))
+        return True
+
+    def _finish_move_turn(self, ok: bool) -> None:
+        """#7050 : après le premier tour cible — `verified` (le registre prend
+        la session de la cible) s'il s'est terminé avec une session, sinon
+        `failed` (bail rendu, retour à la source). Un tour jamais lancé
+        (admission différée, préparation refusée) garde la tentative liée à
+        ce bail pour le tour suivant."""
+        first = self._move_turn
+        if first is None or not self._turn_launched:
+            return
+        self._move_turn = None
+        try:
+            row = first.finish(bool(ok), session=first.session, account=first.account,
+                               harness=first.harness, cwd=first.cwd)
+        except db_mod.DbError as exc:
+            log_async("[%s] conversation move %s not closed (%s)"
+                      % (self.name, first.move_id, db_mod.explain(exc)))
+            return
+        if row is not None and row.get("state") == "verified":
+            if self.agent is not None:
+                self.agent["session_id"] = first.session
+                self.agent["session_account"] = first.account
+            log_async("[%s] conversation move %s verified: session %s"
+                      % (self.name, first.move_id, first.session))
+            return
+        # échec : la ligne repart à la source ; la session locale de la cible
+        # ne doit pas ressusciter à un retour ultérieur sur cet hôte
+        try:
+            os.unlink(self._path("session"))
+        except OSError:
+            pass
+        self.lease_lost.set()
+        log_async("[%s] conversation move %s failed: back to host %s"
+                  % (self.name, first.move_id, first.move["source_host"]))
 
     def _run_turn_sous_battement(self, spec: dict) -> bool:
         if spec.get("lot_switch_failed"):
@@ -9030,6 +9113,11 @@ class AgentWorker(threading.Thread):
 
         with self._preparing("account setup"):
             compte = account_turn.for_turn(self)  # L30
+        if not self._open_move_turn():
+            return False
+        if self._move_turn is not None:
+            # #7050 : la consigne désigne le segment, jamais son texte (argv)
+            spec = dict(spec, prompt=self._move_turn.prompt_note() + spec["prompt"])
         session = self.current_session()
         connue = (self._session_connue(harness, compte, adapter)
                   if session and not self.runner.dry_run else None)
@@ -9444,7 +9532,9 @@ class AgentWorker(threading.Thread):
                 budget_usd=self.agent.get("budget_usd"),
                 spent_usd=self.agent.get("spent_usd"),
                 spend_key=spend_key, marker=marqueur,
-                reservation=reservation)
+                reservation=reservation,
+                conversation=(self._move_turn.context
+                              if self._move_turn is not None else None))
             turn_context.write(self.state_dir, document,
                                secrets=turn_context.environment_secrets())
         except (OSError, turn_context.ContextError, db_mod.DbError) as exc:
@@ -11706,6 +11796,28 @@ class Runner:
             return ""
         return brief
 
+    def advance_conversation_moves(self) -> list:
+        """#7050 (5322 §2.3) : prépare (harnais, binaire, compte, dossier,
+        interactif ; aucun appel modèle) puis bascule les déplacements de
+        conversation dont cet hôte est la cible ; ceux d'agents hors de la
+        liste d'admission de cet exécuteur sont laissés à un autre."""
+        def probes(move):
+            return conversation_move.host_probes(
+                self.cfg, registry.get(self.db, move["agent"]),
+                adapter_for=lambda harness, binary: agent_adapter(harness, binary, self.host))
+        try:
+            steps = conversation_move.advance(
+                self.db, self.host, probes=probes, cwd_for=conversation_move.host_folder,
+                agents=self.agents_filter or None)
+        except Exception as exc:  # noqa: BLE001 - a move never stops the runner
+            log_async("conversation moves not advanced (%s): %s"
+                      % (type(exc).__name__, db_mod.brief(exc)))
+            return []
+        for ident, step in steps:
+            if step != "waiting":
+                log_async("conversation move %s: %s" % (ident, step))
+        return steps
+
     def _note_gate_wait(self, reason: str) -> None:
         if getattr(self, "mediated", False):
             return
@@ -12466,6 +12578,12 @@ class Runner:
             except Exception as exc:
                 log_async("auto-take pass failed (%s): %s; runner continues"
                           % (type(exc).__name__, db_mod.brief(exc)))
+        # #7050 : les déplacements de conversation vers cet hôte avancent
+        # (préparation, bascule) avant la réclamation : un agent basculé est
+        # réclamé dans la même passe. Une panne n'arrête pas l'exécuteur.
+        if not getattr(self, "mediated", False) and not self.dry_run \
+                and not _admits_nobody(self):
+            self.advance_conversation_moves()
         # #3925 : une liste d'admission vide n'admet personne (`claimable`
         # lit une liste vide comme « tous »)
         candidates = ([] if _admits_nobody(self)

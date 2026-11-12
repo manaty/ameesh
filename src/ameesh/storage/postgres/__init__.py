@@ -26,6 +26,7 @@ from .ci import CiResults
 from .decisions import Decisions
 from .costs import TurnCosts
 from .conversations import Conversations
+from .conversation_moves import ConversationMoves
 from .credentials import Credentials
 from .events import Events
 from .external_executors import ExternalExecutors
@@ -123,3 +124,4 @@ class PostgresStorage(interface.Storage):
         self.ci = CiResults(db)
         self.prevalidation = PrevalidationReports(db)
         self.conversations = Conversations(db)
+        self.conversation_moves = ConversationMoves(db)

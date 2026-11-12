@@ -1,0 +1,355 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#7050 (avatar A2, design 5322 §2.3-§2.4): conversation_moves — state
+machine, claim of the move, provisional session, segment on a private
+channel, failure back to the source, idempotence, two holders never."""
+from __future__ import annotations
+
+import dataclasses
+import os
+import stat
+import threading
+import uuid
+
+from ameesh import (conversation as C, conversation_move as M,
+                    conversation_segment as S, registry, storage, turn_context)
+from tests.support import PgTestCase
+
+SECRET = "sk-test-0123456789abcdef-SECRET"
+READY = {c: True for c in M.CHECKS}
+
+
+def ready(_move):
+    return READY
+
+
+class Base(PgTestCase):
+    def setUp(self):
+        super().setUp()
+        self.db.execute("DELETE FROM conversation_moves; DELETE FROM conversation_log;"
+                        " DELETE FROM conversation_heads")
+        self.cfg = dataclasses.replace(
+            self.cfg, threads_dir=os.path.join(self.tmp, self._testMethodName))
+        registry.upsert(self.db, "avatar", harness="claude", host="source",
+                        cwd="/src/avatar", session_id="sess-source")
+        self.lease = registry.claim(self.db, "avatar", "runner-src", ttl_seconds=300,
+                                    host="source")
+        self.epoch = self.lease["lease_epoch"]
+        self.moves = storage.of(self.db).conversation_moves
+        self.state = os.path.join(self.tmp, self._testMethodName, "state")
+        log = C.Log(self.db, self.cfg, agent="avatar", project="acme", lot="7050")
+        log.append("human_message", "quelle est la couleur du vélo ?",
+                   author="human:alice", turn="t1")
+        log.append("turn_end", "le vélo est vert", turn="t1",
+                   meta={"status": "completed"})
+
+    # -- helpers -----------------------------------------------------------
+    def plan(self, **kw):
+        return M.plan(self.db, "avatar", "target", requested_by="human:alice", **kw)
+
+    def advance(self):
+        return M.advance(self.db, "target", probes=ready, cwd_for=lambda m: "/tgt/avatar")
+
+    def target_claim(self, owner="runner-tgt"):
+        return registry.claim(self.db, "avatar", owner, ttl_seconds=300, host="target")
+
+    def first_turn(self, lease, owner="runner-tgt", **kw):
+        return M.open_first_turn(self.db, self.cfg, self.state, agent="avatar",
+                                 host="target", owner=owner, epoch=lease["lease_epoch"],
+                                 secrets=kw.pop("secrets", [SECRET]), **kw)
+
+    def begin(self, owner="runner-src", epoch=None):
+        return registry.begin_turn_diagnosed(
+            self.db, "avatar", owner, self.epoch if epoch is None else epoch, "turn")
+
+    def row(self):
+        return registry.get(self.db, "avatar")
+
+
+
+class MoveTest(Base):
+    def test_full_move_session_provisional_until_verified(self):
+        move = self.plan()
+        self.assertTrue(move["created"])
+        self.assertEqual((move["state"], move["source_host"], move["source_session"]),
+                         ("planned", "source", "sess-source"))
+        # the source opens no new turn once the move is planned
+        self.assertEqual(self.begin(), M.BEGIN_REFUSAL)
+        self.assertEqual(self.advance(), [(move["move_id"], "prepared"),
+                                          (move["move_id"], "switched")])
+        row = self.row()
+        self.assertEqual((row["host"], row["cwd"]), ("target", "/tgt/avatar"))
+        self.assertIsNone(row["lease_owner"])
+        self.assertGreater(row["lease_epoch"], self.epoch)
+        # provisional: the registry still names the source session
+        self.assertEqual(row["session_id"], "sess-source")
+        # the old source lease is fenced out
+        self.assertNotEqual(self.begin(), "started")
+        lease = self.target_claim()
+        self.assertIsNotNone(lease)
+        first = self.first_turn(lease)
+        self.assertEqual(first.move["state"], "rehydrating")
+        self.assertEqual(self.row()["session_id"], "sess-source")
+        first.launched("sess-target")
+        self.assertEqual(self.row()["session_id"], "sess-source")
+        done = first.finish(True, session="sess-target", account="acct", harness="claude",
+                            cwd="/tgt/avatar")
+        self.assertEqual((done["state"], done["source_cache"]), ("verified", "stale-cache"))
+        row = self.row()
+        self.assertEqual((row["session_id"], row["session_account"]), ("sess-target", "acct"))
+        self.assertFalse(os.path.exists(first.path))
+        self.assertIsNone(self.moves.open_for("avatar"))
+
+    def test_segment_file_private_and_never_in_prompt_or_row(self):
+        C.Log(self.db, self.cfg, agent="avatar", project="acme").append(
+            "human_message", "mon jeton est " + SECRET, author="human:alice", turn="t2")
+        C.Log(self.db, self.cfg, agent="avatar", project="acme").append(
+            "turn_end", "noté", turn="t2", meta={"status": "completed"})
+        self.plan()
+        self.advance()
+        first = self.first_turn(self.target_claim())
+        mode = stat.S_IMODE(os.stat(first.path).st_mode)
+        self.assertEqual(mode, 0o600)
+        with open(first.path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("le vélo est vert", text)
+        self.assertNotIn(SECRET, text)
+        self.assertIn(S.REDACTED, text)
+        # the command-line note names the file indirectly, never the conversation
+        note = first.prompt_note()
+        self.assertNotIn("vélo", note)
+        self.assertNotIn(first.path, note)
+        # the attempt row and the turn context carry bounds and digest only
+        row = self.moves.get(first.move_id)
+        flat = repr(row)
+        self.assertNotIn("vélo", flat)
+        self.assertNotIn(SECRET, flat)
+        self.assertEqual(row["digest"], first.context["digest"])
+        document = turn_context.build(
+            turn_id="t", agent="avatar", host="target", kind="prompt", started_ts=1.0,
+            session=None, work_item_id=None, lease_owner="runner-tgt", lease_epoch=1,
+            lease_expires_ts=None, requests=(), harness="claude", model=None,
+            budget_usd=None, spent_usd=0.0, spend_key=None, marker=None,
+            reservation=None, conversation=first.context)
+        self.assertEqual(set(document["conversation"]), set(turn_context.CONVERSATION_KEYS))
+        self.assertNotIn("vélo", repr(document))
+        # the segment is never written back into the journal
+        entries = storage.of(self.db).conversations.read("avatar")["entries"]
+        self.assertEqual(sum("vélo est vert" in e["text"] for e in entries), 1)
+
+    def test_idempotent_plan_bind_and_verify(self):
+        move = self.plan(move_id=str(uuid.uuid4()))
+        again = self.plan(move_id=move["move_id"])
+        other = self.plan()
+        self.assertFalse(again["created"])
+        self.assertEqual(again["move_id"], move["move_id"])
+        self.assertEqual(other["move_id"], move["move_id"])
+        self.advance()
+        self.assertEqual(self.advance(), [])  # nothing left for the target to do
+        lease = self.target_claim()
+        first = self.first_turn(lease)
+        replay = self.first_turn(lease)
+        self.assertEqual(replay.context["digest"], first.context["digest"])
+        ok = dict(session="sess-target", account=None, harness="claude", cwd="/tgt")
+        self.assertEqual(first.finish(True, **ok)["state"], "verified")
+        self.assertEqual(self.moves.verify(first.move_id, owner="runner-tgt",
+                                           epoch=lease["lease_epoch"], **ok)["state"],
+                         "verified")
+
+    def test_prepare_failure_source_keeps_serving(self):
+        move = self.plan()
+        steps = M.advance(self.db, "target", cwd_for=lambda m: "/tgt",
+                          probes=lambda m: dict(READY, binary=False))
+        self.assertEqual(steps, [(move["move_id"], "failed")])
+        self.assertIn("binary", self.moves.get(move["move_id"])["error"])
+        row = self.row()
+        self.assertEqual((row["host"], row["lease_owner"], row["lease_epoch"],
+                          row["session_id"]),
+                         ("source", "runner-src", self.epoch, "sess-source"))
+        self.assertEqual(self.begin(), "started")
+
+    def test_first_turn_failure_returns_to_source_with_notice(self):
+        self.plan()
+        self.advance()
+        lease = self.target_claim()
+        first = self.first_turn(lease)
+        first.launched("sess-target")
+        done = first.finish(False, session=None, account=None, harness="claude",
+                            cwd="/tgt", error="harness exit 1")
+        self.assertEqual(done["state"], "failed")
+        row = self.row()
+        self.assertEqual((row["host"], row["cwd"], row["session_id"]),
+                         ("source", "/src/avatar", "sess-source"))
+        self.assertIsNone(row["lease_owner"])
+        self.assertGreater(row["lease_epoch"], lease["lease_epoch"])
+        self.assertIn("part of that turn may have run", row["pending_prompt"])
+        # the source reclaims and serves its own native session
+        back = registry.claim(self.db, "avatar", "runner-src", ttl_seconds=300,
+                                     host="source")
+        self.assertIsNotNone(back)
+        self.assertEqual(registry.get(self.db, "avatar")["session_id"], "sess-source")
+
+    def test_no_switch_during_a_source_turn_and_never_two_holders(self):
+        move = self.plan()
+        # the source was already in its turn when the move was planned
+        self.db.execute("UPDATE agent_registry SET status = 'running' WHERE name = 'avatar'")
+        self.assertEqual(self.advance(), [(move["move_id"], "prepared"),
+                                          (move["move_id"], "waiting")])
+        self.assertEqual(self.row()["lease_owner"], "runner-src")
+        self.assertIsNone(self.target_claim())  # not on the target host yet
+        self.db.execute("UPDATE agent_registry SET status = 'idle' WHERE name = 'avatar'")
+        results = []
+
+        def go():
+            results.append(self.moves.switch(move["move_id"], target_host="target"))
+
+        threads = [threading.Thread(target=go) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertTrue(all(r and r["state"] == "switched" for r in results))
+        self.assertEqual(self.row()["lease_epoch"], self.epoch + 1)  # one release only
+        self.assertIsNone(registry.claim(self.db, "avatar", "runner-src", ttl_seconds=300,
+                                     host="source"))
+        self.assertIsNotNone(self.target_claim())
+        self.assertIsNone(self.target_claim("runner-other"))
+
+    def test_interactive_session_holds_the_source(self):
+        move = self.plan()
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'attach:alice@source'"
+                        " WHERE name = 'avatar'")
+        self.assertEqual(self.advance()[-1], (move["move_id"], "waiting"))
+        self.assertEqual(self.row()["host"], "source")
+
+    def test_recovered_when_the_source_is_gone(self):
+        move = self.plan()
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = now() - interval '1 s'"
+                        " WHERE name = 'avatar'")
+        self.assertEqual(self.advance()[-1], (move["move_id"], "recovered"))
+        first = self.first_turn(self.target_claim())
+        self.assertEqual(first.move["state"], "rehydrating")
+
+    def test_restarted_target_fails_back_to_source(self):
+        self.plan()
+        self.advance()
+        lease = self.target_claim()
+        self.first_turn(lease).launched("sess-target")
+        # the target runner dies; another target runner claims after expiry
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = now() - interval '1 s'"
+                        " WHERE name = 'avatar'")
+        relaunch = self.target_claim("runner-tgt-2")
+        with self.assertRaises(M.MoveError):
+            self.first_turn(relaunch, owner="runner-tgt-2")
+        row = self.row()
+        self.assertEqual((row["host"], row["session_id"]), ("source", "sess-source"))
+        self.assertIn("part of that turn may have run", row["pending_prompt"])
+
+    def test_stale_plan_releases_the_source(self):
+        move = self.plan()
+        self.db.execute("UPDATE conversation_moves SET updated_at = now() - interval '1 hour'")
+        self.assertEqual(self.begin(), "started")
+        self.assertEqual(self.advance(), [(move["move_id"], "failed")])
+
+    def test_plan_refused_on_same_host_or_external(self):
+        self.assertIsNone(M.plan(self.db, "avatar", "source", requested_by="human:alice"))
+        with self.assertRaises(ValueError):
+            self.plan(reason="whim")
+
+    def test_checks_are_booleans_only(self):
+        move = self.plan()
+        with self.assertRaises(ValueError):
+            self.moves.prepare(move["move_id"], target_host="target", target_cwd="/tgt",
+                               checks={"account": "/home/x/.claude/credentials.json"})
+
+
+class WorkerTest(Base):
+    """The runner's hooks: claim of the move, provisional session, verify/fail."""
+
+    def worker(self, lease):
+        from types import SimpleNamespace
+        from ameesh.runner import AgentWorker
+        os.makedirs(self.state, exist_ok=True)
+        w = SimpleNamespace(
+            name="avatar", db=self.db, cfg=self.cfg, state_dir=self.state,
+            epoch=lease["lease_epoch"], lease_lost=threading.Event(),
+            runner=SimpleNamespace(host="target", runner_id="runner-tgt", dry_run=False),
+            agent=dict(registry.get(self.db, "avatar")), _move_turn=None,
+            _turn_launched=False, _path=lambda leaf: os.path.join(self.state, leaf),
+            read_session_file=lambda: None, _state_note=lambda *a: True,
+            _resume_drop=lambda: None, _installe_hook_preuve=lambda cwd: None,
+            write_session_file=lambda sid: None)
+        for name in ("_open_move_turn", "_finish_move_turn", "current_session",
+                     "_note_session"):
+            setattr(w, name, getattr(AgentWorker, name).__get__(w))
+        return w
+
+    def switched(self):
+        self.plan()
+        self.advance()
+        return self.target_claim()
+
+    def test_turn_verifies_and_registry_takes_target_session(self):
+        w = self.worker(self.switched())
+        self.assertTrue(w._open_move_turn())
+        self.assertIsNone(w.current_session())  # a new native session
+        w._turn_launched = True
+        w._note_session("sess-target", None, "claude", None, "/tgt", "", "claude")
+        self.assertEqual(self.row()["session_id"], "sess-source")  # provisional
+        self.assertEqual(w.current_session(), "sess-target")
+        w._finish_move_turn(True)
+        self.assertEqual(self.row()["session_id"], "sess-target")
+        self.assertEqual(w.agent["session_id"], "sess-target")
+        self.assertFalse(w.lease_lost.is_set())
+        self.assertIsNone(w._move_turn)
+
+    def test_turn_not_launched_keeps_the_attempt(self):
+        w = self.worker(self.switched())
+        self.assertTrue(w._open_move_turn())
+        w._finish_move_turn(False)
+        self.assertIsNotNone(w._move_turn)
+        self.assertEqual(self.moves.open_for("avatar")["state"], "rehydrating")
+
+    def test_failed_turn_returns_to_source(self):
+        w = self.worker(self.switched())
+        w._open_move_turn()
+        w._turn_launched = True
+        w._finish_move_turn(False)
+        self.assertTrue(w.lease_lost.is_set())
+        row = self.row()
+        self.assertEqual((row["host"], row["session_id"]), ("source", "sess-source"))
+
+    def test_runner_pass_prepares_and_switches(self):
+        from types import SimpleNamespace
+        from ameesh.runner import Runner
+        move = self.plan()
+        adapter = SimpleNamespace(binary="/bin/sh", spec=SimpleNamespace(attach=["x"]))
+        runner = SimpleNamespace(cfg=self.cfg, db=self.db, host="target",
+                                 agents_filter=["avatar"])
+        self.db.execute("UPDATE conversation_moves SET source_cwd = %s", (self.tmp,))
+        from unittest import mock
+        with mock.patch("ameesh.runner.agent_adapter", return_value=adapter), \
+                mock.patch("ameesh.accounts.profiles", return_value=[]), \
+                mock.patch("ameesh.accounts.default_home", return_value=self.tmp):
+            steps = Runner.advance_conversation_moves(runner)
+        self.assertEqual(steps, [(move["move_id"], "prepared"), (move["move_id"], "switched")])
+        self.assertEqual(self.moves.get(move["move_id"])["checks"], READY)
+        # another runner's admission list leaves the attempt alone
+        runner.agents_filter = ["someone-else"]
+        self.assertEqual(Runner.advance_conversation_moves(runner), [])
+
+
+class ProbeTest(PgTestCase):
+    def test_missing_harness_or_binary(self):
+        from types import SimpleNamespace
+
+        def missing(harness, binary):
+            raise RuntimeError("no descriptor")
+        verdicts = M.host_probes(self.cfg, {"harness": "claude"}, adapter_for=missing)
+        self.assertFalse(verdicts["harness"])
+        adapter = SimpleNamespace(binary="/nonexistent/claude",
+                                  spec=SimpleNamespace(attach=False))
+        verdicts = M.host_probes(self.cfg, {"harness": "claude"},
+                                 adapter_for=lambda h, b: adapter)
+        self.assertTrue(verdicts["harness"])
+        self.assertFalse(verdicts["binary"])
+        self.assertFalse(verdicts["interactive"])
