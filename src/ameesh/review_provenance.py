@@ -31,7 +31,9 @@ Une session de gouvernance **hors tour** (le bureau, canon §10) n'a ni bail ni
 décision 0030). Sa liaison est une preuve aussi forte qu'un tour tant qu'elle
 porte un PID — le processus est alors vérifié comme descendant du harnais lié
 (L46/L63) — et que l'agent est `externe` au registre, sans bail vivant, sous le
-même harnais que la liaison. Le reçu porte alors `turn = "session:<id>"` : un
+même harnais que la liaison (ou, #7004, avec le harnais de la liaison dans
+l'ensemble `harnesses` que le canon lui déclare ; le reçu porte alors le harnais
+de la liaison, jamais celui du registre). Le reçu porte `turn = "session:<id>"` : un
 tour synthétique qui dit l'origine sans la confondre avec un tour managé. La
 paire de hooks Git installée, les commandes `ameesh provenance
 intent|created|record` et le commit mécanique de `resolutions.finish_resolution`
@@ -266,6 +268,35 @@ def _binding_hint(db, cfg, actor: str) -> str:
             "rebind with --pid" % (len(without), names))
 
 
+def _declared_harnesses(reg: dict, name: str):
+    """#7004 : l'ensemble fermé des harnais admis d'un agent, ou None.
+
+    None : le registre n'en déclare aucun (`harnesses` NULL, ou colonne 0573
+    pas encore posée) — seul `harness` vaut, comme avant. Sinon un tuple non
+    vide de harnais connus (`session_bindings.HARNESSES`) ; un ensemble vide,
+    illisible ou portant un harnais inconnu est refusé, jamais élargi."""
+    from . import session_bindings
+    raw = reg.get("harnesses")
+    if raw is None:
+        return None
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise ProvenanceError(
+            "agent %s declares an unreadable harness set (%r): refused"
+            % (name, raw))
+    allowed = tuple(dict.fromkeys(
+        str(item or "").strip().lower() for item in raw))
+    if not allowed:
+        raise ProvenanceError(
+            "agent %s declares an empty harness set: refused" % name)
+    unknown = [item for item in allowed if item not in session_bindings.HARNESSES]
+    if unknown:
+        raise ProvenanceError(
+            "agent %s declares unknown harness(es) %s (%s): refused"
+            % (name, ", ".join(repr(item) for item in unknown),
+               "|".join(session_bindings.HARNESSES)))
+    return allowed
+
+
 def _bound_session(db, *, actor: str = "", cfg=None) -> dict:
     """L'identité d'une session liée (`ameesh mail bind`), ou un refus nommé.
 
@@ -273,7 +304,12 @@ def _bound_session(db, *, actor: str = "", cfg=None) -> dict:
     (contrôle L46/L63 de `session_bindings.by_ancestry`) et être active sur cet
     hôte. L'agent doit être `externe` au registre, sans bail vivant, et le
     harnais de la liaison doit être celui que le registre lui connaît : deux
-    sources qui divergent ne prouvent rien. Le `turn` rendu est synthétique
+    sources qui divergent ne prouvent rien. #7004 : une identité liée session
+    par session (le bureau : codex sur le PC, claude sur BG) déclare au canon
+    l'ensemble fermé de ses harnais (`harnesses:`, colonne 0573) ; le harnais
+    de la liaison doit alors y appartenir, et c'est LUI que porte le reçu
+    (§11 : la famille est le harnais exécuté). Un ensemble vide, illisible ou
+    portant un harnais inconnu refuse. Le `turn` rendu est synthétique
     (`session:<id>`) — un reçu de session ne se fait jamais passer pour un tour
     managé.
 
@@ -326,11 +362,18 @@ def _bound_session(db, *, actor: str = "", cfg=None) -> dict:
             "%s is an execute agent (runner-driven): a session binding cannot "
             "prove a family outside a managed turn" % name)
     declared = str(reg.get("harness") or "").strip().lower()
-    if declared and declared != harness:
+    allowed = _declared_harnesses(reg, name)
+    if allowed is None:
+        refused = bool(declared) and declared != harness
+        registered = declared
+    else:
+        refused = harness not in allowed
+        registered = ", ".join(allowed)
+    if refused:
         raise ProvenanceError(
             "agent %s is registered under %r but its session binding declares "
             "%r: rebind the session or correct the registry"
-            % (name, declared, harness))
+            % (name, registered, harness))
     return {"actor": name, "turn": SESSION_TURN_PREFIX + session,
             "harness": harness, "session": session}
 
