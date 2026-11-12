@@ -109,14 +109,14 @@ class SignedReplacementAuthority(bootstrap.SignedBootstrapAuthority):
         self.scopes=scopes(operation,self.bundle)
 
     def render(self,operation,expires_at):
-        return question(operation,self.bundle,expires_at=expires_at)
+        return question(operation,self.bundle,expires_at=expires_at,fresh=False)
 
 
 class SignedRollbackAuthority(SignedReplacementAuthority):
     steps,option,options,prefix=('rollback',),'rollback',ROLLBACK_OPTIONS,ROLLBACK_PREFIX
 
     def render(self,operation,expires_at):
-        return rollback_question(operation,self.bundle,expires_at=expires_at)
+        return rollback_question(operation,self.bundle,expires_at=expires_at,fresh=False)
 
 
 class Replacement:

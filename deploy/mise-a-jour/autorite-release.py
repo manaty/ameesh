@@ -10,8 +10,8 @@ fence is never committed under an authority that would die before the window
 it approved, recovery included. The one-hour `decide <id> <answer> --key`
 signature (SIGN_TTL_S) therefore only covers a window ending within the hour:
 every question builder refuses any other window through `signable()` (#7013),
-before an owner signature is spent on it; a legacy question rendered past
-that bound no longer revalidates. After the window, resuming the same
+before an owner signature is spent on it. Revalidating a stored question
+re-renders it without that bound (`fresh=False`): its approval decides. After the window, resuming the same
 manifest needs a fresh signed decision.
 """
 import hashlib
@@ -56,11 +56,16 @@ def _utc(epoch):
     return time.strftime('%H:%MZ on %Y-%m-%d', time.gmtime(epoch))
 
 
-def question(operation, manifest, *, expires_at):
-    """Prepared question for decide ask --needs-signature; no request is sent."""
+def question(operation, manifest, *, expires_at, fresh=True):
+    """Prepared question for decide ask --needs-signature; no request is sent.
+
+    `fresh=False` only re-renders a stored question to check its bytes: the
+    signed approval then decides (`_proof_live`), not this preparation bound.
+    """
     if type(expires_at) is not int or expires_at <= manifest['rollback_until']:
         raise ValueError('authority expiry must cover the rollback window')
-    signable(expires_at)
+    if fresh:
+        signable(expires_at)
     scope = {'v': 1, 'operation': operation, 'host': manifest['host'],
              'manifest_digest': digest(manifest), 'manifest': manifest,
              'steps': list(STEPS), 'expires_at': expires_at}
@@ -110,7 +115,7 @@ class SignedDecisionAuthority:
         try:
             scope = json.loads(text[len(PREFIX):])
             expires = scope['expires_at']
-            if type(expires) is not int or text != question(operation, self.manifest, expires_at=expires):
+            if type(expires) is not int or text != question(operation, self.manifest, expires_at=expires, fresh=False):
                 return False
         except (KeyError, TypeError, ValueError):
             return False

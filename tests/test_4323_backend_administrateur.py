@@ -330,24 +330,26 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
         self.sign(view,ttl=decisions.SIGN_TTL_S)
         self.assertTrue(self.backend.plan(self.operation,view['id'],authority=self.signed(view=view))['authorized'])
 
-    def test_7013_execution_still_refuses_an_uncovered_window(self):
-        # A legacy question rendered past the bound no longer revalidates.
-        with mock.patch.object(bootstrap.signed,'signable',return_value=''):
-            text=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+2*3600)
+    def test_7013_execution_leaves_the_decision_to_the_approval(self):
+        # Revalidation re-renders without the preparation bound: a legacy
+        # window in (SIGN_TTL_S - margin, SIGN_TTL_S] covered by its fresh
+        # approval still executes.
+        text=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+3500,fresh=False)
+        with self.assertRaisesRegex(bootstrap.BootstrapError,'at most'):
+            bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+3500)
+        self.stage_bundle(self.bundle,text)
+        view=self.ask(text,bootstrap.OPTIONS)
+        self.sign(view,ttl=decisions.SIGN_TTL_S)
+        self.assertTrue(self.backend.plan(self.operation,view['id'],authority=self.signed(view=view))['authorized'])
+        # No change to `_proof_live`: a 2 h legacy window under a 1 h approval
+        # is refused as today, and its rollback stays preparable.
+        text=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+2*3600,fresh=False)
         self.stage_bundle(self.bundle,text)
         view=self.ask(text,bootstrap.OPTIONS)
         self.sign(view,ttl=decisions.SIGN_TTL_S)
         self.assertFalse(self.backend.plan(self.operation,view['id'],authority=self.signed(view=view))['authorized'])
-        # Its stored bytes still check out: its rollback stays preparable.
         self.assertEqual(self.backend.prepared(self.operation).question,text)
         self.assertIn('runs before',self.backend.revoke_question(self.operation,int(self.now)+600)['deadline'])
-        # No change to `_proof_live`: an approval dying before a coverable
-        # window ends is still refused at execution.
-        text=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+50*60)
-        self.stage_bundle(self.bundle,text)
-        view=self.ask(text,bootstrap.OPTIONS)
-        self.sign(view,ttl=30*60)
-        self.assertFalse(self.backend.plan(self.operation,view['id'],authority=self.signed(view=view))['authorized'])
 
     def test_bureau_mention_installs_then_revokes_through_the_backend(self):
         # #4788: the canonical signer keeps its fixed mention; the backend must

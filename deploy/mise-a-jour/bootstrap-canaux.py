@@ -107,7 +107,7 @@ class SignedChannelAuthority(release.SignedBootstrapAuthority):
         self.scopes=scopes(operation,self.bundle)
 
     def render(self,operation,expires_at):
-        return question(operation,self.bundle,expires_at=expires_at)
+        return question(operation,self.bundle,expires_at=expires_at,fresh=False)
 
 
 class SignedChannelRevokeAuthority(SignedChannelAuthority):
@@ -115,7 +115,7 @@ class SignedChannelRevokeAuthority(SignedChannelAuthority):
     steps,option,options,prefix=('revoke',),'revoke',REVOKE_OPTIONS,REVOKE_PREFIX
 
     def render(self,operation,expires_at):
-        return revoke_question(operation,self.bundle,expires_at=expires_at)
+        return revoke_question(operation,self.bundle,expires_at=expires_at,fresh=False)
 
 
 def run(journal,operation,bundle, *, authority,adapter):

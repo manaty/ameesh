@@ -35,6 +35,8 @@ class SignableWindowTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'at most'):
             release.question('op', manifest, expires_at=far)
         self.assertIn('"expires_at":%d' % near, release.question('op', manifest, expires_at=near))
+        # Revalidation re-renders the stored bytes; the approval then decides.
+        self.assertIn('"expires_at":%d' % far, release.question('op', manifest, expires_at=far, fresh=False))
 
 
 class ReleaseAuthorityTest(PgTestCase):

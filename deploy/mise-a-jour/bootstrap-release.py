@@ -114,7 +114,7 @@ class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
     steps,option,options,prefix=STEPS,'install',OPTIONS,PREFIX
 
     def render(self,operation,expires_at):
-        return question(operation,self.bundle,expires_at=expires_at)
+        return question(operation,self.bundle,expires_at=expires_at,fresh=False)
 
     def validate(self,operation,digest,step):
         self.denial_reason=None
@@ -152,7 +152,7 @@ class SignedBootstrapRevokeAuthority(SignedBootstrapAuthority):
     steps,option,options,prefix=('revoke',),'revoke',REVOKE_OPTIONS,REVOKE_PREFIX
 
     def render(self,operation,expires_at):
-        return revoke_question(operation,self.bundle,expires_at=expires_at)
+        return revoke_question(operation,self.bundle,expires_at=expires_at,fresh=False)
 
 
 def _run(journal,operation,bundle, *, authority,adapter,steps=STEPS,scopes_of=None,predecessor=None):
