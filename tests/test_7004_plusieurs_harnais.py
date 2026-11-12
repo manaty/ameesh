@@ -112,6 +112,29 @@ class SeveralHarnessesBoundSessionTest(PgTestCase):
                 prov._declared_harnesses({"harnesses": raw}, "bureau")
             self.assertIn("unreadable harness set", str(raised.exception))
 
+    # -- #5690 : écrivains N-1 (sans la colonne 0573) -----------------------
+    def test_a_n1_insert_leaves_no_set_and_the_single_harness_rules(self):
+        self.previous_insert("agent_registry", {
+            "name": "bureau", "harness": "codex", "host": self.cfg.host,
+            "mode": "externe"}, added=("harnesses",))
+        self.assertIsNone(registry.get(self.db, "bureau")["harnesses"])
+        self.bind(harness="codex")
+        self.assertEqual(prov.capture(environ={}, families=FAMILIES,
+                                      db=self.db)["harness"], "codex")
+        self.db.execute("TRUNCATE session_bindings RESTART IDENTITY")
+        self.bind(session="s-bureau-bg", harness="claude")
+        self.assertIn("registered under 'codex'", self.refused())
+
+    def test_a_n1_update_keeps_the_declared_set(self):
+        self.bind(session="s-bureau-bg", harness="claude")
+        self.declare()
+        self.previous_update("agent_registry", {"harness": "codex", "model": "gpt"},
+                             where={"name": "bureau"}, added=("harnesses",))
+        self.assertEqual(list(registry.get(self.db, "bureau")["harnesses"]),
+                         ["codex", "claude"])
+        self.assertEqual(prov.capture(environ={}, families=FAMILIES,
+                                      db=self.db)["harness"], "claude")
+
 
 class SeveralHarnessesSyncTest(_CanonDbCase):
 
