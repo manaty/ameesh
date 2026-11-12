@@ -884,8 +884,9 @@ def _regular(run, rev: str, path: str) -> tuple | None:
 def _own_mapping(path: str, mapping: Mapping) -> dict:
     """B dev3 #213504 : le seul remplacement permis dans `path`. Un fichier
     numéroté ne change que son propre numéro (ancien ou déjà nouveau) : le
-    `SELECT 784` d'une migration 785 reste 784. Un fichier sans numéro de la
-    renumérotation (registre déclaré) suit le remplacement entier."""
+    `SELECT 784` d'une migration 785 reste 784 ; un fichier numéroté hors de la
+    renumérotation ne change pas. Un fichier sans numéro (registre déclaré)
+    suit le remplacement entier."""
     match = _NUMBERED.match(os.path.basename(path))
     if not match:
         return dict(mapping)
@@ -893,9 +894,9 @@ def _own_mapping(path: str, mapping: Mapping) -> dict:
     if number in mapping:
         return {number: mapping[number]}
     olds = [old for old, new in mapping.items() if new == number]
-    if olds:
-        return {olds[0]: number} if len(olds) == 1 else {}
-    return dict(mapping)
+    # B qa-01 #213550 : un fichier numéroté hors de la renumérotation (une autre
+    # migration du lot) ne change pas, même retouché puis rétabli
+    return {olds[0]: number} if len(olds) == 1 else {}
 
 
 def _mapping_text(mapping: Mapping) -> str:

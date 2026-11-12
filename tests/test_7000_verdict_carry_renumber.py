@@ -261,6 +261,17 @@ class RenumberingTest(unittest.TestCase):
         frozen, renumber = self.two_reservations("-- 782\nSELECT 783;\n")
         self.refused(frozen, "with only 785→782 changed", renumber)
 
+    def test_another_lot_migration_touched_then_restored_is_refused(self):
+        # B qa-01 #213550 : 786 n'est pas renumérotée, son SELECT 784 ne bouge pas.
+        _put(self.root, "supabase/migrations/786_third.sql", "-- 786\nSELECT 784;\n")
+        self.reviewed = _commit(self.root, "third migration")
+        self.rename()
+        self.references()
+        _put(self.root, "supabase/migrations/786_third.sql", "-- 786\nSELECT 783;\n")
+        _commit(self.root, "touched")
+        _put(self.root, "supabase/migrations/786_third.sql", "-- 786\nSELECT 784;\n")
+        self.refused(_commit(self.root, "restored"), "neither a test adaptation")
+
     def test_a_product_change_hidden_in_the_history_is_refused(self):
         _put(self.root, "secret.txt", "s\n")
         _commit(self.root, "secret")
