@@ -215,6 +215,20 @@ class RenumberingTest(unittest.TestCase):
             "supabase/migrations", frozenset({783}), ("supabase/rollback",))
         self.refused(frozen, "to the same number", renumber)
 
+    def test_a_padded_old_number_is_the_same_old_number(self):
+        # B qa-01 #213606 : 0784 et 784 sont un seul ancien numéro (I3).
+        _put(self.root, "supabase/migrations/0784_alpha.sql", "SELECT 1;\n")
+        _put(self.root, "supabase/migrations/784_beta.sql", "SELECT 2;\n")
+        self.reviewed = _commit(self.root, "two spellings of 784")
+        _git(self.root, "mv", "supabase/migrations/0784_alpha.sql",
+             "supabase/migrations/782_alpha.sql")
+        _git(self.root, "mv", "supabase/migrations/784_beta.sql",
+             "supabase/migrations/783_beta.sql")
+        frozen = _commit(self.root, "renumber")
+        renumber = verdict_carry.Renumbering(
+            "supabase/migrations", frozenset({782, 783}), ("supabase/rollback",))
+        self.refused(frozen, "renumbering 784 to two numbers", renumber)
+
     def symlink(self, path, target):
         full = os.path.join(self.root, path)
         os.remove(full)

@@ -823,6 +823,7 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
         return out
     pairs = [pair for pair in _renamed_pairs(changes, renumber) if pair[0] in renumber.owned]
     mapping: dict = {}
+    news: dict = {}               # I3 : ancien → nouveau, en entiers (0784 = 784)
     for _old, _new, number, renamed, zone in pairs:
         if zone != "migration":
             continue
@@ -831,8 +832,9 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
                           % (number, renamed, renamed,
                              ", ".join(str(n) for n in sorted(renumber.reserved))))
             return out
-        if mapping.setdefault(number, renamed) != renamed:
-            out["why"] = "renumbering %s to two numbers" % number
+        if (mapping.setdefault(number, renamed) != renamed
+                or news.setdefault(int(number), int(renamed)) != int(renamed)):
+            out["why"] = "renumbering %d to two numbers" % int(number)
             return out
     # B2 dev3 #213435 : deux anciens numéros vers un même nouveau laisseraient
     # deux migrations de ce numéro à l'arrivée
