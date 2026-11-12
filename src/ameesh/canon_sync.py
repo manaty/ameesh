@@ -1451,6 +1451,27 @@ def _write_candidate(db: Db, canon: Canon, agent, admission, host: str, *,
         credential_mode=admission.credential_mode or agent.credential_mode)
 
 
+def _write_tenancy(db: Db, canon: Canon, host: str, canon_key: str) -> None:
+    """#7106 (avatar B3) : `policy.shared`/`tenants` de la fiche Host de `host`
+    dans `host_tenancy`, pour la garde de réclamation (`ameesh_tenant_claim_ok`).
+
+    Tenants résolus par CE canon (`human:<id>`) ; un tenant qui ne résout pas
+    est omis (fail closed : il n'est admis nulle part). Une fiche absente
+    efface la ligne ; deux fiches de l'hôte dont l'une est partagée gardent
+    l'hôte partagé, sans tenant (personne n'y réclame)."""
+    cards = [h for h in canon.hosts if h.title == host]
+    shared = any(card.policy.shared for card in cards)
+    tenants: list[str] = []
+    if len(cards) == 1:
+        for ref in cards[0].policy.tenants or []:
+            resolved = canon.resolve_human(canon_mod.tenant_key(ref) or ref)
+            if resolved and resolved not in tenants:
+                tenants.append(resolved)
+    storage.of(db).tenancy.write_policy(
+        host, canon_key, shared=shared, tenants=tenants if shared else [],
+        canon_ref=cards[0].fiche.ref if len(cards) == 1 else None)
+
+
 def _card_error_text(errors) -> str:
     """Texte court et stable d'une erreur de fiche Agent (codes, sans contenu)."""
     return "agent card invalid: " + "; ".join(sorted({f.code for f in errors}))
@@ -1876,6 +1897,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     # jour ; `set_election` ne déplace jamais l'agent et retire les verdicts
     # des hôtes qui ne sont plus candidats.
     canon_key = "" if canon.is_default else ident
+    # #7106 : la politique de partage de CET hôte est écrite avant les
+    # agents : la garde de réclamation la voit avant que le canon ne rouvre
+    _write_tenancy(db, canon, host, canon_key)
     for declared in canon.agents:
         # #7048 : pour `preference`, les candidats sont les hôtes du Placement,
         # dans l'ordre (la colonne `candidats` garde cet ordre)

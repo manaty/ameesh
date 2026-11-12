@@ -1087,7 +1087,7 @@ class Leases(interface.Leases):
             WITH verrou AS (
                 SELECT name, host, session_id, lease_owner, lease_epoch
                   FROM agent_registry WHERE name = %s FOR UPDATE
-            ), p AS (SELECT %s::text AS brief)
+            ), p AS (SELECT %s::text AS brief, %s::text AS claimer)
             UPDATE agent_registry AS r
                SET lease_owner      = %s,
                    lease_expires_at = clock_timestamp() + make_interval(secs => %s),
@@ -1221,6 +1221,12 @@ class Leases(interface.Leases):
                                                          THEN __H__ ELSE r.host END
                                       AND hh.until > clock_timestamp()))
                __RESPONSABLE__
+               -- #7106 : sur un hôte partagé, seul le runner du tenant
+               -- `responsible` de l'agent prend le bail (garde de la base,
+               -- quel que soit le filtre d'agents de l'exécuteur)
+               AND ameesh_tenant_claim_ok(CASE WHEN r.releve IN ('election', 'preference')
+                                               THEN __H__ ELSE r.host END,
+                                          p.claimer, r.responsible)
                AND (r.releve IN ('election', 'preference') OR NOT r.handoff_fenced)
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch, r.host, r.cwd,
@@ -1242,7 +1248,7 @@ class Leases(interface.Leases):
         # L232b : réclamation d'un agent nommé (pas de tour du contrôleur) —
         # seul l'agent sonde de la fermeture de release rouvre la condition.
         sql = sql.replace("__CANON__", canon_claim_predicate_sql("r", probe=True, host=host))
-        rows = self.db.query(sql, (name, election_brief, owner, ttl_seconds,
+        rows = self.db.query(sql, (name, election_brief, owner, owner, ttl_seconds,
                                    owner, owner, owner, owner, owner, owner))
         return rows[0] if rows else None
 
@@ -1266,7 +1272,7 @@ class Leases(interface.Leases):
         sql = """
             WITH verrou AS (
                 SELECT name FROM agent_registry WHERE name = %s FOR UPDATE
-            )
+            ), p AS (SELECT %s::text AS claimer)
             UPDATE agent_registry AS r
                SET lease_owner      = %s,
                    lease_expires_at = clock_timestamp() + make_interval(secs => %s),
@@ -1274,7 +1280,7 @@ class Leases(interface.Leases):
                    status           = 'running',
                    status_text      = 'session interactive (attach)',
                    updated_at       = now()
-              FROM verrou
+              FROM verrou, p
              WHERE r.name = verrou.name
                AND r.status <> 'stopped'
                AND NOT (r.status = 'running' AND r.lease_owner IS NOT NULL
@@ -1287,6 +1293,9 @@ class Leases(interface.Leases):
                                     WHERE hh.host = r.host
                                       AND hh.until > clock_timestamp()))
                __RESPONSABLE__
+               -- #7106 : sur un hôte partagé, seule la session de
+               -- l'utilisateur système du tenant `responsible` s'attache
+               AND ameesh_tenant_claim_ok(r.host, p.claimer, r.responsible)
                AND (r.releve IN ('election', 'preference') OR NOT r.handoff_fenced)
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch,
@@ -1297,7 +1306,7 @@ class Leases(interface.Leases):
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
         sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
-        rows = self.db.query(sql, (name, owner, ttl_seconds, owner))
+        rows = self.db.query(sql, (name, owner, owner, ttl_seconds, owner))
         return rows[0] if rows else None
 
     def state(self, name) -> dict | None:

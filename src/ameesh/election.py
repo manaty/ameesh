@@ -535,6 +535,12 @@ def candidate_state(db, role: Mapping, host: str, *, now: float | None = None,
     canon = _canon_reason(db, role, host)
     if canon:
         reasons.append(canon)
+    # #7106 (§3.2 point 5) : sur un hôte partagé, le relevé est celui du
+    # superviseur ; la présence est celle du runner du TENANT de l'agent
+    from . import tenancy
+    tenant = tenancy.presence_reason(db, role, host, now=now, limit_s=limit)
+    if tenant:
+        reasons.append(tenant)
     return {
         "host": host,
         "fresh": fresh,
@@ -567,10 +573,17 @@ def publish_self(cfg, db, host: str, *, interval_s: float = EVAL_INTERVAL_S,
     never looks like readiness.
     """
     published = 0
+    from . import tenancy
+    policy = tenancy.host_policy(db, host)
     for role in pg.elected_roles(db, host):
         # même convention que `registry.claimable` : une liste vide ne filtre
         # pas, seule une liste non vide restreint la publication
         if names and role["name"] not in names:
+            continue
+        # #7106 : sur un hôte partagé, seul le runner du tenant de l'agent
+        # publie sa candidature (le superviseur et les autres tenants ne
+        # réclameraient pas : même raison que #3099)
+        if not tenancy.admits(cfg, policy, role):
             continue
         latest = pg.latest(db, role["name"]).get(host) or {}
         age = None

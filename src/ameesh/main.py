@@ -102,6 +102,8 @@
         heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
         durable withdrawal, return and verified lost-host recovery (L232e);
+  ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
+        tenants of a shared host: plan, binding, presence (#7106, bureau only);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
   ameesh hosts [--json] [HOST]          host resources (L31);
@@ -492,6 +494,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # #5250 (CTX-06) : pilote réversible de la politique d'un agent.
         from . import context_pilot
         return context_pilot.main(rest[1:])
+    if command == "host" and rest[:1] == ["tenant"]:
+        # #7106 (avatar B3) : tenants d'un hôte partagé, geste d'infrastructure
+        from . import tenancy
+        return tenancy.main(rest[1:])
     if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)

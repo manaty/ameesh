@@ -283,6 +283,10 @@ def proposals(canon: Canon, agent: str,
             reasons += canon_mod.placement_violations(fiche, {"title": title, "policy": {
                 "harnesses": policy.harnesses, "providers": policy.providers,
                 "models": policy.models}})
+            # #7106 : un hôte partagé n'admet que ses tenants ; le mode se
+            # choisit plus bas, dans `credential_modes` (api-key seul, Q2)
+            reasons += canon_mod.shared_violations(
+                fiche, hosts[0], canon_mod.SHARED_CREDENTIAL_MODES[0])
             modes = None if policy.credential_modes is None else list(policy.credential_modes)
             if modes == []:
                 reasons.append("no credential mode admitted by host %s" % title)

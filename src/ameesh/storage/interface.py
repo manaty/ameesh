@@ -4766,6 +4766,57 @@ class Operations(Domain):
 
 
 # --------------------------------------------------------------------------
+# hôte partagé multi-tenant (#7106, migration 0575)
+# --------------------------------------------------------------------------
+
+class Tenancy(Domain):
+    """#7106 (avatar B3) : politique d'hôte partagé, liaisons des tenants et
+    présence de leurs runners.
+
+    La politique (`host_tenancy`) est écrite par `canon sync` ; la liaison
+    tenant → utilisateur système, UID et runner (`host_tenants`) par le
+    superviseur d'hôte ; la présence (`runner_presence`) par le runner du
+    tenant, seulement sous une liaison existante.
+    """
+
+    @abc.abstractmethod
+    def write_policy(self, host: str, canon: str, *, shared: bool,
+                     tenants: Sequence[str], canon_ref: str | None) -> None:
+        """Écrit la politique de partage d'un canon pour `host` ; un hôte non
+        partagé et sans tenant efface la ligne."""
+
+    @abc.abstractmethod
+    def policy(self, host: str) -> dict:
+        """`{shared, tenants}` de l'hôte, tous canons réunis (partagé si un
+        canon le dit)."""
+
+    @abc.abstractmethod
+    def bind(self, host: str, tenant: str, *, unix_user: str, uid: int,
+             runner_id: str, actor: str) -> dict:
+        """Lie un tenant à son utilisateur système, son UID et son runner ;
+        rend la ligne. Une liaison existante est remplacée."""
+
+    @abc.abstractmethod
+    def unbind(self, host: str, tenant: str) -> dict:
+        """Retire la liaison si aucun agent du tenant n'est encore sur l'hôte
+        (bail, tour ou ligne non déplacée) : `{removed, blocking}`."""
+
+    @abc.abstractmethod
+    def bindings(self, host: str | None = None) -> list[dict]:
+        """Liaisons (avec la présence de leur runner : `seen_ts`, `version`)."""
+
+    @abc.abstractmethod
+    def beat(self, host: str, tenant: str, runner_id: str, *, uid: int | None,
+             version: str | None) -> bool:
+        """Battement du runner d'un tenant ; faux sans liaison qui le nomme."""
+
+    @abc.abstractmethod
+    def presence(self, host: str, tenant: str) -> dict | None:
+        """Dernier battement du tenant sur l'hôte (`seen_ts`, `now_ts`,
+        `runner_id`), ou None."""
+
+
+# --------------------------------------------------------------------------
 # ressources des hôtes (lot L31, décision 0028, migration 0029)
 # --------------------------------------------------------------------------
 
@@ -6239,6 +6290,7 @@ class Storage(abc.ABC):
     operations: Operations
     hosts: HostResources
     host_lifecycle: HostLifecycle
+    tenancy: Tenancy
     turn_resources: TurnResources
     turn_observation: TurnObservation
     visibility: Visibility

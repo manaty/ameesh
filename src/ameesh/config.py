@@ -274,6 +274,11 @@ class Config:
     config_dir: str = _expand(DEFAULT_V0_CONFIG)
     host: str = hostname()
     runner_id: str = ""
+    #: #7106 (avatar B3) : sur un hôte partagé, le tenant (`human:<id>`) de cet
+    #: exécuteur ; il ne réclame que les agents dont il est le `responsible` et
+    #: bat `runner_presence` au lieu de publier les relevés de l'hôte. Vide :
+    #: exécuteur d'hôte (superviseur sur un hôte partagé).
+    tenant: str = ""
     #: délai de connexion à la base (libpq `connect_timeout`, secondes). 10 s
     #: et non 3 : une base distante (VPN, plusieurs centaines de ms d'aller-
     #: retour) dépassait 3 s au moindre à-coup du lien (L72).
@@ -1166,6 +1171,7 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
         config_dir=_expand(pick("AGENT_MAIL_CONFIG", default=cfg.config_dir)),
         host=pick("AMEESH_HOST", "AGENT_MESH_HOST", default=cfg.host),
         runner_id=pick("AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID", default=cfg.runner_id),
+        tenant=str(pick("AMEESH_TENANT", default=cfg.tenant) or "").strip(),
         connect_timeout=_as_float(pick("AMEESH_CONNECT_TIMEOUT", "AGENT_MESH_CONNECT_TIMEOUT"),
                                   cfg.connect_timeout),
         db_retry_max=_as_float(pick("AMEESH_DB_RETRY_MAX"), cfg.db_retry_max),

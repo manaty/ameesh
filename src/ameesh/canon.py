@@ -1149,6 +1149,13 @@ class HostPolicy:
     #: #2202 S2 : le placement de Job (`policy.sandbox`), None = l'hôte ne
     #: reçoit aucun tour en bac à sable.
     sandbox: SandboxPlacement | None = None
+    #: #7106 (avatar B3, docs/design/5322-avatar-humain.md §3.4) : hôte
+    #: partagé multi-tenant. Chaque tenant (`human:<id>`) a son utilisateur
+    #: système, son runner et ses dossiers de comptes ; seul un agent dont le
+    #: `responsible` est un tenant y est admis, avec des clés d'organisation
+    #: (décision Q2 #213954). `tenants` sans `shared` est une erreur.
+    shared: bool = False
+    tenants: list[str] | None = None
 
     def to_dict(self) -> dict:
         """Politique sérialisable (`canon show --json`) : le bloc sandbox est
@@ -1817,6 +1824,85 @@ def _get(obj: Any, key: str) -> Any:
     return getattr(obj, key, None)
 
 
+#: #7106 : décision Q2 (#213954, signée 12/11) — sur un hôte partagé, des
+#: clés d'organisation seulement ; l'abonnement personnel reste sur le poste.
+SHARED_CREDENTIAL_MODES = ("api-key",)
+SHARED_DECISION = "#213954"
+
+
+def tenant_key(ref: Any) -> str:
+    """`human:<id>` normalisé (espaces autour de l'identifiant retirés), ou ""."""
+    text = str(ref or "").strip()
+    if not text.startswith("human:"):
+        return ""
+    ident = text[len("human:"):].strip()
+    return "human:%s" % ident if ident else ""
+
+
+def shared_violations(agent: Any, host: Any, mode: Any) -> list[str]:
+    """#7106 : raisons pour lesquelles un hôte partagé refuse cet agent.
+
+    Seul un agent dont le `responsible` est un tenant déclaré de l'hôte y est
+    admis, avec un mode d'identifiants d'organisation (Q2, #213954). Une liste
+    de tenants absente n'admet personne (fail closed)."""
+    policy = _get(host, "policy")
+    if policy is None or not _get(policy, "shared"):
+        return []
+    host_name = _get(host, "title") or _get(host, "name") or "?"
+    out: list[str] = []
+    tenants = {tenant_key(t) for t in (_get(policy, "tenants") or [])} - {""}
+    responsible = tenant_key(_get(agent, "responsible"))
+    if not responsible or responsible not in tenants:
+        out.append("responsible %s is not a tenant of shared host %s (tenants: %s)" % (
+            responsible or "undeclared", host_name, ", ".join(sorted(tenants)) or "none"))
+    text = None if mode is None or mode == "" else str(mode)
+    restricted = _get(policy, "credential_modes")
+    if isinstance(restricted, str):
+        restricted = [restricted]
+    already = restricted is not None and text not in [str(m) for m in restricted]
+    if text not in SHARED_CREDENTIAL_MODES and not already:
+        out.append("credential mode %s not allowed on shared host %s: organization "
+                   "keys only (decision %s)" % (text or "undeclared", host_name,
+                                                 SHARED_DECISION))
+    return out
+
+
+def _validate_tenancy(canon: "Canon", host: Any, add) -> None:
+    """#7106 : cohérence de `policy.shared` / `policy.tenants` d'une fiche Host."""
+    policy = host.policy
+    tenants = policy.tenants or []
+    if tenants and not policy.shared:
+        add("host-tenants-not-shared", ERROR,
+            "policy of host %s declares `tenants` without `shared: true`" % host.title,
+            host.fiche, host=host.title)
+    if not policy.shared:
+        return
+    if not tenants:
+        add("host-shared-no-tenants", ERROR,
+            "shared host %s without `policy.tenants`: no agent can be admitted"
+            % host.title, host.fiche, host=host.title)
+    seen: set[str] = set()
+    for ref in tenants:
+        resolved = canon.resolve_human(tenant_key(ref) or ref)
+        if resolved is None:
+            add("host-tenant-unresolved", ERROR,
+                "tenant %r of shared host %s does not resolve to a human Member"
+                % (ref, host.title), host.fiche, host=host.title)
+        elif resolved in seen:
+            add("host-tenant-duplicate", ERROR,
+                "tenant %s declared twice on shared host %s" % (resolved, host.title),
+                host.fiche, host=host.title)
+        else:
+            seen.add(resolved)
+    modes = policy.credential_modes
+    if modes is None or any(m not in SHARED_CREDENTIAL_MODES for m in modes):
+        add("host-shared-credential-mode", ERROR,
+            "shared host %s must restrict `policy.credential_modes` to %s: "
+            "organization keys only on a shared host (decision %s)"
+            % (host.title, ", ".join(SHARED_CREDENTIAL_MODES), SHARED_DECISION),
+            host.fiche, host=host.title)
+
+
 def placement_violations(agent: Any, host: Any, placement: Any = None) -> list[str]:
     """Raisons pour lesquelles ce placement viole la politique de l'hôte ([] = admis).
 
@@ -1856,6 +1942,8 @@ def placement_violations(agent: Any, host: Any, placement: Any = None) -> list[s
         out.append("%s %s not allowed by host %s (allowed: %s)" % (
             label, text if text is not None else "undeclared", host_name,
             ", ".join(allowed) or "none"))
+    # #7106 : un hôte partagé n'admet que les agents de ses tenants
+    out.extend(shared_violations(agent, host, mode))
     return out
 
 
@@ -4252,6 +4340,25 @@ class _Loader:
                 else:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.intermittent`: boolean expected", **where, **subject)
+            # #7106 : hôte partagé. Illisible = partagé (fail closed : la règle
+            # du partage est la plus stricte, elle n'admet que les tenants).
+            if raw.get("shared") is not None:
+                if isinstance(raw["shared"], bool):
+                    policy.shared = raw["shared"]
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.shared`: boolean expected", **where, **subject)
+                    policy.shared = True
+            if raw.get("tenants") is not None:
+                value = raw["tenants"]
+                if isinstance(value, str):
+                    value = [value]
+                if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.tenants`: list of `human:<id>` expected",
+                             **where, **subject)
+                    value = []
+                policy.tenants = [v.strip() for v in value if v.strip()]
             if raw.get("lease_ttl") is not None:
                 value = raw["lease_ttl"]
                 if isinstance(value, (int, float)) and not isinstance(value, bool) \
@@ -5399,6 +5506,7 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 add("host-occupant-unresolved", ERROR,
                     "occupant %r de l'hôte %s ne résout pas vers un Member humain"
                     % (ref, host.title), host.fiche, host=host.title)
+        _validate_tenancy(canon, host, add)
         for name in host.policy.harnesses or []:
             if name not in known_harnesses:
                 add("host-harness-unknown", ERROR,
