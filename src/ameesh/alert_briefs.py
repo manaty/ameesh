@@ -1005,11 +1005,20 @@ def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
     alerte SLO copiée à plusieurs coordinateurs n'en réveille qu'un, stable
     d'une passe à l'autre (`_one_orchestrator`) ; les autres la lisent en copie
     à leur tour suivant, et le palier suivant reprend si rien ne bouge. Un P1
-    (`urgent`) réveille tout le monde, comme avant."""
-    if alert.get("urgent"):
-        return {}
+    (`urgent`) réveille tout le monde, comme avant.
+
+    #7009 : une pause critique ne réveille pas un destinataire lui-même en
+    pause budget sur le même compte (11/11 03:32-04:23Z : auditeur,
+    mesh-design et orchestrateur se réveillaient l'un l'autre pour une pause
+    qu'aucun ne pouvait lever) ; il la lit en `info`, sans l'urgence."""
     names = [name for name in names if not name.startswith("thread:")]
     kind = alert.get("type")
+    if kind == "critical_budget_pause":
+        account = (alert.get("episode") or ("",))[0]
+        return {name: {"info": True, "urgent": False} for name in names
+                if account and _budget_paused_on(by_name.get(name), account)}
+    if alert.get("urgent"):
+        return {}
     if kind in ("operator_pause_long", "operator_pause_host") and automatic_sleep(alert):
         return {name: {"info": True} for name in names}
     if kind != "slo_breach" or len(names) < 2:
@@ -1018,6 +1027,24 @@ def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
     woken = holder if holder in names else \
         _one_orchestrator(names, by_name, alert.get("lot"))[0]
     return {name: {"cc": woken} for name in names if name != woken}
+
+
+def _budget_paused_on(row, account: str) -> bool:
+    """#7009 : l'agent est en pause budget (statut `blocked`) sur ce compte."""
+    from . import accounts as accounts_mod
+    from . import budget as budget_mod
+    if not row or row.get("status") != "blocked":
+        return False
+    text = row.get("status_text") or ""
+    if not text.startswith(budget_mod.PAUSE_PREFIX):
+        return False
+    reason = text[len(budget_mod.PAUSE_PREFIX):]
+    if reason.startswith(budget_mod.CRITICAL_MARK):
+        reason = reason[len(budget_mod.CRITICAL_MARK):]
+    nature = accounts_mod.pause_nature(reason).split("|")
+    if nature[0] == "pause":
+        return nature[1] == account
+    return (row.get("session_account") or "") == account
 
 
 def _operator_pause(alert: dict) -> str:
