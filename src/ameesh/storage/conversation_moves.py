@@ -43,6 +43,13 @@ class ConversationMoves(abc.ABC):
         """The agent's open attempt, if any."""
 
     @abc.abstractmethod
+    def release_refused(self, agent: str, *, owner: str, epoch: int, host: str) -> bool:
+        """After a `conversation_move` admission refusal: `running` back to
+        `queued` (prompt waiting) or `idle`, in one compare-and-set on the
+        source lease (owner, epoch, host, status still `running`). Any other
+        holder, an operator stop or a target turn is left untouched."""
+
+    @abc.abstractmethod
     def holds(self, agent: str) -> bool:
         """An attempt still holds the agent's session back: switched,
         recovered or rehydrating, or planned/prepared younger than

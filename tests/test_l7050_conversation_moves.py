@@ -397,6 +397,43 @@ class WorkerTest(Base):
         self.assertEqual(self.advance(), [(move["move_id"], "prepared"),
                                           (move["move_id"], "switched")])
 
+    def test_stale_source_release_never_touches_another_holder(self):
+        # relecture cx2 : CAS sur le bail source — un détenteur périmé (autre
+        # epoch, autre hôte) ou un arrêt opérateur ne sont jamais réécrits
+        self.db.execute("UPDATE agent_registry SET status = 'running',"
+                        " pending_prompt = 'p' WHERE name = 'avatar'")
+        self.assertFalse(self.moves.release_refused(
+            "avatar", owner="runner-src", epoch=self.epoch - 1, host="source"))
+        self.assertFalse(self.moves.release_refused(
+            "avatar", owner="runner-src", epoch=self.epoch, host="target"))
+        self.assertFalse(self.moves.release_refused(
+            "avatar", owner="runner-tgt", epoch=self.epoch, host="source"))
+        self.assertEqual(self.row()["status"], "running")
+        self.db.execute("UPDATE agent_registry SET status = 'stopped' WHERE name = 'avatar'")
+        self.assertFalse(self.moves.release_refused(
+            "avatar", owner="runner-src", epoch=self.epoch, host="source"))
+        self.assertEqual(self.row()["status"], "stopped")
+        self.db.execute("UPDATE agent_registry SET status = 'running' WHERE name = 'avatar'")
+        self.assertTrue(self.moves.release_refused(
+            "avatar", owner="runner-src", epoch=self.epoch, host="source"))
+        self.assertEqual(self.row()["status"], "queued")
+
+    def test_target_running_turn_survives_a_late_source_refusal(self):
+        # relecture cx2 : la cible a réclamé et tourne ; le refus tardif de
+        # la source (bail rendu au switch) ne touche pas son `running`
+        from types import SimpleNamespace
+        from ameesh.runner import AgentWorker
+        self.plan()
+        self.advance()
+        lease = self.target_claim()
+        self.db.execute("UPDATE agent_registry SET status = 'running' WHERE name = 'avatar'")
+        w = self.worker({"lease_epoch": self.epoch})
+        w.runner = SimpleNamespace(host="source", runner_id="runner-src", dry_run=False)
+        AgentWorker._release_running_for_move(w)
+        row = self.row()
+        self.assertEqual((row["status"], row["lease_owner"], row["lease_epoch"]),
+                         ("running", "runner-tgt", lease["lease_epoch"]))
+
     def test_mediated_executor_has_no_move_hooks(self):
         # B3 (relecture 2/2) : RemoteDb n'a pas `conversation_moves` — no-op
         # explicite, jamais AttributeError, jamais « ouvert pour toujours »

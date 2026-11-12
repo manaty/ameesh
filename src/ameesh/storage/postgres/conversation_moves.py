@@ -116,6 +116,17 @@ class ConversationMoves(Contract):
                                   " WHERE agent = %s AND state IN " + _OPEN_SQL,
                                   (agent,)))
 
+    def release_refused(self, agent, *, owner, epoch, host):
+        return bool(self.db.query(
+            """UPDATE agent_registry
+                  SET status = CASE WHEN pending_prompt IS NOT NULL THEN 'queued'
+                                    ELSE 'idle' END,
+                      status_text = 'conversation move in progress',
+                      last_seen = now(), updated_at = now()
+                WHERE name = %s AND status = 'running' AND host = %s
+                  AND lease_owner = %s AND lease_epoch = %s
+            RETURNING name""", (agent, host, owner, int(epoch))))
+
     def holds(self, agent):
         return bool(self.db.query(
             "SELECT 1 FROM conversation_moves WHERE agent = %s AND (state IN "

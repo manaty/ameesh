@@ -2480,12 +2480,14 @@ class AgentWorker(threading.Thread):
         puis `begin_turn` a refusé (`conversation_move`) sans ouvrir de tour —
         la consigne remise, le statut ne peut pas rester `running` : `switch`
         attendrait la fin d'un tour qui n'existe pas, jusqu'à l'expiration."""
+        if _move_unsupported(self):
+            return
         try:
-            row = registry.get(self.db, self.name) or {}
-            if row.get("status") == "running":
-                registry.set_status(self.db, self.name,
-                                    "queued" if row.get("pending_prompt") else "idle",
-                                    status_text="conversation move in progress")
+            # relecture cx2 : une seule écriture, gardée par le bail de la
+            # source (détenteur, epoch, hôte) — jamais le `running` d'un autre
+            storage.of(self.db).conversation_moves.release_refused(
+                self.name, owner=self.runner.runner_id, epoch=self.epoch,
+                host=self.runner.host)
         except db_mod.DbError as exc:
             log_async("[%s] status after the move refusal not written (%s)"
                       % (self.name, db_mod.explain(exc)))
