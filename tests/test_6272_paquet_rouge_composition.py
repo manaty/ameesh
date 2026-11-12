@@ -170,9 +170,15 @@ class FakeShell:
         self.mails: list[tuple[str, str]] = []
 
     def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
-        self.calls.append(list(cmd))
         if cmd[0] == "agent-mail":
+            self.calls.append(list(cmd))
             self.mails.append((cmd[2], input_text))
+            return hourly.Result(0)
+        # #7091 : la note passée par stdin (« - ») est relue à sa place.
+        if input_text is not None and "-" in cmd[1:]:
+            cmd = list(cmd)
+            cmd[cmd.index("-", 1)] = input_text
+        self.calls.append(list(cmd))
         return hourly.Result(0)
 
 

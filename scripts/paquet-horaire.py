@@ -511,8 +511,9 @@ class Context:
         return self.shell.run(["ameesh", *args], cwd=self.repo,
                               input_text=input_text, timeout=timeout)
 
-    def must(self, *args: str, what: str, timeout: int = COMMAND_TIMEOUT) -> Result:
-        result = self.ameesh(*args, timeout=timeout)
+    def must(self, *args: str, what: str, input_text: str | None = None,
+             timeout: int = COMMAND_TIMEOUT) -> Result:
+        result = self.ameesh(*args, input_text=input_text, timeout=timeout)
         if result.returncode != 0:
             raise HoraireError("%s : rc %d : %s"
                                % (what, result.returncode, auto._tail(result.text, 20)))
@@ -525,8 +526,11 @@ class Context:
         if self.dry_run:
             self.say("[essai] note #%d : %s" % (lot, text))
             return
-        self.must("work", "note", str(lot), text, "--actor", self.actor,
-                  what="note au porteur #%d" % lot)
+        # #7091 : le texte passe par l'entrée standard (`work note <lot> -`) ;
+        # en argv, une projection de contrats de plus de 128 Kio
+        # (MAX_ARG_STRLEN) faisait mourir l'appel en E2BIG.
+        self.must("work", "note", str(lot), "-", "--actor", self.actor,
+                  input_text=text, what="note au porteur #%d" % lot)
 
     def mail(self, to: str, lot: int, body: str) -> None:
         if self.dry_run:
@@ -2113,8 +2117,9 @@ def exclude(ctx: Context, lot: int, carrier: int, name: str, run_id: str,
     if ctx.dry_run:
         ctx.say("[essai] #%d → build : %s" % (lot, trace))
         return
+    # #7091 : la liste des tests n'est pas bornée, la note passe par stdin.
     moved = ctx.ameesh("work", "move", str(lot), "build", "--package-exclusion",
-                       "--note", trace, "--actor", ctx.actor)
+                       "--note", "-", "--actor", ctx.actor, input_text=trace)
     if moved.returncode == 0:
         return
     ctx.say("#%d non repassé en build : %s" % (lot, auto._tail(moved.text, 5)))
@@ -2301,7 +2306,8 @@ def alert_once(ctx: Context, key: str, title: str, code: str, message: str) -> N
     if lot:
         # #5097 : la cause vit dans le lot, pas seulement dans le courrier
         # (h-10 : lot ouvert avec le seul code « pose », courrier jamais lu).
-        noted = ctx.ameesh("work", "note", str(lot), message, "--actor", ctx.actor)
+        noted = ctx.ameesh("work", "note", str(lot), "-", "--actor", ctx.actor,
+                           input_text=message)
         if noted.returncode != 0:
             ctx.say("note du lot #%d non écrite : %s" % (lot, auto._tail(noted.text, 5)))
     for to in dict.fromkeys((ctx.pilot, BUREAU)):

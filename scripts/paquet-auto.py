@@ -4896,9 +4896,16 @@ def request_full_ci(worktree: Path, carrier: int, head: str) -> str:
 
 
 def note_carrier(worktree: Path, carrier: int, note: str) -> str:
-    """Une note au journal du porteur ; une erreur est dite, jamais fatale."""
-    proc = run_command(["ameesh", "work", "note", str(carrier), note],
-                       cwd=worktree, timeout=GIT_TIMEOUT)
+    """Une note au journal du porteur ; une erreur est dite, jamais fatale.
+
+    #7091 : le texte passe par l'entrée standard (`work note <lot> -`) ; une
+    projection de contrats de plus de 128 Kio (MAX_ARG_STRLEN) faisait mourir
+    l'appel en E2BIG, une OSError qui arrêtait toute la composition."""
+    try:
+        proc = run_command(["ameesh", "work", "note", str(carrier), "-"],
+                           cwd=worktree, input_text=note, timeout=GIT_TIMEOUT)
+    except (OSError, PaquetAutoError) as exc:
+        return "note du porteur #%d non écrite : %s" % (carrier, exc)
     if proc.returncode != 0:
         return "note du porteur #%d non écrite : %s" % (carrier, _tail(_output(proc)))
     return "note du porteur #%d écrite" % carrier
