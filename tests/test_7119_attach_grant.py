@@ -256,6 +256,28 @@ class RedeemTest(PgTestCase):
             self.bob.proof(receipts.challenge(receipt["request"])))
         self.assertRefused(self.redeem(forged), receipts.SIGNATURE)
 
+    def test_appareil_revoque_pendant_la_verification(self):
+        """B cx2 : la clé d'appareil révoquée entre sa lecture et la
+        consommation du reçu n'ouvre rien (relue sous verrou à l'écriture)."""
+        receipt = self.grant()
+        real = receipts.verify_receipt
+
+        def revoke_then_verify(*args, **kwargs):
+            members = [{"title": "alice", "canon_ref": "members/alice.md@%s" % COMMIT,
+                        "authenticators": [self.alice.entry()]}]
+            other = self.connect()
+            try:
+                apply_authenticators(other, members)
+            finally:
+                other.close()
+            return real(*args, **kwargs)
+
+        with mock.patch.object(receipts, "verify_receipt", side_effect=revoke_then_verify):
+            grant = self.redeem(receipt)
+        self.assertRefused(grant, attach_grant.DEVICE)
+        self.assertIn("revoked during verification", grant.reason)
+        self.assertEqual([e["outcome"] for e in self.events()], ["refused"])
+
     def test_un_seul_grant_par_attach_id(self):
         receipt = self.grant()
         self.assertTrue(self.redeem(receipt).ok)

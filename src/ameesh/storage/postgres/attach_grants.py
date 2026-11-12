@@ -30,6 +30,32 @@ class AttachGrants(Contract):
              nonce, exp, checked_by))
         return int(rows[0]["id"]) if rows else None
 
+    def record_granted(self, *, device_authenticator_id, human, agent, host, tenant,
+                       device_key, attach_id, nonce, exp, reason, checked_by):
+        with self.db.transaction() as tx:
+            # 1. le verrou, sans condition d'état dans le WHERE (motif de 0011 :
+            #    une révocation concurrente est attendue, puis relue) ;
+            # 2. l'état relu sous ce verrou ; 3. l'écriture.
+            locked = tx.query("SELECT id FROM authenticators WHERE id = %s FOR SHARE",
+                              (int(device_authenticator_id),))
+            live = locked and tx.query(
+                "SELECT 1 AS live FROM authenticators WHERE id = %s AND revoked_at IS NULL",
+                (int(device_authenticator_id),))
+            if not live:
+                return "device_revoked", None
+            rows = tx.query(
+                "INSERT INTO attach_grant_events"
+                "       (outcome, code, reason, human, agent, host, tenant, device_key,"
+                "        attach_id, nonce, exp, checked_by)"
+                " VALUES ('granted', 'ok', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (attach_id) WHERE outcome = 'granted' DO NOTHING"
+                " RETURNING id",
+                (reason, human, agent, host, tenant, device_key, attach_id, nonce, exp,
+                 checked_by))
+            if not rows:
+                return "used", None
+            return "ok", int(rows[0]["id"])
+
     def recent(self, *, agent=None, limit=50):
         limit = max(1, min(int(limit), 1000))
         if agent:

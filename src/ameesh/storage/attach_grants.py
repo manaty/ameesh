@@ -22,6 +22,19 @@ class AttachGrants(abc.ABC):
         `granted` existe déjà pour cet `attach_id` (rien n'est écrit)."""
 
     @abc.abstractmethod
+    def record_granted(self, *, device_authenticator_id: int, human: str, agent: str,
+                       host: str, tenant: str, device_key: str, attach_id: str, nonce: str,
+                       exp: int, reason: str, checked_by: str) -> tuple[str, Optional[int]]:
+        """Écrit le grant accepté, SI la clé d'appareil est encore active.
+
+        Une transaction : la ligne `authenticators[device_authenticator_id]`
+        est prise `FOR SHARE` (sérialisée avec sa révocation, comme
+        l'authentificateur WebAuthn dans `ameesh_receipt_consume`), son état
+        relu sous ce verrou, puis la ligne `granted` écrite. Rend
+        `("ok", id)`, `("device_revoked", None)` (rien d'écrit) ou
+        `("used", None)` (un grant existe déjà pour cet attach_id)."""
+
+    @abc.abstractmethod
     def recent(self, *, agent: Optional[str] = None, limit: int = 50) -> list[dict]:
         """Les dernières issues (toutes, ou d'un agent), de la plus récente à
         la plus ancienne ; `at_ts` en secondes Unix."""

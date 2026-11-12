@@ -179,6 +179,8 @@ class Grant:
 
 
 def _record(db: Db, grant: Grant, *, nonce: str, checked_by: str) -> int | None:
+    if grant.ok:
+        raise ValueError("a granted attach is written by record_granted")
     return storage.of(db).attach_grants.record(
         outcome="granted" if grant.ok else "refused", code=grant.code,
         reason=grant.reason[:2000], human=grant.human[:200], agent=grant.agent[:200],
@@ -200,20 +202,36 @@ def redeem(db: Db, receipt, *, canon, agent: str, host: str, tenant: str, device
     """
     base = {"agent": agent, "host": host, "tenant": tenant, "device_key": device_key}
     nonce = ""
+    device_id = 0
 
     def finish(grant: Grant) -> Grant:
         try:
-            event_id = _record(db, grant, nonce=nonce, checked_by=checked_by)
+            if grant.ok:
+                # la clé d'appareil est relue sous verrou, dans la transaction
+                # qui écrit le grant : une révocation validée entre sa première
+                # lecture et ici n'est jamais contournée
+                state, event_id = storage.of(db).attach_grants.record_granted(
+                    device_authenticator_id=device_id, human=grant.human,
+                    agent=grant.agent, host=grant.host, tenant=grant.tenant,
+                    device_key=grant.device_key, attach_id=grant.attach_id, nonce=nonce,
+                    exp=grant.exp, reason=grant.reason[:2000], checked_by=checked_by)
+                if state == "device_revoked":
+                    return finish(dataclasses.replace(
+                        grant, ok=False, code=DEVICE,
+                        reason="device %s revoked during verification"
+                               % grant.device_key[:16]))
+                if state != "ok":
+                    return finish(dataclasses.replace(
+                        grant, ok=False, code=receipts.REPLAY,
+                        reason="grant %s already used" % grant.attach_id))
+            else:
+                event_id = _record(db, grant, nonce=nonce, checked_by=checked_by)
         except DbError as exc:
             # grant déjà consommé : sans trace, il ne vaut rien (fail closed)
             return dataclasses.replace(
                 grant, ok=False, code=AUDIT,
                 reason="attach journal unavailable (%s): %s"
                        % (type(exc).__name__, grant.reason))
-        if grant.ok and event_id is None:
-            return finish(dataclasses.replace(
-                grant, ok=False, code=receipts.REPLAY,
-                reason="grant %s already used" % grant.attach_id))
         return dataclasses.replace(grant, event_id=event_id)
 
     def refuse(code: str, reason: str, **fields) -> Grant:
@@ -245,6 +263,7 @@ def redeem(db: Db, receipt, *, canon, agent: str, host: str, tenant: str, device
         return refuse(AUDIT, "trust registry unreachable (%s)" % type(exc).__name__, **seen)
     if row is None:
         return refuse(DEVICE, "device %s: %s" % (device_key[:16], reason), **seen)
+    device_id = int(row["id"])
     try:
         key = receipts.parse_public_key("device-es256", receipts.b64u_decode(
             row["public_key"], "stored device key"))
