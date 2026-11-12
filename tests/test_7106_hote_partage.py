@@ -165,6 +165,27 @@ class SharedClaimTest(test_canon._CanonDbCase):
         self.sync("banc")
         self.assertIsNone(registry.claim(self.db, "relecteur", "banc/alice", 600))
 
+    def test_partage_retire_sous_liaison_reste_ferme(self):
+        # B2 (revue impl-04) : la fiche retire `shared` (ou disparaît) alors
+        # que les tenants restent liés : personne ne réclame leurs agents
+        self.db.execute("UPDATE agent_registry SET canon_ref = NULL WHERE name = 'relecteur'")
+        for card in (banc_partage(shared=None, tenants=None), None):
+            with self.subTest(card=bool(card)):
+                if card is None:
+                    os.remove(os.path.join(self.root, "hotes/banc.md"))
+                else:
+                    write(self.root, "hotes/banc.md", card)
+                self.sync("banc")
+                self.assertTrue(tenancy.host_policy(self.db, "banc")["shared"])
+                for owner in ("banc/bruno", "banc:4242", "banc/alice"):
+                    self.assertIsNone(registry.claim(self.db, "relecteur", owner, 600))
+        # liaisons retirées (agents partis) : l'hôte redevient dédié
+        self.db.execute("UPDATE agent_registry SET host = 'atelier'"
+                        " WHERE responsible IN (%s, %s)", (ALICE, BRUNO))
+        for tenant in (ALICE, BRUNO):
+            tenancy.remove(self.db, "banc", tenant)
+        self.assertFalse(tenancy.host_policy(self.db, "banc")["shared"])
+
     def test_attach_par_l_utilisateur_du_tenant(self):
         self.assertIsNone(registry.attach_claim(self.db, "relecteur",
                                                 "attach:ameesh-bruno@banc", 60))
@@ -281,6 +302,19 @@ class ProvisioningTest(unittest.TestCase):
         self.assertIn("loginctl enable-linger ameesh-alice", text)
         self.assertIn("AMEESH_TENANT=human:alice", text)
         self.assertIn("UMask=0077", text)
+        self.assertIn("--register --actor", text)
+
+    def test_unite_porte_l_identifiant_lie(self):
+        # B1 (revue impl-04) : l'unité imprimée et `register` nomment le même runner
+        text = tenancy.unit_text("banc", ALICE)
+        self.assertIn("Environment=AMEESH_RUNNER_ID=%s\n" % tenancy.runner_id("banc", ALICE),
+                      text)
+        from ameesh import config
+        cfg = config.Config(host="banc", tenant=" " + ALICE)
+        self.assertEqual(cfg.runner, tenancy.runner_id("banc", ALICE))
+        self.assertEqual(dataclasses.replace(cfg, runner_id="r1").runner, "r1")
+        self.assertEqual(dataclasses.replace(cfg, tenant="").runner,
+                         "banc:%d" % os.getpid())
         self.assertNotIn("KEY", text.upper().replace("KEYS", ""))
 
     def test_runner_de_tenant_bat_sans_relever(self):

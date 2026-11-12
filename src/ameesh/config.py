@@ -733,7 +733,17 @@ class Config:
 
     @property
     def runner(self) -> str:
-        return self.runner_id or "%s:%d" % (self.host, os.getpid())
+        if self.runner_id:
+            return self.runner_id
+        if self.tenant:
+            # #7106 : le runner d'un tenant sans `runner_id` prend l'identifiant
+            # que lie `ameesh host tenant add --register` (`<hôte>/<id>`)
+            from . import tenancy
+            try:
+                return tenancy.runner_id(self.host, self.tenant)
+            except tenancy.TenancyError:
+                pass
+        return "%s:%d" % (self.host, os.getpid())
 
     @property
     def aliases_path(self) -> str:

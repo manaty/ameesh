@@ -174,8 +174,11 @@ def isolation_problem(db, host: str, agent: Mapping, peers: list[Mapping], *,
 # --------------------------------------------------------------------------
 # provisionnement (source only : `ameesh host tenant add|list|remove`)
 # --------------------------------------------------------------------------
-def unit_text(tenant: str, *, ameesh_bin: str = "/usr/local/bin/ameesh") -> str:
-    """Unité utilisateur du runner d'un tenant (installée sous son home)."""
+def unit_text(host: str, tenant: str, *, ameesh_bin: str = "/usr/local/bin/ameesh") -> str:
+    """Unité utilisateur du runner d'un tenant (installée sous son home).
+
+    `AMEESH_RUNNER_ID` est l'identifiant que `register` lie (`runner_id`) :
+    sans lui, l'exécuteur vaudrait `<hôte>:<pid>`, ni battement ni bail."""
     ident = check_tenant(tenant)[len("human:"):]
     return """[Unit]
 Description=ameesh runner of tenant human:%(ident)s (shared host, #7106)
@@ -184,6 +187,7 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=AMEESH_TENANT=human:%(ident)s
+Environment=AMEESH_RUNNER_ID=%(runner)s
 Environment=AMEESH_CONFIG=%%h/.config/ameesh/config.json
 ExecStart=%(bin)s run
 Restart=on-failure
@@ -192,7 +196,7 @@ UMask=0077
 
 [Install]
 WantedBy=default.target
-""" % {"ident": ident, "bin": ameesh_bin}
+""" % {"ident": ident, "runner": runner_id(host, tenant), "bin": ameesh_bin}
 
 
 def add_plan(host: str, tenant: str) -> list[list[str]]:
@@ -264,9 +268,13 @@ def shell_plan(host: str, tenant: str) -> str:
     lines.append("# unit %s, installed as %s:"
                  % (TENANT_UNIT % tenant[len("human:"):],
                     "/home/%s/.config/systemd/user/ameesh-runner-tenant@.service" % user))
-    lines += ["#   " + line for line in unit_text(tenant).splitlines()]
-    lines.append("# then: ameesh host tenant add %s --host %s --register"
-                 % (shlex.quote(tenant), shlex.quote(host)))
+    lines += ["#   " + line for line in unit_text(host, tenant).splitlines()]
+    lines.append("# %s: the tenant's configuration (database, no secret in this plan),"
+                 " installed by the bureau like the organization keys"
+                 % ("/home/%s/.config/ameesh/config.json" % user))
+    lines.append("# then (as the host supervisor): ameesh host tenant add %s --host %s"
+                 " --register --actor <human:id of the registrant>"
+                 % (shlex.quote(check_tenant(tenant)), shlex.quote(host)))
     return "\n".join(lines)
 
 

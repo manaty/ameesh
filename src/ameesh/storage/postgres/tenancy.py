@@ -38,7 +38,11 @@ class Tenancy(interface.Tenancy):
         for row in rows:
             if row["shared"]:
                 tenants.extend(t for t in row["tenants"] or () if t not in tenants)
-        return {"shared": any(row["shared"] for row in rows), "tenants": tenants}
+        # comme `ameesh_host_shared` : un tenant encore lié garde l'hôte
+        # partagé quand le canon ne le déclare plus (fail closed)
+        shared = any(row["shared"] for row in rows) or bool(self.db.query(
+            "SELECT 1 FROM host_tenants WHERE host = %s LIMIT 1", (host,)))
+        return {"shared": shared, "tenants": tenants}
 
     def bind(self, host, tenant, *, unix_user, uid, runner_id, actor):
         rows = self.db.query(

@@ -1477,7 +1477,8 @@ def _write_tenancy(db: Db, canon: Canon, host: str, canon_key: str) -> None:
 
     Tenants résolus par CE canon (`human:<id>`) ; un tenant qui ne résout pas
     est omis (fail closed : il n'est admis nulle part). Une fiche absente
-    efface la ligne ; deux fiches de l'hôte dont l'une est partagée gardent
+    ou sans `shared` efface la ligne, mais la garde reste fermée tant qu'un
+    tenant est lié (`ameesh_host_shared`, 0575) ; deux fiches de l'hôte dont l'une est partagée gardent
     l'hôte partagé, sans tenant (personne n'y réclame)."""
     cards = [h for h in canon.hosts if h.title == host]
     shared = any(card.policy.shared for card in cards)

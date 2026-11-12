@@ -22,7 +22,7 @@
 -- distinct (0033/L155), non revendiqué ici.
 --
 -- Additive seulement : tables et fonctions neuves ; sans ligne
--- `host_tenancy`, aucune réclamation ne change de sens.
+-- `host_tenancy` ni `host_tenants`, aucune réclamation ne change de sens.
 
 create table if not exists host_tenancy (
     host       text not null,
@@ -72,10 +72,14 @@ create table if not exists runner_presence (
 comment on table runner_presence is
     '#7106: heartbeat of a tenant runner on a shared host (presence, design §3.2 point 5).';
 
--- Vrai si un canon déclare `host` partagé.
+-- Vrai si un canon déclare `host` partagé, ou si un tenant y reste lié :
+-- une fiche qui retire `shared` (ou absente) ne rouvre pas les agents des
+-- tenants à tous les runners (fail closed) ; la liaison se retire par
+-- `ameesh host tenant remove`, une fois les agents partis.
 create or replace function ameesh_host_shared(h text)
 returns boolean language sql stable as $$
     select exists (select 1 from host_tenancy y where y.host = h and y.shared)
+        or exists (select 1 from host_tenants t where t.host = h)
 $$;
 
 -- La garde de réclamation d'un hôte partagé : `claimer` est le runner lié au
