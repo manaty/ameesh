@@ -592,6 +592,66 @@ class PacketAdmissionTest(_Base):
         self.assertEqual(self.fake.queue_rows[1]["target"], "main")
 
 
+class PausedFamilyFallbackContextTest(_Base):
+    """#6990 (B1 cx1, 12/11 16:10) : la file ne donne le repli de famille en
+    pause qu'à l'admission d'un paquet. Un lot ordinaire — même couvert par
+    une exception incident/unblock, simulée ici par la garde autorisée du
+    banc — garde ses deux avis avant fusion (décision owner #213032 a)."""
+
+    def enter_with_gate(self, lot):
+        seen = {}
+
+        def gate(db, marks, frozen, **kw):
+            seen.update(kw)
+            return {"ok": True, "required": 2, "class": "sensitive",
+                    "waived": False, "attribution_read": False}
+
+        with mock.patch.object(merge_queue, "review_gate", side_effect=gate):
+            self.enter(lot)
+        return seen
+
+    def test_a_direct_lot_keeps_the_fallback_closed(self):
+        self.ready(1)
+        seen = self.enter_with_gate(1)
+        self.assertIs(seen.get("packet"), False, seen)
+
+    def test_the_queue_gate_really_refuses_the_fallback(self):
+        # La porte réelle reçoit `packet=False` : avec un seul avis et une
+        # famille en pause prouvée, la file refuse et nomme la barrière
+        # manquante au lieu d'abaisser le compte à un.
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/merge_queue.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/merge_queue.py"]}],
+                 "train_reviews": 2,
+                 "train_reviews_paths": {"src/ameesh/merge_queue.py": 2},
+                 "paused_family_min_hours": 12, "paused_family_reviews": 1}
+        tip = self.tip(1)
+        self.marks[1] = [{"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0},
+                         {"id": 2, "kind": "verdict", "verdict": "ok", "sha": tip,
+                          "at_ts": 2.0, "actor": "rev1"}]
+        evidence = {"family": "codex", "resume_ts": 9999999999.0,
+                    "accounts": ["primary"], "min_hours": 12,
+                    "required": 2, "shortfall": 1}
+        with mock.patch.object(merge_queue, "_class_of", return_value=klass), \
+                mock.patch.object(merge_queue, "_paused_family_fallback",
+                                  return_value=evidence), \
+                mock.patch.object(merge_queue, "_exact_verdict_receipt",
+                                  return_value={}):
+            with self.assertRaisesRegex(merge_queue.QueueError,
+                                        "reserved to a packet admission"):
+                merge_queue.enter(types.SimpleNamespace(), 1, repo=self.repo,
+                                  actor="orch", ci=self.green(1))
+
+    def test_a_packet_vehicle_opens_the_packet_context(self):
+        sha = self.tip(1)
+        _git(self.repo, "branch", "integration/paquet-6990", sha)
+        self.fake.lots[1]["branch"] = "integration/paquet-6990"
+        self.ready(1)
+        seen = self.enter_with_gate(1)
+        self.assertIs(seen.get("packet"), True, seen)
+
+
 class LightClassTest(_Base):
     """L539 (§8): a light lot enters without a review verdict, but keeps every
     other gate — green CI on the frozen head, a non-draft PR, a target that is

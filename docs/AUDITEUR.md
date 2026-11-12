@@ -382,6 +382,34 @@ référence : il attend la fin de la pression ou refait la mesure (règle du
    que le hook de courrier remet des messages aux sous-agents (bug noté dans
    l'amendement de 0036), un message a pu atterrir chez l'un d'eux.
 
+### Revue des usages root du bureau sur bureau-goal (#6882)
+
+Décision de l'owner #214339, option b (signée, approbation #339, 12/11/2026
+18:50Z) : l'agent du bureau garde le groupe docker sur bureau-goal (BG), donc
+un accès équivalent à root. La note du pilote du 12/11 18:54Z sur #6882 fait
+foi pour ce droit : le périmètre (points 1 à 4), une note par usage root
+(point 5) et une trace technique persistante (point 6). Le point 7 confie la
+revue à l'auditeur :
+
+* **quand** : à chaque analyse profonde de nuit, et après chaque usage root
+  qui lui est signalé ;
+* **quoi** : il lit l'extrait de la trace technique que publie le bureau
+  (auditd ou journal des `docker events`, avec les montages des conteneurs
+  créés) et le rapproche des notes d'usage root sur les lots. Un usage est
+  root s'il monte `/` ou un chemin système de l'hôte, s'il emploie
+  `--privileged`, les espaces de noms de l'hôte, `nsenter` ou `chroot` ;
+* **écart** : un usage root sans note dans les 15 min, sans lot ni décision
+  cité avant le geste, ou qui touche un point exclu (point 4 : secrets d'un
+  autre compte, gardes du rôle limité, compte ou clés de l'owner, rebond vers
+  un autre hôte). Il le remonte à l'owner par `ameesh decide`, avec l'extrait
+  de trace et le lot concerné ;
+* **trace absente** : tant que le point 6 n'est pas posé, ou si l'extrait du
+  jour manque, il le signale au bureau et au pilote dans son rapport. Le
+  rapprochement est alors déclaré non concluant, jamais conforme.
+
+Le rapport de nuit porte une ligne « usages root BG » : le nombre d'usages
+tracés, de notes, d'écarts, et la période couverte.
+
 ### Sur un bug de priorité 1 ou une release retirée
 
 Demande du propriétaire du 2026-10-12 (L317c, après la Nexlink desktop 0.2.9

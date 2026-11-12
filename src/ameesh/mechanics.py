@@ -27,6 +27,15 @@ mécanique, ce que l'outillage exécute sans agent :
   c'est le plancher lu par `reviews_for`, jamais une règle de chemin — une
   règle positive reclasse le chemin en sensible et ne doit pas servir de
   raccourci fourre-tout ;
+- `reviews.paused_family_min_hours` (#6990, décision owner #213032 a) : le
+  délai minimal, en heures, de reprise d'une famille de relecture en pause
+  budget au-delà duquel la porte de fusion peut admettre un lot éligible sur
+  un avis plus la CI complète du paquet. Clé optionnelle : absente (ou 0),
+  aucun repli n'est ouvert ; le lecteur ne suppose jamais un seuil.
+  Les règles `train_reviews` peuvent porter `paused_family_reviews: 1`
+  (même lot) : la règle autorise ce repli pour les chemins qu'elle nomme.
+  Une règle sans la clé garde ses deux avis avant fusion (porte CI, SQL,
+  secrets, identité, paiement, prod réelle) ;
 - `merge.named_fire`, `repeat_freeze`, `on_green_packet`, `post_merge_red` :
   la fusion du paquet dès la suite verte, sans feu nominatif ni gel répété ;
 - `backlog.lot_min_value` (#2584, bloc optionnel) : la valeur à partir de
@@ -141,7 +150,7 @@ _PREVALIDATION_KEYS = ("classes", "contracts", "hosts", "plan_script",
 _BUILD_KEYS = ("max_in_build",)
 _CI_KEYS = ("packet", "incident_label", "environment_red", "faulty_lot")
 _REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families",
-                 "light_reviews")
+                 "light_reviews", "paused_family_min_hours")
 _MERGE_KEYS = ("named_fire", "repeat_freeze", "on_green_packet", "post_merge_red")
 _BACKLOG_KEYS = ("lot_min_value",)
 #: #3291 : clés du bloc optionnel `staging` (déploiement hors créneau)
@@ -482,6 +491,9 @@ class Document:
     #: #4448 : seuil de rotation de session par harnais ; None = bloc absent
     session: Session | None = None
     auto_take: AutoTake | None = None
+    #: #6990 : délai minimal de reprise d'une famille en pause budget pour le
+    #: repli de la porte ; 0 = aucun repli ouvert
+    paused_family_min_hours: int = 0
 
     def auto_take_excluded_families(self, now: float) -> tuple[str, ...]:
         """La date d'expiration est incluse, dans le fuseau du canon."""
@@ -539,6 +551,10 @@ class Document:
                       "post_merge_red": self.merge_post_merge_red},
             "projects": sorted(item.name for item in self.overrides),
         }
+        if self.paused_family_min_hours:
+            # #6990 : absent (0), la clé n'existe pas : le document sans clé
+            # compile à l'identique, les lecteurs antérieurs ne la refusent pas.
+            payload["reviews"]["paused_family_min_hours"] = self.paused_family_min_hours
         if self.prevalidation is not None:
             # absent, la clé n'existe pas : le document sans bloc compile à l'identique
             payload["prevalidation"] = self.prevalidation.to_dict()
@@ -568,6 +584,9 @@ class ReviewRule:
 
     paths: tuple[str, ...]
     reviews: int
+    #: #6990 : nombre d'avis admis quand la famille manquante est en pause
+    #: budget au-delà de `reviews.paused_family_min_hours` ; 0 = aucun repli
+    paused_family_reviews: int = 0
     regexes: tuple = field(default=(), compare=False, repr=False)
 
 
@@ -616,6 +635,8 @@ class Mechanics:
 
     contract_selection: ContractSelection | None = None
     repair_policy: repair_policy.Policy | None = None
+    #: #6990 : seuil de reprise d'une famille en pause pour le repli ; 0 = aucun
+    paused_family_min_hours: int = 0
 
     # -- coupures -----------------------------------------------------------
 
@@ -776,9 +797,14 @@ class Mechanics:
                       "repeat_freeze": self.merge_repeat_freeze,
                       "on_green_packet": self.merge_on_green_packet,
                       "post_merge_red": self.merge_post_merge_red},
-            "review_rules": [{"paths": list(rule.paths), "reviews": rule.reviews}
+            "review_rules": [dict({"paths": list(rule.paths), "reviews": rule.reviews},
+                                  **({"paused_family_reviews": rule.paused_family_reviews}
+                                     if rule.paused_family_reviews else {}))
                              for rule in self.rules],
         }
+        if self.paused_family_min_hours:
+            # #6990 : absente, la clé n'existe pas (compilation identique).
+            payload["reviews"]["paused_family_min_hours"] = self.paused_family_min_hours
         if self.prevalidation is not None:
             # absent, la clé n'existe pas : le document sans bloc compile à l'identique
             payload["prevalidation"] = self.prevalidation.to_dict()
@@ -855,6 +881,31 @@ def _review_floor(value, where: str) -> int:
     """
     if type(value) is not int or value not in (0, 1):
         raise MechanicsError("%s: 0 or 1 expected" % where)
+    return value
+
+
+def _paused_family_min_hours(value, where: str) -> int:
+    """#6990 : le délai minimal de reprise d'une famille en pause, en heures.
+
+    0 est explicite et vaut « aucun repli ouvert » ; un nombre négatif, un
+    booléen ou un flottant ne sont pas une durée. Le lecteur ne suppose aucun
+    seuil quand la clé est absente (défaut 0)."""
+    if type(value) is not int or value < 0:
+        raise MechanicsError("%s: a non-negative integer is required" % where)
+    return value
+
+
+def _paused_family_reviews(value, where: str, reviews: int) -> int:
+    """#6990 : le compte admis quand la famille manquante est en pause budget.
+
+    Domaine volontairement étroit : 0 (aucun repli) ou 1 (un avis admis),
+    jamais au-dessus du compte de la règle. Absente, la clé vaut 0 et la porte
+    garde ses deux avis avant fusion ; 2 est refusé parce qu'une règle à deux
+    avis qui les admet tous deux n'ouvre aucun repli et ne doit pas le laisser
+    croire.
+    """
+    if type(value) is not int or value not in (0, 1) or value > reviews:
+        raise MechanicsError("%s: 0 or 1 expected, at most the rule's reviews" % where)
     return value
 
 
@@ -1275,6 +1326,9 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
     # home qui le pose à 1 (#2642) ; un zéro déclaré se dit, jamais un implicite.
     light_reviews = _review_floor(reviews.get("light_reviews", 0),
                                   source + ".reviews.light_reviews")
+    paused_min_hours = _paused_family_min_hours(
+        reviews.get("paused_family_min_hours", 0),
+        source + ".reviews.paused_family_min_hours")
     packet, label, environment, faulty = _ci(parsed.get("ci"), source + ".ci")
     named_fire, repeat_freeze, on_green, post_merge = _merge(parsed.get("merge"),
                                                              source + ".merge")
@@ -1302,6 +1356,7 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         distinct_families=_boolean(reviews.get("distinct_families"),
                                    source + ".reviews.distinct_families"),
         light_reviews=light_reviews,
+        paused_family_min_hours=paused_min_hours,
         merge_named_fire=named_fire,
         merge_repeat_freeze=repeat_freeze,
         merge_on_green_packet=on_green,
@@ -1502,6 +1557,20 @@ def review_flags_at(repo: str, commit: str) -> tuple[bool, bool]:
     return document.exclude_author_family, document.distinct_families
 
 
+@functools.lru_cache(maxsize=256)
+def paused_family_min_hours_at(repo: str, commit: str) -> int:
+    """Le délai de reprise d'une famille en pause pour le repli (#6990).
+
+    `reviews.paused_family_min_hours` du document global, au commit exact :
+    0 quand la clé est absente (aucun repli ouvert), la valeur déclarée sinon.
+    Même lecteur strict et même commit que la classification ; `MechanicsAbsent`
+    remonte tel quel, un canon sans document n'est pas un zéro implicite. Un
+    document sans l'attribut (lecteur factice, document antérieur) rend 0 :
+    une permission absente ne s'accorde jamais, elle ne refuse pas la classe.
+    """
+    return int(getattr(load_global(repo, commit), "paused_family_min_hours", 0) or 0)
+
+
 def _federation(repo: str, commit: str, *,
                 deadline: Deadline | None = None) -> dict:
     try:
@@ -1591,10 +1660,15 @@ def _review_policy(federation: dict, project: str, commit: str
     rules: list[ReviewRule] = []
     for index, rule in enumerate(entry["rules"]):
         where = "review_policies.train_reviews.projects.%s.rules[%d]" % (project, index)
-        if not isinstance(rule, dict) or set(rule) != {"paths", "reviews"}:
+        if (not isinstance(rule, dict)
+                or not {"paths", "reviews"} <= set(rule)
+                or set(rule) - {"paths", "reviews", "paused_family_reviews"}):
             raise MechanicsError("%s: `paths` and `reviews` are required" % where)
         if type(rule["reviews"]) is not int or rule["reviews"] not in (1, 2):
             raise MechanicsError("%s.reviews: 1 or 2 expected" % where)
+        paused = _paused_family_reviews(
+            rule.get("paused_family_reviews", 0),
+            where + ".paused_family_reviews", rule["reviews"])
         paths = rule["paths"]
         if not isinstance(paths, list) or not paths \
                 or any(not isinstance(p, str) or not p.strip() for p in paths):
@@ -1604,6 +1678,7 @@ def _review_policy(federation: dict, project: str, commit: str
         except re.error as exc:
             raise MechanicsError("%s.paths: invalid pattern (%s)" % (where, exc)) from exc
         rules.append(ReviewRule(paths=tuple(paths), reviews=rule["reviews"],
+                                paused_family_reviews=paused,
                                 regexes=regexes))
     return policy, tuple(rules)
 
@@ -1654,6 +1729,7 @@ def load(repo: str, commit: str, project: str, *,
         exclude_author_family=document.exclude_author_family,
         distinct_families=document.distinct_families,
         light_reviews=document.light_reviews,
+        paused_family_min_hours=document.paused_family_min_hours,
         merge_named_fire=document.merge_named_fire,
         merge_repeat_freeze=document.merge_repeat_freeze,
         merge_on_green_packet=document.merge_on_green_packet,

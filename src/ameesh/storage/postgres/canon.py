@@ -323,7 +323,7 @@ class Canon(interface.Canon):
     def host_rows(self, host, names) -> list[dict]:
         sql = """
             SELECT name, harness, host, cwd, model, budget_usd, responsible, team, projects,
-                   aliases, roles, releve, candidats, relit,
+                   aliases, roles, releve, candidats, relit, harnesses,
                    provider, credential_mode, capabilities, canon_ref, canon, ephemeral, priority,
                    admitted_hosts, admitted_tags, memory_repository,
                    visibility_ok, visibility_diagnostic,
@@ -356,6 +356,7 @@ class Canon(interface.Canon):
         aliases = _caps_param(values.get("aliases"))
         roles = _caps_param(values.get("roles"))
         relit = _caps_param(values.get("relit"))
+        harnesses = _caps_param(values.get("harnesses"))
         # L165 (EP1) : relève et hôtes candidats, déclaratifs comme le placement
         candidats = _caps_param(values.get("candidats"))
         rows = self.db.query(
@@ -367,10 +368,10 @@ class Canon(interface.Canon):
                  priority, admitted_hosts, admitted_tags, memory_repository,
                  visibility_ok, visibility_diagnostic,
                  placement_ok, placement_diagnostic, placement_ref, placement_profile, canon,
-                 releve, candidats, projects, aliases, roles, relit)
+                 releve, candidats, projects, aliases, roles, relit, harnesses)
             SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
                    %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s,
-                   %s, __CANDIDATS__, __PROJECTS__, __ALIASES__, __ROLES__, __RELIT__
+                   %s, __CANDIDATS__, __PROJECTS__, __ALIASES__, __ROLES__, __RELIT__, __HARNESSES__
               FROM l
             ON CONFLICT (name) DO UPDATE SET
                 harness         = excluded.harness,
@@ -384,6 +385,7 @@ class Canon(interface.Canon):
                 aliases         = excluded.aliases,
                 roles           = excluded.roles,
                 relit           = excluded.relit,
+                harnesses       = excluded.harnesses,
                 provider        = excluded.provider,
                 credential_mode = excluded.credential_mode,
                 capabilities    = excluded.capabilities,
@@ -418,6 +420,7 @@ class Canon(interface.Canon):
                .replace("__ALIASES__", _CAPS_SQL)
                .replace("__ROLES__", _CAPS_SQL)
                .replace("__RELIT__", _CAPS_SQL)
+               .replace("__HARNESSES__", _CAPS_SQL)
                .replace("__PROFILE__", PROFILE_PARAMS_SQL),
             (name_lock_key(name),
              name, values["harness"], values["host"], values["cwd"], values["model"],
@@ -431,6 +434,7 @@ class Canon(interface.Canon):
                                        candidats, candidats, projects, projects, aliases, aliases,
                                        roles, roles,
                                        relit, relit,
+                                       harnesses, harnesses,
                                        values.get("_expected_lease_epoch", values.get("lease_epoch", -1))),
         )
         return bool(rows)
@@ -451,7 +455,7 @@ class Canon(interface.Canon):
                     "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END")
         self.db.execute(
             "DELETE FROM agent_candidates WHERE name = %s AND canon = %s"
-            " AND (%s <> 'election' OR NOT (host = ANY(" + empty + ")))",
+            " AND (%s NOT IN ('election', 'preference') OR NOT (host = ANY(" + empty + ")))",
             (name, canon, releve, candidates, candidates))
         self.db.execute(
             """
@@ -463,19 +467,21 @@ class Canon(interface.Canon):
             (releve, candidates, candidates, name, canon, releve, candidates, candidates))
 
     def write_candidate(self, name, host, *, canon, cwd, ok, diagnostic, ref,
-                        harness, provider, model, credential_mode) -> None:
+                        harness, provider, model, credential_mode,
+                        preference_rank=None) -> None:
         """L165 (EP1) : verdict de placement de `name` sur l'hôte candidat.
 
         Le profil évalué est calculé ici, pour CET hôte : la réclamation depuis
         un autre candidat compare le sien, donc un profil divergé ferme la
-        réclamation comme pour un agent épinglé."""
+        réclamation comme pour un agent épinglé. `preference_rank` (#7048) :
+        index de l'hôte dans l'ordre du Placement d'un agent `preference`."""
         self.db.execute(
             """
             INSERT INTO agent_candidates
                 (name, host, canon, cwd, placement_ok, placement_diagnostic,
-                 placement_ref, placement_profile, updated_at)
+                 placement_ref, placement_profile, preference_rank, updated_at)
             SELECT %s, %s, %s, %s, %s, %s, %s,
-                   ameesh_placement_profile(%s, %s, %s, %s, %s), now()
+                   ameesh_placement_profile(%s, %s, %s, %s, %s), %s, now()
             ON CONFLICT (name, host) DO UPDATE SET
                 canon = excluded.canon,
                 cwd = excluded.cwd,
@@ -483,10 +489,11 @@ class Canon(interface.Canon):
                 placement_diagnostic = excluded.placement_diagnostic,
                 placement_ref = excluded.placement_ref,
                 placement_profile = excluded.placement_profile,
+                preference_rank = excluded.preference_rank,
                 updated_at = now()
             """,
             (name, host, canon, cwd, ok, diagnostic or "", ref,
-             host, harness, provider, model, credential_mode))
+             host, harness, provider, model, credential_mode, preference_rank))
 
     def candidate_names(self, host, canon="") -> list[str]:
         rows = self.db.query(
@@ -708,7 +715,7 @@ class Canon(interface.Canon):
               FROM verrou
              WHERE r.name = verrou.name
                AND verrou.host = %s
-               AND coalesce(verrou.releve, 'hote') <> 'election'
+               AND coalesce(verrou.releve, 'hote') NOT IN ('election', 'preference')
                AND verrou.status <> 'running'
                AND NOT ameesh_handoff_fenced(r.name)
                AND NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name

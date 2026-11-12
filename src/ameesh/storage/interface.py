@@ -2420,11 +2420,13 @@ class WorkItems(Domain):
         """#3138: terminal write of one exact never-fired train plan.
 
         Same lease/epoch and revision checks as `train_save`, plus in the same
-        transaction: the persisted plan id is still `plan_id`, its phase is not
-        terminal or `promoting`, and no active/promoting/landed fire receipt
-        exists for it. A concurrent fire grant is serialized on the target
-        lease, so a plan cannot be abandoned between the grant's check and its
-        insertion. Returns the new document, None on any mismatch.
+        transaction: the persisted plan id is still `plan_id`, its phase is
+        neither `promoting` nor a terminal phase other than `paused` (#6853: a
+        paused train has no other exit, while `landed`, `empty` and
+        `invalidated` stay refused), and no active/promoting/landed fire
+        receipt exists for it. A concurrent fire grant is serialized on the
+        target lease, so a plan cannot be abandoned between the grant's check
+        and its insertion. Returns the new document, None on any mismatch.
         """
 
     @abc.abstractmethod
@@ -3648,7 +3650,8 @@ class Canon(Domain):
     def write_candidate(self, name: str, host: str, *, canon: str, cwd: str | None,
                         ok: bool | None, diagnostic: str, ref: str | None,
                         harness: str | None, provider: str | None,
-                        model: str | None, credential_mode: str | None) -> None:
+                        model: str | None, credential_mode: str | None,
+                        preference_rank: int | None = None) -> None:
         """L165 (EP1) : inscrit le verdict de placement de `name` sur l'hôte
         candidat `host` (profil évalué calculé dans la même instruction), pour
         que la réclamation depuis cet hôte soit jugée sur SA politique."""

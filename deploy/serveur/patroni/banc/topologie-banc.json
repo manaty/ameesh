@@ -1,0 +1,59 @@
+{
+  "grappe": "ameesh-banc",
+  "namespace": "/ameesh-banc/",
+  "reseau": "172.30.77.0/24",
+  "adresse_pc": "172.30.77.50",
+  "primaire_prefere": "banc-1",
+  "ports": {
+    "etcd_client": 2379,
+    "etcd_peer": 2380,
+    "patroni_rest": 8008,
+    "postgres": 5432
+  },
+  "sante": {
+    "seuil_retard_octets": 16777216,
+    "seuil_disque_gio": 5,
+    "seuil_disque_pct": 10,
+    "seuil_archive_s": 900
+  },
+  "chemins": {
+    "etcd_conf": "/etc/etcd/etcd.yml",
+    "etcd_data": "/var/lib/etcd/ameesh",
+    "etcd_tls": "/etc/etcd/tls",
+    "patroni_conf": "/etc/patroni/patroni.yml",
+    "patroni_tls": "/etc/patroni/tls",
+    "ca": "/etc/ameesh/tls/ca.crt",
+    "env": "/etc/ameesh/patroni.env",
+    "pg_data": "/var/lib/postgresql/17/main",
+    "pg_conf": "/etc/postgresql/17/main",
+    "pg_bin": "/usr/lib/postgresql/17/bin",
+    "pgpass": "/var/lib/postgresql/.pgpass",
+    "etat_sante": "/var/lib/ameesh-db/sante.json"
+  },
+  "noeuds": [
+    {
+      "nom": "banc-1",
+      "adresse": "172.30.77.11",
+      "role": "candidat primaire",
+      "priorite": 100,
+      "nofailover": false,
+      "nosync": false
+    },
+    {
+      "nom": "banc-2",
+      "adresse": "172.30.77.12",
+      "role": "candidat primaire",
+      "priorite": 90,
+      "nofailover": false,
+      "nosync": false
+    },
+    {
+      "nom": "banc-3",
+      "adresse": "172.30.77.10",
+      "role": "votant etcd et standby asynchrone",
+      "priorite": 0,
+      "nofailover": true,
+      "nosync": true
+    }
+  ]
+}

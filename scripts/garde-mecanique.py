@@ -86,6 +86,7 @@ SCHEMA_KEYS = (
     "reviews.exclude_author_family",
     "reviews.distinct_families",
     "reviews.light_reviews",
+    "reviews.paused_family_min_hours",
     "merge.named_fire",
     "merge.repeat_freeze",
     "merge.on_green_packet",
@@ -155,6 +156,7 @@ BINDINGS = {
     "distinct_families": "reviews.distinct_families",
     "families": "reviews.families",
     "light_reviews": "reviews.light_reviews",
+    "paused_family_min_hours": "reviews.paused_family_min_hours",
     "cutoffs": "cutoffs",
     "timezone": "timezone",
     "classes": "prevalidation.classes",
@@ -230,6 +232,7 @@ DICT_BINDINGS = {
     "distinct_families": "reviews.distinct_families",
     "families": "reviews.families",
     "light_reviews": "reviews.light_reviews",
+    "paused_family_min_hours": "reviews.paused_family_min_hours",
     "cutoffs": "cutoffs",
     "timezone": "timezone",
     "schema": "schema",
@@ -525,6 +528,10 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "reviews.light_reviews":
         # §2 (#2642) : 0 n'est admis que le temps de la PR home, 1 au canon.
         return type(value) is int and value in (0, 1)
+    if key == "reviews.paused_family_min_hours":
+        # #6990 : un délai de reprise en heures, strictement positif ; 0 est
+        # l'absence documentée de repli, pas un seuil recopié.
+        return type(value) is int and value > 0
     if key in ("cutoffs", "packets.cutoffs"):
         return _is_cutoff_literal(value)
     if key == "timezone":

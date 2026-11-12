@@ -94,6 +94,14 @@ def note(repo: str, sha: str, *, state_dir: Optional[str] = None) -> None:
         pass
 
 
+def forget(repo: str, sha: str, *, state_dir: Optional[str] = None) -> None:
+    """Lève un refus que la forge a démenti (#6934) ; jamais d'exception."""
+    try:
+        os.unlink(_path(repo, sha, state_dir))
+    except OSError:
+        pass
+
+
 def _prune(directory: str) -> None:
     try:
         names = os.listdir(directory)

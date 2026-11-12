@@ -70,14 +70,15 @@ class SharedPlanTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
-    def plan(self, *, used=True, stale=False, policy=True):
+    def plan(self, *, used=True, stale=False, policy=True, lot_safe=None):
         classes = {m: ['P3', 'unchanged'] for m in self.inventory}
         classes['test_changed'] = ['P0', 'changed test']
         classes['test_map'] = ['P1', 'map reader']
         state = {'classes': classes, 'contract': ['test_cluster'], 'always': [],
                  'map': {'used': used, 'stale': stale, 'commit': self.base},
                  'sure': used, 'phase2_safe': used and not stale,
-                 'lot_safe': used, 'unsure': [], 'phase2_why': '', 'changed': 1}
+                 'lot_safe': used if lot_safe is None else lot_safe,
+                 'unsure': [], 'phase2_why': '', 'changed': 1}
         with patch.object(planner.parts, 'modules', return_value=self.inventory), \
                 patch.object(planner, 'classify', return_value=state), \
                 patch.object(planner.transverse_contracts, 'problem', return_value=''), \
@@ -143,6 +144,19 @@ class SharedPlanTest(unittest.TestCase):
         self.assertNotIn('test_map', stale)
         self.assertNotIn('test_changed', stale)
         self.assertIn('test_map', self.packet_modules(self.plan()))
+
+    def test_fresh_map_unsafe_selection_packet_takes_contracts_only(self):
+        # #7092 : une carte fraîche sur une fondation (tests/support.py) rend
+        # la sélection non sûre ; ses impactés sont toute la suite, due à la
+        # CI complète du paquet, pas à sa passe des contrats.
+        expected = self.packet_modules(self.plan(used=False))
+        unsafe = self.packet_modules(self.plan(lot_safe=False))
+        self.assertEqual(unsafe, expected)
+        self.assertNotIn('test_map', unsafe)
+        self.assertIn('test_declared', unsafe)
+        plan = self.plan()
+        plan['contract_plan']['full_suite_required'] = True
+        self.assertEqual(self.packet_modules(plan), expected)
 
     def test_stale_map_rules_unchanged(self):
         plan = self.plan(stale=True)

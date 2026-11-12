@@ -72,6 +72,11 @@ pour `verify-full` est une suite.
 | `sante-base.py` | collecteur de santé et alertes `db_*` |
 | `ameesh-db-sante.service` / `.timer` | contrôle toutes les minutes, journal et `/run/ameesh-db/alertes.json` (répertoire préservé entre les sondes : `RuntimeDirectoryPreserve=yes`) |
 | `requirements.txt` | dépendances du venv Patroni (4.x + psycopg) |
+| `adopter.sh` | EP8.4 (#6861) : passage de la réplication EP8.3 à Patroni, par phases, simulation par défaut |
+| `retour-arriere.sh` | EP8.4 (#6861) : retour à l'unité Debian et à EP8.3, le leader en dernier |
+| `lib-patroni.sh` | fonctions communes des deux scripts (sourcé après `replication/lib.sh`) |
+| `adoption.py` | contrôles en lecture seule : topologie contre `noeuds.conf`, `pg_hba`, slots, état `/cluster` |
+| `verifier-clients.py` | preuve côté client d'une bascule : délai, reconnexion, balayage de l'écouteur, RPO |
 
 `generer-tls.sh` n'écrit jamais dans le dépôt : il exige `--sortie`. Un
 `.gitignore` local refuse les clés, certificats, `secrets.env` et `patroni.env`
@@ -213,7 +218,10 @@ pour les deux autres.
    doit avoir `initial-cluster-state: existing` : c'est le chemin de
    remplacement d'un membre, pas le démarrage initial.
 
-4. **Patroni** : arrêter d'abord l'unité Debian sur le nœud qui porte la base
+4. **Patroni** : sur la base EP8.3 existante, passer par `adopter.sh`
+   (section suivante), qui ajoute les contrôles et la sauvegarde. Le geste
+   manuel ci-dessous reste la référence pour une grappe neuve. Arrêter d'abord
+   l'unité Debian sur le nœud qui porte la base
    (`systemctl disable --now postgresql@17-main`), puis démarrer Patroni sur
    **un seul** nœud pour amorcer la grappe :
 
@@ -243,6 +251,138 @@ pour les deux autres.
    journalctl -u ameesh-db-sante.service -n 20 --no-pager
    cat /run/ameesh-db/alertes.json 2>/dev/null || true
    ```
+
+## Adoption de la réplication EP8.3 (EP8.4, #6861)
+
+`adopter.sh` fait passer la grappe EP8.3 (unité Debian, réplication manuelle
+de `deploy/serveur/replication`) sous Patroni, **sans `pg_basebackup`** : le
+primaire garde son `data_dir`, les standbys aussi (même identifiant système).
+Chaque phase se joue en root sur le nœud nommé. Sans `--geste-reel`, c'est une
+simulation : les contrôles sont réels et les gestes sont seulement affichés.
+
+```bash
+cd deploy/serveur/patroni
+./adopter.sh verifier                    # sur les trois nœuds, lecture seule
+./adopter.sh --geste-reel etcd           # sur les trois, dans la même fenêtre
+./adopter.sh --geste-reel primaire       # sur le primaire EP8.3 (ameesh-agents-1)
+./adopter.sh --geste-reel standby        # ameesh-agents-2, puis manaty-mesh-1
+./adopter.sh grappe                      # un leader, un synchrone, le hub async
+```
+
+Ce que les phases contrôlent, et refusent :
+
+- `topologie.json` et `replication/noeuds.conf` décrivent la même grappe
+  (noms, adresses, priorités, `nofailover`, `nosync`) ;
+- etcd 3.5.x et Patroni 4.x, `patroni.env` en 0640, `patroni.yml` du nœud ;
+- `wal_log_hints=on` (sinon pas de `pg_rewind` après une bascule) ;
+- aucun paramètre géré par Patroni dans `postgresql.auto.conf`, qui est lu en
+  dernier et l'emporterait. Le bloc de reprise d'EP8.3 (`primary_conninfo`,
+  `primary_slot_name`) est retiré au passage : laissé là, il ferait suivre
+  l'ancien primaire après une bascule ;
+- `pg_hba` : Patroni réécrit le fichier. Une règle hors bloc EP8.3 qui
+  disparaîtrait (par exemple `hostssl ameesh all 10.77.0.0/24` d'
+  `installer-serveur.sh`), ou une adresse cliente connectée que le nouveau
+  `pg_hba` ne couvre pas, arrête la phase. `--accepter-hba` passe outre :
+  c'est une décision d'exploitant ;
+- liste synchrone : `postgresql.conf` de Patroni inclut d'abord la
+  configuration de base, donc `conf.d`. Quand Patroni retire
+  `synchronous_standby_names` (aucun synchrone disponible), la valeur incluse
+  revient. La ligne du fragment EP8.3 est donc vidée avant le démarrage de
+  Patroni (l'original reste dans la sauvegarde), et toute autre liste non vide
+  dans `postgresql.conf` ou `conf.d` arrête la phase ;
+- slots : Patroni supprime un slot physique qu'il ne connaît pas. Ceux
+  d'EP8.3 portent déjà le nom des membres (`ameesh_agents_2`, `manaty_mesh_1`) ;
+- `primaire` : jamais sur le hub `nofailover` (Patroni ne le garderait pas
+  leader ; si l'aller-retour de #6947 l'a laissé primaire, `promouvoir.sh`
+  ramène d'abord le primaire sur ameesh-agents-1), quorum etcd, aucune clé `leader` ni `initialize` dans le DCS,
+  aucun autre primaire joignable ;
+- `standby` : un leader dans le DCS, `running` dans son API, avec le même
+  identifiant système que le `data_dir` local. Sinon, Patroni réinitialiserait
+  ce `data_dir`.
+
+Les gestes de `primaire` et de `standby` : sauvegarde de la configuration
+Debian dans `/var/lib/ameesh-db/avant-patroni/<horodatage>-<nœud>` (lien
+`dernier`, 0700), `start.conf` à `manual` (l'unité Debian ne redémarre plus la
+base au boot à côté de Patroni), `systemctl disable --now postgresql@17-main`,
+puis `systemctl enable --now patroni.service`. Sur le leader, les mots de passe
+`postgres` et `replicator` de `patroni.env` sont ensuite posés sur l'entrée
+standard de `psql`, avec `log_statement` coupé pour la session.
+
+Effets attendus : un redémarrage bref de la base pendant la phase `primaire`
+(les clients se reconnectent par le DSN multi-hôtes). Entre les phases
+`primaire` et `standby` d'`ameesh-agents-2`, la grappe est asynchrone : Patroni
+ne prend pour synchrone qu'un membre, et les standbys d'EP8.3 n'en sont pas
+encore. Le redémarrage du primaire coupe leurs connexions, et leur
+reconnexion échoue avec l'ancien mot de passe de `replicator` : ils ne
+suivent plus jusqu'à leur propre phase `standby`. Les slots retiennent le WAL,
+rien n'est perdu ; on enchaîne donc les standbys sans attendre.
+
+### Retour arrière scripté
+
+```bash
+./retour-arriere.sh --geste-reel arreter              # chaque membre non leader
+./retour-arriere.sh --geste-reel primaire             # le leader, en dernier
+./retour-arriere.sh --geste-reel standby --source ameesh-agents-1   # les autres
+./retour-arriere.sh --geste-reel etcd                 # les trois
+../replication/configurer-noeud.sh                    # sur le primaire : ANY 1 revient
+```
+
+La phase `primaire` refuse tant qu'un autre membre tourne sous Patroni. Elle
+restaure la configuration sauvegardée, sans liste synchrone (aucun standby
+n'est encore là), puis repose les rôles et le `pgpass` d'EP8.3 depuis
+`replication.env`. La phase `standby` restaure aussi le `pgpass` d'avant
+Patroni, puis confie la reprise du flux à `replication/suivre-primaire.sh` ;
+un nœud arrêté en primaire (il a divergé) est refusé et renvoyé à
+`replication/reintegrer.sh` (`pg_rewind`).
+
+La phase `primaire` lit le leader dans etcd. Si etcd est perdu, elle
+s'arrête : la sûreté contre un second primaire passe avant le retour. Dans ce
+cas, la décision est humaine. Vérifier à la main qu'aucun autre nœud ne sert
+(`pg_isready -h` sur chacun, `patronictl list` s'il répond), puis reprendre
+les gestes de la section manuelle ci-dessous.
+
+### Preuve côté client
+
+`verifier-clients.py` (venv ameesh, psycopg) fait ce que font les clients du
+mesh sur le DSN multi-hôtes : un écrivain avec un `NOTIFY` par ligne, et un
+écouteur qui se réabonne et balaie après chaque coupure, sans sondage. Le
+primaire est tué par la commande de l'exploitant (`--tuer`) ; le script ne
+touche aucun hôte. Il mesure le délai jusqu'au nouveau primaire (cible 60 s,
+exigence 300 s), la reprise de l'écouteur, les messages de la coupure remis
+par le balayage, et le RPO : chaque COMMIT confirmé doit se retrouver sur le
+nouveau primaire. Hors des hôtes locaux, `--geste-reel` est exigé. Une table
+`verif_bascule_<hex>` est créée puis supprimée.
+
+```bash
+~/.local/share/ameesh/venv/bin/python deploy/serveur/patroni/verifier-clients.py \
+  --dsn 'postgresql://ameesh@10.78.0.11,10.78.0.12,10.78.0.10:5432/ameesh?sslmode=require' \
+  --tuer 'ssh root@10.78.0.11 systemctl kill -s KILL patroni.service' \
+  --geste-reel --rapport "$TMPDIR/verif-6861.json"
+```
+
+Le split brain sous partition se prouve sur le banc (#6902, `exercer.py`) :
+un client seul ne le voit pas.
+
+### Plan du geste réel (lot bureau, après #6947)
+
+Root sur AG1, AG2 et manaty-mesh-1, staging (§14), fenêtre annoncée :
+
+1. Prérequis : #6947 fait (trois nœuds EP8.3 en flux) ; etcd 3.5.17 et
+   Patroni 4.1.5 installés (§ Prérequis) ; TLS et configurations générés et
+   copiés (§ Installation, étapes 1 et 2) ; sauvegarde pgBackRest du jour
+   vérifiée.
+2. `adopter.sh verifier` sur les trois nœuds, et sortie jointe au lot. Une
+   règle `pg_hba` perdue se tranche avant d'aller plus loin : ajout dans
+   `topologie.json` (lot) ou `--accepter-hba` (trace).
+3. `etcd` sur les trois, puis `primaire` sur ameesh-agents-1, puis `standby`
+   sur ameesh-agents-2, puis sur manaty-mesh-1, puis `grappe`.
+4. Clients : DSN multi-hôtes et `.pgpass` par hôte (EP8.5, #6862) ; sans eux,
+   le DSN mono-hôte actuel continue de fonctionner tant qu'il vise le
+   leader.
+5. Preuve : `verifier-clients.py` avec `--tuer` sur le leader (délai < 1 min,
+   RPO 0, balayage), puis retour de l'ancien primaire (`pg_rewind`,
+   `patronictl list`), puis `ameesh doctor`. Le rapport JSON va au lot.
+6. En cas d'échec, `retour-arriere.sh` dans l'ordre ci-dessus.
 
 ## Santé et alertes
 
@@ -367,6 +507,8 @@ puis `reinit` l'autre. Ne pas restaurer à l'aveugle.
 
 ### Retour arrière vers l'unité Debian
 
+Scripté par `retour-arriere.sh` (§ Adoption) ; le détail manuel :
+
 1. `systemctl disable --now patroni.service` sur les trois nœuds.
 2. Sur le nœud qui doit servir la base : restaurer la configuration Debian
    d'avant Patroni. Patroni a renommé `postgresql.conf` en
@@ -418,9 +560,10 @@ puis `reinit` l'autre. Ne pas restaurer à l'aveugle.
 
 ## Limites et suites
 
-- Ce lot **ne crée aucun rôle, aucune migration, aucun cluster** : il prépare
-  les fichiers et les tests. EP8.4 (#6861) fait le geste réel, l'intégration
-  et la preuve de bascule sur staging (§14).
+- #6870 **ne crée aucun rôle, aucune migration, aucun cluster** : il prépare
+  les fichiers et les tests. EP8.4 (#6861) ajoute l'adoption, le retour
+  arrière et la preuve côté client (§ Adoption). Le geste réel et la preuve
+  de bascule sur staging (§14) sont un lot bureau dédié, après #6947.
 - Les clients (DSN multi-hôtes, `target_session_attrs=read-write`,
   reconnexion psycopg, écouteur LISTEN/NOTIFY et balayage après bascule) sont
   EP8.4a (#6869), pas ce lot. Le DSN documenté dans l'étude §5 suppose les

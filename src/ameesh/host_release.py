@@ -336,7 +336,7 @@ def return_targets(control, listing, controls, *, known_hosts, holds):
     open_hosts = _open_hosts(controls, known_hosts, holds)
     out = []
     for row in listing or ():
-        if row.get("host") != host or row.get("releve") == "election":
+        if row.get("host") != host or row.get("releve") in ("election", "preference"):
             continue
         if row.get("mode") not in (None, "execute") or row.get("status") == "stopped":
             continue
