@@ -11,6 +11,9 @@
 -- Additive : la contrainte s'élargit, la colonne est nullable ; aucune ligne
 -- existante ne change de sens.
 
+-- 0473 admettait ('hote', 'election') : la nouvelle contrainte en est un
+-- sur-ensemble, aucune ligne existante n'est refusée.
+-- ameesh: constraint not tightened
 alter table agent_registry drop constraint if exists agent_registry_releve_valid;
 alter table agent_registry
     add constraint agent_registry_releve_valid
