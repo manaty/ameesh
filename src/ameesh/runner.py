@@ -2767,7 +2767,11 @@ class AgentWorker(threading.Thread):
             log_async("[%s] account ceiling check skipped (%s)"
                       % (self.name, " ".join(str(exc).split())[:160]))
             return None
-        if not ev.hard or ev.until is None or float(ev.until) <= now:
+        # #6961 (l242b) : `hard_all` — un plafond qui vaut aussi pour un agent
+        # critique. Le plafond implicite de 50 % d'un non-critique ne clôt pas
+        # le tour en vol et ne se publie pas en pause partagée : elle
+        # écarterait un critique autorisé au-delà (défaut l242b).
+        if not ev.hard_all or ev.until is None or float(ev.until) <= now:
             return None
         raison = "account hard cap: %s (%s)" % (profile.name, ev.reason)
         try:

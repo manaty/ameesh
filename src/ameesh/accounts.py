@@ -168,6 +168,10 @@ TYPES = ("config_dir", "api_key_env")
 #: L226b (owner decision 2026-10-07, "primaries last, capped"): defaults of the
 #: per-account settings `cap`, `overage_cap` and `priority`
 PRIMARY_CAP = 0.50          #: the harness's default account leaves half of each window to the owner
+#: L226b/#6961 : libellé du plafond implicite du compte par défaut, que L242b
+#: écarte pour un agent critique — il ne se partage donc jamais en pause de
+#: compte (`Evaluation.hard_all`).
+CAP_LABEL_PRIMARY = "primary cap"
 #: L242b (2): a non-critical agent stops this much below the pace cap, so that
 #: the critical agents keep the margin up to it
 RESERVE = 0.10
@@ -1131,6 +1135,12 @@ class Evaluation:
     #: L226b: held back by an absolute rule (in overage, past a fixed cap),
     #: not only by its pace: no budget setting lifts it
     hard: bool = False
+    #: #6961 (l242b) : le plafond fixe qui retient vaut AUSSI pour un agent
+    #: critique — plafond du compte (`cap`), d'overage, ou compte en overage.
+    #: Faux quand seul le plafond implicite de 50 % du compte par défaut
+    #: retient : L242b l'écarte pour un critique, et une pause partagée
+    #: publiée sur ce seul motif l'écarterait à tort.
+    hard_all: bool = False
     #: #3647 : {clé de jauge: perte prévue au reset} des fenêtres dont le
     #: rythme est relevé (`underused_floor`)
     raises: dict = field(default_factory=dict)
@@ -1518,7 +1528,7 @@ def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tupl
     if critical and profile.cap is None:
         cap = None
     if cap is not None:
-        fixed.append((cap, "primary cap" if profile.cap is None else "account cap"))
+        fixed.append((cap, CAP_LABEL_PRIMARY if profile.cap is None else "account cap"))
     if overage_capable(profile, getattr(gauges, "overage", None)):
         fixed.append((profile.overage_cap, "overage cap"))
     return fixed
@@ -1671,6 +1681,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # #313 : le refus d'un compte partagé avec un autre mesh est une règle
         # absolue — la garde de budget désactivée ne le lève pas
         result.hard = bool(getattr(profile, "refused", ""))
+        result.hard_all = result.hard
         return result
     from .codex_gauges import AmbiguousCodexGauges
     if _gauges is not None:
@@ -1682,6 +1693,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         except AmbiguousCodexGauges as exc:
             result.reason = str(exc)
             result.hard = True
+            result.hard_all = True
             return result
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
@@ -1690,6 +1702,9 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # L226b: an account in overage is never chosen (no spending beyond the plan)
         result.reason = "%s plan: in overage (billed beyond the plan)" % profile.harness
         result.hard = True
+        # #6961 : l'overage est un plafond du compte, il vaut aussi pour un
+        # agent critique (contrairement au plafond implicite de 50 %).
+        result.hard_all = True
         # eligible again once the windows that ran out have reset
         spent = result.gauges.spent()
         resets = [g.resets_at for g in spent if g.resets_at]
@@ -1722,6 +1737,10 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         fixed = fixed_caps(profile, result.gauges, critical=critical)
         hard = [(g, pair) for g in depasses for pair in fixed if g.used_at(now) >= pair[0]]
         result.hard = bool(hard)
+        # #6961 (l242b) : « primary cap » est le plafond implicite de 50 % du
+        # compte par défaut, que L242b écarte pour un agent critique. Seul un
+        # plafond qui vaut aussi pour lui (compte, overage) est partageable.
+        result.hard_all = any(label != CAP_LABEL_PRIMARY for _gauge, (_cap, label) in hard)
         # an absolute cap first in the reason: the pace may be lower, it is
         # not what holds the account
         gauge, (cap, label) = hard[0] if hard else (depasses[0],
@@ -2527,8 +2546,10 @@ def _pause_lifted_by(pause: dict | None, ev: Evaluation | None) -> bool:
     La comparaison porte sur `observed_at` (l'instant du relevé qui a fondé la
     pause), jamais sur l'heure d'insertion : un relevé ancien arrivé tard ne
     contredit pas une observation plus fraîche (#1132). Un relevé non daté ne
-    lève rien — la prudence garde la pause."""
-    if pause is None or ev is None or ev.hard:
+    lève rien — la prudence garde la pause. `hard_all` (#6961, l242b), jamais
+    `hard` : le plafond implicite de 50 % d'un non-critique ne maintient pas
+    une pause partagée que le critique a le droit de franchir."""
+    if pause is None or ev is None or ev.hard_all:
         return False
     observed = pause.get("observed_at")
     read_at = _read_at_of(ev.gauges)
@@ -3078,7 +3099,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             state = cache.get(profile.name)
             pause = pauses.get(profile.name)
             observed = _read_at_of(state.gauges) if state is not None else None
-            if state is not None and state.hard and state.until \
+            # #6961 (l242b) : `hard_all`, jamais `hard` — le plafond implicite
+            # de 50 % d'un non-critique ne se partage pas : une pause publiée
+            # dessus écarterait un agent critique autorisé au-delà (défaut
+            # trouvé par tests.test_l242b_critical_accounts).
+            if state is not None and state.hard_all and state.until \
                     and float(state.until) > now:
                 stamp = observed if observed is not None else now
                 if (pause is not None

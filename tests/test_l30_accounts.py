@@ -727,6 +727,20 @@ class PlafondTourTest(_Base):
         self.assertIsNone(worker.account_ceiling_due(now=now))
         self.assertEqual(storage.of(self.db).accounts.account_pauses("codex"), {})
 
+    def test_le_plafond_implicite_de_50_ne_clot_pas_ni_ne_se_partage(self):
+        """#6961 (l242b) : le plafond implicite de 50 % du compte par défaut
+        n'est pas le plafond dur du COMPTE — un agent critique peut le
+        franchir. Un tour ordinaire qui le dépasse ne se clôt donc pas et ne
+        publie aucune pause partagée (défaut trouvé par la CI du paquet h-09)."""
+        comptes = self._codex_comptes()
+        items = accounts.parse({"codex": comptes})["codex"]
+        now = time.time()
+        _codex_rollout(items[0].path, 60, now + 3600)
+        _runner, worker = self._worker("plafond-implicite", "codex", {"codex": comptes})
+        worker._account = items[0]
+        self.assertIsNone(worker.account_ceiling_due(now=now))
+        self.assertEqual(storage.of(self.db).accounts.account_pauses("codex"), {})
+
     def test_le_point_sur_clot_le_tour_au_plafond_du_compte(self):
         """#6961 : la vérification est branchée sur les points sûrs du tour —
         le premier point sûr après le franchissement clôt le harnais, l'appel
