@@ -14,7 +14,7 @@ from dataclasses import asdict
 
 from . import lot_class, merge_queue, packet_guard, storage
 from .train import TrainError
-from .train_admissions import Requirement
+from .train_admissions import hold_refusal, pilot_holds, refuse_held, requirement_of
 
 
 class Inventory:
@@ -24,7 +24,7 @@ class Inventory:
         target = merge_queue._remote_branch(project.target)
         if not target:
             raise TrainError("explicit candidate inventory target required")
-        self.ops, self.project = storage.of(db).work, project
+        self.db, self.ops, self.project = db, storage.of(db).work, project
         self.candidate, self.target = candidate, target
 
     def read(self):
@@ -58,6 +58,11 @@ class Inventory:
                 causes.append("release: " + release)
             candidates.append(dict(work_item_id=item["id"], branch=item.get("branch") or "",
                                    target=target, candidate=candidate, causes=causes))
+        # #6972 : le hold de pilote, par le lecteur de paquet-candidats (#3375).
+        holds = pilot_holds(self.db, [row["work_item_id"] for row in candidates])
+        for row in candidates:
+            if row["work_item_id"] in holds:
+                row["causes"].append(hold_refusal(holds[row["work_item_id"]]))
         return dict(schema="ameesh-train-candidates/1", project=self.project.name,
                     source=merge_queue.source_of(self.project.repo), target=self.target,
                     candidates=candidates)
@@ -95,6 +100,7 @@ class Preparation:
             raise TrainError("candidate no longer belongs to this QA branch, project or target")
         if lot_class.release_reason(item, target):
             raise TrainError("release lots cannot enter an automatic train")
+        refuse_held(self.history.db, item["id"])
         subject = dict(work_item_id=item["id"], branch=item["branch"], target=target,
                        source=self.repository.source, frozen_id=declared["id"],
                        frozen_sha=origin["sha"])
@@ -110,10 +116,8 @@ class Preparation:
             raise TrainError("candidate #%s branch=%s frozen=%s published=%s" % (
                 item["id"], item["branch"], origin["sha"], published or "missing"))
         subject["frozen_sha"] = head
-        requirement = self.policy(item, subject, base, self.history.path)
-        if not isinstance(requirement, Requirement):
-            raise TrainError("trusted policy returned no structured review requirement")
-        requirement.check(subject, base)
+        requirement = requirement_of(self.history.db, self.policy, item, subject,
+                                     base, self.history.path)
         historical = self.history.qualify_subject(
             subject, base, required=requirement.reviews, klass=requirement.klass())
         return dict(schema="ameesh-train-candidate-preparation/1", subject=subject,

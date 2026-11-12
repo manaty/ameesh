@@ -28,7 +28,8 @@ class InventoryTest(unittest.TestCase):
         self.result = dict(sha="a" * 40, origin="frozen", declared=self.marks[0],
                            verdict=None, notes=["no-verdict"], causes=[])
         self.reader = mock.Mock(return_value=self.result)
-        patch = mock.patch.object(storage, "of", return_value=types.SimpleNamespace(work=self.ops))
+        patch = mock.patch.object(storage, "of", return_value=types.SimpleNamespace(
+            work=self.ops, progress=types.SimpleNamespace(lot_hold_events=lambda ids, patterns: [])))
         patch.start()
         self.addCleanup(patch.stop)
         source = mock.patch.object(train_candidates.merge_queue, "source_of",

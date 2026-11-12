@@ -13,9 +13,10 @@ provider, runner hook or configuration is enabled by importing this module.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
-from . import land, lot_class, merge_queue, packet_guard, review, storage, work
+from . import (land, lot_class, merge_queue, packet_guard, review, review_floor,
+               storage, work)
 from .train import MemberDeferred, TrainError, identity
 from .train_review import SHA
 
@@ -67,14 +68,23 @@ class Requirement:
     project: str = ""
     train_reviews_paths: dict = field(default_factory=dict)
     train_reviews_wide: int = 0
+    #: #6972 : le plancher de pilote du lot (#3183), lu par `floored` avec le
+    #: lecteur de la classe (`review_floor.apply`) ; illisible vaut deux avis.
+    reviews_floor: int = 0
+    reviews_floor_unreadable: str = ""
 
     def klass(self) -> dict:
         """La classe et les chemins classés, lus par la porte des avis (#2681),
-        avec la lecture par chemin du canon (#3542)."""
-        return {"class": self.risk, "files": list(self.files),
-                "project": self.project,
-                "train_reviews_paths": dict(self.train_reviews_paths),
-                "train_reviews_wide": self.train_reviews_wide}
+        avec la lecture par chemin du canon (#3542) et le plancher (#3183)."""
+        klass = {"class": self.risk, "files": list(self.files),
+                 "project": self.project,
+                 "train_reviews_paths": dict(self.train_reviews_paths),
+                 "train_reviews_wide": self.train_reviews_wide}
+        if self.reviews_floor:
+            klass["reviews_floor"] = self.reviews_floor
+        if self.reviews_floor_unreadable:
+            klass["reviews_floor_unreadable"] = self.reviews_floor_unreadable
+        return klass
 
     def check(self, row, base):
         if (self.lot, self.base, self.head) != (row["work_item_id"], base, row["frozen_sha"]):
@@ -89,6 +99,10 @@ class Requirement:
                 or type(self.train_reviews_wide) is not int \
                 or self.train_reviews_wide not in (0, 1, 2):
             raise TrainError("malformed review path reading")
+        if type(self.reviews_floor) is not int \
+                or not 0 <= self.reviews_floor <= review_floor.MAX_FLOOR \
+                or not isinstance(self.reviews_floor_unreadable, str):
+            raise TrainError("malformed review floor reading")
         if type(self.reviews) is not int or self.risk not in _RISKS \
                 or self.reviews not in ({0, 1, 2} if self.risk == "light" else {1, 2}):
             raise TrainError("explicit known non-release review requirement expected")
@@ -100,6 +114,59 @@ class Requirement:
         if self.reviews < minimum:
             raise TrainError("review policy requires %d independent review(s) for the frozen "
                              "class, not %d" % (minimum, self.reviews))
+
+
+def floored(db, requirement):
+    """#6972 : le besoin relevé au plancher de pilote du lot (#3183).
+
+    Même lecture que la porte, la désignation et `paquet-candidats`
+    (`review_floor.apply` sur la classe) : le compte devient
+    `max(barème, plancher)`, jamais moins ; un journal illisible vaut deux
+    avis (`merge_queue.required_verdicts`)."""
+    klass = review_floor.apply({}, db, requirement.lot)
+    floor = int(klass.get("reviews_floor") or 0)
+    unreadable = str(klass.get("reviews_floor_unreadable") or "")
+    if not floor and not unreadable:
+        return requirement
+    raised = replace(requirement, reviews_floor=floor,
+                     reviews_floor_unreadable=unreadable)
+    return replace(raised, reviews=max(requirement.reviews,
+                                       merge_queue.required_verdicts(raised.klass())))
+
+
+def requirement_of(db, policy, item, row, base, path):
+    """Le besoin d'avis d'un sujet : politique versionnée, puis plancher."""
+    requirement = policy(item, row, base, path)
+    if not isinstance(requirement, Requirement):
+        raise TrainError("trusted policy returned no structured review requirement")
+    requirement = floored(db, requirement)
+    requirement.check(row, base)
+    return requirement
+
+
+def pilot_holds(db, ids) -> dict:
+    """#6972 : `{lot: hold}` des holds de pilote actifs, par le lecteur de
+    `paquet-candidats` (#3375, lecture stricte) ; illisible : refus."""
+    from . import packet_candidates   # import tardif : composeur lourd
+    try:
+        return packet_candidates._pilot_holds(db, ids)
+    except packet_candidates.CandidateError as exc:
+        raise TrainError(str(exc)) from exc
+
+
+def hold_refusal(hold) -> str:
+    """La cause `pilot-hold`, au texte de `paquet-candidats`."""
+    from . import packet_candidates
+    return "pilot-hold: hold pilote (par %s, depuis %s) : %s" % (
+        hold.get("by") or "auteur inconnu",
+        packet_candidates._hold_moment(hold.get("since")),
+        hold.get("note") or "motif non consigné")
+
+
+def refuse_held(db, lot):
+    hold = pilot_holds(db, [lot]).get(int(lot))
+    if hold:
+        raise TrainError(hold_refusal(hold))
 
 
 class Admissions:
@@ -149,10 +216,8 @@ class Admissions:
         item = self.ops.get(row["work_item_id"])
         if item is None:
             return None
-        requirement = self.policy(item, row, base, self.history.path)
-        if not isinstance(requirement, Requirement):
-            return None
-        requirement.check(row, base)
+        requirement = requirement_of(self.db, self.policy, item, row, base,
+                                     self.history.path)
         historical = self.history.qualify(
             row, base, required=requirement.reviews, klass=requirement.klass())
         value = ((historical or {}).get("reviews") or {}).get("admitted_ts")
@@ -248,10 +313,11 @@ class Admissions:
 
     def _member_proof(self, row, current, base, mode):
         item = self._current(row, current)
-        requirement = self.policy(item, row, base, self.history.path)
-        if not isinstance(requirement, Requirement):
-            raise TrainError("trusted policy returned no structured review requirement")
-        requirement.check(row, base)
+        # #6972 : les refus de `paquet-candidats` que la file ne porte pas.
+        # Pas dans `_current` : la quarantaine d'un lot retenu reste possible.
+        refuse_held(self.db, item["id"])
+        requirement = requirement_of(self.db, self.policy, item, row, base,
+                                     self.history.path)
         historical = self.history.qualify(row, base, required=requirement.reviews,
                                           klass=requirement.klass())
         proof = dict(admission=identity(row), policy=asdict(requirement), history=historical)
