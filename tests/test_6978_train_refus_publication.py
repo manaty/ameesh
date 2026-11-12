@@ -23,6 +23,7 @@ class PublicationRefusedTest(Base):
                              (self.ledger.key,))[0]["owner"]
 
     def test_deterministic_refusal_invalidates_and_releases_the_reservation(self):
+        self.repository.published.return_value = ""   # référence distante absente
         self.repository.publish.side_effect = train.PublicationRefused(
             "full-suite source differs from audited CI contract: .github/workflows/lot-plan.yml")
         outcome = self.engine.step(3600)
@@ -46,6 +47,38 @@ class PublicationRefusedTest(Base):
         # Une passe antérieure a pu pousser : un refus ensuite ne l'invalide pas.
         self.repository.publish.side_effect = train.PublicationRefused("source differs")
         self.assertEqual(self.engine.step(3601)["result"], "publication-uncertain")
+        self.assertEqual(self.ledger.load()["phase"], "publishing")
+        self.assertEqual(self.owner(), self.ledger.owner)
+
+
+    def test_a_crash_after_the_push_keeps_publishing_and_the_reservation(self):
+        # B cx2 #213473 : le push atomique a réussi, le processus meurt avant
+        # de sauver ci-intent ; le document reste publishing, sans marqueur.
+        remote = {"head": ""}
+
+        def push_then_die(plan, **_kwargs):
+            remote["head"] = plan["head"]
+            raise KeyboardInterrupt("process killed after the push")
+
+        self.repository.published.side_effect = lambda plan: remote["head"]
+        self.repository.publish.side_effect = push_then_die
+        with self.assertRaises(KeyboardInterrupt):
+            self.engine.step(3600)
+        state = self.ledger.load()
+        self.assertEqual(state["phase"], "publishing")
+        self.assertFalse(state.get("publication_uncertain"))
+        # Au redémarrage, le contrat audité a changé : refus déterministe, mais
+        # la référence du plan est publiée (sa CI peut courir) : rien n'est rendu.
+        self.repository.publish.side_effect = train.PublicationRefused("source differs")
+        outcome = self.engine.step(3601)
+        self.assertEqual(outcome["result"], "publication-uncertain", outcome)
+        self.assertEqual(self.ledger.load()["phase"], "publishing")
+        self.assertEqual(self.owner(), self.ledger.owner)
+
+    def test_an_unreadable_remote_proves_nothing(self):
+        self.repository.published.side_effect = train.TrainError("cannot read remote train")
+        self.repository.publish.side_effect = train.PublicationRefused("source differs")
+        self.assertEqual(self.engine.step(3600)["result"], "publication-uncertain")
         self.assertEqual(self.ledger.load()["phase"], "publishing")
         self.assertEqual(self.owner(), self.ledger.owner)
 

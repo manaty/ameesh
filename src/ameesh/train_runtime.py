@@ -207,6 +207,10 @@ class Runtime:
         self.repository.publish(plan, key=self.ledger.key, epoch=epoch,
                                 owner=self.ledger.owner, workflows=self.ci_adapter.workflows)
 
+    def published(self, plan):
+        """#6978 : la tête que nomme la référence distante du plan ("" : absente)."""
+        return self.repository.published(plan)
+
     def start_ci(self, plan):
         self.ci_adapter.start(plan)
 

@@ -359,6 +359,12 @@ class Repository:
         rows = resolutions._text(proc).split()
         return rows[0] if rows else ""
 
+    def published(self, plan):
+        """#6978 : la tête que nomme la référence immuable du plan sur le dépôt
+        distant, "" si elle est absente ; `TrainError` si elle est illisible."""
+        _branch, ref = self._validate(plan)
+        return self._read(land._origin(self.project) or self.project.repo, ref)
+
     def publish(self, plan, *, key, epoch, owner, workflows):
         # Publication itself triggers push workflows. Reject a known stale
         # contract locally, before even updating the remote lease reference.

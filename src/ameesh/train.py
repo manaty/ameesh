@@ -170,6 +170,7 @@ class Ports(Protocol):
                 sync: dict | None = None) -> dict: ...
     def validate_transports(self, plan: dict) -> list[dict]: ...
     def publish(self, plan: dict, epoch: int) -> None: ...
+    def published(self, plan: dict) -> str: ...
     def start_ci(self, plan: dict) -> None: ...
     def ci(self, plan: dict) -> dict: ...
     def authorize(self, plan: dict) -> dict: ...
@@ -391,10 +392,12 @@ class Engine:
                     return self._prevalidation_red(state, exc)
                 except PublicationRefused as exc:
                     # #6978 : refusé avant le bail distant, donc rien n'a été
-                    # poussé dans cette passe. Une passe antérieure incertaine
-                    # a pu pousser sous un autre contrat : elle garde son
-                    # chemin de réconciliation.
-                    if not state.get("publication_uncertain"):
+                    # poussé dans cette passe. Une passe antérieure a pu
+                    # pousser — réponse perdue (marqueur), ou mort du
+                    # processus entre le push et la sauvegarde suivante, sans
+                    # marqueur (B cx2 #213473) : la réservation n'est rendue
+                    # que si la référence distante du plan est lue absente.
+                    if not state.get("publication_uncertain") and self._unpublished(state):
                         return self._publication_refused(state, exc)
                     self.ports.notify(str(exc), state)
                     return {"result": "publication-uncertain", "error": str(exc)}
@@ -546,6 +549,23 @@ class Engine:
         self.ports.notify("plan abandoned at the pilot's request", saved)
         return {"result": "abandoned", "plan": saved["plan"], "abandoned": saved["abandoned"],
                 "state": saved}
+
+    def _unpublished(self, state):
+        """#6978 (B cx2 #213473) : la preuve qu'aucune passe n'a publié le plan.
+
+        Le push de publication est atomique (référence immuable du train et
+        bail ensemble) et c'est lui qui déclenche la CI : une référence lue
+        absente, sous notre bail, prouve qu'aucun effet distant n'a eu lieu,
+        quel que soit l'historique du document (marqueur absent, document
+        antérieur à ce déploiement). Lecture impossible ou référence présente :
+        rien n'est prouvé, le plan garde `publishing` et sa réservation."""
+        published = getattr(self.ports, "published", None)
+        if not callable(published):
+            return False
+        try:
+            return published(state["plan"]) == ""
+        except TrainError:
+            return False
 
     def _publication_refused(self, state, exc):
         """#6978 : termine un plan dont la publication est refusée à l'identique.
