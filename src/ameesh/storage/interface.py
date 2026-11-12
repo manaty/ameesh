@@ -5677,17 +5677,22 @@ class CiResults(Domain):
     @abc.abstractmethod
     def observe_queue(self, repo: str, *, oldest_id: int | None, oldest_at: str | None,
                       queued: int) -> None:
-        """Enregistre la file vue du dépôt : le plus vieux **job** `queued`
-        (`oldest_id` : identifiant GitHub du job ; `oldest_at` : son
-        `created_at`) et le nombre de jobs `queued` vus, toutes exécutions non
-        conclues. Un run peut être ancien (reprise) ou `in_progress` et porter
-        un job en file : la date du run ne date pas ses jobs. `queued=0` efface
-        le relevé précédent."""
+        """Enregistre la file **de capacité** vue du dépôt : le plus vieux
+        **job** `queued` qu'aucun runner libre ne peut prendre (`oldest_id` :
+        identifiant GitHub du job ; `oldest_at` : son `created_at`) et le
+        nombre de jobs dans ce cas, toutes exécutions non conclues. Un run
+        peut être ancien (reprise) ou `in_progress` et porter un job en file :
+        la date du run ne date pas ses jobs. #7015 : un job retenu par sa
+        propre exécution (matrice `max-parallel` au plafond, `needs`) pendant
+        qu'un runner libre porte ses labels n'est pas une attente de capacité
+        et n'est pas compté (`ci.Watcher`). `queued=0` efface le relevé
+        précédent."""
 
     @abc.abstractmethod
     def queued_oldest(self) -> list[dict]:
-        """Le dernier relevé de file par dépôt : `{repo, oldest_id, oldest_ts,
-        queued, seen_ts}` (les dépôts sans job `queued` ont `oldest_ts` NULL)."""
+        """Le dernier relevé de file de capacité par dépôt : `{repo,
+        oldest_id, oldest_ts, queued, seen_ts}` (les dépôts sans job en
+        attente de runner ont `oldest_ts` NULL)."""
 
     @abc.abstractmethod
     def prune_queue(self, repos: Sequence[str]) -> None:
