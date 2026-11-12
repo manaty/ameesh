@@ -298,6 +298,27 @@ def _commit_receipt(provider, db, sha: str, *, strict: bool) -> Optional[dict]:
     return fields
 
 
+def _revoked_receipt(provider, db, sha: str) -> bool:
+    """#6873 : la preuve de ce commit a-t-elle été révoquée ?
+
+    Une révocation n'est pas une absence ordinaire : sans ce contrôle, la
+    lecture retomberait sur l'identité Git du commit (auteur/committer d'agent)
+    ou sur une réémission au patch identique, et le reçu retiré continuerait
+    d'attribuer le commit. Elle reste une origine inconnue, comme l'exige le
+    geste de révocation."""
+    provider = provider or review_provenance
+    getter = getattr(provider, "revocation_for_commit", None)
+    if getter is None or db is None:
+        return False
+    try:
+        return bool(getter(db, sha))
+    except review_provenance.ProvenanceError:
+        raise
+    except Exception:  # noqa: BLE001 - le doute refuse : une lecture ratée
+        # ne rouvre jamais le repli sur l'identité Git (#6873, N de relecture).
+        return True
+
+
 def _milestone_receipt(provider, db, milestone_id: int, *, strict: bool) -> Optional[dict]:
     provider = provider or review_provenance
     error_type = getattr(provider, "ProvenanceError", review_provenance.ProvenanceError)
@@ -3745,6 +3766,11 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             record_unreadable(sha)
             continue
         if receipt is None:
+            if _revoked_receipt(provider, db, sha):
+                # #6873 : une preuve retirée est une origine inconnue — jamais
+                # remplacée par l'identité Git du commit.
+                record_unknown(sha)
+                continue
             if not _local_reads(repo, [sha], cache):
                 record_unknown(sha)
                 continue
@@ -5471,6 +5497,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             unknown.append(sha[:12])
             continue
         if receipt is None:
+            if _revoked_receipt(provider, db, sha):
+                # #6873 : le reçu a été retiré ; le commit reste sans auteur
+                # prouvé, même si son identité Git désigne un agent.
+                unknown.append(sha[:12])
+                continue
             rows, missing = _unreceived_authors(
                 db, item, repo, sha, author_name=author_name,
                 author_family=author_family, reviewers=reviewers,

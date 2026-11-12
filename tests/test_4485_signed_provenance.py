@@ -3,9 +3,8 @@
 
 Le bureau (canon §10) compose parfois des commits sur `bureau-goal`, où ameesh
 n'est pas installé : aucun PID local à faire vérifier par la liaison #3985. La
-preuve est alors une **attestation signée par une clé `owner`** (le
-propriétaire, ou le bureau qui détient sa délégation) : elle couvre le SHA
-complet, l'acteur, la session, le harnais, l'hôte et le lot. Le reçu porte
+preuve est alors une **attestation signée par une clé `owner`** : elle couvre le
+SHA complet, l'acteur, la session, le harnais, l'hôte et le lot. Le reçu porte
 `turn = "signed:<approbation>"` et la porte lit la famille comme pour un tour.
 
 Les témoins couvrent la preuve (clé owner, ou approbation pré-signée), les
@@ -18,13 +17,24 @@ HEAD : il a été créé sur un autre hôte.
 signé doit être un harnais déjà vu pour l'acteur (registre courant ou liaison
 passée). Le harnais courant divergent est écrit dans le meta de l'approbation
 et `provenance show` l'affiche.
+
+#6873 : la décision owner #164261 a (29/10, approval #170) dit que seule une
+signature faite par l'owner lui-même vaut provenance ; le bureau n'utilise pas
+la copie de sa clé pour ses propres commits. Le code ne distingue pas une copie
+privée utilisée sous le nom de l'owner d'une signature de l'owner : les témoins
+ci-dessous couvrent ce qui est **déclarable** — un détenteur agent, la même
+identité que l'acteur, une copie enregistrée sous un agent — et la révocation
+définitive d'un reçu (`provenance revoke`), qui rend le commit inconnu à la
+porte.
 """
 from __future__ import annotations
 
 import os
 import subprocess
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 from ameesh import authority, registry, review_authors, review_provenance as prov
 from ameesh import session_bindings as sb, signing, storage, work
@@ -116,6 +126,21 @@ class SignedProvenanceTest(PgTestCase):
     def unbind(self, *, session="s-bureau-old", harness="claude"):
         return sb.unbind(self.cfg, self.db, session_id=session, harness=harness,
                          by="human:test")
+
+    def delegated_copy(self, agent="bureau"):
+        """La même clé owner, enregistrée sur une fiche d'agent (#326 r2).
+
+        C'est la forme **déclarable** de la copie du bureau : le registre dit
+        que le détenteur est un agent, pas l'owner."""
+        return authority.register_key(self.db, agent, self.public, role="owner")
+
+    def revoke(self, sha, *, actor="human:test", reason="preuve auto-attestée"):
+        """Le geste sous l'autorité d'un humain à son terminal (L46), hors
+        session d'agent du banc : la révocation exige un correcteur ou l'owner."""
+        nobody = types.SimpleNamespace(name="", ok=False, source="none", reason="")
+        with mock.patch("ameesh.identity.resolve_binding", return_value=nobody), \
+                mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": ""}):
+            return prov.revoke_receipt(self.db, sha, actor=actor, reason=reason)
 
     def approval_meta(self, receipt):
         turn = str(receipt.get("turn") or "")
@@ -397,6 +422,125 @@ class SignedProvenanceTest(PgTestCase):
                 approval_id=int(built["id"]), cwd=self.repo)
         self.assertIn("revoked", str(raised.exception))
 
+    # -- #6873 : ni auto-attestation, ni copie déléguée ---------------------
+    def test_a_delegated_agent_key_cannot_attest_its_owner(self):
+        """La copie enregistrée sous l'agent est un détenteur agent : refus.
+
+        C'est la forme que le code peut voir : `--as bureau` avec la clé owner
+        posée sur la fiche `bureau`. Le même secret signe l'owner et son
+        délégataire, mais la déclaration « détenteur = agent » suffit à
+        refuser ; l'approbation n'est pas consommée."""
+        self.delegated_copy("bureau")
+        head = self.commit("auto-attesté")
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            self.sign(head, approver="bureau")
+        self.assertIn("agent key holder", str(raised.exception))
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+
+    def test_a_registered_copy_under_another_agent_blocks_the_owner_name(self):
+        """Une copie sous un AUTRE agent rend la signature ambiguë : refus.
+
+        Même quand l'approbation nomme `smichea` (le détenteur humain), une
+        clé identique détenue par `bureau-goal` ne permet pas de savoir qui a
+        signé. Tant que la copie existe, la provenance signée par cette clé est
+        refusée : la séparation demande une clé distincte (décision #164261)."""
+        registry.upsert(self.db, "bureau-goal", harness="codex",
+                        host=self.cfg.host, mode="externe")
+        self.delegated_copy("bureau-goal")
+        head = self.commit("copie enregistrée")
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            self.sign(head)
+        self.assertIn("also held by agent bureau-goal", str(raised.exception))
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+
+    def test_the_owner_in_person_still_signs_when_no_copy_is_registered(self):
+        """Témoin inverse : clé owner humaine, aucun agent ne la détient."""
+        head = self.commit("owner en personne")
+        row = self.sign(head)
+        self.assertTrue(row["recorded"])
+        self.assertEqual(prov.receipt_for_commit(self.db, head)["actor"], "bureau")
+        meta = storage.of(self.db).approvals.get(int(row["turn"].split(":", 1)[1]))
+        self.assertEqual((meta.get("meta") or {}).get("holder"), OWNER)
+
+    def test_a_revoked_receipt_is_final_and_unknown_to_the_gate(self):
+        """#6873 (b) : la révocation retire la preuve, sans la réécrire.
+
+        `receipt_for_commit` rend `None` (auteur inconnu pour la porte), la
+        lecture ne retombe pas sur l'identité Git, et ni une nouvelle clé ni
+        une approbation pré-signée ne ressuscitent le reçu."""
+        head = self.commit("à révoquer")
+        row = self.sign(head)
+        self.assertTrue(row["recorded"])
+        item = {"id": int(self.lot["id"]), "assignee": "bureau", "app": "ameesh"}
+        authors, unknown, _ = review_authors.reading(
+            self.db, item, None, [head], repo=self.repo, families=FAMILIES,
+            strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual(authors, [{"name": "bureau", "family": "claude"}])
+
+        revoked = self.revoke(
+            head, actor="human:auditeur",
+            reason="auto-attestation du délégataire (#6873)")
+        self.assertTrue(revoked["recorded"])
+        self.assertEqual(revoked["actor"], "human:auditeur")
+        self.assertEqual(revoked["sha"], head)
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+        self.assertEqual(prov.revocation_for_commit(self.db, head)["reason"],
+                         "auto-attestation du délégataire (#6873)")
+
+        authors, unknown, _ = review_authors.reading(
+            self.db, item, None, [head], repo=self.repo, families=FAMILIES,
+            strict=True)
+        self.assertEqual(authors, [])
+        self.assertEqual(unknown, [head[:12]])
+
+        # La preuve est toujours lisible pour l'audit, et la révocation ne se
+        # réécrit pas : la première raison fait foi.
+        again = self.revoke(head, actor="human:quelqu-un",
+                            reason="une autre raison")
+        self.assertFalse(again["recorded"])
+        self.assertEqual(again["actor"], "human:auditeur")
+        self.assertEqual(again["reason"],
+                         "auto-attestation du délégataire (#6873)")
+        raw = storage.of(self.db).provenance.get("commit:" + head)
+        self.assertEqual(raw["actor"], "bureau")
+
+        # Aucun chemin d'écriture ne ressuscite un reçu révoqué.
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            self.sign(head)
+        self.assertIn("revoked", str(raised.exception))
+        built = self.approval(head)
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            prov.record_signed_commit(
+                self.db, head, actor="bureau", session=SESSION,
+                harness="claude", host=HOST, families=FAMILIES,
+                lot=int(self.lot["id"]), approval_id=int(built["id"]),
+                cwd=self.repo)
+        self.assertIn("revoked", str(raised.exception))
+        self.assertIsNone(
+            storage.of(self.db).approvals.get(int(built["id"])).get("consumed_ts"))
+
+    def test_an_unreadable_revocation_read_refuses_instead_of_falling_back(self):
+        """N #6873 : une lecture de révocation en échec refuse, elle ne rouvre
+        pas le repli sur l'identité Git du commit."""
+        with mock.patch.object(prov, "revocation_for_commit",
+                               side_effect=RuntimeError("db down")):
+            self.assertTrue(review_authors._revoked_receipt(
+                None, object(), "a" * 40))
+
+    def test_a_revocation_requires_an_existing_commit_receipt(self):
+        head = self.commit()
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            self.revoke(head)
+        self.assertIn("no provenance receipt", str(raised.exception))
+        # Un reçu de jalon n'est pas un commit : le geste de commit ne le voit
+        # pas et ne le révoque pas (0566 ne révoque que `commit:<sha>`).
+        storage.of(self.db).provenance.add(
+            "milestone:999999", head, "bureau", SESSION, "t" * 32, "claude")
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            self.revoke(head)
+        self.assertIn("no provenance receipt", str(raised.exception))
+
     def test_an_approval_for_another_statement_is_refused(self):
         head = self.commit("autre")
         built = self.approval(head)
@@ -450,6 +594,8 @@ class SignedProvenanceCliTest(PgTestCase):
             "TRUNCATE provenance_receipts, mesh_approvals, mesh_consumed_nonces,"
             " session_bindings RESTART IDENTITY CASCADE")
         registry.upsert(self.db, "bureau", harness="claude", host=self.cfg.host,
+                        mode="externe")
+        registry.upsert(self.db, "auditeur", harness="claude", host=self.cfg.host,
                         mode="externe")
         self.lot = work.add(self.db, title="un lot signé du CLI", app="ameesh",
                             actor="orchestrateur")
@@ -568,6 +714,97 @@ class SignedProvenanceCliTest(PgTestCase):
             commit=self.head, actor="bureau", session=SESSION,
             harness="claude", host=HOST, lot=int(self.lot["id"]))
         self.assertEqual(data["digest"], expected)
+
+    # -- #6873 : le geste de révocation ------------------------------------
+    def test_the_cli_revokes_another_receipt_as_the_auditor(self):
+        import json
+        storage.of(self.db).provenance.add(
+            "commit:" + self.head, self.head, "bureau", SESSION,
+            "t" * 32, "claude")
+        sb.bind(self.cfg, self.db, "auditeur", session_id="s-revoke-cli",
+                harness="claude", pid=os.getpid(), by="human:test")
+        out = self.mesh(
+            "provenance", "revoke", "--commit", self.head,
+            "--reason", "auto-attestation du délégataire (#6873)",
+            env=self.env(AMEESH_ALERT_ORCHESTRATORS="auditeur"))
+        self.assertEqual(out.returncode, 0, out.stderr + out.stdout)
+        self.assertIn("provenance revoked", out.stdout)
+        self.assertIsNone(prov.receipt_for_commit(self.db, self.head))
+        revoked = prov.revocation_for_commit(self.db, self.head)
+        self.assertEqual(revoked["actor"], "auditeur")
+        self.assertEqual(revoked["reason"],
+                         "auto-attestation du délégataire (#6873)")
+        # `show` garde la ligne pour l'audit et dit qu'elle ne vaut plus.
+        shown = self.mesh("provenance", "show", "--commit", self.head, "--json")
+        self.assertEqual(shown.returncode, 0, shown.stderr + shown.stdout)
+        data = json.loads(shown.stdout)
+        self.assertTrue(data["revoked"])
+        self.assertEqual(data["revocation"]["actor"], "auditeur")
+        self.assertEqual(data["receipt"]["actor"], "bureau")
+        text = self.mesh("provenance", "show", "--commit", self.head)
+        self.assertEqual(text.returncode, 0, text.stderr + text.stdout)
+        self.assertIn("REVOKED", text.stdout)
+
+    def test_the_cli_refuses_a_bound_agent_without_corrector_authority(self):
+        """B #6873 : un agent lié sans rapport avec le reçu ne peut pas le
+        retirer ; le refus précède toute écriture."""
+        storage.of(self.db).provenance.add(
+            "commit:" + self.head, self.head, "mty-amh-impl-07", SESSION,
+            "t" * 32, "deepseek")
+        sb.bind(self.cfg, self.db, "bureau", session_id="s-revoke-third",
+                harness="claude", pid=os.getpid(), by="human:test")
+        out = self.mesh("provenance", "revoke", "--commit", self.head,
+                        "--reason", "x")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("provenance revoke refused", out.stderr)
+        self.assertIn("neither a human", out.stderr)
+        self.assertIsNotNone(prov.receipt_for_commit(self.db, self.head))
+        self.assertIsNone(prov.revocation_for_commit(self.db, self.head))
+
+    def test_the_cli_refuses_a_bound_agent_claiming_the_owner_name(self):
+        storage.of(self.db).provenance.add(
+            "commit:" + self.head, self.head, "bureau", SESSION,
+            "t" * 32, "claude")
+        sb.bind(self.cfg, self.db, "bureau", session_id="s-revoke-owner",
+                harness="claude", pid=os.getpid(), by="human:test")
+        out = self.mesh(
+            "provenance", "revoke", "--commit", self.head, "--reason", "x",
+            "--actor", "human:smichea",
+            env=self.env(AMEESH_ALERT_ORCHESTRATORS="bureau"))
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("does not act on behalf of", out.stderr)
+        self.assertIsNone(prov.revocation_for_commit(self.db, self.head))
+
+    def test_the_cli_accepts_the_owner_at_a_human_terminal(self):
+        storage.of(self.db).provenance.add(
+            "commit:" + self.head, self.head, "bureau", SESSION,
+            "t" * 32, "claude")
+        out = self.mesh(
+            "provenance", "revoke", "--commit", self.head, "--reason", "x",
+            "--actor", "human:smichea")
+        self.assertEqual(out.returncode, 0, out.stderr + out.stdout)
+        revoked = prov.revocation_for_commit(self.db, self.head)
+        self.assertEqual(revoked["actor"], "human:smichea")
+
+    def test_the_cli_revoke_refuses_an_unbound_agent_name(self):
+        storage.of(self.db).provenance.add(
+            "commit:" + self.head, self.head, "bureau", SESSION,
+            "t" * 32, "claude")
+        out = self.mesh(
+            "provenance", "revoke", "--commit", self.head, "--reason", "x",
+            env=self.env(AGENT_MAIL_NAME="bureau"))
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("bound session identity", out.stderr)
+        self.assertIsNotNone(prov.receipt_for_commit(self.db, self.head))
+
+    def test_the_cli_revoke_refuses_an_unknown_commit(self):
+        sb.bind(self.cfg, self.db, "auditeur", session_id="s-revoke-unknown",
+                harness="claude", pid=os.getpid(), by="human:test")
+        out = self.mesh(
+            "provenance", "revoke", "--commit", self.head, "--reason", "x",
+            env=self.env(AMEESH_ALERT_ORCHESTRATORS="auditeur"))
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("no provenance receipt", out.stderr)
 
 
 if __name__ == "__main__":
