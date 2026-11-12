@@ -14,6 +14,7 @@ identité, paiement et prod réelle gardent leurs deux avis avant fusion.
 """
 from __future__ import annotations
 
+import contextlib
 import types
 import unittest
 from unittest import mock
@@ -23,6 +24,7 @@ from ameesh import (debit, lot_class, mechanics, merge_queue, packet_reviews,
                     storage, work)
 
 from .test_4779_reviewer_profile import agent_row
+from .test_1104_review_lot_hors_file import _Witness
 from .test_l539_review_lot import FakeOps
 
 HEAD = "a" * 40
@@ -610,6 +612,63 @@ class AfterMergeTest(unittest.TestCase):
         self.assertIn("pas de lot de relecture", out["why"])
 
 
+class RequiredFamilyTest(unittest.TestCase):
+    """La prise d'une mission de repli suit la famille que la marque nomme.
+
+    B1 de `ameesh-cx2` (mail #213516) : `required_family` recalculait toujours
+    l'opposée de l'auteur et ignorait `families` de la marque ; la mission de
+    la famille en pause n'était donc prise par personne, et la famille opposée
+    la prenait pour se la voir refuser à la clôture par `guard_delivery`.
+    """
+
+    LOT = AfterMergeTest.LOT
+    ITEM = {"id": 9, "issue_ref": review_lot.ref_of(AfterMergeTest.LOT)}
+
+    def call(self, mark, families_of_canon=FAMILIES):
+        with mock.patch.object(review_lot, "compiled_families",
+                               return_value=families_of_canon), \
+                mock.patch.object(work, "get",
+                                  return_value={"id": self.LOT, "assignee": "a1"}), \
+                mock.patch.object(review_lot, "requirement_of",
+                                  return_value=mark), \
+                mock.patch.object(review_lot, "_author_at_freeze",
+                                  return_value={"name": "a1", "harness": "deepseek"}):
+            required = review_lot.required_family(None, self.ITEM)
+            taken = {agent: review_lot.may_take(
+                None, self.ITEM, {"name": agent, "harness": agent})
+                for agent in families_of_canon}
+        return required, taken
+
+    def test_the_mark_names_the_paused_family(self):
+        required, taken = self.call({"families": ["codex"]})
+        self.assertEqual(required, "codex")
+        self.assertTrue(taken["codex"], taken)
+        self.assertFalse(taken["claude"], taken)
+        self.assertFalse(taken["deepseek"], taken)
+
+    def test_without_families_the_opposite_of_the_author_is_due(self):
+        required, taken = self.call(None)
+        self.assertEqual(required, "codex")        # opposée de deepseek
+        self.assertTrue(taken["codex"], taken)
+        self.assertFalse(taken["claude"], taken)
+
+    def test_several_named_families_are_not_guessed(self):
+        required, taken = self.call({"families": ["codex", "claude"]})
+        self.assertEqual(required, "")
+        self.assertFalse(any(taken.values()), taken)
+
+    def test_an_unreadable_mark_is_an_unknown_family(self):
+        with mock.patch.object(review_lot, "compiled_families",
+                               return_value=FAMILIES), \
+                mock.patch.object(work, "get",
+                                  return_value={"id": self.LOT, "assignee": "a1"}), \
+                mock.patch.object(review_lot, "requirement_of",
+                                  side_effect=work.WorkError("marque illisible")):
+            self.assertEqual(review_lot.required_family(None, self.ITEM), "")
+            self.assertFalse(review_lot.may_take(
+                None, self.ITEM, {"name": "cx1", "harness": "codex"}))
+
+
 class GuardDeliveryTest(unittest.TestCase):
     """La garde de clôture n'accepte que l'avis de la famille désignée."""
 
@@ -651,6 +710,83 @@ class GuardDeliveryTest(unittest.TestCase):
         with self.assertRaises(work.WorkError) as caught:
             self.guard([("cx1", "blocked")])
         self.assertIn("bloquant", str(caught.exception))
+
+
+class OpenForMergeFallbackTest(unittest.TestCase):
+    """`open_for_merge` rend le repli trouvé même si la création a échoué.
+
+    B2 de `ameesh-cx2` (mail #213516) : `open_after_merge` avait trouvé le
+    repli puis échoué à écrire la mission ; `open_for_merge` ne remontait pas
+    `fallback`, et le rattrapage closait le candidat comme une classe non
+    légère ordinaire — la relecture due était perdue au lieu d'être réessayée.
+    """
+
+    LOT = AfterMergeTest.LOT
+
+    def test_the_due_fallback_survives_a_failed_creation(self):
+        item = {"id": self.LOT, "title": "un lot de porte", "app": "ameesh",
+                "assignee": "a1", "state": "merged", "branch_target": "main",
+                "type": "evolution"}
+        ops = FakeOps({self.LOT: item})
+        store = mock.Mock(work=ops)
+        opened = {"class": "sensitive", "merged_class": "sensitive",
+                  "fallback": {"family": "codex", "resume_ts": T + 30 * H,
+                               "accounts": ["primary"]},
+                  "why": "lot de relecture non ouvert : WorkError: refusé"}
+        with mock.patch.object(storage, "of", return_value=store), \
+                mock.patch.object(work, "get", return_value=item), \
+                mock.patch.object(review_lot, "class_at_merge",
+                                  return_value={"class": "sensitive",
+                                                "why": "policy of ameesh"}), \
+                mock.patch.object(review_lot, "open_after_merge",
+                                  return_value=opened):
+            out = review_lot.open_for_merge(None, self.LOT, merged_sha=HEAD)
+        self.assertFalse(out["created"])
+        self.assertEqual(out["fallback"]["family"], "codex", out)
+        self.assertIn("non ouvert", out["why"])
+
+
+class CatchUpFallbackRetryTest(_Witness):
+    """Le rattrapage réessaie la mission de repli, il ne la clôt pas.
+
+    B2 de `ameesh-cx2` (mail #213516) : échec de création puis réussite à la
+    passe suivante, pour un lot non léger admis par le repli d'une famille en
+    pause — la mission de cette famille reste due après fusion (#213032 a).
+    """
+
+    def fallback(self):
+        return {"family": "codex", "resume_ts": T + 30 * H,
+                "accounts": ["primary"]}
+
+    def run_pass(self, *, broken=False):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                review_lot, "class_at_merge",
+                return_value={"class": "sensitive", "why": "policy of ameesh"}))
+            stack.enter_context(mock.patch.object(
+                review_lot, "_fallback_on_merge", return_value=self.fallback()))
+            if broken:
+                stack.enter_context(mock.patch.object(
+                    review_lot.work, "add", side_effect=work.WorkError("refusé")))
+            return review_lot.catch_up(self.db, retry_s=0)
+
+    def test_a_failed_fallback_creation_is_retried_not_closed(self):
+        lot = self.merged_lot("repli non ouvert")
+        first = self.run_pass(broken=True)
+        self.assertEqual((first["examined"], first["missing"], first["attempted"],
+                          first["terminal"]), (1, 1, 1, 0), first)
+        self.assertEqual(self.review_lots(lot), [])
+        second = self.run_pass()
+        self.assertEqual((second["examined"], second["opened"]), (1, 1), second)
+        (mission,) = self.review_lots(lot)
+        self.assertEqual(mission["issue_ref"], review_lot.ref_of(lot))
+        body = work.get(self.db, mission["id"])["body"]
+        self.assertIn("Repli #6990", body)
+        self.assertIn("famille **codex**", body)
+        mark = review_lot.requirement_of(
+            self.db, {"issue_ref": review_lot.ref_of(lot)})
+        self.assertEqual(mark["families"], ["codex"])
+        self.assertEqual(mark["required"], 1)
 
 
 if __name__ == "__main__":

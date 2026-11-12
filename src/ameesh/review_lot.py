@@ -629,6 +629,29 @@ def review_ref(item: dict) -> str:
     return ""
 
 
+def _designated_family(db, item: dict) -> Optional[str]:
+    """La famille due que la marque de mission nomme, ou `None` (#6990).
+
+    `None` quand la mission ne restreint pas la famille (marque d'un lot léger
+    ordinaire, sans `families`) : la prise retombe sur la famille opposée à
+    l'auteur. Une chaîne vide quand la marque nomme plusieurs familles ou une
+    valeur illisible : la prise ne devine pas une famille unique. Une marque
+    illisible lève (comme `guard_delivery`), l'appelant la traduit en famille
+    inconnue — non pris, plutôt qu'une famille supposée.
+    """
+    mark = requirement_of(db, item)
+    if not isinstance(mark, dict):
+        return None
+    named = mark.get("families")
+    if not named:
+        return None
+    names = sorted({str(family).strip().lower() for family in named
+                    if str(family).strip()})
+    if len(names) != 1:
+        return ""
+    return names[0]
+
+
 def _required_family(db, item: dict, families) -> Optional[str]:
     """`required_family` avec les familles du canon déjà lues."""
     ref = review_ref(item)
@@ -639,6 +662,13 @@ def _required_family(db, item: dict, families) -> Optional[str]:
         source = work.get(db, lot)
         if source is None:
             return ""
+        # #6990 : un repli de famille en pause nomme la famille due dans la
+        # marque de mission ; la relire ici est la même preuve que celle que
+        # `guard_delivery` exigera pour clore, sinon la prise donnerait la
+        # mission à la famille opposée et refuserait ensuite son avis.
+        designated = _designated_family(db, item)
+        if designated is not None:
+            return designated
         family = reviewer_family(_author_at_freeze(db, lot, source).get("harness"),
                                  families)
     except Exception:  # noqa: BLE001 - lecture impossible : famille inconnue
@@ -1060,13 +1090,15 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     """Ouvre le lot de relecture du lot léger `lot`, s'il n'existe pas déjà.
 
     Rend `{lot, id, created, class, merged_class, critical, reviews,
-    already_reviewed, reviewed_by, why}` — ne lève jamais. `klass` est la
-    classe lue sur le diff fusionné ; seule `light` ouvre un lot de relecture,
-    un doute ou une classe supérieure n'ouvre rien (le canon §2 ne demande une
-    relecture après fusion que pour les lots légers). Une classe `light` dont
-    le diff touche pourtant un chemin critique (porte de fusion, SQL, sécurité,
-    prod : `CRITICAL_SCOPE`) ouvre une relecture **sensible**, avec **deux**
-    avis de familles distinctes (#2374) : le classement du canon ne peut pas
+    already_reviewed, reviewed_by, fallback, why}` — ne lève jamais. `klass`
+    est la classe lue sur le diff fusionné ; seule `light` ouvre un lot de
+    relecture, un doute ou une classe supérieure n'ouvre rien (le canon §2 ne
+    demande une relecture après fusion que pour les lots légers), sauf le repli
+    d'une famille en pause (#6990) dont `fallback` porte la preuve. Une classe
+    `light` dont le diff touche pourtant un chemin critique (porte de fusion,
+    SQL, sécurité, prod : `CRITICAL_SCOPE`) ouvre une relecture **sensible**,
+    avec **deux** avis de familles distinctes (#2374) : le classement du canon
+    ne peut pas
     dispenser la sécurité d'une seconde lecture quand il a omis le chemin.
 
     #2585 : si assez d'avis `ok` d'une autre famille couvrent déjà la tête
@@ -1630,7 +1662,8 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
     lot = int(lot)
     out = {"lot": lot, "id": None, "created": False, "class": "",
            "merged_class": "", "critical": False, "reviews": 0,
-           "already_reviewed": False, "reviewed_by": [], "why": ""}
+           "already_reviewed": False, "reviewed_by": [], "fallback": None,
+           "why": ""}
     try:
         item = work.get(db, lot)
         if item is None:
@@ -1672,6 +1705,7 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
                     "reviews": int(opened.get("reviews") or 0),
                     "already_reviewed": bool(opened.get("already_reviewed")),
                     "reviewed_by": list(opened.get("reviewed_by") or []),
+                    "fallback": opened.get("fallback"),
                     "why": opened.get("why") or ""})
         return out
     except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
@@ -1814,6 +1848,9 @@ def catch_up(db, *, repo: str = "", target: str = "",
     seule lecture, aucune tentative horaire perpétuelle. Un candidat **douteux**
     (classe non confirmée) est réessayé au plus `max_attempts` fois, espacées de
     `retry_s`, puis marqué terminal à son tour — le journal garde la trace.
+    #6990 : un candidat non léger admis par le repli d'une famille en pause fait
+    exception — la mission de cette famille reste due après fusion et se
+    réessaie comme celle d'un léger tant que sa création échoue.
 
     #2585 : un candidat dont la tête est déjà relue par une autre famille
     n'ouvre rien ; il reçoit la marque terminale (`reviewed`) au lieu d'être
@@ -2003,12 +2040,19 @@ def catch_up(db, *, repo: str = "", target: str = "",
                 out["already"] += 1
                 continue
             merged_class = str(done.get("merged_class") or done.get("class") or "")
-            if not done.get("doubt") and merged_class and merged_class != lot_class.LIGHT:
+            if (not done.get("doubt") and merged_class
+                    and merged_class != lot_class.LIGHT
+                    and not done.get("fallback")):
                 # classe confirmée non-light : le canon §2 ne demande une
                 # relecture après fusion que pour un lot léger — terminal.
                 # On lit la classe du diff fusionné, pas celle du lot de
                 # relecture : un light critique a bien une relecture due (deux
                 # avis) et doit rester réessayable (#2374).
+                # #6990 : sauf repli d'une famille en pause — la mission de
+                # cette famille reste due après fusion (décision owner #213032
+                # a) même si sa création a échoué. `open_for_merge` rend le
+                # repli trouvé, donc ce candidat se réessaie comme un léger au
+                # lieu d'être clos à tort.
                 out["terminal"] += 1
                 close_terminal(lot, state, "classe %s confirmée non-light"
                                % merged_class)
