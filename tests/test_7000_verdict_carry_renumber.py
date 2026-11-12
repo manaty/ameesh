@@ -161,6 +161,13 @@ class RenumberingTest(unittest.TestCase):
         _put(self.root, "supabase/migrations/753_admission.sql", "SELECT 753; -- 783\n")
         self.refused(self.references(), "753_admission.sql differs outside")
 
+    def test_a_migration_of_the_target_is_not_the_lot_s(self):
+        # B1 qa-01 #213399 : la tête relue n'a jamais touché ce fichier.
+        _git(self.root, "merge", "-q", "--no-edit", "main")
+        _git(self.root, "mv", "supabase/migrations/784_other_lot.sql",
+             "supabase/migrations/783_other_lot.sql")
+        self.refused(_commit(self.root, "steal"), "_other_lot.sql differs outside")
+
     def test_a_product_change_hidden_in_the_history_is_refused(self):
         _put(self.root, "secret.txt", "s\n")
         _commit(self.root, "secret")
@@ -178,6 +185,21 @@ class RenumberingTest(unittest.TestCase):
             "supabase/migrations", frozenset({783}), ()))
         self.assertIsNone(verdict_carry.renumbering_of(
             None, {"id": 1, "migration": None, "migration_repo": "manaty/nexlink"}, self.root))
+
+
+class CompanionsWithoutGithubTest(unittest.TestCase):
+    """B2 qa-01 #213399 : `github` est facultatif, le dépôt se lit sur `origin`."""
+
+    def test_companions_follow_the_origin(self):
+        repo = Repo()
+        self.addCleanup(repo.cleanup)
+        _git(repo.root, "remote", "add", "origin", "git@github.com:manaty/nexlink.git")
+        cfg = type("Cfg", (), {"radar": {"projects": {"nexlink": {
+            "repo": repo.root, "migrations": "supabase/migrations",
+            "migrations_companions": ["supabase/rollback"]}}}})()
+        row = {"id": 6953, "migration": 783, "migration_repo": "manaty/nexlink"}
+        self.assertEqual(verdict_carry.renumbering_of(cfg, row, repo.root).companions,
+                         ("supabase/rollback",))
 
 
 class SettingsTest(unittest.TestCase):

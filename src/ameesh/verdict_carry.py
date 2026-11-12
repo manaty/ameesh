@@ -55,7 +55,9 @@ auteur juge donc la nouvelle tête, redésigné normalement.
 réservations, l'auteur renomme sa migration 784 en 783 et retouche les renvois
 au numéro. C'est une troisième adaptation, à ces seules conditions : des couples
 suppression/ajout d'un même répertoire dont le nom ne change que par son préfixe
-numérique, dont au moins un sous le répertoire de migrations déclaré du dépôt
+numérique, l'ancien chemin ajouté ou modifié par la tête relue (une migration
+de la cible n'est pas au lot), dont au moins un sous le répertoire de migrations
+déclaré du dépôt
 (`migrations.layout_for`) ; chaque nouveau numéro **réservé par le lot**
 (`ameesh work migration`, L122) ; le nouveau contenu égal octet pour octet à
 l'ancien, l'ancien numéro remplacé par le nouveau en jeton entier
@@ -118,7 +120,7 @@ import re
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Optional
 
 from . import merge_queue, plan_git, storage, work
@@ -708,6 +710,11 @@ class Renumbering:
     directory: str
     reserved: frozenset
     companions: tuple = ()
+    #: les chemins que la tête relue ajoute ou modifie depuis sa base avec la
+    #: cible (`adapted` les fixe) : seuls ceux-là se renumérotent — une migration
+    #: de la cible, jamais relue, n'est pas au lot (B1 qa-01 #213399). None :
+    #: aucun chemin prouvé, aucune renumérotation
+    owned: frozenset | None = None
 
     def zone(self, path: str) -> str:
         """`migration`, `companion`, `test` ou "" : où vit `path`."""
@@ -741,7 +748,8 @@ def renumbering_of(cfg, row: Mapping, repo: str) -> Renumbering | None:
     companions: tuple = ()
     try:
         for project in radar.settings_of(cfg).projects.values():
-            if migrations.repo_key(project.github) == slug:
+            # B2 qa-01 #213399 : `github` est facultatif, déduit de l'origine
+            if migrations.repo_key(radar.github_slug(project) or "") == slug:
                 companions = tuple(project.migrations_companions)
     except Exception:  # noqa: BLE001 - réglages illisibles : aucun compagnon
         companions = ()
@@ -796,9 +804,9 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
     retouché) **égal octet pour octet** à l'ancien, numéros remplacés en jetons
     entiers (`_substitute`). Un test renommé suit la règle des tests (adaptable)."""
     out = {"mapping": {}, "paths": set(), "why": ""}
-    if renumber is None:
+    if renumber is None or renumber.owned is None:
         return out
-    pairs = _renamed_pairs(changes, renumber)
+    pairs = [pair for pair in _renamed_pairs(changes, renumber) if pair[0] in renumber.owned]
     mapping: dict = {}
     for _old, _new, number, renamed, zone in pairs:
         if zone != "migration":
@@ -825,7 +833,8 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
                 return out
         paths.update((old, new))
     for path, status in sorted(changes.items()):
-        if status == "M" and path not in paths and renumber.zone(path) == "companion":
+        if (status == "M" and path not in paths and path in renumber.owned
+                and renumber.zone(path) == "companion"):
             old_blob, new_blob = before(path), after(path)
             if old_blob is None or new_blob is None or _substitute(old_blob, mapping) != new_blob:
                 out["why"] = "%s is changed beyond the renumbering" % path
@@ -988,11 +997,11 @@ def _renumber_commit(repo: str, parent: str, commit: str, fields: Mapping,
         return (before is not None and after is not None
                 and _substitute(before, mapping) == _substitute(after, mapping))
 
+    renamed_to = set(mapping.values())
     pairs = {}
     for old, new, number, renamed, zone in _renamed_pairs(fields, renumber):
-        if mapping.get(number) == renamed:
+        if mapping.get(number) == renamed and old in (renumber.owned or ()):
             pairs[old] = pairs[new] = (old, new, zone)
-    renamed_to = set(mapping.values())
     for path, status in fields.items():
         zone = renumber.zone(path)
         if path in pairs:
@@ -1003,8 +1012,8 @@ def _renumber_commit(repo: str, parent: str, commit: str, fields: Mapping,
         if status in ("M", "A") and zone == "test":
             continue
         match = _NUMBERED.match(os.path.basename(path))
-        if status == "M" and (zone == "companion" or (
-                zone == "migration" and match and match.group(1) in renamed_to)):
+        if status == "M" and zone in ("migration", "companion") and (
+                path in (renumber.owned or ()) or (match and match.group(1) in renamed_to)):
             if not same(path, path):
                 return False
             continue
@@ -1032,6 +1041,12 @@ def adapted(repo: str, reviewed: str, frozen: str, tip: str, *,
         return False, "complete Git history required; shallow clone refused"
     if _same(reviewed, frozen):
         return False, "same head"
+    if renumber is not None:
+        base = plan_git._out(repo, "merge-base", reviewed, tip)
+        own = _name_status(repo, base, reviewed) if base else None
+        renumber = replace(renumber, owned=frozenset(
+            path for path, status in (own or {}).items() if status in ("A", "M"))
+            if own is not None else None)
     merge = _merge_adaptation(repo, tip, reviewed, head=frozen, renumber=renumber)
     if not merge["ok"]:
         return False, merge["why"]
