@@ -12,7 +12,7 @@ import sys
 import unittest
 from unittest import mock
 
-from ameesh import cli, registry
+from ameesh import cli, registry, session_bindings
 
 from .support import REPO, PgTestCase
 
@@ -289,6 +289,12 @@ class CliCompatTest(PgTestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout.strip(), "delivered to alpha")
 
+        # #7149 : `inbox NAME` d'un agent `execute` n'est lu que par sa session
+        # liée ; on lie ce processus APRÈS l'envoi (fait sous le nom beta) pour
+        # garder le test de compat v0.
+        session_bindings.bind(self.cfg, self.db, "alpha", session_id="compat-7149",
+                              harness="claude", pid=os.getpid(), by="alpha", force=True)
+        self.addCleanup(self.db.execute, "DELETE FROM session_bindings")
         proc = self.cli("inbox", "alpha")
         self.assertEqual(proc.stdout.strip(), "from beta: bonjour alpha")
 

@@ -176,6 +176,9 @@ class AgentAliasTest(PgTestCase):
             self.assertEqual(binding.name, 'worker')
 
     def test_mail_aliases_share_inbox_and_thread(self):
+        # #7149 : la boîte d'un agent `execute` n'est lisible que par sa
+        # session liée ; ce test porte sur les alias, pas sur cette garde.
+        registry.set_mode(self.db, 'worker', 'externe')
         message = mail.send(self.db, 'old-worker', 'reviewer', 'Report from the worker')
         self.assertEqual(mail.get(self.db, message)['sender'], 'worker')
         message = mail.send(self.db, 'reviewer', 'old-worker', 'A useful review report')

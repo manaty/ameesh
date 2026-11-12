@@ -915,6 +915,27 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
                   file=sys.stderr)
             return 1
         name = binding.name
+    if bk.kind == "pg":
+        # #7149 : la boîte d'un agent mené par l'exécuteur n'est lue que par
+        # la session liée à ce nom. Un AGENT_MAIL_NAME hérité, ou un nom passé
+        # en argument, ne suffisent pas : l'incident a montré un lecteur qui
+        # traitait le courrier de claude2 comme le sien. Les personas externes
+        # (sans exécuteur) restent lisibles pour le diagnostic et l'export.
+        caller = identity.resolve_binding(cfg, bk.db)
+        if caller.name == name and not caller.ok:
+            print("unbound identity: %s" % (caller.reason or "ambiguous"),
+                  file=sys.stderr)
+            return 1
+        own = (caller.ok and caller.name == name
+               and caller.source in ("session", "runner"))
+        if not own:
+            row = registry.get(bk.db, name) or {}
+            if (row.get("mode") or "") == "execute" and not row.get("retired_ts"):
+                print("box of %s: driven by its executor (mode execute); only "
+                      "its bound session reads it — its runner delivers its "
+                      "mail. A received message is read with `ameesh mail show "
+                      "<id>`." % name, file=sys.stderr)
+                return 1
     if bk.kind != "pg":
         from .agent_names import resolve
         name = resolve(name, cfg=cfg, operation="mail.inbox")
@@ -967,6 +988,16 @@ def cmd_show(bk, cfg: Config, rest: list[str]) -> int:
         print("unbound identity: %s" % (binding.reason or "AGENT_MAIL_NAME not set"),
               file=sys.stderr)
         return 1
+    if binding.source == "explicit":
+        # #7149 : même garde que `inbox` — un AGENT_MAIL_NAME hérité ne lit
+        # pas le courrier d'un agent mené par l'exécuteur. Seule sa session
+        # liée (source session/runner) le lit.
+        agent_row = registry.get(bk.db, binding.name) or {}
+        if (agent_row.get("mode") or "") == "execute" and not agent_row.get("retired_ts"):
+            print("message #%d: %s is driven by its executor (mode execute); "
+                  "only its bound session reads its mail"
+                  % (message_id, binding.name), file=sys.stderr)
+            return 1
     row = mail.get_received(bk.db, message_id, binding.name)
     if row is None:
         print("no message #%d addressed to %s: only its recipient (or a copy) "

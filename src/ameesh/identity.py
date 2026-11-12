@@ -151,6 +151,23 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
         return Binding(name=canonical, source="runner", runner_id=runner_id, epoch=epoch,
                        ok=ok, reason=reason, projects=_projects_of(row))
     name = resolve(name, db=db, cfg=cfg, operation="identity.binding")
+    if db is not None:
+        # #7149 : un AGENT_MAIL_NAME hérité (pont local, shell, session
+        # reprise) ne prend pas l'identité d'une session DÉJÀ liée à un autre
+        # nom. L'incident a montré un lecteur qui se croyait claude2 et
+        # répondait à son courrier ; la liaison de #4485 est lue sans repasser
+        # par AGENT_MAIL_NAME. Une simple identité annoncée, sans liaison,
+        # garde le comportement v0.
+        try:
+            bound = _session_binding(cfg, db, harness, session_id)
+        except Exception:
+            bound = Binding(reason=_UNBOUND)
+        if bound.name and bound.name != name:
+            return Binding(
+                name=name, source="explicit",
+                reason="ambiguous identity: AGENT_MAIL_NAME is %s but this "
+                       "session is bound to %s; unset AGENT_MAIL_NAME or "
+                       "rebind (ameesh mail bind)" % (name, bound.name))
     return Binding(name=name, source="explicit", ok=True)
 
 
