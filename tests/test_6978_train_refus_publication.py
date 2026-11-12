@@ -39,6 +39,8 @@ class PublicationRefusedTest(Base):
         self.repository.publish.assert_called_once()
 
     def test_a_true_uncertainty_keeps_publishing_and_the_reservation(self):
+        # Push perdu : la référence du plan est publiée à distance.
+        self.repository.published.side_effect = lambda plan: plan["head"]
         self.repository.publish.side_effect = train.TrainError("atomic train publication refused")
         self.assertEqual(self.engine.step(3600)["result"], "publication-uncertain")
         state = self.ledger.load()
@@ -50,6 +52,22 @@ class PublicationRefusedTest(Base):
         self.assertEqual(self.ledger.load()["phase"], "publishing")
         self.assertEqual(self.owner(), self.ledger.owner)
 
+    def test_a_pre_effect_error_marker_does_not_hold_an_unpublished_plan(self):
+        # B qa-01 #39438 : une erreur avant tout push (prévalidation) pose le
+        # marqueur ; la référence distante lue absente prouve l'absence de
+        # publication, le refus déterministe suivant invalide et rend le bail.
+        self.repository.published.return_value = ""
+        self.runtime = self.runtime_for(prevalidation=mock.Mock(
+            side_effect=train.TrainError("prevalidation refused (api): transient")))
+        self.engine = self.engine_for(self.runtime)
+        self.assertEqual(self.engine.step(3600)["result"], "publication-uncertain")
+        self.assertTrue(self.ledger.load()["publication_uncertain"])
+        self.runtime.prevalidation = None
+        self.repository.publish.side_effect = train.PublicationRefused("source differs")
+        outcome = self.engine.step(3601)
+        self.assertEqual(outcome["result"], "invalidated", outcome)
+        self.assertEqual(self.ledger.load()["phase"], "invalidated")
+        self.assertIsNone(self.owner())
 
     def test_a_crash_after_the_push_keeps_publishing_and_the_reservation(self):
         # B cx2 #213473 : le push atomique a réussi, le processus meurt avant

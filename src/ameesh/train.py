@@ -397,7 +397,10 @@ class Engine:
                     # processus entre le push et la sauvegarde suivante, sans
                     # marqueur (B cx2 #213473) : la réservation n'est rendue
                     # que si la référence distante du plan est lue absente.
-                    if not state.get("publication_uncertain") and self._unpublished(state):
+                    # Le marqueur reste un diagnostic, pas la décision : une
+                    # erreur pré-effet (prévalidation, bail) le pose aussi
+                    # (B qa-01 #39438).
+                    if self._unpublished(state):
                         return self._publication_refused(state, exc)
                     self.ports.notify(str(exc), state)
                     return {"result": "publication-uncertain", "error": str(exc)}
