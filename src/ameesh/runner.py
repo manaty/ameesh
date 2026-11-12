@@ -13695,8 +13695,8 @@ class Runner:
         """#7106 : les agents réclamables que CET exécuteur peut prendre sur un
         hôte partagé (`tenancy.admits`) ; hôte non partagé : inchangé. Une
         politique illisible ne filtre pas : la garde reste la base."""
-        if not candidates:
-            return candidates
+        if not candidates or getattr(self, "mediated", False):
+            return candidates  # un appareil médié n'est jamais un hôte partagé
         from . import tenancy
         try:
             policy = tenancy.host_policy(self.db, self.host)

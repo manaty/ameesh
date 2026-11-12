@@ -420,6 +420,18 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'
     ]),
+    -- #7106 (0575): shared multi-tenant host: canon policy, tenant binding
+    -- (system user, UID, runner id) and runner heartbeat; state, no secret.
+    ('host_tenancy', ARRAY[
+        'host', 'canon', 'shared', 'tenants', 'canon_ref', 'synced_at'
+    ]),
+    ('host_tenants', ARRAY[
+        'host', 'tenant', 'unix_user', 'uid', 'runner_id', 'registered_by',
+        'registered_at'
+    ]),
+    ('runner_presence', ARRAY[
+        'host', 'tenant', 'runner_id', 'uid', 'version', 'seen_at'
+    ]),
     -- #4148 : one journal line per acknowledged adapter transition; `detail`
     -- (command output) is a content.
     ('host_lifecycle_transitions', ARRAY[
