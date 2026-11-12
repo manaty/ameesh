@@ -43,7 +43,9 @@ class Fixture:
         self.bundle=base.bundle; self.operation=base.operation
         self.stage=self.root/('var/lib/ameesh-release-bootstrap/'+self.operation)
         self.root.joinpath('var/lib/ameesh-release-bootstrap').chmod(0o700)
-        self.question=bootstrap.question(self.operation,self.bundle,expires_at=2000000000)
+        # #7013: a prepared window ends within one fresh signature.
+        self.expires=int(time.time())+600
+        self.question=bootstrap.question(self.operation,self.bundle,expires_at=self.expires)
         self.stage_bundle(self.bundle,self.question)
         self.enrollment=dict(version=1,host=self.bundle['host'],machine_id=self.bundle['machine_id'],
                              code_sha256='e'*64)
@@ -196,7 +198,7 @@ class BackendTest(Fixture,unittest.TestCase):
         self.assertEqual(backend_mod.parse(['revoke-question','op-1','--expires','2000000000']),
                          ('revoke-question','op-1',2000000000))
         with self.assertRaises(backend_mod.BackendError): backend_mod.parse(['revoke-question','op-1','--decision','7'])
-        question=self.backend.revoke_question(self.operation,2000000000)['question']
+        question=self.backend.revoke_question(self.operation,self.expires)['question']
         self.assertTrue(question.startswith(bootstrap.REVOKE_PREFIX))
         self.assertIn(bootstrap.scopes(self.operation,self.bundle)['revoke'],question)
         with mock.patch.object(backend_mod.os,'geteuid',return_value=1001), \
@@ -205,7 +207,7 @@ class BackendTest(Fixture,unittest.TestCase):
 
     def test_prepare_observes_the_inventory_itself_and_never_rerenders(self):
         for name in ('bundle.json','question.txt'): (self.stage/name).unlink()
-        value=dict(plan=self.bundle['plan'],account_ids=dict(uid=987,gid=987),expires_at=2000000000)
+        value=dict(plan=self.bundle['plan'],account_ids=dict(uid=987,gid=987),expires_at=self.expires)
         path=self.stage/'plan.json'; path.write_text(json.dumps(value)); path.chmod(0o600)
         inventory=self.backend.inventory(self.operation)
         self.assertTrue(all(item is None for item in inventory['files'].values()))
@@ -252,13 +254,14 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
             question=question,options=['%s=%s'%(item['key'],item['label']) for item in options],
             needs_signature=True)
 
-    def sign(self,view=None,text='install',signed=True):
+    def sign(self,view=None,text='install',signed=True,ttl=None):
         view=view or self.view
         if signed:
             option=decisions.match_option(view,text)
             digest=decisions.answer_digest(view,text,option,'human:fixture-owner')
             authority.create_approval(self.db,self.seed,approver='fixture-owner',action=decisions.APPROVAL_ACTION,
-                artifact_kind=decisions.APPROVAL_KIND,artifact_hash=digest,ttl=(self.now+900)-time.time())
+                artifact_kind=decisions.APPROVAL_KIND,artifact_hash=digest,
+                ttl=(self.now+900)-time.time() if ttl is None else ttl)
         decisions.answer(self.cfg,self.db,view['id'],text,human='human:fixture-owner',channel='cli',signed=signed)
 
     def signed(self,clock=None,view=None,revoke=False):
@@ -299,6 +302,44 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
         self.assertTrue(self.backend.plan(self.operation,self.view['id'],authority=self.signed())['authorized'])
         self.assertEqual(self.backend.install(self.operation,self.view['id'],authority=self.signed())['outcome'],
                          'installed')
+
+    def test_7013_window_no_fresh_signature_covers_is_refused_at_preparation(self):
+        # #6583: a question prepared up to the artifact expiry (+2 days) spent
+        # an owner signature that `_proof_live` could only refuse at execution.
+        far=int(self.now)+2*86400
+        for name in ('bundle.json','question.txt'): (self.stage/name).unlink()
+        plan=self.stage/'plan.json'
+        plan.write_text(json.dumps(dict(plan=self.bundle['plan'],account_ids=dict(uid=987,gid=987),
+                                        expires_at=far))); plan.chmod(0o600)
+        with self.assertRaisesRegex(backend_mod.BackendError,'at most'):
+            self.backend.prepare(self.operation)
+        self.assertFalse((self.stage/'question.txt').exists())
+        self.assertFalse((self.stage/'bundle.json').exists())
+        # A window ending within one fresh signature is prepared, with its deadline.
+        near=int(self.now)+50*60
+        plan.write_text(json.dumps(dict(plan=self.bundle['plan'],account_ids=dict(uid=987,gid=987),
+                                        expires_at=near))); plan.chmod(0o600)
+        prepared=self.backend.prepare(self.operation)
+        self.assertEqual(prepared['deadline'],'sign, then the gesture runs before %s'
+                         % time.strftime('%H:%MZ on %Y-%m-%d',time.gmtime(near)))
+        with self.assertRaisesRegex(backend_mod.BackendError,'at most'):
+            self.backend.revoke_question(self.operation,far)
+        self.assertIn('deadline',self.backend.revoke_question(self.operation,near))
+        # The `decide --key` signature made right away covers that window.
+        view=self.ask(prepared['question'],bootstrap.OPTIONS)
+        self.sign(view,ttl=decisions.SIGN_TTL_S)
+        self.assertTrue(self.backend.plan(self.operation,view['id'],authority=self.signed(view=view))['authorized'])
+
+    def test_7013_execution_still_refuses_an_uncovered_window(self):
+        # No change to `_proof_live`: a window prepared around the guard is
+        # still refused when the fresh signature dies before it ends.
+        text=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+2*3600)
+        self.stage_bundle(self.bundle,text)
+        view=self.ask(text,bootstrap.OPTIONS)
+        self.sign(view,ttl=decisions.SIGN_TTL_S)
+        self.assertFalse(self.backend.plan(self.operation,view['id'],authority=self.signed(view=view))['authorized'])
+        self.assertFalse(self.signed(view=view).validate(self.operation,
+            bootstrap.scopes(self.operation,self.bundle)['preflight'],'preflight'))
 
     def test_bureau_mention_installs_then_revokes_through_the_backend(self):
         # #4788: the canonical signer keeps its fixed mention; the backend must

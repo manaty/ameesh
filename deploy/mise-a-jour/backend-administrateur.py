@@ -45,6 +45,12 @@ commands then prepare and execute the separately signed bundle of the
 `installateur-canaux.py`), which publishes no tree and requires the release
 bootstrap already installed. Its rollback is again its own signed decision.
 
+Every signed window (`expires_at` of `plan.json` or `replacement.json`,
+`--expires T`) must end within one fresh `decide --key` signature
+(`SIGN_TTL_S` less a skew margin): a longer one is refused when its question
+is prepared, with the largest accepted value, and the output's `deadline`
+tells the owner when the gesture must run (#7013).
+
 Every effect gesture is appended to a private hash-chained journal
 (`gestes.jsonl`): code digest, bundle digest, step, intent, receipt digest or
 a fixed failure category, never a document body, secret or provider text.
@@ -87,6 +93,15 @@ delegation=bootstrap.delegation
 protocol=bootstrap.protocol
 runtime=installer.runtime
 files_mod=installer.file_mod
+
+
+def signable(expires_at):
+    """Refuse a window no fresh owner signature covers (#7013); its deadline."""
+    try:
+        return bootstrap.signed.signable(expires_at)
+    except ValueError as error:
+        raise BackendError(str(error)) from None
+
 
 STAGE='/var/lib/ameesh-release-bootstrap'
 #: Operation names never start with a dot: no stage can collide with this.
@@ -316,6 +331,7 @@ class Backend:
 
     def prepare(self,operation):
         stage,value=self.staged(operation)
+        deadline=signable(value['expires_at'])
         observed=self.inventory(operation)['files']
         if value.get('delegation')=='canaux':
             # No staged tree: the channels run the installed release trees.
@@ -349,7 +365,8 @@ class Backend:
         self.gestes.append(command='prepare',operation=operation,phase='prepared',
                            bundle_digest=prepared.bundle['digest'],
                            question_sha256=hashlib.sha256(prepared.question.encode()).hexdigest())
-        return dict(operation=operation,bundle_digest=prepared.bundle['digest'],question=prepared.question)
+        return dict(operation=operation,bundle_digest=prepared.bundle['digest'],question=prepared.question,
+                    deadline=deadline)
 
     @staticmethod
     def write(path,text):
@@ -615,12 +632,13 @@ class Backend:
         return result
 
     def revoke_question(self,operation,expires_at):
+        deadline=signable(expires_at)
         bundle=self.prepared(operation).bundle; kind=kind_of(bundle)
         question=kind.revoke_question(operation,bundle,expires_at=expires_at)
         if len(question.encode())>entry.MAX_QUESTION:
             raise BackendError('revoke question exceeds the signed limit')
         return dict(operation=operation,bundle_digest=bundle['digest'],question=question,
-                    options=kind.revoke_options)
+                    options=kind.revoke_options,deadline=deadline)
 
     def continuation_question(self,operation,previous,decision):
         continuation=module('continuation-bootstrap')

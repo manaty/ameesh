@@ -72,6 +72,14 @@ def _text(prefix,value):
     return text
 
 
+def signable(expires_at):
+    """Refuse a window no fresh owner signature covers (#7013); its deadline."""
+    try:
+        return bootstrap.signed.signable(expires_at)
+    except ValueError as error:
+        raise ReplacementError(str(error)) from None
+
+
 def question(operation,bundle, *, expires_at):
     if type(expires_at) is not int or expires_at<=0:
         raise ReplacementError('signed replacement deadline required')
@@ -190,6 +198,7 @@ class Replacement:
                     or value['held_operation']==self.operation))):
             raise ReplacementError('exact staged replacement required')
         self.check_held(value['held_operation'])
+        deadline=signable(value['expires_at'])
         host_key=backend.host_key()
         if not isinstance(host_key,str) or re.fullmatch('[0-9a-f]{64}',host_key) is None:
             raise ReplacementError('pinned host key required')
@@ -226,7 +235,8 @@ class Replacement:
         backend.gestes.append(command='replacement-prepare',operation=self.operation,phase='prepared',
                               bundle_digest=bundle['digest'],
                               question_sha256=hashlib.sha256(rendered.encode()).hexdigest())
-        return dict(operation=self.operation,bundle_digest=bundle['digest'],question=rendered,options=OPTIONS)
+        return dict(operation=self.operation,bundle_digest=bundle['digest'],question=rendered,options=OPTIONS,
+                    deadline=deadline)
 
     def prepared(self,*,same_code=True):
         try:
@@ -246,9 +256,10 @@ class Replacement:
         return bundle,text
 
     def rollback_text(self,expires_at):
+        deadline=signable(expires_at)
         bundle,_=self.prepared()
         return dict(operation=self.operation,question=rollback_question(self.operation,bundle,expires_at=expires_at),
-                    options=ROLLBACK_OPTIONS)
+                    options=ROLLBACK_OPTIONS,deadline=deadline)
 
     # ---- observation
     def digest(self,path):

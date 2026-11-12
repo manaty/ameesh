@@ -267,7 +267,8 @@ class Fixture:
         self.bundle=json.loads((self.stage/'bundle.json').read_text())
 
     def stage_plan(self,**extra):
-        value=dict(delegation='canaux',plan=self.plan,account_ids=IDS,expires_at=2000000000,**extra)
+        # #7013: a prepared window ends within one fresh signature.
+        value=dict(delegation='canaux',plan=self.plan,account_ids=IDS,expires_at=int(time.time())+600,**extra)
         path=self.stage/'plan.json'; path.unlink(missing_ok=True)
         path.write_text(json.dumps(value)); path.chmod(0o600)
 
@@ -390,7 +391,7 @@ class BackendChannelTest(Fixture,unittest.TestCase):
         self.assertEqual(set(self.system.accounts),{'ameesh-handoff','ameesh-secrets'})
         for logical in delegation.DIRECTORIES: self.assertTrue(self.path(logical).is_dir(),logical)
         self.assertEqual(self.system.reloads,2)
-        question=self.backend.revoke_question(self.operation,2000000000)
+        question=self.backend.revoke_question(self.operation,int(time.time())+600)
         self.assertTrue(question['question'].startswith(channels.REVOKE_PREFIX))
         self.assertEqual(question['options'],channels.REVOKE_OPTIONS)
 

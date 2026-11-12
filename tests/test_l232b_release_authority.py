@@ -16,6 +16,20 @@ release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
 
 
+class SignableWindowTest(unittest.TestCase):
+    """#7013: a window no fresh `decide --key` signature covers is refused."""
+
+    def test_bound_is_one_fresh_signature_less_the_margin(self):
+        now = 1_800_000_000
+        latest = now + int(decisions.SIGN_TTL_S) - release.SIGN_MARGIN_S
+        self.assertEqual(release.signable(latest, now=now), 'sign, then the gesture runs before %s'
+                         % time.strftime('%H:%MZ on %Y-%m-%d', time.gmtime(latest)))
+        self.assertIn('runs before', release.signable(now + 50*60, now=now))
+        for value in (latest + 1, now + 2*86400, float(now + 60), None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'at most %d ' % latest):
+                release.signable(value, now=now)
+
+
 class ReleaseAuthorityTest(PgTestCase):
     @classmethod
     def setUpClass(cls):

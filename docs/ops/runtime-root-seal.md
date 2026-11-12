@@ -156,7 +156,11 @@ Ordre sur l'hôte :
    écriture de groupe ; stage 0700). Il y écrit `replacement.json`, root 0600 :
    `{"version":1,"sha":"…","expires_at":EPOCH,"held_operation":"OLD"}`.
    `held_operation` nomme le bootstrap retenu à `validate` (`null` s'il n'y en a
-   aucun) ; sa réservation et son journal ne sont pas modifiés.
+   aucun) ; sa réservation et son journal ne sont pas modifiés. `expires_at`
+   tombe dans l'heure d'une signature fraîche : au plus maintenant + 3600 s
+   (`SIGN_TTL_S`) − 300 s, sinon `replacement-prepare` refuse en donnant la
+   valeur maximale (#7013) ; une fenêtre plus longue ne pourrait être couverte
+   par aucune signature `decide --key`.
 4. Préparer, avec `S=/var/lib/ameesh-release-bootstrap/OP` et `DIR2` un
    répertoire neuf, privé (0700), créé par l'utilisateur qui lance `ameesh
    decide ask` et la vérification :
@@ -174,8 +178,12 @@ Ordre sur l'hôte :
    question=$(cat "$DIR2/replacement-question.txt")
    ameesh decide ask --lot L --needs-signature --question "$question" \
      --option replace="Replace this exact sealed runtime" \
-     --option leave="Leave this host unchanged"
+     --option leave="Leave this host unchanged" \
+     --why "DEADLINE"
    ```
+   `DEADLINE` est le champ `deadline` rendu par `replacement-prepare`
+   (« sign, then the gesture runs before HH:MMZ on AAAA-MM-JJ ») : il dit à
+   l'owner l'échéance exacte de son geste.
    La question affiche `next.sha`,
    `next.runtime`, `next.lib` et `code_sha256`.
    Avant de signer, recalculer ces valeurs sans passer par le stage, hors root,
@@ -207,8 +215,8 @@ Ordre sur l'hôte :
    achevé, signé et non annulé nomme OLD ; la référence signée le cite. Garder le
    stage `OP` jusqu'à la fin de la continuation : elle y relit bundle et question.
 
-Retour arrière : `replacement-rollback-question OP --expires T`, décision signée
-propre, socket arrêté, puis `replacement-rollback OP --decision N` depuis le même
+Retour arrière : `replacement-rollback-question OP --expires T` (même borne
+d'une heure, même champ `deadline`), décision signée propre, socket arrêté, puis `replacement-rollback OP --decision N` depuis le même
 stage. Les arbres neufs restent sous `replaced-runtime` et `replaced-lib` ; un
 remplacement annulé ne reprend pas : préparer une nouvelle opération.
 
