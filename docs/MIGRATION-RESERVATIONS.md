@@ -141,7 +141,16 @@ number and active named slots is refused; use the named slot API instead.
 Packet candidates adding numbered SQL migrations must hold an active reservation
 on that repository and target. A missing reservation produces a
 `migration-collision` cause; an unreadable registry is a candidate read error.
-Modifying an existing historical migration does not require a new reservation.
+A candidate also leaves the ready list with a `migration-gap` cause when one of
+its added numbers is not in the contiguous run that begins just above the target
+head: a number reserved but not merged would leave a hole, and the later file
+would land below the ledger's top and never be applied. A number at or below the
+target head is refused for the same reason (`case: behind`). The run is computed
+over the ready candidates of the package, which travel together because they
+share one ordered schema history; a candidate removed for another cause no
+longer fills its slot, so the check is repeated. The author renumbers and
+freezes again; the composer never renumbers. Modifying an existing historical
+migration does not require a new reservation.
 
 The named allocator takes a repository advisory lock (unknown legacy targets
 span branches), then the target lock, then affected lot rows in id order.

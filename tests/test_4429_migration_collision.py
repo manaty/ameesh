@@ -224,6 +224,23 @@ class MigrationCollisionTest(unittest.TestCase):
         self.assertIn(4352, payload["ready"])
         self.assertEqual(self.registry.asked, [])
 
+    def test_7007_a_gap_above_the_target_head_is_excluded(self):
+        # #7007 : la cible s'arrête à 0505, aucun lot prêt n'apporte 0506 ;
+        # 0507 laisserait un trou que la migration 0506, réservée mais non
+        # fusionnée, ne comblerait qu'après coup (jamais appliquée).
+        self.rows[:] = [row for row in self.rows if row["id"] not in (4351, 4352)]
+        self.reservations = {4174: [505], 4400: [507]}
+        payload = self.inventory()
+        entry = self.by_id(payload)[4400]
+        self.assertNotIn(4400, payload["ready"])
+        (cause,) = [c for c in entry["causes"] if c["code"] == "migration-gap"]
+        self.assertEqual((cause["case"], cause["number"], cause["missing"]),
+                         ("gap", 507, 506))
+        self.assertIn(4401, payload["ready"])
+        text = candidates_script.render(payload)
+        self.assertIn("migration-gap: migration %s/0507_fine.sql: number 507 "
+                      "leaves a gap after main (505), missing 506" % MIG, text)
+
     def test_reason_in_text_and_json(self):
         payload = self.inventory()
         text = candidates_script.render(payload)

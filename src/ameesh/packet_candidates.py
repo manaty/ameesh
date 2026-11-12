@@ -62,6 +62,17 @@ regeler). Un projet sans `migrations` déclaré n'est pas lu. La couverture
 par une réservation active du lot (#4430, `_check_migration_coverage`) passe
 avant : un lot non couvert ne départage personne.
 
+#7007 : au-dessus de la tête de la cible (`package_base`), les numéros ajoutés
+doivent former une suite **contiguë**. Un numéro réservé mais non fusionné
+laisse un trou : la migration qui arrive plus tard atterrit sous le sommet du
+registre et `migrate` la signale « gap » sans l'appliquer. Un numéro sous la
+tête (fichier historique jamais atterri) a le même défaut. Le candidat est
+écarté `migration-gap` (cas « gap », avec le premier numéro manquant ; cas
+« behind » sous la tête), sans lancer la CI. Le calcul porte sur l'union des
+lots encore prêts d'un paquet — `packet_parallel` réunit tous les porteurs de
+migration — et un candidat écarté ne comble plus un trou : la reprise va
+jusqu'au point fixe. Aucune renumérotation ici non plus : geste d'auteur.
+
 Un lot dont la préparation n'a pas pu être lue (branche, cible, classe, porte)
 n'est ni prêt ni écarté : il porte `error` et il est nommé dans `errors` et
 `errors_by_lot`. L'appelant peut alors composer les autres lots, mais il doit
@@ -304,8 +315,9 @@ def _exclude(entry: dict, cause: dict) -> None:
 def _migration_collisions(db, candidates: list[dict], *, where: str,
                           package_base: str, directory: str, slug: str,
                           target_branch: str) -> None:
-    """#4429 : écarte les lots prêts dont une migration ajoutée entre en
-    collision (numéro sur la base du paquet, ou partagé entre lots prêts).
+    """#4429, #7007 : écarte les lots prêts dont une migration ajoutée entre en
+    collision (numéro sur la base du paquet, ou partagé entre lots prêts) ou
+    laisse un trou au-dessus de la tête de la cible.
 
     Lecture seule. Une lecture Git impossible met le lot en `error` (à
     écarter explicitement, #3813) ; un registre illisible pour départager
@@ -387,6 +399,45 @@ def _migration_collisions(db, candidates: list[dict], *, where: str,
                 number=number, paths=added[entry["work_item"]][number],
                 case="candidates", with_lot=keeper["work_item"],
                 with_paths=added[keeper["work_item"]][number]))
+    # #7007 : au-dessus de la tête, la suite doit être contiguë. Un numéro
+    # sous la tête ne serait jamais appliqué (« gap » puis `record` à la main).
+    # L'union porte sur les lots **encore** prêts : un candidat écarté ne
+    # comble plus un trou, d'où la reprise jusqu'au point fixe.
+    head = max(on_target, default=0)
+    entries = {entry["work_item"]: entry for entry in ready}
+    remaining = {lot: mine for lot, mine in added.items()
+                 if entries[lot]["ready"]}
+    while remaining:
+        occupied = {number for mine in remaining.values() for number in mine}
+        missing = head + 1
+        while missing in occupied:
+            missing += 1
+        doomed: set[int] = set()
+        for lot in sorted(remaining):
+            entry = entries[lot]
+            for number, paths in sorted(remaining[lot].items()):
+                if number <= head:
+                    _exclude(entry, _cause(
+                        "migration-gap",
+                        "migration %s: number %d is at or below %s (%d): renumber "
+                        "above the target head, reserve, freeze again"
+                        % (", ".join(paths), number, target_branch, head),
+                        number=number, paths=paths, case="behind",
+                        target_head=head))
+                    doomed.add(lot)
+                elif number >= missing:
+                    _exclude(entry, _cause(
+                        "migration-gap",
+                        "migration %s: number %d leaves a gap after %s (%d), "
+                        "missing %d: renumber, reserve, freeze again"
+                        % (", ".join(paths), number, target_branch, head, missing),
+                        number=number, paths=paths, case="gap",
+                        missing=missing, target_head=head))
+                    doomed.add(lot)
+        if not doomed:
+            break
+        for lot in doomed:
+            remaining.pop(lot, None)
 
 
 def _ancestor(repo: str, tip: str, base: str) -> bool:
