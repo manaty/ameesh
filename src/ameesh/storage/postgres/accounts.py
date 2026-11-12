@@ -353,7 +353,17 @@ class Accounts(interface.Accounts):
             (harness, account, float(until_ts), float(observed_at),
              reason or "", source or ""))
 
-    def release_account_pause(self, harness, account) -> None:
-        self.db.execute(
-            "delete from account_pauses where harness = %s and account = %s",
-            (harness, account))
+    def release_account_pause(self, harness, account, observed_at) -> bool:
+        """#6961 (B codex) : compare et supprime dans la même instruction.
+
+        `observed_at` est l'observation de la pause que la décision a lue.
+        Une publication concurrente plus récente (observed_at supérieur) est
+        conservée : sans cette garde, deux agents pouvaient lire une pause
+        ancienne, l'un publiait un plafond dur plus récent, l'autre le
+        supprimait sans condition et la relecture finale, vide, plaçait le
+        compte au plafond. Rend True si la ligne a été supprimée."""
+        rows = self.db.query(
+            "delete from account_pauses where harness = %s and account = %s"
+            " and observed_at <= %s returning observed_at",
+            (harness, account, float(observed_at)))
+        return bool(rows)

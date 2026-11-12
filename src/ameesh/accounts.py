@@ -3100,12 +3100,25 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                     "source": "%s@%s" % (agent or "?", host)}
             elif pause is not None and (not _pause_valid(pause, now)
                                         or _pause_lifted_by(pause, state)):
+                # #6961 (B codex) : la levée compare et supprime dans la même
+                # instruction, sur l'observation de la pause LUE. Une pause
+                # publiée entre cette lecture et la suppression (un autre hôte
+                # voit le plafond dur plus tard) n'est jamais effacée : la
+                # relecture finale la verrait vide et placerait le compte au
+                # plafond. Sans observation (ligne impossible : NOT NULL), on
+                # ne supprime pas — la prudence garde la pause.
+                seen = pause.get("observed_at")
+                if seen is None:
+                    continue
+                leve = True
                 if not simulate:
                     try:
-                        store.release_account_pause(harness, profile.name)
+                        leve = store.release_account_pause(
+                            harness, profile.name, float(seen))
                     except db_mod.DbError:
-                        pass    # la pause reste pour les autres : prudent
-                pauses.pop(profile.name, None)
+                        leve = False    # la pause reste pour les autres : prudent
+                if leve:
+                    pauses.pop(profile.name, None)
 
     choice = decide(retenus, conflits, sick, pauses)
     _sync_pauses()

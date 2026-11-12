@@ -1417,10 +1417,17 @@ class Accounts(Domain):
         ancienne n'écrase pas une plus récente. Sans effet par défaut."""
         return None
 
-    def release_account_pause(self, harness: str, account: str) -> None:
-        """#6961 : lève la pause du compte (relevé plus récent sous le
-        plafond, ou échéance passée). Sans effet par défaut."""
-        return None
+    def release_account_pause(self, harness: str, account: str,
+                              observed_at: float) -> bool:
+        """#6961 : lève la pause SI elle porte encore l'observation lue.
+
+        `observed_at` est l'observation de la pause sur laquelle la décision
+        de levée s'est fondée ; la suppression compare cette valeur dans la
+        même instruction, donc une publication concurrente plus récente
+        survit (B codex : sinon la relecture finale, vide, placerait le
+        compte au plafond). Rend True si la ligne a été supprimée. Sans effet
+        par défaut : False (la pause n'est pas levée)."""
+        return False
 
 
 # --------------------------------------------------------------------------

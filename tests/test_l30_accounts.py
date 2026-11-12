@@ -637,8 +637,60 @@ class ChoixTest(_Base):
                                     "codex plan: in overage")
         ligne = store.account_pauses("codex")["primaire"]
         self.assertEqual((ligne["until_ts"], ligne["observed_at"]), (1000.0, 200.0))
-        store.release_account_pause("codex", "primaire")
+        self.assertTrue(store.release_account_pause("codex", "primaire", 200.0))
         self.assertEqual(store.account_pauses("codex"), {})
+
+    def test_une_publication_concurrente_plus_recente_survit_a_la_levee(self):
+        """#6961 (B codex) : la levée compare l'observation dans la même
+        instruction. A lit la pause t100 ; B publie un plafond dur t120 entre
+        la lecture et la suppression : A ne doit pas effacer la pause de B."""
+        store = storage.of(self.db).accounts
+        store.publish_account_pause("codex", "primaire", 1000.0, 100.0,
+                                    "hard cap seen by A")
+        store.publish_account_pause("codex", "primaire", 2000.0, 120.0,
+                                    "hard cap published by B")
+        # A a lu la version t100 : sa levée ne passe pas sur la version t120.
+        self.assertFalse(store.release_account_pause("codex", "primaire", 100.0))
+        ligne = store.account_pauses("codex")["primaire"]
+        self.assertEqual((ligne["until_ts"], ligne["observed_at"], ligne["reason"]),
+                         (2000.0, 120.0, "hard cap published by B"))
+        # la levée de la version effectivement lue (t120) passe, elle.
+        self.assertTrue(store.release_account_pause("codex", "primaire", 120.0))
+        self.assertEqual(store.account_pauses("codex"), {})
+
+    def test_une_pause_publiee_entre_lecture_et_levee_n_est_pas_effacee(self):
+        """#6961 (B codex), témoin de bout en bout : A lit la pause t-10 et
+        un relevé local sous le plafond t-5, donc décide de lever ; B publie
+        un plafond dur à `now`, plus récent que le relevé de A, entre la
+        lecture et la suppression. La pause de B survit et A ne place pas le
+        compte (sans la garde, la relecture finale était vide)."""
+        items = self._items_plafonnes()
+        now = time.time()
+        _codex_rollout(items[0].path, 30, now + 3600)
+        _stamp_rollout(items[0].path, now - 5)
+        store = storage.of(self.db).accounts
+        store.publish_account_pause("codex", "primaire", now + 3600, now - 10,
+                                    "hard cap seen before")
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+        store_cls = type(store)
+        vraie = store_cls.release_account_pause
+
+        def release_avec_publication(self_, harness, account, observed_at):
+            # B publie entre la lecture de A et sa suppression, plus récent
+            # que le relevé local de A (now - 5).
+            self_.publish_account_pause(harness, account, now + 3600, now,
+                                        "hard cap concurrent")
+            return vraie(self_, harness, account, observed_at)
+
+        with mock.patch.object(store_cls, "release_account_pause",
+                               release_avec_publication):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items[:1],
+                                    book, now=now)
+        self.assertIsNone(choix.profile, choix.reason)
+        self.assertIn("paused at the account hard cap", choix.reason)
+        ligne = storage.of(self.db).accounts.account_pauses("codex")["primaire"]
+        self.assertEqual((ligne["until_ts"], ligne["observed_at"], ligne["reason"]),
+                         (now + 3600, now, "hard cap concurrent"))
 
 
 class PlafondTourTest(_Base):
