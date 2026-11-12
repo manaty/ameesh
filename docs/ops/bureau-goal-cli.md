@@ -68,10 +68,12 @@ Limites, dites franchement :
 1. **Migration 0567** : elle part avec le déploiement staging ordinaire. Elle
    est additive, et la garde est inerte tant qu'aucune connexion limitée
    n'existe.
-2. **Pair WireGuard** de bureau-goal, sur le serveur du mesh :
-   `deploy/serveur/ajouter-appareil.sh bureau-goal`. Il attribue une adresse
-   libre `10.77.0.N/32` (côté hub : `AllowedIPs = 10.77.0.N/32`) et affiche la
-   configuration de l'appareil. Côté bureau-goal :
+2. **Pair WireGuard** de bureau-goal, sur le serveur du mesh. Sur le mesh
+   manaty, il est posé par `ameesh-bg-peer.service` (`10.77.0.6/32`, filtre
+   avant pair, #6269 ; pose : `deploy/serveur/RESEAU-PRIVE.md`, « Pairs hors
+   de `wg0.conf` »). Ailleurs : `deploy/serveur/ajouter-appareil.sh
+   bureau-goal`, qui attribue une adresse libre `10.77.0.N/32` (côté hub :
+   `AllowedIPs = 10.77.0.N/32`) et affiche la configuration de l'appareil. Côté bureau-goal :
    `AllowedIPs = 10.77.0.1/32`, c'est-à-dire la seule adresse du hub, pas le
    /24. La clé privée n'est affichée qu'une fois : elle va directement dans
    `/etc/wireguard/ameesh.conf` (0600) sur bureau-goal.
@@ -128,8 +130,9 @@ Avant le premier geste sur un hôte ou un geste à dépense, elle lance
 
 1. `REVOKE ALL` puis `DROP OWNED BY bureau_goal; DROP ROLE bureau_goal` (la
    ligne de `limited_logins` peut rester : elle n'a d'effet que pour ce rôle).
-2. Retrait du pair dans `/etc/wireguard/wg0.conf` du hub, puis
-   `wg syncconf`.
+2. Retrait du pair : `systemctl disable --now ameesh-bg-peer.service` puis
+   suppression de l'unité (mesh manaty), sinon retrait du bloc dans
+   `/etc/wireguard/wg0.conf` du hub et `wg set wg0 peer <clé> remove`.
 3. Retrait de la ligne pg_hba.
 
 Ce sont trois gestes distincts (§10).

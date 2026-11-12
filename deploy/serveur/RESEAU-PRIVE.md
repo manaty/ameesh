@@ -26,7 +26,8 @@ réseau privé existant n'est réutilisable. Le repli WireGuard partiel (étude
 | `terraform/reseau-prive/` | crée le réseau privé, réserve une adresse par nœud (IPAM) et rattache une carte privée aux VM **existantes** ; ne crée ni ne modifie aucun serveur ; refuse un serveur hors du projet |
 | `reseau-prive.sh interface` | adresse fixe sur la carte privée, sans passerelle ni DNS, persistante (systemd-networkd, sinon ifupdown) |
 | `reseau-prive.sh postgres` | Postgres écoute aussi l'adresse privée ; `pg_hba` : `hostssl` + `scram-sha-256` sur le sous-réseau seul ; attente de la carte au démarrage |
-| `reseau-prive.sh verifier` | pairs joignables, Postgres prêt là où il écoute, aucune base sur une adresse publique ; `--hub-arrete` exige un hub injoignable |
+| `reseau-prive.sh verifier` | pairs joignables, Postgres prêt là où il écoute, aucune base sur une adresse publique ; `--hub-arrete` exige un hub injoignable ; sur le hub, chaque pair attendu de `wg0` est posé |
+| `ameesh-bg-peer.service`, `ameesh-bg-peer.sh` | pair WireGuard de bureau-goal (`10.77.0.6`), posé hors de `wg0.conf` après son filtre (#6269, #7002) |
 
 ## Plan d'adresses
 
@@ -146,13 +147,50 @@ bas) : prévenir le pilote, PC sans tour en cours si possible.
 
    et sur `manaty-mesh-1` : `reseau-prive.sh verifier 10.78.0.0/24
    10.78.0.11 10.78.0.12 10.78.0.13 --hub-arrete`.
-4. `systemctl start wg-quick@wg0` ; le poste retrouve la base (Postgres
-   garde sa socket sur `10.77.0.1` pendant l'arrêt de `wg0` : vérifier
-   `ss -ltn 'sport = :5432'` et une connexion du poste).
+4. `systemctl start wg-quick@wg0`, puis sur `manaty-mesh-1` :
+   `reseau-prive.sh verifier 10.78.0.0/24 10.78.0.11 10.78.0.12 10.78.0.13`
+   (sans `--hub-arrete`) est vert, **pairs de `wg0` compris** : un pair
+   posé hors de `wg0.conf` qui ne serait pas revenu sort en `ÉCHEC pair wg0
+   <nom>` (#7002 : bureau-goal privé de base 1 h 46 après cet essai). Le
+   poste retrouve la base (Postgres garde sa socket sur `10.77.0.1` pendant
+   l'arrêt de `wg0` : vérifier `ss -ltn 'sport = :5432'` et une connexion du
+   poste).
 
 Joindre au lot les sorties de l'étape 3 (sans DSN ni mot de passe : le
 script n'en affiche pas). L'acceptation : chaque nœud joint les autres hub
 arrêté ; `verifier` n'a relevé aucune base exposée.
+
+## Pairs hors de `wg0.conf` (#7002)
+
+Le pair de bureau-goal (`10.77.0.6`, #6269) n'est pas dans `wg0.conf` :
+`wg-quick` le poserait avant son filtre iptables (BG-IN, 5432 seul), donc
+ouvert si le filtre échoue. `ameesh-bg-peer.service` pose le filtre, le
+vérifie, puis le pair. Elle est `PartOf=` **et** `WantedBy=wg-quick@wg0` :
+un arrêt de `wg0` l'arrête, un démarrage ou un redémarrage la relance.
+Elle déclare `X-Ameesh-Pair-WireGuard=bureau-goal 10.77.0.6/32`, que
+`verifier` lit avec les `[Peer]` de `wg0.conf` pour savoir quels pairs
+attendre. Un autre pair de ce genre déclare la même ligne dans son unité.
+
+Pose ou mise à jour, en root sur `manaty-mesh-1` (bureau, dans un créneau
+annoncé : `wg0` redémarre, le poste et bureau-goal perdent la base quelques
+secondes). La clé publique reste dans `/etc/ameesh-bg-peer/bureau-goal.pub`,
+hors dépôt :
+
+```bash
+S=/opt/ameesh/src/deploy/serveur
+sha256sum /usr/local/sbin/ameesh-bg-peer.sh $S/ameesh-bg-peer.sh   # f01db3f3… des deux côtés (#6269)
+install -m 0755 $S/ameesh-bg-peer.sh /usr/local/sbin/ameesh-bg-peer.sh
+install -m 0644 $S/ameesh-bg-peer.service /etc/systemd/system/ameesh-bg-peer.service
+systemctl daemon-reload
+systemctl reenable ameesh-bg-peer.service    # crée wg-quick@wg0.service.wants/
+systemctl restart wg-quick@wg0
+$S/reseau-prive.sh verifier 10.78.0.0/24 10.78.0.11 10.78.0.12 10.78.0.13
+```
+
+`verifier` doit montrer `ok pair wg0 bureau-goal (10.77.0.6/32)` sans
+geste manuel sur le pair. `ajouter-appareil.sh` ajoute désormais son seul
+pair (`wg set`) : `wg syncconf` retirait les pairs posés hors de
+`wg0.conf`.
 
 ## Chemin du poste
 
