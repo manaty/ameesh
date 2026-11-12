@@ -4241,6 +4241,16 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 seats = [dict(row) for row in shape.get("reviewers") or ()
                          if live is None
                          or str((row or {}).get("name") or "").strip() in live]
+                if shape.get("reviewers") and not seats:
+                    # #3557 : la marque d'attente nommait des sièges, mais
+                    # aucun n'est plus vivant (retiré à la main). Ce n'est plus
+                    # une désignation du gel : une reprise qui ne peut pas lire
+                    # ses entrées le dit, sans réécrire la colonne depuis la
+                    # marque.
+                    return {"state": "unavailable", "reviewers": [],
+                            "freeze": freeze,
+                            "why": "recorded waiting designation has no live seat: %s"
+                                   % inputs.why}
                 shape.update({"state": rd.WAITING, "reviewers": seats,
                               "freeze": freeze,
                               "why": "recorded waiting designation kept: %s"
