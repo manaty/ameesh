@@ -1140,10 +1140,11 @@ class SchemaTest(unittest.TestCase):
 
         class Sh:
             def run(self, cmd, input_text=None, **kw):
-                calls.append(cmd)
                 if cmd[0] == "agent-mail":
+                    calls.append(cmd)
                     mails.append((cmd[2], cmd, input_text))
                     return ph.Result(0)
+                calls.append(_logical(cmd, input_text))
                 if cmd[0] == "ameesh":
                     return ph.Result(0, json.dumps({"created": created, "lot": 4100}))
                 if cmd[-1] == "--dry-run":
