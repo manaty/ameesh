@@ -6,7 +6,7 @@
 -- si elles existent (ajoutées par un lot pas encore dans la base visée).
 -- Ce que chaque droit sert (chemins tracés, #6881) :
 --   lecture des lots exécutés (`work show`), liaison L41 (`mail bind`), prise
---   #6839 (`work claim`), reçus de provenance (hooks), `agent-mail send|inbox`.
+--   #6839 (`work claim`), reçus de provenance (hooks), `agent-mail send|inbox|list`.
 -- Aucune table de secrets, de clés privées, d'approbation ou de comptes.
 CREATE TEMP TABLE IF NOT EXISTS bureau_spec(rel text, priv text, cols text[], opt_cols text[]);
 DELETE FROM pg_temp.bureau_spec;
@@ -21,6 +21,15 @@ INSERT INTO pg_temp.bureau_spec(rel, priv, cols) VALUES
   ('agent_registry','UPDATE',ARRAY['updated_at']),
   ('agent_name_resolutions','INSERT',ARRAY['supplied_name','primary_name','operation']),
   ('agent_candidates','SELECT',NULL),
+  -- #7058 : présence et non-lus (`agent-mail list`) ; la vue ne lit que
+  -- agent_registry et agent_mailbox, déjà lisibles en entier
+  ('agent_mesh_overview','SELECT',NULL),
+  -- … et son prédicat de réclamation (canon_claim_predicate_sql) : les
+  -- fonctions invocatrices ameesh_host_claims_open, ameesh_agent_claims_open
+  -- et ameesh_handoff_fenced, aux seules colonnes qu'elles lisent
+  ('host_lifecycle','SELECT',ARRAY['host','mode','claims_open','return_probe']),
+  ('host_release_fences','SELECT',ARRAY['host','probe']),
+  ('host_handoffs','SELECT',ARRAY['agent','fenced']),
   ('canon_state','SELECT',NULL),
   ('mesh_keys','SELECT',NULL),
   ('limited_logins','SELECT',NULL),

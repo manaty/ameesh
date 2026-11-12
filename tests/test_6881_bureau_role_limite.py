@@ -195,6 +195,11 @@ class BureauRoleLimiteTest(PgTestCase):
         proc = self.as_bureau("mail", "inbox", "bureau")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("reçu", proc.stdout)
+        # #7058 : présence et non-lus des agents (`agent-mail list`), la
+        # supervision du bureau depuis BG quand le poste est éteint
+        proc = self.as_bureau("mail", "list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("orchestrateur", proc.stdout)
 
     def test_prise_identite_complete_check_puis_levee(self):
         """#6877 (0566) sur l'arbre intégré : la prise écrit le harnais et la
