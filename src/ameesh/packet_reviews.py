@@ -476,7 +476,10 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
     admet pour fusionner (file de fusion, feu) l'ouvre, pour que la preuve
     d'un repli de famille en pause soit écrite sur la tête du membre avant la
     fusion du paquet ; la lecture de plan de CI et les candidats la laissent
-    fermée (B/P1 auditeur, 11/11 21:42).
+    fermée (B/P1 auditeur, 11/11 21:42). Le contexte `packet=True` descend
+    aussi : un membre n'est admis que par l'admission d'un paquet, dont la
+    suite complète est la seconde barrière du repli (#213032 a, B1 cx1 du
+    12/11 16:10).
 
     #3091 : la base de la composition est lue dans `work_packet_members`, pas
     dans la ref `origin/<cible>` du checkout de la porte. Cette ref peut être
@@ -599,7 +602,7 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                                            klass=klass, item=member_row, cfg=cfg,
                                            admitted_heads=tuple(admitted_sources),
                                            production_cache=production_cache,
-                                           record=record)
+                                           record=record, packet=True)
         except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
             return {"ok": False, "required": None, "klass": None,
                     "why": "constituent #%d: cannot read its review gate: %s"

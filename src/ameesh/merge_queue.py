@@ -827,7 +827,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 authors=None, authors_complete=False, cfg=None, project=None,
                 target=None, vehicle=None, exclude_author_family=None,
                 distinct_families=None, admitted_heads=(), production_cache=None,
-                record: bool = False, now: float | None = None) -> dict:
+                record: bool = False, packet: bool | None = None,
+                now: float | None = None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     `admitted_heads` ne vient que de la porte du véhicule : les gels de ses
@@ -953,12 +954,21 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
 
     #6990 : quand le barème exige deux avis, qu'un seul est rendu et que la
     # famille manquante est entièrement en pause budget au-delà du seuil du
-    # canon, la porte admet sur cet avis (`fallback` porte la preuve). Seul
+    # canon, la porte admet sur cet avis (`fallback` porte la preuve). Ce
+    # repli échange le second avis contre la **CI complète du paquet**
+    # (décision owner #213032 a) : `packet` dit si l'admission qui lit la
+    # porte est celle d'un paquet (`True`, la suite complète de la tête
+    # intégrée est la seconde barrière) ou une fusion directe (`False`, file
+    # de fusion ou feu d'un lot ordinaire, où une CI ciblée suffit sous
+    # exception incident/unblock) — dans ce dernier cas les deux avis restent
+    # dus. `None` (défaut) est une **lecture** sans décision de fusion
+    # (candidat de paquet, alerte, train) : elle reste permissive, la preuve
+    # et le contexte sont redonnés par la porte effective (B1 cx1,
+    # 12/11 16:10). Une admission effective (`record=True`) qui laisse
+    # `packet` à `None` échoue fermée : elle doit nommer son contexte. Seul
     # un appelant qui admet pour fusionner passe `record=True` (file, feu,
     # porte du véhicule qui descend `record` à ses membres) : la preuve est
-    # alors écrite au journal et la relecture après fusion la relit. Une
-    # lecture sans écriture (candidat de paquet, alerte) reste `ok` sans note ;
-    # la preuve est écrite par la porte d'admission avant la fusion.
+    # alors écrite au journal et la relecture après fusion la relit.
 
     Rend `{ok, why, class, required, accepted, accepted_unfiltered, blocked,
     waived, author, author_family, author_families, authors, corrections,
@@ -1196,20 +1206,41 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # paiement et la prod réelle n'y ont jamais droit. Le repli ne relève pas
     # l'exigence d'indépendance : l'avis doit rester d'une autre famille que
     # tous les auteurs (`strict` ci-dessous).
+    #
+    # B1 cx1 (12/11 16:10) : le repli échange le second avis contre la suite
+    # **complète du paquet**. Une fusion directe (file, feu) peut se contenter
+    # d'une CI ciblée sous exception incident/unblock : elle ne doit donc
+    # jamais hériter du repli. `packet=False` le refuse, `packet=True`
+    # l'ouvre pour l'admission d'un véhicule ; `None` est une lecture sans
+    # décision de fusion, qui reste permissive pour que les candidats de
+    # paquet voient le lot admissible (la porte effective redonne le contexte
+    # et écrit la preuve).
     fallback = None
+    fallback_refused = ""
     if (required == 2 and len(latest_ok) == 1 and db is not None
             and item is not None):
         try:
-            fallback = _paused_family_fallback(
+            evidence = _paused_family_fallback(
                 db, item, marks, klass, families, cfg, frozen,
                 time.time() if now is None else float(now))
         except Exception:  # noqa: BLE001 - preuve illisible : jamais un repli
-            fallback = None
-    if fallback is not None:
-        out["fallback"] = fallback
-        out["fallback_required"] = 2
-        required = 1
-        out["required"] = 1
+            evidence = None
+        if evidence is not None:
+            # B1 cx1 : une admission **effective** (`record=True`) qui ne
+            # nomme pas son contexte de paquet ne reçoit pas le repli — elle
+            # échoue fermée au lieu d'hériter d'un défaut permissif.
+            if packet is False or (packet is None and record):
+                fallback_refused = (
+                    "the paused-family fallback is reserved to a packet admission "
+                    "covered by the packet's full CI (#213032); an effective merge "
+                    "outside a packet keeps both reviews")
+                out["fallback_refused"] = fallback_refused
+            else:
+                fallback = evidence
+                out["fallback"] = fallback
+                out["fallback_required"] = 2
+                required = 1
+                out["required"] = 1
     if len(latest_ok) < required and callable(getattr(db, "query", None)):
         # #3400 (auditeur sur #3397) : ces `ok` ne sont pas des avis
         # **acceptés**. Le filtre d'indépendance (auteurs, correcteurs,
@@ -1231,6 +1262,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent "
                       "review verdict(s) required, %s; got %s"
                       % (frozen[:12], cls, required, need, got))
+        if fallback_refused:
+            out["why"] += "; " + fallback_refused
         # #3397 : le retour anticipé garde le diagnostic du chemin historique
         # (#2928) : les verdicts écartés faute de reçu exact sont déjà lus
         # ci-dessus, sans Git ; sans ce suffixe, la porte refusée pour un
@@ -1654,6 +1687,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent review "
                   "verdict(s) required, %s; got %s"
                   % (frozen[:12], cls, required, need, got))
+    if fallback_refused:
+        out["why"] += "; " + fallback_refused
     # #3968 : le refus nomme les familles d'auteurs de la tête et chaque avis
     # écarté avec sa cause. Une famille « interdite » sans cette preuve se
     # lisait comme un défaut d'attribution (nexlink #3882 : la famille codex
@@ -3000,8 +3035,15 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                     % (lot, exc)) from exc
             gate_authors = {"authors": authors, "families": families,
                             "authors_complete": True}
+    # #6990 (B1 cx1, 12/11) : le contexte de la porte. Une file qui fusionne
+    # une tête `integration/**` admet un paquet : sa suite complète est la
+    # seconde barrière du repli de famille en pause. Un lot ordinaire, même
+    # avec une exception incident/unblock et une CI ciblée verte, garde ses
+    # deux avis avant fusion (décision owner #213032 a).
+    from . import packet_reviews
     gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row,
                        cfg=cfg, target=fresh_target, record=True,
+                       packet=packet_reviews.is_vehicle(row),
                        **gate_authors)
     if not gate["ok"]:
         raise QueueError("lot #%d: %s" % (lot, gate["why"]))

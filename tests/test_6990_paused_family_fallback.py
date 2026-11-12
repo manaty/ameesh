@@ -354,7 +354,7 @@ class GateFallbackTest(unittest.TestCase):
                 "title": "porte", "state": "qa"}
 
     def gate(self, klass=None, *, actor="cx1", evidence="yes", record=False,
-             record_error=None):
+             record_error=None, packet=None):
         evidence_value = ({"schema": review_family_paused.FALLBACK_SCHEMA,
                            "family": "codex", "resume_ts": T + 30 * H,
                            "accounts": ["primary"], "min_hours": 12,
@@ -372,7 +372,7 @@ class GateFallbackTest(unittest.TestCase):
                 item=self.item(), families=FAMILIES,
                 family_of=lambda name: ({"author": "deepseek", "cx1": "codex",
                                          "r2": "deepseek", "r3": "claude"}).get(name, ""),
-                record=record, now=T)
+                record=record, packet=packet, now=T)
         return out, recorded
 
     def test_one_independent_ok_is_admitted_on_the_evidence(self):
@@ -381,6 +381,43 @@ class GateFallbackTest(unittest.TestCase):
         self.assertEqual(out["required"], 1)
         self.assertEqual(out["fallback"]["family"], "codex")
         self.assertEqual([entry["family"] for entry in out["accepted"]], ["codex"])
+
+    def test_a_direct_merge_keeps_both_reviews(self):
+        # B1 cx1 (12/11 16:10) : une file ou un feu de lot ordinaire peut
+        # fusionner sur une CI ciblée (exception incident/unblock) ; le repli
+        # y est refusé, sinon la seconde barrière de #213032 a — la suite
+        # complète du paquet — manquerait.
+        out, recorded = self.gate(packet=False, record=True)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["required"], 2)
+        self.assertIn("reserved to a packet admission", out["why"])
+        self.assertIn("an effective merge outside a packet keeps both reviews",
+                      out["why"])
+        self.assertEqual(out["fallback_refused"],
+                         "the paused-family fallback is reserved to a packet admission "
+                         "covered by the packet's full CI (#213032); an effective merge "
+                         "outside a packet keeps both reviews")
+        recorded.assert_not_called()
+
+    def test_an_effective_merge_without_context_fails_closed(self):
+        # Une admission effective qui ne nomme pas son contexte (`record=True`
+        # sans `packet`) ne reçoit pas le repli : le défaut n'est permissif
+        # que pour les lectures.
+        out, recorded = self.gate(record=True)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["required"], 2)
+        self.assertIn("effective merge outside a packet", out["why"])
+        recorded.assert_not_called()
+
+    def test_a_packet_admission_opens_the_fallback_and_writes_it(self):
+        # Une tête `integration/**` est admise par un paquet : sa suite complète
+        # est la seconde barrière, le repli s'ouvre et la preuve s'écrit sur la
+        # tête du membre avant la fusion du véhicule.
+        out, recorded = self.gate(packet=True, record=True)
+        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual(out["required"], 1)
+        self.assertEqual(out["fallback"]["family"], "codex")
+        recorded.assert_called_once()
 
     def test_without_a_canon_key_the_two_reviews_stay_due(self):
         klass = {key: value for key, value in self.KLASS.items()
@@ -403,10 +440,11 @@ class GateFallbackTest(unittest.TestCase):
         self.assertEqual([entry["reason"] for entry in out["rejected"]], ["author"])
 
     def test_the_note_is_written_only_when_the_gate_admits(self):
-        out, recorded = self.gate(record=True)
+        out, recorded = self.gate(record=True, packet=True)
         self.assertTrue(out["ok"], out["why"])
         recorded.assert_called_once()
-        out, recorded = self.gate(record=True, record_error=work.WorkError("db"))
+        out, recorded = self.gate(record=True, packet=True,
+                                  record_error=work.WorkError("db"))
         self.assertFalse(out["ok"])
         self.assertIn("could not be recorded", out["why"])
 
@@ -471,6 +509,9 @@ class PacketGateRecordTest(unittest.TestCase):
                                       record=True)
         self.assertTrue(out["ok"], out)
         self.assertTrue(gate.call_args.kwargs["record"])
+        # #6990 (B1 cx1) : le membre n'est admis que par l'admission d'un
+        # paquet, dont la suite complète est la seconde barrière du repli.
+        self.assertIs(gate.call_args.kwargs["packet"], True)
 
 
 class PausedFamilyFallbackWiringTest(unittest.TestCase):

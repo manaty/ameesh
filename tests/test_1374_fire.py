@@ -626,6 +626,88 @@ class ReadyTest(unittest.TestCase):
         self.assertIn("independent review", why)
         self.assertEqual(gate.call_args.kwargs["repo"], "/checkout")
 
+    def test_a_direct_merge_keeps_the_paused_family_fallback_closed(self):
+        # #6990 (B1 cx1, 12/11 16:10) : le feu direct d'un lot ordinaire —
+        # même couvert par une exception incident/unblock et une CI ciblée —
+        # n'est pas l'admission d'un paquet : le repli de famille en pause y
+        # est refusé, les deux avis restent dus (#213032 a).
+        klass = {"class": "sensitive", "doubt": False, "files": [
+            {"path": "src/ameesh/merge_queue.py", "class": "sensitive",
+             "rule": ["src/ameesh/merge_queue.py"]}]}
+        seen = {}
+
+        def gate(db, marks, frozen, **kw):
+            seen.update(kw)
+            return {"ok": False, "why": "two reviews due"}
+
+        with mock.patch.object(fire.lot_class, "of_lot", return_value=klass), \
+                mock.patch.object(merge_queue, "_complete_authors",
+                                  return_value=([], ())), \
+                mock.patch.object(merge_queue, "review_gate", side_effect=gate):
+            ok, why, _ = fire.ready_verdicts(
+                None, None, self.ROW,
+                _marks(_mark("frozen", A), _verdict("rev1")),
+                repo=None, project=None, target="main")
+        self.assertFalse(ok)
+        self.assertIs(seen.get("packet"), False, seen)
+
+    def test_the_fire_gate_really_refuses_the_fallback(self):
+        # La porte réelle reçoit `packet=False` : un seul avis, une famille
+        # en pause prouvée, et le feu refuse en nommant la barrière manquante
+        # au lieu d'abaisser le compte à un.
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/merge_queue.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/merge_queue.py"]}],
+                 "train_reviews": 2,
+                 "train_reviews_paths": {"src/ameesh/merge_queue.py": 2},
+                 "paused_family_min_hours": 12, "paused_family_reviews": 1}
+        evidence = {"family": "codex", "resume_ts": 9999999999.0,
+                    "accounts": ["primary"], "min_hours": 12,
+                    "required": 2, "shortfall": 1}
+        db = types.SimpleNamespace()
+        with mock.patch.object(fire.lot_class, "of_lot", return_value=klass), \
+                mock.patch.object(merge_queue, "_complete_authors",
+                                  return_value=([{"name": "author",
+                                                  "family": "deepseek"}],
+                                                ("claude", "codex", "deepseek"))), \
+                mock.patch.object(merge_queue, "_paused_family_fallback",
+                                  return_value=evidence), \
+                mock.patch.object(merge_queue, "_exact_verdict_receipt",
+                                  return_value={}):
+            ok, why, _ = fire.ready_verdicts(
+                db, db, self.ROW,
+                _marks(_mark("frozen", A), _verdict("rev1")),
+                repo=None, project=None, target="main")
+        self.assertFalse(ok)
+        self.assertIn("reserved to a packet admission", why)
+        self.assertIn("an effective merge outside a packet keeps both reviews", why)
+
+    def test_a_packet_admits_with_the_packet_context(self):
+        # Une tête `integration/**` est un paquet : sa suite complète est la
+        # seconde barrière du repli, le feu donne le contexte `packet=True`.
+        klass = {"class": "sensitive", "doubt": False, "files": [
+            {"path": "src/ameesh/merge_queue.py", "class": "sensitive",
+             "rule": ["src/ameesh/merge_queue.py"]}]}
+        row = dict(self.ROW, branch="integration/paquet-6990")
+        seen = {}
+
+        def gate(db, marks, frozen, **kw):
+            seen.update(kw)
+            return {"ok": True}
+
+        with mock.patch.object(fire.lot_class, "of_lot", return_value=klass), \
+                mock.patch.object(merge_queue, "pinned", return_value=A), \
+                mock.patch.object(merge_queue, "_class_base", return_value="main"), \
+                mock.patch.object(review_authors, "refreshed_target", return_value=A), \
+                mock.patch.object(merge_queue, "review_gate", side_effect=gate):
+            ok, why, _ = fire.ready_verdicts(
+                None, None, row,
+                _marks(_mark("frozen", A), _verdict("rev1")),
+                repo="/checkout", project=None, target="main")
+        self.assertTrue(ok, why)
+        self.assertIs(seen.get("packet"), True, seen)
+
     def test_a_corrector_author_does_not_review_his_own_work(self):
         # #1515 N1 : les auteurs du delta sont lus avant la porte ; le
         # relecteur qui a corrigé ne relit pas sa propre correction.
