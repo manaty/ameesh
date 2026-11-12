@@ -840,7 +840,7 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
         if zone != "test":
             old_blob, new_blob = before(old), after(new)
             if (old_blob is None or new_blob is None or old_blob[0] != new_blob[0]
-                    or _substitute(old_blob[1], mapping) != new_blob[1]):
+                    or _substitute(old_blob[1], {number: renamed}) != new_blob[1]):
                 out["why"] = ("%s is not %s with only %s→%s changed"
                               % (new, old, number, renamed))
                 return out
@@ -850,7 +850,7 @@ def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -
                 and renumber.zone(path) == "companion"):
             old_blob, new_blob = before(path), after(path)
             if (old_blob is None or new_blob is None or old_blob[0] != new_blob[0]
-                    or _substitute(old_blob[1], mapping) != new_blob[1]):
+                    or _substitute(old_blob[1], _own_mapping(path, mapping)) != new_blob[1]):
                 out["why"] = "%s is changed beyond the renumbering" % path
                 return out
             paths.add(path)
@@ -879,6 +879,23 @@ def _regular(run, rev: str, path: str) -> tuple | None:
         return None
     proc = run("cat-file", "blob", sha)
     return (mode, proc.stdout) if proc.returncode == 0 else None
+
+
+def _own_mapping(path: str, mapping: Mapping) -> dict:
+    """B dev3 #213504 : le seul remplacement permis dans `path`. Un fichier
+    numéroté ne change que son propre numéro (ancien ou déjà nouveau) : le
+    `SELECT 784` d'une migration 785 reste 784. Un fichier sans numéro de la
+    renumérotation (registre déclaré) suit le remplacement entier."""
+    match = _NUMBERED.match(os.path.basename(path))
+    if not match:
+        return dict(mapping)
+    number = match.group(1)
+    if number in mapping:
+        return {number: mapping[number]}
+    olds = [old for old, new in mapping.items() if new == number]
+    if olds:
+        return {olds[0]: number} if len(olds) == 1 else {}
+    return dict(mapping)
 
 
 def _mapping_text(mapping: Mapping) -> str:
@@ -1034,8 +1051,9 @@ def _renumber_commit(repo: str, parent: str, commit: str, fields: Mapping,
 
     def same(old: str, new: str) -> bool:
         before, after = _regular(run, parent, old), _regular(run, commit, new)
+        own = _own_mapping(old, mapping)
         return (before is not None and after is not None and before[0] == after[0]
-                and _substitute(before[1], mapping) == _substitute(after[1], mapping))
+                and _substitute(before[1], own) == _substitute(after[1], own))
 
     # B1 dev3 #213435 : seuls un chemin de la tête relue et le nouveau chemin
     # attendu d'un tel chemin se retouchent ; un fichier de la cible qui porte

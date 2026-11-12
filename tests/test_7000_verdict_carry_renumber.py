@@ -239,6 +239,28 @@ class RenumberingTest(unittest.TestCase):
         _put(self.root, self.MIG % "783", text)
         self.refused(_commit(self.root, "back"), "neither a test adaptation")
 
+    def two_reservations(self, second):
+        """B dev3 #213504 : 784→783 et 785→782 ; la migration 785 cite 784."""
+        _put(self.root, "supabase/migrations/785_second.sql", "-- 785\nSELECT 784;\n")
+        self.reviewed = _commit(self.root, "second migration")
+        self.rename()
+        _git(self.root, "mv", "supabase/migrations/785_second.sql",
+             "supabase/migrations/782_second.sql")
+        _put(self.root, "supabase/migrations/782_second.sql", second)
+        frozen = self.references()
+        return frozen, verdict_carry.Renumbering(
+            "supabase/migrations", frozenset({783, 782}), ("supabase/rollback",))
+
+    def test_each_file_changes_only_its_own_number(self):
+        frozen, renumber = self.two_reservations("-- 782\nSELECT 784;\n")
+        ok, why, adaptation = self.carriable(frozen, renumber)
+        self.assertTrue(ok and adaptation, why)
+        self.assertIn("784→783, 785→782", why)
+
+    def test_another_renumbered_number_in_a_file_is_refused(self):
+        frozen, renumber = self.two_reservations("-- 782\nSELECT 783;\n")
+        self.refused(frozen, "with only 785→782 changed", renumber)
+
     def test_a_product_change_hidden_in_the_history_is_refused(self):
         _put(self.root, "secret.txt", "s\n")
         _commit(self.root, "secret")
