@@ -47,9 +47,15 @@ def metadata(value):
     """Explicit allowlist: no raw protocol dictionaries or tool outputs."""
     value = value or {}
     out = {}
-    for key in ("status", "tool"):
+    for key in ("status", "tool", "child", "report_kind"):
         if isinstance(value.get(key), str):
             out[key] = bounded(value[key], 256)[0]
+    # #7034 : le lien d'un rapport/copie avec son enfant ; des entiers bornés,
+    # jamais le corps ni un secret.
+    for key in ("child_seq", "copied_from"):
+        number = value.get(key)
+        if isinstance(number, int) and not isinstance(number, bool) and 0 <= number < 2**63:
+            out[key] = number
     for key in ("cost_usd", "duration_s", "dropped"):
         number = value.get(key)
         if isinstance(number, (int, float)) and not isinstance(number, bool) \

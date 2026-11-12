@@ -3841,7 +3841,9 @@ class Ephemerals(Domain):
                credential_mode: str | None = None,
                placement: dict | None = None,
                evaluated_profile: dict | None = None,
-               evaluated_identity: dict | None = None) -> dict | None:
+               evaluated_identity: dict | None = None,
+               profile: dict | None = None,
+               context: dict | None = None) -> dict | None:
         """Crée l'éphémère atomiquement (INSERT … SELECT sur la ligne du
         créateur) ; None si le nom est pris ou si le créateur a changé.
 
@@ -3861,11 +3863,46 @@ class Ephemerals(Domain):
         (`{host, responsible, created_by, lineage}`) est l'identité de lignée
         au moment du choix : l'INSERT refuse un parent déplacé, un responsable
         changé, un `created_by` modifié ou un ancêtre revenu sur l'hôte
-        d'arrivée."""
+        d'arrivée.
+
+        #7034 : `profile` (outils/MCP, écrit dans `spawn_profiles`) et
+        `context` (extrait borné, écrit dans `spawn_contexts`) sont posés dans
+        la MÊME transaction que l'enfant : un enfant restreint n'existe jamais
+        sans sa liste, et un contexte ne survit pas à un refus."""
 
     @abc.abstractmethod
     def exists(self, name: str) -> bool:
         """Un agent de ce nom existe-t-il ?"""
+
+    @abc.abstractmethod
+    def profile(self, child: str) -> dict | None:
+        """Le profil effectif d'un enfant restreint, ou None."""
+
+    @abc.abstractmethod
+    def context(self, child: str) -> dict | None:
+        """L'extrait de contexte confié au démarrage, ou None."""
+
+    @abc.abstractmethod
+    def next_report_seq(self, child: str) -> int:
+        """Compteur monotone des rapports progress/question de cet enfant."""
+
+    @abc.abstractmethod
+    def set_report(self, child: str, *, started: bool = False,
+                   final: str | None = None) -> dict | None:
+        """Pose `started_at`/`final_at` (idempotent), rend l'état du rapport."""
+
+    @abc.abstractmethod
+    def report(self, child: str) -> dict | None:
+        """L'état des rapports started/final de l'enfant."""
+
+    @abc.abstractmethod
+    def expired_children(self, parent: str, *, limit: int = 16) -> list[dict]:
+        """Enfants échus du parent qui n'ont pas encore de rapport final."""
+
+    @abc.abstractmethod
+    def purge_context(self, child: str) -> None:
+        """Supprime l'extrait de contexte d'un enfant clos (le profil reste,
+        sans secret, pour l'audit de la liste appliquée)."""
 
 
 # --------------------------------------------------------------------------

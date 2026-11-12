@@ -787,8 +787,8 @@ class Ephemerals(interface.Ephemerals):
     def creator(self, name) -> dict | None:
         rows = self.db.query(
             """
-            SELECT name, responsible, ephemeral, status, capabilities,
-                   (NOT ephemeral OR ephemeral_expires_at > now()) AS alive
+            SELECT name, responsible, ephemeral, status, capabilities, harness, cwd,
+                   canon_ref, (NOT ephemeral OR ephemeral_expires_at > now()) AS alive
               FROM agent_registry WHERE name = %s
             """,
             (name,),
@@ -818,7 +818,12 @@ class Ephemerals(interface.Ephemerals):
         `evaluated_identity` (`{host, responsible, created_by, lineage}`)
         ferme la course de la fenêtre choix → INSERT : un parent déplacé, un
         responsable changé, un `created_by` modifié ou un ancêtre revenu sur
-        l'hôte d'arrivée n'écrit rien."""
+        l'hôte d'arrivée n'écrit rien.
+
+        #7034 : le profil d'outils/MCP (et les serveurs MCP filtrés) et
+        l'extrait de contexte sont écrits dans la MÊME transaction que
+        l'enfant — un enfant restreint n'existe jamais sans sa liste, et un
+        contexte ne survit pas à un refus."""
         placed = host is not None
         if placed and placement is None:
             raise ValueError("Ephemerals.create: a placement verdict is required with host")
@@ -887,55 +892,159 @@ class Ephemerals(interface.Ephemerals):
                            evaluated_identity.get("responsible"),
                            evaluated_identity.get("created_by"),
                            evaluated_identity.get("lineage") or [], host])
-        created = self.db.query(
+        with self.db.transaction() as tx:
+            created = tx.query(
+                """
+                __LOCK__
+                INSERT INTO agent_registry
+                    (name, chantier, harness, host, cwd, model, responsible, team, projects, provider,
+                     credential_mode, capabilities, ephemeral, ephemeral_expires_at, created_by,
+                     admitted_hosts,
+                     placement_ok, placement_diagnostic, placement_ref, placement_profile, canon)
+                SELECT %s, c.chantier, c.harness, __HOST__, __CWD__, c.model,
+                       c.responsible, c.team, c.projects, c.provider, __MODE__,
+                       ARRAY(SELECT x FROM unnest(ARRAY['read', 'propose']::text[]) AS x
+                              WHERE c.capabilities IS NULL OR x = ANY(c.capabilities)),
+                       true,
+                       CASE WHEN c.ephemeral
+                            THEN least(now() + make_interval(secs => %s), c.ephemeral_expires_at)
+                            ELSE now() + make_interval(secs => %s) END,
+                       c.name,
+                       __ADMITTED__,
+                       __OK__, __DIAGNOSTIC__, __REF__, __PROFILE__,
+                       -- L42 (0031) : l'éphémère appartient au canon de son créateur
+                       c.canon
+                  FROM agent_registry c
+                 CROSS JOIN l
+                 WHERE c.name = %s
+                   __PROFILE_GUARD__
+                   AND coalesce(c.responsible, '') <> ''
+                   AND c.status <> 'stopped'
+                   AND (NOT c.ephemeral OR c.ephemeral_expires_at > now())
+                ON CONFLICT (name) DO NOTHING
+                RETURNING name, responsible, host, cwd, harness, capabilities, created_by,
+                          placement_ok, placement_diagnostic,
+                          extract(epoch from ephemeral_expires_at)::float8 AS ephemeral_expires_ts
+                """
+                .replace("__LOCK__", NAME_LOCK_CTE)
+                .replace("__HOST__", host_expr)
+                .replace("__CWD__", cwd_expr)
+                .replace("__MODE__", mode_expr)
+                .replace("__OK__", ok_expr)
+                .replace("__DIAGNOSTIC__", diagnostic_expr)
+                .replace("__REF__", ref_expr)
+                .replace("__PROFILE__", profile_expr)
+                .replace("__ADMITTED__", admitted_expr)
+                .replace("__PROFILE_GUARD__", profile_guard)
+                # après l'insertion des expressions : __NOW__ vit dans __OK__ et
+                # __DIAGNOSTIC__ (héritage du créateur), pas dans le SQL nu
+                .replace("__NOW__", profile_sql("c")),
+                tuple(params),
+            )
+            if not created:
+                return None
+            if profile is not None:
+                tx.execute(
+                    """
+                    INSERT INTO spawn_profiles
+                        (child, parent, harness, tools, mcp, mcp_servers, config_digest)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (name, profile["parent"], profile["harness"],
+                     list(profile.get("tools") or ()), list(profile.get("mcp") or ()),
+                     json.dumps(profile.get("mcp_servers") or {}, sort_keys=True),
+                     profile.get("config_digest")))
+            if context is not None:
+                tx.execute(
+                    """
+                    INSERT INTO spawn_contexts (child, parent, digest, bytes, text)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (name, context["parent"], context["digest"],
+                     int(context["bytes"]), context["text"]))
+            return created[0]
+
+    def profile(self, child) -> dict | None:
+        rows = self.db.query(
             """
-            __LOCK__
-            INSERT INTO agent_registry
-                (name, chantier, harness, host, cwd, model, responsible, team, projects, provider,
-                 credential_mode, capabilities, ephemeral, ephemeral_expires_at, created_by,
-                 admitted_hosts,
-                 placement_ok, placement_diagnostic, placement_ref, placement_profile, canon)
-            SELECT %s, c.chantier, c.harness, __HOST__, __CWD__, c.model,
-                   c.responsible, c.team, c.projects, c.provider, __MODE__,
-                   ARRAY(SELECT x FROM unnest(ARRAY['read', 'propose']::text[]) AS x
-                          WHERE c.capabilities IS NULL OR x = ANY(c.capabilities)),
-                   true,
-                   CASE WHEN c.ephemeral
-                        THEN least(now() + make_interval(secs => %s), c.ephemeral_expires_at)
-                        ELSE now() + make_interval(secs => %s) END,
-                   c.name,
-                   __ADMITTED__,
-                   __OK__, __DIAGNOSTIC__, __REF__, __PROFILE__,
-                   -- L42 (0031) : l'éphémère appartient au canon de son créateur
-                   c.canon
-              FROM agent_registry c
-             CROSS JOIN l
-             WHERE c.name = %s
-               __PROFILE_GUARD__
-               AND coalesce(c.responsible, '') <> ''
-               AND c.status <> 'stopped'
-               AND (NOT c.ephemeral OR c.ephemeral_expires_at > now())
-            ON CONFLICT (name) DO NOTHING
-            RETURNING name, responsible, host, cwd, harness, capabilities, created_by,
-                      placement_ok, placement_diagnostic,
-                      extract(epoch from ephemeral_expires_at)::float8 AS ephemeral_expires_ts
-            """
-            .replace("__LOCK__", NAME_LOCK_CTE)
-            .replace("__HOST__", host_expr)
-            .replace("__CWD__", cwd_expr)
-            .replace("__MODE__", mode_expr)
-            .replace("__OK__", ok_expr)
-            .replace("__DIAGNOSTIC__", diagnostic_expr)
-            .replace("__REF__", ref_expr)
-            .replace("__PROFILE__", profile_expr)
-            .replace("__ADMITTED__", admitted_expr)
-            .replace("__PROFILE_GUARD__", profile_guard)
-            # après l'insertion des expressions : __NOW__ vit dans __OK__ et
-            # __DIAGNOSTIC__ (héritage du créateur), pas dans le SQL nu
-            .replace("__NOW__", profile_sql("c")),
-            tuple(params),
+            SELECT child, parent, harness, tools, mcp, mcp_servers, config_digest,
+                   extract(epoch from created_at)::float8 AS created_ts
+              FROM spawn_profiles WHERE child = %s
+            """,
+            (child,),
         )
-        return created[0] if created else None
+        return rows[0] if rows else None
+
+    def context(self, child) -> dict | None:
+        rows = self.db.query(
+            """
+            SELECT child, parent, digest, bytes, text,
+                   extract(epoch from created_at)::float8 AS created_ts
+              FROM spawn_contexts WHERE child = %s
+            """,
+            (child,),
+        )
+        return rows[0] if rows else None
+
+    def next_report_seq(self, child) -> int:
+        rows = self.db.query(
+            """
+            INSERT INTO spawn_reports (child, seq) VALUES (%s, 1)
+            ON CONFLICT (child) DO UPDATE
+               SET seq = spawn_reports.seq + 1, updated_at = now()
+            RETURNING seq
+            """,
+            (child,),
+        )
+        return int(rows[0]["seq"]) if rows else 0
+
+    def report(self, child) -> dict | None:
+        rows = self.db.query(
+            "SELECT child, seq, started_at, final_at, final_status FROM spawn_reports"
+            " WHERE child = %s", (child,))
+        return rows[0] if rows else None
+
+    def set_report(self, child, *, started=False, final=None) -> dict | None:
+        """Pose l'état des rapports ; un `final` déjà posé n'est jamais écrasé."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT child, seq, started_at, final_at, final_status"
+                " FROM spawn_reports WHERE child = %s FOR UPDATE", (child,))
+            if not rows:
+                tx.execute("INSERT INTO spawn_reports (child) VALUES (%s)"
+                           " ON CONFLICT (child) DO NOTHING", (child,))
+                rows = tx.query(
+                    "SELECT child, seq, started_at, final_at, final_status"
+                    " FROM spawn_reports WHERE child = %s FOR UPDATE", (child,))
+            row = rows[0]
+            if started and row.get("started_at") is None:
+                tx.execute("UPDATE spawn_reports SET started_at = now(), updated_at = now()"
+                           " WHERE child = %s", (child,))
+            if final and row.get("final_at") is None:
+                tx.execute("UPDATE spawn_reports SET final_at = now(), final_status = %s,"
+                           " updated_at = now() WHERE child = %s", (final, child))
+            return tx.query(
+                "SELECT child, seq, started_at, final_at, final_status FROM spawn_reports"
+                " WHERE child = %s", (child,))[0]
+
+    def expired_children(self, parent, *, limit=16) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT r.name, r.created_by, r.harness,
+                   extract(epoch from r.ephemeral_expires_at)::float8 AS expires_ts
+              FROM agent_registry r
+              LEFT JOIN spawn_reports p ON p.child = r.name
+             WHERE r.ephemeral AND r.created_by = %s
+               AND r.ephemeral_expires_at <= now()
+               AND (p.final_at IS NULL)
+             ORDER BY r.ephemeral_expires_at
+             LIMIT %s
+            """,
+            (parent, int(limit)),
+        )
+
+    def purge_context(self, child) -> None:
+        self.db.execute("DELETE FROM spawn_contexts WHERE child = %s", (child,))
 
     def exists(self, name) -> bool:
         return bool(self.db.query("SELECT 1 AS x FROM agent_registry WHERE name = %s", (name,)))

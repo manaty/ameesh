@@ -98,6 +98,7 @@ import time
 
 from . import canon as canon_mod
 from . import canon_sync, db as db_mod, identity, registry
+from . import spawn as spawn_policy
 from . import placement as placement_mod
 from .config import Config
 
@@ -923,6 +924,13 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
                   % (binding.describe(), args.by), file=sys.stderr)
             return 1
     ttl = canon_sync.parse_ttl(args.ttl)
+    # #7034 : le contexte est lu par le parent avant tout accès à la base ;
+    # un fichier illisible, trop gros ou porteur d'un secret ne crée rien.
+    try:
+        context = spawn_policy.read_context(args.context) if args.context else None
+    except spawn_policy.SpawnToolsError as exc:
+        print("refused: %s: %s" % (exc.code, exc), file=sys.stderr)
+        return 1
     # L42 (0031) : le nom de l'éphémère ne doit être déclaré par aucun canon
     canon: list = []
     for index, entry in enumerate(canon_mod.configured(cfg)):
@@ -936,19 +944,28 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
         db_mod.require_schema(db)
         name = args.name or _generated_name(
             canon[0].naming if canon else None, args.role, args.project, canon, db)
-        row = canon_sync.spawn(db, name, args.by, ttl, cwd=args.cwd, canon=canon)
+        row = canon_sync.spawn(db, name, args.by, ttl, cwd=args.cwd, canon=canon,
+                               tools=args.tool, mcp=args.mcp, context=context)
         if args.prompt:
             registry.set_pending_prompt(db, name, args.prompt)
+    except canon_sync.SpawnError as exc:
+        print("refused: %s" % exc, file=sys.stderr)
+        return 1
     finally:
         db.close()
     if args.json:
         print(json.dumps(row, ensure_ascii=False, indent=2))
         return 0
+    restriction = ""
+    if row.get("tools") or row.get("mcp"):
+        restriction = " tools %s, mcp %s" % (
+            _join(row.get("tools")) or "—", _join(row.get("mcp")) or "—")
     print("ephemeral agent %s created by %s: responsible %s, capabilities %s, host %s, "
-          "expires %s" % (
+          "expires %s%s" % (
               row["name"], row["created_by"], row["responsible"],
               _join(row.get("capabilities")), row.get("host") or "—",
-              time.strftime("%Y-%m-%d %H:%M", time.localtime(row["ephemeral_expires_ts"]))))
+              time.strftime("%Y-%m-%d %H:%M", time.localtime(row["ephemeral_expires_ts"])),
+              restriction))
     placed = row.get("placement")
     if placed:
         # #7107 (avatar B5) : le placement propre, pas seulement l'hôte — le
@@ -1170,6 +1187,12 @@ def _add_agent_parsers(parent, *, move: bool = False) -> None:
                          help="project of a generated name; repeat for several (L243)")
     p_spawn.add_argument("--cwd", default=None, help="directory (otherwise the creator's)")
     p_spawn.add_argument("--prompt", default=None, help="first prompt")
+    p_spawn.add_argument("--tool", action="append", default=None,
+                         help="tool the child may use (repeatable; subset of the parent's)")
+    p_spawn.add_argument("--mcp", action="append", default=None,
+                         help="MCP server the child may use (repeatable; subset of the parent's)")
+    p_spawn.add_argument("--context", default=None,
+                         help="one UTF-8 file (16 KiB max) loaded at the child's start")
     p_spawn.add_argument("--json", action="store_true")
     p_spawn.set_defaults(func=cmd_spawn)
 

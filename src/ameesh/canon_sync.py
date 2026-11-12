@@ -154,6 +154,7 @@ from . import harnesses
 from . import mechanics
 from . import placement as placement_mod
 from . import receipts, registry, storage
+from . import spawn as spawn_policy
 from . import visibility as visibility_mod
 from .canon import Canon, Finding
 from .config import NAME_RE
@@ -2857,7 +2858,9 @@ def parse_ttl(text: str | None) -> float:
 
 
 def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
-          cwd: str | None = None, canon: "Canon | list[Canon] | None" = None) -> dict:
+          cwd: str | None = None, canon: "Canon | list[Canon] | None" = None,
+          tools: list[str] | None = None, mcp: list[str] | None = None,
+          context: tuple[str, str] | None = None) -> dict:
     """Crée un agent éphémère : responsable copié du créateur, capacités ⊆ {read, propose}.
 
     L'insertion est atomique (INSERT … SELECT sur la ligne du créateur) : le
@@ -2876,6 +2879,13 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
     `avatar_children.place_child`. `none` refuse (`spawn-forbidden`), `pod`
     est hors lot (B5b, `spawn-pod-unsupported`), et sans placement propre
     `spawn` refuse (`spawn-no-placement`) au lieu de replier sur le parent.
+
+    #7034 : `tools`/`mcp` sont un sous-ensemble de la liste du parent, et
+    `context` est `(texte, digest)` (déjà lu et borné par l'appelant). La
+    liste, les serveurs MCP filtrés et le contexte sont écrits dans la même
+    transaction que l'enfant. Un enfant placé sur un autre hôte ne peut pas
+    lire le `.mcp.json` de son projet : les serveurs retenus sont donc joints
+    au profil, et le runner écrit son fichier privé depuis cette ligne.
     """
     if not NAME_RE.match(name or ""):
         raise SpawnError("invalid agent name: %r" % (name,))
@@ -2883,8 +2893,9 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
         raise SpawnError("invalid creator: %r" % (creator,))
     if name == creator:
         raise SpawnError("an agent cannot create itself")
+    canons = list(canon) if isinstance(canon, (list, tuple)) else [canon]
     # L42 (0031) : le nom ne doit être déclaré par AUCUN des canons configurés
-    for one in (canon if isinstance(canon, (list, tuple)) else [canon]):
+    for one in canons:
         if one is not None and one.readable and one.agent(name) is not None:
             raise SpawnError("%s has a card in the canon%s: it is not an ephemeral"
                              % (name, "" if one.is_default else " %s" % one.id))
@@ -2898,6 +2909,71 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
         raise SpawnError("creator %s is an expired ephemeral" % creator)
     if parent.get("status") == "stopped":
         raise SpawnError("creator %s is stopped" % creator)
+
+    try:
+        tools, mcp = spawn_policy.normalize(tools, mcp)
+        # Le parent : sa carte s'il est canonique, son propre profil s'il est
+        # éphémère (transitivité). Un parent canonique dont la fiche n'a pas
+        # été lue n'est JAMAIS réputé sans politique : listes vides.
+        parent_profile = None
+        card = None
+        if parent.get("ephemeral"):
+            parent_profile = storage.of(db).ephemerals.profile(creator)
+        else:
+            for one in canons:
+                if one is not None and one.readable:
+                    card = one.agent(creator)
+                    if card is not None:
+                        break
+        if parent_profile is not None:
+            parent_tools, parent_mcp = spawn_policy.parent_lists(
+                None, parent_profile)
+        elif parent.get("ephemeral"):
+            parent_tools, parent_mcp = None, None
+        elif card is not None:
+            parent_tools, parent_mcp = spawn_policy.parent_lists(
+                getattr(card, "tools", None), None)
+        else:
+            parent_tools, parent_mcp = [], []
+        spawn_policy.subset(parent_tools, parent_mcp, tools, mcp)
+        support = spawn_policy.supported(
+            str(parent.get("harness") or ""), tools, mcp)
+        # Le `.mcp.json` est le fichier du projet du parent. Pour un enfant
+        # placé, son dossier de travail est sur un autre hôte : il n'y a rien
+        # à y lire au moment du spawn (le profil porte les serveurs retenus).
+        policy_cwd = (os.path.abspath(os.path.expanduser(cwd)) if cwd
+                      else parent.get("cwd"))
+        servers = None
+        if mcp:
+            if support is None or not support.mcp_source:
+                raise spawn_policy.SpawnToolsError(
+                    "spawn-tools-unsupported",
+                    "harness %r does not declare an MCP source"
+                    % parent.get("harness"))
+            servers = spawn_policy.mcp_servers(policy_cwd, support.mcp_source, mcp)
+        profile = None
+        if tools or mcp:
+            profile = {
+                "parent": creator,
+                "harness": parent.get("harness"),
+                "tools": tools,
+                "mcp": mcp,
+                "mcp_servers": servers or {},
+                "config_digest": spawn_policy.policy_digest(tools, mcp),
+            }
+        context_row = None
+        if context is not None:
+            text, digest = context
+            text = spawn_policy.check_text(text, "--context", spawn_policy.CONTEXT_LIMIT)
+            context_row = {
+                "parent": creator,
+                "digest": digest,
+                "bytes": len(text.encode("utf-8")),
+                "text": text,
+            }
+    except spawn_policy.SpawnToolsError as exc:
+        raise SpawnError("%s: %s" % (exc.code, exc)) from None
+
     placement = None
     canons = (None if canon is None else
               list(canon) if isinstance(canon, (list, tuple)) else [canon])
@@ -2929,10 +3005,11 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
                     db, canon_obj, root_card, name, lineage_rows=lineage, cwd=cwd)
             except avatar_children.PlacementError as exc:
                 raise SpawnError(str(exc)) from exc
+    extra = {"profile": profile, "context": context_row}
     if placement is None:
         created = storage.of(db).ephemerals.create(
             name, creator, cwd=os.path.abspath(os.path.expanduser(cwd)) if cwd else None,
-            ttl_seconds=ttl_seconds)
+            ttl_seconds=ttl_seconds, **extra)
     else:
         created = storage.of(db).ephemerals.create(
             name, creator, cwd=placement.cwd, ttl_seconds=ttl_seconds,
@@ -2942,11 +3019,14 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
             evaluated_identity=placement.evaluated_identity,
             placement={"ok": placement.verdict.ok,
                        "diagnostic": placement.verdict.diagnostic,
-                       "ref": placement.verdict.ref})
+                       "ref": placement.verdict.ref},
+            **extra)
     if created is None:
         if storage.of(db).ephemerals.exists(name):
             raise SpawnError("an agent %s already exists" % name)
         raise SpawnError("creator %s changed during creation: retry" % creator)
+    created["tools"] = tools
+    created["mcp"] = mcp
     if placement is not None:
         created["placement"] = placement.describe()
     return created

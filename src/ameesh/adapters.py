@@ -1254,12 +1254,20 @@ class HarnessAdapter:
     def command(self, text: str, session_id: str | None = None,
                 model: str | None = None, effort: str | None = None,
                 patch: str | None = None, tier: str | None = None,
-                compact: int | None = None) -> list[str]:
-        """Ligne de commande d'un tour sans tête (le texte est la consigne)."""
+                compact: int | None = None,
+                spawn: Sequence[str] | None = None) -> list[str]:
+        """Ligne de commande d'un tour sans tête (le texte est la consigne).
+
+        `spawn` (#7034) porte les arguments de la politique d'enfant restreint
+        (liste d'outils, configuration MCP privée), déjà construits par
+        `spawn.argv` depuis le descripteur. Ils précèdent la commande du
+        harnais, comme les autres options.
+        """
         if self.descriptor.protocol == "acp":
             return self._acp_command(text, session_id, model, effort, tier)
         return self._argv(self.spec.headless, session_id, text,
-                          extra=self._options(model, effort, tier, patch)
+                          extra=list(spawn or ())
+                          + self._options(model, effort, tier, patch)
                           + self._compact_options(compact))
 
     def _acp_command(self, text: str, session_id: str | None, model: str | None,

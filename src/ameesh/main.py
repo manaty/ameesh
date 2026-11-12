@@ -18,7 +18,11 @@
   ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh agent retire <name> --reason R | restore <name>   take an agent out of the
         active registry (never designated, claimed nor mailed), or back (#3460);
-  ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
+  ameesh agent spawn <name> --by <creator> --ttl <duration>
+        [--tool T] [--mcp M] [--context F]   ephemeral child, restricted
+        to a subset of the parent's tools/MCP, with a bounded context;
+  ameesh child report --kind progress|question|final [--body-file F|--text T]
+        the child's report to its parent (journal + mail);
   ameesh alerts [--follow] [--json]     operational alerts (one object per line);
   ameesh approvals            list signed approvals;
   ameesh approve              sign an approval;
@@ -564,6 +568,11 @@ def _dispatch(argv: list[str] | None) -> int:
         # L86 (0033 §4) : identité des humains par OIDC et rattachement au canon
         from . import oidc
         return oidc.main(rest)
+    if command == "child":
+        # #7034 : le canal de compte rendu enfant → parent (depuis le tour de
+        # l'enfant ; l'identité vient du document de tour, jamais d'un argument)
+        from . import child_reports
+        return child_reports.main(rest)
     if command == "chat":
         # L123 : l'agent de conversation du propriétaire
         from . import chat

@@ -47,6 +47,11 @@
     "backup": {"session_files": ["projects/*/{session}.jsonl", "projects/*/{session}"]},
     "resident": {"protocol": "claude-stream-json", "command": ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--replay-user-messages", "--dangerously-skip-permissions"], "new_session": ["--session-id"], "min_version": "2.1.286"},
     "refusal": {"schema": "ameesh-refusal/1", "exit_code": 86},
+    "spawn": {
+      "contract": "ameesh-spawn-tools/1",
+      "tools": {"flag": ["--tools"]},
+      "mcp": {"flag": ["--mcp-config", "{path}", "--strict-mcp-config"], "source": ".mcp.json"}
+    },
     "install": {"note": "binaire `claude` installé par l'hôte ; distribution signée en L17"}
   }
 }
