@@ -261,6 +261,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #3185 (0479) : projets dont l'agent relit les lots, hors de son
         -- équipe (des noms, pas de contenu) — comme `projects` et `roles`
         'relit',
+        -- #7004 (0573) : harnais admis d'une identité (des noms de harnais,
+        -- pas de contenu) — même nature que `harness` et `session_harness`
+        'harnesses',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
         'workstream',
         -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,

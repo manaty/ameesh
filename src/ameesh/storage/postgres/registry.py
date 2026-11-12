@@ -88,6 +88,9 @@ AGENT_COLUMNS = """
 _GET_FIELDS = [part.strip() for part in re.sub(r"--[^\n]*", "", AGENT_COLUMNS).split(",")]
 _GET_NAMES = [part.rsplit(" as ", 1)[-1].strip() for part in _GET_FIELDS]
 _GET_NAMES += ["last_mail_ts", "last_mail_host"]
+#: #7004 : harnais admis (canon `harnesses:`), lus par la provenance d'une
+#: session liée ; clé à NULL tant que la colonne additive 0573 manque.
+_GET_NAMES += ["harnesses"]
 _GET_TIMESTAMPS = [re.sub(
     r"from (\w+)", r"from (j.__row->>'\1')::timestamptz", part)
     for part in _GET_FIELDS if part.startswith("extract(")]

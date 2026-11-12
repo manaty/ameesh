@@ -179,7 +179,9 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                # L165 (EP1) : relève (`hote`/`election`) et hôtes candidats
                "releve", "candidats",
                # #3185 : projets relus hors équipe, lus par la désignation
-               "relit")
+               "relit",
+               # #7004 : harnais admis, lus par la provenance d'une session liée
+               "harnesses")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -1542,7 +1544,7 @@ def _same(row: dict, values: dict) -> bool:
         if key == "budget_usd":
             old = None if old is None else float(old)
             new = None if new is None else float(new)
-        if key in ("capabilities", "projects", "roles", "relit"):
+        if key in ("capabilities", "projects", "roles", "relit", "harnesses"):
             old = None if old is None else list(old)
         if old != new:
             return False
@@ -2050,6 +2052,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                           else None),
             # #3185 : les projets dont l'agent relit les lots, hors son équipe
             "relit": list(agent.relit) if agent.relit is not None else None,
+            # #7004 : l'ensemble fermé des harnais admis (NULL : `harness` seul)
+            "harnesses": (list(agent.harnesses) if agent.harnesses is not None
+                          else None),
             # L42 (0031) : canon déclarant (NULL pour le canon par défaut)
             "canon": None if canon.is_default else ident,
             # Reject writes based on a pre-handoff read, including after the
