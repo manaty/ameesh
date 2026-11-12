@@ -6118,10 +6118,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                            budget=budget)
     entries += volumes["entries"]
     plan += volumes["plan"]
-    # 4b-bis. #4560 : images Docker sans tag — celles que le mesh a déclarées
-    #     jetables (`ameesh.lifetime=test`, construction d'un tour) récoltées
-    #     après le même délai d'absence continue ; les images taguées et les
-    #     images sans étiquette ne sont jamais supprimées.
+    # 4b-bis. #4560/#7081 : images Docker sans tag — celles que le mesh a
+    #     déclarées jetables (`ameesh.lifetime=test`, construction d'un tour)
+    #     récoltées après le même délai d'absence continue ; dans un docker
+    #     rootless, les dangling sans étiquette aussi. Une image taguée n'est
+    #     jamais supprimée ; un conteneur, même arrêté, garde son image.
     budget.check("images")
     images = reap_images(runtime, db, host, policy, dry_run=dry_run, now=now,
                          budget=budget)
