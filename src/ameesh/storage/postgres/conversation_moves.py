@@ -56,7 +56,7 @@ class ConversationMoves(Contract):
         if not rows:
             return None, None
         registry = tx.query(
-            """SELECT name, host, cwd, mode, status, lease_owner, lease_epoch,
+            """SELECT name, host, cwd, mode, status, lease_owner, lease_epoch, session_id,
                       (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
                        AND lease_expires_at > clock_timestamp()) AS lease_live
                  FROM agent_registry WHERE name = %s FOR UPDATE""", (rows[0]["agent"],))
@@ -140,6 +140,12 @@ class ConversationMoves(Contract):
                 return None
             if r["mode"] != "execute" or r["host"] != move["source_host"]:
                 return None
+            if (r["session_id"] or None) != (move["source_session"] or None):
+                # B4 : la session native a changé depuis le plan (rotation,
+                # bascule de lot) — l'échec ne pourrait plus la rendre
+                return self._set(tx, move_id,
+                                 "state = 'failed', error = %s, failed_at = clock_timestamp()",
+                                 ("switch: source session changed since the plan",))
             owner = r["lease_owner"] or ""
             if r["lease_live"]:
                 # the turn boundary: never during a source turn, never from an

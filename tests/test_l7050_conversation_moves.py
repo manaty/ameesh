@@ -354,6 +354,46 @@ class WorkerTest(Base):
         w._finish_move_turn(True)
         self.assertFalse(w._conversation_move_open())
 
+    def test_mediated_executor_has_no_move_hooks(self):
+        # B3 (relecture 2/2) : RemoteDb n'a pas `conversation_moves` — no-op
+        # explicite, jamais AttributeError, jamais « ouvert pour toujours »
+        from ameesh.storage.remote.client import RemoteDb
+        self.plan()
+        w = self.worker({"lease_epoch": self.row()["lease_epoch"]})
+        w.db = RemoteDb(None, object())
+        self.assertFalse(w._conversation_move_open())
+        self.assertTrue(w._open_move_turn())
+        self.assertIsNone(w._move_turn)
+
+    def test_rotation_and_lot_switch_held_while_planned(self):
+        # B4 (relecture 2/2) : rotation due et bascule de lot retenues tant
+        # qu'une tentative vise l'agent ; session et reset intacts
+        from ameesh.runner import AgentWorker
+        reset = ("SELECT session_id, session_reset_at FROM agent_registry"
+                 " WHERE name = 'avatar'")
+        self.plan()
+        before = self.db.query(reset)[0]
+        w = self.worker({"lease_epoch": self.row()["lease_epoch"]})
+        w.rotation_forcee = True
+        self.assertFalse(AgentWorker.maybe_rotate(w))
+        spec = {"lot": "4242", "prompt": "x"}
+        self.assertIs(AgentWorker.rotate_for_lot(w, spec), spec)
+        self.assertEqual(self.db.query(reset)[0], before)
+        self.assertEqual(before["session_id"], "sess-source")
+
+    def test_switch_refused_when_the_source_session_changed(self):
+        # B4 : garde au switch — une session changée depuis le plan échoue
+        # la tentative avant tout effet ; la source reste chez elle
+        move = self.plan()
+        self.db.execute("UPDATE agent_registry SET session_id = 'sess-other'"
+                        " WHERE name = 'avatar'")
+        steps = self.advance()
+        self.assertIn((move["move_id"], "failed"), steps)
+        self.assertEqual(self.moves.get(move["move_id"])["error"],
+                         "switch: source session changed since the plan")
+        row = self.row()
+        self.assertEqual((row["host"], row["session_id"]), ("source", "sess-other"))
+
     def test_runner_pass_prepares_and_switches(self):
         from types import SimpleNamespace
         from ameesh.runner import Runner

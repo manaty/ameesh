@@ -666,6 +666,14 @@ def _wake_arming_event(events) -> dict | None:
     return None
 
 
+def _move_unsupported(worker) -> bool:
+    """#7050 (B3) : l'exécuteur médié (L109) n'a pas `conversation_moves` à
+    son contrat — permanent, à ne pas confondre avec une panne de base."""
+    runner = getattr(worker, "runner", None)
+    return (bool(getattr(runner, "mediated", False))
+            or storage.is_remote(getattr(worker, "db", None)))
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -3192,6 +3200,10 @@ class AgentWorker(threading.Thread):
         ni annulée à chaque passage (2026-10-10 : 62 rotations annulées en une
         soirée), et la ligne de fin de l'épisode de pression la cite.
         """
+        # #7050 (B4) : ni résumé ni oubli de session pendant un déplacement de
+        # conversation — la source doit retrouver sa session native à l'échec
+        if self._conversation_move_open():
+            return False
         # L81 (étude §6) : l'entretien d'une session résidente se décide entre
         # deux tours, sur la mesure enregistrée au dernier tour.
         entretien = self._resident_maintenance()
@@ -3818,6 +3830,10 @@ class AgentWorker(threading.Thread):
             return spec
         lot = spec.get("lot")
         self._workdir_lot = lot or self.agent.get("session_work_item")
+        if self._conversation_move_open():
+            # #7050 (B4) : aucune bascule de session de lot pendant un
+            # déplacement (session_id et session_reset_at intacts)
+            return spec
         from . import projects as projects_mod
         multi_switch = (lot and self.proc is None
                         and len(projects_mod.agent_projects(self.agent)) > 1
@@ -9009,6 +9025,8 @@ class AgentWorker(threading.Thread):
         rendu, ligne revenue à la source) : pas de tour ici."""
         if self._move_turn is not None or self.runner.dry_run:
             return True
+        if _move_unsupported(self):
+            return True  # B3 : exécuteur médié, aucun déplacement (non supporté)
         try:
             first = conversation_move.open_first_turn(
                 self.db, self.cfg, self.state_dir, agent=self.name,
@@ -9033,7 +9051,7 @@ class AgentWorker(threading.Thread):
         if self._move_turn is not None:
             return True
         if not (getattr(self, "agent", None) or {}).get("session_id") \
-                or getattr(self, "db", None) is None:
+                or getattr(self, "db", None) is None or _move_unsupported(self):
             return False
         try:
             return storage.of(self.db).conversation_moves.open_for(self.name) is not None
