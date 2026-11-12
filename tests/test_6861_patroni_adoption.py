@@ -725,6 +725,44 @@ class VerifierClientsGardeTest(unittest.TestCase):
         self.assertIn("--geste-reel", res.stderr)
 
 
+def _verifier_clients():
+    spec = importlib.util.spec_from_file_location("verifier_clients", PATRONI / "verifier-clients.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class VerifierClientsEvaluerTest(unittest.TestCase):
+    """#7117 : une coupure de l'écouteur sans message ne prouve pas le balayage."""
+
+    def _faux(self, confirmes, vus, coupures, abonnements):
+        ecrivain = type("E", (), dict(premiere_erreur=10.0, reprise=12.0,
+                                      serveurs=[(0, "a:1"), (12, "b:2")],
+                                      confirmes=confirmes))()
+        ecouteur = type("L", (), dict(vus=vus, coupures=coupures,
+                                      abonnements=abonnements))()
+        return ecrivain, ecouteur
+
+    def test_coupure_vide_est_un_ecart(self):
+        vc = _verifier_clients()
+        ecrivain, ecouteur = self._faux([(1, 5.0), (2, 13.0)],
+                                        {1: (5.0, "notify"), 2: (13.0, "notify")},
+                                        [10.5], [0.0, 11.5])
+        ecarts, mesures = vc.evaluer(ecrivain, ecouteur, [1, 2], 9.0, 60, 300)
+        self.assertEqual(mesures["messages_pendant_la_coupure"], 0)
+        self.assertTrue(any("balayage n'est pas prouvé" in e for e in ecarts), ecarts)
+
+    def test_message_de_la_coupure_remis_par_balayage(self):
+        vc = _verifier_clients()
+        ecrivain, ecouteur = self._faux([(1, 5.0), (2, 12.0), (3, 13.0)],
+                                        {1: (5.0, "notify"), 2: (12.5, "balayage"),
+                                         3: (13.0, "notify")},
+                                        [10.5], [0.0, 12.5])
+        ecarts, mesures = vc.evaluer(ecrivain, ecouteur, [1, 2, 3], 9.0, 60, 300)
+        self.assertEqual(ecarts, [])
+        self.assertEqual(mesures["messages_pendant_la_coupure"], 1)
+
+
 @unittest.skipUnless(all((PG_BIN / b).exists() for b in ("initdb", "pg_ctl", "pg_basebackup")),
                      "binaires serveur PostgreSQL 17 absents")
 @unittest.skipIf(os.geteuid() == 0, "initdb refuse root")
@@ -821,6 +859,9 @@ class VerifierClientsTest(unittest.TestCase):
         self.assertLess(mesures["delai_nouveau_primaire_s"], 60)
         self.assertEqual(len(set(mesures["serveurs_ecrivain"])), 2)
         self.assertIn("reprise_ecouteur_s", mesures)
+        # #7117 : l'écouteur attend un COMMIT avant de se réabonner, la
+        # coupure n'est jamais vide et ses messages viennent du balayage.
+        self.assertGreaterEqual(mesures["messages_pendant_la_coupure"], 1)
 
 
 if __name__ == "__main__":

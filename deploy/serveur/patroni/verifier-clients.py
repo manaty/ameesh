@@ -13,7 +13,10 @@ du mesh et mesure ce que l'acceptation d'EP8.4 exige :
 - un écouteur LISTEN sur le même DSN qui, après chaque reconnexion, se
   réabonne puis balaie la table avant d'attendre : c'est le balayage du
   runner (#6869), qui remet un message envoyé pendant la bascule sans
-  attendre le sondage ; l'écouteur n'a pas de sondage du tout ;
+  attendre le sondage ; l'écouteur n'a pas de sondage du tout ; après une
+  coupure, il attend qu'un COMMIT de l'écrivain soit confirmé avant de se
+  réabonner : la coupure contient ainsi toujours au moins un message, que
+  seul le balayage peut remettre (#7117) ;
 - `--tuer` lance la commande d'exploitant qui tue le primaire (le script ne
   touche aucun hôte lui-même) ; on mesure le délai jusqu'au premier COMMIT
   sur le nouveau primaire (cible 60 s, exigence 300 s), la reprise de
@@ -133,16 +136,23 @@ class Ecrivain(threading.Thread):
 
 
 class Ecouteur(threading.Thread):
-    def __init__(self, connecter, table, canal, journal, arret):
+    def __init__(self, connecter, table, canal, journal, arret, ecrivain):
         super().__init__(daemon=True)
         self.connecter, self.table, self.canal = connecter, table, canal
-        self.journal, self.arret = journal, arret
+        self.journal, self.arret, self.ecrivain = journal, arret, ecrivain
         self.vus = {}                # n -> (t_vu, par « notify » ou « balayage »)
         self.abonnements = []        # t de chaque LISTEN réussi
         self.coupures = []
 
     def _voir(self, n, t, par):
         self.vus.setdefault(n, (t, par))
+
+    def _attendre_un_commit(self, depuis):
+        # Synchronisation du témoin : un COMMIT confirmé après la coupure et
+        # avant le LISTEN, dont le NOTIFY est perdu pour cet écouteur.
+        confirmes = self.ecrivain.confirmes
+        while not self.arret.is_set() and not (confirmes and confirmes[-1][1] > depuis):
+            self.arret.wait(0.05)
 
     def run(self):
         attente = 0.2
@@ -163,9 +173,11 @@ class Ecouteur(threading.Thread):
                     for notif in conn.notifies(timeout=0.5, stop_after=64):
                         self._voir(int(notif.payload), maintenant(), "notify")
             except Exception as exc:
-                self.coupures.append(maintenant())
+                t_coupure = maintenant()
+                self.coupures.append(t_coupure)
                 self.journal.note("ecouteur", "coupure", erreur=type(exc).__name__)
                 self.arret.wait(attente)
+                self._attendre_un_commit(t_coupure)
                 attente = min(attente * 2, 2.0)
             finally:
                 if conn is not None:
@@ -211,6 +223,9 @@ def evaluer(ecrivain, ecouteur, presents, t_tuer, cible, exigence):
         coupure = min([t for t in ecouteur.coupures if t >= t_tuer] or [apres[0]])
         pendant = [n for n, t in ecrivain.confirmes if coupure <= t < apres[0]]
         mesures["messages_pendant_la_coupure"] = len(pendant)
+        if not pendant:
+            ecarts.append("aucun COMMIT confirmé pendant la coupure de l'écouteur : "
+                          "le balayage n'est pas prouvé")
         mal_remis = [n for n in pendant if ecouteur.vus.get(n, (0, ""))[1] != "balayage"]
         if mal_remis:
             ecarts.append("messages de la coupure non remis par le balayage : %s" % mal_remis[:20])
@@ -262,7 +277,7 @@ def main(argv=None) -> int:
 
     journal, arret = Journal(), threading.Event()
     ecrivain = Ecrivain(connecter, table, canal, args.pas, journal, arret)
-    ecouteur = Ecouteur(connecter, table, canal, journal, arret)
+    ecouteur = Ecouteur(connecter, table, canal, journal, arret, ecrivain)
     ecouteur.start()
     ecrivain.start()
     code_tuer = None
