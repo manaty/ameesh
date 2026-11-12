@@ -260,8 +260,9 @@ class LeaseFenceTest(unittest.TestCase):
 
     #: The writes of a passage, named here rather than read from `_FENCED`.
     WRITES = {
-        "runtime": (train_runtime.Runtime, ("save", "release", "enroll", "quarantine",
-                                            "start_ci", "reconcile", "promote")),
+        "runtime": (train_runtime.Runtime, ("save", "abandon", "release", "enroll",
+                                            "quarantine", "start_ci", "reconcile",
+                                            "promote")),
         "ledger": (train_reservation.ReservedLedger, ("acquire", "before_publish")),
         "repository": (train_git.Repository, ("publish",)),
         "migrations": (train_migrations.Allocator, ("reserve", "landed")),
