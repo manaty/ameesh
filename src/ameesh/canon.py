@@ -1894,6 +1894,16 @@ def _validate_tenancy(canon: "Canon", host: Any, add) -> None:
                 host.fiche, host=host.title)
         else:
             seen.add(resolved)
+    # `~` est le home du tenant de chaque agent (canon sync) ; un chemin
+    # absolu serait un dossier commun à des UID distincts
+    paths = ([policy.work_root] if policy.work_root else []) \
+        + list((policy.work_roots or {}).values()) + list((policy.work_dirs or {}).values())
+    absolute = sorted({str(p) for p in paths if not str(p).startswith("~")})
+    if absolute:
+        add("host-shared-workspace-absolute", WARNING,
+            "shared host %s: workspace(s) %s outside `~` are common to all tenants' "
+            "system users; use `~/…` (the home of each agent's tenant)"
+            % (host.title, ", ".join(absolute)), host.fiche, host=host.title)
     modes = policy.credential_modes
     if modes is None or any(m not in SHARED_CREDENTIAL_MODES for m in modes):
         add("host-shared-credential-mode", ERROR,

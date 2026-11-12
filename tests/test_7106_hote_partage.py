@@ -71,6 +71,15 @@ class SharedCanonTest(test_canon._TmpMixin, unittest.TestCase):
         write(self.root, "hotes/banc.md", banc_partage(credential_modes=None))
         self.assertIn("host-shared-credential-mode", self.errors())
 
+    def test_dossier_absolu_averti(self):
+        write(self.root, "hotes/banc.md", banc_partage())
+        self.assertNotIn("host-shared-workspace-absolute",
+                         codes(canon.validate(self.load()), canon.WARNING))
+        write(self.root, "hotes/banc.md", banc_partage(
+            workspaces="{roots: {acme-web: /srv/acme/acme-web}}"))
+        self.assertIn("host-shared-workspace-absolute",
+                      codes(canon.validate(self.load()), canon.WARNING))
+
     def test_partage_illisible_ferme(self):
         write(self.root, "hotes/banc.md", banc_partage(shared="oui"))
         self.assertTrue(self.load().host("banc").policy.shared)
@@ -142,6 +151,14 @@ class SharedClaimTest(test_canon._CanonDbCase):
         self.assertIsNotNone(lease)
         registry.release(self.db, "relecteur", "banc/alice", lease["lease_epoch"])
         self.assertIsNotNone(registry.claim(self.db, "ouvrier", "banc/bruno", 600))
+
+    def test_dossier_dans_le_home_du_tenant(self):
+        # le superviseur synchronise ; `~` reste le home du tenant de l'agent
+        write(self.root, "hotes/banc.md", banc_partage(
+            workspaces="{roots: {acme-web: ~/acme/acme-web}}"))
+        self.sync("banc")
+        self.assertEqual(self.row("relecteur")["cwd"], "/home/ameesh-alice/acme/acme-web")
+        self.assertEqual(self.row("ouvrier")["cwd"], "/home/ameesh-bruno/acme/acme-web")
 
     def test_tenant_retire_du_canon_ne_reclame_plus(self):
         write(self.root, "hotes/banc.md", banc_partage(tenants=[BRUNO]))

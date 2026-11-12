@@ -68,6 +68,11 @@ def unix_user(tenant: str) -> str:
     return (USER_PREFIX + ident)[:32].rstrip("-")
 
 
+def tenant_home(tenant: str) -> str:
+    """Home de l'utilisateur système du tenant (celui que crée `add_plan`)."""
+    return "/home/%s" % unix_user(tenant)
+
+
 def runner_id(host: str, tenant: str) -> str:
     """Identifiant d'exécuteur du runner d'un tenant (stable, sans secret)."""
     return "%s/%s" % (host, check_tenant(tenant)[len("human:"):])
@@ -198,7 +203,7 @@ def add_plan(host: str, tenant: str) -> list[list[str]]:
     les secrets (clés d'organisation, Q2) sont installés ensuite par
     l'humain ou son tenant, jamais par ce plan ni par le canon."""
     user = unix_user(tenant)
-    home = "/home/%s" % user
+    home = tenant_home(tenant)
     return [
         ["useradd", "--create-home", "--home-dir", home, "--user-group",
          "--shell", "/usr/sbin/nologin", user],

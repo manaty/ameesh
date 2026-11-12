@@ -1444,11 +1444,31 @@ def _write_candidate(db: Db, canon: Canon, agent, admission, host: str, *,
             else None)
     storage.of(db).canon.write_candidate(
         agent.title, host, canon=canon_key, preference_rank=rank,
-        cwd=os.path.expanduser(cwd) if cwd else None,
+        cwd=_expand_work_dir(canon, host, agent, cwd),
         ok=verdict.ok, diagnostic=verdict.diagnostic, ref=verdict.ref,
         harness=agent.harness or "other", provider=agent.provider,
         model=agent.model,
         credential_mode=admission.credential_mode or agent.credential_mode)
+
+
+def _expand_work_dir(canon: Canon, host: str, agent, cwd: str | None) -> str | None:
+    """Dossier de travail développé (`~`).
+
+    #7106 : sur un hôte partagé, `~` est le home du tenant de l'agent
+    (`tenancy.tenant_home`), jamais celui du superviseur qui synchronise : son
+    home est 0700, le runner du tenant n'y entrerait pas. Un responsable qui
+    n'est pas un tenant valide garde le développement ordinaire (son placement
+    est refusé de toute façon)."""
+    if not cwd:
+        return None
+    card = canon.host(host)
+    if card is not None and card.policy.shared and (cwd == "~" or cwd.startswith("~/")):
+        from . import tenancy
+        try:
+            return tenancy.tenant_home(agent.responsible) + cwd[1:]
+        except tenancy.TenancyError:
+            pass
+    return os.path.expanduser(cwd)
 
 
 def _write_tenancy(db: Db, canon: Canon, host: str, canon_key: str) -> None:
@@ -2040,7 +2060,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         values = {
             "harness": agent.harness or "other",
             "host": host,
-            "cwd": os.path.expanduser(cwd) if cwd else None,
+            "cwd": _expand_work_dir(canon, host, agent, cwd),
             "model": agent.model,
             "budget_usd": agent.budget_usd_per_day,
             "responsible": responsible,
