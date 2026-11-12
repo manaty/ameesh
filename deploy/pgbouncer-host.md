@@ -149,7 +149,12 @@ the `[databases]` line only when it differs (backup
 `pgbouncer.ini.avant-amont`) and sends `RELOAD`. `server_fast_close = 1`
 (reloadable: a HUP applies it, verified with `SHOW CONFIG` on 1.26) closes the
 old upstream's server sessions at the end of their transaction.
-`install-amont` writes and enables a user timer running it every 15 s. The
+`install-amont` writes and enables a user timer running it every 15 s, with
+the stable venv launcher (`~/.local/share/ameesh/venv/bin/python`, never the
+resolved system python, which lacks psycopg) and the stable checkout's script
+when present; it first runs that exact command with `amont --dry-run` and
+installs nothing if it fails. A failed `RELOAD` puts the previous
+`pgbouncer.ini` back, so the next pass retries. The
 procedure, the refusals and the rollback are in `docs/EXPLOITATION.md`
 (« Amont du PgBouncer local »).
 

@@ -426,7 +426,14 @@ def amont(home, state, *, connect=None, reload=None, dry_run=False):
     os.chmod(backup, 0o600)
     replace(config, with_upstream(text, dbname, host, port).encode())
     os.chmod(config, 0o600)
-    (reload or console_reload)(state)
+    try:
+        (reload or console_reload)(state)
+    except Exception:
+        # The pool still runs the old upstream: put the old file back so the
+        # next pass sees the difference again and retries the reload.
+        replace(config, text.encode())
+        os.chmod(config, 0o600)
+        raise
     return 'changed'
 
 
@@ -462,10 +469,30 @@ WantedBy=timers.target
 '''
 
 
+def amont_command(home, executable, script):
+    """(python, script) for the timer, both stable across ameesh updates.
+
+    The versioned venv's python is a symlink to the system python, which lacks
+    psycopg once resolved, and the versioned venv and source snapshot are
+    pruned by later updates: the stable launcher and the stable checkout are
+    preferred, otherwise the unresolved paths of this run are kept."""
+    base = home / '.local/share/ameesh'
+    launcher = base / 'venv/bin/python'
+    python = str(launcher) if os.access(launcher, os.X_OK) else os.path.abspath(executable)
+    stable = base / 'src/deploy/pgbouncer-host.py'
+    script = str(stable) if stable.is_file() else os.path.abspath(script)
+    return python, script
+
+
 def install_amont(home, python, script):
     """Write and start the user timer that runs `amont` every 15 s."""
     if not (home / '.config/pgbouncer' / AMONT_DSN).is_file():
         raise ValueError('upstream DSN file missing')
+    if not all(re.fullmatch(r'/[A-Za-z0-9_./-]+', path) for path in (python, script)):
+        raise ValueError('unsupported timer command path')
+    # The exact unit command must work (psycopg importable, script that knows
+    # `amont`, primary reachable), or every pass would fail unseen.
+    run([python, script, 'amont', '--dry-run'])
     units = home / '.config/systemd/user'
     service = units / 'ameesh-pgbouncer-amont.service'
     timer = units / 'ameesh-pgbouncer-amont.timer'
@@ -626,7 +653,7 @@ def main():
     elif args.action == 'amont':
         amont(home, state, dry_run=args.dry_run)
     elif args.action == 'install-amont':
-        install_amont(home, os.path.realpath(sys.executable), os.path.realpath(__file__))
+        install_amont(home, *amont_command(home, sys.executable, __file__))
     else:
         switch(home, state, rollback=args.action == 'rollback')
 

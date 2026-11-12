@@ -92,8 +92,20 @@ class CopieHebdoTest(unittest.TestCase):
         self.assertTrue(other.exists(), "un dump de staging n'est pas une copie hebdomadaire")
 
     def test_invalid_settings_are_refused(self):
-        done = self.run_copy(COPIE_GARDEES="0")
+        for setting in ("COPIE_GARDEES", "COPIE_PG_MIN"):
+            with self.subTest(setting=setting):
+                done = self.run_copy(**{setting: "0"})
+                self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                self.assertIn(setting + " invalide", done.stderr)
+
+    def test_missing_client_tool_is_refused_with_code_2(self):
+        # Relecture impl-08 : sous set -e/pipefail, l'outil absent sortait en 127.
+        # (un pg_restore système peut exister : le faux rend le 127 du shell)
+        (self.bench.root / "bin/pg_restore").write_text("#!/bin/sh\nexit 127\n")
+        done = self.run_copy()
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn("pg_restore absent", done.stderr)
+        self.assertEqual(self.copies(), [])
 
     def test_installer_writes_the_weekly_timer_once(self):
         done = self.run_copy("--installer")

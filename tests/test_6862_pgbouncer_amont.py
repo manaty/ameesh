@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import re
 import shutil
 import socket
 import stat
@@ -167,6 +168,77 @@ class AmontUnitTest(unittest.TestCase):
                     self.recipe.main()
                 follow.assert_not_called()
                 install.assert_not_called()
+
+    def test_a_failed_reload_puts_the_old_upstream_back(self):
+        # Relecture impl-08 : sinon le passage suivant trouve la nouvelle
+        # ligne, ne recharge plus, et le pool reste sur l'ancien amont.
+        def refuse(_state):
+            raise OSError("console down")
+        with self.assertRaises(OSError):
+            self.recipe.amont(self.home, self.state, connect=self.connect_to(
+                FakeConn("10.78.0.11")), reload=refuse)
+        self.assertEqual(self.ini.read_text(), INI)
+        self.assertEqual(stat.S_IMODE(self.ini.stat().st_mode), 0o600)
+        self.assertEqual(self.run_amont(FakeConn("10.78.0.11")), "changed")
+        self.assertEqual(self.reloads, [self.state])
+
+    def test_timer_command_keeps_the_venv_and_a_stable_script(self):
+        # Relecture impl-08 : realpath(sys.executable) menait au python
+        # système, sans psycopg ; le venv versionné et l'instantané de source
+        # disparaissent aux mises à jour suivantes.
+        system = self.tmp / "usr/bin/python3.12"
+        system.parent.mkdir(parents=True)
+        system.write_text("")
+        versioned = self.home / ".local/share/ameesh/venv-abc1234/bin/python"
+        versioned.parent.mkdir(parents=True)
+        versioned.symlink_to(system)
+        snapshot = self.home / ".local/share/ameesh/src-abc1234/deploy/pgbouncer-host.py"
+        snapshot.parent.mkdir(parents=True)
+        snapshot.write_text("")
+        python, script = self.recipe.amont_command(self.home, str(versioned), str(snapshot))
+        self.assertEqual((python, script), (str(versioned), str(snapshot)))
+        launcher = self.home / ".local/share/ameesh/venv/bin/python"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\n")
+        launcher.chmod(0o755)
+        stable = self.home / ".local/share/ameesh/src/deploy/pgbouncer-host.py"
+        stable.parent.mkdir(parents=True)
+        stable.write_text("")
+        self.assertEqual(self.recipe.amont_command(self.home, str(versioned), str(snapshot)),
+                         (str(launcher), str(stable)))
+
+    def test_install_through_main_checks_the_unit_command_first(self):
+        # `main` refuses a home outside [A-Za-z0-9_./-] ; TMPDIR may hold `~`.
+        parent = next((d for d in (tempfile.gettempdir(), os.path.expanduser("~/.cache"))
+                       if re.fullmatch(r"/[A-Za-z0-9_./-]+", d) and os.path.isdir(d)), None)
+        if parent is None:
+            self.skipTest("no temporary directory with a plain path")
+        root = pathlib.Path(tempfile.mkdtemp(prefix="t6862-main-", dir=parent))
+        self.addCleanup(shutil.rmtree, root, True)
+        self.home = root / "home"
+        shutil.copytree(self.tmp / "home", self.home)
+        (self.home / ".local/state/pgbouncer").chmod(0o700)
+        versioned = self.home / ".local/share/ameesh/venv-abc1234/bin/python"
+        versioned.parent.mkdir(parents=True)
+        versioned.symlink_to(self.tmp / "system-python")
+        with mock.patch("sys.argv", ["recipe", "install-amont"]), \
+                mock.patch("sys.executable", str(versioned)), \
+                mock.patch.object(self.recipe, "approved_home", return_value=self.home), \
+                mock.patch.object(self.recipe, "run") as run:
+            self.recipe.main()
+        service = (self.home / ".config/systemd/user/ameesh-pgbouncer-amont.service").read_text()
+        script = os.path.abspath(self.recipe.__file__)
+        self.assertIn("ExecStart=%s %s amont\n" % (versioned, script), service)
+        self.assertNotIn(os.path.realpath(versioned), service)
+        self.assertEqual(run.call_args_list[0].args[0],
+                         [str(versioned), script, "amont", "--dry-run"])
+
+    def test_a_failing_unit_command_installs_nothing(self):
+        with mock.patch.object(self.recipe, "run",
+                               side_effect=subprocess.CalledProcessError(1, "x")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.recipe.install_amont(self.home, "/usr/bin/python3", "/src/x.py")
+        self.assertFalse((self.home / ".config/systemd/user").exists())
 
     def test_install_writes_the_timer_once(self):
         with mock.patch.object(self.recipe, "run") as run:

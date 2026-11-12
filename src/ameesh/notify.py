@@ -2850,13 +2850,16 @@ class Notifier:
         current += migration_current
         # #6862 : le collecteur de santé de la grappe. Une lecture non
         # concluante (fichier absent ou périmé) garde les alertes reprises ;
-        # `db_health_stale`, elle, est rendue et se résout normalement.
+        # `db_health_stale` est rendue quand le document est périmé, gardée
+        # sinon (fichier absent ou illisible : rien n'est résolu).
         health_current, health_errors = db_sante.local(self.cfg, now)
         for error in health_errors:
             self.log("database health collector not conclusive (%s): "
                      "its local alerts kept" % error)
         if health_errors:
             unobserved.update(db_sante.FORWARDED)
+            if not any(a.get("type") == db_sante.STALE_TYPE for a in health_current):
+                unobserved.add(db_sante.STALE_TYPE)
         current += health_current
         router = Router(self.cfg, None, self.ncfg)
         wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}

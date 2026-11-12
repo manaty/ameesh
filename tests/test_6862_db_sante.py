@@ -172,6 +172,17 @@ class CollecteurTest(unittest.TestCase):
         self.assertEqual(self.passage(notifier, 1020.0),
                          ["db_etcd_no_quorum", "db_no_primary"])
 
+    def test_missing_file_keeps_the_stale_alert_too(self):
+        """Relecture impl-08 : au redémarrage, `/run/ameesh-db` est là mais
+        `alertes.json` pas encore ; `db_health_stale` n'est pas résolue."""
+        self.collecter(SANS_PRIMAIRE, 1000.0)
+        notifier = self.notifier(1010.0)
+        self.passage(notifier, 1010.0)
+        self.passage(notifier, 1000.0 + db_sante.STALE_S + 60)
+        self.fichier.unlink()
+        self.assertEqual(self.passage(notifier, 1000.0 + db_sante.STALE_S + 90),
+                         ["db_etcd_no_quorum", "db_health_stale", "db_no_primary"])
+
     def test_host_outside_the_cluster_has_no_source(self):
         cfg = dataclasses.replace(self.cfg, db_health_file=str(self.root / "absent/alertes.json"))
         self.assertEqual(db_sante.local(cfg, 1.0), ([], []))

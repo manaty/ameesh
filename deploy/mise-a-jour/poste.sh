@@ -397,9 +397,10 @@ sauvegarder_mesh() {
   ls -l "$sortie"
 }
 
-# #6862 : majeur d'un outil client PostgreSQL (« pg_dump (PostgreSQL) 17.6 »).
+# #6862 : majeur d'un outil client PostgreSQL (« pg_dump (PostgreSQL) 17.6 »),
+# vide si l'outil manque (jamais d'arrêt 127 sous set -e/pipefail).
 majeur_pg() {
-  "$1" --version 2>/dev/null | sed -n 's/^[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1
+  { "$1" --version 2>/dev/null || true; } | sed -n 's/^[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1
 }
 
 copie_hebdo() {
@@ -408,7 +409,7 @@ copie_hebdo() {
     copie_hebdo_installer
     return
   fi
-  for _v in COPIE_LIBRE_MIN_GIO COPIE_GARDEES; do
+  for _v in COPIE_LIBRE_MIN_GIO COPIE_GARDEES COPIE_PG_MIN; do
     [[ ${!_v} =~ ^[0-9]+$ ]] && [ "${!_v}" -gt 0 ] \
       || { echo "$_v invalide : « ${!_v} » (entier > 0 attendu)" >&2; return 2; }
   done
