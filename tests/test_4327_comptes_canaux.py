@@ -135,11 +135,15 @@ class RendererTest(unittest.TestCase):
                 delegation.question(altered)
         prior={path:dict(sha256='e'*64,mode=0o644) for path in bundle['files']}
         full=delegation.render(plan(),account_ids=IDS,previous_files=prior)
-        text=channels.question('c'*80,full,expires_at=2000000000)
+        text=channels.question('c'*80,full,expires_at=int(time.time())+600)
         self.assertLessEqual(len(text.encode()),channels.MAX_QUESTION)
         self.assertIn('"handoff":"ameesh-handoff 981:981"',text)
-        self.assertLessEqual(len(channels.revoke_question('x',full,expires_at=2000000000).encode()),
+        self.assertLessEqual(len(channels.revoke_question('x',full,expires_at=int(time.time())+600).encode()),
                              channels.MAX_QUESTION)
+        # #7013: a window no fresh owner signature covers is never rendered.
+        for render in (channels.question,channels.revoke_question):
+            with self.subTest(render=render.__name__),self.assertRaisesRegex(channels.BootstrapError,'at most'):
+                render('x',full,expires_at=int(time.time())+2*86400)
 
     def test_scopes_are_distinct_from_the_release_bootstrap(self):
         bundle=delegation.render(plan(),account_ids=IDS)
@@ -247,6 +251,9 @@ class Fixture:
         (runtime_tree/'bin/python').write_bytes(b'synthetic executable, never launched')
         lib=self.root/'opt/ameesh-release/lib'; lib.mkdir(mode=0o700)
         for name in ('hote-handoff.py','hote-secrets.py'): (lib/name).write_text('# synthetic pinned source\n')
+        # A setgid parent (offload guest job directory) is inherited by mkdir;
+        # the trees must not carry it (runtime.inventory refuses 07000).
+        for directory in (runtime_tree,runtime_tree/'bin',lib): directory.chmod(0o700)
         inventory=adapter_mod.runtime.inventory
         self.plan=plan(inventory(runtime_tree)['digest'],inventory(lib)['digest'])
         for directory in ('etc/ssh','usr/local/libexec','etc/sudoers.d','etc/ssh/sshd_config.d'):
@@ -267,7 +274,8 @@ class Fixture:
         self.bundle=json.loads((self.stage/'bundle.json').read_text())
 
     def stage_plan(self,**extra):
-        value=dict(delegation='canaux',plan=self.plan,account_ids=IDS,expires_at=2000000000,**extra)
+        # #7013: a prepared window ends within one fresh signature.
+        value=dict(delegation='canaux',plan=self.plan,account_ids=IDS,expires_at=int(time.time())+600,**extra)
         path=self.stage/'plan.json'; path.unlink(missing_ok=True)
         path.write_text(json.dumps(value)); path.chmod(0o600)
 
@@ -291,7 +299,7 @@ class BackendChannelTest(Fixture,unittest.TestCase):
             with self.subTest(extra=extra),self.assertRaisesRegex(backend_mod.BackendError,'exact staged plan'):
                 self.backend.inventory(self.operation)
         self.stage_plan(); (self.stage/'plan.json').write_text(json.dumps(dict(
-            delegation='autre',plan=self.plan,account_ids=IDS,expires_at=2000000000)))
+            delegation='autre',plan=self.plan,account_ids=IDS,expires_at=int(time.time())+600)))
         with self.assertRaisesRegex(backend_mod.BackendError,'exact staged plan'):
             self.backend.inventory(self.operation)
 
@@ -390,7 +398,7 @@ class BackendChannelTest(Fixture,unittest.TestCase):
         self.assertEqual(set(self.system.accounts),{'ameesh-handoff','ameesh-secrets'})
         for logical in delegation.DIRECTORIES: self.assertTrue(self.path(logical).is_dir(),logical)
         self.assertEqual(self.system.reloads,2)
-        question=self.backend.revoke_question(self.operation,2000000000)
+        question=self.backend.revoke_question(self.operation,int(time.time())+600)
         self.assertTrue(question['question'].startswith(channels.REVOKE_PREFIX))
         self.assertEqual(question['options'],channels.REVOKE_OPTIONS)
 

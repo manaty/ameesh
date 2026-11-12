@@ -2,6 +2,7 @@
 """Bounded two-key delegation; no host effects or credentials."""
 import base64
 import copy
+import time
 import unittest
 from unittest import mock
 
@@ -52,7 +53,7 @@ class LocalTransportTest(unittest.TestCase):
         from tests import test_l232b_bootstrap_installer as installer_fixture
         bootstrap=installer_fixture.installer.bootstrap
         bundle=delegation.render(dict(self.plan,local_transport=self.local),account_ids={'uid':600,'gid':600})
-        text=bootstrap.question('fixture-two-keys',bundle,expires_at=2000000000)
+        text=bootstrap.question('fixture-two-keys',bundle,expires_at=int(time.time())+600)
         self.assertIn('"local_transport":{"key_sha256":"'
                       +bootstrap.protocol.identity(self.local['controller_key'])
                       +'","source":"127.0.0.1/32"}',text)

@@ -111,13 +111,13 @@ class PlanPrepareTest(Fixture,unittest.TestCase):
         self.assertEqual(effects['/opt/ameesh-release/store'],'refuse untrusted')
 
     def test_prepare_replay_repairs_a_lost_or_altered_question_only(self):
-        value=dict(plan=self.bundle['plan'],account_ids=dict(uid=987,gid=987),expires_at=2000000000)
+        value=dict(plan=self.bundle['plan'],account_ids=dict(uid=987,gid=987),expires_at=self.expires)
         plan_path=self.stage/'plan.json'; plan_path.write_text(json.dumps(value)); plan_path.chmod(0o600)
         bundle=self.stage/'bundle.json'; question=self.stage/'question.txt'
         before=(bundle.stat().st_ino,bundle.stat().st_mtime_ns,
                 hashlib.sha256(bundle.read_bytes()).hexdigest())
         for altered in (None,self.question.replace('"install"','"revoke"'),
-                        bootstrap.question(self.operation,self.bundle,expires_at=1999999999)):
+                        bootstrap.question(self.operation,self.bundle,expires_at=self.expires-1)):
             with self.subTest(altered=altered is not None):
                 if altered is None: question.unlink(missing_ok=True)
                 else: question.write_text(altered); question.chmod(0o600)
