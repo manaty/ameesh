@@ -40,8 +40,13 @@ if [ -r /etc/ameesh/sauvegarde.env ]; then
     . /etc/ameesh/sauvegarde.env
     storage=1
 fi
+# #6862 (EP8.5) : le DSN de config.json est celui de la grappe (multi-hôtes,
+# docs/EXPLOITATION.md « DSN multi-hôtes ») ; --primary force
+# target_session_attrs=read-write : le dump lit le primaire où qu'il soit,
+# une seule fois par jour depuis l'hôte qui porte ce minuteur, et un hôte
+# unique devenu secours est refusé plutôt que dumpé.
 "$python" "$helper" dump --config /home/ameesh/.config/ameesh/config.json --output "$f" \
-    --timeout "${AMEESH_DUMP_TIMEOUT_S:-3600}"
+    --timeout "${AMEESH_DUMP_TIMEOUT_S:-3600}" --primary
 if [ "$storage" = 1 ]; then
     export SCW_ACCESS_KEY SCW_SECRET_KEY SCW_BUCKET SCW_REGION
     "$python" "$helper" upload --file "$f" --host "$(hostname)"

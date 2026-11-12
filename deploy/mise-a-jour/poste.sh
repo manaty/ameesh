@@ -14,6 +14,14 @@
 #                reportable d'emblée), 1 = autre échec
 #   sauvegarder  dump de la base du mesh sur la VM (copie gardée), rapatrié
 #                compressé, puis pg_dump de l'ancienne base
+#   copie-hebdo [--installer]
+#                #6862 (EP8.5, décision owner #207987 point 7) : la copie
+#                hebdomadaire du poste, hors région, jamais votante : si le
+#                disque est sain (place libre >= COPIE_LIBRE_MIN_GIO, écriture
+#                possible) et pg_dump/pg_restore >= 17, le dump serveur du jour
+#                est rapatrié en mesh-hebdo-*.dump ; COPIE_GARDEES copies sont
+#                gardées. 3 = disque refusé, 2 = outils trop anciens.
+#                --installer pose la minuterie utilisateur hebdomadaire
 #   migrer [--additif-seulement] [REF]
 #                migrations de REF (défaut HEAD, comme installer), lancées
 #                depuis son instantané AVANT de l'installer : base du mesh
@@ -110,6 +118,11 @@ SAUVEGARDES_VM=${SAUVEGARDES_VM%/}
 #: zéros de tête sont normalisés) ; la progression et les octets déjà écrits
 #: sont journalisés par le récepteur en cas d'échec
 RECUPERATION_TIMEOUT=${RECUPERATION_TIMEOUT:-3600}
+#: #6862 : copie hebdomadaire du poste — place libre minimale (Gio), copies
+#: gardées, majeur minimal de pg_dump/pg_restore (le serveur est en 17)
+COPIE_LIBRE_MIN_GIO=${COPIE_LIBRE_MIN_GIO:-20}
+COPIE_GARDEES=${COPIE_GARDEES:-4}
+COPIE_PG_MIN=${COPIE_PG_MIN:-17}
 # #6537 (suite de #6528) : l'arrêt prouvé n'attend plus TimeoutStopSec
 # (35 min) en plein tour. Fin de tour attendue au plus ARRET_BORNE s par runner
 # et ARRET_BUDGET s sur toute l'étape ; puis arrêt forcé (second SIGTERM, puis
@@ -296,9 +309,24 @@ sauvegarde_serveur() {
 }
 
 sauvegarder() {
-  local jour sortie meta statut distant taille sha statuts dsn
+  local jour dsn
   jour=$(date +%F-%H%M)
-  sortie="$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  sauvegarder_mesh "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  if ancienne; then
+    etape "ancienne base"
+    dsn_part dsn "$CONFIG_RESTE" dsn || return
+    # #5682 : ce dump garde le défaut borné du helper (3600 s) ; le budget du
+    # stade « sauvegarde » de staging.sh le compte avec le dump serveur (9060)
+    # et le rapatriement (3600).
+    "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG_RESTE" \
+      --output "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
+    ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
+  fi
+}
+
+# Dump serveur de la base du mesh, rapatrié dans $1 (taille et SHA-256 vérifiés).
+sauvegarder_mesh() {
+  local sortie=$1 meta statut distant taille sha statuts dsn
   case "$RECUPERATION_TIMEOUT" in
     ''|*[!0-9]*|0) echo "RECUPERATION_TIMEOUT doit être un entier positif" >&2; return 2 ;;
   esac
@@ -367,16 +395,93 @@ sauvegarder() {
     return 1
   fi
   ls -l "$sortie"
-  if ancienne; then
-    etape "ancienne base"
-    dsn_part dsn "$CONFIG_RESTE" dsn || return
-    # #5682 : ce dump garde le défaut borné du helper (3600 s) ; le budget du
-    # stade « sauvegarde » de staging.sh le compte avec le dump serveur (9060)
-    # et le rapatriement (3600).
-    "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG_RESTE" \
-      --output "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
-    ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
+}
+
+# #6862 : majeur d'un outil client PostgreSQL (« pg_dump (PostgreSQL) 17.6 »).
+majeur_pg() {
+  "$1" --version 2>/dev/null | sed -n 's/^[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+copie_hebdo() {
+  local libre_kio min_kio sonde outil majeur jour
+  if [ "${1:-}" = --installer ]; then
+    copie_hebdo_installer
+    return
   fi
+  for _v in COPIE_LIBRE_MIN_GIO COPIE_GARDEES; do
+    [[ ${!_v} =~ ^[0-9]+$ ]] && [ "${!_v}" -gt 0 ] \
+      || { echo "$_v invalide : « ${!_v} » (entier > 0 attendu)" >&2; return 2; }
+  done
+  etape "copie hebdomadaire du poste : outils et disque"
+  # Le serveur est en 17 : une archive -Fc 17 ne se relit qu'avec pg_restore
+  # >= 17, et un pg_dump plus ancien ne sert pas à la restauration.
+  for outil in pg_dump pg_restore; do
+    majeur=$(majeur_pg "$outil")
+    if [ -z "$majeur" ] || [ "$majeur" -lt "$COPIE_PG_MIN" ]; then
+      echo "$outil ${majeur:-absent} : $COPIE_PG_MIN ou plus requis pour la copie du poste" >&2
+      return 2
+    fi
+  done
+  libre_kio=$(df -Pk -- "$SAUVEGARDES" | awk 'NR == 2 { print $4 }')
+  min_kio=$((COPIE_LIBRE_MIN_GIO * 1024 * 1024))
+  if ! [[ $libre_kio =~ ^[0-9]+$ ]] || [ "$libre_kio" -lt "$min_kio" ]; then
+    echo "disque du poste refusé : ${libre_kio:-?} Kio libres sous $SAUVEGARDES," \
+      "$COPIE_LIBRE_MIN_GIO Gio requis ; copie reportée" >&2
+    return 3
+  fi
+  if ! sonde=$(mktemp -p "$SAUVEGARDES" .sonde-XXXXXX 2>/dev/null) \
+      || ! printf 'sonde\n' > "$sonde" || ! sync -f "$sonde" 2>/dev/null; then
+    [ -n "${sonde:-}" ] && rm -f -- "$sonde"
+    echo "disque du poste refusé : écriture impossible sous $SAUVEGARDES ; copie reportée" >&2
+    return 3
+  fi
+  rm -f -- "$sonde"
+  jour=$(date +%F-%H%M)
+  sauvegarder_mesh "$SAUVEGARDES/mesh-hebdo-$jour.dump"
+  etape "copies hebdomadaires gardées : $COPIE_GARDEES"
+  # Noms datés : l'ordre lexical est l'ordre chronologique.
+  find "$SAUVEGARDES" -maxdepth 1 -type f -name 'mesh-hebdo-*.dump' -printf '%f\n' \
+    | sort | head -n "-$COPIE_GARDEES" | while IFS= read -r ancien; do
+        rm -f -- "${SAUVEGARDES:?}/$ancien"
+        echo "retirée : $ancien"
+      done
+}
+
+copie_hebdo_installer() {
+  local unites="$HOME/.config/systemd/user"
+  local service="$unites/ameesh-copie-hebdo.service" timer="$unites/ameesh-copie-hebdo.timer"
+  etape "minuterie de la copie hebdomadaire du poste"
+  if [ -e "$service" ] || [ -e "$timer" ]; then
+    echo "minuterie déjà posée ($service) : rien n'est réécrit" >&2
+    return 1
+  fi
+  mkdir -p "$unites"
+  cat > "$service" <<UNITE
+# #6862 (EP8.5) : copie hebdomadaire de la base du mesh sur le poste.
+[Unit]
+Description=Copie hebdomadaire de la base du mesh sur le poste (#6862)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $ICI/poste.sh copie-hebdo
+TimeoutStartSec=4h
+UMask=0077
+UNITE
+  cat > "$timer" <<'UNITE'
+[Unit]
+Description=Copie hebdomadaire de la base du mesh sur le poste (#6862)
+
+[Timer]
+OnCalendar=Sun *-*-* 05:30:00
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target
+UNITE
+  systemctl --user daemon-reload
+  systemctl --user enable --now ameesh-copie-hebdo.timer
+  systemctl --user list-timers ameesh-copie-hebdo.timer --no-pager || true
 }
 
 # Instantané du commit REF dans $PARTAGE/src-<court> ; affiche son chemin.
@@ -1207,6 +1312,7 @@ case "${1:-}" in
   verifier) verifier ;;
   prevol) prevol "${2:-HEAD}" ;;
   sauvegarder) sauvegarder ;;
+  copie-hebdo) shift; copie_hebdo "$@" ;;
   installer) installer "${2:-HEAD}" ;;
   migrer) shift; migrer "$@" ;;
   role) role ;;

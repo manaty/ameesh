@@ -376,7 +376,8 @@ Root sur AG1, AG2 et manaty-mesh-1, staging (§14), fenêtre annoncée :
    `topologie.json` (lot) ou `--accepter-hba` (trace).
 3. `etcd` sur les trois, puis `primaire` sur ameesh-agents-1, puis `standby`
    sur ameesh-agents-2, puis sur manaty-mesh-1, puis `grappe`.
-4. Clients : DSN multi-hôtes et `.pgpass` par hôte (EP8.5, #6862) ; sans eux,
+4. Clients : DSN multi-hôtes, `.pgpass` par hôte et amont PgBouncer
+   (EP8.5, #6862, `docs/EXPLOITATION.md` « DSN multi-hôtes ») ; sans eux,
    le DSN mono-hôte actuel continue de fonctionner tant qu'il vise le
    leader.
 5. Preuve : `verifier-clients.py` avec `--tuer` sur le leader (délai < 1 min,
@@ -568,9 +569,11 @@ Scripté par `retour-arriere.sh` (§ Adoption) ; le détail manuel :
   reconnexion psycopg, écouteur LISTEN/NOTIFY et balayage après bascule) sont
   EP8.4a (#6869), pas ce lot. Le DSN documenté dans l'étude §5 suppose les
   adresses de ce répertoire.
-- `ameesh db status`, `ameesh doctor`, les alertes `db_*` dans `ameesh alerts`
-  et `sauvegarder-base.sh` sont EP8.5 (#6862). Ici, `sante-base.py` est le
-  collecteur local, pas la commande ameesh.
+- `ameesh db status`, `ameesh doctor` et les alertes `db_*` de la passe
+  ordinaire sont EP8.5a (#6871) ; le relais de `alertes.json` par le passage
+  local d'`ameesh notify`, sans la base, et `sauvegarder-base.sh --primary`
+  sont EP8.5 (#6862). Ici, `sante-base.py` est le collecteur local, pas la
+  commande ameesh.
 - Le chien de garde matériel, le test de `pg_rewind` réel, la bascule réelle
   et les runbooks en production sont EP8.4/EP8.6, sur staging.
 - `installer-serveur.sh`, `deploy/serveur/terraform/` et

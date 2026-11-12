@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 from datetime import datetime, timezone
@@ -223,6 +224,7 @@ auth_file = {auth_file}
 admin_users = {admin_user}
 pool_mode = session
 server_reset_query = DISCARD ALL
+server_fast_close = 1
 server_tls_sslmode = {tls}
 server_idle_timeout = 30
 server_lifetime = 3600
@@ -336,6 +338,146 @@ WantedBy=default.target
             run(['systemctl', '--user', 'daemon-reload'])
         raise
     print('Installed and started; Ameesh configuration unchanged; service not enabled.')
+
+
+# #6862 (EP8.5) : PgBouncer has no `target_session_attrs`; a comma-separated
+# `host=` list is used round-robin, standbys included. The pool's upstream is
+# therefore one host, the primary, and `amont` follows it: libpq resolves the
+# read-write host of the multi-host DSN, and the [databases] line is rewritten
+# and reloaded only when it differs. RELOAD marks the old servers
+# close_needed; `server_fast_close = 1` closes them at the end of their
+# transaction (session mode), so the clients reconnect to the new primary.
+AMONT_DSN = 'amont.dsn'
+_IDENT = re.compile(r'[A-Za-z0-9_.:-]+')
+
+
+def database_line(text, dbname):
+    """(index, host, port) of the pool's `[databases]` entry for `dbname`."""
+    lines = text.split('\n')
+    section = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('['):
+            section = stripped
+            continue
+        if section != '[databases]' or '=' not in stripped:
+            continue
+        name, _, value = stripped.partition('=')
+        if name.strip() != dbname:
+            continue
+        fields = dict(part.split('=', 1) for part in value.split() if '=' in part)
+        return index, fields.get('host'), fields.get('port', '5432')
+    raise ValueError('pool has no [databases] entry for the database')
+
+
+def with_upstream(text, dbname, host, port):
+    index, _host, _port = database_line(text, dbname)
+    lines = text.split('\n')
+    lines[index] = f'{dbname} = host={host} port={port} dbname={dbname}'
+    return '\n'.join(lines)
+
+
+def primary_of(dsn, connect=None):
+    """(host, port, dbname) of the read-write server the multi-host DSN reaches."""
+    import psycopg
+    params = psycopg.conninfo.conninfo_to_dict(dsn)
+    if params.get('password'):
+        raise ValueError('upstream DSN carries a password; use ~/.pgpass')
+    if ',' not in params.get('host', ''):
+        raise ValueError('upstream DSN is not multi-host')
+    params['target_session_attrs'] = 'read-write'
+    params.setdefault('connect_timeout', '10')
+    connect = connect or psycopg.connect
+    with connect(psycopg.conninfo.make_conninfo(**params), autocommit=True) as conn:
+        if conn.execute('SELECT pg_is_in_recovery()').fetchone()[0]:
+            raise ValueError('reached server is in recovery')
+        host, port, dbname = conn.info.host, str(conn.info.port), conn.info.dbname
+    if host not in params['host'].split(','):
+        raise ValueError('reached host is not in the DSN host list')
+    if not all(_IDENT.fullmatch(value) for value in (host, port, dbname)):
+        raise ValueError('unsupported upstream identifiers')
+    return host, port, dbname
+
+
+def amont(home, state, *, connect=None, reload=None, dry_run=False):
+    """Point the pool at the current primary; return 'unchanged' or 'changed'."""
+    settings = home / '.config/pgbouncer'
+    config = settings / 'pgbouncer.ini'
+    source = settings / AMONT_DSN
+    for path in (config, source):
+        if path.is_symlink():
+            raise ValueError('symlink configuration')
+    if source.stat().st_mode & 0o077:
+        raise ValueError('upstream DSN file must be private (0600)')
+    host, port, dbname = primary_of(source.read_text().strip(), connect)
+    text = config.read_text()
+    _index, current_host, current_port = database_line(text, dbname)
+    if (current_host, current_port) == (host, port):
+        print(f'Upstream already the primary {host}:{port}.')
+        return 'unchanged'
+    print(f'Upstream {current_host}:{current_port} -> primary {host}:{port}'
+          + (' (dry run)' if dry_run else '') + '.')
+    if dry_run:
+        return 'changed'
+    backup = config.with_name('pgbouncer.ini.avant-amont')
+    if backup.is_symlink():
+        raise ValueError('symlink configuration')
+    replace(backup, text.encode())
+    os.chmod(backup, 0o600)
+    replace(config, with_upstream(text, dbname, host, port).encode())
+    os.chmod(config, 0o600)
+    (reload or console_reload)(state)
+    return 'changed'
+
+
+def console_reload(state):
+    import psycopg
+    admin_dsn = psycopg.conninfo.make_conninfo(
+        (state / 'socket.dsn').read_text().strip(), dbname='pgbouncer', options='')
+    with psycopg.connect(admin_dsn, autocommit=True, connect_timeout=10) as admin:
+        admin.execute('RELOAD', prepare=False)
+
+
+AMONT_SERVICE = '''[Unit]
+Description=Local PgBouncer upstream follows the database primary (#6862)
+After=ameesh-pgbouncer.service
+
+[Service]
+Type=oneshot
+ExecStart={python} {script} amont
+TimeoutStartSec=30
+UMask=0077
+NoNewPrivileges=true
+'''
+AMONT_TIMER = '''[Unit]
+Description=Local PgBouncer upstream follows the database primary (#6862)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+'''
+
+
+def install_amont(home, python, script):
+    """Write and start the user timer that runs `amont` every 15 s."""
+    if not (home / '.config/pgbouncer' / AMONT_DSN).is_file():
+        raise ValueError('upstream DSN file missing')
+    units = home / '.config/systemd/user'
+    service = units / 'ameesh-pgbouncer-amont.service'
+    timer = units / 'ameesh-pgbouncer-amont.timer'
+    if any(os.path.lexists(path) for path in (service, timer)):
+        raise ValueError('existing installation; refusing overwrite')
+    units.mkdir(parents=True, exist_ok=True)
+    write_new(service, AMONT_SERVICE.format(python=python, script=script), 0o644)
+    write_new(timer, AMONT_TIMER, 0o644)
+    run(['systemd-analyze', '--user', 'verify', str(service)])
+    run(['systemctl', '--user', 'daemon-reload'])
+    run(['systemctl', '--user', 'enable', '--now', 'ameesh-pgbouncer-amont.timer'])
+    print('Upstream follower timer enabled.')
 
 
 def switch(home, state, rollback=False):
@@ -458,7 +600,9 @@ def verify(state):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['install', 'verify', 'switch', 'rollback',
-                                           'measure', 'check'])
+                                           'measure', 'check', 'amont', 'install-amont'])
+    parser.add_argument('--dry-run', action='store_true',
+                        help='amont: say what would change, write nothing')
     parser.add_argument('--label', choices=['before', 'after', 'rollback'], default='before')
     parser.add_argument('--max-agents', type=int,
                         help='canonical max_agents of the host card, for check')
@@ -479,6 +623,10 @@ def main():
         measure(state, args.label)
     elif args.action == 'verify':
         verify(state)
+    elif args.action == 'amont':
+        amont(home, state, dry_run=args.dry_run)
+    elif args.action == 'install-amont':
+        install_amont(home, os.path.realpath(sys.executable), os.path.realpath(__file__))
     else:
         switch(home, state, rollback=args.action == 'rollback')
 

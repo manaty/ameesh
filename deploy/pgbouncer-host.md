@@ -138,6 +138,21 @@ does not affect correctness. It is to be reconciled at the next planned
 restart of the host — not during a release window — with the reload above or by
 writing these values at that restart.
 
+## Upstream follows the database primary (#6862)
+
+With the EP8 cluster, the upstream must be the current primary. PgBouncer has
+no `target_session_attrs`, and a comma-separated `host=` list is used
+round-robin, standbys included. The pool keeps one upstream host;
+`pgbouncer-host.py amont` resolves the read-write server of the multi-host DSN
+in `~/.config/pgbouncer/amont.dsn` (0600, no password: `~/.pgpass`), rewrites
+the `[databases]` line only when it differs (backup
+`pgbouncer.ini.avant-amont`) and sends `RELOAD`. `server_fast_close = 1`
+(reloadable: a HUP applies it, verified with `SHOW CONFIG` on 1.26) closes the
+old upstream's server sessions at the end of their transaction.
+`install-amont` writes and enables a user timer running it every 15 s. The
+procedure, the refusals and the rollback are in `docs/EXPLOITATION.md`
+(« Amont du PgBouncer local »).
+
 ## Session settings the pool must track (#3745)
 
 Every Ameesh session sends its settings in the startup packet

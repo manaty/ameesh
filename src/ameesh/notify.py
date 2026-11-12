@@ -242,6 +242,11 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # être éteint, ces alertes partent d'un hôte du mesh.
                  "db_no_standby", "db_replication_lag",
                  "db_sync_lost", "db_two_primaries", "db_stats_masked",
+                 # #6862 (EP8.5) : le collecteur de santé de chaque nœud,
+                 # lu sans la base par le passage local (primaire absent
+                 # compris) ; le PC peut être éteint.
+                 "db_no_primary", "db_failover", "db_etcd_no_quorum",
+                 "db_disk_low", "db_archive_stale", "db_health_stale",
                  # #4609 : la sauvegarde quotidienne de la base du mesh n'a pas
                  # lu la base dans sa fenêtre — le propriétaire doit le savoir
                  "mesh_backup_unseen",
@@ -305,6 +310,12 @@ TYPE_LABELS = {
     "db_sync_lost": "database has no synchronous standby",
     "db_two_primaries": "database has two primaries",
     "db_stats_masked": "database replication statistics masked",
+    "db_no_primary": "database cluster has no primary",
+    "db_failover": "database failover",
+    "db_etcd_no_quorum": "database consensus (etcd) without quorum",
+    "db_disk_low": "database disk low",
+    "db_archive_stale": "database WAL archiving stale",
+    "db_health_stale": "database health collector silent",
     "mesh_backup_unseen": "mesh database backup not seen",
     "migration_pending_non_additive": "non-additive migration waiting",
     "staging_canon_stale": "staging executor canon behind the agents' canon",
@@ -474,6 +485,9 @@ URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "orphan_lot", "dead_runne
                 # #6871 : un secours perdu, la synchronisation perdue ou deux
                 # primaires ne peuvent pas attendre le prochain tour ordinaire.
                 "db_no_standby", "db_sync_lost", "db_two_primaries",
+                # #6862 : plus de primaire, plus de quorum, disque plein : la
+                # base s'arrête ou va s'arrêter.
+                "db_no_primary", "db_etcd_no_quorum", "db_disk_low",
                 "host_network_overlap")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
@@ -487,9 +501,13 @@ QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
 #: #5692 : la base secondaire d'un hôte n'est lisible que sur cet hôte ; son
 #: alerte est locale comme la console du pool (#532), jamais résolue par la
 #: passe ordinaire d'un autre hôte qui ne voit pas ce fichier.
+#: #6862 : le collecteur de santé de la grappe (`db_sante`) se lit dans le
+#: fichier de l'hôte, sans la base — c'est ce qui fait partir `db_no_primary`.
 LOCAL_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_pool_at_ceiling",
                "pgbouncer_console_unreadable",
-               "host_migration_pending_non_additive")
+               "host_migration_pending_non_additive",
+               "db_no_primary", "db_failover", "db_etcd_no_quorum",
+               "db_disk_low", "db_archive_stale", "db_health_stale")
 #: #5692 : les types d'une même source (la console du pool), pour ne retenir
 #: que la source qui n'a pas conclu — une base secondaire illisible ne doit pas
 #: figer une alerte de console qui, elle, a été observée et résolue.
@@ -2391,7 +2409,9 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          "observation_host",
          # #3502 : l'épisode de biais (sens, palier, entrée) est lisible dans
          # l'état ; la clé garde `since` et `reason`, pas la publication.
-         "bias_side", "bias_level", "tier_since", "biased_since")
+         "bias_side", "bias_level", "tier_since", "biased_since",
+         # #6862 : la clé des alertes du collecteur de grappe (`db_sante`)
+         "cluster", "health_key")
 
 
 # --------------------------------------------------------------------------
@@ -2812,7 +2832,7 @@ class Notifier:
         now = float(self.clock() if now is None else now)
         records: list = []
         self._records = records
-        from . import migration_alerts, pgbouncer_local
+        from . import db_sante, migration_alerts, pgbouncer_local
         unobserved: set[str] = set()
         try:
             current = pgbouncer_local.probe(self.cfg)
@@ -2828,6 +2848,16 @@ class Notifier:
         if migration_errors:
             unobserved.add("host_migration_pending_non_additive")
         current += migration_current
+        # #6862 : le collecteur de santé de la grappe. Une lecture non
+        # concluante (fichier absent ou périmé) garde les alertes reprises ;
+        # `db_health_stale`, elle, est rendue et se résout normalement.
+        health_current, health_errors = db_sante.local(self.cfg, now)
+        for error in health_errors:
+            self.log("database health collector not conclusive (%s): "
+                     "its local alerts kept" % error)
+        if health_errors:
+            unobserved.update(db_sante.FORWARDED)
+        current += health_current
         router = Router(self.cfg, None, self.ncfg)
         wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
         active = self.state["active"]
