@@ -37,16 +37,20 @@ def tree_state(root):
 class Fixture:
     """Installer fixture plus the staged bundle the backend reads."""
 
+    #: These synthetic bundles carry no seal: a sealed agent host or guest
+    #: must not lead `bootstrap.run` to its real root-only lock (#7013). A
+    #: harness that enrolls a real seal document turns this off.
+    isolate_seal=True
+
     def setUp(self):
         base=installer_fixture.InstallerTest(); base.setUp(); self.addCleanup(base.doCleanups)
         self.base=base; self.root=base.root; self.system=base.system; self.authority=base.authority
         self.bundle=base.bundle; self.operation=base.operation
         self.stage=self.root/('var/lib/ameesh-release-bootstrap/'+self.operation)
         self.root.joinpath('var/lib/ameesh-release-bootstrap').chmod(0o700)
-        # These synthetic bundles carry no seal: a sealed agent host or guest
-        # must not lead `bootstrap.run` to its real root-only lock (#7013).
-        patcher=mock.patch.object(bootstrap.delegation,'SEAL_DOCUMENT',str(self.root/'absent-seal.json'))
-        patcher.start(); self.addCleanup(patcher.stop)
+        if self.isolate_seal:
+            patcher=mock.patch.object(bootstrap.delegation,'SEAL_DOCUMENT',str(self.root/'absent-seal.json'))
+            patcher.start(); self.addCleanup(patcher.stop)
         # #7013: a prepared window ends within one fresh signature.
         self.expires=int(time.time())+600
         self.question=bootstrap.question(self.operation,self.bundle,expires_at=self.expires)

@@ -323,6 +323,11 @@ class OperatorEntryTest(unittest.TestCase):
 
     def test_install_executes_through_the_enrolled_backend_and_lands_the_turn_enrollment(self):
         prepared=self.prepare()
+        # This synthetic bundle carries no seal: a sealed agent host or guest
+        # must not lead `bootstrap.run` to its real root-only lock (#7013).
+        from unittest import mock
+        patcher=mock.patch.object(entry.bootstrap.delegation,'SEAL_DOCUMENT',str(self.temp/'absent-seal.json'))
+        patcher.start(); self.addCleanup(patcher.stop)
         system=Host(self.root); authority=self.base.authority
         adapter=installer.BootstrapHostAdapter(self.temp/'effects',authority=authority,
                                                system=system,root=self.root)

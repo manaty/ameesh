@@ -65,6 +65,9 @@ def thaw(path):
 
 
 class Harness(fixture.Fixture, support.PgTestCase):
+    #: Real seal documents are enrolled and locked through `seal` here.
+    isolate_seal = False
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

@@ -251,6 +251,9 @@ class Fixture:
         (runtime_tree/'bin/python').write_bytes(b'synthetic executable, never launched')
         lib=self.root/'opt/ameesh-release/lib'; lib.mkdir(mode=0o700)
         for name in ('hote-handoff.py','hote-secrets.py'): (lib/name).write_text('# synthetic pinned source\n')
+        # A setgid parent (offload guest job directory) is inherited by mkdir;
+        # the trees must not carry it (runtime.inventory refuses 07000).
+        for directory in (runtime_tree,runtime_tree/'bin',lib): directory.chmod(0o700)
         inventory=adapter_mod.runtime.inventory
         self.plan=plan(inventory(runtime_tree)['digest'],inventory(lib)['digest'])
         for directory in ('etc/ssh','usr/local/libexec','etc/sudoers.d','etc/ssh/sshd_config.d'):
