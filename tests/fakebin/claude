@@ -17,7 +17,10 @@ AMEESH_TEST_CLAUDE_MODEL (modèle annoncé par `system/init`),
 AMEESH_TEST_CLAUDE_MODEL_USAGE (JSON `modelUsage` du `result`) et
 AMEESH_TEST_CLAUDE_COMPACT (JSON `compact_metadata` d'une frontière de
 compaction). #1270 : AMEESH_TEST_STDERR (texte écrit sur le stderr du
-harnais, canal fournisseur distinct du résultat libre).
+harnais, canal fournisseur distinct du résultat libre). #7008 :
+AMEESH_TEST_HANG_AFTER_RESULT (secondes de sommeil après le `result`, flux
+ouvert : harnais bloqué après sa fin de tour) et AMEESH_TEST_IGNORE_TERM
+(SIGTERM ignoré : seul SIGKILL l'arrête).
 """
 import json
 import os
@@ -248,6 +251,10 @@ def main() -> int:
     if bruit:
         sys.stderr.write(bruit if bruit.endswith("\n") else bruit + "\n")
         sys.stderr.flush()
+    if os.environ.get("AMEESH_TEST_HANG_AFTER_RESULT"):
+        if os.environ.get("AMEESH_TEST_IGNORE_TERM"):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(float(os.environ["AMEESH_TEST_HANG_AFTER_RESULT"]))
     return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 
 

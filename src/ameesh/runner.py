@@ -294,6 +294,18 @@ RESIDENT_END_WAIT_S = 5.0
 #: steers en fin de tour. Un `driver.steer` accepté après le solde laisserait
 #: une réservation orpheline ; la jonction ferme ce cycle.
 PREEMPT_JOIN_S = 10.0
+#: #7008 : borne dure de la durée d'un tour, indépendante du flux. Le plafond
+#: L105 attend un point sûr, c'est-à-dire une ligne du harnais ; un harnais
+#: muet (bloqué après « end of turn », outil figé) n'en donne jamais. Au-delà
+#: du plafond + marge, l'exécuteur arrête lui-même le groupe du harnais
+#: (SIGTERM, grâce, SIGKILL). Marge : la moitié du plafond, au moins 10 min —
+#: les dépassements ordinaires du 11/11 (jusqu'à 2 295 s pour 1 800 s)
+#: atteignent leur point sûr avant.
+TURN_HARD_MARGIN_MIN_S = 600.0
+TURN_HARD_MARGIN_RATIO = 0.5
+#: #7008 : pas de sondage de la borne dure (le moniteur dort jusqu'à elle,
+#: puis revérifie le temps gelé par la garde de l'hôte)
+TURN_HARD_POLL_S = 30.0
 #: L77/B8 : barrière de steer. Le pilote borne une requête `turn/steer` à
 #: `resident.CONTROL_TIMEOUT` (15 s), avec une attente préalable possible du
 #: `turn/start` : la fin de tour attend le steer en cours au-delà de la simple
@@ -964,6 +976,8 @@ class AgentWorker(threading.Thread):
         #: CTX-02b : motif de clôture observé (L105) et dernière rotation
         #: réussie, publiés avec le tour — jamais lus par une décision.
         self._turn_close_observation: dict | None = None
+        #: #7008 : raison de la clôture dure du tour en cours (borne hors flux)
+        self._turn_hard_closed: str | None = None
         #: #6040 : seuil de compaction réellement passé au harnais de ce tour
         self._turn_compact_tokens: int | None = None
         #: M4 (#6662) : le réglage capturé **avant** le lancement pour la
@@ -2340,6 +2354,51 @@ class AgentWorker(threading.Thread):
                 # `ameesh restart` (L26) : même point de passage, même grâce
                 self.stop_group_now("restart requested", grace=1.0)
                 return
+
+    def turn_hard_limit_seconds(self) -> float:
+        """#7008 : borne dure d'un tour — plafond L105 + marge ; 0 = sans."""
+        cap = self.turn_max_seconds()
+        if cap <= 0:
+            return 0.0
+        return cap + max(TURN_HARD_MARGIN_MIN_S, cap * TURN_HARD_MARGIN_RATIO)
+
+    def _turn_hard_cap_monitor(self, done: threading.Event, started: float,
+                               limit: float) -> None:
+        """#7008 : clôt le tour à la borne dure, sans attendre le flux.
+
+        Le plafond L105 se lit à chaque ligne du harnais et ferme au point
+        sûr : un harnais resté muet après sa fin de tour gardait le tour
+        « running » (72,8 min pour 1 800 s, AG1 le 11/11). Ici, au-delà de
+        la borne (temps gelé par la garde de l'hôte exclu, comme L105), le
+        groupe du harnais est arrêté par le point de passage unique ; le tour
+        se solde ensuite comme une clôture de plafond (comptabilité, suite).
+        """
+        while True:
+            now = time.time()
+            ecoule = now - started - self.runner.gate_frozen_between(started, now)
+            reste = limit - ecoule
+            if reste <= 0:
+                break
+            if done.wait(min(reste, TURN_HARD_POLL_S)):
+                return
+        if done.is_set():
+            return
+        raison = ("maximum turn duration: %ds (cap %ds), harness silent past "
+                  "the hard limit (%ds)" % (int(ecoule), self.turn_max_seconds(),
+                                            int(limit)))
+        self._turn_hard_closed = raison
+        self._turn_close_observation = {
+            "kind": "duration_hard", "reason": raison,
+            "elapsed_s": round(ecoule, 3),
+            "turn_max_seconds": self.turn_max_seconds(),
+            "hard_limit_s": round(limit, 3),
+        }
+        with self.lock:
+            resident = self.proc is None and self.resident is not None
+        # Le signal d'abord (SIGTERM, grâce, SIGKILL du groupe) ; un résident
+        # n'a pas de `Popen` publié : seul l'arrêt dur le tue.
+        self.stop_group_now("turn closed: %s" % raison, hard=resident)
+        log_async("[%s] %s: harness group stopped" % (self.name, raison))
 
     def _audit_deadline_monitor(self, done: threading.Event, deadline: float) -> None:
         """L234 : échéance monotone indépendante du flux et de la base.
@@ -9513,6 +9572,12 @@ class AgentWorker(threading.Thread):
         self._context_profile_mode = None
         self._turn_close_observation = None
         self._context_baseline = self._context_session_baseline(session)
+        self._turn_hard_closed = None
+        borne_dure = self.turn_hard_limit_seconds() if plafonne else 0.0
+        if borne_dure > 0:
+            threading.Thread(target=self._turn_hard_cap_monitor,
+                             args=(preempt_done, started, borne_dure),
+                             daemon=True, name="turn-hard-cap").start()
         try:
             from .platform import turn_cgroup
             with open(stderr_path, "ab") as stderr:
@@ -9858,7 +9923,8 @@ class AgentWorker(threading.Thread):
             else:
                 result_code, erreur_resident, session_resident, fin_resident = \
                     self._resident_result(
-                        rp, tour_resident, clos or self.host_yield is not None)
+                        rp, tour_resident, clos or self.host_yield is not None
+                        or self._turn_hard_closed is not None)
                 error = error or erreur_resident
                 # L80a : un tour résident Codex/ACP n'annonce sa session que
                 # dans son `TurnResult` (le flux brut est du JSON-RPC) ; sans
@@ -9868,6 +9934,10 @@ class AgentWorker(threading.Thread):
                     session_new = session_resident
                     self._note_session(session_new, session, harness, compte,
                                        cwd, resume, harnais_lance)
+            if self._turn_hard_closed is not None and not clos:
+                # #7008 : borne dure atteinte hors flux — le tour se solde
+                # comme une clôture de plafond (suite au tour suivant)
+                clos, cloture = True, self._turn_hard_closed
         except _LancementImpossible as exc:
             echec_lancement = str(exc)
             result_code = 127
