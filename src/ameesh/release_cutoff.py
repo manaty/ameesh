@@ -2665,7 +2665,9 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                          and not pending.get("execution") else None)
             if (isinstance(pending, dict)
                     and pending.get("sha") == release_sha
-                    and _staging_request_active(pending, lease, sequences)):
+                    and _staging_request_active(
+                        pending, lease, sequences,
+                        start_timeout_s=options.get("start_timeout_s"))):
                 return {"exit": 75, "queued": True, "duration_s": 0.0, "log": "",
                         "summary": [], "attestation": None,
                         "request": pending.get("request"),
@@ -3349,7 +3351,9 @@ def _staging_execution_holder(db, options: dict) -> dict | None:
 
 
 def _staging_request_active(request: dict | None, lease: dict | None,
-                            sequences: dict | None = None) -> bool:
+                            sequences: dict | None = None, *,
+                            start_timeout_s: float | None = None,
+                            now: float | None = None) -> bool:
     """Whether a shared staging request proves live staging (#6520 review).
 
     A terminal or blocked request never does: its commit must not be lent to
@@ -3362,8 +3366,16 @@ def _staging_request_active(request: dict | None, lease: dict | None,
     #6584: an older writer (N-1) does not write the request's `execution`
     field. A running request without it is not inactive by default: the live
     shared sequence of its own run, on the same commit and host, is the proof
-    (#4880 log). The lease, when held, must name that same host. No sequence,
-    no proof: an orphan lease stays an orphan and is still alarmed.
+    (#4880 log). The lease, when held, must name that same host.
+
+    #6992: the executor holds the lease while it prepares (probe, fetch,
+    # forge check, worktree) and writes `running` only after that; the shared
+    # sequence log is empty for longer still. An N-1 pending request still
+    # inside its own start deadline, or an N-1 running request younger than
+    # the executor's start window (`start_timeout_s`) on the lease holder's
+    # host, is that attempt before its first proof. Past those bounds, or on
+    # another host, no sequence means no proof: a real orphan lease is still
+    # alarmed.
     """
     if not isinstance(request, dict):
         return False
@@ -3373,7 +3385,19 @@ def _staging_request_active(request: dict | None, lease: dict | None,
     owner = str((lease or {}).get("owner") or "")
     execution = str(request.get("execution") or "")
     if state == "pending":
-        return not lease or (bool(owner) and execution == owner)
+        if not lease:
+            return True
+        if execution:
+            return bool(owner) and execution == owner
+        # #6992: the N-1 writer records neither `execution` nor `host` before
+        # its attempt. A pending request inside the start deadline it was
+        # submitted with is the handoff the lease holder is preparing; past
+        # the deadline it is no proof at all.
+        deadline = request.get("deadline")
+        moment = time.time() if now is None else now
+        return (bool(owner) and isinstance(deadline, (int, float))
+                and not isinstance(deadline, bool)
+                and moment <= deadline)
     if state == "running":
         if execution:
             return bool(owner) and execution == owner
@@ -3381,11 +3405,23 @@ def _staging_request_active(request: dict | None, lease: dict | None,
         # to the in-flight sequence alone. The expiry is not read here.
         run = str(request.get("run") or "")
         sequence = (sequences or {}).get(run) if run else None
+        request_host = str(request.get("host") or "")
         if not sequence:
-            return False
+            # #6992: the start window of the lease holder's own attempt. The
+            # settings reader always fills `start_timeout_s`; a caller that
+            # omits it keeps the pre-#6992 rule (no window, no proof).
+            owner_bits = owner.split(":")
+            lease_host = owner_bits[1] if len(owner_bits) > 2 else ""
+            started = request.get("started")
+            window = float(start_timeout_s or 0.0)
+            moment = time.time() if now is None else now
+            return (window > 0 and bool(request_host)
+                    and lease_host == request_host
+                    and isinstance(started, (int, float))
+                    and not isinstance(started, bool)
+                    and 0 <= moment - started <= window)
         if str(sequence.get("sha") or "") != str(request.get("sha") or ""):
             return False
-        request_host = str(request.get("host") or "")
         sequence_host = str(sequence.get("host") or "")
         if request_host and sequence_host and request_host != sequence_host:
             return False
@@ -3422,6 +3458,9 @@ def staging_holders(project: ProjectRelease, db) -> list[dict]:
     lends its commit to an orphan lease (#6520 review). #6584: an N-1 request
     without `execution` is attached by its host and live run instead, and a
     live sequence merges into the entry it proves rather than being dropped.
+    #6992: before its first sequence, that request is active for the
+    executor's start window, so the attempt's first seconds are reported as
+    staging, not as an orphan lease.
     """
     if db is None:
         return []
@@ -3470,7 +3509,9 @@ def staging_holders(project: ProjectRelease, db) -> list[dict]:
                 sha = str(request.get("sha") or "")
                 request_host = str(request.get("host") or "")
                 request_run = str(request.get("run") or "")
-                active = _staging_request_active(request, lease, sequences)
+                active = _staging_request_active(
+                    request, lease, sequences,
+                    start_timeout_s=options.get("start_timeout_s"))
                 if active:
                     add({"kind": "elected", "active": True,
                          "host": request_host or (owner_host if lease else ""),
