@@ -86,6 +86,16 @@ non relus du parent. Geste de l'auteur ou du pilote : `ameesh work
 dependencies <lot> --add <parent>` (#6214 range alors le lot derrière son
 parent), ou rebaser sur la cible. Une lecture des lots ouverts impossible ou
 tronquée rend l'inventaire illisible, jamais un lot réputé non empilé.
+
+#6893 : un lot qui porte une **exception de paquet** déclarée sur sa tête
+gelée (`packet-exception incident|unblock sha=… reason=…`, §11 bis) est
+destiné à une fusion hors paquet : il est écarté avec le motif
+`packet-exception` (la nature et le motif sont cités), jamais composé comme
+unité — un paquet qui le contiendrait ne pourrait pas fusionner et sa CI
+serait perdue. La déclaration ne couvre que la tête qu'elle nomme ; une
+nouvelle tête gelée redonne le lot aux candidats tant qu'aucune exception ne
+la nomme. Un journal illisible ne prouve aucune exception : la liste est
+refusée (`CandidateError`), jamais un lot déclaré réputé composable.
 """
 from __future__ import annotations
 
@@ -946,6 +956,19 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     marks = _marks(db, ids)
     overrides = _hold_overrides(hold_overrides)
     holds = _pilot_holds(db, ids, cfg=cfg)
+    # #6893 : les exceptions de paquet déclarées au journal (même lecture
+    # ciblée que les holds : seules les notes du marqueur sortent). Une
+    # lecture impossible refuse la liste : une exception invisible ferait
+    # entrer dans le paquet un lot destiné à une fusion hors paquet.
+    try:
+        exception_events = storage.of(db).progress.lot_hold_events(
+            ids, [packet_guard.PATTERN])
+    except Exception as exc:  # noqa: BLE001 - liste incomplète : on ne compose pas
+        raise CandidateError(
+            "cannot read the packet exceptions: %s" % exc) from exc
+    packet_exceptions: dict[int, list[dict]] = {}
+    for event in exception_events:
+        packet_exceptions.setdefault(int(event["work_item_id"]), []).append(event)
     # #4144 : même vérité que `work show`, y compris les prérequis hors qa.
     # Une panne de lecture ne doit jamais transformer un lot bloqué en prêt.
     try:
@@ -1003,7 +1026,8 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
             package_base=package_base,
             marks=[m for m in marks.get(lot, []) if not _names_remise(m, shas)],
             cfg=cfg, canons=canons, pilot_hold=holds.get(lot),
-            hold_override=overrides.get(lot, "")))
+            hold_override=overrides.get(lot, ""),
+            packet_exceptions=packet_exceptions.get(lot, ())))
     _apply_remises(db, candidates, {int(row["id"]): row for row in rows}, marks,
                    remises, remise_error, where=where, package_base=package_base,
                    cfg=cfg, canons=canons)
@@ -1204,8 +1228,13 @@ def _ready_order(entry: dict) -> tuple:
 def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
                package_base: str, marks: list[dict], cfg=None,
                canons=None, pilot_hold: dict | None = None,
-               hold_override: str = "") -> dict:
-    """Un lot : tête publiée, gel, classe, porte des avis, essai de fusion."""
+               hold_override: str = "", packet_exceptions=()) -> dict:
+    """Un lot : tête publiée, gel, classe, porte des avis, essai de fusion.
+
+    `packet_exceptions` : les événements du journal portant le marqueur
+    `packet-exception` (§11 bis), pour ce lot ; une déclaration ne couvre que
+    la tête gelée qu'elle nomme."""
+
     lot = int(row["id"])
     branch = str(row.get("branch") or "").strip()
     target = _row_target(row, target_branch)
@@ -1240,6 +1269,8 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
         # #3375 : le hold de pilote actif, et la surcharge explicite éventuelle
         "pilot_hold": None,
         "hold_override": "",
+        # #6893 : l'exception de paquet déclarée sur la tête gelée, s'il y en a
+        "packet_exception": None,
     }
     if pilot_hold:
         entry["pilot_hold"] = dict(pilot_hold)
@@ -1294,6 +1325,20 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
             "freeze-not-head",
             "freeze %s is not the published head %s: freeze again, then review"
             % (frozen[:12], tip[:12])))
+    if frozen:
+        # #6893 : le lot a déclaré une exception de paquet sur cette tête
+        # exacte (`packet-exception incident|unblock sha=…`) : il fusionne
+        # hors paquet, le composer ne doit pas l'admettre. Une déclaration
+        # d'une autre tête ne couvre rien.
+        declared = packet_guard.declared_in(packet_exceptions, frozen)
+        if declared is not None:
+            entry["packet_exception"] = declared
+            entry["causes"].append(_cause(
+                "packet-exception",
+                "exception %s declared on %s: %s — the lot merges outside the "
+                "packet (§11 bis), never as a unit"
+                % (declared["exception"], frozen[:12],
+                   declared["reason"] or "no reason given")))
     try:
         # La classe se lit sur la cible **résolue du paquet** (#2464), comme la
         # file de fusion : sans `branch_target` sur la ligne du lot, `of_lot`

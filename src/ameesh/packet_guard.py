@@ -49,6 +49,9 @@ PACKET_PREFIX = "integration/"
 EXCEPTIONS = ("incident", "unblock")
 #: préfixe de la note-journal d'une exception
 MARKER = "packet-exception"
+#: #6893 : motif de lecture ciblée des déclarations au journal
+#: (`Progress.lot_hold_events`), sans relire les notes ordinaires
+PATTERN = r"^" + re.escape(MARKER) + r"\s"
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 #: `owner/repo` nu : un dépôt GitHub
 _SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
