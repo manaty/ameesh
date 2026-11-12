@@ -101,7 +101,11 @@ l'humain. Chaque famille a sa règle :
   dans un tour porte `ameesh.lifetime=test` (shim L73) ; une fois SANS TAG et
   après le même délai d'absence continue, elle est récoltée (`docker image
   rm`). Une image taguée n'est JAMAIS supprimée, même étiquetée : un tag est
-  une référence. Les images dangling sans étiquette sont seulement comptées.
+  une référence. Les images dangling sans étiquette sont seulement comptées,
+  sauf dans un docker SANS RACINE (#7081) : il n'appartient qu'à l'utilisateur
+  du mesh, ses images dangling (anciennes versions d'images tirées ou
+  construites hors du shim) suivent le même délai ; une image dont descend
+  un conteneur, même arrêté, est gardée.
 
 * **Scopes systemd `dsh-subprocess-*`** (#3226, [`reap_dsh_scopes`]) : sans
   la garde #490, dsh lance ses outils dans des scopes du gestionnaire
@@ -501,7 +505,8 @@ class Policy:
     docker_volumes: bool = True
     #: #4560 : récolter les images SANS TAG déclarées jetables par le mesh
     #: (`ameesh.lifetime=test`, posée par le shim sur les constructions d'un
-    #: tour) ; `false` : aucune image n'est supprimée
+    #: tour) et, #7081, toute image dangling sans étiquette du docker rootless
+    #: de l'utilisateur ; `false` : aucune image n'est supprimée
     docker_images: bool = True
     #: #2003/#4560 : absence continue (secondes, mesurée par les relevés) avant
     #: cette récolte (volumes et images)
@@ -5003,6 +5008,16 @@ def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False
     arrêté : la course avec un `docker run` qui la reprend est fermée. Seul
     `docker` est couvert (comme la mesure #411). `dry_run` : le plan seulement.
 
+    #7081 : dans un docker SANS RACINE (celui de l'utilisateur du mesh, rien
+    d'autre n'y construit ni n'y tire), une image dangling SANS étiquette de
+    durée de vie — l'ancienne version d'une image tirée ou construite hors du
+    shim (playwright, actionlint, caddy) — suit le même délai et la même voie
+    de retrait. Une image qui porte une AUTRE valeur de `ameesh.lifetime` n'est
+    pas visée (sa durée de vie est déclarée ailleurs). Avant tout retrait,
+    une image dont descend un conteneur, même arrêté, est gardée (`in use`),
+    et gardée aussi si cette lecture échoue. Hors rootless, ces images
+    restent seulement comptées (`others_total`).
+
     Rend `{entries, plan, ours, others_total}` ; `ours` à None si le moteur ne
     répond pas."""
     from . import containers as containers_mod
@@ -5019,6 +5034,10 @@ def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False
     idle = max(0.0, float(policy.docker_volume_idle))
     ours: list = []
     declared, others_total = [], 0
+    # #7081 : un docker rootless n'appartient qu'à l'utilisateur du mesh ;
+    # ailleurs (démon système partagé), la provenance reste inconnue.
+    rootless = None
+    stray: set = set()
     for row in rows:
         if budget is not None and budget.expired():
             budget.timed_out = True
@@ -5027,6 +5046,13 @@ def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False
         if _lifetime_declared(labels):
             declared.append(row)
         elif not (row.get("tags") or ()):
+            if rootless is None:
+                probe = getattr(runtime, "rootless", None)
+                rootless = bool(probe()) if probe is not None else False
+            if rootless and containers_mod.LIFETIME_LABEL not in labels:
+                declared.append(row)
+                stray.add(str(row.get("id") or ""))
+                continue
             # image dangling sans provenance du mesh : signalée par le compte,
             # jamais supprimée (précédent #411).
             others_total += 1
@@ -5051,6 +5077,8 @@ def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False
         if not ident:
             continue
         base = {"kind": "image", "path": ident}
+        kind = ("untagged image in the rootless docker" if ident in stray
+                else "declared disposable image")
         stamp = row.get("created")
         tags = row.get("tags") or ()
         if tags:
@@ -5063,7 +5091,7 @@ def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False
                            % ident[:19], data={"created": stamp}))
             continue
         if stamp is None:
-            why = "declared disposable: creation identity unreadable: flagged only"
+            why = "%s: creation identity unreadable: flagged only" % kind
             ours.append(dict(base, action="signalé", detail=why))
             out["plan"].append(dict(base, action="signalé", detail=why))
             continue
@@ -5072,13 +5100,25 @@ def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False
             since = now
         absence = max(0.0, now - since)
         if absence < idle:
-            detail = "declared disposable image; no tag for %s (under %s)" % (
-                fmt_idle(absence), fmt_idle(idle))
+            detail = "%s; no tag for %s (under %s)" % (
+                kind, fmt_idle(absence), fmt_idle(idle))
             out["entries"].append(dict(base, action="waiting", detail=detail,
                                        data={"created": stamp, "episode_since": since}))
             ours.append(dict(base, action="attend", detail=detail))
             continue
-        why = "declared disposable image; no tag for %s" % fmt_idle(absence)
+        why = "%s; no tag for %s" % (kind, fmt_idle(absence))
+        users_of = getattr(runtime, "image_users", None)
+        users = users_of(ident) if users_of is not None else []
+        if users is None or users:
+            # #7081 : un conteneur, même arrêté, la retient — ou la lecture a
+            # échoué : gardée, sans tag temporaire laissé par un refus.
+            held = ("in use by %d container(s)" % len(users) if users
+                    else "container usage unreadable")
+            entry = dict(base, action="kept", detail="%s: %s: kept" % (why, held),
+                         data={"created": stamp, "episode_since": since})
+            out["entries"].append(entry)
+            ours.append(entry)
+            continue
         out["plan"].append(dict(base, action="suppression", detail=why))
         if dry_run:
             ours.append(dict(base, action="suppression", detail=why))
@@ -5092,6 +5132,7 @@ def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False
         ours.append(entry)
     out["ours"] = ours
     out["others_total"] = others_total
+    out["rootless"] = rootless
     return out
 
 

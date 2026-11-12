@@ -500,6 +500,42 @@ class Runtime:
             return False, "image is tagged again (temporary reap tag %s removed)" % temp
         return False, "image still referenced (temporary reap tag %s removed)" % temp
 
+    def rootless(self) -> bool | None:
+        """#7081 : ce moteur est-il un démon docker SANS RACINE ? Lu dans
+        `docker info` (`SecurityOptions` porte `name=rootless`) ; un démon
+        rootless appartient à l'utilisateur qui le lance (sa socket vit sous
+        son `XDG_RUNTIME_DIR`), donc ses images sont celles de cet utilisateur
+        seul. None si le moteur ne répond pas ou rend une réponse illisible."""
+        import json
+        argv = self._argv("info", "--format", "{{json .SecurityOptions}}")
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        try:
+            options = json.loads(proc.stdout or "null")
+        except ValueError:
+            return None
+        if not isinstance(options, list):
+            return None
+        return any("name=rootless" in str(opt).split(",") for opt in options)
+
+    def image_users(self, ident: str) -> list[str] | None:
+        """#7081 : les conteneurs, arrêtés compris, qui descendent de cette
+        image (`ps -a --filter ancestor=<id>`) ; None si le moteur ne répond
+        pas — l'appelant garde alors l'image."""
+        argv = self._argv("ps", "-a", "--no-trunc", "--quiet",
+                          "--filter", "ancestor=%s" % ident)
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+
 
 #: #4560 : plus de 6 chiffres après la virgule ne sont lus par
 #: `datetime.fromisoformat` ni par Python 3.10 : la fraction est ramenée à la
