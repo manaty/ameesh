@@ -171,16 +171,25 @@ class RenumberingTest(unittest.TestCase):
     def test_a_target_file_touched_then_restored_is_refused(self):
         # B1 dev3 #213435 : il porte le nouveau numéro, mais n'est pas au lot.
         _git(self.root, "switch", "-q", "main")
-        _put(self.root, "supabase/migrations/783_target.sql", "-- 783\n")
-        self.tip = _commit(self.root, "a target file numbered 783")
+        _put(self.root, "supabase/rollback/783_target.sql", "-- 783\n")
+        self.tip = _commit(self.root, "a target companion numbered 783")
         _git(self.root, "switch", "-q", "lot/6953")
         _git(self.root, "merge", "-q", "--no-edit", "main")
         self.rename()
         self.references()
-        _put(self.root, "supabase/migrations/783_target.sql", "-- 784\n")
+        _put(self.root, "supabase/rollback/783_target.sql", "-- 784\n")
         _commit(self.root, "touched")
-        _put(self.root, "supabase/migrations/783_target.sql", "-- 783\n")
+        _put(self.root, "supabase/rollback/783_target.sql", "-- 783\n")
         self.refused(_commit(self.root, "restored"), "neither a test adaptation")
+
+    def test_a_new_number_already_in_the_target_is_refused(self):
+        # I8 : la cible porte déjà une migration 783 ; l'arrivée en aurait deux.
+        _git(self.root, "switch", "-q", "main")
+        _put(self.root, "supabase/migrations/783_target.sql", "SELECT 1;\n")
+        self.tip = _commit(self.root, "a target migration numbered 783")
+        _git(self.root, "switch", "-q", "lot/6953")
+        self.rename()
+        self.refused(self.references(), "migration number 783 names 2 files once landed")
 
     def test_two_migrations_to_one_number_are_refused(self):
         # B2 dev3 #213435 : deux 783 à l'arrivée.

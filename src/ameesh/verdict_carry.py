@@ -53,19 +53,32 @@ auteur juge donc la nouvelle tête, redésigné normalement.
 
 **Renumérotation (#7000)** — constat nexlink #6953 : le pilote échange deux
 réservations, l'auteur renomme sa migration 784 en 783 et retouche les renvois
-au numéro. C'est une troisième adaptation, à ces seules conditions : des couples
-suppression/ajout d'un même répertoire dont le nom ne change que par son préfixe
-numérique, l'ancien chemin ajouté ou modifié par la tête relue (une migration
-de la cible n'est pas au lot), dont au moins un sous le répertoire de migrations
-déclaré du dépôt
-(`migrations.layout_for`) ; chaque nouveau numéro **réservé par le lot**
-(`ameesh work migration`, L122) ; le nouveau contenu égal octet pour octet à
-l'ancien, l'ancien numéro remplacé par le nouveau en jeton entier
-(`_substitute`) — un numéro porté par du SQL actif reste couvert, toute autre
-ligne est refusée. Hors de ce répertoire, seuls un test adaptable (règle des
-tests) et un compagnon déclaré (`radar.projects.<p>.migrations_companions` :
-rollback, registre), retouché du même seul remplacement, peuvent suivre. Le
-report note « adaptation : renumérotation N→M ».
+au numéro. C'est une troisième adaptation ; l'invariant prouvé, pour la
+renumérotation `M` {ancien n° : nouveau n°} :
+
+- I1 (portée) chaque fichier renommé F (ancien → nouveau) est un couple
+  suppression/ajout d'un même répertoire, de même nom après le préfixe
+  numérique, sous le répertoire de migrations déclaré, un compagnon déclaré
+  (`radar.projects.<p>.migrations_companions`) ou un test adaptable ; F a été
+  ajouté ou modifié par la tête relue depuis sa base avec la cible ;
+- I2 (réservation) au moins une migration est renommée, et chaque nouveau
+  numéro est réservé par le lot (`ameesh work migration`, L122) ;
+- I3 (fonction) `M` donne un seul nouveau numéro par ancien, et deux anciens
+  ne vont jamais au même nouveau ; les numéros se comparent en entiers ;
+- I4 (contenu) une migration ou un compagnon renommé reste un fichier
+  ordinaire de même mode, et son contenu est l'ancien où seules les
+  occurrences en jeton entier de **son propre** ancien numéro deviennent son
+  nouveau numéro (`_substitute`, `_own_mapping`) ;
+- I5 (reste) hors des couples, ne changent que des tests adaptables (règle des
+  tests) et des compagnons de la tête relue, fichiers ordinaires de même mode,
+  retouchés de leur seul numéro — ou de `M` entier pour un registre sans
+  numéro ; un fichier numéroté hors de `M` ne change pas ;
+- I6 (historique) chaque commit nouveau respecte I1, I4 et I5 pas à pas (un
+  contenu retouché puis rétabli reste refusé) ;
+- I7 (arrivée) chaque nouveau numéro nomme une seule migration de l'arbre
+  d'atterrissage.
+
+Le report note « adaptation : renumérotation N→M ».
 
 **Report** — pour chaque relecteur, son **dernier** verdict, s'il porte sur une
 tête réalignée, est recopié en jalon `verdict` sur la tête gelée : au nom du
@@ -961,6 +974,22 @@ def _merge_adaptation(repo: str, left: str, right: str, *, head: str | None = No
                               lambda path: regular(tree, path))
         if renamed["why"]:
             return dict(refused, why=renamed["why"])
+        if renamed["mapping"]:
+            # I8 : chaque nouveau numéro nomme une seule migration de l'arbre
+            # d'atterrissage (un fichier de la cible au même numéro en ferait deux)
+            listed = radar._scratch_git(repo, objects, scratch, "ls-tree", "-z", "--name-only",
+                                        tree, "--", renumber.directory + "/")
+            if listed.returncode != 0:
+                return dict(refused, why="the landed migrations cannot be listed")
+            counts: dict = {}
+            for name in listed.stdout.decode("utf-8", "surrogateescape").split("\0"):
+                match = _NUMBERED.match(os.path.basename(name)) if name else None
+                if match:
+                    counts[int(match.group(1))] = counts.get(int(match.group(1)), 0) + 1
+            for new in sorted({int(value) for value in renamed["mapping"].values()}):
+                if counts.get(new, 0) != 1:
+                    return dict(refused, why="migration number %d names %d files once landed"
+                                % (new, counts.get(new, 0)))
         tests = hunks = 0
         for path, status in sorted(changes.items()):
             if path in renamed["paths"]:
