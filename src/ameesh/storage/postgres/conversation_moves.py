@@ -78,6 +78,14 @@ class ConversationMoves(Contract):
             if not rows or rows[0]["mode"] != "execute" or rows[0]["host"] == target_host:
                 return None
             r = rows[0]
+            # B (relecture 3) : une tentative d'avant la bascule plus vieille
+            # que PLAN_TTL_S ne retient plus rien — échouée ici, une nouvelle
+            # peut s'ouvrir, même sur le même epoch (clé partielle, 0572)
+            tx.execute(
+                "UPDATE conversation_moves SET state = 'failed', failed_at = clock_timestamp(),"
+                " error = 'expired before the switch', updated_at = clock_timestamp()"
+                " WHERE agent = %s AND state IN " + _BEFORE_SQL + " AND updated_at <="
+                " clock_timestamp() - make_interval(secs => %s)", (agent, PLAN_TTL_S))
             # ON CONFLICT without a target: the (agent, epoch_source) key AND the
             # one-open-attempt index both reread instead of raising
             created = tx.query(
@@ -107,6 +115,13 @@ class ConversationMoves(Contract):
         return _row(self.db.query("SELECT " + _COLUMNS + " FROM conversation_moves"
                                   " WHERE agent = %s AND state IN " + _OPEN_SQL,
                                   (agent,)))
+
+    def holds(self, agent):
+        return bool(self.db.query(
+            "SELECT 1 FROM conversation_moves WHERE agent = %s AND (state IN "
+            + _AFTER_SQL + " OR (state IN " + _BEFORE_SQL + " AND updated_at >"
+            " clock_timestamp() - make_interval(secs => %s))) LIMIT 1",
+            (agent, PLAN_TTL_S)))
 
     def for_target(self, host):
         rows = self.db.query("SELECT " + _COLUMNS + " FROM conversation_moves"

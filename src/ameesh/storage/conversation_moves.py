@@ -43,6 +43,12 @@ class ConversationMoves(abc.ABC):
         """The agent's open attempt, if any."""
 
     @abc.abstractmethod
+    def holds(self, agent: str) -> bool:
+        """An attempt still holds the agent's session back: switched,
+        recovered or rehydrating, or planned/prepared younger than
+        `PLAN_TTL_S` (the same rule as `begin_turn`)."""
+
+    @abc.abstractmethod
     def for_target(self, host: str) -> list[dict]:
         """Open attempts whose target is `host`, oldest first."""
 

@@ -9054,7 +9054,9 @@ class AgentWorker(threading.Thread):
                 or getattr(self, "db", None) is None or _move_unsupported(self):
             return False
         try:
-            return storage.of(self.db).conversation_moves.open_for(self.name) is not None
+            # B (relecture 3) : même règle que `begin_turn` — une tentative
+            # périmée avant sa bascule ne retient plus l'agent
+            return storage.of(self.db).conversation_moves.holds(self.name)
         except db_mod.DbError:
             return True
 
@@ -9133,7 +9135,10 @@ class AgentWorker(threading.Thread):
         session = self.current_session()
         origin = self.agent.get("session_cwd")
         from . import projects as projects_mod
-        if (session and len(projects_mod.agent_projects(self.agent)) > 1
+        # B (relecture 3) : aucune bascule de lot pendant un déplacement —
+        # ni la session de la source retenue, ni celle du rejeu de la cible
+        if (session and not self._conversation_move_open()
+                and len(projects_mod.agent_projects(self.agent)) > 1
                 and (self.agent.get("session_origin") != session or not origin
                      or os.path.realpath(origin) != os.path.realpath(cwd))):
             lot = self._workdir_lot

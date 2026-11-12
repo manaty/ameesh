@@ -7,9 +7,11 @@
 --   planned → prepared → switched | recovered → rehydrating → verified
 --   et `failed` depuis tout état non terminal.
 --
--- Clé d'idempotence `(agent, epoch_source)` : l'epoch du bail de la source au
--- moment du plan ; un second plan sur le même epoch relit la ligne. Au plus
--- une tentative ouverte par agent (index partiel).
+-- Clé d'idempotence `move_id` ; `(agent, epoch_source)`, l'epoch du bail de la
+-- source au moment du plan, est unique hors des tentatives échouées : un
+-- second plan sur le même epoch relit la ligne vivante, et une tentative
+-- échouée (ou périmée) laisse planifier de nouveau. Au plus une tentative
+-- ouverte par agent (index partiel).
 --
 -- La ligne ne porte que des identifiants, des hôtes, des dossiers de travail,
 -- des bornes de séquence et un digest : jamais le texte du segment, jamais un
@@ -54,7 +56,6 @@ create table if not exists conversation_moves (
     switched_at timestamptz,
     verified_at timestamptz,
     failed_at timestamptz,
-    unique (agent, epoch_source),
     check (target_host <> source_host),
     check ((target_owner is null) = (target_epoch is null)),
     check (state not in ('rehydrating', 'verified')
@@ -62,6 +63,8 @@ create table if not exists conversation_moves (
     check (state <> 'verified' or target_session is not null)
 );
 
+create unique index if not exists conversation_moves_epoch_uq
+    on conversation_moves (agent, epoch_source) where state <> 'failed';
 create unique index if not exists conversation_moves_open_uq
     on conversation_moves (agent)
     where state in ('planned', 'prepared', 'switched', 'recovered', 'rehydrating');

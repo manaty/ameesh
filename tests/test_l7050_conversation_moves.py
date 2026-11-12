@@ -250,6 +250,23 @@ class MoveTest(Base):
         self.assertEqual(self.begin(), "started")
         self.assertEqual(self.advance(), [(move["move_id"], "failed")])
 
+    def test_stale_plan_holds_nothing_and_can_be_planned_again(self):
+        # B (relecture 3) : au-delà de PLAN_TTL_S, la tentative ne retient
+        # plus rien (même règle que begin_turn) ; un nouveau plan, même sur
+        # le même epoch, ouvre une tentative neuve
+        old = self.plan()
+        self.assertTrue(self.moves.holds("avatar"))
+        self.db.execute("UPDATE conversation_moves SET updated_at = now() - interval '1 hour'")
+        self.assertFalse(self.moves.holds("avatar"))
+        again = self.plan()
+        self.assertTrue(again["created"])
+        self.assertNotEqual(again["move_id"], old["move_id"])
+        self.assertEqual(again["epoch_source"], old["epoch_source"])
+        self.assertEqual(self.moves.get(old["move_id"])["state"], "failed")
+        self.assertTrue(self.moves.holds("avatar"))
+        # the replay of the live attempt still rereads it
+        self.assertFalse(self.plan(move_id=again["move_id"])["created"])
+
     def test_plan_refused_on_same_host_or_external(self):
         self.assertIsNone(M.plan(self.db, "avatar", "source", requested_by="human:alice"))
         with self.assertRaises(ValueError):
@@ -380,6 +397,41 @@ class WorkerTest(Base):
         self.assertIs(AgentWorker.rotate_for_lot(w, spec), spec)
         self.assertEqual(self.db.query(reset)[0], before)
         self.assertEqual(before["session_id"], "sess-source")
+
+    def test_lot_switch_of_the_turn_held_while_a_move_is_open(self):
+        # B (relecture 3) : la bascule de lot de `_run_turn_sous_battement`
+        # (agent multi-projet, session ouverte ailleurs) est retenue — côté
+        # source retenue comme au rejeu de la cible
+        from unittest import mock
+        from ameesh.runner import AgentWorker
+
+        class Stop(Exception):
+            pass
+        self.plan()
+        w = self.worker({"lease_epoch": self.row()["lease_epoch"]})
+        switched = []
+        w._workdir_lot = None
+        w._lot_workdir_secondary = False
+        w._resolve_workdir = lambda: self.tmp
+        w._switch_lot = lambda *a: switched.append(a) or True
+        w._adopt_originless_session = lambda *a: False
+        w.agent.update(session_cwd="/elsewhere", session_origin="other",
+                       session_work_item="1")
+
+        def stop(spec):
+            raise Stop()
+        w._with_background_note = stop
+        run = AgentWorker._run_turn_sous_battement.__get__(w)
+        with mock.patch("ameesh.runner_sandbox.dispatch", return_value=None), \
+                mock.patch("ameesh.projects.agent_projects", return_value=["a", "b"]):
+            with self.assertRaises(Stop):
+                run({"lot": "2", "prompt": "x"})
+            self.assertEqual(switched, [])
+            # sans tentative, la même bascule part (le chemin est bien celui-ci)
+            self.db.execute("DELETE FROM conversation_moves")
+            with self.assertRaises(Stop):
+                run({"lot": "2", "prompt": "x"})
+        self.assertEqual(switched, [("1", "2")])
 
     def test_switch_refused_when_the_source_session_changed(self):
         # B4 : garde au switch — une session changée depuis le plan échoue
