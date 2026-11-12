@@ -269,6 +269,10 @@ avant A2. Précisions du contrat :
   sans ses entrées intermédiaires) ; le tour le plus récent est toujours
   gardé, ses textes tronqués (`truncated: true`) si même sa forme réduite
   dépasse ;
+- la lecture est une fenêtre des 500 dernières entrées ; si elle commence au
+  milieu d'un tour (tour de plus de 500 entrées), ses messages humains sont
+  relus à rebours jusqu'au `turn_end` précédent et ce tour n'est gardé que
+  réduit ; le fil n'est alors pas consulté ;
 - les entrées `input` et `state` ne sont jamais incluses (le courrier est
   relu par le tour lui-même) ; un `tool` ne garde que `meta.{tool, status}`,
   nom filtré par `safe_tool_name` ;

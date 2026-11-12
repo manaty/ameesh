@@ -43,7 +43,11 @@ SCHEMA = "ameesh-conversation-segment/1"
 #: segment budget, UTF-8 bytes of the canonical JSON document
 BUDGET_BYTES = 24 * 1024
 #: detail rows read for one segment; more than any 24 KB selection needs
+#: (500 entries of at least ~75 bytes each already exceed the budget)
 READ_LIMIT = 500
+#: pages read backwards to find the human messages of a turn that starts
+#: before the window (a turn of more than READ_LIMIT entries)
+BACK_PAGES = 20
 TEXT_KINDS = frozenset(("human_message", "text", "turn_end"))
 KINDS = TEXT_KINDS | {"tool"}
 REDACTED = "[secret retiré]"
@@ -162,15 +166,18 @@ def select(detail: Iterable[dict], thread: Iterable[dict] = (), *, agent: str,
     `detail`: `conversation_log` rows (seq, kind, author, ts, text, meta,
     truncated); `thread`: rows of the same shape rebuilt from R12 entries,
     used only before the first retained detail row.  `head_complete=False`
-    when `detail` is a window that may start inside a turn: its first turn
-    is then dropped, and the thread is not consulted.
+    when the first turn of `detail` lacks entries (a window that starts
+    inside a turn, completed by its human messages): that turn can only be
+    kept reduced, and the thread is not consulted.
     """
     conversation.identifier(agent)
     secrets = sorted({s for s in secrets if s}, key=len, reverse=True)
     rows = [e for e in (_entry(r, secrets) for r in detail) if e]
     closed, _open = turns(rows)
     if not head_complete:
-        closed, thread = closed[1:], ()
+        thread = ()
+        if closed:
+            closed[0] = _reduced(closed[0])
     if rows:
         first = min(e["seq"] for e in rows)
         older = [e for e in (_entry(r, secrets, source="thread") for r in thread)
@@ -185,9 +192,10 @@ def select(detail: Iterable[dict], thread: Iterable[dict] = (), *, agent: str,
     chosen: list[list[dict]] = []
     reduced_seq = None
     used = 0
+    partial = closed[0] if closed and not head_complete else None
     for turn in reversed(candidates):
         cost = sum(_size(e) + 1 for e in turn)
-        if used + cost <= room:
+        if turn is not partial and used + cost <= room:
             chosen.insert(0, turn)
             used += cost
             continue
@@ -237,6 +245,30 @@ def thread_rows(entries: Iterable[fil.Entry], agent: str) -> list[dict]:
     return rows
 
 
+def _turn_head(store, agent: str, first: int) -> tuple[list[dict], bool]:
+    """Human messages of the turn that contains entry `first`, read backwards
+    until the previous `turn_end` or the start of the retained detail.
+    Returns (messages, whole): `whole` when the entry just before `first`
+    is a `turn_end`, i.e. `first` already starts a turn."""
+    messages: list[dict] = []
+    nearest = True
+    hi = first
+    for _ in range(BACK_PAGES):
+        if hi <= 1:
+            break
+        lo = max(0, hi - 1 - READ_LIMIT)
+        page = [r for r in store.read(agent, after=lo, limit=READ_LIMIT)["entries"]
+                if int(r["seq"]) < hi]
+        for row in reversed(page):
+            if row["kind"] == "turn_end":
+                return messages, nearest
+            nearest = False
+            if row["kind"] == "human_message":
+                messages.insert(0, row)
+        hi = lo + 1
+    return messages, False
+
+
 def build(db, cfg, agent: str, *, secrets: Iterable[str] | None = None,
           transport=None, threads: Sequence[fil.ThreadRef] | None = None,
           budget: int = BUDGET_BYTES) -> dict:
@@ -245,11 +277,17 @@ def build(db, cfg, agent: str, *, secrets: Iterable[str] | None = None,
     if secrets is None:
         secrets = turn_context.environment_secrets()
     secrets = list(secrets)
-    pages = storage.of(db).conversations.recent([agent], limit=READ_LIMIT)
+    store = storage.of(db).conversations
+    pages = store.recent([agent], limit=READ_LIMIT)
     detail = next((p["entries"] for p in pages if p["agent"] == agent), [])
     thread: list[dict] = []
     complete = len(detail) < READ_LIMIT
-    if complete and (not detail or int(detail[0]["seq"]) > 1):
+    if not complete:
+        # the window may start inside a turn (#7049 B): complete that turn
+        # with its human messages so the newest turn is always kept
+        head, complete = _turn_head(store, agent, int(detail[0]["seq"]))
+        detail = head + list(detail)
+    elif not detail or int(detail[0]["seq"]) > 1:
         transport = transport or fil.transport_for(cfg)
         if threads is None:
             # R12 copies go to the thread of the row's project and lot; with no

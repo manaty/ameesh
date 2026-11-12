@@ -105,12 +105,29 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(S.canonical(doc).count("doublon du détail"), 0)
         self.assertEqual(doc["from_seq"], 1)
 
-    def test_window_starting_inside_a_turn_drops_it(self):
+    def test_partial_head_turn_is_kept_reduced_and_thread_ignored(self):
         rows = turn(1, "q1", "r1")[2:] + turn(5, "q2", "r2")
         doc = S.select(rows, [{"seq": 0, "kind": "human_message", "author": "human:a",
                                "ts": 0.0, "text": "fil", "meta": {}}],
                        agent="avatar", head_complete=False)
-        self.assertEqual(doc["from_seq"], 5)
+        self.assertEqual([e["seq"] for e in doc["entries"]], [3, 5, 6, 7])
+        self.assertEqual(doc["cut"]["reduced_seq"], 3)
+        self.assertNotIn("fil", [e.get("text") for e in doc["entries"]])
+
+    def test_newest_turn_longer_than_the_read_window_is_kept(self):
+        # review B (mty-amh-qa-01): 1 human + 498 text + 1 turn_end
+        rows = [{"seq": 1, "kind": "human_message", "author": "human:alice", "ts": 1.0,
+                 "text": "question", "meta": {}}]
+        rows += [{"seq": n, "kind": "text", "author": "agent:x", "ts": 2.0,
+                  "text": "pas %d" % n, "meta": {}} for n in range(2, 500)]
+        rows.append({"seq": 500, "kind": "turn_end", "author": "agent:x", "ts": 3.0,
+                     "text": "finale", "meta": {"status": "completed"}})
+        for complete in (True, False):
+            doc = S.select(rows, agent="x", head_complete=complete)
+            self.assertEqual([(e["seq"], e["text"]) for e in doc["entries"]],
+                             [(1, "question"), (500, "finale")])
+            self.assertEqual(doc["cut"], {"truncated_before_seq": 1, "reason": "bytes",
+                                          "reduced_seq": 500})
 
 
 class SecretAndDigestTest(unittest.TestCase):
@@ -191,6 +208,31 @@ class BuildTest(PgTestCase):
         self.assertEqual((doc["from_seq"], doc["to_seq"]), (1, 8))
         self.assertNotIn(SECRET, S.canonical(doc) + S.render(doc))
         self.assertIn("deuxième question", S.render(doc))
+
+    def test_turn_longer_than_the_read_window_keeps_question_and_answer(self):
+        self.exchange("ancienne question", "ancienne réponse", "t0")
+        self.log.append("human_message", "longue question", author="human:alice", turn="t1")
+        for n in range(S.READ_LIMIT + 100):
+            self.log.append("tool", "Bash", meta={"tool": "Bash", "status": "completed"},
+                            turn="t1")
+        self.log.append("turn_end", "longue réponse", turn="t1", meta={"status": "completed"},
+                        thread_text="longue réponse", event_id="final:t1")
+        last = self.db.query("SELECT max(seq) AS m FROM conversation_log")[0]["m"]
+        doc = S.build(self.db, self.cfg, "avatar", secrets=[])
+        self.assertEqual([(e["kind"], e["text"]) for e in doc["entries"]],
+                         [("human_message", "longue question"), ("turn_end", "longue réponse")])
+        self.assertEqual(doc["cut"], {"truncated_before_seq": 5, "reason": "bytes",
+                                      "reduced_seq": last})
+        S.verify(doc, doc["digest"])
+
+    def test_full_window_on_a_turn_boundary_keeps_whole_turns(self):
+        for n in range(S.READ_LIMIT // 4 + 3):
+            self.exchange("q%d" % n, "r%d" % n, "t%d" % n)
+        doc = S.build(self.db, self.cfg, "avatar", secrets=[])
+        closed, open_tail = S.turns(doc["entries"])
+        self.assertEqual(open_tail, [])
+        self.assertTrue(all(len(t) == 4 for t in closed))
+        self.assertEqual(doc["entries"][-1]["text"], "r%d" % (S.READ_LIMIT // 4 + 2))
 
     def test_falls_back_on_the_thread_after_detail_retention(self):
         self.exchange("question d'il y a longtemps", "réponse d'il y a longtemps", "t1")
