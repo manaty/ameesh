@@ -193,5 +193,23 @@ class LaterPassTest(unittest.TestCase):
         self.assertNotIn("canon_refresh", data)
 
 
+class UndatableRefusalTest(unittest.TestCase):
+    """Relecture mty-amh-impl-03 : un refus alerte même sans date de retard."""
+
+    def test_refusal_on_a_commit_unknown_to_the_agents_alerts(self):
+        data = dict(canon_ref="a" * 40, notify="mesh-design", canon_refresh=dict(
+            state="refused", reason="not a fast-forward"))
+        alert, = staging_watch.canon_drift_findings(
+            [("mesh", data)], head="b" * 40, first_ahead=lambda r, h: None, now=T0)
+        self.assertEqual((alert["since"], alert["value"]), (None, None))
+        self.assertIn("not datable", alert["detail"])
+        self.assertIn("refused (not a fast-forward)", alert["detail"])
+
+    def test_undatable_drift_without_refusal_stays_quiet(self):
+        self.assertEqual(staging_watch.canon_drift_findings(
+            [("mesh", dict(canon_ref="a" * 40))], head="b" * 40,
+            first_ahead=lambda r, h: None, now=T0), [])
+
+
 if __name__ == "__main__":
     unittest.main()

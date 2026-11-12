@@ -810,19 +810,23 @@ def canon_drift_findings(records, *, head: str, first_ahead, now: float) -> list
         refused = (str(refresh.get("reason") or "refused")
                    if isinstance(refresh, dict) and refresh.get("state") == "refused"
                    else "")
-        if since is None or (now - since < CANON_DRIFT_S and not refused):
+        # A refusal alerts even when the agents' clone cannot date the drift
+        # (the executor's commit unknown to it, e.g. after rewritten history).
+        if not refused and (since is None or now - since < CANON_DRIFT_S):
             continue
         detail = ("Staging executor %s reads canon %s; the agents' canon is at %s, "
-                  "ahead for %.1f d (threshold 1 d). Host fiches and rules read "
-                  "by staging may be stale. "
-                  % (key, ref[:12], head[:12], (now - since) / 86400.0))
+                  % (key, ref[:12], head[:12]))
+        detail += ("ahead for %.1f d (threshold 1 d). " % ((now - since) / 86400.0)
+                   if since is not None else "drift not datable from the agents' clone. ")
+        detail += "Host fiches and rules read by staging may be stale. "
         detail += ("The automatic refresh of its last completed pass was refused "
                    "(%s): copy kept; fix the cause, or see the operator gesture "
                    "in DEPLOIEMENT-HOTE-AGENTS.md." % refused[:200] if refused else
                    "Its next completed pass refreshes the copy (#7053); without one, "
                    "see the operator gesture in DEPLOIEMENT-HOTE-AGENTS.md.")
         out.append(dict(schema="ameesh-alert/1", type="staging_canon_stale",
-                        agent=None, since=since, value=now - since,
+                        agent=None, since=since,
+                        value=now - since if since is not None else None,
                         threshold=CANON_DRIFT_S, reason=key, canon_ref=ref,
                         head=head, urgent=False,
                         orchestrators=([data["notify"]]
