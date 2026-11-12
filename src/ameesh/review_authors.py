@@ -4124,6 +4124,62 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
         return None
 
 
+def _forge_serves(repo: str, sha: str, *, timeout: Optional[float] = None):
+    """La forge du clone sert-elle le commit exact `sha` ? (#6934, B/P2 cx2)
+
+    `_forge_fetch` conclut sur l'objet **local** : un commit de sonde resté
+    dans le clone de lecture y paraît servi. Ici la question va à la forge
+    seule, depuis un dépôt vide temporaire (`--filter=blob:none --depth=1`,
+    jamais sur le clone partagé) qui reprend la configuration d'accès du
+    clone (`credential.*`, `http.*`, `url.*`). Rend `True` (servi), `False`
+    (refus **explicite** de l'objet : jamais publié, ou plus servi) ou `None`
+    (pas de forge, échéance, panne : un doute qui garde l'exclusion)."""
+    text = plan_git.full_commit_id(sha)
+    if not text:
+        return None
+    bound = plan_git.FETCH_TIMEOUT if timeout is None else min(
+        float(timeout), plan_git.FETCH_TIMEOUT)
+    sweep = active_sweep()
+    if sweep is not None:
+        sweep.check("forge serves")
+        bound = min(bound, sweep.deadline.remaining())
+    if bound <= 0:
+        return None
+    try:
+        forge = plan_git.forge_remote(repo)
+        if forge is None:
+            return None
+        url = (plan_git._out(repo, "remote", "get-url", forge)
+               if forge == "origin" else forge)
+        url = str(url or "").strip()
+        if not url:
+            return None
+        if ("://" not in url and not os.path.isabs(url)
+                and not re.match(r"^[^/]+:", url)):
+            # un chemin local relatif se lit depuis le clone, pas le scratch
+            url = os.path.normpath(os.path.join(repo, url))
+        access = plan_git._out(repo, "config", "--local", "--get-regexp",
+                               r"^(credential|http|url)\.") or ""
+        options: list[str] = []
+        for line in str(access).splitlines():
+            name, _sep, value = line.partition(" ")
+            if name:
+                options.extend(("-c", "%s=%s" % (name, value)))
+        with tempfile.TemporaryDirectory(prefix="ameesh-forge-serves-") as scratch:
+            init = plan_git._git(scratch, "init", "--quiet", timeout=bound)
+            if init.returncode != 0:
+                return None
+            proc = plan_git._git(
+                scratch, *options, "fetch", "--quiet", "--no-tags",
+                "--no-write-fetch-head", "--filter=blob:none", "--depth=1",
+                "--", url, text, timeout=bound)
+    except Exception:  # noqa: BLE001 - forge injoignable ou coupée : doute
+        return None
+    if proc.returncode == 0:
+        return True
+    return False if _fetch_refused(proc.stderr) else None
+
+
 #: stderr d'un `git fetch` qui refuse **explicitement** l'objet demandé (#4457)
 _FETCH_REFUSAL_MARKERS = (
     "not our ref",
@@ -4989,7 +5045,10 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     (`pushed_by` : têtes relevées, gels postérieurs) est une sonde locale
     jamais poussée (cas réel nexlink #6912) : il n'exclut pas son acteur et
     `unattached` le dit avec `reason: never-pushed`. Une forge muette ou une
-    poussée lisible garde le doute de #4679.
+    poussée lisible garde le doute de #4679. B/P2 cx2 : la même règle vaut
+    pour une sonde restée **lisible** dans le clone (`published` : poussée
+    tracée, ou forge interrogée seule par `_forge_serves`) ; un correctif
+    publié puis réécrit reste exclu (#4457).
 
     #5197 : la note de relecture d'une branche `review/<relecteur>-<lot>` ne
     corrige pas cette tête : un commit de cette branche du relecteur
@@ -5204,6 +5263,29 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         pushes[slot] = found
         return found
 
+    def published(key: str, freeze_id: int, freeze_sha: str, full: str) -> bool:
+        """Le commit lisible `full` a-t-il été publié ? (#6934, B/P2 cx2)
+
+        Une poussée de l'acteur sur la branche du lot (`pushed_by`) ou une
+        forge qui sert l'objet le disent publié. Seul un refus **net** de la
+        forge, sans poussée tracée, dit « jamais publié » ; le refus se
+        mémorise (`fetch_cache`, même sens : la forge ne sert pas ce commit)
+        pour la lecture du gel (`fetch=False`), qui ne lit que lui. Un doute
+        dit « publié » : l'exclusion demeure."""
+        if pushed_by(key, freeze_id, freeze_sha):
+            return True
+        if fetch_cache.refused(repo, full, state_dir=state_dir):
+            return False
+        if not fetch:
+            return True
+        check()
+        served = _forge_serves(repo, full, timeout=remaining())
+        check()
+        if served is False:
+            fetch_cache.note(repo, full, state_dir=state_dir)
+            return False
+        return True
+
     def finish(result: dict) -> dict:
         """Ajoute la trace des reçus sans lot au retour (#4679 B/P2)."""
         if unattached is not None:
@@ -5329,6 +5411,16 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     # #5197 : une note de relecture — sur la branche review/*
                     # du relecteur et hors du contenu du lot —, pas un
                     # correctif réécrit
+                    continue
+                check()
+                if not published(key, freeze_id, freeze_sha, full):
+                    # #6934 (B/P2 cx2) : une sonde restée lisible dans le
+                    # clone, que la forge ne sert pas et sans poussée de
+                    # l'acteur sur la branche du lot : pas une correction.
+                    if unattached is not None:
+                        ignored.setdefault((key, full), {
+                            "name": actor, "sha": full, "freeze": freeze_id,
+                            "reason": "never-pushed"})
                     continue
                 check()
                 other_lot = stacked_lot(receipt, full)

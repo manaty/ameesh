@@ -13,6 +13,10 @@ push (#4679) dont la poussée est vue sur la branche → exclusion inchangée.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
+import unittest
 from unittest import mock
 
 from ameesh import (plan_git, review_authors, review_designation as rd,
@@ -44,7 +48,7 @@ class ProbeCommitTest(rebased.RebasedCorrectorDoubtTest):
         act.prefetch_freeze_objects(self.db, item, target, self.frozen)
         return self.freeze()
 
-    def _prepare_probe(self):
+    def _prepare_probe(self, *, forget=True):
         head_a = self.frozen
         self.freeze()                       # F1
         # La sonde de cx3 sur la tête gelée, jamais poussée.
@@ -56,7 +60,8 @@ class ProbeCommitTest(rebased.RebasedCorrectorDoubtTest):
             " work_item_id, turn_id)"
             " VALUES ('cx3', 'codex', 's-codex', now(), %s, 't')", (self.lot,))
         self.repo.git("reset", "--hard", head_a)
-        self._forget(probe)
+        if forget:
+            self._forget(probe)
         self.db.execute(
             "UPDATE provenance_receipts SET at = now() - interval '10 minutes'"
             " WHERE subject = %s", ("commit:" + probe,))
@@ -109,3 +114,55 @@ class ProbeCommitTest(rebased.RebasedCorrectorDoubtTest):
             _mark, out = self.prefetched_freeze()      # F2
         self.assertNotIn("excluded by doubt", out["why"])
         self.assertIn("never pushed", out["why"])
+
+    def test_a_probe_still_readable_in_the_clone_excludes_nobody(self):
+        # B/P2 cx2 : la sonde reste dans le clone de lecture ; la forge seule
+        # dit qu'elle n'a jamais été publiée.
+        probe = self._prepare_probe(forget=False)
+        self.assertIsNotNone(plan_git.local_commit(self.repo.root, probe))
+        served = lambda repo, sha, *, timeout=None: (
+            False if plan_git.same_commit(sha, probe) else None)
+        with mock.patch.object(review_authors, "_forge_serves",
+                               side_effect=served):
+            _mark, out = self.prefetched_freeze()   # F2
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertNotIn("cx3", out.get("fixers") or [])
+        self.assertNotIn("corrector(s) excluded: cx3", out["why"])
+        self.assertIn("never pushed", out["why"])
+        self.assertIn(probe[:12], out["why"])
+
+    def test_a_readable_correction_the_forge_serves_stays_excluded(self):
+        # #4457 : publiée puis réécrite, la correction exclut toujours.
+        self._prepare_probe(forget=False)
+        with mock.patch.object(review_authors, "_forge_serves",
+                               return_value=True):
+            _mark, out = self.prefetched_freeze()   # F2
+        names = [row["name"] for row in out["reviewers"]]
+        self.assertNotIn("cx3", names)
+        self.assertNotIn("never pushed", out["why"])
+
+
+class ForgeServesTest(unittest.TestCase):
+    """`_forge_serves` interroge la forge seule, jamais l'objet local."""
+
+    def git(self, cwd, *args):
+        env = dict(os.environ, GIT_AUTHOR_NAME="a", GIT_AUTHOR_EMAIL="a@x.invalid",
+                   GIT_COMMITTER_NAME="a", GIT_COMMITTER_EMAIL="a@x.invalid")
+        return subprocess.run(["git", *args], cwd=cwd, env=env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_served_published_refused_local_and_none_without_forge(self):
+        with tempfile.TemporaryDirectory() as root:
+            forge, clone = os.path.join(root, "forge.git"), os.path.join(root, "clone")
+            self.git(root, "init", "-q", "--bare", forge)
+            self.git(root, "init", "-q", clone)
+            self.git(clone, "remote", "add", "origin", "../forge.git")
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "publié")
+            published = self.git(clone, "rev-parse", "HEAD")
+            self.git(clone, "push", "-q", "origin", "HEAD:refs/heads/lot")
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "sonde")
+            probe = self.git(clone, "rev-parse", "HEAD")
+            self.assertIs(review_authors._forge_serves(clone, published), True)
+            self.assertIs(review_authors._forge_serves(clone, probe), False)
+            self.git(clone, "remote", "remove", "origin")
+            self.assertIsNone(review_authors._forge_serves(clone, probe))
