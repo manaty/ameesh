@@ -102,7 +102,7 @@ Règles encodées :
 | `configurer-noeud.sh` | idempotent : fragment `conf.d`, bloc `pg_hba`, rechargement, redémarrage optionnel, rôles et slots sur le primaire effectif |
 | `initialiser-standby.sh` | `pg_basebackup -X stream -S <slot> -R -c fast`, reprise et `standby.signal`, contrôle du flux |
 | `promouvoir.sh` | promotion manuelle avec gardes anti-split-brain et borne WAL rejouée ; crée les slots des autres nœuds |
-| `reintegrer.sh` | `pg_rewind` de l'ancien primaire, re-pose de la configuration copiée par le rewind, démarrage en standby |
+| `reintegrer.sh` | `pg_rewind` de l'ancien primaire, re-pose de la configuration copiée par le rewind, démarrage en standby, suppression des slots physiques inactifs de l'ancien rôle primaire |
 | `suivre-primaire.sh` | fait suivre un autre standby au nouveau primaire (`primary_conninfo`/slot), recharge et contrôle |
 | `retour-arriere.sh` | retire la configuration du lot, et sur demande les slots et les rôles ; aucune donnée supprimée |
 | `etat.sh` | lecture seule : rôle, synchrones, slots, flux, retards, avertissements |

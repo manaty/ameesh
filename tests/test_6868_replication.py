@@ -988,6 +988,31 @@ os.execv({vrai_stat!r}, ["stat"] + args)
         self.assertIn("pg_ctlcluster 17 main start", journal)
         self.assertTrue((self.state / "running").exists())
 
+    def test_reintegrer_supprime_les_slots_de_l_ancien_primaire(self):
+        # #7028 : les slots physiques de l'ancien primaire restent dans
+        # pg_replslot après le rewind ; inactifs sur un standby, ils retiennent
+        # du WAL. Ceux de l'inventaire partent, un slot actif ou inconnu reste.
+        self.donnees()
+        self.serveur(demarre=False)
+        self.hote_distant("ameesh-agents-1", demarre=True, en_recuperation=False)
+        (self.state / "receiver").write_text("streaming|ameesh-agents-1|x|||\n",
+                                             encoding="utf-8")
+        self.slots([["ameesh_agents_1", "f", "reserved"],
+                    ["ameesh_agents_2", "f", "reserved"],
+                    ["manaty_mesh_1", "t", "reserved"],
+                    ["cascade_manuel", "f", "reserved"]])
+
+        resultat = self.run_script("reintegrer.sh",
+                                   "--source", "ameesh-agents-1", "manaty-mesh-1")
+        self.assertIn("slot physique ameesh_agents_1 supprimé", resultat.stdout)
+        self.assertIn("slot physique ameesh_agents_2 supprimé", resultat.stdout)
+        self.assertIn("2 slot(s) physique(s) de l'ancien rôle primaire supprimé(s)",
+                      resultat.stdout)
+        restants = sorted(ligne.split("|")[0] for ligne in
+                          (self.state / "slots").read_text(encoding="utf-8").split())
+        self.assertEqual(restants, ["cascade_manuel", "manaty_mesh_1"])
+        self.assertIn("réintégré en standby de ameesh-agents-1", resultat.stdout)
+
     def test_reintegrer_echec_non_masque(self):
         self.donnees()
         self.serveur(demarre=False)
