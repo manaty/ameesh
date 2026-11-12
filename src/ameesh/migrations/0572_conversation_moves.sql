@@ -21,7 +21,7 @@
 -- le code d'avant ne la nomme jamais.
 set local lock_timeout = '5s';
 
-create table if not exists conversation_moves (
+create table conversation_moves (
     move_id uuid primary key,
     agent text not null check (length(agent) between 1 and 256),
     epoch_source bigint not null,
@@ -74,7 +74,6 @@ create index if not exists conversation_moves_target
 
 -- Same spelling contract as agent_rename.REWRITTEN: resolve aliases on new
 -- writes, under the registry lock used by the rename transaction (0516).
-drop trigger if exists ameesh_agent_spelling on conversation_moves;
 create trigger ameesh_agent_spelling before insert or update of agent,requested_by
     on conversation_moves
     for each row execute function ameesh_agent_spelling('agent requested_by');
