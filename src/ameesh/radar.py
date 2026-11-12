@@ -59,6 +59,10 @@ Configuration de l'hôte (clé `radar`) :
 `migrations_width` (facultatif) : chiffres des numéros de migration
 (`014_x.sql` : 3) ; sinon celui d'un dépôt connu, sinon 4.
 
+`migrations_companions` (facultatif, #7000) : chemins qui portent le numéro
+d'une migration (`["supabase/rollback"]`) ; une renumérotation imposée par la
+réservation peut les renommer ou les retoucher du seul numéro.
+
 `github` (facultatif, sinon déduit de l'URL `origin`) : le dépôt où lire l'état
 de la CI des PR, pour savoir si un conflit bloque.
 """
@@ -79,7 +83,8 @@ from .canon import GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
-PROJECT_KEYS = ("repo", "migrations", "migrations_width", "target", "github", "land", "gates", "merge_method",
+PROJECT_KEYS = ("repo", "migrations", "migrations_width", "migrations_companions", "target",
+                "github", "land", "gates", "merge_method",
                 "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
                 "required_statuses", "required_checks", "production_branch")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
@@ -165,6 +170,11 @@ class Project:
     #: #4750 : chiffres des numéros de migration (`014_x.sql` : 3) ; 0 : celui
     #: d'un dépôt connu (`migrations.LAYOUTS`), sinon 4
     migrations_width: int = 0
+    #: #7000 : chemins (répertoires ou fichiers) qui suivent le numéro d'une
+    #: migration — rollback, registre : une renumérotation imposée par la
+    #: réservation peut les renommer ou les retoucher du seul numéro
+    #: (`verdict_carry`, adaptation sans second avis)
+    migrations_companions: tuple = ()
     target: str = ""
     github: str = ""
     #: L160e2: `off` (default), `local` or `pr`; the commands run on the merged
@@ -359,6 +369,18 @@ def parse_settings(raw) -> Settings:
         if isinstance(width, bool) or not isinstance(width, int) or not 0 <= width <= 9:
             raise SettingsError("%s.migrations_width: digits of a migration number (1-9) "
                                 "expected" % where)
+        companions = value.get("migrations_companions") or ()
+        if isinstance(companions, str):
+            companions = (companions,)
+        if not isinstance(companions, (list, tuple)) or not all(
+                isinstance(c, str) and c.strip().strip("/") for c in companions):
+            raise SettingsError("%s.migrations_companions: a list of relative paths expected"
+                                % where)
+        companions = tuple(c.strip().strip("/") for c in companions)
+        if any(c.startswith("~") or any(part in (".", "..") for part in c.split("/"))
+               for c in companions):
+            raise SettingsError("%s.migrations_companions: path must be relative to the "
+                                "repository" % where)
         if texts["target"]:
             plan_git.check_ref(texts["target"], "cible")
         if texts["production_branch"]:
@@ -518,6 +540,7 @@ def parse_settings(raw) -> Settings:
             raise SettingsError("%s.lease_ref: %s" % (where, exc)) from exc
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], migrations_width=width,
+                                 migrations_companions=companions,
                                  target=texts["target"],
                                  github=texts["github"], land=land,
                                  production_branch=texts["production_branch"],

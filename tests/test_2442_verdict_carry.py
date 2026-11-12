@@ -503,9 +503,9 @@ class CarryTest(PgTestCase):
         self.freeze(frozen)
         real = verdict_carry._carriable
 
-        def withdraw(*args):
+        def withdraw(*args, **kwargs):
             seats.designate_reviewer(self.lot, "rev1", actor="human:alice", remove=True)
-            return real(*args)
+            return real(*args, **kwargs)
 
         with mock.patch.object(verdict_carry, "_carriable", side_effect=withdraw):
             self.assertNotEqual(self.carry()["result"], "carried")

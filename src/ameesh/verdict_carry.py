@@ -51,6 +51,35 @@ tests seuls n'en profite pas : ses tests sont son contenu. **Seul un avis
 favorable se reporte ainsi** : une adaptation peut répondre au blocage, son
 auteur juge donc la nouvelle tête, redésigné normalement.
 
+**Renumérotation (#7000)** — constat nexlink #6953 : le pilote échange deux
+réservations, l'auteur renomme sa migration 784 en 783 et retouche les renvois
+au numéro. C'est une troisième adaptation ; l'invariant prouvé, pour la
+renumérotation `M` {ancien n° : nouveau n°} :
+
+- I1 (portée) chaque fichier renommé F (ancien → nouveau) est un couple
+  suppression/ajout d'un même répertoire, de même nom après le préfixe
+  numérique, sous le répertoire de migrations déclaré, un compagnon déclaré
+  (`radar.projects.<p>.migrations_companions`) ou un test adaptable ; F a été
+  ajouté ou modifié par la tête relue depuis sa base avec la cible ;
+- I2 (réservation) au moins une migration est renommée, et chaque nouveau
+  numéro est réservé par le lot (`ameesh work migration`, L122) ;
+- I3 (fonction) `M` donne un seul nouveau numéro par ancien, et deux anciens
+  ne vont jamais au même nouveau ; les numéros se comparent en entiers ;
+- I4 (contenu) une migration ou un compagnon renommé reste un fichier
+  ordinaire de même mode, et son contenu est l'ancien où seules les
+  occurrences en jeton entier de **son propre** ancien numéro deviennent son
+  nouveau numéro (`_substitute`, `_own_mapping`) ;
+- I5 (reste) hors des couples, ne changent que des tests adaptables (règle des
+  tests) et des compagnons de la tête relue, fichiers ordinaires de même mode,
+  retouchés de leur seul numéro — ou de `M` entier pour un registre sans
+  numéro ; un fichier numéroté hors de `M` ne change pas ;
+- I6 (historique) chaque commit nouveau respecte I1, I4 et I5 pas à pas (un
+  contenu retouché puis rétabli reste refusé) ;
+- I7 (arrivée) chaque nouveau numéro nomme une seule migration de l'arbre
+  d'atterrissage.
+
+Le report note « adaptation : renumérotation N→M ».
+
 **Report** — pour chaque relecteur, son **dernier** verdict, s'il porte sur une
 tête réalignée, est recopié en jalon `verdict` sur la tête gelée : au nom du
 relecteur (sa famille compte à la porte, #1374), sans preuve de tour (#1465 :
@@ -104,6 +133,7 @@ import re
 import shutil
 import tempfile
 import time
+from dataclasses import dataclass, replace
 from typing import Mapping, Optional
 
 from . import merge_queue, plan_git, storage, work
@@ -683,14 +713,221 @@ def composed_hunks(conflicted: bytes, resolved: bytes) -> int | None:
     return hunks if hunks and position == len(expected) else None
 
 
+@dataclass(frozen=True)
+class Renumbering:
+    """#7000 : ce qu'une renumérotation de migration peut toucher sans avis — le
+    répertoire de migrations déclaré du dépôt, ses compagnons déclarés
+    (`radar.projects.<p>.migrations_companions` : rollback, registre) — et les
+    numéros que le lot réserve (`ameesh work migration`, L122)."""
+
+    directory: str
+    reserved: frozenset
+    companions: tuple = ()
+    #: les chemins que la tête relue ajoute ou modifie depuis sa base avec la
+    #: cible (`adapted` les fixe) : seuls ceux-là se renumérotent — une migration
+    #: de la cible, jamais relue, n'est pas au lot (B1 qa-01 #213399). None :
+    #: aucun chemin prouvé, aucune renumérotation
+    owned: frozenset | None = None
+
+    def zone(self, path: str) -> str:
+        """`migration`, `companion`, `test` ou "" : où vit `path`."""
+        if os.path.dirname(path) == self.directory:
+            return "migration"
+        if any(path == c or path.startswith(c + "/") for c in self.companions):
+            return "companion"
+        return "test" if _adaptable_test(path) else ""
+
+
+#: un fichier numéroté : le numéro littéral, puis le reste du nom (`_x.sql`)
+_NUMBERED = re.compile(r"^(\d+)(_.+)$")
+
+
+def renumbering_of(cfg, row: Mapping, repo: str) -> Renumbering | None:
+    """La renumérotation admissible pour le lot `row` dans le clone `repo`, ou
+    None : dépôt sans répertoire de migrations déclaré, ou aucun numéro réservé
+    dans ce dépôt — rien n'est alors une renumérotation (fail-closed)."""
+    from . import migrations, radar
+    slug = migrations.repo_key(plan_git._repo_slug(repo) or row.get("migration_repo") or "")
+    if not slug:
+        return None
+    layout = migrations.layout_for(slug, cfg)
+    if layout is None or not layout.directory:
+        return None
+    reserved = frozenset(
+        int(r["number"]) for r in work.reserved_migrations(dict(row))
+        if migrations.repo_key(r["repo"] or row.get("migration_repo") or "") == slug)
+    if not reserved:
+        return None
+    companions: tuple = ()
+    try:
+        for project in radar.settings_of(cfg).projects.values():
+            # B2 qa-01 #213399 : `github` est facultatif, déduit de l'origine
+            if migrations.repo_key(radar.github_slug(project) or "") == slug:
+                companions = tuple(project.migrations_companions)
+    except Exception:  # noqa: BLE001 - réglages illisibles : aucun compagnon
+        companions = ()
+    return Renumbering(layout.directory.strip("/"), reserved, companions)
+
+
+def _substitute(blob: bytes, mapping: Mapping) -> bytes:
+    """`blob`, chaque ancien numéro de `mapping` remplacé par le nouveau en jeton
+    entier (ni lettre ni chiffre de part et d'autre), en une passe : un numéro
+    rendu n'est jamais remplacé à nouveau."""
+    if not mapping:
+        return blob
+    olds = sorted(mapping, key=len, reverse=True)
+    pattern = re.compile(rb"(?<![0-9A-Za-z])(" + b"|".join(re.escape(o.encode()) for o in olds)
+                         + rb")(?![0-9A-Za-z])")
+    return pattern.sub(lambda m: mapping[m.group(1).decode()].encode(), blob)
+
+
+def _renamed_pairs(changes: Mapping, renumber: Renumbering) -> list:
+    """Les couples suppression/ajout d'un même répertoire dont seul le numéro du
+    nom change : `[(ancien chemin, nouveau chemin, ancien n°, nouveau n°, zone)]`.
+    Un chemin supprimé qui a zéro ou plusieurs ajouts possibles n'en forme aucun."""
+    added: dict = {}
+    for path, status in changes.items():
+        match = _NUMBERED.match(os.path.basename(path)) if status == "A" else None
+        if match:
+            added.setdefault((os.path.dirname(path), match.group(2)), []).append(
+                (path, match.group(1)))
+    pairs = []
+    for path, status in sorted(changes.items()):
+        match = _NUMBERED.match(os.path.basename(path)) if status == "D" else None
+        zone = renumber.zone(path) if match else ""
+        if not zone:
+            continue
+        found = [(new, number) for new, number in
+                 added.get((os.path.dirname(path), match.group(2)), ())
+                 if number != match.group(1)]
+        if len(found) == 1:
+            pairs.append((path, found[0][0], match.group(1), found[0][1], zone))
+    return pairs
+
+
+def _renumbered(changes: Mapping, renumber: Renumbering | None, before, after) -> dict:
+    """#7000 : la part de `changes` (base → arbre) qui n'est qu'une renumérotation.
+
+    Rend `{mapping, paths, why}` : `mapping` {ancien n° : nouveau n°} (vide si aucune),
+    `paths` les chemins couverts, `why` un refus ; `before`/`after` lisent un
+    chemin dans la base et dans l'arbre (`_regular` : `(mode, contenu)` d'un
+    fichier ordinaire, None sinon — un lien symbolique ne se renumérote pas,
+    et le mode ne change pas, B cx2 #213476). Conditions, toutes requises :
+    au moins un fichier du répertoire de migrations renommé du seul préfixe
+    numérique ; chaque nouveau numéro réservé par le lot ; un seul nouveau numéro
+    par ancien ; le contenu de chaque migration ou compagnon renommé (ou compagnon
+    retouché) **égal octet pour octet** à l'ancien, numéros remplacés en jetons
+    entiers (`_substitute`). Un test renommé suit la règle des tests (adaptable)."""
+    out = {"mapping": {}, "paths": set(), "why": ""}
+    if renumber is None or renumber.owned is None:
+        return out
+    pairs = [pair for pair in _renamed_pairs(changes, renumber) if pair[0] in renumber.owned]
+    mapping: dict = {}
+    news: dict = {}               # I3 : ancien → nouveau, en entiers (0784 = 784)
+    for _old, _new, number, renamed, zone in pairs:
+        if zone != "migration":
+            continue
+        if int(renamed) not in renumber.reserved:
+            out["why"] = ("renumbering %s→%s: %s is not the lot's reservation (%s)"
+                          % (number, renamed, renamed,
+                             ", ".join(str(n) for n in sorted(renumber.reserved))))
+            return out
+        if (mapping.setdefault(number, renamed) != renamed
+                or news.setdefault(int(number), int(renamed)) != int(renamed)):
+            out["why"] = "renumbering %d to two numbers" % int(number)
+            return out
+    # B2 dev3 #213435 : deux anciens numéros vers un même nouveau laisseraient
+    # deux migrations de ce numéro à l'arrivée
+    taken: dict = {}
+    for _old, new, number, renamed, zone in pairs:
+        if zone == "migration" and mapping.get(number) == renamed:
+            # B dev01 #213475 : `0783` et `783` sont le même numéro
+            if taken.setdefault(int(renamed), number) != number:
+                out["why"] = ("renumbering %s and %s to the same number %s"
+                              % (taken[int(renamed)], number, renamed))
+                return out
+    if not mapping:
+        return out
+    paths: set = set()
+    for old, new, number, renamed, zone in pairs:
+        if mapping.get(number) != renamed:
+            continue                  # couple hors de la renumérotation : jugé ailleurs
+        if zone != "test":
+            old_blob, new_blob = before(old), after(new)
+            if (old_blob is None or new_blob is None or old_blob[0] != new_blob[0]
+                    or _substitute(old_blob[1], {number: renamed}) != new_blob[1]):
+                out["why"] = ("%s is not %s with only %s→%s changed"
+                              % (new, old, number, renamed))
+                return out
+        paths.update((old, new))
+    for path, status in sorted(changes.items()):
+        if (status == "M" and path not in paths and path in renumber.owned
+                and renumber.zone(path) == "companion"):
+            old_blob, new_blob = before(path), after(path)
+            if (old_blob is None or new_blob is None or old_blob[0] != new_blob[0]
+                    or _substitute(old_blob[1], _own_mapping(path, mapping)) != new_blob[1]):
+                out["why"] = "%s is changed beyond the renumbering" % path
+                return out
+            paths.add(path)
+    out.update(mapping=mapping, paths=paths)
+    return out
+
+
+#: les modes d'un fichier ordinaire dans un arbre git
+_REGULAR_MODES = ("100644", "100755")
+
+
+def _regular(run, rev: str, path: str) -> tuple | None:
+    """`(mode, contenu)` de `path` dans `rev` si c'est un fichier ordinaire, None
+    sinon (absent, lien symbolique, sous-module, illisible). `run(*args)` lance
+    git et rend le processus."""
+    listed = run("ls-tree", "-z", rev, "--", path)
+    if listed.returncode != 0:
+        return None
+    entry = listed.stdout.split(b"\0", 1)[0]
+    meta, _tab, name = entry.partition(b"\t")
+    fields = meta.split()
+    if len(fields) != 3 or name.decode("utf-8", "surrogateescape") != path:
+        return None
+    mode, kind, sha = (field.decode() for field in fields)
+    if kind != "blob" or mode not in _REGULAR_MODES:
+        return None
+    proc = run("cat-file", "blob", sha)
+    return (mode, proc.stdout) if proc.returncode == 0 else None
+
+
+def _own_mapping(path: str, mapping: Mapping) -> dict:
+    """B dev3 #213504 : le seul remplacement permis dans `path`. Un fichier
+    numéroté ne change que son propre numéro (ancien ou déjà nouveau) : le
+    `SELECT 784` d'une migration 785 reste 784 ; un fichier numéroté hors de la
+    renumérotation ne change pas. Un fichier sans numéro (registre déclaré)
+    suit le remplacement entier."""
+    match = _NUMBERED.match(os.path.basename(path))
+    if not match:
+        return dict(mapping)
+    number = match.group(1)
+    if number in mapping:
+        return {number: mapping[number]}
+    olds = [old for old, new in mapping.items() if new == number]
+    # B qa-01 #213550 : un fichier numéroté hors de la renumérotation (une autre
+    # migration du lot) ne change pas, même retouché puis rétabli
+    return {olds[0]: number} if len(olds) == 1 else {}
+
+
+def _mapping_text(mapping: Mapping) -> str:
+    return ", ".join("%s→%s" % item for item in sorted(mapping.items()))
+
+
+
 def _merge_adaptation(repo: str, left: str, right: str, *, head: str | None = None,
-                      tree: str | None = None) -> dict:
+                      tree: str | None = None, renumber: Renumbering | None = None) -> dict:
     """La fusion `left` + `right` comparée à son résultat attendu : l'arbre `tree`
     (une fusion de l'historique), ou la fusion propre de `head` dans `left`.
-    Rend `{ok, why, tests, hunks}` : seuls des fichiers de test modifiés ou
-    ajoutés et des conflits résolus mécaniquement peuvent différer."""
+    Rend `{ok, why, tests, hunks, renumbered}` : seuls des fichiers de test
+    modifiés ou ajoutés, des conflits résolus mécaniquement et une renumérotation
+    de migration réservée (`_renumbered`, #7000) peuvent différer."""
     from . import radar
-    refused = {"ok": False, "tests": 0, "hunks": 0}
+    refused = {"ok": False, "tests": 0, "hunks": 0, "renumbered": {}}
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
                             "--git-path", "objects")
     if not objects:
@@ -731,8 +968,34 @@ def _merge_adaptation(repo: str, left: str, right: str, *, head: str | None = No
         unresolved = sorted(path for path in conflicts if path not in changes)
         if unresolved:
             return dict(refused, why="conflict left as is in %s" % unresolved[0])
+        def regular(root: str, path: str):
+            return _regular(lambda *args: radar._scratch_git(repo, objects, scratch, *args),
+                            root, path)
+
+        renamed = _renumbered(changes, renumber, lambda path: regular(base, path),
+                              lambda path: regular(tree, path))
+        if renamed["why"]:
+            return dict(refused, why=renamed["why"])
+        if renamed["mapping"]:
+            # I8 : chaque nouveau numéro nomme une seule migration de l'arbre
+            # d'atterrissage (un fichier de la cible au même numéro en ferait deux)
+            listed = radar._scratch_git(repo, objects, scratch, "ls-tree", "-z", "--name-only",
+                                        tree, "--", renumber.directory + "/")
+            if listed.returncode != 0:
+                return dict(refused, why="the landed migrations cannot be listed")
+            counts: dict = {}
+            for name in listed.stdout.decode("utf-8", "surrogateescape").split("\0"):
+                match = _NUMBERED.match(os.path.basename(name)) if name else None
+                if match:
+                    counts[int(match.group(1))] = counts.get(int(match.group(1)), 0) + 1
+            for new in sorted({int(value) for value in renamed["mapping"].values()}):
+                if counts.get(new, 0) != 1:
+                    return dict(refused, why="migration number %d names %d files once landed"
+                                % (new, counts.get(new, 0)))
         tests = hunks = 0
         for path, status in sorted(changes.items()):
+            if path in renamed["paths"]:
+                continue
             if status in ("M", "A") and _adaptable_test(path):
                 tests += 1
                 continue
@@ -745,17 +1008,21 @@ def _merge_adaptation(repo: str, left: str, right: str, *, head: str | None = No
                 return dict(refused, why="conflict in %s is not resolved by keeping both "
                             "sides' changes and nothing else" % path)
             hunks += found
-        return {"ok": True, "why": "", "tests": tests, "hunks": hunks}
+        return {"ok": True, "why": "", "tests": tests, "hunks": hunks,
+                "renumbered": renamed["mapping"]}
     except radar.GitError as exc:
         return dict(refused, why=str(exc)[:200])
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _adapted_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
+def _adapted_history(repo: str, reviewed: str, frozen: str, tip: str, *,
+                     renumber: Renumbering | None = None, mapping: Mapping | None = None
+                     ) -> tuple:
     """Chaque commit que `frozen` apporte, hors tête relue et cible, est une
     adaptation : fusion dont l'arbre est celle de ses parents à une adaptation
-    près, commit limité à des fichiers de test modifiés ou ajoutés, ou reprise
+    près, commit limité à des fichiers de test modifiés ou ajoutés, commit de la
+    renumérotation `mapping` (`_renumber_commit`, #7000), ou reprise
     propre d'un commit relu. Tout autre contenu est refusé, même retiré ensuite :
     il resterait dans l'historique (R1 cx1). Rend `(oui, raison)`."""
     new = _lines_of(repo, "rev-list", "--topo-order", "--reverse", frozen, "--not",
@@ -772,7 +1039,8 @@ def _adapted_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
             return False, "commit %s cannot be read" % commit[:12]
         parents = parents[1:]
         if len(parents) == 2:
-            merge = _merge_adaptation(repo, parents[0], parents[1], tree=tree)
+            merge = _merge_adaptation(repo, parents[0], parents[1], tree=tree,
+                                      renumber=renumber)
             if not merge["ok"]:
                 return False, "merge %s: %s" % (commit[:12], merge["why"])
             continue
@@ -783,6 +1051,8 @@ def _adapted_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
             return False, "commit %s cannot be read" % commit[:12]
         if fields and all(status in ("M", "A") and _adaptable_test(path)
                           for path, status in fields.items()):
+            continue
+        if mapping and _renumber_commit(repo, parents[0], commit, fields, renumber, mapping):
             continue
         if sources is None:
             try:
@@ -800,6 +1070,54 @@ def _adapted_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
     return True, "%d commit(s) proved" % len(new)
 
 
+def _renumber_commit(repo: str, parent: str, commit: str, fields: Mapping,
+                     renumber: Renumbering, mapping: Mapping) -> bool:
+    """Un commit de l'historique n'est-il qu'un pas de la renumérotation `mapping`
+    (prouvée de bout en bout par `_renumbered`) ? Chaque chemin est un test
+    adaptable, un couple renommé du seul numéro, le fichier renuméroté ou un
+    compagnon, et son contenu ne diffère du précédent **que par ces numéros**
+    (remplacés des deux côtés, l'égalité stricte reste celle du bout en bout) :
+    renommer puis retoucher les renvois en deux commits reste une adaptation."""
+    def run(*args):
+        return plan_git._git(repo, *args)
+
+    def same(old: str, new: str) -> bool:
+        before, after = _regular(run, parent, old), _regular(run, commit, new)
+        own = _own_mapping(old, mapping)
+        return (before is not None and after is not None and before[0] == after[0]
+                and _substitute(before[1], own) == _substitute(after[1], own))
+
+    # B1 dev3 #213435 : seuls un chemin de la tête relue et le nouveau chemin
+    # attendu d'un tel chemin se retouchent ; un fichier de la cible qui porte
+    # le nouveau numéro n'est pas au lot, même retouché puis rétabli
+    owned = renumber.owned or frozenset()
+    expected = set(owned)
+    for path in owned:
+        match = _NUMBERED.match(os.path.basename(path))
+        if match and match.group(1) in mapping:
+            expected.add(os.path.join(os.path.dirname(path),
+                                      mapping[match.group(1)] + match.group(2)))
+    pairs = {}
+    for old, new, number, renamed, zone in _renamed_pairs(fields, renumber):
+        if mapping.get(number) == renamed and old in owned:
+            pairs[old] = pairs[new] = (old, new, zone)
+    for path, status in fields.items():
+        zone = renumber.zone(path)
+        if path in pairs:
+            old, new, zone = pairs[path]
+            if path == new and zone != "test" and not same(old, new):
+                return False
+            continue
+        if status in ("M", "A") and zone == "test":
+            continue
+        if status == "M" and zone in ("migration", "companion") and path in expected:
+            if not same(path, path):
+                return False
+            continue
+        return False
+    return bool(fields)
+
+
 def _name_status(repo: str, old: str, new: str) -> dict | None:
     """{chemin: statut} entre deux commits, renommages dépliés ; None si illisible."""
     proc = plan_git._git(repo, "diff-tree", "-r", "--no-renames", "--name-status", "-z",
@@ -810,7 +1128,8 @@ def _name_status(repo: str, old: str, new: str) -> dict | None:
     return dict(zip(fields[1::2], fields[0::2]))
 
 
-def adapted(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
+def adapted(repo: str, reviewed: str, frozen: str, tip: str, *,
+            renumber: Renumbering | None = None) -> tuple:
     """#5042 : `frozen` n'est-elle qu'une adaptation de `reviewed` au sens du
     canon §2 (« conflit mécanique, adaptation de test : aucun avis ») ? Rend
     `(oui, raison)` ; le critère est dans la doc du module. Un clone superficiel
@@ -819,10 +1138,16 @@ def adapted(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
         return False, "complete Git history required; shallow clone refused"
     if _same(reviewed, frozen):
         return False, "same head"
-    merge = _merge_adaptation(repo, tip, reviewed, head=frozen)
+    if renumber is not None:
+        base = plan_git._out(repo, "merge-base", reviewed, tip)
+        own = _name_status(repo, base, reviewed) if base else None
+        renumber = replace(renumber, owned=frozenset(
+            path for path, status in (own or {}).items() if status in ("A", "M"))
+            if own is not None else None)
+    merge = _merge_adaptation(repo, tip, reviewed, head=frozen, renumber=renumber)
     if not merge["ok"]:
         return False, merge["why"]
-    if not merge["tests"] and not merge["hunks"]:
+    if not merge["tests"] and not merge["hunks"] and not merge["renumbered"]:
         return False, "no test adaptation and no mechanical conflict"
     if merge["tests"]:
         base = plan_git._out(repo, "merge-base", reviewed, tip)
@@ -831,21 +1156,29 @@ def adapted(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
             return False, "the reviewed delta cannot be read"
         if all(_adaptable_test(path) for path in own):
             return False, "the lot is made of tests: they are its reviewed content"
-    history, why = _adapted_history(repo, reviewed, frozen, tip)
+    history, why = _adapted_history(repo, reviewed, frozen, tip, renumber=renumber,
+                                    mapping=merge["renumbered"])
     if not history:
         return False, why
+    if merge["renumbered"]:
+        return True, ("adaptation : renumérotation %s (migration number reserved by the lot, "
+                      "canon §2): renamed files differ only by that number, %d test file(s) "
+                      "changed, %d conflict hunk(s) keeping both sides; %s"
+                      % (_mapping_text(merge["renumbered"]), merge["tests"], merge["hunks"],
+                         why))
     return True, ("test or mechanical adaptation (canon §2): %d test file(s) changed, "
                   "%d conflict hunk(s) keeping both sides, no other line; %s"
                   % (merge["tests"], merge["hunks"], why))
 
 
-def _carriable(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
+def _carriable(repo: str, reviewed: str, frozen: str, tip: str, *,
+               renumber: Renumbering | None = None) -> tuple:
     """`(oui, raison, adaptation)` : réalignement (tout verdict se reporte) ou, à
-    défaut, adaptation (l'avis favorable seul se reporte, #5042)."""
+    défaut, adaptation (l'avis favorable seul se reporte, #5042, #7000)."""
     ok, why = realigned(repo, reviewed, frozen, tip)
     if ok:
         return True, why, False
-    fits, how = adapted(repo, reviewed, frozen, tip)
+    fits, how = adapted(repo, reviewed, frozen, tip, renumber=renumber)
     if fits:
         return True, how, True
     return False, "%s; not an adaptation either: %s" % (why, how), False
@@ -1065,6 +1398,10 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
                    % (declared[:12], where))
         return out, [], [], ""
     out["frozen"] = frozen
+    try:
+        renumber = renumbering_of(cfg, row, repo)
+    except Exception:  # noqa: BLE001 - réservation illisible : aucune renumérotation
+        renumber = None
     verdicts: dict = {}          # tête relue complète -> (oui, raison)
     plan: list = []              # (relecteur, verdict reporté)
     refused: list = []           # (tête relue, raison)
@@ -1080,7 +1417,7 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
                 _norm(mark.get("sha"))[:12], where)
             continue                  # objet absent : rien de prouvé, retenté
         if reviewed not in verdicts:
-            verdicts[reviewed] = _carriable(where, reviewed, frozen, tip)
+            verdicts[reviewed] = _carriable(where, reviewed, frozen, tip, renumber=renumber)
         ok, why, adaptation = verdicts[reviewed]
         if ok and adaptation and (mark.get("verdict") or "ok") != "ok":
             ok, why = False, NOT_OK_ADAPTATION
