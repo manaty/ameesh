@@ -279,7 +279,7 @@ class WorkerTest(Base):
             _resume_drop=lambda: None, _installe_hook_preuve=lambda cwd: None,
             write_session_file=lambda sid: None)
         for name in ("_open_move_turn", "_finish_move_turn", "current_session",
-                     "_note_session"):
+                     "_note_session", "_note_move_launched", "_conversation_move_open"):
             setattr(w, name, getattr(AgentWorker, name).__get__(w))
         return w
 
@@ -317,6 +317,42 @@ class WorkerTest(Base):
         self.assertTrue(w.lease_lost.is_set())
         row = self.row()
         self.assertEqual((row["host"], row["session_id"]), ("source", "sess-source"))
+
+    def test_launched_without_session_warns_the_source(self):
+        # B1 (relecture 1/2) : lancé puis en échec avant toute annonce de
+        # session — la source est avertie qu'un tour a pu s'exécuter
+        w = self.worker(self.switched())
+        w._open_move_turn()
+        w._turn_launched = True
+        w._note_move_launched()
+        self.assertTrue(self.moves.open_for("avatar")["target_turn_started"])
+        w._finish_move_turn(False)
+        row = self.row()
+        self.assertEqual((row["host"], row["session_id"]), ("source", "sess-source"))
+        self.assertIn("part of that turn may have run", row["pending_prompt"])
+
+    def test_finish_of_a_launched_turn_notes_the_launch(self):
+        # B1 : même sans marque au lancement, `finish(launched=True)` la pose
+        first = self.first_turn(self.switched())
+        first.finish(False, session=None, account=None, harness="claude", cwd=None,
+                     launched=True)
+        self.assertIn("part of that turn may have run", self.row()["pending_prompt"])
+
+    def test_continuity_held_while_a_move_is_open(self):
+        # B2 (relecture 1/2) : ni résumé ni rotation tant que la tentative est
+        # ouverte — source retenue, puis cible pas encore vérifiée
+        self.plan()
+        source = self.worker({"lease_epoch": self.row()["lease_epoch"]})
+        self.assertTrue(source._conversation_move_open())
+        self.advance()
+        w = self.worker(self.target_claim())
+        self.assertTrue(w._conversation_move_open())
+        w._open_move_turn()
+        self.assertTrue(w._conversation_move_open())
+        w._turn_launched = True
+        w._note_session("sess-target", None, "claude", None, "/tgt", "", "claude")
+        w._finish_move_turn(True)
+        self.assertFalse(w._conversation_move_open())
 
     def test_runner_pass_prepares_and_switches(self):
         from types import SimpleNamespace

@@ -6669,7 +6669,10 @@ class AgentWorker(threading.Thread):
         # L30 : session ouverte sous un autre compte et non reprenable → résumé
         # sous l'ancien compte, avant de consommer quoi que ce soit (jamais en
         # plein tour).
-        if not account_turn.continuity(self):
+        # #7050 (B2) : pendant un déplacement de conversation, ni résumé ni
+        # rotation — la session source doit rester reprenable jusqu'à
+        # `verified`, et le premier tour cible est celui de la consigne
+        if not self._conversation_move_open() and not account_turn.continuity(self):
             return None  # #389 r2 : rotation requise mais annulée, rien consommé
         # #811 (B1/R3) : un urgent d'un lot retenu attend comme les autres, et
         # le préfixe retenu ne le masque plus ; les messages primaires passent.
@@ -9022,6 +9025,33 @@ class AgentWorker(threading.Thread):
                          first.context.get("to_seq"), first.move["source_host"]))
         return True
 
+    def _conversation_move_open(self) -> bool:
+        """#7050 (B2) : une tentative ouverte vise cet agent (source retenue
+        ou cible pas encore vérifiée). Sans session au registre, rien à
+        protéger : aucune lecture. Base injoignable : réputée ouverte (la
+        continuité est seulement remise au tour suivant)."""
+        if self._move_turn is not None:
+            return True
+        if not (getattr(self, "agent", None) or {}).get("session_id") \
+                or getattr(self, "db", None) is None:
+            return False
+        try:
+            return storage.of(self.db).conversation_moves.open_for(self.name) is not None
+        except db_mod.DbError:
+            return True
+
+    def _note_move_launched(self) -> None:
+        """#7050 (5322 §2.3) : le premier tour cible est lancé — noté sur la
+        tentative dès le lancement, avant toute annonce de session, pour qu'un
+        échec ultérieur avertisse la source qu'un tour a pu s'exécuter."""
+        if self._move_turn is None:
+            return
+        try:
+            self._move_turn.launched(None)
+        except db_mod.DbError as exc:
+            log_async("[%s] conversation move launch not noted (%s)"
+                      % (self.name, db_mod.explain(exc)))
+
     def _finish_move_turn(self, ok: bool) -> None:
         """#7050 : après le premier tour cible — `verified` (le registre prend
         la session de la cible) s'il s'est terminé avec une session, sinon
@@ -9034,7 +9064,7 @@ class AgentWorker(threading.Thread):
         self._move_turn = None
         try:
             row = first.finish(bool(ok), session=first.session, account=first.account,
-                               harness=first.harness, cwd=first.cwd)
+                               harness=first.harness, cwd=first.cwd, launched=True)
         except db_mod.DbError as exc:
             log_async("[%s] conversation move %s not closed (%s)"
                       % (self.name, first.move_id, db_mod.explain(exc)))
@@ -9075,6 +9105,11 @@ class AgentWorker(threading.Thread):
                 return False
             self._workdir_missing(force_status=True)
             return False
+        # #7050 (B2) : la cible réclame le déplacement avant toute porte qui lit
+        # la session (bascule de lot ci-dessous) : `current_session` rend alors
+        # la session neuve de la cible, jamais celle de la source
+        if not self._open_move_turn():
+            return False
         # First assignment to another repository, or a changed Host root:
         # a session can only resume in the directory that opened it.
         session = self.current_session()
@@ -9113,8 +9148,6 @@ class AgentWorker(threading.Thread):
 
         with self._preparing("account setup"):
             compte = account_turn.for_turn(self)  # L30
-        if not self._open_move_turn():
-            return False
         if self._move_turn is not None:
             # #7050 : la consigne désigne le segment, jamais son texte (argv)
             spec = dict(spec, prompt=self._move_turn.prompt_note() + spec["prompt"])
@@ -9792,6 +9825,7 @@ class AgentWorker(threading.Thread):
             # un send accepté (plus bas).
             if rp is None:
                 self._turn_launched = True
+                self._note_move_launched()
                 self._consume_scheduled_wake(spec)
             # Lancé (et publié, pour que l'arrêt le trouve). La remise n'est
             # constatée qu'APRÈS l'acceptation de la consigne par le harnais
@@ -9815,6 +9849,7 @@ class AgentWorker(threading.Thread):
                     # ResidentError laisse le claim expirer et le réveil
                     # sera délivré de nouveau.
                     self._turn_launched = True
+                    self._note_move_launched()
                     self._consume_scheduled_wake(spec)
                     self._livre_courrier(spec)  # consigne acceptée : remise
                     flux = (json.dumps(raw, ensure_ascii=False)

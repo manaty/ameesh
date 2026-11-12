@@ -196,10 +196,17 @@ class FirstTurn:
                                   session=session)
 
     def finish(self, ok: bool, *, session: str | None, account: str | None,
-               harness: str | None, cwd: str | None, error: str = "") -> dict | None:
-        """Verify on a completed turn with a session, otherwise fail."""
+               harness: str | None, cwd: str | None, error: str = "",
+               launched: bool = False) -> dict | None:
+        """Verify on a completed turn with a session, otherwise fail.
+
+        `launched`: the turn was started — noted (idempotent) before the
+        failure, so the source is warned that part of it may have run."""
         session = session or self.session
         try:
+            if launched:
+                _moves(self.db).note_turn(self.move_id, owner=self.owner,
+                                          epoch=self.epoch, session=None)
             if ok and session:
                 row = _moves(self.db).verify(self.move_id, owner=self.owner,
                                              epoch=self.epoch, session=session,
