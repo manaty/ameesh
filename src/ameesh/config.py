@@ -301,6 +301,10 @@ class Config:
     #: mono-nœud, sauf si Patroni ou `synchronous_standby_names` est posé) et
     #: `db_lag_threshold_s` est le seuil du retard de rejeu qui alerte.
     patroni_url: str = ""
+    #: #6863 (EP8.6) : l'API REST de la grappe est en HTTPS, signée par l'AC
+    #: privée de la grappe (`/etc/ameesh/tls/ca.crt`) ; `patroni_ca` la fait
+    #: vérifier pour cette seule lecture, sans toucher au magasin du système.
+    patroni_ca: str = ""
     db_min_standbys: int = 0
     db_lag_threshold_s: float = 30.0
     #: #6862 (EP8.5) : le document du collecteur de santé de la grappe
@@ -1178,6 +1182,8 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
             cfg.statement_timeout_ms),
         patroni_url=str(pick("AMEESH_PATRONI_URL",
                              default=cfg.patroni_url) or "").strip(),
+        patroni_ca=str(pick("AMEESH_PATRONI_CA",
+                            default=cfg.patroni_ca) or "").strip(),
         db_min_standbys=_as_count(pick("AMEESH_DB_MIN_STANDBYS"),
                                   cfg.db_min_standbys),
         db_lag_threshold_s=_as_seconds(pick("AMEESH_DB_LAG_THRESHOLD_S"),
