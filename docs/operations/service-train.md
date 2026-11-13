@@ -316,8 +316,9 @@ Le paquet Nexlink n'est pas un run unique : chaque suite de lot est un
 par `scripts/ci/lot-plan.mjs` sur le change set intégré. Le contrat ne fige
 donc **pas** les 23 suites : il épingle seulement le sélecteur
 (`scripts/ci/lot-plan.mjs`) et les workflows partagés de plan et de statut
-(`.github/workflows/lot-plan.yml`, `.github/workflows/lot-status.yml`), au
-commit `NEXLINK_AUDIT_COMMIT` (`9103c167`, develop du 18/10 19:09 Paris). Le
+(`.github/workflows/lot-plan.yml`, `.github/workflows/lot-status.yml`), ainsi
+que leur helper `scripts/ci/git-fetch-retry.sh`, au commit
+`NEXLINK_AUDIT_COMMIT` (`c1277f06`, #7246). Le
 sélecteur de la cible est vérifié au commit de base (une modification exige un
 nouveau contrat) ; `ci_parts.due` (bac à sable `bwrap`, aucun repli) rend les
 contextes `lot/<suite>` dus. Le même sélecteur audité tourne sur **deux
@@ -327,6 +328,18 @@ peut pas réduire) et celui de la tête (les suites que le paquet ajoute ou
 de la base : un sélecteur modifié est refusé, jamais exécuté. L'union des deux
 plans est exigée ; chaque fichier doit déclarer le même `context` à la tête
 dispatchée, puis il est dispatché avec `expected_sha`.
+
+Les scripts `scripts/ci/release-base.mjs` et
+`scripts/ci/merge-base-with-develop.sh`, appelés par le workflow de plan du
+projet, restent hors de cette épingle. Ils choisissent la base et le
+merge-base du plan GitHub ; le train calcule indépendamment les parts dues
+avec `ci_parts.due`, sur la base et la tête explicites de son propre plan,
+sans exécuter ces deux scripts. Cette épingle ne certifie donc pas leur
+sélection de base ni le plan GitHub qui en résulte : le périmètre audité est
+la sélection indépendante du train et les sources partagées listées ci-dessus.
+Un changement de ces scripts reste du code projet à relire ; auditer tout le
+plan GitHub demanderait de les épingler aussi.
+
 À la lecture, la suite doit exister à la tête et **tous ses jobs exécutables**
 doivent être verts. Seuls des jobs de plomberie **nommés exactement**
 (`lot-plan`, `lot-plan-retry`, `lot-pending`, `lot-status` et leurs jobs

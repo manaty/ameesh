@@ -91,12 +91,16 @@ Le relevé porte son horodatage (`Gauge.read_at`) : marqueur de compte Claude,
 date du journal de session Codex.
 
 **Failover order and caps** (L226b, owner decision 2026-10-07, "primaries
-last, capped"): step 3 ranks by the account's `priority` first (the harness's
-default account last), the pace only breaking ties. Each window is held to
-the lowest of its pace cap (or `short_window_cap` on the short window), the
+last, capped"): after #1580, step 3 ranks by freshness, reset loss and pace
+before `priority` (the final tie-breaker, see `_rank_key`). A healthy session
+account keeps continuity in `choose`; priority is not pinning. Each window
+is held to the lowest of its pace cap (or `short_window_cap` on the short window), the
 account's fixed `cap` (50 % for the default account) and `overage_cap`
 (80 %) when the account may be billed beyond its plan; an account in overage
-is never chosen. These caps apply to continuity too (`limits`, `evaluate`).
+is never chosen. For `scope=organization`, no personal reserve or implicit
+50 % cap applies: a hard 95 % cap replaces `overage_cap`, while an explicit
+`cap` may tighten it and the pace cap still applies. These caps apply to
+continuity too (`limits`, `evaluate`).
 
 **Plafond de rythme par compte et fin de fenêtre** (#1176, décision de
 l'owner du 2026-10-14) : `pace_ceiling` remplace les 90 % en dur, et
@@ -1324,8 +1328,9 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
 
 def account_cap(profile: Profile) -> float | None:
     """The fixed cap on every window of the account (L226b): its `cap`
-    setting, or `PRIMARY_CAP` for the harness's default account (~/.claude,
-    ~/.codex: the owner's own), none otherwise."""
+    setting, or `PRIMARY_CAP` for the harness's personal default account
+    (~/.claude, ~/.codex: the owner's own), none otherwise. Organization
+    accounts have no implicit 50 % cap; `fixed_caps` adds their hard 95 % cap."""
     if profile.cap is not None:
         return profile.cap
     return PRIMARY_CAP if profile.default and profile.scope == "personal" else None
@@ -1542,7 +1547,9 @@ def pace_ceilings(profile: Profile, gauges, now: float) -> dict:
 def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tuple[float, str]]:
     """[(cap, label)]: the caps that hold on every window of the account
     whatever its pace (L226b): its fixed cap (`account_cap`), and
-    `overage_cap` when it may be billed beyond its plan.
+    `overage_cap` when a personal account may be billed beyond its plan.
+    Organization accounts instead keep a hard 95 % cap, even for critical
+    agents and regardless of the provider overage flag.
 
     `critical` (L242b, owner decision 2026-10-12 10:00): the implicit 50 %
     cap of the default account does not hold for a critical agent; a `cap`
@@ -1569,12 +1576,13 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
     to (L226b), the lowest of
     * the pace cap of the guard (0019), or on the short window the account's
       `short_window_cap` when set (it replaces the pace cap there);
-    * the account's fixed cap (`account_cap`: 50 % for the primary);
-    * `overage_cap` (80 %) when the account may be billed beyond its plan.
+    * the account's fixed cap (`account_cap`: 50 % for the personal primary);
+    * `overage_cap` (80 %) when a personal account may be billed beyond its plan,
+      or the hard organization cap (95 %), regardless of the overage flag.
 
     `critical` (L242b): see `fixed_caps`. `reserve` (L242b (2), a
-    non-critical agent): the pace cap, or the short window cap that replaces
-    it, is lowered by `RESERVE` —
+    non-critical agent on a personal plan only): the pace cap, or the short
+    window cap that replaces it, is lowered by `RESERVE` —
     `max(min(PACE_CEILING, multiplier × elapsed + PACE_MARGIN) − RESERVE,
     PACE_MARGIN)` — and the fixed caps are not lowered. #777 : tant que
     `multiplier × elapsed ≤ RESERVE` (soit `≤ PACE_MARGIN` quand la réserve
@@ -1702,7 +1710,10 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     `record=False` (simulation, L39) : l'historique des jauges n'est pas écrit.
     `critical` (L242b) : pour un agent critique, sans le plafond implicite de
     50 % du compte par défaut (`fixed_caps`). `reserve` : pour un agent non
-    critique, le rythme moins `RESERVE` (`limits`). `model` (#1580 tranche 3) :
+    critique sur un compte personnel, le rythme moins `RESERVE` (`limits`).
+    Un compte d’organisation ne garde aucune réserve ni plafond implicite de
+    50 % ; son plafond dur de 95 % remplace `overage_cap` (`fixed_caps`).
+    `model` (#1580 tranche 3) :
     le modèle de la session ; `None` = pas de session (affichage), tous les
     seaux comptent, `''` = modèle inconnu, les seaux de modèle sont écartés
     (`gauges_of`).
@@ -2252,7 +2263,8 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
       n'est retranchée qu'**une fois** : quand `limits` a été calculé avec
       elle (`Evaluation.reserve`, #6958), le rythme et la fenêtre courte la
       portent déjà ; les plafonds fixes ne la portent jamais — elle s'y
-      applique ici.
+      applique ici. Les comptes d’organisation n’ont aucune réserve, y
+      compris dans ce contrôle.
 
     Sans preuve (âge inconnu, aucune fenêtre datée ouverte, plafond absent), le
     relevé reste périmé : fraîcheur 2. L'incident #1672 (relevé de quatre
@@ -2391,7 +2403,8 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
 
     #1566 N1 : un relevé partiel qui reste **informateur** — âge sous ce qui
     reste d'une fenêtre datée ouverte, et chaque fenêtre ouverte sous son
-    plafond effectif moins `RESERVE` (`_informative_partial`, GO pilote du
+    plafond effectif moins `RESERVE` (sans réserve pour une organisation ;
+    `_informative_partial`, GO pilote du
     15/10) — concourt avec les relevés courants : c'est la fin de l'inversion
     de l'ordre de bascule quand seule une fenêtre courte s'est remise à zéro.
     Sans preuve, il reste périmé (fraîcheur 2) ; un relevé écarté par

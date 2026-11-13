@@ -106,9 +106,13 @@ Sources: [Docker volume lifecycle](https://docs.docker.com/engine/storage/volume
 
 ## Agent VM BuildKit cache policy (#7245)
 
-For agent VMs AG1–AG3, the proposed Docker rootless default-builder retention
-is **10GB** (decimal bytes, about 9.31 GiB), with BuildKit GC enabled. The
-reviewable fragment is
+For agent VMs with BuildKit and Buildx, the proposed Docker rootless
+default-builder retention is **10GB** (10 GiB, 10,737,418,240 bytes: Docker
+parses this size with binary units), with BuildKit GC enabled. The inventory
+of 13 November 2026 (bureau #217136) found Buildx on AG2 only; AG1 and AG3
+had none. Qualify AG2 first; record AG1/AG3 as “Buildx absent, BuildKit policy
+unqualified” until their consuming builder is inventoried. The reviewable
+fragment is
 [`docker-buildkit-gc.json`](../deploy/serveur/docker-buildkit-gc.json).
 It is an input to an operator merge, not a complete replacement for an existing
 Docker configuration. The server installer does not apply it automatically.
@@ -123,8 +127,10 @@ configuration: this fragment does not configure it. Verify the builder used by
 the consuming job, including its explicit `--builder`, `BUILDX_BUILDER` or
 `DOCKER_BUILDKIT=0` overrides; a CLI's selected builder alone is insufficient.
 
-`defaultKeepStorage` derives the default GC policies. GC periodically removes
-eligible unused cache, first disposable/old records and then records above the
+`defaultKeepStorage` is the deprecated alias of `defaultReservedSpace` and
+derives the default GC policies when no newer default-space settings or
+custom policy override it. GC periodically removes eligible unused cache,
+first disposable/old records and then records above the
 retention target. This is **not a filesystem quota**: active cache, newly
 exported images, build contexts, concurrent builders and other host activity
 can exceed it. Shared layer accounting also prevents interpreting logical cache
@@ -133,45 +139,60 @@ an arbitrary build stays above the host's free-space alert threshold.
 
 ### Operator application proposal (not executed by this lot's author)
 
-The bureau applies the reviewed configuration separately on each VM after the
-required approval for an operation that enables cache deletion. Do not prune,
-restart Docker, or change a live host as part of a documentation check.
+The bureau applies the reviewed configuration on an inventoried BuildKit VM
+(AG2 first) after the required approval for an operation that enables cache
+deletion. Do not prune, restart Docker, or change a live host as part of a documentation check.
 
 1. Record the host, Engine/Buildx versions, user service command and effective
    configuration path, rootless socket and storage filesystem. Verify
    `docker info` reports rootless and `docker buildx inspect` reports the
-   consuming builder's driver as `docker`. Record the host's configured
-   free-space alert threshold and its separate hard pause floor; do not
-   substitute the historical 2 GiB pause floor for the alert threshold.
+   consuming builder's driver as `docker`. If Buildx is absent, stop this
+   procedure for that host and record the missing tool and unqualified policy;
+   do not assume the legacy builder uses BuildKit GC. Record the host's
+   configured free-space alert threshold and its separate hard pause floor;
+   do not substitute the historical 2 GiB pause floor for the alert threshold.
 2. Read the existing configuration as the daemon user. Back it up, preserving
    its permissions, outside the product checkout. Prepare a candidate by
    merging only `builder.gc.enabled=true` and
    `builder.gc.defaultKeepStorage="10GB"`; preserve all other keys. If an
-   explicit `builder.gc.policy` exists, stop this application and have the
-   operator reconcile it: the default target does not override custom rules.
+   explicit `builder.gc.policy`, `builder.gc.defaultReservedSpace`,
+   `builder.gc.defaultMaxUsedSpace` or `builder.gc.defaultMinFreeSpace` exists,
+   stop this application and have the operator reconcile it: the alias may be
+   ignored or overridden, and the default target does not override custom rules.
    Likewise, an unexpected type in `builder` or `gc` is an error, not grounds
    to replace that section. Treat a missing configuration as an empty object.
 3. Validate the candidate with the **installed Engine binary**:
-   `dockerd --validate --config-file <candidate>`. JSON parsing alone does not
-   validate Engine support. Keep the original configuration in place if this
-   fails. Stage the validated candidate beside the real file, owned by the
-   daemon user with mode 0600, and atomically rename it into place.
+   `dockerd --validate --config-file <candidate>`. This is a preliminary
+   configuration check, not proof that the GC key is supported: Engine can
+   accept unknown nested GC keys (including `builder.gc.bogusKey`). Verify
+   the effective policy after activation in step 4. Keep the original
+   configuration in place if this fails. Stage the validated candidate beside
+   the real file, owned by the daemon user with mode 0600, and atomically rename it into place.
 4. Choose an idle Docker window with the consuming jobs' operator before
    activating it. Restart the **user** `docker.service`, never the system
    daemon, through the bureau's approved operation. Restarting can interrupt
    running containers; do not infer live-restore support. Verify the actual
    service, rootless socket, daemon health, active jobs and effective file
-   again after restart. A daemon failure calls for restoring the backup and
+   again after restart. Inspect the consuming builder with `docker buildx
+   inspect`: record its effective GC policies, including `Reserved Space`
+   (10 GiB for the general retention rules), or use daemon logs exposing the
+   effective policy for that installed version. A valid file alone does not
+   qualify the policy; if it cannot be observed, report it as unqualified.
+   A daemon failure calls for restoring the backup and
    restarting the same user service through that operator window.
 5. Run the acceptance below on that VM before expanding to the others. Record
    the approved application and its measurements in the lot, not in this
    document. Restoring the previous file reverses the configuration; it cannot
    recover cache already reclaimed by GC (which must be rebuilt).
 
-### Acceptance on each VM
+### Acceptance on AG2, then on other inventoried BuildKit VMs
 
 Use an operator-approved, bounded representative build that generates more
-than 10GB of default-builder cache cumulatively, with adequate initial headroom.
+than 10 GiB of default-builder cache cumulatively, with adequate initial headroom.
+Use 10,737,418,240 bytes when calculating the cache allowance: initial free
+bytes must cover the configured alert threshold plus the workload’s peak
+additional physical use and the operator’s margin; 10 GiB of cache alone
+is not that peak.
 Do not allocate dummy data until a live host reaches its alert threshold.
 Record the exact job, builder, Engine version, configuration and initial cache
 inventory. Sample physical free bytes on the Docker data filesystem throughout
@@ -186,15 +207,19 @@ Acceptance requires a successful build, observed automatic reclamation of
 eligible excess cache, and a sampled minimum **above the configured alert
 threshold**, with the operator's headroom margin documented. Record the
 maximum cache, minimum free bytes, elapsed observation period, and final
-reclaimable/in-use cache. Repeat for AG1, AG2 and AG3; a VM not measured remains
-unqualified. If the driver differs, GC is not observed, cache remains in use,
+reclaimable/in-use cache. Start with AG2; repeat on AG1/AG3 only once their
+BuildKit/Buildx setup and consuming builder are inventoried. Missing Buildx
+or an unmeasured VM remains explicitly unqualified, not a passing acceptance.
+If the driver differs, GC is not observed, cache remains in use,
 or physical free space crosses the threshold, report the unmet condition;
 changing the target alone is not a proven fix for an oversized active build.
 The next mitigation needs workload/storage isolation or admission/headroom
 control, separately scoped and reviewed.
 
 Sources: [Docker BuildKit GC and driver-specific configuration](https://docs.docker.com/build/cache/garbage-collection/),
-[rootless daemon paths and user service](https://docs.docker.com/engine/security/rootless/tips/).
+[rootless daemon paths and user service](https://docs.docker.com/engine/security/rootless/tips/),
+[Moby GC configuration and alias handling](https://github.com/moby/moby/blob/master/daemon/config/builder.go),
+[Docker binary size parsing (`RAMInBytes`)](https://github.com/docker/go-units/blob/master/size.go).
 
 ## Incident evidence, 12 October 2026
 
