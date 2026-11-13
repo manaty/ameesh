@@ -11,8 +11,9 @@ n'y est pas lié.
 from __future__ import annotations
 
 import os
+from unittest import mock
 
-from ameesh import mail, registry, session_bindings
+from ameesh import identity, mail, registry, session_bindings
 from .support import PgTestCase
 
 
@@ -71,6 +72,49 @@ class InboxIdentityTest(PgTestCase):
         proc = self.cli("show", str(mid))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("secret pour show lie", proc.stdout)
+
+    # -- #7149, B1 de la revue : le nom annoncé concordant laisse la liaison
+    #    faire l'identité (le shell porte encore AGENT_MAIL_NAME) ------------
+    def test_bound_session_with_inherited_name_reads_its_box(self):
+        session_bindings.bind(self.cfg, self.db, "victim",
+                              session_id="test-7149-inherited",
+                              harness="claude", pid=os.getpid(), by="victim",
+                              force=True)
+        proc = self.cli("inbox", env=self.env(AGENT_MAIL_NAME="victim"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("secret pour victim", proc.stdout)
+
+    def test_bound_session_with_inherited_name_shows_its_message(self):
+        mid = mail.send(self.db, "sender", "victim", "secret pour show hérité")
+        session_bindings.bind(self.cfg, self.db, "victim",
+                              session_id="test-7149-inherited-show",
+                              harness="claude", pid=os.getpid(), by="victim",
+                              force=True)
+        proc = self.cli("show", str(mid), env=self.env(AGENT_MAIL_NAME="victim"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("secret pour show hérité", proc.stdout)
+
+    def test_resolve_binding_returns_the_bound_session_when_names_agree(self):
+        session_bindings.bind(self.cfg, self.db, "victim",
+                              session_id="test-7149-resolve",
+                              harness="claude", pid=os.getpid(), by="victim",
+                              force=True)
+        with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "victim"}, clear=False):
+            for key in ("AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
+                        "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH"):
+                os.environ.pop(key, None)
+            binding = identity.resolve_binding(self.cfg, self.db)
+        self.assertTrue(binding.ok, binding.reason)
+        self.assertEqual((binding.name, binding.source), ("victim", "session"))
+
+    def test_show_refuses_a_name_contradicting_the_binding(self):
+        mid = mail.send(self.db, "sender", "bureau", "secret pour bureau")
+        session_bindings.bind(self.cfg, self.db, "bureau", session_id="test-7149",
+                              harness="codex", pid=os.getpid(), by="bureau")
+        proc = self.cli("show", str(mid), env=self.env(AGENT_MAIL_NAME="persona"))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("ambiguous identity", proc.stderr)
+        self.assertNotIn("secret pour bureau", proc.stdout)
 
     def test_announced_name_cannot_send_without_from(self):
         session_bindings.bind(self.cfg, self.db, "bureau", session_id="test-7149",
